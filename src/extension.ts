@@ -10,6 +10,7 @@ import {
   registerSelectMetaFolderCommand,
 } from "./commands/selectMetaFolder";
 import { registerStartNewTaskCommand } from "./commands/startNewTask";
+import { registerResumeTaskCommand } from "./commands/resumeTask";
 
 /**
  * Button labels for the prompts
@@ -78,6 +79,7 @@ export function activate(context: vscode.ExtensionContext): void {
   // Register commands
   registerSelectMetaFolderCommand(context);
   registerStartNewTaskCommand(context);
+  registerResumeTaskCommand(context);
 
   // Register the hello world command (keeping for now)
   const helloWorldDisposable = vscode.commands.registerCommand(

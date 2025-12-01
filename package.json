@@ -31,6 +31,10 @@
       {
         "command": "vs-code-ai-helper.startNewTask",
         "title": "AI Helper: Start New Task"
+      },
+      {
+        "command": "vs-code-ai-helper.resumeTask",
+        "title": "AI Helper: Resume Task"
       }
     ],
     "configuration": {

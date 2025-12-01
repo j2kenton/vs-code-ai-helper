@@ -3,6 +3,12 @@ import {
   getMetaResourcesPath,
   hasValidMetaResourcesPath,
 } from "../config/settings";
+import { TaskProgress } from "../types/taskProgress";
+import {
+  createTaskProgress,
+  updateTaskProgressStage,
+  writeTaskProgress,
+} from "../utils/taskProgressUtils";
 
 /**
  * Format a date as YYYY-MM-DD
@@ -98,6 +104,10 @@ export async function startNewTask(): Promise<string | undefined> {
   try {
     await vscode.workspace.fs.createDirectory(taskFolderUri);
 
+    // Initialize task progress tracking
+    let progress: TaskProgress = createTaskProgress(taskFolderName, "created");
+    await writeTaskProgress(taskFolderUri, progress);
+
     void vscode.window.showInformationMessage(
       `Created new task folder: ${taskFolderName}`
     );
@@ -158,6 +168,10 @@ export async function startNewTask(): Promise<string | undefined> {
 
     await createAndOpenFile(planFileUri);
 
+    // Update progress to "plan" stage
+    progress = updateTaskProgressStage(progress, "plan");
+    await writeTaskProgress(taskFolderUri, progress);
+
     // Step 3: Prompt for plan-review.md
     const createReview = await vscode.window.showQuickPick(
       ["Create plan-review.md", "Skip"],
@@ -171,10 +185,19 @@ export async function startNewTask(): Promise<string | undefined> {
       await copyFile(planFileUri, planFinalFileUri);
       const doc = await vscode.workspace.openTextDocument(planFinalFileUri);
       await vscode.window.showTextDocument(doc);
+
+      // Mark as completed
+      progress = updateTaskProgressStage(progress, "completed");
+      await writeTaskProgress(taskFolderUri, progress);
+
       return taskFolderName;
     }
 
     await createAndOpenFile(planReviewFileUri);
+
+    // Update progress to "plan-review" stage
+    progress = updateTaskProgressStage(progress, "plan-review");
+    await writeTaskProgress(taskFolderUri, progress);
 
     // Step 4: Prompt for plan-updated.md
     const createUpdated = await vscode.window.showQuickPick(
@@ -189,10 +212,19 @@ export async function startNewTask(): Promise<string | undefined> {
       await copyFile(planFileUri, planFinalFileUri);
       const doc = await vscode.workspace.openTextDocument(planFinalFileUri);
       await vscode.window.showTextDocument(doc);
+
+      // Mark as completed
+      progress = updateTaskProgressStage(progress, "completed");
+      await writeTaskProgress(taskFolderUri, progress);
+
       return taskFolderName;
     }
 
     await createAndOpenFile(planUpdatedFileUri);
+
+    // Update progress to "plan-updated" stage
+    progress = updateTaskProgressStage(progress, "plan-updated");
+    await writeTaskProgress(taskFolderUri, progress);
 
     // Step 5: Prompt for plan-updated-review.md
     const createUpdatedReview = await vscode.window.showQuickPick(
@@ -207,10 +239,19 @@ export async function startNewTask(): Promise<string | undefined> {
       await copyFile(planUpdatedFileUri, planFinalFileUri);
       const doc = await vscode.workspace.openTextDocument(planFinalFileUri);
       await vscode.window.showTextDocument(doc);
+
+      // Mark as completed
+      progress = updateTaskProgressStage(progress, "completed");
+      await writeTaskProgress(taskFolderUri, progress);
+
       return taskFolderName;
     }
 
     await createAndOpenFile(planUpdatedReviewFileUri);
+
+    // Update progress to "plan-updated-review" stage
+    progress = updateTaskProgressStage(progress, "plan-updated-review");
+    await writeTaskProgress(taskFolderUri, progress);
 
     // Step 6: Prompt for plan-final.md
     const createFinal = await vscode.window.showQuickPick(
@@ -223,11 +264,19 @@ export async function startNewTask(): Promise<string | undefined> {
 
     if (createFinal === "Create plan-final.md") {
       await createAndOpenFile(planFinalFileUri);
+
+      // Update progress to "plan-final" stage
+      progress = updateTaskProgressStage(progress, "plan-final");
+      await writeTaskProgress(taskFolderUri, progress);
     } else {
       await copyFile(planUpdatedFileUri, planFinalFileUri);
       const doc = await vscode.workspace.openTextDocument(planFinalFileUri);
       await vscode.window.showTextDocument(doc);
     }
+
+    // Mark as completed
+    progress = updateTaskProgressStage(progress, "completed");
+    await writeTaskProgress(taskFolderUri, progress);
 
     return taskFolderName;
   } catch (error) {
