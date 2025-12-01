@@ -23,8 +23,29 @@
       {
         "command": "vs-code-ai-helper.helloWorld",
         "title": "AI Helper: Hello World"
+      },
+      {
+        "command": "vs-code-ai-helper.selectMetaFolder",
+        "title": "AI Helper: Select Meta Resources Folder"
       }
-    ]
+    ],
+    "configuration": {
+      "title": "VS Code AI Helper",
+      "properties": {
+        "vs-code-ai-helper.metaResourcesPath": {
+          "type": "string",
+          "default": "",
+          "scope": "resource",
+          "description": "Workspace folder path for storing meta-level resources (logs, documentation, work tracking)"
+        },
+        "vs-code-ai-helper.promptDismissed": {
+          "type": "boolean",
+          "default": false,
+          "scope": "resource",
+          "description": "When true, suppresses folder configuration prompts permanently for this workspace"
+        }
+      }
+    }
   },
   "scripts": {
     "vscode:prepublish": "pnpm run package",
