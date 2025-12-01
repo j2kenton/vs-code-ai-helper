@@ -27,6 +27,10 @@
       {
         "command": "vs-code-ai-helper.selectMetaFolder",
         "title": "AI Helper: Select Meta Resources Folder"
+      },
+      {
+        "command": "vs-code-ai-helper.startNewTask",
+        "title": "AI Helper: Start New Task"
       }
     ],
     "configuration": {
