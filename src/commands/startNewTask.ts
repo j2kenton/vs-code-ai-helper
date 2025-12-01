@@ -102,6 +102,133 @@ export async function startNewTask(): Promise<string | undefined> {
       `Created new task folder: ${taskFolderName}`
     );
 
+    // Helper to copy file content
+    const copyFile = async (
+      sourceUri: vscode.Uri,
+      destUri: vscode.Uri
+    ): Promise<void> => {
+      const content = await vscode.workspace.fs.readFile(sourceUri);
+      await vscode.workspace.fs.writeFile(destUri, content);
+    };
+
+    // Helper to create empty file, open it, and copy path to clipboard
+    const createAndOpenFile = async (fileUri: vscode.Uri): Promise<void> => {
+      await vscode.workspace.fs.writeFile(fileUri, new Uint8Array());
+      const doc = await vscode.workspace.openTextDocument(fileUri);
+      await vscode.window.showTextDocument(doc);
+
+      // Copy relative path to clipboard and notify user
+      const relativePath = vscode.workspace.asRelativePath(fileUri);
+      await vscode.env.clipboard.writeText(relativePath);
+      void vscode.window.showInformationMessage(
+        `Copied to clipboard: ${relativePath}`
+      );
+    };
+
+    const planFileUri = vscode.Uri.joinPath(taskFolderUri, "plan.md");
+    const planReviewFileUri = vscode.Uri.joinPath(
+      taskFolderUri,
+      "plan-review.md"
+    );
+    const planUpdatedFileUri = vscode.Uri.joinPath(
+      taskFolderUri,
+      "plan-updated.md"
+    );
+    const planUpdatedReviewFileUri = vscode.Uri.joinPath(
+      taskFolderUri,
+      "plan-updated-review.md"
+    );
+    const planFinalFileUri = vscode.Uri.joinPath(
+      taskFolderUri,
+      "plan-final.md"
+    );
+
+    // Step 2: Prompt for plan.md
+    const createPlan = await vscode.window.showQuickPick(
+      ["Create plan.md", "Quit"],
+      {
+        placeHolder: "Would you like to create an initial plan?",
+        title: "Task Planning",
+      }
+    );
+
+    if (createPlan !== "Create plan.md") {
+      return taskFolderName;
+    }
+
+    await createAndOpenFile(planFileUri);
+
+    // Step 3: Prompt for plan-review.md
+    const createReview = await vscode.window.showQuickPick(
+      ["Create plan-review.md", "Skip"],
+      {
+        placeHolder: "Would you like to create a plan review?",
+        title: "Plan Review",
+      }
+    );
+
+    if (createReview !== "Create plan-review.md") {
+      await copyFile(planFileUri, planFinalFileUri);
+      const doc = await vscode.workspace.openTextDocument(planFinalFileUri);
+      await vscode.window.showTextDocument(doc);
+      return taskFolderName;
+    }
+
+    await createAndOpenFile(planReviewFileUri);
+
+    // Step 4: Prompt for plan-updated.md
+    const createUpdated = await vscode.window.showQuickPick(
+      ["Create plan-updated.md", "Dismiss review"],
+      {
+        placeHolder: "Would you like to create an updated plan?",
+        title: "Plan Update",
+      }
+    );
+
+    if (createUpdated !== "Create plan-updated.md") {
+      await copyFile(planFileUri, planFinalFileUri);
+      const doc = await vscode.workspace.openTextDocument(planFinalFileUri);
+      await vscode.window.showTextDocument(doc);
+      return taskFolderName;
+    }
+
+    await createAndOpenFile(planUpdatedFileUri);
+
+    // Step 5: Prompt for plan-updated-review.md
+    const createUpdatedReview = await vscode.window.showQuickPick(
+      ["Create plan-updated-review.md", "Skip"],
+      {
+        placeHolder: "Would you like to create an updated plan review?",
+        title: "Updated Plan Review",
+      }
+    );
+
+    if (createUpdatedReview !== "Create plan-updated-review.md") {
+      await copyFile(planUpdatedFileUri, planFinalFileUri);
+      const doc = await vscode.workspace.openTextDocument(planFinalFileUri);
+      await vscode.window.showTextDocument(doc);
+      return taskFolderName;
+    }
+
+    await createAndOpenFile(planUpdatedReviewFileUri);
+
+    // Step 6: Prompt for plan-final.md
+    const createFinal = await vscode.window.showQuickPick(
+      ["Create plan-final.md", "Dismiss re-review"],
+      {
+        placeHolder: "Would you like to create the final plan?",
+        title: "Final Plan",
+      }
+    );
+
+    if (createFinal === "Create plan-final.md") {
+      await createAndOpenFile(planFinalFileUri);
+    } else {
+      await copyFile(planUpdatedFileUri, planFinalFileUri);
+      const doc = await vscode.workspace.openTextDocument(planFinalFileUri);
+      await vscode.window.showTextDocument(doc);
+    }
+
     return taskFolderName;
   } catch (error) {
     const errorMessage =
