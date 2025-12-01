@@ -162,6 +162,7 @@ export async function startNewTask(): Promise<string | undefined> {
       }
     );
 
+    // Treat cancel or "Quit" as a pause — keep current progress so it can be resumed later
     if (createPlan !== "Create plan.md") {
       return taskFolderName;
     }
@@ -180,6 +181,11 @@ export async function startNewTask(): Promise<string | undefined> {
         title: "Plan Review",
       }
     );
+
+    // Cancelled: leave task at current stage
+    if (!createReview) {
+      return taskFolderName;
+    }
 
     if (createReview !== "Create plan-review.md") {
       await copyFile(planFileUri, planFinalFileUri);
@@ -208,6 +214,11 @@ export async function startNewTask(): Promise<string | undefined> {
       }
     );
 
+    // Cancelled: leave task at current stage
+    if (!createUpdated) {
+      return taskFolderName;
+    }
+
     if (createUpdated !== "Create plan-updated.md") {
       await copyFile(planFileUri, planFinalFileUri);
       const doc = await vscode.workspace.openTextDocument(planFinalFileUri);
@@ -235,6 +246,11 @@ export async function startNewTask(): Promise<string | undefined> {
       }
     );
 
+    // Cancelled: leave task at current stage
+    if (!createUpdatedReview) {
+      return taskFolderName;
+    }
+
     if (createUpdatedReview !== "Create plan-updated-review.md") {
       await copyFile(planUpdatedFileUri, planFinalFileUri);
       const doc = await vscode.workspace.openTextDocument(planFinalFileUri);
@@ -261,6 +277,11 @@ export async function startNewTask(): Promise<string | undefined> {
         title: "Final Plan",
       }
     );
+
+    // Cancelled: leave task at current stage
+    if (!createFinal) {
+      return taskFolderName;
+    }
 
     if (createFinal === "Create plan-final.md") {
       await createAndOpenFile(planFinalFileUri);

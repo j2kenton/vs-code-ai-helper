@@ -208,6 +208,11 @@ async function resumeFromStage(
         }
       );
 
+      // Cancelled: keep current stage so the task can be resumed later
+      if (!createReview) {
+        return currentProgress.taskFolder;
+      }
+
       if (createReview !== "Create plan-review.md") {
         await copyFile(planFileUri, planFinalFileUri);
         const doc = await vscode.workspace.openTextDocument(planFinalFileUri);
@@ -234,6 +239,11 @@ async function resumeFromStage(
           title: "Plan Update",
         }
       );
+
+      // Cancelled: keep current stage so the task can be resumed later
+      if (!createUpdated) {
+        return currentProgress.taskFolder;
+      }
 
       if (createUpdated !== "Create plan-updated.md") {
         await copyFile(planFileUri, planFinalFileUri);
@@ -265,6 +275,11 @@ async function resumeFromStage(
         }
       );
 
+      // Cancelled: keep current stage so the task can be resumed later
+      if (!createUpdatedReview) {
+        return currentProgress.taskFolder;
+      }
+
       if (createUpdatedReview !== "Create plan-updated-review.md") {
         await copyFile(planUpdatedFileUri, planFinalFileUri);
         const doc = await vscode.workspace.openTextDocument(planFinalFileUri);
@@ -294,6 +309,11 @@ async function resumeFromStage(
           title: "Final Plan",
         }
       );
+
+      // Cancelled: keep current stage so the task can be resumed later
+      if (!createFinal) {
+        return currentProgress.taskFolder;
+      }
 
       if (createFinal === "Create plan-final.md") {
         await createAndOpenFile(planFinalFileUri);
