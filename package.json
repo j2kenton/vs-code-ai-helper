@@ -3,7 +3,8 @@
   "displayName": "VS Code AI Helper",
   "description": "A VS Code extension for helping developers utilize AI tools and LLMs in their work",
   "version": "0.0.1",
-  "publisher": "your-publisher-id",
+  "publisher": "j2kenton",
+  "license": "MIT",
   "repository": {
     "type": "git",
     "url": "https://github.com/j2kenton/vs-code-ai-helper.git"
