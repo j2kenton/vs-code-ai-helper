@@ -65,7 +65,8 @@
     "check-types": "tsc --noEmit",
     "lint": "eslint src",
     "lint:fix": "eslint src --fix",
-    "test": "vscode-test"
+    "test": "vscode-test",
+    "vsix": "vsce package"
   },
   "devDependencies": {
     "@types/node": "^20.10.0",
