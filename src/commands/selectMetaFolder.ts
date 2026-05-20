@@ -10,7 +10,7 @@ export async function selectMetaFolder(): Promise<string | undefined> {
 
   if (!workspaceFolders || workspaceFolders.length === 0) {
     void vscode.window.showErrorMessage(
-      "No workspace folder open. Please open a folder first."
+      "No workspace folder open. Please open a folder first.",
     );
     return undefined;
   }
@@ -38,13 +38,26 @@ export async function selectMetaFolder(): Promise<string | undefined> {
     return undefined;
   }
 
+  // Ensure the selected folder belongs to the current workspace
+  const selectedWorkspaceFolder =
+    vscode.workspace.getWorkspaceFolder(selectedUri);
+  if (
+    !selectedWorkspaceFolder ||
+    selectedWorkspaceFolder.uri.toString() !== workspaceRoot.uri.toString()
+  ) {
+    void vscode.window.showErrorMessage(
+      "The meta resources folder must be located within the primary workspace folder.",
+    );
+    return undefined;
+  }
+
   // Convert to relative path if within workspace
   const relativePath = vscode.workspace.asRelativePath(selectedUri, false);
 
   await setMetaResourcesPath(relativePath);
 
   void vscode.window.showInformationMessage(
-    `Meta resources folder set to: ${relativePath}`
+    `Meta resources folder set to: ${relativePath}`,
   );
 
   return relativePath;
@@ -54,11 +67,11 @@ export async function selectMetaFolder(): Promise<string | undefined> {
  * Register the selectMetaFolder command
  */
 export function registerSelectMetaFolderCommand(
-  context: vscode.ExtensionContext
+  context: vscode.ExtensionContext,
 ): void {
   const disposable = vscode.commands.registerCommand(
     "vs-code-ai-helper.selectMetaFolder",
-    selectMetaFolder
+    selectMetaFolder,
   );
 
   context.subscriptions.push(disposable);
