@@ -2,6 +2,12 @@
 
 A VS Code extension for helping developers utilize AI tools and LLMs in their work.
 
+## Marketplace
+
+Install from the Visual Studio Marketplace:
+
+https://marketplace.visualstudio.com/items?itemName=j2kenton.vs-code-ai-helper
+
 ## Features
 
 🚧 **Under Development** 🚧
