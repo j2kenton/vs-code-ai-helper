@@ -68,7 +68,10 @@
     "lint:fix": "eslint src --fix",
     "test": "vscode-test",
     "vsix": "vsce package",
-    "publish": "vsce publish"
+    "publish": "vsce publish",
+    "publish:patch": "vsce publish patch",
+    "publish:minor": "vsce publish minor",
+    "publish:major": "vsce publish major"
   },
   "devDependencies": {
     "@types/node": "^20.10.0",
