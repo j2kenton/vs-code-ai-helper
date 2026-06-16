@@ -19,6 +19,12 @@ Planned features:
 - Intelligent code completion
 - Code explanation and documentation
 
+## Screenshots
+
+| Command Palette | Task Planning |
+| --- | --- |
+| ![AI Helper commands in the Command Palette](images/screenshots/screenshot-1.jpeg) | ![Task planning prompt](images/screenshots/screenshot-2.jpeg) |
+
 ## Requirements
 
 - VS Code 1.85.0 or higher
