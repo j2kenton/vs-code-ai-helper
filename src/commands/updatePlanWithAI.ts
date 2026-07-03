@@ -24,13 +24,31 @@ async function readIfExists(fileUri: vscode.Uri): Promise<string | undefined> {
 }
 
 /**
- * Stages a task may be in for plan update to be safe: either a review
- * exists with no update yet, or the task is still at the plan-updated
- * stage (regenerating plan-updated.md in place). Later stages are
- * excluded so this command can never regress a task's progress or leave
- * stale downstream artifacts behind.
+ * Stat a file, or undefined if it doesn't exist.
  */
-const ELIGIBLE_STAGES: readonly TaskStage[] = ["plan-review", "plan-updated"];
+async function statIfExists(
+  fileUri: vscode.Uri
+): Promise<vscode.FileStat | undefined> {
+  try {
+    return await vscode.workspace.fs.stat(fileUri);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Stages a task may be in for plan update to be safe: a first-round review
+ * exists with no update yet, the task is still at the plan-updated stage
+ * (regenerating plan-updated.md in place), or a second-round review of the
+ * update exists (revising plan-updated.md again). Later stages are excluded
+ * so this command can never regress a task's progress or leave stale
+ * downstream artifacts behind.
+ */
+const ELIGIBLE_STAGES: readonly TaskStage[] = [
+  "plan-review",
+  "plan-updated",
+  "plan-updated-review",
+];
 
 /**
  * Generate plan-updated.md for a task folder's plan.md and
@@ -57,37 +75,96 @@ export async function updatePlanWithAI(
     return;
   }
 
-  const planFileUri = vscode.Uri.joinPath(taskFolderUri, "plan.md");
+  // Which review to revise against is a second-round review
+  // (plan-updated-review.md, revising plan-updated.md) if EITHER:
+  //  - the task is currently tracked at plan-updated-review, or
+  //  - the task is tracked at plan-updated AND plan-updated-review.md
+  //    exists and postdates plan-updated.md (the case after Resume Task's
+  //    "Revise plan-updated.md again", which resets the stage to
+  //    plan-updated but leaves a real, already-written
+  //    plan-updated-review.md on disk).
+  // The mtime fallback is deliberately scoped to the plan-updated stage
+  // only: AI Helper: Set Task Stage lets a user explicitly rewind a task
+  // (e.g. back to plan-review, to redo the first update from scratch), and
+  // that override must win even if a later plan-updated-review.md still
+  // happens to sit on disk — otherwise the explicit rewind would be
+  // silently ignored.
+  // Once "second round" is selected, the command commits to that source
+  // and must error rather than silently fall back to the stale first-round
+  // plan.md/plan-review.md if plan-updated-review.md turns out to be
+  // missing or empty (e.g. Resume Task just created a blank one).
+  const planUpdatedFileUriForMtime = vscode.Uri.joinPath(
+    taskFolderUri,
+    "plan-updated.md"
+  );
+  const planUpdatedReviewFileUriForMtime = vscode.Uri.joinPath(
+    taskFolderUri,
+    "plan-updated-review.md"
+  );
+  const [progressForSource, planUpdatedReviewContentForMtime, planUpdatedStat, planUpdatedReviewStat] =
+    await Promise.all([
+      readTaskProgress(taskFolderUri),
+      readIfExists(planUpdatedReviewFileUriForMtime),
+      statIfExists(planUpdatedFileUriForMtime),
+      statIfExists(planUpdatedReviewFileUriForMtime),
+    ]);
+  const reviewPostdatesUpdate =
+    !!planUpdatedReviewStat &&
+    !!planUpdatedStat &&
+    planUpdatedReviewStat.mtime >= planUpdatedStat.mtime;
+  const usingUpdatedReview =
+    progressForSource?.currentStage === "plan-updated-review" ||
+    (progressForSource?.currentStage === "plan-updated" &&
+      !!planUpdatedReviewContentForMtime &&
+      reviewPostdatesUpdate);
+
+  const basePlanFileUri = vscode.Uri.joinPath(
+    taskFolderUri,
+    usingUpdatedReview ? "plan-updated.md" : "plan.md"
+  );
   let planContent: string;
   try {
-    const content = await vscode.workspace.fs.readFile(planFileUri);
+    const content = await vscode.workspace.fs.readFile(basePlanFileUri);
     planContent = new TextDecoder().decode(content).trim();
     if (planContent.length === 0) {
       throw new Error("empty");
     }
   } catch {
     void vscode.window.showWarningMessage(
-      "No plan.md found (or it is empty) for this task. Generate a plan before requesting an update."
+      usingUpdatedReview
+        ? "No plan-updated.md found (or it is empty) for this task."
+        : "No plan.md found (or it is empty) for this task. Generate a plan before requesting an update."
     );
     return;
   }
 
-  const planReviewFileUri = vscode.Uri.joinPath(
-    taskFolderUri,
-    "plan-review.md"
-  );
   let planReviewContent: string;
-  try {
-    const content = await vscode.workspace.fs.readFile(planReviewFileUri);
-    planReviewContent = new TextDecoder().decode(content).trim();
-    if (planReviewContent.length === 0) {
-      throw new Error("empty");
+  if (usingUpdatedReview) {
+    const trimmed = planUpdatedReviewContentForMtime?.trim() ?? "";
+    if (trimmed.length === 0) {
+      void vscode.window.showWarningMessage(
+        "No plan-updated-review.md found (or it is empty) for this task. Review the updated plan before requesting another revision."
+      );
+      return;
     }
-  } catch {
-    void vscode.window.showWarningMessage(
-      "No plan-review.md found (or it is empty) for this task. Review the plan before requesting an update."
+    planReviewContent = trimmed;
+  } else {
+    const planReviewFileUri = vscode.Uri.joinPath(
+      taskFolderUri,
+      "plan-review.md"
     );
-    return;
+    try {
+      const content = await vscode.workspace.fs.readFile(planReviewFileUri);
+      planReviewContent = new TextDecoder().decode(content).trim();
+      if (planReviewContent.length === 0) {
+        throw new Error("empty");
+      }
+    } catch {
+      void vscode.window.showWarningMessage(
+        "No plan-review.md found (or it is empty) for this task. Review the plan before requesting an update."
+      );
+      return;
+    }
   }
 
   const runner = new CopilotLanguageModelRunner();

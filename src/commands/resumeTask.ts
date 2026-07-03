@@ -302,13 +302,19 @@ async function resumeFromStage(
       await writeTaskProgress(taskFolderUri, currentProgress);
     }
 
-    // Step 5: Handle "plan-updated-review" stage - prompt for plan-final.md
+    // Step 5: Handle "plan-updated-review" stage - prompt for plan-final.md,
+    // or loop back to revise plan-updated.md again if the review wasn't
+    // satisfactory.
     if (
       getStageIndex(currentProgress.currentStage) <=
       getStageIndex("plan-updated-review")
     ) {
       const createFinal = await vscode.window.showQuickPick(
-        ["Create plan-final.md", "Dismiss re-review"],
+        [
+          "Create plan-final.md",
+          "Revise plan-updated.md again",
+          "Dismiss re-review",
+        ],
         {
           placeHolder: "Would you like to create the final plan?",
           title: "Final Plan",
@@ -317,6 +323,22 @@ async function resumeFromStage(
 
       // Cancelled: keep current stage so the task can be resumed later
       if (!createFinal) {
+        return currentProgress.taskFolder;
+      }
+
+      if (createFinal === "Revise plan-updated.md again") {
+        // Send the task back to "plan-updated" so the update/review cycle
+        // can repeat: edit plan-updated.md (or re-run Update Plan with AI,
+        // which now reads plan-updated-review.md), then review it again.
+        const doc = await vscode.workspace.openTextDocument(
+          planUpdatedFileUri
+        );
+        await vscode.window.showTextDocument(doc);
+        currentProgress = updateTaskProgressStage(
+          currentProgress,
+          "plan-updated"
+        );
+        await writeTaskProgress(taskFolderUri, currentProgress);
         return currentProgress.taskFolder;
       }
 
