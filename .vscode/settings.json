@@ -4,5 +4,8 @@
   "editor.codeActionsOnSave": {
     "source.fixAll.eslint": "explicit"
   },
-  "eslint.validate": ["typescript"]
+  "eslint.validate": [
+    "typescript"
+  ],
+  "vs-code-ai-helper.metaResourcesPath": "plans"
 }
