@@ -52,6 +52,10 @@
       {
         "command": "vs-code-ai-helper.reviewUpdatedPlanWithAI",
         "title": "AI Helper: Review Updated Plan with AI"
+      },
+      {
+        "command": "vs-code-ai-helper.setTaskStage",
+        "title": "AI Helper: Set Task Stage"
       }
     ],
     "configuration": {

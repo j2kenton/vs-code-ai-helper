@@ -39,6 +39,7 @@ Everything the extension writes is a plain Markdown or JSON file in your task fo
 | `AI Helper: Review Plan with AI` | Uses Copilot to critique the existing `plan.md` and write `plan-review.md`. Only offered once a plan exists. |
 | `AI Helper: Update Plan with AI` | Uses Copilot to revise the plan based on `plan-review.md`, writing `plan-updated.md`. Only offered once a plan review exists. |
 | `AI Helper: Review Updated Plan with AI` | Uses Copilot to critique `plan-updated.md`, writing `plan-updated-review.md`. Only offered once an updated plan exists. |
+| `AI Helper: Set Task Stage` | Manually set which stage a task is tracked at, moving it backward or forward. Use this when the auto-tracked stage has gotten ahead of where you actually are. Only changes `task-progress.json` — it doesn't touch or delete any artifact files. |
 | `AI Helper: Hello World` | Sanity-check command confirming the extension is active. |
 
 Every "with AI" command asks for confirmation before overwriting an existing artifact, is only offered when the task is at (or just past) the right stage — so it can never regress a task or clobber later-stage work — and falls back with a clear message (no crash, no silent failure) if Copilot isn't signed in, has no available model, or you're out of quota. The manual `Start New Task` / `Resume Task` flow always works regardless. Promoting a plan to `plan-final.md` is intentionally not automatable yet — it's the one human approval gate the workflow always stops for.

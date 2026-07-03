@@ -102,7 +102,21 @@ export function updateTaskProgressStage(
 export async function findIncompleteTasks(
   metaFolderUri: vscode.Uri
 ): Promise<IncompleteTask[]> {
-  const incompleteTasks: IncompleteTask[] = [];
+  const allTasks = await findAllTasks(metaFolderUri);
+  return allTasks.filter((task) => task.progress.currentStage !== "completed");
+}
+
+/**
+ * Find all tasks in the meta folder, regardless of stage (including completed
+ * tasks). Used by flows that need to let the user pick any task, such as
+ * jumping the stage backward or forward.
+ * @param metaFolderUri - URI of the meta resources folder
+ * @returns Array of tasks, sorted by most recent first
+ */
+export async function findAllTasks(
+  metaFolderUri: vscode.Uri
+): Promise<IncompleteTask[]> {
+  const tasks: IncompleteTask[] = [];
 
   try {
     const entries = await vscode.workspace.fs.readDirectory(metaFolderUri);
@@ -112,8 +126,8 @@ export async function findIncompleteTasks(
         const folderUri = vscode.Uri.joinPath(metaFolderUri, name);
         const progress = await readTaskProgress(folderUri);
 
-        if (progress && progress.currentStage !== "completed") {
-          incompleteTasks.push({
+        if (progress) {
+          tasks.push({
             folderUri,
             folderName: name,
             progress,
@@ -123,7 +137,7 @@ export async function findIncompleteTasks(
     }
 
     // Sort by updatedAt descending (most recent first)
-    incompleteTasks.sort((a, b) => {
+    tasks.sort((a, b) => {
       return (
         new Date(b.progress.updatedAt).getTime() -
         new Date(a.progress.updatedAt).getTime()
@@ -133,5 +147,5 @@ export async function findIncompleteTasks(
     // Directory might not exist or be inaccessible
   }
 
-  return incompleteTasks;
+  return tasks;
 }
