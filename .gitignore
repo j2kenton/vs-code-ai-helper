@@ -10,6 +10,9 @@ out/
 *.log
 npm-debug.log*
 
+# Local planning artifacts
+plans/
+
 # IDE
 .idea/
 *.swp
