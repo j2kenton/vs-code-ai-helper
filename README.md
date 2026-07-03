@@ -22,8 +22,8 @@ https://marketplace.visualstudio.com/items?itemName=j2kenton.vs-code-ai-helper
    - Write `plan.md` yourself, or
    - Run `AI Helper: Generate Plan with AI` to have Copilot draft it from your `task.md` and currently open editors in the workspace.
 4. **Review the plan.** Either write `plan-review.md` yourself, or run `AI Helper: Review Plan with AI` to have Copilot critique the plan for blocking issues, gaps, and scope creep.
-5. **Iterate if needed**, producing `plan-updated.md` and `plan-updated-review.md` through the same prompts (manual editing today; AI-assisted updates are on the roadmap).
-6. **Finalize.** Once you're happy with a plan, the workflow copies it to `plan-final.md` and marks the task `completed`.
+5. **Iterate if needed.** Either write `plan-updated.md` yourself, or run `AI Helper: Update Plan with AI` to have Copilot revise the plan based on the review. Then either write `plan-updated-review.md` yourself, or run `AI Helper: Review Updated Plan with AI` to have Copilot review the revision. Repeat manually as many times as you need.
+6. **Finalize.** Once you're happy with a plan, the workflow copies it to `plan-final.md` and marks the task `completed`. Promoting to `plan-final.md` is always a manual, human step — no command auto-approves a plan.
 7. **Come back later.** If you stop partway through (or just close VS Code), run `AI Helper: Resume Task` — it picks up exactly where you left off, using `task-progress.json` to know the current stage.
 
 Everything the extension writes is a plain Markdown or JSON file in your task folder, so you can read, edit, or hand it to a different tool at any point — nothing is locked into the extension.
@@ -37,9 +37,11 @@ Everything the extension writes is a plain Markdown or JSON file in your task fo
 | `AI Helper: Resume Task` | Lists incomplete tasks and continues the manual workflow from wherever it was left off. |
 | `AI Helper: Generate Plan with AI` | Uses your Copilot access to draft `plan.md` from `task.md` and a generated `context-pack.md`. Only offered for tasks that don't have a plan yet (or are re-generating the current one), so it can't overwrite later-stage work. |
 | `AI Helper: Review Plan with AI` | Uses Copilot to critique the existing `plan.md` and write `plan-review.md`. Only offered once a plan exists. |
+| `AI Helper: Update Plan with AI` | Uses Copilot to revise the plan based on `plan-review.md`, writing `plan-updated.md`. Only offered once a plan review exists. |
+| `AI Helper: Review Updated Plan with AI` | Uses Copilot to critique `plan-updated.md`, writing `plan-updated-review.md`. Only offered once an updated plan exists. |
 | `AI Helper: Hello World` | Sanity-check command confirming the extension is active. |
 
-The two "with AI" commands ask for confirmation before overwriting an existing `plan.md`/`plan-review.md`, and fall back with a clear message (no crash, no silent failure) if Copilot isn't signed in, has no available model, or you're out of quota — the manual `Start New Task` / `Resume Task` flow always works regardless.
+Every "with AI" command asks for confirmation before overwriting an existing artifact, is only offered when the task is at (or just past) the right stage — so it can never regress a task or clobber later-stage work — and falls back with a clear message (no crash, no silent failure) if Copilot isn't signed in, has no available model, or you're out of quota. The manual `Start New Task` / `Resume Task` flow always works regardless. Promoting a plan to `plan-final.md` is intentionally not automatable yet — it's the one human approval gate the workflow always stops for.
 
 ## What gets created in a task folder
 
@@ -50,7 +52,7 @@ YYYY-MM-DD_task_N/
 ├── context-pack.md        # Auto-generated snapshot sent to Copilot (workspace root, open files, task.md)
 ├── plan.md                # Initial plan
 ├── plan-review.md         # Review of the initial plan
-├── plan-updated.md        # Revised plan (manual, after review)
+├── plan-updated.md        # Revised plan, after review
 ├── plan-updated-review.md # Review of the revised plan
 ├── plan-final.md          # The plan you settled on
 └── runs/

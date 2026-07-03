@@ -13,6 +13,8 @@ import { registerStartNewTaskCommand } from "./commands/startNewTask";
 import { registerResumeTaskCommand } from "./commands/resumeTask";
 import { registerGeneratePlanWithAICommand } from "./commands/generatePlanWithAI";
 import { registerReviewPlanWithAICommand } from "./commands/reviewPlanWithAI";
+import { registerUpdatePlanWithAICommand } from "./commands/updatePlanWithAI";
+import { registerReviewUpdatedPlanWithAICommand } from "./commands/reviewUpdatedPlanWithAI";
 
 /**
  * Button labels for the prompts
@@ -84,6 +86,8 @@ export function activate(context: vscode.ExtensionContext): void {
   registerResumeTaskCommand(context);
   registerGeneratePlanWithAICommand(context);
   registerReviewPlanWithAICommand(context);
+  registerUpdatePlanWithAICommand(context);
+  registerReviewUpdatedPlanWithAICommand(context);
 
   // Register the hello world command (keeping for now)
   const helloWorldDisposable = vscode.commands.registerCommand(

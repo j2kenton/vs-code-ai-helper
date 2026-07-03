@@ -2,9 +2,12 @@ import * as vscode from "vscode";
 
 /**
  * The workflow stage an agent run is producing output for.
- * Phase 1 only exercises "plan" and "plan-review".
  */
-export type AgentWorkflowStage = "plan" | "plan-review";
+export type AgentWorkflowStage =
+  | "plan"
+  | "plan-review"
+  | "plan-updated"
+  | "plan-updated-review";
 
 /**
  * Capabilities a given AgentRunner supports. Phase 1 runners only need

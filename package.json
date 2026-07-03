@@ -44,6 +44,14 @@
       {
         "command": "vs-code-ai-helper.reviewPlanWithAI",
         "title": "AI Helper: Review Plan with AI"
+      },
+      {
+        "command": "vs-code-ai-helper.updatePlanWithAI",
+        "title": "AI Helper: Update Plan with AI"
+      },
+      {
+        "command": "vs-code-ai-helper.reviewUpdatedPlanWithAI",
+        "title": "AI Helper: Review Updated Plan with AI"
       }
     ],
     "configuration": {
