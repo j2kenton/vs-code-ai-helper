@@ -11,6 +11,8 @@ import {
 } from "./commands/selectMetaFolder";
 import { registerStartNewTaskCommand } from "./commands/startNewTask";
 import { registerResumeTaskCommand } from "./commands/resumeTask";
+import { registerGeneratePlanWithAICommand } from "./commands/generatePlanWithAI";
+import { registerReviewPlanWithAICommand } from "./commands/reviewPlanWithAI";
 
 /**
  * Button labels for the prompts
@@ -80,6 +82,8 @@ export function activate(context: vscode.ExtensionContext): void {
   registerSelectMetaFolderCommand(context);
   registerStartNewTaskCommand(context);
   registerResumeTaskCommand(context);
+  registerGeneratePlanWithAICommand(context);
+  registerReviewPlanWithAICommand(context);
 
   // Register the hello world command (keeping for now)
   const helloWorldDisposable = vscode.commands.registerCommand(

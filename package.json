@@ -10,7 +10,7 @@
     "url": "https://github.com/j2kenton/vs-code-ai-helper.git"
   },
   "engines": {
-    "vscode": "^1.85.0"
+    "vscode": "^1.93.0"
   },
   "categories": [
     "Other",
@@ -36,6 +36,14 @@
       {
         "command": "vs-code-ai-helper.resumeTask",
         "title": "AI Helper: Resume Task"
+      },
+      {
+        "command": "vs-code-ai-helper.generatePlanWithAI",
+        "title": "AI Helper: Generate Plan with AI"
+      },
+      {
+        "command": "vs-code-ai-helper.reviewPlanWithAI",
+        "title": "AI Helper: Review Plan with AI"
       }
     ],
     "configuration": {
@@ -75,7 +83,7 @@
   },
   "devDependencies": {
     "@types/node": "^20.10.0",
-    "@types/vscode": "^1.85.0",
+    "@types/vscode": "^1.93.0",
     "@typescript-eslint/eslint-plugin": "^6.13.0",
     "@typescript-eslint/parser": "^6.13.0",
     "@vscode/test-cli": "^0.0.4",

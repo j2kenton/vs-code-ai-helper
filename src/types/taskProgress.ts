@@ -11,6 +11,21 @@ export type TaskStage =
   | "completed";
 
 /**
+ * The filename for the task request/scope artifact
+ */
+export const TASK_FILENAME = "task.md";
+
+/**
+ * The filename for the generated context pack artifact
+ */
+export const CONTEXT_PACK_FILENAME = "context-pack.md";
+
+/**
+ * The directory name for per-run agent logs
+ */
+export const RUNS_DIRNAME = "runs";
+
+/**
  * Tracks the progress of a task through the planning workflow
  */
 export interface TaskProgress {

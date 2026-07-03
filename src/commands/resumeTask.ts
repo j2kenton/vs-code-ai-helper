@@ -7,6 +7,7 @@ import {
   TaskProgress,
   TaskStage,
   STAGE_DISPLAY_NAMES,
+  TASK_FILENAME,
 } from "../types/taskProgress";
 import {
   findIncompleteTasks,
@@ -160,6 +161,7 @@ async function resumeFromStage(
     );
   };
 
+  const taskFileUri = vscode.Uri.joinPath(taskFolderUri, TASK_FILENAME);
   const planFileUri = vscode.Uri.joinPath(taskFolderUri, "plan.md");
   const planReviewFileUri = vscode.Uri.joinPath(
     taskFolderUri,
@@ -179,8 +181,11 @@ async function resumeFromStage(
   const currentStageIndex = getStageIndex(currentProgress.currentStage);
 
   try {
-    // Step 1: Handle "created" stage - prompt for plan.md
+    // Step 1: Handle "created" stage - ensure task.md exists, then prompt
+    // for plan.md
     if (currentStageIndex <= getStageIndex("created")) {
+      await createAndOpenFile(taskFileUri);
+
       const createPlan = await vscode.window.showQuickPick(
         ["Create plan.md", "Quit"],
         {

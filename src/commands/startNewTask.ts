@@ -3,7 +3,7 @@ import {
   getMetaResourcesPath,
   hasValidMetaResourcesPath,
 } from "../config/settings";
-import { TaskProgress } from "../types/taskProgress";
+import { TaskProgress, TASK_FILENAME } from "../types/taskProgress";
 import {
   createTaskProgress,
   updateTaskProgressStage,
@@ -135,6 +135,7 @@ export async function startNewTask(): Promise<string | undefined> {
       );
     };
 
+    const taskFileUri = vscode.Uri.joinPath(taskFolderUri, TASK_FILENAME);
     const planFileUri = vscode.Uri.joinPath(taskFolderUri, "plan.md");
     const planReviewFileUri = vscode.Uri.joinPath(
       taskFolderUri,
@@ -152,6 +153,10 @@ export async function startNewTask(): Promise<string | undefined> {
       taskFolderUri,
       "plan-final.md"
     );
+
+    // Step 1: Create task.md so the request, scope, and constraints are
+    // captured before any plan is generated (manually or with AI).
+    await createAndOpenFile(taskFileUri);
 
     // Step 2: Prompt for plan.md
     const createPlan = await vscode.window.showQuickPick(
