@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import {
+  migrateStage,
   TaskProgress,
   TaskStage,
   TASK_PROGRESS_FILENAME,
@@ -30,7 +31,11 @@ export async function readTaskProgress(
   try {
     const content = await vscode.workspace.fs.readFile(progressFileUri);
     const json = new TextDecoder().decode(content);
-    return JSON.parse(json) as TaskProgress;
+    const progress = JSON.parse(json) as TaskProgress;
+    // Migrate stage names written by pre-0.6.0 versions; the migrated
+    // value is persisted the next time the stage changes.
+    progress.currentStage = migrateStage(String(progress.currentStage));
+    return progress;
   } catch {
     // File doesn't exist or is invalid
     return undefined;

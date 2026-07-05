@@ -1,6 +1,15 @@
 # VS Code AI Helper
 
-VS Code AI Helper turns ad-hoc "let's plan this out" conversations into a repeatable, file-based workflow. Every task gets its own dated folder with a task description, a plan, plan reviews, and a final approved plan — either written by hand or generated with your existing GitHub Copilot subscription, no API key required.
+VS Code AI Helper turns ad-hoc "let's plan this out" conversations into a repeatable, file-based workflow. Every task gets its own dated folder and moves through a fixed pipeline — task description, plan, high- and low-level plan reviews, final plan, implementation checklist, and high- and low-level implementation reviews — with every artifact written by hand or generated with your existing GitHub Copilot subscription, no API key required.
+
+The pipeline:
+
+```text
+Task Created → Plan → Plan: High-Level Review → Plan: Low-Level Review
+→ Final Plan → Implementation → Impl: High-Level Review → Impl: Low-Level Review → Completed
+```
+
+There is one plan file (`plan.md`) that gets revised **in place** when you apply a review — no forked "updated plan" copies to keep track of. Implementation reviews send the contents of your open editors to Copilot along with the final plan, so the AI assesses what's *actually implemented* versus outstanding, not just what the plan says.
 
 ## Marketplace
 
@@ -18,14 +27,19 @@ https://marketplace.visualstudio.com/items?itemName=j2kenton.vs-code-ai-helper
 
 1. **Point the extension at a folder.** Run `AI Helper: Select Meta Resources Folder` from the Command Palette (`Ctrl+Shift+P` / `Cmd+Shift+P`) and choose a folder inside your workspace (e.g. `.ai-helper/` or `docs/tasks/`). This is where all task folders will be created.
 2. **Start a task.** Run `AI Helper: Start New Task`. This creates a folder named `YYYY-MM-DD_task_N` (numbered per day) and opens `task.md` for you to describe what you want done — the goal, scope, and any constraints.
-3. **Get a plan.** Either:
-   - Write `plan.md` yourself, or
-   - Run `AI Helper: Generate Plan with AI` to have Copilot draft it from your `task.md` and currently open editors in the workspace.
-4. **Review the plan.** Either write `plan-review.md` yourself, or run `AI Helper: Review Plan with AI` to have Copilot critique the plan for blocking issues, gaps, and scope creep.
-5. **Iterate if needed.** Either write `plan-updated.md` yourself, or run `AI Helper: Update Plan with AI` to have Copilot revise the plan based on the review. Then either write `plan-updated-review.md` yourself, or run `AI Helper: Review Updated Plan with AI` to have Copilot review the revision.
-6. **Not happy with the revision? Loop again.** If `plan-updated-review.md` still isn't satisfactory, revise `plan-updated.md` again (by hand, or by re-running `AI Helper: Update Plan with AI` — once a `plan-updated-review.md` exists, it automatically picks that up as the review to address, instead of the original `plan-review.md`), then re-run `AI Helper: Review Updated Plan with AI`. Repeat as many rounds as you need; `plan-updated.md` and `plan-updated-review.md` are simply overwritten each round (previous rounds are still visible in `runs/` if you want the history). If you're using `AI Helper: Resume Task`, the picker at this stage offers "Revise plan-updated.md again" to send you straight back into this loop.
-7. **Finalize.** Once you're happy with a plan, copy it to `plan-final.md` and mark the task done — `AI Helper: Resume Task` offers to do this for you ("Create plan-final.md" or "Dismiss re-review" to use `plan-updated.md` as-is). Promoting to `plan-final.md` is always a manual, human step — no command auto-approves a plan.
-8. **Come back later.** If you stop partway through (or just close VS Code), run `AI Helper: Resume Task` — it picks up exactly where you left off, using `task-progress.json` to know the current stage.
+3. **Get a plan.** Either write `plan.md` yourself, or run `AI Helper: Generate Plan with AI` to have Copilot draft it from your `task.md` and currently open editors in the workspace.
+4. **High-level review.** Run `AI Helper: Run Review with AI` (or write `plan-high-review.md` yourself) to critique the plan's overall approach and scope. While on a review stage you have four actions — in the Tasks view they're buttons on the task row:
+   - **View Review** — open the review file.
+   - **Reply to Review** — open a `-reply.md` file where you push back on or clarify review points; it's sent to the AI along with the review.
+   - **Apply Review with AI** — Copilot rewrites `plan.md` in place, addressing the review (and your reply, if any). Re-run the review afterwards if you want another pass.
+   - **Next Stage** — happy with the plan? Move on.
+5. **Low-level review.** Same actions, but the review (`plan-low-review.md`) critiques the details: step ordering, named files, edge cases, verifiable acceptance criteria.
+6. **Finalize.** `Next Stage` from the low-level review offers to promote the current plan to `plan-final.md`. Promoting is always a deliberate, human step — no command auto-approves a plan.
+7. **Implement.** Run `AI Helper: Generate Implementation Checklist with AI` to turn `plan-final.md` into `implementation.md` — a concrete `- [ ]` checklist. Do the work.
+8. **Implementation reviews.** Run the high-level then low-level implementation reviews: Copilot receives the final plan, the checklist, and the **contents of your open editors**, and reports per item what's implemented, partial, or missing. Apply a review to update the checklist's checkboxes and notes in place. When the low-level review is clean, `Next Stage` marks the task completed.
+9. **Come back later.** If you stop partway through (or just close VS Code), run `AI Helper: Resume Task` (or click the task in the Tasks view) — it shows the actions relevant to the task's current stage, using `task-progress.json` to know where you are.
+
+Tasks created with versions before 0.6.0 still work: old stage names are migrated automatically, and a legacy `plan-updated.md` is treated as the current plan until the first in-place update writes `plan.md`.
 
 Everything the extension writes is a plain Markdown or JSON file in your task folder, so you can read, edit, or hand it to a different tool at any point — nothing is locked into the extension.
 
@@ -33,10 +47,10 @@ Everything the extension writes is a plain Markdown or JSON file in your task fo
 
 Click the AI Helper icon in the Activity Bar to open the **Tasks** view — a persistent, always-up-to-date checklist of where every task stands, so you don't have to re-run a command just to check progress:
 
-- Each task shows its current stage and step count (e.g. `Plan Review · step 3 of 7`) directly in the tree.
-- Expand a task to see all 7 workflow stages, each marked done ✓, current →, or outstanding ○. Click a stage to open its artifact file directly (if it's been created).
+- Each task shows its current stage and step count (e.g. `Plan: High-Level Review · step 3 of 9`) directly in the tree.
+- Expand a task to see all 9 workflow stages, each marked done ✓, current →, or outstanding ○. Click a stage to open its artifact file directly (if it's been created).
 - The most recently updated active task auto-expands so you land on the relevant checklist immediately.
-- Inline buttons let you **Resume** or **Set Stage** for a task without leaving the view.
+- Inline buttons let you **Resume** or **Set Stage** for a task without leaving the view. On review stages, the task row (and the current stage row) instead show the review actions: **View**, **Reply**, **Apply**, and **Next Stage** (with **Run Review with AI** in the right-click menu).
 - The view refreshes automatically whenever a task's `task-progress.json` changes — no manual refresh needed (though a refresh button is there too).
 
 A matching status bar item (bottom-left) always shows your most recently active task and its stage, and jumps into `Resume Task` when clicked — so progress is visible even with the sidebar closed.
@@ -46,32 +60,37 @@ A matching status bar item (bottom-left) always shows your most recently active 
 | Command | What it does |
 | --- | --- |
 | `AI Helper: Select Meta Resources Folder` | Choose where task folders are stored for this workspace. Run this once per workspace before anything else. |
-| `AI Helper: Start New Task` | Creates a new `YYYY-MM-DD_task_N` folder, opens `task.md`, then walks you through the manual plan → review → update → final-plan prompts. |
-| `AI Helper: Resume Task` | Lists incomplete tasks and continues the manual workflow from wherever it was left off. |
-| `AI Helper: Generate Plan with AI` | Uses your Copilot access to draft `plan.md` from `task.md` and a generated `context-pack.md`. Only offered for tasks that don't have a plan yet (or are re-generating the current one), so it can't overwrite later-stage work. |
-| `AI Helper: Review Plan with AI` | Uses Copilot to critique the existing `plan.md` and write `plan-review.md`. Only offered once a plan exists. |
-| `AI Helper: Update Plan with AI` | Uses Copilot to revise the plan, writing `plan-updated.md`. Reads `plan-updated-review.md` (and revises `plan-updated.md`) if one exists, otherwise falls back to `plan-review.md` (and revises `plan.md`) — so re-running it after a second review keeps building on the latest revision. Only offered once a relevant review exists. |
-| `AI Helper: Review Updated Plan with AI` | Uses Copilot to critique `plan-updated.md`, writing `plan-updated-review.md`. Only offered once an updated plan exists. |
-| `AI Helper: Set Task Stage` | Manually set which stage a task is tracked at, moving it backward or forward. Use this when the auto-tracked stage has gotten ahead of where you actually are. Only changes `task-progress.json` — it doesn't touch or delete any artifact files. |
+| `AI Helper: Start New Task` | Creates a new `YYYY-MM-DD_task_N` folder with progress tracking and opens `task.md`. From there, use the Tasks view or `Resume Task` for the per-stage actions. |
+| `AI Helper: Resume Task` | Shows the actions relevant to a task's current stage — open the artifact, run/apply reviews, advance — instead of a forced wizard. |
+| `AI Helper: Generate Plan with AI` | Uses your Copilot access to draft `plan.md` from `task.md` and a generated `context-pack.md`. Only offered before later-stage work exists, so it can't clobber it. |
+| `AI Helper: Run Review with AI` | Runs the review for wherever the task is: from `plan`/`implementation` it starts the high-level review (and advances the stage); from a review stage it (re)generates that stage's review. Implementation reviews include your open editors' contents so the code itself gets assessed. |
+| `AI Helper: View Review` | Opens the current stage's review file; offers to run the review if it doesn't exist yet. |
+| `AI Helper: Reply to Review` | Opens a `-reply.md` file for the current review where you push back or clarify; it's sent to the AI when you Apply. |
+| `AI Helper: Apply Review with AI` | Copilot rewrites the plan (plan reviews) or the implementation checklist (implementation reviews) **in place**, addressing the review and your reply. Asks for confirmation first. |
+| `AI Helper: Next Stage` | Advances the task one stage, with confirmation. Entering Final Plan offers to promote the current plan to `plan-final.md`; entering Completed asks explicitly. |
+| `AI Helper: Generate Implementation Checklist with AI` | Turns `plan-final.md` into `implementation.md`, a concrete `- [ ]` checklist with a Verification section. |
+| `AI Helper: Set Task Stage` | Manually set which stage a task is tracked at, moving it backward or forward. Only changes `task-progress.json` — it doesn't touch or delete any artifact files. |
 | `AI Helper: Refresh Tasks View` | Manually refresh the Tasks sidebar (it also refreshes automatically on its own). |
 | `AI Helper: Hello World` | Sanity-check command confirming the extension is active. |
 
-Every "with AI" command asks for confirmation before overwriting an existing artifact, is only offered when the task is at (or just past) the right stage — so it can never regress a task or clobber later-stage work — and falls back with a clear message (no crash, no silent failure) if Copilot isn't signed in, has no available model, or you're out of quota. The manual `Start New Task` / `Resume Task` flow always works regardless. Promoting a plan to `plan-final.md` is intentionally not automatable yet — it's the one human approval gate the workflow always stops for.
+Every "with AI" command asks for confirmation before overwriting an existing artifact, is only offered when the task is at a stage the action applies to, and falls back with a clear message (no crash, no silent failure) if Copilot isn't signed in, has no available model, or you're out of quota. Every AI action has a manual counterpart — the workflow never requires Copilot. Promoting a plan to `plan-final.md` and marking a task completed are intentionally explicit, human steps.
 
 ## What gets created in a task folder
 
-```
+```text
 YYYY-MM-DD_task_N/
-├── task-progress.json    # Machine-readable stage tracker (used by Resume Task)
-├── task.md                # Your request: goal, scope, constraints
-├── context-pack.md        # Auto-generated snapshot sent to Copilot (workspace root, open files, task.md)
-├── plan.md                # Initial plan
-├── plan-review.md         # Review of the initial plan
-├── plan-updated.md        # Revised plan, after review
-├── plan-updated-review.md # Review of the revised plan
-├── plan-final.md          # The plan you settled on
+├── task-progress.json         # Machine-readable stage tracker
+├── task.md                    # Your request: goal, scope, constraints
+├── context-pack.md            # Auto-generated snapshot sent to Copilot (incl. open-file contents for impl reviews)
+├── plan.md                    # THE plan — revised in place when reviews are applied
+├── plan-high-review.md        # High-level review of the plan (+ optional -reply.md)
+├── plan-low-review.md         # Low-level review of the plan (+ optional -reply.md)
+├── plan-final.md              # The approved plan (human-promoted)
+├── implementation.md          # Checklist derived from the final plan, checked off as reviews confirm items
+├── impl-high-review.md        # High-level implementation review (+ optional -reply.md)
+├── impl-low-review.md         # Low-level implementation review (+ optional -reply.md)
 └── runs/
-    └── 001-copilot-lm-plan.md   # Log of each AI run: prompt sent + result
+    └── 001-copilot-lm-plan.md # Log of each AI run: prompt sent + result
 ```
 
 `runs/` gives you a paper trail of exactly what was asked and what came back each time you use an AI command, separate from the artifact itself.

@@ -35,14 +35,19 @@ const ELIGIBLE_STAGES: readonly TaskStage[] = ["created", "plan"];
  * Generate plan.md for a task folder using the user's Copilot access.
  * Falls back to informing the user when Copilot is unavailable so the
  * manual planning workflow remains the fallback path.
+ *
+ * When `targetFolderUri` is given (e.g. right after creating or resuming a
+ * specific task), that task is used directly instead of prompting the user
+ * to pick one — otherwise, with multiple eligible tasks, the picker could
+ * silently generate the plan into the wrong folder.
  */
 export async function generatePlanWithAI(
-  extensionUri: vscode.Uri
+  extensionUri: vscode.Uri,
+  targetFolderUri?: vscode.Uri
 ): Promise<void> {
-  const taskFolderUri = await pickTaskFolder(
-    "Generate Plan with AI",
-    ELIGIBLE_STAGES
-  );
+  const taskFolderUri =
+    targetFolderUri ??
+    (await pickTaskFolder("Generate Plan with AI", ELIGIBLE_STAGES));
   if (!taskFolderUri) {
     return;
   }
@@ -174,7 +179,8 @@ export function registerGeneratePlanWithAICommand(
 ): void {
   const disposable = vscode.commands.registerCommand(
     "vs-code-ai-helper.generatePlanWithAI",
-    () => generatePlanWithAI(context.extensionUri)
+    (targetFolderUri?: vscode.Uri) =>
+      generatePlanWithAI(context.extensionUri, targetFolderUri)
   );
   context.subscriptions.push(disposable);
 }

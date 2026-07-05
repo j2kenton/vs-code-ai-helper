@@ -4,35 +4,215 @@ import {
   hasValidMetaResourcesPath,
 } from "../config/settings";
 import {
-  TaskProgress,
-  TaskStage,
+  isReviewStage,
+  PLAN_FILENAME,
+  STAGE_ARTIFACT_FILENAMES,
   STAGE_DISPLAY_NAMES,
   TASK_FILENAME,
+  TaskStage,
 } from "../types/taskProgress";
 import {
   findIncompleteTasks,
   IncompleteTask,
+  readTaskProgress,
   updateTaskProgressStage,
   writeTaskProgress,
 } from "../utils/taskProgressUtils";
+import { openOrCreateDocument, resolveCurrentPlanUri } from "../utils/fileUtils";
+
+interface StageAction {
+  label: string;
+  description?: string;
+  run: (taskFolderUri: vscode.Uri) => Promise<void>;
+}
 
 /**
- * Resume an incomplete task from where the user left off.
- * Returns the task folder name if resumed, undefined if cancelled/failed.
+ * Run another extension command, forwarding the task so pickers are skipped.
+ */
+function delegate(
+  commandId: string,
+  task: IncompleteTask
+): (taskFolderUri: vscode.Uri) => Promise<void> {
+  return async () => {
+    await vscode.commands.executeCommand(commandId, { task });
+  };
+}
+
+/**
+ * Open a stage's artifact file, creating it empty if needed, and advance
+ * the task to that stage if it is currently earlier in the workflow.
+ */
+function openArtifactAndSetStage(
+  filename: string,
+  stage: TaskStage
+): (taskFolderUri: vscode.Uri) => Promise<void> {
+  return async (taskFolderUri) => {
+    await openOrCreateDocument(vscode.Uri.joinPath(taskFolderUri, filename));
+    const progress = await readTaskProgress(taskFolderUri);
+    if (progress && progress.currentStage !== stage) {
+      await writeTaskProgress(
+        taskFolderUri,
+        updateTaskProgressStage(progress, stage)
+      );
+    }
+  };
+}
+
+/**
+ * Build the QuickPick actions relevant to a task's current stage. This is
+ * the manual/AI hybrid menu that replaces the old linear wizard: every AI
+ * action has a manual counterpart, and nothing advances without the user
+ * choosing it.
+ */
+function getStageActions(task: IncompleteTask): StageAction[] {
+  const stage = task.progress.currentStage;
+
+  if (stage === "created") {
+    return [
+      {
+        label: "$(edit) Open task.md",
+        description: "Describe the goal, scope, and constraints",
+        run: async (uri): Promise<void> => {
+          await openOrCreateDocument(vscode.Uri.joinPath(uri, TASK_FILENAME));
+        },
+      },
+      {
+        label: "$(sparkle) Generate Plan with AI",
+        run: async (uri): Promise<void> => {
+          await vscode.commands.executeCommand(
+            "vs-code-ai-helper.generatePlanWithAI",
+            uri
+          );
+        },
+      },
+      {
+        label: "$(file-add) Create plan.md manually",
+        run: openArtifactAndSetStage(PLAN_FILENAME, "plan"),
+      },
+    ];
+  }
+
+  if (stage === "plan") {
+    return [
+      {
+        label: "$(edit) Open the plan",
+        run: async (uri): Promise<void> => {
+          const planUri = await resolveCurrentPlanUri(uri);
+          const doc = await vscode.workspace.openTextDocument(planUri);
+          await vscode.window.showTextDocument(doc);
+        },
+      },
+      {
+        label: "$(sparkle) Run High-Level Review with AI",
+        run: delegate("vs-code-ai-helper.runReviewWithAI", task),
+      },
+      {
+        label: "$(file-add) Write high-level review manually",
+        run: openArtifactAndSetStage(
+          "plan-high-review.md",
+          "plan-high-review"
+        ),
+      },
+      {
+        label: "$(arrow-right) Next Stage",
+        run: delegate("vs-code-ai-helper.nextStage", task),
+      },
+    ];
+  }
+
+  if (isReviewStage(stage)) {
+    return [
+      {
+        label: "$(eye) View Review",
+        run: delegate("vs-code-ai-helper.viewReview", task),
+      },
+      {
+        label: "$(sparkle) Run / Re-run Review with AI",
+        run: delegate("vs-code-ai-helper.runReviewWithAI", task),
+      },
+      {
+        label: "$(comment) Reply to Review",
+        description: "Push back or clarify before applying",
+        run: delegate("vs-code-ai-helper.replyToReview", task),
+      },
+      {
+        label: "$(wand) Apply Review with AI",
+        description: "Rewrites the plan/checklist in place",
+        run: delegate("vs-code-ai-helper.applyReviewWithAI", task),
+      },
+      {
+        label: "$(arrow-right) Next Stage",
+        run: delegate("vs-code-ai-helper.nextStage", task),
+      },
+    ];
+  }
+
+  if (stage === "plan-final") {
+    return [
+      {
+        label: "$(edit) Open plan-final.md",
+        run: async (uri): Promise<void> => {
+          await openOrCreateDocument(
+            vscode.Uri.joinPath(uri, "plan-final.md")
+          );
+        },
+      },
+      {
+        label: "$(tasklist) Generate Implementation Checklist with AI",
+        run: delegate("vs-code-ai-helper.generateImplementationWithAI", task),
+      },
+      {
+        label: "$(arrow-right) Next Stage",
+        description: "Move on to implementation",
+        run: delegate("vs-code-ai-helper.nextStage", task),
+      },
+    ];
+  }
+
+  if (stage === "implementation") {
+    return [
+      {
+        label: "$(edit) Open implementation.md",
+        run: async (uri): Promise<void> => {
+          await openOrCreateDocument(
+            vscode.Uri.joinPath(uri, "implementation.md")
+          );
+        },
+      },
+      {
+        label: "$(tasklist) Generate Implementation Checklist with AI",
+        run: delegate("vs-code-ai-helper.generateImplementationWithAI", task),
+      },
+      {
+        label: "$(sparkle) Run High-Level Review with AI",
+        description: "Reviews your open files against the final plan",
+        run: delegate("vs-code-ai-helper.runReviewWithAI", task),
+      },
+      {
+        label: "$(arrow-right) Next Stage",
+        run: delegate("vs-code-ai-helper.nextStage", task),
+      },
+    ];
+  }
+
+  return [];
+}
+
+/**
+ * Resume a task: show the actions relevant to its current stage.
+ * Returns the task folder name if an action ran, undefined otherwise.
  *
- * When invoked from the tasks tree view, the tree node is passed in and the
- * task picker is skipped in favor of resuming that specific task.
+ * When invoked from the tasks tree view or status bar, the node is passed
+ * in and the task picker is skipped.
  */
 export async function resumeTask(node?: {
   task?: IncompleteTask;
 }): Promise<string | undefined> {
-  // Check if meta resources path is configured
   if (!hasValidMetaResourcesPath()) {
     const selection = await vscode.window.showErrorMessage(
       "No meta resources folder configured. Please set one first.",
       "Select Folder"
     );
-
     if (selection === "Select Folder") {
       await vscode.commands.executeCommand(
         "vs-code-ai-helper.selectMetaFolder"
@@ -41,29 +221,22 @@ export async function resumeTask(node?: {
     return undefined;
   }
 
-  const metaPath = getMetaResourcesPath();
-  const workspaceFolders = vscode.workspace.workspaceFolders;
-
-  if (!workspaceFolders || workspaceFolders.length === 0) {
+  const workspaceRoot = vscode.workspace.workspaceFolders?.[0];
+  if (!workspaceRoot) {
     void vscode.window.showErrorMessage(
       "No workspace folder open. Please open a folder first."
     );
     return undefined;
   }
 
-  const workspaceRoot = workspaceFolders[0];
-  if (!workspaceRoot) {
-    return undefined;
-  }
-
-  // Resolve the meta folder URI
-  const metaFolderUri = vscode.Uri.joinPath(workspaceRoot.uri, metaPath);
-
-  // Find incomplete tasks
+  const metaFolderUri = vscode.Uri.joinPath(
+    workspaceRoot.uri,
+    getMetaResourcesPath()
+  );
   const incompleteTasks = await findIncompleteTasks(metaFolderUri);
 
-  // If a specific task was passed in (e.g. from the tasks tree view), resume
-  // that one directly instead of showing the picker.
+  // If a specific task was passed in (e.g. from the tasks tree view), act
+  // on that one directly instead of showing the picker.
   const preselectedFolder = node?.task?.folderName;
   const preselectedTask = preselectedFolder
     ? incompleteTasks.find((task) => task.folderName === preselectedFolder)
@@ -83,19 +256,12 @@ export async function resumeTask(node?: {
     return undefined;
   }
 
-  // Let user select which task to resume
   let selectedTask: IncompleteTask;
-
   if (preselectedTask) {
     selectedTask = preselectedTask;
-  } else if (incompleteTasks.length === 1) {
-    const task = incompleteTasks[0];
-    if (!task) {
-      return undefined;
-    }
-    selectedTask = task;
+  } else if (incompleteTasks.length === 1 && incompleteTasks[0]) {
+    selectedTask = incompleteTasks[0];
   } else {
-    // Multiple incomplete tasks - show picker
     const items = incompleteTasks.map((task) => ({
       label: task.folderName,
       description: `Stage: ${STAGE_DISPLAY_NAMES[task.progress.currentStage]}`,
@@ -104,308 +270,52 @@ export async function resumeTask(node?: {
       ).toLocaleString()}`,
       task,
     }));
-
     const selected = await vscode.window.showQuickPick(items, {
       placeHolder: "Select a task to resume",
       title: "Resume Task",
     });
-
     if (!selected) {
       return undefined;
     }
-
     selectedTask = selected.task;
   }
 
-  void vscode.window.showInformationMessage(
-    `Resuming task: ${selectedTask.folderName} (${
-      STAGE_DISPLAY_NAMES[selectedTask.progress.currentStage]
-    })`
-  );
+  // Re-read progress from disk so a stale tree/status-bar node can't show
+  // actions for an outdated stage.
+  const freshProgress = await readTaskProgress(selectedTask.folderUri);
+  if (freshProgress) {
+    selectedTask = { ...selectedTask, progress: freshProgress };
+  }
 
-  // Resume from the current stage
-  return await resumeFromStage(selectedTask.folderUri, selectedTask.progress);
-}
-
-/**
- * Get the stage index for workflow progression
- */
-function getStageIndex(stage: TaskStage): number {
-  const stages: TaskStage[] = [
-    "created",
-    "plan",
-    "plan-review",
-    "plan-updated",
-    "plan-updated-review",
-    "plan-final",
-    "completed",
-  ];
-  return stages.indexOf(stage);
-}
-
-/**
- * Resume a task from its current stage
- */
-async function resumeFromStage(
-  taskFolderUri: vscode.Uri,
-  progress: TaskProgress
-): Promise<string | undefined> {
-  // Helper to copy file content
-  const copyFile = async (
-    sourceUri: vscode.Uri,
-    destUri: vscode.Uri
-  ): Promise<void> => {
-    const content = await vscode.workspace.fs.readFile(sourceUri);
-    await vscode.workspace.fs.writeFile(destUri, content);
-  };
-
-  // Helper to create empty file, open it, and copy path to clipboard
-  const createAndOpenFile = async (fileUri: vscode.Uri): Promise<void> => {
-    // Check if file already exists
-    try {
-      await vscode.workspace.fs.stat(fileUri);
-      // File exists, just open it
-      const doc = await vscode.workspace.openTextDocument(fileUri);
-      await vscode.window.showTextDocument(doc);
-    } catch {
-      // File doesn't exist, create it
-      await vscode.workspace.fs.writeFile(fileUri, new Uint8Array());
-      const doc = await vscode.workspace.openTextDocument(fileUri);
-      await vscode.window.showTextDocument(doc);
-    }
-
-    // Copy relative path to clipboard and notify user
-    const relativePath = vscode.workspace.asRelativePath(fileUri);
-    await vscode.env.clipboard.writeText(relativePath);
+  const stage = selectedTask.progress.currentStage;
+  const actions = getStageActions(selectedTask);
+  if (actions.length === 0) {
     void vscode.window.showInformationMessage(
-      `Copied to clipboard: ${relativePath}`
-    );
-  };
-
-  const taskFileUri = vscode.Uri.joinPath(taskFolderUri, TASK_FILENAME);
-  const planFileUri = vscode.Uri.joinPath(taskFolderUri, "plan.md");
-  const planReviewFileUri = vscode.Uri.joinPath(
-    taskFolderUri,
-    "plan-review.md"
-  );
-  const planUpdatedFileUri = vscode.Uri.joinPath(
-    taskFolderUri,
-    "plan-updated.md"
-  );
-  const planUpdatedReviewFileUri = vscode.Uri.joinPath(
-    taskFolderUri,
-    "plan-updated-review.md"
-  );
-  const planFinalFileUri = vscode.Uri.joinPath(taskFolderUri, "plan-final.md");
-
-  let currentProgress = progress;
-  const currentStageIndex = getStageIndex(currentProgress.currentStage);
-
-  try {
-    // Step 1: Handle "created" stage - ensure task.md exists, then prompt
-    // for plan.md
-    if (currentStageIndex <= getStageIndex("created")) {
-      await createAndOpenFile(taskFileUri);
-
-      const createPlan = await vscode.window.showQuickPick(
-        ["Create plan.md", "Quit"],
-        {
-          placeHolder: "Would you like to create an initial plan?",
-          title: "Task Planning",
-        }
-      );
-
-      if (createPlan !== "Create plan.md") {
-        return currentProgress.taskFolder;
-      }
-
-      await createAndOpenFile(planFileUri);
-      currentProgress = updateTaskProgressStage(currentProgress, "plan");
-      await writeTaskProgress(taskFolderUri, currentProgress);
-    }
-
-    // Step 2: Handle "plan" stage - prompt for plan-review.md
-    if (getStageIndex(currentProgress.currentStage) <= getStageIndex("plan")) {
-      const createReview = await vscode.window.showQuickPick(
-        ["Create plan-review.md", "Skip"],
-        {
-          placeHolder: "Would you like to create a plan review?",
-          title: "Plan Review",
-        }
-      );
-
-      // Cancelled: keep current stage so the task can be resumed later
-      if (!createReview) {
-        return currentProgress.taskFolder;
-      }
-
-      if (createReview !== "Create plan-review.md") {
-        await copyFile(planFileUri, planFinalFileUri);
-        const doc = await vscode.workspace.openTextDocument(planFinalFileUri);
-        await vscode.window.showTextDocument(doc);
-        currentProgress = updateTaskProgressStage(currentProgress, "completed");
-        await writeTaskProgress(taskFolderUri, currentProgress);
-        return currentProgress.taskFolder;
-      }
-
-      await createAndOpenFile(planReviewFileUri);
-      currentProgress = updateTaskProgressStage(currentProgress, "plan-review");
-      await writeTaskProgress(taskFolderUri, currentProgress);
-    }
-
-    // Step 3: Handle "plan-review" stage - prompt for plan-updated.md
-    if (
-      getStageIndex(currentProgress.currentStage) <=
-      getStageIndex("plan-review")
-    ) {
-      const createUpdated = await vscode.window.showQuickPick(
-        ["Create plan-updated.md", "Dismiss review"],
-        {
-          placeHolder: "Would you like to create an updated plan?",
-          title: "Plan Update",
-        }
-      );
-
-      // Cancelled: keep current stage so the task can be resumed later
-      if (!createUpdated) {
-        return currentProgress.taskFolder;
-      }
-
-      if (createUpdated !== "Create plan-updated.md") {
-        await copyFile(planFileUri, planFinalFileUri);
-        const doc = await vscode.workspace.openTextDocument(planFinalFileUri);
-        await vscode.window.showTextDocument(doc);
-        currentProgress = updateTaskProgressStage(currentProgress, "completed");
-        await writeTaskProgress(taskFolderUri, currentProgress);
-        return currentProgress.taskFolder;
-      }
-
-      await createAndOpenFile(planUpdatedFileUri);
-      currentProgress = updateTaskProgressStage(
-        currentProgress,
-        "plan-updated"
-      );
-      await writeTaskProgress(taskFolderUri, currentProgress);
-    }
-
-    // Step 4: Handle "plan-updated" stage - prompt for plan-updated-review.md
-    if (
-      getStageIndex(currentProgress.currentStage) <=
-      getStageIndex("plan-updated")
-    ) {
-      const createUpdatedReview = await vscode.window.showQuickPick(
-        ["Create plan-updated-review.md", "Skip"],
-        {
-          placeHolder: "Would you like to create an updated plan review?",
-          title: "Updated Plan Review",
-        }
-      );
-
-      // Cancelled: keep current stage so the task can be resumed later
-      if (!createUpdatedReview) {
-        return currentProgress.taskFolder;
-      }
-
-      if (createUpdatedReview !== "Create plan-updated-review.md") {
-        await copyFile(planUpdatedFileUri, planFinalFileUri);
-        const doc = await vscode.workspace.openTextDocument(planFinalFileUri);
-        await vscode.window.showTextDocument(doc);
-        currentProgress = updateTaskProgressStage(currentProgress, "completed");
-        await writeTaskProgress(taskFolderUri, currentProgress);
-        return currentProgress.taskFolder;
-      }
-
-      await createAndOpenFile(planUpdatedReviewFileUri);
-      currentProgress = updateTaskProgressStage(
-        currentProgress,
-        "plan-updated-review"
-      );
-      await writeTaskProgress(taskFolderUri, currentProgress);
-    }
-
-    // Step 5: Handle "plan-updated-review" stage - prompt for plan-final.md,
-    // or loop back to revise plan-updated.md again if the review wasn't
-    // satisfactory.
-    if (
-      getStageIndex(currentProgress.currentStage) <=
-      getStageIndex("plan-updated-review")
-    ) {
-      const createFinal = await vscode.window.showQuickPick(
-        [
-          "Create plan-final.md",
-          "Revise plan-updated.md again",
-          "Dismiss re-review",
-        ],
-        {
-          placeHolder: "Would you like to create the final plan?",
-          title: "Final Plan",
-        }
-      );
-
-      // Cancelled: keep current stage so the task can be resumed later
-      if (!createFinal) {
-        return currentProgress.taskFolder;
-      }
-
-      if (createFinal === "Revise plan-updated.md again") {
-        // Send the task back to "plan-updated" so the update/review cycle
-        // can repeat: edit plan-updated.md (or re-run Update Plan with AI,
-        // which now reads plan-updated-review.md), then review it again.
-        const doc = await vscode.workspace.openTextDocument(
-          planUpdatedFileUri
-        );
-        await vscode.window.showTextDocument(doc);
-        currentProgress = updateTaskProgressStage(
-          currentProgress,
-          "plan-updated"
-        );
-        await writeTaskProgress(taskFolderUri, currentProgress);
-        return currentProgress.taskFolder;
-      }
-
-      if (createFinal === "Create plan-final.md") {
-        await createAndOpenFile(planFinalFileUri);
-        currentProgress = updateTaskProgressStage(
-          currentProgress,
-          "plan-final"
-        );
-        await writeTaskProgress(taskFolderUri, currentProgress);
-      } else {
-        await copyFile(planUpdatedFileUri, planFinalFileUri);
-        const doc = await vscode.workspace.openTextDocument(planFinalFileUri);
-        await vscode.window.showTextDocument(doc);
-      }
-
-      // Mark as completed
-      currentProgress = updateTaskProgressStage(currentProgress, "completed");
-      await writeTaskProgress(taskFolderUri, currentProgress);
-    }
-
-    // Handle "plan-final" stage - just mark as completed
-    if (currentProgress.currentStage === "plan-final") {
-      currentProgress = updateTaskProgressStage(currentProgress, "completed");
-      await writeTaskProgress(taskFolderUri, currentProgress);
-      void vscode.window.showInformationMessage(
-        `Task ${currentProgress.taskFolder} marked as completed.`
-      );
-    }
-
-    // Handle "completed" stage - nothing to do
-    if (progress.currentStage === "completed") {
-      void vscode.window.showInformationMessage(
-        `Task ${currentProgress.taskFolder} is already completed.`
-      );
-    }
-
-    return currentProgress.taskFolder;
-  } catch (error) {
-    const errorMessage =
-      error instanceof Error ? error.message : "Unknown error";
-    void vscode.window.showErrorMessage(
-      `Failed to resume task: ${errorMessage}`
+      `${selectedTask.folderName} is completed.`
     );
     return undefined;
   }
+
+  const artifact = STAGE_ARTIFACT_FILENAMES[stage];
+  const picked = await vscode.window.showQuickPick(
+    actions.map((action) => ({
+      label: action.label,
+      description: action.description,
+      action,
+    })),
+    {
+      placeHolder: `Current stage: ${STAGE_DISPLAY_NAMES[stage]}${
+        artifact ? ` (${artifact})` : ""
+      }`,
+      title: `Resume: ${selectedTask.folderName}`,
+    }
+  );
+  if (!picked) {
+    return undefined;
+  }
+
+  await picked.action.run(selectedTask.folderUri);
+  return selectedTask.folderName;
 }
 
 /**
@@ -418,6 +328,5 @@ export function registerResumeTaskCommand(
     "vs-code-ai-helper.resumeTask",
     resumeTask
   );
-
   context.subscriptions.push(disposable);
 }

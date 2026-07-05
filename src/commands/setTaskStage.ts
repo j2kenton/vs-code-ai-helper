@@ -19,7 +19,7 @@ import {
  * Let the user jump a task's tracked stage backward or forward, overriding
  * the stage the workflow last auto-advanced it to. Useful when the automatic
  * stage tracking gets ahead of where the user actually is (e.g. they started
- * a plan-review but aren't happy with the plan yet), or when they want to
+ * a review but aren't happy with the plan yet), or when they want to
  * redo a step. Does not touch any files in the task folder — it only changes
  * which stage `Resume Task` and the "with AI" commands treat as current.
  *

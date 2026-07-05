@@ -12,9 +12,7 @@ import {
 import { registerStartNewTaskCommand } from "./commands/startNewTask";
 import { registerResumeTaskCommand } from "./commands/resumeTask";
 import { registerGeneratePlanWithAICommand } from "./commands/generatePlanWithAI";
-import { registerReviewPlanWithAICommand } from "./commands/reviewPlanWithAI";
-import { registerUpdatePlanWithAICommand } from "./commands/updatePlanWithAI";
-import { registerReviewUpdatedPlanWithAICommand } from "./commands/reviewUpdatedPlanWithAI";
+import { registerReviewActionCommands } from "./commands/reviewActions";
 import { registerSetTaskStageCommand } from "./commands/setTaskStage";
 import { TaskTreeProvider, TASKS_VIEW_ID } from "./views/taskTreeProvider";
 import { TaskStatusBar } from "./views/taskStatusBar";
@@ -89,9 +87,7 @@ export function activate(context: vscode.ExtensionContext): void {
   registerStartNewTaskCommand(context);
   registerResumeTaskCommand(context);
   registerGeneratePlanWithAICommand(context);
-  registerReviewPlanWithAICommand(context);
-  registerUpdatePlanWithAICommand(context);
-  registerReviewUpdatedPlanWithAICommand(context);
+  registerReviewActionCommands(context);
   registerSetTaskStageCommand(context);
 
   // Register the hello world command (keeping for now)

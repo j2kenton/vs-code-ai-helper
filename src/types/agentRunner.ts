@@ -1,13 +1,10 @@
 import * as vscode from "vscode";
+import { TaskStage } from "./taskProgress";
 
 /**
  * The workflow stage an agent run is producing output for.
  */
-export type AgentWorkflowStage =
-  | "plan"
-  | "plan-review"
-  | "plan-updated"
-  | "plan-updated-review";
+export type AgentWorkflowStage = TaskStage;
 
 /**
  * Capabilities a given AgentRunner supports. Phase 1 runners only need

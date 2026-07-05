@@ -4,31 +4,19 @@ import {
   hasValidMetaResourcesPath,
 } from "../config/settings";
 import {
+  isReviewStage,
+  STAGE_ARTIFACT_FILENAMES,
   STAGE_DISPLAY_NAMES,
   STAGE_ORDER,
-  TASK_FILENAME,
   TaskStage,
 } from "../types/taskProgress";
 import { findAllTasks, IncompleteTask } from "../utils/taskProgressUtils";
+import { resolveCurrentPlanUri, statIfExists } from "../utils/fileUtils";
 
 /**
  * The view ID for the tasks tree view (must match package.json)
  */
 export const TASKS_VIEW_ID = "vs-code-ai-helper.tasksView";
-
-/**
- * Maps each stage to the markdown artifact it produces, so stage nodes can
- * open the corresponding file. "completed" has no artifact of its own.
- */
-const STAGE_ARTIFACT_FILENAMES: Record<TaskStage, string | undefined> = {
-  created: TASK_FILENAME,
-  plan: "plan.md",
-  "plan-review": "plan-review.md",
-  "plan-updated": "plan-updated.md",
-  "plan-updated-review": "plan-updated-review.md",
-  "plan-final": "plan-final.md",
-  completed: undefined,
-};
 
 type StageStatus = "done" | "current" | "outstanding";
 
@@ -106,8 +94,17 @@ export class TaskNode extends vscode.TreeItem {
     }
 
     this.tooltip = buildTaskTooltip(task);
+    // Review-stage tasks surface the review action buttons instead of the
+    // generic resume/set-stage pair. Keep "created" distinct so the tree
+    // can hide the generic Next Stage button in favor of curated actions.
     this.contextValue =
-      currentStage === "completed" ? "task-completed" : "task-active";
+      currentStage === "completed"
+        ? "task-completed"
+        : currentStage === "created"
+          ? "task-created"
+        : isReviewStage(currentStage)
+          ? "task-active-review"
+          : "task-active";
   }
 }
 
@@ -122,6 +119,9 @@ export class StageNode extends vscode.TreeItem {
     artifactUri: vscode.Uri | undefined
   ) {
     super(STAGE_DISPLAY_NAMES[stage], vscode.TreeItemCollapsibleState.None);
+
+    const artifactName =
+      artifactUri?.path.split("/").pop() ?? STAGE_ARTIFACT_FILENAMES[stage];
 
     switch (status) {
       case "done":
@@ -153,15 +153,18 @@ export class StageNode extends vscode.TreeItem {
         title: "Open Artifact",
         arguments: [artifactUri],
       };
-      this.tooltip = `Open ${STAGE_ARTIFACT_FILENAMES[stage] ?? ""}`;
+      this.tooltip = artifactName ? `Open ${artifactName}` : "Open artifact";
     } else {
-      const artifactName = STAGE_ARTIFACT_FILENAMES[stage];
       this.tooltip = artifactName
         ? `${artifactName} has not been created yet`
         : STAGE_DISPLAY_NAMES[stage];
     }
 
-    this.contextValue = "stage";
+    // The current review stage's row carries the review action buttons
+    this.contextValue =
+      status === "current" && isReviewStage(stage)
+        ? "stage-review-current"
+        : "stage";
   }
 }
 
@@ -267,16 +270,19 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
 
     for (const stage of STAGE_ORDER) {
       const status = getStageStatus(stage, task.progress.currentStage);
-      const artifactName = STAGE_ARTIFACT_FILENAMES[stage];
 
+      // The "plan" stage's artifact may live at the legacy plan-updated.md
+      // path for tasks migrated from pre-0.6.0 stage names; resolve it the
+      // same way the AI commands do rather than assuming plan.md.
       let artifactUri: vscode.Uri | undefined;
-      if (artifactName) {
-        const candidate = vscode.Uri.joinPath(task.folderUri, artifactName);
-        try {
-          await vscode.workspace.fs.stat(candidate);
-          artifactUri = candidate;
-        } catch {
-          // Artifact not created yet
+      if (stage === "plan") {
+        const candidate = await resolveCurrentPlanUri(task.folderUri);
+        artifactUri = (await statIfExists(candidate)) ? candidate : undefined;
+      } else {
+        const artifactName = STAGE_ARTIFACT_FILENAMES[stage];
+        if (artifactName) {
+          const candidate = vscode.Uri.joinPath(task.folderUri, artifactName);
+          artifactUri = (await statIfExists(candidate)) ? candidate : undefined;
         }
       }
 
