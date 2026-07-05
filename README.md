@@ -29,6 +29,18 @@ https://marketplace.visualstudio.com/items?itemName=j2kenton.vs-code-ai-helper
 
 Everything the extension writes is a plain Markdown or JSON file in your task folder, so you can read, edit, or hand it to a different tool at any point — nothing is locked into the extension.
 
+## Tasks View
+
+Click the AI Helper icon in the Activity Bar to open the **Tasks** view — a persistent, always-up-to-date checklist of where every task stands, so you don't have to re-run a command just to check progress:
+
+- Each task shows its current stage and step count (e.g. `Plan Review · step 3 of 7`) directly in the tree.
+- Expand a task to see all 7 workflow stages, each marked done ✓, current →, or outstanding ○. Click a stage to open its artifact file directly (if it's been created).
+- The most recently updated active task auto-expands so you land on the relevant checklist immediately.
+- Inline buttons let you **Resume** or **Set Stage** for a task without leaving the view.
+- The view refreshes automatically whenever a task's `task-progress.json` changes — no manual refresh needed (though a refresh button is there too).
+
+A matching status bar item (bottom-left) always shows your most recently active task and its stage, and jumps into `Resume Task` when clicked — so progress is visible even with the sidebar closed.
+
 ## Commands
 
 | Command | What it does |
@@ -41,6 +53,7 @@ Everything the extension writes is a plain Markdown or JSON file in your task fo
 | `AI Helper: Update Plan with AI` | Uses Copilot to revise the plan, writing `plan-updated.md`. Reads `plan-updated-review.md` (and revises `plan-updated.md`) if one exists, otherwise falls back to `plan-review.md` (and revises `plan.md`) — so re-running it after a second review keeps building on the latest revision. Only offered once a relevant review exists. |
 | `AI Helper: Review Updated Plan with AI` | Uses Copilot to critique `plan-updated.md`, writing `plan-updated-review.md`. Only offered once an updated plan exists. |
 | `AI Helper: Set Task Stage` | Manually set which stage a task is tracked at, moving it backward or forward. Use this when the auto-tracked stage has gotten ahead of where you actually are. Only changes `task-progress.json` — it doesn't touch or delete any artifact files. |
+| `AI Helper: Refresh Tasks View` | Manually refresh the Tasks sidebar (it also refreshes automatically on its own). |
 | `AI Helper: Hello World` | Sanity-check command confirming the extension is active. |
 
 Every "with AI" command asks for confirmation before overwriting an existing artifact, is only offered when the task is at (or just past) the right stage — so it can never regress a task or clobber later-stage work — and falls back with a clear message (no crash, no silent failure) if Copilot isn't signed in, has no available model, or you're out of quota. The manual `Start New Task` / `Resume Task` flow always works regardless. Promoting a plan to `plan-final.md` is intentionally not automatable yet — it's the one human approval gate the workflow always stops for.

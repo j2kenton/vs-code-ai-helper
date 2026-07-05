@@ -16,6 +16,9 @@ import { registerReviewPlanWithAICommand } from "./commands/reviewPlanWithAI";
 import { registerUpdatePlanWithAICommand } from "./commands/updatePlanWithAI";
 import { registerReviewUpdatedPlanWithAICommand } from "./commands/reviewUpdatedPlanWithAI";
 import { registerSetTaskStageCommand } from "./commands/setTaskStage";
+import { TaskTreeProvider, TASKS_VIEW_ID } from "./views/taskTreeProvider";
+import { TaskStatusBar } from "./views/taskStatusBar";
+import { TASK_PROGRESS_FILENAME } from "./types/taskProgress";
 
 /**
  * Button labels for the prompts
@@ -101,6 +104,47 @@ export function activate(context: vscode.ExtensionContext): void {
     }
   );
   context.subscriptions.push(helloWorldDisposable);
+
+  // Tasks tree view + status bar: persistent visibility of workflow progress
+  const taskTreeProvider = new TaskTreeProvider();
+  const tasksTreeView = vscode.window.createTreeView(TASKS_VIEW_ID, {
+    treeDataProvider: taskTreeProvider,
+    showCollapseAll: true,
+  });
+
+  const taskStatusBar = new TaskStatusBar();
+  const tasksLoadedListener = taskTreeProvider.onDidLoadTasks((tasks) => {
+    taskStatusBar.update(tasks);
+  });
+
+  const refreshCommand = vscode.commands.registerCommand(
+    "vs-code-ai-helper.refreshTasksView",
+    () => taskTreeProvider.refresh()
+  );
+
+  // Auto-refresh whenever any task's progress file changes
+  const progressWatcher = vscode.workspace.createFileSystemWatcher(
+    `**/${TASK_PROGRESS_FILENAME}`
+  );
+  progressWatcher.onDidCreate(() => taskTreeProvider.refresh());
+  progressWatcher.onDidChange(() => taskTreeProvider.refresh());
+  progressWatcher.onDidDelete(() => taskTreeProvider.refresh());
+
+  // Refresh when the meta resources folder setting changes
+  const configListener = vscode.workspace.onDidChangeConfiguration((event) => {
+    if (event.affectsConfiguration("vs-code-ai-helper.metaResourcesPath")) {
+      taskTreeProvider.refresh();
+    }
+  });
+
+  context.subscriptions.push(
+    tasksTreeView,
+    taskStatusBar,
+    tasksLoadedListener,
+    refreshCommand,
+    progressWatcher,
+    configListener
+  );
 
   // Handle activation prompt flow
   void handleActivationPrompt();

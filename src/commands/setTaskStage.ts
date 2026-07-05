@@ -10,6 +10,7 @@ import {
 } from "../types/taskProgress";
 import {
   findAllTasks,
+  IncompleteTask,
   updateTaskProgressStage,
   writeTaskProgress,
 } from "../utils/taskProgressUtils";
@@ -21,8 +22,13 @@ import {
  * a plan-review but aren't happy with the plan yet), or when they want to
  * redo a step. Does not touch any files in the task folder — it only changes
  * which stage `Resume Task` and the "with AI" commands treat as current.
+ *
+ * When invoked from the tasks tree view, the tree node is passed in and the
+ * task picker is skipped.
  */
-export async function setTaskStage(): Promise<void> {
+export async function setTaskStage(node?: {
+  task?: IncompleteTask;
+}): Promise<void> {
   if (!hasValidMetaResourcesPath()) {
     void vscode.window.showErrorMessage(
       "No meta resources folder configured. Please set one first."
@@ -60,13 +66,19 @@ export async function setTaskStage(): Promise<void> {
     task,
   }));
 
+  const preselectedFolder = node?.task?.folderName;
+  const preselectedItem = preselectedFolder
+    ? taskItems.find((item) => item.task.folderName === preselectedFolder)
+    : undefined;
+
   const selectedTaskItem =
-    taskItems.length === 1
+    preselectedItem ??
+    (taskItems.length === 1
       ? taskItems[0]
       : await vscode.window.showQuickPick(taskItems, {
           placeHolder: "Select a task",
           title: "Set Task Stage",
-        });
+        }));
 
   if (!selectedTaskItem) {
     return;
