@@ -6,6 +6,7 @@ import {
   AgentRunRequest,
   AgentRunResult,
 } from "../types/agentRunner";
+import { writeTextFile } from "../utils/fileUtils";
 
 /**
  * Runner that uses the user's existing GitHub Copilot access through
@@ -80,10 +81,7 @@ export class CopilotLanguageModelRunner implements AgentRunner {
         return { runnerId: this.id, status: "cancelled" };
       }
 
-      await vscode.workspace.fs.writeFile(
-        request.outputFile,
-        new TextEncoder().encode(output)
-      );
+      await writeTextFile(request.outputFile, output);
 
       return {
         runnerId: this.id,

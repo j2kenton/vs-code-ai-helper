@@ -1,12 +1,24 @@
 import * as vscode from "vscode";
 import { PLAN_FILENAME } from "../types/taskProgress";
 
+function findOpenDocument(fileUri: vscode.Uri): vscode.TextDocument | undefined {
+  return vscode.workspace.textDocuments.find(
+    (doc) => doc.uri.toString() === fileUri.toString()
+  );
+}
+
 /**
- * Read a text file's content, or undefined if it doesn't exist.
+ * Read a text file's content, preferring an open editor buffer so unsaved
+ * changes are included.
  */
 export async function readTextIfExists(
   fileUri: vscode.Uri
 ): Promise<string | undefined> {
+  const openDoc = findOpenDocument(fileUri);
+  if (openDoc) {
+    return openDoc.getText();
+  }
+
   try {
     const content = await vscode.workspace.fs.readFile(fileUri);
     return new TextDecoder().decode(content);
@@ -37,6 +49,42 @@ export async function statIfExists(
     return await vscode.workspace.fs.stat(fileUri);
   } catch {
     return undefined;
+  }
+}
+
+/**
+ * Write a text file, replacing the contents of an open editor buffer when
+ * present so the visible document and on-disk file stay in sync.
+ */
+export async function writeTextFile(
+  fileUri: vscode.Uri,
+  content: string
+): Promise<void> {
+  const openDoc = findOpenDocument(fileUri);
+  if (!openDoc) {
+    await vscode.workspace.fs.writeFile(
+      fileUri,
+      new TextEncoder().encode(content)
+    );
+    return;
+  }
+
+  const fullRange = new vscode.Range(
+    openDoc.positionAt(0),
+    openDoc.positionAt(openDoc.getText().length)
+  );
+  const edit = new vscode.WorkspaceEdit();
+  edit.replace(fileUri, fullRange, content);
+
+  const applied = await vscode.workspace.applyEdit(edit);
+  if (!applied) {
+    throw new Error(`Failed to update ${fileUri.fsPath}.`);
+  }
+
+  const updatedDoc = findOpenDocument(fileUri) ?? openDoc;
+  const saved = await updatedDoc.save();
+  if (!saved) {
+    throw new Error(`Failed to save ${fileUri.fsPath}.`);
   }
 }
 
