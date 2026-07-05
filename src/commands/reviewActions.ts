@@ -294,6 +294,121 @@ const REVIEW_PROMPTS: Partial<Record<TaskStage, string>> = {
 };
 
 /**
+ * Core review logic for a known task folder: build variables, run the AI
+ * review for the given stage, and advance the task to the review stage.
+ * Called by runReviewWithAI (user-invoked) and automatically after plan
+ * generation, an implementation run, or applying a review completes.
+ *
+ * @param skipOverwriteConfirmation When true, skip the "already has content"
+ *   prompt — used for auto-triggered reviews immediately after a stage runs.
+ */
+export async function runReviewForFolder(
+  extensionUri: vscode.Uri,
+  folderUri: vscode.Uri,
+  workspaceRoot: vscode.WorkspaceFolder,
+  currentStage: TaskStage,
+  skipOverwriteConfirmation: boolean
+): Promise<void> {
+  const targetStage = REVIEW_TARGETS[currentStage];
+  const templateFile = targetStage && REVIEW_PROMPTS[targetStage];
+  const reviewUri = targetStage && artifactUri(folderUri, targetStage);
+  if (!targetStage || !templateFile || !reviewUri) {
+    return;
+  }
+
+  const variables: Record<string, string> = {};
+  const isPlanReview = isPlanReviewStage(targetStage);
+
+  if (isPlanReview) {
+    const planUri = await resolveCurrentPlanUri(folderUri);
+    const planContent = await readNonEmptyText(planUri);
+    if (!planContent) {
+      void vscode.window.showWarningMessage(
+        "No plan found (or it is empty). Generate or write a plan first."
+      );
+      return;
+    }
+    variables.plan = planContent;
+  } else {
+    // Implementation reviews must be measured against the APPROVED plan,
+    // never the still-mutable draft — falling back to the in-progress plan
+    // would let implementation proceed without the human approval gate
+    // that promoting to plan-final.md represents.
+    const planFinalContent = await readNonEmptyText(
+      vscode.Uri.joinPath(folderUri, "plan-final.md")
+    );
+    if (!planFinalContent) {
+      void vscode.window.showWarningMessage(
+        "No plan-final.md found. Finalize a plan (Next Stage from the low-level plan review) before reviewing implementation."
+      );
+      return;
+    }
+    const implementationContent = await readNonEmptyText(
+      vscode.Uri.joinPath(folderUri, "implementation.md")
+    );
+    if (!implementationContent) {
+      void vscode.window.showWarningMessage(
+        "No implementation.md found. Generate the implementation checklist first."
+      );
+      return;
+    }
+    variables.plan = planFinalContent;
+    variables.implementation = implementationContent;
+  }
+
+  if (!skipOverwriteConfirmation) {
+    if (!(await confirmOverwrite(reviewUri, STAGE_ARTIFACT_FILENAMES[targetStage] ?? "review"))) {
+      return;
+    }
+  }
+
+  // Implementation reviews scope to the task's tracked changed files so the
+  // AI assesses what was actually written, not whatever tabs happen to be
+  // open. Plan reviews only need the lightweight pack (no file contents).
+  let contextPackContent: string;
+  if (isPlanReview) {
+    const contextPackUri = await writeContextPack(folderUri, workspaceRoot.uri, false);
+    contextPackContent = new TextDecoder().decode(
+      await vscode.workspace.fs.readFile(contextPackUri)
+    );
+  } else {
+    const taskProgress = await readTaskProgress(folderUri);
+    const { contextPackUri, isFallback } = await writeImplReviewContextPack(
+      folderUri,
+      workspaceRoot.uri,
+      taskProgress?.implReviewFiles
+    );
+    if (isFallback) {
+      void vscode.window.showWarningMessage(
+        "No tracked implementation file set found for this task. " +
+          "The review will be based on currently open editors. " +
+          "For best results, open the files you changed before running the review."
+      );
+    }
+    contextPackContent = new TextDecoder().decode(
+      await vscode.workspace.fs.readFile(contextPackUri)
+    );
+  }
+  variables.contextPack = contextPackContent;
+
+  const succeeded = await runAiToFile({
+    extensionUri,
+    taskFolderUri: folderUri,
+    workspaceUri: workspaceRoot.uri,
+    logStage: targetStage,
+    templateFile,
+    variables,
+    outputFileUri: reviewUri,
+    progressTitle: `Running ${STAGE_DISPLAY_NAMES[targetStage]} with Copilot...`,
+    outputLabel: STAGE_ARTIFACT_FILENAMES[targetStage] ?? "review",
+  });
+
+  if (succeeded) {
+    await setStage(folderUri, targetStage);
+  }
+}
+
+/**
  * Run (or re-run) the review for the task's current position in the
  * workflow: from "plan"/"implementation" this starts the high-level review
  * and advances the stage; from a review stage it regenerates that review.
@@ -314,105 +429,13 @@ export async function runReviewWithAI(
   if (!workspaceRoot) {
     return;
   }
-
-  const targetStage = REVIEW_TARGETS[resolved.progress.currentStage];
-  const templateFile = targetStage && REVIEW_PROMPTS[targetStage];
-  const reviewUri = targetStage && artifactUri(resolved.folderUri, targetStage);
-  if (!targetStage || !templateFile || !reviewUri) {
-    return;
-  }
-
-  const variables: Record<string, string> = {};
-  const isPlanReview = isPlanReviewStage(targetStage);
-
-  if (isPlanReview) {
-    const planUri = await resolveCurrentPlanUri(resolved.folderUri);
-    const planContent = await readNonEmptyText(planUri);
-    if (!planContent) {
-      void vscode.window.showWarningMessage(
-        "No plan found (or it is empty). Generate or write a plan first."
-      );
-      return;
-    }
-    variables.plan = planContent;
-  } else {
-    // Implementation reviews must be measured against the APPROVED plan,
-    // never the still-mutable draft — falling back to the in-progress plan
-    // would let implementation proceed without the human approval gate
-    // that promoting to plan-final.md represents.
-    const planFinalContent = await readNonEmptyText(
-      vscode.Uri.joinPath(resolved.folderUri, "plan-final.md")
-    );
-    if (!planFinalContent) {
-      void vscode.window.showWarningMessage(
-        "No plan-final.md found. Finalize a plan (Next Stage from the low-level plan review) before reviewing implementation."
-      );
-      return;
-    }
-    const implementationContent = await readNonEmptyText(
-      vscode.Uri.joinPath(resolved.folderUri, "implementation.md")
-    );
-    if (!implementationContent) {
-      void vscode.window.showWarningMessage(
-        "No implementation.md found. Generate the implementation checklist first."
-      );
-      return;
-    }
-    variables.plan = planFinalContent;
-    variables.implementation = implementationContent;
-  }
-
-  if (!(await confirmOverwrite(reviewUri, STAGE_ARTIFACT_FILENAMES[targetStage] ?? "review"))) {
-    return;
-  }
-
-  // Implementation reviews scope to the task's tracked changed files so the
-  // AI assesses what was actually written, not whatever tabs happen to be
-  // open. Plan reviews only need the lightweight pack (no file contents).
-  let contextPackContent: string;
-  if (isPlanReview) {
-    const contextPackUri = await writeContextPack(
-      resolved.folderUri,
-      workspaceRoot.uri,
-      false
-    );
-    contextPackContent = new TextDecoder().decode(
-      await vscode.workspace.fs.readFile(contextPackUri)
-    );
-  } else {
-    const { contextPackUri, isFallback } = await writeImplReviewContextPack(
-      resolved.folderUri,
-      workspaceRoot.uri,
-      resolved.progress.implReviewFiles
-    );
-    if (isFallback) {
-      void vscode.window.showWarningMessage(
-        "No tracked implementation file set found for this task. " +
-          "The review will be based on currently open editors. " +
-          "For best results, open the files you changed before running the review."
-      );
-    }
-    contextPackContent = new TextDecoder().decode(
-      await vscode.workspace.fs.readFile(contextPackUri)
-    );
-  }
-  variables.contextPack = contextPackContent;
-
-  const succeeded = await runAiToFile({
+  await runReviewForFolder(
     extensionUri,
-    taskFolderUri: resolved.folderUri,
-    workspaceUri: workspaceRoot.uri,
-    logStage: targetStage,
-    templateFile,
-    variables,
-    outputFileUri: reviewUri,
-    progressTitle: `Running ${STAGE_DISPLAY_NAMES[targetStage]} with Copilot...`,
-    outputLabel: STAGE_ARTIFACT_FILENAMES[targetStage] ?? "review",
-  });
-
-  if (succeeded) {
-    await setStage(resolved.folderUri, targetStage);
-  }
+    resolved.folderUri,
+    workspaceRoot,
+    resolved.progress.currentStage,
+    false
+  );
 }
 
 /**
@@ -453,54 +476,49 @@ export async function applyReviewWithAI(
     : undefined;
 
   const isPlanReview = isPlanReviewStage(stage);
+
+  if (!isPlanReview) {
+    // Implementation reviews assess actual code, not implementation.md — so
+    // "applying" the review means re-invoking the AI implementation runner
+    // to fix the code the review found issues with, not rewriting a
+    // checklist document that the review never assessed in the first place.
+    await applyImplementationReviewWithAI(
+      extensionUri,
+      resolved.folderUri,
+      workspaceRoot,
+      stage,
+      reviewContent,
+      replyContent
+    );
+    return;
+  }
+
   const variables: Record<string, string> = {
     review: reviewContent,
     reply: replyContent ?? "_No reply provided._",
   };
 
-  let outputFileUri: vscode.Uri;
-  let templateFile: string;
-  let outputLabel: string;
-
-  if (isPlanReview) {
-    const currentPlanUri = await resolveCurrentPlanUri(resolved.folderUri);
-    const planContent = await readNonEmptyText(currentPlanUri);
-    if (!planContent) {
-      void vscode.window.showWarningMessage(
-        "No plan found (or it is empty). Nothing to apply the review to."
-      );
-      return;
-    }
-    variables.plan = planContent;
-    const contextPackUri = await writeContextPack(
-      resolved.folderUri,
-      workspaceRoot.uri
+  const currentPlanUri = await resolveCurrentPlanUri(resolved.folderUri);
+  const planContent = await readNonEmptyText(currentPlanUri);
+  if (!planContent) {
+    void vscode.window.showWarningMessage(
+      "No plan found (or it is empty). Nothing to apply the review to."
     );
-    variables.contextPack = new TextDecoder().decode(
-      await vscode.workspace.fs.readFile(contextPackUri)
-    );
-    // Always write to the canonical plan.md — this is how legacy
-    // plan-updated.md tasks converge onto the single-plan model.
-    outputFileUri = vscode.Uri.joinPath(resolved.folderUri, PLAN_FILENAME);
-    templateFile = "apply-review.md";
-    outputLabel = PLAN_FILENAME;
-  } else {
-    const implementationUri = vscode.Uri.joinPath(
-      resolved.folderUri,
-      "implementation.md"
-    );
-    const implementationContent = await readNonEmptyText(implementationUri);
-    if (!implementationContent) {
-      void vscode.window.showWarningMessage(
-        "No implementation.md found. Nothing to apply the review to."
-      );
-      return;
-    }
-    variables.implementation = implementationContent;
-    outputFileUri = implementationUri;
-    templateFile = "apply-impl-review.md";
-    outputLabel = "implementation.md";
+    return;
   }
+  variables.plan = planContent;
+  const contextPackUri = await writeContextPack(
+    resolved.folderUri,
+    workspaceRoot.uri
+  );
+  variables.contextPack = new TextDecoder().decode(
+    await vscode.workspace.fs.readFile(contextPackUri)
+  );
+  // Always write to the canonical plan.md — this is how legacy
+  // plan-updated.md tasks converge onto the single-plan model.
+  const outputFileUri = vscode.Uri.joinPath(resolved.folderUri, PLAN_FILENAME);
+  const templateFile = "apply-review.md";
+  const outputLabel = PLAN_FILENAME;
 
   const confirmation = await vscode.window.showWarningMessage(
     `This will rewrite ${outputLabel} in place, addressing the review${
@@ -513,7 +531,7 @@ export async function applyReviewWithAI(
     return;
   }
 
-  await runAiToFile({
+  const applySucceeded = await runAiToFile({
     extensionUri,
     taskFolderUri: resolved.folderUri,
     workspaceUri: workspaceRoot.uri,
@@ -524,6 +542,82 @@ export async function applyReviewWithAI(
     progressTitle: `Applying review to ${outputLabel} with Copilot...`,
     outputLabel,
   });
+
+  if (applySucceeded) {
+    await runReviewForFolder(extensionUri, resolved.folderUri, workspaceRoot, stage, true);
+  }
+}
+
+/**
+ * Apply an implementation review by re-running the AI implementation
+ * runner against the review's findings (and the author's reply, if any),
+ * making real code changes rather than editing implementation.md directly.
+ * Reuses executeImplementationRun so the result is written and re-reviewed
+ * exactly like a normal implementation run.
+ */
+async function applyImplementationReviewWithAI(
+  extensionUri: vscode.Uri,
+  folderUri: vscode.Uri,
+  workspaceRoot: vscode.WorkspaceFolder,
+  stage: TaskStage,
+  reviewContent: string,
+  replyContent: string | undefined
+): Promise<void> {
+  const planFinalContent = await readNonEmptyText(
+    vscode.Uri.joinPath(folderUri, "plan-final.md")
+  );
+  if (!planFinalContent) {
+    void vscode.window.showWarningMessage(
+      "No plan-final.md found. Nothing to apply the review to."
+    );
+    return;
+  }
+
+  const availability = await checkImplementationAvailability();
+  if (!availability.available) {
+    void vscode.window.showWarningMessage(
+      `Copilot is unavailable: ${availability.reason ?? "unknown reason"}. Address the review manually instead.`
+    );
+    return;
+  }
+
+  const confirmation = await vscode.window.showWarningMessage(
+    "This will re-run the AI implementation against the codebase to address the review" +
+      (replyContent ? " and your reply" : "") +
+      ".",
+    { modal: true },
+    "Apply"
+  );
+  if (confirmation !== "Apply") {
+    return;
+  }
+
+  // Use the implementation stage's model, not the review stage's — this is
+  // a tool-calling code-edit run like any other implementation run, and
+  // users may have configured a lighter model for review-only stages.
+  const model = await resolveModelForStage(folderUri, "implementation");
+  const contextPackContent = await generateContextPack(folderUri, workspaceRoot.uri);
+
+  const prompt = await renderPromptTemplate(
+    extensionUri,
+    "apply-impl-review-code.md",
+    {
+      contextPack: contextPackContent,
+      plan: planFinalContent,
+      review: reviewContent,
+      reply: replyContent ?? "_No reply provided._",
+    }
+  );
+
+  await executeImplementationRun(
+    extensionUri,
+    folderUri,
+    workspaceRoot,
+    prompt,
+    model.modelId,
+    "Applying implementation review with Copilot...",
+    stage
+  );
 }
 
 /**
@@ -778,11 +872,129 @@ export async function generateImplementationWithAI(
 }
 
 /**
+ * Stages from which the AI implementation runner can be invoked: the first
+ * run (plan-final), a manual re-run (implementation), or addressing an
+ * implementation review's findings directly in code (impl-*-review).
+ */
+const IMPLEMENTATION_ELIGIBLE_STAGES: readonly TaskStage[] = [
+  "plan-final",
+  "implementation",
+  "impl-high-review",
+  "impl-low-review",
+];
+
+/**
+ * Shared core of an implementation run: invoke Copilot's tool-calling loop
+ * with the given prompt, write the run log, and on success write
+ * implementation.md, persist the changed-file list, and auto-review.
+ * Used both for the initial/manual run and for applying an implementation
+ * review by re-running the AI against the code (not just editing the
+ * checklist document).
+ */
+async function executeImplementationRun(
+  extensionUri: vscode.Uri,
+  folderUri: vscode.Uri,
+  workspaceRoot: vscode.WorkspaceFolder,
+  prompt: string,
+  modelId: string | undefined,
+  progressTitle: string,
+  // The stage to re-review at afterwards: "implementation" for the normal
+  // (first/re-)run, which starts back at the high-level review, or the
+  // impl-*-review stage a review-driven fix originated from, so applying a
+  // low-level review's findings re-checks at the low level rather than
+  // resetting to high-level.
+  postRunReviewStage: TaskStage = "implementation"
+): Promise<void> {
+  const implementationUri = vscode.Uri.joinPath(folderUri, "implementation.md");
+
+  let result: Awaited<ReturnType<typeof runImplementationWithCopilot>> | undefined;
+
+  await vscode.window.withProgress(
+    {
+      location: vscode.ProgressLocation.Notification,
+      title: progressTitle,
+      cancellable: true,
+    },
+    async (progress, token) => {
+      result = await runImplementationWithCopilot({
+        prompt,
+        modelId,
+        workspaceUri: workspaceRoot.uri,
+        token,
+        onProgress: (message) => progress.report({ message }),
+      });
+    }
+  );
+
+  if (!result) {
+    return;
+  }
+
+  const logContent = `# Implementation Run\n\nStatus: ${result.status}\n\nFiles changed:\n${
+    result.filesChanged.length > 0
+      ? result.filesChanged.map((f) => `- ${f}`).join("\n")
+      : "_none recorded_"
+  }\n\n${result.summary ?? result.errorMessage ?? ""}`;
+
+  await writeRunLog(folderUri, "copilot-lm", "implementation", logContent);
+
+  if (result.status === "completed") {
+    // Write the AI-generated summary as implementation.md
+    const summary =
+      result.summary?.trim() ||
+      `## Implementation Complete\n\nFiles changed:\n${
+        result.filesChanged.map((f) => `- ${f}`).join("\n") || "_none recorded_"
+      }`;
+    await writeTextFile(implementationUri, summary);
+
+    // Persist the changed-file list for review scoping. The stage itself is
+    // only force-advanced to "implementation" when the task isn't already
+    // at "implementation" or an impl review stage — i.e. for the first run
+    // out of "plan-final", where code has now genuinely been written and
+    // the task must not be left at a stage ("plan-final") that has no
+    // reviewable action if the follow-up auto-review below then fails.
+    // When re-running from "implementation" or an impl review stage, that
+    // stage is already a valid, recoverable resting point, so it's left
+    // alone here and the follow-up auto-review owns any further transition
+    // — on cancel/failure the task simply stays at its current review
+    // stage instead of silently dropping to the generic "implementation"
+    // stage with no record of where it was.
+    const currentProgress = await readTaskProgress(folderUri);
+    if (currentProgress) {
+      const alreadyAtOrPastImplementation =
+        currentProgress.currentStage === "implementation" ||
+        isReviewStage(currentProgress.currentStage);
+      const updatedProgress = alreadyAtOrPastImplementation
+        ? currentProgress
+        : updateTaskProgressStage(currentProgress, "implementation");
+      await writeTaskProgress(
+        folderUri,
+        updateImplReviewFiles(updatedProgress, result.filesChanged)
+      );
+    }
+
+    const doc = await vscode.workspace.openTextDocument(implementationUri);
+    await vscode.window.showTextDocument(doc);
+    void vscode.window.showInformationMessage(
+      `Implementation complete. ${result.filesChanged.length} file(s) written.`
+    );
+    await runReviewForFolder(extensionUri, folderUri, workspaceRoot, postRunReviewStage, true);
+  } else if (result.status === "cancelled") {
+    void vscode.window.showInformationMessage("Implementation cancelled.");
+  } else {
+    void vscode.window.showErrorMessage(
+      `Implementation failed: ${result.errorMessage ?? "unknown error"}`
+    );
+  }
+}
+
+/**
  * Run the implementation: use Copilot with tool-calling to make actual
  * code changes in the workspace, then write implementation.md with the
  * AI-generated summary of what was done.
  *
- * Eligible stages: plan-final (first run) or implementation (re-run).
+ * Eligible stages: plan-final (first run), implementation (re-run), or
+ * an implementation review stage (addressing findings directly in code).
  */
 export async function runImplementationWithAI(
   extensionUri: vscode.Uri,
@@ -790,7 +1002,7 @@ export async function runImplementationWithAI(
 ): Promise<void> {
   const resolved = await resolveTask(
     node,
-    ["plan-final", "implementation"],
+    IMPLEMENTATION_ELIGIBLE_STAGES,
     "Run Implementation with AI"
   );
   if (!resolved) {
@@ -840,73 +1052,22 @@ export async function runImplementationWithAI(
     { contextPack: contextPackContent, plan: planFinalContent }
   );
 
-  let result: Awaited<ReturnType<typeof runImplementationWithCopilot>> | undefined;
+  // Re-running from an impl review stage re-checks at that same level
+  // (matching Apply Review's routing); the first run (plan-final) or a
+  // plain re-run (implementation) starts back at the high-level review.
+  const postRunReviewStage = isReviewStage(resolved.progress.currentStage)
+    ? resolved.progress.currentStage
+    : "implementation";
 
-  await vscode.window.withProgress(
-    {
-      location: vscode.ProgressLocation.Notification,
-      title: "Running implementation with Copilot...",
-      cancellable: true,
-    },
-    async (progress, token) => {
-      result = await runImplementationWithCopilot({
-        prompt,
-        modelId: model.modelId,
-        workspaceUri: workspaceRoot.uri,
-        token,
-        onProgress: (message) => progress.report({ message }),
-      });
-    }
+  await executeImplementationRun(
+    extensionUri,
+    resolved.folderUri,
+    workspaceRoot,
+    prompt,
+    model.modelId,
+    "Running implementation with Copilot...",
+    postRunReviewStage
   );
-
-  if (!result) {
-    return;
-  }
-
-  const logContent = `# Implementation Run\n\nStatus: ${result.status}\n\nFiles changed:\n${
-    result.filesChanged.length > 0
-      ? result.filesChanged.map((f) => `- ${f}`).join("\n")
-      : "_none recorded_"
-  }\n\n${result.summary ?? result.errorMessage ?? ""}`;
-
-  await writeRunLog(resolved.folderUri, "copilot-lm", "implementation", logContent);
-
-  if (result.status === "completed") {
-    // Write the AI-generated summary as implementation.md
-    const summary =
-      result.summary?.trim() ||
-      `## Implementation Complete\n\nFiles changed:\n${
-        result.filesChanged.map((f) => `- ${f}`).join("\n") || "_none recorded_"
-      }`;
-    await writeTextFile(implementationUri, summary);
-
-    // Advance stage AND persist the changed-file list for review scoping,
-    // combining both into one write so the file stays consistent.
-    const currentProgress = await readTaskProgress(resolved.folderUri);
-    if (currentProgress) {
-      await writeTaskProgress(
-        resolved.folderUri,
-        updateImplReviewFiles(
-          updateTaskProgressStage(currentProgress, "implementation"),
-          result.filesChanged
-        )
-      );
-    } else {
-      await setStage(resolved.folderUri, "implementation");
-    }
-
-    const doc = await vscode.workspace.openTextDocument(implementationUri);
-    await vscode.window.showTextDocument(doc);
-    void vscode.window.showInformationMessage(
-      `Implementation complete. ${result.filesChanged.length} file(s) written.`
-    );
-  } else if (result.status === "cancelled") {
-    void vscode.window.showInformationMessage("Implementation cancelled.");
-  } else {
-    void vscode.window.showErrorMessage(
-      `Implementation failed: ${result.errorMessage ?? "unknown error"}`
-    );
-  }
 }
 
 /**

@@ -11,6 +11,7 @@ import { pickTaskFolder } from "../utils/pickTaskFolder";
 import { CopilotLanguageModelRunner } from "../runners/copilotLanguageModelRunner";
 import { resolveModelForStage } from "../utils/modelSelection";
 import { TASK_FILENAME, TaskStage } from "../types/taskProgress";
+import { runReviewForFolder } from "./reviewActions";
 
 /**
  * Read a text file's content, or undefined if it doesn't exist.
@@ -159,6 +160,7 @@ export async function generatePlanWithAI(
         void vscode.window.showInformationMessage(
           `plan.md generated with Copilot (${result.summary ?? ""})`
         );
+        await runReviewForFolder(extensionUri, taskFolderUri, workspaceRoot, "plan", true);
       } else if (result.status === "cancelled") {
         void vscode.window.showInformationMessage(
           "Plan generation cancelled."

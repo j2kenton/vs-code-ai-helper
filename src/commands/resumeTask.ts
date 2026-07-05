@@ -4,6 +4,7 @@ import {
   hasValidMetaResourcesPath,
 } from "../config/settings";
 import {
+  isPlanReviewStage,
   isReviewStage,
   PLAN_FILENAME,
   STAGE_ARTIFACT_FILENAMES,
@@ -121,6 +122,7 @@ function getStageActions(task: IncompleteTask): StageAction[] {
   }
 
   if (isReviewStage(stage)) {
+    const isPlanReview = isPlanReviewStage(stage);
     return [
       {
         label: "$(eye) View Review",
@@ -137,9 +139,20 @@ function getStageActions(task: IncompleteTask): StageAction[] {
       },
       {
         label: "$(wand) Apply Review with AI",
-        description: "Rewrites the plan/checklist in place",
+        description: isPlanReview
+          ? "Rewrites the plan in place"
+          : "Re-runs the AI implementation to fix the code the review flagged",
         run: delegate("vs-code-ai-helper.applyReviewWithAI", task),
       },
+      ...(isPlanReview
+        ? []
+        : [
+            {
+              label: "$(rocket) Run Implementation with AI",
+              description: "AI makes further code changes from the plan",
+              run: delegate("vs-code-ai-helper.runImplementationWithAI", task),
+            },
+          ]),
       {
         label: "$(arrow-right) Next Stage",
         run: delegate("vs-code-ai-helper.nextStage", task),
