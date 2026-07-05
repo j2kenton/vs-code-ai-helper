@@ -133,11 +133,6 @@ function getStageActions(task: IncompleteTask): StageAction[] {
         run: delegate("vs-code-ai-helper.runReviewWithAI", task),
       },
       {
-        label: "$(comment) Reply to Review",
-        description: "Push back or clarify before applying",
-        run: delegate("vs-code-ai-helper.replyToReview", task),
-      },
-      {
         label: "$(wand) Apply Review with AI",
         description: isPlanReview
           ? "Rewrites the plan in place"

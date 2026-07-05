@@ -89,10 +89,10 @@ export async function setTaskStage(node?: {
 
   let newStage: TaskStage | undefined = node?.stage;
   if (!newStage) {
-    const stageItems = STAGE_ORDER.map((stage) => ({
+    const stageItems = STAGE_ORDER.filter(
+      (stage) => stage !== task.progress.currentStage
+    ).map((stage) => ({
       label: STAGE_DISPLAY_NAMES[stage],
-      description:
-        stage === task.progress.currentStage ? "Current stage" : undefined,
       stage,
     }));
 

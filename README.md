@@ -30,8 +30,8 @@ Install from the Visual Studio Marketplace:
 3. **Get a plan.** Either write `plan.md` yourself, or run `AI Helper: Generate Plan with AI` to have Copilot draft it from your `task.md` and currently open editors in the workspace.
 4. **High-level review.** Run `AI Helper: Run Review with AI` (or write `plan-high-review.md` yourself) to critique the plan's overall approach and scope. While on a review stage you have four actions — in the Tasks view they're buttons on the task row:
    - **View Review** — open the review file.
-   - **Reply to Review** — open a `-reply.md` file where you push back on or clarify review points; it's sent to the AI along with the review.
-   - **Apply Review with AI** — Copilot rewrites `plan.md` in place, addressing the review (and your reply, if any). Re-run the review afterwards if you want another pass.
+   - **Run / Re-run Review with AI** — (re)generate the review.
+   - **Apply Review with AI** — Copilot rewrites `plan.md` in place, addressing the review. Re-run the review afterwards if you want another pass.
    - **Next Stage** — happy with the plan? Move on.
 5. **Low-level review.** Same actions, but the review (`plan-low-review.md`) critiques the details: step ordering, named files, edge cases, verifiable acceptance criteria.
 6. **Finalize.** `Next Stage` from the low-level review offers to promote the current plan to `plan-final.md`. Promoting is always a deliberate, human step — no command auto-approves a plan.
@@ -50,7 +50,7 @@ Click the AI Helper icon in the Activity Bar to open the **Tasks** view — a pe
 - Each task shows its current stage and step count (e.g. `Plan: High-Level Review · step 3 of 9`) directly in the tree.
 - Expand a task to see all 9 workflow stages, each marked done ✓, current →, or outstanding ○. Click a stage to open its artifact file directly (if it's been created).
 - The most recently updated active task auto-expands so you land on the relevant checklist immediately.
-- Inline buttons let you **Resume** or **Set Stage** for a task without leaving the view. On review stages, the task row (and the current stage row) instead show the review actions: **View**, **Reply**, **Apply**, and **Next Stage** (with **Run Review with AI** in the right-click menu).
+- Inline buttons let you **Resume** or **Set Stage** for a task without leaving the view. On review stages, the task row (and the current stage row) instead show the review actions: **View**, **Run/Re-run Review**, **Apply**, and **Next Stage**.
 - The view refreshes automatically whenever a task's `task-progress.json` changes — no manual refresh needed (though a refresh button is there too).
 
 A matching status bar item (bottom-left) always shows your most recently active task and its stage, and jumps into `Resume Task` when clicked — so progress is visible even with the sidebar closed.
@@ -65,8 +65,7 @@ A matching status bar item (bottom-left) always shows your most recently active 
 | `AI Helper: Generate Plan with AI` | Uses your Copilot access to draft `plan.md` from `task.md` and a generated `context-pack.md`. Only offered before later-stage work exists, so it can't clobber it. |
 | `AI Helper: Run Review with AI` | Runs the review for wherever the task is: from `plan`/`implementation` it starts the high-level review (and advances the stage); from a review stage it (re)generates that stage's review. Implementation reviews use the files changed during the AI implementation run as the review scope; if no tracked file set exists (manual implementation), they fall back to open editors with a warning. |
 | `AI Helper: View Review` | Opens the current stage's review file; offers to run the review if it doesn't exist yet. |
-| `AI Helper: Reply to Review` | Opens a `-reply.md` file for the current review where you push back or clarify; it's sent to the AI when you Apply. |
-| `AI Helper: Apply Review with AI` | Copilot rewrites the plan (plan reviews) or the implementation checklist (implementation reviews) **in place**, addressing the review and your reply. Asks for confirmation first. |
+| `AI Helper: Apply Review with AI` | For plan reviews, Copilot rewrites `plan.md` **in place**, addressing the review. For implementation reviews, Copilot re-runs the AI implementation against the codebase to fix the flagged code, then rewrites `implementation.md` with a summary. Asks for confirmation first. |
 | `AI Helper: Next Stage` | Advances the task one stage, with confirmation. Entering Final Plan offers to promote the current plan to `plan-final.md`; entering Completed asks explicitly. |
 | `AI Helper: Generate Implementation Checklist with AI` | Turns `plan-final.md` into `implementation.md`, a concrete `- [ ]` checklist with a Verification section. |
 | `AI Helper: Set Task Stage` | Manually set which stage a task is tracked at, moving it backward or forward. Only changes `task-progress.json` — it doesn't touch or delete any artifact files. |
@@ -83,12 +82,12 @@ YYYY-MM-DD_task_N/
 ├── task.md                    # Your request: goal, scope, constraints
 ├── context-pack.md            # Auto-generated snapshot sent to Copilot (uses tracked changed files for impl reviews; open editors as fallback)
 ├── plan.md                    # THE plan — revised in place when reviews are applied
-├── plan-high-review.md        # High-level review of the plan (+ optional -reply.md)
-├── plan-low-review.md         # Low-level review of the plan (+ optional -reply.md)
+├── plan-high-review.md        # High-level review of the plan
+├── plan-low-review.md         # Low-level review of the plan
 ├── plan-final.md              # The approved plan (human-promoted)
 ├── implementation.md          # Checklist derived from the final plan, checked off as reviews confirm items
-├── impl-high-review.md        # High-level implementation review (+ optional -reply.md)
-├── impl-low-review.md         # Low-level implementation review (+ optional -reply.md)
+├── impl-high-review.md        # High-level implementation review
+├── impl-low-review.md         # Low-level implementation review
 └── runs/
     └── 001-copilot-lm-plan.md # Log of each AI run: prompt sent + result
 ```

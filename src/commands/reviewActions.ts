@@ -4,7 +4,6 @@ import {
   hasValidMetaResourcesPath,
 } from "../config/settings";
 import {
-  getReviewReplyFilename,
   isPlanReviewStage,
   isReviewStage,
   PLAN_FILENAME,
@@ -439,11 +438,11 @@ export async function runReviewWithAI(
 }
 
 /**
- * Apply the current review: the AI rewrites the plan (plan review stages)
- * or the implementation checklist (implementation review stages) in place,
- * taking into account the review and, if present, the user's reply file.
- * The stage does not change — re-run the review or move to the next stage
- * explicitly.
+ * Apply the current review: for plan review stages the AI rewrites the plan
+ * in place; for implementation review stages it re-runs the AI
+ * implementation against the codebase to address the review's findings
+ * (see applyImplementationReviewWithAI). The stage does not change —
+ * re-run the review or move to the next stage explicitly.
  */
 export async function applyReviewWithAI(
   extensionUri: vscode.Uri,
@@ -468,13 +467,6 @@ export async function applyReviewWithAI(
     return;
   }
 
-  const replyFilename = getReviewReplyFilename(stage);
-  const replyContent = replyFilename
-    ? await readNonEmptyText(
-        vscode.Uri.joinPath(resolved.folderUri, replyFilename)
-      )
-    : undefined;
-
   const isPlanReview = isPlanReviewStage(stage);
 
   if (!isPlanReview) {
@@ -487,15 +479,13 @@ export async function applyReviewWithAI(
       resolved.folderUri,
       workspaceRoot,
       stage,
-      reviewContent,
-      replyContent
+      reviewContent
     );
     return;
   }
 
   const variables: Record<string, string> = {
     review: reviewContent,
-    reply: replyContent ?? "_No reply provided._",
   };
 
   const currentPlanUri = await resolveCurrentPlanUri(resolved.folderUri);
@@ -521,9 +511,7 @@ export async function applyReviewWithAI(
   const outputLabel = PLAN_FILENAME;
 
   const confirmation = await vscode.window.showWarningMessage(
-    `This will rewrite ${outputLabel} in place, addressing the review${
-      replyContent ? " and your reply" : ""
-    }.`,
+    `This will rewrite ${outputLabel} in place, addressing the review.`,
     { modal: true },
     "Apply"
   );
@@ -550,18 +538,17 @@ export async function applyReviewWithAI(
 
 /**
  * Apply an implementation review by re-running the AI implementation
- * runner against the review's findings (and the author's reply, if any),
- * making real code changes rather than editing implementation.md directly.
- * Reuses executeImplementationRun so the result is written and re-reviewed
- * exactly like a normal implementation run.
+ * runner against the review's findings, making real code changes rather
+ * than editing implementation.md directly. Reuses executeImplementationRun
+ * so the result is written and re-reviewed exactly like a normal
+ * implementation run.
  */
 async function applyImplementationReviewWithAI(
   extensionUri: vscode.Uri,
   folderUri: vscode.Uri,
   workspaceRoot: vscode.WorkspaceFolder,
   stage: TaskStage,
-  reviewContent: string,
-  replyContent: string | undefined
+  reviewContent: string
 ): Promise<void> {
   const planFinalContent = await readNonEmptyText(
     vscode.Uri.joinPath(folderUri, "plan-final.md")
@@ -582,9 +569,7 @@ async function applyImplementationReviewWithAI(
   }
 
   const confirmation = await vscode.window.showWarningMessage(
-    "This will re-run the AI implementation against the codebase to address the review" +
-      (replyContent ? " and your reply" : "") +
-      ".",
+    "This will re-run the AI implementation against the codebase to address the review.",
     { modal: true },
     "Apply"
   );
@@ -605,7 +590,6 @@ async function applyImplementationReviewWithAI(
       contextPack: contextPackContent,
       plan: planFinalContent,
       review: reviewContent,
-      reply: replyContent ?? "_No reply provided._",
     }
   );
 
@@ -617,29 +601,6 @@ async function applyImplementationReviewWithAI(
     model.modelId,
     "Applying implementation review with Copilot...",
     stage
-  );
-}
-
-/**
- * Open (creating if needed) the reply file for the current review, where
- * the user can push back on or clarify review points before applying it.
- */
-export async function replyToReview(node?: TaskNodeArg): Promise<void> {
-  const resolved = await resolveTask(node, REVIEW_STAGES, "Reply to Review");
-  if (!resolved) {
-    return;
-  }
-  const stage = resolved.progress.currentStage;
-  const replyFilename = getReviewReplyFilename(stage);
-  if (!replyFilename) {
-    return;
-  }
-  const replyUri = vscode.Uri.joinPath(resolved.folderUri, replyFilename);
-  await openOrCreateDocument(
-    replyUri,
-    `# Reply: ${STAGE_DISPLAY_NAMES[stage]}\n\n` +
-      `_Respond here to review points you disagree with or want to clarify. ` +
-      `This file is sent to the AI together with the review when you Apply it._\n\n`
   );
 }
 
@@ -1084,10 +1045,6 @@ export function registerReviewActionCommands(
     vscode.commands.registerCommand(
       "vs-code-ai-helper.applyReviewWithAI",
       (node?: TaskNodeArg) => applyReviewWithAI(context.extensionUri, node)
-    ),
-    vscode.commands.registerCommand(
-      "vs-code-ai-helper.replyToReview",
-      (node?: TaskNodeArg) => replyToReview(node)
     ),
     vscode.commands.registerCommand(
       "vs-code-ai-helper.viewReview",

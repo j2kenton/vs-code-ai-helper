@@ -54,11 +54,6 @@
         "icon": "$(eye)"
       },
       {
-        "command": "vs-code-ai-helper.replyToReview",
-        "title": "AI Helper: Reply to Review",
-        "icon": "$(comment)"
-      },
-      {
         "command": "vs-code-ai-helper.applyReviewWithAI",
         "title": "AI Helper: Apply Review with AI",
         "icon": "$(wand)"
@@ -198,11 +193,6 @@
           "command": "vs-code-ai-helper.runReviewWithAI",
           "when": "view == vs-code-ai-helper.tasksView && (viewItem == task-active-review || viewItem =~ /^stage-review-current/)",
           "group": "inline@2.5"
-        },
-        {
-          "command": "vs-code-ai-helper.replyToReview",
-          "when": "view == vs-code-ai-helper.tasksView && (viewItem == task-active-review || viewItem =~ /^stage-review-current/)",
-          "group": "inline@2"
         },
         {
           "command": "vs-code-ai-helper.applyReviewWithAI",

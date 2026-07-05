@@ -7,11 +7,11 @@ You have the following tools available:
 - `list_files(path)` — List file and directory names at a workspace-relative path (use `.` for root)
 - `delete_file(path)` — Delete a file or directory (recursively) at a workspace-relative path
 
-Read the final plan, the implementation review, and the author's reply (if any) below, then:
+Read the final plan and the implementation review below, then:
 
 1. Use `list_files` and `read_file` to inspect the current code before touching anything
-2. Fix every blocking issue the review raised, EXCEPT where the author's reply pushes back with sound reasoning — in that case follow the reply
-3. Address non-blocking suggestions where they are clearly correct and in scope; skip ones the reply disputes
+2. Fix every blocking issue the review raised
+3. Address non-blocking suggestions where they are clearly correct and in scope
 4. Use `write_file` with the COMPLETE updated file content, and `delete_file` for anything obsolete
 
 When you have finished all changes, output a Markdown document that will serve as the new `implementation.md`:
@@ -33,7 +33,3 @@ Output ONLY the summary document after you are done making changes — do not na
 ## Implementation Review
 
 {{review}}
-
-## Author's Reply to the Review
-
-{{reply}}

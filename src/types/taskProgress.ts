@@ -110,7 +110,7 @@ export const STAGE_ARTIFACT_FILENAMES: Record<TaskStage, string | undefined> =
 
 /**
  * The stages that are review stages, in which the review actions
- * (view / reply / apply / next stage) are available.
+ * (view / apply / next stage) are available.
  */
 export const REVIEW_STAGES: readonly TaskStage[] = [
   "plan-high-review",
@@ -144,19 +144,6 @@ export function isReviewStage(stage: TaskStage): boolean {
  */
 export function isPlanReviewStage(stage: TaskStage): boolean {
   return stage === "plan-high-review" || stage === "plan-low-review";
-}
-
-/**
- * The reply artifact filename for a review stage (the user's response to a
- * review, fed to the AI alongside the review when applying it), or
- * undefined for non-review stages.
- */
-export function getReviewReplyFilename(stage: TaskStage): string | undefined {
-  const artifact = STAGE_ARTIFACT_FILENAMES[stage];
-  if (!artifact || !isReviewStage(stage)) {
-    return undefined;
-  }
-  return artifact.replace(/\.md$/, "-reply.md");
 }
 
 /**
