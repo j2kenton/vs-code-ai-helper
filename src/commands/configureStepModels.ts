@@ -19,10 +19,25 @@ interface ModelPickItem extends vscode.QuickPickItem {
   clearWorkspaceDefault?: boolean;
 }
 
-type StageSave =
+export type StageSave =
   | { type: "workspace"; modelId: string | undefined }
   | { type: "taskOnly"; modelId: string | undefined }
   | { type: "taskAndWorkspace"; modelId: string };
+
+export async function applyStageSave(
+  stage: TaskStage,
+  save: StageSave,
+  taskFolderUri: vscode.Uri | undefined
+): Promise<void> {
+  if (save.type === "workspace") {
+    await setAiModelDefault(stage, save.modelId);
+  } else if (save.type === "taskOnly") {
+    await setTaskStageModel(taskFolderUri!, stage, save.modelId);
+  } else {
+    await setAiModelDefault(stage, save.modelId);
+    await setTaskStageModel(taskFolderUri!, stage, undefined);
+  }
+}
 
 interface ConfigureModelArg {
   taskFolderUri?: vscode.Uri;
@@ -120,7 +135,7 @@ async function resolveTaskFolderUri(
   return { cancelled: false, taskFolderUri: pickedTask.task.folderUri };
 }
 
-async function collectStageSelection(
+export async function collectStageSelection(
   stage: TaskStage,
   models: readonly vscode.LanguageModelChat[],
   taskFolderUri: vscode.Uri | undefined
@@ -238,20 +253,112 @@ export async function configureStepModels(
   }
 
   for (const [stage, save] of selections) {
-    if (save.type === "workspace") {
-      await setAiModelDefault(stage, save.modelId);
-    } else if (save.type === "taskOnly") {
-      await setTaskStageModel(taskFolderUri!, stage, save.modelId);
-    } else {
-      await setAiModelDefault(stage, save.modelId);
-      await setTaskStageModel(taskFolderUri!, stage, undefined);
-    }
+    await applyStageSave(stage, save, taskFolderUri);
   }
 
   void vscode.window.showInformationMessage(
     taskFolderUri
       ? "Saved per-step model selections for this task."
       : "Saved per-step workspace default model selections."
+  );
+}
+
+interface StageNodeArg {
+  task: IncompleteTask;
+  stage: TaskStage;
+}
+
+/**
+ * Resolve which task and stage to configure when the command isn't invoked
+ * from a specific stage row (e.g. from the Command Palette): prompt for a
+ * task, then for one of its AI-configurable stages.
+ */
+async function resolveStageTarget(
+  node: StageNodeArg | undefined
+): Promise<StageNodeArg | undefined> {
+  if (node?.task && node.stage) {
+    return node;
+  }
+
+  if (!hasValidMetaResourcesPath()) {
+    void vscode.window.showErrorMessage(
+      "No meta resources folder configured. Please set one first."
+    );
+    return undefined;
+  }
+  const workspaceRoot = vscode.workspace.workspaceFolders?.[0];
+  if (!workspaceRoot) {
+    void vscode.window.showErrorMessage(
+      "No workspace folder open. Please open a folder first."
+    );
+    return undefined;
+  }
+
+  const tasks = await findAllTasks(
+    vscode.Uri.joinPath(workspaceRoot.uri, getMetaResourcesPath())
+  );
+  if (tasks.length === 0) {
+    void vscode.window.showInformationMessage(
+      "No tasks found yet. Start a task first."
+    );
+    return undefined;
+  }
+
+  const pickedTask = await vscode.window.showQuickPick(
+    tasks.map((task) => ({
+      label: task.folderName,
+      description: `Stage: ${STAGE_DISPLAY_NAMES[task.progress.currentStage]}`,
+      task,
+    })),
+    {
+      title: "Set Model for This Step",
+      placeHolder: "Select a task",
+    }
+  );
+  if (!pickedTask) {
+    return undefined;
+  }
+
+  const pickedStage = await vscode.window.showQuickPick(
+    AI_MODEL_STAGES.map((stage) => ({
+      label: STAGE_DISPLAY_NAMES[stage],
+      stage,
+    })),
+    {
+      title: "Set Model for This Step",
+      placeHolder: "Select a step",
+    }
+  );
+  if (!pickedStage) {
+    return undefined;
+  }
+
+  return { task: pickedTask.task, stage: pickedStage.stage };
+}
+
+export async function setStageModel(node?: StageNodeArg): Promise<void> {
+  const target = await resolveStageTarget(node);
+  if (!target) {
+    return;
+  }
+
+  const models = await getAvailableCopilotModels();
+  if (models.length === 0) {
+    void vscode.window.showWarningMessage(
+      "No Copilot models are available. Sign in to Copilot and try again."
+    );
+    return;
+  }
+
+  const taskFolderUri = target.task.folderUri;
+  const save = await collectStageSelection(target.stage, models, taskFolderUri);
+  if (!save) {
+    return;
+  }
+
+  await applyStageSave(target.stage, save, taskFolderUri);
+  void vscode.window.showInformationMessage(
+    `Saved model for ${STAGE_DISPLAY_NAMES[target.stage]}.`
   );
 }
 
@@ -263,4 +370,10 @@ export function registerConfigureStepModelsCommand(
     (arg?: ConfigureModelArg) => configureStepModels(arg)
   );
   context.subscriptions.push(disposable);
+
+  const stageDisposable = vscode.commands.registerCommand(
+    "vs-code-ai-helper.setStageModel",
+    (arg?: StageNodeArg) => setStageModel(arg)
+  );
+  context.subscriptions.push(stageDisposable);
 }

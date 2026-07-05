@@ -4,6 +4,7 @@ import {
   hasValidMetaResourcesPath,
 } from "../config/settings";
 import {
+  AI_MODEL_STAGES,
   isReviewStage,
   STAGE_ARTIFACT_FILENAMES,
   STAGE_DISPLAY_NAMES,
@@ -161,7 +162,7 @@ export class StageNode extends vscode.TreeItem {
     }
 
     // The current review stage's row carries the review action buttons
-    this.contextValue =
+    const baseContextValue =
       status === "current" && isReviewStage(stage)
         ? "stage-review-current"
         : status === "current" && stage === "plan"
@@ -173,6 +174,13 @@ export class StageNode extends vscode.TreeItem {
         : status === "current"
           ? "stage-current"
         : "stage";
+
+    // Stages that run an AI model get a "-modelable" suffix so the tree's
+    // per-step "Set Model" hover action can target them via a regex `when`
+    // clause without disturbing the status-specific action buttons above.
+    this.contextValue = AI_MODEL_STAGES.includes(stage)
+      ? `${baseContextValue}-modelable`
+      : baseContextValue;
   }
 }
 

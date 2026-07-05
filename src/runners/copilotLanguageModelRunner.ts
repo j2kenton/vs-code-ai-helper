@@ -60,7 +60,12 @@ export class CopilotLanguageModelRunner implements AgentRunner {
     const requestedModel = request.modelId
       ? models.find((candidate) => candidate.id === request.modelId)
       : undefined;
-    const model = requestedModel ?? models[0];
+    const autoModel = models.find(
+      (candidate) =>
+        candidate.id.toLowerCase() === "auto" ||
+        candidate.name.toLowerCase() === "auto"
+    );
+    const model = requestedModel ?? autoModel ?? models[0];
     if (!model) {
       return {
         runnerId: this.id,

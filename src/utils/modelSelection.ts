@@ -125,10 +125,26 @@ export async function resolveModelForStage(
   return { source: "none" };
 }
 
+function isAutoModel(model: vscode.LanguageModelChat): boolean {
+  return model.id.toLowerCase() === "auto" || model.name.toLowerCase() === "auto";
+}
+
 export async function getAvailableCopilotModels(): Promise<
   vscode.LanguageModelChat[]
 > {
-  return vscode.lm.selectChatModels({ vendor: "copilot" });
+  const models = await vscode.lm.selectChatModels({ vendor: "copilot" });
+  const autoIndex = models.findIndex(isAutoModel);
+  if (autoIndex <= 0) {
+    return models;
+  }
+
+  // Surface an "auto" model first so it reads as the default choice.
+  const reordered = [...models];
+  // autoIndex > 0 guarantees splice returns the removed element.
+  // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+  const [autoModel] = reordered.splice(autoIndex, 1) as [vscode.LanguageModelChat];
+  reordered.unshift(autoModel);
+  return reordered;
 }
 
 export function describeModel(

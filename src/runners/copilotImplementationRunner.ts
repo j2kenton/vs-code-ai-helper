@@ -327,9 +327,12 @@ export async function runImplementationWithCopilot(options: {
   const requestedModel = modelId
     ? models.find((m) => m.id === modelId)
     : undefined;
+  const autoModel = models.find(
+    (m) => m.id.toLowerCase() === "auto" || m.name.toLowerCase() === "auto"
+  );
   // models.length > 0 is guaranteed by the check above
   // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-  const model = requestedModel ?? models[0]!;
+  const model = requestedModel ?? autoModel ?? models[0]!;
 
   onProgress(`Using model: ${model.name}`);
 
