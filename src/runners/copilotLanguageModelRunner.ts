@@ -57,7 +57,10 @@ export class CopilotLanguageModelRunner implements AgentRunner {
       };
     }
 
-    const model = models[0];
+    const requestedModel = request.modelId
+      ? models.find((candidate) => candidate.id === request.modelId)
+      : undefined;
+    const model = requestedModel ?? models[0];
     if (!model) {
       return {
         runnerId: this.id,
@@ -83,11 +86,16 @@ export class CopilotLanguageModelRunner implements AgentRunner {
 
       await writeTextFile(request.outputFile, output);
 
+      const fallbackNote =
+        request.modelId && !requestedModel
+          ? ` Requested model ${request.modelId} was unavailable, so ${model.name} was used instead.`
+          : "";
+
       return {
         runnerId: this.id,
         status: "completed",
         outputFile: request.outputFile,
-        summary: `Generated ${output.length} characters using ${model.name}.`,
+        summary: `Generated ${output.length} characters using ${model.name}.${fallbackNote}`,
       };
     } catch (error) {
       if (

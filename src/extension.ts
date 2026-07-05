@@ -14,6 +14,7 @@ import { registerResumeTaskCommand } from "./commands/resumeTask";
 import { registerGeneratePlanWithAICommand } from "./commands/generatePlanWithAI";
 import { registerReviewActionCommands } from "./commands/reviewActions";
 import { registerSetTaskStageCommand } from "./commands/setTaskStage";
+import { registerConfigureStepModelsCommand } from "./commands/configureStepModels";
 import { TaskTreeProvider, TASKS_VIEW_ID } from "./views/taskTreeProvider";
 import { TaskStatusBar } from "./views/taskStatusBar";
 import { TASK_PROGRESS_FILENAME } from "./types/taskProgress";
@@ -89,6 +90,7 @@ export function activate(context: vscode.ExtensionContext): void {
   registerGeneratePlanWithAICommand(context);
   registerReviewActionCommands(context);
   registerSetTaskStageCommand(context);
+  registerConfigureStepModelsCommand(context);
 
   // Register the hello world command (keeping for now)
   const helloWorldDisposable = vscode.commands.registerCommand(

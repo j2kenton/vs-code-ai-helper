@@ -74,6 +74,11 @@
         "icon": "$(tasklist)"
       },
       {
+        "command": "vs-code-ai-helper.configureStepModels",
+        "title": "AI Helper: Configure AI Models per Step",
+        "icon": "$(server-environment)"
+      },
+      {
         "command": "vs-code-ai-helper.setTaskStage",
         "title": "AI Helper: Set Task Stage",
         "icon": "$(milestone)"
@@ -136,6 +141,11 @@
           "command": "vs-code-ai-helper.expandAllTasks",
           "when": "view == vs-code-ai-helper.tasksView && vs-code-ai-helper.hasTasks",
           "group": "navigation@3"
+        },
+        {
+          "command": "vs-code-ai-helper.configureStepModels",
+          "when": "view == vs-code-ai-helper.tasksView",
+          "group": "navigation@4"
         }
       ],
       "view/item/context": [
@@ -148,6 +158,11 @@
           "command": "vs-code-ai-helper.setTaskStage",
           "when": "view == vs-code-ai-helper.tasksView && (viewItem == task-active || viewItem == task-created || viewItem == task-completed)",
           "group": "inline@2"
+        },
+        {
+          "command": "vs-code-ai-helper.configureStepModels",
+          "when": "view == vs-code-ai-helper.tasksView && (viewItem == task-active || viewItem == task-created || viewItem == task-completed || viewItem == task-active-review)",
+          "group": "task@3"
         },
         {
           "command": "vs-code-ai-helper.runReviewWithAI",
@@ -220,6 +235,21 @@
           "default": false,
           "scope": "resource",
           "description": "When true, suppresses folder configuration prompts permanently for this workspace"
+        },
+        "vs-code-ai-helper.aiModelDefaults": {
+          "type": "object",
+          "default": {},
+          "scope": "resource",
+          "markdownDescription": "Workspace defaults for Copilot model IDs by AI workflow stage. Configure via **AI Helper: Configure AI Models per Step**.",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "vs-code-ai-helper.modelSelectionPromptShown": {
+          "type": "boolean",
+          "default": false,
+          "scope": "resource",
+          "description": "Tracks whether first-task model-selection onboarding has already been shown in this workspace"
         }
       }
     }

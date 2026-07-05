@@ -32,6 +32,7 @@ export interface AgentRunRequest {
   stage: AgentWorkflowStage;
   prompt: string;
   outputFile: vscode.Uri;
+  modelId?: string;
 }
 
 /**

@@ -112,6 +112,19 @@ export const REVIEW_STAGES: readonly TaskStage[] = [
 ] as const;
 
 /**
+ * Stages that execute an AI run and therefore can have per-stage model
+ * selection configured.
+ */
+export const AI_MODEL_STAGES: readonly TaskStage[] = [
+  "plan",
+  "plan-high-review",
+  "plan-low-review",
+  "implementation",
+  "impl-high-review",
+  "impl-low-review",
+] as const;
+
+/**
  * Whether a stage is one of the four review stages
  */
 export function isReviewStage(stage: TaskStage): boolean {

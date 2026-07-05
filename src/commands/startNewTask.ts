@@ -2,6 +2,8 @@ import * as vscode from "vscode";
 import {
   getMetaResourcesPath,
   hasValidMetaResourcesPath,
+  isModelSelectionPromptShown,
+  setModelSelectionPromptShown,
 } from "../config/settings";
 import { TASK_FILENAME } from "../types/taskProgress";
 import {
@@ -99,6 +101,22 @@ export async function startNewTask(): Promise<string | undefined> {
 
     const taskFileUri = vscode.Uri.joinPath(taskFolderUri, TASK_FILENAME);
     await openOrCreateDocument(taskFileUri);
+
+    if (!isModelSelectionPromptShown()) {
+      await setModelSelectionPromptShown();
+      const modelChoice = await vscode.window.showInformationMessage(
+        "Choose Copilot models per workflow step now? You can save selections for just this task or as workspace defaults.",
+        "Configure Models",
+        "Skip"
+      );
+
+      if (modelChoice === "Configure Models") {
+        await vscode.commands.executeCommand(
+          "vs-code-ai-helper.configureStepModels",
+          { taskFolderUri }
+        );
+      }
+    }
 
     const relativePath = vscode.workspace.asRelativePath(taskFileUri);
     await vscode.env.clipboard.writeText(relativePath);

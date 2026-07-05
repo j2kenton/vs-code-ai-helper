@@ -31,6 +31,7 @@ import { generateContextPack, writeContextPack } from "../utils/contextPack";
 import { renderPromptTemplate } from "../utils/promptTemplates";
 import { writeRunLog } from "../utils/runLog";
 import { CopilotLanguageModelRunner } from "../runners/copilotLanguageModelRunner";
+import { resolveModelForStage } from "../utils/modelSelection";
 
 /**
  * The optional argument tree-view buttons pass to these commands: the tree
@@ -187,6 +188,11 @@ async function runAiToFile(options: {
     return false;
   }
 
+  const model = await resolveModelForStage(
+    options.taskFolderUri,
+    options.logStage
+  );
+
   let completed = false;
   await vscode.window.withProgress(
     {
@@ -210,6 +216,7 @@ async function runAiToFile(options: {
           stage: options.logStage,
           prompt,
           outputFile: options.outputFileUri,
+          modelId: model.modelId,
         },
         token
       );

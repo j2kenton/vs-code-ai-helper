@@ -9,6 +9,7 @@ import { renderPromptTemplate } from "../utils/promptTemplates";
 import { writeRunLog } from "../utils/runLog";
 import { pickTaskFolder } from "../utils/pickTaskFolder";
 import { CopilotLanguageModelRunner } from "../runners/copilotLanguageModelRunner";
+import { resolveModelForStage } from "../utils/modelSelection";
 import { TASK_FILENAME, TaskStage } from "../types/taskProgress";
 
 /**
@@ -106,6 +107,7 @@ export async function generatePlanWithAI(
       cancellable: true,
     },
     async (progress, token) => {
+      const model = await resolveModelForStage(taskFolderUri, "plan");
       const contextPackUri = await writeContextPack(
         taskFolderUri,
         workspaceRoot.uri
@@ -131,6 +133,7 @@ export async function generatePlanWithAI(
           stage: "plan",
           prompt,
           outputFile: planFileUri,
+          modelId: model.modelId,
         },
         token
       );
