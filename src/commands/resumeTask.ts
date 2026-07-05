@@ -19,8 +19,13 @@ import {
 /**
  * Resume an incomplete task from where the user left off.
  * Returns the task folder name if resumed, undefined if cancelled/failed.
+ *
+ * When invoked from the tasks tree view, the tree node is passed in and the
+ * task picker is skipped in favor of resuming that specific task.
  */
-export async function resumeTask(): Promise<string | undefined> {
+export async function resumeTask(node?: {
+  task?: IncompleteTask;
+}): Promise<string | undefined> {
   // Check if meta resources path is configured
   if (!hasValidMetaResourcesPath()) {
     const selection = await vscode.window.showErrorMessage(
@@ -57,6 +62,20 @@ export async function resumeTask(): Promise<string | undefined> {
   // Find incomplete tasks
   const incompleteTasks = await findIncompleteTasks(metaFolderUri);
 
+  // If a specific task was passed in (e.g. from the tasks tree view), resume
+  // that one directly instead of showing the picker.
+  const preselectedFolder = node?.task?.folderName;
+  const preselectedTask = preselectedFolder
+    ? incompleteTasks.find((task) => task.folderName === preselectedFolder)
+    : undefined;
+
+  if (preselectedFolder && !preselectedTask) {
+    void vscode.window.showInformationMessage(
+      `${preselectedFolder} is already completed.`
+    );
+    return undefined;
+  }
+
   if (incompleteTasks.length === 0) {
     void vscode.window.showInformationMessage(
       "No incomplete tasks found. Use 'Start New Task' to create one."
@@ -67,7 +86,9 @@ export async function resumeTask(): Promise<string | undefined> {
   // Let user select which task to resume
   let selectedTask: IncompleteTask;
 
-  if (incompleteTasks.length === 1) {
+  if (preselectedTask) {
+    selectedTask = preselectedTask;
+  } else if (incompleteTasks.length === 1) {
     const task = incompleteTasks[0];
     if (!task) {
       return undefined;

@@ -146,6 +146,10 @@ export function activate(context: vscode.ExtensionContext): void {
     configListener
   );
 
+  // Populate the status bar immediately, without waiting for the tree view
+  // to be shown or for a change event to occur
+  taskTreeProvider.refresh();
+
   // Handle activation prompt flow
   void handleActivationPrompt();
 }

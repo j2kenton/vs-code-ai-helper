@@ -14,7 +14,6 @@ export class TaskStatusBar implements vscode.Disposable {
       vscode.StatusBarAlignment.Left,
       100
     );
-    this.item.command = "vs-code-ai-helper.resumeTask";
   }
 
   /**
@@ -36,6 +35,11 @@ export class TaskStatusBar implements vscode.Disposable {
     const totalSteps = STAGE_ORDER.length;
 
     this.item.text = `$(checklist) ${active.folderName}: ${STAGE_DISPLAY_NAMES[stage]} (${stepNumber}/${totalSteps})`;
+    this.item.command = {
+      command: "vs-code-ai-helper.resumeTask",
+      title: "Resume Task",
+      arguments: [{ task: active }],
+    };
     this.item.tooltip = new vscode.MarkdownString(
       [
         `**AI Helper — active task**`,

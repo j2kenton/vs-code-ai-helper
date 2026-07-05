@@ -106,7 +106,8 @@ export class TaskNode extends vscode.TreeItem {
     }
 
     this.tooltip = buildTaskTooltip(task);
-    this.contextValue = "task";
+    this.contextValue =
+      currentStage === "completed" ? "task-completed" : "task-active";
   }
 }
 
@@ -192,8 +193,17 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
   /** Fired after the root task list is (re)loaded, e.g. for the status bar */
   readonly onDidLoadTasks = this._onDidLoadTasks.event;
 
+  /**
+   * Refresh both the tree view and any other listeners (e.g. the status
+   * bar) that depend on the current task list. Loads the task list itself
+   * rather than relying on the tree view asking for its root children,
+   * since that only happens while the view is visible/expanded — without
+   * this, refreshes while the sidebar is collapsed would never reach
+   * listeners of `onDidLoadTasks`.
+   */
   refresh(): void {
     this._onDidChangeTreeData.fire();
+    void this.loadTasks();
   }
 
   getTreeItem(element: TaskTreeNode): vscode.TreeItem {
@@ -210,7 +220,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
     return this.getTaskNodes();
   }
 
-  private async getTaskNodes(): Promise<TaskNode[]> {
+  private async loadTasks(): Promise<IncompleteTask[]> {
     const metaFolderUri = getMetaFolderUri();
 
     void vscode.commands.executeCommand(
@@ -233,6 +243,11 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
     );
 
     this._onDidLoadTasks.fire(tasks);
+    return tasks;
+  }
+
+  private async getTaskNodes(): Promise<TaskNode[]> {
+    const tasks = await this.loadTasks();
 
     // Active tasks first (most recent first), completed tasks after
     const active = tasks.filter((t) => t.progress.currentStage !== "completed");
