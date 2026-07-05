@@ -89,6 +89,48 @@ export async function writeTextFile(
 }
 
 /**
+ * Find open editor tabs for a file, or for anything under a directory path
+ * (so a recursive directory delete also matches its open descendants).
+ */
+function findOpenTabsUnder(fileUri: vscode.Uri): vscode.Tab[] {
+  const target = fileUri.toString();
+  const targetPrefix = target.endsWith("/") ? target : target + "/";
+  return vscode.window.tabGroups.all
+    .flatMap((group) => group.tabs)
+    .filter((tab) => {
+      if (!(tab.input instanceof vscode.TabInputText)) {
+        return false;
+      }
+      const tabUriString = tab.input.uri.toString();
+      return tabUriString === target || tabUriString.startsWith(targetPrefix);
+    });
+}
+
+/**
+ * Delete a file or directory (recursively), first closing any open editor
+ * tabs for it (or, for a directory, its descendants) so a stale dirty
+ * buffer can't resurrect the deleted path on save.
+ *
+ * Throws without deleting anything if a tab couldn't be closed (e.g. the
+ * user cancelled a save-changes prompt for a dirty buffer).
+ */
+export async function deletePath(fileUri: vscode.Uri): Promise<void> {
+  const tabs = findOpenTabsUnder(fileUri);
+  if (tabs.length > 0) {
+    const closed = await vscode.window.tabGroups.close(tabs, false);
+    if (!closed) {
+      throw new Error(
+        `Could not close open editor(s) for ${fileUri.fsPath}; deletion aborted.`
+      );
+    }
+  }
+  await vscode.workspace.fs.delete(fileUri, {
+    recursive: true,
+    useTrash: false,
+  });
+}
+
+/**
  * Open a document in the editor, creating it empty first if it doesn't
  * exist.
  */

@@ -26,11 +26,16 @@ import {
   readNonEmptyText,
   resolveCurrentPlanUri,
   statIfExists,
+  writeTextFile,
 } from "../utils/fileUtils";
 import { generateContextPack, writeContextPack } from "../utils/contextPack";
 import { renderPromptTemplate } from "../utils/promptTemplates";
 import { writeRunLog } from "../utils/runLog";
 import { CopilotLanguageModelRunner } from "../runners/copilotLanguageModelRunner";
+import {
+  checkImplementationAvailability,
+  runImplementationWithCopilot,
+} from "../runners/copilotImplementationRunner";
 import { resolveModelForStage } from "../utils/modelSelection";
 
 /**
@@ -751,6 +756,125 @@ export async function generateImplementationWithAI(
 }
 
 /**
+ * Run the implementation: use Copilot with tool-calling to make actual
+ * code changes in the workspace, then write implementation.md with the
+ * AI-generated summary of what was done.
+ *
+ * Eligible stages: plan-final (first run) or implementation (re-run).
+ */
+export async function runImplementationWithAI(
+  extensionUri: vscode.Uri,
+  node?: TaskNodeArg
+): Promise<void> {
+  const resolved = await resolveTask(
+    node,
+    ["plan-final", "implementation"],
+    "Run Implementation with AI"
+  );
+  if (!resolved) {
+    return;
+  }
+  const workspaceRoot = getWorkspaceRoot();
+  if (!workspaceRoot) {
+    return;
+  }
+
+  const planFinalContent = await readNonEmptyText(
+    vscode.Uri.joinPath(resolved.folderUri, "plan-final.md")
+  );
+  if (!planFinalContent) {
+    void vscode.window.showWarningMessage(
+      "No plan-final.md found. Finalize a plan (Next Stage from the low-level plan review) before running the implementation."
+    );
+    return;
+  }
+
+  const availability = await checkImplementationAvailability();
+  if (!availability.available) {
+    void vscode.window.showWarningMessage(
+      `Copilot is unavailable: ${availability.reason ?? "unknown reason"}. Implement the plan manually instead.`
+    );
+    return;
+  }
+
+  const implementationUri = vscode.Uri.joinPath(
+    resolved.folderUri,
+    "implementation.md"
+  );
+  if (!(await confirmOverwrite(implementationUri, "implementation.md"))) {
+    return;
+  }
+
+  const model = await resolveModelForStage(resolved.folderUri, "implementation");
+
+  const contextPackContent = await generateContextPack(
+    resolved.folderUri,
+    workspaceRoot.uri
+  );
+
+  const prompt = await renderPromptTemplate(
+    extensionUri,
+    "run-implementation.md",
+    { contextPack: contextPackContent, plan: planFinalContent }
+  );
+
+  let result: Awaited<ReturnType<typeof runImplementationWithCopilot>> | undefined;
+
+  await vscode.window.withProgress(
+    {
+      location: vscode.ProgressLocation.Notification,
+      title: "Running implementation with Copilot...",
+      cancellable: true,
+    },
+    async (progress, token) => {
+      result = await runImplementationWithCopilot({
+        prompt,
+        modelId: model.modelId,
+        workspaceUri: workspaceRoot.uri,
+        token,
+        onProgress: (message) => progress.report({ message }),
+      });
+    }
+  );
+
+  if (!result) {
+    return;
+  }
+
+  const logContent = `# Implementation Run\n\nStatus: ${result.status}\n\nFiles changed:\n${
+    result.filesChanged.length > 0
+      ? result.filesChanged.map((f) => `- ${f}`).join("\n")
+      : "_none recorded_"
+  }\n\n${result.summary ?? result.errorMessage ?? ""}`;
+
+  await writeRunLog(resolved.folderUri, "copilot-lm", "implementation", logContent);
+
+  if (result.status === "completed") {
+    // Write the AI-generated summary as implementation.md
+    const summary =
+      result.summary?.trim() ||
+      `## Implementation Complete\n\nFiles changed:\n${
+        result.filesChanged.map((f) => `- ${f}`).join("\n") || "_none recorded_"
+      }`;
+    await writeTextFile(implementationUri, summary);
+
+    await setStage(resolved.folderUri, "implementation");
+
+    const doc = await vscode.workspace.openTextDocument(implementationUri);
+    await vscode.window.showTextDocument(doc);
+    void vscode.window.showInformationMessage(
+      `Implementation complete. ${result.filesChanged.length} file(s) written.`
+    );
+  } else if (result.status === "cancelled") {
+    void vscode.window.showInformationMessage("Implementation cancelled.");
+  } else {
+    void vscode.window.showErrorMessage(
+      `Implementation failed: ${result.errorMessage ?? "unknown error"}`
+    );
+  }
+}
+
+/**
  * Register all review/stage action commands
  */
 export function registerReviewActionCommands(
@@ -781,6 +905,11 @@ export function registerReviewActionCommands(
       "vs-code-ai-helper.generateImplementationWithAI",
       (node?: TaskNodeArg) =>
         generateImplementationWithAI(context.extensionUri, node)
+    ),
+    vscode.commands.registerCommand(
+      "vs-code-ai-helper.runImplementationWithAI",
+      (node?: TaskNodeArg) =>
+        runImplementationWithAI(context.extensionUri, node)
     )
   );
 }

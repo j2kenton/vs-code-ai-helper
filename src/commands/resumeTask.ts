@@ -158,7 +158,13 @@ function getStageActions(task: IncompleteTask): StageAction[] {
         },
       },
       {
+        label: "$(rocket) Run Implementation with AI",
+        description: "AI makes actual code changes from the plan",
+        run: delegate("vs-code-ai-helper.runImplementationWithAI", task),
+      },
+      {
         label: "$(tasklist) Generate Implementation Checklist with AI",
+        description: "Generate a checklist document instead of running directly",
         run: delegate("vs-code-ai-helper.generateImplementationWithAI", task),
       },
       {
@@ -180,7 +186,13 @@ function getStageActions(task: IncompleteTask): StageAction[] {
         },
       },
       {
+        label: "$(rocket) Run Implementation with AI",
+        description: "AI makes actual code changes from the plan",
+        run: delegate("vs-code-ai-helper.runImplementationWithAI", task),
+      },
+      {
         label: "$(tasklist) Generate Implementation Checklist with AI",
+        description: "Generate a checklist document instead of running directly",
         run: delegate("vs-code-ai-helper.generateImplementationWithAI", task),
       },
       {

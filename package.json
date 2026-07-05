@@ -74,6 +74,11 @@
         "icon": "$(tasklist)"
       },
       {
+        "command": "vs-code-ai-helper.runImplementationWithAI",
+        "title": "AI Helper: Run Implementation with AI",
+        "icon": "$(rocket)"
+      },
+      {
         "command": "vs-code-ai-helper.configureStepModels",
         "title": "AI Helper: Configure AI Models per Step",
         "icon": "$(server-environment)"
@@ -170,6 +175,16 @@
           "group": "inline@3"
         },
         {
+          "command": "vs-code-ai-helper.runImplementationWithAI",
+          "when": "view == vs-code-ai-helper.tasksView && (viewItem == stage-plan-final-current || viewItem == stage-impl-current)",
+          "group": "inline@1"
+        },
+        {
+          "command": "vs-code-ai-helper.runReviewWithAI",
+          "when": "view == vs-code-ai-helper.tasksView && viewItem == stage-impl-current",
+          "group": "inline@2"
+        },
+        {
           "command": "vs-code-ai-helper.viewReview",
           "when": "view == vs-code-ai-helper.tasksView && (viewItem == task-active-review || viewItem == stage-review-current)",
           "group": "inline@1"
@@ -264,6 +279,7 @@
     "check-types": "tsc --noEmit",
     "lint": "eslint src",
     "lint:fix": "eslint src --fix",
+    "test:unit": "tsc --project tsconfig.test.json && node --test out/test/pathSafety.test.js",
     "test": "vscode-test",
     "vsix": "vsce package",
     "publish": "vsce publish",

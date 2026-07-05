@@ -164,8 +164,12 @@ export class StageNode extends vscode.TreeItem {
     this.contextValue =
       status === "current" && isReviewStage(stage)
         ? "stage-review-current"
-        : status === "current" && (stage === "plan" || stage === "implementation")
+        : status === "current" && stage === "plan"
           ? "stage-reviewable-current"
+        : status === "current" && stage === "plan-final"
+          ? "stage-plan-final-current"
+        : status === "current" && stage === "implementation"
+          ? "stage-impl-current"
         : status === "current"
           ? "stage-current"
         : "stage";
