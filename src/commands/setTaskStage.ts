@@ -28,6 +28,7 @@ import {
  */
 export async function setTaskStage(node?: {
   task?: IncompleteTask;
+  stage?: TaskStage;
 }): Promise<void> {
   if (!hasValidMetaResourcesPath()) {
     void vscode.window.showErrorMessage(
@@ -86,23 +87,26 @@ export async function setTaskStage(node?: {
 
   const { task } = selectedTaskItem;
 
-  const stageItems = STAGE_ORDER.map((stage) => ({
-    label: STAGE_DISPLAY_NAMES[stage],
-    description:
-      stage === task.progress.currentStage ? "Current stage" : undefined,
-    stage,
-  }));
+  let newStage: TaskStage | undefined = node?.stage;
+  if (!newStage) {
+    const stageItems = STAGE_ORDER.map((stage) => ({
+      label: STAGE_DISPLAY_NAMES[stage],
+      description:
+        stage === task.progress.currentStage ? "Current stage" : undefined,
+      stage,
+    }));
 
-  const selectedStageItem = await vscode.window.showQuickPick(stageItems, {
-    placeHolder: "Select the stage this task should be on",
-    title: `Set Stage: ${task.folderName}`,
-  });
+    const selectedStageItem = await vscode.window.showQuickPick(stageItems, {
+      placeHolder: "Select the stage this task should be on",
+      title: `Set Stage: ${task.folderName}`,
+    });
 
-  if (!selectedStageItem) {
-    return;
+    if (!selectedStageItem) {
+      return;
+    }
+    newStage = selectedStageItem.stage;
   }
 
-  const newStage: TaskStage = selectedStageItem.stage;
   if (newStage === task.progress.currentStage) {
     return;
   }
