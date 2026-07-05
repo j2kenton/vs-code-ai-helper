@@ -236,7 +236,7 @@
         },
         {
           "command": "vs-code-ai-helper.setTaskStage",
-          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage/",
+          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage(-modelable)?$/",
           "group": "inline@1"
         },
         {

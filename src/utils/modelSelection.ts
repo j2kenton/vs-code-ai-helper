@@ -152,7 +152,7 @@ export function describeModel(
   availableModels: readonly vscode.LanguageModelChat[]
 ): string {
   if (!modelId) {
-    return "Default (first available model)";
+    return "Default (prefers auto model)";
   }
 
   const model = availableModels.find((candidate) => candidate.id === modelId);
