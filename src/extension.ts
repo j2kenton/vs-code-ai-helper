@@ -117,6 +117,10 @@ export function activate(context: vscode.ExtensionContext): void {
     "vs-code-ai-helper.refreshTasksView",
     () => taskTreeProvider.refresh()
   );
+  const expandAllCommand = vscode.commands.registerCommand(
+    "vs-code-ai-helper.expandAllTasks",
+    () => taskTreeProvider.expandAll(tasksTreeView)
+  );
 
   // Auto-refresh whenever any task's progress file changes
   const progressWatcher = vscode.workspace.createFileSystemWatcher(
@@ -138,6 +142,7 @@ export function activate(context: vscode.ExtensionContext): void {
     taskStatusBar,
     tasksLoadedListener,
     refreshCommand,
+    expandAllCommand,
     progressWatcher,
     configListener
   );

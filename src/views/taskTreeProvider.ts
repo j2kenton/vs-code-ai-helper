@@ -164,6 +164,10 @@ export class StageNode extends vscode.TreeItem {
     this.contextValue =
       status === "current" && isReviewStage(stage)
         ? "stage-review-current"
+        : status === "current" && (stage === "plan" || stage === "implementation")
+          ? "stage-reviewable-current"
+        : status === "current"
+          ? "stage-current"
         : "stage";
   }
 }
@@ -189,6 +193,8 @@ export function getMetaFolderUri(): vscode.Uri | undefined {
 export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
   private readonly _onDidChangeTreeData = new vscode.EventEmitter<void>();
   readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
+  private lastTaskNodes: TaskNode[] = [];
+  private readonly taskNodesByFolder = new Map<string, TaskNode>();
 
   private readonly _onDidLoadTasks = new vscode.EventEmitter<
     IncompleteTask[]
@@ -209,8 +215,31 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
     void this.loadTasks();
   }
 
+  /** Expand every task row currently shown in the tree view. */
+  async expandAll(treeView: vscode.TreeView<TaskTreeNode>): Promise<void> {
+    if (this.lastTaskNodes.length === 0) {
+      this.lastTaskNodes = await this.getTaskNodes();
+      this._onDidChangeTreeData.fire();
+    }
+
+    for (const node of this.lastTaskNodes) {
+      await treeView.reveal(node, {
+        expand: true,
+        focus: false,
+        select: false,
+      });
+    }
+  }
+
   getTreeItem(element: TaskTreeNode): vscode.TreeItem {
     return element;
+  }
+
+  getParent(element: TaskTreeNode): TaskNode | undefined {
+    if (element instanceof TaskNode) {
+      return undefined;
+    }
+    return this.taskNodesByFolder.get(element.task.folderUri.toString());
   }
 
   async getChildren(element?: TaskTreeNode): Promise<TaskTreeNode[]> {
@@ -260,9 +289,16 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
 
     // Auto-expand the most recently updated active task so the user
     // immediately sees where they are in the workflow
-    return [...active, ...completed].map(
-      (task, index) => new TaskNode(task, index === 0 && active.length > 0)
+    const nodes = [...active, ...completed].map(
+      (task, index) =>
+        new TaskNode(task, index === 0 && active.length > 0)
     );
+    this.taskNodesByFolder.clear();
+    for (const node of nodes) {
+      this.taskNodesByFolder.set(node.task.folderUri.toString(), node);
+    }
+    this.lastTaskNodes = nodes;
+    return nodes;
   }
 
   private async getStageNodes(task: IncompleteTask): Promise<StageNode[]> {
