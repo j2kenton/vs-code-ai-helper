@@ -18,6 +18,7 @@ import {
   findAllTasks,
   IncompleteTask,
   readTaskProgress,
+  updateImplReviewFiles,
   updateTaskProgressStage,
   writeTaskProgress,
 } from "../utils/taskProgressUtils";
@@ -28,7 +29,7 @@ import {
   statIfExists,
   writeTextFile,
 } from "../utils/fileUtils";
-import { generateContextPack, writeContextPack } from "../utils/contextPack";
+import { generateContextPack, writeContextPack, writeImplReviewContextPack } from "../utils/contextPack";
 import { renderPromptTemplate } from "../utils/promptTemplates";
 import { writeRunLog } from "../utils/runLog";
 import { CopilotLanguageModelRunner } from "../runners/copilotLanguageModelRunner";
@@ -365,16 +366,37 @@ export async function runReviewWithAI(
     return;
   }
 
-  // Implementation reviews embed open-file contents so the AI can assess
-  // actual code; plan reviews only need the lightweight pack.
-  const contextPackUri = await writeContextPack(
-    resolved.folderUri,
-    workspaceRoot.uri,
-    !isPlanReview
-  );
-  variables.contextPack = new TextDecoder().decode(
-    await vscode.workspace.fs.readFile(contextPackUri)
-  );
+  // Implementation reviews scope to the task's tracked changed files so the
+  // AI assesses what was actually written, not whatever tabs happen to be
+  // open. Plan reviews only need the lightweight pack (no file contents).
+  let contextPackContent: string;
+  if (isPlanReview) {
+    const contextPackUri = await writeContextPack(
+      resolved.folderUri,
+      workspaceRoot.uri,
+      false
+    );
+    contextPackContent = new TextDecoder().decode(
+      await vscode.workspace.fs.readFile(contextPackUri)
+    );
+  } else {
+    const { contextPackUri, isFallback } = await writeImplReviewContextPack(
+      resolved.folderUri,
+      workspaceRoot.uri,
+      resolved.progress.implReviewFiles
+    );
+    if (isFallback) {
+      void vscode.window.showWarningMessage(
+        "No tracked implementation file set found for this task. " +
+          "The review will be based on currently open editors. " +
+          "For best results, open the files you changed before running the review."
+      );
+    }
+    contextPackContent = new TextDecoder().decode(
+      await vscode.workspace.fs.readFile(contextPackUri)
+    );
+  }
+  variables.contextPack = contextPackContent;
 
   const succeeded = await runAiToFile({
     extensionUri,
@@ -858,7 +880,20 @@ export async function runImplementationWithAI(
       }`;
     await writeTextFile(implementationUri, summary);
 
-    await setStage(resolved.folderUri, "implementation");
+    // Advance stage AND persist the changed-file list for review scoping,
+    // combining both into one write so the file stays consistent.
+    const currentProgress = await readTaskProgress(resolved.folderUri);
+    if (currentProgress) {
+      await writeTaskProgress(
+        resolved.folderUri,
+        updateImplReviewFiles(
+          updateTaskProgressStage(currentProgress, "implementation"),
+          result.filesChanged
+        )
+      );
+    } else {
+      await setStage(resolved.folderUri, "implementation");
+    }
 
     const doc = await vscode.workspace.openTextDocument(implementationUri);
     await vscode.window.showTextDocument(doc);

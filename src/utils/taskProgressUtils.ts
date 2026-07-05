@@ -35,6 +35,18 @@ export async function readTaskProgress(
     // Migrate stage names written by pre-0.6.0 versions; the migrated
     // value is persisted the next time the stage changes.
     progress.currentStage = migrateStage(String(progress.currentStage));
+    // Sanitize implReviewFiles: it must be an array of strings or absent.
+    // task-progress.json can be edited manually, so the field may be null,
+    // a non-array type, or an array containing non-string entries.
+    if (progress.implReviewFiles !== undefined) {
+      if (!Array.isArray(progress.implReviewFiles)) {
+        progress.implReviewFiles = undefined;
+      } else {
+        progress.implReviewFiles = (progress.implReviewFiles as unknown[]).filter(
+          (e): e is string => typeof e === "string"
+        );
+      }
+    }
     return progress;
   } catch {
     // File doesn't exist or is invalid
@@ -95,6 +107,22 @@ export function updateTaskProgressStage(
   return {
     ...progress,
     currentStage: newStage,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * Record the workspace-relative paths changed by the most recent AI
+ * implementation run so implementation reviews can use them as the review
+ * scope instead of relying on open editors.
+ */
+export function updateImplReviewFiles(
+  progress: TaskProgress,
+  files: string[]
+): TaskProgress {
+  return {
+    ...progress,
+    implReviewFiles: files,
     updatedAt: new Date().toISOString(),
   };
 }

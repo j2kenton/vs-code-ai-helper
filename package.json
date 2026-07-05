@@ -289,7 +289,7 @@
     "check-types": "tsc --noEmit",
     "lint": "eslint src",
     "lint:fix": "eslint src --fix",
-    "test:unit": "tsc --project tsconfig.test.json && node --test out/test/pathSafety.test.js",
+    "test:unit": "tsc --project tsconfig.test.json && node --test out/test/pathSafety.test.js out/test/implReviewFileSelection.test.js",
     "test": "vscode-test",
     "vsix": "vsce package",
     "publish": "vsce publish",

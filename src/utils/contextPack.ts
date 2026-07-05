@@ -1,5 +1,33 @@
 import * as vscode from "vscode";
+import * as nodePath from "path";
+import * as nodeFs from "fs";
 import { CONTEXT_PACK_FILENAME, TASK_FILENAME } from "../types/taskProgress";
+import {
+  applyContentCaps,
+  IMPL_REVIEW_MAX_CHARS_PER_FILE,
+  IMPL_REVIEW_MAX_TOTAL_CHARS,
+} from "./implReviewFileSelection";
+import { sanitizeRelativePath } from "./pathSafety";
+
+/**
+ * Resolve the real, symlink-free path of the nearest existing ancestor of
+ * fsPath. Used to detect symlinks/junctions inside the workspace that resolve
+ * outside it. Mirrors the same helper in copilotImplementationRunner.ts.
+ */
+function realpathOfNearestExistingAncestor(fsPath: string): string {
+  let current = fsPath;
+  for (;;) {
+    try {
+      return nodeFs.realpathSync.native(current);
+    } catch {
+      const parent = nodePath.dirname(current);
+      if (parent === current) {
+        return current;
+      }
+      current = parent;
+    }
+  }
+}
 
 /**
  * Read a text file, returning undefined if it does not exist or is empty.
@@ -162,4 +190,347 @@ export async function writeContextPack(
     new TextEncoder().encode(content)
   );
   return contextPackUri;
+}
+
+// ---------------------------------------------------------------------------
+// Implementation-review context pack
+// ---------------------------------------------------------------------------
+
+/**
+ * Get the content of a workspace file, preferring an open editor buffer over
+ * the on-disk copy so that unsaved changes are captured.
+ * Returns undefined when the file is neither open in an editor nor on disk.
+ */
+async function getFileContentForReview(
+  fileUri: vscode.Uri
+): Promise<string | undefined> {
+  const openDoc = vscode.workspace.textDocuments.find(
+    (doc) => doc.uri.toString() === fileUri.toString()
+  );
+  if (openDoc) {
+    return openDoc.getText();
+  }
+  try {
+    const bytes = await vscode.workspace.fs.readFile(fileUri);
+    return new TextDecoder().decode(bytes);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Build the body of context-pack.md for an implementation review.
+ *
+ * **Tracked / no-change mode** (when `implReviewFiles` is an array, even
+ * empty): the review is scoped to the files recorded by the AI
+ * implementation run, which may be zero. If a tracked file is open in
+ * the editor, the unsaved buffer is used in place of the on-disk copy.
+ * `isFallback` is `false` in this mode.
+ *
+ * **Fallback mode** (when `implReviewFiles` is `undefined`): the task was
+ * implemented manually, or was created before file tracking was
+ * introduced. All open editors that belong to this workspace are used
+ * instead, and the pack contains an explicit warning. `isFallback` is
+ * `true` in this mode.
+ *
+ * Every tracked path is validated against the workspace boundary before
+ * any file is read; paths that fail validation are listed in the pack as
+ * rejected rather than silently skipped.
+ *
+ * In both modes the per-file and total size caps are applied and any
+ * truncation, omission, or missing-on-disk condition is noted in the pack.
+ */
+export async function generateImplReviewContextPack(
+  taskFolderUri: vscode.Uri,
+  workspaceUri: vscode.Uri,
+  implReviewFiles: string[] | undefined
+): Promise<{ content: string; isFallback: boolean }> {
+  const taskFileUri = vscode.Uri.joinPath(taskFolderUri, TASK_FILENAME);
+  const taskContent = await readTextFileIfExists(taskFileUri);
+
+  const lines: string[] = [];
+  lines.push("# Context Pack");
+  lines.push("");
+  lines.push(`Generated: ${new Date().toISOString()}`);
+  lines.push("");
+  lines.push("## Workspace Root");
+  lines.push("");
+  lines.push(vscode.workspace.asRelativePath(workspaceUri, false) || ".");
+  lines.push("");
+  lines.push("## User Request");
+  lines.push("");
+  lines.push(taskContent ?? "_No task.md content found._");
+  lines.push("");
+
+  // isTracked distinguishes an AI run (even one that changed zero files)
+  // from a manually-implemented task or a pre-tracking task.
+  // implReviewFiles === undefined  → no tracking info  → fallback mode
+  // implReviewFiles === []         → tracked, no files changed → tracked mode
+  // implReviewFiles has entries    → tracked, normal case
+  const isTracked = implReviewFiles !== undefined;
+
+  if (isTracked) {
+    // ------------------------------------------------------------------ //
+    // Tracked mode (AI implementation run, possibly zero files changed)  //
+    // ------------------------------------------------------------------ //
+    lines.push("## Implementation Review Files");
+    lines.push("");
+
+    if (implReviewFiles.length === 0) {
+      // AI run completed but wrote no workspace files — nothing to embed.
+      lines.push(
+        "_The most recent AI implementation run completed but changed no " +
+        "workspace files. There are no implementation files to review._"
+      );
+      lines.push("");
+      lines.push("## Constraints");
+      lines.push("");
+      lines.push("- Do not refactor unrelated files.");
+      lines.push("- Keep changes scoped to the request above.");
+      lines.push("");
+      return { content: lines.join("\n"), isFallback: false };
+    }
+
+    lines.push(
+      "_Tracked changed files from the most recent AI implementation run. " +
+      "For files also open in the editor, the unsaved buffer is used in place " +
+      "of the on-disk copy._"
+    );
+    lines.push("");
+
+    // Validate and resolve every tracked path before reading anything.
+    // task-progress.json is a plain workspace file that can be edited
+    // manually or committed from another machine, so its paths are treated
+    // as untrusted input.
+    const wsFsRaw = workspaceUri.fsPath;
+    const wsFs =
+      nodePath.parse(wsFsRaw).root === wsFsRaw
+        ? wsFsRaw
+        : wsFsRaw.replace(/[/\\]+$/, "");
+    // Compute the real (symlink-resolved) workspace root once for the loop.
+    const wsRealFs = nodeFs.realpathSync.native(wsFs);
+
+    const fileInputs: Array<{ relPath: string; content: string | undefined }> = [];
+    const rejectedPaths: string[] = [];
+
+    for (const rawPath of implReviewFiles) {
+      // Reject paths that contain traversal or other suspicious patterns.
+      const normalized = sanitizeRelativePath(rawPath);
+      if (normalized === undefined || normalized === "") {
+        // undefined = traversal/invalid; "" = workspace root (not a file)
+        rejectedPaths.push(rawPath);
+        continue;
+      }
+
+      // Defence-in-depth: verify the resolved absolute path stays inside
+      // the workspace, e.g. to catch encoded traversal that slipped past
+      // the string check.
+      const resolved = vscode.Uri.joinPath(workspaceUri, normalized);
+      const resolvedFs = resolved.fsPath;
+      const inWorkspace =
+        resolvedFs === wsFs ||
+        resolvedFs.startsWith(wsFs + "/") ||
+        resolvedFs.startsWith(wsFs + nodePath.sep);
+      if (!inWorkspace) {
+        rejectedPaths.push(rawPath);
+        continue;
+      }
+
+      // Defence-in-depth: a symlink or junction inside the workspace
+      // (e.g. "linked-dir" pointing outside it) passes the string-prefix
+      // check above while workspace.fs still follows the link on disk.
+      // Resolve the real path of the nearest existing ancestor and re-check.
+      const resolvedRealFs = realpathOfNearestExistingAncestor(resolvedFs);
+      const realInWorkspace =
+        resolvedRealFs === wsRealFs ||
+        resolvedRealFs.startsWith(wsRealFs + "/") ||
+        resolvedRealFs.startsWith(wsRealFs + nodePath.sep);
+      if (!realInWorkspace) {
+        rejectedPaths.push(rawPath);
+        continue;
+      }
+
+      const content = await getFileContentForReview(resolved);
+      fileInputs.push({ relPath: normalized, content });
+    }
+
+    if (rejectedPaths.length > 0) {
+      lines.push(
+        `⚠ ${rejectedPaths.length} tracked path(s) rejected (unsafe or outside workspace):` 
+      );
+      lines.push("");
+      for (const p of rejectedPaths) {
+        lines.push(`- \`${p}\``);
+      }
+      lines.push("");
+    }
+
+    for (const { relPath, content } of fileInputs) {
+      const note = content === undefined ? " ⚠ (missing on disk)" : "";
+      lines.push(`- ${relPath}${note}`);
+    }
+    lines.push("");
+
+    lines.push("## Implementation Review File Contents");
+    lines.push("");
+
+    const results = applyContentCaps(
+      fileInputs,
+      IMPL_REVIEW_MAX_CHARS_PER_FILE,
+      IMPL_REVIEW_MAX_TOTAL_CHARS
+    );
+
+    const included = results.filter(
+      (r): r is (typeof r) & { content: string | undefined } => r.content !== null
+    );
+    const omitted = results.filter((r) => r.content === null);
+
+    for (const result of included) {
+      if (result.content === undefined) {
+        lines.push(`### ${result.relPath} (missing on disk)`);
+        lines.push("");
+        lines.push("_File was tracked as changed but no longer exists on disk._");
+        lines.push("");
+      } else {
+        const label = result.truncated ? " (truncated)" : "";
+        lines.push(`### ${result.relPath}${label}`);
+        lines.push("");
+        lines.push("```");
+        lines.push(result.content);
+        lines.push("```");
+        lines.push("");
+      }
+    }
+
+    if (omitted.length > 0) {
+      lines.push(
+        `_${omitted.length} further tracked file(s) omitted: total content size limit reached._`
+      );
+      lines.push("");
+      for (const o of omitted) {
+        lines.push(`- ${o.relPath}`);
+      }
+      lines.push("");
+    }
+
+    lines.push("## Constraints");
+    lines.push("");
+    lines.push("- Do not refactor unrelated files.");
+    lines.push("- Keep changes scoped to the request above.");
+    lines.push("");
+
+    return { content: lines.join("\n"), isFallback: false };
+  }
+
+  // ---------------------------------------------------------------------- //
+  // Fallback mode — no tracked file set (manual impl or pre-tracking task)  //
+  // ---------------------------------------------------------------------- //
+  lines.push(
+    "⚠ **Fallback mode**: This task has no tracked implementation file set " +
+    "(the implementation was done manually, or predates file tracking). " +
+    "The files below are the editors currently open in VS Code — they may not " +
+    "represent all changed files."
+  );
+  lines.push("");
+
+  const openDocs = vscode.workspace.textDocuments.filter(
+    (doc) => doc.uri.scheme === "file" && isInsideWorkspace(doc.uri, workspaceUri)
+  );
+  const seenPaths = new Set<string>();
+  const uniqueDocs = openDocs.filter((doc) => {
+    const relPath = vscode.workspace.asRelativePath(doc.uri, false);
+    if (seenPaths.has(relPath)) {
+      return false;
+    }
+    seenPaths.add(relPath);
+    return true;
+  });
+
+  lines.push("## Open Editors (Fallback)");
+  lines.push("");
+  if (uniqueDocs.length > 0) {
+    for (const doc of uniqueDocs) {
+      lines.push(`- ${vscode.workspace.asRelativePath(doc.uri, false)}`);
+    }
+  } else {
+    lines.push("_No open editors._");
+  }
+  lines.push("");
+
+  if (uniqueDocs.length > 0) {
+    lines.push("## Open Editor Contents (Fallback)");
+    lines.push("");
+
+    const fileInputs = uniqueDocs.map((doc) => ({
+      relPath: vscode.workspace.asRelativePath(doc.uri, false),
+      content: doc.getText() as string | undefined,
+    }));
+
+    const results = applyContentCaps(
+      fileInputs,
+      IMPL_REVIEW_MAX_CHARS_PER_FILE,
+      IMPL_REVIEW_MAX_TOTAL_CHARS
+    );
+
+    const included = results.filter(
+      (r): r is (typeof r) & { content: string | undefined } => r.content !== null
+    );
+    const omitted = results.filter((r) => r.content === null);
+
+    for (const result of included) {
+      if (result.content !== undefined) {
+        const label = result.truncated ? " (truncated)" : "";
+        lines.push(`### ${result.relPath}${label}`);
+        lines.push("");
+        lines.push("```");
+        lines.push(result.content);
+        lines.push("```");
+        lines.push("");
+      }
+    }
+
+    if (omitted.length > 0) {
+      lines.push(
+        `_${omitted.length} further open file(s) omitted: total content size limit reached._`
+      );
+      lines.push("");
+      for (const o of omitted) {
+        lines.push(`- ${o.relPath}`);
+      }
+      lines.push("");
+    }
+  }
+
+  lines.push("## Constraints");
+  lines.push("");
+  lines.push("- Do not refactor unrelated files.");
+  lines.push("- Keep changes scoped to the request above.");
+  lines.push("");
+
+  return { content: lines.join("\n"), isFallback: true };
+}
+
+/**
+ * Write context-pack.md for an implementation review and return its URI
+ * together with a flag indicating whether fallback (open-editor) mode was used.
+ */
+export async function writeImplReviewContextPack(
+  taskFolderUri: vscode.Uri,
+  workspaceUri: vscode.Uri,
+  implReviewFiles: string[] | undefined
+): Promise<{ contextPackUri: vscode.Uri; isFallback: boolean }> {
+  const contextPackUri = vscode.Uri.joinPath(
+    taskFolderUri,
+    CONTEXT_PACK_FILENAME
+  );
+  const { content, isFallback } = await generateImplReviewContextPack(
+    taskFolderUri,
+    workspaceUri,
+    implReviewFiles
+  );
+  await vscode.workspace.fs.writeFile(
+    contextPackUri,
+    new TextEncoder().encode(content)
+  );
+  return { contextPackUri, isFallback };
 }

@@ -9,13 +9,13 @@ Task Created → Plan → Plan: High-Level Review → Plan: Low-Level Review
 → Final Plan → Implementation → Impl: High-Level Review → Impl: Low-Level Review → Completed
 ```
 
-There is one plan file (`plan.md`) that gets revised **in place** when you apply a review — no forked "updated plan" copies to keep track of. Implementation reviews send the contents of your open editors to Copilot along with the final plan, so the AI assesses what's *actually implemented* versus outstanding, not just what the plan says.
+There is one plan file (`plan.md`) that gets revised **in place** when you apply a review — no forked "updated plan" copies to keep track of. Implementation reviews send the files changed during the AI implementation run to Copilot along with the final plan, so the AI assesses what's *actually implemented* versus outstanding. If a changed file is open in the editor with unsaved edits, the unsaved buffer is used instead of the on-disk copy. Tasks implemented manually (or before file tracking was introduced) fall back to open editors with an explicit warning.
 
 ## Marketplace
 
 Install from the Visual Studio Marketplace:
 
-https://marketplace.visualstudio.com/items?itemName=j2kenton.vs-code-ai-helper
+<https://marketplace.visualstudio.com/items?itemName=j2kenton.vs-code-ai-helper>
 
 ## Requirements
 
@@ -36,7 +36,7 @@ https://marketplace.visualstudio.com/items?itemName=j2kenton.vs-code-ai-helper
 5. **Low-level review.** Same actions, but the review (`plan-low-review.md`) critiques the details: step ordering, named files, edge cases, verifiable acceptance criteria.
 6. **Finalize.** `Next Stage` from the low-level review offers to promote the current plan to `plan-final.md`. Promoting is always a deliberate, human step — no command auto-approves a plan.
 7. **Implement.** Run `AI Helper: Generate Implementation Checklist with AI` to turn `plan-final.md` into `implementation.md` — a concrete `- [ ]` checklist. Do the work.
-8. **Implementation reviews.** Run the high-level then low-level implementation reviews: Copilot receives the final plan, the checklist, and the **contents of your open editors**, and reports per item what's implemented, partial, or missing. Apply a review to update the checklist's checkboxes and notes in place. When the low-level review is clean, `Next Stage` marks the task completed.
+8. **Implementation reviews.** Run the high-level then low-level implementation reviews: Copilot receives the final plan, the checklist, and the **contents of the files changed during the AI implementation run** (or the currently open editors if the task was implemented manually — the extension will warn you). If a changed file is open with unsaved edits, the unsaved buffer is used in place of the on-disk copy. Files that are too large may be truncated; the context pack notes any truncation or omission explicitly. Apply a review to update the checklist's checkboxes and notes in place. When the low-level review is clean, `Next Stage` marks the task completed.
 9. **Come back later.** If you stop partway through (or just close VS Code), run `AI Helper: Resume Task` (or click the task in the Tasks view) — it shows the actions relevant to the task's current stage, using `task-progress.json` to know where you are.
 
 Tasks created with versions before 0.6.0 still work: old stage names are migrated automatically, and a legacy `plan-updated.md` is treated as the current plan until the first in-place update writes `plan.md`.
@@ -63,7 +63,7 @@ A matching status bar item (bottom-left) always shows your most recently active 
 | `AI Helper: Start New Task` | Creates a new `YYYY-MM-DD_task_N` folder with progress tracking and opens `task.md`. From there, use the Tasks view or `Resume Task` for the per-stage actions. |
 | `AI Helper: Resume Task` | Shows the actions relevant to a task's current stage — open the artifact, run/apply reviews, advance — instead of a forced wizard. |
 | `AI Helper: Generate Plan with AI` | Uses your Copilot access to draft `plan.md` from `task.md` and a generated `context-pack.md`. Only offered before later-stage work exists, so it can't clobber it. |
-| `AI Helper: Run Review with AI` | Runs the review for wherever the task is: from `plan`/`implementation` it starts the high-level review (and advances the stage); from a review stage it (re)generates that stage's review. Implementation reviews include your open editors' contents so the code itself gets assessed. |
+| `AI Helper: Run Review with AI` | Runs the review for wherever the task is: from `plan`/`implementation` it starts the high-level review (and advances the stage); from a review stage it (re)generates that stage's review. Implementation reviews use the files changed during the AI implementation run as the review scope; if no tracked file set exists (manual implementation), they fall back to open editors with a warning. |
 | `AI Helper: View Review` | Opens the current stage's review file; offers to run the review if it doesn't exist yet. |
 | `AI Helper: Reply to Review` | Opens a `-reply.md` file for the current review where you push back or clarify; it's sent to the AI when you Apply. |
 | `AI Helper: Apply Review with AI` | Copilot rewrites the plan (plan reviews) or the implementation checklist (implementation reviews) **in place**, addressing the review and your reply. Asks for confirmation first. |
@@ -81,7 +81,7 @@ Every "with AI" command asks for confirmation before overwriting an existing art
 YYYY-MM-DD_task_N/
 ├── task-progress.json         # Machine-readable stage tracker
 ├── task.md                    # Your request: goal, scope, constraints
-├── context-pack.md            # Auto-generated snapshot sent to Copilot (incl. open-file contents for impl reviews)
+├── context-pack.md            # Auto-generated snapshot sent to Copilot (uses tracked changed files for impl reviews; open editors as fallback)
 ├── plan.md                    # THE plan — revised in place when reviews are applied
 ├── plan-high-review.md        # High-level review of the plan (+ optional -reply.md)
 ├── plan-low-review.md         # Low-level review of the plan (+ optional -reply.md)

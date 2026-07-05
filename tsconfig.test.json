@@ -14,6 +14,7 @@
   },
   "include": [
     "src/utils/pathSafety.ts",
+    "src/utils/implReviewFileSelection.ts",
     "src/test/**/*.ts"
   ]
 }
