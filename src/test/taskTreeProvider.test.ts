@@ -19,15 +19,15 @@ taskProgressModule.isReviewStage = mockIsReviewStage as (
   stage: TaskStage
 ) => boolean;
 
-describe("getStageNodeContextValue", () => {
-  const modelableStages = AI_MODEL_STAGES as readonly TaskStage[];
+void describe("getStageNodeContextValue", () => {
+  const modelableStages: readonly TaskStage[] = AI_MODEL_STAGES;
   const nonModelableStages = STAGE_ORDER.filter(
     (s) => !AI_MODEL_STAGES.includes(s)
   );
 
   // Test cases for "current" status
-  describe('when status is "current"', () => {
-    it('should return "stage-created" for the "created" stage, without a modelable suffix', () => {
+  void describe('when status is "current"', () => {
+    void it('should return "stage-created" for the "created" stage, without a modelable suffix', () => {
       // This is true even if "created" were to be added to AI_MODEL_STAGES
       assert.strictEqual(
         getStageNodeContextValue("created", "current"),
@@ -35,14 +35,14 @@ describe("getStageNodeContextValue", () => {
       );
     });
 
-    it('should return "stage-reviewable-current" for the "plan" stage', () => {
+    void it('should return "stage-reviewable-current" for the "plan" stage', () => {
       const expected = modelableStages.includes("plan")
         ? "stage-reviewable-current-modelable"
         : "stage-reviewable-current";
       assert.strictEqual(getStageNodeContextValue("plan", "current"), expected);
     });
 
-    it('should return "stage-plan-final-current" for the "plan-final" stage', () => {
+    void it('should return "stage-plan-final-current" for the "plan-final" stage', () => {
       const expected = modelableStages.includes("plan-final")
         ? "stage-plan-final-current-modelable"
         : "stage-plan-final-current";
@@ -52,7 +52,7 @@ describe("getStageNodeContextValue", () => {
       );
     });
 
-    it('should return "stage-impl-current" for the "implementation" stage', () => {
+    void it('should return "stage-impl-current" for the "implementation" stage', () => {
       const expected = modelableStages.includes("implementation")
         ? "stage-impl-current-modelable"
         : "stage-impl-current";
@@ -62,7 +62,7 @@ describe("getStageNodeContextValue", () => {
       );
     });
 
-    it('should return "stage-review-current" for review stages', () => {
+    void it('should return "stage-review-current" for review stages', () => {
       const reviewStage = "plan-high-review"; // Example review stage
       const expected = modelableStages.includes(reviewStage)
         ? "stage-review-current-modelable"
@@ -73,7 +73,7 @@ describe("getStageNodeContextValue", () => {
       );
     });
 
-    it('should return "stage-current" for other non-special stages', () => {
+    void it('should return "stage-current" for other non-special stages', () => {
       // Find a stage that is not 'created', 'plan', 'plan-final', 'implementation', or a review stage
       const otherStage = "task" as TaskStage;
       const expected = modelableStages.includes(otherStage)
@@ -87,10 +87,10 @@ describe("getStageNodeContextValue", () => {
   });
 
   // Test cases for "done" and "outstanding" statuses
-  describe('when status is not "current"', () => {
+  void describe('when status is not "current"', () => {
     for (const status of ["done", "outstanding"] as const) {
       for (const stage of STAGE_ORDER) {
-        it(`should return computed context for stage "${stage}" with status "${status}"`, () => {
+        void it(`should return computed context for stage "${stage}" with status "${status}"`, () => {
           const expectedBase = mockComputeStageContext(stage);
           const expected = modelableStages.includes(stage)
             ? `${expectedBase}-modelable`
@@ -105,11 +105,11 @@ describe("getStageNodeContextValue", () => {
   });
 
   // Test cases for modelable suffix
-  describe("modelable suffix handling", () => {
+  void describe("modelable suffix handling", () => {
     for (const stage of modelableStages) {
-      if (stage === "created") continue; // "created" is a special case handled above
+      if (stage === "created") { continue; }
 
-      it(`should append "-modelable" for modelable stage "${stage}"`, () => {
+      void it(`should append "-modelable" for modelable stage "${stage}"`, () => {
         const context = getStageNodeContextValue(stage, "current");
         assert.ok(
           context.endsWith("-modelable"),
@@ -119,7 +119,7 @@ describe("getStageNodeContextValue", () => {
     }
 
     for (const stage of nonModelableStages) {
-      it(`should NOT append "-modelable" for non-modelable stage "${stage}"`, () => {
+      void it(`should NOT append "-modelable" for non-modelable stage "${stage}"`, () => {
         const context = getStageNodeContextValue(stage, "current");
         assert.ok(
           !context.endsWith("-modelable"),

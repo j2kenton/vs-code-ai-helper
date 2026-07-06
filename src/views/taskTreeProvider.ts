@@ -274,7 +274,6 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
   /** Collapse all task rows by switching to collapsed mode */
   collapseAll(): void {
     try {
-      const previousMode = this.mode;
       this.mode = 'allCollapsed';
       this.rootRenderVersion++;
       this.lastTaskNodes = [];
@@ -294,7 +293,6 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
   /** Expand all task rows by switching to auto-expand mode */
   async expandAll(treeView: vscode.TreeView<TaskTreeNode>): Promise<void> {
     try {
-      const previousMode = this.mode;
       this.mode = 'autoFirstActive';
       this.rootRenderVersion++;
       this.lastTaskNodes = [];
@@ -439,7 +437,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
     );
 
     // Auto-expand the first active task only in autoFirstActive mode
-    const shouldAutoExpand = (index: number) =>
+    const shouldAutoExpand = (index: number): boolean =>
       this.mode === 'autoFirstActive' && index === 0 && active.length > 0;
 
     const nodes = [...active, ...completed].map(
