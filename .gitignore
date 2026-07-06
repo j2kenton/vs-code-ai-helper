@@ -17,6 +17,7 @@ plans/
 .idea/
 *.swp
 *.swo
+.vscode/settings.json
 
 # OS
 .DS_Store
@@ -29,3 +30,4 @@ coverage/
 .env
 .env.local
 .env.*.local
+
