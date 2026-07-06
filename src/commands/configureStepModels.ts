@@ -13,6 +13,9 @@ import {
   SelectableModel,
   setTaskStageModel,
 } from "../utils/modelSelection";
+import { selectPreferredModel, type ModelPreselectionOptions } from "../utils/modelPreselection";
+import { updateInvocationCache } from "../utils/invocationCache";
+import { getAiModelDefault } from "../config/settings";
 
 interface ModelPickItem extends vscode.QuickPickItem {
   modelId?: string;
@@ -139,18 +142,37 @@ async function resolveTaskFolderUri(
 export async function collectStageSelection(
   stage: TaskStage,
   models: readonly SelectableModel[],
-  taskFolderUri: vscode.Uri | undefined
+  taskFolderUri: vscode.Uri | undefined,
+  invocationCache: Map<string, string>
 ): Promise<StageSave | null> {
   const taskModels = taskFolderUri
     ? await readTaskStageModels(taskFolderUri)
     : {};
   const currentTaskModelId = taskModels[stage];
+  const workspaceModelId = getAiModelDefault(stage);
+
+  // Build preselection using precedence: current → inherited → cached
+  const availableModels = models.map((m) => m.id);
+  // Cache key format: 'workspace' for workspace-level caching, 'task:<uri>' for task-specific caching
+  const cachedModel = taskFolderUri
+    ? invocationCache.get(`task:${taskFolderUri.toString()}`)
+    : invocationCache.get('workspace');
+
+  const preselectionOptions: ModelPreselectionOptions = {
+    currentModel: taskFolderUri ? currentTaskModelId : workspaceModelId,
+    inheritedModel: taskFolderUri ? workspaceModelId : undefined,
+    cachedModel,
+    availableModels,
+  };
+
+  const preferredModelId = selectPreferredModel(preselectionOptions);
 
   const items: ModelPickItem[] = models.map((model) => ({
     label: model.name,
     description: model.id,
     detail: model.providerLabel,
     modelId: model.id,
+    picked: model.id === preferredModelId,
   }));
 
   if (taskFolderUri) {
@@ -158,12 +180,14 @@ export async function collectStageSelection(
       label: "Use workspace default",
       description: "Clear task-specific override for this stage",
       useWorkspaceDefault: true,
+      picked: !currentTaskModelId && preferredModelId === undefined,
     });
   } else {
     items.unshift({
       label: "Use automatic model selection",
       description: "Clear workspace default for this stage",
       clearWorkspaceDefault: true,
+      picked: !workspaceModelId && preferredModelId === undefined,
     });
   }
 
@@ -240,10 +264,11 @@ export async function configureStepModels(
     return;
   }
   const taskFolderUri = target.taskFolderUri;
+  const invocationCache = new Map<string, string>();
 
   const selections = new Map<TaskStage, StageSave>();
   for (const stage of AI_MODEL_STAGES) {
-    const save = await collectStageSelection(stage, models, taskFolderUri);
+    const save = await collectStageSelection(stage, models, taskFolderUri, invocationCache);
     if (!save) {
       void vscode.window.showInformationMessage(
         "Model configuration canceled. No changes were saved."
@@ -251,6 +276,14 @@ export async function configureStepModels(
       return;
     }
     selections.set(stage, save);
+
+    // Update cache immediately after each selection
+    // Cache key format: 'workspace' or 'task:<uri>'
+    if (taskFolderUri) {
+      updateInvocationCache(invocationCache, save, taskFolderUri.toString());
+    } else {
+      updateInvocationCache(invocationCache, save, '');
+    }
   }
 
   for (const [stage, save] of selections) {
@@ -352,7 +385,8 @@ export async function setStageModel(node?: StageNodeArg): Promise<void> {
   }
 
   const taskFolderUri = target.task.folderUri;
-  const save = await collectStageSelection(target.stage, models, taskFolderUri);
+  const invocationCache = new Map<string, string>();
+  const save = await collectStageSelection(target.stage, models, taskFolderUri, invocationCache);
   if (!save) {
     return;
   }

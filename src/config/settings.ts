@@ -74,6 +74,14 @@ export function getAiModelDefaults(): Partial<Record<TaskStage, string>> {
 }
 
 /**
+ * Get the workspace-level default model for a single stage.
+ */
+export function getAiModelDefault(stage: TaskStage): string | undefined {
+  const defaults = getAiModelDefaults();
+  return defaults[stage];
+}
+
+/**
  * Set or clear a workspace-level default model for one AI workflow stage.
  */
 export async function setAiModelDefault(

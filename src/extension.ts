@@ -15,6 +15,7 @@ import { registerGeneratePlanWithAICommand } from "./commands/generatePlanWithAI
 import { registerReviewActionCommands } from "./commands/reviewActions";
 import { registerSetTaskStageCommand } from "./commands/setTaskStage";
 import { registerConfigureStepModelsCommand } from "./commands/configureStepModels";
+import { registerViewArtifactCommands } from "./commands/viewArtifacts";
 import { TaskTreeProvider, TASKS_VIEW_ID } from "./views/taskTreeProvider";
 import { TaskStatusBar } from "./views/taskStatusBar";
 import { TASK_PROGRESS_FILENAME } from "./types/taskProgress";
@@ -91,6 +92,7 @@ export function activate(context: vscode.ExtensionContext): void {
   registerReviewActionCommands(context);
   registerSetTaskStageCommand(context);
   registerConfigureStepModelsCommand(context);
+  registerViewArtifactCommands(context);
 
   // Register the hello world command (keeping for now)
   const helloWorldDisposable = vscode.commands.registerCommand(
@@ -107,7 +109,7 @@ export function activate(context: vscode.ExtensionContext): void {
   const taskTreeProvider = new TaskTreeProvider();
   const tasksTreeView = vscode.window.createTreeView(TASKS_VIEW_ID, {
     treeDataProvider: taskTreeProvider,
-    showCollapseAll: true,
+    showCollapseAll: false,
   });
 
   const taskStatusBar = new TaskStatusBar();
@@ -122,6 +124,10 @@ export function activate(context: vscode.ExtensionContext): void {
   const expandAllCommand = vscode.commands.registerCommand(
     "vs-code-ai-helper.expandAllTasks",
     () => taskTreeProvider.expandAll(tasksTreeView)
+  );
+  const collapseAllCommand = vscode.commands.registerCommand(
+    "vs-code-ai-helper.collapseAllTasks",
+    () => taskTreeProvider.collapseAll()
   );
 
   // Auto-refresh whenever any task's progress file changes
@@ -145,6 +151,7 @@ export function activate(context: vscode.ExtensionContext): void {
     tasksLoadedListener,
     refreshCommand,
     expandAllCommand,
+    collapseAllCommand,
     progressWatcher,
     configListener
   );

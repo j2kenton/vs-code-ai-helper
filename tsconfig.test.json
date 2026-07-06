@@ -1,6 +1,7 @@
 {
+  "extends": "./tsconfig.json",
   "compilerOptions": {
-    "module": "CommonJS",
+    "module": "Node16",
     "target": "ES2022",
     "lib": ["ES2022"],
     "outDir": "out",
@@ -10,11 +11,15 @@
     "skipLibCheck": true,
     "noUnusedLocals": true,
     "noUnusedParameters": true,
-    "forceConsistentCasingInFileNames": true
+    "forceConsistentCasingInFileNames": true,
+    "sourceMap": true
   },
   "include": [
     "src/utils/pathSafety.ts",
     "src/utils/implReviewFileSelection.ts",
+    "src/views/taskTreeProvider.ts",
+    "src/utils/stageContext.ts",
+    "src/types/taskProgress.ts",
     "src/test/**/*.ts"
   ]
 }
