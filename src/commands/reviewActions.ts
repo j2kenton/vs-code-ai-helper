@@ -17,6 +17,7 @@ import {
   findAllTasks,
   IncompleteTask,
   readTaskProgress,
+  clearImplReviewFiles,
   updateImplReviewFiles,
   updateTaskProgressStage,
   writeTaskProgress,
@@ -31,11 +32,11 @@ import {
 import { generateContextPack, writeContextPack, writeImplReviewContextPack } from "../utils/contextPack";
 import { renderPromptTemplate } from "../utils/promptTemplates";
 import { writeRunLog } from "../utils/runLog";
-import { CopilotLanguageModelRunner } from "../runners/copilotLanguageModelRunner";
 import {
-  checkImplementationAvailability,
-  runImplementationWithCopilot,
-} from "../runners/copilotImplementationRunner";
+  checkImplementationAvailabilityForModel,
+  resolveRunnerForModel,
+  runImplementationForModel,
+} from "../runners/runnerRegistry";
 import { resolveModelForStage } from "../utils/modelSelection";
 
 /**
@@ -179,30 +180,32 @@ async function runAiToFile(options: {
   templateFile: string;
   variables: Record<string, string>;
   outputFileUri: vscode.Uri;
-  progressTitle: string;
+  /** e.g. "Running Plan: High-Level Review" — provider name is appended. */
+  progressAction: string;
   outputLabel: string;
 }): Promise<boolean> {
-  const runner = new CopilotLanguageModelRunner();
+  const model = await resolveModelForStage(
+    options.taskFolderUri,
+    options.logStage
+  );
+  const { runner, providerLabel, nativeModelId } = await resolveRunnerForModel(
+    model.modelId
+  );
   const availability = await runner.isAvailable();
   if (!availability.available) {
     void vscode.window.showWarningMessage(
-      `Copilot is unavailable: ${
+      `${providerLabel} is unavailable: ${
         availability.reason ?? "unknown reason"
       }. Write ${options.outputLabel} manually instead.`
     );
     return false;
   }
 
-  const model = await resolveModelForStage(
-    options.taskFolderUri,
-    options.logStage
-  );
-
   let completed = false;
   await vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Notification,
-      title: options.progressTitle,
+      title: `${options.progressAction} with ${providerLabel}...`,
       cancellable: true,
     },
     async (progress, token) => {
@@ -212,7 +215,7 @@ async function runAiToFile(options: {
         options.variables
       );
 
-      progress.report({ message: "Waiting for Copilot response..." });
+      progress.report({ message: `Waiting for ${providerLabel} response...` });
 
       const result = await runner.run(
         {
@@ -221,7 +224,7 @@ async function runAiToFile(options: {
           stage: options.logStage,
           prompt,
           outputFile: options.outputFileUri,
-          modelId: model.modelId,
+          modelId: nativeModelId,
         },
         token
       );
@@ -242,7 +245,7 @@ async function runAiToFile(options: {
         );
         await vscode.window.showTextDocument(doc);
         void vscode.window.showInformationMessage(
-          `${options.outputLabel} generated with Copilot (${
+          `${options.outputLabel} generated with ${providerLabel} (${
             result.summary ?? ""
           })`
         );
@@ -398,7 +401,7 @@ export async function runReviewForFolder(
     templateFile,
     variables,
     outputFileUri: reviewUri,
-    progressTitle: `Running ${STAGE_DISPLAY_NAMES[targetStage]} with Copilot...`,
+    progressAction: `Running ${STAGE_DISPLAY_NAMES[targetStage]}`,
     outputLabel: STAGE_ARTIFACT_FILENAMES[targetStage] ?? "review",
   });
 
@@ -527,7 +530,7 @@ export async function applyReviewWithAI(
     templateFile,
     variables,
     outputFileUri,
-    progressTitle: `Applying review to ${outputLabel} with Copilot...`,
+    progressAction: `Applying review to ${outputLabel}`,
     outputLabel,
   });
 
@@ -560,10 +563,16 @@ async function applyImplementationReviewWithAI(
     return;
   }
 
-  const availability = await checkImplementationAvailability();
+  // Use the implementation stage's model, not the review stage's — this is
+  // a tool-calling code-edit run like any other implementation run, and
+  // users may have configured a lighter model for review-only stages.
+  const model = await resolveModelForStage(folderUri, "implementation");
+
+  const { availability, providerLabel } =
+    await checkImplementationAvailabilityForModel(model.modelId);
   if (!availability.available) {
     void vscode.window.showWarningMessage(
-      `Copilot is unavailable: ${availability.reason ?? "unknown reason"}. Address the review manually instead.`
+      `${providerLabel} is unavailable: ${availability.reason ?? "unknown reason"}. Address the review manually instead.`
     );
     return;
   }
@@ -577,10 +586,6 @@ async function applyImplementationReviewWithAI(
     return;
   }
 
-  // Use the implementation stage's model, not the review stage's — this is
-  // a tool-calling code-edit run like any other implementation run, and
-  // users may have configured a lighter model for review-only stages.
-  const model = await resolveModelForStage(folderUri, "implementation");
   const contextPackContent = await generateContextPack(folderUri, workspaceRoot.uri);
 
   const prompt = await renderPromptTemplate(
@@ -599,7 +604,7 @@ async function applyImplementationReviewWithAI(
     workspaceRoot,
     prompt,
     model.modelId,
-    "Applying implementation review with Copilot...",
+    `Applying implementation review with ${providerLabel}...`,
     stage
   );
 }
@@ -823,7 +828,7 @@ export async function generateImplementationWithAI(
     templateFile: "create-implementation.md",
     variables: { contextPack: contextPackContent, plan: planFinalContent },
     outputFileUri: implementationUri,
-    progressTitle: "Generating implementation checklist with Copilot...",
+    progressAction: "Generating implementation checklist",
     outputLabel: "implementation.md",
   });
 
@@ -868,7 +873,7 @@ async function executeImplementationRun(
 ): Promise<void> {
   const implementationUri = vscode.Uri.joinPath(folderUri, "implementation.md");
 
-  let result: Awaited<ReturnType<typeof runImplementationWithCopilot>> | undefined;
+  let result: Awaited<ReturnType<typeof runImplementationForModel>> | undefined;
 
   await vscode.window.withProgress(
     {
@@ -877,7 +882,7 @@ async function executeImplementationRun(
       cancellable: true,
     },
     async (progress, token) => {
-      result = await runImplementationWithCopilot({
+      result = await runImplementationForModel({
         prompt,
         modelId,
         workspaceUri: workspaceRoot.uri,
@@ -897,7 +902,7 @@ async function executeImplementationRun(
       : "_none recorded_"
   }\n\n${result.summary ?? result.errorMessage ?? ""}`;
 
-  await writeRunLog(folderUri, "copilot-lm", "implementation", logContent);
+  await writeRunLog(folderUri, result.runnerId, "implementation", logContent);
 
   if (result.status === "completed") {
     // Write the AI-generated summary as implementation.md
@@ -928,9 +933,16 @@ async function executeImplementationRun(
       const updatedProgress = alreadyAtOrPastImplementation
         ? currentProgress
         : updateTaskProgressStage(currentProgress, "implementation");
+      // When the changed-file set couldn't be determined (e.g. a CLI
+      // provider ran outside a git repository), clear implReviewFiles so
+      // the review falls back to open editors with a warning. Leaving a
+      // stale list from an earlier (trackable) run in place would let a
+      // later review silently use outdated scope instead of falling back.
       await writeTaskProgress(
         folderUri,
-        updateImplReviewFiles(updatedProgress, result.filesChanged)
+        result.filesChangedUnknown
+          ? clearImplReviewFiles(updatedProgress)
+          : updateImplReviewFiles(updatedProgress, result.filesChanged)
       );
     }
 
@@ -984,10 +996,13 @@ export async function runImplementationWithAI(
     return;
   }
 
-  const availability = await checkImplementationAvailability();
+  const model = await resolveModelForStage(resolved.folderUri, "implementation");
+
+  const { availability, providerLabel } =
+    await checkImplementationAvailabilityForModel(model.modelId);
   if (!availability.available) {
     void vscode.window.showWarningMessage(
-      `Copilot is unavailable: ${availability.reason ?? "unknown reason"}. Implement the plan manually instead.`
+      `${providerLabel} is unavailable: ${availability.reason ?? "unknown reason"}. Implement the plan manually instead.`
     );
     return;
   }
@@ -999,8 +1014,6 @@ export async function runImplementationWithAI(
   if (!(await confirmOverwrite(implementationUri, "implementation.md"))) {
     return;
   }
-
-  const model = await resolveModelForStage(resolved.folderUri, "implementation");
 
   const contextPackContent = await generateContextPack(
     resolved.folderUri,
@@ -1026,7 +1039,7 @@ export async function runImplementationWithAI(
     workspaceRoot,
     prompt,
     model.modelId,
-    "Running implementation with Copilot...",
+    `Running implementation with ${providerLabel}...`,
     postRunReviewStage
   );
 }

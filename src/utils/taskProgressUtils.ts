@@ -128,6 +128,21 @@ export function updateImplReviewFiles(
 }
 
 /**
+ * Clear any previously tracked changed-file set, e.g. when the most recent
+ * run couldn't determine which files changed (git unavailable). Explicitly
+ * removing the field — rather than leaving a stale list from an earlier
+ * run in place — ensures the next review falls back to open editors
+ * instead of silently reviewing outdated scope.
+ */
+export function clearImplReviewFiles(progress: TaskProgress): TaskProgress {
+  const { implReviewFiles: _unused, ...rest } = progress;
+  return {
+    ...rest,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+/**
  * Find all incomplete tasks in the meta folder
  * @param metaFolderUri - URI of the meta resources folder
  * @returns Array of incomplete tasks, sorted by most recent first

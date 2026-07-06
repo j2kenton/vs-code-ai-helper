@@ -281,6 +281,14 @@ export interface ImplementationRunResult {
   status: "completed" | "failed" | "cancelled";
   /** Workspace-relative paths written by the model */
   filesChanged: string[];
+  /**
+   * True when filesChanged could not be reliably determined (e.g. a CLI
+   * provider ran outside a git repository, so there was no way to diff
+   * changes). Callers must treat this the same as "manual implementation"
+   * and fall back to open-editor review scope instead of trusting an
+   * empty filesChanged as "nothing changed".
+   */
+  filesChangedUnknown?: boolean;
   /** Markdown summary text intended for implementation.md */
   summary?: string;
   errorMessage?: string;

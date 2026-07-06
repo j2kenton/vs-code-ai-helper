@@ -1,6 +1,6 @@
 # VS Code AI Helper
 
-VS Code AI Helper turns ad-hoc "let's plan this out" conversations into a repeatable, file-based workflow. Every task gets its own dated folder and moves through a fixed pipeline — task description, plan, high- and low-level plan reviews, final plan, implementation checklist, and high- and low-level implementation reviews — with every artifact written by hand or generated with your existing GitHub Copilot subscription, no API key required.
+VS Code AI Helper turns ad-hoc "let's plan this out" conversations into a repeatable, file-based workflow. Every task gets its own dated folder and moves through a fixed pipeline — task description, plan, high- and low-level plan reviews, final plan, implementation checklist, and high- and low-level implementation reviews — with every artifact written by hand or generated with an AI subscription you already have — GitHub Copilot, Claude (Anthropic), ChatGPT/Codex (OpenAI), or Gemini (Google) — no API key required.
 
 The pipeline:
 
@@ -21,7 +21,15 @@ Install from the Visual Studio Marketplace:
 
 - VS Code 1.93.0 or higher
 - A workspace folder open (the extension stores everything relative to your workspace)
-- Optional: an active GitHub Copilot subscription, signed in to VS Code, if you want to use the "with AI" commands
+- Optional, for the "with AI" commands — at least one of:
+  - an active GitHub Copilot subscription, signed in to VS Code (works out of the box, no CLI needed), or
+  - a vendor CLI signed in to your existing subscription: **Claude Code** (`npm i -g @anthropic-ai/claude-code`, Anthropic Pro/Max), **Codex** (`npm i -g @openai/codex`, ChatGPT Plus/Pro), or **Gemini CLI** (`npm i -g @google/gemini-cli`, Google account / Code Assist). Each needs a one-time browser sign-in from its CLI — never an API key.
+
+## AI Providers
+
+The per-step model picker (`AI Helper: Configure AI Models per Step`) lists every model it can find: GitHub Copilot models via VS Code's Language Model API, plus the models of each vendor CLI that is installed. Selections are stored as plain IDs — bare IDs are Copilot models; prefixed IDs run through a CLI (e.g. `claude-cli:sonnet`, `codex-cli:default`, `gemini-cli:gemini-2.5-pro`). You can mix providers per step — e.g. plan with Claude Opus, review with Gemini, implement with Copilot.
+
+For plan and review steps, CLIs run read-only and their answer is written to the task artifact. For implementation steps they run agentically with file-edit permissions in your workspace (Claude uses `acceptEdits`, Codex a workspace-write sandbox, Gemini `auto_edit`); the files they change are detected via git status and used as the implementation-review scope, exactly like Copilot runs.
 
 ## Quick Start
 
@@ -72,7 +80,7 @@ A matching status bar item (bottom-left) always shows your most recently active 
 | `AI Helper: Refresh Tasks View` | Manually refresh the Tasks sidebar (it also refreshes automatically on its own). |
 | `AI Helper: Hello World` | Sanity-check command confirming the extension is active. |
 
-Every "with AI" command asks for confirmation before overwriting an existing artifact, is only offered when the task is at a stage the action applies to, and falls back with a clear message (no crash, no silent failure) if Copilot isn't signed in, has no available model, or you're out of quota. Every AI action has a manual counterpart — the workflow never requires Copilot. Promoting a plan to `plan-final.md` and marking a task completed are intentionally explicit, human steps.
+Every "with AI" command asks for confirmation before overwriting an existing artifact, is only offered when the task is at a stage the action applies to, and falls back with a clear message (no crash, no silent failure) if the selected provider isn't signed in, isn't installed, has no available model, or you're out of quota. Every AI action has a manual counterpart — the workflow never requires an AI provider. Promoting a plan to `plan-final.md` and marking a task completed are intentionally explicit, human steps.
 
 ## What gets created in a task folder
 
@@ -148,7 +156,7 @@ vs-code-ai-helper/
 ├── src/
 │   ├── extension.ts             # Extension entry point / command registration
 │   ├── commands/                # One file per command (startNewTask, resumeTask, generatePlanWithAI, ...)
-│   ├── runners/                 # AI provider adapters (currently: Copilot Language Model API)
+│   ├── runners/                 # AI provider adapters (Copilot LM API + Claude/Codex/Gemini subscription CLIs)
 │   ├── config/                  # Workspace settings helpers
 │   ├── types/                   # Shared types (TaskProgress, AgentRunner, ...)
 │   └── utils/                   # Task-progress, context-pack, and run-log helpers

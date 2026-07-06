@@ -105,7 +105,7 @@ export async function startNewTask(): Promise<string | undefined> {
     if (!isModelSelectionPromptShown()) {
       await setModelSelectionPromptShown();
       const modelChoice = await vscode.window.showInformationMessage(
-        "Choose Copilot models per workflow step now? You can save selections for just this task or as workspace defaults.",
+        "Choose AI models per workflow step now? You can save selections for just this task or as workspace defaults.",
         "Configure Models",
         "Skip"
       );

@@ -8,7 +8,7 @@ import { writeContextPack } from "../utils/contextPack";
 import { renderPromptTemplate } from "../utils/promptTemplates";
 import { writeRunLog } from "../utils/runLog";
 import { pickTaskFolder } from "../utils/pickTaskFolder";
-import { CopilotLanguageModelRunner } from "../runners/copilotLanguageModelRunner";
+import { resolveRunnerForModel } from "../runners/runnerRegistry";
 import { resolveModelForStage } from "../utils/modelSelection";
 import { TASK_FILENAME, TaskStage } from "../types/taskProgress";
 import { runReviewForFolder } from "./reviewActions";
@@ -62,11 +62,14 @@ export async function generatePlanWithAI(
     return;
   }
 
-  const runner = new CopilotLanguageModelRunner();
+  const model = await resolveModelForStage(taskFolderUri, "plan");
+  const { runner, providerLabel, nativeModelId } = await resolveRunnerForModel(
+    model.modelId
+  );
   const availability = await runner.isAvailable();
   if (!availability.available) {
     void vscode.window.showWarningMessage(
-      `Copilot is unavailable: ${
+      `${providerLabel} is unavailable: ${
         availability.reason ?? "unknown reason"
       }. Use the manual planning workflow (Start New Task / Resume Task) instead.`
     );
@@ -104,11 +107,10 @@ export async function generatePlanWithAI(
   await vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Notification,
-      title: "Generating plan with Copilot...",
+      title: `Generating plan with ${providerLabel}...`,
       cancellable: true,
     },
     async (progress, token) => {
-      const model = await resolveModelForStage(taskFolderUri, "plan");
       const contextPackUri = await writeContextPack(
         taskFolderUri,
         workspaceRoot.uri
@@ -125,7 +127,7 @@ export async function generatePlanWithAI(
 
       const planFileUri = vscode.Uri.joinPath(taskFolderUri, "plan.md");
 
-      progress.report({ message: "Waiting for Copilot response..." });
+      progress.report({ message: `Waiting for ${providerLabel} response...` });
 
       const result = await runner.run(
         {
@@ -134,7 +136,7 @@ export async function generatePlanWithAI(
           stage: "plan",
           prompt,
           outputFile: planFileUri,
-          modelId: model.modelId,
+          modelId: nativeModelId,
         },
         token
       );
@@ -158,7 +160,7 @@ export async function generatePlanWithAI(
         const doc = await vscode.workspace.openTextDocument(planFileUri);
         await vscode.window.showTextDocument(doc);
         void vscode.window.showInformationMessage(
-          `plan.md generated with Copilot (${result.summary ?? ""})`
+          `plan.md generated with ${providerLabel} (${result.summary ?? ""})`
         );
         await runReviewForFolder(extensionUri, taskFolderUri, workspaceRoot, "plan", true);
       } else if (result.status === "cancelled") {

@@ -8,8 +8,9 @@ import { AI_MODEL_STAGES, STAGE_DISPLAY_NAMES, TaskStage } from "../types/taskPr
 import { findAllTasks, IncompleteTask } from "../utils/taskProgressUtils";
 import {
   describeModel,
-  getAvailableCopilotModels,
+  getAvailableModels,
   readTaskStageModels,
+  SelectableModel,
   setTaskStageModel,
 } from "../utils/modelSelection";
 
@@ -137,7 +138,7 @@ async function resolveTaskFolderUri(
 
 export async function collectStageSelection(
   stage: TaskStage,
-  models: readonly vscode.LanguageModelChat[],
+  models: readonly SelectableModel[],
   taskFolderUri: vscode.Uri | undefined
 ): Promise<StageSave | null> {
   const taskModels = taskFolderUri
@@ -148,7 +149,7 @@ export async function collectStageSelection(
   const items: ModelPickItem[] = models.map((model) => ({
     label: model.name,
     description: model.id,
-    detail: `Vendor: ${model.vendor}`,
+    detail: model.providerLabel,
     modelId: model.id,
   }));
 
@@ -226,10 +227,10 @@ export async function collectStageSelection(
 export async function configureStepModels(
   arg?: ConfigureModelArg
 ): Promise<void> {
-  const models = await getAvailableCopilotModels();
+  const models = await getAvailableModels();
   if (models.length === 0) {
     void vscode.window.showWarningMessage(
-      "No Copilot models are available. Sign in to Copilot and try again."
+      "No AI models are available. Sign in to GitHub Copilot, or install one of the subscription CLIs (claude, codex, gemini), and try again."
     );
     return;
   }
@@ -342,10 +343,10 @@ export async function setStageModel(node?: StageNodeArg): Promise<void> {
     return;
   }
 
-  const models = await getAvailableCopilotModels();
+  const models = await getAvailableModels();
   if (models.length === 0) {
     void vscode.window.showWarningMessage(
-      "No Copilot models are available. Sign in to Copilot and try again."
+      "No AI models are available. Sign in to GitHub Copilot, or install one of the subscription CLIs (claude, codex, gemini), and try again."
     );
     return;
   }

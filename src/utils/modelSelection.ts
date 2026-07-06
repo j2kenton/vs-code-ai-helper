@@ -1,5 +1,7 @@
 import * as vscode from "vscode";
 import { getAiModelDefaults } from "../config/settings";
+import { cliCommandExists } from "../runners/cliAgentRunner";
+import { CLI_PROVIDERS, toQualifiedModelId } from "../runners/providers";
 import { AI_MODEL_STAGES, TaskStage } from "../types/taskProgress";
 
 export const TASK_MODEL_CONFIG_FILENAME = "task-models.json";
@@ -129,6 +131,18 @@ function isAutoModel(model: vscode.LanguageModelChat): boolean {
   return model.id.toLowerCase() === "auto" || model.name.toLowerCase() === "auto";
 }
 
+/**
+ * A model the user can pick for a stage, from any provider. `id` is the
+ * stored form: bare Copilot model IDs (legacy format) or provider-qualified
+ * IDs like "claude-cli:sonnet" for subscription CLI providers.
+ */
+export interface SelectableModel {
+  id: string;
+  name: string;
+  /** Display name of where the model runs, e.g. "GitHub Copilot". */
+  providerLabel: string;
+}
+
 export async function getAvailableCopilotModels(): Promise<
   vscode.LanguageModelChat[]
 > {
@@ -147,9 +161,50 @@ export async function getAvailableCopilotModels(): Promise<
   return reordered;
 }
 
+/**
+ * All models selectable for a stage: Copilot models from the LM API plus,
+ * for each vendor CLI that is installed (Claude Code, Codex, Gemini), that
+ * provider's model choices. Copilot being unavailable is not an error —
+ * CLI providers still work without it, and vice versa.
+ */
+export async function getAvailableModels(): Promise<SelectableModel[]> {
+  const result: SelectableModel[] = [];
+
+  try {
+    const copilotModels = await getAvailableCopilotModels();
+    for (const model of copilotModels) {
+      result.push({
+        id: model.id,
+        name: model.name,
+        providerLabel: "GitHub Copilot",
+      });
+    }
+  } catch {
+    // Copilot not signed in / not installed — CLI providers may still work.
+  }
+
+  const availability = await Promise.all(
+    CLI_PROVIDERS.map((def) => cliCommandExists(def.command))
+  );
+  CLI_PROVIDERS.forEach((def, index) => {
+    if (!availability[index]) {
+      return;
+    }
+    for (const choice of def.models) {
+      result.push({
+        id: toQualifiedModelId(def.id, choice.model),
+        name: choice.name,
+        providerLabel: `${def.label} (subscription CLI)`,
+      });
+    }
+  });
+
+  return result;
+}
+
 export function describeModel(
   modelId: string | undefined,
-  availableModels: readonly vscode.LanguageModelChat[]
+  availableModels: readonly SelectableModel[]
 ): string {
   if (!modelId) {
     return "Default (prefers auto model)";
