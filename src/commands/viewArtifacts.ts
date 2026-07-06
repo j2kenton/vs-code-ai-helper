@@ -55,7 +55,7 @@ export async function viewTask(arg?: ViewTaskArg): Promise<void> {
 
   // Prepare picker using artifactPicker helper (no filtering for viewTask)
   const hasPlanMap = new Map<string, boolean>();
-  const pickerOptions: ArtifactPickerOptions = {
+  const pickerOptions: ArtifactPickerOptions<vscode.Uri> = {
     tasks,
     hasPlanMap,
     mode: 'viewTask',
@@ -147,7 +147,7 @@ export async function viewPlan(arg?: ViewPlanArg): Promise<void> {
     hasPlanMap.set(key, exists);
   }
 
-  const pickerOptions: ArtifactPickerOptions = {
+  const pickerOptions: ArtifactPickerOptions<vscode.Uri> = {
     tasks,
     hasPlanMap,
     mode: 'viewPlan',

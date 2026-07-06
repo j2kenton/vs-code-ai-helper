@@ -3,27 +3,25 @@
  * No vscode imports - testable under node:test.
  */
 
-export interface TaskMetadata {
+export interface TaskMetadata<TUri extends { toString(): string } = { toString(): string }> {
   folderName: string;
-  folderUri: { toString(): string };
-  [key: string]: unknown;
+  folderUri: TUri;
 }
 
-export interface PickerItem {
+export interface PickerItem<TUri extends { toString(): string } = { toString(): string }> {
   label: string;
-  task: TaskMetadata;
-  [key: string]: unknown;
+  task: TaskMetadata<TUri>;
 }
 
-export interface ArtifactPickerOptions {
-  tasks: TaskMetadata[];
+export interface ArtifactPickerOptions<TUri extends { toString(): string } = { toString(): string }> {
+  tasks: TaskMetadata<TUri>[];
   /** Map keyed by task.folderUri.toString(), pre-evaluated by caller */
   hasPlanMap: Map<string, boolean>;
   mode: 'viewTask' | 'viewPlan';
 }
 
-export interface ArtifactPickerResult {
-  items: PickerItem[];
+export interface ArtifactPickerResult<TUri extends { toString(): string } = { toString(): string }> {
+  items: PickerItem<TUri>[];
   emptyMessage?: string;
 }
 
@@ -31,12 +29,12 @@ export interface ArtifactPickerResult {
  * Prepare filtered picker items and empty-state message for artifact commands.
  * Caller must pre-evaluate hasPlanMap before calling this helper.
  */
-export function prepareArtifactPicker(
-  options: ArtifactPickerOptions
-): ArtifactPickerResult {
+export function prepareArtifactPicker<TUri extends { toString(): string }>(
+  options: ArtifactPickerOptions<TUri>
+): ArtifactPickerResult<TUri> {
   const { tasks, hasPlanMap, mode } = options;
 
-  let filteredTasks: TaskMetadata[];
+  let filteredTasks: TaskMetadata<TUri>[];
 
   if (mode === 'viewTask') {
     // Include all tasks for viewTask
@@ -57,7 +55,7 @@ export function prepareArtifactPicker(
     return { items: [], emptyMessage };
   }
 
-  const items: PickerItem[] = filteredTasks.map((task) => ({
+  const items: PickerItem<TUri>[] = filteredTasks.map((task) => ({
     label: task.folderName,
     task,
   }));

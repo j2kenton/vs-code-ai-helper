@@ -241,7 +241,6 @@ export function getMetaFolderUri(): vscode.Uri | undefined {
 export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
   private readonly _onDidChangeTreeData = new vscode.EventEmitter<void>();
   readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
-  private lastTaskNodes: TaskNode[] = [];
   private readonly taskNodesByFolder = new Map<string, TaskNode>();
 
   private readonly _onDidLoadTasks = new vscode.EventEmitter<
@@ -276,7 +275,6 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
     try {
       this.mode = 'allCollapsed';
       this.rootRenderVersion++;
-      this.lastTaskNodes = [];
       this.refresh();
       // Context sync happens automatically at end of loadTasks()
     } catch (error) {
@@ -295,7 +293,6 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
     try {
       this.mode = 'autoFirstActive';
       this.rootRenderVersion++;
-      this.lastTaskNodes = [];
 
       // Refresh to get new nodes with expanded state
       this._onDidChangeTreeData.fire();
@@ -315,7 +312,6 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
       console.error('Failed to expand tasks:', error);
       // Revert mode and sync context on error
       this.mode = 'allCollapsed';
-      this.lastTaskNodes = [];
       this.syncCollapseExpandContext();
       void vscode.window.showErrorMessage(
         `Failed to load tasks: ${error instanceof Error ? error.message : String(error)}`
@@ -448,7 +444,6 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
     for (const node of nodes) {
       this.taskNodesByFolder.set(node.task.folderUri.toString(), node);
     }
-    this.lastTaskNodes = nodes;
 
     // Context sync now happens at end of loadTasks(), no need here
     return nodes;

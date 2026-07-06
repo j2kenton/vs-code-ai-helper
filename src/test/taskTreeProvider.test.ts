@@ -14,8 +14,8 @@ import * as taskProgressModule from "../types/taskProgress";
 const mockComputeStageContext = (stage: TaskStage): string => `stage-${stage}`;
 const mockIsReviewStage = (stage: string): boolean => stage.includes("review");
 
-stageContextModule.computeStageContext = mockComputeStageContext;
-taskProgressModule.isReviewStage = mockIsReviewStage as (
+(stageContextModule as Record<string, unknown>).computeStageContext = mockComputeStageContext;
+(taskProgressModule as Record<string, unknown>).isReviewStage = mockIsReviewStage as (
   stage: TaskStage
 ) => boolean;
 
