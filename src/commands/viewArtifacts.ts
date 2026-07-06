@@ -8,8 +8,6 @@ import { findAllTasks, IncompleteTask } from "../utils/taskProgressUtils";
 import { resolveCurrentPlanUri, statIfExists } from "../utils/fileUtils";
 import {
   prepareArtifactPicker,
-  type TaskMetadata,
-  type PickerItem,
   type ArtifactPickerOptions,
 } from "../utils/artifactPicker";
 
