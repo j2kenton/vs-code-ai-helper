@@ -3,6 +3,9 @@
  * denylist. Consumed by contextPack.ts and implReviewFileSelection.ts so
  * the rules are expressed once and cannot drift between pack builders.
  *
+ * This module is intentionally free of VS Code API imports so it can be
+ * compiled and tested without the VS Code extension host.
+ *
  * ─────────────────────────────────────────────────────────────────────────
  * SIZE CONSTANTS
  * ─────────────────────────────────────────────────────────────────────────
@@ -36,6 +39,14 @@ export const PROMPT_TOTAL_MAX_BYTES = 600_000;
  */
 export function estimateTokensFromUtf8Bytes(bytes: number): number {
   return Math.ceil(bytes / 4);
+}
+
+/**
+ * Measure the byte length of a prompt string as UTF-8.
+ * This is the canonical measurement used for size guards.
+ */
+export function measurePromptBytes(prompt: string): number {
+  return Buffer.byteLength(prompt, "utf8");
 }
 
 /**

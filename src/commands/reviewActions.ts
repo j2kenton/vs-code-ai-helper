@@ -44,6 +44,7 @@ import {
   materializeCanonicalIfNeeded,
 } from "../utils/implementationArtifactResolver";
 import { ensureAiConsent } from "../utils/aiConsent";
+import { checkAndConfirmPromptSize } from "../utils/promptSizeGuard";
 import * as cp from "child_process";
 
 /**
@@ -204,6 +205,10 @@ async function hasUncommittedChanges(cwd: string): Promise<boolean> {
  * Shared boilerplate for every AI command: availability check, progress
  * notification, prompt render, run, run log, result handling. Returns true
  * when the run completed successfully.
+ *
+ * Applies the prompt-size gate (high-context confirm + hard ceiling) before
+ * launching the provider process. The prompt is built here so its size is
+ * measured on the exact string that will be sent.
  */
 async function runAiToFile(options: {
   extensionUri: vscode.Uri;
@@ -234,6 +239,19 @@ async function runAiToFile(options: {
     return false;
   }
 
+  // Build the prompt here so we can apply the size gate before launching.
+  const prompt = await renderPromptTemplate(
+    options.extensionUri,
+    options.templateFile,
+    options.variables
+  );
+
+  // ── Prompt-size gate ─────────────────────────────────────────────────────
+  const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel);
+  if (sizeCheck === "abort" || sizeCheck === "declined") {
+    return false;
+  }
+
   let completed = false;
   await vscode.window.withProgress(
     {
@@ -242,12 +260,6 @@ async function runAiToFile(options: {
       cancellable: true,
     },
     async (progress, token) => {
-      const prompt = await renderPromptTemplate(
-        options.extensionUri,
-        options.templateFile,
-        options.variables
-      );
-
       progress.report({ message: `Waiting for ${providerLabel} response...` });
 
       const result = await runner.run(
@@ -341,6 +353,9 @@ const REVIEW_PROMPTS: Partial<Record<TaskStage, string>> = {
  * NOTE: Consent is checked at the entry-point level (runReviewWithAI,
  * applyReviewWithAI, etc.) — not here — so internal chaining (nextStage →
  * runReviewForFolder) does not re-prompt.
+ *
+ * The prompt-size gate IS applied here (via runAiToFile) since this is
+ * where the final prompt string is assembled.
  */
 export async function runReviewForFolder(
   extensionUri: vscode.Uri,
@@ -557,6 +572,7 @@ export async function applyReviewWithAI(
   const outputLabel = PLAN_FILENAME;
 
   // No overwrite confirmation — user triggered this deliberately
+  // (prompt-size gate is inside runAiToFile)
   const applySucceeded = await runAiToFile({
     extensionUri,
     taskFolderUri: resolved.folderUri,
@@ -618,6 +634,12 @@ async function applyImplementationReviewWithAI(
       review: reviewContent,
     }
   );
+
+  // ── Prompt-size gate ─────────────────────────────────────────────────────
+  const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel);
+  if (sizeCheck === "abort" || sizeCheck === "declined") {
+    return;
+  }
 
   await executeImplementationRun(
     extensionUri,
@@ -848,6 +870,7 @@ export async function generateImplementationWithAI(
 
   const implementationUri = planFinalUri;
   // No overwrite confirmation
+  // (prompt-size gate is inside runAiToFile)
   const succeeded = await runAiToFile({
     extensionUri,
     taskFolderUri: resolved.folderUri,
@@ -880,6 +903,17 @@ const IMPLEMENTATION_ELIGIBLE_STAGES: readonly TaskStage[] = [
  * ⚠ SAFETY: Before launching, warns the user if:
  *   - the workspace is not a git repo (changes cannot be tracked/reverted)
  *   - the workspace has uncommitted changes (recommend committing first)
+ *
+ * The prompt-size gate (high-context confirm + hard ceiling) is applied
+ * before the pre-run safety checks, so the user sees the size warning
+ * before the git-state warnings.
+ *
+ * NOTE: When called from applyImplementationReviewWithAI, the size gate
+ * has already been applied on the assembled prompt before this function
+ * is reached, so it is not double-applied. This function does NOT apply
+ * the size gate for the path coming from applyImplementationReviewWithAI;
+ * it IS applied for paths coming directly from runImplementationWithAI
+ * (where the prompt is assembled here).
  */
 async function executeImplementationRun(
   extensionUri: vscode.Uri,
@@ -1088,6 +1122,12 @@ export async function runImplementationWithAI(
     "run-implementation.md",
     { contextPack: contextPackContent, plan: planFinalContent }
   );
+
+  // ── Prompt-size gate (applied before executeImplementationRun) ────────────
+  const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel);
+  if (sizeCheck === "abort" || sizeCheck === "declined") {
+    return;
+  }
 
   const postRunReviewStage = isReviewStage(resolved.progress.currentStage)
     ? resolved.progress.currentStage

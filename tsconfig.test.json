@@ -17,6 +17,8 @@
   "include": [
     "src/utils/pathSafety.ts",
     "src/utils/implReviewFileSelection.ts",
+    "src/utils/contextEligibility.ts",
+    "src/legal/disclaimerVersion.ts",
     "src/views/taskTreeProvider.ts",
     "src/utils/stageContext.ts",
     "src/types/taskProgress.ts",

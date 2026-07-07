@@ -90,6 +90,12 @@ function basename(fsPath: string): string {
  *         OR file doesn't exist on disk yet — new unsaved buffer)
  *
  * NOTE: untitled: documents are ALWAYS excluded (scheme !== "file").
+ *
+ * IMPORTANT: The "new unsaved file" branch is reached only when the file
+ * path does NOT exist on disk (lstat ENOENT). An existing symlink is NOT
+ * treated as a new unsaved file — it goes through the realpath containment
+ * check so the resolved-target basename denylist is always applied to
+ * existing files including symlinked ones.
  */
 function isEligibleDocument(
   doc: vscode.TextDocument,
@@ -109,31 +115,42 @@ function isEligibleDocument(
     return false;
   }
 
-  // Realpath containment check — only for files that exist on disk.
-  // A new unsaved file-backed document may not exist yet; lexical
-  // containment is the best we can do and is acceptable for new files.
-  const realAncestor = realpathOfNearestExistingAncestor(doc.uri.fsPath);
-  if (realAncestor !== doc.uri.fsPath) {
-    // The nearest existing ancestor differs from the file path — the file
-    // doesn't exist yet (new unsaved document). Lexical containment already
-    // passed above, so this is eligible.
-    // BUT: check if the nearest existing ancestor resolves outside the workspace
-    // (e.g. a symlinked directory whose target is outside the workspace).
-    const realInWorkspace =
+  // Determine whether the file exists on disk right now.
+  // We use lstatSync (not statSync) so that a symlink is detected as
+  // "existing" even if its target doesn't exist, which is the right
+  // check: if lstat succeeds, the path is a real filesystem entry and
+  // must be treated as "existing" for realpath purposes.
+  let fileExistsOnDisk: boolean;
+  try {
+    nodeFs.lstatSync(doc.uri.fsPath);
+    fileExistsOnDisk = true;
+  } catch {
+    // ENOENT (or similar) — file doesn't exist on disk.
+    fileExistsOnDisk = false;
+  }
+
+  if (!fileExistsOnDisk) {
+    // New unsaved file-backed document (doesn't exist on disk yet).
+    // Lexical containment already passed above; use the nearest existing
+    // ancestor realpath to verify the containing directory isn't a
+    // symlink/junction that escapes the workspace.
+    const realAncestor = realpathOfNearestExistingAncestor(doc.uri.fsPath);
+    const realAncestorInWorkspace =
       realAncestor === wsRealFs ||
       realAncestor.startsWith(wsRealFs + "/") ||
       realAncestor.startsWith(wsRealFs + nodePath.sep);
-    if (!realInWorkspace) {
-      return false;
-    }
-    return true;
+    return realAncestorInWorkspace;
   }
 
-  // File exists — resolve its realpath and check it is inside the workspace.
+  // File exists on disk — resolve its realpath and check it is inside the
+  // workspace. This branch handles normal files AND symlinks correctly:
+  // realpathSync.native follows the symlink chain to the final target,
+  // so a symlink whose target is outside the workspace is excluded here.
   try {
     const realFilePath = nodeFs.realpathSync.native(doc.uri.fsPath);
     // Denylist check on the resolved target basename too (catches symlinks
-    // where the link name is innocuous but the target name is secret-like).
+    // where the link name is innocuous but the target name is secret-like,
+    // e.g. a symlink "notes.txt" → ".env").
     if (isDenylisted(nodePath.basename(realFilePath))) {
       return false;
     }
@@ -143,8 +160,8 @@ function isEligibleDocument(
       realFilePath.startsWith(wsRealFs + nodePath.sep);
     return realInWorkspace;
   } catch {
-    // realpath failed for a reason other than ENOENT (e.g. EPERM).
-    // Fail closed — exclude.
+    // realpath failed for a reason other than ENOENT (e.g. EPERM, broken
+    // symlink target). Fail closed — exclude.
     return false;
   }
 }
@@ -188,23 +205,60 @@ export async function generateContextPack(
   const allDocs = vscode.workspace.textDocuments;
 
   const activeUri = vscode.window.activeTextEditor?.document.uri.toString();
-  const visibleUris = new Set(
+  const visibleUriSet = new Set(
     vscode.window.visibleTextEditors.map((e) => e.document.uri.toString())
   );
 
-  const seenUris = new Set<string>();
-  const orderedDocs: vscode.TextDocument[] = [];
+  // Build the tab-order URI list for the third retention tier.
+  // window.tabGroups gives the actual tab order the user sees.
+  const tabOrderUris: string[] = [];
+  for (const group of vscode.window.tabGroups.all) {
+    for (const tab of group.tabs) {
+      const input = tab.input;
+      if (
+        input !== null &&
+        typeof input === "object" &&
+        "uri" in input &&
+        input.uri instanceof vscode.Uri
+      ) {
+        tabOrderUris.push(input.uri.toString());
+      }
+    }
+  }
 
-  // Collect in retention order: active, visible, rest
+  // Assign a sort key to each document:
+  //   0 = active editor
+  //   1 = visible (but not active)
+  //   2 = tab (but not visible/active), in tab order
+  //   3 = other (ambient document not in any visible/tab set)
+  const tabOrderIndex = new Map<string, number>(
+    tabOrderUris.map((uri, i) => [uri, i])
+  );
+
   const sorted = [...allDocs].sort((a, b) => {
     const aUri = a.uri.toString();
     const bUri = b.uri.toString();
-    if (aUri === activeUri) { return -1; }
-    if (bUri === activeUri) { return 1; }
-    if (visibleUris.has(aUri) && !visibleUris.has(bUri)) { return -1; }
-    if (!visibleUris.has(aUri) && visibleUris.has(bUri)) { return 1; }
+
+    const tier = (uri: string): number => {
+      if (uri === activeUri) { return 0; }
+      if (visibleUriSet.has(uri)) { return 1; }
+      if (tabOrderIndex.has(uri)) { return 2; }
+      return 3;
+    };
+
+    const aTier = tier(aUri);
+    const bTier = tier(bUri);
+    if (aTier !== bTier) { return aTier - bTier; }
+
+    // Within the tab tier, preserve the tab group/tab order.
+    if (aTier === 2) {
+      return (tabOrderIndex.get(aUri) ?? 0) - (tabOrderIndex.get(bUri) ?? 0);
+    }
     return 0;
   });
+
+  const seenUris = new Set<string>();
+  const orderedDocs: vscode.TextDocument[] = [];
 
   let excludedCount = 0;
   for (const doc of sorted) {

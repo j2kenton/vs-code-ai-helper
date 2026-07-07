@@ -12,6 +12,7 @@ import { resolveRunnerForModel } from "../runners/runnerRegistry";
 import { resolveModelForStage } from "../utils/modelSelection";
 import { TASK_FILENAME, TaskStage } from "../types/taskProgress";
 import { ensureAiConsent } from "../utils/aiConsent";
+import { checkAndConfirmPromptSize } from "../utils/promptSizeGuard";
 
 /**
  * Stages a task may be in for plan generation to be safe: either at the
@@ -93,6 +94,24 @@ export async function generatePlanWithAI(
     return;
   }
 
+  // Build the prompt and check its size BEFORE writing any artifacts.
+  const contextPackContent = await (async () => {
+    const uri = await writeContextPack(taskFolderUri, workspaceRoot.uri);
+    return new TextDecoder().decode(await vscode.workspace.fs.readFile(uri));
+  })();
+
+  const prompt = await renderPromptTemplate(
+    context.extensionUri,
+    "create-plan.md",
+    { contextPack: contextPackContent }
+  );
+
+  // ── Prompt-size gate ─────────────────────────────────────────────────────
+  const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel);
+  if (sizeCheck === "abort" || sizeCheck === "declined") {
+    return;
+  }
+
   // No overwrite confirmation — user has deliberately triggered regeneration
   await vscode.window.withProgress(
     {
@@ -101,20 +120,6 @@ export async function generatePlanWithAI(
       cancellable: true,
     },
     async (progress, token) => {
-      const contextPackUri = await writeContextPack(
-        taskFolderUri,
-        workspaceRoot.uri
-      );
-      const contextPackContent = new TextDecoder().decode(
-        await vscode.workspace.fs.readFile(contextPackUri)
-      );
-
-      const prompt = await renderPromptTemplate(
-        context.extensionUri,
-        "create-plan.md",
-        { contextPack: contextPackContent }
-      );
-
       const planFileUri = vscode.Uri.joinPath(taskFolderUri, "plan.md");
 
       progress.report({ message: `Waiting for ${providerLabel} response...` });

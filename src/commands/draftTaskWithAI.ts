@@ -7,6 +7,7 @@ import { writeRunLog } from "../utils/runLog";
 import { TaskInventory } from "../state/taskInventory";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { ensureAiConsent } from "../utils/aiConsent";
+import { checkAndConfirmPromptSize } from "../utils/promptSizeGuard";
 
 const INTRO_TEXT = `Briefly describe what changes you want to be made, and then use AI to help you clarify the plan.`;
 const SHORTCUT_NOTE = `Shortcut: Apply Current Stage Action (Windows/Linux: Ctrl+Shift+Alt+I, macOS: Cmd+Shift+Alt+I).`;
@@ -281,6 +282,19 @@ export async function draftTaskWithAI(
     return;
   }
 
+  // Build the prompt and check its size BEFORE launching or writing artifacts.
+  const prompt = await renderPromptTemplate(
+    context.extensionUri,
+    "draft-task-with-ai.md",
+    { taskDescription: parsed.taskDescription }
+  );
+
+  // ── Prompt-size gate ─────────────────────────────────────────────────────
+  const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel);
+  if (sizeCheck === "abort" || sizeCheck === "declined") {
+    return;
+  }
+
   let aiOutput: { draftWithAI: string; openQuestions: string } | undefined;
 
   await vscode.window.withProgress(
@@ -290,12 +304,6 @@ export async function draftTaskWithAI(
       cancellable: true,
     },
     async (progress, token) => {
-      const prompt = await renderPromptTemplate(
-        context.extensionUri,
-        "draft-task-with-ai.md",
-        { taskDescription: parsed.taskDescription }
-      );
-
       progress.report({ message: `Waiting for ${providerLabel} response...` });
 
       const result = await runner.run(
