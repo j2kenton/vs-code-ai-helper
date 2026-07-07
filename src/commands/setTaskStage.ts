@@ -241,20 +241,33 @@ export async function setTaskStage(
 }
 
 /**
- * Register the setTaskStage command.
+ * Register the setTaskStage command(s).
+ *
+ * Two command IDs share the same underlying handler: `setTaskStage` (task-row
+ * button, opens a quick-pick over all stages) and `setStageAsCurrent`
+ * (stage-row button, marks that specific stage current with no picker). They
+ * are split into distinct command IDs purely so each can carry its own icon
+ * in package.json — sharing one command made both buttons render identically
+ * and indistinguishably from "Move on to Next Stage".
  */
 export function registerSetTaskStageCommand(
   context: vscode.ExtensionContext,
   inventory: TaskInventory,
   currentTaskStore: CurrentTaskStore
 ): void {
+  // When called from either tree view button, no auto-review — the user is
+  // manually navigating stages.
+  const handler = (node?: SetTaskStageArg): Promise<void> =>
+    setTaskStage(inventory, currentTaskStore, node, false);
+
   const disposable = vscode.commands.registerCommand(
     "vs-code-ai-helper.setTaskStage",
-    (node?: SetTaskStageArg) =>
-      // When called from the tree view "Set stage as current" button,
-      // no auto-review — the user is manually navigating stages.
-      setTaskStage(inventory, currentTaskStore, node, false)
+    handler
+  );
+  const stageDisposable = vscode.commands.registerCommand(
+    "vs-code-ai-helper.setStageAsCurrent",
+    handler
   );
 
-  context.subscriptions.push(disposable);
+  context.subscriptions.push(disposable, stageDisposable);
 }

@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import { TaskInventory } from "../state/taskInventory";
+import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
 import {
   readTaskProgress,
@@ -12,12 +13,14 @@ import {
  */
 export async function pauseTask(
   inventory: TaskInventory,
+  currentTaskStore: CurrentTaskStore,
   explicitArg?: { canonicalId?: string; taskFolderPath?: string }
 ): Promise<void> {
   const resolvedTask = await resolveTaskContext(
     inventory,
     explicitArg,
-    { allowPaused: true } // Allow paused to handle "already paused" message
+    { allowPaused: true }, // Allow paused to handle "already paused" message
+    currentTaskStore
   );
 
   if (!resolvedTask) {
@@ -58,12 +61,13 @@ export async function pauseTask(
  */
 export function registerPauseTaskCommand(
   context: vscode.ExtensionContext,
-  inventory: TaskInventory
+  inventory: TaskInventory,
+  currentTaskStore: CurrentTaskStore
 ): void {
   const disposable = vscode.commands.registerCommand(
     "vs-code-ai-helper.pauseTask",
     (arg?: { canonicalId?: string; taskFolderPath?: string }) =>
-      pauseTask(inventory, arg)
+      pauseTask(inventory, currentTaskStore, arg)
   );
   context.subscriptions.push(disposable);
 }

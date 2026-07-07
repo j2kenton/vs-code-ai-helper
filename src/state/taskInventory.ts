@@ -1,3 +1,4 @@
+import * as path from "path";
 import * as vscode from "vscode";
 import { discoverAllTasks, DiscoveredTask } from "../utils/taskRoot";
 import { readTaskProgress } from "../utils/taskProgressUtils";
@@ -22,8 +23,13 @@ export class TaskInventory {
 
   readonly onDidChange = this._onDidChange.event;
 
+  // Must match the normalization in taskRoot.ts's normalizePath, since
+  // canonicalId (used as the map key) is produced there. path.normalize
+  // preserves platform-native separators (backslashes on Windows), so
+  // this cannot use a forward-slash replacement or lookups will never
+  // match the stored keys.
   private static normalizePath(p: string): string {
-    const normalized = p.replace(/\\/g, "/");
+    const normalized = path.normalize(p);
     return process.platform === "win32" ? normalized.toLowerCase() : normalized;
   }
 

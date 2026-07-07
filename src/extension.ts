@@ -39,7 +39,7 @@ export function activate(context: vscode.ExtensionContext): void {
   // context to every command that needs them.
   registerSelectMetaFolderCommand(context);
   registerStartNewTaskCommand(context, inventory, currentTaskStore);
-  registerResumeTaskCommand(context, inventory);
+  registerResumeTaskCommand(context, inventory, currentTaskStore);
   // AI commands receive the full context so they can call ensureAiConsent
   registerGeneratePlanWithAICommand(context);
   registerReviewActionCommands(context);
@@ -48,7 +48,7 @@ export function activate(context: vscode.ExtensionContext): void {
   registerViewArtifactCommands(context);
   registerDraftTaskWithAICommand(context, inventory);
   registerApplyCurrentStageActionCommand(context, inventory, currentTaskStore);
-  registerPauseTaskCommand(context, inventory);
+  registerPauseTaskCommand(context, inventory, currentTaskStore);
   registerApplyHighLevelReviewChangesCommand(context, inventory);
   registerApplyLowLevelReviewChangesCommand(context, inventory);
   registerCommitAndPushTaskCommand(context, inventory);
