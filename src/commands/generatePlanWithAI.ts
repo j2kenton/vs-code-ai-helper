@@ -4,7 +4,7 @@ import {
   updateTaskProgressStage,
   writeTaskProgress,
 } from "../utils/taskProgressUtils";
-import { writeContextPack } from "../utils/contextPack";
+import { generateContextPack, writeContextPack } from "../utils/contextPack";
 import { renderPromptTemplate } from "../utils/promptTemplates";
 import { writeRunLog } from "../utils/runLog";
 import { pickTaskFolder } from "../utils/pickTaskFolder";
@@ -94,11 +94,13 @@ export async function generatePlanWithAI(
     return;
   }
 
-  // Build the prompt and check its size BEFORE writing any artifacts.
-  const contextPackContent = await (async () => {
-    const uri = await writeContextPack(taskFolderUri, workspaceRoot.uri);
-    return new TextDecoder().decode(await vscode.workspace.fs.readFile(uri));
-  })();
+  // Build the context pack IN MEMORY — do NOT write context-pack.md yet.
+  // The size gate below may abort or the user may decline; in either case
+  // no on-disk artifact should be written for this run.
+  const contextPackContent = await generateContextPack(
+    taskFolderUri,
+    workspaceRoot.uri
+  );
 
   const prompt = await renderPromptTemplate(
     context.extensionUri,
@@ -106,11 +108,15 @@ export async function generatePlanWithAI(
     { contextPack: contextPackContent }
   );
 
-  // ── Prompt-size gate ─────────────────────────────────────────────────────
+  // ── Prompt-size gate (BEFORE any artifact is written) ────────────────────
   const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel);
   if (sizeCheck === "abort" || sizeCheck === "declined") {
     return;
   }
+
+  // Size gate passed — now persist context-pack.md so it is available in
+  // the task folder and in run logs as an audit record of what was sent.
+  await writeContextPack(taskFolderUri, workspaceRoot.uri);
 
   // No overwrite confirmation — user has deliberately triggered regeneration
   await vscode.window.withProgress(

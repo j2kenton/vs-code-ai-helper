@@ -83,19 +83,21 @@ function basename(fsPath: string): string {
  *  - basename or resolved-target basename matches the secret denylist
  *  - realpath resolves outside the workspace (symlink escape)
  *  - realpath resolution fails for a reason other than "file doesn't exist yet"
+ *  - lstatSync fails for any reason other than ENOENT (e.g. EPERM) — fail closed
  *
  * Included when:
  *  - file scheme, lexically inside workspace, basename not denylisted
  *  - AND (file exists on disk with realpath inside workspace,
- *         OR file doesn't exist on disk yet — new unsaved buffer)
+ *         OR file doesn't exist on disk yet — new unsaved buffer, ENOENT only)
  *
  * NOTE: untitled: documents are ALWAYS excluded (scheme !== "file").
  *
- * IMPORTANT: The "new unsaved file" branch is reached only when the file
- * path does NOT exist on disk (lstat ENOENT). An existing symlink is NOT
- * treated as a new unsaved file — it goes through the realpath containment
- * check so the resolved-target basename denylist is always applied to
- * existing files including symlinked ones.
+ * IMPORTANT: The "new unsaved file" branch is reached ONLY when lstatSync
+ * throws with ENOENT. Any other lstatSync error (EPERM, EACCES, etc.) causes
+ * the file to be excluded — fail closed. An existing symlink is NOT treated
+ * as a new unsaved file — it goes through the realpath containment check so
+ * the resolved-target basename denylist is always applied to existing files
+ * including symlinked ones.
  */
 function isEligibleDocument(
   doc: vscode.TextDocument,
@@ -120,13 +122,24 @@ function isEligibleDocument(
   // "existing" even if its target doesn't exist, which is the right
   // check: if lstat succeeds, the path is a real filesystem entry and
   // must be treated as "existing" for realpath purposes.
+  //
+  // IMPORTANT: Only treat ENOENT as "file doesn't exist yet" (new unsaved
+  // buffer). Any other lstatSync error (EPERM, EACCES, etc.) means we
+  // cannot determine the file's status — fail closed and exclude.
   let fileExistsOnDisk: boolean;
   try {
     nodeFs.lstatSync(doc.uri.fsPath);
     fileExistsOnDisk = true;
-  } catch {
-    // ENOENT (or similar) — file doesn't exist on disk.
-    fileExistsOnDisk = false;
+  } catch (err: unknown) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") {
+      // File genuinely does not exist on disk yet (new unsaved buffer).
+      fileExistsOnDisk = false;
+    } else {
+      // Permission error, I/O error, or other unexpected condition.
+      // Fail closed — we cannot safely determine the file's nature.
+      return false;
+    }
   }
 
   if (!fileExistsOnDisk) {
@@ -177,6 +190,7 @@ function isEligibleDocument(
  *  - lexically and via realpath inside the workspace
  *  - basename not in the secret-filename denylist
  *  - symlink escapes are caught via realpath containment
+ *  - lstatSync errors other than ENOENT cause the file to be excluded (fail closed)
  *
  * When `includeFileContents` is true (used by implementation reviews, which
  * must assess actual code), each open editor's content is embedded in a
