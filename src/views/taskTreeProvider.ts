@@ -267,7 +267,9 @@ type TaskTreeNode = TaskNode | StageNode;
 async function tryReadReadiness(
   artifactUri: vscode.Uri | undefined
 ): Promise<{ label: string; icon: string; colorKey: string } | undefined> {
-  if (!artifactUri) return undefined;
+  if (!artifactUri) {
+    return undefined;
+  }
   try {
     const content = await vscode.workspace.fs.readFile(artifactUri);
     const text = new TextDecoder().decode(content);
@@ -315,7 +317,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
    */
   refresh(): void {
     this._onDidChangeTreeData.fire();
-    void this.loadTasks();
+    this.loadTasks();
   }
 
   /** Collapse all task rows by switching to collapsed mode */
@@ -341,7 +343,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
       this.rootRenderVersion++;
 
       this._onDidChangeTreeData.fire();
-      const nodes = await this.getTaskNodes();
+      const nodes = this.getTaskNodes();
 
       for (const node of nodes) {
         await treeView.reveal(node, {
@@ -393,7 +395,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
     return this.getTaskNodes();
   }
 
-  private async loadTasks(): Promise<IncompleteTask[]> {
+  private loadTasks(): IncompleteTask[] {
     this.refreshInProgress = true;
     try {
       // Use the shared inventory as the source of truth
@@ -446,8 +448,8 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
     );
   }
 
-  private async getTaskNodes(): Promise<TaskNode[]> {
-    const tasks = await this.loadTasks();
+  private getTaskNodes(): TaskNode[] {
+    const tasks = this.loadTasks();
 
     const active = tasks.filter((t) => t.progress.currentStage !== "completed");
     const completed = tasks.filter(

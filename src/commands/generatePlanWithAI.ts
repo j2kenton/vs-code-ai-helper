@@ -13,18 +13,6 @@ import { resolveModelForStage } from "../utils/modelSelection";
 import { TASK_FILENAME, TaskStage } from "../types/taskProgress";
 
 /**
- * Read a text file's content, or undefined if it doesn't exist.
- */
-async function readIfExists(fileUri: vscode.Uri): Promise<string | undefined> {
-  try {
-    const content = await vscode.workspace.fs.readFile(fileUri);
-    return new TextDecoder().decode(content);
-  } catch {
-    return undefined;
-  }
-}
-
-/**
  * Stages a task may be in for plan generation to be safe: either at the
  * task-description stage (first generation) or the plan stage (regeneration).
  */

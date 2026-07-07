@@ -1,5 +1,4 @@
 import * as vscode from "vscode";
-import * as path from "path";
 import { TASK_FILENAME } from "../types/taskProgress";
 import { resolveModelForStage } from "../utils/modelSelection";
 import { resolveRunnerForModel } from "../runners/runnerRegistry";
@@ -10,11 +9,6 @@ import { resolveTaskContext } from "../utils/resolveTaskContext";
 
 const INTRO_TEXT = `Briefly describe what changes you want to be made, and then use AI to help you clarify the plan.`;
 const SHORTCUT_NOTE = `Shortcut: Apply Current Stage Action (Windows/Linux: Ctrl+Shift+Alt+I, macOS: Cmd+Shift+Alt+I).`;
-
-/**
- * Section headers that are canonically managed by this command.
- */
-const MANAGED_HEADERS = ["## Task Description", "## Draft with AI", "## Open Questions"];
 
 interface ParsedTaskDocument {
   introText: string;
@@ -85,11 +79,17 @@ export function parseTaskDocument(content: string): ParsedTaskDocument {
         taskDescBodies.push(withoutIntro);
       }
     } else if (section.header === "## Task Description") {
-      if (bodyText.length > 0) taskDescBodies.push(bodyText);
+      if (bodyText.length > 0) {
+        taskDescBodies.push(bodyText);
+      }
     } else if (section.header === "## Draft with AI") {
-      if (bodyText.length > 0) draftBodies.push(bodyText);
+      if (bodyText.length > 0) {
+        draftBodies.push(bodyText);
+      }
     } else if (section.header === "## Open Questions") {
-      if (bodyText.length > 0) questionsBodies.push(bodyText);
+      if (bodyText.length > 0) {
+        questionsBodies.push(bodyText);
+      }
     } else {
       // Non-canonical top-level headers: move body into Task Description
       const combined = section.header + "\n" + bodyText;
@@ -186,7 +186,9 @@ export function parseAIResponse(
  * Detect the line ending style of a string.
  */
 function detectEOL(content: string): string {
-  if (content.includes("\r\n")) return "\r\n";
+  if (content.includes("\r\n")) {
+    return "\r\n";
+  }
   return "\n";
 }
 
@@ -324,7 +326,9 @@ export async function draftTaskWithAI(
     // ignore
   }
 
-  if (!aiOutput) return;
+  if (!aiOutput) {
+    return;
+  }
 
   // Build updated document, preserving EOL style
   const updatedParsed: ParsedTaskDocument = {

@@ -294,7 +294,8 @@ export async function resolveTaskRootForCreation(
   try {
     await vscode.workspace.fs.createDirectory(rootUri);
   } catch (error) {
-    throw new Error(`Failed to create task root directory: ${error}`);
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Failed to create task root directory: ${message}`);
   }
 
   return resolvedRoot;

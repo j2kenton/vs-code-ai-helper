@@ -92,7 +92,7 @@ export function activate(context: vscode.ExtensionContext): void {
   const progressWatcher = vscode.workspace.createFileSystemWatcher(
     `**/${TASK_PROGRESS_FILENAME}`
   );
-  const onProgressChange = () => {
+  const onProgressChange = (): void => {
     void inventory.refresh().then(() => taskTreeProvider.refresh());
   };
   progressWatcher.onDidCreate(onProgressChange);

@@ -1,8 +1,7 @@
 import * as vscode from "vscode";
 import { discoverAllTasks, DiscoveredTask } from "../utils/taskRoot";
-import { readTaskProgress, TaskProgress } from "../utils/taskProgressUtils";
-import { TASK_PROGRESS_FILENAME } from "../types/taskProgress";
-import * as path from "path";
+import { readTaskProgress } from "../utils/taskProgressUtils";
+import { TaskProgress } from "../types/taskProgress";
 
 /**
  * A task with its progress metadata loaded
@@ -23,29 +22,26 @@ export class TaskInventory {
 
   readonly onDidChange = this._onDidChange.event;
 
+  private static normalizePath(p: string): string {
+    const normalized = p.replace(/\\/g, "/");
+    return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+  }
+
   /**
    * Refresh the task inventory by discovering all tasks and loading their progress.
    */
   async refresh(): Promise<void> {
     const discovered = await discoverAllTasks();
-    const allDiscoveredMap = new Map<string, DiscoveredTask>();
-
-    // Track all discovered tasks (before loading progress)
-    for (const task of discovered) {
-      allDiscoveredMap.set(task.canonicalId, task);
-    }
 
     // Load progress for visible tasks
     const withProgress: TaskWithProgress[] = [];
 
     for (const task of discovered) {
       try {
-        const progressPath = path.join(
-          task.taskFolderPath,
-          TASK_PROGRESS_FILENAME
-        );
-        const progressUri = vscode.Uri.file(progressPath);
-        const progress = await readTaskProgress(progressUri);
+        const progress = await readTaskProgress(vscode.Uri.file(task.taskFolderPath));
+        if (!progress) {
+          continue;
+        }
 
         withProgress.push({
           ...task,
@@ -98,7 +94,7 @@ export class TaskInventory {
    * Get a task by its absolute path
    */
   getTaskByPath(absolutePath: string): TaskWithProgress | undefined {
-    return this.taskByCanonicalId.get(absolutePath);
+    return this.taskByCanonicalId.get(TaskInventory.normalizePath(absolutePath));
   }
 
   /**
@@ -120,6 +116,8 @@ export class TaskInventory {
   getVisibleTaskForSuppressedPath(
     suppressedPath: string
   ): TaskWithProgress | undefined {
-    return this.getVisibleTaskForSuppressedId(suppressedPath);
+    return this.getVisibleTaskForSuppressedId(
+      TaskInventory.normalizePath(suppressedPath)
+    );
   }
 }

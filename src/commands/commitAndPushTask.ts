@@ -7,6 +7,10 @@ import { TASK_FILENAME } from "../types/taskProgress";
 import { resolveImplementationArtifact } from "../utils/implementationArtifactResolver";
 import { getLowLevelPlanUri } from "../utils/lowLevelPlanArtifactResolver";
 
+function getErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 /**
  * Run a git command with safe argument passing
  */
@@ -21,12 +25,12 @@ async function runGitCommand(
     let stdout = "";
     let stderr = "";
 
-    gitProcess.stdout?.on("data", (data) => {
-      stdout += data.toString();
+    gitProcess.stdout?.on("data", (data: Buffer | string) => {
+      stdout += typeof data === "string" ? data : data.toString("utf8");
     });
 
-    gitProcess.stderr?.on("data", (data) => {
-      stderr += data.toString();
+    gitProcess.stderr?.on("data", (data: Buffer | string) => {
+      stderr += typeof data === "string" ? data : data.toString("utf8");
     });
 
     gitProcess.on("error", (error: NodeJS.ErrnoException) => {
@@ -151,7 +155,9 @@ function extractSectionBody(
   sectionHeader: string
 ): string | undefined {
   const headerIndex = content.indexOf(sectionHeader);
-  if (headerIndex === -1) return undefined;
+  if (headerIndex === -1) {
+    return undefined;
+  }
 
   const afterHeader = content.slice(headerIndex + sectionHeader.length);
   const nextHeaderMatch = /^## /m.exec(afterHeader);
@@ -300,10 +306,16 @@ async function saveDirtyDocuments(
   ]);
 
   const dirtyDocs = vscode.workspace.textDocuments.filter((doc) => {
-    if (!doc.isDirty) return false;
-    if (relevantPaths.has(doc.uri.fsPath)) return true;
+    if (!doc.isDirty) {
+      return false;
+    }
+    if (relevantPaths.has(doc.uri.fsPath)) {
+      return true;
+    }
     // Also include any dirty file inside the repo
-    if (doc.uri.fsPath.startsWith(repoRoot)) return true;
+    if (doc.uri.fsPath.startsWith(repoRoot)) {
+      return true;
+    }
     return false;
   });
 
@@ -498,7 +510,7 @@ export async function commitAndPushTask(
           void vscode.window.showInformationMessage(
             `Successfully committed and pushed ${resolvedTask.folderName}`
           );
-        } catch (error: any) {
+        } catch (error: unknown) {
           if (commitCreated && newCommitHash) {
             // Rollback if commit was created but push failed
             try {
@@ -510,16 +522,16 @@ export async function commitAndPushTask(
               if (currentHash.trim() === newCommitHash) {
                 await runGitCommand(repoRoot, "reset", ["--mixed", "HEAD~1"]);
                 void vscode.window.showErrorMessage(
-                  `Push failed, commit rolled back: ${error.message}`
+                  `Push failed, commit rolled back: ${getErrorMessage(error)}`
                 );
               } else {
                 void vscode.window.showErrorMessage(
-                  `Push failed. Local commit remains (HEAD changed since commit): ${error.message}`
+                  `Push failed. Local commit remains (HEAD changed since commit): ${getErrorMessage(error)}`
                 );
               }
-            } catch (rollbackError: any) {
+            } catch (rollbackError: unknown) {
               void vscode.window.showErrorMessage(
-                `Push failed and rollback failed. Local commit remains: ${error.message}. Rollback error: ${rollbackError.message}`
+                `Push failed and rollback failed. Local commit remains: ${getErrorMessage(error)}. Rollback error: ${getErrorMessage(rollbackError)}`
               );
             }
           } else {
@@ -532,9 +544,9 @@ export async function commitAndPushTask(
             throw error;
           }
         }
-      } catch (error: any) {
+      } catch (error: unknown) {
         void vscode.window.showErrorMessage(
-          `Commit and push failed: ${error.message}`
+          `Commit and push failed: ${getErrorMessage(error)}`
         );
       }
     }

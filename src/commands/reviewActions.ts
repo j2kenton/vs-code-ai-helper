@@ -40,6 +40,7 @@ import {
 import { resolveModelForStage } from "../utils/modelSelection";
 import {
   getCanonicalImplementationUri,
+  resolveImplementationArtifact,
   materializeCanonicalIfNeeded,
 } from "../utils/implementationArtifactResolver";
 
@@ -612,9 +613,6 @@ async function currentStageArtifactExists(
   }
   // For implementation stage use the artifact resolver
   if (stage === "implementation") {
-    const { resolveImplementationArtifact } = await import(
-      "../utils/implementationArtifactResolver"
-    );
     const resolved = await resolveImplementationArtifact(folderUri);
     const stat = await statIfExists(resolved.uri);
     return stat !== undefined;
@@ -670,9 +668,6 @@ export async function nextStage(
   // Special handling for advancing into "implementation" stage:
   // copy the current plan to plan-final.md if not already there
   if (next === "implementation") {
-    const { resolveImplementationArtifact } = await import(
-      "../utils/implementationArtifactResolver"
-    );
     const resolved2 = await resolveImplementationArtifact(resolved.folderUri);
     if (!resolved2.isCanonical) {
       // Plan-final.md doesn't exist yet — copy current plan
@@ -703,7 +698,9 @@ export async function nextStage(
   // implicitly by calling the review directly with a specific node arg so it
   // does not loop back here.
   const workspaceRoot = getWorkspaceRoot();
-  if (!workspaceRoot) return;
+  if (!workspaceRoot) {
+    return;
+  }
 
   // Only auto-trigger plan-high-review when coming from "plan" stage, and
   // only auto-trigger plan-low-review when re-entering it.

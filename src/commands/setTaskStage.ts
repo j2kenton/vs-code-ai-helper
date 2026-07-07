@@ -21,7 +21,7 @@ import { resolveTaskContext } from "../utils/resolveTaskContext";
  */
 const AUTO_REVIEW_TRANSITIONS: Partial<Record<TaskStage, TaskStage>> = {
   plan: "plan-high-review",
-  "plan-low": "plan-low-review",
+  "plan-high-review": "plan-low-review",
 };
 
 /**
@@ -104,7 +104,7 @@ export async function setTaskStage(
   // Resolve via shared inventory-backed resolver, with persisted current-task
   // support so the command works correctly from both tree-item invocation and
   // command-palette invocation.
-  let resolvedTask = await resolveTaskContext(
+  const resolvedTask = await resolveTaskContext(
     inventory,
     resolverArg,
     { allowPaused: true },

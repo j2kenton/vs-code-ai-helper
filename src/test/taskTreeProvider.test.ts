@@ -349,8 +349,11 @@ void describe("draftTaskWithAI.parseAIResponse", () => {
 
     const result = parseAIResponse(response);
     assert.ok(result !== undefined);
-    assert.strictEqual(result!.draftWithAI, "This is the draft content.");
-    assert.ok(result!.openQuestions.includes("- What is the scope?"));
+    if (!result) {
+      assert.fail("Expected parseAIResponse to return a result");
+    }
+    assert.strictEqual(result.draftWithAI, "This is the draft content.");
+    assert.ok(result.openQuestions.includes("- What is the scope?"));
   });
 
   void it('should return undefined when Draft with AI header is missing', () => {
@@ -382,7 +385,10 @@ void describe("draftTaskWithAI.parseAIResponse", () => {
     const response = "## Draft with AI\n\nDraft.\n\n## Open Questions\n\n- None.";
     const result = parseAIResponse(response);
     assert.ok(result !== undefined);
-    assert.strictEqual(result!.openQuestions, "- None.");
+    if (!result) {
+      assert.fail("Expected parseAIResponse to return a result");
+    }
+    assert.strictEqual(result.openQuestions, "- None.");
   });
 });
 
@@ -392,15 +398,15 @@ void describe("Stage order and STAGE_ORDER", () => {
   });
 
   void it('should NOT contain "created" stage', () => {
-    assert.ok(!(STAGE_ORDER as readonly string[]).includes("created"));
+    assert.strictEqual(STAGE_ORDER.some((s) => String(s) === "created"), false);
   });
 
   void it('should NOT contain "plan-final" stage', () => {
-    assert.ok(!(STAGE_ORDER as readonly string[]).includes("plan-final"));
+    assert.strictEqual(STAGE_ORDER.some((s) => String(s) === "plan-final"), false);
   });
 
   void it('should contain exactly one "implementation" entry', () => {
-    const count = (STAGE_ORDER as readonly string[]).filter(
+    const count = STAGE_ORDER.filter(
       (s) => s === "implementation"
     ).length;
     assert.strictEqual(count, 1);
