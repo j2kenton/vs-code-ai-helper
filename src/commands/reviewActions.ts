@@ -43,6 +43,8 @@ import {
   resolveImplementationArtifact,
   materializeCanonicalIfNeeded,
 } from "../utils/implementationArtifactResolver";
+import { ensureAiConsent } from "../utils/aiConsent";
+import * as cp from "child_process";
 
 /**
  * The optional argument tree-view buttons pass to these commands: the tree
@@ -166,6 +168,39 @@ function artifactUri(
 }
 
 /**
+ * Check if the workspace is inside a git repository.
+ * Returns true when git is available and the path is inside a repo.
+ */
+async function isGitWorkspace(cwd: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    cp.execFile(
+      "git",
+      ["rev-parse", "--show-toplevel"],
+      { cwd, windowsHide: true },
+      (err) => resolve(!err)
+    );
+  });
+}
+
+/**
+ * Check if the workspace has uncommitted changes (dirty state).
+ * Returns true when git reports any modified/untracked files.
+ */
+async function hasUncommittedChanges(cwd: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    cp.execFile(
+      "git",
+      ["status", "--porcelain"],
+      { cwd, windowsHide: true },
+      (err, stdout) => {
+        if (err) { resolve(false); return; }
+        resolve(stdout.trim().length > 0);
+      }
+    );
+  });
+}
+
+/**
  * Shared boilerplate for every AI command: availability check, progress
  * notification, prompt render, run, run log, result handling. Returns true
  * when the run completed successfully.
@@ -203,7 +238,7 @@ async function runAiToFile(options: {
   await vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Notification,
-      title: `${options.progressAction} with ${providerLabel}...`,
+      title: `${options.progressAction} with ${providerLabel} (uses your ${providerLabel} quota)...`,
       cancellable: true,
     },
     async (progress, token) => {
@@ -302,6 +337,10 @@ const REVIEW_PROMPTS: Partial<Record<TaskStage, string>> = {
  * Stage advancement is handled by nextStage/setTaskStage exclusively.
  *
  * No overwrite confirmation is shown (user has already triggered this deliberately).
+ *
+ * NOTE: Consent is checked at the entry-point level (runReviewWithAI,
+ * applyReviewWithAI, etc.) — not here — so internal chaining (nextStage →
+ * runReviewForFolder) does not re-prompt.
  */
 export async function runReviewForFolder(
   extensionUri: vscode.Uri,
@@ -396,21 +435,35 @@ export async function runReviewForFolder(
 /**
  * Run (or re-run) the review for the task's current position in the
  * workflow. Labeled "Re-review" in the UI.
+ *
+ * Requires first-use consent before any AI action runs.
  */
 export async function runReviewWithAI(
   extensionUri: vscode.Uri,
+  context: vscode.ExtensionContext,
   node?: TaskNodeArg
 ): Promise<void> {
+  // ── Workspace guard ───────────────────────────────────────────────────────
+  const workspaceRoot = getWorkspaceRoot();
+  if (!workspaceRoot) {
+    void vscode.window.showErrorMessage(
+      "No workspace folder open. Please open a folder first."
+    );
+    return;
+  }
+
+  // ── Consent gate ─────────────────────────────────────────────────────────
+  const consented = await ensureAiConsent(context);
+  if (!consented) {
+    return;
+  }
+
   const resolved = await resolveTask(
     node,
     Object.keys(REVIEW_TARGETS) as TaskStage[],
     "Re-review with AI"
   );
   if (!resolved) {
-    return;
-  }
-  const workspaceRoot = getWorkspaceRoot();
-  if (!workspaceRoot) {
     return;
   }
   await runReviewForFolder(
@@ -427,17 +480,31 @@ export async function runReviewWithAI(
  * in place; for implementation review stages it re-runs the AI
  * implementation against the codebase to address the review's findings.
  * The stage does not change — re-run the review or move to the next stage explicitly.
+ *
+ * Requires first-use consent before any AI action runs.
  */
 export async function applyReviewWithAI(
   extensionUri: vscode.Uri,
+  context: vscode.ExtensionContext,
   node?: TaskNodeArg
 ): Promise<void> {
-  const resolved = await resolveTask(node, REVIEW_STAGES, "Apply Review with AI");
-  if (!resolved) {
-    return;
-  }
+  // ── Workspace guard ───────────────────────────────────────────────────────
   const workspaceRoot = getWorkspaceRoot();
   if (!workspaceRoot) {
+    void vscode.window.showErrorMessage(
+      "No workspace folder open. Please open a folder first."
+    );
+    return;
+  }
+
+  // ── Consent gate ─────────────────────────────────────────────────────────
+  const consented = await ensureAiConsent(context);
+  if (!consented) {
+    return;
+  }
+
+  const resolved = await resolveTask(node, REVIEW_STAGES, "Apply Review with AI");
+  if (!resolved) {
     return;
   }
 
@@ -632,6 +699,10 @@ async function currentStageArtifactExists(
  *
  * When auto-triggering review, this command delegates to the registered
  * runReviewWithAI command (which has access to extensionUri via closure).
+ *
+ * NOTE: When auto-triggering review via runReviewForFolder, consent was
+ * already obtained earlier in the user-initiated flow that called nextStage.
+ * The auto-triggered review does NOT re-prompt for consent.
  */
 export async function nextStage(
   extensionUri: vscode.Uri,
@@ -713,14 +784,15 @@ export async function nextStage(
     // Re-read progress to get the newly persisted stage
     const freshProgress = await readTaskProgress(resolved.folderUri);
     if (freshProgress) {
-      // Delegate through the command so extensionUri is correctly resolved
-      await runReviewWithAI(extensionUri, {
-        task: {
-          folderUri: resolved.folderUri,
-          folderName: freshProgress.taskFolder,
-          progress: freshProgress,
-        },
-      });
+      // Bypass the consent gate for auto-triggered reviews — consent was
+      // already given by the user action that triggered nextStage.
+      await runReviewForFolder(
+        extensionUri,
+        resolved.folderUri,
+        workspaceRoot,
+        freshProgress.currentStage,
+        true
+      );
     }
   }
 }
@@ -728,21 +800,35 @@ export async function nextStage(
 /**
  * Generate plan-final.md (Implementation stage) from a task.
  * This is the "Generate implementation" action for the merged Implementation stage.
+ *
+ * Requires first-use consent before any AI action runs.
  */
 export async function generateImplementationWithAI(
   extensionUri: vscode.Uri,
+  context: vscode.ExtensionContext,
   node?: TaskNodeArg
 ): Promise<void> {
+  // ── Workspace guard ───────────────────────────────────────────────────────
+  const workspaceRoot = getWorkspaceRoot();
+  if (!workspaceRoot) {
+    void vscode.window.showErrorMessage(
+      "No workspace folder open. Please open a folder first."
+    );
+    return;
+  }
+
+  // ── Consent gate ─────────────────────────────────────────────────────────
+  const consented = await ensureAiConsent(context);
+  if (!consented) {
+    return;
+  }
+
   const resolved = await resolveTask(
     node,
     ["plan-low-review", "implementation"],
     "Generate Implementation with AI"
   );
   if (!resolved) {
-    return;
-  }
-  const workspaceRoot = getWorkspaceRoot();
-  if (!workspaceRoot) {
     return;
   }
 
@@ -790,6 +876,10 @@ const IMPLEMENTATION_ELIGIBLE_STAGES: readonly TaskStage[] = [
 
 /**
  * Shared core of an implementation run.
+ *
+ * ⚠ SAFETY: Before launching, warns the user if:
+ *   - the workspace is not a git repo (changes cannot be tracked/reverted)
+ *   - the workspace has uncommitted changes (recommend committing first)
  */
 async function executeImplementationRun(
   extensionUri: vscode.Uri,
@@ -801,6 +891,44 @@ async function executeImplementationRun(
   postRunReviewStage: TaskStage = "implementation"
 ): Promise<void> {
   const implementationUri = getCanonicalImplementationUri(folderUri);
+  const cwd = workspaceRoot.uri.fsPath;
+
+  // Pre-run safety checks for agentic file-editing runs
+  const isGit = await isGitWorkspace(cwd);
+  if (!isGit) {
+    // Non-git workspace: changes cannot be tracked or reverted
+    const proceed = await vscode.window.showWarningMessage(
+      "⚠️ This workspace is not tracked by git.\n\n" +
+        "The AI implementation run will edit files in your workspace, " +
+        "but there is no git history to track or revert those changes. " +
+        "You will not be able to see exactly what was changed or undo it via git.\n\n" +
+        "Back up your workspace before proceeding.",
+      { modal: true },
+      "Proceed Anyway",
+    );
+    if (proceed !== "Proceed Anyway") {
+      void vscode.window.showInformationMessage("Implementation run cancelled.");
+      return;
+    }
+  } else {
+    // Git workspace: warn if there are uncommitted changes
+    const dirty = await hasUncommittedChanges(cwd);
+    if (dirty) {
+      const proceed = await vscode.window.showWarningMessage(
+        "⚠️ Your workspace has uncommitted changes.\n\n" +
+          "The AI implementation run will edit workspace files. " +
+          "For best results, commit your current changes first so you can " +
+          "clearly see what the AI changed and revert if needed.",
+        { modal: false },
+        "Proceed",
+        "Cancel",
+      );
+      if (proceed !== "Proceed") {
+        void vscode.window.showInformationMessage("Implementation run cancelled.");
+        return;
+      }
+    }
+  }
 
   let result: Awaited<ReturnType<typeof runImplementationForModel>> | undefined;
 
@@ -834,6 +962,21 @@ async function executeImplementationRun(
   await writeRunLog(folderUri, result.runnerId, "implementation", logContent);
 
   if (result.status === "completed") {
+    // Post-run: show changed files or warn if tracking was unavailable
+    if (result.filesChangedUnknown) {
+      void vscode.window.showWarningMessage(
+        "⚠️ The AI implementation run completed, but the list of changed files " +
+          "could not be determined (the workspace may not be a git repository). " +
+          "Review your workspace manually to see what was changed."
+      );
+    } else if (result.filesChanged.length > 0) {
+      void vscode.window.showInformationMessage(
+        `Implementation complete. ${result.filesChanged.length} file(s) changed: ` +
+          result.filesChanged.slice(0, 5).join(", ") +
+          (result.filesChanged.length > 5 ? ` … and ${result.filesChanged.length - 5} more` : "")
+      );
+    }
+
     const summary =
       result.summary?.trim() ||
       `## Implementation Complete\n\nFiles changed:\n${
@@ -859,10 +1002,7 @@ async function executeImplementationRun(
 
     const doc = await vscode.workspace.openTextDocument(implementationUri);
     await vscode.window.showTextDocument(doc);
-    void vscode.window.showInformationMessage(
-      `Implementation complete. ${result.filesChanged.length} file(s) written.`
-    );
-    // Auto-review after implementation run — pass extensionUri correctly
+    // Auto-review after implementation run — bypass consent (already obtained)
     await runReviewForFolder(extensionUri, folderUri, workspaceRoot, postRunReviewStage, true);
   } else if (result.status === "cancelled") {
     void vscode.window.showInformationMessage("Implementation cancelled.");
@@ -876,21 +1016,35 @@ async function executeImplementationRun(
 /**
  * Run the implementation: use AI with tool-calling to make actual code changes.
  * No overwrite confirmation shown.
+ *
+ * Requires first-use consent before any AI action runs.
  */
 export async function runImplementationWithAI(
   extensionUri: vscode.Uri,
+  context: vscode.ExtensionContext,
   node?: TaskNodeArg
 ): Promise<void> {
+  // ── Workspace guard ───────────────────────────────────────────────────────
+  const workspaceRoot = getWorkspaceRoot();
+  if (!workspaceRoot) {
+    void vscode.window.showErrorMessage(
+      "No workspace folder open. Please open a folder first."
+    );
+    return;
+  }
+
+  // ── Consent gate ─────────────────────────────────────────────────────────
+  const consented = await ensureAiConsent(context);
+  if (!consented) {
+    return;
+  }
+
   const resolved = await resolveTask(
     node,
     IMPLEMENTATION_ELIGIBLE_STAGES,
     "Run Implementation with AI"
   );
   if (!resolved) {
-    return;
-  }
-  const workspaceRoot = getWorkspaceRoot();
-  if (!workspaceRoot) {
     return;
   }
 
@@ -945,7 +1099,7 @@ export async function runImplementationWithAI(
     workspaceRoot,
     prompt,
     model.modelId,
-    `Running implementation with ${providerLabel}...`,
+    `Running implementation with ${providerLabel} (uses your ${providerLabel} quota)...`,
     postRunReviewStage
   );
 }
@@ -959,11 +1113,11 @@ export function registerReviewActionCommands(
   context.subscriptions.push(
     vscode.commands.registerCommand(
       "vs-code-ai-helper.runReviewWithAI",
-      (node?: TaskNodeArg) => runReviewWithAI(context.extensionUri, node)
+      (node?: TaskNodeArg) => runReviewWithAI(context.extensionUri, context, node)
     ),
     vscode.commands.registerCommand(
       "vs-code-ai-helper.applyReviewWithAI",
-      (node?: TaskNodeArg) => applyReviewWithAI(context.extensionUri, node)
+      (node?: TaskNodeArg) => applyReviewWithAI(context.extensionUri, context, node)
     ),
     vscode.commands.registerCommand(
       "vs-code-ai-helper.viewReview",
@@ -977,12 +1131,12 @@ export function registerReviewActionCommands(
     vscode.commands.registerCommand(
       "vs-code-ai-helper.generateImplementationWithAI",
       (node?: TaskNodeArg) =>
-        generateImplementationWithAI(context.extensionUri, node)
+        generateImplementationWithAI(context.extensionUri, context, node)
     ),
     vscode.commands.registerCommand(
       "vs-code-ai-helper.runImplementationWithAI",
       (node?: TaskNodeArg) =>
-        runImplementationWithAI(context.extensionUri, node)
+        runImplementationWithAI(context.extensionUri, context, node)
     )
   );
 }

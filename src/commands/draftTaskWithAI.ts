@@ -6,6 +6,7 @@ import { renderPromptTemplate } from "../utils/promptTemplates";
 import { writeRunLog } from "../utils/runLog";
 import { TaskInventory } from "../state/taskInventory";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
+import { ensureAiConsent } from "../utils/aiConsent";
 
 const INTRO_TEXT = `Briefly describe what changes you want to be made, and then use AI to help you clarify the plan.`;
 const SHORTCUT_NOTE = `Shortcut: Apply Current Stage Action (Windows/Linux: Ctrl+Shift+Alt+I, macOS: Cmd+Shift+Alt+I).`;
@@ -197,12 +198,30 @@ function detectEOL(content: string): string {
  * Draft the task description with AI. Reads from the live open document
  * buffer if task.md is open (to capture unsaved edits), writes back only
  * to `## Draft with AI` and `## Open Questions`.
+ *
+ * Requires first-use consent (ensureAiConsent) before any provider is
+ * launched or any file is written.
  */
 export async function draftTaskWithAI(
   inventory: TaskInventory,
-  extensionUri: vscode.Uri,
+  context: vscode.ExtensionContext,
   explicitArg?: { canonicalId?: string }
 ): Promise<void> {
+  // ── Workspace guard (must come before consent) ──────────────────────────
+  const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+  if (!workspaceFolder) {
+    void vscode.window.showErrorMessage(
+      "No workspace folder open. Please open a folder first."
+    );
+    return;
+  }
+
+  // ── Consent gate ─────────────────────────────────────────────────────────
+  const consented = await ensureAiConsent(context);
+  if (!consented) {
+    return;
+  }
+
   const resolvedTask = await resolveTaskContext(inventory, explicitArg, {
     allowPaused: false,
   });
@@ -267,12 +286,12 @@ export async function draftTaskWithAI(
   await vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Notification,
-      title: `Drafting task with ${providerLabel}...`,
+      title: `Drafting task with ${providerLabel} (uses your ${providerLabel} quota)...`,
       cancellable: true,
     },
     async (progress, token) => {
       const prompt = await renderPromptTemplate(
-        extensionUri,
+        context.extensionUri,
         "draft-task-with-ai.md",
         { taskDescription: parsed.taskDescription }
       );
@@ -282,7 +301,7 @@ export async function draftTaskWithAI(
       const result = await runner.run(
         {
           taskFolderUri: taskFolderUri,
-          workspaceUri: vscode.workspace.workspaceFolders?.[0]?.uri ?? taskFolderUri,
+          workspaceUri: workspaceFolder.uri,
           stage: "task-description",
           prompt,
           outputFile: vscode.Uri.joinPath(taskFolderUri, "_draft-ai-output.tmp"),
@@ -397,7 +416,7 @@ export function registerDraftTaskWithAICommand(
   const disposable = vscode.commands.registerCommand(
     "vs-code-ai-helper.draftTaskWithAI",
     (explicitArg?: { canonicalId?: string }) =>
-      draftTaskWithAI(inventory, context.extensionUri, explicitArg)
+      draftTaskWithAI(inventory, context, explicitArg)
   );
   context.subscriptions.push(disposable);
 }

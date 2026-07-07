@@ -35,11 +35,12 @@ export function activate(context: vscode.ExtensionContext): void {
   // current-task selection survives reloads without being shared globally.
   const currentTaskStore = new CurrentTaskStore(context.workspaceState);
 
-  // Register commands — pass the shared inventory and currentTaskStore to
-  // every command that needs them.
+  // Register commands — pass the shared inventory, currentTaskStore, and
+  // context to every command that needs them.
   registerSelectMetaFolderCommand(context);
   registerStartNewTaskCommand(context, inventory, currentTaskStore);
   registerResumeTaskCommand(context, inventory);
+  // AI commands receive the full context so they can call ensureAiConsent
   registerGeneratePlanWithAICommand(context);
   registerReviewActionCommands(context);
   registerSetTaskStageCommand(context, inventory, currentTaskStore);
@@ -62,6 +63,25 @@ export function activate(context: vscode.ExtensionContext): void {
     }
   );
   context.subscriptions.push(helloWorldDisposable);
+
+  // Register the viewDisclaimer command — opens the packaged DISCLAIMER.md
+  // in the markdown preview so users can read it inside VS Code at any time.
+  // This command is also wired into the first-use consent modal's
+  // "View Disclaimer" button.
+  const viewDisclaimerDisposable = vscode.commands.registerCommand(
+    "vs-code-ai-helper.viewDisclaimer",
+    () => {
+      const disclaimerUri = vscode.Uri.joinPath(
+        context.extensionUri,
+        "DISCLAIMER.md"
+      );
+      void vscode.commands.executeCommand(
+        "markdown.showPreview",
+        disclaimerUri
+      );
+    }
+  );
+  context.subscriptions.push(viewDisclaimerDisposable);
 
   // Tasks tree view + status bar: persistent visibility of workflow progress
   const taskTreeProvider = new TaskTreeProvider(inventory);

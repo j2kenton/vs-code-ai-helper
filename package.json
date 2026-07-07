@@ -1,7 +1,7 @@
 {
   "name": "vs-code-ai-helper",
   "displayName": "VS Code AI Helper",
-  "description": "A VS Code extension for helping developers utilize AI tools and LLMs in their work",
+  "description": "AI-assisted task planning and implementation workflow for VS Code. Uses your existing AI subscriptions (Copilot, Claude, Codex, Gemini) — real usage costs apply. AI runs can modify workspace files. Provided as-is with no warranty. See README and DISCLAIMER.md.",
   "version": "0.10.0",
   "publisher": "j2kenton",
   "license": "MIT",
@@ -117,6 +117,10 @@
         "command": "vs-code-ai-helper.commitAndPushTask",
         "title": "AI Helper: Commit and Push Task",
         "icon": "$(cloud-upload)"
+      },
+      {
+        "command": "vs-code-ai-helper.viewDisclaimer",
+        "title": "AI Helper: View Disclaimer"
       }
     ],
     "keybindings": [

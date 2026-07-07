@@ -8,6 +8,12 @@ import {
   IMPL_REVIEW_MAX_TOTAL_CHARS,
 } from "./implReviewFileSelection";
 import { sanitizeRelativePath } from "./pathSafety";
+import {
+  CONTEXT_PER_FILE_MAX_BYTES,
+  CONTEXT_MAX_FILES,
+  CONTEXT_TOTAL_MAX_BYTES,
+  isDenylisted,
+} from "./contextEligibility";
 
 /**
  * Resolve the real, symlink-free path of the nearest existing ancestor of
@@ -45,9 +51,8 @@ async function readTextFileIfExists(
 }
 
 /**
- * True if fileUri is located inside workspaceUri. Used to keep files from
- * unrelated open editors (e.g. from a different workspace/folder) out of
- * the context pack sent to the AI provider.
+ * True if fileUri is located inside workspaceUri (lexical check).
+ * Used as the first guard; realpath containment follows for existing files.
  */
 function isInsideWorkspace(
   fileUri: vscode.Uri,
@@ -63,18 +68,98 @@ function isInsideWorkspace(
 }
 
 /**
- * Per-file and total caps applied when embedding open-file contents in the
- * context pack (used by implementation reviews), so a workspace full of
- * open editors can't produce an oversized prompt.
+ * Return the basename of a path string (last component).
  */
-const MAX_CHARS_PER_FILE = 8000;
-const MAX_TOTAL_CONTENT_CHARS = 60000;
+function basename(fsPath: string): string {
+  return nodePath.basename(fsPath);
+}
+
+/**
+ * True when the document should be excluded from provider-bound context packs.
+ *
+ * Excluded when:
+ *  - scheme is not "file"
+ *  - out-of-workspace (lexical check; realpath check follows for existing files)
+ *  - basename or resolved-target basename matches the secret denylist
+ *  - realpath resolves outside the workspace (symlink escape)
+ *  - realpath resolution fails for a reason other than "file doesn't exist yet"
+ *
+ * Included when:
+ *  - file scheme, lexically inside workspace, basename not denylisted
+ *  - AND (file exists on disk with realpath inside workspace,
+ *         OR file doesn't exist on disk yet — new unsaved buffer)
+ *
+ * NOTE: untitled: documents are ALWAYS excluded (scheme !== "file").
+ */
+function isEligibleDocument(
+  doc: vscode.TextDocument,
+  workspaceUri: vscode.Uri,
+  wsRealFs: string
+): boolean {
+  if (doc.uri.scheme !== "file") {
+    return false;
+  }
+
+  if (!isInsideWorkspace(doc.uri, workspaceUri)) {
+    return false;
+  }
+
+  // Denylist check on the literal basename
+  if (isDenylisted(basename(doc.uri.fsPath))) {
+    return false;
+  }
+
+  // Realpath containment check — only for files that exist on disk.
+  // A new unsaved file-backed document may not exist yet; lexical
+  // containment is the best we can do and is acceptable for new files.
+  const realAncestor = realpathOfNearestExistingAncestor(doc.uri.fsPath);
+  if (realAncestor !== doc.uri.fsPath) {
+    // The nearest existing ancestor differs from the file path — the file
+    // doesn't exist yet (new unsaved document). Lexical containment already
+    // passed above, so this is eligible.
+    // BUT: check if the nearest existing ancestor resolves outside the workspace
+    // (e.g. a symlinked directory whose target is outside the workspace).
+    const realInWorkspace =
+      realAncestor === wsRealFs ||
+      realAncestor.startsWith(wsRealFs + "/") ||
+      realAncestor.startsWith(wsRealFs + nodePath.sep);
+    if (!realInWorkspace) {
+      return false;
+    }
+    return true;
+  }
+
+  // File exists — resolve its realpath and check it is inside the workspace.
+  try {
+    const realFilePath = nodeFs.realpathSync.native(doc.uri.fsPath);
+    // Denylist check on the resolved target basename too (catches symlinks
+    // where the link name is innocuous but the target name is secret-like).
+    if (isDenylisted(nodePath.basename(realFilePath))) {
+      return false;
+    }
+    const realInWorkspace =
+      realFilePath === wsRealFs ||
+      realFilePath.startsWith(wsRealFs + "/") ||
+      realFilePath.startsWith(wsRealFs + nodePath.sep);
+    return realInWorkspace;
+  } catch {
+    // realpath failed for a reason other than ENOENT (e.g. EPERM).
+    // Fail closed — exclude.
+    return false;
+  }
+}
 
 /**
  * Generate context-pack.md for a task folder: the user request from
  * task.md, the workspace root, and the list of currently open editors
  * that belong to this workspace. This is an explicit, reviewable
  * selection of context, not a full repository dump.
+ *
+ * Eligibility rules (see isEligibleDocument):
+ *  - file: scheme only (no untitled:, virtual, notebook, diff)
+ *  - lexically and via realpath inside the workspace
+ *  - basename not in the secret-filename denylist
+ *  - symlink escapes are caught via realpath containment
  *
  * When `includeFileContents` is true (used by implementation reviews, which
  * must assess actual code), each open editor's content is embedded in a
@@ -88,19 +173,59 @@ export async function generateContextPack(
   const taskFileUri = vscode.Uri.joinPath(taskFolderUri, TASK_FILENAME);
   const taskContent = await readTextFileIfExists(taskFileUri);
 
-  const openDocs = vscode.workspace.textDocuments.filter(
-    (doc) =>
-      doc.uri.scheme === "file" && isInsideWorkspace(doc.uri, workspaceUri)
+  // Resolve workspace realpath once for eligibility checks.
+  const wsFsRaw = workspaceUri.fsPath.replace(/[/\\]+$/, "");
+  let wsRealFs: string;
+  try {
+    wsRealFs = nodeFs.realpathSync.native(wsFsRaw);
+  } catch {
+    // If workspace realpath fails, fall back to the lexical path.
+    wsRealFs = wsFsRaw;
+  }
+
+  // Build the eligible, deduplicated document list.
+  // Retention order: active editor first, then visible editors, then tabs.
+  const allDocs = vscode.workspace.textDocuments;
+
+  const activeUri = vscode.window.activeTextEditor?.document.uri.toString();
+  const visibleUris = new Set(
+    vscode.window.visibleTextEditors.map((e) => e.document.uri.toString())
   );
-  const seenPaths = new Set<string>();
-  const uniqueDocs = openDocs.filter((doc) => {
-    const relPath = vscode.workspace.asRelativePath(doc.uri, false);
-    if (seenPaths.has(relPath)) {
-      return false;
-    }
-    seenPaths.add(relPath);
-    return true;
+
+  const seenUris = new Set<string>();
+  const orderedDocs: vscode.TextDocument[] = [];
+
+  // Collect in retention order: active, visible, rest
+  const sorted = [...allDocs].sort((a, b) => {
+    const aUri = a.uri.toString();
+    const bUri = b.uri.toString();
+    if (aUri === activeUri) { return -1; }
+    if (bUri === activeUri) { return 1; }
+    if (visibleUris.has(aUri) && !visibleUris.has(bUri)) { return -1; }
+    if (!visibleUris.has(aUri) && visibleUris.has(bUri)) { return 1; }
+    return 0;
   });
+
+  let excludedCount = 0;
+  for (const doc of sorted) {
+    const uriKey = doc.uri.toString();
+    if (seenUris.has(uriKey)) {
+      continue;
+    }
+    seenUris.add(uriKey);
+
+    if (!isEligibleDocument(doc, workspaceUri, wsRealFs)) {
+      excludedCount++;
+      continue;
+    }
+
+    if (orderedDocs.length >= CONTEXT_MAX_FILES) {
+      excludedCount++;
+      continue;
+    }
+
+    orderedDocs.push(doc);
+  }
 
   const lines: string[] = [];
   lines.push("# Context Pack");
@@ -117,21 +242,24 @@ export async function generateContextPack(
   lines.push("");
   lines.push("## Open Editors");
   lines.push("");
-  if (uniqueDocs.length > 0) {
-    for (const doc of uniqueDocs) {
+  if (orderedDocs.length > 0) {
+    for (const doc of orderedDocs) {
       lines.push(`- ${vscode.workspace.asRelativePath(doc.uri, false)}`);
     }
   } else {
-    lines.push("_No open editors._");
+    lines.push("_No eligible open editors._");
+  }
+  if (excludedCount > 0) {
+    lines.push(`_${excludedCount} editor(s) excluded for safety (out-of-workspace, denylist, or symlink escape)._`);
   }
   lines.push("");
 
-  if (includeFileContents && uniqueDocs.length > 0) {
+  if (includeFileContents && orderedDocs.length > 0) {
     lines.push("## Open Editor Contents");
     lines.push("");
-    let totalChars = 0;
-    for (const doc of uniqueDocs) {
-      if (totalChars >= MAX_TOTAL_CONTENT_CHARS) {
+    let totalBytes = 0;
+    for (const doc of orderedDocs) {
+      if (totalBytes >= CONTEXT_TOTAL_MAX_BYTES) {
         lines.push(
           "_Further open files omitted: total content size limit reached._"
         );
@@ -141,16 +269,28 @@ export async function generateContextPack(
       const relPath = vscode.workspace.asRelativePath(doc.uri, false);
       let text = doc.getText();
       let truncated = false;
-      if (text.length > MAX_CHARS_PER_FILE) {
-        text = text.slice(0, MAX_CHARS_PER_FILE);
+
+      // Per-file byte cap
+      const textBytes = Buffer.byteLength(text, "utf8");
+      if (textBytes > CONTEXT_PER_FILE_MAX_BYTES) {
+        // Truncate by character count approximation (bytes ≈ chars for ASCII)
+        const ratio = CONTEXT_PER_FILE_MAX_BYTES / textBytes;
+        text = text.slice(0, Math.floor(text.length * ratio));
         truncated = true;
       }
-      if (totalChars + text.length > MAX_TOTAL_CONTENT_CHARS) {
-        text = text.slice(0, MAX_TOTAL_CONTENT_CHARS - totalChars);
+
+      // Total byte cap
+      const currentBytes = Buffer.byteLength(text, "utf8");
+      if (totalBytes + currentBytes > CONTEXT_TOTAL_MAX_BYTES) {
+        const remaining = CONTEXT_TOTAL_MAX_BYTES - totalBytes;
+        const ratio = remaining / currentBytes;
+        text = text.slice(0, Math.floor(text.length * ratio));
         truncated = true;
       }
-      totalChars += text.length;
-      lines.push(`### ${relPath}${truncated ? " (truncated)" : ""}`);
+      totalBytes += Buffer.byteLength(text, "utf8");
+
+      const truncMarker = truncated ? ` [truncated at ${Math.round(CONTEXT_PER_FILE_MAX_BYTES / 1024)} KB]` : "";
+      lines.push(`### ${relPath}${truncMarker}`);
       lines.push("");
       lines.push("```");
       lines.push(text);
@@ -322,6 +462,12 @@ export async function generateImplReviewContextPack(
         continue;
       }
 
+      // Denylist check on the tracked path's basename
+      if (isDenylisted(nodePath.basename(normalized))) {
+        rejectedPaths.push(rawPath);
+        continue;
+      }
+
       // Defence-in-depth: verify the resolved absolute path stays inside
       // the workspace, e.g. to catch encoded traversal that slipped past
       // the string check.
@@ -356,7 +502,7 @@ export async function generateImplReviewContextPack(
 
     if (rejectedPaths.length > 0) {
       lines.push(
-        `⚠ ${rejectedPaths.length} tracked path(s) rejected (unsafe or outside workspace):` 
+        `⚠ ${rejectedPaths.length} tracked path(s) rejected (unsafe, denylisted, or outside workspace):`
       );
       lines.push("");
       for (const p of rejectedPaths) {
@@ -433,8 +579,17 @@ export async function generateImplReviewContextPack(
   );
   lines.push("");
 
+  // Resolve workspace realpath for eligibility checks.
+  const wsFsRawFallback = workspaceUri.fsPath.replace(/[/\\]+$/, "");
+  let wsRealFsFallback: string;
+  try {
+    wsRealFsFallback = nodeFs.realpathSync.native(wsFsRawFallback);
+  } catch {
+    wsRealFsFallback = wsFsRawFallback;
+  }
+
   const openDocs = vscode.workspace.textDocuments.filter(
-    (doc) => doc.uri.scheme === "file" && isInsideWorkspace(doc.uri, workspaceUri)
+    (doc) => isEligibleDocument(doc, workspaceUri, wsRealFsFallback)
   );
   const seenPaths = new Set<string>();
   const uniqueDocs = openDocs.filter((doc) => {
@@ -453,7 +608,7 @@ export async function generateImplReviewContextPack(
       lines.push(`- ${vscode.workspace.asRelativePath(doc.uri, false)}`);
     }
   } else {
-    lines.push("_No open editors._");
+    lines.push("_No eligible open editors._");
   }
   lines.push("");
 

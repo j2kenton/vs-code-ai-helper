@@ -9,7 +9,37 @@ Task Created → Plan → Plan: High-Level Review → Plan: Low-Level Review
 → Final Plan → Implementation → Impl: High-Level Review → Impl: Low-Level Review → Completed
 ```
 
-There is one plan file (`plan.md`) that gets revised **in place** when you apply a review — no forked "updated plan" copies to keep track of. Implementation reviews send the files changed during the AI implementation run to Copilot along with the final plan, so the AI assesses what's *actually implemented* versus outstanding. If a changed file is open in the editor with unsaved edits, the unsaved buffer is used instead of the on-disk copy. Tasks implemented manually (or before file tracking was introduced) fall back to open editors with an explicit warning.
+---
+
+## ⚠️ Disclaimer & Terms of Use
+
+> **Read before using any AI-powered feature.**
+> Full details are in [`DISCLAIMER.md`](DISCLAIMER.md). This is a summary only.
+> Use the `AI Helper: View Disclaimer` command in the Command Palette to read it inside VS Code.
+
+**Provided as-is — no warranty.** This is open-source personal developer tooling. The authors accept no liability of any kind for anything that happens as a result of using this extension. See the MIT License and `DISCLAIMER.md`.
+
+**Token, quota, and API costs are your responsibility.** Every "with AI" command consumes real quota or money from the AI subscription you have configured (Copilot, Anthropic, OpenAI, or Google). A single implementation run can run for up to 30 minutes. There is no built-in cost ceiling or token estimate. **You will be shown a first-use consent dialog in each workspace before any AI action runs.**
+
+**AI runs can modify or delete files in your workspace.** Implementation runs give the selected AI model permission to read, create, overwrite, and delete files anywhere inside your workspace. Always commit or back up your workspace before running an AI implementation.
+
+**File contents are sent to third-party AI providers.** When you use a "with AI" command, a context pack is assembled from your task file and the contents of open editors in your workspace and sent to the selected AI provider. Specifically: all eligible open editors are included in the context pack; for documents with unsaved changes, the unsaved buffer content is sent in place of the on-disk content (including new unsaved file-backed documents under the workspace) — `untitled:` documents are never sent. Out-of-workspace editors are excluded by default. A best-effort filename denylist (`.env`, `*.pem`, `*.key`, `*.tfstate`, etc.) blocks common secret-file names — this is a courtesy filter based on filename conventions only, not secret detection.
+
+**Commit & Push is outward-facing and largely irreversible.** The Commit & Push command stages changes and pushes to your remote repository. By default, only the task folder's changes are staged; run artifacts (`runs/`, `context-pack.md`) are excluded from the default staged set. Review the preview carefully before confirming.
+
+**Run logs contain full prompt content.** Every AI run writes a log under `runs/` in your task folder. These logs include the full prompt sent to the provider, which may include file contents. If you push your task folder, run logs go with it.
+
+**Never use unsupervised. Supervise every action. Review results before acting on them.**
+
+**This is not production or compliance tooling.** It is a personal developer tool, not designed or certified for regulated environments, enterprise deployments, or data-processing-agreement contexts.
+
+For the full disclaimer, data-flow details, and your pre-use checklist, see **[DISCLAIMER.md](DISCLAIMER.md)**.
+For the security policy, see **[SECURITY.md](SECURITY.md)**.
+For instructions on reporting a vulnerability, see **[SECURITY.md](SECURITY.md)**.
+
+*Documentation is informational only and not legal advice. No guarantee of legal enforceability is made.*
+
+---
 
 ## Marketplace
 
@@ -78,6 +108,7 @@ A matching status bar item (bottom-left) always shows your most recently active 
 | `AI Helper: Generate Implementation Checklist with AI` | Turns `plan-final.md` into `implementation.md`, a concrete `- [ ]` checklist with a Verification section. |
 | `AI Helper: Set Task Stage` | Manually set which stage a task is tracked at, moving it backward or forward. Only changes `task-progress.json` — it doesn't touch or delete any artifact files. |
 | `AI Helper: Refresh Tasks View` | Manually refresh the Tasks sidebar (it also refreshes automatically on its own). |
+| `AI Helper: View Disclaimer` | Open `DISCLAIMER.md` in the VS Code markdown preview. |
 | `AI Helper: Hello World` | Sanity-check command confirming the extension is active. |
 
 Every "with AI" command asks for confirmation before overwriting an existing artifact, is only offered when the task is at a stage the action applies to, and falls back with a clear message (no crash, no silent failure) if the selected provider isn't signed in, isn't installed, has no available model, or you're out of quota. Every AI action has a manual counterpart — the workflow never requires an AI provider. Promoting a plan to `plan-final.md` and marking a task completed are intentionally explicit, human steps.
@@ -101,6 +132,8 @@ YYYY-MM-DD_task_N/
 ```
 
 `runs/` gives you a paper trail of exactly what was asked and what came back each time you use an AI command, separate from the artifact itself.
+
+> **Note:** Run logs contain the full prompt sent to the AI provider, including any file contents included in the context pack. If you commit and push your task folder, run logs are included. See `DISCLAIMER.md` §5 for details.
 
 ## Settings
 
@@ -155,12 +188,16 @@ vs-code-ai-helper/
 │   └── prompts/                 # Prompt templates used by the AI commands
 ├── src/
 │   ├── extension.ts             # Extension entry point / command registration
+│   ├── legal/                   # Disclaimer version constant
 │   ├── commands/                # One file per command (startNewTask, resumeTask, generatePlanWithAI, ...)
 │   ├── runners/                 # AI provider adapters (Copilot LM API + Claude/Codex/Gemini subscription CLIs)
 │   ├── config/                  # Workspace settings helpers
 │   ├── types/                   # Shared types (TaskProgress, AgentRunner, ...)
-│   └── utils/                   # Task-progress, context-pack, and run-log helpers
+│   └── utils/                   # Task-progress, context-pack, consent, and run-log helpers
 ├── dist/                        # Compiled output (git-ignored)
+├── DISCLAIMER.md                # Full disclaimer and terms of use — read before using AI features
+├── SECURITY.md                  # Security policy and vulnerability reporting
+├── CHANGELOG.md                 # Change history
 ├── package.json                 # Extension manifest
 ├── tsconfig.json                # TypeScript configuration
 ├── .eslintrc.json               # ESLint configuration
@@ -169,4 +206,6 @@ vs-code-ai-helper/
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).
+
+This extension is provided as-is. See [DISCLAIMER.md](DISCLAIMER.md) for the full terms of use.

@@ -11,6 +11,7 @@ import { pickTaskFolder } from "../utils/pickTaskFolder";
 import { resolveRunnerForModel } from "../runners/runnerRegistry";
 import { resolveModelForStage } from "../utils/modelSelection";
 import { TASK_FILENAME, TaskStage } from "../types/taskProgress";
+import { ensureAiConsent } from "../utils/aiConsent";
 
 /**
  * Stages a task may be in for plan generation to be safe: either at the
@@ -26,23 +27,32 @@ const ELIGIBLE_STAGES: readonly TaskStage[] = ["task-description", "plan"];
  * When `targetFolderUri` is given (e.g. right after creating or resuming a
  * specific task), that task is used directly instead of prompting the user
  * to pick one.
+ *
+ * Requires first-use consent (ensureAiConsent) before any provider is
+ * launched or any file is written.
  */
 export async function generatePlanWithAI(
-  extensionUri: vscode.Uri,
+  context: vscode.ExtensionContext,
   targetFolderUri?: vscode.Uri
 ): Promise<void> {
-  const taskFolderUri =
-    targetFolderUri ??
-    (await pickTaskFolder("Generate Plan with AI", ELIGIBLE_STAGES));
-  if (!taskFolderUri) {
-    return;
-  }
-
   const workspaceRoot = vscode.workspace.workspaceFolders?.[0];
   if (!workspaceRoot) {
     void vscode.window.showErrorMessage(
       "No workspace folder open. Please open a folder first."
     );
+    return;
+  }
+
+  // ── Consent gate ─────────────────────────────────────────────────────────
+  const consented = await ensureAiConsent(context);
+  if (!consented) {
+    return;
+  }
+
+  const taskFolderUri =
+    targetFolderUri ??
+    (await pickTaskFolder("Generate Plan with AI", ELIGIBLE_STAGES));
+  if (!taskFolderUri) {
     return;
   }
 
@@ -87,7 +97,7 @@ export async function generatePlanWithAI(
   await vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Notification,
-      title: `Generating plan with ${providerLabel}...`,
+      title: `Generating plan with ${providerLabel} (uses your ${providerLabel} quota)...`,
       cancellable: true,
     },
     async (progress, token) => {
@@ -100,7 +110,7 @@ export async function generatePlanWithAI(
       );
 
       const prompt = await renderPromptTemplate(
-        extensionUri,
+        context.extensionUri,
         "create-plan.md",
         { contextPack: contextPackContent }
       );
@@ -168,7 +178,7 @@ export function registerGeneratePlanWithAICommand(
   const disposable = vscode.commands.registerCommand(
     "vs-code-ai-helper.generatePlanWithAI",
     (targetFolderUri?: vscode.Uri) =>
-      generatePlanWithAI(context.extensionUri, targetFolderUri)
+      generatePlanWithAI(context, targetFolderUri)
   );
   context.subscriptions.push(disposable);
 }
