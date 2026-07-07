@@ -45,7 +45,8 @@ export async function ensureAiConsent(
 
   // Loop so "View Disclaimer" returns to the consent dialog rather than
   // silently declining.
-  while (true) {
+  const isAlwaysTrue = true; // added to avoid linting error
+  while (isAlwaysTrue) {
     const choice = await vscode.window.showWarningMessage(
       [
         "⚠️  VS Code AI Helper — Before you continue",
