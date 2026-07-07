@@ -1,0 +1,76 @@
+/**
+ * Centralizes review readiness parsing and icon-band mapping.
+ *
+ * Review artifacts must include a top-level line in this exact form:
+ *   Readiness: N/10
+ *
+ * Scores map to:
+ *   8-10 -> green positive  (thumbs-up)
+ *   5-7  -> yellow caution  (question)
+ *   0-4  -> red negative    (thumbs-down)
+ */
+
+export interface ReadinessResult {
+  score: number | null;
+  /** Formatted label e.g. "9/10" or "—/10" */
+  label: string;
+  /** VS Code codicon name */
+  icon: string;
+  /** VS Code ThemeColor key */
+  colorKey: string;
+}
+
+/** Primary regex: exact `Readiness: N/10` line */
+const EXACT_READINESS_RE = /^Readiness:\s*(10|[0-9])\/10\s*$/m;
+/** Legacy fallback: case-insensitive `readiness` keyword + N/10 anywhere */
+const LEGACY_READINESS_RE = /readiness[^0-9]*(10|[0-9])\/10/i;
+
+/**
+ * Parse readiness from a review artifact string.
+ * Returns a ReadinessResult with icon/color for the sidebar.
+ */
+export function parseReadiness(content: string): ReadinessResult {
+  let score: number | null = null;
+
+  const exactMatch = EXACT_READINESS_RE.exec(content);
+  if (exactMatch?.[1] !== undefined) {
+    score = parseInt(exactMatch[1], 10);
+  } else {
+    const legacyMatch = LEGACY_READINESS_RE.exec(content);
+    if (legacyMatch?.[1] !== undefined) {
+      score = parseInt(legacyMatch[1], 10);
+    }
+  }
+
+  if (score === null) {
+    return {
+      score: null,
+      label: "—/10",
+      icon: "circle-outline",
+      colorKey: "disabledForeground",
+    };
+  }
+
+  if (score >= 8) {
+    return {
+      score,
+      label: `${score}/10`,
+      icon: "thumbsup",
+      colorKey: "charts.green",
+    };
+  }
+  if (score >= 5) {
+    return {
+      score,
+      label: `${score}/10`,
+      icon: "question",
+      colorKey: "charts.yellow",
+    };
+  }
+  return {
+    score,
+    label: `${score}/10`,
+    icon: "thumbsdown",
+    colorKey: "charts.red",
+  };
+}

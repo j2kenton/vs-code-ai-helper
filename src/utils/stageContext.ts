@@ -10,9 +10,9 @@ import type { TaskStage } from '../types/taskProgress';
  * These values drive menu visibility via when clauses in package.json.
  */
 export function computeStageContext(stage: TaskStage): string {
-  // Created and plan stages get unique context values for targeted actions
-  if (stage === 'created') {
-    return 'stage-created';
+  // Task-description and plan stages get unique context values for targeted actions
+  if (stage === 'task-description') {
+    return 'stage-task-description';
   }
   if (stage === 'plan') {
     return 'stage-plan';

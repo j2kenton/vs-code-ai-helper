@@ -1,12 +1,5 @@
 import * as vscode from "vscode";
 import {
-  getMetaResourcesPath,
-  isPromptDismissed,
-  dismissPrompt,
-  hasValidMetaResourcesPath,
-} from "./config/settings";
-import {
-  selectMetaFolder,
   registerSelectMetaFolderCommand,
 } from "./commands/selectMetaFolder";
 import { registerStartNewTaskCommand } from "./commands/startNewTask";
@@ -16,85 +9,50 @@ import { registerReviewActionCommands } from "./commands/reviewActions";
 import { registerSetTaskStageCommand } from "./commands/setTaskStage";
 import { registerConfigureStepModelsCommand } from "./commands/configureStepModels";
 import { registerViewArtifactCommands } from "./commands/viewArtifacts";
+import { registerDraftTaskWithAICommand } from "./commands/draftTaskWithAI";
+import { registerApplyCurrentStageActionCommand } from "./commands/applyCurrentStageAction";
+import { registerPauseTaskCommand } from "./commands/pauseTask";
+import { registerApplyHighLevelReviewChangesCommand } from "./commands/applyHighLevelReviewChanges";
+import { registerApplyLowLevelReviewChangesCommand } from "./commands/applyLowLevelReviewChanges";
+import { registerCommitAndPushTaskCommand } from "./commands/commitAndPushTask";
 import { TaskTreeProvider, TASKS_VIEW_ID } from "./views/taskTreeProvider";
 import { TaskStatusBar } from "./views/taskStatusBar";
+import { TaskInventory } from "./state/taskInventory";
+import { CurrentTaskStore } from "./utils/currentTaskStore";
 import { TASK_PROGRESS_FILENAME } from "./types/taskProgress";
 
 /**
- * Button labels for the prompts
- */
-const BUTTON_OK = "OK";
-const BUTTON_CHANGE = "Change";
-const BUTTON_DISMISS = "Dismiss";
-const BUTTON_SELECT_FOLDER = "Select Folder";
-
-/**
- * Handle the activation prompt flow based on current configuration state
- */
-async function handleActivationPrompt(): Promise<void> {
-  // If prompt was previously dismissed, stay silent
-  if (isPromptDismissed()) {
-    console.log("AI Helper: Prompt dismissed, extension inactive");
-    return;
-  }
-
-  if (hasValidMetaResourcesPath()) {
-    // Path exists - show info with option to change or dismiss
-    const currentPath = getMetaResourcesPath();
-    const selection = await vscode.window.showInformationMessage(
-      `AI Helper using: ${currentPath}`,
-      BUTTON_OK,
-      BUTTON_CHANGE,
-      BUTTON_DISMISS
-    );
-
-    if (selection === BUTTON_CHANGE) {
-      await selectMetaFolder();
-    } else if (selection === BUTTON_DISMISS) {
-      await dismissPrompt();
-      void vscode.window.showInformationMessage(
-        "AI Helper has been dismissed. Reinstall to re-enable."
-      );
-    }
-    // OK or close - continue with current path
-  } else {
-    // No path configured - prompt to select or dismiss
-    const selection = await vscode.window.showInformationMessage(
-      "Configure a folder to store AI Helper meta resources (logs, docs, tracking)",
-      BUTTON_SELECT_FOLDER,
-      BUTTON_DISMISS
-    );
-
-    if (selection === BUTTON_SELECT_FOLDER) {
-      await selectMetaFolder();
-    } else if (selection === BUTTON_DISMISS) {
-      await dismissPrompt();
-      void vscode.window.showInformationMessage(
-        "AI Helper has been dismissed. Reinstall to re-enable."
-      );
-    }
-    // Close without selection - will prompt again next activation
-  }
-}
-
-/**
  * This method is called when your extension is activated.
- * Your extension is activated the very first time the command is executed.
  */
 export function activate(context: vscode.ExtensionContext): void {
   console.log("VS Code AI Helper is now active!");
 
-  // Register commands
+  // Create a single shared TaskInventory instance. All commands and the tree
+  // provider use this same instance so discovery results are always consistent.
+  const inventory = new TaskInventory();
+
+  // Create a single shared CurrentTaskStore backed by workspaceState so the
+  // current-task selection survives reloads without being shared globally.
+  const currentTaskStore = new CurrentTaskStore(context.workspaceState);
+
+  // Register commands — pass the shared inventory and currentTaskStore to
+  // every command that needs them.
   registerSelectMetaFolderCommand(context);
-  registerStartNewTaskCommand(context);
-  registerResumeTaskCommand(context);
+  registerStartNewTaskCommand(context, inventory, currentTaskStore);
+  registerResumeTaskCommand(context, inventory);
   registerGeneratePlanWithAICommand(context);
   registerReviewActionCommands(context);
-  registerSetTaskStageCommand(context);
+  registerSetTaskStageCommand(context, inventory, currentTaskStore);
   registerConfigureStepModelsCommand(context);
   registerViewArtifactCommands(context);
+  registerDraftTaskWithAICommand(context, inventory);
+  registerApplyCurrentStageActionCommand(context, inventory, currentTaskStore);
+  registerPauseTaskCommand(context, inventory);
+  registerApplyHighLevelReviewChangesCommand(context, inventory);
+  registerApplyLowLevelReviewChangesCommand(context, inventory);
+  registerCommitAndPushTaskCommand(context, inventory);
 
-  // Register the hello world command (keeping for now)
+  // Register the hello world command (keeping for backward compat)
   const helloWorldDisposable = vscode.commands.registerCommand(
     "vs-code-ai-helper.helloWorld",
     () => {
@@ -106,7 +64,7 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(helloWorldDisposable);
 
   // Tasks tree view + status bar: persistent visibility of workflow progress
-  const taskTreeProvider = new TaskTreeProvider();
+  const taskTreeProvider = new TaskTreeProvider(inventory);
   const tasksTreeView = vscode.window.createTreeView(TASKS_VIEW_ID, {
     treeDataProvider: taskTreeProvider,
     showCollapseAll: false,
@@ -130,18 +88,21 @@ export function activate(context: vscode.ExtensionContext): void {
     () => taskTreeProvider.collapseAll()
   );
 
-  // Auto-refresh whenever any task's progress file changes
+  // Refresh inventory and tree whenever any task's progress file changes
   const progressWatcher = vscode.workspace.createFileSystemWatcher(
     `**/${TASK_PROGRESS_FILENAME}`
   );
-  progressWatcher.onDidCreate(() => taskTreeProvider.refresh());
-  progressWatcher.onDidChange(() => taskTreeProvider.refresh());
-  progressWatcher.onDidDelete(() => taskTreeProvider.refresh());
+  const onProgressChange = () => {
+    void inventory.refresh().then(() => taskTreeProvider.refresh());
+  };
+  progressWatcher.onDidCreate(onProgressChange);
+  progressWatcher.onDidChange(onProgressChange);
+  progressWatcher.onDidDelete(onProgressChange);
 
   // Refresh when the meta resources folder setting changes
   const configListener = vscode.workspace.onDidChangeConfiguration((event) => {
     if (event.affectsConfiguration("vs-code-ai-helper.metaResourcesPath")) {
-      taskTreeProvider.refresh();
+      void inventory.refresh().then(() => taskTreeProvider.refresh());
     }
   });
 
@@ -156,12 +117,11 @@ export function activate(context: vscode.ExtensionContext): void {
     configListener
   );
 
-  // Populate the status bar immediately, without waiting for the tree view
-  // to be shown or for a change event to occur
-  taskTreeProvider.refresh();
+  // Populate the inventory and status bar immediately (silent — no folder creation)
+  void inventory.refresh().then(() => taskTreeProvider.refresh());
 
-  // Handle activation prompt flow
-  void handleActivationPrompt();
+  // NOTE: The initial "using plans" popup has been intentionally removed.
+  // Discovery is silent; no folder is created until a task is actually made.
 }
 
 /**

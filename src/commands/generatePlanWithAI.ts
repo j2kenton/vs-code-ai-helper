@@ -11,7 +11,6 @@ import { pickTaskFolder } from "../utils/pickTaskFolder";
 import { resolveRunnerForModel } from "../runners/runnerRegistry";
 import { resolveModelForStage } from "../utils/modelSelection";
 import { TASK_FILENAME, TaskStage } from "../types/taskProgress";
-import { runReviewForFolder } from "./reviewActions";
 
 /**
  * Read a text file's content, or undefined if it doesn't exist.
@@ -26,22 +25,19 @@ async function readIfExists(fileUri: vscode.Uri): Promise<string | undefined> {
 }
 
 /**
- * Stages a task may be in for plan generation to be safe: either no plan
- * exists yet, or the task is still at the initial plan stage (regenerating
- * plan.md in place). Later stages are excluded so this command can never
- * regress a task's progress or leave stale downstream artifacts behind.
+ * Stages a task may be in for plan generation to be safe: either at the
+ * task-description stage (first generation) or the plan stage (regeneration).
  */
-const ELIGIBLE_STAGES: readonly TaskStage[] = ["created", "plan"];
+const ELIGIBLE_STAGES: readonly TaskStage[] = ["task-description", "plan"];
 
 /**
  * Generate plan.md for a task folder using the user's Copilot access.
- * Falls back to informing the user when Copilot is unavailable so the
- * manual planning workflow remains the fallback path.
+ * No overwrite confirmation is shown since the user has already triggered
+ * this action deliberately.
  *
  * When `targetFolderUri` is given (e.g. right after creating or resuming a
  * specific task), that task is used directly instead of prompting the user
- * to pick one — otherwise, with multiple eligible tasks, the picker could
- * silently generate the plan into the wrong folder.
+ * to pick one.
  */
 export async function generatePlanWithAI(
   extensionUri: vscode.Uri,
@@ -71,7 +67,7 @@ export async function generatePlanWithAI(
     void vscode.window.showWarningMessage(
       `${providerLabel} is unavailable: ${
         availability.reason ?? "unknown reason"
-      }. Use the manual planning workflow (Start New Task / Resume Task) instead.`
+      }. Use the manual planning workflow instead.`
     );
     return;
   }
@@ -79,8 +75,16 @@ export async function generatePlanWithAI(
   const taskFileUri = vscode.Uri.joinPath(taskFolderUri, TASK_FILENAME);
   let taskContent: string;
   try {
-    const content = await vscode.workspace.fs.readFile(taskFileUri);
-    taskContent = new TextDecoder().decode(content).trim();
+    // Prefer open document buffer for unsaved changes
+    const openDoc = vscode.workspace.textDocuments.find(
+      (doc) => doc.uri.toString() === taskFileUri.toString()
+    );
+    if (openDoc) {
+      taskContent = openDoc.getText().trim();
+    } else {
+      const content = await vscode.workspace.fs.readFile(taskFileUri);
+      taskContent = new TextDecoder().decode(content).trim();
+    }
   } catch {
     taskContent = "";
   }
@@ -91,19 +95,7 @@ export async function generatePlanWithAI(
     return;
   }
 
-  const planFileUriForCheck = vscode.Uri.joinPath(taskFolderUri, "plan.md");
-  const existingPlanContent = await readIfExists(planFileUriForCheck);
-  if (existingPlanContent && existingPlanContent.trim().length > 0) {
-    const confirmation = await vscode.window.showWarningMessage(
-      "plan.md already has content. Generating a new plan will overwrite it.",
-      { modal: true },
-      "Overwrite"
-    );
-    if (confirmation !== "Overwrite") {
-      return;
-    }
-  }
-
+  // No overwrite confirmation — user has deliberately triggered regeneration
   await vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Notification,
@@ -151,6 +143,7 @@ export async function generatePlanWithAI(
       );
 
       if (result.status === "completed") {
+        // Persist stage as "plan" (generation stage, not review stage)
         const existing = await readTaskProgress(taskFolderUri);
         if (existing && ELIGIBLE_STAGES.includes(existing.currentStage)) {
           const updated = updateTaskProgressStage(existing, "plan");
@@ -162,7 +155,7 @@ export async function generatePlanWithAI(
         void vscode.window.showInformationMessage(
           `plan.md generated with ${providerLabel} (${result.summary ?? ""})`
         );
-        await runReviewForFolder(extensionUri, taskFolderUri, workspaceRoot, "plan", true);
+        // Do NOT auto-trigger review here — user advances stage manually
       } else if (result.status === "cancelled") {
         void vscode.window.showInformationMessage(
           "Plan generation cancelled."

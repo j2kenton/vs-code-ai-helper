@@ -1,8 +1,10 @@
 import * as vscode from "vscode";
 import {
   migrateStage,
+  migrateStatus,
   TaskProgress,
   TaskStage,
+  TaskStatus,
   TASK_PROGRESS_FILENAME,
 } from "../types/taskProgress";
 
@@ -32,12 +34,12 @@ export async function readTaskProgress(
     const content = await vscode.workspace.fs.readFile(progressFileUri);
     const json = new TextDecoder().decode(content);
     const progress = JSON.parse(json) as TaskProgress;
-    // Migrate stage names written by pre-0.6.0 versions; the migrated
+    // Migrate stage names written by older versions; the migrated
     // value is persisted the next time the stage changes.
     progress.currentStage = migrateStage(String(progress.currentStage));
+    // Migrate/normalize status field (missing -> "active").
+    progress.status = migrateStatus(progress.status);
     // Sanitize implReviewFiles: it must be an array of strings or absent.
-    // task-progress.json can be edited manually, so the field may be null,
-    // a non-array type, or an array containing non-string entries.
     if (progress.implReviewFiles !== undefined) {
       if (!Array.isArray(progress.implReviewFiles)) {
         progress.implReviewFiles = undefined;
@@ -78,17 +80,18 @@ export async function writeTaskProgress(
 /**
  * Create a new task progress object
  * @param taskFolder - The task folder name
- * @param stage - The initial stage (defaults to "created")
+ * @param stage - The initial stage (defaults to "task-description")
  * @returns A new TaskProgress object
  */
 export function createTaskProgress(
   taskFolder: string,
-  stage: TaskStage = "created"
+  stage: TaskStage = "task-description"
 ): TaskProgress {
   const now = new Date().toISOString();
   return {
     taskFolder,
     currentStage: stage,
+    status: "active",
     createdAt: now,
     updatedAt: now,
   };
@@ -112,6 +115,20 @@ export function updateTaskProgressStage(
 }
 
 /**
+ * Update task status (active/paused)
+ */
+export function updateTaskStatus(
+  progress: TaskProgress,
+  status: TaskStatus
+): TaskProgress {
+  return {
+    ...progress,
+    status,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+/**
  * Record the workspace-relative paths changed by the most recent AI
  * implementation run so implementation reviews can use them as the review
  * scope instead of relying on open editors.
@@ -128,11 +145,7 @@ export function updateImplReviewFiles(
 }
 
 /**
- * Clear any previously tracked changed-file set, e.g. when the most recent
- * run couldn't determine which files changed (git unavailable). Explicitly
- * removing the field — rather than leaving a stale list from an earlier
- * run in place — ensures the next review falls back to open editors
- * instead of silently reviewing outdated scope.
+ * Clear any previously tracked changed-file set.
  */
 export function clearImplReviewFiles(progress: TaskProgress): TaskProgress {
   const { implReviewFiles: _unused, ...rest } = progress;

@@ -36,22 +36,28 @@
       },
       {
         "command": "vs-code-ai-helper.resumeTask",
-        "title": "AI Helper: Resume Task",
-        "icon": "$(play)"
+        "title": "AI Helper: Resume Paused Task",
+        "icon": "$(debug-continue)"
       },
       {
-        "command": "vs-code-ai-helper.generatePlanWithAI",
-        "title": "AI Helper: Generate Plan with AI"
+        "command": "vs-code-ai-helper.pauseTask",
+        "title": "AI Helper: Pause Task",
+        "icon": "$(debug-pause)"
       },
       {
-        "command": "vs-code-ai-helper.runReviewWithAI",
-        "title": "AI Helper: Run Review with AI",
+        "command": "vs-code-ai-helper.draftTaskWithAI",
+        "title": "AI Helper: Draft with AI",
         "icon": "$(sparkle)"
       },
       {
-        "command": "vs-code-ai-helper.viewReview",
-        "title": "AI Helper: View Review",
-        "icon": "$(eye)"
+        "command": "vs-code-ai-helper.generatePlanWithAI",
+        "title": "AI Helper: Generate Plan with AI",
+        "icon": "$(sparkle)"
+      },
+      {
+        "command": "vs-code-ai-helper.runReviewWithAI",
+        "title": "AI Helper: Re-review with AI",
+        "icon": "$(refresh)"
       },
       {
         "command": "vs-code-ai-helper.applyReviewWithAI",
@@ -60,12 +66,12 @@
       },
       {
         "command": "vs-code-ai-helper.nextStage",
-        "title": "AI Helper: Next Stage",
+        "title": "AI Helper: Move on to Next Stage",
         "icon": "$(arrow-right)"
       },
       {
         "command": "vs-code-ai-helper.generateImplementationWithAI",
-        "title": "AI Helper: Generate Implementation Checklist with AI",
+        "title": "AI Helper: Generate Implementation with AI",
         "icon": "$(tasklist)"
       },
       {
@@ -85,8 +91,8 @@
       },
       {
         "command": "vs-code-ai-helper.setTaskStage",
-        "title": "AI Helper: Set Task Stage",
-        "icon": "$(milestone)"
+        "title": "AI Helper: Set Stage as Current",
+        "icon": "$(arrow-right)"
       },
       {
         "command": "vs-code-ai-helper.refreshTasksView",
@@ -94,24 +100,30 @@
         "icon": "$(refresh)"
       },
       {
-        "command": "vs-code-ai-helper.expandAllTasks",
-        "title": "AI Helper: Expand All Steps",
-        "icon": "$(expand-all)"
+        "command": "vs-code-ai-helper.applyCurrentStageAction",
+        "title": "AI Helper: Apply Current Stage Action"
       },
       {
-        "command": "vs-code-ai-helper.collapseAllTasks",
-        "title": "AI Helper: Collapse All Steps",
-        "icon": "$(collapse-all)"
+        "command": "vs-code-ai-helper.applyHighLevelReviewChanges",
+        "title": "AI Helper: Apply High-Level Review Changes",
+        "icon": "$(wand)"
       },
       {
-        "command": "vs-code-ai-helper.viewTask",
-        "title": "AI Helper: View Task",
-        "icon": "$(file)"
+        "command": "vs-code-ai-helper.applyLowLevelReviewChanges",
+        "title": "AI Helper: Apply Low-Level Review Changes",
+        "icon": "$(wand)"
       },
       {
-        "command": "vs-code-ai-helper.viewPlan",
-        "title": "AI Helper: View Plan",
-        "icon": "$(file-text)"
+        "command": "vs-code-ai-helper.commitAndPushTask",
+        "title": "AI Helper: Commit and Push Task",
+        "icon": "$(cloud-upload)"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "vs-code-ai-helper.applyCurrentStageAction",
+        "key": "ctrl+shift+alt+i",
+        "mac": "cmd+shift+alt+i"
       }
     ],
     "viewsContainers": {
@@ -158,91 +170,101 @@
           "group": "navigation@2"
         },
         {
-          "command": "vs-code-ai-helper.collapseAllTasks",
-          "when": "view == vs-code-ai-helper.tasksView && vs-code-ai-helper.hasTasks && !vs-code-ai-helper.tasksViewAllCollapsed",
-          "group": "navigation@3"
-        },
-        {
-          "command": "vs-code-ai-helper.expandAllTasks",
-          "when": "view == vs-code-ai-helper.tasksView && vs-code-ai-helper.hasTasks && vs-code-ai-helper.tasksViewAllCollapsed",
-          "group": "navigation@3"
-        },
-        {
           "command": "vs-code-ai-helper.configureStepModels",
           "when": "view == vs-code-ai-helper.tasksView",
-          "group": "navigation@4"
+          "group": "navigation@3"
         }
       ],
       "view/item/context": [
         {
           "command": "vs-code-ai-helper.resumeTask",
-          "when": "view == vs-code-ai-helper.tasksView && (viewItem == task-active || viewItem == task-created)",
+          "when": "view == vs-code-ai-helper.tasksView && viewItem == task-paused",
+          "group": "inline@1"
+        },
+        {
+          "command": "vs-code-ai-helper.pauseTask",
+          "when": "view == vs-code-ai-helper.tasksView && (viewItem == task-active || viewItem == task-active-review)",
           "group": "inline@1"
         },
         {
           "command": "vs-code-ai-helper.setTaskStage",
-          "when": "view == vs-code-ai-helper.tasksView && (viewItem == task-active || viewItem == task-created || viewItem == task-completed)",
+          "when": "view == vs-code-ai-helper.tasksView && (viewItem == task-active || viewItem == task-paused || viewItem == task-completed)",
           "group": "inline@2"
+        },
+        {
+          "command": "vs-code-ai-helper.commitAndPushTask",
+          "when": "view == vs-code-ai-helper.tasksView && viewItem == task-completed",
+          "group": "inline@1"
         },
         {
           "command": "vs-code-ai-helper.configureStepModels",
-          "when": "view == vs-code-ai-helper.tasksView && (viewItem == task-active || viewItem == task-created || viewItem == task-completed || viewItem == task-active-review)",
+          "when": "view == vs-code-ai-helper.tasksView && (viewItem == task-active || viewItem == task-paused || viewItem == task-completed || viewItem == task-active-review)",
           "group": "task@3"
         },
         {
-          "command": "vs-code-ai-helper.generatePlanWithAI",
-          "when": "view == vs-code-ai-helper.tasksView && viewItem == stage-created",
+          "command": "vs-code-ai-helper.draftTaskWithAI",
+          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage-task-description/",
           "group": "inline@1"
         },
         {
-          "command": "vs-code-ai-helper.viewTask",
-          "when": "view == vs-code-ai-helper.tasksView && viewItem == stage-created",
+          "command": "vs-code-ai-helper.setTaskStage",
+          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage-task-description/",
           "group": "inline@2"
         },
         {
-          "command": "vs-code-ai-helper.viewPlan",
-          "when": "view == vs-code-ai-helper.tasksView && viewItem == stage-reviewable-current",
+          "command": "vs-code-ai-helper.generatePlanWithAI",
+          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage-plan-current/",
           "group": "inline@1"
         },
         {
-          "command": "vs-code-ai-helper.runReviewWithAI",
-          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage-reviewable-current/",
-          "group": "inline@3"
+          "command": "vs-code-ai-helper.setTaskStage",
+          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage-plan-current/",
+          "group": "inline@2"
+        },
+        {
+          "command": "vs-code-ai-helper.nextStage",
+          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage-plan-current/",
+          "group": "inline@9"
         },
         {
           "command": "vs-code-ai-helper.runImplementationWithAI",
-          "when": "view == vs-code-ai-helper.tasksView && (viewItem == stage-plan-final-current || viewItem =~ /^stage-impl-current/)",
+          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage-impl-current/",
           "group": "inline@1"
         },
         {
-          "command": "vs-code-ai-helper.runReviewWithAI",
+          "command": "vs-code-ai-helper.generateImplementationWithAI",
           "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage-impl-current/",
           "group": "inline@2"
         },
         {
-          "command": "vs-code-ai-helper.viewReview",
-          "when": "view == vs-code-ai-helper.tasksView && (viewItem == task-active-review || viewItem =~ /^stage-review-current/)",
-          "group": "inline@1"
+          "command": "vs-code-ai-helper.setTaskStage",
+          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage-impl-current/",
+          "group": "inline@3"
+        },
+        {
+          "command": "vs-code-ai-helper.nextStage",
+          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage-impl-current/",
+          "group": "inline@9"
         },
         {
           "command": "vs-code-ai-helper.runReviewWithAI",
           "when": "view == vs-code-ai-helper.tasksView && (viewItem == task-active-review || viewItem =~ /^stage-review-current/)",
-          "group": "inline@2.5"
+          "group": "inline@1"
         },
         {
           "command": "vs-code-ai-helper.applyReviewWithAI",
           "when": "view == vs-code-ai-helper.tasksView && (viewItem == task-active-review || viewItem =~ /^stage-review-current/)",
+          "group": "inline@2"
+        },
+        {
+          "command": "vs-code-ai-helper.setTaskStage",
+          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage-review-current/",
           "group": "inline@3"
         },
         {
           "command": "vs-code-ai-helper.nextStage",
           "when": "view == vs-code-ai-helper.tasksView && (viewItem == task-active-review || viewItem =~ /^stage-review-current/)",
-          "group": "inline@4"
-        },
-        {
-          "command": "vs-code-ai-helper.runReviewWithAI",
-          "when": "view == vs-code-ai-helper.tasksView && (viewItem == task-active-review || viewItem =~ /^stage-review-current/)",
-          "group": "review@1"
+          "group": "inline@9"
         },
         {
           "command": "vs-code-ai-helper.resumeTask",
@@ -262,7 +284,7 @@
         {
           "command": "vs-code-ai-helper.setStageModel",
           "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /-modelable$/",
-          "group": "inline@9"
+          "group": "inline@8"
         }
       ]
     },
@@ -271,9 +293,9 @@
       "properties": {
         "vs-code-ai-helper.metaResourcesPath": {
           "type": "string",
-          "default": "",
+          "default": ".helper/plans",
           "scope": "resource",
-          "description": "Workspace folder path for storing meta-level resources (logs, documentation, work tracking)"
+          "description": "Workspace folder path for storing task plans and workflow state. Defaults to .helper/plans."
         },
         "vs-code-ai-helper.promptDismissed": {
           "type": "boolean",

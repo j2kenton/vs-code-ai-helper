@@ -38,6 +38,10 @@ import {
   runImplementationForModel,
 } from "../runners/runnerRegistry";
 import { resolveModelForStage } from "../utils/modelSelection";
+import {
+  getCanonicalImplementationUri,
+  materializeCanonicalIfNeeded,
+} from "../utils/implementationArtifactResolver";
 
 /**
  * The optional argument tree-view buttons pass to these commands: the tree
@@ -63,20 +67,6 @@ async function resolveTask(
   eligibleStages: readonly TaskStage[],
   title: string
 ): Promise<ResolvedTask | undefined> {
-  if (!hasValidMetaResourcesPath()) {
-    void vscode.window.showErrorMessage(
-      "No meta resources folder configured. Please set one first."
-    );
-    return undefined;
-  }
-  const workspaceRoot = vscode.workspace.workspaceFolders?.[0];
-  if (!workspaceRoot) {
-    void vscode.window.showErrorMessage(
-      "No workspace folder open. Please open a folder first."
-    );
-    return undefined;
-  }
-
   if (node?.task) {
     const folderUri = node.task.folderUri;
     const progress = await readTaskProgress(folderUri);
@@ -97,17 +87,44 @@ async function resolveTask(
     return { folderUri, progress };
   }
 
-  const metaFolderUri = vscode.Uri.joinPath(
-    workspaceRoot.uri,
-    getMetaResourcesPath()
-  );
+  // Fall back to discovering tasks from the configured meta folder
+  const workspaceRoot = vscode.workspace.workspaceFolders?.[0];
+  if (!workspaceRoot) {
+    void vscode.window.showErrorMessage(
+      "No workspace folder open. Please open a folder first."
+    );
+    return undefined;
+  }
+
+  // Attempt to discover tasks using the configured path, or .helper/plans default
+  let metaFolderUri: vscode.Uri;
+  if (hasValidMetaResourcesPath()) {
+    metaFolderUri = vscode.Uri.joinPath(workspaceRoot.uri, getMetaResourcesPath());
+  } else {
+    metaFolderUri = vscode.Uri.joinPath(workspaceRoot.uri, ".helper/plans");
+  }
+
   const allTasks = await findAllTasks(metaFolderUri);
-  const eligible = allTasks.filter((task) =>
+
+  // Also check legacy plans/ folder if different
+  let legacyTasks: IncompleteTask[] = [];
+  try {
+    const legacyUri = vscode.Uri.joinPath(workspaceRoot.uri, "plans");
+    if (legacyUri.fsPath !== metaFolderUri.fsPath) {
+      legacyTasks = await findAllTasks(legacyUri);
+    }
+  } catch {
+    // Ignore errors reading legacy folder
+  }
+
+  const combinedTasks = [...allTasks, ...legacyTasks];
+
+  const eligible = combinedTasks.filter((task) =>
     eligibleStages.includes(task.progress.currentStage)
   );
   if (eligible.length === 0) {
     void vscode.window.showInformationMessage(
-      allTasks.length === 0
+      combinedTasks.length === 0
         ? "No task folders found. Use 'Start New Task' to create one."
         : "No tasks are at a stage eligible for this action."
     );
@@ -145,26 +162,6 @@ function artifactUri(
 ): vscode.Uri | undefined {
   const name = STAGE_ARTIFACT_FILENAMES[stage];
   return name ? vscode.Uri.joinPath(taskFolderUri, name) : undefined;
-}
-
-/**
- * Confirm overwriting an artifact that already has content. Returns true
- * when it is safe to proceed (no content, or the user confirmed).
- */
-async function confirmOverwrite(
-  fileUri: vscode.Uri,
-  fileLabel: string
-): Promise<boolean> {
-  const existing = await readNonEmptyText(fileUri);
-  if (!existing) {
-    return true;
-  }
-  const confirmation = await vscode.window.showWarningMessage(
-    `${fileLabel} already has content. This will overwrite it.`,
-    { modal: true },
-    "Overwrite"
-  );
-  return confirmation === "Overwrite";
 }
 
 /**
@@ -298,18 +295,19 @@ const REVIEW_PROMPTS: Partial<Record<TaskStage, string>> = {
 /**
  * Core review logic for a known task folder: build variables, run the AI
  * review for the given stage, and advance the task to the review stage.
- * Called by runReviewWithAI (user-invoked) and automatically after plan
- * generation, an implementation run, or applying a review completes.
+ * Called by runReviewWithAI (user-invoked) and by nextStage for auto-triggered reviews.
  *
- * @param skipOverwriteConfirmation When true, skip the "already has content"
- *   prompt — used for auto-triggered reviews immediately after a stage runs.
+ * Review commands are stage-neutral: they do NOT change currentStage.
+ * Stage advancement is handled by nextStage/setTaskStage exclusively.
+ *
+ * No overwrite confirmation is shown (user has already triggered this deliberately).
  */
 export async function runReviewForFolder(
   extensionUri: vscode.Uri,
   folderUri: vscode.Uri,
   workspaceRoot: vscode.WorkspaceFolder,
   currentStage: TaskStage,
-  skipOverwriteConfirmation: boolean
+  _skipOverwriteConfirmation: boolean  // kept for API compat, always skipped now
 ): Promise<void> {
   const targetStage = REVIEW_TARGETS[currentStage];
   const templateFile = targetStage && REVIEW_PROMPTS[targetStage];
@@ -332,25 +330,19 @@ export async function runReviewForFolder(
     }
     variables.plan = planContent;
   } else {
-    // Implementation reviews must be measured against the APPROVED plan,
-    // never the still-mutable draft — falling back to the in-progress plan
-    // would let implementation proceed without the human approval gate
-    // that promoting to plan-final.md represents.
-    const planFinalContent = await readNonEmptyText(
-      vscode.Uri.joinPath(folderUri, "plan-final.md")
-    );
+    // Implementation reviews use the canonical plan-final.md artifact
+    const canonicalImpl = getCanonicalImplementationUri(folderUri);
+    const planFinalContent = await readNonEmptyText(canonicalImpl);
     if (!planFinalContent) {
       void vscode.window.showWarningMessage(
-        "No plan-final.md found. Finalize a plan (Next Stage from the low-level plan review) before reviewing implementation."
+        "No plan-final.md found. Finalize a plan before reviewing implementation."
       );
       return;
     }
-    const implementationContent = await readNonEmptyText(
-      vscode.Uri.joinPath(folderUri, "implementation.md")
-    );
+    const implementationContent = await readNonEmptyText(canonicalImpl);
     if (!implementationContent) {
       void vscode.window.showWarningMessage(
-        "No implementation.md found. Generate the implementation checklist first."
+        "No implementation artifact found. Generate the implementation first."
       );
       return;
     }
@@ -358,15 +350,6 @@ export async function runReviewForFolder(
     variables.implementation = implementationContent;
   }
 
-  if (!skipOverwriteConfirmation) {
-    if (!(await confirmOverwrite(reviewUri, STAGE_ARTIFACT_FILENAMES[targetStage] ?? "review"))) {
-      return;
-    }
-  }
-
-  // Implementation reviews scope to the task's tracked changed files so the
-  // AI assesses what was actually written, not whatever tabs happen to be
-  // open. Plan reviews only need the lightweight pack (no file contents).
   let contextPackContent: string;
   if (isPlanReview) {
     const contextPackUri = await writeContextPack(folderUri, workspaceRoot.uri, false);
@@ -393,7 +376,9 @@ export async function runReviewForFolder(
   }
   variables.contextPack = contextPackContent;
 
-  const succeeded = await runAiToFile({
+  // Review commands do NOT change currentStage — stage changes are
+  // handled by nextStage/setTaskStage exclusively.
+  await runAiToFile({
     extensionUri,
     taskFolderUri: folderUri,
     workspaceUri: workspaceRoot.uri,
@@ -401,19 +386,15 @@ export async function runReviewForFolder(
     templateFile,
     variables,
     outputFileUri: reviewUri,
-    progressAction: `Running ${STAGE_DISPLAY_NAMES[targetStage]}`,
+    progressAction: `Re-reviewing ${STAGE_DISPLAY_NAMES[targetStage]}`,
     outputLabel: STAGE_ARTIFACT_FILENAMES[targetStage] ?? "review",
   });
-
-  if (succeeded) {
-    await setStage(folderUri, targetStage);
-  }
+  // Note: we do NOT call setStage here.
 }
 
 /**
  * Run (or re-run) the review for the task's current position in the
- * workflow: from "plan"/"implementation" this starts the high-level review
- * and advances the stage; from a review stage it regenerates that review.
+ * workflow. Labeled "Re-review" in the UI.
  */
 export async function runReviewWithAI(
   extensionUri: vscode.Uri,
@@ -422,7 +403,7 @@ export async function runReviewWithAI(
   const resolved = await resolveTask(
     node,
     Object.keys(REVIEW_TARGETS) as TaskStage[],
-    "Run Review with AI"
+    "Re-review with AI"
   );
   if (!resolved) {
     return;
@@ -436,16 +417,15 @@ export async function runReviewWithAI(
     resolved.folderUri,
     workspaceRoot,
     resolved.progress.currentStage,
-    false
+    true
   );
 }
 
 /**
  * Apply the current review: for plan review stages the AI rewrites the plan
  * in place; for implementation review stages it re-runs the AI
- * implementation against the codebase to address the review's findings
- * (see applyImplementationReviewWithAI). The stage does not change —
- * re-run the review or move to the next stage explicitly.
+ * implementation against the codebase to address the review's findings.
+ * The stage does not change — re-run the review or move to the next stage explicitly.
  */
 export async function applyReviewWithAI(
   extensionUri: vscode.Uri,
@@ -473,10 +453,6 @@ export async function applyReviewWithAI(
   const isPlanReview = isPlanReviewStage(stage);
 
   if (!isPlanReview) {
-    // Implementation reviews assess actual code, not implementation.md — so
-    // "applying" the review means re-invoking the AI implementation runner
-    // to fix the code the review found issues with, not rewriting a
-    // checklist document that the review never assessed in the first place.
     await applyImplementationReviewWithAI(
       extensionUri,
       resolved.folderUri,
@@ -507,21 +483,12 @@ export async function applyReviewWithAI(
   variables.contextPack = new TextDecoder().decode(
     await vscode.workspace.fs.readFile(contextPackUri)
   );
-  // Always write to the canonical plan.md — this is how legacy
-  // plan-updated.md tasks converge onto the single-plan model.
+  // Always write to the canonical plan.md
   const outputFileUri = vscode.Uri.joinPath(resolved.folderUri, PLAN_FILENAME);
   const templateFile = "apply-review.md";
   const outputLabel = PLAN_FILENAME;
 
-  const confirmation = await vscode.window.showWarningMessage(
-    `This will rewrite ${outputLabel} in place, addressing the review.`,
-    { modal: true },
-    "Apply"
-  );
-  if (confirmation !== "Apply") {
-    return;
-  }
-
+  // No overwrite confirmation — user triggered this deliberately
   const applySucceeded = await runAiToFile({
     extensionUri,
     taskFolderUri: resolved.folderUri,
@@ -535,16 +502,14 @@ export async function applyReviewWithAI(
   });
 
   if (applySucceeded) {
+    // Re-review after applying (no confirmation, no stage change)
     await runReviewForFolder(extensionUri, resolved.folderUri, workspaceRoot, stage, true);
   }
 }
 
 /**
  * Apply an implementation review by re-running the AI implementation
- * runner against the review's findings, making real code changes rather
- * than editing implementation.md directly. Reuses executeImplementationRun
- * so the result is written and re-reviewed exactly like a normal
- * implementation run.
+ * runner against the review's findings.
  */
 async function applyImplementationReviewWithAI(
   extensionUri: vscode.Uri,
@@ -553,9 +518,8 @@ async function applyImplementationReviewWithAI(
   stage: TaskStage,
   reviewContent: string
 ): Promise<void> {
-  const planFinalContent = await readNonEmptyText(
-    vscode.Uri.joinPath(folderUri, "plan-final.md")
-  );
+  const canonicalUri = getCanonicalImplementationUri(folderUri);
+  const planFinalContent = await readNonEmptyText(canonicalUri);
   if (!planFinalContent) {
     void vscode.window.showWarningMessage(
       "No plan-final.md found. Nothing to apply the review to."
@@ -563,9 +527,7 @@ async function applyImplementationReviewWithAI(
     return;
   }
 
-  // Use the implementation stage's model, not the review stage's — this is
-  // a tool-calling code-edit run like any other implementation run, and
-  // users may have configured a lighter model for review-only stages.
+  // Use the implementation stage's model, not the review stage's
   const model = await resolveModelForStage(folderUri, "implementation");
 
   const { availability, providerLabel } =
@@ -574,15 +536,6 @@ async function applyImplementationReviewWithAI(
     void vscode.window.showWarningMessage(
       `${providerLabel} is unavailable: ${availability.reason ?? "unknown reason"}. Address the review manually instead.`
     );
-    return;
-  }
-
-  const confirmation = await vscode.window.showWarningMessage(
-    "This will re-run the AI implementation against the codebase to address the review.",
-    { modal: true },
-    "Apply"
-  );
-  if (confirmation !== "Apply") {
     return;
   }
 
@@ -610,8 +563,7 @@ async function applyImplementationReviewWithAI(
 }
 
 /**
- * Open the review artifact for the task's current review stage. Offers to
- * run the review if it doesn't exist yet.
+ * Open the review artifact for the task's current review stage.
  */
 export async function viewReview(node?: TaskNodeArg): Promise<void> {
   const resolved = await resolveTask(node, REVIEW_STAGES, "View Review");
@@ -627,10 +579,10 @@ export async function viewReview(node?: TaskNodeArg): Promise<void> {
   if (!content) {
     const choice = await vscode.window.showInformationMessage(
       `No ${STAGE_ARTIFACT_FILENAMES[stage]} yet for this task.`,
-      "Run Review with AI",
+      "Re-review with AI",
       "Create Manually"
     );
-    if (choice === "Run Review with AI") {
+    if (choice === "Re-review with AI") {
       await vscode.commands.executeCommand(
         "vs-code-ai-helper.runReviewWithAI",
         node
@@ -646,11 +598,6 @@ export async function viewReview(node?: TaskNodeArg): Promise<void> {
 
 /**
  * Whether the artifact for a task's current stage exists and has content.
- * Required before advancing past that stage, so "Next Stage" can't skip a
- * step that hasn't actually been done yet (e.g. created -> plan with no
- * task.md written, or implementation -> review with no implementation.md).
- * Review stages are excluded here since applying/regenerating them is
- * optional by design.
  */
 async function currentStageArtifactExists(
   folderUri: vscode.Uri,
@@ -663,6 +610,15 @@ async function currentStageArtifactExists(
   if (!name) {
     return true;
   }
+  // For implementation stage use the artifact resolver
+  if (stage === "implementation") {
+    const { resolveImplementationArtifact } = await import(
+      "../utils/implementationArtifactResolver"
+    );
+    const resolved = await resolveImplementationArtifact(folderUri);
+    const stat = await statIfExists(resolved.uri);
+    return stat !== undefined;
+  }
   const content = await readNonEmptyText(
     vscode.Uri.joinPath(folderUri, name)
   );
@@ -670,11 +626,19 @@ async function currentStageArtifactExists(
 }
 
 /**
- * Advance a task to the next stage in the workflow. Entering "plan-final"
- * offers to promote the current plan into plan-final.md (the human approval
- * gate); entering "completed" asks for explicit confirmation.
+ * Advance a task to the next stage in the workflow.
+ * Auto-triggers review when advancing into a review stage from its
+ * immediately preceding non-review stage (plan -> plan-high-review, or
+ * plan-low-review being re-entered).
+ * No confirmation dialogs.
+ *
+ * When auto-triggering review, this command delegates to the registered
+ * runReviewWithAI command (which has access to extensionUri via closure).
  */
-export async function nextStage(node?: TaskNodeArg): Promise<void> {
+export async function nextStage(
+  extensionUri: vscode.Uri,
+  node?: TaskNodeArg
+): Promise<void> {
   const advanceable = STAGE_ORDER.filter((stage) => stage !== "completed");
   const resolved = await resolveTask(node, advanceable, "Next Stage");
   if (!resolved) {
@@ -687,22 +651,8 @@ export async function nextStage(node?: TaskNodeArg): Promise<void> {
     return;
   }
 
-  // Command-palette usage can bypass the tree's curated created-stage
-  // actions; don't allow created -> plan unless a plan artifact already
-  // exists (generated or manually created).
-  if (resolved.progress.currentStage === "created" && next === "plan") {
-    const planUri = await resolveCurrentPlanUri(resolved.folderUri);
-    const hasPlanArtifact = (await statIfExists(planUri)) !== undefined;
-    if (!hasPlanArtifact) {
-      void vscode.window.showWarningMessage(
-        "Cannot advance to Plan yet. Generate a plan with AI or create plan.md manually first."
-      );
-      return;
-    }
-  }
-
+  // Check artifact existence for non-review stages
   if (
-    next !== "plan-final" &&
     !(await currentStageArtifactExists(
       resolved.folderUri,
       resolved.progress.currentStage
@@ -717,13 +667,15 @@ export async function nextStage(node?: TaskNodeArg): Promise<void> {
     return;
   }
 
-  if (next === "plan-final") {
-    const planFinalUri = vscode.Uri.joinPath(
-      resolved.folderUri,
-      "plan-final.md"
+  // Special handling for advancing into "implementation" stage:
+  // copy the current plan to plan-final.md if not already there
+  if (next === "implementation") {
+    const { resolveImplementationArtifact } = await import(
+      "../utils/implementationArtifactResolver"
     );
-    const existingFinal = await readNonEmptyText(planFinalUri);
-    if (!existingFinal) {
+    const resolved2 = await resolveImplementationArtifact(resolved.folderUri);
+    if (!resolved2.isCanonical) {
+      // Plan-final.md doesn't exist yet — copy current plan
       const currentPlanUri = await resolveCurrentPlanUri(resolved.folderUri);
       const planContent = await readNonEmptyText(currentPlanUri);
       if (!planContent) {
@@ -732,48 +684,53 @@ export async function nextStage(node?: TaskNodeArg): Promise<void> {
         );
         return;
       }
-      const confirmation = await vscode.window.showInformationMessage(
-        "Promote the current plan to plan-final.md and advance? Finalizing is a deliberate, human approval step.",
-        { modal: true },
-        "Promote & Advance"
-      );
-      if (confirmation !== "Promote & Advance") {
-        return;
-      }
+      const canonicalUri = vscode.Uri.joinPath(resolved.folderUri, "plan-final.md");
       await vscode.workspace.fs.writeFile(
-        planFinalUri,
+        canonicalUri,
         new TextEncoder().encode(planContent)
       );
     }
-  } else if (next === "completed") {
-    const confirmation = await vscode.window.showInformationMessage(
-      `Mark ${resolved.progress.taskFolder} as completed?`,
-      { modal: true },
-      "Complete Task"
-    );
-    if (confirmation !== "Complete Task") {
-      return;
-    }
-  } else {
-    const confirmation = await vscode.window.showInformationMessage(
-      `Advance ${resolved.progress.taskFolder} to "${STAGE_DISPLAY_NAMES[next]}"?`,
-      { modal: true },
-      "Advance"
-    );
-    if (confirmation !== "Advance") {
-      return;
-    }
   }
 
+  // Persist stage advance FIRST so auto-review reads the correct current stage
   await setStage(resolved.folderUri, next);
   void vscode.window.showInformationMessage(
     `${resolved.progress.taskFolder} advanced to: ${STAGE_DISPLAY_NAMES[next]}`
   );
+
+  // Auto-trigger review only when advancing INTO a review stage from the
+  // correct immediately-preceding source stage. Pass triggerAutoReview: false
+  // implicitly by calling the review directly with a specific node arg so it
+  // does not loop back here.
+  const workspaceRoot = getWorkspaceRoot();
+  if (!workspaceRoot) return;
+
+  // Only auto-trigger plan-high-review when coming from "plan" stage, and
+  // only auto-trigger plan-low-review when re-entering it.
+  const shouldAutoReview =
+    resolved.progress.status !== "paused" &&
+    isReviewStage(next) &&
+    REVIEW_TARGETS[resolved.progress.currentStage] === next;
+
+  if (shouldAutoReview) {
+    // Re-read progress to get the newly persisted stage
+    const freshProgress = await readTaskProgress(resolved.folderUri);
+    if (freshProgress) {
+      // Delegate through the command so extensionUri is correctly resolved
+      await runReviewWithAI(extensionUri, {
+        task: {
+          folderUri: resolved.folderUri,
+          folderName: freshProgress.taskFolder,
+          progress: freshProgress,
+        },
+      });
+    }
+  }
 }
 
 /**
- * Generate implementation.md — a concrete checklist derived from the final
- * plan — using the user's Copilot access.
+ * Generate plan-final.md (Implementation stage) from a task.
+ * This is the "Generate implementation" action for the merged Implementation stage.
  */
 export async function generateImplementationWithAI(
   extensionUri: vscode.Uri,
@@ -781,8 +738,8 @@ export async function generateImplementationWithAI(
 ): Promise<void> {
   const resolved = await resolveTask(
     node,
-    ["plan-final", "implementation"],
-    "Generate Implementation Checklist with AI"
+    ["plan-low-review", "implementation"],
+    "Generate Implementation with AI"
   );
   if (!resolved) {
     return;
@@ -792,26 +749,12 @@ export async function generateImplementationWithAI(
     return;
   }
 
-  // Require the APPROVED plan, not the draft — generating the
-  // implementation checklist from an unfinalized plan would let
-  // implementation start without the human approval gate that promoting to
-  // plan-final.md represents (e.g. if a task's stage was moved forward
-  // manually via Set Task Stage without ever finalizing).
-  const planFinalContent = await readNonEmptyText(
-    vscode.Uri.joinPath(resolved.folderUri, "plan-final.md")
-  );
+  const planFinalUri = getCanonicalImplementationUri(resolved.folderUri);
+  const planFinalContent = await readNonEmptyText(planFinalUri);
   if (!planFinalContent) {
     void vscode.window.showWarningMessage(
-      "No plan-final.md found. Finalize a plan (Next Stage from the low-level plan review) before generating the implementation checklist."
+      "No plan-final.md found. Advance to the Implementation stage first."
     );
-    return;
-  }
-
-  const implementationUri = vscode.Uri.joinPath(
-    resolved.folderUri,
-    "implementation.md"
-  );
-  if (!(await confirmOverwrite(implementationUri, "implementation.md"))) {
     return;
   }
 
@@ -820,6 +763,8 @@ export async function generateImplementationWithAI(
     workspaceRoot.uri
   );
 
+  const implementationUri = planFinalUri;
+  // No overwrite confirmation
   const succeeded = await runAiToFile({
     extensionUri,
     taskFolderUri: resolved.folderUri,
@@ -828,8 +773,8 @@ export async function generateImplementationWithAI(
     templateFile: "create-implementation.md",
     variables: { contextPack: contextPackContent, plan: planFinalContent },
     outputFileUri: implementationUri,
-    progressAction: "Generating implementation checklist",
-    outputLabel: "implementation.md",
+    progressAction: "Generating implementation",
+    outputLabel: "plan-final.md",
   });
 
   if (succeeded) {
@@ -838,24 +783,16 @@ export async function generateImplementationWithAI(
 }
 
 /**
- * Stages from which the AI implementation runner can be invoked: the first
- * run (plan-final), a manual re-run (implementation), or addressing an
- * implementation review's findings directly in code (impl-*-review).
+ * Stages from which the AI implementation runner can be invoked.
  */
 const IMPLEMENTATION_ELIGIBLE_STAGES: readonly TaskStage[] = [
-  "plan-final",
   "implementation",
   "impl-high-review",
   "impl-low-review",
 ];
 
 /**
- * Shared core of an implementation run: invoke Copilot's tool-calling loop
- * with the given prompt, write the run log, and on success write
- * implementation.md, persist the changed-file list, and auto-review.
- * Used both for the initial/manual run and for applying an implementation
- * review by re-running the AI against the code (not just editing the
- * checklist document).
+ * Shared core of an implementation run.
  */
 async function executeImplementationRun(
   extensionUri: vscode.Uri,
@@ -864,14 +801,9 @@ async function executeImplementationRun(
   prompt: string,
   modelId: string | undefined,
   progressTitle: string,
-  // The stage to re-review at afterwards: "implementation" for the normal
-  // (first/re-)run, which starts back at the high-level review, or the
-  // impl-*-review stage a review-driven fix originated from, so applying a
-  // low-level review's findings re-checks at the low level rather than
-  // resetting to high-level.
   postRunReviewStage: TaskStage = "implementation"
 ): Promise<void> {
-  const implementationUri = vscode.Uri.joinPath(folderUri, "implementation.md");
+  const implementationUri = getCanonicalImplementationUri(folderUri);
 
   let result: Awaited<ReturnType<typeof runImplementationForModel>> | undefined;
 
@@ -905,7 +837,6 @@ async function executeImplementationRun(
   await writeRunLog(folderUri, result.runnerId, "implementation", logContent);
 
   if (result.status === "completed") {
-    // Write the AI-generated summary as implementation.md
     const summary =
       result.summary?.trim() ||
       `## Implementation Complete\n\nFiles changed:\n${
@@ -913,18 +844,6 @@ async function executeImplementationRun(
       }`;
     await writeTextFile(implementationUri, summary);
 
-    // Persist the changed-file list for review scoping. The stage itself is
-    // only force-advanced to "implementation" when the task isn't already
-    // at "implementation" or an impl review stage — i.e. for the first run
-    // out of "plan-final", where code has now genuinely been written and
-    // the task must not be left at a stage ("plan-final") that has no
-    // reviewable action if the follow-up auto-review below then fails.
-    // When re-running from "implementation" or an impl review stage, that
-    // stage is already a valid, recoverable resting point, so it's left
-    // alone here and the follow-up auto-review owns any further transition
-    // — on cancel/failure the task simply stays at its current review
-    // stage instead of silently dropping to the generic "implementation"
-    // stage with no record of where it was.
     const currentProgress = await readTaskProgress(folderUri);
     if (currentProgress) {
       const alreadyAtOrPastImplementation =
@@ -933,11 +852,6 @@ async function executeImplementationRun(
       const updatedProgress = alreadyAtOrPastImplementation
         ? currentProgress
         : updateTaskProgressStage(currentProgress, "implementation");
-      // When the changed-file set couldn't be determined (e.g. a CLI
-      // provider ran outside a git repository), clear implReviewFiles so
-      // the review falls back to open editors with a warning. Leaving a
-      // stale list from an earlier (trackable) run in place would let a
-      // later review silently use outdated scope instead of falling back.
       await writeTaskProgress(
         folderUri,
         result.filesChangedUnknown
@@ -951,6 +865,7 @@ async function executeImplementationRun(
     void vscode.window.showInformationMessage(
       `Implementation complete. ${result.filesChanged.length} file(s) written.`
     );
+    // Auto-review after implementation run — pass extensionUri correctly
     await runReviewForFolder(extensionUri, folderUri, workspaceRoot, postRunReviewStage, true);
   } else if (result.status === "cancelled") {
     void vscode.window.showInformationMessage("Implementation cancelled.");
@@ -962,12 +877,8 @@ async function executeImplementationRun(
 }
 
 /**
- * Run the implementation: use Copilot with tool-calling to make actual
- * code changes in the workspace, then write implementation.md with the
- * AI-generated summary of what was done.
- *
- * Eligible stages: plan-final (first run), implementation (re-run), or
- * an implementation review stage (addressing findings directly in code).
+ * Run the implementation: use AI with tool-calling to make actual code changes.
+ * No overwrite confirmation shown.
  */
 export async function runImplementationWithAI(
   extensionUri: vscode.Uri,
@@ -986,12 +897,21 @@ export async function runImplementationWithAI(
     return;
   }
 
-  const planFinalContent = await readNonEmptyText(
-    vscode.Uri.joinPath(resolved.folderUri, "plan-final.md")
-  );
+  // Materialize canonical plan-final.md from legacy implementation.md if needed
+  let canonicalUri: vscode.Uri;
+  try {
+    canonicalUri = await materializeCanonicalIfNeeded(resolved.folderUri);
+  } catch (error) {
+    void vscode.window.showErrorMessage(
+      error instanceof Error ? error.message : String(error)
+    );
+    return;
+  }
+
+  const planFinalContent = await readNonEmptyText(canonicalUri);
   if (!planFinalContent) {
     void vscode.window.showWarningMessage(
-      "No plan-final.md found. Finalize a plan (Next Stage from the low-level plan review) before running the implementation."
+      "No plan-final.md found. Advance to the Implementation stage first."
     );
     return;
   }
@@ -1007,14 +927,6 @@ export async function runImplementationWithAI(
     return;
   }
 
-  const implementationUri = vscode.Uri.joinPath(
-    resolved.folderUri,
-    "implementation.md"
-  );
-  if (!(await confirmOverwrite(implementationUri, "implementation.md"))) {
-    return;
-  }
-
   const contextPackContent = await generateContextPack(
     resolved.folderUri,
     workspaceRoot.uri
@@ -1026,9 +938,6 @@ export async function runImplementationWithAI(
     { contextPack: contextPackContent, plan: planFinalContent }
   );
 
-  // Re-running from an impl review stage re-checks at that same level
-  // (matching Apply Review's routing); the first run (plan-final) or a
-  // plain re-run (implementation) starts back at the high-level review.
   const postRunReviewStage = isReviewStage(resolved.progress.currentStage)
     ? resolved.progress.currentStage
     : "implementation";
@@ -1065,7 +974,8 @@ export function registerReviewActionCommands(
     ),
     vscode.commands.registerCommand(
       "vs-code-ai-helper.nextStage",
-      (node?: TaskNodeArg) => nextStage(node)
+      (node?: TaskNodeArg) =>
+        nextStage(context.extensionUri, node)
     ),
     vscode.commands.registerCommand(
       "vs-code-ai-helper.generateImplementationWithAI",

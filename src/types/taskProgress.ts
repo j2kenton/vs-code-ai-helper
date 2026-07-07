@@ -1,18 +1,22 @@
 /**
  * Represents the different stages in the task workflow:
- * plan drafting, plan reviews, final plan, implementation, and
- * implementation reviews.
+ * task description, plan drafting, plan reviews, implementation (merged
+ * from old final-plan + implementation stages), and implementation reviews.
  */
 export type TaskStage =
-  | "created"
+  | "task-description"
   | "plan"
   | "plan-high-review"
   | "plan-low-review"
-  | "plan-final"
   | "implementation"
   | "impl-high-review"
   | "impl-low-review"
   | "completed";
+
+/**
+ * Task status values.
+ */
+export type TaskStatus = "active" | "paused";
 
 /**
  * The filename for the task request/scope artifact
@@ -24,6 +28,21 @@ export const TASK_FILENAME = "task.md";
  * a review rewrites it in place rather than forking into "updated" copies.
  */
 export const PLAN_FILENAME = "plan.md";
+
+/**
+ * The filename for the low-level plan artifact.
+ */
+export const LOW_LEVEL_PLAN_FILENAME = "plan-low.md";
+
+/**
+ * The filename for the implementation / final-plan artifact (merged stage).
+ */
+export const IMPLEMENTATION_FILENAME = "plan-final.md";
+
+/**
+ * The filename for the legacy implementation artifact (read/fallback only).
+ */
+export const LEGACY_IMPLEMENTATION_FILENAME = "implementation.md";
 
 /**
  * The filename for the generated context pack artifact
@@ -43,6 +62,8 @@ export interface TaskProgress {
   taskFolder: string;
   /** Current stage in the workflow */
   currentStage: TaskStage;
+  /** Task status: active or paused. Missing = active for backward compat. */
+  status?: TaskStatus;
   /** ISO timestamp when the task was created */
   createdAt: string;
   /** ISO timestamp when the progress was last updated */
@@ -66,11 +87,10 @@ export const TASK_PROGRESS_FILENAME = "task-progress.json";
  * Order of stages for determining workflow progression
  */
 export const STAGE_ORDER: readonly TaskStage[] = [
-  "created",
+  "task-description",
   "plan",
   "plan-high-review",
   "plan-low-review",
-  "plan-final",
   "implementation",
   "impl-high-review",
   "impl-low-review",
@@ -81,11 +101,10 @@ export const STAGE_ORDER: readonly TaskStage[] = [
  * Human-readable names for each stage
  */
 export const STAGE_DISPLAY_NAMES: Record<TaskStage, string> = {
-  created: "Task Created",
+  "task-description": "Task Description",
   plan: "Plan",
   "plan-high-review": "Plan: High-Level Review",
   "plan-low-review": "Plan: Low-Level Review",
-  "plan-final": "Final Plan",
   implementation: "Implementation",
   "impl-high-review": "Implementation: High-Level Review",
   "impl-low-review": "Implementation: Low-Level Review",
@@ -97,12 +116,11 @@ export const STAGE_DISPLAY_NAMES: Record<TaskStage, string> = {
  */
 export const STAGE_ARTIFACT_FILENAMES: Record<TaskStage, string | undefined> =
   {
-    created: TASK_FILENAME,
+    "task-description": TASK_FILENAME,
     plan: PLAN_FILENAME,
     "plan-high-review": "plan-high-review.md",
     "plan-low-review": "plan-low-review.md",
-    "plan-final": "plan-final.md",
-    implementation: "implementation.md",
+    implementation: IMPLEMENTATION_FILENAME,
     "impl-high-review": "impl-high-review.md",
     "impl-low-review": "impl-low-review.md",
     completed: undefined,
@@ -124,6 +142,7 @@ export const REVIEW_STAGES: readonly TaskStage[] = [
  * selection configured.
  */
 export const AI_MODEL_STAGES: readonly TaskStage[] = [
+  "task-description",
   "plan",
   "plan-high-review",
   "plan-low-review",
@@ -147,12 +166,17 @@ export function isPlanReviewStage(stage: TaskStage): boolean {
 }
 
 /**
- * Stage names used by versions before 0.6.0, mapped onto the current
- * pipeline. "plan-updated" collapses into the high-level review loop (the
- * plan had been revised after the first review) and "plan-updated-review"
- * maps to the low-level (second-round) review.
+ * Stage names used by older versions, mapped onto the current pipeline.
+ * - "created" / "Task Created" -> "task-description"
+ * - "plan-final" -> "implementation"  (merged stage)
+ * - "plan-review" etc. -> legacy review names
  */
 const LEGACY_STAGE_MAP: Record<string, TaskStage> = {
+  // Pre-"task-description" rename
+  created: "task-description",
+  // Pre-merge of final-plan + implementation
+  "plan-final": "implementation",
+  // Very old stage names from pre-0.6.0
   "plan-review": "plan-high-review",
   "plan-updated": "plan-high-review",
   "plan-updated-review": "plan-low-review",
@@ -160,8 +184,8 @@ const LEGACY_STAGE_MAP: Record<string, TaskStage> = {
 
 /**
  * Normalize a stage value read from disk: current stage names pass through,
- * pre-0.6.0 names are migrated, and anything unrecognized falls back to
- * "created" so a corrupt file never breaks the workflow.
+ * legacy names are migrated, and anything unrecognized falls back to
+ * "task-description" so a corrupt file never breaks the workflow.
  */
 export function migrateStage(stage: string): TaskStage {
   if ((STAGE_ORDER as readonly string[]).includes(stage)) {
@@ -171,5 +195,15 @@ export function migrateStage(stage: string): TaskStage {
   if (legacy) {
     return legacy;
   }
-  return "created";
+  return "task-description";
+}
+
+/**
+ * Normalize a status value read from disk. Missing or invalid -> "active".
+ */
+export function migrateStatus(status: unknown): TaskStatus {
+  if (status === "active" || status === "paused") {
+    return status;
+  }
+  return "active";
 }

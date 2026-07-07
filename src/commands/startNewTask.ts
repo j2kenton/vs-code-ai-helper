@@ -1,16 +1,19 @@
 import * as vscode from "vscode";
-import {
-  getMetaResourcesPath,
-  hasValidMetaResourcesPath,
-  isModelSelectionPromptShown,
-  setModelSelectionPromptShown,
-} from "../config/settings";
+import * as path from "path";
 import { TASK_FILENAME } from "../types/taskProgress";
 import {
   createTaskProgress,
   writeTaskProgress,
 } from "../utils/taskProgressUtils";
-import { openOrCreateDocument } from "../utils/fileUtils";
+import { resolveTaskRootForCreation } from "../utils/taskRoot";
+import { TaskInventory } from "../state/taskInventory";
+import { CurrentTaskStore } from "../utils/currentTaskStore";
+
+/**
+ * The default plans root relative to workspace.
+ * Used when no explicit meta resources path is configured.
+ */
+export const DEFAULT_PLANS_ROOT = ".helper/plans";
 
 /**
  * Format a date as YYYY-MM-DD
@@ -26,13 +29,14 @@ function formatDate(date: Date): string {
  * Get the next task number for a given date by checking existing folders
  */
 async function getNextTaskNumber(
-  metaFolderUri: vscode.Uri,
+  metaFolderPath: string,
   dateStr: string
 ): Promise<number> {
   const pattern = new RegExp(`^${dateStr}_task_(\\d+)$`);
   let maxTaskNumber = 0;
 
   try {
+    const metaFolderUri = vscode.Uri.file(metaFolderPath);
     const entries = await vscode.workspace.fs.readDirectory(metaFolderUri);
 
     for (const [name, type] of entries) {
@@ -54,26 +58,59 @@ async function getNextTaskNumber(
 }
 
 /**
+ * Load the task template from the bundled template file.
+ */
+async function loadTaskTemplate(extensionUri: vscode.Uri): Promise<string> {
+  const templateUri = vscode.Uri.joinPath(
+    extensionUri,
+    "resources",
+    "prompts",
+    "task-template.md"
+  );
+  try {
+    const bytes = await vscode.workspace.fs.readFile(templateUri);
+    return new TextDecoder().decode(bytes);
+  } catch (error) {
+    // Fallback to inline template if file read fails
+    return `Briefly describe what changes you want to be made, and then use AI to help you clarify the plan.
+
+Shortcut: Apply Current Stage Action (Windows/Linux: Ctrl+Shift+Alt+I, macOS: Cmd+Shift+Alt+I).
+
+## Task Description
+
+## Draft with AI
+
+## Open Questions
+`;
+  }
+}
+
+/**
+ * Normalize a path consistently with taskRoot.ts: normalize separators and,
+ * on Windows, lowercase for case-insensitive comparison.
+ */
+function normalizePath(p: string): string {
+  const normalized = path.normalize(p);
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+
+/**
  * Creates a new task folder (YYYY-MM-DD_task_X) with progress tracking and
- * opens task.md for the user to describe the work. From there the Tasks
- * view / Resume Task offer the per-stage actions — there is no forced
- * wizard walking every stage up front.
+ * opens task.md for the user to describe the work. The file is pre-seeded
+ * with the task template (intro, shortcut note, and the three canonical
+ * sections). No plan-generation prompt is shown.
+ *
+ * After a successful creation the new task is persisted as the current task
+ * so the keyboard shortcut (Ctrl+Shift+Alt+I) works immediately without the
+ * user having to navigate the tree first.
+ *
  * Returns the created folder name, or undefined if cancelled/failed.
  */
-export async function startNewTask(): Promise<string | undefined> {
-  if (!hasValidMetaResourcesPath()) {
-    const selection = await vscode.window.showErrorMessage(
-      "No meta resources folder configured. Please set one first.",
-      "Select Folder"
-    );
-    if (selection === "Select Folder") {
-      await vscode.commands.executeCommand(
-        "vs-code-ai-helper.selectMetaFolder"
-      );
-    }
-    return undefined;
-  }
-
+export async function startNewTask(
+  inventory: TaskInventory,
+  extensionUri: vscode.Uri,
+  currentTaskStore: CurrentTaskStore
+): Promise<string | undefined> {
   const workspaceRoot = vscode.workspace.workspaceFolders?.[0];
   if (!workspaceRoot) {
     void vscode.window.showErrorMessage(
@@ -82,56 +119,63 @@ export async function startNewTask(): Promise<string | undefined> {
     return undefined;
   }
 
-  const metaFolderUri = vscode.Uri.joinPath(
-    workspaceRoot.uri,
-    getMetaResourcesPath()
-  );
-
-  const dateStr = formatDate(new Date());
-  const taskNumber = await getNextTaskNumber(metaFolderUri, dateStr);
-  const taskFolderName = `${dateStr}_task_${taskNumber}`;
-  const taskFolderUri = vscode.Uri.joinPath(metaFolderUri, taskFolderName);
-
   try {
+    // Resolve the task root, creating it if needed
+    const metaFolderPath = await resolveTaskRootForCreation(workspaceRoot);
+
+    const dateStr = formatDate(new Date());
+    const taskNumber = await getNextTaskNumber(metaFolderPath, dateStr);
+    const taskFolderName = `${dateStr}_task_${taskNumber}`;
+    const taskFolderPath = path.join(metaFolderPath, taskFolderName);
+    const taskFolderUri = vscode.Uri.file(taskFolderPath);
+
+    // Create the task folder
     await vscode.workspace.fs.createDirectory(taskFolderUri);
+
+    // Write initial progress with the new "task-description" stage
     await writeTaskProgress(
       taskFolderUri,
-      createTaskProgress(taskFolderName, "created")
+      createTaskProgress(taskFolderName, "task-description")
     );
 
+    // Load and write task.md pre-seeded with the template
+    const taskTemplate = await loadTaskTemplate(extensionUri);
     const taskFileUri = vscode.Uri.joinPath(taskFolderUri, TASK_FILENAME);
-    await openOrCreateDocument(taskFileUri);
-
-    if (!isModelSelectionPromptShown()) {
-      await setModelSelectionPromptShown();
-      const modelChoice = await vscode.window.showInformationMessage(
-        "Choose AI models per workflow step now? You can save selections for just this task or as workspace defaults.",
-        "Configure Models",
-        "Skip"
-      );
-
-      if (modelChoice === "Configure Models") {
-        await vscode.commands.executeCommand(
-          "vs-code-ai-helper.configureStepModels",
-          { taskFolderUri }
-        );
-      }
-    }
-
-    const relativePath = vscode.workspace.asRelativePath(taskFileUri);
-    await vscode.env.clipboard.writeText(relativePath);
-
-    const choice = await vscode.window.showInformationMessage(
-      `Created ${taskFolderName}. Describe the task in ${TASK_FILENAME}, then generate a plan.`,
-      "Generate Plan with AI",
-      "Later"
+    await vscode.workspace.fs.writeFile(
+      taskFileUri,
+      new TextEncoder().encode(taskTemplate)
     );
-    if (choice === "Generate Plan with AI") {
-      await vscode.commands.executeCommand(
-        "vs-code-ai-helper.generatePlanWithAI",
-        taskFolderUri
+
+    // Refresh inventory so the new task is discoverable
+    await inventory.refresh();
+
+    // Resolve the newly created task back out of the inventory by its
+    // normalized canonical path (mirrors the normalization in taskRoot.ts).
+    const normalizedFolderPath = normalizePath(taskFolderPath);
+    const newTask =
+      inventory.getTaskById(normalizedFolderPath) ??
+      inventory.getTaskByPath(normalizedFolderPath) ??
+      // Fallback: match by folder name in case path normalization differs
+      inventory.getTasks().find((t) => t.folderName === taskFolderName);
+
+    if (newTask) {
+      // Persist the new task as the current task so the shortcut router
+      // finds it immediately, even before the user interacts with the tree.
+      await currentTaskStore.set(newTask.canonicalId);
+    } else {
+      // The task folder was created and the inventory was refreshed, but the
+      // task could not be re-resolved. This is unexpected (e.g. a race with
+      // discovery filters). Surface a warning so the user knows the shortcut
+      // may not work until they manually select the task in the tree.
+      void vscode.window.showWarningMessage(
+        `Task "${taskFolderName}" was created but could not be set as the ` +
+          `current task automatically. Select it in the Tasks panel to activate it.`
       );
     }
+
+    // Open task.md in the editor regardless — the file was written successfully
+    const doc = await vscode.workspace.openTextDocument(taskFileUri);
+    await vscode.window.showTextDocument(doc);
 
     return taskFolderName;
   } catch (error) {
@@ -147,11 +191,13 @@ export async function startNewTask(): Promise<string | undefined> {
  * Register the startNewTask command
  */
 export function registerStartNewTaskCommand(
-  context: vscode.ExtensionContext
+  context: vscode.ExtensionContext,
+  inventory: TaskInventory,
+  currentTaskStore: CurrentTaskStore
 ): void {
   const disposable = vscode.commands.registerCommand(
     "vs-code-ai-helper.startNewTask",
-    startNewTask
+    () => startNewTask(inventory, context.extensionUri, currentTaskStore)
   );
   context.subscriptions.push(disposable);
 }

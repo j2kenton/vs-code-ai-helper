@@ -2,7 +2,12 @@ You are performing a LOW-LEVEL review of an implementation plan for a software e
 
 Focus on the details: are the individual steps concrete, correctly ordered, and actually implementable? Are the named files/areas plausible? Are edge cases, error handling, migrations, and testing covered? Is each acceptance criterion verifiable?
 
-Structure your review as:
+Begin your response with a readiness score on its own line in this exact format:
+Readiness: N/10
+
+Where N is a score from 0-10 (8-10 = ready to proceed, 5-7 = needs minor changes, 0-4 = needs significant changes).
+
+Then structure your review as:
 - Summary verdict (ready to finalize / needs changes).
 - Blocking issues (if any), each tied to a specific step or section of the plan.
 - Non-blocking suggestions (if any).

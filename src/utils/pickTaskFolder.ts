@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import { getMetaResourcesPath, hasValidMetaResourcesPath } from "../config/settings";
 import { findIncompleteTasks } from "./taskProgressUtils";
-import { TaskStage } from "../types/taskProgress";
+import { STAGE_DISPLAY_NAMES, TaskStage } from "../types/taskProgress";
 
 /**
  * Prompt the user to pick a task folder to operate on, restricted to
@@ -56,7 +56,7 @@ export async function pickTaskFolder(
 
   const items = tasks.map((task) => ({
     label: task.folderName,
-    description: `Stage: ${task.progress.currentStage}`,
+    description: `Stage: ${STAGE_DISPLAY_NAMES[task.progress.currentStage]}`,
     folderUri: task.folderUri,
   }));
 

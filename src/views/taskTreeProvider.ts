@@ -1,9 +1,5 @@
 import * as vscode from "vscode";
 import {
-  getMetaResourcesPath,
-  hasValidMetaResourcesPath,
-} from "../config/settings";
-import {
   AI_MODEL_STAGES,
   isReviewStage,
   STAGE_ARTIFACT_FILENAMES,
@@ -11,13 +7,17 @@ import {
   STAGE_ORDER,
   TaskStage,
 } from "../types/taskProgress";
-import { findAllTasks, IncompleteTask } from "../utils/taskProgressUtils";
+import { IncompleteTask } from "../utils/taskProgressUtils";
 import { resolveCurrentPlanUri, statIfExists } from "../utils/fileUtils";
 import {
   computeCollapseExpandContext,
   type ExpansionMode,
 } from "../utils/collapseExpandContext";
 import { computeStageContext } from "../utils/stageContext";
+import { resolveImplementationArtifact } from "../utils/implementationArtifactResolver";
+import { getLowLevelPlanUri } from "../utils/lowLevelPlanArtifactResolver";
+import { parseReadiness } from "../utils/reviewReadiness";
+import { TaskInventory, TaskWithProgress } from "../state/taskInventory";
 
 /**
  * The view ID for the tasks tree view (must match package.json)
@@ -48,6 +48,11 @@ function getStageStatus(stage: TaskStage, currentStage: TaskStage): StageStatus 
 function buildTaskTooltip(task: IncompleteTask): vscode.MarkdownString {
   const lines: string[] = [`**${task.folderName}**`, ""];
 
+  const isPaused = task.progress.status === "paused";
+  if (isPaused) {
+    lines.push("⏸ **Paused**", "");
+  }
+
   for (const stage of STAGE_ORDER) {
     const status = getStageStatus(stage, task.progress.currentStage);
     const marker =
@@ -64,6 +69,17 @@ function buildTaskTooltip(task: IncompleteTask): vscode.MarkdownString {
 
   const tooltip = new vscode.MarkdownString(lines.join("\n"), true);
   return tooltip;
+}
+
+/**
+ * Adapt a TaskWithProgress to the IncompleteTask shape expected by tree nodes.
+ */
+function toIncompleteTask(t: TaskWithProgress): IncompleteTask {
+  return {
+    folderUri: vscode.Uri.file(t.taskFolderPath),
+    folderName: t.folderName,
+    progress: t.progress,
+  };
 }
 
 /**
@@ -84,12 +100,19 @@ export class TaskNode extends vscode.TreeItem {
     const currentStage = task.progress.currentStage;
     const stepNumber = STAGE_ORDER.indexOf(currentStage) + 1;
     const totalSteps = STAGE_ORDER.length;
+    const isPaused = task.progress.status === "paused";
 
     if (currentStage === "completed") {
       this.description = "Completed";
       this.iconPath = new vscode.ThemeIcon(
         "pass-filled",
         new vscode.ThemeColor("charts.green")
+      );
+    } else if (isPaused) {
+      this.description = `Paused · ${STAGE_DISPLAY_NAMES[currentStage]} · step ${stepNumber} of ${totalSteps}`;
+      this.iconPath = new vscode.ThemeIcon(
+        "debug-pause",
+        new vscode.ThemeColor("charts.orange")
       );
     } else {
       this.description = `${STAGE_DISPLAY_NAMES[currentStage]} · step ${stepNumber} of ${totalSteps}`;
@@ -102,12 +125,15 @@ export class TaskNode extends vscode.TreeItem {
     this.tooltip = buildTaskTooltip(task);
     // Review-stage tasks surface the review action buttons instead of the
     // generic resume/set-stage pair.
-    this.contextValue =
-      currentStage === "completed"
-        ? "task-completed"
-        : isReviewStage(currentStage)
-          ? "task-active-review"
-          : "task-active";
+    if (currentStage === "completed") {
+      this.contextValue = "task-completed";
+    } else if (isPaused) {
+      this.contextValue = "task-paused";
+    } else if (isReviewStage(currentStage)) {
+      this.contextValue = "task-active-review";
+    } else {
+      this.contextValue = "task-active";
+    }
   }
 }
 
@@ -119,7 +145,9 @@ export class StageNode extends vscode.TreeItem {
     public readonly task: IncompleteTask,
     public readonly stage: TaskStage,
     status: StageStatus,
-    artifactUri: vscode.Uri | undefined
+    artifactUri: vscode.Uri | undefined,
+    /** Optional readiness info for review stages */
+    readiness?: { label: string; icon: string; colorKey: string }
   ) {
     super(STAGE_DISPLAY_NAMES[stage], vscode.TreeItemCollapsibleState.None);
 
@@ -128,18 +156,34 @@ export class StageNode extends vscode.TreeItem {
 
     switch (status) {
       case "done":
-        this.iconPath = new vscode.ThemeIcon(
-          "check",
-          new vscode.ThemeColor("charts.green")
-        );
-        this.description = "done";
+        if (readiness) {
+          this.iconPath = new vscode.ThemeIcon(
+            readiness.icon,
+            new vscode.ThemeColor(readiness.colorKey)
+          );
+          this.description = `done · ${readiness.label}`;
+        } else {
+          this.iconPath = new vscode.ThemeIcon(
+            "check",
+            new vscode.ThemeColor("charts.green")
+          );
+          this.description = "done";
+        }
         break;
       case "current":
-        this.iconPath = new vscode.ThemeIcon(
-          "arrow-right",
-          new vscode.ThemeColor("charts.blue")
-        );
-        this.description = "current";
+        if (readiness) {
+          this.iconPath = new vscode.ThemeIcon(
+            readiness.icon,
+            new vscode.ThemeColor(readiness.colorKey)
+          );
+          this.description = `current · ${readiness.label}`;
+        } else {
+          this.iconPath = new vscode.ThemeIcon(
+            "arrow-right",
+            new vscode.ThemeColor("charts.blue")
+          );
+          this.description = "current";
+        }
         break;
       case "outstanding":
         this.iconPath = new vscode.ThemeIcon(
@@ -184,16 +228,11 @@ export function getStageNodeContextValue(
 
   if (status === "current") {
     switch (stage) {
-      case "created":
-        // Special case for the "created" stage to show "Generate Plan" and "View Task".
-        // This value is targeted by an exact-match `when` clause in package.json,
-        // so it must not be appended with "-modelable" even if it becomes a modelable stage.
-        return "stage-created";
+      case "task-description":
+        // Special case for the "task-description" stage.
+        return "stage-task-description";
       case "plan":
-        contextValue = "stage-reviewable-current";
-        break;
-      case "plan-final":
-        contextValue = "stage-plan-final-current";
+        contextValue = "stage-plan-current";
         break;
       case "implementation":
         contextValue = "stage-impl-current";
@@ -223,20 +262,29 @@ export function getStageNodeContextValue(
 type TaskTreeNode = TaskNode | StageNode;
 
 /**
- * Resolve the configured meta resources folder URI, if any
+ * Try to read review readiness from an artifact file.
  */
-export function getMetaFolderUri(): vscode.Uri | undefined {
-  const workspaceRoot = vscode.workspace.workspaceFolders?.[0];
-  if (!workspaceRoot || !hasValidMetaResourcesPath()) {
+async function tryReadReadiness(
+  artifactUri: vscode.Uri | undefined
+): Promise<{ label: string; icon: string; colorKey: string } | undefined> {
+  if (!artifactUri) return undefined;
+  try {
+    const content = await vscode.workspace.fs.readFile(artifactUri);
+    const text = new TextDecoder().decode(content);
+    const result = parseReadiness(text);
+    return { label: result.label, icon: result.icon, colorKey: result.colorKey };
+  } catch {
     return undefined;
   }
-  return vscode.Uri.joinPath(workspaceRoot.uri, getMetaResourcesPath());
 }
 
 /**
  * Tree data provider for the AI Helper tasks view. Shows every task in the
  * meta resources folder with a per-stage checklist (done / current /
  * outstanding), so workflow progress is always visible at a glance.
+ *
+ * Accepts the shared TaskInventory so it and all commands use the same
+ * discovered-task source.
  */
 export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
   private readonly _onDidChangeTreeData = new vscode.EventEmitter<void>();
@@ -250,20 +298,20 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
   readonly onDidLoadTasks = this._onDidLoadTasks.event;
 
   // Collapse/expand state management
-  // TODO: Consider persisting mode preference in workspace settings for better UX across sessions
   private mode: ExpansionMode = 'autoFirstActive';
   private rootRenderVersion: number = 0;
   private lastLoadedTaskCount: number = 0;
   private refreshInProgress: boolean = false;
   private pendingModeSwitch: ExpansionMode | null = null;
 
+  constructor(private readonly inventory: TaskInventory) {
+    // When the shared inventory changes, refresh the tree automatically
+    this.inventory.onDidChange(() => this._onDidChangeTreeData.fire());
+  }
+
   /**
-   * Refresh both the tree view and any other listeners (e.g. the status
-   * bar) that depend on the current task list. Loads the task list itself
-   * rather than relying on the tree view asking for its root children,
-   * since that only happens while the view is visible/expanded — without
-   * this, refreshes while the sidebar is collapsed would never reach
-   * listeners of `onDidLoadTasks`.
+   * Refresh the tree view. Also asks the inventory to reload so newly-created
+   * tasks are visible immediately.
    */
   refresh(): void {
     this._onDidChangeTreeData.fire();
@@ -276,10 +324,8 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
       this.mode = 'allCollapsed';
       this.rootRenderVersion++;
       this.refresh();
-      // Context sync happens automatically at end of loadTasks()
     } catch (error) {
       console.error('Failed to collapse tasks:', error);
-      // Revert mode and sync context on error
       this.mode = 'autoFirstActive';
       this.syncCollapseExpandContext();
       void vscode.window.showErrorMessage(
@@ -294,11 +340,9 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
       this.mode = 'autoFirstActive';
       this.rootRenderVersion++;
 
-      // Refresh to get new nodes with expanded state
       this._onDidChangeTreeData.fire();
       const nodes = await this.getTaskNodes();
 
-      // Reveal each root node expanded
       for (const node of nodes) {
         await treeView.reveal(node, {
           expand: true,
@@ -306,11 +350,8 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
           select: false,
         });
       }
-
-      // Context sync happens automatically at end of loadTasks()
     } catch (error) {
       console.error('Failed to expand tasks:', error);
-      // Revert mode and sync context on error
       this.mode = 'allCollapsed';
       this.syncCollapseExpandContext();
       void vscode.window.showErrorMessage(
@@ -323,10 +364,8 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
   handleManualExpand(): void {
     if (this.mode === 'allCollapsed') {
       if (this.refreshInProgress) {
-        // Defer mode switch until refresh completes
         this.pendingModeSwitch = 'autoFirstActive';
       } else {
-        // Switch immediately and sync context
         this.mode = 'autoFirstActive';
         this.syncCollapseExpandContext();
       }
@@ -357,31 +396,21 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
   private async loadTasks(): Promise<IncompleteTask[]> {
     this.refreshInProgress = true;
     try {
-      const metaFolderUri = getMetaFolderUri();
+      // Use the shared inventory as the source of truth
+      const inventoryTasks = this.inventory.getTasks();
+      const tasks: IncompleteTask[] = inventoryTasks.map(toIncompleteTask);
 
-      void vscode.commands.executeCommand(
-        "setContext",
-        "vs-code-ai-helper.hasMetaFolder",
-        metaFolderUri !== undefined
-      );
-
-      if (!metaFolderUri) {
-        void vscode.commands.executeCommand(
-          "setContext",
-          "vs-code-ai-helper.hasTasks",
-          false
-        );
-        this.lastLoadedTaskCount = 0;
-        this._onDidLoadTasks.fire([]);
-        return [];
-      }
-
-      const tasks = await findAllTasks(metaFolderUri);
-
+      const hasTasks = tasks.length > 0;
       void vscode.commands.executeCommand(
         "setContext",
         "vs-code-ai-helper.hasTasks",
-        tasks.length > 0
+        hasTasks
+      );
+      // Always report hasMetaFolder as true since we use .helper/plans by default
+      void vscode.commands.executeCommand(
+        "setContext",
+        "vs-code-ai-helper.hasMetaFolder",
+        true
       );
 
       this.lastLoadedTaskCount = tasks.length;
@@ -394,19 +423,16 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
       throw error;
     } finally {
       this.refreshInProgress = false;
-      // Apply any pending mode switch that occurred during refresh
       if (this.pendingModeSwitch !== null) {
         this.mode = this.pendingModeSwitch;
         this.pendingModeSwitch = null;
       }
-      // Sync context automatically after every loadTasks completion
       this.syncCollapseExpandContext();
     }
   }
 
   /**
    * Synchronize the collapse/expand context key with current provider state.
-   * This is the only place that writes vs-code-ai-helper.tasksViewAllCollapsed.
    */
   private syncCollapseExpandContext(): void {
     const allCollapsed = computeCollapseExpandContext(
@@ -423,16 +449,11 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
   private async getTaskNodes(): Promise<TaskNode[]> {
     const tasks = await this.loadTasks();
 
-    // Update task count after successful load (already done in loadTasks)
-    // this.lastLoadedTaskCount = tasks.length;
-
-    // Active tasks first (most recent first), completed tasks after
     const active = tasks.filter((t) => t.progress.currentStage !== "completed");
     const completed = tasks.filter(
       (t) => t.progress.currentStage === "completed"
     );
 
-    // Auto-expand the first active task only in autoFirstActive mode
     const shouldAutoExpand = (index: number): boolean =>
       this.mode === 'autoFirstActive' && index === 0 && active.length > 0;
 
@@ -445,7 +466,6 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
       this.taskNodesByFolder.set(node.task.folderUri.toString(), node);
     }
 
-    // Context sync now happens at end of loadTasks(), no need here
     return nodes;
   }
 
@@ -455,13 +475,19 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
     for (const stage of STAGE_ORDER) {
       const status = getStageStatus(stage, task.progress.currentStage);
 
-      // The "plan" stage's artifact may live at the legacy plan-updated.md
-      // path for tasks migrated from pre-0.6.0 stage names; resolve it the
-      // same way the AI commands do rather than assuming plan.md.
       let artifactUri: vscode.Uri | undefined;
+
       if (stage === "plan") {
         const candidate = await resolveCurrentPlanUri(task.folderUri);
         artifactUri = (await statIfExists(candidate)) ? candidate : undefined;
+      } else if (stage === "plan-low-review") {
+        // Low-level plan stage opens plan-low.md
+        const candidate = getLowLevelPlanUri(task.folderUri);
+        artifactUri = (await statIfExists(candidate)) ? candidate : undefined;
+      } else if (stage === "implementation") {
+        // Merged stage: prefer plan-final.md, fallback to implementation.md
+        const resolved = await resolveImplementationArtifact(task.folderUri);
+        artifactUri = (await statIfExists(resolved.uri)) ? resolved.uri : undefined;
       } else {
         const artifactName = STAGE_ARTIFACT_FILENAMES[stage];
         if (artifactName) {
@@ -470,7 +496,13 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
         }
       }
 
-      nodes.push(new StageNode(task, stage, status, artifactUri));
+      // For review stages, try to parse readiness from the artifact
+      let readiness: { label: string; icon: string; colorKey: string } | undefined;
+      if (isReviewStage(stage) && (status === "done" || status === "current")) {
+        readiness = await tryReadReadiness(artifactUri);
+      }
+
+      nodes.push(new StageNode(task, stage, status, artifactUri, readiness));
     }
 
     return nodes;
