@@ -377,27 +377,46 @@ export async function generateContextPack(
 }
 
 /**
- * Write context-pack.md to the task folder and return its URI.
+ * Write pre-generated context-pack content to disk and return its URI.
+ *
+ * Callers that have already called `generateContextPack` should use this
+ * function to persist the exact same bytes that were assembled in memory —
+ * avoiding a second generation pass that could produce a different result
+ * if open buffers change between the two calls.
  */
-export async function writeContextPack(
+export async function writeContextPackContent(
   taskFolderUri: vscode.Uri,
-  workspaceUri: vscode.Uri,
-  includeFileContents = false
+  content: string
 ): Promise<vscode.Uri> {
   const contextPackUri = vscode.Uri.joinPath(
     taskFolderUri,
     CONTEXT_PACK_FILENAME
-  );
-  const content = await generateContextPack(
-    taskFolderUri,
-    workspaceUri,
-    includeFileContents
   );
   await vscode.workspace.fs.writeFile(
     contextPackUri,
     new TextEncoder().encode(content)
   );
   return contextPackUri;
+}
+
+/**
+ * Write context-pack.md to the task folder and return its URI.
+ *
+ * NOTE: Prefer `writeContextPackContent` when you have already called
+ * `generateContextPack` — that avoids a redundant second generation which
+ * could differ if open buffers change between calls.
+ */
+export async function writeContextPack(
+  taskFolderUri: vscode.Uri,
+  workspaceUri: vscode.Uri,
+  includeFileContents = false
+): Promise<vscode.Uri> {
+  const content = await generateContextPack(
+    taskFolderUri,
+    workspaceUri,
+    includeFileContents
+  );
+  return writeContextPackContent(taskFolderUri, content);
 }
 
 // ---------------------------------------------------------------------------
@@ -742,18 +761,11 @@ export async function writeImplReviewContextPack(
   workspaceUri: vscode.Uri,
   implReviewFiles: string[] | undefined
 ): Promise<{ contextPackUri: vscode.Uri; isFallback: boolean }> {
-  const contextPackUri = vscode.Uri.joinPath(
-    taskFolderUri,
-    CONTEXT_PACK_FILENAME
-  );
   const { content, isFallback } = await generateImplReviewContextPack(
     taskFolderUri,
     workspaceUri,
     implReviewFiles
   );
-  await vscode.workspace.fs.writeFile(
-    contextPackUri,
-    new TextEncoder().encode(content)
-  );
+  const contextPackUri = await writeContextPackContent(taskFolderUri, content);
   return { contextPackUri, isFallback };
 }

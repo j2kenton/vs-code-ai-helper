@@ -11,15 +11,68 @@ Task Created → Plan → Plan: High-Level Review → Plan: Low-Level Review
 
 ---
 
-## ⚠️ Disclaimer & Terms of Use
+## ⚠️ Critical Warnings — Read Before Installing
 
-> **Read before using any AI-powered feature.**
+> **This section is a legally-relevant disclosure. Read it before using any feature of this extension.**
+> Full details are in [`DISCLAIMER.md`](DISCLAIMER.md).
+> Use `AI Helper: View Disclaimer` from the Command Palette to read it inside VS Code.
+
+### This Extension Is Provided With Absolutely No Warranty
+
+This is **open-source personal developer tooling provided strictly "as is"**, with **no warranty of any kind** — express or implied. The authors and contributors accept **zero liability** for any damage, loss, or cost arising from use of this extension, including but not limited to:
+
+- **Token, quota, and API cost overruns.** Every "with AI" command consumes real quota or money from your configured AI subscription. A single implementation run can run for up to 30 minutes. There is no built-in cost ceiling or token estimate. **You are solely responsible for all charges incurred.** The authors will not refund, compensate, or accept liability for any token waste, subscription overuse, or API bills — even if caused by a bug in this extension.
+
+- **File modification and deletion.** AI implementation commands give the selected model permission to read, create, overwrite, and delete files anywhere inside your workspace. **The extension can and will modify files.** This is its intended purpose. The authors accept no liability for any file damage, corruption, accidental deletion, or data loss — including loss of work, loss of production data, or any other damage to any file, database, repository, or system. **Always commit or back up your workspace before running any AI command.**
+
+- **Data transmission to third-party AI providers.** File contents from open editors are sent to the AI provider you have configured. The authors accept no liability for any consequences of that transmission — including data leaks, privacy violations, intellectual property exposure, or any other harm.
+
+- **Commit and push actions.** The Commit & Push command stages and pushes changes to a remote repository. This is largely irreversible. The authors accept no liability for any unintended commits, pushes, or data exposed to remote repositories.
+
+- **Any other damage whatsoever**, including indirect, incidental, consequential, special, or punitive damages, loss of profits, loss of data, or business interruption.
+
+### You Must Evaluate It Before Using It
+
+This extension is **fully open source** (MIT License). Before using it:
+
+1. **Read the source code.** Every line is available. If you cannot evaluate it yourself, have a qualified technical professional evaluate it for you.
+2. **Read [`DISCLAIMER.md`](DISCLAIMER.md)** in full. It is the complete terms of use.
+3. **Decide whether it is suitable for your context.** If you are unsure, do not use it.
+
+**If you use it after reading these warnings, you accept that you do so entirely at your own risk.**
+
+### Never Use It Unsupervised
+
+**Always supervise every AI action.** Watch what the AI does in real time. Review every generated file before acting on it. Never leave an AI implementation run unattended. The authors strongly advise that you:
+
+- Keep your workspace committed and clean before any AI run
+- Monitor token usage in your provider's billing dashboard
+- Close files containing secrets or sensitive data before running any "with AI" command
+- After any AI run, review `context-pack.md` in your task folder to see exactly what was sent
+
+The extension is designed to be used with active human supervision at every step. **Using it unsupervised, in automated pipelines, or in contexts where you cannot monitor it, is explicitly not recommended and is done at your own risk.**
+
+### This Is Not Production or Enterprise Tooling
+
+This extension is a **personal productivity tool for individual developers**. It is not designed, tested, or certified for:
+
+- Production environments or production-facing systems
+- Regulated industries (finance, healthcare, legal, government)
+- Environments with data-residency, GDPR, HIPAA, or other compliance requirements
+- Multi-user, team, or enterprise deployments
+- Any context where AI-generated output is used without human review
+
+If you need production-grade AI tooling with governance controls, audit trails, or compliance certifications, this is not the right tool. Fork it, customise it, and have it evaluated by qualified security and legal professionals before deploying it in such contexts.
+
+---
+
+## ⚠️ Disclaimer & Terms of Use (Summary)
+
 > Full details are in [`DISCLAIMER.md`](DISCLAIMER.md). This is a summary only.
-> Use the `AI Helper: View Disclaimer` command in the Command Palette to read it inside VS Code.
 
 **Provided as-is — no warranty.** This is open-source personal developer tooling. The authors accept no liability of any kind for anything that happens as a result of using this extension. See the MIT License and `DISCLAIMER.md`.
 
-**Token, quota, and API costs are your responsibility.** Every "with AI" command consumes real quota or money from the AI subscription you have configured (Copilot, Anthropic, OpenAI, or Google). A single implementation run can run for up to 30 minutes. There is no built-in cost ceiling or token estimate. **You will be shown a first-use consent dialog in each workspace before any AI action runs.**
+**Token, quota, and API costs are your responsibility.** Every "with AI" command consumes real quota or money from the AI subscription you have configured (Copilot, Anthropic, OpenAI, or Google). A single implementation run can run for up to 30 minutes. There is no built-in cost ceiling or token estimate. **You will be shown a first-use consent dialog in each workspace before any AI action runs** — this is a software control, not a billing cap.
 
 **AI runs can modify or delete files in your workspace.** Implementation runs give the selected AI model permission to read, create, overwrite, and delete files anywhere inside your workspace. Always commit or back up your workspace before running an AI implementation.
 
@@ -30,8 +83,6 @@ Task Created → Plan → Plan: High-Level Review → Plan: Low-Level Review
 **Run logs contain full prompt content.** Every AI run writes a log under `runs/` in your task folder. These logs include the full prompt sent to the provider, which may include file contents. If you push your task folder, run logs go with it.
 
 **Never use unsupervised. Supervise every action. Review results before acting on them.**
-
-**This is not production or compliance tooling.** It is a personal developer tool, not designed or certified for regulated environments, enterprise deployments, or data-processing-agreement contexts.
 
 For the full disclaimer, data-flow details, and your pre-use checklist, see **[DISCLAIMER.md](DISCLAIMER.md)**.
 For the security policy, see **[SECURITY.md](SECURITY.md)**.
@@ -208,4 +259,4 @@ vs-code-ai-helper/
 
 MIT — see [LICENSE](LICENSE).
 
-This extension is provided as-is. See [DISCLAIMER.md](DISCLAIMER.md) for the full terms of use.
+This extension is provided as-is, with no warranty of any kind. The authors accept no liability for token costs, file damage, data loss, or any other harm arising from use of this extension. See [DISCLAIMER.md](DISCLAIMER.md) for the full terms of use.

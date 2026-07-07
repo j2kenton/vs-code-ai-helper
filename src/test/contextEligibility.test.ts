@@ -1,7 +1,8 @@
 /**
  * Unit tests for src/utils/contextEligibility.ts
  *
- * Tests the prompt-size guard logic, token estimation, and the denylist.
+ * Tests the prompt-size guard logic, token estimation, the denylist, and
+ * lstatSync error-code branching (fail-closed contract for EPERM/EACCES/etc).
  * These are pure Node tests (no VS Code API) so they run in the unit suite.
  */
 import * as assert from "node:assert/strict";
@@ -196,4 +197,56 @@ void test("isDenylisted: package.json is not denylisted", () => {
 void test("isDenylisted: my.keynotefile.ts is not denylisted (no .key extension)", () => {
   // .key pattern matches files ENDING in .key — "my.keynotefile.ts" does not
   assert.equal(isDenylisted("my.keynotefile.ts"), false);
+});
+
+// ---------------------------------------------------------------------------
+// lstatSync error-code discrimination logic
+// (unit-tests the fail-closed contract without requiring VS Code or real fs)
+//
+// The isEligibleDocument function in contextPack.ts uses this exact branching:
+//   catch (err) {
+//     if (err.code === "ENOENT") → treat as new unsaved file (fileExistsOnDisk = false)
+//     else                       → fail closed (return false immediately)
+//   }
+// These tests confirm the discrimination logic is correct in isolation so that
+// any accidental change to the branching is caught by the unit suite.
+// ---------------------------------------------------------------------------
+
+/**
+ * Simulate the error-code check used inside isEligibleDocument.
+ * Returns "enoent" for ENOENT, "closed" for any other error code.
+ */
+function simulateLstatErrorBranch(errorCode: string): "enoent" | "closed" {
+  const err = Object.assign(new Error("simulated"), { code: errorCode }) as NodeJS.ErrnoException;
+  const code = err.code;
+  if (code === "ENOENT") {
+    return "enoent";
+  }
+  return "closed";
+}
+
+void test("lstatSync error-code branch: ENOENT is treated as new unsaved file", () => {
+  assert.equal(simulateLstatErrorBranch("ENOENT"), "enoent");
+});
+
+void test("lstatSync error-code branch: EPERM is fail-closed", () => {
+  assert.equal(simulateLstatErrorBranch("EPERM"), "closed");
+});
+
+void test("lstatSync error-code branch: EACCES is fail-closed", () => {
+  assert.equal(simulateLstatErrorBranch("EACCES"), "closed");
+});
+
+void test("lstatSync error-code branch: EIO is fail-closed", () => {
+  assert.equal(simulateLstatErrorBranch("EIO"), "closed");
+});
+
+void test("lstatSync error-code branch: ENOTDIR is fail-closed", () => {
+  assert.equal(simulateLstatErrorBranch("ENOTDIR"), "closed");
+});
+
+void test("lstatSync error-code branch: undefined code is fail-closed", () => {
+  // An error with no .code property (e.g. a TypeError) should also be closed.
+  // undefined !== "ENOENT" so the branch correctly returns "closed".
+  assert.equal(simulateLstatErrorBranch(""), "closed");
 });

@@ -4,7 +4,10 @@ import {
   updateTaskProgressStage,
   writeTaskProgress,
 } from "../utils/taskProgressUtils";
-import { generateContextPack, writeContextPack } from "../utils/contextPack";
+import {
+  generateContextPack,
+  writeContextPackContent,
+} from "../utils/contextPack";
 import { renderPromptTemplate } from "../utils/promptTemplates";
 import { writeRunLog } from "../utils/runLog";
 import { pickTaskFolder } from "../utils/pickTaskFolder";
@@ -114,9 +117,11 @@ export async function generatePlanWithAI(
     return;
   }
 
-  // Size gate passed — now persist context-pack.md so it is available in
-  // the task folder and in run logs as an audit record of what was sent.
-  await writeContextPack(taskFolderUri, workspaceRoot.uri);
+  // Size gate passed — persist the EXACT same context-pack content that was
+  // assembled above (no second generation pass). This ensures context-pack.md
+  // on disk is byte-for-byte identical to what was sent in the prompt, even
+  // if open buffers change between the two calls.
+  await writeContextPackContent(taskFolderUri, contextPackContent);
 
   // No overwrite confirmation — user has deliberately triggered regeneration
   await vscode.window.withProgress(
