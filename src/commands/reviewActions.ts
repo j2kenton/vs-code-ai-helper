@@ -17,7 +17,6 @@ import {
   findAllTasks,
   IncompleteTask,
   readTaskProgress,
-  clearImplReviewFiles,
   updateImplReviewFiles,
   updateTaskProgressStage,
   writeTaskProgress,
@@ -1026,12 +1025,20 @@ async function executeImplementationRun(
       const updatedProgress = alreadyAtOrPastImplementation
         ? currentProgress
         : updateTaskProgressStage(currentProgress, "implementation");
-      await writeTaskProgress(
-        folderUri,
-        result.filesChangedUnknown
-          ? clearImplReviewFiles(updatedProgress)
-          : updateImplReviewFiles(updatedProgress, result.filesChanged)
-      );
+      // filesChangedUnknown means THIS run's own change detection failed
+      // (git unavailable/not-a-repo), not that no files changed — it says
+      // nothing about the task's previously accumulated implReviewFiles.
+      // Leave that set untouched rather than clearing it, so a single
+      // transient detection failure can't erase file tracking built up by
+      // earlier successful runs in the same task.
+      if (!result.filesChangedUnknown) {
+        await writeTaskProgress(
+          folderUri,
+          updateImplReviewFiles(updatedProgress, result.filesChanged)
+        );
+      } else if (updatedProgress !== currentProgress) {
+        await writeTaskProgress(folderUri, updatedProgress);
+      }
     }
 
     const doc = await vscode.workspace.openTextDocument(implementationUri);

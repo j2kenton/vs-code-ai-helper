@@ -454,6 +454,13 @@ async function getFileContentForReview(
  * the editor, the unsaved buffer is used in place of the on-disk copy.
  * `isFallback` is `false` in this mode.
  *
+ * A zero-length tracked list is expected to be rare in practice: callers
+ * accumulate `implReviewFiles` across a task's implementation runs (see
+ * `updateImplReviewFiles` in taskProgressUtils.ts) rather than overwriting it
+ * per run, so an empty list here means the task genuinely has no AI-authored
+ * changes recorded yet, not that a later no-op run clobbered an earlier
+ * run's files.
+ *
  * **Fallback mode** (when `implReviewFiles` is `undefined`): the task was
  * implemented manually, or was created before file tracking was
  * introduced. All open editors that belong to this workspace are used
@@ -504,10 +511,11 @@ export async function generateImplReviewContextPack(
     lines.push("");
 
     if (implReviewFiles.length === 0) {
-      // AI run completed but wrote no workspace files — nothing to embed.
+      // No AI implementation run for this task has changed any workspace
+      // files yet — nothing to embed.
       lines.push(
-        "_The most recent AI implementation run completed but changed no " +
-        "workspace files. There are no implementation files to review._"
+        "_No AI implementation run for this task has changed any workspace " +
+        "files yet. There are no implementation files to review._"
       );
       lines.push("");
       lines.push("## Constraints");
@@ -519,9 +527,9 @@ export async function generateImplReviewContextPack(
     }
 
     lines.push(
-      "_Tracked changed files from the most recent AI implementation run. " +
-      "For files also open in the editor, the unsaved buffer is used in place " +
-      "of the on-disk copy._"
+      "_Tracked changed files accumulated across this task's AI implementation " +
+      "runs. For files also open in the editor, the unsaved buffer is used in " +
+      "place of the on-disk copy._"
     );
     lines.push("");
 

@@ -129,17 +129,28 @@ export function updateTaskStatus(
 }
 
 /**
- * Record the workspace-relative paths changed by the most recent AI
- * implementation run so implementation reviews can use them as the review
- * scope instead of relying on open editors.
+ * Record the workspace-relative paths changed by an AI implementation run,
+ * so implementation reviews can use them as the review scope instead of
+ * relying on open editors.
+ *
+ * Unions `files` with any previously tracked set rather than replacing it.
+ * A task can have several implementation runs in sequence (e.g. an initial
+ * run followed by review-driven follow-up runs); a later run's before/after
+ * git snapshot legitimately diffs to empty when it only re-confirms files an
+ * earlier run already finalized. Overwriting the tracked set with that empty
+ * diff would silently discard the earlier runs' files from the review scope.
+ * Use `clearImplReviewFiles` for the one case where discarding the set is
+ * actually intended: an explicit "start over" action, not a routine re-run.
  */
 export function updateImplReviewFiles(
   progress: TaskProgress,
   files: string[]
 ): TaskProgress {
+  const existing = progress.implReviewFiles ?? [];
+  const union = new Set([...existing, ...files]);
   return {
     ...progress,
-    implReviewFiles: files,
+    implReviewFiles: [...union].sort(),
     updatedAt: new Date().toISOString(),
   };
 }

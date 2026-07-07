@@ -69,9 +69,12 @@ export interface TaskProgress {
   /** ISO timestamp when the progress was last updated */
   updatedAt: string;
   /**
-   * Workspace-relative paths changed by the most recent AI implementation
-   * run. Used as the primary review scope for implementation reviews so
-   * the review is not limited to whatever files happen to be open.
+   * Workspace-relative paths changed across all AI implementation runs for
+   * this task, accumulated (unioned, not replaced) as each run completes —
+   * see `updateImplReviewFiles`. Sorted alphabetically. Used as the primary
+   * review scope for implementation reviews so the review is not limited to
+   * whatever files happen to be open, and so a later run that happens to
+   * touch no new files doesn't erase an earlier run's tracked files.
    * Absent for tasks implemented manually or created before this field
    * was introduced — those fall back to open-editor review.
    */

@@ -21,6 +21,7 @@
     "src/legal/disclaimerVersion.ts",
     "src/views/taskTreeProvider.ts",
     "src/utils/stageContext.ts",
+    "src/utils/taskProgressUtils.ts",
     "src/types/taskProgress.ts",
     "src/test/**/*.ts"
   ]
