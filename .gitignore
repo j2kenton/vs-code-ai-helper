@@ -12,6 +12,7 @@ npm-debug.log*
 
 # Local planning artifacts
 plans/
+notes/
 
 # IDE
 .idea/
