@@ -15,6 +15,11 @@ import { registerPauseTaskCommand } from "./commands/pauseTask";
 import { registerApplyHighLevelReviewChangesCommand } from "./commands/applyHighLevelReviewChanges";
 import { registerApplyLowLevelReviewChangesCommand } from "./commands/applyLowLevelReviewChanges";
 import { registerCommitAndPushTaskCommand } from "./commands/commitAndPushTask";
+import { registerToggleMetaResourcesGitIgnoreCommand } from "./commands/toggleMetaResourcesGitIgnore";
+import { registerChatWithStageCommand } from "./commands/chatWithStage";
+import { registerOpenGeneralAssistantCommand } from "./commands/openGeneralAssistant";
+import { registerRunLintingFixesCommand } from "./commands/runLintingFixes";
+import { registerScheduleTaskResumeCommand } from "./commands/scheduleTaskResume";
 import { TaskTreeProvider, TASKS_VIEW_ID } from "./views/taskTreeProvider";
 import { TaskStatusBar } from "./views/taskStatusBar";
 import { TaskInventory } from "./state/taskInventory";
@@ -52,6 +57,11 @@ export function activate(context: vscode.ExtensionContext): void {
   registerApplyHighLevelReviewChangesCommand(context, inventory);
   registerApplyLowLevelReviewChangesCommand(context, inventory);
   registerCommitAndPushTaskCommand(context, inventory);
+  registerToggleMetaResourcesGitIgnoreCommand(context);
+  registerChatWithStageCommand(context, inventory);
+  registerOpenGeneralAssistantCommand(context);
+  registerRunLintingFixesCommand(context, inventory);
+  registerScheduleTaskResumeCommand(context, inventory);
 
   // Register the hello world command (keeping for backward compat)
   const helloWorldDisposable = vscode.commands.registerCommand(
@@ -84,7 +94,7 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(viewDisclaimerDisposable);
 
   // Tasks tree view + status bar: persistent visibility of workflow progress
-  const taskTreeProvider = new TaskTreeProvider(inventory);
+  const taskTreeProvider = new TaskTreeProvider(inventory, currentTaskStore);
   const tasksTreeView = vscode.window.createTreeView(TASKS_VIEW_ID, {
     treeDataProvider: taskTreeProvider,
     showCollapseAll: false,

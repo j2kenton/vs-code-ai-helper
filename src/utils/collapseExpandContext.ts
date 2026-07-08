@@ -3,15 +3,25 @@
  * No vscode imports - testable under node:test.
  */
 
-export type ExpansionMode = 'autoFirstActive' | 'allCollapsed';
+export type ExpansionMode = 'autoFirstActive' | 'allCollapsed' | 'allExpanded';
 
 /**
  * Compute whether the tasks view should show the "all collapsed" state.
- * Returns true only when in collapsed mode with at least one task present.
+ * Returns true when we want to show the "expand" button (currently collapsed),
+ * and false when we want to show the "collapse" button (currently expanded).
  */
 export function computeCollapseExpandContext(
   mode: ExpansionMode,
   taskCount: number
 ): boolean {
-  return mode === 'allCollapsed' && taskCount > 0;
+  // allCollapsed mode: show expand button (return true)
+  if (mode === 'allCollapsed') {
+    return taskCount > 0;
+  }
+  // allExpanded mode: show collapse button (return false)
+  if (mode === 'allExpanded') {
+    return false;
+  }
+  // autoFirstActive mode: first active is expanded, so show collapse button (return false)
+  return false;
 }

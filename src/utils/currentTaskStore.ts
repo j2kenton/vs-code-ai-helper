@@ -12,6 +12,9 @@ const CURRENT_TASK_KEY = "vs-code-ai-helper.currentTaskCanonicalId";
  * which is stable and unambiguous even when multiple roots are configured.
  */
 export class CurrentTaskStore {
+  private readonly _onDidChange = new vscode.EventEmitter<void>();
+  readonly onDidChange = this._onDidChange.event;
+
   constructor(private readonly workspaceState: vscode.Memento) {}
 
   /**
@@ -27,6 +30,7 @@ export class CurrentTaskStore {
    */
   async set(canonicalId: string): Promise<void> {
     await this.workspaceState.update(CURRENT_TASK_KEY, canonicalId);
+    this._onDidChange.fire();
   }
 
   /**
@@ -34,5 +38,6 @@ export class CurrentTaskStore {
    */
   async clear(): Promise<void> {
     await this.workspaceState.update(CURRENT_TASK_KEY, undefined);
+    this._onDidChange.fire();
   }
 }

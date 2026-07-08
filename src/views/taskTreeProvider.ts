@@ -18,6 +18,7 @@ import { resolveImplementationArtifact } from "../utils/implementationArtifactRe
 import { getLowLevelPlanUri } from "../utils/lowLevelPlanArtifactResolver";
 import { parseReadiness } from "../utils/reviewReadiness";
 import { TaskInventory, TaskWithProgress } from "../state/taskInventory";
+import { CurrentTaskStore } from "../utils/currentTaskStore";
 
 /**
  * The view ID for the tasks tree view (must match package.json)
@@ -88,7 +89,8 @@ function toIncompleteTask(t: TaskWithProgress): IncompleteTask {
 export class TaskNode extends vscode.TreeItem {
   constructor(
     public readonly task: IncompleteTask,
-    expanded: boolean
+    expanded: boolean,
+    isCurrent: boolean = false
   ) {
     super(
       task.folderName,
@@ -120,6 +122,11 @@ export class TaskNode extends vscode.TreeItem {
         "play-circle",
         new vscode.ThemeColor("charts.blue")
       );
+    }
+
+    // Highlight current task
+    if (isCurrent) {
+      this.resourceUri = vscode.Uri.parse(`current-task:${task.folderName}`);
     }
 
     this.tooltip = buildTaskTooltip(task);
@@ -301,14 +308,19 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
 
   // Collapse/expand state management
   private mode: ExpansionMode = 'autoFirstActive';
-  private rootRenderVersion: number = 0;
   private lastLoadedTaskCount: number = 0;
-  private refreshInProgress: boolean = false;
-  private pendingModeSwitch: ExpansionMode | null = null;
 
-  constructor(private readonly inventory: TaskInventory) {
+  constructor(
+    private readonly inventory: TaskInventory,
+    private readonly currentTaskStore?: CurrentTaskStore
+  ) {
     // When the shared inventory changes, refresh the tree automatically
     this.inventory.onDidChange(() => this._onDidChangeTreeData.fire());
+
+    // Subscribe to current-task changes and refresh the tree
+    if (currentTaskStore) {
+      currentTaskStore.onDidChange(() => this._onDidChangeTreeData.fire());
+    }
   }
 
   /**
@@ -322,54 +334,28 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
 
   /** Collapse all task rows by switching to collapsed mode */
   collapseAll(): void {
-    try {
-      this.mode = 'allCollapsed';
-      this.rootRenderVersion++;
-      this.refresh();
-    } catch (error) {
-      console.error('Failed to collapse tasks:', error);
-      this.mode = 'autoFirstActive';
-      this.syncCollapseExpandContext();
-      void vscode.window.showErrorMessage(
-        `Failed to load tasks: ${error instanceof Error ? error.message : String(error)}`
-      );
-    }
+    this.mode = 'allCollapsed';
+    this.syncCollapseExpandContext();
+    this._onDidChangeTreeData.fire();
   }
 
-  /** Expand all task rows by switching to auto-expand mode */
+  /** Expand all task rows by switching to all-expanded mode */
   async expandAll(treeView: vscode.TreeView<TaskTreeNode>): Promise<void> {
-    try {
-      this.mode = 'autoFirstActive';
-      this.rootRenderVersion++;
+    this.mode = 'allExpanded';
+    this.syncCollapseExpandContext();
+    this._onDidChangeTreeData.fire();
 
-      this._onDidChangeTreeData.fire();
-      const nodes = this.getTaskNodes();
-
-      for (const node of nodes) {
+    // Force reveal all nodes to ensure they are expanded
+    const nodes = this.getTaskNodes();
+    for (const node of nodes) {
+      try {
         await treeView.reveal(node, {
           expand: true,
           focus: false,
           select: false,
         });
-      }
-    } catch (error) {
-      console.error('Failed to expand tasks:', error);
-      this.mode = 'allCollapsed';
-      this.syncCollapseExpandContext();
-      void vscode.window.showErrorMessage(
-        `Failed to load tasks: ${error instanceof Error ? error.message : String(error)}`
-      );
-    }
-  }
-
-  /** Handle manual expand of a task node */
-  handleManualExpand(): void {
-    if (this.mode === 'allCollapsed') {
-      if (this.refreshInProgress) {
-        this.pendingModeSwitch = 'autoFirstActive';
-      } else {
-        this.mode = 'autoFirstActive';
-        this.syncCollapseExpandContext();
+      } catch {
+        // Ignore reveal failures (node may not be visible yet)
       }
     }
   }
@@ -396,7 +382,6 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
   }
 
   private loadTasks(): IncompleteTask[] {
-    this.refreshInProgress = true;
     try {
       // Use the shared inventory as the source of truth
       const inventoryTasks = this.inventory.getTasks();
@@ -416,20 +401,15 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
       );
 
       this.lastLoadedTaskCount = tasks.length;
+      this.syncCollapseExpandContext();
       this._onDidLoadTasks.fire(tasks);
       return tasks;
     } catch (error) {
       console.error('Failed to load tasks:', error);
       this.lastLoadedTaskCount = 0;
+      this.syncCollapseExpandContext();
       this._onDidLoadTasks.fire([]);
       throw error;
-    } finally {
-      this.refreshInProgress = false;
-      if (this.pendingModeSwitch !== null) {
-        this.mode = this.pendingModeSwitch;
-        this.pendingModeSwitch = null;
-      }
-      this.syncCollapseExpandContext();
     }
   }
 
@@ -456,12 +436,25 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
       (t) => t.progress.currentStage === "completed"
     );
 
-    const shouldAutoExpand = (index: number): boolean =>
-      this.mode === 'autoFirstActive' && index === 0 && active.length > 0;
+    const shouldExpand = (index: number): boolean => {
+      if (this.mode === 'allExpanded') {
+        return true;
+      }
+      if (this.mode === 'allCollapsed') {
+        return false;
+      }
+      // autoFirstActive mode
+      return index === 0 && active.length > 0;
+    };
+
+    // Get current task ID
+    const currentTaskCanonicalId = this.currentTaskStore?.get();
 
     const nodes = [...active, ...completed].map(
-      (task, index) =>
-        new TaskNode(task, shouldAutoExpand(index))
+      (task, index) => {
+        const isCurrent = currentTaskCanonicalId === task.folderUri.fsPath;
+        return new TaskNode(task, shouldExpand(index), isCurrent);
+      }
     );
     this.taskNodesByFolder.clear();
     for (const node of nodes) {

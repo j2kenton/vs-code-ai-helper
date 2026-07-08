@@ -3,9 +3,41 @@ import * as path from "path";
 import { spawn } from "child_process";
 import { TaskInventory } from "../state/taskInventory";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
-import { TASK_FILENAME } from "../types/taskProgress";
+import { TASK_FILENAME, STAGE_DISPLAY_NAMES } from "../types/taskProgress";
 import { resolveImplementationArtifact } from "../utils/implementationArtifactResolver";
 import { getLowLevelPlanUri } from "../utils/lowLevelPlanArtifactResolver";
+import { IncompleteTask } from "../utils/taskProgressUtils";
+
+/**
+ * Accepted argument shapes for commitAndPushTask.
+ * - Tree-view task node passes { task: IncompleteTask }
+ * - Resolver-aware callers pass { canonicalId?, taskFolderPath? }
+ */
+type CommitAndPushTaskArg =
+  | { task?: IncompleteTask }
+  | { canonicalId?: string; taskFolderPath?: string };
+
+/**
+ * Normalize a command argument into the shape resolveTaskContext expects.
+ */
+function normalizeArg(node: CommitAndPushTaskArg | undefined): {
+  canonicalId?: string;
+  taskFolderPath?: string;
+} | undefined {
+  if (!node) {
+    return undefined;
+  }
+
+  if ("task" in node && node.task) {
+    return { taskFolderPath: node.task.folderUri.fsPath };
+  }
+
+  const n = node as { canonicalId?: string; taskFolderPath?: string };
+  const hasExplicit = !!(n.canonicalId || n.taskFolderPath);
+  return hasExplicit
+    ? { canonicalId: n.canonicalId, taskFolderPath: n.taskFolderPath }
+    : undefined;
+}
 
 function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -46,6 +78,34 @@ function renderPath(repoRelativePath: string): string {
     return repoRelativePath;
   }
   return json;
+}
+
+/**
+ * Check if a file path is inside a folder.
+ * Uses proper path boundary checking to avoid false positives.
+ * Case normalization is applied on Windows only for drive-letter compatibility.
+ */
+function isFileInFolder(filePath: string, folderPath: string): boolean {
+  // Normalize separators first
+  const normalizedFilePath = filePath.replace(/\\/g, "/");
+  const normalizedFolderPath = folderPath.replace(/\\/g, "/");
+
+  // Apply case normalization on Windows only
+  const isCaseSensitive = process.platform !== "win32";
+  const compareFilePath = isCaseSensitive
+    ? normalizedFilePath
+    : normalizedFilePath.toLowerCase();
+  const compareFolderPath = isCaseSensitive
+    ? normalizedFolderPath
+    : normalizedFolderPath.toLowerCase();
+
+  // Ensure folder path ends with separator for boundary-safe comparison
+  const folderPathWithSeparator = compareFolderPath.endsWith("/")
+    ? compareFolderPath
+    : compareFolderPath + "/";
+
+  return compareFilePath.startsWith(folderPathWithSeparator) ||
+         compareFilePath === compareFolderPath;
 }
 
 /**
@@ -440,10 +500,10 @@ async function saveDirtyDocuments(
     }
     // In task-folder-only mode: only save files inside the task folder
     if (!includeAll) {
-      return doc.uri.fsPath.startsWith(taskFolderPath);
+      return isFileInFolder(doc.uri.fsPath, taskFolderPath);
     }
     // In include-all mode: also include dirty files inside the repo
-    return doc.uri.fsPath.startsWith(repoRoot);
+    return isFileInFolder(doc.uri.fsPath, repoRoot);
   });
 
   for (const doc of dirtyDocs) {
@@ -523,22 +583,25 @@ async function describePushDestination(
  */
 export async function commitAndPushTask(
   inventory: TaskInventory,
-  explicitArg?: { canonicalId?: string; taskFolderPath?: string }
+  explicitArg?: CommitAndPushTaskArg
 ): Promise<void> {
-  const resolvedTask = await resolveTaskContext(inventory, explicitArg, {
-    allowPaused: false,
+  const resolverArg = normalizeArg(explicitArg);
+
+  const resolvedTask = await resolveTaskContext(inventory, resolverArg, {
+    allowPaused: true,
   });
 
   if (!resolvedTask) {
     void vscode.window.showInformationMessage(
-      "No completed tasks to commit and push."
+      "No task found to commit and push."
     );
     return;
   }
 
+  // Allow committing from completed stage only
   if (resolvedTask.progress.currentStage !== "completed") {
-    void vscode.window.showInformationMessage(
-      "Task must be completed before committing and pushing."
+    void vscode.window.showWarningMessage(
+      `Task is at stage "${STAGE_DISPLAY_NAMES[resolvedTask.progress.currentStage]}" — must be completed before committing and pushing.`
     );
     return;
   }
@@ -812,13 +875,14 @@ export async function commitAndPushTask(
             // Include-all mode: stage everything in the repo
             await runGitCommand(repoRoot, "add", ["-A", "--", "."]);
           } else {
-            // Default mode: stage only the task folder
-            // This is safer and avoids accidentally staging unrelated changes.
-            await runGitCommand(repoRoot, "add", [
-              "-A",
-              "--",
-              resolvedTask.taskFolderPath,
-            ]);
+            // Default mode: stage only files from scopedFiles (excludes run artifacts)
+            // We need to stage each file individually to exclude run artifacts.
+            if (scopedFiles.length > 0) {
+              await runGitCommand(repoRoot, "add", [
+                "--",
+                ...scopedFiles,
+              ]);
+            }
           }
 
           // Commit
@@ -873,7 +937,7 @@ export function registerCommitAndPushTaskCommand(
 ): void {
   const disposable = vscode.commands.registerCommand(
     "vs-code-ai-helper.commitAndPushTask",
-    (arg?: { canonicalId?: string; taskFolderPath?: string }) =>
+    (arg?: CommitAndPushTaskArg) =>
       commitAndPushTask(inventory, arg)
   );
   context.subscriptions.push(disposable);
