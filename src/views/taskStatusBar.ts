@@ -42,7 +42,7 @@ export class TaskStatusBar implements vscode.Disposable {
     };
     this.item.tooltip = new vscode.MarkdownString(
       [
-        `**AI Helper — active task**`,
+        `**Ensemble — active task**`,
         "",
         `Task: \`${active.folderName}\``,
         `Stage: **${STAGE_DISPLAY_NAMES[stage]}** (step ${stepNumber} of ${totalSteps})`,

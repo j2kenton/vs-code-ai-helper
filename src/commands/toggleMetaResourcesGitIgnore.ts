@@ -55,7 +55,7 @@ export async function toggleMetaResourcesGitIgnore(): Promise<void> {
   if (!normalizedPath) {
     void vscode.window.showErrorMessage(
       `Cannot add meta resources path to .gitignore: "${metaResourcesPath}" is not a valid relative path. ` +
-      `Please configure a safe relative path in the AI Helper settings.`
+      `Please configure a safe relative path in the Ensemble settings.`
     );
     return;
   }
@@ -130,7 +130,7 @@ export async function toggleMetaResourcesGitIgnore(): Promise<void> {
 
     const lines = content.split(/\r?\n/);
     const metaResourcesEntry = `/${gitignorePath}`;
-    const commentEntry = `# AI Helper meta resources`;
+    const commentEntry = `# Ensemble meta resources`;
 
     // Check if already in gitignore
     const hasEntry = lines.some((line) => line.trim() === metaResourcesEntry);

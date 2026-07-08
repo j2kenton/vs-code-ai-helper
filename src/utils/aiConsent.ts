@@ -49,7 +49,7 @@ export async function ensureAiConsent(
   while (promptAgain) {
     const choice = await vscode.window.showWarningMessage(
       [
-        "⚠️  VS Code AI Helper — Before you continue",
+        "⚠️  Ensemble — Before you continue",
         "",
         "AI commands consume real quota/money from your AI subscription.",
         "AI implementation runs can edit or delete files in your workspace.",

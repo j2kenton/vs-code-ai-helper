@@ -288,7 +288,7 @@ async function tryReadReadiness(
 }
 
 /**
- * Tree data provider for the AI Helper tasks view. Shows every task in the
+ * Tree data provider for the Ensemble tasks view. Shows every task in the
  * meta resources folder with a per-stage checklist (done / current /
  * outstanding), so workflow progress is always visible at a glance.
  *

@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to VS Code AI Helper are documented here.
+All notable changes to Ensemble (formerly VS Code AI Helper) are documented here.
 
 ## [Unreleased] — Safety Round 2: Consent Gate, Data Minimization & Commit Scoping
 
@@ -9,7 +9,7 @@ All notable changes to VS Code AI Helper are documented here.
 - **`src/legal/disclaimerVersion.ts`** — Single canonical source for `DISCLAIMER_VERSION = 1`. The consent storage key (`aiHelper.consent.v1`) is derived from this value; bumping it re-prompts users. A unit test should assert this matches the `Version:` line in `DISCLAIMER.md`.
 - **`src/utils/aiConsent.ts`** — `ensureAiConsent(context)` helper: shows a modal on first use per workspace per version summarising token cost risk, file-edit risk, and data transmission, with a "View Disclaimer" button. Consent is stored in `workspaceState` as a structured record `{ acceptedAt, version }`. Returns `true` when consent is already given or just given; `false` when the user declines (callers abort the AI action immediately).
 - **`src/utils/contextEligibility.ts`** — Canonical constants (`CONTEXT_PER_FILE_MAX_BYTES = 100_000`, `CONTEXT_MAX_FILES = 20`, `CONTEXT_TOTAL_MAX_BYTES = 400_000`, `CONTEXT_CONFIRM_THRESHOLD_BYTES = 150_000`, `PROMPT_TOTAL_MAX_BYTES = 600_000`) and the secret-filename denylist (`isDenylisted`). Consumed by `contextPack.ts` so rules are expressed once.
-- **`src/commands/commitAndPushTask.ts`** — "AI Helper: Commit Preview" output channel (lazily-created singleton). `renderPath` helper uses JSON-string-escaping for lossless display of filenames containing spaces, quotes, backslashes, and newlines. "View Full List" button in the confirm dialog opens the channel with the full parsed file list including skipped-artifact markers, then returns (user re-invokes to proceed). Default staging scope is now **task folder only** (not entire repo). Run artifacts (`runs/`, `context-pack.md`) are **excluded from the default staged set** and marked `(run artifact — contains AI prompts)` in the preview. Detached-HEAD and multiple-remotes/no-remote states now abort with a clear message before any dialog. `saveDirtyDocuments` scoped to match the staging scope.
+- **`src/commands/commitAndPushTask.ts`** — "Ensemble: Commit Preview" output channel (lazily-created singleton). `renderPath` helper uses JSON-string-escaping for lossless display of filenames containing spaces, quotes, backslashes, and newlines. "View Full List" button in the confirm dialog opens the channel with the full parsed file list including skipped-artifact markers, then returns (user re-invokes to proceed). Default staging scope is now **task folder only** (not entire repo). Run artifacts (`runs/`, `context-pack.md`) are **excluded from the default staged set** and marked `(run artifact — contains AI prompts)` in the preview. Detached-HEAD and multiple-remotes/no-remote states now abort with a clear message before any dialog. `saveDirtyDocuments` scoped to match the staging scope.
 
 ### Changed
 

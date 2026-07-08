@@ -1,6 +1,6 @@
 {
   "name": "vs-code-ai-helper",
-  "displayName": "VS Code AI Helper",
+  "displayName": "Ensemble",
   "description": "AI-assisted task planning and implementation workflow for VS Code. Uses your existing AI subscriptions (Copilot, Claude, Codex, Gemini) — real usage costs apply. AI runs can modify workspace files. Provided as-is with no warranty. See README and DISCLAIMER.md.",
   "version": "0.12.1",
   "publisher": "j2kenton",
@@ -23,15 +23,15 @@
     "commands": [
       {
         "command": "vs-code-ai-helper.helloWorld",
-        "title": "AI Helper: Hello World"
+        "title": "Ensemble: Hello World"
       },
       {
         "command": "vs-code-ai-helper.selectMetaFolder",
-        "title": "AI Helper: Select Meta Resources Folder"
+        "title": "Ensemble: Select Meta Resources Folder"
       },
       {
         "command": "vs-code-ai-helper.startNewTask",
-        "title": "AI Helper: Start New Task",
+        "title": "Ensemble: Start New Task",
         "icon": "$(add)"
       },
       {
@@ -106,7 +106,7 @@
       },
       {
         "command": "vs-code-ai-helper.applyCurrentStageAction",
-        "title": "AI Helper: Apply Current Stage Action"
+        "title": "Ensemble: Apply Current Stage Action"
       },
       {
         "command": "vs-code-ai-helper.applyHighLevelReviewChanges",
@@ -125,7 +125,7 @@
       },
       {
         "command": "vs-code-ai-helper.viewDisclaimer",
-        "title": "AI Helper: View Disclaimer"
+        "title": "Ensemble: View Disclaimer"
       },
       {
         "command": "vs-code-ai-helper.expandAllTasks",
@@ -174,7 +174,7 @@
       "activitybar": [
         {
           "id": "ai-helper",
-          "title": "AI Helper",
+          "title": "Ensemble",
           "icon": "images/tasks-view.svg"
         }
       ]
@@ -185,7 +185,7 @@
           "id": "vs-code-ai-helper.tasksView",
           "name": "Tasks",
           "icon": "images/tasks-view.svg",
-          "contextualTitle": "AI Helper Tasks"
+          "contextualTitle": "Ensemble Tasks"
         }
       ]
     },
@@ -368,7 +368,7 @@
       ]
     },
     "configuration": {
-      "title": "VS Code AI Helper",
+      "title": "Ensemble",
       "properties": {
         "vs-code-ai-helper.metaResourcesPath": {
           "type": "string",
@@ -386,7 +386,7 @@
           "type": "object",
           "default": {},
           "scope": "resource",
-          "markdownDescription": "Workspace defaults for AI model IDs by workflow stage. Bare IDs are GitHub Copilot models; prefixed IDs (e.g. `claude-cli:sonnet`, `codex-cli:default`, `gemini-cli:gemini-2.5-pro`) run through the vendor's subscription CLI. Configure via **AI Helper: Configure AI Models per Step**.",
+          "markdownDescription": "Workspace defaults for AI model IDs by workflow stage. Bare IDs are GitHub Copilot models; prefixed IDs (e.g. `claude-cli:sonnet`, `codex-cli:default`, `gemini-cli:gemini-2.5-pro`) run through the vendor's subscription CLI. Configure via **Ensemble: Configure AI Models per Step**.",
           "additionalProperties": {
             "type": "string"
           }

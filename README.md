@@ -1,6 +1,6 @@
-# VS Code AI Helper
+# Ensemble
 
-VS Code AI Helper turns ad-hoc "let's plan this out" conversations into a repeatable, file-based workflow. Every task gets its own dated folder and moves through a fixed pipeline — task description, plan, high- and low-level plan reviews, final plan, implementation checklist, and high- and low-level implementation reviews — with every artifact written by hand or generated with an AI subscription you already have — GitHub Copilot, Claude (Anthropic), ChatGPT/Codex (OpenAI), or Gemini (Google) — no API key required.
+Ensemble turns ad-hoc "let's plan this out" conversations into a repeatable, file-based workflow. Every task gets its own dated folder and moves through a fixed pipeline — task description, plan, high- and low-level plan reviews, final plan, implementation checklist, and high- and low-level implementation reviews — with every artifact written by hand or generated with an AI subscription you already have — GitHub Copilot, Claude (Anthropic), ChatGPT/Codex (OpenAI), or Gemini (Google) — no API key required.
 
 The pipeline:
 
@@ -15,7 +15,7 @@ Task Created → Plan → Plan: High-Level Review → Plan: Low-Level Review
 
 > **This section is a legally-relevant disclosure. Read it before using any feature of this extension.**
 > Full details are in [`DISCLAIMER.md`](DISCLAIMER.md).
-> Use `AI Helper: View Disclaimer` from the Command Palette to read it inside VS Code.
+> Use `Ensemble: View Disclaimer` from the Command Palette to read it inside VS Code.
 
 ### This Extension Is Provided With Absolutely No Warranty
 
@@ -108,25 +108,25 @@ Install from the Visual Studio Marketplace:
 
 ## AI Providers
 
-The per-step model picker (`AI Helper: Configure AI Models per Step`) lists every model it can find: GitHub Copilot models via VS Code's Language Model API, plus the models of each vendor CLI that is installed. Selections are stored as plain IDs — bare IDs are Copilot models; prefixed IDs run through a CLI (e.g. `claude-cli:sonnet`, `codex-cli:default`, `gemini-cli:gemini-2.5-pro`). You can mix providers per step — e.g. plan with Claude Opus, review with Gemini, implement with Copilot.
+The per-step model picker (`Ensemble: Configure AI Models per Step`) lists every model it can find: GitHub Copilot models via VS Code's Language Model API, plus the models of each vendor CLI that is installed. Selections are stored as plain IDs — bare IDs are Copilot models; prefixed IDs run through a CLI (e.g. `claude-cli:sonnet`, `codex-cli:default`, `gemini-cli:gemini-2.5-pro`). You can mix providers per step — e.g. plan with Claude Opus, review with Gemini, implement with Copilot.
 
 For plan and review steps, CLIs run read-only and their answer is written to the task artifact. For implementation steps they run agentically with file-edit permissions in your workspace (Claude uses `acceptEdits`, Codex a workspace-write sandbox, Gemini `auto_edit`); the files they change are detected via git status and used as the implementation-review scope, exactly like Copilot runs.
 
 ## Quick Start
 
-1. **Point the extension at a folder.** Run `AI Helper: Select Meta Resources Folder` from the Command Palette (`Ctrl+Shift+P` / `Cmd+Shift+P`) and choose a folder inside your workspace (e.g. `.ai-helper/` or `docs/tasks/`). This is where all task folders will be created.
-2. **Start a task.** Run `AI Helper: Start New Task`. This creates a folder named `YYYY-MM-DD_task_N` (numbered per day) and opens `task.md` for you to describe what you want done — the goal, scope, and any constraints.
-3. **Get a plan.** Either write `plan.md` yourself, or run `AI Helper: Generate Plan with AI` to have Copilot draft it from your `task.md` and currently open editors in the workspace.
-4. **High-level review.** Run `AI Helper: Run Review with AI` (or write `plan-high-review.md` yourself) to critique the plan's overall approach and scope. While on a review stage you have four actions — in the Tasks view they're buttons on the task row:
+1. **Point the extension at a folder.** Run `Ensemble: Select Meta Resources Folder` from the Command Palette (`Ctrl+Shift+P` / `Cmd+Shift+P`) and choose a folder inside your workspace (e.g. `.ai-helper/` or `docs/tasks/`). This is where all task folders will be created.
+2. **Start a task.** Run `Ensemble: Start New Task`. This creates a folder named `YYYY-MM-DD_task_N` (numbered per day) and opens `task.md` for you to describe what you want done — the goal, scope, and any constraints.
+3. **Get a plan.** Either write `plan.md` yourself, or run `Ensemble: Generate Plan with AI` to have Copilot draft it from your `task.md` and currently open editors in the workspace.
+4. **High-level review.** Run `Ensemble: Run Review with AI` (or write `plan-high-review.md` yourself) to critique the plan's overall approach and scope. While on a review stage you have four actions — in the Tasks view they're buttons on the task row:
    - **View Review** — open the review file.
    - **Run / Re-run Review with AI** — (re)generate the review.
    - **Apply Review with AI** — Copilot rewrites `plan.md` in place, addressing the review. Re-run the review afterwards if you want another pass.
    - **Next Stage** — happy with the plan? Move on.
 5. **Low-level review.** Same actions, but the review (`plan-low-review.md`) critiques the details: step ordering, named files, edge cases, verifiable acceptance criteria.
 6. **Finalize.** `Next Stage` from the low-level review offers to promote the current plan to `plan-final.md`. Promoting is always a deliberate, human step — no command auto-approves a plan.
-7. **Implement.** Run `AI Helper: Generate Implementation Checklist with AI` to turn `plan-final.md` into `implementation.md` — a concrete `- [ ]` checklist. Do the work.
+7. **Implement.** Run `Ensemble: Generate Implementation Checklist with AI` to turn `plan-final.md` into `implementation.md` — a concrete `- [ ]` checklist. Do the work.
 8. **Implementation reviews.** Run the high-level then low-level implementation reviews: Copilot receives the final plan, the checklist, and the **contents of the files changed during the AI implementation run** (or the currently open editors if the task was implemented manually — the extension will warn you). If a changed file is open with unsaved edits, the unsaved buffer is used in place of the on-disk copy. Files that are too large may be truncated; the context pack notes any truncation or omission explicitly. Apply a review to update the checklist's checkboxes and notes in place. When the low-level review is clean, `Next Stage` marks the task completed.
-9. **Come back later.** If you stop partway through (or just close VS Code), run `AI Helper: Resume Task` (or click the task in the Tasks view) — it shows the actions relevant to the task's current stage, using `task-progress.json` to know where you are.
+9. **Come back later.** If you stop partway through (or just close VS Code), run `Ensemble: Resume Task` (or click the task in the Tasks view) — it shows the actions relevant to the task's current stage, using `task-progress.json` to know where you are.
 
 Tasks created with versions before 0.6.0 still work: old stage names are migrated automatically, and a legacy `plan-updated.md` is treated as the current plan until the first in-place update writes `plan.md`.
 
@@ -134,7 +134,7 @@ Everything the extension writes is a plain Markdown or JSON file in your task fo
 
 ## Tasks View
 
-Click the AI Helper icon in the Activity Bar to open the **Tasks** view — a persistent, always-up-to-date checklist of where every task stands, so you don't have to re-run a command just to check progress:
+Click the Ensemble icon in the Activity Bar to open the **Tasks** view — a persistent, always-up-to-date checklist of where every task stands, so you don't have to re-run a command just to check progress:
 
 - Each task shows its current stage and step count (e.g. `Plan: High-Level Review · step 3 of 9`) directly in the tree.
 - Expand a task to see all 9 workflow stages, each marked done ✓, current →, or outstanding ○. Click a stage to open its artifact file directly (if it's been created).
@@ -148,19 +148,19 @@ A matching status bar item (bottom-left) always shows your most recently active 
 
 | Command | What it does |
 | --- | --- |
-| `AI Helper: Select Meta Resources Folder` | Choose where task folders are stored for this workspace. Run this once per workspace before anything else. |
-| `AI Helper: Start New Task` | Creates a new `YYYY-MM-DD_task_N` folder with progress tracking and opens `task.md`. From there, use the Tasks view or `Resume Task` for the per-stage actions. |
-| `AI Helper: Resume Task` | Shows the actions relevant to a task's current stage — open the artifact, run/apply reviews, advance — instead of a forced wizard. |
-| `AI Helper: Generate Plan with AI` | Uses your Copilot access to draft `plan.md` from `task.md` and a generated `context-pack.md`. Only offered before later-stage work exists, so it can't clobber it. |
-| `AI Helper: Run Review with AI` | Runs the review for wherever the task is: from `plan`/`implementation` it starts the high-level review (and advances the stage); from a review stage it (re)generates that stage's review. Implementation reviews use the files changed during the AI implementation run as the review scope; if no tracked file set exists (manual implementation), they fall back to open editors with a warning. |
-| `AI Helper: View Review` | Opens the current stage's review file; offers to run the review if it doesn't exist yet. |
-| `AI Helper: Apply Review with AI` | For plan reviews, Copilot rewrites `plan.md` **in place**, addressing the review. For implementation reviews, Copilot re-runs the AI implementation against the codebase to fix the flagged code, then rewrites `implementation.md` with a summary. Asks for confirmation first. |
-| `AI Helper: Next Stage` | Advances the task one stage, with confirmation. Entering Final Plan offers to promote the current plan to `plan-final.md`; entering Completed asks explicitly. |
-| `AI Helper: Generate Implementation Checklist with AI` | Turns `plan-final.md` into `implementation.md`, a concrete `- [ ]` checklist with a Verification section. |
-| `AI Helper: Set Task Stage` | Manually set which stage a task is tracked at, moving it backward or forward. Only changes `task-progress.json` — it doesn't touch or delete any artifact files. |
-| `AI Helper: Refresh Tasks View` | Manually refresh the Tasks sidebar (it also refreshes automatically on its own). |
-| `AI Helper: View Disclaimer` | Open `DISCLAIMER.md` in the VS Code markdown preview. |
-| `AI Helper: Hello World` | Sanity-check command confirming the extension is active. |
+| `Ensemble: Select Meta Resources Folder` | Choose where task folders are stored for this workspace. Run this once per workspace before anything else. |
+| `Ensemble: Start New Task` | Creates a new `YYYY-MM-DD_task_N` folder with progress tracking and opens `task.md`. From there, use the Tasks view or `Resume Task` for the per-stage actions. |
+| `Ensemble: Resume Task` | Shows the actions relevant to a task's current stage — open the artifact, run/apply reviews, advance — instead of a forced wizard. |
+| `Ensemble: Generate Plan with AI` | Uses your Copilot access to draft `plan.md` from `task.md` and a generated `context-pack.md`. Only offered before later-stage work exists, so it can't clobber it. |
+| `Ensemble: Run Review with AI` | Runs the review for wherever the task is: from `plan`/`implementation` it starts the high-level review (and advances the stage); from a review stage it (re)generates that stage's review. Implementation reviews use the files changed during the AI implementation run as the review scope; if no tracked file set exists (manual implementation), they fall back to open editors with a warning. |
+| `Ensemble: View Review` | Opens the current stage's review file; offers to run the review if it doesn't exist yet. |
+| `Ensemble: Apply Review with AI` | For plan reviews, Copilot rewrites `plan.md` **in place**, addressing the review. For implementation reviews, Copilot re-runs the AI implementation against the codebase to fix the flagged code, then rewrites `implementation.md` with a summary. Asks for confirmation first. |
+| `Ensemble: Next Stage` | Advances the task one stage, with confirmation. Entering Final Plan offers to promote the current plan to `plan-final.md`; entering Completed asks explicitly. |
+| `Ensemble: Generate Implementation Checklist with AI` | Turns `plan-final.md` into `implementation.md`, a concrete `- [ ]` checklist with a Verification section. |
+| `Ensemble: Set Task Stage` | Manually set which stage a task is tracked at, moving it backward or forward. Only changes `task-progress.json` — it doesn't touch or delete any artifact files. |
+| `Ensemble: Refresh Tasks View` | Manually refresh the Tasks sidebar (it also refreshes automatically on its own). |
+| `Ensemble: View Disclaimer` | Open `DISCLAIMER.md` in the VS Code markdown preview. |
+| `Ensemble: Hello World` | Sanity-check command confirming the extension is active. |
 
 Every "with AI" command asks for confirmation before overwriting an existing artifact, is only offered when the task is at a stage the action applies to, and falls back with a clear message (no crash, no silent failure) if the selected provider isn't signed in, isn't installed, has no available model, or you're out of quota. Every AI action has a manual counterpart — the workflow never requires an AI provider. Promoting a plan to `plan-final.md` and marking a task completed are intentionally explicit, human steps.
 
@@ -190,14 +190,14 @@ YYYY-MM-DD_task_N/
 
 | Setting | Description |
 | --- | --- |
-| `vs-code-ai-helper.metaResourcesPath` | Workspace-relative path where task folders are stored. Set via `AI Helper: Select Meta Resources Folder`. |
+| `vs-code-ai-helper.metaResourcesPath` | Workspace-relative path where task folders are stored. Set via `Ensemble: Select Meta Resources Folder`. |
 | `vs-code-ai-helper.promptDismissed` | When `true`, suppresses the one-time activation prompt asking you to configure a folder. |
 
 ## Screenshots
 
 | Command Palette | Task Planning |
 | --- | --- |
-| ![AI Helper commands in the Command Palette](images/screenshots/screenshot-1.jpeg) | ![Task planning prompt](images/screenshots/screenshot-2.jpeg) |
+| ![Ensemble commands in the Command Palette](images/screenshots/screenshot-1.jpeg) | ![Task planning prompt](images/screenshots/screenshot-2.jpeg) |
 
 ## Development
 
@@ -215,7 +215,7 @@ pnpm run compile
 
 1. Press `F5` to open a new VS Code window (the "Extension Development Host") with the extension loaded
 2. Open a folder as your workspace in that window
-3. Run `AI Helper: Select Meta Resources Folder`, then `AI Helper: Start New Task` from the Command Palette (`Ctrl+Shift+P`) to exercise the full workflow described in [Quick Start](#quick-start)
+3. Run `Ensemble: Select Meta Resources Folder`, then `Ensemble: Start New Task` from the Command Palette (`Ctrl+Shift+P`) to exercise the full workflow described in [Quick Start](#quick-start)
 
 ### Available Scripts
 

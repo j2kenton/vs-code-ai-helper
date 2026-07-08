@@ -130,7 +130,7 @@ export async function execCliAgent(options: {
   if (def.usesLastMessageFile) {
     lastMessageFile = nodePath.join(
       os.tmpdir(),
-      `ai-helper-${def.id}-${Date.now()}-${Math.random().toString(36).slice(2)}.md`
+      `vs-code-ai-helper-${def.id}-${Date.now()}-${Math.random().toString(36).slice(2)}.md`
     );
   }
 

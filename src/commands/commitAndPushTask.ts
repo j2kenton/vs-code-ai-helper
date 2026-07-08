@@ -47,13 +47,13 @@ function getErrorMessage(error: unknown): string {
  * Lazily-created singleton output channel used for the full file-list debug
  * surface in the commit-and-push flow. Cleared before each use.
  *
- * Name is pinned: "AI Helper: Commit Preview"
+ * Name is pinned: "Ensemble: Commit Preview"
  */
 let commitPreviewChannel: vscode.OutputChannel | undefined;
 function getCommitPreviewChannel(): vscode.OutputChannel {
   if (!commitPreviewChannel) {
     commitPreviewChannel = vscode.window.createOutputChannel(
-      "AI Helper: Commit Preview"
+      "Ensemble: Commit Preview"
     );
   }
   return commitPreviewChannel;
@@ -789,7 +789,7 @@ export async function commitAndPushTask(
           // the user can re-invoke the command after reviewing.
           const channel = getCommitPreviewChannel();
           channel.clear();
-          channel.appendLine("=== AI Helper: Commit Preview — Full File List ===");
+          channel.appendLine("=== Ensemble: Commit Preview — Full File List ===");
           channel.appendLine("");
           channel.appendLine(`Scope: ${scopeLabel}`);
           channel.appendLine(`Branch: ${currentBranch}`);
@@ -820,7 +820,7 @@ export async function commitAndPushTask(
           channel.appendLine("Run the command again to proceed after reviewing.");
           channel.show(true);
           void vscode.window.showInformationMessage(
-            "Full file list shown in 'AI Helper: Commit Preview'. Re-run the command to proceed."
+            "Full file list shown in 'Ensemble: Commit Preview'. Re-run the command to proceed."
           );
           return;
         }
@@ -887,7 +887,7 @@ export async function commitAndPushTask(
 
           // Commit
           progress.report({ message: "Creating commit..." });
-          const commitMessage = `AI Helper: ${resolvedTask.folderName}`;
+          const commitMessage = `Ensemble: ${resolvedTask.folderName}`;
           await runGitCommand(repoRoot, "commit", ["-m", commitMessage]);
 
           // Push with explicit destination

@@ -30,7 +30,7 @@ import { TASK_PROGRESS_FILENAME } from "./types/taskProgress";
  * This method is called when your extension is activated.
  */
 export function activate(context: vscode.ExtensionContext): void {
-  console.log("VS Code AI Helper is now active!");
+  console.log("Ensemble is now active!");
 
   // Create a single shared TaskInventory instance. All commands and the tree
   // provider use this same instance so discovery results are always consistent.
@@ -68,7 +68,7 @@ export function activate(context: vscode.ExtensionContext): void {
     "vs-code-ai-helper.helloWorld",
     () => {
       void vscode.window.showInformationMessage(
-        "Hello from VS Code AI Helper!"
+        "Hello from Ensemble!"
       );
     }
   );

@@ -26,7 +26,7 @@ export async function selectMetaFolder(): Promise<string | undefined> {
     canSelectMany: false,
     defaultUri: workspaceRoot.uri,
     openLabel: "Select Meta Resources Folder",
-    title: "Select folder for AI Helper meta resources",
+    title: "Select folder for Ensemble meta resources",
   });
 
   if (!selectedFolders || selectedFolders.length === 0) {
