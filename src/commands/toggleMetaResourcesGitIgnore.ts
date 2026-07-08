@@ -66,7 +66,7 @@ export async function toggleMetaResourcesGitIgnore(): Promise<void> {
   // Find the workspace folder containing the meta resources folder.
   // For single-root workspaces, this is always workspaceFolders[0].
   // For multi-root workspaces, check which workspace contains the meta resources folder.
-  let targetWorkspaceFolder = workspaceFolders[0];
+  let targetWorkspaceFolder: vscode.WorkspaceFolder | undefined = workspaceFolders[0];
 
   if (workspaceFolders.length > 1) {
     // Check if meta resources folder exists under any workspace
@@ -107,6 +107,11 @@ export async function toggleMetaResourcesGitIgnore(): Promise<void> {
     } else {
       targetWorkspaceFolder = foundFolder;
     }
+  }
+
+  if (!targetWorkspaceFolder) {
+    void vscode.window.showErrorMessage("Could not determine target workspace folder.");
+    return;
   }
 
   const workspaceRoot = targetWorkspaceFolder.uri.fsPath;
