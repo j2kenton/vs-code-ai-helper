@@ -136,12 +136,34 @@ export async function toggleMetaResourcesGitIgnore(): Promise<void> {
     const hasEntry = lines.some((line) => line.trim() === metaResourcesEntry);
 
     if (hasEntry) {
-      // Remove from gitignore
+      // Find the comment index to determine if we added a blank line
+      const commentIndex = lines.findIndex((line) => line.trim() === commentEntry);
+
+      // Remove our comment and entry lines
       const newLines = lines.filter(
         (line) =>
           line.trim() !== metaResourcesEntry && line.trim() !== commentEntry
       );
-      const newContent = newLines.join("\n");
+
+      // Conservative blank line removal: only remove a trailing blank line if:
+      // 1. We found our comment (commentIndex >= 0)
+      // 2. There was a blank line immediately before our comment (commentIndex > 0 && lines[commentIndex - 1] is blank)
+      // 3. Our section (blank + comment + entry) was at the very end of the file
+      // 4. After removal, that blank line is now trailing
+      if (
+        commentIndex >= 0 &&
+        commentIndex > 0 &&
+        lines[commentIndex - 1]?.trim() === "" &&
+        commentIndex + 2 === lines.length &&
+        newLines.length > 0 &&
+        newLines[newLines.length - 1]?.trim() === ""
+      ) {
+        // Our section was exactly: blank line + comment + entry at EOF
+        // Remove the single trailing blank line
+        newLines.pop();
+      }
+
+      const newContent = newLines.join("\n") + (newLines.length > 0 ? "\n" : "");
       await vscode.workspace.fs.writeFile(
         gitignoreUri,
         new TextEncoder().encode(newContent)

@@ -16,12 +16,20 @@ import { resolveModelForStage } from "../utils/modelSelection";
 import { TASK_FILENAME, TaskStage } from "../types/taskProgress";
 import { ensureAiConsent } from "../utils/aiConsent";
 import { checkAndConfirmPromptSize } from "../utils/promptSizeGuard";
+import { TaskInventory } from "../state/taskInventory";
 
 /**
  * Stages a task may be in for plan generation to be safe: either at the
  * task-description stage (first generation) or the plan stage (regeneration).
  */
 const ELIGIBLE_STAGES: readonly TaskStage[] = ["task-description", "plan"];
+
+/**
+ * Accepted argument shapes for generatePlanWithAI.
+ * - Legacy direct URI: vscode.Uri
+ * - Canonical ID resolver: { canonicalId?: string }
+ */
+type GeneratePlanArg = vscode.Uri | { canonicalId?: string };
 
 /**
  * Generate plan.md for a task folder using the user's Copilot access.
@@ -37,7 +45,8 @@ const ELIGIBLE_STAGES: readonly TaskStage[] = ["task-description", "plan"];
  */
 export async function generatePlanWithAI(
   context: vscode.ExtensionContext,
-  targetFolderUri?: vscode.Uri
+  inventory: TaskInventory,
+  arg?: GeneratePlanArg
 ): Promise<void> {
   const workspaceRoot = vscode.workspace.workspaceFolders?.[0];
   if (!workspaceRoot) {
@@ -53,9 +62,28 @@ export async function generatePlanWithAI(
     return;
   }
 
-  const taskFolderUri =
-    targetFolderUri ??
-    (await pickTaskFolder("Generate Plan with AI", ELIGIBLE_STAGES));
+  // Resolve argument: if it's a URI, use it directly; if it's an object with
+  // canonicalId, resolve via TaskInventory; otherwise prompt user
+  let taskFolderUri: vscode.Uri | undefined;
+
+  if (arg instanceof vscode.Uri) {
+    taskFolderUri = arg;
+  } else if (arg && typeof arg === "object" && "canonicalId" in arg && arg.canonicalId) {
+    // Resolve canonicalId to taskFolderUri via TaskInventory
+    const task = inventory.getTaskById(arg.canonicalId);
+    if (task) {
+      taskFolderUri = vscode.Uri.file(task.taskFolderPath);
+    } else {
+      void vscode.window.showErrorMessage(
+        `Task with ID "${arg.canonicalId}" not found.`
+      );
+      return;
+    }
+  } else {
+    // No arg provided, prompt user
+    taskFolderUri = await pickTaskFolder("Generate Plan with AI", ELIGIBLE_STAGES);
+  }
+
   if (!taskFolderUri) {
     return;
   }
@@ -189,12 +217,13 @@ export async function generatePlanWithAI(
  * Register the generatePlanWithAI command
  */
 export function registerGeneratePlanWithAICommand(
-  context: vscode.ExtensionContext
+  context: vscode.ExtensionContext,
+  inventory: TaskInventory
 ): void {
   const disposable = vscode.commands.registerCommand(
     "vs-code-ai-helper.generatePlanWithAI",
-    (targetFolderUri?: vscode.Uri) =>
-      generatePlanWithAI(context, targetFolderUri)
+    (arg?: GeneratePlanArg) =>
+      generatePlanWithAI(context, inventory, arg)
   );
   context.subscriptions.push(disposable);
 }

@@ -50,6 +50,13 @@ export async function applyCurrentStageAction(
     return;
   }
 
+  if (stage === "plan") {
+    await vscode.commands.executeCommand("vs-code-ai-helper.generatePlanWithAI", {
+      canonicalId: resolvedTask.canonicalId,
+    });
+    return;
+  }
+
   if (stage === "plan-high-review") {
     const artifactName = STAGE_ARTIFACT_FILENAMES["plan-high-review"];
     if (artifactName) {

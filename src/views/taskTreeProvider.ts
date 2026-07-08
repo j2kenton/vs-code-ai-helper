@@ -15,7 +15,6 @@ import {
 } from "../utils/collapseExpandContext";
 import { computeStageContext } from "../utils/stageContext";
 import { resolveImplementationArtifact } from "../utils/implementationArtifactResolver";
-import { getLowLevelPlanUri } from "../utils/lowLevelPlanArtifactResolver";
 import { parseReadiness } from "../utils/reviewReadiness";
 import { TaskInventory, TaskWithProgress } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
@@ -237,7 +236,8 @@ export function getStageNodeContextValue(
     switch (stage) {
       case "task-description":
         // Special case for the "task-description" stage.
-        return "stage-task-description";
+        contextValue = "stage-task-description-current";
+        break;
       case "plan":
         contextValue = "stage-plan-current";
         break;
@@ -333,7 +333,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
   }
 
   /** Collapse all task rows by switching to collapsed mode */
-  collapseAll(): void {
+  async collapseAll(): Promise<void> {
     this.mode = 'allCollapsed';
     this.syncCollapseExpandContext();
     this._onDidChangeTreeData.fire();
@@ -474,10 +474,6 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
 
       if (stage === "plan") {
         const candidate = await resolveCurrentPlanUri(task.folderUri);
-        artifactUri = (await statIfExists(candidate)) ? candidate : undefined;
-      } else if (stage === "plan-low-review") {
-        // Low-level plan stage opens plan-low.md
-        const candidate = getLowLevelPlanUri(task.folderUri);
         artifactUri = (await statIfExists(candidate)) ? candidate : undefined;
       } else if (stage === "implementation") {
         // Merged stage: prefer plan-final.md, fallback to implementation.md

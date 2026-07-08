@@ -46,7 +46,7 @@ export function activate(context: vscode.ExtensionContext): void {
   registerStartNewTaskCommand(context, inventory, currentTaskStore);
   registerResumeTaskCommand(context, inventory, currentTaskStore);
   // AI commands receive the full context so they can call ensureAiConsent
-  registerGeneratePlanWithAICommand(context);
+  registerGeneratePlanWithAICommand(context, inventory);
   registerReviewActionCommands(context);
   registerSetTaskStageCommand(context, inventory, currentTaskStore);
   registerConfigureStepModelsCommand(context);
