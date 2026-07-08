@@ -154,13 +154,23 @@ export async function scheduleTaskResume(
   );
 
   // Set up the timeout
-  setTimeout(async () => {
-    void vscode.window.showInformationMessage(
-      `Resuming task "${resolvedTask.folderName}"...`
-    );
-    await vscode.commands.executeCommand("vs-code-ai-helper.resumeTask", {
-      canonicalId: resolvedTask.canonicalId,
-    });
+  setTimeout(() => {
+    void (async (): Promise<void> => {
+      void vscode.window.showInformationMessage(
+        `Resuming task "${resolvedTask.folderName}"...`
+      );
+      try {
+        await vscode.commands.executeCommand("vs-code-ai-helper.resumeTask", {
+          canonicalId: resolvedTask.canonicalId,
+        });
+      } catch (error) {
+        const message =
+          error instanceof Error ? error.message : "Unknown error";
+        void vscode.window.showErrorMessage(
+          `Failed to resume task "${resolvedTask.folderName}": ${message}`
+        );
+      }
+    })();
   }, timeUntilResume);
 }
 
