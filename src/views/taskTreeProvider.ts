@@ -333,7 +333,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
   }
 
   /** Collapse all task rows by switching to collapsed mode */
-  async collapseAll(): Promise<void> {
+  collapseAll(): void {
     this.mode = 'allCollapsed';
     this.syncCollapseExpandContext();
     this._onDidChangeTreeData.fire();
