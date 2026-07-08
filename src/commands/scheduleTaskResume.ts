@@ -39,7 +39,7 @@ function normalizeArg(node: ScheduleTaskResumeArg | undefined): {
  */
 function parseTimeString(timeStr: string): Date | undefined {
   const match = /^(\d{1,2}):(\d{2})$/.exec(timeStr.trim());
-  if (!match) {
+  if (!match || typeof match[1] !== "string" || typeof match[2] !== "string") {
     return undefined;
   }
   const hours = parseInt(match[1], 10);
