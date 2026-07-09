@@ -160,28 +160,118 @@ void describe("getAvailableModels", () => {
             providerLabel: "OpenAI Codex (subscription CLI)",
           },
           {
-            id: "codex-cli:gpt-5.5",
-            name: "GPT-5.5",
+            id: "codex-cli:gpt-5.5@low",
+            name: "GPT-5.5 (Low)",
             providerLabel: "OpenAI Codex (subscription CLI)",
           },
           {
-            id: "codex-cli:gpt-5.6-terra",
-            name: "GPT-5.6-Terra",
+            id: "codex-cli:gpt-5.5@medium",
+            name: "GPT-5.5 (Medium)",
             providerLabel: "OpenAI Codex (subscription CLI)",
           },
           {
-            id: "codex-cli:gpt-5.6-luna",
-            name: "GPT-5.6-Luna",
+            id: "codex-cli:gpt-5.5@high",
+            name: "GPT-5.5 (High)",
             providerLabel: "OpenAI Codex (subscription CLI)",
           },
           {
-            id: "codex-cli:gpt-5.4",
-            name: "GPT-5.4",
+            id: "codex-cli:gpt-5.5@xhigh",
+            name: "GPT-5.5 (Extra High)",
             providerLabel: "OpenAI Codex (subscription CLI)",
           },
           {
-            id: "codex-cli:gpt-5.4-mini",
-            name: "GPT-5.4-Mini",
+            id: "codex-cli:gpt-5.6-terra@low",
+            name: "GPT-5.6-Terra (Low)",
+            providerLabel: "OpenAI Codex (subscription CLI)",
+          },
+          {
+            id: "codex-cli:gpt-5.6-terra@medium",
+            name: "GPT-5.6-Terra (Medium)",
+            providerLabel: "OpenAI Codex (subscription CLI)",
+          },
+          {
+            id: "codex-cli:gpt-5.6-terra@high",
+            name: "GPT-5.6-Terra (High)",
+            providerLabel: "OpenAI Codex (subscription CLI)",
+          },
+          {
+            id: "codex-cli:gpt-5.6-terra@xhigh",
+            name: "GPT-5.6-Terra (Extra High)",
+            providerLabel: "OpenAI Codex (subscription CLI)",
+          },
+          {
+            id: "codex-cli:gpt-5.6-terra@max",
+            name: "GPT-5.6-Terra (Max)",
+            providerLabel: "OpenAI Codex (subscription CLI)",
+          },
+          {
+            id: "codex-cli:gpt-5.6-terra@ultra",
+            name: "GPT-5.6-Terra (Ultra)",
+            providerLabel: "OpenAI Codex (subscription CLI)",
+          },
+          {
+            id: "codex-cli:gpt-5.6-luna@low",
+            name: "GPT-5.6-Luna (Low)",
+            providerLabel: "OpenAI Codex (subscription CLI)",
+          },
+          {
+            id: "codex-cli:gpt-5.6-luna@medium",
+            name: "GPT-5.6-Luna (Medium)",
+            providerLabel: "OpenAI Codex (subscription CLI)",
+          },
+          {
+            id: "codex-cli:gpt-5.6-luna@high",
+            name: "GPT-5.6-Luna (High)",
+            providerLabel: "OpenAI Codex (subscription CLI)",
+          },
+          {
+            id: "codex-cli:gpt-5.6-luna@xhigh",
+            name: "GPT-5.6-Luna (Extra High)",
+            providerLabel: "OpenAI Codex (subscription CLI)",
+          },
+          {
+            id: "codex-cli:gpt-5.6-luna@max",
+            name: "GPT-5.6-Luna (Max)",
+            providerLabel: "OpenAI Codex (subscription CLI)",
+          },
+          {
+            id: "codex-cli:gpt-5.4@low",
+            name: "GPT-5.4 (Low)",
+            providerLabel: "OpenAI Codex (subscription CLI)",
+          },
+          {
+            id: "codex-cli:gpt-5.4@medium",
+            name: "GPT-5.4 (Medium)",
+            providerLabel: "OpenAI Codex (subscription CLI)",
+          },
+          {
+            id: "codex-cli:gpt-5.4@high",
+            name: "GPT-5.4 (High)",
+            providerLabel: "OpenAI Codex (subscription CLI)",
+          },
+          {
+            id: "codex-cli:gpt-5.4@xhigh",
+            name: "GPT-5.4 (Extra High)",
+            providerLabel: "OpenAI Codex (subscription CLI)",
+          },
+          {
+            id: "codex-cli:gpt-5.4-mini@low",
+            name: "GPT-5.4-Mini (Low)",
+            providerLabel: "OpenAI Codex (subscription CLI)",
+          },
+          {
+            id: "codex-cli:gpt-5.4-mini@medium",
+            name: "GPT-5.4-Mini (Medium)",
+            providerLabel: "OpenAI Codex (subscription CLI)",
+          },
+          {
+            id: "codex-cli:gpt-5.4-mini@high",
+            name: "GPT-5.4-Mini (High)",
+            providerLabel: "OpenAI Codex (subscription CLI)",
+          },
+          {
+            id: "codex-cli:gpt-5.4-mini@xhigh",
+            name: "GPT-5.4-Mini (Extra High)",
             providerLabel: "OpenAI Codex (subscription CLI)",
           },
         ]

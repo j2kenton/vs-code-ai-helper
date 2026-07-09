@@ -81,6 +81,43 @@ export interface CliProviderDefinition {
   usesLastMessageFile: boolean;
 }
 
+const CODEX_REASONING_EFFORTS = new Set([
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+  "ultra",
+]);
+
+export interface ParsedCodexModelSelection {
+  model: string | undefined;
+  reasoningEffort: string | undefined;
+}
+
+export function parseCodexModelSelection(
+  model: string | undefined
+): ParsedCodexModelSelection {
+  if (!model) {
+    return { model: undefined, reasoningEffort: undefined };
+  }
+
+  const separator = model.lastIndexOf("@");
+  if (separator <= 0) {
+    return { model, reasoningEffort: undefined };
+  }
+
+  const reasoningEffort = model.slice(separator + 1);
+  if (!CODEX_REASONING_EFFORTS.has(reasoningEffort)) {
+    return { model, reasoningEffort: undefined };
+  }
+
+  return {
+    model: model.slice(0, separator) || undefined,
+    reasoningEffort,
+  };
+}
+
 export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
   {
     id: "claude-cli",
@@ -124,11 +161,18 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     models: [{ model: undefined, name: "Codex (CLI default)" }],
     usesLastMessageFile: true,
     buildArgs(mode, model, lastMessageFile): string[] {
+      const parsedModel = parseCodexModelSelection(model);
       const args = ["exec", "--skip-git-repo-check", "--color", "never"];
       // exec is non-interactive; the sandbox policy is what limits writes.
       args.push("--sandbox", mode === "edit" ? "workspace-write" : "read-only");
-      if (model) {
-        args.push("--model", model);
+      if (parsedModel.model) {
+        args.push("--model", parsedModel.model);
+      }
+      if (parsedModel.reasoningEffort) {
+        args.push(
+          "-c",
+          `model_reasoning_effort="${parsedModel.reasoningEffort}"`
+        );
       }
       if (lastMessageFile) {
         args.push("--output-last-message", lastMessageFile);

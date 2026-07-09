@@ -1,6 +1,10 @@
 import * as assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { CLI_PROVIDERS, getCliProvider } from "../runners/providers";
+import {
+  CLI_PROVIDERS,
+  getCliProvider,
+  parseCodexModelSelection,
+} from "../runners/providers";
 
 void describe("provider CLI contracts", () => {
   void it("Kiro uses stdin prompt transport for --no-interactive", () => {
@@ -49,6 +53,38 @@ void describe("provider CLI contracts", () => {
       "--dangerously-skip-permissions",
       "--model",
       "gemini-3-pro",
+    ]);
+  });
+
+  void it("Codex model variants map to base model plus reasoning config", () => {
+    const codex = getCliProvider("codex-cli");
+    assert.ok(codex, "expected codex-cli provider definition");
+
+    const parsed = parseCodexModelSelection("gpt-5.6-terra@ultra");
+    assert.deepStrictEqual(parsed, {
+      model: "gpt-5.6-terra",
+      reasoningEffort: "ultra",
+    });
+
+    const textArgs = codex.buildArgs(
+      "text",
+      "gpt-5.6-terra@ultra",
+      "/tmp/codex-last-message.md"
+    );
+    assert.deepStrictEqual(textArgs, [
+      "exec",
+      "--skip-git-repo-check",
+      "--color",
+      "never",
+      "--sandbox",
+      "read-only",
+      "--model",
+      "gpt-5.6-terra",
+      "-c",
+      'model_reasoning_effort="ultra"',
+      "--output-last-message",
+      "/tmp/codex-last-message.md",
+      "-",
     ]);
   });
 
