@@ -19,6 +19,35 @@ function antigravityModels(
   return providerModels(models, "Antigravity CLI (subscription CLI)");
 }
 
+void describe("CLI model refresh fallback", () => {
+  void it("keeps existing defaults when discovery returns an empty list", () => {
+    const current = [
+      { model: "gemini-3.5-flash-medium", name: "Gemini 3.5 Flash (Medium)" },
+      { model: "gemini-3.1-pro-high", name: "Gemini 3.1 Pro (High)" },
+    ];
+
+    assert.deepStrictEqual(
+      __testOnly.resolveRefreshedCliModels(current, []),
+      current
+    );
+  });
+
+  void it("replaces defaults when discovery returns a non-empty list", () => {
+    const current = [
+      { model: "gemini-3.5-flash-medium", name: "Gemini 3.5 Flash (Medium)" },
+    ];
+    const discovered = [
+      { model: "gemini-3-pro", name: "Gemini 3 Pro" },
+      { model: "gemini-3-flash", name: "Gemini 3 Flash" },
+    ];
+
+    assert.deepStrictEqual(
+      __testOnly.resolveRefreshedCliModels(current, discovered),
+      discovered
+    );
+  });
+});
+
 void describe("getAvailableModels", () => {
   void it("annotates Copilot Claude Fable and Opus models as Pro+ only", async () => {
     __testOnly.restoreSeededCliModelCache();

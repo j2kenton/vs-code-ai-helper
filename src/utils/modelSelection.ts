@@ -280,6 +280,13 @@ function restoreSeededCliModelCache(): void {
   }
 }
 
+function resolveRefreshedCliModels(
+  currentModels: readonly DiscoveredCliModel[],
+  discoveredModels: readonly DiscoveredCliModel[]
+): readonly DiscoveredCliModel[] {
+  return discoveredModels.length > 0 ? discoveredModels : currentModels;
+}
+
 function queueCliModelRefresh(
   def: CliProviderDefinition
 ): Promise<readonly DiscoveredCliModel[]> {
@@ -294,14 +301,17 @@ function queueCliModelRefresh(
       def.commandAliases
     );
     if (!resolvedCommand) {
-      const discovered: readonly DiscoveredCliModel[] = [];
+      const discovered = resolveRefreshedCliModels(cached?.models ?? [], []);
       cliModelCache.set(def.id, {
         models: discovered,
       });
       return discovered;
     }
 
-    const discovered = await discoverAgyModels(resolvedCommand);
+    const discovered = resolveRefreshedCliModels(
+      cached?.models ?? [],
+      await discoverAgyModels(resolvedCommand)
+    );
     cliModelCache.set(def.id, {
       models: discovered,
     });
@@ -353,6 +363,7 @@ export const __testOnly = {
     modelSelectionTestOverrides = undefined;
   },
   restoreSeededCliModelCache,
+  resolveRefreshedCliModels,
 };
 
 export async function warmCliModelCache(): Promise<void> {
