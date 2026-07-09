@@ -3,6 +3,7 @@ import * as nodePath from "path";
 import * as nodeFs from "fs";
 import { deletePath, readTextIfExists, writeTextFile } from "../utils/fileUtils";
 import { AgentAvailability } from "../types/agentRunner";
+import { parseCopilotModelSelection } from "./providers";
 import { sanitizeRelativePath } from "../utils/pathSafety";
 
 /**
@@ -332,8 +333,9 @@ export async function runImplementationWithCopilot(options: {
     };
   }
 
-  const requestedModel = modelId
-    ? models.find((m) => m.id === modelId)
+  const parsedModel = parseCopilotModelSelection(modelId);
+  const requestedModel = parsedModel.model
+    ? models.find((m) => m.id === parsedModel.model)
     : undefined;
   const autoModel = models.find(
     (m) => m.id.toLowerCase() === "auto" || m.name.toLowerCase() === "auto"
@@ -347,6 +349,14 @@ export async function runImplementationWithCopilot(options: {
   const messages: vscode.LanguageModelChatMessage[] = [
     vscode.LanguageModelChatMessage.User(prompt),
   ];
+  const requestOptions: vscode.LanguageModelChatRequestOptions =
+    parsedModel.reasoningEffort
+      ? {
+          modelOptions: {
+            model_reasoning_effort: parsedModel.reasoningEffort,
+          },
+        }
+      : {};
 
   let iteration = 0;
   let finalSummary = "";
@@ -364,7 +374,7 @@ export async function runImplementationWithCopilot(options: {
     try {
       response = await model.sendRequest(
         messages,
-        { tools: IMPLEMENTATION_TOOLS },
+        { ...requestOptions, tools: IMPLEMENTATION_TOOLS },
         token
       );
     } catch (e) {

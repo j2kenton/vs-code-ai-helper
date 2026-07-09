@@ -57,6 +57,18 @@ function codexVariants(
   return variants;
 }
 
+function copilotReasoningVariants(
+  model: string,
+  label: string,
+  efforts: readonly (readonly [string, string])[]
+): SelectableModel[] {
+  return efforts.map(([effort, effortLabel]) => ({
+    id: `${model}@${effort}`,
+    name: `${label} (${effortLabel})`,
+    providerLabel: "GitHub Copilot",
+  }));
+}
+
 void describe("CLI model refresh fallback", () => {
   void it("keeps existing defaults when discovery returns an empty list", () => {
     const current = [
@@ -100,10 +112,6 @@ void describe("getAvailableModels", () => {
             id: "copilot-claude-opus-4.8",
             name: "Claude Opus 4.8",
           } as SelectableModel as never,
-          {
-            id: "copilot-gpt-5.5",
-            name: "GPT-5.5",
-          } as SelectableModel as never,
         ]);
       },
       cliCommandExists() {
@@ -124,11 +132,107 @@ void describe("getAvailableModels", () => {
           name: "Claude Opus 4.8 (only on Pro+ plan)",
           providerLabel: "GitHub Copilot",
         },
+      ]);
+    } finally {
+      __testOnly.clearModelSelectionTestOverrides();
+      __testOnly.resetCliModelCache();
+      __testOnly.restoreSeededCliModelCache();
+    }
+  });
+
+  void it("surfaces seeded Copilot GPT reasoning variants", async () => {
+    __testOnly.restoreSeededCliModelCache();
+    __testOnly.setModelSelectionTestOverrides({
+      getAvailableCopilotModels() {
+        return Promise.resolve([
+          {
+            id: "copilot-gpt-5.5",
+            name: "GPT-5.5",
+          } as SelectableModel as never,
+          {
+            id: "copilot-gpt-5.6-terra",
+            name: "GPT-5.6-Terra",
+          } as SelectableModel as never,
+          {
+            id: "copilot-gpt-5.6-luna",
+            name: "GPT-5.6-Luna",
+          } as SelectableModel as never,
+          {
+            id: "copilot-gpt-5.4",
+            name: "GPT-5.4",
+          } as SelectableModel as never,
+          {
+            id: "copilot-gpt-5.4-mini",
+            name: "GPT-5.4-Mini",
+          } as SelectableModel as never,
+        ]);
+      },
+      cliCommandExists() {
+        return Promise.resolve(false);
+      },
+    });
+
+    try {
+      const models = await getAvailableModels();
+      assert.deepStrictEqual(models, [
         {
           id: "copilot-gpt-5.5",
           name: "GPT-5.5",
           providerLabel: "GitHub Copilot",
         },
+        ...copilotReasoningVariants("copilot-gpt-5.5", "GPT-5.5", [
+          ["low", "Low"],
+          ["medium", "Medium"],
+          ["high", "High"],
+          ["xhigh", "Extra High"],
+        ]),
+        {
+          id: "copilot-gpt-5.6-terra",
+          name: "GPT-5.6-Terra",
+          providerLabel: "GitHub Copilot",
+        },
+        ...copilotReasoningVariants("copilot-gpt-5.6-terra", "GPT-5.6-Terra", [
+          ["low", "Low"],
+          ["medium", "Medium"],
+          ["high", "High"],
+          ["xhigh", "Extra High"],
+          ["max", "Max"],
+          ["ultra", "Ultra"],
+        ]),
+        {
+          id: "copilot-gpt-5.6-luna",
+          name: "GPT-5.6-Luna",
+          providerLabel: "GitHub Copilot",
+        },
+        ...copilotReasoningVariants("copilot-gpt-5.6-luna", "GPT-5.6-Luna", [
+          ["low", "Low"],
+          ["medium", "Medium"],
+          ["high", "High"],
+          ["xhigh", "Extra High"],
+          ["max", "Max"],
+        ]),
+        {
+          id: "copilot-gpt-5.4",
+          name: "GPT-5.4",
+          providerLabel: "GitHub Copilot",
+        },
+        ...copilotReasoningVariants("copilot-gpt-5.4", "GPT-5.4", [
+          ["low", "Low"],
+          ["medium", "Medium"],
+          ["high", "High"],
+          ["xhigh", "Extra High"],
+        ]),
+        {
+          id: "copilot-gpt-5.4-mini",
+          name: "GPT-5.4-Mini",
+          providerLabel: "GitHub Copilot",
+        },
+        ...copilotReasoningVariants("copilot-gpt-5.4-mini", "GPT-5.4-Mini", [
+          ["low", "Low"],
+          ["medium", "Medium"],
+          ["high", "High"],
+          ["xhigh", "Extra High"],
+        ]),
       ]);
     } finally {
       __testOnly.clearModelSelectionTestOverrides();

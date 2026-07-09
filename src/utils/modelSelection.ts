@@ -200,6 +200,59 @@ function normalizeCopilotModelName(model: vscode.LanguageModelChat): string {
   return name;
 }
 
+const COPILOT_GPT_REASONING_VARIANTS: Readonly<
+  Array<{
+    slug: string;
+    effort: string;
+    label: string;
+  }>
+> = [
+  { slug: "gpt-5.5", effort: "low", label: "Low" },
+  { slug: "gpt-5.5", effort: "medium", label: "Medium" },
+  { slug: "gpt-5.5", effort: "high", label: "High" },
+  { slug: "gpt-5.5", effort: "xhigh", label: "Extra High" },
+  { slug: "gpt-5.6-terra", effort: "low", label: "Low" },
+  { slug: "gpt-5.6-terra", effort: "medium", label: "Medium" },
+  { slug: "gpt-5.6-terra", effort: "high", label: "High" },
+  { slug: "gpt-5.6-terra", effort: "xhigh", label: "Extra High" },
+  { slug: "gpt-5.6-terra", effort: "max", label: "Max" },
+  { slug: "gpt-5.6-terra", effort: "ultra", label: "Ultra" },
+  { slug: "gpt-5.6-luna", effort: "low", label: "Low" },
+  { slug: "gpt-5.6-luna", effort: "medium", label: "Medium" },
+  { slug: "gpt-5.6-luna", effort: "high", label: "High" },
+  { slug: "gpt-5.6-luna", effort: "xhigh", label: "Extra High" },
+  { slug: "gpt-5.6-luna", effort: "max", label: "Max" },
+  { slug: "gpt-5.4", effort: "low", label: "Low" },
+  { slug: "gpt-5.4", effort: "medium", label: "Medium" },
+  { slug: "gpt-5.4", effort: "high", label: "High" },
+  { slug: "gpt-5.4", effort: "xhigh", label: "Extra High" },
+  { slug: "gpt-5.4-mini", effort: "low", label: "Low" },
+  { slug: "gpt-5.4-mini", effort: "medium", label: "Medium" },
+  { slug: "gpt-5.4-mini", effort: "high", label: "High" },
+  { slug: "gpt-5.4-mini", effort: "xhigh", label: "Extra High" },
+];
+
+function createSeededCopilotReasoningVariants(
+  model: vscode.LanguageModelChat,
+  baseName: string
+): SelectableModel[] {
+  const haystack = `${model.id} ${model.name}`.toLowerCase();
+  const variants: SelectableModel[] = [];
+
+  for (const variant of COPILOT_GPT_REASONING_VARIANTS) {
+    if (!haystack.includes(variant.slug)) {
+      continue;
+    }
+    variants.push({
+      id: `${model.id}@${variant.effort}`,
+      name: `${baseName} (${variant.label})`,
+      providerLabel: "GitHub Copilot",
+    });
+  }
+
+  return variants;
+}
+
 function createCodexReasoningVariant(
   model: string,
   label: string,
@@ -495,11 +548,18 @@ export async function getAvailableModels(): Promise<SelectableModel[]> {
   try {
     const copilotModels = await getCopilotModels();
     for (const model of copilotModels) {
+      const baseName = normalizeCopilotModelName(model);
       pushSelectableModel(result, seenIds, {
         id: model.id,
-        name: normalizeCopilotModelName(model),
+        name: baseName,
         providerLabel: "GitHub Copilot",
       });
+      for (const variant of createSeededCopilotReasoningVariants(
+        model,
+        baseName
+      )) {
+        pushSelectableModel(result, seenIds, variant);
+      }
     }
   } catch {
     // Copilot not signed in / not installed — CLI providers may still work.

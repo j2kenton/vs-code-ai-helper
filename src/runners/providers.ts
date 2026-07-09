@@ -90,6 +90,15 @@ const CODEX_REASONING_EFFORTS = new Set([
   "ultra",
 ]);
 
+const COPILOT_REASONING_EFFORTS = new Set([
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+  "ultra",
+]);
+
 export interface ParsedCodexModelSelection {
   model: string | undefined;
   reasoningEffort: string | undefined;
@@ -122,6 +131,34 @@ export function parseCodexModelSelection(
     model: model.slice(0, separator) || undefined,
     reasoningEffort,
     serviceTier: speedTier === "fast" ? "priority" : undefined,
+  };
+}
+
+export interface ParsedCopilotModelSelection {
+  model: string | undefined;
+  reasoningEffort: string | undefined;
+}
+
+export function parseCopilotModelSelection(
+  model: string | undefined
+): ParsedCopilotModelSelection {
+  if (!model) {
+    return { model: undefined, reasoningEffort: undefined };
+  }
+
+  const separator = model.lastIndexOf("@");
+  if (separator <= 0) {
+    return { model, reasoningEffort: undefined };
+  }
+
+  const reasoningEffort = model.slice(separator + 1);
+  if (!reasoningEffort || !COPILOT_REASONING_EFFORTS.has(reasoningEffort)) {
+    return { model, reasoningEffort: undefined };
+  }
+
+  return {
+    model: model.slice(0, separator) || undefined,
+    reasoningEffort,
   };
 }
 

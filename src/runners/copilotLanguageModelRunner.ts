@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { parseCopilotModelSelection } from "./providers";
 import {
   AgentAvailability,
   AgentRunner,
@@ -57,8 +58,9 @@ export class CopilotLanguageModelRunner implements AgentRunner {
       };
     }
 
-    const requestedModel = request.modelId
-      ? models.find((candidate) => candidate.id === request.modelId)
+    const parsedModel = parseCopilotModelSelection(request.modelId);
+    const requestedModel = parsedModel.model
+      ? models.find((candidate) => candidate.id === parsedModel.model)
       : undefined;
     const autoModel = models.find(
       (candidate) =>
@@ -76,9 +78,17 @@ export class CopilotLanguageModelRunner implements AgentRunner {
     }
 
     const messages = [vscode.LanguageModelChatMessage.User(request.prompt)];
+    const requestOptions: vscode.LanguageModelChatRequestOptions =
+      parsedModel.reasoningEffort
+        ? {
+            modelOptions: {
+              model_reasoning_effort: parsedModel.reasoningEffort,
+            },
+          }
+        : {};
 
     try {
-      const response = await model.sendRequest(messages, {}, token);
+      const response = await model.sendRequest(messages, requestOptions, token);
 
       let output = "";
       for await (const fragment of response.text) {

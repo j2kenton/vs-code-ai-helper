@@ -3,6 +3,7 @@ import { describe, it } from "node:test";
 import {
   CLI_PROVIDERS,
   getCliProvider,
+  parseCopilotModelSelection,
   parseCodexModelSelection,
 } from "../runners/providers";
 
@@ -89,6 +90,14 @@ void describe("provider CLI contracts", () => {
       "/tmp/codex-last-message.md",
       "-",
     ]);
+  });
+
+  void it("Copilot model variants map to base model plus reasoning config", () => {
+    const parsed = parseCopilotModelSelection("gpt-5.6-terra@ultra");
+    assert.deepStrictEqual(parsed, {
+      model: "gpt-5.6-terra",
+      reasoningEffort: "ultra",
+    });
   });
 
   void it("Kiro hints mention KIRO_API_KEY requirement", () => {
