@@ -236,6 +236,34 @@ export function clearImplReviewFiles(progress: TaskProgress): TaskProgress {
 }
 
 /**
+ * Persist a lint-state payload for a completed task.
+ * Replaces any previously stored lint result.
+ */
+export function updateLintPayload(
+  progress: TaskProgress,
+  payload: import("../types/taskProgress").LintPayload
+): TaskProgress {
+  return {
+    ...progress,
+    lintPayload: payload,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * Remove the persisted lint payload (e.g. when re-running lint after
+ * code changes so the stale result is no longer shown as current).
+ */
+export function clearLintPayload(progress: TaskProgress): TaskProgress {
+  const { lintPayload: _unused, ...rest } = progress;
+  return {
+    ...rest,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+
+/**
  * Find all incomplete tasks in the meta folder
  * @param metaFolderUri - URI of the meta resources folder
  * @returns Array of incomplete tasks, sorted by most recent first

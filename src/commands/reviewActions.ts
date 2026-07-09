@@ -22,6 +22,12 @@ import {
   updateTaskProgressStage,
 } from "../utils/taskProgressUtils";
 import {
+  advanceStage,
+  computeNextStage,
+  AUTO_REVIEW_TRANSITIONS,
+} from "../utils/stageTransition";
+import {
+
   openOrCreateDocument,
   readNonEmptyText,
   resolveCurrentPlanUri,
@@ -1039,15 +1045,18 @@ async function currentStageArtifactExists(
  * Advance a task to the next stage in the workflow.
  * Auto-triggers review when advancing into a review stage from its
  * immediately preceding non-review stage (plan -> plan-high-review, or
- * plan-low-review being re-entered).
+ * implementation -> impl-high-review).
  * No confirmation dialogs.
  *
- * When auto-triggering review, this command delegates to the registered
- * runReviewWithAI command (which has access to extensionUri via closure).
+ * Uses the shared `advanceStage` helper to guarantee persist-first ordering
+ * and exactly-once auto-review dispatch per successful transition.
  *
- * NOTE: When auto-triggering review via runReviewForFolder, consent was
- * already obtained earlier in the user-initiated flow that called nextStage.
- * The auto-triggered review does NOT re-prompt for consent.
+ * When advancing to "completed", runs in strict lifecycle order:
+ *   1. persist completion (advanceStage)
+ *   2. refresh inventory (via progress-file watcher, or caller)
+ *   3. show completion message
+ *   4. (future: persist lint payload)
+ *   5. show final info
  */
 export async function nextStage(
   extensionUri: vscode.Uri,
@@ -1059,8 +1068,7 @@ export async function nextStage(
     return;
   }
 
-  const currentIndex = STAGE_ORDER.indexOf(resolved.progress.currentStage);
-  const next = STAGE_ORDER[currentIndex + 1];
+  const next = computeNextStage(resolved.progress.currentStage);
   if (!next) {
     return;
   }
@@ -1103,30 +1111,50 @@ export async function nextStage(
     }
   }
 
-  // Persist stage advance using patchTaskProgress to avoid overwriting
-  // unrelated fields (e.g. implReviewFiles, scheduledAt, lint results).
-  await setStage(resolved.folderUri, next);
+  // ── Step 1: Persist stage transition using shared helper ──────────────────
+  const transitionResult = await advanceStage(
+    resolved.folderUri,
+    resolved.progress.currentStage,
+    next,
+    resolved.progress.status === "paused",
+    true // triggerAutoReview opt-in
+  );
+
+  if (!transitionResult?.persisted) {
+    void vscode.window.showErrorMessage(
+      `Could not persist stage advance for ${resolved.progress.taskFolder}. Please try again.`
+    );
+    return;
+  }
+
+  // ── Step 2: Show stage-advance message ───────────────────────────────
   void vscode.window.showInformationMessage(
     `${resolved.progress.taskFolder} advanced to: ${STAGE_DISPLAY_NAMES[next]}`
   );
 
-  // Auto-trigger review only when advancing INTO a review stage from the
-  // correct immediately-preceding source stage. Pass triggerAutoReview: false
-  // implicitly by calling the review directly with a specific node arg so it
-  // does not loop back here.
-  const workspaceRoot = getWorkspaceRoot();
-  if (!workspaceRoot) {
+  // ── Step 3: Post-completion lifecycle (when advancing to "completed") ──────
+  // Strict ordering:
+  //   persistence already done (Step 1)
+  //   refresh inventory — triggered automatically by the progress-file watcher
+  //     in extension.ts; we do not need to call inventory.refresh() here since
+  //     patchTaskProgress writes task-progress.json, which the watcher picks up.
+  //   post-completion helper actions — (no-op in this stage; future: open PR draft)
+  //   persist lint payload — deferred until runLintingFixes is called explicitly
+  //   refresh final rendered state — inventory watcher handles this
+  if (next === "completed") {
+    // No additional steps in this implementation; the watcher handles refresh.
+    // The lint payload path is handled by runLintingFixes separately.
     return;
   }
 
-  // Only auto-trigger plan-high-review when coming from "plan" stage, and
-  // only auto-trigger plan-low-review when re-entering it.
-  const shouldAutoReview =
-    resolved.progress.status !== "paused" &&
-    isReviewStage(next) &&
-    REVIEW_TARGETS[resolved.progress.currentStage] === next;
-
-  if (shouldAutoReview) {
+  // ── Step 4: Auto-trigger review when eligible ────────────────────────
+  // transitionResult.shouldAutoReview is already computed by advanceStage
+  // using exactly-once semantics tied to the persistence result.
+  if (transitionResult.shouldAutoReview) {
+    const workspaceRoot = getWorkspaceRoot();
+    if (!workspaceRoot) {
+      return;
+    }
     // Re-read progress to get the newly persisted stage
     const freshProgress = await readTaskProgress(resolved.folderUri);
     if (freshProgress) {

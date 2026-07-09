@@ -7,6 +7,7 @@ import { TASK_FILENAME, STAGE_DISPLAY_NAMES } from "../types/taskProgress";
 import { resolveImplementationArtifact } from "../utils/implementationArtifactResolver";
 import { getLowLevelPlanUri } from "../utils/lowLevelPlanArtifactResolver";
 import { IncompleteTask } from "../utils/taskProgressUtils";
+import { CurrentTaskStore } from "../utils/currentTaskStore";
 
 /**
  * Accepted argument shapes for commitAndPushTask.
@@ -583,18 +584,34 @@ async function describePushDestination(
  */
 export async function commitAndPushTask(
   inventory: TaskInventory,
-  explicitArg?: CommitAndPushTaskArg
+  explicitArg?: CommitAndPushTaskArg,
+  currentTaskStore?: CurrentTaskStore
 ): Promise<void> {
   const resolverArg = normalizeArg(explicitArg);
 
+  // Resolution order (matches resolveTaskContext contract):
+  //   1. explicit task arg (tree node, canonical ID, folder path) — highest precedence
+  //   2. persisted current-task canonical ID from CurrentTaskStore
+  // Malformed explicit args are hard failures (no redirect to unrelated tasks).
   const resolvedTask = await resolveTaskContext(inventory, resolverArg, {
     allowPaused: true,
-  });
+  }, currentTaskStore);
 
   if (!resolvedTask) {
-    void vscode.window.showInformationMessage(
-      "No task found to commit and push."
-    );
+    // If an explicit arg was supplied but resolution failed, the task is gone;
+    // a clear error was already shown by resolveTaskContext. If no arg and no
+    // persisted task, guide the user.
+    if (resolverArg) {
+      void vscode.window.showErrorMessage(
+        "The task could not be found. It may have been deleted or moved. " +
+          "Please refresh the Tasks panel and try again."
+      );
+    } else {
+      void vscode.window.showInformationMessage(
+        "No completed task found to commit and push. " +
+          "Select a task in the Tasks panel first, or invoke from a completed task row."
+      );
+    }
     return;
   }
 
@@ -604,6 +621,39 @@ export async function commitAndPushTask(
       `Task is at stage "${STAGE_DISPLAY_NAMES[resolvedTask.progress.currentStage]}" — must be completed before committing and pushing.`
     );
     return;
+  }
+
+  // ── Lint-state gate ────────────────────────────────────────────────────────
+  // If the lint state is unknown (no lintPayload), warn the user before
+  // committing. The user can bypass by confirming, or cancel to run lint first.
+  const lintPayload = resolvedTask.progress.lintPayload;
+  if (!lintPayload) {
+    const choice = await vscode.window.showWarningMessage(
+      `Lint state is unknown for "${resolvedTask.folderName}".\n\n` +
+        "Run linting fixes first to record the lint state, or proceed without lint validation.",
+      { modal: true },
+      "Proceed Without Lint",
+      "Cancel"
+    );
+    if (choice !== "Proceed Without Lint") {
+      void vscode.window.showInformationMessage(
+        "Commit and push cancelled. Run 'Fix Linting Issues' first to record lint state."
+      );
+      return;
+    }
+  } else if (!lintPayload.passed) {
+    const summary = lintPayload.summary ? ` (${lintPayload.summary})` : "";
+    const choice = await vscode.window.showWarningMessage(
+      `Lint reported failures for "${resolvedTask.folderName}"${summary}.\n\n` +
+        "The task was committed despite lint failures. Proceed anyway?",
+      { modal: true },
+      "Proceed",
+      "Cancel"
+    );
+    if (choice !== "Proceed") {
+      void vscode.window.showInformationMessage("Commit and push cancelled.");
+      return;
+    }
   }
 
   await vscode.window.withProgress(
@@ -933,12 +983,13 @@ export async function commitAndPushTask(
  */
 export function registerCommitAndPushTaskCommand(
   context: vscode.ExtensionContext,
-  inventory: TaskInventory
+  inventory: TaskInventory,
+  currentTaskStore?: CurrentTaskStore
 ): void {
   const disposable = vscode.commands.registerCommand(
     "vs-code-ai-helper.commitAndPushTask",
     (arg?: CommitAndPushTaskArg) =>
-      commitAndPushTask(inventory, arg)
+      commitAndPushTask(inventory, arg, currentTaskStore)
   );
   context.subscriptions.push(disposable);
 }

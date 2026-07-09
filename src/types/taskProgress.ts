@@ -55,6 +55,19 @@ export const CONTEXT_PACK_FILENAME = "context-pack.md";
 export const RUNS_DIRNAME = "runs";
 
 /**
+ * Persisted lint-state payload for a completed task.
+ * Used to gate completion-only actions (commit/push) on known lint state.
+ */
+export interface LintPayload {
+  /** ISO timestamp when lint was last run */
+  runAt: string;
+  /** true = all lint checks passed, false = failures recorded */
+  passed: boolean;
+  /** Optional human-readable summary (e.g. "3 errors, 2 warnings") */
+  summary?: string;
+}
+
+/**
  * Tracks the progress of a task through the planning workflow
  */
 export interface TaskProgress {
@@ -79,6 +92,13 @@ export interface TaskProgress {
    * was introduced — those fall back to open-editor review.
    */
   implReviewFiles?: string[];
+  /**
+   * Persisted lint state for this task. Present only after a lint run has
+   * been executed for a completed task. When absent, the lint state is
+   * "unknown" and completion-only actions (commit/push) are gated pending
+   * a lint run or an explicit user bypass.
+   */
+  lintPayload?: LintPayload;
 }
 
 /**
