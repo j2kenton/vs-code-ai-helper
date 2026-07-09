@@ -206,7 +206,7 @@ export function normalizeReviewArg(arg: ReviewCommandArg): TaskNodeArg {
     return {};
   }
   if ("task" in arg && arg.task) {
-    return arg as TaskNodeArg;
+    return arg;
   }
   // Caller passed { taskFolderPath }
   if ("taskFolderPath" in arg && arg.taskFolderPath) {

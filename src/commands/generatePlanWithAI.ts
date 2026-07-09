@@ -224,13 +224,13 @@ export async function generatePlanWithAI(
       cancellable: true,
     },
     async (progress, token) => {
-      const planFileUri = vscode.Uri.joinPath(taskFolderUri!, "plan.md");
+      const planFileUri = vscode.Uri.joinPath(taskFolderUri, "plan.md");
 
       progress.report({ message: `Waiting for ${providerLabel} response...` });
 
       const result = await runner.run(
         {
-          taskFolderUri: taskFolderUri!,
+          taskFolderUri: taskFolderUri,
           workspaceUri: workspaceRoot.uri,
           stage: "plan",
           prompt,
@@ -241,7 +241,7 @@ export async function generatePlanWithAI(
       );
 
       await writeRunLog(
-        taskFolderUri!,
+        taskFolderUri,
         runner.id,
         "plan",
         `# Prompt\n\n${prompt}\n\n# Result\n\nStatus: ${result.status}\n\n${
@@ -252,7 +252,7 @@ export async function generatePlanWithAI(
       if (result.status === "completed") {
         // Use patchTaskProgress to preserve unrelated fields (e.g. implReviewFiles,
         // scheduled metadata, lint results) while updating the stage.
-        await patchTaskProgress(taskFolderUri!, (existing) => {
+        await patchTaskProgress(taskFolderUri, (existing) => {
           if (!ELIGIBLE_STAGES.includes(existing.currentStage)) {
             return existing;
           }

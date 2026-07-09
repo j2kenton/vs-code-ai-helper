@@ -26,8 +26,8 @@ void describe("parseAIResponse — tolerant heading matching", () => {
     ].join("\n");
     const result = parseAIResponse(response);
     assert.ok(result !== undefined);
-    assert.strictEqual(result!.draftWithAI, "The draft content.");
-    assert.strictEqual(result!.openQuestions, "- Q1");
+    assert.strictEqual(result.draftWithAI, "The draft content.");
+    assert.strictEqual(result.openQuestions, "- Q1");
   });
 
   // ── Heading level tolerance ──────────────────────────────────────────────
@@ -44,7 +44,7 @@ void describe("parseAIResponse — tolerant heading matching", () => {
     ].join("\n");
     const result = parseAIResponse(response);
     assert.ok(result !== undefined, "should accept h1 headings");
-    assert.strictEqual(result!.draftWithAI, "Draft body.");
+    assert.strictEqual(result.draftWithAI, "Draft body.");
   });
 
   void it("accepts ### (h3) headings", () => {
@@ -59,7 +59,7 @@ void describe("parseAIResponse — tolerant heading matching", () => {
     ].join("\n");
     const result = parseAIResponse(response);
     assert.ok(result !== undefined, "should accept h3 headings");
-    assert.strictEqual(result!.draftWithAI, "Draft body.");
+    assert.strictEqual(result.draftWithAI, "Draft body.");
   });
 
   void it("accepts mixed heading levels across sections", () => {
@@ -90,7 +90,7 @@ void describe("parseAIResponse — tolerant heading matching", () => {
     ].join("\n");
     const result = parseAIResponse(response);
     assert.ok(result !== undefined, "should accept uppercase headings");
-    assert.strictEqual(result!.draftWithAI, "Draft.");
+    assert.strictEqual(result.draftWithAI, "Draft.");
   });
 
   void it("accepts mixed-case headings", () => {
@@ -137,8 +137,8 @@ void describe("parseAIResponse — tolerant heading matching", () => {
     ].join("\r\n");
     const result = parseAIResponse(response);
     assert.ok(result !== undefined, "should accept CRLF line endings");
-    assert.strictEqual(result!.draftWithAI, "Draft body.");
-    assert.strictEqual(result!.openQuestions, "- Q1");
+    assert.strictEqual(result.draftWithAI, "Draft body.");
+    assert.strictEqual(result.openQuestions, "- Q1");
   });
 
   // ── Extra blank lines ────────────────────────────────────────────────────
@@ -157,7 +157,7 @@ void describe("parseAIResponse — tolerant heading matching", () => {
     ].join("\n");
     const result = parseAIResponse(response);
     assert.ok(result !== undefined, "should accept extra blank lines");
-    assert.ok(result!.draftWithAI.includes("Draft body."));
+    assert.ok(result.draftWithAI.includes("Draft body."));
   });
 
   // ── Empty section bodies ─────────────────────────────────────────────────
@@ -171,8 +171,8 @@ void describe("parseAIResponse — tolerant heading matching", () => {
     ].join("\n");
     const result = parseAIResponse(response);
     assert.ok(result !== undefined, "should accept empty bodies");
-    assert.strictEqual(result!.draftWithAI, "");
-    assert.strictEqual(result!.openQuestions, "");
+    assert.strictEqual(result.draftWithAI, "");
+    assert.strictEqual(result.openQuestions, "");
   });
 });
 
@@ -258,8 +258,8 @@ void describe("parseAIResponse — body content extraction", () => {
     const result = parseAIResponse(response);
     assert.ok(result !== undefined);
     // trim() is applied to the full body block
-    assert.strictEqual(result!.draftWithAI, "Content with leading space");
-    assert.strictEqual(result!.openQuestions, "- Q1");
+    assert.strictEqual(result.draftWithAI, "Content with leading space");
+    assert.strictEqual(result.openQuestions, "- Q1");
   });
 
   void it("body content after Open Questions heading is extracted to end of response", () => {
@@ -276,8 +276,8 @@ void describe("parseAIResponse — body content extraction", () => {
     ].join("\n");
     const result = parseAIResponse(response);
     assert.ok(result !== undefined);
-    assert.ok(result!.openQuestions.includes("Line 1."));
-    assert.ok(result!.openQuestions.includes("Line 2."));
-    assert.ok(result!.openQuestions.includes("Line 3."));
+    assert.ok(result.openQuestions.includes("Line 1."));
+    assert.ok(result.openQuestions.includes("Line 2."));
+    assert.ok(result.openQuestions.includes("Line 3."));
   });
 });

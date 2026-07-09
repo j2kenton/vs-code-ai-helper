@@ -90,20 +90,21 @@ function makeMemStore(): MemStore {
 
 function installMemStore(store: MemStore): void {
   // Monkey-patch the vscode stub's workspace.fs for this test suite
-  (vscode.workspace.fs as unknown as Record<string, unknown>).readFile = async (
+  (vscode.workspace.fs as unknown as Record<string, unknown>).readFile = (
     uri: vscode.Uri
   ): Promise<Uint8Array> => {
     const content = store.get(uri.toString());
     if (content === undefined) {
       throw new Error(`ENOENT: ${uri.toString()}`);
     }
-    return new TextEncoder().encode(content);
+    return Promise.resolve(new TextEncoder().encode(content));
   };
-  (vscode.workspace.fs as unknown as Record<string, unknown>).writeFile = async (
+  (vscode.workspace.fs as unknown as Record<string, unknown>).writeFile = (
     uri: vscode.Uri,
     data: Uint8Array
   ): Promise<void> => {
     store.set(uri.toString(), new TextDecoder().decode(data));
+    return Promise.resolve();
   };
 }
 
@@ -111,25 +112,26 @@ function makeTaskFolderUri(name: string): vscode.Uri {
   return vscode.Uri.file(`/fake-workspace/${name}`);
 }
 
-async function seedProgress(
+function seedProgress(
   store: MemStore,
   folderUri: vscode.Uri,
   progress: TaskProgress
 ): Promise<void> {
   const uri = vscode.Uri.joinPath(folderUri, "task-progress.json");
   store.set(uri.toString(), JSON.stringify(progress, null, 2));
+  return Promise.resolve();
 }
 
-async function readStoredProgress(
+function readStoredProgress(
   store: MemStore,
   folderUri: vscode.Uri
 ): Promise<TaskProgress | undefined> {
   const uri = vscode.Uri.joinPath(folderUri, "task-progress.json");
   const raw = store.get(uri.toString());
   if (!raw) {
-    return undefined;
+    return Promise.resolve(undefined);
   }
-  return JSON.parse(raw) as TaskProgress;
+  return Promise.resolve(JSON.parse(raw) as TaskProgress);
 }
 
 void test("patchTaskProgress returns undefined when no progress file exists", async () => {
@@ -149,10 +151,10 @@ void test("patchTaskProgress applies a partial object update", async () => {
 
   const result = await patchTaskProgress(folderUri, { currentStage: "plan" });
   assert.ok(result !== undefined);
-  assert.equal(result!.currentStage, "plan");
+  assert.equal(result.currentStage, "plan");
   // Other fields preserved
-  assert.equal(result!.taskFolder, initial.taskFolder);
-  assert.equal(result!.createdAt, initial.createdAt);
+  assert.equal(result.taskFolder, initial.taskFolder);
+  assert.equal(result.createdAt, initial.createdAt);
 });
 
 void test("patchTaskProgress applies a callback update", async () => {
@@ -166,7 +168,7 @@ void test("patchTaskProgress applies a callback update", async () => {
     updateImplReviewFiles(current, ["b.ts"])
   );
   assert.ok(result !== undefined);
-  assert.deepEqual(result!.implReviewFiles, ["a.ts", "b.ts"]);
+  assert.deepEqual(result.implReviewFiles, ["a.ts", "b.ts"]);
 });
 
 void test("patchTaskProgress persists changes to disk", async () => {
@@ -180,7 +182,7 @@ void test("patchTaskProgress persists changes to disk", async () => {
 
   const stored = await readStoredProgress(store, folderUri);
   assert.ok(stored !== undefined);
-  assert.equal(stored!.currentStage, "plan");
+  assert.equal(stored.currentStage, "plan");
 });
 
 void test("patchTaskProgress preserves implReviewFiles when updating stage", async () => {
@@ -195,9 +197,9 @@ void test("patchTaskProgress preserves implReviewFiles when updating stage", asy
 
   const result = await patchTaskProgress(folderUri, { currentStage: "impl-high-review" });
   assert.ok(result !== undefined);
-  assert.equal(result!.currentStage, "impl-high-review");
+  assert.equal(result.currentStage, "impl-high-review");
   // implReviewFiles must not be erased by a stage-only patch
-  assert.deepEqual(result!.implReviewFiles, ["a.ts", "b.ts"]);
+  assert.deepEqual(result.implReviewFiles, ["a.ts", "b.ts"]);
 });
 
 void test("patchTaskProgress normalizes invalid currentStage values", async () => {
@@ -214,5 +216,5 @@ void test("patchTaskProgress normalizes invalid currentStage values", async () =
   }));
   assert.ok(result !== undefined);
   // Should normalize to task-description (the migrateStage fallback)
-  assert.equal(result!.currentStage, "task-description");
+  assert.equal(result.currentStage, "task-description");
 });

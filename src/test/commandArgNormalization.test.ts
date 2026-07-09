@@ -103,6 +103,7 @@ import {
   runReviewWithAI,
 } from "../commands/reviewActions";
 import { TaskInventory } from "../state/taskInventory";
+import { getCanonicalImplementationUri } from "../utils/implementationArtifactResolver";
 
 /**
  * Build a minimal TaskInventory stub that returns a known task for a given
@@ -306,20 +307,21 @@ function installMemStore(store: Map<string, string>): FsStubHandles {
   const origReadFile = (vscode.workspace.fs as unknown as Record<string, unknown>).readFile;
   const origWriteFile = (vscode.workspace.fs as unknown as Record<string, unknown>).writeFile;
 
-  (vscode.workspace.fs as unknown as Record<string, unknown>).readFile = async (
+  (vscode.workspace.fs as unknown as Record<string, unknown>).readFile = (
     uri: vscode.Uri
   ): Promise<Uint8Array> => {
     const content = store.get(uri.toString());
     if (content === undefined) {
       throw new Error(`ENOENT: ${uri.toString()}`);
     }
-    return new TextEncoder().encode(content);
+    return Promise.resolve(new TextEncoder().encode(content));
   };
-  (vscode.workspace.fs as unknown as Record<string, unknown>).writeFile = async (
+  (vscode.workspace.fs as unknown as Record<string, unknown>).writeFile = (
     uri: vscode.Uri,
     data: Uint8Array
   ): Promise<void> => {
     store.set(uri.toString(), new TextDecoder().decode(data));
+    return Promise.resolve();
   };
 
   return {
@@ -334,25 +336,26 @@ function makeTaskFolderUri(name: string): vscode.Uri {
   return vscode.Uri.file(`/fake-workspace/${name}`);
 }
 
-async function seedProgress(
+function seedProgress(
   store: Map<string, string>,
   folderUri: vscode.Uri,
   progress: TaskProgress
 ): Promise<void> {
   const uri = vscode.Uri.joinPath(folderUri, "task-progress.json");
   store.set(uri.toString(), JSON.stringify(progress, null, 2));
+  return Promise.resolve();
 }
 
-async function readStoredProgress(
+function readStoredProgress(
   store: Map<string, string>,
   folderUri: vscode.Uri
 ): Promise<TaskProgress | undefined> {
   const uri = vscode.Uri.joinPath(folderUri, "task-progress.json");
   const raw = store.get(uri.toString());
   if (!raw) {
-    return undefined;
+    return Promise.resolve(undefined);
   }
-  return JSON.parse(raw) as TaskProgress;
+  return Promise.resolve(JSON.parse(raw) as TaskProgress);
 }
 
 // ---------------------------------------------------------------------------
@@ -374,7 +377,7 @@ void describe("normalizeGeneratePlanArg", () => {
     const uri = vscode.Uri.file(FOLDER);
     const result = normalizeGeneratePlanArg(uri, inv);
     assert.ok(result instanceof vscode.Uri);
-    assert.ok((result as vscode.Uri).fsPath.includes("2026-07-08_task_1"));
+    assert.ok((result).fsPath.includes("2026-07-08_task_1"));
   });
 
   void it("{ task: IncompleteTask } returns the task's folderUri", () => {
@@ -400,7 +403,7 @@ void describe("normalizeGeneratePlanArg", () => {
     const inv = makeInventoryStub(CANONICAL_ID, FOLDER);
     const result = normalizeGeneratePlanArg({ taskFolderPath: FOLDER }, inv);
     assert.ok(result instanceof vscode.Uri);
-    assert.ok((result as vscode.Uri).fsPath.includes("2026-07-08_task_1"));
+    assert.ok((result).fsPath.includes("2026-07-08_task_1"));
   });
 
   void it("{ canonicalId } found in inventory → returns a Uri", () => {
@@ -486,13 +489,13 @@ void describe("normalizePauseTaskArg", () => {
     const task = makeIncompleteTask(FOLDER);
     const result = normalizePauseTaskArg({ task });
     assert.ok(result !== undefined);
-    assert.ok(result!.taskFolderPath !== undefined,
+    assert.ok(result.taskFolderPath !== undefined,
       "TaskNode shape must yield a taskFolderPath for resolveTaskContext"
     );
-    assert.ok(result!.taskFolderPath!.includes("2026-07-08_pause_task"),
+    assert.ok(result.taskFolderPath.includes("2026-07-08_pause_task"),
       "taskFolderPath must come from the IncompleteTask's folderUri"
     );
-    assert.strictEqual(result!.canonicalId, undefined,
+    assert.strictEqual(result.canonicalId, undefined,
       "canonicalId must not be set when extracting from IncompleteTask"
     );
   });
@@ -505,13 +508,13 @@ void describe("normalizePauseTaskArg", () => {
   void it("{ canonicalId } flat shape passes through", () => {
     const result = normalizePauseTaskArg({ canonicalId: "/some/canonical/id" });
     assert.ok(result !== undefined);
-    assert.strictEqual(result!.canonicalId, "/some/canonical/id");
+    assert.strictEqual(result.canonicalId, "/some/canonical/id");
   });
 
   void it("{ taskFolderPath } flat shape passes through", () => {
     const result = normalizePauseTaskArg({ taskFolderPath: FOLDER });
     assert.ok(result !== undefined);
-    assert.strictEqual(result!.taskFolderPath, FOLDER);
+    assert.strictEqual(result.taskFolderPath, FOLDER);
   });
 
   void it("empty object {} returns undefined (triggers current-task fallback)", () => {
@@ -536,13 +539,13 @@ void describe("normalizeResumeTaskArg", () => {
     const task = makeIncompleteTask(FOLDER);
     const result = normalizeResumeTaskArg({ task });
     assert.ok(result !== undefined);
-    assert.ok(result!.taskFolderPath !== undefined,
+    assert.ok(result.taskFolderPath !== undefined,
       "TaskNode shape must yield a taskFolderPath for resolveTaskContext"
     );
-    assert.ok(result!.taskFolderPath!.includes("2026-07-08_resume_task"),
+    assert.ok(result.taskFolderPath.includes("2026-07-08_resume_task"),
       "taskFolderPath must come from the IncompleteTask's folderUri"
     );
-    assert.strictEqual(result!.canonicalId, undefined,
+    assert.strictEqual(result.canonicalId, undefined,
       "canonicalId must not be set when extracting from IncompleteTask"
     );
   });
@@ -555,13 +558,13 @@ void describe("normalizeResumeTaskArg", () => {
   void it("{ canonicalId } flat shape passes through", () => {
     const result = normalizeResumeTaskArg({ canonicalId: "/some/canonical/id" });
     assert.ok(result !== undefined);
-    assert.strictEqual(result!.canonicalId, "/some/canonical/id");
+    assert.strictEqual(result.canonicalId, "/some/canonical/id");
   });
 
   void it("{ taskFolderPath } flat shape passes through", () => {
     const result = normalizeResumeTaskArg({ taskFolderPath: FOLDER });
     assert.ok(result !== undefined);
-    assert.strictEqual(result!.taskFolderPath, FOLDER);
+    assert.strictEqual(result.taskFolderPath, FOLDER);
   });
 
   void it("empty object {} returns undefined (triggers current-task fallback)", () => {
@@ -877,9 +880,9 @@ void describe("patchTaskProgress preserves unrelated fields (pauseTask regressio
       );
 
       assert.ok(patched !== undefined);
-      assert.strictEqual(patched!.status, "paused");
+      assert.strictEqual(patched.status, "paused");
       // implReviewFiles must survive the pause mutation
-      assert.deepEqual(patched!.implReviewFiles, ["src/a.ts", "src/b.ts"],
+      assert.deepEqual(patched.implReviewFiles, ["src/a.ts", "src/b.ts"],
         "implReviewFiles must not be erased by a pause mutation"
       );
 
@@ -912,8 +915,8 @@ void describe("patchTaskProgress preserves unrelated fields (pauseTask regressio
       );
 
       assert.ok(patched !== undefined);
-      assert.strictEqual(patched!.status, "active");
-      assert.deepEqual(patched!.implReviewFiles, ["src/c.ts"],
+      assert.strictEqual(patched.status, "active");
+      assert.deepEqual(patched.implReviewFiles, ["src/c.ts"],
         "implReviewFiles must not be erased by a resume mutation"
       );
     } finally {
@@ -943,8 +946,8 @@ void describe("patchTaskProgress preserves unrelated fields (pauseTask regressio
       );
 
       assert.ok(patched !== undefined);
-      assert.strictEqual(patched!.currentStage, "impl-high-review");
-      assert.deepEqual(patched!.implReviewFiles, ["src/d.ts", "src/e.ts"],
+      assert.strictEqual(patched.currentStage, "impl-high-review");
+      assert.deepEqual(patched.implReviewFiles, ["src/d.ts", "src/e.ts"],
         "implReviewFiles must not be erased by a stage-change mutation"
       );
     } finally {
@@ -1098,7 +1101,7 @@ void describe("setTaskStage auto-review delegation (production code)", () => {
         "setTaskStage must dispatch vs-code-ai-helper.runReviewWithAI when auto-review is eligible"
       );
 
-      const dispatchArg = reviewDispatch!.arg as Record<string, unknown>;
+      const dispatchArg = reviewDispatch.arg as Record<string, unknown>;
 
       // CRITICAL: must carry taskFolderPath so normalizeReviewArg in
       // reviewActions.ts can construct a synthetic IncompleteTask for
@@ -1109,7 +1112,7 @@ void describe("setTaskStage auto-review delegation (production code)", () => {
         "auto-review dispatch must carry taskFolderPath (not canonicalId-only)"
       );
       assert.ok(
-        (dispatchArg.taskFolderPath as string).includes("set-stage-auto-review-delegation"),
+        (dispatchArg.taskFolderPath).includes("set-stage-auto-review-delegation"),
         "taskFolderPath in dispatch must match the task being advanced"
       );
     } finally {
@@ -1196,8 +1199,8 @@ void describe("setTaskStage auto-review delegation (production code)", () => {
       "normalizeReviewArg: taskFolderPath arg resolves to a synthetic IncompleteTask"
     );
     assert.ok(
-      withPath.task!.folderUri.fsPath.includes("some") ||
-        withPath.task!.folderUri.path.includes("some"),
+      withPath.task.folderUri.fsPath.includes("some") ||
+        withPath.task.folderUri.path.includes("some"),
       "normalizeReviewArg: resolved task folderUri matches the supplied path"
     );
   });
@@ -1404,14 +1407,14 @@ void describe("runReviewForFolder impl-review variable sourcing (production code
     // vscode.lm stub
     const origLm = vs.lm;
     vs.lm = {
-      selectChatModels: async () => [],
+      selectChatModels: () => Promise.resolve([]),
     };
 
     // vscode.workspace.getConfiguration stub (used by settings.ts)
     const origGetConfig = (vscode.workspace as unknown as Record<string, unknown>).getConfiguration;
     (vscode.workspace as unknown as Record<string, unknown>).getConfiguration = () => ({
       get: (_key: string, defaultValue?: unknown) => defaultValue ?? undefined,
-      update: async () => undefined,
+      update: () => Promise.resolve(undefined),
       has: () => false,
       inspect: () => undefined,
     });
@@ -1664,14 +1667,6 @@ void describe("runReviewForFolder impl-review variable sourcing (production code
     // changed to return plan.md, tests 1–3 above could still pass if content
     // happened to be the same — this test catches the URI-level regression
     // independently of content.
-    const {
-      getCanonicalImplementationUri,
-    } =
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      require("../utils/implementationArtifactResolver") as {
-        getCanonicalImplementationUri: (uri: vscode.Uri) => vscode.Uri;
-      };
-
     const folderUri = makeTaskFolderUri("uri-separation-structural");
     const implUri = getCanonicalImplementationUri(folderUri);
 
@@ -1870,8 +1865,8 @@ void describe("normalizeReviewArg canonicalId-only regression (compile-time + ru
       "taskFolderPath arg must resolve to a synthetic IncompleteTask"
     );
     assert.ok(
-      result.task!.folderUri.fsPath.includes("2026-07-08_task_1") ||
-        result.task!.folderUri.path.includes("2026-07-08_task_1"),
+      result.task.folderUri.fsPath.includes("2026-07-08_task_1") ||
+        result.task.folderUri.path.includes("2026-07-08_task_1"),
       "resolved task folderUri must match the supplied taskFolderPath"
     );
   });
@@ -1898,7 +1893,7 @@ void describe("normalizeReviewArg canonicalId-only regression (compile-time + ru
     );
   });
 
-  void it("malformed arg (canonicalId-only via cast) triggers error at command entry point, not QuickPick", async () => {
+  void it("malformed arg (canonicalId-only via cast) triggers error at command entry point, not QuickPick", () => {
     // This test exercises layer (c): the isMalformedReviewArg guard at the
     // command entry point. When a non-empty object with no well-formed { task }
     // or { taskFolderPath } key is passed (as could happen from stale JS/cast),
@@ -1913,15 +1908,15 @@ void describe("normalizeReviewArg canonicalId-only regression (compile-time + ru
     //
     // { task: {} } does NOT have a truthy folderUri, so it is malformed.
 
-    function isMalformedReviewArgSim(arg: Record<string, unknown> | undefined | unknown): boolean {
-      if (arg === undefined || arg === null) return false;
-      if (typeof arg !== "object") return false;
-      if (Object.keys(arg as object).length === 0) return false;
+    function isMalformedReviewArgSim(arg: unknown): boolean {
+      if (arg === undefined || arg === null) {return false;}
+      if (typeof arg !== "object") {return false;}
+      if (Object.keys(arg).length === 0) {return false;}
       const rec = arg as Record<string, unknown>;
       // { task } branch is valid only when task is truthy AND has truthy folderUri
       if ("task" in rec && rec.task && typeof rec.task === "object") {
         const taskObj = rec.task as Record<string, unknown>;
-        if (taskObj.folderUri) return false;
+        if (taskObj.folderUri) {return false;}
       }
       // { taskFolderPath } branch is valid only when the value is a non-empty string
       if ("taskFolderPath" in rec && typeof rec.taskFolderPath === "string" && rec.taskFolderPath.length > 0) {
@@ -2011,11 +2006,11 @@ void describe("runReviewForFolder legacy-task fallback (suite 14)", () => {
   function installRunnerStubs(): { restore: () => void } {
     const vs = vscode as unknown as Record<string, unknown>;
     const origLm = vs.lm;
-    vs.lm = { selectChatModels: async () => [] };
+    vs.lm = { selectChatModels: () => Promise.resolve([]) };
     const origGetConfig = (vscode.workspace as unknown as Record<string, unknown>).getConfiguration;
     (vscode.workspace as unknown as Record<string, unknown>).getConfiguration = () => ({
       get: (_key: string, defaultValue?: unknown) => defaultValue ?? undefined,
-      update: async () => undefined,
+      update: () => Promise.resolve(undefined),
       has: () => false,
       inspect: () => undefined,
     });
@@ -2166,7 +2161,7 @@ void describe("runReviewForFolder legacy-task fallback (suite 14)", () => {
         "plan-final.md must not be overwritten when it already exists"
       );
       assert.ok(
-        !afterContent!.includes("Legacy content"),
+        !afterContent.includes("Legacy content"),
         "plan-final.md must NOT contain legacy content when canonical file exists"
       );
 
@@ -2217,15 +2212,15 @@ void describe("isMalformedReviewArg mixed-shape bypass variants (suite 15)", () 
   // Mirror the production guard logic exactly for pure-logic assertions.
   // Production isMalformedReviewArg is not exported, so we replicate it here
   // and separately test production behavior via runReviewWithAI below.
-  function isMalformedReviewArgSim(arg: Record<string, unknown> | undefined | unknown): boolean {
-    if (arg === undefined || arg === null) return false;
-    if (typeof arg !== "object") return false;
-    if (Object.keys(arg as object).length === 0) return false;
+  function isMalformedReviewArgSim(arg: unknown): boolean {
+    if (arg === undefined || arg === null) {return false;}
+    if (typeof arg !== "object") {return false;}
+    if (Object.keys(arg).length === 0) {return false;}
     const rec = arg as Record<string, unknown>;
     // { task } branch is valid only when task is truthy AND has truthy folderUri
     if ("task" in rec && rec.task && typeof rec.task === "object") {
       const taskObj = rec.task as Record<string, unknown>;
-      if (taskObj.folderUri) return false;
+      if (taskObj.folderUri) {return false;}
     }
     // { taskFolderPath } branch is valid only when the value is a non-empty string
     if ("taskFolderPath" in rec && typeof rec.taskFolderPath === "string" && rec.taskFolderPath.length > 0) {
@@ -2389,9 +2384,9 @@ void describe("isMalformedReviewArg mixed-shape bypass variants (suite 15)", () 
     const fakeContext = {
       extensionUri: vscode.Uri.file("/fake-extension"),
       subscriptions: [],
-      globalState: { get: () => undefined, update: async () => undefined, keys: () => [], setKeysForSync: () => undefined },
-      secrets: { get: async () => undefined, store: async () => undefined, delete: async () => undefined, onDidChange: { event: () => ({ dispose: () => undefined }) } },
-      workspaceState: { get: () => undefined, update: async () => undefined, keys: () => [] },
+      globalState: { get: () => undefined, update: () => Promise.resolve(undefined), keys: () => [], setKeysForSync: () => undefined },
+      secrets: { get: () => Promise.resolve(undefined), store: () => Promise.resolve(undefined), delete: () => Promise.resolve(undefined), onDidChange: { event: () => ({ dispose: () => undefined }) } },
+      workspaceState: { get: () => undefined, update: () => Promise.resolve(undefined), keys: () => [] },
     } as unknown as vscode.ExtensionContext;
 
     try {
@@ -2425,9 +2420,9 @@ void describe("isMalformedReviewArg mixed-shape bypass variants (suite 15)", () 
     const fakeContext = {
       extensionUri: vscode.Uri.file("/fake-extension"),
       subscriptions: [],
-      globalState: { get: () => undefined, update: async () => undefined, keys: () => [], setKeysForSync: () => undefined },
-      secrets: { get: async () => undefined, store: async () => undefined, delete: async () => undefined, onDidChange: { event: () => ({ dispose: () => undefined }) } },
-      workspaceState: { get: () => undefined, update: async () => undefined, keys: () => [] },
+      globalState: { get: () => undefined, update: () => Promise.resolve(undefined), keys: () => [], setKeysForSync: () => undefined },
+      secrets: { get: () => Promise.resolve(undefined), store: () => Promise.resolve(undefined), delete: () => Promise.resolve(undefined), onDidChange: { event: () => ({ dispose: () => undefined }) } },
+      workspaceState: { get: () => undefined, update: () => Promise.resolve(undefined), keys: () => [] },
     } as unknown as vscode.ExtensionContext;
 
     try {
@@ -2471,9 +2466,9 @@ void describe("isMalformedReviewArg mixed-shape bypass variants (suite 15)", () 
     const fakeContext = {
       extensionUri: vscode.Uri.file("/fake-extension"),
       subscriptions: [],
-      globalState: { get: () => undefined, update: async () => undefined, keys: () => [], setKeysForSync: () => undefined },
-      secrets: { get: async () => undefined, store: async () => undefined, delete: async () => undefined, onDidChange: { event: () => ({ dispose: () => undefined }) } },
-      workspaceState: { get: () => undefined, update: async () => undefined, keys: () => [] },
+      globalState: { get: () => undefined, update: () => Promise.resolve(undefined), keys: () => [], setKeysForSync: () => undefined },
+      secrets: { get: () => Promise.resolve(undefined), store: () => Promise.resolve(undefined), delete: () => Promise.resolve(undefined), onDidChange: { event: () => ({ dispose: () => undefined }) } },
+      workspaceState: { get: () => undefined, update: () => Promise.resolve(undefined), keys: () => [] },
     } as unknown as vscode.ExtensionContext;
 
     let threw = false;
