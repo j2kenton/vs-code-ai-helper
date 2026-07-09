@@ -30,7 +30,6 @@ import {
   readNonEmptyText,
   resolveCurrentPlanUri,
   statIfExists,
-  writeTextFile,
 } from "../utils/fileUtils";
 import { generateContextPack, writeContextPack, writeImplReviewContextPack } from "../utils/contextPack";
 import { renderPromptTemplate } from "../utils/promptTemplates";
@@ -611,10 +610,9 @@ export async function runReviewForFolder(
     //
     //   {{plan}} — the plan the implementation was supposed to follow.
     //     Source: plan.md (resolveCurrentPlanUri), NOT plan-final.md.
-    //     After an implementation run, plan-final.md is overwritten with the
-    //     run summary, so using it for {{plan}} would inject the summary
-    //     into both slots and the reviewer would compare the same text
-    //     against itself.
+    //     Using plan-final.md here would inject implementation notes into
+    //     both slots and the reviewer would compare the same text against
+    //     itself.
     //
     //   {{implementation}} — the run summary / implementation notes.
     //     Source: plan-final.md (getCanonicalImplementationUri).
@@ -1313,7 +1311,6 @@ async function executeImplementationRun(
   progressTitle: string,
   postRunReviewStage: TaskStage = "implementation"
 ): Promise<void> {
-  const implementationUri = getCanonicalImplementationUri(folderUri);
   const cwd = workspaceRoot.uri.fsPath;
 
   // Pre-run safety checks for agentic file-editing runs
@@ -1400,13 +1397,6 @@ async function executeImplementationRun(
       );
     }
 
-    const summary =
-      result.summary?.trim() ||
-      `## Implementation Complete\n\nFiles changed:\n${
-        result.filesChanged.map((f) => `- ${f}`).join("\n") || "_none recorded_"
-      }`;
-    await writeTextFile(implementationUri, summary);
-
     // Use patchTaskProgress to avoid overwriting unrelated fields.
     await patchTaskProgress(folderUri, (currentProgress) => {
       const alreadyAtOrPastImplementation =
@@ -1424,6 +1414,7 @@ async function executeImplementationRun(
       return stageUpdated;
     });
 
+    const implementationUri = getCanonicalImplementationUri(folderUri);
     const doc = await vscode.workspace.openTextDocument(implementationUri);
     await vscode.window.showTextDocument(doc);
     // Auto-review after implementation run — bypass consent (already obtained)

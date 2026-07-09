@@ -289,7 +289,7 @@ export interface ImplementationRunResult {
    * empty filesChanged as "nothing changed".
    */
   filesChangedUnknown?: boolean;
-  /** Markdown summary text written back to plan-final.md after a completed run */
+  /** Markdown summary text returned for logs/user feedback after a completed run */
   summary?: string;
   errorMessage?: string;
 }

@@ -119,6 +119,102 @@ interface CliExecResult {
   errorMessage?: string;
 }
 
+const ANSI_ESCAPE_PATTERN =
+  // eslint-disable-next-line no-control-regex
+  /\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g;
+
+function stripAnsi(value: string): string {
+  return value.replace(ANSI_ESCAPE_PATTERN, "");
+}
+
+function tryReadFileUriContent(value: string): string | undefined {
+  const fileUriMatches = value.match(/file:\/\/\/[^\s)]+/g);
+  if (!fileUriMatches) {
+    return undefined;
+  }
+
+  for (const rawMatch of fileUriMatches) {
+    try {
+      const uri = vscode.Uri.parse(rawMatch);
+      if (!uri.fsPath || !nodeFs.existsSync(uri.fsPath)) {
+        continue;
+      }
+      const content = nodeFs.readFileSync(uri.fsPath, "utf8").trim();
+      if (content.length > 0) {
+        return stripAnsi(content).trim();
+      }
+    } catch {
+      // Ignore malformed URIs or unreadable files and keep trying.
+    }
+  }
+
+  return undefined;
+}
+
+function extractKiroFinalOutput(stdout: string): string {
+  const cleaned = stripAnsi(stdout).trim();
+  if (cleaned.length === 0) {
+    return cleaned;
+  }
+
+  const fromFile = tryReadFileUriContent(cleaned);
+  if (fromFile) {
+    return fromFile;
+  }
+
+  const markers = [
+    "Based on my analysis",
+    "Here's my low-level review:",
+    "Here's my high-level review:",
+    "## Summary Verdict",
+    "## Conclusion",
+    "I have completed a high-level review",
+  ];
+
+  let bestIndex = -1;
+  for (const marker of markers) {
+    const index = cleaned.indexOf(marker);
+    if (index >= 0 && (bestIndex < 0 || index < bestIndex)) {
+      bestIndex = index;
+    }
+  }
+  if (bestIndex >= 0) {
+    return cleaned.slice(bestIndex).trim();
+  }
+
+  return cleaned;
+}
+
+function normalizeCliOutput(
+  def: CliProviderDefinition,
+  stdout: string,
+  lastMessageFile: string | undefined
+): string {
+  let output = stripAnsi(stdout).trim();
+  if (lastMessageFile) {
+    try {
+      const fromFile = nodeFs.readFileSync(lastMessageFile, "utf8").trim();
+      if (fromFile.length > 0) {
+        output = stripAnsi(fromFile).trim();
+      }
+    } catch {
+      // Fall back to stdout when the CLI never wrote the file.
+    }
+  }
+
+  if (def.id === "kiro-cli") {
+    return extractKiroFinalOutput(output);
+  }
+
+  return output;
+}
+
+export const __testOnly = {
+  stripAnsi,
+  extractKiroFinalOutput,
+  normalizeCliOutput,
+};
+
 /**
  * Convert raw CLI failure output into a user-facing error, surfacing the
  * provider's login hint when the output looks like an auth problem.
@@ -308,19 +404,7 @@ export async function execCliAgent(options: {
         return;
       }
 
-      let output = stdout.trim();
-      if (lastMessageFile) {
-        try {
-          const fromFile = nodeFs
-            .readFileSync(lastMessageFile, "utf8")
-            .trim();
-          if (fromFile.length > 0) {
-            output = fromFile;
-          }
-        } catch {
-          // Fall back to stdout when the CLI never wrote the file.
-        }
-      }
+      const output = normalizeCliOutput(def, stdout, lastMessageFile);
 
       if (code !== 0) {
         finish({

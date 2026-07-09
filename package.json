@@ -475,7 +475,7 @@
     "check-types": "tsc --noEmit",
     "lint": "eslint src",
     "lint:fix": "eslint src --fix",
-    "test:unit": "tsc --project tsconfig.test.json && node --require ./test-stubs/register.js --test out/test/pathSafety.test.js out/test/implReviewFileSelection.test.js out/test/taskTreeProvider.test.js out/test/stage3ActionMatrix.test.js out/test/treeReliability.test.js out/test/contextEligibility.test.js out/test/disclaimerVersion.test.js out/test/taskProgressUtils.test.js out/test/draftTaskWithAI.test.js out/test/reviewActionArgs.test.js out/test/commandArgNormalization.test.js out/test/providerCliContracts.test.js out/test/cliAgentRunnerArgvLimit.test.js out/test/cliModelDiscovery.test.js out/test/modelSelection.test.js",
+    "test:unit": "tsc --project tsconfig.test.json && node --require ./test-stubs/register.js --test out/test/pathSafety.test.js out/test/implReviewFileSelection.test.js out/test/taskTreeProvider.test.js out/test/stage3ActionMatrix.test.js out/test/treeReliability.test.js out/test/contextEligibility.test.js out/test/disclaimerVersion.test.js out/test/taskProgressUtils.test.js out/test/draftTaskWithAI.test.js out/test/reviewActionArgs.test.js out/test/commandArgNormalization.test.js out/test/providerCliContracts.test.js out/test/cliAgentRunnerArgvLimit.test.js out/test/cliAgentRunnerOutput.test.js out/test/cliModelDiscovery.test.js out/test/modelSelection.test.js",
     "test": "vscode-test",
     "vsix": "vsce package",
     "publish": "vsce publish",
