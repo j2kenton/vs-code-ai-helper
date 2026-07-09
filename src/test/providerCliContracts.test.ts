@@ -60,15 +60,16 @@ void describe("provider CLI contracts", () => {
     const codex = getCliProvider("codex-cli");
     assert.ok(codex, "expected codex-cli provider definition");
 
-    const parsed = parseCodexModelSelection("gpt-5.6-terra@ultra");
+    const parsed = parseCodexModelSelection("gpt-5.6-terra@ultra+fast");
     assert.deepStrictEqual(parsed, {
       model: "gpt-5.6-terra",
       reasoningEffort: "ultra",
+      serviceTier: "priority",
     });
 
     const textArgs = codex.buildArgs(
       "text",
-      "gpt-5.6-terra@ultra",
+      "gpt-5.6-terra@ultra+fast",
       "/tmp/codex-last-message.md"
     );
     assert.deepStrictEqual(textArgs, [
@@ -82,6 +83,8 @@ void describe("provider CLI contracts", () => {
       "gpt-5.6-terra",
       "-c",
       'model_reasoning_effort="ultra"',
+      "-c",
+      'service_tier="priority"',
       "--output-last-message",
       "/tmp/codex-last-message.md",
       "-",

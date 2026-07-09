@@ -93,28 +93,35 @@ const CODEX_REASONING_EFFORTS = new Set([
 export interface ParsedCodexModelSelection {
   model: string | undefined;
   reasoningEffort: string | undefined;
+  serviceTier: string | undefined;
 }
 
 export function parseCodexModelSelection(
   model: string | undefined
 ): ParsedCodexModelSelection {
   if (!model) {
-    return { model: undefined, reasoningEffort: undefined };
+    return {
+      model: undefined,
+      reasoningEffort: undefined,
+      serviceTier: undefined,
+    };
   }
 
   const separator = model.lastIndexOf("@");
   if (separator <= 0) {
-    return { model, reasoningEffort: undefined };
+    return { model, reasoningEffort: undefined, serviceTier: undefined };
   }
 
-  const reasoningEffort = model.slice(separator + 1);
-  if (!CODEX_REASONING_EFFORTS.has(reasoningEffort)) {
-    return { model, reasoningEffort: undefined };
+  const selection = model.slice(separator + 1);
+  const [reasoningEffort, speedTier] = selection.split("+", 2);
+  if (!reasoningEffort || !CODEX_REASONING_EFFORTS.has(reasoningEffort)) {
+    return { model, reasoningEffort: undefined, serviceTier: undefined };
   }
 
   return {
     model: model.slice(0, separator) || undefined,
     reasoningEffort,
+    serviceTier: speedTier === "fast" ? "priority" : undefined,
   };
 }
 
@@ -173,6 +180,9 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
           "-c",
           `model_reasoning_effort="${parsedModel.reasoningEffort}"`
         );
+      }
+      if (parsedModel.serviceTier) {
+        args.push("-c", `service_tier="${parsedModel.serviceTier}"`);
       }
       if (lastMessageFile) {
         args.push("--output-last-message", lastMessageFile);

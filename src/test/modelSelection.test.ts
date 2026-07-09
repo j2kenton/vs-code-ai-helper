@@ -23,6 +23,40 @@ function antigravityModels(
   return providerModels(models, "Antigravity CLI (subscription CLI)");
 }
 
+function codexVariant(
+  id: string,
+  name: string
+): SelectableModel {
+  return {
+    id,
+    name,
+    providerLabel: "OpenAI Codex (subscription CLI)",
+  };
+}
+
+function codexVariants(
+  model: string,
+  label: string,
+  efforts: readonly (readonly [string, string])[],
+  includeFastVariants: boolean
+): SelectableModel[] {
+  const variants: SelectableModel[] = [];
+  for (const [effort, effortLabel] of efforts) {
+    variants.push(
+      codexVariant(`codex-cli:${model}@${effort}`, `${label} (${effortLabel})`)
+    );
+    if (includeFastVariants) {
+      variants.push(
+        codexVariant(
+          `codex-cli:${model}@${effort}+fast`,
+          `${label} (${effortLabel}, Fast)`
+        )
+      );
+    }
+  }
+  return variants;
+}
+
 void describe("CLI model refresh fallback", () => {
   void it("keeps existing defaults when discovery returns an empty list", () => {
     const current = [
@@ -154,126 +188,65 @@ void describe("getAvailableModels", () => {
       assert.deepStrictEqual(
         providerModels(models, "OpenAI Codex (subscription CLI)"),
         [
-          {
-            id: "codex-cli:default",
-            name: "Codex (CLI default)",
-            providerLabel: "OpenAI Codex (subscription CLI)",
-          },
-          {
-            id: "codex-cli:gpt-5.5@low",
-            name: "GPT-5.5 (Low)",
-            providerLabel: "OpenAI Codex (subscription CLI)",
-          },
-          {
-            id: "codex-cli:gpt-5.5@medium",
-            name: "GPT-5.5 (Medium)",
-            providerLabel: "OpenAI Codex (subscription CLI)",
-          },
-          {
-            id: "codex-cli:gpt-5.5@high",
-            name: "GPT-5.5 (High)",
-            providerLabel: "OpenAI Codex (subscription CLI)",
-          },
-          {
-            id: "codex-cli:gpt-5.5@xhigh",
-            name: "GPT-5.5 (Extra High)",
-            providerLabel: "OpenAI Codex (subscription CLI)",
-          },
-          {
-            id: "codex-cli:gpt-5.6-terra@low",
-            name: "GPT-5.6-Terra (Low)",
-            providerLabel: "OpenAI Codex (subscription CLI)",
-          },
-          {
-            id: "codex-cli:gpt-5.6-terra@medium",
-            name: "GPT-5.6-Terra (Medium)",
-            providerLabel: "OpenAI Codex (subscription CLI)",
-          },
-          {
-            id: "codex-cli:gpt-5.6-terra@high",
-            name: "GPT-5.6-Terra (High)",
-            providerLabel: "OpenAI Codex (subscription CLI)",
-          },
-          {
-            id: "codex-cli:gpt-5.6-terra@xhigh",
-            name: "GPT-5.6-Terra (Extra High)",
-            providerLabel: "OpenAI Codex (subscription CLI)",
-          },
-          {
-            id: "codex-cli:gpt-5.6-terra@max",
-            name: "GPT-5.6-Terra (Max)",
-            providerLabel: "OpenAI Codex (subscription CLI)",
-          },
-          {
-            id: "codex-cli:gpt-5.6-terra@ultra",
-            name: "GPT-5.6-Terra (Ultra)",
-            providerLabel: "OpenAI Codex (subscription CLI)",
-          },
-          {
-            id: "codex-cli:gpt-5.6-luna@low",
-            name: "GPT-5.6-Luna (Low)",
-            providerLabel: "OpenAI Codex (subscription CLI)",
-          },
-          {
-            id: "codex-cli:gpt-5.6-luna@medium",
-            name: "GPT-5.6-Luna (Medium)",
-            providerLabel: "OpenAI Codex (subscription CLI)",
-          },
-          {
-            id: "codex-cli:gpt-5.6-luna@high",
-            name: "GPT-5.6-Luna (High)",
-            providerLabel: "OpenAI Codex (subscription CLI)",
-          },
-          {
-            id: "codex-cli:gpt-5.6-luna@xhigh",
-            name: "GPT-5.6-Luna (Extra High)",
-            providerLabel: "OpenAI Codex (subscription CLI)",
-          },
-          {
-            id: "codex-cli:gpt-5.6-luna@max",
-            name: "GPT-5.6-Luna (Max)",
-            providerLabel: "OpenAI Codex (subscription CLI)",
-          },
-          {
-            id: "codex-cli:gpt-5.4@low",
-            name: "GPT-5.4 (Low)",
-            providerLabel: "OpenAI Codex (subscription CLI)",
-          },
-          {
-            id: "codex-cli:gpt-5.4@medium",
-            name: "GPT-5.4 (Medium)",
-            providerLabel: "OpenAI Codex (subscription CLI)",
-          },
-          {
-            id: "codex-cli:gpt-5.4@high",
-            name: "GPT-5.4 (High)",
-            providerLabel: "OpenAI Codex (subscription CLI)",
-          },
-          {
-            id: "codex-cli:gpt-5.4@xhigh",
-            name: "GPT-5.4 (Extra High)",
-            providerLabel: "OpenAI Codex (subscription CLI)",
-          },
-          {
-            id: "codex-cli:gpt-5.4-mini@low",
-            name: "GPT-5.4-Mini (Low)",
-            providerLabel: "OpenAI Codex (subscription CLI)",
-          },
-          {
-            id: "codex-cli:gpt-5.4-mini@medium",
-            name: "GPT-5.4-Mini (Medium)",
-            providerLabel: "OpenAI Codex (subscription CLI)",
-          },
-          {
-            id: "codex-cli:gpt-5.4-mini@high",
-            name: "GPT-5.4-Mini (High)",
-            providerLabel: "OpenAI Codex (subscription CLI)",
-          },
-          {
-            id: "codex-cli:gpt-5.4-mini@xhigh",
-            name: "GPT-5.4-Mini (Extra High)",
-            providerLabel: "OpenAI Codex (subscription CLI)",
-          },
+          codexVariant("codex-cli:default", "Codex (CLI default)"),
+          ...codexVariants(
+            "gpt-5.5",
+            "GPT-5.5",
+            [
+              ["low", "Low"],
+              ["medium", "Medium"],
+              ["high", "High"],
+              ["xhigh", "Extra High"],
+            ],
+            true
+          ),
+          ...codexVariants(
+            "gpt-5.6-terra",
+            "GPT-5.6-Terra",
+            [
+              ["low", "Low"],
+              ["medium", "Medium"],
+              ["high", "High"],
+              ["xhigh", "Extra High"],
+              ["max", "Max"],
+              ["ultra", "Ultra"],
+            ],
+            true
+          ),
+          ...codexVariants(
+            "gpt-5.6-luna",
+            "GPT-5.6-Luna",
+            [
+              ["low", "Low"],
+              ["medium", "Medium"],
+              ["high", "High"],
+              ["xhigh", "Extra High"],
+              ["max", "Max"],
+            ],
+            true
+          ),
+          ...codexVariants(
+            "gpt-5.4",
+            "GPT-5.4",
+            [
+              ["low", "Low"],
+              ["medium", "Medium"],
+              ["high", "High"],
+              ["xhigh", "Extra High"],
+            ],
+            true
+          ),
+          ...codexVariants(
+            "gpt-5.4-mini",
+            "GPT-5.4-Mini",
+            [
+              ["low", "Low"],
+              ["medium", "Medium"],
+              ["high", "High"],
+              ["xhigh", "Extra High"],
+            ],
+            false
+          ),
         ]
       );
       assert.deepStrictEqual(

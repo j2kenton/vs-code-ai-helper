@@ -212,52 +212,60 @@ function createCodexReasoningVariant(
   };
 }
 
+function createCodexSpeedVariant(
+  model: string,
+  label: string,
+  effort: string,
+  effortLabel: string
+): DiscoveredCliModel {
+  return {
+    model: `${model}@${effort}+fast`,
+    name: `${label} (${effortLabel}, Fast)`,
+  };
+}
+
 function createSeededCodexModels(): readonly DiscoveredCliModel[] {
+  const createVariants = (
+    model: string,
+    label: string,
+    efforts: readonly (readonly [string, string])[]
+  ): DiscoveredCliModel[] => {
+    const variants: DiscoveredCliModel[] = [];
+    for (const [effort, effortLabel] of efforts) {
+      variants.push(createCodexReasoningVariant(model, label, effort, effortLabel));
+      variants.push(createCodexSpeedVariant(model, label, effort, effortLabel));
+    }
+    return variants;
+  };
+
   return [
-    createCodexReasoningVariant("gpt-5.5", "GPT-5.5", "low", "Low"),
-    createCodexReasoningVariant("gpt-5.5", "GPT-5.5", "medium", "Medium"),
-    createCodexReasoningVariant("gpt-5.5", "GPT-5.5", "high", "High"),
-    createCodexReasoningVariant("gpt-5.5", "GPT-5.5", "xhigh", "Extra High"),
-    createCodexReasoningVariant("gpt-5.6-terra", "GPT-5.6-Terra", "low", "Low"),
-    createCodexReasoningVariant(
-      "gpt-5.6-terra",
-      "GPT-5.6-Terra",
-      "medium",
-      "Medium"
-    ),
-    createCodexReasoningVariant("gpt-5.6-terra", "GPT-5.6-Terra", "high", "High"),
-    createCodexReasoningVariant(
-      "gpt-5.6-terra",
-      "GPT-5.6-Terra",
-      "xhigh",
-      "Extra High"
-    ),
-    createCodexReasoningVariant("gpt-5.6-terra", "GPT-5.6-Terra", "max", "Max"),
-    createCodexReasoningVariant(
-      "gpt-5.6-terra",
-      "GPT-5.6-Terra",
-      "ultra",
-      "Ultra"
-    ),
-    createCodexReasoningVariant("gpt-5.6-luna", "GPT-5.6-Luna", "low", "Low"),
-    createCodexReasoningVariant(
-      "gpt-5.6-luna",
-      "GPT-5.6-Luna",
-      "medium",
-      "Medium"
-    ),
-    createCodexReasoningVariant("gpt-5.6-luna", "GPT-5.6-Luna", "high", "High"),
-    createCodexReasoningVariant(
-      "gpt-5.6-luna",
-      "GPT-5.6-Luna",
-      "xhigh",
-      "Extra High"
-    ),
-    createCodexReasoningVariant("gpt-5.6-luna", "GPT-5.6-Luna", "max", "Max"),
-    createCodexReasoningVariant("gpt-5.4", "GPT-5.4", "low", "Low"),
-    createCodexReasoningVariant("gpt-5.4", "GPT-5.4", "medium", "Medium"),
-    createCodexReasoningVariant("gpt-5.4", "GPT-5.4", "high", "High"),
-    createCodexReasoningVariant("gpt-5.4", "GPT-5.4", "xhigh", "Extra High"),
+    ...createVariants("gpt-5.5", "GPT-5.5", [
+      ["low", "Low"],
+      ["medium", "Medium"],
+      ["high", "High"],
+      ["xhigh", "Extra High"],
+    ]),
+    ...createVariants("gpt-5.6-terra", "GPT-5.6-Terra", [
+      ["low", "Low"],
+      ["medium", "Medium"],
+      ["high", "High"],
+      ["xhigh", "Extra High"],
+      ["max", "Max"],
+      ["ultra", "Ultra"],
+    ]),
+    ...createVariants("gpt-5.6-luna", "GPT-5.6-Luna", [
+      ["low", "Low"],
+      ["medium", "Medium"],
+      ["high", "High"],
+      ["xhigh", "Extra High"],
+      ["max", "Max"],
+    ]),
+    ...createVariants("gpt-5.4", "GPT-5.4", [
+      ["low", "Low"],
+      ["medium", "Medium"],
+      ["high", "High"],
+      ["xhigh", "Extra High"],
+    ]),
     createCodexReasoningVariant("gpt-5.4-mini", "GPT-5.4-Mini", "low", "Low"),
     createCodexReasoningVariant(
       "gpt-5.4-mini",
