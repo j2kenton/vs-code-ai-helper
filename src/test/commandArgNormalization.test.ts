@@ -135,12 +135,12 @@ function makeInventoryStub(
   // @ts-expect-error — direct field init on stub
   inv.suppressionAliasMap = new Map();
   // Stub refresh: no-op (the inventory is already "refreshed")
-  inv.refresh = async () => { /* no-op */ };
-  inv.getTasks = () => [task];
-  inv.getTaskById = (id: string) => (id === knownId ? task : undefined);
-  inv.getTaskByPath = (p: string) => (p === taskFolderPath ? task : undefined);
-  inv.getVisibleTaskForSuppressedId = () => undefined;
-  inv.getVisibleTaskForSuppressedPath = () => undefined;
+  inv.refresh = async (): Promise<void> => { /* no-op */ };
+  inv.getTasks = (): Array<typeof task> => [task];
+  inv.getTaskById = (id: string): typeof task | undefined => (id === knownId ? task : undefined);
+  inv.getTaskByPath = (p: string): typeof task | undefined => (p === taskFolderPath ? task : undefined);
+  inv.getVisibleTaskForSuppressedId = (): undefined => undefined;
+  inv.getVisibleTaskForSuppressedPath = (): undefined => undefined;
   return inv;
 }
 
@@ -155,12 +155,12 @@ function makeEmptyInventoryStub(): TaskInventory {
   inv.taskByCanonicalId = new Map();
   // @ts-expect-error — direct field init on stub
   inv.suppressionAliasMap = new Map();
-  inv.refresh = async () => { /* no-op */ };
-  inv.getTasks = () => [];
-  inv.getTaskById = () => undefined;
-  inv.getTaskByPath = () => undefined;
-  inv.getVisibleTaskForSuppressedId = () => undefined;
-  inv.getVisibleTaskForSuppressedPath = () => undefined;
+  inv.refresh = async (): Promise<void> => { /* no-op */ };
+  inv.getTasks = (): Array<never> => [];
+  inv.getTaskById = (): undefined => undefined;
+  inv.getTaskByPath = (): undefined => undefined;
+  inv.getVisibleTaskForSuppressedId = (): undefined => undefined;
+  inv.getVisibleTaskForSuppressedPath = (): undefined => undefined;
   return inv;
 }
 
@@ -194,12 +194,12 @@ function makeInventoryStubWithStage(
   inv.taskByCanonicalId = new Map([[knownId, task]]);
   // @ts-expect-error — direct field init on stub
   inv.suppressionAliasMap = new Map();
-  inv.refresh = async () => { /* no-op */ };
-  inv.getTasks = () => [task];
-  inv.getTaskById = (id: string) => (id === knownId ? task : undefined);
-  inv.getTaskByPath = (p: string) => (p === taskFolderPath ? task : undefined);
-  inv.getVisibleTaskForSuppressedId = () => undefined;
-  inv.getVisibleTaskForSuppressedPath = () => undefined;
+  inv.refresh = async (): Promise<void> => { /* no-op */ };
+  inv.getTasks = (): Array<typeof task> => [task];
+  inv.getTaskById = (id: string): typeof task | undefined => (id === knownId ? task : undefined);
+  inv.getTaskByPath = (p: string): typeof task | undefined => (p === taskFolderPath ? task : undefined);
+  inv.getVisibleTaskForSuppressedId = (): undefined => undefined;
+  inv.getVisibleTaskForSuppressedPath = (): undefined => undefined;
   return inv;
 }
 
@@ -209,7 +209,11 @@ function makeInventoryStubWithStage(
 function makeIncompleteTask(
   folderPath: string,
   status: "active" | "paused" = "active"
-) {
+): {
+  folderUri: vscode.Uri;
+  folderName: string;
+  progress: TaskProgress;
+} {
   return {
     folderUri: vscode.Uri.file(folderPath),
     folderName: folderPath.split(/[/\\]/).pop() ?? "",
@@ -231,9 +235,9 @@ import { CurrentTaskStore } from "../utils/currentTaskStore";
 
 function makeCurrentTaskStoreStub(persistedId?: string): CurrentTaskStore {
   const store = Object.create(CurrentTaskStore.prototype) as CurrentTaskStore;
-  store.get = () => persistedId;
-  store.set = async () => { /* no-op */ };
-  store.clear = async () => { /* no-op */ };
+  store.get = (): string | undefined => persistedId;
+  store.set = async (): Promise<void> => { /* no-op */ };
+  store.clear = async (): Promise<void> => { /* no-op */ };
   return store;
 }
 
@@ -261,31 +265,31 @@ function installMessageCapture(): {
   const origQuickPick = win.showQuickPick;
   const origWithProgress = win.withProgress;
 
-  win.showInformationMessage = (msg: string) => {
+  win.showInformationMessage = (msg: string): Promise<undefined> => {
     captured.push({ method: "info", message: msg });
     return Promise.resolve(undefined);
   };
-  win.showErrorMessage = (msg: string) => {
+  win.showErrorMessage = (msg: string): Promise<undefined> => {
     captured.push({ method: "error", message: msg });
     return Promise.resolve(undefined);
   };
-  win.showWarningMessage = (msg: string) => {
+  win.showWarningMessage = (msg: string): Promise<undefined> => {
     captured.push({ method: "warning", message: msg });
     return Promise.resolve(undefined);
   };
-  win.showQuickPick = () => {
+  win.showQuickPick = (): Promise<undefined> => {
     return Promise.resolve(undefined);
   };
   win.withProgress = async (
     _options: unknown,
     task: (progress: unknown, token: unknown) => Thenable<unknown>
-  ) => {
-    return task({ report: () => undefined }, { isCancellationRequested: false });
+  ): Thenable<unknown> => {
+    return task({ report: (): void => undefined }, { isCancellationRequested: false });
   };
 
   return {
     captured,
-    restore: () => {
+    restore: (): void => {
       win.showInformationMessage = origInfo;
       win.showErrorMessage = origErr;
       win.showWarningMessage = origWarn;
@@ -325,7 +329,7 @@ function installMemStore(store: Map<string, string>): FsStubHandles {
   };
 
   return {
-    restore: () => {
+    restore: (): void => {
       (vscode.workspace.fs as unknown as Record<string, unknown>).readFile = origReadFile;
       (vscode.workspace.fs as unknown as Record<string, unknown>).writeFile = origWriteFile;
     },
@@ -1014,7 +1018,7 @@ void describe("setTaskStage auto-review delegation (production code)", () => {
       { uri: vscode.Uri.file("/fake-workspace"), name: "fake-workspace", index: 0 },
     ];
     return {
-      restore: () => {
+      restore: (): void => {
         (vscode.workspace as unknown as Record<string, unknown>).workspaceFolders = orig;
       },
     };
@@ -1038,13 +1042,13 @@ void describe("setTaskStage auto-review delegation (production code)", () => {
     (vscode.commands as unknown as Record<string, unknown>).executeCommand = async (
       command: string,
       arg?: unknown
-    ) => {
+    ): Promise<undefined> => {
       captured.push({ command, arg });
       return Promise.resolve(undefined);
     };
     return {
       captured,
-      restore: () => {
+      restore: (): void => {
         (vscode.commands as unknown as Record<string, unknown>).executeCommand = orig;
       },
     };
@@ -1217,7 +1221,7 @@ void describe("setTaskStage auto-review delegation (production code)", () => {
 void describe("installMessageCapture restore contract", () => {
   void it("restore() reinstates the original showInformationMessage", () => {
     const win = vscode.window as unknown as Record<string, unknown>;
-    const sentinel = () => Promise.resolve(undefined);
+    const sentinel = (): Promise<undefined> => Promise.resolve(undefined);
     win.showInformationMessage = sentinel;
 
     const capture = installMessageCapture();
@@ -1238,7 +1242,7 @@ void describe("installMessageCapture restore contract", () => {
 
   void it("restore() reinstates the original showErrorMessage", () => {
     const win = vscode.window as unknown as Record<string, unknown>;
-    const sentinel = () => Promise.resolve(undefined);
+    const sentinel = (): Promise<undefined> => Promise.resolve(undefined);
     win.showErrorMessage = sentinel;
 
     const capture = installMessageCapture();
@@ -1254,7 +1258,7 @@ void describe("installMessageCapture restore contract", () => {
 
   void it("restore() reinstates the original showWarningMessage", () => {
     const win = vscode.window as unknown as Record<string, unknown>;
-    const sentinel = () => Promise.resolve(undefined);
+    const sentinel = (): Promise<undefined> => Promise.resolve(undefined);
     win.showWarningMessage = sentinel;
 
     const capture = installMessageCapture();
@@ -1270,7 +1274,7 @@ void describe("installMessageCapture restore contract", () => {
 
   void it("restore() reinstates the original showQuickPick", () => {
     const win = vscode.window as unknown as Record<string, unknown>;
-    const sentinel = () => Promise.resolve(undefined);
+    const sentinel = (): Promise<undefined> => Promise.resolve(undefined);
     win.showQuickPick = sentinel;
 
     const capture = installMessageCapture();
@@ -1286,7 +1290,7 @@ void describe("installMessageCapture restore contract", () => {
 
   void it("restore() reinstates the original withProgress", () => {
     const win = vscode.window as unknown as Record<string, unknown>;
-    const sentinel = () => Promise.resolve(undefined);
+    const sentinel = (): Promise<undefined> => Promise.resolve(undefined);
     win.withProgress = sentinel;
 
     const capture = installMessageCapture();
@@ -1302,14 +1306,14 @@ void describe("installMessageCapture restore contract", () => {
 
   void it("nested capture/restore correctly reinstates two levels of overrides", () => {
     const win = vscode.window as unknown as Record<string, unknown>;
-    const outerSentinel = () => Promise.resolve("outer");
+    const outerSentinel = (): Promise<string> => Promise.resolve("outer");
     win.showInformationMessage = outerSentinel;
 
     const outer = installMessageCapture();
     // Outer capture replaced the sentinel
     assert.notStrictEqual(win.showInformationMessage, outerSentinel);
 
-    const innerSentinel = () => Promise.resolve("inner");
+    const innerSentinel = (): Promise<string> => Promise.resolve("inner");
     // Simulate a nested test overriding further
     win.showInformationMessage = innerSentinel;
 
@@ -1412,8 +1416,13 @@ void describe("runReviewForFolder impl-review variable sourcing (production code
 
     // vscode.workspace.getConfiguration stub (used by settings.ts)
     const origGetConfig = (vscode.workspace as unknown as Record<string, unknown>).getConfiguration;
-    (vscode.workspace as unknown as Record<string, unknown>).getConfiguration = () => ({
-      get: (_key: string, defaultValue?: unknown) => defaultValue ?? undefined,
+    (vscode.workspace as unknown as Record<string, unknown>).getConfiguration = (): {
+      get: (_key: string, defaultValue?: unknown) => unknown;
+      update: () => Promise<undefined>;
+      has: () => boolean;
+      inspect: () => undefined;
+    } => ({
+      get: (_key: string, defaultValue?: unknown): unknown => defaultValue ?? undefined,
       update: () => Promise.resolve(undefined),
       has: () => false,
       inspect: () => undefined,
@@ -1424,7 +1433,7 @@ void describe("runReviewForFolder impl-review variable sourcing (production code
     (vscode.workspace as unknown as Record<string, unknown>).textDocuments = [];
 
     return {
-      restore: () => {
+      restore: (): void => {
         vs.lm = origLm;
         (vscode.workspace as unknown as Record<string, unknown>).getConfiguration = origGetConfig;
         (vscode.workspace as unknown as Record<string, unknown>).textDocuments = origTextDocuments;
@@ -1703,7 +1712,7 @@ void describe("setTaskStage deleted-task error path", () => {
       { uri: vscode.Uri.file("/fake-workspace"), name: "fake-workspace", index: 0 },
     ];
     return {
-      restore: () => {
+      restore: (): void => {
         (vscode.workspace as unknown as Record<string, unknown>).workspaceFolders = orig;
       },
     };
@@ -2008,8 +2017,13 @@ void describe("runReviewForFolder legacy-task fallback (suite 14)", () => {
     const origLm = vs.lm;
     vs.lm = { selectChatModels: () => Promise.resolve([]) };
     const origGetConfig = (vscode.workspace as unknown as Record<string, unknown>).getConfiguration;
-    (vscode.workspace as unknown as Record<string, unknown>).getConfiguration = () => ({
-      get: (_key: string, defaultValue?: unknown) => defaultValue ?? undefined,
+    (vscode.workspace as unknown as Record<string, unknown>).getConfiguration = (): {
+      get: (_key: string, defaultValue?: unknown) => unknown;
+      update: () => Promise<undefined>;
+      has: () => boolean;
+      inspect: () => undefined;
+    } => ({
+      get: (_key: string, defaultValue?: unknown): unknown => defaultValue ?? undefined,
       update: () => Promise.resolve(undefined),
       has: () => false,
       inspect: () => undefined,
@@ -2017,7 +2031,7 @@ void describe("runReviewForFolder legacy-task fallback (suite 14)", () => {
     const origTextDocuments = (vscode.workspace as unknown as Record<string, unknown>).textDocuments;
     (vscode.workspace as unknown as Record<string, unknown>).textDocuments = [];
     return {
-      restore: () => {
+      restore: (): void => {
         vs.lm = origLm;
         (vscode.workspace as unknown as Record<string, unknown>).getConfiguration = origGetConfig;
         (vscode.workspace as unknown as Record<string, unknown>).textDocuments = origTextDocuments;
@@ -2384,9 +2398,9 @@ void describe("isMalformedReviewArg mixed-shape bypass variants (suite 15)", () 
     const fakeContext = {
       extensionUri: vscode.Uri.file("/fake-extension"),
       subscriptions: [],
-      globalState: { get: () => undefined, update: () => Promise.resolve(undefined), keys: () => [], setKeysForSync: () => undefined },
-      secrets: { get: () => Promise.resolve(undefined), store: () => Promise.resolve(undefined), delete: () => Promise.resolve(undefined), onDidChange: { event: () => ({ dispose: () => undefined }) } },
-      workspaceState: { get: () => undefined, update: () => Promise.resolve(undefined), keys: () => [] },
+      globalState: { get: (): undefined => undefined, update: (): Promise<undefined> => Promise.resolve(undefined), keys: (): string[] => [], setKeysForSync: (): undefined => undefined },
+      secrets: { get: (): Promise<undefined> => Promise.resolve(undefined), store: (): Promise<undefined> => Promise.resolve(undefined), delete: (): Promise<undefined> => Promise.resolve(undefined), onDidChange: { event: (): { dispose: () => void } => ({ dispose: (): void => undefined }) } },
+      workspaceState: { get: (): undefined => undefined, update: (): Promise<undefined> => Promise.resolve(undefined), keys: (): string[] => [] },
     } as unknown as vscode.ExtensionContext;
 
     try {
@@ -2420,9 +2434,9 @@ void describe("isMalformedReviewArg mixed-shape bypass variants (suite 15)", () 
     const fakeContext = {
       extensionUri: vscode.Uri.file("/fake-extension"),
       subscriptions: [],
-      globalState: { get: () => undefined, update: () => Promise.resolve(undefined), keys: () => [], setKeysForSync: () => undefined },
-      secrets: { get: () => Promise.resolve(undefined), store: () => Promise.resolve(undefined), delete: () => Promise.resolve(undefined), onDidChange: { event: () => ({ dispose: () => undefined }) } },
-      workspaceState: { get: () => undefined, update: () => Promise.resolve(undefined), keys: () => [] },
+      globalState: { get: (): undefined => undefined, update: (): Promise<undefined> => Promise.resolve(undefined), keys: (): string[] => [], setKeysForSync: (): undefined => undefined },
+      secrets: { get: (): Promise<undefined> => Promise.resolve(undefined), store: (): Promise<undefined> => Promise.resolve(undefined), delete: (): Promise<undefined> => Promise.resolve(undefined), onDidChange: { event: (): { dispose: () => void } => ({ dispose: (): void => undefined }) } },
+      workspaceState: { get: (): undefined => undefined, update: (): Promise<undefined> => Promise.resolve(undefined), keys: (): string[] => [] },
     } as unknown as vscode.ExtensionContext;
 
     try {
@@ -2466,9 +2480,9 @@ void describe("isMalformedReviewArg mixed-shape bypass variants (suite 15)", () 
     const fakeContext = {
       extensionUri: vscode.Uri.file("/fake-extension"),
       subscriptions: [],
-      globalState: { get: () => undefined, update: () => Promise.resolve(undefined), keys: () => [], setKeysForSync: () => undefined },
-      secrets: { get: () => Promise.resolve(undefined), store: () => Promise.resolve(undefined), delete: () => Promise.resolve(undefined), onDidChange: { event: () => ({ dispose: () => undefined }) } },
-      workspaceState: { get: () => undefined, update: () => Promise.resolve(undefined), keys: () => [] },
+      globalState: { get: (): undefined => undefined, update: (): Promise<undefined> => Promise.resolve(undefined), keys: (): string[] => [], setKeysForSync: (): undefined => undefined },
+      secrets: { get: (): Promise<undefined> => Promise.resolve(undefined), store: (): Promise<undefined> => Promise.resolve(undefined), delete: (): Promise<undefined> => Promise.resolve(undefined), onDidChange: { event: (): { dispose: () => void } => ({ dispose: (): void => undefined }) } },
+      workspaceState: { get: (): undefined => undefined, update: (): Promise<undefined> => Promise.resolve(undefined), keys: (): string[] => [] },
     } as unknown as vscode.ExtensionContext;
 
     let threw = false;
