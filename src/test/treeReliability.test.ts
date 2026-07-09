@@ -14,6 +14,7 @@
 
 import * as assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import * as vscode from "vscode";
 
 import type { IncompleteTask } from "../utils/taskProgressUtils";
 import { TaskStatusBar } from "../views/taskStatusBar";
@@ -30,8 +31,6 @@ function makeTask(
   status: "active" | "paused" = "active",
   canonicalId?: string
 ): IncompleteTask {
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const vscode = require("vscode") as typeof import("vscode");
   return {
     folderUri: vscode.Uri.file(fsPath),
     folderName,
@@ -47,7 +46,7 @@ function makeTask(
 }
 
 /** Minimal TaskInventory stub for provider state tests. */
-function makeInventoryStub() {
+function makeInventoryStub(): import("../state/taskInventory").TaskInventory {
   return {
     getTasks: () => [],
     refresh: async () => {},
@@ -56,7 +55,7 @@ function makeInventoryStub() {
 }
 
 /** Minimal CurrentTaskStore stub for status-bar tests. */
-function makeStoreStub() {
+function makeStoreStub(): import("../utils/currentTaskStore").CurrentTaskStore {
   return {
     get: () => undefined,
     set: async (_id: string) => {},
@@ -203,8 +202,6 @@ void describe("TaskNode — stable TreeItem.id", () => {
   });
 
   void it("sets id to folderUri.fsPath when canonicalId is absent", () => {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const vscode = require("vscode") as typeof import("vscode");
     const task = makeTask("/workspace/tasks/beta", "beta");
     const node = new TaskNode(task, false, false);
 
@@ -337,15 +334,16 @@ void describe("TaskTreeProvider — explicit expand/collapse state", () => {
     provider.notifyExpanded(task);
 
     // Stub executeCommand so syncCollapseExpandContext() doesn't throw.
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const vscode = require("vscode") as { commands: { executeCommand: unknown } };
-    const origExecute = vscode.commands.executeCommand;
-    vscode.commands.executeCommand = async () => {};
+    const commands = vscode.commands as {
+      executeCommand: (...args: unknown[]) => unknown;
+    };
+    const origExecute = commands.executeCommand;
+    commands.executeCommand = async () => {};
 
     try {
       assert.doesNotThrow(() => provider.collapseAll());
     } finally {
-      vscode.commands.executeCommand = origExecute;
+      commands.executeCommand = origExecute;
     }
   });
 

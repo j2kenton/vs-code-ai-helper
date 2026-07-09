@@ -227,7 +227,7 @@ export function activate(context: vscode.ExtensionContext): void {
  * where `getTaskNodesForReveal()` returns the pre-refresh node list.
  */
 async function revealCurrentTask(
-  treeView: vscode.TreeView<TaskNode | unknown>,
+  treeView: vscode.TreeView<TaskNode>,
   provider: TaskTreeProvider,
   store: CurrentTaskStore
 ): Promise<void> {
@@ -251,7 +251,7 @@ async function revealCurrentTask(
   }
 
   try {
-    await (treeView as vscode.TreeView<TaskNode>).reveal(node, {
+    await treeView.reveal(node, {
       expand: true,
       focus: false,
       select: false,

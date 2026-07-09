@@ -230,18 +230,18 @@ function queueCliModelRefresh(
   return refresh;
 }
 
-async function getDiscoveredCliModels(
+function getDiscoveredCliModels(
   def: CliProviderDefinition
 ): Promise<readonly DiscoveredCliModel[]> {
   if (def.id !== "antigravity-cli") {
-    return [];
+    return Promise.resolve([]);
   }
 
   const cached = cliModelCache.get(def.id);
   if (cached) {
-    return cached.models;
+    return Promise.resolve(cached.models);
   }
-  return [];
+  return Promise.resolve([]);
 }
 
 export const __testOnly = {

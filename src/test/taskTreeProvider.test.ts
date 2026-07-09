@@ -1,5 +1,6 @@
 import * as assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import * as vscode from "vscode";
 import { getStageNodeContextValue, StageNode } from "../views/taskTreeProvider";
 import {
   AI_MODEL_STAGES,
@@ -23,10 +24,17 @@ const mockIsReviewStage = (stage: string): boolean => stage.includes("review");
 ) => boolean;
 
 /** Minimal IncompleteTask stub for StageNode construction */
-function makeTask(currentStage: TaskStage = "implementation") {
-  // Use the vscode stub's Uri.file
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const vscode = require("vscode") as typeof import("vscode");
+function makeTask(currentStage: TaskStage = "implementation"): {
+  folderUri: vscode.Uri;
+  folderName: string;
+  progress: {
+    currentStage: TaskStage;
+    status: "active";
+    taskFolder: string;
+    createdAt: string;
+    updatedAt: string;
+  };
+} {
   return {
     folderUri: vscode.Uri.file("/workspace/tasks/my-task"),
     folderName: "my-task",
