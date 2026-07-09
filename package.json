@@ -292,7 +292,7 @@
         },
         {
           "command": "vs-code-ai-helper.setStageAsCurrent",
-          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage-task-description/ && viewItem !~ /-current/",
+          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage-task-description/ && !(viewItem =~ /-current/)",
           "group": "inline@2"
         },
         {
@@ -347,7 +347,7 @@
         },
         {
           "command": "vs-code-ai-helper.setStageAsCurrent",
-          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage(-modelable)?$/ && viewItem !~ /-current/",
+          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage(-modelable)?$/ && !(viewItem =~ /-current/)",
           "group": "inline@1"
         },
         {
