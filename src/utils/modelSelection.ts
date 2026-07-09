@@ -1,8 +1,17 @@
 import * as vscode from "vscode";
 import { getAiModelDefaults } from "../config/settings";
-import { cliCommandExists } from "../runners/cliAgentRunner";
-import { CLI_PROVIDERS, toQualifiedModelId } from "../runners/providers";
+import { cliCommandExists, resolveCliCommand } from "../runners/cliAgentRunner";
+import {
+  CLI_PROVIDERS,
+  type CliProviderDefinition,
+  toQualifiedModelId,
+} from "../runners/providers";
 import { AI_MODEL_STAGES, TaskStage } from "../types/taskProgress";
+import {
+  discoverAgyModels,
+  discoverAgyModelsWithTimeout,
+  type DiscoveredCliModel,
+} from "./cliModelDiscovery";
 
 export const TASK_MODEL_CONFIG_FILENAME = "task-models.json";
 
@@ -143,6 +152,116 @@ export interface SelectableModel {
   providerLabel: string;
 }
 
+const CLI_MODEL_CACHE_TTL_MS = 60 * 1000;
+const CLI_MODEL_INITIAL_WAIT_MS = 1200;
+const cliModelCache = new Map<
+  string,
+  {
+    expiresAt: number;
+    models: readonly DiscoveredCliModel[];
+    inFlight?: Promise<readonly DiscoveredCliModel[]>;
+  }
+>();
+
+function queueCliModelRefresh(
+  def: CliProviderDefinition
+): Promise<readonly DiscoveredCliModel[]> {
+  const cached = cliModelCache.get(def.id);
+  if (cached?.inFlight) {
+    return cached.inFlight;
+  }
+
+  const refresh = (async () => {
+    const resolvedCommand = await resolveCliCommand(
+      def.command,
+      def.commandAliases
+    );
+    if (!resolvedCommand) {
+      return [];
+    }
+
+    const discovered = await discoverAgyModels(resolvedCommand);
+    cliModelCache.set(def.id, {
+      expiresAt: Date.now() + CLI_MODEL_CACHE_TTL_MS,
+      models: discovered,
+    });
+    return discovered;
+  })();
+
+  cliModelCache.set(def.id, {
+    expiresAt: cached?.expiresAt ?? 0,
+    models: cached?.models ?? [],
+    inFlight: refresh,
+  });
+
+  void refresh.finally(() => {
+    const latest = cliModelCache.get(def.id);
+    if (latest?.inFlight === refresh) {
+      cliModelCache.set(def.id, {
+        expiresAt: latest.expiresAt,
+        models: latest.models,
+      });
+    }
+  });
+
+  return refresh;
+}
+
+async function getDiscoveredCliModels(
+  def: CliProviderDefinition
+): Promise<readonly DiscoveredCliModel[]> {
+  if (def.id !== "antigravity-cli") {
+    return [];
+  }
+
+  const cached = cliModelCache.get(def.id);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.models;
+  }
+
+  if (cached) {
+    void queueCliModelRefresh(def);
+    return cached.models;
+  }
+
+  const resolvedCommand = await resolveCliCommand(def.command, def.commandAliases);
+  if (!resolvedCommand) {
+    return [];
+  }
+
+  const foregroundDiscovery = discoverAgyModelsWithTimeout(
+    resolvedCommand,
+    CLI_MODEL_INITIAL_WAIT_MS
+  );
+  cliModelCache.set(def.id, {
+    expiresAt: 0,
+    models: [],
+    inFlight: foregroundDiscovery,
+  });
+
+  void foregroundDiscovery.finally(() => {
+    const latest = cliModelCache.get(def.id);
+    if (latest?.inFlight === foregroundDiscovery) {
+      cliModelCache.set(def.id, {
+        expiresAt: Date.now() + CLI_MODEL_CACHE_TTL_MS,
+        models: latest.models,
+      });
+    }
+  });
+
+  const discovered = await foregroundDiscovery;
+  cliModelCache.set(def.id, {
+    expiresAt: Date.now() + CLI_MODEL_CACHE_TTL_MS,
+    models: discovered,
+  });
+  if (discovered.length > 0) {
+    return discovered;
+  }
+
+  void queueCliModelRefresh(def);
+  return [];
+}
+
 export async function getAvailableCopilotModels(): Promise<
   vscode.LanguageModelChat[]
 > {
@@ -189,10 +308,11 @@ export async function getAvailableModels(): Promise<SelectableModel[]> {
       cliCommandExists(def.command, def.commandAliases)
     )
   );
-  CLI_PROVIDERS.forEach((def, index) => {
+  for (const [index, def] of CLI_PROVIDERS.entries()) {
     if (!availability[index]) {
-      return;
+      continue;
     }
+
     for (const choice of def.models) {
       result.push({
         id: toQualifiedModelId(def.id, choice.model),
@@ -200,7 +320,16 @@ export async function getAvailableModels(): Promise<SelectableModel[]> {
         providerLabel: `${def.label} (subscription CLI)`,
       });
     }
-  });
+
+    const discoveredChoices = await getDiscoveredCliModels(def);
+    for (const choice of discoveredChoices) {
+      result.push({
+        id: toQualifiedModelId(def.id, choice.model),
+        name: choice.name,
+        providerLabel: `${def.label} (subscription CLI)`,
+      });
+    }
+  }
 
   return result;
 }

@@ -33,6 +33,9 @@ void describe("provider CLI contracts", () => {
 
     assert.strictEqual(antigravity.command, "agy");
     assert.deepStrictEqual(antigravity.commandAliases, ["antigravity"]);
+    assert.deepStrictEqual(antigravity.models, [
+      { model: undefined, name: "Antigravity (CLI default)" },
+    ]);
   });
 
   void it("Kiro hints mention KIRO_API_KEY requirement", () => {

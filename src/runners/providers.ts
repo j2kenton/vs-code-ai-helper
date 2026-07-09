@@ -178,11 +178,9 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     loginHint:
       "Run `agy` (or `antigravity`) in a terminal and complete the Google sign-in, then try again.",
     authErrorMarkers: ["login", "authenticate", "credentials", "api key"],
-    models: [
-      { model: undefined, name: "Antigravity (CLI default)" },
-      { model: "gemini-2.5-pro", name: "Gemini 2.5 Pro" },
-      { model: "gemini-2.5-flash", name: "Gemini 2.5 Flash" },
-    ],
+    // The actual model set comes from `agy models` at picker time.
+    // Keep fallback choices to CLI default only if discovery fails.
+    models: [{ model: undefined, name: "Antigravity (CLI default)" }],
     usesLastMessageFile: false,
     buildArgs(mode, model): string[] {
       const args: string[] = [];
