@@ -112,7 +112,7 @@ export class TaskStatusBar implements vscode.Disposable {
 
     interface ActionQuickPickItem extends vscode.QuickPickItem {
       command: string;
-      arg?: any;
+      arg?: unknown;
     }
 
     const items: ActionQuickPickItem[] = [];

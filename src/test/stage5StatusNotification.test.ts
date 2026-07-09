@@ -6,7 +6,11 @@ import {
   initNotificationRouter,
   deactivateNotificationRouter,
   NotificationRouter,
+  StatusSurface,
 } from "../utils/notificationRouter";
+import { TaskInventory } from "../state/taskInventory";
+import { CurrentTaskStore } from "../utils/currentTaskStore";
+import { TaskStage } from "../types/taskProgress";
 import { StatusTreeProvider } from "../views/statusView";
 import { TaskStatusBar } from "../views/taskStatusBar";
 import { IncompleteTask } from "../utils/taskProgressUtils";
@@ -18,7 +22,7 @@ import { IncompleteTask } from "../utils/taskProgressUtils";
 function makeTask(
   fsPath: string,
   folderName: string,
-  stage: string = "implementation",
+  stage: TaskStage = "implementation",
   status: "active" | "paused" = "active",
   canonicalId?: string
 ): IncompleteTask {
@@ -26,7 +30,7 @@ function makeTask(
     folderUri: vscode.Uri.file(fsPath),
     folderName,
     progress: {
-      currentStage: stage as import("../types/taskProgress").TaskStage,
+      currentStage: stage,
       status,
       taskFolder: folderName,
       createdAt: new Date().toISOString(),
@@ -36,18 +40,72 @@ function makeTask(
   };
 }
 
-function makeStoreStub(initialId?: string) {
+function makeStoreStub(initialId?: string): CurrentTaskStore {
   let id = initialId;
+  const onDidChange: vscode.Event<void> = () => ({
+    dispose(): void {},
+  });
+
   return {
     get: (): string | undefined => id,
-    set: async (newId: string): Promise<void> => {
+    set: (newId: string): Promise<void> => {
       id = newId;
+      return Promise.resolve();
     },
-    clear: (): void => {
+    clear: (): Promise<void> => {
       id = undefined;
+      return Promise.resolve();
     },
-    onDidChange: { event: () => ({ dispose() {} }) },
-  } as unknown as import("../utils/currentTaskStore").CurrentTaskStore;
+    onDidChange,
+  } as unknown as CurrentTaskStore;
+}
+
+type WindowStub = {
+  showQuickPick: typeof vscode.window.showQuickPick;
+  showInputBox: typeof vscode.window.showInputBox;
+  showTextDocument: typeof vscode.window.showTextDocument;
+  showErrorMessage: typeof vscode.window.showErrorMessage;
+  showWarningMessage: typeof vscode.window.showWarningMessage;
+};
+
+type WorkspaceStub = {
+  workspaceFolders: typeof vscode.workspace.workspaceFolders;
+  fs: Pick<typeof vscode.workspace.fs, "createDirectory" | "writeFile">;
+  openTextDocument: typeof vscode.workspace.openTextDocument;
+};
+
+function getWindowStub(): WindowStub {
+  return vscode.window as unknown as WindowStub;
+}
+
+function getWorkspaceStub(): WorkspaceStub {
+  return vscode.workspace as unknown as WorkspaceStub;
+}
+
+function getStatusBarItem(bar: TaskStatusBar): Pick<vscode.StatusBarItem, "text"> {
+  return (bar as unknown as { item: Pick<vscode.StatusBarItem, "text"> }).item;
+}
+
+function requireValue<T>(value: T | undefined, message: string): T {
+  if (value === undefined) {
+    throw new Error(message);
+  }
+  return value;
+}
+
+function makeInventoryStub(
+  overrides: Partial<
+    Pick<TaskInventory, "refresh" | "getTaskById" | "getTaskByPath" | "getTasks">
+  > = {}
+): TaskInventory {
+  const stub = {
+    refresh: (): Promise<void> => Promise.resolve(),
+    getTaskById: (): undefined => undefined,
+    getTaskByPath: (): undefined => undefined,
+    getTasks: (): readonly IncompleteTask[] => [],
+    ...overrides,
+  };
+  return stub as unknown as TaskInventory;
 }
 
 // ---------------------------------------------------------------------------
@@ -83,9 +141,9 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
       NotificationRouter.showInformation("a".repeat(200));
       let entries = surface.getEntries();
       assert.strictEqual(entries.length, 1);
-      assert.ok(entries[0]);
-      assert.strictEqual(entries[0]!.message.length, 153); // 150 characters + "..."
-      assert.ok(entries[0]!.message.endsWith("..."));
+      const firstTrimmed = requireValue(entries[0], "missing first trimmed entry");
+      assert.strictEqual(firstTrimmed.message.length, 153); // 150 characters + "..."
+      assert.ok(firstTrimmed.message.endsWith("..."));
 
       // Newest-first ordering
       surface.clear();
@@ -93,10 +151,10 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
       NotificationRouter.showInformation("second");
       entries = surface.getEntries();
       assert.strictEqual(entries.length, 2);
-      assert.ok(entries[0]);
-      assert.ok(entries[1]);
-      assert.strictEqual(entries[0]!.message, "second"); // Newest first
-      assert.strictEqual(entries[1]!.message, "first");
+      const firstOrdered = requireValue(entries[0], "missing newest entry");
+      const secondOrdered = requireValue(entries[1], "missing second entry");
+      assert.strictEqual(firstOrdered.message, "second"); // Newest first
+      assert.strictEqual(secondOrdered.message, "first");
 
       // Bounded retention (50 entries)
       surface.clear();
@@ -105,10 +163,10 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
       }
       entries = surface.getEntries();
       assert.strictEqual(entries.length, 50);
-      assert.ok(entries[0]);
-      assert.ok(entries[49]);
-      assert.strictEqual(entries[0]!.message, "message 59"); // Newest
-      assert.strictEqual(entries[49]!.message, "message 10"); // Oldest remaining (0-9 removed)
+      const newest = requireValue(entries[0], "missing newest retained entry");
+      const oldest = requireValue(entries[49], "missing oldest retained entry");
+      assert.strictEqual(newest.message, "message 59"); // Newest
+      assert.strictEqual(oldest.message, "message 10"); // Oldest remaining (0-9 removed)
 
       deactivateNotificationRouter();
     });
@@ -125,15 +183,15 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
 
       const entries = surface.getEntries();
       assert.strictEqual(entries.length, 3);
-      assert.ok(entries[0]);
-      assert.ok(entries[1]);
-      assert.ok(entries[2]);
-      assert.strictEqual(entries[0]!.message, "Error message");
-      assert.strictEqual(entries[0]!.level, "error");
-      assert.strictEqual(entries[1]!.message, "Warning message");
-      assert.strictEqual(entries[1]!.level, "warning");
-      assert.strictEqual(entries[2]!.message, "Info message");
-      assert.strictEqual(entries[2]!.level, "info");
+      const firstEntry = requireValue(entries[0], "missing first routed entry");
+      const secondEntry = requireValue(entries[1], "missing second routed entry");
+      const thirdEntry = requireValue(entries[2], "missing third routed entry");
+      assert.strictEqual(firstEntry.message, "Error message");
+      assert.strictEqual(firstEntry.level, "error");
+      assert.strictEqual(secondEntry.message, "Warning message");
+      assert.strictEqual(secondEntry.level, "warning");
+      assert.strictEqual(thirdEntry.message, "Info message");
+      assert.strictEqual(thirdEntry.level, "info");
 
       deactivateNotificationRouter();
     });
@@ -148,7 +206,7 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
       bar.update(tasks, undefined);
 
       // Access private item stub properties
-      const item = (bar as any).item;
+      const item = getStatusBarItem(bar);
       assert.strictEqual(item.text, "$(checklist) Ensemble: No active task");
       bar.dispose();
     });
@@ -160,7 +218,7 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
 
       bar.update(tasks, "/workspace/task-a");
 
-      const item = (bar as any).item;
+      const item = getStatusBarItem(bar);
       assert.ok(item.text.includes("[paused]"));
       assert.ok(item.text.includes("task-a"));
       bar.dispose();
@@ -173,7 +231,7 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
 
       bar.update(tasks, "/workspace/task-a");
 
-      const item = (bar as any).item;
+      const item = getStatusBarItem(bar);
       assert.ok(!item.text.includes("[paused]"));
       assert.ok(item.text.includes("task-a"));
       bar.dispose();
@@ -187,12 +245,15 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
       const tasks = [makeTask("/workspace/task-a", "task-a", "implementation", "paused", "/workspace/task-a")];
       bar.update(tasks, "/workspace/task-a");
 
-      const win = vscode.window as any;
+      const win = getWindowStub();
       const origShowQuickPick = win.showQuickPick;
-      let capturedItems: any[] = [];
-      win.showQuickPick = async (items: any[]) => {
-        capturedItems = items;
-        return undefined; // Cancel selection
+      let capturedItems: vscode.QuickPickItem[] = [];
+      win.showQuickPick = async <T extends vscode.QuickPickItem>(
+        items: readonly T[] | Thenable<readonly T[]>
+      ): Promise<T | undefined> => {
+        const resolvedItems = await Promise.resolve(items);
+        capturedItems = [...resolvedItems];
+        return undefined;
       };
 
       try {
@@ -213,12 +274,15 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
       const tasks = [makeTask("/workspace/task-a", "task-a", "implementation", "active", "/workspace/task-a")];
       bar.update(tasks, "/workspace/task-a");
 
-      const win = vscode.window as any;
+      const win = getWindowStub();
       const origShowQuickPick = win.showQuickPick;
-      let capturedItems: any[] = [];
-      win.showQuickPick = async (items: any[]) => {
-        capturedItems = items;
-        return undefined; // Cancel selection
+      let capturedItems: vscode.QuickPickItem[] = [];
+      win.showQuickPick = async <T extends vscode.QuickPickItem>(
+        items: readonly T[] | Thenable<readonly T[]>
+      ): Promise<T | undefined> => {
+        const resolvedItems = await Promise.resolve(items);
+        capturedItems = [...resolvedItems];
+        return undefined;
       };
 
       try {
@@ -239,12 +303,15 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
       const tasks = [makeTask("/workspace/task-a", "task-a", "completed", "active", "/workspace/task-a")];
       bar.update(tasks, "/workspace/task-a");
 
-      const win = vscode.window as any;
+      const win = getWindowStub();
       const origShowQuickPick = win.showQuickPick;
-      let capturedItems: any[] = [];
-      win.showQuickPick = async (items: any[]) => {
-        capturedItems = items;
-        return undefined; // Cancel selection
+      let capturedItems: vscode.QuickPickItem[] = [];
+      win.showQuickPick = async <T extends vscode.QuickPickItem>(
+        items: readonly T[] | Thenable<readonly T[]>
+      ): Promise<T | undefined> => {
+        const resolvedItems = await Promise.resolve(items);
+        capturedItems = [...resolvedItems];
+        return undefined;
       };
 
       try {
@@ -266,14 +333,18 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
       const { startNewTask } = await import("../commands/startNewTask.js");
 
       // Initialize notification router
-      initNotificationRouter({ addEntry() {} });
+      const surface: StatusSurface = {
+        addEntry(): void {},
+      };
+      initNotificationRouter(surface);
 
-      const win = vscode.window as any;
+      const win = getWindowStub();
       const origShowInputBox = win.showInputBox;
-      win.showInputBox = async () => "Implement sidebar status view";
+      win.showInputBox = (): Promise<string> =>
+        Promise.resolve("Implement sidebar status view");
 
       // Stub workspace functions and resolveTaskRootForCreation to prevent real directory writes
-      const workspace = vscode.workspace as any;
+      const workspace = getWorkspaceStub();
       const origWorkspaceFolders = workspace.workspaceFolders;
       workspace.workspaceFolders = [{ uri: vscode.Uri.file("/workspace"), name: "workspace", index: 0 }];
 
@@ -285,22 +356,25 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
       const origShowWarningMessage = win.showWarningMessage;
 
       let writtenContent = "";
-      workspace.fs.createDirectory = async () => {};
-      workspace.fs.writeFile = async (_uri: any, bytes: Uint8Array) => {
+      workspace.fs.createDirectory = (): Promise<void> => Promise.resolve();
+      workspace.fs.writeFile = (
+        _uri: vscode.Uri,
+        bytes: Uint8Array
+      ): Promise<void> => {
         writtenContent = new TextDecoder().decode(bytes);
+        return Promise.resolve();
       };
-      workspace.openTextDocument = async () => ({});
-      win.showTextDocument = async () => {};
-      win.showErrorMessage = async () => undefined;
-      win.showWarningMessage = async () => undefined;
+      workspace.openTextDocument = (): Promise<vscode.TextDocument> =>
+        Promise.resolve({} as vscode.TextDocument);
+      win.showTextDocument = (): Promise<vscode.TextEditor> =>
+        Promise.resolve({} as vscode.TextEditor);
+      win.showErrorMessage = (): Thenable<string | undefined> =>
+        Promise.resolve(undefined);
+      win.showWarningMessage = (): Thenable<string | undefined> =>
+        Promise.resolve(undefined);
 
       // Inventory mock
-      const inventory = {
-        refresh: async () => {},
-        getTaskById: () => undefined,
-        getTaskByPath: () => undefined,
-        getTasks: () => [],
-      } as any;
+      const inventory = makeInventoryStub();
 
       const store = makeStoreStub();
 
@@ -326,13 +400,16 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
       const { startNewTask } = await import("../commands/startNewTask.js");
 
       // Initialize notification router
-      initNotificationRouter({ addEntry() {} });
+      const surface: StatusSurface = {
+        addEntry(): void {},
+      };
+      initNotificationRouter(surface);
 
-      const win = vscode.window as any;
+      const win = getWindowStub();
       const origShowInputBox = win.showInputBox;
-      win.showInputBox = async () => undefined; // Cancel
+      win.showInputBox = (): Promise<string | undefined> => Promise.resolve(undefined);
 
-      const workspace = vscode.workspace as any;
+      const workspace = getWorkspaceStub();
       const origWorkspaceFolders = workspace.workspaceFolders;
       workspace.workspaceFolders = [{ uri: vscode.Uri.file("/workspace"), name: "workspace", index: 0 }];
 
@@ -341,16 +418,16 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
       const origShowWarningMessage = win.showWarningMessage;
 
       let dirCreated = false;
-      workspace.fs.createDirectory = async () => {
+      workspace.fs.createDirectory = (): Promise<void> => {
         dirCreated = true;
+        return Promise.resolve();
       };
-      win.showErrorMessage = async () => undefined;
-      win.showWarningMessage = async () => undefined;
+      win.showErrorMessage = (): Thenable<string | undefined> =>
+        Promise.resolve(undefined);
+      win.showWarningMessage = (): Thenable<string | undefined> =>
+        Promise.resolve(undefined);
 
-      const inventory = {
-        refresh: async () => {},
-        getTasks: () => [],
-      } as any;
+      const inventory = makeInventoryStub();
       const store = makeStoreStub();
 
       try {
@@ -372,13 +449,16 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
       const { startNewTask } = await import("../commands/startNewTask.js");
 
       // Initialize notification router
-      initNotificationRouter({ addEntry() {} });
+      const surface: StatusSurface = {
+        addEntry(): void {},
+      };
+      initNotificationRouter(surface);
 
-      const win = vscode.window as any;
+      const win = getWindowStub();
       const origShowInputBox = win.showInputBox;
-      win.showInputBox = async () => ""; // Empty input (Enter pressed with no text)
+      win.showInputBox = (): Promise<string> => Promise.resolve("");
 
-      const workspace = vscode.workspace as any;
+      const workspace = getWorkspaceStub();
       const origWorkspaceFolders = workspace.workspaceFolders;
       workspace.workspaceFolders = [{ uri: vscode.Uri.file("/workspace"), name: "workspace", index: 0 }];
 
@@ -391,23 +471,27 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
 
       let dirCreated = false;
       let writtenContent = "";
-      workspace.fs.createDirectory = async () => {
+      workspace.fs.createDirectory = (): Promise<void> => {
         dirCreated = true;
+        return Promise.resolve();
       };
-      workspace.fs.writeFile = async (_uri: any, bytes: Uint8Array) => {
+      workspace.fs.writeFile = (
+        _uri: vscode.Uri,
+        bytes: Uint8Array
+      ): Promise<void> => {
         writtenContent = new TextDecoder().decode(bytes);
+        return Promise.resolve();
       };
-      workspace.openTextDocument = async () => ({});
-      win.showTextDocument = async () => {};
-      win.showErrorMessage = async () => undefined;
-      win.showWarningMessage = async () => undefined;
+      workspace.openTextDocument = (): Promise<vscode.TextDocument> =>
+        Promise.resolve({} as vscode.TextDocument);
+      win.showTextDocument = (): Promise<vscode.TextEditor> =>
+        Promise.resolve({} as vscode.TextEditor);
+      win.showErrorMessage = (): Thenable<string | undefined> =>
+        Promise.resolve(undefined);
+      win.showWarningMessage = (): Thenable<string | undefined> =>
+        Promise.resolve(undefined);
 
-      const inventory = {
-        refresh: async () => {},
-        getTaskById: () => undefined,
-        getTaskByPath: () => undefined,
-        getTasks: () => [],
-      } as any;
+      const inventory = makeInventoryStub();
       const store = makeStoreStub();
 
       try {
