@@ -138,9 +138,13 @@ export async function resolveTaskContext(
       }
 
       // If the persisted canonical ID still can't be resolved (task deleted,
-      // moved, or never existed), leave resolution unset and fall through to
-      // the final "not found" result below. Do NOT clear the store here —
-      // the folder may reappear (e.g. unmounted drive).
+      // moved, or never existed), clear the persisted state so the extension
+      // does not start from a stale ID after window reload or later command
+      // flows. This keeps CurrentTaskStore in sync across all surfaces (tree,
+      // status bar, task actions).
+      if (!resolved) {
+        await currentTaskStore.clear();
+      }
     }
   }
 

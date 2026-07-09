@@ -381,3 +381,95 @@ void describe("TaskTreeProvider — stale ID does not match any loaded node", ()
     assert.strictEqual(result, undefined);
   });
 });
+
+// ---------------------------------------------------------------------------
+// resolveTaskContext — clears stale persisted ID
+// ---------------------------------------------------------------------------
+// Regression coverage for the blocking issue: when resolveTaskContext
+// determines a persisted current-task ID no longer resolves (after refresh
+// retry), it must clear the persisted state so the extension does not start
+// from a stale ID after window reload or later command flows.
+
+void describe("resolveTaskContext — clears stale persisted ID", () => {
+  void it("clears store when persisted ID fails to resolve after refresh", async () => {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { resolveTaskContext } = await import("../utils/resolveTaskContext.js");
+
+    let clearCalled = false;
+    const store = {
+      get: (): string | undefined => "/workspace/deleted-task",
+      set: async (_id: string): Promise<void> => {},
+      clear: (): void => { clearCalled = true; },
+      onDidChange: { event: (_handler: () => void) => ({ dispose() {} }) },
+    } as unknown as import("../utils/currentTaskStore").CurrentTaskStore;
+
+    // Inventory stub with no tasks and a no-op refresh
+    const inventory = {
+      getTasks: () => [],
+      getTaskById: (_id: string) => undefined,
+      getVisibleTaskForSuppressedId: (_id: string) => undefined,
+      refresh: async (): Promise<void> => {},
+      onDidChange: (_handler: () => void) => ({ dispose() {} }),
+    } as unknown as import("../state/taskInventory").TaskInventory;
+
+    const resolved = await resolveTaskContext(
+      inventory,
+      undefined, // No explicit arg — should try persisted ID
+      undefined,
+      store
+    );
+
+    assert.strictEqual(
+      resolved,
+      undefined,
+      "Expected resolution to fail when persisted ID is stale"
+    );
+    assert.strictEqual(
+      clearCalled,
+      true,
+      "Expected store.clear() to be called when persisted ID fails to resolve after refresh"
+    );
+  });
+
+  void it("does NOT clear store when explicit arg fails (not persisted ID)", async () => {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { resolveTaskContext } = await import("../utils/resolveTaskContext.js");
+
+    let clearCalled = false;
+    const store = {
+      get: (): string | undefined => undefined, // No persisted ID
+      set: async (_id: string): Promise<void> => {},
+      clear: (): void => { clearCalled = true; },
+      onDidChange: { event: (_handler: () => void) => ({ dispose() {} }) },
+    } as unknown as import("../utils/currentTaskStore").CurrentTaskStore;
+
+    const inventory = {
+      getTasks: () => [],
+      getTaskById: (_id: string) => undefined,
+      getTaskByPath: (_path: string) => undefined,
+      getVisibleTaskForSuppressedId: (_id: string) => undefined,
+      getVisibleTaskForSuppressedPath: (_path: string) => undefined,
+      refresh: async (): Promise<void> => {},
+      onDidChange: (_handler: () => void) => ({ dispose() {} }),
+    } as unknown as import("../state/taskInventory").TaskInventory;
+
+    // Pass explicit arg that fails to resolve
+    const resolved = await resolveTaskContext(
+      inventory,
+      { canonicalId: "/workspace/explicit-missing-task" },
+      undefined,
+      store
+    );
+
+    assert.strictEqual(
+      resolved,
+      undefined,
+      "Expected resolution to fail for missing explicit arg"
+    );
+    assert.strictEqual(
+      clearCalled,
+      false,
+      "Expected store NOT to be cleared when explicit arg fails (only persisted IDs should trigger clear)"
+    );
+  });
+});
