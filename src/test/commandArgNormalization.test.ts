@@ -134,17 +134,11 @@ function makeInventoryStub(
   // @ts-expect-error — direct field init on stub
   inv.suppressionAliasMap = new Map();
   // Stub refresh: no-op (the inventory is already "refreshed")
-  // @ts-expect-error — override method on prototype stub
   inv.refresh = async () => { /* no-op */ };
-  // @ts-expect-error — override method on prototype stub
   inv.getTasks = () => [task];
-  // @ts-expect-error — override method on prototype stub
   inv.getTaskById = (id: string) => (id === knownId ? task : undefined);
-  // @ts-expect-error — override method on prototype stub
   inv.getTaskByPath = (p: string) => (p === taskFolderPath ? task : undefined);
-  // @ts-expect-error — override method on prototype stub
   inv.getVisibleTaskForSuppressedId = () => undefined;
-  // @ts-expect-error — override method on prototype stub
   inv.getVisibleTaskForSuppressedPath = () => undefined;
   return inv;
 }
@@ -160,17 +154,11 @@ function makeEmptyInventoryStub(): TaskInventory {
   inv.taskByCanonicalId = new Map();
   // @ts-expect-error — direct field init on stub
   inv.suppressionAliasMap = new Map();
-  // @ts-expect-error — override method on prototype stub
   inv.refresh = async () => { /* no-op */ };
-  // @ts-expect-error — override method on prototype stub
   inv.getTasks = () => [];
-  // @ts-expect-error — override method on prototype stub
   inv.getTaskById = () => undefined;
-  // @ts-expect-error — override method on prototype stub
   inv.getTaskByPath = () => undefined;
-  // @ts-expect-error — override method on prototype stub
   inv.getVisibleTaskForSuppressedId = () => undefined;
-  // @ts-expect-error — override method on prototype stub
   inv.getVisibleTaskForSuppressedPath = () => undefined;
   return inv;
 }
@@ -205,17 +193,11 @@ function makeInventoryStubWithStage(
   inv.taskByCanonicalId = new Map([[knownId, task]]);
   // @ts-expect-error — direct field init on stub
   inv.suppressionAliasMap = new Map();
-  // @ts-expect-error — override method on prototype stub
   inv.refresh = async () => { /* no-op */ };
-  // @ts-expect-error — override method on prototype stub
   inv.getTasks = () => [task];
-  // @ts-expect-error — override method on prototype stub
   inv.getTaskById = (id: string) => (id === knownId ? task : undefined);
-  // @ts-expect-error — override method on prototype stub
   inv.getTaskByPath = (p: string) => (p === taskFolderPath ? task : undefined);
-  // @ts-expect-error — override method on prototype stub
   inv.getVisibleTaskForSuppressedId = () => undefined;
-  // @ts-expect-error — override method on prototype stub
   inv.getVisibleTaskForSuppressedPath = () => undefined;
   return inv;
 }
@@ -248,11 +230,8 @@ import { CurrentTaskStore } from "../utils/currentTaskStore";
 
 function makeCurrentTaskStoreStub(persistedId?: string): CurrentTaskStore {
   const store = Object.create(CurrentTaskStore.prototype) as CurrentTaskStore;
-  // @ts-expect-error — override method on prototype stub
   store.get = () => persistedId;
-  // @ts-expect-error — override method on prototype stub
   store.set = async () => { /* no-op */ };
-  // @ts-expect-error — override method on prototype stub
   store.clear = async () => { /* no-op */ };
   return store;
 }
