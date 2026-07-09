@@ -1,7 +1,11 @@
 import * as vscode from "vscode";
 import { TaskInventory } from "../state/taskInventory";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
-import { IncompleteTask } from "../utils/taskProgressUtils";
+import {
+  IncompleteTask,
+  patchTaskProgress,
+  updateLintPayload,
+} from "../utils/taskProgressUtils";
 
 /**
  * Accepted argument shapes for runLintingFixes.
@@ -93,6 +97,20 @@ export async function runLintingFixes(
     return;
   }
 
+  const taskFolderUri = vscode.Uri.file(resolvedTask.taskFolderPath);
+  const persistLintState = async (
+    passed: boolean,
+    summary: string
+  ): Promise<void> => {
+    await patchTaskProgress(taskFolderUri, (current) =>
+      updateLintPayload(current, {
+        runAt: new Date().toISOString(),
+        passed,
+        summary,
+      })
+    );
+  };
+
   await vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Notification,
@@ -122,6 +140,7 @@ export async function runLintingFixes(
         });
 
         if (lintingIssues.length === 0) {
+          await persistLintState(true, "No linting issues found.");
           void vscode.window.showInformationMessage(
             "No linting issues found in the task folder. Your code looks good!"
           );
@@ -156,6 +175,32 @@ export async function runLintingFixes(
           }
         }
 
+        const remainingLintIssues = vscode.languages
+          .getDiagnostics()
+          .filter(([uri, diags]) => {
+            if (!isFileInTaskFolder(uri, taskFolderPath)) {
+              return false;
+            }
+            return diags.some(
+              (d) =>
+                d.source === "eslint" ||
+                d.source === "ts" ||
+                d.source === "typescript"
+            );
+          }).length;
+
+        if (remainingLintIssues === 0) {
+          await persistLintState(
+            true,
+            `Lint fixes complete (${fixedCount} file(s) processed).`
+          );
+        } else {
+          await persistLintState(
+            false,
+            `${remainingLintIssues} file(s) still report lint issues after auto-fix.`
+          );
+        }
+
         if (fixedCount > 0) {
           void vscode.window.showInformationMessage(
             `Linting fixes applied to ${fixedCount} file(s) in the task folder!` +
@@ -167,6 +212,10 @@ export async function runLintingFixes(
           );
         }
       } catch (error) {
+        await persistLintState(
+          false,
+          `Linting run failed: ${error instanceof Error ? error.message : String(error)}`
+        );
         void vscode.window.showErrorMessage(
           `Linting fixes failed: ${error instanceof Error ? error.message : String(error)}`
         );

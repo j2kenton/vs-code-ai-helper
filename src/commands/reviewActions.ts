@@ -24,10 +24,8 @@ import {
 import {
   advanceStage,
   computeNextStage,
-  AUTO_REVIEW_TRANSITIONS,
 } from "../utils/stageTransition";
 import {
-
   openOrCreateDocument,
   readNonEmptyText,
   resolveCurrentPlanUri,

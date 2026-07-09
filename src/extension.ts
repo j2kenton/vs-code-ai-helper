@@ -91,7 +91,7 @@ export function activate(context: vscode.ExtensionContext): void {
   registerPauseTaskCommand(context, inventory, currentTaskStore);
   registerApplyHighLevelReviewChangesCommand(context, inventory);
   registerApplyLowLevelReviewChangesCommand(context, inventory);
-  registerCommitAndPushTaskCommand(context, inventory);
+  registerCommitAndPushTaskCommand(context, inventory, currentTaskStore);
   registerToggleMetaResourcesGitIgnoreCommand(context);
   registerChatWithStageCommand(context, inventory);
   registerOpenGeneralAssistantCommand(context);
