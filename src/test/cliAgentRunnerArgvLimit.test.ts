@@ -2,7 +2,7 @@ import * as assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import * as vscode from "vscode";
 import { execCliAgent } from "../runners/cliAgentRunner";
-import { CliProviderDefinition } from "../runners/providers";
+import { CliProviderDefinition, getCliProvider } from "../runners/providers";
 
 void describe("execCliAgent argv prompt limits", () => {
   void it("fails fast when argv prompt exceeds provider cap", async () => {
@@ -36,5 +36,12 @@ void describe("execCliAgent argv prompt limits", () => {
     assert.strictEqual(result.status, "failed");
     assert.match(result.errorMessage ?? "", /too large/i);
     assert.match(result.errorMessage ?? "", /max 10 bytes/i);
+  });
+
+  void it("Antigravity declares an argv prompt cap to avoid ENAMETOOLONG", () => {
+    const provider = getCliProvider("antigravity-cli");
+    assert.ok(provider, "expected antigravity-cli provider definition");
+    assert.strictEqual(provider.promptTransport, "argv");
+    assert.strictEqual(provider.maxArgvPromptBytes, 24_000);
   });
 });

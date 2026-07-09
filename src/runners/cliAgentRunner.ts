@@ -219,18 +219,34 @@ export async function execCliAgent(options: {
       useShell && process.platform === "win32"
         ? args.map((a) => (a.includes(" ") ? `"${a}"` : a))
         : args;
-    const child = cp.spawn(resolvedCommand, spawnArgs, {
-      cwd,
-      shell: useShell,
-      windowsHide: true,
-      env: process.env,
-      // POSIX only: makes the shell (and everything it execs/forks) its
-      // own process group, so killProcessTree can SIGTERM the whole group
-      // instead of just the shell's PID — see killProcessTree for why that
-      // matters with shell:true. Windows has no process-group concept here
-      // and uses taskkill /T on the PID tree instead.
-      detached: process.platform !== "win32",
-    });
+    let child: cp.ChildProcess;
+    try {
+      child = cp.spawn(resolvedCommand, spawnArgs, {
+        cwd,
+        shell: useShell,
+        windowsHide: true,
+        env: process.env,
+        // POSIX only: makes the shell (and everything it execs/forks) its
+        // own process group, so killProcessTree can SIGTERM the whole group
+        // instead of just the shell's PID — see killProcessTree for why that
+        // matters with shell:true. Windows has no process-group concept here
+        // and uses taskkill /T on the PID tree instead.
+        detached: process.platform !== "win32",
+      });
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : String(error);
+      const argvHint =
+        promptTransport === "argv"
+          ? " Reduce context or choose a provider that accepts stdin prompts."
+          : "";
+      resolve({
+        status: "failed",
+        output: "",
+        errorMessage: `Could not start the ${def.label} CLI (${resolvedCommand}): ${message}.${argvHint} ${def.installHint}`.trim(),
+      });
+      return;
+    }
 
     const finish = (result: CliExecResult): void => {
       if (settled) {

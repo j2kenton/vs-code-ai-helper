@@ -183,6 +183,10 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     usesLastMessageFile: false,
     promptTransport: "argv",
     useShell: false,
+    // argv-based prompt transport can hit OS command-line length limits on
+    // large implementation prompts, especially on Windows. Keep this
+    // conservative so we fail with a clear message before spawn().
+    maxArgvPromptBytes: 24_000,
     buildArgs(mode, model): string[] {
       const args: string[] = [];
       if (mode === "edit") {

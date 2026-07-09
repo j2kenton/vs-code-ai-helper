@@ -35,6 +35,7 @@ void describe("provider CLI contracts", () => {
     assert.deepStrictEqual(antigravity.commandAliases, ["antigravity"]);
     assert.strictEqual(antigravity.promptTransport, "argv");
     assert.strictEqual(antigravity.useShell, false);
+    assert.strictEqual(antigravity.maxArgvPromptBytes, 24_000);
     assert.deepStrictEqual(antigravity.models, [
       { model: undefined, name: "Antigravity (CLI default)" },
     ]);
