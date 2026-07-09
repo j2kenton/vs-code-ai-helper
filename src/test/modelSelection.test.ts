@@ -69,6 +69,17 @@ function copilotReasoningVariants(
   }));
 }
 
+function copilotModel(
+  id: string,
+  name: string
+): SelectableModel {
+  return {
+    id,
+    name,
+    providerLabel: "GitHub Copilot",
+  };
+}
+
 void describe("CLI model refresh fallback", () => {
   void it("keeps existing defaults when discovery returns an empty list", () => {
     const current = [
@@ -233,6 +244,76 @@ void describe("getAvailableModels", () => {
           ["high", "High"],
           ["xhigh", "Extra High"],
         ]),
+      ]);
+    } finally {
+      __testOnly.clearModelSelectionTestOverrides();
+      __testOnly.resetCliModelCache();
+      __testOnly.restoreSeededCliModelCache();
+    }
+  });
+
+  void it("surfaces seeded Copilot Claude reasoning variants", async () => {
+    __testOnly.restoreSeededCliModelCache();
+    __testOnly.setModelSelectionTestOverrides({
+      getAvailableCopilotModels() {
+        return Promise.resolve([
+          {
+            id: "copilot-claude-sonnet-4.5",
+            name: "Claude Sonnet 4.5",
+          } as SelectableModel as never,
+          {
+            id: "copilot-claude-sonnet-4.6",
+            name: "Claude Sonnet 4.6",
+          } as SelectableModel as never,
+          {
+            id: "copilot-claude-opus-4.6",
+            name: "Claude Opus 4.6",
+          } as SelectableModel as never,
+          {
+            id: "copilot-claude-haiku-4.5",
+            name: "Claude Haiku 4.5",
+          } as SelectableModel as never,
+        ]);
+      },
+      cliCommandExists() {
+        return Promise.resolve(false);
+      },
+    });
+
+    try {
+      const models = await getAvailableModels();
+      assert.deepStrictEqual(models, [
+        copilotModel("copilot-claude-sonnet-4.5", "Claude Sonnet 4.5"),
+        ...copilotReasoningVariants("copilot-claude-sonnet-4.5", "Claude Sonnet 4.5", [
+          ["low", "Low"],
+          ["medium", "Medium"],
+          ["high", "High"],
+          ["xhigh", "Extra High"],
+          ["max", "Max"],
+        ]),
+        copilotModel("copilot-claude-sonnet-4.6", "Claude Sonnet 4.6"),
+        ...copilotReasoningVariants("copilot-claude-sonnet-4.6", "Claude Sonnet 4.6", [
+          ["low", "Low"],
+          ["medium", "Medium"],
+          ["high", "High"],
+          ["max", "Max"],
+        ]),
+        copilotModel(
+          "copilot-claude-opus-4.6",
+          "Claude Opus 4.6 (only on Pro+ plan)"
+        ),
+        ...copilotReasoningVariants(
+          "copilot-claude-opus-4.6",
+          "Claude Opus 4.6 (only on Pro+ plan)",
+          [
+          ["low", "Low"],
+          ["medium", "Medium"],
+          ["high", "High"],
+          ["xhigh", "Extra High"],
+          ["max", "Max"],
+          ]
+        ),
+        copilotModel("copilot-claude-haiku-4.5", "Claude Haiku 4.5"),
       ]);
     } finally {
       __testOnly.clearModelSelectionTestOverrides();

@@ -200,36 +200,89 @@ function normalizeCopilotModelName(model: vscode.LanguageModelChat): string {
   return name;
 }
 
-const COPILOT_GPT_REASONING_VARIANTS: Readonly<
+const COPILOT_REASONING_VARIANT_RULES: Readonly<
   Array<{
     slug: string;
-    effort: string;
-    label: string;
+    efforts: readonly { effort: string; label: string }[];
   }>
 > = [
-  { slug: "gpt-5.5", effort: "low", label: "Low" },
-  { slug: "gpt-5.5", effort: "medium", label: "Medium" },
-  { slug: "gpt-5.5", effort: "high", label: "High" },
-  { slug: "gpt-5.5", effort: "xhigh", label: "Extra High" },
-  { slug: "gpt-5.6-terra", effort: "low", label: "Low" },
-  { slug: "gpt-5.6-terra", effort: "medium", label: "Medium" },
-  { slug: "gpt-5.6-terra", effort: "high", label: "High" },
-  { slug: "gpt-5.6-terra", effort: "xhigh", label: "Extra High" },
-  { slug: "gpt-5.6-terra", effort: "max", label: "Max" },
-  { slug: "gpt-5.6-terra", effort: "ultra", label: "Ultra" },
-  { slug: "gpt-5.6-luna", effort: "low", label: "Low" },
-  { slug: "gpt-5.6-luna", effort: "medium", label: "Medium" },
-  { slug: "gpt-5.6-luna", effort: "high", label: "High" },
-  { slug: "gpt-5.6-luna", effort: "xhigh", label: "Extra High" },
-  { slug: "gpt-5.6-luna", effort: "max", label: "Max" },
-  { slug: "gpt-5.4", effort: "low", label: "Low" },
-  { slug: "gpt-5.4", effort: "medium", label: "Medium" },
-  { slug: "gpt-5.4", effort: "high", label: "High" },
-  { slug: "gpt-5.4", effort: "xhigh", label: "Extra High" },
-  { slug: "gpt-5.4-mini", effort: "low", label: "Low" },
-  { slug: "gpt-5.4-mini", effort: "medium", label: "Medium" },
-  { slug: "gpt-5.4-mini", effort: "high", label: "High" },
-  { slug: "gpt-5.4-mini", effort: "xhigh", label: "Extra High" },
+  {
+    slug: "gpt-5.5",
+    efforts: [
+      { effort: "low", label: "Low" },
+      { effort: "medium", label: "Medium" },
+      { effort: "high", label: "High" },
+      { effort: "xhigh", label: "Extra High" },
+    ],
+  },
+  {
+    slug: "gpt-5.6-terra",
+    efforts: [
+      { effort: "low", label: "Low" },
+      { effort: "medium", label: "Medium" },
+      { effort: "high", label: "High" },
+      { effort: "xhigh", label: "Extra High" },
+      { effort: "max", label: "Max" },
+      { effort: "ultra", label: "Ultra" },
+    ],
+  },
+  {
+    slug: "gpt-5.6-luna",
+    efforts: [
+      { effort: "low", label: "Low" },
+      { effort: "medium", label: "Medium" },
+      { effort: "high", label: "High" },
+      { effort: "xhigh", label: "Extra High" },
+      { effort: "max", label: "Max" },
+    ],
+  },
+  {
+    slug: "gpt-5.4",
+    efforts: [
+      { effort: "low", label: "Low" },
+      { effort: "medium", label: "Medium" },
+      { effort: "high", label: "High" },
+      { effort: "xhigh", label: "Extra High" },
+    ],
+  },
+  {
+    slug: "gpt-5.4-mini",
+    efforts: [
+      { effort: "low", label: "Low" },
+      { effort: "medium", label: "Medium" },
+      { effort: "high", label: "High" },
+      { effort: "xhigh", label: "Extra High" },
+    ],
+  },
+  {
+    slug: "claude-sonnet-4.5",
+    efforts: [
+      { effort: "low", label: "Low" },
+      { effort: "medium", label: "Medium" },
+      { effort: "high", label: "High" },
+      { effort: "xhigh", label: "Extra High" },
+      { effort: "max", label: "Max" },
+    ],
+  },
+  {
+    slug: "claude-sonnet-4.6",
+    efforts: [
+      { effort: "low", label: "Low" },
+      { effort: "medium", label: "Medium" },
+      { effort: "high", label: "High" },
+      { effort: "max", label: "Max" },
+    ],
+  },
+  {
+    slug: "claude-opus-4.6",
+    efforts: [
+      { effort: "low", label: "Low" },
+      { effort: "medium", label: "Medium" },
+      { effort: "high", label: "High" },
+      { effort: "xhigh", label: "Extra High" },
+      { effort: "max", label: "Max" },
+    ],
+  },
 ];
 
 function createSeededCopilotReasoningVariants(
@@ -239,15 +292,18 @@ function createSeededCopilotReasoningVariants(
   const haystack = `${model.id} ${model.name}`.toLowerCase();
   const variants: SelectableModel[] = [];
 
-  for (const variant of COPILOT_GPT_REASONING_VARIANTS) {
-    if (!haystack.includes(variant.slug)) {
+  for (const rule of COPILOT_REASONING_VARIANT_RULES) {
+    if (!haystack.includes(rule.slug)) {
       continue;
     }
-    variants.push({
-      id: `${model.id}@${variant.effort}`,
-      name: `${baseName} (${variant.label})`,
-      providerLabel: "GitHub Copilot",
-    });
+    for (const variant of rule.efforts) {
+      variants.push({
+        id: `${model.id}@${variant.effort}`,
+        name: `${baseName} (${variant.label})`,
+        providerLabel: "GitHub Copilot",
+      });
+    }
+    break;
   }
 
   return variants;
