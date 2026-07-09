@@ -27,6 +27,8 @@ import { TaskInventory } from "./state/taskInventory";
 import { CurrentTaskStore } from "./utils/currentTaskStore";
 import { TASK_PROGRESS_FILENAME } from "./types/taskProgress";
 import { warmCliModelCache } from "./utils/modelSelection";
+import { StatusTreeProvider } from "./views/statusView";
+import { initNotificationRouter, deactivateNotificationRouter } from "./utils/notificationRouter";
 
 /**
  * FileDecorationProvider for the synthetic `current-task:` URI scheme.
@@ -137,6 +139,15 @@ export function activate(context: vscode.ExtensionContext): void {
     showCollapseAll: false,
   });
 
+  // Initialize status view and notification router
+  const statusTreeProvider = new StatusTreeProvider();
+  initNotificationRouter(statusTreeProvider);
+
+  const statusTreeView = vscode.window.createTreeView("vs-code-ai-helper.statusView", {
+    treeDataProvider: statusTreeProvider,
+    showCollapseAll: false,
+  });
+
   const taskStatusBar = new TaskStatusBar(currentTaskStore);
   const tasksLoadedListener = taskTreeProvider.onDidLoadTasks((tasks) => {
     const currentTaskCanonicalId = currentTaskStore.get();
@@ -154,6 +165,10 @@ export function activate(context: vscode.ExtensionContext): void {
   const collapseAllCommand = vscode.commands.registerCommand(
     "vs-code-ai-helper.collapseAllTasks",
     () => taskTreeProvider.collapseAll()
+  );
+  const statusBarMenuCommand = vscode.commands.registerCommand(
+    "vs-code-ai-helper.statusBarMenu",
+    () => taskStatusBar.showMenu()
   );
 
   // Refresh inventory and tree whenever any task's progress file changes
@@ -197,16 +212,23 @@ export function activate(context: vscode.ExtensionContext): void {
 
   context.subscriptions.push(
     tasksTreeView,
+    statusTreeView,
     taskStatusBar,
     tasksLoadedListener,
     refreshCommand,
     expandAllCommand,
     collapseAllCommand,
+    statusBarMenuCommand,
     progressWatcher,
     configListener,
     currentTaskListener,
     onExpandListener,
-    onCollapseListener
+    onCollapseListener,
+    {
+      dispose: () => {
+        deactivateNotificationRouter();
+      }
+    }
   );
 
   // Populate the inventory and status bar immediately (silent — no folder creation)

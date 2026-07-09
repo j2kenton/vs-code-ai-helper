@@ -17,6 +17,7 @@ import { ensureAiConsent } from "../utils/aiConsent";
 import { checkAndConfirmPromptSize } from "../utils/promptSizeGuard";
 import { TaskInventory } from "../state/taskInventory";
 import { IncompleteTask } from "../utils/taskProgressUtils";
+import { NotificationRouter } from "../utils/notificationRouter";
 
 /**
  * Stages a task may be in for plan generation to be safe: either at the
@@ -159,7 +160,7 @@ export async function generatePlanWithAI(
   );
   const availability = await runner.isAvailable();
   if (!availability.available) {
-    void vscode.window.showWarningMessage(
+    NotificationRouter.showWarning(
       `${providerLabel} is unavailable: ${
         availability.reason ?? "unknown reason"
       }. Use the manual planning workflow instead.`
@@ -184,7 +185,7 @@ export async function generatePlanWithAI(
     taskContent = "";
   }
   if (taskContent.length === 0) {
-    void vscode.window.showWarningMessage(
+    NotificationRouter.showWarning(
       `${TASK_FILENAME} is empty. Describe the task before generating a plan.`
     );
     return;
@@ -224,6 +225,7 @@ export async function generatePlanWithAI(
       cancellable: true,
     },
     async (progress, token) => {
+      NotificationRouter.emitProgressSummary(`Generating plan with ${providerLabel}...`);
       const planFileUri = vscode.Uri.joinPath(taskFolderUri, "plan.md");
 
       progress.report({ message: `Waiting for ${providerLabel} response...` });
@@ -261,12 +263,12 @@ export async function generatePlanWithAI(
 
         const doc = await vscode.workspace.openTextDocument(planFileUri);
         await vscode.window.showTextDocument(doc);
-        void vscode.window.showInformationMessage(
+        NotificationRouter.showInformation(
           `plan.md generated with ${providerLabel} (${result.summary ?? ""})`
         );
         // Do NOT auto-trigger review here — user advances stage manually
       } else if (result.status === "cancelled") {
-        void vscode.window.showInformationMessage(
+        NotificationRouter.showInformation(
           "Plan generation cancelled."
         );
       } else {

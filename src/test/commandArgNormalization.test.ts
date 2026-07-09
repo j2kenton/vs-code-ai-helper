@@ -104,6 +104,20 @@ import {
 } from "../commands/reviewActions";
 import { TaskInventory } from "../state/taskInventory";
 import { getCanonicalImplementationUri } from "../utils/implementationArtifactResolver";
+import { initNotificationRouter } from "../utils/notificationRouter";
+
+// Initialize notification router to forward to vscode stubs so tests can intercept them
+initNotificationRouter({
+  addEntry(message, level) {
+    if (level === "warning") {
+      void vscode.window.showWarningMessage(message);
+    } else if (level === "error") {
+      void vscode.window.showErrorMessage(message);
+    } else {
+      void vscode.window.showInformationMessage(message);
+    }
+  }
+});
 
 /**
  * Build a minimal TaskInventory stub that returns a known task for a given

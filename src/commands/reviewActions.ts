@@ -48,6 +48,7 @@ import {
 import { ensureAiConsent } from "../utils/aiConsent";
 import { checkAndConfirmPromptSize } from "../utils/promptSizeGuard";
 import * as cp from "child_process";
+import { NotificationRouter } from "../utils/notificationRouter";
 
 /**
  * The optional argument tree-view buttons pass to these commands: the tree
@@ -269,7 +270,7 @@ async function resolveTask(
       return undefined;
     }
     if (!eligibleStages.includes(progress.currentStage)) {
-      void vscode.window.showWarningMessage(
+      NotificationRouter.showWarning(
         `${node.task.folderName} is at stage "${
           STAGE_DISPLAY_NAMES[progress.currentStage]
         }", which this action doesn't apply to.`
@@ -315,7 +316,7 @@ async function resolveTask(
     eligibleStages.includes(task.progress.currentStage)
   );
   if (eligible.length === 0) {
-    void vscode.window.showInformationMessage(
+    NotificationRouter.showInformation(
       combinedTasks.length === 0
         ? "No task folders found. Use 'Start New Task' to create one."
         : "No tasks are at a stage eligible for this action."
@@ -430,7 +431,7 @@ async function runAiToFile(options: {
   );
   const availability = await runner.isAvailable();
   if (!availability.available) {
-    void vscode.window.showWarningMessage(
+    NotificationRouter.showWarning(
       `${providerLabel} is unavailable: ${
         availability.reason ?? "unknown reason"
       }. Write ${options.outputLabel} manually instead.`
@@ -459,6 +460,7 @@ async function runAiToFile(options: {
       cancellable: true,
     },
     async (progress, token) => {
+      NotificationRouter.emitProgressSummary(`${options.progressAction} with ${providerLabel}...`);
       progress.report({ message: `Waiting for ${providerLabel} response...` });
 
       const result = await runner.run(
@@ -488,13 +490,13 @@ async function runAiToFile(options: {
           options.outputFileUri
         );
         await vscode.window.showTextDocument(doc);
-        void vscode.window.showInformationMessage(
+        NotificationRouter.showInformation(
           `${options.outputLabel} generated with ${providerLabel} (${
             result.summary ?? ""
           })`
         );
       } else if (result.status === "cancelled") {
-        void vscode.window.showInformationMessage(
+        NotificationRouter.showInformation(
           `${options.outputLabel} generation cancelled.`
         );
       } else {
@@ -599,7 +601,7 @@ export async function runReviewForFolder(
     const planUri = await resolveCurrentPlanUri(folderUri);
     const planContent = await readNonEmptyText(planUri);
     if (!planContent) {
-      void vscode.window.showWarningMessage(
+      NotificationRouter.showWarning(
         "No plan found (or it is empty). Generate or write a plan first."
       );
       return;
@@ -627,7 +629,7 @@ export async function runReviewForFolder(
     const planUri = await resolveCurrentPlanUri(folderUri);
     const planContent = await readNonEmptyText(planUri);
     if (!planContent) {
-      void vscode.window.showWarningMessage(
+      NotificationRouter.showWarning(
         "No plan found (or it is empty). Generate or write a plan before reviewing implementation."
       );
       return;
@@ -638,7 +640,7 @@ export async function runReviewForFolder(
     try {
       canonicalImplUri = await materializeCanonicalIfNeeded(folderUri);
     } catch {
-      void vscode.window.showWarningMessage(
+      NotificationRouter.showWarning(
         "No implementation notes found (plan-final.md is missing or empty). " +
           "Run the implementation step first."
       );
@@ -647,7 +649,7 @@ export async function runReviewForFolder(
 
     const implementationContent = await readNonEmptyText(canonicalImplUri);
     if (!implementationContent) {
-      void vscode.window.showWarningMessage(
+      NotificationRouter.showWarning(
         "No implementation notes found (plan-final.md is missing or empty). " +
           "Run the implementation step first."
       );
@@ -672,7 +674,7 @@ export async function runReviewForFolder(
       taskProgress?.implReviewFiles
     );
     if (isFallback) {
-      void vscode.window.showWarningMessage(
+      NotificationRouter.showWarning(
         "No tracked implementation file set found for this task. " +
           "The review will be based on currently open editors. " +
           "For best results, open the files you changed before running the review."
@@ -819,7 +821,7 @@ export async function applyReviewWithAI(
   const reviewUri = artifactUri(resolved.folderUri, stage);
   const reviewContent = reviewUri && (await readNonEmptyText(reviewUri));
   if (!reviewContent) {
-    void vscode.window.showWarningMessage(
+    NotificationRouter.showWarning(
       "No review found (or it is empty). Run the review before applying it."
     );
     return;
@@ -845,7 +847,7 @@ export async function applyReviewWithAI(
   const currentPlanUri = await resolveCurrentPlanUri(resolved.folderUri);
   const planContent = await readNonEmptyText(currentPlanUri);
   if (!planContent) {
-    void vscode.window.showWarningMessage(
+    NotificationRouter.showWarning(
       "No plan found (or it is empty). Nothing to apply the review to."
     );
     return;
@@ -908,7 +910,7 @@ async function applyImplementationReviewWithAI(
   try {
     canonicalUri = await materializeCanonicalIfNeeded(folderUri);
   } catch {
-    void vscode.window.showWarningMessage(
+    NotificationRouter.showWarning(
       "No plan-final.md found. Nothing to apply the review to."
     );
     return;
@@ -916,7 +918,7 @@ async function applyImplementationReviewWithAI(
 
   const planFinalContent = await readNonEmptyText(canonicalUri);
   if (!planFinalContent) {
-    void vscode.window.showWarningMessage(
+    NotificationRouter.showWarning(
       "No plan-final.md found. Nothing to apply the review to."
     );
     return;
@@ -928,7 +930,7 @@ async function applyImplementationReviewWithAI(
   const { availability, providerLabel } =
     await checkImplementationAvailabilityForModel(model.modelId);
   if (!availability.available) {
-    void vscode.window.showWarningMessage(
+    NotificationRouter.showWarning(
       `${providerLabel} is unavailable: ${availability.reason ?? "unknown reason"}. Address the review manually instead.`
     );
     return;
@@ -1078,7 +1080,7 @@ export async function nextStage(
   ) {
     const artifactName =
       STAGE_ARTIFACT_FILENAMES[resolved.progress.currentStage];
-    void vscode.window.showWarningMessage(
+    NotificationRouter.showWarning(
       `${artifactName ?? "The current stage's artifact"} hasn't been created yet. ` +
         `Write or generate it before advancing.`
     );
@@ -1094,7 +1096,7 @@ export async function nextStage(
       const currentPlanUri = await resolveCurrentPlanUri(resolved.folderUri);
       const planContent = await readNonEmptyText(currentPlanUri);
       if (!planContent) {
-        void vscode.window.showWarningMessage(
+        NotificationRouter.showWarning(
           "No plan to promote. Write or generate a plan first."
         );
         return;
@@ -1124,7 +1126,7 @@ export async function nextStage(
   }
 
   // ── Step 2: Show stage-advance message ───────────────────────────────
-  void vscode.window.showInformationMessage(
+  NotificationRouter.showInformation(
     `${resolved.progress.taskFolder} advanced to: ${STAGE_DISPLAY_NAMES[next]}`
   );
 
@@ -1244,7 +1246,7 @@ export async function generateImplementationWithAI(
 
   const planFinalContent = await readNonEmptyText(planFinalUri);
   if (!planFinalContent) {
-    void vscode.window.showWarningMessage(
+    NotificationRouter.showWarning(
       "No plan-final.md found. Advance to the Implementation stage first."
     );
     return;
@@ -1327,7 +1329,7 @@ async function executeImplementationRun(
       "Proceed Anyway",
     );
     if (proceed !== "Proceed Anyway") {
-      void vscode.window.showInformationMessage("Implementation run cancelled.");
+      NotificationRouter.showInformation("Implementation run cancelled.");
       return;
     }
   } else {
@@ -1344,7 +1346,7 @@ async function executeImplementationRun(
         "Cancel",
       );
       if (proceed !== "Proceed") {
-        void vscode.window.showInformationMessage("Implementation run cancelled.");
+        NotificationRouter.showInformation("Implementation run cancelled.");
         return;
       }
     }
@@ -1359,6 +1361,7 @@ async function executeImplementationRun(
       cancellable: true,
     },
     async (progress, token) => {
+      NotificationRouter.emitProgressSummary(progressTitle);
       result = await runImplementationForModel({
         prompt,
         modelId,
@@ -1384,13 +1387,13 @@ async function executeImplementationRun(
   if (result.status === "completed") {
     // Post-run: show changed files or warn if tracking was unavailable
     if (result.filesChangedUnknown) {
-      void vscode.window.showWarningMessage(
+      NotificationRouter.showWarning(
         "⚠️ The AI implementation run completed, but the list of changed files " +
           "could not be determined (the workspace may not be a git repository). " +
           "Review your workspace manually to see what was changed."
       );
     } else if (result.filesChanged.length > 0) {
-      void vscode.window.showInformationMessage(
+      NotificationRouter.showInformation(
         `Implementation complete. ${result.filesChanged.length} file(s) changed: ` +
           result.filesChanged.slice(0, 5).join(", ") +
           (result.filesChanged.length > 5 ? ` … and ${result.filesChanged.length - 5} more` : "")
@@ -1420,7 +1423,7 @@ async function executeImplementationRun(
     // Auto-review after implementation run — bypass consent (already obtained)
     await runReviewForFolder(extensionUri, folderUri, workspaceRoot, postRunReviewStage, true);
   } else if (result.status === "cancelled") {
-    void vscode.window.showInformationMessage("Implementation cancelled.");
+    NotificationRouter.showInformation("Implementation cancelled.");
   } else {
     void vscode.window.showErrorMessage(
       `Implementation failed: ${result.errorMessage ?? "unknown error"}`
@@ -1479,7 +1482,7 @@ export async function runImplementationWithAI(
 
   const planFinalContent = await readNonEmptyText(canonicalUri);
   if (!planFinalContent) {
-    void vscode.window.showWarningMessage(
+    NotificationRouter.showWarning(
       "No plan-final.md found. Advance to the Implementation stage first."
     );
     return;
@@ -1491,7 +1494,7 @@ export async function runImplementationWithAI(
   const { availability, providerLabel } =
     await checkImplementationAvailabilityForModel(model.modelId);
   if (!availability.available) {
-    void vscode.window.showWarningMessage(
+    NotificationRouter.showWarning(
       `${providerLabel} is unavailable: ${availability.reason ?? "unknown reason"}. Implement the plan manually instead.`
     );
     return;

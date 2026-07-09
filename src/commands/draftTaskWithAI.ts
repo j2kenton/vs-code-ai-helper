@@ -8,6 +8,7 @@ import { TaskInventory } from "../state/taskInventory";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { ensureAiConsent } from "../utils/aiConsent";
 import { checkAndConfirmPromptSize } from "../utils/promptSizeGuard";
+import { NotificationRouter } from "../utils/notificationRouter";
 
 const INTRO_TEXT = `Briefly describe what changes you want to be made, and then use AI to help you clarify the plan.`;
 const SHORTCUT_NOTE = `Shortcut: Apply Current Stage Action (Windows/Linux: Ctrl+Shift+Alt+I, macOS: Cmd+Shift+Alt+I).`;
@@ -338,14 +339,14 @@ export async function draftTaskWithAI(
   });
 
   if (!resolvedTask) {
-    void vscode.window.showInformationMessage(
+    NotificationRouter.showInformation(
       "No active task found at the Task Description stage."
     );
     return;
   }
 
   if (resolvedTask.progress.currentStage !== "task-description") {
-    void vscode.window.showInformationMessage(
+    NotificationRouter.showInformation(
       "Task is not at the Task Description stage."
     );
     return;
@@ -378,7 +379,7 @@ export async function draftTaskWithAI(
   const parsed = parseTaskDocument(rawContent);
 
   if (!parsed.taskDescription.trim()) {
-    void vscode.window.showWarningMessage(
+    NotificationRouter.showWarning(
       "Please enter a task description before using Draft with AI."
     );
     return;
@@ -390,7 +391,7 @@ export async function draftTaskWithAI(
   );
   const availability = await runner.isAvailable();
   if (!availability.available) {
-    void vscode.window.showWarningMessage(
+    NotificationRouter.showWarning(
       `${providerLabel} is unavailable: ${availability.reason ?? "unknown reason"}.`
     );
     return;
@@ -419,6 +420,7 @@ export async function draftTaskWithAI(
         cancellable: true,
       },
       async (progress, token) => {
+        NotificationRouter.emitProgressSummary(`Drafting task with ${providerLabel}...`);
         progress.report({ message: `Waiting for ${providerLabel} response...` });
 
         const result = await runner.run(
@@ -455,7 +457,7 @@ export async function draftTaskWithAI(
             );
           }
         } else if (result.status === "cancelled") {
-          void vscode.window.showInformationMessage("Draft with AI cancelled.");
+          NotificationRouter.showInformation("Draft with AI cancelled.");
         } else {
           void vscode.window.showErrorMessage(
             `Draft with AI failed: ${result.errorMessage ?? "unknown error"}`
@@ -512,7 +514,7 @@ export async function draftTaskWithAI(
         "Draft with AI completed but task.md could not be saved. The updated content is shown in the editor."
       );
     } else {
-      void vscode.window.showInformationMessage(
+      NotificationRouter.showInformation(
         `task.md updated with Draft with AI (${providerLabel}).`
       );
     }
@@ -524,7 +526,7 @@ export async function draftTaskWithAI(
     // Open the file
     const doc = await vscode.workspace.openTextDocument(taskFileUri);
     await vscode.window.showTextDocument(doc);
-    void vscode.window.showInformationMessage(
+    NotificationRouter.showInformation(
       `task.md updated with Draft with AI (${providerLabel}).`
     );
   }

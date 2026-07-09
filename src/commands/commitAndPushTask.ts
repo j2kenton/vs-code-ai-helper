@@ -10,6 +10,7 @@ import { IncompleteTask, patchTaskProgress, updateLintPayload } from "../utils/t
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { advanceStage } from "../utils/stageTransition";
 import { selectNextTask } from "./markTaskDone";
+import { NotificationRouter } from "../utils/notificationRouter";
 
 /**
  * Accepted argument shapes for commitAndPushTask.
@@ -609,7 +610,7 @@ export async function commitAndPushTask(
           "Please refresh the Tasks panel and try again."
       );
     } else {
-      void vscode.window.showInformationMessage(
+      NotificationRouter.showInformation(
         "No completed task found to commit and push. " +
           "Select a task in the Tasks panel first, or invoke from a completed task row."
       );
@@ -619,7 +620,7 @@ export async function commitAndPushTask(
 
   // Allow committing from completed stage only
   if (resolvedTask.progress.currentStage !== "completed") {
-    void vscode.window.showWarningMessage(
+    NotificationRouter.showWarning(
       `Task is at stage "${STAGE_DISPLAY_NAMES[resolvedTask.progress.currentStage]}" — must be completed before committing and pushing.`
     );
     return;
@@ -638,7 +639,7 @@ export async function commitAndPushTask(
       "Cancel"
     );
     if (choice !== "Proceed Without Lint") {
-      void vscode.window.showInformationMessage(
+      NotificationRouter.showInformation(
         "Commit and push cancelled. Run 'Fix Linting Issues' first to record lint state."
       );
       return;
@@ -662,7 +663,7 @@ export async function commitAndPushTask(
       "Cancel"
     );
     if (choice !== "Proceed") {
-      void vscode.window.showInformationMessage("Commit and push cancelled.");
+      NotificationRouter.showInformation("Commit and push cancelled.");
       return;
     }
   }
@@ -674,6 +675,7 @@ export async function commitAndPushTask(
       cancellable: false,
     },
     async (progress) => {
+      NotificationRouter.emitProgressSummary(`Committing and pushing ${resolvedTask.folderName}...`);
       try {
         // Resolve repository
         progress.report({ message: "Resolving git repository..." });
@@ -709,7 +711,7 @@ export async function commitAndPushTask(
           // Task folder is clean — offer include-all or cancel
           const hasRepoChanges = await hasChangesToCommit(repoRoot);
           if (!hasRepoChanges) {
-            void vscode.window.showInformationMessage(
+            NotificationRouter.showInformation(
               "No changes to commit — the repository is clean."
             );
             return;
@@ -723,7 +725,7 @@ export async function commitAndPushTask(
             "Include All Repository Changes",
           );
           if (choice !== "Include All Repository Changes") {
-            void vscode.window.showInformationMessage("Commit and push cancelled.");
+            NotificationRouter.showInformation("Commit and push cancelled.");
             return;
           }
           includeAll = true;
@@ -761,7 +763,7 @@ export async function commitAndPushTask(
               return f === taskRelative || f.startsWith(taskRelative + "/");
             }));
           } else {
-            void vscode.window.showInformationMessage("Commit and push cancelled.");
+            NotificationRouter.showInformation("Commit and push cancelled.");
             return;
           }
         }
@@ -880,14 +882,14 @@ export async function commitAndPushTask(
           channel.appendLine("");
           channel.appendLine("Run the command again to proceed after reviewing.");
           channel.show(true);
-          void vscode.window.showInformationMessage(
+          NotificationRouter.showInformation(
             "Full file list shown in 'Ensemble: Commit Preview'. Re-run the command to proceed."
           );
           return;
         }
 
         if (confirmed !== "Commit & Push") {
-          void vscode.window.showInformationMessage(
+          NotificationRouter.showInformation(
             "Commit and push cancelled."
           );
           return;
@@ -965,7 +967,7 @@ export async function commitAndPushTask(
             ]);
           }
 
-          void vscode.window.showInformationMessage(
+          NotificationRouter.showInformation(
             `Successfully committed and pushed ${resolvedTask.folderName} to ${pushDestination}`
           );
         } catch (error: unknown) {
@@ -1010,7 +1012,7 @@ export async function completeCommitAndPushTask(
           "Please refresh the Tasks panel and try again."
       );
     } else {
-      void vscode.window.showInformationMessage(
+      NotificationRouter.showInformation(
         "No active task found to complete, commit, and push."
       );
     }
@@ -1023,7 +1025,7 @@ export async function completeCommitAndPushTask(
       // If already completed, fall back directly to commit & push
       return commitAndPushTask(inventory, explicitArg, currentTaskStore);
     }
-    void vscode.window.showWarningMessage(
+    NotificationRouter.showWarning(
       `"Complete, Commit and Push" is only available when the task is at the final review stage (Implementation: Low-Level Review) or completed.`
     );
     return;
@@ -1032,7 +1034,7 @@ export async function completeCommitAndPushTask(
   // Gate on known lint state (only when lint state is known)
   const lintPayload = resolvedTask.progress.lintPayload;
   if (!lintPayload) {
-    void vscode.window.showWarningMessage(
+    NotificationRouter.showWarning(
       `Lint state is unknown for "${resolvedTask.folderName}". Run linting fixes first.`
     );
     return;

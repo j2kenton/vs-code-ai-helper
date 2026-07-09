@@ -1,20 +1,20 @@
 # plan-final.md
 
-This stage polished the task user interface by resolving model selection visibility, enforcing consistent command tooltips/titles across different surfaces, ensuring action icons match their intent, and replacing ad hoc row-context logic with validated context tokens.
+This stage polished the task status surfaces and notification routing, sending routine non-blocking notifications to a bounded status surface while keeping destructive validations as popups, and ensuring that the status bar actions are always context-sensitive and useful.
 
 ## Files Changed
 
-- [package.json](file:///c:/dev/PERSONAL/vs-code-ai-helper/package.json): Updated the task-row context menu to use `configureTaskStepModels` for proper task scope, and renamed the title of `setStageModel` to "Set Model for This Step" for clearer tooltips.
-- [src/types/taskProgress.ts](file:///c:/dev/PERSONAL/vs-code-ai-helper/src/types/taskProgress.ts): Extended `TaskProgress` interface with `scheduledResumeTime` and `pendingNotes` fields to support context token calculation.
-- [src/commands/configureStepModels.ts](file:///c:/dev/PERSONAL/vs-code-ai-helper/src/commands/configureStepModels.ts): Annotated selectable model quick pick items with their active status (`Active task override`, `Workspace default`, or `Active workspace default`).
-- [src/views/taskTreeProvider.ts](file:///c:/dev/PERSONAL/vs-code-ai-helper/src/views/taskTreeProvider.ts): Imported `path`, implemented asynchronous gitignore checking, and passed `isScheduled`, `hasPendingNote`, and `isMetaManaged` states to the `TaskNode` and `StageNode` constructors to drive centralized context token building.
-- [src/test/taskTreeProvider.test.ts](file:///c:/dev/PERSONAL/vs-code-ai-helper/src/test/taskTreeProvider.test.ts): Removed the global mock of `buildStageContextValue` and updated context token assertions to reflect the real centralized implementation.
-- [src/test/modelSelection.test.ts](file:///c:/dev/PERSONAL/vs-code-ai-helper/src/test/modelSelection.test.ts): Added test assertions for resolved model display strings when a model is currently unavailable.
+- [src/views/taskStatusBar.ts](file:///c:/dev/PERSONAL/vs-code-ai-helper/src/views/taskStatusBar.ts): Updated `showMenu` to check if a task exists and offer `Resume shown task` if it is paused, or `Open shown task` otherwise (including completed states).
+- [src/commands/generatePlanWithAI.ts](file:///c:/dev/PERSONAL/vs-code-ai-helper/src/commands/generatePlanWithAI.ts): Integrated `NotificationRouter` for routine notifications and emitted progress summaries to the status view.
+- [src/commands/draftTaskWithAI.ts](file:///c:/dev/PERSONAL/vs-code-ai-helper/src/commands/draftTaskWithAI.ts): Integrated `NotificationRouter` for routine notifications and emitted progress summaries to the status view.
+- [src/commands/runLintingFixes.ts](file:///c:/dev/PERSONAL/vs-code-ai-helper/src/commands/runLintingFixes.ts): Integrated `NotificationRouter` for routine notifications and emitted progress summaries to the status view.
+- [src/commands/commitAndPushTask.ts](file:///c:/dev/PERSONAL/vs-code-ai-helper/src/commands/commitAndPushTask.ts): Integrated `NotificationRouter` for routine notifications and emitted progress summaries to the status view.
+- [src/commands/reviewActions.ts](file:///c:/dev/PERSONAL/vs-code-ai-helper/src/commands/reviewActions.ts): Integrated `NotificationRouter` for routine notifications and emitted progress summaries to the status view.
+- [src/test/stage5StatusNotification.test.ts](file:///c:/dev/PERSONAL/vs-code-ai-helper/src/test/stage5StatusNotification.test.ts): Added unit tests for `TaskStatusBar` quick pick menu actions under paused, active, and completed task states.
 
 ## Verification
 
-- [ ] Run `pnpm run test:unit` to verify that all 351 unit tests pass successfully.
-- [ ] Confirm that model pick items clearly annotate task overrides, workspace defaults, and automatic selections.
-- [ ] Verify that right-clicking a task row displays "Configure Models for This Task" instead of "Configure Workspace Default Models".
-- [ ] Verify that hovering over a modelable stage row's set model button displays the tooltip "Set Model for This Step".
-- [ ] Confirm that row-context tokens correctly adapt to scheduling, pending-note, and git-managed/meta-managed states.
+- [ ] Run `pnpm run test:unit` to verify that all 367 unit tests pass successfully.
+- [ ] Verify that routine warnings and informational messages appear in the "Recent Status" sidebar view.
+- [ ] Confirm that destructive confirmations (like git push confirmations) still appear as modal/standard popups.
+- [ ] Confirm that clicking the status bar when a shown task exists offers "Resume shown task" if paused, and "Open shown task" otherwise.

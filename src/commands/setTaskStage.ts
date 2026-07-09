@@ -9,6 +9,7 @@ import { TaskInventory } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { advanceStage } from "../utils/stageTransition";
+import { NotificationRouter } from "../utils/notificationRouter";
 
 /**
  * Accepted argument shapes for setTaskStage.
@@ -121,7 +122,7 @@ export async function setTaskStage(
     // active task). Fall back to a quick pick over all known tasks.
     const allTasks = inventory.getTasks();
     if (allTasks.length === 0) {
-      void vscode.window.showInformationMessage(
+      NotificationRouter.showInformation(
         "No task folders found. Use 'Start New Task' to create one."
       );
       return;
@@ -210,7 +211,7 @@ export async function setTaskStage(
   // Refresh the inventory so the new stage is visible immediately
   await inventory.refresh();
 
-  void vscode.window.showInformationMessage(
+  NotificationRouter.showInformation(
     `${task.folderName} set to stage: ${STAGE_DISPLAY_NAMES[newStage]}`
   );
 

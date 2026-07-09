@@ -8,6 +8,8 @@ import {
   updateTaskStatus,
 } from "../utils/taskProgressUtils";
 
+import { NotificationRouter } from "../utils/notificationRouter";
+
 /**
  * Accepted argument shapes for resumeTask.
  *
@@ -103,12 +105,12 @@ export async function resumePausedTask(
       );
       return;
     }
-    void vscode.window.showInformationMessage("No paused tasks to resume.");
+    NotificationRouter.showInformation("No paused tasks to resume.");
     return;
   }
 
   if (resolvedTask.progress.status !== "paused") {
-    void vscode.window.showInformationMessage(`Task is not paused.`);
+    NotificationRouter.showInformation(`Task is not paused.`);
     return;
   }
 
@@ -127,7 +129,7 @@ export async function resumePausedTask(
   await currentTaskStore.set(resolvedTask.canonicalId);
 
   await inventory.refresh();
-  void vscode.window.showInformationMessage(`Task resumed.`);
+  NotificationRouter.showInformation(`Task resumed.`);
 }
 
 /**

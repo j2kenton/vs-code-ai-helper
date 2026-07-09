@@ -8,6 +8,8 @@ import {
   updateTaskStatus,
 } from "../utils/taskProgressUtils";
 
+import { NotificationRouter } from "../utils/notificationRouter";
+
 /**
  * Accepted argument shapes for pauseTask.
  *
@@ -102,23 +104,19 @@ export async function pauseTask(
       );
       return;
     }
-    void vscode.window.showInformationMessage("No active tasks to pause.");
+    NotificationRouter.showInformation("No active tasks to pause.");
     return;
   }
 
   // If already paused, show message
   if (resolvedTask.progress.status === "paused") {
-    void vscode.window.showInformationMessage(
-      `Task is already paused.`
-    );
+    NotificationRouter.showInformation(`Task is already paused.`);
     return;
   }
 
   // If completed, don't allow pause
   if (resolvedTask.progress.currentStage === "completed") {
-    void vscode.window.showInformationMessage(
-      "Cannot pause a completed task."
-    );
+    NotificationRouter.showInformation("Cannot pause a completed task.");
     return;
   }
 
@@ -132,7 +130,7 @@ export async function pauseTask(
   }
 
   await inventory.refresh();
-  void vscode.window.showInformationMessage(`Task paused.`);
+  NotificationRouter.showInformation(`Task paused.`);
 }
 
 /**

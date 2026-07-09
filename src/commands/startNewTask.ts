@@ -120,6 +120,18 @@ export async function startNewTask(
   }
 
   try {
+    // Prompt for optional task description
+    const description = await vscode.window.showInputBox({
+      title: "New Task Description",
+      prompt: "Enter an optional description for the new task. Press Escape to cancel.",
+      placeHolder: "e.g., Implement sidebar status view",
+    });
+
+    // If the user cancelled the input box (returned undefined), abort creation.
+    if (description === undefined) {
+      return undefined;
+    }
+
     // Resolve the task root, creating it if needed
     const metaFolderPath = await resolveTaskRootForCreation(workspaceRoot);
 
@@ -139,7 +151,10 @@ export async function startNewTask(
     );
 
     // Load and write task.md pre-seeded with the template
-    const taskTemplate = await loadTaskTemplate(extensionUri);
+    let taskTemplate = await loadTaskTemplate(extensionUri);
+    if (description.trim().length > 0) {
+      taskTemplate = prefillTemplate(taskTemplate, description);
+    }
     const taskFileUri = vscode.Uri.joinPath(taskFolderUri, TASK_FILENAME);
     await vscode.workspace.fs.writeFile(
       taskFileUri,
@@ -167,10 +182,14 @@ export async function startNewTask(
       // task could not be re-resolved. This is unexpected (e.g. a race with
       // discovery filters). Surface a warning so the user knows the shortcut
       // may not work until they manually select the task in the tree.
-      void vscode.window.showWarningMessage(
-        `Task "${taskFolderName}" was created but could not be set as the ` +
-          `current task automatically. Select it in the Tasks panel to activate it.`
-      );
+      const warningMsg = `Task "${taskFolderName}" was created but could not be set as the ` +
+        `current task automatically. Select it in the Tasks panel to activate it.`;
+      try {
+        const { NotificationRouter } = await import("../utils/notificationRouter.js");
+        NotificationRouter.showWarning(warningMsg);
+      } catch {
+        void vscode.window.showWarningMessage(warningMsg);
+      }
     }
 
     // Open task.md in the editor regardless — the file was written successfully
@@ -185,6 +204,24 @@ export async function startNewTask(
     );
     return undefined;
   }
+}
+
+/**
+ * Prefill the task template with the user-provided description under the Task Description heading.
+ */
+function prefillTemplate(template: string, description: string): string {
+  const heading = "## Task Description";
+  const index = template.indexOf(heading);
+  if (index !== -1) {
+    return (
+      template.slice(0, index + heading.length) +
+      "\n\n" +
+      description.trim() +
+      "\n" +
+      template.slice(index + heading.length)
+    );
+  }
+  return template + "\n\n" + description.trim() + "\n";
 }
 
 /**

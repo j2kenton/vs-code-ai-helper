@@ -6,6 +6,7 @@ import {
   patchTaskProgress,
   updateLintPayload,
 } from "../utils/taskProgressUtils";
+import { NotificationRouter } from "../utils/notificationRouter";
 
 /**
  * Accepted argument shapes for runLintingFixes.
@@ -84,7 +85,7 @@ export async function runLintingFixes(
   });
 
   if (!resolvedTask) {
-    void vscode.window.showInformationMessage(
+    NotificationRouter.showInformation(
       "No task found. Please select a task first."
     );
     return;
@@ -94,7 +95,7 @@ export async function runLintingFixes(
     resolvedTask.progress.currentStage !== "completed" &&
     resolvedTask.progress.currentStage !== "impl-low-review"
   ) {
-    void vscode.window.showWarningMessage(
+    NotificationRouter.showWarning(
       "Linting fixes are only available for completed tasks or tasks at the final review stage."
     );
     return;
@@ -121,6 +122,7 @@ export async function runLintingFixes(
       cancellable: false,
     },
     async (progress) => {
+      NotificationRouter.emitProgressSummary("Running linting fixes...");
       try {
         progress.report({ message: "Checking for linting errors..." });
 
@@ -144,7 +146,7 @@ export async function runLintingFixes(
 
         if (lintingIssues.length === 0) {
           await persistLintState(true, "No linting issues found.");
-          void vscode.window.showInformationMessage(
+          NotificationRouter.showInformation(
             "No linting issues found in the task folder. Your code looks good!"
           );
           return;
@@ -205,12 +207,12 @@ export async function runLintingFixes(
         }
 
         if (fixedCount > 0) {
-          void vscode.window.showInformationMessage(
+          NotificationRouter.showInformation(
             `Linting fixes applied to ${fixedCount} file(s) in the task folder!` +
             (failedCount > 0 ? ` (${failedCount} file(s) could not be fixed automatically)` : "")
           );
         } else {
-          void vscode.window.showWarningMessage(
+          NotificationRouter.showWarning(
             "Could not apply automatic fixes. Please install ESLint extension or fix issues manually."
           );
         }

@@ -40,7 +40,11 @@ class Uri {
         return u;
       }
     }
-    return new Uri(normalizeFsPath(value.replace(/^file:\/\//, "")));
+    let fsPath = value.replace(/^file:\/\//, "");
+    if (process.platform === "win32" && fsPath.startsWith("/") && /^[a-zA-Z]:/.test(fsPath.slice(1))) {
+      fsPath = fsPath.slice(1);
+    }
+    return new Uri(normalizeFsPath(fsPath));
   }
 
   static joinPath(base, ...segments) {
@@ -190,6 +194,10 @@ const workspace = {
   },
   asRelativePath: (uri) => (uri && uri.path ? uri.path : String(uri)),
   workspaceFolders: undefined,
+  getConfiguration: () => ({
+    get: (key, defaultValue) => defaultValue,
+    inspect: () => undefined,
+  }),
 };
 
 // Minimal window stub: show* methods are overridable by individual tests via
@@ -200,6 +208,7 @@ const window = {
   showErrorMessage: notImplemented("window.showErrorMessage"),
   showWarningMessage: notImplemented("window.showWarningMessage"),
   showQuickPick: notImplemented("window.showQuickPick"),
+  showInputBox: notImplemented("window.showInputBox"),
   withProgress: notImplemented("window.withProgress"),
   // createStatusBarItem is needed by TaskStatusBar constructor.
   // Returns a minimal StatusBarItem stub so TaskStatusBar can be exercised
