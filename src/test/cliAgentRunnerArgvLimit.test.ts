@@ -38,10 +38,10 @@ void describe("execCliAgent argv prompt limits", () => {
     assert.match(result.errorMessage ?? "", /max 10 bytes/i);
   });
 
-  void it("Antigravity declares an argv prompt cap to avoid ENAMETOOLONG", () => {
+  void it("Antigravity no longer uses argv prompt transport", () => {
     const provider = getCliProvider("antigravity-cli");
     assert.ok(provider, "expected antigravity-cli provider definition");
-    assert.strictEqual(provider.promptTransport, "argv");
-    assert.strictEqual(provider.maxArgvPromptBytes, 24_000);
+    assert.strictEqual(provider.promptTransport, "stdin");
+    assert.strictEqual(provider.maxArgvPromptBytes, undefined);
   });
 });

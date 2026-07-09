@@ -33,22 +33,21 @@ void describe("provider CLI contracts", () => {
 
     assert.strictEqual(antigravity.command, "agy");
     assert.deepStrictEqual(antigravity.commandAliases, ["antigravity"]);
-    assert.strictEqual(antigravity.promptTransport, "argv");
+    assert.strictEqual(antigravity.promptTransport, "stdin");
     assert.strictEqual(antigravity.useShell, false);
-    assert.strictEqual(antigravity.maxArgvPromptBytes, 24_000);
+    assert.strictEqual(antigravity.maxArgvPromptBytes, undefined);
     assert.deepStrictEqual(antigravity.models, [
       { model: undefined, name: "Antigravity (CLI default)" },
     ]);
 
     const textArgs = antigravity.buildArgs("text", undefined, undefined);
-    assert.deepStrictEqual(textArgs, ["--prompt"]);
+    assert.deepStrictEqual(textArgs, []);
 
     const editArgs = antigravity.buildArgs("edit", "gemini-3-pro", undefined);
     assert.deepStrictEqual(editArgs, [
       "--dangerously-skip-permissions",
       "--model",
       "gemini-3-pro",
-      "--prompt",
     ]);
   });
 

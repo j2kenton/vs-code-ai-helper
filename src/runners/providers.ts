@@ -181,12 +181,8 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     // when available.
     models: [{ model: undefined, name: "Antigravity (CLI default)" }],
     usesLastMessageFile: false,
-    promptTransport: "argv",
+    promptTransport: "stdin",
     useShell: false,
-    // argv-based prompt transport can hit OS command-line length limits on
-    // large implementation prompts, especially on Windows. Keep this
-    // conservative so we fail with a clear message before spawn().
-    maxArgvPromptBytes: 24_000,
     buildArgs(mode, model): string[] {
       const args: string[] = [];
       if (mode === "edit") {
@@ -195,7 +191,6 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
       if (model) {
         args.push("--model", model);
       }
-      args.push("--prompt");
       return args;
     },
   },
