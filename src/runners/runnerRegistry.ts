@@ -69,7 +69,7 @@ async function resolveEffectiveProvider(
   }
 
   for (const def of CLI_PROVIDERS) {
-    if (await cliCommandExists(def.command)) {
+    if (await cliCommandExists(def.command, def.commandAliases)) {
       return { kind: "cli", def, model: undefined };
     }
   }
@@ -133,7 +133,7 @@ export async function checkImplementationAvailabilityForModel(
     };
   }
   const { def } = effective;
-  const exists = await cliCommandExists(def.command);
+  const exists = await cliCommandExists(def.command, def.commandAliases);
   return {
     availability: exists
       ? { available: true }

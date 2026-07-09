@@ -19,7 +19,9 @@ import { getAiModelDefault } from "../config/settings";
 import { CLI_PROVIDERS } from "../runners/providers";
 
 function supportedCliListLabel(): string {
-  return CLI_PROVIDERS.map((provider) => provider.command).join(", ");
+  return CLI_PROVIDERS.map((provider) =>
+    [provider.command, ...(provider.commandAliases ?? [])].join("/")
+  ).join(", ");
 }
 
 interface ModelPickItem extends vscode.QuickPickItem {

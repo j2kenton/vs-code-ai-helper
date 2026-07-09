@@ -185,7 +185,9 @@ export async function getAvailableModels(): Promise<SelectableModel[]> {
   }
 
   const availability = await Promise.all(
-    CLI_PROVIDERS.map((def) => cliCommandExists(def.command))
+    CLI_PROVIDERS.map((def) =>
+      cliCommandExists(def.command, def.commandAliases)
+    )
   );
   CLI_PROVIDERS.forEach((def, index) => {
     if (!availability[index]) {

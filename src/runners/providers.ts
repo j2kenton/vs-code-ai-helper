@@ -7,7 +7,7 @@
  *  - Claude Code  (`claude`) — Anthropic Claude Pro/Max subscription
  *  - Codex CLI    (`codex`)  — OpenAI ChatGPT Plus/Pro subscription
  *  - Gemini CLI   (`gemini`) — Google account / Gemini Code Assist
- *  - Antigravity  (`antigravity`) — Google Gemini/Antigravity CLI account
+ *  - Antigravity  (`agy` / `antigravity`) — Google Gemini/Antigravity CLI account
  *  - Kiro CLI     (`kiro-cli`) — AWS Kiro subscription/login
  *
  * Model IDs are stored as "<provider>:<model>" (e.g. "claude-cli:sonnet",
@@ -39,6 +39,8 @@ export interface CliProviderDefinition {
   label: string;
   /** Executable name resolved via PATH. */
   command: string;
+  /** Fallback executable names accepted for the same provider. */
+  commandAliases?: readonly string[];
   /** Shown when the CLI is not installed. */
   installHint: string;
   /** Shown when the CLI reports an authentication problem. */
@@ -169,11 +171,12 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
   {
     id: "antigravity-cli",
     label: "Antigravity CLI",
-    command: "antigravity",
+    command: "agy",
+    commandAliases: ["antigravity"],
     installHint:
-      "Install the Antigravity CLI, then run `antigravity` once to sign in with your Google account.",
+      "Install the Antigravity CLI, then run `agy` (or `antigravity`) once to sign in with your Google account.",
     loginHint:
-      "Run `antigravity` in a terminal and complete the Google sign-in, then try again.",
+      "Run `agy` (or `antigravity`) in a terminal and complete the Google sign-in, then try again.",
     authErrorMarkers: ["login", "authenticate", "credentials", "api key"],
     models: [
       { model: undefined, name: "Antigravity (CLI default)" },

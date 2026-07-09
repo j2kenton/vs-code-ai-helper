@@ -27,6 +27,14 @@ void describe("provider CLI contracts", () => {
     ]);
   });
 
+  void it("Antigravity supports both agy and antigravity executable names", () => {
+    const antigravity = getCliProvider("antigravity-cli");
+    assert.ok(antigravity, "expected antigravity-cli provider definition");
+
+    assert.strictEqual(antigravity.command, "agy");
+    assert.deepStrictEqual(antigravity.commandAliases, ["antigravity"]);
+  });
+
   void it("Kiro hints mention KIRO_API_KEY requirement", () => {
     const kiro = getCliProvider("kiro-cli");
     assert.ok(kiro, "expected kiro-cli provider definition");

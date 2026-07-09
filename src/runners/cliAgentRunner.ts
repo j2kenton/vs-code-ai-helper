@@ -30,10 +30,14 @@ const RUN_TIMEOUT_MS = 30 * 60 * 1000;
 const COMMAND_EXISTS_CACHE_TTL_MS = 60 * 1000;
 const commandExistsCache = new Map<string, { exists: boolean; expiresAt: number }>();
 
-/**
- * Whether an executable is resolvable via PATH (where/which exits 0).
- */
-export async function cliCommandExists(command: string): Promise<boolean> {
+function cliCommandCandidates(
+  command: string,
+  aliases: readonly string[] = []
+): readonly string[] {
+  return [command, ...aliases];
+}
+
+async function lookupCliCommand(command: string): Promise<boolean> {
   const cached = commandExistsCache.get(command);
   if (cached !== undefined && cached.expiresAt > Date.now()) {
     return cached.exists;
@@ -51,6 +55,32 @@ export async function cliCommandExists(command: string): Promise<boolean> {
     expiresAt: Date.now() + COMMAND_EXISTS_CACHE_TTL_MS,
   });
   return exists;
+}
+
+/**
+ * Resolve the first executable name for this provider that is available on
+ * PATH, trying aliases in order.
+ */
+export async function resolveCliCommand(
+  command: string,
+  aliases: readonly string[] = []
+): Promise<string | undefined> {
+  for (const candidate of cliCommandCandidates(command, aliases)) {
+    if (await lookupCliCommand(candidate)) {
+      return candidate;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Whether an executable is resolvable via PATH (where/which exits 0).
+ */
+export async function cliCommandExists(
+  command: string,
+  aliases: readonly string[] = []
+): Promise<boolean> {
+  return (await resolveCliCommand(command, aliases)) !== undefined;
 }
 
 /**
@@ -163,6 +193,19 @@ export async function execCliAgent(options: {
     args.push(prompt);
   }
 
+  const resolvedCommand = await resolveCliCommand(
+    def.command,
+    def.commandAliases
+  );
+
+  if (!resolvedCommand) {
+    return {
+      status: "failed",
+      output: "",
+      errorMessage: `Could not start the ${def.label} CLI (${def.command}): command not found. ${def.installHint}`,
+    };
+  }
+
   return new Promise<CliExecResult>((resolve) => {
     let settled = false;
     let cancelled = false;
@@ -176,7 +219,7 @@ export async function execCliAgent(options: {
       useShell && process.platform === "win32"
         ? args.map((a) => (a.includes(" ") ? `"${a}"` : a))
         : args;
-    const child = cp.spawn(def.command, spawnArgs, {
+    const child = cp.spawn(resolvedCommand, spawnArgs, {
       cwd,
       shell: useShell,
       windowsHide: true,
@@ -227,7 +270,7 @@ export async function execCliAgent(options: {
       finish({
         status: "failed",
         output: "",
-        errorMessage: `Could not start the ${def.label} CLI (${def.command}): ${error.message}. ${def.installHint}`,
+        errorMessage: `Could not start the ${def.label} CLI (${resolvedCommand}): ${error.message}. ${def.installHint}`,
       });
     });
 
@@ -317,7 +360,10 @@ export class CliAgentRunner implements AgentRunner {
   }
 
   async isAvailable(): Promise<AgentAvailability> {
-    const exists = await cliCommandExists(this.def.command);
+    const exists = await cliCommandExists(
+      this.def.command,
+      this.def.commandAliases
+    );
     if (!exists) {
       return {
         available: false,

@@ -104,7 +104,7 @@ Install from the Visual Studio Marketplace:
 - A workspace folder open (the extension stores everything relative to your workspace)
 - Optional, for the "with AI" commands — at least one of:
   - an active GitHub Copilot subscription, signed in to VS Code (works out of the box, no CLI needed), or
-  - a vendor CLI signed in to your existing subscription: **Claude Code** (`npm i -g @anthropic-ai/claude-code`, Anthropic Pro/Max), **Codex** (`npm i -g @openai/codex`, ChatGPT Plus/Pro), **Gemini CLI** (`npm i -g @google/gemini-cli`, Google account / Code Assist), **Antigravity CLI** (`antigravity`, Google account), or **Kiro CLI** (`kiro-cli`, AWS Kiro).
+  - a vendor CLI signed in to your existing subscription: **Claude Code** (`npm i -g @anthropic-ai/claude-code`, Anthropic Pro/Max), **Codex** (`npm i -g @openai/codex`, ChatGPT Plus/Pro), **Gemini CLI** (`npm i -g @google/gemini-cli`, Google account / Code Assist), **Antigravity CLI** (`agy` or `antigravity`, Google account), or **Kiro CLI** (`kiro-cli`, AWS Kiro).
 
 For Kiro specifically, Ensemble uses `kiro-cli chat --no-interactive`, which requires `KIRO_API_KEY` in the environment. `kiro-cli login` alone is not sufficient for headless runs.
 
