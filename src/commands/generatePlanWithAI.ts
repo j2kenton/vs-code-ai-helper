@@ -1,8 +1,7 @@
 import * as vscode from "vscode";
 import {
-  readTaskProgress,
+  patchTaskProgress,
   updateTaskProgressStage,
-  writeTaskProgress,
 } from "../utils/taskProgressUtils";
 import {
   generateContextPack,
@@ -17,6 +16,7 @@ import { TASK_FILENAME, TaskStage } from "../types/taskProgress";
 import { ensureAiConsent } from "../utils/aiConsent";
 import { checkAndConfirmPromptSize } from "../utils/promptSizeGuard";
 import { TaskInventory } from "../state/taskInventory";
+import { IncompleteTask } from "../utils/taskProgressUtils";
 
 /**
  * Stages a task may be in for plan generation to be safe: either at the
@@ -26,10 +26,71 @@ const ELIGIBLE_STAGES: readonly TaskStage[] = ["task-description", "plan"];
 
 /**
  * Accepted argument shapes for generatePlanWithAI.
- * - Legacy direct URI: vscode.Uri
- * - Canonical ID resolver: { canonicalId?: string }
+ *
+ * Commands may be invoked from:
+ *   - Tree stage-row buttons: the tree node itself, which has `.task: IncompleteTask`
+ *     and `.stage: TaskStage` (StageNode shape)
+ *   - Tree task-row buttons / IncompleteTask wrappers: `{ task: IncompleteTask }`
+ *   - Keyboard shortcut router: `{ canonicalId?: string }`
+ *   - Legacy direct URI (kept for backward compat): vscode.Uri
+ *   - Command palette (no arg): undefined
  */
-type GeneratePlanArg = vscode.Uri | { canonicalId?: string };
+type GeneratePlanArg =
+  | vscode.Uri
+  | { canonicalId?: string }
+  | { task?: IncompleteTask }
+  | { taskFolderPath?: string };
+
+/**
+ * Normalize a GeneratePlanArg into a resolved value for the caller to act on.
+ *
+ * Returns:
+ *   - A `vscode.Uri` when the target folder is unambiguously resolved
+ *     (direct Uri, `{ task }` shape, or `{ taskFolderPath }` shape).
+ *   - `{ canonicalId: string }` sentinel when the arg carries only a canonical
+ *     ID that was not found in the inventory — the caller must fail clearly
+ *     rather than silently opening a folder picker.
+ *   - `undefined` to fall through to the user folder picker (no arg, empty
+ *     object, or `{ task: undefined }`).
+ *
+ * @internal exported for testing
+ */
+export function normalizeGeneratePlanArg(
+  arg: GeneratePlanArg | undefined,
+  inventory: TaskInventory
+): vscode.Uri | { canonicalId: string } | undefined {
+  if (!arg) {
+    return undefined;
+  }
+
+  // Direct URI (legacy shape, e.g. right-click in explorer)
+  if (arg instanceof vscode.Uri) {
+    return arg;
+  }
+
+  // Tree stage-row shape: StageNode has `.task: IncompleteTask`
+  if ("task" in arg && arg.task) {
+    return arg.task.folderUri;
+  }
+
+  // Explicit folder path (e.g. from applyHighLevelReviewChanges delegation)
+  if ("taskFolderPath" in arg && arg.taskFolderPath) {
+    return vscode.Uri.file(arg.taskFolderPath);
+  }
+
+  // Canonical ID — resolve via inventory
+  if ("canonicalId" in arg && arg.canonicalId) {
+    const task = inventory.getTaskById(arg.canonicalId);
+    if (task) {
+      return vscode.Uri.file(task.taskFolderPath);
+    }
+    // Return a sentinel so the caller can report the failure rather than
+    // silently falling through to the folder picker.
+    return { canonicalId: arg.canonicalId };
+  }
+
+  return undefined;
+}
 
 /**
  * Generate plan.md for a task folder using the user's Copilot access.
@@ -62,26 +123,30 @@ export async function generatePlanWithAI(
     return;
   }
 
-  // Resolve argument: if it's a URI, use it directly; if it's an object with
-  // canonicalId, resolve via TaskInventory; otherwise prompt user
+  // Resolve the target task folder URI from the argument.
   let taskFolderUri: vscode.Uri | undefined;
 
-  if (arg instanceof vscode.Uri) {
-    taskFolderUri = arg;
-  } else if (arg && typeof arg === "object" && "canonicalId" in arg && arg.canonicalId) {
-    // Resolve canonicalId to taskFolderUri via TaskInventory
-    const task = inventory.getTaskById(arg.canonicalId);
-    if (task) {
-      taskFolderUri = vscode.Uri.file(task.taskFolderPath);
+  const normalized = normalizeGeneratePlanArg(arg, inventory);
+
+  if (normalized === undefined) {
+    // No arg or unresolvable arg — prompt user to pick
+    taskFolderUri = await pickTaskFolder("Generate Plan with AI", ELIGIBLE_STAGES);
+  } else if (normalized instanceof vscode.Uri) {
+    taskFolderUri = normalized;
+  } else {
+    // Sentinel: canonicalId was provided but not found in the inventory.
+    // After a refresh attempt the inventory still doesn't know this task —
+    // fail clearly rather than silently acting on a different task.
+    await inventory.refresh();
+    const retried = inventory.getTaskById(normalized.canonicalId);
+    if (retried) {
+      taskFolderUri = vscode.Uri.file(retried.taskFolderPath);
     } else {
       void vscode.window.showErrorMessage(
-        `Task with ID "${arg.canonicalId}" not found.`
+        `Task with ID "${normalized.canonicalId}" not found. It may have been deleted or moved.`
       );
       return;
     }
-  } else {
-    // No arg provided, prompt user
-    taskFolderUri = await pickTaskFolder("Generate Plan with AI", ELIGIBLE_STAGES);
   }
 
   if (!taskFolderUri) {
@@ -159,13 +224,13 @@ export async function generatePlanWithAI(
       cancellable: true,
     },
     async (progress, token) => {
-      const planFileUri = vscode.Uri.joinPath(taskFolderUri, "plan.md");
+      const planFileUri = vscode.Uri.joinPath(taskFolderUri!, "plan.md");
 
       progress.report({ message: `Waiting for ${providerLabel} response...` });
 
       const result = await runner.run(
         {
-          taskFolderUri,
+          taskFolderUri: taskFolderUri!,
           workspaceUri: workspaceRoot.uri,
           stage: "plan",
           prompt,
@@ -176,7 +241,7 @@ export async function generatePlanWithAI(
       );
 
       await writeRunLog(
-        taskFolderUri,
+        taskFolderUri!,
         runner.id,
         "plan",
         `# Prompt\n\n${prompt}\n\n# Result\n\nStatus: ${result.status}\n\n${
@@ -185,12 +250,14 @@ export async function generatePlanWithAI(
       );
 
       if (result.status === "completed") {
-        // Persist stage as "plan" (generation stage, not review stage)
-        const existing = await readTaskProgress(taskFolderUri);
-        if (existing && ELIGIBLE_STAGES.includes(existing.currentStage)) {
-          const updated = updateTaskProgressStage(existing, "plan");
-          await writeTaskProgress(taskFolderUri, updated);
-        }
+        // Use patchTaskProgress to preserve unrelated fields (e.g. implReviewFiles,
+        // scheduled metadata, lint results) while updating the stage.
+        await patchTaskProgress(taskFolderUri!, (existing) => {
+          if (!ELIGIBLE_STAGES.includes(existing.currentStage)) {
+            return existing;
+          }
+          return updateTaskProgressStage(existing, "plan");
+        });
 
         const doc = await vscode.workspace.openTextDocument(planFileUri);
         await vscode.window.showTextDocument(doc);

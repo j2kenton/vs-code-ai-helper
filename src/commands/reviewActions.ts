@@ -16,10 +16,10 @@ import {
 import {
   findAllTasks,
   IncompleteTask,
+  patchTaskProgress,
   readTaskProgress,
   updateImplReviewFiles,
   updateTaskProgressStage,
-  writeTaskProgress,
 } from "../utils/taskProgressUtils";
 import {
   openOrCreateDocument,
@@ -54,10 +54,196 @@ export interface TaskNodeArg {
   task?: IncompleteTask;
 }
 
+/**
+ * Normalized argument shape accepted by review commands.
+ *
+ * Commands may be invoked from:
+ *   - Tree task-row buttons: `{ task: IncompleteTask }`
+ *   - Tree stage-row buttons: `{ task: IncompleteTask }` (same shape)
+ *   - Keyboard shortcut router: `{ taskFolderPath: string }`
+ *   - Command palette (no arg): undefined
+ *
+ * Note: `{ canonicalId }` alone is NOT a supported shape. Callers that
+ * have only a canonical ID must first resolve it to a `taskFolderPath`
+ * (via the task inventory) before invoking a review command. Passing only
+ * `{ canonicalId }` without `taskFolderPath` is a caller error.
+ *
+ * At the type level: `{ canonicalId }` without `taskFolderPath` is not
+ * included in this union, so the TypeScript compiler rejects such calls
+ * at compile time.
+ *
+ * At the runtime level: `isMalformedReviewArg` is called at each command
+ * entry point to catch stale/untyped callers that pass an unsupported shape
+ * (e.g. via `as any` or untyped JS). Such calls show a clear error message
+ * and return early instead of silently falling through to a QuickPick where
+ * the wrong task could be selected.
+ *
+ * This union type lets review command handlers accept all shapes and
+ * normalize them into a single `resolveTask` call.
+ */
+type ReviewCommandArg =
+  | TaskNodeArg
+  | { taskFolderPath: string }
+  | undefined;
+
+/**
+ * Detect whether a value that was passed as `ReviewCommandArg` is an
+ * unrecognized object shape — i.e. neither `undefined`, nor a well-formed
+ * `{ task }` node, nor a `{ taskFolderPath }` path arg.
+ *
+ * "Well-formed `{ task }`" means the `task` key is present AND its value is
+ * a truthy object with a truthy `folderUri` property. Passing `{ task: {} }`
+ * or `{ task: { folderUri: undefined } }` is not a valid `TaskNodeArg`
+ * because `resolveTask` dereferences `task.folderUri` and passes it straight
+ * to `readTaskProgress` → `vscode.Uri.joinPath`, which would throw before
+ * the function's `try/catch`. Requiring `task.folderUri` to be truthy here
+ * catches those stale/untyped callers before they can cause an unhandled
+ * exception.
+ *
+ * Callers that have only a `canonicalId` (e.g. stale code that pre-dates the
+ * `ReviewCommandArg` narrowing) will hit this guard rather than silently
+ * falling through to a QuickPick that could re-target the action against a
+ * different task.
+ *
+ * A key being present but its value being falsy/undefined counts as malformed.
+ * For example `{ canonicalId: "x", taskFolderPath: undefined }` has the
+ * `taskFolderPath` key but the value is undefined, so it is not a valid
+ * `{ taskFolderPath: string }` arg and must be caught here rather than
+ * falling through normalizeReviewArg to a QuickPick.
+ *
+ * PRIMITIVE INPUTS: `"x"`, `42`, `true`, etc. are not valid ReviewCommandArg
+ * values. This function returns `false` for primitives so that the entry
+ * points treat them the same as `undefined` (safe QuickPick fallback) rather
+ * than throwing a TypeError in `normalizeReviewArg` where the `in` operator
+ * would be applied to a non-object. This matches the `typeof arg !== "object"`
+ * early-return below.
+ *
+ * Returns true when `arg` is a non-null object that either:
+ *   (a) carries none of the accepted discriminant keys (`task`, `taskFolderPath`), or
+ *   (b) carries one of those keys but with a falsy or structurally invalid
+ *       value, AND carries at least one other key (indicating a stale caller
+ *       with extra properties trying to look valid).
+ *
+ * More precisely: returns true when the object is non-empty AND does not
+ * satisfy either accepted branch:
+ *   - `{ task }` branch: "task" in arg AND arg.task is truthy AND
+ *     arg.task has a truthy `folderUri` property
+ *   - `{ taskFolderPath }` branch: "taskFolderPath" in arg AND
+ *     arg.taskFolderPath is a non-empty string
+ */
+function isMalformedReviewArg(arg: ReviewCommandArg | Record<string, unknown>): boolean {
+  if (arg === undefined || arg === null) {
+    return false;
+  }
+  // Primitives (string, number, boolean) are not valid ReviewCommandArg values.
+  // Return false so entry points fall through to the safe QuickPick path via
+  // normalizeReviewArg — the `in` operator on a primitive would throw a
+  // TypeError, so we must NOT return true here (which would show an error
+  // message for an arg the user never consciously passed).
+  // The entry points pass the value straight to normalizeReviewArg after this
+  // guard, and normalizeReviewArg's `typeof arg !== "object"` check treats
+  // primitives as "no arg" (safe QuickPick fallback).
+  if (typeof arg !== "object") {
+    return false;
+  }
+  // An empty object is treated as "no arg" by normalizeReviewArg → {} → QuickPick.
+  // That is safe, not malformed.
+  if (Object.keys(arg).length === 0) {
+    return false;
+  }
+  const rec = arg as Record<string, unknown>;
+  // { task } branch is valid only when task is a truthy object with a truthy folderUri.
+  // Requiring folderUri prevents { task: {} } and { task: { folderUri: undefined } }
+  // from slipping through to resolveTask, which would pass undefined to
+  // vscode.Uri.joinPath and throw before the try/catch.
+  if ("task" in rec && rec.task && typeof rec.task === "object") {
+    const taskObj = rec.task as Record<string, unknown>;
+    if (taskObj.folderUri) {
+      return false;
+    }
+  }
+  // { taskFolderPath } branch is valid only when the value is a non-empty string
+  if ("taskFolderPath" in rec && typeof rec.taskFolderPath === "string" && rec.taskFolderPath.length > 0) {
+    return false;
+  }
+  // Non-empty object that satisfies neither accepted branch — unsupported/malformed shape
+  return true;
+}
+
 interface ResolvedTask {
   folderUri: vscode.Uri;
   progress: NonNullable<Awaited<ReturnType<typeof readTaskProgress>>>;
 }
+
+/**
+ * Normalize a ReviewCommandArg into the `TaskNodeArg` shape that the local
+ * `resolveTask` function accepts.
+ *
+ * - `{ task: IncompleteTask }` → passed through unchanged
+ * - `{ taskFolderPath }` → re-wrapped with a synthetic IncompleteTask so
+ *   `resolveTask` re-reads fresh progress from disk (stale data not used)
+ * - `undefined` → `{}` (no-task, triggers the QuickPick fallback)
+ * - primitives (string, number, boolean) → `{}` (treated as no-arg; the
+ *   `in` operator must never be applied to a non-object, so we guard with
+ *   `typeof arg !== "object"` before any property access)
+ *
+ * Callers must supply `taskFolderPath` (not just `canonicalId`) to resolve a
+ * specific task without a picker. The `ReviewCommandArg` type does not include
+ * `{ canonicalId }` alone; passing only a `canonicalId` is rejected at compile
+ * time. At runtime, `isMalformedReviewArg` (called at command entry points)
+ * catches stale callers before `normalizeReviewArg` is reached, so
+ * `normalizeReviewArg` never needs to handle that case.
+ *
+ * @internal exported for testing
+ */
+export function normalizeReviewArg(arg: ReviewCommandArg): TaskNodeArg {
+  // Guard against primitives: the `in` operator throws a TypeError when
+  // applied to a non-object (string, number, boolean). Treat primitives as
+  // "no arg" — the same as undefined — so callers get the safe QuickPick
+  // fallback rather than a crash. isMalformedReviewArg already returns false
+  // for primitives so they reach this function; handle them here explicitly.
+  if (!arg || typeof arg !== "object") {
+    return {};
+  }
+  if ("task" in arg && arg.task) {
+    return arg as TaskNodeArg;
+  }
+  // Caller passed { taskFolderPath }
+  if ("taskFolderPath" in arg && arg.taskFolderPath) {
+    // Construct a minimal IncompleteTask so resolveTask can re-read its progress
+    return {
+      task: {
+        folderUri: vscode.Uri.file(arg.taskFolderPath),
+        folderName: arg.taskFolderPath.split(/[\\/]/).pop() ?? "",
+        progress: {
+          taskFolder: arg.taskFolderPath.split(/[\\/]/).pop() ?? "",
+          currentStage: "task-description" as TaskStage,
+          status: "active",
+          createdAt: "",
+          updatedAt: "",
+        },
+      },
+    };
+  }
+  return {};
+}
+
+/**
+ * The stages eligible for the "Generate Implementation" action.
+ *
+ * Only `"implementation"` is eligible. Tasks at `"plan-low-review"` are NOT
+ * eligible — the user must advance to the implementation stage (which promotes
+ * plan.md → plan-final.md) before generating implementation notes. Including
+ * `"plan-low-review"` would let the command advertise a task as eligible in
+ * the QuickPick but then hard-fail immediately because plan-final.md doesn't
+ * exist yet.
+ *
+ * Exported so that tests can import and assert against this constant directly,
+ * ensuring suite 16 stays coupled to the production value.
+ */
+export const GENERATE_IMPL_ELIGIBLE_STAGES: readonly TaskStage[] = [
+  "implementation",
+];
 
 /**
  * Resolve which task a command should act on: the tree node's task when
@@ -205,6 +391,12 @@ async function hasUncommittedChanges(cwd: string): Promise<boolean> {
  * notification, prompt render, run, run log, result handling. Returns true
  * when the run completed successfully.
  *
+ * `logStage` controls which stage label is used for run logs and progress
+ * messages. `executionStage`, when provided, controls which model is resolved
+ * for the run — this lets plan-review apply log under the review stage while
+ * executing with the `plan` model, and implementation-review apply log under
+ * the review stage while executing with the `implementation` model.
+ *
  * Applies the prompt-size gate (high-context confirm + hard ceiling) before
  * launching the provider process. The prompt is built here so its size is
  * measured on the exact string that will be sent.
@@ -213,7 +405,14 @@ async function runAiToFile(options: {
   extensionUri: vscode.Uri;
   taskFolderUri: vscode.Uri;
   workspaceUri: vscode.Uri;
+  /** Stage used for run-log labels and progress messages. */
   logStage: TaskStage;
+  /**
+   * Stage used for model resolution. When absent, falls back to `logStage`.
+   * Use this to separate "what stage label shows in the log" from "which
+   * model is selected for execution".
+   */
+  executionStage?: TaskStage;
   templateFile: string;
   variables: Record<string, string>;
   outputFileUri: vscode.Uri;
@@ -221,10 +420,8 @@ async function runAiToFile(options: {
   progressAction: string;
   outputLabel: string;
 }): Promise<boolean> {
-  const model = await resolveModelForStage(
-    options.taskFolderUri,
-    options.logStage
-  );
+  const modelStage = options.executionStage ?? options.logStage;
+  const model = await resolveModelForStage(options.taskFolderUri, modelStage);
   const { runner, providerLabel, nativeModelId } = await resolveRunnerForModel(
     model.modelId
   );
@@ -309,17 +506,20 @@ async function runAiToFile(options: {
   return completed;
 }
 
+/**
+ * Safe stage-advance helper that uses `patchTaskProgress` to avoid
+ * overwriting unrelated fields.
+ */
 async function setStage(
   folderUri: vscode.Uri,
   newStage: TaskStage
 ): Promise<void> {
-  const progress = await readTaskProgress(folderUri);
-  if (progress && progress.currentStage !== newStage) {
-    await writeTaskProgress(
-      folderUri,
-      updateTaskProgressStage(progress, newStage)
-    );
-  }
+  await patchTaskProgress(folderUri, (current) => {
+    if (current.currentStage === newStage) {
+      return current;
+    }
+    return updateTaskProgressStage(current, newStage);
+  });
 }
 
 /** Stages from which a review can be run, mapped to the review it produces */
@@ -355,6 +555,25 @@ const REVIEW_PROMPTS: Partial<Record<TaskStage, string>> = {
  *
  * The prompt-size gate IS applied here (via runAiToFile) since this is
  * where the final prompt string is assembled.
+ *
+ * Model resolution: review generation always uses the review-stage model
+ * (logStage == executionStage). Only apply flows override executionStage
+ * to target the execution-stage model instead.
+ *
+ * Variable sourcing for implementation reviews:
+ *   - `{{plan}}` is read from the current plan artifact (plan.md via
+ *     resolveCurrentPlanUri) — this is the plan the implementation was
+ *     supposed to follow.
+ *   - `{{implementation}}` is read from plan-final.md (the canonical
+ *     implementation-stage artifact) — after an implementation run,
+ *     executeImplementationRun writes the run summary back here. The two
+ *     variables therefore always carry distinct content.
+ *
+ *   Legacy tasks that still have only `implementation.md` are handled via
+ *   `materializeCanonicalIfNeeded`: the legacy file is copied to plan-final.md
+ *   before the review starts, so subsequent reads always see the canonical
+ *   path. This mirrors the same migration path used by generateImplementationWithAI
+ *   and runImplementationWithAI.
  */
 export async function runReviewForFolder(
   extensionUri: vscode.Uri,
@@ -384,23 +603,56 @@ export async function runReviewForFolder(
     }
     variables.plan = planContent;
   } else {
-    // Implementation reviews use the canonical plan-final.md artifact
-    const canonicalImpl = getCanonicalImplementationUri(folderUri);
-    const planFinalContent = await readNonEmptyText(canonicalImpl);
-    if (!planFinalContent) {
+    // Implementation reviews need two distinct artifacts:
+    //
+    //   {{plan}} — the plan the implementation was supposed to follow.
+    //     Source: plan.md (resolveCurrentPlanUri), NOT plan-final.md.
+    //     After an implementation run, plan-final.md is overwritten with the
+    //     run summary, so using it for {{plan}} would inject the summary
+    //     into both slots and the reviewer would compare the same text
+    //     against itself.
+    //
+    //   {{implementation}} — the run summary / implementation notes.
+    //     Source: plan-final.md (getCanonicalImplementationUri).
+    //     executeImplementationRun writes the summary here on completion.
+    //
+    //   Legacy tasks (implementation.md present, plan-final.md absent):
+    //     materializeCanonicalIfNeeded copies implementation.md → plan-final.md
+    //     so the canonical path always exists after this point. This mirrors
+    //     the same migration used by generateImplementationWithAI and
+    //     runImplementationWithAI.
+
+    const planUri = await resolveCurrentPlanUri(folderUri);
+    const planContent = await readNonEmptyText(planUri);
+    if (!planContent) {
       void vscode.window.showWarningMessage(
-        "No plan-final.md found. Finalize a plan before reviewing implementation."
+        "No plan found (or it is empty). Generate or write a plan before reviewing implementation."
       );
       return;
     }
-    const implementationContent = await readNonEmptyText(canonicalImpl);
+
+    // Materialize canonical plan-final.md from legacy implementation.md if needed.
+    let canonicalImplUri: vscode.Uri;
+    try {
+      canonicalImplUri = await materializeCanonicalIfNeeded(folderUri);
+    } catch {
+      void vscode.window.showWarningMessage(
+        "No implementation notes found (plan-final.md is missing or empty). " +
+          "Run the implementation step first."
+      );
+      return;
+    }
+
+    const implementationContent = await readNonEmptyText(canonicalImplUri);
     if (!implementationContent) {
       void vscode.window.showWarningMessage(
-        "No implementation artifact found. Generate the implementation first."
+        "No implementation notes found (plan-final.md is missing or empty). " +
+          "Run the implementation step first."
       );
       return;
     }
-    variables.plan = planFinalContent;
+
+    variables.plan = planContent;
     variables.implementation = implementationContent;
   }
 
@@ -430,8 +682,8 @@ export async function runReviewForFolder(
   }
   variables.contextPack = contextPackContent;
 
-  // Review commands do NOT change currentStage — stage changes are
-  // handled by nextStage/setTaskStage exclusively.
+  // Review generation uses the review-stage model (no executionStage override).
+  // Only apply flows separate logStage from executionStage.
   await runAiToFile({
     extensionUri,
     taskFolderUri: folderUri,
@@ -455,13 +707,29 @@ export async function runReviewForFolder(
 export async function runReviewWithAI(
   extensionUri: vscode.Uri,
   context: vscode.ExtensionContext,
-  node?: TaskNodeArg
+  arg?: ReviewCommandArg
 ): Promise<void> {
   // ── Workspace guard ───────────────────────────────────────────────────────
   const workspaceRoot = getWorkspaceRoot();
   if (!workspaceRoot) {
     void vscode.window.showErrorMessage(
       "No workspace folder open. Please open a folder first."
+    );
+    return;
+  }
+
+  // ── Malformed-arg guard ───────────────────────────────────────────────────
+  // Catch stale or untyped callers that pass an unsupported arg shape (e.g.
+  // { canonicalId } without taskFolderPath, or { taskFolderPath: undefined },
+  // or { task: {} } without folderUri, via `as any` or untyped JS).
+  // Primitives ("x", 42, true) are NOT caught as malformed — they fall through
+  // to normalizeReviewArg which treats non-object/falsy values as "no arg"
+  // (safe QuickPick fallback). Only structured objects with wrong shapes are
+  // rejected here to avoid showing an error for args the user never intended.
+  if (isMalformedReviewArg(arg as ReviewCommandArg | Record<string, unknown>)) {
+    void vscode.window.showErrorMessage(
+      "Re-review: unsupported argument shape. " +
+        "Use { taskFolderPath } to target a specific task, or invoke without an argument to pick from a list."
     );
     return;
   }
@@ -473,7 +741,7 @@ export async function runReviewWithAI(
   }
 
   const resolved = await resolveTask(
-    node,
+    normalizeReviewArg(arg),
     Object.keys(REVIEW_TARGETS) as TaskStage[],
     "Re-review with AI"
   );
@@ -495,12 +763,18 @@ export async function runReviewWithAI(
  * implementation against the codebase to address the review's findings.
  * The stage does not change — re-run the review or move to the next stage explicitly.
  *
+ * Model resolution:
+ *   - Plan review apply uses the `plan` model (not the review-stage model).
+ *   - Implementation review apply uses the `implementation` model (not the review-stage model).
+ *   - Review generation (runReviewForFolder) is not affected and continues to
+ *     use the review-stage model.
+ *
  * Requires first-use consent before any AI action runs.
  */
 export async function applyReviewWithAI(
   extensionUri: vscode.Uri,
   context: vscode.ExtensionContext,
-  node?: TaskNodeArg
+  arg?: ReviewCommandArg
 ): Promise<void> {
   // ── Workspace guard ───────────────────────────────────────────────────────
   const workspaceRoot = getWorkspaceRoot();
@@ -511,13 +785,30 @@ export async function applyReviewWithAI(
     return;
   }
 
+  // ── Malformed-arg guard ───────────────────────────────────────────────────
+  // Catch stale or untyped callers that pass an unsupported arg shape (e.g.
+  // { canonicalId } without taskFolderPath, or { taskFolderPath: undefined },
+  // or { task: {} } without folderUri, via `as any` or untyped JS).
+  // Primitives ("x", 42, true) fall through to normalizeReviewArg safely.
+  if (isMalformedReviewArg(arg as ReviewCommandArg | Record<string, unknown>)) {
+    void vscode.window.showErrorMessage(
+      "Apply Review: unsupported argument shape. " +
+        "Use { taskFolderPath } to target a specific task, or invoke without an argument to pick from a list."
+    );
+    return;
+  }
+
   // ── Consent gate ─────────────────────────────────────────────────────────
   const consented = await ensureAiConsent(context);
   if (!consented) {
     return;
   }
 
-  const resolved = await resolveTask(node, REVIEW_STAGES, "Apply Review with AI");
+  const resolved = await resolveTask(
+    normalizeReviewArg(arg),
+    REVIEW_STAGES,
+    "Apply Review with AI"
+  );
   if (!resolved) {
     return;
   }
@@ -570,13 +861,15 @@ export async function applyReviewWithAI(
   const templateFile = "apply-review.md";
   const outputLabel = PLAN_FILENAME;
 
-  // No overwrite confirmation — user triggered this deliberately
-  // (prompt-size gate is inside runAiToFile)
+  // No overwrite confirmation — user triggered this deliberately.
+  // Log under the review stage label but execute with the `plan` model so
+  // the plan-rewrite uses plan-stage model configuration, not the review model.
   const applySucceeded = await runAiToFile({
     extensionUri,
     taskFolderUri: resolved.folderUri,
     workspaceUri: workspaceRoot.uri,
-    logStage: stage,
+    logStage: stage,          // review stage — for run logs and progress labels
+    executionStage: "plan",   // plan model — for actual AI model resolution
     templateFile,
     variables,
     outputFileUri,
@@ -593,6 +886,13 @@ export async function applyReviewWithAI(
 /**
  * Apply an implementation review by re-running the AI implementation
  * runner against the review's findings.
+ *
+ * Uses the `implementation` model for execution, not the review-stage model.
+ *
+ * Legacy tasks (implementation.md present, plan-final.md absent) are handled
+ * via materializeCanonicalIfNeeded, which copies implementation.md →
+ * plan-final.md before reading the canonical content. This mirrors the same
+ * migration path used by generateImplementationWithAI and runImplementationWithAI.
  */
 async function applyImplementationReviewWithAI(
   extensionUri: vscode.Uri,
@@ -601,7 +901,17 @@ async function applyImplementationReviewWithAI(
   stage: TaskStage,
   reviewContent: string
 ): Promise<void> {
-  const canonicalUri = getCanonicalImplementationUri(folderUri);
+  // Materialize canonical plan-final.md from legacy implementation.md if needed.
+  let canonicalUri: vscode.Uri;
+  try {
+    canonicalUri = await materializeCanonicalIfNeeded(folderUri);
+  } catch {
+    void vscode.window.showWarningMessage(
+      "No plan-final.md found. Nothing to apply the review to."
+    );
+    return;
+  }
+
   const planFinalContent = await readNonEmptyText(canonicalUri);
   if (!planFinalContent) {
     void vscode.window.showWarningMessage(
@@ -610,7 +920,7 @@ async function applyImplementationReviewWithAI(
     return;
   }
 
-  // Use the implementation stage's model, not the review stage's
+  // Use the `implementation` stage's model, not the review stage's model.
   const model = await resolveModelForStage(folderUri, "implementation");
 
   const { availability, providerLabel } =
@@ -654,8 +964,22 @@ async function applyImplementationReviewWithAI(
 /**
  * Open the review artifact for the task's current review stage.
  */
-export async function viewReview(node?: TaskNodeArg): Promise<void> {
-  const resolved = await resolveTask(node, REVIEW_STAGES, "View Review");
+export async function viewReview(arg?: ReviewCommandArg): Promise<void> {
+  // ── Malformed-arg guard ───────────────────────────────────────────────────
+  // Primitives ("x", 42, true) fall through to normalizeReviewArg safely.
+  if (isMalformedReviewArg(arg as ReviewCommandArg | Record<string, unknown>)) {
+    void vscode.window.showErrorMessage(
+      "View Review: unsupported argument shape. " +
+        "Use { taskFolderPath } to target a specific task, or invoke without an argument to pick from a list."
+    );
+    return;
+  }
+
+  const resolved = await resolveTask(
+    normalizeReviewArg(arg),
+    REVIEW_STAGES,
+    "View Review"
+  );
   if (!resolved) {
     return;
   }
@@ -674,7 +998,7 @@ export async function viewReview(node?: TaskNodeArg): Promise<void> {
     if (choice === "Re-review with AI") {
       await vscode.commands.executeCommand(
         "vs-code-ai-helper.runReviewWithAI",
-        node
+        arg
       );
     } else if (choice === "Create Manually") {
       await openOrCreateDocument(reviewUri);
@@ -779,7 +1103,8 @@ export async function nextStage(
     }
   }
 
-  // Persist stage advance FIRST so auto-review reads the correct current stage
+  // Persist stage advance using patchTaskProgress to avoid overwriting
+  // unrelated fields (e.g. implReviewFiles, scheduledAt, lint results).
   await setStage(resolved.folderUri, next);
   void vscode.window.showInformationMessage(
     `${resolved.progress.taskFolder} advanced to: ${STAGE_DISPLAY_NAMES[next]}`
@@ -819,8 +1144,28 @@ export async function nextStage(
 }
 
 /**
- * Generate plan-final.md (Implementation stage) from a task.
- * This is the "Generate implementation" action for the merged Implementation stage.
+ * Generate the implementation notes in `plan-final.md` (the canonical
+ * implementation-stage artifact) using AI.
+ *
+ * This is the "Generate Implementation" action for the merged Implementation
+ * stage. It reads the current contents of `plan-final.md` as context (the
+ * promoted plan snapshot written when advancing to the implementation stage,
+ * or materialized from legacy `implementation.md` when upgrading an older
+ * task folder) and overwrites `plan-final.md` with the AI-generated
+ * implementation notes, which are then used as the prompt for the AI
+ * implementation run.
+ *
+ * Eligible stages: only `"implementation"` (see `GENERATE_IMPL_ELIGIBLE_STAGES`).
+ * Tasks at `"plan-low-review"` are NOT eligible — the user must first advance
+ * to the implementation stage (which promotes plan.md → plan-final.md) before
+ * generating implementation notes. Allowing plan-low-review here would let the
+ * command advertise the task as eligible in the QuickPick but then hard-fail
+ * immediately because plan-final.md doesn't exist yet.
+ *
+ * Legacy task folders that still have only `implementation.md` are handled
+ * transparently: `materializeCanonicalIfNeeded` copies `implementation.md`
+ * to `plan-final.md` before the generation starts, matching the same
+ * migration path used by `runImplementationWithAI`.
  *
  * Requires first-use consent before any AI action runs.
  */
@@ -844,16 +1189,35 @@ export async function generateImplementationWithAI(
     return;
   }
 
+  // Only "implementation" stage is eligible (see GENERATE_IMPL_ELIGIBLE_STAGES).
+  // plan-low-review is excluded because plan-final.md (which this command reads)
+  // is only written when the task advances INTO the implementation stage via
+  // nextStage. A plan-low-review task that has not yet been advanced will always
+  // fail the plan-final.md existence check below, so advertising it in the
+  // QuickPick would be misleading.
   const resolved = await resolveTask(
     node,
-    ["plan-low-review", "implementation"],
+    GENERATE_IMPL_ELIGIBLE_STAGES,
     "Generate Implementation with AI"
   );
   if (!resolved) {
     return;
   }
 
-  const planFinalUri = getCanonicalImplementationUri(resolved.folderUri);
+  // Materialize canonical plan-final.md from legacy implementation.md if needed.
+  // This mirrors the same migration path used by runImplementationWithAI so
+  // that both implementation-stage entry points handle legacy task folders
+  // consistently.
+  let planFinalUri: vscode.Uri;
+  try {
+    planFinalUri = await materializeCanonicalIfNeeded(resolved.folderUri);
+  } catch (error) {
+    void vscode.window.showErrorMessage(
+      error instanceof Error ? error.message : String(error)
+    );
+    return;
+  }
+
   const planFinalContent = await readNonEmptyText(planFinalUri);
   if (!planFinalContent) {
     void vscode.window.showWarningMessage(
@@ -867,8 +1231,8 @@ export async function generateImplementationWithAI(
     workspaceRoot.uri
   );
 
+  // Output goes to plan-final.md — the canonical artifact for the implementation stage.
   const implementationUri = planFinalUri;
-  // No overwrite confirmation
   // (prompt-size gate is inside runAiToFile)
   const succeeded = await runAiToFile({
     extensionUri,
@@ -1017,29 +1381,22 @@ async function executeImplementationRun(
       }`;
     await writeTextFile(implementationUri, summary);
 
-    const currentProgress = await readTaskProgress(folderUri);
-    if (currentProgress) {
+    // Use patchTaskProgress to avoid overwriting unrelated fields.
+    await patchTaskProgress(folderUri, (currentProgress) => {
       const alreadyAtOrPastImplementation =
         currentProgress.currentStage === "implementation" ||
         isReviewStage(currentProgress.currentStage);
-      const updatedProgress = alreadyAtOrPastImplementation
+      const stageUpdated = alreadyAtOrPastImplementation
         ? currentProgress
         : updateTaskProgressStage(currentProgress, "implementation");
-      // filesChangedUnknown means THIS run's own change detection failed
-      // (git unavailable/not-a-repo), not that no files changed — it says
-      // nothing about the task's previously accumulated implReviewFiles.
-      // Leave that set untouched rather than clearing it, so a single
-      // transient detection failure can't erase file tracking built up by
-      // earlier successful runs in the same task.
-      if (!result.filesChangedUnknown) {
-        await writeTaskProgress(
-          folderUri,
-          updateImplReviewFiles(updatedProgress, result.filesChanged)
-        );
-      } else if (updatedProgress !== currentProgress) {
-        await writeTaskProgress(folderUri, updatedProgress);
+
+      // filesChangedUnknown means THIS run's own change detection failed.
+      // Leave implReviewFiles untouched rather than clearing it.
+      if (!result!.filesChangedUnknown) {
+        return updateImplReviewFiles(stageUpdated, result!.filesChanged);
       }
-    }
+      return stageUpdated;
+    });
 
     const doc = await vscode.workspace.openTextDocument(implementationUri);
     await vscode.window.showTextDocument(doc);
@@ -1056,6 +1413,9 @@ async function executeImplementationRun(
 
 /**
  * Run the implementation: use AI with tool-calling to make actual code changes.
+ *
+ * Reads from `plan-final.md` (the canonical implementation-stage artifact).
+ * Uses the `implementation` stage model for execution.
  * No overwrite confirmation shown.
  *
  * Requires first-use consent before any AI action runs.
@@ -1108,6 +1468,7 @@ export async function runImplementationWithAI(
     return;
   }
 
+  // Resolve implementation model for execution
   const model = await resolveModelForStage(resolved.folderUri, "implementation");
 
   const { availability, providerLabel } =
@@ -1160,15 +1521,15 @@ export function registerReviewActionCommands(
   context.subscriptions.push(
     vscode.commands.registerCommand(
       "vs-code-ai-helper.runReviewWithAI",
-      (node?: TaskNodeArg) => runReviewWithAI(context.extensionUri, context, node)
+      (arg?: ReviewCommandArg) => runReviewWithAI(context.extensionUri, context, arg)
     ),
     vscode.commands.registerCommand(
       "vs-code-ai-helper.applyReviewWithAI",
-      (node?: TaskNodeArg) => applyReviewWithAI(context.extensionUri, context, node)
+      (arg?: ReviewCommandArg) => applyReviewWithAI(context.extensionUri, context, arg)
     ),
     vscode.commands.registerCommand(
       "vs-code-ai-helper.viewReview",
-      (node?: TaskNodeArg) => viewReview(node)
+      (arg?: ReviewCommandArg) => viewReview(arg)
     ),
     vscode.commands.registerCommand(
       "vs-code-ai-helper.nextStage",

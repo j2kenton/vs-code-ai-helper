@@ -71,7 +71,7 @@
       },
       {
         "command": "vs-code-ai-helper.generateImplementationWithAI",
-        "title": "Generate Implementation Plan",
+        "title": "Generate Implementation",
         "icon": "$(tasklist)"
       },
       {
@@ -161,6 +161,21 @@
         "command": "vs-code-ai-helper.scheduleTaskResume",
         "title": "Schedule Resume",
         "icon": "$(clock)"
+      },
+      {
+        "command": "vs-code-ai-helper.viewTask",
+        "title": "View Task",
+        "icon": "$(file-text)"
+      },
+      {
+        "command": "vs-code-ai-helper.viewPlan",
+        "title": "View Plan",
+        "icon": "$(book)"
+      },
+      {
+        "command": "vs-code-ai-helper.viewReview",
+        "title": "View Review",
+        "icon": "$(eye)"
       }
     ],
     "keybindings": [
@@ -395,7 +410,7 @@
     "check-types": "tsc --noEmit",
     "lint": "eslint src",
     "lint:fix": "eslint src --fix",
-    "test:unit": "tsc --project tsconfig.test.json && node --require ./test-stubs/register.js --test out/test/pathSafety.test.js out/test/implReviewFileSelection.test.js out/test/taskTreeProvider.test.js out/test/contextEligibility.test.js out/test/disclaimerVersion.test.js out/test/taskProgressUtils.test.js",
+    "test:unit": "tsc --project tsconfig.test.json && node --require ./test-stubs/register.js --test out/test/pathSafety.test.js out/test/implReviewFileSelection.test.js out/test/taskTreeProvider.test.js out/test/contextEligibility.test.js out/test/disclaimerVersion.test.js out/test/taskProgressUtils.test.js out/test/draftTaskWithAI.test.js out/test/reviewActionArgs.test.js out/test/commandArgNormalization.test.js",
     "test": "vscode-test",
     "vsix": "vsce package",
     "publish": "vsce publish",

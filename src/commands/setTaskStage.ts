@@ -7,9 +7,8 @@ import {
 } from "../types/taskProgress";
 import {
   IncompleteTask,
+  patchTaskProgress,
   updateTaskProgressStage,
-  writeTaskProgress,
-  readTaskProgress,
 } from "../utils/taskProgressUtils";
 import { TaskInventory } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
@@ -211,17 +210,19 @@ export async function setTaskStage(
     isReviewStage(newStage) &&
     AUTO_REVIEW_TRANSITIONS[sourceStage] === newStage;
 
-  // Persist the destination stage FIRST so subsequent readers see it
+  // Persist the destination stage using patchTaskProgress so unrelated fields
+  // (e.g. implReviewFiles, scheduledAt, lint results) are preserved.
   const taskFolderUri = vscode.Uri.file(task.taskFolderPath);
-  const existing = await readTaskProgress(taskFolderUri);
-  if (!existing) {
+  const capturedNewStage = newStage;
+  const patched = await patchTaskProgress(taskFolderUri, (current) =>
+    updateTaskProgressStage(current, capturedNewStage)
+  );
+  if (!patched) {
     void vscode.window.showErrorMessage(
       `Could not read task progress for ${task.folderName}.`
     );
     return;
   }
-  const updated = updateTaskProgressStage(existing, newStage);
-  await writeTaskProgress(taskFolderUri, updated);
 
   // Refresh the inventory so the new stage is visible immediately
   await inventory.refresh();
@@ -231,11 +232,13 @@ export async function setTaskStage(
   );
 
   // Auto-trigger review after stage is persisted, if eligible.
-  // Pass the canonical ID (not a synthetic partial task object) so the review
-  // command resolves the task correctly through the shared inventory resolver.
+  // Use taskFolderPath so normalizeReviewArg in reviewActions can construct a
+  // synthetic IncompleteTask for resolveTask to re-read fresh progress from
+  // disk. Passing only canonicalId would fall through to the QuickPick
+  // because normalizeReviewArg cannot construct a folderUri from a canonicalId.
   if (shouldAutoReview) {
     await vscode.commands.executeCommand("vs-code-ai-helper.runReviewWithAI", {
-      canonicalId: task.canonicalId,
+      taskFolderPath: task.taskFolderPath,
     });
   }
 }

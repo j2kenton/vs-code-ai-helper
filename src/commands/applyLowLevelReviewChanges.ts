@@ -41,9 +41,10 @@ export async function applyLowLevelReviewChanges(
     return;
   }
 
-  // Delegate to the existing unified review apply command
+  // Delegate to the unified review apply command using taskFolderPath so the
+  // normalizeReviewArg helper in reviewActions can resolve the task correctly.
   await vscode.commands.executeCommand("vs-code-ai-helper.applyReviewWithAI", {
-    canonicalId: resolvedTask.canonicalId,
+    taskFolderPath: resolvedTask.taskFolderPath,
   });
 }
 

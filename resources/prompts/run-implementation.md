@@ -14,7 +14,7 @@ Work through the final plan step by step:
 3. Use `delete_file` to remove obsolete files. To rename or move a file, `write_file` the new path with the old file's content, then `delete_file` the old path
 4. Implement every item in the plan; do not skip steps
 
-When you have finished all changes, output a Markdown document that will serve as `implementation.md`:
+When you have finished all changes, output a Markdown document that will serve as `plan-final.md`:
 
 - A one-or-two sentence statement of what was implemented
 - A `## Files Changed` section listing each file created or modified with one line describing the change

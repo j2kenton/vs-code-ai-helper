@@ -12,6 +12,9 @@ import { checkAndConfirmPromptSize } from "../utils/promptSizeGuard";
 const INTRO_TEXT = `Briefly describe what changes you want to be made, and then use AI to help you clarify the plan.`;
 const SHORTCUT_NOTE = `Shortcut: Apply Current Stage Action (Windows/Linux: Ctrl+Shift+Alt+I, macOS: Cmd+Shift+Alt+I).`;
 
+/** Filename for the temporary AI output file used during draft-task runs. */
+const DRAFT_TMP_FILENAME = "_draft-ai-output.tmp";
+
 interface ParsedTaskDocument {
   introText: string;
   taskDescription: string;
@@ -146,37 +149,103 @@ export function buildTaskDocument(parsed: ParsedTaskDocument): string {
 }
 
 /**
+ * Normalize a heading line for robust matching:
+ * - Strip leading `#` characters and whitespace (tolerate heading levels 1-6)
+ * - Trim trailing whitespace
+ * - Lowercase for case-insensitive comparison
+ */
+function normalizeHeading(line: string): string {
+  return line.replace(/^#+\s*/, "").trim().toLowerCase();
+}
+
+/**
  * Parse the AI response for Draft with AI.
- * Expects exactly one `## Draft with AI` section and one `## Open Questions` section.
- * Returns undefined if malformed.
+ *
+ * Expects exactly one section matching "Draft with AI" and one matching
+ * "Open Questions", identified by heading text (case-insensitive, any
+ * heading level `#`–`######`, leading/trailing whitespace trimmed).
+ * CRLF line endings are normalized to LF before parsing.
+ *
+ * Fails (returns undefined) if:
+ *   - Either required section is missing
+ *   - Either required section appears more than once
+ *   - "Draft with AI" appears after "Open Questions"
+ *   - Any unrecognized top-level heading is present
+ *
+ * Tolerates:
+ *   - Heading level differences (# vs ##)
+ *   - Heading case differences (DRAFT WITH AI vs Draft with AI)
+ *   - Trailing heading whitespace
+ *   - Extra blank lines between sections
+ *   - CRLF vs LF line endings
  */
 export function parseAIResponse(
   response: string
 ): { draftWithAI: string; openQuestions: string } | undefined {
-  // Find the two required headers
-  const draftIdx = response.indexOf("## Draft with AI");
-  const questionsIdx = response.indexOf("## Open Questions");
+  // Normalize CRLF -> LF
+  const normalized = response.replace(/\r\n/g, "\n");
 
-  if (draftIdx === -1 || questionsIdx === -1) {
-    return undefined;
-  }
-  if (draftIdx > questionsIdx) {
-    return undefined;
-  }
+  // Split into lines and find heading positions
+  const lines = normalized.split("\n");
 
-  // Check for duplicates
-  const secondDraft = response.indexOf("## Draft with AI", draftIdx + 1);
-  const secondQuestions = response.indexOf("## Open Questions", questionsIdx + 1);
-  if (secondDraft !== -1 || secondQuestions !== -1) {
-    return undefined;
+  interface HeadingOccurrence {
+    lineIndex: number;
+    normalizedTitle: string;
   }
 
-  const draftBody = response
-    .slice(draftIdx + "## Draft with AI".length, questionsIdx)
-    .trim();
-  const questionsBody = response
-    .slice(questionsIdx + "## Open Questions".length)
-    .trim();
+  const headings: HeadingOccurrence[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
+    if (/^#+\s/.test(line) || /^#+$/.test(line)) {
+      headings.push({ lineIndex: i, normalizedTitle: normalizeHeading(line) });
+    }
+  }
+
+  // Find occurrences of each required section by normalized title
+  const draftOccurrences = headings.filter(
+    (h) => h.normalizedTitle === "draft with ai"
+  );
+  const questionsOccurrences = headings.filter(
+    (h) => h.normalizedTitle === "open questions"
+  );
+  const otherOccurrences = headings.filter(
+    (h) =>
+      h.normalizedTitle !== "draft with ai" &&
+      h.normalizedTitle !== "open questions"
+  );
+
+  // Missing sections
+  if (draftOccurrences.length === 0 || questionsOccurrences.length === 0) {
+    return undefined;
+  }
+
+  // Duplicate sections
+  if (draftOccurrences.length > 1 || questionsOccurrences.length > 1) {
+    return undefined;
+  }
+
+  // Unrecognized sections
+  if (otherOccurrences.length > 0) {
+    return undefined;
+  }
+
+  const draftHeading = draftOccurrences[0]!;
+  const questionsHeading = questionsOccurrences[0]!;
+
+  // Wrong order
+  if (draftHeading.lineIndex > questionsHeading.lineIndex) {
+    return undefined;
+  }
+
+  // Extract body content between headings
+  const draftBodyLines = lines.slice(
+    draftHeading.lineIndex + 1,
+    questionsHeading.lineIndex
+  );
+  const questionsBodyLines = lines.slice(questionsHeading.lineIndex + 1);
+
+  const draftBody = draftBodyLines.join("\n").trim();
+  const questionsBody = questionsBodyLines.join("\n").trim();
 
   return {
     draftWithAI: draftBody,
@@ -194,11 +263,52 @@ function detectEOL(content: string): string {
   return "\n";
 }
 
+/**
+ * Attempt to delete the draft temp file, silently ignoring any error.
+ * This is safe to call even if the file doesn't exist.
+ */
+async function deleteDraftTmpFile(taskFolderUri: vscode.Uri): Promise<void> {
+  try {
+    const tmpUri = vscode.Uri.joinPath(taskFolderUri, DRAFT_TMP_FILENAME);
+    await vscode.workspace.fs.delete(tmpUri);
+  } catch {
+    // Ignore: file may not exist (runner didn't create it, or already cleaned up)
+  }
+}
+
+/**
+ * Read the draft temp file if it exists and is non-empty.
+ * Returns the file content as a string, or undefined if unavailable.
+ */
+async function readDraftTmpFile(
+  taskFolderUri: vscode.Uri
+): Promise<string | undefined> {
+  try {
+    const tmpUri = vscode.Uri.joinPath(taskFolderUri, DRAFT_TMP_FILENAME);
+    const bytes = await vscode.workspace.fs.readFile(tmpUri);
+    const text = new TextDecoder().decode(bytes).trim();
+    return text.length > 0 ? text : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 /**
  * Draft the task description with AI. Reads from the live open document
  * buffer if task.md is open (to capture unsaved edits), writes back only
  * to `## Draft with AI` and `## Open Questions`.
+ *
+ * Parse source preference:
+ *   1. `_draft-ai-output.tmp` when it exists and is non-empty (real model output)
+ *   2. `result.summary` from the runner (fallback when temp file unavailable)
+ *
+ * The temp file is removed on every terminal path:
+ *   - success
+ *   - malformed output
+ *   - runner failure
+ *   - cancellation
+ *   - thrown exception
+ *   - stale pre-existing temp file before a failed run
  *
  * Requires first-use consent (ensureAiConsent) before any provider is
  * launched or any file is written.
@@ -243,6 +353,10 @@ export async function draftTaskWithAI(
 
   const taskFolderUri = vscode.Uri.file(resolvedTask.taskFolderPath);
   const taskFileUri = vscode.Uri.joinPath(taskFolderUri, TASK_FILENAME);
+  const tmpUri = vscode.Uri.joinPath(taskFolderUri, DRAFT_TMP_FILENAME);
+
+  // ── Pre-run cleanup: remove any stale temp file from a prior failed run ──
+  await deleteDraftTmpFile(taskFolderUri);
 
   // Prefer live document buffer over stale disk content
   const openDoc = vscode.workspace.textDocuments.find(
@@ -297,60 +411,62 @@ export async function draftTaskWithAI(
 
   let aiOutput: { draftWithAI: string; openQuestions: string } | undefined;
 
-  await vscode.window.withProgress(
-    {
-      location: vscode.ProgressLocation.Notification,
-      title: `Drafting task with ${providerLabel} (uses your ${providerLabel} quota)...`,
-      cancellable: true,
-    },
-    async (progress, token) => {
-      progress.report({ message: `Waiting for ${providerLabel} response...` });
+  try {
+    await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: `Drafting task with ${providerLabel} (uses your ${providerLabel} quota)...`,
+        cancellable: true,
+      },
+      async (progress, token) => {
+        progress.report({ message: `Waiting for ${providerLabel} response...` });
 
-      const result = await runner.run(
-        {
-          taskFolderUri: taskFolderUri,
-          workspaceUri: workspaceFolder.uri,
-          stage: "task-description",
-          prompt,
-          outputFile: vscode.Uri.joinPath(taskFolderUri, "_draft-ai-output.tmp"),
-          modelId: nativeModelId,
-        },
-        token
-      );
+        const result = await runner.run(
+          {
+            taskFolderUri: taskFolderUri,
+            workspaceUri: workspaceFolder.uri,
+            stage: "task-description",
+            prompt,
+            outputFile: tmpUri,
+            modelId: nativeModelId,
+          },
+          token
+        );
 
-      await writeRunLog(
-        taskFolderUri,
-        runner.id,
-        "task-description",
-        `# Prompt\n\n${prompt}\n\n# Result\n\nStatus: ${result.status}\n\n${
-          result.summary ?? result.errorMessage ?? ""
-        }`
-      );
+        await writeRunLog(
+          taskFolderUri,
+          runner.id,
+          "task-description",
+          `# Prompt\n\n${prompt}\n\n# Result\n\nStatus: ${result.status}\n\n${
+            result.summary ?? result.errorMessage ?? ""
+          }`
+        );
 
-      if (result.status === "completed") {
-        const outputText = result.summary ?? "";
-        aiOutput = parseAIResponse(outputText);
-        if (!aiOutput) {
+        if (result.status === "completed") {
+          // Prefer the real temp output file over the runner summary.
+          const tmpContent = await readDraftTmpFile(taskFolderUri);
+          const outputText = tmpContent ?? result.summary ?? "";
+          const parsed = parseAIResponse(outputText);
+          if (parsed) {
+            aiOutput = parsed;
+          } else {
+            void vscode.window.showErrorMessage(
+              "AI returned a malformed response (missing, duplicate, or unrecognized sections). task.md was not changed."
+            );
+          }
+        } else if (result.status === "cancelled") {
+          void vscode.window.showInformationMessage("Draft with AI cancelled.");
+        } else {
           void vscode.window.showErrorMessage(
-            "AI returned a malformed response (missing or duplicate sections). task.md was not changed."
+            `Draft with AI failed: ${result.errorMessage ?? "unknown error"}`
           );
         }
-      } else if (result.status === "cancelled") {
-        void vscode.window.showInformationMessage("Draft with AI cancelled.");
-      } else {
-        void vscode.window.showErrorMessage(
-          `Draft with AI failed: ${result.errorMessage ?? "unknown error"}`
-        );
       }
-    }
-  );
-
-  // Clean up temp file if created
-  try {
-    const tmpUri = vscode.Uri.joinPath(taskFolderUri, "_draft-ai-output.tmp");
-    await vscode.workspace.fs.delete(tmpUri);
-  } catch {
-    // ignore
+    );
+  } finally {
+    // ── Cleanup on all terminal paths ──────────────────────────────────────
+    // success, malformed, runner failure, cancellation, exception
+    await deleteDraftTmpFile(taskFolderUri);
   }
 
   if (!aiOutput) {

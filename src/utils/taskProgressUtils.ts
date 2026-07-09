@@ -57,7 +57,9 @@ export async function readTaskProgress(
 }
 
 /**
- * Write the task progress to a task folder
+ * Write the task progress to a task folder.
+ * Writes the full progress object. Prefer `patchTaskProgress` when only
+ * updating specific fields to avoid accidentally discarding unrelated ones.
  * @param taskFolderUri - URI of the task folder
  * @param progress - The task progress to write
  */
@@ -75,6 +77,60 @@ export async function writeTaskProgress(
     progressFileUri,
     new TextEncoder().encode(content)
   );
+}
+
+/**
+ * Safe partial-update helper for `task-progress.json`.
+ *
+ * Reads the full current progress, applies the provided update (either a
+ * partial object merged with spread, or an update callback), preserves all
+ * unrelated fields, runs the same normalization/sanitization used for reads,
+ * and writes the merged result back.
+ *
+ * Use this instead of `writeTaskProgress` when you only want to change
+ * specific fields (e.g. stage, status, implReviewFiles) without risk of
+ * overwriting other fields that another code path may have written concurrently.
+ *
+ * If the progress file doesn't exist or is unreadable, the update is NOT
+ * applied and the function returns undefined. Callers that must ensure the
+ * progress file exists should call `writeTaskProgress` first.
+ *
+ * @param taskFolderUri - URI of the task folder
+ * @param update - Partial fields to merge in, or a callback `(current) => patched`
+ * @returns The persisted TaskProgress if successful, or undefined if the
+ *          progress file could not be read.
+ */
+export async function patchTaskProgress(
+  taskFolderUri: vscode.Uri,
+  update: Partial<TaskProgress> | ((current: TaskProgress) => TaskProgress)
+): Promise<TaskProgress | undefined> {
+  const current = await readTaskProgress(taskFolderUri);
+  if (!current) {
+    return undefined;
+  }
+
+  let patched: TaskProgress;
+  if (typeof update === "function") {
+    patched = update(current);
+  } else {
+    patched = { ...current, ...update };
+  }
+
+  // Re-apply normalization/sanitization so writes always produce clean data.
+  patched.currentStage = migrateStage(String(patched.currentStage));
+  patched.status = migrateStatus(patched.status);
+  if (patched.implReviewFiles !== undefined) {
+    if (!Array.isArray(patched.implReviewFiles)) {
+      patched.implReviewFiles = undefined;
+    } else {
+      patched.implReviewFiles = (patched.implReviewFiles as unknown[]).filter(
+        (e): e is string => typeof e === "string"
+      );
+    }
+  }
+
+  await writeTaskProgress(taskFolderUri, patched);
+  return patched;
 }
 
 /**
