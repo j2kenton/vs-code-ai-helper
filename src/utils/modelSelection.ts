@@ -171,7 +171,7 @@ function queueCliModelRefresh(
     return cached.inFlight;
   }
 
-  const refresh = (async () => {
+  const refresh = (async (): Promise<readonly DiscoveredCliModel[]> => {
     const resolvedCommand = await resolveCliCommand(
       def.command,
       def.commandAliases

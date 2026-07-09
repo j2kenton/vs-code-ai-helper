@@ -80,7 +80,7 @@ export function parseAgyModelsOutput(output: string): DiscoveredCliModel[] {
       /^available models:?$/i.test(line) ||
       /^models:?$/i.test(line) ||
       /^model(\s+name)?$/i.test(line) ||
-      /^[\-=]{3,}$/.test(line)
+      /^[-=]{3,}$/.test(line)
     ) {
       continue;
     }
