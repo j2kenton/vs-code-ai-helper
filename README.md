@@ -1,6 +1,6 @@
 # Ensemble
 
-Ensemble turns ad-hoc "let's plan this out" conversations into a repeatable, file-based workflow. Every task gets its own dated folder and moves through a fixed pipeline — task description, plan, high- and low-level plan reviews, final plan, implementation checklist, and high- and low-level implementation reviews — with every artifact written by hand or generated with an AI subscription you already have — GitHub Copilot, Claude (Anthropic), ChatGPT/Codex (OpenAI), or Gemini (Google) — no API key required.
+Ensemble turns ad-hoc "let's plan this out" conversations into a repeatable, file-based workflow. Every task gets its own dated folder and moves through a fixed pipeline — task description, plan, high- and low-level plan reviews, final plan, implementation checklist, and high- and low-level implementation reviews — with every artifact written by hand or generated with an AI subscription you already have — GitHub Copilot, Claude (Anthropic), ChatGPT/Codex (OpenAI), Gemini/Antigravity (Google), or Kiro (AWS).
 
 The pipeline:
 
@@ -104,13 +104,15 @@ Install from the Visual Studio Marketplace:
 - A workspace folder open (the extension stores everything relative to your workspace)
 - Optional, for the "with AI" commands — at least one of:
   - an active GitHub Copilot subscription, signed in to VS Code (works out of the box, no CLI needed), or
-  - a vendor CLI signed in to your existing subscription: **Claude Code** (`npm i -g @anthropic-ai/claude-code`, Anthropic Pro/Max), **Codex** (`npm i -g @openai/codex`, ChatGPT Plus/Pro), or **Gemini CLI** (`npm i -g @google/gemini-cli`, Google account / Code Assist). Each needs a one-time browser sign-in from its CLI — never an API key.
+  - a vendor CLI signed in to your existing subscription: **Claude Code** (`npm i -g @anthropic-ai/claude-code`, Anthropic Pro/Max), **Codex** (`npm i -g @openai/codex`, ChatGPT Plus/Pro), **Gemini CLI** (`npm i -g @google/gemini-cli`, Google account / Code Assist), **Antigravity CLI** (`antigravity`, Google account), or **Kiro CLI** (`kiro-cli`, AWS Kiro).
+
+For Kiro specifically, Ensemble uses `kiro-cli chat --no-interactive`, which requires `KIRO_API_KEY` in the environment. `kiro-cli login` alone is not sufficient for headless runs.
 
 ## AI Providers
 
-The per-step model picker (`Ensemble: Configure AI Models per Step`) lists every model it can find: GitHub Copilot models via VS Code's Language Model API, plus the models of each vendor CLI that is installed. Selections are stored as plain IDs — bare IDs are Copilot models; prefixed IDs run through a CLI (e.g. `claude-cli:sonnet`, `codex-cli:default`, `gemini-cli:gemini-2.5-pro`). You can mix providers per step — e.g. plan with Claude Opus, review with Gemini, implement with Copilot.
+The per-step model picker (`Ensemble: Configure AI Models per Step`) lists every model it can find: GitHub Copilot models via VS Code's Language Model API, plus the models of each vendor CLI that is installed. Selections are stored as plain IDs — bare IDs are Copilot models; prefixed IDs run through a CLI (e.g. `claude-cli:sonnet`, `codex-cli:default`, `gemini-cli:gemini-2.5-pro`, `antigravity-cli:default`, `kiro-cli:default`). You can mix providers per step — e.g. plan with Claude Opus, review with Gemini, implement with Copilot.
 
-For plan and review steps, CLIs run read-only and their answer is written to the task artifact. For implementation steps they run agentically with file-edit permissions in your workspace (Claude uses `acceptEdits`, Codex a workspace-write sandbox, Gemini `auto_edit`); the files they change are detected via git status and used as the implementation-review scope, exactly like Copilot runs.
+For plan and review steps, CLIs run read-only and their answer is written to the task artifact. For implementation steps they run agentically with file-edit permissions in your workspace (Claude uses `acceptEdits`, Codex a workspace-write sandbox, Gemini/Antigravity `auto_edit`, Kiro trusted tools in non-interactive chat mode with `KIRO_API_KEY`); the files they change are detected via git status and used as the implementation-review scope, exactly like Copilot runs.
 
 ## Quick Start
 
@@ -241,7 +243,7 @@ vs-code-ai-helper/
 │   ├── extension.ts             # Extension entry point / command registration
 │   ├── legal/                   # Disclaimer version constant
 │   ├── commands/                # One file per command (startNewTask, resumeTask, generatePlanWithAI, ...)
-│   ├── runners/                 # AI provider adapters (Copilot LM API + Claude/Codex/Gemini subscription CLIs)
+│   ├── runners/                 # AI provider adapters (Copilot LM API + Claude/Codex/Gemini/Antigravity/Kiro subscription CLIs)
 │   ├── config/                  # Workspace settings helpers
 │   ├── types/                   # Shared types (TaskProgress, AgentRunner, ...)
 │   └── utils/                   # Task-progress, context-pack, consent, and run-log helpers

@@ -1,18 +1,26 @@
 /**
  * AI provider definitions. Besides GitHub Copilot (VS Code Language Model
  * API), the extension can drive vendor CLIs that authenticate against the
- * user's existing subscription via their own one-time login — no API keys:
+ * user's existing subscription via their own login flow. Most providers
+ * support OAuth/CLI login only; Kiro headless mode requires KIRO_API_KEY:
  *
  *  - Claude Code  (`claude`) — Anthropic Claude Pro/Max subscription
  *  - Codex CLI    (`codex`)  — OpenAI ChatGPT Plus/Pro subscription
  *  - Gemini CLI   (`gemini`) — Google account / Gemini Code Assist
+ *  - Antigravity  (`antigravity`) — Google Gemini/Antigravity CLI account
+ *  - Kiro CLI     (`kiro-cli`) — AWS Kiro subscription/login
  *
  * Model IDs are stored as "<provider>:<model>" (e.g. "claude-cli:sonnet",
  * "gemini-cli:default"). Bare IDs with no known provider prefix are Copilot
  * model IDs, which keeps existing saved configurations working unchanged.
  */
 
-export type CliProviderId = "claude-cli" | "codex-cli" | "gemini-cli";
+export type CliProviderId =
+  | "claude-cli"
+  | "codex-cli"
+  | "gemini-cli"
+  | "antigravity-cli"
+  | "kiro-cli";
 export type ProviderId = "copilot" | CliProviderId;
 
 /** How a CLI run may touch the workspace. */
@@ -37,10 +45,21 @@ export interface CliProviderDefinition {
   loginHint: string;
   /** Substrings in CLI output that indicate an auth problem. */
   authErrorMarkers: readonly string[];
+  /** How the prompt is passed to the CLI. Defaults to stdin. */
+  promptTransport?: "stdin" | "argv";
+  /**
+   * Whether this provider should run with shell:true.
+   * Defaults to true so npm/pnpm global .cmd shims resolve on Windows.
+   */
+  useShell?: boolean;
+  /**
+   * Maximum UTF-8 bytes allowed for argv-based prompt transport.
+   * Ignored for stdin transport.
+   */
+  maxArgvPromptBytes?: number;
   models: readonly CliModelChoice[];
   /**
-   * Build the CLI arguments. The prompt is always piped via stdin so no
-   * shell quoting of user content is ever needed. "text" mode must keep the
+   * Build the CLI arguments. "text" mode must keep the
    * CLI read-only; "edit" mode may let it modify files in the working
    * directory (but not run arbitrary commands unapproved).
    *
@@ -143,6 +162,65 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
       }
       if (model) {
         args.push("--model", model);
+      }
+      return args;
+    },
+  },
+  {
+    id: "antigravity-cli",
+    label: "Antigravity CLI",
+    command: "antigravity",
+    installHint:
+      "Install the Antigravity CLI, then run `antigravity` once to sign in with your Google account.",
+    loginHint:
+      "Run `antigravity` in a terminal and complete the Google sign-in, then try again.",
+    authErrorMarkers: ["login", "authenticate", "credentials", "api key"],
+    models: [
+      { model: undefined, name: "Antigravity (CLI default)" },
+      { model: "gemini-2.5-pro", name: "Gemini 2.5 Pro" },
+      { model: "gemini-2.5-flash", name: "Gemini 2.5 Flash" },
+    ],
+    usesLastMessageFile: false,
+    buildArgs(mode, model): string[] {
+      const args: string[] = [];
+      if (mode === "edit") {
+        args.push("--approval-mode", "auto_edit");
+      }
+      if (model) {
+        args.push("--model", model);
+      }
+      return args;
+    },
+  },
+  {
+    id: "kiro-cli",
+    label: "Kiro CLI",
+    command: "kiro-cli",
+    installHint:
+      "Install Kiro CLI from https://kiro.dev/cli/ (or the Kiro installer), then set KIRO_API_KEY for headless mode. `kiro-cli login` alone is not enough for `chat --no-interactive`.",
+    loginHint:
+      "Set KIRO_API_KEY (required by Kiro headless mode), then try again. `kiro-cli login` does not satisfy `chat --no-interactive` auth.",
+    authErrorMarkers: [
+      "not logged in",
+      "login",
+      "authenticate",
+      "api key",
+      "unauthorized",
+    ],
+    promptTransport: "argv",
+    useShell: false,
+    // Keep argv payload comfortably below Windows command-line limits.
+    maxArgvPromptBytes: 24_000,
+    // Kiro model selection is managed by the CLI session/settings.
+    // Keep picker options to CLI default to avoid stale hard-coded names.
+    models: [{ model: undefined, name: "Kiro (CLI default)" }],
+    usesLastMessageFile: false,
+    buildArgs(mode): string[] {
+      const args = ["chat", "--no-interactive"];
+      if (mode === "edit") {
+        args.push("--trust-all-tools");
+      } else {
+        args.push("--trust-tools", "read,grep");
       }
       return args;
     },

@@ -1,7 +1,7 @@
 {
   "name": "vs-code-ai-helper",
   "displayName": "Ensemble",
-  "description": "AI-assisted task planning and implementation workflow for VS Code. Uses your existing AI subscriptions (Copilot, Claude, Codex, Gemini) — real usage costs apply. AI runs can modify workspace files. Provided as-is with no warranty. See README and DISCLAIMER.md.",
+  "description": "AI-assisted task planning and implementation workflow for VS Code. Uses your existing AI subscriptions (Copilot, Claude, Codex, Gemini, Antigravity, Kiro) — real usage costs apply. AI runs can modify workspace files. Provided as-is with no warranty. See README and DISCLAIMER.md.",
   "version": "0.14.0",
   "publisher": "j2kenton",
   "license": "MIT",
@@ -386,7 +386,7 @@
           "type": "object",
           "default": {},
           "scope": "resource",
-          "markdownDescription": "Workspace defaults for AI model IDs by workflow stage. Bare IDs are GitHub Copilot models; prefixed IDs (e.g. `claude-cli:sonnet`, `codex-cli:default`, `gemini-cli:gemini-2.5-pro`) run through the vendor's subscription CLI. Configure via **Ensemble: Configure AI Models per Step**.",
+          "markdownDescription": "Workspace defaults for AI model IDs by workflow stage. Bare IDs are GitHub Copilot models; prefixed IDs (e.g. `claude-cli:sonnet`, `codex-cli:default`, `gemini-cli:gemini-2.5-pro`, `antigravity-cli:default`, `kiro-cli:default`) run through the vendor's subscription CLI. Configure via **Ensemble: Configure AI Models per Step**.",
           "additionalProperties": {
             "type": "string"
           }
@@ -410,7 +410,7 @@
     "check-types": "tsc --noEmit",
     "lint": "eslint src",
     "lint:fix": "eslint src --fix",
-    "test:unit": "tsc --project tsconfig.test.json && node --require ./test-stubs/register.js --test out/test/pathSafety.test.js out/test/implReviewFileSelection.test.js out/test/taskTreeProvider.test.js out/test/contextEligibility.test.js out/test/disclaimerVersion.test.js out/test/taskProgressUtils.test.js out/test/draftTaskWithAI.test.js out/test/reviewActionArgs.test.js out/test/commandArgNormalization.test.js",
+    "test:unit": "tsc --project tsconfig.test.json && node --require ./test-stubs/register.js --test out/test/pathSafety.test.js out/test/implReviewFileSelection.test.js out/test/taskTreeProvider.test.js out/test/contextEligibility.test.js out/test/disclaimerVersion.test.js out/test/taskProgressUtils.test.js out/test/draftTaskWithAI.test.js out/test/reviewActionArgs.test.js out/test/commandArgNormalization.test.js out/test/providerCliContracts.test.js out/test/cliAgentRunnerArgvLimit.test.js",
     "test": "vscode-test",
     "vsix": "vsce package",
     "publish": "vsce publish",

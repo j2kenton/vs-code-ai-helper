@@ -134,7 +134,34 @@ export async function execCliAgent(options: {
     );
   }
 
+  const promptTransport = def.promptTransport ?? "stdin";
+  const useShell = def.useShell ?? true;
   const args = def.buildArgs(mode, model, lastMessageFile);
+
+  if (promptTransport === "argv") {
+    if (useShell) {
+      return {
+        status: "failed",
+        output: "",
+        errorMessage: `${def.label} provider misconfiguration: argv prompt transport requires shell:false for safe argument passing.`,
+      };
+    }
+    const promptBytes = Buffer.byteLength(prompt, "utf8");
+    const maxArgvPromptBytes = def.maxArgvPromptBytes;
+    if (
+      typeof maxArgvPromptBytes === "number" &&
+      promptBytes > maxArgvPromptBytes
+    ) {
+      return {
+        status: "failed",
+        output: "",
+        errorMessage:
+          `${def.label} prompt is too large for this CLI mode (${promptBytes} bytes; max ${maxArgvPromptBytes} bytes). ` +
+          "Reduce context or choose a provider that accepts stdin prompts.",
+      };
+    }
+    args.push(prompt);
+  }
 
   return new Promise<CliExecResult>((resolve) => {
     let settled = false;
@@ -142,16 +169,16 @@ export async function execCliAgent(options: {
     let stdout = "";
     let stderr = "";
 
-    // shell:true so Windows resolves .cmd/.ps1 shims from npm/pnpm global
-    // installs. Args are fixed flag tokens (no user content — the prompt
-    // travels via stdin), except the temp file path, which is quoted.
-    const quotedArgs =
-      process.platform === "win32"
+    // shell:true is the default so Windows resolves .cmd/.ps1 shims from
+    // npm/pnpm global installs. When shell:true on Windows, quote arguments
+    // containing spaces.
+    const spawnArgs =
+      useShell && process.platform === "win32"
         ? args.map((a) => (a.includes(" ") ? `"${a}"` : a))
         : args;
-    const child = cp.spawn(def.command, quotedArgs, {
+    const child = cp.spawn(def.command, spawnArgs, {
       cwd,
-      shell: true,
+      shell: useShell,
       windowsHide: true,
       env: process.env,
       // POSIX only: makes the shell (and everything it execs/forks) its
@@ -259,19 +286,22 @@ export async function execCliAgent(options: {
       finish({ status: "completed", output });
     });
 
-    child.stdin?.on("error", () => {
-      // Ignore EPIPE when the process exits before consuming the prompt;
-      // the close handler reports the real failure.
-    });
-    child.stdin?.write(prompt);
+    if (promptTransport === "stdin") {
+      child.stdin?.on("error", () => {
+        // Ignore EPIPE when the process exits before consuming the prompt;
+        // the close handler reports the real failure.
+      });
+      child.stdin?.write(prompt);
+    }
     child.stdin?.end();
   });
 }
 
 /**
- * Text-producing runner (plans, reviews) backed by a vendor CLI that uses
- * the user's existing subscription login — no API key. The prompt is piped
- * to the CLI and its answer is written to the requested output file.
+ * Text-producing runner (plans, reviews) backed by a vendor CLI.
+ * Providers may use subscription login and/or API-key auth depending on
+ * vendor requirements, and prompt transport may be stdin or argv.
+ * The CLI answer is written to the requested output file.
  */
 export class CliAgentRunner implements AgentRunner {
   readonly id: string;

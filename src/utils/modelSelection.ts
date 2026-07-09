@@ -163,9 +163,10 @@ export async function getAvailableCopilotModels(): Promise<
 
 /**
  * All models selectable for a stage: Copilot models from the LM API plus,
- * for each vendor CLI that is installed (Claude Code, Codex, Gemini), that
- * provider's model choices. Copilot being unavailable is not an error —
- * CLI providers still work without it, and vice versa.
+ * for each vendor CLI that is installed (Claude Code, Codex, Gemini,
+ * Antigravity, Kiro), that provider's model choices. Copilot being
+ * unavailable is not an error — CLI providers still work without it,
+ * and vice versa.
  */
 export async function getAvailableModels(): Promise<SelectableModel[]> {
   const result: SelectableModel[] = [];

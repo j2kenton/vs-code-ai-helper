@@ -16,6 +16,11 @@ import {
 import { selectPreferredModel, type ModelPreselectionOptions } from "../utils/modelPreselection";
 import { updateInvocationCache } from "../utils/invocationCache";
 import { getAiModelDefault } from "../config/settings";
+import { CLI_PROVIDERS } from "../runners/providers";
+
+function supportedCliListLabel(): string {
+  return CLI_PROVIDERS.map((provider) => provider.command).join(", ");
+}
 
 interface ModelPickItem extends vscode.QuickPickItem {
   modelId?: string;
@@ -254,7 +259,7 @@ export async function configureStepModels(
   const models = await getAvailableModels();
   if (models.length === 0) {
     void vscode.window.showWarningMessage(
-      "No AI models are available. Sign in to GitHub Copilot, or install one of the subscription CLIs (claude, codex, gemini), and try again."
+      `No AI models are available. Sign in to GitHub Copilot, or install one of the subscription CLIs (${supportedCliListLabel()}), and try again.`
     );
     return;
   }
@@ -379,7 +384,7 @@ export async function setStageModel(node?: StageNodeArg): Promise<void> {
   const models = await getAvailableModels();
   if (models.length === 0) {
     void vscode.window.showWarningMessage(
-      "No AI models are available. Sign in to GitHub Copilot, or install one of the subscription CLIs (claude, codex, gemini), and try again."
+      `No AI models are available. Sign in to GitHub Copilot, or install one of the subscription CLIs (${supportedCliListLabel()}), and try again.`
     );
     return;
   }

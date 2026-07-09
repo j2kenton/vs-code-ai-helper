@@ -34,7 +34,8 @@ type EffectiveProvider =
  * available, but falls back to the first installed CLI provider — so a
  * CLI-only setup (no Copilot subscription) works without the user first
  * visiting the model picker. This is what makes "at least one of Copilot /
- * Claude Code / Codex / Gemini" (see README) actually hold without extra
+ * Claude Code / Codex / Gemini / Antigravity / Kiro" (see README) actually
+ * hold without extra
  * configuration.
  *
  * Shared by resolveRunnerForModel (plan/review) and the two implementation
