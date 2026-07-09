@@ -182,14 +182,17 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     // picker on CLI default only rather than exposing stale model IDs.
     models: [{ model: undefined, name: "Antigravity (CLI default)" }],
     usesLastMessageFile: false,
+    promptTransport: "argv",
+    useShell: false,
     buildArgs(mode, model): string[] {
       const args: string[] = [];
       if (mode === "edit") {
-        args.push("--approval-mode", "auto_edit");
+        args.push("--dangerously-skip-permissions");
       }
       if (model) {
         args.push("--model", model);
       }
+      args.push("--prompt");
       return args;
     },
   },
