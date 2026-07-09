@@ -3,6 +3,7 @@ import { getAiModelDefaults } from "../config/settings";
 import { cliCommandExists, resolveCliCommand } from "../runners/cliAgentRunner";
 import {
   CLI_PROVIDERS,
+  type CliProviderId,
   type CliProviderDefinition,
   toQualifiedModelId,
 } from "../runners/providers";
@@ -173,6 +174,63 @@ function pushSelectableModel(
   target.push(model);
 }
 
+const SEEDED_CLI_MODELS: Readonly<
+  Partial<Record<CliProviderId, readonly DiscoveredCliModel[]>>
+> = {
+  "claude-cli": [
+    { model: "sonnet", name: "Sonnet 4.5" },
+    { model: "haiku", name: "Haiku 4.5" },
+    { model: "opus", name: "Opus 4.1 (only on Max plan)" },
+    { model: "fable", name: "Fable 5 (only on Max plan)" },
+  ],
+  "codex-cli": [
+    { model: "gpt-5.5", name: "GPT-5.5" },
+    { model: "gpt-5.4", name: "GPT-5.4" },
+    { model: "gpt-5.4-mini", name: "GPT-5.4-Mini" },
+  ],
+  "antigravity-cli": [
+    { model: "gemini-3.5-flash-medium", name: "Gemini 3.5 Flash (Medium)" },
+    { model: "gemini-3.5-flash-high", name: "Gemini 3.5 Flash (High)" },
+    { model: "gemini-3.5-flash-low", name: "Gemini 3.5 Flash (Low)" },
+    { model: "gemini-3.1-pro-low", name: "Gemini 3.1 Pro (Low)" },
+    { model: "gemini-3.1-pro-high", name: "Gemini 3.1 Pro (High)" },
+    {
+      model: "claude-sonnet-4.6-thinking",
+      name: "Claude Sonnet 4.6 (Thinking)",
+    },
+    {
+      model: "claude-opus-4.6-thinking",
+      name: "Claude Opus 4.6 (Thinking)",
+    },
+    { model: "gpt-oss-120b-medium", name: "GPT-OSS 120B (Medium)" },
+  ],
+  "kiro-cli": [
+    { model: "claude-sonnet-4.5", name: "Claude Sonnet 4.5" },
+    { model: "claude-sonnet-4", name: "Claude Sonnet 4" },
+    { model: "claude-haiku-4.5", name: "Claude Haiku 4.5" },
+    { model: "deepseek-3.2", name: "DeepSeek 3.2" },
+    { model: "minimax-m2.5", name: "MiniMax M2.5" },
+    { model: "minimax-m2.1", name: "MiniMax M2.1" },
+    { model: "glm-5", name: "GLM-5" },
+    { model: "qwen3-coder-next", name: "Qwen3 Coder Next" },
+  ],
+};
+
+function createSeededCliModelCache(): Map<
+  string,
+  {
+    models: readonly DiscoveredCliModel[];
+    inFlight?: Promise<readonly DiscoveredCliModel[]>;
+  }
+> {
+  return new Map(
+    Object.entries(SEEDED_CLI_MODELS).map(([providerId, models]) => [
+      providerId,
+      { models: [...models] },
+    ])
+  );
+}
+
 const cliModelCache = new Map<
   string,
   {
@@ -181,8 +239,19 @@ const cliModelCache = new Map<
   }
 >();
 
+for (const [providerId, entry] of createSeededCliModelCache()) {
+  cliModelCache.set(providerId, entry);
+}
+
 function resetCliModelCache(): void {
   cliModelCache.clear();
+}
+
+function restoreSeededCliModelCache(): void {
+  resetCliModelCache();
+  for (const [providerId, entry] of createSeededCliModelCache()) {
+    cliModelCache.set(providerId, entry);
+  }
 }
 
 function queueCliModelRefresh(
@@ -233,10 +302,6 @@ function queueCliModelRefresh(
 function getDiscoveredCliModels(
   def: CliProviderDefinition
 ): Promise<readonly DiscoveredCliModel[]> {
-  if (def.id !== "antigravity-cli") {
-    return Promise.resolve([]);
-  }
-
   const cached = cliModelCache.get(def.id);
   if (cached) {
     return Promise.resolve(cached.models);
@@ -261,6 +326,7 @@ export const __testOnly = {
   clearModelSelectionTestOverrides(): void {
     modelSelectionTestOverrides = undefined;
   },
+  restoreSeededCliModelCache,
 };
 
 export async function warmCliModelCache(): Promise<void> {

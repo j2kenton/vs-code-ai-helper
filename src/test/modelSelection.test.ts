@@ -6,15 +6,200 @@ import {
   type SelectableModel,
 } from "../utils/modelSelection";
 
+function providerModels(
+  models: readonly SelectableModel[],
+  providerLabel: string
+): SelectableModel[] {
+  return models.filter((model) => model.providerLabel === providerLabel);
+}
+
 function antigravityModels(
   models: readonly SelectableModel[]
 ): SelectableModel[] {
-  return models.filter(
-    (model) => model.providerLabel === "Antigravity CLI (subscription CLI)"
-  );
+  return providerModels(models, "Antigravity CLI (subscription CLI)");
 }
 
 void describe("getAvailableModels", () => {
+  void it("surfaces seeded CLI models immediately for installed providers", async () => {
+    __testOnly.restoreSeededCliModelCache();
+    __testOnly.setModelSelectionTestOverrides({
+      getAvailableCopilotModels() {
+        return Promise.resolve([]);
+      },
+      cliCommandExists(command) {
+        return Promise.resolve(
+          command === "claude" ||
+            command === "codex" ||
+            command === "agy" ||
+            command === "kiro-cli"
+        );
+      },
+    });
+
+    try {
+      const models = await getAvailableModels();
+      assert.deepStrictEqual(
+        providerModels(models, "Claude Code (subscription CLI)"),
+        [
+          {
+            id: "claude-cli:default",
+            name: "Claude (CLI default)",
+            providerLabel: "Claude Code (subscription CLI)",
+          },
+          {
+            id: "claude-cli:sonnet",
+            name: "Sonnet 4.5",
+            providerLabel: "Claude Code (subscription CLI)",
+          },
+          {
+            id: "claude-cli:haiku",
+            name: "Haiku 4.5",
+            providerLabel: "Claude Code (subscription CLI)",
+          },
+          {
+            id: "claude-cli:opus",
+            name: "Opus 4.1 (only on Max plan)",
+            providerLabel: "Claude Code (subscription CLI)",
+          },
+          {
+            id: "claude-cli:fable",
+            name: "Fable 5 (only on Max plan)",
+            providerLabel: "Claude Code (subscription CLI)",
+          },
+        ]
+      );
+      assert.deepStrictEqual(
+        providerModels(models, "OpenAI Codex (subscription CLI)"),
+        [
+          {
+            id: "codex-cli:default",
+            name: "Codex (CLI default)",
+            providerLabel: "OpenAI Codex (subscription CLI)",
+          },
+          {
+            id: "codex-cli:gpt-5.5",
+            name: "GPT-5.5",
+            providerLabel: "OpenAI Codex (subscription CLI)",
+          },
+          {
+            id: "codex-cli:gpt-5.4",
+            name: "GPT-5.4",
+            providerLabel: "OpenAI Codex (subscription CLI)",
+          },
+          {
+            id: "codex-cli:gpt-5.4-mini",
+            name: "GPT-5.4-Mini",
+            providerLabel: "OpenAI Codex (subscription CLI)",
+          },
+        ]
+      );
+      assert.deepStrictEqual(
+        antigravityModels(models),
+        [
+          {
+            id: "antigravity-cli:default",
+            name: "Antigravity (CLI default)",
+            providerLabel: "Antigravity CLI (subscription CLI)",
+          },
+          {
+            id: "antigravity-cli:gemini-3.5-flash-medium",
+            name: "Gemini 3.5 Flash (Medium)",
+            providerLabel: "Antigravity CLI (subscription CLI)",
+          },
+          {
+            id: "antigravity-cli:gemini-3.5-flash-high",
+            name: "Gemini 3.5 Flash (High)",
+            providerLabel: "Antigravity CLI (subscription CLI)",
+          },
+          {
+            id: "antigravity-cli:gemini-3.5-flash-low",
+            name: "Gemini 3.5 Flash (Low)",
+            providerLabel: "Antigravity CLI (subscription CLI)",
+          },
+          {
+            id: "antigravity-cli:gemini-3.1-pro-low",
+            name: "Gemini 3.1 Pro (Low)",
+            providerLabel: "Antigravity CLI (subscription CLI)",
+          },
+          {
+            id: "antigravity-cli:gemini-3.1-pro-high",
+            name: "Gemini 3.1 Pro (High)",
+            providerLabel: "Antigravity CLI (subscription CLI)",
+          },
+          {
+            id: "antigravity-cli:claude-sonnet-4.6-thinking",
+            name: "Claude Sonnet 4.6 (Thinking)",
+            providerLabel: "Antigravity CLI (subscription CLI)",
+          },
+          {
+            id: "antigravity-cli:claude-opus-4.6-thinking",
+            name: "Claude Opus 4.6 (Thinking)",
+            providerLabel: "Antigravity CLI (subscription CLI)",
+          },
+          {
+            id: "antigravity-cli:gpt-oss-120b-medium",
+            name: "GPT-OSS 120B (Medium)",
+            providerLabel: "Antigravity CLI (subscription CLI)",
+          },
+        ]
+      );
+      assert.deepStrictEqual(
+        providerModels(models, "Kiro CLI (subscription CLI)"),
+        [
+          {
+            id: "kiro-cli:default",
+            name: "Kiro (CLI default)",
+            providerLabel: "Kiro CLI (subscription CLI)",
+          },
+          {
+            id: "kiro-cli:claude-sonnet-4.5",
+            name: "Claude Sonnet 4.5",
+            providerLabel: "Kiro CLI (subscription CLI)",
+          },
+          {
+            id: "kiro-cli:claude-sonnet-4",
+            name: "Claude Sonnet 4",
+            providerLabel: "Kiro CLI (subscription CLI)",
+          },
+          {
+            id: "kiro-cli:claude-haiku-4.5",
+            name: "Claude Haiku 4.5",
+            providerLabel: "Kiro CLI (subscription CLI)",
+          },
+          {
+            id: "kiro-cli:deepseek-3.2",
+            name: "DeepSeek 3.2",
+            providerLabel: "Kiro CLI (subscription CLI)",
+          },
+          {
+            id: "kiro-cli:minimax-m2.5",
+            name: "MiniMax M2.5",
+            providerLabel: "Kiro CLI (subscription CLI)",
+          },
+          {
+            id: "kiro-cli:minimax-m2.1",
+            name: "MiniMax M2.1",
+            providerLabel: "Kiro CLI (subscription CLI)",
+          },
+          {
+            id: "kiro-cli:glm-5",
+            name: "GLM-5",
+            providerLabel: "Kiro CLI (subscription CLI)",
+          },
+          {
+            id: "kiro-cli:qwen3-coder-next",
+            name: "Qwen3 Coder Next",
+            providerLabel: "Kiro CLI (subscription CLI)",
+          },
+        ]
+      );
+    } finally {
+      __testOnly.clearModelSelectionTestOverrides();
+      __testOnly.resetCliModelCache();
+      __testOnly.restoreSeededCliModelCache();
+    }
+  });
+
   void it("prefers discovered Antigravity models over stale fallback entries", async () => {
     __testOnly.resetCliModelCache();
     __testOnly.setModelSelectionTestOverrides({

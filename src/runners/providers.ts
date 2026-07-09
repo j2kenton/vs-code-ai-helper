@@ -91,12 +91,9 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     loginHint:
       "Run `claude` in a terminal and complete the sign-in with your Anthropic (Claude) account, then try again.",
     authErrorMarkers: ["log in", "login", "authenticate", "api key", "oauth"],
-    models: [
-      { model: undefined, name: "Claude (CLI default)" },
-      { model: "sonnet", name: "Claude Sonnet" },
-      { model: "opus", name: "Claude Opus" },
-      { model: "haiku", name: "Claude Haiku" },
-    ],
+    // Keep the provider-level fallback to CLI default only. Temporary picker
+    // options are seeded separately until live loading is fixed.
+    models: [{ model: undefined, name: "Claude (CLI default)" }],
     usesLastMessageFile: false,
     buildArgs(mode, model): string[] {
       const args = ["-p", "--output-format", "text"];
@@ -120,9 +117,10 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     loginHint:
       "Run `codex login` in a terminal and sign in with your ChatGPT account, then try again.",
     authErrorMarkers: ["not logged in", "login", "authenticate", "api key"],
-    // Codex model names churn quickly and unsupported names hard-fail, so
-    // only the CLI's own default is offered. Any other model can still be
-    // used by setting a "codex-cli:<model>" ID directly in settings.
+    // Keep the provider-level fallback to CLI default only. The picker can
+    // seed temporary model options elsewhere without changing runner
+    // semantics here, and any unsupported custom ID can still be set
+    // directly via "codex-cli:<model>" in settings.
     models: [{ model: undefined, name: "Codex (CLI default)" }],
     usesLastMessageFile: true,
     buildArgs(mode, model, lastMessageFile): string[] {
@@ -178,8 +176,9 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     loginHint:
       "Run `agy` (or `antigravity`) in a terminal and complete the Google sign-in, then try again.",
     authErrorMarkers: ["login", "authenticate", "credentials", "api key"],
-    // Prefer live discovery from `agy models`. If discovery fails, keep the
-    // picker on CLI default only rather than exposing stale model IDs.
+    // Keep the provider-level fallback to CLI default only. The picker seeds
+    // temporary cached entries and still prefers live `agy models` results
+    // when available.
     models: [{ model: undefined, name: "Antigravity (CLI default)" }],
     usesLastMessageFile: false,
     promptTransport: "argv",
@@ -215,8 +214,8 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     useShell: false,
     // Use stdin transport so large context packs are not constrained by
     // command-line argument limits.
-    // Kiro model selection is managed by the CLI session/settings.
-    // Keep picker options to CLI default to avoid stale hard-coded names.
+    // Keep the provider-level fallback to CLI default only. Temporary picker
+    // options are seeded separately until live loading is fixed.
     models: [{ model: undefined, name: "Kiro (CLI default)" }],
     usesLastMessageFile: false,
     buildArgs(mode): string[] {
