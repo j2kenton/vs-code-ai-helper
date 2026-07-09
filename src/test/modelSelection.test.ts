@@ -322,6 +322,49 @@ void describe("getAvailableModels", () => {
     }
   });
 
+  void it("surfaces seeded Copilot Gemini reasoning variants", async () => {
+    __testOnly.restoreSeededCliModelCache();
+    __testOnly.setModelSelectionTestOverrides({
+      getAvailableCopilotModels() {
+        return Promise.resolve([
+          {
+            id: "copilot-gemini-2.5-pro",
+            name: "Gemini 2.5 Pro",
+          } as SelectableModel as never,
+          {
+            id: "copilot-gemini-2.5-flash",
+            name: "Gemini 2.5 Flash",
+          } as SelectableModel as never,
+        ]);
+      },
+      cliCommandExists() {
+        return Promise.resolve(false);
+      },
+    });
+
+    try {
+      const models = await getAvailableModels();
+      assert.deepStrictEqual(models, [
+        copilotModel("copilot-gemini-2.5-pro", "Gemini 2.5 Pro"),
+        ...copilotReasoningVariants("copilot-gemini-2.5-pro", "Gemini 2.5 Pro", [
+          ["low", "Low"],
+          ["medium", "Medium"],
+          ["high", "High"],
+        ]),
+        copilotModel("copilot-gemini-2.5-flash", "Gemini 2.5 Flash"),
+        ...copilotReasoningVariants("copilot-gemini-2.5-flash", "Gemini 2.5 Flash", [
+          ["low", "Low"],
+          ["medium", "Medium"],
+          ["high", "High"],
+        ]),
+      ]);
+    } finally {
+      __testOnly.clearModelSelectionTestOverrides();
+      __testOnly.resetCliModelCache();
+      __testOnly.restoreSeededCliModelCache();
+    }
+  });
+
   void it("surfaces seeded CLI models immediately for installed providers", async () => {
     __testOnly.restoreSeededCliModelCache();
     __testOnly.setModelSelectionTestOverrides({

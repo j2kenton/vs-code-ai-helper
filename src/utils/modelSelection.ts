@@ -255,6 +255,14 @@ const COPILOT_REASONING_VARIANT_RULES: Readonly<
     ],
   },
   {
+    slug: "gemini",
+    efforts: [
+      { effort: "low", label: "Low" },
+      { effort: "medium", label: "Medium" },
+      { effort: "high", label: "High" },
+    ],
+  },
+  {
     slug: "claude-sonnet-4.5",
     efforts: [
       { effort: "low", label: "Low" },
