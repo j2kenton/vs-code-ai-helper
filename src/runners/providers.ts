@@ -208,10 +208,10 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
       "api key",
       "unauthorized",
     ],
-    promptTransport: "argv",
+    promptTransport: "stdin",
     useShell: false,
-    // Keep argv payload comfortably below Windows command-line limits.
-    maxArgvPromptBytes: 24_000,
+    // Use stdin transport so large context packs are not constrained by
+    // command-line argument limits.
     // Kiro model selection is managed by the CLI session/settings.
     // Keep picker options to CLI default to avoid stale hard-coded names.
     models: [{ model: undefined, name: "Kiro (CLI default)" }],

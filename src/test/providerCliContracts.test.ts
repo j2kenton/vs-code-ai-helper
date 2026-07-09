@@ -3,13 +3,13 @@ import { describe, it } from "node:test";
 import { CLI_PROVIDERS, getCliProvider } from "../runners/providers";
 
 void describe("provider CLI contracts", () => {
-  void it("Kiro uses argv prompt transport for --no-interactive", () => {
+  void it("Kiro uses stdin prompt transport for --no-interactive", () => {
     const kiro = getCliProvider("kiro-cli");
     assert.ok(kiro, "expected kiro-cli provider definition");
 
-    assert.strictEqual(kiro.promptTransport, "argv");
+    assert.strictEqual(kiro.promptTransport, "stdin");
     assert.strictEqual(kiro.useShell, false);
-    assert.strictEqual(kiro.maxArgvPromptBytes, 24_000);
+    assert.strictEqual(kiro.maxArgvPromptBytes, undefined);
 
     const textArgs = kiro.buildArgs("text", undefined, undefined);
     assert.deepStrictEqual(textArgs, [
