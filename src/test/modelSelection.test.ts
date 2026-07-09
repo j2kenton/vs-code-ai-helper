@@ -165,6 +165,16 @@ void describe("getAvailableModels", () => {
             providerLabel: "OpenAI Codex (subscription CLI)",
           },
           {
+            id: "codex-cli:gpt-5.6-terra",
+            name: "GPT-5.6-Terra",
+            providerLabel: "OpenAI Codex (subscription CLI)",
+          },
+          {
+            id: "codex-cli:gpt-5.6-luna",
+            name: "GPT-5.6-Luna",
+            providerLabel: "OpenAI Codex (subscription CLI)",
+          },
+          {
             id: "codex-cli:gpt-5.4",
             name: "GPT-5.4",
             providerLabel: "OpenAI Codex (subscription CLI)",

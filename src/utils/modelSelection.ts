@@ -211,6 +211,8 @@ const SEEDED_CLI_MODELS: Readonly<
   ],
   "codex-cli": [
     { model: "gpt-5.5", name: "GPT-5.5" },
+    { model: "gpt-5.6-terra", name: "GPT-5.6-Terra" },
+    { model: "gpt-5.6-luna", name: "GPT-5.6-Luna" },
     { model: "gpt-5.4", name: "GPT-5.4" },
     { model: "gpt-5.4-mini", name: "GPT-5.4-Mini" },
   ],
