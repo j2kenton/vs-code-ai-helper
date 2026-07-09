@@ -18,20 +18,20 @@ void describe("getAvailableModels", () => {
   void it("prefers discovered Antigravity models over stale fallback entries", async () => {
     __testOnly.resetCliModelCache();
     __testOnly.setModelSelectionTestOverrides({
-      async getAvailableCopilotModels() {
-        return [];
+      getAvailableCopilotModels() {
+        return Promise.resolve([]);
       },
-      async cliCommandExists(command) {
-        return command === "agy";
+      cliCommandExists(command) {
+        return Promise.resolve(command === "agy");
       },
-      async getDiscoveredCliModels(def) {
+      getDiscoveredCliModels(def) {
         if (def.id !== "antigravity-cli") {
-          return [];
+          return Promise.resolve([]);
         }
-        return [
+        return Promise.resolve([
           { model: "gemini-3-pro", name: "Gemini 3 Pro" },
           { model: "gemini-3-flash", name: "Gemini 3 Flash" },
-        ];
+        ]);
       },
     });
 
@@ -63,14 +63,14 @@ void describe("getAvailableModels", () => {
   void it("uses Antigravity fallback entries when discovery returns nothing", async () => {
     __testOnly.resetCliModelCache();
     __testOnly.setModelSelectionTestOverrides({
-      async getAvailableCopilotModels() {
-        return [];
+      getAvailableCopilotModels() {
+        return Promise.resolve([]);
       },
-      async cliCommandExists(command) {
-        return command === "agy";
+      cliCommandExists(command) {
+        return Promise.resolve(command === "agy");
       },
-      async getDiscoveredCliModels() {
-        return [];
+      getDiscoveredCliModels() {
+        return Promise.resolve([]);
       },
     });
 
