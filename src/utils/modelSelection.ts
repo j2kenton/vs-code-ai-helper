@@ -9,7 +9,6 @@ import {
 import { AI_MODEL_STAGES, TaskStage } from "../types/taskProgress";
 import {
   discoverAgyModels,
-  discoverAgyModelsWithTimeout,
   type DiscoveredCliModel,
 } from "./cliModelDiscovery";
 
@@ -174,12 +173,9 @@ function pushSelectableModel(
   target.push(model);
 }
 
-const CLI_MODEL_CACHE_TTL_MS = 60 * 1000;
-const CLI_MODEL_INITIAL_WAIT_MS = 1200;
 const cliModelCache = new Map<
   string,
   {
-    expiresAt: number;
     models: readonly DiscoveredCliModel[];
     inFlight?: Promise<readonly DiscoveredCliModel[]>;
   }
@@ -203,19 +199,21 @@ function queueCliModelRefresh(
       def.commandAliases
     );
     if (!resolvedCommand) {
-      return [];
+      const discovered: readonly DiscoveredCliModel[] = [];
+      cliModelCache.set(def.id, {
+        models: discovered,
+      });
+      return discovered;
     }
 
     const discovered = await discoverAgyModels(resolvedCommand);
     cliModelCache.set(def.id, {
-      expiresAt: Date.now() + CLI_MODEL_CACHE_TTL_MS,
       models: discovered,
     });
     return discovered;
   })();
 
   cliModelCache.set(def.id, {
-    expiresAt: cached?.expiresAt ?? 0,
     models: cached?.models ?? [],
     inFlight: refresh,
   });
@@ -224,7 +222,6 @@ function queueCliModelRefresh(
     const latest = cliModelCache.get(def.id);
     if (latest?.inFlight === refresh) {
       cliModelCache.set(def.id, {
-        expiresAt: latest.expiresAt,
         models: latest.models,
       });
     }
@@ -241,55 +238,23 @@ async function getDiscoveredCliModels(
   }
 
   const cached = cliModelCache.get(def.id);
-  if (cached && cached.expiresAt > Date.now()) {
-    return cached.models;
-  }
-
   if (cached) {
-    void queueCliModelRefresh(def);
     return cached.models;
   }
-
-  const resolvedCommand = await resolveCliCommand(def.command, def.commandAliases);
-  if (!resolvedCommand) {
-    return [];
-  }
-
-  const foregroundDiscovery = discoverAgyModelsWithTimeout(
-    resolvedCommand,
-    CLI_MODEL_INITIAL_WAIT_MS
-  );
-  cliModelCache.set(def.id, {
-    expiresAt: 0,
-    models: [],
-    inFlight: foregroundDiscovery,
-  });
-
-  void foregroundDiscovery.finally(() => {
-    const latest = cliModelCache.get(def.id);
-    if (latest?.inFlight === foregroundDiscovery) {
-      cliModelCache.set(def.id, {
-        expiresAt: Date.now() + CLI_MODEL_CACHE_TTL_MS,
-        models: latest.models,
-      });
-    }
-  });
-
-  const discovered = await foregroundDiscovery;
-  cliModelCache.set(def.id, {
-    expiresAt: Date.now() + CLI_MODEL_CACHE_TTL_MS,
-    models: discovered,
-  });
-  if (discovered.length > 0) {
-    return discovered;
-  }
-
-  void queueCliModelRefresh(def);
   return [];
 }
 
 export const __testOnly = {
   resetCliModelCache,
+  primeCliModelCache(
+    providerId: string,
+    value: {
+      models: readonly DiscoveredCliModel[];
+      inFlight?: Promise<readonly DiscoveredCliModel[]>;
+    }
+  ): void {
+    cliModelCache.set(providerId, value);
+  },
   setModelSelectionTestOverrides(overrides: ModelSelectionTestOverrides): void {
     modelSelectionTestOverrides = overrides;
   },
@@ -297,6 +262,16 @@ export const __testOnly = {
     modelSelectionTestOverrides = undefined;
   },
 };
+
+export async function warmCliModelCache(): Promise<void> {
+  const refreshes: Promise<readonly DiscoveredCliModel[]>[] = [];
+  for (const def of CLI_PROVIDERS) {
+    if (def.id === "antigravity-cli") {
+      refreshes.push(queueCliModelRefresh(def));
+    }
+  }
+  await Promise.allSettled(refreshes);
+}
 
 export async function getAvailableCopilotModels(): Promise<
   vscode.LanguageModelChat[]

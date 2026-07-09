@@ -47,4 +47,19 @@ void describe("parseAgyModelsOutput", () => {
       { model: "gemini-2.5-flash", name: "gemini-2.5-flash" },
     ]);
   });
+
+  void it("can recover models from partial line output", () => {
+    const parsed = parseAgyModelsOutput(
+      [
+        "gemini-2.5-pro",
+        "gemini-2.5-flash",
+        "",
+      ].join("\n")
+    );
+
+    assert.deepStrictEqual(parsed, [
+      { model: "gemini-2.5-pro", name: "gemini-2.5-pro" },
+      { model: "gemini-2.5-flash", name: "gemini-2.5-flash" },
+    ]);
+  });
 });

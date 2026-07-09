@@ -108,7 +108,7 @@ export function parseAgyModelsOutput(output: string): DiscoveredCliModel[] {
 export async function discoverAgyModels(command: string): Promise<
   DiscoveredCliModel[]
 > {
-  return discoverAgyModelsWithTimeout(command, 10_000);
+  return discoverAgyModelsWithTimeout(command, 30_000);
 }
 
 export async function discoverAgyModelsWithTimeout(
@@ -126,11 +126,16 @@ export async function discoverAgyModelsWithTimeout(
         env: process.env,
       },
       (error, stdout) => {
+        const parsed = parseAgyModelsOutput(stdout);
+        if (parsed.length > 0) {
+          resolve(parsed);
+          return;
+        }
         if (error) {
           resolve([]);
           return;
         }
-        resolve(parseAgyModelsOutput(stdout));
+        resolve(parsed);
       }
     );
   });

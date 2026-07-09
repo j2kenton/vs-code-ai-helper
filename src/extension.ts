@@ -25,6 +25,7 @@ import { TaskStatusBar } from "./views/taskStatusBar";
 import { TaskInventory } from "./state/taskInventory";
 import { CurrentTaskStore } from "./utils/currentTaskStore";
 import { TASK_PROGRESS_FILENAME } from "./types/taskProgress";
+import { warmCliModelCache } from "./utils/modelSelection";
 
 /**
  * This method is called when your extension is activated.
@@ -149,6 +150,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   // Populate the inventory and status bar immediately (silent — no folder creation)
   void inventory.refresh().then(() => taskTreeProvider.refresh());
+  void warmCliModelCache();
 
   // NOTE: The initial "using plans" popup has been intentionally removed.
   // Discovery is silent; no folder is created until a task is actually made.
