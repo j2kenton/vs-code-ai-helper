@@ -282,8 +282,8 @@ function installMessageCapture(): {
   };
   win.withProgress = async (
     _options: unknown,
-    task: (progress: unknown, token: unknown) => Thenable<unknown>
-  ): Thenable<unknown> => {
+    task: (progress: unknown, token: unknown) => Promise<unknown>
+  ): Promise<unknown> => {
     return task({ report: (): void => undefined }, { isCancellationRequested: false });
   };
 
