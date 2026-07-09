@@ -90,10 +90,55 @@ class ThemeColor {
 
 class EventEmitter {
   constructor() {
-    this.event = () => ({ dispose() {} });
+    this.event = () => ({ dispose() { } });
   }
-  fire() {}
-  dispose() {}
+  fire() { }
+  dispose() { }
+}
+
+class CancellationToken {
+  constructor() {
+    this.isCancellationRequested = false;
+    this._listeners = [];
+  }
+
+  onCancellationRequested(listener) {
+    if (typeof listener !== "function") {
+      return { dispose() { } };
+    }
+    this._listeners.push(listener);
+    return {
+      dispose: () => {
+        this._listeners = this._listeners.filter((l) => l !== listener);
+      },
+    };
+  }
+
+  _cancel() {
+    if (this.isCancellationRequested) {
+      return;
+    }
+    this.isCancellationRequested = true;
+    for (const listener of [...this._listeners]) {
+      try {
+        listener();
+      } catch {
+        // Ignore listener errors in test stub.
+      }
+    }
+  }
+}
+
+class CancellationTokenSource {
+  constructor() {
+    this.token = new CancellationToken();
+  }
+
+  cancel() {
+    this.token._cancel();
+  }
+
+  dispose() { }
 }
 
 /**
@@ -114,12 +159,18 @@ class StatusBarItem {
   hide() {
     this.visible = false;
   }
-  dispose() {}
+  dispose() { }
 }
 
 const StatusBarAlignment = {
   Left: 1,
   Right: 2,
+};
+
+const ProgressLocation = {
+  SourceControl: 1,
+  Window: 10,
+  Notification: 15,
 };
 
 function notImplemented(name) {
@@ -134,6 +185,7 @@ const workspace = {
   fs: {
     readFile: notImplemented("workspace.fs.readFile"),
     writeFile: notImplemented("workspace.fs.writeFile"),
+    createDirectory: notImplemented("workspace.fs.createDirectory"),
     readDirectory: notImplemented("workspace.fs.readDirectory"),
   },
   asRelativePath: (uri) => (uri && uri.path ? uri.path : String(uri)),
@@ -175,12 +227,14 @@ module.exports = {
   Uri,
   FileType,
   StatusBarAlignment,
+  ProgressLocation,
   StatusBarItem,
   TreeItemCollapsibleState,
   TreeItem,
   MarkdownString,
   ThemeIcon,
   ThemeColor,
+  CancellationTokenSource,
   EventEmitter,
   workspace,
   window,
