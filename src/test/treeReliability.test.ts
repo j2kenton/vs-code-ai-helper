@@ -38,6 +38,7 @@ function makeTask(
     progress: {
       currentStage: stage as import("../types/taskProgress").TaskStage,
       status,
+      taskFolder: folderName,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     },
@@ -54,6 +55,16 @@ function makeInventoryStub() {
   } as unknown as import("../state/taskInventory").TaskInventory;
 }
 
+/** Minimal CurrentTaskStore stub for status-bar tests. */
+function makeStoreStub() {
+  return {
+    get: () => undefined,
+    set: async (_id: string) => {},
+    clear: async () => {},
+    onDidChange: { event: (_handler: () => void) => ({ dispose() {} }) },
+  } as unknown as import("../utils/currentTaskStore").CurrentTaskStore;
+}
+
 // ---------------------------------------------------------------------------
 // TaskStatusBar — store-driven only, no fabricated current task
 // ---------------------------------------------------------------------------
@@ -66,21 +77,21 @@ void describe("TaskStatusBar — store-driven only, no fabricated current task",
   void it("hides when currentTaskCanonicalId is undefined (no ID ever stored)", () => {
     // update() must not throw and must hide silently; it must NOT pick the
     // first active task as a fallback.
-    const bar = new TaskStatusBar();
+    const bar = new TaskStatusBar(makeStoreStub());
     const tasks = [makeTask("/workspace/task-a", "task-a")];
     assert.doesNotThrow(() => bar.update(tasks, undefined));
     bar.dispose();
   });
 
   void it("hides when the stored ID is stale (task no longer in list)", () => {
-    const bar = new TaskStatusBar();
+    const bar = new TaskStatusBar(makeStoreStub());
     const tasks = [makeTask("/workspace/task-a", "task-a")];
     assert.doesNotThrow(() => bar.update(tasks, "/workspace/deleted-task"));
     bar.dispose();
   });
 
   void it("does not throw when currentTaskCanonicalId matches a task", () => {
-    const bar = new TaskStatusBar();
+    const bar = new TaskStatusBar(makeStoreStub());
     const taskPath = "/workspace/task-a";
     const tasks = [makeTask(taskPath, "task-a")];
     assert.doesNotThrow(() => bar.update(tasks, taskPath));
@@ -88,13 +99,13 @@ void describe("TaskStatusBar — store-driven only, no fabricated current task",
   });
 
   void it("does not throw when task list is empty and ID is undefined", () => {
-    const bar = new TaskStatusBar();
+    const bar = new TaskStatusBar(makeStoreStub());
     assert.doesNotThrow(() => bar.update([], undefined));
     bar.dispose();
   });
 
   void it("does not throw when task list is empty and ID is set (stale)", () => {
-    const bar = new TaskStatusBar();
+    const bar = new TaskStatusBar(makeStoreStub());
     assert.doesNotThrow(() => bar.update([], "/workspace/gone-task"));
     bar.dispose();
   });
@@ -102,7 +113,7 @@ void describe("TaskStatusBar — store-driven only, no fabricated current task",
   // Structural guard: if `hasEverStoredCurrentTask` were re-introduced the
   // fabrication bug would come back. Assert the property does not exist.
   void it('does NOT have a "hasEverStoredCurrentTask" property (fabrication guard removed)', () => {
-    const bar = new TaskStatusBar() as unknown as Record<string, unknown>;
+    const bar = new TaskStatusBar(makeStoreStub()) as unknown as Record<string, unknown>;
     assert.strictEqual(
       "hasEverStoredCurrentTask" in bar,
       false,
@@ -123,7 +134,7 @@ void describe("TaskStatusBar — store-driven only, no fabricated current task",
 
 void describe("TaskStatusBar — canonical-ID-aware matching", () => {
   void it("resolves stored ID against task.canonicalId when present", () => {
-    const bar = new TaskStatusBar();
+    const bar = new TaskStatusBar(makeStoreStub());
     // Simulate Windows: canonical ID is lower-cased, fsPath preserves original
     const canonicalId = "/workspace/task-a";
     const tasks = [makeTask("/workspace/Task-A", "task-a", "implementation", "active", canonicalId)];
@@ -133,7 +144,7 @@ void describe("TaskStatusBar — canonical-ID-aware matching", () => {
   });
 
   void it("hides when stored ID matches neither canonicalId nor fsPath", () => {
-    const bar = new TaskStatusBar();
+    const bar = new TaskStatusBar(makeStoreStub());
     const tasks = [makeTask("/workspace/task-a", "task-a", "implementation", "active", "/workspace/task-a")];
     // A completely different ID
     assert.doesNotThrow(() => bar.update(tasks, "/workspace/totally-different"));
@@ -141,10 +152,32 @@ void describe("TaskStatusBar — canonical-ID-aware matching", () => {
   });
 
   void it("falls back to fsPath matching when canonicalId is absent", () => {
-    const bar = new TaskStatusBar();
+    const bar = new TaskStatusBar(makeStoreStub());
     // No canonicalId supplied — legacy task object
     const tasks = [makeTask("/workspace/task-b", "task-b")];
     assert.doesNotThrow(() => bar.update(tasks, "/workspace/task-b"));
+    bar.dispose();
+  });
+
+  void it("calls store.clear() when stored ID is stale", () => {
+    let clearCalled = false;
+    const store = {
+      get: () => undefined,
+      set: async (_id: string) => {},
+      clear: () => { clearCalled = true; },
+      onDidChange: { event: (_handler: () => void) => ({ dispose() {} }) },
+    } as unknown as import("../utils/currentTaskStore").CurrentTaskStore;
+
+    const bar = new TaskStatusBar(store);
+    const tasks = [makeTask("/workspace/task-a", "task-a")];
+    // Pass a stale ID that doesn't match any task
+    bar.update(tasks, "/workspace/deleted-task");
+    
+    assert.strictEqual(
+      clearCalled,
+      true,
+      "Expected store.clear() to be called when stored ID is stale"
+    );
     bar.dispose();
   });
 });

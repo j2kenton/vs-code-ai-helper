@@ -33,6 +33,7 @@ function makeTask(currentStage: TaskStage = "implementation") {
     progress: {
       currentStage,
       status: "active" as const,
+      taskFolder: "my-task",
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     },

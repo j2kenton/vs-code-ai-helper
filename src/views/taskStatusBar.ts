@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import { STAGE_DISPLAY_NAMES, STAGE_ORDER } from "../types/taskProgress";
 import { IncompleteTask } from "../utils/taskProgressUtils";
+import { CurrentTaskStore } from "../utils/currentTaskStore";
 
 /**
  * Status bar item that shows the persisted current task from CurrentTaskStore.
@@ -11,8 +12,9 @@ import { IncompleteTask } from "../utils/taskProgressUtils";
  * hidden. This keeps the status bar consistent with the tree badge, the task
  * action router, and reveal behaviour.
  *
- * When the stored ID is stale (task deleted), the bar also hides so all
- * surfaces remain in sync.
+ * When the stored ID is stale (task deleted), the bar hides and clears the
+ * persisted state so all surfaces remain in sync and the extension does not
+ * start from a stale ID after window reload.
  *
  * Matching priority for resolving the stored canonical ID against the task
  * list:
@@ -27,7 +29,7 @@ import { IncompleteTask } from "../utils/taskProgressUtils";
 export class TaskStatusBar implements vscode.Disposable {
   private readonly item: vscode.StatusBarItem;
 
-  constructor() {
+  constructor(private readonly currentTaskStore: CurrentTaskStore) {
     this.item = vscode.window.createStatusBarItem(
       vscode.StatusBarAlignment.Left,
       100
@@ -40,6 +42,10 @@ export class TaskStatusBar implements vscode.Disposable {
    * Shows the matching task when `currentTaskCanonicalId` is set and still
    * present in `tasks`. Hides in every other case (no ID stored, or stored ID
    * is stale).
+   *
+   * When the stored ID is stale (task deleted), clears the persisted state so
+   * the extension does not start from a deleted task ID after window reload or
+   * later command flows.
    */
   update(
     tasks: IncompleteTask[],
@@ -60,9 +66,10 @@ export class TaskStatusBar implements vscode.Disposable {
         t.folderUri.fsPath === currentTaskCanonicalId
     );
 
-    // Stored ID is stale (task was deleted or moved) → hide.
+    // Stored ID is stale (task was deleted or moved) → hide and clear.
     if (!taskToShow) {
       this.item.hide();
+      void this.currentTaskStore.clear();
       return;
     }
 

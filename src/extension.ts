@@ -135,7 +135,7 @@ export function activate(context: vscode.ExtensionContext): void {
     showCollapseAll: false,
   });
 
-  const taskStatusBar = new TaskStatusBar();
+  const taskStatusBar = new TaskStatusBar(currentTaskStore);
   const tasksLoadedListener = taskTreeProvider.onDidLoadTasks((tasks) => {
     const currentTaskCanonicalId = currentTaskStore.get();
     taskStatusBar.update(tasks, currentTaskCanonicalId);
