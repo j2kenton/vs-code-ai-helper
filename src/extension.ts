@@ -20,6 +20,7 @@ import { registerChatWithStageCommand } from "./commands/chatWithStage";
 import { registerOpenGeneralAssistantCommand } from "./commands/openGeneralAssistant";
 import { registerRunLintingFixesCommand } from "./commands/runLintingFixes";
 import { registerScheduleTaskResumeCommand } from "./commands/scheduleTaskResume";
+import { registerMarkTaskDoneCommand } from "./commands/markTaskDone";
 import { TaskTreeProvider, TASKS_VIEW_ID, TaskNode } from "./views/taskTreeProvider";
 import { TaskStatusBar } from "./views/taskStatusBar";
 import { TaskInventory } from "./state/taskInventory";
@@ -97,6 +98,7 @@ export function activate(context: vscode.ExtensionContext): void {
   registerOpenGeneralAssistantCommand(context);
   registerRunLintingFixesCommand(context, inventory);
   registerScheduleTaskResumeCommand(context, inventory);
+  registerMarkTaskDoneCommand(context, inventory, currentTaskStore);
 
   // Register the hello world command (keeping for backward compat)
   const helloWorldDisposable = vscode.commands.registerCommand(

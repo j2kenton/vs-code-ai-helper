@@ -278,6 +278,10 @@ export function getStageNodeContextValue(
         // Merged stage: prefer plan-final.md, fallback to implementation.md
         contextValue = "stage-impl-current";
         break;
+      case "impl-low-review":
+        // Final review stage: exposes markTaskDone instead of nextStage
+        contextValue = "stage-impl-low-review-current";
+        break;
       default:
         if (isReviewStage(stage)) {
           contextValue = "stage-review-current";

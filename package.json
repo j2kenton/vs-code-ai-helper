@@ -176,6 +176,11 @@
         "command": "vs-code-ai-helper.viewReview",
         "title": "View Review",
         "icon": "$(eye)"
+      },
+      {
+        "command": "vs-code-ai-helper.markTaskDone",
+        "title": "Mark Task Done + Select Next",
+        "icon": "$(pass-filled)"
       }
     ],
     "keybindings": [
@@ -291,6 +296,11 @@
           "group": "inline@1"
         },
         {
+          "command": "vs-code-ai-helper.nextStage",
+          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage-task-description-current/",
+          "group": "inline@9"
+        },
+        {
           "command": "vs-code-ai-helper.setStageAsCurrent",
           "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage-task-description/ && !(viewItem =~ /-current/)",
           "group": "inline@2"
@@ -332,7 +342,12 @@
         },
         {
           "command": "vs-code-ai-helper.nextStage",
-          "when": "view == vs-code-ai-helper.tasksView && (viewItem == task-active-review || viewItem =~ /^stage-review-current/)",
+          "when": "view == vs-code-ai-helper.tasksView && (viewItem == task-active-review || viewItem =~ /^stage-review-current/) && !(viewItem =~ /^stage-impl-low-review-current/)",
+          "group": "inline@9"
+        },
+        {
+          "command": "vs-code-ai-helper.markTaskDone",
+          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage-impl-low-review-current/",
           "group": "inline@9"
         },
         {
