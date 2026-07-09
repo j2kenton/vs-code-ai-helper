@@ -30,6 +30,7 @@ import {
   readNonEmptyText,
   resolveCurrentPlanUri,
   statIfExists,
+  writeTextFile,
 } from "../utils/fileUtils";
 import { generateContextPack, writeContextPack, writeImplReviewContextPack } from "../utils/contextPack";
 import { renderPromptTemplate } from "../utils/promptTemplates";
@@ -1382,9 +1383,26 @@ async function executeImplementationRun(
       : "_none recorded_"
   }\n\n${result.summary ?? result.errorMessage ?? ""}`;
 
-  await writeRunLog(folderUri, result.runnerId, "implementation", logContent);
+  const logUri = await writeRunLog(folderUri, result.runnerId, "implementation", logContent);
 
   if (result.status === "completed") {
+    const implementationUri = getCanonicalImplementationUri(folderUri);
+
+    if (!result.filesChangedUnknown && result.filesChanged.length === 0) {
+      NotificationRouter.showWarning(
+        "Implementation finished, but no workspace files changed. " +
+          "Review the implementation run log; the provider may have been blocked from writing files."
+      );
+      const logDoc = await vscode.workspace.openTextDocument(logUri);
+      await vscode.window.showTextDocument(logDoc);
+      return;
+    }
+
+    const summary = result.summary?.trim();
+    if (summary) {
+      await writeTextFile(implementationUri, `${summary}\n`);
+    }
+
     // Post-run: show changed files or warn if tracking was unavailable
     if (result.filesChangedUnknown) {
       NotificationRouter.showWarning(
@@ -1417,7 +1435,6 @@ async function executeImplementationRun(
       return stageUpdated;
     });
 
-    const implementationUri = getCanonicalImplementationUri(folderUri);
     const doc = await vscode.workspace.openTextDocument(implementationUri);
     await vscode.window.showTextDocument(doc);
     // Auto-review after implementation run — bypass consent (already obtained)
