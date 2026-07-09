@@ -247,7 +247,12 @@ export class StageNode extends vscode.TreeItem {
     }
 
     // Use the computed stage context for stage-specific buttons
-    this.contextValue = getStageNodeContextValue(stage, status);
+    this.contextValue = getStageNodeContextValue(
+      stage,
+      status,
+      task.progress.status === "paused",
+      task.progress.lintPayload !== undefined
+    );
   }
 }
 
@@ -261,7 +266,9 @@ export class StageNode extends vscode.TreeItem {
  */
 export function getStageNodeContextValue(
   stage: TaskStage,
-  status: StageStatus
+  status: StageStatus,
+  isPaused: boolean = false,
+  hasLintPayload: boolean = false
 ): string {
   let contextValue: string;
 
@@ -292,6 +299,14 @@ export function getStageNodeContextValue(
   } else {
     // For non-current stages, the context is simpler.
     contextValue = computeStageContext(stage);
+  }
+
+  if (isPaused) {
+    contextValue += "-paused";
+  }
+
+  if (hasLintPayload && stage === "impl-low-review" && status === "current") {
+    contextValue += "-lint-known";
   }
 
   // Stages that run an AI model get a "-modelable" suffix so the tree's

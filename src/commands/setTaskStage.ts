@@ -1,27 +1,14 @@
 import * as vscode from "vscode";
 import {
-  isReviewStage,
   STAGE_DISPLAY_NAMES,
   STAGE_ORDER,
   TaskStage,
 } from "../types/taskProgress";
-import {
-  IncompleteTask,
-  patchTaskProgress,
-  updateTaskProgressStage,
-} from "../utils/taskProgressUtils";
+import { IncompleteTask } from "../utils/taskProgressUtils";
 import { TaskInventory } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
-
-/**
- * Explicit transition map: advancing FROM these source stages INTO the
- * corresponding review stage auto-triggers the corresponding review.
- */
-const AUTO_REVIEW_TRANSITIONS: Partial<Record<TaskStage, TaskStage>> = {
-  plan: "plan-high-review",
-  "plan-high-review": "plan-low-review",
-};
+import { advanceStage } from "../utils/stageTransition";
 
 /**
  * Accepted argument shapes for setTaskStage.
@@ -116,7 +103,7 @@ export async function setTaskStage(
   );
 
   if (!resolvedTask) {
-    // BLOCKING FIX: If the caller supplied an explicit task identifier (tree
+    // If the caller supplied an explicit task identifier (tree
     // node, canonical ID, or folder path) but resolution failed, that means
     // the referenced task no longer exists or is no longer discoverable.
     // Silently falling through to a task picker would redirect the action
@@ -202,29 +189,20 @@ export async function setTaskStage(
     return;
   }
 
-  // Determine whether we should auto-trigger review after the stage change.
-  // Auto-review only fires when:
-  //   1. The caller explicitly opts in (triggerAutoReview: true), AND
-  //   2. The task is not paused, AND
-  //   3. The destination is a review stage, AND
-  //   4. The source → destination transition is in the explicit map.
-  const sourceStage = task.progress.currentStage;
-  const shouldAutoReview =
-    triggerAutoReview &&
-    task.progress.status !== "paused" &&
-    isReviewStage(newStage) &&
-    AUTO_REVIEW_TRANSITIONS[sourceStage] === newStage;
-
-  // Persist the destination stage using patchTaskProgress so unrelated fields
-  // (e.g. implReviewFiles, scheduledAt, lint results) are preserved.
+  // Persist the destination stage using the shared advanceStage helper.
+  // This centralizes auto-review eligibility, transition sequencing, and persistence.
   const taskFolderUri = vscode.Uri.file(task.taskFolderPath);
-  const capturedNewStage = newStage;
-  const patched = await patchTaskProgress(taskFolderUri, (current) =>
-    updateTaskProgressStage(current, capturedNewStage)
+  const transitionResult = await advanceStage(
+    taskFolderUri,
+    task.progress.currentStage,
+    newStage,
+    task.progress.status === "paused",
+    triggerAutoReview
   );
-  if (!patched) {
+
+  if (!transitionResult?.persisted) {
     void vscode.window.showErrorMessage(
-      `Could not read task progress for ${task.folderName}.`
+      `Could not read or update task progress for ${task.folderName}.`
     );
     return;
   }
@@ -248,7 +226,7 @@ export async function setTaskStage(
   // synthetic IncompleteTask for resolveTask to re-read fresh progress from
   // disk. Passing only canonicalId would fall through to the QuickPick
   // because normalizeReviewArg cannot construct a folderUri from a canonicalId.
-  if (shouldAutoReview) {
+  if (transitionResult.shouldAutoReview) {
     await vscode.commands.executeCommand("vs-code-ai-helper.runReviewWithAI", {
       taskFolderPath: task.taskFolderPath,
     });

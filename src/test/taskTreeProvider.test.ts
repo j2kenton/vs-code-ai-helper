@@ -99,6 +99,27 @@ void describe("getStageNodeContextValue", () => {
         `Expected ${result} to contain stage-current or similar`
       );
     });
+
+    void it('should return paused suffix if isPaused is true', () => {
+      assert.strictEqual(
+        getStageNodeContextValue("task-description", "current", true),
+        "stage-task-description-current-paused-modelable"
+      );
+    });
+
+    void it('should return lint-known suffix if hasLintPayload is true on final review stage', () => {
+      assert.strictEqual(
+        getStageNodeContextValue("impl-low-review", "current", false, true),
+        "stage-impl-low-review-current-lint-known-modelable"
+      );
+    });
+
+    void it('should combine paused and lint-known suffixes', () => {
+      assert.strictEqual(
+        getStageNodeContextValue("impl-low-review", "current", true, true),
+        "stage-impl-low-review-current-paused-lint-known-modelable"
+      );
+    });
   });
 
   // Test cases for "done" and "outstanding" statuses

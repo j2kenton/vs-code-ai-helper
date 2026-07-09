@@ -6,8 +6,10 @@ import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { TASK_FILENAME, STAGE_DISPLAY_NAMES } from "../types/taskProgress";
 import { resolveImplementationArtifact } from "../utils/implementationArtifactResolver";
 import { getLowLevelPlanUri } from "../utils/lowLevelPlanArtifactResolver";
-import { IncompleteTask } from "../utils/taskProgressUtils";
+import { IncompleteTask, patchTaskProgress, updateLintPayload } from "../utils/taskProgressUtils";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
+import { advanceStage } from "../utils/stageTransition";
+import { selectNextTask } from "./markTaskDone";
 
 /**
  * Accepted argument shapes for commitAndPushTask.
@@ -641,6 +643,15 @@ export async function commitAndPushTask(
       );
       return;
     }
+    // Backfill lint payload for older completed tasks that have no lint payload yet
+    const taskFolderUri = vscode.Uri.file(resolvedTask.taskFolderPath);
+    await patchTaskProgress(taskFolderUri, (current) =>
+      updateLintPayload(current, {
+        runAt: new Date().toISOString(),
+        passed: true,
+        summary: "Bypassed/Backfilled",
+      })
+    );
   } else if (!lintPayload.passed) {
     const summary = lintPayload.summary ? ` (${lintPayload.summary})` : "";
     const choice = await vscode.window.showWarningMessage(
@@ -979,6 +990,98 @@ export async function commitAndPushTask(
 }
 
 /**
+ * Combined complete + commit + push command.
+ * Marks the task completed, selects the next task, and commits/pushes the completed task.
+ */
+export async function completeCommitAndPushTask(
+  inventory: TaskInventory,
+  explicitArg?: CommitAndPushTaskArg,
+  currentTaskStore?: CurrentTaskStore
+): Promise<void> {
+  const resolverArg = normalizeArg(explicitArg);
+  const resolvedTask = await resolveTaskContext(inventory, resolverArg, {
+    allowPaused: false,
+  }, currentTaskStore);
+
+  if (!resolvedTask) {
+    if (resolverArg) {
+      void vscode.window.showErrorMessage(
+        "The task could not be found. It may have been deleted or moved. " +
+          "Please refresh the Tasks panel and try again."
+      );
+    } else {
+      void vscode.window.showInformationMessage(
+        "No active task found to complete, commit, and push."
+      );
+    }
+    return;
+  }
+
+  // Check stage eligibility: must be at final review stage (impl-low-review) or completed
+  if (resolvedTask.progress.currentStage !== "impl-low-review") {
+    if (resolvedTask.progress.currentStage === "completed") {
+      // If already completed, fall back directly to commit & push
+      return commitAndPushTask(inventory, explicitArg, currentTaskStore);
+    }
+    void vscode.window.showWarningMessage(
+      `"Complete, Commit and Push" is only available when the task is at the final review stage (Implementation: Low-Level Review) or completed.`
+    );
+    return;
+  }
+
+  // Gate on known lint state (only when lint state is known)
+  const lintPayload = resolvedTask.progress.lintPayload;
+  if (!lintPayload) {
+    void vscode.window.showWarningMessage(
+      `Lint state is unknown for "${resolvedTask.folderName}". Run linting fixes first.`
+    );
+    return;
+  }
+
+  // 1. Transition stage to "completed" using the shared advanceStage helper
+  const taskFolderUri = vscode.Uri.file(resolvedTask.taskFolderPath);
+  const transitionResult = await advanceStage(
+    taskFolderUri,
+    resolvedTask.progress.currentStage,
+    "completed",
+    false,
+    false
+  );
+
+  if (!transitionResult?.persisted) {
+    void vscode.window.showErrorMessage(
+      `Could not persist completion for ${resolvedTask.folderName}. Please try again.`
+    );
+    return;
+  }
+
+  // 2. Refresh inventory
+  await inventory.refresh();
+
+  // 3. Select next active task deterministically
+  if (currentTaskStore) {
+    const nextCanonicalId = selectNextTask(inventory, resolvedTask.canonicalId);
+    if (nextCanonicalId) {
+      await currentTaskStore.set(nextCanonicalId);
+    } else {
+      await currentTaskStore.clear();
+    }
+  }
+
+  // 4. Run commit & push
+  const completedTask: IncompleteTask = {
+    folderUri: vscode.Uri.file(resolvedTask.taskFolderPath),
+    folderName: resolvedTask.folderName,
+    progress: {
+      ...resolvedTask.progress,
+      currentStage: "completed", // Since it was just advanced
+    },
+    canonicalId: resolvedTask.canonicalId,
+  };
+  await commitAndPushTask(inventory, { task: completedTask }, currentTaskStore);
+}
+
+/**
  * Register the commitAndPushTask command.
  */
 export function registerCommitAndPushTaskCommand(
@@ -991,5 +1094,10 @@ export function registerCommitAndPushTaskCommand(
     (arg?: CommitAndPushTaskArg) =>
       commitAndPushTask(inventory, arg, currentTaskStore)
   );
-  context.subscriptions.push(disposable);
+  const completeDisposable = vscode.commands.registerCommand(
+    "vs-code-ai-helper.completeCommitAndPushTask",
+    (arg?: CommitAndPushTaskArg) =>
+      completeCommitAndPushTask(inventory, arg, currentTaskStore)
+  );
+  context.subscriptions.push(disposable, completeDisposable);
 }

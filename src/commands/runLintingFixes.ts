@@ -90,9 +90,12 @@ export async function runLintingFixes(
     return;
   }
 
-  if (resolvedTask.progress.currentStage !== "completed") {
+  if (
+    resolvedTask.progress.currentStage !== "completed" &&
+    resolvedTask.progress.currentStage !== "impl-low-review"
+  ) {
     void vscode.window.showWarningMessage(
-      "Linting fixes are only available for completed tasks."
+      "Linting fixes are only available for completed tasks or tasks at the final review stage."
     );
     return;
   }
