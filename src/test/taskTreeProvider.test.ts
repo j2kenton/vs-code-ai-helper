@@ -1,6 +1,6 @@
 import * as assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { getStageNodeContextValue } from "../views/taskTreeProvider";
+import { getStageNodeContextValue, StageNode } from "../views/taskTreeProvider";
 import {
   AI_MODEL_STAGES,
   STAGE_ORDER,
@@ -22,6 +22,23 @@ const mockIsReviewStage = (stage: string): boolean => stage.includes("review");
   stage: TaskStage
 ) => boolean;
 
+/** Minimal IncompleteTask stub for StageNode construction */
+function makeTask(currentStage: TaskStage = "implementation") {
+  // Use the vscode stub's Uri.file
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const vscode = require("vscode") as typeof import("vscode");
+  return {
+    folderUri: vscode.Uri.file("/workspace/tasks/my-task"),
+    folderName: "my-task",
+    progress: {
+      currentStage,
+      status: "active" as const,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    },
+  };
+}
+
 void describe("getStageNodeContextValue", () => {
   const modelableStages: readonly TaskStage[] = AI_MODEL_STAGES;
   const nonModelableStages = STAGE_ORDER.filter(
@@ -30,10 +47,12 @@ void describe("getStageNodeContextValue", () => {
 
   // Test cases for "current" status
   void describe('when status is "current"', () => {
-    void it('should return "stage-task-description" for the "task-description" stage, without a modelable suffix', () => {
+    // task-description IS in AI_MODEL_STAGES, so the context value has
+    // the -modelable suffix appended.
+    void it('should return "stage-task-description-current-modelable" for the "task-description" stage', () => {
       assert.strictEqual(
         getStageNodeContextValue("task-description", "current"),
-        "stage-task-description"
+        "stage-task-description-current-modelable"
       );
     });
 
@@ -94,8 +113,6 @@ void describe("getStageNodeContextValue", () => {
   // Test cases for modelable suffix
   void describe("modelable suffix handling", () => {
     for (const stage of modelableStages) {
-      if (stage === "task-description") { continue; }
-
       void it(`should append "-modelable" for modelable stage "${stage}"`, () => {
         const context = getStageNodeContextValue(stage, "current");
         assert.ok(
@@ -114,6 +131,91 @@ void describe("getStageNodeContextValue", () => {
         );
       });
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// StageNode rendering — done review stage with readiness data
+// ---------------------------------------------------------------------------
+// Regression coverage for the blocking review finding:
+//   A completed ("done") review stage with readiness data MUST render with the
+//   green "check" tick icon, not with the readiness thumbsup/question/thumbsdown
+//   icon. Overwriting the tick with a readiness icon made completed stages
+//   visually ambiguous after a refresh.
+// ---------------------------------------------------------------------------
+
+void describe("StageNode — done review stage icon", () => {
+  void it('renders green "check" tick when status is "done" and readiness data is present', () => {
+    const task = makeTask("implementation"); // current stage is after plan-high-review
+    const readiness = { label: "9/10", icon: "thumbsup", colorKey: "charts.green" };
+    const node = new StageNode(task, "plan-high-review", "done", undefined, readiness);
+
+    // The icon must be "check" regardless of readiness data
+    const icon = node.iconPath as import("vscode").ThemeIcon;
+    assert.strictEqual(
+      icon.id,
+      "check",
+      `Expected icon "check" for done review stage, got "${icon.id}"`
+    );
+    // The color must be the green theme color
+    const color = icon.color as import("vscode").ThemeColor;
+    assert.strictEqual(
+      color.id,
+      "charts.green",
+      `Expected color "charts.green" for done tick, got "${color.id}"`
+    );
+  });
+
+  void it('renders green "check" tick when status is "done" and readiness data is absent', () => {
+    const task = makeTask("implementation");
+    const node = new StageNode(task, "plan-high-review", "done", undefined, undefined);
+
+    const icon = node.iconPath as import("vscode").ThemeIcon;
+    assert.strictEqual(icon.id, "check");
+  });
+
+  void it('renders readiness icon when status is "current" and readiness data is present', () => {
+    const task = makeTask("plan-high-review");
+    const readiness = { label: "9/10", icon: "thumbsup", colorKey: "charts.green" };
+    const node = new StageNode(task, "plan-high-review", "current", undefined, readiness);
+
+    const icon = node.iconPath as import("vscode").ThemeIcon;
+    assert.strictEqual(
+      icon.id,
+      "thumbsup",
+      `Expected readiness icon "thumbsup" for current review stage, got "${icon.id}"`
+    );
+  });
+
+  void it('renders blue arrow when status is "current" and readiness data is absent', () => {
+    const task = makeTask("plan-high-review");
+    const node = new StageNode(task, "plan-high-review", "current", undefined, undefined);
+
+    const icon = node.iconPath as import("vscode").ThemeIcon;
+    assert.strictEqual(icon.id, "arrow-right");
+  });
+
+  void it('has description "done" for a done review stage with readiness', () => {
+    const task = makeTask("implementation");
+    const readiness = { label: "7/10", icon: "question", colorKey: "charts.yellow" };
+    const node = new StageNode(task, "plan-low-review", "done", undefined, readiness);
+
+    assert.strictEqual(
+      node.description,
+      "done",
+      `Expected description "done" for done review stage, got "${node.description}"`
+    );
+  });
+
+  void it('has description including "current" for a current review stage with readiness', () => {
+    const task = makeTask("plan-low-review");
+    const readiness = { label: "4/10", icon: "thumbsdown", colorKey: "charts.red" };
+    const node = new StageNode(task, "plan-low-review", "current", undefined, readiness);
+
+    assert.ok(
+      String(node.description).includes("current"),
+      `Expected description to include "current", got "${node.description}"`
+    );
   });
 });
 

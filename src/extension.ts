@@ -20,12 +20,40 @@ import { registerChatWithStageCommand } from "./commands/chatWithStage";
 import { registerOpenGeneralAssistantCommand } from "./commands/openGeneralAssistant";
 import { registerRunLintingFixesCommand } from "./commands/runLintingFixes";
 import { registerScheduleTaskResumeCommand } from "./commands/scheduleTaskResume";
-import { TaskTreeProvider, TASKS_VIEW_ID } from "./views/taskTreeProvider";
+import { TaskTreeProvider, TASKS_VIEW_ID, TaskNode } from "./views/taskTreeProvider";
 import { TaskStatusBar } from "./views/taskStatusBar";
 import { TaskInventory } from "./state/taskInventory";
 import { CurrentTaskStore } from "./utils/currentTaskStore";
 import { TASK_PROGRESS_FILENAME } from "./types/taskProgress";
 import { warmCliModelCache } from "./utils/modelSelection";
+
+/**
+ * FileDecorationProvider for the synthetic `current-task:` URI scheme.
+ * Renders a blue arrow badge on the current task row in the tree.
+ */
+class CurrentTaskDecorationProvider implements vscode.FileDecorationProvider {
+  private readonly _onDidChangeFileDecorations = new vscode.EventEmitter<
+    vscode.Uri | vscode.Uri[] | undefined
+  >();
+  readonly onDidChangeFileDecorations = this._onDidChangeFileDecorations.event;
+
+  provideFileDecoration(uri: vscode.Uri): vscode.FileDecoration | undefined {
+    if (uri.scheme === "current-task") {
+      return {
+        badge: "▶",
+        color: new vscode.ThemeColor("charts.blue"),
+      };
+    }
+    return undefined;
+  }
+
+  /**
+   * Notify VS Code that decorations for the current-task scheme have changed.
+   */
+  notifyChanged(): void {
+    this._onDidChangeFileDecorations.fire(undefined);
+  }
+}
 
 /**
  * This method is called when your extension is activated.
@@ -40,6 +68,12 @@ export function activate(context: vscode.ExtensionContext): void {
   // Create a single shared CurrentTaskStore backed by workspaceState so the
   // current-task selection survives reloads without being shared globally.
   const currentTaskStore = new CurrentTaskStore(context.workspaceState);
+
+  // Register the current-task decoration provider
+  const decorationProvider = new CurrentTaskDecorationProvider();
+  context.subscriptions.push(
+    vscode.window.registerFileDecorationProvider(decorationProvider)
+  );
 
   // Register commands — pass the shared inventory, currentTaskStore, and
   // context to every command that needs them.
@@ -103,7 +137,8 @@ export function activate(context: vscode.ExtensionContext): void {
 
   const taskStatusBar = new TaskStatusBar();
   const tasksLoadedListener = taskTreeProvider.onDidLoadTasks((tasks) => {
-    taskStatusBar.update(tasks);
+    const currentTaskCanonicalId = currentTaskStore.get();
+    taskStatusBar.update(tasks, currentTaskCanonicalId);
   });
 
   const refreshCommand = vscode.commands.registerCommand(
@@ -137,6 +172,27 @@ export function activate(context: vscode.ExtensionContext): void {
     }
   });
 
+  // Repaint decorations when the current task changes
+  const currentTaskListener = currentTaskStore.onDidChange(() => {
+    decorationProvider.notifyChanged();
+    // Reveal the newly-current task in the tree. We wait for the provider to
+    // finish its next render cycle (triggered by its own onDidChange sub above)
+    // before calling reveal, so the node is guaranteed to exist in the tree.
+    void revealCurrentTask(tasksTreeView, taskTreeProvider, currentTaskStore);
+  });
+
+  // Track tree expand/collapse events so state survives refresh
+  const onExpandListener = tasksTreeView.onDidExpandElement((event) => {
+    if (event.element instanceof TaskNode) {
+      taskTreeProvider.notifyExpanded(event.element.task);
+    }
+  });
+  const onCollapseListener = tasksTreeView.onDidCollapseElement((event) => {
+    if (event.element instanceof TaskNode) {
+      taskTreeProvider.notifyCollapsed(event.element.task);
+    }
+  });
+
   context.subscriptions.push(
     tasksTreeView,
     taskStatusBar,
@@ -145,7 +201,10 @@ export function activate(context: vscode.ExtensionContext): void {
     expandAllCommand,
     collapseAllCommand,
     progressWatcher,
-    configListener
+    configListener,
+    currentTaskListener,
+    onExpandListener,
+    onCollapseListener
   );
 
   // Populate the inventory and status bar immediately (silent — no folder creation)
@@ -154,6 +213,52 @@ export function activate(context: vscode.ExtensionContext): void {
 
   // NOTE: The initial "using plans" popup has been intentionally removed.
   // Discovery is silent; no folder is created until a task is actually made.
+}
+
+/**
+ * Reveal the current task node in the tree view after the provider has
+ * finished re-rendering.
+ *
+ * The provider fires `onDidChangeTreeData` synchronously when the current
+ * task changes. VS Code's tree widget re-renders asynchronously on the next
+ * event-loop turn. We therefore wait for the provider's `onDidLoadTasks`
+ * event — which fires at the end of `loadTasks()`, after new nodes have been
+ * built and cached — before attempting the reveal. This avoids the race
+ * where `getTaskNodesForReveal()` returns the pre-refresh node list.
+ */
+async function revealCurrentTask(
+  treeView: vscode.TreeView<TaskNode | unknown>,
+  provider: TaskTreeProvider,
+  store: CurrentTaskStore
+): Promise<void> {
+  const canonicalId = store.get();
+  if (!canonicalId) {
+    return;
+  }
+
+  // Wait for the provider to complete its next load cycle so the node for
+  // the new current task exists in the rendered node cache.
+  await new Promise<void>((resolve) => {
+    const sub = provider.onDidLoadTasks(() => {
+      sub.dispose();
+      resolve();
+    });
+  });
+
+  const node = provider.getTaskNodeById(canonicalId);
+  if (!node) {
+    return;
+  }
+
+  try {
+    await (treeView as vscode.TreeView<TaskNode>).reveal(node, {
+      expand: true,
+      focus: false,
+      select: false,
+    });
+  } catch {
+    // Reveal can fail if the view is not visible — ignore silently.
+  }
 }
 
 /**

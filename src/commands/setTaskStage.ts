@@ -79,6 +79,11 @@ function normalizeArg(node: SetTaskStageArg | undefined): {
  * When invoked from the tasks tree view, the tree node passes a task/stage
  * pair or canonicalId/taskFolderPath so the task picker is skipped.
  *
+ * After a successful stage change the task is persisted as the current task
+ * in CurrentTaskStore so the keyboard shortcut router and status bar reflect
+ * it immediately — CurrentTaskStore is the single source of truth for all
+ * surfaces (tree, status bar, task actions).
+ *
  * @param triggerAutoReview - when true (Move on to next stage), advancing into
  *   a review stage auto-triggers the corresponding review AI run.
  *   Default: false (manual set-stage-as-current does not auto-trigger review).
@@ -230,6 +235,13 @@ export async function setTaskStage(
   void vscode.window.showInformationMessage(
     `${task.folderName} set to stage: ${STAGE_DISPLAY_NAMES[newStage]}`
   );
+
+  // Persist this task as the current task so the keyboard shortcut router and
+  // status bar reflect the operated-on task immediately — CurrentTaskStore is
+  // the single source of truth for all surfaces (tree, status bar, task
+  // actions). This write mirrors the same write in startNewTask and
+  // resumeTask, completing the "single persisted source of truth" contract.
+  await currentTaskStore.set(task.canonicalId);
 
   // Auto-trigger review after stage is persisted, if eligible.
   // Use taskFolderPath so normalizeReviewArg in reviewActions can construct a

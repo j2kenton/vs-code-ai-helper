@@ -9,12 +9,25 @@ import {
 } from "../types/taskProgress";
 
 /**
- * Represents an incomplete task with its folder URI and progress
+ * Represents an incomplete task with its folder URI and progress.
+ *
+ * `canonicalId` is the normalized absolute path produced by `taskRoot.ts`
+ * (lowercased on Windows). It is the identity key used by `CurrentTaskStore`
+ * and `TaskInventory`. When a `TaskWithProgress` is adapted into this shape
+ * via `toIncompleteTask`, the canonical ID is preserved so that every render
+ * surface (tree nodes, status bar) can match against the stored ID without
+ * relying on `folderUri.fsPath` alone. If absent (e.g. tasks constructed
+ * directly from URIs in legacy paths), `folderUri.fsPath` is used as the
+ * fallback identity.
  */
 export interface IncompleteTask {
   folderUri: vscode.Uri;
   folderName: string;
   progress: TaskProgress;
+  /** Canonical identity key (normalized absolute path). Present when the task
+   *  was sourced from TaskInventory via toIncompleteTask(); may be absent for
+   *  legacy in-memory task objects constructed outside the inventory path. */
+  canonicalId?: string;
 }
 
 /**
@@ -259,6 +272,9 @@ export async function findAllTasks(
             folderUri,
             folderName: name,
             progress,
+            // No canonicalId here — these tasks come from a direct directory
+            // scan rather than through TaskInventory, so no normalized
+            // canonical ID is available. Matching falls back to fsPath.
           });
         }
       }

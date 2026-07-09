@@ -71,7 +71,9 @@ export function resumeTaskArgHasExplicitTask(
 }
 
 /**
- * Resume a paused task (set status back to "active").
+ * Resume a paused task (set status back to "active") and persist it as the
+ * current task in CurrentTaskStore so the keyboard shortcut and status bar
+ * immediately reflect the resumed task.
  *
  * Uses patchTaskProgress to preserve unrelated fields (e.g. implReviewFiles,
  * scheduled metadata, lint results) when writing the updated status.
@@ -118,6 +120,11 @@ export async function resumePausedTask(
     void vscode.window.showErrorMessage("Could not read task progress.");
     return;
   }
+
+  // Persist the resumed task as the current task so the keyboard shortcut
+  // router and status bar reflect it immediately — CurrentTaskStore is the
+  // single source of truth for all surfaces (tree, status bar, task actions).
+  await currentTaskStore.set(resolvedTask.canonicalId);
 
   await inventory.refresh();
   void vscode.window.showInformationMessage(`Task resumed.`);

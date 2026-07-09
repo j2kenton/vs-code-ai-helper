@@ -28,6 +28,18 @@ class Uri {
   }
 
   static parse(value) {
+    // Support non-file URIs by preserving scheme and authority
+    if (!value.startsWith("file://")) {
+      const colonIdx = value.indexOf(":");
+      if (colonIdx !== -1) {
+        const scheme = value.slice(0, colonIdx);
+        const rest = value.slice(colonIdx + 1);
+        const u = new Uri(rest);
+        u.scheme = scheme;
+        u.path = rest;
+        return u;
+      }
+    }
     return new Uri(normalizeFsPath(value.replace(/^file:\/\//, "")));
   }
 
@@ -84,6 +96,32 @@ class EventEmitter {
   dispose() {}
 }
 
+/**
+ * Minimal StatusBarItem stub. Tracks show/hide calls and stores text so tests
+ * can assert on the status bar's visible state without a real VS Code window.
+ */
+class StatusBarItem {
+  constructor() {
+    this.text = undefined;
+    this.tooltip = undefined;
+    this.command = undefined;
+    this.color = undefined;
+    this.visible = false;
+  }
+  show() {
+    this.visible = true;
+  }
+  hide() {
+    this.visible = false;
+  }
+  dispose() {}
+}
+
+const StatusBarAlignment = {
+  Left: 1,
+  Right: 2,
+};
+
 function notImplemented(name) {
   return () => {
     throw new Error(
@@ -111,6 +149,10 @@ const window = {
   showWarningMessage: notImplemented("window.showWarningMessage"),
   showQuickPick: notImplemented("window.showQuickPick"),
   withProgress: notImplemented("window.withProgress"),
+  // createStatusBarItem is needed by TaskStatusBar constructor.
+  // Returns a minimal StatusBarItem stub so TaskStatusBar can be exercised
+  // in unit tests without the real VS Code extension host.
+  createStatusBarItem: (_alignment, _priority) => new StatusBarItem(),
 };
 
 // Minimal commands stub: executeCommand is overridable by individual tests
@@ -132,6 +174,8 @@ const lm = {
 module.exports = {
   Uri,
   FileType,
+  StatusBarAlignment,
+  StatusBarItem,
   TreeItemCollapsibleState,
   TreeItem,
   MarkdownString,

@@ -72,13 +72,34 @@ function buildTaskTooltip(task: IncompleteTask): vscode.MarkdownString {
 }
 
 /**
+ * Return the stable identity key for a task, used as `TreeItem.id` and for
+ * matching against the persisted `CurrentTaskStore` value.
+ *
+ * Prefers the canonicalId when present (normalized absolute path produced by
+ * taskRoot.ts — lowercased on Windows). Falls back to `folderUri.fsPath` for
+ * legacy task objects that were not sourced through TaskInventory.
+ */
+function taskIdentityKey(task: IncompleteTask): string {
+  return task.canonicalId ?? task.folderUri.fsPath;
+}
+
+/**
  * Adapt a TaskWithProgress to the IncompleteTask shape expected by tree nodes.
+ *
+ * Preserves the canonicalId from the inventory so that every render surface
+ * (TreeItem.id, status bar, isCurrent matching, getTaskNodeById) uses the
+ * same normalized identity key that CurrentTaskStore persists. Without this,
+ * a path-case difference on Windows (inventory normalizes to lower-case, but
+ * Uri.file().fsPath preserves the original case) would cause the stored
+ * canonical ID to not match the fsPath used for comparison, making the tree
+ * badge and status bar miss the current task.
  */
 function toIncompleteTask(t: TaskWithProgress): IncompleteTask {
   return {
     folderUri: vscode.Uri.file(t.taskFolderPath),
     folderName: t.folderName,
     progress: t.progress,
+    canonicalId: t.canonicalId,
   };
 }
 
@@ -97,6 +118,13 @@ export class TaskNode extends vscode.TreeItem {
         ? vscode.TreeItemCollapsibleState.Expanded
         : vscode.TreeItemCollapsibleState.Collapsed
     );
+
+    // Stable identity so VS Code can preserve expansion state across
+    // refreshes within the same session. Uses the canonical ID when
+    // available (normalized, lowercased on Windows) so it matches
+    // exactly what CurrentTaskStore persists, falling back to fsPath for
+    // legacy task objects not sourced through TaskInventory.
+    this.id = taskIdentityKey(task);
 
     const currentStage = task.progress.currentStage;
     const stepNumber = STAGE_ORDER.indexOf(currentStage) + 1;
@@ -123,9 +151,14 @@ export class TaskNode extends vscode.TreeItem {
       );
     }
 
-    // Highlight current task
+    // Highlight current task: synthesize a `current-task:` URI so the
+    // FileDecorationProvider in extension.ts can paint the ▶ badge.
+    // The URI authority carries the canonical identity key so the decoration
+    // provider can invalidate it precisely when the current task changes.
     if (isCurrent) {
-      this.resourceUri = vscode.Uri.parse(`current-task:${task.folderName}`);
+      this.resourceUri = vscode.Uri.parse(
+        `current-task:${taskIdentityKey(task)}`
+      );
     }
 
     this.tooltip = buildTaskTooltip(task);
@@ -162,21 +195,21 @@ export class StageNode extends vscode.TreeItem {
 
     switch (status) {
       case "done":
-        if (readiness) {
-          this.iconPath = new vscode.ThemeIcon(
-            readiness.icon,
-            new vscode.ThemeColor(readiness.colorKey)
-          );
-          this.description = `done · ${readiness.label}`;
-        } else {
-          this.iconPath = new vscode.ThemeIcon(
-            "check",
-            new vscode.ThemeColor("charts.green")
-          );
-          this.description = "done";
-        }
+        // Completed stages always render with the done/tick icon, regardless
+        // of whether readiness data is present. Overwriting the tick with a
+        // readiness icon (thumbsup/question/thumbsdown) would make completed
+        // stages visually ambiguous after a refresh — the acceptance criterion
+        // for reliable completed-stage ticks requires the tick to be
+        // unconditional for the "done" state.
+        this.iconPath = new vscode.ThemeIcon(
+          "check",
+          new vscode.ThemeColor("charts.green")
+        );
+        this.description = "done";
         break;
       case "current":
+        // Current review stages show the readiness icon so the user can see
+        // the AI's assessment at a glance without opening the artifact.
         if (readiness) {
           this.iconPath = new vscode.ThemeIcon(
             readiness.icon,
@@ -242,6 +275,7 @@ export function getStageNodeContextValue(
         contextValue = "stage-plan-current";
         break;
       case "implementation":
+        // Merged stage: prefer plan-final.md, fallback to implementation.md
         contextValue = "stage-impl-current";
         break;
       default:
@@ -309,6 +343,8 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
   // Collapse/expand state management
   private mode: ExpansionMode = 'autoFirstActive';
   private lastLoadedTaskCount: number = 0;
+  private readonly explicitlyExpanded = new Set<string>();
+  private readonly explicitlyCollapsed = new Set<string>();
 
   constructor(
     private readonly inventory: TaskInventory,
@@ -335,6 +371,8 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
   /** Collapse all task rows by switching to collapsed mode */
   collapseAll(): void {
     this.mode = 'allCollapsed';
+    this.explicitlyExpanded.clear();
+    this.explicitlyCollapsed.clear();
     this.syncCollapseExpandContext();
     this._onDidChangeTreeData.fire();
   }
@@ -342,6 +380,8 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
   /** Expand all task rows by switching to all-expanded mode */
   async expandAll(treeView: vscode.TreeView<TaskTreeNode>): Promise<void> {
     this.mode = 'allExpanded';
+    this.explicitlyExpanded.clear();
+    this.explicitlyCollapsed.clear();
     this.syncCollapseExpandContext();
     this._onDidChangeTreeData.fire();
 
@@ -358,6 +398,51 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
         // Ignore reveal failures (node may not be visible yet)
       }
     }
+  }
+
+  /**
+   * Called when a task row is explicitly expanded by the user.
+   * Records the choice so it survives refreshes within the same session.
+   */
+  notifyExpanded(task: IncompleteTask): void {
+    const id = taskIdentityKey(task);
+    this.explicitlyExpanded.add(id);
+    this.explicitlyCollapsed.delete(id);
+  }
+
+  /**
+   * Called when a task row is explicitly collapsed by the user.
+   * Records the choice so it survives refreshes within the same session.
+   */
+  notifyCollapsed(task: IncompleteTask): void {
+    const id = taskIdentityKey(task);
+    this.explicitlyCollapsed.add(id);
+    this.explicitlyExpanded.delete(id);
+  }
+
+  /**
+   * Return the cached TaskNode for the given canonical ID, or undefined if the
+   * node is not in the current render. Used by the reveal helper in
+   * extension.ts so it can call `treeView.reveal()` with a live node reference.
+   *
+   * Matching priority:
+   *   1. `task.canonicalId` — exact match against the normalized ID that
+   *      CurrentTaskStore persists. This is the authoritative comparison and
+   *      handles Windows case-normalization differences between the stored
+   *      canonical ID and `folderUri.fsPath`.
+   *   2. `task.folderUri.fsPath` — fallback for legacy nodes that were
+   *      constructed without a canonical ID (e.g. direct URI scan tasks).
+   */
+  getTaskNodeById(canonicalId: string): TaskNode | undefined {
+    for (const node of this.taskNodesByFolder.values()) {
+      if (
+        node.task.canonicalId === canonicalId ||
+        node.task.folderUri.fsPath === canonicalId
+      ) {
+        return node;
+      }
+    }
+    return undefined;
   }
 
   getTreeItem(element: TaskTreeNode): vscode.TreeItem {
@@ -436,26 +521,44 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
       (t) => t.progress.currentStage === "completed"
     );
 
-    const shouldExpand = (index: number): boolean => {
+    const shouldExpand = (task: IncompleteTask, index: number): boolean => {
+      const id = taskIdentityKey(task);
+
+      // Explicit user state takes precedence over mode
+      if (this.explicitlyExpanded.has(id)) {
+        return true;
+      }
+      if (this.explicitlyCollapsed.has(id)) {
+        return false;
+      }
+
+      // Otherwise follow the global mode
       if (this.mode === 'allExpanded') {
         return true;
       }
       if (this.mode === 'allCollapsed') {
         return false;
       }
-      // autoFirstActive mode
+      // autoFirstActive mode: expand only the first active task
       return index === 0 && active.length > 0;
     };
 
-    // Get current task ID
+    // Get current task ID from the store (canonical normalized path).
+    // Compare against task.canonicalId first, falling back to fsPath for
+    // legacy task objects that have no canonicalId.
     const currentTaskCanonicalId = this.currentTaskStore?.get();
 
     const nodes = [...active, ...completed].map(
       (task, index) => {
-        const isCurrent = currentTaskCanonicalId === task.folderUri.fsPath;
-        return new TaskNode(task, shouldExpand(index), isCurrent);
+        const taskId = taskIdentityKey(task);
+        const isCurrent =
+          currentTaskCanonicalId !== undefined &&
+          taskId === currentTaskCanonicalId;
+        return new TaskNode(task, shouldExpand(task, index), isCurrent);
       }
     );
+
+    // Rebuild the folder→node cache so getParent and getTaskNodeById work
     this.taskNodesByFolder.clear();
     for (const node of nodes) {
       this.taskNodesByFolder.set(node.task.folderUri.toString(), node);
@@ -487,9 +590,11 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
         }
       }
 
-      // For review stages, try to parse readiness from the artifact
+      // For review stages, only try to parse readiness when the stage is
+      // current — done stages always render with the tick icon regardless of
+      // readiness data present in the artifact.
       let readiness: { label: string; icon: string; colorKey: string } | undefined;
-      if (isReviewStage(stage) && (status === "done" || status === "current")) {
+      if (isReviewStage(stage) && status === "current") {
         readiness = await tryReadReadiness(artifactUri);
       }
 
