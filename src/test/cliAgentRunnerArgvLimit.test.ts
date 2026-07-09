@@ -38,7 +38,7 @@ void describe("execCliAgent argv prompt limits", () => {
     assert.match(result.errorMessage ?? "", /max 10 bytes/i);
   });
 
-  void it("Antigravity no longer uses argv prompt transport", () => {
+  void it("Antigravity uses stdin transport so large context packs are allowed", () => {
     const provider = getCliProvider("antigravity-cli");
     assert.ok(provider, "expected antigravity-cli provider definition");
     assert.strictEqual(provider.promptTransport, "stdin");

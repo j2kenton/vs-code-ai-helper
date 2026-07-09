@@ -41,10 +41,11 @@ void describe("provider CLI contracts", () => {
     ]);
 
     const textArgs = antigravity.buildArgs("text", undefined, undefined);
-    assert.deepStrictEqual(textArgs, []);
+    assert.deepStrictEqual(textArgs, ["--print"]);
 
     const editArgs = antigravity.buildArgs("edit", "gemini-3-pro", undefined);
     assert.deepStrictEqual(editArgs, [
+      "--print",
       "--dangerously-skip-permissions",
       "--model",
       "gemini-3-pro",

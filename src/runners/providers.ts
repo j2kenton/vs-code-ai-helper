@@ -183,8 +183,10 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     usesLastMessageFile: false,
     promptTransport: "stdin",
     useShell: false,
+    // `agy --print` runs a single non-interactive prompt and reads the
+    // prompt from stdin, which avoids command-line length limits.
     buildArgs(mode, model): string[] {
-      const args: string[] = [];
+      const args: string[] = ["--print"];
       if (mode === "edit") {
         args.push("--dangerously-skip-permissions");
       }
