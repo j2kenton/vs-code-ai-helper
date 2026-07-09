@@ -23,168 +23,208 @@
     "commands": [
       {
         "command": "vs-code-ai-helper.helloWorld",
-        "title": "Ensemble: Hello World"
+        "title": "Hello World",
+        "category": "Ensemble"
       },
       {
         "command": "vs-code-ai-helper.selectMetaFolder",
-        "title": "Ensemble: Select Meta Resources Folder"
+        "title": "Select Meta Resources Folder",
+        "category": "Ensemble"
       },
       {
         "command": "vs-code-ai-helper.startNewTask",
-        "title": "Ensemble: Start New Task",
+        "title": "Start New Task",
+        "category": "Ensemble",
         "icon": "$(add)"
       },
       {
         "command": "vs-code-ai-helper.resumeTask",
         "title": "Resume Task",
+        "category": "Ensemble",
         "icon": "$(debug-continue)"
       },
       {
         "command": "vs-code-ai-helper.pauseTask",
         "title": "Pause Task",
+        "category": "Ensemble",
         "icon": "$(debug-pause)"
       },
       {
         "command": "vs-code-ai-helper.draftTaskWithAI",
         "title": "Draft with AI",
+        "category": "Ensemble",
         "icon": "$(sparkle)"
       },
       {
         "command": "vs-code-ai-helper.generatePlanWithAI",
         "title": "Generate Plan",
+        "category": "Ensemble",
         "icon": "$(sparkle)"
       },
       {
         "command": "vs-code-ai-helper.runReviewWithAI",
-        "title": "Re-review",
+        "title": "Run Review with AI",
+        "category": "Ensemble",
         "icon": "$(refresh)"
       },
       {
         "command": "vs-code-ai-helper.applyReviewWithAI",
         "title": "Apply Review",
+        "category": "Ensemble",
         "icon": "$(wand)"
       },
       {
         "command": "vs-code-ai-helper.nextStage",
         "title": "Mark Stage as Complete",
-        "icon": "$(check)"
+        "category": "Ensemble",
+        "icon": "$(arrow-right)"
       },
       {
         "command": "vs-code-ai-helper.generateImplementationWithAI",
         "title": "Generate Implementation",
+        "category": "Ensemble",
         "icon": "$(tasklist)"
       },
       {
         "command": "vs-code-ai-helper.runImplementationWithAI",
         "title": "Run Implementation",
+        "category": "Ensemble",
         "icon": "$(rocket)"
       },
       {
         "command": "vs-code-ai-helper.configureStepModels",
-        "title": "Configure AI Models",
+        "title": "Configure Workspace Default Models",
+        "category": "Ensemble",
+        "icon": "$(server-environment)"
+      },
+      {
+        "command": "vs-code-ai-helper.configureTaskStepModels",
+        "title": "Configure Models for This Task",
+        "category": "Ensemble",
         "icon": "$(server-environment)"
       },
       {
         "command": "vs-code-ai-helper.setStageModel",
-        "title": "Set Model",
+        "title": "Set Model for This Step",
+        "category": "Ensemble",
         "icon": "$(server-environment)"
       },
       {
         "command": "vs-code-ai-helper.setTaskStage",
         "title": "Jump to Stage",
+        "category": "Ensemble",
         "icon": "$(target)"
       },
       {
         "command": "vs-code-ai-helper.setStageAsCurrent",
         "title": "Set as Current Stage",
+        "category": "Ensemble",
         "icon": "$(target)"
       },
       {
         "command": "vs-code-ai-helper.refreshTasksView",
         "title": "Refresh Tasks",
+        "category": "Ensemble",
         "icon": "$(refresh)"
       },
       {
         "command": "vs-code-ai-helper.applyCurrentStageAction",
-        "title": "Ensemble: Apply Current Stage Action"
+        "title": "Apply Current Stage Action",
+        "category": "Ensemble"
       },
       {
         "command": "vs-code-ai-helper.applyHighLevelReviewChanges",
         "title": "Apply High-Level Review",
+        "category": "Ensemble",
         "icon": "$(wand)"
       },
       {
         "command": "vs-code-ai-helper.applyLowLevelReviewChanges",
         "title": "Apply Low-Level Review",
+        "category": "Ensemble",
         "icon": "$(wand)"
       },
       {
         "command": "vs-code-ai-helper.commitAndPushTask",
         "title": "Commit and Push",
+        "category": "Ensemble",
         "icon": "$(cloud-upload)"
       },
       {
         "command": "vs-code-ai-helper.viewDisclaimer",
-        "title": "Ensemble: View Disclaimer"
+        "title": "View Disclaimer",
+        "category": "Ensemble"
       },
       {
         "command": "vs-code-ai-helper.expandAllTasks",
         "title": "Expand All Tasks",
+        "category": "Ensemble",
         "icon": "$(expand-all)"
       },
       {
         "command": "vs-code-ai-helper.collapseAllTasks",
         "title": "Collapse All Tasks",
+        "category": "Ensemble",
         "icon": "$(collapse-all)"
       },
       {
         "command": "vs-code-ai-helper.toggleMetaResourcesGitIgnore",
         "title": "Toggle Meta Resources in .gitignore",
+        "category": "Ensemble",
         "icon": "$(eye-closed)"
       },
       {
         "command": "vs-code-ai-helper.chatWithStage",
         "title": "Chat with Stage AI",
+        "category": "Ensemble",
         "icon": "$(comment)"
       },
       {
         "command": "vs-code-ai-helper.openGeneralAssistant",
         "title": "Open AI Assistant",
+        "category": "Ensemble",
         "icon": "$(robot)"
       },
       {
         "command": "vs-code-ai-helper.runLintingFixes",
         "title": "Fix Linting Issues",
+        "category": "Ensemble",
         "icon": "$(wand)"
       },
       {
         "command": "vs-code-ai-helper.scheduleTaskResume",
         "title": "Schedule Resume",
+        "category": "Ensemble",
         "icon": "$(clock)"
       },
       {
         "command": "vs-code-ai-helper.viewTask",
         "title": "View Task",
+        "category": "Ensemble",
         "icon": "$(file-text)"
       },
       {
         "command": "vs-code-ai-helper.viewPlan",
         "title": "View Plan",
+        "category": "Ensemble",
         "icon": "$(book)"
       },
       {
         "command": "vs-code-ai-helper.viewReview",
         "title": "View Review",
+        "category": "Ensemble",
         "icon": "$(eye)"
       },
       {
         "command": "vs-code-ai-helper.markTaskDone",
         "title": "Mark Task Done + Select Next",
-        "icon": "$(pass-filled)"
+        "category": "Ensemble",
+        "icon": "$(check)"
       },
       {
         "command": "vs-code-ai-helper.completeCommitAndPushTask",
         "title": "Complete, Commit & Push",
+        "category": "Ensemble",
         "icon": "$(cloud-upload)"
       }
     ],
@@ -291,7 +331,7 @@
           "group": "inline@2"
         },
         {
-          "command": "vs-code-ai-helper.configureStepModels",
+          "command": "vs-code-ai-helper.configureTaskStepModels",
           "when": "view == vs-code-ai-helper.tasksView && (viewItem == task-active || viewItem == task-paused || viewItem == task-completed || viewItem == task-completed-lint-known || viewItem == task-active-review)",
           "group": "task@3"
         },

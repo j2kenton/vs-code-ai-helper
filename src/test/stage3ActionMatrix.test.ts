@@ -95,12 +95,12 @@ void describe("Stage 3 action matrix contracts", () => {
 
   void it("maps impl-low-review current stage row to dedicated context value", () => {
     const providerSource = readWorkspaceFile(
-      path.join("src", "views", "taskTreeProvider.ts")
+      path.join("src", "utils", "contextTokens.ts")
     );
 
     assert.match(
       providerSource,
-      /case\s+"impl-low-review":\s*[\s\S]*contextValue\s*=\s*"stage-impl-low-review-current";/
+      /case\s+"impl-low-review":\s*[\s\S]*tokens\.push\("stage-impl-low-review-current"\);/
     );
   });
 });

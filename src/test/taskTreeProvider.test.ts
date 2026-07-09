@@ -2,6 +2,7 @@ import * as assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import * as vscode from "vscode";
 import { getStageNodeContextValue, StageNode } from "../views/taskTreeProvider";
+import { buildTaskContextValue, buildStageContextValue } from "../utils/contextTokens";
 import {
   AI_MODEL_STAGES,
   STAGE_ORDER,
@@ -15,6 +16,7 @@ import { parseTaskDocument, buildTaskDocument, parseAIResponse } from "../comman
 import * as stageContextModule from "../utils/stageContext";
 import * as taskProgressModule from "../types/taskProgress";
 
+
 const mockComputeStageContext = (stage: TaskStage): string => `stage-${stage}`;
 const mockIsReviewStage = (stage: string): boolean => stage.includes("review");
 
@@ -22,6 +24,9 @@ const mockIsReviewStage = (stage: string): boolean => stage.includes("review");
 (taskProgressModule as Record<string, unknown>).isReviewStage = mockIsReviewStage as (
   stage: TaskStage
 ) => boolean;
+
+// No buildStageContextValue mock here, use the real one.
+
 
 /** Minimal IncompleteTask stub for StageNode construction */
 function makeTask(currentStage: TaskStage = "implementation"): {
@@ -127,7 +132,14 @@ void describe("getStageNodeContextValue", () => {
     for (const status of ["done", "outstanding"] as const) {
       for (const stage of STAGE_ORDER) {
         void it(`should return computed context for stage "${stage}" with status "${status}"`, () => {
-          const expectedBase = mockComputeStageContext(stage);
+          let expectedBase: string;
+          if (stage === "task-description") {
+            expectedBase = "stage-task-description";
+          } else if (stage === "plan") {
+            expectedBase = "stage-plan";
+          } else {
+            expectedBase = "stage";
+          }
           const expected = modelableStages.includes(stage)
             ? `${expectedBase}-modelable`
             : expectedBase;
@@ -546,5 +558,96 @@ void describe("Stage order and STAGE_ORDER", () => {
 
   void it('should contain "completed" as the last stage', () => {
     assert.strictEqual(STAGE_ORDER[STAGE_ORDER.length - 1], "completed");
+  });
+});
+
+void describe("Context Tokens Emission", () => {
+  void it("buildTaskContextValue returns expected lifecycle and feature flags", () => {
+    assert.strictEqual(
+      buildTaskContextValue({ status: "active", currentStage: "plan" }),
+      "task-active"
+    );
+    assert.strictEqual(
+      buildTaskContextValue({ status: "paused", currentStage: "plan" }),
+      "task-paused"
+    );
+    assert.strictEqual(
+      buildTaskContextValue({ status: "active", currentStage: "plan-high-review" }),
+      "task-active-review"
+    );
+    assert.strictEqual(
+      buildTaskContextValue({ status: "active", currentStage: "completed" }),
+      "task-completed"
+    );
+    assert.strictEqual(
+      buildTaskContextValue({ status: "active", currentStage: "completed", hasLintPayload: true }),
+      "task-completed-lint-known"
+    );
+    assert.strictEqual(
+      buildTaskContextValue({ status: "paused", currentStage: "plan", isScheduled: true, hasPendingNote: true, isMetaManaged: true }),
+      "task-paused-scheduled-pending-note-meta-managed"
+    );
+  });
+
+  void it("buildStageContextValue returns expected lifecycle and feature flags", () => {
+    assert.strictEqual(
+      buildStageContextValue({ stage: "plan", status: "current", isPaused: false }),
+      "stage-plan-current-modelable"
+    );
+    assert.strictEqual(
+      buildStageContextValue({ stage: "plan", status: "current", isPaused: true }),
+      "stage-plan-current-paused-modelable"
+    );
+    assert.strictEqual(
+      buildStageContextValue({ stage: "impl-low-review", status: "current", isPaused: true, hasLintPayload: true }),
+      "stage-impl-low-review-current-paused-lint-known-modelable"
+    );
+    assert.strictEqual(
+      buildStageContextValue({ stage: "implementation", status: "done", isPaused: false }),
+      "stage-modelable"
+    );
+    assert.strictEqual(
+      buildStageContextValue({ stage: "completed", status: "outstanding" }),
+      "stage"
+    );
+    assert.strictEqual(
+      buildStageContextValue({ stage: "plan", status: "current", isScheduled: true, hasPendingNote: true, isMetaManaged: true }),
+      "stage-plan-current-scheduled-pending-note-meta-managed-modelable"
+    );
+  });
+});
+
+void describe("Icon selection in StageNode", () => {
+  const mockTask = {
+    folderUri: vscode.Uri.file("/workspace/tasks/t1"),
+    folderName: "t1",
+    progress: {
+      currentStage: "implementation" as const,
+      status: "active" as const,
+      taskFolder: "t1",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    },
+  };
+
+  void it("uses check icon for done status", () => {
+    const node = new StageNode(mockTask, "plan", "done", undefined);
+    assert.strictEqual((node.iconPath as vscode.ThemeIcon).id, "check");
+  });
+
+  void it("uses arrow-right icon for current status when no readiness is set", () => {
+    const node = new StageNode(mockTask, "plan", "current", undefined);
+    assert.strictEqual((node.iconPath as vscode.ThemeIcon).id, "arrow-right");
+  });
+
+  void it("uses readiness icon for current status when readiness is set", () => {
+    const readiness = { label: "Perfect", icon: "thumbsup", colorKey: "charts.green" };
+    const node = new StageNode(mockTask, "plan-high-review", "current", undefined, readiness);
+    assert.strictEqual((node.iconPath as vscode.ThemeIcon).id, "thumbsup");
+  });
+
+  void it("uses circle-large-outline for outstanding status", () => {
+    const node = new StageNode(mockTask, "impl-low-review", "outstanding", undefined);
+    assert.strictEqual((node.iconPath as vscode.ThemeIcon).id, "circle-large-outline");
   });
 });

@@ -4,6 +4,10 @@ import {
   __testOnly,
   getAvailableModels,
   type SelectableModel,
+  describeModel,
+  getModelDisplayName,
+  describeModelSource,
+  describeResolvedModel,
 } from "../utils/modelSelection";
 
 function providerModels(
@@ -436,5 +440,62 @@ void describe("getAvailableModels", () => {
       __testOnly.clearModelSelectionTestOverrides();
       __testOnly.resetCliModelCache();
     }
+  });
+});
+
+void describe("Model Selection Display States", () => {
+  const mockModels: SelectableModel[] = [
+    { id: "gemini-3.5-flash", name: "Gemini 3.5 Flash", providerLabel: "Antigravity" },
+    { id: "claude-sonnet-4.5", name: "Claude Sonnet 4.5", providerLabel: "Kiro" },
+  ];
+
+  void it("describeModel returns correct strings", () => {
+    assert.strictEqual(describeModel(undefined, mockModels), "Automatic (no explicit selection)");
+    assert.strictEqual(describeModel("gemini-3.5-flash", mockModels), "Gemini 3.5 Flash (gemini-3.5-flash)");
+    assert.strictEqual(describeModel("gpt-5", mockModels), "gpt-5 (currently unavailable)");
+  });
+
+  void it("getModelDisplayName returns correct strings", () => {
+    assert.strictEqual(getModelDisplayName(undefined, mockModels), "Automatic");
+    assert.strictEqual(getModelDisplayName("gemini-3.5-flash", mockModels), "Gemini 3.5 Flash");
+    assert.strictEqual(getModelDisplayName("gpt-5", mockModels), "gpt-5");
+  });
+
+  void it("describeModelSource returns correct strings", () => {
+    assert.strictEqual(describeModelSource("task"), "task override");
+    assert.strictEqual(describeModelSource("workspace"), "workspace default");
+    assert.strictEqual(describeModelSource("none"), "automatic selection");
+  });
+
+  void it("describeResolvedModel covers explicit task override", () => {
+    const resolved = { modelId: "gemini-3.5-flash", source: "task" as const };
+    assert.strictEqual(
+      describeResolvedModel(resolved, mockModels),
+      "Gemini 3.5 Flash (gemini-3.5-flash) (explicit task override)"
+    );
+  });
+
+  void it("describeResolvedModel covers inherited workspace default", () => {
+    const resolved = { modelId: "claude-sonnet-4.5", source: "workspace" as const };
+    assert.strictEqual(
+      describeResolvedModel(resolved, mockModels),
+      "Claude Sonnet 4.5 (claude-sonnet-4.5) (inherited workspace default)"
+    );
+  });
+
+  void it("describeResolvedModel covers automatic / no selection", () => {
+    const resolved = { modelId: undefined, source: "none" as const };
+    assert.strictEqual(
+      describeResolvedModel(resolved, mockModels),
+      "Automatic (no explicit selection)"
+    );
+  });
+
+  void it("describeResolvedModel covers unavailable model", () => {
+    const resolved = { modelId: "gpt-5", source: "task" as const };
+    assert.strictEqual(
+      describeResolvedModel(resolved, mockModels),
+      "gpt-5 (currently unavailable) (explicit task override)"
+    );
   });
 });

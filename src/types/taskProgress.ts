@@ -99,6 +99,10 @@ export interface TaskProgress {
    * a lint run or an explicit user bypass.
    */
   lintPayload?: LintPayload;
+  /** ISO timestamp when the task is scheduled to resume */
+  scheduledResumeTime?: string;
+  /** Pending notes by stage */
+  pendingNotes?: Partial<Record<TaskStage, string>>;
 }
 
 /**

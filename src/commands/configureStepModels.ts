@@ -7,7 +7,7 @@ import {
 import { AI_MODEL_STAGES, STAGE_DISPLAY_NAMES, TaskStage } from "../types/taskProgress";
 import { findAllTasks, IncompleteTask } from "../utils/taskProgressUtils";
 import {
-  describeModel,
+  describeResolvedModel,
   getAvailableModels,
   readTaskStageModels,
   SelectableModel,
@@ -174,18 +174,35 @@ export async function collectStageSelection(
 
   const preferredModelId = selectPreferredModel(preselectionOptions);
 
-  const items: ModelPickItem[] = models.map((model) => ({
-    label: model.name,
-    description: model.id,
-    detail: model.providerLabel,
-    modelId: model.id,
-    picked: model.id === preferredModelId,
-  }));
+  const items: ModelPickItem[] = models.map((model) => {
+    let description = model.id;
+    if (taskFolderUri) {
+      if (model.id === currentTaskModelId) {
+        description += " (Active task override)";
+      } else if (model.id === workspaceModelId) {
+        description += " (Workspace default)";
+      }
+    } else {
+      if (model.id === workspaceModelId) {
+        description += " (Active workspace default)";
+      }
+    }
+    return {
+      label: model.name,
+      description,
+      detail: model.providerLabel,
+      modelId: model.id,
+      picked: model.id === preferredModelId,
+    };
+  });
 
   if (taskFolderUri) {
+    const workspaceDefaultStr = workspaceModelId
+      ? (models.find((m) => m.id === workspaceModelId)?.name || workspaceModelId)
+      : "Automatic (no explicit selection)";
     items.unshift({
       label: "Use workspace default",
-      description: "Clear task-specific override for this stage",
+      description: `Inherit workspace default: ${workspaceDefaultStr}`,
       useWorkspaceDefault: true,
       picked: !currentTaskModelId && preferredModelId === undefined,
     });
@@ -198,11 +215,16 @@ export async function collectStageSelection(
     });
   }
 
+  const effectiveModelId = taskFolderUri ? (currentTaskModelId || workspaceModelId) : workspaceModelId;
+  const effectiveSource = taskFolderUri
+    ? (currentTaskModelId ? "task" : (workspaceModelId ? "workspace" : "none"))
+    : (workspaceModelId ? "workspace" : "none");
+  const effectiveResolved = { modelId: effectiveModelId, source: effectiveSource as "task" | "workspace" | "none" };
+  const effectiveStr = describeResolvedModel(effectiveResolved, models);
+
   const selection = await vscode.window.showQuickPick(items, {
     title: `Model for ${STAGE_DISPLAY_NAMES[stage]}`,
-    placeHolder: taskFolderUri
-      ? `Current task setting: ${describeModel(currentTaskModelId, models)}`
-      : "Choose workspace default model",
+    placeHolder: `Effective model: ${effectiveStr}`,
     matchOnDescription: true,
     matchOnDetail: true,
   });
@@ -412,6 +434,12 @@ export function registerConfigureStepModelsCommand(
     (arg?: ConfigureModelArg) => configureStepModels(arg)
   );
   context.subscriptions.push(disposable);
+
+  const taskDisposable = vscode.commands.registerCommand(
+    "vs-code-ai-helper.configureTaskStepModels",
+    (arg?: ConfigureModelArg) => configureStepModels(arg)
+  );
+  context.subscriptions.push(taskDisposable);
 
   const stageDisposable = vscode.commands.registerCommand(
     "vs-code-ai-helper.setStageModel",

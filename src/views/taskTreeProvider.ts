@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import * as path from "path";
 import {
   AI_MODEL_STAGES,
   isReviewStage,
@@ -13,11 +14,18 @@ import {
   computeCollapseExpandContext,
   type ExpansionMode,
 } from "../utils/collapseExpandContext";
-import { computeStageContext } from "../utils/stageContext";
 import { resolveImplementationArtifact } from "../utils/implementationArtifactResolver";
 import { parseReadiness } from "../utils/reviewReadiness";
 import { TaskInventory, TaskWithProgress } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
+import { buildTaskContextValue, buildStageContextValue } from "../utils/contextTokens";
+import {
+  resolveModelForStage,
+  type ResolvedStageModel,
+  type SelectableModel,
+  describeResolvedModel,
+  getAvailableModels,
+} from "../utils/modelSelection";
 
 /**
  * The view ID for the tasks tree view (must match package.json)
@@ -102,15 +110,15 @@ function toIncompleteTask(t: TaskWithProgress): IncompleteTask {
     canonicalId: t.canonicalId,
   };
 }
-
-/**
- * Tree node representing a single task folder
- */
+// ... (skip down to TaskNode)
 export class TaskNode extends vscode.TreeItem {
   constructor(
     public readonly task: IncompleteTask,
     expanded: boolean,
-    isCurrent: boolean = false
+    isCurrent: boolean = false,
+    isScheduled: boolean = false,
+    hasPendingNote: boolean = false,
+    isMetaManaged: boolean = false
   ) {
     super(
       task.folderName,
@@ -162,17 +170,16 @@ export class TaskNode extends vscode.TreeItem {
     }
 
     this.tooltip = buildTaskTooltip(task);
-    // Review-stage tasks surface the review action buttons instead of the
-    // generic resume/set-stage pair.
-    if (currentStage === "completed") {
-      this.contextValue = "task-completed";
-    } else if (isPaused) {
-      this.contextValue = "task-paused";
-    } else if (isReviewStage(currentStage)) {
-      this.contextValue = "task-active-review";
-    } else {
-      this.contextValue = "task-active";
-    }
+    
+    // Centralized context value construction via buildTaskContextValue
+    this.contextValue = buildTaskContextValue({
+      status: isPaused ? "paused" : (task.progress.status || "active"),
+      currentStage,
+      hasLintPayload: task.progress.lintPayload !== undefined,
+      isScheduled,
+      hasPendingNote,
+      isMetaManaged
+    });
   }
 }
 
@@ -186,7 +193,12 @@ export class StageNode extends vscode.TreeItem {
     status: StageStatus,
     artifactUri: vscode.Uri | undefined,
     /** Optional readiness info for review stages */
-    readiness?: { label: string; icon: string; colorKey: string }
+    readiness?: { label: string; icon: string; colorKey: string },
+    modelInfo?: ResolvedStageModel,
+    availableModels?: readonly SelectableModel[]  ,
+    isScheduled: boolean = false,
+    hasPendingNote: boolean = false,
+    isMetaManaged: boolean = false
   ) {
     super(STAGE_DISPLAY_NAMES[stage], vscode.TreeItemCollapsibleState.None);
 
@@ -239,19 +251,27 @@ export class StageNode extends vscode.TreeItem {
         title: "Open Artifact",
         arguments: [artifactUri],
       };
-      this.tooltip = artifactName ? `Open ${artifactName}` : "Open artifact";
-    } else {
-      this.tooltip = artifactName
-        ? `${artifactName} has not been created yet`
-        : STAGE_DISPLAY_NAMES[stage];
     }
+
+    let tooltipStr = artifactName
+      ? (artifactUri ? `Open ${artifactName}` : `${artifactName} has not been created yet`)
+      : STAGE_DISPLAY_NAMES[stage];
+
+    if (modelInfo && availableModels) {
+      const effectiveStr = describeResolvedModel(modelInfo, availableModels);
+      tooltipStr += `\n\nEffective Model: ${effectiveStr}`;
+    }
+    this.tooltip = new vscode.MarkdownString(tooltipStr, true);
 
     // Use the computed stage context for stage-specific buttons
     this.contextValue = getStageNodeContextValue(
       stage,
       status,
       task.progress.status === "paused",
-      task.progress.lintPayload !== undefined
+      task.progress.lintPayload !== undefined,
+      isScheduled,
+      hasPendingNote,
+      isMetaManaged
     );
   }
 }
@@ -268,55 +288,20 @@ export function getStageNodeContextValue(
   stage: TaskStage,
   status: StageStatus,
   isPaused: boolean = false,
-  hasLintPayload: boolean = false
+  hasLintPayload: boolean = false,
+  isScheduled: boolean = false,
+  hasPendingNote: boolean = false,
+  isMetaManaged: boolean = false
 ): string {
-  let contextValue: string;
-
-  if (status === "current") {
-    switch (stage) {
-      case "task-description":
-        // Special case for the "task-description" stage.
-        contextValue = "stage-task-description-current";
-        break;
-      case "plan":
-        contextValue = "stage-plan-current";
-        break;
-      case "implementation":
-        // Merged stage: prefer plan-final.md, fallback to implementation.md
-        contextValue = "stage-impl-current";
-        break;
-      case "impl-low-review":
-        // Final review stage: exposes markTaskDone instead of nextStage
-        contextValue = "stage-impl-low-review-current";
-        break;
-      default:
-        if (isReviewStage(stage)) {
-          contextValue = "stage-review-current";
-        } else {
-          contextValue = "stage-current";
-        }
-    }
-  } else {
-    // For non-current stages, the context is simpler.
-    contextValue = computeStageContext(stage);
-  }
-
-  if (isPaused) {
-    contextValue += "-paused";
-  }
-
-  if (hasLintPayload && stage === "impl-low-review" && status === "current") {
-    contextValue += "-lint-known";
-  }
-
-  // Stages that run an AI model get a "-modelable" suffix so the tree's
-  // per-step "Set Model" hover action can target them via a regex `when`
-  // clause without disturbing the status-specific action buttons above.
-  if (AI_MODEL_STAGES.includes(stage)) {
-    return `${contextValue}-modelable`;
-  }
-
-  return contextValue;
+  return buildStageContextValue({
+    stage,
+    status,
+    isPaused,
+    hasLintPayload,
+    isScheduled,
+    hasPendingNote,
+    isMetaManaged,
+  });
 }
 
 type TaskTreeNode = TaskNode | StageNode;
@@ -364,6 +349,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
   private lastLoadedTaskCount: number = 0;
   private readonly explicitlyExpanded = new Set<string>();
   private readonly explicitlyCollapsed = new Set<string>();
+  private availableModels: SelectableModel[] = [];
 
   constructor(
     private readonly inventory: TaskInventory,
@@ -475,7 +461,52 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
     return this.taskNodesByFolder.get(element.task.folderUri.toString());
   }
 
+  private isMetaManaged: boolean = false;
+
+  private async updateMetaManagedStatus(): Promise<void> {
+    try {
+      const workspaceFolders = vscode.workspace.workspaceFolders;
+      if (!workspaceFolders || workspaceFolders.length === 0) {
+        this.isMetaManaged = false;
+        return;
+      }
+      
+      const metaPath = vscode.workspace.getConfiguration("vs-code-ai-helper").get<string>("metaResourcesPath") || ".helper/plans";
+      if (!metaPath || metaPath.trim() === "" || path.isAbsolute(metaPath)) {
+        this.isMetaManaged = false;
+        return;
+      }
+      
+      const normalized = path.normalize(metaPath);
+      if (normalized.startsWith("..") || normalized.includes(`..${path.sep}`)) {
+        this.isMetaManaged = false;
+        return;
+      }
+      
+      const gitignorePath = normalized.replace(/\\/g, "/");
+      const firstFolder = workspaceFolders[0];
+      if (!firstFolder) {
+        this.isMetaManaged = false;
+        return;
+      }
+      const workspaceRoot = firstFolder.uri.fsPath;
+      const gitignoreUri = vscode.Uri.file(path.join(workspaceRoot, ".gitignore"));
+      
+      const fileContent = await vscode.workspace.fs.readFile(gitignoreUri);
+      const content = new TextDecoder().decode(fileContent);
+      const lines = content.split(/\r?\n/);
+      const metaResourcesEntry = `/${gitignorePath}`;
+      
+      this.isMetaManaged = lines.some((line) => line.trim() === metaResourcesEntry);
+    } catch {
+      this.isMetaManaged = false;
+    }
+  }
+
   async getChildren(element?: TaskTreeNode): Promise<TaskTreeNode[]> {
+    if (!element) {
+      await this.updateMetaManagedStatus();
+    }
     if (element instanceof TaskNode) {
       return this.getStageNodes(element.task);
     }
@@ -573,7 +604,17 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
         const isCurrent =
           currentTaskCanonicalId !== undefined &&
           taskId === currentTaskCanonicalId;
-        return new TaskNode(task, shouldExpand(task, index), isCurrent);
+        const isScheduled = task.progress.scheduledResumeTime !== undefined;
+        const hasPendingNote = task.progress.pendingNotes !== undefined &&
+          Object.keys(task.progress.pendingNotes).length > 0;
+        return new TaskNode(
+          task,
+          shouldExpand(task, index),
+          isCurrent,
+          isScheduled,
+          hasPendingNote,
+          this.isMetaManaged
+        );
       }
     );
 
@@ -588,6 +629,14 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
 
   private async getStageNodes(task: IncompleteTask): Promise<StageNode[]> {
     const nodes: StageNode[] = [];
+
+    if (this.availableModels.length === 0) {
+      try {
+        this.availableModels = await getAvailableModels();
+      } catch {
+        // ignore
+      }
+    }
 
     for (const stage of STAGE_ORDER) {
       const status = getStageStatus(stage, task.progress.currentStage);
@@ -617,7 +666,28 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
         readiness = await tryReadReadiness(artifactUri);
       }
 
-      nodes.push(new StageNode(task, stage, status, artifactUri, readiness));
+      let modelInfo: ResolvedStageModel | undefined;
+      if (AI_MODEL_STAGES.includes(stage)) {
+        modelInfo = await resolveModelForStage(task.folderUri, stage);
+      }
+
+      const isStageScheduled = status === "current" && task.progress.scheduledResumeTime !== undefined;
+      const isStagePendingNote = status === "current" && task.progress.pendingNotes?.[stage] !== undefined;
+
+      nodes.push(
+        new StageNode(
+          task,
+          stage,
+          status,
+          artifactUri,
+          readiness,
+          modelInfo,
+          this.availableModels,
+          isStageScheduled,
+          isStagePendingNote,
+          this.isMetaManaged
+        )
+      );
     }
 
     return nodes;

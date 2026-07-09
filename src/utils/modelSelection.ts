@@ -462,7 +462,7 @@ export function describeModel(
   availableModels: readonly SelectableModel[]
 ): string {
   if (!modelId) {
-    return "Default (prefers auto model)";
+    return "Automatic (no explicit selection)";
   }
 
   const model = availableModels.find((candidate) => candidate.id === modelId);
@@ -471,4 +471,54 @@ export function describeModel(
   }
 
   return `${modelId} (currently unavailable)`;
+}
+
+export function getModelDisplayName(
+  modelId: string | undefined,
+  availableModels: readonly SelectableModel[]
+): string {
+  if (!modelId) {
+    return "Automatic";
+  }
+  const model = availableModels.find((candidate) => candidate.id === modelId);
+  if (model) {
+    return model.name;
+  }
+  return modelId;
+}
+
+export function describeModelSource(
+  source: "task" | "workspace" | "none"
+): string {
+  switch (source) {
+    case "task":
+      return "task override";
+    case "workspace":
+      return "workspace default";
+    case "none":
+      return "automatic selection";
+  }
+}
+
+export function describeResolvedModel(
+  resolved: ResolvedStageModel,
+  availableModels: readonly SelectableModel[]
+): string {
+  const modelId = resolved.modelId;
+  const source = resolved.source;
+
+  let modelName = "Automatic (no explicit selection)";
+  if (modelId) {
+    const found = availableModels.find((m) => m.id === modelId);
+    modelName = found ? `${found.name} (${modelId})` : `${modelId} (currently unavailable)`;
+  }
+
+  switch (source) {
+    case "task":
+      return `${modelName} (explicit task override)`;
+    case "workspace":
+      return `${modelName} (inherited workspace default)`;
+    case "none":
+      return "Automatic (no explicit selection)";
+  }
 }
