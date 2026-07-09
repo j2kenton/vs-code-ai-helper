@@ -174,6 +174,32 @@ function pushSelectableModel(
   target.push(model);
 }
 
+function normalizeCopilotModelName(model: vscode.LanguageModelChat): string {
+  const id = model.id.toLowerCase();
+  const name = model.name;
+  const lowerName = name.toLowerCase();
+
+  if (
+    (lowerName.includes("claude") || id.includes("claude")) &&
+    (lowerName.includes("fable") || id.includes("fable"))
+  ) {
+    return name.includes("(only on Pro+ plan)")
+      ? name
+      : `${name} (only on Pro+ plan)`;
+  }
+
+  if (
+    (lowerName.includes("claude") || id.includes("claude")) &&
+    (lowerName.includes("opus") || id.includes("opus"))
+  ) {
+    return name.includes("(only on Pro+ plan)")
+      ? name
+      : `${name} (only on Pro+ plan)`;
+  }
+
+  return name;
+}
+
 const SEEDED_CLI_MODELS: Readonly<
   Partial<Record<CliProviderId, readonly DiscoveredCliModel[]>>
 > = {
@@ -381,7 +407,7 @@ export async function getAvailableModels(): Promise<SelectableModel[]> {
     for (const model of copilotModels) {
       pushSelectableModel(result, seenIds, {
         id: model.id,
-        name: model.name,
+        name: normalizeCopilotModelName(model),
         providerLabel: "GitHub Copilot",
       });
     }

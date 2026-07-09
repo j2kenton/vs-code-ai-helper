@@ -20,6 +20,56 @@ function antigravityModels(
 }
 
 void describe("getAvailableModels", () => {
+  void it("annotates Copilot Claude Fable and Opus models as Pro+ only", async () => {
+    __testOnly.restoreSeededCliModelCache();
+    __testOnly.setModelSelectionTestOverrides({
+      getAvailableCopilotModels() {
+        return Promise.resolve([
+          {
+            id: "copilot-claude-fable-5",
+            name: "Claude Fable 5",
+          } as SelectableModel as never,
+          {
+            id: "copilot-claude-opus-4.8",
+            name: "Claude Opus 4.8",
+          } as SelectableModel as never,
+          {
+            id: "copilot-gpt-5.5",
+            name: "GPT-5.5",
+          } as SelectableModel as never,
+        ]);
+      },
+      cliCommandExists() {
+        return Promise.resolve(false);
+      },
+    });
+
+    try {
+      const models = await getAvailableModels();
+      assert.deepStrictEqual(models, [
+        {
+          id: "copilot-claude-fable-5",
+          name: "Claude Fable 5 (only on Pro+ plan)",
+          providerLabel: "GitHub Copilot",
+        },
+        {
+          id: "copilot-claude-opus-4.8",
+          name: "Claude Opus 4.8 (only on Pro+ plan)",
+          providerLabel: "GitHub Copilot",
+        },
+        {
+          id: "copilot-gpt-5.5",
+          name: "GPT-5.5",
+          providerLabel: "GitHub Copilot",
+        },
+      ]);
+    } finally {
+      __testOnly.clearModelSelectionTestOverrides();
+      __testOnly.resetCliModelCache();
+      __testOnly.restoreSeededCliModelCache();
+    }
+  });
+
   void it("surfaces seeded CLI models immediately for installed providers", async () => {
     __testOnly.restoreSeededCliModelCache();
     __testOnly.setModelSelectionTestOverrides({
