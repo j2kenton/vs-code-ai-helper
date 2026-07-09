@@ -15,7 +15,10 @@ import { registerPauseTaskCommand } from "./commands/pauseTask";
 import { registerApplyHighLevelReviewChangesCommand } from "./commands/applyHighLevelReviewChanges";
 import { registerApplyLowLevelReviewChangesCommand } from "./commands/applyLowLevelReviewChanges";
 import { registerCommitAndPushTaskCommand } from "./commands/commitAndPushTask";
-import { registerToggleMetaResourcesGitIgnoreCommand } from "./commands/toggleMetaResourcesGitIgnore";
+import {
+  refreshMetaResourcesGitIgnoreContext,
+  registerToggleMetaResourcesGitIgnoreCommand,
+} from "./commands/toggleMetaResourcesGitIgnore";
 import { registerChatWithStageCommand } from "./commands/chatWithStage";
 import { registerOpenGeneralAssistantCommand } from "./commands/openGeneralAssistant";
 import { registerRunLintingFixesCommand } from "./commands/runLintingFixes";
@@ -95,7 +98,7 @@ export function activate(context: vscode.ExtensionContext): void {
   registerApplyHighLevelReviewChangesCommand(context, inventory);
   registerApplyLowLevelReviewChangesCommand(context, inventory);
   registerCommitAndPushTaskCommand(context, inventory, currentTaskStore);
-  registerToggleMetaResourcesGitIgnoreCommand(context);
+  registerToggleMetaResourcesGitIgnoreCommand(context, inventory, currentTaskStore);
   registerChatWithStageCommand(context, inventory);
   registerOpenGeneralAssistantCommand(context);
   registerRunLintingFixesCommand(context, inventory);
@@ -152,6 +155,7 @@ export function activate(context: vscode.ExtensionContext): void {
   const tasksLoadedListener = taskTreeProvider.onDidLoadTasks((tasks) => {
     const currentTaskCanonicalId = currentTaskStore.get();
     taskStatusBar.update(tasks, currentTaskCanonicalId);
+    void refreshMetaResourcesGitIgnoreContext(inventory, currentTaskStore);
   });
 
   const refreshCommand = vscode.commands.registerCommand(
@@ -192,6 +196,7 @@ export function activate(context: vscode.ExtensionContext): void {
   // Repaint decorations when the current task changes
   const currentTaskListener = currentTaskStore.onDidChange(() => {
     decorationProvider.notifyChanged();
+    void refreshMetaResourcesGitIgnoreContext(inventory, currentTaskStore);
     // Reveal the newly-current task in the tree. We wait for the provider to
     // finish its next render cycle (triggered by its own onDidChange sub above)
     // before calling reveal, so the node is guaranteed to exist in the tree.

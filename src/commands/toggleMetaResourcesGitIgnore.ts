@@ -1,209 +1,575 @@
 import * as vscode from "vscode";
 import * as path from "path";
-import { getMetaResourcesPath } from "../config/settings";
+import * as cp from "child_process";
+import { TaskInventory, TaskWithProgress } from "../state/taskInventory";
+import { CurrentTaskStore } from "../utils/currentTaskStore";
+import { getConfiguredTaskRoot } from "../utils/taskRoot";
+import { NotificationRouter } from "../utils/notificationRouter";
 
-/**
- * Validates and normalizes the meta resources path.
- * Returns the normalized safe path if valid, otherwise undefined.
- */
-function validateAndNormalizePath(metaPath: string): string | undefined {
-  if (!metaPath || metaPath.trim() === "") {
-    return undefined;
-  }
+const MANAGED_BEGIN = "# BEGIN Ensemble managed meta resources";
+const MANAGED_END = "# END Ensemble managed meta resources";
+const MANAGED_NOTE = "# Managed by Ensemble. Do not edit this block manually.";
+const LEGACY_COMMENT = "# Ensemble meta resources";
+const LEGACY_TASK_ROOT = "plans";
 
-  if (path.isAbsolute(metaPath)) {
-    return undefined;
-  }
+const META_ELIGIBLE_CONTEXT = "vs-code-ai-helper.metaGitIgnoreEligible";
+const META_HIDDEN_CONTEXT = "vs-code-ai-helper.currentTaskMetaHidden";
 
-  // Normalize and check for path traversal
-  const normalized = path.normalize(metaPath);
-  if (normalized.startsWith("..") || normalized.includes(`..${path.sep}`)) {
-    return undefined;
-  }
+type Eol = "\n" | "\r\n";
 
-  // Reject "." or paths that normalize to workspace root
-  // Handle both "." and variations with trailing separators
-  const withoutTrailingSep = normalized.endsWith(path.sep)
-    ? normalized.slice(0, -path.sep.length)
-    : normalized;
-
-  if (withoutTrailingSep === "." || withoutTrailingSep === "") {
-    return undefined;
-  }
-
-  return normalized;
+interface ManagedBlock {
+  start: number;
+  end: number;
+  lines: string[];
 }
 
-/**
- * Toggle the meta resources folder in .gitignore.
- * Adds or removes the path from .gitignore in the correct workspace root.
- *
- * For multi-root workspaces, this command determines the workspace folder
- * containing the meta resources folder and updates that folder's .gitignore.
- */
-export async function toggleMetaResourcesGitIgnore(): Promise<void> {
-  const workspaceFolders = vscode.workspace.workspaceFolders;
-  if (!workspaceFolders || workspaceFolders.length === 0) {
-    void vscode.window.showErrorMessage("No workspace folder is open.");
-    return;
-  }
-
-  const metaResourcesPath = getMetaResourcesPath();
-
-  // Validate and normalize the path
-  const normalizedPath = validateAndNormalizePath(metaResourcesPath);
-  if (!normalizedPath) {
-    void vscode.window.showErrorMessage(
-      `Cannot add meta resources path to .gitignore: "${metaResourcesPath}" is not a valid relative path. ` +
-      `Please configure a safe relative path in the Ensemble settings.`
-    );
-    return;
-  }
-
-  // Normalize path separators for gitignore (always use /)
-  const gitignorePath = normalizedPath.replace(/\\/g, "/");
-
-  // Find the workspace folder containing the meta resources folder.
-  // For single-root workspaces, this is always workspaceFolders[0].
-  // For multi-root workspaces, check which workspace contains the meta resources folder.
-  let targetWorkspaceFolder: vscode.WorkspaceFolder | undefined = workspaceFolders[0];
-
-  if (workspaceFolders.length > 1) {
-    // Check if meta resources folder exists under any workspace
-    let foundFolder: vscode.WorkspaceFolder | undefined;
-
-    for (const folder of workspaceFolders) {
-      const metaFolderPath = path.join(folder.uri.fsPath, normalizedPath);
-      try {
-        const stat = await vscode.workspace.fs.stat(vscode.Uri.file(metaFolderPath));
-        if (stat.type === vscode.FileType.Directory) {
-          foundFolder = folder;
-          break;
-        }
-      } catch {
-        // Folder doesn't exist in this workspace, continue
-      }
-    }
-
-    if (!foundFolder) {
-      // Meta resources folder doesn't exist yet — ask user which workspace to use
-      const choices = workspaceFolders.map(f => ({
-        label: path.basename(f.uri.fsPath),
-        description: f.uri.fsPath,
-        folder: f
-      }));
-
-      const selected = await vscode.window.showQuickPick(choices, {
-        placeHolder: "Select workspace folder for meta resources .gitignore entry",
-        ignoreFocusOut: false
-      });
-
-      if (!selected) {
-        void vscode.window.showInformationMessage("Toggle cancelled.");
-        return;
-      }
-
-      targetWorkspaceFolder = selected.folder;
-    } else {
-      targetWorkspaceFolder = foundFolder;
-    }
-  }
-
-  if (!targetWorkspaceFolder) {
-    void vscode.window.showErrorMessage("Could not determine target workspace folder.");
-    return;
-  }
-
-  const workspaceRoot = targetWorkspaceFolder.uri.fsPath;
-  const gitignoreFilePath = path.join(workspaceRoot, ".gitignore");
-  const gitignoreUri = vscode.Uri.file(gitignoreFilePath);
-
-  try {
-    // Read existing .gitignore or create empty
-    let content = "";
-    try {
-      const fileContent = await vscode.workspace.fs.readFile(gitignoreUri);
-      content = new TextDecoder().decode(fileContent);
-    } catch {
-      // File doesn't exist, will create new one
-    }
-
-    const lines = content.split(/\r?\n/);
-    const metaResourcesEntry = `/${gitignorePath}`;
-    const commentEntry = `# Ensemble meta resources`;
-
-    // Check if already in gitignore
-    const hasEntry = lines.some((line) => line.trim() === metaResourcesEntry);
-
-    if (hasEntry) {
-      // Find the comment index to determine if we added a blank line
-      const commentIndex = lines.findIndex((line) => line.trim() === commentEntry);
-
-      // Remove our comment and entry lines
-      const newLines = lines.filter(
-        (line) =>
-          line.trim() !== metaResourcesEntry && line.trim() !== commentEntry
-      );
-
-      // Conservative blank line removal: only remove a trailing blank line if:
-      // 1. We found our comment (commentIndex >= 0)
-      // 2. There was a blank line immediately before our comment (commentIndex > 0 && lines[commentIndex - 1] is blank)
-      // 3. Our section (blank + comment + entry) was at the very end of the file
-      // 4. After removal, that blank line is now trailing
-      if (
-        commentIndex >= 0 &&
-        commentIndex > 0 &&
-        lines[commentIndex - 1]?.trim() === "" &&
-        commentIndex + 2 === lines.length &&
-        newLines.length > 0 &&
-        newLines[newLines.length - 1]?.trim() === ""
-      ) {
-        // Our section was exactly: blank line + comment + entry at EOF
-        // Remove the single trailing blank line
-        newLines.pop();
-      }
-
-      const newContent = newLines.join("\n") + (newLines.length > 0 ? "\n" : "");
-      await vscode.workspace.fs.writeFile(
-        gitignoreUri,
-        new TextEncoder().encode(newContent)
-      );
-      void vscode.window.showInformationMessage(
-        `Meta resources folder (${gitignorePath}) is now visible in git.`
-      );
-    } else {
-      // Add to gitignore
-      const newLines = [...lines];
-      if (newLines.length > 0 && newLines[newLines.length - 1]?.trim() !== "") {
-        newLines.push(""); // Add blank line before comment
-      }
-      newLines.push(commentEntry);
-      newLines.push(metaResourcesEntry);
-      const newContent = newLines.join("\n");
-      await vscode.workspace.fs.writeFile(
-        gitignoreUri,
-        new TextEncoder().encode(newContent)
-      );
-      void vscode.window.showInformationMessage(
-        `Meta resources folder (${gitignorePath}) is now hidden from git.`
-      );
-    }
-  } catch (error) {
-    void vscode.window.showErrorMessage(
-      `Failed to update .gitignore: ${error instanceof Error ? error.message : String(error)}`
-    );
-  }
+interface CurrentMetaGitIgnoreTarget {
+  task: TaskWithProgress;
+  repoRoot: string;
+  gitignoreUri: vscode.Uri;
+  patterns: string[];
+  legacyRootPatterns: string[];
 }
 
-/**
- * Register the toggleMetaResourcesGitIgnore command.
- */
-export function registerToggleMetaResourcesGitIgnoreCommand(
-  context: vscode.ExtensionContext
-): void {
-  const disposable = vscode.commands.registerCommand(
-    "vs-code-ai-helper.toggleMetaResourcesGitIgnore",
-    () => toggleMetaResourcesGitIgnore()
+interface ApplyManagedMetaGitIgnoreOptions {
+  legacyRootPatterns?: readonly string[];
+}
+
+let metaVisibilityContextVersion = 0;
+
+function detectEol(content: string): Eol {
+  return content.includes("\r\n") ? "\r\n" : "\n";
+}
+
+function splitLines(content: string): string[] {
+  return content.length === 0 ? [] : content.split(/\r?\n/);
+}
+
+function stripSingleTrailingEmptyLine(lines: string[]): string[] {
+  if (lines.length > 0 && lines[lines.length - 1] === "") {
+    return lines.slice(0, -1);
+  }
+  return lines;
+}
+
+function toGitignorePattern(repoRoot: string, absolutePath: string): string | undefined {
+  const relative = path.relative(repoRoot, absolutePath).replace(/\\/g, "/");
+  if (
+    relative.length === 0 ||
+    relative === ".." ||
+    relative.startsWith("../") ||
+    path.isAbsolute(relative)
+  ) {
+    return undefined;
+  }
+  return `/${relative.replace(/\/+$/, "")}/`;
+}
+
+function resolveConfiguredTaskRootPath(repoRoot: string): string | undefined {
+  const configured = getConfiguredTaskRoot();
+  if (!configured || configured.trim().length === 0) {
+    return undefined;
+  }
+  return path.isAbsolute(configured)
+    ? configured
+    : path.join(repoRoot, configured);
+}
+
+export function buildManagedIgnorePatterns(
+  repoRoot: string,
+  taskFolderPath: string,
+  configuredTaskRootPath: string | undefined
+): string[] {
+  const patterns = new Set<string>();
+  const actual = toGitignorePattern(repoRoot, taskFolderPath);
+  if (actual) {
+    patterns.add(actual);
+  }
+
+  const folderName = path.basename(taskFolderPath);
+  if (configuredTaskRootPath) {
+    const configuredPattern = toGitignorePattern(
+      repoRoot,
+      path.join(configuredTaskRootPath, folderName)
+    );
+    if (configuredPattern) {
+      patterns.add(configuredPattern);
+    }
+  }
+
+  const legacyPattern = toGitignorePattern(
+    repoRoot,
+    path.join(repoRoot, LEGACY_TASK_ROOT, folderName)
   );
-  context.subscriptions.push(disposable);
+  if (legacyPattern) {
+    patterns.add(legacyPattern);
+  }
+
+  return [...patterns].sort();
+}
+
+function toLegacyRootPatternVariants(
+  repoRoot: string,
+  absolutePath: string
+): string[] {
+  const relative = path.relative(repoRoot, absolutePath).replace(/\\/g, "/");
+  if (
+    relative.length === 0 ||
+    relative === ".." ||
+    relative.startsWith("../") ||
+    path.isAbsolute(relative)
+  ) {
+    return [];
+  }
+
+  const withoutTrailingSlash = `/${relative.replace(/\/+$/, "")}`;
+  return [withoutTrailingSlash, `${withoutTrailingSlash}/`];
+}
+
+export function buildLegacyMetaRootIgnorePatterns(
+  repoRoot: string,
+  configuredTaskRootPath: string | undefined
+): string[] {
+  const patterns = new Set<string>();
+  const roots = [
+    configuredTaskRootPath,
+    path.join(repoRoot, LEGACY_TASK_ROOT),
+  ].filter((root): root is string => !!root);
+
+  for (const root of roots) {
+    for (const pattern of toLegacyRootPatternVariants(repoRoot, root)) {
+      patterns.add(pattern);
+    }
+  }
+
+  return [...patterns].sort();
+}
+
+function findManagedBlocks(lines: string[]): ManagedBlock[] {
+  const blocks: ManagedBlock[] = [];
+  let index = 0;
+
+  while (index < lines.length) {
+    if (lines[index]?.trim() !== MANAGED_BEGIN) {
+      index++;
+      continue;
+    }
+
+    const start = index;
+    let end = index + 1;
+    while (end < lines.length && lines[end]?.trim() !== MANAGED_END) {
+      end++;
+    }
+
+    if (end >= lines.length) {
+      index = start + 1;
+      continue;
+    }
+
+    blocks.push({ start, end, lines: lines.slice(start, end + 1) });
+    index = end + 1;
+  }
+
+  return blocks;
+}
+
+function removeManagedBlocksFromLines(lines: string[]): string[] {
+  const output: string[] = [];
+  let index = 0;
+
+  while (index < lines.length) {
+    if (lines[index]?.trim() !== MANAGED_BEGIN) {
+      output.push(lines[index] ?? "");
+      index++;
+      continue;
+    }
+
+    const start = index;
+    let end = index + 1;
+    while (end < lines.length && lines[end]?.trim() !== MANAGED_END) {
+      end++;
+    }
+
+    if (end >= lines.length) {
+      output.push(lines[index] ?? "");
+      index = start + 1;
+      continue;
+    }
+
+    if (output.length > 0 && output[output.length - 1]?.trim() === "") {
+      output.pop();
+    }
+
+    index = end + 1;
+
+    if (
+      index < lines.length &&
+      lines[index]?.trim() === "" &&
+      output.length > 0 &&
+      output[output.length - 1]?.trim() === ""
+    ) {
+      index++;
+    }
+  }
+
+  while (output.length > 0 && output[output.length - 1]?.trim() === "") {
+    output.pop();
+  }
+
+  return output;
+}
+
+function hasLegacyMetaResourcesEntry(
+  lines: readonly string[],
+  legacyRootPatterns: readonly string[]
+): boolean {
+  const legacyPatterns = new Set(legacyRootPatterns.map((line) => line.trim()));
+  if (legacyPatterns.size === 0) {
+    return false;
+  }
+
+  for (let index = 0; index < lines.length - 1; index++) {
+    if (
+      lines[index]?.trim() === LEGACY_COMMENT &&
+      legacyPatterns.has(lines[index + 1]?.trim() ?? "")
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function removeLegacyMetaResourcesEntriesFromLines(
+  lines: string[],
+  legacyRootPatterns: readonly string[]
+): string[] {
+  const legacyPatterns = new Set(legacyRootPatterns.map((line) => line.trim()));
+  if (legacyPatterns.size === 0) {
+    return lines;
+  }
+
+  const output: string[] = [];
+  let index = 0;
+
+  while (index < lines.length) {
+    if (
+      lines[index]?.trim() !== LEGACY_COMMENT ||
+      !legacyPatterns.has(lines[index + 1]?.trim() ?? "")
+    ) {
+      output.push(lines[index] ?? "");
+      index++;
+      continue;
+    }
+
+    if (output.length > 0 && output[output.length - 1]?.trim() === "") {
+      output.pop();
+    }
+
+    index++;
+    while (index < lines.length && legacyPatterns.has(lines[index]?.trim() ?? "")) {
+      index++;
+    }
+  }
+
+  while (output.length > 0 && output[output.length - 1]?.trim() === "") {
+    output.pop();
+  }
+
+  return output;
+}
+
+function renderManagedBlock(patterns: readonly string[]): string[] {
+  return [MANAGED_BEGIN, MANAGED_NOTE, ...patterns, MANAGED_END];
+}
+
+export function applyManagedMetaGitIgnoreBlock(
+  content: string,
+  patterns: readonly string[],
+  hidden: boolean,
+  options: ApplyManagedMetaGitIgnoreOptions = {}
+): string {
+  const eol = detectEol(content);
+  const lines = splitLines(content);
+  const hasManagedBlock =
+    findManagedBlocks(stripSingleTrailingEmptyLine(lines)).length > 0;
+  const hasLegacyBlock = hasLegacyMetaResourcesEntry(
+    lines,
+    options.legacyRootPatterns ?? []
+  );
+
+  if (!hidden && !hasManagedBlock && !hasLegacyBlock) {
+    return content;
+  }
+
+  const withoutLegacy = removeLegacyMetaResourcesEntriesFromLines(
+    lines,
+    options.legacyRootPatterns ?? []
+  );
+  const withoutManaged = removeManagedBlocksFromLines(withoutLegacy);
+
+  if (!hidden) {
+    return withoutManaged.length > 0 ? `${withoutManaged.join(eol)}${eol}` : "";
+  }
+
+  const nextLines = [...withoutManaged];
+  if (nextLines.length > 0) {
+    nextLines.push("");
+  }
+  nextLines.push(...renderManagedBlock(patterns));
+  return `${nextLines.join(eol)}${eol}`;
+}
+
+export function isManagedMetaGitIgnoreHidden(
+  content: string,
+  patterns: readonly string[],
+  options: ApplyManagedMetaGitIgnoreOptions = {}
+): boolean {
+  const required = new Set(patterns);
+  const lines = stripSingleTrailingEmptyLine(splitLines(content));
+  for (const block of findManagedBlocks(lines)) {
+    const blockPatterns = new Set(
+      block.lines
+        .map((line) => line.trim())
+        .filter((line) => line.startsWith("/"))
+    );
+    let hasAll = true;
+    for (const pattern of required) {
+      if (!blockPatterns.has(pattern)) {
+        hasAll = false;
+        break;
+      }
+    }
+    if (hasAll) {
+      return true;
+    }
+  }
+
+  return hasLegacyMetaResourcesEntry(lines, options.legacyRootPatterns ?? []);
+}
+
+async function readTextIfExists(uri: vscode.Uri): Promise<string> {
+  try {
+    return new TextDecoder().decode(await vscode.workspace.fs.readFile(uri));
+  } catch {
+    return "";
+  }
+}
+
+async function resolveGitRepoRoot(cwd: string): Promise<string | undefined> {
+  return new Promise((resolve) => {
+    cp.execFile(
+      "git",
+      ["rev-parse", "--show-toplevel"],
+      { cwd, windowsHide: true },
+      (error, stdout) => {
+        resolve(error ? undefined : stdout.trim());
+      }
+    );
+  });
+}
+
+function getCurrentTask(
+  inventory: TaskInventory,
+  currentTaskStore: CurrentTaskStore
+): TaskWithProgress | undefined {
+  const canonicalId = currentTaskStore.get();
+  if (!canonicalId) {
+    return undefined;
+  }
+  return (
+    inventory.getTaskById(canonicalId) ??
+    inventory.getVisibleTaskForSuppressedId(canonicalId)
+  );
+}
+
+async function resolveTarget(
+  inventory: TaskInventory,
+  currentTaskStore: CurrentTaskStore,
+  showMessages: boolean
+): Promise<CurrentMetaGitIgnoreTarget | undefined> {
+  let task = getCurrentTask(inventory, currentTaskStore);
+  if (!task) {
+    await inventory.refresh();
+    task = getCurrentTask(inventory, currentTaskStore);
+  }
+
+  if (!task) {
+    if (showMessages) {
+      void vscode.window.showWarningMessage(
+        "Select a current task before changing meta-file git visibility."
+      );
+    }
+    return undefined;
+  }
+
+  const repoRoot = await resolveGitRepoRoot(task.taskFolderPath);
+  if (!repoRoot) {
+    if (showMessages) {
+      void vscode.window.showWarningMessage(
+        "Could not find a git repository for the current task."
+      );
+    }
+    return undefined;
+  }
+
+  const configuredTaskRootPath = resolveConfiguredTaskRootPath(repoRoot);
+  const patterns = buildManagedIgnorePatterns(
+    repoRoot,
+    task.taskFolderPath,
+    configuredTaskRootPath
+  );
+  if (patterns.length === 0) {
+    if (showMessages) {
+      void vscode.window.showWarningMessage(
+        "Current task is not inside the git repository."
+      );
+    }
+    return undefined;
+  }
+
+  return {
+    task,
+    repoRoot,
+    gitignoreUri: vscode.Uri.file(path.join(repoRoot, ".gitignore")),
+    patterns,
+    legacyRootPatterns: buildLegacyMetaRootIgnorePatterns(
+      repoRoot,
+      configuredTaskRootPath
+    ),
+  };
+}
+
+async function setMetaVisibilityContexts(
+  eligible: boolean,
+  hidden: boolean,
+  contextVersion: number
+): Promise<void> {
+  if (contextVersion !== metaVisibilityContextVersion) {
+    return;
+  }
+
+  await vscode.commands.executeCommand(
+    "setContext",
+    META_ELIGIBLE_CONTEXT,
+    eligible
+  );
+
+  if (contextVersion !== metaVisibilityContextVersion) {
+    return;
+  }
+
+  await vscode.commands.executeCommand(
+    "setContext",
+    META_HIDDEN_CONTEXT,
+    hidden
+  );
+}
+
+export async function refreshMetaResourcesGitIgnoreContext(
+  inventory: TaskInventory,
+  currentTaskStore: CurrentTaskStore
+): Promise<void> {
+  const contextVersion = ++metaVisibilityContextVersion;
+  const target = await resolveTarget(inventory, currentTaskStore, false);
+  if (!target) {
+    await setMetaVisibilityContexts(false, false, contextVersion);
+    return;
+  }
+
+  const content = await readTextIfExists(target.gitignoreUri);
+  if (contextVersion !== metaVisibilityContextVersion) {
+    return;
+  }
+
+  await setMetaVisibilityContexts(
+    true,
+    isManagedMetaGitIgnoreHidden(content, target.patterns, {
+      legacyRootPatterns: target.legacyRootPatterns,
+    }),
+    contextVersion
+  );
+}
+
+async function setCurrentTaskMetaGitVisibility(
+  inventory: TaskInventory,
+  currentTaskStore: CurrentTaskStore,
+  hidden: boolean
+): Promise<void> {
+  const contextVersion = ++metaVisibilityContextVersion;
+  const target = await resolveTarget(inventory, currentTaskStore, true);
+  if (!target) {
+    await setMetaVisibilityContexts(false, false, contextVersion);
+    return;
+  }
+
+  const current = await readTextIfExists(target.gitignoreUri);
+  const next = applyManagedMetaGitIgnoreBlock(current, target.patterns, hidden, {
+    legacyRootPatterns: target.legacyRootPatterns,
+  });
+
+  await vscode.workspace.fs.writeFile(
+    target.gitignoreUri,
+    new TextEncoder().encode(next)
+  );
+
+  await setMetaVisibilityContexts(true, hidden, contextVersion);
+  NotificationRouter.showInformation(
+    hidden
+      ? `Meta files for ${target.task.folderName} are now hidden from git.`
+      : `Meta files for ${target.task.folderName} are now visible in git.`
+  );
+}
+
+export async function hideMetaResourcesInGitIgnore(
+  inventory: TaskInventory,
+  currentTaskStore: CurrentTaskStore
+): Promise<void> {
+  await setCurrentTaskMetaGitVisibility(inventory, currentTaskStore, true);
+}
+
+export async function showMetaResourcesInGitIgnore(
+  inventory: TaskInventory,
+  currentTaskStore: CurrentTaskStore
+): Promise<void> {
+  await setCurrentTaskMetaGitVisibility(inventory, currentTaskStore, false);
+}
+
+export async function toggleMetaResourcesGitIgnore(
+  inventory: TaskInventory,
+  currentTaskStore: CurrentTaskStore
+): Promise<void> {
+  const target = await resolveTarget(inventory, currentTaskStore, true);
+  if (!target) {
+    const contextVersion = ++metaVisibilityContextVersion;
+    await setMetaVisibilityContexts(false, false, contextVersion);
+    return;
+  }
+
+  const content = await readTextIfExists(target.gitignoreUri);
+  const hidden = isManagedMetaGitIgnoreHidden(content, target.patterns, {
+    legacyRootPatterns: target.legacyRootPatterns,
+  });
+  await setCurrentTaskMetaGitVisibility(inventory, currentTaskStore, !hidden);
+}
+
+export function registerToggleMetaResourcesGitIgnoreCommand(
+  context: vscode.ExtensionContext,
+  inventory: TaskInventory,
+  currentTaskStore: CurrentTaskStore
+): void {
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      "vs-code-ai-helper.hideMetaResourcesInGitIgnore",
+      () => hideMetaResourcesInGitIgnore(inventory, currentTaskStore)
+    ),
+    vscode.commands.registerCommand(
+      "vs-code-ai-helper.showMetaResourcesInGitIgnore",
+      () => showMetaResourcesInGitIgnore(inventory, currentTaskStore)
+    ),
+    vscode.commands.registerCommand(
+      "vs-code-ai-helper.toggleMetaResourcesGitIgnore",
+      () => toggleMetaResourcesGitIgnore(inventory, currentTaskStore)
+    )
+  );
 }
