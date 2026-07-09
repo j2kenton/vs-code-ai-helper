@@ -152,6 +152,28 @@ export interface SelectableModel {
   providerLabel: string;
 }
 
+interface ModelSelectionTestOverrides {
+  getAvailableCopilotModels?: typeof getAvailableCopilotModels;
+  cliCommandExists?: typeof cliCommandExists;
+  getDiscoveredCliModels?: (
+    def: CliProviderDefinition
+  ) => Promise<readonly DiscoveredCliModel[]>;
+}
+
+let modelSelectionTestOverrides: ModelSelectionTestOverrides | undefined;
+
+function pushSelectableModel(
+  target: SelectableModel[],
+  seenIds: Set<string>,
+  model: SelectableModel
+): void {
+  if (seenIds.has(model.id)) {
+    return;
+  }
+  seenIds.add(model.id);
+  target.push(model);
+}
+
 const CLI_MODEL_CACHE_TTL_MS = 60 * 1000;
 const CLI_MODEL_INITIAL_WAIT_MS = 1200;
 const cliModelCache = new Map<
@@ -162,6 +184,10 @@ const cliModelCache = new Map<
     inFlight?: Promise<readonly DiscoveredCliModel[]>;
   }
 >();
+
+function resetCliModelCache(): void {
+  cliModelCache.clear();
+}
 
 function queueCliModelRefresh(
   def: CliProviderDefinition
@@ -262,6 +288,16 @@ async function getDiscoveredCliModels(
   return [];
 }
 
+export const __testOnly = {
+  resetCliModelCache,
+  setModelSelectionTestOverrides(overrides: ModelSelectionTestOverrides): void {
+    modelSelectionTestOverrides = overrides;
+  },
+  clearModelSelectionTestOverrides(): void {
+    modelSelectionTestOverrides = undefined;
+  },
+};
+
 export async function getAvailableCopilotModels(): Promise<
   vscode.LanguageModelChat[]
 > {
@@ -289,11 +325,20 @@ export async function getAvailableCopilotModels(): Promise<
  */
 export async function getAvailableModels(): Promise<SelectableModel[]> {
   const result: SelectableModel[] = [];
+  const seenIds = new Set<string>();
+  const getCopilotModels =
+    modelSelectionTestOverrides?.getAvailableCopilotModels ??
+    getAvailableCopilotModels;
+  const commandExists =
+    modelSelectionTestOverrides?.cliCommandExists ?? cliCommandExists;
+  const discoverCliModels =
+    modelSelectionTestOverrides?.getDiscoveredCliModels ??
+    getDiscoveredCliModels;
 
   try {
-    const copilotModels = await getAvailableCopilotModels();
+    const copilotModels = await getCopilotModels();
     for (const model of copilotModels) {
-      result.push({
+      pushSelectableModel(result, seenIds, {
         id: model.id,
         name: model.name,
         providerLabel: "GitHub Copilot",
@@ -305,7 +350,7 @@ export async function getAvailableModels(): Promise<SelectableModel[]> {
 
   const availability = await Promise.all(
     CLI_PROVIDERS.map((def) =>
-      cliCommandExists(def.command, def.commandAliases)
+      commandExists(def.command, def.commandAliases)
     )
   );
   for (const [index, def] of CLI_PROVIDERS.entries()) {
@@ -314,16 +359,16 @@ export async function getAvailableModels(): Promise<SelectableModel[]> {
     }
 
     for (const choice of def.models) {
-      result.push({
+      pushSelectableModel(result, seenIds, {
         id: toQualifiedModelId(def.id, choice.model),
         name: choice.name,
         providerLabel: `${def.label} (subscription CLI)`,
       });
     }
 
-    const discoveredChoices = await getDiscoveredCliModels(def);
+    const discoveredChoices = await discoverCliModels(def);
     for (const choice of discoveredChoices) {
-      result.push({
+      pushSelectableModel(result, seenIds, {
         id: toQualifiedModelId(def.id, choice.model),
         name: choice.name,
         providerLabel: `${def.label} (subscription CLI)`,
