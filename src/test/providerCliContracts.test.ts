@@ -100,6 +100,22 @@ void describe("provider CLI contracts", () => {
     });
   });
 
+  void it("Claude model variants map to base model plus thinking budget", () => {
+    const claude = getCliProvider("claude-cli");
+    assert.ok(claude, "expected claude-cli provider definition");
+
+    const textArgs = claude.buildArgs("text", "sonnet@high", undefined);
+    assert.deepStrictEqual(textArgs, [
+      "-p",
+      "--output-format",
+      "text",
+      "--model",
+      "sonnet",
+      "--max-thinking-tokens",
+      "8192",
+    ]);
+  });
+
   void it("Kiro hints mention KIRO_API_KEY requirement", () => {
     const kiro = getCliProvider("kiro-cli");
     assert.ok(kiro, "expected kiro-cli provider definition");

@@ -80,6 +80,18 @@ function copilotModel(
   };
 }
 
+function claudeCliReasoningVariants(
+  model: string,
+  label: string,
+  efforts: readonly (readonly [string, string])[]
+): SelectableModel[] {
+  return efforts.map(([effort, effortLabel]) => ({
+    id: `claude-cli:${model}@${effort}`,
+    name: `${label} (${effortLabel})`,
+    providerLabel: "Claude Code (subscription CLI)",
+  }));
+}
+
 void describe("CLI model refresh fallback", () => {
   void it("keeps existing defaults when discovery returns an empty list", () => {
     const current = [
@@ -388,27 +400,56 @@ void describe("getAvailableModels", () => {
         [
           {
             id: "claude-cli:default",
-            name: "Claude (CLI default)",
+            name: "Sonnet 5 (Default, recommended)",
             providerLabel: "Claude Code (subscription CLI)",
           },
           {
             id: "claude-cli:sonnet",
-            name: "Sonnet 4.5",
+            name: "Sonnet 5",
             providerLabel: "Claude Code (subscription CLI)",
           },
-          {
-            id: "claude-cli:haiku",
-            name: "Haiku 4.5",
-            providerLabel: "Claude Code (subscription CLI)",
-          },
-          {
-            id: "claude-cli:opus",
-            name: "Opus 4.1 (only on Max plan)",
-            providerLabel: "Claude Code (subscription CLI)",
-          },
+          ...claudeCliReasoningVariants("sonnet", "Sonnet 5", [
+            ["low", "Low"],
+            ["medium", "Medium"],
+            ["high", "High"],
+            ["xhigh", "Extra High"],
+            ["max", "Max"],
+          ]),
           {
             id: "claude-cli:fable",
             name: "Fable 5 (only on Max plan)",
+            providerLabel: "Claude Code (subscription CLI)",
+          },
+          ...claudeCliReasoningVariants(
+            "fable",
+            "Fable 5 (only on Max plan)",
+            [
+              ["low", "Low"],
+              ["medium", "Medium"],
+              ["high", "High"],
+              ["xhigh", "Extra High"],
+              ["max", "Max"],
+            ]
+          ),
+          {
+            id: "claude-cli:opus",
+            name: "Opus 4.8 (only on Max plan)",
+            providerLabel: "Claude Code (subscription CLI)",
+          },
+          ...claudeCliReasoningVariants(
+            "opus",
+            "Opus 4.8 (only on Max plan)",
+            [
+              ["low", "Low"],
+              ["medium", "Medium"],
+              ["high", "High"],
+              ["xhigh", "Extra High"],
+              ["max", "Max"],
+            ]
+          ),
+          {
+            id: "claude-cli:haiku",
+            name: "Haiku 4.5",
             providerLabel: "Claude Code (subscription CLI)",
           },
         ]

@@ -99,6 +99,17 @@ const COPILOT_REASONING_EFFORTS = new Set([
   "ultra",
 ]);
 
+const CLAUDE_REASONING_EFFORT_TO_MAX_THINKING_TOKENS = new Map<
+  string,
+  number
+>([
+  ["low", 1024],
+  ["medium", 4096],
+  ["high", 8192],
+  ["xhigh", 16384],
+  ["max", 32768],
+]);
+
 export interface ParsedCodexModelSelection {
   model: string | undefined;
   reasoningEffort: string | undefined;
@@ -162,6 +173,36 @@ export function parseCopilotModelSelection(
   };
 }
 
+interface ParsedClaudeCliModelSelection {
+  model: string | undefined;
+  maxThinkingTokens: number | undefined;
+}
+
+function parseClaudeCliModelSelection(
+  model: string | undefined
+): ParsedClaudeCliModelSelection {
+  if (!model) {
+    return { model: undefined, maxThinkingTokens: undefined };
+  }
+
+  const separator = model.lastIndexOf("@");
+  if (separator <= 0) {
+    return { model, maxThinkingTokens: undefined };
+  }
+
+  const reasoningEffort = model.slice(separator + 1);
+  const maxThinkingTokens =
+    CLAUDE_REASONING_EFFORT_TO_MAX_THINKING_TOKENS.get(reasoningEffort);
+  if (maxThinkingTokens === undefined) {
+    return { model, maxThinkingTokens: undefined };
+  }
+
+  return {
+    model: model.slice(0, separator) || undefined,
+    maxThinkingTokens,
+  };
+}
+
 export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
   {
     id: "claude-cli",
@@ -174,17 +215,29 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     authErrorMarkers: ["log in", "login", "authenticate", "api key", "oauth"],
     // Keep the provider-level fallback to CLI default only. Temporary picker
     // options are seeded separately until live loading is fixed.
-    models: [{ model: undefined, name: "Claude (CLI default)" }],
+    models: [
+      {
+        model: undefined,
+        name: "Sonnet 5 (Default, recommended)",
+      },
+    ],
     usesLastMessageFile: false,
     buildArgs(mode, model): string[] {
+      const parsedModel = parseClaudeCliModelSelection(model);
       const args = ["-p", "--output-format", "text"];
       if (mode === "edit") {
         // Allow file edits in the workspace without per-edit prompts;
         // anything beyond edits (e.g. arbitrary shell) stays denied.
         args.push("--permission-mode", "acceptEdits");
       }
-      if (model) {
-        args.push("--model", model);
+      if (parsedModel.model) {
+        args.push("--model", parsedModel.model);
+      }
+      if (parsedModel.maxThinkingTokens !== undefined) {
+        args.push(
+          "--max-thinking-tokens",
+          String(parsedModel.maxThinkingTokens)
+        );
       }
       return args;
     },

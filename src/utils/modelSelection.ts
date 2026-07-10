@@ -341,6 +341,62 @@ function createCodexSpeedVariant(
   };
 }
 
+function createClaudeCliReasoningVariant(
+  model: string,
+  label: string,
+  effort: string,
+  effortLabel: string
+): DiscoveredCliModel {
+  return {
+    model: `${model}@${effort}`,
+    name: `${label} (${effortLabel})`,
+  };
+}
+
+function createSeededClaudeCliModels(): readonly DiscoveredCliModel[] {
+  const createVariants = (
+    model: string,
+    label: string,
+    efforts: readonly (readonly [string, string])[]
+  ): DiscoveredCliModel[] => {
+    const variants: DiscoveredCliModel[] = [];
+    for (const [effort, effortLabel] of efforts) {
+      variants.push(
+        createClaudeCliReasoningVariant(model, label, effort, effortLabel)
+      );
+    }
+    return variants;
+  };
+
+  return [
+    { model: "sonnet", name: "Sonnet 5" },
+    ...createVariants("sonnet", "Sonnet 5", [
+      ["low", "Low"],
+      ["medium", "Medium"],
+      ["high", "High"],
+      ["xhigh", "Extra High"],
+      ["max", "Max"],
+    ]),
+    { model: "fable", name: "Fable 5 (only on Max plan)" },
+    ...createVariants("fable", "Fable 5 (only on Max plan)", [
+      ["low", "Low"],
+      ["medium", "Medium"],
+      ["high", "High"],
+      ["xhigh", "Extra High"],
+      ["max", "Max"],
+    ]),
+    { model: "opus", name: "Opus 4.8 (only on Max plan)" },
+    ...createVariants("opus", "Opus 4.8 (only on Max plan)", [
+      ["low", "Low"],
+      ["medium", "Medium"],
+      ["high", "High"],
+      ["xhigh", "Extra High"],
+      ["max", "Max"],
+    ]),
+    { model: "haiku", name: "Haiku 4.5" },
+  ];
+}
+
 function createSeededCodexModels(): readonly DiscoveredCliModel[] {
   const createVariants = (
     model: string,
@@ -404,10 +460,7 @@ const SEEDED_CLI_MODELS: Readonly<
   Partial<Record<CliProviderId, readonly DiscoveredCliModel[]>>
 > = {
   "claude-cli": [
-    { model: "sonnet", name: "Sonnet 4.5" },
-    { model: "haiku", name: "Haiku 4.5" },
-    { model: "opus", name: "Opus 4.1 (only on Max plan)" },
-    { model: "fable", name: "Fable 5 (only on Max plan)" },
+    ...createSeededClaudeCliModels(),
   ],
   "codex-cli": createSeededCodexModels(),
   "antigravity-cli": [
