@@ -1477,7 +1477,7 @@ void describe("runReviewForFolder impl-review variable sourcing (production code
     const lmObj = (vscode as unknown as { lm?: { selectChatModels?: () => Promise<unknown[]> } }).lm;
     const origSelectChatModels = lmObj?.selectChatModels;
     if (lmObj) {
-      lmObj.selectChatModels = () => Promise.resolve([]);
+      lmObj.selectChatModels = (): Promise<unknown[]> => Promise.resolve([]);
     }
 
     // vscode.workspace.getConfiguration stub (used by settings.ts)
@@ -2101,7 +2101,7 @@ void describe("runReviewForFolder legacy-task fallback (suite 14)", () => {
     const lmObj = (vscode as unknown as { lm?: { selectChatModels?: () => Promise<unknown[]> } }).lm;
     const origSelectChatModels = lmObj?.selectChatModels;
     if (lmObj) {
-      lmObj.selectChatModels = () => Promise.resolve([]);
+      lmObj.selectChatModels = (): Promise<unknown[]> => Promise.resolve([]);
     }
     const origGetConfig = (vscode.workspace as unknown as Record<string, unknown>).getConfiguration;
     (vscode.workspace as unknown as Record<string, unknown>).getConfiguration = (): {

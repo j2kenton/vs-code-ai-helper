@@ -50,7 +50,7 @@ function makeInventoryStub(): import("../state/taskInventory").TaskInventory {
   return {
     getTasks: () => [],
     refresh: async () => {},
-    onDidChange: (_handler: () => void) => ({ dispose() {} }),
+    onDidChange: (_handler: () => void): { dispose: () => void } => ({ dispose(): void {} }),
   } as unknown as import("../state/taskInventory").TaskInventory;
 }
 
@@ -60,7 +60,7 @@ function makeStoreStub(): import("../utils/currentTaskStore").CurrentTaskStore {
     get: () => undefined,
     set: async (_id: string) => {},
     clear: async () => {},
-    onDidChange: { event: (_handler: () => void) => ({ dispose() {} }) },
+    onDidChange: { event: (_handler: () => void): { dispose: () => void } => ({ dispose(): void {} }) },
   } as unknown as import("../utils/currentTaskStore").CurrentTaskStore;
 }
 
@@ -164,7 +164,7 @@ void describe("TaskStatusBar — canonical-ID-aware matching", () => {
       get: () => undefined,
       set: async (_id: string) => {},
       clear: () => { clearCalled = true; },
-      onDidChange: { event: (_handler: () => void) => ({ dispose() {} }) },
+      onDidChange: { event: (_handler: () => void): { dispose: () => void } => ({ dispose(): void {} }) },
     } as unknown as import("../utils/currentTaskStore").CurrentTaskStore;
 
     const bar = new TaskStatusBar(store);
@@ -338,7 +338,7 @@ void describe("TaskTreeProvider — explicit expand/collapse state", () => {
       executeCommand: (...args: unknown[]) => unknown;
     };
     const origExecute = commands.executeCommand;
-    commands.executeCommand = async () => {};
+    commands.executeCommand = async (): Promise<void> => {};
 
     try {
       assert.doesNotThrow(() => provider.collapseAll());
@@ -398,7 +398,7 @@ void describe("resolveTaskContext — clears stale persisted ID", () => {
       get: (): string | undefined => "/workspace/deleted-task",
       set: async (_id: string): Promise<void> => {},
       clear: (): void => { clearCalled = true; },
-      onDidChange: { event: (_handler: () => void) => ({ dispose() {} }) },
+      onDidChange: { event: (_handler: () => void): { dispose: () => void } => ({ dispose(): void {} }) },
     } as unknown as import("../utils/currentTaskStore").CurrentTaskStore;
 
     // Inventory stub with no tasks and a no-op refresh
@@ -407,7 +407,7 @@ void describe("resolveTaskContext — clears stale persisted ID", () => {
       getTaskById: (_id: string) => undefined,
       getVisibleTaskForSuppressedId: (_id: string) => undefined,
       refresh: async (): Promise<void> => {},
-      onDidChange: (_handler: () => void) => ({ dispose() {} }),
+      onDidChange: (_handler: () => void): { dispose: () => void } => ({ dispose(): void {} }),
     } as unknown as import("../state/taskInventory").TaskInventory;
 
     const resolved = await resolveTaskContext(
@@ -438,7 +438,7 @@ void describe("resolveTaskContext — clears stale persisted ID", () => {
       get: (): string | undefined => undefined, // No persisted ID
       set: async (_id: string): Promise<void> => {},
       clear: (): void => { clearCalled = true; },
-      onDidChange: { event: (_handler: () => void) => ({ dispose() {} }) },
+      onDidChange: { event: (_handler: () => void): { dispose: () => void } => ({ dispose(): void {} }) },
     } as unknown as import("../utils/currentTaskStore").CurrentTaskStore;
 
     const inventory = {
@@ -448,7 +448,7 @@ void describe("resolveTaskContext — clears stale persisted ID", () => {
       getVisibleTaskForSuppressedId: (_id: string) => undefined,
       getVisibleTaskForSuppressedPath: (_path: string) => undefined,
       refresh: async (): Promise<void> => {},
-      onDidChange: (_handler: () => void) => ({ dispose() {} }),
+      onDidChange: (_handler: () => void): { dispose: () => void } => ({ dispose(): void {} }),
     } as unknown as import("../state/taskInventory").TaskInventory;
 
     // Pass explicit arg that fails to resolve
