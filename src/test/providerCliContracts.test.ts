@@ -92,6 +92,24 @@ void describe("provider CLI contracts", () => {
       "/tmp/codex-last-message.md",
       "-",
     ]);
+
+    const editArgs = codex.buildArgs(
+      "edit",
+      undefined,
+      undefined,
+      "/workspace/project"
+    );
+    assert.deepStrictEqual(editArgs, [
+      "exec",
+      "--skip-git-repo-check",
+      "--color",
+      "never",
+      "--cd",
+      "/workspace/project",
+      "--sandbox",
+      "workspace-write",
+      "-",
+    ]);
   });
 
   void it("Copilot model variants map to base model plus reasoning config", () => {

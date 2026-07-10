@@ -72,7 +72,8 @@ export interface CliProviderDefinition {
   buildArgs(
     mode: CliRunMode,
     model: string | undefined,
-    lastMessageFile: string | undefined
+    lastMessageFile: string | undefined,
+    cwd?: string
   ): string[];
   /**
    * True when the CLI's stdout is an event stream rather than the final
@@ -257,9 +258,12 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     // directly via "codex-cli:<model>" in settings.
     models: [{ model: undefined, name: "Codex (CLI default)" }],
     usesLastMessageFile: true,
-    buildArgs(mode, model, lastMessageFile): string[] {
+    buildArgs(mode, model, lastMessageFile, cwd): string[] {
       const parsedModel = parseCodexModelSelection(model);
       const args = ["exec", "--skip-git-repo-check", "--color", "never"];
+      if (cwd) {
+        args.push("--cd", cwd);
+      }
       // exec is non-interactive; the sandbox policy is what limits writes.
       args.push("--sandbox", mode === "edit" ? "workspace-write" : "read-only");
       if (parsedModel.model) {

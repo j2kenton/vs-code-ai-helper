@@ -263,7 +263,7 @@ export async function execCliAgent(options: {
 
   const promptTransport = def.promptTransport ?? "stdin";
   const useShell = def.useShell ?? true;
-  const args = def.buildArgs(mode, model, lastMessageFile);
+  const args = def.buildArgs(mode, model, lastMessageFile, cwd);
 
   if (promptTransport === "argv") {
     if (useShell) {
