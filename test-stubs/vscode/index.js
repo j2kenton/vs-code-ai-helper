@@ -93,11 +93,9 @@ class ThemeColor {
 }
 
 class EventEmitter {
-  constructor() {
-    this.event = () => ({ dispose() { } });
-  }
-  fire() { }
-  dispose() { }
+  constructor() { this._listeners = new Set(); this.event = (listener) => { this._listeners.add(listener); return { dispose: () => this._listeners.delete(listener) }; }; }
+  fire(value) { for (const listener of this._listeners) listener(value); }
+  dispose() { this._listeners.clear(); }
 }
 
 class CancellationToken {
@@ -170,7 +168,27 @@ class StatusBarItem {
   hide() {
     this.visible = false;
   }
-  dispose() { }
+  dispose() { this.disposed = true; }
+}
+
+class QuickPick {
+  constructor() { this.items = []; this.selectedItems = []; this.value = ""; this.visible = false; }
+  show() { this.visible = true; }
+  hide() { this.visible = false; }
+  dispose() { this.hide(); }
+}
+
+class InputBox extends QuickPick { }
+
+class FileSystemWatcher {
+  constructor() { this._onDidChange = new EventEmitter(); this._onDidCreate = new EventEmitter(); this._onDidDelete = new EventEmitter(); }
+  get onDidChange() { return this._onDidChange.event; }
+  get onDidCreate() { return this._onDidCreate.event; }
+  get onDidDelete() { return this._onDidDelete.event; }
+  fireChange(uri) { this._onDidChange.fire(uri); }
+  fireCreate(uri) { this._onDidCreate.fire(uri); }
+  fireDelete(uri) { this._onDidDelete.fire(uri); }
+  dispose() { this._onDidChange.dispose(); this._onDidCreate.dispose(); this._onDidDelete.dispose(); }
 }
 
 const StatusBarAlignment = {
@@ -201,33 +219,77 @@ const workspace = {
   },
   asRelativePath: (uri) => (uri && uri.path ? uri.path : String(uri)),
   workspaceFolders: undefined,
+  textDocuments: [],
+  openTextDocument: async (uri) => ({ uri, getText: () => "", isDirty: false }),
+  createFileSystemWatcher: () => new FileSystemWatcher(),
   getConfiguration: () => ({
-    get: (key, defaultValue) => defaultValue,
+    get: (_key, defaultValue) => defaultValue,
     inspect: () => undefined,
   }),
+  onDidChangeConfiguration: (listener) => workspace._configurationChanges.event(listener),
+  _configurationChanges: new EventEmitter(),
 };
 
-// Minimal window stub: show* methods are overridable by individual tests via
-// installMessageCapture(). The defaults throw so any test that forgets to
-// install capture will fail loudly rather than silently swallowing messages.
+class TreeView {
+  constructor(id, options) {
+    Object.assign(this, { id, ...options });
+    this._onDidExpandElement = new EventEmitter();
+    this._onDidCollapseElement = new EventEmitter();
+    this.revealed = [];
+  }
+  get onDidExpandElement() { return this._onDidExpandElement.event; }
+  get onDidCollapseElement() { return this._onDidCollapseElement.event; }
+  reveal(element, options) { this.revealed.push({ element, options }); return Promise.resolve(); }
+  fireExpand(element) { this._onDidExpandElement.fire({ element }); }
+  fireCollapse(element) { this._onDidCollapseElement.fire({ element }); }
+  dispose() { this._onDidExpandElement.dispose(); this._onDidCollapseElement.dispose(); }
+}
+
+// Minimal window stub. Interactive methods use queues so command tests can
+// exercise the real command path without replacing global window methods.
+const quickPickResults = [];
+const inputBoxResults = [];
 const window = {
   showInformationMessage: notImplemented("window.showInformationMessage"),
   showErrorMessage: notImplemented("window.showErrorMessage"),
   showWarningMessage: notImplemented("window.showWarningMessage"),
-  showQuickPick: notImplemented("window.showQuickPick"),
-  showInputBox: notImplemented("window.showInputBox"),
+  showQuickPick: async (_items) => {
+    if (!quickPickResults.length) notImplemented("window.showQuickPick")();
+    return quickPickResults.shift();
+  },
+  showInputBox: async () => {
+    if (!inputBoxResults.length) notImplemented("window.showInputBox")();
+    return inputBoxResults.shift();
+  },
   withProgress: notImplemented("window.withProgress"),
   // createStatusBarItem is needed by TaskStatusBar constructor.
   // Returns a minimal StatusBarItem stub so TaskStatusBar can be exercised
   // in unit tests without the real VS Code extension host.
   createStatusBarItem: (_alignment, _priority) => new StatusBarItem(),
+  createQuickPick: () => new QuickPick(),
+  createInputBox: () => new InputBox(),
+  showTextDocument: async (document) => ({ document, viewColumn: undefined }),
+  createTreeView: (id, options) => new TreeView(id, options),
+  registerFileDecorationProvider: (provider) => ({ provider, dispose() { } }),
 };
+
+window._queueQuickPickResult = (result) => { quickPickResults.push(result); };
+window._queueInputBoxResult = (result) => { inputBoxResults.push(result); };
+window._clearInteractionQueues = () => { quickPickResults.length = 0; inputBoxResults.length = 0; };
 
 // Minimal commands stub: executeCommand is overridable by individual tests
 // via installExecuteCommandStub(). Default throws so forgotten stubs are
 // caught immediately.
 const commands = {
-  executeCommand: notImplemented("commands.executeCommand"),
+  executeCommand: async (id, ...args) => {
+    if (commands._executeCommandOverride) return commands._executeCommandOverride(id, ...args);
+    const handler = commands._handlers.get(id);
+    if (!handler) throw new Error(`vscode test stub: command '${id}' is not registered.`);
+    return handler(...args);
+  },
+  _handlers: new Map(),
+  _executeCommandOverride: undefined,
+  registerCommand: (id, handler) => { commands._handlers.set(id, handler); return { dispose: () => commands._handlers.delete(id) }; },
 };
 
 // Minimal lm stub: selectChatModels is overridable by individual tests via
@@ -245,6 +307,9 @@ module.exports = {
   StatusBarAlignment,
   ProgressLocation,
   StatusBarItem,
+  QuickPick,
+  InputBox,
+  FileSystemWatcher,
   TreeItemCollapsibleState,
   TreeItem,
   MarkdownString,
@@ -257,4 +322,5 @@ module.exports = {
   window,
   commands,
   lm,
+  TreeView,
 };
