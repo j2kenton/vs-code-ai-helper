@@ -63,19 +63,19 @@
       },
       {
         "command": "vs-code-ai-helper.runReviewWithAI",
-        "title": "Run Review with AI",
+        "title": "Review with AI",
         "category": "Ensemble",
         "icon": "$(law)"
       },
       {
         "command": "vs-code-ai-helper.applyReviewWithAI",
-        "title": "Apply Review",
+        "title": "Apply Review with AI",
         "category": "Ensemble",
         "icon": "$(wand)"
       },
       {
         "command": "vs-code-ai-helper.fastForwardReviewWithAI",
-        "title": "Fast Forward Review",
+        "title": "Fast Forward Fixes",
         "category": "Ensemble",
         "icon": "$(run-all)"
       },
@@ -87,7 +87,7 @@
       },
       {
         "command": "vs-code-ai-helper.generateImplementationWithAI",
-        "title": "Draft Implementation Checklist",
+        "title": "Generate Implementation Checklist",
         "category": "Ensemble",
         "icon": "$(tasklist)"
       },
@@ -241,7 +241,7 @@
       },
       {
         "command": "vs-code-ai-helper.completeCommitAndPushTask",
-        "title": "Complete, Commit & Push",
+        "title": "Commit & Push",
         "category": "Ensemble",
         "icon": "$(cloud-upload)"
       },
@@ -252,7 +252,7 @@
       },
       {
         "command": "vs-code-ai-helper.reReviewCurrentTask",
-        "title": "Re-review Current Task",
+        "title": "Review with AI",
         "category": "Ensemble"
       },
       {
