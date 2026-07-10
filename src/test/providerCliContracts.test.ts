@@ -1,4 +1,6 @@
 import * as assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { describe, it } from "node:test";
 import {
   CLI_PROVIDERS,
@@ -133,6 +135,26 @@ void describe("provider CLI contracts", () => {
           `${provider.id} must set useShell=false when promptTransport=argv`
         );
       }
+    }
+  });
+
+  void it("implementation prompts are provider-neutral for CLI agents", () => {
+    for (const fileName of [
+      "run-implementation.md",
+      "apply-impl-review-code.md",
+    ]) {
+      const content = fs.readFileSync(
+        path.join(process.cwd(), "resources", "prompts", fileName),
+        "utf8"
+      );
+
+      assert.match(content, /CLI coding agent/);
+      assert.match(content, /native shell, patch, and file-editing tools/);
+      assert.match(content, /If you cannot write files, report that failure/);
+      assert.doesNotMatch(
+        content,
+        /You have the following tools available:\s*\n\s*-\s*`read_file/
+      );
     }
   });
 });

@@ -1,18 +1,19 @@
 You are addressing an implementation review by making actual changes to the codebase — not by editing a checklist document.
 
-You have the following tools available:
+Use the file inspection and editing capabilities available in your execution environment:
 
-- `read_file(path)` — Read a file's content by workspace-relative path
-- `write_file(path, content)` — Create or overwrite a file with the full content
-- `list_files(path)` — List file and directory names at a workspace-relative path (use `.` for root)
-- `delete_file(path)` — Delete a file or directory (recursively) at a workspace-relative path
+- If your environment exposes `read_file`, `write_file`, `list_files`, and `delete_file`, use those tools.
+- If you are running as a CLI coding agent, use your native shell, patch, and file-editing tools to inspect and modify files directly in the current repository.
+- If a named tool is unavailable, use an equivalent available mechanism. Do not stop or switch to a notes-only answer just because the exact tool name is absent.
 
 Read the implementation notes and the review below, then:
 
-1. Use `list_files` and `read_file` to inspect the current code before touching anything
+1. Inspect the current code before touching anything
 2. Fix every blocking issue the review raised
 3. Address non-blocking suggestions where they are clearly correct and in scope
-4. Use `write_file` with the COMPLETE updated file content, and `delete_file` for anything obsolete
+4. Edit files directly in the workspace, and remove anything obsolete
+
+Before producing the final summary, make sure the workspace files were actually changed. If you cannot write files, report that failure and the reason instead of claiming the implementation is complete.
 
 When you have finished all changes, output a Markdown document that will serve as the new `plan-final.md`:
 

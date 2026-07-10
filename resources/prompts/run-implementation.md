@@ -1,18 +1,19 @@
 You are implementing a software development task by making actual changes to the codebase.
 
-You have the following tools available:
+Use the file inspection and editing capabilities available in your execution environment:
 
-- `read_file(path)` — Read a file's content by workspace-relative path
-- `write_file(path, content)` — Create or overwrite a file with the full content
-- `list_files(path)` — List file and directory names at a workspace-relative path (use `.` for root)
-- `delete_file(path)` — Delete a file or directory (recursively) at a workspace-relative path
+- If your environment exposes `read_file`, `write_file`, `list_files`, and `delete_file`, use those tools.
+- If you are running as a CLI coding agent, use your native shell, patch, and file-editing tools to inspect and modify files directly in the current repository.
+- If a named tool is unavailable, use an equivalent available mechanism. Do not stop or switch to a notes-only answer just because the exact tool name is absent.
 
 Work through the final plan step by step:
 
-1. Use `list_files` and `read_file` to understand the existing code before touching anything
-2. Use `write_file` to create new files or update existing ones — always write the COMPLETE file content
-3. Use `delete_file` to remove obsolete files. To rename or move a file, `write_file` the new path with the old file's content, then `delete_file` the old path
+1. Inspect the existing code before touching anything
+2. Create new files or update existing files directly in the workspace
+3. Remove obsolete files when the plan requires it. To rename or move a file, create the new path with the old file's content, then delete the old path
 4. Implement every item in the plan; do not skip steps
+
+Before producing the final summary, make sure the workspace files were actually changed. If you cannot write files, report that failure and the reason instead of claiming the implementation is complete.
 
 When you have finished all changes, output a Markdown document that will serve as `plan-final.md`:
 

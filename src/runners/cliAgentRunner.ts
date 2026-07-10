@@ -113,7 +113,7 @@ function killProcessTree(child: cp.ChildProcess): void {
   }
 }
 
-interface CliExecResult {
+export interface CliExecResult {
   status: "completed" | "failed" | "cancelled";
   output: string;
   errorMessage?: string;
@@ -213,6 +213,7 @@ export const __testOnly = {
   stripAnsi,
   extractKiroFinalOutput,
   normalizeCliOutput,
+  toCliImplementationRunResult,
 };
 
 /**
@@ -618,6 +619,45 @@ function changedPathsSince(
   return [...paths].sort();
 }
 
+function toCliImplementationRunResult(
+  def: CliProviderDefinition,
+  result: CliExecResult,
+  filesChanged: string[],
+  filesChangedUnknown: boolean
+): ImplementationRunResult {
+  if (result.status === "cancelled") {
+    return { status: "cancelled", filesChanged, filesChangedUnknown };
+  }
+  if (result.status === "failed") {
+    return {
+      status: "failed",
+      filesChanged,
+      filesChangedUnknown,
+      errorMessage: result.errorMessage,
+    };
+  }
+  if (!filesChangedUnknown && filesChanged.length === 0) {
+    const providerOutput = result.output.trim();
+    return {
+      status: "failed",
+      filesChanged,
+      filesChangedUnknown,
+      errorMessage:
+        `${def.label} reported completion but did not modify any workspace files. ` +
+        "The implementation runner requires real file edits; check provider permissions " +
+        "or choose another implementation model." +
+        (providerOutput ? `\n\nProvider output:\n${providerOutput}` : ""),
+    };
+  }
+
+  return {
+    status: "completed",
+    filesChanged,
+    filesChangedUnknown,
+    summary: result.output || undefined,
+  };
+}
+
 /**
  * Run an agentic implementation with a vendor CLI: the CLI edits files in
  * the workspace itself (with edit-level permissions only), and the files it
@@ -659,22 +699,10 @@ export async function runImplementationWithCli(options: {
     ? []
     : changedPathsSince(before, after);
 
-  if (result.status === "cancelled") {
-    return { status: "cancelled", filesChanged, filesChangedUnknown };
-  }
-  if (result.status === "failed") {
-    return {
-      status: "failed",
-      filesChanged,
-      filesChangedUnknown,
-      errorMessage: result.errorMessage,
-    };
-  }
-
-  return {
-    status: "completed",
+  return toCliImplementationRunResult(
+    def,
+    result,
     filesChanged,
-    filesChangedUnknown,
-    summary: result.output || undefined,
-  };
+    filesChangedUnknown
+  );
 }

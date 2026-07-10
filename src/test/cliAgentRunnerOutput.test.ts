@@ -70,4 +70,23 @@ void describe("CLI output normalization", () => {
 
     assert.strictEqual(output, "## Summary Verdict\n\nNeeds changes.");
   });
+
+  void it("fails CLI implementation runs that report completion without file changes", () => {
+    const codex = getCliProvider("codex-cli");
+    assert.ok(codex, "expected codex-cli provider definition");
+
+    const result = __testOnly.toCliImplementationRunResult(
+      codex,
+      {
+        status: "completed",
+        output: "Implemented the requested changes.",
+      },
+      [],
+      false
+    );
+
+    assert.strictEqual(result.status, "failed");
+    assert.match(result.errorMessage ?? "", /did not modify any workspace files/);
+    assert.match(result.errorMessage ?? "", /Provider output:/);
+  });
 });
