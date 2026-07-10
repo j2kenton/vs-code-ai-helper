@@ -234,9 +234,13 @@ void describe("meta gitignore command contributions", () => {
 
     assert.ok(hideEntry, "Expected Hide Current Task Meta Files header action");
     assert.ok(showEntry, "Expected Show Current Task Meta Files header action");
-    assert.match(hideEntry.when ?? "", /metaGitIgnoreEligible/);
+    // Deliberately NOT gated on metaGitIgnoreEligible: this is a persistent
+    // top-level toolbar action (alongside Start New Task, Refresh, etc.) and
+    // must not flicker in/out based on whether a current task happens to be
+    // set. When there's no eligible current task, the command itself shows a
+    // friendly warning (see resolveTarget in toggleMetaResourcesGitIgnore.ts)
+    // instead of the button silently disappearing.
     assert.match(hideEntry.when ?? "", /!vs-code-ai-helper\.currentTaskMetaHidden/);
-    assert.match(showEntry.when ?? "", /metaGitIgnoreEligible/);
     assert.match(showEntry.when ?? "", /vs-code-ai-helper\.currentTaskMetaHidden/);
   });
 });

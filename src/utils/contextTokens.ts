@@ -44,11 +44,14 @@ export function buildTaskContextValue(input: TaskContextInput): string {
 
   const tokens: string[] = [];
 
-  // Lifecycle
-  if (input.currentStage === "completed") {
-    tokens.push("task-completed");
-  } else if (input.status === "paused") {
+  // Lifecycle. Paused is checked before completed so a task parked on the
+  // Publish stage (fixing lint / committing / pushing) can still be
+  // paused/resumed at the task level instead of losing that control the
+  // moment it reaches the final stage.
+  if (input.status === "paused") {
     tokens.push("task-paused");
+  } else if (input.currentStage === "completed") {
+    tokens.push("task-completed");
   } else if (isReviewStage(input.currentStage)) {
     tokens.push("task-active-review");
   } else {
@@ -101,6 +104,9 @@ export function buildStageContextValue(input: StageContextInput): string {
       case "impl-low-review":
         tokens.push("stage-impl-low-review-current");
         break;
+      case "completed":
+        tokens.push("stage-completed-current");
+        break;
       default:
         if (isReviewStage(input.stage)) {
           tokens.push("stage-review-current");
@@ -124,7 +130,11 @@ export function buildStageContextValue(input: StageContextInput): string {
   }
 
   // Lint state
-  if (input.hasLintPayload && input.stage === "impl-low-review" && input.status === "current") {
+  if (
+    input.hasLintPayload &&
+    (input.stage === "impl-low-review" || input.stage === "completed") &&
+    input.status === "current"
+  ) {
     tokens.push("lint-known");
     if (input.lintPassed !== undefined) {
       tokens.push(input.lintPassed ? "lint-passed" : "lint-failed");

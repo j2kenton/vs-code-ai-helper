@@ -114,12 +114,6 @@ export async function pauseTask(
     return;
   }
 
-  // If completed, don't allow pause
-  if (resolvedTask.progress.currentStage === "completed") {
-    NotificationRouter.showInformation("Cannot pause a completed task.");
-    return;
-  }
-
   const taskUri = vscode.Uri.file(resolvedTask.taskFolderPath);
   const patched = await patchTaskProgress(taskUri, (current) =>
     updateTaskStatus(current, "paused")

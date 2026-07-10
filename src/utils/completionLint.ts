@@ -18,7 +18,15 @@ function isInFolder(uri: vscode.Uri, folder: string): boolean {
 
 function runCheck(cwd: string, args: string[]): Promise<{ code: number; output: string }> {
   return new Promise((resolve) => {
-    const child = spawn(process.platform === "win32" ? "pnpm.cmd" : "pnpm", args, { cwd, shell: false });
+    // shell:true on Windows so pnpm.cmd (an npm/pnpm global-install shim, not
+    // a real executable) can be exec'd at all — spawning a .cmd file directly
+    // with shell:false fails with EINVAL. See cliAgentRunner.ts for the same
+    // pattern applied to the CLI provider runners.
+    const child = spawn(
+      process.platform === "win32" ? "pnpm.cmd" : "pnpm",
+      args,
+      { cwd, shell: process.platform === "win32" }
+    );
     let output = "";
     child.stdout?.on("data", (data: Buffer | string) => { output += typeof data === "string" ? data : data.toString("utf8"); });
     child.stderr?.on("data", (data: Buffer | string) => { output += typeof data === "string" ? data : data.toString("utf8"); });

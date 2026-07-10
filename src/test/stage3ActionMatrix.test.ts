@@ -45,7 +45,7 @@ void describe("Stage 3 action matrix contracts", () => {
     );
 
     assert.ok(markTaskDone, "Expected markTaskDone command contribution");
-    assert.equal(markTaskDone.title, "Mark Task Done + Select Next");
+    assert.equal(markTaskDone.title, "Complete and Move On to Next Task");
   });
 
   void it("declares nextStage menu for current task-description stage row", () => {
@@ -64,19 +64,35 @@ void describe("Stage 3 action matrix contracts", () => {
     );
   });
 
-  void it("declares markTaskDone menu for current impl-low-review stage row", () => {
+  void it("declares markTaskDone menu for current Publish (completed) stage row", () => {
     const contributes = readPackageContributes();
     const contextMenus = contributes.menus?.["view/item/context"] ?? [];
 
     const markDoneEntry = contextMenus.find(
       (entry) =>
         entry.command === "vs-code-ai-helper.markTaskDone" &&
-        (entry.when ?? "").includes("viewItem =~ /^stage-impl-low-review-current/")
+        (entry.when ?? "").includes("viewItem =~ /^stage-completed-current/")
     );
 
     assert.ok(
       markDoneEntry,
-      "Expected markTaskDone menu entry for stage-impl-low-review-current"
+      "Expected markTaskDone menu entry for stage-completed-current"
+    );
+  });
+
+  void it("declares nextStage menu for current impl-low-review stage row", () => {
+    const contributes = readPackageContributes();
+    const contextMenus = contributes.menus?.["view/item/context"] ?? [];
+
+    const nextStageEntry = contextMenus.find(
+      (entry) =>
+        entry.command === "vs-code-ai-helper.nextStage" &&
+        (entry.when ?? "").includes("viewItem =~ /^stage-impl-low-review-current/")
+    );
+
+    assert.ok(
+      nextStageEntry,
+      "Expected nextStage menu entry for stage-impl-low-review-current"
     );
   });
 
@@ -101,6 +117,17 @@ void describe("Stage 3 action matrix contracts", () => {
     assert.match(
       providerSource,
       /case\s+"impl-low-review":\s*[\s\S]*tokens\.push\("stage-impl-low-review-current"\);/
+    );
+  });
+
+  void it("maps completed (Publish) current stage row to dedicated context value", () => {
+    const providerSource = readWorkspaceFile(
+      path.join("src", "utils", "contextTokens.ts")
+    );
+
+    assert.match(
+      providerSource,
+      /case\s+"completed":\s*[\s\S]*tokens\.push\("stage-completed-current"\);/
     );
   });
 });

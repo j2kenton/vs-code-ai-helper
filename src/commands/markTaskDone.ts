@@ -2,8 +2,7 @@ import * as vscode from "vscode";
 import { TaskInventory, TaskWithProgress } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
-import { advanceStage } from "../utils/stageTransition";
-import { STAGE_DISPLAY_NAMES, STAGE_ORDER } from "../types/taskProgress";
+import { STAGE_DISPLAY_NAMES } from "../types/taskProgress";
 import { IncompleteTask } from "../utils/taskProgressUtils";
 import { runCompletionLint } from "../utils/completionLint";
 
@@ -39,14 +38,17 @@ function normalizeArg(node: MarkTaskDoneArg | undefined): {
 }
 
 /**
- * Whether a task is lifecycle-eligible for the "Mark Done" command.
+ * Whether a task is lifecycle-eligible for the "Complete and Move On to Next
+ * Task" command.
  *
  * A task is eligible only when:
  *   - It is not paused, AND
- *   - Its current stage is the last non-completed stage (impl-low-review).
+ *   - It has already reached the Publish stage ("completed").
  *
- * This prevents the command from appearing on tasks that still have pending
- * review or implementation stages.
+ * Reaching Publish (via `nextStage` from impl-low-review) does not itself
+ * select the next task — that only happens once this command runs, so the
+ * user gets a chance to fix lint issues / commit / push on the Publish row
+ * first.
  */
 export function isMarkTaskDoneEligible(
   progress: TaskWithProgress["progress"]
@@ -54,8 +56,7 @@ export function isMarkTaskDoneEligible(
   if (progress.status === "paused") {
     return false;
   }
-  const lastNonCompleted = STAGE_ORDER[STAGE_ORDER.length - 2]; // "impl-low-review"
-  return progress.currentStage === lastNonCompleted;
+  return progress.currentStage === "completed";
 }
 
 /**
@@ -82,19 +83,22 @@ export function selectNextTask(
 }
 
 /**
- * Mark the current task as Done and then deterministically select the next
- * active task.
+ * Complete a task that has already reached the Publish stage and
+ * deterministically select the next active task.
  *
- * This is a dedicated completion command, separate from `nextStage`. It only
- * acts on tasks at `impl-low-review` (the last non-completed stage), refusing
- * to act on tasks that still have work remaining.
+ * This is a dedicated completion command, separate from `nextStage`. The
+ * transition into Publish ("completed") happens earlier, via the normal
+ * `nextStage` advance from impl-low-review — reaching Publish does not by
+ * itself select the next task, so the user gets a chance to fix lint issues,
+ * commit, and push on the Publish row first. This command only performs the
+ * final "move on" step.
  *
- * Completion lifecycle ordering (strict):
- *   1. Persist completion via advanceStage → patchTaskProgress.
- *   2. Refresh inventory so the completed task's new stage is reflected.
+ * Ordering (strict):
+ *   1. Re-run completion lint for a fresh read (picks up any fixes made
+ *      while on the Publish row).
+ *   2. Refresh inventory.
  *   3. Select the next active task in CurrentTaskStore.
  *   4. Show completion info message.
- *   5. (Lint payload is persisted separately by runLintingFixes; not here.)
  */
 export async function markTaskDone(
   inventory: TaskInventory,
@@ -131,39 +135,19 @@ export async function markTaskDone(
     const currentStageName =
       STAGE_DISPLAY_NAMES[resolvedTask.progress.currentStage];
     void vscode.window.showWarningMessage(
-      `"Mark Task Done" is only available when the task is at the final ` +
-        `review stage (${STAGE_DISPLAY_NAMES["impl-low-review"]}). ` +
+      `"Complete and Move On to Next Task" is only available once the task ` +
+        `has reached ${STAGE_DISPLAY_NAMES["completed"]}. ` +
         `Current stage: ${currentStageName}.`
     );
     return;
   }
 
-  // ── Step 1: Persist completion ───────────────────────────────────────────
+  // ── Step 1: Re-run completion lint for a fresh, final read ───────────────
   const taskFolderUri = vscode.Uri.file(resolvedTask.taskFolderPath);
-  const transitionResult = await advanceStage(
-    taskFolderUri,
-    resolvedTask.progress.currentStage,
-    "completed",
-    false, // not paused — eligibility check above ensures this
-    false  // no auto-review on completion
-  );
-
-  if (!transitionResult?.persisted) {
-    void vscode.window.showErrorMessage(
-      `Could not persist completion for ${resolvedTask.folderName}. Please try again.`
-    );
-    return;
-  }
-
-  // ── Step 2: Refresh inventory ────────────────────────────────────────────
-  await inventory.refresh();
-
-  // Completion lint is part of the transition, so completed tasks never
-  // silently remain in an unknown lint state.
   const lintResult = await runCompletionLint(taskFolderUri);
   await inventory.refresh();
 
-  // ── Step 3: Select next active task deterministically ────────────────────
+  // ── Step 2: Select next active task deterministically ────────────────────
   const nextCanonicalId = selectNextTask(inventory, resolvedTask.canonicalId);
   if (nextCanonicalId) {
     await currentTaskStore.set(nextCanonicalId);
@@ -171,11 +155,11 @@ export async function markTaskDone(
     await currentTaskStore.clear();
   }
 
-  // ── Step 4: Show completion message ──────────────────────────────────────
+  // ── Step 3: Show completion message ──────────────────────────────────────
   void vscode.window.showInformationMessage(
     nextCanonicalId
-      ? `${resolvedTask.folderName} marked as done (${lintResult.passed ? "lint passed" : "lint issues found"}). Next task selected.`
-      : `${resolvedTask.folderName} marked as done (${lintResult.passed ? "lint passed" : "lint issues found"}). No remaining active tasks.`
+      ? `${resolvedTask.folderName} complete (${lintResult.passed ? "lint passed" : "lint issues found"}). Next task selected.`
+      : `${resolvedTask.folderName} complete (${lintResult.passed ? "lint passed" : "lint issues found"}). No remaining active tasks.`
   );
 }
 

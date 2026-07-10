@@ -41,7 +41,7 @@ function getStageStatus(stage: TaskStage, currentStage: TaskStage): StageStatus 
   const stageIndex = STAGE_ORDER.indexOf(stage);
   const currentIndex = STAGE_ORDER.indexOf(currentStage);
 
-  if (currentStage === "completed" || stageIndex < currentIndex) {
+  if (stageIndex < currentIndex) {
     return "done";
   }
   if (stageIndex === currentIndex) {
@@ -139,17 +139,17 @@ export class TaskNode extends vscode.TreeItem {
     const totalSteps = STAGE_ORDER.length;
     const isPaused = task.progress.status === "paused";
 
-    if (currentStage === "completed") {
-      this.description = "Completed";
-      this.iconPath = new vscode.ThemeIcon(
-        "pass-filled",
-        new vscode.ThemeColor("charts.green")
-      );
-    } else if (isPaused) {
+    if (isPaused) {
       this.description = `Paused · ${STAGE_DISPLAY_NAMES[currentStage]} · step ${stepNumber} of ${totalSteps}`;
       this.iconPath = new vscode.ThemeIcon(
         "debug-pause",
         new vscode.ThemeColor("charts.orange")
+      );
+    } else if (currentStage === "completed") {
+      this.description = "Completed";
+      this.iconPath = new vscode.ThemeIcon(
+        "pass-filled",
+        new vscode.ThemeColor("charts.green")
       );
     } else {
       this.description = `${STAGE_DISPLAY_NAMES[currentStage]} · step ${stepNumber} of ${totalSteps}`;

@@ -134,12 +134,12 @@ export const STAGE_ORDER: readonly TaskStage[] = [
 export const STAGE_DISPLAY_NAMES: Record<TaskStage, string> = {
   "task-description": "Task Description",
   plan: "Plan",
-  "plan-high-review": "Plan: High-Level Review",
-  "plan-low-review": "Plan: Low-Level Review",
+  "plan-high-review": "High-Level Review (Plan)",
+  "plan-low-review": "Low-Level Review (Plan)",
   implementation: "Implementation",
-  "impl-high-review": "Implementation: High-Level Review",
-  "impl-low-review": "Implementation: Low-Level Review",
-  completed: "Completed",
+  "impl-high-review": "High-Level Code Review",
+  "impl-low-review": "Low-Level Code Review",
+  completed: "Publish",
 };
 
 /**
