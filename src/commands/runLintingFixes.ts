@@ -101,11 +101,10 @@ export async function runLintingFixes(
   }
 
   if (
-    resolvedTask.progress.currentStage !== "completed" &&
-    resolvedTask.progress.currentStage !== "impl-low-review"
+    resolvedTask.progress.currentStage !== "completed"
   ) {
     NotificationRouter.showWarning(
-      "Linting fixes are only available for completed tasks or tasks at the final review stage."
+      "Linting fixes are only available for completed tasks."
     );
     return;
   }
@@ -153,8 +152,8 @@ export async function runLintingFixes(
           );
         });
 
-        if (lintingIssues.length === 0) {
-          await runCompletionLint(taskFolderUri);
+        const initialLint = await runCompletionLint(taskFolderUri);
+        if (initialLint.passed) {
           NotificationRouter.showInformation(
             "No linting issues found in the task folder. Your code looks good!"
           );
@@ -210,10 +209,11 @@ export async function runLintingFixes(
             );
           }).length;
 
-        if (remainingLintIssues === 0) {
-          await runCompletionLint(taskFolderUri);
-        } else {
-          await persistLintState(false, `${remainingLintIssues} file(s) still report lint issues after auto-fix.`);
+        const postFixLint = remainingLintIssues === 0
+          ? await runCompletionLint(taskFolderUri)
+          : await runCompletionLint(taskFolderUri);
+
+        if (!postFixLint.passed) {
 
           // Automatic editor fixes are only the first pass. Give the configured
           // implementation agent the remaining diagnostics so it can make
@@ -222,7 +222,13 @@ export async function runLintingFixes(
           if (workspaceFolder) {
             const model = await resolveModelForStage(taskFolderUri, "implementation");
             const postFixDiagnostics = vscode.languages.getDiagnostics().filter(([uri, ds]) => isFileInTaskFolder(uri, taskFolderPath) && ds.some((d) => d.source === "eslint" || d.source === "ts" || d.source === "typescript"));
-            const lint = JSON.stringify({ remainingFiles: remainingLintIssues, diagnostics: postFixDiagnostics.map(([uri, ds]) => ({ file: uri.fsPath, messages: ds.map((d) => d.message) })) }, null, 2);
+            const lint = JSON.stringify({
+              summary: postFixLint.summary,
+              issueCount: postFixLint.issueCount,
+              failedChecks: postFixLint.failedChecks,
+              remainingFiles: remainingLintIssues,
+              diagnostics: postFixDiagnostics.map(([uri, ds]) => ({ file: uri.fsPath, messages: ds.map((d) => d.message) })),
+            }, null, 2);
             const contextPack = await generateContextPack(taskFolderUri, workspaceFolder.uri);
             const prompt = await renderPromptTemplate(extensionUri, "final-fixes-code.md", { lint, contextPack });
             const sizeCheck = await checkAndConfirmPromptSize(prompt, "the configured implementation agent");
@@ -238,8 +244,13 @@ export async function runLintingFixes(
                 await runCompletionLint(taskFolderUri);
                 await inventory.refresh();
                 NotificationRouter.showInformation("AI final fixes applied; completion lint was rerun.");
-              } else if (result?.errorMessage) {
-                NotificationRouter.showWarning(`AI final fixes failed: ${result.errorMessage}`);
+              } else {
+                await runCompletionLint(taskFolderUri);
+                if (result?.errorMessage) {
+                  NotificationRouter.showWarning(`AI final fixes failed: ${result.errorMessage}`);
+                } else {
+                  NotificationRouter.showWarning("AI final fixes were cancelled; completion lint was rerun.");
+                }
               }
             }
           }

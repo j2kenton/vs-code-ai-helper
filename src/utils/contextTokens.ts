@@ -4,6 +4,7 @@ export interface TaskContextInput {
   status: TaskStatus;
   currentStage: TaskStage;
   hasLintPayload?: boolean;
+  lintPassed?: boolean;
   isScheduled?: boolean;
   hasPendingNote?: boolean;
   isMetaManaged?: boolean;
@@ -14,6 +15,7 @@ export interface StageContextInput {
   status: "done" | "current" | "outstanding";
   isPaused?: boolean;
   hasLintPayload?: boolean;
+  lintPassed?: boolean;
   isScheduled?: boolean;
   hasPendingNote?: boolean;
   isMetaManaged?: boolean;
@@ -56,6 +58,9 @@ export function buildTaskContextValue(input: TaskContextInput): string {
   // Suffixes based on conditions
   if (input.hasLintPayload && input.currentStage === "completed") {
     tokens.push("lint-known");
+    if (input.lintPassed !== undefined) {
+      tokens.push(input.lintPassed ? "lint-passed" : "lint-failed");
+    }
   }
 
   if (input.isScheduled) {
@@ -121,6 +126,9 @@ export function buildStageContextValue(input: StageContextInput): string {
   // Lint state
   if (input.hasLintPayload && input.stage === "impl-low-review" && input.status === "current") {
     tokens.push("lint-known");
+    if (input.lintPassed !== undefined) {
+      tokens.push(input.lintPassed ? "lint-passed" : "lint-failed");
+    }
   }
 
   // Scheduled state

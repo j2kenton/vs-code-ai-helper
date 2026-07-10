@@ -176,6 +176,7 @@ export class TaskNode extends vscode.TreeItem {
       status: isPaused ? "paused" : (task.progress.status || "active"),
       currentStage,
       hasLintPayload: task.progress.lintPayload !== undefined,
+      lintPassed: task.progress.lintPayload?.passed,
       isScheduled,
       hasPendingNote,
       isMetaManaged
@@ -269,6 +270,7 @@ export class StageNode extends vscode.TreeItem {
       status,
       task.progress.status === "paused",
       task.progress.lintPayload !== undefined,
+      task.progress.lintPayload?.passed,
       isScheduled,
       hasPendingNote,
       isMetaManaged
@@ -289,6 +291,7 @@ export function getStageNodeContextValue(
   status: StageStatus,
   isPaused: boolean = false,
   hasLintPayload: boolean = false,
+  lintPassed?: boolean,
   isScheduled: boolean = false,
   hasPendingNote: boolean = false,
   isMetaManaged: boolean = false
@@ -298,6 +301,7 @@ export function getStageNodeContextValue(
     status,
     isPaused,
     hasLintPayload,
+    lintPassed,
     isScheduled,
     hasPendingNote,
     isMetaManaged,

@@ -65,6 +65,10 @@ export interface LintPayload {
   passed: boolean;
   /** Optional human-readable summary (e.g. "3 errors, 2 warnings") */
   summary?: string;
+  /** Number of editor diagnostics plus failed checks. */
+  issueCount?: number;
+  /** Commands that failed, including their exit codes and output. */
+  failedChecks?: Array<{ command: string; exitCode: number; output: string }>;
 }
 
 /**

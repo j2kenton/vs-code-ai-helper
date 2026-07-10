@@ -627,26 +627,10 @@ export async function commitAndPushTask(
     return;
   }
 
-  // ── Lint-state gate ────────────────────────────────────────────────────────
-  // If the lint state is unknown (no lintPayload), warn the user before
-  // committing. The user can bypass by confirming, or cancel to run lint first.
-  const lintPayload = resolvedTask.progress.lintPayload;
-  if (!lintPayload) {
-    const choice = await vscode.window.showWarningMessage(
-      `Lint state is unknown for "${resolvedTask.folderName}".\n\n` +
-        "Run linting fixes first to record the lint state, or proceed without lint validation.",
-      { modal: true },
-      "Proceed Without Lint",
-      "Cancel"
-    );
-    if (choice !== "Proceed Without Lint") {
-      NotificationRouter.showInformation(
-        "Commit and push cancelled. Run 'Fix Linting Issues' first to record lint state."
-      );
-      return;
-    }
-    // Do not persist a synthetic passing result when validation was bypassed.
-  } else if (!lintPayload.passed) {
+  // Always run fresh checks immediately before a commit. Persisted payloads
+  // are informational and may be stale after files were edited.
+  const lintPayload = await runCompletionLint(vscode.Uri.file(resolvedTask.taskFolderPath));
+  if (!lintPayload.passed) {
     const summary = lintPayload.summary ? ` (${lintPayload.summary})` : "";
     const choice = await vscode.window.showWarningMessage(
       `Lint reported failures for "${resolvedTask.folderName}"${summary}.\n\n` +
@@ -1024,16 +1008,7 @@ export async function completeCommitAndPushTask(
     return;
   }
 
-  // Gate on known lint state (only when lint state is known)
-  const lintPayload = resolvedTask.progress.lintPayload;
-  if (!lintPayload) {
-    NotificationRouter.showWarning(
-      `Lint state is unknown for "${resolvedTask.folderName}". Run linting fixes first.`
-    );
-    return;
-  }
-
-  // 1. Transition stage to "completed" using the shared advanceStage helper
+  // 1. Run fresh checks, then transition stage to "completed".
   const taskFolderUri = vscode.Uri.file(resolvedTask.taskFolderPath);
   const lintResult = await runCompletionLint(taskFolderUri);
   if (!lintResult.passed) {
