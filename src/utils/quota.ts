@@ -47,7 +47,9 @@ export function getPendingResume(context: vscode.ExtensionContext): PendingResum
 export async function clearPendingResume(context: vscode.ExtensionContext): Promise<void> { await context.workspaceState.update(KEY, undefined); }
 
 export async function handleQuotaFailure(context: vscode.ExtensionContext, request: AgentRunRequest, result: AgentRunResult, switchModel?: () => Thenable<void>): Promise<"resume" | "switch" | undefined> {
-  if (result.failureKind !== "quota") return undefined;
+  if (result.failureKind !== "quota") {
+    return undefined;
+  }
   await savePendingResume(context, request);
   const choice = await vscode.window.showWarningMessage("AI credits are exhausted.", "Resume when credits restore", "Switch model");
   if (choice === "Switch model") { await switchModel?.(); return "switch"; }
