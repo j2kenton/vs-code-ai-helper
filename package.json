@@ -65,7 +65,7 @@
         "command": "vs-code-ai-helper.runReviewWithAI",
         "title": "Run Review with AI",
         "category": "Ensemble",
-        "icon": "$(refresh)"
+        "icon": "$(law)"
       },
       {
         "command": "vs-code-ai-helper.applyReviewWithAI",
