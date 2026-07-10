@@ -50,6 +50,8 @@ import { ensureAiConsent } from "../utils/aiConsent";
 import { checkAndConfirmPromptSize } from "../utils/promptSizeGuard";
 import * as cp from "child_process";
 import { NotificationRouter } from "../utils/notificationRouter";
+import { parseReadiness } from "../utils/reviewReadiness";
+import { improveReviewScore, MAX_REVIEW_ATTEMPTS } from "../utils/reviewScoreLoop";
 
 /**
  * The optional argument tree-view buttons pass to these commands: the tree
@@ -889,6 +891,147 @@ export async function applyReviewWithAI(
 }
 
 /**
+ * Fast Forward Review: repeats the exact apply-then-re-review cycle that the
+ * "Apply Review" button runs once, up to MAX_REVIEW_ATTEMPTS times, stopping
+ * as soon as an attempt's readiness score improves by at least 1 over the
+ * score the review had when this command started.
+ *
+ * Deliberately calls the unmodified applyReviewWithAI for each attempt
+ * rather than re-implementing apply logic, so this can never diverge from
+ * what the regular "Apply Review" button does per attempt — it only adds
+ * the surrounding loop. Progress between attempts is inferred by re-reading
+ * the review artifact from disk (rather than threading a success signal
+ * through applyReviewWithAI's internals, which branch differently for plan
+ * vs. implementation reviews): if an attempt leaves the review file
+ * byte-identical to before, that attempt produced nothing to compare
+ * (blocked by a guard, or the run failed before writing), and the loop
+ * stops immediately rather than silently repeating the same failure up to
+ * 5 times.
+ *
+ * Requires first-use consent before any AI action runs (same as Apply Review).
+ */
+export async function fastForwardReviewWithAI(
+  extensionUri: vscode.Uri,
+  context: vscode.ExtensionContext,
+  arg?: ReviewCommandArg
+): Promise<void> {
+  const workspaceRoot = getWorkspaceRoot();
+  if (!workspaceRoot) {
+    void vscode.window.showErrorMessage(
+      "No workspace folder open. Please open a folder first."
+    );
+    return;
+  }
+
+  if (isMalformedReviewArg(arg as ReviewCommandArg | Record<string, unknown>)) {
+    void vscode.window.showErrorMessage(
+      "Fast Forward Review: unsupported argument shape. " +
+        "Use { taskFolderPath } to target a specific task, or invoke without an argument to pick from a list."
+    );
+    return;
+  }
+
+  const consented = await ensureAiConsent(context);
+  if (!consented) {
+    return;
+  }
+
+  const resolved = await resolveTask(
+    normalizeReviewArg(arg),
+    REVIEW_STAGES,
+    "Fast Forward Review with AI"
+  );
+  if (!resolved) {
+    return;
+  }
+
+  const stage = resolved.progress.currentStage;
+  const reviewUri = artifactUri(resolved.folderUri, stage);
+  const initialContent = reviewUri && (await readNonEmptyText(reviewUri));
+  if (!reviewUri || !initialContent) {
+    NotificationRouter.showWarning(
+      "No review found (or it is empty). Run the review before fast-forwarding."
+    );
+    return;
+  }
+
+  const initialScore = parseReadiness(initialContent).score;
+  if (initialScore === null) {
+    NotificationRouter.showWarning(
+      "Fast Forward Review: the current review has no \"Readiness: N/10\" line to use as a " +
+        "starting score. Run the review again (or edit it to include one) before fast-forwarding."
+    );
+    return;
+  }
+  const baselineScore = initialScore;
+
+  // Concrete taskFolderPath so every attempt targets this same task without
+  // resolveTask re-prompting (it already resolved the task once above).
+  const concreteArg: ReviewCommandArg = { taskFolderPath: resolved.folderUri.fsPath };
+
+  let previousContent = initialContent;
+  let attemptNumber = 0;
+
+  let outcome: Awaited<ReturnType<typeof improveReviewScore>>;
+  try {
+    outcome = await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: `Fast-forwarding ${STAGE_DISPLAY_NAMES[stage] ?? "review"}...`,
+        cancellable: true,
+      },
+      (progress, token) =>
+        improveReviewScore({
+          context,
+          stage,
+          baselineScore,
+          token,
+          apply: async () => {
+            attemptNumber += 1;
+            progress.report({
+              message: `Attempt ${attemptNumber} of ${MAX_REVIEW_ATTEMPTS}...`,
+            });
+            await applyReviewWithAI(extensionUri, context, concreteArg);
+          },
+          review: async () => {
+            const newContent = await readNonEmptyText(reviewUri);
+            if (!newContent || newContent === previousContent) {
+              return null;
+            }
+            previousContent = newContent;
+            return parseReadiness(newContent).score;
+          },
+        })
+    );
+  } catch (error) {
+    if (error instanceof vscode.CancellationError) {
+      NotificationRouter.showInformation(
+        `Fast Forward Review cancelled after ${attemptNumber} attempt(s).`
+      );
+      return;
+    }
+    throw error;
+  }
+
+  if (outcome.improved) {
+    NotificationRouter.showInformation(
+      `Fast Forward Review: score improved to ${outcome.score}/10 after ${outcome.attempts} attempt(s).`
+    );
+  } else if (outcome.stalled) {
+    NotificationRouter.showWarning(
+      `Fast Forward Review stopped after ${outcome.attempts} attempt(s): the review did not change. ` +
+        "Check the run log — the provider may have failed or been blocked."
+    );
+  } else {
+    NotificationRouter.showWarning(
+      `Fast Forward Review: no improvement after ${MAX_REVIEW_ATTEMPTS} attempts (best score ${
+        outcome.score ?? "—"
+      }/10).`
+    );
+  }
+}
+
+/**
  * Apply an implementation review by re-running the AI implementation
  * runner against the review's findings.
  *
@@ -1563,6 +1706,10 @@ export function registerReviewActionCommands(
     vscode.commands.registerCommand(
       "vs-code-ai-helper.applyReviewWithAI",
       (arg?: ReviewCommandArg) => applyReviewWithAI(context.extensionUri, context, arg)
+    ),
+    vscode.commands.registerCommand(
+      "vs-code-ai-helper.fastForwardReviewWithAI",
+      (arg?: ReviewCommandArg) => fastForwardReviewWithAI(context.extensionUri, context, arg)
     ),
     vscode.commands.registerCommand(
       "vs-code-ai-helper.viewReview",

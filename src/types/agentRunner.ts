@@ -45,6 +45,9 @@ export interface AgentRunResult {
   logFile?: vscode.Uri;
   summary?: string;
   errorMessage?: string;
+  /** Stable provider-neutral failure classification. */
+  failureKind?: "quota" | "generic";
+  modelId?: string;
 }
 
 /**

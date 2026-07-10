@@ -10,9 +10,10 @@ import {
   AgentRunRequest,
   AgentRunResult,
 } from "../types/agentRunner";
-import { writeTextFile } from "../utils/fileUtils";
+import { withAttribution, writeTextFile } from "../utils/fileUtils";
 import { ImplementationRunResult } from "./copilotImplementationRunner";
 import { CliProviderDefinition, CliRunMode } from "./providers";
+import { classifyCliFailure } from "../utils/quota";
 
 /**
  * Hard cap on a single CLI run. Runs are also cancellable from the progress
@@ -102,6 +103,44 @@ export async function cliCommandExists(
 }
 
 /**
+ * Env var name prefixes/exact-names that identify an in-progress Claude Code
+ * session hosting *this extension itself*. These must never reach a spawned
+ * provider CLI: this extension host typically runs inside a Claude Code
+ * session (e.g. the Claude Code VS Code extension), so process.env carries
+ * that session's identity (CLAUDECODE, CLAUDE_CODE_*, CLAUDE_EFFORT, etc.).
+ * Passed through unfiltered, a nested `claude -p ...` child can detect it's
+ * being launched as an IDE-companion/child session and behave differently
+ * than a fresh headless call.
+ *
+ * Deliberately scoped to Claude-session-identity variables only, not other
+ * vendors' env namespaces: this extension host has no comparable reason to
+ * ever itself be a Codex or Gemini session, and those vendors' own env vars
+ * (e.g. CODEX_HOME) are the user's legitimate CLI config/auth — stripping
+ * them would silently break an intentionally-configured login/profile
+ * rather than prevent any actual leak.
+ */
+const AGENTIC_SESSION_ENV_EXACT = new Set([
+  "CLAUDECODE",
+  "CLAUDE_EFFORT",
+  "CLAUDE_AGENT_SDK_VERSION",
+]);
+const AGENTIC_SESSION_ENV_PREFIXES = ["CLAUDE_CODE_"];
+
+function sanitizedCliEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (AGENTIC_SESSION_ENV_EXACT.has(key)) {
+      continue;
+    }
+    if (AGENTIC_SESSION_ENV_PREFIXES.some((prefix) => key.startsWith(prefix))) {
+      continue;
+    }
+    env[key] = value;
+  }
+  return env;
+}
+
+/**
  * Kill a CLI process and its children (agent CLIs spawn helpers, and since
  * they're launched with shell:true there's always at least a shell process
  * in between). On Windows, taskkill /T walks the whole process tree by PID.
@@ -135,6 +174,8 @@ export interface CliExecResult {
   status: "completed" | "failed" | "cancelled";
   output: string;
   errorMessage?: string;
+  /** Set on failed results; absent for completed/cancelled. */
+  failureKind?: "quota" | "generic";
 }
 
 const ANSI_ESCAPE_PATTERN =
@@ -232,6 +273,7 @@ export const __testOnly = {
   extractKiroFinalOutput,
   normalizeCliOutput,
   toCliImplementationRunResult,
+  sanitizedCliEnv,
 };
 
 /**
@@ -290,18 +332,62 @@ export async function execCliAgent(options: {
     onProgress?.(dangerousBypass.warningMessage);
     warnAboutDangerousBypassOnce(def);
   }
+
+  let promptFile: string | undefined;
+  if (promptTransport === "file") {
+    if (useShell) {
+      return classifyCliFailure({
+        status: "failed",
+        output: "",
+        errorMessage: `${def.label} provider misconfiguration: file prompt transport requires shell:false for safe argument passing.`,
+      });
+    }
+    promptFile = nodePath.join(
+      os.tmpdir(),
+      `vs-code-ai-helper-${def.id}-prompt-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`
+    );
+    try {
+      // mode 0o600: prompt contents may include full context packs (source
+      // code, review text). os.tmpdir() is shared across all local users on
+      // POSIX systems, and the default write mode (0o666 before umask) can
+      // leave the file world-readable depending on the process's umask.
+      nodeFs.writeFileSync(promptFile, prompt, { encoding: "utf8", mode: 0o600 });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return classifyCliFailure({
+        status: "failed",
+        output: "",
+        errorMessage: `Could not write a temp prompt file for ${def.label}: ${message}`,
+      });
+    }
+  }
+
+  // Once promptFile exists on disk, every return path from here on must
+  // clean it up — including the early-return guards below, which run
+  // before the finish()/Promise machinery that normally owns cleanup.
+  const cleanupPromptFile = (): void => {
+    if (promptFile) {
+      try {
+        nodeFs.unlinkSync(promptFile);
+      } catch {
+        // Best-effort cleanup.
+      }
+    }
+  };
+
   const args = def.buildArgs(mode, model, lastMessageFile, {
     cwd,
     dangerousBypassEnabled,
+    promptFile,
   });
 
   if (promptTransport === "argv") {
     if (useShell) {
-      return {
+      return classifyCliFailure({
         status: "failed",
         output: "",
         errorMessage: `${def.label} provider misconfiguration: argv prompt transport requires shell:false for safe argument passing.`,
-      };
+      });
     }
     const promptBytes = Buffer.byteLength(prompt, "utf8");
     const maxArgvPromptBytes = def.maxArgvPromptBytes;
@@ -309,13 +395,13 @@ export async function execCliAgent(options: {
       typeof maxArgvPromptBytes === "number" &&
       promptBytes > maxArgvPromptBytes
     ) {
-      return {
+      return classifyCliFailure({
         status: "failed",
         output: "",
         errorMessage:
           `${def.label} prompt is too large for this CLI mode (${promptBytes} bytes; max ${maxArgvPromptBytes} bytes). ` +
           "Reduce context or choose a provider that accepts stdin prompts.",
-      };
+      });
     }
     args.push(prompt);
   }
@@ -326,11 +412,12 @@ export async function execCliAgent(options: {
   );
 
   if (!resolvedCommand) {
-    return {
+    cleanupPromptFile();
+    return classifyCliFailure({
       status: "failed",
       output: "",
       errorMessage: `Could not start the ${def.label} CLI (${def.command}): command not found. ${def.installHint}`,
-    };
+    });
   }
 
   return new Promise<CliExecResult>((resolve) => {
@@ -352,7 +439,7 @@ export async function execCliAgent(options: {
         cwd,
         shell: useShell,
         windowsHide: true,
-        env: process.env,
+        env: sanitizedCliEnv(),
         // POSIX only: makes the shell (and everything it execs/forks) its
         // own process group, so killProcessTree can SIGTERM the whole group
         // instead of just the shell's PID — see killProcessTree for why that
@@ -367,11 +454,12 @@ export async function execCliAgent(options: {
         promptTransport === "argv"
           ? " Reduce context or choose a provider that accepts stdin prompts."
           : "";
-      resolve({
+      cleanupPromptFile();
+      resolve(classifyCliFailure({
         status: "failed",
         output: "",
         errorMessage: `Could not start the ${def.label} CLI (${resolvedCommand}): ${message}.${argvHint} ${def.installHint}`.trim(),
-      });
+      }));
       return;
     }
 
@@ -389,18 +477,19 @@ export async function execCliAgent(options: {
           // Best-effort cleanup.
         }
       }
+      cleanupPromptFile();
       resolve(result);
     };
 
     const timeoutHandle = setTimeout(() => {
       killProcessTree(child);
-      finish({
+      finish(classifyCliFailure({
         status: "failed",
         output: stdout,
         errorMessage: `${def.label} CLI timed out after ${
           RUN_TIMEOUT_MS / 60000
         } minutes.`,
-      });
+      }));
     }, RUN_TIMEOUT_MS);
 
     const cancellationListener = token.onCancellationRequested(() => {
@@ -410,11 +499,11 @@ export async function execCliAgent(options: {
     });
 
     child.on("error", (error) => {
-      finish({
+      finish(classifyCliFailure({
         status: "failed",
         output: "",
         errorMessage: `Could not start the ${def.label} CLI (${resolvedCommand}): ${error.message}. ${def.installHint}`,
-      });
+      }));
     });
 
     child.stdout?.on("data", (chunk: Buffer) => {
@@ -438,22 +527,22 @@ export async function execCliAgent(options: {
       const output = normalizeCliOutput(def, stdout, lastMessageFile);
 
       if (code !== 0) {
-        finish({
+        finish(classifyCliFailure({
           status: "failed",
           output,
           errorMessage: toFriendlyError(def, code, stderr, stdout),
-        });
+        }));
         return;
       }
 
       if (output.length === 0) {
-        finish({
+        finish(classifyCliFailure({
           status: "failed",
           output,
           errorMessage: `${def.label} CLI produced no output. ${
             stderr.trim().split(/\r?\n/).slice(-4).join("\n") || ""
           }`.trim(),
-        });
+        }));
         return;
       }
 
@@ -525,14 +614,21 @@ export class CliAgentRunner implements AgentRunner {
         runnerId: this.id,
         status: "failed",
         errorMessage: result.errorMessage ?? "unknown error",
+        failureKind: result.failureKind,
       };
     }
 
-    await writeTextFile(request.outputFile, result.output);
+    const signedOutput = withAttribution(
+      result.output,
+      this.label,
+      request.modelId
+    );
+    await writeTextFile(request.outputFile, signedOutput);
     return {
       runnerId: this.id,
       status: "completed",
       outputFile: request.outputFile,
+      modelId: request.modelId,
       summary: `Generated ${result.output.length} characters using ${this.label}.`,
     };
   }
@@ -664,6 +760,7 @@ function toCliImplementationRunResult(
       filesChanged,
       filesChangedUnknown,
       errorMessage: result.errorMessage,
+      failureKind: result.failureKind,
     };
   }
   if (!filesChangedUnknown && filesChanged.length === 0) {
@@ -677,6 +774,10 @@ function toCliImplementationRunResult(
         "The implementation runner requires real file edits; check provider permissions " +
         "or choose another implementation model." +
         (providerOutput ? `\n\nProvider output:\n${providerOutput}` : ""),
+      // Not a CLI-reported failure — the run itself succeeded, so this can
+      // never be a quota exhaustion; classify explicitly rather than
+      // leaving failureKind unset for a "failed" result.
+      failureKind: "generic",
     };
   }
 

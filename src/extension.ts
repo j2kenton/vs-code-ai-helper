@@ -13,6 +13,7 @@ import { registerDraftTaskWithAICommand } from "./commands/draftTaskWithAI";
 import { registerApplyCurrentStageActionCommand } from "./commands/applyCurrentStageAction";
 import { registerOpenAndStartNewTaskCommand } from "./commands/openAndStartNewTask";
 import { registerReReviewCurrentTaskCommand } from "./commands/reReviewCurrentTask";
+import { registerFastForwardCurrentTaskReviewCommand } from "./commands/fastForwardCurrentTaskReview";
 import { registerPauseTaskCommand } from "./commands/pauseTask";
 import { registerApplyHighLevelReviewChangesCommand } from "./commands/applyHighLevelReviewChanges";
 import { registerApplyLowLevelReviewChangesCommand } from "./commands/applyLowLevelReviewChanges";
@@ -98,6 +99,7 @@ export function activate(context: vscode.ExtensionContext): void {
   registerApplyCurrentStageActionCommand(context, inventory, currentTaskStore);
   registerOpenAndStartNewTaskCommand(context, inventory, currentTaskStore);
   registerReReviewCurrentTaskCommand(context, inventory, currentTaskStore);
+  registerFastForwardCurrentTaskReviewCommand(context, inventory, currentTaskStore);
   registerPauseTaskCommand(context, inventory, currentTaskStore);
   registerApplyHighLevelReviewChangesCommand(context, inventory);
   registerApplyLowLevelReviewChangesCommand(context, inventory);

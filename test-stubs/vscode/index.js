@@ -145,6 +145,13 @@ class CancellationTokenSource {
   dispose() { }
 }
 
+class CancellationError extends Error {
+  constructor() {
+    super("Canceled");
+    this.name = "CancellationError";
+  }
+}
+
 /**
  * Minimal StatusBarItem stub. Tracks show/hide calls and stores text so tests
  * can assert on the status bar's visible state without a real VS Code window.
@@ -244,6 +251,7 @@ module.exports = {
   ThemeIcon,
   ThemeColor,
   CancellationTokenSource,
+  CancellationError,
   EventEmitter,
   workspace,
   window,

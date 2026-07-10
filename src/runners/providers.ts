@@ -44,6 +44,12 @@ export interface CliBuildArgsContext {
    * runner never needs to know which provider owns which dangerous flag.
    */
   dangerousBypassEnabled?: boolean;
+  /**
+   * Path to a temp file containing the prompt, set only when
+   * promptTransport is "file". buildArgs must reference this path in the
+   * argument it returns (e.g. `--print=${promptFile}`).
+   */
+  promptFile?: string;
 }
 
 /**
@@ -78,8 +84,15 @@ export interface CliProviderDefinition {
   loginHint: string;
   /** Substrings in CLI output that indicate an auth problem. */
   authErrorMarkers: readonly string[];
-  /** How the prompt is passed to the CLI. Defaults to stdin. */
-  promptTransport?: "stdin" | "argv";
+  /**
+   * How the prompt is passed to the CLI. Defaults to stdin.
+   *  - "stdin": written to the child's stdin.
+   *  - "argv": appended as the final argv element (requires useShell: false).
+   *  - "file": written to a temp file whose path is passed to buildArgs as
+   *    promptFile; use this when a CLI's flag takes the prompt as a value
+   *    but the prompt may be too large for a single argv element.
+   */
+  promptTransport?: "stdin" | "argv" | "file";
   /**
    * Whether this provider should run with shell:true.
    * Defaults to true so npm/pnpm global .cmd shims resolve on Windows.
@@ -380,12 +393,18 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     // when available.
     models: [{ model: undefined, name: "Antigravity (CLI default)" }],
     usesLastMessageFile: false,
-    promptTransport: "stdin",
+    // `agy --print` takes the prompt as its flag value, not stdin — the CLI
+    // has no stdin-prompt mode at all: a bare `--print` with the prompt
+    // piped over stdin makes its Go flag parser either error ("flag needs
+    // an argument: -print") or, with `--print=true`, swallow the literal
+    // string "true" as the prompt and ignore stdin entirely. `--print`
+    // does accept a file path as its value (reads the file's contents as
+    // the prompt), which avoids the OS argv-length ceiling a literal
+    // `--print=<prompt>` value would hit on large context packs.
+    promptTransport: "file",
     useShell: false,
-    // `agy --print` runs a single non-interactive prompt and reads the
-    // prompt from stdin, which avoids command-line length limits.
-    buildArgs(mode, model): string[] {
-      const args: string[] = ["--print"];
+    buildArgs(mode, model, _lastMessageFile, context): string[] {
+      const args: string[] = [`--print=${context?.promptFile ?? ""}`];
       if (mode === "edit") {
         args.push("--dangerously-skip-permissions");
       }

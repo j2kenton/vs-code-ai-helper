@@ -5,6 +5,7 @@ import { deletePath, readTextIfExists, writeTextFile } from "../utils/fileUtils"
 import { AgentAvailability } from "../types/agentRunner";
 import { parseCopilotModelSelection } from "./providers";
 import { sanitizeRelativePath } from "../utils/pathSafety";
+import { classifyFailure } from "../utils/quota";
 
 /**
  * Maximum number of tool-call rounds before aborting to prevent runaway loops.
@@ -293,6 +294,8 @@ export interface ImplementationRunResult {
   /** Markdown summary text returned for logs/user feedback after a completed run */
   summary?: string;
   errorMessage?: string;
+  /** Stable provider-neutral failure classification; set on failed results only. */
+  failureKind?: "quota" | "generic";
 }
 
 /**
@@ -316,21 +319,21 @@ export async function runImplementationWithCopilot(options: {
   try {
     models = await vscode.lm.selectChatModels({ vendor: "copilot" });
   } catch (e) {
-    return {
+    return classifyFailure<ImplementationRunResult>({
       status: "failed",
       filesChanged: [],
       errorMessage: `Failed to select a Copilot model: ${
         e instanceof Error ? e.message : String(e)
       }`,
-    };
+    });
   }
   if (models.length === 0) {
-    return {
+    return classifyFailure<ImplementationRunResult>({
       status: "failed",
       filesChanged: [],
       errorMessage:
         "No Copilot language models are available. Sign in to GitHub Copilot in VS Code.",
-    };
+    });
   }
 
   const parsedModel = parseCopilotModelSelection(modelId);
@@ -381,13 +384,13 @@ export async function runImplementationWithCopilot(options: {
       if (token.isCancellationRequested) {
         return { status: "cancelled", filesChanged: [...filesChanged] };
       }
-      return {
+      return classifyFailure<ImplementationRunResult>({
         status: "failed",
         filesChanged: [...filesChanged],
         errorMessage: `Model request failed: ${
           e instanceof Error ? e.message : String(e)
         }`,
-      };
+      });
     }
 
     // Collect all response parts
@@ -409,13 +412,13 @@ export async function runImplementationWithCopilot(options: {
       if (token.isCancellationRequested) {
         return { status: "cancelled", filesChanged: [...filesChanged] };
       }
-      return {
+      return classifyFailure<ImplementationRunResult>({
         status: "failed",
         filesChanged: [...filesChanged],
         errorMessage: `Stream error: ${
           e instanceof Error ? e.message : String(e)
         }`,
-      };
+      });
     }
 
     const assistantText = textParts.join("");
@@ -460,11 +463,11 @@ export async function runImplementationWithCopilot(options: {
   }
 
   if (!completedCleanly) {
-    return {
+    return classifyFailure<ImplementationRunResult>({
       status: "failed",
       filesChanged: [...filesChanged],
       errorMessage: `Reached the maximum of ${MAX_ITERATIONS} tool-call rounds without finishing. The implementation may be incomplete.`,
-    };
+    });
   }
 
   return {

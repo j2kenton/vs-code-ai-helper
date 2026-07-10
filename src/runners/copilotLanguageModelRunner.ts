@@ -7,7 +7,8 @@ import {
   AgentRunRequest,
   AgentRunResult,
 } from "../types/agentRunner";
-import { writeTextFile } from "../utils/fileUtils";
+import { withAttribution, writeTextFile } from "../utils/fileUtils";
+import { classifyFailure } from "../utils/quota";
 
 /**
  * Runner that uses the user's existing GitHub Copilot access through
@@ -51,11 +52,11 @@ export class CopilotLanguageModelRunner implements AgentRunner {
       models = await vscode.lm.selectChatModels({ vendor: "copilot" });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      return {
+      return classifyFailure<AgentRunResult>({
         runnerId: this.id,
         status: "failed",
         errorMessage: `Failed to select a Copilot model: ${message}`,
-      };
+      });
     }
 
     const parsedModel = parseCopilotModelSelection(request.modelId);
@@ -99,7 +100,8 @@ export class CopilotLanguageModelRunner implements AgentRunner {
         return { runnerId: this.id, status: "cancelled" };
       }
 
-      await writeTextFile(request.outputFile, output);
+      const signedOutput = withAttribution(output, "GitHub Copilot", model.name);
+      await writeTextFile(request.outputFile, signedOutput);
 
       const fallbackNote =
         request.modelId && !requestedModel
@@ -110,6 +112,7 @@ export class CopilotLanguageModelRunner implements AgentRunner {
         runnerId: this.id,
         status: "completed",
         outputFile: request.outputFile,
+        modelId: model.id,
         summary: `Generated ${output.length} characters using ${model.name}.${fallbackNote}`,
       };
     } catch (error) {
@@ -120,17 +123,17 @@ export class CopilotLanguageModelRunner implements AgentRunner {
         if (token.isCancellationRequested) {
           return { runnerId: this.id, status: "cancelled" };
         }
-        return {
+        return classifyFailure<AgentRunResult>({
           runnerId: this.id,
           status: "failed",
           errorMessage: error.message,
-        };
+        });
       }
-      return {
+      return classifyFailure<AgentRunResult>({
         runnerId: this.id,
         status: "failed",
         errorMessage: String(error),
-      };
+      });
     }
   }
 }
