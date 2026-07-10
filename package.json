@@ -504,6 +504,12 @@
           "default": false,
           "scope": "resource",
           "description": "Tracks whether first-task model-selection onboarding has already been shown in this workspace"
+        },
+        "vs-code-ai-helper.codexDangerouslyBypassSandboxForImplementation": {
+          "type": "boolean",
+          "default": false,
+          "scope": "resource",
+          "markdownDescription": "When true, Codex implementation runs use `codex exec --dangerously-bypass-approvals-and-sandbox` instead of the `workspace-write` sandbox. This is dangerous because Codex can execute commands without sandboxing. Enable only in trusted workspaces when Codex refuses to edit under `workspace-write`."
         }
       }
     }

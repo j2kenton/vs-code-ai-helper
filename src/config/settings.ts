@@ -6,6 +6,8 @@ const META_RESOURCES_PATH_KEY = "metaResourcesPath";
 const PROMPT_DISMISSED_KEY = "promptDismissed";
 const AI_MODEL_DEFAULTS_KEY = "aiModelDefaults";
 const MODEL_PROMPT_SHOWN_KEY = "modelSelectionPromptShown";
+const CODEX_BYPASS_SANDBOX_FOR_IMPLEMENTATION_KEY =
+  "codexDangerouslyBypassSandboxForImplementation";
 
 /**
  * Get the configured meta resources path for the current workspace
@@ -79,6 +81,18 @@ export function getAiModelDefaults(): Partial<Record<TaskStage, string>> {
 export function getAiModelDefault(stage: TaskStage): string | undefined {
   const defaults = getAiModelDefaults();
   return defaults[stage];
+}
+
+/**
+ * Whether Codex implementation runs should bypass Codex approvals/sandboxing.
+ * Dangerous: only used for explicit workspace opt-in.
+ */
+export function isCodexDangerouslyBypassSandboxForImplementationEnabled(): boolean {
+  const config = vscode.workspace.getConfiguration(CONFIG_SECTION);
+  return config.get<boolean>(
+    CODEX_BYPASS_SANDBOX_FOR_IMPLEMENTATION_KEY,
+    false
+  );
 }
 
 /**

@@ -97,7 +97,7 @@ void describe("provider CLI contracts", () => {
       "edit",
       undefined,
       undefined,
-      "/workspace/project"
+      { cwd: "/workspace/project" }
     );
     assert.deepStrictEqual(editArgs, [
       "exec",
@@ -110,6 +110,62 @@ void describe("provider CLI contracts", () => {
       "workspace-write",
       "-",
     ]);
+
+    // --cd must still apply when the bypass is engaged: bypassing the
+    // sandbox only removes the --sandbox flag, not the working directory.
+    const bypassArgs = codex.buildArgs("edit", undefined, undefined, {
+      cwd: "/workspace/project",
+      dangerousBypassEnabled: true,
+    });
+    assert.deepStrictEqual(bypassArgs, [
+      "exec",
+      "--skip-git-repo-check",
+      "--color",
+      "never",
+      "--cd",
+      "/workspace/project",
+      "--dangerously-bypass-approvals-and-sandbox",
+      "-",
+    ]);
+
+    // The bypass flag must never leak into "text" mode, even if enabled.
+    const textWithBypassArgs = codex.buildArgs("text", undefined, undefined, {
+      cwd: "/workspace/project",
+      dangerousBypassEnabled: true,
+    });
+    assert.deepStrictEqual(textWithBypassArgs, [
+      "exec",
+      "--skip-git-repo-check",
+      "--color",
+      "never",
+      "--cd",
+      "/workspace/project",
+      "--sandbox",
+      "read-only",
+      "-",
+    ]);
+  });
+
+  void it("Codex declares a provider-owned dangerousBypass toggle scoped to edit mode", () => {
+    const codex = getCliProvider("codex-cli");
+    assert.ok(codex, "expected codex-cli provider definition");
+    assert.ok(codex.dangerousBypass, "expected codex-cli to declare dangerousBypass");
+    assert.deepStrictEqual(codex.dangerousBypass?.appliesToModes, ["edit"]);
+    assert.strictEqual(typeof codex.dangerousBypass?.isEnabled, "function");
+    assert.match(codex.dangerousBypass?.warningMessage ?? "", /sandbox/i);
+  });
+
+  void it("other CLI providers do not declare a dangerousBypass toggle", () => {
+    for (const provider of CLI_PROVIDERS) {
+      if (provider.id === "codex-cli") {
+        continue;
+      }
+      assert.strictEqual(
+        provider.dangerousBypass,
+        undefined,
+        `${provider.id} should not declare dangerousBypass`
+      );
+    }
   });
 
   void it("Copilot model variants map to base model plus reasoning config", () => {
@@ -174,5 +230,25 @@ void describe("provider CLI contracts", () => {
         /You have the following tools available:\s*\n\s*-\s*`read_file/
       );
     }
+  });
+
+  void it("declares explicit Codex unsafe implementation opt-in setting", () => {
+    const packageJson = JSON.parse(
+      fs.readFileSync(path.join(process.cwd(), "package.json"), "utf8")
+    ) as {
+      contributes?: {
+        configuration?: {
+          properties?: Record<string, { default?: unknown; type?: string }>;
+        };
+      };
+    };
+    const setting =
+      packageJson.contributes?.configuration?.properties?.[
+        "vs-code-ai-helper.codexDangerouslyBypassSandboxForImplementation"
+      ];
+
+    assert.ok(setting, "expected Codex bypass setting to be contributed");
+    assert.strictEqual(setting.type, "boolean");
+    assert.strictEqual(setting.default, false);
   });
 });

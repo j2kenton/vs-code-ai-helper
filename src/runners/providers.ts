@@ -15,6 +15,8 @@
  * model IDs, which keeps existing saved configurations working unchanged.
  */
 
+import { isCodexDangerouslyBypassSandboxForImplementationEnabled } from "../config/settings";
+
 export type CliProviderId =
   | "claude-cli"
   | "codex-cli"
@@ -31,6 +33,35 @@ export interface CliModelChoice {
   model: string | undefined;
   /** Human-readable name shown in the model picker. */
   name: string;
+}
+
+export interface CliBuildArgsContext {
+  cwd?: string;
+  /**
+   * True when this provider's own dangerousBypass.isEnabled() returned true
+   * for the current mode. Providers that don't declare dangerousBypass never
+   * see this set to true. Generic (not provider-specific) so the shared
+   * runner never needs to know which provider owns which dangerous flag.
+   */
+  dangerousBypassEnabled?: boolean;
+}
+
+/**
+ * A provider-owned opt-in "dangerous mode" toggle (e.g. bypassing a CLI's own
+ * sandbox/approvals). Each provider that has one declares its own settings
+ * getter and CLI-specific warning copy; the shared runner (execCliAgent) only
+ * ever calls isEnabled() and, when true, shows warningMessage via onProgress
+ * before invoking the CLI. This keeps provider-specific "dangerous" concerns
+ * out of the shared CliBuildArgsContext/execCliAgent code, so adding a similar
+ * toggle for another provider never requires touching the shared runner.
+ */
+export interface CliDangerousBypass {
+  /** Which run mode(s) this dangerous toggle applies to (e.g. only "edit"). */
+  appliesToModes: readonly CliRunMode[];
+  /** Reads the provider's own settings getter for its bypass toggle. */
+  isEnabled(): boolean;
+  /** Shown via onProgress immediately before a bypassed run starts. */
+  warningMessage: string;
 }
 
 export interface CliProviderDefinition {
@@ -61,6 +92,11 @@ export interface CliProviderDefinition {
   maxArgvPromptBytes?: number;
   models: readonly CliModelChoice[];
   /**
+   * Optional provider-owned "dangerous mode" toggle — see CliDangerousBypass.
+   * Absent for providers with no such toggle.
+   */
+  dangerousBypass?: CliDangerousBypass;
+  /**
    * Build the CLI arguments. "text" mode must keep the
    * CLI read-only; "edit" mode may let it modify files in the working
    * directory (but not run arbitrary commands unapproved).
@@ -73,7 +109,7 @@ export interface CliProviderDefinition {
     mode: CliRunMode,
     model: string | undefined,
     lastMessageFile: string | undefined,
-    cwd?: string
+    context?: CliBuildArgsContext
   ): string[];
   /**
    * True when the CLI's stdout is an event stream rather than the final
@@ -258,14 +294,29 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     // directly via "codex-cli:<model>" in settings.
     models: [{ model: undefined, name: "Codex (CLI default)" }],
     usesLastMessageFile: true,
-    buildArgs(mode, model, lastMessageFile, cwd): string[] {
+    dangerousBypass: {
+      appliesToModes: ["edit"],
+      isEnabled: isCodexDangerouslyBypassSandboxForImplementationEnabled,
+      warningMessage:
+        "Codex is running with --dangerously-bypass-approvals-and-sandbox: " +
+        "it can execute commands without sandboxing or approval prompts.",
+    },
+    buildArgs(mode, model, lastMessageFile, context): string[] {
       const parsedModel = parseCodexModelSelection(model);
       const args = ["exec", "--skip-git-repo-check", "--color", "never"];
-      if (cwd) {
-        args.push("--cd", cwd);
+      if (context?.cwd) {
+        args.push("--cd", context.cwd);
       }
-      // exec is non-interactive; the sandbox policy is what limits writes.
-      args.push("--sandbox", mode === "edit" ? "workspace-write" : "read-only");
+      if (mode === "edit" && context?.dangerousBypassEnabled) {
+        args.push("--dangerously-bypass-approvals-and-sandbox");
+      } else {
+        // exec is non-interactive; the sandbox policy is what limits writes
+        // whenever the bypass above isn't engaged.
+        args.push(
+          "--sandbox",
+          mode === "edit" ? "workspace-write" : "read-only"
+        );
+      }
       if (parsedModel.model) {
         args.push("--model", parsedModel.model);
       }
