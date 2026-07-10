@@ -15,13 +15,13 @@ Work through the final plan step by step:
 
 Before producing the final summary, make sure the workspace files were actually changed. If you cannot write files, report that failure and the reason instead of claiming the implementation is complete.
 
-When you have finished all changes, output a Markdown document that will serve as `plan-final.md`:
+Do NOT create or edit a `plan-final.md` or `implementation.md` file at the repository root — those filenames are reserved there for the extension's own task-tracking artifacts (nested paths, e.g. `docs/implementation.md`, are unaffected and fine to touch if the plan calls for it). When you have finished all changes, output your summary as plain Markdown text in your final response (not written to any file):
 
 - A one-or-two sentence statement of what was implemented
 - A `## Files Changed` section listing each file created or modified with one line describing the change
 - A `## Verification` section with a short checklist of how to confirm the implementation is correct
 
-Output ONLY the summary document after you are done making changes — do not narrate your intentions before acting.
+Output ONLY the summary document as your final text response after you are done making changes — do not narrate your intentions before acting, and do not write the summary to a file.
 
 ## Context Pack
 

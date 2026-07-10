@@ -14,6 +14,12 @@ npm-debug.log*
 plans/
 notes/
 
+# Stray implementation-run artifacts: these filenames are only ever valid
+# inside a plans/<task>/ folder. A file with either name at the repo root is
+# always a misdirected write from an agentic CLI run, never an intentional doc.
+/implementation.md
+/plan-final.md
+
 # IDE
 .idea/
 *.swp

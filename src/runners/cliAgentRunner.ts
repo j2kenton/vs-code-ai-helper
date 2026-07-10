@@ -14,6 +14,27 @@ import { withAttribution, writeTextFile } from "../utils/fileUtils";
 import { ImplementationRunResult } from "./copilotImplementationRunner";
 import { CliProviderDefinition, CliRunMode } from "./providers";
 import { classifyCliFailure } from "../utils/quota";
+import {
+  IMPLEMENTATION_FILENAME,
+  LEGACY_IMPLEMENTATION_FILENAME,
+} from "../types/taskProgress";
+import { looksLikeGeneratedImplementationSummary } from "../utils/implementationArtifactResolver";
+
+/**
+ * Reserved artifact filenames the implementation stage writes inside a task
+ * folder. CLI agents run with cwd set to the workspace root and are
+ * sometimes instructed (via the implementation prompt) to "produce
+ * plan-final.md" — a model can misread that as "write ./plan-final.md" in
+ * the repo root instead of returning the summary as its final answer. A
+ * root-level file with one of these names is only treated as that stray
+ * write — and stripped out of filesChanged — when its content actually
+ * matches the generated-summary shape (see looksLikeGeneratedImplementationSummary);
+ * a workspace's own unrelated file of the same name is left alone.
+ */
+const RESERVED_ROOT_ARTIFACT_NAMES: ReadonlySet<string> = new Set([
+  IMPLEMENTATION_FILENAME,
+  LEGACY_IMPLEMENTATION_FILENAME,
+]);
 
 /**
  * Hard cap on a single CLI run. Runs are also cancellable from the progress
@@ -826,9 +847,34 @@ export async function runImplementationWithCli(options: {
   // implementations, rather than trusting an empty filesChanged.
   const after = before ? await gitStatusSnapshot(cwd) : undefined;
   const filesChangedUnknown = before === undefined || after === undefined;
-  const filesChanged = filesChangedUnknown
+  const rawFilesChanged = filesChangedUnknown
     ? []
     : changedPathsSince(before, after);
+
+  const strayReservedNames = rawFilesChanged.filter((path) => {
+    if (!RESERVED_ROOT_ARTIFACT_NAMES.has(path)) {
+      return false;
+    }
+    let content: string | undefined;
+    try {
+      content = nodeFs.readFileSync(nodePath.join(cwd, path), "utf8");
+    } catch {
+      // Deleted, or unreadable — can't confirm the generated-summary shape,
+      // so leave it as a normal tracked change rather than assuming it's stray.
+      return false;
+    }
+    return looksLikeGeneratedImplementationSummary(content);
+  });
+  const filesChanged = rawFilesChanged.filter(
+    (path) => !strayReservedNames.includes(path)
+  );
+  if (strayReservedNames.length > 0) {
+    onProgress(
+      `Note: ${def.label} wrote its implementation summary to a repo-root ` +
+        `${strayReservedNames.join("/")} instead of returning it as its final answer; ` +
+        "ignoring that stray file."
+    );
+  }
 
   return toCliImplementationRunResult(
     def,

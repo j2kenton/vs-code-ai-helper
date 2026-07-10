@@ -20,6 +20,22 @@ export interface ResolvedImplementationArtifact {
 }
 
 /**
+ * True when content matches the shape the implementation-run prompts
+ * (run-implementation.md / apply-impl-review-code.md) dictate for the
+ * implementation summary: a "## Files Changed" section and a
+ * "## Verification" section. Used to tell a misdirected summary write —
+ * an agent that wrote its final answer to a `plan-final.md`/`implementation.md`
+ * file instead of returning it as text — apart from a same-named file that
+ * happens to hold real, unrelated project content. Filename and location
+ * alone can't make that distinction: a project may legitimately have its own
+ * root-level `implementation.md`, so only a content match is treated as the
+ * extension's own artifact.
+ */
+export function looksLikeGeneratedImplementationSummary(content: string): boolean {
+  return content.includes("## Files Changed") && content.includes("## Verification");
+}
+
+/**
  * Returns the canonical URI (plan-final.md) for new writes.
  * All AI generation must write to this path.
  */

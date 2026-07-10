@@ -6,6 +6,27 @@ import { AgentAvailability } from "../types/agentRunner";
 import { parseCopilotModelSelection } from "./providers";
 import { sanitizeRelativePath } from "../utils/pathSafety";
 import { classifyFailure } from "../utils/quota";
+import {
+  IMPLEMENTATION_FILENAME,
+  LEGACY_IMPLEMENTATION_FILENAME,
+} from "../types/taskProgress";
+import { looksLikeGeneratedImplementationSummary } from "../utils/implementationArtifactResolver";
+
+/**
+ * Reserved artifact filenames the implementation stage writes inside a task
+ * folder. The implementation prompt asks the model to "produce
+ * plan-final.md" as its final summary; a model can misread that as a
+ * write_file call for "./plan-final.md" at the workspace root instead of
+ * returning the summary as its final text response. A write to one of these
+ * names at the root is only rejected when its content actually matches the
+ * generated-summary shape (see looksLikeGeneratedImplementationSummary) —
+ * filename and location alone can't tell that apart from a workspace's own
+ * unrelated file of the same name.
+ */
+const RESERVED_ROOT_ARTIFACT_NAMES: ReadonlySet<string> = new Set([
+  IMPLEMENTATION_FILENAME,
+  LEGACY_IMPLEMENTATION_FILENAME,
+]);
 
 /**
  * Maximum number of tool-call rounds before aborting to prevent runaway loops.
@@ -216,6 +237,15 @@ async function executeToolCall(
         // so parent-directory creation uses the same normalised path.
         // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
         const normalizedPath = sanitizeRelativePath(relPath)!;
+        if (
+          RESERVED_ROOT_ARTIFACT_NAMES.has(normalizedPath) &&
+          looksLikeGeneratedImplementationSummary(content)
+        ) {
+          return (
+            `Error: Do not write the implementation summary to "${normalizedPath}" ` +
+            "at the workspace root — return it as your final text response instead."
+          );
+        }
         const slashIdx = normalizedPath.lastIndexOf("/");
         if (slashIdx > 0) {
           const parentPath = normalizedPath.substring(0, slashIdx);
