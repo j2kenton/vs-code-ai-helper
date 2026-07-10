@@ -13,6 +13,7 @@ import { generateContextPack } from "../utils/contextPack";
 import { resolveModelForStage } from "../utils/modelSelection";
 import { runImplementationForModel } from "../runners/runnerRegistry";
 import { checkAndConfirmPromptSize } from "../utils/promptSizeGuard";
+import { ensureAiConsent } from "../utils/aiConsent";
 
 /**
  * Accepted argument shapes for runLintingFixes.
@@ -83,7 +84,8 @@ function isFileInTaskFolder(fileUri: vscode.Uri, taskFolderPath: string): boolea
 export async function runLintingFixes(
   inventory: TaskInventory,
   extensionUri: vscode.Uri,
-  explicitArg?: RunLintingFixesArg
+  explicitArg?: RunLintingFixesArg,
+  context?: vscode.ExtensionContext
 ): Promise<void> {
   const resolverArg = normalizeArg(explicitArg);
 
@@ -135,7 +137,7 @@ export async function runLintingFixes(
 
         // Check if there are any TypeScript/JavaScript files with problems in the task folder
         const diagnostics = vscode.languages.getDiagnostics();
-        const taskFolderPath = resolvedTask.taskFolderPath;
+        const taskFolderPath = vscode.workspace.getWorkspaceFolder(taskFolderUri)?.uri.fsPath ?? resolvedTask.taskFolderPath;
 
         const lintingIssues = diagnostics.filter(([uri, diags]) => {
           // Only include diagnostics for files inside the task folder
@@ -219,11 +221,15 @@ export async function runLintingFixes(
           const workspaceFolder = vscode.workspace.getWorkspaceFolder(taskFolderUri);
           if (workspaceFolder) {
             const model = await resolveModelForStage(taskFolderUri, "implementation");
-            const lint = JSON.stringify({ remainingFiles: remainingLintIssues, diagnostics: lintingIssues.map(([uri, ds]) => ({ file: uri.fsPath, messages: ds.map((d) => d.message) })) }, null, 2);
+            const postFixDiagnostics = vscode.languages.getDiagnostics().filter(([uri, ds]) => isFileInTaskFolder(uri, taskFolderPath) && ds.some((d) => d.source === "eslint" || d.source === "ts" || d.source === "typescript"));
+            const lint = JSON.stringify({ remainingFiles: remainingLintIssues, diagnostics: postFixDiagnostics.map(([uri, ds]) => ({ file: uri.fsPath, messages: ds.map((d) => d.message) })) }, null, 2);
             const contextPack = await generateContextPack(taskFolderUri, workspaceFolder.uri);
             const prompt = await renderPromptTemplate(extensionUri, "final-fixes-code.md", { lint, contextPack });
             const sizeCheck = await checkAndConfirmPromptSize(prompt, "the configured implementation agent");
             if (sizeCheck === "ok" || sizeCheck === "confirmed") {
+              if (!context || !(await ensureAiConsent(context))) {
+                return;
+              }
               let result: Awaited<ReturnType<typeof runImplementationForModel>> | undefined;
               await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: "Applying AI final fixes...", cancellable: true }, async (aiProgress, token) => {
                 result = await runImplementationForModel({ modelId: model.modelId, prompt, workspaceUri: workspaceFolder.uri, token, onProgress: (message) => aiProgress.report({ message }) });
@@ -276,7 +282,7 @@ export function registerRunLintingFixesCommand(
   const disposable = vscode.commands.registerCommand(
     "vs-code-ai-helper.runLintingFixes",
     (arg?: RunLintingFixesArg) =>
-      runLintingFixes(inventory, context.extensionUri, arg)
+      runLintingFixes(inventory, context.extensionUri, arg, context)
   );
   context.subscriptions.push(disposable);
 }

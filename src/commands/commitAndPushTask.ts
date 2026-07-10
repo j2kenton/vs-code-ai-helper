@@ -6,11 +6,12 @@ import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { TASK_FILENAME, STAGE_DISPLAY_NAMES } from "../types/taskProgress";
 import { resolveImplementationArtifact } from "../utils/implementationArtifactResolver";
 import { getLowLevelPlanUri } from "../utils/lowLevelPlanArtifactResolver";
-import { IncompleteTask, patchTaskProgress, updateLintPayload } from "../utils/taskProgressUtils";
+import { IncompleteTask } from "../utils/taskProgressUtils";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { advanceStage } from "../utils/stageTransition";
 import { selectNextTask } from "./markTaskDone";
 import { NotificationRouter } from "../utils/notificationRouter";
+import { runCompletionLint } from "../utils/completionLint";
 
 /**
  * Accepted argument shapes for commitAndPushTask.
@@ -644,15 +645,7 @@ export async function commitAndPushTask(
       );
       return;
     }
-    // Backfill lint payload for older completed tasks that have no lint payload yet
-    const taskFolderUri = vscode.Uri.file(resolvedTask.taskFolderPath);
-    await patchTaskProgress(taskFolderUri, (current) =>
-      updateLintPayload(current, {
-        runAt: new Date().toISOString(),
-        passed: true,
-        summary: "Bypassed/Backfilled",
-      })
-    );
+    // Do not persist a synthetic passing result when validation was bypassed.
   } else if (!lintPayload.passed) {
     const summary = lintPayload.summary ? ` (${lintPayload.summary})` : "";
     const choice = await vscode.window.showWarningMessage(
@@ -1042,6 +1035,11 @@ export async function completeCommitAndPushTask(
 
   // 1. Transition stage to "completed" using the shared advanceStage helper
   const taskFolderUri = vscode.Uri.file(resolvedTask.taskFolderPath);
+  const lintResult = await runCompletionLint(taskFolderUri);
+  if (!lintResult.passed) {
+    NotificationRouter.showWarning(`Lint issues found for "${resolvedTask.folderName}". Fix them before completing.`);
+    return;
+  }
   const transitionResult = await advanceStage(
     taskFolderUri,
     resolvedTask.progress.currentStage,

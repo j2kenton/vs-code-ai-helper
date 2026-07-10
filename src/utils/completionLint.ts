@@ -32,11 +32,15 @@ export function collectCompletionLint(folder: string): CompletionLintResult {
 
 /** Persist the latest completion lint result without changing the task stage. */
 export async function runCompletionLint(folderUri: vscode.Uri): Promise<CompletionLintResult> {
-  const result = collectCompletionLint(folderUri.fsPath);
-  await patchTaskProgress(folderUri, (current) => updateLintPayload(current, {
+  const workspaceFolder = vscode.workspace.getWorkspaceFolder(folderUri);
+  const result = collectCompletionLint(workspaceFolder?.uri.fsPath ?? folderUri.fsPath);
+  const persisted = await patchTaskProgress(folderUri, (current) => updateLintPayload(current, {
     runAt: result.runAt,
     passed: result.passed,
     summary: result.summary,
   }));
+  if (!persisted) {
+    throw new Error("Could not persist completion lint result.");
+  }
   return result;
 }
