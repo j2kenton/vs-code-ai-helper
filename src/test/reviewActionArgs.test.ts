@@ -21,6 +21,7 @@ import { describe, it } from "node:test";
 // code author extending the arg handling can rely on this as a spec.
 
 import * as vscode from "vscode";
+import { parseReadiness } from "../utils/reviewReadiness";
 
 /**
  * Re-implement the normalizeReviewArg contract for test verification.
@@ -184,6 +185,42 @@ void describe("review apply model resolution contract", () => {
       assert.strictEqual(effectiveModelStage, logStage);
     });
   }
+});
+
+// ---------------------------------------------------------------------------
+// Review output validation contract (runAiToFile's validateOutput hook)
+// ---------------------------------------------------------------------------
+//
+// runReviewForFolder passes validateReviewOutput to runAiToFile so that a CLI
+// response which exits 0 with non-empty text, but never actually performed
+// the review (e.g. a model that answers with a clarifying question about the
+// prompt file instead of reviewing it — observed with the Antigravity CLI),
+// is rejected and reverted instead of being accepted as a completed review.
+// validateReviewOutput itself is not exported; it is a thin wrapper around
+// parseReadiness, so these tests document its contract directly against that
+// shared parser.
+
+function validateReviewOutputSpec(content: string): boolean {
+  return parseReadiness(content).score !== null;
+}
+
+void describe("validateReviewOutput contract (review generation)", () => {
+  void it("rejects a response with no Readiness line", () => {
+    const clarifyingQuestion =
+      "I see you've opened the implementation-review context file. " +
+      "What would you like me to do with it?";
+    assert.strictEqual(validateReviewOutputSpec(clarifyingQuestion), false);
+  });
+
+  void it("rejects an empty response", () => {
+    assert.strictEqual(validateReviewOutputSpec(""), false);
+  });
+
+  void it("accepts a response with a well-formed Readiness line", () => {
+    const realReview =
+      "Readiness: 7/10\n\n- Summary verdict: needs changes.\n- Blocking issues: none.";
+    assert.strictEqual(validateReviewOutputSpec(realReview), true);
+  });
 });
 
 // ---------------------------------------------------------------------------

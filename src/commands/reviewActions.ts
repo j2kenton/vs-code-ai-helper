@@ -408,6 +408,16 @@ async function hasUncommittedChanges(cwd: string): Promise<boolean> {
  * Applies the prompt-size gate (high-context confirm + hard ceiling) before
  * launching the provider process. The prompt is built here so its size is
  * measured on the exact string that will be sent.
+ *
+ * `validateOutput`, when provided, is run against the CLI's response before
+ * it is accepted as a success. A provider process can exit 0 with non-empty
+ * text that never actually performed the requested task (e.g. a model that
+ * responds with a clarifying question instead of writing the review) —
+ * `runner.run` has no way to tell that apart from a real answer, so this is
+ * the only place callers who care about a specific output shape can reject
+ * it. On failed validation the file is reverted to its pre-run content
+ * (or left empty if there was none) instead of keeping the invalid response,
+ * and the run is reported as not completed.
  */
 async function runAiToFile(options: {
   extensionUri: vscode.Uri;
@@ -427,6 +437,11 @@ async function runAiToFile(options: {
   /** e.g. "Running Plan: High-Level Review" — provider name is appended. */
   progressAction: string;
   outputLabel: string;
+  /**
+   * Optional shape check for the CLI's response. Returns a human-readable
+   * `reason` when invalid so it can be surfaced in the error message.
+   */
+  validateOutput?: (content: string) => { valid: boolean; reason: string };
 }): Promise<boolean> {
   const modelStage = options.executionStage ?? options.logStage;
   const model = await resolveModelForStage(options.taskFolderUri, modelStage);
@@ -455,6 +470,12 @@ async function runAiToFile(options: {
   if (sizeCheck === "abort" || sizeCheck === "declined") {
     return false;
   }
+
+  // Snapshot pre-run content so a response that fails validation can be
+  // reverted instead of clobbering a previously valid file.
+  const previousContent = options.validateOutput
+    ? (await readNonEmptyText(options.outputFileUri)) ?? ""
+    : undefined;
 
   let completed = false;
   await vscode.window.withProgress(
@@ -489,16 +510,32 @@ async function runAiToFile(options: {
       );
 
       if (result.status === "completed") {
-        completed = true;
-        const doc = await vscode.workspace.openTextDocument(
+        const newContentBytes = await vscode.workspace.fs.readFile(
           options.outputFileUri
         );
-        await vscode.window.showTextDocument(doc);
-        NotificationRouter.showInformation(
-          `${options.outputLabel} generated with ${providerLabel} (${
-            result.summary ?? ""
-          })`
-        );
+        const newContent = new TextDecoder().decode(newContentBytes);
+        const validation = options.validateOutput?.(newContent);
+
+        if (validation && !validation.valid) {
+          // Revert instead of leaving the invalid response in place — an
+          // exit-0 CLI result is not proof the task was actually performed.
+          await writeTextFile(options.outputFileUri, previousContent ?? "");
+          void vscode.window.showErrorMessage(
+            `${options.outputLabel} generation from ${providerLabel} did not produce a valid result ` +
+              `(${validation.reason}). The provider may not have followed the instructions — try again.`
+          );
+        } else {
+          completed = true;
+          const doc = await vscode.workspace.openTextDocument(
+            options.outputFileUri
+          );
+          await vscode.window.showTextDocument(doc);
+          NotificationRouter.showInformation(
+            `${options.outputLabel} generated with ${providerLabel} (${
+              result.summary ?? ""
+            })`
+          );
+        }
       } else if (result.status === "cancelled") {
         NotificationRouter.showInformation(
           `${options.outputLabel} generation cancelled.`
@@ -702,8 +739,25 @@ export async function runReviewForFolder(
     outputFileUri: reviewUri,
     progressAction: `Re-reviewing ${STAGE_DISPLAY_NAMES[targetStage]}`,
     outputLabel: STAGE_ARTIFACT_FILENAMES[targetStage] ?? "review",
+    validateOutput: validateReviewOutput,
   });
   // Note: we do NOT call setStage here.
+}
+
+/**
+ * Review prompts (review-plan-high.md, review-plan-low.md, review-impl-high.md,
+ * review-impl-low.md) all require a leading `Readiness: N/10` line. A response
+ * missing it is a strong signal the provider didn't actually perform the
+ * review — e.g. it replied with a clarifying question about the prompt file
+ * instead of reviewing it, which still exits 0 with non-empty output and
+ * would otherwise be indistinguishable from a real review.
+ */
+function validateReviewOutput(content: string): { valid: boolean; reason: string } {
+  const { score } = parseReadiness(content);
+  if (score === null) {
+    return { valid: false, reason: 'response has no "Readiness: N/10" line' };
+  }
+  return { valid: true, reason: "" };
 }
 
 /**
