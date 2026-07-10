@@ -11,6 +11,8 @@ import { registerConfigureStepModelsCommand } from "./commands/configureStepMode
 import { registerViewArtifactCommands } from "./commands/viewArtifacts";
 import { registerDraftTaskWithAICommand } from "./commands/draftTaskWithAI";
 import { registerApplyCurrentStageActionCommand } from "./commands/applyCurrentStageAction";
+import { registerOpenAndStartNewTaskCommand } from "./commands/openAndStartNewTask";
+import { registerReReviewCurrentTaskCommand } from "./commands/reReviewCurrentTask";
 import { registerPauseTaskCommand } from "./commands/pauseTask";
 import { registerApplyHighLevelReviewChangesCommand } from "./commands/applyHighLevelReviewChanges";
 import { registerApplyLowLevelReviewChangesCommand } from "./commands/applyLowLevelReviewChanges";
@@ -94,6 +96,8 @@ export function activate(context: vscode.ExtensionContext): void {
   registerViewArtifactCommands(context);
   registerDraftTaskWithAICommand(context, inventory);
   registerApplyCurrentStageActionCommand(context, inventory, currentTaskStore);
+  registerOpenAndStartNewTaskCommand(context, inventory, currentTaskStore);
+  registerReReviewCurrentTaskCommand(context, inventory, currentTaskStore);
   registerPauseTaskCommand(context, inventory, currentTaskStore);
   registerApplyHighLevelReviewChangesCommand(context, inventory);
   registerApplyLowLevelReviewChangesCommand(context, inventory);

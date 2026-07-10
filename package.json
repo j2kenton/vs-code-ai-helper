@@ -238,6 +238,16 @@
         "title": "Complete, Commit & Push",
         "category": "Ensemble",
         "icon": "$(cloud-upload)"
+      },
+      {
+        "command": "vs-code-ai-helper.openAndStartNewTask",
+        "title": "Open Ensemble and Start New Task",
+        "category": "Ensemble"
+      },
+      {
+        "command": "vs-code-ai-helper.reReviewCurrentTask",
+        "title": "Re-review Current Task",
+        "category": "Ensemble"
       }
     ],
     "keybindings": [
@@ -245,6 +255,16 @@
         "command": "vs-code-ai-helper.applyCurrentStageAction",
         "key": "ctrl+shift+alt+i",
         "mac": "cmd+shift+alt+i"
+      },
+      {
+        "command": "vs-code-ai-helper.openAndStartNewTask",
+        "key": "ctrl+shift+alt+o",
+        "mac": "cmd+shift+alt+o"
+      },
+      {
+        "command": "vs-code-ai-helper.reReviewCurrentTask",
+        "key": "ctrl+shift+alt+r",
+        "mac": "cmd+shift+alt+r"
       }
     ],
     "viewsContainers": {
