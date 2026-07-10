@@ -79,14 +79,15 @@ export class CopilotLanguageModelRunner implements AgentRunner {
     }
 
     const messages = [vscode.LanguageModelChatMessage.User(request.prompt)];
+    const modelOptions: Record<string, unknown> = {};
+    if (parsedModel.reasoningEffort) {
+      modelOptions.model_reasoning_effort = parsedModel.reasoningEffort;
+    }
+    if (parsedModel.contextWindow) {
+      modelOptions.model_context_window = parsedModel.contextWindow;
+    }
     const requestOptions: vscode.LanguageModelChatRequestOptions =
-      parsedModel.reasoningEffort
-        ? {
-            modelOptions: {
-              model_reasoning_effort: parsedModel.reasoningEffort,
-            },
-          }
-        : {};
+      Object.keys(modelOptions).length > 0 ? { modelOptions } : {};
 
     try {
       const response = await model.sendRequest(messages, requestOptions, token);

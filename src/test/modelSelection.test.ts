@@ -69,6 +69,30 @@ function copilotReasoningVariants(
   }));
 }
 
+function copilotReasoningAndContextVariants(
+  model: string,
+  label: string,
+  efforts: readonly (readonly [string, string])[],
+  longContext: boolean
+): SelectableModel[] {
+  const variants: SelectableModel[] = [];
+  for (const [effort, effortLabel] of efforts) {
+    variants.push({
+      id: `${model}@${effort}`,
+      name: `${label} (${effortLabel})`,
+      providerLabel: "GitHub Copilot",
+    });
+    if (longContext) {
+      variants.push({
+        id: `${model}@${effort}+long`,
+        name: `${label} (${effortLabel}, Long Context)`,
+        providerLabel: "GitHub Copilot",
+      });
+    }
+  }
+  return variants;
+}
+
 function copilotModel(
   id: string,
   name: string
@@ -122,11 +146,60 @@ void describe("CLI model refresh fallback", () => {
 });
 
 void describe("getAvailableModels", () => {
-  void it("annotates Copilot Claude Fable and Opus models as Pro+ only", async () => {
+  void it("surfaces the current Copilot default model matrix", async () => {
     __testOnly.restoreSeededCliModelCache();
     __testOnly.setModelSelectionTestOverrides({
       getAvailableCopilotModels() {
         return Promise.resolve([
+          { id: "auto", name: "Auto" } as SelectableModel as never,
+          {
+            id: "copilot-gpt-5.6-sol",
+            name: "GPT-5.6 Sol",
+          } as SelectableModel as never,
+          {
+            id: "copilot-gpt-5.6-terra",
+            name: "GPT-5.6 Terra",
+          } as SelectableModel as never,
+          {
+            id: "copilot-gpt-5.6-luna",
+            name: "GPT-5.6 Luna",
+          } as SelectableModel as never,
+          {
+            id: "copilot-gpt-5.5",
+            name: "GPT-5.5",
+          } as SelectableModel as never,
+          {
+            id: "copilot-gpt-5.4",
+            name: "GPT-5.4",
+          } as SelectableModel as never,
+          {
+            id: "copilot-gpt-5.3-codex",
+            name: "GPT-5.3-Codex",
+          } as SelectableModel as never,
+          {
+            id: "copilot-gpt-5.4-mini",
+            name: "GPT-5.4 mini",
+          } as SelectableModel as never,
+          {
+            id: "copilot-gpt-5-mini",
+            name: "GPT-5 mini",
+          } as SelectableModel as never,
+          {
+            id: "copilot-claude-sonnet-5",
+            name: "Claude Sonnet 5",
+          } as SelectableModel as never,
+          {
+            id: "copilot-claude-sonnet-4.6",
+            name: "Claude Sonnet 4.6",
+          } as SelectableModel as never,
+          {
+            id: "copilot-claude-sonnet-4.5",
+            name: "Claude Sonnet 4.5",
+          } as SelectableModel as never,
+          {
+            id: "copilot-claude-haiku-4.5",
+            name: "Claude Haiku 4.5",
+          } as SelectableModel as never,
           {
             id: "copilot-claude-fable-5",
             name: "Claude Fable 5",
@@ -135,155 +208,37 @@ void describe("getAvailableModels", () => {
             id: "copilot-claude-opus-4.8",
             name: "Claude Opus 4.8",
           } as SelectableModel as never,
-        ]);
-      },
-      cliCommandExists() {
-        return Promise.resolve(false);
-      },
-    });
-
-    try {
-      const models = await getAvailableModels();
-      assert.deepStrictEqual(models, [
-        {
-          id: "copilot-claude-fable-5",
-          name: "Claude Fable 5 (only on Pro+ plan)",
-          providerLabel: "GitHub Copilot",
-        },
-        {
-          id: "copilot-claude-opus-4.8",
-          name: "Claude Opus 4.8 (only on Pro+ plan)",
-          providerLabel: "GitHub Copilot",
-        },
-      ]);
-    } finally {
-      __testOnly.clearModelSelectionTestOverrides();
-      __testOnly.resetCliModelCache();
-      __testOnly.restoreSeededCliModelCache();
-    }
-  });
-
-  void it("surfaces seeded Copilot GPT reasoning variants", async () => {
-    __testOnly.restoreSeededCliModelCache();
-    __testOnly.setModelSelectionTestOverrides({
-      getAvailableCopilotModels() {
-        return Promise.resolve([
           {
-            id: "copilot-gpt-5.5",
-            name: "GPT-5.5",
+            id: "copilot-claude-opus-4.8-fast",
+            name: "Claude Opus 4.8 (fast mode) (Preview)",
           } as SelectableModel as never,
           {
-            id: "copilot-gpt-5.6-terra",
-            name: "GPT-5.6-Terra",
+            id: "copilot-claude-opus-4.7",
+            name: "Claude Opus 4.7",
           } as SelectableModel as never,
           {
-            id: "copilot-gpt-5.6-luna",
-            name: "GPT-5.6-Luna",
+            id: "copilot-gemini-3.1-pro",
+            name: "Gemini 3.1 Pro (Preview)",
           } as SelectableModel as never,
           {
-            id: "copilot-gpt-5.4",
-            name: "GPT-5.4",
+            id: "copilot-gemini-3.5-flash",
+            name: "Gemini 3.5 Flash",
           } as SelectableModel as never,
           {
-            id: "copilot-gpt-5.4-mini",
-            name: "GPT-5.4-Mini",
-          } as SelectableModel as never,
-        ]);
-      },
-      cliCommandExists() {
-        return Promise.resolve(false);
-      },
-    });
-
-    try {
-      const models = await getAvailableModels();
-      assert.deepStrictEqual(models, [
-        {
-          id: "copilot-gpt-5.5",
-          name: "GPT-5.5",
-          providerLabel: "GitHub Copilot",
-        },
-        ...copilotReasoningVariants("copilot-gpt-5.5", "GPT-5.5", [
-          ["low", "Low"],
-          ["medium", "Medium"],
-          ["high", "High"],
-          ["xhigh", "Extra High"],
-        ]),
-        {
-          id: "copilot-gpt-5.6-terra",
-          name: "GPT-5.6-Terra",
-          providerLabel: "GitHub Copilot",
-        },
-        ...copilotReasoningVariants("copilot-gpt-5.6-terra", "GPT-5.6-Terra", [
-          ["low", "Low"],
-          ["medium", "Medium"],
-          ["high", "High"],
-          ["xhigh", "Extra High"],
-          ["max", "Max"],
-          ["ultra", "Ultra"],
-        ]),
-        {
-          id: "copilot-gpt-5.6-luna",
-          name: "GPT-5.6-Luna",
-          providerLabel: "GitHub Copilot",
-        },
-        ...copilotReasoningVariants("copilot-gpt-5.6-luna", "GPT-5.6-Luna", [
-          ["low", "Low"],
-          ["medium", "Medium"],
-          ["high", "High"],
-          ["xhigh", "Extra High"],
-          ["max", "Max"],
-        ]),
-        {
-          id: "copilot-gpt-5.4",
-          name: "GPT-5.4",
-          providerLabel: "GitHub Copilot",
-        },
-        ...copilotReasoningVariants("copilot-gpt-5.4", "GPT-5.4", [
-          ["low", "Low"],
-          ["medium", "Medium"],
-          ["high", "High"],
-          ["xhigh", "Extra High"],
-        ]),
-        {
-          id: "copilot-gpt-5.4-mini",
-          name: "GPT-5.4-Mini",
-          providerLabel: "GitHub Copilot",
-        },
-        ...copilotReasoningVariants("copilot-gpt-5.4-mini", "GPT-5.4-Mini", [
-          ["low", "Low"],
-          ["medium", "Medium"],
-          ["high", "High"],
-          ["xhigh", "Extra High"],
-        ]),
-      ]);
-    } finally {
-      __testOnly.clearModelSelectionTestOverrides();
-      __testOnly.resetCliModelCache();
-      __testOnly.restoreSeededCliModelCache();
-    }
-  });
-
-  void it("surfaces seeded Copilot Claude reasoning variants", async () => {
-    __testOnly.restoreSeededCliModelCache();
-    __testOnly.setModelSelectionTestOverrides({
-      getAvailableCopilotModels() {
-        return Promise.resolve([
-          {
-            id: "copilot-claude-sonnet-4.5",
-            name: "Claude Sonnet 4.5",
+            id: "copilot-kimi-k2.7-code",
+            name: "Kimi K2.7 Code",
           } as SelectableModel as never,
           {
-            id: "copilot-claude-sonnet-4.6",
-            name: "Claude Sonnet 4.6",
+            id: "copilot-mai-code-1-flash",
+            name: "MAI-Code-1-Flash",
           } as SelectableModel as never,
           {
             id: "copilot-claude-opus-4.6",
-            name: "Claude Opus 4.6",
+            name: "claude-opus-4.6",
           } as SelectableModel as never,
           {
-            id: "copilot-claude-haiku-4.5",
-            name: "Claude Haiku 4.5",
+            id: "copilot-claude-opus-4.5",
+            name: "claude-opus-4.5",
           } as SelectableModel as never,
         ]);
       },
@@ -294,82 +249,213 @@ void describe("getAvailableModels", () => {
 
     try {
       const models = await getAvailableModels();
-      assert.deepStrictEqual(models, [
-        copilotModel("copilot-claude-sonnet-4.5", "Claude Sonnet 4.5"),
-        ...copilotReasoningVariants("copilot-claude-sonnet-4.5", "Claude Sonnet 4.5", [
-          ["low", "Low"],
-          ["medium", "Medium"],
-          ["high", "High"],
-          ["xhigh", "Extra High"],
-          ["max", "Max"],
-        ]),
-        copilotModel("copilot-claude-sonnet-4.6", "Claude Sonnet 4.6"),
-        ...copilotReasoningVariants("copilot-claude-sonnet-4.6", "Claude Sonnet 4.6", [
-          ["low", "Low"],
-          ["medium", "Medium"],
-          ["high", "High"],
-          ["max", "Max"],
-        ]),
-        copilotModel(
-          "copilot-claude-opus-4.6",
-          "Claude Opus 4.6 (only on Pro+ plan)"
-        ),
-        ...copilotReasoningVariants(
-          "copilot-claude-opus-4.6",
-          "Claude Opus 4.6 (only on Pro+ plan)",
+      const expected: SelectableModel[] = [
+        copilotModel("auto", "Auto"),
+        copilotModel("copilot-gpt-5.6-sol", "GPT-5.6 Sol"),
+        ...copilotReasoningAndContextVariants(
+          "copilot-gpt-5.6-sol",
+          "GPT-5.6 Sol",
           [
+            ["low", "Low"],
+            ["medium", "Medium"],
+            ["high", "High"],
+            ["xhigh", "Extra High"],
+            ["max", "Max"],
+            ["ultra", "Ultra"],
+          ],
+          true
+        ),
+        copilotModel("copilot-gpt-5.6-terra", "GPT-5.6 Terra"),
+        ...copilotReasoningAndContextVariants(
+          "copilot-gpt-5.6-terra",
+          "GPT-5.6 Terra",
+          [
+            ["low", "Low"],
+            ["medium", "Medium"],
+            ["high", "High"],
+            ["xhigh", "Extra High"],
+            ["max", "Max"],
+            ["ultra", "Ultra"],
+          ],
+          true
+        ),
+        copilotModel("copilot-gpt-5.6-luna", "GPT-5.6 Luna"),
+        ...copilotReasoningAndContextVariants(
+          "copilot-gpt-5.6-luna",
+          "GPT-5.6 Luna",
+          [
+            ["low", "Low"],
+            ["medium", "Medium"],
+            ["high", "High"],
+            ["xhigh", "Extra High"],
+            ["max", "Max"],
+          ],
+          true
+        ),
+        copilotModel("copilot-gpt-5.5", "GPT-5.5"),
+        ...copilotReasoningAndContextVariants(
+          "copilot-gpt-5.5",
+          "GPT-5.5",
+          [
+            ["low", "Low"],
+            ["medium", "Medium"],
+            ["high", "High"],
+            ["xhigh", "Extra High"],
+          ],
+          true
+        ),
+        copilotModel("copilot-gpt-5.4", "GPT-5.4"),
+        ...copilotReasoningAndContextVariants(
+          "copilot-gpt-5.4",
+          "GPT-5.4",
+          [
+            ["low", "Low"],
+            ["medium", "Medium"],
+            ["high", "High"],
+            ["xhigh", "Extra High"],
+          ],
+          true
+        ),
+        copilotModel("copilot-gpt-5.3-codex", "GPT-5.3-Codex"),
+        ...copilotReasoningVariants("copilot-gpt-5.3-codex", "GPT-5.3-Codex", [
           ["low", "Low"],
           ["medium", "Medium"],
           ["high", "High"],
           ["xhigh", "Extra High"],
-          ["max", "Max"],
-          ]
+        ]),
+        copilotModel("copilot-gpt-5.4-mini", "GPT-5.4 mini"),
+        ...copilotReasoningVariants("copilot-gpt-5.4-mini", "GPT-5.4 mini", [
+          ["low", "Low"],
+          ["medium", "Medium"],
+          ["high", "High"],
+          ["xhigh", "Extra High"],
+        ]),
+        copilotModel("copilot-gpt-5-mini", "GPT-5 mini"),
+        ...copilotReasoningVariants("copilot-gpt-5-mini", "GPT-5 mini", [
+          ["low", "Low"],
+          ["medium", "Medium"],
+          ["high", "High"],
+          ["xhigh", "Extra High"],
+        ]),
+        copilotModel("copilot-claude-sonnet-5", "Claude Sonnet 5"),
+        ...copilotReasoningAndContextVariants(
+          "copilot-claude-sonnet-5",
+          "Claude Sonnet 5",
+          [
+            ["low", "Low"],
+            ["medium", "Medium"],
+            ["high", "High"],
+            ["xhigh", "Extra High"],
+            ["max", "Max"],
+          ],
+          true
         ),
+        copilotModel("copilot-claude-sonnet-4.6", "Claude Sonnet 4.6"),
+        ...copilotReasoningAndContextVariants(
+          "copilot-claude-sonnet-4.6",
+          "Claude Sonnet 4.6",
+          [
+            ["low", "Low"],
+            ["medium", "Medium"],
+            ["high", "High"],
+            ["max", "Max"],
+          ],
+          true
+        ),
+        copilotModel("copilot-claude-sonnet-4.5", "Claude Sonnet 4.5"),
         copilotModel("copilot-claude-haiku-4.5", "Claude Haiku 4.5"),
-      ]);
-    } finally {
-      __testOnly.clearModelSelectionTestOverrides();
-      __testOnly.resetCliModelCache();
-      __testOnly.restoreSeededCliModelCache();
-    }
-  });
-
-  void it("surfaces seeded Copilot Gemini reasoning variants", async () => {
-    __testOnly.restoreSeededCliModelCache();
-    __testOnly.setModelSelectionTestOverrides({
-      getAvailableCopilotModels() {
-        return Promise.resolve([
-          {
-            id: "copilot-gemini-2.5-pro",
-            name: "Gemini 2.5 Pro",
-          } as SelectableModel as never,
-          {
-            id: "copilot-gemini-2.5-flash",
-            name: "Gemini 2.5 Flash",
-          } as SelectableModel as never,
-        ]);
-      },
-      cliCommandExists() {
-        return Promise.resolve(false);
-      },
-    });
-
-    try {
-      const models = await getAvailableModels();
-      assert.deepStrictEqual(models, [
-        copilotModel("copilot-gemini-2.5-pro", "Gemini 2.5 Pro"),
-        ...copilotReasoningVariants("copilot-gemini-2.5-pro", "Gemini 2.5 Pro", [
+        copilotModel("copilot-claude-fable-5", "Claude Fable 5"),
+        ...copilotReasoningAndContextVariants(
+          "copilot-claude-fable-5",
+          "Claude Fable 5",
+          [
+            ["low", "Low"],
+            ["medium", "Medium"],
+            ["high", "High"],
+            ["xhigh", "Extra High"],
+            ["max", "Max"],
+          ],
+          true
+        ),
+        copilotModel("copilot-claude-opus-4.8", "Claude Opus 4.8"),
+        ...copilotReasoningAndContextVariants(
+          "copilot-claude-opus-4.8",
+          "Claude Opus 4.8",
+          [
+            ["low", "Low"],
+            ["medium", "Medium"],
+            ["high", "High"],
+            ["xhigh", "Extra High"],
+            ["max", "Max"],
+          ],
+          true
+        ),
+        copilotModel(
+          "copilot-claude-opus-4.8-fast",
+          "Claude Opus 4.8 (fast mode) (Preview)"
+        ),
+        ...copilotReasoningAndContextVariants(
+          "copilot-claude-opus-4.8-fast",
+          "Claude Opus 4.8 (fast mode) (Preview)",
+          [
+            ["low", "Low"],
+            ["medium", "Medium"],
+            ["high", "High"],
+            ["xhigh", "Extra High"],
+            ["max", "Max"],
+          ],
+          true
+        ),
+        copilotModel("copilot-claude-opus-4.7", "Claude Opus 4.7"),
+        ...copilotReasoningAndContextVariants(
+          "copilot-claude-opus-4.7",
+          "Claude Opus 4.7",
+          [
+            ["low", "Low"],
+            ["medium", "Medium"],
+            ["high", "High"],
+            ["xhigh", "Extra High"],
+            ["max", "Max"],
+          ],
+          true
+        ),
+        copilotModel("copilot-gemini-3.1-pro", "Gemini 3.1 Pro (Preview)"),
+        ...copilotReasoningAndContextVariants(
+          "copilot-gemini-3.1-pro",
+          "Gemini 3.1 Pro (Preview)",
+          [
+            ["low", "Low"],
+            ["medium", "Medium"],
+            ["high", "High"],
+          ],
+          true
+        ),
+        copilotModel("copilot-gemini-3.5-flash", "Gemini 3.5 Flash"),
+        ...copilotReasoningAndContextVariants(
+          "copilot-gemini-3.5-flash",
+          "Gemini 3.5 Flash",
+          [
+            ["low", "Low"],
+            ["medium", "Medium"],
+            ["high", "High"],
+          ],
+          true
+        ),
+        copilotModel("copilot-kimi-k2.7-code", "Kimi K2.7 Code"),
+        copilotModel("copilot-mai-code-1-flash", "MAI-Code-1-Flash"),
+        ...copilotReasoningVariants("copilot-mai-code-1-flash", "MAI-Code-1-Flash", [
           ["low", "Low"],
           ["medium", "Medium"],
           ["high", "High"],
+          ["xhigh", "Extra High"],
         ]),
-        copilotModel("copilot-gemini-2.5-flash", "Gemini 2.5 Flash"),
-        ...copilotReasoningVariants("copilot-gemini-2.5-flash", "Gemini 2.5 Flash", [
-          ["low", "Low"],
-          ["medium", "Medium"],
-          ["high", "High"],
-        ]),
-      ]);
+        copilotModel("copilot-claude-opus-4.6", "claude-opus-4.6"),
+        copilotModel("copilot-claude-opus-4.5", "claude-opus-4.5"),
+      ];
+      assert.deepStrictEqual(
+        providerModels(models, "GitHub Copilot"),
+        expected
+      );
     } finally {
       __testOnly.clearModelSelectionTestOverrides();
       __testOnly.resetCliModelCache();

@@ -198,6 +198,7 @@ export function parseCodexModelSelection(
 export interface ParsedCopilotModelSelection {
   model: string | undefined;
   reasoningEffort: string | undefined;
+  contextWindow?: string;
 }
 
 export function parseCopilotModelSelection(
@@ -212,7 +213,8 @@ export function parseCopilotModelSelection(
     return { model, reasoningEffort: undefined };
   }
 
-  const reasoningEffort = model.slice(separator + 1);
+  const selection = model.slice(separator + 1);
+  const [reasoningEffort, contextWindow] = selection.split("+", 2);
   if (!reasoningEffort || !COPILOT_REASONING_EFFORTS.has(reasoningEffort)) {
     return { model, reasoningEffort: undefined };
   }
@@ -220,6 +222,7 @@ export function parseCopilotModelSelection(
   return {
     model: model.slice(0, separator) || undefined,
     reasoningEffort,
+    ...(contextWindow === "long" ? { contextWindow: "long" } : {}),
   };
 }
 

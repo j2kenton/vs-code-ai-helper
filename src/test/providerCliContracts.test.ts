@@ -172,11 +172,12 @@ void describe("provider CLI contracts", () => {
     }
   });
 
-  void it("Copilot model variants map to base model plus reasoning config", () => {
-    const parsed = parseCopilotModelSelection("gpt-5.6-terra@ultra");
+  void it("Copilot model variants map to base model plus reasoning and context config", () => {
+    const parsed = parseCopilotModelSelection("gpt-5.6-terra@ultra+long");
     assert.deepStrictEqual(parsed, {
       model: "gpt-5.6-terra",
       reasoningEffort: "ultra",
+      contextWindow: "long",
     });
   });
 
