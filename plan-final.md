@@ -1,20 +1,27 @@
-# plan-final.md
+# Implementation Summary
 
-This stage polished the task status surfaces and notification routing, sending routine non-blocking notifications to a bounded status surface while keeping destructive validations as popups, and ensuring that the status bar actions are always context-sensitive and useful.
+Implemented current-task-aware managed meta-file git visibility. The Tasks view now exposes one state-dependent hide/show header action, while the command updates only a tagged Ensemble-owned block in the repository-root `.gitignore`, preserving user rules, legacy task paths, and line endings. CLI implementation safeguards were also completed so provider runs use workspace-rooted edit permissions and zero-change runs cannot be reported as successful.
 
 ## Files Changed
 
-- [src/views/taskStatusBar.ts](file:///c:/dev/PERSONAL/vs-code-ai-helper/src/views/taskStatusBar.ts): Updated `showMenu` to check if a task exists and offer `Resume shown task` if it is paused, or `Open shown task` otherwise (including completed states).
-- [src/commands/generatePlanWithAI.ts](file:///c:/dev/PERSONAL/vs-code-ai-helper/src/commands/generatePlanWithAI.ts): Integrated `NotificationRouter` for routine notifications and emitted progress summaries to the status view.
-- [src/commands/draftTaskWithAI.ts](file:///c:/dev/PERSONAL/vs-code-ai-helper/src/commands/draftTaskWithAI.ts): Integrated `NotificationRouter` for routine notifications and emitted progress summaries to the status view.
-- [src/commands/runLintingFixes.ts](file:///c:/dev/PERSONAL/vs-code-ai-helper/src/commands/runLintingFixes.ts): Integrated `NotificationRouter` for routine notifications and emitted progress summaries to the status view.
-- [src/commands/commitAndPushTask.ts](file:///c:/dev/PERSONAL/vs-code-ai-helper/src/commands/commitAndPushTask.ts): Integrated `NotificationRouter` for routine notifications and emitted progress summaries to the status view.
-- [src/commands/reviewActions.ts](file:///c:/dev/PERSONAL/vs-code-ai-helper/src/commands/reviewActions.ts): Integrated `NotificationRouter` for routine notifications and emitted progress summaries to the status view.
-- [src/test/stage5StatusNotification.test.ts](file:///c:/dev/PERSONAL/vs-code-ai-helper/src/test/stage5StatusNotification.test.ts): Added unit tests for `TaskStatusBar` quick pick menu actions under paused, active, and completed task states.
+- `src/commands/toggleMetaResourcesGitIgnore.ts` — Added repo-root git resolution, current-task eligibility, managed block insertion/removal, legacy path compatibility, EOL preservation, and hide/show command handlers.
+- `src/extension.ts` — Wired shared task inventory/current-task state into the gitignore commands and refreshed visibility contexts after task/current-task changes.
+- `package.json` — Added hide/show command contributions, state-based Tasks header menu entries, Codex bypass configuration, and unit-test coverage registration.
+- `src/test/metaGitIgnore.test.ts` — Added managed-block, legacy cleanup, EOL, hidden-state, malformed-block, pattern, and contribution tests.
+- `resources/prompts/run-implementation.md` — Made implementation instructions provider-neutral for CLI agents.
+- `resources/prompts/apply-impl-review-code.md` — Made review-application instructions provider-neutral for CLI agents.
+- `src/runners/cliAgentRunner.ts` — Fails completed CLI implementation runs that produce no tracked workspace changes.
+- `src/runners/providers.ts` — Roots Codex edit runs with `--cd`, supports workspace-write mode, and honors the explicit dangerous bypass setting.
+- `src/config/settings.ts` — Added the Codex dangerous sandbox-bypass setting getter.
+- `src/test/cliAgentRunnerOutput.test.ts` — Added zero-change implementation regression coverage.
+- `src/test/providerCliContracts.test.ts` — Added prompt-neutrality, Codex argument, and bypass-setting regression coverage.
+- `plan-final.md` — Recorded the completed implementation and verification checklist.
 
 ## Verification
 
-- [ ] Run `pnpm run test:unit` to verify that all 367 unit tests pass successfully.
-- [ ] Verify that routine warnings and informational messages appear in the "Recent Status" sidebar view.
-- [ ] Confirm that destructive confirmations (like git push confirmations) still appear as modal/standard popups.
-- [ ] Confirm that clicking the status bar when a shown task exists offers "Resume shown task" if paused, and "Open shown task" otherwise.
+- [x] Type-check with `pnpm run check-types`.
+- [x] Run the unit suite with `pnpm run test:unit`; the implementation context reports 389 passing tests.
+- [x] Compile with `pnpm run compile`; the implementation context reports a successful build with only existing lint warnings.
+- [x] Confirm the compiled extension includes the managed gitignore implementation.
+- [ ] Manually verify the Tasks header shows exactly one hide/show action as the current task and managed state change.
+- [ ] Manually verify hide/show edits only the tagged block in the repository-root `.gitignore`, including a missing file, CRLF content, and legacy root entries.
