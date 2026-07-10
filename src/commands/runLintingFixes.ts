@@ -271,10 +271,14 @@ export async function runLintingFixes(
           );
         }
       } catch (error) {
-        await persistLintState(
-          false,
-          `Linting run failed: ${error instanceof Error ? error.message : String(error)}`
-        );
+        try {
+          await runCompletionLint(taskFolderUri);
+        } catch {
+          await persistLintState(
+            false,
+            `Linting run failed: ${error instanceof Error ? error.message : String(error)}`
+          );
+        }
         void vscode.window.showErrorMessage(
           `Linting fixes failed: ${error instanceof Error ? error.message : String(error)}`
         );
