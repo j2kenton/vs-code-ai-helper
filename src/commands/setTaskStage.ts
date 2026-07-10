@@ -10,6 +10,7 @@ import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { advanceStage } from "../utils/stageTransition";
 import { NotificationRouter } from "../utils/notificationRouter";
+import { runCompletionLint } from "../utils/completionLint";
 
 /**
  * Accepted argument shapes for setTaskStage.
@@ -210,6 +211,11 @@ export async function setTaskStage(
 
   // Refresh the inventory so the new stage is visible immediately
   await inventory.refresh();
+
+  if (newStage === "completed") {
+    await runCompletionLint(taskFolderUri);
+    await inventory.refresh();
+  }
 
   NotificationRouter.showInformation(
     `${task.folderName} set to stage: ${STAGE_DISPLAY_NAMES[newStage]}`

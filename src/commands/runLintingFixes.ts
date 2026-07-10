@@ -7,6 +7,12 @@ import {
   updateLintPayload,
 } from "../utils/taskProgressUtils";
 import { NotificationRouter } from "../utils/notificationRouter";
+import { runCompletionLint } from "../utils/completionLint";
+import { renderPromptTemplate } from "../utils/promptTemplates";
+import { generateContextPack } from "../utils/contextPack";
+import { resolveModelForStage } from "../utils/modelSelection";
+import { runImplementationForModel } from "../runners/runnerRegistry";
+import { checkAndConfirmPromptSize } from "../utils/promptSizeGuard";
 
 /**
  * Accepted argument shapes for runLintingFixes.
@@ -76,6 +82,7 @@ function isFileInTaskFolder(fileUri: vscode.Uri, taskFolderPath: string): boolea
  */
 export async function runLintingFixes(
   inventory: TaskInventory,
+  extensionUri: vscode.Uri,
   explicitArg?: RunLintingFixesArg
 ): Promise<void> {
   const resolverArg = normalizeArg(explicitArg);
@@ -145,7 +152,7 @@ export async function runLintingFixes(
         });
 
         if (lintingIssues.length === 0) {
-          await persistLintState(true, "No linting issues found.");
+          await runCompletionLint(taskFolderUri);
           NotificationRouter.showInformation(
             "No linting issues found in the task folder. Your code looks good!"
           );
@@ -175,6 +182,13 @@ export async function runLintingFixes(
               await vscode.commands.executeCommand("editor.action.formatDocument");
               fixedCount++;
             }
+
+            // Fix commands can leave edits only in the in-memory document.
+            // Persist them before collecting the post-fix result so the lint
+            // payload describes what is actually on disk.
+            if (doc.isDirty) {
+              await doc.save();
+            }
           } catch {
             failedCount++;
           }
@@ -195,16 +209,39 @@ export async function runLintingFixes(
           }).length;
 
         if (remainingLintIssues === 0) {
-          await persistLintState(
-            true,
-            `Lint fixes complete (${fixedCount} file(s) processed).`
-          );
+          await runCompletionLint(taskFolderUri);
         } else {
-          await persistLintState(
-            false,
-            `${remainingLintIssues} file(s) still report lint issues after auto-fix.`
-          );
+          await persistLintState(false, `${remainingLintIssues} file(s) still report lint issues after auto-fix.`);
+
+          // Automatic editor fixes are only the first pass. Give the configured
+          // implementation agent the remaining diagnostics so it can make
+          // focused edits while the task remains completed.
+          const workspaceFolder = vscode.workspace.getWorkspaceFolder(taskFolderUri);
+          if (workspaceFolder) {
+            const model = await resolveModelForStage(taskFolderUri, "implementation");
+            const lint = JSON.stringify({ remainingFiles: remainingLintIssues, diagnostics: lintingIssues.map(([uri, ds]) => ({ file: uri.fsPath, messages: ds.map((d) => d.message) })) }, null, 2);
+            const contextPack = await generateContextPack(taskFolderUri, workspaceFolder.uri);
+            const prompt = await renderPromptTemplate(extensionUri, "final-fixes-code.md", { lint, contextPack });
+            const sizeCheck = await checkAndConfirmPromptSize(prompt, "the configured implementation agent");
+            if (sizeCheck === "ok" || sizeCheck === "confirmed") {
+              let result: Awaited<ReturnType<typeof runImplementationForModel>> | undefined;
+              await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: "Applying AI final fixes...", cancellable: true }, async (aiProgress, token) => {
+                result = await runImplementationForModel({ modelId: model.modelId, prompt, workspaceUri: workspaceFolder.uri, token, onProgress: (message) => aiProgress.report({ message }) });
+              });
+              if (result?.status === "completed") {
+                await runCompletionLint(taskFolderUri);
+                await inventory.refresh();
+                NotificationRouter.showInformation("AI final fixes applied; completion lint was rerun.");
+              } else if (result?.errorMessage) {
+                NotificationRouter.showWarning(`AI final fixes failed: ${result.errorMessage}`);
+              }
+            }
+          }
         }
+
+        // Keep the tree and subsequent command resolution aligned with the
+        // refreshed persisted lint payload.
+        await inventory.refresh();
 
         if (fixedCount > 0) {
           NotificationRouter.showInformation(
@@ -239,7 +276,7 @@ export function registerRunLintingFixesCommand(
   const disposable = vscode.commands.registerCommand(
     "vs-code-ai-helper.runLintingFixes",
     (arg?: RunLintingFixesArg) =>
-      runLintingFixes(inventory, arg)
+      runLintingFixes(inventory, context.extensionUri, arg)
   );
   context.subscriptions.push(disposable);
 }

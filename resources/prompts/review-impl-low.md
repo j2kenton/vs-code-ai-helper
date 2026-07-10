@@ -6,6 +6,9 @@ Assess at the code level: correctness of the specific changes, edge cases, error
 
 Structure your review as:
 
+Begin your response with a readiness score on its own line in this exact format:
+Readiness: N/10
+
 - Summary verdict (ready to complete / needs changes / cannot fully assess).
 - Per plan item: done / incomplete / defective / cannot assess, with file-level evidence for each judgment.
 - Blocking issues (if any), each with the file, the problem, and a concrete failure scenario.

@@ -6,6 +6,9 @@ Assess at the architectural level: is the implementation following the plan's ap
 
 Structure your review as:
 
+Begin your response with a readiness score on its own line in this exact format:
+Readiness: N/10
+
 - Summary verdict (on track / off track / cannot assess).
 - Per plan area: implemented / partially implemented / missing / cannot assess, with one line of evidence each (file + what you saw).
 - Blocking issues (if any): places where the implementation contradicts the plan's approach.

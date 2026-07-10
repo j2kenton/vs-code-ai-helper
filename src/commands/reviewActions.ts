@@ -51,6 +51,7 @@ import { checkAndConfirmPromptSize } from "../utils/promptSizeGuard";
 import * as cp from "child_process";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { parseReadiness } from "../utils/reviewReadiness";
+import { runCompletionLint } from "../utils/completionLint";
 import { improveReviewScore, MAX_REVIEW_ATTEMPTS } from "../utils/reviewScoreLoop";
 
 /**
@@ -1284,8 +1285,7 @@ export async function nextStage(
   //   persist lint payload — deferred until runLintingFixes is called explicitly
   //   refresh final rendered state — inventory watcher handles this
   if (next === "completed") {
-    // No additional steps in this implementation; the watcher handles refresh.
-    // The lint payload path is handled by runLintingFixes separately.
+    await runCompletionLint(resolved.folderUri);
     return;
   }
 

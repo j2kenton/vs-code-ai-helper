@@ -5,6 +5,7 @@ import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { advanceStage } from "../utils/stageTransition";
 import { STAGE_DISPLAY_NAMES, STAGE_ORDER } from "../types/taskProgress";
 import { IncompleteTask } from "../utils/taskProgressUtils";
+import { runCompletionLint } from "../utils/completionLint";
 
 /**
  * Accepted argument shapes for markTaskDone.
@@ -157,6 +158,11 @@ export async function markTaskDone(
   // ── Step 2: Refresh inventory ────────────────────────────────────────────
   await inventory.refresh();
 
+  // Completion lint is part of the transition, so completed tasks never
+  // silently remain in an unknown lint state.
+  const lintResult = await runCompletionLint(taskFolderUri);
+  await inventory.refresh();
+
   // ── Step 3: Select next active task deterministically ────────────────────
   const nextCanonicalId = selectNextTask(inventory, resolvedTask.canonicalId);
   if (nextCanonicalId) {
@@ -168,8 +174,8 @@ export async function markTaskDone(
   // ── Step 4: Show completion message ──────────────────────────────────────
   void vscode.window.showInformationMessage(
     nextCanonicalId
-      ? `${resolvedTask.folderName} marked as done. Next task selected.`
-      : `${resolvedTask.folderName} marked as done. No remaining active tasks.`
+      ? `${resolvedTask.folderName} marked as done (${lintResult.passed ? "lint passed" : "lint issues found"}). Next task selected.`
+      : `${resolvedTask.folderName} marked as done (${lintResult.passed ? "lint passed" : "lint issues found"}). No remaining active tasks.`
   );
 }
 
