@@ -251,7 +251,7 @@
         "category": "Ensemble"
       },
       {
-        "command": "vs-code-ai-helper.reReviewCurrentTask",
+        "command": "vs-code-ai-helper.reviewCurrentTask",
         "title": "Review with AI",
         "category": "Ensemble"
       },
@@ -273,7 +273,7 @@
         "mac": "cmd+shift+alt+o"
       },
       {
-        "command": "vs-code-ai-helper.reReviewCurrentTask",
+        "command": "vs-code-ai-helper.reviewCurrentTask",
         "key": "ctrl+shift+alt+r",
         "mac": "cmd+shift+alt+r"
       },

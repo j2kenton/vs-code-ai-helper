@@ -73,7 +73,7 @@ export async function applyCurrentStageAction(
         return;
       } catch {
         void vscode.window.showInformationMessage(
-          "No high-level review artifact found yet. Run Re-review first."
+          "No high-level review artifact found yet. Run Review first."
         );
         return;
       }
@@ -97,7 +97,7 @@ export async function applyCurrentStageAction(
         return;
       } catch {
         void vscode.window.showInformationMessage(
-          "No low-level review artifact found yet. Run Re-review first."
+          "No low-level review artifact found yet. Run Review first."
         );
         return;
       }

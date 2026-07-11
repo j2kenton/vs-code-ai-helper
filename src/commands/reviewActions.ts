@@ -737,7 +737,7 @@ export async function runReviewForFolder(
     templateFile,
     variables,
     outputFileUri: reviewUri,
-    progressAction: `Re-reviewing ${STAGE_DISPLAY_NAMES[targetStage]}`,
+    progressAction: `Reviewing ${STAGE_DISPLAY_NAMES[targetStage]}`,
     outputLabel: STAGE_ARTIFACT_FILENAMES[targetStage] ?? "review",
     validateOutput: validateReviewOutput,
   });
@@ -762,7 +762,7 @@ function validateReviewOutput(content: string): { valid: boolean; reason: string
 
 /**
  * Run (or re-run) the review for the task's current position in the
- * workflow. Labeled "Re-review" in the UI.
+ * workflow. Labeled "Review" in the UI.
  *
  * Requires first-use consent before any AI action runs.
  */
@@ -790,7 +790,7 @@ export async function runReviewWithAI(
   // rejected here to avoid showing an error for args the user never intended.
   if (isMalformedReviewArg(arg as ReviewCommandArg | Record<string, unknown>)) {
     void vscode.window.showErrorMessage(
-      "Re-review: unsupported argument shape. " +
+      "Review: unsupported argument shape. " +
         "Use { taskFolderPath } to target a specific task, or invoke without an argument to pick from a list."
     );
     return;
@@ -805,7 +805,7 @@ export async function runReviewWithAI(
   const resolved = await resolveTask(
     normalizeReviewArg(arg),
     Object.keys(REVIEW_TARGETS) as TaskStage[],
-    "Re-review with AI"
+    "Review with AI"
   );
   if (!resolved) {
     return;
@@ -1195,10 +1195,10 @@ export async function viewReview(arg?: ReviewCommandArg): Promise<void> {
   if (!content) {
     const choice = await vscode.window.showInformationMessage(
       `No ${STAGE_ARTIFACT_FILENAMES[stage]} yet for this task.`,
-      "Re-review with AI",
+      "Review with AI",
       "Create Manually"
     );
-    if (choice === "Re-review with AI") {
+    if (choice === "Review with AI") {
       await vscode.commands.executeCommand(
         "vs-code-ai-helper.runReviewWithAI",
         arg

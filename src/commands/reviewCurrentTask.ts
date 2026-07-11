@@ -4,10 +4,10 @@ import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 
 /**
- * Keyboard shortcut router: runs Re-review with AI against the current task,
+ * Keyboard shortcut router: runs Review with AI against the current task,
  * without requiring the user to navigate the tree first.
  */
-export async function reReviewCurrentTask(
+export async function reviewCurrentTask(
   inventory: TaskInventory,
   currentTaskStore: CurrentTaskStore
 ): Promise<void> {
@@ -38,16 +38,16 @@ export async function reReviewCurrentTask(
 }
 
 /**
- * Register the reReviewCurrentTask command.
+ * Register the reviewCurrentTask command.
  */
-export function registerReReviewCurrentTaskCommand(
+export function registerReviewCurrentTaskCommand(
   context: vscode.ExtensionContext,
   inventory: TaskInventory,
   currentTaskStore: CurrentTaskStore
 ): void {
   const disposable = vscode.commands.registerCommand(
-    "vs-code-ai-helper.reReviewCurrentTask",
-    () => reReviewCurrentTask(inventory, currentTaskStore)
+    "vs-code-ai-helper.reviewCurrentTask",
+    () => reviewCurrentTask(inventory, currentTaskStore)
   );
   context.subscriptions.push(disposable);
 }
