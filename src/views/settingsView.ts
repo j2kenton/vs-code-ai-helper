@@ -353,11 +353,16 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
 
           function modelComboboxHtml(kind, stage, selectedId, disabled) {
             const selectedModel = findModelById(selectedId);
-            const selectedLabel = selectedModel ? modelLabel(selectedModel) : '';
+            const selectedLabel = selectedModel
+              ? modelLabel(selectedModel)
+              : selectedId
+                ? 'Unknown model: ' + selectedId
+                : '';
+            const hiddenValue = selectedModel ? selectedId : '';
             const disabledAttr = disabled ? 'disabled' : '';
             return \`
               <div class="model-combobox" data-kind="\${kind}" data-stage="\${stage}">
-                <input type="hidden" id="\${kind}-\${stage}" value="\${escapeHtml(selectedId || '')}">
+                <input type="hidden" id="\${kind}-\${stage}" value="\${escapeHtml(hiddenValue || '')}">
                 <input
                   type="text"
                   id="\${kind}-input-\${stage}"
@@ -423,6 +428,19 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               hidden.value = id;
               input.value = id ? label : '';
               closeList();
+            }
+
+            function reconcileExactValue() {
+              const typed = input.value.trim().toLowerCase();
+              const exact = availableModels.find(model =>
+                modelLabel(model).toLowerCase() === typed ||
+                model.id.toLowerCase() === typed
+              );
+              if (exact) {
+                selectValue(exact.id, modelLabel(exact));
+              } else {
+                closeList();
+              }
             }
 
             function renderOptions() {
@@ -494,19 +512,27 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             });
 
             input.addEventListener('blur', () => {
-              setTimeout(() => {
-                const typed = input.value.trim().toLowerCase();
-                const exact = availableModels.find(model =>
-                  modelLabel(model).toLowerCase() === typed ||
-                  model.id.toLowerCase() === typed
-                );
-                if (exact) {
-                  selectValue(exact.id, modelLabel(exact));
-                } else {
-                  closeList();
-                }
-              }, 120);
+              setTimeout(reconcileExactValue, 120);
             });
+          }
+
+          function reconcileModelInput(kind, stage) {
+            const hidden = document.getElementById(kind + '-' + stage);
+            const input = document.getElementById(kind + '-input-' + stage);
+            if (!hidden || !input) {
+              return '';
+            }
+
+            const typed = input.value.trim().toLowerCase();
+            const exact = availableModels.find(model =>
+              modelLabel(model).toLowerCase() === typed ||
+              model.id.toLowerCase() === typed
+            );
+            if (exact) {
+              hidden.value = exact.id;
+              input.value = modelLabel(exact);
+            }
+            return hidden.value;
           }
 
           function renderTable() {
@@ -578,10 +604,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             alertRegion.innerText = '';
 
             stagesList.forEach(stage => {
-              const primary = document.getElementById('primary-' + stage).value;
+              const primary = reconcileModelInput('primary', stage);
               const primaryText = document.getElementById('primary-input-' + stage).value.trim();
               const fallbackEnabled = document.getElementById('enable-fallback-' + stage).checked;
-              const backup = document.getElementById('backup-' + stage).value;
+              const backup = reconcileModelInput('backup', stage);
               const backupText = document.getElementById('backup-input-' + stage).value.trim();
               const strategy = document.getElementById('strategy-' + stage).value;
 
