@@ -142,16 +142,16 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
 
   public focusStage(stage: TaskStage, control: "primary" | "backup" = "primary"): void {
     if (this._view) {
-      this._view.show(true);
+      this._view.show(false);
       void this._view.webview.postMessage({ type: "focusStage", stage, control });
     }
   }
 
-  public reveal(): boolean {
+  public reveal(preserveFocus = false): boolean {
     if (!this._view) {
       return false;
     }
-    this._view.show(true);
+    this._view.show(preserveFocus);
     return true;
   }
 
