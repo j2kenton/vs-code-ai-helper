@@ -97,6 +97,16 @@ type ReviewCommandArg =
   | { taskFolderPath: string }
   | undefined;
 
+interface ApplyReviewOptions {
+  /** Skip repeated dirty/non-git workspace confirmations for internally chained runs. */
+  skipImplementationSafetyCheck?: boolean;
+}
+
+interface ExecuteImplementationRunOptions {
+  /** Skip the pre-run dirty/non-git workspace confirmation. */
+  skipPreRunSafetyCheck?: boolean;
+}
+
 /**
  * Detect whether a value that was passed as `ReviewCommandArg` is an
  * unrecognized object shape — i.e. neither `undefined`, nor a well-formed
@@ -943,7 +953,8 @@ export async function runReviewWithAI(
 export async function applyReviewWithAI(
   extensionUri: vscode.Uri,
   context: vscode.ExtensionContext,
-  arg?: ReviewCommandArg
+  arg?: ReviewCommandArg,
+  options: ApplyReviewOptions = {}
 ): Promise<void> {
   // ── Pre-flight workspace guard ────────────────────────────────────────────
   if ((vscode.workspace.workspaceFolders ?? []).length === 0) {
@@ -1009,7 +1020,10 @@ export async function applyReviewWithAI(
       resolved.folderUri,
       workspaceRoot,
       stage,
-      reviewContent
+      reviewContent,
+      {
+        skipPreRunSafetyCheck: options.skipImplementationSafetyCheck,
+      }
     );
     return;
   }
@@ -1067,10 +1081,13 @@ export async function applyReviewWithAI(
  * as soon as an attempt's readiness score improves by at least 1 over the
  * score the review had when this command started.
  *
- * Deliberately calls the unmodified applyReviewWithAI for each attempt
- * rather than re-implementing apply logic, so this can never diverge from
- * what the regular "Apply Review" button does per attempt — it only adds
- * the surrounding loop. Progress between attempts is inferred by re-reading
+ * Deliberately calls the same applyReviewWithAI path for each attempt rather
+ * than re-implementing apply logic, so this can never diverge from what the
+ * regular "Apply Review" button does per attempt. The only fast-forward
+ * override is that attempts after the first skip the implementation pre-run
+ * dirty/non-git confirmation, because the user already approved the button
+ * press and repeated prompts would interrupt the loop. Progress between
+ * attempts is inferred by re-reading
  * the review artifact from disk (rather than threading a success signal
  * through applyReviewWithAI's internals, which branch differently for plan
  * vs. implementation reviews): if an attempt leaves the review file
@@ -1161,7 +1178,9 @@ export async function fastForwardReviewWithAI(
             progress.report({
               message: `Attempt ${attemptNumber} of ${MAX_REVIEW_ATTEMPTS}...`,
             });
-            await applyReviewWithAI(extensionUri, context, concreteArg);
+            await applyReviewWithAI(extensionUri, context, concreteArg, {
+              skipImplementationSafetyCheck: attemptNumber > 1,
+            });
           },
           review: async () => {
             const newContent = await readNonEmptyText(reviewUri);
@@ -1217,7 +1236,8 @@ async function applyImplementationReviewWithAI(
   folderUri: vscode.Uri,
   workspaceRoot: vscode.WorkspaceFolder,
   stage: TaskStage,
-  reviewContent: string
+  reviewContent: string,
+  options: ExecuteImplementationRunOptions = {}
 ): Promise<void> {
   // Materialize canonical plan-final.md from legacy implementation.md if needed.
   let canonicalUri: vscode.Uri;
@@ -1275,7 +1295,8 @@ async function applyImplementationReviewWithAI(
     prompt,
     model.modelId,
     `Applying implementation review with ${providerLabel}...`,
-    stage
+    stage,
+    options
   );
 }
 
@@ -1635,43 +1656,46 @@ async function executeImplementationRun(
   prompt: string,
   modelId: string | undefined,
   progressTitle: string,
-  postRunReviewStage: TaskStage = "impl"
+  postRunReviewStage: TaskStage = "impl",
+  options: ExecuteImplementationRunOptions = {}
 ): Promise<void> {
   const cwd = workspaceRoot.uri.fsPath;
 
   // Pre-run safety checks for agentic file-editing runs
-  const isGit = await isGitWorkspace(cwd);
-  if (!isGit) {
-    // Non-git workspace: changes cannot be tracked or reverted
-    const proceed = await vscode.window.showWarningMessage(
-      "⚠️ This workspace is not tracked by git.\n\n" +
-        "The AI implementation run will edit files in your workspace, " +
-        "but there is no git history to track or revert those changes. " +
-        "You will not be able to see exactly what was changed or undo it via git.\n\n" +
-        "Back up your workspace before proceeding.",
-      { modal: true },
-      "Proceed Anyway",
-    );
-    if (proceed !== "Proceed Anyway") {
-      NotificationRouter.showInformation("Implementation run cancelled.");
-      return;
-    }
-  } else {
-    // Git workspace: warn if there are uncommitted changes
-    const dirty = await hasUncommittedChanges(cwd);
-    if (dirty) {
+  if (!options.skipPreRunSafetyCheck) {
+    const isGit = await isGitWorkspace(cwd);
+    if (!isGit) {
+      // Non-git workspace: changes cannot be tracked or reverted
       const proceed = await vscode.window.showWarningMessage(
-        "⚠️ Your workspace has uncommitted changes.\n\n" +
-          "The AI implementation run will edit workspace files. " +
-          "For best results, commit your current changes first so you can " +
-          "clearly see what the AI changed and revert if needed.",
-        { modal: false },
-        "Proceed",
-        "Cancel",
+        "⚠️ This workspace is not tracked by git.\n\n" +
+          "The AI implementation run will edit files in your workspace, " +
+          "but there is no git history to track or revert those changes. " +
+          "You will not be able to see exactly what was changed or undo it via git.\n\n" +
+          "Back up your workspace before proceeding.",
+        { modal: true },
+        "Proceed Anyway",
       );
-      if (proceed !== "Proceed") {
+      if (proceed !== "Proceed Anyway") {
         NotificationRouter.showInformation("Implementation run cancelled.");
         return;
+      }
+    } else {
+      // Git workspace: warn if there are uncommitted changes
+      const dirty = await hasUncommittedChanges(cwd);
+      if (dirty) {
+        const proceed = await vscode.window.showWarningMessage(
+          "⚠️ Your workspace has uncommitted changes.\n\n" +
+            "The AI implementation run will edit workspace files. " +
+            "For best results, commit your current changes first so you can " +
+            "clearly see what the AI changed and revert if needed.",
+          { modal: false },
+          "Proceed",
+          "Cancel",
+        );
+        if (proceed !== "Proceed") {
+          NotificationRouter.showInformation("Implementation run cancelled.");
+          return;
+        }
       }
     }
   }
