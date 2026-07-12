@@ -46,7 +46,7 @@ export interface AgentRunResult {
   summary?: string;
   errorMessage?: string;
   /** Stable provider-neutral failure classification. */
-  failureKind?: "quota" | "generic";
+  failureKind?: "quota" | "temporarily-unavailable" | "generic";
   modelId?: string;
 }
 

@@ -100,7 +100,7 @@ export async function setTaskStage(
   const resolvedTask = await resolveTaskContext(
     inventory,
     resolverArg,
-    { allowPaused: true },
+    { allowPaused: false },
     currentTaskStore
   );
 
@@ -198,7 +198,7 @@ export async function setTaskStage(
     taskFolderUri,
     task.progress.currentStage,
     newStage,
-    task.progress.status === "paused",
+    false,
     triggerAutoReview
   );
 

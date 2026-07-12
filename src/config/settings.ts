@@ -177,7 +177,14 @@ export async function setModelSettings(settings: ModelSettings): Promise<void> {
   const clean: ModelSettings = {};
   for (const stage of AI_MODEL_STAGES) {
     const setting = settings[stage];
-    if (setting) clean[stage] = { ...setting, fallbackEnabled: Boolean(setting.fallbackEnabled) };
+    if (setting) {
+      const primary = typeof setting.primary === "string" && setting.primary.trim() ? setting.primary.trim() : undefined;
+      const backup = typeof setting.backup === "string" && setting.backup.trim() ? setting.backup.trim() : undefined;
+      const fallbackEnabled = Boolean(setting.fallbackEnabled) && Boolean(backup) && backup !== primary;
+      // Turning fallback off is a policy change, not deletion of the user's
+      // configured backup. Preserve it so re-enabling fallback is reversible.
+      clean[stage] = { ...setting, primary, backup, fallbackEnabled };
+    }
   }
   await config.update(
     MODEL_SETTINGS_KEY,

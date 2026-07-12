@@ -10,7 +10,8 @@ export function migratePersistedState(value: unknown): PersistedStateEnvelope<Ta
   // otherwise it was only an attempted transition and must remain actionable.
   const legacyData = (envelope.data ?? {}) as TaskProgress & { publishArtifact?: unknown; artifacts?: unknown };
   const hasCompletionEvidence = Boolean(
-    legacyData.completedAt || legacyData.publishArtifact || legacyData.artifacts
+    legacyData.completedAt || legacyData.publishArtifact ||
+    (legacyData.currentStage === "publish" && legacyData.publishArtifact)
   );
   const legacyCompleted = legacyStage === "completed" || legacyStatus === "finished" || legacyStatus === "done";
   const completed = legacyCompleted && (hasCompletionEvidence || legacyStatus === "finished" || legacyStatus === "done");

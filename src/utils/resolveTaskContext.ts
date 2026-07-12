@@ -33,8 +33,8 @@ export interface ResolveTaskOptions {
    *     no prompt needed since the match is unambiguous.
    *   - More than one open folder contains it (nested multi-root
    *     workspaces) -> show a folder picker so the user disambiguates.
-   *   - No open folder contains it -> nothing to resolve; fails closed
-   *     same as when this option is unset.
+   *   - No open folder contains it -> show a picker so the user can bind the
+   *     task to its owning workspace, or cancel and fail closed.
    * Off by default so the many existing callers keep their current
    * UI-free, fail-closed behavior; only opt in at a genuine user-driven
    * entry point.
@@ -71,6 +71,18 @@ async function resolveAmbiguousOwnership(
       placeHolder: "This task's saved workspace no longer matches one open folder — select the owning one",
     });
     rebindRoot = picked?.root;
+  } else {
+    const picked = await vscode.window.showOpenDialog({
+      canSelectFiles: false,
+      canSelectFolders: true,
+      canSelectMany: false,
+      openLabel: "Bind Workspace",
+      title: `Select the workspace containing "${task.folderName}"`,
+    });
+    const candidate = picked?.[0]?.fsPath;
+    if (candidate && (task.taskFolderPath === candidate || task.taskFolderPath.startsWith(candidate + path.sep))) {
+      rebindRoot = path.resolve(candidate);
+    }
   }
   if (!rebindRoot) {
     return undefined;
@@ -231,9 +243,8 @@ export async function resolveTaskContext(
   const workspaceRoots = (vscode.workspace.workspaceFolders ?? []).map(folder => path.resolve(folder.uri.fsPath));
 
   if (
-    persistedOwner &&
-    (!workspaceRoots.includes(path.resolve(persistedOwner)) ||
-      resolved.progress.ownership?.state === "ownership-unresolved")
+    resolved.progress.ownership?.state === "ownership-unresolved" ||
+    (persistedOwner && !workspaceRoots.includes(path.resolve(persistedOwner)))
   ) {
     // The persisted owner no longer matches any open workspace folder (the
     // task's ownership is unresolved) or is explicitly marked unresolved. Only

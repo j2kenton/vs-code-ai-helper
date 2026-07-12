@@ -123,14 +123,25 @@ export async function writeTaskProgress(
  *
  * @param taskFolderUri - URI of the task folder
  * @param update - Partial fields to merge in, or a callback `(current) => patched`
+ * @param skipLock - Skip acquiring the task lock (caller already holds an
+ *   equivalent lock, e.g. task activation holding the shared meta-root lock).
+ * @param beforeWrite - Optional side effect run after `update` has validated/
+ *   computed the patched value but before it is persisted, still inside the
+ *   same lease as the CAS check. Use this to publish a file artifact (e.g.
+ *   rename a staged review into place) atomically with the progress write so
+ *   a superseded caller's `update` throwing prevents both the write AND the
+ *   side effect, and a caller that passes CAS can't have its publish step
+ *   raced by a newer claim that starts only after the lease is released.
  * @returns The persisted TaskProgress if successful, or undefined if the
  *          progress file could not be read.
  */
 export async function patchTaskProgress(
   taskFolderUri: vscode.Uri,
-  update: Partial<TaskProgress> | ((current: TaskProgress) => TaskProgress)
+  update: Partial<TaskProgress> | ((current: TaskProgress) => TaskProgress),
+  skipLock = false,
+  beforeWrite?: (patched: TaskProgress) => Promise<void>
 ): Promise<TaskProgress | undefined> {
-  return withTaskLock(taskFolderUri.fsPath, async () => {
+  const operation = async () => {
     // Read and write under the same lease. Reading before acquiring the lock
     // allowed concurrent commands to serialize stale snapshots and lose updates.
     const current = await readTaskProgress(taskFolderUri);
@@ -164,6 +175,12 @@ export async function patchTaskProgress(
     }
   }
 
+    // `update` above already threw for a stale/rejected CAS, so reaching
+    // here means this caller owns the transition. Run the side effect before
+    // persisting so a concurrent claim can only observe it fully applied or
+    // not at all — never interleaved with this write.
+    if (beforeWrite) await beforeWrite(patched);
+
   // All read-modify-write progress mutations share the same lease. This is
   // the CAS boundary used by commands and prevents two operations from
   // silently overwriting each other's stage or status changes.
@@ -173,7 +190,8 @@ export async function patchTaskProgress(
     await writeTaskProgress(taskFolderUri, patched);
     await finishFinalization(taskFolderUri.fsPath);
     return patched;
-  });
+  };
+  return skipLock ? operation() : withTaskLock(taskFolderUri.fsPath, operation);
 }
 
 /**
@@ -190,7 +208,7 @@ export function createTaskProgress(
   return {
     taskFolder,
     currentStage: stage,
-    status: "active",
+    status: "creating",
     createdAt: now,
     updatedAt: now,
   };
@@ -206,9 +224,12 @@ export function updateTaskProgressStage(
   progress: TaskProgress,
   newStage: TaskStage
 ): TaskProgress {
+  const fallbackActive = { ...progress.fallbackActive };
+  delete fallbackActive[newStage];
   return {
     ...progress,
     currentStage: newStage,
+    fallbackActive,
     updatedAt: new Date().toISOString(),
   };
 }

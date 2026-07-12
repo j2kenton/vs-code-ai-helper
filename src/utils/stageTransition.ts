@@ -68,6 +68,16 @@ export const AUTO_REVIEW_TRANSITIONS: Partial<Record<TaskStage, TaskStage>> = {
  * @param newStage       The stage to advance to.
  * @param isPaused       Whether the task is currently paused.
  * @param triggerAutoReview  Whether the caller wants auto-review to fire.
+ * @param expectedReviewAttemptId  When set, the transition is rejected unless
+ *   the task's persisted `reviewAttemptId` still matches — guards against a
+ *   superseded review attempt advancing (or re-publishing over) a newer one.
+ * @param publishArtifact  Optional side effect (e.g. renaming a staged review
+ *   file into place) run atomically with the CAS check/write, inside the same
+ *   lock. Passing the artifact publish here — instead of doing it after
+ *   `advanceStage` returns — closes the window where a newer review attempt
+ *   could claim and publish before this attempt's own (already-validated)
+ *   publish step runs, which would otherwise let a stale result clobber the
+ *   accepted artifact.
  * @returns `StageTransitionResult`, or `undefined` when persistence failed.
  */
 export async function advanceStage(
@@ -75,10 +85,23 @@ export async function advanceStage(
   sourceStage: TaskStage,
   newStage: TaskStage,
   isPaused: boolean,
-  triggerAutoReview: boolean
+  triggerAutoReview: boolean,
+  expectedReviewAttemptId?: string,
+  publishArtifact?: () => Promise<void>
 ): Promise<StageTransitionResult | undefined> {
   // Short-circuit: no-op when source and destination are the same
   if (sourceStage === newStage) {
+    if (expectedReviewAttemptId !== undefined) {
+      const current = await patchTaskProgress(taskFolderUri, (progress) => {
+        if (progress.currentStage !== sourceStage || progress.reviewAttemptId !== expectedReviewAttemptId) {
+          throw new Error("Review result is stale; a newer review attempt owns this transition.");
+        }
+        return progress;
+      }, false, publishArtifact);
+      if (!current) return undefined;
+    } else if (publishArtifact) {
+      await publishArtifact();
+    }
     return {
       persisted: true,
       newStage,
@@ -97,8 +120,11 @@ export async function advanceStage(
         `Task changed before transition (expected ${sourceStage}, found ${current.currentStage}).`
       );
     }
+    if (expectedReviewAttemptId !== undefined && current.reviewAttemptId !== expectedReviewAttemptId) {
+      throw new Error("Review result is stale; a newer review attempt owns this transition.");
+    }
     return updateTaskProgressStage(current, newStage);
-  });
+  }, false, publishArtifact);
 
   if (!patched) {
     return undefined;

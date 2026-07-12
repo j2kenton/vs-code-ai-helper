@@ -464,7 +464,7 @@ export interface ImplementationRunResult {
   summary?: string;
   errorMessage?: string;
   /** Stable provider-neutral failure classification; set on failed results only. */
-  failureKind?: "quota" | "generic";
+  failureKind?: "quota" | "temporarily-unavailable" | "generic";
 }
 
 /**

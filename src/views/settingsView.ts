@@ -99,7 +99,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
    */
   private async _checkModelSettingsConflicts(): Promise<void> {
     const conflicts = await findTaskModelConflicts();
-    if (conflicts.length === 0) return;
+    if (conflicts.length === 0) {
+      return;
+    }
 
     const taskWord = conflicts.length === 1 ? "task has" : "tasks have";
     const choice = await vscode.window.showWarningMessage(

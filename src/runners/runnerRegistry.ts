@@ -175,18 +175,32 @@ export function resolveRunnerForModel(
       capabilities: instrumented.capabilities,
       isAvailable: () => instrumented.isAvailable(),
       async run(request, token): Promise<AgentRunResult> {
+        const availability = await primary.isAvailable();
+        // Never spend a backup allocation on credentials/configuration errors.
+        // Providers commonly report these as plain HTTP status text.
+        const authenticationFailure = isAuthenticationFailure(availability.reason);
+        if (!availability.available && !authenticationFailure) {
+          const folder = taskFolderUri ?? request.taskFolderUri;
+          if (folder && await reserveFallback(folder, stage)) {
+            const fallbackResult = await fallback.runner.run({ ...request, modelId: fallback.nativeModelId }, token);
+            recordQuotaObservation(stage, setting.backup, fallbackResult.failureKind, fallbackResult.errorMessage);
+            return fallbackResult;
+          }
+          return { runnerId: primary.id, status: "failed", failureKind: "temporarily-unavailable", errorMessage: availability.reason ?? "Model is temporarily unavailable." };
+        }
         const result = await primary.run(request, token);
         recordQuotaObservation(stage, modelId, result.failureKind, result.errorMessage);
-        if (result.failureKind !== "quota") {
+        if (result.failureKind !== "quota" && result.failureKind !== "temporarily-unavailable") {
           return result;
         }
 
         const folder = taskFolderUri ?? request.taskFolderUri;
-        if (folder) {
-          const reserved = await reserveFallback(folder, stage);
-          if (!reserved) {
-            return result;
-          }
+        if (!folder) {
+          return result;
+        }
+        const reserved = await reserveFallback(folder, stage);
+        if (!reserved) {
+          return result;
         }
 
         const fallbackResult = await fallback.runner.run({ ...request, modelId: fallback.nativeModelId }, token);
@@ -268,16 +282,31 @@ export async function runImplementationForModel(options: {
     recordQuotaObservation(options.stage, options.modelId, result.failureKind, result.errorMessage);
   }
   const setting = getModelSettings()[options.stage as keyof ReturnType<typeof getModelSettings>];
-  if (result.failureKind === "quota" && options.stage && chooseFallback(setting) === "backup" && setting?.backup) {
-    if (options.taskFolderUri) {
-      const reserved = await reserveFallback(options.taskFolderUri, options.stage);
-      if (!reserved) {
-        return result;
-      }
+  const authFailure = isAuthenticationFailure(result.errorMessage);
+  if (!authFailure && (result.failureKind === "quota" || result.failureKind === "temporarily-unavailable") && options.stage && chooseFallback(setting) === "backup" && setting?.backup) {
+    if (!options.taskFolderUri) {
+      return result;
+    }
+    const reserved = await reserveFallback(options.taskFolderUri, options.stage);
+    if (!reserved) {
+      return result;
     }
     const fallbackResult = await run(resolveEffectiveProvider(setting.backup));
     recordQuotaObservation(options.stage, setting.backup, fallbackResult.failureKind, fallbackResult.errorMessage);
     return fallbackResult;
   }
   return result;
+}
+
+// Authentication failures are terminal for the selected provider. Keep this
+// deliberately broad: providers often label expired credentials as generic
+// unavailability (or even "try again later"-style transient wording) rather
+// than a clean 401/403, so a narrow match would auto-fallback to the backup
+// model on what is actually an auth problem — exactly what callers must
+// never do (see the two call sites below). Exported for direct unit testing.
+export function isAuthenticationFailure(message: string | undefined): boolean {
+  // "session"/"token" tolerate a short word gap (e.g. "session has timed
+  // out", "token has been revoked") instead of requiring the state word to
+  // sit directly next to the noun.
+  return /sign[\s-]*in|log(?:ged|ging)?[\s-]*(?:in|out)|session[\s\w]{0,20}?(?:expired|invalid|missing|timed?\s*out)|authenticat\w*|authoris\w*|authoriz\w*|credential|re[-\s]?auth\w*|token[\s\w]{0,20}?(?:expired|invalid|missing|revoked)|api\s*key|access\s*denied|permission\s*denied|forbidden|unauthori[sz]ed|\b(?:401|403)\b/i.test(message ?? "");
 }

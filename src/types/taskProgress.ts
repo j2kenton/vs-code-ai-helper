@@ -124,6 +124,8 @@ export interface TaskProgress {
   pendingNotes?: Partial<Record<TaskStage, string>>;
   /** Active fallback state by stage */
   fallbackActive?: Partial<Record<TaskStage, boolean>>;
+  /** Monotonic token identifying the review run allowed to finalize this stage. */
+  reviewAttemptId?: string;
 }
 
 /**

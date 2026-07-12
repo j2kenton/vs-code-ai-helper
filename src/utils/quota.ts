@@ -17,18 +17,20 @@ const KEY = "pendingQuotaResume";
 // would false-positive on unrelated errors like "context length exceeded"
 // or an argv-size cap message.
 const QUOTA_MARKERS = ["quota", "rate limit", "ratelimit", "credits", "credit limit", "usage limit"];
+const TEMPORARY_MARKERS = ["temporarily unavailable", "service unavailable", "too many requests", "try again later"];
 
 export function isQuotaError(message: string | undefined): boolean {
   const value = (message ?? "").toLowerCase();
   return QUOTA_MARKERS.some((marker) => value.includes(marker));
 }
 
-export function classifyFailure<T extends { errorMessage?: string }>(result: T): T & { failureKind: "quota" | "generic" } {
-  return { ...result, failureKind: isQuotaError(result.errorMessage) ? "quota" : "generic" };
+export function classifyFailure<T extends { errorMessage?: string }>(result: T): T & { failureKind: "quota" | "temporarily-unavailable" | "generic" } {
+  const message = (result.errorMessage ?? "").toLowerCase();
+  return { ...result, failureKind: isQuotaError(result.errorMessage) ? "quota" : TEMPORARY_MARKERS.some(m => message.includes(m)) ? "temporarily-unavailable" : "generic" };
 }
 
-export function classifyCliFailure<T extends { status: "completed" | "failed" | "cancelled"; errorMessage?: string }>(result: T): T & { failureKind: "quota" | "generic" } {
-  return { ...result, failureKind: isQuotaError(result.errorMessage) ? "quota" : "generic" };
+export function classifyCliFailure<T extends { status: "completed" | "failed" | "cancelled"; errorMessage?: string }>(result: T): T & { failureKind: "quota" | "temporarily-unavailable" | "generic" } {
+  return classifyFailure(result);
 }
 
 export async function savePendingResume(context: vscode.ExtensionContext, request: AgentRunRequest): Promise<void> {
@@ -69,7 +71,7 @@ export async function handleQuotaFailure(context: vscode.ExtensionContext, reque
 // each time the extension host restarts — it is a live signal, not a
 // persisted ledger.
 
-export type QuotaState = "ok" | "exhausted";
+export type QuotaState = "ok" | "exhausted" | "unavailable";
 
 export interface QuotaObservation {
   state: QuotaState;
@@ -93,13 +95,13 @@ function quotaKey(stage: TaskStage, modelId: string | undefined): string {
 export function recordQuotaObservation(
   stage: TaskStage,
   modelId: string | undefined,
-  failureKind: "quota" | "generic" | undefined,
+  failureKind: "quota" | "temporarily-unavailable" | "generic" | undefined,
   errorMessage?: string
 ): void {
   const percentMatch = /(?:remaining|left|available)[^\d]{0,12}(\d{1,3})\s*%/i.exec(errorMessage ?? "");
   const parsedPercent = percentMatch ? Number(percentMatch[1]) : undefined;
   quotaObservations.set(quotaKey(stage, modelId), {
-    state: failureKind === "quota" ? "exhausted" : "ok",
+    state: failureKind === "quota" ? "exhausted" : failureKind === "temporarily-unavailable" ? "unavailable" : "ok",
     observedAt: new Date().toISOString(),
     ...(parsedPercent !== undefined && parsedPercent <= 100 ? { remainingPercent: parsedPercent } : {}),
   });
@@ -121,6 +123,8 @@ export function formatQuotaStatus(observation: QuotaObservation | undefined): st
   const percent = observation.remainingPercent === undefined ? "" : ` (${observation.remainingPercent}% remaining)`;
   return observation.state === "exhausted"
     ? `Quota exhausted as of ${time}${percent}`
+    : observation.state === "unavailable"
+      ? `Temporarily unavailable as of ${time}`
     : `OK as of ${time}${percent}`;
 }
 

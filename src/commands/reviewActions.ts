@@ -503,6 +503,9 @@ async function runAiToFile(options: {
    * `reason` when invalid so it can be surfaced in the error message.
    */
   validateOutput?: (content: string) => { valid: boolean; reason: string };
+  /** Defer publication until the caller has completed its CAS/state checks. */
+  promoteOutput?: boolean;
+  onValidatedOutput?: (content: string) => void;
 }): Promise<boolean> {
   const modelStage = options.executionStage ?? options.logStage;
   const model = await resolveModelForStage(options.taskFolderUri, modelStage);
@@ -520,16 +523,6 @@ async function runAiToFile(options: {
   const { runner, providerLabel, nativeModelId } = resolveRunnerForModel(
     model.modelId, modelStage, options.taskFolderUri
   );
-  const availability = await runner.isAvailable();
-  if (!availability.available) {
-    NotificationRouter.showWarning(
-      `${providerLabel} is unavailable: ${
-        availability.reason ?? "unknown reason"
-      }. Write ${options.outputLabel} manually instead.`
-    );
-    return false;
-  }
-
   // Build the prompt here so we can apply the size gate before launching.
   const prompt = await renderPromptTemplate(
     options.extensionUri,
@@ -550,6 +543,13 @@ async function runAiToFile(options: {
     : undefined;
 
   let completed = false;
+  // Providers write their response to the requested path.  Isolate that
+  // write until the response has passed validation and this run still owns
+  // the stage; otherwise a stale concurrent review can clobber the accepted
+  // artifact before its CAS is rejected.
+  const stagedOutputUri = options.validateOutput
+    ? vscode.Uri.joinPath(vscode.Uri.file(path.dirname(options.outputFileUri.fsPath)), `.${path.basename(options.outputFileUri.fsPath)}.${crypto.randomUUID()}.tmp`)
+    : options.outputFileUri;
   await vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Notification,
@@ -566,7 +566,7 @@ async function runAiToFile(options: {
           workspaceUri: options.workspaceUri,
           stage: options.logStage,
           prompt,
-          outputFile: options.outputFileUri,
+          outputFile: stagedOutputUri,
           modelId: nativeModelId,
         },
         token
@@ -583,7 +583,7 @@ async function runAiToFile(options: {
 
       if (result.status === "completed") {
         const newContentBytes = await vscode.workspace.fs.readFile(
-          options.outputFileUri
+          stagedOutputUri
         );
         const newContent = new TextDecoder().decode(newContentBytes);
         const validation = options.validateOutput?.(newContent);
@@ -591,17 +591,21 @@ async function runAiToFile(options: {
         if (validation && !validation.valid) {
           // Revert instead of leaving the invalid response in place — an
           // exit-0 CLI result is not proof the task was actually performed.
-          await writeTextFile(options.outputFileUri, previousContent ?? "");
+          await writeTextFile(stagedOutputUri, previousContent ?? "");
           void vscode.window.showErrorMessage(
             `${options.outputLabel} generation from ${providerLabel} did not produce a valid result ` +
               `(${validation.reason}). The provider may not have followed the instructions — try again.`
           );
         } else {
+          options.onValidatedOutput?.(newContent);
+          if (options.promoteOutput !== false && stagedOutputUri.fsPath !== options.outputFileUri.fsPath) {
+            await writeTextFile(options.outputFileUri, newContent);
+          }
           completed = true;
-          const doc = await vscode.workspace.openTextDocument(
-            options.outputFileUri
-          );
-          await vscode.window.showTextDocument(doc);
+          if (options.promoteOutput !== false) {
+            const doc = await vscode.workspace.openTextDocument(options.outputFileUri);
+            await vscode.window.showTextDocument(doc);
+          }
           NotificationRouter.showInformation(
             `${options.outputLabel} generated with ${providerLabel} (${
               result.summary ?? ""
@@ -618,6 +622,9 @@ async function runAiToFile(options: {
             result.errorMessage ?? "unknown error"
           }.`
         );
+      }
+      if (stagedOutputUri.fsPath !== options.outputFileUri.fsPath) {
+        try { await vscode.workspace.fs.delete(stagedOutputUri, { useTrash: false }); } catch { /* best effort */ }
       }
     }
   );
@@ -801,8 +808,20 @@ export async function runReviewForFolder(
   }
   variables.contextPack = contextPackContent;
 
+  // Claim the stage before starting the provider call. The token is checked
+  // again by the transition CAS, so a late result cannot advance a newer run.
+  const reviewAttemptId = crypto.randomUUID();
+  const claimed = await patchTaskProgress(folderUri, (current) => {
+    if (current.status === "paused") {
+      throw new Error("The task was paused while the review was starting.");
+    }
+    return { ...current, reviewAttemptId };
+  });
+  if (!claimed) return;
+
   // Review generation uses the review-stage model (no executionStage override).
   // Only apply flows separate logStage from executionStage.
+  let generatedReviewContent: string | undefined;
   const reviewWritten = await runAiToFile({
     extensionUri,
     taskFolderUri: folderUri,
@@ -814,28 +833,68 @@ export async function runReviewForFolder(
     progressAction: `Reviewing ${STAGE_DISPLAY_NAMES[targetStage]}`,
     outputLabel: STAGE_ARTIFACT_FILENAMES[targetStage] ?? "review",
     validateOutput: validateReviewOutput,
+    promoteOutput: false,
+    onValidatedOutput: (content) => { generatedReviewContent = content; },
   });
 
   if (reviewWritten) {
+    // Stage the artifact first. A unique temporary file prevents a stale
+    // review from touching the accepted artifact while it is competing for
+    // the attempt CAS. The rename itself is passed as advanceStage's
+    // publishArtifact side effect, so it runs atomically with the CAS check
+    // under the task lock: a newer review attempt can only claim and publish
+    // strictly before or after this attempt's whole CAS+publish, never in
+    // between. Doing the rename here, unlocked and after the fact, allowed a
+    // slower stale attempt to pass its own CAS and then clobber a faster
+    // attempt's already-published artifact.
+    const stagedReviewUri = vscode.Uri.file(`${reviewUri.fsPath}.attempt-${reviewAttemptId}.tmp`);
+    await vscode.workspace.fs.writeFile(stagedReviewUri, new TextEncoder().encode(generatedReviewContent ?? ""));
+    let transitionToTarget: Awaited<ReturnType<typeof advanceStage>>;
     try {
-      const contentBytes = await vscode.workspace.fs.readFile(reviewUri);
-      const content = new TextDecoder().decode(contentBytes);
-      if (isStrictPerfectReview(content)) {
-        NotificationRouter.showInformation(`Perfect review score (10/10) detected. Auto-advancing stage...`);
-        const configuredStages = await resolveConfiguredReviewStages(folderUri);
-        const next = computeNextStage(targetStage, configuredStages);
-        if (next) {
-          const transitionToTarget = await advanceStage(folderUri, currentStage, targetStage, false, false);
-          if (transitionToTarget?.persisted) {
-            const transition = await advanceStage(folderUri, targetStage, next, false, false);
+      transitionToTarget = await advanceStage(
+        folderUri,
+        currentStage,
+        targetStage,
+        false,
+        false,
+        reviewAttemptId,
+        async () => { await vscode.workspace.fs.rename(stagedReviewUri, reviewUri, { overwrite: true }); }
+      );
+    } catch (error) {
+      // A stale/rejected CAS (a newer attempt already owns the stage) or a
+      // rename failure both throw before progress is ever written, so there
+      // is nothing to revert — just discard this attempt's orphaned staged
+      // file and tell the user, instead of leaving the failure silent.
+      await vscode.workspace.fs.delete(stagedReviewUri).then(
+        () => undefined,
+        () => undefined
+      );
+      const message = error instanceof Error ? error.message : String(error);
+      NotificationRouter.showWarning(`Review was generated but not published: ${message}`);
+      return;
+    }
+    if (transitionToTarget?.persisted && generatedReviewContent !== undefined) {
+      try {
+        const contentBytes = await vscode.workspace.fs.readFile(reviewUri);
+        const content = new TextDecoder().decode(contentBytes);
+        if (isStrictPerfectReview(content)) {
+          NotificationRouter.showInformation(`Perfect review score (10/10) detected. Auto-advancing stage...`);
+          const configuredStages = await resolveConfiguredReviewStages(folderUri);
+          const next = computeNextStage(targetStage, configuredStages);
+          if (next) {
+            const transition = await advanceStage(folderUri, targetStage, next, false, false, reviewAttemptId);
             if (transition?.persisted) {
               NotificationRouter.showInformation(`Perfect review accepted. Advanced to ${STAGE_DISPLAY_NAMES[next]}.`);
             }
           }
         }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        NotificationRouter.showWarning(
+          `Review was published, but auto-advancing past the perfect score failed: ${message}. ` +
+            "Advance the stage manually."
+        );
       }
-    } catch (e) {
-      // Ignore
     }
   }
 }
@@ -2043,5 +2102,22 @@ async function runRelease(arg?: TaskNodeArg): Promise<void> {
   // release"` reimplementation both duplicated that patched escaping logic
   // and broke bun releases on Windows (bun ships bun.exe, not bun.cmd).
   const args = ["run", "release"];
-  await new Promise<void>(resolve => { const child = cp.spawn(manager, args, { cwd: root, shell: process.platform === "win32", windowsHide: true }); child.on("close", code => { if (code === 0) NotificationRouter.showInformation("Release completed."); else void vscode.window.showErrorMessage(`Release failed (exit ${code ?? 1}).`); resolve(); }); child.on("error", e => { void vscode.window.showErrorMessage(`Release failed: ${e.message}`); resolve(); }); });
+  // Pin the manager resolved after confirmation. Do not use a shell: PATH
+  // shadowing or a changed shim must not silently change the executable.
+  let managerPath: string;
+  try {
+    const locator = process.platform === "win32" ? "where.exe" : "which";
+    managerPath = (cp.execFileSync(locator, [manager], { cwd: root, windowsHide: true })
+      .toString("utf8").split(/\r?\n/).map(value => value.trim()).find(Boolean)) ?? "";
+    if (!managerPath || !path.isAbsolute(managerPath)) throw new Error("package manager was not resolved to an absolute path");
+  } catch (error) {
+    void vscode.window.showErrorMessage(`Release cancelled: could not resolve ${manager} safely (${error instanceof Error ? error.message : String(error)}).`);
+    return;
+  }
+  const resolvedBeforeSpawn = managerPath;
+  await new Promise<void>(resolve => {
+    const child = cp.spawn(resolvedBeforeSpawn, args, { cwd: root, shell: process.platform === "win32" && /\.(cmd|bat)$/i.test(resolvedBeforeSpawn), windowsHide: true });
+    child.on("close", code => { if (code === 0) NotificationRouter.showInformation("Release completed."); else void vscode.window.showErrorMessage(`Release failed (exit ${code ?? 1}).`); resolve(); });
+    child.on("error", e => { void vscode.window.showErrorMessage(`Release failed: ${e.message}`); resolve(); });
+  });
 }

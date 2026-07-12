@@ -196,7 +196,7 @@ export interface CliExecResult {
   output: string;
   errorMessage?: string;
   /** Set on failed results; absent for completed/cancelled. */
-  failureKind?: "quota" | "generic";
+  failureKind?: "quota" | "temporarily-unavailable" | "generic";
 }
 
 const ANSI_ESCAPE_PATTERN =
