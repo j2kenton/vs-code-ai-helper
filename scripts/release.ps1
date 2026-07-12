@@ -28,7 +28,7 @@ foreach ($name in @("package", "publish:patch", "publish:minor", "publish:major"
     # Package scripts are deliberately limited to a runner plus `run <script>`
     # chains.  The package script uses &&, so validate each command rather than
     # rejecting the shell operator outright.
-    $safe = ($command -match '^(?:[a-zA-Z0-9_:\-.]+\s+run\s+[a-zA-Z0-9_:\-.]+)(?:\s+&&\s+(?:[a-zA-Z0-9_:\-.]+\s+run\s+[a-zA-Z0-9_:\-.]+|node\s+[a-zA-Z0-9_./:\-]+))*$') -or
+    $safe = ($command -match '^(?:[a-zA-Z0-9_:\-.]+\s+run\s+[a-zA-Z0-9_:\-.]+)(?:\s+&&\s+(?:[a-zA-Z0-9_:\-.]+\s+run\s+[a-zA-Z0-9_:\-.]+|node\s+[a-zA-Z0-9_./:\-]+(?:\s+--production)?))*$') -or
       ($command -match '^vsce\s+publish\s+(patch|minor|major)$')
     if ($allowedRunners -notcontains $runner -or -not $safe) {
         throw "Unsafe package script '$name': $command"
