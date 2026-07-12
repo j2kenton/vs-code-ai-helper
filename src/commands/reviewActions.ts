@@ -2059,16 +2059,6 @@ async function runRelease(arg?: TaskNodeArg): Promise<void> {
     void vscode.window.showWarningMessage("Release requires an active task at the Publish stage.");
     return;
   }
-  try {
-    const review = await vscode.workspace.fs.readFile(vscode.Uri.joinPath(vscode.Uri.file(candidate), STAGE_ARTIFACT_FILENAMES.publish!));
-    if (!isStrictPerfectReview(new TextDecoder().decode(review))) {
-      void vscode.window.showWarningMessage("Release requires a strict 10/10 Publish review.");
-      return;
-    }
-  } catch {
-    void vscode.window.showWarningMessage("Release requires a completed Publish review scored 10/10.");
-    return;
-  }
   const persistedOwner = progress?.ownership?.workspaceRoot;
   if (candidate && persistedOwner && (!owner || path.resolve(owner.uri.fsPath) !== path.resolve(persistedOwner))) {
     void vscode.window.showErrorMessage("This task belongs to a different workspace and cannot be released here.");

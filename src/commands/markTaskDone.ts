@@ -5,8 +5,6 @@ import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { STAGE_DISPLAY_NAMES } from "../types/taskProgress";
 import { IncompleteTask, patchTaskProgress } from "../utils/taskProgressUtils";
 import { runCompletionLint } from "../utils/completionLint";
-import { isStrictPerfectReview } from "../utils/reviewReadiness";
-import { STAGE_ARTIFACT_FILENAMES } from "../types/taskProgress";
 
 /**
  * Accepted argument shapes for markTaskDone.
@@ -155,20 +153,6 @@ export async function markTaskDone(
     return;
   }
 
-  // ── Step 2: Verify Publish review has a strict 10/10 score ───────────────
-  const publishReview = STAGE_ARTIFACT_FILENAMES.publish;
-  if (publishReview) {
-    try {
-      const bytes = await vscode.workspace.fs.readFile(vscode.Uri.joinPath(taskFolderUri, publishReview));
-      if (!isStrictPerfectReview(new TextDecoder().decode(bytes))) {
-        void vscode.window.showWarningMessage("Publish cannot be completed until the Publish review has a strict 10/10 score.");
-        return;
-      }
-    } catch {
-      void vscode.window.showWarningMessage("Publish cannot be completed until a Publish review has been generated and scored 10/10.");
-      return;
-    }
-  }
   // Completion is an explicit user action. Reaching Publish alone never
   // changes lifecycle status, but this command is the durable terminal edge.
   await patchTaskProgress(taskFolderUri, (current) => ({

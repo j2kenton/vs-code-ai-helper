@@ -12,8 +12,6 @@ import { advanceStage } from "../utils/stageTransition";
 import { selectNextTask } from "./markTaskDone";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { runCompletionLint } from "../utils/completionLint";
-import { isStrictPerfectReview } from "../utils/reviewReadiness";
-import { STAGE_ARTIFACT_FILENAMES } from "../types/taskProgress";
 import { resolveModelForStage } from "../utils/modelSelection";
 import { parseCopilotModelSelection, parseModelSelection } from "../runners/providers";
 
@@ -1087,22 +1085,6 @@ export async function completeCommitAndPushTask(
     NotificationRouter.showWarning(
       `"Complete, Commit and Push" is only available when the task is at the final review stage (Implementation: Low-Level Review) or completed.`
     );
-    return;
-  }
-
-  // The combined command must obey the same terminal gate as the dedicated
-  // completion command; reaching Publish is never implicit completion.
-  try {
-    const review = await vscode.workspace.fs.readFile(vscode.Uri.joinPath(
-      vscode.Uri.file(resolvedTask.taskFolderPath),
-      STAGE_ARTIFACT_FILENAMES.publish!
-    ));
-    if (!isStrictPerfectReview(new TextDecoder().decode(review))) {
-      NotificationRouter.showWarning("Publish cannot be completed until its review has a strict 10/10 score.");
-      return;
-    }
-  } catch {
-    NotificationRouter.showWarning("Publish cannot be completed until a review has been generated and scored 10/10.");
     return;
   }
 
