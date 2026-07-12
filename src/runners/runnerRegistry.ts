@@ -20,6 +20,8 @@ import {
 import { getModelSettings } from "../config/settings";
 import { chooseFallback } from "../utils/modelFallback";
 import { recordQuotaObservation } from "../utils/quota";
+import { patchTaskProgress } from "../utils/taskProgressUtils";
+import { TaskStage } from "../types/taskProgress";
 
 type EffectiveProvider =
   | { kind: "copilot"; model: string | undefined }
@@ -94,12 +96,39 @@ function toResolvedRunner(effective: EffectiveProvider): ResolvedRunner {
 }
 
 /**
+ * Atomic/durable fallback switcher to ensure we only switch to the backup
+ * model once per stage epoch, preventing concurrent duplicate runs from both
+ * consuming the backup.
+ */
+async function reserveFallback(
+  taskFolderUri: vscode.Uri,
+  stage: TaskStage
+): Promise<boolean> {
+  let activated = false;
+  await patchTaskProgress(taskFolderUri, (current) => {
+    if (current.fallbackActive?.[stage]) {
+      return current;
+    }
+    activated = true;
+    return {
+      ...current,
+      fallbackActive: {
+        ...current.fallbackActive,
+        [stage]: true,
+      },
+    };
+  });
+  return activated;
+}
+
+/**
  * Resolve the runner responsible for a stored stage model ID (plan/review
  * stages — see resolveEffectiveProvider for the auto-detection rules).
  */
 export function resolveRunnerForModel(
   modelId: string | undefined,
-  stage?: import("../types/taskProgress").TaskStage
+  stage?: import("../types/taskProgress").TaskStage,
+  taskFolderUri?: vscode.Uri
 ): ResolvedRunner {
   const resolved = toResolvedRunner(resolveEffectiveProvider(modelId));
   if (!stage) return resolved;
@@ -129,6 +158,13 @@ export function resolveRunnerForModel(
         const result = await primary.run(request, token);
         recordQuotaObservation(stage, modelId, result.failureKind, result.errorMessage);
         if (result.failureKind !== "quota") return result;
+
+        const folder = taskFolderUri ?? request.taskFolderUri;
+        if (folder) {
+          const reserved = await reserveFallback(folder, stage);
+          if (!reserved) return result;
+        }
+
         const fallbackResult = await fallback.runner.run({ ...request, modelId: fallback.nativeModelId }, token);
         recordQuotaObservation(stage, setting.backup, fallbackResult.failureKind, fallbackResult.errorMessage);
         return fallbackResult;
@@ -177,6 +213,7 @@ export async function runImplementationForModel(options: {
   token: vscode.CancellationToken;
   onProgress: (message: string) => void;
   stage?: import("../types/taskProgress").TaskStage;
+  taskFolderUri?: vscode.Uri;
 }): Promise<ImplementationRunResult & { runnerId: string }> {
   const effective = resolveEffectiveProvider(options.modelId);
 
@@ -207,6 +244,10 @@ export async function runImplementationForModel(options: {
   if (options.stage) recordQuotaObservation(options.stage, options.modelId, result.failureKind, result.errorMessage);
   const setting = getModelSettings()[options.stage as keyof ReturnType<typeof getModelSettings>];
   if (result.failureKind === "quota" && options.stage && chooseFallback(setting) === "backup" && setting?.backup) {
+    if (options.taskFolderUri) {
+      const reserved = await reserveFallback(options.taskFolderUri, options.stage);
+      if (!reserved) return result;
+    }
     const fallbackResult = await run(setting.backup);
     recordQuotaObservation(options.stage, setting.backup, fallbackResult.failureKind, fallbackResult.errorMessage);
     return fallbackResult;

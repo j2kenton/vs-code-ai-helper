@@ -518,7 +518,7 @@ async function runAiToFile(options: {
     return false;
   }
   const { runner, providerLabel, nativeModelId } = resolveRunnerForModel(
-    model.modelId, modelStage
+    model.modelId, modelStage, options.taskFolderUri
   );
   const availability = await runner.isAvailable();
   if (!availability.available) {
@@ -822,21 +822,15 @@ export async function runReviewForFolder(
       const content = new TextDecoder().decode(contentBytes);
       if (isStrictPerfectReview(content)) {
         NotificationRouter.showInformation(`Perfect review score (10/10) detected. Auto-advancing stage...`);
-        // Advance FROM the review stage that was just generated (targetStage),
-        // not from currentStage. For example, when a plan-high-review is
-        // generated from stage "plan", targetStage is "plan-high-review" and the
-        // next stage should be "plan-low-review". Using currentStage ("plan")
-        // here would advance back into the review just written and the CAS
-        // check in advanceStage would throw because the persisted stage has
-        // already moved to targetStage after review generation.
         const configuredStages = await resolveConfiguredReviewStages(folderUri);
         const next = computeNextStage(targetStage, configuredStages);
-        // A perfect review advances exactly one stage. It never completes a
-        // task implicitly; Publish remains a deliberate user action.
         if (next) {
-          const transition = await advanceStage(folderUri, targetStage, next, false, false);
-          if (transition?.persisted) {
-            NotificationRouter.showInformation(`Perfect review accepted. Advanced to ${STAGE_DISPLAY_NAMES[next]}.`);
+          const transitionToTarget = await advanceStage(folderUri, currentStage, targetStage, false, false);
+          if (transitionToTarget?.persisted) {
+            const transition = await advanceStage(folderUri, targetStage, next, false, false);
+            if (transition?.persisted) {
+              NotificationRouter.showInformation(`Perfect review accepted. Advanced to ${STAGE_DISPLAY_NAMES[next]}.`);
+            }
           }
         }
       }
@@ -991,6 +985,10 @@ export async function applyReviewWithAI(
   if (!resolved) {
     return;
   }
+  if (resolved.progress.status === "paused") {
+    NotificationRouter.showInformation("This task is paused. Resume it before applying a review.");
+    return;
+  }
 
   // Prefer the task's persisted ownership.workspaceRoot over the active-editor
   // workspace so context packs and AI runs target the correct workspace.
@@ -1129,6 +1127,10 @@ export async function fastForwardReviewWithAI(
     "Fast Forward Review with AI"
   );
   if (!resolved) {
+    return;
+  }
+  if (resolved.progress.status === "paused") {
+    NotificationRouter.showInformation("This task is paused. Resume it before fast-forwarding.");
     return;
   }
 
@@ -1566,6 +1568,10 @@ export async function generateImplementationWithAI(
   if (!resolved) {
     return;
   }
+  if (resolved.progress.status === "paused") {
+    NotificationRouter.showInformation("This task is paused. Resume it before generating implementation notes.");
+    return;
+  }
 
   // Materialize canonical plan-final.md from legacy implementation.md if needed.
   // This mirrors the same migration path used by runImplementationWithAI so
@@ -1717,6 +1723,7 @@ async function executeImplementationRun(
         token,
         onProgress: (message) => progress.report({ message }),
         stage: postRunReviewStage,
+        taskFolderUri: folderUri,
       });
     }
   );
@@ -1830,6 +1837,10 @@ export async function runImplementationWithAI(
     "Run Implementation with AI"
   );
   if (!resolved) {
+    return;
+  }
+  if (resolved.progress.status === "paused") {
+    NotificationRouter.showInformation("This task is paused. Resume it before running implementation.");
     return;
   }
 

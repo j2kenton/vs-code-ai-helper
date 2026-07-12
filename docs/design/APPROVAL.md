@@ -8,4 +8,4 @@ We hereby approve the design specifications and assets for the vs-code-ai-helper
 - Shortcuts in brackets in tooltips.
 - Loading animations during tree view loading.
 - "Release" button in publish stage prompting the user with pre-filled script.
-- Perfect review score (10/10) automatically moves to publish stage/completes.
+- Perfect review score (10/10) automatically moves to the next stage (does not implicitly complete task).

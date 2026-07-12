@@ -98,7 +98,7 @@ export async function chatWithStage(
       "Respond directly and concisely. If the user requests code changes, make them in the workspace and summarize what changed.";
     let responseText = "";
     await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: `Chatting with ${stageName} AI`, cancellable: true }, async (_progress, token) => {
-      const result = await runImplementationForModel({ modelId, prompt, workspaceUri: workspaceFolder.uri, token, stage: targetStage, onProgress: () => undefined });
+      const result = await runImplementationForModel({ modelId, prompt, workspaceUri: workspaceFolder.uri, token, stage: targetStage, taskFolderUri: vscode.Uri.file(resolvedTask.taskFolderPath), onProgress: () => undefined });
       responseText = result.summary ?? result.errorMessage ?? "The model did not return a response.";
     });
     const document = await vscode.workspace.openTextDocument({ content: responseText, language: "markdown" });

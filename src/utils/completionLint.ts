@@ -45,6 +45,24 @@ function packageManager(folder: string): string {
   return "npm";
 }
 
+function outputReferencesFile(output: string, folder: string, file: string): boolean {
+  const relPath = file.replace(/\\/g, "/");
+  const relPathWin = file.replace(/\//g, "\\");
+  const absPath = path.resolve(folder, file);
+
+  if (output.includes(relPath) || output.includes(relPathWin) || output.includes(absPath)) {
+    return true;
+  }
+
+  const relPathWithDot = "./" + relPath;
+  const relPathWithDotWin = ".\\" + relPathWin;
+  if (output.includes(relPathWithDot) || output.includes(relPathWithDotWin)) {
+    return true;
+  }
+
+  return false;
+}
+
 /** Collect diagnostics after fresh lint/type checks have completed. */
 export async function collectCompletionLint(folder: string, relevantFiles?: readonly string[]): Promise<CompletionLintResult> {
   const manager = packageManager(folder);
@@ -57,7 +75,11 @@ export async function collectCompletionLint(folder: string, relevantFiles?: read
       ? diagnostics.filter((d) => d.source === "eslint" || d.source === "ts" || d.source === "typescript")
       : []
   );
-  const commandFailures = checks.filter((check) => check.code !== 0);
+  const commandFailures = checks.filter((check) => {
+    if (check.code === 0) return false;
+    if (!relevantFiles) return true;
+    return relevantFiles.some(file => outputReferencesFile(check.output, folder, file));
+  });
   const issueCount = issues.length + commandFailures.length;
   const summary = commandFailures.length > 0
     ? `${commandFailures.length} completion check(s) failed${issues.length ? `; ${issues.length} editor diagnostic(s) remain` : "."}`

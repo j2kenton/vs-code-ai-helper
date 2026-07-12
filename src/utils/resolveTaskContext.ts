@@ -230,11 +230,16 @@ export async function resolveTaskContext(
   let persistedOwner = resolved.progress.ownership?.workspaceRoot;
   const workspaceRoots = (vscode.workspace.workspaceFolders ?? []).map(folder => path.resolve(folder.uri.fsPath));
 
-  if (persistedOwner && !workspaceRoots.includes(path.resolve(persistedOwner))) {
+  if (
+    persistedOwner &&
+    (!workspaceRoots.includes(path.resolve(persistedOwner)) ||
+      resolved.progress.ownership?.state === "ownership-unresolved")
+  ) {
     // The persisted owner no longer matches any open workspace folder (the
-    // task's ownership is unresolved). Only attempt recovery when the caller
-    // opted in — resolveTaskContext otherwise stays UI-free and fails closed,
-    // matching every other resolution step in this function.
+    // task's ownership is unresolved) or is explicitly marked unresolved. Only
+    // attempt recovery when the caller opted in — resolveTaskContext otherwise
+    // stays UI-free and fails closed, matching every other resolution step in
+    // this function.
     if (!options?.promptForOwnershipResolution) {
       return undefined;
     }
