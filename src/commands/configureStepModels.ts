@@ -19,16 +19,17 @@ interface StageNodeArg {
 }
 
 export async function configureStepModels(
-  _arg?: ConfigureModelArg
+  _arg?: ConfigureModelArg,
+  settingsViewProvider?: SettingsViewProvider
 ): Promise<void> {
-  await vscode.commands.executeCommand("vs-code-ai-helper.settingsView.focus");
+  await revealSettingsView(settingsViewProvider);
 }
 
 export async function setStageModel(
   node?: StageNodeArg,
   settingsViewProvider?: SettingsViewProvider
 ): Promise<void> {
-  await vscode.commands.executeCommand("vs-code-ai-helper.settingsView.focus");
+  await revealSettingsView(settingsViewProvider);
   if (node?.stage && settingsViewProvider) {
     settingsViewProvider.focusStage(node.stage);
   }
@@ -39,9 +40,37 @@ export async function setStageBackupModel(
   node?: StageNodeArg,
   settingsViewProvider?: SettingsViewProvider
 ): Promise<void> {
-  await vscode.commands.executeCommand("vs-code-ai-helper.settingsView.focus");
+  await revealSettingsView(settingsViewProvider);
   if (node?.stage && settingsViewProvider) {
     settingsViewProvider.focusStage(node.stage, "backup");
+  }
+}
+
+async function revealSettingsView(
+  settingsViewProvider?: SettingsViewProvider
+): Promise<void> {
+  if (settingsViewProvider?.reveal()) {
+    return;
+  }
+
+  try {
+    await vscode.commands.executeCommand(
+      "workbench.action.focusView",
+      SettingsViewProvider.viewType
+    );
+    return;
+  } catch {
+    // Older or non-standard VS Code hosts may not expose focusView. Opening
+    // the Ensemble container is the closest safe fallback and avoids failing
+    // the user command.
+  }
+
+  try {
+    await vscode.commands.executeCommand("workbench.view.extension.ai-helper");
+  } catch {
+    void vscode.window.showWarningMessage(
+      "Could not open Ensemble Settings automatically. Open the Ensemble sidebar and select Settings."
+    );
   }
 }
 
@@ -51,13 +80,13 @@ export function registerConfigureStepModelsCommand(
 ): void {
   const disposable = vscode.commands.registerCommand(
     "vs-code-ai-helper.configureStepModels",
-    (arg?: ConfigureModelArg) => configureStepModels(arg)
+    (arg?: ConfigureModelArg) => configureStepModels(arg, settingsViewProvider)
   );
   context.subscriptions.push(disposable);
 
   const taskDisposable = vscode.commands.registerCommand(
     "vs-code-ai-helper.configureTaskStepModels",
-    (arg?: ConfigureModelArg) => configureStepModels(arg)
+    (arg?: ConfigureModelArg) => configureStepModels(arg, settingsViewProvider)
   );
   context.subscriptions.push(taskDisposable);
 
@@ -75,9 +104,7 @@ export function registerConfigureStepModelsCommand(
 
   const focusDisposable = vscode.commands.registerCommand(
     "vs-code-ai-helper.settingsView.focus",
-    async () => {
-      await vscode.commands.executeCommand("workbench.action.focusView", "vs-code-ai-helper.settingsView");
-    }
+    () => revealSettingsView(settingsViewProvider)
   );
   context.subscriptions.push(focusDisposable);
 }

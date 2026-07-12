@@ -147,6 +147,14 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  public reveal(): boolean {
+    if (!this._view) {
+      return false;
+    }
+    this._view.show(true);
+    return true;
+  }
+
   private _getHtmlForWebview(webview: vscode.Webview): string {
     const nonce = getNonce();
     return `<!DOCTYPE html>
