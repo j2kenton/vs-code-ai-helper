@@ -10,6 +10,8 @@ import { ModelSettings } from "../utils/modelFallback";
 import { getQuotaStatusText } from "../utils/quota";
 
 type IncomingMessage =
+  | { type: "ready" }
+  | { type: "rendered" }
   | { type: "saveSettings"; settings: ModelSettings }
   | { type: "resetDefaults" }
   | { type: "refreshQuotaStatus" };
@@ -17,15 +19,23 @@ type IncomingMessage =
 export class SettingsViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = "vs-code-ai-helper.settingsView";
   private _view?: vscode.WebviewView;
+  // True once the webview has confirmed its table rows actually exist in
+  // the DOM (see the "rendered" case below) — NOT just that its message
+  // listener is attached. focusStage() needs row-<stage> elements to exist,
+  // which is a strictly later point than "ready to receive postMessage".
+  private _tableRendered = false;
+  private _pendingFocus?: { stage: TaskStage; control: "primary" | "backup" };
+  private _conflictsChecked = false;
 
   constructor(private readonly extensionUri: vscode.Uri) {}
 
-  public async resolveWebviewView(
+  public resolveWebviewView(
     webviewView: vscode.WebviewView,
     _context: vscode.WebviewViewResolveContext,
     _token: vscode.CancellationToken
-  ): Promise<void> {
+  ): void {
     this._view = webviewView;
+    this._tableRendered = false;
 
     webviewView.webview.options = {
       enableScripts: true,
@@ -36,6 +46,38 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
 
     webviewView.webview.onDidReceiveMessage(async (data: IncomingMessage) => {
       switch (data.type) {
+        case "ready": {
+          // Collapsing this panel makes VS Code deallocate its webview
+          // document; re-expanding recreates it and calls resolveWebviewView
+          // again. Posting "init" eagerly (right after setting .html, as
+          // this used to do) races that fresh document's script load: if
+          // getAvailableModels() resolves first — it's cache-backed (see
+          // cliAgentRunner's commandExistsCache), so it can return near-
+          // instantly on the 2nd+ open — the message is posted before the
+          // webview's listener exists and is silently dropped, leaving the
+          // panel permanently blank. Waiting for the webview to announce
+          // it's ready avoids that race regardless of timing.
+          await this._postInit(webviewView.webview);
+          break;
+        }
+        case "rendered": {
+          // Distinct from "ready": this fires only after the webview has
+          // actually built its table rows from the "init" payload (see the
+          // 'init' handler in the webview script below), which is what
+          // focusStage() needs (it looks up 'row-' + stage in the DOM).
+          // Gating on "ready" alone would have a window — after the webview
+          // is listening but before getAvailableModels() resolves and the
+          // rows exist — where a focusStage() posted immediately would
+          // reach a live listener that still finds no matching row and
+          // silently drops the request.
+          this._tableRendered = true;
+          if (this._pendingFocus) {
+            const pending = this._pendingFocus;
+            this._pendingFocus = undefined;
+            void webviewView.webview.postMessage({ type: "focusStage", ...pending });
+          }
+          break;
+        }
         case "saveSettings": {
           await setModelSettings(data.settings);
           void vscode.window.showInformationMessage("AI model settings saved.");
@@ -71,11 +113,28 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       }
     });
 
-    // Load initial settings and models
+    // resolveWebviewView runs on every reveal after this panel was
+    // collapsed, not just once per session (see the "ready" case above) —
+    // guard with _conflictsChecked so this prompt is a true one-shot,
+    // otherwise a user who picks "Keep Existing" would be re-asked every
+    // time they reopen the panel.
+    if (!this._conflictsChecked) {
+      this._conflictsChecked = true;
+      void this._checkModelSettingsConflicts();
+    }
+  }
+
+  /**
+   * Send the current settings/models/quota snapshot to the webview. Only
+   * called once the webview confirms via "ready" that its script has loaded
+   * and attached a message listener — see the "ready" case above for why
+   * posting this eagerly right after resolve is unsafe.
+   */
+  private async _postInit(webview: vscode.Webview): Promise<void> {
     const settings = getModelSettings();
     const models = await getAvailableModels();
 
-    void webviewView.webview.postMessage({
+    void webview.postMessage({
       type: "init",
       settings,
       models,
@@ -83,12 +142,6 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       stageNames: STAGE_DISPLAY_NAMES,
       quotaStatus: this._buildQuotaStatus(),
     });
-
-    // One-shot per activation (resolveWebviewView runs once per session, not
-    // on every reveal) rather than tied to onDidChangeVisibility — otherwise
-    // a user who picks "Keep Existing" would be re-asked every time they
-    // reopen the panel.
-    void this._checkModelSettingsConflicts();
   }
 
   /**
@@ -143,9 +196,21 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
   }
 
   public focusStage(stage: TaskStage, control: "primary" | "backup" = "primary"): void {
-    if (this._view) {
-      this._view.show(false);
+    if (!this._view) {
+      return;
+    }
+    this._view.show(false);
+    if (this._tableRendered) {
       void this._view.webview.postMessage({ type: "focusStage", stage, control });
+    } else {
+      // Either show(false) just triggered a fresh resolveWebviewView (if
+      // the panel was collapsed), tearing down the old document, or the
+      // current document is still mid-init (webview loaded and listening,
+      // but getAvailableModels() hasn't resolved and the rows the webview
+      // needs to look up don't exist yet). Queue the request so it's
+      // delivered once "rendered" confirms the rows actually exist, instead
+      // of racing a postMessage that the webview would silently no-op.
+      this._pendingFocus = { stage, control };
     }
   }
 
@@ -316,6 +381,12 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               stageDisplayNames = message.stageNames || {};
               quotaStatus = message.quotaStatus || {};
               renderTable();
+              // renderTable() is synchronous, so every row-<stage> element
+              // exists by this point. Tell the extension host it's now safe
+              // to deliver a focusStage request (see the "rendered" case in
+              // resolveWebviewView) instead of it guessing from "ready"
+              // alone, which only means this listener is attached.
+              vscode.postMessage({ type: 'rendered' });
             } else if (message.type === 'settingsLoaded') {
               currentSettings = message.settings || {};
               renderTable();
@@ -334,6 +405,11 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               }
             }
           });
+
+          // Tell the extension host this document's listener is attached
+          // and ready to receive "init". Posting "init" eagerly on resolve
+          // (instead of waiting for this) would race this script's load.
+          vscode.postMessage({ type: 'ready' });
 
           function escapeHtml(value) {
             return String(value ?? '').replace(/[&<>"']/g, ch => ({
