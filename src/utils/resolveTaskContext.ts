@@ -6,6 +6,23 @@ import * as path from "path";
 import { taskRefFromResolved, TaskRef } from "../types/taskRef";
 import { patchTaskProgress } from "./taskProgressUtils";
 
+/**
+ * Normalize a path for comparison: on Windows, path.resolve/normalize
+ * preserve casing while taskRoot.ts's discovery pipeline lowercases
+ * canonical paths, so raw string comparisons against workspace folder
+ * paths silently fail to match. Lowercase (on Windows only) before
+ * comparing so containment/equality checks are case-insensitive there.
+ */
+function normalizeForCompare(p: string): string {
+  return process.platform === "win32" ? p.toLowerCase() : p;
+}
+
+function isSameOrUnder(childPath: string, root: string): boolean {
+  const child = normalizeForCompare(childPath);
+  const normalizedRoot = normalizeForCompare(root);
+  return child === normalizedRoot || child.startsWith(normalizedRoot + path.sep);
+}
+
 export interface ResolvedTaskContext {
   readonly taskRef: TaskRef;
   /** Canonical task ID (normalized absolute path) */
@@ -54,7 +71,7 @@ async function resolveAmbiguousOwnership(
   workspaceRoots: readonly string[]
 ): Promise<string | undefined> {
   const containingRoots = workspaceRoots.filter(
-    (root) => task.taskFolderPath === root || task.taskFolderPath.startsWith(root + path.sep)
+    (root) => isSameOrUnder(task.taskFolderPath, root)
   );
 
   let rebindRoot: string | undefined;
@@ -80,7 +97,7 @@ async function resolveAmbiguousOwnership(
       title: `Select the workspace containing "${task.folderName}"`,
     });
     const candidate = picked?.[0]?.fsPath;
-    if (candidate && (task.taskFolderPath === candidate || task.taskFolderPath.startsWith(candidate + path.sep))) {
+    if (candidate && isSameOrUnder(task.taskFolderPath, candidate)) {
       rebindRoot = path.resolve(candidate);
     }
   }
@@ -244,7 +261,7 @@ export async function resolveTaskContext(
 
   if (
     resolved.progress.ownership?.state === "ownership-unresolved" ||
-    (persistedOwner && !workspaceRoots.includes(path.resolve(persistedOwner)))
+    (persistedOwner && !workspaceRoots.some(root => normalizeForCompare(root) === normalizeForCompare(path.resolve(persistedOwner!))))
   ) {
     // The persisted owner no longer matches any open workspace folder (the
     // task's ownership is unresolved) or is explicitly marked unresolved. Only
@@ -272,18 +289,19 @@ export async function resolveTaskContext(
       },
     };
   }
-  if (workspaceRoots.length > 0 && !workspaceRoots.some(root => resolved.taskFolderPath === root || resolved.taskFolderPath.startsWith(root + path.sep))) return undefined;
+  if (workspaceRoots.length > 0 && !workspaceRoots.some(root => isSameOrUnder(resolved.taskFolderPath, root))) return undefined;
 
   // Check paused status
   if (!options?.allowPaused && resolved.progress.status === "paused") {
     return undefined;
   }
 
-  const workspaceFolderUri = persistedOwner
-    ? vscode.workspace.workspaceFolders?.map(folder => folder.uri).find(uri => path.resolve(uri.fsPath) === path.resolve(persistedOwner))
+  const resolvedPersistedOwner = persistedOwner ? normalizeForCompare(path.resolve(persistedOwner)) : undefined;
+  const workspaceFolderUri = resolvedPersistedOwner
+    ? vscode.workspace.workspaceFolders?.map(folder => folder.uri).find(uri => normalizeForCompare(path.resolve(uri.fsPath)) === resolvedPersistedOwner)
     : resolved.workspaceFolder ?? (vscode.workspace.workspaceFolders ?? []).map(folder => folder.uri).find(uri => {
     const root = path.resolve(uri.fsPath);
-    return resolved.taskFolderPath === root || resolved.taskFolderPath.startsWith(root + path.sep);
+    return isSameOrUnder(resolved.taskFolderPath, root);
   });
   if (!workspaceFolderUri) return undefined;
   const taskRef = taskRefFromResolved({ canonicalId: resolved.canonicalId, taskFolderPath: resolved.taskFolderPath, workspaceFolder: workspaceFolderUri, metaRoot: resolved.progress.ownership?.metaRoot });

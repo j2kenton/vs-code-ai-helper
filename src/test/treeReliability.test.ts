@@ -470,4 +470,76 @@ void describe("resolveTaskContext — clears stale persisted ID", () => {
       "Expected store NOT to be cleared when explicit arg fails (only persisted IDs should trigger clear)"
     );
   });
+
+  void it("resolves a task whose canonical path is lowercased but the open workspace folder has mixed case (Windows)", async function (this: { skip?: () => void }) {
+    if (process.platform !== "win32") {
+      this.skip?.();
+      return;
+    }
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { resolveTaskContext } = await import("../utils/resolveTaskContext.js");
+
+    // Mirrors real discovery: taskRoot.ts's normalizePath lowercases the
+    // whole path on Windows, so the inventory's canonicalId/taskFolderPath
+    // is all-lowercase even though the workspace folder VS Code reports
+    // (and the actual folder on disk) preserves mixed case.
+    const mixedCaseWorkspaceRoot = process.cwd(); // real, existing directory (mixed case on Windows)
+    // Use a real, existing path for the task folder itself so the
+    // fs.existsSync guard in resolveTaskContext passes.
+    const realTaskFolderPath = mixedCaseWorkspaceRoot; // stand-in existing dir
+
+    const task = {
+      taskFolderPath: realTaskFolderPath.toLowerCase(),
+      canonicalId: realTaskFolderPath.toLowerCase(),
+      folderName: "2026-07-12_task_2",
+      sourceScopeKey: mixedCaseWorkspaceRoot.toLowerCase(),
+      progress: {
+        currentStage: "desc",
+        status: "active",
+        taskFolder: "2026-07-12_task_2",
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        ownership: {
+          metaRoot: mixedCaseWorkspaceRoot + "\\plans",
+          projectRoot: mixedCaseWorkspaceRoot,
+          workspaceRoot: mixedCaseWorkspaceRoot,
+          boundAt: new Date().toISOString(),
+          state: "resolved",
+        },
+      },
+    };
+
+    const inventory = {
+      getTasks: () => [task],
+      getTaskById: (id: string) => (id === task.canonicalId ? task : undefined),
+      getTaskByPath: (p: string) =>
+        p.toLowerCase() === task.taskFolderPath ? task : undefined,
+      getVisibleTaskForSuppressedId: (_id: string) => undefined,
+      getVisibleTaskForSuppressedPath: (_path: string) => undefined,
+      refresh: async (): Promise<void> => {},
+      onDidChange: (_handler: () => void): { dispose: () => void } => ({ dispose(): void {} }),
+    } as unknown as import("../state/taskInventory").TaskInventory;
+
+    const origWsFolders = (vscode.workspace as unknown as Record<string, unknown>).workspaceFolders;
+    (vscode.workspace as unknown as Record<string, unknown>).workspaceFolders = [
+      { uri: vscode.Uri.file(mixedCaseWorkspaceRoot), name: "ws", index: 0 },
+    ];
+
+    try {
+      const resolved = await resolveTaskContext(
+        inventory,
+        { taskFolderPath: mixedCaseWorkspaceRoot }, // tree-row style arg, mixed case
+        { allowPaused: true },
+        undefined
+      );
+
+      assert.notStrictEqual(
+        resolved,
+        undefined,
+        "Expected task to resolve despite case mismatch between lowercased canonical path and mixed-case workspace folder"
+      );
+    } finally {
+      (vscode.workspace as unknown as Record<string, unknown>).workspaceFolders = origWsFolders;
+    }
+  });
 });
