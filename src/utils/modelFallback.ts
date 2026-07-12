@@ -5,14 +5,13 @@ export type FallbackStrategy = "switch-to-backup" | "pause-and-resume" | "alert-
 export interface StageModelSetting {
   primary?: string;
   backup?: string;
-  fallbackEnabled: boolean;
   strategy: FallbackStrategy;
 }
 
 export type ModelSettings = Partial<Record<TaskStage, StageModelSetting>>;
 
 export function canUseBackup(setting: StageModelSetting | undefined): boolean {
-  return Boolean(setting?.fallbackEnabled && setting.backup && setting.backup !== setting.primary);
+  return Boolean(setting?.strategy === "switch-to-backup" && setting.backup && setting.backup !== setting.primary);
 }
 
 export function chooseFallback(setting: StageModelSetting | undefined): "backup" | "pause" | "alert" {

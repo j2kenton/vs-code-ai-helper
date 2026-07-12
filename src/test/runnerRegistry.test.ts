@@ -11,6 +11,7 @@ import {
   resolveRunnerForModel,
   runImplementationForModel,
 } from "../runners/runnerRegistry";
+import { resolveModelForStage } from "../utils/modelSelection";
 
 const requireModule = createRequire(__filename);
 const childProcess = requireModule("node:child_process") as typeof import("node:child_process");
@@ -102,7 +103,6 @@ void describe("resolveRunnerForModel", () => {
       "impl-low-review": {
         primary: "auto",
         backup: "copilot-gpt-5.6-sol",
-        fallbackEnabled: true,
         strategy: "switch-to-backup",
       },
     });
@@ -148,7 +148,6 @@ void describe("resolveRunnerForModel", () => {
       plan: {
         primary: "copilot-gpt-5.6-sol",
         backup: "auto",
-        fallbackEnabled: true,
         strategy: "switch-to-backup",
       },
     });
@@ -251,7 +250,6 @@ void describe("runImplementationForModel", () => {
       impl: {
         primary: "copilot-gpt-5.6-sol",
         backup: "auto",
-        fallbackEnabled: true,
         strategy: "switch-to-backup",
       },
     });
@@ -356,6 +354,78 @@ void describe("runImplementationForModel", () => {
       assert.deepStrictEqual(spawnCalls[0]?.args, ["codex"]);
     } finally {
       childProcess.spawn = originalSpawn;
+    }
+  });
+
+  // Regression coverage: implementation-pipeline fallback bookkeeping must
+  // stay keyed on "impl" (the stage the model is actually resolved from),
+  // never on whatever review stage the task happens to be parked at. Before
+  // the fix, a failed implementation run recorded fallbackActive under the
+  // *review* stage, which then made the next review-generation run for that
+  // stage skip straight to its own backup without ever trying its primary.
+  void it("does not let an impl-stage fallback bleed into an unrelated review stage's model resolution", async () => {
+    const metaRoot = fs.mkdtempSync(
+      path.join(os.tmpdir(), "ensemble-stage-isolation-")
+    );
+    const tasksRoot = path.join(metaRoot, "tasks");
+    const taskFolder = path.join(tasksRoot, "task-a");
+    fs.mkdirSync(taskFolder, { recursive: true });
+    const taskFolderUri = vscode.Uri.file(taskFolder);
+    const progressPath = path.join(taskFolder, "task-progress.json");
+    const now = new Date().toISOString();
+    fs.writeFileSync(
+      progressPath,
+      JSON.stringify(
+        {
+          taskFolder: path.basename(taskFolder),
+          currentStage: "impl-low-review",
+          status: "active",
+          createdAt: now,
+          updatedAt: now,
+          // Simulates the state left behind by an implementation run whose
+          // primary failed: only "impl"'s fallback flag is set.
+          fallbackActive: { impl: true },
+        },
+        null,
+        2
+      ),
+      "utf8"
+    );
+
+    const settings = installModelSettings({
+      impl: {
+        primary: "impl-primary",
+        backup: "impl-backup",
+        strategy: "switch-to-backup",
+      },
+      "impl-low-review": {
+        primary: "review-primary",
+        backup: "review-backup",
+        strategy: "switch-to-backup",
+      },
+    });
+
+    const workspace = vscode.workspace as unknown as {
+      fs: {
+        readFile: (uri: vscode.Uri) => Promise<Uint8Array>;
+      };
+    };
+    const originalReadFile = workspace.fs.readFile;
+    workspace.fs.readFile = (uri: vscode.Uri): Promise<Uint8Array> =>
+      fs.promises.readFile(uri.fsPath);
+
+    try {
+      const implResolved = await resolveModelForStage(taskFolderUri, "impl");
+      assert.strictEqual(implResolved.modelId, "impl-backup");
+
+      const reviewResolved = await resolveModelForStage(
+        taskFolderUri,
+        "impl-low-review"
+      );
+      assert.strictEqual(reviewResolved.modelId, "review-primary");
+    } finally {
+      settings.restore();
+      workspace.fs.readFile = originalReadFile;
     }
   });
 });

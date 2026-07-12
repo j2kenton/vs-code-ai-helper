@@ -1781,7 +1781,11 @@ async function executeImplementationRun(
         workspaceUri: workspaceRoot.uri,
         token,
         onProgress: (message) => progress.report({ message }),
-        stage: postRunReviewStage,
+        // `modelId` is always resolved from the "impl" stage (see the two
+        // callers of executeImplementationRun) — quota/fallback bookkeeping
+        // must use that same stage, not postRunReviewStage (which may be a
+        // review stage used only to pick which review to auto-run below).
+        stage: "impl",
         taskFolderUri: folderUri,
       });
     }

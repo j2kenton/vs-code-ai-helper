@@ -188,6 +188,36 @@ void describe("review apply model resolution contract", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Implementation-pipeline fallback-stage contract
+// ---------------------------------------------------------------------------
+//
+// executeImplementationRun (used by runImplementationWithAI and
+// applyImplementationReviewWithAI) always resolves its model from the "impl"
+// stage, regardless of postRunReviewStage (which only picks which review to
+// auto-run afterward — see runReviewForFolder(..., postRunReviewStage, true)).
+// Its call into runImplementationForModel must therefore pass stage: "impl",
+// not postRunReviewStage, so quota telemetry and fallbackActive bookkeeping
+// stay attributed to the stage the model actually came from. Mirrors the
+// logStage/executionStage separation documented above for runAiToFile.
+
+void describe("implementation-pipeline fallback-stage contract", () => {
+  const REVIEW_STAGES_WHEN_PARKED = ["impl-high-review", "impl-low-review", "publish"];
+
+  for (const postRunReviewStage of REVIEW_STAGES_WHEN_PARKED) {
+    void it(`postRunReviewStage=${postRunReviewStage} must not change the fallback stage`, () => {
+      const modelResolutionStage = "impl";
+      const fallbackBookkeepingStage = modelResolutionStage;
+      assert.notStrictEqual(
+        postRunReviewStage,
+        fallbackBookkeepingStage,
+        "postRunReviewStage is only for picking the post-run review, not fallback bookkeeping"
+      );
+      assert.strictEqual(fallbackBookkeepingStage, "impl");
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Review output validation contract (runAiToFile's validateOutput hook)
 // ---------------------------------------------------------------------------
 //

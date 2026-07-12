@@ -163,7 +163,7 @@ export function resolveRunnerForModel(
   // telemetry instead of a permanent placeholder.
   const instrumented = withQuotaObservation(primary, stage, modelId);
   const setting = getModelSettings()[stage];
-  if (!setting?.fallbackEnabled || setting.strategy !== "switch-to-backup" || !setting.backup || setting.backup === modelId) {
+  if (setting?.strategy !== "switch-to-backup" || !setting.backup || setting.backup === modelId) {
     return { ...resolved, runner: instrumented };
   }
   const fallback = toResolvedRunner(resolveEffectiveProvider(setting.backup));

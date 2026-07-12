@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import { AI_MODEL_STAGES, TaskStage } from "../types/taskProgress";
-import { ModelSettings } from "../utils/modelFallback";
+import { FallbackStrategy, ModelSettings } from "../utils/modelFallback";
 
 const CONFIG_SECTION = "vs-code-ai-helper";
 const META_RESOURCES_PATH_KEY = "metaResourcesPath";
@@ -157,16 +157,24 @@ export function getModelSettings(): ModelSettings {
     const entry = value as Record<string, unknown>;
     const primary = typeof entry.primary === "string" && entry.primary.trim() ? entry.primary : undefined;
     const backup = typeof entry.backup === "string" && entry.backup.trim() ? entry.backup : undefined;
-    const strategy = entry.strategy === "switch-to-backup" || entry.strategy === "pause-and-resume" || entry.strategy === "alert-and-wait"
+    let strategy: FallbackStrategy = entry.strategy === "switch-to-backup" || entry.strategy === "pause-and-resume" || entry.strategy === "alert-and-wait"
       ? entry.strategy : "alert-and-wait";
-    result[stage] = { primary, backup, fallbackEnabled: entry.fallbackEnabled === true, strategy };
+    // Back-compat: the old UI could save strategy: "switch-to-backup" with
+    // fallbackEnabled: false (checkbox unchecked, strategy left untouched).
+    // That combination meant "don't use backup" — downgrade it on read so
+    // removing the checkbox doesn't silently turn fallback on for those
+    // workspaces.
+    if (strategy === "switch-to-backup" && entry.fallbackEnabled === false) {
+      strategy = "alert-and-wait";
+    }
+    result[stage] = { primary, backup, strategy };
   }
   // Migrate the older primary-only setting so existing workspaces do not
   // silently lose their configured models when the settings panel is opened.
   for (const stage of AI_MODEL_STAGES) {
     if (!result[stage]) {
       const legacy = getAiModelDefault(stage);
-      if (legacy) result[stage] = { primary: legacy, fallbackEnabled: false, strategy: "alert-and-wait" };
+      if (legacy) result[stage] = { primary: legacy, strategy: "alert-and-wait" };
     }
   }
   return result;
@@ -180,10 +188,9 @@ export async function setModelSettings(settings: ModelSettings): Promise<void> {
     if (setting) {
       const primary = typeof setting.primary === "string" && setting.primary.trim() ? setting.primary.trim() : undefined;
       const backup = typeof setting.backup === "string" && setting.backup.trim() ? setting.backup.trim() : undefined;
-      const fallbackEnabled = Boolean(setting.fallbackEnabled) && Boolean(backup) && backup !== primary;
-      // Turning fallback off is a policy change, not deletion of the user's
-      // configured backup. Preserve it so re-enabling fallback is reversible.
-      clean[stage] = { ...setting, primary, backup, fallbackEnabled };
+      // Preserve a configured backup even if strategy isn't switch-to-backup —
+      // switching strategy back later shouldn't lose the user's backup choice.
+      clean[stage] = { ...setting, primary, backup };
     }
   }
   await config.update(

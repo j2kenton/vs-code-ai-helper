@@ -5,6 +5,7 @@ import {
   getModelSettings,
   hasValidMetaResourcesPath,
 } from "../config/settings";
+import { canUseBackup } from "./modelFallback";
 import { cliCommandExists, resolveCliCommand } from "../runners/cliAgentRunner";
 import { findAllTasks, readTaskProgress } from "./taskProgressUtils";
 import {
@@ -192,8 +193,7 @@ export async function resolveModelForStage(
         progress &&
         progress.fallbackActive &&
         progress.fallbackActive[stage] &&
-        stageSetting.fallbackEnabled &&
-        stageSetting.backup
+        canUseBackup(stageSetting)
       ) {
         return { modelId: stageSetting.backup, source: "workspace" };
       }

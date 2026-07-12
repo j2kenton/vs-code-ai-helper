@@ -618,7 +618,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             tbody.innerHTML = '';
 
             stagesList.forEach(stage => {
-              const setting = currentSettings[stage] || { fallbackEnabled: false, strategy: 'alert-and-wait' };
+              const setting = currentSettings[stage] || { strategy: 'alert-and-wait' };
               const row = document.createElement('tr');
               row.id = 'row-' + stage;
               row.className = 'stage-row';
@@ -632,8 +632,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               const quotaText = \`<span class="quota-text tooltip" title="Session-observed usage status">\${primaryQuotaStatus}</span>\`;
               const backupQuotaText = \`<span class="quota-text tooltip" title="Session-observed usage status">\${backupQuotaStatus}</span>\`;
 
-              const fallbackChecked = setting.fallbackEnabled ? 'checked' : '';
-              const backupDisabled = setting.fallbackEnabled ? '' : 'disabled';
+              const backupDisabled = setting.strategy === 'switch-to-backup' ? '' : 'disabled';
 
               row.innerHTML = \`
                 <td style="font-weight: bold; width: 35%;">\${stageDisplayNames[stage] || stage}</td>
@@ -644,21 +643,17 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                     \${quotaText}
                   </div>
                   <div style="margin-bottom: 8px;">
-                    <input type="checkbox" id="enable-fallback-\${stage}" \${fallbackChecked}>
-                    <label for="enable-fallback-\${stage}">Use Backup Model</label>
-                  </div>
-                  <div style="margin-bottom: 8px;">
-                    <label for="backup-input-\${stage}" style="font-size: 0.9em; display:block; margin-bottom: 2px;">Backup Model:</label>
-                    \${modelComboboxHtml('backup', stage, setting.backup || '', backupDisabled)}
-                    \${backupDisabled ? '' : backupQuotaText}
-                  </div>
-                  <div>
                     <label for="strategy-\${stage}" style="font-size: 0.9em; display:block; margin-bottom: 2px;">Fallback Strategy:</label>
                     <select id="strategy-\${stage}">
                       <option value="switch-to-backup" \${setting.strategy === 'switch-to-backup' ? 'selected' : ''}>Switch to Backup</option>
                       <option value="pause-and-resume" \${setting.strategy === 'pause-and-resume' ? 'selected' : ''}>Pause until available</option>
                       <option value="alert-and-wait" \${setting.strategy === 'alert-and-wait' ? 'selected' : ''}>Alert and wait</option>
                     </select>
+                  </div>
+                  <div style="margin-bottom: 8px;">
+                    <label for="backup-input-\${stage}" style="font-size: 0.9em; display:block; margin-bottom: 2px;">Backup Model:</label>
+                    \${modelComboboxHtml('backup', stage, setting.backup || '', backupDisabled)}
+                    \${backupDisabled ? '' : backupQuotaText}
                   </div>
                 </td>
               \`;
@@ -667,10 +662,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               setupModelCombobox(row, 'primary', stage);
               setupModelCombobox(row, 'backup', stage);
 
-              const checkbox = row.querySelector('#enable-fallback-' + stage);
+              const strategySelect = row.querySelector('#strategy-' + stage);
               const backupInput = row.querySelector('#backup-input-' + stage);
-              checkbox.addEventListener('change', () => {
-                backupInput.disabled = !checkbox.checked;
+              strategySelect.addEventListener('change', () => {
+                backupInput.disabled = strategySelect.value !== 'switch-to-backup';
               });
             });
           }
@@ -684,30 +679,29 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             stagesList.forEach(stage => {
               const primary = reconcileModelInput('primary', stage);
               const primaryText = document.getElementById('primary-input-' + stage).value.trim();
-              const fallbackEnabled = document.getElementById('enable-fallback-' + stage).checked;
+              const strategy = document.getElementById('strategy-' + stage).value;
+              const usesBackup = strategy === 'switch-to-backup';
               const backup = reconcileModelInput('backup', stage);
               const backupText = document.getElementById('backup-input-' + stage).value.trim();
-              const strategy = document.getElementById('strategy-' + stage).value;
 
               if (primaryText && !primary) {
                 hasErrors = true;
                 alertRegion.innerText += 'Stage ' + (stageDisplayNames[stage] || stage) + ' has an invalid primary model selection. Choose a model from the list.\\n';
               }
 
-              if (fallbackEnabled && backupText && !backup) {
+              if (usesBackup && backupText && !backup) {
                 hasErrors = true;
                 alertRegion.innerText += 'Stage ' + (stageDisplayNames[stage] || stage) + ' has an invalid backup model selection. Choose a model from the list.\\n';
               }
 
-              if (fallbackEnabled && (!backup || backup === primary)) {
+              if (usesBackup && (!backup || backup === primary)) {
                 hasErrors = true;
-                alertRegion.innerText += 'Stage ' + (stageDisplayNames[stage] || stage) + ' requires a distinct valid backup model when backup is enabled.\\n';
+                alertRegion.innerText += 'Stage ' + (stageDisplayNames[stage] || stage) + ' requires a distinct valid backup model when Fallback Strategy is set to Switch to Backup.\\n';
               }
 
               updatedSettings[stage] = {
                 primary: primary || undefined,
                 backup: backup || undefined,
-                fallbackEnabled,
                 strategy
               };
             });
