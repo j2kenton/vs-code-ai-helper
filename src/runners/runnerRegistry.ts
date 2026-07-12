@@ -1,5 +1,9 @@
 import * as vscode from "vscode";
-import { AgentAvailability, AgentRunner } from "../types/agentRunner";
+import {
+  AgentAvailability,
+  AgentRunner,
+  AgentRunResult,
+} from "../types/agentRunner";
 import { CopilotLanguageModelRunner } from "./copilotLanguageModelRunner";
 import {
   checkImplementationAvailability,
@@ -95,6 +99,24 @@ function toResolvedRunner(effective: EffectiveProvider): ResolvedRunner {
   };
 }
 
+function withQuotaObservation(
+  runner: AgentRunner,
+  stage: TaskStage,
+  modelId: string | undefined
+): AgentRunner {
+  return {
+    id: runner.id,
+    label: runner.label,
+    capabilities: runner.capabilities,
+    isAvailable: () => runner.isAvailable(),
+    async run(request, token): Promise<AgentRunResult> {
+      const result = await runner.run(request, token);
+      recordQuotaObservation(stage, modelId, result.failureKind, result.errorMessage);
+      return result;
+    },
+  };
+}
+
 /**
  * Atomic/durable fallback switcher to ensure we only switch to the backup
  * model once per stage epoch, preventing concurrent duplicate runs from both
@@ -131,20 +153,15 @@ export function resolveRunnerForModel(
   taskFolderUri?: vscode.Uri
 ): ResolvedRunner {
   const resolved = toResolvedRunner(resolveEffectiveProvider(modelId));
-  if (!stage) return resolved;
+  if (!stage) {
+    return resolved;
+  }
   const primary = resolved.runner;
   // Record what every run reveals about this stage+model's quota state
   // (session-observed only — see utils/quota.ts for why a numeric percentage
   // isn't offered) so the settings webview can show real, non-fabricated
   // telemetry instead of a permanent placeholder.
-  const instrumented: AgentRunner = {
-    ...primary,
-    async run(request, token) {
-      const result = await primary.run(request, token);
-      recordQuotaObservation(stage, modelId, result.failureKind, result.errorMessage);
-      return result;
-    },
-  };
+  const instrumented = withQuotaObservation(primary, stage, modelId);
   const setting = getModelSettings()[stage];
   if (!setting?.fallbackEnabled || setting.strategy !== "switch-to-backup" || !setting.backup || setting.backup === modelId) {
     return { ...resolved, runner: instrumented };
@@ -153,16 +170,23 @@ export function resolveRunnerForModel(
   return {
     ...resolved,
     runner: {
-      ...instrumented,
-      async run(request, token) {
+      id: instrumented.id,
+      label: instrumented.label,
+      capabilities: instrumented.capabilities,
+      isAvailable: () => instrumented.isAvailable(),
+      async run(request, token): Promise<AgentRunResult> {
         const result = await primary.run(request, token);
         recordQuotaObservation(stage, modelId, result.failureKind, result.errorMessage);
-        if (result.failureKind !== "quota") return result;
+        if (result.failureKind !== "quota") {
+          return result;
+        }
 
         const folder = taskFolderUri ?? request.taskFolderUri;
         if (folder) {
           const reserved = await reserveFallback(folder, stage);
-          if (!reserved) return result;
+          if (!reserved) {
+            return result;
+          }
         }
 
         const fallbackResult = await fallback.runner.run({ ...request, modelId: fallback.nativeModelId }, token);
@@ -241,12 +265,16 @@ export async function runImplementationForModel(options: {
   return { ...result, runnerId: "copilot-lm" };
   };
   const result = await run(effective.kind === "cli" ? effective.model : effective.model);
-  if (options.stage) recordQuotaObservation(options.stage, options.modelId, result.failureKind, result.errorMessage);
+  if (options.stage) {
+    recordQuotaObservation(options.stage, options.modelId, result.failureKind, result.errorMessage);
+  }
   const setting = getModelSettings()[options.stage as keyof ReturnType<typeof getModelSettings>];
   if (result.failureKind === "quota" && options.stage && chooseFallback(setting) === "backup" && setting?.backup) {
     if (options.taskFolderUri) {
       const reserved = await reserveFallback(options.taskFolderUri, options.stage);
-      if (!reserved) return result;
+      if (!reserved) {
+        return result;
+      }
     }
     const fallbackResult = await run(setting.backup);
     recordQuotaObservation(options.stage, setting.backup, fallbackResult.failureKind, fallbackResult.errorMessage);
