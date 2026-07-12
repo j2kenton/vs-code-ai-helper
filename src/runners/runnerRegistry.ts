@@ -241,30 +241,29 @@ export async function runImplementationForModel(options: {
 }): Promise<ImplementationRunResult & { runnerId: string }> {
   const effective = resolveEffectiveProvider(options.modelId);
 
-  const run = async (modelId: string | undefined): Promise<ImplementationRunResult & { runnerId: string }> => {
-  const selected = resolveEffectiveProvider(modelId);
-  if (selected.kind === "cli") {
-    const result = await runImplementationWithCli({
-      def: selected.def,
-      model: selected.model,
+  const run = async (selected: EffectiveProvider): Promise<ImplementationRunResult & { runnerId: string }> => {
+    if (selected.kind === "cli") {
+      const result = await runImplementationWithCli({
+        def: selected.def,
+        model: selected.model,
+        prompt: options.prompt,
+        workspaceUri: options.workspaceUri,
+        token: options.token,
+        onProgress: options.onProgress,
+      });
+      return { ...result, runnerId: selected.def.id };
+    }
+
+    const result = await runImplementationWithCopilot({
       prompt: options.prompt,
+      modelId: selected.model,
       workspaceUri: options.workspaceUri,
       token: options.token,
       onProgress: options.onProgress,
     });
-    return { ...result, runnerId: selected.def.id };
-  }
-
-  const result = await runImplementationWithCopilot({
-    prompt: options.prompt,
-    modelId: selected.model,
-    workspaceUri: options.workspaceUri,
-    token: options.token,
-    onProgress: options.onProgress,
-  });
-  return { ...result, runnerId: "copilot-lm" };
+    return { ...result, runnerId: "copilot-lm" };
   };
-  const result = await run(effective.kind === "cli" ? effective.model : effective.model);
+  const result = await run(effective);
   if (options.stage) {
     recordQuotaObservation(options.stage, options.modelId, result.failureKind, result.errorMessage);
   }
@@ -276,7 +275,7 @@ export async function runImplementationForModel(options: {
         return result;
       }
     }
-    const fallbackResult = await run(setting.backup);
+    const fallbackResult = await run(resolveEffectiveProvider(setting.backup));
     recordQuotaObservation(options.stage, setting.backup, fallbackResult.failureKind, fallbackResult.errorMessage);
     return fallbackResult;
   }
