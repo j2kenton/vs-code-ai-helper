@@ -57,7 +57,7 @@ export class TaskStatusBar implements vscode.Disposable {
       this.lastCurrentTaskId = undefined;
     }
 
-    const isCompleted = taskToShow?.progress.currentStage === "completed";
+    const isCompleted = taskToShow?.progress.status === "completed";
     const hasActiveNonCompleted = taskToShow && !isCompleted;
 
     if (!hasActiveNonCompleted) {

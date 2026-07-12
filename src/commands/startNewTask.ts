@@ -8,6 +8,7 @@ import {
 import { resolveTaskRootForCreation } from "../utils/taskRoot";
 import { TaskInventory } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
+import { activateTask } from "../state/taskActivationCoordinator";
 
 /**
  * The default plans root relative to workspace.
@@ -111,7 +112,13 @@ export async function startNewTask(
   extensionUri: vscode.Uri,
   currentTaskStore: CurrentTaskStore
 ): Promise<string | undefined> {
-  const workspaceRoot = vscode.workspace.workspaceFolders?.[0];
+  const workspaceFolders = vscode.workspace.workspaceFolders ?? [];
+  const workspaceRoot = workspaceFolders.length <= 1
+    ? workspaceFolders[0]
+    : await vscode.window.showQuickPick(
+        workspaceFolders.map(folder => ({ label: folder.name, description: folder.uri.fsPath, folder })),
+        { title: "Choose the workspace for this task", placeHolder: "Tasks must belong to exactly one workspace folder" }
+      ).then(selection => selection?.folder);
   if (!workspaceRoot) {
     void vscode.window.showErrorMessage(
       "No workspace folder open. Please open a folder first."
@@ -147,7 +154,16 @@ export async function startNewTask(
     // Write initial progress with the new "task-description" stage
     await writeTaskProgress(
       taskFolderUri,
-      createTaskProgress(taskFolderName, "task-description")
+      {
+        ...createTaskProgress(taskFolderName, "desc"),
+        ownership: {
+          metaRoot: path.resolve(metaFolderPath),
+          projectRoot: path.resolve(workspaceRoot.uri.fsPath),
+          workspaceRoot: path.resolve(workspaceRoot.uri.fsPath),
+          boundAt: new Date().toISOString(),
+          state: "resolved",
+        },
+      }
     );
 
     // Load and write task.md pre-seeded with the template
@@ -176,7 +192,9 @@ export async function startNewTask(
     if (newTask) {
       // Persist the new task as the current task so the shortcut router
       // finds it immediately, even before the user interacts with the tree.
-      await currentTaskStore.set(newTask.canonicalId);
+      if (!(await activateTask(inventory, currentTaskStore, taskFolderPath, newTask.canonicalId))) {
+        throw new Error("Could not activate the new task.");
+      }
     } else {
       // The task folder was created and the inventory was refreshed, but the
       // task could not be re-resolved. This is unexpected (e.g. a race with

@@ -12,12 +12,14 @@ import {
   runImplementationWithCli,
 } from "./cliAgentRunner";
 import {
-  CLI_PROVIDERS,
   CliProviderDefinition,
   getCliProvider,
   parseModelSelection,
   ProviderId,
 } from "./providers";
+import { getModelSettings } from "../config/settings";
+import { chooseFallback } from "../utils/modelFallback";
+import { recordQuotaObservation } from "../utils/quota";
 
 type EffectiveProvider =
   | { kind: "copilot"; model: string | undefined }
@@ -41,9 +43,9 @@ type EffectiveProvider =
  * Shared by resolveRunnerForModel (plan/review) and the two implementation
  * entry points below so all three "with AI" paths auto-detect the same way.
  */
-async function resolveEffectiveProvider(
+function resolveEffectiveProvider(
   modelId: string | undefined
-): Promise<EffectiveProvider> {
+): EffectiveProvider {
   const parsed = parseModelSelection(modelId);
   if (parsed.provider !== "copilot") {
     const def = getCliProvider(parsed.provider);
@@ -58,23 +60,7 @@ async function resolveEffectiveProvider(
     return { kind: "copilot", model: parsed.model };
   }
 
-  // No stage model configured at all: prefer Copilot, but fall back to
-  // whichever CLI provider is actually installed.
-  const copilotAvailable = await new CopilotLanguageModelRunner()
-    .isAvailable()
-    .then((a) => a.available)
-    .catch(() => false);
-  if (copilotAvailable) {
-    return { kind: "copilot", model: undefined };
-  }
-
-  for (const def of CLI_PROVIDERS) {
-    if (await cliCommandExists(def.command, def.commandAliases)) {
-      return { kind: "cli", def, model: undefined };
-    }
-  }
-
-  return { kind: "copilot", model: undefined };
+  throw new Error("No model is configured for this stage. Open Settings and select a primary model.");
 }
 
 export interface ResolvedRunner {
@@ -111,10 +97,44 @@ function toResolvedRunner(effective: EffectiveProvider): ResolvedRunner {
  * Resolve the runner responsible for a stored stage model ID (plan/review
  * stages — see resolveEffectiveProvider for the auto-detection rules).
  */
-export async function resolveRunnerForModel(
-  modelId: string | undefined
-): Promise<ResolvedRunner> {
-  return toResolvedRunner(await resolveEffectiveProvider(modelId));
+export function resolveRunnerForModel(
+  modelId: string | undefined,
+  stage?: import("../types/taskProgress").TaskStage
+): ResolvedRunner {
+  const resolved = toResolvedRunner(resolveEffectiveProvider(modelId));
+  if (!stage) return resolved;
+  const primary = resolved.runner;
+  // Record what every run reveals about this stage+model's quota state
+  // (session-observed only — see utils/quota.ts for why a numeric percentage
+  // isn't offered) so the settings webview can show real, non-fabricated
+  // telemetry instead of a permanent placeholder.
+  const instrumented: AgentRunner = {
+    ...primary,
+    async run(request, token) {
+      const result = await primary.run(request, token);
+      recordQuotaObservation(stage, modelId, result.failureKind, result.errorMessage);
+      return result;
+    },
+  };
+  const setting = getModelSettings()[stage];
+  if (!setting?.fallbackEnabled || setting.strategy !== "switch-to-backup" || !setting.backup || setting.backup === modelId) {
+    return { ...resolved, runner: instrumented };
+  }
+  const fallback = toResolvedRunner(resolveEffectiveProvider(setting.backup));
+  return {
+    ...resolved,
+    runner: {
+      ...instrumented,
+      async run(request, token) {
+        const result = await primary.run(request, token);
+        recordQuotaObservation(stage, modelId, result.failureKind, result.errorMessage);
+        if (result.failureKind !== "quota") return result;
+        const fallbackResult = await fallback.runner.run({ ...request, modelId: fallback.nativeModelId }, token);
+        recordQuotaObservation(stage, setting.backup, fallbackResult.failureKind, fallbackResult.errorMessage);
+        return fallbackResult;
+      },
+    },
+  };
 }
 
 /**
@@ -125,7 +145,7 @@ export async function resolveRunnerForModel(
 export async function checkImplementationAvailabilityForModel(
   modelId: string | undefined
 ): Promise<{ availability: AgentAvailability; providerLabel: string }> {
-  const effective = await resolveEffectiveProvider(modelId);
+  const effective = resolveEffectiveProvider(modelId);
   if (effective.kind === "copilot") {
     return {
       availability: await checkImplementationAvailability(),
@@ -156,27 +176,40 @@ export async function runImplementationForModel(options: {
   workspaceUri: vscode.Uri;
   token: vscode.CancellationToken;
   onProgress: (message: string) => void;
+  stage?: import("../types/taskProgress").TaskStage;
 }): Promise<ImplementationRunResult & { runnerId: string }> {
-  const effective = await resolveEffectiveProvider(options.modelId);
+  const effective = resolveEffectiveProvider(options.modelId);
 
-  if (effective.kind === "cli") {
+  const run = async (modelId: string | undefined): Promise<ImplementationRunResult & { runnerId: string }> => {
+  const selected = resolveEffectiveProvider(modelId);
+  if (selected.kind === "cli") {
     const result = await runImplementationWithCli({
-      def: effective.def,
-      model: effective.model,
+      def: selected.def,
+      model: selected.model,
       prompt: options.prompt,
       workspaceUri: options.workspaceUri,
       token: options.token,
       onProgress: options.onProgress,
     });
-    return { ...result, runnerId: effective.def.id };
+    return { ...result, runnerId: selected.def.id };
   }
 
   const result = await runImplementationWithCopilot({
     prompt: options.prompt,
-    modelId: effective.model,
+    modelId: selected.model,
     workspaceUri: options.workspaceUri,
     token: options.token,
     onProgress: options.onProgress,
   });
   return { ...result, runnerId: "copilot-lm" };
+  };
+  const result = await run(effective.kind === "cli" ? effective.model : effective.model);
+  if (options.stage) recordQuotaObservation(options.stage, options.modelId, result.failureKind, result.errorMessage);
+  const setting = getModelSettings()[options.stage as keyof ReturnType<typeof getModelSettings>];
+  if (result.failureKind === "quota" && options.stage && chooseFallback(setting) === "backup" && setting?.backup) {
+    const fallbackResult = await run(setting.backup);
+    recordQuotaObservation(options.stage, setting.backup, fallbackResult.failureKind, fallbackResult.errorMessage);
+    return fallbackResult;
+  }
+  return result;
 }

@@ -1,13 +1,19 @@
 import * as vscode from "vscode";
-import { getAiModelDefaults } from "../config/settings";
+import {
+  getAiModelDefaults,
+  getMetaResourcesPath,
+  getModelSettings,
+  hasValidMetaResourcesPath,
+} from "../config/settings";
 import { cliCommandExists, resolveCliCommand } from "../runners/cliAgentRunner";
+import { findAllTasks, readTaskProgress } from "./taskProgressUtils";
 import {
   CLI_PROVIDERS,
   type CliProviderId,
   type CliProviderDefinition,
   toQualifiedModelId,
 } from "../runners/providers";
-import { AI_MODEL_STAGES, TaskStage } from "../types/taskProgress";
+import { AI_MODEL_STAGES, REVIEW_STAGES, TaskStage } from "../types/taskProgress";
 import {
   discoverAgyModels,
   type DiscoveredCliModel,
@@ -113,6 +119,63 @@ export async function setTaskStageModel(
   );
 }
 
+/** A task carrying a leftover per-task model override file (see below). */
+export interface TaskModelConflict {
+  taskFolderUri: vscode.Uri;
+  folderName: string;
+  stages: TaskStage[];
+}
+
+/**
+ * Scan every discoverable task (active and paused) for a leftover per-task
+ * model override file (`task-models.json`). Per-task overrides were removed
+ * in favor of workspace-wide model configuration in the Settings panel —
+ * `resolveModelForStage` above no longer reads this file at all — so a task
+ * that still has one is a stale artifact from before that migration, not a
+ * live override. The Settings panel surfaces this so the user can choose to
+ * clear it (it's otherwise silently inert, which is confusing to find later)
+ * rather than the extension silently ignoring files it once wrote.
+ */
+export async function findTaskModelConflicts(): Promise<TaskModelConflict[]> {
+  const conflicts: TaskModelConflict[] = [];
+  for (const ws of vscode.workspace.workspaceFolders ?? []) {
+    const metaFolderUri = hasValidMetaResourcesPath()
+      ? vscode.Uri.joinPath(ws.uri, getMetaResourcesPath())
+      : vscode.Uri.joinPath(ws.uri, ".helper/plans");
+
+    let tasks;
+    try {
+      tasks = await findAllTasks(metaFolderUri);
+    } catch {
+      continue;
+    }
+
+    for (const task of tasks) {
+      // Completed tasks are done — a leftover per-task override there is not
+      // a live conflict a user needs to resolve, so don't surface it.
+      if (task.progress.status === "completed") {
+        continue;
+      }
+      const stageModels = await readTaskStageModels(task.folderUri);
+      const stages = Object.keys(stageModels) as TaskStage[];
+      if (stages.length > 0) {
+        conflicts.push({ taskFolderUri: task.folderUri, folderName: task.folderName, stages });
+      }
+    }
+  }
+  return conflicts;
+}
+
+/** Clear a task's leftover per-task model override for the given stages. */
+export async function clearTaskStageModels(
+  taskFolderUri: vscode.Uri,
+  stages: readonly TaskStage[]
+): Promise<void> {
+  for (const stage of stages) {
+    await setTaskStageModel(taskFolderUri, stage, undefined);
+  }
+}
+
 export async function resolveModelForStage(
   taskFolderUri: vscode.Uri,
   stage: TaskStage
@@ -121,10 +184,26 @@ export async function resolveModelForStage(
     return { source: "none" };
   }
 
-  const taskModels = await readTaskStageModels(taskFolderUri);
-  const taskModel = taskModels[stage];
-  if (taskModel) {
-    return { modelId: taskModel, source: "task" };
+  // Check new modelSettings first
+  const modelSettings = getModelSettings();
+  const stageSetting = modelSettings[stage];
+  if (stageSetting?.primary) {
+    // If fallback is enabled, check if task progress has fallback active for this stage
+    try {
+      const progress = await readTaskProgress(taskFolderUri);
+      if (
+        progress &&
+        progress.fallbackActive &&
+        progress.fallbackActive[stage] &&
+        stageSetting.fallbackEnabled &&
+        stageSetting.backup
+      ) {
+        return { modelId: stageSetting.backup, source: "workspace" };
+      }
+    } catch {
+      // No persisted progress (or unreadable) — fall through to the primary model.
+    }
+    return { modelId: stageSetting.primary, source: "workspace" };
   }
 
   const defaults = getAiModelDefaults();
@@ -134,6 +213,35 @@ export async function resolveModelForStage(
   }
 
   return { source: "none" };
+}
+
+/**
+ * "plan-low-review" and "impl-low-review" are optional deep-dive reviews:
+ * unlike the other review stages, auto-advance should skip straight past
+ * them when no model is configured, rather than parking the task at a
+ * review stage it has no way to act on. Other review stages (high-level
+ * reviews, publish) are never skipped this way.
+ *
+ * Returns the set of review stages that auto-advance is allowed to land on
+ * for this task — every review stage except an optional one with no
+ * configured model — for use as `computeNextStage`'s `configuredStages`.
+ */
+const OPTIONAL_REVIEW_STAGES: readonly TaskStage[] = [
+  "plan-low-review",
+  "impl-low-review",
+];
+
+export async function resolveConfiguredReviewStages(
+  taskFolderUri: vscode.Uri
+): Promise<ReadonlySet<TaskStage>> {
+  const configured = new Set<TaskStage>(REVIEW_STAGES);
+  for (const stage of OPTIONAL_REVIEW_STAGES) {
+    const resolved = await resolveModelForStage(taskFolderUri, stage);
+    if (!resolved.modelId) {
+      configured.delete(stage);
+    }
+  }
+  return configured;
 }
 
 function isAutoModel(model: vscode.LanguageModelChat): boolean {

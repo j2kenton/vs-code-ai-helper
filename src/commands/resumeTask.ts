@@ -4,11 +4,10 @@ import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
 import {
   IncompleteTask,
-  patchTaskProgress,
-  updateTaskStatus,
 } from "../utils/taskProgressUtils";
 
 import { NotificationRouter } from "../utils/notificationRouter";
+import { activateTask } from "../state/taskActivationCoordinator";
 
 /**
  * Accepted argument shapes for resumeTask.
@@ -114,11 +113,10 @@ export async function resumePausedTask(
     return;
   }
 
-  const taskUri = vscode.Uri.file(resolvedTask.taskFolderPath);
-  const patched = await patchTaskProgress(taskUri, (current) =>
-    updateTaskStatus(current, "active")
+  const activated = await activateTask(
+    inventory, currentTaskStore, resolvedTask.taskFolderPath, resolvedTask.canonicalId
   );
-  if (!patched) {
+  if (!activated) {
     void vscode.window.showErrorMessage("Could not read task progress.");
     return;
   }
@@ -126,9 +124,6 @@ export async function resumePausedTask(
   // Persist the resumed task as the current task so the keyboard shortcut
   // router and status bar reflect it immediately — CurrentTaskStore is the
   // single source of truth for all surfaces (tree, status bar, task actions).
-  await currentTaskStore.set(resolvedTask.canonicalId);
-
-  await inventory.refresh();
   NotificationRouter.showInformation(`Task resumed.`);
 }
 

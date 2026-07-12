@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import { AI_MODEL_STAGES, TaskStage } from "../types/taskProgress";
+import { ModelSettings } from "../utils/modelFallback";
 
 const CONFIG_SECTION = "vs-code-ai-helper";
 const META_RESOURCES_PATH_KEY = "metaResourcesPath";
@@ -134,6 +135,53 @@ export async function setModelSelectionPromptShown(): Promise<void> {
   await config.update(
     MODEL_PROMPT_SHOWN_KEY,
     true,
+    vscode.ConfigurationTarget.Workspace
+  );
+}
+
+const MODEL_SETTINGS_KEY = "modelSettings";
+const MAX_IMPLEMENTATION_ITERATIONS_KEY = "maxImplementationIterations";
+
+export function getMaxImplementationIterations(): number {
+  const value = vscode.workspace.getConfiguration(CONFIG_SECTION).get<number>(MAX_IMPLEMENTATION_ITERATIONS_KEY, 200);
+  return Math.max(1, Math.min(200, Math.floor(typeof value === "number" && Number.isFinite(value) ? value : 200)));
+}
+
+export function getModelSettings(): ModelSettings {
+  const config = vscode.workspace.getConfiguration(CONFIG_SECTION);
+  const raw = config.get<Record<string, unknown>>(MODEL_SETTINGS_KEY, {});
+  const result: ModelSettings = {};
+  for (const stage of AI_MODEL_STAGES) {
+    const value = raw[stage];
+    if (!value || typeof value !== "object") continue;
+    const entry = value as Record<string, unknown>;
+    const primary = typeof entry.primary === "string" && entry.primary.trim() ? entry.primary : undefined;
+    const backup = typeof entry.backup === "string" && entry.backup.trim() ? entry.backup : undefined;
+    const strategy = entry.strategy === "switch-to-backup" || entry.strategy === "pause-and-resume" || entry.strategy === "alert-and-wait"
+      ? entry.strategy : "alert-and-wait";
+    result[stage] = { primary, backup, fallbackEnabled: entry.fallbackEnabled === true, strategy };
+  }
+  // Migrate the older primary-only setting so existing workspaces do not
+  // silently lose their configured models when the settings panel is opened.
+  for (const stage of AI_MODEL_STAGES) {
+    if (!result[stage]) {
+      const legacy = getAiModelDefault(stage);
+      if (legacy) result[stage] = { primary: legacy, fallbackEnabled: false, strategy: "alert-and-wait" };
+    }
+  }
+  return result;
+}
+
+export async function setModelSettings(settings: ModelSettings): Promise<void> {
+  const config = vscode.workspace.getConfiguration(CONFIG_SECTION);
+  const clean: ModelSettings = {};
+  for (const stage of AI_MODEL_STAGES) {
+    const setting = settings[stage];
+    if (setting) clean[stage] = { ...setting, fallbackEnabled: Boolean(setting.fallbackEnabled) };
+  }
+  await config.update(
+    MODEL_SETTINGS_KEY,
+    clean,
     vscode.ConfigurationTarget.Workspace
   );
 }

@@ -23,7 +23,7 @@ export async function applyCurrentStageAction(
   const resolvedTask = await resolveTaskContext(
     inventory,
     undefined,
-    { allowPaused: true },
+    { allowPaused: true, promptForOwnershipResolution: true },
     currentTaskStore
   );
 
@@ -43,7 +43,7 @@ export async function applyCurrentStageAction(
 
   const stage = resolvedTask.progress.currentStage;
 
-  if (stage === "task-description") {
+  if (stage === "desc") {
     await vscode.commands.executeCommand("vs-code-ai-helper.draftTaskWithAI", {
       canonicalId: resolvedTask.canonicalId,
     });

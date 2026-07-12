@@ -79,7 +79,10 @@
  *      fail immediately.
  */
 import * as assert from "node:assert/strict";
-import { describe, it } from "node:test";
+import * as nodeFs from "node:fs";
+import * as nodeOs from "node:os";
+import * as nodePath from "node:path";
+import { after, describe, it } from "node:test";
 import * as vscode from "vscode";
 
 // ---------------------------------------------------------------------------
@@ -136,7 +139,7 @@ function makeInventoryStub(
     sourceScopeKey: knownId,
     progress: {
       taskFolder: taskFolderPath.split(/[/\\]/).pop() ?? "",
-      currentStage: "implementation" as const,
+      currentStage: "impl" as const,
       status,
       createdAt: "2026-07-08T00:00:00.000Z",
       updatedAt: "2026-07-08T00:00:00.000Z",
@@ -233,7 +236,7 @@ function makeIncompleteTask(
     folderName: folderPath.split(/[/\\]/).pop() ?? "",
     progress: {
       taskFolder: folderPath.split(/[/\\]/).pop() ?? "",
-      currentStage: "implementation" as const,
+      currentStage: "impl" as const,
       status,
       createdAt: "2026-07-08T00:00:00.000Z",
       updatedAt: "2026-07-08T00:00:00.000Z",
@@ -336,6 +339,14 @@ function installMemStore(store: Map<string, string>): FsStubHandles {
   (vscode.workspace.fs as unknown as Record<string, unknown>).readFile = (
     uri: vscode.Uri
   ): Promise<Uint8Array> => {
+    // writeTaskProgress persists task-progress.json via writeAtomic, which
+    // always hits the real filesystem (production's vscode.workspace.fs and
+    // Node's fs both resolve to the same disk, but this in-memory store does
+    // not). Prefer the real file when present so patchTaskProgress reads see
+    // its own prior writes instead of the stale seeded snapshot.
+    if (nodePath.basename(uri.fsPath) === "task-progress.json" && nodeFs.existsSync(uri.fsPath)) {
+      return nodeFs.promises.readFile(uri.fsPath, "utf8").then((text) => new TextEncoder().encode(text));
+    }
     const content = store.get(uri.toString());
     if (content === undefined) {
       throw new Error(`ENOENT: ${uri.toString()}`);
@@ -378,8 +389,47 @@ function installMemStore(store: Map<string, string>): FsStubHandles {
   };
 }
 
+// patchTaskProgress (and therefore pauseTask/resumePausedTask/setTaskStage,
+// which all route through it) now serializes writes through withTaskLock,
+// which takes real filesystem leases derived from the folder path's ".."
+// ancestry. A shallow fake path like "/fake-workspace/x" collides with the
+// filesystem root two levels up, and mkdir on a Windows drive root throws
+// EPERM even though it already exists. Use a real temp directory with a
+// ".ensemble"-nested shape matching production so the lease paths land
+// safely inside it instead.
+const REAL_TASK_ROOT = nodeFs.mkdtempSync(
+  nodePath.join(nodeOs.tmpdir(), "ensemble-cmdargs-test-")
+);
+after(() => {
+  nodeFs.rmSync(REAL_TASK_ROOT, { recursive: true, force: true });
+});
+
 function makeTaskFolderUri(name: string): vscode.Uri {
-  return vscode.Uri.file(`/fake-workspace/${name}`);
+  const dir = nodePath.join(REAL_TASK_ROOT, ".ensemble", name);
+  // resolveTaskContext refuses to resolve a task whose folder does not exist
+  // on disk (fs.existsSync guard), so the fixture must create it for real,
+  // not just seed a matching key in the in-memory workspace.fs mock.
+  nodeFs.mkdirSync(dir, { recursive: true });
+  return vscode.Uri.file(dir);
+}
+
+/**
+ * Install a stub for vscode.workspace.workspaceFolders pointing at
+ * REAL_TASK_ROOT, and restore it afterward. resolveTaskContext requires the
+ * resolved task folder to fall under a configured workspace folder, so any
+ * test that exercises the full command path (pauseTask, resumePausedTask,
+ * setTaskStage) against a makeTaskFolderUri()-produced path needs this.
+ */
+function installWorkspaceFoldersStub(): { restore: () => void } {
+  const orig = (vscode.workspace as unknown as Record<string, unknown>).workspaceFolders;
+  (vscode.workspace as unknown as Record<string, unknown>).workspaceFolders = [
+    { uri: vscode.Uri.file(REAL_TASK_ROOT), name: "real-task-root", index: 0 },
+  ];
+  return {
+    restore: (): void => {
+      (vscode.workspace as unknown as Record<string, unknown>).workspaceFolders = orig;
+    },
+  };
 }
 
 function seedProgress(
@@ -388,7 +438,12 @@ function seedProgress(
   progress: TaskProgress
 ): Promise<void> {
   const uri = vscode.Uri.joinPath(folderUri, "task-progress.json");
-  store.set(uri.toString(), JSON.stringify(progress, null, 2));
+  const content = JSON.stringify(progress, null, 2);
+  store.set(uri.toString(), content);
+  // activateTask (used by resumePausedTask/startNewTask) checks task-progress.json's
+  // existence via raw Node fs, not vscode.workspace.fs, so it never sees the
+  // in-memory store. Also write the real file so both paths agree.
+  nodeFs.writeFileSync(uri.fsPath, content, "utf8");
   return Promise.resolve();
 }
 
@@ -397,6 +452,13 @@ function readStoredProgress(
   folderUri: vscode.Uri
 ): Promise<TaskProgress | undefined> {
   const uri = vscode.Uri.joinPath(folderUri, "task-progress.json");
+  // See the matching comment in installMemStore's readFile mock: writeAtomic
+  // always persists task-progress.json to the real filesystem, so the real
+  // file (when present) reflects any patchTaskProgress writes that the
+  // in-memory store does not.
+  if (nodeFs.existsSync(uri.fsPath)) {
+    return nodeFs.promises.readFile(uri.fsPath, "utf8").then((raw) => JSON.parse(raw) as TaskProgress);
+  }
   const raw = store.get(uri.toString());
   if (!raw) {
     return Promise.resolve(undefined);
@@ -717,12 +779,13 @@ void describe("pauseTask integration (full command path)", () => {
     const store = new Map<string, string>();
     const fs = installMemStore(store);
     const msgs = installMessageCapture();
+    const wsFolders = installWorkspaceFoldersStub();
     try {
       const folderUri = makeTaskFolderUri("pause-integration-active");
       const folderPath = folderUri.fsPath;
       const progress: TaskProgress = {
         taskFolder: "pause-integration-active",
-        currentStage: "implementation",
+        currentStage: "impl",
         status: "active",
         createdAt: "2026-07-08T00:00:00.000Z",
         updatedAt: "2026-07-08T00:00:00.000Z",
@@ -755,6 +818,7 @@ void describe("pauseTask integration (full command path)", () => {
     } finally {
       msgs.restore();
       fs.restore();
+      wsFolders.restore();
     }
   });
 
@@ -814,12 +878,13 @@ void describe("resumePausedTask integration (full command path)", () => {
     const store = new Map<string, string>();
     const fs = installMemStore(store);
     const msgs = installMessageCapture();
+    const wsFolders = installWorkspaceFoldersStub();
     try {
       const folderUri = makeTaskFolderUri("resume-integration-paused");
       const folderPath = folderUri.fsPath;
       const progress: TaskProgress = {
         taskFolder: "resume-integration-paused",
-        currentStage: "implementation",
+        currentStage: "impl",
         status: "paused",
         createdAt: "2026-07-08T00:00:00.000Z",
         updatedAt: "2026-07-08T00:00:00.000Z",
@@ -849,6 +914,7 @@ void describe("resumePausedTask integration (full command path)", () => {
     } finally {
       msgs.restore();
       fs.restore();
+      wsFolders.restore();
     }
   });
 
@@ -912,7 +978,7 @@ void describe("patchTaskProgress preserves unrelated fields (pauseTask regressio
 
       const initial: TaskProgress = {
         taskFolder: "pause-preserves-impl-files",
-        currentStage: "implementation",
+        currentStage: "impl",
         status: "active",
         createdAt: "2026-07-08T00:00:00.000Z",
         updatedAt: "2026-07-08T00:00:00.000Z",
@@ -978,7 +1044,7 @@ void describe("patchTaskProgress preserves unrelated fields (pauseTask regressio
 
       const initial: TaskProgress = {
         taskFolder: "set-stage-preserves-impl-files",
-        currentStage: "implementation",
+        currentStage: "impl",
         status: "active",
         createdAt: "2026-07-08T00:00:00.000Z",
         updatedAt: "2026-07-08T00:00:00.000Z",
@@ -1009,7 +1075,7 @@ void describe("patchTaskProgress preserves unrelated fields (pauseTask regressio
 
       const initial: TaskProgress = {
         taskFolder: "accumulate-impl-files",
-        currentStage: "implementation",
+        currentStage: "impl",
         status: "active",
         createdAt: "2026-07-08T00:00:00.000Z",
         updatedAt: "2026-07-08T00:00:00.000Z",
@@ -1051,22 +1117,6 @@ void describe("patchTaskProgress preserves unrelated fields (pauseTask regressio
 
 void describe("setTaskStage auto-review delegation (production code)", () => {
   /**
-   * Helper: install a stub for vscode.workspace.workspaceFolders that
-   * returns a minimal workspace folder, and restore it afterward.
-   */
-  function installWorkspaceFoldersStub(): { restore: () => void } {
-    const orig = (vscode.workspace as unknown as Record<string, unknown>).workspaceFolders;
-    (vscode.workspace as unknown as Record<string, unknown>).workspaceFolders = [
-      { uri: vscode.Uri.file("/fake-workspace"), name: "fake-workspace", index: 0 },
-    ];
-    return {
-      restore: (): void => {
-        (vscode.workspace as unknown as Record<string, unknown>).workspaceFolders = orig;
-      },
-    };
-  }
-
-  /**
    * Helper: install a stub for vscode.commands.executeCommand that captures
    * calls and resolves to undefined (no-op). Returns a restore handle and the
    * captured-calls array.
@@ -1097,7 +1147,8 @@ void describe("setTaskStage auto-review delegation (production code)", () => {
   }
 
   void it("dispatches runReviewWithAI with { taskFolderPath } not { canonicalId }", async () => {
-    const FOLDER_PATH = "/fake-workspace/set-stage-auto-review-delegation";
+    const FOLDER_PATH = nodePath.join(REAL_TASK_ROOT, ".ensemble", "set-stage-auto-review-delegation");
+    nodeFs.mkdirSync(FOLDER_PATH, { recursive: true });
     const folderUri = vscode.Uri.file(FOLDER_PATH);
 
     const store = new Map<string, string>();
@@ -1170,7 +1221,8 @@ void describe("setTaskStage auto-review delegation (production code)", () => {
   });
 
   void it("does NOT dispatch runReviewWithAI when triggerAutoReview is false", async () => {
-    const FOLDER_PATH = "/fake-workspace/set-stage-no-auto-review";
+    const FOLDER_PATH = nodePath.join(REAL_TASK_ROOT, ".ensemble", "set-stage-no-auto-review");
+    nodeFs.mkdirSync(FOLDER_PATH, { recursive: true });
     const folderUri = vscode.Uri.file(FOLDER_PATH);
 
     const store = new Map<string, string>();
@@ -1545,12 +1597,12 @@ void describe("runReviewForFolder impl-review variable sourcing (production code
       });
 
       // Call the PRODUCTION function directly with an impl-review stage.
-      // "implementation" stage maps to targetStage "impl-high-review".
+      // "impl" stage maps to targetStage "impl-high-review".
       await runReviewForFolder(
         fakeExtensionUri,
         folderUri,
         workspaceRoot,
-        "implementation",  // currentStage that maps to impl-high-review review
+        "impl",  // currentStage that maps to impl-high-review review
         true
       );
 
@@ -1618,7 +1670,7 @@ void describe("runReviewForFolder impl-review variable sourcing (production code
         fakeExtensionUri,
         folderUri,
         workspaceRoot,
-        "implementation",
+        "impl",
         true
       );
 
@@ -1697,7 +1749,7 @@ void describe("runReviewForFolder impl-review variable sourcing (production code
         fakeExtensionUri,
         folderUri,
         workspaceRoot,
-        "implementation",
+        "impl",
         true
       );
 
@@ -1826,7 +1878,7 @@ void describe("setTaskStage deleted-task error path", () => {
         currentStore,
         {
           taskFolderPath: "/fake-workspace/nonexistent-task",
-          stage: "implementation",
+          stage: "impl",
         },
         false
       );
@@ -2168,7 +2220,7 @@ void describe("runReviewForFolder legacy-task fallback (suite 14)", () => {
         fakeExtensionUri,
         folderUri,
         workspaceRoot,
-        "implementation",
+        "impl",
         true
       );
 
@@ -2248,7 +2300,7 @@ void describe("runReviewForFolder legacy-task fallback (suite 14)", () => {
         fakeExtensionUri,
         folderUri,
         workspaceRoot,
-        "implementation",
+        "impl",
         true
       );
 
@@ -2601,10 +2653,10 @@ void describe("isMalformedReviewArg mixed-shape bypass variants (suite 15)", () 
 //
 // Confirms that:
 //   (a) plan-low-review tasks are NOT shown in the QuickPick for Generate
-//       Implementation — the eligible stage list is ["implementation"] only.
+//       Implementation — the eligible stage list is ["impl"] only.
 //   (b) implementation-stage tasks ARE eligible.
 //
-// The old code used ["plan-low-review", "implementation"], which advertised
+// The old code used ["plan-low-review", "impl"], which advertised
 // plan-low-review tasks as eligible but then immediately failed when
 // plan-final.md didn't exist yet (because plan-final.md is only written when
 // advancing INTO the implementation stage via nextStage).
@@ -2629,7 +2681,7 @@ void describe("generateImplementationWithAI eligibility (suite 16)", () => {
 
   void it("GENERATE_IMPL_ELIGIBLE_STAGES (production) includes 'implementation'", () => {
     assert.ok(
-      GENERATE_IMPL_ELIGIBLE_STAGES.includes("implementation"),
+      GENERATE_IMPL_ELIGIBLE_STAGES.includes("impl"),
       "production GENERATE_IMPL_ELIGIBLE_STAGES must include 'implementation'"
     );
   });
@@ -2639,7 +2691,7 @@ void describe("generateImplementationWithAI eligibility (suite 16)", () => {
     // any unintended additions (not just plan-low-review) are caught.
     assert.deepEqual(
       [...GENERATE_IMPL_ELIGIBLE_STAGES],
-      ["implementation"],
+      ["impl"],
       "production GENERATE_IMPL_ELIGIBLE_STAGES must be exactly ['implementation']"
     );
   });

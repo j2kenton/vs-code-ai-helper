@@ -3,8 +3,10 @@ import { TaskInventory, TaskWithProgress } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { STAGE_DISPLAY_NAMES } from "../types/taskProgress";
-import { IncompleteTask } from "../utils/taskProgressUtils";
+import { IncompleteTask, patchTaskProgress } from "../utils/taskProgressUtils";
 import { runCompletionLint } from "../utils/completionLint";
+import { isStrictPerfectReview } from "../utils/reviewReadiness";
+import { STAGE_ARTIFACT_FILENAMES } from "../types/taskProgress";
 
 /**
  * Accepted argument shapes for markTaskDone.
@@ -56,7 +58,7 @@ export function isMarkTaskDoneEligible(
   if (progress.status === "paused") {
     return false;
   }
-  return progress.currentStage === "completed";
+  return progress.currentStage === "publish";
 }
 
 /**
@@ -76,7 +78,7 @@ export function selectNextTask(
   const next = tasks.find(
     (t) =>
       t.canonicalId !== completedCanonicalId &&
-      t.progress.currentStage !== "completed" &&
+      t.progress.currentStage !== "publish" &&
       t.progress.status !== "paused"
   );
   return next?.canonicalId;
@@ -96,9 +98,10 @@ export function selectNextTask(
  * Ordering (strict):
  *   1. Re-run completion lint for a fresh read (picks up any fixes made
  *      while on the Publish row).
- *   2. Refresh inventory.
- *   3. Select the next active task in CurrentTaskStore.
- *   4. Show completion info message.
+ *   2. Verify the Publish review has a strict 10/10 score.
+ *   3. Refresh inventory.
+ *   4. Select the next active task in CurrentTaskStore.
+ *   5. Show completion info message.
  */
 export async function markTaskDone(
   inventory: TaskInventory,
@@ -136,7 +139,7 @@ export async function markTaskDone(
       STAGE_DISPLAY_NAMES[resolvedTask.progress.currentStage];
     void vscode.window.showWarningMessage(
       `"Complete and Move On to Next Task" is only available once the task ` +
-        `has reached ${STAGE_DISPLAY_NAMES["completed"]}. ` +
+        `has reached ${STAGE_DISPLAY_NAMES["publish"]}. ` +
         `Current stage: ${currentStageName}.`
     );
     return;
@@ -144,10 +147,38 @@ export async function markTaskDone(
 
   // ── Step 1: Re-run completion lint for a fresh, final read ───────────────
   const taskFolderUri = vscode.Uri.file(resolvedTask.taskFolderPath);
-  const lintResult = await runCompletionLint(taskFolderUri);
+  const lintResult = await runCompletionLint(taskFolderUri, resolvedTask.progress.implReviewFiles);
+  if (!lintResult.passed) {
+    void vscode.window.showWarningMessage(
+      `Cannot complete ${resolvedTask.folderName}: completion checks are still failing. Fix the reported issues and try again.`
+    );
+    return;
+  }
+
+  // ── Step 2: Verify Publish review has a strict 10/10 score ───────────────
+  const publishReview = STAGE_ARTIFACT_FILENAMES.publish;
+  if (publishReview) {
+    try {
+      const bytes = await vscode.workspace.fs.readFile(vscode.Uri.joinPath(taskFolderUri, publishReview));
+      if (!isStrictPerfectReview(new TextDecoder().decode(bytes))) {
+        void vscode.window.showWarningMessage("Publish cannot be completed until the Publish review has a strict 10/10 score.");
+        return;
+      }
+    } catch {
+      void vscode.window.showWarningMessage("Publish cannot be completed until a Publish review has been generated and scored 10/10.");
+      return;
+    }
+  }
+  // Completion is an explicit user action. Reaching Publish alone never
+  // changes lifecycle status, but this command is the durable terminal edge.
+  await patchTaskProgress(taskFolderUri, (current) => ({
+    ...current,
+    status: "completed",
+    completedAt: new Date().toISOString(),
+  }));
   await inventory.refresh();
 
-  // ── Step 2: Select next active task deterministically ────────────────────
+  // ── Step 3: Select next active task deterministically ────────────────────
   const nextCanonicalId = selectNextTask(inventory, resolvedTask.canonicalId);
   if (nextCanonicalId) {
     await currentTaskStore.set(nextCanonicalId);
@@ -155,11 +186,11 @@ export async function markTaskDone(
     await currentTaskStore.clear();
   }
 
-  // ── Step 3: Show completion message ──────────────────────────────────────
+  // ── Step 4: Show completion message ──────────────────────────────────────
   void vscode.window.showInformationMessage(
     nextCanonicalId
-      ? `${resolvedTask.folderName} complete (${lintResult.passed ? "lint passed" : "lint issues found"}). Next task selected.`
-      : `${resolvedTask.folderName} complete (${lintResult.passed ? "lint passed" : "lint issues found"}). No remaining active tasks.`
+      ? `${resolvedTask.folderName} complete (lint passed). Next task selected.`
+      : `${resolvedTask.folderName} complete (lint passed). No remaining active tasks.`
   );
 }
 

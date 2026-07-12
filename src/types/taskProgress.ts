@@ -4,19 +4,22 @@
  * from old final-plan + implementation stages), and implementation reviews.
  */
 export type TaskStage =
-  | "task-description"
+  | "desc"
   | "plan"
   | "plan-high-review"
   | "plan-low-review"
-  | "implementation"
+  | "impl"
   | "impl-high-review"
   | "impl-low-review"
-  | "completed";
+  | "publish";
+
+/** Lifecycle completion is separate from the terminal Publish stage. */
+export type CanonicalTaskStage = TaskStage;
 
 /**
  * Task status values.
  */
-export type TaskStatus = "active" | "paused";
+export type TaskStatus = "creating" | "active" | "paused" | "completed";
 
 /**
  * The filename for the task request/scope artifact
@@ -81,6 +84,18 @@ export interface TaskProgress {
   currentStage: TaskStage;
   /** Task status: active or paused. Missing = active for backward compat. */
   status?: TaskStatus;
+  /** Set when the task is explicitly completed; stage advancement never sets it. */
+  completedAt?: string;
+  /** Original description captured before an AI draft is applied. */
+  preImageDescription?: string;
+  /** Stable project binding used for workspace-scoped operations. */
+  ownership?: {
+    metaRoot: string;
+    projectRoot: string;
+    workspaceRoot?: string;
+    boundAt: string;
+    state?: "resolved" | "ownership-unresolved";
+  };
   /** ISO timestamp when the task was created */
   createdAt: string;
   /** ISO timestamp when the progress was last updated */
@@ -107,6 +122,8 @@ export interface TaskProgress {
   scheduledResumeTime?: string;
   /** Pending notes by stage */
   pendingNotes?: Partial<Record<TaskStage, string>>;
+  /** Active fallback state by stage */
+  fallbackActive?: Partial<Record<TaskStage, boolean>>;
 }
 
 /**
@@ -118,28 +135,30 @@ export const TASK_PROGRESS_FILENAME = "task-progress.json";
  * Order of stages for determining workflow progression
  */
 export const STAGE_ORDER: readonly TaskStage[] = [
-  "task-description",
+  "desc",
   "plan",
   "plan-high-review",
   "plan-low-review",
-  "implementation",
+  "impl",
   "impl-high-review",
   "impl-low-review",
-  "completed",
+  "publish",
 ] as const;
+
+export const PUBLISH_STAGE: TaskStage = "publish";
 
 /**
  * Human-readable names for each stage
  */
 export const STAGE_DISPLAY_NAMES: Record<TaskStage, string> = {
-  "task-description": "Task Description",
+  desc: "Task Description",
   plan: "Plan",
   "plan-high-review": "High-Level Review (Plan)",
   "plan-low-review": "Low-Level Review (Plan)",
-  implementation: "Implementation",
+  impl: "Implementation",
   "impl-high-review": "High-Level Code Review",
   "impl-low-review": "Low-Level Code Review",
-  completed: "Publish",
+  publish: "Publish",
 };
 
 /**
@@ -147,14 +166,14 @@ export const STAGE_DISPLAY_NAMES: Record<TaskStage, string> = {
  */
 export const STAGE_ARTIFACT_FILENAMES: Record<TaskStage, string | undefined> =
   {
-    "task-description": TASK_FILENAME,
+    desc: TASK_FILENAME,
     plan: PLAN_FILENAME,
     "plan-high-review": "plan-high-review.md",
     "plan-low-review": "plan-low-review.md",
-    implementation: IMPLEMENTATION_FILENAME,
+    impl: IMPLEMENTATION_FILENAME,
     "impl-high-review": "impl-high-review.md",
     "impl-low-review": "impl-low-review.md",
-    completed: undefined,
+    publish: "publish-review.md",
   };
 
 /**
@@ -166,6 +185,7 @@ export const REVIEW_STAGES: readonly TaskStage[] = [
   "plan-low-review",
   "impl-high-review",
   "impl-low-review",
+  "publish",
 ] as const;
 
 /**
@@ -173,13 +193,14 @@ export const REVIEW_STAGES: readonly TaskStage[] = [
  * selection configured.
  */
 export const AI_MODEL_STAGES: readonly TaskStage[] = [
-  "task-description",
+  "desc",
   "plan",
   "plan-high-review",
   "plan-low-review",
-  "implementation",
+  "impl",
   "impl-high-review",
   "impl-low-review",
+  "publish",
 ] as const;
 
 /**
@@ -204,9 +225,11 @@ export function isPlanReviewStage(stage: TaskStage): boolean {
  */
 const LEGACY_STAGE_MAP: Record<string, TaskStage> = {
   // Pre-"task-description" rename
-  created: "task-description",
+  created: "desc",
+  "task-description": "desc",
   // Pre-merge of final-plan + implementation
-  "plan-final": "implementation",
+  "plan-final": "impl",
+  implementation: "impl",
   // Very old stage names from pre-0.6.0
   "plan-review": "plan-high-review",
   "plan-updated": "plan-high-review",
@@ -226,15 +249,17 @@ export function migrateStage(stage: string): TaskStage {
   if (legacy) {
     return legacy;
   }
-  return "task-description";
+  return "desc";
 }
 
 /**
  * Normalize a status value read from disk. Missing or invalid -> "active".
  */
 export function migrateStatus(status: unknown): TaskStatus {
-  if (status === "active" || status === "paused") {
+  if (status === "creating" || status === "active" || status === "paused" || status === "completed") {
     return status;
   }
+  // Older task files used `finished` for the explicit completion state.
+  if (status === "finished" || status === "done") return "completed";
   return "active";
 }

@@ -103,18 +103,7 @@
         "category": "Ensemble",
         "icon": "$(server-environment)"
       },
-      {
-        "command": "vs-code-ai-helper.configureTaskStepModels",
-        "title": "Configure Models for This Task",
-        "category": "Ensemble",
-        "icon": "$(server-environment)"
-      },
-      {
-        "command": "vs-code-ai-helper.setStageModel",
-        "title": "Set Model for This Step",
-        "category": "Ensemble",
-        "icon": "$(server-environment)"
-      },
+
       {
         "command": "vs-code-ai-helper.setTaskStage",
         "title": "Jump to Stage",
@@ -205,7 +194,7 @@
       },
       {
         "command": "vs-code-ai-helper.runLintingFixes",
-        "title": "Fix Linting Issues",
+        "title": "Linting & Code Errors",
         "category": "Ensemble",
         "icon": "$(wand)"
       },
@@ -244,6 +233,12 @@
         "title": "Commit & Push",
         "category": "Ensemble",
         "icon": "$(cloud-upload)"
+      },
+      {
+        "command": "vs-code-ai-helper.release",
+        "title": "Release",
+        "category": "Ensemble",
+        "icon": "$(package)"
       },
       {
         "command": "vs-code-ai-helper.openAndStartNewTask",
@@ -305,19 +300,31 @@
           "name": "Recent Status",
           "icon": "images/tasks-view.svg",
           "contextualTitle": "Ensemble Status"
+        },
+        {
+          "id": "vs-code-ai-helper.settingsView",
+          "type": "webview",
+          "name": "Settings",
+          "icon": "$(gear)",
+          "contextualTitle": "Ensemble Settings"
         }
       ]
     },
     "viewsWelcome": [
       {
         "view": "vs-code-ai-helper.tasksView",
+        "contents": "Loading tasks…",
+        "when": "!vs-code-ai-helper.tasksInitialized"
+      },
+      {
+        "view": "vs-code-ai-helper.tasksView",
         "contents": "No meta resources folder is configured yet. Select one to start tracking tasks.\n[Select Meta Resources Folder](command:vs-code-ai-helper.selectMetaFolder)",
-        "when": "!vs-code-ai-helper.hasMetaFolder"
+        "when": "vs-code-ai-helper.tasksInitialized && !vs-code-ai-helper.hasMetaFolder"
       },
       {
         "view": "vs-code-ai-helper.tasksView",
         "contents": "No tasks yet. Start one to see its workflow progress here.\n[Start New Task](command:vs-code-ai-helper.startNewTask)",
-        "when": "vs-code-ai-helper.hasMetaFolder && !vs-code-ai-helper.hasTasks"
+        "when": "vs-code-ai-helper.tasksInitialized && vs-code-ai-helper.hasMetaFolder && !vs-code-ai-helper.hasTasks"
       }
     ],
     "menus": {
@@ -375,23 +382,18 @@
           "group": "inline@1"
         },
         {
-          "command": "vs-code-ai-helper.configureTaskStepModels",
-          "when": "view == vs-code-ai-helper.tasksView && (viewItem =~ /^task-active/ || viewItem =~ /^task-paused/ || viewItem =~ /^task-completed/)",
-          "group": "task@3"
-        },
-        {
           "command": "vs-code-ai-helper.setStageAsCurrent",
-          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage-task-description/ && !(viewItem =~ /-current/) && !(viewItem =~ /-paused/)",
+          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage-desc/ && !(viewItem =~ /-current/) && !(viewItem =~ /-paused/)",
           "group": "inline@1"
         },
         {
           "command": "vs-code-ai-helper.draftTaskWithAI",
-          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage-task-description-current/ && !(viewItem =~ /-paused/)",
+          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage-desc-current/ && !(viewItem =~ /-paused/)",
           "group": "inline@2"
         },
         {
           "command": "vs-code-ai-helper.nextStage",
-          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage-task-description-current/ && !(viewItem =~ /-paused/)",
+          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage-desc-current/ && !(viewItem =~ /-paused/)",
           "group": "inline@9"
         },
         {
@@ -451,28 +453,38 @@
         },
         {
           "command": "vs-code-ai-helper.runLintingFixes",
-          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage-completed-current/ && !(viewItem =~ /-paused/)",
+          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage-publish-current/ && !(viewItem =~ /-paused/)",
           "group": "inline@1"
         },
         {
-          "command": "vs-code-ai-helper.commitAndPushTask",
-          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage-completed-current/ && !(viewItem =~ /-paused/)",
+          "command": "vs-code-ai-helper.runReviewWithAI",
+          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage-publish-current/ && !(viewItem =~ /-paused/)",
+          "group": "inline@1"
+        },
+        {
+          "command": "vs-code-ai-helper.chatWithStage",
+          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage-publish-current/ && !(viewItem =~ /-paused/)",
           "group": "inline@2"
         },
         {
-          "command": "vs-code-ai-helper.markTaskDone",
-          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage-completed-current/ && !(viewItem =~ /-paused/)",
+          "command": "vs-code-ai-helper.commitAndPushTask",
+          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage-publish-current/ && !(viewItem =~ /-paused/)",
           "group": "inline@3"
         },
         {
-          "command": "vs-code-ai-helper.setStageAsCurrent",
-          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage/ && !(viewItem =~ /^stage-task-description/) && !(viewItem =~ /^stage-plan/) && !(viewItem =~ /-current/) && !(viewItem =~ /-paused/)",
-          "group": "inline@1"
+          "command": "vs-code-ai-helper.markTaskDone",
+          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage-publish-current/ && !(viewItem =~ /-paused/)",
+          "group": "inline@4"
         },
         {
-          "command": "vs-code-ai-helper.setStageModel",
-          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /-modelable$/",
-          "group": "inline@8"
+          "command": "vs-code-ai-helper.release",
+          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage-publish-current/ && !(viewItem =~ /-paused/)",
+          "group": "inline@5"
+        },
+        {
+          "command": "vs-code-ai-helper.setStageAsCurrent",
+          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage/ && !(viewItem =~ /^stage-desc/) && !(viewItem =~ /^stage-plan/) && !(viewItem =~ /-current/) && !(viewItem =~ /-paused/)",
+          "group": "inline@1"
         },
         {
           "command": "vs-code-ai-helper.chatWithStage",
@@ -510,11 +522,25 @@
             "type": "string"
           }
         },
+        "vs-code-ai-helper.modelSettings": {
+          "type": "object",
+          "default": {},
+          "scope": "resource",
+          "description": "Workspace settings for primary and backup models per stage, along with fallback strategy."
+        },
         "vs-code-ai-helper.modelSelectionPromptShown": {
           "type": "boolean",
           "default": false,
           "scope": "resource",
           "description": "Tracks whether first-task model-selection onboarding has already been shown in this workspace"
+        },
+        "vs-code-ai-helper.maxImplementationIterations": {
+          "type": "integer",
+          "default": 200,
+          "minimum": 1,
+          "maximum": 200,
+          "scope": "resource",
+          "description": "Maximum Copilot implementation tool-call rounds (1-200)."
         },
         "vs-code-ai-helper.codexDangerouslyBypassSandboxForImplementation": {
           "type": "boolean",

@@ -3,6 +3,9 @@ import { TaskInventory } from "../state/taskInventory";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { STAGE_DISPLAY_NAMES, TaskStage } from "../types/taskProgress";
 import { IncompleteTask } from "../utils/taskProgressUtils";
+import { resolveModelForStage } from "../utils/modelSelection";
+import { runImplementationForModel } from "../runners/runnerRegistry";
+import { generateContextPack } from "../utils/contextPack";
 
 /**
  * Accepted argument shapes for chatWithStage.
@@ -81,17 +84,28 @@ export async function chatWithStage(
     return;
   }
 
-  void vscode.window.showInformationMessage(
-    `Chat with stage feature is coming soon. Your message: "${message}"`
-  );
-
-  // TODO: Implement actual chat functionality
-  // This would involve:
-  // 1. Loading the stage's assigned model
-  // 2. Loading the stage's current context (artifact, task description, etc.)
-  // 3. Sending the user's message to the model
-  // 4. Displaying the response
-  // 5. Optionally updating the stage's artifact based on the conversation
+  const targetStage = stage ?? resolvedTask.progress.currentStage;
+  const workspaceFolder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(resolvedTask.taskFolderPath));
+  if (!workspaceFolder) {
+    void vscode.window.showErrorMessage("The task is not inside an open workspace.");
+    return;
+  }
+  try {
+    const { modelId } = await resolveModelForStage(vscode.Uri.file(resolvedTask.taskFolderPath), targetStage);
+    const contextPack = await generateContextPack(vscode.Uri.file(resolvedTask.taskFolderPath), workspaceFolder.uri);
+    const prompt = `You are assisting with the ${stageName} stage for task ${resolvedTask.folderName}.\n\n` +
+      `Current task context:\n${contextPack.slice(0, 30000)}\n\nUser message:\n${message}\n\n` +
+      "Respond directly and concisely. If the user requests code changes, make them in the workspace and summarize what changed.";
+    let responseText = "";
+    await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: `Chatting with ${stageName} AI`, cancellable: true }, async (_progress, token) => {
+      const result = await runImplementationForModel({ modelId, prompt, workspaceUri: workspaceFolder.uri, token, stage: targetStage, onProgress: () => undefined });
+      responseText = result.summary ?? result.errorMessage ?? "The model did not return a response.";
+    });
+    const document = await vscode.workspace.openTextDocument({ content: responseText, language: "markdown" });
+    await vscode.window.showTextDocument(document, { preview: false });
+  } catch (error) {
+    void vscode.window.showErrorMessage(`Stage chat failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 
 /**

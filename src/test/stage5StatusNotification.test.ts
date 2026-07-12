@@ -22,8 +22,8 @@ import { IncompleteTask } from "../utils/taskProgressUtils";
 function makeTask(
   fsPath: string,
   folderName: string,
-  stage: TaskStage = "implementation",
-  status: "active" | "paused" = "active",
+  stage: TaskStage = "impl",
+  status: import("../types/taskProgress").TaskStatus = "active",
   canonicalId?: string
 ): IncompleteTask {
   return {
@@ -201,7 +201,7 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
     void it("should show neutral state when no active task exists", () => {
       const store = makeStoreStub(undefined);
       const bar = new TaskStatusBar(store);
-      const tasks = [makeTask("/workspace/task-a", "task-a", "completed", "active")];
+      const tasks = [makeTask("/workspace/task-a", "task-a", "publish", "completed")];
 
       bar.update(tasks, undefined);
 
@@ -214,7 +214,7 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
     void it("should show paused state correctly when shown task is paused", () => {
       const store = makeStoreStub("/workspace/task-a");
       const bar = new TaskStatusBar(store);
-      const tasks = [makeTask("/workspace/task-a", "task-a", "implementation", "paused", "/workspace/task-a")];
+      const tasks = [makeTask("/workspace/task-a", "task-a", "impl", "paused", "/workspace/task-a")];
 
       bar.update(tasks, "/workspace/task-a");
 
@@ -227,7 +227,7 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
     void it("should show active state correctly when shown task is active", () => {
       const store = makeStoreStub("/workspace/task-a");
       const bar = new TaskStatusBar(store);
-      const tasks = [makeTask("/workspace/task-a", "task-a", "implementation", "active", "/workspace/task-a")];
+      const tasks = [makeTask("/workspace/task-a", "task-a", "impl", "active", "/workspace/task-a")];
 
       bar.update(tasks, "/workspace/task-a");
 
@@ -242,7 +242,7 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
     void it("should offer Resume shown task when shown task is paused", async () => {
       const store = makeStoreStub("/workspace/task-a");
       const bar = new TaskStatusBar(store);
-      const tasks = [makeTask("/workspace/task-a", "task-a", "implementation", "paused", "/workspace/task-a")];
+      const tasks = [makeTask("/workspace/task-a", "task-a", "impl", "paused", "/workspace/task-a")];
       bar.update(tasks, "/workspace/task-a");
 
       const win = getWindowStub();
@@ -271,7 +271,7 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
     void it("should offer Open shown task when shown task is active (not paused)", async () => {
       const store = makeStoreStub("/workspace/task-a");
       const bar = new TaskStatusBar(store);
-      const tasks = [makeTask("/workspace/task-a", "task-a", "implementation", "active", "/workspace/task-a")];
+      const tasks = [makeTask("/workspace/task-a", "task-a", "impl", "active", "/workspace/task-a")];
       bar.update(tasks, "/workspace/task-a");
 
       const win = getWindowStub();
@@ -300,7 +300,7 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
     void it("should offer Open shown task when shown task is completed", async () => {
       const store = makeStoreStub("/workspace/task-a");
       const bar = new TaskStatusBar(store);
-      const tasks = [makeTask("/workspace/task-a", "task-a", "completed", "active", "/workspace/task-a")];
+      const tasks = [makeTask("/workspace/task-a", "task-a", "publish", "completed", "/workspace/task-a")];
       bar.update(tasks, "/workspace/task-a");
 
       const win = getWindowStub();

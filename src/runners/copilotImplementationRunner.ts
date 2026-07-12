@@ -11,6 +11,7 @@ import {
   LEGACY_IMPLEMENTATION_FILENAME,
 } from "../types/taskProgress";
 import { looksLikeGeneratedImplementationSummary } from "../utils/implementationArtifactResolver";
+import { getMaxImplementationIterations } from "../config/settings";
 
 /**
  * Reserved artifact filenames the implementation stage writes inside a task
@@ -31,8 +32,6 @@ const RESERVED_ROOT_ARTIFACT_NAMES: ReadonlySet<string> = new Set([
 /**
  * Maximum number of tool-call rounds before aborting to prevent runaway loops.
  */
-const MAX_ITERATIONS = 40;
-
 /**
  * Tools exposed to the language model for reading and writing workspace files.
  */
@@ -309,6 +308,146 @@ async function executeToolCall(
   }
 }
 
+interface ImplementationRoundResult {
+  /** Total tool-call rounds consumed so far (across all "Continue" resumes). */
+  iteration: number;
+  completedCleanly: boolean;
+  cancelled: boolean;
+  finalSummary: string;
+  /** Set when the round loop must stop with a hard failure. */
+  failure?: ImplementationRunResult;
+}
+
+/**
+ * Run tool-call rounds against an already-initialized conversation, starting
+ * at `startIteration` and stopping once `maxIterations` is reached. Mutates
+ * `messages` and `filesChanged` in place so a caller can invoke this again
+ * with a higher `maxIterations` (the "Continue working?" path) and resume the
+ * exact same conversation instead of starting over from the original prompt.
+ */
+async function runImplementationRounds(
+  model: vscode.LanguageModelChat,
+  messages: vscode.LanguageModelChatMessage[],
+  requestOptions: vscode.LanguageModelChatRequestOptions,
+  workspaceUri: vscode.Uri,
+  filesChanged: Set<string>,
+  token: vscode.CancellationToken,
+  onProgress: (message: string) => void,
+  startIteration: number,
+  maxIterations: number
+): Promise<ImplementationRoundResult> {
+  let iteration = startIteration;
+
+  while (iteration < maxIterations) {
+    if (token.isCancellationRequested) {
+      return { iteration, completedCleanly: false, cancelled: true, finalSummary: "" };
+    }
+
+    iteration++;
+    onProgress(`Waiting for Copilot (round ${iteration})...`);
+
+    let response: vscode.LanguageModelChatResponse;
+    try {
+      response = await model.sendRequest(
+        messages,
+        { ...requestOptions, tools: IMPLEMENTATION_TOOLS },
+        token
+      );
+    } catch (e) {
+      if (token.isCancellationRequested) {
+        return { iteration, completedCleanly: false, cancelled: true, finalSummary: "" };
+      }
+      return {
+        iteration,
+        completedCleanly: false,
+        cancelled: false,
+        finalSummary: "",
+        failure: classifyFailure<ImplementationRunResult>({
+          status: "failed",
+          filesChanged: [...filesChanged],
+          errorMessage: `Model request failed: ${
+            e instanceof Error ? e.message : String(e)
+          }`,
+        }),
+      };
+    }
+
+    // Collect all response parts
+    const textParts: string[] = [];
+    const toolCalls: vscode.LanguageModelToolCallPart[] = [];
+
+    try {
+      for await (const part of response.stream) {
+        if (token.isCancellationRequested) {
+          return { iteration, completedCleanly: false, cancelled: true, finalSummary: "" };
+        }
+        if (part instanceof vscode.LanguageModelTextPart) {
+          textParts.push(part.value);
+        } else if (part instanceof vscode.LanguageModelToolCallPart) {
+          toolCalls.push(part);
+        }
+      }
+    } catch (e) {
+      if (token.isCancellationRequested) {
+        return { iteration, completedCleanly: false, cancelled: true, finalSummary: "" };
+      }
+      return {
+        iteration,
+        completedCleanly: false,
+        cancelled: false,
+        finalSummary: "",
+        failure: classifyFailure<ImplementationRunResult>({
+          status: "failed",
+          filesChanged: [...filesChanged],
+          errorMessage: `Stream error: ${
+            e instanceof Error ? e.message : String(e)
+          }`,
+        }),
+      };
+    }
+
+    const assistantText = textParts.join("");
+
+    // Record the assistant turn (text + tool calls)
+    const assistantContent: (
+      | vscode.LanguageModelTextPart
+      | vscode.LanguageModelToolCallPart
+    )[] = [];
+    if (assistantText) {
+      assistantContent.push(new vscode.LanguageModelTextPart(assistantText));
+    }
+    assistantContent.push(...toolCalls);
+    if (assistantContent.length > 0) {
+      messages.push(vscode.LanguageModelChatMessage.Assistant(assistantContent));
+    }
+
+    if (toolCalls.length === 0) {
+      // Model is done — final text is the implementation summary
+      return { iteration, completedCleanly: true, cancelled: false, finalSummary: assistantText };
+    }
+
+    // Execute each tool call and collect results
+    const toolResults: vscode.LanguageModelToolResultPart[] = [];
+    for (const call of toolCalls) {
+      if (token.isCancellationRequested) {
+        return { iteration, completedCleanly: false, cancelled: true, finalSummary: "" };
+      }
+      onProgress(`Tool: ${call.name}("${String((call.input as Record<string, unknown>)["path"] ?? "")}")`);
+      const result = await executeToolCall(call, workspaceUri, filesChanged);
+      toolResults.push(
+        new vscode.LanguageModelToolResultPart(call.callId, [
+          new vscode.LanguageModelTextPart(result),
+        ])
+      );
+    }
+
+    // Send tool results back as a User message
+    messages.push(vscode.LanguageModelChatMessage.User(toolResults));
+  }
+
+  return { iteration, completedCleanly: false, cancelled: false, finalSummary: "" };
+}
+
 export interface ImplementationRunResult {
   status: "completed" | "failed" | "cancelled";
   /** Workspace-relative paths written by the model */
@@ -367,15 +506,36 @@ export async function runImplementationWithCopilot(options: {
   }
 
   const parsedModel = parseCopilotModelSelection(modelId);
-  const requestedModel = parsedModel.model
-    ? models.find((m) => m.id === parsedModel.model)
-    : undefined;
-  const autoModel = models.find(
-    (m) => m.id.toLowerCase() === "auto" || m.name.toLowerCase() === "auto"
-  );
-  // models.length > 0 is guaranteed by the check above
-  // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-  const model = requestedModel ?? autoModel ?? models[0]!;
+  let model: vscode.LanguageModelChat | undefined;
+
+  if (parsedModel.model) {
+    // A specific model was requested — use it or fail explicitly.
+    // Silently falling back to `auto` when the configured model is
+    // unavailable contradicts the "no implicit/default coding agent"
+    // requirement: the user must always know which model is being used.
+    model = models.find((m) => m.id === parsedModel.model);
+    if (!model) {
+      return classifyFailure<ImplementationRunResult>({
+        status: "failed",
+        filesChanged: [],
+        errorMessage:
+          `The configured Copilot model "${parsedModel.model}" is not available. ` +
+          "Select an available model in Settings, or sign in to GitHub Copilot.",
+      });
+    }
+  } else {
+    // No specific model configured — use the auto model as the default.
+    model = models.find(
+      (m) => m.id.toLowerCase() === "auto" || m.name.toLowerCase() === "auto"
+    );
+    if (!model) {
+      return classifyFailure<ImplementationRunResult>({
+        status: "failed",
+        filesChanged: [],
+        errorMessage: "The configured Copilot model is unavailable. Select an available model in Settings.",
+      });
+    }
+  }
 
   onProgress(`Using model: ${model.name}`);
 
@@ -393,119 +553,62 @@ export async function runImplementationWithCopilot(options: {
     Object.keys(modelOptions).length > 0 ? { modelOptions } : {};
 
   let iteration = 0;
-  let finalSummary = "";
-  let completedCleanly = false;
+  let maxIterations = getMaxImplementationIterations();
 
-  while (iteration < MAX_ITERATIONS) {
-    if (token.isCancellationRequested) {
+  // Loops across "Continue working?" resumes. `messages` and `filesChanged`
+  // are shared across iterations of this loop (runImplementationRounds
+  // mutates them in place), so resuming after the round limit continues the
+  // same conversation and tool-call history instead of restarting the
+  // implementation from the original prompt.
+  for (;;) {
+    const round = await runImplementationRounds(
+      model,
+      messages,
+      requestOptions,
+      workspaceUri,
+      filesChanged,
+      token,
+      onProgress,
+      iteration,
+      maxIterations
+    );
+    iteration = round.iteration;
+
+    if (round.cancelled) {
       return { status: "cancelled", filesChanged: [...filesChanged] };
     }
+    if (round.failure) {
+      return round.failure;
+    }
+    if (round.completedCleanly) {
+      return {
+        status: "completed",
+        filesChanged: [...filesChanged],
+        summary: round.finalSummary || undefined,
+      };
+    }
 
-    iteration++;
-    onProgress(`Waiting for Copilot (round ${iteration})...`);
-
-    let response: vscode.LanguageModelChatResponse;
-    try {
-      response = await model.sendRequest(
-        messages,
-        { ...requestOptions, tools: IMPLEMENTATION_TOOLS },
-        token
-      );
-    } catch (e) {
-      if (token.isCancellationRequested) {
-        return { status: "cancelled", filesChanged: [...filesChanged] };
-      }
+    // Hit the round limit without finishing.
+    if (maxIterations >= 200) {
       return classifyFailure<ImplementationRunResult>({
         status: "failed",
         filesChanged: [...filesChanged],
-        errorMessage: `Model request failed: ${
-          e instanceof Error ? e.message : String(e)
-        }`,
+        errorMessage: `Reached the configured maximum of ${maxIterations} tool-call rounds without finishing. The implementation may be incomplete.`,
       });
     }
-
-    // Collect all response parts
-    const textParts: string[] = [];
-    const toolCalls: vscode.LanguageModelToolCallPart[] = [];
-
-    try {
-      for await (const part of response.stream) {
-        if (token.isCancellationRequested) {
-          return { status: "cancelled", filesChanged: [...filesChanged] };
-        }
-        if (part instanceof vscode.LanguageModelTextPart) {
-          textParts.push(part.value);
-        } else if (part instanceof vscode.LanguageModelToolCallPart) {
-          toolCalls.push(part);
-        }
-      }
-    } catch (e) {
-      if (token.isCancellationRequested) {
-        return { status: "cancelled", filesChanged: [...filesChanged] };
-      }
+    const choice = await vscode.window.showWarningMessage(
+      `The implementation reached its ${maxIterations}-round limit. Continue working?`,
+      "Continue", "Cancel"
+    );
+    if (choice !== "Continue") {
       return classifyFailure<ImplementationRunResult>({
         status: "failed",
         filesChanged: [...filesChanged],
-        errorMessage: `Stream error: ${
-          e instanceof Error ? e.message : String(e)
-        }`,
+        errorMessage: `Reached the configured maximum of ${maxIterations} tool-call rounds without finishing. The implementation may be incomplete.`,
       });
     }
-
-    const assistantText = textParts.join("");
-
-    // Record the assistant turn (text + tool calls)
-    const assistantContent: (
-      | vscode.LanguageModelTextPart
-      | vscode.LanguageModelToolCallPart
-    )[] = [];
-    if (assistantText) {
-      assistantContent.push(new vscode.LanguageModelTextPart(assistantText));
-    }
-    assistantContent.push(...toolCalls);
-    if (assistantContent.length > 0) {
-      messages.push(vscode.LanguageModelChatMessage.Assistant(assistantContent));
-    }
-
-    if (toolCalls.length === 0) {
-      // Model is done — final text is the implementation summary
-      finalSummary = assistantText;
-      completedCleanly = true;
-      break;
-    }
-
-    // Execute each tool call and collect results
-    const toolResults: vscode.LanguageModelToolResultPart[] = [];
-    for (const call of toolCalls) {
-      if (token.isCancellationRequested) {
-        return { status: "cancelled", filesChanged: [...filesChanged] };
-      }
-      onProgress(`Tool: ${call.name}("${String((call.input as Record<string, unknown>)["path"] ?? "")}")`);
-      const result = await executeToolCall(call, workspaceUri, filesChanged);
-      toolResults.push(
-        new vscode.LanguageModelToolResultPart(call.callId, [
-          new vscode.LanguageModelTextPart(result),
-        ])
-      );
-    }
-
-    // Send tool results back as a User message
-    messages.push(vscode.LanguageModelChatMessage.User(toolResults));
+    maxIterations = Math.min(200, maxIterations + getMaxImplementationIterations());
   }
-
-  if (!completedCleanly) {
-    return classifyFailure<ImplementationRunResult>({
-      status: "failed",
-      filesChanged: [...filesChanged],
-      errorMessage: `Reached the maximum of ${MAX_ITERATIONS} tool-call rounds without finishing. The implementation may be incomplete.`,
-    });
-  }
-
-  return {
-    status: "completed",
-    filesChanged: [...filesChanged],
-    summary: finalSummary || undefined,
-  };
 }
 
 /**

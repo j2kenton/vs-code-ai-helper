@@ -1,4 +1,6 @@
 import * as vscode from "vscode";
+import * as path from "path";
+import * as crypto from "crypto";
 import {
   getMetaResourcesPath,
   hasValidMetaResourcesPath,
@@ -40,7 +42,7 @@ import {
   resolveRunnerForModel,
   runImplementationForModel,
 } from "../runners/runnerRegistry";
-import { resolveModelForStage } from "../utils/modelSelection";
+import { resolveModelForStage, resolveConfiguredReviewStages } from "../utils/modelSelection";
 import {
   getCanonicalImplementationUri,
   resolveImplementationArtifact,
@@ -49,8 +51,9 @@ import {
 import { ensureAiConsent } from "../utils/aiConsent";
 import { checkAndConfirmPromptSize } from "../utils/promptSizeGuard";
 import * as cp from "child_process";
+import * as fs from "fs";
 import { NotificationRouter } from "../utils/notificationRouter";
-import { parseReadiness } from "../utils/reviewReadiness";
+import { parseReadiness, isStrictPerfectReview } from "../utils/reviewReadiness";
 import { runCompletionLint } from "../utils/completionLint";
 import { improveReviewScore, MAX_REVIEW_ATTEMPTS } from "../utils/reviewScoreLoop";
 
@@ -225,7 +228,7 @@ export function normalizeReviewArg(arg: ReviewCommandArg): TaskNodeArg {
         folderName: arg.taskFolderPath.split(/[\\/]/).pop() ?? "",
         progress: {
           taskFolder: arg.taskFolderPath.split(/[\\/]/).pop() ?? "",
-          currentStage: "task-description" as TaskStage,
+          currentStage: "desc" as TaskStage,
           status: "active",
           createdAt: "",
           updatedAt: "",
@@ -250,7 +253,7 @@ export function normalizeReviewArg(arg: ReviewCommandArg): TaskNodeArg {
  * ensuring suite 16 stays coupled to the production value.
  */
 export const GENERATE_IMPL_ELIGIBLE_STAGES: readonly TaskStage[] = [
-  "implementation",
+  "impl",
 ];
 
 /**
@@ -281,40 +284,58 @@ async function resolveTask(
       );
       return undefined;
     }
+    const owner = progress.ownership?.workspaceRoot;
+    const owningWorkspace = vscode.workspace.workspaceFolders?.find(folder =>
+      owner && path.resolve(folder.uri.fsPath) === path.resolve(owner)
+    );
+    if (owner && !owningWorkspace) {
+      void vscode.window.showErrorMessage("This task belongs to a different workspace and cannot be operated on here.");
+      return undefined;
+    }
     return { folderUri, progress };
   }
 
-  // Fall back to discovering tasks from the configured meta folder
-  const workspaceRoot = vscode.workspace.workspaceFolders?.[0];
-  if (!workspaceRoot) {
+  // Discover tasks across ALL workspace folders rather than inferring the
+  // owning workspace from the active editor. The active-editor heuristic can
+  // silently redirect a command to a different workspace when the user's focus
+  // happens to be on a file in an unrelated workspace, violating the
+  // persisted-owner-only rule.
+  const allWorkspaceFolders = vscode.workspace.workspaceFolders ?? [];
+  if (allWorkspaceFolders.length === 0) {
     void vscode.window.showErrorMessage(
       "No workspace folder open. Please open a folder first."
     );
     return undefined;
   }
 
-  // Attempt to discover tasks using the configured path, or .helper/plans default
-  let metaFolderUri: vscode.Uri;
-  if (hasValidMetaResourcesPath()) {
-    metaFolderUri = vscode.Uri.joinPath(workspaceRoot.uri, getMetaResourcesPath());
-  } else {
-    metaFolderUri = vscode.Uri.joinPath(workspaceRoot.uri, ".helper/plans");
-  }
-
-  const allTasks = await findAllTasks(metaFolderUri);
-
-  // Also check legacy plans/ folder if different
-  let legacyTasks: IncompleteTask[] = [];
-  try {
-    const legacyUri = vscode.Uri.joinPath(workspaceRoot.uri, "plans");
-    if (legacyUri.fsPath !== metaFolderUri.fsPath) {
-      legacyTasks = await findAllTasks(legacyUri);
+  const combinedTasks: IncompleteTask[] = [];
+  for (const wsFolder of allWorkspaceFolders) {
+    // Attempt to discover tasks using the configured path, or .helper/plans default
+    let metaFolderUri: vscode.Uri;
+    if (hasValidMetaResourcesPath()) {
+      metaFolderUri = vscode.Uri.joinPath(wsFolder.uri, getMetaResourcesPath());
+    } else {
+      metaFolderUri = vscode.Uri.joinPath(wsFolder.uri, ".helper/plans");
     }
-  } catch {
-    // Ignore errors reading legacy folder
-  }
 
-  const combinedTasks = [...allTasks, ...legacyTasks];
+    try {
+      const wsTasks = await findAllTasks(metaFolderUri);
+      combinedTasks.push(...wsTasks);
+    } catch {
+      // Skip workspace folders where the meta folder doesn't exist
+    }
+
+    // Also check legacy plans/ folder if different
+    try {
+      const legacyUri = vscode.Uri.joinPath(wsFolder.uri, "plans");
+      if (legacyUri.fsPath !== metaFolderUri.fsPath) {
+        const legacyTasks = await findAllTasks(legacyUri);
+        combinedTasks.push(...legacyTasks);
+      }
+    } catch {
+      // Ignore errors reading legacy folder
+    }
+  }
 
   const eligible = combinedTasks.filter((task) =>
     eligibleStages.includes(task.progress.currentStage)
@@ -350,7 +371,37 @@ async function resolveTask(
 }
 
 function getWorkspaceRoot(): vscode.WorkspaceFolder | undefined {
-  return vscode.workspace.workspaceFolders?.[0];
+  const active = vscode.window.activeTextEditor;
+  return active
+    ? vscode.workspace.getWorkspaceFolder(active.document.uri)
+    : vscode.workspace.workspaceFolders?.[0];
+}
+
+/**
+ * Resolve the workspace folder that owns a resolved task.
+ *
+ * Prefers the task's persisted `ownership.workspaceRoot` over the
+ * active-editor-based `getWorkspaceRoot()` heuristic to satisfy the
+ * persisted-owner-only rule: operations on a task should always run against
+ * the workspace that created the task, not whichever workspace happens to
+ * contain the currently active editor.
+ *
+ * Falls back to `getWorkspaceRoot()` only when no ownership is persisted
+ * (e.g. tasks created before the ownership field was introduced).
+ */
+function resolveOwnerWorkspace(
+  progress: NonNullable<Awaited<ReturnType<typeof readTaskProgress>>>
+): vscode.WorkspaceFolder | undefined {
+  const persistedRoot = progress.ownership?.workspaceRoot;
+  if (persistedRoot) {
+    const match = vscode.workspace.workspaceFolders?.find(
+      (f) => path.resolve(f.uri.fsPath) === path.resolve(persistedRoot)
+    );
+    if (match) {
+      return match;
+    }
+  }
+  return getWorkspaceRoot();
 }
 
 function artifactUri(
@@ -445,8 +496,19 @@ async function runAiToFile(options: {
 }): Promise<boolean> {
   const modelStage = options.executionStage ?? options.logStage;
   const model = await resolveModelForStage(options.taskFolderUri, modelStage);
-  const { runner, providerLabel, nativeModelId } = await resolveRunnerForModel(
-    model.modelId
+  if (!model.modelId) {
+    const openSettings = await vscode.window.showWarningMessage(
+      `No model is configured for ${modelStage}. Open Ensemble Settings and choose a primary model before continuing.`,
+      { modal: true },
+      "Open Settings"
+    );
+    if (openSettings === "Open Settings") {
+      await vscode.commands.executeCommand("vs-code-ai-helper.settingsView.focus");
+    }
+    return false;
+  }
+  const { runner, providerLabel, nativeModelId } = resolveRunnerForModel(
+    model.modelId, modelStage
   );
   const availability = await runner.isAvailable();
   if (!availability.available) {
@@ -573,9 +635,10 @@ const REVIEW_TARGETS: Partial<Record<TaskStage, TaskStage>> = {
   plan: "plan-high-review",
   "plan-high-review": "plan-high-review",
   "plan-low-review": "plan-low-review",
-  implementation: "impl-high-review",
+  impl: "impl-high-review",
   "impl-high-review": "impl-high-review",
   "impl-low-review": "impl-low-review",
+  publish: "publish",
 };
 
 const REVIEW_PROMPTS: Partial<Record<TaskStage, string>> = {
@@ -583,6 +646,7 @@ const REVIEW_PROMPTS: Partial<Record<TaskStage, string>> = {
   "plan-low-review": "review-plan-low.md",
   "impl-high-review": "review-impl-high.md",
   "impl-low-review": "review-impl-low.md",
+  "publish": "review-publish.md",
 };
 
 /**
@@ -729,7 +793,7 @@ export async function runReviewForFolder(
 
   // Review generation uses the review-stage model (no executionStage override).
   // Only apply flows separate logStage from executionStage.
-  await runAiToFile({
+  const reviewWritten = await runAiToFile({
     extensionUri,
     taskFolderUri: folderUri,
     workspaceUri: workspaceRoot.uri,
@@ -741,7 +805,35 @@ export async function runReviewForFolder(
     outputLabel: STAGE_ARTIFACT_FILENAMES[targetStage] ?? "review",
     validateOutput: validateReviewOutput,
   });
-  // Note: we do NOT call setStage here.
+
+  if (reviewWritten) {
+    try {
+      const contentBytes = await vscode.workspace.fs.readFile(reviewUri);
+      const content = new TextDecoder().decode(contentBytes);
+      if (isStrictPerfectReview(content)) {
+        NotificationRouter.showInformation(`Perfect review score (10/10) detected. Auto-advancing stage...`);
+        // Advance FROM the review stage that was just generated (targetStage),
+        // not from currentStage. For example, when a plan-high-review is
+        // generated from stage "plan", targetStage is "plan-high-review" and the
+        // next stage should be "plan-low-review". Using currentStage ("plan")
+        // here would advance back into the review just written and the CAS
+        // check in advanceStage would throw because the persisted stage has
+        // already moved to targetStage after review generation.
+        const configuredStages = await resolveConfiguredReviewStages(folderUri);
+        const next = computeNextStage(targetStage, configuredStages);
+        // A perfect review advances exactly one stage. It never completes a
+        // task implicitly; Publish remains a deliberate user action.
+        if (next) {
+          const transition = await advanceStage(folderUri, targetStage, next, false, false);
+          if (transition?.persisted) {
+            NotificationRouter.showInformation(`Perfect review accepted. Advanced to ${STAGE_DISPLAY_NAMES[next]}.`);
+          }
+        }
+      }
+    } catch (e) {
+      // Ignore
+    }
+  }
 }
 
 /**
@@ -771,9 +863,10 @@ export async function runReviewWithAI(
   context: vscode.ExtensionContext,
   arg?: ReviewCommandArg
 ): Promise<void> {
-  // ── Workspace guard ───────────────────────────────────────────────────────
-  const workspaceRoot = getWorkspaceRoot();
-  if (!workspaceRoot) {
+  // ── Pre-flight workspace guard ────────────────────────────────────────────
+  // Fail fast if no workspace is open at all; the ownership-aware resolution
+  // (resolveOwnerWorkspace) happens after task resolution below.
+  if ((vscode.workspace.workspaceFolders ?? []).length === 0) {
     void vscode.window.showErrorMessage(
       "No workspace folder open. Please open a folder first."
     );
@@ -810,6 +903,20 @@ export async function runReviewWithAI(
   if (!resolved) {
     return;
   }
+  if (resolved.progress.status === "paused") {
+    NotificationRouter.showInformation("This task is paused. Resume it before running a review.");
+    return;
+  }
+
+  // Prefer the task's persisted ownership.workspaceRoot over the active-editor
+  // workspace so the context pack is generated from the correct workspace.
+  const workspaceRoot = resolveOwnerWorkspace(resolved.progress);
+  if (!workspaceRoot) {
+    void vscode.window.showErrorMessage(
+      "Could not determine the owning workspace for this task. Please open the workspace that created it."
+    );
+    return;
+  }
   await runReviewForFolder(
     extensionUri,
     resolved.folderUri,
@@ -838,9 +945,8 @@ export async function applyReviewWithAI(
   context: vscode.ExtensionContext,
   arg?: ReviewCommandArg
 ): Promise<void> {
-  // ── Workspace guard ───────────────────────────────────────────────────────
-  const workspaceRoot = getWorkspaceRoot();
-  if (!workspaceRoot) {
+  // ── Pre-flight workspace guard ────────────────────────────────────────────
+  if ((vscode.workspace.workspaceFolders ?? []).length === 0) {
     void vscode.window.showErrorMessage(
       "No workspace folder open. Please open a folder first."
     );
@@ -872,6 +978,16 @@ export async function applyReviewWithAI(
     "Apply Review with AI"
   );
   if (!resolved) {
+    return;
+  }
+
+  // Prefer the task's persisted ownership.workspaceRoot over the active-editor
+  // workspace so context packs and AI runs target the correct workspace.
+  const workspaceRoot = resolveOwnerWorkspace(resolved.progress);
+  if (!workspaceRoot) {
+    void vscode.window.showErrorMessage(
+      "Could not determine the owning workspace for this task. Please open the workspace that created it."
+    );
     return;
   }
 
@@ -970,8 +1086,7 @@ export async function fastForwardReviewWithAI(
   context: vscode.ExtensionContext,
   arg?: ReviewCommandArg
 ): Promise<void> {
-  const workspaceRoot = getWorkspaceRoot();
-  if (!workspaceRoot) {
+  if ((vscode.workspace.workspaceFolders ?? []).length === 0) {
     void vscode.window.showErrorMessage(
       "No workspace folder open. Please open a folder first."
     );
@@ -1124,7 +1239,7 @@ async function applyImplementationReviewWithAI(
   }
 
   // Use the `implementation` stage's model, not the review stage's model.
-  const model = await resolveModelForStage(folderUri, "implementation");
+  const model = await resolveModelForStage(folderUri, "impl");
 
   const { availability, providerLabel } =
     await checkImplementationAvailabilityForModel(model.modelId);
@@ -1227,7 +1342,7 @@ async function currentStageArtifactExists(
     return true;
   }
   // For implementation stage use the artifact resolver
-  if (stage === "implementation") {
+  if (stage === "impl") {
     const resolved = await resolveImplementationArtifact(folderUri);
     const stat = await statIfExists(resolved.uri);
     return stat !== undefined;
@@ -1259,13 +1374,16 @@ export async function nextStage(
   extensionUri: vscode.Uri,
   node?: TaskNodeArg
 ): Promise<void> {
-  const advanceable = STAGE_ORDER.filter((stage) => stage !== "completed");
+  // Publish is the final executable stage: its review is generated here and
+  // completion/release remain explicit actions. There is no stage after it.
+  const advanceable = STAGE_ORDER;
   const resolved = await resolveTask(node, advanceable, "Next Stage");
   if (!resolved) {
     return;
   }
 
-  const next = computeNextStage(resolved.progress.currentStage);
+  const configuredStages = await resolveConfiguredReviewStages(resolved.folderUri);
+  const next = computeNextStage(resolved.progress.currentStage, configuredStages);
   if (!next) {
     return;
   }
@@ -1288,7 +1406,7 @@ export async function nextStage(
 
   // Special handling for advancing into "implementation" stage:
   // copy the current plan to plan-final.md if not already there
-  if (next === "implementation") {
+  if (next === "impl") {
     const resolved2 = await resolveImplementationArtifact(resolved.folderUri);
     if (!resolved2.isCanonical) {
       // Plan-final.md doesn't exist yet — copy current plan
@@ -1338,8 +1456,8 @@ export async function nextStage(
   //   post-completion helper actions — (no-op in this stage; future: open PR draft)
   //   persist lint payload — deferred until runLintingFixes is called explicitly
   //   refresh final rendered state — inventory watcher handles this
-  if (next === "completed") {
-    await runCompletionLint(resolved.folderUri);
+  if (next === "publish") {
+    await runCompletionLint(resolved.folderUri, resolved.progress.implReviewFiles);
     return;
   }
 
@@ -1347,22 +1465,23 @@ export async function nextStage(
   // transitionResult.shouldAutoReview is already computed by advanceStage
   // using exactly-once semantics tied to the persistence result.
   if (transitionResult.shouldAutoReview) {
-    const workspaceRoot = getWorkspaceRoot();
-    if (!workspaceRoot) {
-      return;
-    }
-    // Re-read progress to get the newly persisted stage
+    // Re-read progress to get the newly persisted stage and fresh ownership
     const freshProgress = await readTaskProgress(resolved.folderUri);
     if (freshProgress) {
-      // Bypass the consent gate for auto-triggered reviews — consent was
-      // already given by the user action that triggered nextStage.
-      await runReviewForFolder(
-        extensionUri,
-        resolved.folderUri,
-        workspaceRoot,
-        freshProgress.currentStage,
-        true
-      );
+      // Prefer the task's persisted ownership.workspaceRoot over the active-editor
+      // workspace so the context pack is generated from the correct workspace.
+      const workspaceRoot = resolveOwnerWorkspace(freshProgress);
+      if (workspaceRoot) {
+        // Bypass the consent gate for auto-triggered reviews — consent was
+        // already given by the user action that triggered nextStage.
+        await runReviewForFolder(
+          extensionUri,
+          resolved.folderUri,
+          workspaceRoot,
+          freshProgress.currentStage,
+          true
+        );
+      }
     }
   }
 }
@@ -1399,8 +1518,7 @@ export async function generateImplementationWithAI(
   node?: TaskNodeArg
 ): Promise<void> {
   // ── Workspace guard ───────────────────────────────────────────────────────
-  const workspaceRoot = getWorkspaceRoot();
-  if (!workspaceRoot) {
+  if ((vscode.workspace.workspaceFolders ?? []).length === 0) {
     void vscode.window.showErrorMessage(
       "No workspace folder open. Please open a folder first."
     );
@@ -1450,6 +1568,14 @@ export async function generateImplementationWithAI(
     return;
   }
 
+  const workspaceRoot = resolveOwnerWorkspace(resolved.progress);
+  if (!workspaceRoot) {
+    void vscode.window.showErrorMessage(
+      "Could not determine the owning workspace for this task. Please open the workspace that created it."
+    );
+    return;
+  }
+
   const contextPackContent = await generateContextPack(
     resolved.folderUri,
     workspaceRoot.uri
@@ -1462,7 +1588,7 @@ export async function generateImplementationWithAI(
     extensionUri,
     taskFolderUri: resolved.folderUri,
     workspaceUri: workspaceRoot.uri,
-    logStage: "implementation",
+    logStage: "impl",
     templateFile: "create-implementation.md",
     variables: { contextPack: contextPackContent, plan: planFinalContent },
     outputFileUri: implementationUri,
@@ -1471,7 +1597,7 @@ export async function generateImplementationWithAI(
   });
 
   if (succeeded) {
-    await setStage(resolved.folderUri, "implementation");
+    await setStage(resolved.folderUri, "impl");
   }
 }
 
@@ -1479,7 +1605,7 @@ export async function generateImplementationWithAI(
  * Stages from which the AI implementation runner can be invoked.
  */
 const IMPLEMENTATION_ELIGIBLE_STAGES: readonly TaskStage[] = [
-  "implementation",
+  "impl",
   "impl-high-review",
   "impl-low-review",
 ];
@@ -1509,7 +1635,7 @@ async function executeImplementationRun(
   prompt: string,
   modelId: string | undefined,
   progressTitle: string,
-  postRunReviewStage: TaskStage = "implementation"
+  postRunReviewStage: TaskStage = "impl"
 ): Promise<void> {
   const cwd = workspaceRoot.uri.fsPath;
 
@@ -1566,6 +1692,7 @@ async function executeImplementationRun(
         workspaceUri: workspaceRoot.uri,
         token,
         onProgress: (message) => progress.report({ message }),
+        stage: postRunReviewStage,
       });
     }
   );
@@ -1580,7 +1707,7 @@ async function executeImplementationRun(
       : "_none recorded_"
   }\n\n${result.summary ?? result.errorMessage ?? ""}`;
 
-  const logUri = await writeRunLog(folderUri, result.runnerId, "implementation", logContent);
+  const logUri = await writeRunLog(folderUri, result.runnerId, "impl", logContent);
 
   if (result.status === "completed") {
     const implementationUri = getCanonicalImplementationUri(folderUri);
@@ -1618,11 +1745,11 @@ async function executeImplementationRun(
     // Use patchTaskProgress to avoid overwriting unrelated fields.
     await patchTaskProgress(folderUri, (currentProgress) => {
       const alreadyAtOrPastImplementation =
-        currentProgress.currentStage === "implementation" ||
+        currentProgress.currentStage === "impl" ||
         isReviewStage(currentProgress.currentStage);
       const stageUpdated = alreadyAtOrPastImplementation
         ? currentProgress
-        : updateTaskProgressStage(currentProgress, "implementation");
+        : updateTaskProgressStage(currentProgress, "impl");
 
       // filesChangedUnknown means THIS run's own change detection failed.
       // Leave implReviewFiles untouched rather than clearing it.
@@ -1660,8 +1787,7 @@ export async function runImplementationWithAI(
   node?: TaskNodeArg
 ): Promise<void> {
   // ── Workspace guard ───────────────────────────────────────────────────────
-  const workspaceRoot = getWorkspaceRoot();
-  if (!workspaceRoot) {
+  if ((vscode.workspace.workspaceFolders ?? []).length === 0) {
     void vscode.window.showErrorMessage(
       "No workspace folder open. Please open a folder first."
     );
@@ -1703,13 +1829,21 @@ export async function runImplementationWithAI(
   }
 
   // Resolve implementation model for execution
-  const model = await resolveModelForStage(resolved.folderUri, "implementation");
+  const model = await resolveModelForStage(resolved.folderUri, "impl");
 
   const { availability, providerLabel } =
     await checkImplementationAvailabilityForModel(model.modelId);
   if (!availability.available) {
     NotificationRouter.showWarning(
       `${providerLabel} is unavailable: ${availability.reason ?? "unknown reason"}. Implement the plan manually instead.`
+    );
+    return;
+  }
+
+  const workspaceRoot = resolveOwnerWorkspace(resolved.progress);
+  if (!workspaceRoot) {
+    void vscode.window.showErrorMessage(
+      "Could not determine the owning workspace for this task. Please open the workspace that created it."
     );
     return;
   }
@@ -1733,7 +1867,7 @@ export async function runImplementationWithAI(
 
   const postRunReviewStage = isReviewStage(resolved.progress.currentStage)
     ? resolved.progress.currentStage
-    : "implementation";
+    : "impl";
 
   await executeImplementationRun(
     extensionUri,
@@ -1783,6 +1917,96 @@ export function registerReviewActionCommands(
       "vs-code-ai-helper.runImplementationWithAI",
       (node?: TaskNodeArg) =>
         runImplementationWithAI(context.extensionUri, context, node)
-    )
+    ),
+    vscode.commands.registerCommand("vs-code-ai-helper.release", runRelease)
   );
+}
+
+/**
+ * Whether a package.json `scripts.release` value is safe to display in the
+ * confirmation prompt before delegating execution to the package manager's
+ * own `<manager> run release` (never the script text itself — see
+ * runRelease below). Rejects shell metacharacters (`;`, `&`, `|`, backticks,
+ * `$()`, redirects, quotes, newlines) so a malicious/compromised
+ * package.json can't smuggle a misleading confirmation prompt past the user
+ * — e.g. a script string engineered to look benign when truncated in a
+ * dialog but that would behave differently if it were ever concatenated
+ * into a shell command elsewhere.
+ *
+ * @internal exported for testing
+ */
+export function isSafeReleaseScript(script: unknown): script is string {
+  // Separator is [ \t] (space/tab) only, not \s — \s also matches \r and \n,
+  // which would let a script smuggle embedded newlines into the confirmation
+  // modal (e.g. text engineered to look like a different dialog once wrapped).
+  return (
+    typeof script === "string" &&
+    /^[a-zA-Z0-9@_./:+%=-]+(?:[ \t]+[a-zA-Z0-9@_./:+%=-]+)*$/.test(script)
+  );
+}
+
+async function runRelease(arg?: TaskNodeArg): Promise<void> {
+  const candidate = arg?.task?.folderUri.fsPath;
+  if (!candidate) {
+    void vscode.window.showWarningMessage("Release is available only from a task's Publish stage.");
+    return;
+  }
+  const owner = candidate ? (vscode.workspace.workspaceFolders ?? []).find((folder) => {
+    const root = path.resolve(folder.uri.fsPath);
+    const task = path.resolve(candidate);
+    return task === root || task.startsWith(root + path.sep);
+  }) : undefined;
+  const progress = candidate ? await readTaskProgress(vscode.Uri.file(candidate)) : undefined;
+  if (!progress || progress.currentStage !== "publish" || progress.status === "paused") {
+    void vscode.window.showWarningMessage("Release requires an active task at the Publish stage.");
+    return;
+  }
+  try {
+    const review = await vscode.workspace.fs.readFile(vscode.Uri.joinPath(vscode.Uri.file(candidate), STAGE_ARTIFACT_FILENAMES.publish!));
+    if (!isStrictPerfectReview(new TextDecoder().decode(review))) {
+      void vscode.window.showWarningMessage("Release requires a strict 10/10 Publish review.");
+      return;
+    }
+  } catch {
+    void vscode.window.showWarningMessage("Release requires a completed Publish review scored 10/10.");
+    return;
+  }
+  const persistedOwner = progress?.ownership?.workspaceRoot;
+  if (candidate && persistedOwner && (!owner || path.resolve(owner.uri.fsPath) !== path.resolve(persistedOwner))) {
+    void vscode.window.showErrorMessage("This task belongs to a different workspace and cannot be released here.");
+    return;
+  }
+  const root = persistedOwner ?? owner?.uri.fsPath ?? (candidate ? undefined : getWorkspaceRoot()?.uri.fsPath);
+  if (!root) { void vscode.window.showWarningMessage("Open a workspace before releasing."); return; }
+  let pkg: { scripts?: Record<string, unknown> };
+  try {
+    const parsed: unknown = JSON.parse(Buffer.from(await vscode.workspace.fs.readFile(vscode.Uri.file(`${root}/package.json`))).toString("utf8"));
+    if (!parsed || typeof parsed !== "object") throw new Error("package.json is not an object");
+    pkg = parsed as { scripts?: Record<string, unknown> };
+  }
+  catch { void vscode.window.showErrorMessage("No valid package.json was found."); return; }
+  const script = pkg.scripts?.release;
+  if (!isSafeReleaseScript(script)) { void vscode.window.showErrorMessage("Release requires a safe package.json release script."); return; }
+  if (!vscode.workspace.isTrusted) { void vscode.window.showErrorMessage("Release requires a trusted workspace."); return; }
+  const manager = fs.existsSync(`${root}/pnpm-lock.yaml`) ? "pnpm" : fs.existsSync(`${root}/yarn.lock`) ? "yarn" : fs.existsSync(`${root}/bun.lockb`) ? "bun" : "npm";
+  const scriptHash = crypto.createHash("sha256").update(script).digest("hex");
+  const commandText = `${manager} run release`;
+  const confirmation = await vscode.window.showWarningMessage(`Run release?\n\nCommand: ${commandText}\nWorking directory: ${root}\nPackage manager: ${manager}\nScript: ${script}\nSHA-256: ${scriptHash}`, { modal: true }, "Run Release");
+  if (confirmation !== "Run Release") return;
+  // Re-read immediately before spawning so a package.json edit cannot change
+  // the reviewed release command between confirmation and execution.
+  const currentPackage = JSON.parse(await fs.promises.readFile(`${root}/package.json`, "utf8")) as { scripts?: Record<string, unknown> };
+  if (currentPackage.scripts?.release !== script) { void vscode.window.showErrorMessage("The release script changed after confirmation; release was cancelled."); return; }
+  await fs.promises.writeFile(path.join(candidate, "release-operation.json"), JSON.stringify({ command: commandText, cwd: root, packageManager: manager, script, scriptSha256: scriptHash, startedAt: new Date().toISOString() }, null, 2), "utf8");
+  // Delegate to the package manager's own "run release" — never the script
+  // text itself — so the release regex above is a display sanity check, not
+  // the security boundary. `args` are fixed literals (never user input), so
+  // `shell: true` on Windows is safe here and is Node's own documented,
+  // security-patched way to launch a manager that may be a .cmd/.bat shim
+  // (pnpm/yarn/npm) or a native .exe (bun) without hand-rolling a cmd.exe
+  // wrapper — the previous manual `cmd.exe /d /s /c "<manager>.cmd run
+  // release"` reimplementation both duplicated that patched escaping logic
+  // and broke bun releases on Windows (bun ships bun.exe, not bun.cmd).
+  const args = ["run", "release"];
+  await new Promise<void>(resolve => { const child = cp.spawn(manager, args, { cwd: root, shell: process.platform === "win32", windowsHide: true }); child.on("close", code => { if (code === 0) NotificationRouter.showInformation("Release completed."); else void vscode.window.showErrorMessage(`Release failed (exit ${code ?? 1}).`); resolve(); }); child.on("error", e => { void vscode.window.showErrorMessage(`Release failed: ${e.message}`); resolve(); }); });
 }

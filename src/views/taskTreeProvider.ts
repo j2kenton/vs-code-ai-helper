@@ -145,7 +145,7 @@ export class TaskNode extends vscode.TreeItem {
         "debug-pause",
         new vscode.ThemeColor("charts.orange")
       );
-    } else if (currentStage === "completed") {
+    } else if (task.progress.status === "completed") {
       this.description = "Completed";
       this.iconPath = new vscode.ThemeIcon(
         "pass-filled",
@@ -223,7 +223,10 @@ export class StageNode extends vscode.TreeItem {
       case "current":
         // Current review stages show the readiness icon so the user can see
         // the AI's assessment at a glance without opening the artifact.
-        if (readiness) {
+        if (TaskTreeProvider.isStageRunning(task.canonicalId ?? task.folderUri.fsPath, stage)) {
+          this.iconPath = new vscode.ThemeIcon("loading~spin", new vscode.ThemeColor("charts.blue"));
+          this.description = "running";
+        } else if (readiness) {
           this.iconPath = new vscode.ThemeIcon(
             readiness.icon,
             new vscode.ThemeColor(readiness.colorKey)
@@ -276,6 +279,7 @@ export class StageNode extends vscode.TreeItem {
       isMetaManaged
     );
   }
+
 }
 
 /**
@@ -355,10 +359,34 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
   private readonly explicitlyCollapsed = new Set<string>();
   private availableModels: SelectableModel[] = [];
 
+  private static readonly runningStages = new Map<string, Set<TaskStage>>();
+  private static instance: TaskTreeProvider | undefined;
+
+  static setStageRunning(canonicalId: string, stage: TaskStage, running: boolean): void {
+    let set = this.runningStages.get(canonicalId);
+    if (!set) {
+      set = new Set<TaskStage>();
+      this.runningStages.set(canonicalId, set);
+    }
+    if (running) {
+      set.add(stage);
+    } else {
+      set.delete(stage);
+    }
+    if (this.instance) {
+      this.instance._onDidChangeTreeData.fire();
+    }
+  }
+
+  static isStageRunning(canonicalId: string, stage: TaskStage): boolean {
+    return this.runningStages.get(canonicalId)?.has(stage) ?? false;
+  }
+
   constructor(
     private readonly inventory: TaskInventory,
     private readonly currentTaskStore?: CurrentTaskStore
   ) {
+    TaskTreeProvider.instance = this;
     // When the shared inventory changes, refresh the tree automatically
     this.inventory.onDidChange(() => this._onDidChangeTreeData.fire());
 
@@ -570,9 +598,9 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
   private getTaskNodes(): TaskNode[] {
     const tasks = this.loadTasks();
 
-    const active = tasks.filter((t) => t.progress.currentStage !== "completed");
+    const active = tasks.filter((t) => t.progress.status !== "completed");
     const completed = tasks.filter(
-      (t) => t.progress.currentStage === "completed"
+      (t) => t.progress.status === "completed"
     );
 
     const shouldExpand = (task: IncompleteTask, index: number): boolean => {
@@ -650,7 +678,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
       if (stage === "plan") {
         const candidate = await resolveCurrentPlanUri(task.folderUri);
         artifactUri = (await statIfExists(candidate)) ? candidate : undefined;
-      } else if (stage === "implementation") {
+      } else if (stage === "impl") {
         // Merged stage: prefer plan-final.md, fallback to implementation.md
         const resolved = await resolveImplementationArtifact(task.folderUri);
         artifactUri = (await statIfExists(resolved.uri)) ? resolved.uri : undefined;

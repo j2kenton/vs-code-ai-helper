@@ -212,7 +212,7 @@ export async function setTaskStage(
   // Refresh the inventory so the new stage is visible immediately
   await inventory.refresh();
 
-  if (newStage === "completed") {
+  if (newStage === "publish") {
     await runCompletionLint(taskFolderUri);
     await inventory.refresh();
   }

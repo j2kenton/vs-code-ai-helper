@@ -11,6 +11,7 @@ import {
 } from "../types/taskProgress";
 import { parseReadiness } from "../utils/reviewReadiness";
 import { parseTaskDocument, buildTaskDocument, parseAIResponse } from "../commands/draftTaskWithAI";
+import { shortcutHint } from "../utils/shortcutHints";
 
 // Mock dependencies before importing the module under test
 import * as stageContextModule from "../utils/stageContext";
@@ -29,7 +30,7 @@ const mockIsReviewStage = (stage: string): boolean => stage.includes("review");
 
 
 /** Minimal IncompleteTask stub for StageNode construction */
-function makeTask(currentStage: TaskStage = "implementation"): {
+function makeTask(currentStage: TaskStage = "impl"): {
   folderUri: vscode.Uri;
   folderName: string;
   progress: {
@@ -63,10 +64,10 @@ void describe("getStageNodeContextValue", () => {
   void describe('when status is "current"', () => {
     // task-description IS in AI_MODEL_STAGES, so the context value has
     // the -modelable suffix appended.
-    void it('should return "stage-task-description-current-modelable" for the "task-description" stage', () => {
+    void it('should return "stage-desc-current-modelable" for the "desc" stage', () => {
       assert.strictEqual(
-        getStageNodeContextValue("task-description", "current"),
-        "stage-task-description-current-modelable"
+        getStageNodeContextValue("desc", "current"),
+        "stage-desc-current-modelable"
       );
     });
 
@@ -79,8 +80,8 @@ void describe("getStageNodeContextValue", () => {
       );
     });
 
-    void it('should return "stage-impl-current" (modelable) for the "implementation" stage', () => {
-      const result = getStageNodeContextValue("implementation", "current");
+    void it('should return "stage-impl-current" (modelable) for the "impl" stage', () => {
+      const result = getStageNodeContextValue("impl", "current");
       assert.ok(
         result.includes("stage-impl-current"),
         `Expected ${result} to contain stage-impl-current`
@@ -96,19 +97,18 @@ void describe("getStageNodeContextValue", () => {
       );
     });
 
-    void it('should return "stage-current" for other non-special stages', () => {
-      const otherStage = "completed" as TaskStage;
+    void it('should return "stage-publish-current-modelable" for publish stage', () => {
+      // publish is in AI_MODEL_STAGES (Set Model + chat-with-AI on Publish),
+      // so it gets the -modelable suffix like desc/plan/impl.
+      const otherStage = "publish" as TaskStage;
       const result = getStageNodeContextValue(otherStage, "current");
-      assert.ok(
-        result.includes("stage-current") || result.includes("stage-completed"),
-        `Expected ${result} to contain stage-current or similar`
-      );
+      assert.strictEqual(result, "stage-publish-current-modelable");
     });
 
     void it('should return paused suffix if isPaused is true', () => {
       assert.strictEqual(
-        getStageNodeContextValue("task-description", "current", true),
-        "stage-task-description-current-paused-modelable"
+        getStageNodeContextValue("desc", "current", true),
+        "stage-desc-current-paused-modelable"
       );
     });
 
@@ -133,8 +133,8 @@ void describe("getStageNodeContextValue", () => {
       for (const stage of STAGE_ORDER) {
         void it(`should return computed context for stage "${stage}" with status "${status}"`, () => {
           let expectedBase: string;
-          if (stage === "task-description") {
-            expectedBase = "stage-task-description";
+          if (stage === "desc") {
+            expectedBase = "stage-desc";
           } else if (stage === "plan") {
             expectedBase = "stage-plan";
           } else {
@@ -188,7 +188,7 @@ void describe("getStageNodeContextValue", () => {
 
 void describe("StageNode — done review stage icon", () => {
   void it('renders green "check" tick when status is "done" and readiness data is present', () => {
-    const task = makeTask("implementation"); // current stage is after plan-high-review
+    const task = makeTask("impl"); // current stage is after plan-high-review
     const readiness = { label: "9/10", icon: "thumbsup", colorKey: "charts.green" };
     const node = new StageNode(task, "plan-high-review", "done", undefined, readiness);
 
@@ -209,7 +209,7 @@ void describe("StageNode — done review stage icon", () => {
   });
 
   void it('renders green "check" tick when status is "done" and readiness data is absent', () => {
-    const task = makeTask("implementation");
+    const task = makeTask("impl");
     const node = new StageNode(task, "plan-high-review", "done", undefined, undefined);
 
     const icon = node.iconPath as import("vscode").ThemeIcon;
@@ -238,7 +238,7 @@ void describe("StageNode — done review stage icon", () => {
   });
 
   void it('has description "done" for a done review stage with readiness', () => {
-    const task = makeTask("implementation");
+    const task = makeTask("impl");
     const readiness = { label: "7/10", icon: "question", colorKey: "charts.yellow" };
     const node = new StageNode(task, "plan-low-review", "done", undefined, readiness);
 
@@ -262,20 +262,20 @@ void describe("StageNode — done review stage icon", () => {
 });
 
 void describe("Stage migration (migrateStage)", () => {
-  void it('should migrate "created" to "task-description"', () => {
-    assert.strictEqual(migrateStage("created"), "task-description");
+  void it('should migrate "created" to "desc"', () => {
+    assert.strictEqual(migrateStage("created"), "desc");
   });
 
-  void it('should migrate "plan-final" to "implementation"', () => {
-    assert.strictEqual(migrateStage("plan-final"), "implementation");
+  void it('should migrate "plan-final" to "impl"', () => {
+    assert.strictEqual(migrateStage("plan-final"), "impl");
   });
 
-  void it('should keep "task-description" as-is', () => {
-    assert.strictEqual(migrateStage("task-description"), "task-description");
+  void it('should keep "desc" as-is', () => {
+    assert.strictEqual(migrateStage("desc"), "desc");
   });
 
-  void it('should keep "implementation" as-is', () => {
-    assert.strictEqual(migrateStage("implementation"), "implementation");
+  void it('should migrate "implementation" to "impl"', () => {
+    assert.strictEqual(migrateStage("implementation"), "impl");
   });
 
   void it('should keep "plan" as-is', () => {
@@ -286,8 +286,8 @@ void describe("Stage migration (migrateStage)", () => {
     assert.strictEqual(migrateStage("plan-review"), "plan-high-review");
   });
 
-  void it('should fallback unknown to "task-description"', () => {
-    assert.strictEqual(migrateStage("unknown-stage"), "task-description");
+  void it('should fallback unknown to "desc"', () => {
+    assert.strictEqual(migrateStage("unknown-stage"), "desc");
   });
 });
 
@@ -360,10 +360,11 @@ void describe("reviewReadiness.parseReadiness", () => {
 
 void describe("draftTaskWithAI.parseTaskDocument", () => {
   void it('should parse a new-style task.md with all three sections', () => {
+    const shortcutNote = `Shortcut: Apply Current Stage Action${shortcutHint("vs-code-ai-helper.applyCurrentStageAction")}.`;
     const content = [
       "Briefly describe what changes you want to be made, and then use AI to help you clarify the plan.",
       "",
-      "Shortcut: Apply Current Stage Action (Windows/Linux: Ctrl+Shift+Alt+I, macOS: Cmd+Shift+Alt+I).",
+      shortcutNote,
       "",
       "## Task Description",
       "",
@@ -537,8 +538,8 @@ void describe("draftTaskWithAI.parseAIResponse", () => {
 });
 
 void describe("Stage order and STAGE_ORDER", () => {
-  void it('should contain "task-description" as the first stage', () => {
-    assert.strictEqual(STAGE_ORDER[0], "task-description");
+  void it('should contain "desc" as the first stage', () => {
+    assert.strictEqual(STAGE_ORDER[0], "desc");
   });
 
   void it('should NOT contain "created" stage', () => {
@@ -549,15 +550,15 @@ void describe("Stage order and STAGE_ORDER", () => {
     assert.strictEqual(STAGE_ORDER.some((s) => String(s) === "plan-final"), false);
   });
 
-  void it('should contain exactly one "implementation" entry', () => {
+  void it('should contain exactly one "impl" entry', () => {
     const count = STAGE_ORDER.filter(
-      (s) => s === "implementation"
+      (s) => s === "impl"
     ).length;
     assert.strictEqual(count, 1);
   });
 
-  void it('should contain "completed" as the last stage', () => {
-    assert.strictEqual(STAGE_ORDER[STAGE_ORDER.length - 1], "completed");
+  void it('should contain "publish" as the last stage', () => {
+    assert.strictEqual(STAGE_ORDER[STAGE_ORDER.length - 1], "publish");
   });
 });
 
@@ -576,11 +577,11 @@ void describe("Context Tokens Emission", () => {
       "task-active-review"
     );
     assert.strictEqual(
-      buildTaskContextValue({ status: "active", currentStage: "completed" }),
+      buildTaskContextValue({ status: "completed", currentStage: "publish" }),
       "task-completed"
     );
     assert.strictEqual(
-      buildTaskContextValue({ status: "active", currentStage: "completed", hasLintPayload: true }),
+      buildTaskContextValue({ status: "completed", currentStage: "publish", hasLintPayload: true }),
       "task-completed-lint-known"
     );
     assert.strictEqual(
@@ -603,12 +604,12 @@ void describe("Context Tokens Emission", () => {
       "stage-impl-low-review-current-paused-lint-known-modelable"
     );
     assert.strictEqual(
-      buildStageContextValue({ stage: "implementation", status: "done", isPaused: false }),
+      buildStageContextValue({ stage: "impl", status: "done", isPaused: false }),
       "stage-modelable"
     );
     assert.strictEqual(
-      buildStageContextValue({ stage: "completed", status: "outstanding" }),
-      "stage"
+      buildStageContextValue({ stage: "publish", status: "outstanding" }),
+      "stage-modelable"
     );
     assert.strictEqual(
       buildStageContextValue({ stage: "plan", status: "current", isScheduled: true, hasPendingNote: true, isMetaManaged: true }),
@@ -622,7 +623,7 @@ void describe("Icon selection in StageNode", () => {
     folderUri: vscode.Uri.file("/workspace/tasks/t1"),
     folderName: "t1",
     progress: {
-      currentStage: "implementation" as const,
+      currentStage: "impl" as const,
       status: "active" as const,
       taskFolder: "t1",
       createdAt: new Date().toISOString(),

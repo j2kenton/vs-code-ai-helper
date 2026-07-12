@@ -18,12 +18,13 @@ import { checkAndConfirmPromptSize } from "../utils/promptSizeGuard";
 import { TaskInventory } from "../state/taskInventory";
 import { IncompleteTask } from "../utils/taskProgressUtils";
 import { NotificationRouter } from "../utils/notificationRouter";
+import { TaskTreeProvider } from "../views/taskTreeProvider";
 
 /**
  * Stages a task may be in for plan generation to be safe: either at the
  * task-description stage (first generation) or the plan stage (regeneration).
  */
-const ELIGIBLE_STAGES: readonly TaskStage[] = ["task-description", "plan"];
+const ELIGIBLE_STAGES: readonly TaskStage[] = ["desc", "plan"];
 
 /**
  * Accepted argument shapes for generatePlanWithAI.
@@ -110,14 +111,6 @@ export async function generatePlanWithAI(
   inventory: TaskInventory,
   arg?: GeneratePlanArg
 ): Promise<void> {
-  const workspaceRoot = vscode.workspace.workspaceFolders?.[0];
-  if (!workspaceRoot) {
-    void vscode.window.showErrorMessage(
-      "No workspace folder open. Please open a folder first."
-    );
-    return;
-  }
-
   // ── Consent gate ─────────────────────────────────────────────────────────
   const consented = await ensureAiConsent(context);
   if (!consented) {
@@ -155,8 +148,33 @@ export async function generatePlanWithAI(
   }
 
   const model = await resolveModelForStage(taskFolderUri, "plan");
-  const { runner, providerLabel, nativeModelId } = await resolveRunnerForModel(
-    model.modelId
+  if (!model.modelId) {
+    const openSettings = await vscode.window.showWarningMessage(
+      "No model is configured for the Plan stage. Open Ensemble Settings and choose a primary model before continuing.",
+      { modal: true },
+      "Open Settings"
+    );
+    if (openSettings === "Open Settings") {
+      await vscode.commands.executeCommand("vs-code-ai-helper.settingsView.focus");
+    }
+    return;
+  }
+
+  // A direct URI is not an ownership proof. Require the live inventory to
+  // resolve it so this command cannot write into an unrelated workspace.
+  const ownedTask = inventory.getTaskByPath(taskFolderUri.fsPath);
+  if (!ownedTask) {
+    void vscode.window.showErrorMessage("The selected task is not owned by this workspace.");
+    return;
+  }
+  taskFolderUri = vscode.Uri.file(ownedTask.taskFolderPath);
+  const workspaceFolderUri = ownedTask.workspaceFolder;
+  if (!workspaceFolderUri) {
+    void vscode.window.showErrorMessage("The selected task has no owning workspace.");
+    return;
+  }
+  const { runner, providerLabel, nativeModelId } = resolveRunnerForModel(
+    model.modelId, "plan"
   );
   const availability = await runner.isAvailable();
   if (!availability.available) {
@@ -196,7 +214,7 @@ export async function generatePlanWithAI(
   // no on-disk artifact should be written for this run.
   const contextPackContent = await generateContextPack(
     taskFolderUri,
-    workspaceRoot.uri
+    workspaceFolderUri
   );
 
   const prompt = await renderPromptTemplate(
@@ -217,69 +235,75 @@ export async function generatePlanWithAI(
   // if open buffers change between the two calls.
   await writeContextPackContent(taskFolderUri, contextPackContent);
 
-  // No overwrite confirmation — user has deliberately triggered regeneration
-  await vscode.window.withProgress(
-    {
-      location: vscode.ProgressLocation.Notification,
-      title: `Generating plan with ${providerLabel} (uses your ${providerLabel} quota)...`,
-      cancellable: true,
-    },
-    async (progress, token) => {
-      NotificationRouter.emitProgressSummary(`Generating plan with ${providerLabel}...`);
-      const planFileUri = vscode.Uri.joinPath(taskFolderUri, "plan.md");
+  const canonicalId = inventory.getTaskByPath(taskFolderUri.fsPath)?.canonicalId ?? taskFolderUri.fsPath;
+  try {
+    TaskTreeProvider.setStageRunning(canonicalId, "plan", true);
+    // No overwrite confirmation — user has deliberately triggered regeneration
+    await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: `Generating plan with ${providerLabel} (uses your ${providerLabel} quota)...`,
+        cancellable: true,
+      },
+      async (progress, token) => {
+        NotificationRouter.emitProgressSummary(`Generating plan with ${providerLabel}...`);
+        const planFileUri = vscode.Uri.joinPath(taskFolderUri, "plan.md");
 
-      progress.report({ message: `Waiting for ${providerLabel} response...` });
+        progress.report({ message: `Waiting for ${providerLabel} response...` });
 
-      const result = await runner.run(
-        {
-          taskFolderUri: taskFolderUri,
-          workspaceUri: workspaceRoot.uri,
-          stage: "plan",
-          prompt,
-          outputFile: planFileUri,
-          modelId: nativeModelId,
-        },
-        token
-      );
-
-      await writeRunLog(
-        taskFolderUri,
-        runner.id,
-        "plan",
-        `# Prompt\n\n${prompt}\n\n# Result\n\nStatus: ${result.status}\n\n${
-          result.summary ?? result.errorMessage ?? ""
-        }`
-      );
-
-      if (result.status === "completed") {
-        // Use patchTaskProgress to preserve unrelated fields (e.g. implReviewFiles,
-        // scheduled metadata, lint results) while updating the stage.
-        await patchTaskProgress(taskFolderUri, (existing) => {
-          if (!ELIGIBLE_STAGES.includes(existing.currentStage)) {
-            return existing;
-          }
-          return updateTaskProgressStage(existing, "plan");
-        });
-
-        const doc = await vscode.workspace.openTextDocument(planFileUri);
-        await vscode.window.showTextDocument(doc);
-        NotificationRouter.showInformation(
-          `plan.md generated with ${providerLabel} (${result.summary ?? ""})`
+        const result = await runner.run(
+          {
+            taskFolderUri: taskFolderUri,
+            workspaceUri: workspaceFolderUri,
+            stage: "plan",
+            prompt,
+            outputFile: planFileUri,
+            modelId: nativeModelId,
+          },
+          token
         );
-        // Do NOT auto-trigger review here — user advances stage manually
-      } else if (result.status === "cancelled") {
-        NotificationRouter.showInformation(
-          "Plan generation cancelled."
+
+        await writeRunLog(
+          taskFolderUri,
+          runner.id,
+          "plan",
+          `# Prompt\n\n${prompt}\n\n# Result\n\nStatus: ${result.status}\n\n${
+            result.summary ?? result.errorMessage ?? ""
+          }`
         );
-      } else {
-        void vscode.window.showErrorMessage(
-          `Plan generation failed: ${
-            result.errorMessage ?? "unknown error"
-          }. Use the manual planning workflow instead.`
-        );
+
+        if (result.status === "completed") {
+          // Use patchTaskProgress to preserve unrelated fields (e.g. implReviewFiles,
+          // scheduled metadata, lint results) while updating the stage.
+          await patchTaskProgress(taskFolderUri, (existing) => {
+            if (!ELIGIBLE_STAGES.includes(existing.currentStage)) {
+              return existing;
+            }
+            return updateTaskProgressStage(existing, "plan");
+          });
+
+          const doc = await vscode.workspace.openTextDocument(planFileUri);
+          await vscode.window.showTextDocument(doc);
+          NotificationRouter.showInformation(
+            `plan.md generated with ${providerLabel} (${result.summary ?? ""})`
+          );
+          // Do NOT auto-trigger review here — user advances stage manually
+        } else if (result.status === "cancelled") {
+          NotificationRouter.showInformation(
+            "Plan generation cancelled."
+          );
+        } else {
+          void vscode.window.showErrorMessage(
+            `Plan generation failed: ${
+              result.errorMessage ?? "unknown error"
+            }. Use the manual planning workflow instead.`
+          );
+        }
       }
-    }
-  );
+    );
+  } finally {
+    TaskTreeProvider.setStageRunning(canonicalId, "plan", false);
+  }
 }
 
 /**

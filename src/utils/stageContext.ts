@@ -11,8 +11,8 @@ import type { TaskStage } from '../types/taskProgress';
  */
 export function computeStageContext(stage: TaskStage): string {
   // Task-description and plan stages get unique context values for targeted actions
-  if (stage === 'task-description') {
-    return 'stage-task-description';
+  if (stage === 'desc') {
+    return 'stage-desc';
   }
   if (stage === 'plan') {
     return 'stage-plan';

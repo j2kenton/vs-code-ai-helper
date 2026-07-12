@@ -48,19 +48,19 @@ void describe("Stage 3 action matrix contracts", () => {
     assert.equal(markTaskDone.title, "Complete and Move On to Next Task");
   });
 
-  void it("declares nextStage menu for current task-description stage row", () => {
+  void it("declares nextStage menu for current desc stage row", () => {
     const contributes = readPackageContributes();
     const contextMenus = contributes.menus?.["view/item/context"] ?? [];
 
     const nextStageEntry = contextMenus.find(
       (entry) =>
         entry.command === "vs-code-ai-helper.nextStage" &&
-        (entry.when ?? "").includes("viewItem =~ /^stage-task-description-current/")
+        (entry.when ?? "").includes("viewItem =~ /^stage-desc-current/")
     );
 
     assert.ok(
       nextStageEntry,
-      "Expected nextStage menu entry for stage-task-description-current"
+      "Expected nextStage menu entry for stage-desc-current"
     );
   });
 
@@ -71,12 +71,12 @@ void describe("Stage 3 action matrix contracts", () => {
     const markDoneEntry = contextMenus.find(
       (entry) =>
         entry.command === "vs-code-ai-helper.markTaskDone" &&
-        (entry.when ?? "").includes("viewItem =~ /^stage-completed-current/")
+        (entry.when ?? "").includes("viewItem =~ /^stage-publish-current/")
     );
 
     assert.ok(
       markDoneEntry,
-      "Expected markTaskDone menu entry for stage-completed-current"
+      "Expected markTaskDone menu entry for stage-publish-current"
     );
   });
 
@@ -127,7 +127,7 @@ void describe("Stage 3 action matrix contracts", () => {
 
     assert.match(
       providerSource,
-      /case\s+"completed":\s*[\s\S]*tokens\.push\("stage-completed-current"\);/
+      /case\s+"publish":\s*[\s\S]*tokens\.push\("stage-publish-current"\);/
     );
   });
 });

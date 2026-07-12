@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import * as path from "path";
 import { TASK_FILENAME } from "../types/taskProgress";
 import { resolveModelForStage } from "../utils/modelSelection";
 import { resolveRunnerForModel } from "../runners/runnerRegistry";
@@ -9,9 +10,11 @@ import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { ensureAiConsent } from "../utils/aiConsent";
 import { checkAndConfirmPromptSize } from "../utils/promptSizeGuard";
 import { NotificationRouter } from "../utils/notificationRouter";
+import { TaskTreeProvider } from "../views/taskTreeProvider";
+import { shortcutHint } from "../utils/shortcutHints";
 
 const INTRO_TEXT = `Briefly describe what changes you want to be made, and then use AI to help you clarify the plan.`;
-const SHORTCUT_NOTE = `Shortcut: Apply Current Stage Action (Windows/Linux: Ctrl+Shift+Alt+I, macOS: Cmd+Shift+Alt+I).`;
+const SHORTCUT_NOTE = `Shortcut: Apply Current Stage Action${shortcutHint("vs-code-ai-helper.applyCurrentStageAction")}.`;
 
 /** Filename for the temporary AI output file used during draft-task runs. */
 const DRAFT_TMP_FILENAME = "_draft-ai-output.tmp";
@@ -320,14 +323,6 @@ export async function draftTaskWithAI(
   explicitArg?: { canonicalId?: string }
 ): Promise<void> {
   // ── Workspace guard (must come before consent) ──────────────────────────
-  const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
-  if (!workspaceFolder) {
-    void vscode.window.showErrorMessage(
-      "No workspace folder open. Please open a folder first."
-    );
-    return;
-  }
-
   // ── Consent gate ─────────────────────────────────────────────────────────
   const consented = await ensureAiConsent(context);
   if (!consented) {
@@ -345,7 +340,15 @@ export async function draftTaskWithAI(
     return;
   }
 
-  if (resolvedTask.progress.currentStage !== "task-description") {
+  const workspaceFolder = (vscode.workspace.workspaceFolders ?? []).find(
+    folder => path.resolve(folder.uri.fsPath) === path.resolve(resolvedTask.progress.ownership?.workspaceRoot ?? "")
+  );
+  if (!workspaceFolder) {
+    void vscode.window.showErrorMessage("Could not determine the owning workspace for this task.");
+    return;
+  }
+
+  if (resolvedTask.progress.currentStage !== "desc") {
     NotificationRouter.showInformation(
       "Task is not at the Task Description stage."
     );
@@ -385,9 +388,20 @@ export async function draftTaskWithAI(
     return;
   }
 
-  const model = await resolveModelForStage(taskFolderUri, "task-description");
-  const { runner, providerLabel, nativeModelId } = await resolveRunnerForModel(
-    model.modelId
+  const model = await resolveModelForStage(taskFolderUri, "desc");
+  if (!model.modelId) {
+    const openSettings = await vscode.window.showWarningMessage(
+      "No model is configured for the Description stage. Open Ensemble Settings and choose a primary model before continuing.",
+      { modal: true },
+      "Open Settings"
+    );
+    if (openSettings === "Open Settings") {
+      await vscode.commands.executeCommand("vs-code-ai-helper.settingsView.focus");
+    }
+    return;
+  }
+  const { runner, providerLabel, nativeModelId } = resolveRunnerForModel(
+    model.modelId, "desc"
   );
   const availability = await runner.isAvailable();
   if (!availability.available) {
@@ -413,6 +427,7 @@ export async function draftTaskWithAI(
   let aiOutput: { draftWithAI: string; openQuestions: string } | undefined;
 
   try {
+    TaskTreeProvider.setStageRunning(resolvedTask.canonicalId, "desc", true);
     await vscode.window.withProgress(
       {
         location: vscode.ProgressLocation.Notification,
@@ -427,7 +442,7 @@ export async function draftTaskWithAI(
           {
             taskFolderUri: taskFolderUri,
             workspaceUri: workspaceFolder.uri,
-            stage: "task-description",
+            stage: "desc",
             prompt,
             outputFile: tmpUri,
             modelId: nativeModelId,
@@ -438,7 +453,7 @@ export async function draftTaskWithAI(
         await writeRunLog(
           taskFolderUri,
           runner.id,
-          "task-description",
+          "desc",
           `# Prompt\n\n${prompt}\n\n# Result\n\nStatus: ${result.status}\n\n${
             result.summary ?? result.errorMessage ?? ""
           }`
@@ -466,6 +481,7 @@ export async function draftTaskWithAI(
       }
     );
   } finally {
+    TaskTreeProvider.setStageRunning(resolvedTask.canonicalId, "desc", false);
     // ── Cleanup on all terminal paths ──────────────────────────────────────
     // success, malformed, runner failure, cancellation, exception
     await deleteDraftTmpFile(taskFolderUri);

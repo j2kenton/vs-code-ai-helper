@@ -46,7 +46,7 @@ export interface StageTransitionResult {
 export const AUTO_REVIEW_TRANSITIONS: Partial<Record<TaskStage, TaskStage>> = {
   plan: "plan-high-review",
   "plan-high-review": "plan-low-review",
-  implementation: "impl-high-review",
+  impl: "impl-high-review",
   "impl-high-review": "impl-low-review",
 };
 
@@ -89,9 +89,16 @@ export async function advanceStage(
   // Persist the stage transition before any other action.
   // patchTaskProgress preserves all unrelated fields (implReviewFiles,
   // scheduledAt, lintPayload, status, etc.).
-  const patched = await patchTaskProgress(taskFolderUri, (current) =>
-    updateTaskProgressStage(current, newStage)
-  );
+  const patched = await patchTaskProgress(taskFolderUri, (current) => {
+    // Compare-and-set the source stage inside the task lock. This prevents a
+    // delayed review/shortcut from advancing a newer run a second time.
+    if (current.currentStage !== sourceStage) {
+      throw new Error(
+        `Task changed before transition (expected ${sourceStage}, found ${current.currentStage}).`
+      );
+    }
+    return updateTaskProgressStage(current, newStage);
+  });
 
   if (!patched) {
     return undefined;
@@ -122,12 +129,23 @@ export async function advanceStage(
  */
 import { STAGE_ORDER } from "../types/taskProgress";
 
-export function computeNextStage(currentStage: TaskStage): TaskStage | undefined {
-  const idx = STAGE_ORDER.indexOf(currentStage);
-  if (idx === -1 || idx >= STAGE_ORDER.length - 1) {
-    return undefined;
+export function computeNextStage(
+  currentStage: TaskStage,
+  configuredStages?: ReadonlySet<TaskStage>
+): TaskStage | undefined {
+  let idx = STAGE_ORDER.indexOf(currentStage);
+  if (idx === -1) return undefined;
+  while (idx < STAGE_ORDER.length - 1) {
+    idx += 1;
+    const candidate = STAGE_ORDER[idx];
+    if (!candidate) continue;
+    // A caller that has loaded model settings may omit optional review stages.
+    // Keep the default behavior unchanged when no settings are supplied.
+    if (configuredStages === undefined || !isReviewStage(candidate) || configuredStages.has(candidate)) {
+      return candidate;
+    }
   }
-  return STAGE_ORDER[idx + 1];
+  return undefined;
 }
 
 /**

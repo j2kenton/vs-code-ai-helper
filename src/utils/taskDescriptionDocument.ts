@@ -3,7 +3,7 @@
  */
 
 export const INTRO_TEXT = `Briefly describe what changes you want to be made, and then use AI to help you clarify the plan.`;
-export const SHORTCUT_NOTE = `Shortcut: Apply Current Stage Action (Windows/Linux: Ctrl+Shift+Alt+I, macOS: Cmd+Shift+Alt+I).`;
+export const SHORTCUT_NOTE = `Shortcut: Apply Current Stage Action (Ctrl+Shift+Alt+I).`;
 
 export interface ParsedTaskDocument {
   introText: string;

@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import { AgentRunRequest, AgentRunResult } from "../types/agentRunner";
+import type { TaskStage } from "../types/taskProgress";
 
 export interface PendingResumeOperation {
   request: Omit<AgentRunRequest, "taskFolderUri" | "workspaceUri" | "outputFile"> & {
@@ -55,3 +56,87 @@ export async function handleQuotaFailure(context: vscode.ExtensionContext, reque
   if (choice === "Switch model") { await switchModel?.(); return "switch"; }
   return choice === "Resume when credits restore" ? "resume" : undefined;
 }
+
+// ─── Session-observed quota status ──────────────────────────────────────────
+//
+// No provider exposes a numeric "percent of quota remaining" through its
+// discovery/CLI surface, so a fabricated percentage would just be a made-up
+// number (see the settings webview's explicit "never present fabricated
+// usage data" comment). What we *can* report honestly is what this session
+// has actually observed: the most recent run for a given stage+model either
+// completed/failed for a non-quota reason ("ok"), or failed because the
+// provider reported quota/rate-limit exhaustion ("exhausted"). This is reset
+// each time the extension host restarts — it is a live signal, not a
+// persisted ledger.
+
+export type QuotaState = "ok" | "exhausted";
+
+export interface QuotaObservation {
+  state: QuotaState;
+  observedAt: string;
+  /** Only present when the provider explicitly reported a percentage. */
+  remainingPercent?: number;
+}
+
+const quotaObservations = new Map<string, QuotaObservation>();
+
+function quotaKey(stage: TaskStage, modelId: string | undefined): string {
+  return `${stage}::${modelId ?? "(default)"}`;
+}
+
+/**
+ * Record what a completed run revealed about a stage+model's quota state.
+ * Called after every run that has a `failureKind` classification (quota or
+ * generic) or completed successfully — anything other than "quota" means the
+ * provider was reachable and not currently blocked by quota exhaustion.
+ */
+export function recordQuotaObservation(
+  stage: TaskStage,
+  modelId: string | undefined,
+  failureKind: "quota" | "generic" | undefined,
+  errorMessage?: string
+): void {
+  const percentMatch = /(?:remaining|left|available)[^\d]{0,12}(\d{1,3})\s*%/i.exec(errorMessage ?? "");
+  const parsedPercent = percentMatch ? Number(percentMatch[1]) : undefined;
+  quotaObservations.set(quotaKey(stage, modelId), {
+    state: failureKind === "quota" ? "exhausted" : "ok",
+    observedAt: new Date().toISOString(),
+    ...(parsedPercent !== undefined && parsedPercent <= 100 ? { remainingPercent: parsedPercent } : {}),
+  });
+}
+
+export function getQuotaObservation(
+  stage: TaskStage,
+  modelId: string | undefined
+): QuotaObservation | undefined {
+  return quotaObservations.get(quotaKey(stage, modelId));
+}
+
+/** Human-readable status for the settings webview. Never fabricates a number. */
+export function formatQuotaStatus(observation: QuotaObservation | undefined): string {
+  if (!observation) {
+    return "No usage observed yet this session";
+  }
+  const time = new Date(observation.observedAt).toLocaleTimeString();
+  const percent = observation.remainingPercent === undefined ? "" : ` (${observation.remainingPercent}% remaining)`;
+  return observation.state === "exhausted"
+    ? `Quota exhausted as of ${time}${percent}`
+    : `OK as of ${time}${percent}`;
+}
+
+export function getQuotaStatusText(stage: TaskStage, modelId: string | undefined): string {
+  if (!modelId) return "-";
+  return formatQuotaStatus(getQuotaObservation(stage, modelId));
+}
+
+/** Tooltip paired with getQuotaStatusText's "-" placeholder vs. observed text. */
+export function getQuotaStatusTooltip(modelId: string | undefined): string {
+  if (!modelId) return "No model configured for this slot — usage cannot be observed.";
+  return "Session-observed usage status, not a live percentage (no provider exposes numeric quota remaining).";
+}
+
+export const __quotaTestOnly = {
+  clear(): void {
+    quotaObservations.clear();
+  },
+};

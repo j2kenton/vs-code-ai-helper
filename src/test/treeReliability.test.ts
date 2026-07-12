@@ -27,7 +27,7 @@ import { TaskNode, TaskTreeProvider } from "../views/taskTreeProvider";
 function makeTask(
   fsPath: string,
   folderName: string,
-  stage: string = "implementation",
+  stage: string = "impl",
   status: "active" | "paused" = "active",
   canonicalId?: string
 ): IncompleteTask {
@@ -136,7 +136,7 @@ void describe("TaskStatusBar — canonical-ID-aware matching", () => {
     const bar = new TaskStatusBar(makeStoreStub());
     // Simulate Windows: canonical ID is lower-cased, fsPath preserves original
     const canonicalId = "/workspace/task-a";
-    const tasks = [makeTask("/workspace/Task-A", "task-a", "implementation", "active", canonicalId)];
+    const tasks = [makeTask("/workspace/Task-A", "task-a", "impl", "active", canonicalId)];
     // Must not throw — the task IS present (matched by canonicalId)
     assert.doesNotThrow(() => bar.update(tasks, canonicalId));
     bar.dispose();
@@ -144,7 +144,7 @@ void describe("TaskStatusBar — canonical-ID-aware matching", () => {
 
   void it("hides when stored ID matches neither canonicalId nor fsPath", () => {
     const bar = new TaskStatusBar(makeStoreStub());
-    const tasks = [makeTask("/workspace/task-a", "task-a", "implementation", "active", "/workspace/task-a")];
+    const tasks = [makeTask("/workspace/task-a", "task-a", "impl", "active", "/workspace/task-a")];
     // A completely different ID
     assert.doesNotThrow(() => bar.update(tasks, "/workspace/totally-different"));
     bar.dispose();
@@ -191,7 +191,7 @@ void describe("TaskStatusBar — canonical-ID-aware matching", () => {
 void describe("TaskNode — stable TreeItem.id", () => {
   void it("sets id to the task's canonicalId when present", () => {
     const canonicalId = "/workspace/tasks/alpha-normalized";
-    const task = makeTask("/workspace/tasks/Alpha", "alpha", "implementation", "active", canonicalId);
+    const task = makeTask("/workspace/tasks/Alpha", "alpha", "impl", "active", canonicalId);
     const node = new TaskNode(task, false, false);
 
     assert.strictEqual(

@@ -1,6 +1,8 @@
 import * as vscode from "vscode";
 import { spawn } from "child_process";
 import { patchTaskProgress, updateLintPayload } from "./taskProgressUtils";
+import * as fs from "fs";
+import * as path from "path";
 
 export interface CompletionLintResult {
   runAt: string;
@@ -18,13 +20,14 @@ function isInFolder(uri: vscode.Uri, folder: string): boolean {
 
 function runCheck(cwd: string, args: string[]): Promise<{ code: number; output: string }> {
   return new Promise((resolve) => {
+    const executable = args[0] ?? "npm";
     // shell:true on Windows so pnpm.cmd (an npm/pnpm global-install shim, not
     // a real executable) can be exec'd at all — spawning a .cmd file directly
     // with shell:false fails with EINVAL. See cliAgentRunner.ts for the same
     // pattern applied to the CLI provider runners.
     const child = spawn(
-      process.platform === "win32" ? "pnpm.cmd" : "pnpm",
-      args,
+      process.platform === "win32" ? `${executable}.cmd` : executable,
+      args.slice(1),
       { cwd, shell: process.platform === "win32" }
     );
     let output = "";
@@ -35,14 +38,22 @@ function runCheck(cwd: string, args: string[]): Promise<{ code: number; output: 
   });
 }
 
+function packageManager(folder: string): string {
+  if (fs.existsSync(path.join(folder, "pnpm-lock.yaml"))) return "pnpm";
+  if (fs.existsSync(path.join(folder, "yarn.lock"))) return "yarn";
+  if (fs.existsSync(path.join(folder, "bun.lockb")) || fs.existsSync(path.join(folder, "bun.lock"))) return "bun";
+  return "npm";
+}
+
 /** Collect diagnostics after fresh lint/type checks have completed. */
-export async function collectCompletionLint(folder: string): Promise<CompletionLintResult> {
+export async function collectCompletionLint(folder: string, relevantFiles?: readonly string[]): Promise<CompletionLintResult> {
+  const manager = packageManager(folder);
   const checks = await Promise.all([
-    ["pnpm run lint", ["run", "lint"]] as const,
-    ["pnpm run check-types", ["run", "check-types"]] as const,
+    [`${manager} run lint`, [manager, "run", "lint"]] as const,
+    [`${manager} run check-types`, [manager, "run", "check-types"]] as const,
   ].map(async ([command, args]) => ({ command, ...(await runCheck(folder, [...args])) })));
   const issues = vscode.languages.getDiagnostics().flatMap(([uri, diagnostics]) =>
-    isInFolder(uri, folder)
+    isInFolder(uri, folder) && (!relevantFiles || relevantFiles.some(file => path.resolve(folder, file) === path.resolve(uri.fsPath)))
       ? diagnostics.filter((d) => d.source === "eslint" || d.source === "ts" || d.source === "typescript")
       : []
   );
@@ -61,9 +72,9 @@ export async function collectCompletionLint(folder: string): Promise<CompletionL
 }
 
 /** Persist the latest completion lint result without changing the task stage. */
-export async function runCompletionLint(folderUri: vscode.Uri): Promise<CompletionLintResult> {
+export async function runCompletionLint(folderUri: vscode.Uri, relevantFiles?: readonly string[]): Promise<CompletionLintResult> {
   const workspaceFolder = vscode.workspace.getWorkspaceFolder(folderUri);
-  const result = await collectCompletionLint(workspaceFolder?.uri.fsPath ?? folderUri.fsPath);
+  const result = await collectCompletionLint(workspaceFolder?.uri.fsPath ?? folderUri.fsPath, relevantFiles);
   const persisted = await patchTaskProgress(folderUri, (current) => updateLintPayload(current, {
     runAt: result.runAt,
     passed: result.passed,

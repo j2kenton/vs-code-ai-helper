@@ -29,12 +29,19 @@ import { registerScheduleTaskResumeCommand } from "./commands/scheduleTaskResume
 import { registerMarkTaskDoneCommand } from "./commands/markTaskDone";
 import { TaskTreeProvider, TASKS_VIEW_ID, TaskNode } from "./views/taskTreeProvider";
 import { TaskStatusBar } from "./views/taskStatusBar";
+import { SettingsViewProvider } from "./views/settingsView";
 import { TaskInventory } from "./state/taskInventory";
 import { CurrentTaskStore } from "./utils/currentTaskStore";
 import { TASK_PROGRESS_FILENAME } from "./types/taskProgress";
 import { warmCliModelCache } from "./utils/modelSelection";
 import { StatusTreeProvider } from "./views/statusView";
 import { initNotificationRouter, deactivateNotificationRouter } from "./utils/notificationRouter";
+import { cleanupOrphanedTempFiles } from "./state/writeAtomic";
+import { resolveTaskRootCandidates } from "./utils/taskRoot";
+import { finishFinalization, recoverFinalizationTree } from "./state/finalizationJournal";
+import { PendingOperationsStore } from "./state/pendingOperationsStore";
+import { recoverActivationCheckpoint } from "./state/taskActivationCoordinator";
+import { readTaskProgress } from "./utils/taskProgressUtils";
 
 /**
  * FileDecorationProvider for the synthetic `current-task:` URI scheme.
@@ -69,19 +76,66 @@ class CurrentTaskDecorationProvider implements vscode.FileDecorationProvider {
  */
 export function activate(context: vscode.ExtensionContext): void {
   console.log("Ensemble is now active!");
+  void vscode.commands.executeCommand("setContext", "vs-code-ai-helper.tasksInitialized", false);
+  // Recover interrupted operations before commands become available. They are
+  // retained for reconciliation rather than silently discarded.
+  const pendingOperations = new PendingOperationsStore(context.workspaceState);
+  for (const operation of pendingOperations.recoverable()) {
+    void pendingOperations.update(operation.id, "needs-reconciliation");
+  }
+
+  // Create a single shared CurrentTaskStore backed by workspaceState so the
+  // current-task selection survives reloads without being shared globally.
+  // Constructed before the startup recovery block below because activation
+  // checkpoint recovery needs to update it.
+  const currentTaskStore = new CurrentTaskStore(context.workspaceState);
+
+  // Perform startup cleanup of orphaned temp files
+  try {
+    const candidates = resolveTaskRootCandidates();
+    const rootPaths = candidates.map((c) => c.absolutePath);
+    void cleanupOrphanedTempFiles(rootPaths);
+    for (const root of rootPaths) {
+      void recoverFinalizationTree(root).then(async journals => {
+        for (const journal of journals) {
+          // The journaled write itself is atomic (writeAtomic rename), so a
+          // crash mid-write leaves task-progress.json either fully old or
+          // fully new — never partial. The only actually-interrupted step is
+          // clearing the journal marker, so verifying the file still reads
+          // back as valid progress is sufficient to reconcile automatically
+          // instead of leaving a stale journal that would re-warn forever.
+          const progress = await readTaskProgress(vscode.Uri.file(journal.taskFolder));
+          if (progress) {
+            await finishFinalization(journal.taskFolder);
+          } else {
+            void vscode.window.showWarningMessage(`Could not verify an interrupted ${journal.operation} for task ${journal.taskFolder}. Please check its files manually.`);
+          }
+        }
+      }).catch(err => console.error("Finalization recovery failed", err));
+      void recoverActivationCheckpoint(root, currentTaskStore).then(summary => {
+        if (summary) void vscode.window.showWarningMessage(summary);
+      }).catch(err => console.error("Activation checkpoint recovery failed", err));
+    }
+  } catch (err) {
+    console.error("Startup temp file cleanup failed", err);
+  }
 
   // Create a single shared TaskInventory instance. All commands and the tree
   // provider use this same instance so discovery results are always consistent.
   const inventory = new TaskInventory();
 
-  // Create a single shared CurrentTaskStore backed by workspaceState so the
-  // current-task selection survives reloads without being shared globally.
-  const currentTaskStore = new CurrentTaskStore(context.workspaceState);
-
   // Register the current-task decoration provider
   const decorationProvider = new CurrentTaskDecorationProvider();
   context.subscriptions.push(
     vscode.window.registerFileDecorationProvider(decorationProvider)
+  );
+
+  const settingsViewProvider = new SettingsViewProvider(context.extensionUri);
+  context.subscriptions.push(
+    vscode.window.registerWebviewViewProvider(
+      SettingsViewProvider.viewType,
+      settingsViewProvider
+    )
   );
 
   // Register commands — pass the shared inventory, currentTaskStore, and
@@ -93,7 +147,7 @@ export function activate(context: vscode.ExtensionContext): void {
   registerGeneratePlanWithAICommand(context, inventory);
   registerReviewActionCommands(context);
   registerSetTaskStageCommand(context, inventory, currentTaskStore);
-  registerConfigureStepModelsCommand(context);
+  registerConfigureStepModelsCommand(context, settingsViewProvider);
   registerViewArtifactCommands(context);
   registerDraftTaskWithAICommand(context, inventory);
   registerApplyCurrentStageActionCommand(context, inventory, currentTaskStore);
@@ -159,6 +213,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   const taskStatusBar = new TaskStatusBar(currentTaskStore);
   const tasksLoadedListener = taskTreeProvider.onDidLoadTasks((tasks) => {
+    void vscode.commands.executeCommand("setContext", "vs-code-ai-helper.tasksInitialized", true);
     const currentTaskCanonicalId = currentTaskStore.get();
     taskStatusBar.update(tasks, currentTaskCanonicalId);
     void refreshMetaResourcesGitIgnoreContext(inventory, currentTaskStore);

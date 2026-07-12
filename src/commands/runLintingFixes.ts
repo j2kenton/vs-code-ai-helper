@@ -101,7 +101,7 @@ export async function runLintingFixes(
   }
 
   if (
-    resolvedTask.progress.currentStage !== "completed"
+    resolvedTask.progress.currentStage !== "publish"
   ) {
     NotificationRouter.showWarning(
       "Linting fixes are only available for completed tasks."
@@ -152,7 +152,8 @@ export async function runLintingFixes(
           );
         });
 
-        const initialLint = await runCompletionLint(taskFolderUri);
+        const relevantFiles = resolvedTask.progress.implReviewFiles;
+        const initialLint = await runCompletionLint(taskFolderUri, relevantFiles);
         if (initialLint.passed) {
           NotificationRouter.showInformation(
             "No linting issues found in the task folder. Your code looks good!"
@@ -210,8 +211,8 @@ export async function runLintingFixes(
           }).length;
 
         const postFixLint = remainingLintIssues === 0
-          ? await runCompletionLint(taskFolderUri)
-          : await runCompletionLint(taskFolderUri);
+          ? await runCompletionLint(taskFolderUri, relevantFiles)
+          : await runCompletionLint(taskFolderUri, relevantFiles);
 
         if (!postFixLint.passed) {
 
@@ -220,7 +221,7 @@ export async function runLintingFixes(
           // focused edits while the task remains completed.
           const workspaceFolder = vscode.workspace.getWorkspaceFolder(taskFolderUri);
           if (workspaceFolder) {
-            const model = await resolveModelForStage(taskFolderUri, "implementation");
+            const model = await resolveModelForStage(taskFolderUri, "impl");
             const postFixDiagnostics = vscode.languages.getDiagnostics().filter(([uri, ds]) => isFileInTaskFolder(uri, taskFolderPath) && ds.some((d) => d.source === "eslint" || d.source === "ts" || d.source === "typescript"));
             const lint = JSON.stringify({
               summary: postFixLint.summary,
@@ -238,14 +239,14 @@ export async function runLintingFixes(
               }
               let result: Awaited<ReturnType<typeof runImplementationForModel>> | undefined;
               await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: "Applying AI final fixes...", cancellable: true }, async (aiProgress, token) => {
-                result = await runImplementationForModel({ modelId: model.modelId, prompt, workspaceUri: workspaceFolder.uri, token, onProgress: (message) => aiProgress.report({ message }) });
+                result = await runImplementationForModel({ modelId: model.modelId, prompt, workspaceUri: workspaceFolder.uri, token, stage: "publish", onProgress: (message) => aiProgress.report({ message }) });
               });
               if (result?.status === "completed") {
-                await runCompletionLint(taskFolderUri);
+                await runCompletionLint(taskFolderUri, relevantFiles);
                 await inventory.refresh();
                 NotificationRouter.showInformation("AI final fixes applied; completion lint was rerun.");
               } else {
-                await runCompletionLint(taskFolderUri);
+                await runCompletionLint(taskFolderUri, relevantFiles);
                 if (result?.errorMessage) {
                   NotificationRouter.showWarning(`AI final fixes failed: ${result.errorMessage}`);
                 } else {
@@ -272,7 +273,7 @@ export async function runLintingFixes(
         }
       } catch (error) {
         try {
-          await runCompletionLint(taskFolderUri);
+          await runCompletionLint(taskFolderUri, resolvedTask.progress.implReviewFiles);
         } catch {
           await persistLintState(
             false,

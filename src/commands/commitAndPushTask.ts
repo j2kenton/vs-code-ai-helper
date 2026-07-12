@@ -6,12 +6,16 @@ import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { TASK_FILENAME, STAGE_DISPLAY_NAMES } from "../types/taskProgress";
 import { resolveImplementationArtifact } from "../utils/implementationArtifactResolver";
 import { getLowLevelPlanUri } from "../utils/lowLevelPlanArtifactResolver";
-import { IncompleteTask } from "../utils/taskProgressUtils";
+import { IncompleteTask, patchTaskProgress } from "../utils/taskProgressUtils";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { advanceStage } from "../utils/stageTransition";
 import { selectNextTask } from "./markTaskDone";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { runCompletionLint } from "../utils/completionLint";
+import { isStrictPerfectReview } from "../utils/reviewReadiness";
+import { STAGE_ARTIFACT_FILENAMES } from "../types/taskProgress";
+import { resolveModelForStage } from "../utils/modelSelection";
+import { parseCopilotModelSelection, parseModelSelection } from "../runners/providers";
 
 /**
  * Accepted argument shapes for commitAndPushTask.
@@ -151,6 +155,59 @@ async function runGitCommand(
       }
     });
   });
+}
+
+/**
+ * Generate a suggested structured commit message. Only Copilot-hosted models can
+ * service a one-off chat completion like this (CLI providers are agentic
+ * file-editing runners with no simple text-completion surface), so this
+ * honors the model actually configured for the Publish stage rather than
+ * picking whichever Copilot model happens to be first — falling back to a
+ * deterministic subject when the configured model can't service the request
+ * (a CLI provider is configured, or none is). The caller always shows this
+ * suggestion to the user for review/edit/accept before it is ever committed.
+ */
+async function buildCommitMessage(
+  repoRoot: string,
+  taskFolderUri: vscode.Uri,
+  taskName: string,
+  files: string[]
+): Promise<string> {
+  const diff = await runGitCommand(repoRoot, "diff", ["--cached", "--no-color", "--", ...files]);
+  const changed = files.length > 0 ? files.slice(0, 3).map((file) => path.basename(file)).join(", ") : "workspace changes";
+  const suffix = files.length > 3 ? ` and ${files.length - 3} more files` : "";
+  const fallback = `Ensemble: update ${taskName}\n\nChanges:\n- Updated ${changed}${suffix}\n\nFiles: ${files.length}`;
+
+  const { modelId } = await resolveModelForStage(taskFolderUri, "publish");
+  const parsedProvider = parseModelSelection(modelId);
+  if (parsedProvider.provider !== "copilot") {
+    // Configured stage model is a subscription CLI provider — no chat
+    // completion surface is available for it here.
+    return fallback;
+  }
+  const parsedCopilot = parseCopilotModelSelection(parsedProvider.model);
+
+  const cts = new vscode.CancellationTokenSource();
+  try {
+    const models = await vscode.lm.selectChatModels({ vendor: "copilot" });
+    const model = parsedCopilot.model
+      ? models.find((m) => m.id === parsedCopilot.model)
+      : models.find((m) => m.id.toLowerCase() === "auto" || m.name.toLowerCase() === "auto") ?? models[0];
+    if (model) {
+      const response = await model.sendRequest([
+        vscode.LanguageModelChatMessage.User(`Write an informative git commit message for task ${taskName}. Use a short imperative subject (under 72 characters), then a blank line, then sections named Changes, Added, Removed, and Tests. Include only sections supported by the diff. Return only the commit message.\n\n${diff.stdout.slice(0, 12000)}`)
+      ], {}, cts.token);
+      let subject = "";
+      for await (const part of response.text) subject += part;
+      subject = subject.replace(/^['"`]|['"`]$/g, "").trim();
+      const subjectLine = subject.split(/\r?\n/, 1)[0] ?? "";
+      if (subject && subjectLine.length <= 72) return subject;
+    }
+  } catch { /* Provider unavailable: retain a deterministic safe fallback. */ } finally {
+    cts.cancel();
+    cts.dispose();
+  }
+  return fallback;
 }
 
 /**
@@ -620,7 +677,7 @@ export async function commitAndPushTask(
   }
 
   // Allow committing from completed stage only
-  if (resolvedTask.progress.currentStage !== "completed") {
+  if (resolvedTask.progress.currentStage !== "publish") {
     NotificationRouter.showWarning(
       `Task is at stage "${STAGE_DISPLAY_NAMES[resolvedTask.progress.currentStage]}" — must be completed before committing and pushing.`
     );
@@ -629,7 +686,7 @@ export async function commitAndPushTask(
 
   // Always run fresh checks immediately before a commit. Persisted payloads
   // are informational and may be stale after files were edited.
-  const lintPayload = await runCompletionLint(vscode.Uri.file(resolvedTask.taskFolderPath));
+  const lintPayload = await runCompletionLint(vscode.Uri.file(resolvedTask.taskFolderPath), resolvedTask.progress.implReviewFiles);
   if (!lintPayload.passed) {
     const summary = lintPayload.summary ? ` (${lintPayload.summary})` : "";
     const choice = await vscode.window.showWarningMessage(
@@ -925,9 +982,34 @@ export async function commitAndPushTask(
             }
           }
 
+          // Commit message — generated from the configured Publish-stage
+          // model when possible, always shown to the user to review, edit,
+          // or accept before anything is committed.
+          progress.report({ message: "Generating commit message..." });
+          const suggestedMessage = await buildCommitMessage(
+            repoRoot,
+            vscode.Uri.file(resolvedTask.taskFolderPath),
+            resolvedTask.folderName,
+            scopedFiles
+          );
+          const commitMessage = await vscode.window.showInputBox({
+            title: "Commit Message — review before committing",
+            prompt: "Edit the commit message if needed, then press Enter to commit and push.",
+            value: suggestedMessage,
+            valueSelection: [0, suggestedMessage.length],
+            ignoreFocusOut: true,
+          });
+          if (!commitMessage || commitMessage.trim().length === 0) {
+            // Undo the staging performed above. Nothing else was staged
+            // before this run started (verified earlier in this function),
+            // so a plain reset cleanly restores the pre-run state.
+            await runGitCommand(repoRoot, "reset", []);
+            NotificationRouter.showInformation("Commit and push cancelled.");
+            return;
+          }
+
           // Commit
           progress.report({ message: "Creating commit..." });
-          const commitMessage = `Ensemble: ${resolvedTask.folderName}`;
           await runGitCommand(repoRoot, "commit", ["-m", commitMessage]);
 
           // Push with explicit destination
@@ -998,7 +1080,7 @@ export async function completeCommitAndPushTask(
 
   // Check stage eligibility: must be at final review stage (impl-low-review) or completed
   if (resolvedTask.progress.currentStage !== "impl-low-review") {
-    if (resolvedTask.progress.currentStage === "completed") {
+    if (resolvedTask.progress.currentStage === "publish") {
       // If already completed, fall back directly to commit & push
       return commitAndPushTask(inventory, explicitArg, currentTaskStore);
     }
@@ -1008,7 +1090,23 @@ export async function completeCommitAndPushTask(
     return;
   }
 
-  // 1. Run fresh checks, then transition stage to "completed".
+  // The combined command must obey the same terminal gate as the dedicated
+  // completion command; reaching Publish is never implicit completion.
+  try {
+    const review = await vscode.workspace.fs.readFile(vscode.Uri.joinPath(
+      vscode.Uri.file(resolvedTask.taskFolderPath),
+      STAGE_ARTIFACT_FILENAMES.publish!
+    ));
+    if (!isStrictPerfectReview(new TextDecoder().decode(review))) {
+      NotificationRouter.showWarning("Publish cannot be completed until its review has a strict 10/10 score.");
+      return;
+    }
+  } catch {
+    NotificationRouter.showWarning("Publish cannot be completed until a review has been generated and scored 10/10.");
+    return;
+  }
+
+  // 1. Run fresh checks, then transition stage to "publish".
   const taskFolderUri = vscode.Uri.file(resolvedTask.taskFolderPath);
   const lintResult = await runCompletionLint(taskFolderUri);
   if (!lintResult.passed) {
@@ -1018,7 +1116,7 @@ export async function completeCommitAndPushTask(
   const transitionResult = await advanceStage(
     taskFolderUri,
     resolvedTask.progress.currentStage,
-    "completed",
+    "publish",
     false,
     false
   );
@@ -1029,6 +1127,16 @@ export async function completeCommitAndPushTask(
     );
     return;
   }
+
+  // Completing this command is a lifecycle transition, not merely reaching
+  // Publish. Persist completion before selecting another task so the one
+  // active-task invariant remains true across refreshes and reloads.
+  await patchTaskProgress(taskFolderUri, (current) => ({
+    ...current,
+    status: "completed",
+    completedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  }));
 
   // 2. Refresh inventory
   await inventory.refresh();
@@ -1049,7 +1157,7 @@ export async function completeCommitAndPushTask(
     folderName: resolvedTask.folderName,
     progress: {
       ...resolvedTask.progress,
-      currentStage: "completed", // Since it was just advanced
+      currentStage: "publish", // Since it was just advanced
     },
     canonicalId: resolvedTask.canonicalId,
   };

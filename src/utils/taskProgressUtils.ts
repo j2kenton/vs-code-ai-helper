@@ -8,6 +8,11 @@ import {
   TASK_PROGRESS_FILENAME,
 } from "../types/taskProgress";
 
+import { writeAtomic } from "../state/writeAtomic";
+import { withTaskLock } from "../state/taskStateStore";
+import { beginFinalization, finishFinalization } from "../state/finalizationJournal";
+import { migratePersistedState } from "../state/migratePersistedState";
+
 /**
  * Represents an incomplete task with its folder URI and progress.
  *
@@ -46,10 +51,21 @@ export async function readTaskProgress(
   try {
     const content = await vscode.workspace.fs.readFile(progressFileUri);
     const json = new TextDecoder().decode(content);
-    const progress = JSON.parse(json) as TaskProgress;
+    const progress = migratePersistedState(JSON.parse(json)).data;
     // Migrate stage names written by older versions; the migrated
     // value is persisted the next time the stage changes.
-    progress.currentStage = migrateStage(String(progress.currentStage));
+    const rawStage = String(progress.currentStage);
+    progress.currentStage = migrateStage(rawStage);
+    if (rawStage === "completed") {
+      progress.currentStage = "publish";
+      if (!progress.completedAt && progress.status !== "completed") {
+        if (progress.status === undefined) {
+          progress.status = "active";
+        }
+      } else {
+        progress.status = "completed";
+      }
+    }
     // Migrate/normalize status field (missing -> "active").
     progress.status = migrateStatus(progress.status);
     // Sanitize implReviewFiles: it must be an array of strings or absent.
@@ -86,10 +102,7 @@ export async function writeTaskProgress(
   );
 
   const content = JSON.stringify(progress, null, 2);
-  await vscode.workspace.fs.writeFile(
-    progressFileUri,
-    new TextEncoder().encode(content)
-  );
+  await writeAtomic(progressFileUri, content);
 }
 
 /**
@@ -117,20 +130,29 @@ export async function patchTaskProgress(
   taskFolderUri: vscode.Uri,
   update: Partial<TaskProgress> | ((current: TaskProgress) => TaskProgress)
 ): Promise<TaskProgress | undefined> {
-  const current = await readTaskProgress(taskFolderUri);
-  if (!current) {
-    return undefined;
-  }
+  return withTaskLock(taskFolderUri.fsPath, async () => {
+    // Read and write under the same lease. Reading before acquiring the lock
+    // allowed concurrent commands to serialize stale snapshots and lose updates.
+    const current = await readTaskProgress(taskFolderUri);
+    if (!current) return undefined;
 
-  let patched: TaskProgress;
-  if (typeof update === "function") {
-    patched = update(current);
-  } else {
-    patched = { ...current, ...update };
-  }
+    let patched: TaskProgress;
+    if (typeof update === "function") patched = update(current);
+    else patched = { ...current, ...update };
 
   // Re-apply normalization/sanitization so writes always produce clean data.
-  patched.currentStage = migrateStage(String(patched.currentStage));
+  const rawStage = String(patched.currentStage);
+  patched.currentStage = migrateStage(rawStage);
+  if (rawStage === "completed") {
+    patched.currentStage = "publish";
+    if (!patched.completedAt && patched.status !== "completed") {
+      if (patched.status === undefined) {
+        patched.status = "active";
+      }
+    } else {
+      patched.status = "completed";
+    }
+  }
   patched.status = migrateStatus(patched.status);
   if (patched.implReviewFiles !== undefined) {
     if (!Array.isArray(patched.implReviewFiles)) {
@@ -142,8 +164,16 @@ export async function patchTaskProgress(
     }
   }
 
-  await writeTaskProgress(taskFolderUri, patched);
-  return patched;
+  // All read-modify-write progress mutations share the same lease. This is
+  // the CAS boundary used by commands and prevents two operations from
+  // silently overwriting each other's stage or status changes.
+    await beginFinalization(taskFolderUri.fsPath, taskFolderUri.fsPath, "task-progress mutation");
+    // Keep the intent journal on failure. Startup recovery needs the record
+    // to reconcile an interrupted mutation instead of losing the evidence.
+    await writeTaskProgress(taskFolderUri, patched);
+    await finishFinalization(taskFolderUri.fsPath);
+    return patched;
+  });
 }
 
 /**
@@ -154,7 +184,7 @@ export async function patchTaskProgress(
  */
 export function createTaskProgress(
   taskFolder: string,
-  stage: TaskStage = "task-description"
+  stage: TaskStage = "desc"
 ): TaskProgress {
   const now = new Date().toISOString();
   return {
@@ -272,7 +302,7 @@ export async function findIncompleteTasks(
   metaFolderUri: vscode.Uri
 ): Promise<IncompleteTask[]> {
   const allTasks = await findAllTasks(metaFolderUri);
-  return allTasks.filter((task) => task.progress.currentStage !== "completed");
+  return allTasks.filter((task) => task.progress.status !== "completed");
 }
 
 /**

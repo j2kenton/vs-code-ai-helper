@@ -1,5 +1,8 @@
 import * as assert from "node:assert/strict";
-import { test } from "node:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { after, test } from "node:test";
 import {
   updateImplReviewFiles,
   clearImplReviewFiles,
@@ -10,7 +13,7 @@ import type { TaskProgress } from "../types/taskProgress";
 function makeProgress(implReviewFiles?: string[]): TaskProgress {
   return {
     taskFolder: "2026-07-07_task_1",
-    currentStage: "implementation",
+    currentStage: "impl",
     createdAt: "2026-07-07T00:00:00.000Z",
     updatedAt: "2026-07-07T00:00:00.000Z",
     ...(implReviewFiles !== undefined ? { implReviewFiles } : {}),
@@ -93,6 +96,14 @@ function installMemStore(store: MemStore): void {
   (vscode.workspace.fs as unknown as Record<string, unknown>).readFile = (
     uri: vscode.Uri
   ): Promise<Uint8Array> => {
+    // writeTaskProgress persists task-progress.json via writeAtomic, which
+    // always hits the real filesystem (production's vscode.workspace.fs and
+    // Node's fs both resolve to the same disk, but this in-memory store does
+    // not). Prefer the real file when present so patchTaskProgress reads see
+    // its own prior writes instead of the stale seeded snapshot.
+    if (path.basename(uri.fsPath) === "task-progress.json" && fs.existsSync(uri.fsPath)) {
+      return fs.promises.readFile(uri.fsPath, "utf8").then((text) => new TextEncoder().encode(text));
+    }
     const content = store.get(uri.toString());
     if (content === undefined) {
       throw new Error(`ENOENT: ${uri.toString()}`);
@@ -108,8 +119,20 @@ function installMemStore(store: MemStore): void {
   };
 }
 
+// patchTaskProgress now serializes writes through withTaskLock, which takes
+// real filesystem leases (session/meta/task) derived from the folder path's
+// ".." ancestry. A shallow fake path like "/fake-workspace/x" collides with
+// the filesystem root two levels up, and mkdir on a Windows drive root
+// throws EPERM even though it already exists. Use a real temp directory with
+// a ".ensemble"-nested shape matching production so the lease paths land
+// safely inside it.
+const TEST_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-progress-test-"));
+after(() => {
+  fs.rmSync(TEST_ROOT, { recursive: true, force: true });
+});
+
 function makeTaskFolderUri(name: string): vscode.Uri {
-  return vscode.Uri.file(`/fake-workspace/${name}`);
+  return vscode.Uri.file(path.join(TEST_ROOT, ".ensemble", name));
 }
 
 function seedProgress(
@@ -127,6 +150,13 @@ function readStoredProgress(
   folderUri: vscode.Uri
 ): Promise<TaskProgress | undefined> {
   const uri = vscode.Uri.joinPath(folderUri, "task-progress.json");
+  // See the matching comment in installMemStore's readFile mock: writeAtomic
+  // always persists task-progress.json to the real filesystem, so the real
+  // file (when present) reflects any patchTaskProgress writes that the
+  // in-memory store does not.
+  if (fs.existsSync(uri.fsPath)) {
+    return fs.promises.readFile(uri.fsPath, "utf8").then((raw) => JSON.parse(raw) as TaskProgress);
+  }
   const raw = store.get(uri.toString());
   if (!raw) {
     return Promise.resolve(undefined);
@@ -191,7 +221,7 @@ void test("patchTaskProgress preserves implReviewFiles when updating stage", asy
   const folderUri = makeTaskFolderUri("patch-preserve-impl-files");
   const initial: TaskProgress = {
     ...makeProgress(["a.ts", "b.ts"]),
-    currentStage: "implementation",
+    currentStage: "impl",
   };
   await seedProgress(store, folderUri, initial);
 
@@ -215,6 +245,6 @@ void test("patchTaskProgress normalizes invalid currentStage values", async () =
     currentStage: "totally-invalid-stage" as TaskProgress["currentStage"],
   }));
   assert.ok(result !== undefined);
-  // Should normalize to task-description (the migrateStage fallback)
-  assert.equal(result.currentStage, "task-description");
+  // Should normalize to desc (the migrateStage fallback)
+  assert.equal(result.currentStage, "desc");
 });

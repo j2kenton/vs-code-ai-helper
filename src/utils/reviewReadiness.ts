@@ -74,3 +74,19 @@ export function parseReadiness(content: string): ReadinessResult {
     colorKey: "charts.red",
   };
 }
+
+/** Strict gate used by automatic stage advancement. */
+export function isStrictPerfectReview(content: string): boolean {
+  const lines = content.replace(/^\uFEFF/, "").replace(/\r\n/g, "\n").split("\n");
+  let inFrontmatter = false;
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (line === "---") {
+      inFrontmatter = !inFrontmatter;
+      continue;
+    }
+    if (inFrontmatter || !line || line.startsWith("<!--") || line.endsWith("-->") || line.startsWith("#")) continue;
+    return line === "Readiness: 10/10";
+  }
+  return false;
+}

@@ -1,8 +1,13 @@
 import * as vscode from "vscode";
 import { TaskInventory, TaskWithProgress } from "../state/taskInventory";
 import { CurrentTaskStore } from "./currentTaskStore";
+import * as fs from "fs";
+import * as path from "path";
+import { taskRefFromResolved, TaskRef } from "../types/taskRef";
+import { patchTaskProgress } from "./taskProgressUtils";
 
 export interface ResolvedTaskContext {
+  readonly taskRef: TaskRef;
   /** Canonical task ID (normalized absolute path) */
   canonicalId: string;
   /** Absolute task folder path */
@@ -20,6 +25,68 @@ export interface ResolvedTaskContext {
 export interface ResolveTaskOptions {
   /** Allow resolving paused tasks */
   allowPaused?: boolean;
+  /**
+   * When the task's persisted ownership no longer matches any currently
+   * open workspace folder, offer to resolve it instead of failing closed:
+   *   - Exactly one open folder physically contains the task folder on
+   *     disk (e.g. the workspace was renamed/moved) -> rebind silently,
+   *     no prompt needed since the match is unambiguous.
+   *   - More than one open folder contains it (nested multi-root
+   *     workspaces) -> show a folder picker so the user disambiguates.
+   *   - No open folder contains it -> nothing to resolve; fails closed
+   *     same as when this option is unset.
+   * Off by default so the many existing callers keep their current
+   * UI-free, fail-closed behavior; only opt in at a genuine user-driven
+   * entry point.
+   */
+  promptForOwnershipResolution?: boolean;
+}
+
+/**
+ * Recover from a task whose persisted `ownership.workspaceRoot` no longer
+ * matches any open workspace folder. Returns the workspace root to rebind
+ * ownership to, or undefined if it can't be resolved (or the user cancels
+ * a disambiguation prompt). Persists the corrected ownership before
+ * returning so the caller doesn't need to.
+ */
+async function resolveAmbiguousOwnership(
+  task: TaskWithProgress,
+  workspaceRoots: readonly string[]
+): Promise<string | undefined> {
+  const containingRoots = workspaceRoots.filter(
+    (root) => task.taskFolderPath === root || task.taskFolderPath.startsWith(root + path.sep)
+  );
+
+  let rebindRoot: string | undefined;
+  if (containingRoots.length === 1) {
+    rebindRoot = containingRoots[0];
+  } else if (containingRoots.length > 1) {
+    const items = containingRoots.map((root) => ({
+      label: path.basename(root),
+      description: root,
+      root,
+    }));
+    const picked = await vscode.window.showQuickPick(items, {
+      title: `Which workspace owns "${task.folderName}"?`,
+      placeHolder: "This task's saved workspace no longer matches one open folder — select the owning one",
+    });
+    rebindRoot = picked?.root;
+  }
+  if (!rebindRoot) {
+    return undefined;
+  }
+
+  const patched = await patchTaskProgress(vscode.Uri.file(task.taskFolderPath), (current) => ({
+    ...current,
+    ownership: {
+      metaRoot: current.ownership?.metaRoot ?? path.resolve(task.taskFolderPath, ".."),
+      projectRoot: rebindRoot,
+      workspaceRoot: rebindRoot,
+      boundAt: new Date().toISOString(),
+      state: "resolved",
+    },
+  }));
+  return patched ? rebindRoot : undefined;
 }
 
 /**
@@ -156,17 +223,61 @@ export async function resolveTaskContext(
     return undefined;
   }
 
+  // A resolved inventory entry is still untrusted input at the command
+  // boundary. Refuse operations on missing folders or paths outside a VS Code
+  // workspace; this prevents stale/cross-project task references.
+  if (!path.isAbsolute(resolved.taskFolderPath) || !fs.existsSync(resolved.taskFolderPath)) return undefined;
+  let persistedOwner = resolved.progress.ownership?.workspaceRoot;
+  const workspaceRoots = (vscode.workspace.workspaceFolders ?? []).map(folder => path.resolve(folder.uri.fsPath));
+
+  if (persistedOwner && !workspaceRoots.includes(path.resolve(persistedOwner))) {
+    // The persisted owner no longer matches any open workspace folder (the
+    // task's ownership is unresolved). Only attempt recovery when the caller
+    // opted in — resolveTaskContext otherwise stays UI-free and fails closed,
+    // matching every other resolution step in this function.
+    if (!options?.promptForOwnershipResolution) {
+      return undefined;
+    }
+    const rebindRoot = await resolveAmbiguousOwnership(resolved, workspaceRoots);
+    if (!rebindRoot) {
+      return undefined;
+    }
+    persistedOwner = rebindRoot;
+    resolved = {
+      ...resolved,
+      progress: {
+        ...resolved.progress,
+        ownership: {
+          ...resolved.progress.ownership!,
+          workspaceRoot: rebindRoot,
+          projectRoot: rebindRoot,
+          state: "resolved",
+        },
+      },
+    };
+  }
+  if (workspaceRoots.length > 0 && !workspaceRoots.some(root => resolved.taskFolderPath === root || resolved.taskFolderPath.startsWith(root + path.sep))) return undefined;
+
   // Check paused status
   if (!options?.allowPaused && resolved.progress.status === "paused") {
     return undefined;
   }
 
+  const workspaceFolderUri = persistedOwner
+    ? vscode.workspace.workspaceFolders?.map(folder => folder.uri).find(uri => path.resolve(uri.fsPath) === path.resolve(persistedOwner))
+    : resolved.workspaceFolder ?? (vscode.workspace.workspaceFolders ?? []).map(folder => folder.uri).find(uri => {
+    const root = path.resolve(uri.fsPath);
+    return resolved.taskFolderPath === root || resolved.taskFolderPath.startsWith(root + path.sep);
+  });
+  if (!workspaceFolderUri) return undefined;
+  const taskRef = taskRefFromResolved({ canonicalId: resolved.canonicalId, taskFolderPath: resolved.taskFolderPath, workspaceFolder: workspaceFolderUri, metaRoot: resolved.progress.ownership?.metaRoot });
   return {
+    taskRef,
     canonicalId: resolved.canonicalId,
     taskFolderPath: resolved.taskFolderPath,
     folderName: resolved.folderName,
     sourceScopeKey: resolved.sourceScopeKey,
-    workspaceFolder: resolved.workspaceFolder,
+    workspaceFolder: workspaceFolderUri,
     progress: resolved.progress,
   };
 }

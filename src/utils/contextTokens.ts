@@ -25,7 +25,7 @@ export interface StageContextInput {
  * Validates the inputs to ensure consistent and valid state before generating context.
  */
 export function validateTaskContextInput(input: TaskContextInput): void {
-  if (input.currentStage === "completed" && input.isScheduled) {
+  if (input.status === "completed" && input.isScheduled) {
     throw new Error("A completed task cannot be scheduled to resume.");
   }
 }
@@ -50,7 +50,7 @@ export function buildTaskContextValue(input: TaskContextInput): string {
   // moment it reaches the final stage.
   if (input.status === "paused") {
     tokens.push("task-paused");
-  } else if (input.currentStage === "completed") {
+  } else if (input.status === "completed") {
     tokens.push("task-completed");
   } else if (isReviewStage(input.currentStage)) {
     tokens.push("task-active-review");
@@ -59,7 +59,7 @@ export function buildTaskContextValue(input: TaskContextInput): string {
   }
 
   // Suffixes based on conditions
-  if (input.hasLintPayload && input.currentStage === "completed") {
+  if (input.hasLintPayload && input.currentStage === "publish") {
     tokens.push("lint-known");
     if (input.lintPassed !== undefined) {
       tokens.push(input.lintPassed ? "lint-passed" : "lint-failed");
@@ -92,20 +92,20 @@ export function buildStageContextValue(input: StageContextInput): string {
   // Primary stage token
   if (input.status === "current") {
     switch (input.stage) {
-      case "task-description":
-        tokens.push("stage-task-description-current");
+      case "desc":
+        tokens.push("stage-desc-current");
         break;
       case "plan":
         tokens.push("stage-plan-current");
         break;
-      case "implementation":
+      case "impl":
         tokens.push("stage-impl-current");
         break;
       case "impl-low-review":
         tokens.push("stage-impl-low-review-current");
         break;
-      case "completed":
-        tokens.push("stage-completed-current");
+      case "publish":
+        tokens.push("stage-publish-current");
         break;
       default:
         if (isReviewStage(input.stage)) {
@@ -115,8 +115,8 @@ export function buildStageContextValue(input: StageContextInput): string {
         }
     }
   } else {
-    if (input.stage === "task-description") {
-      tokens.push("stage-task-description");
+    if (input.stage === "desc") {
+      tokens.push("stage-desc");
     } else if (input.stage === "plan") {
       tokens.push("stage-plan");
     } else {
@@ -132,7 +132,7 @@ export function buildStageContextValue(input: StageContextInput): string {
   // Lint state
   if (
     input.hasLintPayload &&
-    (input.stage === "impl-low-review" || input.stage === "completed") &&
+    (input.stage === "impl-low-review" || input.stage === "publish") &&
     input.status === "current"
   ) {
     tokens.push("lint-known");
