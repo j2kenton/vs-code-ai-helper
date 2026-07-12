@@ -10,9 +10,22 @@ export interface AtomicWriteError extends Error {
   operation: string;
   targetPath: string;
   tempPath?: string;
-  cause?: any;
+  cause?: unknown;
   retryable: boolean;
   durableTargetUnchanged: boolean;
+}
+
+function getErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function getErrorCode(error: unknown): string | undefined {
+  if (typeof error !== "object" || error === null || !("code" in error)) {
+    return undefined;
+  }
+
+  const code = (error as { code?: unknown }).code;
+  return typeof code === "string" ? code : undefined;
 }
 
 /**
@@ -30,7 +43,7 @@ export async function writeAtomic(targetUri: vscode.Uri, content: string): Promi
   if (path.basename(targetPath) === "task-progress.json") {
     try { validatePersistedTaskProgress(JSON.parse(content)); }
     catch (error) {
-      const failure = new Error(`Invalid task-progress.json: ${(error as Error).message}`) as AtomicWriteError;
+      const failure = new Error(`Invalid task-progress.json: ${getErrorMessage(error)}`) as AtomicWriteError;
       failure.operation = "validate-input"; failure.targetPath = targetPath;
       failure.cause = error; failure.retryable = false; failure.durableTargetUnchanged = true;
       throw failure;
@@ -61,8 +74,8 @@ export async function writeAtomic(targetUri: vscode.Uri, content: string): Promi
       if (fs.existsSync(tempPath)) {
         await fs.promises.unlink(tempPath);
       }
-    } catch {}
-    const error = new Error(`Failed to write temp file: ${(err as Error).message}`) as AtomicWriteError;
+    } catch { /* best-effort temp cleanup */ }
+    const error = new Error(`Failed to write temp file: ${getErrorMessage(err)}`) as AtomicWriteError;
     error.operation = "writeTemp";
     error.targetPath = targetPath;
     error.tempPath = tempPath;
@@ -74,7 +87,7 @@ export async function writeAtomic(targetUri: vscode.Uri, content: string): Promi
 
   // Rename temp file to target
   let renameSuccess = false;
-  let lastError: any = null;
+  let lastError: unknown;
 
   if (process.platform === "win32") {
     const delays = [20, 60, 120, 240, 480]; // sum = 920ms
@@ -83,9 +96,9 @@ export async function writeAtomic(targetUri: vscode.Uri, content: string): Promi
         await fs.promises.rename(tempPath, targetPath);
         renameSuccess = true;
         break;
-      } catch (err: any) {
+      } catch (err) {
         lastError = err;
-        const code = err.code;
+        const code = getErrorCode(err);
         const isTransient = code === "EBUSY" || code === "EPERM" || code === "EACCES";
         if (isTransient && i < delays.length) {
           await new Promise((resolve) => setTimeout(resolve, delays[i]));
@@ -108,8 +121,8 @@ export async function writeAtomic(targetUri: vscode.Uri, content: string): Promi
       if (fs.existsSync(tempPath)) {
         await fs.promises.unlink(tempPath);
       }
-    } catch {}
-    const error = new Error(`Failed to rename temp file to target: ${(lastError as Error).message}`) as AtomicWriteError;
+    } catch { /* best-effort temp cleanup */ }
+    const error = new Error(`Failed to rename temp file to target: ${getErrorMessage(lastError)}`) as AtomicWriteError;
     error.operation = "rename";
     error.targetPath = targetPath;
     error.tempPath = tempPath;
@@ -133,7 +146,7 @@ export async function writeAtomic(targetUri: vscode.Uri, content: string): Promi
       throw new Error("Content mismatch after write");
     }
   } catch (err) {
-    const error = new Error(`Failed to validate target file after write: ${(err as Error).message}`) as AtomicWriteError;
+    const error = new Error(`Failed to validate target file after write: ${getErrorMessage(err)}`) as AtomicWriteError;
     error.operation = "validate";
     error.targetPath = targetPath;
     error.cause = err;
@@ -172,11 +185,11 @@ export async function cleanupOrphanedTempFiles(taskRootDirs: string[]): Promise<
               // lease. A stale mtime alone is not proof of orphaning.
               const leasePath = path.join(taskDirPath, ".ensemble-task.lock");
               let liveLease = false;
-              try { liveLease = (JSON.parse(await fs.promises.readFile(leasePath, "utf8")) as { expiresAt?: number }).expiresAt! > now; } catch {}
+              try { liveLease = (JSON.parse(await fs.promises.readFile(leasePath, "utf8")) as { expiresAt?: number }).expiresAt! > now; } catch { /* missing or invalid leases are not live */ }
               if (age > staleTempAge && !liveLease) {
                 try {
                   await fs.promises.unlink(filePath);
-                } catch {}
+                } catch { /* best-effort temp cleanup */ }
               }
             }
           }
@@ -187,7 +200,7 @@ export async function cleanupOrphanedTempFiles(taskRootDirs: string[]): Promise<
           if (age > staleTempAge) {
             try {
               await fs.promises.unlink(filePath);
-            } catch {}
+            } catch { /* best-effort temp cleanup */ }
           }
         }
       }
