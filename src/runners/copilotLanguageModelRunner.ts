@@ -1,5 +1,8 @@
 import * as vscode from "vscode";
-import { parseCopilotModelSelection } from "./providers";
+import {
+  buildCopilotRequestOptions,
+  resolveCopilotModel,
+} from "./copilotModelResolution";
 import {
   AgentAvailability,
   AgentRunner,
@@ -59,35 +62,28 @@ export class CopilotLanguageModelRunner implements AgentRunner {
       });
     }
 
-    const parsedModel = parseCopilotModelSelection(request.modelId);
-    const requestedModel = parsedModel.model
-      ? models.find((candidate) => candidate.id === parsedModel.model)
-      : undefined;
-    const autoModel = models.find(
-      (candidate) =>
-        candidate.id.toLowerCase() === "auto" ||
-        candidate.name.toLowerCase() === "auto"
-    );
-    const model = requestedModel ?? autoModel ?? models[0];
-    if (!model) {
-      return {
+    if (models.length === 0) {
+      return classifyFailure<AgentRunResult>({
         runnerId: this.id,
         status: "failed",
         errorMessage:
           "No Copilot language models are available. Sign in to GitHub Copilot in VS Code and try again.",
-      };
+      });
     }
 
+    const resolved = resolveCopilotModel(models, request.modelId);
+    if (!resolved.ok) {
+      return {
+        runnerId: this.id,
+        status: "failed",
+        failureKind: resolved.failureKind,
+        errorMessage: resolved.errorMessage,
+      };
+    }
+    const { model } = resolved;
+
     const messages = [vscode.LanguageModelChatMessage.User(request.prompt)];
-    const modelOptions: Record<string, unknown> = {};
-    if (parsedModel.reasoningEffort) {
-      modelOptions.model_reasoning_effort = parsedModel.reasoningEffort;
-    }
-    if (parsedModel.contextWindow) {
-      modelOptions.model_context_window = parsedModel.contextWindow;
-    }
-    const requestOptions: vscode.LanguageModelChatRequestOptions =
-      Object.keys(modelOptions).length > 0 ? { modelOptions } : {};
+    const requestOptions = buildCopilotRequestOptions(resolved.parsedModel);
 
     try {
       const response = await model.sendRequest(messages, requestOptions, token);
@@ -104,17 +100,12 @@ export class CopilotLanguageModelRunner implements AgentRunner {
       const signedOutput = withAttribution(output, "GitHub Copilot", model.name);
       await writeTextFile(request.outputFile, signedOutput);
 
-      const fallbackNote =
-        request.modelId && !requestedModel
-          ? ` Requested model ${request.modelId} was unavailable, so ${model.name} was used instead.`
-          : "";
-
       return {
         runnerId: this.id,
         status: "completed",
         outputFile: request.outputFile,
         modelId: model.id,
-        summary: `Generated ${output.length} characters using ${model.name}.${fallbackNote}`,
+        summary: `Generated ${output.length} characters using ${model.name}.`,
       };
     } catch (error) {
       if (

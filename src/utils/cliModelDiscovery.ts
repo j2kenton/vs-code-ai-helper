@@ -35,6 +35,13 @@ function parseJsonModels(value: unknown): DiscoveredCliModel[] {
   }
 
   const record = value as Record<string, unknown>;
+  for (const key of ["models", "data", "items"]) {
+    const nestedModels = parseJsonModels(record[key]);
+    if (nestedModels.length > 0) {
+      return uniqueByModel(nestedModels);
+    }
+  }
+
   const modelValue =
     typeof record.id === "string"
       ? record.id
@@ -48,13 +55,18 @@ function parseJsonModels(value: unknown): DiscoveredCliModel[] {
   }
 
   const labelValue =
-    typeof record.name === "string" && record.name.trim().length > 0
-      ? record.name.trim()
-      : modelValue.trim();
+    typeof record.displayName === "string" &&
+    record.displayName.trim().length > 0
+      ? record.displayName.trim()
+      : typeof record.label === "string" && record.label.trim().length > 0
+        ? record.label.trim()
+        : typeof record.name === "string" && record.name.trim().length > 0
+          ? record.name.trim()
+          : modelValue.trim();
   return [{ model: modelValue.trim(), name: labelValue }];
 }
 
-export function parseAgyModelsOutput(output: string): DiscoveredCliModel[] {
+function parseModelListOutput(output: string): DiscoveredCliModel[] {
   const trimmed = output.trim();
   if (trimmed.length === 0) {
     return [];
@@ -105,20 +117,24 @@ export function parseAgyModelsOutput(output: string): DiscoveredCliModel[] {
   return uniqueByModel(result);
 }
 
-export async function discoverAgyModels(command: string): Promise<
-  DiscoveredCliModel[]
-> {
-  return discoverAgyModelsWithTimeout(command, 30_000);
+export function parseAgyModelsOutput(output: string): DiscoveredCliModel[] {
+  return parseModelListOutput(output);
 }
 
-export async function discoverAgyModelsWithTimeout(
+export function parseKiroModelsOutput(output: string): DiscoveredCliModel[] {
+  return parseModelListOutput(output);
+}
+
+function runCliModelDiscovery(
   command: string,
-  timeoutMs: number
+  args: readonly string[],
+  timeoutMs: number,
+  parse: (output: string) => DiscoveredCliModel[]
 ): Promise<DiscoveredCliModel[]> {
   return new Promise((resolve) => {
     cp.execFile(
       command,
-      ["models"],
+      args as string[],
       {
         windowsHide: true,
         timeout: timeoutMs,
@@ -126,7 +142,7 @@ export async function discoverAgyModelsWithTimeout(
         env: process.env,
       },
       (error, stdout) => {
-        const parsed = parseAgyModelsOutput(stdout);
+        const parsed = parse(stdout);
         if (parsed.length > 0) {
           resolve(parsed);
           return;
@@ -139,4 +155,35 @@ export async function discoverAgyModelsWithTimeout(
       }
     );
   });
+}
+
+export async function discoverAgyModels(command: string): Promise<
+  DiscoveredCliModel[]
+> {
+  return discoverAgyModelsWithTimeout(command, 30_000);
+}
+
+export async function discoverAgyModelsWithTimeout(
+  command: string,
+  timeoutMs: number
+): Promise<DiscoveredCliModel[]> {
+  return runCliModelDiscovery(command, ["models"], timeoutMs, parseAgyModelsOutput);
+}
+
+export async function discoverKiroModels(command: string): Promise<
+  DiscoveredCliModel[]
+> {
+  return discoverKiroModelsWithTimeout(command, 30_000);
+}
+
+export async function discoverKiroModelsWithTimeout(
+  command: string,
+  timeoutMs: number
+): Promise<DiscoveredCliModel[]> {
+  return runCliModelDiscovery(
+    command,
+    ["chat", "--no-interactive", "--list-models", "--format", "json"],
+    timeoutMs,
+    parseKiroModelsOutput
+  );
 }

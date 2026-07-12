@@ -7,9 +7,26 @@ import {
   getCliProvider,
   parseCopilotModelSelection,
   parseCodexModelSelection,
+  parseModelSelection,
+  type CliProviderDefinition,
 } from "../runners/providers";
 
 void describe("provider CLI contracts", () => {
+  function modelArgValue(args: readonly string[]): string | undefined {
+    const index = args.indexOf("--model");
+    return index >= 0 ? args[index + 1] : undefined;
+  }
+
+  function buildTextArgs(
+    provider: CliProviderDefinition,
+    model: string | undefined
+  ): string[] {
+    return provider.buildArgs("text", model, "/tmp/last-message.md", {
+      cwd: "/workspace/project",
+      promptFile: "/tmp/prompt.txt",
+    });
+  }
+
   void it("Kiro uses stdin prompt transport for --no-interactive", () => {
     const kiro = getCliProvider("kiro-cli");
     assert.ok(kiro, "expected kiro-cli provider definition");
@@ -23,14 +40,16 @@ void describe("provider CLI contracts", () => {
       "chat",
       "--no-interactive",
       "--trust-tools",
-      "read,grep",
+      "fs_read,grep,glob",
     ]);
 
-    const editArgs = kiro.buildArgs("edit", undefined, undefined);
+    const editArgs = kiro.buildArgs("edit", "claude-opus-4.6", undefined);
     assert.deepStrictEqual(editArgs, [
       "chat",
       "--no-interactive",
       "--trust-all-tools",
+      "--model",
+      "claude-opus-4.6",
     ]);
   });
 
@@ -195,6 +214,68 @@ void describe("provider CLI contracts", () => {
       "--max-thinking-tokens",
       "8192",
     ]);
+  });
+
+  void it("provider-qualified CLI selections pass only native model names to buildArgs", () => {
+    const cases: Array<{
+      storedId: string;
+      expectedProvider: string;
+      expectedModelArg: string | undefined;
+    }> = [
+      {
+        storedId: "claude-cli:opus@max",
+        expectedProvider: "claude-cli",
+        expectedModelArg: "opus",
+      },
+      {
+        storedId: "codex-cli:gpt-5.6-terra@ultra+fast",
+        expectedProvider: "codex-cli",
+        expectedModelArg: "gpt-5.6-terra",
+      },
+      {
+        storedId: "gemini-cli:gemini-2.5-pro",
+        expectedProvider: "gemini-cli",
+        expectedModelArg: "gemini-2.5-pro",
+      },
+      {
+        storedId: "antigravity-cli:gpt-oss-120b-medium",
+        expectedProvider: "antigravity-cli",
+        expectedModelArg: "gpt-oss-120b-medium",
+      },
+      {
+        storedId: "kiro-cli:claude-opus-4.6",
+        expectedProvider: "kiro-cli",
+        expectedModelArg: "claude-opus-4.6",
+      },
+      {
+        storedId: "antigravity-cli:default",
+        expectedProvider: "antigravity-cli",
+        expectedModelArg: undefined,
+      },
+      {
+        storedId: "kiro-cli:default",
+        expectedProvider: "kiro-cli",
+        expectedModelArg: undefined,
+      },
+    ];
+
+    for (const testCase of cases) {
+      const parsed = parseModelSelection(testCase.storedId);
+      assert.strictEqual(parsed.provider, testCase.expectedProvider);
+      const provider = getCliProvider(parsed.provider);
+      assert.ok(provider, `expected ${parsed.provider} provider definition`);
+
+      const args = buildTextArgs(provider, parsed.model);
+      assert.strictEqual(
+        modelArgValue(args),
+        testCase.expectedModelArg,
+        testCase.storedId
+      );
+      assert.ok(
+        !args.some((arg) => arg.startsWith(`${testCase.expectedProvider}:`)),
+        `${testCase.storedId} leaked its storage prefix into CLI args`
+      );
+    }
   });
 
   void it("Kiro hints mention KIRO_API_KEY requirement", () => {

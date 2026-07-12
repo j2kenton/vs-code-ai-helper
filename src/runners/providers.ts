@@ -16,6 +16,11 @@
  */
 
 import { isCodexDangerouslyBypassSandboxForImplementationEnabled } from "../config/settings";
+import {
+  discoverAgyModels,
+  discoverKiroModels,
+  type DiscoveredCliModel,
+} from "../utils/cliModelDiscovery";
 
 export type CliProviderId =
   | "claude-cli"
@@ -109,6 +114,13 @@ export interface CliProviderDefinition {
    * Absent for providers with no such toggle.
    */
   dangerousBypass?: CliDangerousBypass;
+  /**
+   * Optional live model discovery: queries the CLI itself for its current
+   * model list. Absent for providers whose model list is static (only the
+   * seeded `models` field / SEEDED_CLI_MODELS apply). Callers check
+   * `discoverModels !== undefined` generically — no provider-id branching.
+   */
+  discoverModels?: (command: string) => Promise<readonly DiscoveredCliModel[]>;
   /**
    * Build the CLI arguments. "text" mode must keep the
    * CLI read-only; "edit" mode may let it modify files in the working
@@ -395,6 +407,7 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     // temporary cached entries and still prefers live `agy models` results
     // when available.
     models: [{ model: undefined, name: "Antigravity (CLI default)" }],
+    discoverModels: discoverAgyModels,
     usesLastMessageFile: false,
     // `agy --print` takes the prompt as its flag value, not stdin — the CLI
     // has no stdin-prompt mode at all: a bare `--print` with the prompt
@@ -435,17 +448,20 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     promptTransport: "stdin",
     useShell: false,
     // Use stdin transport so large context packs are not constrained by
-    // command-line argument limits.
-    // Keep the provider-level fallback to CLI default only. Temporary picker
-    // options are seeded separately until live loading is fixed.
+    // command-line argument limits. The provider definition keeps only the
+    // CLI default; seeded and discovered picker choices live in modelSelection.
     models: [{ model: undefined, name: "Kiro (CLI default)" }],
+    discoverModels: discoverKiroModels,
     usesLastMessageFile: false,
-    buildArgs(mode): string[] {
+    buildArgs(mode, model): string[] {
       const args = ["chat", "--no-interactive"];
       if (mode === "edit") {
         args.push("--trust-all-tools");
       } else {
-        args.push("--trust-tools", "read,grep");
+        args.push("--trust-tools", "fs_read,grep,glob");
+      }
+      if (model) {
+        args.push("--model", model);
       }
       return args;
     },

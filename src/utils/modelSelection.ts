@@ -14,10 +14,7 @@ import {
   toQualifiedModelId,
 } from "../runners/providers";
 import { AI_MODEL_STAGES, REVIEW_STAGES, TaskStage } from "../types/taskProgress";
-import {
-  discoverAgyModels,
-  type DiscoveredCliModel,
-} from "./cliModelDiscovery";
+import { type DiscoveredCliModel } from "./cliModelDiscovery";
 
 export const TASK_MODEL_CONFIG_FILENAME = "task-models.json";
 
@@ -668,7 +665,7 @@ function queueCliModelRefresh(
 
     const discovered = resolveRefreshedCliModels(
       cached?.models ?? [],
-      await discoverAgyModels(resolvedCommand)
+      def.discoverModels ? await def.discoverModels(resolvedCommand) : []
     );
     cliModelCache.set(def.id, {
       models: discovered,
@@ -727,7 +724,7 @@ export const __testOnly = {
 export async function warmCliModelCache(): Promise<void> {
   const refreshes: Promise<readonly DiscoveredCliModel[]>[] = [];
   for (const def of CLI_PROVIDERS) {
-    if (def.id === "antigravity-cli") {
+    if (def.discoverModels) {
       refreshes.push(queueCliModelRefresh(def));
     }
   }

@@ -711,6 +711,55 @@ void describe("getAvailableModels", () => {
     }
   });
 
+  void it("prefers discovered Kiro models over seeded fallback entries", async () => {
+    __testOnly.resetCliModelCache();
+    __testOnly.setModelSelectionTestOverrides({
+      getAvailableCopilotModels() {
+        return Promise.resolve([]);
+      },
+      cliCommandExists(command) {
+        return Promise.resolve(command === "kiro-cli");
+      },
+      getDiscoveredCliModels(def) {
+        if (def.id !== "kiro-cli") {
+          return Promise.resolve([]);
+        }
+        return Promise.resolve([
+          { model: "claude-opus-4.6", name: "Claude Opus 4.6" },
+          { model: "claude-sonnet-4.5", name: "Claude Sonnet 4.5" },
+          { model: "claude-opus-4.6", name: "Duplicate should be ignored" },
+        ]);
+      },
+    });
+
+    try {
+      assert.deepStrictEqual(
+        providerModels(await getAvailableModels(), "Kiro CLI (subscription CLI)"),
+        [
+          {
+            id: "kiro-cli:default",
+            name: "Kiro (CLI default)",
+            providerLabel: "Kiro CLI (subscription CLI)",
+          },
+          {
+            id: "kiro-cli:claude-opus-4.6",
+            name: "Claude Opus 4.6",
+            providerLabel: "Kiro CLI (subscription CLI)",
+          },
+          {
+            id: "kiro-cli:claude-sonnet-4.5",
+            name: "Claude Sonnet 4.5",
+            providerLabel: "Kiro CLI (subscription CLI)",
+          },
+        ]
+      );
+    } finally {
+      __testOnly.clearModelSelectionTestOverrides();
+      __testOnly.resetCliModelCache();
+      __testOnly.restoreSeededCliModelCache();
+    }
+  });
+
   void it("prefers discovered Antigravity models over stale fallback entries", async () => {
     __testOnly.resetCliModelCache();
     __testOnly.setModelSelectionTestOverrides({

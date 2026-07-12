@@ -124,7 +124,7 @@ export function formatQuotaStatus(observation: QuotaObservation | undefined): st
   return observation.state === "exhausted"
     ? `Quota exhausted as of ${time}${percent}`
     : observation.state === "unavailable"
-      ? `Temporarily unavailable as of ${time}`
+      ? `Unavailable as of ${time}`
     : `OK as of ${time}${percent}`;
 }
 

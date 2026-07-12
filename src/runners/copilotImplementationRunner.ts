@@ -3,7 +3,10 @@ import * as nodePath from "path";
 import * as nodeFs from "fs";
 import { deletePath, readTextIfExists, writeTextFile } from "../utils/fileUtils";
 import { AgentAvailability } from "../types/agentRunner";
-import { parseCopilotModelSelection } from "./providers";
+import {
+  buildCopilotRequestOptions,
+  resolveCopilotModel,
+} from "./copilotModelResolution";
 import { sanitizeRelativePath } from "../utils/pathSafety";
 import { classifyFailure } from "../utils/quota";
 import {
@@ -505,52 +508,27 @@ export async function runImplementationWithCopilot(options: {
     });
   }
 
-  const parsedModel = parseCopilotModelSelection(modelId);
-  let model: vscode.LanguageModelChat | undefined;
-
-  if (parsedModel.model) {
-    // A specific model was requested — use it or fail explicitly.
-    // Silently falling back to `auto` when the configured model is
-    // unavailable contradicts the "no implicit/default coding agent"
-    // requirement: the user must always know which model is being used.
-    model = models.find((m) => m.id === parsedModel.model);
-    if (!model) {
-      return classifyFailure<ImplementationRunResult>({
-        status: "failed",
-        filesChanged: [],
-        errorMessage:
-          `The configured Copilot model "${parsedModel.model}" is not available. ` +
-          "Select an available model in Settings, or sign in to GitHub Copilot.",
-      });
-    }
-  } else {
-    // No specific model configured — use the auto model as the default.
-    model = models.find(
-      (m) => m.id.toLowerCase() === "auto" || m.name.toLowerCase() === "auto"
-    );
-    if (!model) {
-      return classifyFailure<ImplementationRunResult>({
-        status: "failed",
-        filesChanged: [],
-        errorMessage: "The configured Copilot model is unavailable. Select an available model in Settings.",
-      });
-    }
+  // A specific model is used or the run fails explicitly. Silently falling
+  // back to `auto` when the configured model is unavailable contradicts the
+  // "no implicit/default coding agent" requirement: the user must always
+  // know which model is being used.
+  const resolved = resolveCopilotModel(models, modelId);
+  if (!resolved.ok) {
+    return {
+      status: "failed",
+      filesChanged: [],
+      failureKind: resolved.failureKind,
+      errorMessage: resolved.errorMessage,
+    };
   }
+  const { model, parsedModel } = resolved;
 
   onProgress(`Using model: ${model.name}`);
 
   const messages: vscode.LanguageModelChatMessage[] = [
     vscode.LanguageModelChatMessage.User(prompt),
   ];
-  const modelOptions: Record<string, unknown> = {};
-  if (parsedModel.reasoningEffort) {
-    modelOptions.model_reasoning_effort = parsedModel.reasoningEffort;
-  }
-  if (parsedModel.contextWindow) {
-    modelOptions.model_context_window = parsedModel.contextWindow;
-  }
-  const requestOptions: vscode.LanguageModelChatRequestOptions =
-    Object.keys(modelOptions).length > 0 ? { modelOptions } : {};
+  const requestOptions = buildCopilotRequestOptions(parsedModel);
 
   let iteration = 0;
   let maxIterations = getMaxImplementationIterations();

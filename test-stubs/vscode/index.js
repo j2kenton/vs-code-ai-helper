@@ -150,6 +150,43 @@ class CancellationError extends Error {
   }
 }
 
+class LanguageModelError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "LanguageModelError";
+  }
+}
+
+const LanguageModelChatMessage = {
+  User(content) {
+    return { role: "user", content };
+  },
+  Assistant(content) {
+    return { role: "assistant", content };
+  },
+};
+
+class LanguageModelTextPart {
+  constructor(value) {
+    this.value = value;
+  }
+}
+
+class LanguageModelToolCallPart {
+  constructor(callId, name, input) {
+    this.callId = callId;
+    this.name = name;
+    this.input = input;
+  }
+}
+
+class LanguageModelToolResultPart {
+  constructor(callId, content) {
+    this.callId = callId;
+    this.content = content;
+  }
+}
+
 /**
  * Minimal StatusBarItem stub. Tracks show/hide calls and stores text so tests
  * can assert on the status bar's visible state without a real VS Code window.
@@ -317,6 +354,11 @@ module.exports = {
   ThemeColor,
   CancellationTokenSource,
   CancellationError,
+  LanguageModelError,
+  LanguageModelChatMessage,
+  LanguageModelTextPart,
+  LanguageModelToolCallPart,
+  LanguageModelToolResultPart,
   EventEmitter,
   workspace,
   window,

@@ -1,6 +1,9 @@
 import * as assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import { EventEmitter } from "node:events";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { describe, it } from "node:test";
 import * as vscode from "vscode";
 import {
@@ -113,9 +116,208 @@ void describe("resolveRunnerForModel", () => {
       settings.restore();
     }
   });
+
+  void it("switches to backup when an explicit Copilot primary model is unavailable", async () => {
+    const metaRoot = fs.mkdtempSync(
+      path.join(os.tmpdir(), "ensemble-runner-fallback-")
+    );
+    const tasksRoot = path.join(metaRoot, "tasks");
+    const taskFolder = path.join(tasksRoot, "task-a");
+    fs.mkdirSync(taskFolder, { recursive: true });
+    const taskFolderUri = vscode.Uri.file(taskFolder);
+    const outputFile = vscode.Uri.file(path.join(taskFolder, "plan.md"));
+    const progressPath = path.join(taskFolder, "task-progress.json");
+    const now = new Date().toISOString();
+    fs.writeFileSync(
+      progressPath,
+      JSON.stringify(
+        {
+          taskFolder: path.basename(taskFolder),
+          currentStage: "plan",
+          status: "active",
+          createdAt: now,
+          updatedAt: now,
+        },
+        null,
+        2
+      ),
+      "utf8"
+    );
+
+    const settings = installModelSettings({
+      plan: {
+        primary: "copilot-gpt-5.6-sol",
+        backup: "auto",
+        fallbackEnabled: true,
+        strategy: "switch-to-backup",
+      },
+    });
+    const lm = (vscode as unknown as {
+      lm: {
+        selectChatModels: () => Promise<vscode.LanguageModelChat[]>;
+      };
+    }).lm;
+    const originalSelectChatModels = lm.selectChatModels;
+    const workspace = vscode.workspace as unknown as {
+      fs: {
+        readFile: (uri: vscode.Uri) => Promise<Uint8Array>;
+        writeFile: (uri: vscode.Uri, bytes: Uint8Array) => Promise<void>;
+      };
+    };
+    const originalReadFile = workspace.fs.readFile;
+    const originalWriteFile = workspace.fs.writeFile;
+
+    workspace.fs.readFile = (uri: vscode.Uri): Promise<Uint8Array> =>
+      fs.promises.readFile(uri.fsPath);
+    workspace.fs.writeFile = (
+      uri: vscode.Uri,
+      bytes: Uint8Array
+    ): Promise<void> => fs.promises.writeFile(uri.fsPath, bytes);
+    lm.selectChatModels = (): Promise<vscode.LanguageModelChat[]> =>
+      Promise.resolve([
+        {
+          id: "auto",
+          name: "Auto",
+          sendRequest: () =>
+            Promise.resolve({
+              text: ["backup output"] as unknown as AsyncIterable<string>,
+            }),
+        } as unknown as vscode.LanguageModelChat,
+      ]);
+
+    try {
+      const { runner } = resolveRunnerForModel(
+        "copilot-gpt-5.6-sol",
+        "plan",
+        taskFolderUri
+      );
+
+      const result = await runner.run(
+        {
+          taskFolderUri,
+          workspaceUri: vscode.Uri.file(taskFolder),
+          stage: "plan",
+          prompt: "Create a plan.",
+          outputFile,
+          modelId: "copilot-gpt-5.6-sol",
+        },
+        new vscode.CancellationTokenSource().token
+      );
+
+      assert.strictEqual(result.status, "completed");
+      assert.strictEqual(result.modelId, "auto");
+      assert.match(fs.readFileSync(outputFile.fsPath, "utf8"), /backup output/);
+      const progress = JSON.parse(fs.readFileSync(progressPath, "utf8")) as {
+        fallbackActive?: Partial<Record<string, boolean>>;
+      };
+      assert.strictEqual(progress.fallbackActive?.plan, true);
+    } finally {
+      settings.restore();
+      lm.selectChatModels = originalSelectChatModels;
+      workspace.fs.readFile = originalReadFile;
+      workspace.fs.writeFile = originalWriteFile;
+    }
+  });
 });
 
 void describe("runImplementationForModel", () => {
+  void it("switches implementation to backup when an explicit Copilot primary model is unavailable", async () => {
+    const metaRoot = fs.mkdtempSync(
+      path.join(os.tmpdir(), "ensemble-impl-fallback-")
+    );
+    const tasksRoot = path.join(metaRoot, "tasks");
+    const taskFolder = path.join(tasksRoot, "task-a");
+    fs.mkdirSync(taskFolder, { recursive: true });
+    const taskFolderUri = vscode.Uri.file(taskFolder);
+    const progressPath = path.join(taskFolder, "task-progress.json");
+    const now = new Date().toISOString();
+    fs.writeFileSync(
+      progressPath,
+      JSON.stringify(
+        {
+          taskFolder: path.basename(taskFolder),
+          currentStage: "impl",
+          status: "active",
+          createdAt: now,
+          updatedAt: now,
+        },
+        null,
+        2
+      ),
+      "utf8"
+    );
+
+    const settings = installModelSettings({
+      impl: {
+        primary: "copilot-gpt-5.6-sol",
+        backup: "auto",
+        fallbackEnabled: true,
+        strategy: "switch-to-backup",
+      },
+    });
+    const lm = (vscode as unknown as {
+      lm: {
+        selectChatModels: () => Promise<vscode.LanguageModelChat[]>;
+      };
+    }).lm;
+    const originalSelectChatModels = lm.selectChatModels;
+    const workspace = vscode.workspace as unknown as {
+      fs: {
+        readFile: (uri: vscode.Uri) => Promise<Uint8Array>;
+        writeFile: (uri: vscode.Uri, bytes: Uint8Array) => Promise<void>;
+      };
+    };
+    const originalReadFile = workspace.fs.readFile;
+    const originalWriteFile = workspace.fs.writeFile;
+
+    function* responseStream(): Iterable<vscode.LanguageModelTextPart> {
+      yield new vscode.LanguageModelTextPart("backup implementation");
+    }
+
+    workspace.fs.readFile = (uri: vscode.Uri): Promise<Uint8Array> =>
+      fs.promises.readFile(uri.fsPath);
+    workspace.fs.writeFile = (
+      uri: vscode.Uri,
+      bytes: Uint8Array
+    ): Promise<void> => fs.promises.writeFile(uri.fsPath, bytes);
+    lm.selectChatModels = (): Promise<vscode.LanguageModelChat[]> =>
+      Promise.resolve([
+        {
+          id: "auto",
+          name: "Auto",
+          sendRequest: () =>
+            Promise.resolve({
+              stream: responseStream(),
+            }),
+        } as unknown as vscode.LanguageModelChat,
+      ]);
+
+    try {
+      const result = await runImplementationForModel({
+        modelId: "copilot-gpt-5.6-sol",
+        prompt: "Implement the requested change.",
+        workspaceUri: vscode.Uri.file(taskFolder),
+        token: new vscode.CancellationTokenSource().token,
+        onProgress: () => undefined,
+        stage: "impl",
+        taskFolderUri,
+      });
+
+      assert.strictEqual(result.runnerId, "copilot-lm");
+      assert.strictEqual(result.status, "completed");
+      assert.strictEqual(result.summary, "backup implementation");
+      const progress = JSON.parse(fs.readFileSync(progressPath, "utf8")) as {
+        fallbackActive?: Partial<Record<string, boolean>>;
+      };
+      assert.strictEqual(progress.fallbackActive?.impl, true);
+    } finally {
+      settings.restore();
+      lm.selectChatModels = originalSelectChatModels;
+      workspace.fs.readFile = originalReadFile;
+      workspace.fs.writeFile = originalWriteFile;
+    }
+  });
+
   void it("keeps provider-qualified CLI model IDs on the CLI implementation path", async () => {
     const originalSpawn = childProcess.spawn;
     const spawnCalls: Array<{ command: string; args: readonly string[] }> = [];
