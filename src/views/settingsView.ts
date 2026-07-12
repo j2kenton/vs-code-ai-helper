@@ -187,14 +187,54 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           }
           select, input[type="text"] {
             width: 100%;
-            background-color: var(--vscode-settings-selectBackground);
-            color: var(--vscode-settings-selectForeground);
-            border: 1px solid var(--vscode-settings-selectBorder);
+            background-color: var(--vscode-input-background, var(--vscode-editor-background));
+            color: var(--vscode-input-foreground, var(--vscode-foreground));
+            border: 1px solid var(--vscode-input-border, var(--vscode-widget-border));
             padding: 4px;
             border-radius: 2px;
+            box-sizing: border-box;
           }
           select:focus, input[type="text"]:focus {
             outline: 1px solid var(--vscode-focusBorder);
+          }
+          option {
+            background-color: var(--vscode-dropdown-background, var(--vscode-editor-background));
+            color: var(--vscode-dropdown-foreground, var(--vscode-foreground));
+          }
+          .model-combobox {
+            position: relative;
+          }
+          .model-combo-input[disabled] {
+            opacity: 0.55;
+            cursor: not-allowed;
+          }
+          .model-options {
+            position: absolute;
+            left: 0;
+            right: 0;
+            top: calc(100% + 2px);
+            z-index: 10;
+            max-height: 220px;
+            overflow-y: auto;
+            background-color: var(--vscode-dropdown-background, var(--vscode-editorWidget-background, var(--vscode-editor-background)));
+            color: var(--vscode-dropdown-foreground, var(--vscode-foreground));
+            border: 1px solid var(--vscode-dropdown-border, var(--vscode-widget-border));
+            box-shadow: 0 2px 8px var(--vscode-widget-shadow, rgba(0, 0, 0, 0.35));
+          }
+          .model-option {
+            padding: 5px 7px;
+            cursor: pointer;
+            white-space: normal;
+            overflow-wrap: anywhere;
+          }
+          .model-option[aria-selected="true"],
+          .model-option:hover {
+            background-color: var(--vscode-list-hoverBackground, var(--vscode-list-activeSelectionBackground, rgba(127, 127, 127, 0.25)));
+            color: var(--vscode-list-hoverForeground, var(--vscode-list-activeSelectionForeground, var(--vscode-foreground)));
+          }
+          .model-option.empty {
+            color: var(--vscode-descriptionForeground);
+            cursor: default;
           }
           .quota-text {
             font-size: 0.85em;
@@ -286,12 +326,188 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                 row.scrollIntoView({ behavior: 'smooth', block: 'center' });
                 row.classList.add('highlighted');
                 setTimeout(() => row.classList.remove('highlighted'), 3000);
-                const control = message.control === 'backup' ? 'backup-' : 'primary-';
-                const select = document.getElementById(control + message.stage);
-                if (select) select.focus();
+                const control = message.control === 'backup' ? 'backup' : 'primary';
+                const input = document.getElementById(control + '-input-' + message.stage);
+                if (input) input.focus();
               }
             }
           });
+
+          function escapeHtml(value) {
+            return String(value ?? '').replace(/[&<>"']/g, ch => ({
+              '&': '&amp;',
+              '<': '&lt;',
+              '>': '&gt;',
+              '"': '&quot;',
+              "'": '&#39;'
+            })[ch]);
+          }
+
+          function modelLabel(model) {
+            return model ? model.name + ' (' + model.providerLabel + ')' : '';
+          }
+
+          function findModelById(id) {
+            return availableModels.find(model => model.id === id);
+          }
+
+          function modelComboboxHtml(kind, stage, selectedId, disabled) {
+            const selectedModel = findModelById(selectedId);
+            const selectedLabel = selectedModel ? modelLabel(selectedModel) : '';
+            const disabledAttr = disabled ? 'disabled' : '';
+            return \`
+              <div class="model-combobox" data-kind="\${kind}" data-stage="\${stage}">
+                <input type="hidden" id="\${kind}-\${stage}" value="\${escapeHtml(selectedId || '')}">
+                <input
+                  type="text"
+                  id="\${kind}-input-\${stage}"
+                  class="model-combo-input"
+                  value="\${escapeHtml(selectedLabel)}"
+                  placeholder="Search models..."
+                  role="combobox"
+                  aria-autocomplete="list"
+                  aria-expanded="false"
+                  aria-controls="\${kind}-list-\${stage}"
+                  \${disabledAttr}
+                >
+                <div id="\${kind}-list-\${stage}" class="model-options" role="listbox" hidden></div>
+              </div>
+            \`;
+          }
+
+          function setupModelCombobox(row, kind, stage) {
+            const hidden = row.querySelector('#' + kind + '-' + stage);
+            const input = row.querySelector('#' + kind + '-input-' + stage);
+            const list = row.querySelector('#' + kind + '-list-' + stage);
+            if (!hidden || !input || !list) {
+              return;
+            }
+
+            let activeIndex = -1;
+
+            function getChoices(query) {
+              const normalized = query.trim().toLowerCase();
+              const choices = [{ id: '', label: '(None)', searchable: 'none' }].concat(
+                availableModels.map(model => ({
+                  id: model.id,
+                  label: modelLabel(model),
+                  searchable: [model.name, model.providerLabel, model.id].join(' ').toLowerCase()
+                }))
+              );
+              if (!normalized) {
+                return choices;
+              }
+              return choices.filter(choice =>
+                choice.label.toLowerCase().includes(normalized) ||
+                choice.searchable.includes(normalized)
+              );
+            }
+
+            function closeList() {
+              list.hidden = true;
+              input.setAttribute('aria-expanded', 'false');
+              activeIndex = -1;
+            }
+
+            function setActiveOption(options, index) {
+              options.forEach((option, optionIndex) => {
+                option.setAttribute('aria-selected', optionIndex === index ? 'true' : 'false');
+              });
+              const active = options[index];
+              if (active) {
+                active.scrollIntoView({ block: 'nearest' });
+              }
+            }
+
+            function selectValue(id, label) {
+              hidden.value = id;
+              input.value = id ? label : '';
+              closeList();
+            }
+
+            function renderOptions() {
+              const choices = getChoices(input.value);
+              if (choices.length === 0) {
+                list.innerHTML = '<div class="model-option empty">No models found</div>';
+                list.hidden = false;
+                input.setAttribute('aria-expanded', 'true');
+                return;
+              }
+
+              list.innerHTML = choices.map((choice, index) =>
+                '<div class="model-option" role="option" aria-selected="' + (index === 0 ? 'true' : 'false') +
+                '" data-id="' + escapeHtml(choice.id) + '" data-label="' + escapeHtml(choice.label) + '">' +
+                escapeHtml(choice.label) +
+                '</div>'
+              ).join('');
+              activeIndex = 0;
+              list.hidden = false;
+              input.setAttribute('aria-expanded', 'true');
+            }
+
+            input.addEventListener('input', () => {
+              hidden.value = '';
+              renderOptions();
+            });
+
+            input.addEventListener('focus', () => {
+              renderOptions();
+            });
+
+            input.addEventListener('keydown', event => {
+              if (event.key === 'Escape') {
+                closeList();
+                return;
+              }
+
+              const options = Array.from(list.querySelectorAll('.model-option:not(.empty)'));
+              if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+                event.preventDefault();
+                if (list.hidden) {
+                  renderOptions();
+                  return;
+                }
+                if (options.length === 0) {
+                  return;
+                }
+                activeIndex = event.key === 'ArrowDown'
+                  ? Math.min(activeIndex + 1, options.length - 1)
+                  : Math.max(activeIndex - 1, 0);
+                setActiveOption(options, activeIndex);
+              } else if (event.key === 'Enter' && !list.hidden) {
+                const active = options[activeIndex];
+                if (active) {
+                  event.preventDefault();
+                  selectValue(active.dataset.id || '', active.dataset.label || '');
+                }
+              }
+            });
+
+            list.addEventListener('mousedown', event => {
+              const target = event.target instanceof Element ? event.target : event.target.parentElement;
+              const option = target ? target.closest('.model-option:not(.empty)') : undefined;
+              if (!option) {
+                return;
+              }
+              event.preventDefault();
+              selectValue(option.dataset.id || '', option.dataset.label || '');
+            });
+
+            input.addEventListener('blur', () => {
+              setTimeout(() => {
+                const typed = input.value.trim().toLowerCase();
+                const exact = availableModels.find(model =>
+                  modelLabel(model).toLowerCase() === typed ||
+                  model.id.toLowerCase() === typed
+                );
+                if (exact) {
+                  selectValue(exact.id, modelLabel(exact));
+                } else {
+                  closeList();
+                }
+              }, 120);
+            });
+          }
 
           function renderTable() {
             const tbody = document.getElementById('stages-tbody');
@@ -312,20 +528,6 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               const quotaText = \`<span class="quota-text tooltip" title="Session-observed usage status">\${primaryQuotaStatus}</span>\`;
               const backupQuotaText = \`<span class="quota-text tooltip" title="Session-observed usage status">\${backupQuotaStatus}</span>\`;
 
-              // Dropdown for primary model
-              let primaryOptions = '<option value="">(None)</option>';
-              availableModels.forEach(m => {
-                const selected = setting.primary === m.id ? 'selected' : '';
-                primaryOptions += \`<option value="\${m.id}" \${selected}>\${m.name} (\${m.providerLabel})</option>\`;
-              });
-
-              // Dropdown for backup model
-              let backupOptions = '<option value="">(None)</option>';
-              availableModels.forEach(m => {
-                const selected = setting.backup === m.id ? 'selected' : '';
-                backupOptions += \`<option value="\${m.id}" \${selected}>\${m.name} (\${m.providerLabel})</option>\`;
-              });
-
               const fallbackChecked = setting.fallbackEnabled ? 'checked' : '';
               const backupDisabled = setting.fallbackEnabled ? '' : 'disabled';
 
@@ -333,8 +535,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                 <td style="font-weight: bold; width: 35%;">\${stageDisplayNames[stage] || stage}</td>
                 <td>
                   <div style="margin-bottom: 8px;">
-                    <label for="primary-\${stage}" style="font-size: 0.9em; display:block; margin-bottom: 2px;">Primary Model:</label>
-                    <select id="primary-\${stage}">\${primaryOptions}</select>
+                    <label for="primary-input-\${stage}" style="font-size: 0.9em; display:block; margin-bottom: 2px;">Primary Model:</label>
+                    \${modelComboboxHtml('primary', stage, setting.primary || '', false)}
                     \${quotaText}
                   </div>
                   <div style="margin-bottom: 8px;">
@@ -342,8 +544,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                     <label for="enable-fallback-\${stage}">Use Backup Model</label>
                   </div>
                   <div style="margin-bottom: 8px;">
-                    <label for="backup-\${stage}" style="font-size: 0.9em; display:block; margin-bottom: 2px;">Backup Model:</label>
-                    <select id="backup-\${stage}" \${backupDisabled}>\${backupOptions}</select>
+                    <label for="backup-input-\${stage}" style="font-size: 0.9em; display:block; margin-bottom: 2px;">Backup Model:</label>
+                    \${modelComboboxHtml('backup', stage, setting.backup || '', backupDisabled)}
                     \${backupDisabled ? '' : backupQuotaText}
                   </div>
                   <div>
@@ -358,11 +560,13 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               \`;
 
               tbody.appendChild(row);
+              setupModelCombobox(row, 'primary', stage);
+              setupModelCombobox(row, 'backup', stage);
 
               const checkbox = row.querySelector('#enable-fallback-' + stage);
-              const backupSelect = row.querySelector('#backup-' + stage);
+              const backupInput = row.querySelector('#backup-input-' + stage);
               checkbox.addEventListener('change', () => {
-                backupSelect.disabled = !checkbox.checked;
+                backupInput.disabled = !checkbox.checked;
               });
             });
           }
@@ -375,9 +579,21 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
 
             stagesList.forEach(stage => {
               const primary = document.getElementById('primary-' + stage).value;
+              const primaryText = document.getElementById('primary-input-' + stage).value.trim();
               const fallbackEnabled = document.getElementById('enable-fallback-' + stage).checked;
               const backup = document.getElementById('backup-' + stage).value;
+              const backupText = document.getElementById('backup-input-' + stage).value.trim();
               const strategy = document.getElementById('strategy-' + stage).value;
+
+              if (primaryText && !primary) {
+                hasErrors = true;
+                alertRegion.innerText += 'Stage ' + (stageDisplayNames[stage] || stage) + ' has an invalid primary model selection. Choose a model from the list.\\n';
+              }
+
+              if (fallbackEnabled && backupText && !backup) {
+                hasErrors = true;
+                alertRegion.innerText += 'Stage ' + (stageDisplayNames[stage] || stage) + ' has an invalid backup model selection. Choose a model from the list.\\n';
+              }
 
               if (fallbackEnabled && (!backup || backup === primary)) {
                 hasErrors = true;
