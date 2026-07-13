@@ -57,6 +57,13 @@ export async function applyCurrentStageAction(
     return;
   }
 
+  if (stage === "publish") {
+    await vscode.commands.executeCommand("vs-code-ai-helper.runLintingFixes", {
+      canonicalId: resolvedTask.canonicalId,
+    });
+    return;
+  }
+
   if (stage === "plan-high-review") {
     const artifactName = STAGE_ARTIFACT_FILENAMES["plan-high-review"];
     if (artifactName) {

@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import { PLAN_FILENAME } from "../types/taskProgress";
+import { backupArtifactBeforeWrite } from "./artifactBackups";
 
 /**
  * Build a signed attribution line for AI-generated output, so the file
@@ -86,6 +87,7 @@ export async function writeTextFile(
   fileUri: vscode.Uri,
   content: string
 ): Promise<void> {
+  await backupArtifactBeforeWrite(fileUri);
   const openDoc = findOpenDocument(fileUri);
   if (!openDoc) {
     await vscode.workspace.fs.writeFile(

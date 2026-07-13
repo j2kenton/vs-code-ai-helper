@@ -22,7 +22,7 @@ import {
   ProviderId,
 } from "./providers";
 import { getModelSettings } from "../config/settings";
-import { chooseFallback } from "../utils/modelFallback";
+import { chooseFallback, getBackupModels } from "../utils/modelFallback";
 import { recordQuotaObservation } from "../utils/quota";
 import { patchTaskProgress } from "../utils/taskProgressUtils";
 import { TaskStage } from "../types/taskProgress";
@@ -163,10 +163,10 @@ export function resolveRunnerForModel(
   // telemetry instead of a permanent placeholder.
   const instrumented = withQuotaObservation(primary, stage, modelId);
   const setting = getModelSettings()[stage];
-  if (setting?.strategy !== "switch-to-backup" || !setting.backup || setting.backup === modelId) {
+  const backupModels = getBackupModels(setting).filter(candidate => candidate !== modelId);
+  if (setting?.strategy !== "switch-to-backup" || backupModels.length === 0) {
     return { ...resolved, runner: instrumented };
   }
-  const fallback = toResolvedRunner(resolveEffectiveProvider(setting.backup));
   return {
     ...resolved,
     runner: {
@@ -175,6 +175,17 @@ export function resolveRunnerForModel(
       capabilities: instrumented.capabilities,
       isAvailable: () => instrumented.isAvailable(),
       async run(request, token): Promise<AgentRunResult> {
+        const runBackups = async (): Promise<AgentRunResult> => {
+          let last: AgentRunResult | undefined;
+          for (const backupModel of backupModels) {
+            const fallback = toResolvedRunner(resolveEffectiveProvider(backupModel));
+            const fallbackResult = await fallback.runner.run({ ...request, modelId: fallback.nativeModelId }, token);
+            recordQuotaObservation(stage, backupModel, fallbackResult.failureKind, fallbackResult.errorMessage);
+            last = fallbackResult;
+            if (fallbackResult.failureKind !== "quota" && fallbackResult.failureKind !== "temporarily-unavailable") return fallbackResult;
+          }
+          return last ?? { runnerId: primary.id, status: "failed", failureKind: "temporarily-unavailable", errorMessage: "No backup model is available." };
+        };
         const availability = await primary.isAvailable();
         // Never spend a backup allocation on credentials/configuration errors.
         // Providers commonly report these as plain HTTP status text.
@@ -182,9 +193,7 @@ export function resolveRunnerForModel(
         if (!availability.available && !authenticationFailure) {
           const folder = taskFolderUri ?? request.taskFolderUri;
           if (folder && await reserveFallback(folder, stage)) {
-            const fallbackResult = await fallback.runner.run({ ...request, modelId: fallback.nativeModelId }, token);
-            recordQuotaObservation(stage, setting.backup, fallbackResult.failureKind, fallbackResult.errorMessage);
-            return fallbackResult;
+            return runBackups();
           }
           return { runnerId: primary.id, status: "failed", failureKind: "temporarily-unavailable", errorMessage: availability.reason ?? "Model is temporarily unavailable." };
         }
@@ -203,9 +212,7 @@ export function resolveRunnerForModel(
           return result;
         }
 
-        const fallbackResult = await fallback.runner.run({ ...request, modelId: fallback.nativeModelId }, token);
-        recordQuotaObservation(stage, setting.backup, fallbackResult.failureKind, fallbackResult.errorMessage);
-        return fallbackResult;
+        return runBackups();
       },
     },
   };
@@ -283,7 +290,7 @@ export async function runImplementationForModel(options: {
   }
   const setting = getModelSettings()[options.stage as keyof ReturnType<typeof getModelSettings>];
   const authFailure = isAuthenticationFailure(result.errorMessage);
-  if (!authFailure && (result.failureKind === "quota" || result.failureKind === "temporarily-unavailable") && options.stage && chooseFallback(setting) === "backup" && setting?.backup) {
+  if (!authFailure && (result.failureKind === "quota" || result.failureKind === "temporarily-unavailable") && options.stage && chooseFallback(setting) === "backup" && getBackupModels(setting).length) {
     if (!options.taskFolderUri) {
       return result;
     }
@@ -291,9 +298,12 @@ export async function runImplementationForModel(options: {
     if (!reserved) {
       return result;
     }
-    const fallbackResult = await run(resolveEffectiveProvider(setting.backup));
-    recordQuotaObservation(options.stage, setting.backup, fallbackResult.failureKind, fallbackResult.errorMessage);
-    return fallbackResult;
+    for (const backupModel of getBackupModels(setting)) {
+      if (backupModel === options.modelId) continue;
+      const fallbackResult = await run(resolveEffectiveProvider(backupModel));
+      recordQuotaObservation(options.stage, backupModel, fallbackResult.failureKind, fallbackResult.errorMessage);
+      if (fallbackResult.status !== "failed" || (fallbackResult.failureKind !== "quota" && fallbackResult.failureKind !== "temporarily-unavailable")) return fallbackResult;
+    }
   }
   return result;
 }

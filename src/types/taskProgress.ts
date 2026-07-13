@@ -25,6 +25,8 @@ export type TaskStatus = "creating" | "active" | "paused" | "completed";
  * The filename for the task request/scope artifact
  */
 export const TASK_FILENAME = "task.md";
+/** Optional free-text user input used to draft the structured task file. */
+export const TASK_DESCRIPTION_FILENAME = "task-description.md";
 
 /**
  * The filename for the current plan. There is exactly one plan file; applying
@@ -80,6 +82,10 @@ export interface LintPayload {
 export interface TaskProgress {
   /** The task folder name (e.g., "2025-12-01_task_1") */
   taskFolder: string;
+  /** User-facing task label. Folder names stay stable so task ordering/IDs do not change. */
+  displayName?: string;
+  /** True until the generated default label is replaced by a user or AI summary. */
+  nameIsDefault?: boolean;
   /** Current stage in the workflow */
   currentStage: TaskStage;
   /** Task status: active or paused. Missing = active for backward compat. */

@@ -18,29 +18,31 @@ interface StageNodeArg {
   task?: IncompleteTask;
 }
 
-export async function configureStepModels(
+export function configureStepModels(
   _arg?: ConfigureModelArg,
   settingsViewProvider?: SettingsViewProvider
-): Promise<void> {
-  await revealSettingsView(settingsViewProvider);
+): void {
+  // Opening Settings must not wait on provider/model discovery.  The view
+  // itself posts its cached rows immediately and refreshes in the background.
+  void revealSettingsView(settingsViewProvider);
 }
 
-export async function setStageModel(
+export function setStageModel(
   node?: StageNodeArg,
   settingsViewProvider?: SettingsViewProvider
-): Promise<void> {
-  await revealSettingsView(settingsViewProvider);
+): void {
+  void revealSettingsView(settingsViewProvider);
   if (node?.stage && settingsViewProvider) {
     settingsViewProvider.focusStage(node.stage);
   }
 }
 
 /** Open the workspace settings table focused on a stage's backup controls. */
-export async function setStageBackupModel(
+export function setStageBackupModel(
   node?: StageNodeArg,
   settingsViewProvider?: SettingsViewProvider
-): Promise<void> {
-  await revealSettingsView(settingsViewProvider);
+): void {
+  void revealSettingsView(settingsViewProvider);
   if (node?.stage && settingsViewProvider) {
     settingsViewProvider.focusStage(node.stage, "backup");
   }

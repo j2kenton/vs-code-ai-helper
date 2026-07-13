@@ -667,8 +667,8 @@ export async function commitAndPushTask(
       );
     } else {
       NotificationRouter.showInformation(
-        "No completed task found to commit and push. " +
-          "Select a task in the Tasks panel first, or invoke from a completed task row."
+        "Select a completed task in the Tasks panel to commit and push, " +
+          "or invoke this command from that task's completed row."
       );
     }
     return;

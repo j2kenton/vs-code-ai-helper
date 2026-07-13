@@ -50,9 +50,15 @@ export async function improveReviewScore(options: {
   /** Returns the new score, or null if this attempt produced nothing to compare (stops the loop). */
   review: () => Promise<number | null>;
   token?: vscode.CancellationToken;
+  /** Maximum apply/review cycles for this run. */
+  maxAttempts?: number;
+  /** 0 stops at the first improvement; 1-10 stops once that score is reached. */
+  stopAtScore?: number;
 }): Promise<ImproveReviewScoreResult> {
   let best: number | null = null;
-  for (let attempt = 1; attempt <= MAX_REVIEW_ATTEMPTS; attempt++) {
+  const maxAttempts = Math.max(1, options.maxAttempts ?? MAX_REVIEW_ATTEMPTS);
+  const stopAtScore = Math.max(0, Math.min(10, options.stopAtScore ?? 0));
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     if (options.token?.isCancellationRequested) {
       throw new vscode.CancellationError();
     }
@@ -66,9 +72,10 @@ export async function improveReviewScore(options: {
     }
     best = Math.max(best ?? Number.NEGATIVE_INFINITY, score);
     await recordBestReviewScore(options.context, options.stage, score);
-    if (score >= options.baselineScore + 1) {
+    const improved = score >= options.baselineScore + 1;
+    if ((stopAtScore === 0 && improved) || (stopAtScore > 0 && score >= stopAtScore)) {
       return { score, attempts: attempt, improved: true, stalled: false };
     }
   }
-  return { score: best, attempts: MAX_REVIEW_ATTEMPTS, improved: false, stalled: false };
+  return { score: best, attempts: maxAttempts, improved: false, stalled: false };
 }

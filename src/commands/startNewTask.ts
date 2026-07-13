@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import * as path from "path";
-import { TASK_FILENAME } from "../types/taskProgress";
+import { TASK_DESCRIPTION_FILENAME, TASK_FILENAME } from "../types/taskProgress";
 import {
   createTaskProgress,
   writeTaskProgress,
@@ -129,8 +129,8 @@ export async function startNewTask(
   try {
     // Prompt for optional task description
     const description = await vscode.window.showInputBox({
-      title: "New Task Description",
-      prompt: "Enter an optional description for the new task. Press Escape to cancel.",
+      title: "Tell me about this task",
+      prompt: "Describe what you want to do in free text. You can use AI to turn it into the task file.",
       placeHolder: "e.g., Implement sidebar status view",
     });
 
@@ -156,6 +156,8 @@ export async function startNewTask(
       taskFolderUri,
       {
         ...createTaskProgress(taskFolderName, "desc"),
+        displayName: taskFolderName,
+        nameIsDefault: true,
         ownership: {
           metaRoot: path.resolve(metaFolderPath),
           projectRoot: path.resolve(workspaceRoot.uri.fsPath),
@@ -166,16 +168,20 @@ export async function startNewTask(
       }
     );
 
-    // Load and write task.md pre-seeded with the template
-    let taskTemplate = await loadTaskTemplate(extensionUri);
-    if (description.trim().length > 0) {
-      taskTemplate = prefillTemplate(taskTemplate, description);
-    }
+    // Keep raw user input separate from the structured task artifact.  This
+    // avoids AI drafts continually mixing narration and the task contract.
+    const taskTemplate = await loadTaskTemplate(extensionUri);
     const taskFileUri = vscode.Uri.joinPath(taskFolderUri, TASK_FILENAME);
     await vscode.workspace.fs.writeFile(
       taskFileUri,
       new TextEncoder().encode(taskTemplate)
     );
+    if (description.trim().length > 0) {
+      await vscode.workspace.fs.writeFile(
+        vscode.Uri.joinPath(taskFolderUri, TASK_DESCRIPTION_FILENAME),
+        new TextEncoder().encode(description.trim() + "\n")
+      );
+    }
 
     // Refresh inventory so the new task is discoverable
     await inventory.refresh();
@@ -210,8 +216,12 @@ export async function startNewTask(
       }
     }
 
-    // Open task.md in the editor regardless — the file was written successfully
-    const doc = await vscode.workspace.openTextDocument(taskFileUri);
+    // Open the free-text description when present, otherwise the task file.
+    const doc = await vscode.workspace.openTextDocument(
+      description.trim().length > 0
+        ? vscode.Uri.joinPath(taskFolderUri, TASK_DESCRIPTION_FILENAME)
+        : taskFileUri
+    );
     await vscode.window.showTextDocument(doc);
 
     return taskFolderName;
@@ -222,24 +232,6 @@ export async function startNewTask(
     );
     return undefined;
   }
-}
-
-/**
- * Prefill the task template with the user-provided description under the Task Description heading.
- */
-function prefillTemplate(template: string, description: string): string {
-  const heading = "## Task Description";
-  const index = template.indexOf(heading);
-  if (index !== -1) {
-    return (
-      template.slice(0, index + heading.length) +
-      "\n\n" +
-      description.trim() +
-      "\n" +
-      template.slice(index + heading.length)
-    );
-  }
-  return template + "\n\n" + description.trim() + "\n";
 }
 
 /**

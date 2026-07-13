@@ -4,8 +4,9 @@ import {
   getMetaResourcesPath,
   getModelSettings,
   hasValidMetaResourcesPath,
+  isProviderEnabled,
 } from "../config/settings";
-import { canUseBackup } from "./modelFallback";
+import { canUseBackup, getBackupModels } from "./modelFallback";
 import { cliCommandExists, resolveCliCommand } from "../runners/cliAgentRunner";
 import { findAllTasks, readTaskProgress } from "./taskProgressUtils";
 import {
@@ -195,7 +196,7 @@ export async function resolveModelForStage(
         progress.fallbackActive[stage] &&
         canUseBackup(stageSetting)
       ) {
-        return { modelId: stageSetting.backup, source: "workspace" };
+        return { modelId: getBackupModels(stageSetting)[0], source: "workspace" };
       }
     } catch {
       // No persisted progress (or unreadable) — fall through to the primary model.
@@ -451,11 +452,15 @@ function createClaudeCliReasoningVariant(
   model: string,
   label: string,
   effort: string,
-  effortLabel: string
+  effortLabel: string,
+  availabilityNote?: string
 ): DiscoveredCliModel {
   return {
     model: `${model}@${effort}`,
-    name: `${label} (${effortLabel})`,
+    // Keep availability text at the end and in brackets. The settings search
+    // intentionally ignores bracketed metadata, while the actual model name
+    // and reasoning level remain searchable.
+    name: `${label} (${effortLabel})${availabilityNote ? ` [${availabilityNote}]` : ""}`,
   };
 }
 
@@ -463,12 +468,13 @@ function createSeededClaudeCliModels(): readonly DiscoveredCliModel[] {
   const createVariants = (
     model: string,
     label: string,
-    efforts: readonly (readonly [string, string])[]
+    efforts: readonly (readonly [string, string])[],
+    availabilityNote?: string
   ): DiscoveredCliModel[] => {
     const variants: DiscoveredCliModel[] = [];
     for (const [effort, effortLabel] of efforts) {
       variants.push(
-        createClaudeCliReasoningVariant(model, label, effort, effortLabel)
+        createClaudeCliReasoningVariant(model, label, effort, effortLabel, availabilityNote)
       );
     }
     return variants;
@@ -483,22 +489,22 @@ function createSeededClaudeCliModels(): readonly DiscoveredCliModel[] {
       ["xhigh", "Extra High"],
       ["max", "Max"],
     ]),
-    { model: "fable", name: "Fable 5 (only on Max plan)" },
-    ...createVariants("fable", "Fable 5 (only on Max plan)", [
+    { model: "fable", name: "Fable 5 [only on Max plan]" },
+    ...createVariants("fable", "Fable 5", [
       ["low", "Low"],
       ["medium", "Medium"],
       ["high", "High"],
       ["xhigh", "Extra High"],
       ["max", "Max"],
-    ]),
-    { model: "opus", name: "Opus 4.8 (only on Max plan)" },
-    ...createVariants("opus", "Opus 4.8 (only on Max plan)", [
+    ], "only on Max plan"),
+    { model: "opus", name: "Opus 4.8 [only on Max plan]" },
+    ...createVariants("opus", "Opus 4.8", [
       ["low", "Low"],
       ["medium", "Medium"],
       ["high", "High"],
       ["xhigh", "Extra High"],
       ["max", "Max"],
-    ]),
+    ], "only on Max plan"),
     { model: "haiku", name: "Haiku 4.5" },
   ];
 }
@@ -790,7 +796,7 @@ export async function getAvailableModels(): Promise<SelectableModel[]> {
 
   const availability = await Promise.all(
     CLI_PROVIDERS.map((def) =>
-      commandExists(def.command, def.commandAliases)
+      isProviderEnabled(def.id) && commandExists(def.command, def.commandAliases)
     )
   );
   for (const [index, def] of CLI_PROVIDERS.entries()) {

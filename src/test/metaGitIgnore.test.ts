@@ -12,6 +12,7 @@ import {
 function readPackageJson(): {
   contributes?: {
     commands?: Array<{ command: string; title: string }>;
+    keybindings?: Array<{ command: string; key: string; mac?: string }>;
     menus?: { "view/title"?: Array<{ command: string; when?: string }> };
   };
 } {
@@ -20,6 +21,7 @@ function readPackageJson(): {
   ) as {
     contributes?: {
       commands?: Array<{ command: string; title: string }>;
+      keybindings?: Array<{ command: string; key: string; mac?: string }>;
       menus?: { "view/title"?: Array<{ command: string; when?: string }> };
     };
   };
@@ -198,12 +200,36 @@ void describe("managed meta gitignore block", () => {
 
     assert.deepEqual(
       buildLegacyMetaRootIgnorePatterns(repoRoot, configuredRoot),
-      ["/.helper/plans", "/.helper/plans/", "/plans", "/plans/"]
+      [
+        "/.helper/plans",
+        "/.helper/plans/",
+        "/artifacts/helper",
+        "/artifacts/helper/",
+        "/plans",
+        "/plans/",
+      ]
     );
   });
 });
 
 void describe("meta gitignore command contributions", () => {
+  void it("declares the commit/push and next-stage shortcuts", () => {
+    const keybindings = readPackageJson().contributes?.keybindings ?? [];
+    const bindingFor = (command: string) =>
+      keybindings.find((binding) => binding.command === command);
+
+    assert.deepEqual(bindingFor("vs-code-ai-helper.commitAndPushTask"), {
+      command: "vs-code-ai-helper.commitAndPushTask",
+      key: "ctrl+shift+alt+p",
+      mac: "cmd+shift+alt+p",
+    });
+    assert.deepEqual(bindingFor("vs-code-ai-helper.nextStage"), {
+      command: "vs-code-ai-helper.nextStage",
+      key: "ctrl+shift+alt+n",
+      mac: "cmd+shift+alt+n",
+    });
+  });
+
   void it("declares explicit hide/show commands", () => {
     const commands = readPackageJson().contributes?.commands ?? [];
 
@@ -211,14 +237,14 @@ void describe("meta gitignore command contributions", () => {
       commands.some(
         (entry) =>
           entry.command === "vs-code-ai-helper.hideMetaResourcesInGitIgnore" &&
-          entry.title === "Hide Current Task Meta Files"
+          entry.title === "Hide Meta Files in Git Ignore"
       )
     );
     assert.ok(
       commands.some(
         (entry) =>
           entry.command === "vs-code-ai-helper.showMetaResourcesInGitIgnore" &&
-          entry.title === "Show Current Task Meta Files"
+          entry.title === "Show Meta Files in Git Ignore"
       )
     );
   });
@@ -232,8 +258,8 @@ void describe("meta gitignore command contributions", () => {
       (entry) => entry.command === "vs-code-ai-helper.showMetaResourcesInGitIgnore"
     );
 
-    assert.ok(hideEntry, "Expected Hide Current Task Meta Files header action");
-    assert.ok(showEntry, "Expected Show Current Task Meta Files header action");
+    assert.ok(hideEntry, "Expected Hide Meta Files in Git Ignore header action");
+    assert.ok(showEntry, "Expected Show Meta Files in Git Ignore header action");
     // Deliberately NOT gated on metaGitIgnoreEligible: this is a persistent
     // top-level toolbar action (alongside Start New Task, Refresh, etc.) and
     // must not flicker in/out based on whether a current task happens to be

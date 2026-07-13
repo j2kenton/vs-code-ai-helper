@@ -9,6 +9,7 @@ import {
   LEGACY_IMPLEMENTATION_FILENAME,
 } from "../types/taskProgress";
 import { statIfExists } from "./fileUtils";
+import { backupArtifactBeforeWrite } from "./artifactBackups";
 
 export interface ResolvedImplementationArtifact {
   /** The URI to use for reading/opening */
@@ -98,6 +99,7 @@ export async function materializeCanonicalIfNeeded(
   if (legacyStat) {
     // Copy legacy -> canonical
     const content = await vscode.workspace.fs.readFile(legacyUri);
+    await backupArtifactBeforeWrite(canonicalUri);
     await vscode.workspace.fs.writeFile(canonicalUri, content);
     return canonicalUri;
   }

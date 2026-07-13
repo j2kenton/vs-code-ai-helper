@@ -121,7 +121,7 @@ export class TaskNode extends vscode.TreeItem {
     isMetaManaged: boolean = false
   ) {
     super(
-      task.folderName,
+      task.progress.displayName ?? task.folderName,
       expanded
         ? vscode.TreeItemCollapsibleState.Expanded
         : vscode.TreeItemCollapsibleState.Collapsed

@@ -52,24 +52,6 @@ const RUN_TIMEOUT_MS = 30 * 60 * 1000;
 const COMMAND_EXISTS_CACHE_TTL_MS = 60 * 1000;
 const commandExistsCache = new Map<string, { exists: boolean; expiresAt: number }>();
 
-/**
- * Providers whose dangerousBypass warning has already been shown as a modal
- * this VS Code session. Only used to avoid re-showing the same modal on every
- * single run; the onProgress line (which does fire every run) is the
- * authoritative per-run indicator that a bypass is active.
- */
-const dangerousBypassWarnedProviders = new Set<string>();
-
-function warnAboutDangerousBypassOnce(def: CliProviderDefinition): void {
-  if (dangerousBypassWarnedProviders.has(def.id)) {
-    return;
-  }
-  dangerousBypassWarnedProviders.add(def.id);
-  void vscode.window.showWarningMessage(
-    `${def.label}: ${def.dangerousBypass?.warningMessage ?? "Running with a dangerous bypass setting enabled."}`
-  );
-}
-
 function cliCommandCandidates(
   command: string,
   aliases: readonly string[] = []
@@ -121,6 +103,45 @@ export async function cliCommandExists(
   aliases: readonly string[] = []
 ): Promise<boolean> {
   return (await resolveCliCommand(command, aliases)) !== undefined;
+}
+
+export interface CliSetupStatus {
+  installed: boolean;
+  /** Undefined means this CLI has no safe non-interactive auth-status command. */
+  authenticated: boolean | undefined;
+}
+
+/**
+ * Test a provider without sending a model request or consuming model usage.
+ * A successful auth-status command is the only green result; mere presence on
+ * PATH remains explicitly unverified rather than being reported as logged in.
+ */
+export async function testCliProviderSetup(
+  def: CliProviderDefinition
+): Promise<CliSetupStatus> {
+  const command = await resolveCliCommand(def.command, def.commandAliases);
+  if (!command) return { installed: false, authenticated: false };
+  if (!def.authenticationCheckArgs) return { installed: true, authenticated: undefined };
+
+  return new Promise((resolve) => {
+    const child = cp.spawn(command, [...def.authenticationCheckArgs!], {
+      windowsHide: true,
+      shell: process.platform === "win32",
+      env: sanitizedCliEnv(),
+    });
+    const timer = setTimeout(() => {
+      child.kill();
+      resolve({ installed: true, authenticated: false });
+    }, 10_000);
+    child.on("error", () => {
+      clearTimeout(timer);
+      resolve({ installed: true, authenticated: false });
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      resolve({ installed: true, authenticated: code === 0 });
+    });
+  });
 }
 
 /**
@@ -344,16 +365,6 @@ export async function execCliAgent(options: {
 
   const promptTransport = def.promptTransport ?? "stdin";
   const useShell = def.useShell ?? true;
-  const dangerousBypass = def.dangerousBypass;
-  const dangerousBypassEnabled =
-    dangerousBypass !== undefined &&
-    dangerousBypass.appliesToModes.includes(mode) &&
-    dangerousBypass.isEnabled();
-  if (dangerousBypassEnabled && dangerousBypass !== undefined) {
-    onProgress?.(dangerousBypass.warningMessage);
-    warnAboutDangerousBypassOnce(def);
-  }
-
   let promptFile: string | undefined;
   if (promptTransport === "file") {
     if (useShell) {
@@ -398,7 +409,6 @@ export async function execCliAgent(options: {
 
   const args = def.buildArgs(mode, model, lastMessageFile, {
     cwd,
-    dangerousBypassEnabled,
     promptFile,
   });
 

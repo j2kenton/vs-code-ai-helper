@@ -58,12 +58,10 @@ export class TaskInventory {
       }
     }
 
-    // Sort by updatedAt descending
+    // Keep a stable ID/date order. Status and activity must not reshuffle
+    // tasks, which made paused tasks appear to move unexpectedly.
     withProgress.sort((a, b) => {
-      return (
-        new Date(b.progress.updatedAt).getTime() -
-        new Date(a.progress.updatedAt).getTime()
-      );
+      return a.folderName.localeCompare(b.folderName, undefined, { numeric: true });
     });
 
     this.visibleTasks = withProgress;

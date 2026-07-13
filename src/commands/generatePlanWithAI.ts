@@ -19,6 +19,7 @@ import { TaskInventory } from "../state/taskInventory";
 import { IncompleteTask } from "../utils/taskProgressUtils";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { TaskTreeProvider } from "../views/taskTreeProvider";
+import { shouldAutoReviewAfterPlan } from "../config/settings";
 
 /**
  * Stages a task may be in for plan generation to be safe: either at the
@@ -287,7 +288,11 @@ export async function generatePlanWithAI(
           NotificationRouter.showInformation(
             `plan.md generated with ${providerLabel} (${result.summary ?? ""})`
           );
-          // Do NOT auto-trigger review here — user advances stage manually
+          if (shouldAutoReviewAfterPlan()) {
+            await vscode.commands.executeCommand("vs-code-ai-helper.runReviewWithAI", {
+              taskFolderPath: taskFolderUri.fsPath,
+            });
+          }
         } else if (result.status === "cancelled") {
           NotificationRouter.showInformation(
             "Plan generation cancelled."

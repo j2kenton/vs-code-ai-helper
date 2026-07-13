@@ -328,7 +328,7 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
   });
 
   void describe("New-task creation prefill helper", () => {
-    void it("should prefill description under Task Description heading if provided", async () => {
+    void it("should write a separate task description file when provided", async () => {
       // eslint-disable-next-line @typescript-eslint/no-require-imports
       const { startNewTask } = await import("../commands/startNewTask.js");
 
@@ -355,13 +355,13 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
       const origShowErrorMessage = win.showErrorMessage;
       const origShowWarningMessage = win.showWarningMessage;
 
-      let writtenContent = "";
+      const writtenFiles = new Map<string, string>();
       workspace.fs.createDirectory = (): Promise<void> => Promise.resolve();
       workspace.fs.writeFile = (
-        _uri: vscode.Uri,
+        uri: vscode.Uri,
         bytes: Uint8Array
       ): Promise<void> => {
-        writtenContent = new TextDecoder().decode(bytes);
+        writtenFiles.set(uri.path, new TextDecoder().decode(bytes));
         return Promise.resolve();
       };
       workspace.openTextDocument = (): Promise<vscode.TextDocument> =>
@@ -380,8 +380,15 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
 
       try {
         await startNewTask(inventory, vscode.Uri.file("/extension"), store);
-        assert.ok(writtenContent.includes("Implement sidebar status view"));
-        assert.ok(writtenContent.includes("## Task Description"));
+        const description = [...writtenFiles.entries()].find(([filePath]) =>
+          filePath.endsWith("/task-description.md")
+        )?.[1];
+        const task = [...writtenFiles.entries()].find(([filePath]) =>
+          filePath.endsWith("/task.md")
+        )?.[1];
+        assert.strictEqual(description, "Implement sidebar status view\n");
+        assert.ok(task?.includes("## Task Description"));
+        assert.ok(!task?.includes("Implement sidebar status view"));
       } finally {
         win.showInputBox = origShowInputBox;
         win.showErrorMessage = origShowErrorMessage;

@@ -27,6 +27,8 @@ import { registerOpenGeneralAssistantCommand } from "./commands/openGeneralAssis
 import { registerRunLintingFixesCommand } from "./commands/runLintingFixes";
 import { registerScheduleTaskResumeCommand } from "./commands/scheduleTaskResume";
 import { registerMarkTaskDoneCommand } from "./commands/markTaskDone";
+import { registerViewStageChangesCommands } from "./commands/viewStageChanges";
+import { registerRenameTaskCommands } from "./commands/renameTask";
 import { TaskTreeProvider, TASKS_VIEW_ID, TaskNode } from "./views/taskTreeProvider";
 import { TaskStatusBar } from "./views/taskStatusBar";
 import { SettingsViewProvider } from "./views/settingsView";
@@ -164,6 +166,8 @@ export function activate(context: vscode.ExtensionContext): void {
   registerRunLintingFixesCommand(context, inventory);
   registerScheduleTaskResumeCommand(context, inventory);
   registerMarkTaskDoneCommand(context, inventory, currentTaskStore);
+  registerViewStageChangesCommands(context, inventory);
+  registerRenameTaskCommands(context, inventory);
 
   // Register the hello world command (keeping for backward compat)
   const helloWorldDisposable = vscode.commands.registerCommand(

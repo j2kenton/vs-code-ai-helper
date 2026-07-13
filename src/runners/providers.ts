@@ -15,7 +15,6 @@
  * model IDs, which keeps existing saved configurations working unchanged.
  */
 
-import { isCodexDangerouslyBypassSandboxForImplementationEnabled } from "../config/settings";
 import {
   discoverAgyModels,
   discoverKiroModels,
@@ -43,36 +42,11 @@ export interface CliModelChoice {
 export interface CliBuildArgsContext {
   cwd?: string;
   /**
-   * True when this provider's own dangerousBypass.isEnabled() returned true
-   * for the current mode. Providers that don't declare dangerousBypass never
-   * see this set to true. Generic (not provider-specific) so the shared
-   * runner never needs to know which provider owns which dangerous flag.
-   */
-  dangerousBypassEnabled?: boolean;
-  /**
    * Path to a temp file containing the prompt, set only when
    * promptTransport is "file". buildArgs must reference this path in the
    * argument it returns (e.g. `--print=${promptFile}`).
    */
   promptFile?: string;
-}
-
-/**
- * A provider-owned opt-in "dangerous mode" toggle (e.g. bypassing a CLI's own
- * sandbox/approvals). Each provider that has one declares its own settings
- * getter and CLI-specific warning copy; the shared runner (execCliAgent) only
- * ever calls isEnabled() and, when true, shows warningMessage via onProgress
- * before invoking the CLI. This keeps provider-specific "dangerous" concerns
- * out of the shared CliBuildArgsContext/execCliAgent code, so adding a similar
- * toggle for another provider never requires touching the shared runner.
- */
-export interface CliDangerousBypass {
-  /** Which run mode(s) this dangerous toggle applies to (e.g. only "edit"). */
-  appliesToModes: readonly CliRunMode[];
-  /** Reads the provider's own settings getter for its bypass toggle. */
-  isEnabled(): boolean;
-  /** Shown via onProgress immediately before a bypassed run starts. */
-  warningMessage: string;
 }
 
 export interface CliProviderDefinition {
@@ -89,6 +63,8 @@ export interface CliProviderDefinition {
   loginHint: string;
   /** Substrings in CLI output that indicate an auth problem. */
   authErrorMarkers: readonly string[];
+  /** Non-interactive command that reports whether this CLI is authenticated. */
+  authenticationCheckArgs?: readonly string[];
   /**
    * How the prompt is passed to the CLI. Defaults to stdin.
    *  - "stdin": written to the child's stdin.
@@ -109,11 +85,6 @@ export interface CliProviderDefinition {
    */
   maxArgvPromptBytes?: number;
   models: readonly CliModelChoice[];
-  /**
-   * Optional provider-owned "dangerous mode" toggle — see CliDangerousBypass.
-   * Absent for providers with no such toggle.
-   */
-  dangerousBypass?: CliDangerousBypass;
   /**
    * Optional live model discovery: queries the CLI itself for its current
    * model list. Absent for providers whose model list is static (only the
@@ -278,6 +249,7 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     loginHint:
       "Run `claude` in a terminal and complete the sign-in with your Anthropic (Claude) account, then try again.",
     authErrorMarkers: ["log in", "login", "authenticate", "api key", "oauth"],
+    authenticationCheckArgs: ["auth", "status"],
     // Keep the provider-level fallback to CLI default only. Temporary picker
     // options are seeded separately until live loading is fixed.
     models: [
@@ -316,35 +288,22 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     loginHint:
       "Run `codex login` in a terminal and sign in with your ChatGPT account, then try again.",
     authErrorMarkers: ["not logged in", "login", "authenticate", "api key"],
+    authenticationCheckArgs: ["login", "status"],
     // Keep the provider-level fallback to CLI default only. The picker can
     // seed temporary model options elsewhere without changing runner
     // semantics here, and any unsupported custom ID can still be set
     // directly via "codex-cli:<model>" in settings.
     models: [{ model: undefined, name: "Codex (CLI default)" }],
     usesLastMessageFile: true,
-    dangerousBypass: {
-      appliesToModes: ["edit"],
-      isEnabled: isCodexDangerouslyBypassSandboxForImplementationEnabled,
-      warningMessage:
-        "Codex is running with --dangerously-bypass-approvals-and-sandbox: " +
-        "it can execute commands without sandboxing or approval prompts.",
-    },
     buildArgs(mode, model, lastMessageFile, context): string[] {
       const parsedModel = parseCodexModelSelection(model);
       const args = ["exec", "--skip-git-repo-check", "--color", "never"];
       if (context?.cwd) {
         args.push("--cd", context.cwd);
       }
-      if (mode === "edit" && context?.dangerousBypassEnabled) {
-        args.push("--dangerously-bypass-approvals-and-sandbox");
-      } else {
-        // exec is non-interactive; the sandbox policy is what limits writes
-        // whenever the bypass above isn't engaged.
-        args.push(
-          "--sandbox",
-          mode === "edit" ? "workspace-write" : "read-only"
-        );
-      }
+      // Always use Codex's sandbox. The extension must never opt into the
+      // approvals-and-sandbox bypass for workspace implementation runs.
+      args.push("--sandbox", mode === "edit" ? "workspace-write" : "read-only");
       if (parsedModel.model) {
         args.push("--model", parsedModel.model);
       }

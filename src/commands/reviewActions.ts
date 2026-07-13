@@ -53,9 +53,18 @@ import { checkAndConfirmPromptSize } from "../utils/promptSizeGuard";
 import * as cp from "child_process";
 import * as fs from "fs";
 import { NotificationRouter } from "../utils/notificationRouter";
-import { parseReadiness, isStrictPerfectReview } from "../utils/reviewReadiness";
+import { backupArtifactBeforeWrite } from "../utils/artifactBackups";
+import { parseReadiness } from "../utils/reviewReadiness";
 import { runCompletionLint } from "../utils/completionLint";
-import { improveReviewScore, MAX_REVIEW_ATTEMPTS } from "../utils/reviewScoreLoop";
+import { improveReviewScore } from "../utils/reviewScoreLoop";
+import {
+  getAutoAdvanceScoreThreshold,
+  getFastForwardMaxIterations,
+  getFastForwardStopLevel,
+  isAutoAdvanceEnabled,
+  shouldAutoReviewAfterImplementation,
+  usesAcceptanceThresholdForFastForward,
+} from "../config/settings";
 
 /**
  * The optional argument tree-view buttons pass to these commands: the tree
@@ -438,18 +447,43 @@ async function isGitWorkspace(cwd: string): Promise<boolean> {
 }
 
 /**
- * Check if the workspace has uncommitted changes (dirty state).
- * Returns true when git reports any modified/untracked files.
+ * Return changed paths that do not belong to the task currently being run.
+ * Task metadata and files recorded by earlier implementation runs are related
+ * work, so they must not trigger the pre-run warning.
  */
-async function hasUncommittedChanges(cwd: string): Promise<boolean> {
+async function getUnrelatedWorkspaceChanges(
+  cwd: string,
+  taskFolderUri: vscode.Uri
+): Promise<string[]> {
+  const progress = await readTaskProgress(taskFolderUri).catch(() => undefined);
+  const taskRelative = path.relative(cwd, taskFolderUri.fsPath).replace(/\\/g, "/");
+  const relatedPaths = new Set(
+    (progress?.implReviewFiles ?? []).map((file) => file.replace(/\\/g, "/"))
+  );
   return new Promise((resolve) => {
     cp.execFile(
       "git",
-      ["status", "--porcelain"],
+      ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
       { cwd, windowsHide: true },
       (err, stdout) => {
-        if (err) { resolve(false); return; }
-        resolve(stdout.trim().length > 0);
+        if (err) { resolve([]); return; }
+
+        const records = stdout.split("\0");
+        const changedPaths: string[] = [];
+        for (let index = 0; index < records.length; index++) {
+          const record = records[index]!;
+          if (record.length < 4) continue;
+          const status = record.slice(0, 2);
+          changedPaths.push(record.slice(3).replace(/\\/g, "/"));
+          if ((status.includes("R") || status.includes("C")) && records[index + 1]) {
+            changedPaths.push(records[++index]!.replace(/\\/g, "/"));
+          }
+        }
+        resolve(changedPaths.filter((file) =>
+          file !== taskRelative &&
+          !file.startsWith(`${taskRelative}/`) &&
+          !relatedPaths.has(file)
+        ));
       }
     );
   });
@@ -858,7 +892,7 @@ export async function runReviewForFolder(
         false,
         false,
         reviewAttemptId,
-        async () => { await vscode.workspace.fs.rename(stagedReviewUri, reviewUri, { overwrite: true }); }
+        async () => { await backupArtifactBeforeWrite(reviewUri); await vscode.workspace.fs.rename(stagedReviewUri, reviewUri, { overwrite: true }); }
       );
     } catch (error) {
       // A stale/rejected CAS (a newer attempt already owns the stage) or a
@@ -877,14 +911,16 @@ export async function runReviewForFolder(
       try {
         const contentBytes = await vscode.workspace.fs.readFile(reviewUri);
         const content = new TextDecoder().decode(contentBytes);
-        if (isStrictPerfectReview(content)) {
-          NotificationRouter.showInformation(`Perfect review score (10/10) detected. Auto-advancing stage...`);
+        const score = parseReadiness(content).score;
+        const autoAdvanceThreshold = getAutoAdvanceScoreThreshold();
+        if (isAutoAdvanceEnabled() && score !== null && score >= autoAdvanceThreshold) {
+          NotificationRouter.showInformation(`Review score ${score}/10 reached the auto-advance threshold. Auto-advancing stage...`);
           const configuredStages = await resolveConfiguredReviewStages(folderUri);
           const next = computeNextStage(targetStage, configuredStages);
           if (next) {
             const transition = await advanceStage(folderUri, targetStage, next, false, false, reviewAttemptId);
             if (transition?.persisted) {
-              NotificationRouter.showInformation(`Perfect review accepted. Advanced to ${STAGE_DISPLAY_NAMES[next]}.`);
+              NotificationRouter.showInformation(`Review accepted. Advanced to ${STAGE_DISPLAY_NAMES[next]}.`);
             }
           }
         }
@@ -1212,6 +1248,12 @@ export async function fastForwardReviewWithAI(
     return;
   }
   const baselineScore = initialScore;
+  const maxAttempts = getFastForwardMaxIterations();
+  // The acceptance-threshold option uses the user's configured acceptance
+  // threshold; it is not synonymous with a perfect 10/10 score.
+  const configuredStopLevel = usesAcceptanceThresholdForFastForward()
+    ? getAutoAdvanceScoreThreshold()
+    : getFastForwardStopLevel();
 
   // Concrete taskFolderPath so every attempt targets this same task without
   // resolveTask re-prompting (it already resolved the task once above).
@@ -1233,11 +1275,13 @@ export async function fastForwardReviewWithAI(
           context,
           stage,
           baselineScore,
+          maxAttempts,
+          stopAtScore: configuredStopLevel,
           token,
           apply: async () => {
             attemptNumber += 1;
             progress.report({
-              message: `Attempt ${attemptNumber} of ${MAX_REVIEW_ATTEMPTS}...`,
+              message: `Attempt ${attemptNumber} of ${maxAttempts}...`,
             });
             await applyReviewWithAI(extensionUri, context, concreteArg, {
               skipImplementationSafetyCheck: attemptNumber > 1,
@@ -1274,7 +1318,7 @@ export async function fastForwardReviewWithAI(
     );
   } else {
     NotificationRouter.showWarning(
-      `Fast Forward Review: no improvement after ${MAX_REVIEW_ATTEMPTS} attempts (best score ${
+      `Fast Forward Review: target not reached after ${maxAttempts} attempts (best score ${
         outcome.score ?? "—"
       }/10).`
     );
@@ -1501,6 +1545,7 @@ export async function nextStage(
         return;
       }
       const canonicalUri = vscode.Uri.joinPath(resolved.folderUri, "plan-final.md");
+      await backupArtifactBeforeWrite(canonicalUri);
       await vscode.workspace.fs.writeFile(
         canonicalUri,
         new TextEncoder().encode(planContent)
@@ -1745,14 +1790,19 @@ async function executeImplementationRun(
         return;
       }
     } else {
-      // Git workspace: warn if there are uncommitted changes
-      const dirty = await hasUncommittedChanges(cwd);
-      if (dirty) {
+      // Git workspace: unrelated changes can be overwritten or mixed into an
+      // implementation run. Changes already associated with this task are
+      // expected, so do not make users repeatedly approve their own work.
+      const unrelatedChanges = await getUnrelatedWorkspaceChanges(cwd, folderUri);
+      if (unrelatedChanges.length > 0) {
+        const preview = unrelatedChanges.slice(0, 5).map((file) => `• ${file}`).join("\n");
+        const more = unrelatedChanges.length > 5
+          ? `\n• … and ${unrelatedChanges.length - 5} more`
+          : "";
         const proceed = await vscode.window.showWarningMessage(
-          "⚠️ Your workspace has uncommitted changes.\n\n" +
-            "The AI implementation run will edit workspace files. " +
-            "For best results, commit your current changes first so you can " +
-            "clearly see what the AI changed and revert if needed.",
+          "⚠️ Your workspace has unrelated uncommitted changes.\n\n" +
+            "The AI implementation run may edit workspace files. Commit, stash, " +
+            "or review these unrelated changes first:\n\n" + preview + more,
           { modal: false },
           "Proceed",
           "Cancel",
@@ -1855,8 +1905,10 @@ async function executeImplementationRun(
 
     const doc = await vscode.workspace.openTextDocument(implementationUri);
     await vscode.window.showTextDocument(doc);
-    // Auto-review after implementation run — bypass consent (already obtained)
-    await runReviewForFolder(extensionUri, folderUri, workspaceRoot, postRunReviewStage, true);
+    // Optional: a completed implementation only starts review when enabled in Settings.
+    if (shouldAutoReviewAfterImplementation()) {
+      await runReviewForFolder(extensionUri, folderUri, workspaceRoot, postRunReviewStage, true);
+    }
   } else if (result.status === "cancelled") {
     NotificationRouter.showInformation("Implementation cancelled.");
   } else {

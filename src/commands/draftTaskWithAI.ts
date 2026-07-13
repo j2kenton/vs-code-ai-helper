@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import * as path from "path";
-import { TASK_FILENAME } from "../types/taskProgress";
+import { TASK_DESCRIPTION_FILENAME, TASK_FILENAME } from "../types/taskProgress";
 import { resolveModelForStage } from "../utils/modelSelection";
 import { resolveRunnerForModel } from "../runners/runnerRegistry";
 import { renderPromptTemplate } from "../utils/promptTemplates";
@@ -12,6 +12,8 @@ import { checkAndConfirmPromptSize } from "../utils/promptSizeGuard";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { TaskTreeProvider } from "../views/taskTreeProvider";
 import { shortcutHint } from "../utils/shortcutHints";
+import { backupArtifactBeforeWrite, backupArtifactContents } from "../utils/artifactBackups";
+import { patchTaskProgress } from "../utils/taskProgressUtils";
 
 const INTRO_TEXT = `Briefly describe what changes you want to be made, and then use AI to help you clarify the plan.`;
 const SHORTCUT_NOTE = `Shortcut: Apply Current Stage Action${shortcutHint("vs-code-ai-helper.applyCurrentStageAction")}.`;
@@ -357,6 +359,7 @@ export async function draftTaskWithAI(
 
   const taskFolderUri = vscode.Uri.file(resolvedTask.taskFolderPath);
   const taskFileUri = vscode.Uri.joinPath(taskFolderUri, TASK_FILENAME);
+  const descriptionFileUri = vscode.Uri.joinPath(taskFolderUri, TASK_DESCRIPTION_FILENAME);
   const tmpUri = vscode.Uri.joinPath(taskFolderUri, DRAFT_TMP_FILENAME);
 
   // ── Pre-run cleanup: remove any stale temp file from a prior failed run ──
@@ -381,7 +384,17 @@ export async function draftTaskWithAI(
   const eol = detectEOL(rawContent);
   const parsed = parseTaskDocument(rawContent);
 
-  if (!parsed.taskDescription.trim()) {
+  // New tasks keep narration in task-description.md. Fall back to legacy
+  // embedded descriptions so existing tasks remain fully compatible.
+  let sourceDescription = parsed.taskDescription;
+  try {
+    const description = new TextDecoder().decode(await vscode.workspace.fs.readFile(descriptionFileUri)).trim();
+    if (description) sourceDescription = description;
+  } catch {
+    // Optional file.
+  }
+
+  if (!sourceDescription.trim()) {
     NotificationRouter.showWarning(
       "Please enter a task description before using Draft with AI."
     );
@@ -415,7 +428,7 @@ export async function draftTaskWithAI(
   const prompt = await renderPromptTemplate(
     context.extensionUri,
     "draft-task-with-ai.md",
-    { taskDescription: parsed.taskDescription }
+    { taskDescription: `${sourceDescription}\n\nNote: this may be voice-transcribed input; resolve obvious transcription errors from context rather than treating them as requirements.` }
   );
 
   // ── Prompt-size gate ─────────────────────────────────────────────────────
@@ -506,6 +519,10 @@ export async function draftTaskWithAI(
 
   // Write back to the open document buffer if available, otherwise to disk
   if (openDoc) {
+    // Snapshot only immediately before a successful write. This avoids
+    // creating a misleading backup for cancelled or failed draft attempts,
+    // and captures unsaved edits from the active editor.
+    await backupArtifactContents(taskFileUri, new TextEncoder().encode(rawContent));
     const fullRange = new vscode.Range(
       openDoc.positionAt(0),
       openDoc.positionAt(openDoc.getText().length)
@@ -535,6 +552,7 @@ export async function draftTaskWithAI(
       );
     }
   } else {
+    await backupArtifactBeforeWrite(taskFileUri);
     await vscode.workspace.fs.writeFile(
       taskFileUri,
       new TextEncoder().encode(newContent)
@@ -545,6 +563,23 @@ export async function draftTaskWithAI(
     NotificationRouter.showInformation(
       `task.md updated with Draft with AI (${providerLabel}).`
     );
+  }
+
+  // Keep folder IDs stable, but replace the generated label when it has not
+  // been manually renamed. A draft heading is the best concise summary we
+  // have without spending another model request.
+  if (resolvedTask.progress.nameIsDefault !== false) {
+    const title = aiOutput.draftWithAI.match(/^#\s+(.+)$/m)?.[1]?.trim();
+    if (title) {
+      await patchTaskProgress(taskFolderUri, (current) => ({
+        ...current,
+        displayName: title.slice(0, 120),
+        // An AI-derived summary replaces the generated folder-name label.
+        // Treat it as established so later drafts cannot silently overwrite
+        // a title the user has accepted.
+        nameIsDefault: false,
+      }));
+    }
   }
 }
 

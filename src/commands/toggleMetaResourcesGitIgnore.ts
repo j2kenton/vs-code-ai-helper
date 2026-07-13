@@ -1,16 +1,18 @@
 import * as vscode from "vscode";
 import * as path from "path";
 import * as cp from "child_process";
-import { TaskInventory, TaskWithProgress } from "../state/taskInventory";
+import { TaskInventory } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { getConfiguredTaskRoot } from "../utils/taskRoot";
 import { NotificationRouter } from "../utils/notificationRouter";
+import { setMetaFilesHidden } from "../config/settings";
 
 const MANAGED_BEGIN = "# BEGIN Ensemble managed meta resources";
 const MANAGED_END = "# END Ensemble managed meta resources";
 const MANAGED_NOTE = "# Managed by Ensemble. Do not edit this block manually.";
 const LEGACY_COMMENT = "# Ensemble meta resources";
 const LEGACY_TASK_ROOT = "plans";
+const ARTIFACTS_ROOT = "artifacts/helper";
 
 const META_ELIGIBLE_CONTEXT = "vs-code-ai-helper.metaGitIgnoreEligible";
 const META_HIDDEN_CONTEXT = "vs-code-ai-helper.currentTaskMetaHidden";
@@ -24,7 +26,6 @@ interface ManagedBlock {
 }
 
 interface CurrentMetaGitIgnoreTarget {
-  task: TaskWithProgress;
   repoRoot: string;
   gitignoreUri: vscode.Uri;
   patterns: string[];
@@ -75,6 +76,7 @@ function resolveConfiguredTaskRootPath(repoRoot: string): string | undefined {
     : path.join(repoRoot, configured);
 }
 
+/** @deprecated Legacy per-task migration helper. New managed blocks use only workspace roots. */
 export function buildManagedIgnorePatterns(
   repoRoot: string,
   taskFolderPath: string,
@@ -134,6 +136,7 @@ export function buildLegacyMetaRootIgnorePatterns(
   const roots = [
     configuredTaskRootPath,
     path.join(repoRoot, LEGACY_TASK_ROOT),
+    path.join(repoRoot, ARTIFACTS_ROOT),
   ].filter((root): root is string => !!root);
 
   for (const root of roots) {
@@ -369,67 +372,45 @@ async function resolveGitRepoRoot(cwd: string): Promise<string | undefined> {
   });
 }
 
-function getCurrentTask(
-  inventory: TaskInventory,
-  currentTaskStore: CurrentTaskStore
-): TaskWithProgress | undefined {
-  const canonicalId = currentTaskStore.get();
-  if (!canonicalId) {
-    return undefined;
-  }
-  return (
-    inventory.getTaskById(canonicalId) ??
-    inventory.getVisibleTaskForSuppressedId(canonicalId)
-  );
-}
-
 async function resolveTarget(
-  inventory: TaskInventory,
-  currentTaskStore: CurrentTaskStore,
+  _inventory: TaskInventory,
+  _currentTaskStore: CurrentTaskStore,
   showMessages: boolean
 ): Promise<CurrentMetaGitIgnoreTarget | undefined> {
-  let task = getCurrentTask(inventory, currentTaskStore);
-  if (!task) {
-    await inventory.refresh();
-    task = getCurrentTask(inventory, currentTaskStore);
-  }
-
-  if (!task) {
+  // Meta visibility is a repository setting, not a task setting.  Using the
+  // workspace avoids the former "select current task" prompt entirely.
+  const workspace = vscode.workspace.workspaceFolders?.[0];
+  if (!workspace) {
     if (showMessages) {
       void vscode.window.showWarningMessage(
-        "Select a current task before changing meta-file git visibility."
+        "Open a workspace folder before changing meta-file git visibility."
       );
     }
     return undefined;
   }
 
-  const repoRoot = await resolveGitRepoRoot(task.taskFolderPath);
+  const repoRoot = await resolveGitRepoRoot(workspace.uri.fsPath);
   if (!repoRoot) {
     if (showMessages) {
       void vscode.window.showWarningMessage(
-        "Could not find a git repository for the current task."
+        "Could not find a git repository for the current workspace."
       );
     }
     return undefined;
   }
 
   const configuredTaskRootPath = resolveConfiguredTaskRootPath(repoRoot);
-  const patterns = buildManagedIgnorePatterns(
-    repoRoot,
-    task.taskFolderPath,
-    configuredTaskRootPath
-  );
-  if (patterns.length === 0) {
-    if (showMessages) {
-      void vscode.window.showWarningMessage(
-        "Current task is not inside the git repository."
-      );
-    }
-    return undefined;
-  }
+  // The task-root setting is workspace-wide.  Ignore that actual configured
+  // location rather than always writing the legacy /plans/ path.
+  const configuredPattern = configuredTaskRootPath
+    ? toGitignorePattern(repoRoot, configuredTaskRootPath)
+    : undefined;
+  // Both entries describe workspace-level roots. Task plans may be relocated
+  // through settings, while artifacts always remain under /artifacts/helper/.
+  // Neither pattern is task-specific.
+  const patterns = ["/artifacts/helper/", configuredPattern ?? "/plans/"];
 
   return {
-    task,
     repoRoot,
     gitignoreUri: vscode.Uri.file(path.join(repoRoot, ".gitignore")),
     patterns,
@@ -512,12 +493,13 @@ async function setCurrentTaskMetaGitVisibility(
     target.gitignoreUri,
     new TextEncoder().encode(next)
   );
+  await setMetaFilesHidden(hidden);
 
   await setMetaVisibilityContexts(true, hidden, contextVersion);
   NotificationRouter.showInformation(
     hidden
-      ? `Meta files for ${target.task.folderName} are now hidden from git.`
-      : `Meta files for ${target.task.folderName} are now visible in git.`
+      ? "Workspace meta files are now hidden from git."
+      : "Workspace meta files are now visible in git."
   );
 }
 
@@ -547,6 +529,9 @@ export async function toggleMetaResourcesGitIgnore(
   }
 
   const content = await readTextIfExists(target.gitignoreUri);
+  // The managed .gitignore block is the single source of truth.  The setting
+  // is retained only as a UI preference mirror; otherwise manually removing
+  // the block leaves the command inverted.
   const hidden = isManagedMetaGitIgnoreHidden(content, target.patterns, {
     legacyRootPatterns: target.legacyRootPatterns,
   });

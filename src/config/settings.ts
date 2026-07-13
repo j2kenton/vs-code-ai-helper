@@ -7,8 +7,60 @@ const META_RESOURCES_PATH_KEY = "metaResourcesPath";
 const PROMPT_DISMISSED_KEY = "promptDismissed";
 const AI_MODEL_DEFAULTS_KEY = "aiModelDefaults";
 const MODEL_PROMPT_SHOWN_KEY = "modelSelectionPromptShown";
-const CODEX_BYPASS_SANDBOX_FOR_IMPLEMENTATION_KEY =
-  "codexDangerouslyBypassSandboxForImplementation";
+const META_FILES_HIDDEN_KEY = "metaFilesHidden";
+const ENABLED_PROVIDERS_KEY = "enabledProviders";
+const FAST_FORWARD_MAX_ITERATIONS_KEY = "fastForwardMaxIterations";
+const AUTO_ADVANCE_ENABLED_KEY = "autoAdvanceEnabled";
+const AUTO_ADVANCE_SCORE_KEY = "autoAdvanceScoreThreshold";
+const FAST_FORWARD_STOP_LEVEL_KEY = "fastForwardStopLevel";
+const FAST_FORWARD_USE_ACCEPTANCE_KEY = "fastForwardUseAcceptanceThreshold";
+const AUTO_REVIEW_AFTER_PLAN_KEY = "autoReviewAfterPlan";
+const AUTO_REVIEW_AFTER_IMPLEMENTATION_KEY = "autoReviewAfterImplementation";
+
+export function areMetaFilesHidden(): boolean {
+  return vscode.workspace.getConfiguration(CONFIG_SECTION).get<boolean>(META_FILES_HIDDEN_KEY, false);
+}
+
+export async function setMetaFilesHidden(hidden: boolean): Promise<void> {
+  await vscode.workspace.getConfiguration(CONFIG_SECTION).update(META_FILES_HIDDEN_KEY, hidden, vscode.ConfigurationTarget.Workspace);
+}
+
+/** Provider filters are workspace-wide; missing entries deliberately mean enabled. */
+export function isProviderEnabled(provider: string): boolean {
+  const enabled = vscode.workspace.getConfiguration(CONFIG_SECTION).get<Record<string, boolean>>(ENABLED_PROVIDERS_KEY, {});
+  return enabled[provider] !== false;
+}
+
+export function getFastForwardMaxIterations(): number {
+  const value = vscode.workspace.getConfiguration(CONFIG_SECTION).get<number>(FAST_FORWARD_MAX_ITERATIONS_KEY, 5);
+  return Math.max(1, Math.min(99, Math.floor(value)));
+}
+
+export function isAutoAdvanceEnabled(): boolean {
+  return vscode.workspace.getConfiguration(CONFIG_SECTION).get<boolean>(AUTO_ADVANCE_ENABLED_KEY, false);
+}
+
+export function getAutoAdvanceScoreThreshold(): number {
+  const value = vscode.workspace.getConfiguration(CONFIG_SECTION).get<number>(AUTO_ADVANCE_SCORE_KEY, 10);
+  return Math.max(1, Math.min(10, Math.floor(value)));
+}
+
+export function getFastForwardStopLevel(): number {
+  const value = vscode.workspace.getConfiguration(CONFIG_SECTION).get<number>(FAST_FORWARD_STOP_LEVEL_KEY, 0);
+  return Math.max(0, Math.min(10, Math.floor(value)));
+}
+
+export function usesAcceptanceThresholdForFastForward(): boolean {
+  return vscode.workspace.getConfiguration(CONFIG_SECTION).get<boolean>(FAST_FORWARD_USE_ACCEPTANCE_KEY, false);
+}
+
+export function shouldAutoReviewAfterPlan(): boolean {
+  return vscode.workspace.getConfiguration(CONFIG_SECTION).get<boolean>(AUTO_REVIEW_AFTER_PLAN_KEY, false);
+}
+
+export function shouldAutoReviewAfterImplementation(): boolean {
+  return vscode.workspace.getConfiguration(CONFIG_SECTION).get<boolean>(AUTO_REVIEW_AFTER_IMPLEMENTATION_KEY, false);
+}
 
 /**
  * Get the configured meta resources path for the current workspace
@@ -85,18 +137,6 @@ export function getAiModelDefault(stage: TaskStage): string | undefined {
 }
 
 /**
- * Whether Codex implementation runs should bypass Codex approvals/sandboxing.
- * Dangerous: only used for explicit workspace opt-in.
- */
-export function isCodexDangerouslyBypassSandboxForImplementationEnabled(): boolean {
-  const config = vscode.workspace.getConfiguration(CONFIG_SECTION);
-  return config.get<boolean>(
-    CODEX_BYPASS_SANDBOX_FOR_IMPLEMENTATION_KEY,
-    false
-  );
-}
-
-/**
  * Set or clear a workspace-level default model for one AI workflow stage.
  */
 export async function setAiModelDefault(
@@ -157,6 +197,7 @@ export function getModelSettings(): ModelSettings {
     const entry = value as Record<string, unknown>;
     const primary = typeof entry.primary === "string" && entry.primary.trim() ? entry.primary : undefined;
     const backup = typeof entry.backup === "string" && entry.backup.trim() ? entry.backup : undefined;
+    const backups = Array.isArray(entry.backups) ? [...new Set(entry.backups.filter((v): v is string => typeof v === "string" && v.trim().length > 0).map(v => v.trim()))] : undefined;
     let strategy: FallbackStrategy = entry.strategy === "switch-to-backup" || entry.strategy === "pause-and-resume" || entry.strategy === "alert-and-wait"
       ? entry.strategy : "alert-and-wait";
     // Back-compat: the old UI could save strategy: "switch-to-backup" with
@@ -167,7 +208,7 @@ export function getModelSettings(): ModelSettings {
     if (strategy === "switch-to-backup" && entry.fallbackEnabled === false) {
       strategy = "alert-and-wait";
     }
-    result[stage] = { primary, backup, strategy };
+    result[stage] = { primary, backup, backups, strategy };
   }
   // Migrate the older primary-only setting so existing workspaces do not
   // silently lose their configured models when the settings panel is opened.
@@ -188,9 +229,10 @@ export async function setModelSettings(settings: ModelSettings): Promise<void> {
     if (setting) {
       const primary = typeof setting.primary === "string" && setting.primary.trim() ? setting.primary.trim() : undefined;
       const backup = typeof setting.backup === "string" && setting.backup.trim() ? setting.backup.trim() : undefined;
+      const backups = Array.isArray(setting.backups) ? [...new Set(setting.backups.filter((v): v is string => typeof v === "string" && v.trim().length > 0).map(v => v.trim()))].slice(0, 10) : undefined;
       // Preserve a configured backup even if strategy isn't switch-to-backup —
       // switching strategy back later shouldn't lose the user's backup choice.
-      clean[stage] = { ...setting, primary, backup };
+      clean[stage] = { ...setting, primary, backup, backups };
     }
   }
   await config.update(

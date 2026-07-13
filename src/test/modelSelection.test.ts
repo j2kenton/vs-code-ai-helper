@@ -57,6 +57,19 @@ function codexVariants(
   return variants;
 }
 
+function claudeCliReasoningVariants(
+  model: string,
+  label: string,
+  efforts: readonly (readonly [string, string])[],
+  availabilityNote?: string
+): SelectableModel[] {
+  return efforts.map(([effort, effortLabel]) => ({
+    id: `claude-cli:${model}@${effort}`,
+    name: `${label} (${effortLabel})${availabilityNote ? ` [${availabilityNote}]` : ""}`,
+    providerLabel: "Claude Code (subscription CLI)",
+  }));
+}
+
 function copilotReasoningVariants(
   model: string,
   label: string,
@@ -102,18 +115,6 @@ function copilotModel(
     name,
     providerLabel: "GitHub Copilot",
   };
-}
-
-function claudeCliReasoningVariants(
-  model: string,
-  label: string,
-  efforts: readonly (readonly [string, string])[]
-): SelectableModel[] {
-  return efforts.map(([effort, effortLabel]) => ({
-    id: `claude-cli:${model}@${effort}`,
-    name: `${label} (${effortLabel})`,
-    providerLabel: "Claude Code (subscription CLI)",
-  }));
 }
 
 void describe("CLI model refresh fallback", () => {
@@ -503,35 +504,37 @@ void describe("getAvailableModels", () => {
           ]),
           {
             id: "claude-cli:fable",
-            name: "Fable 5 (only on Max plan)",
+            name: "Fable 5 [only on Max plan]",
             providerLabel: "Claude Code (subscription CLI)",
           },
           ...claudeCliReasoningVariants(
             "fable",
-            "Fable 5 (only on Max plan)",
+            "Fable 5",
             [
               ["low", "Low"],
               ["medium", "Medium"],
               ["high", "High"],
               ["xhigh", "Extra High"],
               ["max", "Max"],
-            ]
+            ],
+            "only on Max plan"
           ),
           {
             id: "claude-cli:opus",
-            name: "Opus 4.8 (only on Max plan)",
+            name: "Opus 4.8 [only on Max plan]",
             providerLabel: "Claude Code (subscription CLI)",
           },
           ...claudeCliReasoningVariants(
             "opus",
-            "Opus 4.8 (only on Max plan)",
+            "Opus 4.8",
             [
               ["low", "Low"],
               ["medium", "Medium"],
               ["high", "High"],
               ["xhigh", "Extra High"],
               ["max", "Max"],
-            ]
+            ],
+            "only on Max plan"
           ),
           {
             id: "claude-cli:haiku",
