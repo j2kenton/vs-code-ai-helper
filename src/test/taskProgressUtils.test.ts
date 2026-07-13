@@ -7,9 +7,10 @@ import {
   clearStageFallbackReservation,
   updateImplReviewFiles,
   clearImplReviewFiles,
+  updateTaskProgressStage,
   patchTaskProgress,
 } from "../utils/taskProgressUtils";
-import type { TaskProgress } from "../types/taskProgress";
+import { isNoteAwareStage, type TaskProgress } from "../types/taskProgress";
 
 function makeProgress(implReviewFiles?: string[]): TaskProgress {
   return {
@@ -103,6 +104,30 @@ void test("clearStageFallbackReservation is a no-op when the stage is not reserv
 
   const cleared = clearStageFallbackReservation(progress, "impl");
   assert.strictEqual(cleared, progress);
+});
+
+void test("leaving a stage expires only that stage's pending note", () => {
+  const progress: TaskProgress = {
+    ...makeProgress(),
+    currentStage: "desc",
+    pendingNotes: {
+      desc: "Use the API terminology from the design doc.",
+      plan: "Keep this note for the plan lifecycle.",
+    },
+  };
+
+  const updated = updateTaskProgressStage(progress, "plan");
+
+  assert.deepEqual(updated.pendingNotes, {
+    plan: "Keep this note for the plan lifecycle.",
+  });
+});
+
+void test("only description and plan actions are note-aware", () => {
+  assert.equal(isNoteAwareStage("desc"), true);
+  assert.equal(isNoteAwareStage("plan"), true);
+  assert.equal(isNoteAwareStage("plan-high-review"), false);
+  assert.equal(isNoteAwareStage("publish"), false);
 });
 
 // ---------------------------------------------------------------------------
@@ -240,6 +265,18 @@ void test("patchTaskProgress persists changes to disk", async () => {
   const stored = await readStoredProgress(store, folderUri);
   assert.ok(stored !== undefined);
   assert.equal(stored.currentStage, "plan");
+});
+
+void test("patchTaskProgress does not write when a callback declines a change", async () => {
+  const store = makeMemStore();
+  installMemStore(store);
+  const folderUri = makeTaskFolderUri("patch-no-op");
+  await seedProgress(store, folderUri, makeProgress());
+
+  const result = await patchTaskProgress(folderUri, current => current);
+
+  assert.ok(result !== undefined);
+  assert.equal(fs.existsSync(path.join(folderUri.fsPath, "task-progress.json")), false);
 });
 
 void test("patchTaskProgress preserves implReviewFiles when updating stage", async () => {

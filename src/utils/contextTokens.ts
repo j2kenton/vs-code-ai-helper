@@ -22,18 +22,14 @@ export interface StageContextInput {
 }
 
 /**
- * Validates the inputs to ensure consistent and valid state before generating context.
+ * Validates inputs that would otherwise produce ambiguous context tokens.
+ *
+ * Scheduled state is intentionally tolerated on completed tasks. Older
+ * releases persisted the deprecated scheduledResumeTime field and tree
+ * rendering must not fail while displaying those task-progress files.
  */
 export function validateTaskContextInput(input: TaskContextInput): void {
-  if (input.status === "completed" && input.isScheduled) {
-    throw new Error("A completed task cannot be scheduled to resume.");
-  }
-}
-
-export function validateStageContextInput(input: StageContextInput): void {
-  if (input.status !== "current" && (input.hasPendingNote || input.isScheduled)) {
-    // Only current stages can have pending-note or scheduled states in our lifecycle.
-  }
+  void input;
 }
 
 /**
@@ -85,8 +81,6 @@ export function buildTaskContextValue(input: TaskContextInput): string {
  * Builds the contextValue string for a StageNode.
  */
 export function buildStageContextValue(input: StageContextInput): string {
-  validateStageContextInput(input);
-
   const tokens: string[] = [];
 
   // Primary stage token

@@ -175,6 +175,13 @@ export async function patchTaskProgress(
     }
   }
 
+    // Callers use an unchanged return value to decline a compare-and-swap
+    // update (for example, when another window owns a scheduler lease).
+    // Do not turn that into a journal entry and file write: besides avoiding
+    // needless I/O, task-progress.json is watched and such writes would
+    // otherwise continuously re-trigger the scheduler inventory refresh.
+    if (JSON.stringify(patched) === JSON.stringify(current)) return current;
+
     // `update` above already threw for a stale/rejected CAS, so reaching
     // here means this caller owns the transition. Run the side effect before
     // persisting so a concurrent claim can only observe it fully applied or

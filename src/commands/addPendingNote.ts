@@ -2,7 +2,7 @@ import * as vscode from "vscode";
 import { TaskInventory } from "../state/taskInventory";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { patchTaskProgress } from "../utils/taskProgressUtils";
-import { STAGE_DISPLAY_NAMES, TaskStage } from "../types/taskProgress";
+import { isNoteAwareStage, STAGE_DISPLAY_NAMES, TaskStage } from "../types/taskProgress";
 
 type NoteArg = { canonicalId?: string; taskFolderPath?: string; stage?: TaskStage; task?: { folderUri: vscode.Uri } };
 
@@ -13,6 +13,12 @@ export async function addPendingNote(inventory: TaskInventory, arg?: NoteArg): P
   const task = await resolveTaskContext(inventory, resolverArg, { allowPaused: true });
   if (!task) return;
   const stage = arg?.stage ?? task.progress.currentStage;
+  if (!isNoteAwareStage(stage)) {
+    void vscode.window.showInformationMessage(
+      "Pending notes are available only for Task Description and Plan, whose actions use them."
+    );
+    return;
+  }
   const temp = vscode.Uri.joinPath(vscode.Uri.file(task.taskFolderPath), `.pending-note-${stage}.md`);
   const existing = task.progress.pendingNotes?.[stage] ?? "# Pending note\n\n";
   await vscode.workspace.fs.writeFile(temp, new TextEncoder().encode(existing));
@@ -20,7 +26,9 @@ export async function addPendingNote(inventory: TaskInventory, arg?: NoteArg): P
   await vscode.window.showTextDocument(document, { preview: false });
   const choice = await vscode.window.showInformationMessage(
     `Edit the markdown note for ${STAGE_DISPLAY_NAMES[stage]}, then choose Save Note.`,
-    { modal: true }, "Save Note", "Cancel"
+    // This must remain non-modal: the temporary editor is the multi-line
+    // input surface, and a modal message prevents the user from editing it.
+    "Save Note", "Cancel"
   );
   if (choice === "Save Note") {
     const text = document.getText().trim();

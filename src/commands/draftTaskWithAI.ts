@@ -304,7 +304,9 @@ async function readDraftTmpFile(
  * button (which passes the StageNode itself, i.e. `.task: IncompleteTask`)
  * and from the keyboard shortcut router (`{ canonicalId }`).
  */
-type DraftTaskArg = { canonicalId?: string } | { task?: IncompleteTask };
+type DraftTaskArg =
+  | { canonicalId?: string; taskFolderPath?: string; pendingNote?: string }
+  | { task?: IncompleteTask; pendingNote?: string };
 
 /**
  * Normalize a DraftTaskArg into the `{ canonicalId?, taskFolderPath? }` shape
@@ -324,8 +326,8 @@ export function normalizeDraftTaskArg(
       taskFolderPath: arg.task.folderUri.fsPath,
     };
   }
-  if ("canonicalId" in arg && arg.canonicalId) {
-    return { canonicalId: arg.canonicalId };
+  if ("canonicalId" in arg && (arg.canonicalId || arg.taskFolderPath)) {
+    return { canonicalId: arg.canonicalId, taskFolderPath: arg.taskFolderPath };
   }
   return undefined;
 }
@@ -354,7 +356,7 @@ export async function draftTaskWithAI(
   inventory: TaskInventory,
   context: vscode.ExtensionContext,
   explicitArg?: DraftTaskArg
-): Promise<void> {
+): Promise<boolean | undefined> {
   // ── Workspace guard (must come before consent) ──────────────────────────
   // ── Consent gate ─────────────────────────────────────────────────────────
   const consented = await ensureAiConsent(context);
@@ -461,10 +463,18 @@ export async function draftTaskWithAI(
   }
 
   // Build the prompt and check its size BEFORE launching or writing artifacts.
+  const pendingNote = explicitArg && "pendingNote" in explicitArg
+    ? explicitArg.pendingNote
+    : undefined;
   const prompt = await renderPromptTemplate(
     context.extensionUri,
     "draft-task-with-ai.md",
-    { taskDescription: `${sourceDescription}\n\nNote: this may be voice-transcribed input; resolve obvious transcription errors from context rather than treating them as requirements.` }
+    {
+      taskDescription: `${sourceDescription}\n\nNote: this may be voice-transcribed input; resolve obvious transcription errors from context rather than treating them as requirements.` +
+        (pendingNote
+          ? `\n\n## Pending stage note\n${pendingNote}`
+          : ""),
+    }
   );
 
   // ── Prompt-size gate ─────────────────────────────────────────────────────
@@ -617,6 +627,7 @@ export async function draftTaskWithAI(
       }));
     }
   }
+  return true;
 }
 
 /**

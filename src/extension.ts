@@ -162,9 +162,8 @@ export function activate(context: vscode.ExtensionContext): void {
   registerCommitAndPushTaskCommand(context, inventory, currentTaskStore);
   registerToggleMetaResourcesGitIgnoreCommand(context, inventory, currentTaskStore);
   registerAddPendingNoteCommand(context, inventory);
-  registerOpenGeneralAssistantCommand(context, inventory, currentTaskStore);
   registerRunLintingFixesCommand(context, inventory);
-  registerScheduleTaskResumeCommand(context, inventory);
+  const taskActionScheduler = registerScheduleTaskResumeCommand(context, inventory);
   registerMarkTaskDoneCommand(context, inventory, currentTaskStore);
   registerViewStageChangesCommands(context, inventory);
   registerRenameTaskCommands(context, inventory);
@@ -209,6 +208,7 @@ export function activate(context: vscode.ExtensionContext): void {
   // Initialize status view and notification router
   const statusTreeProvider = new StatusTreeProvider();
   initNotificationRouter(statusTreeProvider);
+  registerOpenGeneralAssistantCommand(context, inventory, currentTaskStore, statusTreeProvider);
 
   const statusTreeView = vscode.window.createTreeView("vs-code-ai-helper.statusView", {
     treeDataProvider: statusTreeProvider,
@@ -245,16 +245,29 @@ export function activate(context: vscode.ExtensionContext): void {
     `**/${TASK_PROGRESS_FILENAME}`
   );
   const onProgressChange = (): void => {
-    void inventory.refresh().then(() => taskTreeProvider.refresh());
+    void inventory.refresh().then(async () => {
+      await taskActionScheduler.armAll();
+      taskTreeProvider.refresh();
+    });
   };
   progressWatcher.onDidCreate(onProgressChange);
   progressWatcher.onDidChange(onProgressChange);
   progressWatcher.onDidDelete(onProgressChange);
 
+  // A crashed window can leave a lease behind. Periodically retrying the
+  // persisted schedules lets this window claim an expired lease even when no
+  // task-progress file change happens after the crash.
+  const schedulerRecoveryTimer = setInterval(() => {
+    void taskActionScheduler.armAll();
+  }, 5 * 60 * 1000);
+
   // Refresh when the meta resources folder setting changes
   const configListener = vscode.workspace.onDidChangeConfiguration((event) => {
     if (event.affectsConfiguration("vs-code-ai-helper.metaResourcesPath")) {
-      void inventory.refresh().then(() => taskTreeProvider.refresh());
+      void inventory.refresh().then(async () => {
+        await taskActionScheduler.armAll();
+        taskTreeProvider.refresh();
+      });
     }
   });
 
@@ -290,6 +303,7 @@ export function activate(context: vscode.ExtensionContext): void {
     collapseAllCommand,
     statusBarMenuCommand,
     progressWatcher,
+    { dispose: () => clearInterval(schedulerRecoveryTimer) },
     configListener,
     currentTaskListener,
     onExpandListener,
@@ -302,7 +316,12 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   // Populate the inventory and status bar immediately (silent — no folder creation)
-  void inventory.refresh().then(() => taskTreeProvider.refresh());
+  // Schedules are persisted in task-progress.json. The inventory must be
+  // populated before arming them or activation would miss every schedule.
+  void inventory.refresh().then(async () => {
+    await taskActionScheduler.armAll();
+    taskTreeProvider.refresh();
+  });
   void warmCliModelCache();
 
   // NOTE: The initial "using plans" popup has been intentionally removed.

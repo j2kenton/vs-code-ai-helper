@@ -159,6 +159,10 @@ export async function markTaskDone(
     ...current,
     status: "completed",
     completedAt: new Date().toISOString(),
+    // A completed task must never retain an actionable timer. Besides being
+    // misleading, that state makes tree context validation reject the task.
+    scheduledRun: undefined,
+    scheduledResumeTime: undefined,
   }));
   await inventory.refresh();
 

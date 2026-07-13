@@ -265,6 +265,18 @@ export class StageNode extends vscode.TreeItem {
       const effectiveStr = describeResolvedModel(modelInfo, availableModels);
       tooltipStr += `\n\nEffective Model: ${effectiveStr}`;
     }
+    if (hasPendingNote) {
+      this.description = this.description
+        ? `${this.description} · note pending`
+        : "note pending";
+      tooltipStr += "\n\nA note is queued for this stage's next action.";
+    }
+    if (isScheduled) {
+      this.description = this.description
+        ? `${this.description} · scheduled`
+        : "scheduled";
+      tooltipStr += "\n\nThe current-stage action is scheduled.";
+    }
     this.tooltip = new vscode.MarkdownString(tooltipStr, true);
 
     // Use the computed stage context for stage-specific buttons
@@ -636,7 +648,9 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
         const isCurrent =
           currentTaskCanonicalId !== undefined &&
           taskId === currentTaskCanonicalId;
-        const isScheduled = task.progress.scheduledRun !== undefined || task.progress.scheduledResumeTime !== undefined;
+        // scheduledResumeTime belonged to the removed in-session scheduler.
+        // Treat legacy values as inert so old completed tasks keep rendering.
+        const isScheduled = task.progress.scheduledRun !== undefined;
         const hasPendingNote = task.progress.pendingNotes !== undefined &&
           Object.keys(task.progress.pendingNotes).length > 0;
         return new TaskNode(
@@ -705,7 +719,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
         });
       }
 
-      const isStageScheduled = status === "current" && (task.progress.scheduledRun !== undefined || task.progress.scheduledResumeTime !== undefined);
+      const isStageScheduled = status === "current" && task.progress.scheduledRun !== undefined;
       const isStagePendingNote = task.progress.pendingNotes?.[stage] !== undefined;
 
       nodes.push(

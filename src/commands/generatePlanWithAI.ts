@@ -40,9 +40,9 @@ const ELIGIBLE_STAGES: readonly TaskStage[] = ["desc", "plan"];
  */
 type GeneratePlanArg =
   | vscode.Uri
-  | { canonicalId?: string }
-  | { task?: IncompleteTask }
-  | { taskFolderPath?: string };
+  | { canonicalId?: string; pendingNote?: string }
+  | { task?: IncompleteTask; pendingNote?: string }
+  | { taskFolderPath?: string; pendingNote?: string };
 
 /**
  * Normalize a GeneratePlanArg into a resolved value for the caller to act on.
@@ -111,7 +111,7 @@ export async function generatePlanWithAI(
   context: vscode.ExtensionContext,
   inventory: TaskInventory,
   arg?: GeneratePlanArg
-): Promise<void> {
+): Promise<boolean | undefined> {
   // ── Consent gate ─────────────────────────────────────────────────────────
   const consented = await ensureAiConsent(context);
   if (!consented) {
@@ -221,7 +221,12 @@ export async function generatePlanWithAI(
   const prompt = await renderPromptTemplate(
     context.extensionUri,
     "create-plan.md",
-    { contextPack: contextPackContent }
+    {
+      contextPack: contextPackContent +
+        (!(arg instanceof vscode.Uri) && arg?.pendingNote
+          ? `\n\n## Pending stage note\n${arg.pendingNote}`
+          : ""),
+    }
   );
 
   // ── Prompt-size gate (BEFORE any artifact is written) ────────────────────
@@ -237,6 +242,7 @@ export async function generatePlanWithAI(
   await writeContextPackContent(taskFolderUri, contextPackContent);
 
   const canonicalId = inventory.getTaskByPath(taskFolderUri.fsPath)?.canonicalId ?? taskFolderUri.fsPath;
+  let succeeded = false;
   try {
     TaskTreeProvider.setStageRunning(canonicalId, "plan", true);
     // No overwrite confirmation — user has deliberately triggered regeneration
@@ -282,6 +288,7 @@ export async function generatePlanWithAI(
             }
             return updateTaskProgressStage(existing, "plan");
           });
+          succeeded = true;
 
           const doc = await vscode.workspace.openTextDocument(planFileUri);
           await vscode.window.showTextDocument(doc);
@@ -309,6 +316,7 @@ export async function generatePlanWithAI(
   } finally {
     TaskTreeProvider.setStageRunning(canonicalId, "plan", false);
   }
+  return succeeded || undefined;
 }
 
 /**

@@ -580,6 +580,12 @@ void describe("Context Tokens Emission", () => {
       buildTaskContextValue({ status: "completed", currentStage: "publish" }),
       "task-completed"
     );
+
+    assert.strictEqual(
+      buildTaskContextValue({ status: "completed", currentStage: "publish", isScheduled: true }),
+      "task-completed-scheduled",
+      "Legacy schedule metadata must not prevent completed tasks from rendering"
+    );
     assert.strictEqual(
       buildTaskContextValue({ status: "completed", currentStage: "publish", hasLintPayload: true }),
       "task-completed-lint-known"
