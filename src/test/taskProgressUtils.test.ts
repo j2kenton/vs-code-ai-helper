@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { after, test } from "node:test";
 import {
+  clearStageFallbackReservation,
   updateImplReviewFiles,
   clearImplReviewFiles,
   patchTaskProgress,
@@ -76,6 +77,32 @@ void test("clearImplReviewFiles removes the tracked set entirely", () => {
   const cleared = clearImplReviewFiles(progress);
   assert.equal(cleared.implReviewFiles, undefined);
   assert.ok(!("implReviewFiles" in cleared));
+});
+
+void test("clearStageFallbackReservation removes only the requested stage", () => {
+  const progress: TaskProgress = {
+    ...makeProgress(),
+    fallbackActive: {
+      impl: true,
+      plan: true,
+    },
+  };
+
+  const cleared = clearStageFallbackReservation(progress, "impl");
+  assert.deepEqual(cleared.fallbackActive, { plan: true });
+  assert.equal(cleared.updatedAt, progress.updatedAt);
+});
+
+void test("clearStageFallbackReservation is a no-op when the stage is not reserved", () => {
+  const progress: TaskProgress = {
+    ...makeProgress(),
+    fallbackActive: {
+      plan: true,
+    },
+  };
+
+  const cleared = clearStageFallbackReservation(progress, "impl");
+  assert.strictEqual(cleared, progress);
 });
 
 // ---------------------------------------------------------------------------

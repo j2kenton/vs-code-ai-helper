@@ -700,7 +700,9 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
 
       let modelInfo: ResolvedStageModel | undefined;
       if (AI_MODEL_STAGES.includes(stage)) {
-        modelInfo = await resolveModelForStage(task.folderUri, stage);
+        modelInfo = await resolveModelForStage(task.folderUri, stage, {
+          ignoreActiveFallback: true,
+        });
       }
 
       const isStageScheduled = status === "current" && (task.progress.scheduledRun !== undefined || task.progress.scheduledResumeTime !== undefined);

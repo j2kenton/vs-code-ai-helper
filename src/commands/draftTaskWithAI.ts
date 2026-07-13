@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import { TASK_DESCRIPTION_FILENAME, TASK_FILENAME } from "../types/taskProgress";
-import { resolveModelForStage } from "../utils/modelSelection";
+import { resolveFreshModelForStage } from "../utils/modelSelection";
 import { resolveRunnerForModel } from "../runners/runnerRegistry";
 import { renderPromptTemplate } from "../utils/promptTemplates";
 import { writeRunLog } from "../utils/runLog";
@@ -437,7 +437,7 @@ export async function draftTaskWithAI(
     return;
   }
 
-  const model = await resolveModelForStage(taskFolderUri, "desc");
+  const model = await resolveFreshModelForStage(taskFolderUri, "desc");
   if (!model.modelId) {
     const openSettings = await vscode.window.showWarningMessage(
       "No model is configured for the Description stage. Open Ensemble Settings and choose a primary model before continuing.",

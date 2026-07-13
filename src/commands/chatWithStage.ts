@@ -3,7 +3,7 @@ import { TaskInventory } from "../state/taskInventory";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { STAGE_DISPLAY_NAMES, TaskStage } from "../types/taskProgress";
 import { IncompleteTask } from "../utils/taskProgressUtils";
-import { resolveModelForStage } from "../utils/modelSelection";
+import { resolveFreshModelForStage } from "../utils/modelSelection";
 import { runImplementationForModel } from "../runners/runnerRegistry";
 import { generateContextPack } from "../utils/contextPack";
 
@@ -91,7 +91,7 @@ export async function chatWithStage(
     return;
   }
   try {
-    const { modelId } = await resolveModelForStage(vscode.Uri.file(resolvedTask.taskFolderPath), targetStage);
+    const { modelId } = await resolveFreshModelForStage(vscode.Uri.file(resolvedTask.taskFolderPath), targetStage);
     const contextPack = await generateContextPack(vscode.Uri.file(resolvedTask.taskFolderPath), workspaceFolder.uri);
     const prompt = `You are assisting with the ${stageName} stage for task ${resolvedTask.folderName}.\n\n` +
       `Current task context:\n${contextPack.slice(0, 30000)}\n\nUser message:\n${message}\n\n` +

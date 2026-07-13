@@ -254,6 +254,30 @@ export function updateTaskStatus(
 }
 
 /**
+ * Clear the active fallback reservation for one stage without treating it as
+ * user-visible task progress. This is internal routing state only, so callers
+ * can persist the cleanup without bumping the task's freshness timestamp.
+ */
+export function clearStageFallbackReservation(
+  progress: TaskProgress,
+  stage: TaskStage
+): TaskProgress {
+  if (!progress.fallbackActive?.[stage]) {
+    return progress;
+  }
+
+  const fallbackActive = { ...progress.fallbackActive };
+  delete fallbackActive[stage];
+
+  return {
+    ...progress,
+    fallbackActive: Object.keys(fallbackActive).length > 0
+      ? fallbackActive
+      : undefined,
+  };
+}
+
+/**
  * Record the workspace-relative paths changed by an AI implementation run,
  * so implementation reviews can use them as the review scope instead of
  * relying on open editors.

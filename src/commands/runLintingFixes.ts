@@ -10,7 +10,7 @@ import { NotificationRouter } from "../utils/notificationRouter";
 import { runCompletionLint } from "../utils/completionLint";
 import { renderPromptTemplate } from "../utils/promptTemplates";
 import { generateContextPack } from "../utils/contextPack";
-import { resolveModelForStage } from "../utils/modelSelection";
+import { resolveFreshModelForStage } from "../utils/modelSelection";
 import { runImplementationForModel } from "../runners/runnerRegistry";
 import { checkAndConfirmPromptSize } from "../utils/promptSizeGuard";
 import { ensureAiConsent } from "../utils/aiConsent";
@@ -221,7 +221,7 @@ export async function runLintingFixes(
           // focused edits while the task remains completed.
           const workspaceFolder = vscode.workspace.getWorkspaceFolder(taskFolderUri);
           if (workspaceFolder) {
-            const model = await resolveModelForStage(taskFolderUri, "impl");
+            const model = await resolveFreshModelForStage(taskFolderUri, "impl");
             const postFixDiagnostics = vscode.languages.getDiagnostics().filter(([uri, ds]) => isFileInTaskFolder(uri, taskFolderPath) && ds.some((d) => d.source === "eslint" || d.source === "ts" || d.source === "typescript"));
             const lint = JSON.stringify({
               summary: postFixLint.summary,

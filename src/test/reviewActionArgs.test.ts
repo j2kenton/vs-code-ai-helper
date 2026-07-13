@@ -21,6 +21,7 @@ import { describe, it } from "node:test";
 // code author extending the arg handling can rely on this as a spec.
 
 import * as vscode from "vscode";
+import { buildFastForwardApplyReviewOptions } from "../commands/reviewActions";
 import { parseReadiness } from "../utils/reviewReadiness";
 
 /**
@@ -144,7 +145,7 @@ void describe("review-apply delegation arg contract", () => {
 // ---------------------------------------------------------------------------
 //
 // Documents that applying a plan review must use the `plan` model, applying
-// an implementation review must use the `implementation` model, and review
+// an implementation review must use the `impl` model, and review
 // generation must use the review-stage model.
 
 void describe("review apply model resolution contract", () => {
@@ -166,10 +167,11 @@ void describe("review apply model resolution contract", () => {
   }
 
   for (const stage of IMPL_REVIEW_STAGES) {
-    void it(`implementation review apply (${stage}) must use 'implementation' execution model`, () => {
-      // applyImplementationReviewWithAI calls resolveModelForStage(folderUri, "implementation").
-      const executionStage = "implementation";
-      assert.strictEqual(executionStage, "implementation");
+    void it(`implementation review apply (${stage}) must use 'impl' execution model`, () => {
+      // applyImplementationReviewWithAI resolves from the implementation stage
+      // (`impl`), not from the parked review stage.
+      const executionStage = "impl";
+      assert.strictEqual(executionStage, "impl");
       assert.notStrictEqual(stage, executionStage,
         "review stage and execution stage must differ for impl review apply"
       );
@@ -185,6 +187,25 @@ void describe("review apply model resolution contract", () => {
       assert.strictEqual(effectiveModelStage, logStage);
     });
   }
+});
+
+void describe("fast-forward fallback contract", () => {
+  void it("treats only the first internal apply attempt as a fresh invocation", () => {
+    assert.deepStrictEqual(
+      buildFastForwardApplyReviewOptions(1),
+      {
+        skipImplementationSafetyCheck: false,
+        preserveActiveFallback: false,
+      }
+    );
+    assert.deepStrictEqual(
+      buildFastForwardApplyReviewOptions(2),
+      {
+        skipImplementationSafetyCheck: true,
+        preserveActiveFallback: true,
+      }
+    );
+  });
 });
 
 // ---------------------------------------------------------------------------

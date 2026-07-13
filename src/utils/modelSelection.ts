@@ -8,7 +8,12 @@ import {
 } from "../config/settings";
 import { canUseBackup, getBackupModels } from "./modelFallback";
 import { cliCommandExists, resolveCliCommand } from "../runners/cliAgentRunner";
-import { findAllTasks, readTaskProgress } from "./taskProgressUtils";
+import {
+  clearStageFallbackReservation,
+  findAllTasks,
+  patchTaskProgress,
+  readTaskProgress,
+} from "./taskProgressUtils";
 import {
   CLI_PROVIDERS,
   type CliProviderId,
@@ -28,6 +33,10 @@ interface TaskModelSelectionFile {
 export interface ResolvedStageModel {
   modelId?: string;
   source: "task" | "workspace" | "none";
+}
+
+interface ResolveStageModelOptions {
+  ignoreActiveFallback?: boolean;
 }
 
 function isConfigurableStage(stage: TaskStage): boolean {
@@ -177,7 +186,8 @@ export async function clearTaskStageModels(
 
 export async function resolveModelForStage(
   taskFolderUri: vscode.Uri,
-  stage: TaskStage
+  stage: TaskStage,
+  options: ResolveStageModelOptions = {}
 ): Promise<ResolvedStageModel> {
   if (!isConfigurableStage(stage)) {
     return { source: "none" };
@@ -187,19 +197,22 @@ export async function resolveModelForStage(
   const modelSettings = getModelSettings();
   const stageSetting = modelSettings[stage];
   if (stageSetting?.primary) {
-    // If fallback is enabled, check if task progress has fallback active for this stage
-    try {
-      const progress = await readTaskProgress(taskFolderUri);
-      if (
-        progress &&
-        progress.fallbackActive &&
-        progress.fallbackActive[stage] &&
-        canUseBackup(stageSetting)
-      ) {
-        return { modelId: getBackupModels(stageSetting)[0], source: "workspace" };
+    if (!options.ignoreActiveFallback) {
+      // If fallback is enabled, check if task progress has fallback active
+      // for this stage.
+      try {
+        const progress = await readTaskProgress(taskFolderUri);
+        if (
+          progress &&
+          progress.fallbackActive &&
+          progress.fallbackActive[stage] &&
+          canUseBackup(stageSetting)
+        ) {
+          return { modelId: getBackupModels(stageSetting)[0], source: "workspace" };
+        }
+      } catch {
+        // No persisted progress (or unreadable) — fall through to the primary model.
       }
-    } catch {
-      // No persisted progress (or unreadable) — fall through to the primary model.
     }
     return { modelId: stageSetting.primary, source: "workspace" };
   }
@@ -211,6 +224,33 @@ export async function resolveModelForStage(
   }
 
   return { source: "none" };
+}
+
+/**
+ * A fresh user-invoked run should always retry the primary model first. Clear
+ * any stale active fallback reservation from an earlier run, then resolve the
+ * configured model without honoring fallbackActive for this lookup.
+ */
+export async function resolveFreshModelForStage(
+  taskFolderUri: vscode.Uri,
+  stage: TaskStage
+): Promise<ResolvedStageModel> {
+  if (isConfigurableStage(stage)) {
+    try {
+      const progress = await readTaskProgress(taskFolderUri);
+      if (progress?.fallbackActive?.[stage]) {
+        await patchTaskProgress(
+          taskFolderUri,
+          (current) => clearStageFallbackReservation(current, stage)
+        );
+      }
+    } catch {
+      // Ignore unreadable/missing progress; model resolution will fall back to
+      // the configured primary below.
+    }
+  }
+
+  return resolveModelForStage(taskFolderUri, stage, { ignoreActiveFallback: true });
 }
 
 /**

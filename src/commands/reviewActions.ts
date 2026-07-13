@@ -42,7 +42,11 @@ import {
   resolveRunnerForModel,
   runImplementationForModel,
 } from "../runners/runnerRegistry";
-import { resolveModelForStage, resolveConfiguredReviewStages } from "../utils/modelSelection";
+import {
+  resolveConfiguredReviewStages,
+  resolveFreshModelForStage,
+  resolveModelForStage,
+} from "../utils/modelSelection";
 import {
   getCanonicalImplementationUri,
   resolveImplementationArtifact,
@@ -109,11 +113,30 @@ type ReviewCommandArg =
 interface ApplyReviewOptions {
   /** Skip repeated dirty/non-git workspace confirmations for internally chained runs. */
   skipImplementationSafetyCheck?: boolean;
+  /** Preserve a stage's active fallback reservation across one internal retry loop. */
+  preserveActiveFallback?: boolean;
 }
 
 interface ExecuteImplementationRunOptions {
   /** Skip the pre-run dirty/non-git workspace confirmation. */
   skipPreRunSafetyCheck?: boolean;
+  /** Preserve a stage's active fallback reservation across one internal retry loop. */
+  preserveActiveFallback?: boolean;
+}
+
+/**
+ * Fast-forward review is one user action that can trigger several internal
+ * apply/re-review attempts. Only the first attempt is a fresh invocation;
+ * later attempts should reuse any fallback activated earlier in the same loop.
+ */
+export function buildFastForwardApplyReviewOptions(
+  attemptNumber: number
+): ApplyReviewOptions {
+  const preserveActiveFallback = attemptNumber > 1;
+  return {
+    skipImplementationSafetyCheck: preserveActiveFallback,
+    preserveActiveFallback,
+  };
 }
 
 /**
@@ -540,9 +563,13 @@ async function runAiToFile(options: {
   /** Defer publication until the caller has completed its CAS/state checks. */
   promoteOutput?: boolean;
   onValidatedOutput?: (content: string) => void;
+  /** Preserve a stage's active fallback reservation across one internal retry loop. */
+  preserveActiveFallback?: boolean;
 }): Promise<boolean> {
   const modelStage = options.executionStage ?? options.logStage;
-  const model = await resolveModelForStage(options.taskFolderUri, modelStage);
+  const model = options.preserveActiveFallback
+    ? await resolveModelForStage(options.taskFolderUri, modelStage)
+    : await resolveFreshModelForStage(options.taskFolderUri, modelStage);
   if (!model.modelId) {
     const openSettings = await vscode.window.showWarningMessage(
       `No model is configured for ${modelStage}. Open Ensemble Settings and choose a primary model before continuing.`,
@@ -741,7 +768,8 @@ export async function runReviewForFolder(
   folderUri: vscode.Uri,
   workspaceRoot: vscode.WorkspaceFolder,
   currentStage: TaskStage,
-  _skipOverwriteConfirmation: boolean  // kept for API compat, always skipped now
+  _skipOverwriteConfirmation: boolean,  // kept for API compat, always skipped now
+  options: { preserveActiveFallback?: boolean } = {}
 ): Promise<void> {
   const targetStage = REVIEW_TARGETS[currentStage];
   const templateFile = targetStage && REVIEW_PROMPTS[targetStage];
@@ -869,6 +897,7 @@ export async function runReviewForFolder(
     validateOutput: validateReviewOutput,
     promoteOutput: false,
     onValidatedOutput: (content) => { generatedReviewContent = content; },
+    preserveActiveFallback: options.preserveActiveFallback,
   });
 
   if (reviewWritten) {
@@ -1116,6 +1145,7 @@ export async function applyReviewWithAI(
       reviewContent,
       {
         skipPreRunSafetyCheck: options.skipImplementationSafetyCheck,
+        preserveActiveFallback: options.preserveActiveFallback,
       }
     );
     return;
@@ -1160,11 +1190,19 @@ export async function applyReviewWithAI(
     outputFileUri,
     progressAction: `Applying review to ${outputLabel}`,
     outputLabel,
+    preserveActiveFallback: options.preserveActiveFallback,
   });
 
   if (applySucceeded) {
     // Re-review after applying (no confirmation, no stage change)
-    await runReviewForFolder(extensionUri, resolved.folderUri, workspaceRoot, stage, true);
+    await runReviewForFolder(
+      extensionUri,
+      resolved.folderUri,
+      workspaceRoot,
+      stage,
+      true,
+      { preserveActiveFallback: options.preserveActiveFallback }
+    );
   }
 }
 
@@ -1176,11 +1214,11 @@ export async function applyReviewWithAI(
  *
  * Deliberately calls the same applyReviewWithAI path for each attempt rather
  * than re-implementing apply logic, so this can never diverge from what the
- * regular "Apply Review" button does per attempt. The only fast-forward
- * override is that attempts after the first skip the implementation pre-run
- * dirty/non-git confirmation, because the user already approved the button
- * press and repeated prompts would interrupt the loop. Progress between
- * attempts is inferred by re-reading
+ * regular "Apply Review" button does per attempt. The fast-forward-specific
+ * overrides are: attempts after the first skip the implementation pre-run
+ * dirty/non-git confirmation, and internal retries preserve any fallback
+ * already activated earlier in the same click so they do not keep re-hitting
+ * a failed primary. Progress between attempts is inferred by re-reading
  * the review artifact from disk (rather than threading a success signal
  * through applyReviewWithAI's internals, which branch differently for plan
  * vs. implementation reviews): if an attempt leaves the review file
@@ -1283,9 +1321,12 @@ export async function fastForwardReviewWithAI(
             progress.report({
               message: `Attempt ${attemptNumber} of ${maxAttempts}...`,
             });
-            await applyReviewWithAI(extensionUri, context, concreteArg, {
-              skipImplementationSafetyCheck: attemptNumber > 1,
-            });
+            await applyReviewWithAI(
+              extensionUri,
+              context,
+              concreteArg,
+              buildFastForwardApplyReviewOptions(attemptNumber)
+            );
           },
           review: async () => {
             const newContent = await readNonEmptyText(reviewUri);
@@ -1342,7 +1383,7 @@ async function applyImplementationReviewWithAI(
   workspaceRoot: vscode.WorkspaceFolder,
   stage: TaskStage,
   reviewContent: string,
-  options: ExecuteImplementationRunOptions = {}
+  options: ApplyReviewOptions & ExecuteImplementationRunOptions = {}
 ): Promise<void> {
   // Materialize canonical plan-final.md from legacy implementation.md if needed.
   let canonicalUri: vscode.Uri;
@@ -1364,7 +1405,9 @@ async function applyImplementationReviewWithAI(
   }
 
   // Use the `implementation` stage's model, not the review stage's model.
-  const model = await resolveModelForStage(folderUri, "impl");
+  const model = options.preserveActiveFallback
+    ? await resolveModelForStage(folderUri, "impl")
+    : await resolveFreshModelForStage(folderUri, "impl");
 
   const { availability, providerLabel } =
     await checkImplementationAvailabilityForModel(model.modelId);
@@ -1907,7 +1950,14 @@ async function executeImplementationRun(
     await vscode.window.showTextDocument(doc);
     // Optional: a completed implementation only starts review when enabled in Settings.
     if (shouldAutoReviewAfterImplementation()) {
-      await runReviewForFolder(extensionUri, folderUri, workspaceRoot, postRunReviewStage, true);
+      await runReviewForFolder(
+        extensionUri,
+        folderUri,
+        workspaceRoot,
+        postRunReviewStage,
+        true,
+        { preserveActiveFallback: options.preserveActiveFallback }
+      );
     }
   } else if (result.status === "cancelled") {
     NotificationRouter.showInformation("Implementation cancelled.");
@@ -1979,7 +2029,7 @@ export async function runImplementationWithAI(
   }
 
   // Resolve implementation model for execution
-  const model = await resolveModelForStage(resolved.folderUri, "impl");
+  const model = await resolveFreshModelForStage(resolved.folderUri, "impl");
 
   const { availability, providerLabel } =
     await checkImplementationAvailabilityForModel(model.modelId);

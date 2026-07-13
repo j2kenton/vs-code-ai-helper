@@ -11,7 +11,7 @@ import { renderPromptTemplate } from "../utils/promptTemplates";
 import { writeRunLog } from "../utils/runLog";
 import { pickTaskFolder } from "../utils/pickTaskFolder";
 import { resolveRunnerForModel } from "../runners/runnerRegistry";
-import { resolveModelForStage } from "../utils/modelSelection";
+import { resolveFreshModelForStage } from "../utils/modelSelection";
 import { TASK_FILENAME, TaskStage } from "../types/taskProgress";
 import { ensureAiConsent } from "../utils/aiConsent";
 import { checkAndConfirmPromptSize } from "../utils/promptSizeGuard";
@@ -148,7 +148,7 @@ export async function generatePlanWithAI(
     return;
   }
 
-  const model = await resolveModelForStage(taskFolderUri, "plan");
+  const model = await resolveFreshModelForStage(taskFolderUri, "plan");
   if (!model.modelId) {
     const openSettings = await vscode.window.showWarningMessage(
       "No model is configured for the Plan stage. Open Ensemble Settings and choose a primary model before continuing.",

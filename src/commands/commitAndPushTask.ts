@@ -12,7 +12,7 @@ import { advanceStage } from "../utils/stageTransition";
 import { selectNextTask } from "./markTaskDone";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { runCompletionLint } from "../utils/completionLint";
-import { resolveModelForStage } from "../utils/modelSelection";
+import { resolveFreshModelForStage } from "../utils/modelSelection";
 import { parseCopilotModelSelection, parseModelSelection } from "../runners/providers";
 
 /**
@@ -176,7 +176,7 @@ async function buildCommitMessage(
   const suffix = files.length > 3 ? ` and ${files.length - 3} more files` : "";
   const fallback = `Ensemble: update ${taskName}\n\nChanges:\n- Updated ${changed}${suffix}\n\nFiles: ${files.length}`;
 
-  const { modelId } = await resolveModelForStage(taskFolderUri, "publish");
+  const { modelId } = await resolveFreshModelForStage(taskFolderUri, "publish");
   const parsedProvider = parseModelSelection(modelId);
   if (parsedProvider.provider !== "copilot") {
     // Configured stage model is a subscription CLI provider — no chat

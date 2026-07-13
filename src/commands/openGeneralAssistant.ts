@@ -2,7 +2,7 @@ import * as vscode from "vscode";
 import { TaskInventory } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
-import { resolveModelForStage } from "../utils/modelSelection";
+import { resolveFreshModelForStage } from "../utils/modelSelection";
 import { resolveRunnerForModel } from "../runners/runnerRegistry";
 import { generateContextPack } from "../utils/contextPack";
 
@@ -16,7 +16,7 @@ export async function openGeneralAssistant(inventory: TaskInventory, currentTask
   const workspace = vscode.workspace.getWorkspaceFolder(taskFolderUri);
   if (!workspace) { void vscode.window.showErrorMessage("The task is not inside an open workspace."); return; }
   try {
-    const { modelId } = await resolveModelForStage(taskFolderUri, task.progress.currentStage);
+    const { modelId } = await resolveFreshModelForStage(taskFolderUri, task.progress.currentStage);
     const resolved = resolveRunnerForModel(modelId, task.progress.currentStage, taskFolderUri);
     if (!resolved.runner.capabilities.assistant) throw new Error(`${resolved.providerLabel} does not support assistant mode.`);
     const available = await resolved.runner.isAvailable();

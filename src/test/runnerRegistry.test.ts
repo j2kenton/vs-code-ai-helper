@@ -11,7 +11,10 @@ import {
   resolveRunnerForModel,
   runImplementationForModel,
 } from "../runners/runnerRegistry";
-import { resolveModelForStage } from "../utils/modelSelection";
+import {
+  resolveFreshModelForStage,
+  resolveModelForStage,
+} from "../utils/modelSelection";
 
 const requireModule = createRequire(__filename);
 const childProcess = requireModule("node:child_process") as typeof import("node:child_process");
@@ -423,6 +426,67 @@ void describe("runImplementationForModel", () => {
         "impl-low-review"
       );
       assert.strictEqual(reviewResolved.modelId, "review-primary");
+    } finally {
+      settings.restore();
+      workspace.fs.readFile = originalReadFile;
+    }
+  });
+
+  void it("retries the primary model for a fresh implementation run after an earlier fallback", async () => {
+    const metaRoot = fs.mkdtempSync(
+      path.join(os.tmpdir(), "ensemble-fresh-impl-primary-")
+    );
+    const tasksRoot = path.join(metaRoot, "tasks");
+    const taskFolder = path.join(tasksRoot, "task-a");
+    fs.mkdirSync(taskFolder, { recursive: true });
+    const taskFolderUri = vscode.Uri.file(taskFolder);
+    const progressPath = path.join(taskFolder, "task-progress.json");
+    const now = new Date().toISOString();
+    fs.writeFileSync(
+      progressPath,
+      JSON.stringify(
+        {
+          taskFolder: path.basename(taskFolder),
+          currentStage: "impl-high-review",
+          status: "active",
+          createdAt: now,
+          updatedAt: now,
+          fallbackActive: { impl: true },
+        },
+        null,
+        2
+      ),
+      "utf8"
+    );
+
+    const settings = installModelSettings({
+      impl: {
+        primary: "impl-primary",
+        backup: "impl-backup",
+        strategy: "switch-to-backup",
+      },
+    });
+
+    const workspace = vscode.workspace as unknown as {
+      fs: {
+        readFile: (uri: vscode.Uri) => Promise<Uint8Array>;
+      };
+    };
+    const originalReadFile = workspace.fs.readFile;
+    workspace.fs.readFile = (uri: vscode.Uri): Promise<Uint8Array> =>
+      fs.promises.readFile(uri.fsPath);
+
+    try {
+      const stickyResolved = await resolveModelForStage(taskFolderUri, "impl");
+      assert.strictEqual(stickyResolved.modelId, "impl-backup");
+
+      const freshResolved = await resolveFreshModelForStage(taskFolderUri, "impl");
+      assert.strictEqual(freshResolved.modelId, "impl-primary");
+
+      const progress = JSON.parse(fs.readFileSync(progressPath, "utf8")) as {
+        fallbackActive?: Partial<Record<string, boolean>>;
+      };
+      assert.strictEqual(progress.fallbackActive?.impl, undefined);
     } finally {
       settings.restore();
       workspace.fs.readFile = originalReadFile;
