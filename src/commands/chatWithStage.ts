@@ -9,6 +9,7 @@ import { generateContextPack } from "../utils/contextPack";
 import { ensureAiConsent } from "../utils/aiConsent";
 import { checkAndConfirmPromptSize } from "../utils/promptSizeGuard";
 
+type ChatRunResult = Awaited<ReturnType<typeof runImplementationForModel>>;
 type ChatWithStageArg =
   | { task?: IncompleteTask; stage?: TaskStage }
   | { canonicalId?: string; taskFolderPath?: string; stage?: TaskStage };
@@ -40,6 +41,13 @@ function normalizeArg(node: ChatWithStageArg | undefined): {
       : undefined,
     stage: n.stage,
   };
+}
+
+export function extractChatResponseText(result: ChatRunResult): string {
+  if (result.status !== "completed") {
+    throw new Error(result.errorMessage ?? "Stage chat did not complete.");
+  }
+  return result.summary ?? "The model did not return a response.";
 }
 
 export async function chatWithStage(
@@ -124,7 +132,7 @@ export async function chatWithStage(
           stage: targetStage,
           taskFolderUri,
         });
-        responseText = result.summary ?? result.errorMessage ?? "The model did not return a response.";
+        responseText = extractChatResponseText(result);
       }
     );
 
