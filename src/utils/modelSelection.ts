@@ -578,6 +578,14 @@ function createSeededCodexModels(): readonly DiscoveredCliModel[] {
       ["max", "Max"],
       ["ultra", "Ultra"],
     ]),
+    ...createVariants("gpt-5.6-sol", "GPT-5.6-SOL", [
+      ["low", "Low"],
+      ["medium", "Medium"],
+      ["high", "High"],
+      ["xhigh", "Extra High"],
+      ["max", "Max"],
+      ["ultra", "Ultra"],
+    ]),
     ...createVariants("gpt-5.6-luna", "GPT-5.6-Luna", [
       ["low", "Low"],
       ["medium", "Medium"],

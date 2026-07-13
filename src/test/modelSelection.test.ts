@@ -572,6 +572,19 @@ void describe("getAvailableModels", () => {
             true
           ),
           ...codexVariants(
+            "gpt-5.6-sol",
+            "GPT-5.6-SOL",
+            [
+              ["low", "Low"],
+              ["medium", "Medium"],
+              ["high", "High"],
+              ["xhigh", "Extra High"],
+              ["max", "Max"],
+              ["ultra", "Ultra"],
+            ],
+            true
+          ),
+          ...codexVariants(
             "gpt-5.6-luna",
             "GPT-5.6-Luna",
             [
