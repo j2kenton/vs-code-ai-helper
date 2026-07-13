@@ -1,5 +1,4 @@
 import * as vscode from "vscode";
-import * as path from "path";
 import { TASK_DESCRIPTION_FILENAME, TASK_FILENAME } from "../types/taskProgress";
 import { resolveModelForStage } from "../utils/modelSelection";
 import { resolveRunnerForModel } from "../runners/runnerRegistry";
@@ -342,9 +341,14 @@ export async function draftTaskWithAI(
     return;
   }
 
-  const workspaceFolder = (vscode.workspace.workspaceFolders ?? []).find(
-    folder => path.resolve(folder.uri.fsPath) === path.resolve(resolvedTask.progress.ownership?.workspaceRoot ?? "")
-  );
+  // resolveTaskContext already computed the owning workspace folder (with a
+  // fallback for tasks that predate the `ownership` field), so reuse it
+  // instead of re-deriving it from ownership.workspaceRoot directly — that
+  // duplicate check had no fallback and always failed for ownership-less
+  // tasks even when the correct (and only) workspace folder was open.
+  const workspaceFolder = resolvedTask.workspaceFolder
+    ? vscode.workspace.getWorkspaceFolder(resolvedTask.workspaceFolder)
+    : undefined;
   if (!workspaceFolder) {
     void vscode.window.showErrorMessage("Could not determine the owning workspace for this task.");
     return;

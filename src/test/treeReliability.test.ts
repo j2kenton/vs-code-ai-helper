@@ -543,3 +543,133 @@ void describe("resolveTaskContext — clears stale persisted ID", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// resolveTaskContext — falls back to the sole active task on a stale/paused
+// persisted pointer
+// ---------------------------------------------------------------------------
+// Regression coverage for: CurrentTaskStore is meant to mirror a task's disk
+// `status` field, but can drift (e.g. a task activated through a code path
+// that predates CurrentTaskStore, or paused without anything updating the
+// pointer). When the persisted task is missing/paused, resolveTaskContext
+// should prefer an unambiguous actually-active task instead of blocking the
+// shortcut on staleness — but only when that's unambiguous.
+
+void describe("resolveTaskContext — falls back to the sole active task on a stale/paused pointer", () => {
+  const realDir = process.cwd(); // stand-in existing directory for fs.existsSync
+
+  function makeStubTask(
+    canonicalId: string,
+    folderName: string,
+    status: "active" | "paused"
+  ) {
+    return {
+      taskFolderPath: realDir,
+      canonicalId,
+      folderName,
+      sourceScopeKey: realDir,
+      progress: {
+        taskFolder: folderName,
+        currentStage: "impl" as const,
+        status,
+        createdAt: "2026-07-10T00:00:00.000Z",
+        updatedAt: "2026-07-10T00:00:00.000Z",
+      },
+    };
+  }
+
+  void it("resolves the sole active task when the persisted pointer is paused", async () => {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { resolveTaskContext } = await import("../utils/resolveTaskContext.js");
+
+    const pausedCurrent = makeStubTask("/paused-current", "2026-07-12_task_2", "paused");
+    const soleActive = makeStubTask("/sole-active", "2026-07-10_task_1", "active");
+    const tasks = [pausedCurrent, soleActive];
+
+    let storedId: string | undefined = pausedCurrent.canonicalId;
+    const store = {
+      get: (): string | undefined => storedId,
+      set: (id: string): Promise<void> => { storedId = id; return Promise.resolve(); },
+      clear: (): Promise<void> => { storedId = undefined; return Promise.resolve(); },
+      onDidChange: { event: (_handler: () => void): { dispose: () => void } => ({ dispose(): void {} }) },
+    } as unknown as import("../utils/currentTaskStore").CurrentTaskStore;
+
+    const inventory = {
+      getTasks: () => tasks,
+      getTaskById: (id: string) => tasks.find((t) => t.canonicalId === id),
+      getVisibleTaskForSuppressedId: (_id: string) => undefined,
+      refresh: async (): Promise<void> => {},
+      onDidChange: (_handler: () => void): { dispose: () => void } => ({ dispose(): void {} }),
+    } as unknown as import("../state/taskInventory").TaskInventory;
+
+    const origWsFolders = (vscode.workspace as unknown as Record<string, unknown>).workspaceFolders;
+    (vscode.workspace as unknown as Record<string, unknown>).workspaceFolders = [
+      { uri: vscode.Uri.file(realDir), name: "ws", index: 0 },
+    ];
+
+    try {
+      const resolved = await resolveTaskContext(inventory, undefined, undefined, store);
+
+      assert.strictEqual(
+        resolved?.canonicalId,
+        soleActive.canonicalId,
+        "Expected resolution to prefer the sole actually-active task over the paused persisted pointer"
+      );
+      assert.strictEqual(
+        storedId,
+        soleActive.canonicalId,
+        "Expected CurrentTaskStore to be resynced to the active task"
+      );
+    } finally {
+      (vscode.workspace as unknown as Record<string, unknown>).workspaceFolders = origWsFolders;
+    }
+  });
+
+  void it("does NOT guess when more than one task is active (ambiguous)", async () => {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { resolveTaskContext } = await import("../utils/resolveTaskContext.js");
+
+    const pausedCurrent = makeStubTask("/paused-current-2", "2026-07-12_task_2", "paused");
+    const activeA = makeStubTask("/active-a", "task-a", "active");
+    const activeB = makeStubTask("/active-b", "task-b", "active");
+    const tasks = [pausedCurrent, activeA, activeB];
+
+    let storedId: string | undefined = pausedCurrent.canonicalId;
+    const store = {
+      get: (): string | undefined => storedId,
+      set: (id: string): Promise<void> => { storedId = id; return Promise.resolve(); },
+      clear: (): Promise<void> => { storedId = undefined; return Promise.resolve(); },
+      onDidChange: { event: (_handler: () => void): { dispose: () => void } => ({ dispose(): void {} }) },
+    } as unknown as import("../utils/currentTaskStore").CurrentTaskStore;
+
+    const inventory = {
+      getTasks: () => tasks,
+      getTaskById: (id: string) => tasks.find((t) => t.canonicalId === id),
+      getVisibleTaskForSuppressedId: (_id: string) => undefined,
+      refresh: async (): Promise<void> => {},
+      onDidChange: (_handler: () => void): { dispose: () => void } => ({ dispose(): void {} }),
+    } as unknown as import("../state/taskInventory").TaskInventory;
+
+    const origWsFolders = (vscode.workspace as unknown as Record<string, unknown>).workspaceFolders;
+    (vscode.workspace as unknown as Record<string, unknown>).workspaceFolders = [
+      { uri: vscode.Uri.file(realDir), name: "ws", index: 0 },
+    ];
+
+    try {
+      const resolved = await resolveTaskContext(inventory, undefined, { allowPaused: true }, store);
+
+      assert.strictEqual(
+        resolved?.canonicalId,
+        pausedCurrent.canonicalId,
+        "Expected resolution to keep the persisted (paused) task when multiple tasks are active — ambiguous, must not guess"
+      );
+      assert.strictEqual(
+        storedId,
+        pausedCurrent.canonicalId,
+        "Expected CurrentTaskStore to remain unchanged when the fallback is ambiguous"
+      );
+    } finally {
+      (vscode.workspace as unknown as Record<string, unknown>).workspaceFolders = origWsFolders;
+    }
+  });
+});

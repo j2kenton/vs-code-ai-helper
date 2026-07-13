@@ -153,10 +153,18 @@ function lookupInInventory(
  *      task objects are never returned.
  *   2. Persisted current-task canonical ID from CurrentTaskStore. If the
  *      persisted ID no longer resolves after one refresh, resolution FAILS.
+ *   3. If step 2 came up empty or paused, and there is EXACTLY ONE task in
+ *      the inventory whose disk `status` is "active", use that task instead
+ *      and resync CurrentTaskStore to it. The persisted pointer is meant to
+ *      mirror disk status but can drift (e.g. a task activated through an
+ *      older code path, or paused without the pointer being updated); status
+ *      is the ground truth. When more than one task is "active" at once — the
+ *      invariant is already broken — this step is skipped and resolution
+ *      fails closed rather than guessing.
  *
- * There is intentionally NO last-resort "first active task" fallback.
- * Falling back silently would cause the shortcut to act on an unrelated task
- * when the user has not yet set a current task or after a task is deleted.
+ * Falling back is deliberately narrow (unambiguous only): it must never
+ * silently redirect the shortcut to an unrelated task when the situation is
+ * actually ambiguous.
  *
  * If a lookup misses the current inventory snapshot, one on-demand refresh
  * is performed before the final failure.
@@ -240,6 +248,27 @@ export async function resolveTaskContext(
       // status bar, task actions).
       if (!resolved) {
         await currentTaskStore.clear();
+      }
+    }
+
+    // The persisted pointer is a convenience cache of "which task is active"
+    // and can drift from the disk `status` field it's supposed to mirror —
+    // e.g. a task activated through an older code path that predates
+    // CurrentTaskStore, or a task that was paused directly without anything
+    // updating the pointer. When the persisted task is missing or paused,
+    // prefer an unambiguous actually-active task elsewhere in the inventory
+    // rather than blocking the shortcut on staleness the user has no way to
+    // see. Only act when there is EXACTLY one such task: more than one means
+    // the "single active task" invariant is already broken, and guessing
+    // which one the user means would be worse than failing closed.
+    if (!resolved || resolved.progress.status === "paused") {
+      const activeTasks = inventory.getTasks().filter(
+        (t) => t.progress.status === "active"
+      );
+      const onlyActiveTask = activeTasks.length === 1 ? activeTasks[0] : undefined;
+      if (onlyActiveTask) {
+        resolved = onlyActiveTask;
+        await currentTaskStore.set(onlyActiveTask.canonicalId);
       }
     }
   }
