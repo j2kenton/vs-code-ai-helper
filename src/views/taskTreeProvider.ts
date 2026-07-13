@@ -117,7 +117,6 @@ export class TaskNode extends vscode.TreeItem {
     expanded: boolean,
     isCurrent: boolean = false,
     isScheduled: boolean = false,
-    hasPendingNote: boolean = false,
     isMetaManaged: boolean = false
   ) {
     super(
@@ -178,7 +177,6 @@ export class TaskNode extends vscode.TreeItem {
       hasLintPayload: task.progress.lintPayload !== undefined,
       lintPassed: task.progress.lintPayload?.passed,
       isScheduled,
-      hasPendingNote,
       isMetaManaged
     });
   }
@@ -198,9 +196,7 @@ export class StageNode extends vscode.TreeItem {
     modelInfo?: ResolvedStageModel,
     availableModels?: readonly SelectableModel[]  ,
     isScheduled: boolean = false,
-    hasPendingNote: boolean = false,
-    isMetaManaged: boolean = false,
-    public readonly pendingNote?: string
+    isMetaManaged: boolean = false
   ) {
     super(STAGE_DISPLAY_NAMES[stage], vscode.TreeItemCollapsibleState.None);
 
@@ -266,12 +262,6 @@ export class StageNode extends vscode.TreeItem {
       const effectiveStr = describeResolvedModel(modelInfo, availableModels);
       tooltipStr += `\n\nEffective Model: ${effectiveStr}`;
     }
-    if (hasPendingNote) {
-      this.description = this.description
-        ? `${this.description} · note pending`
-        : "note pending";
-      tooltipStr += "\n\nA note is queued for this stage's next action.";
-    }
     if (isScheduled) {
       this.description = this.description
         ? `${this.description} · scheduled`
@@ -288,7 +278,6 @@ export class StageNode extends vscode.TreeItem {
       task.progress.lintPayload !== undefined,
       task.progress.lintPayload?.passed,
       isScheduled,
-      hasPendingNote,
       isMetaManaged
     );
   }
@@ -310,7 +299,6 @@ export function getStageNodeContextValue(
   hasLintPayload: boolean = false,
   lintPassed?: boolean,
   isScheduled: boolean = false,
-  hasPendingNote: boolean = false,
   isMetaManaged: boolean = false
 ): string {
   return buildStageContextValue({
@@ -320,7 +308,6 @@ export function getStageNodeContextValue(
     hasLintPayload,
     lintPassed,
     isScheduled,
-    hasPendingNote,
     isMetaManaged,
   });
 }
@@ -652,14 +639,11 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
         // scheduledResumeTime belonged to the removed in-session scheduler.
         // Treat legacy values as inert so old completed tasks keep rendering.
         const isScheduled = task.progress.scheduledRun !== undefined;
-        const hasPendingNote = task.progress.pendingNotes !== undefined &&
-          Object.keys(task.progress.pendingNotes).length > 0;
         return new TaskNode(
           task,
           shouldExpand(task, index),
           isCurrent,
           isScheduled,
-          hasPendingNote,
           this.isMetaManaged
         );
       }
@@ -721,8 +705,6 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
       }
 
       const isStageScheduled = status === "current" && task.progress.scheduledRun !== undefined;
-      const stagePendingNote = task.progress.pendingNotes?.[stage];
-      const isStagePendingNote = stagePendingNote !== undefined;
 
       nodes.push(
         new StageNode(
@@ -734,9 +716,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
           modelInfo,
           this.availableModels,
           isStageScheduled,
-          isStagePendingNote,
-          this.isMetaManaged,
-          stagePendingNote
+          this.isMetaManaged
         )
       );
     }

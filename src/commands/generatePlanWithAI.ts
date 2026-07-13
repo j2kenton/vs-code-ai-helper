@@ -40,9 +40,9 @@ const ELIGIBLE_STAGES: readonly TaskStage[] = ["desc", "plan"];
  */
 type GeneratePlanArg =
   | vscode.Uri
-  | { canonicalId?: string; pendingNote?: string }
-  | { task?: IncompleteTask; pendingNote?: string }
-  | { taskFolderPath?: string; pendingNote?: string };
+  | { canonicalId?: string }
+  | { task?: IncompleteTask }
+  | { taskFolderPath?: string };
 
 /**
  * Normalize a GeneratePlanArg into a resolved value for the caller to act on.
@@ -222,10 +222,7 @@ export async function generatePlanWithAI(
     context.extensionUri,
     "create-plan.md",
     {
-      contextPack: contextPackContent +
-        (!(arg instanceof vscode.Uri) && arg?.pendingNote
-          ? `\n\n## Pending stage note\n${arg.pendingNote}`
-          : ""),
+      contextPack: contextPackContent,
     }
   );
 

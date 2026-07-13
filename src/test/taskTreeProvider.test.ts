@@ -591,8 +591,8 @@ void describe("Context Tokens Emission", () => {
       "task-completed-lint-known"
     );
     assert.strictEqual(
-      buildTaskContextValue({ status: "paused", currentStage: "plan", isScheduled: true, hasPendingNote: true, isMetaManaged: true }),
-      "task-paused-scheduled-pending-note-meta-managed"
+      buildTaskContextValue({ status: "paused", currentStage: "plan", isScheduled: true, isMetaManaged: true }),
+      "task-paused-scheduled-meta-managed"
     );
   });
 
@@ -618,8 +618,8 @@ void describe("Context Tokens Emission", () => {
       "stage-modelable"
     );
     assert.strictEqual(
-      buildStageContextValue({ stage: "plan", status: "current", isScheduled: true, hasPendingNote: true, isMetaManaged: true }),
-      "stage-plan-current-scheduled-pending-note-meta-managed-modelable"
+      buildStageContextValue({ stage: "plan", status: "current", isScheduled: true, isMetaManaged: true }),
+      "stage-plan-current-scheduled-meta-managed-modelable"
     );
   });
 });
@@ -656,22 +656,5 @@ void describe("Icon selection in StageNode", () => {
   void it("uses circle-large-outline for outstanding status", () => {
     const node = new StageNode(mockTask, "impl-low-review", "outstanding", undefined);
     assert.strictEqual((node.iconPath as vscode.ThemeIcon).id, "circle-large-outline");
-  });
-
-  void it("exposes the queued pending note for stage action commands", () => {
-    const node = new StageNode(
-      mockTask,
-      "plan",
-      "current",
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      false,
-      true,
-      false,
-      "Regenerate the outline with milestones."
-    );
-    assert.strictEqual(node.pendingNote, "Regenerate the outline with milestones.");
   });
 });

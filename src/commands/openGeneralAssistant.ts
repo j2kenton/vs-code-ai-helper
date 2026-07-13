@@ -18,7 +18,7 @@ export function buildAssistantPrompt(
   recentStatus: Array<{ message: string; level: StatusEntry["level"]; timestamp: string }>,
   question: string
 ): string {
-  return `You are a one-off assistant for task ${task.folderName}. Do not create a chat session or edit files unless explicitly asked.\n\nCurrent stage: ${task.progress.currentStage}\nTask status: ${JSON.stringify({ status: task.progress.status, updatedAt: task.progress.updatedAt, currentStage: task.progress.currentStage, pendingNotes: task.progress.pendingNotes }, null, 2)}\n\nRecent status entries:\n${JSON.stringify(recentStatus, null, 2)}\n\nTask context:\n${contextPack.slice(0, 30000)}\n\nUser question:\n${question}`;
+  return `You are a one-off assistant for task ${task.folderName}. Do not create a chat session or edit files unless explicitly asked.\n\nCurrent stage: ${task.progress.currentStage}\nTask status: ${JSON.stringify({ status: task.progress.status, updatedAt: task.progress.updatedAt, currentStage: task.progress.currentStage }, null, 2)}\n\nRecent status entries:\n${JSON.stringify(recentStatus, null, 2)}\n\nTask context:\n${contextPack.slice(0, 30000)}\n\nUser question:\n${question}`;
 }
 
 /** Run a single task-scoped assistant request; no chat session is created. */

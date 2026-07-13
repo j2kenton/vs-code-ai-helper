@@ -305,8 +305,8 @@ async function readDraftTmpFile(
  * and from the keyboard shortcut router (`{ canonicalId }`).
  */
 type DraftTaskArg =
-  | { canonicalId?: string; taskFolderPath?: string; pendingNote?: string }
-  | { task?: IncompleteTask; pendingNote?: string };
+  | { canonicalId?: string; taskFolderPath?: string }
+  | { task?: IncompleteTask };
 
 /**
  * Normalize a DraftTaskArg into the `{ canonicalId?, taskFolderPath? }` shape
@@ -463,17 +463,11 @@ export async function draftTaskWithAI(
   }
 
   // Build the prompt and check its size BEFORE launching or writing artifacts.
-  const pendingNote = explicitArg && "pendingNote" in explicitArg
-    ? explicitArg.pendingNote
-    : undefined;
   const prompt = await renderPromptTemplate(
     context.extensionUri,
     "draft-task-with-ai.md",
     {
-      taskDescription: `${sourceDescription}\n\nNote: this may be voice-transcribed input; resolve obvious transcription errors from context rather than treating them as requirements.` +
-        (pendingNote
-          ? `\n\n## Pending stage note\n${pendingNote}`
-          : ""),
+      taskDescription: `${sourceDescription}\n\nNote: this may be voice-transcribed input; resolve obvious transcription errors from context rather than treating them as requirements.`,
     }
   );
 

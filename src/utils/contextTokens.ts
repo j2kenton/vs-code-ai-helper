@@ -6,7 +6,6 @@ export interface TaskContextInput {
   hasLintPayload?: boolean;
   lintPassed?: boolean;
   isScheduled?: boolean;
-  hasPendingNote?: boolean;
   isMetaManaged?: boolean;
 }
 
@@ -17,7 +16,6 @@ export interface StageContextInput {
   hasLintPayload?: boolean;
   lintPassed?: boolean;
   isScheduled?: boolean;
-  hasPendingNote?: boolean;
   isMetaManaged?: boolean;
 }
 
@@ -64,10 +62,6 @@ export function buildTaskContextValue(input: TaskContextInput): string {
 
   if (input.isScheduled) {
     tokens.push("scheduled");
-  }
-
-  if (input.hasPendingNote) {
-    tokens.push("pending-note");
   }
 
   if (input.isMetaManaged) {
@@ -138,11 +132,6 @@ export function buildStageContextValue(input: StageContextInput): string {
   // Scheduled state
   if (input.isScheduled) {
     tokens.push("scheduled");
-  }
-
-  // Pending note state
-  if (input.hasPendingNote) {
-    tokens.push("pending-note");
   }
 
   // Meta-managed state

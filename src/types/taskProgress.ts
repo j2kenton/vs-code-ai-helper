@@ -13,14 +13,6 @@ export type TaskStage =
   | "impl-low-review"
   | "publish";
 
-/** Stages whose primary action accepts and consumes a pending user note. */
-export const NOTE_AWARE_STAGES: readonly TaskStage[] = ["desc", "plan"];
-
-/** Whether a stage action can safely receive a pending user note. */
-export function isNoteAwareStage(stage: TaskStage): boolean {
-  return NOTE_AWARE_STAGES.includes(stage);
-}
-
 /** Lifecycle completion is separate from the terminal Publish stage. */
 export type CanonicalTaskStage = TaskStage;
 
@@ -141,8 +133,6 @@ export interface TaskProgress {
   };
   /** @deprecated Kept readable for schedules created by older releases. */
   scheduledResumeTime?: string;
-  /** Pending notes by stage */
-  pendingNotes?: Partial<Record<TaskStage, string>>;
   /** Active fallback state by stage */
   fallbackActive?: Partial<Record<TaskStage, boolean>>;
   /** Monotonic token identifying the review run allowed to finalize this stage. */

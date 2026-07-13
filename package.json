@@ -181,7 +181,7 @@
       },
       {
         "command": "vs-code-ai-helper.chatWithStage",
-        "title": "Add Pending Stage Note",
+        "title": "Chat with AI",
         "category": "Ensemble",
         "icon": "$(comment)"
       },
@@ -506,6 +506,11 @@
           "group": "inline@2"
         },
         {
+          "command": "vs-code-ai-helper.chatWithStage",
+          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage-publish-current/ && !(viewItem =~ /-paused/)",
+          "group": "inline@3"
+        },
+        {
           "command": "vs-code-ai-helper.commitAndPushTask",
           "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage-publish-current/ && !(viewItem =~ /-paused/)",
           "group": "inline@4"
@@ -527,7 +532,7 @@
         },
         {
           "command": "vs-code-ai-helper.chatWithStage",
-          "when": "view == vs-code-ai-helper.tasksView && (viewItem =~ /^stage-desc-current/ || viewItem =~ /^stage-plan-current/) && !(viewItem =~ /-paused/)",
+          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /-modelable$/ && !(viewItem =~ /^stage-publish-current/) && !(viewItem =~ /-paused/)",
           "group": "inline@9"
         },
         {

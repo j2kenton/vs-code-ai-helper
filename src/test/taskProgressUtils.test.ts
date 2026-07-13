@@ -10,7 +10,7 @@ import {
   updateTaskProgressStage,
   patchTaskProgress,
 } from "../utils/taskProgressUtils";
-import { isNoteAwareStage, type TaskProgress } from "../types/taskProgress";
+import { type TaskProgress } from "../types/taskProgress";
 
 function makeProgress(implReviewFiles?: string[]): TaskProgress {
   return {
@@ -106,28 +106,22 @@ void test("clearStageFallbackReservation is a no-op when the stage is not reserv
   assert.strictEqual(cleared, progress);
 });
 
-void test("leaving a stage expires only that stage's pending note", () => {
+void test("updateTaskProgressStage advances the stage and clears the new stage fallback reservation", () => {
   const progress: TaskProgress = {
     ...makeProgress(),
     currentStage: "desc",
-    pendingNotes: {
-      desc: "Use the API terminology from the design doc.",
-      plan: "Keep this note for the plan lifecycle.",
+    fallbackActive: {
+      desc: true,
+      plan: true,
     },
   };
 
   const updated = updateTaskProgressStage(progress, "plan");
 
-  assert.deepEqual(updated.pendingNotes, {
-    plan: "Keep this note for the plan lifecycle.",
+  assert.equal(updated.currentStage, "plan");
+  assert.deepEqual(updated.fallbackActive, {
+    desc: true,
   });
-});
-
-void test("only description and plan actions are note-aware", () => {
-  assert.equal(isNoteAwareStage("desc"), true);
-  assert.equal(isNoteAwareStage("plan"), true);
-  assert.equal(isNoteAwareStage("plan-high-review"), false);
-  assert.equal(isNoteAwareStage("publish"), false);
 });
 
 // ---------------------------------------------------------------------------

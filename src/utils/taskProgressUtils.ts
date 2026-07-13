@@ -233,15 +233,10 @@ export function updateTaskProgressStage(
 ): TaskProgress {
   const fallbackActive = { ...progress.fallbackActive };
   delete fallbackActive[newStage];
-  // A note belongs to one lifecycle epoch. Once its stage is left it can no
-  // longer be consumed by that stage's action, so expire it deliberately.
-  const pendingNotes = { ...progress.pendingNotes };
-  if (progress.currentStage !== newStage) delete pendingNotes[progress.currentStage];
   return {
     ...progress,
     currentStage: newStage,
     fallbackActive,
-    pendingNotes: Object.keys(pendingNotes).length ? pendingNotes : undefined,
     updatedAt: new Date().toISOString(),
   };
 }
