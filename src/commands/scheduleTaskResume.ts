@@ -34,7 +34,7 @@ export class TaskActionScheduler implements vscode.Disposable {
     });
     if (progress && !progress.scheduledRun) await vscode.commands.executeCommand("vs-code-ai-helper.applyCurrentStageAction", { canonicalId, taskFolderPath });
   }
-  async armAll(): Promise<void> { for (const task of await this.inventory.getTasks()) await this.arm(task.taskFolderPath, task.canonicalId); }
+  async armAll(): Promise<void> { for (const task of this.inventory.getTasks()) await this.arm(task.taskFolderPath, task.canonicalId); }
   async cancel(taskFolderPath: string): Promise<void> { const timer = this.timers.get(taskFolderPath); if (timer) this.clock.clearTimeout(timer); this.timers.delete(taskFolderPath); await patchTaskProgress(vscode.Uri.file(taskFolderPath), p => ({ ...p, scheduledRun: undefined, scheduledResumeTime: undefined, updatedAt: new Date(this.clock.now()).toISOString() })); }
   dispose(): void { for (const timer of this.timers.values()) this.clock.clearTimeout(timer); this.timers.clear(); }
 }
