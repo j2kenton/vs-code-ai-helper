@@ -12,7 +12,7 @@ import { NotificationRouter } from "../utils/notificationRouter";
 import { TaskTreeProvider } from "../views/taskTreeProvider";
 import { shortcutHint } from "../utils/shortcutHints";
 import { backupArtifactBeforeWrite, backupArtifactContents } from "../utils/artifactBackups";
-import { patchTaskProgress } from "../utils/taskProgressUtils";
+import { patchTaskProgress, IncompleteTask } from "../utils/taskProgressUtils";
 
 const INTRO_TEXT = `Briefly describe what changes you want to be made, and then use AI to help you clarify the plan.`;
 const SHORTCUT_NOTE = `Shortcut: Apply Current Stage Action${shortcutHint("vs-code-ai-helper.applyCurrentStageAction")}.`;
@@ -299,6 +299,38 @@ async function readDraftTmpFile(
 }
 
 /**
+ * Accepted argument shapes for draftTaskWithAI. Mirrors generatePlanWithAI's
+ * GeneratePlanArg so the command works both from the tree stage-row inline
+ * button (which passes the StageNode itself, i.e. `.task: IncompleteTask`)
+ * and from the keyboard shortcut router (`{ canonicalId }`).
+ */
+type DraftTaskArg = { canonicalId?: string } | { task?: IncompleteTask };
+
+/**
+ * Normalize a DraftTaskArg into the `{ canonicalId?, taskFolderPath? }` shape
+ * resolveTaskContext accepts.
+ *
+ * @internal exported for testing
+ */
+export function normalizeDraftTaskArg(
+  arg?: DraftTaskArg
+): { canonicalId?: string; taskFolderPath?: string } | undefined {
+  if (!arg) {
+    return undefined;
+  }
+  if ("task" in arg && arg.task) {
+    return {
+      canonicalId: arg.task.canonicalId,
+      taskFolderPath: arg.task.folderUri.fsPath,
+    };
+  }
+  if ("canonicalId" in arg && arg.canonicalId) {
+    return { canonicalId: arg.canonicalId };
+  }
+  return undefined;
+}
+
+/**
  * Draft the task description with AI. Reads from the live open document
  * buffer if task.md is open (to capture unsaved edits), writes back only
  * to `## Draft with AI` and `## Open Questions`.
@@ -321,7 +353,7 @@ async function readDraftTmpFile(
 export async function draftTaskWithAI(
   inventory: TaskInventory,
   context: vscode.ExtensionContext,
-  explicitArg?: { canonicalId?: string }
+  explicitArg?: DraftTaskArg
 ): Promise<void> {
   // ── Workspace guard (must come before consent) ──────────────────────────
   // ── Consent gate ─────────────────────────────────────────────────────────
@@ -330,7 +362,7 @@ export async function draftTaskWithAI(
     return;
   }
 
-  const resolvedTask = await resolveTaskContext(inventory, explicitArg, {
+  const resolvedTask = await resolveTaskContext(inventory, normalizeDraftTaskArg(explicitArg), {
     allowPaused: false,
   });
 
@@ -596,7 +628,7 @@ export function registerDraftTaskWithAICommand(
 ): void {
   const disposable = vscode.commands.registerCommand(
     "vs-code-ai-helper.draftTaskWithAI",
-    (explicitArg?: { canonicalId?: string }) =>
+    (explicitArg?: Parameters<typeof draftTaskWithAI>[2]) =>
       draftTaskWithAI(inventory, context, explicitArg)
   );
   context.subscriptions.push(disposable);
