@@ -853,7 +853,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               }
               if (usesBackup && extraBackups.some(candidate => !availableModels.some(model => model.id === candidate))) {
                 hasErrors = true;
-                alertRegion.innerText += 'Stage ' + (stageDisplayNames[stage] || stage) + ' has an invalid additional backup model selection.\n';
+                alertRegion.innerText += 'Stage ' + (stageDisplayNames[stage] || stage) + ' has an invalid additional backup model selection.\\n';
               }
 
               updatedSettings[stage] = {
