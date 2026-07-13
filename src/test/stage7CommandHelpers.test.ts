@@ -1,6 +1,10 @@
 import * as assert from "node:assert/strict";
 import { test } from "node:test";
-import { extractChatResponseText } from "../commands/chatWithStage";
+import * as vscode from "vscode";
+import {
+  buildStageChatPrompt,
+  resolveStageChatOutcome,
+} from "../commands/chatWithStage";
 import { buildAssistantPrompt } from "../commands/openGeneralAssistant";
 import { TaskProgress } from "../types/taskProgress";
 
@@ -28,23 +32,46 @@ void test("assistant prompts contain task state, recent status, context, and the
   assert.match(prompt, /What should I do next\?/);
 });
 
-void test("stage chat surfaces completed summaries and rejects failed runs", () => {
-  assert.equal(
-    extractChatResponseText({
-      runnerId: "copilot-lm",
+void test("stage chat prompt includes task context and the user message", () => {
+  const prompt = buildStageChatPrompt(
+    "Plan",
+    "task-42",
+    "# Context\nImportant repository details",
+    "What should I change?"
+  );
+
+  assert.match(prompt, /Plan stage/);
+  assert.match(prompt, /task-42/);
+  assert.match(prompt, /Important repository details/);
+  assert.match(prompt, /What should I change\?/);
+});
+
+void test("stage chat handles completed, cancelled, and failed outcomes", () => {
+  const output = vscode.Uri.file("/tmp/stage-chat.md");
+  assert.deepEqual(
+    resolveStageChatOutcome({
       status: "completed",
-      filesChanged: [],
-      summary: "Use the existing abstraction.",
+      outputFile: output,
     }),
-    "Use the existing abstraction."
+    {
+      kind: "completed",
+      outputFile: output,
+    }
+  );
+
+  assert.deepEqual(
+    resolveStageChatOutcome({
+      status: "cancelled",
+    }),
+    {
+      kind: "cancelled",
+    }
   );
 
   assert.throws(
     () =>
-      extractChatResponseText({
-        runnerId: "copilot-lm",
+      resolveStageChatOutcome({
         status: "failed",
-        filesChanged: [],
         errorMessage: "Provider is unavailable.",
       }),
     /Provider is unavailable\./

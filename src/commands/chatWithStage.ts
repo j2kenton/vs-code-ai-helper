@@ -4,12 +4,13 @@ import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { STAGE_DISPLAY_NAMES, TaskStage } from "../types/taskProgress";
 import { IncompleteTask } from "../utils/taskProgressUtils";
 import { resolveFreshModelForStage } from "../utils/modelSelection";
-import { resolveRunnerForModel, runImplementationForModel } from "../runners/runnerRegistry";
+import { resolveRunnerForModel } from "../runners/runnerRegistry";
 import { generateContextPack } from "../utils/contextPack";
 import { ensureAiConsent } from "../utils/aiConsent";
 import { checkAndConfirmPromptSize } from "../utils/promptSizeGuard";
+import { AgentRunResult } from "../types/agentRunner";
+import { ensureRunsDirectory } from "../utils/runLog";
 
-type ChatRunResult = Awaited<ReturnType<typeof runImplementationForModel>>;
 type ChatWithStageArg =
   | { task?: IncompleteTask; stage?: TaskStage }
   | { canonicalId?: string; taskFolderPath?: string; stage?: TaskStage };
@@ -43,11 +44,28 @@ function normalizeArg(node: ChatWithStageArg | undefined): {
   };
 }
 
-export function extractChatResponseText(result: ChatRunResult): string {
-  if (result.status !== "completed") {
-    throw new Error(result.errorMessage ?? "Stage chat did not complete.");
+export function buildStageChatPrompt(
+  stageName: string,
+  taskName: string,
+  contextPack: string,
+  message: string
+): string {
+  return `You are assisting with the ${stageName} stage for task ${taskName}.\n\nCurrent task context:\n${contextPack.slice(0, 30000)}\n\nUser message:\n${message}\n\nRespond directly and concisely. If the user requests workspace changes, describe the exact edits or next action to take instead of claiming they were already made.`;
+}
+
+export function resolveStageChatOutcome(
+  result: Pick<AgentRunResult, "status" | "outputFile" | "errorMessage"> | undefined
+) {
+  if (result?.status === "cancelled") {
+    return { kind: "cancelled" as const };
   }
-  return result.summary ?? "The model did not return a response.";
+  if (result?.status !== "completed" || !result.outputFile) {
+    throw new Error(result?.errorMessage ?? "Stage chat did not complete.");
+  }
+  return {
+    kind: "completed" as const,
+    outputFile: result.outputFile,
+  };
 }
 
 export async function chatWithStage(
@@ -104,18 +122,26 @@ export async function chatWithStage(
       return;
     }
 
-    const { providerLabel } = resolveRunnerForModel(modelId, targetStage, taskFolderUri);
+    const resolved = resolveRunnerForModel(modelId, targetStage, taskFolderUri);
+    if (!resolved.runner.capabilities.assistant) {
+      throw new Error(`${resolved.providerLabel} does not support assistant mode.`);
+    }
     const contextPack = await generateContextPack(taskFolderUri, workspaceFolder.uri);
-    const prompt = `You are assisting with the ${stageName} stage for task ${resolvedTask.folderName}.\n\n` +
-      `Current task context:\n${contextPack.slice(0, 30000)}\n\nUser message:\n${message}\n\n` +
-      "Respond directly and concisely. If the user requests code changes, make them in the workspace and summarize what changed.";
+    const prompt = buildStageChatPrompt(
+      stageName,
+      resolvedTask.folderName,
+      contextPack,
+      message
+    );
 
-    const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel);
+    const sizeCheck = await checkAndConfirmPromptSize(prompt, resolved.providerLabel);
     if (sizeCheck === "abort" || sizeCheck === "declined") {
       return;
     }
 
-    let responseText = "";
+    const runsUri = await ensureRunsDirectory(taskFolderUri);
+    const output = vscode.Uri.joinPath(runsUri, `stage-chat-${Date.now()}.md`);
+    let result: Awaited<ReturnType<typeof resolved.runner.run>> | undefined;
     await vscode.window.withProgress(
       {
         location: vscode.ProgressLocation.Notification,
@@ -123,24 +149,26 @@ export async function chatWithStage(
         cancellable: true,
       },
       async (_progress, token) => {
-        const result = await runImplementationForModel({
-          modelId,
-          prompt,
-          workspaceUri: workspaceFolder.uri,
-          token,
-          onProgress: () => undefined,
-          stage: targetStage,
+        result = await resolved.runner.run({
           taskFolderUri,
-        });
-        responseText = extractChatResponseText(result);
+          workspaceUri: workspaceFolder.uri,
+          stage: targetStage,
+          prompt,
+          outputFile: output,
+          modelId: resolved.nativeModelId,
+        }, token);
       }
     );
 
-    const document = await vscode.workspace.openTextDocument({
-      content: responseText,
-      language: "markdown",
-    });
-    await vscode.window.showTextDocument(document, { preview: false });
+    const outcome = resolveStageChatOutcome(result);
+    if (outcome.kind === "cancelled") {
+      void vscode.window.showInformationMessage("Stage chat cancelled.");
+      return;
+    }
+    await vscode.window.showTextDocument(
+      await vscode.workspace.openTextDocument(outcome.outputFile),
+      { preview: false }
+    );
   } catch (error) {
     void vscode.window.showErrorMessage(
       `Stage chat failed: ${error instanceof Error ? error.message : String(error)}`
