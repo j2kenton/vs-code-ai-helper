@@ -64,6 +64,38 @@ void describe("Stage 3 action matrix contracts", () => {
     );
   });
 
+  void it("declares Draft with AI menu for current desc stage row", () => {
+    const contributes = readPackageContributes();
+    const contextMenus = contributes.menus?.["view/item/context"] ?? [];
+
+    const draftEntry = contextMenus.find(
+      (entry) =>
+        entry.command === "vs-code-ai-helper.draftTaskWithAI" &&
+        (entry.when ?? "").includes("viewItem =~ /^stage-desc-current/")
+    );
+
+    assert.ok(
+      draftEntry,
+      "Expected draftTaskWithAI menu entry for stage-desc-current"
+    );
+  });
+
+  void it("declares Generate Plan menu for current plan stage row", () => {
+    const contributes = readPackageContributes();
+    const contextMenus = contributes.menus?.["view/item/context"] ?? [];
+
+    const generateEntry = contextMenus.find(
+      (entry) =>
+        entry.command === "vs-code-ai-helper.generatePlanWithAI" &&
+        (entry.when ?? "").includes("viewItem =~ /^stage-plan-current/")
+    );
+
+    assert.ok(
+      generateEntry,
+      "Expected generatePlanWithAI menu entry for stage-plan-current"
+    );
+  });
+
   void it("declares markTaskDone menu for current Publish (completed) stage row", () => {
     const contributes = readPackageContributes();
     const contextMenus = contributes.menus?.["view/item/context"] ?? [];

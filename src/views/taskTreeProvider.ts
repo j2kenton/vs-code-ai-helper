@@ -199,7 +199,8 @@ export class StageNode extends vscode.TreeItem {
     availableModels?: readonly SelectableModel[]  ,
     isScheduled: boolean = false,
     hasPendingNote: boolean = false,
-    isMetaManaged: boolean = false
+    isMetaManaged: boolean = false,
+    public readonly pendingNote?: string
   ) {
     super(STAGE_DISPLAY_NAMES[stage], vscode.TreeItemCollapsibleState.None);
 
@@ -720,7 +721,8 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
       }
 
       const isStageScheduled = status === "current" && task.progress.scheduledRun !== undefined;
-      const isStagePendingNote = task.progress.pendingNotes?.[stage] !== undefined;
+      const stagePendingNote = task.progress.pendingNotes?.[stage];
+      const isStagePendingNote = stagePendingNote !== undefined;
 
       nodes.push(
         new StageNode(
@@ -733,7 +735,8 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
           this.availableModels,
           isStageScheduled,
           isStagePendingNote,
-          this.isMetaManaged
+          this.isMetaManaged,
+          stagePendingNote
         )
       );
     }

@@ -657,4 +657,21 @@ void describe("Icon selection in StageNode", () => {
     const node = new StageNode(mockTask, "impl-low-review", "outstanding", undefined);
     assert.strictEqual((node.iconPath as vscode.ThemeIcon).id, "circle-large-outline");
   });
+
+  void it("exposes the queued pending note for stage action commands", () => {
+    const node = new StageNode(
+      mockTask,
+      "plan",
+      "current",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      false,
+      true,
+      false,
+      "Regenerate the outline with milestones."
+    );
+    assert.strictEqual(node.pendingNote, "Regenerate the outline with milestones.");
+  });
 });

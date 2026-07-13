@@ -27,9 +27,10 @@ export function clearPendingNoteForStage(
 }
 
 /**
- * Routes the keyboard shortcut and inline stage actions to the primary action
- * for the current task stage. Keeping both entry points here ensures queued
- * stage notes are supplied and consumed consistently.
+ * Routes the keyboard shortcut and other generic "current stage action"
+ * entry points to the primary action for the current task stage. Keeping
+ * those paths here ensures queued stage notes are supplied and consumed
+ * consistently.
  *
  * - Task Description  -> draftTaskWithAI
  * - High-Level Review -> applyHighLevelReviewChanges (if artifact exists)
