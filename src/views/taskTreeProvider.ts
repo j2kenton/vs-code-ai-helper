@@ -636,7 +636,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
         const isCurrent =
           currentTaskCanonicalId !== undefined &&
           taskId === currentTaskCanonicalId;
-        const isScheduled = task.progress.scheduledResumeTime !== undefined;
+        const isScheduled = task.progress.scheduledRun !== undefined || task.progress.scheduledResumeTime !== undefined;
         const hasPendingNote = task.progress.pendingNotes !== undefined &&
           Object.keys(task.progress.pendingNotes).length > 0;
         return new TaskNode(
@@ -703,8 +703,8 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
         modelInfo = await resolveModelForStage(task.folderUri, stage);
       }
 
-      const isStageScheduled = status === "current" && task.progress.scheduledResumeTime !== undefined;
-      const isStagePendingNote = status === "current" && task.progress.pendingNotes?.[stage] !== undefined;
+      const isStageScheduled = status === "current" && (task.progress.scheduledRun !== undefined || task.progress.scheduledResumeTime !== undefined);
+      const isStagePendingNote = task.progress.pendingNotes?.[stage] !== undefined;
 
       nodes.push(
         new StageNode(

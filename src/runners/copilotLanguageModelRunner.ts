@@ -24,6 +24,7 @@ export class CopilotLanguageModelRunner implements AgentRunner {
   readonly capabilities: AgentRunnerCapabilities = {
     planning: true,
     review: true,
+    assistant: true,
   };
 
   async isAvailable(): Promise<AgentAvailability> {

@@ -13,6 +13,8 @@ export type AgentWorkflowStage = TaskStage;
 export interface AgentRunnerCapabilities {
   planning: boolean;
   review: boolean;
+  /** Can produce a task-scoped, non-session assistant response. */
+  assistant: boolean;
 }
 
 /**

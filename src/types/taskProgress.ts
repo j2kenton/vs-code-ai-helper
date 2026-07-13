@@ -124,7 +124,14 @@ export interface TaskProgress {
    * a lint run or an explicit user bypass.
    */
   lintPayload?: LintPayload;
-  /** ISO timestamp when the task is scheduled to resume */
+  /** Persisted one-shot current-stage action schedule. */
+  scheduledRun?: {
+    runAt: string;
+    stage: TaskStage;
+    leaseOwner?: string;
+    leaseUntil?: string;
+  };
+  /** @deprecated Kept readable for schedules created by older releases. */
   scheduledResumeTime?: string;
   /** Pending notes by stage */
   pendingNotes?: Partial<Record<TaskStage, string>>;

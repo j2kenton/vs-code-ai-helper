@@ -181,7 +181,7 @@
       },
       {
         "command": "vs-code-ai-helper.chatWithStage",
-        "title": "Chat with Stage AI",
+        "title": "Add Pending Stage Note",
         "category": "Ensemble",
         "icon": "$(comment)"
       },
@@ -199,7 +199,13 @@
       },
       {
         "command": "vs-code-ai-helper.scheduleTaskResume",
-        "title": "Schedule Resume",
+        "title": "Schedule Current Stage Action",
+        "category": "Ensemble",
+        "icon": "$(clock)"
+      },
+      {
+        "command": "vs-code-ai-helper.cancelScheduledTaskAction",
+        "title": "Cancel Scheduled Stage Action",
         "category": "Ensemble",
         "icon": "$(clock)"
       },
@@ -526,7 +532,7 @@
         },
         {
           "command": "vs-code-ai-helper.chatWithStage",
-          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /-modelable$/",
+          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage-.*-current.*-modelable$/ && !(viewItem =~ /-paused/)",
           "group": "inline@9"
         },
         {
@@ -551,7 +557,12 @@
         },
         {
           "command": "vs-code-ai-helper.scheduleTaskResume",
-          "when": "view == vs-code-ai-helper.tasksView && ((viewItem =~ /^task-active/ && !(viewItem =~ /^task-active-review/)) || viewItem =~ /^task-paused/)",
+          "when": "view == vs-code-ai-helper.tasksView && ((viewItem =~ /^task-active/ && !(viewItem =~ /^task-active-review/) && !(viewItem =~ /-scheduled/)) || (viewItem =~ /^task-paused/ && !(viewItem =~ /-scheduled/)))",
+          "group": "task@4"
+        },
+        {
+          "command": "vs-code-ai-helper.cancelScheduledTaskAction",
+          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^task/ && viewItem =~ /-scheduled/",
           "group": "task@4"
         }
       ]

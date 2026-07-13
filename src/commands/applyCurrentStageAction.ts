@@ -6,6 +6,9 @@ import {
   STAGE_ARTIFACT_FILENAMES,
   STAGE_DISPLAY_NAMES,
 } from "../types/taskProgress";
+import { patchTaskProgress } from "../utils/taskProgressUtils";
+
+type ApplyArg = { canonicalId?: string; taskFolderPath?: string };
 
 /**
  * Keyboard shortcut router: applies the primary action for the current
@@ -18,11 +21,12 @@ import {
  */
 export async function applyCurrentStageAction(
   inventory: TaskInventory,
-  currentTaskStore: CurrentTaskStore
+  currentTaskStore: CurrentTaskStore,
+  explicitArg?: ApplyArg
 ): Promise<void> {
   const resolvedTask = await resolveTaskContext(
     inventory,
-    undefined,
+    explicitArg,
     { allowPaused: true, promptForOwnershipResolution: true },
     currentTaskStore
   );
@@ -42,25 +46,36 @@ export async function applyCurrentStageAction(
   }
 
   const stage = resolvedTask.progress.currentStage;
+  const consumeNoteAfterSuccess = async (): Promise<void> => {
+    if (!resolvedTask.progress.pendingNotes?.[stage]) return;
+    await patchTaskProgress(vscode.Uri.file(resolvedTask.taskFolderPath), current => {
+      // Never consume a note after a competing transition changed the stage.
+      if (current.currentStage !== stage || !current.pendingNotes?.[stage]) return current;
+      const pendingNotes = { ...current.pendingNotes };
+      delete pendingNotes[stage];
+      return { ...current, pendingNotes: Object.keys(pendingNotes).length ? pendingNotes : undefined, updatedAt: new Date().toISOString() };
+    });
+  };
+  const execute = async (command: string): Promise<void> => {
+    await vscode.commands.executeCommand(command, {
+      canonicalId: resolvedTask.canonicalId,
+      pendingNote: resolvedTask.progress.pendingNotes?.[stage],
+    });
+    await consumeNoteAfterSuccess();
+  };
 
   if (stage === "desc") {
-    await vscode.commands.executeCommand("vs-code-ai-helper.draftTaskWithAI", {
-      canonicalId: resolvedTask.canonicalId,
-    });
+    await execute("vs-code-ai-helper.draftTaskWithAI");
     return;
   }
 
   if (stage === "plan") {
-    await vscode.commands.executeCommand("vs-code-ai-helper.generatePlanWithAI", {
-      canonicalId: resolvedTask.canonicalId,
-    });
+    await execute("vs-code-ai-helper.generatePlanWithAI");
     return;
   }
 
   if (stage === "publish") {
-    await vscode.commands.executeCommand("vs-code-ai-helper.runLintingFixes", {
-      canonicalId: resolvedTask.canonicalId,
-    });
+    await execute("vs-code-ai-helper.runLintingFixes");
     return;
   }
 
@@ -73,10 +88,7 @@ export async function applyCurrentStageAction(
       );
       try {
         await vscode.workspace.fs.stat(artifactUri);
-        await vscode.commands.executeCommand(
-          "vs-code-ai-helper.applyHighLevelReviewChanges",
-          { canonicalId: resolvedTask.canonicalId }
-        );
+        await execute("vs-code-ai-helper.applyHighLevelReviewChanges");
         return;
       } catch {
         void vscode.window.showInformationMessage(
@@ -97,10 +109,7 @@ export async function applyCurrentStageAction(
       );
       try {
         await vscode.workspace.fs.stat(artifactUri);
-        await vscode.commands.executeCommand(
-          "vs-code-ai-helper.applyLowLevelReviewChanges",
-          { canonicalId: resolvedTask.canonicalId }
-        );
+        await execute("vs-code-ai-helper.applyLowLevelReviewChanges");
         return;
       } catch {
         void vscode.window.showInformationMessage(
@@ -127,7 +136,7 @@ export function registerApplyCurrentStageActionCommand(
 ): void {
   const disposable = vscode.commands.registerCommand(
     "vs-code-ai-helper.applyCurrentStageAction",
-    () => applyCurrentStageAction(inventory, currentTaskStore)
+    (arg?: ApplyArg) => applyCurrentStageAction(inventory, currentTaskStore, arg)
   );
   context.subscriptions.push(disposable);
 }

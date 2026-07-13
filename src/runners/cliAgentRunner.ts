@@ -603,6 +603,7 @@ export class CliAgentRunner implements AgentRunner {
   readonly capabilities: AgentRunnerCapabilities = {
     planning: true,
     review: true,
+    assistant: true,
   };
 
   constructor(private readonly def: CliProviderDefinition) {

@@ -22,7 +22,7 @@ import {
   refreshMetaResourcesGitIgnoreContext,
   registerToggleMetaResourcesGitIgnoreCommand,
 } from "./commands/toggleMetaResourcesGitIgnore";
-import { registerChatWithStageCommand } from "./commands/chatWithStage";
+import { registerAddPendingNoteCommand } from "./commands/addPendingNote";
 import { registerOpenGeneralAssistantCommand } from "./commands/openGeneralAssistant";
 import { registerRunLintingFixesCommand } from "./commands/runLintingFixes";
 import { registerScheduleTaskResumeCommand } from "./commands/scheduleTaskResume";
@@ -161,8 +161,8 @@ export function activate(context: vscode.ExtensionContext): void {
   registerApplyLowLevelReviewChangesCommand(context, inventory);
   registerCommitAndPushTaskCommand(context, inventory, currentTaskStore);
   registerToggleMetaResourcesGitIgnoreCommand(context, inventory, currentTaskStore);
-  registerChatWithStageCommand(context, inventory);
-  registerOpenGeneralAssistantCommand(context);
+  registerAddPendingNoteCommand(context, inventory);
+  registerOpenGeneralAssistantCommand(context, inventory, currentTaskStore);
   registerRunLintingFixesCommand(context, inventory);
   registerScheduleTaskResumeCommand(context, inventory);
   registerMarkTaskDoneCommand(context, inventory, currentTaskStore);
