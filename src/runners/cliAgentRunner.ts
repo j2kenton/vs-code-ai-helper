@@ -675,6 +675,45 @@ export class CliAgentRunner implements AgentRunner {
  */
 type GitSnapshot = Map<string, string>;
 
+interface GitStatusEntry {
+  statusCode: string;
+  path: string;
+}
+
+function parseGitStatusEntries(statusOutput: string): GitStatusEntry[] {
+  const entries = statusOutput.split("\0");
+  const parsed: GitStatusEntry[] = [];
+  let index = 0;
+  while (index < entries.length) {
+    const entry = entries[index]!;
+    index++;
+    if (entry.length < 4) {
+      continue;
+    }
+
+    const statusCode = entry.substring(0, 2);
+    const path = entry.substring(3).replace(/\\/g, "/");
+    if (path.length > 0) {
+      parsed.push({ statusCode, path });
+    }
+
+    if (
+      (statusCode[0] === "R" ||
+        statusCode[0] === "C" ||
+        statusCode[1] === "R" ||
+        statusCode[1] === "C") &&
+      entries[index]
+    ) {
+      parsed.push({
+        statusCode,
+        path: entries[index]!.replace(/\\/g, "/"),
+      });
+      index++;
+    }
+  }
+  return parsed;
+}
+
 /**
  * Snapshot of the workspace's git working-tree state, keyed by
  * workspace-relative path, used to detect which files an agentic CLI run
@@ -684,31 +723,19 @@ type GitSnapshot = Map<string, string>;
 async function gitStatusSnapshot(
   cwd: string
 ): Promise<GitSnapshot | undefined> {
-  const statusOutput = await execGit(cwd, ["status", "--porcelain"]);
+  const statusOutput = await execGit(cwd, [
+    "status",
+    "--porcelain=v1",
+    "-z",
+    "--untracked-files=all",
+  ]);
   if (statusOutput === undefined) {
     return undefined;
   }
 
   const snapshot: GitSnapshot = new Map();
   const paths: string[] = [];
-  for (const rawLine of statusOutput.split(/\r?\n/)) {
-    const line = rawLine.trimEnd();
-    if (line.length === 0) {
-      continue;
-    }
-    const statusCode = line.substring(0, 2);
-    let path = line.substring(3);
-    const renameIdx = path.indexOf(" -> ");
-    if (renameIdx >= 0) {
-      path = path.substring(renameIdx + 4);
-    }
-    if (path.startsWith('"') && path.endsWith('"')) {
-      path = path.substring(1, path.length - 1);
-    }
-    path = path.replace(/\\/g, "/");
-    if (path.length === 0) {
-      continue;
-    }
+  for (const { statusCode, path } of parseGitStatusEntries(statusOutput)) {
     snapshot.set(path, statusCode);
     paths.push(path);
   }
@@ -781,7 +808,8 @@ function toCliImplementationRunResult(
   def: CliProviderDefinition,
   result: CliExecResult,
   filesChanged: string[],
-  filesChangedUnknown: boolean
+  filesChangedUnknown: boolean,
+  requireFileChange = true
 ): ImplementationRunResult {
   if (result.status === "cancelled") {
     return { status: "cancelled", filesChanged, filesChangedUnknown };
@@ -795,7 +823,7 @@ function toCliImplementationRunResult(
       failureKind: result.failureKind,
     };
   }
-  if (!filesChangedUnknown && filesChanged.length === 0) {
+  if (requireFileChange && !filesChangedUnknown && filesChanged.length === 0) {
     const providerOutput = result.output.trim();
     return {
       status: "failed",
@@ -827,6 +855,13 @@ function toCliImplementationRunResult(
  * changed are detected via a git status snapshot taken before and after.
  * Mirrors runImplementationWithCopilot's result shape so callers treat all
  * providers uniformly.
+ *
+ * requireFileChange (default true) fails the run when the CLI reports
+ * completion without touching any file — appropriate for "Run
+ * Implementation", where a no-op really is a failure. Callers whose prompt
+ * may legitimately be answered without an edit (e.g. stage-response chat)
+ * should pass false so a real "just an answer" completion isn't misreported
+ * as an error.
  */
 export async function runImplementationWithCli(options: {
   def: CliProviderDefinition;
@@ -835,8 +870,9 @@ export async function runImplementationWithCli(options: {
   workspaceUri: vscode.Uri;
   token: vscode.CancellationToken;
   onProgress: (message: string) => void;
+  requireFileChange?: boolean;
 }): Promise<ImplementationRunResult> {
-  const { def, model, prompt, workspaceUri, token, onProgress } = options;
+  const { def, model, prompt, workspaceUri, token, onProgress, requireFileChange } = options;
   const cwd = workspaceUri.fsPath;
 
   onProgress(`Using ${def.label}...`);
@@ -891,6 +927,7 @@ export async function runImplementationWithCli(options: {
     def,
     result,
     filesChanged,
-    filesChangedUnknown
+    filesChangedUnknown,
+    requireFileChange
   );
 }

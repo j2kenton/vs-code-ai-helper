@@ -1,14 +1,62 @@
 import * as assert from "node:assert/strict";
+import * as cp from "node:child_process";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { test } from "node:test";
 import * as vscode from "vscode";
+import { buildStageResponsePrompt } from "../commands/chatWithStage";
 import {
-  buildStageEditPrompt,
-  buildStageChatPrompt,
-  looksLikeStageEditRequest,
-  resolveStageChatOutcome,
-} from "../commands/chatWithStage";
+  changedStageResponsePathsSince,
+  normalizeStageResponseChangedFiles,
+  partitionScopedFiles,
+  resolveStageResponseScope,
+  resolveStageResponseScopePath,
+  revertOutOfScopeFiles,
+  snapshotDirtyPaths,
+  snapshotStageResponseState,
+} from "../utils/stageResponseScope";
 import { buildAssistantPrompt } from "../commands/openGeneralAssistant";
 import { TaskProgress } from "../types/taskProgress";
+
+function git(cwd: string, args: string[]): void {
+  cp.execFileSync("git", args, { cwd, stdio: "ignore", windowsHide: true });
+}
+
+function writableTempDir(): string {
+  for (const candidate of [process.env["TMPDIR"], "/tmp", os.tmpdir()]) {
+    if (!candidate) {
+      continue;
+    }
+    try {
+      fs.accessSync(candidate, fs.constants.W_OK);
+      return candidate;
+    } catch {
+      // Try the next platform-specific fallback.
+    }
+  }
+  return os.tmpdir();
+}
+
+function makeGitFixture(): { repoRoot: string; workspaceRoot: string; taskRoot: string } {
+  const repoRoot = fs.mkdtempSync(path.join(writableTempDir(), "ensemble-stage-scope-"));
+  const workspaceRoot = path.join(repoRoot, "workspace");
+  const taskRoot = path.join(workspaceRoot, "plans", "2026-07-13_task_2");
+  fs.mkdirSync(taskRoot, { recursive: true });
+  fs.writeFileSync(path.join(taskRoot, "plan.md"), "initial\n");
+  git(repoRoot, ["init"]);
+  git(repoRoot, ["add", "."]);
+  git(repoRoot, [
+    "-c",
+    "user.email=test@example.invalid",
+    "-c",
+    "user.name=Test",
+    "commit",
+    "-m",
+    "initial",
+  ]);
+  return { repoRoot, workspaceRoot, taskRoot };
+}
 
 function progress(stage: TaskProgress["currentStage"] = "plan"): TaskProgress {
   return {
@@ -34,168 +82,214 @@ void test("assistant prompts contain task state, recent status, context, and the
   assert.match(prompt, /What should I do next\?/);
 });
 
-void test("stage chat prompt includes task context and the user message", () => {
-  const prompt = buildStageChatPrompt(
+void test("stage response prompt scopes the model to one artifact and lets it choose to answer or edit", () => {
+  const prompt = buildStageResponsePrompt(
     "Plan",
     "task-42",
+    "plans/2026-07-13_task_2/plan.md",
     "# Context\nImportant repository details",
     "What should I change?"
   );
 
   assert.match(prompt, /Plan stage/);
   assert.match(prompt, /task-42/);
+  assert.match(prompt, /You may modify only one file: plans\/2026-07-13_task_2\/plan\.md/);
+  assert.match(prompt, /Do not create, edit, or delete any other file/);
+  assert.match(prompt, /just answer directly instead of editing anything/);
   assert.match(prompt, /Important repository details/);
   assert.match(prompt, /What should I change\?/);
 });
 
-void test("stage edit prompt tells the model to make workspace changes", () => {
-  const prompt = buildStageEditPrompt(
-    "Plan",
-    "task-42",
-    "# Context\nImportant repository details",
-    "Update task.md to reflect the latest clarifications."
-  );
-
-  assert.match(prompt, /Update the relevant task artifacts/);
-  assert.match(prompt, /summarize what changed/);
-});
-
-void test("stage chat routes explicit file-update requests to implementation mode", () => {
-  assert.equal(
-    looksLikeStageEditRequest(
-      [
-        "update",
-        "plans\\2026-07-12_task_2\\task.md",
-        "to reflect clarifications found in",
-        "plans\\2026-07-12_task_2\\runs\\stage-chat-1783947049280.md",
-      ].join("\n")
-    ),
-    true
-  );
+void test("resolveStageResponseScopePath maps each stage to its one workspace-relative artifact", () => {
+  const workspaceUri = vscode.Uri.file("/repo");
+  const taskFolderUri = vscode.Uri.file("/repo/plans/2026-07-13_task_2");
 
   assert.equal(
-    looksLikeStageEditRequest("Can you update task.md to reflect the latest review?"),
-    true
+    resolveStageResponseScopePath(workspaceUri, taskFolderUri, "desc"),
+    "plans/2026-07-13_task_2/task.md"
   );
-
   assert.equal(
-    looksLikeStageEditRequest("The scope changed, please update task.md accordingly."),
-    true
+    resolveStageResponseScopePath(workspaceUri, taskFolderUri, "plan"),
+    "plans/2026-07-13_task_2/plan.md"
   );
-
   assert.equal(
-    looksLikeStageEditRequest("please review and update the plan"),
-    true
+    resolveStageResponseScopePath(workspaceUri, taskFolderUri, "impl"),
+    "plans/2026-07-13_task_2/plan-final.md"
   );
-
   assert.equal(
-    looksLikeStageEditRequest("review this then update task.md"),
-    true
-  );
-
-  assert.equal(
-    looksLikeStageEditRequest("Please do this: update task.md"),
-    true
-  );
-
-  assert.equal(
-    looksLikeStageEditRequest("Note: please change the task description."),
-    true
-  );
-
-  assert.equal(
-    looksLikeStageEditRequest("What changed in task.md after the last review?"),
-    false
-  );
-
-  assert.equal(
-    looksLikeStageEditRequest("Explain the fix you applied to task.md."),
-    false
-  );
-
-  assert.equal(
-    looksLikeStageEditRequest("Can you explain how to update task.md?"),
-    false
-  );
-
-  assert.equal(
-    looksLikeStageEditRequest(
-      "I looked at task.md, and fix looks like it's still pending from last time."
-    ),
-    false
-  );
-
-  assert.equal(
-    looksLikeStageEditRequest(
-      "In plan.md, remove seems like the wrong word choice in paragraph 2 - is that intentional?"
-    ),
-    false
-  );
-
-  assert.equal(
-    looksLikeStageEditRequest(
-      "The commit message says: fix the task file typo (already done, just asking)."
-    ),
-    false
-  );
-
-  assert.equal(
-    looksLikeStageEditRequest(
-      "Note: change the task description was already suggested in the review; do you agree?"
-    ),
-    false
-  );
-
-  assert.equal(
-    looksLikeStageEditRequest(
-      "FYI: update the plan file happened last week per the log."
-    ),
-    false
-  );
-
-  assert.equal(
-    looksLikeStageEditRequest(
-      "Action taken previously: fix the plan file resolved the issue last sprint."
-    ),
-    false
-  );
-
-  assert.equal(
-    looksLikeStageEditRequest(
-      "My request for context: fix the task file was already merged, just documenting."
-    ),
-    false
+    resolveStageResponseScopePath(workspaceUri, taskFolderUri, "publish"),
+    "plans/2026-07-13_task_2/publish-review.md"
   );
 });
 
-void test("stage chat handles completed, cancelled, and failed outcomes", () => {
-  const output = vscode.Uri.file("/tmp/stage-chat.md");
-  assert.deepEqual(
-    resolveStageChatOutcome({
-      status: "completed",
-      outputFile: output,
-    }),
-    {
-      kind: "completed",
-      outputFile: output,
-    }
-  );
+void test("partitionScopedFiles keeps only the allowed artifact and buckets everything else as out of scope", () => {
+  const allowed = "plans/2026-07-13_task_2/task.md";
 
   assert.deepEqual(
-    resolveStageChatOutcome({
-      status: "cancelled",
-    }),
-    {
-      kind: "cancelled",
-    }
+    partitionScopedFiles(
+      [allowed, "src/other.ts", "plans/2026-07-13_task_2/plan.md"],
+      allowed
+    ),
+    { kept: [allowed], outOfScope: ["src/other.ts", "plans/2026-07-13_task_2/plan.md"] }
   );
 
-  assert.throws(
-    () =>
-      resolveStageChatOutcome({
-        status: "failed",
-        errorMessage: "Provider is unavailable.",
-      }),
-    /Provider is unavailable\./
-  );
+  assert.deepEqual(partitionScopedFiles([], allowed), { kept: [], outOfScope: [] });
+
+  assert.deepEqual(partitionScopedFiles(["src/other.ts"], allowed), {
+    kept: [],
+    outOfScope: ["src/other.ts"],
+  });
+});
+
+void test("stage response scope compares nested-workspace paths in git-root coordinates", async () => {
+  const { repoRoot, workspaceRoot, taskRoot } = makeGitFixture();
+  try {
+    const scope = await resolveStageResponseScope(
+      vscode.Uri.file(workspaceRoot),
+      vscode.Uri.file(taskRoot),
+      "plan"
+    );
+
+    assert.equal(scope.artifactWorkspacePath, "plans/2026-07-13_task_2/plan.md");
+    assert.equal(scope.artifactScopePath, "workspace/plans/2026-07-13_task_2/plan.md");
+
+    const changed = normalizeStageResponseChangedFiles(
+      ["plans/2026-07-13_task_2/plan.md", "src/other.ts"],
+      scope,
+      "copilot-lm"
+    );
+    assert.deepEqual(changed, [
+      "workspace/plans/2026-07-13_task_2/plan.md",
+      "workspace/src/other.ts",
+    ]);
+
+    assert.deepEqual(partitionScopedFiles(changed, scope.artifactScopePath), {
+      kept: ["workspace/plans/2026-07-13_task_2/plan.md"],
+      outOfScope: ["workspace/src/other.ts"],
+    });
+  } finally {
+    fs.rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+void test("stage response dirty snapshot protects individual untracked files", async () => {
+  const { repoRoot, workspaceRoot, taskRoot } = makeGitFixture();
+  try {
+    const notesDir = path.join(workspaceRoot, "notes");
+    fs.mkdirSync(notesDir, { recursive: true });
+    fs.writeFileSync(path.join(notesDir, "draft.md"), "do not delete\n");
+
+    const scope = await resolveStageResponseScope(
+      vscode.Uri.file(workspaceRoot),
+      vscode.Uri.file(taskRoot),
+      "plan"
+    );
+    const dirty = await snapshotDirtyPaths(scope);
+
+    assert.ok(dirty?.has("workspace/notes/draft.md"));
+    assert.equal(dirty?.has("workspace/notes/"), false);
+  } finally {
+    fs.rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+void test("stage response dirty snapshot lines up with nested Copilot paths", async () => {
+  const { repoRoot, workspaceRoot, taskRoot } = makeGitFixture();
+  try {
+    const srcDir = path.join(workspaceRoot, "src");
+    fs.mkdirSync(srcDir, { recursive: true });
+    fs.writeFileSync(path.join(srcDir, "other.ts"), "tracked\n");
+    git(repoRoot, ["add", "."]);
+    git(repoRoot, [
+      "-c",
+      "user.email=test@example.invalid",
+      "-c",
+      "user.name=Test",
+      "commit",
+      "-m",
+      "add other",
+    ]);
+    fs.writeFileSync(path.join(srcDir, "other.ts"), "user edit\n");
+
+    const scope = await resolveStageResponseScope(
+      vscode.Uri.file(workspaceRoot),
+      vscode.Uri.file(taskRoot),
+      "plan"
+    );
+    const dirty = await snapshotDirtyPaths(scope);
+    const changed = normalizeStageResponseChangedFiles(
+      ["src/other.ts"],
+      scope,
+      "copilot-lm"
+    );
+
+    assert.deepEqual(changed, ["workspace/src/other.ts"]);
+    assert.ok(dirty?.has(changed[0]!));
+  } finally {
+    fs.rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+void test("stage response state diff catches out-of-scope edits hidden by fallback results", async () => {
+  const { repoRoot, workspaceRoot, taskRoot } = makeGitFixture();
+  try {
+    const srcDir = path.join(workspaceRoot, "src");
+    fs.mkdirSync(srcDir, { recursive: true });
+    fs.writeFileSync(path.join(srcDir, "outside.ts"), "initial\n");
+    git(repoRoot, ["add", "."]);
+    git(repoRoot, [
+      "-c",
+      "user.email=test@example.invalid",
+      "-c",
+      "user.name=Test",
+      "commit",
+      "-m",
+      "add outside file",
+    ]);
+
+    const scope = await resolveStageResponseScope(
+      vscode.Uri.file(workspaceRoot),
+      vscode.Uri.file(taskRoot),
+      "plan"
+    );
+    const before = await snapshotStageResponseState(scope);
+    assert.ok(before);
+
+    fs.writeFileSync(path.join(taskRoot, "plan.md"), "fallback edit\n");
+    fs.writeFileSync(path.join(srcDir, "outside.ts"), "primary stray edit\n");
+
+    const after = await snapshotStageResponseState(scope);
+    assert.ok(after);
+    assert.deepEqual(changedStageResponsePathsSince(before, after), [
+      "workspace/plans/2026-07-13_task_2/plan.md",
+      "workspace/src/outside.ts",
+    ]);
+  } finally {
+    fs.rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+void test("stage response cleanup removes out-of-scope untracked directories", async () => {
+  const { repoRoot, workspaceRoot, taskRoot } = makeGitFixture();
+  try {
+    const scope = await resolveStageResponseScope(
+      vscode.Uri.file(workspaceRoot),
+      vscode.Uri.file(taskRoot),
+      "plan"
+    );
+    const outDir = path.join(workspaceRoot, "generated");
+    fs.mkdirSync(outDir, { recursive: true });
+    fs.writeFileSync(path.join(outDir, "extra.md"), "out of scope\n");
+
+    const result = await revertOutOfScopeFiles(scope, ["workspace/generated/"]);
+
+    assert.deepEqual(result, {
+      restored: [],
+      deleted: ["workspace/generated/"],
+      failed: [],
+    });
+    assert.equal(fs.existsSync(outDir), false);
+  } finally {
+    fs.rmSync(repoRoot, { recursive: true, force: true });
+  }
 });

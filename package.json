@@ -181,7 +181,7 @@
       },
       {
         "command": "vs-code-ai-helper.chatWithStage",
-        "title": "Chat with AI",
+        "title": "Respond to AI",
         "category": "Ensemble",
         "icon": "$(comment)"
       },

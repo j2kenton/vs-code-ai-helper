@@ -259,6 +259,10 @@ export async function runImplementationForModel(options: {
   onProgress: (message: string) => void;
   stage?: import("../types/taskProgress").TaskStage;
   taskFolderUri?: vscode.Uri;
+  /** See runImplementationWithCli — default true; pass false when the
+   * prompt may legitimately be answered without an edit. Copilot's runner
+   * has no equivalent no-op failure, so this only affects CLI providers. */
+  requireFileChange?: boolean;
 }): Promise<ImplementationRunResult & { runnerId: string }> {
   const effective = resolveEffectiveProvider(options.modelId);
 
@@ -271,6 +275,7 @@ export async function runImplementationForModel(options: {
         workspaceUri: options.workspaceUri,
         token: options.token,
         onProgress: options.onProgress,
+        requireFileChange: options.requireFileChange,
       });
       return { ...result, runnerId: selected.def.id };
     }

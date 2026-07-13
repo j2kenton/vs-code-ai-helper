@@ -93,6 +93,25 @@ void describe("CLI output normalization", () => {
     assert.match(result.errorMessage ?? "", /Provider output:/);
   });
 
+  void it("treats a no-file-change CLI completion as success when requireFileChange is false", () => {
+    const codex = getCliProvider("codex-cli");
+    assert.ok(codex, "expected codex-cli provider definition");
+
+    const result = __testOnly.toCliImplementationRunResult(
+      codex,
+      {
+        status: "completed",
+        output: "Just answering the question, no edit was needed.",
+      },
+      [],
+      false,
+      false
+    );
+
+    assert.strictEqual(result.status, "completed");
+    assert.strictEqual(result.summary, "Just answering the question, no edit was needed.");
+  });
+
   void it("strips this extension's own Claude Code session identity from nested CLI env", () => {
     const original = { ...process.env };
     try {
