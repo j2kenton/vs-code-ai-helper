@@ -41,3 +41,8 @@ coverage/
 .env.local
 .env.*.local
 
+# BEGIN Ensemble managed meta resources
+# Managed by Ensemble. Do not edit this block manually.
+/artifacts/helper/
+/plans/
+# END Ensemble managed meta resources
