@@ -175,18 +175,24 @@ export async function patchTaskProgress(
     }
   }
 
-    // Callers use an unchanged return value to decline a compare-and-swap
-    // update (for example, when another window owns a scheduler lease).
-    // Do not turn that into a journal entry and file write: besides avoiding
-    // needless I/O, task-progress.json is watched and such writes would
-    // otherwise continuously re-trigger the scheduler inventory refresh.
-    if (JSON.stringify(patched) === JSON.stringify(current)) return current;
+    const unchanged = JSON.stringify(patched) === JSON.stringify(current);
 
     // `update` above already threw for a stale/rejected CAS, so reaching
     // here means this caller owns the transition. Run the side effect before
     // persisting so a concurrent claim can only observe it fully applied or
     // not at all — never interleaved with this write.
     if (beforeWrite) await beforeWrite(patched);
+
+    // Callers use an unchanged return value to decline a compare-and-swap
+    // update (for example, when another window owns a scheduler lease).
+    // Do not turn that into a journal entry and file write: besides avoiding
+    // needless I/O, task-progress.json is watched and such writes would
+    // otherwise continuously re-trigger the scheduler inventory refresh.
+    //
+    // A validated no-op CAS may still have a side effect, though. Same-stage
+    // review refreshes publish their staged review artifact this way after the
+    // reviewAttemptId check succeeds, while leaving task-progress.json as-is.
+    if (unchanged) return current;
 
   // All read-modify-write progress mutations share the same lease. This is
   // the CAS boundary used by commands and prevents two operations from

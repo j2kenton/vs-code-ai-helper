@@ -273,6 +273,28 @@ void test("patchTaskProgress does not write when a callback declines a change", 
   assert.equal(fs.existsSync(path.join(folderUri.fsPath, "task-progress.json")), false);
 });
 
+void test("patchTaskProgress runs beforeWrite for an accepted no-op CAS", async () => {
+  const store = makeMemStore();
+  installMemStore(store);
+  const folderUri = makeTaskFolderUri("patch-no-op-before-write");
+  await seedProgress(store, folderUri, makeProgress());
+
+  let sideEffectCount = 0;
+  const result = await patchTaskProgress(
+    folderUri,
+    current => current,
+    false,
+    () => {
+      sideEffectCount += 1;
+      return Promise.resolve();
+    }
+  );
+
+  assert.ok(result !== undefined);
+  assert.equal(sideEffectCount, 1);
+  assert.equal(fs.existsSync(path.join(folderUri.fsPath, "task-progress.json")), false);
+});
+
 void test("patchTaskProgress preserves implReviewFiles when updating stage", async () => {
   const store = makeMemStore();
   installMemStore(store);
