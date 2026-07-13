@@ -2,7 +2,7 @@
   "name": "vs-code-ai-helper",
   "displayName": "Ensemble",
   "description": "AI-assisted task planning and implementation workflow for VS Code. Uses your existing AI subscriptions (Copilot, Claude, Codex, Gemini, Antigravity, Kiro) — real usage costs apply. AI runs can modify workspace files. Provided as-is with no warranty. See README and DISCLAIMER.md.",
-  "version": "0.31.3",
+  "version": "0.32.0",
   "publisher": "j2kenton",
   "license": "MIT",
   "repository": {
@@ -599,31 +599,51 @@
           "description": "Provider Selection. Set a CLI provider ID to false to exclude it from model pickers and search."
         },
         "vs-code-ai-helper.fastForwardMaxIterations": {
-          "type": "integer", "default": 5, "minimum": 1, "maximum": 99, "scope": "resource",
+          "type": "integer",
+          "default": 5,
+          "minimum": 1,
+          "maximum": 99,
+          "scope": "resource",
           "description": "Maximum fast-forward iterations (1–99)."
         },
         "vs-code-ai-helper.autoAdvanceEnabled": {
-          "type": "boolean", "default": false, "scope": "resource",
+          "type": "boolean",
+          "default": false,
+          "scope": "resource",
           "description": "Automatically advance when the configured review score threshold is reached."
         },
         "vs-code-ai-helper.autoAdvanceScoreThreshold": {
-          "type": "integer", "default": 10, "minimum": 1, "maximum": 10, "scope": "resource",
+          "type": "integer",
+          "default": 10,
+          "minimum": 1,
+          "maximum": 10,
+          "scope": "resource",
           "description": "Score required for auto-advance (1–10)."
         },
         "vs-code-ai-helper.fastForwardStopLevel": {
-          "type": "integer", "default": 0, "minimum": 0, "maximum": 10, "scope": "resource",
+          "type": "integer",
+          "default": 0,
+          "minimum": 0,
+          "maximum": 10,
+          "scope": "resource",
           "description": "Fast-forward target score. 0 stops after any improvement; 1–10 continues until that score."
         },
         "vs-code-ai-helper.fastForwardUseAcceptanceThreshold": {
-          "type": "boolean", "default": false, "scope": "resource",
+          "type": "boolean",
+          "default": false,
+          "scope": "resource",
           "description": "Use the review acceptance threshold instead of the fast-forward stop level."
         },
         "vs-code-ai-helper.autoReviewAfterPlan": {
-          "type": "boolean", "default": false, "scope": "resource",
+          "type": "boolean",
+          "default": false,
+          "scope": "resource",
           "description": "Start high-level review after AI drafts a plan."
         },
         "vs-code-ai-helper.autoReviewAfterImplementation": {
-          "type": "boolean", "default": false, "scope": "resource",
+          "type": "boolean",
+          "default": false,
+          "scope": "resource",
           "description": "Start high-level review after AI completes initial implementation."
         },
         "vs-code-ai-helper.modelSelectionPromptShown": {
