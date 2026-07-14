@@ -521,7 +521,7 @@ void describe("getAvailableModels", () => {
           ),
           {
             id: "claude-cli:opus",
-            name: "Opus 4.8 [only on Max plan]",
+            name: "Opus 4.8",
             providerLabel: "Claude Code (subscription CLI)",
           },
           ...claudeCliReasoningVariants(
@@ -533,8 +533,7 @@ void describe("getAvailableModels", () => {
               ["high", "High"],
               ["xhigh", "Extra High"],
               ["max", "Max"],
-            ],
-            "only on Max plan"
+            ]
           ),
           {
             id: "claude-cli:haiku",

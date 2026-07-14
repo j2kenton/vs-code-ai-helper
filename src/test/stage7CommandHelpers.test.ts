@@ -16,8 +16,6 @@ import {
   snapshotDirtyPaths,
   snapshotStageResponseState,
 } from "../utils/stageResponseScope";
-import { buildAssistantPrompt } from "../commands/openGeneralAssistant";
-import { TaskProgress } from "../types/taskProgress";
 
 function git(cwd: string, args: string[]): void {
   cp.execFileSync("git", args, { cwd, stdio: "ignore", windowsHide: true });
@@ -58,31 +56,7 @@ function makeGitFixture(): { repoRoot: string; workspaceRoot: string; taskRoot: 
   return { repoRoot, workspaceRoot, taskRoot };
 }
 
-function progress(stage: TaskProgress["currentStage"] = "plan"): TaskProgress {
-  return {
-    taskFolder: "task",
-    currentStage: stage,
-    status: "active",
-    createdAt: "2026-07-13T00:00:00.000Z",
-    updatedAt: "2026-07-13T00:00:00.000Z",
-  };
-}
-
-void test("assistant prompts contain task state, recent status, context, and the question", () => {
-  const prompt = buildAssistantPrompt(
-    { folderName: "task-42", progress: progress() },
-    "# Context\nImportant repository details",
-    [{ message: "Plan saved", level: "info", timestamp: "2026-07-13T10:00:00.000Z" }],
-    "What should I do next?"
-  );
-
-  assert.match(prompt, /task task-42/);
-  assert.match(prompt, /Plan saved/);
-  assert.match(prompt, /Important repository details/);
-  assert.match(prompt, /What should I do next\?/);
-});
-
-void test("stage response prompt scopes the model to one artifact and lets it choose to answer or edit", () => {
+void test("stage response prompt is text-only and does not permit artifact edits", () => {
   const prompt = buildStageResponsePrompt(
     "Plan",
     "task-42",
@@ -93,9 +67,8 @@ void test("stage response prompt scopes the model to one artifact and lets it ch
 
   assert.match(prompt, /Plan stage/);
   assert.match(prompt, /task-42/);
-  assert.match(prompt, /You may modify only one file: plans\/2026-07-13_task_2\/plan\.md/);
-  assert.match(prompt, /Do not create, edit, or delete any other file/);
-  assert.match(prompt, /just answer directly instead of editing anything/);
+  assert.match(prompt, /Do not modify files, invoke tools/);
+  assert.match(prompt, /use the stage action that applies it explicitly/);
   assert.match(prompt, /Important repository details/);
   assert.match(prompt, /What should I change\?/);
 });

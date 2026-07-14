@@ -21,6 +21,9 @@ export type CanonicalTaskStage = TaskStage;
  */
 export type TaskStatus = "creating" | "active" | "paused" | "completed";
 
+/** Authoritative list of every persisted task status, in display order. */
+export const TASK_STATUSES: readonly TaskStatus[] = ["creating", "active", "paused", "completed"];
+
 /**
  * The filename for the task request/scope artifact
  */
@@ -92,6 +95,8 @@ export interface TaskProgress {
   status?: TaskStatus;
   /** Set when the task is explicitly completed; stage advancement never sets it. */
   completedAt?: string;
+  /** Stages explicitly completed by a terminal lifecycle action. */
+  completedStages?: TaskStage[];
   /** Original description captured before an AI draft is applied. */
   preImageDescription?: string;
   /** Stable project binding used for workspace-scoped operations. */

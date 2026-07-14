@@ -407,8 +407,11 @@ async function resolveTarget(
     : undefined;
   // Both entries describe workspace-level roots. Task plans may be relocated
   // through settings, while artifacts always remain under /artifacts/helper/.
-  // Neither pattern is task-specific.
-  const patterns = ["/artifacts/helper/", configuredPattern ?? "/plans/"];
+  // Neither pattern is task-specific. Dedupe: if the configured task root
+  // resolves to the same path as the artifacts root, the two entries above
+  // collapse to one pattern — without this, the managed block would render
+  // that pattern twice (renderManagedBlock does not dedupe its input).
+  const patterns = [...new Set(["/artifacts/helper/", configuredPattern ?? "/plans/"])];
 
   return {
     repoRoot,
@@ -472,16 +475,68 @@ export async function refreshMetaResourcesGitIgnoreContext(
   );
 }
 
+/** Line-level diff between two `.gitignore` contents, used to render an exact
+ * confirmation preview. This only needs to be correct for the managed-block
+ * add/remove edits `applyManagedMetaGitIgnoreBlock` produces, not arbitrary
+ * text — those never reorder a caller's own unrelated lines. */
+export function diffGitignoreLines(
+  current: string,
+  next: string
+): { added: string[]; removed: string[] } {
+  const currentLines = splitLines(current);
+  const nextLines = splitLines(next);
+  const currentSet = new Set(currentLines);
+  const nextSet = new Set(nextLines);
+  return {
+    added: nextLines.filter((line) => !currentSet.has(line)),
+    removed: currentLines.filter((line) => !nextSet.has(line)),
+  };
+}
+
+/** Every `.gitignore` write goes through this confirmation, no matter which
+ * command triggers it (hide/show/toggle, or a Settings save). Declining
+ * leaves the file and the `metaFilesHidden` setting untouched. */
+async function confirmGitignoreWrite(
+  current: string,
+  next: string,
+  hidden: boolean
+): Promise<boolean> {
+  if (current === next) {
+    return true;
+  }
+
+  const { added, removed } = diffGitignoreLines(current, next);
+  const detailLines: string[] = [];
+  if (added.length > 0) {
+    detailLines.push(...added.map((line) => `+ ${line}`));
+  }
+  if (removed.length > 0) {
+    detailLines.push(...removed.map((line) => `- ${line}`));
+  }
+
+  const actionLabel = hidden ? "Hide Meta Files" : "Show Meta Files";
+  const confirm = await vscode.window.showWarningMessage(
+    hidden
+      ? "Ensemble wants to add a managed block to .gitignore to hide its meta files from git."
+      : "Ensemble wants to remove its managed block from .gitignore, making its meta files visible in git.",
+    { modal: true, detail: detailLines.join("\n") },
+    actionLabel
+  );
+  return confirm === actionLabel;
+}
+
+/** Returns whether the write was applied (`false` if the user declined the
+ * confirmation, or if there was no eligible git repository/target). */
 async function setCurrentTaskMetaGitVisibility(
   inventory: TaskInventory,
   currentTaskStore: CurrentTaskStore,
   hidden: boolean
-): Promise<void> {
+): Promise<boolean> {
   const contextVersion = ++metaVisibilityContextVersion;
   const target = await resolveTarget(inventory, currentTaskStore, true);
   if (!target) {
     await setMetaVisibilityContexts(false, false, contextVersion);
-    return;
+    return false;
   }
 
   const current = await readTextIfExists(target.gitignoreUri);
@@ -489,10 +544,16 @@ async function setCurrentTaskMetaGitVisibility(
     legacyRootPatterns: target.legacyRootPatterns,
   });
 
-  await vscode.workspace.fs.writeFile(
-    target.gitignoreUri,
-    new TextEncoder().encode(next)
-  );
+  if (!(await confirmGitignoreWrite(current, next, hidden))) {
+    return false;
+  }
+
+  if (current !== next) {
+    await vscode.workspace.fs.writeFile(
+      target.gitignoreUri,
+      new TextEncoder().encode(next)
+    );
+  }
   await setMetaFilesHidden(hidden);
 
   await setMetaVisibilityContexts(true, hidden, contextVersion);
@@ -501,31 +562,32 @@ async function setCurrentTaskMetaGitVisibility(
       ? "Workspace meta files are now hidden from git."
       : "Workspace meta files are now visible in git."
   );
+  return true;
 }
 
 export async function hideMetaResourcesInGitIgnore(
   inventory: TaskInventory,
   currentTaskStore: CurrentTaskStore
-): Promise<void> {
-  await setCurrentTaskMetaGitVisibility(inventory, currentTaskStore, true);
+): Promise<boolean> {
+  return setCurrentTaskMetaGitVisibility(inventory, currentTaskStore, true);
 }
 
 export async function showMetaResourcesInGitIgnore(
   inventory: TaskInventory,
   currentTaskStore: CurrentTaskStore
-): Promise<void> {
-  await setCurrentTaskMetaGitVisibility(inventory, currentTaskStore, false);
+): Promise<boolean> {
+  return setCurrentTaskMetaGitVisibility(inventory, currentTaskStore, false);
 }
 
 export async function toggleMetaResourcesGitIgnore(
   inventory: TaskInventory,
   currentTaskStore: CurrentTaskStore
-): Promise<void> {
+): Promise<boolean> {
   const target = await resolveTarget(inventory, currentTaskStore, true);
   if (!target) {
     const contextVersion = ++metaVisibilityContextVersion;
     await setMetaVisibilityContexts(false, false, contextVersion);
-    return;
+    return false;
   }
 
   const content = await readTextIfExists(target.gitignoreUri);
@@ -535,7 +597,7 @@ export async function toggleMetaResourcesGitIgnore(
   const hidden = isManagedMetaGitIgnoreHidden(content, target.patterns, {
     legacyRootPatterns: target.legacyRootPatterns,
   });
-  await setCurrentTaskMetaGitVisibility(inventory, currentTaskStore, !hidden);
+  return setCurrentTaskMetaGitVisibility(inventory, currentTaskStore, !hidden);
 }
 
 export function registerToggleMetaResourcesGitIgnoreCommand(

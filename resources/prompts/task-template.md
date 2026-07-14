@@ -1,9 +1,5 @@
-Briefly describe what changes you want to be made, and then use AI to help you clarify the plan.
+# Task
 
-Shortcut: Apply Current Stage Action (Windows/Linux: Ctrl+Shift+Alt+I, macOS: Cmd+Shift+Alt+I).
-
-## Task Description
-
-## Draft with AI
-
-## Open Questions
+Describe the work you want to do here in as much detail as is useful. When
+you're ready, use **Draft with AI** to turn these notes into a structured task
+description. Questions from the stage AI appear in the **Chat With AI** panel.

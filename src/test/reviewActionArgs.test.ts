@@ -196,6 +196,7 @@ void describe("fast-forward fallback contract", () => {
       {
         skipImplementationSafetyCheck: false,
         preserveActiveFallback: false,
+        skipTaskLock: true,
       }
     );
     assert.deepStrictEqual(
@@ -203,6 +204,7 @@ void describe("fast-forward fallback contract", () => {
       {
         skipImplementationSafetyCheck: true,
         preserveActiveFallback: true,
+        skipTaskLock: true,
       }
     );
   });

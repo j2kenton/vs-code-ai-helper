@@ -537,14 +537,14 @@ function createSeededClaudeCliModels(): readonly DiscoveredCliModel[] {
       ["xhigh", "Extra High"],
       ["max", "Max"],
     ], "only on Max plan"),
-    { model: "opus", name: "Opus 4.8 [only on Max plan]" },
+    { model: "opus", name: "Opus 4.8" },
     ...createVariants("opus", "Opus 4.8", [
       ["low", "Low"],
       ["medium", "Medium"],
       ["high", "High"],
       ["xhigh", "Extra High"],
       ["max", "Max"],
-    ], "only on Max plan"),
+    ]),
     { model: "haiku", name: "Haiku 4.5" },
   ];
 }

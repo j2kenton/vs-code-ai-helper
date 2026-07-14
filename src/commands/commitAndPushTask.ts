@@ -14,6 +14,11 @@ import { NotificationRouter } from "../utils/notificationRouter";
 import { runCompletionLint } from "../utils/completionLint";
 import { resolveFreshModelForStage } from "../utils/modelSelection";
 import { parseCopilotModelSelection, parseModelSelection } from "../runners/providers";
+import {
+  releaseTaskOperationLock,
+  showTaskBusyWarning,
+  tryAcquireTaskOperationLock,
+} from "../utils/taskOperationLock";
 
 /**
  * Accepted argument shapes for commitAndPushTask.
@@ -243,65 +248,85 @@ async function hasChangesToCommit(
   }
 }
 
-/**
- * Parse git status --porcelain=v1 -z --untracked-files=all output.
- * Returns an array of { status, path } records.
- *
- * The -z format uses NUL as a field/record separator.
- * For rename/copy entries (R/C), the format is:
- *   "XY old-path\0new-path\0"
- * For all other entries:
- *   "XY path\0"
- *
- * This parser handles both forms defensively.
- */
-function parsePortcelainZ(output: string): Array<{ status: string; path: string }> {
-  const results: Array<{ status: string; path: string }> = [];
-  const entries = output.split("\0");
-
-  let i = 0;
-  while (i < entries.length) {
-    const entry = entries[i]!;
-    i++;
-
-    if (entry.length < 3) {
-      continue;
-    }
-
-    const status = entry.substring(0, 2);
-    const filePath = entry.substring(3);
-
-    if (filePath.length === 0) {
-      continue;
-    }
-
-    // Rename/copy entries: "XY old-path" followed by "new-path" as next NUL-delimited token
-    if (status[0] === "R" || status[0] === "C" || status[1] === "R" || status[1] === "C") {
-      results.push({ status, path: filePath }); // old path
-      if (i < entries.length && entries[i] && entries[i]!.length > 0) {
-        results.push({ status, path: entries[i]! }); // new path
-        i++;
-      }
-    } else {
-      results.push({ status, path: filePath });
-    }
-  }
-
-  return results.filter((r) => r.path.length > 0);
+/** A single change record from `git status --porcelain=v2 -z`. */
+interface PorcelainV2Entry {
+  status: string;
+  /** Current (destination) path. For renames/copies this is the new path. */
+  path: string;
+  /** Original path, present only for rename/copy entries. */
+  origPath?: string;
 }
 
 /**
- * Get the list of changed files scoped to the task folder (default mode)
- * or the entire repo (include-all mode).
+ * Parse git status --porcelain=v2 -z --untracked-files=all output.
+ *
+ * Porcelain v2 reports rename/copy changes as a single atomic record
+ * (`2 ...`) carrying both the destination path and, as the following
+ * NUL-delimited field, the original path — unlike v1, which reports the two
+ * endpoints as independent tokens with no structural link between them. That
+ * distinction matters here: callers decide inclusion (task-folder scoping,
+ * run-artifact exclusion) per record, and a rename must be kept as one unit
+ * so both endpoints are staged together rather than a rename being silently
+ * split into an orphaned delete on one side of a scope boundary.
+ *
+ * Record shapes (fields are space-separated; the -z format still uses NUL
+ * only to separate whole records, and — for renames only — to separate the
+ * trailing origPath from its record):
+ *   1 XY sub mH mI mW hH hI path                  (ordinary changed entry)
+ *   2 XY sub mH mI mW hH hI X score path\0origPath (rename or copy)
+ *   u XY sub m1 m2 m3 mW h1 h2 h3 path             (unmerged)
+ *   ? path                                        (untracked)
+ *   ! path                                         (ignored)
+ */
+export function parsePorcelainV2Z(output: string): PorcelainV2Entry[] {
+  const tokens = output.split("\0").filter((t) => t.length > 0);
+  const results: PorcelainV2Entry[] = [];
+
+  let i = 0;
+  while (i < tokens.length) {
+    const token = tokens[i]!;
+    i++;
+
+    if (token.startsWith("1 ")) {
+      const fields = token.split(" ");
+      const status = fields[1] ?? "";
+      const filePath = fields.slice(8).join(" ");
+      if (filePath) results.push({ status, path: filePath });
+    } else if (token.startsWith("2 ")) {
+      const fields = token.split(" ");
+      const status = fields[1] ?? "";
+      const filePath = fields.slice(9).join(" ");
+      const origPath = i < tokens.length ? tokens[i] : undefined;
+      if (origPath !== undefined) i++;
+      if (filePath) results.push({ status, path: filePath, origPath });
+    } else if (token.startsWith("u ")) {
+      const fields = token.split(" ");
+      const status = fields[1] ?? "";
+      const filePath = fields.slice(10).join(" ");
+      if (filePath) results.push({ status, path: filePath });
+    } else if (token.startsWith("? ")) {
+      results.push({ status: "??", path: token.slice(2) });
+    } else if (token.startsWith("! ")) {
+      results.push({ status: "!!", path: token.slice(2) });
+    }
+  }
+
+  return results;
+}
+
+/**
+ * Get the list of changed files scoped to the implemented source changes
+ * (default mode: everything OUTSIDE the task folder) or the entire repo,
+ * task folder included (include-task-folder mode).
  *
  * Returns two arrays:
  *  - scopedFiles: files to be staged and shown in the preview
- *  - repoFiles:   all changed files in the repo (for include-all mode display)
+ *  - repoFiles:   all changed files in the repo (for display of what's excluded)
  */
-async function getChangedFiles(
+export async function getChangedFiles(
   repoRoot: string,
   taskFolderPath: string,
-  includeAll: boolean
+  includeTaskFolder: boolean
 ): Promise<{
   scopedFiles: string[];
   repoFiles: string[];
@@ -309,12 +334,12 @@ async function getChangedFiles(
 }> {
   try {
     const { stdout } = await runGitCommand(repoRoot, "status", [
-      "--porcelain=v1",
+      "--porcelain=v2",
       "-z",
       "--untracked-files=all",
     ]);
 
-    const allEntries = parsePortcelainZ(stdout);
+    const allEntries = parsePorcelainV2Z(stdout);
 
     // Compute the task folder relative to the repo root
     const taskRelative = path
@@ -327,6 +352,11 @@ async function getChangedFiles(
     const repoFiles: string[] = [];
 
     for (const entry of allEntries) {
+      // A rename/copy is one logical change with two path endpoints. Scope
+      // and count it as a single unit anchored on the destination path so it
+      // can never be split across the task-folder boundary — e.g. only the
+      // deletion half staged while the addition half is excluded (or vice
+      // versa), which would corrupt the rename into an orphaned add/delete.
       repoFiles.push(entry.path);
 
       // Determine if this file is inside the task folder
@@ -334,7 +364,10 @@ async function getChangedFiles(
         entry.path === taskRelative ||
         entry.path.startsWith(taskRelative + "/");
 
-      if (!includeAll && !isInTaskFolder) {
+      // Default mode stages the implemented source — everything OUTSIDE the
+      // task folder. The task folder holds planning metadata, not the code
+      // changes, so it is excluded unless the caller opts in.
+      if (!includeTaskFolder && isInTaskFolder) {
         continue;
       }
 
@@ -346,13 +379,19 @@ async function getChangedFiles(
 
       if (isRunArtifact) {
         runArtifactPaths.push(entry.path);
-        if (!includeAll) {
-          // In default mode, run artifacts are excluded from the staged set
-          continue;
-        }
+        // Run artifacts are always excluded from the staged set here. The
+        // "Include Run Artifacts" flow opts in separately by re-fetching and
+        // filtering, rather than via this function.
+        continue;
       }
 
       scopedFiles.push(entry.path);
+      // Stage both rename endpoints together: `git add` on the destination
+      // alone would record only an addition, leaving the vacated origPath
+      // untracked-removed rather than committed as part of the same rename.
+      if (entry.origPath) {
+        scopedFiles.push(entry.origPath);
+      }
     }
 
     return {
@@ -530,13 +569,14 @@ async function generatePRDescription(
 
 /**
  * Save relevant dirty documents before git operations.
- * In default (task-folder-only) mode, only saves documents inside the
- * task folder. In include-all mode, saves any dirty document in the repo.
+ * In default (source-only) mode, only saves documents outside the task
+ * folder plus the always-relevant task/plan artifacts. In
+ * include-task-folder mode, saves any dirty document in the repo.
  */
 async function saveDirtyDocuments(
   taskFolderPath: string,
   repoRoot: string,
-  includeAll: boolean
+  includeTaskFolder: boolean
 ): Promise<boolean> {
   const taskFileUri = vscode.Uri.file(path.join(taskFolderPath, TASK_FILENAME));
   const taskFolderUri = vscode.Uri.file(taskFolderPath);
@@ -558,11 +598,14 @@ async function saveDirtyDocuments(
     if (relevantPaths.has(doc.uri.fsPath)) {
       return true;
     }
-    // In task-folder-only mode: only save files inside the task folder
-    if (!includeAll) {
-      return isFileInFolder(doc.uri.fsPath, taskFolderPath);
+    // In default (source-only) mode: only save files outside the task folder
+    if (!includeTaskFolder) {
+      return (
+        isFileInFolder(doc.uri.fsPath, repoRoot) &&
+        !isFileInFolder(doc.uri.fsPath, taskFolderPath)
+      );
     }
-    // In include-all mode: also include dirty files inside the repo
+    // In include-task-folder mode: save any dirty file in the repo
     return isFileInFolder(doc.uri.fsPath, repoRoot);
   });
 
@@ -630,8 +673,13 @@ async function describePushDestination(
  *
  * ⚠️ RISK NOTICE (IMPORTANT — READ BEFORE MODIFYING):
  *
- * Default mode: stages ONLY the task folder, excluding run artifacts.
- * Include-all mode: stages the entire repo (requires explicit opt-in).
+ * Default mode: stages the implemented source changes — every changed file
+ * OUTSIDE the task folder. The task folder holds planning metadata
+ * (task.md, plan.md, run logs), not the code changes being shipped, so it
+ * is excluded from the default staged set.
+ * Include-task-folder mode: also stages changes inside the task folder
+ * (requires explicit opt-in), still excluding run artifacts unless the
+ * user separately opts into those too.
  *
  * Run artifacts (runs/, context-pack.md) contain full AI prompts and
  * file contents. They are excluded from the default staged set.
@@ -700,9 +748,15 @@ export async function commitAndPushTask(
     }
   }
 
+  const lockKey = resolvedTask.taskFolderPath;
+  if (!tryAcquireTaskOperationLock(lockKey, "Commit and Push")) {
+    showTaskBusyWarning(lockKey);
+    return;
+  }
+  try {
   await vscode.window.withProgress(
     {
-      location: vscode.ProgressLocation.Notification,
+      location: vscode.ProgressLocation.Window,
       title: `Committing and pushing ${resolvedTask.folderName}...`,
       cancellable: false,
     },
@@ -730,17 +784,21 @@ export async function commitAndPushTask(
           );
         }
 
-        // Check for changes in the task folder (default mode)
-        progress.report({ message: "Checking for changes..." });
-        const hasTaskFolderChanges = await hasChangesToCommit(
+        // Determine staging scope: default to the implemented source changes
+        // (everything OUTSIDE the task folder), since that's what "commit
+        // and push" is meant to ship. The task folder holds planning
+        // metadata (task.md, plan.md, run logs), not the code changes.
+        progress.report({ message: "Collecting changed files..." });
+        let includeTaskFolder = false;
+        let { scopedFiles, repoFiles, runArtifactPaths } = await getChangedFiles(
           repoRoot,
-          resolvedTask.taskFolderPath
+          resolvedTask.taskFolderPath,
+          includeTaskFolder
         );
 
-        // Determine staging scope
-        let includeAll = false;
-        if (!hasTaskFolderChanges) {
-          // Task folder is clean — offer include-all or cancel
+        if (scopedFiles.length === 0) {
+          // No source changes — everything that changed lives inside the
+          // task folder. Offer to include it, or bail out if nothing changed.
           const hasRepoChanges = await hasChangesToCommit(repoRoot);
           if (!hasRepoChanges) {
             NotificationRouter.showInformation(
@@ -750,53 +808,45 @@ export async function commitAndPushTask(
           }
 
           const choice = await vscode.window.showInformationMessage(
-            "No changes in the task folder.\n\n" +
-              "There are changes elsewhere in the repository. " +
-              "Would you like to include all repository changes?",
+            "No source code changes found outside the task folder.\n\n" +
+              "Only the task's planning files (in the task folder) have changed. " +
+              "Include the task folder in this commit instead?",
             { modal: true },
-            "Include All Repository Changes",
+            "Include Task Folder Changes",
           );
-          if (choice !== "Include All Repository Changes") {
+          if (choice !== "Include Task Folder Changes") {
             NotificationRouter.showInformation("Commit and push cancelled.");
             return;
           }
-          includeAll = true;
-        }
+          includeTaskFolder = true;
+          ({ scopedFiles, repoFiles, runArtifactPaths } = await getChangedFiles(
+            repoRoot,
+            resolvedTask.taskFolderPath,
+            includeTaskFolder
+          ));
 
-        // Get changed files for preview
-        progress.report({ message: "Collecting changed files..." });
-        const { scopedFiles, repoFiles, runArtifactPaths } =
-          await getChangedFiles(repoRoot, resolvedTask.taskFolderPath, includeAll);
-
-        if (scopedFiles.length === 0 && !includeAll) {
-          // All task-folder changes were run artifacts
-          const choice = await vscode.window.showWarningMessage(
-            "The only changes in the task folder are run artifacts " +
-              "(runs/, context-pack.md). " +
-              "These are excluded from the default staged set because they " +
-              "contain AI prompts and file contents.\n\n" +
-              "Include run artifacts in this commit?",
-            { modal: true },
-            "Include Run Artifacts",
-          );
-          if (choice === "Include Run Artifacts") {
-            includeAll = false;
-            // Re-fetch with run artifacts included
-            const withRunArtifacts = await getChangedFiles(
-              repoRoot,
-              resolvedTask.taskFolderPath,
-              false
+          if (scopedFiles.length === 0) {
+            // All task-folder changes were run artifacts
+            const artifactChoice = await vscode.window.showWarningMessage(
+              "The only changes in the task folder are run artifacts " +
+                "(runs/, context-pack.md). " +
+                "These are excluded from the default staged set because they " +
+                "contain AI prompts and file contents.\n\n" +
+                "Include run artifacts in this commit?",
+              { modal: true },
+              "Include Run Artifacts",
             );
-            // Force include run artifacts by using all task-folder files
-            scopedFiles.push(...withRunArtifacts.repoFiles.filter((f) => {
+            if (artifactChoice === "Include Run Artifacts") {
               const taskRelative = path
                 .relative(repoRoot, resolvedTask.taskFolderPath)
                 .replace(/\\/g, "/");
-              return f === taskRelative || f.startsWith(taskRelative + "/");
-            }));
-          } else {
-            NotificationRouter.showInformation("Commit and push cancelled.");
-            return;
+              scopedFiles.push(...repoFiles.filter((f) => {
+                return f === taskRelative || f.startsWith(taskRelative + "/");
+              }));
+            } else {
+              NotificationRouter.showInformation("Commit and push cancelled.");
+              return;
+            }
           }
         }
 
@@ -839,9 +889,9 @@ export async function commitAndPushTask(
         const previewFiles = scopedFiles.slice(0, MAX_PREVIEW_FILES);
         const remaining = scopedFiles.length - previewFiles.length;
 
-        const scopeLabel = includeAll
-          ? "all repository changes"
-          : "task folder only (run artifacts excluded by default)";
+        const scopeLabel = includeTaskFolder
+          ? "all repository changes, including the task folder"
+          : "source changes only (task folder excluded by default)";
 
         const fileList = previewFiles
           .map((f) => {
@@ -853,9 +903,10 @@ export async function commitAndPushTask(
         const moreNote =
           remaining > 0 ? `\n  … and ${remaining} more file(s)` : "";
 
+        const notStagedCount = repoFiles.length - scopedFiles.length;
         const repoExtra =
-          !includeAll && repoFiles.length > scopedFiles.length + runArtifactPaths.length
-            ? `\n\n(${repoFiles.length - scopedFiles.length - runArtifactPaths.length} additional file(s) changed elsewhere in the repo — not staged in default mode)`
+          !includeTaskFolder && notStagedCount > 0
+            ? `\n\n(${notStagedCount} file(s) changed in the task folder — not staged by default)`
             : "";
 
         const confirmMessage =
@@ -898,15 +949,15 @@ export async function commitAndPushTask(
               : "";
             channel.appendLine(`  ${renderPath(f)}${marker}`);
           }
-          if (!includeAll && repoFiles.length > scopedFiles.length + runArtifactPaths.length) {
+          if (!includeTaskFolder && notStagedCount > 0) {
             channel.appendLine("");
-            channel.appendLine("Not staged (outside task folder in default mode):");
+            channel.appendLine("Not staged (inside task folder, excluded by default):");
+            const taskRelative = path
+              .relative(repoRoot, resolvedTask.taskFolderPath)
+              .replace(/\\/g, "/");
             for (const f of repoFiles) {
-              const taskRelative = path
-                .relative(repoRoot, resolvedTask.taskFolderPath)
-                .replace(/\\/g, "/");
               const inTaskFolder = f === taskRelative || f.startsWith(taskRelative + "/");
-              if (!inTaskFolder) {
+              if (inTaskFolder) {
                 channel.appendLine(`  ${renderPath(f)}`);
               }
             }
@@ -927,12 +978,12 @@ export async function commitAndPushTask(
           return;
         }
 
-        // Save dirty documents (scoped to task folder or entire repo)
+        // Save dirty documents (scoped to source files, or entire repo)
         progress.report({ message: "Saving open files..." });
         const saved = await saveDirtyDocuments(
           resolvedTask.taskFolderPath,
           repoRoot,
-          includeAll
+          includeTaskFolder
         );
         if (!saved) {
           return;
@@ -963,21 +1014,15 @@ export async function commitAndPushTask(
         });
 
         try {
-          // Stage changes — scoped to task folder in default mode,
-          // or the entire repo in include-all mode.
+          // Stage changes — always exactly the scopedFiles list the user
+          // just confirmed in the preview dialog above (never a bare `-A`,
+          // which would silently stage excluded run artifacts too).
           progress.report({ message: "Staging changes..." });
-          if (includeAll) {
-            // Include-all mode: stage everything in the repo
-            await runGitCommand(repoRoot, "add", ["-A", "--", "."]);
-          } else {
-            // Default mode: stage only files from scopedFiles (excludes run artifacts)
-            // We need to stage each file individually to exclude run artifacts.
-            if (scopedFiles.length > 0) {
-              await runGitCommand(repoRoot, "add", [
-                "--",
-                ...scopedFiles,
-              ]);
-            }
+          if (scopedFiles.length > 0) {
+            await runGitCommand(repoRoot, "add", [
+              "--",
+              ...scopedFiles,
+            ]);
           }
 
           // Commit message — generated from the configured Publish-stage
@@ -1046,6 +1091,9 @@ export async function commitAndPushTask(
       }
     }
   );
+  } finally {
+    releaseTaskOperationLock(lockKey);
+  }
 }
 
 /**
@@ -1088,49 +1136,63 @@ export async function completeCommitAndPushTask(
     return;
   }
 
-  // 1. Run fresh checks, then transition stage to "publish".
-  const taskFolderUri = vscode.Uri.file(resolvedTask.taskFolderPath);
-  const lintResult = await runCompletionLint(taskFolderUri);
-  if (!lintResult.passed) {
-    NotificationRouter.showWarning(`Lint issues found for "${resolvedTask.folderName}". Fix them before completing.`);
+  // Guard the lint/advance/complete portion against a concurrent invocation
+  // of this same command (or a sibling command on the same task) racing the
+  // stage-eligibility check above and double-advancing/double-completing.
+  // Released before step 4 so the commitAndPushTask call below can acquire
+  // its own lock on the same folder without self-deadlocking.
+  const lockKey = resolvedTask.taskFolderPath;
+  if (!tryAcquireTaskOperationLock(lockKey, "Complete, Commit and Push")) {
+    showTaskBusyWarning(lockKey);
     return;
   }
-  const transitionResult = await advanceStage(
-    taskFolderUri,
-    resolvedTask.progress.currentStage,
-    "publish",
-    false,
-    false
-  );
-
-  if (!transitionResult?.persisted) {
-    void vscode.window.showErrorMessage(
-      `Could not persist completion for ${resolvedTask.folderName}. Please try again.`
-    );
-    return;
-  }
-
-  // Completing this command is a lifecycle transition, not merely reaching
-  // Publish. Persist completion before selecting another task so the one
-  // active-task invariant remains true across refreshes and reloads.
-  await patchTaskProgress(taskFolderUri, (current) => ({
-    ...current,
-    status: "completed",
-    completedAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-  }));
-
-  // 2. Refresh inventory
-  await inventory.refresh();
-
-  // 3. Select next active task deterministically
-  if (currentTaskStore) {
-    const nextCanonicalId = selectNextTask(inventory, resolvedTask.canonicalId);
-    if (nextCanonicalId) {
-      await currentTaskStore.set(nextCanonicalId);
-    } else {
-      await currentTaskStore.clear();
+  try {
+    // 1. Run fresh checks, then transition stage to "publish".
+    const taskFolderUri = vscode.Uri.file(resolvedTask.taskFolderPath);
+    const lintResult = await runCompletionLint(taskFolderUri);
+    if (!lintResult.passed) {
+      NotificationRouter.showWarning(`Lint issues found for "${resolvedTask.folderName}". Fix them before completing.`);
+      return;
     }
+    const transitionResult = await advanceStage(
+      taskFolderUri,
+      resolvedTask.progress.currentStage,
+      "publish",
+      false,
+      false
+    );
+
+    if (!transitionResult?.persisted) {
+      void vscode.window.showErrorMessage(
+        `Could not persist completion for ${resolvedTask.folderName}. Please try again.`
+      );
+      return;
+    }
+
+    // Completing this command is a lifecycle transition, not merely reaching
+    // Publish. Persist completion before selecting another task so the one
+    // active-task invariant remains true across refreshes and reloads.
+    await patchTaskProgress(taskFolderUri, (current) => ({
+      ...current,
+      status: "completed",
+      completedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    }));
+
+    // 2. Refresh inventory
+    await inventory.refresh();
+
+    // 3. Select next active task deterministically
+    if (currentTaskStore) {
+      const nextCanonicalId = selectNextTask(inventory, resolvedTask.canonicalId);
+      if (nextCanonicalId) {
+        await currentTaskStore.set(nextCanonicalId);
+      } else {
+        await currentTaskStore.clear();
+      }
+    }
+  } finally {
+    releaseTaskOperationLock(lockKey);
   }
 
   // 4. Run commit & push

@@ -1,14 +1,16 @@
 import * as vscode from "vscode";
 import * as path from "path";
-import { TASK_DESCRIPTION_FILENAME, TASK_FILENAME } from "../types/taskProgress";
+import { TASK_FILENAME } from "../types/taskProgress";
 import {
   createTaskProgress,
+  readTaskProgress,
   writeTaskProgress,
 } from "../utils/taskProgressUtils";
 import { resolveTaskRootForCreation } from "../utils/taskRoot";
 import { TaskInventory } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { activateTask } from "../state/taskActivationCoordinator";
+import { withMetaRootLock } from "../state/taskStateStore";
 
 /**
  * The default plans root relative to workspace.
@@ -59,6 +61,40 @@ async function getNextTaskNumber(
 }
 
 /**
+ * Finish a creation that was interrupted after both durable seed files were
+ * written but before its sentinel could be promoted. Incomplete sentinels are
+ * deliberately retained for inspection and never reused for a new task.
+ */
+async function recoverCompletedTaskCreations(metaFolderPath: string): Promise<void> {
+  const root = vscode.Uri.file(metaFolderPath);
+  let entries: [string, vscode.FileType][];
+  try {
+    entries = await vscode.workspace.fs.readDirectory(root);
+  } catch {
+    return;
+  }
+
+  for (const [name, type] of entries) {
+    if (type !== vscode.FileType.Directory) continue;
+    const folder = vscode.Uri.joinPath(root, name);
+    const progress = await readTaskProgress(folder);
+    if (progress?.status !== "creating") continue;
+    try {
+      await vscode.workspace.fs.stat(vscode.Uri.joinPath(folder, TASK_FILENAME));
+      await writeTaskProgress(folder, { ...progress, status: "active" });
+    } catch {
+      // The creation is genuinely incomplete. Preserve its sentinel rather
+      // than risking deletion or silently repurposing its folder number.
+    }
+  }
+}
+
+/** Recover durable task-creation sentinels during extension startup. */
+export async function recoverTaskCreations(metaFolderPath: string): Promise<void> {
+  await withMetaRootLock(metaFolderPath, () => recoverCompletedTaskCreations(metaFolderPath));
+}
+
+/**
  * Load the task template from the bundled template file.
  */
 async function loadTaskTemplate(extensionUri: vscode.Uri): Promise<string> {
@@ -73,16 +109,7 @@ async function loadTaskTemplate(extensionUri: vscode.Uri): Promise<string> {
     return new TextDecoder().decode(bytes);
   } catch (error) {
     // Fallback to inline template if file read fails
-    return `Briefly describe what changes you want to be made, and then use AI to help you clarify the plan.
-
-Shortcut: Apply Current Stage Action (Windows/Linux: Ctrl+Shift+Alt+I, macOS: Cmd+Shift+Alt+I).
-
-## Task Description
-
-## Draft with AI
-
-## Open Questions
-`;
+    return "# Task\n\nDescribe the work you want to do here in as much detail as is useful. When\nyou're ready, use **Draft with AI** to turn these notes into a structured task\ndescription. Questions from the stage AI appear in the **Chat With AI** panel.\n";
   }
 }
 
@@ -97,9 +124,8 @@ function normalizePath(p: string): string {
 
 /**
  * Creates a new task folder (YYYY-MM-DD_task_X) with progress tracking and
- * opens task.md for the user to describe the work. The file is pre-seeded
- * with the task template (intro, shortcut note, and the three canonical
- * sections). No plan-generation prompt is shown.
+ * opens an almost-blank task.md for the user to describe the work. No input
+ * popup or plan-generation prompt is shown.
  *
  * After a successful creation the new task is persisted as the current task
  * so the keyboard shortcut (Ctrl+Shift+Alt+I) works immediately without the
@@ -127,34 +153,27 @@ export async function startNewTask(
   }
 
   try {
-    // Prompt for optional task description
-    const description = await vscode.window.showInputBox({
-      title: "Tell me about this task",
-      prompt: "Describe what you want to do in free text. You can use AI to turn it into the task file.",
-      placeHolder: "e.g., Implement sidebar status view",
-    });
-
-    // If the user cancelled the input box (returned undefined), abort creation.
-    if (description === undefined) {
-      return undefined;
-    }
-
     // Resolve the task root, creating it if needed
     const metaFolderPath = await resolveTaskRootForCreation(workspaceRoot);
 
-    const dateStr = formatDate(new Date());
-    const taskNumber = await getNextTaskNumber(metaFolderPath, dateStr);
-    const taskFolderName = `${dateStr}_task_${taskNumber}`;
-    const taskFolderPath = path.join(metaFolderPath, taskFolderName);
-    const taskFolderUri = vscode.Uri.file(taskFolderPath);
+    // The meta-root lease is shared across extension hosts. Folder-number
+    // discovery, directory creation, and the initial files must be one
+    // operation: otherwise two VS Code windows can both choose task_2 and
+    // overwrite each other's seed files.
+    const created = await withMetaRootLock(metaFolderPath, async () => {
+      await recoverCompletedTaskCreations(metaFolderPath);
+      const dateStr = formatDate(new Date());
+      const taskNumber = await getNextTaskNumber(metaFolderPath, dateStr);
+      const taskFolderName = `${dateStr}_task_${taskNumber}`;
+      const taskFolderPath = path.join(metaFolderPath, taskFolderName);
+      const taskFolderUri = vscode.Uri.file(taskFolderPath);
+      const taskFileUri = vscode.Uri.joinPath(taskFolderUri, TASK_FILENAME);
 
-    // Create the task folder
-    await vscode.workspace.fs.createDirectory(taskFolderUri);
+      await vscode.workspace.fs.createDirectory(taskFolderUri);
 
-    // Write initial progress with the new "task-description" stage
-    await writeTaskProgress(
-      taskFolderUri,
-      {
+      // "creating" is a durable creation sentinel. It is only promoted after
+      // task.md and task-progress.json have both been written successfully.
+      const progress = {
         ...createTaskProgress(taskFolderName, "desc"),
         displayName: taskFolderName,
         nameIsDefault: true,
@@ -163,25 +182,22 @@ export async function startNewTask(
           projectRoot: path.resolve(workspaceRoot.uri.fsPath),
           workspaceRoot: path.resolve(workspaceRoot.uri.fsPath),
           boundAt: new Date().toISOString(),
-          state: "resolved",
+          state: "resolved" as const,
         },
-      }
-    );
+      };
+      await writeTaskProgress(taskFolderUri, progress);
 
-    // Keep raw user input separate from the structured task artifact.  This
-    // avoids AI drafts continually mixing narration and the task contract.
-    const taskTemplate = await loadTaskTemplate(extensionUri);
-    const taskFileUri = vscode.Uri.joinPath(taskFolderUri, TASK_FILENAME);
-    await vscode.workspace.fs.writeFile(
-      taskFileUri,
-      new TextEncoder().encode(taskTemplate)
-    );
-    if (description.trim().length > 0) {
+      // task.md is the sole initial task document. Users can write freely in
+      // the editor before asking the stage AI to turn it into a structured task.
+      const taskTemplate = await loadTaskTemplate(extensionUri);
       await vscode.workspace.fs.writeFile(
-        vscode.Uri.joinPath(taskFolderUri, TASK_DESCRIPTION_FILENAME),
-        new TextEncoder().encode(description.trim() + "\n")
+        taskFileUri,
+        new TextEncoder().encode(taskTemplate)
       );
-    }
+      await writeTaskProgress(taskFolderUri, { ...progress, status: "active" });
+      return { taskFolderName, taskFolderPath, taskFileUri };
+    });
+    const { taskFolderName, taskFolderPath, taskFileUri } = created;
 
     // Refresh inventory so the new task is discoverable
     await inventory.refresh();
@@ -216,12 +232,7 @@ export async function startNewTask(
       }
     }
 
-    // Open the free-text description when present, otherwise the task file.
-    const doc = await vscode.workspace.openTextDocument(
-      description.trim().length > 0
-        ? vscode.Uri.joinPath(taskFolderUri, TASK_DESCRIPTION_FILENAME)
-        : taskFileUri
-    );
+    const doc = await vscode.workspace.openTextDocument(taskFileUri);
     await vscode.window.showTextDocument(doc);
 
     return taskFolderName;

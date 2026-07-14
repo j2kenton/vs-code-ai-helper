@@ -2,12 +2,11 @@ import * as vscode from "vscode";
 import {
   registerSelectMetaFolderCommand,
 } from "./commands/selectMetaFolder";
-import { registerStartNewTaskCommand } from "./commands/startNewTask";
+import { recoverTaskCreations, registerStartNewTaskCommand } from "./commands/startNewTask";
 import { registerResumeTaskCommand } from "./commands/resumeTask";
 import { registerGeneratePlanWithAICommand } from "./commands/generatePlanWithAI";
 import { registerReviewActionCommands } from "./commands/reviewActions";
 import { registerSetTaskStageCommand } from "./commands/setTaskStage";
-import { registerConfigureStepModelsCommand } from "./commands/configureStepModels";
 import { registerViewArtifactCommands } from "./commands/viewArtifacts";
 import { registerDraftTaskWithAICommand } from "./commands/draftTaskWithAI";
 import { registerApplyCurrentStageActionCommand } from "./commands/applyCurrentStageAction";
@@ -29,9 +28,10 @@ import { registerScheduleTaskResumeCommand } from "./commands/scheduleTaskResume
 import { registerMarkTaskDoneCommand } from "./commands/markTaskDone";
 import { registerViewStageChangesCommands } from "./commands/viewStageChanges";
 import { registerRenameTaskCommands } from "./commands/renameTask";
-import { TaskTreeProvider, TASKS_VIEW_ID, TaskNode } from "./views/taskTreeProvider";
+import { TaskTreeProvider, TASKS_VIEW_ID, TaskNode, StageNode, EmptyTasksNode } from "./views/taskTreeProvider";
 import { TaskStatusBar } from "./views/taskStatusBar";
 import { SettingsViewProvider } from "./views/settingsView";
+import { ChatViewProvider } from "./views/chatView";
 import { TaskInventory } from "./state/taskInventory";
 import { CurrentTaskStore } from "./utils/currentTaskStore";
 import { TASK_PROGRESS_FILENAME } from "./types/taskProgress";
@@ -44,6 +44,7 @@ import { finishFinalization, recoverFinalizationTree } from "./state/finalizatio
 import { PendingOperationsStore } from "./state/pendingOperationsStore";
 import { recoverActivationCheckpoint } from "./state/taskActivationCoordinator";
 import { readTaskProgress } from "./utils/taskProgressUtils";
+import { migrateEnabledProvidersForExistingModels } from "./config/settings";
 
 /**
  * FileDecorationProvider for the synthetic `current-task:` URI scheme.
@@ -78,6 +79,9 @@ class CurrentTaskDecorationProvider implements vscode.FileDecorationProvider {
  */
 export function activate(context: vscode.ExtensionContext): void {
   console.log("Ensemble is now active!");
+  void migrateEnabledProvidersForExistingModels().catch(error =>
+    console.error("Provider settings migration failed", error)
+  );
   void vscode.commands.executeCommand("setContext", "vs-code-ai-helper.tasksInitialized", false);
   // Recover interrupted operations before commands become available. They are
   // retained for reconciliation rather than silently discarded.
@@ -98,6 +102,9 @@ export function activate(context: vscode.ExtensionContext): void {
     const rootPaths = candidates.map((c) => c.absolutePath);
     void cleanupOrphanedTempFiles(rootPaths);
     for (const root of rootPaths) {
+      void recoverTaskCreations(root).catch(err =>
+        console.error("Task creation recovery failed", err)
+      );
       void recoverFinalizationTree(root).then(async journals => {
         for (const journal of journals) {
           // The journaled write itself is atomic (writeAtomic rename), so a
@@ -133,11 +140,15 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   const settingsViewProvider = new SettingsViewProvider(context.extensionUri);
+  const chatViewProvider = new ChatViewProvider(context.workspaceState);
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(
       SettingsViewProvider.viewType,
       settingsViewProvider
     )
+  );
+  context.subscriptions.push(
+    vscode.window.registerWebviewViewProvider(ChatViewProvider.viewType, chatViewProvider)
   );
 
   // Register commands — pass the shared inventory, currentTaskStore, and
@@ -149,7 +160,10 @@ export function activate(context: vscode.ExtensionContext): void {
   registerGeneratePlanWithAICommand(context, inventory);
   registerReviewActionCommands(context);
   registerSetTaskStageCommand(context, inventory, currentTaskStore);
-  registerConfigureStepModelsCommand(context, settingsViewProvider);
+  context.subscriptions.push(vscode.commands.registerCommand(
+    "vs-code-ai-helper.openSettings",
+    () => vscode.commands.executeCommand("vs-code-ai-helper.settingsView.focus")
+  ));
   registerViewArtifactCommands(context);
   registerDraftTaskWithAICommand(context, inventory);
   registerApplyCurrentStageActionCommand(context, inventory, currentTaskStore);
@@ -161,7 +175,7 @@ export function activate(context: vscode.ExtensionContext): void {
   registerApplyLowLevelReviewChangesCommand(context, inventory);
   registerCommitAndPushTaskCommand(context, inventory, currentTaskStore);
   registerToggleMetaResourcesGitIgnoreCommand(context, inventory, currentTaskStore);
-  registerChatWithStageCommand(context, inventory);
+  registerChatWithStageCommand(context, inventory, chatViewProvider);
   registerRunLintingFixesCommand(context, inventory);
   const taskActionScheduler = registerScheduleTaskResumeCommand(context, inventory);
   registerMarkTaskDoneCommand(context, inventory, currentTaskStore);
@@ -199,16 +213,20 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(viewDisclaimerDisposable);
 
   // Tasks tree view + status bar: persistent visibility of workflow progress
-  const taskTreeProvider = new TaskTreeProvider(inventory, currentTaskStore);
+  const taskTreeProvider = new TaskTreeProvider(inventory, currentTaskStore, context.workspaceState);
   const tasksTreeView = vscode.window.createTreeView(TASKS_VIEW_ID, {
     treeDataProvider: taskTreeProvider,
-    showCollapseAll: false,
+    showCollapseAll: true,
   });
 
   // Initialize status view and notification router
-  const statusTreeProvider = new StatusTreeProvider();
+  const statusTreeProvider = new StatusTreeProvider(context.workspaceState);
   initNotificationRouter(statusTreeProvider);
-  registerOpenGeneralAssistantCommand(context, inventory, currentTaskStore, statusTreeProvider);
+  context.subscriptions.push(vscode.commands.registerCommand(
+    "vs-code-ai-helper.clearNotifications",
+    () => statusTreeProvider.clear()
+  ));
+  registerOpenGeneralAssistantCommand(context, inventory, currentTaskStore);
 
   const statusTreeView = vscode.window.createTreeView("vs-code-ai-helper.statusView", {
     treeDataProvider: statusTreeProvider,
@@ -219,6 +237,14 @@ export function activate(context: vscode.ExtensionContext): void {
   const tasksLoadedListener = taskTreeProvider.onDidLoadTasks((tasks) => {
     void vscode.commands.executeCommand("setContext", "vs-code-ai-helper.tasksInitialized", true);
     const currentTaskCanonicalId = currentTaskStore.get();
+    const currentTaskStage = currentTaskCanonicalId
+      ? inventory.getTaskById(currentTaskCanonicalId)?.progress.currentStage
+      : undefined;
+    void vscode.commands.executeCommand(
+      "setContext",
+      "vs-code-ai-helper.currentTaskStage",
+      currentTaskStage
+    );
     taskStatusBar.update(tasks, currentTaskCanonicalId);
     void refreshMetaResourcesGitIgnoreContext(inventory, currentTaskStore);
   });
@@ -231,10 +257,14 @@ export function activate(context: vscode.ExtensionContext): void {
     "vs-code-ai-helper.expandAllTasks",
     () => taskTreeProvider.expandAll(tasksTreeView)
   );
-  const collapseAllCommand = vscode.commands.registerCommand(
-    "vs-code-ai-helper.collapseAllTasks",
-    () => taskTreeProvider.collapseAll()
-  );
+  context.subscriptions.push(vscode.commands.registerCommand(
+    "vs-code-ai-helper.filterTasksByStatus",
+    () => taskTreeProvider.chooseStatusFilter()
+  ));
+  context.subscriptions.push(vscode.commands.registerCommand(
+    "vs-code-ai-helper.resetTaskStatusFilter",
+    () => taskTreeProvider.resetStatusFilter()
+  ));
   const statusBarMenuCommand = vscode.commands.registerCommand(
     "vs-code-ai-helper.statusBarMenu",
     () => taskStatusBar.showMenu()
@@ -274,6 +304,15 @@ export function activate(context: vscode.ExtensionContext): void {
   // Repaint decorations when the current task changes
   const currentTaskListener = currentTaskStore.onDidChange(() => {
     decorationProvider.notifyChanged();
+    const currentTaskCanonicalId = currentTaskStore.get();
+    const currentTaskStage = currentTaskCanonicalId
+      ? inventory.getTaskById(currentTaskCanonicalId)?.progress.currentStage
+      : undefined;
+    void vscode.commands.executeCommand(
+      "setContext",
+      "vs-code-ai-helper.currentTaskStage",
+      currentTaskStage
+    );
     void refreshMetaResourcesGitIgnoreContext(inventory, currentTaskStore);
     // Reveal the newly-current task in the tree. We wait for the provider to
     // finish its next render cycle (triggered by its own onDidChange sub above)
@@ -300,7 +339,6 @@ export function activate(context: vscode.ExtensionContext): void {
     tasksLoadedListener,
     refreshCommand,
     expandAllCommand,
-    collapseAllCommand,
     statusBarMenuCommand,
     progressWatcher,
     { dispose: () => clearInterval(schedulerRecoveryTimer) },
@@ -340,7 +378,7 @@ export function activate(context: vscode.ExtensionContext): void {
  * where `getTaskNodesForReveal()` returns the pre-refresh node list.
  */
 async function revealCurrentTask(
-  treeView: vscode.TreeView<TaskNode>,
+  treeView: vscode.TreeView<TaskNode | StageNode | EmptyTasksNode>,
   provider: TaskTreeProvider,
   store: CurrentTaskStore
 ): Promise<void> {

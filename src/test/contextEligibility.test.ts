@@ -34,8 +34,8 @@ void test("CONTEXT_TOTAL_MAX_BYTES equals 400000", () => {
   assert.equal(CONTEXT_TOTAL_MAX_BYTES, 400_000);
 });
 
-void test("CONTEXT_CONFIRM_THRESHOLD_BYTES equals 150000", () => {
-  assert.equal(CONTEXT_CONFIRM_THRESHOLD_BYTES, 150_000);
+void test("CONTEXT_CONFIRM_THRESHOLD_BYTES equals 300000", () => {
+  assert.equal(CONTEXT_CONFIRM_THRESHOLD_BYTES, 300_000);
 });
 
 void test("PROMPT_TOTAL_MAX_BYTES equals 600000", () => {

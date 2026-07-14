@@ -13,6 +13,11 @@ import { TaskTreeProvider } from "../views/taskTreeProvider";
 import { shortcutHint } from "../utils/shortcutHints";
 import { backupArtifactBeforeWrite, backupArtifactContents } from "../utils/artifactBackups";
 import { patchTaskProgress, IncompleteTask } from "../utils/taskProgressUtils";
+import {
+  releaseTaskOperationLock,
+  showTaskBusyWarning,
+  tryAcquireTaskOperationLock,
+} from "../utils/taskOperationLock";
 
 const INTRO_TEXT = `Briefly describe what changes you want to be made, and then use AI to help you clarify the plan.`;
 const SHORTCUT_NOTE = `Shortcut: Apply Current Stage Action${shortcutHint("vs-code-ai-helper.applyCurrentStageAction")}.`;
@@ -375,6 +380,13 @@ export async function draftTaskWithAI(
     return;
   }
 
+  const lockKey = resolvedTask.taskFolderPath;
+  if (!tryAcquireTaskOperationLock(lockKey, "Draft Task with AI")) {
+    showTaskBusyWarning(lockKey);
+    return;
+  }
+  try {
+
   // resolveTaskContext already computed the owning workspace folder (with a
   // fallback for tasks that predate the `ownership` field), so reuse it
   // instead of re-deriving it from ownership.workspaceRoot directly — that
@@ -447,7 +459,7 @@ export async function draftTaskWithAI(
       "Open Settings"
     );
     if (openSettings === "Open Settings") {
-      await vscode.commands.executeCommand("vs-code-ai-helper.settingsView.focus");
+      await vscode.commands.executeCommand("vs-code-ai-helper.openSettings");
     }
     return;
   }
@@ -483,7 +495,7 @@ export async function draftTaskWithAI(
     TaskTreeProvider.setStageRunning(resolvedTask.canonicalId, "desc", true);
     await vscode.window.withProgress(
       {
-        location: vscode.ProgressLocation.Notification,
+        location: vscode.ProgressLocation.Window,
         title: `Drafting task with ${providerLabel} (uses your ${providerLabel} quota)...`,
         cancellable: true,
       },
@@ -622,6 +634,9 @@ export async function draftTaskWithAI(
     }
   }
   return true;
+  } finally {
+    releaseTaskOperationLock(lockKey);
+  }
 }
 
 /**

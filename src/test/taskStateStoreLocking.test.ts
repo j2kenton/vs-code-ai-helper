@@ -13,11 +13,10 @@ import { withTaskLock, withMetaRootLock } from "../state/taskStateStore";
 // `metaLocksForTasksRoot` helper in taskStateStore.ts; this test proves that
 // by actually contending for the locks rather than just comparing strings.
 //
-// PrimarySessionLock is fail-fast, not a blocking queue: a second acquire
-// attempt while a lease is live rejects immediately with "Another Ensemble
-// session..." rather than waiting. Before the fix, withMetaRootLock's
-// predecessor used a mismatched path and would have acquired successfully
-// here instead of rejecting.
+// Mutations issued by the same extension host are queued before acquiring the
+// cross-process lease. This prevents a repeated task action from failing with
+// "Another Ensemble session..." while preserving the on-disk lock for other
+// extension hosts.
 
 const TEST_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-lock-test-"));
 after(() => {
@@ -25,8 +24,7 @@ after(() => {
 });
 
 void test(
-  "withMetaRootLock cannot acquire while a withTaskLock mutation holds the shared lock " +
-    "under the same tasks root, and can once it is released",
+  "withMetaRootLock waits for a withTaskLock mutation under the same tasks root",
   async () => {
     const tasksDir = path.join(TEST_ROOT, ".ensemble", "tasks-exclude");
     const taskA = path.join(tasksDir, "taskA");
@@ -45,18 +43,17 @@ void test(
     await new Promise((resolve) => setTimeout(resolve, 50));
 
     let ranWhileHeld = false;
-    await assert.rejects(
-      () =>
-        withMetaRootLock(tasksDir, () => {
-          ranWhileHeld = true;
-          return Promise.resolve();
-        }),
-      /Another Ensemble session/
-    );
+    const opB = withMetaRootLock(tasksDir, () => {
+      ranWhileHeld = true;
+      return Promise.resolve();
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
     assert.equal(ranWhileHeld, false);
 
     releaseHeld();
     await opA;
+    await opB;
+    assert.equal(ranWhileHeld, true);
 
     // Once A has released, the same lock is free for withMetaRootLock.
     let ranAfterRelease = false;
@@ -69,8 +66,7 @@ void test(
 );
 
 void test(
-  "a withTaskLock mutation cannot acquire while withMetaRootLock holds the shared lock " +
-    "under the same tasks root",
+  "withTaskLock waits for a withMetaRootLock mutation under the same tasks root",
   async () => {
     const tasksDir = path.join(TEST_ROOT, ".ensemble", "tasks-reverse");
     const taskA = path.join(tasksDir, "taskA");
@@ -88,17 +84,16 @@ void test(
     await new Promise((resolve) => setTimeout(resolve, 50));
 
     let ranWhileHeld = false;
-    await assert.rejects(
-      () =>
-        withTaskLock(taskA, () => {
-          ranWhileHeld = true;
-          return Promise.resolve();
-        }),
-      /Another Ensemble session/
-    );
+    const opTask = withTaskLock(taskA, () => {
+      ranWhileHeld = true;
+      return Promise.resolve();
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
     assert.equal(ranWhileHeld, false);
 
     releaseHeld();
     await opMeta;
+    await opTask;
+    assert.equal(ranWhileHeld, true);
   }
 );

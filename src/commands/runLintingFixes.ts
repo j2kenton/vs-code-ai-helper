@@ -14,6 +14,11 @@ import { resolveFreshModelForStage } from "../utils/modelSelection";
 import { runImplementationForModel } from "../runners/runnerRegistry";
 import { checkAndConfirmPromptSize } from "../utils/promptSizeGuard";
 import { ensureAiConsent } from "../utils/aiConsent";
+import {
+  releaseTaskOperationLock,
+  showTaskBusyWarning,
+  tryAcquireTaskOperationLock,
+} from "../utils/taskOperationLock";
 
 /**
  * Accepted argument shapes for runLintingFixes.
@@ -110,6 +115,11 @@ export async function runLintingFixes(
   }
 
   const taskFolderUri = vscode.Uri.file(resolvedTask.taskFolderPath);
+  const lockKey = taskFolderUri.fsPath;
+  if (!tryAcquireTaskOperationLock(lockKey, "Linting Fixes")) {
+    showTaskBusyWarning(lockKey);
+    return;
+  }
   const persistLintState = async (
     passed: boolean,
     summary: string
@@ -123,9 +133,10 @@ export async function runLintingFixes(
     );
   };
 
+  try {
   await vscode.window.withProgress(
     {
-      location: vscode.ProgressLocation.Notification,
+      location: vscode.ProgressLocation.Window,
       title: "Running linting fixes...",
       cancellable: false,
     },
@@ -210,9 +221,7 @@ export async function runLintingFixes(
             );
           }).length;
 
-        const postFixLint = remainingLintIssues === 0
-          ? await runCompletionLint(taskFolderUri, relevantFiles)
-          : await runCompletionLint(taskFolderUri, relevantFiles);
+        const postFixLint = await runCompletionLint(taskFolderUri, relevantFiles);
 
         if (!postFixLint.passed) {
 
@@ -238,7 +247,7 @@ export async function runLintingFixes(
                 return;
               }
               let result: Awaited<ReturnType<typeof runImplementationForModel>> | undefined;
-              await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: "Applying AI final fixes...", cancellable: true }, async (aiProgress, token) => {
+              await vscode.window.withProgress({ location: vscode.ProgressLocation.Window, title: "Applying AI final fixes...", cancellable: true }, async (aiProgress, token) => {
                 // `model` is resolved from the "impl" stage above — fallback
                 // bookkeeping must use that same stage, not "publish".
                 result = await runImplementationForModel({ modelId: model.modelId, prompt, workspaceUri: workspaceFolder.uri, token, stage: "impl", taskFolderUri: taskFolderUri, onProgress: (message) => aiProgress.report({ message }) });
@@ -288,6 +297,9 @@ export async function runLintingFixes(
       }
     }
   );
+  } finally {
+    releaseTaskOperationLock(lockKey);
+  }
 }
 
 /**

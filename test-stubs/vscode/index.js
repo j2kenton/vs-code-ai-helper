@@ -233,6 +233,12 @@ const StatusBarAlignment = {
   Right: 2,
 };
 
+const ConfigurationTarget = {
+  Global: 1,
+  Workspace: 2,
+  WorkspaceFolder: 3,
+};
+
 const ProgressLocation = {
   SourceControl: 1,
   Window: 10,
@@ -342,6 +348,7 @@ module.exports = {
   Uri,
   FileType,
   StatusBarAlignment,
+  ConfigurationTarget,
   ProgressLocation,
   StatusBarItem,
   QuickPick,

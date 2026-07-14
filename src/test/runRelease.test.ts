@@ -8,7 +8,10 @@
  */
 import * as assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { isSafeReleaseScript } from "../commands/reviewActions";
+import {
+  isSafeReleaseScript,
+  resolveReleaseWorkspace,
+} from "../commands/reviewActions";
 
 void describe("isSafeReleaseScript", () => {
   void it("accepts plain release commands with allowed characters", () => {
@@ -54,5 +57,35 @@ void describe("isSafeReleaseScript", () => {
     assert.strictEqual(isSafeReleaseScript(123), false);
     assert.strictEqual(isSafeReleaseScript({}), false);
     assert.strictEqual(isSafeReleaseScript(["vsce", "publish"]), false);
+  });
+});
+
+void describe("resolveReleaseWorkspace", () => {
+  const workspace = { uri: { fsPath: "C:\\Projects\\Helper" } };
+
+  void it("uses persisted project ownership for an external metadata root", () => {
+    const resolved = resolveReleaseWorkspace(
+      "C:\\EnsembleMeta\\tasks\\task-a",
+      {
+        metaRoot: "C:\\EnsembleMeta",
+        projectRoot: "c:\\projects\\helper",
+      },
+      [workspace]
+    );
+
+    assert.equal(resolved, workspace);
+  });
+
+  void it("rejects a task that is outside its persisted metadata root", () => {
+    const resolved = resolveReleaseWorkspace(
+      "C:\\Elsewhere\\task-a",
+      {
+        metaRoot: "C:\\EnsembleMeta",
+        projectRoot: "C:\\Projects\\Helper",
+      },
+      [workspace]
+    );
+
+    assert.equal(resolved, undefined);
   });
 });

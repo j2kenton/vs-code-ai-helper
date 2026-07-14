@@ -16,6 +16,7 @@ import * as assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import * as vscode from "vscode";
 
+import { TASK_STATUSES } from "../types/taskProgress";
 import type { IncompleteTask } from "../utils/taskProgressUtils";
 import { TaskStatusBar } from "../views/taskStatusBar";
 import { TaskNode, TaskTreeProvider } from "../views/taskTreeProvider";
@@ -328,28 +329,136 @@ void describe("TaskTreeProvider — explicit expand/collapse state", () => {
     });
   });
 
-  void it("collapseAll executes without error (with executeCommand stub)", () => {
-    const provider = new TaskTreeProvider(makeInventoryStub());
-    const task = makeTask("/workspace/task-z", "task-z");
-    provider.notifyExpanded(task);
-
-    // Stub executeCommand so syncCollapseExpandContext() doesn't throw.
-    const commands = vscode.commands as {
-      executeCommand: (...args: unknown[]) => unknown;
-    };
-    const origExecute = commands.executeCommand;
-    commands.executeCommand = async (): Promise<void> => {};
-
-    try {
-      assert.doesNotThrow(() => provider.collapseAll());
-    } finally {
-      commands.executeCommand = origExecute;
-    }
-  });
-
   void it("getTaskNodeById returns undefined when no nodes have been loaded", () => {
     const provider = new TaskTreeProvider(makeInventoryStub());
     assert.strictEqual(provider.getTaskNodeById("/workspace/nonexistent"), undefined);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// TaskTreeProvider — task-status filter migration
+// ---------------------------------------------------------------------------
+// Blocking issue: a persisted status filter saved before this session's
+// changes (or before the "creating" recovery status existed) silently
+// excluded any status not in the saved array — forever, with no visible
+// indication anything was hidden. The fix reconciles the saved selection
+// against a persisted "known statuses" snapshot, unioning in any status
+// that didn't exist the last time the filter was saved. When no snapshot
+// exists (installs that saved a filter before this reconciliation shipped),
+// the snapshot defaults to the status set that predates "creating" — the
+// only status added since the filter feature shipped.
+
+function makeMementoStub(initial: Record<string, unknown> = {}): vscode.Memento {
+  const store = new Map<string, unknown>(Object.entries(initial));
+  return {
+    get: (<T>(key: string, defaultValue?: T): T =>
+      (store.has(key) ? (store.get(key) as T) : (defaultValue as T))) as vscode.Memento["get"],
+    update: (key: string, value: unknown): Thenable<void> => {
+      store.set(key, value);
+      return Promise.resolve();
+    },
+    keys: () => [...store.keys()],
+  } as unknown as vscode.Memento;
+}
+
+function makeTaskWithStatus(
+  fsPath: string,
+  folderName: string,
+  status: import("../types/taskProgress").TaskStatus
+): IncompleteTask {
+  return {
+    folderUri: vscode.Uri.file(fsPath),
+    folderName,
+    progress: {
+      currentStage: "impl" as import("../types/taskProgress").TaskStage,
+      status,
+      taskFolder: folderName,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    },
+    canonicalId: fsPath,
+  };
+}
+
+function makeInventoryWithTasks(
+  tasks: IncompleteTask[]
+): import("../state/taskInventory").TaskInventory {
+  return {
+    getTasks: () =>
+      tasks.map((t) => ({
+        taskFolderPath: t.folderUri.fsPath,
+        folderName: t.folderName,
+        progress: t.progress,
+        canonicalId: t.canonicalId,
+      })),
+    refresh: async () => {},
+    onDidChange: (_handler: () => void): { dispose: () => void } => ({ dispose(): void {} }),
+  } as unknown as import("../state/taskInventory").TaskInventory;
+}
+
+/**
+ * getChildren() fires `setContext` via executeCommand as a side effect;
+ * the vscode test stub throws on unregistered commands, so stub it out for
+ * the duration of the callback.
+ */
+async function withStubbedCommands<T>(callback: () => Promise<T>): Promise<T> {
+  const commandsStub = vscode.commands as typeof vscode.commands & {
+    _executeCommandOverride?: (id: string, ...args: unknown[]) => Promise<unknown>;
+  };
+  const previous = commandsStub._executeCommandOverride;
+  commandsStub._executeCommandOverride = () => Promise.resolve(undefined);
+  try {
+    return await callback();
+  } finally {
+    commandsStub._executeCommandOverride = previous;
+  }
+}
+
+void describe("TaskTreeProvider — task-status filter migration", () => {
+  void it("shows a status not present in a saved pre-existing filter (e.g. 'creating')", async () => {
+    // Simulates an install that saved a filter before "creating" existed as
+    // a status: no "ensemble.taskStatusFilterKnownStatuses" key at all.
+    const memento = makeMementoStub({
+      "ensemble.taskStatusFilter": ["active", "paused", "completed"],
+    });
+    const creatingTask = makeTaskWithStatus("/workspace/task-creating", "task-creating", "creating");
+    const inventory = makeInventoryWithTasks([creatingTask]);
+
+    const provider = new TaskTreeProvider(inventory, undefined, memento);
+    const children = await withStubbedCommands(() => provider.getChildren());
+
+    assert.ok(
+      children.length > 0,
+      "Expected a 'creating' task to remain visible despite a saved filter that predates that status"
+    );
+  });
+
+  void it("keeps a status hidden when the saved filter deliberately excluded it (not newly-added)", async () => {
+    const memento = makeMementoStub({
+      "ensemble.taskStatusFilter": ["active"],
+      "ensemble.taskStatusFilterKnownStatuses": [...TASK_STATUSES],
+    });
+    const completedTask = makeTaskWithStatus("/workspace/task-done", "task-done", "completed");
+    const inventory = makeInventoryWithTasks([completedTask]);
+
+    const provider = new TaskTreeProvider(inventory, undefined, memento);
+    const children = await withStubbedCommands(() => provider.getChildren());
+
+    assert.ok(
+      children.every((child) => !(child instanceof TaskNode)),
+      "Expected the completed task to stay hidden — it was already known and deliberately excluded"
+    );
+  });
+
+  void it("defaults to all statuses selected when no filter has ever been saved", async () => {
+    const memento = makeMementoStub({});
+    const activeTask = makeTaskWithStatus("/workspace/task-active", "task-active", "active");
+    const inventory = makeInventoryWithTasks([activeTask]);
+
+    const provider = new TaskTreeProvider(inventory, undefined, memento);
+    const children = await withStubbedCommands(() => provider.getChildren());
+
+    assert.ok(children.length > 0, "Expected all-statuses-selected default to show an active task");
   });
 });
 

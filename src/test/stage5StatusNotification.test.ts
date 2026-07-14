@@ -132,18 +132,28 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
     });
   });
 
-  void describe("Status Surface retention, ordering, and trimming", () => {
-    void it("should keep bounded retention, newest-first, and trim message text", () => {
+  void describe("Status Surface retention, ordering, and expansion", () => {
+    void it("should keep the full message text and expose it via a click-to-expand child", () => {
       const surface = new StatusTreeProvider();
       initNotificationRouter(surface);
 
-      // Trim message text
-      NotificationRouter.showInformation("a".repeat(200));
+      // The stored entry keeps the complete text — only the tree label is
+      // shortened for display, and only then via a click-to-expand child.
+      const longMessage = "a".repeat(200);
+      NotificationRouter.showInformation(longMessage);
       let entries = surface.getEntries();
       assert.strictEqual(entries.length, 1);
-      const firstTrimmed = requireValue(entries[0], "missing first trimmed entry");
-      assert.strictEqual(firstTrimmed.message.length, 153); // 150 characters + "..."
-      assert.ok(firstTrimmed.message.endsWith("..."));
+      const firstEntry = requireValue(entries[0], "missing first entry");
+      assert.strictEqual(firstEntry.message, longMessage);
+
+      const treeItem = surface.getTreeItem(firstEntry);
+      assert.strictEqual(treeItem.label, `${longMessage.slice(0, 150)}…`);
+      assert.strictEqual(treeItem.collapsibleState, 1 /* Collapsed */);
+
+      const children = surface.getChildren(firstEntry);
+      assert.ok(Array.isArray(children) && children.length === 1);
+      const detailItem = surface.getTreeItem((children as unknown[])[0] as Parameters<typeof surface.getTreeItem>[0]);
+      assert.strictEqual(detailItem.label, longMessage);
 
       // Newest-first ordering
       surface.clear();
@@ -156,17 +166,17 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
       assert.strictEqual(firstOrdered.message, "second"); // Newest first
       assert.strictEqual(secondOrdered.message, "first");
 
-      // Bounded retention (50 entries)
+      // No retention cap — every notification persists until explicitly cleared.
       surface.clear();
       for (let i = 0; i < 60; i++) {
         NotificationRouter.showInformation(`message ${i}`);
       }
       entries = surface.getEntries();
-      assert.strictEqual(entries.length, 50);
-      const newest = requireValue(entries[0], "missing newest retained entry");
-      const oldest = requireValue(entries[49], "missing oldest retained entry");
+      assert.strictEqual(entries.length, 60);
+      const newest = requireValue(entries[0], "missing newest entry");
+      const oldest = requireValue(entries[59], "missing oldest entry");
       assert.strictEqual(newest.message, "message 59"); // Newest
-      assert.strictEqual(oldest.message, "message 10"); // Oldest remaining (0-9 removed)
+      assert.strictEqual(oldest.message, "message 0"); // Oldest — nothing evicted
 
       deactivateNotificationRouter();
     });
@@ -327,8 +337,8 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
     });
   });
 
-  void describe("New-task creation prefill helper", () => {
-    void it("should write a separate task description file when provided", async () => {
+  void describe("New-task creation", () => {
+    void it("creates and opens task.md without showing an input popup", async () => {
       // eslint-disable-next-line @typescript-eslint/no-require-imports
       const { startNewTask } = await import("../commands/startNewTask.js");
 
@@ -340,8 +350,11 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
 
       const win = getWindowStub();
       const origShowInputBox = win.showInputBox;
-      win.showInputBox = (): Promise<string> =>
-        Promise.resolve("Implement sidebar status view");
+      let inputBoxShown = false;
+      win.showInputBox = (): Promise<string> => {
+        inputBoxShown = true;
+        return Promise.resolve("unexpected");
+      };
 
       // Stub workspace functions and resolveTaskRootForCreation to prevent real directory writes
       const workspace = getWorkspaceStub();
@@ -380,15 +393,7 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
 
       try {
         await startNewTask(inventory, vscode.Uri.file("/extension"), store);
-        const description = [...writtenFiles.entries()].find(([filePath]) =>
-          filePath.endsWith("/task-description.md")
-        )?.[1];
-        const task = [...writtenFiles.entries()].find(([filePath]) =>
-          filePath.endsWith("/task.md")
-        )?.[1];
-        assert.strictEqual(description, "Implement sidebar status view\n");
-        assert.ok(task?.includes("## Task Description"));
-        assert.ok(!task?.includes("Implement sidebar status view"));
+        assert.equal(inputBoxShown, false);
       } finally {
         win.showInputBox = origShowInputBox;
         win.showErrorMessage = origShowErrorMessage;
@@ -402,7 +407,7 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
       }
     });
 
-    void it("should abort and do nothing when input is cancelled", async () => {
+    void it("creates the task document", async () => {
       // eslint-disable-next-line @typescript-eslint/no-require-imports
       const { startNewTask } = await import("../commands/startNewTask.js");
 
@@ -413,58 +418,6 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
       initNotificationRouter(surface);
 
       const win = getWindowStub();
-      const origShowInputBox = win.showInputBox;
-      win.showInputBox = (): Promise<string | undefined> => Promise.resolve(undefined);
-
-      const workspace = getWorkspaceStub();
-      const origWorkspaceFolders = workspace.workspaceFolders;
-      workspace.workspaceFolders = [{ uri: vscode.Uri.file("/workspace"), name: "workspace", index: 0 }];
-
-      const origCreateDirectory = workspace.fs.createDirectory;
-      const origShowErrorMessage = win.showErrorMessage;
-      const origShowWarningMessage = win.showWarningMessage;
-
-      let dirCreated = false;
-      workspace.fs.createDirectory = (): Promise<void> => {
-        dirCreated = true;
-        return Promise.resolve();
-      };
-      win.showErrorMessage = (): Thenable<string | undefined> =>
-        Promise.resolve(undefined);
-      win.showWarningMessage = (): Thenable<string | undefined> =>
-        Promise.resolve(undefined);
-
-      const inventory = makeInventoryStub();
-      const store = makeStoreStub();
-
-      try {
-        const result = await startNewTask(inventory, vscode.Uri.file("/extension"), store);
-        assert.strictEqual(result, undefined);
-        assert.strictEqual(dirCreated, false, "Should not create directory when cancelled");
-      } finally {
-        win.showInputBox = origShowInputBox;
-        win.showErrorMessage = origShowErrorMessage;
-        win.showWarningMessage = origShowWarningMessage;
-        workspace.workspaceFolders = origWorkspaceFolders;
-        workspace.fs.createDirectory = origCreateDirectory;
-        deactivateNotificationRouter();
-      }
-    });
-
-    void it("should create standard task when description is empty", async () => {
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const { startNewTask } = await import("../commands/startNewTask.js");
-
-      // Initialize notification router
-      const surface: StatusSurface = {
-        addEntry(): void {},
-      };
-      initNotificationRouter(surface);
-
-      const win = getWindowStub();
-      const origShowInputBox = win.showInputBox;
-      win.showInputBox = (): Promise<string> => Promise.resolve("");
-
       const workspace = getWorkspaceStub();
       const origWorkspaceFolders = workspace.workspaceFolders;
       workspace.workspaceFolders = [{ uri: vscode.Uri.file("/workspace"), name: "workspace", index: 0 }];
@@ -477,16 +430,16 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
       const origShowWarningMessage = win.showWarningMessage;
 
       let dirCreated = false;
-      let writtenContent = "";
+      const writtenFiles = new Map<string, string>();
       workspace.fs.createDirectory = (): Promise<void> => {
         dirCreated = true;
         return Promise.resolve();
       };
       workspace.fs.writeFile = (
-        _uri: vscode.Uri,
+        uri: vscode.Uri,
         bytes: Uint8Array
       ): Promise<void> => {
-        writtenContent = new TextDecoder().decode(bytes);
+        writtenFiles.set(uri.path, new TextDecoder().decode(bytes));
         return Promise.resolve();
       };
       workspace.openTextDocument = (): Promise<vscode.TextDocument> =>
@@ -504,10 +457,7 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
       try {
         await startNewTask(inventory, vscode.Uri.file("/extension"), store);
         assert.strictEqual(dirCreated, true);
-        assert.ok(writtenContent.includes("## Task Description"));
-        assert.ok(!writtenContent.includes("undefined"));
       } finally {
-        win.showInputBox = origShowInputBox;
         win.showErrorMessage = origShowErrorMessage;
         win.showWarningMessage = origShowWarningMessage;
         workspace.workspaceFolders = origWorkspaceFolders;

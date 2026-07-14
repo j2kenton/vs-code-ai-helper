@@ -1,13 +1,69 @@
 import * as assert from "node:assert/strict";
+import * as cp from "node:child_process";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
+import * as vscode from "vscode";
 import {
   applyManagedMetaGitIgnoreBlock,
   buildLegacyMetaRootIgnorePatterns,
   buildManagedIgnorePatterns,
+  diffGitignoreLines,
+  hideMetaResourcesInGitIgnore,
   isManagedMetaGitIgnoreHidden,
 } from "../commands/toggleMetaResourcesGitIgnore";
+import {
+  deactivateNotificationRouter,
+  initNotificationRouter,
+} from "../utils/notificationRouter";
+import { StatusTreeProvider } from "../views/statusView";
+import { TaskInventory } from "../state/taskInventory";
+import { CurrentTaskStore } from "../utils/currentTaskStore";
+
+function git(cwd: string, args: string[]): void {
+  cp.execFileSync("git", args, { cwd, stdio: "ignore", windowsHide: true });
+}
+
+function makeGitFixture(): string {
+  const repoRoot = fs.mkdtempSync(
+    path.join(os.tmpdir(), "ensemble-meta-gitignore-")
+  );
+  git(repoRoot, ["init"]);
+  git(repoRoot, [
+    "-c",
+    "user.email=test@example.invalid",
+    "-c",
+    "user.name=Test",
+    "commit",
+    "--allow-empty",
+    "-m",
+    "initial",
+  ]);
+  return repoRoot;
+}
+
+function installConfigStub(): { restore: () => void } {
+  const original = (vscode.workspace as unknown as Record<string, unknown>)
+    .getConfiguration;
+  (vscode.workspace as unknown as Record<string, unknown>).getConfiguration =
+    (): {
+      get: (key: string, defaultValue?: unknown) => unknown;
+      update: () => Promise<void>;
+      inspect: () => undefined;
+    } => ({
+      get: (_key: string, defaultValue?: unknown): unknown => defaultValue,
+      update: async (): Promise<void> => {},
+      inspect: () => undefined,
+    });
+  return {
+    restore: (): void => {
+      (
+        vscode.workspace as unknown as Record<string, unknown>
+      ).getConfiguration = original;
+    },
+  };
+}
 
 function readPackageJson(): {
   contributes?: {
@@ -230,26 +286,28 @@ void describe("meta gitignore command contributions", () => {
     });
   });
 
-  void it("declares explicit hide/show commands", () => {
+  void it("keeps hide/show/toggle commands out of the command manifest (Settings owns confirmation)", () => {
+    // These commands still exist and are still registered (settingsView.ts
+    // invokes them programmatically), but they must not be reachable from
+    // the Command Palette or any menu — every .gitignore write must go
+    // through the confirmation flow, and the only caller that's supposed to
+    // reach it is the Settings save handler.
     const commands = readPackageJson().contributes?.commands ?? [];
 
-    assert.ok(
-      commands.some(
-        (entry) =>
-          entry.command === "vs-code-ai-helper.hideMetaResourcesInGitIgnore" &&
-          entry.title === "Hide Meta Files in Git Ignore"
-      )
-    );
-    assert.ok(
-      commands.some(
-        (entry) =>
-          entry.command === "vs-code-ai-helper.showMetaResourcesInGitIgnore" &&
-          entry.title === "Show Meta Files in Git Ignore"
-      )
-    );
+    for (const command of [
+      "vs-code-ai-helper.hideMetaResourcesInGitIgnore",
+      "vs-code-ai-helper.showMetaResourcesInGitIgnore",
+      "vs-code-ai-helper.toggleMetaResourcesGitIgnore",
+    ]) {
+      assert.equal(
+        commands.some((entry) => entry.command === command),
+        false,
+        `${command} must not be declared in contributes.commands`
+      );
+    }
   });
 
-  void it("shows exactly one header action based on managed current-task state", () => {
+  void it("keeps Git-ignore actions out of the Tasks header and exposes settings there", () => {
     const titleMenus = readPackageJson().contributes?.menus?.["view/title"] ?? [];
     const hideEntry = titleMenus.find(
       (entry) => entry.command === "vs-code-ai-helper.hideMetaResourcesInGitIgnore"
@@ -258,15 +316,219 @@ void describe("meta gitignore command contributions", () => {
       (entry) => entry.command === "vs-code-ai-helper.showMetaResourcesInGitIgnore"
     );
 
-    assert.ok(hideEntry, "Expected Hide Meta Files in Git Ignore header action");
-    assert.ok(showEntry, "Expected Show Meta Files in Git Ignore header action");
-    // Deliberately NOT gated on metaGitIgnoreEligible: this is a persistent
-    // top-level toolbar action (alongside Start New Task, Refresh, etc.) and
-    // must not flicker in/out based on whether a current task happens to be
-    // set. When there's no eligible current task, the command itself shows a
-    // friendly warning (see resolveTarget in toggleMetaResourcesGitIgnore.ts)
-    // instead of the button silently disappearing.
-    assert.match(hideEntry.when ?? "", /!vs-code-ai-helper\.currentTaskMetaHidden/);
-    assert.match(showEntry.when ?? "", /vs-code-ai-helper\.currentTaskMetaHidden/);
+    assert.equal(hideEntry, undefined);
+    assert.equal(showEntry, undefined);
+    assert.ok(titleMenus.some((entry) => entry.command === "vs-code-ai-helper.openSettings"));
+  });
+});
+
+void describe("diffGitignoreLines", () => {
+  void it("reports exactly the added lines when hiding meta files for the first time", () => {
+    const current = ["node_modules/", ""].join("\n");
+    const next = applyManagedMetaGitIgnoreBlock(current, ["/plans/task-a/"], true);
+
+    const { added, removed } = diffGitignoreLines(current, next);
+    assert.equal(removed.length, 0);
+    assert.deepEqual(added, [
+      "# BEGIN Ensemble managed meta resources",
+      "# Managed by Ensemble. Do not edit this block manually.",
+      "/plans/task-a/",
+      "# END Ensemble managed meta resources",
+    ]);
+  });
+
+  void it("reports no diff when the content is unchanged", () => {
+    assert.deepEqual(diffGitignoreLines("dist/\n", "dist/\n"), {
+      added: [],
+      removed: [],
+    });
+  });
+});
+
+void describe("gitignore writes require confirmation with an exact diff", () => {
+  void it("does not touch .gitignore when the user declines the confirmation", async () => {
+    const repoRoot = makeGitFixture();
+    const configStub = installConfigStub();
+    const surface = new StatusTreeProvider();
+    initNotificationRouter(surface);
+
+    const originalWorkspaceFolders = vscode.workspace.workspaceFolders;
+    const originalShowWarningMessage = vscode.window.showWarningMessage;
+    (vscode.workspace as unknown as { workspaceFolders: unknown }).workspaceFolders = [
+      { uri: vscode.Uri.file(repoRoot), name: "repo", index: 0 },
+    ];
+
+    let promptedDetail: string | undefined;
+    (vscode.window as unknown as { showWarningMessage: unknown }).showWarningMessage =
+      (
+        _message: string,
+        options: { detail?: string },
+        ..._actions: string[]
+      ): Promise<string | undefined> => {
+        promptedDetail = options.detail;
+        return Promise.resolve(undefined); // user dismisses/declines
+      };
+
+    try {
+      const applied = await hideMetaResourcesInGitIgnore(
+        {} as TaskInventory,
+        {} as CurrentTaskStore
+      );
+
+      assert.equal(applied, false);
+      assert.ok(promptedDetail?.includes("BEGIN Ensemble managed meta resources"));
+      assert.equal(
+        fs.existsSync(path.join(repoRoot, ".gitignore")),
+        false,
+        "declining the confirmation must leave .gitignore untouched"
+      );
+    } finally {
+      (vscode.workspace as unknown as { workspaceFolders: unknown }).workspaceFolders =
+        originalWorkspaceFolders;
+      (vscode.window as unknown as { showWarningMessage: unknown }).showWarningMessage =
+        originalShowWarningMessage;
+      deactivateNotificationRouter();
+      configStub.restore();
+      fs.rmSync(repoRoot, { recursive: true, force: true });
+    }
+  });
+
+  void it("writes .gitignore once the user confirms", async () => {
+    const repoRoot = makeGitFixture();
+    const configStub = installConfigStub();
+    const surface = new StatusTreeProvider();
+    initNotificationRouter(surface);
+
+    const originalWorkspaceFolders = vscode.workspace.workspaceFolders;
+    const originalShowWarningMessage = vscode.window.showWarningMessage;
+    const originalWriteFile = (
+      vscode.workspace.fs as unknown as { writeFile: unknown }
+    ).writeFile;
+    (vscode.workspace as unknown as { workspaceFolders: unknown }).workspaceFolders = [
+      { uri: vscode.Uri.file(repoRoot), name: "repo", index: 0 },
+    ];
+    (vscode.window as unknown as { showWarningMessage: unknown }).showWarningMessage =
+      (
+        _message: string,
+        _options: { detail?: string },
+        ...actions: string[]
+      ): Promise<string | undefined> => Promise.resolve(actions[0]);
+    (vscode.workspace.fs as unknown as { writeFile: unknown }).writeFile = (
+      uri: vscode.Uri,
+      bytes: Uint8Array
+    ): Promise<void> => {
+      fs.writeFileSync(uri.fsPath, Buffer.from(bytes));
+      return Promise.resolve();
+    };
+    // setMetaVisibilityContexts fires the built-in "setContext" command as a
+    // side effect once the write is confirmed; the stub throws on
+    // unregistered commands, so no-op it for the duration of this test.
+    const commandsStub = vscode.commands as typeof vscode.commands & {
+      _executeCommandOverride?: (id: string, ...args: unknown[]) => Promise<unknown>;
+    };
+    const originalExecuteCommandOverride = commandsStub._executeCommandOverride;
+    commandsStub._executeCommandOverride = () => Promise.resolve(undefined);
+
+    try {
+      const applied = await hideMetaResourcesInGitIgnore(
+        {} as TaskInventory,
+        {} as CurrentTaskStore
+      );
+
+      assert.equal(applied, true);
+      const written = fs.readFileSync(path.join(repoRoot, ".gitignore"), "utf8");
+      assert.match(written, /# BEGIN Ensemble managed meta resources/);
+    } finally {
+      commandsStub._executeCommandOverride = originalExecuteCommandOverride;
+      (vscode.workspace.fs as unknown as { writeFile: unknown }).writeFile =
+        originalWriteFile;
+      (vscode.workspace as unknown as { workspaceFolders: unknown }).workspaceFolders =
+        originalWorkspaceFolders;
+      (vscode.window as unknown as { showWarningMessage: unknown }).showWarningMessage =
+        originalShowWarningMessage;
+      deactivateNotificationRouter();
+      configStub.restore();
+      fs.rmSync(repoRoot, { recursive: true, force: true });
+    }
+  });
+
+  void it("does not duplicate the artifacts pattern when the configured task root resolves to the same path", async () => {
+    const repoRoot = makeGitFixture();
+    const surface = new StatusTreeProvider();
+    initNotificationRouter(surface);
+
+    // Configuring the task root to "artifacts/helper" makes it resolve to
+    // the exact same repo-relative path as the fixed artifacts root, which
+    // previously produced a managed block listing "/artifacts/helper/"
+    // twice (reported by users as an unexplained duplicate entry).
+    const originalGetConfiguration = (
+      vscode.workspace as unknown as Record<string, unknown>
+    ).getConfiguration;
+    (vscode.workspace as unknown as Record<string, unknown>).getConfiguration =
+      (): {
+        get: (key: string, defaultValue?: unknown) => unknown;
+        update: () => Promise<void>;
+        inspect: () => undefined;
+      } => ({
+        get: (key: string, defaultValue?: unknown): unknown =>
+          key === "metaResourcesPath" ? "artifacts/helper" : defaultValue,
+        update: async (): Promise<void> => {},
+        inspect: () => undefined,
+      });
+
+    const originalWorkspaceFolders = vscode.workspace.workspaceFolders;
+    const originalShowWarningMessage = vscode.window.showWarningMessage;
+    const originalWriteFile = (
+      vscode.workspace.fs as unknown as { writeFile: unknown }
+    ).writeFile;
+    (vscode.workspace as unknown as { workspaceFolders: unknown }).workspaceFolders = [
+      { uri: vscode.Uri.file(repoRoot), name: "repo", index: 0 },
+    ];
+    (vscode.window as unknown as { showWarningMessage: unknown }).showWarningMessage =
+      (
+        _message: string,
+        _options: { detail?: string },
+        ...actions: string[]
+      ): Promise<string | undefined> => Promise.resolve(actions[0]);
+    (vscode.workspace.fs as unknown as { writeFile: unknown }).writeFile = (
+      uri: vscode.Uri,
+      bytes: Uint8Array
+    ): Promise<void> => {
+      fs.writeFileSync(uri.fsPath, Buffer.from(bytes));
+      return Promise.resolve();
+    };
+    const commandsStub = vscode.commands as typeof vscode.commands & {
+      _executeCommandOverride?: (id: string, ...args: unknown[]) => Promise<unknown>;
+    };
+    const originalExecuteCommandOverride = commandsStub._executeCommandOverride;
+    commandsStub._executeCommandOverride = () => Promise.resolve(undefined);
+
+    try {
+      const applied = await hideMetaResourcesInGitIgnore(
+        {} as TaskInventory,
+        {} as CurrentTaskStore
+      );
+
+      assert.equal(applied, true);
+      const written = fs.readFileSync(path.join(repoRoot, ".gitignore"), "utf8");
+      const occurrences = written.split("/artifacts/helper/").length - 1;
+      assert.equal(
+        occurrences,
+        1,
+        `expected "/artifacts/helper/" to appear exactly once, got ${occurrences}:\n${written}`
+      );
+    } finally {
+      commandsStub._executeCommandOverride = originalExecuteCommandOverride;
+      (vscode.workspace.fs as unknown as { writeFile: unknown }).writeFile =
+        originalWriteFile;
+      (vscode.workspace as unknown as { workspaceFolders: unknown }).workspaceFolders =
+        originalWorkspaceFolders;
+      (vscode.window as unknown as { showWarningMessage: unknown }).showWarningMessage =
+        originalShowWarningMessage;
+      deactivateNotificationRouter();
+      (vscode.workspace as unknown as Record<string, unknown>).getConfiguration =
+        originalGetConfiguration;
+      fs.rmSync(repoRoot, { recursive: true, force: true });
+    }
   });
 });

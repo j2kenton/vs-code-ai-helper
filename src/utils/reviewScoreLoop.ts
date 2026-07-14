@@ -52,7 +52,8 @@ export async function improveReviewScore(options: {
   token?: vscode.CancellationToken;
   /** Maximum apply/review cycles for this run. */
   maxAttempts?: number;
-  /** 0 stops at the first improvement; 1-10 stops once that score is reached. */
+  /** 0 stops at the first improvement; a positive target is an additional
+   * goal, but never replaces the mandatory baseline-plus-one improvement. */
   stopAtScore?: number;
 }): Promise<ImproveReviewScoreResult> {
   let best: number | null = null;
@@ -73,7 +74,10 @@ export async function improveReviewScore(options: {
     best = Math.max(best ?? Number.NEGATIVE_INFINITY, score);
     await recordBestReviewScore(options.context, options.stage, score);
     const improved = score >= options.baselineScore + 1;
-    if ((stopAtScore === 0 && improved) || (stopAtScore > 0 && score >= stopAtScore)) {
+    // Fast Forward is only successful after it has made measurable progress
+    // from the score it started with.  A configured target may require more,
+    // but must not let a task at (or above) that target stop without improving.
+    if (improved && (stopAtScore === 0 || score >= stopAtScore)) {
       return { score, attempts: attempt, improved: true, stalled: false };
     }
   }

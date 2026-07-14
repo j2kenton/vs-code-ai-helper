@@ -4,6 +4,43 @@ import { writeAtomic } from "./writeAtomic";
 import { PrimarySessionLock } from "./primarySessionLock";
 import * as path from "path";
 
+// Commands issued from one extension host can overlap (for example, a second
+// click on "Complete Stage & Move On" while the first state write is still
+// finishing). Queue them before taking the cross-process lease so a local
+// duplicate waits for the first operation instead of surfacing a misleading
+// "Another Ensemble session" error. The on-disk leases still protect against
+// other extension hosts and processes.
+const localMutationQueues = new Map<string, Promise<void>>();
+
+function localQueueKey(tasksRoot: string): string {
+  const resolved = path.resolve(tasksRoot);
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+async function withLocalMutationQueue<T>(
+  tasksRoot: string,
+  operation: () => Promise<T>
+): Promise<T> {
+  const key = localQueueKey(tasksRoot);
+  const previous = localMutationQueues.get(key) ?? Promise.resolve();
+  let releaseGate: (() => void) | undefined;
+  const gate = new Promise<void>((resolve) => {
+    releaseGate = resolve;
+  });
+  const tail = previous.catch(() => undefined).then(() => gate);
+  localMutationQueues.set(key, tail);
+
+  await previous.catch(() => undefined);
+  try {
+    return await operation();
+  } finally {
+    releaseGate?.();
+    if (localMutationQueues.get(key) === tail) {
+      localMutationQueues.delete(key);
+    }
+  }
+}
+
 // The session lock lives two levels above a task folder (the meta root's
 // parent) and the meta lock one level above (the meta root itself, i.e. the
 // tasks directory). Both are shared by every task under the same meta root.
@@ -17,19 +54,26 @@ function metaLocksForTasksRoot(tasksRoot: string): PrimarySessionLock[] {
 }
 
 export async function withTaskLock<T>(taskFolderPath: string, operation: () => Promise<T>): Promise<T> {
-  // Mutations always acquire the shared session, meta-root, then task lease.
-  // Keeping this order fixed prevents activation and task writes deadlocking.
-  const locks = [
-    ...metaLocksForTasksRoot(path.join(taskFolderPath, "..")),
-    new PrimarySessionLock(path.join(taskFolderPath, ".ensemble-task.lock")),
-  ];
-  const releases: Array<() => Promise<void>> = [];
-  try {
-    for (const lock of locks) releases.push(await lock.acquire());
-    return await operation();
-  } finally {
-    for (const release of releases.reverse()) await release();
-  }
+  const tasksRoot = path.join(taskFolderPath, "..");
+  return withLocalMutationQueue(tasksRoot, async () => {
+    // Mutations always acquire the shared session, meta-root, then task lease.
+    // Keeping this order fixed prevents activation and task writes deadlocking.
+    const locks = [
+      ...metaLocksForTasksRoot(tasksRoot),
+      new PrimarySessionLock(path.join(taskFolderPath, ".ensemble-task.lock")),
+    ];
+    const releases: Array<() => Promise<void>> = [];
+    try {
+      for (const lock of locks) {
+        releases.push(await lock.acquire());
+      }
+      return await operation();
+    } finally {
+      for (const release of releases.reverse()) {
+        await release();
+      }
+    }
+  });
 }
 
 /**
@@ -44,14 +88,20 @@ export async function withTaskLock<T>(taskFolderPath: string, operation: () => P
  * with the ones `withTaskLock` computes for any task inside it.
  */
 export async function withMetaRootLock<T>(tasksRoot: string, operation: () => Promise<T>): Promise<T> {
-  const locks = metaLocksForTasksRoot(tasksRoot);
-  const releases: Array<() => Promise<void>> = [];
-  try {
-    for (const lock of locks) releases.push(await lock.acquire());
-    return await operation();
-  } finally {
-    for (const release of releases.reverse()) await release();
-  }
+  return withLocalMutationQueue(tasksRoot, async () => {
+    const locks = metaLocksForTasksRoot(tasksRoot);
+    const releases: Array<() => Promise<void>> = [];
+    try {
+      for (const lock of locks) {
+        releases.push(await lock.acquire());
+      }
+      return await operation();
+    } finally {
+      for (const release of releases.reverse()) {
+        await release();
+      }
+    }
+  });
 }
 
 /** Compare-and-set persistence for task JSON files. */

@@ -2,10 +2,7 @@ import * as vscode from "vscode";
 import { TaskInventory } from "../state/taskInventory";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
-import {
-  STAGE_ARTIFACT_FILENAMES,
-  STAGE_DISPLAY_NAMES,
-} from "../types/taskProgress";
+import { STAGE_ARTIFACT_FILENAMES } from "../types/taskProgress";
 
 type ApplyArg = { canonicalId?: string; taskFolderPath?: string };
 
@@ -14,9 +11,11 @@ type ApplyArg = { canonicalId?: string; taskFolderPath?: string };
  * entry points to the primary action for the current task stage.
  *
  * - Task Description  -> draftTaskWithAI
+ * - Plan               -> generatePlanWithAI
+ * - Implementation     -> runImplementationWithAI
+ * - Publish            -> runLintingFixes
  * - High-Level Review -> applyHighLevelReviewChanges (if artifact exists)
  * - Low-Level Review  -> applyLowLevelReviewChanges (if artifact exists)
- * - All other stages  -> info message
  */
 export async function applyCurrentStageAction(
   inventory: TaskInventory,
@@ -59,6 +58,11 @@ export async function applyCurrentStageAction(
 
   if (stage === "plan") {
     await execute("vs-code-ai-helper.generatePlanWithAI");
+    return;
+  }
+
+  if (stage === "impl") {
+    await execute("vs-code-ai-helper.runImplementationWithAI");
     return;
   }
 
@@ -109,9 +113,47 @@ export async function applyCurrentStageAction(
     return;
   }
 
-  void vscode.window.showInformationMessage(
-    `No shortcut action for stage: ${STAGE_DISPLAY_NAMES[stage]}.`
-  );
+  if (stage === "impl-high-review") {
+    const artifactName = STAGE_ARTIFACT_FILENAMES["impl-high-review"];
+    if (artifactName) {
+      const artifactUri = vscode.Uri.joinPath(
+        vscode.Uri.file(resolvedTask.taskFolderPath),
+        artifactName
+      );
+      try {
+        await vscode.workspace.fs.stat(artifactUri);
+        await execute("vs-code-ai-helper.applyHighLevelReviewChanges");
+        return;
+      } catch {
+        void vscode.window.showInformationMessage(
+          "No high-level review artifact found yet. Run Review first."
+        );
+        return;
+      }
+    }
+    return;
+  }
+
+  if (stage === "impl-low-review") {
+    const artifactName = STAGE_ARTIFACT_FILENAMES["impl-low-review"];
+    if (artifactName) {
+      const artifactUri = vscode.Uri.joinPath(
+        vscode.Uri.file(resolvedTask.taskFolderPath),
+        artifactName
+      );
+      try {
+        await vscode.workspace.fs.stat(artifactUri);
+        await execute("vs-code-ai-helper.applyLowLevelReviewChanges");
+        return;
+      } catch {
+        void vscode.window.showInformationMessage(
+          "No low-level review artifact found yet. Run Review first."
+        );
+        return;
+      }
+    }
+    return;
+  }
 }
 
 /**

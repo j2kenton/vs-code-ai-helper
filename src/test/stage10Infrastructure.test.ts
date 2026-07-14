@@ -92,7 +92,9 @@ void describe("Stage 10 test infrastructure", () => {
 
     const statuses = new StatusTreeProvider();
     statuses.addEntry("x".repeat(151), "warning");
-    assert.equal(statuses.getEntries()[0]?.level, "warning");
-    assert.equal(statuses.getEntries()[0]?.message.endsWith("..."), true);
+    const storedEntry = statuses.getEntries()[0];
+    assert.equal(storedEntry?.level, "warning");
+    assert.equal(storedEntry?.message.length, 151); // full text is retained, not truncated
+    assert.ok(storedEntry && statuses.getTreeItem(storedEntry).label?.toString().endsWith("…"));
   });
 });

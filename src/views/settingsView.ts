@@ -16,6 +16,7 @@ type IncomingMessage =
   | { type: "rendered" }
   | { type: "saveSettings"; settings: ModelSettings }
   | { type: "saveWorkspaceSettings"; settings: WorkspaceSettings }
+  | { type: "validationError"; message: string }
   | { type: "resetDefaults" }
   | { type: "refreshQuotaStatus" }
   | { type: "testProviderSetup"; providerId: string };
@@ -30,6 +31,7 @@ interface WorkspaceSettings {
   fastForwardUseAcceptanceThreshold: boolean;
   autoReviewAfterPlan: boolean;
   autoReviewAfterImplementation: boolean;
+  allowDirtyWorktreeChanges: boolean;
 }
 
 export class SettingsViewProvider implements vscode.WebviewViewProvider {
@@ -99,24 +101,38 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           void vscode.window.showInformationMessage("AI model settings saved.");
           break;
         }
+        case "validationError": {
+          void vscode.window.showErrorMessage(data.message);
+          break;
+        }
         case "saveWorkspaceSettings": {
+          // Run the .gitignore change first — it prompts the user for
+          // confirmation with an exact diff — and abort the whole save with
+          // no writes if they decline, rather than silently saving the rest
+          // of the workflow settings while the meta-visibility change is
+          // dropped.
+          const metaChangeApplied = await vscode.commands.executeCommand<boolean>(
+            data.settings.metaFilesHidden
+              ? "vs-code-ai-helper.hideMetaResourcesInGitIgnore"
+              : "vs-code-ai-helper.showMetaResourcesInGitIgnore"
+          );
+          if (metaChangeApplied === false) {
+            void vscode.window.showWarningMessage(
+              "Workflow settings were not saved: the .gitignore update was declined."
+            );
+            break;
+          }
+
           const config = vscode.workspace.getConfiguration("vs-code-ai-helper");
           for (const [key, value] of Object.entries(data.settings)) {
-            // Meta visibility is backed by the managed .gitignore block, so
-            // leave that key to its command rather than only changing a flag.
+            // Meta visibility is backed by the managed .gitignore block,
+            // which the command above already updated atomically along with
+            // the UI mirror (see setMetaFilesHidden in that command).
             if (key === "metaFilesHidden") {
               continue;
             }
             await config.update(key, value, vscode.ConfigurationTarget.Workspace);
           }
-          // This key is deliberately excluded from the generic update loop:
-          // its authoritative state is the managed .gitignore block, which
-          // the commands below update atomically along with the UI mirror.
-          await vscode.commands.executeCommand(
-            data.settings.metaFilesHidden
-              ? "vs-code-ai-helper.hideMetaResourcesInGitIgnore"
-              : "vs-code-ai-helper.showMetaResourcesInGitIgnore"
-          );
           void vscode.window.showInformationMessage("Workflow settings saved.");
           break;
         }
@@ -216,6 +232,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       fastForwardUseAcceptanceThreshold: config.get<boolean>("fastForwardUseAcceptanceThreshold", false),
       autoReviewAfterPlan: config.get<boolean>("autoReviewAfterPlan", false),
       autoReviewAfterImplementation: config.get<boolean>("autoReviewAfterImplementation", false),
+      allowDirtyWorktreeChanges: config.get<boolean>("allowDirtyWorktreeChanges", false),
     };
   }
 
@@ -345,6 +362,12 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           }
           .model-combobox {
             position: relative;
+          }
+          .model-provider-filter {
+            display: block;
+            width: 100%;
+            margin-bottom: 4px;
+            font-size: 0.9em;
           }
           .model-combo-input[disabled] {
             opacity: 0.55;
@@ -523,6 +546,17 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             return availableModels.find(model => model.id === id);
           }
 
+          function providerLabelsInUse() {
+            // Providers are derived from the models actually on offer, so
+            // the filter always matches what's selectable and needs no
+            // separate provider registry (which excludes Copilot).
+            const seen = [];
+            availableModels.forEach(model => {
+              if (!seen.includes(model.providerLabel)) seen.push(model.providerLabel);
+            });
+            return seen;
+          }
+
           function modelComboboxHtml(kind, stage, selectedId, disabled) {
             const selectedModel = findModelById(selectedId);
             const selectedLabel = selectedModel
@@ -532,8 +566,18 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                 : '';
             const hiddenValue = selectedModel ? selectedId : '';
             const disabledAttr = disabled ? 'disabled' : '';
+            // Provider acts as a filter for the model list below it, so it is
+            // selected first and narrows what the search/dropdown shows.
+            // Pre-select the current model's provider so switching back to
+            // "All Providers" is an explicit, visible action rather than the
+            // default state hiding the already-configured model's provider.
+            const providerOptions = ['All Providers'].concat(providerLabelsInUse());
+            const selectedProviderLabel = selectedModel ? selectedModel.providerLabel : 'All Providers';
             return \`
               <div class="model-combobox" data-kind="\${kind}" data-stage="\${stage}">
+                <select class="model-provider-filter" id="\${kind}-provider-\${stage}" aria-label="Filter models by provider" \${disabledAttr}>
+                  \${providerOptions.map(label => '<option value="' + escapeHtml(label) + '" ' + (label === selectedProviderLabel ? 'selected' : '') + '>' + escapeHtml(label) + '</option>').join('')}
+                </select>
                 <input type="hidden" id="\${kind}-\${stage}" value="\${escapeHtml(hiddenValue || '')}">
                 <input
                   type="text"
@@ -556,6 +600,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             const hidden = row.querySelector('#' + kind + '-' + stage);
             const input = row.querySelector('#' + kind + '-input-' + stage);
             const list = row.querySelector('#' + kind + '-list-' + stage);
+            const providerFilter = row.querySelector('#' + kind + '-provider-' + stage);
             if (!hidden || !input || !list) {
               return;
             }
@@ -564,8 +609,12 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
 
             function getChoices(query) {
               const tokens = query.toLowerCase().match(/[a-z0-9.]+/g) || [];
+              const providerValue = providerFilter ? providerFilter.value : 'All Providers';
+              const modelsForProvider = providerValue === 'All Providers'
+                ? availableModels
+                : availableModels.filter(model => model.providerLabel === providerValue);
               const choices = [{ id: '', label: '(None)', searchable: 'none' }].concat(
-                availableModels.map(model => ({
+                modelsForProvider.map(model => ({
                   id: model.id,
                   label: modelLabel(model),
                   // Plans/availability are rendered in brackets by providers;
@@ -578,6 +627,13 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                 return choices;
               }
               return choices.filter(choice => tokens.every(token => choice.searchable.includes(token)));
+            }
+
+            if (providerFilter) {
+              providerFilter.addEventListener('change', () => {
+                renderOptions();
+                input.focus();
+              });
             }
 
             function closeList() {
@@ -748,7 +804,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                     <label for="backup-input-\${stage}" style="font-size: 0.9em; display:block; margin-bottom: 2px;">Backup models (tried in order):</label>
                     \${modelComboboxHtml('backup', stage, backupModels[0] || '', false)}
                     \${backupQuotaText}
-                    <div class="extra-backups">\${backupModels.slice(1).map((model, index) => '<div style="display:flex;gap:4px;margin-top:4px"><input class="backup-extra" value="' + escapeHtml(model) + '" placeholder="Backup model ID"><button type="button" class="remove-backup" aria-label="Remove backup">×</button></div>').join('')}</div>
+                    <div class="extra-backups">\${backupModels.slice(1).map(model => '<div style="display:flex;gap:4px;margin-top:4px"><select class="backup-extra" aria-label="Additional backup model">' + availableModels.map(candidate => '<option value="' + escapeHtml(candidate.id) + '" ' + (candidate.id === model ? 'selected' : '') + '>' + escapeHtml(modelLabel(candidate)) + '</option>').join('') + '</select><button type="button" class="remove-backup" aria-label="Remove backup">×</button></div>').join('')}</div>
                     <button type="button" class="add-backup" style="margin-top:4px" \${backupModels.length >= 10 ? 'disabled title="A maximum of 10 backup models is allowed"' : ''}>+ Add another backup</button>
                     <span class="backup-limit" style="margin-left:4px;font-size:0.9em">\${backupModels.length}/10</span>
                   </div>
@@ -772,7 +828,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                 if (container.children.length >= 9) return;
                 const item = document.createElement('div');
                 item.style.cssText = 'display:flex;gap:4px;margin-top:4px';
-                item.innerHTML = '<input class="backup-extra" placeholder="Backup model ID"><button type="button" class="remove-backup" aria-label="Remove backup">×</button>';
+                item.innerHTML = '<select class="backup-extra" aria-label="Additional backup model">' + availableModels.map(model => '<option value="' + escapeHtml(model.id) + '">' + escapeHtml(modelLabel(model)) + '</option>').join('') + '</select><button type="button" class="remove-backup" aria-label="Remove backup">×</button>';
                 item.querySelector('.remove-backup').addEventListener('click', () => {
                   item.remove();
                   syncBackupLimit();
@@ -796,17 +852,20 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               '<fieldset><legend>Meta-file visibility</legend>' +
               '<label><input id="meta-files-hidden" type="checkbox" ' + checked(workspaceSettings.metaFilesHidden) + '> Hide Ensemble meta resources from Git</label></fieldset>' +
               '<fieldset style="margin-top:12px"><legend>Provider Selection</legend>' +
-              providers.map(provider => '<div style="margin:4px 0"><label><input type="checkbox" data-provider="' + escapeHtml(provider.id) + '" ' + checked(enabled[provider.id] !== false) + '> ' + escapeHtml(provider.label) + '</label> <button type="button" class="test-provider" data-test-provider="' + escapeHtml(provider.id) + '">Test Setup</button> <span id="provider-status-' + escapeHtml(provider.id) + '" aria-live="polite">?</span></div>').join('') +
+              providers.map(provider => '<div style="margin:4px 0"><label><input type="checkbox" data-provider="' + escapeHtml(provider.id) + '" ' + checked(enabled[provider.id] === true) + '> ' + escapeHtml(provider.label) + '</label> <button type="button" class="test-provider" data-test-provider="' + escapeHtml(provider.id) + '">Test Setup</button> <span id="provider-status-' + escapeHtml(provider.id) + '" aria-live="polite">?</span></div>').join('') +
               '<p style="margin:8px 0 0;font-size:0.9em">Usage status is session-observed; providers do not expose a live numeric quota through these checks.</p></fieldset>' +
               '<fieldset style="margin-top:12px"><legend>Fast Forward Review</legend>' +
               '<label>Maximum iterations (1–99): <input id="fast-forward-max" type="number" min="1" max="99" value="' + escapeHtml(workspaceSettings.fastForwardMaxIterations || 5) + '"></label><br>' +
-              '<label>Target score (0 = stop after any improvement): <input id="fast-forward-stop" type="number" min="0" max="10" value="' + escapeHtml(workspaceSettings.fastForwardStopLevel || 0) + '"></label><br>' +
+              '<label>Target score (0 = stop after any improvement): <input id="fast-forward-stop" type="number" min="0" max="10" value="' + escapeHtml(workspaceSettings.fastForwardStopLevel || 0) + '"></label><br><p style="margin:6px 0;font-size:0.9em">Fast Forward always continues until the score improves by at least one point from where it started, even when the target is already met.</p>' +
               '<label><input id="fast-forward-acceptance" type="checkbox" ' + checked(workspaceSettings.fastForwardUseAcceptanceThreshold) + '> Use the auto-advance acceptance threshold instead of target score</label></fieldset>' +
               '<fieldset style="margin-top:12px"><legend>Auto-advance and review</legend>' +
               '<label><input id="auto-advance-enabled" type="checkbox" ' + checked(workspaceSettings.autoAdvanceEnabled) + '> Advance after a review reaches this score</label> ' +
               '<input id="auto-advance-score" type="number" min="1" max="10" value="' + escapeHtml(workspaceSettings.autoAdvanceScoreThreshold || 10) + '"><br>' +
               '<label><input id="auto-review-plan" type="checkbox" ' + checked(workspaceSettings.autoReviewAfterPlan) + '> Start review after AI drafts a plan</label><br>' +
-              '<label><input id="auto-review-implementation" type="checkbox" ' + checked(workspaceSettings.autoReviewAfterImplementation) + '> Start review after AI completes implementation</label></fieldset>';
+              '<label><input id="auto-review-implementation" type="checkbox" ' + checked(workspaceSettings.autoReviewAfterImplementation) + '> Start review after AI completes implementation</label></fieldset>' +
+              '<fieldset style="margin-top:12px"><legend>Uncommitted changes</legend>' +
+              '<label><input id="allow-dirty-worktree" type="checkbox" ' + checked(workspaceSettings.allowDirtyWorktreeChanges) + '> Always proceed with implementation/Fast Forward runs even when the workspace has unrelated uncommitted changes</label>' +
+              '<p style="margin:6px 0 0;font-size:0.9em">When off, you will be warned and asked to confirm before an AI run edits files while unrelated changes are uncommitted.</p></fieldset>';
             const acceptance = document.getElementById('fast-forward-acceptance');
             const target = document.getElementById('fast-forward-stop');
             function syncAcceptance() { target.disabled = acceptance.checked; }
@@ -847,9 +906,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                 alertRegion.innerText += 'Stage ' + (stageDisplayNames[stage] || stage) + ' has an invalid backup model selection. Choose a model from the list.\\n';
               }
 
-              if (usesBackup && (!backup || backup === primary)) {
+              if (usesBackup && !backup) {
                 hasErrors = true;
-                alertRegion.innerText += 'Stage ' + (stageDisplayNames[stage] || stage) + ' requires a distinct valid backup model when Fallback Strategy is set to Switch to Backup.\\n';
+                alertRegion.innerText += 'Stage ' + (stageDisplayNames[stage] || stage) + ' requires a valid backup model when Fallback Strategy is set to Switch to Backup.\\n';
               }
               if (usesBackup && extraBackups.some(candidate => !availableModels.some(model => model.id === candidate))) {
                 hasErrors = true;
@@ -865,6 +924,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             });
 
             if (hasErrors) {
+              vscode.postMessage({ type: 'validationError', message: alertRegion.innerText.trim() });
               return;
             }
 
@@ -898,7 +958,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               autoAdvanceEnabled: document.getElementById('auto-advance-enabled').checked,
               autoAdvanceScoreThreshold: clamp('auto-advance-score', 1, 10, 10),
               autoReviewAfterPlan: document.getElementById('auto-review-plan').checked,
-              autoReviewAfterImplementation: document.getElementById('auto-review-implementation').checked
+              autoReviewAfterImplementation: document.getElementById('auto-review-implementation').checked,
+              allowDirtyWorktreeChanges: document.getElementById('allow-dirty-worktree').checked
             }});
           });
         </script>

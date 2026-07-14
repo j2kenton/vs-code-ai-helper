@@ -6,14 +6,11 @@ import {
   STAGE_ARTIFACT_FILENAMES,
   STAGE_DISPLAY_NAMES,
   STAGE_ORDER,
+  TASK_STATUSES,
   TaskStage,
 } from "../types/taskProgress";
 import { IncompleteTask } from "../utils/taskProgressUtils";
 import { resolveCurrentPlanUri, statIfExists } from "../utils/fileUtils";
-import {
-  computeCollapseExpandContext,
-  type ExpansionMode,
-} from "../utils/collapseExpandContext";
 import { resolveImplementationArtifact } from "../utils/implementationArtifactResolver";
 import { parseReadiness } from "../utils/reviewReadiness";
 import { TaskInventory, TaskWithProgress } from "../state/taskInventory";
@@ -37,7 +34,10 @@ type StageStatus = "done" | "current" | "outstanding";
 /**
  * Determine the status of a stage relative to a task's current stage
  */
-function getStageStatus(stage: TaskStage, currentStage: TaskStage): StageStatus {
+function getStageStatus(stage: TaskStage, currentStage: TaskStage, completedStages?: readonly TaskStage[]): StageStatus {
+  if (completedStages?.includes(stage)) {
+    return "done";
+  }
   const stageIndex = STAGE_ORDER.indexOf(stage);
   const currentIndex = STAGE_ORDER.indexOf(currentStage);
 
@@ -62,7 +62,7 @@ function buildTaskTooltip(task: IncompleteTask): vscode.MarkdownString {
   }
 
   for (const stage of STAGE_ORDER) {
-    const status = getStageStatus(stage, task.progress.currentStage);
+    const status = getStageStatus(stage, task.progress.currentStage, task.progress.completedStages);
     const marker =
       status === "done" ? "$(check)" : status === "current" ? "$(arrow-right)" : "$(circle-large-outline)";
     const suffix =
@@ -312,7 +312,16 @@ export function getStageNodeContextValue(
   });
 }
 
-type TaskTreeNode = TaskNode | StageNode;
+export class EmptyTasksNode extends vscode.TreeItem {
+  constructor() {
+    super("No matching tasks", vscode.TreeItemCollapsibleState.None);
+    this.description = "Change the status filter or reset it to view all tasks.";
+    this.iconPath = new vscode.ThemeIcon("filter");
+    this.command = { command: "vs-code-ai-helper.resetTaskStatusFilter", title: "Reset task status filter" };
+  }
+}
+
+type TaskTreeNode = TaskNode | StageNode | EmptyTasksNode;
 
 /**
  * Try to read review readiness from an artifact file.
@@ -353,11 +362,13 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
   readonly onDidLoadTasks = this._onDidLoadTasks.event;
 
   // Collapse/expand state management
-  private mode: ExpansionMode = 'autoFirstActive';
-  private lastLoadedTaskCount: number = 0;
+  private mode: "autoFirstActive" | "allExpanded" = "autoFirstActive";
   private readonly explicitlyExpanded = new Set<string>();
   private readonly explicitlyCollapsed = new Set<string>();
   private availableModels: SelectableModel[] = [];
+  private readonly filterKey = "ensemble.taskStatusFilter";
+  private readonly filterKnownStatusesKey = "ensemble.taskStatusFilterKnownStatuses";
+  private selectedStatuses: Set<string>;
 
   private static readonly runningStages = new Map<string, Set<TaskStage>>();
   private static instance: TaskTreeProvider | undefined;
@@ -384,8 +395,25 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
 
   constructor(
     private readonly inventory: TaskInventory,
-    private readonly currentTaskStore?: CurrentTaskStore
+    private readonly currentTaskStore?: CurrentTaskStore,
+    private readonly state?: vscode.Memento
   ) {
+    const saved = state?.get<string[]>(this.filterKey);
+    if (Array.isArray(saved)) {
+      // Reconcile against statuses that didn't exist when the filter was last saved, so a
+      // status introduced after the user's last save (e.g. the "creating" recovery status)
+      // isn't silently hidden forever. Installations that saved a filter before this
+      // reconciliation existed have no known-statuses record, so assume the status set that
+      // predated "creating" (the only status added since this filter shipped).
+      const savedKnown = state?.get<string[]>(this.filterKnownStatusesKey);
+      const previouslyKnown = Array.isArray(savedKnown)
+        ? savedKnown
+        : this.allStatuses().filter(status => status !== "creating");
+      const newlyAddedStatuses = this.allStatuses().filter(status => !previouslyKnown.includes(status));
+      this.selectedStatuses = new Set([...saved, ...newlyAddedStatuses]);
+    } else {
+      this.selectedStatuses = new Set(this.allStatuses());
+    }
     TaskTreeProvider.instance = this;
     // When the shared inventory changes, refresh the tree automatically
     this.inventory.onDidChange(() => this._onDidChangeTreeData.fire());
@@ -405,12 +433,35 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
     this.loadTasks();
   }
 
-  /** Collapse all task rows by switching to collapsed mode */
-  collapseAll(): void {
-    this.mode = 'allCollapsed';
-    this.explicitlyExpanded.clear();
-    this.explicitlyCollapsed.clear();
-    this.syncCollapseExpandContext();
+  private allStatuses(): string[] {
+    return [...TASK_STATUSES];
+  }
+
+  private static readonly STATUS_DESCRIPTIONS: Partial<Record<string, string>> = {
+    creating: "Still being created (recovery entries)",
+    active: "In progress tasks",
+  };
+
+  async chooseStatusFilter(): Promise<void> {
+    const picked = await vscode.window.showQuickPick(
+      this.allStatuses().map(status => ({
+        label: (status[0] ?? "").toUpperCase() + status.slice(1),
+        description: TaskTreeProvider.STATUS_DESCRIPTIONS[status],
+        picked: this.selectedStatuses.has(status),
+      })),
+      { canPickMany: true, title: "Filter tasks by status", placeHolder: "Select the task statuses to show" }
+    );
+    if (!picked) return;
+    this.selectedStatuses = new Set(picked.map(item => item.label.toLowerCase()));
+    await this.state?.update(this.filterKey, [...this.selectedStatuses]);
+    await this.state?.update(this.filterKnownStatusesKey, this.allStatuses());
+    this._onDidChangeTreeData.fire();
+  }
+
+  async resetStatusFilter(): Promise<void> {
+    this.selectedStatuses = new Set(this.allStatuses());
+    await this.state?.update(this.filterKey, [...this.selectedStatuses]);
+    await this.state?.update(this.filterKnownStatusesKey, this.allStatuses());
     this._onDidChangeTreeData.fire();
   }
 
@@ -419,12 +470,12 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
     this.mode = 'allExpanded';
     this.explicitlyExpanded.clear();
     this.explicitlyCollapsed.clear();
-    this.syncCollapseExpandContext();
     this._onDidChangeTreeData.fire();
 
     // Force reveal all nodes to ensure they are expanded
     const nodes = this.getTaskNodes();
     for (const node of nodes) {
+      if (!(node instanceof TaskNode)) continue;
       try {
         await treeView.reveal(node, {
           expand: true,
@@ -487,9 +538,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
   }
 
   getParent(element: TaskTreeNode): TaskNode | undefined {
-    if (element instanceof TaskNode) {
-      return undefined;
-    }
+    if (element instanceof TaskNode || element instanceof EmptyTasksNode) return undefined;
     return this.taskNodesByFolder.get(element.task.folderUri.toString());
   }
 
@@ -567,41 +616,20 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
         true
       );
 
-      this.lastLoadedTaskCount = tasks.length;
-      this.syncCollapseExpandContext();
       this._onDidLoadTasks.fire(tasks);
       return tasks;
     } catch (error) {
       console.error('Failed to load tasks:', error);
-      this.lastLoadedTaskCount = 0;
-      this.syncCollapseExpandContext();
       this._onDidLoadTasks.fire([]);
       throw error;
     }
   }
 
-  /**
-   * Synchronize the collapse/expand context key with current provider state.
-   */
-  private syncCollapseExpandContext(): void {
-    const allCollapsed = computeCollapseExpandContext(
-      this.mode,
-      this.lastLoadedTaskCount
-    );
-    void vscode.commands.executeCommand(
-      "setContext",
-      "vs-code-ai-helper.tasksViewAllCollapsed",
-      allCollapsed
-    );
-  }
-
-  private getTaskNodes(): TaskNode[] {
+  private getTaskNodes(): TaskTreeNode[] {
     const tasks = this.loadTasks();
-
-    const active = tasks.filter((t) => t.progress.status !== "completed");
-    const completed = tasks.filter(
-      (t) => t.progress.status === "completed"
-    );
+    const visible = tasks.filter(task => this.selectedStatuses.has(task.progress.status ?? "active"));
+    const active = visible.filter((t) => t.progress.status !== "completed");
+    const completed = visible.filter((t) => t.progress.status === "completed");
 
     const shouldExpand = (task: IncompleteTask, index: number): boolean => {
       const id = taskIdentityKey(task);
@@ -618,9 +646,6 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
       if (this.mode === 'allExpanded') {
         return true;
       }
-      if (this.mode === 'allCollapsed') {
-        return false;
-      }
       // autoFirstActive mode: expand only the first active task
       return index === 0 && active.length > 0;
     };
@@ -630,7 +655,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
     // legacy task objects that have no canonicalId.
     const currentTaskCanonicalId = this.currentTaskStore?.get();
 
-    const nodes = [...active, ...completed].map(
+    const nodes: TaskTreeNode[] = [...active, ...completed].map(
       (task, index) => {
         const taskId = taskIdentityKey(task);
         const isCurrent =
@@ -652,10 +677,9 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
     // Rebuild the folder→node cache so getParent and getTaskNodeById work
     this.taskNodesByFolder.clear();
     for (const node of nodes) {
-      this.taskNodesByFolder.set(node.task.folderUri.toString(), node);
+      if (node instanceof TaskNode) this.taskNodesByFolder.set(node.task.folderUri.toString(), node);
     }
-
-    return nodes;
+    return nodes.length === 0 && tasks.length > 0 ? [new EmptyTasksNode()] : nodes;
   }
 
   private async getStageNodes(task: IncompleteTask): Promise<StageNode[]> {
@@ -670,7 +694,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
     }
 
     for (const stage of STAGE_ORDER) {
-      const status = getStageStatus(stage, task.progress.currentStage);
+      const status = getStageStatus(stage, task.progress.currentStage, task.progress.completedStages);
 
       let artifactUri: vscode.Uri | undefined;
 

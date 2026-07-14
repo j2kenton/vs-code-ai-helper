@@ -16,9 +16,16 @@ type MenuContribution = {
 
 type PackageContributes = {
   commands?: CommandContribution[];
+  keybindings?: KeybindingContribution[];
   menus?: {
     "view/item/context"?: MenuContribution[];
   };
+};
+
+type KeybindingContribution = {
+  command: string;
+  key: string;
+  when?: string;
 };
 
 function readWorkspaceFile(relativePath: string): string {
@@ -61,6 +68,60 @@ void describe("Stage 3 action matrix contracts", () => {
     assert.ok(
       nextStageEntry,
       "Expected nextStage menu entry for stage-desc-current"
+    );
+  });
+
+  void it("routes implementation and Publish fixes through mutually exclusive current-stage contexts", () => {
+    const contributes = readPackageContributes();
+    const keybindings = contributes.keybindings ?? [];
+    const implementationBinding = keybindings.find(
+      (entry) => entry.command === "vs-code-ai-helper.applyCurrentStageAction"
+    );
+    const publishFixBinding = keybindings.find(
+      (entry) => entry.command === "vs-code-ai-helper.runLintingFixes"
+    );
+
+    assert.equal(implementationBinding?.key, "ctrl+shift+alt+i");
+    assert.equal(
+      implementationBinding?.when,
+      "vs-code-ai-helper.tasksInitialized && vs-code-ai-helper.currentTaskStage == impl"
+    );
+    assert.equal(publishFixBinding?.key, "ctrl+shift+alt+i");
+    assert.equal(
+      publishFixBinding?.when,
+      "vs-code-ai-helper.tasksInitialized && vs-code-ai-helper.currentTaskStage == publish"
+    );
+  });
+
+  void it("routes the current implementation task by folder path, never through a picker", () => {
+    const routerSource = readWorkspaceFile(
+      path.join("src", "commands", "applyCurrentStageAction.ts")
+    );
+    const implementationSource = readWorkspaceFile(
+      path.join("src", "commands", "reviewActions.ts")
+    );
+
+    assert.match(
+      routerSource,
+      /runImplementationWithAI[\s\S]*?return;/,
+      "The current-stage router must dispatch the implementation command."
+    );
+    assert.match(
+      implementationSource,
+      /export async function runImplementationWithAI\([\s\S]*?normalizeReviewArg\(arg\)[\s\S]*?IMPLEMENTATION_ELIGIBLE_STAGES/,
+      "The implementation command must normalize its explicit taskFolderPath before task discovery."
+    );
+  });
+
+  void it("uses the same free-form task-entry guidance in packaged and fallback templates", () => {
+    const expected = "# Task\n\nDescribe the work you want to do here in as much detail as is useful. When\nyou're ready, use **Draft with AI** to turn these notes into a structured task\ndescription. Questions from the stage AI appear in the **Chat With AI** panel.\n";
+    const packagedTemplate = readWorkspaceFile(
+      path.join("resources", "prompts", "task-template.md")
+    ).replace(/\r\n/g, "\n");
+    assert.equal(packagedTemplate, expected);
+    assert.match(
+      readWorkspaceFile(path.join("src", "commands", "startNewTask.ts")),
+      /return "# Task\\n\\nDescribe the work you want to do here/
     );
   });
 
@@ -110,6 +171,35 @@ void describe("Stage 3 action matrix contracts", () => {
       markDoneEntry,
       "Expected markTaskDone menu entry for stage-publish-current"
     );
+  });
+
+  void it("gives every Publish action a distinct, explicit inline order", () => {
+    const contributes = readPackageContributes();
+    const contextMenus = contributes.menus?.["view/item/context"] ?? [];
+    const publishActionCommands = new Set([
+      "vs-code-ai-helper.runReviewWithAI",
+      "vs-code-ai-helper.runLintingFixes",
+      "vs-code-ai-helper.viewStageChanges",
+      "vs-code-ai-helper.chatWithStage",
+      "vs-code-ai-helper.commitAndPushTask",
+      "vs-code-ai-helper.release",
+      "vs-code-ai-helper.markTaskDone",
+    ]);
+    const publishActions = contextMenus.filter((entry) =>
+      publishActionCommands.has(entry.command) &&
+      (entry.when ?? "").includes("&& viewItem =~ /^stage-publish-current/ &&")
+    );
+    const groups = publishActions.map(entry => entry.group);
+
+    assert.deepEqual(groups, [
+      "inline@10",
+      "inline@20",
+      "inline@30",
+      "inline@40",
+      "inline@50",
+      "inline@60",
+      "inline@70",
+    ]);
   });
 
   void it("declares nextStage menu for current impl-low-review stage row", () => {

@@ -1,35 +1,54 @@
 import * as vscode from "vscode";
 import { StatusSurface } from "../utils/notificationRouter";
 
-const MAX_ENTRIES = 50;
-const MAX_MESSAGE_LENGTH = 150;
-
 export interface StatusEntry {
   message: string;
   level: "info" | "warning" | "error";
   timestamp: Date;
 }
 
-export class StatusTreeProvider implements vscode.TreeDataProvider<StatusEntry>, StatusSurface {
-  private readonly _onDidChangeTreeData = new vscode.EventEmitter<StatusEntry | undefined | null | void>();
+/** Synthetic child node revealing an entry's full text when expanded. */
+interface StatusDetailNode {
+  readonly kind: "detail";
+  readonly entry: StatusEntry;
+}
+
+type StatusTreeNode = StatusEntry | StatusDetailNode;
+
+function isDetailNode(node: StatusTreeNode): node is StatusDetailNode {
+  return (node as StatusDetailNode).kind === "detail";
+}
+
+const STATUS_STATE_KEY = "ensemble.notifications";
+/** Label text above this length gets a "click to expand" child row instead of a hover-only tooltip. */
+const LABEL_TRUNCATE_LENGTH = 150;
+
+export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNode>, StatusSurface {
+  private readonly _onDidChangeTreeData = new vscode.EventEmitter<StatusTreeNode | undefined | null | void>();
   readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
 
-  private entries: StatusEntry[] = [];
+  private entries: StatusEntry[];
+  private writes: Promise<void> = Promise.resolve();
 
-  constructor() {}
+  constructor(private readonly state?: vscode.Memento) {
+    const persisted = state?.get<Array<Omit<StatusEntry, "timestamp"> & { timestamp: string }>>(STATUS_STATE_KEY, []) ?? [];
+    // Notifications persist for the lifetime of this workspace with no
+    // retention limit — the user only clears them explicitly via Clear All.
+    this.entries = persisted
+      .filter(entry => typeof entry.message === "string" && typeof entry.timestamp === "string")
+      .map(entry => ({ ...entry, timestamp: new Date(entry.timestamp) }))
+      .filter(entry => !Number.isNaN(entry.timestamp.getTime()));
+  }
 
   /**
    * Add a new status entry to the surface.
-   * Enforces bounded retention (MAX_ENTRIES), newest-first ordering, and text trimming.
+   * Entries persist indefinitely (no retention cap); the user clears them via Clear All.
    */
   addEntry(message: string, level: "info" | "warning" | "error"): void {
-    const trimmedMessage =
-      message.length > MAX_MESSAGE_LENGTH
-        ? message.substring(0, MAX_MESSAGE_LENGTH) + "..."
-        : message;
-
     const entry: StatusEntry = {
-      message: trimmedMessage,
+      // Keep the complete process/result text. The tree label is compacted
+      // separately, while the persisted entry remains useful after reload.
+      message,
       level,
       timestamp: new Date(),
     };
@@ -37,12 +56,9 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusEntry>,
     // Insert newest first
     this.entries.unshift(entry);
 
-    // Keep retention bounded
-    if (this.entries.length > MAX_ENTRIES) {
-      this.entries.pop();
-    }
-
+    this.persist();
     this.refresh();
+    void vscode.commands.executeCommand("vs-code-ai-helper.statusView.focus").then(undefined, () => undefined);
   }
 
   /**
@@ -50,6 +66,7 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusEntry>,
    */
   clear(): void {
     this.entries = [];
+    this.persist();
     this.refresh();
   }
 
@@ -64,9 +81,27 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusEntry>,
     this._onDidChangeTreeData.fire();
   }
 
-  getTreeItem(element: StatusEntry): vscode.TreeItem {
-    const item = new vscode.TreeItem(element.message, vscode.TreeItemCollapsibleState.None);
-    
+  private persist(): void {
+    if (!this.state) return;
+    const serialized = this.entries.map(entry => ({ ...entry, timestamp: entry.timestamp.toISOString() }));
+    this.writes = this.writes.then(() => this.state!.update(STATUS_STATE_KEY, serialized));
+    void this.writes.catch(() => undefined);
+  }
+
+  getTreeItem(element: StatusTreeNode): vscode.TreeItem {
+    if (isDetailNode(element)) {
+      const item = new vscode.TreeItem(element.entry.message, vscode.TreeItemCollapsibleState.None);
+      item.tooltip = new vscode.MarkdownString(element.entry.message);
+      return item;
+    }
+
+    const isTruncated = element.message.length > LABEL_TRUNCATE_LENGTH;
+    const label = isTruncated ? `${element.message.slice(0, LABEL_TRUNCATE_LENGTH)}…` : element.message;
+    const item = new vscode.TreeItem(
+      label,
+      isTruncated ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None
+    );
+
     // Format timestamp as HH:mm:ss
     const timeStr = element.timestamp.toLocaleTimeString(undefined, {
       hour12: false,
@@ -74,7 +109,7 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusEntry>,
       minute: "2-digit",
       second: "2-digit",
     });
-    
+
     item.description = timeStr;
     item.tooltip = new vscode.MarkdownString(
       `**[${element.level.toUpperCase()}]** ${element.message}\n\nTime: ${element.timestamp.toLocaleString()}`
@@ -95,10 +130,16 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusEntry>,
     return item;
   }
 
-  getChildren(element?: StatusEntry): vscode.ProviderResult<StatusEntry[]> {
-    if (element) {
+  getChildren(element?: StatusTreeNode): vscode.ProviderResult<StatusTreeNode[]> {
+    if (!element) {
+      return this.entries;
+    }
+    if (isDetailNode(element)) {
       return [];
     }
-    return this.entries;
+    // Clicking the caret on a truncated entry reveals its full text below it.
+    return element.message.length > LABEL_TRUNCATE_LENGTH
+      ? [{ kind: "detail", entry: element }]
+      : [];
   }
 }

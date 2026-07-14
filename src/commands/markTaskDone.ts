@@ -5,6 +5,11 @@ import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { STAGE_DISPLAY_NAMES } from "../types/taskProgress";
 import { IncompleteTask, patchTaskProgress } from "../utils/taskProgressUtils";
 import { runCompletionLint } from "../utils/completionLint";
+import {
+  releaseTaskOperationLock,
+  showTaskBusyWarning,
+  tryAcquireTaskOperationLock,
+} from "../utils/taskOperationLock";
 
 /**
  * Accepted argument shapes for markTaskDone.
@@ -145,41 +150,53 @@ export async function markTaskDone(
 
   // ── Step 1: Re-run completion lint for a fresh, final read ───────────────
   const taskFolderUri = vscode.Uri.file(resolvedTask.taskFolderPath);
-  const lintResult = await runCompletionLint(taskFolderUri, resolvedTask.progress.implReviewFiles);
-  if (!lintResult.passed) {
-    void vscode.window.showWarningMessage(
-      `Cannot complete ${resolvedTask.folderName}: completion checks are still failing. Fix the reported issues and try again.`
-    );
+  const lockKey = taskFolderUri.fsPath;
+  if (!tryAcquireTaskOperationLock(lockKey, "Complete and Move On")) {
+    showTaskBusyWarning(lockKey);
     return;
   }
+  try {
+    const lintResult = await runCompletionLint(taskFolderUri, resolvedTask.progress.implReviewFiles);
+    if (!lintResult.passed) {
+      void vscode.window.showWarningMessage(
+        `Cannot complete ${resolvedTask.folderName}: completion checks are still failing. Fix the reported issues and try again.`
+      );
+      return;
+    }
 
-  // Completion is an explicit user action. Reaching Publish alone never
-  // changes lifecycle status, but this command is the durable terminal edge.
-  await patchTaskProgress(taskFolderUri, (current) => ({
-    ...current,
-    status: "completed",
-    completedAt: new Date().toISOString(),
-    // A completed task must never retain an actionable timer. Besides being
-    // misleading, that state makes tree context validation reject the task.
-    scheduledRun: undefined,
-    scheduledResumeTime: undefined,
-  }));
-  await inventory.refresh();
+    // Completion is an explicit user action. Reaching Publish alone never
+    // changes lifecycle status, but this command is the durable terminal edge.
+    await patchTaskProgress(taskFolderUri, (current) => ({
+      ...current,
+      status: "completed",
+      completedAt: new Date().toISOString(),
+      // Publish is the final stage. Record it explicitly so its row retains a
+      // completion tick after the task moves to the completed lifecycle state.
+      completedStages: Array.from(new Set([...(current.completedStages ?? []), "publish"])),
+      // A completed task must never retain an actionable timer. Besides being
+      // misleading, that state makes tree context validation reject the task.
+      scheduledRun: undefined,
+      scheduledResumeTime: undefined,
+    }));
+    await inventory.refresh();
 
-  // ── Step 3: Select next active task deterministically ────────────────────
-  const nextCanonicalId = selectNextTask(inventory, resolvedTask.canonicalId);
-  if (nextCanonicalId) {
-    await currentTaskStore.set(nextCanonicalId);
-  } else {
-    await currentTaskStore.clear();
+    // ── Step 3: Select next active task deterministically ──────────────────
+    const nextCanonicalId = selectNextTask(inventory, resolvedTask.canonicalId);
+    if (nextCanonicalId) {
+      await currentTaskStore.set(nextCanonicalId);
+    } else {
+      await currentTaskStore.clear();
+    }
+
+    // ── Step 4: Show completion message ─────────────────────────────────────
+    void vscode.window.showInformationMessage(
+      nextCanonicalId
+        ? `${resolvedTask.folderName} complete (lint passed). Next task selected.`
+        : `${resolvedTask.folderName} complete (lint passed). No remaining active tasks.`
+    );
+  } finally {
+    releaseTaskOperationLock(lockKey);
   }
-
-  // ── Step 4: Show completion message ──────────────────────────────────────
-  void vscode.window.showInformationMessage(
-    nextCanonicalId
-      ? `${resolvedTask.folderName} complete (lint passed). Next task selected.`
-      : `${resolvedTask.folderName} complete (lint passed). No remaining active tasks.`
-  );
 }
 
 /**

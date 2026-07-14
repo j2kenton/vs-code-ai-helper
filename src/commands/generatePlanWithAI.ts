@@ -20,6 +20,11 @@ import { IncompleteTask } from "../utils/taskProgressUtils";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { TaskTreeProvider } from "../views/taskTreeProvider";
 import { shouldAutoReviewAfterPlan } from "../config/settings";
+import {
+  releaseTaskOperationLock,
+  showTaskBusyWarning,
+  tryAcquireTaskOperationLock,
+} from "../utils/taskOperationLock";
 
 /**
  * Stages a task may be in for plan generation to be safe: either at the
@@ -148,6 +153,44 @@ export async function generatePlanWithAI(
     return;
   }
 
+  const lockKey = taskFolderUri.fsPath;
+  if (!tryAcquireTaskOperationLock(lockKey, "Generate Plan")) {
+    showTaskBusyWarning(lockKey);
+    return;
+  }
+  let result: GeneratePlanResult;
+  try {
+    result = await generatePlanWithAIForResolvedTask(
+      context,
+      inventory,
+      taskFolderUri
+    );
+  } finally {
+    releaseTaskOperationLock(lockKey);
+  }
+
+  // Run only after this run's own lock is released above, since
+  // runReviewWithAI acquires the same per-task lock itself.
+  if (result.triggerAutoReview && result.taskFolderPath) {
+    await vscode.commands.executeCommand("vs-code-ai-helper.runReviewWithAI", {
+      taskFolderPath: result.taskFolderPath,
+    });
+  }
+
+  return result.succeeded || undefined;
+}
+
+interface GeneratePlanResult {
+  succeeded: boolean;
+  triggerAutoReview: boolean;
+  taskFolderPath?: string;
+}
+
+async function generatePlanWithAIForResolvedTask(
+  context: vscode.ExtensionContext,
+  inventory: TaskInventory,
+  taskFolderUri: vscode.Uri
+): Promise<GeneratePlanResult> {
   const model = await resolveFreshModelForStage(taskFolderUri, "plan");
   if (!model.modelId) {
     const openSettings = await vscode.window.showWarningMessage(
@@ -156,9 +199,9 @@ export async function generatePlanWithAI(
       "Open Settings"
     );
     if (openSettings === "Open Settings") {
-      await vscode.commands.executeCommand("vs-code-ai-helper.settingsView.focus");
+      await vscode.commands.executeCommand("vs-code-ai-helper.openSettings");
     }
-    return;
+    return { succeeded: false, triggerAutoReview: false };
   }
 
   // A direct URI is not an ownership proof. Require the live inventory to
@@ -166,13 +209,13 @@ export async function generatePlanWithAI(
   const ownedTask = inventory.getTaskByPath(taskFolderUri.fsPath);
   if (!ownedTask) {
     void vscode.window.showErrorMessage("The selected task is not owned by this workspace.");
-    return;
+    return { succeeded: false, triggerAutoReview: false };
   }
   taskFolderUri = vscode.Uri.file(ownedTask.taskFolderPath);
   const workspaceFolderUri = ownedTask.workspaceFolder;
   if (!workspaceFolderUri) {
     void vscode.window.showErrorMessage("The selected task has no owning workspace.");
-    return;
+    return { succeeded: false, triggerAutoReview: false };
   }
   const { runner, providerLabel, nativeModelId } = resolveRunnerForModel(
     model.modelId, "plan"
@@ -184,7 +227,7 @@ export async function generatePlanWithAI(
         availability.reason ?? "unknown reason"
       }. Use the manual planning workflow instead.`
     );
-    return;
+    return { succeeded: false, triggerAutoReview: false };
   }
 
   const taskFileUri = vscode.Uri.joinPath(taskFolderUri, TASK_FILENAME);
@@ -207,7 +250,7 @@ export async function generatePlanWithAI(
     NotificationRouter.showWarning(
       `${TASK_FILENAME} is empty. Describe the task before generating a plan.`
     );
-    return;
+    return { succeeded: false, triggerAutoReview: false };
   }
 
   // Build the context pack IN MEMORY — do NOT write context-pack.md yet.
@@ -229,7 +272,7 @@ export async function generatePlanWithAI(
   // ── Prompt-size gate (BEFORE any artifact is written) ────────────────────
   const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel);
   if (sizeCheck === "abort" || sizeCheck === "declined") {
-    return;
+    return { succeeded: false, triggerAutoReview: false };
   }
 
   // Size gate passed — persist the EXACT same context-pack content that was
@@ -240,12 +283,13 @@ export async function generatePlanWithAI(
 
   const canonicalId = inventory.getTaskByPath(taskFolderUri.fsPath)?.canonicalId ?? taskFolderUri.fsPath;
   let succeeded = false;
+  let triggerAutoReview = false;
   try {
     TaskTreeProvider.setStageRunning(canonicalId, "plan", true);
     // No overwrite confirmation — user has deliberately triggered regeneration
     await vscode.window.withProgress(
       {
-        location: vscode.ProgressLocation.Notification,
+        location: vscode.ProgressLocation.Window,
         title: `Generating plan with ${providerLabel} (uses your ${providerLabel} quota)...`,
         cancellable: true,
       },
@@ -279,11 +323,17 @@ export async function generatePlanWithAI(
         if (result.status === "completed") {
           // Use patchTaskProgress to preserve unrelated fields (e.g. implReviewFiles,
           // scheduled metadata, lint results) while updating the stage.
+          // The destination stage must be persisted before its automatic
+          // operation begins.  This keeps the tree/progress indicator and
+          // review eligibility aligned with the operation actually running.
+          const destinationStage: TaskStage = shouldAutoReviewAfterPlan()
+            ? "plan-high-review"
+            : "plan";
           await patchTaskProgress(taskFolderUri, (existing) => {
             if (!ELIGIBLE_STAGES.includes(existing.currentStage)) {
               return existing;
             }
-            return updateTaskProgressStage(existing, "plan");
+            return updateTaskProgressStage(existing, destinationStage);
           });
           succeeded = true;
 
@@ -293,9 +343,11 @@ export async function generatePlanWithAI(
             `plan.md generated with ${providerLabel} (${result.summary ?? ""})`
           );
           if (shouldAutoReviewAfterPlan()) {
-            await vscode.commands.executeCommand("vs-code-ai-helper.runReviewWithAI", {
-              taskFolderPath: taskFolderUri.fsPath,
-            });
+            // Deferred: the review command acquires this same task's
+            // operation lock, which this run still holds until the
+            // outer `finally` below runs. Trigger it from the caller
+            // after that lock has been released instead of here.
+            triggerAutoReview = true;
           }
         } else if (result.status === "cancelled") {
           NotificationRouter.showInformation(
@@ -313,7 +365,7 @@ export async function generatePlanWithAI(
   } finally {
     TaskTreeProvider.setStageRunning(canonicalId, "plan", false);
   }
-  return succeeded || undefined;
+  return { succeeded, triggerAutoReview, taskFolderPath: taskFolderUri.fsPath };
 }
 
 /**

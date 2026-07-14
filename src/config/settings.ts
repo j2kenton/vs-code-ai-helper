@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import { AI_MODEL_STAGES, TaskStage } from "../types/taskProgress";
 import { FallbackStrategy, ModelSettings } from "../utils/modelFallback";
+import { parseModelSelection } from "../runners/providers";
 
 const CONFIG_SECTION = "vs-code-ai-helper";
 const META_RESOURCES_PATH_KEY = "metaResourcesPath";
@@ -12,10 +13,18 @@ const ENABLED_PROVIDERS_KEY = "enabledProviders";
 const FAST_FORWARD_MAX_ITERATIONS_KEY = "fastForwardMaxIterations";
 const AUTO_ADVANCE_ENABLED_KEY = "autoAdvanceEnabled";
 const AUTO_ADVANCE_SCORE_KEY = "autoAdvanceScoreThreshold";
+const COMPLETE_AND_MOVE_ON_TRIGGERS_AI_KEY = "completeAndMoveOnTriggersAI";
+
+/** Whether completing a stage automatically starts the destination stage's AI action. */
+export function completeAndMoveOnTriggersAI(): boolean {
+  return vscode.workspace.getConfiguration("vs-code-ai-helper")
+    .get<boolean>(COMPLETE_AND_MOVE_ON_TRIGGERS_AI_KEY, true);
+}
 const FAST_FORWARD_STOP_LEVEL_KEY = "fastForwardStopLevel";
 const FAST_FORWARD_USE_ACCEPTANCE_KEY = "fastForwardUseAcceptanceThreshold";
 const AUTO_REVIEW_AFTER_PLAN_KEY = "autoReviewAfterPlan";
 const AUTO_REVIEW_AFTER_IMPLEMENTATION_KEY = "autoReviewAfterImplementation";
+const ALLOW_DIRTY_WORKTREE_CHANGES_KEY = "allowDirtyWorktreeChanges";
 
 export function areMetaFilesHidden(): boolean {
   return vscode.workspace.getConfiguration(CONFIG_SECTION).get<boolean>(META_FILES_HIDDEN_KEY, false);
@@ -25,10 +34,34 @@ export async function setMetaFilesHidden(hidden: boolean): Promise<void> {
   await vscode.workspace.getConfiguration(CONFIG_SECTION).update(META_FILES_HIDDEN_KEY, hidden, vscode.ConfigurationTarget.Workspace);
 }
 
-/** Provider filters are workspace-wide; missing entries deliberately mean enabled. */
+/** Providers are opt-in.  A migration on activation preserves providers that
+ * are already referenced by older model settings. */
 export function isProviderEnabled(provider: string): boolean {
   const enabled = vscode.workspace.getConfiguration(CONFIG_SECTION).get<Record<string, boolean>>(ENABLED_PROVIDERS_KEY, {});
-  return enabled[provider] !== false;
+  return enabled[provider] === true;
+}
+
+/**
+ * One-time compatibility migration for the old implicit-enable behaviour.
+ * Only providers actually referenced by a pre-existing stage model are kept
+ * enabled; a new workspace therefore starts with every provider disabled.
+ */
+export async function migrateEnabledProvidersForExistingModels(): Promise<void> {
+  const config = vscode.workspace.getConfiguration(CONFIG_SECTION);
+  if (config.inspect<Record<string, boolean>>(ENABLED_PROVIDERS_KEY)?.workspaceValue !== undefined) {
+    return;
+  }
+  const settings = getModelSettings();
+  const enabled: Record<string, boolean> = {};
+  for (const setting of Object.values(settings)) {
+    for (const model of [setting?.primary, setting?.backup, ...(setting?.backups ?? [])]) {
+      if (!model) continue;
+      enabled[parseModelSelection(model).provider] = true;
+    }
+  }
+  if (Object.keys(enabled).length > 0) {
+    await config.update(ENABLED_PROVIDERS_KEY, enabled, vscode.ConfigurationTarget.Workspace);
+  }
 }
 
 export function getFastForwardMaxIterations(): number {
@@ -60,6 +93,11 @@ export function shouldAutoReviewAfterPlan(): boolean {
 
 export function shouldAutoReviewAfterImplementation(): boolean {
   return vscode.workspace.getConfiguration(CONFIG_SECTION).get<boolean>(AUTO_REVIEW_AFTER_IMPLEMENTATION_KEY, false);
+}
+
+/** Whether implementation/Fast Forward runs may proceed without prompting when the workspace has unrelated uncommitted changes. */
+export function allowsDirtyWorktreeChanges(): boolean {
+  return vscode.workspace.getConfiguration(CONFIG_SECTION).get<boolean>(ALLOW_DIRTY_WORKTREE_CHANGES_KEY, false);
 }
 
 /**
