@@ -706,7 +706,8 @@
     "publish:patch": "vsce publish patch",
     "publish:minor": "vsce publish minor",
     "publish:major": "vsce publish major",
-    "release": "powershell -ExecutionPolicy Bypass -File scripts/release.ps1"
+    "release": "powershell -ExecutionPolicy Bypass -File scripts/release.ps1",
+    "ensemble:release": "powershell -ExecutionPolicy Bypass -File scripts/release.ps1"
   },
   "devDependencies": {
     "@types/node": "^20.10.0",
