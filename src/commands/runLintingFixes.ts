@@ -15,10 +15,9 @@ import { runImplementationForModel } from "../runners/runnerRegistry";
 import { checkAndConfirmPromptSize } from "../utils/promptSizeGuard";
 import { ensureAiConsent } from "../utils/aiConsent";
 import {
-  releaseTaskOperationLock,
+  taskOperations,
   showTaskBusyWarning,
-  tryAcquireTaskOperationLock,
-} from "../utils/taskOperationLock";
+} from "../utils/taskOperations";
 
 /**
  * Accepted argument shapes for runLintingFixes.
@@ -116,7 +115,8 @@ export async function runLintingFixes(
 
   const taskFolderUri = vscode.Uri.file(resolvedTask.taskFolderPath);
   const lockKey = taskFolderUri.fsPath;
-  if (!tryAcquireTaskOperationLock(lockKey, "Linting Fixes")) {
+  const op = taskOperations.begin(lockKey, { label: "Linting Fixes", stage: "publish", taskName: resolvedTask.folderName });
+  if (!op) {
     showTaskBusyWarning(lockKey);
     return;
   }
@@ -298,7 +298,7 @@ export async function runLintingFixes(
     }
   );
   } finally {
-    releaseTaskOperationLock(lockKey);
+    taskOperations.end(op);
   }
 }
 

@@ -36,8 +36,10 @@ import { TaskInventory } from "./state/taskInventory";
 import { CurrentTaskStore } from "./utils/currentTaskStore";
 import { TASK_PROGRESS_FILENAME } from "./types/taskProgress";
 import { warmCliModelCache } from "./utils/modelSelection";
-import { StatusTreeProvider } from "./views/statusView";
+import { StatusTreeProvider, STATUS_VIEW_ID } from "./views/statusView";
 import { initNotificationRouter, deactivateNotificationRouter } from "./utils/notificationRouter";
+import { ViewProgressBinder } from "./utils/viewProgressBinder";
+import { taskOperations } from "./utils/taskOperations";
 import { cleanupOrphanedTempFiles } from "./state/writeAtomic";
 import { resolveTaskRootCandidates } from "./utils/taskRoot";
 import { finishFinalization, recoverFinalizationTree } from "./state/finalizationJournal";
@@ -141,6 +143,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   const settingsViewProvider = new SettingsViewProvider(context.extensionUri);
   const chatViewProvider = new ChatViewProvider(context.workspaceState);
+  context.subscriptions.push(chatViewProvider);
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(
       SettingsViewProvider.viewType,
@@ -214,6 +217,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   // Tasks tree view + status bar: persistent visibility of workflow progress
   const taskTreeProvider = new TaskTreeProvider(inventory, currentTaskStore, context.workspaceState);
+  context.subscriptions.push(taskTreeProvider);
   const tasksTreeView = vscode.window.createTreeView(TASKS_VIEW_ID, {
     treeDataProvider: taskTreeProvider,
     showCollapseAll: true,
@@ -221,6 +225,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   // Initialize status view and notification router
   const statusTreeProvider = new StatusTreeProvider(context.workspaceState);
+  context.subscriptions.push(statusTreeProvider);
   initNotificationRouter(statusTreeProvider);
   context.subscriptions.push(vscode.commands.registerCommand(
     "vs-code-ai-helper.clearNotifications",
@@ -228,10 +233,13 @@ export function activate(context: vscode.ExtensionContext): void {
   ));
   registerOpenGeneralAssistantCommand(context, inventory, currentTaskStore);
 
-  const statusTreeView = vscode.window.createTreeView("vs-code-ai-helper.statusView", {
+  const statusTreeView = vscode.window.createTreeView(STATUS_VIEW_ID, {
     treeDataProvider: statusTreeProvider,
     showCollapseAll: false,
   });
+
+  const progressBinder = new ViewProgressBinder(taskOperations);
+  context.subscriptions.push(progressBinder);
 
   const taskStatusBar = new TaskStatusBar(currentTaskStore);
   const tasksLoadedListener = taskTreeProvider.onDidLoadTasks((tasks) => {

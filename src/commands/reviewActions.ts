@@ -8,10 +8,10 @@ import {
   hasValidMetaResourcesPath,
 } from "../config/settings";
 import {
-  releaseTaskOperationLock,
+  taskOperations,
   showTaskBusyWarning,
-  tryAcquireTaskOperationLock,
-} from "../utils/taskOperationLock";
+  TaskOperationHandle,
+} from "../utils/taskOperations";
 import {
   isPlanReviewStage,
   isReviewStage,
@@ -180,11 +180,9 @@ interface ApplyReviewOptions {
   /** Preserve a stage's active fallback reservation across one internal retry loop. */
   preserveActiveFallback?: boolean;
   /**
-   * Skip acquiring the per-task operation lock — for internal callers (Fast
-   * Forward) that already hold it for the whole run. A direct "Apply Review"
-   * button click never sets this.
+   * Replaces skipTaskLock. The parent operation that holds the task operation lock.
    */
-  skipTaskLock?: boolean;
+  parentOperation?: TaskOperationHandle;
 }
 
 interface ExecuteImplementationRunOptions {
@@ -192,6 +190,7 @@ interface ExecuteImplementationRunOptions {
   skipPreRunSafetyCheck?: boolean;
   /** Preserve a stage's active fallback reservation across one internal retry loop. */
   preserveActiveFallback?: boolean;
+  onBusyDetail?: (detail: string | undefined) => void;
 }
 
 /**
@@ -200,16 +199,14 @@ interface ExecuteImplementationRunOptions {
  * later attempts should reuse any fallback activated earlier in the same loop.
  */
 export function buildFastForwardApplyReviewOptions(
-  attemptNumber: number
+  attemptNumber: number,
+  parentOperation?: TaskOperationHandle
 ): ApplyReviewOptions {
   const preserveActiveFallback = attemptNumber > 1;
   return {
     skipImplementationSafetyCheck: preserveActiveFallback,
     preserveActiveFallback,
-    // fastForwardReviewWithAI already holds the task operation lock for the
-    // whole run; each attempt's nested applyReviewWithAI call must not try
-    // to re-acquire it.
-    skipTaskLock: true,
+    parentOperation,
   };
 }
 
@@ -1143,7 +1140,8 @@ export async function runReviewWithAI(
     return;
   }
   const lockKey = resolved.folderUri.fsPath;
-  if (!tryAcquireTaskOperationLock(lockKey, "Review")) {
+  const op = taskOperations.begin(lockKey, { label: "Review", stage: resolved.progress.currentStage });
+  if (!op) {
     showTaskBusyWarning(lockKey);
     return;
   }
@@ -1156,7 +1154,7 @@ export async function runReviewWithAI(
       true
     );
   } finally {
-    releaseTaskOperationLock(lockKey);
+    taskOperations.end(op);
   }
 }
 
@@ -1231,7 +1229,8 @@ export async function applyReviewWithAI(
   }
 
   const lockKey = resolved.folderUri.fsPath;
-  if (!options.skipTaskLock && !tryAcquireTaskOperationLock(lockKey, "Apply Review")) {
+  const op = options.parentOperation ?? taskOperations.begin(lockKey, { label: "Apply Review", stage: resolved.progress.currentStage });
+  if (!op) {
     showTaskBusyWarning(lockKey);
     return;
   }
@@ -1317,8 +1316,8 @@ export async function applyReviewWithAI(
       );
     }
   } finally {
-    if (!options.skipTaskLock) {
-      releaseTaskOperationLock(lockKey);
+    if (!options.parentOperation) {
+      taskOperations.end(op);
     }
   }
 }
@@ -1385,7 +1384,8 @@ export async function fastForwardReviewWithAI(
   }
 
   const lockKey = resolved.folderUri.fsPath;
-  if (!tryAcquireTaskOperationLock(lockKey, "Fast Forward Review")) {
+  const op = taskOperations.begin(lockKey, { label: "Fast Forward Review", stage: resolved.progress.currentStage });
+  if (!op) {
     showTaskBusyWarning(lockKey);
     return;
   }
@@ -1476,7 +1476,7 @@ export async function fastForwardReviewWithAI(
               extensionUri,
               context,
               concreteArg,
-              buildFastForwardApplyReviewOptions(attemptNumber)
+              buildFastForwardApplyReviewOptions(attemptNumber, op)
             );
           },
           review: async () => {
@@ -1516,7 +1516,7 @@ export async function fastForwardReviewWithAI(
     );
   }
   } finally {
-    releaseTaskOperationLock(lockKey);
+    taskOperations.end(op);
   }
 }
 
@@ -1598,7 +1598,10 @@ async function applyImplementationReviewWithAI(
     model.modelId,
     `Applying implementation review with ${providerLabel}...`,
     stage,
-    options
+    {
+      ...options,
+      onBusyDetail: options.parentOperation ? (d) => options.parentOperation!.report(d) : undefined,
+    }
   );
 }
 
@@ -1902,7 +1905,8 @@ export async function generateImplementationWithAI(
   }
 
   const lockKey = resolved.folderUri.fsPath;
-  if (!tryAcquireTaskOperationLock(lockKey, "Generate Implementation")) {
+  const op = taskOperations.begin(lockKey, { label: "Generate Implementation", stage: "impl" });
+  if (!op) {
     showTaskBusyWarning(lockKey);
     return;
   }
@@ -1961,7 +1965,7 @@ export async function generateImplementationWithAI(
       await setStage(resolved.folderUri, "impl");
     }
   } finally {
-    releaseTaskOperationLock(lockKey);
+    taskOperations.end(op);
   }
 }
 
@@ -2070,6 +2074,7 @@ async function executeImplementationRun(
         // review stage used only to pick which review to auto-run below).
         stage: "impl",
         taskFolderUri: folderUri,
+        onBusyDetail: options.onBusyDetail,
       });
     }
   );
@@ -2152,7 +2157,7 @@ async function executeImplementationRun(
   } else if (result.status === "cancelled") {
     NotificationRouter.showInformation("Implementation cancelled.");
   } else {
-    void vscode.window.showErrorMessage(
+    NotificationRouter.showError(
       `Implementation failed: ${result.errorMessage ?? "unknown error"}`
     );
   }
@@ -2211,7 +2216,8 @@ export async function runImplementationWithAI(
   }
 
   const lockKey = resolved.folderUri.fsPath;
-  if (!tryAcquireTaskOperationLock(lockKey, "Run Implementation")) {
+  const op = taskOperations.begin(lockKey, { label: "Run Implementation", stage: "impl" });
+  if (!op) {
     showTaskBusyWarning(lockKey);
     return;
   }
@@ -2283,10 +2289,11 @@ export async function runImplementationWithAI(
       prompt,
       model.modelId,
       `Running implementation with ${providerLabel} (uses your ${providerLabel} quota)...`,
-      postRunReviewStage
+      postRunReviewStage,
+      { onBusyDetail: (d) => op.report(d) }
     );
   } finally {
-    releaseTaskOperationLock(lockKey);
+    taskOperations.end(op);
   }
 }
 
@@ -2387,7 +2394,8 @@ async function runRelease(arg?: TaskNodeArg): Promise<void> {
   const root = owner?.uri.fsPath;
   if (!root) { void vscode.window.showWarningMessage("Open a workspace before releasing."); return; }
 
-  if (!tryAcquireTaskOperationLock(candidate, "Release")) {
+  const op = taskOperations.begin(candidate, { label: "Release", taskName: arg?.task?.folderName ?? path.basename(candidate) });
+  if (!op) {
     showTaskBusyWarning(candidate);
     return;
   }
@@ -2441,6 +2449,6 @@ async function runRelease(arg?: TaskNodeArg): Promise<void> {
       child.on("error", e => { void vscode.window.showErrorMessage(`Release failed: ${e.message}`); resolve(); });
     });
   } finally {
-    releaseTaskOperationLock(candidate);
+    taskOperations.end(op);
   }
 }

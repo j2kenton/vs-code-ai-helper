@@ -482,8 +482,9 @@ export async function runImplementationWithCopilot(options: {
   workspaceUri: vscode.Uri;
   token: vscode.CancellationToken;
   onProgress: (message: string) => void;
+  onBusyDetail?: (detail: string | undefined) => void;
 }): Promise<ImplementationRunResult> {
-  const { prompt, modelId, workspaceUri, token, onProgress } = options;
+  const { prompt, modelId, workspaceUri, token, onProgress, onBusyDetail } = options;
 
   const filesChanged = new Set<string>();
 
@@ -575,11 +576,13 @@ export async function runImplementationWithCopilot(options: {
         errorMessage: `Reached the configured maximum of ${maxIterations} tool-call rounds without finishing. The implementation may be incomplete.`,
       });
     }
+    onBusyDetail?.("waiting for your answer — round limit reached");
     notifyDesktop("Ensemble — question", `The implementation reached its ${maxIterations}-round limit. Continue working?`);
     const choice = await vscode.window.showWarningMessage(
       `The implementation reached its ${maxIterations}-round limit. Continue working?`,
       "Continue", "Cancel"
     );
+    onBusyDetail?.(undefined);
     if (choice !== "Continue") {
       return classifyFailure<ImplementationRunResult>({
         status: "failed",

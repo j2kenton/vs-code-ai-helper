@@ -36,6 +36,7 @@ function checkInitialized(): StatusSurface {
 export const NotificationRouter = {
   /**
    * Route routine informational message.
+   * NOTE: Routine notices must never raise an OS toast (desktop notification).
    */
   showInformation(message: string): void {
     const surface = checkInitialized();
@@ -44,6 +45,7 @@ export const NotificationRouter = {
 
   /**
    * Route routine warning message.
+   * NOTE: Routine warning notices must never raise an OS toast (desktop notification).
    */
   showWarning(message: string): void {
     const surface = checkInitialized();

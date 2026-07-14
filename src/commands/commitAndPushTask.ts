@@ -15,10 +15,9 @@ import { runCompletionLint } from "../utils/completionLint";
 import { resolveFreshModelForStage } from "../utils/modelSelection";
 import { parseCopilotModelSelection, parseModelSelection } from "../runners/providers";
 import {
-  releaseTaskOperationLock,
+  taskOperations,
   showTaskBusyWarning,
-  tryAcquireTaskOperationLock,
-} from "../utils/taskOperationLock";
+} from "../utils/taskOperations";
 
 /**
  * Accepted argument shapes for commitAndPushTask.
@@ -749,7 +748,8 @@ export async function commitAndPushTask(
   }
 
   const lockKey = resolvedTask.taskFolderPath;
-  if (!tryAcquireTaskOperationLock(lockKey, "Commit and Push")) {
+  const op = taskOperations.begin(lockKey, { label: "Commit and Push", taskName: resolvedTask.folderName });
+  if (!op) {
     showTaskBusyWarning(lockKey);
     return;
   }
@@ -1092,7 +1092,7 @@ export async function commitAndPushTask(
     }
   );
   } finally {
-    releaseTaskOperationLock(lockKey);
+    taskOperations.end(op);
   }
 }
 
@@ -1142,7 +1142,8 @@ export async function completeCommitAndPushTask(
   // Released before step 4 so the commitAndPushTask call below can acquire
   // its own lock on the same folder without self-deadlocking.
   const lockKey = resolvedTask.taskFolderPath;
-  if (!tryAcquireTaskOperationLock(lockKey, "Complete, Commit and Push")) {
+  const op = taskOperations.begin(lockKey, { label: "Complete, Commit and Push", taskName: resolvedTask.folderName });
+  if (!op) {
     showTaskBusyWarning(lockKey);
     return;
   }
@@ -1192,7 +1193,7 @@ export async function completeCommitAndPushTask(
       }
     }
   } finally {
-    releaseTaskOperationLock(lockKey);
+    taskOperations.end(op);
   }
 
   // 4. Run commit & push

@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import { AgentRunRequest, AgentRunResult } from "../types/agentRunner";
 import type { TaskStage } from "../types/taskProgress";
 import { notifyDesktop } from "./desktopNotifier";
+import { taskOperations } from "./taskOperations";
 
 export interface PendingResumeOperation {
   request: Omit<AgentRunRequest, "taskFolderUri" | "workspaceUri" | "outputFile"> & {
@@ -56,7 +57,9 @@ export async function handleQuotaFailure(context: vscode.ExtensionContext, reque
   }
   await savePendingResume(context, request);
   notifyDesktop("Ensemble — question", "AI credits are exhausted. Resume when they restore, or switch model?");
+  taskOperations.report(request.taskFolderUri.fsPath, "waiting for your answer — credits exhausted");
   const choice = await vscode.window.showWarningMessage("AI credits are exhausted.", "Resume when credits restore", "Switch model");
+  taskOperations.report(request.taskFolderUri.fsPath, undefined);
   if (choice === "Switch model") { await switchModel?.(); return "switch"; }
   return choice === "Resume when credits restore" ? "resume" : undefined;
 }

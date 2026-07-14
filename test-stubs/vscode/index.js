@@ -304,7 +304,14 @@ const window = {
     if (!inputBoxResults.length) notImplemented("window.showInputBox")();
     return inputBoxResults.shift();
   },
-  withProgress: notImplemented("window.withProgress"),
+  withProgress: async (options, task) => {
+    const progress = { report: () => {} };
+    const token = { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) };
+    if (window._withProgressCalls) {
+      window._withProgressCalls.push({ options, task });
+    }
+    return await task(progress, token);
+  },
   // createStatusBarItem is needed by TaskStatusBar constructor.
   // Returns a minimal StatusBarItem stub so TaskStatusBar can be exercised
   // in unit tests without the real VS Code extension host.
@@ -322,7 +329,8 @@ const window = {
 
 window._queueQuickPickResult = (result) => { quickPickResults.push(result); };
 window._queueInputBoxResult = (result) => { inputBoxResults.push(result); };
-window._clearInteractionQueues = () => { quickPickResults.length = 0; inputBoxResults.length = 0; };
+window._withProgressCalls = [];
+window._clearInteractionQueues = () => { quickPickResults.length = 0; inputBoxResults.length = 0; window._withProgressCalls = []; };
 
 // Minimal commands stub: executeCommand is overridable by individual tests
 // via installExecuteCommandStub(). Default throws so forgotten stubs are

@@ -22,6 +22,7 @@ import { describe, it } from "node:test";
 
 import * as vscode from "vscode";
 import { buildFastForwardApplyReviewOptions } from "../commands/reviewActions";
+import { TaskOperationHandle } from "../utils/taskOperations";
 import { parseReadiness } from "../utils/reviewReadiness";
 
 /**
@@ -190,21 +191,45 @@ void describe("review apply model resolution contract", () => {
 });
 
 void describe("fast-forward fallback contract", () => {
+  // Fast Forward holds the task operation for the whole run; each nested apply
+  // attempt must inherit that handle rather than call begin() again. If the
+  // handle stops being threaded through, the nested begin() would be refused by
+  // its own parent's exclusive lock, emit a spurious "already in progress"
+  // warning and abort the attempt — so the handle is asserted, not just the flags.
+  const parentOperation = {
+    id: "op-test",
+    key: "c:/tasks/task_1",
+    label: "Fast Forward Review",
+    stage: "impl-high-review",
+    report: () => {},
+  } as unknown as TaskOperationHandle;
+
+  void it("threads the parent operation handle into every internal apply attempt", () => {
+    assert.strictEqual(
+      buildFastForwardApplyReviewOptions(1, parentOperation).parentOperation,
+      parentOperation
+    );
+    assert.strictEqual(
+      buildFastForwardApplyReviewOptions(2, parentOperation).parentOperation,
+      parentOperation
+    );
+  });
+
   void it("treats only the first internal apply attempt as a fresh invocation", () => {
     assert.deepStrictEqual(
-      buildFastForwardApplyReviewOptions(1),
+      buildFastForwardApplyReviewOptions(1, parentOperation),
       {
         skipImplementationSafetyCheck: false,
         preserveActiveFallback: false,
-        skipTaskLock: true,
+        parentOperation,
       }
     );
     assert.deepStrictEqual(
-      buildFastForwardApplyReviewOptions(2),
+      buildFastForwardApplyReviewOptions(2, parentOperation),
       {
         skipImplementationSafetyCheck: true,
         preserveActiveFallback: true,
-        skipTaskLock: true,
+        parentOperation,
       }
     );
   });

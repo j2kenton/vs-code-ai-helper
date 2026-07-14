@@ -11,6 +11,7 @@ import { checkAndConfirmPromptSize } from "../utils/promptSizeGuard";
 import { ChatViewProvider } from "../views/chatView";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { notifyDesktop } from "../utils/desktopNotifier";
+import { taskOperations } from "../utils/taskOperations";
 
 type ChatWithStageArg =
   | { task?: IncompleteTask; stage?: TaskStage; message?: string }
@@ -68,6 +69,13 @@ export async function chatWithStage(
   }
   if (!(await ensureAiConsent(context))) return;
 
+  const lockKey = task.taskFolderPath;
+  const op = taskOperations.begin(lockKey, {
+    label: "Chat",
+    stage: targetStage,
+    taskName: task.folderName,
+    exclusive: false,
+  });
   try {
     const taskFolderUri = vscode.Uri.file(task.taskFolderPath);
     const workspaceFolder = vscode.workspace.getWorkspaceFolder(taskFolderUri);
@@ -116,6 +124,8 @@ export async function chatWithStage(
     const failureMessage = `Stage response failed: ${text}`;
     NotificationRouter.showError(failureMessage);
     notifyDesktop("Ensemble — error", failureMessage);
+  } finally {
+    taskOperations.end(op);
   }
 }
 

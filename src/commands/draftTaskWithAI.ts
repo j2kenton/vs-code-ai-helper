@@ -9,15 +9,14 @@ import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { ensureAiConsent } from "../utils/aiConsent";
 import { checkAndConfirmPromptSize } from "../utils/promptSizeGuard";
 import { NotificationRouter } from "../utils/notificationRouter";
-import { TaskTreeProvider } from "../views/taskTreeProvider";
+
 import { shortcutHint } from "../utils/shortcutHints";
 import { backupArtifactBeforeWrite, backupArtifactContents } from "../utils/artifactBackups";
 import { patchTaskProgress, IncompleteTask } from "../utils/taskProgressUtils";
 import {
-  releaseTaskOperationLock,
+  taskOperations,
   showTaskBusyWarning,
-  tryAcquireTaskOperationLock,
-} from "../utils/taskOperationLock";
+} from "../utils/taskOperations";
 
 const INTRO_TEXT = `Briefly describe what changes you want to be made, and then use AI to help you clarify the plan.`;
 const SHORTCUT_NOTE = `Shortcut: Apply Current Stage Action${shortcutHint("vs-code-ai-helper.applyCurrentStageAction")}.`;
@@ -381,7 +380,8 @@ export async function draftTaskWithAI(
   }
 
   const lockKey = resolvedTask.taskFolderPath;
-  if (!tryAcquireTaskOperationLock(lockKey, "Draft Task with AI")) {
+  const op = taskOperations.begin(lockKey, { label: "Draft Task with AI", stage: "desc", taskName: resolvedTask.folderName });
+  if (!op) {
     showTaskBusyWarning(lockKey);
     return;
   }
@@ -492,7 +492,6 @@ export async function draftTaskWithAI(
   let aiOutput: { draftWithAI: string; openQuestions: string } | undefined;
 
   try {
-    TaskTreeProvider.setStageRunning(resolvedTask.canonicalId, "desc", true);
     await vscode.window.withProgress(
       {
         location: vscode.ProgressLocation.Window,
@@ -546,7 +545,6 @@ export async function draftTaskWithAI(
       }
     );
   } finally {
-    TaskTreeProvider.setStageRunning(resolvedTask.canonicalId, "desc", false);
     // ── Cleanup on all terminal paths ──────────────────────────────────────
     // success, malformed, runner failure, cancellation, exception
     await deleteDraftTmpFile(taskFolderUri);
@@ -635,7 +633,7 @@ export async function draftTaskWithAI(
   }
   return true;
   } finally {
-    releaseTaskOperationLock(lockKey);
+    taskOperations.end(op);
   }
 }
 

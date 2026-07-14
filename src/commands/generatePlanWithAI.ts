@@ -18,13 +18,12 @@ import { checkAndConfirmPromptSize } from "../utils/promptSizeGuard";
 import { TaskInventory } from "../state/taskInventory";
 import { IncompleteTask } from "../utils/taskProgressUtils";
 import { NotificationRouter } from "../utils/notificationRouter";
-import { TaskTreeProvider } from "../views/taskTreeProvider";
+
 import { shouldAutoReviewAfterPlan } from "../config/settings";
 import {
-  releaseTaskOperationLock,
+  taskOperations,
   showTaskBusyWarning,
-  tryAcquireTaskOperationLock,
-} from "../utils/taskOperationLock";
+} from "../utils/taskOperations";
 
 /**
  * Stages a task may be in for plan generation to be safe: either at the
@@ -154,7 +153,8 @@ export async function generatePlanWithAI(
   }
 
   const lockKey = taskFolderUri.fsPath;
-  if (!tryAcquireTaskOperationLock(lockKey, "Generate Plan")) {
+  const op = taskOperations.begin(lockKey, { label: "Generate Plan", stage: "plan" });
+  if (!op) {
     showTaskBusyWarning(lockKey);
     return;
   }
@@ -166,7 +166,7 @@ export async function generatePlanWithAI(
       taskFolderUri
     );
   } finally {
-    releaseTaskOperationLock(lockKey);
+    taskOperations.end(op);
   }
 
   // Run only after this run's own lock is released above, since
@@ -281,13 +281,11 @@ async function generatePlanWithAIForResolvedTask(
   // if open buffers change between the two calls.
   await writeContextPackContent(taskFolderUri, contextPackContent);
 
-  const canonicalId = inventory.getTaskByPath(taskFolderUri.fsPath)?.canonicalId ?? taskFolderUri.fsPath;
   let succeeded = false;
   let triggerAutoReview = false;
-  try {
-    TaskTreeProvider.setStageRunning(canonicalId, "plan", true);
-    // No overwrite confirmation — user has deliberately triggered regeneration
-    await vscode.window.withProgress(
+
+  // No overwrite confirmation — user has deliberately triggered regeneration
+  await vscode.window.withProgress(
       {
         location: vscode.ProgressLocation.Window,
         title: `Generating plan with ${providerLabel} (uses your ${providerLabel} quota)...`,
@@ -362,9 +360,6 @@ async function generatePlanWithAIForResolvedTask(
         }
       }
     );
-  } finally {
-    TaskTreeProvider.setStageRunning(canonicalId, "plan", false);
-  }
   return { succeeded, triggerAutoReview, taskFolderPath: taskFolderUri.fsPath };
 }
 

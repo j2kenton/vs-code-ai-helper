@@ -3,6 +3,7 @@ import { describe, it } from "node:test";
 import * as vscode from "vscode";
 
 import { buildNotifyCommand, notifyDesktop, __testOnly } from "../utils/desktopNotifier";
+import { NotificationRouter, initNotificationRouter } from "../utils/notificationRouter";
 
 type SpawnCall = { cmd: string; args: string[] };
 
@@ -236,6 +237,30 @@ void describe("desktopNotifier — notifyDesktop gating and queueing", () => {
       assert.strictEqual(calls.length, 1, "a later call must still fire — the queue must not stay poisoned by the earlier throw");
     } finally {
       if (originalDescriptor) Object.defineProperty(vscode.window, "state", originalDescriptor);
+      __testOnly.clearSpawnOverride();
+      restore();
+    }
+  });
+
+  void it("does not trigger desktop notifications for routine information or warning messages through NotificationRouter", async () => {
+    const { restore } = enableDesktopNotifications();
+    const { calls } = recordSpawns();
+    const originalFocused = vscode.window.state.focused;
+    setFocused(false);
+
+    // Mock a StatusSurface so NotificationRouter can be initialized
+    const mockSurface = {
+      addEntry: () => {},
+    };
+    initNotificationRouter(mockSurface);
+
+    try {
+      NotificationRouter.showInformation("Routine info");
+      NotificationRouter.showWarning("Routine warning");
+      await __testOnly.flush();
+      assert.strictEqual(calls.length, 0, "Routine notification routing must not spawn OS notifications");
+    } finally {
+      setFocused(originalFocused);
       __testOnly.clearSpawnOverride();
       restore();
     }

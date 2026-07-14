@@ -6,10 +6,9 @@ import { STAGE_DISPLAY_NAMES } from "../types/taskProgress";
 import { IncompleteTask, patchTaskProgress } from "../utils/taskProgressUtils";
 import { runCompletionLint } from "../utils/completionLint";
 import {
-  releaseTaskOperationLock,
+  taskOperations,
   showTaskBusyWarning,
-  tryAcquireTaskOperationLock,
-} from "../utils/taskOperationLock";
+} from "../utils/taskOperations";
 
 /**
  * Accepted argument shapes for markTaskDone.
@@ -151,7 +150,10 @@ export async function markTaskDone(
   // ── Step 1: Re-run completion lint for a fresh, final read ───────────────
   const taskFolderUri = vscode.Uri.file(resolvedTask.taskFolderPath);
   const lockKey = taskFolderUri.fsPath;
-  if (!tryAcquireTaskOperationLock(lockKey, "Complete and Move On")) {
+  // Task-level: completing a task is not scoped to one stage, so it spins the
+  // task row rather than a stage row.
+  const op = taskOperations.begin(lockKey, { label: "Complete and Move On", taskName: resolvedTask.folderName });
+  if (!op) {
     showTaskBusyWarning(lockKey);
     return;
   }
@@ -195,7 +197,7 @@ export async function markTaskDone(
         : `${resolvedTask.folderName} complete (lint passed). No remaining active tasks.`
     );
   } finally {
-    releaseTaskOperationLock(lockKey);
+    taskOperations.end(op);
   }
 }
 

@@ -10,6 +10,7 @@ import {
   TaskStage,
 } from "../types/taskProgress";
 import { IncompleteTask } from "../utils/taskProgressUtils";
+import { taskOperations, taskKey } from "../utils/taskOperations";
 import { resolveCurrentPlanUri, statIfExists } from "../utils/fileUtils";
 import { resolveImplementationArtifact } from "../utils/implementationArtifactResolver";
 import { parseReadiness } from "../utils/reviewReadiness";
@@ -138,7 +139,22 @@ export class TaskNode extends vscode.TreeItem {
     const totalSteps = STAGE_ORDER.length;
     const isPaused = task.progress.status === "paused";
 
-    if (isPaused) {
+    // Only task-level operations (commit/push, Complete and Move On, Release)
+    // spin the task row. Stage-scoped operations already spin their own stage
+    // row, so spinning here as well would be redundant and would hide the
+    // task's stage/step description behind the operation label.
+    const tKey = taskKey(task.canonicalId ?? task.folderUri.fsPath);
+    const taskLevelOp = taskOperations
+      .getTaskOperations(tKey)
+      .find(op => op.exclusive && op.stage === undefined);
+
+    if (taskLevelOp) {
+      this.iconPath = new vscode.ThemeIcon(
+        "loading~spin",
+        new vscode.ThemeColor("charts.blue")
+      );
+      this.description = `${taskLevelOp.label}… · ${STAGE_DISPLAY_NAMES[currentStage]} · step ${stepNumber} of ${totalSteps}`;
+    } else if (isPaused) {
       this.description = `Paused · ${STAGE_DISPLAY_NAMES[currentStage]} · step ${stepNumber} of ${totalSteps}`;
       this.iconPath = new vscode.ThemeIcon(
         "debug-pause",
@@ -203,47 +219,52 @@ export class StageNode extends vscode.TreeItem {
     const artifactName =
       artifactUri?.path.split("/").pop() ?? STAGE_ARTIFACT_FILENAMES[stage];
 
-    switch (status) {
-      case "done":
-        // Completed stages always render with the done/tick icon, regardless
-        // of whether readiness data is present. Overwriting the tick with a
-        // readiness icon (thumbsup/question/thumbsdown) would make completed
-        // stages visually ambiguous after a refresh — the acceptance criterion
-        // for reliable completed-stage ticks requires the tick to be
-        // unconditional for the "done" state.
-        this.iconPath = new vscode.ThemeIcon(
-          "check",
-          new vscode.ThemeColor("charts.green")
-        );
-        this.description = "done";
-        break;
-      case "current":
-        // Current review stages show the readiness icon so the user can see
-        // the AI's assessment at a glance without opening the artifact.
-        if (TaskTreeProvider.isStageRunning(task.canonicalId ?? task.folderUri.fsPath, stage)) {
-          this.iconPath = new vscode.ThemeIcon("loading~spin", new vscode.ThemeColor("charts.blue"));
-          this.description = "running";
-        } else if (readiness) {
+    const tKey = taskKey(task.canonicalId ?? task.folderUri.fsPath);
+    const isRunning = taskOperations.getTaskOperations(tKey).some(op => op.stage === stage);
+
+    if (isRunning) {
+      this.iconPath = new vscode.ThemeIcon("loading~spin", new vscode.ThemeColor("charts.blue"));
+      this.description = "running";
+    } else {
+      switch (status) {
+        case "done":
+          // Completed stages always render with the done/tick icon, regardless
+          // of whether readiness data is present. Overwriting the tick with a
+          // readiness icon (thumbsup/question/thumbsdown) would make completed
+          // stages visually ambiguous after a refresh — the acceptance criterion
+          // for reliable completed-stage ticks requires the tick to be
+          // unconditional for the "done" state.
           this.iconPath = new vscode.ThemeIcon(
-            readiness.icon,
-            new vscode.ThemeColor(readiness.colorKey)
+            "check",
+            new vscode.ThemeColor("charts.green")
           );
-          this.description = `current · ${readiness.label}`;
-        } else {
+          this.description = "done";
+          break;
+        case "current":
+          // Current review stages show the readiness icon so the user can see
+          // the AI's assessment at a glance without opening the artifact.
+          if (readiness) {
+            this.iconPath = new vscode.ThemeIcon(
+              readiness.icon,
+              new vscode.ThemeColor(readiness.colorKey)
+            );
+            this.description = `current · ${readiness.label}`;
+          } else {
+            this.iconPath = new vscode.ThemeIcon(
+              "arrow-right",
+              new vscode.ThemeColor("charts.blue")
+            );
+            this.description = "current";
+          }
+          break;
+        case "outstanding":
           this.iconPath = new vscode.ThemeIcon(
-            "arrow-right",
-            new vscode.ThemeColor("charts.blue")
+            "circle-large-outline",
+            new vscode.ThemeColor("disabledForeground")
           );
-          this.description = "current";
-        }
-        break;
-      case "outstanding":
-        this.iconPath = new vscode.ThemeIcon(
-          "circle-large-outline",
-          new vscode.ThemeColor("disabledForeground")
-        );
-        this.description = "outstanding";
-        break;
+          this.description = "outstanding";
+          break;
+      }
     }
 
     if (artifactUri) {
@@ -350,7 +371,7 @@ async function tryReadReadiness(
  * Accepts the shared TaskInventory so it and all commands use the same
  * discovered-task source.
  */
-export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
+export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, vscode.Disposable {
   private readonly _onDidChangeTreeData = new vscode.EventEmitter<void>();
   readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
   private readonly taskNodesByFolder = new Map<string, TaskNode>();
@@ -369,29 +390,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
   private readonly filterKey = "ensemble.taskStatusFilter";
   private readonly filterKnownStatusesKey = "ensemble.taskStatusFilterKnownStatuses";
   private selectedStatuses: Set<string>;
-
-  private static readonly runningStages = new Map<string, Set<TaskStage>>();
-  private static instance: TaskTreeProvider | undefined;
-
-  static setStageRunning(canonicalId: string, stage: TaskStage, running: boolean): void {
-    let set = this.runningStages.get(canonicalId);
-    if (!set) {
-      set = new Set<TaskStage>();
-      this.runningStages.set(canonicalId, set);
-    }
-    if (running) {
-      set.add(stage);
-    } else {
-      set.delete(stage);
-    }
-    if (this.instance) {
-      this.instance._onDidChangeTreeData.fire();
-    }
-  }
-
-  static isStageRunning(canonicalId: string, stage: TaskStage): boolean {
-    return this.runningStages.get(canonicalId)?.has(stage) ?? false;
-  }
+  private readonly operationsSub: vscode.Disposable;
 
   constructor(
     private readonly inventory: TaskInventory,
@@ -414,7 +413,6 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
     } else {
       this.selectedStatuses = new Set(this.allStatuses());
     }
-    TaskTreeProvider.instance = this;
     // When the shared inventory changes, refresh the tree automatically
     this.inventory.onDidChange(() => this._onDidChangeTreeData.fire());
 
@@ -422,6 +420,14 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode> {
     if (currentTaskStore) {
       currentTaskStore.onDidChange(() => this._onDidChangeTreeData.fire());
     }
+
+    // taskOperations is a module singleton that outlives this provider, so the
+    // subscription must be released on dispose or it will fire into a dead emitter.
+    this.operationsSub = taskOperations.onDidChange(() => this._onDidChangeTreeData.fire());
+  }
+
+  dispose(): void {
+    this.operationsSub.dispose();
   }
 
   /**

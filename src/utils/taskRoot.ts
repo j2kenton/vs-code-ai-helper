@@ -73,8 +73,11 @@ export function getConfiguredTaskRoot(): string {
 /**
  * Normalize a path for comparison: resolve to absolute, normalize separators,
  * and on Windows, lowercase for case-insensitive comparison.
+ *
+ * This is the canonical task identity rule. `taskOperations.taskKey` delegates
+ * here so operation lookups can never drift from `canonicalId`.
  */
-function normalizePath(p: string): string {
+export function normalizePath(p: string): string {
   const normalized = path.normalize(p);
   return process.platform === "win32" ? normalized.toLowerCase() : normalized;
 }

@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import { STAGE_DISPLAY_NAMES, STAGE_ORDER } from "../types/taskProgress";
 import { IncompleteTask } from "../utils/taskProgressUtils";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
+import { taskOperations } from "../utils/taskOperations";
 
 /**
  * Status bar item that shows the persisted current task from CurrentTaskStore.
@@ -22,6 +23,7 @@ export class TaskStatusBar implements vscode.Disposable {
   private readonly item: vscode.StatusBarItem;
   private lastTasks: IncompleteTask[] = [];
   private lastCurrentTaskId: string | undefined = undefined;
+  private readonly onDidChangeSub: vscode.Disposable;
 
   constructor(private readonly currentTaskStore: CurrentTaskStore) {
     this.item = vscode.window.createStatusBarItem(
@@ -29,6 +31,9 @@ export class TaskStatusBar implements vscode.Disposable {
       100
     );
     this.item.command = "vs-code-ai-helper.statusBarMenu";
+    this.onDidChangeSub = taskOperations.onDidChange(() => {
+      this.update(this.lastTasks, this.lastCurrentTaskId);
+    });
   }
 
   /**
@@ -59,10 +64,12 @@ export class TaskStatusBar implements vscode.Disposable {
 
     const isCompleted = taskToShow?.progress.status === "completed";
     const hasActiveNonCompleted = taskToShow && !isCompleted;
+    const isRunning = taskOperations.hasAny();
+    const icon = isRunning ? "$(sync~spin)" : "$(checklist)";
 
     if (!hasActiveNonCompleted) {
       // Neutral state when no active non-completed task exists
-      this.item.text = `$(checklist) Ensemble: No active task`;
+      this.item.text = `${icon} Ensemble: No active task`;
       this.item.tooltip = new vscode.MarkdownString(
         [
           `**Ensemble**`,
@@ -83,7 +90,7 @@ export class TaskStatusBar implements vscode.Disposable {
     const statusLabel = isPaused ? "paused" : "active";
 
     // Text: Checklist, folderName, stage display name, step progress, status
-    this.item.text = `$(checklist) ${taskToShow.folderName}: ${STAGE_DISPLAY_NAMES[stage]} (${stepNumber}/${totalSteps})${isPaused ? " [paused]" : ""}`;
+    this.item.text = `${icon} ${taskToShow.folderName}: ${STAGE_DISPLAY_NAMES[stage]} (${stepNumber}/${totalSteps})${isPaused ? " [paused]" : ""}`;
     this.item.tooltip = new vscode.MarkdownString(
       [
         `**Ensemble — ${statusLabel} task**`,
@@ -154,6 +161,7 @@ export class TaskStatusBar implements vscode.Disposable {
   }
 
   dispose(): void {
+    this.onDidChangeSub.dispose();
     this.item.dispose();
   }
 }

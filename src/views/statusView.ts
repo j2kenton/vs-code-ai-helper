@@ -1,5 +1,8 @@
 import * as vscode from "vscode";
 import { StatusSurface } from "../utils/notificationRouter";
+import { taskOperations } from "../utils/taskOperations";
+
+export const STATUS_VIEW_ID = "vs-code-ai-helper.statusView";
 
 export interface StatusEntry {
   message: string;
@@ -13,22 +16,35 @@ interface StatusDetailNode {
   readonly entry: StatusEntry;
 }
 
-type StatusTreeNode = StatusEntry | StatusDetailNode;
+export interface StatusOperationNode {
+  readonly kind: "operation";
+  readonly id: string;
+  readonly label: string;
+  readonly taskName: string;
+  readonly detail?: string;
+}
+
+type StatusTreeNode = StatusEntry | StatusDetailNode | StatusOperationNode;
 
 function isDetailNode(node: StatusTreeNode): node is StatusDetailNode {
   return (node as StatusDetailNode).kind === "detail";
+}
+
+function isOperationNode(node: StatusTreeNode): node is StatusOperationNode {
+  return (node as StatusOperationNode).kind === "operation";
 }
 
 const STATUS_STATE_KEY = "ensemble.notifications";
 /** Label text above this length gets a "click to expand" child row instead of a hover-only tooltip. */
 const LABEL_TRUNCATE_LENGTH = 150;
 
-export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNode>, StatusSurface {
+export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNode>, StatusSurface, vscode.Disposable {
   private readonly _onDidChangeTreeData = new vscode.EventEmitter<StatusTreeNode | undefined | null | void>();
   readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
 
   private entries: StatusEntry[];
   private writes: Promise<void> = Promise.resolve();
+  private readonly operationsSub: vscode.Disposable;
 
   constructor(private readonly state?: vscode.Memento) {
     const persisted = state?.get<Array<Omit<StatusEntry, "timestamp"> & { timestamp: string }>>(STATUS_STATE_KEY, []) ?? [];
@@ -38,6 +54,14 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
       .filter(entry => typeof entry.message === "string" && typeof entry.timestamp === "string")
       .map(entry => ({ ...entry, timestamp: new Date(entry.timestamp) }))
       .filter(entry => !Number.isNaN(entry.timestamp.getTime()));
+
+    // taskOperations is a module singleton that outlives this provider, so the
+    // subscription must be released on dispose or it will fire into a dead emitter.
+    this.operationsSub = taskOperations.onDidChange(() => this.refresh());
+  }
+
+  dispose(): void {
+    this.operationsSub.dispose();
   }
 
   /**
@@ -89,6 +113,15 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
   }
 
   getTreeItem(element: StatusTreeNode): vscode.TreeItem {
+    if (isOperationNode(element)) {
+      const label = `${element.label} — ${element.taskName}`;
+      const item = new vscode.TreeItem(label, vscode.TreeItemCollapsibleState.None);
+      item.id = `running:${element.id}`;
+      item.description = element.detail ?? "running";
+      item.iconPath = new vscode.ThemeIcon("loading~spin", new vscode.ThemeColor("charts.blue"));
+      return item;
+    }
+
     if (isDetailNode(element)) {
       const item = new vscode.TreeItem(element.entry.message, vscode.TreeItemCollapsibleState.None);
       item.tooltip = new vscode.MarkdownString(element.entry.message);
@@ -132,9 +165,16 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
 
   getChildren(element?: StatusTreeNode): vscode.ProviderResult<StatusTreeNode[]> {
     if (!element) {
-      return this.entries;
+      const runningNodes = taskOperations.getAll().map((op): StatusOperationNode => ({
+        kind: "operation",
+        id: op.id,
+        label: op.label,
+        taskName: op.taskName,
+        detail: op.detail,
+      }));
+      return [...runningNodes, ...this.entries];
     }
-    if (isDetailNode(element)) {
+    if (isDetailNode(element) || isOperationNode(element)) {
       return [];
     }
     // Clicking the caret on a truncated entry reveals its full text below it.

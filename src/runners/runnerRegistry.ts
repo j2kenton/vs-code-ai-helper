@@ -264,6 +264,7 @@ export async function runImplementationForModel(options: {
    * prompt may legitimately be answered without an edit. Copilot's runner
    * has no equivalent no-op failure, so this only affects CLI providers. */
   requireFileChange?: boolean;
+  onBusyDetail?: (detail: string | undefined) => void;
 }): Promise<ImplementationRunResult & { runnerId: string }> {
   const effective = resolveEffectiveProvider(options.modelId);
 
@@ -287,6 +288,7 @@ export async function runImplementationForModel(options: {
       workspaceUri: options.workspaceUri,
       token: options.token,
       onProgress: options.onProgress,
+      onBusyDetail: options.onBusyDetail,
     });
     return { ...result, runnerId: "copilot-lm" };
   };
