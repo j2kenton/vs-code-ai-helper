@@ -8,7 +8,7 @@ import {
   IMPLEMENTATION_FILENAME,
   LEGACY_IMPLEMENTATION_FILENAME,
 } from "../types/taskProgress";
-import { statIfExists } from "./fileUtils";
+import { readNonEmptyText, resolveCurrentPlanUri, statIfExists } from "./fileUtils";
 import { backupArtifactBeforeWrite } from "./artifactBackups";
 
 export interface ResolvedImplementationArtifact {
@@ -108,4 +108,59 @@ export async function materializeCanonicalIfNeeded(
     `No ${IMPLEMENTATION_FILENAME} or ${LEGACY_IMPLEMENTATION_FILENAME} found. ` +
       "Generate an implementation plan before running implementation."
   );
+}
+
+/** Result of {@link preparePlanPromotion}. */
+export type PlanPromotion =
+  | { ready: true; publish?: () => Promise<void> }
+  | { ready: false };
+
+/**
+ * Prepare (but do not perform) seeding plan-final.md from the current
+ * plan.md the first time a task enters the Implementation stage.
+ *
+ * This is the single source of truth for that promotion: every path that can
+ * transition a task's stage to "impl" (manual Next Stage, and score-based
+ * review auto-advance) must use it, or the task lands on "impl" with no
+ * implementation artifact and Generate Checklist/Implement immediately
+ * hard-fail via `materializeCanonicalIfNeeded`.
+ *
+ * Returns `{ ready: false }` when there is no plan content to promote —
+ * callers should abort the transition. Returns `{ ready: true }` with no
+ * `publish` when a canonical artifact already exists (nothing to do).
+ * Otherwise returns `{ ready: true, publish }`, where `publish` performs the
+ * actual backup+write.
+ *
+ * The write is intentionally split out from this read/check step so callers
+ * that gate the transition behind a compare-and-swap (e.g. `advanceStage`'s
+ * `publishArtifact` hook) can defer `publish` until that CAS has actually
+ * succeeded. Writing eagerly, before the CAS runs, would let a review
+ * attempt that loses the race still materialize plan-final.md for a stage
+ * transition that never happens.
+ */
+export async function preparePlanPromotion(
+  taskFolderUri: vscode.Uri
+): Promise<PlanPromotion> {
+  const resolved = await resolveImplementationArtifact(taskFolderUri);
+  if (resolved.isCanonical) {
+    return { ready: true };
+  }
+
+  const currentPlanUri = await resolveCurrentPlanUri(taskFolderUri);
+  const planContent = await readNonEmptyText(currentPlanUri);
+  if (!planContent) {
+    return { ready: false };
+  }
+
+  return {
+    ready: true,
+    publish: async () => {
+      const canonicalUri = getCanonicalImplementationUri(taskFolderUri);
+      await backupArtifactBeforeWrite(canonicalUri);
+      await vscode.workspace.fs.writeFile(
+        canonicalUri,
+        new TextEncoder().encode(planContent)
+      );
+    },
+  };
 }

@@ -51,6 +51,7 @@ import {
   getCanonicalImplementationUri,
   resolveImplementationArtifact,
   materializeCanonicalIfNeeded,
+  preparePlanPromotion,
 } from "../utils/implementationArtifactResolver";
 import { ensureAiConsent } from "../utils/aiConsent";
 import { checkAndConfirmPromptSize } from "../utils/promptSizeGuard";
@@ -947,7 +948,25 @@ export async function runReviewForFolder(
           const configuredStages = await resolveConfiguredReviewStages(folderUri);
           const next = computeNextStage(targetStage, configuredStages);
           if (next) {
-            const transition = await advanceStage(folderUri, targetStage, next, false, false, reviewAttemptId);
+            // Advancing into "impl" must promote plan.md -> plan-final.md,
+            // mirroring nextStage's manual handling below. The write itself
+            // is deferred into advanceStage's publishArtifact hook so it
+            // only lands atomically with — and only when — this review
+            // attempt actually wins the CAS. Writing it eagerly here would
+            // let a stale attempt that loses the race still materialize
+            // plan-final.md for a transition that never happens.
+            let publishArtifact: (() => Promise<void>) | undefined;
+            if (next === "impl") {
+              const promotion = await preparePlanPromotion(folderUri);
+              if (!promotion.ready) {
+                NotificationRouter.showWarning(
+                  "Review score reached the auto-advance threshold, but there is no plan to promote. Advance to Implementation manually once a plan exists."
+                );
+                return;
+              }
+              publishArtifact = promotion.publish;
+            }
+            const transition = await advanceStage(folderUri, targetStage, next, false, false, reviewAttemptId, publishArtifact);
             if (transition?.persisted) {
               NotificationRouter.showInformation(`Review accepted. Advanced to ${STAGE_DISPLAY_NAMES[next]}.`);
             }
@@ -1574,25 +1593,21 @@ export async function nextStage(
   }
 
   // Special handling for advancing into "implementation" stage:
-  // copy the current plan to plan-final.md if not already there
+  // copy the current plan to plan-final.md if not already there. Shared with
+  // the score-based auto-advance path above so neither entry point into
+  // "impl" can skip the promotion (see preparePlanPromotion). This manual
+  // transition isn't racing another review attempt's CAS, so the write can
+  // run immediately rather than being deferred into advanceStage.
   if (next === "impl") {
-    const resolved2 = await resolveImplementationArtifact(resolved.folderUri);
-    if (!resolved2.isCanonical) {
-      // Plan-final.md doesn't exist yet — copy current plan
-      const currentPlanUri = await resolveCurrentPlanUri(resolved.folderUri);
-      const planContent = await readNonEmptyText(currentPlanUri);
-      if (!planContent) {
-        NotificationRouter.showWarning(
-          "No plan to promote. Write or generate a plan first."
-        );
-        return;
-      }
-      const canonicalUri = vscode.Uri.joinPath(resolved.folderUri, "plan-final.md");
-      await backupArtifactBeforeWrite(canonicalUri);
-      await vscode.workspace.fs.writeFile(
-        canonicalUri,
-        new TextEncoder().encode(planContent)
+    const promotion = await preparePlanPromotion(resolved.folderUri);
+    if (!promotion.ready) {
+      NotificationRouter.showWarning(
+        "No plan to promote. Write or generate a plan first."
       );
+      return;
+    }
+    if (promotion.publish) {
+      await promotion.publish();
     }
   }
 
