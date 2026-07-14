@@ -25,7 +25,7 @@ export const CONTEXT_TOTAL_MAX_BYTES = 400_000;
  * the run. Measured on the full final prompt string, not just the pack
  * fragment.
  */
-export const CONTEXT_CONFIRM_THRESHOLD_BYTES = 150_000;
+export const CONTEXT_CONFIRM_THRESHOLD_BYTES = 300_000;
 
 /**
  * Absolute ceiling on the full final-prompt string. A prompt above this
