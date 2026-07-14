@@ -56,6 +56,9 @@ function createFakeWebviewView() {
     onDidChangeVisibility(_listener: () => void) {
       return { dispose() {} };
     },
+    onDidDispose(_listener: () => void) {
+      return { dispose() {} };
+    },
     show(_preserveFocus?: boolean) {
       webviewView.visible = true;
     },

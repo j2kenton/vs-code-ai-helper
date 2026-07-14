@@ -5,7 +5,7 @@ import {
   findTaskModelConflicts,
   getAvailableModels,
 } from "../utils/modelSelection";
-import { getModelSettings, setModelSettings } from "../config/settings";
+import { getModelSettings, setModelSettings, targetFor } from "../config/settings";
 import { ModelSettings } from "../utils/modelFallback";
 import { getQuotaStatusText } from "../utils/quota";
 import { cliDisplayLabel, CLI_PROVIDERS } from "../runners/providers";
@@ -19,20 +19,12 @@ type IncomingMessage =
   | { type: "validationError"; message: string }
   | { type: "resetDefaults" }
   | { type: "refreshQuotaStatus" }
-  | { type: "testProviderSetup"; providerId: string };
+  | { type: "testProviderSetup"; providerId: string }
+  | { type: "openNativeSettings" };
 
 interface WorkspaceSettings {
   metaFilesHidden: boolean;
   enabledProviders: Record<string, boolean>;
-  fastForwardMaxIterations: number;
-  autoAdvanceEnabled: boolean;
-  autoAdvanceScoreThreshold: number;
-  fastForwardStopLevel: number;
-  fastForwardUseAcceptanceThreshold: boolean;
-  autoReviewAfterPlan: boolean;
-  autoReviewAfterImplementation: boolean;
-  allowDirtyWorktreeChanges: boolean;
-  desktopNotifications: boolean;
 }
 
 export class SettingsViewProvider implements vscode.WebviewViewProvider {
@@ -142,7 +134,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             if (key === "metaFilesHidden") {
               continue;
             }
-            await config.update(key, value, vscode.ConfigurationTarget.Workspace);
+            await config.update(key, value, targetFor(key));
           }
           void vscode.window.showInformationMessage("Workflow settings saved.");
           break;
@@ -183,6 +175,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           });
           break;
         }
+        case "openNativeSettings": {
+          void vscode.commands.executeCommand("workbench.action.openSettings", "@ext:j2kenton.vs-code-ai-helper");
+          break;
+        }
       }
     });
 
@@ -194,6 +190,17 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         void webviewView.webview.postMessage({ type: "quotaStatus", quotaStatus: this._buildQuotaStatus() });
       }
     });
+
+    // Model settings and provider selection can now be edited directly in
+    // settings.json (they're native settings), or from a different
+    // workspace via the now-Global scope — re-sync the panel so it doesn't
+    // show a stale snapshot from when it was first opened.
+    const configListener = vscode.workspace.onDidChangeConfiguration((event) => {
+      if (webviewView.visible && event.affectsConfiguration("vs-code-ai-helper")) {
+        void this._postInit(webviewView.webview);
+      }
+    });
+    webviewView.onDidDispose(() => { configListener.dispose(); });
 
     // resolveWebviewView runs on every reveal after this panel was
     // collapsed, not just once per session (see the "ready" case above) —
@@ -236,15 +243,6 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       // visibility or invert a toggle.
       metaFilesHidden: config.get<boolean>("metaFilesHidden", false),
       enabledProviders: config.get<Record<string, boolean>>("enabledProviders", {}),
-      fastForwardMaxIterations: config.get<number>("fastForwardMaxIterations", 5),
-      autoAdvanceEnabled: config.get<boolean>("autoAdvanceEnabled", false),
-      autoAdvanceScoreThreshold: config.get<number>("autoAdvanceScoreThreshold", 10),
-      fastForwardStopLevel: config.get<number>("fastForwardStopLevel", 0),
-      fastForwardUseAcceptanceThreshold: config.get<boolean>("fastForwardUseAcceptanceThreshold", false),
-      autoReviewAfterPlan: config.get<boolean>("autoReviewAfterPlan", false),
-      autoReviewAfterImplementation: config.get<boolean>("autoReviewAfterImplementation", false),
-      allowDirtyWorktreeChanges: config.get<boolean>("allowDirtyWorktreeChanges", false),
-      desktopNotifications: config.get<boolean>("desktopNotifications", false),
     };
   }
 
@@ -474,10 +472,13 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           <button id="reset-btn" class="secondary">Reset to Defaults</button>
         </div>
 
-        <h2 style="font-size: 1.2em; margin: 28px 0 10px;">Workflow Settings</h2>
-        <p style="color: var(--vscode-descriptionForeground);">These settings apply to this workspace, not an individual task.</p>
+        <h2 style="font-size: 1.2em; margin: 28px 0 10px;">Providers &amp; Meta Files</h2>
         <div id="workflow-settings"></div>
-        <div class="btn-container"><button id="save-workflow-btn">Save Workflow Settings</button></div>
+        <div class="btn-container"><button id="save-workflow-btn">Save</button></div>
+
+        <div class="btn-container" style="margin-top: 24px; border-top: 1px solid var(--vscode-widget-border); padding-top: 15px;">
+          <button id="open-native-settings-btn" class="secondary">Open Ensemble Settings (Fast Forward, Auto-advance, Notifications…)</button>
+        </div>
 
         <script nonce="${nonce}">
           const vscode = acquireVsCodeApi();
@@ -865,27 +866,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               '<label><input id="meta-files-hidden" type="checkbox" ' + checked(workspaceSettings.metaFilesHidden) + '> Hide Ensemble meta resources from Git</label></fieldset>' +
               '<fieldset style="margin-top:12px"><legend>Provider Selection</legend>' +
               providers.map(provider => '<div style="margin:4px 0"><label><input type="checkbox" data-provider="' + escapeHtml(provider.id) + '" ' + checked(enabled[provider.id] === true) + '> ' + escapeHtml(provider.label) + '</label> <button type="button" class="test-provider" data-test-provider="' + escapeHtml(provider.id) + '">Test Setup</button> <span id="provider-status-' + escapeHtml(provider.id) + '" aria-live="polite">?</span></div>').join('') +
-              '<p style="margin:8px 0 0;font-size:0.9em">Usage status is session-observed; providers do not expose a live numeric quota through these checks.</p></fieldset>' +
-              '<fieldset style="margin-top:12px"><legend>Fast Forward Review</legend>' +
-              '<label>Maximum iterations (1–99): <input id="fast-forward-max" type="number" min="1" max="99" value="' + escapeHtml(workspaceSettings.fastForwardMaxIterations || 5) + '"></label><br>' +
-              '<label>Target score (0 = stop after any improvement): <input id="fast-forward-stop" type="number" min="0" max="10" value="' + escapeHtml(workspaceSettings.fastForwardStopLevel || 0) + '"></label><br><p style="margin:6px 0;font-size:0.9em">Fast Forward always continues until the score improves by at least one point from where it started, even when the target is already met.</p>' +
-              '<label><input id="fast-forward-acceptance" type="checkbox" ' + checked(workspaceSettings.fastForwardUseAcceptanceThreshold) + '> Use the auto-advance acceptance threshold instead of target score</label></fieldset>' +
-              '<fieldset style="margin-top:12px"><legend>Auto-advance and review</legend>' +
-              '<label><input id="auto-advance-enabled" type="checkbox" ' + checked(workspaceSettings.autoAdvanceEnabled) + '> Advance after a review reaches this score</label> ' +
-              '<input id="auto-advance-score" type="number" min="1" max="10" value="' + escapeHtml(workspaceSettings.autoAdvanceScoreThreshold || 10) + '"><br>' +
-              '<label><input id="auto-review-plan" type="checkbox" ' + checked(workspaceSettings.autoReviewAfterPlan) + '> Start review after AI drafts a plan</label><br>' +
-              '<label><input id="auto-review-implementation" type="checkbox" ' + checked(workspaceSettings.autoReviewAfterImplementation) + '> Start review after AI completes implementation</label></fieldset>' +
-              '<fieldset style="margin-top:12px"><legend>Uncommitted changes</legend>' +
-              '<label><input id="allow-dirty-worktree" type="checkbox" ' + checked(workspaceSettings.allowDirtyWorktreeChanges) + '> Always proceed with implementation/Fast Forward runs even when the workspace has unrelated uncommitted changes</label>' +
-              '<p style="margin:6px 0 0;font-size:0.9em">When off, you will be warned and asked to confirm before an AI run edits files while unrelated changes are uncommitted.</p></fieldset>' +
-              '<fieldset style="margin-top:12px"><legend>Desktop notifications</legend>' +
-              '<label><input id="desktop-notifications" type="checkbox" ' + checked(workspaceSettings.desktopNotifications) + '> Show a native OS notification when Ensemble needs your attention</label>' +
-              '<p style="margin:6px 0 0;font-size:0.9em">Covers questions Ensemble is waiting on you to answer, and runs that fail outright. Off by default.</p></fieldset>';
-            const acceptance = document.getElementById('fast-forward-acceptance');
-            const target = document.getElementById('fast-forward-stop');
-            function syncAcceptance() { target.disabled = acceptance.checked; }
-            acceptance.addEventListener('change', syncAcceptance);
-            syncAcceptance();
+              '<p style="margin:8px 0 0;font-size:0.9em">Usage status is session-observed; providers do not expose a live numeric quota through these checks.</p></fieldset>';
             container.querySelectorAll('[data-test-provider]').forEach(button => {
               button.addEventListener('click', () => {
                 const providerId = button.dataset.testProvider;
@@ -960,23 +941,14 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             document.querySelectorAll('[data-provider]').forEach(input => {
               enabledProviders[input.dataset.provider] = input.checked;
             });
-            const clamp = (id, min, max, fallback) => {
-              const value = Number(document.getElementById(id).value);
-              return Number.isFinite(value) ? Math.max(min, Math.min(max, Math.floor(value))) : fallback;
-            };
             vscode.postMessage({ type: 'saveWorkspaceSettings', settings: {
               metaFilesHidden: document.getElementById('meta-files-hidden').checked,
-              enabledProviders,
-              fastForwardMaxIterations: clamp('fast-forward-max', 1, 99, 5),
-              fastForwardStopLevel: clamp('fast-forward-stop', 0, 10, 0),
-              fastForwardUseAcceptanceThreshold: document.getElementById('fast-forward-acceptance').checked,
-              autoAdvanceEnabled: document.getElementById('auto-advance-enabled').checked,
-              autoAdvanceScoreThreshold: clamp('auto-advance-score', 1, 10, 10),
-              autoReviewAfterPlan: document.getElementById('auto-review-plan').checked,
-              autoReviewAfterImplementation: document.getElementById('auto-review-implementation').checked,
-              allowDirtyWorktreeChanges: document.getElementById('allow-dirty-worktree').checked,
-              desktopNotifications: document.getElementById('desktop-notifications').checked
+              enabledProviders
             }});
+          });
+
+          document.getElementById('open-native-settings-btn').addEventListener('click', () => {
+            vscode.postMessage({ type: 'openNativeSettings' });
           });
         </script>
       </body>

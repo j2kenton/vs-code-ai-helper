@@ -5,9 +5,7 @@ import { normalizeQualifiedModelId, parseModelSelection } from "../runners/provi
 
 const CONFIG_SECTION = "vs-code-ai-helper";
 const META_RESOURCES_PATH_KEY = "metaResourcesPath";
-const PROMPT_DISMISSED_KEY = "promptDismissed";
 const AI_MODEL_DEFAULTS_KEY = "aiModelDefaults";
-const MODEL_PROMPT_SHOWN_KEY = "modelSelectionPromptShown";
 const META_FILES_HIDDEN_KEY = "metaFilesHidden";
 const ENABLED_PROVIDERS_KEY = "enabledProviders";
 const FAST_FORWARD_MAX_ITERATIONS_KEY = "fastForwardMaxIterations";
@@ -27,12 +25,87 @@ const AUTO_REVIEW_AFTER_IMPLEMENTATION_KEY = "autoReviewAfterImplementation";
 const ALLOW_DIRTY_WORKTREE_CHANGES_KEY = "allowDirtyWorktreeChanges";
 const DESKTOP_NOTIFICATIONS_KEY = "desktopNotifications";
 
+// metaResourcesPath and metaFilesHidden describe *this* project (a path
+// relative to it, and a mirror of its own .gitignore), so they stay
+// per-workspace. Every other setting is a personal preference the user
+// expects to carry into a brand-new workspace, so it's written to user
+// (Global) settings instead — see migrateSettingsScope() below for the
+// one-time cutover of values already sitting in a workspace's settings.json.
+const WORKSPACE_SCOPED_KEYS = new Set<string>([META_RESOURCES_PATH_KEY, META_FILES_HIDDEN_KEY]);
+
+export function targetFor(key: string): vscode.ConfigurationTarget {
+  return WORKSPACE_SCOPED_KEYS.has(key)
+    ? vscode.ConfigurationTarget.Workspace
+    : vscode.ConfigurationTarget.Global;
+}
+
+/**
+ * One-time cutover of previously workspace-scoped settings to user (Global)
+ * settings, so a new workspace inherits them instead of starting blank.
+ * Must run before migrateEnabledProvidersForExistingModels(), which inspects
+ * the post-migration state.
+ */
+export async function migrateSettingsScope(): Promise<void> {
+  const config = vscode.workspace.getConfiguration(CONFIG_SECTION);
+  const globalKeys = [
+    AI_MODEL_DEFAULTS_KEY,
+    MODEL_SETTINGS_KEY,
+    ENABLED_PROVIDERS_KEY,
+    FAST_FORWARD_MAX_ITERATIONS_KEY,
+    AUTO_ADVANCE_ENABLED_KEY,
+    AUTO_ADVANCE_SCORE_KEY,
+    COMPLETE_AND_MOVE_ON_TRIGGERS_AI_KEY,
+    FAST_FORWARD_STOP_LEVEL_KEY,
+    FAST_FORWARD_USE_ACCEPTANCE_KEY,
+    AUTO_REVIEW_AFTER_PLAN_KEY,
+    AUTO_REVIEW_AFTER_IMPLEMENTATION_KEY,
+    ALLOW_DIRTY_WORKTREE_CHANGES_KEY,
+    DESKTOP_NOTIFICATIONS_KEY,
+    MAX_IMPLEMENTATION_ITERATIONS_KEY,
+  ];
+
+  const conflicts: string[] = [];
+  for (const key of globalKeys) {
+    const inspected = config.inspect(key);
+    if (inspected?.workspaceValue === undefined) {
+      continue;
+    }
+    if (inspected.globalValue === undefined) {
+      await config.update(key, inspected.workspaceValue, vscode.ConfigurationTarget.Global);
+      await config.update(key, undefined, vscode.ConfigurationTarget.Workspace);
+    } else if (JSON.stringify(inspected.workspaceValue) === JSON.stringify(inspected.globalValue)) {
+      await config.update(key, undefined, vscode.ConfigurationTarget.Workspace);
+    } else {
+      conflicts.push(key);
+    }
+  }
+
+  if (conflicts.length === 0) {
+    return;
+  }
+
+  const choice = await vscode.window.showWarningMessage(
+    `This workspace has ${conflicts.length} Ensemble setting(s) that differ from your user settings. ` +
+      "Workspace values still take effect here, but won't follow you to other workspaces unless you " +
+      "make them the default.",
+    "Use This Workspace's Settings Everywhere",
+    "Keep Workspace Overrides"
+  );
+  if (choice === "Use This Workspace's Settings Everywhere") {
+    for (const key of conflicts) {
+      const inspected = config.inspect(key);
+      await config.update(key, inspected?.workspaceValue, vscode.ConfigurationTarget.Global);
+      await config.update(key, undefined, vscode.ConfigurationTarget.Workspace);
+    }
+  }
+}
+
 export function areMetaFilesHidden(): boolean {
   return vscode.workspace.getConfiguration(CONFIG_SECTION).get<boolean>(META_FILES_HIDDEN_KEY, false);
 }
 
 export async function setMetaFilesHidden(hidden: boolean): Promise<void> {
-  await vscode.workspace.getConfiguration(CONFIG_SECTION).update(META_FILES_HIDDEN_KEY, hidden, vscode.ConfigurationTarget.Workspace);
+  await vscode.workspace.getConfiguration(CONFIG_SECTION).update(META_FILES_HIDDEN_KEY, hidden, targetFor(META_FILES_HIDDEN_KEY));
 }
 
 /** Providers are opt-in.  A migration on activation preserves providers that
@@ -46,10 +119,14 @@ export function isProviderEnabled(provider: string): boolean {
  * One-time compatibility migration for the old implicit-enable behaviour.
  * Only providers actually referenced by a pre-existing stage model are kept
  * enabled; a new workspace therefore starts with every provider disabled.
+ * Checks both scopes: migrateSettingsScope() may already have lifted this
+ * key to Global before this runs, and re-running would otherwise silently
+ * re-enable providers the user has since disabled.
  */
 export async function migrateEnabledProvidersForExistingModels(): Promise<void> {
   const config = vscode.workspace.getConfiguration(CONFIG_SECTION);
-  if (config.inspect<Record<string, boolean>>(ENABLED_PROVIDERS_KEY)?.workspaceValue !== undefined) {
+  const inspected = config.inspect<Record<string, boolean>>(ENABLED_PROVIDERS_KEY);
+  if (inspected?.workspaceValue !== undefined || inspected?.globalValue !== undefined) {
     return;
   }
   const settings = getModelSettings();
@@ -61,7 +138,7 @@ export async function migrateEnabledProvidersForExistingModels(): Promise<void> 
     }
   }
   if (Object.keys(enabled).length > 0) {
-    await config.update(ENABLED_PROVIDERS_KEY, enabled, vscode.ConfigurationTarget.Workspace);
+    await config.update(ENABLED_PROVIDERS_KEY, enabled, targetFor(ENABLED_PROVIDERS_KEY));
   }
 }
 
@@ -122,27 +199,7 @@ export async function setMetaResourcesPath(path: string): Promise<void> {
   await config.update(
     META_RESOURCES_PATH_KEY,
     path,
-    vscode.ConfigurationTarget.Workspace
-  );
-}
-
-/**
- * Check if the prompt has been dismissed for this workspace
- */
-export function isPromptDismissed(): boolean {
-  const config = vscode.workspace.getConfiguration(CONFIG_SECTION);
-  return config.get<boolean>(PROMPT_DISMISSED_KEY, false);
-}
-
-/**
- * Mark the prompt as dismissed in workspace settings
- */
-export async function dismissPrompt(): Promise<void> {
-  const config = vscode.workspace.getConfiguration(CONFIG_SECTION);
-  await config.update(
-    PROMPT_DISMISSED_KEY,
-    true,
-    vscode.ConfigurationTarget.Workspace
+    targetFor(META_RESOURCES_PATH_KEY)
   );
 }
 
@@ -199,27 +256,7 @@ export async function setAiModelDefault(
   await config.update(
     AI_MODEL_DEFAULTS_KEY,
     current,
-    vscode.ConfigurationTarget.Workspace
-  );
-}
-
-/**
- * Whether the user has already been prompted about per-stage model config.
- */
-export function isModelSelectionPromptShown(): boolean {
-  const config = vscode.workspace.getConfiguration(CONFIG_SECTION);
-  return config.get<boolean>(MODEL_PROMPT_SHOWN_KEY, false);
-}
-
-/**
- * Mark the per-stage model configuration onboarding prompt as shown.
- */
-export async function setModelSelectionPromptShown(): Promise<void> {
-  const config = vscode.workspace.getConfiguration(CONFIG_SECTION);
-  await config.update(
-    MODEL_PROMPT_SHOWN_KEY,
-    true,
-    vscode.ConfigurationTarget.Workspace
+    targetFor(AI_MODEL_DEFAULTS_KEY)
   );
 }
 
@@ -296,6 +333,6 @@ export async function setModelSettings(settings: ModelSettings): Promise<void> {
   await config.update(
     MODEL_SETTINGS_KEY,
     clean,
-    vscode.ConfigurationTarget.Workspace
+    targetFor(MODEL_SETTINGS_KEY)
   );
 }

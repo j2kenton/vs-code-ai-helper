@@ -46,7 +46,7 @@ import { finishFinalization, recoverFinalizationTree } from "./state/finalizatio
 import { PendingOperationsStore } from "./state/pendingOperationsStore";
 import { recoverActivationCheckpoint } from "./state/taskActivationCoordinator";
 import { readTaskProgress } from "./utils/taskProgressUtils";
-import { migrateEnabledProvidersForExistingModels } from "./config/settings";
+import { migrateEnabledProvidersForExistingModels, migrateSettingsScope } from "./config/settings";
 
 /**
  * FileDecorationProvider for the synthetic `current-task:` URI scheme.
@@ -81,9 +81,13 @@ class CurrentTaskDecorationProvider implements vscode.FileDecorationProvider {
  */
 export function activate(context: vscode.ExtensionContext): void {
   console.log("Ensemble is now active!");
-  void migrateEnabledProvidersForExistingModels().catch(error =>
-    console.error("Provider settings migration failed", error)
-  );
+  // Scope migration must resolve before the provider migration, which
+  // inspects enabledProviders' post-migration state to decide whether it
+  // still needs to run.
+  void migrateSettingsScope()
+    .catch(error => console.error("Settings scope migration failed", error))
+    .then(() => migrateEnabledProvidersForExistingModels())
+    .catch(error => console.error("Provider settings migration failed", error));
   void vscode.commands.executeCommand("setContext", "vs-code-ai-helper.tasksInitialized", false);
   // Recover interrupted operations before commands become available. They are
   // retained for reconciliation rather than silently discarded.

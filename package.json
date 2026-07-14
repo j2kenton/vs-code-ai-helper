@@ -585,17 +585,11 @@
           "scope": "resource",
           "description": "Workspace folder path for storing task plans and workflow state. Defaults to .helper/plans."
         },
-        "vs-code-ai-helper.promptDismissed": {
-          "type": "boolean",
-          "default": false,
-          "scope": "resource",
-          "description": "When true, suppresses folder configuration prompts permanently for this workspace"
-        },
         "vs-code-ai-helper.aiModelDefaults": {
           "type": "object",
           "default": {},
-          "scope": "resource",
-          "markdownDescription": "Workspace defaults for AI model IDs by workflow stage. Bare IDs are GitHub Copilot models; prefixed IDs (e.g. `claude-cli:sonnet`, `codex-cli:default`, `gemini-cli:gemini-2.5-pro`, `antigravity-cli:default`, `kiro-cli:default`) run through the vendor's subscription CLI. Configure via **Ensemble: Configure AI Models per Step**.",
+          "scope": "window",
+          "markdownDescription": "Legacy per-stage AI model IDs, superseded by `#vs-code-ai-helper.modelSettings#`. Bare IDs are GitHub Copilot models; prefixed IDs (e.g. `claude-cli:sonnet`, `codex-cli:default`, `gemini-cli:gemini-2.5-pro`, `antigravity-cli:default`, `kiro-cli:default`) run through the vendor's subscription CLI. Configure via **Ensemble: Configure AI Models per Step**.",
           "additionalProperties": {
             "type": "string"
           }
@@ -603,8 +597,8 @@
         "vs-code-ai-helper.modelSettings": {
           "type": "object",
           "default": {},
-          "scope": "resource",
-          "description": "Workspace settings for primary and backup models per stage, along with fallback strategy."
+          "scope": "window",
+          "description": "Primary and backup models per stage, along with fallback strategy. Configure via Ensemble Settings."
         },
         "vs-code-ai-helper.metaFilesHidden": {
           "type": "boolean",
@@ -615,27 +609,27 @@
         "vs-code-ai-helper.enabledProviders": {
           "type": "object",
           "default": {},
-          "scope": "resource",
-          "description": "Provider Selection. Providers are disabled until explicitly enabled for this workspace."
+          "scope": "window",
+          "description": "Provider Selection. Providers are disabled until explicitly enabled."
         },
         "vs-code-ai-helper.fastForwardMaxIterations": {
           "type": "integer",
           "default": 5,
           "minimum": 1,
           "maximum": 99,
-          "scope": "resource",
+          "scope": "window",
           "description": "Maximum fast-forward iterations (1–99)."
         },
         "vs-code-ai-helper.autoAdvanceEnabled": {
           "type": "boolean",
           "default": false,
-          "scope": "resource",
+          "scope": "window",
           "description": "Automatically advance when the configured review score threshold is reached."
         },
         "vs-code-ai-helper.completeAndMoveOnTriggersAI": {
           "type": "boolean",
           "default": true,
-          "scope": "resource",
+          "scope": "window",
           "description": "When completing a stage and moving on, automatically start the AI action for the destination stage."
         },
         "vs-code-ai-helper.autoAdvanceScoreThreshold": {
@@ -643,7 +637,7 @@
           "default": 10,
           "minimum": 1,
           "maximum": 10,
-          "scope": "resource",
+          "scope": "window",
           "description": "Score required for auto-advance (1–10)."
         },
         "vs-code-ai-helper.fastForwardStopLevel": {
@@ -651,51 +645,45 @@
           "default": 0,
           "minimum": 0,
           "maximum": 10,
-          "scope": "resource",
+          "scope": "window",
           "description": "Fast-forward target score. 0 stops after any improvement; 1–10 continues until that score."
         },
         "vs-code-ai-helper.fastForwardUseAcceptanceThreshold": {
           "type": "boolean",
           "default": false,
-          "scope": "resource",
+          "scope": "window",
           "description": "Use the review acceptance threshold instead of the fast-forward stop level."
         },
         "vs-code-ai-helper.autoReviewAfterPlan": {
           "type": "boolean",
           "default": false,
-          "scope": "resource",
+          "scope": "window",
           "description": "Start high-level review after AI drafts a plan."
         },
         "vs-code-ai-helper.autoReviewAfterImplementation": {
           "type": "boolean",
           "default": false,
-          "scope": "resource",
+          "scope": "window",
           "description": "Start high-level review after AI completes initial implementation."
-        },
-        "vs-code-ai-helper.modelSelectionPromptShown": {
-          "type": "boolean",
-          "default": false,
-          "scope": "resource",
-          "description": "Tracks whether first-task model-selection onboarding has already been shown in this workspace"
         },
         "vs-code-ai-helper.maxImplementationIterations": {
           "type": "integer",
           "default": 200,
           "minimum": 1,
           "maximum": 200,
-          "scope": "resource",
+          "scope": "window",
           "description": "Maximum Copilot implementation tool-call rounds (1-200)."
         },
         "vs-code-ai-helper.allowDirtyWorktreeChanges": {
           "type": "boolean",
           "default": false,
-          "scope": "resource",
+          "scope": "window",
           "description": "Automatically proceed with AI implementation/Fast Forward runs even when the workspace has unrelated uncommitted changes, without prompting first."
         },
         "vs-code-ai-helper.desktopNotifications": {
           "type": "boolean",
           "default": false,
-          "scope": "resource",
+          "scope": "window",
           "description": "Show a native OS notification when Ensemble is waiting on you to answer a question or a run fails outright. Off by default."
         }
       }
