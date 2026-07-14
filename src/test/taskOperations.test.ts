@@ -92,7 +92,7 @@ void describe("taskOperations", () => {
     void it("leaves hasAny() as false on success, error, and cancellation", async () => {
       const task = "/dev/task_1";
 
-      const runWithLock = async (fn: () => Promise<void>) => {
+      const runWithLock = async (fn: () => void | Promise<void>): Promise<void> => {
         const op = registry.begin(task, { label: "Work" });
         assert.ok(op);
         try {
@@ -106,14 +106,14 @@ void describe("taskOperations", () => {
       assert.strictEqual(registry.hasAny(), false);
 
       await assert.rejects(
-        runWithLock(async () => {
+        runWithLock(() => {
           throw new Error("fail");
         })
       );
       assert.strictEqual(registry.hasAny(), false);
 
       await assert.rejects(
-        runWithLock(async () => {
+        runWithLock(() => {
           throw new vscode.CancellationError();
         })
       );

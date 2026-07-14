@@ -24,7 +24,7 @@ export interface StatusOperationNode {
   readonly detail?: string;
 }
 
-type StatusTreeNode = StatusEntry | StatusDetailNode | StatusOperationNode;
+export type StatusTreeNode = StatusEntry | StatusDetailNode | StatusOperationNode;
 
 function isDetailNode(node: StatusTreeNode): node is StatusDetailNode {
   return (node as StatusDetailNode).kind === "detail";

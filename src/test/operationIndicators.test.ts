@@ -2,16 +2,27 @@ import * as assert from "node:assert/strict";
 import { describe, it, beforeEach, afterEach } from "node:test";
 import * as vscode from "vscode";
 import { StageNode } from "../views/taskTreeProvider";
-import { StatusTreeProvider, StatusOperationNode } from "../views/statusView";
+import { StatusTreeProvider, StatusTreeNode } from "../views/statusView";
 import { ViewProgressBinder } from "../utils/viewProgressBinder";
-import { taskOperations } from "../utils/taskOperations";
+import { taskOperations, TaskOperationHandle } from "../utils/taskOperations";
 import { IncompleteTask } from "../utils/taskProgressUtils";
+
+interface WithProgressCall {
+  options: unknown;
+  task: () => Promise<void>;
+}
+
+/** vscode.window as exposed by test-stubs/vscode/index.js, with the test-only recorder attached. */
+type TestWindow = typeof vscode.window & { _withProgressCalls: WithProgressCall[] };
+const testWindow = vscode.window as TestWindow;
 
 void describe("operationIndicators", () => {
   beforeEach(() => {
-    const all = taskOperations.getAll();
-    for (const op of all) {
-      taskOperations.end({ id: op.id, key: op.key } as any);
+    for (const op of taskOperations.getAll()) {
+      // getAll() returns readonly snapshots; end() only needs the id/key pair
+      // a real TaskOperationHandle carries, so build a minimal one for cleanup.
+      const handle: TaskOperationHandle = { id: op.id, key: op.key, label: op.label, stage: op.stage, report: () => {} };
+      taskOperations.end(handle);
     }
   });
 
@@ -64,22 +75,22 @@ void describe("operationIndicators", () => {
       assert.ok(op);
 
       try {
-        const children = provider.getChildren() as StatusOperationNode[] | undefined;
+        const children = provider.getChildren() as StatusTreeNode[] | undefined;
         assert.ok(children);
         assert.strictEqual(children.length, 2);
-        assert.ok(children[0]);
-        assert.strictEqual(children[0].kind, "operation");
-        assert.strictEqual(children[0].label, "Running Op");
-        assert.ok(children[1]);
-        assert.strictEqual((children[1] as any).message, "Done action");
+        const [first, second] = children;
+        assert.ok(first && "kind" in first && first.kind === "operation");
+        assert.strictEqual(first.label, "Running Op");
+        assert.ok(second && !("kind" in second));
+        assert.strictEqual(second.message, "Done action");
 
         provider.clear();
 
-        const childrenAfterClear = provider.getChildren() as StatusOperationNode[] | undefined;
+        const childrenAfterClear = provider.getChildren() as StatusTreeNode[] | undefined;
         assert.ok(childrenAfterClear);
         assert.strictEqual(childrenAfterClear.length, 1);
-        assert.ok(childrenAfterClear[0]);
-        assert.strictEqual(childrenAfterClear[0].kind, "operation");
+        const [remaining] = childrenAfterClear;
+        assert.ok(remaining && "kind" in remaining && remaining.kind === "operation");
       } finally {
         taskOperations.end(op);
       }
@@ -90,13 +101,13 @@ void describe("operationIndicators", () => {
     let binder: ViewProgressBinder;
 
     beforeEach(() => {
-      (vscode.window as any)._withProgressCalls = [];
+      testWindow._withProgressCalls = [];
       binder = new ViewProgressBinder(taskOperations);
     });
 
     afterEach(() => {
       binder.dispose();
-      (vscode.window as any)._withProgressCalls = [];
+      testWindow._withProgressCalls = [];
     });
 
     // onDidChange is coalesced through queueMicrotask so a burst of operations
@@ -105,7 +116,7 @@ void describe("operationIndicators", () => {
     const flush = (): Promise<void> => new Promise(resolve => queueMicrotask(resolve));
 
     void it("opens exactly one progress bar per view on first busy, and none for a second concurrent op", async () => {
-      const calls = (vscode.window as any)._withProgressCalls;
+      const calls = testWindow._withProgressCalls;
       assert.strictEqual(calls.length, 0);
 
       const op1 = taskOperations.begin("/dev/task_1", { label: "Op 1" });
@@ -133,7 +144,7 @@ void describe("operationIndicators", () => {
       await flush();
 
       const settled: string[] = [];
-      const bars = ((vscode.window as any)._withProgressCalls as { task: () => Promise<void> }[])
+      const bars = testWindow._withProgressCalls
         .map((call, i) => call.task().then(() => { settled.push(`bar-${i}`); }));
 
       taskOperations.end(op1);
