@@ -13,6 +13,14 @@ The task → plan → implementation → review loop keeps human judgment in the
 
 The Tasks view and status bar show the current task and stage. Every AI action has a manual counterpart, and task artifacts remain ordinary Markdown and JSON files that you can edit, inspect, or use with another tool.
 
+## Screenshots
+
+![Task view with model configuration](images/screenshots/screenshot-1.png)
+
+![AI-generated low-level code review](images/screenshots/screenshot-2.png)
+
+![Provider selection and fast-forward review settings](images/screenshots/screenshot-3.png)
+
 ## Quick start
 
 1. Install from the [Visual Studio Marketplace](https://marketplace.visualstudio.com/items?itemName=j2kenton.vs-code-ai-helper).
