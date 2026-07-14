@@ -106,21 +106,31 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           break;
         }
         case "saveWorkspaceSettings": {
-          // Run the .gitignore change first — it prompts the user for
-          // confirmation with an exact diff — and abort the whole save with
-          // no writes if they decline, rather than silently saving the rest
-          // of the workflow settings while the meta-visibility change is
-          // dropped.
-          const metaChangeApplied = await vscode.commands.executeCommand<boolean>(
-            data.settings.metaFilesHidden
-              ? "vs-code-ai-helper.hideMetaResourcesInGitIgnore"
-              : "vs-code-ai-helper.showMetaResourcesInGitIgnore"
-          );
-          if (metaChangeApplied === false) {
-            void vscode.window.showWarningMessage(
-              "Workflow settings were not saved: the .gitignore update was declined."
+          // Only touch the .gitignore when the checkbox actually changed —
+          // otherwise every workflow-settings save re-runs the hide/show
+          // command, which (since there's nothing to write) skips its own
+          // confirmation prompt but still fires a spurious "meta files are
+          // now hidden/visible" status entry even though nothing changed.
+          const previousMetaFilesHidden = vscode.workspace
+            .getConfiguration("vs-code-ai-helper")
+            .get<boolean>("metaFilesHidden", false);
+          if (data.settings.metaFilesHidden !== previousMetaFilesHidden) {
+            // Run the .gitignore change first — it prompts the user for
+            // confirmation with an exact diff — and abort the whole save with
+            // no writes if they decline, rather than silently saving the rest
+            // of the workflow settings while the meta-visibility change is
+            // dropped.
+            const metaChangeApplied = await vscode.commands.executeCommand<boolean>(
+              data.settings.metaFilesHidden
+                ? "vs-code-ai-helper.hideMetaResourcesInGitIgnore"
+                : "vs-code-ai-helper.showMetaResourcesInGitIgnore"
             );
-            break;
+            if (metaChangeApplied === false) {
+              void vscode.window.showWarningMessage(
+                "Workflow settings were not saved: the .gitignore update was declined."
+              );
+              break;
+            }
           }
 
           const config = vscode.workspace.getConfiguration("vs-code-ai-helper");
