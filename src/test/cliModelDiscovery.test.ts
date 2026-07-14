@@ -42,6 +42,40 @@ void describe("parseAgyModelsOutput", () => {
     ]);
   });
 
+  void it("keeps multi-word display names whole when there is no id column (real `agy models` output)", () => {
+    // `agy models` has no id/slug form at all — each line is the whole
+    // display name, single-spaced, and that whole string is what `agy
+    // --model` expects back verbatim (verified against the real CLI).
+    const parsed = parseAgyModelsOutput(
+      [
+        "Gemini 3.5 Flash (Medium)",
+        "Gemini 3.1 Pro (High)",
+        "Claude Sonnet 4.6 (Thinking)",
+        "GPT-OSS 120B (Medium)",
+      ].join("\n")
+    );
+
+    assert.deepStrictEqual(parsed, [
+      { model: "Gemini 3.5 Flash (Medium)", name: "Gemini 3.5 Flash (Medium)" },
+      { model: "Gemini 3.1 Pro (High)", name: "Gemini 3.1 Pro (High)" },
+      { model: "Claude Sonnet 4.6 (Thinking)", name: "Claude Sonnet 4.6 (Thinking)" },
+      { model: "GPT-OSS 120B (Medium)", name: "GPT-OSS 120B (Medium)" },
+    ]);
+  });
+
+  void it("cannot distinguish a single-space id/description pair from a multi-word name (known limitation)", () => {
+    // Only a 2+-space or tab column separator is treated as tabular; a
+    // single-space "id description" line (no CLI in this codebase emits
+    // that today — Kiro requests --format json and agy has no id column)
+    // is indistinguishable from a multi-word display name and is kept
+    // whole rather than truncated to its first word.
+    const parsed = parseAgyModelsOutput("gpt-oss-120b some fast model");
+
+    assert.deepStrictEqual(parsed, [
+      { model: "gpt-oss-120b some fast model", name: "gpt-oss-120b some fast model" },
+    ]);
+  });
+
   void it("parses JSON arrays and deduplicates repeated entries", () => {
     const parsed = parseAgyModelsOutput(
       JSON.stringify([

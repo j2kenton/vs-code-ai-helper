@@ -623,21 +623,26 @@ const SEEDED_CLI_MODELS: Readonly<
     ...createSeededClaudeCliModels(),
   ],
   "codex-cli": createSeededCodexModels(),
+  // `model` must be the exact string `agy --model` accepts — Antigravity has
+  // no separate slug/id form, its CLI takes the human display name verbatim
+  // (verified live: `agy --model "Gemini 3.5 Flash (Medium)"` works, while a
+  // slug like `gemini-3.5-flash-medium` fails with "invalid --model"). Keep
+  // these in sync with `agy models`' own output — see cliModelDiscovery.ts.
   "antigravity-cli": [
-    { model: "gemini-3.5-flash-medium", name: "Gemini 3.5 Flash (Medium)" },
-    { model: "gemini-3.5-flash-high", name: "Gemini 3.5 Flash (High)" },
-    { model: "gemini-3.5-flash-low", name: "Gemini 3.5 Flash (Low)" },
-    { model: "gemini-3.1-pro-low", name: "Gemini 3.1 Pro (Low)" },
-    { model: "gemini-3.1-pro-high", name: "Gemini 3.1 Pro (High)" },
+    { model: "Gemini 3.5 Flash (Medium)", name: "Gemini 3.5 Flash (Medium)" },
+    { model: "Gemini 3.5 Flash (High)", name: "Gemini 3.5 Flash (High)" },
+    { model: "Gemini 3.5 Flash (Low)", name: "Gemini 3.5 Flash (Low)" },
+    { model: "Gemini 3.1 Pro (Low)", name: "Gemini 3.1 Pro (Low)" },
+    { model: "Gemini 3.1 Pro (High)", name: "Gemini 3.1 Pro (High)" },
     {
-      model: "claude-sonnet-4.6-thinking",
+      model: "Claude Sonnet 4.6 (Thinking)",
       name: "Claude Sonnet 4.6 (Thinking)",
     },
     {
-      model: "claude-opus-4.6-thinking",
+      model: "Claude Opus 4.6 (Thinking)",
       name: "Claude Opus 4.6 (Thinking)",
     },
-    { model: "gpt-oss-120b-medium", name: "GPT-OSS 120B (Medium)" },
+    { model: "GPT-OSS 120B (Medium)", name: "GPT-OSS 120B (Medium)" },
   ],
   "kiro-cli": [
     { model: "claude-sonnet-4.5", name: "Claude Sonnet 4.5" },

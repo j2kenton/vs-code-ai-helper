@@ -12,7 +12,7 @@ import {
 } from "../types/agentRunner";
 import { withAttribution, writeTextFile } from "../utils/fileUtils";
 import { ImplementationRunResult } from "./copilotImplementationRunner";
-import { CliProviderDefinition, CliRunMode } from "./providers";
+import { cliDisplayLabel, CliProviderDefinition, CliRunMode } from "./providers";
 import { classifyCliFailure } from "../utils/quota";
 import {
   IMPLEMENTATION_FILENAME,
@@ -319,6 +319,27 @@ export const __testOnly = {
 };
 
 /**
+ * Trim CLI output to a manageable size for a user-facing error without
+ * losing the lead explanation line. A pure tail slice can hide the actual
+ * "Error: ..." message when a CLI appends a long fixed-size list after it
+ * (e.g. Antigravity's "invalid --model" error is followed by its full
+ * "Available models:" list) — the real reason gets pushed out of the
+ * window and only the trailing list survives. Keeping the first line plus
+ * the tail preserves that lead message while still bounding output size,
+ * and costs nothing for CLIs whose meaningful message is on the last line
+ * instead (e.g. a Python-style traceback), since the tail is kept either way.
+ */
+function truncateCliDetail(text: string, maxLines = 8): string {
+  const lines = text.trim().split(/\r?\n/);
+  if (lines.length <= maxLines) {
+    return lines.join("\n").trim();
+  }
+  const head = lines[0]!;
+  const tail = lines.slice(-(maxLines - 1));
+  return (tail.includes(head) ? tail : [head, ...tail]).join("\n").trim();
+}
+
+/**
  * Convert raw CLI failure output into a user-facing error, surfacing the
  * provider's login hint when the output looks like an auth problem.
  */
@@ -333,11 +354,11 @@ function toFriendlyError(
     combined.includes(marker)
   );
   const detail =
-    stderr.trim().split(/\r?\n/).slice(-8).join("\n").trim() ||
-    stdout.trim().split(/\r?\n/).slice(-8).join("\n").trim() ||
+    truncateCliDetail(stderr) ||
+    truncateCliDetail(stdout) ||
     `exit code ${exitCode ?? "unknown"}`;
   const authSuffix = looksLikeAuth ? ` ${def.loginHint}` : "";
-  return `${def.label} CLI failed: ${detail}${authSuffix}`;
+  return `${cliDisplayLabel(def)} CLI failed: ${detail}${authSuffix}`;
 }
 
 /**
@@ -447,7 +468,7 @@ export async function execCliAgent(options: {
     return classifyCliFailure({
       status: "failed",
       output: "",
-      errorMessage: `Could not start the ${def.label} CLI (${def.command}): command not found. ${def.installHint}`,
+      errorMessage: `Could not start the ${cliDisplayLabel(def)} CLI (${def.command}): command not found. ${def.installHint}`,
     });
   }
 
@@ -489,7 +510,7 @@ export async function execCliAgent(options: {
       resolve(classifyCliFailure({
         status: "failed",
         output: "",
-        errorMessage: `Could not start the ${def.label} CLI (${resolvedCommand}): ${message}.${argvHint} ${def.installHint}`.trim(),
+        errorMessage: `Could not start the ${cliDisplayLabel(def)} CLI (${resolvedCommand}): ${message}.${argvHint} ${def.installHint}`.trim(),
       }));
       return;
     }
@@ -517,7 +538,7 @@ export async function execCliAgent(options: {
       finish(classifyCliFailure({
         status: "failed",
         output: stdout,
-        errorMessage: `${def.label} CLI timed out after ${
+        errorMessage: `${cliDisplayLabel(def)} CLI timed out after ${
           RUN_TIMEOUT_MS / 60000
         } minutes.`,
       }));
@@ -533,7 +554,7 @@ export async function execCliAgent(options: {
       finish(classifyCliFailure({
         status: "failed",
         output: "",
-        errorMessage: `Could not start the ${def.label} CLI (${resolvedCommand}): ${error.message}. ${def.installHint}`,
+        errorMessage: `Could not start the ${cliDisplayLabel(def)} CLI (${resolvedCommand}): ${error.message}. ${def.installHint}`,
       }));
     });
 
@@ -570,8 +591,8 @@ export async function execCliAgent(options: {
         finish(classifyCliFailure({
           status: "failed",
           output,
-          errorMessage: `${def.label} CLI produced no output. ${
-            stderr.trim().split(/\r?\n/).slice(-4).join("\n") || ""
+          errorMessage: `${cliDisplayLabel(def)} CLI produced no output. ${
+            truncateCliDetail(stderr, 4)
           }`.trim(),
         }));
         return;
@@ -619,7 +640,7 @@ export class CliAgentRunner implements AgentRunner {
     if (!exists) {
       return {
         available: false,
-        reason: `The ${this.def.label} CLI (${this.def.command}) is not installed. ${this.def.installHint}`,
+        reason: `The ${cliDisplayLabel(this.def)} CLI (${this.def.command}) is not installed. ${this.def.installHint}`,
       };
     }
     return { available: true };

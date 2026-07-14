@@ -16,6 +16,7 @@ import {
   runImplementationWithCli,
 } from "./cliAgentRunner";
 import {
+  cliDisplayLabel,
   CliProviderDefinition,
   getCliProvider,
   parseModelSelection,
@@ -240,7 +241,7 @@ export async function checkImplementationAvailabilityForModel(
       ? { available: true }
       : {
           available: false,
-          reason: `The ${def.label} CLI (${def.command}) is not installed. ${def.installHint}`,
+          reason: `The ${cliDisplayLabel(def)} CLI (${def.command}) is not installed. ${def.installHint}`,
         },
     providerLabel: def.label,
   };

@@ -98,20 +98,24 @@ function parseModelListOutput(output: string): DiscoveredCliModel[] {
     }
 
     const bulletStripped = line.replace(/^[*•-]\s*/, "");
+    // A genuine tabular layout (id column, description trailing) separates
+    // columns with 2+ spaces or a tab; a run of single spaces just means the
+    // entry itself is a multi-word name — e.g. Antigravity's `agy models`
+    // prints whole display names like "Gemini 3.5 Flash (Medium)" with no id
+    // column at all. Only split into columns when that stronger separator is
+    // actually present, otherwise keep the whole line — splitting on any
+    // whitespace here would truncate such a name down to just "Gemini".
     const columnSplit = bulletStripped.split(/\s{2,}|\t+/).filter(Boolean);
-    const candidateSource = columnSplit[0] ?? bulletStripped;
-    const token = candidateSource.trim().split(/\s+/)[0]?.trim();
-    if (
-      token &&
-      /^(model|models|id|name)$/i.test(token) &&
-      (columnSplit.length > 1 || /\s+/.test(bulletStripped))
-    ) {
+    const candidate = (
+      columnSplit.length > 1 ? columnSplit[0]! : bulletStripped
+    ).trim();
+    if (/^(model|models|id|name)$/i.test(candidate)) {
       continue;
     }
-    if (!token || !/^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(token)) {
+    if (!candidate || !/^[A-Za-z0-9][A-Za-z0-9 ._:()/-]*$/.test(candidate)) {
       continue;
     }
-    result.push({ model: token, name: token });
+    result.push({ model: candidate, name: candidate });
   }
 
   return uniqueByModel(result);

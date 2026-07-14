@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import { AI_MODEL_STAGES, TaskStage } from "../types/taskProgress";
 import { FallbackStrategy, ModelSettings } from "../utils/modelFallback";
-import { parseModelSelection } from "../runners/providers";
+import { normalizeQualifiedModelId, parseModelSelection } from "../runners/providers";
 
 const CONFIG_SECTION = "vs-code-ai-helper";
 const META_RESOURCES_PATH_KEY = "metaResourcesPath";
@@ -159,7 +159,7 @@ export function getAiModelDefaults(): Partial<Record<TaskStage, string>> {
   for (const stage of AI_MODEL_STAGES) {
     const value = raw[stage];
     if (typeof value === "string" && value.trim().length > 0) {
-      defaults[stage] = value;
+      defaults[stage] = normalizeQualifiedModelId(value);
     }
   }
 
@@ -233,9 +233,23 @@ export function getModelSettings(): ModelSettings {
     const value = raw[stage];
     if (!value || typeof value !== "object") continue;
     const entry = value as Record<string, unknown>;
-    const primary = typeof entry.primary === "string" && entry.primary.trim() ? entry.primary : undefined;
-    const backup = typeof entry.backup === "string" && entry.backup.trim() ? entry.backup : undefined;
-    const backups = Array.isArray(entry.backups) ? [...new Set(entry.backups.filter((v): v is string => typeof v === "string" && v.trim().length > 0).map(v => v.trim()))] : undefined;
+    // Normalize through legacyModelAliases so a stage's selection matches
+    // the same model everywhere: the execution path already applies the
+    // alias inside parseModelSelection, but callers that match a stored ID
+    // against getAvailableModels() by exact string (the settings webview)
+    // would otherwise still see the old, no-longer-listed ID.
+    const primary = typeof entry.primary === "string" && entry.primary.trim() ? normalizeQualifiedModelId(entry.primary) : undefined;
+    const backup = typeof entry.backup === "string" && entry.backup.trim() ? normalizeQualifiedModelId(entry.backup) : undefined;
+    const backups = Array.isArray(entry.backups)
+      ? [
+          ...new Set(
+            entry.backups
+              .filter((v): v is string => typeof v === "string" && v.trim().length > 0)
+              .map((v) => normalizeQualifiedModelId(v.trim()))
+              .filter((v): v is string => v !== undefined)
+          ),
+        ]
+      : undefined;
     let strategy: FallbackStrategy = entry.strategy === "switch-to-backup" || entry.strategy === "pause-and-resume" || entry.strategy === "alert-and-wait"
       ? entry.strategy : "alert-and-wait";
     // Back-compat: the old UI could save strategy: "switch-to-backup" with

@@ -8,7 +8,7 @@ import {
 import { getModelSettings, setModelSettings } from "../config/settings";
 import { ModelSettings } from "../utils/modelFallback";
 import { getQuotaStatusText } from "../utils/quota";
-import { CLI_PROVIDERS } from "../runners/providers";
+import { cliDisplayLabel, CLI_PROVIDERS } from "../runners/providers";
 import { testCliProviderSetup } from "../runners/cliAgentRunner";
 
 type IncomingMessage =
@@ -165,10 +165,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             providerId: provider.id,
             available: status.installed && status.authenticated === true,
             message: !status.installed
-              ? `${provider.label} CLI was not found. ${provider.installHint}`
+              ? `${cliDisplayLabel(provider)} CLI was not found. ${provider.installHint}`
               : status.authenticated === false
-                ? `${provider.label} CLI is installed but not authenticated. ${provider.loginHint}`
-                : `${provider.label} CLI is installed. Authentication cannot be checked without sending a model request.`,
+                ? `${cliDisplayLabel(provider)} CLI is installed but not authenticated. ${provider.loginHint}`
+                : `${cliDisplayLabel(provider)} CLI is installed. Authentication cannot be checked without sending a model request.`,
           });
           break;
         }

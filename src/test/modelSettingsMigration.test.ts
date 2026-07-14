@@ -82,3 +82,51 @@ void describe("getModelSettings — legacy fallbackEnabled migration", () => {
     }
   });
 });
+
+// Regression coverage for a Codex review finding: Antigravity's stored model
+// ID format changed from kebab-case slugs to the CLI's own display-name
+// strings. parseModelSelection aliases the old slugs at the execution-path
+// read site, but getModelSettings feeds the settings webview too, which
+// matches a stage's stored ID against getAvailableModels() by exact string —
+// without normalizing here as well, a previously-saved slug would run fine
+// but render as "Unknown model" and reset to default on the next save.
+void describe("getModelSettings — Antigravity legacy model ID migration", () => {
+  void it("rewrites a legacy Antigravity slug in primary/backup/backups to its current display-name ID", () => {
+    const settings = installModelSettings({
+      impl: {
+        primary: "antigravity-cli:gpt-oss-120b-medium",
+        backup: "antigravity-cli:gemini-3.1-pro-high",
+        backups: ["antigravity-cli:gemini-3.1-pro-high", "antigravity-cli:claude-opus-4.6-thinking"],
+        strategy: "switch-to-backup",
+      },
+    });
+    try {
+      const result = getModelSettings();
+      assert.strictEqual(result.impl?.primary, "antigravity-cli:GPT-OSS 120B (Medium)");
+      assert.strictEqual(result.impl?.backup, "antigravity-cli:Gemini 3.1 Pro (High)");
+      assert.deepStrictEqual(result.impl?.backups, [
+        "antigravity-cli:Gemini 3.1 Pro (High)",
+        "antigravity-cli:Claude Opus 4.6 (Thinking)",
+      ]);
+    } finally {
+      settings.restore();
+    }
+  });
+
+  void it("leaves current-format IDs and other providers' IDs unchanged", () => {
+    const settings = installModelSettings({
+      impl: {
+        primary: "antigravity-cli:Gemini 3.5 Flash (Medium)",
+        backup: "claude-cli:sonnet@high",
+        strategy: "switch-to-backup",
+      },
+    });
+    try {
+      const result = getModelSettings();
+      assert.strictEqual(result.impl?.primary, "antigravity-cli:Gemini 3.5 Flash (Medium)");
+      assert.strictEqual(result.impl?.backup, "claude-cli:sonnet@high");
+    } finally {
+      settings.restore();
+    }
+  });
+});

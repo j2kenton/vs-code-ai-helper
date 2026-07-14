@@ -187,9 +187,20 @@ void describe("provider CLI contracts", () => {
         expectedModelArg: "gemini-2.5-pro",
       },
       {
+        // Legacy slug from before Antigravity's storage format switched to
+        // the CLI's own display-name strings — must still resolve to a
+        // model `agy --model` actually accepts, via legacyModelAliases.
         storedId: "antigravity-cli:gpt-oss-120b-medium",
         expectedProvider: "antigravity-cli",
-        expectedModelArg: "gpt-oss-120b-medium",
+        expectedModelArg: "GPT-OSS 120B (Medium)",
+      },
+      {
+        // Current format: the model portion is agy's verbatim display name
+        // (spaces and parens included) and must survive buildArgs as a
+        // single --model argument, not be split on whitespace.
+        storedId: "antigravity-cli:Gemini 3.5 Flash (Medium)",
+        expectedProvider: "antigravity-cli",
+        expectedModelArg: "Gemini 3.5 Flash (Medium)",
       },
       {
         storedId: "kiro-cli:claude-opus-4.6",

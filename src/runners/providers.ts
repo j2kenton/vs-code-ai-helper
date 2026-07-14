@@ -93,6 +93,13 @@ export interface CliProviderDefinition {
    */
   discoverModels?: (command: string) => Promise<readonly DiscoveredCliModel[]>;
   /**
+   * Maps a model ID this provider used to store (e.g. a slug from before its
+   * storage format changed) to the current native model value. Applied by
+   * parseModelSelection so a selection saved under the old format keeps
+   * working instead of being passed to the CLI verbatim and rejected.
+   */
+  legacyModelAliases?: Readonly<Record<string, string>>;
+  /**
    * Build the CLI arguments. "text" mode must keep the
    * CLI read-only; "edit" mode may let it modify files in the working
    * directory (but not run arbitrary commands unapproved).
@@ -367,6 +374,21 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     // when available.
     models: [{ model: undefined, name: "Antigravity (CLI default)" }],
     discoverModels: discoverAgyModels,
+    // Model IDs used to be kebab-case slugs (e.g. "gemini-3.5-flash-medium")
+    // before we learned `agy --model` only accepts its own display string
+    // verbatim (see SEEDED_CLI_MODELS in modelSelection.ts). A selection
+    // saved under the old slug would otherwise still be passed to `agy`
+    // as-is and rejected with "invalid --model".
+    legacyModelAliases: {
+      "gemini-3.5-flash-medium": "Gemini 3.5 Flash (Medium)",
+      "gemini-3.5-flash-high": "Gemini 3.5 Flash (High)",
+      "gemini-3.5-flash-low": "Gemini 3.5 Flash (Low)",
+      "gemini-3.1-pro-low": "Gemini 3.1 Pro (Low)",
+      "gemini-3.1-pro-high": "Gemini 3.1 Pro (High)",
+      "claude-sonnet-4.6-thinking": "Claude Sonnet 4.6 (Thinking)",
+      "claude-opus-4.6-thinking": "Claude Opus 4.6 (Thinking)",
+      "gpt-oss-120b-medium": "GPT-OSS 120B (Medium)",
+    },
     usesLastMessageFile: false,
     // `agy --print` takes the prompt as its flag value, not stdin — the CLI
     // has no stdin-prompt mode at all: a bare `--print` with the prompt
@@ -433,6 +455,17 @@ export function getCliProvider(
   return CLI_PROVIDERS.find((provider) => provider.id === id);
 }
 
+/**
+ * A provider's label for splicing into messages that themselves append
+ * " CLI" (e.g. "... CLI failed", "Could not start the ... CLI"). Some
+ * labels already end in "CLI" (Gemini CLI, Antigravity CLI, Kiro CLI) and
+ * would otherwise double up into "Gemini CLI CLI failed"; others (Claude
+ * Code, OpenAI Codex) don't and are returned unchanged.
+ */
+export function cliDisplayLabel(def: CliProviderDefinition): string {
+  return def.label.replace(/\s+CLI$/i, "");
+}
+
 export interface ParsedModelSelection {
   provider: ProviderId;
   /** Provider-native model name; undefined means the provider's default. */
@@ -457,11 +490,13 @@ export function parseModelSelection(
     if (prefix === "copilot") {
       return { provider: "copilot", model: rest || undefined };
     }
-    if (getCliProvider(prefix)) {
-      return {
-        provider: prefix as CliProviderId,
-        model: rest === "default" || rest === "" ? undefined : rest,
-      };
+    const cliDef = getCliProvider(prefix);
+    if (cliDef) {
+      const model =
+        rest === "default" || rest === ""
+          ? undefined
+          : (cliDef.legacyModelAliases?.[rest] ?? rest);
+      return { provider: prefix as CliProviderId, model };
     }
   }
   return { provider: "copilot", model: modelId };
@@ -473,4 +508,28 @@ export function toQualifiedModelId(
   model: string | undefined
 ): string {
   return `${provider}:${model ?? "default"}`;
+}
+
+/**
+ * Rewrite a stored qualified model ID to its current canonical form,
+ * resolving legacyModelAliases so every consumer agrees on the same ID for
+ * the same model — not just the execution path (which already applies the
+ * alias inside parseModelSelection), but also callers like the settings
+ * webview that match a stored ID against getAvailableModels() by exact
+ * string. Without this, a selection saved under a provider's old ID format
+ * still runs correctly but shows as "Unknown model" and resets to default
+ * the next time settings are saved. Copilot/bare IDs have no alias table
+ * and are returned unchanged.
+ */
+export function normalizeQualifiedModelId(
+  modelId: string | undefined
+): string | undefined {
+  if (!modelId) {
+    return modelId;
+  }
+  const parsed = parseModelSelection(modelId);
+  if (parsed.provider === "copilot") {
+    return modelId;
+  }
+  return toQualifiedModelId(parsed.provider, parsed.model);
 }
