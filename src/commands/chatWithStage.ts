@@ -10,6 +10,7 @@ import { ensureAiConsent } from "../utils/aiConsent";
 import { checkAndConfirmPromptSize } from "../utils/promptSizeGuard";
 import { ChatViewProvider } from "../views/chatView";
 import { NotificationRouter } from "../utils/notificationRouter";
+import { notifyDesktop } from "../utils/desktopNotifier";
 
 type ChatWithStageArg =
   | { task?: IncompleteTask; stage?: TaskStage; message?: string }
@@ -112,7 +113,9 @@ export async function chatWithStage(
   } catch (error) {
     const text = error instanceof Error ? error.message : String(error);
     await chatViewProvider.append("assistant", `Unable to respond: ${text}`, targetStage, task.canonicalId);
-    NotificationRouter.showError(`Stage response failed: ${text}`);
+    const failureMessage = `Stage response failed: ${text}`;
+    NotificationRouter.showError(failureMessage);
+    notifyDesktop("Ensemble — error", failureMessage);
   }
 }
 

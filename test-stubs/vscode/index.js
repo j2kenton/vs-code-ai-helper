@@ -314,6 +314,10 @@ const window = {
   showTextDocument: async (document) => ({ document, viewColumn: undefined }),
   createTreeView: (id, options) => new TreeView(id, options),
   registerFileDecorationProvider: (provider) => ({ provider, dispose() { } }),
+  // Real VS Code always has a WindowState; default to focused so tests that
+  // don't care about desktop-notification focus-gating aren't surprised by
+  // a suppressed call. Tests exercising that gating flip this directly.
+  state: { focused: true },
 };
 
 window._queueQuickPickResult = (result) => { quickPickResults.push(result); };
@@ -344,6 +348,13 @@ const lm = {
   selectChatModels: async () => [],
 };
 
+// remoteName is undefined for a local window; Remote-SSH/WSL/Codespaces set
+// it to e.g. "ssh-remote". Tests that care override it directly.
+const env = {
+  remoteName: undefined,
+  sessionId: "test-session",
+};
+
 module.exports = {
   Uri,
   FileType,
@@ -371,5 +382,6 @@ module.exports = {
   window,
   commands,
   lm,
+  env,
   TreeView,
 };

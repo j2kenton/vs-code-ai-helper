@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import * as crypto from "crypto";
 import { TaskStage } from "../types/taskProgress";
+import { notifyDesktop } from "../utils/desktopNotifier";
 
 export interface ChatMessage {
   role: "user" | "assistant" | "question";
@@ -69,6 +70,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   async ask(question: StageChatQuestion): Promise<void> {
     await this.open(question);
     await this.append("question", question.question, question.stage, question.canonicalId, true);
+    notifyDesktop("Ensemble — question", question.question);
   }
 
   async append(

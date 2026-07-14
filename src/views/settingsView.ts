@@ -32,6 +32,7 @@ interface WorkspaceSettings {
   autoReviewAfterPlan: boolean;
   autoReviewAfterImplementation: boolean;
   allowDirtyWorktreeChanges: boolean;
+  desktopNotifications: boolean;
 }
 
 export class SettingsViewProvider implements vscode.WebviewViewProvider {
@@ -243,6 +244,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       autoReviewAfterPlan: config.get<boolean>("autoReviewAfterPlan", false),
       autoReviewAfterImplementation: config.get<boolean>("autoReviewAfterImplementation", false),
       allowDirtyWorktreeChanges: config.get<boolean>("allowDirtyWorktreeChanges", false),
+      desktopNotifications: config.get<boolean>("desktopNotifications", false),
     };
   }
 
@@ -875,7 +877,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               '<label><input id="auto-review-implementation" type="checkbox" ' + checked(workspaceSettings.autoReviewAfterImplementation) + '> Start review after AI completes implementation</label></fieldset>' +
               '<fieldset style="margin-top:12px"><legend>Uncommitted changes</legend>' +
               '<label><input id="allow-dirty-worktree" type="checkbox" ' + checked(workspaceSettings.allowDirtyWorktreeChanges) + '> Always proceed with implementation/Fast Forward runs even when the workspace has unrelated uncommitted changes</label>' +
-              '<p style="margin:6px 0 0;font-size:0.9em">When off, you will be warned and asked to confirm before an AI run edits files while unrelated changes are uncommitted.</p></fieldset>';
+              '<p style="margin:6px 0 0;font-size:0.9em">When off, you will be warned and asked to confirm before an AI run edits files while unrelated changes are uncommitted.</p></fieldset>' +
+              '<fieldset style="margin-top:12px"><legend>Desktop notifications</legend>' +
+              '<label><input id="desktop-notifications" type="checkbox" ' + checked(workspaceSettings.desktopNotifications) + '> Show a native OS notification when Ensemble needs your attention</label>' +
+              '<p style="margin:6px 0 0;font-size:0.9em">Covers questions Ensemble is waiting on you to answer, and runs that fail outright. Off by default.</p></fieldset>';
             const acceptance = document.getElementById('fast-forward-acceptance');
             const target = document.getElementById('fast-forward-stop');
             function syncAcceptance() { target.disabled = acceptance.checked; }
@@ -969,7 +974,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               autoAdvanceScoreThreshold: clamp('auto-advance-score', 1, 10, 10),
               autoReviewAfterPlan: document.getElementById('auto-review-plan').checked,
               autoReviewAfterImplementation: document.getElementById('auto-review-implementation').checked,
-              allowDirtyWorktreeChanges: document.getElementById('allow-dirty-worktree').checked
+              allowDirtyWorktreeChanges: document.getElementById('allow-dirty-worktree').checked,
+              desktopNotifications: document.getElementById('desktop-notifications').checked
             }});
           });
         </script>

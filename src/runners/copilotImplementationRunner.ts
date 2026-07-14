@@ -15,6 +15,7 @@ import {
 } from "../types/taskProgress";
 import { looksLikeGeneratedImplementationSummary } from "../utils/implementationArtifactResolver";
 import { getMaxImplementationIterations } from "../config/settings";
+import { notifyDesktop } from "../utils/desktopNotifier";
 
 /**
  * Reserved artifact filenames the implementation stage writes inside a task
@@ -574,6 +575,7 @@ export async function runImplementationWithCopilot(options: {
         errorMessage: `Reached the configured maximum of ${maxIterations} tool-call rounds without finishing. The implementation may be incomplete.`,
       });
     }
+    notifyDesktop("Ensemble — question", `The implementation reached its ${maxIterations}-round limit. Continue working?`);
     const choice = await vscode.window.showWarningMessage(
       `The implementation reached its ${maxIterations}-round limit. Continue working?`,
       "Continue", "Cancel"

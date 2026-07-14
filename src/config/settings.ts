@@ -25,6 +25,7 @@ const FAST_FORWARD_USE_ACCEPTANCE_KEY = "fastForwardUseAcceptanceThreshold";
 const AUTO_REVIEW_AFTER_PLAN_KEY = "autoReviewAfterPlan";
 const AUTO_REVIEW_AFTER_IMPLEMENTATION_KEY = "autoReviewAfterImplementation";
 const ALLOW_DIRTY_WORKTREE_CHANGES_KEY = "allowDirtyWorktreeChanges";
+const DESKTOP_NOTIFICATIONS_KEY = "desktopNotifications";
 
 export function areMetaFilesHidden(): boolean {
   return vscode.workspace.getConfiguration(CONFIG_SECTION).get<boolean>(META_FILES_HIDDEN_KEY, false);
@@ -98,6 +99,11 @@ export function shouldAutoReviewAfterImplementation(): boolean {
 /** Whether implementation/Fast Forward runs may proceed without prompting when the workspace has unrelated uncommitted changes. */
 export function allowsDirtyWorktreeChanges(): boolean {
   return vscode.workspace.getConfiguration(CONFIG_SECTION).get<boolean>(ALLOW_DIRTY_WORKTREE_CHANGES_KEY, false);
+}
+
+/** Whether native OS notifications fire for things that need attention (questions, warnings, errors). Off by default. */
+export function isDesktopNotificationsEnabled(): boolean {
+  return vscode.workspace.getConfiguration(CONFIG_SECTION).get<boolean>(DESKTOP_NOTIFICATIONS_KEY, false);
 }
 
 /**

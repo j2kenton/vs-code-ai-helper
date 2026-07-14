@@ -691,6 +691,12 @@
           "default": false,
           "scope": "resource",
           "description": "Automatically proceed with AI implementation/Fast Forward runs even when the workspace has unrelated uncommitted changes, without prompting first."
+        },
+        "vs-code-ai-helper.desktopNotifications": {
+          "type": "boolean",
+          "default": false,
+          "scope": "resource",
+          "description": "Show a native OS notification when Ensemble is waiting on you to answer a question or a run fails outright. Off by default."
         }
       }
     }
