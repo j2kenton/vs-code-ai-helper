@@ -729,8 +729,15 @@ async function runAiToFile(options: {
           }
           completed = true;
           if (options.promoteOutput !== false) {
-            const doc = await vscode.workspace.openTextDocument(options.outputFileUri);
-            await vscode.window.showTextDocument(doc);
+            try {
+              const doc = await vscode.workspace.openTextDocument(options.outputFileUri);
+              await vscode.window.showTextDocument(doc);
+            } catch (error) {
+              const message = error instanceof Error ? error.message : String(error);
+              NotificationRouter.showWarning(
+                `${options.outputLabel} was generated, but could not be opened automatically: ${message}`
+              );
+            }
           }
           NotificationRouter.showInformation(
             `${options.outputLabel} generated with ${providerLabel} (${
@@ -1068,6 +1075,21 @@ function validateReviewOutput(content: string): { valid: boolean; reason: string
   return { valid: true, reason: "" };
 }
 
+async function markReviewArtifactStale(
+  reviewUri: vscode.Uri,
+  changedArtifact: string
+): Promise<void> {
+  const staleNotice = [
+    "# Review Stale",
+    "",
+    `This review was generated before ${changedArtifact} was updated.`,
+    "",
+    "Run Review with AI again to evaluate the current artifact.",
+    "",
+  ].join("\n");
+  await writeTextFile(reviewUri, staleNotice);
+}
+
 /**
  * Run (or re-run) the review for the task's current position in the
  * workflow. Labeled "Review" in the UI.
@@ -1299,6 +1321,9 @@ export async function applyReviewWithAI(
     });
 
     if (applySucceeded) {
+      if (reviewUri) {
+        await markReviewArtifactStale(reviewUri, PLAN_FILENAME);
+      }
       // Re-review after applying (no confirmation, no stage change)
       await runReviewForFolder(
         extensionUri,
