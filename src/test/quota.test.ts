@@ -8,6 +8,10 @@ void describe("isQuotaError", () => {
     assert.strictEqual(isQuotaError("Rate limit exceeded, please retry later"), true);
     assert.strictEqual(isQuotaError("Your usage limit has been reached"), true);
     assert.strictEqual(isQuotaError("Insufficient credits for this request"), true);
+    assert.strictEqual(
+      isQuotaError("Claude Code CLI failed: You've hit your session limit · resets 2:30am (Asia/Jerusalem)."),
+      true
+    );
   });
 
   void it("does not classify unrelated 'exceeded' errors as quota errors", () => {

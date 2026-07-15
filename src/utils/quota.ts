@@ -14,11 +14,11 @@ export interface PendingResumeOperation {
 
 const KEY = "pendingQuotaResume";
 // Deliberately excludes a bare "exceeded" marker: real quota phrasing
-// already matches via "quota"/"rate limit"/"usage limit" (e.g. "exceeded
+// already matches via "quota"/"rate limit"/"usage limit"/"session limit" (e.g. "exceeded
 // your current quota" matches on "quota" alone), while "exceeded" alone
 // would false-positive on unrelated errors like "context length exceeded"
 // or an argv-size cap message.
-const QUOTA_MARKERS = ["quota", "rate limit", "ratelimit", "credits", "credit limit", "usage limit"];
+const QUOTA_MARKERS = ["quota", "rate limit", "ratelimit", "credits", "credit limit", "usage limit", "session limit"];
 const TEMPORARY_MARKERS = ["temporarily unavailable", "service unavailable", "too many requests", "try again later"];
 
 export function isQuotaError(message: string | undefined): boolean {

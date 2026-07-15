@@ -166,11 +166,11 @@ void describe("CLI output normalization", () => {
       models: [{ model: undefined, name: "default" }],
       usesLastMessageFile: false,
       buildArgs(): string[] {
-        // Exits non-zero with quota-flavored stderr, simulating a real
-        // provider CLI reporting exhausted credits.
+        // Exits non-zero with quota-flavored stderr, simulating Claude Code
+        // reporting an exhausted session allocation.
         return [
           "-e",
-          "process.stderr.write('Error: rate limit exceeded, please retry later'); process.exit(1);",
+          "process.stderr.write('Claude Code CLI failed: You\\'ve hit your session limit · resets 2:30am (Asia/Jerusalem).'); process.exit(1);",
         ];
       },
     };
