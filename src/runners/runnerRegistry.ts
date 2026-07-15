@@ -83,6 +83,14 @@ export interface ResolvedRunner {
   nativeModelId: string | undefined;
 }
 
+export interface RunnerAvailability {
+  availability: AgentAvailability;
+  providerLabel: string;
+  provider: ProviderId;
+  modelId: string | undefined;
+  nativeModelId: string | undefined;
+}
+
 function toResolvedRunner(effective: EffectiveProvider): ResolvedRunner {
   if (effective.kind === "cli") {
     return {
@@ -98,6 +106,80 @@ function toResolvedRunner(effective: EffectiveProvider): ResolvedRunner {
     providerLabel: "Copilot",
     nativeModelId: effective.model,
   };
+}
+
+function backupModelsForStage(
+  stage: TaskStage | undefined,
+  modelId: string | undefined
+): string[] {
+  if (!stage) {
+    return [];
+  }
+  const setting = getModelSettings()[stage];
+  if (setting?.strategy !== "switch-to-backup") {
+    return [];
+  }
+  return getBackupModels(setting).filter(candidate => candidate !== modelId);
+}
+
+export async function checkRunnerAvailabilityForModel(
+  modelId: string | undefined,
+  stage?: TaskStage
+): Promise<RunnerAvailability> {
+  const resolved = toResolvedRunner(resolveEffectiveProvider(modelId));
+  const primaryAvailability = await resolved.runner.isAvailable();
+  const primary: RunnerAvailability = {
+    availability: primaryAvailability,
+    providerLabel: resolved.providerLabel,
+    provider: resolved.provider,
+    modelId,
+    nativeModelId: resolved.nativeModelId,
+  };
+
+  if (
+    primaryAvailability.available ||
+    isAuthenticationFailure(primaryAvailability.reason)
+  ) {
+    return primary;
+  }
+
+  for (const backupModel of backupModelsForStage(stage, modelId)) {
+    const fallback = toResolvedRunner(resolveEffectiveProvider(backupModel));
+    const fallbackAvailability = await fallback.runner.isAvailable();
+    const candidate: RunnerAvailability = {
+      availability: fallbackAvailability,
+      providerLabel: fallback.providerLabel,
+      provider: fallback.provider,
+      modelId: backupModel,
+      nativeModelId: fallback.nativeModelId,
+    };
+    if (
+      fallbackAvailability.available ||
+      isAuthenticationFailure(fallbackAvailability.reason)
+    ) {
+      return candidate;
+    }
+  }
+
+  return primary;
+}
+
+async function recordActiveFallbackModel(
+  taskFolderUri: vscode.Uri,
+  stage: TaskStage,
+  modelId: string
+): Promise<void> {
+  await patchTaskProgress(taskFolderUri, (current) => ({
+    ...current,
+    fallbackActive: {
+      ...current.fallbackActive,
+      [stage]: true,
+    },
+    fallbackModelId: {
+      ...current.fallbackModelId,
+      [stage]: modelId,
+    },
+  }));
 }
 
 function withQuotaObservation(
@@ -133,12 +215,17 @@ async function reserveFallback(
       return current;
     }
     activated = true;
+    const fallbackModelId = { ...current.fallbackModelId };
+    delete fallbackModelId[stage];
     return {
       ...current,
       fallbackActive: {
         ...current.fallbackActive,
         [stage]: true,
       },
+      fallbackModelId: Object.keys(fallbackModelId).length > 0
+        ? fallbackModelId
+        : undefined,
     };
   });
   return activated;
@@ -150,7 +237,7 @@ async function reserveFallback(
  */
 export function resolveRunnerForModel(
   modelId: string | undefined,
-  stage?: import("../types/taskProgress").TaskStage,
+  stage?: TaskStage,
   taskFolderUri?: vscode.Uri
 ): ResolvedRunner {
   const resolved = toResolvedRunner(resolveEffectiveProvider(modelId));
@@ -163,9 +250,8 @@ export function resolveRunnerForModel(
   // isn't offered) so the settings webview can show real, non-fabricated
   // telemetry instead of a permanent placeholder.
   const instrumented = withQuotaObservation(primary, stage, modelId);
-  const setting = getModelSettings()[stage];
-  const backupModels = getBackupModels(setting).filter(candidate => candidate !== modelId);
-  if (setting?.strategy !== "switch-to-backup" || backupModels.length === 0) {
+  const backupModels = backupModelsForStage(stage, modelId);
+  if (backupModels.length === 0) {
     return { ...resolved, runner: instrumented };
   }
   return {
@@ -174,16 +260,43 @@ export function resolveRunnerForModel(
       id: instrumented.id,
       label: instrumented.label,
       capabilities: instrumented.capabilities,
-      isAvailable: () => instrumented.isAvailable(),
+      isAvailable: async () =>
+        (await checkRunnerAvailabilityForModel(modelId, stage)).availability,
       async run(request, token): Promise<AgentRunResult> {
         const runBackups = async (): Promise<AgentRunResult> => {
           let last: AgentRunResult | undefined;
           for (const backupModel of backupModels) {
             const fallback = toResolvedRunner(resolveEffectiveProvider(backupModel));
+            const fallbackAvailability = await fallback.runner.isAvailable();
+            if (!fallbackAvailability.available) {
+              last = {
+                runnerId: fallback.runner.id,
+                status: "failed",
+                failureKind: isAuthenticationFailure(fallbackAvailability.reason)
+                  ? "generic"
+                  : "temporarily-unavailable",
+                errorMessage: fallbackAvailability.reason ?? "Backup model is unavailable.",
+              };
+              recordQuotaObservation(stage, backupModel, last.failureKind, last.errorMessage);
+              if (isAuthenticationFailure(fallbackAvailability.reason)) {
+                return last;
+              }
+              continue;
+            }
             const fallbackResult = await fallback.runner.run({ ...request, modelId: fallback.nativeModelId }, token);
             recordQuotaObservation(stage, backupModel, fallbackResult.failureKind, fallbackResult.errorMessage);
             last = fallbackResult;
-            if (fallbackResult.failureKind !== "quota" && fallbackResult.failureKind !== "temporarily-unavailable") return fallbackResult;
+            if (
+              fallbackResult.failureKind !== "quota" &&
+              fallbackResult.failureKind !== "temporarily-unavailable"
+            ) {
+              await recordActiveFallbackModel(
+                taskFolderUri ?? request.taskFolderUri,
+                stage,
+                backupModel
+              );
+              return fallbackResult;
+            }
           }
           return last ?? { runnerId: primary.id, status: "failed", failureKind: "temporarily-unavailable", errorMessage: "No backup model is available." };
         };
@@ -225,26 +338,57 @@ export function resolveRunnerForModel(
  * resolveEffectiveProvider).
  */
 export async function checkImplementationAvailabilityForModel(
-  modelId: string | undefined
-): Promise<{ availability: AgentAvailability; providerLabel: string }> {
-  const effective = resolveEffectiveProvider(modelId);
-  if (effective.kind === "copilot") {
+  modelId: string | undefined,
+  stage?: TaskStage
+): Promise<RunnerAvailability> {
+  const check = async (
+    storedModelId: string | undefined,
+    effective: EffectiveProvider
+  ): Promise<RunnerAvailability> => {
+    if (effective.kind === "copilot") {
+      return {
+        availability: await checkImplementationAvailability(),
+        providerLabel: "Copilot",
+        provider: "copilot",
+        modelId: storedModelId,
+        nativeModelId: effective.model,
+      };
+    }
+    const { def } = effective;
+    const exists = await cliCommandExists(def.command, def.commandAliases);
     return {
-      availability: await checkImplementationAvailability(),
-      providerLabel: "Copilot",
+      availability: exists
+        ? { available: true }
+        : {
+            available: false,
+            reason: `The ${cliDisplayLabel(def)} CLI (${def.command}) is not installed. ${def.installHint}`,
+          },
+      providerLabel: def.label,
+      provider: def.id,
+      modelId: storedModelId,
+      nativeModelId: effective.model,
     };
-  }
-  const { def } = effective;
-  const exists = await cliCommandExists(def.command, def.commandAliases);
-  return {
-    availability: exists
-      ? { available: true }
-      : {
-          available: false,
-          reason: `The ${cliDisplayLabel(def)} CLI (${def.command}) is not installed. ${def.installHint}`,
-        },
-    providerLabel: def.label,
   };
+
+  const primary = await check(modelId, resolveEffectiveProvider(modelId));
+  if (
+    primary.availability.available ||
+    isAuthenticationFailure(primary.availability.reason)
+  ) {
+    return primary;
+  }
+
+  for (const backupModel of backupModelsForStage(stage, modelId)) {
+    const fallback = await check(backupModel, resolveEffectiveProvider(backupModel));
+    if (
+      fallback.availability.available ||
+      isAuthenticationFailure(fallback.availability.reason)
+    ) {
+      return fallback;
+    }
+  }
+
+  return primary;
 }
 
 /**
@@ -258,7 +402,7 @@ export async function runImplementationForModel(options: {
   workspaceUri: vscode.Uri;
   token: vscode.CancellationToken;
   onProgress: (message: string) => void;
-  stage?: import("../types/taskProgress").TaskStage;
+  stage?: TaskStage;
   taskFolderUri?: vscode.Uri;
   /** See runImplementationWithCli — default true; pass false when the
    * prompt may legitimately be answered without an edit. Copilot's runner
@@ -298,7 +442,14 @@ export async function runImplementationForModel(options: {
   }
   const setting = getModelSettings()[options.stage as keyof ReturnType<typeof getModelSettings>];
   const authFailure = isAuthenticationFailure(result.errorMessage);
-  if (!authFailure && (result.failureKind === "quota" || result.failureKind === "temporarily-unavailable") && options.stage && chooseFallback(setting) === "backup" && getBackupModels(setting).length) {
+  if (
+    !authFailure &&
+    (result.failureKind === "quota" ||
+      result.failureKind === "temporarily-unavailable") &&
+    options.stage &&
+    chooseFallback(setting) === "backup" &&
+    getBackupModels(setting).length
+  ) {
     if (!options.taskFolderUri) {
       return result;
     }
@@ -307,10 +458,40 @@ export async function runImplementationForModel(options: {
       return result;
     }
     for (const backupModel of getBackupModels(setting)) {
-      if (backupModel === options.modelId) continue;
+      if (backupModel === options.modelId) {
+        continue;
+      }
+      const fallbackAvailability =
+        await checkImplementationAvailabilityForModel(backupModel);
+      if (!fallbackAvailability.availability.available) {
+        const fallbackFailure = {
+          ...result,
+          status: "failed" as const,
+          failureKind: isAuthenticationFailure(fallbackAvailability.availability.reason)
+            ? "generic" as const
+            : "temporarily-unavailable" as const,
+          errorMessage: fallbackAvailability.availability.reason ?? "Backup model is unavailable.",
+        };
+        recordQuotaObservation(options.stage, backupModel, fallbackFailure.failureKind, fallbackFailure.errorMessage);
+        if (isAuthenticationFailure(fallbackAvailability.availability.reason)) {
+          return fallbackFailure;
+        }
+        continue;
+      }
       const fallbackResult = await run(resolveEffectiveProvider(backupModel));
       recordQuotaObservation(options.stage, backupModel, fallbackResult.failureKind, fallbackResult.errorMessage);
-      if (fallbackResult.status !== "failed" || (fallbackResult.failureKind !== "quota" && fallbackResult.failureKind !== "temporarily-unavailable")) return fallbackResult;
+      if (
+        fallbackResult.status !== "failed" ||
+        (fallbackResult.failureKind !== "quota" &&
+          fallbackResult.failureKind !== "temporarily-unavailable")
+      ) {
+        await recordActiveFallbackModel(
+          options.taskFolderUri,
+          options.stage,
+          backupModel
+        );
+        return fallbackResult;
+      }
     }
   }
   return result;
@@ -323,8 +504,12 @@ export async function runImplementationForModel(options: {
 // model on what is actually an auth problem — exactly what callers must
 // never do (see the two call sites below). Exported for direct unit testing.
 export function isAuthenticationFailure(message: string | undefined): boolean {
+  const value = message ?? "";
+  if (/not\s+installed|command\s+not\s+found|could\s+not\s+start\b/i.test(value)) {
+    return false;
+  }
   // "session"/"token" tolerate a short word gap (e.g. "session has timed
   // out", "token has been revoked") instead of requiring the state word to
   // sit directly next to the noun.
-  return /sign[\s-]*in|log(?:ged|ging)?[\s-]*(?:in|out)|session[\s\w]{0,20}?(?:expired|invalid|missing|timed?\s*out)|authenticat\w*|authoris\w*|authoriz\w*|credential|re[-\s]?auth\w*|token[\s\w]{0,20}?(?:expired|invalid|missing|revoked)|api\s*key|access\s*denied|permission\s*denied|forbidden|unauthori[sz]ed|\b(?:401|403)\b/i.test(message ?? "");
+  return /sign[\s-]*in|log(?:ged|ging)?[\s-]*(?:in|out)|session(?:\s+\w+){0,3}\s+(?:expired|invalid|missing|timed?\s*out)|authenticat\w*|authoris\w*|authoriz\w*|credential|re[-\s]?auth\w*|token(?:\s+\w+){0,3}\s+(?:expired|invalid|missing|revoked)|api\s*key|access\s*denied|permission\s*denied|forbidden|unauthori[sz]ed|\b(?:401|403)\b/i.test(value);
 }

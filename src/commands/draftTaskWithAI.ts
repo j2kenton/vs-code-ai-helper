@@ -1,7 +1,10 @@
 import * as vscode from "vscode";
 import { TASK_DESCRIPTION_FILENAME, TASK_FILENAME } from "../types/taskProgress";
 import { resolveFreshModelForStage } from "../utils/modelSelection";
-import { resolveRunnerForModel } from "../runners/runnerRegistry";
+import {
+  checkRunnerAvailabilityForModel,
+  resolveRunnerForModel,
+} from "../runners/runnerRegistry";
 import { renderPromptTemplate } from "../utils/promptTemplates";
 import { writeRunLog } from "../utils/runLog";
 import { TaskInventory } from "../state/taskInventory";
@@ -463,10 +466,13 @@ export async function draftTaskWithAI(
     }
     return;
   }
-  const { runner, providerLabel, nativeModelId } = resolveRunnerForModel(
-    model.modelId, "desc"
+  const { runner, nativeModelId } = resolveRunnerForModel(
+    model.modelId, "desc", taskFolderUri
   );
-  const availability = await runner.isAvailable();
+  const { availability, providerLabel } = await checkRunnerAvailabilityForModel(
+    model.modelId,
+    "desc"
+  );
   if (!availability.available) {
     NotificationRouter.showWarning(
       `${providerLabel} is unavailable: ${availability.reason ?? "unknown reason"}.`

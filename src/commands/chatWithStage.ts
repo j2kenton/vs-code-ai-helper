@@ -4,7 +4,10 @@ import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { STAGE_DISPLAY_NAMES, TaskStage, RUNS_DIRNAME } from "../types/taskProgress";
 import { IncompleteTask } from "../utils/taskProgressUtils";
 import { resolveFreshModelForStage } from "../utils/modelSelection";
-import { resolveRunnerForModel } from "../runners/runnerRegistry";
+import {
+  checkRunnerAvailabilityForModel,
+  resolveRunnerForModel,
+} from "../runners/runnerRegistry";
 import { generateContextPack } from "../utils/contextPack";
 import { ensureAiConsent } from "../utils/aiConsent";
 import { checkAndConfirmPromptSize } from "../utils/promptSizeGuard";
@@ -89,8 +92,8 @@ export async function chatWithStage(
       if (choice === "Open Settings") await vscode.commands.executeCommand("vs-code-ai-helper.openSettings");
       return;
     }
-    const { runner, providerLabel, nativeModelId } = resolveRunnerForModel(modelId, targetStage, taskFolderUri);
-    const available = await runner.isAvailable();
+    const { runner, nativeModelId } = resolveRunnerForModel(modelId, targetStage, taskFolderUri);
+    const { availability: available, providerLabel } = await checkRunnerAvailabilityForModel(modelId, targetStage);
     if (!available.available) throw new Error(available.reason ?? `${providerLabel} is unavailable.`);
     const conversation = chatViewProvider.transcript(task.canonicalId)
       .slice(-20)

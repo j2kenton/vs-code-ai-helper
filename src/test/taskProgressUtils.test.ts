@@ -87,10 +87,15 @@ void test("clearStageFallbackReservation removes only the requested stage", () =
       impl: true,
       plan: true,
     },
+    fallbackModelId: {
+      impl: "impl-backup",
+      plan: "plan-backup",
+    },
   };
 
   const cleared = clearStageFallbackReservation(progress, "impl");
   assert.deepEqual(cleared.fallbackActive, { plan: true });
+  assert.deepEqual(cleared.fallbackModelId, { plan: "plan-backup" });
   assert.equal(cleared.updatedAt, progress.updatedAt);
 });
 
@@ -114,6 +119,10 @@ void test("updateTaskProgressStage advances the stage and clears the new stage f
       desc: true,
       plan: true,
     },
+    fallbackModelId: {
+      desc: "desc-backup",
+      plan: "plan-backup",
+    },
   };
 
   const updated = updateTaskProgressStage(progress, "plan");
@@ -121,6 +130,9 @@ void test("updateTaskProgressStage advances the stage and clears the new stage f
   assert.equal(updated.currentStage, "plan");
   assert.deepEqual(updated.fallbackActive, {
     desc: true,
+  });
+  assert.deepEqual(updated.fallbackModelId, {
+    desc: "desc-backup",
   });
 });
 

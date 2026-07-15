@@ -10,7 +10,10 @@ import {
 import { renderPromptTemplate } from "../utils/promptTemplates";
 import { writeRunLog } from "../utils/runLog";
 import { pickTaskFolder } from "../utils/pickTaskFolder";
-import { resolveRunnerForModel } from "../runners/runnerRegistry";
+import {
+  checkRunnerAvailabilityForModel,
+  resolveRunnerForModel,
+} from "../runners/runnerRegistry";
 import { resolveFreshModelForStage } from "../utils/modelSelection";
 import { TASK_FILENAME, TaskStage } from "../types/taskProgress";
 import { ensureAiConsent } from "../utils/aiConsent";
@@ -217,10 +220,13 @@ async function generatePlanWithAIForResolvedTask(
     void vscode.window.showErrorMessage("The selected task has no owning workspace.");
     return { succeeded: false, triggerAutoReview: false };
   }
-  const { runner, providerLabel, nativeModelId } = resolveRunnerForModel(
-    model.modelId, "plan"
+  const { runner, nativeModelId } = resolveRunnerForModel(
+    model.modelId, "plan", taskFolderUri
   );
-  const availability = await runner.isAvailable();
+  const { availability, providerLabel } = await checkRunnerAvailabilityForModel(
+    model.modelId,
+    "plan"
+  );
   if (!availability.available) {
     NotificationRouter.showWarning(
       `${providerLabel} is unavailable: ${

@@ -7,6 +7,8 @@ import * as path from "node:path";
 import { describe, it } from "node:test";
 import * as vscode from "vscode";
 import {
+  checkImplementationAvailabilityForModel,
+  checkRunnerAvailabilityForModel,
   isAuthenticationFailure,
   resolveRunnerForModel,
   runImplementationForModel,
@@ -18,6 +20,14 @@ import {
 
 const requireModule = createRequire(__filename);
 const childProcess = requireModule("node:child_process") as typeof import("node:child_process");
+
+type LmStub = {
+  selectChatModels: () => Promise<vscode.LanguageModelChat[]>;
+};
+
+function lmStub(): LmStub {
+  return (vscode as unknown as { lm: LmStub }).lm;
+}
 
 function installModelSettings(raw: Record<string, unknown>): { restore: () => void } {
   const original = (vscode.workspace as unknown as Record<string, unknown>).getConfiguration;
@@ -76,6 +86,8 @@ void describe("isAuthenticationFailure", () => {
     "Rate limit exceeded, try again later.",
     "Quota exhausted for this billing period.",
     "Context length exceeded.",
+    "The Kiro CLI (kiro-cli) is not installed. Install Kiro CLI, then set KIRO_API_KEY for headless mode.",
+    "Could not start the Codex CLI (codex): command not found. Install the Codex CLI, then run `codex login`.",
     undefined,
     "",
   ];
@@ -101,22 +113,74 @@ void describe("resolveRunnerForModel", () => {
     }
   });
 
-  void it("preserves runner availability checks when fallback switching is enabled", async () => {
+  void it("reports available when fallback switching has an available backup", async () => {
     const settings = installModelSettings({
       "impl-low-review": {
-        primary: "auto",
-        backup: "copilot-gpt-5.6-sol",
+        primary: "kiro-cli:default",
+        backup: "auto",
         strategy: "switch-to-backup",
       },
     });
+    const lm = lmStub();
+    const originalSelectChatModels = lm.selectChatModels;
+    const originalSpawn = childProcess.spawn;
+
+    lm.selectChatModels = (): Promise<vscode.LanguageModelChat[]> =>
+      Promise.resolve([
+        { id: "auto", name: "Auto" } as unknown as vscode.LanguageModelChat,
+      ]);
+    childProcess.spawn = ((
+      _command: string,
+      _args: readonly string[] = []
+    ) => {
+      const child = new EventEmitter() as import("node:child_process").ChildProcess;
+      process.nextTick(() => child.emit("close", 1));
+      return child;
+    }) as typeof childProcess.spawn;
+
     try {
-      const { runner } = resolveRunnerForModel("auto", "impl-low-review");
+      const { runner } = resolveRunnerForModel("kiro-cli:default", "impl-low-review");
 
       assert.equal(typeof runner.isAvailable, "function");
       const availability = await runner.isAvailable();
-      assert.equal(availability.available, false);
+      assert.equal(availability.available, true);
+
+      const checked = await checkRunnerAvailabilityForModel(
+        "kiro-cli:default",
+        "impl-low-review"
+      );
+      assert.equal(checked.availability.available, true);
+      assert.equal(checked.providerLabel, "Copilot");
     } finally {
       settings.restore();
+      lm.selectChatModels = originalSelectChatModels;
+      childProcess.spawn = originalSpawn;
+    }
+  });
+
+  void it("does not report backup availability when the primary availability failure is authentication", async () => {
+    const settings = installModelSettings({
+      "impl-low-review": {
+        primary: "auto",
+        backup: "kiro-cli:default",
+        strategy: "switch-to-backup",
+      },
+    });
+    const lm = lmStub();
+    const originalSelectChatModels = lm.selectChatModels;
+
+    lm.selectChatModels = (): Promise<vscode.LanguageModelChat[]> =>
+      Promise.resolve([]);
+
+    try {
+      const { runner } = resolveRunnerForModel("auto", "impl-low-review");
+
+      const availability = await runner.isAvailable();
+      assert.equal(availability.available, false);
+      assert.match(availability.reason ?? "", /Sign in to GitHub Copilot/i);
+    } finally {
+      settings.restore();
+      lm.selectChatModels = originalSelectChatModels;
     }
   });
 
@@ -154,11 +218,7 @@ void describe("resolveRunnerForModel", () => {
         strategy: "switch-to-backup",
       },
     });
-    const lm = (vscode as unknown as {
-      lm: {
-        selectChatModels: () => Promise<vscode.LanguageModelChat[]>;
-      };
-    }).lm;
+    const lm = lmStub();
     const originalSelectChatModels = lm.selectChatModels;
     const workspace = vscode.workspace as unknown as {
       fs: {
@@ -211,8 +271,10 @@ void describe("resolveRunnerForModel", () => {
       assert.match(fs.readFileSync(outputFile.fsPath, "utf8"), /backup output/);
       const progress = JSON.parse(fs.readFileSync(progressPath, "utf8")) as {
         fallbackActive?: Partial<Record<string, boolean>>;
+        fallbackModelId?: Partial<Record<string, string>>;
       };
       assert.strictEqual(progress.fallbackActive?.plan, true);
+      assert.strictEqual(progress.fallbackModelId?.plan, "auto");
     } finally {
       settings.restore();
       lm.selectChatModels = originalSelectChatModels;
@@ -220,9 +282,158 @@ void describe("resolveRunnerForModel", () => {
       workspace.fs.writeFile = originalWriteFile;
     }
   });
+
+  void it("skips an unavailable backup and runs the next configured backup", async () => {
+    const metaRoot = fs.mkdtempSync(
+      path.join(os.tmpdir(), "ensemble-runner-multi-fallback-")
+    );
+    const tasksRoot = path.join(metaRoot, "tasks");
+    const taskFolder = path.join(tasksRoot, "task-a");
+    fs.mkdirSync(taskFolder, { recursive: true });
+    const taskFolderUri = vscode.Uri.file(taskFolder);
+    const outputFile = vscode.Uri.file(path.join(taskFolder, "plan.md"));
+    const progressPath = path.join(taskFolder, "task-progress.json");
+    const now = new Date().toISOString();
+    fs.writeFileSync(
+      progressPath,
+      JSON.stringify(
+        {
+          taskFolder: path.basename(taskFolder),
+          currentStage: "plan",
+          status: "active",
+          createdAt: now,
+          updatedAt: now,
+        },
+        null,
+        2
+      ),
+      "utf8"
+    );
+
+    const settings = installModelSettings({
+      plan: {
+        primary: "kiro-cli:default",
+        backups: ["antigravity-cli:Gemini 3.5 Flash (Medium)", "auto"],
+        strategy: "switch-to-backup",
+      },
+    });
+    const lm = lmStub();
+    const originalSelectChatModels = lm.selectChatModels;
+    const originalSpawn = childProcess.spawn;
+    const workspace = vscode.workspace as unknown as {
+      fs: {
+        readFile: (uri: vscode.Uri) => Promise<Uint8Array>;
+        writeFile: (uri: vscode.Uri, bytes: Uint8Array) => Promise<void>;
+      };
+    };
+    const originalReadFile = workspace.fs.readFile;
+    const originalWriteFile = workspace.fs.writeFile;
+
+    workspace.fs.readFile = (uri: vscode.Uri): Promise<Uint8Array> =>
+      fs.promises.readFile(uri.fsPath);
+    workspace.fs.writeFile = (
+      uri: vscode.Uri,
+      bytes: Uint8Array
+    ): Promise<void> => fs.promises.writeFile(uri.fsPath, bytes);
+    childProcess.spawn = ((
+      _command: string,
+      _args: readonly string[] = []
+    ) => {
+      const child = new EventEmitter() as import("node:child_process").ChildProcess;
+      process.nextTick(() => child.emit("close", 1));
+      return child;
+    }) as typeof childProcess.spawn;
+    lm.selectChatModels = (): Promise<vscode.LanguageModelChat[]> =>
+      Promise.resolve([
+        {
+          id: "auto",
+          name: "Auto",
+          sendRequest: () =>
+            Promise.resolve({
+              text: ["second backup output"] as unknown as AsyncIterable<string>,
+            }),
+        } as unknown as vscode.LanguageModelChat,
+      ]);
+
+    try {
+      const { runner } = resolveRunnerForModel(
+        "kiro-cli:default",
+        "plan",
+        taskFolderUri
+      );
+
+      const result = await runner.run(
+        {
+          taskFolderUri,
+          workspaceUri: vscode.Uri.file(taskFolder),
+          stage: "plan",
+          prompt: "Create a plan.",
+          outputFile,
+          modelId: "default",
+        },
+        new vscode.CancellationTokenSource().token
+      );
+
+      assert.strictEqual(result.status, "completed");
+      assert.strictEqual(result.modelId, "auto");
+      assert.match(fs.readFileSync(outputFile.fsPath, "utf8"), /second backup output/);
+      const progress = JSON.parse(fs.readFileSync(progressPath, "utf8")) as {
+        fallbackActive?: Partial<Record<string, boolean>>;
+        fallbackModelId?: Partial<Record<string, string>>;
+      };
+      assert.strictEqual(progress.fallbackActive?.plan, true);
+      assert.strictEqual(progress.fallbackModelId?.plan, "auto");
+
+      const stickyResolved = await resolveModelForStage(taskFolderUri, "plan");
+      assert.strictEqual(stickyResolved.modelId, "auto");
+    } finally {
+      settings.restore();
+      lm.selectChatModels = originalSelectChatModels;
+      childProcess.spawn = originalSpawn;
+      workspace.fs.readFile = originalReadFile;
+      workspace.fs.writeFile = originalWriteFile;
+    }
+  });
 });
 
 void describe("runImplementationForModel", () => {
+  void it("reports implementation availability from a configured backup", async () => {
+    const settings = installModelSettings({
+      impl: {
+        primary: "kiro-cli:default",
+        backup: "auto",
+        strategy: "switch-to-backup",
+      },
+    });
+    const lm = lmStub();
+    const originalSelectChatModels = lm.selectChatModels;
+    const originalSpawn = childProcess.spawn;
+
+    lm.selectChatModels = (): Promise<vscode.LanguageModelChat[]> =>
+      Promise.resolve([
+        { id: "auto", name: "Auto" } as unknown as vscode.LanguageModelChat,
+      ]);
+    childProcess.spawn = ((
+      _command: string,
+      _args: readonly string[] = []
+    ) => {
+      const child = new EventEmitter() as import("node:child_process").ChildProcess;
+      process.nextTick(() => child.emit("close", 1));
+      return child;
+    }) as typeof childProcess.spawn;
+
+    try {
+      const { availability, providerLabel } =
+        await checkImplementationAvailabilityForModel("kiro-cli:default", "impl");
+      assert.equal(availability.available, true);
+      assert.equal(providerLabel, "Copilot");
+    } finally {
+      settings.restore();
+      lm.selectChatModels = originalSelectChatModels;
+      childProcess.spawn = originalSpawn;
+    }
+  });
+
   void it("switches implementation to backup when an explicit Copilot primary model is unavailable", async () => {
     const metaRoot = fs.mkdtempSync(
       path.join(os.tmpdir(), "ensemble-impl-fallback-")
@@ -256,11 +467,7 @@ void describe("runImplementationForModel", () => {
         strategy: "switch-to-backup",
       },
     });
-    const lm = (vscode as unknown as {
-      lm: {
-        selectChatModels: () => Promise<vscode.LanguageModelChat[]>;
-      };
-    }).lm;
+    const lm = lmStub();
     const originalSelectChatModels = lm.selectChatModels;
     const workspace = vscode.workspace as unknown as {
       fs: {
@@ -309,8 +516,10 @@ void describe("runImplementationForModel", () => {
       assert.strictEqual(result.summary, "backup implementation");
       const progress = JSON.parse(fs.readFileSync(progressPath, "utf8")) as {
         fallbackActive?: Partial<Record<string, boolean>>;
+        fallbackModelId?: Partial<Record<string, string>>;
       };
       assert.strictEqual(progress.fallbackActive?.impl, true);
+      assert.strictEqual(progress.fallbackModelId?.impl, "auto");
     } finally {
       settings.restore();
       lm.selectChatModels = originalSelectChatModels;
@@ -452,6 +661,7 @@ void describe("runImplementationForModel", () => {
           createdAt: now,
           updatedAt: now,
           fallbackActive: { impl: true },
+          fallbackModelId: { impl: "impl-backup" },
         },
         null,
         2
@@ -485,8 +695,10 @@ void describe("runImplementationForModel", () => {
 
       const progress = JSON.parse(fs.readFileSync(progressPath, "utf8")) as {
         fallbackActive?: Partial<Record<string, boolean>>;
+        fallbackModelId?: Partial<Record<string, string>>;
       };
       assert.strictEqual(progress.fallbackActive?.impl, undefined);
+      assert.strictEqual(progress.fallbackModelId?.impl, undefined);
     } finally {
       settings.restore();
       workspace.fs.readFile = originalReadFile;

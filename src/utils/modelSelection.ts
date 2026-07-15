@@ -205,7 +205,15 @@ export async function resolveModelForStage(
           progress.fallbackActive[stage] &&
           canUseBackup(stageSetting)
         ) {
-          return { modelId: getBackupModels(stageSetting)[0], source: "workspace" };
+          const backupModels = getBackupModels(stageSetting);
+          const activeFallbackModel = progress.fallbackModelId?.[stage];
+          return {
+            modelId:
+              activeFallbackModel && backupModels.includes(activeFallbackModel)
+                ? activeFallbackModel
+                : backupModels[0],
+            source: "workspace",
+          };
         }
       } catch {
         // No persisted progress (or unreadable) — fall through to the primary model.

@@ -140,6 +140,8 @@ export interface TaskProgress {
   scheduledResumeTime?: string;
   /** Active fallback state by stage */
   fallbackActive?: Partial<Record<TaskStage, boolean>>;
+  /** Stored model ID for the backup that is currently carrying a stage. */
+  fallbackModelId?: Partial<Record<TaskStage, string>>;
   /** Monotonic token identifying the review run allowed to finalize this stage. */
   reviewAttemptId?: string;
 }

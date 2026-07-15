@@ -238,11 +238,18 @@ export function updateTaskProgressStage(
   newStage: TaskStage
 ): TaskProgress {
   const fallbackActive = { ...progress.fallbackActive };
+  const fallbackModelId = { ...progress.fallbackModelId };
   delete fallbackActive[newStage];
+  delete fallbackModelId[newStage];
   return {
     ...progress,
     currentStage: newStage,
-    fallbackActive,
+    fallbackActive: Object.keys(fallbackActive).length > 0
+      ? fallbackActive
+      : undefined,
+    fallbackModelId: Object.keys(fallbackModelId).length > 0
+      ? fallbackModelId
+      : undefined,
     updatedAt: new Date().toISOString(),
   };
 }
@@ -270,17 +277,22 @@ export function clearStageFallbackReservation(
   progress: TaskProgress,
   stage: TaskStage
 ): TaskProgress {
-  if (!progress.fallbackActive?.[stage]) {
+  if (!progress.fallbackActive?.[stage] && !progress.fallbackModelId?.[stage]) {
     return progress;
   }
 
   const fallbackActive = { ...progress.fallbackActive };
+  const fallbackModelId = { ...progress.fallbackModelId };
   delete fallbackActive[stage];
+  delete fallbackModelId[stage];
 
   return {
     ...progress,
     fallbackActive: Object.keys(fallbackActive).length > 0
       ? fallbackActive
+      : undefined,
+    fallbackModelId: Object.keys(fallbackModelId).length > 0
+      ? fallbackModelId
       : undefined,
   };
 }

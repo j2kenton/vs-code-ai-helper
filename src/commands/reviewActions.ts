@@ -1558,7 +1558,7 @@ async function applyImplementationReviewWithAI(
     : await resolveFreshModelForStage(folderUri, "impl");
 
   const { availability, providerLabel } =
-    await checkImplementationAvailabilityForModel(model.modelId);
+    await checkImplementationAvailabilityForModel(model.modelId, "impl");
   if (!availability.available) {
     NotificationRouter.showWarning(
       `${providerLabel} is unavailable: ${availability.reason ?? "unknown reason"}. Address the review manually instead.`
@@ -2239,7 +2239,7 @@ export async function runImplementationWithAI(
     const model = await resolveFreshModelForStage(resolved.folderUri, "impl");
 
     const { availability, providerLabel } =
-      await checkImplementationAvailabilityForModel(model.modelId);
+      await checkImplementationAvailabilityForModel(model.modelId, "impl");
     if (!availability.available) {
       NotificationRouter.showWarning(
         `${providerLabel} is unavailable: ${availability.reason ?? "unknown reason"}. Implement the plan manually instead.`
