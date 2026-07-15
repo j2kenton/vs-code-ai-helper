@@ -24,6 +24,7 @@ import {
   describeResolvedModel,
   getAvailableModels,
 } from "../utils/modelSelection";
+import { getMetaResourcesPath } from "../config/settings";
 
 /**
  * The view ID for the tasks tree view (must match package.json)
@@ -558,7 +559,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
         return;
       }
       
-      const metaPath = vscode.workspace.getConfiguration("vs-code-ai-helper").get<string>("metaResourcesPath") || ".helper/plans";
+      const metaPath = getMetaResourcesPath();
       if (!metaPath || metaPath.trim() === "" || path.isAbsolute(metaPath)) {
         this.isMetaManaged = false;
         return;
@@ -615,7 +616,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
         "vs-code-ai-helper.hasTasks",
         hasTasks
       );
-      // Always report hasMetaFolder as true since we use .helper/plans by default
+      // Always report hasMetaFolder as true since we use a default meta root.
       void vscode.commands.executeCommand(
         "setContext",
         "vs-code-ai-helper.hasMetaFolder",

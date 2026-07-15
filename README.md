@@ -24,7 +24,7 @@ The Tasks view and status bar show the current task and stage. Every AI action h
 ## Quick start
 
 1. Install from the [Visual Studio Marketplace](https://marketplace.visualstudio.com/items?itemName=j2kenton.vs-code-ai-helper).
-2. Run **Ensemble: Select Meta Resources Folder** and choose a workspace folder such as `.helper/plans`.
+2. Open a workspace folder. Ensemble stores task metadata in `.ensemble` by default, or you can run **Ensemble: Select Meta Resources Folder** to choose a different workspace folder.
 3. Run **Ensemble: Start New Task**, describe the work in `task.md`, and use **Generate Plan with AI** or write the plan yourself.
 4. Review and promote the plan, generate the implementation checklist, implement, and run the implementation reviews.
 

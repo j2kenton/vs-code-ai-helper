@@ -1,8 +1,5 @@
 import * as vscode from "vscode";
-import {
-  getMetaResourcesPath,
-  hasValidMetaResourcesPath,
-} from "../config/settings";
+import { getMetaResourcesPath } from "../config/settings";
 import { TASK_FILENAME } from "../types/taskProgress";
 import { findAllTasks, IncompleteTask } from "../utils/taskProgressUtils";
 import { resolveCurrentPlanUri, statIfExists } from "../utils/fileUtils";
@@ -23,13 +20,6 @@ interface ViewPlanArg {
  * View task.md for a selected task, or the task passed from tree context.
  */
 export async function viewTask(arg?: ViewTaskArg): Promise<void> {
-  if (!hasValidMetaResourcesPath()) {
-    void vscode.window.showErrorMessage(
-      "No meta resources folder configured. Please set one first."
-    );
-    return;
-  }
-
   const workspaceRoot = vscode.workspace.workspaceFolders?.[0];
   if (!workspaceRoot) {
     void vscode.window.showErrorMessage(
@@ -86,13 +76,6 @@ export async function viewTask(arg?: ViewTaskArg): Promise<void> {
  * Only shows tasks that have an existing plan.
  */
 export async function viewPlan(arg?: ViewPlanArg): Promise<void> {
-  if (!hasValidMetaResourcesPath()) {
-    void vscode.window.showErrorMessage(
-      "No meta resources folder configured. Please set one first."
-    );
-    return;
-  }
-
   const workspaceRoot = vscode.workspace.workspaceFolders?.[0];
   if (!workspaceRoot) {
     void vscode.window.showErrorMessage(

@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import { AI_MODEL_STAGES, TaskStage } from "../types/taskProgress";
 import { FallbackStrategy, ModelSettings } from "../utils/modelFallback";
 import { normalizeQualifiedModelId, parseModelSelection } from "../runners/providers";
+import { DEFAULT_TASK_ROOT } from "../utils/taskRoot";
 
 const CONFIG_SECTION = "vs-code-ai-helper";
 const META_RESOURCES_PATH_KEY = "metaResourcesPath";
@@ -188,7 +189,9 @@ export function isDesktopNotificationsEnabled(): boolean {
  */
 export function getMetaResourcesPath(): string {
   const config = vscode.workspace.getConfiguration(CONFIG_SECTION);
-  return config.get<string>(META_RESOURCES_PATH_KEY, "");
+  const value = config.get<string>(META_RESOURCES_PATH_KEY, "");
+  const trimmed = typeof value === "string" ? value.trim() : "";
+  return trimmed.length > 0 ? trimmed : DEFAULT_TASK_ROOT;
 }
 
 /**
@@ -201,14 +204,6 @@ export async function setMetaResourcesPath(path: string): Promise<void> {
     path,
     targetFor(META_RESOURCES_PATH_KEY)
   );
-}
-
-/**
- * Check if a valid meta resources path is configured
- */
-export function hasValidMetaResourcesPath(): boolean {
-  const path = getMetaResourcesPath();
-  return path.length > 0;
 }
 
 /**

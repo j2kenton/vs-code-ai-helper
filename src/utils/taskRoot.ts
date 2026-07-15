@@ -4,8 +4,10 @@ import { TASK_FILENAME } from "../types/taskProgress";
 
 const CONFIG_SECTION = "vs-code-ai-helper";
 const META_RESOURCES_PATH_KEY = "metaResourcesPath";
-const DEFAULT_TASK_ROOT = ".helper/plans";
+export const DEFAULT_TASK_ROOT = ".ensemble";
+const LEGACY_DEFAULT_TASK_ROOT = ".helper/plans";
 const LEGACY_TASK_ROOT = "plans";
+const LEGACY_TASK_ROOTS = [LEGACY_DEFAULT_TASK_ROOT, LEGACY_TASK_ROOT];
 
 /**
  * Represents a discovered task root candidate for scanning
@@ -57,7 +59,7 @@ export function isTaskRootExplicitlyConfigured(): boolean {
 
 /**
  * Get the configured task root. Returns the explicit value if configured,
- * otherwise returns the default `.helper/plans`.
+ * otherwise returns the default `.ensemble`.
  */
 export function getConfiguredTaskRoot(): string {
   const config = vscode.workspace.getConfiguration(CONFIG_SECTION);
@@ -119,33 +121,16 @@ export function resolveTaskRootCandidates(): TaskRootCandidate[] {
     }
   }
 
-  // If root is unset/defaulted, also discover legacy plans/
-  if (!isExplicit) {
-    for (const ws of workspaceFolders) {
-      const wsPath = ws.uri.fsPath;
-      const legacyPath = path.join(wsPath, LEGACY_TASK_ROOT);
+  // Always discover historical implicit roots as compatibility fallbacks.
+  // New task creation defaults to `.ensemble`, but older workspaces may have
+  // tasks under `.helper/plans` or the first-generation `plans` root.
+  for (const ws of workspaceFolders) {
+    const wsPath = ws.uri.fsPath;
+    for (const legacyRoot of LEGACY_TASK_ROOTS) {
+      const legacyPath = path.join(wsPath, legacyRoot);
       const legacyNormalized = normalizePath(legacyPath);
 
       // Only add if different from configured candidate
-      const alreadyIncluded = candidates.some(
-        (c) => c.absolutePath === legacyNormalized
-      );
-      if (!alreadyIncluded) {
-        candidates.push({
-          absolutePath: legacyNormalized,
-          isExplicit: false,
-          workspaceFolder: ws.uri,
-          sourceScopeKey: normalizePath(wsPath),
-        });
-      }
-    }
-  } else {
-    // If root is explicitly configured, still check legacy if different
-    for (const ws of workspaceFolders) {
-      const wsPath = ws.uri.fsPath;
-      const legacyPath = path.join(wsPath, LEGACY_TASK_ROOT);
-      const legacyNormalized = normalizePath(legacyPath);
-
       const alreadyIncluded = candidates.some(
         (c) => c.absolutePath === legacyNormalized
       );
@@ -230,7 +215,7 @@ export async function discoverAllTasks(): Promise<DiscoveredTask[]> {
       continue;
     }
 
-    // Prefer explicit root, then .helper/plans, then lexically smaller path
+    // Prefer explicit root, then the current default, then lexically smaller path.
     const existingIsExplicit = candidates.find(c =>
       existing.taskFolderPath.startsWith(c.absolutePath)
     )?.isExplicit ?? false;
@@ -244,7 +229,7 @@ export async function discoverAllTasks(): Promise<DiscoveredTask[]> {
     } else if (!taskIsExplicit && existingIsExplicit) {
       // Keep existing
     } else {
-      // Both same explicit-ness, prefer .helper/plans over plans/
+      // Both same explicit-ness, prefer the current default over legacy roots.
       const existingIsDefault = existing.taskFolderPath.includes(DEFAULT_TASK_ROOT);
       const taskIsDefault = task.taskFolderPath.includes(DEFAULT_TASK_ROOT);
 

@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import { getMetaResourcesPath, hasValidMetaResourcesPath } from "../config/settings";
+import { getMetaResourcesPath } from "../config/settings";
 import { findIncompleteTasks } from "./taskProgressUtils";
 import { STAGE_DISPLAY_NAMES, TaskStage } from "../types/taskProgress";
 
@@ -16,13 +16,6 @@ export async function pickTaskFolder(
   quickPickTitle: string,
   eligibleStages: readonly TaskStage[]
 ): Promise<vscode.Uri | undefined> {
-  if (!hasValidMetaResourcesPath()) {
-    void vscode.window.showErrorMessage(
-      "No meta resources folder configured. Please set one first."
-    );
-    return undefined;
-  }
-
   const workspaceRoot = vscode.workspace.workspaceFolders?.[0];
   if (!workspaceRoot) {
     void vscode.window.showErrorMessage(

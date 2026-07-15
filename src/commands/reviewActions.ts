@@ -5,7 +5,6 @@ import * as crypto from "crypto";
 import {
   allowsDirtyWorktreeChanges,
   getMetaResourcesPath,
-  hasValidMetaResourcesPath,
 } from "../config/settings";
 import {
   taskOperations,
@@ -423,13 +422,8 @@ async function resolveTask(
 
   const combinedTasks: IncompleteTask[] = [];
   for (const wsFolder of allWorkspaceFolders) {
-    // Attempt to discover tasks using the configured path, or .helper/plans default
-    let metaFolderUri: vscode.Uri;
-    if (hasValidMetaResourcesPath()) {
-      metaFolderUri = vscode.Uri.joinPath(wsFolder.uri, getMetaResourcesPath());
-    } else {
-      metaFolderUri = vscode.Uri.joinPath(wsFolder.uri, ".helper/plans");
-    }
+    // Attempt to discover tasks using the configured path, or the default meta root.
+    const metaFolderUri = vscode.Uri.joinPath(wsFolder.uri, getMetaResourcesPath());
 
     try {
       const wsTasks = await findAllTasks(metaFolderUri);

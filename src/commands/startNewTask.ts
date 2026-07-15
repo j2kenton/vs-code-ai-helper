@@ -13,12 +13,6 @@ import { activateTask } from "../state/taskActivationCoordinator";
 import { withMetaRootLock } from "../state/taskStateStore";
 
 /**
- * The default plans root relative to workspace.
- * Used when no explicit meta resources path is configured.
- */
-export const DEFAULT_PLANS_ROOT = ".helper/plans";
-
-/**
  * Format a date as YYYY-MM-DD
  */
 function formatDate(date: Date): string {
@@ -147,7 +141,7 @@ export async function startNewTask(
       ).then(selection => selection?.folder);
   if (!workspaceRoot) {
     void vscode.window.showErrorMessage(
-      "No workspace folder open. Please open a folder first."
+      "Open your repo folder in VS Code before starting a task. Ensemble will create .ensemble there automatically."
     );
     return undefined;
   }

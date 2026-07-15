@@ -376,7 +376,7 @@
       },
       {
         "view": "vs-code-ai-helper.tasksView",
-        "contents": "No meta resources folder is configured yet. Select one to start tracking tasks.\n[Select Meta Resources Folder](command:vs-code-ai-helper.selectMetaFolder)",
+        "contents": "Open a workspace folder to start tracking tasks. Ensemble stores task metadata in `.ensemble` by default.\n[Select Meta Resources Folder](command:vs-code-ai-helper.selectMetaFolder)",
         "when": "vs-code-ai-helper.tasksInitialized && !vs-code-ai-helper.hasMetaFolder"
       },
       {
@@ -581,9 +581,9 @@
       "properties": {
         "vs-code-ai-helper.metaResourcesPath": {
           "type": "string",
-          "default": ".helper/plans",
+          "default": ".ensemble",
           "scope": "resource",
-          "description": "Workspace folder path for storing task plans and workflow state. Defaults to .helper/plans."
+          "description": "Workspace folder path for storing task plans and workflow state. Defaults to .ensemble."
         },
         "vs-code-ai-helper.aiModelDefaults": {
           "type": "object",

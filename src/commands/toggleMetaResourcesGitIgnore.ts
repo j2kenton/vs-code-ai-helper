@@ -11,6 +11,7 @@ const MANAGED_BEGIN = "# BEGIN Ensemble managed meta resources";
 const MANAGED_END = "# END Ensemble managed meta resources";
 const MANAGED_NOTE = "# Managed by Ensemble. Do not edit this block manually.";
 const LEGACY_COMMENT = "# Ensemble meta resources";
+const LEGACY_DEFAULT_TASK_ROOT = ".helper/plans";
 const LEGACY_TASK_ROOT = "plans";
 const ARTIFACTS_ROOT = "artifacts/helper";
 
@@ -107,6 +108,14 @@ export function buildManagedIgnorePatterns(
     patterns.add(legacyPattern);
   }
 
+  const legacyDefaultPattern = toGitignorePattern(
+    repoRoot,
+    path.join(repoRoot, LEGACY_DEFAULT_TASK_ROOT, folderName)
+  );
+  if (legacyDefaultPattern) {
+    patterns.add(legacyDefaultPattern);
+  }
+
   return [...patterns].sort();
 }
 
@@ -135,6 +144,7 @@ export function buildLegacyMetaRootIgnorePatterns(
   const patterns = new Set<string>();
   const roots = [
     configuredTaskRootPath,
+    path.join(repoRoot, LEGACY_DEFAULT_TASK_ROOT),
     path.join(repoRoot, LEGACY_TASK_ROOT),
     path.join(repoRoot, ARTIFACTS_ROOT),
   ].filter((root): root is string => !!root);

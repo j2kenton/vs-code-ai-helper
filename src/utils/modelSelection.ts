@@ -3,7 +3,6 @@ import {
   getAiModelDefaults,
   getMetaResourcesPath,
   getModelSettings,
-  hasValidMetaResourcesPath,
   isProviderEnabled,
 } from "../config/settings";
 import { canUseBackup, getBackupModels } from "./modelFallback";
@@ -147,9 +146,7 @@ export interface TaskModelConflict {
 export async function findTaskModelConflicts(): Promise<TaskModelConflict[]> {
   const conflicts: TaskModelConflict[] = [];
   for (const ws of vscode.workspace.workspaceFolders ?? []) {
-    const metaFolderUri = hasValidMetaResourcesPath()
-      ? vscode.Uri.joinPath(ws.uri, getMetaResourcesPath())
-      : vscode.Uri.joinPath(ws.uri, ".helper/plans");
+    const metaFolderUri = vscode.Uri.joinPath(ws.uri, getMetaResourcesPath());
 
     let tasks;
     try {
