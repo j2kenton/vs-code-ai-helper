@@ -116,6 +116,23 @@ export async function writeTextFile(
   }
 }
 
+export async function safeOpenTextDocument(
+  fileUri: vscode.Uri,
+  label = fileUri.fsPath
+): Promise<boolean> {
+  try {
+    const doc = await vscode.workspace.openTextDocument(fileUri);
+    await vscode.window.showTextDocument(doc);
+    return true;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    void vscode.window.showWarningMessage(
+      `Could not open ${label}: ${message}`
+    );
+    return false;
+  }
+}
+
 /**
  * Find open editor tabs for a file, or for anything under a directory path
  * (so a recursive directory delete also matches its open descendants).
@@ -173,8 +190,7 @@ export async function openOrCreateDocument(
       new TextEncoder().encode(initialContent)
     );
   }
-  const doc = await vscode.workspace.openTextDocument(fileUri);
-  await vscode.window.showTextDocument(doc);
+  await safeOpenTextDocument(fileUri);
 }
 
 /**

@@ -2,7 +2,11 @@ import * as vscode from "vscode";
 import { getMetaResourcesPath } from "../config/settings";
 import { TASK_FILENAME } from "../types/taskProgress";
 import { findAllTasks, IncompleteTask } from "../utils/taskProgressUtils";
-import { resolveCurrentPlanUri, statIfExists } from "../utils/fileUtils";
+import {
+  resolveCurrentPlanUri,
+  safeOpenTextDocument,
+  statIfExists,
+} from "../utils/fileUtils";
 import {
   prepareArtifactPicker,
   type ArtifactPickerOptions,
@@ -36,8 +40,7 @@ export async function viewTask(arg?: ViewTaskArg): Promise<void> {
   // If invoked from tree with a specific task, open directly
   if (arg?.task) {
     const taskUri = vscode.Uri.joinPath(arg.task.folderUri, TASK_FILENAME);
-    const doc = await vscode.workspace.openTextDocument(taskUri);
-    await vscode.window.showTextDocument(doc);
+    await safeOpenTextDocument(taskUri, TASK_FILENAME);
     return;
   }
 
@@ -67,8 +70,7 @@ export async function viewTask(arg?: ViewTaskArg): Promise<void> {
   }
 
   const taskUri = vscode.Uri.joinPath(selected.task.folderUri, TASK_FILENAME);
-  const doc = await vscode.workspace.openTextDocument(taskUri);
-  await vscode.window.showTextDocument(doc);
+  await safeOpenTextDocument(taskUri, TASK_FILENAME);
 }
 
 /**
@@ -99,8 +101,7 @@ export async function viewPlan(arg?: ViewPlanArg): Promise<void> {
         );
         return;
       }
-      const doc = await vscode.workspace.openTextDocument(planUri);
-      await vscode.window.showTextDocument(doc);
+      await safeOpenTextDocument(planUri, "plan.md");
     } catch (error) {
       void vscode.window.showErrorMessage(
         `Failed to resolve plan: ${error instanceof Error ? error.message : String(error)}`
@@ -153,8 +154,7 @@ export async function viewPlan(arg?: ViewPlanArg): Promise<void> {
 
   try {
     const planUri = await resolveCurrentPlanUri(selected.task.folderUri);
-    const doc = await vscode.workspace.openTextDocument(planUri);
-    await vscode.window.showTextDocument(doc);
+    await safeOpenTextDocument(planUri, "plan.md");
   } catch (error) {
     void vscode.window.showErrorMessage(
       `Failed to resolve plan: ${error instanceof Error ? error.message : String(error)}`

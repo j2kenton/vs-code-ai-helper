@@ -12,6 +12,7 @@ import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { ensureAiConsent } from "../utils/aiConsent";
 import { checkAndConfirmPromptSize } from "../utils/promptSizeGuard";
 import { NotificationRouter } from "../utils/notificationRouter";
+import { safeOpenTextDocument } from "../utils/fileUtils";
 
 import { shortcutHint } from "../utils/shortcutHints";
 import { backupArtifactBeforeWrite, backupArtifactContents } from "../utils/artifactBackups";
@@ -613,9 +614,7 @@ export async function draftTaskWithAI(
       taskFileUri,
       new TextEncoder().encode(newContent)
     );
-    // Open the file
-    const doc = await vscode.workspace.openTextDocument(taskFileUri);
-    await vscode.window.showTextDocument(doc);
+    await safeOpenTextDocument(taskFileUri, "task.md");
     NotificationRouter.showInformation(
       `task.md updated with Draft with AI (${providerLabel}).`
     );

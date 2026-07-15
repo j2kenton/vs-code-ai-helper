@@ -21,6 +21,7 @@ import { checkAndConfirmPromptSize } from "../utils/promptSizeGuard";
 import { TaskInventory } from "../state/taskInventory";
 import { IncompleteTask } from "../utils/taskProgressUtils";
 import { NotificationRouter } from "../utils/notificationRouter";
+import { safeOpenTextDocument } from "../utils/fileUtils";
 
 import { shouldAutoReviewAfterPlan } from "../config/settings";
 import {
@@ -341,8 +342,7 @@ async function generatePlanWithAIForResolvedTask(
           });
           succeeded = true;
 
-          const doc = await vscode.workspace.openTextDocument(planFileUri);
-          await vscode.window.showTextDocument(doc);
+          await safeOpenTextDocument(planFileUri, "plan.md");
           NotificationRouter.showInformation(
             `plan.md generated with ${providerLabel} (${result.summary ?? ""})`
           );

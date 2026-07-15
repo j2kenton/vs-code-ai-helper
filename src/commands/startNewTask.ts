@@ -11,6 +11,7 @@ import { TaskInventory } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { activateTask } from "../state/taskActivationCoordinator";
 import { withMetaRootLock } from "../state/taskStateStore";
+import { safeOpenTextDocument } from "../utils/fileUtils";
 
 /**
  * Format a date as YYYY-MM-DD
@@ -226,8 +227,7 @@ export async function startNewTask(
       }
     }
 
-    const doc = await vscode.workspace.openTextDocument(taskFileUri);
-    await vscode.window.showTextDocument(doc);
+    await safeOpenTextDocument(taskFileUri, "task.md");
 
     return taskFolderName;
   } catch (error) {

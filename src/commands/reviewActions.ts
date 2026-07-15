@@ -37,6 +37,7 @@ import {
   openOrCreateDocument,
   readNonEmptyText,
   resolveCurrentPlanUri,
+  safeOpenTextDocument,
   statIfExists,
   writeTextFile,
 } from "../utils/fileUtils";
@@ -729,15 +730,7 @@ async function runAiToFile(options: {
           }
           completed = true;
           if (options.promoteOutput !== false) {
-            try {
-              const doc = await vscode.workspace.openTextDocument(options.outputFileUri);
-              await vscode.window.showTextDocument(doc);
-            } catch (error) {
-              const message = error instanceof Error ? error.message : String(error);
-              NotificationRouter.showWarning(
-                `${options.outputLabel} was generated, but could not be opened automatically: ${message}`
-              );
-            }
+            await safeOpenTextDocument(options.outputFileUri, options.outputLabel);
           }
           NotificationRouter.showInformation(
             `${options.outputLabel} generated with ${providerLabel} (${
@@ -1075,6 +1068,10 @@ function validateReviewOutput(content: string): { valid: boolean; reason: string
   return { valid: true, reason: "" };
 }
 
+function isStaleReviewArtifact(content: string): boolean {
+  return content.trimStart().startsWith("# Review Stale");
+}
+
 async function markReviewArtifactStale(
   reviewUri: vscode.Uri,
   changedArtifact: string
@@ -1257,6 +1254,19 @@ export async function applyReviewWithAI(
     if (!reviewContent) {
       NotificationRouter.showWarning(
         "No review found (or it is empty). Run the review before applying it."
+      );
+      return;
+    }
+    if (isStaleReviewArtifact(reviewContent)) {
+      NotificationRouter.showWarning(
+        "The review is stale. Run the review again before applying it."
+      );
+      return;
+    }
+    const reviewValidation = validateReviewOutput(reviewContent);
+    if (!reviewValidation.valid) {
+      NotificationRouter.showWarning(
+        `The review content is invalid (${reviewValidation.reason}). Run the review again before applying it.`
       );
       return;
     }
@@ -1668,8 +1678,10 @@ export async function viewReview(arg?: ReviewCommandArg): Promise<void> {
     }
     return;
   }
-  const doc = await vscode.workspace.openTextDocument(reviewUri);
-  await vscode.window.showTextDocument(doc);
+  await safeOpenTextDocument(
+    reviewUri,
+    STAGE_ARTIFACT_FILENAMES[stage] ?? "review"
+  );
 }
 
 /**
@@ -2118,8 +2130,7 @@ async function executeImplementationRun(
         "Implementation finished, but no workspace files changed. " +
           "Review the implementation run log; the provider may have been blocked from writing files."
       );
-      const logDoc = await vscode.workspace.openTextDocument(logUri);
-      await vscode.window.showTextDocument(logDoc);
+      await safeOpenTextDocument(logUri, "implementation run log");
       return;
     }
 
@@ -2160,8 +2171,14 @@ async function executeImplementationRun(
       return stageUpdated;
     });
 
-    const doc = await vscode.workspace.openTextDocument(implementationUri);
-    await vscode.window.showTextDocument(doc);
+    if (isReviewStage(postRunReviewStage)) {
+      const reviewUri = artifactUri(folderUri, postRunReviewStage);
+      if (reviewUri) {
+        await markReviewArtifactStale(reviewUri, "workspace files");
+      }
+    }
+
+    await safeOpenTextDocument(implementationUri, "plan-final.md");
     // Optional: a completed implementation only starts review when enabled in Settings.
     if (shouldAutoReviewAfterImplementation()) {
       await runReviewForFolder(
