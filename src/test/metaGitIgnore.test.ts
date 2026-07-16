@@ -12,6 +12,7 @@ import {
   diffGitignoreLines,
   hideMetaResourcesInGitIgnore,
   isManagedMetaGitIgnoreHidden,
+  showMetaResourcesInGitIgnore,
 } from "../commands/toggleMetaResourcesGitIgnore";
 import {
   deactivateNotificationRouter,
@@ -248,6 +249,69 @@ void describe("managed meta gitignore block", () => {
       buildManagedIgnorePatterns(repoRoot, taskFolder, configuredRoot),
       ["/.helper/plans/task-a/", "/plans/task-a/"]
     );
+  });
+
+  void it("keeps transcript patterns present when hiding (persistentPatterns merged with root patterns)", () => {
+    const content = applyManagedMetaGitIgnoreBlock(
+      "",
+      ["/plans/"],
+      true,
+      { persistentPatterns: ["/plans/**/chat-v1.json", "/plans/**/chat-v1.corrupt.json"] }
+    );
+
+    assert.match(content, /\/plans\/\*\*\/chat-v1\.json/);
+    assert.match(content, /\/plans\/\*\*\/chat-v1\.corrupt\.json/);
+    assert.match(content, /\/plans\//);
+  });
+
+  void it("replaces the block with a transcripts-only block on show, instead of removing it (Option A)", () => {
+    const hidden = applyManagedMetaGitIgnoreBlock(
+      "",
+      ["/plans/"],
+      true,
+      { persistentPatterns: ["/plans/**/chat-v1.json", "/plans/**/chat-v1.corrupt.json"] }
+    );
+
+    const shown = applyManagedMetaGitIgnoreBlock(
+      hidden,
+      ["/plans/"],
+      false,
+      { persistentPatterns: ["/plans/**/chat-v1.json", "/plans/**/chat-v1.corrupt.json"] }
+    );
+
+    assert.match(shown, /# BEGIN Ensemble managed meta resources/, "the block must survive Show Meta Files");
+    assert.match(shown, /\/plans\/\*\*\/chat-v1\.json/);
+    assert.match(shown, /\/plans\/\*\*\/chat-v1\.corrupt\.json/);
+    const lines = shown.split(/\r?\n/).map((line) => line.trim());
+    assert.equal(lines.includes("/plans/"), false, "the root folder pattern itself must be gone once shown");
+  });
+
+  void it("isManagedMetaGitIgnoreHidden reports NOT hidden once shown, even though a transcripts-only block remains", () => {
+    const hidden = applyManagedMetaGitIgnoreBlock(
+      "",
+      ["/plans/"],
+      true,
+      { persistentPatterns: ["/plans/**/chat-v1.json"] }
+    );
+    assert.equal(isManagedMetaGitIgnoreHidden(hidden, ["/plans/"]), true);
+
+    const shown = applyManagedMetaGitIgnoreBlock(
+      hidden,
+      ["/plans/"],
+      false,
+      { persistentPatterns: ["/plans/**/chat-v1.json"] }
+    );
+    assert.equal(
+      isManagedMetaGitIgnoreHidden(shown, ["/plans/"]),
+      false,
+      "hidden-detection keys on the root pattern, which is absent from a transcripts-only block"
+    );
+  });
+
+  void it("removes the block entirely on show when there are no persistent patterns (unchanged default behavior)", () => {
+    const hidden = applyManagedMetaGitIgnoreBlock("dist/\n", ["/plans/"], true);
+    const shown = applyManagedMetaGitIgnoreBlock(hidden, ["/plans/"], false);
+    assert.equal(shown, "dist/\n");
   });
 
   void it("builds legacy root variants for cleanup", () => {
@@ -511,11 +575,16 @@ void describe("gitignore writes require confirmation with an exact diff", () => 
 
       assert.equal(applied, true);
       const written = fs.readFileSync(path.join(repoRoot, ".gitignore"), "utf8");
-      const occurrences = written.split("/artifacts/helper/").length - 1;
+      // Count exact standalone-line occurrences of the root pattern, not a
+      // raw substring count: "/artifacts/helper/**/chat-v1.json" legitimately
+      // contains "/artifacts/helper/" as a prefix without being a duplicate
+      // of the root pattern itself.
+      const lines = written.split(/\r?\n/).map((line) => line.trim());
+      const occurrences = lines.filter((line) => line === "/artifacts/helper/").length;
       assert.equal(
         occurrences,
         1,
-        `expected "/artifacts/helper/" to appear exactly once, got ${occurrences}:\n${written}`
+        `expected "/artifacts/helper/" to appear exactly once as its own line, got ${occurrences}:\n${written}`
       );
     } finally {
       commandsStub._executeCommandOverride = originalExecuteCommandOverride;
@@ -528,6 +597,96 @@ void describe("gitignore writes require confirmation with an exact diff", () => 
       deactivateNotificationRouter();
       (vscode.workspace as unknown as Record<string, unknown>).getConfiguration =
         originalGetConfiguration;
+      fs.rmSync(repoRoot, { recursive: true, force: true });
+    }
+  });
+
+  void it("keeps chat-transcript patterns in .gitignore after hide then show (Option A end-to-end)", async () => {
+    const repoRoot = makeGitFixture();
+    const configStub = installConfigStub();
+    const surface = new StatusTreeProvider();
+    initNotificationRouter(surface);
+
+    const originalWorkspaceFolders = vscode.workspace.workspaceFolders;
+    const originalShowWarningMessage = vscode.window.showWarningMessage;
+    const originalWriteFile = (
+      vscode.workspace.fs as unknown as { writeFile: unknown }
+    ).writeFile;
+    const originalReadFile = (
+      vscode.workspace.fs as unknown as { readFile: unknown }
+    ).readFile;
+    (vscode.workspace as unknown as { workspaceFolders: unknown }).workspaceFolders = [
+      { uri: vscode.Uri.file(repoRoot), name: "repo", index: 0 },
+    ];
+    (vscode.window as unknown as { showWarningMessage: unknown }).showWarningMessage =
+      (
+        _message: string,
+        _options: { detail?: string },
+        ...actions: string[]
+      ): Promise<string | undefined> => Promise.resolve(actions[0]);
+    (vscode.workspace.fs as unknown as { writeFile: unknown }).writeFile = (
+      uri: vscode.Uri,
+      bytes: Uint8Array
+    ): Promise<void> => {
+      fs.writeFileSync(uri.fsPath, Buffer.from(bytes));
+      return Promise.resolve();
+    };
+    // The second call (show) must see the first call's (hide) write, so
+    // readFile needs a real bridge too — unlike the other tests in this
+    // file, which only ever write once and never need to read back a prior
+    // write of their own.
+    (vscode.workspace.fs as unknown as { readFile: unknown }).readFile = (
+      uri: vscode.Uri
+    ): Promise<Uint8Array> => fs.promises.readFile(uri.fsPath).then((buf) => new Uint8Array(buf));
+    const commandsStub = vscode.commands as typeof vscode.commands & {
+      _executeCommandOverride?: (id: string, ...args: unknown[]) => Promise<unknown>;
+    };
+    const originalExecuteCommandOverride = commandsStub._executeCommandOverride;
+    commandsStub._executeCommandOverride = () => Promise.resolve(undefined);
+
+    try {
+      const hideApplied = await hideMetaResourcesInGitIgnore(
+        {} as TaskInventory,
+        {} as CurrentTaskStore
+      );
+      assert.equal(hideApplied, true);
+      const hiddenContent = fs.readFileSync(path.join(repoRoot, ".gitignore"), "utf8");
+      // The config stub returns the caller's own default for every key
+      // (installConfigStub), so the task root here resolves to the real
+      // built-in default (".ensemble"), not the legacy "/plans/".
+      assert.match(hiddenContent, /\/\.ensemble\/\*\*\/chat-v1\.json/);
+      assert.match(hiddenContent, /\/\.ensemble\/\*\*\/chat-v1\.corrupt\.json/);
+
+      const showApplied = await showMetaResourcesInGitIgnore(
+        {} as TaskInventory,
+        {} as CurrentTaskStore
+      );
+      assert.equal(showApplied, true);
+      const shownContent = fs.readFileSync(path.join(repoRoot, ".gitignore"), "utf8");
+      assert.match(
+        shownContent,
+        /\/\.ensemble\/\*\*\/chat-v1\.json/,
+        "transcript patterns must survive Show Meta Files"
+      );
+      assert.match(shownContent, /\/\.ensemble\/\*\*\/chat-v1\.corrupt\.json/);
+      const shownLines = shownContent.split(/\r?\n/).map((line) => line.trim());
+      assert.equal(
+        shownLines.includes("/.ensemble/"),
+        false,
+        "the root task-folder pattern itself must be gone once shown"
+      );
+    } finally {
+      commandsStub._executeCommandOverride = originalExecuteCommandOverride;
+      (vscode.workspace.fs as unknown as { writeFile: unknown }).writeFile =
+        originalWriteFile;
+      (vscode.workspace.fs as unknown as { readFile: unknown }).readFile =
+        originalReadFile;
+      (vscode.workspace as unknown as { workspaceFolders: unknown }).workspaceFolders =
+        originalWorkspaceFolders;
+      (vscode.window as unknown as { showWarningMessage: unknown }).showWarningMessage =
+        originalShowWarningMessage;
+      deactivateNotificationRouter();
+      configStub.restore();
       fs.rmSync(repoRoot, { recursive: true, force: true });
     }
   });

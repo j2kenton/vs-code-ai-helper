@@ -47,6 +47,9 @@ function normalizeArg(node: MarkTaskDoneArg | undefined): {
  *
  * A task is eligible only when:
  *   - It is not paused, AND
+ *   - It is not already completed (re-running this on an already-completed
+ *     task would re-stamp `completedAt` and re-run "select next task" —
+ *     re-completing is Resume/reopen's job, not this command's), AND
  *   - It has already reached the Publish stage ("completed").
  *
  * Reaching Publish (via `nextStage` from impl-low-review) does not itself
@@ -57,7 +60,7 @@ function normalizeArg(node: MarkTaskDoneArg | undefined): {
 export function isMarkTaskDoneEligible(
   progress: TaskWithProgress["progress"]
 ): boolean {
-  if (progress.status === "paused") {
+  if (progress.status === "paused" || progress.status === "completed") {
     return false;
   }
   return progress.currentStage === "publish";

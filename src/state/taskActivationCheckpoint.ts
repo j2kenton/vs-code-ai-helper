@@ -12,10 +12,27 @@ const CHECKPOINT_FILENAME = ".ensemble-activation-checkpoint.json";
  * sequence got so a crash mid-activation can be reconciled deterministically
  * on the next startup instead of leaving stale "paused"/"active" flags with
  * no record of what the coordinator was trying to do.
+ *
+ * "target-write-pending" is written immediately before the target's own
+ * `patchTaskProgress` call (the write that flips it to "active", optionally
+ * composed with a reopen mutation) and closes the interval between that
+ * write landing and the "target-activated" checkpoint being recorded — a
+ * crash there previously had no checkpoint to recover from. Recovery for
+ * this phase re-reads the target's durable state rather than assuming
+ * success or failure; see `resolveTargetWritePending` in
+ * taskActivationCoordinator.ts.
+ *
+ * Downgrade caveat: an older extension build that doesn't know this phase
+ * would treat it as an unrecognized-but-earlier phase and roll back — if the
+ * target write had actually landed, that reproduces the pre-existing
+ * two-active-tasks exposure this phase closes. This only happens on a crash
+ * followed by a downgrade to an older build, and is no worse than the bug
+ * that existed before this phase was added.
  */
 export type ActivationCheckpointPhase =
   | "intent-recorded"
   | "others-paused"
+  | "target-write-pending"
   | "target-activated"
   | "focus-updated";
 

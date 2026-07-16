@@ -95,7 +95,7 @@ export async function chatWithStage(
     const { runner, nativeModelId } = resolveRunnerForModel(modelId, targetStage, taskFolderUri);
     const { availability: available, providerLabel } = await checkRunnerAvailabilityForModel(modelId, targetStage);
     if (!available.available) throw new Error(available.reason ?? `${providerLabel} is unavailable.`);
-    const conversation = chatViewProvider.transcript(task.canonicalId)
+    const conversation = (await chatViewProvider.transcript(task.taskFolderPath, task.canonicalId))
       .slice(-20)
       .map(entry => `${entry.role.toUpperCase()}: ${entry.text}`)
       .join("\n");
@@ -112,18 +112,18 @@ export async function chatWithStage(
     const result = await runner.run({ taskFolderUri, workspaceUri: workspaceFolder.uri, stage: targetStage, prompt, outputFile, modelId: nativeModelId }, tokenSource.token);
     tokenSource.dispose();
     if (result.status === "cancelled") {
-      await chatViewProvider.append("assistant", "Stage chat was cancelled.", targetStage, task.canonicalId);
+      await chatViewProvider.append("assistant", "Stage chat was cancelled.", targetStage, { canonicalId: task.canonicalId, taskFolderPath: task.taskFolderPath });
       return;
     }
     if (result.status !== "completed") throw new Error(result.errorMessage ?? "Stage chat did not complete.");
     const response = splitQuestionEnvelope(new TextDecoder().decode(await vscode.workspace.fs.readFile(outputFile)).trim());
-    if (response.answer) await chatViewProvider.append("assistant", response.answer, targetStage, task.canonicalId);
+    if (response.answer) await chatViewProvider.append("assistant", response.answer, targetStage, { canonicalId: task.canonicalId, taskFolderPath: task.taskFolderPath });
     if (response.question) await chatViewProvider.ask({ canonicalId: task.canonicalId, taskFolderPath: task.taskFolderPath, stage: targetStage, question: response.question });
-    if (!response.answer && !response.question) await chatViewProvider.append("assistant", "The stage AI did not return an answer.", targetStage, task.canonicalId);
+    if (!response.answer && !response.question) await chatViewProvider.append("assistant", "The stage AI did not return an answer.", targetStage, { canonicalId: task.canonicalId, taskFolderPath: task.taskFolderPath });
     NotificationRouter.showInformation(`Stage AI response received for ${STAGE_DISPLAY_NAMES[targetStage]}.`);
   } catch (error) {
     const text = error instanceof Error ? error.message : String(error);
-    await chatViewProvider.append("assistant", `Unable to respond: ${text}`, targetStage, task.canonicalId);
+    await chatViewProvider.append("assistant", `Unable to respond: ${text}`, targetStage, { canonicalId: task.canonicalId, taskFolderPath: task.taskFolderPath });
     const failureMessage = `Stage response failed: ${text}`;
     NotificationRouter.showError(failureMessage);
     notifyDesktop("Ensemble — error", failureMessage);

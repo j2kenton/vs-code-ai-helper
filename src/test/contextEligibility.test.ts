@@ -200,6 +200,28 @@ void test("isDenylisted: my.keynotefile.ts is not denylisted (no .key extension)
 });
 
 // ---------------------------------------------------------------------------
+// Task-local chat transcripts (chatHistoryStore.ts) — plaintext prompt/
+// response content, never swept into generic AI context collection even
+// when an editor for the file is open.
+// ---------------------------------------------------------------------------
+
+void test("isDenylisted: chat-v1.json is denylisted", () => {
+  assert.equal(isDenylisted("chat-v1.json"), true);
+});
+
+void test("isDenylisted: chat-v1.corrupt.json (quarantine copy) is denylisted", () => {
+  assert.equal(isDenylisted("chat-v1.corrupt.json"), true);
+});
+
+void test("isDenylisted: case-insensitive for Chat-V1.JSON", () => {
+  assert.equal(isDenylisted("Chat-V1.JSON"), true);
+});
+
+void test("isDenylisted: chat-v2.json (different version) is not denylisted", () => {
+  assert.equal(isDenylisted("chat-v2.json"), false);
+});
+
+// ---------------------------------------------------------------------------
 // lstatSync error-code discrimination logic
 // (unit-tests the fail-closed contract without requiring VS Code or real fs)
 //

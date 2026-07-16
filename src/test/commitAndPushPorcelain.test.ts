@@ -17,7 +17,9 @@ import { describe, it } from "node:test";
 import {
   getChangedFiles,
   parsePorcelainV2Z,
+  stripSensitiveTaskFiles,
 } from "../commands/commitAndPushTask";
+import { CHAT_HISTORY_FILENAME, CHAT_HISTORY_CORRUPT_FILENAME } from "../utils/chatHistoryConstants";
 
 function git(cwd: string, args: string[]): void {
   cp.execFileSync("git", args, { cwd, stdio: "ignore", windowsHide: true });
@@ -115,5 +117,187 @@ void describe("getChangedFiles rename atomicity", () => {
     } finally {
       fs.rmSync(repoRoot, { recursive: true, force: true });
     }
+  });
+});
+
+void describe("getChangedFiles chat-transcript exclusion (Option A staging policy)", () => {
+  void it("excludes chat-v1.json from scopedFiles in include-task-folder mode, and classifies it as sensitive", async () => {
+    const repoRoot = makeGitFixture();
+    try {
+      fs.mkdirSync(path.join(repoRoot, "plans", "task_1"), { recursive: true });
+      fs.writeFileSync(path.join(repoRoot, "plans", "task_1", "task.md"), "# Task\n");
+      fs.writeFileSync(path.join(repoRoot, "plans", "task_1", CHAT_HISTORY_FILENAME), "{}");
+
+      const { scopedFiles, sensitiveFilePaths } = await getChangedFiles(
+        repoRoot,
+        path.join(repoRoot, "plans", "task_1"),
+        true
+      );
+      assert.ok(scopedFiles.includes("plans/task_1/task.md"), "ordinary task-folder file still staged when included");
+      assert.ok(
+        !scopedFiles.some((f) => f.endsWith(CHAT_HISTORY_FILENAME)),
+        "chat-v1.json must never be staged, even in include-task-folder mode"
+      );
+      assert.ok(sensitiveFilePaths.includes(`plans/task_1/${CHAT_HISTORY_FILENAME}`));
+    } finally {
+      fs.rmSync(repoRoot, { recursive: true, force: true });
+    }
+  });
+
+  void it("excludes a SIBLING task's chat-v1.json in default mode, not just the current task's", async () => {
+    const repoRoot = makeGitFixture();
+    try {
+      fs.mkdirSync(path.join(repoRoot, "plans", "task_1"), { recursive: true });
+      fs.mkdirSync(path.join(repoRoot, "plans", "task_2"), { recursive: true });
+      fs.writeFileSync(path.join(repoRoot, "plans", "task_2", CHAT_HISTORY_FILENAME), "{}");
+      fs.writeFileSync(path.join(repoRoot, "plans", "task_2", CHAT_HISTORY_CORRUPT_FILENAME), "{}");
+
+      const { scopedFiles, sensitiveFilePaths } = await getChangedFiles(
+        repoRoot,
+        path.join(repoRoot, "plans", "task_1"),
+        false
+      );
+      // Default mode stages everything OUTSIDE the current task's own
+      // folder — task_2 is a sibling, so without transcript-specific
+      // scoping its chat-v1.json would otherwise be swept in as an ordinary
+      // "source change".
+      assert.ok(
+        !scopedFiles.some((f) => f.includes(CHAT_HISTORY_FILENAME)),
+        "a sibling task's transcript must never be staged either"
+      );
+      assert.ok(sensitiveFilePaths.includes(`plans/task_2/${CHAT_HISTORY_FILENAME}`));
+      assert.ok(sensitiveFilePaths.includes(`plans/task_2/${CHAT_HISTORY_CORRUPT_FILENAME}`));
+    } finally {
+      fs.rmSync(repoRoot, { recursive: true, force: true });
+    }
+  });
+
+  void it("excludes BOTH endpoints of a chat-v1.json renamed out of the task root to an innocuous path", async () => {
+    const repoRoot = makeGitFixture();
+    try {
+      fs.mkdirSync(path.join(repoRoot, "plans", "task_1"), { recursive: true });
+      fs.mkdirSync(path.join(repoRoot, "src"), { recursive: true });
+      fs.writeFileSync(path.join(repoRoot, "plans", "task_1", "task.md"), "# Task\n");
+      fs.writeFileSync(path.join(repoRoot, "plans", "task_1", CHAT_HISTORY_FILENAME), JSON.stringify({ transcript: "secret" }));
+      git(repoRoot, ["add", "-A"]);
+      git(repoRoot, [
+        "-c", "user.email=test@example.invalid", "-c", "user.name=Test",
+        "commit", "-m", "seed transcript",
+      ]);
+
+      // `git mv` out of the task root under an innocuous name — the content
+      // (and therefore the transcript) survives at the new path. Staged via
+      // `git add -A`: `git status` only ever links a deletion+addition pair
+      // into a single "2" rename/copy record (the shape getChangedFiles must
+      // classify correctly) for a STAGED change — an unstaged filesystem
+      // move shows up as two independent, unlinked entries instead. Command
+      // callers never reach getChangedFiles with staged changes present (an
+      // earlier guard refuses to proceed), but getChangedFiles/
+      // stripSensitiveTaskFiles must still classify a "2" record correctly
+      // wherever one is presented to them, as the sole enforcement point for
+      // the never-stage-transcripts invariant.
+      fs.renameSync(
+        path.join(repoRoot, "plans", "task_1", CHAT_HISTORY_FILENAME),
+        path.join(repoRoot, "src", "archive.json")
+      );
+      git(repoRoot, ["add", "-A"]);
+
+      const { scopedFiles, sensitiveFilePaths } = await getChangedFiles(
+        repoRoot,
+        path.join(repoRoot, "plans", "task_1"),
+        false
+      );
+      assert.ok(
+        !scopedFiles.includes("src/archive.json"),
+        "the rename destination must never be staged — it still carries transcript content"
+      );
+      assert.ok(
+        !scopedFiles.some((f) => f.includes(CHAT_HISTORY_FILENAME)),
+        "the rename origin must not be staged either"
+      );
+      assert.ok(sensitiveFilePaths.includes("src/archive.json"), "the destination must be classified as sensitive");
+      assert.ok(sensitiveFilePaths.includes(`plans/task_1/${CHAT_HISTORY_FILENAME}`));
+    } finally {
+      fs.rmSync(repoRoot, { recursive: true, force: true });
+    }
+  });
+
+  void it("excludes both endpoints of a chat-v1.json renamed to an innocuous basename INSIDE the task folder", async () => {
+    const repoRoot = makeGitFixture();
+    try {
+      fs.mkdirSync(path.join(repoRoot, "plans", "task_1"), { recursive: true });
+      fs.writeFileSync(path.join(repoRoot, "plans", "task_1", "task.md"), "# Task\n");
+      fs.writeFileSync(path.join(repoRoot, "plans", "task_1", CHAT_HISTORY_FILENAME), JSON.stringify({ transcript: "secret" }));
+      git(repoRoot, ["add", "-A"]);
+      git(repoRoot, [
+        "-c", "user.email=test@example.invalid", "-c", "user.name=Test",
+        "commit", "-m", "seed transcript",
+      ]);
+
+      fs.renameSync(
+        path.join(repoRoot, "plans", "task_1", CHAT_HISTORY_FILENAME),
+        path.join(repoRoot, "plans", "task_1", "notes.json")
+      );
+      git(repoRoot, ["add", "-A"]); // staged, so git links it as a single "2" rename record
+
+      // include-task-folder mode is where a same-folder rename would
+      // otherwise be picked up as an ordinary task-folder file.
+      const { scopedFiles, sensitiveFilePaths } = await getChangedFiles(
+        repoRoot,
+        path.join(repoRoot, "plans", "task_1"),
+        true
+      );
+      assert.ok(
+        !scopedFiles.includes("plans/task_1/notes.json"),
+        "an innocuously-renamed transcript must not be staged even inside the task folder"
+      );
+      assert.ok(sensitiveFilePaths.includes("plans/task_1/notes.json"));
+    } finally {
+      fs.rmSync(repoRoot, { recursive: true, force: true });
+    }
+  });
+
+  void it("does not exclude an unrelated file outside the task root that happens to share the transcript basename", async () => {
+    const repoRoot = makeGitFixture();
+    try {
+      fs.mkdirSync(path.join(repoRoot, "plans", "task_1"), { recursive: true });
+      fs.mkdirSync(path.join(repoRoot, "notes"), { recursive: true });
+      fs.writeFileSync(path.join(repoRoot, "notes", CHAT_HISTORY_FILENAME), "unrelated file with the same basename");
+
+      const { scopedFiles, sensitiveFilePaths } = await getChangedFiles(
+        repoRoot,
+        path.join(repoRoot, "plans", "task_1"),
+        false
+      );
+      assert.ok(
+        scopedFiles.includes(`notes/${CHAT_HISTORY_FILENAME}`),
+        "a same-named file outside the task root must be staged normally"
+      );
+      assert.ok(!sensitiveFilePaths.includes(`notes/${CHAT_HISTORY_FILENAME}`));
+    } finally {
+      fs.rmSync(repoRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+void describe("stripSensitiveTaskFiles (final staging gate)", () => {
+  void it("removes only transcript basenames under the task root", () => {
+    const repoRoot = path.resolve("repo-root");
+    const taskFolderPath = path.join(repoRoot, "plans", "task_1");
+    const scopedFiles = [
+      "src/foo.ts",
+      `plans/task_1/${CHAT_HISTORY_FILENAME}`,
+      `plans/task_2/${CHAT_HISTORY_CORRUPT_FILENAME}`,
+      "notes/chat-v1.json", // outside the task root — same basename, must survive
+    ];
+    const result = stripSensitiveTaskFiles(scopedFiles, repoRoot, taskFolderPath);
+    assert.deepEqual(result, ["src/foo.ts", "notes/chat-v1.json"]);
+  });
+
+  void it("is a no-op for a list with no sensitive files", () => {
+    const repoRoot = path.resolve("repo-root");
+    const taskFolderPath = path.join(repoRoot, "plans", "task_1");
+    const scopedFiles = ["src/foo.ts", "src/bar.ts"];
+    assert.deepEqual(stripSensitiveTaskFiles(scopedFiles, repoRoot, taskFolderPath), scopedFiles);
   });
 });

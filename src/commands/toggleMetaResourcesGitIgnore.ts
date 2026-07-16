@@ -6,6 +6,7 @@ import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { getConfiguredTaskRoot } from "../utils/taskRoot";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { setMetaFilesHidden } from "../config/settings";
+import { CHAT_HISTORY_FILENAME, CHAT_HISTORY_CORRUPT_FILENAME } from "../utils/chatHistoryConstants";
 
 const MANAGED_BEGIN = "# BEGIN Ensemble managed meta resources";
 const MANAGED_END = "# END Ensemble managed meta resources";
@@ -31,10 +32,22 @@ interface CurrentMetaGitIgnoreTarget {
   gitignoreUri: vscode.Uri;
   patterns: string[];
   legacyRootPatterns: string[];
+  /** Chat-transcript ignore patterns (Option A staging policy) that must
+   * survive "Show Meta Files" — see ApplyManagedMetaGitIgnoreOptions.persistentPatterns. */
+  persistentPatterns: string[];
 }
 
 interface ApplyManagedMetaGitIgnoreOptions {
   legacyRootPatterns?: readonly string[];
+  /**
+   * Patterns that must remain in the managed block even when `hidden` is
+   * false. Used for chat-transcript basenames (chat-v1.json,
+   * chat-v1.corrupt.json): the transcript staging policy (Option A) commits
+   * to never staging a transcript regardless of whether task-root folders
+   * are otherwise visible in git, so "Show Meta Files" replaces the managed
+   * block with a transcripts-only block instead of removing it outright.
+   */
+  persistentPatterns?: readonly string[];
 }
 
 let metaVisibilityContextVersion = 0;
@@ -310,6 +323,7 @@ export function applyManagedMetaGitIgnoreBlock(
     lines,
     options.legacyRootPatterns ?? []
   );
+  const persistentPatterns = options.persistentPatterns ?? [];
 
   if (!hidden && !hasManagedBlock && !hasLegacyBlock) {
     return content;
@@ -322,14 +336,28 @@ export function applyManagedMetaGitIgnoreBlock(
   const withoutManaged = removeManagedBlocksFromLines(withoutLegacy);
 
   if (!hidden) {
-    return withoutManaged.length > 0 ? `${withoutManaged.join(eol)}${eol}` : "";
+    if (persistentPatterns.length === 0) {
+      return withoutManaged.length > 0 ? `${withoutManaged.join(eol)}${eol}` : "";
+    }
+    // "Show Meta Files" would otherwise remove the block outright, exposing
+    // the task-root folders (and everything transitively ignored under
+    // them, transcripts included) to git. Patterns that must survive
+    // regardless of visibility state replace the block instead of removing
+    // it — isManagedMetaGitIgnoreHidden still reports "not hidden" here
+    // because it keys on the root `patterns`, not these.
+    const nextLines = [...withoutManaged];
+    if (nextLines.length > 0) {
+      nextLines.push("");
+    }
+    nextLines.push(...renderManagedBlock(persistentPatterns));
+    return `${nextLines.join(eol)}${eol}`;
   }
 
   const nextLines = [...withoutManaged];
   if (nextLines.length > 0) {
     nextLines.push("");
   }
-  nextLines.push(...renderManagedBlock(patterns));
+  nextLines.push(...renderManagedBlock([...new Set([...patterns, ...persistentPatterns])]));
   return `${nextLines.join(eol)}${eol}`;
 }
 
@@ -367,6 +395,21 @@ async function readTextIfExists(uri: vscode.Uri): Promise<string> {
   } catch {
     return "";
   }
+}
+
+/**
+ * Ignore patterns for chat-transcript files under the task root, built from
+ * the same resolved root pattern already used for the task-root entry (so
+ * relocating the task root via settings relocates these too). Scoped to the
+ * task root only — not a bare `**\/chat-v1.json` — so an unrelated file
+ * sharing a transcript's basename elsewhere in the repo is never matched.
+ */
+function buildTranscriptIgnorePatterns(taskRootPattern: string): string[] {
+  const base = taskRootPattern.replace(/\/+$/, "");
+  return [
+    `${base}/**/${CHAT_HISTORY_FILENAME}`,
+    `${base}/**/${CHAT_HISTORY_CORRUPT_FILENAME}`,
+  ];
 }
 
 async function resolveGitRepoRoot(cwd: string): Promise<string | undefined> {
@@ -422,11 +465,13 @@ async function resolveTarget(
   // collapse to one pattern — without this, the managed block would render
   // that pattern twice (renderManagedBlock does not dedupe its input).
   const patterns = [...new Set(["/artifacts/helper/", configuredPattern ?? "/plans/"])];
+  const taskRootPattern = configuredPattern ?? "/plans/";
 
   return {
     repoRoot,
     gitignoreUri: vscode.Uri.file(path.join(repoRoot, ".gitignore")),
     patterns,
+    persistentPatterns: buildTranscriptIgnorePatterns(taskRootPattern),
     legacyRootPatterns: buildLegacyMetaRootIgnorePatterns(
       repoRoot,
       configuredTaskRootPath
@@ -552,6 +597,7 @@ async function setCurrentTaskMetaGitVisibility(
   const current = await readTextIfExists(target.gitignoreUri);
   const next = applyManagedMetaGitIgnoreBlock(current, target.patterns, hidden, {
     legacyRootPatterns: target.legacyRootPatterns,
+    persistentPatterns: target.persistentPatterns,
   });
 
   if (!(await confirmGitignoreWrite(current, next, hidden))) {

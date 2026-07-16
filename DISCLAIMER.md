@@ -84,6 +84,8 @@ The `Commit and Push Task` command stages changes and pushes to your remote repo
 
 **Default staging scope:** by default, only the task folder's changes are staged. Run artifacts (`runs/`, `context-pack.md`) are **excluded from the default staged set** because they contain AI prompts and may include file contents. Opting into "include all repository changes" stages the entire repo and shows run artifacts with an explicit warning marker.
 
+**Chat transcripts are never staged by this command, under any option.** `chat-v1.json` (a task's Chat With AI transcript — see §5 "Extension state storage") is excluded in every mode, including "include all repository changes" and "Include Run Artifacts" — there is no in-command way to stage it. If you want a transcript committed, add it manually outside this command.
+
 Before using this command:
 
 - Review which files will be staged (use the preview dialog and "View Full List" if needed).
@@ -140,10 +142,12 @@ The `Commit and Push` command excludes `runs/` and `context-pack.md` from its **
 
 ### Extension state storage
 
-The extension persists two categories of data locally:
+The extension persists these categories of data locally:
 
-- **Benign extension state** — consent timestamp and version, model preferences — stored in VS Code `workspaceState` and workspace configuration. This is metadata only; no file contents are stored here.
+- **Benign extension state** — consent timestamp and version, model preferences — stored in VS Code `workspaceState` and workspace configuration. This is metadata only; no file contents are stored here. **Exception during migration:** a task's Chat With AI transcript may still be present here as a legacy entry until it is migrated to `chat-v1.json` (see below) — that legacy entry is plaintext prompt/response content, not metadata, and is deleted only once the migration write succeeds.
 - **Sensitive run content** — full AI prompts and responses — stored in `runs/` log files and `context-pack.md` inside your task folder, as plain files on disk. These are created only after you confirm an AI action.
+- **Chat transcripts** — each task's Chat With AI conversation is stored as **plaintext prompt/response content** in `chat-v1.json` inside the task folder (with `chat-v1.corrupt.json` as an occasional quarantine copy of an unreadable file — see below). It travels with the task folder and is excluded from Commit and Push in every mode (see §4). If you have used the Meta Files visibility commands, the extension also keeps transcript-specific `.gitignore` rules in its managed block so "Show Meta Files" does not expose transcripts to git; if no managed block has ever been installed, that extra protection is absent and manual Git commands can still stage the files even though Commit and Push will not. If an older workspace-state transcript for a task hasn't been opened yet under this version, it is migrated into `chat-v1.json` the first time that task's chat is read or written; until that migration succeeds, the transcript may still live only in workspace state. A `chat-v1.json` that fails to parse is preserved as `chat-v1.corrupt.json` (only the most recent quarantine copy is kept) rather than being silently discarded.
+- **Chat transcript concurrency limitation:** transcript writes are serialized only within a single VS Code window. If you have the same task open in two windows and chat with it in both at once, the last write wins and a message from the other window can be lost. This is a deliberate, weaker guarantee than task progress gets (task progress uses a cross-process lease); simultaneous multi-window chat on one task is not a supported workflow.
 
 ### AI providers' own privacy policies
 

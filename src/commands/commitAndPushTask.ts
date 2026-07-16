@@ -18,6 +18,7 @@ import {
   taskOperations,
   showTaskBusyWarning,
 } from "../utils/taskOperations";
+import { CHAT_HISTORY_FILENAME, CHAT_HISTORY_CORRUPT_FILENAME } from "../utils/chatHistoryConstants";
 
 /**
  * Accepted argument shapes for commitAndPushTask.
@@ -314,13 +315,97 @@ export function parsePorcelainV2Z(output: string): PorcelainV2Entry[] {
 }
 
 /**
+ * Chat-transcript basenames (chatHistoryStore.ts). Under the transcript
+ * staging policy (Option A — never-stage, non-overridable), these must never
+ * be staged by Commit and Push through any path: they are plaintext
+ * prompt/response content, unlike run artifacts which can be opted back in.
+ */
+const SENSITIVE_TASK_FILE_BASENAMES = new Set([
+  CHAT_HISTORY_FILENAME,
+  CHAT_HISTORY_CORRUPT_FILENAME,
+]);
+
+/**
+ * Repo-relative path of the task ROOT (the parent directory holding every
+ * task folder, e.g. "plans"), not just the current task's own folder. Chat
+ * transcripts must be excluded for every task under this root — not only
+ * the current one — since default-mode staging would otherwise sweep a
+ * sibling task's transcript in as an ordinary "source change" outside this
+ * task's own folder. Returns undefined when the task root can't be
+ * expressed as a repo-relative path (e.g. configured outside the repo), in
+ * which case no entry can match it and sensitivity filtering is a no-op.
+ */
+function taskRootRelativeFor(repoRoot: string, taskFolderPath: string): string | undefined {
+  const taskRoot = path.resolve(taskFolderPath, "..");
+  const relative = path.relative(repoRoot, taskRoot).replace(/\\/g, "/");
+  if (relative.startsWith("..") || path.isAbsolute(relative)) {
+    return undefined;
+  }
+  return relative;
+}
+
+function isUnderTaskRoot(entryPath: string, taskRootRelative: string): boolean {
+  return (
+    taskRootRelative === "" ||
+    entryPath === taskRootRelative ||
+    entryPath.startsWith(taskRootRelative + "/")
+  );
+}
+
+/**
+ * True when `entryPath` is a chat-transcript file (or its quarantine copy)
+ * for some task under `taskRootRelative`. Scoped to the task root so a file
+ * that happens to share a transcript's basename elsewhere in the repo is
+ * never matched.
+ */
+function isSensitiveTaskFile(entryPath: string, taskRootRelative: string | undefined): boolean {
+  if (taskRootRelative === undefined) return false;
+  if (!isUnderTaskRoot(entryPath, taskRootRelative)) return false;
+  return SENSITIVE_TASK_FILE_BASENAMES.has(path.basename(entryPath));
+}
+
+/**
+ * Final gate: strips chat-transcript files — this task's or any sibling
+ * task's — from a staging list immediately before it is shown to the user
+ * or staged with `git add`. Re-applied here regardless of which path above
+ * built `scopedFiles`, catching any entry whose OWN path matches a
+ * transcript basename.
+ *
+ * This is necessarily a basename check over a flat path list, so it cannot
+ * by itself catch a transcript renamed to an innocuous destination path
+ * (the rename's origin information isn't in this list — it was already
+ * discarded when `scopedFiles` was flattened). That case is caught earlier,
+ * in `getChangedFiles`, which still has each rename/copy record's origin
+ * path available and treats the whole record as sensitive if either
+ * endpoint is: see the "destSensitive || origSensitive" check there. Both
+ * layers are needed; this one alone is not sufficient for renames.
+ */
+export function stripSensitiveTaskFiles(
+  scopedFiles: string[],
+  repoRoot: string,
+  taskFolderPath: string
+): string[] {
+  const taskRootRelative = taskRootRelativeFor(repoRoot, taskFolderPath);
+  if (taskRootRelative === undefined) return scopedFiles;
+  return scopedFiles.filter((f) => !isSensitiveTaskFile(f, taskRootRelative));
+}
+
+/**
  * Get the list of changed files scoped to the implemented source changes
  * (default mode: everything OUTSIDE the task folder) or the entire repo,
  * task folder included (include-task-folder mode).
  *
- * Returns two arrays:
+ * Returns:
  *  - scopedFiles: files to be staged and shown in the preview
  *  - repoFiles:   all changed files in the repo (for display of what's excluded)
+ *  - runArtifactPaths: run-artifact files under the task folder, excluded by
+ *    default but eligible for the "Include Run Artifacts" override
+ *  - sensitiveFilePaths: chat-transcript files, excluded in EVERY mode
+ *    (including includeTaskFolder) — never eligible for that override. A
+ *    rename/copy record is classified here using BOTH its endpoints (see the
+ *    "destSensitive || origSensitive" check below), since this is the one
+ *    place where a rename's origin path is still available; the later
+ *    `stripSensitiveTaskFiles` gate only sees a flattened path list.
  */
 export async function getChangedFiles(
   repoRoot: string,
@@ -330,6 +415,7 @@ export async function getChangedFiles(
   scopedFiles: string[];
   repoFiles: string[];
   runArtifactPaths: string[];
+  sensitiveFilePaths: string[];
 }> {
   try {
     const { stdout } = await runGitCommand(repoRoot, "status", [
@@ -344,9 +430,11 @@ export async function getChangedFiles(
     const taskRelative = path
       .relative(repoRoot, taskFolderPath)
       .replace(/\\/g, "/");
+    const taskRootRelative = taskRootRelativeFor(repoRoot, taskFolderPath);
 
     // Identify run-artifact paths (runs/ and context-pack.md under the task folder)
     const runArtifactPaths: string[] = [];
+    const sensitiveFilePaths: string[] = [];
     const scopedFiles: string[] = [];
     const repoFiles: string[] = [];
 
@@ -357,6 +445,26 @@ export async function getChangedFiles(
       // deletion half staged while the addition half is excluded (or vice
       // versa), which would corrupt the rename into an orphaned add/delete.
       repoFiles.push(entry.path);
+
+      // Chat transcripts are excluded in every mode, for every task under
+      // the task root — never included by includeTaskFolder, and never
+      // eligible for the run-artifact override below. Checked against BOTH
+      // endpoints of a rename/copy: content survives a `git mv` to an
+      // innocuous-looking destination path (e.g. moving chat-v1.json out of
+      // the task root, or to a non-transcript basename inside it), so
+      // checking only entry.path would let transcript content reach staging
+      // under a new name. Either endpoint being sensitive taints the whole
+      // record — neither endpoint may enter scopedFiles/runArtifactPaths.
+      if (
+        isSensitiveTaskFile(entry.path, taskRootRelative) ||
+        (entry.origPath !== undefined && isSensitiveTaskFile(entry.origPath, taskRootRelative))
+      ) {
+        sensitiveFilePaths.push(entry.path);
+        if (entry.origPath !== undefined && entry.origPath !== entry.path) {
+          sensitiveFilePaths.push(entry.origPath);
+        }
+        continue;
+      }
 
       // Determine if this file is inside the task folder
       const isInTaskFolder =
@@ -397,9 +505,10 @@ export async function getChangedFiles(
       scopedFiles: scopedFiles.filter((f) => f.length > 0),
       repoFiles: repoFiles.filter((f) => f.length > 0),
       runArtifactPaths,
+      sensitiveFilePaths,
     };
   } catch {
-    return { scopedFiles: [], repoFiles: [], runArtifactPaths: [] };
+    return { scopedFiles: [], repoFiles: [], runArtifactPaths: [], sensitiveFilePaths: [] };
   }
 }
 
@@ -729,24 +838,11 @@ export async function commitAndPushTask(
     return;
   }
 
-  // Always run fresh checks immediately before a commit. Persisted payloads
-  // are informational and may be stale after files were edited.
-  const lintPayload = await runCompletionLint(vscode.Uri.file(resolvedTask.taskFolderPath), resolvedTask.progress.implReviewFiles);
-  if (!lintPayload.passed) {
-    const summary = lintPayload.summary ? ` (${lintPayload.summary})` : "";
-    const choice = await vscode.window.showWarningMessage(
-      `Lint reported failures for "${resolvedTask.folderName}"${summary}.\n\n` +
-        "The task was committed despite lint failures. Proceed anyway?",
-      { modal: true },
-      "Proceed",
-      "Cancel"
-    );
-    if (choice !== "Proceed") {
-      NotificationRouter.showInformation("Commit and push cancelled.");
-      return;
-    }
-  }
-
+  // Acquire the exclusive task-operation guard BEFORE any lint, prompts,
+  // staging, commit, or push work starts. A duplicate invocation (e.g. a
+  // fast double-click) must be refused here, not partway through — lint runs
+  // and the lint-failure modal below are not idempotent-safe against a
+  // second concurrent invocation on the same task.
   const lockKey = resolvedTask.taskFolderPath;
   const op = taskOperations.begin(lockKey, { label: "Commit and Push", taskName: resolvedTask.folderName });
   if (!op) {
@@ -754,6 +850,24 @@ export async function commitAndPushTask(
     return;
   }
   try {
+    // Always run fresh checks immediately before a commit. Persisted payloads
+    // are informational and may be stale after files were edited.
+    const lintPayload = await runCompletionLint(vscode.Uri.file(resolvedTask.taskFolderPath), resolvedTask.progress.implReviewFiles);
+    if (!lintPayload.passed) {
+      const summary = lintPayload.summary ? ` (${lintPayload.summary})` : "";
+      const choice = await vscode.window.showWarningMessage(
+        `Lint reported failures for "${resolvedTask.folderName}"${summary}.\n\n` +
+          "The task was committed despite lint failures. Proceed anyway?",
+        { modal: true },
+        "Proceed",
+        "Cancel"
+      );
+      if (choice !== "Proceed") {
+        NotificationRouter.showInformation("Commit and push cancelled.");
+        return;
+      }
+    }
+
   await vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Window,
@@ -790,7 +904,7 @@ export async function commitAndPushTask(
         // metadata (task.md, plan.md, run logs), not the code changes.
         progress.report({ message: "Collecting changed files..." });
         let includeTaskFolder = false;
-        let { scopedFiles, repoFiles, runArtifactPaths } = await getChangedFiles(
+        let { scopedFiles, repoFiles, runArtifactPaths, sensitiveFilePaths } = await getChangedFiles(
           repoRoot,
           resolvedTask.taskFolderPath,
           includeTaskFolder
@@ -819,7 +933,7 @@ export async function commitAndPushTask(
             return;
           }
           includeTaskFolder = true;
-          ({ scopedFiles, repoFiles, runArtifactPaths } = await getChangedFiles(
+          ({ scopedFiles, repoFiles, runArtifactPaths, sensitiveFilePaths } = await getChangedFiles(
             repoRoot,
             resolvedTask.taskFolderPath,
             includeTaskFolder
@@ -840,8 +954,20 @@ export async function commitAndPushTask(
               const taskRelative = path
                 .relative(repoRoot, resolvedTask.taskFolderPath)
                 .replace(/\\/g, "/");
+              // Chat transcripts are never eligible for this override — even
+              // though they live under the task folder like run artifacts,
+              // the transcript staging policy (Option A) never stages them.
+              // Filtered against `sensitiveFilePaths` (this same
+              // getChangedFiles call's classification), not a basename
+              // re-check: a transcript renamed to an innocuous basename still
+              // inside the task folder carries a destination path that
+              // getChangedFiles has already tagged as sensitive because its
+              // rename origin was a transcript, but whose own basename would
+              // pass a plain SENSITIVE_TASK_FILE_BASENAMES check.
+              const sensitivePathSet = new Set(sensitiveFilePaths);
               scopedFiles.push(...repoFiles.filter((f) => {
-                return f === taskRelative || f.startsWith(taskRelative + "/");
+                if (!(f === taskRelative || f.startsWith(taskRelative + "/"))) return false;
+                return !sensitivePathSet.has(f);
               }));
             } else {
               NotificationRouter.showInformation("Commit and push cancelled.");
@@ -879,6 +1005,12 @@ export async function commitAndPushTask(
           );
         }
 
+        // Final gate (the invariant): re-applied here regardless of which
+        // path above built `scopedFiles` — default fetch, include-task-folder
+        // re-fetch, or the run-artifact override re-add — so no chat
+        // transcript can reach the preview the user is about to confirm.
+        scopedFiles = stripSensitiveTaskFiles(scopedFiles, repoRoot, resolvedTask.taskFolderPath);
+
         // ----------------------------------------------------------------
         // ⚠️  CONFIRMATION DIALOG with file preview and push destination
         //
@@ -908,6 +1040,10 @@ export async function commitAndPushTask(
           !includeTaskFolder && notStagedCount > 0
             ? `\n\n(${notStagedCount} file(s) changed in the task folder — not staged by default)`
             : "";
+        const sensitiveExtra =
+          sensitiveFilePaths.length > 0
+            ? `\n\n(${sensitiveFilePaths.length} chat transcript file(s) excluded — plaintext prompt/response content, never staged by this command)`
+            : "";
 
         const confirmMessage =
           `⚠️ Commit and push — please review carefully\n\n` +
@@ -918,6 +1054,7 @@ export async function commitAndPushTask(
           fileList +
           moreNote +
           repoExtra +
+          sensitiveExtra +
           `\n\nPushing is outward-facing and largely irreversible.\n` +
           `Run artifacts (runs/, context-pack.md) contain AI prompts and file contents.\n` +
           `See DISCLAIMER.md §4-5 for full risk details.\n\n` +
@@ -960,6 +1097,13 @@ export async function commitAndPushTask(
               if (inTaskFolder) {
                 channel.appendLine(`  ${renderPath(f)}`);
               }
+            }
+          }
+          if (sensitiveFilePaths.length > 0) {
+            channel.appendLine("");
+            channel.appendLine("Excluded — chat transcripts (plaintext prompt/response content, never staged by this command):");
+            for (const f of sensitiveFilePaths) {
+              channel.appendLine(`  ${renderPath(f)}`);
             }
           }
           channel.appendLine("");
@@ -1014,6 +1158,12 @@ export async function commitAndPushTask(
         });
 
         try {
+          // Final gate, reapplied immediately before the actual `git add` —
+          // the true invariant point. Nothing rebuilds scopedFiles between
+          // the confirmation preview and here today, but this call is what
+          // makes that a property of the code rather than an assumption.
+          scopedFiles = stripSensitiveTaskFiles(scopedFiles, repoRoot, resolvedTask.taskFolderPath);
+
           // Stage changes — always exactly the scopedFiles list the user
           // just confirmed in the preview dialog above (never a bare `-A`,
           // which would silently stage excluded run artifacts too).
@@ -1140,7 +1290,10 @@ export async function completeCommitAndPushTask(
   // of this same command (or a sibling command on the same task) racing the
   // stage-eligibility check above and double-advancing/double-completing.
   // Released before step 4 so the commitAndPushTask call below can acquire
-  // its own lock on the same folder without self-deadlocking.
+  // its own lock on the same folder without self-deadlocking. This leaves a
+  // small window, between this lock's release and commitAndPushTask's own
+  // (now-earlier) guard acquisition, where a second invocation could begin —
+  // tolerated for now; durable cross-call serialization is out of scope here.
   const lockKey = resolvedTask.taskFolderPath;
   const op = taskOperations.begin(lockKey, { label: "Complete, Commit and Push", taskName: resolvedTask.folderName });
   if (!op) {

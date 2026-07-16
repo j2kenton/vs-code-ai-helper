@@ -7,6 +7,7 @@
 // more vscode-importing modules.
 
 const path = require("node:path");
+const fs = require("node:fs");
 
 function normalizeFsPath(p) {
   return p.split("/").join(path.sep);
@@ -217,6 +218,20 @@ class QuickPick {
 
 class InputBox extends QuickPick { }
 
+/** Minimal OutputChannel stub: records lines so tests can assert on them. */
+class OutputChannel {
+  constructor(name) {
+    this.name = name;
+    this.lines = [];
+  }
+  appendLine(value) { this.lines.push(value); }
+  append(value) { this.lines.push(value); }
+  clear() { this.lines = []; }
+  show() { /* no-op in tests */ }
+  hide() { /* no-op in tests */ }
+  dispose() { /* no-op in tests */ }
+}
+
 class FileSystemWatcher {
   constructor() { this._onDidChange = new EventEmitter(); this._onDidCreate = new EventEmitter(); this._onDidDelete = new EventEmitter(); }
   get onDidChange() { return this._onDidChange.event; }
@@ -259,6 +274,19 @@ const workspace = {
     writeFile: notImplemented("workspace.fs.writeFile"),
     createDirectory: notImplemented("workspace.fs.createDirectory"),
     readDirectory: notImplemented("workspace.fs.readDirectory"),
+    // Real implementation (not notImplemented): several modules use a plain
+    // existence/kind check before deciding whether to migrate/create a file,
+    // and that's cheap enough to back with real fs rather than require every
+    // such test to stub it individually.
+    stat: async (uri) => {
+      const stats = fs.statSync(uri.fsPath);
+      return {
+        type: stats.isDirectory() ? FileType.Directory : FileType.File,
+        ctime: stats.ctimeMs,
+        mtime: stats.mtimeMs,
+        size: stats.size,
+      };
+    },
   },
   asRelativePath: (uri) => (uri && uri.path ? uri.path : String(uri)),
   workspaceFolders: undefined,
@@ -320,6 +348,7 @@ const window = {
   createInputBox: () => new InputBox(),
   showTextDocument: async (document) => ({ document, viewColumn: undefined }),
   createTreeView: (id, options) => new TreeView(id, options),
+  createOutputChannel: (name) => new OutputChannel(name),
   registerFileDecorationProvider: (provider) => ({ provider, dispose() { } }),
   // Real VS Code always has a WindowState; default to focused so tests that
   // don't care about desktop-notification focus-gating aren't surprised by
@@ -372,6 +401,7 @@ module.exports = {
   StatusBarItem,
   QuickPick,
   InputBox,
+  OutputChannel,
   FileSystemWatcher,
   TreeItemCollapsibleState,
   TreeItem,

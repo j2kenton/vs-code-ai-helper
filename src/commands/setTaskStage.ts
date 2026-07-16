@@ -7,10 +7,11 @@ import {
 import { IncompleteTask } from "../utils/taskProgressUtils";
 import { TaskInventory } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
-import { resolveTaskContext } from "../utils/resolveTaskContext";
+import { resolveTaskContext, ResolvedTaskContext } from "../utils/resolveTaskContext";
 import { advanceStage } from "../utils/stageTransition";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { runCompletionLint } from "../utils/completionLint";
+import { pickReopenStage, reopenCompletedTask } from "../utils/reopenTask";
 
 /**
  * Accepted argument shapes for setTaskStage.
@@ -166,6 +167,18 @@ export async function setTaskStage(
   }
 
   const task = resolvedTask;
+
+  // A completed task changing stage is always a reopen, never a plain
+  // advance/jump: `advanceStage` has no notion of leaving the completed
+  // lifecycle, and the current-stage-current filtering below would remove
+  // Publish — a valid reopen target — from a completed task's picker. Route
+  // through the same reopen transition Resume uses so this command (reachable
+  // from the palette and keybindings, where menu `when`-clauses can't help)
+  // can never regress a completed task into a contradictory state.
+  if (task.progress.status === "completed") {
+    return setTaskStageOnCompletedTask(inventory, currentTaskStore, task, requestedStage);
+  }
+
   let newStage: TaskStage | undefined = requestedStage;
 
   if (!newStage) {
@@ -238,6 +251,57 @@ export async function setTaskStage(
       taskFolderPath: task.taskFolderPath,
     });
   }
+}
+
+/**
+ * Reopen a completed task instead of advancing it. Shared with the Resume
+ * command via `reopenCompletedTask` so marker capture, stale validation, and
+ * field invalidation cannot drift between entry points.
+ *
+ * `requestedStage` is set when this was invoked from a specific stage-row
+ * button (`setStageAsCurrent`) rather than the task-row picker
+ * (`setTaskStage`) — that path skips the picker but still gets the full
+ * reopen transition, marker capture, and stale validation.
+ *
+ * Deliberately does not filter the current stage out of the picker (unlike
+ * the non-completed path above) and does not run the publish auto-lint: the
+ * reopen mutation already cleared `lintPayload`, so lint state is "unknown"
+ * and the existing commit/push gating handles re-running it.
+ */
+async function setTaskStageOnCompletedTask(
+  inventory: TaskInventory,
+  currentTaskStore: CurrentTaskStore,
+  task: ResolvedTaskContext,
+  requestedStage: TaskStage | undefined
+): Promise<void> {
+  const capturedCompletedAt = task.progress.completedAt;
+  const chosenStage = requestedStage ?? (await pickReopenStage(task.folderName));
+  if (!chosenStage) {
+    return;
+  }
+
+  const result = await reopenCompletedTask(
+    inventory,
+    currentTaskStore,
+    task.taskFolderPath,
+    task.canonicalId,
+    chosenStage,
+    capturedCompletedAt
+  );
+
+  if (result.outcome === "stale") {
+    void vscode.window.showWarningMessage(result.message!);
+    return;
+  }
+  if (result.outcome === "failed") {
+    void vscode.window.showErrorMessage(result.message ?? "Could not reopen the task.");
+    return;
+  }
+
+  await inventory.refresh();
+  NotificationRouter.showInformation(
+    `${task.folderName} reopened at ${STAGE_DISPLAY_NAMES[chosenStage]}.`
+  );
 }
 
 /**

@@ -1,13 +1,15 @@
 import * as vscode from "vscode";
 import { TaskInventory } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
-import { resolveTaskContext } from "../utils/resolveTaskContext";
+import { resolveTaskContext, ResolvedTaskContext } from "../utils/resolveTaskContext";
 import {
   IncompleteTask,
 } from "../utils/taskProgressUtils";
+import { STAGE_DISPLAY_NAMES } from "../types/taskProgress";
 
 import { NotificationRouter } from "../utils/notificationRouter";
 import { activateTask } from "../state/taskActivationCoordinator";
+import { pickReopenStage, reopenCompletedTask } from "../utils/reopenTask";
 
 /**
  * Accepted argument shapes for resumeTask.
@@ -108,6 +110,10 @@ export async function resumePausedTask(
     return;
   }
 
+  if (resolvedTask.progress.status === "completed") {
+    return resumeCompletedTask(inventory, currentTaskStore, resolvedTask);
+  }
+
   if (resolvedTask.progress.status !== "paused") {
     NotificationRouter.showInformation(`Task is not paused.`);
     return;
@@ -125,6 +131,48 @@ export async function resumePausedTask(
   // router and status bar reflect it immediately — CurrentTaskStore is the
   // single source of truth for all surfaces (tree, status bar, task actions).
   NotificationRouter.showInformation(`Task resumed.`);
+}
+
+/**
+ * Resume a completed task by reopening it at a chosen stage (Publish
+ * preselected). Shows the picker BEFORE any state changes — cancelling
+ * leaves the task fully completed and pauses nothing. The lifecycle marker
+ * (`completedAt`) is captured here, before the picker is shown, so the
+ * in-write validation inside `reopenCompletedTask` can detect the task being
+ * resumed or re-completed by another window while the picker was open.
+ */
+async function resumeCompletedTask(
+  inventory: TaskInventory,
+  currentTaskStore: CurrentTaskStore,
+  resolvedTask: ResolvedTaskContext
+): Promise<void> {
+  const capturedCompletedAt = resolvedTask.progress.completedAt;
+  const chosenStage = await pickReopenStage(resolvedTask.folderName);
+  if (!chosenStage) {
+    return;
+  }
+
+  const result = await reopenCompletedTask(
+    inventory,
+    currentTaskStore,
+    resolvedTask.taskFolderPath,
+    resolvedTask.canonicalId,
+    chosenStage,
+    capturedCompletedAt
+  );
+
+  if (result.outcome === "stale") {
+    void vscode.window.showWarningMessage(result.message!);
+    return;
+  }
+  if (result.outcome === "failed") {
+    void vscode.window.showErrorMessage(result.message ?? "Could not reopen the task.");
+    return;
+  }
+
+  NotificationRouter.showInformation(
+    `${resolvedTask.folderName} reopened at ${STAGE_DISPLAY_NAMES[chosenStage]}.`
+  );
 }
 
 /**

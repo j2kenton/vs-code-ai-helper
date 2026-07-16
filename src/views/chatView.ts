@@ -3,21 +3,23 @@ import * as crypto from "crypto";
 import { TaskStage } from "../types/taskProgress";
 import { notifyDesktop } from "../utils/desktopNotifier";
 import { taskOperations } from "../utils/taskOperations";
+import { NotificationRouter } from "../utils/notificationRouter";
+import {
+  ChatMessage,
+  loadTranscriptWithMigration,
+  writeChatHistory,
+} from "../utils/chatHistoryStore";
 
-export interface ChatMessage {
-  role: "user" | "assistant" | "question";
-  text: string;
-  stage: TaskStage;
-  at: string;
-  /** A question remains pending until the user sends a follow-up message. */
-  pending?: boolean;
-}
+export type { ChatMessage };
 
 interface ChatTarget {
   canonicalId: string;
   taskFolderPath: string;
   stage: TaskStage;
 }
+
+/** The identity fields an append/transcript operation is anchored to. */
+type ChatIdentity = Pick<ChatTarget, "canonicalId" | "taskFolderPath">;
 
 interface SendMessage {
   type: "send";
@@ -34,13 +36,30 @@ export interface StageChatQuestion extends ChatTarget {
   question: string;
 }
 
-/** A workspace-scoped, persistent conversation surface for the active task. */
+function sameIdentity(a: ChatIdentity | undefined, b: ChatIdentity | undefined): boolean {
+  if (!a || !b) return a === b;
+  return a.canonicalId === b.canonicalId && a.taskFolderPath === b.taskFolderPath;
+}
+
+/** A workspace-scoped, persistent conversation surface for the active task.
+ * Transcripts are persisted to `chat-v1.json` inside each task folder (see
+ * chatHistoryStore.ts) so they travel with the task, with a lazy one-time
+ * migration from the legacy per-workspace Memento transcript. */
 export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposable {
   static readonly viewType = "vs-code-ai-helper.chatView";
   private view?: vscode.WebviewView;
   private target?: ChatTarget;
-  /** Serialize updates so rapid user/agent messages cannot lose one another. */
-  private writes: Promise<void> = Promise.resolve();
+  /**
+   * One write/read queue per task folder, so a slow or failing operation on
+   * one task can never stall or lose a message for another. Reads
+   * (transcript/render) are chained through the same queue as writes so a
+   * lazy migration can never race a concurrent append for the same task.
+   */
+  private queues = new Map<string, Promise<void>>();
+  /** Tracks which tasks already showed the "could not save" warning, so a
+   * run of write failures surfaces one notice, not one per message. Cleared
+   * the next time a write for that task succeeds. */
+  private warnedTasks = new Set<string>();
   private readonly operationsSub: vscode.Disposable;
 
   constructor(private readonly state: vscode.Memento) {
@@ -63,10 +82,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     view.webview.html = this.html();
     view.webview.onDidReceiveMessage(async (message: unknown) => {
       if (!isSendMessage(message) || !this.target) return;
+      // Captured before any await, so a target switch mid-send still writes
+      // to (and, if still current, renders) the task the message was sent to.
       const target = this.target;
       const text = message.text.trim();
       if (!text) return;
-      await this.append("user", text, target.stage, target.canonicalId);
+      await this.append("user", text, target.stage, target);
       await vscode.commands.executeCommand("vs-code-ai-helper.chatWithStage", {
         ...target,
         message: text,
@@ -81,51 +102,114 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     void this.render();
   }
 
+  /**
+   * A question is always appended to `question`'s own transcript, regardless
+   * of what's currently open — see `append`. The view itself is only
+   * switched/focused onto `question`'s task when doing so wouldn't yank the
+   * user away from a different task they've since switched to: either
+   * nothing is open yet, or the currently open task already is this one. If
+   * some other task is current, this must not steal focus back to `question`
+   * — that would silently render the answer/question against the wrong task
+   * from the user's point of view (see chatWithStage.ts, whose stage runs
+   * capture the target task before any await, so a response can complete
+   * well after the user has moved on to a different task's chat).
+   */
   async ask(question: StageChatQuestion): Promise<void> {
-    await this.open(question);
-    await this.append("question", question.question, question.stage, question.canonicalId, true);
+    if (!this.target || sameIdentity(this.target, question)) {
+      await this.open(question);
+    }
+    await this.append("question", question.question, question.stage, question, true);
     notifyDesktop("Ensemble — question", question.question);
   }
 
+  /**
+   * Append a message to `identity`'s transcript (defaulting to the current
+   * target). `identity` must be captured by the caller before any await —
+   * see chatWithStage.ts, which captures the task at the start of a run so a
+   * response completing after the user switched chats still lands in the
+   * originating task's file rather than whatever is currently open.
+   */
   async append(
     role: ChatMessage["role"],
     text: string,
     stage: TaskStage,
-    canonicalId = this.target?.canonicalId,
+    identity: ChatIdentity | undefined = this.target,
     pending = false
   ): Promise<void> {
-    if (!canonicalId) return;
-    const key = this.keyFor(canonicalId);
-    this.writes = this.writes.then(async () => {
-      const entries = this.entriesFor(key);
-      entries.push({ role, text, stage, at: new Date().toISOString(), pending });
-      await this.state.update(key, entries.slice(-200));
-    });
-    await this.writes;
-    await this.render();
+    if (!identity) return;
+    const message: ChatMessage = { role, text, stage, at: new Date().toISOString(), pending };
+    await this.runQueued(identity.taskFolderPath, () => this.persistAppend(identity, message));
+
+    if (sameIdentity(this.target, identity)) {
+      await this.render();
+    }
   }
 
   /** Recent conversation is supplied to the runner so a response can safely
    * answer an AI's earlier clarification question rather than becoming an
    * unrelated one-shot prompt. */
-  transcript(canonicalId: string): ChatMessage[] {
-    return this.entriesFor(this.keyFor(canonicalId));
+  async transcript(taskFolderPath: string, canonicalId: string): Promise<ChatMessage[]> {
+    return this.runQueued(taskFolderPath, () =>
+      loadTranscriptWithMigration(taskFolderPath, canonicalId, this.state)
+    );
   }
 
-  private keyFor(canonicalId: string): string {
-    // Canonical IDs are workspace-local, but encoding keeps a Memento key
-    // safe even for legacy IDs containing punctuation.
-    return `ensemble.stageChat.transcript.${encodeURIComponent(canonicalId)}`;
+  private async persistAppend(identity: ChatIdentity, message: ChatMessage): Promise<void> {
+    try {
+      const current = await loadTranscriptWithMigration(identity.taskFolderPath, identity.canonicalId, this.state);
+      await writeChatHistory(identity.taskFolderPath, [...current, message]);
+      this.warnedTasks.delete(identity.taskFolderPath);
+    } catch (error) {
+      // A persistence failure must not surface as a chat-send failure, and
+      // must not stop later messages for this (or any other) task from
+      // being attempted — the queue this runs under already keeps advancing.
+      if (!this.warnedTasks.has(identity.taskFolderPath)) {
+        this.warnedTasks.add(identity.taskFolderPath);
+        NotificationRouter.showWarning(
+          `Could not save chat history to disk for this task. (${error instanceof Error ? error.message : String(error)})`
+        );
+      }
+    }
   }
 
-  private entriesFor(key: string): ChatMessage[] {
-    const value = this.state.get<ChatMessage[]>(key, []);
-    return Array.isArray(value) ? value.slice(-200) : [];
+  /** Chain `op` onto this task's queue so operations on one task's transcript
+   * (writes and reads alike) never interleave with one another, while a
+   * different task's queue is unaffected. A failed prior operation cannot
+   * poison the queue for subsequent ones. */
+  private runQueued<T>(taskFolderPath: string, op: () => Promise<T>): Promise<T> {
+    const previous = this.queues.get(taskFolderPath) ?? Promise.resolve();
+    let result!: T;
+    const next = previous.catch(() => undefined).then(async () => {
+      result = await op();
+    });
+    this.queues.set(taskFolderPath, next);
+    return next.then(() => result);
   }
 
   private async render(): Promise<void> {
-    const entries = this.target ? this.entriesFor(this.keyFor(this.target.canonicalId)) : [];
-    const busy = this.target ? taskOperations.getTaskOperations(this.target.canonicalId).some(op => !op.exclusive) : false;
+    // Captured before the (now async, file-backed) transcript read so a
+    // target switch mid-read can be detected and the stale render dropped
+    // instead of painting one task's history into another's view.
+    const target = this.target;
+    let entries: ChatMessage[] = [];
+    if (target) {
+      try {
+        entries = await this.transcript(target.taskFolderPath, target.canonicalId);
+      } catch (error) {
+        // A transcript that fails to read (e.g. corrupt and unquarantinable —
+        // see chatHistoryStore's readChatHistory) must not crash render(), or
+        // by extension append()/ask() callers that await it. Show it as
+        // empty and warn once, mirroring persistAppend's own containment.
+        if (!this.warnedTasks.has(target.taskFolderPath)) {
+          this.warnedTasks.add(target.taskFolderPath);
+          NotificationRouter.showWarning(
+            `Could not load chat history for this task. (${error instanceof Error ? error.message : String(error)})`
+          );
+        }
+      }
+    }
+    if (!sameIdentity(target, this.target)) return;
+    const busy = target ? taskOperations.getTaskOperations(target.canonicalId).some(op => !op.exclusive) : false;
     await this.view?.webview.postMessage({ type: "state", target: this.target, entries, busy });
   }
 
