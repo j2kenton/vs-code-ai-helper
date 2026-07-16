@@ -69,7 +69,10 @@ void describe("provider CLI contracts", () => {
     const textArgs = antigravity.buildArgs("text", undefined, undefined, {
       promptFile: "/tmp/prompt.txt",
     });
-    assert.deepStrictEqual(textArgs, ["--print=/tmp/prompt.txt"]);
+    assert.deepStrictEqual(textArgs, [
+      "--print=/tmp/prompt.txt",
+      "--dangerously-skip-permissions",
+    ]);
 
     const editArgs = antigravity.buildArgs("edit", "gemini-3-pro", undefined, {
       promptFile: "/tmp/prompt.txt",

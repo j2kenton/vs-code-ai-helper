@@ -400,11 +400,24 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     // `--print=<prompt>` value would hit on large context packs.
     promptTransport: "file",
     useShell: false,
-    buildArgs(mode, model, _lastMessageFile, context): string[] {
-      const args: string[] = [`--print=${context?.promptFile ?? ""}`];
-      if (mode === "edit") {
-        args.push("--dangerously-skip-permissions");
-      }
+    // Deliberate exception to the "text mode stays read-only" contract
+    // above: `agy --print` (headless) has no way to grant scoped, read-only
+    // tool trust the way Gemini's `--sandbox read-only` or Kiro's
+    // `--trust-tools` do. Its only approval surface is a fixed
+    // ~/.gemini/antigravity-cli/settings.json allowlist of exact shell
+    // commands, and `--sandbox` restricts what an *approved* command can do
+    // rather than granting approval — confirmed by testing both against the
+    // same denied call. Any verification command the model reaches for that
+    // isn't on that allowlist makes text-mode runs (plans, reviews) fail
+    // outright with zero output, since headless mode can't prompt. Passing
+    // --dangerously-skip-permissions here too trades that hard, silent
+    // failure for the (accepted) risk that a text-mode run could write or
+    // delete files.
+    buildArgs(_mode, model, _lastMessageFile, context): string[] {
+      const args: string[] = [
+        `--print=${context?.promptFile ?? ""}`,
+        "--dangerously-skip-permissions",
+      ];
       if (model) {
         args.push("--model", model);
       }
