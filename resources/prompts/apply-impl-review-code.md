@@ -9,9 +9,13 @@ Use the file inspection and editing capabilities available in your execution env
 Read the implementation notes and the review below, then:
 
 1. Inspect the current code before touching anything
-2. Fix every blocking issue the review raised
-3. Address non-blocking suggestions where they are clearly correct and in scope
-4. Edit files directly in the workspace, and remove anything obsolete
+2. Fix every unresolved or partially resolved blocker the review identifies, including architectural, defect, completion, and previous-review blockers
+3. Do not substitute smaller non-blocking changes while required blockers remain
+4. Treat review-confidence blockers as an instruction to inspect the workspace directly or improve the missing evidence, not as proof of a code defect
+5. Address non-blocking suggestions where they are clearly correct and in scope
+6. Edit files directly in the workspace, and remove anything obsolete
+
+If a blocker is too large to complete in one run, implement the largest coherent prerequisite slice that directly advances that blocker, then state exactly what remains. Do not claim the review is fully addressed merely because unrelated or lower-risk fixes were completed.
 
 Before producing the final summary, make sure the workspace files were actually changed. If you cannot write files, report that failure and the reason instead of claiming the implementation is complete.
 
@@ -19,6 +23,7 @@ Do NOT create or edit a `plan-final.md` or `implementation.md` file at the repos
 
 - A one-or-two sentence statement of what was implemented overall (including this round's fixes)
 - A `## Files Changed` section listing each file created or modified in this round with one line describing the change
+- If any blocker remains, a `## Remaining Blockers` section naming each unresolved item and why it could not be completed in this run
 - A `## Verification` section with a short checklist of how to confirm the implementation is correct
 
 Output ONLY the summary document as your final text response after you are done making changes — do not narrate your intentions before acting, and do not write the summary to a file.

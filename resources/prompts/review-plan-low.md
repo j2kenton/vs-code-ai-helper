@@ -2,6 +2,8 @@ You are performing a LOW-LEVEL review of an implementation plan for a software e
 
 Focus on the details: are the individual steps concrete, correctly ordered, and actually implementable? Are the named files/areas plausible? Are edge cases, error handling, migrations, and testing covered? Is each acceptance criterion verifiable?
 
+Classify an issue as blocking when the plan cannot be implemented responsibly or verified without resolving it. Details that can safely be settled during implementation are non-blocking.
+
 Begin your response with a readiness score on its own line in this exact format:
 Readiness: N/10
 

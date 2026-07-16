@@ -6,6 +6,8 @@
  * requiring the VS Code extension host.
  */
 import * as assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { describe, it } from "node:test";
 
 // ---------------------------------------------------------------------------
@@ -193,35 +195,85 @@ void describe("review apply model resolution contract", () => {
   }
 });
 
-void describe("high-level plan re-review prompt selection", () => {
-  void it("uses the initial-review prompt when entering high-level review from plan", () => {
+void describe("review and re-review prompt selection", () => {
+  const cases = [
+    {
+      stage: "plan-high-review",
+      initialPrompt: "review-plan-high.md",
+      rereviewPrompt: "review-plan-high-rereview.md",
+    },
+    {
+      stage: "plan-low-review",
+      initialPrompt: "review-plan-low.md",
+      rereviewPrompt: "review-plan-low-rereview.md",
+    },
+    {
+      stage: "impl-high-review",
+      initialPrompt: "review-impl-high.md",
+      rereviewPrompt: "review-impl-high-rereview.md",
+    },
+    {
+      stage: "impl-low-review",
+      initialPrompt: "review-impl-low.md",
+      rereviewPrompt: "review-impl-low-rereview.md",
+    },
+    {
+      stage: "publish",
+      initialPrompt: "review-publish.md",
+      rereviewPrompt: "review-publish-rereview.md",
+    },
+  ] as const;
+
+  for (const testCase of cases) {
+    void it(`has both prompt files for ${testCase.stage}`, () => {
+      for (const promptFile of [testCase.initialPrompt, testCase.rereviewPrompt]) {
+        assert.ok(
+          fs.existsSync(path.join(process.cwd(), "resources", "prompts", promptFile)),
+          `missing review prompt: ${promptFile}`
+        );
+      }
+    });
+
+    void it(`uses the initial ${testCase.stage} prompt when no previous review exists`, () => {
+      assert.strictEqual(
+        selectReviewPromptTemplate(
+          testCase.stage,
+          testCase.stage,
+          undefined
+        ),
+        testCase.initialPrompt
+      );
+    });
+
+    void it(`uses the reconciliation prompt when re-reviewing ${testCase.stage}`, () => {
+      assert.strictEqual(
+        selectReviewPromptTemplate(
+          testCase.stage,
+          testCase.stage,
+          "Readiness: 5/10\n\n- Completion blockers: one."
+        ),
+        testCase.rereviewPrompt
+      );
+    });
+
+    void it(`does not treat a stale ${testCase.stage} placeholder as a previous review`, () => {
+      assert.strictEqual(
+        selectReviewPromptTemplate(
+          testCase.stage,
+          testCase.stage,
+          "# Review Stale\n\nRun Review with AI again."
+        ),
+        testCase.initialPrompt
+      );
+    });
+  }
+
+  void it("uses the initial prompt when entering a review stage even if an old artifact exists", () => {
     assert.strictEqual(
       selectReviewPromptTemplate(
         "plan-high-review",
         "plan",
-        "Readiness: 5/10\n\n- Blocking issues: one."
-      ),
-      "review-plan-high.md"
-    );
-  });
-
-  void it("uses the reconciliation prompt when re-reviewing an existing high-level review", () => {
-    assert.strictEqual(
-      selectReviewPromptTemplate(
-        "plan-high-review",
-        "plan-high-review",
-        "Readiness: 5/10\n\n- Blocking issues: one."
-      ),
-      "review-plan-high-rereview.md"
-    );
-  });
-
-  void it("does not treat a stale placeholder as a previous review", () => {
-    assert.strictEqual(
-      selectReviewPromptTemplate(
-        "plan-high-review",
-        "plan-high-review",
-        "# Review Stale\n\nRun Review with AI again."
+        "Readiness: 5/10\n\n- Completion blockers: one."
       ),
       "review-plan-high.md"
     );

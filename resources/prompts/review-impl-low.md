@@ -4,6 +4,8 @@ The context pack below contains the implementation review files for this task. W
 
 Assess at the code level: correctness of the specific changes, edge cases, error handling, consistency with the surrounding code, and whether each plan item is genuinely complete rather than superficially present.
 
+Score the current implementation against the full approved plan, not merely the subset attempted in the implementation notes. Required plan items or acceptance criteria that remain incomplete or were unilaterally deferred are completion blockers. Keep missing evidence separate as a review-confidence blocker rather than guessing.
+
 Structure your review as:
 
 Begin your response with a readiness score on its own line in this exact format:
@@ -11,7 +13,9 @@ Readiness: N/10
 
 - Summary verdict (ready to complete / needs changes / cannot fully assess).
 - Per plan item: done / incomplete / defective / cannot assess, with file-level evidence for each judgment.
-- Blocking issues (if any), each with the file, the problem, and a concrete failure scenario.
+- Defect blockers (if any), each with the file, the problem, and a concrete failure scenario.
+- Completion blockers (if any).
+- Review-confidence blockers (if any).
 - Non-blocking suggestions (if any).
 
 ## Context Pack (implementation review files)

@@ -795,18 +795,25 @@ const REVIEW_PROMPTS: Partial<Record<TaskStage, string>> = {
   "publish": "review-publish.md",
 };
 
+const REVIEW_REREVIEW_PROMPTS: Partial<Record<TaskStage, string>> = {
+  "plan-high-review": "review-plan-high-rereview.md",
+  "plan-low-review": "review-plan-low-rereview.md",
+  "impl-high-review": "review-impl-high-rereview.md",
+  "impl-low-review": "review-impl-low-rereview.md",
+  "publish": "review-publish-rereview.md",
+};
+
 export function selectReviewPromptTemplate(
   targetStage: TaskStage,
   currentStage: TaskStage,
   previousReview: string | undefined
 ): string | undefined {
   if (
-    targetStage === "plan-high-review" &&
     currentStage === targetStage &&
     previousReview !== undefined &&
     !isStaleReviewArtifact(previousReview)
   ) {
-    return "review-plan-high-rereview.md";
+    return REVIEW_REREVIEW_PROMPTS[targetStage] ?? REVIEW_PROMPTS[targetStage];
   }
   return REVIEW_PROMPTS[targetStage];
 }
@@ -883,7 +890,7 @@ export async function runReviewForFolder(
   const variables: Record<string, string> = {};
   const isPlanReview = isPlanReviewStage(targetStage);
   const previousReview =
-    targetStage === "plan-high-review" && currentStage === targetStage
+    currentStage === targetStage
       ? await readPreviousReviewForRereview(reviewUri)
       : undefined;
   const templateFile = selectReviewPromptTemplate(
@@ -1103,12 +1110,12 @@ export async function runReviewForFolder(
 }
 
 /**
- * Review prompts (review-plan-high.md, review-plan-low.md, review-impl-high.md,
- * review-impl-low.md) all require a leading `Readiness: N/10` line. A response
- * missing it is a strong signal the provider didn't actually perform the
- * review — e.g. it replied with a clarifying question about the prompt file
- * instead of reviewing it, which still exits 0 with non-empty output and
- * would otherwise be indistinguishable from a real review.
+ * All initial-review and re-review prompts require a leading
+ * `Readiness: N/10` line. A response missing it is a strong signal the
+ * provider didn't actually perform the review — e.g. it replied with a
+ * clarifying question about the prompt file instead of reviewing it, which
+ * still exits 0 with non-empty output and would otherwise be
+ * indistinguishable from a real review.
  */
 function validateReviewOutput(content: string): { valid: boolean; reason: string } {
   const { score } = parseReadiness(content);

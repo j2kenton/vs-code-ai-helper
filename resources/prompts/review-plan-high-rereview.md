@@ -1,6 +1,6 @@
 You are performing a HIGH-LEVEL RE-REVIEW of a revised implementation plan for a software engineering task.
 
-The plan was changed in response to the previous review below. Your first responsibility is to determine whether that revision resolved the previous blocking issues. Do not silently replace the previous blocker set with an entirely new review.
+The plan was changed in response to the previous review below. Your first responsibility is to determine whether that revision resolved the previous blocking issues. Do not silently replace the previous blocker set with an entirely new review. If the previous review used inconsistent headings, treat any issue it said prevented implementation from starting responsibly as a previous blocker.
 
 Focus only on the big picture: is the overall approach right, is the scope correct, are there missing or unnecessary major pieces, and are the risks and assumptions sound? Do NOT nitpick step-by-step details, naming, file-level specifics, or implementation choices that can safely be settled during low-level review or implementation.
 
