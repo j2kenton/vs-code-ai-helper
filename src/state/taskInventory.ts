@@ -58,10 +58,11 @@ export class TaskInventory {
       }
     }
 
-    // Keep a stable ID/date order. Status and activity must not reshuffle
-    // tasks, which made paused tasks appear to move unexpectedly.
+    // Keep a stable ID/date order, newest first. Status and activity must
+    // not reshuffle tasks, which made paused tasks appear to move
+    // unexpectedly.
     withProgress.sort((a, b) => {
-      return a.folderName.localeCompare(b.folderName, undefined, { numeric: true });
+      return b.folderName.localeCompare(a.folderName, undefined, { numeric: true });
     });
 
     this.visibleTasks = withProgress;

@@ -1,8 +1,32 @@
 import * as vscode from "vscode";
-import { spawn, execSync } from "child_process";
+import { spawn, execSync, execFileSync } from "child_process";
 import { patchTaskProgress, updateLintPayload } from "./taskProgressUtils";
 import * as fs from "fs";
 import * as path from "path";
+
+/**
+ * Resolve a package manager executable to an absolute path, preferring a
+ * .cmd/.bat/.exe shim on Windows. `where.exe` also matches extension-less
+ * POSIX shim scripts that npm installs alongside the real Windows shim (e.g.
+ * a bare `pnpm` file next to `pnpm.CMD`), and can list them first — spawning
+ * that extension-less file directly fails with ENOENT. Falls back to the
+ * bare executable name (relying on PATH resolution via shell:true) if
+ * `where`/`which` can't resolve it.
+ */
+function resolveManagerExecutable(cwd: string, manager: string): string {
+  try {
+    const locator = process.platform === "win32" ? "where.exe" : "which";
+    const candidates = execFileSync(locator, [manager], { cwd, windowsHide: true })
+      .toString("utf8").split(/\r?\n/).map(value => value.trim()).filter(Boolean);
+    const preferred = process.platform === "win32"
+      ? candidates.find(value => /\.(cmd|bat|exe)$/i.test(value)) ?? candidates[0]
+      : candidates[0];
+    if (preferred) return preferred;
+  } catch {
+    // Fall through to the PATH-relative name below.
+  }
+  return process.platform === "win32" ? `${manager}.cmd` : manager;
+}
 
 export interface CompletionLintResult {
   runAt: string;
@@ -59,14 +83,15 @@ function outputReferencesFile(output: string, folder: string, file: string): boo
 function runCheck(cwd: string, args: string[]): Promise<{ code: number; output: string }> {
   return new Promise((resolve) => {
     const executable = args[0] ?? "npm";
-    // shell:true on Windows so pnpm.cmd (an npm/pnpm global-install shim, not
-    // a real executable) can be exec'd at all — spawning a .cmd file directly
-    // with shell:false fails with EINVAL. See cliAgentRunner.ts for the same
-    // pattern applied to the CLI provider runners.
+    const resolved = resolveManagerExecutable(cwd, executable);
+    // shell:true on Windows so a .cmd/.bat shim (an npm/pnpm global-install
+    // shim, not a real executable) can be exec'd at all — spawning a .cmd
+    // file directly with shell:false fails with EINVAL. See cliAgentRunner.ts
+    // for the same pattern applied to the CLI provider runners.
     const child = spawn(
-      process.platform === "win32" ? `${executable}.cmd` : executable,
+      resolved,
       args.slice(1),
-      { cwd, shell: process.platform === "win32" }
+      { cwd, shell: process.platform === "win32" && /\.(cmd|bat)$/i.test(resolved) }
     );
     let output = "";
     child.stdout?.on("data", (data: Buffer | string) => { output += typeof data === "string" ? data : data.toString("utf8"); });

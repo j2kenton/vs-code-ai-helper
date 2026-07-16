@@ -133,12 +133,13 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
   });
 
   void describe("Status Surface retention, ordering, and expansion", () => {
-    void it("should keep the full message text and expose it via a click-to-expand child", () => {
+    void it("should keep the full message text in the stored entry while truncating only the tree label", () => {
       const surface = new StatusTreeProvider();
       initNotificationRouter(surface);
 
       // The stored entry keeps the complete text — only the tree label is
-      // shortened for display, and only then via a click-to-expand child.
+      // shortened for display (full text remains in the hover tooltip).
+      // There is no click-to-expand child row.
       const longMessage = "a".repeat(200);
       NotificationRouter.showInformation(longMessage);
       let entries = surface.getEntries();
@@ -148,12 +149,10 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
 
       const treeItem = surface.getTreeItem(firstEntry);
       assert.strictEqual(treeItem.label, `${longMessage.slice(0, 150)}…`);
-      assert.strictEqual(treeItem.collapsibleState, 1 /* Collapsed */);
+      assert.strictEqual(treeItem.collapsibleState, 0 /* None */);
 
       const children = surface.getChildren(firstEntry);
-      assert.ok(Array.isArray(children) && children.length === 1);
-      const detailItem = surface.getTreeItem((children as unknown[])[0] as Parameters<typeof surface.getTreeItem>[0]);
-      assert.strictEqual(detailItem.label, longMessage);
+      assert.ok(Array.isArray(children) && children.length === 0);
 
       // Newest-first ordering
       surface.clear();

@@ -184,6 +184,14 @@ interface ApplyReviewOptions {
   preserveActiveFallback?: boolean;
   /**
    * Replaces skipTaskLock. The parent operation that holds the task operation lock.
+   *
+   * This is the operation-lifecycle mechanism for composite flows: when a caller
+   * (e.g. fastForwardReviewWithAI) passes its own handle here, applyReviewWithAI
+   * reuses that single registered operation for every internal attempt instead
+   * of registering (and un-registering) a new one per attempt — so the
+   * Notifications/status views render exactly one in-progress row for the
+   * whole composite action, never one per internal step. See the
+   * `options.parentOperation` checks around the `begin`/`end` calls below.
    */
   parentOperation?: TaskOperationHandle;
 }
@@ -1043,6 +1051,7 @@ export async function runReviewForFolder(
         currentStage,
         targetStage,
         false,
+        "review-run",
         false,
         reviewAttemptId,
         async () => {
@@ -1092,9 +1101,48 @@ export async function runReviewForFolder(
               }
               publishArtifact = promotion.publish;
             }
-            const transition = await advanceStage(folderUri, targetStage, next, false, false, reviewAttemptId, publishArtifact);
+            const transition = await advanceStage(folderUri, targetStage, next, false, "auto-advance", true, reviewAttemptId, publishArtifact);
             if (transition?.persisted) {
               NotificationRouter.showInformation(`Review accepted. Advanced to ${STAGE_DISPLAY_NAMES[next]}.`);
+              // Auto-advancing into another review stage must itself kick off
+              // that stage's review — otherwise the task silently sits on a
+              // freshly-entered review stage with nothing running, which is
+              // indistinguishable from auto-advance being broken. This
+              // mirrors nextStage's own Step 4 (manual "Complete Stage & Move
+              // On" auto-review dispatch) for the auto-advance path.
+              if (transition.shouldAutoReview) {
+                const freshProgress = await readTaskProgress(folderUri);
+                if (freshProgress) {
+                  const nextWorkspaceRoot = resolveOwnerWorkspace(freshProgress);
+                  if (nextWorkspaceRoot) {
+                    // This dispatch bypasses the runReviewWithAI command, so it
+                    // must claim the exclusive lock itself — otherwise a manual
+                    // "Review with AI" click racing this auto-dispatch (the
+                    // registry has no record of this run in progress) would
+                    // start a second concurrent review for the same task.
+                    const autoReviewLockKey = folderUri.fsPath;
+                    const autoReviewOp = taskOperations.begin(autoReviewLockKey, {
+                      label: "Review",
+                      stage: freshProgress.currentStage,
+                    });
+                    if (!autoReviewOp) {
+                      showTaskBusyWarning(autoReviewLockKey);
+                    } else {
+                      try {
+                        await runReviewForFolder(
+                          extensionUri,
+                          folderUri,
+                          nextWorkspaceRoot,
+                          freshProgress.currentStage,
+                          true
+                        );
+                      } finally {
+                        taskOperations.end(autoReviewOp);
+                      }
+                    }
+                  }
+                }
+              }
             }
           }
         }
@@ -1867,6 +1915,7 @@ export async function nextStage(
     resolved.progress.currentStage,
     next,
     resolved.progress.status === "paused",
+    "complete-and-move-on",
     // Completing a stage may start work in its destination only when the
     // workspace explicitly enables that behavior.  Manual stage selection
     // deliberately does not use this path.
@@ -1931,14 +1980,31 @@ export async function nextStage(
       const workspaceRoot = resolveOwnerWorkspace(freshProgress);
       if (workspaceRoot) {
         // Bypass the consent gate for auto-triggered reviews — consent was
-        // already given by the user action that triggered nextStage.
-        await runReviewForFolder(
-          extensionUri,
-          resolved.folderUri,
-          workspaceRoot,
-          freshProgress.currentStage,
-          true
-        );
+        // already given by the user action that triggered nextStage. This
+        // dispatch bypasses the runReviewWithAI command, so it must claim the
+        // exclusive lock itself — otherwise a manual "Review with AI" click
+        // racing this auto-dispatch (the registry has no record of this run
+        // in progress) would start a second concurrent review for the same task.
+        const autoReviewLockKey = resolved.folderUri.fsPath;
+        const autoReviewOp = taskOperations.begin(autoReviewLockKey, {
+          label: "Review",
+          stage: freshProgress.currentStage,
+        });
+        if (!autoReviewOp) {
+          showTaskBusyWarning(autoReviewLockKey);
+        } else {
+          try {
+            await runReviewForFolder(
+              extensionUri,
+              resolved.folderUri,
+              workspaceRoot,
+              freshProgress.currentStage,
+              true
+            );
+          } finally {
+            taskOperations.end(autoReviewOp);
+          }
+        }
       }
     }
   }
@@ -2552,8 +2618,17 @@ async function runRelease(arg?: TaskNodeArg): Promise<void> {
     let managerPath: string;
     try {
       const locator = process.platform === "win32" ? "where.exe" : "which";
-      managerPath = (cp.execFileSync(locator, [manager], { cwd: root, windowsHide: true })
-        .toString("utf8").split(/\r?\n/).map(value => value.trim()).find(Boolean)) ?? "";
+      const candidates = cp.execFileSync(locator, [manager], { cwd: root, windowsHide: true })
+        .toString("utf8").split(/\r?\n/).map(value => value.trim()).filter(Boolean);
+      // where.exe also matches extension-less POSIX shim scripts (e.g. npm's
+      // global `pnpm` file alongside `pnpm.CMD`), and lists them ahead of the
+      // real Windows-executable shim in some npm installs. Node can't spawn
+      // an extension-less file directly on Windows (ENOENT), so prefer a
+      // .cmd/.bat/.exe match when one exists rather than blindly taking the
+      // first line.
+      managerPath = (process.platform === "win32"
+        ? candidates.find(value => /\.(cmd|bat|exe)$/i.test(value)) ?? candidates[0]
+        : candidates[0]) ?? "";
       if (!managerPath || !path.isAbsolute(managerPath)) throw new Error("package manager was not resolved to an absolute path");
     } catch (error) {
       void vscode.window.showErrorMessage(`Release cancelled: could not resolve ${manager} safely (${error instanceof Error ? error.message : String(error)}).`);

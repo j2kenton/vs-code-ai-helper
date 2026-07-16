@@ -71,25 +71,26 @@ void describe("Stage 3 action matrix contracts", () => {
     );
   });
 
-  void it("routes implementation and Publish fixes through mutually exclusive current-stage contexts", () => {
+  void it("binds Ctrl+Shift+Alt+I to applyCurrentStageAction for every stage, with no competing binding", () => {
     const contributes = readPackageContributes();
     const keybindings = contributes.keybindings ?? [];
     const implementationBinding = keybindings.find(
       (entry) => entry.command === "vs-code-ai-helper.applyCurrentStageAction"
     );
-    const publishFixBinding = keybindings.find(
-      (entry) => entry.command === "vs-code-ai-helper.runLintingFixes"
+    const competingBindings = keybindings.filter(
+      (entry) => entry.key === "ctrl+shift+alt+i" && entry.command !== "vs-code-ai-helper.applyCurrentStageAction"
     );
 
     assert.equal(implementationBinding?.key, "ctrl+shift+alt+i");
-    assert.equal(
-      implementationBinding?.when,
-      "vs-code-ai-helper.tasksInitialized && vs-code-ai-helper.currentTaskStage == impl"
-    );
-    assert.equal(publishFixBinding?.key, "ctrl+shift+alt+i");
-    assert.equal(
-      publishFixBinding?.when,
-      "vs-code-ai-helper.tasksInitialized && vs-code-ai-helper.currentTaskStage == publish"
+    // No stage gate: applyCurrentStageAction re-derives the live stage itself
+    // and routes accordingly (including to runLintingFixes on Publish), so
+    // gating the keybinding on a specific stage only breaks it on every
+    // other stage.
+    assert.equal(implementationBinding?.when, "vs-code-ai-helper.tasksInitialized");
+    assert.deepEqual(
+      competingBindings,
+      [],
+      "No other command should claim Ctrl+Shift+Alt+I; runLintingFixes is reached via applyCurrentStageAction's routing, not its own binding."
     );
   });
 
@@ -114,14 +115,16 @@ void describe("Stage 3 action matrix contracts", () => {
   });
 
   void it("uses the same free-form task-entry guidance in packaged and fallback templates", () => {
-    const expected = "# Task\n\nDescribe the work you want to do here in as much detail as is useful. When\nyou're ready, use **Draft with AI** to turn these notes into a structured task\ndescription. Questions from the stage AI appear in the **Chat With AI** panel.\n";
+    const expected =
+      "# Instructions\n\nDescribe the work you want to do here in as much detail as is useful. When\nyou're ready, use **Draft with AI** to turn these notes into a structured task\ndescription. Questions from the stage AI appear in the **Chat With AI** panel.\n\n# User's Description of the Task\n" +
+      "\n".repeat(10);
     const packagedTemplate = readWorkspaceFile(
       path.join("resources", "prompts", "task-template.md")
     ).replace(/\r\n/g, "\n");
     assert.equal(packagedTemplate, expected);
     assert.match(
       readWorkspaceFile(path.join("src", "commands", "startNewTask.ts")),
-      /return "# Task\\n\\nDescribe the work you want to do here/
+      /return "# Instructions\\n\\nDescribe the work you want to do here/
     );
   });
 

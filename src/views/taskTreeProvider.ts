@@ -119,7 +119,8 @@ export class TaskNode extends vscode.TreeItem {
     expanded: boolean,
     isCurrent: boolean = false,
     isScheduled: boolean = false,
-    isMetaManaged: boolean = false
+    isMetaManaged: boolean = false,
+    collapseEpoch: number = 0
   ) {
     super(
       task.progress.displayName ?? task.folderName,
@@ -132,8 +133,12 @@ export class TaskNode extends vscode.TreeItem {
     // refreshes within the same session. Uses the canonical ID when
     // available (normalized, lowercased on Windows) so it matches
     // exactly what CurrentTaskStore persists, falling back to fsPath for
-    // legacy task objects not sourced through TaskInventory.
-    this.id = taskIdentityKey(task);
+    // legacy task objects not sourced through TaskInventory. The epoch
+    // suffix is bumped by collapseAll() so the widget can't reuse a
+    // previously-memorized (expanded) UI state for the same task.
+    this.id = collapseEpoch > 0
+      ? `${taskIdentityKey(task)}::c${collapseEpoch}`
+      : taskIdentityKey(task);
 
     const currentStage = task.progress.currentStage;
     const stepNumber = STAGE_ORDER.indexOf(currentStage) + 1;
@@ -384,9 +389,12 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
   readonly onDidLoadTasks = this._onDidLoadTasks.event;
 
   // Collapse/expand state management
-  private mode: "autoFirstActive" | "allExpanded" = "autoFirstActive";
+  private mode: "autoFirstActive" | "allExpanded" | "allCollapsed" = "autoFirstActive";
   private readonly explicitlyExpanded = new Set<string>();
   private readonly explicitlyCollapsed = new Set<string>();
+  // Bumped on every collapseAll() so TaskNode ids change and VS Code can't
+  // reuse its own memorized (already-expanded) UI state for the same node.
+  private collapseEpoch = 0;
   private availableModels: SelectableModel[] = [];
   private readonly filterKey = "ensemble.taskStatusFilter";
   private readonly filterKnownStatusesKey = "ensemble.taskStatusFilterKnownStatuses";
@@ -493,6 +501,25 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
         // Ignore reveal failures (node may not be visible yet)
       }
     }
+  }
+
+  /** Collapse all task rows by switching to all-collapsed mode */
+  collapseAll(): void {
+    this.mode = 'allCollapsed';
+    this.explicitlyExpanded.clear();
+    this.explicitlyCollapsed.clear();
+    // VS Code's TreeView remembers expand/collapse state per item id across
+    // refreshes, so simply re-rendering with Collapsed items isn't enough for
+    // rows the user (or expandAll) already expanded. Bumping the epoch changes
+    // every node's id so the widget treats them as new items and applies the
+    // freshly computed (collapsed) state instead of the memorized one.
+    this.collapseEpoch += 1;
+    this._onDidChangeTreeData.fire();
+  }
+
+  /** Whether the tree is currently in all-expanded mode (for context-key sync) */
+  isAllExpanded(): boolean {
+    return this.mode === 'allExpanded';
   }
 
   /**
@@ -653,6 +680,9 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
       if (this.mode === 'allExpanded') {
         return true;
       }
+      if (this.mode === 'allCollapsed') {
+        return false;
+      }
       // autoFirstActive mode: expand only the first active task
       return index === 0 && active.length > 0;
     };
@@ -676,7 +706,8 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
           shouldExpand(task, index),
           isCurrent,
           isScheduled,
-          this.isMetaManaged
+          this.isMetaManaged,
+          this.collapseEpoch
         );
       }
     );

@@ -141,7 +141,7 @@
       },
       {
         "command": "vs-code-ai-helper.applyCurrentStageAction",
-        "title": "Apply Current Stage Action",
+        "title": "Apply Current Stage Action [Ctrl+Shift+Alt+I]",
         "category": "Ensemble"
       },
       {
@@ -174,6 +174,12 @@
         "icon": "$(expand-all)"
       },
       {
+        "command": "vs-code-ai-helper.collapseAllTasks",
+        "title": "Collapse All Tasks",
+        "category": "Ensemble",
+        "icon": "$(collapse-all)"
+      },
+      {
         "command": "vs-code-ai-helper.chatWithStage",
         "title": "Respond to AI",
         "category": "Ensemble",
@@ -192,7 +198,7 @@
       },
       {
         "command": "vs-code-ai-helper.runLintingFixes",
-        "title": "Fix Linting & Code Errors [Ctrl+Shift+Alt+I]",
+        "title": "Fix Linting & Code Errors",
         "category": "Ensemble",
         "icon": "$(wand)"
       },
@@ -295,13 +301,7 @@
         "command": "vs-code-ai-helper.applyCurrentStageAction",
         "key": "ctrl+shift+alt+i",
         "mac": "cmd+shift+alt+i",
-        "when": "vs-code-ai-helper.tasksInitialized && vs-code-ai-helper.currentTaskStage == impl"
-      },
-      {
-        "command": "vs-code-ai-helper.runLintingFixes",
-        "key": "ctrl+shift+alt+i",
-        "mac": "cmd+shift+alt+i",
-        "when": "vs-code-ai-helper.tasksInitialized && vs-code-ai-helper.currentTaskStage == publish"
+        "when": "vs-code-ai-helper.tasksInitialized"
       },
       {
         "command": "vs-code-ai-helper.openAndStartNewTask",
@@ -406,6 +406,16 @@
           "command": "vs-code-ai-helper.filterTasksByStatus",
           "when": "view == vs-code-ai-helper.tasksView",
           "group": "navigation@3"
+        },
+        {
+          "command": "vs-code-ai-helper.expandAllTasks",
+          "when": "view == vs-code-ai-helper.tasksView && !vs-code-ai-helper.taskListAllExpanded",
+          "group": "navigation@4"
+        },
+        {
+          "command": "vs-code-ai-helper.collapseAllTasks",
+          "when": "view == vs-code-ai-helper.tasksView && vs-code-ai-helper.taskListAllExpanded",
+          "group": "navigation@4"
         },
         {
           "command": "vs-code-ai-helper.openSettings",

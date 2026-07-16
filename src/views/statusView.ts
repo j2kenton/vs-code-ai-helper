@@ -8,12 +8,8 @@ export interface StatusEntry {
   message: string;
   level: "info" | "warning" | "error";
   timestamp: Date;
-}
-
-/** Synthetic child node revealing an entry's full text when expanded. */
-interface StatusDetailNode {
-  readonly kind: "detail";
-  readonly entry: StatusEntry;
+  /** Absolute fsPath of the file this notification relates to, if any. Clicking the entry opens it. */
+  filePath?: string;
 }
 
 export interface StatusOperationNode {
@@ -24,18 +20,14 @@ export interface StatusOperationNode {
   readonly detail?: string;
 }
 
-export type StatusTreeNode = StatusEntry | StatusDetailNode | StatusOperationNode;
-
-function isDetailNode(node: StatusTreeNode): node is StatusDetailNode {
-  return (node as StatusDetailNode).kind === "detail";
-}
+export type StatusTreeNode = StatusEntry | StatusOperationNode;
 
 function isOperationNode(node: StatusTreeNode): node is StatusOperationNode {
   return (node as StatusOperationNode).kind === "operation";
 }
 
 const STATUS_STATE_KEY = "ensemble.notifications";
-/** Label text above this length gets a "click to expand" child row instead of a hover-only tooltip. */
+/** Label text above this length is truncated with an ellipsis; the full text is still in the hover tooltip. */
 const LABEL_TRUNCATE_LENGTH = 150;
 
 export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNode>, StatusSurface, vscode.Disposable {
@@ -68,13 +60,14 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
    * Add a new status entry to the surface.
    * Entries persist indefinitely (no retention cap); the user clears them via Clear All.
    */
-  addEntry(message: string, level: "info" | "warning" | "error"): void {
+  addEntry(message: string, level: "info" | "warning" | "error", filePath?: string): void {
     const entry: StatusEntry = {
       // Keep the complete process/result text. The tree label is compacted
       // separately, while the persisted entry remains useful after reload.
       message,
       level,
       timestamp: new Date(),
+      filePath,
     };
 
     // Insert newest first
@@ -122,31 +115,34 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
       return item;
     }
 
-    if (isDetailNode(element)) {
-      const item = new vscode.TreeItem(element.entry.message, vscode.TreeItemCollapsibleState.None);
-      item.tooltip = new vscode.MarkdownString(element.entry.message);
-      return item;
-    }
-
     const isTruncated = element.message.length > LABEL_TRUNCATE_LENGTH;
     const label = isTruncated ? `${element.message.slice(0, LABEL_TRUNCATE_LENGTH)}…` : element.message;
-    const item = new vscode.TreeItem(
-      label,
-      isTruncated ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None
-    );
+    const item = new vscode.TreeItem(label, vscode.TreeItemCollapsibleState.None);
 
-    // Format timestamp as HH:mm:ss
+    // Displayed timestamp is HH:mm (seconds are noisy for the user); the
+    // underlying Date retains full precision and still drives ordering.
     const timeStr = element.timestamp.toLocaleTimeString(undefined, {
       hour12: false,
       hour: "2-digit",
       minute: "2-digit",
-      second: "2-digit",
     });
 
     item.description = timeStr;
-    item.tooltip = new vscode.MarkdownString(
-      `**[${element.level.toUpperCase()}]** ${element.message}\n\nTime: ${element.timestamp.toLocaleString()}`
-    );
+
+    if (element.filePath) {
+      item.command = {
+        command: "vscode.open",
+        title: "Open File",
+        arguments: [vscode.Uri.file(element.filePath)],
+      };
+      item.tooltip = new vscode.MarkdownString(
+        `**[${element.level.toUpperCase()}]** ${element.message}\n\nTime: ${element.timestamp.toLocaleString()}\n\nClick to open the related file.`
+      );
+    } else {
+      // Plain (non-Markdown, non-clickable-looking) tooltip when there's
+      // nothing for a click to navigate to.
+      item.tooltip = `[${element.level.toUpperCase()}] ${element.message}\n\nTime: ${element.timestamp.toLocaleString()}`;
+    }
 
     // Icon based on severity
     let iconName = "info";
@@ -174,12 +170,6 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
       }));
       return [...runningNodes, ...this.entries];
     }
-    if (isDetailNode(element) || isOperationNode(element)) {
-      return [];
-    }
-    // Clicking the caret on a truncated entry reveals its full text below it.
-    return element.message.length > LABEL_TRUNCATE_LENGTH
-      ? [{ kind: "detail", entry: element }]
-      : [];
+    return [];
   }
 }

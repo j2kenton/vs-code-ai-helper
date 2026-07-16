@@ -267,7 +267,30 @@ export function activate(context: vscode.ExtensionContext): void {
   );
   const expandAllCommand = vscode.commands.registerCommand(
     "vs-code-ai-helper.expandAllTasks",
-    () => taskTreeProvider.expandAll(tasksTreeView)
+    async () => {
+      await taskTreeProvider.expandAll(tasksTreeView);
+      void vscode.commands.executeCommand(
+        "setContext",
+        "vs-code-ai-helper.taskListAllExpanded",
+        true
+      );
+    }
+  );
+  const collapseAllCommand = vscode.commands.registerCommand(
+    "vs-code-ai-helper.collapseAllTasks",
+    () => {
+      taskTreeProvider.collapseAll();
+      void vscode.commands.executeCommand(
+        "setContext",
+        "vs-code-ai-helper.taskListAllExpanded",
+        false
+      );
+    }
+  );
+  void vscode.commands.executeCommand(
+    "setContext",
+    "vs-code-ai-helper.taskListAllExpanded",
+    false
   );
   context.subscriptions.push(vscode.commands.registerCommand(
     "vs-code-ai-helper.filterTasksByStatus",
@@ -351,6 +374,7 @@ export function activate(context: vscode.ExtensionContext): void {
     tasksLoadedListener,
     refreshCommand,
     expandAllCommand,
+    collapseAllCommand,
     statusBarMenuCommand,
     progressWatcher,
     { dispose: () => clearInterval(schedulerRecoveryTimer) },

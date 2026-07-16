@@ -1,5 +1,5 @@
 export interface StatusSurface {
-  addEntry(message: string, level: "info" | "warning" | "error"): void;
+  addEntry(message: string, level: "info" | "warning" | "error", filePath?: string): void;
 }
 
 let activeStatusSurface: StatusSurface | undefined = undefined;
@@ -38,26 +38,26 @@ export const NotificationRouter = {
    * Route routine informational message.
    * NOTE: Routine notices must never raise an OS toast (desktop notification).
    */
-  showInformation(message: string): void {
+  showInformation(message: string, filePath?: string): void {
     const surface = checkInitialized();
-    surface.addEntry(message, "info");
+    surface.addEntry(message, "info", filePath);
   },
 
   /**
    * Route routine warning message.
    * NOTE: Routine warning notices must never raise an OS toast (desktop notification).
    */
-  showWarning(message: string): void {
+  showWarning(message: string, filePath?: string): void {
     const surface = checkInitialized();
-    surface.addEntry(message, "warning");
+    surface.addEntry(message, "warning", filePath);
   },
 
   /**
    * Route routine error message.
    */
-  showError(message: string): void {
+  showError(message: string, filePath?: string): void {
     const surface = checkInitialized();
-    surface.addEntry(message, "error");
+    surface.addEntry(message, "error", filePath);
   },
 
   /**

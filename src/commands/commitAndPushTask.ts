@@ -1313,6 +1313,7 @@ export async function completeCommitAndPushTask(
       resolvedTask.progress.currentStage,
       "publish",
       false,
+      "complete-and-move-on",
       false
     );
 

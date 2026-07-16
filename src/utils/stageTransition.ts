@@ -36,7 +36,7 @@ export interface StageTransitionResult {
 
 /**
  * Explicit map of source → destination transitions that trigger auto-review
- * when the caller opts in via `triggerAutoReview: true`.
+ * when the caller opts in via a `kind` in `AUTO_REVIEW_ELIGIBLE_KINDS`.
  *
  * Only transitions that end in a review stage AND come from the immediately
  * preceding non-review stage qualify.
@@ -49,6 +49,47 @@ export const AUTO_REVIEW_TRANSITIONS: Partial<Record<TaskStage, TaskStage>> = {
   impl: "impl-high-review",
   "impl-high-review": "impl-low-review",
 };
+
+/**
+ * Every distinct reason `advanceStage` can be called for.
+ *
+ * A plain boolean can't distinguish "this transition is allowed to opt into
+ * auto-review" from "this transition must never auto-review, no matter what
+ * a caller passes in" — a future call site could pass `true` for the wrong
+ * reason and silently start a duplicate/incorrect review. `kind` makes that
+ * a compile-time-visible decision instead of a scattered boolean.
+ *
+ * Only `complete-and-move-on` and `auto-advance` may ever result in
+ * `shouldAutoReview: true` (see `AUTO_REVIEW_ELIGIBLE_KINDS`); every other
+ * kind is hard-blocked inside `advanceStage` regardless of `optIn`.
+ */
+export type TransitionKind =
+  /** "Complete Stage & Move On" / "Complete, Commit and Push" style manual completion. */
+  | "complete-and-move-on"
+  /** Score-based auto-advance past a perfect/threshold review result. */
+  | "auto-advance"
+  /** Manual "Set Task Stage" / "Set Stage as Current" jump to an arbitrary stage. */
+  | "jump"
+  /** Non-review-stage reset paths (e.g. reverting progress) — never review-eligible. */
+  | "reset"
+  /** Reopening a previously-completed task at a chosen stage. */
+  | "reopen"
+  /** Startup/checkpoint recovery replaying a transition that already happened. */
+  | "recovery"
+  /** Internal transition used only inside fast-forward's own retry loop. */
+  | "fast-forward-internal"
+  /** Running a review itself moves the task onto the review stage; must never re-dispatch a review. */
+  | "review-run";
+
+/**
+ * The only two kinds that may ever produce `shouldAutoReview: true`. Every
+ * other `TransitionKind` is hard-blocked in `advanceStage` regardless of the
+ * `optIn` flag a caller passes.
+ */
+export const AUTO_REVIEW_ELIGIBLE_KINDS: ReadonlySet<TransitionKind> = new Set([
+  "complete-and-move-on",
+  "auto-advance",
+]);
 
 /**
  * Persist a stage transition and compute whether auto-review should fire.
@@ -67,7 +108,11 @@ export const AUTO_REVIEW_TRANSITIONS: Partial<Record<TaskStage, TaskStage>> = {
  * @param sourceStage    The stage the task is currently at before this transition.
  * @param newStage       The stage to advance to.
  * @param isPaused       Whether the task is currently paused.
- * @param triggerAutoReview  Whether the caller wants auto-review to fire.
+ * @param kind           Why this transition is happening. Hard-gates auto-review
+ *   eligibility: only `AUTO_REVIEW_ELIGIBLE_KINDS` can ever produce
+ *   `shouldAutoReview: true`, regardless of `optIn`.
+ * @param optIn          Caller-side opt-in (e.g. a workspace setting) for kinds
+ *   that are eligible. Ignored for ineligible kinds. Defaults to `true`.
  * @param expectedReviewAttemptId  When set, the transition is rejected unless
  *   the task's persisted `reviewAttemptId` still matches — guards against a
  *   superseded review attempt advancing (or re-publishing over) a newer one.
@@ -85,7 +130,8 @@ export async function advanceStage(
   sourceStage: TaskStage,
   newStage: TaskStage,
   isPaused: boolean,
-  triggerAutoReview: boolean,
+  kind: TransitionKind,
+  optIn: boolean = true,
   expectedReviewAttemptId?: string,
   publishArtifact?: () => Promise<void>
 ): Promise<StageTransitionResult | undefined> {
@@ -132,9 +178,12 @@ export async function advanceStage(
 
   // Compute exactly-once auto-review eligibility.
   // Conditions are evaluated AFTER persistence so a failed write never
-  // triggers a review on stale data.
+  // triggers a review on stale data. `kind` is a hard gate: only
+  // AUTO_REVIEW_ELIGIBLE_KINDS can ever reach `shouldAutoReview: true`, no
+  // matter what `optIn` is — see TransitionKind's doc comment.
   const shouldAutoReview =
-    triggerAutoReview &&
+    AUTO_REVIEW_ELIGIBLE_KINDS.has(kind) &&
+    optIn &&
     !isPaused &&
     isReviewStage(newStage) &&
     AUTO_REVIEW_TRANSITIONS[sourceStage] === newStage;

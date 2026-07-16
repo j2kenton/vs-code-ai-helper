@@ -10,6 +10,7 @@ import { ModelSettings } from "../utils/modelFallback";
 import { getQuotaStatusText } from "../utils/quota";
 import { cliDisplayLabel, CLI_PROVIDERS } from "../runners/providers";
 import { testCliProviderSetup } from "../runners/cliAgentRunner";
+import { NotificationRouter } from "../utils/notificationRouter";
 
 type IncomingMessage =
   | { type: "ready" }
@@ -91,7 +92,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         }
         case "saveSettings": {
           await setModelSettings(data.settings);
-          void vscode.window.showInformationMessage("AI model settings saved.");
+          NotificationRouter.showInformation("AI model settings saved.");
           break;
         }
         case "validationError": {
@@ -141,15 +142,16 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         }
         case "resetDefaults": {
           const confirm = await vscode.window.showWarningMessage(
-            "Are you sure you want to reset all model settings to defaults?",
+            "Reset all model settings to defaults in the form? Click Save Settings afterwards to apply.",
             { modal: true },
             "Reset"
           );
           if (confirm === "Reset") {
+            // Only repopulates the form — nothing is persisted here. The
+            // user must still click Save Settings to actually apply the
+            // reset, matching Save Settings being the only action that writes.
             const emptySettings: ModelSettings = {};
-            await setModelSettings(emptySettings);
             void webviewView.webview.postMessage({ type: "settingsLoaded", settings: emptySettings });
-            void vscode.window.showInformationMessage("Model settings reset to defaults.");
           }
           break;
         }
@@ -421,6 +423,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             gap: 10px;
             margin-top: 15px;
           }
+          #loading-indicator {
+            color: var(--vscode-descriptionForeground);
+            padding: 12px 0;
+          }
           button {
             background-color: var(--vscode-button-background);
             color: var(--vscode-button-foreground);
@@ -431,6 +437,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           }
           button:hover {
             background-color: var(--vscode-button-hoverBackground);
+          }
+          button:disabled {
+            opacity: 0.5;
+            cursor: default;
           }
           button.secondary {
             background-color: var(--vscode-button-secondaryBackground);
@@ -454,8 +464,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         <h2 style="font-size: 1.2em; margin-bottom: 10px;">Model Configuration</h2>
         <div role="status" aria-live="polite" id="status-region" style="position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); border: 0;"></div>
         <div role="alert" aria-live="assertive" id="alert-region" style="position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); border: 0;"></div>
-        
-        <table id="settings-table">
+
+        <div id="loading-indicator">Loading settings…</div>
+
+        <table id="settings-table" hidden>
           <thead>
             <tr>
               <th scope="col">Stage</th>
@@ -467,9 +479,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           </tbody>
         </table>
 
-        <div class="btn-container">
-          <button id="save-btn">Save Settings</button>
+        <div class="btn-container" id="model-settings-buttons" hidden>
           <button id="reset-btn" class="secondary">Reset to Defaults</button>
+          <button id="save-btn" disabled>Save Settings</button>
         </div>
 
         <h2 style="font-size: 1.2em; margin: 28px 0 10px;">Providers &amp; Meta Files</h2>
@@ -489,6 +501,18 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           let quotaStatus = {};
           let workspaceSettings = {};
           let providers = [];
+          let formDirty = false;
+
+          function updateSaveButtonState() {
+            document.getElementById('save-btn').disabled = !formDirty;
+          }
+
+          function markDirty() {
+            if (!formDirty) {
+              formDirty = true;
+              updateSaveButtonState();
+            }
+          }
 
           window.addEventListener('message', event => {
             const message = event.data;
@@ -502,6 +526,11 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               providers = message.providers || [];
               renderTable();
               renderWorkflowSettings();
+              document.getElementById('loading-indicator').hidden = true;
+              document.getElementById('settings-table').hidden = false;
+              document.getElementById('model-settings-buttons').hidden = false;
+              formDirty = false;
+              updateSaveButtonState();
               // renderTable() is synchronous, so every row-<stage> element
               // exists by this point. Tell the extension host it's now safe
               // to deliver a focusStage request (see the "rendered" case in
@@ -511,6 +540,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             } else if (message.type === 'settingsLoaded') {
               currentSettings = message.settings || {};
               renderTable();
+              // Reset to Defaults only repopulates the form — it hasn't
+              // persisted anything yet, so treat this like any other
+              // unsaved edit and require an explicit Save Settings click.
+              markDirty();
             } else if (message.type === 'quotaStatus') {
               quotaStatus = message.quotaStatus || {};
               renderTable();
@@ -530,6 +563,18 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                 const input = document.getElementById(control + '-input-' + message.stage);
                 if (input) input.focus();
               }
+            }
+          });
+
+          // Delegated dirty-tracking: rows in #stages-tbody are rebuilt by
+          // renderTable() on every 'init'/'settingsLoaded' message, so a
+          // single listener on the (static) container catches every current
+          // and future row's typed/selected changes without re-binding.
+          document.getElementById('stages-tbody').addEventListener('input', markDirty);
+          document.getElementById('stages-tbody').addEventListener('change', markDirty);
+          document.getElementById('stages-tbody').addEventListener('click', event => {
+            if (event.target.closest('.add-backup, .remove-backup')) {
+              markDirty();
             }
           });
 
@@ -669,6 +714,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               hidden.value = id;
               input.value = id ? label : '';
               closeList();
+              markDirty();
             }
 
             function reconcileExactValue() {
@@ -928,8 +974,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               type: 'saveSettings',
               settings: updatedSettings
             });
-            
+
             document.getElementById('status-region').innerText = 'Settings saved successfully.';
+            formDirty = false;
+            updateSaveButtonState();
           });
 
           document.getElementById('reset-btn').addEventListener('click', () => {

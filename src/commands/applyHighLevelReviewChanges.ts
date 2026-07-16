@@ -34,9 +34,12 @@ export async function applyHighLevelReviewChanges(
     return;
   }
 
-  if (resolvedTask.progress.currentStage !== "plan-high-review") {
+  if (
+    resolvedTask.progress.currentStage !== "plan-high-review" &&
+    resolvedTask.progress.currentStage !== "impl-high-review"
+  ) {
     void vscode.window.showInformationMessage(
-      "Task is not at the High-Level Review stage."
+      "Task is not at a High-Level Review stage."
     );
     return;
   }

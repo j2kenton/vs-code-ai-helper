@@ -95,6 +95,7 @@ void test(
       "impl-high-review",
       "impl-high-review",
       false,
+      "review-run",
       false,
       "attempt-B",
       () => {
@@ -112,7 +113,7 @@ void test(
     // never run, so it cannot overwrite what B already published.
     await assert.rejects(
       () =>
-        advanceStage(folderUri, "impl-high-review", "impl-high-review", false, false, "attempt-A", () => {
+        advanceStage(folderUri, "impl-high-review", "impl-high-review", false, "review-run", false, "attempt-A", () => {
           publishOrder.push("A-publish");
           published = "A-content";
           return Promise.resolve();
@@ -148,6 +149,7 @@ void test(
       "impl",
       "impl-high-review",
       false,
+      "review-run",
       false,
       "attempt-1",
       () => {
@@ -163,7 +165,7 @@ void test(
     // impl-high-review) must reject and must not publish again.
     await assert.rejects(
       () =>
-        advanceStage(folderUri, "impl", "impl-high-review", false, false, "attempt-1", () => {
+        advanceStage(folderUri, "impl", "impl-high-review", false, "review-run", false, "attempt-1", () => {
           publishCount += 1;
           return Promise.resolve();
         }),

@@ -104,7 +104,7 @@ async function loadTaskTemplate(extensionUri: vscode.Uri): Promise<string> {
     return new TextDecoder().decode(bytes);
   } catch (error) {
     // Fallback to inline template if file read fails
-    return "# Task\n\nDescribe the work you want to do here in as much detail as is useful. When\nyou're ready, use **Draft with AI** to turn these notes into a structured task\ndescription. Questions from the stage AI appear in the **Chat With AI** panel.\n";
+    return "# Instructions\n\nDescribe the work you want to do here in as much detail as is useful. When\nyou're ready, use **Draft with AI** to turn these notes into a structured task\ndescription. Questions from the stage AI appear in the **Chat With AI** panel.\n\n# User's Description of the Task\n\n\n\n\n\n\n\n\n\n\n";
   }
 }
 

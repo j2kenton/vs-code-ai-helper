@@ -34,9 +34,12 @@ export async function applyLowLevelReviewChanges(
     return;
   }
 
-  if (resolvedTask.progress.currentStage !== "plan-low-review") {
+  if (
+    resolvedTask.progress.currentStage !== "plan-low-review" &&
+    resolvedTask.progress.currentStage !== "impl-low-review"
+  ) {
     void vscode.window.showInformationMessage(
-      "Task is not at the Low-Level Review stage."
+      "Task is not at a Low-Level Review stage."
     );
     return;
   }

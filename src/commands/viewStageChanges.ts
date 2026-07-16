@@ -4,6 +4,7 @@ import { StageNode } from "../views/taskTreeProvider";
 import { STAGE_ARTIFACT_FILENAMES, TaskStage } from "../types/taskProgress";
 import { previousVersionUri, hasPreviousVersion } from "../utils/artifactBackups";
 import { resolveCurrentPlanUri } from "../utils/fileUtils";
+import { NotificationRouter } from "../utils/notificationRouter";
 
 async function artifactFor(node: StageNode): Promise<vscode.Uri | undefined> {
   if (node.stage === "plan") return resolveCurrentPlanUri(node.task.folderUri);
@@ -16,7 +17,10 @@ export function registerViewStageChangesCommands(context: vscode.ExtensionContex
     if (!node) return;
     const artifact = await artifactFor(node);
     if (!artifact || !(await hasPreviousVersion(artifact))) {
-      void vscode.window.showInformationMessage("No previous version is available for this stage yet.");
+      NotificationRouter.showInformation(
+        "No previous version is available for this stage yet.",
+        artifact?.fsPath
+      );
       return;
     }
     await vscode.commands.executeCommand("vscode.diff", previousVersionUri(artifact), artifact, `${artifact.path.split("/").pop()} — previous ↔ current`);
@@ -25,10 +29,10 @@ export function registerViewStageChangesCommands(context: vscode.ExtensionContex
     if (!node) return;
     const artifact = await artifactFor(node);
     if (!artifact || !(await hasPreviousVersion(artifact))) {
-      void vscode.window.showInformationMessage("No previous version is available to delete.");
+      NotificationRouter.showInformation("No previous version is available to delete.", artifact?.fsPath);
       return;
     }
     await vscode.workspace.fs.delete(previousVersionUri(artifact), { useTrash: true });
-    void vscode.window.showInformationMessage("Previous version deleted.");
+    NotificationRouter.showInformation("Previous version deleted.", artifact.fsPath);
   }));
 }

@@ -212,6 +212,11 @@ export async function setTaskStage(
     task.progress.currentStage,
     newStage,
     false,
+    // A caller opting into auto-review (triggerAutoReview=true) is treating
+    // this like a "move on" transition rather than an arbitrary jump — the
+    // `kind` gate must reflect that, not the always-ineligible "jump" kind,
+    // or the eligible-kinds hard gate in advanceStage would silently drop it.
+    triggerAutoReview ? "complete-and-move-on" : "jump",
     triggerAutoReview
   );
 
