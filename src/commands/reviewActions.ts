@@ -65,7 +65,10 @@ import { checkAndConfirmPromptSize } from "../utils/promptSizeGuard";
 import * as cp from "child_process";
 import * as fs from "fs";
 import { NotificationRouter } from "../utils/notificationRouter";
-import { backupArtifactBeforeWrite } from "../utils/artifactBackups";
+import {
+  backupArtifactBeforeWrite,
+  previousVersionUri,
+} from "../utils/artifactBackups";
 import { parseReadiness } from "../utils/reviewReadiness";
 import { runCompletionLint } from "../utils/completionLint";
 import { improveReviewScore } from "../utils/reviewScoreLoop";
@@ -792,6 +795,36 @@ const REVIEW_PROMPTS: Partial<Record<TaskStage, string>> = {
   "publish": "review-publish.md",
 };
 
+export function selectReviewPromptTemplate(
+  targetStage: TaskStage,
+  currentStage: TaskStage,
+  previousReview: string | undefined
+): string | undefined {
+  if (
+    targetStage === "plan-high-review" &&
+    currentStage === targetStage &&
+    previousReview !== undefined &&
+    !isStaleReviewArtifact(previousReview)
+  ) {
+    return "review-plan-high-rereview.md";
+  }
+  return REVIEW_PROMPTS[targetStage];
+}
+
+async function readPreviousReviewForRereview(
+  reviewUri: vscode.Uri
+): Promise<string | undefined> {
+  const currentReview = await readNonEmptyText(reviewUri);
+  if (currentReview !== undefined && !isStaleReviewArtifact(currentReview)) {
+    return currentReview;
+  }
+
+  const backedUpReview = await readNonEmptyText(previousVersionUri(reviewUri));
+  return backedUpReview !== undefined && !isStaleReviewArtifact(backedUpReview)
+    ? backedUpReview
+    : undefined;
+}
+
 // Fast Forward's own internal per-attempt calls into applyReviewWithAI reuse
 // the lock it already holds (see ApplyReviewOptions.skipTaskLock) rather than
 // re-acquiring — nested acquisition from the same logical operation would
@@ -842,14 +875,28 @@ export async function runReviewForFolder(
   options: { preserveActiveFallback?: boolean } = {}
 ): Promise<void> {
   const targetStage = REVIEW_TARGETS[currentStage];
-  const templateFile = targetStage && REVIEW_PROMPTS[targetStage];
   const reviewUri = targetStage && artifactUri(folderUri, targetStage);
-  if (!targetStage || !templateFile || !reviewUri) {
+  if (!targetStage || !reviewUri) {
     return;
   }
 
   const variables: Record<string, string> = {};
   const isPlanReview = isPlanReviewStage(targetStage);
+  const previousReview =
+    targetStage === "plan-high-review" && currentStage === targetStage
+      ? await readPreviousReviewForRereview(reviewUri)
+      : undefined;
+  const templateFile = selectReviewPromptTemplate(
+    targetStage,
+    currentStage,
+    previousReview
+  );
+  if (!templateFile) {
+    return;
+  }
+  if (previousReview !== undefined) {
+    variables.previousReview = previousReview;
+  }
 
   if (isPlanReview) {
     const planUri = await resolveCurrentPlanUri(folderUri);

@@ -21,7 +21,10 @@ import { describe, it } from "node:test";
 // code author extending the arg handling can rely on this as a spec.
 
 import * as vscode from "vscode";
-import { buildFastForwardApplyReviewOptions } from "../commands/reviewActions";
+import {
+  buildFastForwardApplyReviewOptions,
+  selectReviewPromptTemplate,
+} from "../commands/reviewActions";
 import { TaskOperationHandle } from "../utils/taskOperations";
 import { parseReadiness } from "../utils/reviewReadiness";
 
@@ -188,6 +191,41 @@ void describe("review apply model resolution contract", () => {
       assert.strictEqual(effectiveModelStage, logStage);
     });
   }
+});
+
+void describe("high-level plan re-review prompt selection", () => {
+  void it("uses the initial-review prompt when entering high-level review from plan", () => {
+    assert.strictEqual(
+      selectReviewPromptTemplate(
+        "plan-high-review",
+        "plan",
+        "Readiness: 5/10\n\n- Blocking issues: one."
+      ),
+      "review-plan-high.md"
+    );
+  });
+
+  void it("uses the reconciliation prompt when re-reviewing an existing high-level review", () => {
+    assert.strictEqual(
+      selectReviewPromptTemplate(
+        "plan-high-review",
+        "plan-high-review",
+        "Readiness: 5/10\n\n- Blocking issues: one."
+      ),
+      "review-plan-high-rereview.md"
+    );
+  });
+
+  void it("does not treat a stale placeholder as a previous review", () => {
+    assert.strictEqual(
+      selectReviewPromptTemplate(
+        "plan-high-review",
+        "plan-high-review",
+        "# Review Stale\n\nRun Review with AI again."
+      ),
+      "review-plan-high.md"
+    );
+  });
 });
 
 void describe("fast-forward fallback contract", () => {
