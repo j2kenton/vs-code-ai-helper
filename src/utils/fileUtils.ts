@@ -82,12 +82,20 @@ export async function statIfExists(
 /**
  * Write a text file, replacing the contents of an open editor buffer when
  * present so the visible document and on-disk file stay in sync.
+ *
+ * Pass `skipBackup: true` when the caller has already made its own
+ * backup decision for this write (e.g. conditionally, or not at all) —
+ * otherwise this unconditional backup runs regardless and can clobber one
+ * that decision intentionally skipped.
  */
 export async function writeTextFile(
   fileUri: vscode.Uri,
-  content: string
+  content: string,
+  options: { skipBackup?: boolean } = {}
 ): Promise<void> {
-  await backupArtifactBeforeWrite(fileUri);
+  if (!options.skipBackup) {
+    await backupArtifactBeforeWrite(fileUri);
+  }
   const openDoc = findOpenDocument(fileUri);
   if (!openDoc) {
     await vscode.workspace.fs.writeFile(

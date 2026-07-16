@@ -991,7 +991,10 @@ export async function runReviewForFolder(
         false,
         false,
         reviewAttemptId,
-        async () => { await backupArtifactBeforeWrite(reviewUri); await vscode.workspace.fs.rename(stagedReviewUri, reviewUri, { overwrite: true }); }
+        async () => {
+          await backupReviewUnlessStale(reviewUri);
+          await vscode.workspace.fs.rename(stagedReviewUri, reviewUri, { overwrite: true });
+        }
       );
     } catch (error) {
       // A stale/rejected CAS (a newer attempt already owns the stage) or a
@@ -1072,10 +1075,34 @@ function isStaleReviewArtifact(content: string): boolean {
   return content.trimStart().startsWith("# Review Stale");
 }
 
+/**
+ * Backs up a review artifact unless its current content is already a
+ * "# Review Stale" placeholder. A placeholder is never worth preserving as
+ * the "previous version" for View Changes — without this guard, staling the
+ * same artifact twice in a row (e.g. two implementation reruns with
+ * auto-review off) or publishing a new review over a staled one would
+ * overwrite the last real review's backup with the placeholder itself.
+ */
+async function backupReviewUnlessStale(reviewUri: vscode.Uri): Promise<void> {
+  const existing = await readNonEmptyText(reviewUri);
+  if (existing !== undefined && !isStaleReviewArtifact(existing)) {
+    await backupArtifactBeforeWrite(reviewUri);
+  }
+}
+
 async function markReviewArtifactStale(
   reviewUri: vscode.Uri,
   changedArtifact: string
 ): Promise<void> {
+  // Snapshot the real review content as the "previous version" before it's
+  // clobbered by the placeholder below — otherwise the placeholder itself
+  // would become the backup once the next review publishes. skipBackup is
+  // required here: writeTextFile's own unconditional backup would otherwise
+  // immediately re-read the (still on-disk, not-yet-overwritten) content and
+  // redo the backup — which is harmless on the first staling but clobbers
+  // the guard above on a second consecutive staling, since by then the
+  // on-disk content is already the placeholder.
+  await backupReviewUnlessStale(reviewUri);
   const staleNotice = [
     "# Review Stale",
     "",
@@ -1084,7 +1111,7 @@ async function markReviewArtifactStale(
     "Run Review with AI again to evaluate the current artifact.",
     "",
   ].join("\n");
-  await writeTextFile(reviewUri, staleNotice);
+  await writeTextFile(reviewUri, staleNotice, { skipBackup: true });
 }
 
 /**
