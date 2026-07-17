@@ -7,6 +7,8 @@ Structure your review as:
 Begin your response with a readiness score on its own line in this exact format:
 Readiness: N/10
 
+{{reviewScoringRubric}}
+
 - Summary verdict (ready to publish / needs changes / cannot fully assess).
 - Shipping blockers (if any), each with the file, the problem, and a concrete failure scenario.
 - Review-confidence blockers (if any).

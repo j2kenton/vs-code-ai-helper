@@ -16,6 +16,8 @@ Score the current implementation against the full approved plan. Explain any unc
 Begin your response with a readiness score on its own line in this exact format:
 Readiness: N/10
 
+{{reviewScoringRubric}}
+
 Then structure your review as:
 - Summary verdict (ready to complete / needs changes / cannot fully assess).
 - Progress since previous review (improved / unchanged / regressed), with a short explanation.

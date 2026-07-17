@@ -5,7 +5,9 @@ Focus only on the big picture: is the overall approach right, is the scope corre
 Begin your response with a readiness score on its own line in this exact format:
 Readiness: N/10
 
-Where N is a score from 0-10 (8-10 = ready to proceed, 5-7 = needs minor changes, 0-4 = needs significant changes).
+Where N is a score from 0-10.
+
+{{reviewScoringRubric}}
 
 Then structure your review as:
 - Summary verdict (ready to proceed / needs changes / unclear scope).

@@ -16,6 +16,8 @@ Score the current implementation against the full approved plan, not merely the 
 Begin your response with a readiness score on its own line in this exact format:
 Readiness: N/10
 
+{{reviewScoringRubric}}
+
 Then structure your review as:
 - Summary verdict (on track / off track / cannot assess).
 - Progress since previous review (improved / unchanged / regressed), with a short explanation.

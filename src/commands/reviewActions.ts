@@ -70,7 +70,7 @@ import {
   backupArtifactBeforeWrite,
   previousVersionUri,
 } from "../utils/artifactBackups";
-import { parseReadiness } from "../utils/reviewReadiness";
+import { meetsAutoAdvanceThreshold, parseReadiness } from "../utils/reviewReadiness";
 import { runCompletionLint } from "../utils/completionLint";
 import { improveReviewScore } from "../utils/reviewScoreLoop";
 import {
@@ -1110,7 +1110,7 @@ export async function runReviewForFolder(
         const content = new TextDecoder().decode(contentBytes);
         const score = parseReadiness(content).score;
         const autoAdvanceThreshold = getAutoAdvanceScoreThreshold();
-        if (isAutoAdvanceEnabled() && score !== null && score >= autoAdvanceThreshold) {
+        if (isAutoAdvanceEnabled() && meetsAutoAdvanceThreshold(score, autoAdvanceThreshold)) {
           NotificationRouter.showInformation(`Review score ${score}/10 reached the auto-advance threshold. Auto-advancing stage...`);
           const configuredStages = await resolveConfiguredReviewStages(folderUri);
           const next = computeNextStage(targetStage, configuredStages);
@@ -1185,7 +1185,7 @@ export async function runReviewForFolder(
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         NotificationRouter.showWarning(
-          `Review was published, but auto-advancing past the perfect score failed: ${message}. ` +
+          `Review was published, but auto-advancing past the score threshold failed: ${message}. ` +
             "Advance the stage manually."
         );
       }

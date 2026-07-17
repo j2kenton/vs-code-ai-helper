@@ -80,6 +80,19 @@ export function parseReadiness(content: string): ReadinessResult {
   };
 }
 
+/**
+ * Numeric auto-advance check: a parsed score meets the user's configured
+ * threshold. This is the only condition auto-advance evaluates — blockers,
+ * summary verdicts, and review prose add no independent gate, so a threshold
+ * of 4 advances on a score of 4.
+ */
+export function meetsAutoAdvanceThreshold(
+  score: number | null,
+  threshold: number
+): boolean {
+  return score !== null && score >= threshold;
+}
+
 /** Strict gate used by automatic stage advancement. */
 export function isStrictPerfectReview(content: string): boolean {
   const lines = content.replace(/^\uFEFF/, "").replace(/\r\n/g, "\n").split("\n");
@@ -90,7 +103,9 @@ export function isStrictPerfectReview(content: string): boolean {
       inFrontmatter = !inFrontmatter;
       continue;
     }
-    if (inFrontmatter || !line || line.startsWith("<!--") || line.endsWith("-->") || line.startsWith("#")) continue;
+    if (inFrontmatter || !line || line.startsWith("<!--") || line.endsWith("-->") || line.startsWith("#")) {
+      continue;
+    }
     return line === "Readiness: 10/10";
   }
   return false;

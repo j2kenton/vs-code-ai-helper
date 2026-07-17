@@ -659,7 +659,7 @@
           "minimum": 1,
           "maximum": 10,
           "scope": "window",
-          "description": "Score required for auto-advance (1–10)."
+          "description": "Score required for auto-advance (1–10). Lower thresholds intentionally permit earlier advancement; the extension does not impose a universal minimum acceptable score."
         },
         "vs-code-ai-helper.fastForwardStopLevel": {
           "type": "integer",

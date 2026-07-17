@@ -11,6 +11,8 @@ Score the current publish readiness. Explain any unchanged or lower score despit
 Begin your response with a readiness score on its own line in this exact format:
 Readiness: N/10
 
+{{reviewScoringRubric}}
+
 Then structure your review as:
 - Summary verdict (ready to publish / needs changes / cannot fully assess).
 - Progress since previous review (improved / unchanged / regressed), with a short explanation.
