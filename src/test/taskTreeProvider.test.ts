@@ -1,7 +1,8 @@
 import * as assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import * as vscode from "vscode";
-import { getStageNodeContextValue, StageNode } from "../views/taskTreeProvider";
+import { getStageNodeContextValue, orderTasksForDisplay, StageNode } from "../views/taskTreeProvider";
+import type { IncompleteTask } from "../utils/taskProgressUtils";
 import { buildTaskContextValue, buildStageContextValue } from "../utils/contextTokens";
 import {
   AI_MODEL_STAGES,
@@ -53,6 +54,63 @@ function makeTask(currentStage: TaskStage = "impl"): {
     },
   };
 }
+
+void describe("orderTasksForDisplay", () => {
+  function taskEntry(
+    name: string,
+    overrides: { pinnedAt?: string; updatedAt?: string; displayName?: string } = {}
+  ): IncompleteTask {
+    return {
+      folderUri: vscode.Uri.file(`/workspace/tasks/${name}`),
+      folderName: name,
+      progress: {
+        currentStage: "impl",
+        status: "active",
+        taskFolder: name,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: overrides.updatedAt ?? "2026-01-01T00:00:00.000Z",
+        pinnedAt: overrides.pinnedAt,
+        displayName: overrides.displayName,
+      },
+    } as unknown as IncompleteTask;
+  }
+
+  void it("puts pinned tasks first, most recently pinned first", () => {
+    const ordered = orderTasksForDisplay([
+      taskEntry("plain", { updatedAt: "2026-06-01T00:00:00.000Z" }),
+      taskEntry("pinned-old", { pinnedAt: "2026-02-01T00:00:00.000Z" }),
+      taskEntry("pinned-new", { pinnedAt: "2026-03-01T00:00:00.000Z" }),
+    ]);
+    assert.deepEqual(
+      ordered.map((t) => t.folderName),
+      ["pinned-new", "pinned-old", "plain"]
+    );
+  });
+
+  void it("sorts unpinned tasks by recency then task name as tiebreaker", () => {
+    const ordered = orderTasksForDisplay([
+      taskEntry("zeta", { updatedAt: "2026-05-01T00:00:00.000Z" }),
+      taskEntry("alpha", { updatedAt: "2026-05-01T00:00:00.000Z" }),
+      taskEntry("older-but-b", { updatedAt: "2026-04-01T00:00:00.000Z" }),
+    ]);
+    assert.deepEqual(
+      ordered.map((t) => t.folderName),
+      ["alpha", "zeta", "older-but-b"],
+      "equal updatedAt must fall back to the display name for a deterministic order"
+    );
+  });
+
+  void it("uses displayName over folderName for the tiebreaker when present", () => {
+    const ordered = orderTasksForDisplay([
+      taskEntry("2026-01-01_task_1", { displayName: "zz rename" }),
+      taskEntry("2026-01-01_task_2", { displayName: "aa rename" }),
+    ]);
+    assert.deepEqual(
+      ordered.map((t) => t.progress.displayName),
+      ["aa rename", "zz rename"]
+    );
+  });
+});
 
 void describe("getStageNodeContextValue", () => {
   const modelableStages: readonly TaskStage[] = AI_MODEL_STAGES;
@@ -189,7 +247,7 @@ void describe("getStageNodeContextValue", () => {
 void describe("StageNode — done review stage icon", () => {
   void it('renders green "check" tick when status is "done" and readiness data is present', () => {
     const task = makeTask("impl"); // current stage is after plan-high-review
-    const readiness = { label: "9/10", icon: "thumbsup", colorKey: "charts.green" };
+    const readiness = { label: "9/10", icon: "check", colorKey: "charts.green" };
     const node = new StageNode(task, "plan-high-review", "done", undefined, readiness);
 
     // The icon must be "check" regardless of readiness data
@@ -218,14 +276,14 @@ void describe("StageNode — done review stage icon", () => {
 
   void it('renders readiness icon when status is "current" and readiness data is present', () => {
     const task = makeTask("plan-high-review");
-    const readiness = { label: "9/10", icon: "thumbsup", colorKey: "charts.green" };
+    const readiness = { label: "9/10", icon: "check", colorKey: "charts.green" };
     const node = new StageNode(task, "plan-high-review", "current", undefined, readiness);
 
     const icon = node.iconPath as import("vscode").ThemeIcon;
     assert.strictEqual(
       icon.id,
-      "thumbsup",
-      `Expected readiness icon "thumbsup" for current review stage, got "${icon.id}"`
+      "check",
+      `Expected readiness icon "check" for current review stage, got "${icon.id}"`
     );
   });
 
@@ -239,7 +297,7 @@ void describe("StageNode — done review stage icon", () => {
 
   void it('has description "done" for a done review stage with readiness', () => {
     const task = makeTask("impl");
-    const readiness = { label: "7/10", icon: "question", colorKey: "charts.yellow" };
+    const readiness = { label: "7/10", icon: "arrow-right", colorKey: "charts.yellow" };
     const node = new StageNode(task, "plan-low-review", "done", undefined, readiness);
 
     assert.strictEqual(
@@ -251,7 +309,7 @@ void describe("StageNode — done review stage icon", () => {
 
   void it('has description including "current" for a current review stage with readiness', () => {
     const task = makeTask("plan-low-review");
-    const readiness = { label: "4/10", icon: "thumbsdown", colorKey: "charts.red" };
+    const readiness = { label: "4/10", icon: "arrow-down", colorKey: "charts.red" };
     const node = new StageNode(task, "plan-low-review", "current", undefined, readiness);
 
     assert.ok(
@@ -296,52 +354,52 @@ void describe("reviewReadiness.parseReadiness", () => {
     const result = parseReadiness("Readiness: 9/10\nSome content");
     assert.strictEqual(result.score, 9);
     assert.strictEqual(result.label, "9/10");
-    assert.strictEqual(result.icon, "thumbsup");
+    assert.strictEqual(result.icon, "check");
     assert.strictEqual(result.colorKey, "charts.green");
   });
 
   void it('should parse "Readiness: 10/10"', () => {
     const result = parseReadiness("Readiness: 10/10");
     assert.strictEqual(result.score, 10);
-    assert.strictEqual(result.icon, "thumbsup");
+    assert.strictEqual(result.icon, "check");
   });
 
   void it('should parse "Readiness: 8/10" as green', () => {
     const result = parseReadiness("Readiness: 8/10");
     assert.strictEqual(result.score, 8);
-    assert.strictEqual(result.icon, "thumbsup");
+    assert.strictEqual(result.icon, "check");
   });
 
   void it('should parse "Readiness: 7/10" as yellow question', () => {
     const result = parseReadiness("Readiness: 7/10");
     assert.strictEqual(result.score, 7);
-    assert.strictEqual(result.icon, "question");
+    assert.strictEqual(result.icon, "arrow-right");
     assert.strictEqual(result.colorKey, "charts.yellow");
   });
 
   void it('should parse "Readiness: 5/10" as yellow', () => {
     const result = parseReadiness("Readiness: 5/10");
     assert.strictEqual(result.score, 5);
-    assert.strictEqual(result.icon, "question");
+    assert.strictEqual(result.icon, "arrow-right");
   });
 
   void it('should parse "Readiness: 4/10" as red thumbsdown', () => {
     const result = parseReadiness("Readiness: 4/10");
     assert.strictEqual(result.score, 4);
-    assert.strictEqual(result.icon, "thumbsdown");
+    assert.strictEqual(result.icon, "arrow-down");
     assert.strictEqual(result.colorKey, "charts.red");
   });
 
   void it('should parse "Readiness: 0/10" as red', () => {
     const result = parseReadiness("Readiness: 0/10");
     assert.strictEqual(result.score, 0);
-    assert.strictEqual(result.icon, "thumbsdown");
+    assert.strictEqual(result.icon, "arrow-down");
   });
 
   void it('should use legacy fallback for case-insensitive readiness wording', () => {
     const result = parseReadiness("Overall readiness 7/10 based on analysis");
     assert.strictEqual(result.score, 7);
-    assert.strictEqual(result.icon, "question");
+    assert.strictEqual(result.icon, "arrow-right");
   });
 
   void it('should return neutral icon for missing readiness', () => {
@@ -650,9 +708,9 @@ void describe("Icon selection in StageNode", () => {
   });
 
   void it("uses readiness icon for current status when readiness is set", () => {
-    const readiness = { label: "Perfect", icon: "thumbsup", colorKey: "charts.green" };
+    const readiness = { label: "Perfect", icon: "check", colorKey: "charts.green" };
     const node = new StageNode(mockTask, "plan-high-review", "current", undefined, readiness);
-    assert.strictEqual((node.iconPath as vscode.ThemeIcon).id, "thumbsup");
+    assert.strictEqual((node.iconPath as vscode.ThemeIcon).id, "check");
   });
 
   void it("uses circle-large-outline for outstanding status", () => {

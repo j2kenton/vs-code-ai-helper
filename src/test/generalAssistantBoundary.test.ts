@@ -1,113 +1,159 @@
 /**
- * openGeneralAssistant is a thin entry point that delegates straight into
- * `vs-code-ai-helper.chatWithStage` (see openGeneralAssistant.ts's own
- * docstring) — it does not build its own prompt or write files. The C4
- * chat-edit boundary (resolveMarkdownUpdateTarget in chatWithStage.ts) is
- * therefore already enforced for the general assistant surface, because it
- * is the same code path. A file-level grep for UPDATE_FILE/writeTextFile in
- * openGeneralAssistant.ts will always come up empty even though the
- * boundary applies — this test asserts the delegation contract directly so
- * that fact doesn't have to be re-derived by reading the source each time.
+ * The global assistant executes ONLY operations from the typed, allowlisted
+ * registry in utils/globalAssistantActions.ts: unregistered proposals are
+ * rejected without executing, payloads are schema-validated, consequential
+ * operations are confirmation-gated with the affected-task list, and a
+ * partial failure stops and reports rather than plowing on. These tests
+ * assert that authorization boundary directly.
  */
 import * as assert from "node:assert/strict";
-import * as nodeFs from "node:fs";
-import * as nodeOs from "node:os";
-import * as nodePath from "node:path";
-import { after, describe, it } from "node:test";
+import { describe, it } from "node:test";
 import * as vscode from "vscode";
 
-import { openGeneralAssistant } from "../commands/openGeneralAssistant";
+import {
+  executeProposedAction,
+  getGlobalAssistantOperation,
+  GLOBAL_ASSISTANT_OPERATIONS,
+  parseProposedAction,
+  stripActionEnvelopes,
+  GlobalAssistantContext,
+} from "../utils/globalAssistantActions";
+import { buildGlobalAssistantPrompt } from "../commands/openGeneralAssistant";
 import { TaskInventory, TaskWithProgress } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import type { TaskProgress } from "../types/taskProgress";
 
-const REAL_TASK_ROOT = nodeFs.mkdtempSync(
-  nodePath.join(nodeOs.tmpdir(), "ensemble-general-assistant-test-")
-);
-after(() => {
-  nodeFs.rmSync(REAL_TASK_ROOT, { recursive: true, force: true });
-});
-
-function makeTaskFolder(name: string): string {
-  const dir = nodePath.join(REAL_TASK_ROOT, ".ensemble", name);
-  nodeFs.mkdirSync(dir, { recursive: true });
-  return dir;
-}
-
-function makeInventoryStub(canonicalId: string, taskFolderPath: string): TaskInventory {
-  const inv = Object.create(TaskInventory.prototype) as TaskInventory;
-  const task: TaskWithProgress = {
-    canonicalId,
-    taskFolderPath,
-    folderName: nodePath.basename(taskFolderPath),
-    sourceScopeKey: canonicalId,
+function makeTask(folderName: string, status: TaskProgress["status"]): TaskWithProgress {
+  return {
+    canonicalId: `c:/tmp/${folderName}`,
+    taskFolderPath: `c:/tmp/${folderName}`,
+    folderName,
+    sourceScopeKey: "scope",
     progress: {
-      taskFolder: nodePath.basename(taskFolderPath),
-      currentStage: "impl" as const,
-      status: "active",
-      createdAt: "2026-07-08T00:00:00.000Z",
-      updatedAt: "2026-07-08T00:00:00.000Z",
+      taskFolder: folderName,
+      currentStage: "publish",
+      status,
+      createdAt: "2026-07-01T00:00:00.000Z",
+      updatedAt: "2026-07-01T00:00:00.000Z",
     } as TaskProgress,
   };
-  // @ts-expect-error — direct field init on stub
-  inv.visibleTasks = [task];
-  inv.refresh = async (): Promise<void> => { /* no-op */ };
-  inv.getTasks = (): TaskWithProgress[] => [task];
-  inv.getTaskById = (id: string): TaskWithProgress | undefined => (id === canonicalId ? task : undefined);
-  inv.getTaskByPath = (p: string): TaskWithProgress | undefined => (p === taskFolderPath ? task : undefined);
-  inv.getVisibleTaskForSuppressedId = (): undefined => undefined;
-  inv.getVisibleTaskForSuppressedPath = (): undefined => undefined;
-  return inv;
 }
 
-function makeCurrentTaskStoreStub(persistedId?: string): CurrentTaskStore {
+function makeContext(tasks: TaskWithProgress[]): GlobalAssistantContext {
+  const inventory = Object.create(TaskInventory.prototype) as TaskInventory;
+  inventory.getTasks = (): TaskWithProgress[] => tasks;
+  inventory.refresh = async (): Promise<void> => { /* no-op */ };
   const store = Object.create(CurrentTaskStore.prototype) as CurrentTaskStore;
-  store.get = (): string | undefined => persistedId;
-  store.set = async (): Promise<void> => { /* no-op */ };
+  store.get = (): string | undefined => undefined;
   store.clear = async (): Promise<void> => { /* no-op */ };
-  return store;
+  return {
+    inventory,
+    currentTaskStore: store,
+    assistantFolderUri: vscode.Uri.file("c:/tmp/global-assistant"),
+  };
 }
 
-void describe("openGeneralAssistant delegation (C4 boundary inheritance)", () => {
-  void it("dispatches vs-code-ai-helper.chatWithStage with the resolved task's own taskFolderPath", async () => {
-    const folderPath = makeTaskFolder("general-assistant-delegation");
-    const canonicalId = folderPath;
-    const inv = makeInventoryStub(canonicalId, folderPath);
-    const currentStore = makeCurrentTaskStoreStub(canonicalId);
+function withWarningStub<T>(
+  result: string | undefined,
+  body: (calls: string[]) => Promise<T>
+): Promise<T> {
+  const win = vscode.window as unknown as Record<string, unknown>;
+  const original = win.showWarningMessage;
+  const calls: string[] = [];
+  win.showWarningMessage = (message: string): Promise<string | undefined> => {
+    calls.push(message);
+    return Promise.resolve(result);
+  };
+  return body(calls).finally(() => {
+    win.showWarningMessage = original;
+  });
+}
 
-    if (!(vscode as unknown as Record<string, unknown>).commands) {
-      (vscode as unknown as Record<string, unknown>).commands = {};
+void describe("global assistant action envelopes", () => {
+  void it("parses an ACTION envelope with a JSON payload", () => {
+    const proposal = parseProposedAction(
+      'Sure. [[ACTION:repairStuckTask {"taskFolder": "2026-07-01_task_1"}]]'
+    );
+    assert.ok(proposal);
+    assert.strictEqual(proposal.operationId, "repairStuckTask");
+    assert.deepStrictEqual(proposal.payload, { taskFolder: "2026-07-01_task_1" });
+  });
+
+  void it("strips every envelope from the displayed text", () => {
+    const stripped = stripActionEnvelopes(
+      "Before [[ACTION:archiveCompletedTasks]] after"
+    );
+    assert.ok(!stripped.includes("[[ACTION:"));
+    assert.ok(stripped.startsWith("Before"));
+    assert.ok(stripped.endsWith("after"));
+  });
+
+  void it("names only registry operations in the assistant prompt", () => {
+    const prompt = buildGlobalAssistantPrompt("(no tasks)", "", "hello");
+    for (const op of GLOBAL_ASSISTANT_OPERATIONS) {
+      assert.ok(prompt.includes(op.id), `prompt must document ${op.id}`);
     }
-    const origExec = (vscode.commands as unknown as Record<string, unknown>).executeCommand;
-    const origWs = (vscode.workspace as unknown as Record<string, unknown>).workspaceFolders;
-    const captured: Array<{ command: string; arg: unknown }> = [];
-    (vscode.commands as unknown as Record<string, unknown>).executeCommand = async (
-      command: string,
-      arg?: unknown
-    ): Promise<undefined> => {
-      captured.push({ command, arg });
-      return Promise.resolve(undefined);
-    };
-    (vscode.workspace as unknown as Record<string, unknown>).workspaceFolders = [
-      { uri: vscode.Uri.file(REAL_TASK_ROOT), name: "real-task-root", index: 0 },
-    ];
+  });
+});
 
-    try {
-      await openGeneralAssistant(inv, currentStore);
+void describe("global assistant authorization boundary", () => {
+  void it("rejects an unregistered operation without executing or prompting", async () => {
+    const ctx = makeContext([makeTask("t1", "completed")]);
+    await withWarningStub("Run Action", async (calls) => {
+      const outcome = await executeProposedAction(ctx, {
+        operationId: "deleteEverything",
+        payload: undefined,
+      });
+      assert.match(outcome, /not in the allowlisted registry/);
+      assert.strictEqual(calls.length, 0, "no confirmation may be shown for a rejected op");
+    });
+  });
 
-      const dispatch = captured.find((e) => e.command === "vs-code-ai-helper.chatWithStage");
-      assert.ok(dispatch, "openGeneralAssistant must dispatch vs-code-ai-helper.chatWithStage");
-      const arg = dispatch.arg as { taskFolderPath?: string; canonicalId?: string };
-      assert.strictEqual(
-        arg.taskFolderPath,
-        folderPath,
-        "dispatch must carry the resolved task's own taskFolderPath — the same value " +
-          "chatWithStage's resolveMarkdownUpdateTarget scopes markdown edits to, so the " +
-          "general assistant is bound to the active task exactly like stage chat"
-      );
-    } finally {
-      (vscode.commands as unknown as Record<string, unknown>).executeCommand = origExec;
-      (vscode.workspace as unknown as Record<string, unknown>).workspaceFolders = origWs;
-    }
+  void it("rejects an invalid payload via the operation's own schema validation", async () => {
+    const ctx = makeContext([]);
+    await withWarningStub("Run Action", async (calls) => {
+      const outcome = await executeProposedAction(ctx, {
+        operationId: "repairStuckTask",
+        payload: { wrong: true },
+      });
+      assert.match(outcome, /rejected/);
+      assert.strictEqual(calls.length, 0);
+    });
+  });
+
+  void it("gates consequential operations on confirmation listing affected tasks", async () => {
+    const ctx = makeContext([makeTask("done-1", "completed"), makeTask("active-1", "active")]);
+    await withWarningStub(undefined, async (calls) => {
+      const outcome = await executeProposedAction(ctx, {
+        operationId: "archiveCompletedTasks",
+        payload: undefined,
+      });
+      assert.strictEqual(calls.length, 1, "a confirmation must be shown");
+      assert.ok(calls[0]!.includes("done-1"), "the confirmation lists affected tasks");
+      assert.ok(!calls[0]!.includes("active-1"), "only completed tasks are affected");
+      assert.match(outcome, /not confirmed; nothing was executed/);
+    });
+  });
+
+  void it("stops on the first failure and reports which tasks were left untouched", async () => {
+    // Under the unit-test stub, task progress files cannot be read, so the
+    // first archive attempt fails — the operation must stop there and say so
+    // instead of continuing to the second task.
+    const ctx = makeContext([makeTask("done-1", "completed"), makeTask("done-2", "completed")]);
+    await withWarningStub("Run Action", async () => {
+      const outcome = await executeProposedAction(ctx, {
+        operationId: "archiveCompletedTasks",
+        payload: undefined,
+      });
+      assert.match(outcome, /Archived 0 of 2/);
+      assert.match(outcome, /Stopped after a failure/);
+      assert.match(outcome, /Remaining tasks were left untouched/);
+    });
+  });
+
+  void it("exposes exactly the allowlisted operations through the registry lookup", () => {
+    assert.ok(getGlobalAssistantOperation("archiveCompletedTasks"));
+    assert.ok(getGlobalAssistantOperation("repairStuckTask"));
+    assert.strictEqual(getGlobalAssistantOperation("anythingElse"), undefined);
   });
 });

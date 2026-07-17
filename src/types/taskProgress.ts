@@ -19,10 +19,20 @@ export type CanonicalTaskStage = TaskStage;
 /**
  * Task status values.
  */
-export type TaskStatus = "creating" | "active" | "paused" | "completed";
+export type TaskStatus = "creating" | "active" | "paused" | "completed" | "archived";
 
 /** Authoritative list of every persisted task status, in display order. */
-export const TASK_STATUSES: readonly TaskStatus[] = ["creating", "active", "paused", "completed"];
+export const TASK_STATUSES: readonly TaskStatus[] = ["creating", "active", "paused", "completed", "archived"];
+
+/**
+ * Statuses hidden from the task list unless the user explicitly filters them
+ * in. Archived tasks are parked, not deleted — they stay reachable through
+ * the status filter but never clutter the default view.
+ */
+export const DEFAULT_HIDDEN_STATUSES: readonly TaskStatus[] = ["archived"];
+
+/** Maximum number of tasks that can be pinned at once. */
+export const MAX_PINNED_TASKS = 10;
 
 /**
  * The filename for the task request/scope artifact
@@ -93,8 +103,30 @@ export interface TaskProgress {
   currentStage: TaskStage;
   /** Task status: active or paused. Missing = active for backward compat. */
   status?: TaskStatus;
-  /** Set when the task is explicitly completed; stage advancement never sets it. */
+  /**
+   * Set when the task is explicitly completed; stage advancement never sets
+   * it. After a resume/reopen this survives as historical metadata only —
+   * completion is inferred solely from `status`, never from this field.
+   */
   completedAt?: string;
+  /**
+   * The lifecycle status the task had when it was archived (active, paused,
+   * or completed). Recorded for history; resuming an archived task always
+   * returns it to "active" regardless of this value.
+   */
+  archivedFrom?: TaskStatus;
+  /**
+   * ISO timestamp of when the task was pinned. Present only while pinned.
+   * Pinned tasks sort before unpinned ones, most recently pinned first,
+   * capped at MAX_PINNED_TASKS (the oldest pin is dropped automatically).
+   */
+  pinnedAt?: string;
+  /**
+   * Workspace-relative project root the Publish stage verifies against
+   * (lint/tests/plan verification). Persisted per task so two tasks in the
+   * same workspace folder of a monorepo can target different packages.
+   */
+  publishScopePath?: string;
   /** Stages explicitly completed by a terminal lifecycle action. */
   completedStages?: TaskStage[];
   /** Original description captured before an AI draft is applied. */
@@ -276,7 +308,7 @@ export function migrateStage(stage: string): TaskStage {
  * Normalize a status value read from disk. Missing or invalid -> "active".
  */
 export function migrateStatus(status: unknown): TaskStatus {
-  if (status === "creating" || status === "active" || status === "paused" || status === "completed") {
+  if (status === "creating" || status === "active" || status === "paused" || status === "completed" || status === "archived") {
     return status;
   }
   // Older task files used `finished` for the explicit completion state.

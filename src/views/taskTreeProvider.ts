@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import * as path from "path";
 import {
   AI_MODEL_STAGES,
+  DEFAULT_HIDDEN_STATUSES,
   isReviewStage,
   STAGE_ARTIFACT_FILENAMES,
   STAGE_DISPLAY_NAMES,
@@ -24,12 +25,35 @@ import {
   describeResolvedModel,
   getAvailableModels,
 } from "../utils/modelSelection";
-import { getMetaResourcesPath } from "../config/settings";
+import { getConfiguredTaskRoot } from "../utils/taskRoot";
 
 /**
  * The view ID for the tasks tree view (must match package.json)
  */
 export const TASKS_VIEW_ID = "vs-code-ai-helper.tasksView";
+
+/**
+ * Task-list display order: pinned tasks first (most recently pinned first),
+ * then unpinned tasks by recency (updatedAt descending) with the task
+ * display name as a deterministic tiebreaker for equal timestamps.
+ * Exported for direct unit testing.
+ */
+export function orderTasksForDisplay(visible: readonly IncompleteTask[]): IncompleteTask[] {
+  const displayLabel = (t: IncompleteTask): string =>
+    t.progress.displayName ?? t.folderName;
+  const pinned = visible
+    .filter((t) => t.progress.pinnedAt !== undefined)
+    .sort((a, b) => String(b.progress.pinnedAt).localeCompare(String(a.progress.pinnedAt)));
+  const unpinned = visible
+    .filter((t) => t.progress.pinnedAt === undefined)
+    .sort((a, b) => {
+      const recency =
+        new Date(b.progress.updatedAt).getTime() -
+        new Date(a.progress.updatedAt).getTime();
+      return recency !== 0 ? recency : displayLabel(a).localeCompare(displayLabel(b));
+    });
+  return [...pinned, ...unpinned];
+}
 
 type StageStatus = "done" | "current" | "outstanding";
 
@@ -61,6 +85,12 @@ function buildTaskTooltip(task: IncompleteTask): vscode.MarkdownString {
   const isPaused = task.progress.status === "paused";
   if (isPaused) {
     lines.push("⏸ **Paused**", "");
+  }
+  if (task.progress.status === "archived") {
+    lines.push("$(archive) **Archived**", "");
+  }
+  if (task.progress.pinnedAt) {
+    lines.push("$(pinned) **Pinned**", "");
   }
 
   for (const stage of STAGE_ORDER) {
@@ -166,6 +196,12 @@ export class TaskNode extends vscode.TreeItem {
         "debug-pause",
         new vscode.ThemeColor("charts.orange")
       );
+    } else if (task.progress.status === "archived") {
+      this.description = "Archived";
+      this.iconPath = new vscode.ThemeIcon(
+        "archive",
+        new vscode.ThemeColor("disabledForeground")
+      );
     } else if (task.progress.status === "completed") {
       this.description = "Completed";
       this.iconPath = new vscode.ThemeIcon(
@@ -199,7 +235,8 @@ export class TaskNode extends vscode.TreeItem {
       hasLintPayload: task.progress.lintPayload !== undefined,
       lintPassed: task.progress.lintPayload?.passed,
       isScheduled,
-      isMetaManaged
+      isMetaManaged,
+      isPinned: task.progress.pinnedAt !== undefined
     });
   }
 }
@@ -437,10 +474,16 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
       const previouslyKnown = Array.isArray(savedKnown)
         ? savedKnown
         : this.allStatuses().filter(status => status !== "creating");
-      const newlyAddedStatuses = this.allStatuses().filter(status => !previouslyKnown.includes(status));
+      // Newly introduced statuses become visible automatically — except the
+      // hidden-by-default ones (archived), which the user must opt into.
+      const newlyAddedStatuses = this.allStatuses().filter(
+        status =>
+          !previouslyKnown.includes(status) &&
+          !(DEFAULT_HIDDEN_STATUSES as readonly string[]).includes(status)
+      );
       this.selectedStatuses = new Set([...saved, ...newlyAddedStatuses]);
     } else {
-      this.selectedStatuses = new Set(this.allStatuses());
+      this.selectedStatuses = new Set(this.defaultStatuses());
     }
     // When the shared inventory changes, refresh the tree automatically
     this.inventory.onDidChange(() => this._onDidChangeTreeData.fire());
@@ -472,9 +515,17 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
     return [...TASK_STATUSES];
   }
 
+  /** Filter default: every status except the hidden-by-default ones (archived). */
+  private defaultStatuses(): string[] {
+    return this.allStatuses().filter(
+      status => !(DEFAULT_HIDDEN_STATUSES as readonly string[]).includes(status)
+    );
+  }
+
   private static readonly STATUS_DESCRIPTIONS: Partial<Record<string, string>> = {
     creating: "Still being created (recovery entries)",
     active: "In progress tasks",
+    archived: "Archived tasks (hidden by default)",
   };
 
   async chooseStatusFilter(): Promise<void> {
@@ -494,7 +545,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
   }
 
   async resetStatusFilter(): Promise<void> {
-    this.selectedStatuses = new Set(this.allStatuses());
+    this.selectedStatuses = new Set(this.defaultStatuses());
     await this.state?.update(this.filterKey, [...this.selectedStatuses]);
     await this.state?.update(this.filterKnownStatusesKey, this.allStatuses());
     this._onDidChangeTreeData.fire();
@@ -606,7 +657,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
         return;
       }
       
-      const metaPath = getMetaResourcesPath();
+      const metaPath = getConfiguredTaskRoot();
       if (!metaPath || metaPath.trim() === "" || path.isAbsolute(metaPath)) {
         this.isMetaManaged = false;
         return;
@@ -682,8 +733,11 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
   private getTaskNodes(): TaskTreeNode[] {
     const tasks = this.loadTasks();
     const visible = tasks.filter(task => this.selectedStatuses.has(task.progress.status ?? "active"));
-    const active = visible.filter((t) => t.progress.status !== "completed");
-    const completed = visible.filter((t) => t.progress.status === "completed");
+
+    const ordered = orderTasksForDisplay(visible);
+    const active = ordered.filter(
+      (t) => t.progress.status !== "completed" && t.progress.status !== "archived"
+    );
 
     const shouldExpand = (task: IncompleteTask, index: number): boolean => {
       const id = taskIdentityKey(task);
@@ -712,7 +766,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
     // legacy task objects that have no canonicalId.
     const currentTaskCanonicalId = this.currentTaskStore?.get();
 
-    const nodes: TaskTreeNode[] = [...active, ...completed].map(
+    const nodes: TaskTreeNode[] = ordered.map(
       (task, index) => {
         const taskId = taskIdentityKey(task);
         const isCurrent =

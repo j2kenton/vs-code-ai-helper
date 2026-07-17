@@ -9,18 +9,9 @@ import {
   applyManagedMetaGitIgnoreBlock,
   buildLegacyMetaRootIgnorePatterns,
   buildManagedIgnorePatterns,
-  diffGitignoreLines,
-  hideMetaResourcesInGitIgnore,
+  ensureAutomaticMetaGitIgnore,
   isManagedMetaGitIgnoreHidden,
-  showMetaResourcesInGitIgnore,
 } from "../commands/toggleMetaResourcesGitIgnore";
-import {
-  deactivateNotificationRouter,
-  initNotificationRouter,
-} from "../utils/notificationRouter";
-import { StatusTreeProvider } from "../views/statusView";
-import { TaskInventory } from "../state/taskInventory";
-import { CurrentTaskStore } from "../utils/currentTaskStore";
 
 function git(cwd: string, args: string[]): void {
   cp.execFileSync("git", args, { cwd, stdio: "ignore", windowsHide: true });
@@ -44,7 +35,7 @@ function makeGitFixture(): string {
   return repoRoot;
 }
 
-function installConfigStub(): { restore: () => void } {
+function installConfigStub(configuredTaskRoot?: string): { restore: () => void } {
   const original = (vscode.workspace as unknown as Record<string, unknown>)
     .getConfiguration;
   (vscode.workspace as unknown as Record<string, unknown>).getConfiguration =
@@ -53,7 +44,10 @@ function installConfigStub(): { restore: () => void } {
       update: () => Promise<void>;
       inspect: () => undefined;
     } => ({
-      get: (_key: string, defaultValue?: unknown): unknown => defaultValue,
+      get: (key: string, defaultValue?: unknown): unknown =>
+        key === "metaResourcesPath" && configuredTaskRoot !== undefined
+          ? configuredTaskRoot
+          : defaultValue,
       update: async (): Promise<void> => {},
       inspect: () => undefined,
     });
@@ -63,6 +57,55 @@ function installConfigStub(): { restore: () => void } {
         vscode.workspace as unknown as Record<string, unknown>
       ).getConfiguration = original;
     },
+  };
+}
+
+function installWorkspaceFoldersStub(...roots: string[]): {
+  folders: vscode.WorkspaceFolder[];
+  restore: () => void;
+} {
+  const target = vscode.workspace as unknown as Record<string, unknown>;
+  const orig = target.workspaceFolders;
+  const folders = roots.map((root, index) => ({
+    uri: vscode.Uri.file(root),
+    name: path.basename(root),
+    index,
+  }));
+  target.workspaceFolders = folders;
+  return { folders, restore: (): void => { target.workspaceFolders = orig; } };
+}
+
+/** Mirrors the gate-key normalization in ensureAutomaticMetaGitIgnore. */
+function gateKeyFor(root: string): string {
+  const normalized = path.normalize(vscode.Uri.file(root).fsPath);
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+
+function installWriteFileBridge(): { restore: () => void } {
+  const fsTarget = vscode.workspace.fs as unknown as { writeFile: unknown };
+  const original = fsTarget.writeFile;
+  fsTarget.writeFile = (uri: vscode.Uri, bytes: Uint8Array): Promise<void> => {
+    fs.writeFileSync(uri.fsPath, Buffer.from(bytes));
+    return Promise.resolve();
+  };
+  return { restore: (): void => { fsTarget.writeFile = original; } };
+}
+
+function makeContext(): { context: vscode.ExtensionContext; state: Map<string, unknown> } {
+  const state = new Map<string, unknown>();
+  const workspaceState = {
+    get: <T>(key: string, defaultValue?: T): T =>
+      (state.has(key) ? (state.get(key) as T) : (defaultValue as T)),
+    update: (key: string, value: unknown): Promise<void> => {
+      if (value === undefined) state.delete(key);
+      else state.set(key, value);
+      return Promise.resolve();
+    },
+    keys: (): readonly string[] => [...state.keys()],
+  };
+  return {
+    context: { workspaceState, subscriptions: [] } as unknown as vscode.ExtensionContext,
+    state,
   };
 }
 
@@ -279,7 +322,7 @@ void describe("managed meta gitignore block", () => {
       { persistentPatterns: ["/plans/**/chat-v1.json", "/plans/**/chat-v1.corrupt.json"] }
     );
 
-    assert.match(shown, /# BEGIN Ensemble managed meta resources/, "the block must survive Show Meta Files");
+    assert.match(shown, /# BEGIN Ensemble managed meta resources/, "the block must survive a show edit");
     assert.match(shown, /\/plans\/\*\*\/chat-v1\.json/);
     assert.match(shown, /\/plans\/\*\*\/chat-v1\.corrupt\.json/);
     const lines = shown.split(/\r?\n/).map((line) => line.trim());
@@ -350,12 +393,10 @@ void describe("meta gitignore command contributions", () => {
     });
   });
 
-  void it("keeps hide/show/toggle commands out of the command manifest (Settings owns confirmation)", () => {
-    // These commands still exist and are still registered (settingsView.ts
-    // invokes them programmatically), but they must not be reachable from
-    // the Command Palette or any menu — every .gitignore write must go
-    // through the confirmation flow, and the only caller that's supposed to
-    // reach it is the Settings save handler.
+  void it("keeps the removed hide/show/toggle commands out of the command manifest", () => {
+    // Git-ignore handling is fully automatic now (ensureAutomaticMetaGitIgnore);
+    // the manual hide/show/toggle command pathway was removed outright, so the
+    // manifest must not resurrect any of it.
     const commands = readPackageJson().contributes?.commands ?? [];
 
     for (const command of [
@@ -386,199 +427,74 @@ void describe("meta gitignore command contributions", () => {
   });
 });
 
-void describe("diffGitignoreLines", () => {
-  void it("reports exactly the added lines when hiding meta files for the first time", () => {
-    const current = ["node_modules/", ""].join("\n");
-    const next = applyManagedMetaGitIgnoreBlock(current, ["/plans/task-a/"], true);
-
-    const { added, removed } = diffGitignoreLines(current, next);
-    assert.equal(removed.length, 0);
-    assert.deepEqual(added, [
-      "# BEGIN Ensemble managed meta resources",
-      "# Managed by Ensemble. Do not edit this block manually.",
-      "/plans/task-a/",
-      "# END Ensemble managed meta resources",
-    ]);
-  });
-
-  void it("reports no diff when the content is unchanged", () => {
-    assert.deepEqual(diffGitignoreLines("dist/\n", "dist/\n"), {
-      added: [],
-      removed: [],
-    });
-  });
-});
-
-void describe("gitignore writes require confirmation with an exact diff", () => {
-  void it("does not touch .gitignore when the user declines the confirmation", async () => {
+void describe("automatic managed .gitignore maintenance", () => {
+  void it("applies the managed block silently and records the applied root", async () => {
     const repoRoot = makeGitFixture();
     const configStub = installConfigStub();
-    const surface = new StatusTreeProvider();
-    initNotificationRouter(surface);
-
-    const originalWorkspaceFolders = vscode.workspace.workspaceFolders;
-    const originalShowWarningMessage = vscode.window.showWarningMessage;
-    (vscode.workspace as unknown as { workspaceFolders: unknown }).workspaceFolders = [
-      { uri: vscode.Uri.file(repoRoot), name: "repo", index: 0 },
-    ];
-
-    let promptedDetail: string | undefined;
-    (vscode.window as unknown as { showWarningMessage: unknown }).showWarningMessage =
-      (
-        _message: string,
-        options: { detail?: string },
-        ..._actions: string[]
-      ): Promise<string | undefined> => {
-        promptedDetail = options.detail;
-        return Promise.resolve(undefined); // user dismisses/declines
-      };
+    const ws = installWorkspaceFoldersStub(repoRoot);
+    const writeBridge = installWriteFileBridge();
+    const { context, state } = makeContext();
 
     try {
-      const applied = await hideMetaResourcesInGitIgnore(
-        {} as TaskInventory,
-        {} as CurrentTaskStore
-      );
+      await ensureAutomaticMetaGitIgnore(context);
 
-      assert.equal(applied, false);
-      assert.ok(promptedDetail?.includes("BEGIN Ensemble managed meta resources"));
+      const written = fs.readFileSync(path.join(repoRoot, ".gitignore"), "utf8");
+      assert.match(written, /# BEGIN Ensemble managed meta resources/);
+      assert.match(written, /\/\.ensemble\//);
+      assert.match(written, /\/\.ensemble\/\*\*\/chat-v1\.json/);
+      assert.match(written, /\/\.ensemble\/\*\*\/chat-v1\.corrupt\.json/);
+      assert.deepEqual(
+        state.get("ensemble.autoGitIgnoreApplied"),
+        { [gateKeyFor(repoRoot)]: ".ensemble" },
+        "the applied root is recorded per workspace folder so activation does not re-fight a manual edit"
+      );
+    } finally {
+      writeBridge.restore();
+      ws.restore();
+      configStub.restore();
+      fs.rmSync(repoRoot, { recursive: true, force: true });
+    }
+  });
+
+  void it("is a no-op once applied for the active root, even if the user hand-edited the file", async () => {
+    const repoRoot = makeGitFixture();
+    const configStub = installConfigStub();
+    const ws = installWorkspaceFoldersStub(repoRoot);
+    const writeBridge = installWriteFileBridge();
+    const { context, state } = makeContext();
+    // Legacy bare-string gate format (pre multi-root): it only ever targeted
+    // the first workspace folder and must still be honored for it.
+    state.set("ensemble.autoGitIgnoreApplied", ".ensemble");
+
+    try {
+      await ensureAutomaticMetaGitIgnore(context);
       assert.equal(
         fs.existsSync(path.join(repoRoot, ".gitignore")),
         false,
-        "declining the confirmation must leave .gitignore untouched"
+        "a recorded application for the active root must not write again"
       );
     } finally {
-      (vscode.workspace as unknown as { workspaceFolders: unknown }).workspaceFolders =
-        originalWorkspaceFolders;
-      (vscode.window as unknown as { showWarningMessage: unknown }).showWarningMessage =
-        originalShowWarningMessage;
-      deactivateNotificationRouter();
+      writeBridge.restore();
+      ws.restore();
       configStub.restore();
       fs.rmSync(repoRoot, { recursive: true, force: true });
     }
   });
 
-  void it("writes .gitignore once the user confirms", async () => {
+  void it("does not duplicate the artifacts pattern when the legacy configured root resolves to the same path", async () => {
     const repoRoot = makeGitFixture();
-    const configStub = installConfigStub();
-    const surface = new StatusTreeProvider();
-    initNotificationRouter(surface);
-
-    const originalWorkspaceFolders = vscode.workspace.workspaceFolders;
-    const originalShowWarningMessage = vscode.window.showWarningMessage;
-    const originalWriteFile = (
-      vscode.workspace.fs as unknown as { writeFile: unknown }
-    ).writeFile;
-    (vscode.workspace as unknown as { workspaceFolders: unknown }).workspaceFolders = [
-      { uri: vscode.Uri.file(repoRoot), name: "repo", index: 0 },
-    ];
-    (vscode.window as unknown as { showWarningMessage: unknown }).showWarningMessage =
-      (
-        _message: string,
-        _options: { detail?: string },
-        ...actions: string[]
-      ): Promise<string | undefined> => Promise.resolve(actions[0]);
-    (vscode.workspace.fs as unknown as { writeFile: unknown }).writeFile = (
-      uri: vscode.Uri,
-      bytes: Uint8Array
-    ): Promise<void> => {
-      fs.writeFileSync(uri.fsPath, Buffer.from(bytes));
-      return Promise.resolve();
-    };
-    // setMetaVisibilityContexts fires the built-in "setContext" command as a
-    // side effect once the write is confirmed; the stub throws on
-    // unregistered commands, so no-op it for the duration of this test.
-    const commandsStub = vscode.commands as typeof vscode.commands & {
-      _executeCommandOverride?: (id: string, ...args: unknown[]) => Promise<unknown>;
-    };
-    const originalExecuteCommandOverride = commandsStub._executeCommandOverride;
-    commandsStub._executeCommandOverride = () => Promise.resolve(undefined);
-
-    try {
-      const applied = await hideMetaResourcesInGitIgnore(
-        {} as TaskInventory,
-        {} as CurrentTaskStore
-      );
-
-      assert.equal(applied, true);
-      const written = fs.readFileSync(path.join(repoRoot, ".gitignore"), "utf8");
-      assert.match(written, /# BEGIN Ensemble managed meta resources/);
-    } finally {
-      commandsStub._executeCommandOverride = originalExecuteCommandOverride;
-      (vscode.workspace.fs as unknown as { writeFile: unknown }).writeFile =
-        originalWriteFile;
-      (vscode.workspace as unknown as { workspaceFolders: unknown }).workspaceFolders =
-        originalWorkspaceFolders;
-      (vscode.window as unknown as { showWarningMessage: unknown }).showWarningMessage =
-        originalShowWarningMessage;
-      deactivateNotificationRouter();
-      configStub.restore();
-      fs.rmSync(repoRoot, { recursive: true, force: true });
-    }
-  });
-
-  void it("does not duplicate the artifacts pattern when the configured task root resolves to the same path", async () => {
-    const repoRoot = makeGitFixture();
-    const surface = new StatusTreeProvider();
-    initNotificationRouter(surface);
-
-    // Configuring the task root to "artifacts/helper" makes it resolve to
+    // A leftover legacy metaResourcesPath of "artifacts/helper" resolves to
     // the exact same repo-relative path as the fixed artifacts root, which
-    // previously produced a managed block listing "/artifacts/helper/"
-    // twice (reported by users as an unexplained duplicate entry).
-    const originalGetConfiguration = (
-      vscode.workspace as unknown as Record<string, unknown>
-    ).getConfiguration;
-    (vscode.workspace as unknown as Record<string, unknown>).getConfiguration =
-      (): {
-        get: (key: string, defaultValue?: unknown) => unknown;
-        update: () => Promise<void>;
-        inspect: () => undefined;
-      } => ({
-        get: (key: string, defaultValue?: unknown): unknown =>
-          key === "metaResourcesPath" ? "artifacts/helper" : defaultValue,
-        update: async (): Promise<void> => {},
-        inspect: () => undefined,
-      });
-
-    const originalWorkspaceFolders = vscode.workspace.workspaceFolders;
-    const originalShowWarningMessage = vscode.window.showWarningMessage;
-    const originalWriteFile = (
-      vscode.workspace.fs as unknown as { writeFile: unknown }
-    ).writeFile;
-    (vscode.workspace as unknown as { workspaceFolders: unknown }).workspaceFolders = [
-      { uri: vscode.Uri.file(repoRoot), name: "repo", index: 0 },
-    ];
-    (vscode.window as unknown as { showWarningMessage: unknown }).showWarningMessage =
-      (
-        _message: string,
-        _options: { detail?: string },
-        ...actions: string[]
-      ): Promise<string | undefined> => Promise.resolve(actions[0]);
-    (vscode.workspace.fs as unknown as { writeFile: unknown }).writeFile = (
-      uri: vscode.Uri,
-      bytes: Uint8Array
-    ): Promise<void> => {
-      fs.writeFileSync(uri.fsPath, Buffer.from(bytes));
-      return Promise.resolve();
-    };
-    const commandsStub = vscode.commands as typeof vscode.commands & {
-      _executeCommandOverride?: (id: string, ...args: unknown[]) => Promise<unknown>;
-    };
-    const originalExecuteCommandOverride = commandsStub._executeCommandOverride;
-    commandsStub._executeCommandOverride = () => Promise.resolve(undefined);
+    // previously produced a managed block listing "/artifacts/helper/" twice.
+    const configStub = installConfigStub("artifacts/helper");
+    const ws = installWorkspaceFoldersStub(repoRoot);
+    const writeBridge = installWriteFileBridge();
+    const { context } = makeContext();
 
     try {
-      const applied = await hideMetaResourcesInGitIgnore(
-        {} as TaskInventory,
-        {} as CurrentTaskStore
-      );
+      await ensureAutomaticMetaGitIgnore(context);
 
-      assert.equal(applied, true);
       const written = fs.readFileSync(path.join(repoRoot, ".gitignore"), "utf8");
-      // Count exact standalone-line occurrences of the root pattern, not a
-      // raw substring count: "/artifacts/helper/**/chat-v1.json" legitimately
-      // contains "/artifacts/helper/" as a prefix without being a duplicate
-      // of the root pattern itself.
       const lines = written.split(/\r?\n/).map((line) => line.trim());
       const occurrences = lines.filter((line) => line === "/artifacts/helper/").length;
       assert.equal(
@@ -587,107 +503,61 @@ void describe("gitignore writes require confirmation with an exact diff", () => 
         `expected "/artifacts/helper/" to appear exactly once as its own line, got ${occurrences}:\n${written}`
       );
     } finally {
-      commandsStub._executeCommandOverride = originalExecuteCommandOverride;
-      (vscode.workspace.fs as unknown as { writeFile: unknown }).writeFile =
-        originalWriteFile;
-      (vscode.workspace as unknown as { workspaceFolders: unknown }).workspaceFolders =
-        originalWorkspaceFolders;
-      (vscode.window as unknown as { showWarningMessage: unknown }).showWarningMessage =
-        originalShowWarningMessage;
-      deactivateNotificationRouter();
-      (vscode.workspace as unknown as Record<string, unknown>).getConfiguration =
-        originalGetConfiguration;
+      writeBridge.restore();
+      ws.restore();
+      configStub.restore();
       fs.rmSync(repoRoot, { recursive: true, force: true });
     }
   });
 
-  void it("keeps chat-transcript patterns in .gitignore after hide then show (Option A end-to-end)", async () => {
-    const repoRoot = makeGitFixture();
+  void it("writes the .gitignore of the selected workspace folder in a multi-root workspace", async () => {
+    // Two independent repositories opened as one multi-root workspace. The
+    // first folder was already handled (legacy string gate format); creating
+    // the first task in the second folder must update the second repository's
+    // .gitignore — not skip on the first folder's gate, and not touch the
+    // first repository.
+    const firstRepo = makeGitFixture();
+    const secondRepo = makeGitFixture();
     const configStub = installConfigStub();
-    const surface = new StatusTreeProvider();
-    initNotificationRouter(surface);
-
-    const originalWorkspaceFolders = vscode.workspace.workspaceFolders;
-    const originalShowWarningMessage = vscode.window.showWarningMessage;
-    const originalWriteFile = (
-      vscode.workspace.fs as unknown as { writeFile: unknown }
-    ).writeFile;
-    const originalReadFile = (
-      vscode.workspace.fs as unknown as { readFile: unknown }
-    ).readFile;
-    (vscode.workspace as unknown as { workspaceFolders: unknown }).workspaceFolders = [
-      { uri: vscode.Uri.file(repoRoot), name: "repo", index: 0 },
-    ];
-    (vscode.window as unknown as { showWarningMessage: unknown }).showWarningMessage =
-      (
-        _message: string,
-        _options: { detail?: string },
-        ...actions: string[]
-      ): Promise<string | undefined> => Promise.resolve(actions[0]);
-    (vscode.workspace.fs as unknown as { writeFile: unknown }).writeFile = (
-      uri: vscode.Uri,
-      bytes: Uint8Array
-    ): Promise<void> => {
-      fs.writeFileSync(uri.fsPath, Buffer.from(bytes));
-      return Promise.resolve();
-    };
-    // The second call (show) must see the first call's (hide) write, so
-    // readFile needs a real bridge too — unlike the other tests in this
-    // file, which only ever write once and never need to read back a prior
-    // write of their own.
-    (vscode.workspace.fs as unknown as { readFile: unknown }).readFile = (
-      uri: vscode.Uri
-    ): Promise<Uint8Array> => fs.promises.readFile(uri.fsPath).then((buf) => new Uint8Array(buf));
-    const commandsStub = vscode.commands as typeof vscode.commands & {
-      _executeCommandOverride?: (id: string, ...args: unknown[]) => Promise<unknown>;
-    };
-    const originalExecuteCommandOverride = commandsStub._executeCommandOverride;
-    commandsStub._executeCommandOverride = () => Promise.resolve(undefined);
+    const ws = installWorkspaceFoldersStub(firstRepo, secondRepo);
+    const writeBridge = installWriteFileBridge();
+    const { context, state } = makeContext();
+    state.set("ensemble.autoGitIgnoreApplied", ".ensemble");
 
     try {
-      const hideApplied = await hideMetaResourcesInGitIgnore(
-        {} as TaskInventory,
-        {} as CurrentTaskStore
-      );
-      assert.equal(hideApplied, true);
-      const hiddenContent = fs.readFileSync(path.join(repoRoot, ".gitignore"), "utf8");
-      // The config stub returns the caller's own default for every key
-      // (installConfigStub), so the task root here resolves to the real
-      // built-in default (".ensemble"), not the legacy "/plans/".
-      assert.match(hiddenContent, /\/\.ensemble\/\*\*\/chat-v1\.json/);
-      assert.match(hiddenContent, /\/\.ensemble\/\*\*\/chat-v1\.corrupt\.json/);
+      await ensureAutomaticMetaGitIgnore(context, ws.folders[1]);
 
-      const showApplied = await showMetaResourcesInGitIgnore(
-        {} as TaskInventory,
-        {} as CurrentTaskStore
-      );
-      assert.equal(showApplied, true);
-      const shownContent = fs.readFileSync(path.join(repoRoot, ".gitignore"), "utf8");
-      assert.match(
-        shownContent,
-        /\/\.ensemble\/\*\*\/chat-v1\.json/,
-        "transcript patterns must survive Show Meta Files"
-      );
-      assert.match(shownContent, /\/\.ensemble\/\*\*\/chat-v1\.corrupt\.json/);
-      const shownLines = shownContent.split(/\r?\n/).map((line) => line.trim());
       assert.equal(
-        shownLines.includes("/.ensemble/"),
+        fs.existsSync(path.join(firstRepo, ".gitignore")),
         false,
-        "the root task-folder pattern itself must be gone once shown"
+        "the first repository must not be touched when the second folder is the target"
+      );
+      const written = fs.readFileSync(path.join(secondRepo, ".gitignore"), "utf8");
+      assert.match(written, /# BEGIN Ensemble managed meta resources/);
+      assert.match(written, /\/\.ensemble\//);
+      assert.deepEqual(
+        state.get("ensemble.autoGitIgnoreApplied"),
+        {
+          [gateKeyFor(firstRepo)]: ".ensemble",
+          [gateKeyFor(secondRepo)]: ".ensemble",
+        },
+        "the legacy first-folder record must be preserved and the second folder recorded alongside it"
+      );
+
+      // A second run for the same folder is gated off (record format).
+      fs.rmSync(path.join(secondRepo, ".gitignore"));
+      await ensureAutomaticMetaGitIgnore(context, ws.folders[1]);
+      assert.equal(
+        fs.existsSync(path.join(secondRepo, ".gitignore")),
+        false,
+        "a recorded application for the selected folder must not write again"
       );
     } finally {
-      commandsStub._executeCommandOverride = originalExecuteCommandOverride;
-      (vscode.workspace.fs as unknown as { writeFile: unknown }).writeFile =
-        originalWriteFile;
-      (vscode.workspace.fs as unknown as { readFile: unknown }).readFile =
-        originalReadFile;
-      (vscode.workspace as unknown as { workspaceFolders: unknown }).workspaceFolders =
-        originalWorkspaceFolders;
-      (vscode.window as unknown as { showWarningMessage: unknown }).showWarningMessage =
-        originalShowWarningMessage;
-      deactivateNotificationRouter();
+      writeBridge.restore();
+      ws.restore();
       configStub.restore();
-      fs.rmSync(repoRoot, { recursive: true, force: true });
+      fs.rmSync(firstRepo, { recursive: true, force: true });
+      fs.rmSync(secondRepo, { recursive: true, force: true });
     }
   });
 });

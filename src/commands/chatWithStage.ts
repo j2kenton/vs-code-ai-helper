@@ -165,7 +165,14 @@ export async function chatWithStage(
   }
   const targetStage = stage ?? task.progress.currentStage;
   if (!message?.trim()) {
-    await chatViewProvider.open({ canonicalId: task.canonicalId, taskFolderPath: task.taskFolderPath, stage: targetStage });
+    await chatViewProvider.open({
+      canonicalId: task.canonicalId,
+      taskFolderPath: task.taskFolderPath,
+      stage: targetStage,
+      // Chat labels always show the associated task: the display name when
+      // set, otherwise the view falls back to the folder's date/task-ID code.
+      taskName: task.progress.displayName,
+    });
     return;
   }
   if (!(await ensureAiConsent(context))) return;
@@ -198,7 +205,9 @@ export async function chatWithStage(
     const { runner, nativeModelId } = resolveRunnerForModel(modelId, targetStage, taskFolderUri);
     const { availability: available, providerLabel } = await checkRunnerAvailabilityForModel(modelId, targetStage);
     if (!available.available) throw new Error(available.reason ?? `${providerLabel} is unavailable.`);
-    const conversation = (await chatViewProvider.transcript(task.taskFolderPath, task.canonicalId))
+    // Stage-scoped: each stage has a fully separate conversation, so the
+    // prompt context never mixes in another stage's messages.
+    const conversation = (await chatViewProvider.transcript(task.taskFolderPath, task.canonicalId, targetStage))
       .slice(-20)
       .map(entry => `${entry.role.toUpperCase()}: ${entry.text}`)
       .join("\n");

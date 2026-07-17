@@ -9,11 +9,13 @@ import {
   AgentRunnerCapabilities,
   AgentRunRequest,
   AgentRunResult,
+  AgentWorkflowStage,
 } from "../types/agentRunner";
 import { withAttribution, writeTextFile } from "../utils/fileUtils";
 import { ImplementationRunResult } from "./copilotImplementationRunner";
 import { cliDisplayLabel, CliProviderDefinition, CliRunMode } from "./providers";
 import { classifyCliFailure } from "../utils/quota";
+import { writeRunLog } from "../utils/runLog";
 import {
   IMPLEMENTATION_FILENAME,
   LEGACY_IMPLEMENTATION_FILENAME,
@@ -212,12 +214,212 @@ function killProcessTree(child: cp.ChildProcess): void {
   }
 }
 
+/**
+ * What the CLI's own stdout event stream showed for a timed-out run —
+ * the primary evidence gate for auto-retrying an edit-capable run.
+ */
+export interface CliEditEventEvidence {
+  /** Whether stdout carried a parseable per-event (JSON-lines) stream at all. */
+  streamAvailable: boolean;
+  /** Whether any tool-use / file-edit event was observed before the failure. */
+  sawToolOrEditEvent: boolean;
+}
+
+/**
+ * Markers that identify a tool-use or file-edit boundary event in a
+ * provider's JSON event stream. Deliberately broad across the supported
+ * CLIs' event vocabularies (Claude stream-json `tool_use`, Codex
+ * `function_call`/`exec`/`apply_patch`, Gemini `tool`/`edit` events):
+ * a false positive merely suppresses an auto-retry, while a false negative
+ * could retry a run that already had side effects.
+ */
+const TOOL_OR_EDIT_EVENT_PATTERN =
+  /"type"\s*:\s*"[^"]*(?:tool|edit|patch|exec|command|file_change|write)[^"]*"|"tool_use"|"tool_name"|"tool_calls?"|"function_call"|"apply_patch"|"file_edit"/i;
+
+/**
+ * Parse a CLI's raw stdout as a JSON-lines event stream and report whether
+ * one was present and whether it contained tool-use/file-edit activity.
+ * Exported for direct unit testing of the retry-evidence matrix.
+ */
+export function analyzeCliEventStream(stdoutRaw: string): CliEditEventEvidence {
+  let streamAvailable = false;
+  let sawToolOrEditEvent = false;
+  for (const line of stripAnsi(stdoutRaw).split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) {
+      continue;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    if (!parsed || typeof parsed !== "object") {
+      continue;
+    }
+    streamAvailable = true;
+    if (TOOL_OR_EDIT_EVENT_PATTERN.test(trimmed)) {
+      sawToolOrEditEvent = true;
+    }
+  }
+  return { streamAvailable, sawToolOrEditEvent };
+}
+
+export interface EditRetryDecision {
+  retry: boolean;
+  /** Human-readable evidence/justification, recorded in the retry audit log. */
+  reason: string;
+}
+
+/**
+ * The edit-run auto-retry rule (exported for direct unit testing): retry a
+ * timed-out edit run ONLY when the provider guarantees tool/edit boundary
+ * events are flushed before side effects, the parsed event stream was
+ * actually available AND clean of tool/edit activity, and the working-tree
+ * snapshot is unchanged. Every other combination refuses the retry — an
+ * absent or unverifiable stream from a timed-out process proves nothing.
+ */
+export function evaluateEditRetryEligibility(options: {
+  providerLabel: string;
+  guaranteesEditEventFlushBeforeSideEffects: boolean;
+  evidence: CliEditEventEvidence | undefined;
+  snapshotClean: boolean;
+}): EditRetryDecision {
+  if (!options.guaranteesEditEventFlushBeforeSideEffects) {
+    return {
+      retry: false,
+      reason:
+        `Automatic retry is disabled for ${options.providerLabel} edit runs: its CLI protocol ` +
+        "does not guarantee edit events are flushed before side effects.",
+    };
+  }
+  if (!options.evidence?.streamAvailable) {
+    return {
+      retry: false,
+      reason:
+        "No parseable event stream was available for the timed-out run, so it cannot be " +
+        "proven side-effect free.",
+    };
+  }
+  if (options.evidence.sawToolOrEditEvent) {
+    return {
+      retry: false,
+      reason:
+        "The run's event stream shows tool/edit activity before the timeout, so it may " +
+        "already have made changes.",
+    };
+  }
+  if (!options.snapshotClean) {
+    return {
+      retry: false,
+      reason: "The working tree changed (or could not be verified) during the timed-out run.",
+    };
+  }
+  return {
+    retry: true,
+    reason:
+      "provider flush guarantee + clean event stream (no tool/edit events) + unchanged " +
+      "working-tree snapshot",
+  };
+}
+
+/** One audited (attempted or refused) retry, persisted via runLog. */
+export interface RetryAuditEntry {
+  attempt: number;
+  classification: string;
+  capabilityFlag: boolean | undefined;
+  evidence: string;
+  delayMs: number;
+  retried: boolean;
+}
+
+/** Render the retry audit as the Markdown run-log artifact. @internal exported for testing */
+export function formatRetryAuditLog(
+  providerLabel: string,
+  mode: string,
+  entries: readonly RetryAuditEntry[]
+): string {
+  const lines = [
+    `# CLI Retry Audit — ${providerLabel} (${mode})`,
+    "",
+    `- Policy: max ${CLI_RETRY_MAX_ATTEMPTS} attempts, ${CLI_RETRY_DELAY_MS / 1000}s delay between attempts`,
+    `- Recorded at: ${new Date().toISOString()}`,
+    "",
+  ];
+  for (const entry of entries) {
+    lines.push(
+      `## Attempt ${entry.attempt}`,
+      "",
+      `- Classification: ${entry.classification}`,
+      `- Provider flush-guarantee flag: ${entry.capabilityFlag === undefined ? "n/a (read-only run)" : String(entry.capabilityFlag)}`,
+      `- Evidence: ${entry.evidence}`,
+      `- Decision: ${entry.retried ? `retried after ${entry.delayMs / 1000}s` : "not retried"}`,
+      ""
+    );
+  }
+  return lines.join("\n");
+}
+
+/** Best-effort persistence of the retry audit — a log failure never fails the run. */
+async function persistRetryAuditLog(
+  taskFolderUri: vscode.Uri | undefined,
+  runnerId: string,
+  stage: AgentWorkflowStage | undefined,
+  providerLabel: string,
+  mode: string,
+  entries: readonly RetryAuditEntry[]
+): Promise<void> {
+  if (!taskFolderUri || entries.length === 0) {
+    return;
+  }
+  try {
+    await writeRunLog(
+      taskFolderUri,
+      `${runnerId}-retry`,
+      stage ?? "impl",
+      formatRetryAuditLog(providerLabel, mode, entries)
+    );
+  } catch {
+    // Auditing is evidence, not control flow.
+  }
+}
+
 export interface CliExecResult {
   status: "completed" | "failed" | "cancelled";
   output: string;
   errorMessage?: string;
   /** Set on failed results; absent for completed/cancelled. */
   failureKind?: "quota" | "temporarily-unavailable" | "generic";
+  /**
+   * True when the failure is a transient transport-level condition (a run
+   * timeout) that is in principle retryable. Auth errors, non-zero tool
+   * exits, and content errors are never marked transient.
+   */
+  transient?: boolean;
+  /** Event-stream evidence captured for transient (timeout) failures. */
+  editEvidence?: CliEditEventEvidence;
+}
+
+/** Bounded retry policy for transient CLI failures (timeouts). */
+export const CLI_RETRY_MAX_ATTEMPTS = 3; // 1 initial + 2 retries
+export const CLI_RETRY_DELAY_MS = 5_000;
+
+/** Cancellable delay between retry attempts. */
+async function retryDelay(
+  token: vscode.CancellationToken,
+  ms = CLI_RETRY_DELAY_MS
+): Promise<void> {
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(() => {
+      sub.dispose();
+      resolve();
+    }, ms);
+    const sub = token.onCancellationRequested(() => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
 }
 
 const ANSI_ESCAPE_PATTERN =
@@ -535,13 +737,22 @@ export async function execCliAgent(options: {
 
     const timeoutHandle = setTimeout(() => {
       killProcessTree(child);
-      finish(classifyCliFailure({
-        status: "failed",
-        output: stdout,
-        errorMessage: `${cliDisplayLabel(def)} CLI timed out after ${
-          RUN_TIMEOUT_MS / 60000
-        } minutes.`,
-      }));
+      finish({
+        ...classifyCliFailure({
+          status: "failed",
+          output: stdout,
+          errorMessage: `${cliDisplayLabel(def)} CLI timed out after ${
+            RUN_TIMEOUT_MS / 60000
+          } minutes.`,
+        }),
+        // A timeout is the one failure shape that is transport-transient and
+        // therefore retry-eligible (read-only runs always; edit runs only
+        // under the per-provider flush guarantee — see runImplementationWithCli).
+        transient: true,
+        // What the event stream showed up to the kill — the primary
+        // retry-evidence input for edit-capable runs.
+        editEvidence: analyzeCliEventStream(stdout),
+      });
     }, RUN_TIMEOUT_MS);
 
     const cancellationListener = token.onCancellationRequested(() => {
@@ -650,14 +861,51 @@ export class CliAgentRunner implements AgentRunner {
     request: AgentRunRequest,
     token: vscode.CancellationToken
   ): Promise<AgentRunResult> {
-    const result = await execCliAgent({
-      def: this.def,
-      mode: "text",
-      model: request.modelId,
-      prompt: request.prompt,
-      cwd: request.workspaceUri.fsPath,
-      token,
-    });
+    // Read-only (text) runs are side-effect free, so transient timeouts are
+    // retried freely: up to CLI_RETRY_MAX_ATTEMPTS with a short delay. Each
+    // attempt is audited to the task's run log (attempt, classification,
+    // evidence, delay), not just the debug console.
+    const retryAudit: RetryAuditEntry[] = [];
+    let result: CliExecResult | undefined;
+    for (let attempt = 1; attempt <= CLI_RETRY_MAX_ATTEMPTS; attempt++) {
+      result = await execCliAgent({
+        def: this.def,
+        mode: "text",
+        model: request.modelId,
+        prompt: request.prompt,
+        cwd: request.workspaceUri.fsPath,
+        token,
+      });
+      const retryable =
+        result.status === "failed" &&
+        result.transient === true &&
+        attempt < CLI_RETRY_MAX_ATTEMPTS &&
+        !token.isCancellationRequested;
+      if (!retryable) {
+        break;
+      }
+      retryAudit.push({
+        attempt,
+        classification: "transient (run timeout)",
+        capabilityFlag: undefined,
+        evidence: "read-only (text-mode) run — side-effect free by construction",
+        delayMs: CLI_RETRY_DELAY_MS,
+        retried: true,
+      });
+      await retryDelay(token);
+      if (token.isCancellationRequested) {
+        await persistRetryAuditLog(
+          request.taskFolderUri, this.id, request.stage, this.label, "text", retryAudit
+        );
+        return { runnerId: this.id, status: "cancelled" };
+      }
+    }
+    await persistRetryAuditLog(
+      request.taskFolderUri, this.id, request.stage, this.label, "text", retryAudit
+    );
+    if (!result) {
+      return { runnerId: this.id, status: "failed", errorMessage: "unknown error" };
+    }
 
     if (result.status === "cancelled") {
       return { runnerId: this.id, status: "cancelled" };
@@ -892,6 +1140,9 @@ export async function runImplementationWithCli(options: {
   token: vscode.CancellationToken;
   onProgress: (message: string) => void;
   requireFileChange?: boolean;
+  /** When provided, retry attempts/refusals are audited to this task's run log. */
+  taskFolderUri?: vscode.Uri;
+  stage?: AgentWorkflowStage;
 }): Promise<ImplementationRunResult> {
   const { def, model, prompt, workspaceUri, token, onProgress, requireFileChange } = options;
   const cwd = workspaceUri.fsPath;
@@ -899,7 +1150,7 @@ export async function runImplementationWithCli(options: {
   onProgress(`Using ${def.label}...`);
   const before = await gitStatusSnapshot(cwd);
 
-  const result = await execCliAgent({
+  let result = await execCliAgent({
     def,
     mode: "edit",
     model,
@@ -908,6 +1159,76 @@ export async function runImplementationWithCli(options: {
     token,
     onProgress,
   });
+
+  // Edit-capable runs may auto-retry a transient timeout ONLY on providers
+  // whose CLI protocol guarantees tool/edit boundary events are flushed
+  // before any side effect (per-provider capability flag, default off), and
+  // even then only with double evidence: the parsed event stream must be
+  // available and free of tool-use/file-edit events, AND the working-tree
+  // snapshot must be unchanged. On any other combination the timed-out run
+  // may already have made changes, so it is never auto-retried — the user
+  // must review and retry explicitly. Every decision (retry or refusal) is
+  // audited to the task's run log.
+  const retryAudit: RetryAuditEntry[] = [];
+  let attempt = 1;
+  while (
+    result.status === "failed" &&
+    result.transient === true &&
+    attempt < CLI_RETRY_MAX_ATTEMPTS &&
+    !token.isCancellationRequested
+  ) {
+    const capabilityFlag = def.guaranteesEditEventFlushBeforeSideEffects === true;
+    const snapshotNow = capabilityFlag && before ? await gitStatusSnapshot(cwd) : undefined;
+    const snapshotClean =
+      before !== undefined &&
+      snapshotNow !== undefined &&
+      changedPathsSince(before, snapshotNow).length === 0;
+    const decision = evaluateEditRetryEligibility({
+      providerLabel: def.label,
+      guaranteesEditEventFlushBeforeSideEffects: capabilityFlag,
+      evidence: result.editEvidence,
+      snapshotClean,
+    });
+    retryAudit.push({
+      attempt,
+      classification: "transient (run timeout)",
+      capabilityFlag,
+      evidence: decision.reason,
+      delayMs: CLI_RETRY_DELAY_MS,
+      retried: decision.retry,
+    });
+    if (!decision.retry) {
+      result = {
+        ...result,
+        transient: false,
+        errorMessage:
+          `${result.errorMessage ?? "The run timed out."} ` +
+          "This run may already have made changes; review your working tree before retrying. " +
+          `(${decision.reason})`,
+      };
+      break;
+    }
+    onProgress(
+      `${def.label} timed out with no observed changes; retrying (attempt ${attempt + 1}/${CLI_RETRY_MAX_ATTEMPTS})...`
+    );
+    await retryDelay(token);
+    if (token.isCancellationRequested) {
+      break;
+    }
+    attempt++;
+    result = await execCliAgent({
+      def,
+      mode: "edit",
+      model,
+      prompt,
+      cwd,
+      token,
+      onProgress,
+    });
+  }
+  await persistRetryAuditLog(
+    options.taskFolderUri, def.id, options.stage, def.label, "edit", retryAudit
+  );
 
   // Git unavailable or not a repository — we genuinely can't tell what
   // changed, which is different from "nothing changed". Callers must fall

@@ -16,6 +16,14 @@ interface ChatTarget {
   canonicalId: string;
   taskFolderPath: string;
   stage: TaskStage;
+  /** User-facing task name; falls back to the folder's date/task-ID code. */
+  taskName?: string;
+  /**
+   * "global" marks the task-section global assistant, which has its own
+   * fully separate history (stored in a dedicated folder, not any task's)
+   * and is labeled as a global assistant rather than a task/stage chat.
+   */
+  kind?: "stage" | "global";
 }
 
 /** The identity fields an append/transcript operation is anchored to. */
@@ -88,10 +96,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       const text = message.text.trim();
       if (!text) return;
       await this.append("user", text, target.stage, target);
-      await vscode.commands.executeCommand("vs-code-ai-helper.chatWithStage", {
-        ...target,
-        message: text,
-      });
+      if (target.kind === "global") {
+        // The global assistant has its own send path — it is not a task or
+        // stage chat, and chatWithStage cannot resolve its synthetic folder.
+        await vscode.commands.executeCommand("vs-code-ai-helper.globalAssistantSend", {
+          message: text,
+        });
+      } else {
+        await vscode.commands.executeCommand("vs-code-ai-helper.chatWithStage", {
+          ...target,
+          message: text,
+        });
+      }
     });
     void this.render();
   }
@@ -147,11 +163,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
 
   /** Recent conversation is supplied to the runner so a response can safely
    * answer an AI's earlier clarification question rather than becoming an
-   * unrelated one-shot prompt. */
-  async transcript(taskFolderPath: string, canonicalId: string): Promise<ChatMessage[]> {
-    return this.runQueued(taskFolderPath, () =>
+   * unrelated one-shot prompt. When `stage` is given, only that stage's
+   * messages are returned — every stage has a fully separate conversation. */
+  async transcript(taskFolderPath: string, canonicalId: string, stage?: TaskStage): Promise<ChatMessage[]> {
+    const all = await this.runQueued(taskFolderPath, () =>
       loadTranscriptWithMigration(taskFolderPath, canonicalId, this.state)
     );
+    return stage === undefined ? all : all.filter((entry) => entry.stage === stage);
   }
 
   private async persistAppend(identity: ChatIdentity, message: ChatMessage): Promise<void> {
@@ -194,7 +212,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     let entries: ChatMessage[] = [];
     if (target) {
       try {
-        entries = await this.transcript(target.taskFolderPath, target.canonicalId);
+        // Stage chats are fully isolated: a stage's view never shows another
+        // stage's conversation. The global assistant's history lives in its
+        // own dedicated folder, so it is separate by construction.
+        entries = await this.transcript(
+          target.taskFolderPath,
+          target.canonicalId,
+          target.kind === "global" ? undefined : target.stage
+        );
       } catch (error) {
         // A transcript that fails to read (e.g. corrupt and unquarantinable —
         // see chatHistoryStore's readChatHistory) must not crash render(), or
@@ -210,11 +235,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     }
     if (!sameIdentity(target, this.target)) return;
     const busy = target ? taskOperations.getTaskOperations(target.canonicalId).some(op => !op.exclusive) : false;
-    // Full, user-facing stage name rather than the raw stage id (e.g. "impl-high-review")
-    // so the chat header reads as prose instead of an abbreviated identifier.
-    const label = target
-      ? `Chatting with the AI in charge of the ${STAGE_DISPLAY_NAMES[target.stage]} stage (${target.stage})`
-      : undefined;
+    // Always show the associated task: the task name when available,
+    // otherwise the folder's date/task-ID code — with no bracketed raw
+    // stage id. The global assistant is labeled as a global assistant.
+    let label: string | undefined;
+    if (target?.kind === "global") {
+      label = "Global Assistant — cross-task actions (Uses the model currently set for Task Description)";
+    } else if (target) {
+      const taskLabel = target.taskName ?? target.taskFolderPath.replace(/\\/g, "/").split("/").pop() ?? "task";
+      label = `${taskLabel} — ${STAGE_DISPLAY_NAMES[target.stage]} stage chat`;
+    }
     await this.view?.webview.postMessage({ type: "state", target: this.target, label, entries, busy });
   }
 

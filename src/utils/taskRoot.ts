@@ -58,8 +58,34 @@ export function isTaskRootExplicitlyConfigured(): boolean {
 }
 
 /**
- * Get the configured task root. Returns the explicit value if configured,
- * otherwise returns the default `.ensemble`.
+ * The legacy resource root that stays *active* (not just discoverable) while
+ * the workspace remains unmigrated: set by metaResourcesMigration.ts when the
+ * user declines the move to `.ensemble` (or the move aborts), cleared once
+ * the migration succeeds. While set, task creation and every direct-root
+ * consumer keep using the legacy location, so declining never splits the
+ * workspace between two roots. Session-scoped; re-established on activation
+ * from the persisted migration state.
+ */
+let activeLegacyTaskRoot: string | undefined;
+
+export function setActiveLegacyTaskRoot(root: string | undefined): void {
+  const trimmed = root?.trim();
+  activeLegacyTaskRoot = trimmed && trimmed.length > 0 ? trimmed : undefined;
+}
+
+export function getActiveLegacyTaskRoot(): string | undefined {
+  return activeLegacyTaskRoot;
+}
+
+/**
+ * The active task-root path. Fixed at `.ensemble` for every new workspace;
+ * a leftover legacy `metaResourcesPath` value is honored read-only, and a
+ * declined/aborted migration keeps its legacy root active (see
+ * setActiveLegacyTaskRoot above), so an unmigrated workspace keeps using
+ * its tasks' existing location until the one-time migration to `.ensemble`
+ * runs (metaResourcesMigration.ts). The setting is no longer contributed,
+ * surfaced in any UI, or written anywhere — this compatibility read is the
+ * only remaining reference.
  */
 export function getConfiguredTaskRoot(): string {
   const config = vscode.workspace.getConfiguration(CONFIG_SECTION);
@@ -67,6 +93,10 @@ export function getConfiguredTaskRoot(): string {
 
   if (value && value.trim().length > 0) {
     return value.trim();
+  }
+
+  if (activeLegacyTaskRoot) {
+    return activeLegacyTaskRoot;
   }
 
   return DEFAULT_TASK_ROOT;

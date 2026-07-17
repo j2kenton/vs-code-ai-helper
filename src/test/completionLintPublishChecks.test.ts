@@ -80,7 +80,7 @@ void describe("collectCompletionLint — publish pre-check schema (lint/test scr
     );
   });
 
-  void it("skips both lint and test when neither is configured, and does not block completion", async () => {
+  void it("reports inconclusive (never passed) when neither lint nor test is configured", async () => {
     const dir = makeWorkspace("missing-both-scripts", {
       name: "x",
       scripts: {
@@ -91,7 +91,42 @@ void describe("collectCompletionLint — publish pre-check schema (lint/test scr
     const result = await collectCompletionLint(dir, []);
 
     assert.deepEqual(result.missingScripts.sort(), ["lint", "test"]);
-    assert.equal(result.passed, true, "missing conventional scripts must never hard-block — inform, don't block");
+    assert.equal(
+      result.passed,
+      false,
+      "an undetected toolchain is never a pass — required checks that could not run leave the result inconclusive"
+    );
+    assert.equal(result.issueCount, 0, "inconclusive is not a failure: nothing that ran failed");
+    assert.match(result.summary, /inconclusive/i);
+  });
+
+  void it("runs explicitly configured verification commands with precedence over script detection", async () => {
+    const dir = makeWorkspace("explicit-commands", {
+      name: "x",
+      // A lint script that would fail if the conventional path ran it.
+      scripts: { lint: "node -e \"process.exit(1)\"" },
+    });
+
+    const result = await collectCompletionLint(dir, [], {
+      explicitCommands: ["node -e \"process.exit(0)\""],
+    });
+
+    assert.deepEqual(result.missingScripts, [], "explicit commands bypass missing-script reporting");
+    assert.deepEqual(result.failedChecks, [], "only the explicit command runs, and it passed");
+    assert.equal(result.passed, true);
+  });
+
+  void it("reports a failing explicit verification command as a failed check", async () => {
+    const dir = makeWorkspace("explicit-commands-fail", { name: "x" });
+
+    const result = await collectCompletionLint(dir, [], {
+      explicitCommands: ["node -e \"console.error('boom'); process.exit(3)\""],
+    });
+
+    assert.equal(result.passed, false);
+    assert.equal(result.failedChecks.length, 1);
+    assert.equal(result.failedChecks[0]!.exitCode, 3);
+    assert.match(result.failedChecks[0]!.output, /boom/);
   });
 
   void it("runs the test script when configured and reports a real failure", async () => {

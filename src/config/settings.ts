@@ -2,17 +2,43 @@ import * as vscode from "vscode";
 import { AI_MODEL_STAGES, TaskStage } from "../types/taskProgress";
 import { FallbackStrategy, ModelSettings } from "../utils/modelFallback";
 import { normalizeQualifiedModelId, parseModelSelection } from "../runners/providers";
-import { DEFAULT_TASK_ROOT } from "../utils/taskRoot";
 
 const CONFIG_SECTION = "vs-code-ai-helper";
 const META_RESOURCES_PATH_KEY = "metaResourcesPath";
 const AI_MODEL_DEFAULTS_KEY = "aiModelDefaults";
 const META_FILES_HIDDEN_KEY = "metaFilesHidden";
 const ENABLED_PROVIDERS_KEY = "enabledProviders";
+const PUBLISH_VERIFICATION_COMMANDS_KEY = "publishVerificationCommands";
 const FAST_FORWARD_MAX_ITERATIONS_KEY = "fastForwardMaxIterations";
 const AUTO_ADVANCE_ENABLED_KEY = "autoAdvanceEnabled";
 const AUTO_ADVANCE_SCORE_KEY = "autoAdvanceScoreThreshold";
 const COMPLETE_AND_MOVE_ON_TRIGGERS_AI_KEY = "completeAndMoveOnTriggersAI";
+const UNSAVED_SETTINGS_WARNING_KEY = "warnings.unsavedSettings";
+const LARGE_TOKEN_REQUEST_WARNING_KEY = "warnings.largeTokenRequest";
+
+/** Whether the unsaved-settings-change warning is shown (true = warn). */
+export function isUnsavedSettingsWarningEnabled(): boolean {
+  return vscode.workspace.getConfiguration(CONFIG_SECTION)
+    .get<boolean>(UNSAVED_SETTINGS_WARNING_KEY, true);
+}
+
+/** Persist the "Don't show again" opt-out for the unsaved-settings warning. */
+export async function setUnsavedSettingsWarningEnabled(enabled: boolean): Promise<void> {
+  await vscode.workspace.getConfiguration(CONFIG_SECTION)
+    .update(UNSAVED_SETTINGS_WARNING_KEY, enabled, vscode.ConfigurationTarget.Global);
+}
+
+/** Whether the large-AI-token-request warning is shown (true = warn). */
+export function isLargeTokenRequestWarningEnabled(): boolean {
+  return vscode.workspace.getConfiguration(CONFIG_SECTION)
+    .get<boolean>(LARGE_TOKEN_REQUEST_WARNING_KEY, true);
+}
+
+/** Persist the "Proceed and don't ask again" opt-out for the large-token warning. */
+export async function setLargeTokenRequestWarningEnabled(enabled: boolean): Promise<void> {
+  await vscode.workspace.getConfiguration(CONFIG_SECTION)
+    .update(LARGE_TOKEN_REQUEST_WARNING_KEY, enabled, vscode.ConfigurationTarget.Global);
+}
 
 /** Whether completing a stage automatically starts the destination stage's AI action. */
 export function completeAndMoveOnTriggersAI(): boolean {
@@ -26,13 +52,20 @@ const AUTO_REVIEW_AFTER_IMPLEMENTATION_KEY = "autoReviewAfterImplementation";
 const ALLOW_DIRTY_WORKTREE_CHANGES_KEY = "allowDirtyWorktreeChanges";
 const DESKTOP_NOTIFICATIONS_KEY = "desktopNotifications";
 
-// metaResourcesPath and metaFilesHidden describe *this* project (a path
-// relative to it, and a mirror of its own .gitignore), so they stay
-// per-workspace. Every other setting is a personal preference the user
-// expects to carry into a brand-new workspace, so it's written to user
-// (Global) settings instead — see migrateSettingsScope() below for the
-// one-time cutover of values already sitting in a workspace's settings.json.
-const WORKSPACE_SCOPED_KEYS = new Set<string>([META_RESOURCES_PATH_KEY, META_FILES_HIDDEN_KEY]);
+// The legacy metaResourcesPath/metaFilesHidden keys (no longer contributed
+// or written — resource storage and Git-ignore handling are automatic now)
+// described *this* project, so migrateSettingsScope must never lift a
+// leftover value into user settings. publishVerificationCommands likewise
+// describes this project's toolchain. Every other setting is a personal
+// preference the user expects to carry into a brand-new workspace, so it's
+// written to user (Global) settings instead — see migrateSettingsScope()
+// below for the one-time cutover of values already sitting in a workspace's
+// settings.json.
+const WORKSPACE_SCOPED_KEYS = new Set<string>([
+  META_RESOURCES_PATH_KEY,
+  META_FILES_HIDDEN_KEY,
+  PUBLISH_VERIFICATION_COMMANDS_KEY,
+]);
 
 export function targetFor(key: string): vscode.ConfigurationTarget {
   return WORKSPACE_SCOPED_KEYS.has(key)
@@ -101,12 +134,39 @@ export async function migrateSettingsScope(): Promise<void> {
   }
 }
 
-export function areMetaFilesHidden(): boolean {
-  return vscode.workspace.getConfiguration(CONFIG_SECTION).get<boolean>(META_FILES_HIDDEN_KEY, false);
+/**
+ * Explicitly configured Publish verification command lines for this
+ * project. When set, these take precedence over the conventional
+ * package.json lint/test script detection in completionLint.ts.
+ */
+export function getPublishVerificationCommands(): string[] {
+  const raw = vscode.workspace.getConfiguration(CONFIG_SECTION)
+    .get<unknown>(PUBLISH_VERIFICATION_COMMANDS_KEY, []);
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  return raw
+    .filter((value): value is string => typeof value === "string")
+    .map((value) => value.trim())
+    .filter((value) => value.length > 0);
 }
 
-export async function setMetaFilesHidden(hidden: boolean): Promise<void> {
-  await vscode.workspace.getConfiguration(CONFIG_SECTION).update(META_FILES_HIDDEN_KEY, hidden, targetFor(META_FILES_HIDDEN_KEY));
+/**
+ * Whether the user (or the activation migration) has ever recorded an
+ * explicit provider selection. Used by the runner-entry guard: when a
+ * selection exists, models of providers missing from it are refused at run
+ * time; when no selection was ever made (fresh pre-migration state), the
+ * guard stays inactive so nothing is blocked before migration runs.
+ */
+export function isProviderSelectionConfigured(): boolean {
+  const inspected = vscode.workspace.getConfiguration(CONFIG_SECTION)
+    .inspect<Record<string, boolean>>(ENABLED_PROVIDERS_KEY);
+  return !!(
+    inspected &&
+    (inspected.globalValue !== undefined ||
+      inspected.workspaceValue !== undefined ||
+      inspected.workspaceFolderValue !== undefined)
+  );
 }
 
 /** Providers are opt-in.  A migration on activation preserves providers that
@@ -182,28 +242,6 @@ export function allowsDirtyWorktreeChanges(): boolean {
 /** Whether native OS notifications fire for things that need attention (questions, warnings, errors). Off by default. */
 export function isDesktopNotificationsEnabled(): boolean {
   return vscode.workspace.getConfiguration(CONFIG_SECTION).get<boolean>(DESKTOP_NOTIFICATIONS_KEY, false);
-}
-
-/**
- * Get the configured meta resources path for the current workspace
- */
-export function getMetaResourcesPath(): string {
-  const config = vscode.workspace.getConfiguration(CONFIG_SECTION);
-  const value = config.get<string>(META_RESOURCES_PATH_KEY, "");
-  const trimmed = typeof value === "string" ? value.trim() : "";
-  return trimmed.length > 0 ? trimmed : DEFAULT_TASK_ROOT;
-}
-
-/**
- * Set the meta resources path in workspace settings
- */
-export async function setMetaResourcesPath(path: string): Promise<void> {
-  const config = vscode.workspace.getConfiguration(CONFIG_SECTION);
-  await config.update(
-    META_RESOURCES_PATH_KEY,
-    path,
-    targetFor(META_RESOURCES_PATH_KEY)
-  );
 }
 
 /**

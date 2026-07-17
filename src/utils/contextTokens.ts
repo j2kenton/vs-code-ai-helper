@@ -7,6 +7,7 @@ export interface TaskContextInput {
   lintPassed?: boolean;
   isScheduled?: boolean;
   isMetaManaged?: boolean;
+  isPinned?: boolean;
 }
 
 export interface StageContextInput {
@@ -42,7 +43,9 @@ export function buildTaskContextValue(input: TaskContextInput): string {
   // Publish stage (fixing lint / committing / pushing) can still be
   // paused/resumed at the task level instead of losing that control the
   // moment it reaches the final stage.
-  if (input.status === "paused") {
+  if (input.status === "archived") {
+    tokens.push("task-archived");
+  } else if (input.status === "paused") {
     tokens.push("task-paused");
   } else if (input.status === "completed") {
     tokens.push("task-completed");
@@ -66,6 +69,12 @@ export function buildTaskContextValue(input: TaskContextInput): string {
 
   if (input.isMetaManaged) {
     tokens.push("meta-managed");
+  }
+
+  // Pinned marker last so menu `when` clauses can match /-pinned$/ without
+  // colliding with the other suffix tokens.
+  if (input.isPinned) {
+    tokens.push("pinned");
   }
 
   return tokens.join("-");

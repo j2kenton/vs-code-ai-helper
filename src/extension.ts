@@ -1,7 +1,4 @@
 import * as vscode from "vscode";
-import {
-  registerSelectMetaFolderCommand,
-} from "./commands/selectMetaFolder";
 import { recoverTaskCreations, registerStartNewTaskCommand } from "./commands/startNewTask";
 import { registerResumeTaskCommand } from "./commands/resumeTask";
 import { registerGeneratePlanWithAICommand } from "./commands/generatePlanWithAI";
@@ -14,16 +11,23 @@ import { registerOpenAndStartNewTaskCommand } from "./commands/openAndStartNewTa
 import { registerReviewCurrentTaskCommand } from "./commands/reviewCurrentTask";
 import { registerFastForwardCurrentTaskReviewCommand } from "./commands/fastForwardCurrentTaskReview";
 import { registerPauseTaskCommand } from "./commands/pauseTask";
+import { registerArchiveTaskCommands } from "./commands/archiveTask";
+import { registerPinTaskCommands } from "./commands/pinTask";
 import { registerApplyHighLevelReviewChangesCommand } from "./commands/applyHighLevelReviewChanges";
 import { registerApplyLowLevelReviewChangesCommand } from "./commands/applyLowLevelReviewChanges";
 import { registerCommitAndPushTaskCommand } from "./commands/commitAndPushTask";
 import {
-  refreshMetaResourcesGitIgnoreContext,
-  registerToggleMetaResourcesGitIgnoreCommand,
+  ensureAutomaticMetaGitIgnore,
 } from "./commands/toggleMetaResourcesGitIgnore";
+import {
+  maybeOfferMetaResourcesMigration,
+  registerMetaResourcesMigrationCommand,
+} from "./utils/metaResourcesMigration";
+import { registerChoosePublishScopeCommand } from "./commands/choosePublishScope";
 import { registerChatWithStageCommand } from "./commands/chatWithStage";
 import { registerOpenGeneralAssistantCommand } from "./commands/openGeneralAssistant";
 import { registerRunLintingFixesCommand } from "./commands/runLintingFixes";
+import { registerRunPublishChecksCommand } from "./commands/runPublishChecks";
 import { registerScheduleTaskResumeCommand } from "./commands/scheduleTaskResume";
 import { registerMarkTaskDoneCommand } from "./commands/markTaskDone";
 import { registerViewStageChangesCommands } from "./commands/viewStageChanges";
@@ -161,15 +165,21 @@ export function activate(context: vscode.ExtensionContext): void {
 
   // Register commands — pass the shared inventory, currentTaskStore, and
   // context to every command that needs them.
-  registerSelectMetaFolderCommand(context);
   registerStartNewTaskCommand(context, inventory, currentTaskStore);
   registerResumeTaskCommand(context, inventory, currentTaskStore);
   // AI commands receive the full context so they can call ensureAiConsent
   registerGeneratePlanWithAICommand(context, inventory);
   registerReviewActionCommands(context);
   registerSetTaskStageCommand(context, inventory, currentTaskStore);
+  // The extension-level Settings button (beside the overflow menu) opens
+  // native VS Code Settings scoped to this extension; the AI Models webview
+  // has its own focus command used by the missing-model guard.
   context.subscriptions.push(vscode.commands.registerCommand(
     "vs-code-ai-helper.openSettings",
+    () => vscode.commands.executeCommand("workbench.action.openSettings", "@ext:j2kenton.vs-code-ai-helper")
+  ));
+  context.subscriptions.push(vscode.commands.registerCommand(
+    "vs-code-ai-helper.openAiModels",
     () => vscode.commands.executeCommand("vs-code-ai-helper.settingsView.focus")
   ));
   registerViewArtifactCommands(context);
@@ -179,12 +189,16 @@ export function activate(context: vscode.ExtensionContext): void {
   registerReviewCurrentTaskCommand(context, inventory, currentTaskStore);
   registerFastForwardCurrentTaskReviewCommand(context, inventory, currentTaskStore);
   registerPauseTaskCommand(context, inventory, currentTaskStore);
+  registerArchiveTaskCommands(context, inventory, currentTaskStore);
+  registerPinTaskCommands(context, inventory);
   registerApplyHighLevelReviewChangesCommand(context, inventory);
   registerApplyLowLevelReviewChangesCommand(context, inventory);
   registerCommitAndPushTaskCommand(context, inventory, currentTaskStore);
-  registerToggleMetaResourcesGitIgnoreCommand(context, inventory, currentTaskStore);
+  registerMetaResourcesMigrationCommand(context, inventory, currentTaskStore);
+  registerChoosePublishScopeCommand(context, inventory);
   registerChatWithStageCommand(context, inventory, chatViewProvider);
   registerRunLintingFixesCommand(context, inventory);
+  registerRunPublishChecksCommand(context, inventory);
   const taskActionScheduler = registerScheduleTaskResumeCommand(context, inventory);
   registerMarkTaskDoneCommand(context, inventory, currentTaskStore);
   registerViewStageChangesCommands(context, inventory);
@@ -241,6 +255,10 @@ export function activate(context: vscode.ExtensionContext): void {
     "vs-code-ai-helper.clearNotifications",
     () => statusTreeProvider.clear()
   ));
+  context.subscriptions.push(vscode.commands.registerCommand(
+    "vs-code-ai-helper.filterNotifications",
+    () => statusTreeProvider.chooseLevelFilter()
+  ));
   // Inline cancel button on cancellable running-operation rows in the
   // Notifications view. Cancellation is a request: it fires the operation's
   // token (cascading to running children) and the row shows "cancelling…"
@@ -256,7 +274,7 @@ export function activate(context: vscode.ExtensionContext): void {
       }
     }
   ));
-  registerOpenGeneralAssistantCommand(context, inventory, currentTaskStore);
+  registerOpenGeneralAssistantCommand(context, inventory, currentTaskStore, chatViewProvider);
 
   const statusTreeView = vscode.window.createTreeView(STATUS_VIEW_ID, {
     treeDataProvider: statusTreeProvider,
@@ -279,7 +297,6 @@ export function activate(context: vscode.ExtensionContext): void {
       currentTaskStage
     );
     taskStatusBar.update(tasks, currentTaskCanonicalId);
-    void refreshMetaResourcesGitIgnoreContext(inventory, currentTaskStore);
   });
 
   const refreshCommand = vscode.commands.registerCommand(
@@ -381,7 +398,6 @@ export function activate(context: vscode.ExtensionContext): void {
       "vs-code-ai-helper.currentTaskStage",
       currentTaskStage
     );
-    void refreshMetaResourcesGitIgnoreContext(inventory, currentTaskStore);
     // Reveal the newly-current task in the tree. We wait for the provider to
     // finish its next render cycle (triggered by its own onDidChange sub above)
     // before calling reveal, so the node is guaranteed to exist in the tree.
@@ -428,6 +444,15 @@ export function activate(context: vscode.ExtensionContext): void {
   void inventory.refresh().then(async () => {
     await taskActionScheduler.armAll();
     taskTreeProvider.refresh();
+    // Git-ignore handling for Ensemble resources is automatic (no settings
+    // UI); a legacy/custom resource folder additionally gets a one-time
+    // offer to move to the fixed `.ensemble` location.
+    if (inventory.getTasks().length > 0) {
+      void ensureAutomaticMetaGitIgnore(context)
+        .catch(err => console.error("Automatic meta .gitignore maintenance failed", err));
+    }
+    void maybeOfferMetaResourcesMigration(context, inventory, currentTaskStore)
+      .catch(err => console.error("Meta resources migration offer failed", err));
   });
   void warmCliModelCache();
 

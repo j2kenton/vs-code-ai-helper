@@ -119,6 +119,38 @@ export interface CliProviderDefinition {
    * answer, and the answer must instead be read from lastMessageFile.
    */
   usesLastMessageFile: boolean;
+  /**
+   * Retry-evidence capability flag: true ONLY when this provider's CLI
+   * protocol verifiably guarantees that tool/edit boundary events are
+   * emitted and flushed before any side effect occurs. Edit-capable runs
+   * are auto-retried after a transient timeout only on providers with this
+   * guarantee (and even then only with an unchanged working-tree snapshot
+   * as a secondary guard). Defaults to absent (= not guaranteed): an absent
+   * or clean event stream from a process that timed out proves nothing —
+   * events can be buffered, truncated, or lost — so edit runs on such
+   * providers are never auto-retried. Set this to true for a provider only
+   * after verifying the guarantee against its protocol documentation and
+   * observed behavior for the currently supported CLI version.
+   */
+  guaranteesEditEventFlushBeforeSideEffects?: boolean;
+  /**
+   * Terminal command line(s) for the "Sign in / Switch account" action.
+   * Run in a visible IDE terminal so the provider's interactive login flow
+   * works. Validated against the currently supported CLI version before
+   * being wired to a button (loginHint text is evidence, not a contract).
+   * Last validated 2026-07-17 against installed CLIs: claude 2.1.209
+   * (binary exposes `claude auth status` and in-session `/login`), codex
+   * 0.144.4 (binary exposes `codex login` / `codex login status`), gemini
+   * 0.50.0 (interactive run offers the LOGIN_WITH_GOOGLE auth flow), agy
+   * (interactive run performs OAuth; no dedicated login subcommand), and
+   * kiro-cli kas 2.12.0 (its own auth-error recovery action is
+   * `kiro-cli login`). Re-validate before changing any signInCommand.
+   */
+  signInCommand: string;
+  /** Label for the sign-in action; "Sign in" when the CLI has no distinct switch-account command. */
+  signInLabel: string;
+  /** Extra guidance shown alongside the sign-in action (e.g. Kiro's headless API-key requirement). */
+  signInGuidance?: string;
 }
 
 const CODEX_REASONING_EFFORTS = new Set([
@@ -257,6 +289,10 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
       "Run `claude` in a terminal and complete the sign-in with your Anthropic (Claude) account, then try again.",
     authErrorMarkers: ["log in", "login", "authenticate", "api key", "oauth"],
     authenticationCheckArgs: ["auth", "status"],
+    signInCommand: "claude",
+    signInLabel: "Sign in / Switch account",
+    signInGuidance:
+      "Complete the Anthropic sign-in in the terminal; run /login inside the CLI to switch accounts.",
     // Keep the provider-level fallback to CLI default only. Temporary picker
     // options are seeded separately until live loading is fixed.
     models: [
@@ -296,6 +332,8 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
       "Run `codex login` in a terminal and sign in with your ChatGPT account, then try again.",
     authErrorMarkers: ["not logged in", "login", "authenticate", "api key"],
     authenticationCheckArgs: ["login", "status"],
+    signInCommand: "codex login",
+    signInLabel: "Sign in",
     // Keep the provider-level fallback to CLI default only. The picker can
     // seed temporary model options elsewhere without changing runner
     // semantics here, and any unsupported custom ID can still be set
@@ -340,6 +378,9 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     loginHint:
       "Run `gemini` in a terminal and complete the Google sign-in, then try again.",
     authErrorMarkers: ["login", "authenticate", "credentials", "api key"],
+    signInCommand: "gemini",
+    signInLabel: "Sign in",
+    signInGuidance: "Complete the Google sign-in in the terminal.",
     models: [
       { model: undefined, name: "Gemini (CLI default)" },
       { model: "gemini-2.5-pro", name: "Gemini 2.5 Pro" },
@@ -369,6 +410,9 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     loginHint:
       "Run `agy` (or `antigravity`) in a terminal and complete the Google sign-in, then try again.",
     authErrorMarkers: ["login", "authenticate", "credentials", "api key"],
+    signInCommand: "agy",
+    signInLabel: "Sign in",
+    signInGuidance: "Complete the Google sign-in in the terminal.",
     // Keep the provider-level fallback to CLI default only. The picker seeds
     // temporary cached entries and still prefers live `agy models` results
     // when available.
@@ -439,6 +483,10 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
       "api key",
       "unauthorized",
     ],
+    signInCommand: "kiro-cli login",
+    signInLabel: "Sign in",
+    signInGuidance:
+      "Headless mode additionally requires KIRO_API_KEY — `kiro-cli login` alone does not satisfy `chat --no-interactive` auth.",
     promptTransport: "stdin",
     useShell: false,
     // Use stdin transport so large context packs are not constrained by

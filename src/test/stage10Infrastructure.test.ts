@@ -85,7 +85,7 @@ void describe("Stage 10 test infrastructure", () => {
   });
 
   void it("covers review readiness, quota classification, and status routing contracts", () => {
-    assert.equal(parseReadiness("Readiness: 9/10").icon, "thumbsup");
+    assert.equal(parseReadiness("Readiness: 9/10").icon, "check");
     assert.equal(parseReadiness("Readiness: 3/10").colorKey, "charts.red");
     assert.equal(isQuotaError("provider rate limit reached"), true);
     assert.equal(isQuotaError("context length exceeded"), false);

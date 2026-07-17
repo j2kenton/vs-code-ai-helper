@@ -3,6 +3,7 @@ import { TaskInventory } from "../state/taskInventory";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { STAGE_ARTIFACT_FILENAMES } from "../types/taskProgress";
+import { ensureStageModelConfigured } from "../utils/modelSelection";
 
 type ApplyArg = { canonicalId?: string; taskFolderPath?: string };
 
@@ -13,7 +14,8 @@ type ApplyArg = { canonicalId?: string; taskFolderPath?: string };
  * - Task Description  -> draftTaskWithAI
  * - Plan               -> generatePlanWithAI
  * - Implementation     -> runImplementationWithAI
- * - Publish            -> runLintingFixes
+ * - Publish            -> runPublishChecks (first Publish action: run the
+ *   checks and produce the report; fixing is the separate second action)
  * - High-Level Review -> applyHighLevelReviewChanges (if artifact exists)
  * - Low-Level Review  -> applyLowLevelReviewChanges (if artifact exists)
  */
@@ -44,6 +46,19 @@ export async function applyCurrentStageAction(
   }
 
   const stage = resolvedTask.progress.currentStage;
+
+  // Run-time model guard: a stage without a configured model (or whose
+  // model's provider is disabled) shows an alert and opens AI Models
+  // instead of failing silently mid-run.
+  if (
+    !(await ensureStageModelConfigured(
+      vscode.Uri.file(resolvedTask.taskFolderPath),
+      stage
+    ))
+  ) {
+    return;
+  }
+
   const execute = async (command: string): Promise<void> => {
     await vscode.commands.executeCommand(command, {
       canonicalId: resolvedTask.canonicalId,
@@ -67,7 +82,7 @@ export async function applyCurrentStageAction(
   }
 
   if (stage === "publish") {
-    await execute("vs-code-ai-helper.runLintingFixes");
+    await execute("vs-code-ai-helper.runPublishChecks");
     return;
   }
 

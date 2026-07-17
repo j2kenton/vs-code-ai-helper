@@ -134,13 +134,13 @@ void describe("review scoring rubric", () => {
         assert.strictEqual(result.score, score);
         assert.strictEqual(result.label, `${score}/10`);
         if (score >= 8) {
-          assert.strictEqual(result.icon, "thumbsup");
+          assert.strictEqual(result.icon, "check");
           assert.strictEqual(result.colorKey, "charts.green");
         } else if (score >= 5) {
-          assert.strictEqual(result.icon, "question");
+          assert.strictEqual(result.icon, "arrow-right");
           assert.strictEqual(result.colorKey, "charts.yellow");
         } else {
-          assert.strictEqual(result.icon, "thumbsdown");
+          assert.strictEqual(result.icon, "arrow-down");
           assert.strictEqual(result.colorKey, "charts.red");
         }
       }

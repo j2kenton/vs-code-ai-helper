@@ -1,11 +1,7 @@
 import * as vscode from "vscode";
 import * as path from "path";
 import * as cp from "child_process";
-import { TaskInventory } from "../state/taskInventory";
-import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { getConfiguredTaskRoot } from "../utils/taskRoot";
-import { NotificationRouter } from "../utils/notificationRouter";
-import { setMetaFilesHidden } from "../config/settings";
 import { CHAT_HISTORY_FILENAME, CHAT_HISTORY_CORRUPT_FILENAME } from "../utils/chatHistoryConstants";
 
 const MANAGED_BEGIN = "# BEGIN Ensemble managed meta resources";
@@ -15,9 +11,6 @@ const LEGACY_COMMENT = "# Ensemble meta resources";
 const LEGACY_DEFAULT_TASK_ROOT = ".helper/plans";
 const LEGACY_TASK_ROOT = "plans";
 const ARTIFACTS_ROOT = "artifacts/helper";
-
-const META_ELIGIBLE_CONTEXT = "vs-code-ai-helper.metaGitIgnoreEligible";
-const META_HIDDEN_CONTEXT = "vs-code-ai-helper.currentTaskMetaHidden";
 
 type Eol = "\n" | "\r\n";
 
@@ -49,8 +42,6 @@ interface ApplyManagedMetaGitIgnoreOptions {
    */
   persistentPatterns?: readonly string[];
 }
-
-let metaVisibilityContextVersion = 0;
 
 function detectEol(content: string): Eol {
   return content.includes("\r\n") ? "\r\n" : "\n";
@@ -426,29 +417,20 @@ async function resolveGitRepoRoot(cwd: string): Promise<string | undefined> {
 }
 
 async function resolveTarget(
-  _inventory: TaskInventory,
-  _currentTaskStore: CurrentTaskStore,
-  showMessages: boolean
+  workspace: vscode.WorkspaceFolder | undefined
 ): Promise<CurrentMetaGitIgnoreTarget | undefined> {
-  // Meta visibility is a repository setting, not a task setting.  Using the
-  // workspace avoids the former "select current task" prompt entirely.
-  const workspace = vscode.workspace.workspaceFolders?.[0];
+  // Meta visibility is a repository property, not a task property, so the
+  // target is the git repository of the workspace folder that owns the
+  // `.ensemble` resources being hidden. In a multi-root workspace each
+  // folder may be its own repository, so callers that know which folder a
+  // task was created in must pass it; only folder-agnostic callers (startup
+  // maintenance) fall back to the first folder.
   if (!workspace) {
-    if (showMessages) {
-      void vscode.window.showWarningMessage(
-        "Open a workspace folder before changing meta-file git visibility."
-      );
-    }
     return undefined;
   }
 
   const repoRoot = await resolveGitRepoRoot(workspace.uri.fsPath);
   if (!repoRoot) {
-    if (showMessages) {
-      void vscode.window.showWarningMessage(
-        "Could not find a git repository for the current workspace."
-      );
-    }
     return undefined;
   }
 
@@ -479,130 +461,21 @@ async function resolveTarget(
   };
 }
 
-async function setMetaVisibilityContexts(
-  eligible: boolean,
-  hidden: boolean,
-  contextVersion: number
-): Promise<void> {
-  if (contextVersion !== metaVisibilityContextVersion) {
-    return;
-  }
-
-  await vscode.commands.executeCommand(
-    "setContext",
-    META_ELIGIBLE_CONTEXT,
-    eligible
-  );
-
-  if (contextVersion !== metaVisibilityContextVersion) {
-    return;
-  }
-
-  await vscode.commands.executeCommand(
-    "setContext",
-    META_HIDDEN_CONTEXT,
-    hidden
-  );
-}
-
-export async function refreshMetaResourcesGitIgnoreContext(
-  inventory: TaskInventory,
-  currentTaskStore: CurrentTaskStore
-): Promise<void> {
-  const contextVersion = ++metaVisibilityContextVersion;
-  const target = await resolveTarget(inventory, currentTaskStore, false);
-  if (!target) {
-    await setMetaVisibilityContexts(false, false, contextVersion);
-    return;
-  }
-
-  const content = await readTextIfExists(target.gitignoreUri);
-  if (contextVersion !== metaVisibilityContextVersion) {
-    return;
-  }
-
-  await setMetaVisibilityContexts(
-    true,
-    isManagedMetaGitIgnoreHidden(content, target.patterns, {
-      legacyRootPatterns: target.legacyRootPatterns,
-    }),
-    contextVersion
-  );
-}
-
-/** Line-level diff between two `.gitignore` contents, used to render an exact
- * confirmation preview. This only needs to be correct for the managed-block
- * add/remove edits `applyManagedMetaGitIgnoreBlock` produces, not arbitrary
- * text — those never reorder a caller's own unrelated lines. */
-export function diffGitignoreLines(
-  current: string,
-  next: string
-): { added: string[]; removed: string[] } {
-  const currentLines = splitLines(current);
-  const nextLines = splitLines(next);
-  const currentSet = new Set(currentLines);
-  const nextSet = new Set(nextLines);
-  return {
-    added: nextLines.filter((line) => !currentSet.has(line)),
-    removed: currentLines.filter((line) => !nextSet.has(line)),
-  };
-}
-
-/** Every `.gitignore` write goes through this confirmation, no matter which
- * command triggers it (hide/show/toggle, or a Settings save). Declining
- * leaves the file and the `metaFilesHidden` setting untouched. */
-async function confirmGitignoreWrite(
-  current: string,
-  next: string,
-  hidden: boolean
+/** Apply the managed hide block silently. Returns whether a target git
+ * repository was found (the write itself is skipped when already current). */
+async function applyAutomaticMetaGitIgnore(
+  workspace: vscode.WorkspaceFolder | undefined
 ): Promise<boolean> {
-  if (current === next) {
-    return true;
-  }
-
-  const { added, removed } = diffGitignoreLines(current, next);
-  const detailLines: string[] = [];
-  if (added.length > 0) {
-    detailLines.push(...added.map((line) => `+ ${line}`));
-  }
-  if (removed.length > 0) {
-    detailLines.push(...removed.map((line) => `- ${line}`));
-  }
-
-  const actionLabel = hidden ? "Hide Meta Files" : "Show Meta Files";
-  const confirm = await vscode.window.showWarningMessage(
-    hidden
-      ? "Ensemble wants to add a managed block to .gitignore to hide its meta files from git."
-      : "Ensemble wants to remove its managed block from .gitignore, making its meta files visible in git.",
-    { modal: true, detail: detailLines.join("\n") },
-    actionLabel
-  );
-  return confirm === actionLabel;
-}
-
-/** Returns whether the write was applied (`false` if the user declined the
- * confirmation, or if there was no eligible git repository/target). */
-async function setCurrentTaskMetaGitVisibility(
-  inventory: TaskInventory,
-  currentTaskStore: CurrentTaskStore,
-  hidden: boolean
-): Promise<boolean> {
-  const contextVersion = ++metaVisibilityContextVersion;
-  const target = await resolveTarget(inventory, currentTaskStore, true);
+  const target = await resolveTarget(workspace);
   if (!target) {
-    await setMetaVisibilityContexts(false, false, contextVersion);
     return false;
   }
 
   const current = await readTextIfExists(target.gitignoreUri);
-  const next = applyManagedMetaGitIgnoreBlock(current, target.patterns, hidden, {
+  const next = applyManagedMetaGitIgnoreBlock(current, target.patterns, true, {
     legacyRootPatterns: target.legacyRootPatterns,
     persistentPatterns: target.persistentPatterns,
   });
-
-  if (!(await confirmGitignoreWrite(current, next, hidden))) {
-    return false;
-  }
 
   if (current !== next) {
     await vscode.workspace.fs.writeFile(
@@ -610,69 +483,63 @@ async function setCurrentTaskMetaGitVisibility(
       new TextEncoder().encode(next)
     );
   }
-  await setMetaFilesHidden(hidden);
-
-  await setMetaVisibilityContexts(true, hidden, contextVersion);
-  NotificationRouter.showInformation(
-    hidden
-      ? "Workspace meta files are now hidden from git."
-      : "Workspace meta files are now visible in git."
-  );
   return true;
 }
 
-export async function hideMetaResourcesInGitIgnore(
-  inventory: TaskInventory,
-  currentTaskStore: CurrentTaskStore
-): Promise<boolean> {
-  return setCurrentTaskMetaGitVisibility(inventory, currentTaskStore, true);
+/**
+ * Automatic Git-ignore maintenance: Ensemble resources are hidden from git
+ * unconditionally, without configuration UI, following standard extension
+ * conventions. This is the only pathway that writes the managed block —
+ * the former hide/show/toggle commands and the `metaFilesHidden` setting
+ * mirror are gone. Applied silently once per workspace/root, so a user who
+ * deliberately hand-edits the block afterwards is not fought on every
+ * activation. Also cleans up a stale block after a resource-folder move,
+ * because the managed block is always rebuilt from the currently active
+ * task-root path.
+ */
+/** Normalize a workspace path for use as a gate key (mirrors taskRoot.ts:
+ * normalized separators, lowercased on Windows). */
+function toGateKey(fsPath: string): string {
+  const normalized = path.normalize(fsPath);
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
 }
 
-export async function showMetaResourcesInGitIgnore(
-  inventory: TaskInventory,
-  currentTaskStore: CurrentTaskStore
-): Promise<boolean> {
-  return setCurrentTaskMetaGitVisibility(inventory, currentTaskStore, false);
-}
-
-export async function toggleMetaResourcesGitIgnore(
-  inventory: TaskInventory,
-  currentTaskStore: CurrentTaskStore
-): Promise<boolean> {
-  const target = await resolveTarget(inventory, currentTaskStore, true);
-  if (!target) {
-    const contextVersion = ++metaVisibilityContextVersion;
-    await setMetaVisibilityContexts(false, false, contextVersion);
-    return false;
+export async function ensureAutomaticMetaGitIgnore(
+  context: vscode.ExtensionContext,
+  workspace?: vscode.WorkspaceFolder
+): Promise<void> {
+  const APPLIED_KEY = "ensemble.autoGitIgnoreApplied";
+  const targetWorkspace = workspace ?? vscode.workspace.workspaceFolders?.[0];
+  if (!targetWorkspace) {
+    return;
   }
 
-  const content = await readTextIfExists(target.gitignoreUri);
-  // The managed .gitignore block is the single source of truth.  The setting
-  // is retained only as a UI preference mirror; otherwise manually removing
-  // the block leaves the command inverted.
-  const hidden = isManagedMetaGitIgnoreHidden(content, target.patterns, {
-    legacyRootPatterns: target.legacyRootPatterns,
-  });
-  return setCurrentTaskMetaGitVisibility(inventory, currentTaskStore, !hidden);
-}
-
-export function registerToggleMetaResourcesGitIgnoreCommand(
-  context: vscode.ExtensionContext,
-  inventory: TaskInventory,
-  currentTaskStore: CurrentTaskStore
-): void {
-  context.subscriptions.push(
-    vscode.commands.registerCommand(
-      "vs-code-ai-helper.hideMetaResourcesInGitIgnore",
-      () => hideMetaResourcesInGitIgnore(inventory, currentTaskStore)
-    ),
-    vscode.commands.registerCommand(
-      "vs-code-ai-helper.showMetaResourcesInGitIgnore",
-      () => showMetaResourcesInGitIgnore(inventory, currentTaskStore)
-    ),
-    vscode.commands.registerCommand(
-      "vs-code-ai-helper.toggleMetaResourcesGitIgnore",
-      () => toggleMetaResourcesGitIgnore(inventory, currentTaskStore)
-    )
+  // The once-per-root gate is scoped per workspace folder: in a multi-root
+  // workspace each folder can be an independent repository, and applying the
+  // block in one must not suppress it in another. Older versions stored a
+  // bare string; that format only ever targeted the first folder, so it is
+  // migrated to that folder's entry.
+  const stored = context.workspaceState.get<string | Record<string, string>>(
+    APPLIED_KEY
   );
+  let appliedByFolder: Record<string, string>;
+  if (typeof stored === "string") {
+    const firstFolder = vscode.workspace.workspaceFolders?.[0];
+    appliedByFolder = firstFolder
+      ? { [toGateKey(firstFolder.uri.fsPath)]: stored }
+      : {};
+  } else {
+    appliedByFolder = { ...(stored ?? {}) };
+  }
+
+  const gateKey = toGateKey(targetWorkspace.uri.fsPath);
+  const activeRoot = getConfiguredTaskRoot();
+  if (appliedByFolder[gateKey] === activeRoot) {
+    return;
+  }
+  const applied = await applyAutomaticMetaGitIgnore(targetWorkspace);
+  if (applied) {
+    appliedByFolder[gateKey] = activeRoot;
+    await context.workspaceState.update(APPLIED_KEY, appliedByFolder);
+  }
 }

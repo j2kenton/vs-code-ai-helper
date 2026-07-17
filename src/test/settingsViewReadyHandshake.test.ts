@@ -1,4 +1,5 @@
 import * as assert from "node:assert/strict";
+import * as vm from "node:vm";
 import { describe, it } from "node:test";
 import * as vscode from "vscode";
 import { SettingsViewProvider } from "../views/settingsView";
@@ -267,5 +268,257 @@ void describe("SettingsViewProvider — webview ready handshake", () => {
     } finally {
       __testOnly.clearModelSelectionTestOverrides();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Draft preservation across webview disposal (plan step 29)
+//
+// The discard path VS Code owns — deallocating the webview document when the
+// view is hidden/closed — cannot be intercepted by the extension, so the
+// webview script itself serializes dirty form state into the webview state
+// API (vscode.setState) and restores it, with a notice, on the next init.
+// That logic lives entirely in the inline webview script, so these tests
+// execute the REAL script (extracted from the provider's HTML) in a vm
+// sandbox with a minimal DOM: the "disposal" is a fresh script run sharing
+// the same persistent state store, exactly like VS Code recreating the
+// document while retaining webview state.
+// ---------------------------------------------------------------------------
+
+/** Minimal DOM node for the settings webview script: enough surface for
+ * renderProviderSelection/renderTable/collectFormSettings to run, recording
+ * innerHTML and appended children so tests can observe what was rendered. */
+class FakeNode {
+  children: FakeNode[] = [];
+  value = "";
+  innerHTML = "";
+  textContent = "";
+  innerText = "";
+  hidden = false;
+  disabled = false;
+  checked = false;
+  id = "";
+  className = "";
+  title = "";
+  style: Record<string, unknown> = {};
+  dataset: Record<string, string> = {};
+  classList = { add: (): void => undefined, remove: (): void => undefined };
+  private listeners = new Map<string, Array<(event: unknown) => unknown>>();
+  private attributes = new Map<string, string>();
+  private selectorChildren = new Map<string, FakeNode>();
+
+  appendChild(child: FakeNode): FakeNode {
+    this.children.push(child);
+    return child;
+  }
+  remove(): void {
+    /* no-op */
+  }
+  querySelector(selector: string): FakeNode {
+    let node = this.selectorChildren.get(selector);
+    if (!node) {
+      node = new FakeNode();
+      this.selectorChildren.set(selector, node);
+    }
+    return node;
+  }
+  querySelectorAll(): FakeNode[] {
+    return [];
+  }
+  addEventListener(type: string, listener: (event: unknown) => unknown): void {
+    const list = this.listeners.get(type) ?? [];
+    list.push(listener);
+    this.listeners.set(type, list);
+  }
+  setAttribute(name: string, value: string): void {
+    this.attributes.set(name, value);
+  }
+  getAttribute(name: string): string | undefined {
+    return this.attributes.get(name);
+  }
+  scrollIntoView(): void {
+    /* no-op */
+  }
+  focus(): void {
+    /* no-op */
+  }
+  closest(): null {
+    return null;
+  }
+  async dispatch(type: string, event: unknown = {}): Promise<void> {
+    for (const listener of this.listeners.get(type) ?? []) {
+      await listener(event);
+    }
+  }
+}
+
+function extractWebviewScript(): string {
+  const provider = new SettingsViewProvider(vscode.Uri.file("/fake/ext"));
+  const html = (
+    provider as unknown as { _getHtmlForWebview(webview: { cspSource: string }): string }
+  )._getHtmlForWebview({ cspSource: "vscode-webview://fake" });
+  const match = /<script nonce="[^"]*">([\s\S]*?)<\/script>/.exec(html);
+  assert.ok(match, "expected the settings webview HTML to contain its inline script");
+  return match[1]!;
+}
+
+interface WebviewSession {
+  byId(id: string): FakeNode;
+  posted: Array<Record<string, unknown>>;
+  deliver(message: Record<string, unknown>): Promise<void>;
+}
+
+/** One webview document lifetime. `stateStore` outlives sessions, exactly
+ * like VS Code's webview state persists across document disposal. */
+function runWebviewSession(script: string, stateStore: { value: unknown }): WebviewSession {
+  const byId = new Map<string, FakeNode>();
+  const documentStub = {
+    getElementById(id: string): FakeNode {
+      let node = byId.get(id);
+      if (!node) {
+        node = new FakeNode();
+        node.id = id;
+        byId.set(id, node);
+      }
+      return node;
+    },
+    createElement(): FakeNode {
+      return new FakeNode();
+    },
+    body: new FakeNode(),
+  };
+  const messageListeners: Array<(event: { data: unknown }) => unknown> = [];
+  const posted: Array<Record<string, unknown>> = [];
+  const sandbox = {
+    acquireVsCodeApi: () => ({
+      postMessage: (message: Record<string, unknown>): void => {
+        posted.push(message);
+      },
+      setState: (state: unknown): void => {
+        stateStore.value = state;
+      },
+      getState: (): unknown => stateStore.value,
+    }),
+    document: documentStub,
+    window: {
+      addEventListener: (type: string, listener: (event: { data: unknown }) => unknown): void => {
+        if (type === "message") {
+          messageListeners.push(listener);
+        }
+      },
+    },
+    CSS: { escape: (value: string): string => value },
+    setTimeout,
+    console,
+    Element: FakeNode,
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(script, sandbox);
+  return {
+    byId: (id: string): FakeNode => documentStub.getElementById(id),
+    posted,
+    async deliver(message: Record<string, unknown>): Promise<void> {
+      for (const listener of messageListeners) {
+        await listener({ data: message });
+      }
+      // The init handler is async; let its awaited continuations settle.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    },
+  };
+}
+
+function initMessage(): Record<string, unknown> {
+  return {
+    type: "init",
+    settings: {},
+    models: [{ id: "claude-cli:sonnet", name: "Sonnet", providerLabel: "Claude CLI" }],
+    stages: ["impl"],
+    stageNames: { impl: "Implementation" },
+    quotaStatus: {},
+    enabledProviders: {},
+    providers: [],
+    warnUnsavedSettings: true,
+  };
+}
+
+void describe("SettingsViewProvider webview — draft restore across disposal", () => {
+  void it("restores a dirty draft, with a notice, after the document is disposed and recreated", async () => {
+    const script = extractWebviewScript();
+    const stateStore: { value: unknown } = { value: undefined };
+
+    // Session 1: the user edits the form (a model selection lands in the
+    // hidden input), making it dirty — the draft is serialized to state.
+    const first = runWebviewSession(script, stateStore);
+    await first.deliver(initMessage());
+    first.byId("primary-impl").value = "claude-cli:sonnet";
+    await first.byId("stages-tbody").dispatch("input");
+
+    const draft = (stateStore.value as { draftSettings?: Record<string, { primary?: string }> } | undefined)
+      ?.draftSettings;
+    assert.equal(
+      draft?.impl?.primary,
+      "claude-cli:sonnet",
+      "marking the form dirty must persist the draft into webview state"
+    );
+
+    // VS Code disposes the document (view hidden/closed) and later recreates
+    // it: a brand-new script run against the SAME persistent state store.
+    const second = runWebviewSession(script, stateStore);
+    await second.deliver(initMessage());
+
+    const noteContainer = second.byId("restored-note-container");
+    assert.ok(
+      noteContainer.children.some((child) => /Restored unsaved changes/.test(child.textContent)),
+      "the recreated document must show the restored-draft notice"
+    );
+    assert.equal(
+      second.byId("save-btn").disabled,
+      false,
+      "the restored draft must leave the form dirty so Save Settings is enabled"
+    );
+    const renderedRows = second
+      .byId("stages-tbody")
+      .children.map((row) => row.innerHTML)
+      .join("");
+    assert.ok(
+      renderedRows.includes("claude-cli:sonnet"),
+      "the re-rendered form must contain the drafted model selection, not the empty saved settings"
+    );
+    assert.ok(second.posted.some((message) => message.type === "rendered"));
+  });
+
+  void it("does not show a restore notice when there is no draft, and Save clears a restored draft", async () => {
+    const script = extractWebviewScript();
+
+    // No draft: clean init.
+    const cleanStore: { value: unknown } = { value: undefined };
+    const clean = runWebviewSession(script, cleanStore);
+    await clean.deliver(initMessage());
+    assert.equal(clean.byId("restored-note-container").children.length, 0);
+    assert.equal(clean.byId("save-btn").disabled, true, "a clean form must keep Save disabled");
+
+    // With a draft: restoring and then saving must clear the persisted draft
+    // so a later recreation starts clean instead of resurrecting stale edits.
+    const draftStore: { value: unknown } = {
+      value: { draftSettings: { impl: { primary: "claude-cli:sonnet", backups: [], strategy: "alert-and-wait" } } },
+    };
+    const restored = runWebviewSession(script, draftStore);
+    await restored.deliver(initMessage());
+    assert.equal(restored.byId("save-btn").disabled, false);
+
+    await restored.byId("save-btn").dispatch("click");
+    assert.ok(
+      restored.posted.some((message) => message.type === "saveSettings"),
+      "saving the restored draft must post saveSettings"
+    );
+    assert.equal(draftStore.value, undefined, "saving must clear the persisted draft");
+
+    const third = runWebviewSession(script, draftStore);
+    await third.deliver(initMessage());
+    assert.equal(
+      third.byId("restored-note-container").children.length,
+      0,
+      "after saving, a recreated document must not claim there are unsaved changes"
+    );
   });
 });

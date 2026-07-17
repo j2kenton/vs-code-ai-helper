@@ -10,10 +10,11 @@ import { startNewTask } from "./startNewTask";
 export async function openAndStartNewTask(
   inventory: TaskInventory,
   extensionUri: vscode.Uri,
-  currentTaskStore: CurrentTaskStore
+  currentTaskStore: CurrentTaskStore,
+  context?: vscode.ExtensionContext
 ): Promise<void> {
   await vscode.commands.executeCommand("workbench.view.extension.ai-helper");
-  await startNewTask(inventory, extensionUri, currentTaskStore);
+  await startNewTask(inventory, extensionUri, currentTaskStore, context);
 }
 
 /**
@@ -26,7 +27,7 @@ export function registerOpenAndStartNewTaskCommand(
 ): void {
   const disposable = vscode.commands.registerCommand(
     "vs-code-ai-helper.openAndStartNewTask",
-    () => openAndStartNewTask(inventory, context.extensionUri, currentTaskStore)
+    () => openAndStartNewTask(inventory, context.extensionUri, currentTaskStore, context)
   );
   context.subscriptions.push(disposable);
 }

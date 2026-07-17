@@ -6,6 +6,7 @@ import { describe, it } from "node:test";
 type CommandContribution = {
   command: string;
   title: string;
+  icon?: string;
 };
 
 type MenuContribution = {
@@ -85,14 +86,14 @@ void describe("Stage 3 action matrix contracts", () => {
 
     assert.equal(implementationBinding?.key, "ctrl+shift+alt+i");
     // No stage gate: applyCurrentStageAction re-derives the live stage itself
-    // and routes accordingly (including to runLintingFixes on Publish), so
+    // and routes accordingly (including to runPublishChecks on Publish), so
     // gating the keybinding on a specific stage only breaks it on every
     // other stage.
     assert.equal(implementationBinding?.when, "vs-code-ai-helper.tasksInitialized");
     assert.deepEqual(
       competingBindings,
       [],
-      "No other command should claim Ctrl+Shift+Alt+I; runLintingFixes is reached via applyCurrentStageAction's routing, not its own binding."
+      "No other command should claim Ctrl+Shift+Alt+I; runPublishChecks is reached via applyCurrentStageAction's routing, not its own binding."
     );
   });
 
@@ -182,7 +183,7 @@ void describe("Stage 3 action matrix contracts", () => {
     const contributes = readPackageContributes();
     const contextMenus = contributes.menus?.["view/item/context"] ?? [];
     const publishActionCommands = new Set([
-      "vs-code-ai-helper.runReviewWithAI",
+      "vs-code-ai-helper.runPublishChecks",
       "vs-code-ai-helper.runLintingFixes",
       "vs-code-ai-helper.viewStageChanges",
       "vs-code-ai-helper.chatWithStage",
@@ -205,6 +206,100 @@ void describe("Stage 3 action matrix contracts", () => {
       "inline@60",
       "inline@70",
     ]);
+  });
+
+  void it("makes 'run the checks' (scales icon) the first Publish action and 'fix the report' the second", () => {
+    const contributes = readPackageContributes();
+    const commands = contributes.commands ?? [];
+    const contextMenus = contributes.menus?.["view/item/context"] ?? [];
+    const publishInline = contextMenus.filter((entry) =>
+      (entry.when ?? "").includes("&& viewItem =~ /^stage-publish-current/ &&")
+    );
+
+    const firstAction = publishInline.find((entry) => entry.group === "inline@10");
+    assert.equal(
+      firstAction?.command,
+      "vs-code-ai-helper.runPublishChecks",
+      "The first inline Publish action must run the checks and produce the report"
+    );
+    const secondAction = publishInline.find((entry) => entry.group === "inline@20");
+    assert.equal(
+      secondAction?.command,
+      "vs-code-ai-helper.runLintingFixes",
+      "The second inline Publish action must fix the report's findings"
+    );
+
+    const checksCommand = commands.find(
+      (entry) => entry.command === "vs-code-ai-helper.runPublishChecks"
+    );
+    assert.equal(
+      checksCommand?.icon,
+      "$(law)",
+      "The check-and-report action carries the scales icon"
+    );
+    const fixCommand = commands.find(
+      (entry) => entry.command === "vs-code-ai-helper.runLintingFixes"
+    );
+    assert.equal(fixCommand?.icon, "$(wand)");
+  });
+
+  void it("separates Publish check and fix responsibilities in the command sources", () => {
+    const checksSource = readWorkspaceFile(
+      path.join("src", "commands", "runPublishChecks.ts")
+    );
+    assert.match(
+      checksSource,
+      /runCompletionLint\(\s*taskFolderUri/,
+      "The first Publish action must run the completion checks (lint/tests + plan verification)"
+    );
+    assert.match(
+      checksSource,
+      /await ensureStageModelConfigured\(taskFolderUri, "publish"\)/,
+      "The directly-invocable check action must carry the missing-model guard itself (the inline button bypasses applyCurrentStageAction)"
+    );
+
+    const fixesSource = readWorkspaceFile(
+      path.join("src", "commands", "runLintingFixes.ts")
+    );
+    assert.match(
+      fixesSource,
+      /const lastReport = resolvedTask\.progress\.lintPayload;/,
+      "The fix action must consume the persisted report from the first action, not run initial checks itself"
+    );
+    assert.match(
+      fixesSource,
+      /resolvePublishScopeFolder\(taskFolderUri, resolvedTask\.progress\)/,
+      "Deterministic fixes and diagnostics must be limited to the resolved Publish verification scope, not the workspace root"
+    );
+    assert.match(
+      fixesSource,
+      /await ensureStageModelConfigured\(taskFolderUri, "publish"\)/,
+      "The directly-invocable fix action must carry the missing-model guard before any mutation (the inline button bypasses applyCurrentStageAction)"
+    );
+    assert.ok(
+      fixesSource.indexOf('await ensureStageModelConfigured(taskFolderUri, "publish")') <
+        fixesSource.indexOf("runTrackedOperation("),
+      "The fix action's model guard must run before the tracked operation so no autofix/format mutation happens without a usable Publish model"
+    );
+    assert.match(
+      fixesSource,
+      /resolveFreshModelForStage\(taskFolderUri, "publish"\)/,
+      "The AI fix pass must run with the Publish-stage model"
+    );
+    assert.match(
+      fixesSource,
+      /stage: "publish", taskFolderUri/,
+      "The AI fix run must execute under the Publish stage, not Implementation"
+    );
+
+    const routerSource = readWorkspaceFile(
+      path.join("src", "commands", "applyCurrentStageAction.ts")
+    );
+    assert.match(
+      routerSource,
+      /stage === "publish"[\s\S]{0,120}?runPublishChecks/,
+      "The current-stage router must dispatch the Publish checks as the stage's primary action"
+    );
   });
 
   void it("declares nextStage menu for current impl-low-review stage row", () => {

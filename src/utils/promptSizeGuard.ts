@@ -5,6 +5,10 @@ import {
   estimateTokensFromUtf8Bytes,
   measurePromptBytes,
 } from "./contextEligibility";
+import {
+  isLargeTokenRequestWarningEnabled,
+  setLargeTokenRequestWarningEnabled,
+} from "../config/settings";
 
 /**
  * Check whether a prompt is safe to send, applying two enforcement rules:
@@ -40,17 +44,31 @@ export async function checkAndConfirmPromptSize(
     return "abort";
   }
 
-  // High-context confirmation threshold
+  // High-context confirmation threshold. Configurable: when the user has
+  // opted out (vs-code-ai-helper.warnings.largeTokenRequest = false) the
+  // dialog is skipped and the run proceeds as if confirmed. The hard
+  // ceiling above is never skippable. Native modals can't host a checkbox,
+  // so the opt-out is the middle button rather than a checkbox.
   if (bytes > CONTEXT_CONFIRM_THRESHOLD_BYTES) {
+    if (!isLargeTokenRequestWarningEnabled()) {
+      return "confirmed";
+    }
     const kb = Math.round(bytes / 1024);
     const tokens = estimateTokensFromUtf8Bytes(bytes);
+    const PROCEED = "Proceed";
+    const PROCEED_DONT_ASK = "Proceed and don't ask again";
     const choice = await vscode.window.showWarningMessage(
       `⚠️ This will send a prompt of ~${kb} KB (~${tokens.toLocaleString()} tokens) to ${providerLabel}. ` +
         `This may use significant quota. Continue?`,
       { modal: true },
-      "Continue"
+      PROCEED,
+      PROCEED_DONT_ASK
     );
-    if (choice !== "Continue") {
+    if (choice === PROCEED_DONT_ASK) {
+      await setLargeTokenRequestWarningEnabled(false);
+      return "confirmed";
+    }
+    if (choice !== PROCEED) {
       return "declined";
     }
     return "confirmed";

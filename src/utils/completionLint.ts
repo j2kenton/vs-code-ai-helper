@@ -1,9 +1,14 @@
 import * as vscode from "vscode";
 import { spawn, execSync, execFileSync } from "child_process";
-import { patchTaskProgress, updateLintPayload } from "./taskProgressUtils";
+import * as crypto from "crypto";
+import { patchTaskProgress, readTaskProgress, updateLintPayload } from "./taskProgressUtils";
 import * as fs from "fs";
 import * as path from "path";
-import { STAGE_ARTIFACT_FILENAMES } from "../types/taskProgress";
+import { STAGE_ARTIFACT_FILENAMES, TaskProgress } from "../types/taskProgress";
+import { getPublishVerificationCommands } from "../config/settings";
+import { promptAndPersistPublishScope } from "../commands/choosePublishScope";
+import { resolveModelForStage } from "./modelSelection";
+import { resolveRunnerForModel } from "../runners/runnerRegistry";
 
 /**
  * Resolve a package manager executable to an absolute path, preferring a
@@ -29,6 +34,13 @@ function resolveManagerExecutable(cwd: string, manager: string): string {
   return process.platform === "win32" ? `${manager}.cmd` : manager;
 }
 
+export interface PlanItemVerification {
+  text: string;
+  /** Never "passed" for anything that could not actually be verified. */
+  status: "passed" | "failed" | "inconclusive";
+  note?: string;
+}
+
 export interface CompletionLintResult {
   runAt: string;
   passed: boolean;
@@ -36,8 +48,397 @@ export interface CompletionLintResult {
   issueCount: number;
   failedChecks: Array<{ command: string; exitCode: number; output: string }>;
   /** `scripts` entries (from the conventional `lint`/`test` names) not found
-   * in the workspace `package.json`, and therefore skipped rather than run. */
+   * in the workspace `package.json`, and therefore skipped rather than run.
+   * Reported as `inconclusive` — an undetected toolchain is never a pass. */
   missingScripts: string[];
+  /** AI-verified plan-item completion check (report section, not a gate):
+   * `passed` only ever comes from AI evidence against the source, never from
+   * a checked checkbox alone. */
+  planItems?: PlanItemVerification[];
+  /** The folder lint/tests actually ran against (the Publish scope). */
+  verifiedFolder?: string;
+}
+
+/**
+ * Resolve the folder the Publish stage verifies (lint/tests) against: the
+ * task's persisted, workspace-folder-relative `publishScopePath` when set
+ * and still present on disk; otherwise the workspace folder containing the
+ * task. A persisted path that no longer exists is reported `stale` so
+ * interactive callers can re-prompt (see choosePublishScope.ts).
+ */
+export function resolvePublishScopeFolder(
+  taskFolderUri: vscode.Uri,
+  progress: Pick<TaskProgress, "publishScopePath"> | undefined
+): { folder: string; stale: boolean } {
+  const workspaceFolder = vscode.workspace.getWorkspaceFolder(taskFolderUri);
+  const defaultFolder = workspaceFolder?.uri.fsPath ?? taskFolderUri.fsPath;
+  const persisted = progress?.publishScopePath?.trim();
+  if (!persisted) {
+    return { folder: defaultFolder, stale: false };
+  }
+  const absolute = path.isAbsolute(persisted)
+    ? persisted
+    : path.join(defaultFolder, persisted);
+  try {
+    if (fs.statSync(absolute).isDirectory()) {
+      return { folder: absolute, stale: false };
+    }
+  } catch {
+    // Fall through: the persisted path no longer exists.
+  }
+  return { folder: defaultFolder, stale: true };
+}
+
+const DEFERRED_MARKERS = /\b(deferred|out[ -]of[ -]scope|won'?t (?:do|fix)|skipped)\b/i;
+
+/**
+ * Deterministic baseline over the plan-final.md checklist. A checkbox alone
+ * is never evidence of implementation, so nothing here produces `passed`:
+ * an item marked deferred/out-of-scope is `failed` (deferring is not
+ * completing); everything else — checked or not — is `inconclusive` until
+ * the AI-assisted verification (below) inspects the actual source and
+ * upgrades or contradicts it.
+ */
+export function verifyPlanItems(planContent: string): PlanItemVerification[] {
+  const items: PlanItemVerification[] = [];
+  for (const line of planContent.split(/\r?\n/)) {
+    const match = /^\s*[-*]\s*\[([ xX])\]\s+(.*\S)\s*$/.exec(line);
+    if (!match) {
+      continue;
+    }
+    const checked = match[1]?.toLowerCase() === "x";
+    const text = match[2] ?? "";
+    const deferred = DEFERRED_MARKERS.test(text);
+    if (deferred) {
+      items.push({
+        text,
+        status: "failed",
+        note: "marked deferred/out-of-scope — not counted as complete",
+      });
+    } else if (checked) {
+      items.push({
+        text,
+        status: "inconclusive",
+        note: "checked in the plan — a checkbox is not evidence; awaiting AI verification against the implementation",
+      });
+    } else {
+      items.push({
+        text,
+        status: "inconclusive",
+        note: "unchecked — completion could not be verified automatically",
+      });
+    }
+  }
+  return items;
+}
+
+// ---------------------------------------------------------------------------
+// AI-assisted plan-item verification: a checked box in plan-final.md is not
+// proof that source changes exist, so the Publish check asks the configured
+// Publish-stage model to inspect the verification scope (read-only) and
+// return a per-item verdict. The deterministic baseline above is only ever
+// *upgraded* by real AI evidence — when the AI pass cannot run (no model,
+// provider unavailable, unparseable response), every non-deferred item stays
+// `inconclusive` with the reason recorded, never `passed`.
+// ---------------------------------------------------------------------------
+
+/** A single per-item verdict extracted from the AI verification response. */
+export interface AiPlanVerdict {
+  status: PlanItemVerification["status"];
+  note?: string;
+}
+
+function appendNote(existing: string | undefined, addition: string): string {
+  return existing ? `${existing}; ${addition}` : addition;
+}
+
+/** Deferred items keep their deterministic failure; everything else records
+ * why the AI pass could not corroborate it. */
+function markAiVerificationUnavailable(
+  items: readonly PlanItemVerification[],
+  reason: string
+): PlanItemVerification[] {
+  return items.map((item) =>
+    item.status === "failed"
+      ? { ...item }
+      : { ...item, note: appendNote(item.note, `AI verification unavailable: ${reason}`) }
+  );
+}
+
+/**
+ * Extract per-item verdicts from an AI response: a fenced ```json block, a
+ * bare JSON array/object, or JSON-object lines — any mix is accepted, and
+ * anything unparseable is ignored. Item numbers are 1-based and clamped to
+ * the actual item count. Exported for testing.
+ */
+export function parseAiPlanVerdicts(
+  output: string,
+  itemCount: number
+): Map<number, AiPlanVerdict> {
+  const verdicts = new Map<number, AiPlanVerdict>();
+  const accept = (value: unknown): void => {
+    if (Array.isArray(value)) {
+      for (const entry of value) {
+        accept(entry);
+      }
+      return;
+    }
+    if (!value || typeof value !== "object") {
+      return;
+    }
+    const record = value as { item?: unknown; status?: unknown; note?: unknown };
+    const item = typeof record.item === "number" ? record.item : Number(record.item);
+    const status = record.status;
+    if (!Number.isInteger(item) || item < 1 || item > itemCount) {
+      return;
+    }
+    if (status !== "passed" && status !== "failed" && status !== "inconclusive") {
+      return;
+    }
+    const note =
+      typeof record.note === "string" && record.note.trim().length > 0
+        ? record.note.trim()
+        : undefined;
+    verdicts.set(item, { status, note });
+  };
+  const tryParse = (candidate: string): void => {
+    try {
+      accept(JSON.parse(candidate));
+    } catch {
+      // Not JSON — ignore; other extraction passes may still match.
+    }
+  };
+
+  for (const match of output.matchAll(/```(?:json)?\s*([\s\S]*?)```/g)) {
+    tryParse(match[1] ?? "");
+  }
+  tryParse(output.trim());
+  for (const line of output.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+      tryParse(trimmed);
+    }
+  }
+  return verdicts;
+}
+
+/**
+ * Merge AI verdicts into the deterministic baseline. Deterministic failures
+ * (deferred/out-of-scope items) are authoritative — an AI "passed" cannot
+ * launder a deferral into completion. Items the AI skipped stay at their
+ * baseline status with that gap recorded. Exported for testing.
+ */
+export function mergeAiPlanVerdicts(
+  items: readonly PlanItemVerification[],
+  verdicts: ReadonlyMap<number, AiPlanVerdict>
+): PlanItemVerification[] {
+  return items.map((item, index) => {
+    if (item.status === "failed") {
+      return { ...item };
+    }
+    const verdict = verdicts.get(index + 1);
+    if (!verdict) {
+      return {
+        ...item,
+        note: appendNote(item.note, "no AI verdict was returned for this item"),
+      };
+    }
+    return {
+      text: item.text,
+      status: verdict.status,
+      note: verdict.note
+        ? `AI verification: ${verdict.note}`
+        : "AI-verified against the implementation",
+    };
+  });
+}
+
+const PLAN_VERIFICATION_MAX_PLAN_CHARS = 20_000;
+
+function buildPlanVerificationPrompt(
+  items: readonly PlanItemVerification[],
+  planContent: string,
+  scopeFolder: string
+): string {
+  const numbered = items
+    .map((item, index) => `${index + 1}. ${item.text}`)
+    .join("\n");
+  const plan =
+    planContent.length > PLAN_VERIFICATION_MAX_PLAN_CHARS
+      ? `${planContent.slice(0, PLAN_VERIFICATION_MAX_PLAN_CHARS)}\n… (truncated)`
+      : planContent;
+  return [
+    "You are verifying whether a development task's plan items were actually implemented in the codebase.",
+    "",
+    `Verification scope (project folder): ${scopeFolder}`,
+    "",
+    "Inspect the repository READ-ONLY — do not create, modify, or delete any file. For every numbered plan item below decide:",
+    '- "passed": you found concrete evidence in the source code that the item is implemented.',
+    '- "failed": the item is not implemented, only partially implemented, or was deferred/descoped.',
+    '- "inconclusive": the code does not let you determine it either way.',
+    "",
+    "A checked checkbox in the plan is NOT evidence — verify against the actual source files.",
+    "",
+    "Plan items:",
+    numbered,
+    "",
+    "Full plan for context:",
+    "",
+    plan,
+    "",
+    "Respond with ONLY a fenced json code block containing an array with exactly one object per numbered item:",
+    "```json",
+    '[',
+    '  { "item": 1, "status": "passed", "note": "one-sentence evidence naming the file/function" }',
+    ']',
+    "```",
+  ].join("\n");
+}
+
+interface PlanVerificationCacheEntry {
+  /** Scope + plan content — a changed plan or scope invalidates the entry. */
+  contentKey: string;
+  at: number;
+  items: PlanItemVerification[];
+}
+
+/** One AI verification per task per plan revision within this window — the
+ * publish fix loop re-runs runCompletionLint several times back-to-back and
+ * must not spend an AI call (and minutes of latency) on each pass. */
+const PLAN_VERIFICATION_CACHE_TTL_MS = 5 * 60 * 1000;
+const planVerificationCache = new Map<string, PlanVerificationCacheEntry>();
+
+/** @internal exported for testing */
+export function clearPlanVerificationCache(): void {
+  planVerificationCache.clear();
+}
+
+async function runAiPlanVerification(
+  taskFolderUri: vscode.Uri,
+  scopeFolder: string,
+  baseline: readonly PlanItemVerification[],
+  planContent: string
+): Promise<PlanItemVerification[]> {
+  const model = await resolveModelForStage(taskFolderUri, "publish");
+  if (!model.modelId) {
+    return markAiVerificationUnavailable(
+      baseline,
+      "no AI model is configured for the Publish stage"
+    );
+  }
+
+  let resolved: ReturnType<typeof resolveRunnerForModel>;
+  try {
+    resolved = resolveRunnerForModel(model.modelId, "publish", taskFolderUri);
+  } catch (error) {
+    return markAiVerificationUnavailable(
+      baseline,
+      error instanceof Error ? error.message : String(error)
+    );
+  }
+
+  const availability = await resolved.runner.isAvailable();
+  if (!availability.available) {
+    return markAiVerificationUnavailable(
+      baseline,
+      availability.reason ?? `${resolved.providerLabel} is unavailable`
+    );
+  }
+
+  const prompt = buildPlanVerificationPrompt(baseline, planContent, scopeFolder);
+  const outputFile = vscode.Uri.file(
+    path.join(taskFolderUri.fsPath, `.plan-verification.${crypto.randomUUID()}.tmp.md`)
+  );
+  const tokenSource = new vscode.CancellationTokenSource();
+  try {
+    const result = await resolved.runner.run(
+      {
+        taskFolderUri,
+        workspaceUri: vscode.Uri.file(scopeFolder),
+        stage: "publish",
+        prompt,
+        outputFile,
+        modelId: resolved.nativeModelId,
+      },
+      tokenSource.token
+    );
+    if (result.status !== "completed") {
+      return markAiVerificationUnavailable(
+        baseline,
+        result.errorMessage ??
+          `the ${resolved.providerLabel} verification run did not complete`
+      );
+    }
+    let output = "";
+    try {
+      output = new TextDecoder().decode(await vscode.workspace.fs.readFile(outputFile));
+    } catch {
+      // Missing/unreadable output file → treated as an empty response below.
+    }
+    const verdicts = parseAiPlanVerdicts(output, baseline.length);
+    if (verdicts.size === 0) {
+      return markAiVerificationUnavailable(
+        baseline,
+        "the AI response contained no parseable per-item verdicts"
+      );
+    }
+    return mergeAiPlanVerdicts(baseline, verdicts);
+  } finally {
+    tokenSource.dispose();
+    try {
+      await vscode.workspace.fs.delete(outputFile);
+    } catch {
+      // Already absent (run failed before writing) — nothing to clean up.
+    }
+  }
+}
+
+/**
+ * The full Publish plan-item verification: deterministic checklist baseline,
+ * then the AI-assisted pass against the verification scope, with per-task
+ * caching keyed on the plan content so back-to-back Publish checks don't
+ * repeat the AI call. Absent/empty plan → undefined (no section rendered).
+ */
+export async function collectAiVerifiedPlanItems(
+  taskFolderUri: vscode.Uri,
+  scopeFolder: string
+): Promise<PlanItemVerification[] | undefined> {
+  let planContent: string;
+  try {
+    planContent = fs.readFileSync(
+      path.join(taskFolderUri.fsPath, "plan-final.md"),
+      "utf8"
+    );
+  } catch {
+    return undefined;
+  }
+  const baseline = verifyPlanItems(planContent);
+  if (baseline.length === 0) {
+    return undefined;
+  }
+
+  const cacheKey = taskFolderUri.fsPath;
+  const contentKey = `${scopeFolder}\n${planContent}`;
+  const cached = planVerificationCache.get(cacheKey);
+  if (
+    cached &&
+    cached.contentKey === contentKey &&
+    Date.now() - cached.at < PLAN_VERIFICATION_CACHE_TTL_MS
+  ) {
+    return cached.items.map((item) => ({ ...item }));
+  }
+
+  let items: PlanItemVerification[];
+  try {
+    items = await runAiPlanVerification(taskFolderUri, scopeFolder, baseline, planContent);
+  } catch (error) {
+    items = markAiVerificationUnavailable(
+      baseline,
+      error instanceof Error ? error.message : String(error)
+    );
+  }
+  planVerificationCache.set(cacheKey, { contentKey, at: Date.now(), items });
+  return items.map((item) => ({ ...item }));
 }
 
 /**
@@ -132,34 +533,72 @@ function packageManager(folder: string): string {
   return "npm";
 }
 
-/** Collect diagnostics after fresh lint/type/test checks have completed. */
-export async function collectCompletionLint(folder: string, relevantFiles?: readonly string[]): Promise<CompletionLintResult> {
-  const manager = packageManager(folder);
-  const scripts = readPackageScripts(folder);
-  const missingScripts: string[] = [];
-
-  const candidateChecks: Array<readonly [string, string[]]> = [
-    [`${manager} run lint`, [manager, "run", "lint"]],
-    [`${manager} run check-types`, [manager, "run", "check-types"]],
-    [`${manager} run test`, [manager, "run", "test"]],
-  ];
-
-  // The conventional `lint`/`test` scripts (publish pre-check contract) are
-  // skipped rather than run when not present in package.json's `scripts`, so
-  // an unconfigured workspace gets clean setup guidance instead of every
-  // publish check being misreported as a failure. `check-types` predates
-  // that contract and keeps its existing unconditional-run behavior.
-  const runnableChecks = candidateChecks.filter(([, args]) => {
-    const scriptName = args[2];
-    if (scriptName !== "lint" && scriptName !== "test") return true;
-    const configured = !!scripts && Object.prototype.hasOwnProperty.call(scripts, scriptName);
-    if (!configured) missingScripts.push(scriptName);
-    return configured;
+/** Run one user-authored verification command line through the shell. */
+function runExplicitCheck(cwd: string, command: string): Promise<{ code: number; output: string }> {
+  return new Promise((resolve) => {
+    const child = spawn(command, { cwd, shell: true });
+    let output = "";
+    child.stdout?.on("data", (data: Buffer | string) => { output += typeof data === "string" ? data : data.toString("utf8"); });
+    child.stderr?.on("data", (data: Buffer | string) => { output += typeof data === "string" ? data : data.toString("utf8"); });
+    child.on("error", (error) => resolve({ code: 1, output: error.message }));
+    child.on("close", (code) => resolve({ code: code ?? 1, output }));
   });
+}
 
-  const checks = await Promise.all(
-    runnableChecks.map(async ([command, args]) => ({ command, ...(await runCheck(folder, [...args])) }))
-  );
+export interface CollectCompletionLintOptions {
+  /**
+   * Explicitly configured verification command lines. When non-empty these
+   * take precedence over the conventional package.json `lint`/`test`/
+   * `check-types` script detection: exactly these commands run, and the
+   * missing-script (inconclusive) reporting does not apply.
+   */
+  explicitCommands?: readonly string[];
+}
+
+/** Collect diagnostics after fresh lint/type/test checks have completed. */
+export async function collectCompletionLint(
+  folder: string,
+  relevantFiles?: readonly string[],
+  options?: CollectCompletionLintOptions
+): Promise<CompletionLintResult> {
+  const manager = packageManager(folder);
+  const missingScripts: string[] = [];
+  const explicitCommands = (options?.explicitCommands ?? [])
+    .map((command) => command.trim())
+    .filter((command) => command.length > 0);
+
+  let checks: Array<{ command: string; code: number; output: string }>;
+  if (explicitCommands.length > 0) {
+    // Toolchain resolution order (publish pre-check contract): explicitly
+    // configured verification commands win over conventional npm scripts.
+    checks = await Promise.all(
+      explicitCommands.map(async (command) => ({ command, ...(await runExplicitCheck(folder, command)) }))
+    );
+  } else {
+    const scripts = readPackageScripts(folder);
+    const candidateChecks: Array<readonly [string, string[]]> = [
+      [`${manager} run lint`, [manager, "run", "lint"]],
+      [`${manager} run check-types`, [manager, "run", "check-types"]],
+      [`${manager} run test`, [manager, "run", "test"]],
+    ];
+
+    // The conventional `lint`/`test` scripts (publish pre-check contract) are
+    // skipped rather than run when not present in package.json's `scripts`, so
+    // an unconfigured workspace gets clean setup guidance instead of every
+    // publish check being misreported as a failure. `check-types` predates
+    // that contract and keeps its existing unconditional-run behavior.
+    const runnableChecks = candidateChecks.filter(([, args]) => {
+      const scriptName = args[2];
+      if (scriptName !== "lint" && scriptName !== "test") return true;
+      const configured = !!scripts && Object.prototype.hasOwnProperty.call(scripts, scriptName);
+      if (!configured) missingScripts.push(scriptName);
+      return configured;
+    });
+
+    checks = await Promise.all(
+      runnableChecks.map(async ([command, args]) => ({ command, ...(await runCheck(folder, [...args])) }))
+    );
+  }
 
   let filesToCheck = relevantFiles ? [...relevantFiles] : [];
   if (filesToCheck.length === 0) {
@@ -187,11 +626,14 @@ export async function collectCompletionLint(folder: string, relevantFiles?: read
     : issues.length === 0 ? "No linting issues found." : `${issues.length} lint issue(s) remain.`;
   const summary = missingScripts.length > 0
     ? `${baseSummary} (${missingScripts.join("/")} script(s) not configured — add them to package.json's ` +
-      `"scripts" to enable publish checks for them.)`
+      `"scripts" to enable publish checks for them. Checks are inconclusive, not passed.)`
     : baseSummary;
   return {
     runAt: new Date().toISOString(),
-    passed: issueCount === 0,
+    // An undetected toolchain is never a pass: with a required check
+    // inconclusive (missing lint/test script), the run cannot report passed
+    // even when everything that could run came back clean.
+    passed: issueCount === 0 && missingScripts.length === 0,
     issueCount,
     summary,
     failedChecks: commandFailures.map(({ command, code, output }) => ({ command, exitCode: code, output })),
@@ -211,9 +653,25 @@ function renderCompletionChecksSection(
   override?: { reason: string }
 ): string {
   const lines: string[] = [PUBLISH_CHECKS_SECTION_START, "## Completion Checks", ""];
-  lines.push(`- Status: ${result.passed ? "Passed" : "Failed"}`);
+  const status = result.passed
+    ? "Passed"
+    : result.issueCount > 0
+      ? "Failed"
+      : "Inconclusive (required checks could not run)";
+  lines.push(`- Status: ${status}`);
   lines.push(`- Last run: ${result.runAt}`);
+  if (result.verifiedFolder) {
+    lines.push(`- Verified against: ${result.verifiedFolder}`);
+  }
   lines.push(`- Summary: ${result.summary}`);
+  if (result.missingScripts.length > 0) {
+    lines.push("", "### Inconclusive checks");
+    for (const script of result.missingScripts) {
+      lines.push(
+        `- \`${script}\`: **inconclusive** — no \`${script}\` script is configured in the verified package.json, so this check could not run (an undetected toolchain is never a pass).`
+      );
+    }
+  }
   if (result.failedChecks.length > 0) {
     lines.push("", "### Failed checks");
     for (const check of result.failedChecks) {
@@ -221,6 +679,23 @@ function renderCompletionChecksSection(
         ? `${check.output.slice(0, PUBLISH_CHECKS_MAX_OUTPUT_CHARS)}\n… (truncated)`
         : check.output;
       lines.push("", `**${check.command}** (exit ${check.exitCode})`, "```", output, "```");
+    }
+  }
+  if (result.planItems && result.planItems.length > 0) {
+    const counts = { passed: 0, failed: 0, inconclusive: 0 };
+    for (const item of result.planItems) {
+      counts[item.status]++;
+    }
+    lines.push(
+      "",
+      "### Plan Item Verification",
+      "",
+      `_AI-assisted completion check of the plan checklist against the implementation (not a completion gate): ${counts.passed} passed, ${counts.failed} failed, ${counts.inconclusive} inconclusive._`,
+      ""
+    );
+    for (const item of result.planItems) {
+      const marker = item.status === "passed" ? "✅ passed" : item.status === "failed" ? "❌ failed" : "❓ inconclusive";
+      lines.push(`- ${marker} — ${item.text}${item.note ? ` _(${item.note})_` : ""}`);
     }
   }
   if (override) {
@@ -280,8 +755,34 @@ export async function upsertCompletionChecksInPublishReview(
 
 /** Persist the latest completion lint result without changing the task stage. */
 export async function runCompletionLint(folderUri: vscode.Uri, relevantFiles?: readonly string[]): Promise<CompletionLintResult> {
-  const workspaceFolder = vscode.workspace.getWorkspaceFolder(folderUri);
-  const result = await collectCompletionLint(workspaceFolder?.uri.fsPath ?? folderUri.fsPath, relevantFiles);
+  // Verify against the task's Publish scope (persisted per task; defaults to
+  // the workspace folder containing the task), never just the task folder.
+  const progress = await readTaskProgress(folderUri);
+  const scope = resolvePublishScopeFolder(folderUri, progress);
+  let scopeFolder = scope.folder;
+  if (scope.stale) {
+    // The persisted scope no longer exists on disk. Silently verifying the
+    // workspace root instead would report results for the wrong project, so
+    // re-prompt for a valid scope; cancelling aborts the check outright.
+    const repicked = await promptAndPersistPublishScope(folderUri, {
+      title: "The saved Publish verification scope no longer exists — choose a new one",
+      currentRelPath: progress?.publishScopePath,
+    });
+    if (!repicked) {
+      throw new Error(
+        `The saved Publish verification scope ("${progress?.publishScopePath ?? ""}") no longer exists. ` +
+          "Choose a valid scope to run the Publish checks against."
+      );
+    }
+    scopeFolder = repicked;
+  }
+  const result = await collectCompletionLint(scopeFolder, relevantFiles, {
+    explicitCommands: getPublishVerificationCommands(),
+  });
+  result.verifiedFolder = scopeFolder;
+  // Plan-item completion is AI-verified against the same scope the lint/test
+  // checks ran in — a checked box in plan-final.md alone never passes.
+  result.planItems = await collectAiVerifiedPlanItems(folderUri, scopeFolder);
   const persisted = await patchTaskProgress(folderUri, (current) => updateLintPayload(current, {
     runAt: result.runAt,
     passed: result.passed,

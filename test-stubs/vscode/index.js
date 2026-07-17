@@ -268,6 +268,20 @@ function notImplemented(name) {
   };
 }
 
+/**
+ * Minimal RelativePattern: only stores base/pattern so modules can construct
+ * one and tests can inspect what was asked for (findFiles below is
+ * test-overridable and defaults to no matches).
+ */
+class RelativePattern {
+  constructor(base, pattern) {
+    this.base = typeof base === "string"
+      ? base
+      : base && base.uri ? base.uri.fsPath : base ? base.fsPath : "";
+    this.pattern = pattern;
+  }
+}
+
 const workspace = {
   fs: {
     readFile: notImplemented("workspace.fs.readFile"),
@@ -290,6 +304,33 @@ const workspace = {
   },
   asRelativePath: (uri) => (uri && uri.path ? uri.path : String(uri)),
   workspaceFolders: undefined,
+  // Real implementation over the test-settable `workspaceFolders` above:
+  // returns the deepest workspace folder containing the uri (case-insensitive
+  // on Windows, like real VS Code), or undefined when none contains it.
+  getWorkspaceFolder: (uri) => {
+    const folders = workspace.workspaceFolders;
+    if (!folders || !uri || !uri.fsPath) return undefined;
+    const normalize = (p) => {
+      const unified = String(p).split("\\").join("/").replace(/\/+$/, "");
+      return process.platform === "win32" ? unified.toLowerCase() : unified;
+    };
+    const target = normalize(uri.fsPath);
+    let best;
+    let bestLength = -1;
+    for (const folder of folders) {
+      const root = normalize(folder.uri.fsPath);
+      if ((target === root || target.startsWith(root + "/")) && root.length > bestLength) {
+        best = folder;
+        bestLength = root.length;
+      }
+    }
+    return best;
+  },
+  // Overridable per test (assign a new async function); the default reports
+  // no matches rather than throwing so commands that merely enumerate
+  // optional candidates (e.g. nested package.json pickers) degrade the same
+  // way an empty workspace would.
+  findFiles: async () => [],
   textDocuments: [],
   openTextDocument: async (uri) => ({ uri, getText: () => "", isDirty: false }),
   createFileSystemWatcher: () => new FileSystemWatcher(),
@@ -407,6 +448,7 @@ const languages = {
 module.exports = {
   Uri,
   FileType,
+  RelativePattern,
   StatusBarAlignment,
   ConfigurationTarget,
   ProgressLocation,

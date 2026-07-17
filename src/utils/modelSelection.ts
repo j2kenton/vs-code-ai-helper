@@ -1,10 +1,10 @@
 import * as vscode from "vscode";
 import {
   getAiModelDefaults,
-  getMetaResourcesPath,
   getModelSettings,
   isProviderEnabled,
 } from "../config/settings";
+import { getConfiguredTaskRoot } from "./taskRoot";
 import { canUseBackup, getBackupModels } from "./modelFallback";
 import { cliCommandExists, resolveCliCommand } from "../runners/cliAgentRunner";
 import {
@@ -17,9 +17,10 @@ import {
   CLI_PROVIDERS,
   type CliProviderId,
   type CliProviderDefinition,
+  parseModelSelection,
   toQualifiedModelId,
 } from "../runners/providers";
-import { AI_MODEL_STAGES, REVIEW_STAGES, TaskStage } from "../types/taskProgress";
+import { AI_MODEL_STAGES, REVIEW_STAGES, STAGE_DISPLAY_NAMES, TaskStage } from "../types/taskProgress";
 import { type DiscoveredCliModel } from "./cliModelDiscovery";
 
 export const TASK_MODEL_CONFIG_FILENAME = "task-models.json";
@@ -146,7 +147,7 @@ export interface TaskModelConflict {
 export async function findTaskModelConflicts(): Promise<TaskModelConflict[]> {
   const conflicts: TaskModelConflict[] = [];
   for (const ws of vscode.workspace.workspaceFolders ?? []) {
-    const metaFolderUri = vscode.Uri.joinPath(ws.uri, getMetaResourcesPath());
+    const metaFolderUri = vscode.Uri.joinPath(ws.uri, getConfiguredTaskRoot());
 
     let tasks;
     try {
@@ -229,6 +230,52 @@ export async function resolveModelForStage(
   }
 
   return { source: "none" };
+}
+
+/**
+ * Run-time guard for launching a stage: a stage with no configured model —
+ * or whose configured model belongs to a provider that is currently
+ * disabled in Provider Selection — must not run silently. Shows a warning
+ * and opens the AI Models configuration instead. The stored model id is
+ * never touched (disabled-provider selections are preserved byte-for-byte);
+ * the stage is merely treated as unconfigured at run time.
+ *
+ * Returns true when the stage has a usable model and the caller may proceed.
+ */
+export async function ensureStageModelConfigured(
+  taskFolderUri: vscode.Uri,
+  stage: TaskStage
+): Promise<boolean> {
+  if (!isConfigurableStage(stage)) {
+    return true;
+  }
+  const resolved = await resolveModelForStage(taskFolderUri, stage, {
+    ignoreActiveFallback: true,
+  });
+  const stageName = STAGE_DISPLAY_NAMES[stage];
+  if (!resolved.modelId) {
+    // Copilot resolution can still pick a model automatically; only warn
+    // when there is genuinely nothing configured AND no Copilot fallback.
+    // resolveModelForStage returning source "none" means nothing configured.
+    if (resolved.source === "none") {
+      void vscode.window.showWarningMessage(
+        `No AI model is configured for the ${stageName} stage. Configure one in AI Models.`
+      );
+      void vscode.commands.executeCommand("vs-code-ai-helper.openAiModels");
+      return false;
+    }
+    return true;
+  }
+  const parsed = parseModelSelection(resolved.modelId);
+  if (parsed.provider !== "copilot" && !isProviderEnabled(parsed.provider)) {
+    void vscode.window.showWarningMessage(
+      `The model configured for the ${stageName} stage (${resolved.modelId}) belongs to a disabled provider. ` +
+        "Enable the provider or choose another model in AI Models."
+    );
+    void vscode.commands.executeCommand("vs-code-ai-helper.openAiModels");
+    return false;
+  }
+  return true;
 }
 
 /**

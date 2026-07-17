@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import { TASKS_VIEW_ID } from "../views/taskTreeProvider";
+import { STATUS_VIEW_ID } from "../views/statusView";
 import { TaskOperationRegistry } from "./taskOperations";
 
 /**
@@ -40,10 +40,10 @@ export class ViewProgressBinder implements vscode.Disposable {
         const idle = new Promise<void>((r) => {
           this.resolveIdle = r;
         });
-        // Notifications already show their own persistent operation row and
-        // spinner. A view-level progress bar there duplicates that state and
-        // produces a distracting blue line; keep the single task-view bar.
-        void vscode.window.withProgress({ location: { viewId: TASKS_VIEW_ID } }, () => idle);
+        // The horizontal progress animation lives on the Notifications view
+        // (where the running-operation rows already are), NOT the tasks
+        // area — per-row spinners in the Tasks view are untouched.
+        void vscode.window.withProgress({ location: { viewId: STATUS_VIEW_ID } }, () => idle);
       }, this.showDelayMs);
     } else if (!busy) {
       if (this.showTimer) {

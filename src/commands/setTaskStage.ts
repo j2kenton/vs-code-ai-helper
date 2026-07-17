@@ -11,6 +11,7 @@ import { resolveTaskContext, ResolvedTaskContext } from "../utils/resolveTaskCon
 import { advanceStage, AUTO_REVIEW_ELIGIBLE_KINDS, TransitionKind } from "../utils/stageTransition";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { runCompletionLint } from "../utils/completionLint";
+import { ensureStageModelConfigured } from "../utils/modelSelection";
 import { pickReopenStage, reopenCompletedTask } from "../utils/reopenTask";
 
 /**
@@ -264,6 +265,12 @@ export async function setTaskStage(
   // disk. Passing only canonicalId would fall through to the QuickPick
   // because normalizeReviewArg cannot construct a folderUri from a canonicalId.
   if (transitionResult.shouldAutoReview) {
+    // Run-time model guard: entering a review stage with no configured
+    // model (or a disabled provider) alerts and opens AI Models instead of
+    // silently kicking off a run that would fail.
+    if (!(await ensureStageModelConfigured(taskFolderUri, newStage))) {
+      return;
+    }
     await vscode.commands.executeCommand("vs-code-ai-helper.runReviewWithAI", {
       taskFolderPath: task.taskFolderPath,
     });

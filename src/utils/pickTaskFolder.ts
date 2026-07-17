@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import { getMetaResourcesPath } from "../config/settings";
+import { getConfiguredTaskRoot } from "./taskRoot";
 import { findIncompleteTasks } from "./taskProgressUtils";
 import { STAGE_DISPLAY_NAMES, TaskStage } from "../types/taskProgress";
 
@@ -26,7 +26,7 @@ export async function pickTaskFolder(
 
   const metaFolderUri = vscode.Uri.joinPath(
     workspaceRoot.uri,
-    getMetaResourcesPath()
+    getConfiguredTaskRoot()
   );
 
   const allTasks = await findIncompleteTasks(metaFolderUri);

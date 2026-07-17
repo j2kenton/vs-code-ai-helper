@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import { getMetaResourcesPath } from "../config/settings";
+import { getConfiguredTaskRoot } from "../utils/taskRoot";
 import { TASK_FILENAME } from "../types/taskProgress";
 import { findAllTasks, IncompleteTask } from "../utils/taskProgressUtils";
 import {
@@ -34,7 +34,7 @@ export async function viewTask(arg?: ViewTaskArg): Promise<void> {
 
   const metaFolderUri = vscode.Uri.joinPath(
     workspaceRoot.uri,
-    getMetaResourcesPath()
+    getConfiguredTaskRoot()
   );
 
   // If invoked from tree with a specific task, open directly
@@ -88,7 +88,7 @@ export async function viewPlan(arg?: ViewPlanArg): Promise<void> {
 
   const metaFolderUri = vscode.Uri.joinPath(
     workspaceRoot.uri,
-    getMetaResourcesPath()
+    getConfiguredTaskRoot()
   );
 
   // If invoked from tree with a specific task, open directly

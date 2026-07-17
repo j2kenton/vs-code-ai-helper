@@ -4,10 +4,10 @@
  * Review artifacts must include a top-level line in this exact form:
  *   Readiness: N/10
  *
- * Scores map to:
- *   8-10 -> green positive  (thumbs-up)
- *   5-7  -> yellow caution  (question)
- *   0-4  -> red negative    (thumbs-down)
+ * Scores map to regular ticks/arrows (not thumbs/question glyphs):
+ *   8-10 -> green positive  (check)
+ *   5-7  -> yellow caution  (arrow-right)
+ *   0-4  -> red negative    (arrow-down)
  */
 
 export interface ReadinessResult {
@@ -60,7 +60,7 @@ export function parseReadiness(content: string): ReadinessResult {
     return {
       score,
       label: `${score}/10`,
-      icon: "thumbsup",
+      icon: "check",
       colorKey: "charts.green",
     };
   }
@@ -68,14 +68,14 @@ export function parseReadiness(content: string): ReadinessResult {
     return {
       score,
       label: `${score}/10`,
-      icon: "question",
+      icon: "arrow-right",
       colorKey: "charts.yellow",
     };
   }
   return {
     score,
     label: `${score}/10`,
-    icon: "thumbsdown",
+    icon: "arrow-down",
     colorKey: "charts.red",
   };
 }

@@ -7,10 +7,16 @@ import {
   updateLintPayload,
 } from "../utils/taskProgressUtils";
 import { NotificationRouter } from "../utils/notificationRouter";
-import { runCompletionLint } from "../utils/completionLint";
+import {
+  runCompletionLint,
+  resolvePublishScopeFolder,
+} from "../utils/completionLint";
 import { renderPromptTemplate } from "../utils/promptTemplates";
 import { generateContextPack } from "../utils/contextPack";
-import { resolveFreshModelForStage } from "../utils/modelSelection";
+import {
+  ensureStageModelConfigured,
+  resolveFreshModelForStage,
+} from "../utils/modelSelection";
 import { runImplementationForModel } from "../runners/runnerRegistry";
 import { checkAndConfirmPromptSize } from "../utils/promptSizeGuard";
 import { ensureAiConsent } from "../utils/aiConsent";
@@ -51,39 +57,43 @@ function normalizeArg(node: RunLintingFixesArg | undefined): {
 }
 
 /**
- * Check if a file URI is inside the task folder.
+ * Check if a file URI is inside the given folder (the task's resolved
+ * Publish verification scope).
  * Uses proper path boundary checking to avoid false positives.
  * Case normalization is applied on Windows only for drive-letter compatibility.
  */
-function isFileInTaskFolder(fileUri: vscode.Uri, taskFolderPath: string): boolean {
+function isFileInFolder(fileUri: vscode.Uri, folderPath: string): boolean {
   const filePath = fileUri.fsPath;
 
   // Normalize separators first
   const normalizedFilePath = filePath.replace(/\\/g, "/");
-  const normalizedTaskPath = taskFolderPath.replace(/\\/g, "/");
+  const normalizedFolderPath = folderPath.replace(/\\/g, "/");
 
   // Apply case normalization on Windows only
   const isCaseSensitive = process.platform !== "win32";
   const compareFilePath = isCaseSensitive
     ? normalizedFilePath
     : normalizedFilePath.toLowerCase();
-  const compareTaskPath = isCaseSensitive
-    ? normalizedTaskPath
-    : normalizedTaskPath.toLowerCase();
+  const compareFolderPath = isCaseSensitive
+    ? normalizedFolderPath
+    : normalizedFolderPath.toLowerCase();
 
-  // Ensure task path ends with separator for boundary-safe comparison
-  const taskPathWithSeparator = compareTaskPath.endsWith("/")
-    ? compareTaskPath
-    : compareTaskPath + "/";
+  // Ensure folder path ends with separator for boundary-safe comparison
+  const folderPathWithSeparator = compareFolderPath.endsWith("/")
+    ? compareFolderPath
+    : compareFolderPath + "/";
 
-  return compareFilePath.startsWith(taskPathWithSeparator) ||
-         compareFilePath === compareTaskPath;
+  return compareFilePath.startsWith(folderPathWithSeparator) ||
+         compareFilePath === compareFolderPath;
 }
 
 /**
- * Run linting and automatically fix issues for a completed task.
- * This is intended to be run on tasks in the "completed" stage to ensure
- * code quality before committing.
+ * Second Publish action: fix the issues the latest Publish-checks report
+ * (persisted lint payload + publish-review.md, produced by runPublishChecks)
+ * identified. Applies editor autofixes first, then hands remaining failures
+ * to the Publish-stage AI agent, and re-runs the checks afterwards so the
+ * report reflects the post-fix state. It never runs the initial checks
+ * itself — with no report yet, it directs the user to the first action.
  *
  * When `parentOperation` is supplied (the publish flow's "Fix with AI"
  * choice), the fix run registers as a child of that operation (C1 nesting):
@@ -120,7 +130,70 @@ export async function runLintingFixes(
     return;
   }
 
+  // Fix what the LAST Publish-checks report found — this action never runs
+  // the initial checks itself. The first Publish action (runPublishChecks)
+  // produces the report; checks re-run here only AFTER fixes, to verify them
+  // and refresh the report. Gated before the tracked operation so the
+  // "Run Publish Checks" fallback never contends with this action's own
+  // exclusive task lock.
+  const lastReport = resolvedTask.progress.lintPayload;
+  if (!lastReport) {
+    const choice = await vscode.window.showWarningMessage(
+      "No Publish report found. Run the Publish checks first to generate " +
+        "the report this action fixes.",
+      "Run Publish Checks"
+    );
+    if (choice === "Run Publish Checks") {
+      await vscode.commands.executeCommand(
+        "vs-code-ai-helper.runPublishChecks",
+        { taskFolderPath: resolvedTask.taskFolderPath }
+      );
+    }
+    return;
+  }
+  if (lastReport.passed) {
+    NotificationRouter.showInformation(
+      "The latest Publish checks passed — there is nothing to fix. " +
+        "Re-run the Publish checks if files changed since the last report."
+    );
+    return;
+  }
+
   const taskFolderUri = vscode.Uri.file(resolvedTask.taskFolderPath);
+
+  // The inline tree button invokes this command directly (not through
+  // applyCurrentStageAction), so the run-time model guard must live here
+  // too — and before any mutation: with no Publish model configured, or
+  // its provider disabled, the action must warn and open AI Models rather
+  // than autofix/format files first and only fail at the AI pass.
+  if (!(await ensureStageModelConfigured(taskFolderUri, "publish"))) {
+    return;
+  }
+
+  // Deterministic autofixes and the diagnostics handed to the AI pass are
+  // limited to the same Publish verification scope the report was produced
+  // against — never the whole workspace, which in a monorepo would autofix
+  // unrelated packages. A stale persisted scope is re-established through
+  // the first action (which re-prompts for a valid one), not silently
+  // widened to the workspace root. Resolved before the tracked operation so
+  // the fallback dispatch below never contends with this action's own lock.
+  const scope = resolvePublishScopeFolder(taskFolderUri, resolvedTask.progress);
+  if (scope.stale) {
+    const choice = await vscode.window.showWarningMessage(
+      "The saved Publish verification scope no longer exists. Re-run the " +
+        "Publish checks to choose a new scope before applying fixes.",
+      "Run Publish Checks"
+    );
+    if (choice === "Run Publish Checks") {
+      await vscode.commands.executeCommand(
+        "vs-code-ai-helper.runPublishChecks",
+        { taskFolderPath: resolvedTask.taskFolderPath }
+      );
+    }
+    return;
+  }
+  const fixScopeFolder = scope.folder;
+
   const lockKey = taskFolderUri.fsPath;
   const persistLintState = async (
     passed: boolean,
@@ -150,13 +223,13 @@ export async function runLintingFixes(
           try {
             progress.report({ message: "Checking for linting errors..." });
 
-            // Check if there are any TypeScript/JavaScript files with problems in the task folder
+            // Check for TypeScript/JavaScript files with problems inside the
+            // task's Publish verification scope
             const diagnostics = vscode.languages.getDiagnostics();
-            const taskFolderPath = vscode.workspace.getWorkspaceFolder(taskFolderUri)?.uri.fsPath ?? resolvedTask.taskFolderPath;
 
             const lintingIssues = diagnostics.filter(([uri, diags]) => {
-              // Only include diagnostics for files inside the task folder
-              if (!isFileInTaskFolder(uri, taskFolderPath)) {
+              // Only include diagnostics for files inside the Publish scope
+              if (!isFileInFolder(uri, fixScopeFolder)) {
                 return false;
               }
 
@@ -169,13 +242,6 @@ export async function runLintingFixes(
             });
 
             const relevantFiles = resolvedTask.progress.implReviewFiles;
-            const initialLint = await runCompletionLint(taskFolderUri, relevantFiles);
-            if (initialLint.passed) {
-              NotificationRouter.showInformation(
-                "No linting issues found in the task folder. Your code looks good!"
-              );
-              return;
-            }
 
             progress.report({ message: "Applying automatic fixes..." });
 
@@ -215,7 +281,7 @@ export async function runLintingFixes(
             const remainingLintIssues = vscode.languages
               .getDiagnostics()
               .filter(([uri, diags]) => {
-                if (!isFileInTaskFolder(uri, taskFolderPath)) {
+                if (!isFileInFolder(uri, fixScopeFolder)) {
                   return false;
                 }
                 return diags.some(
@@ -230,13 +296,17 @@ export async function runLintingFixes(
 
             if (!postFixLint.passed) {
 
-              // Automatic editor fixes are only the first pass. Give the configured
-              // implementation agent the remaining diagnostics so it can make
+              // Automatic editor fixes are only the first pass. Give the
+              // Publish-stage agent the remaining diagnostics so it can make
               // focused edits while the task remains completed.
               const workspaceFolder = vscode.workspace.getWorkspaceFolder(taskFolderUri);
               if (workspaceFolder) {
-                const model = await resolveFreshModelForStage(taskFolderUri, "impl");
-                const postFixDiagnostics = vscode.languages.getDiagnostics().filter(([uri, ds]) => isFileInTaskFolder(uri, taskFolderPath) && ds.some((d) => d.source === "eslint" || d.source === "ts" || d.source === "typescript"));
+                // This is a Publish-stage action, so the AI fix pass runs with
+                // the model configured for the Publish stage — a user who set
+                // a specialized Publish model must not have their lint/test
+                // fixes run by the unrelated Implementation model.
+                const model = await resolveFreshModelForStage(taskFolderUri, "publish");
+                const postFixDiagnostics = vscode.languages.getDiagnostics().filter(([uri, ds]) => isFileInFolder(uri, fixScopeFolder) && ds.some((d) => d.source === "eslint" || d.source === "ts" || d.source === "typescript"));
                 const lint = JSON.stringify({
                   summary: postFixLint.summary,
                   issueCount: postFixLint.issueCount,
@@ -246,16 +316,16 @@ export async function runLintingFixes(
                 }, null, 2);
                 const contextPack = await generateContextPack(taskFolderUri, workspaceFolder.uri);
                 const prompt = await renderPromptTemplate(extensionUri, "final-fixes-code.md", { lint, contextPack });
-                const sizeCheck = await checkAndConfirmPromptSize(prompt, "the configured implementation agent");
+                const sizeCheck = await checkAndConfirmPromptSize(prompt, "the configured Publish-stage agent");
                 if (sizeCheck === "ok" || sizeCheck === "confirmed") {
                   if (!context || !(await ensureAiConsent(context))) {
                     return;
                   }
                   let result: Awaited<ReturnType<typeof runImplementationForModel>> | undefined;
                   await vscode.window.withProgress({ location: vscode.ProgressLocation.Window, title: "Applying AI final fixes...", cancellable: true }, async (aiProgress, token) => {
-                    // `model` is resolved from the "impl" stage above — fallback
-                    // bookkeeping must use that same stage, not "publish".
-                    result = await runImplementationForModel({ modelId: model.modelId, prompt, workspaceUri: workspaceFolder.uri, token, stage: "impl", taskFolderUri: taskFolderUri, onProgress: (message) => aiProgress.report({ message }) });
+                    // `model` is resolved from the "publish" stage above —
+                    // fallback bookkeeping must use that same stage.
+                    result = await runImplementationForModel({ modelId: model.modelId, prompt, workspaceUri: workspaceFolder.uri, token, stage: "publish", taskFolderUri: taskFolderUri, onProgress: (message) => aiProgress.report({ message }) });
                   });
                   if (result?.status === "completed") {
                     await runCompletionLint(taskFolderUri, relevantFiles);
@@ -279,7 +349,7 @@ export async function runLintingFixes(
 
             if (fixedCount > 0) {
               NotificationRouter.showInformation(
-                `Linting fixes applied to ${fixedCount} file(s) in the task folder!` +
+                `Linting fixes applied to ${fixedCount} file(s) in the Publish scope!` +
                 (failedCount > 0 ? ` (${failedCount} file(s) could not be fixed automatically)` : "")
               );
             } else {

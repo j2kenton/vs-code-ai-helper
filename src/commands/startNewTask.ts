@@ -13,6 +13,7 @@ import { activateTask } from "../state/taskActivationCoordinator";
 import { withMetaRootLock } from "../state/taskStateStore";
 import { safeOpenTextDocument } from "../utils/fileUtils";
 import { runTrackedOperation } from "../utils/taskOperations";
+import { ensureAutomaticMetaGitIgnore } from "./toggleMetaResourcesGitIgnore";
 
 /**
  * Format a date as YYYY-MM-DD
@@ -132,7 +133,8 @@ function normalizePath(p: string): string {
 export async function startNewTask(
   inventory: TaskInventory,
   extensionUri: vscode.Uri,
-  currentTaskStore: CurrentTaskStore
+  currentTaskStore: CurrentTaskStore,
+  context?: vscode.ExtensionContext
 ): Promise<string | undefined> {
   const workspaceFolders = vscode.workspace.workspaceFolders ?? [];
   const workspaceRoot = workspaceFolders.length <= 1
@@ -158,7 +160,7 @@ export async function startNewTask(
     return await runTrackedOperation(
       workspaceRoot.uri.fsPath,
       { label: "Create Task", taskName: workspaceRoot.name, kind: "create-task" },
-      (op) => createTask(inventory, extensionUri, currentTaskStore, workspaceRoot, op)
+      (op) => createTask(inventory, extensionUri, currentTaskStore, workspaceRoot, op, context)
     );
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -174,7 +176,8 @@ async function createTask(
   extensionUri: vscode.Uri,
   currentTaskStore: CurrentTaskStore,
   workspaceRoot: vscode.WorkspaceFolder,
-  op: { report(detail: string | undefined): void }
+  op: { report(detail: string | undefined): void },
+  context?: vscode.ExtensionContext
 ): Promise<string> {
   // Resolve the task root, creating it if needed
   const metaFolderPath = await resolveTaskRootForCreation(workspaceRoot);
@@ -221,6 +224,21 @@ async function createTask(
     return { taskFolderName, taskFolderPath, taskFileUri };
   });
   const { taskFolderName, taskFolderPath, taskFileUri } = created;
+
+  // Activation only runs Git-ignore maintenance when the inventory already
+  // holds tasks, so the very first creation in a fresh workspace must apply
+  // the managed block itself or the new `.ensemble` resources would show up
+  // as unignored Git changes until the next reload. The selected workspace
+  // folder is passed explicitly: in a multi-root workspace the task may live
+  // in a repository other than the first folder's. Non-fatal: a gitignore
+  // failure must not fail the task creation that already succeeded.
+  if (context) {
+    try {
+      await ensureAutomaticMetaGitIgnore(context, workspaceRoot);
+    } catch (err) {
+      console.error("Automatic meta .gitignore maintenance failed", err);
+    }
+  }
 
   // Refresh inventory so the new task is discoverable
   await inventory.refresh();
@@ -274,7 +292,7 @@ export function registerStartNewTaskCommand(
 ): void {
   const disposable = vscode.commands.registerCommand(
     "vs-code-ai-helper.startNewTask",
-    () => startNewTask(inventory, context.extensionUri, currentTaskStore)
+    () => startNewTask(inventory, context.extensionUri, currentTaskStore, context)
   );
   context.subscriptions.push(disposable);
 }

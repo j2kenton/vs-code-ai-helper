@@ -32,6 +32,8 @@ function isOperationNode(node: StatusTreeNode): node is StatusOperationNode {
 
 const STATUS_STATE_KEY = "ensemble.notifications";
 const RUNNING_OPERATIONS_STATE_KEY = "ensemble.runningOperations";
+const LEVEL_FILTER_STATE_KEY = "ensemble.notificationLevelFilter";
+const ALL_LEVELS: ReadonlyArray<StatusEntry["level"]> = ["info", "warning", "error"];
 /** Label text above this length is truncated with an ellipsis; the full text is still in the hover tooltip. */
 const LABEL_TRUNCATE_LENGTH = 150;
 
@@ -42,8 +44,19 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
   private entries: StatusEntry[];
   private writes: Promise<void> = Promise.resolve();
   private readonly operationsSub: vscode.Disposable;
+  /** Which notification levels are shown; all by default. */
+  private levelFilter: Set<StatusEntry["level"]>;
 
   constructor(private readonly state?: vscode.Memento) {
+    const savedFilter = state?.get<string[]>(LEVEL_FILTER_STATE_KEY);
+    this.levelFilter = new Set(
+      Array.isArray(savedFilter)
+        ? (savedFilter.filter((l): l is StatusEntry["level"] => (ALL_LEVELS as readonly string[]).includes(l)))
+        : ALL_LEVELS
+    );
+    if (this.levelFilter.size === 0) {
+      this.levelFilter = new Set(ALL_LEVELS);
+    }
     const persisted = state?.get<Array<Omit<StatusEntry, "timestamp"> & { timestamp: string }>>(STATUS_STATE_KEY, []) ?? [];
     // Notifications persist for the lifetime of this workspace with no
     // retention limit — the user only clears them explicitly via Clear All.
@@ -103,6 +116,25 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
     this.persist();
     this.refresh();
     void vscode.commands.executeCommand("vs-code-ai-helper.statusView.focus").then(undefined, () => undefined);
+  }
+
+  /**
+   * QuickPick for filtering notifications by type (info / warning / error).
+   * Running-operation rows are never filtered out.
+   */
+  async chooseLevelFilter(): Promise<void> {
+    const picked = await vscode.window.showQuickPick(
+      ALL_LEVELS.map((level) => ({
+        label: level[0]!.toUpperCase() + level.slice(1),
+        picked: this.levelFilter.has(level),
+        level,
+      })),
+      { canPickMany: true, title: "Filter notifications by type", placeHolder: "Select the notification types to show" }
+    );
+    if (!picked) return;
+    this.levelFilter = picked.length === 0 ? new Set(ALL_LEVELS) : new Set(picked.map((item) => item.level));
+    await this.state?.update(LEVEL_FILTER_STATE_KEY, [...this.levelFilter]);
+    this.refresh();
   }
 
   /**
@@ -211,7 +243,7 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
         detail: op.detail,
         cancellable: op.cancellable,
       }));
-      return [...runningNodes, ...this.entries];
+      return [...runningNodes, ...this.entries.filter((entry) => this.levelFilter.has(entry.level))];
     }
     return [];
   }

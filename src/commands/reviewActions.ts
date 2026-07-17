@@ -2,10 +2,8 @@ import * as vscode from "vscode";
 import * as path from "path";
 import * as crypto from "crypto";
 
-import {
-  allowsDirtyWorktreeChanges,
-  getMetaResourcesPath,
-} from "../config/settings";
+import { allowsDirtyWorktreeChanges } from "../config/settings";
+import { getConfiguredTaskRoot } from "../utils/taskRoot";
 import {
   taskOperations,
   runTrackedOperation,
@@ -443,7 +441,7 @@ async function resolveTask(
   const combinedTasks: IncompleteTask[] = [];
   for (const wsFolder of allWorkspaceFolders) {
     // Attempt to discover tasks using the configured path, or the default meta root.
-    const metaFolderUri = vscode.Uri.joinPath(wsFolder.uri, getMetaResourcesPath());
+    const metaFolderUri = vscode.Uri.joinPath(wsFolder.uri, getConfiguredTaskRoot());
 
     try {
       const wsTasks = await findAllTasks(metaFolderUri);
@@ -1136,6 +1134,33 @@ export async function runReviewForFolder(
             const transition = await advanceStage(folderUri, targetStage, next, false, "auto-advance", true, reviewAttemptId, publishArtifact);
             if (transition?.persisted) {
               NotificationRouter.showInformation(`Review accepted. Advanced to ${STAGE_DISPLAY_NAMES[next]}.`);
+              // Auto-advancing into Implementation must also start the
+              // implementation itself (which generates the checklist first
+              // when absent). runImplementationWithAI claims the task's
+              // exclusive operation lock, which this review still holds — so
+              // dispatch it once this root operation has ended successfully.
+              if (next === "impl") {
+                const rootOperationId = options.operation?.id;
+                if (rootOperationId) {
+                  const endSub = taskOperations.onDidEnd((snapshot) => {
+                    if (snapshot.id !== rootOperationId) {
+                      return;
+                    }
+                    endSub.dispose();
+                    if (snapshot.state === "succeeded") {
+                      void vscode.commands.executeCommand(
+                        "vs-code-ai-helper.runImplementationWithAI",
+                        { taskFolderPath: folderUri.fsPath }
+                      );
+                    }
+                  });
+                } else {
+                  void vscode.commands.executeCommand(
+                    "vs-code-ai-helper.runImplementationWithAI",
+                    { taskFolderPath: folderUri.fsPath }
+                  );
+                }
+              }
               // Auto-advancing into another review stage must itself kick off
               // that stage's review — otherwise the task silently sits on a
               // freshly-entered review stage with nothing running, which is
@@ -2028,7 +2053,8 @@ export async function nextStage(
   //     in extension.ts; we do not need to call inventory.refresh() here since
   //     patchTaskProgress writes task-progress.json, which the watcher picks up.
   //   post-completion helper actions — (no-op in this stage; future: open PR draft)
-  //   persist lint payload — deferred until runLintingFixes is called explicitly
+  //   persist lint payload — runCompletionLint below runs immediately on the
+  //     transition to Publish and persists the payload
   //   refresh final rendered state — inventory watcher handles this
   if (next === "publish") {
     await runCompletionLint(resolved.folderUri, resolved.progress.implReviewFiles);
@@ -2044,7 +2070,10 @@ export async function nextStage(
       return;
     }
     if (next === "impl") {
-      await vscode.commands.executeCommand("vs-code-ai-helper.generateImplementationWithAI", target);
+      // Merged action: "Implement Actual Work" generates the implementation
+      // checklist first when it is absent, then implements — there is no
+      // separate checklist command anymore.
+      await vscode.commands.executeCommand("vs-code-ai-helper.runImplementationWithAI", target);
       return;
     }
     if (next === "publish") {
@@ -2224,6 +2253,13 @@ export async function generateImplementationWithAI(
     });
 
     if (succeeded) {
+      const generatedContent = await readNonEmptyText(implementationUri);
+      if (generatedContent && !generatedContent.includes(IMPLEMENTATION_CHECKLIST_MARKER)) {
+        await writeTextFile(
+          implementationUri,
+          `${IMPLEMENTATION_CHECKLIST_MARKER}\n\n${generatedContent}`
+        );
+      }
       await setStage(resolved.folderUri, "impl");
     }
     }
@@ -2238,6 +2274,16 @@ const IMPLEMENTATION_ELIGIBLE_STAGES: readonly TaskStage[] = [
   "impl-high-review",
   "impl-low-review",
 ];
+
+/**
+ * Marker stamped at the top of plan-final.md once the implementation
+ * checklist has been generated for a task. "Implement Actual Work" checks
+ * for it and generates the checklist first when it is absent (the merged
+ * generate-then-implement behavior); post-run summaries overwrite the file,
+ * so the marker check is additionally limited to first runs (no
+ * implReviewFiles yet) to avoid regenerating over an existing run's output.
+ */
+export const IMPLEMENTATION_CHECKLIST_MARKER = "<!-- ensemble:implementation-checklist -->";
 
 /**
  * Shared core of an implementation run.
@@ -2419,8 +2465,60 @@ async function executeImplementationRun(
     }
 
     await safeOpenTextDocument(implementationUri, "plan-final.md");
+
+    // Auto-advance: a completed implementation proceeds to High-Level Code
+    // Review when auto-advance is enabled, and (via AUTO_REVIEW_TRANSITIONS)
+    // starts that review. Runs before the legacy auto-review-in-place setting
+    // below; when it fires, the legacy path is skipped to avoid a duplicate.
+    let autoAdvancedToHighReview = false;
+    if (isAutoAdvanceEnabled()) {
+      try {
+        const freshProgress = await readTaskProgress(folderUri);
+        if (freshProgress?.currentStage === "impl" && freshProgress.status !== "paused") {
+          const transition = await advanceStage(
+            folderUri,
+            "impl",
+            "impl-high-review",
+            false,
+            "auto-advance"
+          );
+          if (transition?.persisted) {
+            autoAdvancedToHighReview = true;
+            NotificationRouter.showInformation(
+              `Implementation complete. Advanced to ${STAGE_DISPLAY_NAMES["impl-high-review"]}.`
+            );
+            if (transition.shouldAutoReview) {
+              const runHighReview = (operation?: TaskOperationHandle): Promise<void> =>
+                runReviewForFolder(
+                  extensionUri,
+                  folderUri,
+                  workspaceRoot,
+                  "impl-high-review",
+                  true,
+                  { preserveActiveFallback: options.preserveActiveFallback, operation }
+                );
+              if (options.parentOperation) {
+                await runTrackedOperation(
+                  folderUri.fsPath,
+                  { parent: options.parentOperation, label: "Reviewing implementation", stage: "impl-high-review", kind: "review" },
+                  (reviewOp) => runHighReview(reviewOp)
+                );
+              } else {
+                await runHighReview();
+              }
+            }
+          }
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        NotificationRouter.showWarning(
+          `Implementation completed, but auto-advancing to review failed: ${message}. Advance the stage manually.`
+        );
+      }
+    }
+
     // Optional: a completed implementation only starts review when enabled in Settings.
-    if (shouldAutoReviewAfterImplementation()) {
+    if (!autoAdvancedToHighReview && shouldAutoReviewAfterImplementation()) {
       const runPostRunReview = (operation?: TaskOperationHandle): Promise<void> =>
         runReviewForFolder(
           extensionUri,
@@ -2519,12 +2617,64 @@ export async function runImplementationWithAI(
       return;
     }
 
-    const planFinalContent = await readNonEmptyText(canonicalUri);
+    let planFinalContent = await readNonEmptyText(canonicalUri);
     if (!planFinalContent) {
       NotificationRouter.showWarning(
         "No plan-final.md found. Advance to the Implementation stage first."
       );
       return;
+    }
+
+    // Merged checklist behavior: on a task's first implementation run, if
+    // the implementation checklist hasn't been generated yet (no marker in
+    // plan-final.md), generate it first and then implement. Re-runs (which
+    // have implReviewFiles from an earlier run, and whose plan-final.md may
+    // hold a post-run summary) never regenerate.
+    const needsChecklist =
+      !planFinalContent.includes(IMPLEMENTATION_CHECKLIST_MARKER) &&
+      resolved.progress.currentStage === "impl" &&
+      (resolved.progress.implReviewFiles?.length ?? 0) === 0;
+    if (needsChecklist) {
+      const checklistWorkspace = resolveOwnerWorkspace(resolved.progress);
+      if (!checklistWorkspace) {
+        void vscode.window.showErrorMessage(
+          "Could not determine the owning workspace for this task. Please open the workspace that created it."
+        );
+        return;
+      }
+      const checklistContextPack = await generateContextPack(
+        resolved.folderUri,
+        checklistWorkspace.uri
+      );
+      const generated = await runTrackedOperation(
+        resolved.folderUri.fsPath,
+        { parent: op, label: "Generating implementation checklist", stage: "impl", kind: "generate-implementation" },
+        () =>
+          runAiToFile({
+            extensionUri,
+            taskFolderUri: resolved.folderUri,
+            workspaceUri: checklistWorkspace.uri,
+            logStage: "impl",
+            templateFile: "create-implementation.md",
+            variables: { contextPack: checklistContextPack, plan: planFinalContent! },
+            outputFileUri: canonicalUri,
+            progressAction: "Generating implementation checklist",
+            outputLabel: "plan-final.md",
+          })
+      );
+      if (!generated) {
+        // Generation failed or was cancelled; implementing straight from the
+        // raw promoted plan would silently skip the checklist step.
+        return;
+      }
+      const generatedContent = await readNonEmptyText(canonicalUri);
+      if (generatedContent && !generatedContent.includes(IMPLEMENTATION_CHECKLIST_MARKER)) {
+        await writeTextFile(
+          canonicalUri,
+          `${IMPLEMENTATION_CHECKLIST_MARKER}\n\n${generatedContent}`
+        );
+      }
+      planFinalContent = (await readNonEmptyText(canonicalUri)) ?? planFinalContent;
     }
 
     // Resolve implementation model for execution
@@ -2610,17 +2760,43 @@ export function registerReviewActionCommands(
       (node?: TaskNodeArg) =>
         nextStage(context.extensionUri, node)
     ),
-    vscode.commands.registerCommand(
-      "vs-code-ai-helper.generateImplementationWithAI",
-      (arg?: ReviewCommandArg) =>
-        generateImplementationWithAI(context.extensionUri, context, arg)
-    ),
+    // The standalone "Generate Implementation Checklist" command was merged
+    // into "Implement Actual Work": runImplementationWithAI generates the
+    // checklist automatically when it is absent, then implements.
     vscode.commands.registerCommand(
       "vs-code-ai-helper.runImplementationWithAI",
       (arg?: ReviewCommandArg) =>
         runImplementationWithAI(context.extensionUri, context, arg)
     ),
-    vscode.commands.registerCommand("vs-code-ai-helper.release", runRelease)
+    vscode.commands.registerCommand(
+      "vs-code-ai-helper.release",
+      (arg?: TaskNodeArg) => runRelease(context, arg)
+    ),
+    vscode.commands.registerCommand(
+      "vs-code-ai-helper.chooseReleaseTarget",
+      async () => {
+        const folders = vscode.workspace.workspaceFolders ?? [];
+        if (folders.length === 0) {
+          void vscode.window.showWarningMessage("Open a workspace before choosing a release target.");
+          return;
+        }
+        let folder = folders[0];
+        if (folders.length > 1) {
+          const picked = await vscode.window.showWorkspaceFolderPick({
+            placeHolder: "Workspace folder whose release target to change",
+          });
+          if (!picked) { return; }
+          folder = folders.find((f) => f.uri.toString() === picked.uri.toString());
+        }
+        if (!folder) { return; }
+        const chosen = await resolveReleaseTargetPackageJson(context, folder.uri.fsPath, true);
+        if (chosen) {
+          NotificationRouter.showInformation(
+            `Release target set to ${path.relative(folder.uri.fsPath, chosen) || "package.json"}.`
+          );
+        }
+      }
+    )
   );
 }
 
@@ -2651,7 +2827,64 @@ export function isSafeReleaseScript(script: unknown): script is string {
  * failure has already been surfaced to the user. */
 class ReleaseRunFailure extends Error {}
 
-async function runRelease(arg?: TaskNodeArg): Promise<void> {
+/** Name of the required release script in the target package.json. */
+export const RELEASE_SCRIPT_NAME = "ensemble:release";
+
+function releaseTargetStateKey(workspaceRoot: string): string {
+  const normalized = path.resolve(workspaceRoot);
+  return `ensemble.releaseTarget:${process.platform === "win32" ? normalized.toLowerCase() : normalized}`;
+}
+
+/**
+ * Resolve the release-target package.json for a workspace folder: the
+ * explicit workspace-relative package.json path persisted per folder (so a
+ * folder with several releasable packages is unambiguous). When unset — or
+ * when the persisted path no longer exists — the user picks from the
+ * detected package.json files and the choice is stored. `forcePrompt` is the
+ * "change release target" path: always re-prompts, defaulting nothing away.
+ */
+async function resolveReleaseTargetPackageJson(
+  context: vscode.ExtensionContext,
+  workspaceRoot: string,
+  forcePrompt = false
+): Promise<string | undefined> {
+  const key = releaseTargetStateKey(workspaceRoot);
+  const stored = context.workspaceState.get<string>(key);
+  if (stored && !forcePrompt) {
+    const absolute = path.join(workspaceRoot, stored);
+    if (fs.existsSync(absolute)) {
+      return absolute;
+    }
+    // Persisted-but-invalid path: re-prompt rather than silently falling back.
+  }
+
+  const uris = await vscode.workspace.findFiles(
+    new vscode.RelativePattern(workspaceRoot, "**/package.json"),
+    "**/node_modules/**",
+    50
+  );
+  if (uris.length === 0) {
+    void vscode.window.showErrorMessage("No package.json was found in this workspace.");
+    return undefined;
+  }
+  const items = uris
+    .map((uri) => ({
+      label: path.relative(workspaceRoot, uri.fsPath) || "package.json",
+      uri,
+    }))
+    .sort((a, b) => a.label.length - b.label.length);
+  const picked = await vscode.window.showQuickPick(items, {
+    title: "Select the package.json to release",
+    placeHolder: `The chosen file must define a "${RELEASE_SCRIPT_NAME}" script; the choice is remembered for this workspace folder`,
+  });
+  if (!picked) {
+    return undefined;
+  }
+  await context.workspaceState.update(key, path.relative(workspaceRoot, picked.uri.fsPath));
+  return picked.uri.fsPath;
+}
+
+async function runRelease(context: vscode.ExtensionContext, arg?: TaskNodeArg): Promise<void> {
   const candidate = arg?.task?.folderUri.fsPath;
   if (!candidate) {
     void vscode.window.showWarningMessage("Release is available only from a task's Publish stage.");
@@ -2687,76 +2920,68 @@ async function runRelease(arg?: TaskNodeArg): Promise<void> {
     candidate,
     { label: "Release", taskName: arg?.task?.folderName ?? path.basename(candidate), kind: "release" },
     async () => {
+    // The release target is the explicit, per-workspace-folder persisted
+    // package.json path (see resolveReleaseTargetPackageJson) — it may be a
+    // nested package and can differ from any task's Publish verification
+    // scope. A persisted-but-invalid path re-prompts.
+    const packageJsonPath = await resolveReleaseTargetPackageJson(context, root);
+    if (!packageJsonPath) { return; }
+    const packageDir = path.dirname(packageJsonPath);
+
     let pkg: { scripts?: Record<string, unknown> };
     try {
-      const parsed: unknown = JSON.parse(Buffer.from(await vscode.workspace.fs.readFile(vscode.Uri.file(`${root}/package.json`))).toString("utf8"));
+      const parsed: unknown = JSON.parse(await fs.promises.readFile(packageJsonPath, "utf8"));
       if (!parsed || typeof parsed !== "object") throw new Error("package.json is not an object");
       pkg = parsed as { scripts?: Record<string, unknown> };
     }
-    catch { void vscode.window.showErrorMessage("No valid package.json was found."); return; }
-    const script = pkg.scripts?.release;
-    if (!isSafeReleaseScript(script)) { void vscode.window.showErrorMessage("Release requires a safe package.json release script."); return; }
-    if (!vscode.workspace.isTrusted) { void vscode.window.showErrorMessage("Release requires a trusted workspace."); return; }
-    const manager = fs.existsSync(`${root}/pnpm-lock.yaml`) ? "pnpm" : fs.existsSync(`${root}/yarn.lock`) ? "yarn" : fs.existsSync(`${root}/bun.lockb`) ? "bun" : "npm";
-    const scriptHash = crypto.createHash("sha256").update(script).digest("hex");
-    const commandText = `${manager} run release`;
-    const confirmation = await vscode.window.showWarningMessage(`Run release?\n\nCommand: ${commandText}\nWorking directory: ${root}\nPackage manager: ${manager}\nScript: ${script}\nSHA-256: ${scriptHash}`, { modal: true }, "Run Release");
-    if (confirmation !== "Run Release") return;
-    // Re-read immediately before spawning so a package.json edit cannot change
-    // the reviewed release command between confirmation and execution.
-    const currentPackage = JSON.parse(await fs.promises.readFile(`${root}/package.json`, "utf8")) as { scripts?: Record<string, unknown> };
-    if (currentPackage.scripts?.release !== script) { void vscode.window.showErrorMessage("The release script changed after confirmation; release was cancelled."); return; }
-    await fs.promises.writeFile(path.join(candidate, "release-operation.json"), JSON.stringify({ command: commandText, cwd: root, packageManager: manager, script, scriptSha256: scriptHash, startedAt: new Date().toISOString() }, null, 2), "utf8");
-    // Delegate to the package manager's own "run release" — never the script
-    // text itself — so the release regex above is a display sanity check, not
-    // the security boundary. `args` are fixed literals (never user input), so
-    // `shell: true` on Windows is safe here and is Node's own documented,
-    // security-patched way to launch a manager that may be a .cmd/.bat shim
-    // (pnpm/yarn/npm) or a native .exe (bun) without hand-rolling a cmd.exe
-    // wrapper — the previous manual `cmd.exe /d /s /c "<manager>.cmd run
-    // release"` reimplementation both duplicated that patched escaping logic
-    // and broke bun releases on Windows (bun ships bun.exe, not bun.cmd).
-    const args = ["run", "release"];
-    // Pin the manager resolved after confirmation. Do not use a shell: PATH
-    // shadowing or a changed shim must not silently change the executable.
-    let managerPath: string;
-    try {
-      const locator = process.platform === "win32" ? "where.exe" : "which";
-      const candidates = cp.execFileSync(locator, [manager], { cwd: root, windowsHide: true })
-        .toString("utf8").split(/\r?\n/).map(value => value.trim()).filter(Boolean);
-      // where.exe also matches extension-less POSIX shim scripts (e.g. npm's
-      // global `pnpm` file alongside `pnpm.CMD`), and lists them ahead of the
-      // real Windows-executable shim in some npm installs. Node can't spawn
-      // an extension-less file directly on Windows (ENOENT), so prefer a
-      // .cmd/.bat/.exe match when one exists rather than blindly taking the
-      // first line.
-      managerPath = (process.platform === "win32"
-        ? candidates.find(value => /\.(cmd|bat|exe)$/i.test(value)) ?? candidates[0]
-        : candidates[0]) ?? "";
-      if (!managerPath || !path.isAbsolute(managerPath)) throw new Error("package manager was not resolved to an absolute path");
-    } catch (error) {
-      void vscode.window.showErrorMessage(`Release cancelled: could not resolve ${manager} safely (${error instanceof Error ? error.message : String(error)}).`);
+    catch { void vscode.window.showErrorMessage("No valid package.json was found at the selected release target."); return; }
+    const script = pkg.scripts?.[RELEASE_SCRIPT_NAME];
+    if (script === undefined) {
+      void vscode.window.showErrorMessage(
+        `Release requires a "${RELEASE_SCRIPT_NAME}" script in ${path.relative(root, packageJsonPath) || "package.json"}. ` +
+          `Add one, e.g. "${RELEASE_SCRIPT_NAME}": "npm run release", then try again.`
+      );
       return;
     }
-    const resolvedBeforeSpawn = managerPath;
-    const failureMessage = await new Promise<string | undefined>(resolve => {
-      const child = cp.spawn(resolvedBeforeSpawn, args, { cwd: root, shell: process.platform === "win32" && /\.(cmd|bat)$/i.test(resolvedBeforeSpawn), windowsHide: true });
-      // A failed spawn fires "error" AND "close" — report exactly once, with
-      // the spawn error (the exit code from that "close" is meaningless).
-      let spawnError: Error | undefined;
-      child.on("error", e => { spawnError = e; resolve(`Release failed: ${e.message}`); });
-      child.on("close", code => {
-        if (spawnError) { return; }
-        if (code === 0) { NotificationRouter.showInformation("Release completed."); resolve(undefined); }
-        else { resolve(`Release failed (exit ${code ?? 1}).`); }
-      });
-    });
-    if (failureMessage) {
-      void vscode.window.showErrorMessage(failureMessage);
+    if (!isSafeReleaseScript(script)) { void vscode.window.showErrorMessage(`Release requires a safe package.json "${RELEASE_SCRIPT_NAME}" script.`); return; }
+    if (!vscode.workspace.isTrusted) { void vscode.window.showErrorMessage("Release requires a trusted workspace."); return; }
+    const manager = fs.existsSync(path.join(packageDir, "pnpm-lock.yaml")) || fs.existsSync(`${root}/pnpm-lock.yaml`)
+      ? "pnpm"
+      : fs.existsSync(path.join(packageDir, "yarn.lock")) || fs.existsSync(`${root}/yarn.lock`)
+        ? "yarn"
+        : fs.existsSync(path.join(packageDir, "bun.lockb")) || fs.existsSync(`${root}/bun.lockb`)
+          ? "bun"
+          : "npm";
+    const scriptHash = crypto.createHash("sha256").update(script).digest("hex");
+    const commandText = `${manager} run ${RELEASE_SCRIPT_NAME}`;
+    // Same safeguard as before the move to a terminal: the user reviews the
+    // project-defined script body (and its hash) before anything runs, and a
+    // post-confirmation script change cancels the release.
+    const confirmation = await vscode.window.showWarningMessage(`Run release?\n\nCommand: ${commandText}\nWorking directory: ${packageDir}\nPackage manager: ${manager}\nScript: ${script}\nSHA-256: ${scriptHash}`, { modal: true }, "Run Release");
+    if (confirmation !== "Run Release") return;
+    // Re-read immediately before launching so a package.json edit cannot
+    // change the reviewed release command between confirmation and execution.
+    const currentPackage = JSON.parse(await fs.promises.readFile(packageJsonPath, "utf8")) as { scripts?: Record<string, unknown> };
+    if (currentPackage.scripts?.[RELEASE_SCRIPT_NAME] !== script) { void vscode.window.showErrorMessage("The release script changed after confirmation; release was cancelled."); return; }
+    await fs.promises.writeFile(path.join(candidate, "release-operation.json"), JSON.stringify({ command: commandText, cwd: packageDir, packageManager: manager, script, scriptSha256: scriptHash, startedAt: new Date().toISOString() }, null, 2), "utf8");
+    // Run in a visible IDE terminal so interactive version prompts work.
+    // The extension only reports that the release was STARTED — it does not
+    // observe the terminal and never claims the release succeeded; the
+    // outcome is visible in the terminal itself.
+    try {
+      const terminal = vscode.window.createTerminal({ name: "Ensemble Release", cwd: packageDir });
+      terminal.show();
+      terminal.sendText(commandText, true);
+    } catch (error) {
+      const message = `Release failed to start: ${error instanceof Error ? error.message : String(error)}`;
+      void vscode.window.showErrorMessage(message);
       // Thrown so the tracked operation records a `failed` terminal state;
       // swallowed just below — the failure was already reported above.
-      throw new ReleaseRunFailure(failureMessage);
+      throw new ReleaseRunFailure(message);
     }
+    NotificationRouter.showInformation(
+      `Release started in the "Ensemble Release" terminal (${commandText}). Follow its prompts there.`
+    );
     }
   ).catch(error => {
     if (!(error instanceof ReleaseRunFailure)) { throw error; }

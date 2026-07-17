@@ -1,9 +1,10 @@
 import * as vscode from "vscode";
 import { TaskInventory } from "../state/taskInventory";
-import { TASK_FILENAME } from "../types/taskProgress";
+import { TASK_DESCRIPTION_FILENAME, TASK_FILENAME } from "../types/taskProgress";
 import { patchTaskProgress } from "../utils/taskProgressUtils";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { runTrackedOperation } from "../utils/taskOperations";
+import { parseTaskDocument } from "../utils/taskDescriptionDocument";
 import { TaskNode } from "../views/taskTreeProvider";
 
 type TaskArg = TaskNode | { canonicalId?: string; taskFolderPath?: string };
@@ -57,7 +58,43 @@ export async function renameTask(
   );
 }
 
-/** A concise title can be generated from an AI draft without renaming folders/IDs. */
+/**
+ * Derive a concise task name from the task description text: the first
+ * meaningful (non-heading, non-boilerplate) line, stripped of markdown
+ * markup and truncated at a sentence boundary. Exported for testing.
+ */
+export function deriveNameFromDescription(text: string): string | undefined {
+  const withoutCode = text.replace(/```[\s\S]*?```/g, " ");
+  for (const rawLine of withoutCode.split(/\r?\n/)) {
+    let line = rawLine.trim();
+    if (!line || /^#{1,6}\s/.test(line) || /^<!--/.test(line)) {
+      continue;
+    }
+    // Strip list markers, emphasis, and inline code markup.
+    line = line
+      .replace(/^[-*>\d.)\s]+/, "")
+      .replace(/[*_`]/g, "")
+      .trim();
+    if (line.length < 8) {
+      continue;
+    }
+    // Cut at the first sentence end when the line is long.
+    const sentenceEnd = line.search(/[.!?](\s|$)/);
+    if (sentenceEnd > 12) {
+      line = line.slice(0, sentenceEnd);
+    }
+    return line.slice(0, 100).trim();
+  }
+  return undefined;
+}
+
+/**
+ * A concise title derived from the task description without renaming
+ * folders/IDs. Prefers the user's own free-text description
+ * (task-description.md), then the structured "Task Description" section of
+ * task.md, then the AI draft — instead of whatever heading happened to come
+ * first in the document.
+ */
 export async function renameTaskWithAI(
   inventory: TaskInventory,
   arg?: TaskArg
@@ -65,22 +102,23 @@ export async function renameTaskWithAI(
   const task = await resolve(inventory, arg);
   if (!task) return;
 
-  const taskUri = vscode.Uri.joinPath(
-    vscode.Uri.file(task.taskFolderPath),
-    TASK_FILENAME
-  );
-  let text = "";
-  try {
-    text = new TextDecoder().decode(await vscode.workspace.fs.readFile(taskUri));
-  } catch {
-    // The folder name remains a valid suggestion when the task artifact is missing.
+  const readText = async (fileName: string): Promise<string> => {
+    try {
+      const uri = vscode.Uri.joinPath(vscode.Uri.file(task.taskFolderPath), fileName);
+      return new TextDecoder().decode(await vscode.workspace.fs.readFile(uri));
+    } catch {
+      return "";
+    }
+  };
+
+  let sourceText = (await readText(TASK_DESCRIPTION_FILENAME)).trim();
+  if (!sourceText) {
+    const parsed = parseTaskDocument(await readText(TASK_FILENAME));
+    sourceText = parsed.taskDescription || parsed.draftWithAI;
   }
 
-  const draft =
-    text.match(/^#\s+(.+)$/m)?.[1] ??
-    text.match(/## Draft with AI\s*\n+([^\n.#][^\n]*)/i)?.[1] ??
-    task.folderName;
-  await renameTask(inventory, arg, draft.replace(/^[-*\d.\s]+/, "").slice(0, 120));
+  const suggestion = deriveNameFromDescription(sourceText) ?? task.folderName;
+  await renameTask(inventory, arg, suggestion.slice(0, 120));
 }
 
 export function registerRenameTaskCommands(

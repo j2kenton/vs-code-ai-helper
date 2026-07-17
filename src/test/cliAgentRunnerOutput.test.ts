@@ -162,6 +162,8 @@ void describe("CLI output normalization", () => {
       installHint: "install",
       loginHint: "login",
       authErrorMarkers: ["login"],
+      signInCommand: "login",
+      signInLabel: "Sign in",
       useShell: false,
       models: [{ model: undefined, name: "default" }],
       usesLastMessageFile: false,

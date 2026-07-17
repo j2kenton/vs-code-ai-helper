@@ -853,6 +853,7 @@ export async function commitAndPushTask(
   // the Complete/Commit/Push composite, this registers as a child of that
   // root (C1 nesting) instead of contending for the lock the root holds.
   const lockKey = resolvedTask.taskFolderPath;
+  try {
   await runTrackedOperation(
     lockKey,
     { label: "Commit and Push", taskName: resolvedTask.folderName, kind: "commit-push", parent: parentOperation },
@@ -876,7 +877,7 @@ export async function commitAndPushTask(
     // Failing checks surface a three-way decision (C3): Publish Anyway,
     // Fix with AI, or Cancel (the modal's dismiss affordance). Fix with AI
     // runs the linting-fixes flow — editor autofixes plus the configured
-    // implementation agent fed the failing lint/test output — nested under
+    // Publish-stage agent fed the failing lint/test output — nested under
     // this operation, then checks re-run before publishing can continue, so
     // a fix pass that didn't resolve everything re-surfaces this decision.
     while (!lintPayload.passed) {
@@ -941,16 +942,46 @@ export async function commitAndPushTask(
           );
         }
 
-        // Check for existing staged changes
+        // Handle pre-existing staged changes. When EVERYTHING that changed
+        // is already staged, commit/push proceeds without raising an error
+        // (the staged files are part of the porcelain status and flow into
+        // the preview and commit). When only SOME changes are staged, the
+        // user chooses: commit everything together, or cancel and handle
+        // the existing staged changes manually.
         const { stdout: stagedOutput } = await runGitCommand(
           repoRoot,
           "diff",
           ["--cached", "--name-only"]
         );
-        if (stagedOutput.trim().length > 0) {
-          throw new Error(
-            "There are already staged changes. Please commit or unstage them first."
+        const preStagedFiles = stagedOutput.trim().split(/\r?\n/).filter(Boolean);
+        if (preStagedFiles.length > 0) {
+          const { stdout: unstagedOutput } = await runGitCommand(
+            repoRoot,
+            "diff",
+            ["--name-only"]
           );
+          const { stdout: untrackedOutput } = await runGitCommand(
+            repoRoot,
+            "ls-files",
+            ["--others", "--exclude-standard"]
+          );
+          const hasUnstagedChanges =
+            unstagedOutput.trim().length > 0 || untrackedOutput.trim().length > 0;
+          if (hasUnstagedChanges) {
+            const choice = await vscode.window.showWarningMessage(
+              `This repository already has ${preStagedFiles.length} staged change(s) alongside unstaged changes.\n\n` +
+                "Commit everything together (staged and unstaged changes in one commit), " +
+                "or cancel to handle the existing staged changes manually first.",
+              { modal: true },
+              "Commit Everything Together"
+            );
+            if (choice !== "Commit Everything Together") {
+              NotificationRouter.showInformation(
+                "Commit and push cancelled — handle the existing staged changes manually, then retry."
+              );
+              throw new vscode.CancellationError();
+            }
+          }
         }
 
         // Determine staging scope: default to the implemented source changes
@@ -1167,7 +1198,10 @@ export async function commitAndPushTask(
           NotificationRouter.showInformation(
             "Full file list shown in 'Ensemble: Commit Preview'. Re-run the command to proceed."
           );
-          return;
+          // End the tracked operation as cancelled, not succeeded — nothing
+          // was committed or pushed, so a "completed" terminal entry here
+          // would falsely report success. Swallowed at the outer call.
+          throw new vscode.CancellationError();
         }
 
         if (confirmed !== "Commit & Push") {
@@ -1290,6 +1324,11 @@ export async function commitAndPushTask(
           );
         }
       } catch (error: unknown) {
+        if (error instanceof vscode.CancellationError) {
+          // "View Full List" (and genuine cancellations) end the tracked
+          // operation as cancelled instead of falsely reporting success.
+          throw error;
+        }
         void vscode.window.showErrorMessage(
           `Commit and push failed: ${getErrorMessage(error)}`
         );
@@ -1298,6 +1337,11 @@ export async function commitAndPushTask(
   );
     }
   );
+  } catch (error) {
+    if (!(error instanceof vscode.CancellationError)) {
+      throw error;
+    }
+  }
 }
 
 /**

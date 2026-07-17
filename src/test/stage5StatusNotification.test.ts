@@ -467,5 +467,175 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
         deactivateNotificationRouter();
       }
     });
+
+    void it("runs automatic Git-ignore maintenance when the first task is created", async () => {
+      // Activation only runs the maintenance when the startup inventory
+      // already has tasks, so the first creation in a fresh workspace must
+      // trigger it itself — otherwise `.ensemble` shows up as unignored Git
+      // changes until the next reload. Same monkey-patch recorder pattern as
+      // metaResourcesMigration.test.ts.
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { startNewTask } = await import("../commands/startNewTask.js");
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const gitIgnoreModule = require("../commands/toggleMetaResourcesGitIgnore") as {
+        ensureAutomaticMetaGitIgnore: (...args: unknown[]) => Promise<void>;
+      };
+
+      const surface: StatusSurface = {
+        addEntry(): void {},
+      };
+      initNotificationRouter(surface);
+
+      const win = getWindowStub();
+      const workspace = getWorkspaceStub();
+      const origWorkspaceFolders = workspace.workspaceFolders;
+      const soleFolder = { uri: vscode.Uri.file("/workspace"), name: "workspace", index: 0 };
+      workspace.workspaceFolders = [soleFolder];
+
+      const origCreateDirectory = workspace.fs.createDirectory;
+      const origWriteFile = workspace.fs.writeFile;
+      const origOpenTextDocument = workspace.openTextDocument;
+      const origShowTextDocument = win.showTextDocument;
+      const origShowErrorMessage = win.showErrorMessage;
+      const origShowWarningMessage = win.showWarningMessage;
+      const origEnsure = gitIgnoreModule.ensureAutomaticMetaGitIgnore;
+
+      workspace.fs.createDirectory = (): Promise<void> => Promise.resolve();
+      workspace.fs.writeFile = (): Promise<void> => Promise.resolve();
+      workspace.openTextDocument = (): Promise<vscode.TextDocument> =>
+        Promise.resolve({} as vscode.TextDocument);
+      win.showTextDocument = (): Promise<vscode.TextEditor> =>
+        Promise.resolve({} as vscode.TextEditor);
+      win.showErrorMessage = (): Thenable<string | undefined> =>
+        Promise.resolve(undefined);
+      win.showWarningMessage = (): Thenable<string | undefined> =>
+        Promise.resolve(undefined);
+
+      const gitIgnoreCalls: unknown[][] = [];
+      gitIgnoreModule.ensureAutomaticMetaGitIgnore = (
+        ...args: unknown[]
+      ): Promise<void> => {
+        gitIgnoreCalls.push(args);
+        return Promise.resolve();
+      };
+
+      // Empty inventory — the fresh-workspace case activation skips.
+      const inventory = makeInventoryStub();
+      const store = makeStoreStub();
+      const context = { workspaceState: new Map() } as unknown as vscode.ExtensionContext;
+
+      try {
+        await startNewTask(inventory, vscode.Uri.file("/extension"), store, context);
+        assert.strictEqual(
+          gitIgnoreCalls.length,
+          1,
+          "creating the first task must apply the managed .gitignore block"
+        );
+        assert.strictEqual(
+          gitIgnoreCalls[0]?.[0],
+          context,
+          "the maintenance must receive the extension context (its once-per-root gate lives in workspaceState)"
+        );
+        assert.strictEqual(
+          gitIgnoreCalls[0]?.[1],
+          soleFolder,
+          "the maintenance must receive the workspace folder the task was created in"
+        );
+      } finally {
+        gitIgnoreModule.ensureAutomaticMetaGitIgnore = origEnsure;
+        win.showErrorMessage = origShowErrorMessage;
+        win.showWarningMessage = origShowWarningMessage;
+        workspace.workspaceFolders = origWorkspaceFolders;
+        workspace.fs.createDirectory = origCreateDirectory;
+        workspace.fs.writeFile = origWriteFile;
+        workspace.openTextDocument = origOpenTextDocument;
+        win.showTextDocument = origShowTextDocument;
+        deactivateNotificationRouter();
+      }
+    });
+
+    void it("targets the selected workspace folder for Git-ignore maintenance in a multi-root workspace", async () => {
+      // Two independent folders: the task is created in the second, so the
+      // Git-ignore maintenance must be told about that folder — resolving
+      // from workspaceFolders[0] would update the wrong repository.
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { startNewTask } = await import("../commands/startNewTask.js");
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const gitIgnoreModule = require("../commands/toggleMetaResourcesGitIgnore") as {
+        ensureAutomaticMetaGitIgnore: (...args: unknown[]) => Promise<void>;
+      };
+
+      const surface: StatusSurface = {
+        addEntry(): void {},
+      };
+      initNotificationRouter(surface);
+
+      const win = getWindowStub();
+      const workspace = getWorkspaceStub();
+      const origWorkspaceFolders = workspace.workspaceFolders;
+      const firstFolder = { uri: vscode.Uri.file("/repo-a"), name: "repo-a", index: 0 };
+      const secondFolder = { uri: vscode.Uri.file("/repo-b"), name: "repo-b", index: 1 };
+      workspace.workspaceFolders = [firstFolder, secondFolder];
+
+      const origCreateDirectory = workspace.fs.createDirectory;
+      const origWriteFile = workspace.fs.writeFile;
+      const origOpenTextDocument = workspace.openTextDocument;
+      const origShowTextDocument = win.showTextDocument;
+      const origShowErrorMessage = win.showErrorMessage;
+      const origShowWarningMessage = win.showWarningMessage;
+      const origShowQuickPick = win.showQuickPick;
+      const origEnsure = gitIgnoreModule.ensureAutomaticMetaGitIgnore;
+
+      workspace.fs.createDirectory = (): Promise<void> => Promise.resolve();
+      workspace.fs.writeFile = (): Promise<void> => Promise.resolve();
+      workspace.openTextDocument = (): Promise<vscode.TextDocument> =>
+        Promise.resolve({} as vscode.TextDocument);
+      win.showTextDocument = (): Promise<vscode.TextEditor> =>
+        Promise.resolve({} as vscode.TextEditor);
+      win.showErrorMessage = (): Thenable<string | undefined> =>
+        Promise.resolve(undefined);
+      win.showWarningMessage = (): Thenable<string | undefined> =>
+        Promise.resolve(undefined);
+      // The user picks the second folder in the workspace quick pick.
+      win.showQuickPick = (<T>(items: readonly T[]): Thenable<T | undefined> =>
+        Promise.resolve(items[1])) as typeof win.showQuickPick;
+
+      const gitIgnoreCalls: unknown[][] = [];
+      gitIgnoreModule.ensureAutomaticMetaGitIgnore = (
+        ...args: unknown[]
+      ): Promise<void> => {
+        gitIgnoreCalls.push(args);
+        return Promise.resolve();
+      };
+
+      const inventory = makeInventoryStub();
+      const store = makeStoreStub();
+      const context = { workspaceState: new Map() } as unknown as vscode.ExtensionContext;
+
+      try {
+        await startNewTask(inventory, vscode.Uri.file("/extension"), store, context);
+        assert.strictEqual(
+          gitIgnoreCalls.length,
+          1,
+          "creating the first task must apply the managed .gitignore block"
+        );
+        assert.strictEqual(
+          gitIgnoreCalls[0]?.[1],
+          secondFolder,
+          "the maintenance must target the folder the user selected, not workspaceFolders[0]"
+        );
+      } finally {
+        gitIgnoreModule.ensureAutomaticMetaGitIgnore = origEnsure;
+        win.showQuickPick = origShowQuickPick;
+        win.showErrorMessage = origShowErrorMessage;
+        win.showWarningMessage = origShowWarningMessage;
+        workspace.workspaceFolders = origWorkspaceFolders;
+        workspace.fs.createDirectory = origCreateDirectory;
+        workspace.fs.writeFile = origWriteFile;
+        workspace.openTextDocument = origOpenTextDocument;
+        win.showTextDocument = origShowTextDocument;
+        deactivateNotificationRouter();
+      }
+    });
   });
 });

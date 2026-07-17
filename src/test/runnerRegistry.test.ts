@@ -99,6 +99,87 @@ void describe("isAuthenticationFailure", () => {
   }
 });
 
+/** Config stub with a recorded provider selection (enabledProviders present
+ * in the Global scope), so the runner-entry disabled-provider guard is
+ * active — unlike installModelSettings, whose inspect() returns undefined
+ * (no selection ever recorded → guard inactive by design). */
+function installProviderSelection(
+  enabled: Record<string, boolean>,
+  raw: Record<string, unknown> = {}
+): { restore: () => void } {
+  const original = (vscode.workspace as unknown as Record<string, unknown>).getConfiguration;
+  (vscode.workspace as unknown as Record<string, unknown>).getConfiguration = (): {
+    get: (key: string, defaultValue?: unknown) => unknown;
+    inspect: (key: string) => { globalValue?: unknown } | undefined;
+  } => ({
+    get: (key: string, defaultValue?: unknown): unknown =>
+      key === "modelSettings" ? raw : key === "enabledProviders" ? enabled : defaultValue,
+    inspect: (key: string) =>
+      key === "enabledProviders" ? { globalValue: enabled } : undefined,
+  });
+  return {
+    restore: (): void => {
+      (vscode.workspace as unknown as Record<string, unknown>).getConfiguration = original;
+    },
+  };
+}
+
+void describe("runner-entry disabled-provider guard", () => {
+  void it("refuses to resolve a runner for a disabled provider's model", () => {
+    const stub = installProviderSelection({ "claude-cli": true });
+    try {
+      assert.throws(
+        () => resolveRunnerForModel("kiro-cli:default", "impl-low-review"),
+        /disabled in Provider Selection/
+      );
+    } finally {
+      stub.restore();
+    }
+  });
+
+  void it("resolves normally when the provider is enabled", () => {
+    const stub = installProviderSelection({ "kiro-cli": true });
+    try {
+      const { provider } = resolveRunnerForModel("kiro-cli:default", "impl-low-review");
+      assert.equal(provider, "kiro-cli");
+    } finally {
+      stub.restore();
+    }
+  });
+
+  void it("never blocks Copilot (bare/legacy) model ids", () => {
+    const stub = installProviderSelection({ "claude-cli": true });
+    try {
+      const { provider } = resolveRunnerForModel("gpt-4o", "impl-low-review");
+      assert.equal(provider, "copilot");
+    } finally {
+      stub.restore();
+    }
+  });
+
+  void it("stays inactive when no provider selection was ever recorded", () => {
+    const settings = installModelSettings({});
+    try {
+      const { provider } = resolveRunnerForModel("kiro-cli:default", "impl-low-review");
+      assert.equal(provider, "kiro-cli");
+    } finally {
+      settings.restore();
+    }
+  });
+
+  void it("guards implementation availability checks through the same rule", async () => {
+    const stub = installProviderSelection({ "claude-cli": true });
+    try {
+      await assert.rejects(
+        () => checkImplementationAvailabilityForModel("kiro-cli:default", "impl"),
+        /disabled in Provider Selection/
+      );
+    } finally {
+      stub.restore();
+    }
+  });
+});
+
 void describe("resolveRunnerForModel", () => {
   void it("preserves runner availability checks when quota observation is enabled", async () => {
     const settings = installModelSettings({});

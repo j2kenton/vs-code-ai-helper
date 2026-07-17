@@ -22,7 +22,11 @@ import {
   parseModelSelection,
   ProviderId,
 } from "./providers";
-import { getModelSettings } from "../config/settings";
+import {
+  getModelSettings,
+  isProviderEnabled,
+  isProviderSelectionConfigured,
+} from "../config/settings";
 import { chooseFallback, getBackupModels } from "../utils/modelFallback";
 import { recordQuotaObservation } from "../utils/quota";
 import { patchTaskProgress } from "../utils/taskProgressUtils";
@@ -50,6 +54,26 @@ type EffectiveProvider =
  * Shared by resolveRunnerForModel (plan/review) and the two implementation
  * entry points below so all three "with AI" paths auto-detect the same way.
  */
+/**
+ * Runner-entry guard: a model belonging to a provider the user has disabled
+ * in Provider Selection must never run, no matter which code path resolved
+ * it (stage command, chat, implementation, backup fallback). The stored
+ * model id itself is preserved untouched; only running it is refused. The
+ * guard is active only once a provider selection actually exists — a fresh
+ * pre-migration state (no enabledProviders value in any scope) blocks
+ * nothing, matching migrateEnabledProvidersForExistingModels's semantics.
+ * Mirrors the command-level ensureStageModelConfigured guard, which
+ * additionally opens the AI Models view; this one is the last line of
+ * defense for paths that never went through a guarded command entry point.
+ */
+function isModelProviderDisabled(provider: ProviderId): boolean {
+  return (
+    provider !== "copilot" &&
+    isProviderSelectionConfigured() &&
+    !isProviderEnabled(provider)
+  );
+}
+
 function resolveEffectiveProvider(
   modelId: string | undefined
 ): EffectiveProvider {
@@ -57,6 +81,12 @@ function resolveEffectiveProvider(
   if (parsed.provider !== "copilot") {
     const def = getCliProvider(parsed.provider);
     if (def) {
+      if (isModelProviderDisabled(def.id)) {
+        throw new Error(
+          `The selected model ("${modelId}") belongs to ${def.label}, which is disabled in Provider Selection. ` +
+            "Enable the provider or choose another model in AI Models."
+        );
+      }
       return { kind: "cli", def, model: parsed.model };
     }
   }
@@ -108,6 +138,14 @@ function toResolvedRunner(effective: EffectiveProvider): ResolvedRunner {
   };
 }
 
+/** Drop backup candidates whose provider is disabled so a fallback can never
+ * route around the runner-entry guard above. */
+function filterEnabledBackupModels(models: readonly string[]): string[] {
+  return models.filter(
+    (candidate) => !isModelProviderDisabled(parseModelSelection(candidate).provider)
+  );
+}
+
 function backupModelsForStage(
   stage: TaskStage | undefined,
   modelId: string | undefined
@@ -119,7 +157,9 @@ function backupModelsForStage(
   if (setting?.strategy !== "switch-to-backup") {
     return [];
   }
-  return getBackupModels(setting).filter(candidate => candidate !== modelId);
+  return filterEnabledBackupModels(
+    getBackupModels(setting).filter(candidate => candidate !== modelId)
+  );
 }
 
 export async function checkRunnerAvailabilityForModel(
@@ -422,6 +462,8 @@ export async function runImplementationForModel(options: {
         token: options.token,
         onProgress: options.onProgress,
         requireFileChange: options.requireFileChange,
+        taskFolderUri: options.taskFolderUri,
+        stage: options.stage,
       });
       return { ...result, runnerId: selected.def.id };
     }
@@ -457,7 +499,7 @@ export async function runImplementationForModel(options: {
     if (!reserved) {
       return result;
     }
-    for (const backupModel of getBackupModels(setting)) {
+    for (const backupModel of filterEnabledBackupModels(getBackupModels(setting))) {
       if (backupModel === options.modelId) {
         continue;
       }

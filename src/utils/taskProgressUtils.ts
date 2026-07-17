@@ -58,12 +58,12 @@ export async function readTaskProgress(
     progress.currentStage = migrateStage(rawStage);
     if (rawStage === "completed") {
       progress.currentStage = "publish";
-      if (!progress.completedAt && progress.status !== "completed") {
-        if (progress.status === undefined) {
-          progress.status = "active";
-        }
-      } else {
-        progress.status = "completed";
+      // Only infer a status when none is recorded: legacy files with the
+      // "completed" stage and a completedAt are completed; an explicit
+      // status (active/paused/archived) always wins — completion is never
+      // inferred from completedAt alone (it survives resume as history).
+      if (progress.status === undefined) {
+        progress.status = progress.completedAt ? "completed" : "active";
       }
     }
     // Migrate/normalize status field (missing -> "active").
@@ -156,12 +156,10 @@ export async function patchTaskProgress(
   patched.currentStage = migrateStage(rawStage);
   if (rawStage === "completed") {
     patched.currentStage = "publish";
-    if (!patched.completedAt && patched.status !== "completed") {
-      if (patched.status === undefined) {
-        patched.status = "active";
-      }
-    } else {
-      patched.status = "completed";
+    // Mirrors readTaskProgress: an explicit status always wins; completedAt
+    // is historical metadata and never re-flips a resumed task to completed.
+    if (patched.status === undefined) {
+      patched.status = patched.completedAt ? "completed" : "active";
     }
   }
   patched.status = migrateStatus(patched.status);

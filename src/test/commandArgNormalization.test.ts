@@ -1172,6 +1172,21 @@ void describe("setTaskStage auto-review delegation (production code)", () => {
     const wsFolders = installWorkspaceFoldersStub();
     const execCmd = installExecuteCommandStub();
 
+    // The run-time model guard (ensureStageModelConfigured) blocks the
+    // auto-review dispatch when the destination stage has no configured
+    // model, so this delegation test configures a Copilot model for it.
+    const wsRecord = vscode.workspace as unknown as Record<string, unknown>;
+    const origGetConfiguration = wsRecord.getConfiguration;
+    wsRecord.getConfiguration = () => ({
+      get: (key: string, defaultValue?: unknown): unknown => {
+        if (key === "modelSettings") {
+          return { "plan-high-review": { primary: "gpt-test-model" } };
+        }
+        return defaultValue;
+      },
+      inspect: (): undefined => undefined,
+    });
+
     try {
       // Seed the task at "plan" stage.
       // AUTO_REVIEW_TRANSITIONS maps plan → plan-high-review, so advancing
@@ -1228,6 +1243,7 @@ void describe("setTaskStage auto-review delegation (production code)", () => {
         "taskFolderPath in dispatch must match the task being advanced"
       );
     } finally {
+      wsRecord.getConfiguration = origGetConfiguration;
       msgs.restore();
       memFs.restore();
       wsFolders.restore();

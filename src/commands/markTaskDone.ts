@@ -57,7 +57,11 @@ function normalizeArg(node: MarkTaskDoneArg | undefined): {
 export function isMarkTaskDoneEligible(
   progress: TaskWithProgress["progress"]
 ): boolean {
-  if (progress.status === "paused" || progress.status === "completed") {
+  if (
+    progress.status === "paused" ||
+    progress.status === "completed" ||
+    progress.status === "archived"
+  ) {
     return false;
   }
   return progress.currentStage === "publish";
@@ -66,8 +70,9 @@ export function isMarkTaskDoneEligible(
 /**
  * Select the next active task deterministically after completing the current
  * task. Priority order:
- *   1. The first active (non-paused, non-completed) task in inventory order
- *      (most recently updated first) that is NOT the just-completed task.
+ *   1. The first active (non-paused, non-completed, non-archived) task in
+ *      inventory order (most recently updated first) that is NOT the
+ *      just-completed task.
  *   2. If none exists, clear the current task store so no task is selected.
  *
  * Returns the canonicalId of the selected task, or undefined if none was found.
@@ -81,7 +86,11 @@ export function selectNextTask(
     (t) =>
       t.canonicalId !== completedCanonicalId &&
       t.progress.currentStage !== "publish" &&
-      t.progress.status !== "paused"
+      t.progress.status !== "paused" &&
+      t.progress.status !== "completed" &&
+      // An archived task is parked: it must never silently become the
+      // current task — resuming it is an explicit user action.
+      t.progress.status !== "archived"
   );
   return next?.canonicalId;
 }

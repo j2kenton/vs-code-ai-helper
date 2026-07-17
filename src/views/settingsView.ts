@@ -5,28 +5,27 @@ import {
   findTaskModelConflicts,
   getAvailableModels,
 } from "../utils/modelSelection";
-import { getModelSettings, setModelSettings, targetFor } from "../config/settings";
+import {
+  getModelSettings,
+  isUnsavedSettingsWarningEnabled,
+  setModelSettings,
+  setUnsavedSettingsWarningEnabled,
+  targetFor,
+} from "../config/settings";
 import { ModelSettings } from "../utils/modelFallback";
 import { getQuotaStatusText } from "../utils/quota";
 import { cliDisplayLabel, CLI_PROVIDERS } from "../runners/providers";
-import { testCliProviderSetup } from "../runners/cliAgentRunner";
 import { NotificationRouter } from "../utils/notificationRouter";
 
 type IncomingMessage =
   | { type: "ready" }
   | { type: "rendered" }
   | { type: "saveSettings"; settings: ModelSettings }
-  | { type: "saveWorkspaceSettings"; settings: WorkspaceSettings }
+  | { type: "saveProviders"; enabledProviders: Record<string, boolean> }
   | { type: "validationError"; message: string }
-  | { type: "resetDefaults" }
   | { type: "refreshQuotaStatus" }
-  | { type: "testProviderSetup"; providerId: string }
-  | { type: "openNativeSettings" };
-
-interface WorkspaceSettings {
-  metaFilesHidden: boolean;
-  enabledProviders: Record<string, boolean>;
-}
+  | { type: "providerSignIn"; providerId: string }
+  | { type: "suppressUnsavedWarning" };
 
 export class SettingsViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = "vs-code-ai-helper.settingsView";
@@ -61,27 +60,19 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         case "ready": {
           // Collapsing this panel makes VS Code deallocate its webview
           // document; re-expanding recreates it and calls resolveWebviewView
-          // again. Posting "init" eagerly (right after setting .html, as
-          // this used to do) races that fresh document's script load: if
-          // getAvailableModels() resolves first — it's cache-backed (see
-          // cliAgentRunner's commandExistsCache), so it can return near-
-          // instantly on the 2nd+ open — the message is posted before the
-          // webview's listener exists and is silently dropped, leaving the
-          // panel permanently blank. Waiting for the webview to announce
+          // again. Posting "init" eagerly (right after setting .html) races
+          // that fresh document's script load: if getAvailableModels()
+          // resolves first — it's cache-backed — the message is posted before
+          // the webview's listener exists and is silently dropped, leaving
+          // the panel permanently blank. Waiting for the webview to announce
           // it's ready avoids that race regardless of timing.
           await this._postInit(webviewView.webview);
           break;
         }
         case "rendered": {
           // Distinct from "ready": this fires only after the webview has
-          // actually built its table rows from the "init" payload (see the
-          // 'init' handler in the webview script below), which is what
-          // focusStage() needs (it looks up 'row-' + stage in the DOM).
-          // Gating on "ready" alone would have a window — after the webview
-          // is listening but before getAvailableModels() resolves and the
-          // rows exist — where a focusStage() posted immediately would
-          // reach a live listener that still finds no matching row and
-          // silently drops the request.
+          // actually built its table rows from the "init" payload, which is
+          // what focusStage() needs (it looks up 'row-' + stage in the DOM).
           this._tableRendered = true;
           if (this._pendingFocus) {
             const pending = this._pendingFocus;
@@ -99,86 +90,47 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           void vscode.window.showErrorMessage(data.message);
           break;
         }
-        case "saveWorkspaceSettings": {
-          // Only touch the .gitignore when the checkbox actually changed —
-          // otherwise every workflow-settings save re-runs the hide/show
-          // command, which (since there's nothing to write) skips its own
-          // confirmation prompt but still fires a spurious "meta files are
-          // now hidden/visible" status entry even though nothing changed.
-          const previousMetaFilesHidden = vscode.workspace
-            .getConfiguration("vs-code-ai-helper")
-            .get<boolean>("metaFilesHidden", false);
-          if (data.settings.metaFilesHidden !== previousMetaFilesHidden) {
-            // Run the .gitignore change first — it prompts the user for
-            // confirmation with an exact diff — and abort the whole save with
-            // no writes if they decline, rather than silently saving the rest
-            // of the workflow settings while the meta-visibility change is
-            // dropped.
-            const metaChangeApplied = await vscode.commands.executeCommand<boolean>(
-              data.settings.metaFilesHidden
-                ? "vs-code-ai-helper.hideMetaResourcesInGitIgnore"
-                : "vs-code-ai-helper.showMetaResourcesInGitIgnore"
-            );
-            if (metaChangeApplied === false) {
-              NotificationRouter.showWarning(
-                "Workflow settings were not saved: the .gitignore update was declined."
-              );
-              break;
-            }
-          }
-
+        case "saveProviders": {
           const config = vscode.workspace.getConfiguration("vs-code-ai-helper");
-          for (const [key, value] of Object.entries(data.settings)) {
-            // Meta visibility is backed by the managed .gitignore block,
-            // which the command above already updated atomically along with
-            // the UI mirror (see setMetaFilesHidden in that command).
-            if (key === "metaFilesHidden") {
-              continue;
-            }
-            await config.update(key, value, targetFor(key));
-          }
-          NotificationRouter.showInformation("Workflow settings saved.");
-          break;
-        }
-        case "resetDefaults": {
-          const confirm = await vscode.window.showWarningMessage(
-            "Reset all model settings to defaults in the form? Click Save Settings afterwards to apply.",
-            { modal: true },
-            "Reset"
-          );
-          if (confirm === "Reset") {
-            // Only repopulates the form — nothing is persisted here. The
-            // user must still click Save Settings to actually apply the
-            // reset, matching Save Settings being the only action that writes.
-            const emptySettings: ModelSettings = {};
-            void webviewView.webview.postMessage({ type: "settingsLoaded", settings: emptySettings });
-          }
+          await config.update("enabledProviders", data.enabledProviders, targetFor("enabledProviders"));
+          NotificationRouter.showInformation("Provider selection saved.");
           break;
         }
         case "refreshQuotaStatus": {
           void webviewView.webview.postMessage({ type: "quotaStatus", quotaStatus: this._buildQuotaStatus() });
           break;
         }
-        case "testProviderSetup": {
+        case "providerSignIn": {
           const provider = CLI_PROVIDERS.find((candidate) => candidate.id === data.providerId);
           if (!provider) {
             return;
           }
-          const status = await testCliProviderSetup(provider);
-          void webviewView.webview.postMessage({
-            type: "providerSetupStatus",
-            providerId: provider.id,
-            available: status.installed && status.authenticated === true,
-            message: !status.installed
-              ? `${cliDisplayLabel(provider)} CLI was not found. ${provider.installHint}`
-              : status.authenticated === false
-                ? `${cliDisplayLabel(provider)} CLI is installed but not authenticated. ${provider.loginHint}`
-                : `${cliDisplayLabel(provider)} CLI is installed. Authentication cannot be checked without sending a model request.`,
-          });
+          // Run the interactive login/switch-account flow in a VISIBLE IDE
+          // terminal. The extension reports the terminal as launched — it
+          // never claims the sign-in succeeded; any post-hoc status comes
+          // from the next model-discovery pass.
+          try {
+            const terminal = vscode.window.createTerminal({
+              name: `Ensemble Sign-in (${cliDisplayLabel(provider)})`,
+            });
+            terminal.show();
+            terminal.sendText(provider.signInCommand, true);
+            NotificationRouter.showInformation(
+              `${cliDisplayLabel(provider)} sign-in launched in the terminal. ` +
+                (provider.signInGuidance ?? "Complete the sign-in there.")
+            );
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            void vscode.window.showErrorMessage(
+              `Could not open a terminal for the ${cliDisplayLabel(provider)} sign-in: ${message}`
+            );
+          }
           break;
         }
-        case "openNativeSettings": {
-          void vscode.commands.executeCommand("workbench.action.openSettings", "@ext:j2kenton.vs-code-ai-helper");
+        case "suppressUnsavedWarning": {
+          // The in-webview "Don't show again" checkbox for the
+          // unsaved-settings warning.
+          await setUnsavedSettingsWarningEnabled(false);
           break;
         }
       }
@@ -193,10 +145,11 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       }
     });
 
-    // Model settings and provider selection can now be edited directly in
-    // settings.json (they're native settings), or from a different
-    // workspace via the now-Global scope — re-sync the panel so it doesn't
-    // show a stale snapshot from when it was first opened.
+    // Model settings and provider selection can be edited directly in
+    // settings.json, or from a different workspace via the Global scope —
+    // re-sync the panel so it doesn't show a stale snapshot. The webview
+    // itself guards this refresh with the unsaved-changes warning when its
+    // form is dirty (an interceptable discard path).
     const configListener = vscode.workspace.onDidChangeConfiguration((event) => {
       if (webviewView.visible && event.affectsConfiguration("vs-code-ai-helper")) {
         void this._postInit(webviewView.webview);
@@ -205,10 +158,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     webviewView.onDidDispose(() => { configListener.dispose(); });
 
     // resolveWebviewView runs on every reveal after this panel was
-    // collapsed, not just once per session (see the "ready" case above) —
-    // guard with _conflictsChecked so this prompt is a true one-shot,
-    // otherwise a user who picks "Keep Existing" would be re-asked every
-    // time they reopen the panel.
+    // collapsed, not just once per session — guard with _conflictsChecked so
+    // this prompt is a true one-shot.
     if (!this._conflictsChecked) {
       this._conflictsChecked = true;
       void this._checkModelSettingsConflicts();
@@ -218,8 +169,11 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
   /**
    * Send the current settings/models/quota snapshot to the webview. Only
    * called once the webview confirms via "ready" that its script has loaded
-   * and attached a message listener — see the "ready" case above for why
-   * posting this eagerly right after resolve is unsafe.
+   * and attached a message listener.
+   *
+   * The model list from getAvailableModels() is already filtered by the
+   * globally enabled providers — that selection is the single source of
+   * truth for which providers' models are offered anywhere in the UI.
    */
   private async _postInit(webview: vscode.Webview): Promise<void> {
     const settings = getModelSettings();
@@ -232,26 +186,23 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       stages: AI_MODEL_STAGES,
       stageNames: STAGE_DISPLAY_NAMES,
       quotaStatus: this._buildQuotaStatus(),
-      workspaceSettings: this._getWorkspaceSettings(),
-      providers: CLI_PROVIDERS.map((provider) => ({ id: provider.id, label: provider.label })),
+      enabledProviders: vscode.workspace
+        .getConfiguration("vs-code-ai-helper")
+        .get<Record<string, boolean>>("enabledProviders", {}),
+      providers: CLI_PROVIDERS.map((provider) => ({
+        id: provider.id,
+        label: provider.label,
+        signInLabel: provider.signInLabel,
+        signInGuidance: provider.signInGuidance ?? "",
+      })),
+      warnUnsavedSettings: isUnsavedSettingsWarningEnabled(),
     });
-  }
-
-  private _getWorkspaceSettings(): WorkspaceSettings {
-    const config = vscode.workspace.getConfiguration("vs-code-ai-helper");
-    return {
-      // The .gitignore block is read asynchronously by the command.  This
-      // persisted value is a display preference only, never used to infer
-      // visibility or invert a toggle.
-      metaFilesHidden: config.get<boolean>("metaFilesHidden", false),
-      enabledProviders: config.get<Record<string, boolean>>("enabledProviders", {}),
-    };
   }
 
   /**
    * Leftover per-task model override files (see utils/modelSelection.ts —
    * findTaskModelConflicts) are inert now that model configuration lives
-   * only in this Settings panel. Surface them once so the user can clear
+   * only in this AI Models panel. Surface them once so the user can clear
    * them instead of the extension silently ignoring files it once wrote.
    */
   private async _checkModelSettingsConflicts(): Promise<void> {
@@ -263,7 +214,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     const taskWord = conflicts.length === 1 ? "task has" : "tasks have";
     const choice = await vscode.window.showWarningMessage(
       `${conflicts.length} ${taskWord} leftover per-task model overrides from before model ` +
-        "configuration moved to this Settings panel. They are no longer used — the settings " +
+        "configuration moved to the AI Models panel. They are no longer used — the settings " +
         "above always apply now.",
       "Reset to Default",
       "Keep Existing"
@@ -309,11 +260,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     } else {
       // Either show(false) just triggered a fresh resolveWebviewView (if
       // the panel was collapsed), tearing down the old document, or the
-      // current document is still mid-init (webview loaded and listening,
-      // but getAvailableModels() hasn't resolved and the rows the webview
-      // needs to look up don't exist yet). Queue the request so it's
-      // delivered once "rendered" confirms the rows actually exist, instead
-      // of racing a postMessage that the webview would silently no-op.
+      // current document is still mid-init. Queue the request so it's
+      // delivered once "rendered" confirms the rows actually exist.
       this._pendingFocus = { stage, control };
     }
   }
@@ -334,7 +282,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         <meta charset="UTF-8">
         <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}';">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Ensemble Settings</title>
+        <title>Ensemble AI Models</title>
         <style>
           body {
             font-family: var(--vscode-font-family);
@@ -375,12 +323,6 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           .model-combobox {
             position: relative;
           }
-          .model-provider-filter {
-            display: block;
-            width: 100%;
-            margin-bottom: 4px;
-            font-size: 0.9em;
-          }
           .model-combo-input[disabled] {
             opacity: 0.55;
             cursor: not-allowed;
@@ -418,6 +360,11 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             color: var(--vscode-descriptionForeground);
             margin-top: 2px;
           }
+          .provider-disabled-note {
+            font-size: 0.85em;
+            color: var(--vscode-errorForeground, #f48771);
+            margin-top: 2px;
+          }
           .btn-container {
             display: flex;
             gap: 10px;
@@ -452,20 +399,43 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           .stage-row.highlighted {
             background-color: var(--vscode-editor-findMatchHighlightBackground, rgba(234, 92, 0, 0.3));
           }
-          .tooltip {
-            position: relative;
-            display: inline-block;
-            cursor: help;
-            color: var(--vscode-descriptionForeground);
+          #unsaved-warning-overlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.45);
+            z-index: 50;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+          }
+          #unsaved-warning-dialog {
+            background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
+            border: 1px solid var(--vscode-widget-border);
+            box-shadow: 0 4px 16px var(--vscode-widget-shadow, rgba(0,0,0,0.5));
+            padding: 16px;
+            max-width: 420px;
+          }
+          .restored-note {
+            background: var(--vscode-inputValidation-infoBackground, rgba(64,128,255,0.15));
+            border: 1px solid var(--vscode-inputValidation-infoBorder, rgba(64,128,255,0.4));
+            padding: 6px 8px;
+            margin: 8px 0;
+            font-size: 0.9em;
           }
         </style>
       </head>
       <body>
-        <h2 style="font-size: 1.2em; margin-bottom: 10px;">Model Configuration</h2>
+        <h2 style="font-size: 1.2em; margin-bottom: 10px;">AI Models</h2>
         <div role="status" aria-live="polite" id="status-region" style="position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); border: 0;"></div>
         <div role="alert" aria-live="assertive" id="alert-region" style="position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); border: 0;"></div>
 
         <div id="loading-indicator">Loading settings…</div>
+
+        <!-- Provider selection: the single source of truth for which
+             providers' models are offered in every combo box below. -->
+        <div id="provider-selection"></div>
+
+        <div id="restored-note-container"></div>
 
         <table id="settings-table" hidden>
           <thead>
@@ -484,14 +454,6 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           <button id="save-btn" disabled>Save Settings</button>
         </div>
 
-        <h2 style="font-size: 1.2em; margin: 28px 0 10px;">Providers &amp; Meta Files</h2>
-        <div id="workflow-settings"></div>
-        <div class="btn-container"><button id="save-workflow-btn">Save</button></div>
-
-        <div class="btn-container" style="margin-top: 24px; border-top: 1px solid var(--vscode-widget-border); padding-top: 15px;">
-          <button id="open-native-settings-btn" class="secondary">Open Ensemble Settings (Fast Forward, Auto-advance, Notifications…)</button>
-        </div>
-
         <script nonce="${nonce}">
           const vscode = acquireVsCodeApi();
           let currentSettings = {};
@@ -499,9 +461,12 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           let stagesList = [];
           let stageDisplayNames = {};
           let quotaStatus = {};
-          let workspaceSettings = {};
+          let enabledProviders = {};
           let providers = [];
+          let warnUnsavedSettings = true;
           let formDirty = false;
+          let initialized = false;
+          let extraBackupSeq = 0;
 
           function updateSaveButtonState() {
             document.getElementById('save-btn').disabled = !formDirty;
@@ -512,46 +477,127 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               formDirty = true;
               updateSaveButtonState();
             }
+            persistDraft();
           }
 
-          window.addEventListener('message', event => {
+          function clearDirty() {
+            formDirty = false;
+            updateSaveButtonState();
+            vscode.setState(undefined);
+          }
+
+          // Draft preservation for discard paths the extension cannot
+          // intercept (VS Code disposing the webview when the view is hidden
+          // or closed): serialize the dirty form into the webview state API
+          // so it can be restored with a notice on the next render.
+          function persistDraft() {
+            try {
+              vscode.setState({ draftSettings: collectFormSettings().settings });
+            } catch {
+              // Collection can fail mid-render; drafts are best-effort.
+            }
+          }
+
+          function takeSavedDraft() {
+            const state = vscode.getState();
+            return state && state.draftSettings ? state.draftSettings : undefined;
+          }
+
+          // ── Unsaved-changes warning (interceptable discard paths) ──────
+          // Shown before any extension-initiated re-render, in-form Reset, or
+          // external-settings reload discards dirty form state. Hosts a REAL
+          // "Don't show again" checkbox (this is a webview, unlike native
+          // modals). Uninterceptable discards are covered by persistDraft().
+          function confirmDiscardUnsaved(actionLabel) {
+            return new Promise(resolve => {
+              if (!formDirty || !warnUnsavedSettings) {
+                resolve(true);
+                return;
+              }
+              const overlay = document.createElement('div');
+              overlay.id = 'unsaved-warning-overlay';
+              overlay.innerHTML =
+                '<div id="unsaved-warning-dialog" role="alertdialog" aria-modal="true">' +
+                '<p><strong>You have unsaved model settings.</strong></p>' +
+                '<p>' + escapeHtml(actionLabel) + ' will discard them.</p>' +
+                '<label style="display:block;margin:10px 0"><input type="checkbox" id="unsaved-dont-show"> Don\\'t show again</label>' +
+                '<div class="btn-container">' +
+                '<button id="unsaved-discard">Discard Changes</button>' +
+                '<button id="unsaved-keep" class="secondary">Keep Editing</button>' +
+                '</div></div>';
+              document.body.appendChild(overlay);
+              const finish = (proceed) => {
+                const dontShow = overlay.querySelector('#unsaved-dont-show').checked;
+                if (dontShow) {
+                  warnUnsavedSettings = false;
+                  vscode.postMessage({ type: 'suppressUnsavedWarning' });
+                }
+                overlay.remove();
+                resolve(proceed);
+              };
+              overlay.querySelector('#unsaved-discard').addEventListener('click', () => finish(true));
+              overlay.querySelector('#unsaved-keep').addEventListener('click', () => finish(false));
+            });
+          }
+
+          window.addEventListener('message', async event => {
             const message = event.data;
             if (message.type === 'init') {
+              // An init while the form is dirty is a discard: the
+              // extension re-sends state after external settings changes or
+              // its own refresh. Warn (with opt-out) before applying.
+              if (initialized && formDirty) {
+                const proceed = await confirmDiscardUnsaved('Reloading the settings from disk');
+                if (!proceed) {
+                  // Keep the dirty form; the user can Save and the next
+                  // config-change event will re-sync.
+                  warnUnsavedSettings = message.warnUnsavedSettings !== false;
+                  return;
+                }
+              }
               currentSettings = message.settings || {};
               availableModels = message.models || [];
               stagesList = message.stages || [];
               stageDisplayNames = message.stageNames || {};
               quotaStatus = message.quotaStatus || {};
-              workspaceSettings = message.workspaceSettings || {};
+              enabledProviders = message.enabledProviders || {};
               providers = message.providers || [];
+              warnUnsavedSettings = message.warnUnsavedSettings !== false;
+
+              // Restore a draft preserved across a webview disposal.
+              const draft = takeSavedDraft();
+              let restoredDraft = false;
+              if (!initialized && draft) {
+                currentSettings = draft;
+                restoredDraft = true;
+              }
+
+              renderProviderSelection();
               renderTable();
-              renderWorkflowSettings();
               document.getElementById('loading-indicator').hidden = true;
               document.getElementById('settings-table').hidden = false;
               document.getElementById('model-settings-buttons').hidden = false;
-              formDirty = false;
-              updateSaveButtonState();
+              initialized = true;
+              if (restoredDraft) {
+                const note = document.createElement('div');
+                note.className = 'restored-note';
+                note.textContent = 'Restored unsaved changes from your previous session. Click Save Settings to apply them.';
+                const container = document.getElementById('restored-note-container');
+                container.innerHTML = '';
+                container.appendChild(note);
+                formDirty = true;
+                updateSaveButtonState();
+              } else {
+                clearDirty();
+              }
               // renderTable() is synchronous, so every row-<stage> element
               // exists by this point. Tell the extension host it's now safe
-              // to deliver a focusStage request (see the "rendered" case in
-              // resolveWebviewView) instead of it guessing from "ready"
-              // alone, which only means this listener is attached.
+              // to deliver a focusStage request.
               vscode.postMessage({ type: 'rendered' });
-            } else if (message.type === 'settingsLoaded') {
-              currentSettings = message.settings || {};
-              renderTable();
-              // Reset to Defaults only repopulates the form — it hasn't
-              // persisted anything yet, so treat this like any other
-              // unsaved edit and require an explicit Save Settings click.
-              markDirty();
             } else if (message.type === 'quotaStatus') {
               quotaStatus = message.quotaStatus || {};
-              renderTable();
-            } else if (message.type === 'providerSetupStatus') {
-              const status = document.getElementById('provider-status-' + message.providerId);
-              if (status) {
-                status.textContent = message.available ? '✓' : '✗';
-                status.title = message.message || '';
+              if (!formDirty) {
+                renderTable();
               }
             } else if (message.type === 'focusStage') {
               const row = document.getElementById('row-' + message.stage);
@@ -567,9 +613,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           });
 
           // Delegated dirty-tracking: rows in #stages-tbody are rebuilt by
-          // renderTable() on every 'init'/'settingsLoaded' message, so a
-          // single listener on the (static) container catches every current
-          // and future row's typed/selected changes without re-binding.
+          // renderTable() on every 'init' message, so a single listener on
+          // the (static) container catches every current and future row.
           document.getElementById('stages-tbody').addEventListener('input', markDirty);
           document.getElementById('stages-tbody').addEventListener('change', markDirty);
           document.getElementById('stages-tbody').addEventListener('click', event => {
@@ -579,8 +624,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           });
 
           // Tell the extension host this document's listener is attached
-          // and ready to receive "init". Posting "init" eagerly on resolve
-          // (instead of waiting for this) would race this script's load.
+          // and ready to receive "init".
           vscode.postMessage({ type: 'ready' });
 
           function escapeHtml(value) {
@@ -594,9 +638,6 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           }
 
           function modelLabel(model) {
-            // Availability/provider metadata belongs last and in brackets so
-            // the model name remains scannable and bracket text can be ignored
-            // by search ranking.
             return model ? model.name + ' — ' + model.providerLabel : '';
           }
 
@@ -604,39 +645,41 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             return availableModels.find(model => model.id === id);
           }
 
-          function providerLabelsInUse() {
-            // Providers are derived from the models actually on offer, so
-            // the filter always matches what's selectable and needs no
-            // separate provider registry (which excludes Copilot).
-            const seen = [];
-            availableModels.forEach(model => {
-              if (!seen.includes(model.providerLabel)) seen.push(model.providerLabel);
-            });
-            return seen;
+          // Provider prefix of a stored model id ("claude-cli:sonnet" ->
+          // "claude-cli"); bare ids are Copilot models (always offered).
+          function providerIdOfModelId(id) {
+            const sep = (id || '').indexOf(':');
+            if (sep <= 0) return 'copilot';
+            const prefix = id.slice(0, sep);
+            return providers.some(p => p.id === prefix) ? prefix : 'copilot';
+          }
+
+          function isStoredModelProviderDisabled(id) {
+            if (!id) return false;
+            const providerId = providerIdOfModelId(id);
+            if (providerId === 'copilot') return false;
+            return enabledProviders[providerId] !== true;
           }
 
           function modelComboboxHtml(kind, stage, selectedId, disabled) {
             const selectedModel = findModelById(selectedId);
+            // A stored selection whose provider is disabled (or that is
+            // otherwise unavailable) is preserved byte-for-byte: the hidden
+            // input keeps the stored id so saving never destroys it.
+            const providerDisabled = !selectedModel && isStoredModelProviderDisabled(selectedId);
             const selectedLabel = selectedModel
               ? modelLabel(selectedModel)
               : selectedId
-                ? 'Unknown model: ' + selectedId
+                ? (providerDisabled ? selectedId + ' (provider disabled)' : 'Unknown model: ' + selectedId)
                 : '';
-            const hiddenValue = selectedModel ? selectedId : '';
+            const hiddenValue = selectedId || '';
             const disabledAttr = disabled ? 'disabled' : '';
-            // Provider acts as a filter for the model list below it, so it is
-            // selected first and narrows what the search/dropdown shows.
-            // Pre-select the current model's provider so switching back to
-            // "All Providers" is an explicit, visible action rather than the
-            // default state hiding the already-configured model's provider.
-            const providerOptions = ['All Providers'].concat(providerLabelsInUse());
-            const selectedProviderLabel = selectedModel ? selectedModel.providerLabel : 'All Providers';
+            const disabledNote = providerDisabled
+              ? '<div class="provider-disabled-note">This model\\'s provider is disabled in Provider Selection above; the stage is treated as unconfigured until the provider is re-enabled or another model is chosen.</div>'
+              : '';
             return \`
               <div class="model-combobox" data-kind="\${kind}" data-stage="\${stage}">
-                <select class="model-provider-filter" id="\${kind}-provider-\${stage}" aria-label="Filter models by provider" \${disabledAttr}>
-                  \${providerOptions.map(label => '<option value="' + escapeHtml(label) + '" ' + (label === selectedProviderLabel ? 'selected' : '') + '>' + escapeHtml(label) + '</option>').join('')}
-                </select>
-                <input type="hidden" id="\${kind}-\${stage}" value="\${escapeHtml(hiddenValue || '')}">
+                <input type="hidden" id="\${kind}-\${stage}" value="\${escapeHtml(hiddenValue)}">
                 <input
                   type="text"
                   id="\${kind}-input-\${stage}"
@@ -650,15 +693,15 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                   \${disabledAttr}
                 >
                 <div id="\${kind}-list-\${stage}" class="model-options" role="listbox" hidden></div>
+                \${disabledNote}
               </div>
             \`;
           }
 
           function setupModelCombobox(row, kind, stage) {
-            const hidden = row.querySelector('#' + kind + '-' + stage);
-            const input = row.querySelector('#' + kind + '-input-' + stage);
-            const list = row.querySelector('#' + kind + '-list-' + stage);
-            const providerFilter = row.querySelector('#' + kind + '-provider-' + stage);
+            const hidden = row.querySelector('#' + CSS.escape(kind + '-' + stage));
+            const input = row.querySelector('#' + CSS.escape(kind + '-input-' + stage));
+            const list = row.querySelector('#' + CSS.escape(kind + '-list-' + stage));
             if (!hidden || !input || !list) {
               return;
             }
@@ -667,16 +710,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
 
             function getChoices(query) {
               const tokens = query.toLowerCase().match(/[a-z0-9.]+/g) || [];
-              const providerValue = providerFilter ? providerFilter.value : 'All Providers';
-              const modelsForProvider = providerValue === 'All Providers'
-                ? availableModels
-                : availableModels.filter(model => model.providerLabel === providerValue);
               const choices = [{ id: '', label: '(None)', searchable: 'none' }].concat(
-                modelsForProvider.map(model => ({
+                availableModels.map(model => ({
                   id: model.id,
                   label: modelLabel(model),
-                  // Plans/availability are rendered in brackets by providers;
-                  // they should never make a model match a query.
                   searchable: [model.name, model.providerLabel, model.id]
                     .join(' ').replace(/\\[[^\\]]*\\]/g, '').toLowerCase()
                 }))
@@ -685,13 +722,6 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                 return choices;
               }
               return choices.filter(choice => tokens.every(token => choice.searchable.includes(token)));
-            }
-
-            if (providerFilter) {
-              providerFilter.addEventListener('change', () => {
-                renderOptions();
-                input.focus();
-              });
             }
 
             function closeList() {
@@ -822,6 +852,64 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             return hidden.value;
           }
 
+          // Additional backup models use the SAME combobox control as the
+          // primary model (no plain <select> anywhere).
+          function addExtraBackupCombobox(row, stage, selectedId) {
+            const container = row.querySelector('.extra-backups');
+            if (!container || container.children.length >= 9) return;
+            const kind = 'backupx' + (++extraBackupSeq);
+            const item = document.createElement('div');
+            item.style.cssText = 'display:flex;gap:4px;margin-top:4px;align-items:flex-start';
+            item.innerHTML =
+              '<div style="flex:1">' + modelComboboxHtml(kind, stage, selectedId || '', false) + '</div>' +
+              '<button type="button" class="remove-backup" aria-label="Remove backup">×</button>';
+            item.querySelector('.remove-backup').addEventListener('click', () => {
+              item.remove();
+              syncBackupLimitFor(row);
+              markDirty();
+            });
+            container.appendChild(item);
+            setupModelCombobox(item, kind, stage);
+            syncBackupLimitFor(row);
+          }
+
+          function syncBackupLimitFor(row) {
+            const addBackupButton = row.querySelector('.add-backup');
+            const backupLimit = row.querySelector('.backup-limit');
+            if (!addBackupButton || !backupLimit) return;
+            const count = 1 + row.querySelectorAll('.extra-backups .model-combobox').length;
+            addBackupButton.disabled = count >= 10;
+            addBackupButton.title = count >= 10 ? 'A maximum of 10 backup models is allowed' : '';
+            backupLimit.textContent = count + '/10';
+          }
+
+          function renderProviderSelection() {
+            let container = document.getElementById('provider-selection');
+            container.innerHTML =
+              '<fieldset><legend>Provider Selection</legend>' +
+              providers.map(provider =>
+                '<div style="margin:4px 0;display:flex;align-items:center;gap:8px;flex-wrap:wrap">' +
+                '<label><input type="checkbox" data-provider="' + escapeHtml(provider.id) + '" ' + (enabledProviders[provider.id] === true ? 'checked' : '') + '> ' + escapeHtml(provider.label) + '</label>' +
+                '<button type="button" class="secondary provider-signin" data-signin-provider="' + escapeHtml(provider.id) + '" title="' + escapeHtml(provider.signInGuidance || 'Runs the provider\\'s login command in a visible terminal') + '">' + escapeHtml(provider.signInLabel || 'Sign in') + '</button>' +
+                '</div>'
+              ).join('') +
+              '<p style="margin:8px 0 0;font-size:0.9em">Enabled providers determine which models are offered below. Sign-in runs in a visible terminal; the extension reports it as launched, not as succeeded.</p>' +
+              '<div class="btn-container" style="margin-top:8px"><button id="save-providers-btn" class="secondary">Save Provider Selection</button></div>' +
+              '</fieldset>';
+            container.querySelectorAll('[data-signin-provider]').forEach(button => {
+              button.addEventListener('click', () => {
+                vscode.postMessage({ type: 'providerSignIn', providerId: button.dataset.signinProvider });
+              });
+            });
+            container.querySelector('#save-providers-btn').addEventListener('click', () => {
+              const next = {};
+              container.querySelectorAll('[data-provider]').forEach(input => {
+                next[input.dataset.provider] = input.checked;
+              });
+              vscode.postMessage({ type: 'saveProviders', enabledProviders: next });
+            });
+          }
+
           function renderTable() {
             const tbody = document.getElementById('stages-tbody');
             tbody.innerHTML = '';
@@ -832,14 +920,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               row.id = 'row-' + stage;
               row.className = 'stage-row';
 
-              // Quota telemetry is session-observed only (see utils/quota.ts):
-              // no provider exposes a numeric "percent remaining", so this
-              // shows what the last run for this stage+model actually
-              // reported instead of ever fabricating a number.
               const primaryQuotaStatus = quotaStatus[stage + ':primary'] || 'No usage observed yet this session';
               const backupQuotaStatus = quotaStatus[stage + ':backup'] || 'No usage observed yet this session';
-              const quotaText = \`<span class="quota-text tooltip" title="Session-observed usage status">\${primaryQuotaStatus}</span>\`;
-              const backupQuotaText = \`<span class="quota-text tooltip" title="Session-observed usage status">\${backupQuotaStatus}</span>\`;
+              const quotaText = \`<span class="quota-text" title="Session-observed usage status">\${primaryQuotaStatus}</span>\`;
+              const backupQuotaText = \`<span class="quota-text" title="Session-observed usage status">\${backupQuotaStatus}</span>\`;
 
               const backupModels = (setting.backups && setting.backups.length ? setting.backups : (setting.backup ? [setting.backup] : []));
 
@@ -863,9 +947,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                     <label for="backup-input-\${stage}" style="font-size: 0.9em; display:block; margin-bottom: 2px;">Backup models (tried in order):</label>
                     \${modelComboboxHtml('backup', stage, backupModels[0] || '', false)}
                     \${backupQuotaText}
-                    <div class="extra-backups">\${backupModels.slice(1).map(model => '<div style="display:flex;gap:4px;margin-top:4px"><select class="backup-extra" aria-label="Additional backup model">' + availableModels.map(candidate => '<option value="' + escapeHtml(candidate.id) + '" ' + (candidate.id === model ? 'selected' : '') + '>' + escapeHtml(modelLabel(candidate)) + '</option>').join('') + '</select><button type="button" class="remove-backup" aria-label="Remove backup">×</button></div>').join('')}</div>
-                    <button type="button" class="add-backup" style="margin-top:4px" \${backupModels.length >= 10 ? 'disabled title="A maximum of 10 backup models is allowed"' : ''}>+ Add another backup</button>
-                    <span class="backup-limit" style="margin-left:4px;font-size:0.9em">\${backupModels.length}/10</span>
+                    <div class="extra-backups"></div>
+                    <button type="button" class="add-backup" style="margin-top:4px">+ Add another backup</button>
+                    <span class="backup-limit" style="margin-left:4px;font-size:0.9em">1/10</span>
                   </div>
                 </td>
               \`;
@@ -874,60 +958,18 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               setupModelCombobox(row, 'primary', stage);
               setupModelCombobox(row, 'backup', stage);
 
-              const addBackupButton = row.querySelector('.add-backup');
-              const backupLimit = row.querySelector('.backup-limit');
-              const syncBackupLimit = () => {
-                const count = 1 + row.querySelectorAll('.backup-extra').length;
-                addBackupButton.disabled = count >= 10;
-                addBackupButton.title = count >= 10 ? 'A maximum of 10 backup models is allowed' : '';
-                backupLimit.textContent = count + '/10';
-              };
-              addBackupButton.addEventListener('click', () => {
-                const container = row.querySelector('.extra-backups');
-                if (container.children.length >= 9) return;
-                const item = document.createElement('div');
-                item.style.cssText = 'display:flex;gap:4px;margin-top:4px';
-                item.innerHTML = '<select class="backup-extra" aria-label="Additional backup model">' + availableModels.map(model => '<option value="' + escapeHtml(model.id) + '">' + escapeHtml(modelLabel(model)) + '</option>').join('') + '</select><button type="button" class="remove-backup" aria-label="Remove backup">×</button>';
-                item.querySelector('.remove-backup').addEventListener('click', () => {
-                  item.remove();
-                  syncBackupLimit();
-                });
-                container.appendChild(item);
-                syncBackupLimit();
+              backupModels.slice(1).forEach(model => addExtraBackupCombobox(row, stage, model));
+
+              row.querySelector('.add-backup').addEventListener('click', () => {
+                addExtraBackupCombobox(row, stage, '');
               });
-              row.querySelectorAll('.remove-backup').forEach(button => button.addEventListener('click', () => {
-                button.parentElement.remove();
-                syncBackupLimit();
-              }));
-              syncBackupLimit();
+              syncBackupLimitFor(row);
             });
           }
 
-          function checked(value) { return value ? 'checked' : ''; }
-          function renderWorkflowSettings() {
-            const container = document.getElementById('workflow-settings');
-            const enabled = workspaceSettings.enabledProviders || {};
-            container.innerHTML =
-              '<fieldset><legend>Meta-file visibility</legend>' +
-              '<label><input id="meta-files-hidden" type="checkbox" ' + checked(workspaceSettings.metaFilesHidden) + '> Hide Ensemble meta resources from Git</label></fieldset>' +
-              '<fieldset style="margin-top:12px"><legend>Provider Selection</legend>' +
-              providers.map(provider => '<div style="margin:4px 0"><label><input type="checkbox" data-provider="' + escapeHtml(provider.id) + '" ' + checked(enabled[provider.id] === true) + '> ' + escapeHtml(provider.label) + '</label> <button type="button" class="test-provider" data-test-provider="' + escapeHtml(provider.id) + '">Test Setup</button> <span id="provider-status-' + escapeHtml(provider.id) + '" aria-live="polite">?</span></div>').join('') +
-              '<p style="margin:8px 0 0;font-size:0.9em">Usage status is session-observed; providers do not expose a live numeric quota through these checks.</p></fieldset>';
-            container.querySelectorAll('[data-test-provider]').forEach(button => {
-              button.addEventListener('click', () => {
-                const providerId = button.dataset.testProvider;
-                const status = document.getElementById('provider-status-' + providerId);
-                if (status) status.textContent = '…';
-                vscode.postMessage({ type: 'testProviderSetup', providerId });
-              });
-            });
-          }
-
-          document.getElementById('save-btn').addEventListener('click', () => {
+          function collectFormSettings() {
             const updatedSettings = {};
-            let hasErrors = false;
-            const alertRegion = document.getElementById('alert-region');
-            alertRegion.innerText = '';
+            const errors = [];
 
             stagesList.forEach(stage => {
               const primary = reconcileModelInput('primary', stage);
@@ -936,25 +978,22 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               const usesBackup = strategy === 'switch-to-backup';
               const backup = reconcileModelInput('backup', stage);
               const backupText = document.getElementById('backup-input-' + stage).value.trim();
-              const extraBackups = Array.from(document.querySelectorAll('#row-' + stage + ' .backup-extra')).map(input => input.value.trim()).filter(Boolean);
+              const row = document.getElementById('row-' + stage);
+              const extraBackups = Array.from(row.querySelectorAll('.extra-backups .model-combobox input[type="hidden"]'))
+                .map(input => input.value.trim()).filter(Boolean);
 
-              if (primaryText && !primary) {
-                hasErrors = true;
-                alertRegion.innerText += 'Stage ' + (stageDisplayNames[stage] || stage) + ' has an invalid primary model selection. Choose a model from the list.\\n';
+              // A stored id whose provider is disabled resolves to no
+              // available model but must be preserved, not flagged invalid.
+              const primaryIsPreservedStored = primary && !findModelById(primary);
+              if (primaryText && !primary && !primaryIsPreservedStored) {
+                errors.push('Stage ' + (stageDisplayNames[stage] || stage) + ' has an invalid primary model selection. Choose a model from the list.');
               }
-
-              if (usesBackup && backupText && !backup) {
-                hasErrors = true;
-                alertRegion.innerText += 'Stage ' + (stageDisplayNames[stage] || stage) + ' has an invalid backup model selection. Choose a model from the list.\\n';
+              const backupIsPreservedStored = backup && !findModelById(backup);
+              if (usesBackup && backupText && !backup && !backupIsPreservedStored) {
+                errors.push('Stage ' + (stageDisplayNames[stage] || stage) + ' has an invalid backup model selection. Choose a model from the list.');
               }
-
               if (usesBackup && !backup) {
-                hasErrors = true;
-                alertRegion.innerText += 'Stage ' + (stageDisplayNames[stage] || stage) + ' requires a valid backup model when Fallback Strategy is set to Switch to Backup.\\n';
-              }
-              if (usesBackup && extraBackups.some(candidate => !availableModels.some(model => model.id === candidate))) {
-                hasErrors = true;
-                alertRegion.innerText += 'Stage ' + (stageDisplayNames[stage] || stage) + ' has an invalid additional backup model selection.\\n';
+                errors.push('Stage ' + (stageDisplayNames[stage] || stage) + ' requires a valid backup model when Fallback Strategy is set to Switch to Backup.');
               }
 
               updatedSettings[stage] = {
@@ -965,38 +1004,40 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               };
             });
 
-            if (hasErrors) {
-              vscode.postMessage({ type: 'validationError', message: alertRegion.innerText.trim() });
+            return { settings: updatedSettings, errors };
+          }
+
+          document.getElementById('save-btn').addEventListener('click', () => {
+            const alertRegion = document.getElementById('alert-region');
+            alertRegion.innerText = '';
+            const collected = collectFormSettings();
+
+            if (collected.errors.length > 0) {
+              alertRegion.innerText = collected.errors.join('\\n');
+              vscode.postMessage({ type: 'validationError', message: collected.errors.join('\\n') });
               return;
             }
 
             vscode.postMessage({
               type: 'saveSettings',
-              settings: updatedSettings
+              settings: collected.settings
             });
 
             document.getElementById('status-region').innerText = 'Settings saved successfully.';
-            formDirty = false;
-            updateSaveButtonState();
+            document.getElementById('restored-note-container').innerHTML = '';
+            clearDirty();
           });
 
-          document.getElementById('reset-btn').addEventListener('click', () => {
-            vscode.postMessage({ type: 'resetDefaults' });
-          });
-
-          document.getElementById('save-workflow-btn').addEventListener('click', () => {
-            const enabledProviders = {};
-            document.querySelectorAll('[data-provider]').forEach(input => {
-              enabledProviders[input.dataset.provider] = input.checked;
-            });
-            vscode.postMessage({ type: 'saveWorkspaceSettings', settings: {
-              metaFilesHidden: document.getElementById('meta-files-hidden').checked,
-              enabledProviders
-            }});
-          });
-
-          document.getElementById('open-native-settings-btn').addEventListener('click', () => {
-            vscode.postMessage({ type: 'openNativeSettings' });
+          document.getElementById('reset-btn').addEventListener('click', async () => {
+            // Reset repopulates the form with empty settings; it is an
+            // interceptable discard of any dirty state, so it goes through
+            // the unsaved-changes warning first. Nothing is persisted until
+            // Save Settings is clicked.
+            const proceed = await confirmDiscardUnsaved('Resetting the form');
+            if (!proceed) return;
+            currentSettings = {};
+            renderTable();
+            markDirty();
           });
         </script>
       </body>

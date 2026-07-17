@@ -3,14 +3,14 @@ import { describe, it } from "node:test";
 import * as vscode from "vscode";
 import { ViewProgressBinder } from "../utils/viewProgressBinder";
 import { TaskOperationRegistry } from "../utils/taskOperations";
-import { TASKS_VIEW_ID } from "../views/taskTreeProvider";
+import { STATUS_VIEW_ID } from "../views/statusView";
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 void describe("ViewProgressBinder", () => {
-  void it("shows the view progress line only in Tasks, not Notifications", async () => {
+  void it("shows the view progress line only in Notifications, not Tasks", async () => {
     const registry = new TaskOperationRegistry();
     // Zero delay: this test is about WHERE the bar shows, not the debounce.
     const binder = new ViewProgressBinder(registry, 0);
@@ -25,7 +25,7 @@ void describe("ViewProgressBinder", () => {
       await sleep(5);
 
       assert.equal(operation !== null, true);
-      assert.deepEqual(calls.map((call) => call.options.location?.viewId), [TASKS_VIEW_ID]);
+      assert.deepEqual(calls.map((call) => call.options.location?.viewId), [STATUS_VIEW_ID]);
       registry.end(operation);
     } finally {
       delete windowWithCalls._withProgressCalls;
@@ -77,8 +77,8 @@ void describe("ViewProgressBinder", () => {
 
       assert.deepEqual(
         calls.map((call) => call.options.location?.viewId),
-        [TASKS_VIEW_ID],
-        "a long-running operation must surface the Tasks progress bar after the delay"
+        [STATUS_VIEW_ID],
+        "a long-running operation must surface the Notifications progress bar after the delay"
       );
       registry.end(operation);
     } finally {

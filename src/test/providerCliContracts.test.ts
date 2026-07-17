@@ -241,6 +241,48 @@ void describe("provider CLI contracts", () => {
     }
   });
 
+  void it("sign-in actions use each CLI's validated auth entry point", () => {
+    // Pinned to the commands validated against installed CLI versions on
+    // 2026-07-17 (see the signInCommand doc comment in providers.ts).
+    // Changing a value here requires re-validating against that CLI.
+    const validatedSignInCommands: Record<string, string> = {
+      "claude-cli": "claude",
+      "codex-cli": "codex login",
+      "gemini-cli": "gemini",
+      "antigravity-cli": "agy",
+      "kiro-cli": "kiro-cli login",
+    };
+
+    for (const provider of CLI_PROVIDERS) {
+      const expected = validatedSignInCommands[provider.id];
+      assert.ok(
+        expected !== undefined,
+        `${provider.id} has no validated sign-in command on record`
+      );
+      assert.strictEqual(provider.signInCommand, expected, provider.id);
+
+      const executable = provider.signInCommand.split(" ")[0] ?? "";
+      assert.ok(
+        [provider.command, ...(provider.commandAliases ?? [])].includes(
+          executable
+        ),
+        `${provider.id} sign-in must launch the provider's own executable`
+      );
+      assert.ok(
+        provider.signInLabel.length > 0,
+        `${provider.id} sign-in action needs a label`
+      );
+    }
+
+    const claude = getCliProvider("claude-cli");
+    assert.ok(claude);
+    assert.match(claude.signInLabel, /switch account/i);
+
+    const kiro = getCliProvider("kiro-cli");
+    assert.ok(kiro);
+    assert.match(kiro.signInGuidance ?? "", /KIRO_API_KEY/);
+  });
+
   void it("Kiro hints mention KIRO_API_KEY requirement", () => {
     const kiro = getCliProvider("kiro-cli");
     assert.ok(kiro, "expected kiro-cli provider definition");
