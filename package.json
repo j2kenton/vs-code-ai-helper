@@ -729,7 +729,7 @@
     "publish:minor": "vsce publish minor",
     "publish:major": "vsce publish major",
     "release": "powershell -ExecutionPolicy Bypass -File scripts/release.ps1",
-    "ensemble:release": "powershell -ExecutionPolicy Bypass -File scripts/release.ps1"
+    "ensemble:release": "npm run release"
   },
   "devDependencies": {
     "@types/node": "^20.10.0",
