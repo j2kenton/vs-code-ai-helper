@@ -21,6 +21,30 @@ import {
   updateTaskProgressStage,
 } from "./taskProgressUtils";
 
+// The disk-level CAS below protects multiple windows. This in-memory queue
+// additionally serializes transition dispatch within this extension host, so
+// a manual completion and an auto-advance cannot both reach downstream
+// dispatch work at the same time for one task.
+const transitionDispatches = new Map<string, Promise<void>>();
+
+function queueTransition<T>(taskFolderUri: vscode.Uri, action: () => Promise<T>): Promise<T> {
+  const key = taskFolderUri.fsPath.toLowerCase();
+  const previous = transitionDispatches.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => { release = resolve; });
+  transitionDispatches.set(key, current);
+
+  return previous
+    .catch(() => undefined)
+    .then(action)
+    .finally(() => {
+      release();
+      if (transitionDispatches.get(key) === current) {
+        transitionDispatches.delete(key);
+      }
+    });
+}
+
 /**
  * Result returned from advanceStage so callers can decide whether to
  * dispatch auto-review or show success messages.
@@ -132,6 +156,28 @@ export async function advanceStage(
   isPaused: boolean,
   kind: TransitionKind,
   optIn: boolean = true,
+  expectedReviewAttemptId?: string,
+  publishArtifact?: () => Promise<void>
+): Promise<StageTransitionResult | undefined> {
+  return queueTransition(taskFolderUri, () => advanceStageLocked(
+    taskFolderUri,
+    sourceStage,
+    newStage,
+    isPaused,
+    kind,
+    optIn,
+    expectedReviewAttemptId,
+    publishArtifact
+  ));
+}
+
+async function advanceStageLocked(
+  taskFolderUri: vscode.Uri,
+  sourceStage: TaskStage,
+  newStage: TaskStage,
+  isPaused: boolean,
+  kind: TransitionKind,
+  optIn: boolean,
   expectedReviewAttemptId?: string,
   publishArtifact?: () => Promise<void>
 ): Promise<StageTransitionResult | undefined> {

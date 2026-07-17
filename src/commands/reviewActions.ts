@@ -8,7 +8,8 @@ import {
 } from "../config/settings";
 import {
   taskOperations,
-  showTaskBusyWarning,
+  runTrackedOperation,
+  linkCancellationTokens,
   TaskOperationHandle,
 } from "../utils/taskOperations";
 import {
@@ -202,6 +203,13 @@ interface ExecuteImplementationRunOptions {
   /** Preserve a stage's active fallback reservation across one internal retry loop. */
   preserveActiveFallback?: boolean;
   onBusyDetail?: (detail: string | undefined) => void;
+  /**
+   * Tracked operation this run executes under. When set, the post-run
+   * auto-review registers as a child of it (C1 nesting), so the stage-row
+   * spinner moves from the implementation row to the review row while the
+   * re-review runs.
+   */
+  parentOperation?: TaskOperationHandle;
 }
 
 /**
@@ -698,17 +706,30 @@ async function runAiToFile(options: {
       NotificationRouter.emitProgressSummary(`${options.progressAction} with ${providerLabel}...`);
       progress.report({ message: `Waiting for ${providerLabel} response...` });
 
-      const result = await runner.run(
-        {
-          taskFolderUri: options.taskFolderUri,
-          workspaceUri: options.workspaceUri,
-          stage: options.logStage,
-          prompt,
-          outputFile: stagedOutputUri,
-          modelId: nativeModelId,
-        },
-        token
+      // The run must also honor the tracked operation's cancellation token
+      // (the Notifications-section cancel button), not just the native
+      // progress token — this call site is deep enough that it never
+      // receives the operation handle, so look it up by task key.
+      const linked = linkCancellationTokens(
+        token,
+        taskOperations.tokenFor(options.taskFolderUri.fsPath)
       );
+      let result: Awaited<ReturnType<typeof runner.run>>;
+      try {
+        result = await runner.run(
+          {
+            taskFolderUri: options.taskFolderUri,
+            workspaceUri: options.workspaceUri,
+            stage: options.logStage,
+            prompt,
+            outputFile: stagedOutputUri,
+            modelId: nativeModelId,
+          },
+          linked.token
+        );
+      } finally {
+        linked.dispose();
+      }
 
       await writeRunLog(
         options.taskFolderUri,
@@ -887,7 +908,18 @@ export async function runReviewForFolder(
   workspaceRoot: vscode.WorkspaceFolder,
   currentStage: TaskStage,
   _skipOverwriteConfirmation: boolean,  // kept for API compat, always skipped now
-  options: { preserveActiveFallback?: boolean } = {}
+  options: {
+    preserveActiveFallback?: boolean;
+    /**
+     * The tracked operation this review runs under. The auto-advance tail
+     * below registers its follow-up review as a CHILD of it — claiming a new
+     * exclusive lock there while the caller still holds this one would refuse
+     * itself and surface a spurious "Review is already in progress" warning
+     * instead of starting the next stage's review (the reported auto-advance
+     * defect).
+     */
+    operation?: TaskOperationHandle;
+  } = {}
 ): Promise<void> {
   const targetStage = REVIEW_TARGETS[currentStage];
   const reviewUri = targetStage && artifactUri(folderUri, targetStage);
@@ -1116,30 +1148,34 @@ export async function runReviewForFolder(
                   const nextWorkspaceRoot = resolveOwnerWorkspace(freshProgress);
                   if (nextWorkspaceRoot) {
                     // This dispatch bypasses the runReviewWithAI command, so it
-                    // must claim the exclusive lock itself — otherwise a manual
-                    // "Review with AI" click racing this auto-dispatch (the
-                    // registry has no record of this run in progress) would
-                    // start a second concurrent review for the same task.
+                    // must register with the operation registry itself. It runs
+                    // while the caller's own tracked operation still holds the
+                    // task's exclusive lock, so it MUST register as a child of
+                    // that operation (options.operation) — claiming a fresh
+                    // exclusive lock here refuses against the caller's own lock
+                    // and the auto-started review silently never runs. As a
+                    // child it also moves the stage-row spinner onto the newly
+                    // entered review stage.
                     const autoReviewLockKey = folderUri.fsPath;
-                    const autoReviewOp = taskOperations.begin(autoReviewLockKey, {
-                      label: "Review",
-                      stage: freshProgress.currentStage,
-                    });
-                    if (!autoReviewOp) {
-                      showTaskBusyWarning(autoReviewLockKey);
-                    } else {
-                      try {
-                        await runReviewForFolder(
+                    await runTrackedOperation(
+                      autoReviewLockKey,
+                      {
+                        label: "Review",
+                        stage: freshProgress.currentStage,
+                        kind: "review",
+                        cancellable: true,
+                        parent: options.operation,
+                      },
+                      (autoReviewOp) =>
+                        runReviewForFolder(
                           extensionUri,
                           folderUri,
                           nextWorkspaceRoot,
                           freshProgress.currentStage,
-                          true
-                        );
-                      } finally {
-                        taskOperations.end(autoReviewOp);
-                      }
-                    }
+                          true,
+                          { operation: autoReviewOp }
+                        )
+                    );
                   }
                 }
               }
@@ -1282,22 +1318,24 @@ export async function runReviewWithAI(
     return;
   }
   const lockKey = resolved.folderUri.fsPath;
-  const op = taskOperations.begin(lockKey, { label: "Review", stage: resolved.progress.currentStage });
-  if (!op) {
-    showTaskBusyWarning(lockKey);
-    return;
-  }
-  try {
-    await runReviewForFolder(
-      extensionUri,
-      resolved.folderUri,
-      workspaceRoot,
-      resolved.progress.currentStage,
-      true
-    );
-  } finally {
-    taskOperations.end(op);
-  }
+  await runTrackedOperation(
+    lockKey,
+    {
+      label: "Review",
+      stage: resolved.progress.currentStage,
+      kind: "review",
+      cancellable: true,
+    },
+    (op) =>
+      runReviewForFolder(
+        extensionUri,
+        resolved.folderUri,
+        workspaceRoot,
+        resolved.progress.currentStage,
+        true,
+        { operation: op }
+      )
+  );
 }
 
 /**
@@ -1371,13 +1409,8 @@ export async function applyReviewWithAI(
   }
 
   const lockKey = resolved.folderUri.fsPath;
-  const op = options.parentOperation ?? taskOperations.begin(lockKey, { label: "Apply Review", stage: resolved.progress.currentStage });
-  if (!op) {
-    showTaskBusyWarning(lockKey);
-    return;
-  }
-  try {
-    const stage = resolved.progress.currentStage;
+  const stage = resolved.progress.currentStage;
+  const runApply = async (op: TaskOperationHandle): Promise<void> => {
     const reviewUri = artifactUri(resolved.folderUri, stage);
     const reviewContent = reviewUri && (await readNonEmptyText(reviewUri));
     if (!reviewContent) {
@@ -1403,16 +1436,26 @@ export async function applyReviewWithAI(
     const isPlanReview = isPlanReviewStage(stage);
 
     if (!isPlanReview) {
-      await applyImplementationReviewWithAI(
-        extensionUri,
-        resolved.folderUri,
-        workspaceRoot,
-        stage,
-        reviewContent,
-        {
-          skipPreRunSafetyCheck: options.skipImplementationSafetyCheck,
-          preserveActiveFallback: options.preserveActiveFallback,
-        }
+      // Child operation (C1 nesting): while the fix is being implemented the
+      // stage-row spinner sits on the Implementation row, not the review row.
+      // The re-review that follows registers its own child inside
+      // executeImplementationRun, moving the spinner back to the review row.
+      await runTrackedOperation(
+        lockKey,
+        { parent: op, label: "Applying implementation review", stage: "impl", kind: "run-implementation" },
+        (child) =>
+          applyImplementationReviewWithAI(
+            extensionUri,
+            resolved.folderUri,
+            workspaceRoot,
+            stage,
+            reviewContent,
+            {
+              skipPreRunSafetyCheck: options.skipImplementationSafetyCheck,
+              preserveActiveFallback: options.preserveActiveFallback,
+              parentOperation: child,
+            }
+          )
       );
       return;
     }
@@ -1445,38 +1488,59 @@ export async function applyReviewWithAI(
     // No overwrite confirmation — user triggered this deliberately.
     // Log under the review stage label but execute with the `plan` model so
     // the plan-rewrite uses plan-stage model configuration, not the review model.
-    const applySucceeded = await runAiToFile({
-      extensionUri,
-      taskFolderUri: resolved.folderUri,
-      workspaceUri: workspaceRoot.uri,
-      logStage: stage,          // review stage — for run logs and progress labels
-      executionStage: "plan",   // plan model — for actual AI model resolution
-      templateFile,
-      variables,
-      outputFileUri,
-      progressAction: `Applying review to ${outputLabel}`,
-      outputLabel,
-      preserveActiveFallback: options.preserveActiveFallback,
-    });
+    // Child operation (C1 nesting): the spinner sits on the Plan row while the
+    // plan is being rewritten, then moves back to the review row below.
+    const applySucceeded = await runTrackedOperation(
+      lockKey,
+      { parent: op, label: `Applying review to ${outputLabel}`, stage: "plan", kind: "apply-review" },
+      () =>
+        runAiToFile({
+          extensionUri,
+          taskFolderUri: resolved.folderUri,
+          workspaceUri: workspaceRoot.uri,
+          logStage: stage,          // review stage — for run logs and progress labels
+          executionStage: "plan",   // plan model — for actual AI model resolution
+          templateFile,
+          variables,
+          outputFileUri,
+          progressAction: `Applying review to ${outputLabel}`,
+          outputLabel,
+          preserveActiveFallback: options.preserveActiveFallback,
+        })
+    );
 
     if (applySucceeded) {
       if (reviewUri) {
         await markReviewArtifactStale(reviewUri, PLAN_FILENAME);
       }
       // Re-review after applying (no confirmation, no stage change)
-      await runReviewForFolder(
-        extensionUri,
-        resolved.folderUri,
-        workspaceRoot,
-        stage,
-        true,
-        { preserveActiveFallback: options.preserveActiveFallback }
+      await runTrackedOperation(
+        lockKey,
+        { parent: op, label: "Re-running review", stage, kind: "review" },
+        (reReviewOp) =>
+          runReviewForFolder(
+            extensionUri,
+            resolved.folderUri,
+            workspaceRoot,
+            stage,
+            true,
+            { preserveActiveFallback: options.preserveActiveFallback, operation: reReviewOp }
+          )
       );
     }
-  } finally {
-    if (!options.parentOperation) {
-      taskOperations.end(op);
-    }
+  };
+
+  if (options.parentOperation) {
+    // A composite caller (fast-forward) already registered the tracked
+    // operation; run under its handle so the whole composite renders exactly
+    // one Notifications row and internal attempts nest as its children.
+    await runApply(options.parentOperation);
+  } else {
+    await runTrackedOperation(
+      lockKey,
+      { label: "Apply Review", stage, kind: "apply-review", cancellable: true },
+      runApply
+    );
   }
 }
 
@@ -1542,12 +1606,15 @@ export async function fastForwardReviewWithAI(
   }
 
   const lockKey = resolved.folderUri.fsPath;
-  const op = taskOperations.begin(lockKey, { label: "Fast Forward Review", stage: resolved.progress.currentStage });
-  if (!op) {
-    showTaskBusyWarning(lockKey);
-    return;
-  }
-  try {
+  await runTrackedOperation(
+    lockKey,
+    {
+      label: "Fast Forward Review",
+      stage: resolved.progress.currentStage,
+      kind: "fast-forward",
+      cancellable: true,
+    },
+    async (op) => {
   const stage = resolved.progress.currentStage;
   const reviewUri = artifactUri(resolved.folderUri, stage);
   if (!reviewUri) {
@@ -1575,7 +1642,7 @@ export async function fastForwardReviewWithAI(
         title: `Running initial ${STAGE_DISPLAY_NAMES[stage] ?? "review"} before fast-forwarding...`,
         cancellable: false,
       },
-      () => runReviewForFolder(extensionUri, resolved.folderUri, workspaceRoot, stage, true)
+      () => runReviewForFolder(extensionUri, resolved.folderUri, workspaceRoot, stage, true, { operation: op })
     );
     initialContent = await readNonEmptyText(reviewUri);
     if (!initialContent) {
@@ -1617,19 +1684,25 @@ export async function fastForwardReviewWithAI(
         title: `Fast-forwarding ${STAGE_DISPLAY_NAMES[stage] ?? "review"}...`,
         cancellable: true,
       },
-      (progress, token) =>
-        improveReviewScore({
+      (progress, token) => {
+        // Cancelling from either surface — the native progress toast or the
+        // Notifications-section cancel button (the operation's own token) —
+        // must stop the loop.
+        const linked = linkCancellationTokens(token, op.token);
+        return improveReviewScore({
           context,
           stage,
           baselineScore,
           maxAttempts,
           stopAtScore: configuredStopLevel,
-          token,
+          token: linked.token,
           apply: async () => {
             attemptNumber += 1;
             progress.report({
               message: `Attempt ${attemptNumber} of ${maxAttempts}...`,
             });
+            // Iteration progress on the root operation's Notifications row.
+            op.report(`iteration ${attemptNumber}/${maxAttempts}`);
             await applyReviewWithAI(
               extensionUri,
               context,
@@ -1645,7 +1718,8 @@ export async function fastForwardReviewWithAI(
             previousContent = newContent;
             return parseReadiness(newContent).score;
           },
-        })
+        }).finally(() => linked.dispose());
+      }
     );
   } catch (error) {
     if (error instanceof vscode.CancellationError) {
@@ -1673,9 +1747,8 @@ export async function fastForwardReviewWithAI(
       }/10).`
     );
   }
-  } finally {
-    taskOperations.end(op);
-  }
+    }
+  );
 }
 
 /**
@@ -1910,17 +1983,31 @@ export async function nextStage(
   }
 
   // ── Step 1: Persist stage transition using shared helper ──────────────────
-  const transitionResult = await advanceStage(
-    resolved.folderUri,
-    resolved.progress.currentStage,
-    next,
-    resolved.progress.status === "paused",
-    "complete-and-move-on",
-    // Completing a stage may start work in its destination only when the
-    // workspace explicitly enables that behavior.  Manual stage selection
-    // deliberately does not use this path.
-    completeAndMoveOnTriggersAI()
-  );
+  let transitionResult: Awaited<ReturnType<typeof advanceStage>>;
+  try {
+    transitionResult = await advanceStage(
+      resolved.folderUri,
+      resolved.progress.currentStage,
+      next,
+      resolved.progress.status === "paused",
+      "complete-and-move-on",
+      // Completing a stage may start work in its destination only when the
+      // workspace explicitly enables that behavior.  Manual stage selection
+      // deliberately does not use this path.
+      completeAndMoveOnTriggersAI()
+    );
+  } catch (error) {
+    // advanceStage throws (rather than resolving falsy) when its
+    // compare-and-set is rejected — e.g. an auto-advance already moved this
+    // task off the expected source stage under the lock while this manual
+    // "Complete Stage & Move On" was in flight. Report it like any other
+    // failed transition instead of an unhandled rejection.
+    const message = error instanceof Error ? error.message : String(error);
+    NotificationRouter.showWarning(
+      `Could not advance ${resolved.progress.taskFolder}: ${message}`
+    );
+    return;
+  }
 
   if (!transitionResult?.persisted) {
     void vscode.window.showErrorMessage(
@@ -1986,25 +2073,24 @@ export async function nextStage(
         // racing this auto-dispatch (the registry has no record of this run
         // in progress) would start a second concurrent review for the same task.
         const autoReviewLockKey = resolved.folderUri.fsPath;
-        const autoReviewOp = taskOperations.begin(autoReviewLockKey, {
-          label: "Review",
-          stage: freshProgress.currentStage,
-        });
-        if (!autoReviewOp) {
-          showTaskBusyWarning(autoReviewLockKey);
-        } else {
-          try {
-            await runReviewForFolder(
+        await runTrackedOperation(
+          autoReviewLockKey,
+          {
+            label: "Review",
+            stage: freshProgress.currentStage,
+            kind: "review",
+            cancellable: true,
+          },
+          (autoReviewOp) =>
+            runReviewForFolder(
               extensionUri,
               resolved.folderUri,
               workspaceRoot,
               freshProgress.currentStage,
-              true
-            );
-          } finally {
-            taskOperations.end(autoReviewOp);
-          }
-        }
+              true,
+              { operation: autoReviewOp }
+            )
+        );
       }
     }
   }
@@ -2083,12 +2169,10 @@ export async function generateImplementationWithAI(
   }
 
   const lockKey = resolved.folderUri.fsPath;
-  const op = taskOperations.begin(lockKey, { label: "Generate Implementation", stage: "impl" });
-  if (!op) {
-    showTaskBusyWarning(lockKey);
-    return;
-  }
-  try {
+  await runTrackedOperation(
+    lockKey,
+    { label: "Generate Implementation", stage: "impl", kind: "generate-implementation", cancellable: true },
+    async () => {
     // Materialize canonical plan-final.md from legacy implementation.md if needed.
     // This mirrors the same migration path used by runImplementationWithAI so
     // that both implementation-stage entry points handle legacy task folders
@@ -2142,9 +2226,8 @@ export async function generateImplementationWithAI(
     if (succeeded) {
       await setStage(resolved.folderUri, "impl");
     }
-  } finally {
-    taskOperations.end(op);
-  }
+    }
+  );
 }
 
 /**
@@ -2240,11 +2323,18 @@ async function executeImplementationRun(
     },
     async (progress, token) => {
       NotificationRouter.emitProgressSummary(progressTitle);
+      // Honor the tracked operation's cancellation token (Notifications-
+      // section cancel button) alongside the native progress token.
+      const linked = linkCancellationTokens(
+        token,
+        taskOperations.tokenFor(folderUri.fsPath)
+      );
+      try {
       result = await runImplementationForModel({
         prompt,
         modelId,
         workspaceUri: workspaceRoot.uri,
-        token,
+        token: linked.token,
         onProgress: (message) => progress.report({ message }),
         // `modelId` is always resolved from the "impl" stage (see the two
         // callers of executeImplementationRun) — quota/fallback bookkeeping
@@ -2254,6 +2344,9 @@ async function executeImplementationRun(
         taskFolderUri: folderUri,
         onBusyDetail: options.onBusyDetail,
       });
+      } finally {
+        linked.dispose();
+      }
     }
   );
 
@@ -2328,14 +2421,26 @@ async function executeImplementationRun(
     await safeOpenTextDocument(implementationUri, "plan-final.md");
     // Optional: a completed implementation only starts review when enabled in Settings.
     if (shouldAutoReviewAfterImplementation()) {
-      await runReviewForFolder(
-        extensionUri,
-        folderUri,
-        workspaceRoot,
-        postRunReviewStage,
-        true,
-        { preserveActiveFallback: options.preserveActiveFallback }
-      );
+      const runPostRunReview = (operation?: TaskOperationHandle): Promise<void> =>
+        runReviewForFolder(
+          extensionUri,
+          folderUri,
+          workspaceRoot,
+          postRunReviewStage,
+          true,
+          { preserveActiveFallback: options.preserveActiveFallback, operation }
+        );
+      if (options.parentOperation) {
+        // Child operation (C1 nesting): the stage-row spinner moves from the
+        // implementation row to the review row while the re-review runs.
+        await runTrackedOperation(
+          folderUri.fsPath,
+          { parent: options.parentOperation, label: "Reviewing implementation", stage: postRunReviewStage, kind: "review" },
+          (reviewOp) => runPostRunReview(reviewOp)
+        );
+      } else {
+        await runPostRunReview();
+      }
     }
   } else if (result.status === "cancelled") {
     NotificationRouter.showInformation("Implementation cancelled.");
@@ -2399,12 +2504,10 @@ export async function runImplementationWithAI(
   }
 
   const lockKey = resolved.folderUri.fsPath;
-  const op = taskOperations.begin(lockKey, { label: "Run Implementation", stage: "impl" });
-  if (!op) {
-    showTaskBusyWarning(lockKey);
-    return;
-  }
-  try {
+  await runTrackedOperation(
+    lockKey,
+    { label: "Run Implementation", stage: "impl", kind: "run-implementation", cancellable: true },
+    async (op) => {
     // Materialize canonical plan-final.md from legacy implementation.md if needed
     let canonicalUri: vscode.Uri;
     try {
@@ -2473,11 +2576,10 @@ export async function runImplementationWithAI(
       model.modelId,
       `Running implementation with ${providerLabel} (uses your ${providerLabel} quota)...`,
       postRunReviewStage,
-      { onBusyDetail: (d) => op.report(d) }
+      { onBusyDetail: (d) => op.report(d), parentOperation: op }
     );
-  } finally {
-    taskOperations.end(op);
-  }
+    }
+  );
 }
 
 /**
@@ -2545,6 +2647,10 @@ export function isSafeReleaseScript(script: unknown): script is string {
   );
 }
 
+/** Sentinel used to end the Release tracked operation as `failed` after the
+ * failure has already been surfaced to the user. */
+class ReleaseRunFailure extends Error {}
+
 async function runRelease(arg?: TaskNodeArg): Promise<void> {
   const candidate = arg?.task?.folderUri.fsPath;
   if (!candidate) {
@@ -2577,12 +2683,10 @@ async function runRelease(arg?: TaskNodeArg): Promise<void> {
   const root = owner?.uri.fsPath;
   if (!root) { void vscode.window.showWarningMessage("Open a workspace before releasing."); return; }
 
-  const op = taskOperations.begin(candidate, { label: "Release", taskName: arg?.task?.folderName ?? path.basename(candidate) });
-  if (!op) {
-    showTaskBusyWarning(candidate);
-    return;
-  }
-  try {
+  await runTrackedOperation(
+    candidate,
+    { label: "Release", taskName: arg?.task?.folderName ?? path.basename(candidate), kind: "release" },
+    async () => {
     let pkg: { scripts?: Record<string, unknown> };
     try {
       const parsed: unknown = JSON.parse(Buffer.from(await vscode.workspace.fs.readFile(vscode.Uri.file(`${root}/package.json`))).toString("utf8"));
@@ -2635,12 +2739,26 @@ async function runRelease(arg?: TaskNodeArg): Promise<void> {
       return;
     }
     const resolvedBeforeSpawn = managerPath;
-    await new Promise<void>(resolve => {
+    const failureMessage = await new Promise<string | undefined>(resolve => {
       const child = cp.spawn(resolvedBeforeSpawn, args, { cwd: root, shell: process.platform === "win32" && /\.(cmd|bat)$/i.test(resolvedBeforeSpawn), windowsHide: true });
-      child.on("close", code => { if (code === 0) NotificationRouter.showInformation("Release completed."); else void vscode.window.showErrorMessage(`Release failed (exit ${code ?? 1}).`); resolve(); });
-      child.on("error", e => { void vscode.window.showErrorMessage(`Release failed: ${e.message}`); resolve(); });
+      // A failed spawn fires "error" AND "close" — report exactly once, with
+      // the spawn error (the exit code from that "close" is meaningless).
+      let spawnError: Error | undefined;
+      child.on("error", e => { spawnError = e; resolve(`Release failed: ${e.message}`); });
+      child.on("close", code => {
+        if (spawnError) { return; }
+        if (code === 0) { NotificationRouter.showInformation("Release completed."); resolve(undefined); }
+        else { resolve(`Release failed (exit ${code ?? 1}).`); }
+      });
     });
-  } finally {
-    taskOperations.end(op);
-  }
+    if (failureMessage) {
+      void vscode.window.showErrorMessage(failureMessage);
+      // Thrown so the tracked operation records a `failed` terminal state;
+      // swallowed just below — the failure was already reported above.
+      throw new ReleaseRunFailure(failureMessage);
+    }
+    }
+  ).catch(error => {
+    if (!(error instanceof ReleaseRunFailure)) { throw error; }
+  });
 }

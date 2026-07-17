@@ -36,6 +36,9 @@ Thumbs.db
 # Test coverage
 coverage/
 
+# Downloaded VS Code builds + user data for extension-host tests (test:host)
+.vscode-test/
+
 # Environment files
 .env
 .env.local

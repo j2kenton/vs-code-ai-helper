@@ -108,19 +108,31 @@ import {
 import { TaskInventory } from "../state/taskInventory";
 import { getCanonicalImplementationUri } from "../utils/implementationArtifactResolver";
 import { initNotificationRouter } from "../utils/notificationRouter";
+import { installOperationNotificationBridge } from "../utils/operationNotificationBridge";
 
 // Initialize notification router to forward to vscode stubs so tests can intercept them
 initNotificationRouter({
   addEntry(message, level) {
-    if (level === "warning") {
-      void vscode.window.showWarningMessage(message);
-    } else if (level === "error") {
-      void vscode.window.showErrorMessage(message);
-    } else {
-      void vscode.window.showInformationMessage(message);
+    // Tests that don't install a message capture leave the window stubs in
+    // their throwing "not implemented" state; entries they never assert on
+    // are simply dropped.
+    try {
+      if (level === "warning") {
+        void vscode.window.showWarningMessage(message);
+      } else if (level === "error") {
+        void vscode.window.showErrorMessage(message);
+      } else {
+        void vscode.window.showInformationMessage(message);
+      }
+    } catch {
+      // No capture installed for this test — ignore.
     }
   }
 });
+// Production activation installs the operation → terminal-entry bridge, so
+// the full command paths exercised here must be asserted against that same
+// centralized subscription, not against ad-hoc per-command messages.
+installOperationNotificationBridge();
 
 /**
  * Build a minimal TaskInventory stub that returns a known task for a given
@@ -799,12 +811,13 @@ void describe("pauseTask integration (full command path)", () => {
 
       await pauseTask(inv, currentStore, { task });
 
-      // Command must show success message
+      // The operation-notification bridge must record the terminal entry for
+      // the tracked pause mutation (taxonomy: pause-task / terminal-always).
       assert.ok(
         msgs.captured.some(
-          (m) => m.method === "info" && m.message.includes("paused")
+          (m) => m.method === "info" && m.message.includes("Pause Task") && m.message.includes("completed")
         ),
-        "pauseTask with TaskNode arg must show 'paused' info message"
+        "pauseTask must record a lifecycle-backed 'Pause Task … completed' terminal entry"
       );
       // progress file must be updated
       const stored = await readStoredProgress(store, folderUri);
@@ -898,11 +911,13 @@ void describe("resumePausedTask integration (full command path)", () => {
 
       await resumePausedTask(inv, currentStore, { task });
 
+      // The operation-notification bridge must record the terminal entry for
+      // the tracked resume mutation (taxonomy: resume-task / terminal-always).
       assert.ok(
         msgs.captured.some(
-          (m) => m.method === "info" && m.message.includes("resumed")
+          (m) => m.method === "info" && m.message.includes("Resume Task") && m.message.includes("completed")
         ),
-        "resumePausedTask with TaskNode arg must show 'resumed' info message"
+        "resumePausedTask must record a lifecycle-backed 'Resume Task … completed' terminal entry"
       );
       const stored = await readStoredProgress(store, folderUri);
       assert.strictEqual(stored!.status, "active",
@@ -1186,7 +1201,7 @@ void describe("setTaskStage auto-review delegation (production code)", () => {
         inv,
         currentStore,
         { taskFolderPath: FOLDER_PATH, stage: "plan-high-review" },
-        true /* triggerAutoReview */
+        "complete-and-move-on" /* kind */
       );
 
       // Find the auto-review command dispatch
@@ -1249,12 +1264,13 @@ void describe("setTaskStage auto-review delegation (production code)", () => {
       );
       const currentStore = makeCurrentTaskStoreStub(undefined);
 
-      // triggerAutoReview=false (the default for manual set-stage-as-current)
+      // kind="jump" (the default for manual set-stage-as-current) is not in
+      // AUTO_REVIEW_ELIGIBLE_KINDS, so no auto-review can fire.
       await setTaskStage(
         inv,
         currentStore,
         { taskFolderPath: FOLDER_PATH, stage: "plan-high-review" },
-        false /* triggerAutoReview */
+        "jump" /* kind */
       );
 
       const reviewDispatch = execCmd.captured.find(
@@ -1845,7 +1861,7 @@ void describe("setTaskStage deleted-task error path", () => {
         inv,
         currentStore,
         { task, stage: "plan-high-review" },
-        false
+        "jump"
       );
 
       assert.ok(
@@ -1880,7 +1896,7 @@ void describe("setTaskStage deleted-task error path", () => {
           taskFolderPath: "/fake-workspace/nonexistent-task",
           stage: "impl",
         },
-        false
+        "jump"
       );
 
       assert.ok(
@@ -1904,7 +1920,7 @@ void describe("setTaskStage deleted-task error path", () => {
     const wsFolders = installWorkspaceFoldersStub();
 
     try {
-      await setTaskStage(inv, currentStore, undefined, false);
+      await setTaskStage(inv, currentStore, undefined, "jump");
 
       assert.ok(
         msgs.captured.some(

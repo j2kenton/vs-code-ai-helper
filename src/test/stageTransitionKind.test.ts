@@ -7,6 +7,7 @@ import * as vscode from "vscode";
 import {
   advanceStage,
   AUTO_REVIEW_ELIGIBLE_KINDS,
+  StageTransitionResult,
   TransitionKind,
 } from "../utils/stageTransition";
 import type { TaskProgress } from "../types/taskProgress";
@@ -130,4 +131,61 @@ void test("advanceStage(kind=\"complete-and-move-on\", optIn=false) never auto-r
 
   assert.ok(result?.persisted);
   assert.equal(result.shouldAutoReview, false);
+});
+
+// ---------------------------------------------------------------------------
+// C2 — concurrent manual+auto transition race.
+//
+// advanceStage has no separate in-memory mutex of its own; the guarantee
+// instead comes from patchTaskProgress's underlying withTaskLock (a real
+// cross-process file lease, see primarySessionLock.ts), which serializes
+// every write for a given task folder and re-validates currentStage under
+// the lock before writing. Two overlapping advanceStage calls for the same
+// task race for that lock; whichever loses sees the winner's already-applied
+// stage and REJECTS (patchTaskProgress does not catch the CAS-mismatch throw
+// from its update callback — see stageTransition.ts's "Task changed before
+// transition" throw) rather than resolving to undefined. Every production
+// call site must therefore wrap advanceStage in try/catch (setTaskStage.ts,
+// reviewActions.ts's nextStage, commitAndPushTask.ts all do); this test
+// exercises the underlying guarantee directly with a manual
+// ("complete-and-move-on") and an auto ("auto-advance") call fired
+// concurrently at the same source stage, matching the plan's "concurrent
+// manual+auto race" acceptance criterion.
+// ---------------------------------------------------------------------------
+
+void test("concurrent manual + auto-advance calls on the same task never both persist (single-dispatch guarantee)", async () => {
+  const store = new Map<string, string>();
+  installMemStore(store);
+  const folderUri = makeTaskFolderUri("concurrent-manual-auto-race");
+  seedProgress(store, folderUri, {
+    taskFolder: "concurrent-manual-auto-race",
+    currentStage: "plan",
+    createdAt: "2026-07-07T00:00:00.000Z",
+    updatedAt: "2026-07-07T00:00:00.000Z",
+  });
+
+  const [manual, auto] = await Promise.allSettled([
+    advanceStage(folderUri, "plan", "plan-high-review", false, "complete-and-move-on", true),
+    advanceStage(folderUri, "plan", "plan-high-review", false, "auto-advance", true),
+  ]);
+
+  const results = [manual, auto];
+  const succeeded = results.filter(
+    (r): r is PromiseFulfilledResult<StageTransitionResult | undefined> =>
+      r.status === "fulfilled" && r.value?.persisted === true
+  );
+  const rejected = results.filter((r) => r.status === "rejected");
+
+  assert.equal(succeeded.length, 1, "exactly one of the two racing transitions must persist");
+  assert.equal(rejected.length, 1, "the losing transition must reject (CAS failure), not silently apply");
+  assert.equal(succeeded[0]!.value!.shouldAutoReview, true, "the winning transition must still be auto-review eligible");
+
+  // A third, later call using the (now-stale) "plan" source stage must also
+  // reject — the task really did move, so nothing can replay the transition
+  // and produce a second dispatch after the race resolves.
+  await assert.rejects(
+    advanceStage(folderUri, "plan", "plan-high-review", false, "complete-and-move-on", true),
+    /Task changed before transition/,
+    "a stale replay of the same transition must not re-persist or re-dispatch"
+  );
 });

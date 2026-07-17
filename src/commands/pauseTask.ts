@@ -9,6 +9,7 @@ import {
 } from "../utils/taskProgressUtils";
 
 import { NotificationRouter } from "../utils/notificationRouter";
+import { runTrackedOperation } from "../utils/taskOperations";
 
 /**
  * Accepted argument shapes for pauseTask.
@@ -114,17 +115,29 @@ export async function pauseTask(
     return;
   }
 
+  // Tracked instant mutation (taxonomy: pause-task / terminal-always). The
+  // registration is synchronous, so the Notifications row appears optimistically
+  // the moment the button is pressed; the terminal entry is recorded centrally
+  // by the operation-notification bridge, not by an ad-hoc message here.
   const taskUri = vscode.Uri.file(resolvedTask.taskFolderPath);
-  const patched = await patchTaskProgress(taskUri, (current) =>
-    updateTaskStatus(current, "paused")
-  );
-  if (!patched) {
-    void vscode.window.showErrorMessage("Could not read task progress.");
-    return;
+  try {
+    await runTrackedOperation(
+      resolvedTask.taskFolderPath,
+      { label: "Pause Task", taskName: resolvedTask.folderName, kind: "pause-task" },
+      async () => {
+        const patched = await patchTaskProgress(taskUri, (current) =>
+          updateTaskStatus(current, "paused")
+        );
+        if (!patched) {
+          throw new Error("Could not read task progress.");
+        }
+        await inventory.refresh();
+      }
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    void vscode.window.showErrorMessage(message);
   }
-
-  await inventory.refresh();
-  NotificationRouter.showInformation(`Task paused.`);
 }
 
 /**

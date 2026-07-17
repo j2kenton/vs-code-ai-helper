@@ -102,7 +102,9 @@ void describe("operationIndicators", () => {
 
     beforeEach(() => {
       testWindow._withProgressCalls = [];
-      binder = new ViewProgressBinder(taskOperations);
+      // Short show delay so these tests stay fast while still exercising the
+      // debounced-show contract (default is VIEW_PROGRESS_SHOW_DELAY_MS).
+      binder = new ViewProgressBinder(taskOperations, 5);
     });
 
     afterEach(() => {
@@ -114,47 +116,52 @@ void describe("operationIndicators", () => {
     // triggers a single refresh rather than one per mutation. Callers therefore
     // observe the effect on the next microtask, not synchronously.
     const flush = (): Promise<void> => new Promise(resolve => queueMicrotask(resolve));
+    // The bar only appears once the registry stays busy past the show delay
+    // (anti-flicker debounce for instant mutations).
+    const waitForShowDelay = (): Promise<void> => new Promise(resolve => setTimeout(resolve, 25));
 
-    void it("opens exactly one progress bar per view on first busy, and none for a second concurrent op", async () => {
+    void it("opens exactly one progress bar (Tasks view only), and none for a second concurrent op", async () => {
       const calls = testWindow._withProgressCalls;
       assert.strictEqual(calls.length, 0);
 
       const op1 = taskOperations.begin("/dev/task_1", { label: "Op 1" });
       assert.ok(op1);
-      await flush();
-      // One bar for the Tasks view, one for the Notifications view.
-      assert.strictEqual(calls.length, 2);
+      await waitForShowDelay();
+      // A single bar, on the Tasks view. The Notifications view deliberately
+      // gets none — its persistent operation row already shows the state.
+      assert.strictEqual(calls.length, 1);
 
       const op2 = taskOperations.begin("/dev/task_2", { label: "Op 2" });
       assert.ok(op2);
-      await flush();
-      // Already busy — the bars are refcounted in aggregate, not per operation.
-      assert.strictEqual(calls.length, 2);
+      await waitForShowDelay();
+      // Already busy — the bar is refcounted in aggregate, not per operation.
+      assert.strictEqual(calls.length, 1);
 
       taskOperations.end(op1);
       taskOperations.end(op2);
       await flush();
     });
 
-    void it("keeps the bars up until the last operation ends", async () => {
+    void it("keeps the bar up until the last operation ends", async () => {
       const op1 = taskOperations.begin("/dev/task_1", { label: "Op 1" });
       const op2 = taskOperations.begin("/dev/task_2", { label: "Op 2" });
       assert.ok(op1);
       assert.ok(op2);
-      await flush();
+      await waitForShowDelay();
 
       const settled: string[] = [];
       const bars = testWindow._withProgressCalls
         .map((call, i) => call.task().then(() => { settled.push(`bar-${i}`); }));
+      assert.strictEqual(bars.length, 1, "exactly one bar (Tasks view) is open");
 
       taskOperations.end(op1);
       await flush();
-      assert.deepStrictEqual(settled, [], "bars must stay up while another operation is still running");
+      assert.deepStrictEqual(settled, [], "the bar must stay up while another operation is still running");
 
       taskOperations.end(op2);
       await flush();
       await Promise.all(bars);
-      assert.strictEqual(settled.length, 2, "both bars must come down once the last operation ends");
+      assert.strictEqual(settled.length, 1, "the bar must come down once the last operation ends");
     });
   });
 });

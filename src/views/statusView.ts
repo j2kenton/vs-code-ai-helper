@@ -1,6 +1,8 @@
 import * as vscode from "vscode";
 import { StatusSurface } from "../utils/notificationRouter";
 import { taskOperations } from "../utils/taskOperations";
+import { TaskOperationSnapshot } from "../utils/taskOperations";
+import { terminalEntryFor } from "../utils/operationNotificationBridge";
 
 export const STATUS_VIEW_ID = "vs-code-ai-helper.statusView";
 
@@ -18,6 +20,8 @@ export interface StatusOperationNode {
   readonly label: string;
   readonly taskName: string;
   readonly detail?: string;
+  /** Shows the inline cancel button (see the ensemble-operation-cancellable menu contribution). */
+  readonly cancellable: boolean;
 }
 
 export type StatusTreeNode = StatusEntry | StatusOperationNode;
@@ -27,6 +31,7 @@ function isOperationNode(node: StatusTreeNode): node is StatusOperationNode {
 }
 
 const STATUS_STATE_KEY = "ensemble.notifications";
+const RUNNING_OPERATIONS_STATE_KEY = "ensemble.runningOperations";
 /** Label text above this length is truncated with an ellipsis; the full text is still in the hover tooltip. */
 const LABEL_TRUNCATE_LENGTH = 150;
 
@@ -47,9 +52,31 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
       .map(entry => ({ ...entry, timestamp: new Date(entry.timestamp) }))
       .filter(entry => !Number.isNaN(entry.timestamp.getTime()));
 
+    // Operations themselves are necessarily in-memory, but a tiny snapshot
+    // lets a later activation tell the user that a live operation was cut off
+    // by reload rather than silently losing its Notifications row.
+    const interrupted = state?.get<SerializedOperation[]>(RUNNING_OPERATIONS_STATE_KEY, []) ?? [];
+    for (const snapshot of interrupted) {
+      const entry = terminalEntryFor({ ...snapshot, state: "interrupted" });
+      if (entry) {
+        this.entries.unshift({
+          message: entry.message,
+          level: "warning",
+          timestamp: new Date(),
+        });
+      }
+    }
+    if (interrupted.length > 0) {
+      this.persist();
+      void state?.update(RUNNING_OPERATIONS_STATE_KEY, []);
+    }
+
     // taskOperations is a module singleton that outlives this provider, so the
     // subscription must be released on dispose or it will fire into a dead emitter.
-    this.operationsSub = taskOperations.onDidChange(() => this.refresh());
+    this.operationsSub = taskOperations.onDidChange(() => {
+      this.persistRunningOperations();
+      this.refresh();
+    });
   }
 
   dispose(): void {
@@ -105,6 +132,13 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
     void this.writes.catch(() => undefined);
   }
 
+  private persistRunningOperations(): void {
+    if (!this.state) return;
+    const snapshots = taskOperations.getRootOperations().map(serializeOperation);
+    this.writes = this.writes.then(() => this.state!.update(RUNNING_OPERATIONS_STATE_KEY, snapshots));
+    void this.writes.catch(() => undefined);
+  }
+
   getTreeItem(element: StatusTreeNode): vscode.TreeItem {
     if (isOperationNode(element)) {
       const label = `${element.label} — ${element.taskName}`;
@@ -112,6 +146,11 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
       item.id = `running:${element.id}`;
       item.description = element.detail ?? "running";
       item.iconPath = new vscode.ThemeIcon("loading~spin", new vscode.ThemeColor("charts.blue"));
+      // Cancellable operations get an inline stop button via the
+      // view/item/context menu contribution keyed on this contextValue.
+      item.contextValue = element.cancellable
+        ? "ensemble-operation-cancellable"
+        : "ensemble-operation";
       return item;
     }
 
@@ -161,15 +200,31 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
 
   getChildren(element?: StatusTreeNode): vscode.ProviderResult<StatusTreeNode[]> {
     if (!element) {
-      const runningNodes = taskOperations.getAll().map((op): StatusOperationNode => ({
+      // Root operations only (C1 nesting): a composite like Fast Forward
+      // renders exactly one in-progress row, never one per internal attempt.
+      // getRootOperations surfaces the newest child detail on the root row.
+      const runningNodes = taskOperations.getRootOperations().map((op): StatusOperationNode => ({
         kind: "operation",
         id: op.id,
         label: op.label,
         taskName: op.taskName,
         detail: op.detail,
+        cancellable: op.cancellable,
       }));
       return [...runningNodes, ...this.entries];
     }
     return [];
   }
+}
+
+/** JSON-safe minimal representation of a root operation surviving reload. */
+type SerializedOperation = Pick<
+  TaskOperationSnapshot,
+  "id" | "key" | "label" | "stage" | "taskName" | "startedAt" |
+  "detail" | "exclusive" | "kind" | "parentId" | "cancellable"
+>;
+
+function serializeOperation(operation: TaskOperationSnapshot): SerializedOperation {
+  const { id, key, label, stage, taskName, startedAt, detail, exclusive, kind, parentId, cancellable } = operation;
+  return { id, key, label, stage, taskName, startedAt, detail, exclusive, kind, parentId, cancellable };
 }

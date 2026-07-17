@@ -3,6 +3,7 @@ import { spawn, execSync, execFileSync } from "child_process";
 import { patchTaskProgress, updateLintPayload } from "./taskProgressUtils";
 import * as fs from "fs";
 import * as path from "path";
+import { STAGE_ARTIFACT_FILENAMES } from "../types/taskProgress";
 
 /**
  * Resolve a package manager executable to an absolute path, preferring a
@@ -34,6 +35,25 @@ export interface CompletionLintResult {
   summary: string;
   issueCount: number;
   failedChecks: Array<{ command: string; exitCode: number; output: string }>;
+  /** `scripts` entries (from the conventional `lint`/`test` names) not found
+   * in the workspace `package.json`, and therefore skipped rather than run. */
+  missingScripts: string[];
+}
+
+/**
+ * Read the workspace `package.json`'s `scripts` map, or `undefined` if the
+ * file is missing/unreadable. Used to skip conventional `lint`/`test`
+ * checks that aren't configured instead of misreporting a package-manager
+ * "missing script" error as a real check failure.
+ */
+export function readPackageScripts(folder: string): Record<string, string> | undefined {
+  try {
+    const raw = fs.readFileSync(path.join(folder, "package.json"), "utf8");
+    const parsed = JSON.parse(raw) as { scripts?: Record<string, string> };
+    return parsed.scripts;
+  } catch {
+    return undefined;
+  }
 }
 
 function isInFolder(uri: vscode.Uri, folder: string): boolean {
@@ -74,12 +94,6 @@ function getOpenWorkspaceFiles(folder: string): string[] {
   return files;
 }
 
-function outputReferencesFile(output: string, folder: string, file: string): boolean {
-  const normalized = file.replace(/\\/g, "/");
-  const absolute = path.resolve(folder, file);
-  return output.includes(normalized) || output.includes(file.replace(/\//g, "\\")) || output.includes(absolute);
-}
-
 function runCheck(cwd: string, args: string[]): Promise<{ code: number; output: string }> {
   return new Promise((resolve) => {
     const executable = args[0] ?? "npm";
@@ -88,10 +102,20 @@ function runCheck(cwd: string, args: string[]): Promise<{ code: number; output: 
     // shim, not a real executable) can be exec'd at all — spawning a .cmd
     // file directly with shell:false fails with EINVAL. See cliAgentRunner.ts
     // for the same pattern applied to the CLI provider runners.
+    const useShell = process.platform === "win32" && /\.(cmd|bat)$/i.test(resolved);
+    // With shell:true, Node builds `cmd.exe /d /s /c "<command> <args...>"`
+    // without quoting `command` itself — an unquoted path containing spaces
+    // (e.g. the default Windows Node.js install, "C:\Program Files\nodejs\
+    // npm.cmd") gets split at the first space and misreported as
+    // "'C:\Program' is not recognized...", silently failing every lint/
+    // check-types/test check. Quote both the resolved executable and any
+    // argument containing spaces, mirroring cliAgentRunner.ts's existing
+    // argument-quoting for the same shell:true-on-Windows situation.
+    const quote = (value: string): string => (value.includes(" ") ? `"${value}"` : value);
     const child = spawn(
-      resolved,
-      args.slice(1),
-      { cwd, shell: process.platform === "win32" && /\.(cmd|bat)$/i.test(resolved) }
+      useShell ? quote(resolved) : resolved,
+      useShell ? args.slice(1).map(quote) : args.slice(1),
+      { cwd, shell: useShell }
     );
     let output = "";
     child.stdout?.on("data", (data: Buffer | string) => { output += typeof data === "string" ? data : data.toString("utf8"); });
@@ -108,13 +132,34 @@ function packageManager(folder: string): string {
   return "npm";
 }
 
-/** Collect diagnostics after fresh lint/type checks have completed. */
+/** Collect diagnostics after fresh lint/type/test checks have completed. */
 export async function collectCompletionLint(folder: string, relevantFiles?: readonly string[]): Promise<CompletionLintResult> {
   const manager = packageManager(folder);
-  const checks = await Promise.all([
-    [`${manager} run lint`, [manager, "run", "lint"]] as const,
-    [`${manager} run check-types`, [manager, "run", "check-types"]] as const,
-  ].map(async ([command, args]) => ({ command, ...(await runCheck(folder, [...args])) })));
+  const scripts = readPackageScripts(folder);
+  const missingScripts: string[] = [];
+
+  const candidateChecks: Array<readonly [string, string[]]> = [
+    [`${manager} run lint`, [manager, "run", "lint"]],
+    [`${manager} run check-types`, [manager, "run", "check-types"]],
+    [`${manager} run test`, [manager, "run", "test"]],
+  ];
+
+  // The conventional `lint`/`test` scripts (publish pre-check contract) are
+  // skipped rather than run when not present in package.json's `scripts`, so
+  // an unconfigured workspace gets clean setup guidance instead of every
+  // publish check being misreported as a failure. `check-types` predates
+  // that contract and keeps its existing unconditional-run behavior.
+  const runnableChecks = candidateChecks.filter(([, args]) => {
+    const scriptName = args[2];
+    if (scriptName !== "lint" && scriptName !== "test") return true;
+    const configured = !!scripts && Object.prototype.hasOwnProperty.call(scripts, scriptName);
+    if (!configured) missingScripts.push(scriptName);
+    return configured;
+  });
+
+  const checks = await Promise.all(
+    runnableChecks.map(async ([command, args]) => ({ command, ...(await runCheck(folder, [...args])) }))
+  );
 
   let filesToCheck = relevantFiles ? [...relevantFiles] : [];
   if (filesToCheck.length === 0) {
@@ -129,27 +174,108 @@ export async function collectCompletionLint(folder: string, relevantFiles?: read
       ? diagnostics.filter((d) => d.source === "eslint" || d.source === "ts" || d.source === "typescript")
       : []
   );
-  const commandFailures = checks.filter((check) => {
-    if (check.code === 0) return false;
-    // A repo-wide command may report pre-existing failures. Attribute it to
-    // this task only when the tool names one of the files in scope; if scope
-    // is genuinely unknown, retain the conservative blocking behavior.
-    // A non-zero exit with no attributable file is indeterminate, not a pass.
-    // Compiler/configuration failures often contain no source path and must
-    // remain blocking until the user resolves or explicitly reruns the check.
-    return filesToCheck.length === 0 || filesToCheck.some(file => outputReferencesFile(check.output, folder, file));
-  });
+  // A configured publish check is a workspace-level gate. Its exit status is
+  // authoritative: runner/configuration failures frequently name no source
+  // file at all, and filtering those by task-file attribution previously
+  // converted a real non-zero exit into a passing publish result. Keep every
+  // failed configured check so publish-review.md and the Publish Anyway / Fix
+  // / Cancel prompt always reflect the actual command outcome.
+  const commandFailures = checks.filter((check) => check.code !== 0);
   const issueCount = issues.length + commandFailures.length;
-  const summary = commandFailures.length > 0
+  const baseSummary = commandFailures.length > 0
     ? `${commandFailures.length} completion check(s) failed${issues.length ? `; ${issues.length} editor diagnostic(s) remain` : "."}`
     : issues.length === 0 ? "No linting issues found." : `${issues.length} lint issue(s) remain.`;
+  const summary = missingScripts.length > 0
+    ? `${baseSummary} (${missingScripts.join("/")} script(s) not configured — add them to package.json's ` +
+      `"scripts" to enable publish checks for them.)`
+    : baseSummary;
   return {
     runAt: new Date().toISOString(),
     passed: issueCount === 0,
     issueCount,
     summary,
     failedChecks: commandFailures.map(({ command, code, output }) => ({ command, exitCode: code, output })),
+    missingScripts,
   };
+}
+
+const PUBLISH_CHECKS_SECTION_START = "<!-- completion-checks:start -->";
+const PUBLISH_CHECKS_SECTION_END = "<!-- completion-checks:end -->";
+/** Cap per-failed-check output embedded in publish-review.md — this is a
+ * human-facing artifact, not an AI prompt, so it only needs enough of the
+ * output to identify the failure, not the full log. */
+const PUBLISH_CHECKS_MAX_OUTPUT_CHARS = 4000;
+
+function renderCompletionChecksSection(
+  result: CompletionLintResult,
+  override?: { reason: string }
+): string {
+  const lines: string[] = [PUBLISH_CHECKS_SECTION_START, "## Completion Checks", ""];
+  lines.push(`- Status: ${result.passed ? "Passed" : "Failed"}`);
+  lines.push(`- Last run: ${result.runAt}`);
+  lines.push(`- Summary: ${result.summary}`);
+  if (result.failedChecks.length > 0) {
+    lines.push("", "### Failed checks");
+    for (const check of result.failedChecks) {
+      const output = check.output.length > PUBLISH_CHECKS_MAX_OUTPUT_CHARS
+        ? `${check.output.slice(0, PUBLISH_CHECKS_MAX_OUTPUT_CHARS)}\n… (truncated)`
+        : check.output;
+      lines.push("", `**${check.command}** (exit ${check.exitCode})`, "```", output, "```");
+    }
+  }
+  if (override) {
+    lines.push("", `_Published anyway despite failing checks — ${override.reason}._`);
+  }
+  lines.push(PUBLISH_CHECKS_SECTION_END);
+  return lines.join("\n");
+}
+
+/**
+ * Merge a rendered "Completion Checks" section into whatever publish-review.md
+ * content already exists, replacing a previous run of the managed section in
+ * place so the AI-authored publish-readiness review (generated separately by
+ * the review-publish.md prompt) around it is preserved.
+ *
+ * @internal exported for testing
+ */
+export function mergeCompletionChecksSection(existing: string, section: string): string {
+  const startIdx = existing.indexOf(PUBLISH_CHECKS_SECTION_START);
+  const endIdx = existing.indexOf(PUBLISH_CHECKS_SECTION_END);
+  return startIdx !== -1 && endIdx !== -1 && endIdx > startIdx
+    ? existing.slice(0, startIdx) + section + existing.slice(endIdx + PUBLISH_CHECKS_SECTION_END.length)
+    : existing.trim().length > 0
+      ? `${existing.trimEnd()}\n\n${section}\n`
+      : `${section}\n`;
+}
+
+/**
+ * Upsert a "Completion Checks" section into publish-review.md. Every
+ * completion lint run at the Publish stage calls this, so both the "check"
+ * and "fix" paths keep this artifact current. Uses plain `node:fs` (like
+ * `readPackageScripts` above) rather than `vscode.workspace.fs` — this is
+ * always a plain file on disk inside the task folder, never a virtual FS
+ * scheme, so there's nothing the VS Code FS abstraction adds here.
+ */
+export async function upsertCompletionChecksInPublishReview(
+  taskFolderUri: vscode.Uri,
+  result: CompletionLintResult,
+  override?: { reason: string }
+): Promise<void> {
+  const filename = STAGE_ARTIFACT_FILENAMES.publish;
+  if (!filename) {
+    return;
+  }
+  const targetPath = path.join(taskFolderUri.fsPath, filename);
+
+  let existing = "";
+  try {
+    existing = await fs.promises.readFile(targetPath, "utf8");
+  } catch {
+    existing = "";
+  }
+
+  const section = renderCompletionChecksSection(result, override);
+  await fs.promises.writeFile(targetPath, mergeCompletionChecksSection(existing, section), "utf8");
 }
 
 /** Persist the latest completion lint result without changing the task stage. */
@@ -166,5 +292,10 @@ export async function runCompletionLint(folderUri: vscode.Uri, relevantFiles?: r
   if (!persisted) {
     throw new Error("Could not persist completion lint result.");
   }
+  // Every runCompletionLint call site gates on the task already being at (or
+  // advancing into) the Publish stage, so it's always safe to keep
+  // publish-review.md's checks section current here rather than at each of
+  // the eight call sites individually.
+  await upsertCompletionChecksInPublishReview(folderUri, result);
   return result;
 }

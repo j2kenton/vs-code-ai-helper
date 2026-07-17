@@ -226,7 +226,11 @@ export class StageNode extends vscode.TreeItem {
       artifactUri?.path.split("/").pop() ?? STAGE_ARTIFACT_FILENAMES[stage];
 
     const tKey = taskKey(task.canonicalId ?? task.folderUri.fsPath);
-    const isRunning = taskOperations.getTaskOperations(tKey).some(op => op.stage === stage);
+    // Leaf-operation semantics (C1 nesting): during a composite run the
+    // spinner follows the actively running sub-stage — the implementation
+    // row while a fix is being implemented, the review row while
+    // re-reviewing — rather than parking on the composite root's stage.
+    const isRunning = taskOperations.getActiveStages(tKey).includes(stage);
 
     if (isRunning) {
       this.iconPath = new vscode.ThemeIcon("loading~spin", new vscode.ThemeColor("charts.blue"));
@@ -278,6 +282,22 @@ export class StageNode extends vscode.TreeItem {
         command: "vscode.open",
         title: "Open Artifact",
         arguments: [artifactUri],
+      };
+    } else if (artifactName) {
+      // No artifact on disk yet — most commonly because auto-advance just
+      // moved this stage to "current" and its AI review is still generating
+      // the file asynchronously. Previously this left `command` unset, so
+      // clicking the row silently did nothing; bind a fallback that at least
+      // explains why. Once the artifact is written, taskOperations' change
+      // event refreshes the tree and this node is rebuilt with the real
+      // "vscode.open" command above.
+      const notReadyMessage = isRunning
+        ? `${artifactName} is still being generated for "${task.folderName}" — click the stage again once the review finishes to open it.`
+        : `${artifactName} has not been created yet for this stage of "${task.folderName}".`;
+      this.command = {
+        command: "vs-code-ai-helper.stageArtifactNotReady",
+        title: "Artifact Not Ready",
+        arguments: [notReadyMessage],
       };
     }
 

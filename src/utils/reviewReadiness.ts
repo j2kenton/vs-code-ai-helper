@@ -46,7 +46,12 @@ export function parseReadiness(content: string): ReadinessResult {
     return {
       score: null,
       label: "—/10",
-      icon: "circle-outline",
+      // Must be circle-LARGE-outline, matching the "outstanding" stage rows in
+      // taskTreeProvider. The smaller plain "circle-outline" made a current
+      // review stage whose artifact has no parseable score render with a
+      // visibly smaller circle than its neighbours (the reported intermittent
+      // "smaller circle on High-Level Review (Plan)").
+      icon: "circle-large-outline",
       colorKey: "disabledForeground",
     };
   }

@@ -6,6 +6,7 @@ import {
   applyContentCaps,
   IMPL_REVIEW_MAX_CHARS_PER_FILE,
   IMPL_REVIEW_MAX_TOTAL_CHARS,
+  mapSourceToTestPath,
 } from "./implReviewFileSelection";
 import { sanitizeRelativePath } from "./pathSafety";
 import {
@@ -593,6 +594,27 @@ export async function generateImplReviewContextPack(
 
       const content = await getFileContentForReview(resolved);
       fileInputs.push({ relPath: normalized, content });
+    }
+
+    // Deterministically pull in each tracked source file's associated test
+    // file (src/**/x.ts -> src/test/x.test.ts), so a reviewer sees the test
+    // alongside the code it covers without it having to be separately
+    // recorded as a "changed" file. Only added when it exists on disk and
+    // isn't already part of the tracked set.
+    const trackedRelPaths = new Set(fileInputs.map((f) => f.relPath));
+    const mappedTestPaths = new Set<string>();
+    for (const relPath of trackedRelPaths) {
+      const mapped = mapSourceToTestPath(relPath);
+      if (mapped && !trackedRelPaths.has(mapped)) {
+        mappedTestPaths.add(mapped);
+      }
+    }
+    for (const mappedPath of mappedTestPaths) {
+      const resolved = vscode.Uri.joinPath(workspaceUri, mappedPath);
+      const content = await getFileContentForReview(resolved);
+      if (content !== undefined) {
+        fileInputs.push({ relPath: mappedPath, content });
+      }
     }
 
     if (rejectedPaths.length > 0) {

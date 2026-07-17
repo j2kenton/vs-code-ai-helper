@@ -25,8 +25,9 @@ import { safeOpenTextDocument } from "../utils/fileUtils";
 
 import { shouldAutoReviewAfterPlan } from "../config/settings";
 import {
-  taskOperations,
-  showTaskBusyWarning,
+  linkCancellationTokens,
+  runTrackedOperation,
+  TaskOperationHandle,
 } from "../utils/taskOperations";
 
 /**
@@ -157,20 +158,16 @@ export async function generatePlanWithAI(
   }
 
   const lockKey = taskFolderUri.fsPath;
-  const op = taskOperations.begin(lockKey, { label: "Generate Plan", stage: "plan" });
-  if (!op) {
-    showTaskBusyWarning(lockKey);
+  const result = await runTrackedOperation(
+    lockKey,
+    { label: "Generate Plan", stage: "plan", kind: "generate-plan", cancellable: true },
+    (op) =>
+      generatePlanWithAIForResolvedTask(context, inventory, taskFolderUri, op)
+  );
+  if (!result) {
+    // Refused (another operation holds this task's lock) — the busy warning
+    // was already shown by runTrackedOperation.
     return;
-  }
-  let result: GeneratePlanResult;
-  try {
-    result = await generatePlanWithAIForResolvedTask(
-      context,
-      inventory,
-      taskFolderUri
-    );
-  } finally {
-    taskOperations.end(op);
   }
 
   // Run only after this run's own lock is released above, since
@@ -193,7 +190,8 @@ interface GeneratePlanResult {
 async function generatePlanWithAIForResolvedTask(
   context: vscode.ExtensionContext,
   inventory: TaskInventory,
-  taskFolderUri: vscode.Uri
+  taskFolderUri: vscode.Uri,
+  op: TaskOperationHandle
 ): Promise<GeneratePlanResult> {
   const model = await resolveFreshModelForStage(taskFolderUri, "plan");
   if (!model.modelId) {
@@ -304,17 +302,25 @@ async function generatePlanWithAIForResolvedTask(
 
         progress.report({ message: `Waiting for ${providerLabel} response...` });
 
-        const result = await runner.run(
-          {
-            taskFolderUri: taskFolderUri,
-            workspaceUri: workspaceFolderUri,
-            stage: "plan",
-            prompt,
-            outputFile: planFileUri,
-            modelId: nativeModelId,
-          },
-          token
-        );
+        // Cancellable from either surface: the native progress toast and the
+        // Notifications-row cancel button both abort the same provider run.
+        const linked = linkCancellationTokens(token, op.token);
+        let result: Awaited<ReturnType<typeof runner.run>>;
+        try {
+          result = await runner.run(
+            {
+              taskFolderUri: taskFolderUri,
+              workspaceUri: workspaceFolderUri,
+              stage: "plan",
+              prompt,
+              outputFile: planFileUri,
+              modelId: nativeModelId,
+            },
+            linked.token
+          );
+        } finally {
+          linked.dispose();
+        }
 
         await writeRunLog(
           taskFolderUri,

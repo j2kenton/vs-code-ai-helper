@@ -56,7 +56,7 @@ function makeGitFixture(): { repoRoot: string; workspaceRoot: string; taskRoot: 
   return { repoRoot, workspaceRoot, taskRoot };
 }
 
-void test("stage response prompt is text-only and does not permit artifact edits", () => {
+void test("stage response prompt forbids tool calls and code edits, but permits scoped markdown updates", () => {
   const prompt = buildStageResponsePrompt(
     "Plan",
     "task-42",
@@ -67,8 +67,13 @@ void test("stage response prompt is text-only and does not permit artifact edits
 
   assert.match(prompt, /Plan stage/);
   assert.match(prompt, /task-42/);
-  assert.match(prompt, /Do not modify files, invoke tools/);
+  assert.match(prompt, /Do not invoke tools/);
   assert.match(prompt, /use the stage action that applies it explicitly/);
+  // C4 boundary: markdown files inside the task's own folder may be updated
+  // directly via the UPDATE_FILE envelope, but this must never be framed as
+  // general tool access or code editing.
+  assert.match(prompt, /UPDATE_FILE/);
+  assert.match(prompt, /never target a source code file/);
   assert.match(prompt, /Important repository details/);
   assert.match(prompt, /What should I change\?/);
 });

@@ -294,7 +294,12 @@ const workspace = {
   openTextDocument: async (uri) => ({ uri, getText: () => "", isDirty: false }),
   createFileSystemWatcher: () => new FileSystemWatcher(),
   getConfiguration: () => ({
-    get: (_key, defaultValue) => defaultValue,
+    get: (key, defaultValue) => {
+      if (key === "enabledProviders") {
+        return new Proxy({}, { get: () => true });
+      }
+      return defaultValue;
+    },
     inspect: () => undefined,
   }),
   onDidChangeConfiguration: (listener) => workspace._configurationChanges.event(listener),
@@ -392,6 +397,13 @@ const env = {
   sessionId: "test-session",
 };
 
+// Minimal languages stub: no tested module needs real editor diagnostics
+// today, only an empty result so completionLint.ts's unconditional
+// vscode.languages.getDiagnostics() call doesn't throw under plain node --test.
+const languages = {
+  getDiagnostics: () => [],
+};
+
 module.exports = {
   Uri,
   FileType,
@@ -421,5 +433,6 @@ module.exports = {
   commands,
   lm,
   env,
+  languages,
   TreeView,
 };

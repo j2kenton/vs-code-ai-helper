@@ -18,8 +18,8 @@ import { shortcutHint } from "../utils/shortcutHints";
 import { backupArtifactBeforeWrite, backupArtifactContents } from "../utils/artifactBackups";
 import { patchTaskProgress, IncompleteTask } from "../utils/taskProgressUtils";
 import {
-  taskOperations,
-  showTaskBusyWarning,
+  linkCancellationTokens,
+  runTrackedOperation,
 } from "../utils/taskOperations";
 
 const INTRO_TEXT = `Briefly describe what changes you want to be made, and then use AI to help you clarify the plan.`;
@@ -384,12 +384,10 @@ export async function draftTaskWithAI(
   }
 
   const lockKey = resolvedTask.taskFolderPath;
-  const op = taskOperations.begin(lockKey, { label: "Draft Task with AI", stage: "desc", taskName: resolvedTask.folderName });
-  if (!op) {
-    showTaskBusyWarning(lockKey);
-    return;
-  }
-  try {
+  return await runTrackedOperation(
+    lockKey,
+    { label: "Draft Task with AI", stage: "desc", taskName: resolvedTask.folderName, kind: "draft-task", cancellable: true },
+    async (op) => {
 
   // resolveTaskContext already computed the owning workspace folder (with a
   // fallback for tasks that predate the `ownership` field), so reuse it
@@ -509,17 +507,25 @@ export async function draftTaskWithAI(
         NotificationRouter.emitProgressSummary(`Drafting task with ${providerLabel}...`);
         progress.report({ message: `Waiting for ${providerLabel} response...` });
 
-        const result = await runner.run(
-          {
-            taskFolderUri: taskFolderUri,
-            workspaceUri: workspaceFolder.uri,
-            stage: "desc",
-            prompt,
-            outputFile: tmpUri,
-            modelId: nativeModelId,
-          },
-          token
-        );
+        // Cancellable from either surface: the native progress toast and the
+        // Notifications-row cancel button both abort the same provider run.
+        const linked = linkCancellationTokens(token, op.token);
+        let result: Awaited<ReturnType<typeof runner.run>>;
+        try {
+          result = await runner.run(
+            {
+              taskFolderUri: taskFolderUri,
+              workspaceUri: workspaceFolder.uri,
+              stage: "desc",
+              prompt,
+              outputFile: tmpUri,
+              modelId: nativeModelId,
+            },
+            linked.token
+          );
+        } finally {
+          linked.dispose();
+        }
 
         await writeRunLog(
           taskFolderUri,
@@ -637,9 +643,8 @@ export async function draftTaskWithAI(
     }
   }
   return true;
-  } finally {
-    taskOperations.end(op);
-  }
+    }
+  );
 }
 
 /**

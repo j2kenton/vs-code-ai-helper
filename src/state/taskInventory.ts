@@ -12,6 +12,52 @@ export interface TaskWithProgress extends DiscoveredTask {
 }
 
 /**
+ * Parse a task folder name into its canonical ordering key: the creation
+ * date plus the per-day task number (e.g. `2026-07-08_task_12` →
+ * `{ date: "2026-07-08", num: 12 }`). Returns undefined for names that do
+ * not follow the generated convention.
+ *
+ * @internal exported for testing
+ */
+export function parseTaskOrderKey(
+  folderName: string
+): { date: string; num: number } | undefined {
+  const match = /^(\d{4}-\d{2}-\d{2})_.*?(\d+)\s*$/.exec(folderName);
+  const date = match?.[1];
+  const num = match?.[2];
+  if (!date || !num) {
+    return undefined;
+  }
+  return { date, num: Number.parseInt(num, 10) };
+}
+
+/**
+ * Ordering rule for the task list: strictly newest-to-oldest by the task's
+ * ID (creation date, then task number). Status and activity never
+ * participate, so completing/pausing a task can never reshuffle the list.
+ * Non-conventional folder names fall back to a numeric-aware name compare
+ * and sort after conventional ones.
+ *
+ * @internal exported for testing
+ */
+export function compareTasksNewestFirst(a: string, b: string): number {
+  const keyA = parseTaskOrderKey(a);
+  const keyB = parseTaskOrderKey(b);
+  if (keyA && keyB) {
+    if (keyA.date !== keyB.date) {
+      return keyB.date.localeCompare(keyA.date);
+    }
+    if (keyA.num !== keyB.num) {
+      return keyB.num - keyA.num;
+    }
+    return b.localeCompare(a, undefined, { numeric: true });
+  }
+  if (keyA) return -1;
+  if (keyB) return 1;
+  return b.localeCompare(a, undefined, { numeric: true });
+}
+
+/**
  * Centralized task inventory that manages discovery, duplicate suppression,
  * and provides lookup by canonical ID or path.
  */
@@ -61,9 +107,7 @@ export class TaskInventory {
     // Keep a stable ID/date order, newest first. Status and activity must
     // not reshuffle tasks, which made paused tasks appear to move
     // unexpectedly.
-    withProgress.sort((a, b) => {
-      return b.folderName.localeCompare(a.folderName, undefined, { numeric: true });
-    });
+    withProgress.sort((a, b) => compareTasksNewestFirst(a.folderName, b.folderName));
 
     this.visibleTasks = withProgress;
 

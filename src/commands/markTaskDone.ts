@@ -4,11 +4,8 @@ import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { STAGE_DISPLAY_NAMES } from "../types/taskProgress";
 import { IncompleteTask, patchTaskProgress } from "../utils/taskProgressUtils";
-import { runCompletionLint } from "../utils/completionLint";
-import {
-  taskOperations,
-  showTaskBusyWarning,
-} from "../utils/taskOperations";
+import { NotificationRouter } from "../utils/notificationRouter";
+import { runTrackedOperation } from "../utils/taskOperations";
 
 /**
  * Accepted argument shapes for markTaskDone.
@@ -100,13 +97,18 @@ export function selectNextTask(
  * commit, and push on the Publish row first. This command only performs the
  * final "move on" step.
  *
+ * Completion is deliberately UNGATED (C3): it never runs completion checks,
+ * never prompts, and never refuses a Publish-stage task. The completion-check
+ * flow (run checks, offer "Fix with AI", record a "Publish Anyway"-style
+ * override in publish-review.md) belongs to the publishing commands
+ * (commitAndPushTask / runLintingFixes), not to task completion — the user
+ * may complete a task whenever they want.
+ *
  * Ordering (strict):
- *   1. Re-run completion lint for a fresh read (picks up any fixes made
- *      while on the Publish row).
- *   2. Verify the Publish review has a strict 10/10 score.
- *   3. Refresh inventory.
- *   4. Select the next active task in CurrentTaskStore.
- *   5. Show completion info message.
+ *   1. Persist completion (status + completedAt + completedStages).
+ *   2. Refresh inventory.
+ *   3. Select the next active task in CurrentTaskStore.
+ *   4. Record the completion in the Notifications section.
  */
 export async function markTaskDone(
   inventory: TaskInventory,
@@ -143,32 +145,24 @@ export async function markTaskDone(
     const currentStageName =
       STAGE_DISPLAY_NAMES[resolvedTask.progress.currentStage];
     void vscode.window.showWarningMessage(
-      `"Complete and Move On to Next Task" is only available once the task ` +
+      `"Complete Task" is only available once the task ` +
         `has reached ${STAGE_DISPLAY_NAMES["publish"]}. ` +
         `Current stage: ${currentStageName}.`
     );
     return;
   }
 
-  // ── Step 1: Re-run completion lint for a fresh, final read ───────────────
   const taskFolderUri = vscode.Uri.file(resolvedTask.taskFolderPath);
-  const lockKey = taskFolderUri.fsPath;
-  // Task-level: completing a task is not scoped to one stage, so it spins the
-  // task row rather than a stage row.
-  const op = taskOperations.begin(lockKey, { label: "Complete and Move On", taskName: resolvedTask.folderName });
-  if (!op) {
-    showTaskBusyWarning(lockKey);
-    return;
-  }
-  try {
-    const lintResult = await runCompletionLint(taskFolderUri, resolvedTask.progress.implReviewFiles);
-    if (!lintResult.passed) {
-      void vscode.window.showWarningMessage(
-        `Cannot complete ${resolvedTask.folderName}: completion checks are still failing. Fix the reported issues and try again.`
-      );
-      return;
-    }
 
+  // ── Step 1: Acquire the task lock and complete — no checks, no prompts ───
+  // Task-level: completing a task is not scoped to one stage, so it spins the
+  // task row rather than a stage row. This is an instant mutation (taxonomy),
+  // so the lock is held only for the persistence writes below.
+  const lockKey = taskFolderUri.fsPath;
+  await runTrackedOperation(
+    lockKey,
+    { label: "Complete Task", taskName: resolvedTask.folderName, kind: "complete-task" },
+    async () => {
     // Completion is an explicit user action. Reaching Publish alone never
     // changes lifecycle status, but this command is the durable terminal edge.
     await patchTaskProgress(taskFolderUri, (current) => ({
@@ -185,7 +179,7 @@ export async function markTaskDone(
     }));
     await inventory.refresh();
 
-    // ── Step 3: Select next active task deterministically ──────────────────
+    // ── Step 2: Select next active task deterministically ──────────────────
     const nextCanonicalId = selectNextTask(inventory, resolvedTask.canonicalId);
     if (nextCanonicalId) {
       await currentTaskStore.set(nextCanonicalId);
@@ -193,15 +187,16 @@ export async function markTaskDone(
       await currentTaskStore.clear();
     }
 
-    // ── Step 4: Show completion message ─────────────────────────────────────
-    void vscode.window.showInformationMessage(
+    // ── Step 3: Record the completion in the Notifications section ──────────
+    // (taxonomy: instant-mutation → terminal entry there, no duplicate native
+    // IDE toast for a success the Notifications section already records).
+    NotificationRouter.showInformation(
       nextCanonicalId
-        ? `${resolvedTask.folderName} complete (lint passed). Next task selected.`
-        : `${resolvedTask.folderName} complete (lint passed). No remaining active tasks.`
+        ? `${resolvedTask.folderName} complete. Next task selected.`
+        : `${resolvedTask.folderName} complete. No remaining active tasks.`
     );
-  } finally {
-    taskOperations.end(op);
-  }
+    }
+  );
 }
 
 /**

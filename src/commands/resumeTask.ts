@@ -10,6 +10,7 @@ import { STAGE_DISPLAY_NAMES } from "../types/taskProgress";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { activateTask } from "../state/taskActivationCoordinator";
 import { pickReopenStage, reopenCompletedTask } from "../utils/reopenTask";
+import { runTrackedOperation } from "../utils/taskOperations";
 
 /**
  * Accepted argument shapes for resumeTask.
@@ -119,18 +120,28 @@ export async function resumePausedTask(
     return;
   }
 
-  const activated = await activateTask(
-    inventory, currentTaskStore, resolvedTask.taskFolderPath, resolvedTask.canonicalId
-  );
-  if (!activated) {
-    void vscode.window.showErrorMessage("Could not read task progress.");
-    return;
+  // Tracked instant mutation (taxonomy: resume-task / terminal-always). The
+  // terminal entry is recorded centrally by the operation-notification bridge.
+  // activateTask also persists the resumed task as the current task so the
+  // keyboard shortcut router and status bar reflect it immediately —
+  // CurrentTaskStore is the single source of truth for all surfaces.
+  try {
+    await runTrackedOperation(
+      resolvedTask.taskFolderPath,
+      { label: "Resume Task", taskName: resolvedTask.folderName, kind: "resume-task" },
+      async () => {
+        const activated = await activateTask(
+          inventory, currentTaskStore, resolvedTask.taskFolderPath, resolvedTask.canonicalId
+        );
+        if (!activated) {
+          throw new Error("Could not read task progress.");
+        }
+      }
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    void vscode.window.showErrorMessage(message);
   }
-
-  // Persist the resumed task as the current task so the keyboard shortcut
-  // router and status bar reflect it immediately — CurrentTaskStore is the
-  // single source of truth for all surfaces (tree, status bar, task actions).
-  NotificationRouter.showInformation(`Task resumed.`);
 }
 
 /**
@@ -152,27 +163,46 @@ async function resumeCompletedTask(
     return;
   }
 
-  const result = await reopenCompletedTask(
-    inventory,
-    currentTaskStore,
-    resolvedTask.taskFolderPath,
-    resolvedTask.canonicalId,
-    chosenStage,
-    capturedCompletedAt
-  );
-
-  if (result.outcome === "stale") {
-    void vscode.window.showWarningMessage(result.message!);
+  // Tracked instant mutation (taxonomy: resume-task). The picker stays outside
+  // the operation — no lock or spinner while the user is still deciding. A
+  // stale or failed reopen throws so the operation ends in the `failed`
+  // terminal state instead of recording a bogus "completed" entry.
+  let result: Awaited<ReturnType<typeof reopenCompletedTask>> | undefined;
+  try {
+    await runTrackedOperation(
+      resolvedTask.taskFolderPath,
+      { label: "Resume Task", taskName: resolvedTask.folderName, kind: "resume-task" },
+      async (op) => {
+        result = await reopenCompletedTask(
+          inventory,
+          currentTaskStore,
+          resolvedTask.taskFolderPath,
+          resolvedTask.canonicalId,
+          chosenStage,
+          capturedCompletedAt
+        );
+        if (result.outcome !== "reopened") {
+          throw new Error(result.message ?? "Could not reopen the task.");
+        }
+        op.report(`reopened at ${STAGE_DISPLAY_NAMES[chosenStage]}`);
+      }
+    );
+  } catch {
+    if (result?.outcome === "stale") {
+      void vscode.window.showWarningMessage(result.message!);
+    } else {
+      void vscode.window.showErrorMessage(result?.message ?? "Could not reopen the task.");
+    }
     return;
   }
-  if (result.outcome === "failed") {
-    void vscode.window.showErrorMessage(result.message ?? "Could not reopen the task.");
+
+  // A busy refusal resolves without throwing but never runs the reopen.
+  if (result?.outcome !== "reopened") {
     return;
   }
 
-  NotificationRouter.showInformation(
-    `${resolvedTask.folderName} reopened at ${STAGE_DISPLAY_NAMES[chosenStage]}.`
-  );
+  // The tracked resume operation has already produced the sole terminal
+  // success entry through operationNotificationBridge.
 }
 
 /**

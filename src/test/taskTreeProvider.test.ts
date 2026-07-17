@@ -348,7 +348,9 @@ void describe("reviewReadiness.parseReadiness", () => {
     const result = parseReadiness("No readiness score here");
     assert.strictEqual(result.score, null);
     assert.strictEqual(result.label, "—/10");
-    assert.strictEqual(result.icon, "circle-outline");
+    // Same-size circle as "outstanding" stage rows — a plain circle-outline
+    // rendered visibly smaller than every neighbouring stage icon.
+    assert.strictEqual(result.icon, "circle-large-outline");
   });
 
   void it('should return neutral icon for empty content', () => {

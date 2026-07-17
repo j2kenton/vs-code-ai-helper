@@ -3,6 +3,7 @@ import { TaskInventory } from "../state/taskInventory";
 import { TASK_FILENAME } from "../types/taskProgress";
 import { patchTaskProgress } from "../utils/taskProgressUtils";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
+import { runTrackedOperation } from "../utils/taskOperations";
 import { TaskNode } from "../views/taskTreeProvider";
 
 type TaskArg = TaskNode | { canonicalId?: string; taskFolderPath?: string };
@@ -37,12 +38,23 @@ export async function renameTask(
   });
   if (name === undefined) return;
 
-  await patchTaskProgress(vscode.Uri.file(task.taskFolderPath), (current) => ({
-    ...current,
-    displayName: name.trim(),
-    nameIsDefault: false,
-  }));
-  await inventory.refresh();
+  // Tracked instant mutation (taxonomy: rename-task / terminal-always). The
+  // input box stays outside the operation; the terminal Notifications entry
+  // (including the new name, via report()) is recorded centrally by the
+  // operation-notification bridge.
+  await runTrackedOperation(
+    task.taskFolderPath,
+    { label: "Rename Task", taskName: task.folderName, kind: "rename-task" },
+    async (op) => {
+      await patchTaskProgress(vscode.Uri.file(task.taskFolderPath), (current) => ({
+        ...current,
+        displayName: name.trim(),
+        nameIsDefault: false,
+      }));
+      await inventory.refresh();
+      op.report(`renamed to "${name.trim()}"`);
+    }
+  );
 }
 
 /** A concise title can be generated from an AI draft without renaming folders/IDs. */

@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import * as crypto from "crypto";
-import { TaskStage } from "../types/taskProgress";
+import { STAGE_DISPLAY_NAMES, TaskStage } from "../types/taskProgress";
 import { notifyDesktop } from "../utils/desktopNotifier";
 import { taskOperations } from "../utils/taskOperations";
 import { NotificationRouter } from "../utils/notificationRouter";
@@ -210,7 +210,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     }
     if (!sameIdentity(target, this.target)) return;
     const busy = target ? taskOperations.getTaskOperations(target.canonicalId).some(op => !op.exclusive) : false;
-    await this.view?.webview.postMessage({ type: "state", target: this.target, entries, busy });
+    // Full, user-facing stage name rather than the raw stage id (e.g. "impl-high-review")
+    // so the chat header reads as prose instead of an abbreviated identifier.
+    const label = target
+      ? `Chatting with the AI in charge of the ${STAGE_DISPLAY_NAMES[target.stage]} stage (${target.stage})`
+      : undefined;
+    await this.view?.webview.postMessage({ type: "state", target: this.target, label, entries, busy });
   }
 
   private html(): string {
@@ -241,14 +246,26 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           font-style: italic;
           opacity: 0.8;
         }
+        #form {
+          display: flex;
+          flex-direction: column;
+          gap: 6px;
+        }
+        #form textarea {
+          resize: vertical;
+        }
+        #form button {
+          align-self: flex-end;
+        }
       </style>
       </head><body>
       <div id="context">Select an active task to start a stage conversation.</div><div id="messages"></div>
       <div id="busy-indicator" style="display:none"><span class="spinner"></span>Waiting for the stage AI…</div>
-      <form id="form"><textarea id="message" rows="3" placeholder="Ask the current stage AI…"></textarea><button>Send</button></form>
-      <script nonce="${nonce}">const v=acquireVsCodeApi(), c=document.getElementById('context'), m=document.getElementById('messages'), b=document.getElementById('busy-indicator');
-      window.addEventListener('message', e=>{const s=e.data;if(s.type!=='state')return;c.textContent=s.target?'Chatting with '+s.target.stage.replaceAll('-',' ')+' AI':'Select an active task to start a stage conversation.';m.replaceChildren(...s.entries.map(x=>{const d=document.createElement('p');d.textContent='['+x.role+(x.pending?' — awaiting your answer':'')+'] '+x.text;return d;}));b.style.display=s.busy?'block':'none';});
-      document.getElementById('form').addEventListener('submit',e=>{e.preventDefault();const input=document.getElementById('message');v.postMessage({type:'send',text:input.value});input.value='';});</script>
+      <form id="form"><textarea id="message" rows="3" placeholder="Ask the current stage AI… (Ctrl+Enter to send)"></textarea><button>Send</button></form>
+      <script nonce="${nonce}">const v=acquireVsCodeApi(), c=document.getElementById('context'), m=document.getElementById('messages'), b=document.getElementById('busy-indicator'), f=document.getElementById('form'), i=document.getElementById('message');
+      window.addEventListener('message', e=>{const s=e.data;if(s.type!=='state')return;c.textContent=s.label??'Select an active task to start a stage conversation.';m.replaceChildren(...s.entries.map(x=>{const d=document.createElement('p');d.textContent='['+x.role+(x.pending?' — awaiting your answer':'')+'] '+x.text;return d;}));b.style.display=s.busy?'block':'none';});
+      f.addEventListener('submit',e=>{e.preventDefault();v.postMessage({type:'send',text:i.value});i.value='';});
+      i.addEventListener('keydown',e=>{if(e.key==='Enter'&&e.ctrlKey){e.preventDefault();f.requestSubmit();}});</script>
     </body></html>`;
   }
 }

@@ -1,6 +1,6 @@
 import * as assert from "node:assert/strict";
 import { test } from "node:test";
-import { applyContentCaps } from "../utils/implReviewFileSelection";
+import { applyContentCaps, mapSourceToTestPath } from "../utils/implReviewFileSelection";
 
 // ---------------------------------------------------------------------------
 // Basic inclusion
@@ -41,7 +41,7 @@ void test("truncates a file exceeding the per-file cap", () => {
 // Total cap
 // ---------------------------------------------------------------------------
 
-void test("truncates at total cap even when under per-file cap", () => {
+void test("omits a file whole when it doesn't fully fit the remaining total cap", () => {
   const files = [
     { relPath: "a.ts", content: "a".repeat(60) },
     { relPath: "b.ts", content: "b".repeat(60) },
@@ -49,8 +49,10 @@ void test("truncates at total cap even when under per-file cap", () => {
   const results = applyContentCaps(files, 100, 80);
   assert.equal(results[0]!.content, "a".repeat(60));
   assert.equal(results[0]!.truncated, false);
-  assert.equal(results[1]!.content, "b".repeat(20));
-  assert.equal(results[1]!.truncated, true);
+  // b.ts only has 20 chars of budget left but is 60 chars — omitted whole
+  // rather than shown as a silently-cut 20-char slice.
+  assert.equal(results[1]!.content, null);
+  assert.equal(results[1]!.truncated, false);
 });
 
 void test("marks files after total cap as omitted (content: null)", () => {
@@ -67,17 +69,28 @@ void test("marks files after total cap as omitted (content: null)", () => {
   assert.equal(results[1]!.truncated, false);
 });
 
-void test("last file is truncated rather than omitted when it partially fits", () => {
+void test("last file is omitted whole rather than partially shown when it doesn't fully fit", () => {
   const files = [
     { relPath: "a.ts", content: "a".repeat(75) },
     { relPath: "b.ts", content: "b".repeat(10) },
   ];
-  // Total cap = 80; after a.ts (75 chars), remaining = 5
+  // Total cap = 80; after a.ts (75 chars), remaining = 5, but b.ts is 10 chars.
   const results = applyContentCaps(files, 100, 80);
   assert.equal(results[0]!.content, "a".repeat(75));
   assert.equal(results[0]!.truncated, false);
+  assert.equal(results[1]!.content, null);
+  assert.equal(results[1]!.truncated, false);
+});
+
+void test("a file that exactly fits the remaining total cap is included in full", () => {
+  const files = [
+    { relPath: "a.ts", content: "a".repeat(75) },
+    { relPath: "b.ts", content: "b".repeat(5) },
+  ];
+  // Total cap = 80; after a.ts (75 chars), remaining = 5, b.ts is exactly 5.
+  const results = applyContentCaps(files, 100, 80);
   assert.equal(results[1]!.content, "b".repeat(5));
-  assert.equal(results[1]!.truncated, true);
+  assert.equal(results[1]!.truncated, false);
 });
 
 // ---------------------------------------------------------------------------
@@ -132,4 +145,48 @@ void test("mixed: missing then normal then omitted", () => {
   assert.equal(results[0]!.content, undefined);    // missing
   assert.equal(results[1]!.content, "x".repeat(10)); // included
   assert.equal(results[2]!.content, null);           // omitted
+});
+
+// ---------------------------------------------------------------------------
+// mapSourceToTestPath: src/**/x.ts -> src/test/x.test.ts convention
+// ---------------------------------------------------------------------------
+
+void test("maps a top-level src file to src/test/<name>.test.ts", () => {
+  assert.equal(mapSourceToTestPath("src/extension.ts"), "src/test/extension.test.ts");
+});
+
+void test("maps a nested src file by basename, ignoring its subdirectory", () => {
+  assert.equal(
+    mapSourceToTestPath("src/commands/chatWithStage.ts"),
+    "src/test/chatWithStage.test.ts"
+  );
+  assert.equal(
+    mapSourceToTestPath("src/utils/contextPack.ts"),
+    "src/test/contextPack.test.ts"
+  );
+});
+
+void test("maps a .tsx source file to src/test/<name>.test.ts", () => {
+  assert.equal(mapSourceToTestPath("src/views/chatView.tsx"), "src/test/chatView.test.ts");
+});
+
+void test("normalizes backslashes before mapping", () => {
+  assert.equal(
+    mapSourceToTestPath("src\\commands\\chatWithStage.ts"),
+    "src/test/chatWithStage.test.ts"
+  );
+});
+
+void test("returns undefined for paths outside src/", () => {
+  assert.equal(mapSourceToTestPath("package.json"), undefined);
+  assert.equal(mapSourceToTestPath("docs/notes.ts"), undefined);
+});
+
+void test("returns undefined for paths already inside src/test/", () => {
+  assert.equal(mapSourceToTestPath("src/test/contextPack.test.ts"), undefined);
+});
+
+void test("returns undefined for non-TypeScript files", () => {
+  assert.equal(mapSourceToTestPath("src/media/icon.svg"), undefined);
+  assert.equal(mapSourceToTestPath("src/commands/README.md"), undefined);
 });

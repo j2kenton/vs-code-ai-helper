@@ -120,7 +120,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                 : "vs-code-ai-helper.showMetaResourcesInGitIgnore"
             );
             if (metaChangeApplied === false) {
-              void vscode.window.showWarningMessage(
+              NotificationRouter.showWarning(
                 "Workflow settings were not saved: the .gitignore update was declined."
               );
               break;
@@ -137,7 +137,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             }
             await config.update(key, value, targetFor(key));
           }
-          void vscode.window.showInformationMessage("Workflow settings saved.");
+          NotificationRouter.showInformation("Workflow settings saved.");
           break;
         }
         case "resetDefaults": {

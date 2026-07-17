@@ -11,12 +11,17 @@ import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { advanceStage } from "../utils/stageTransition";
 import { selectNextTask } from "./markTaskDone";
 import { NotificationRouter } from "../utils/notificationRouter";
-import { runCompletionLint } from "../utils/completionLint";
+import {
+  CompletionLintResult,
+  runCompletionLint,
+  upsertCompletionChecksInPublishReview,
+} from "../utils/completionLint";
+import { runLintingFixes } from "./runLintingFixes";
 import { resolveFreshModelForStage } from "../utils/modelSelection";
 import { parseCopilotModelSelection, parseModelSelection } from "../runners/providers";
 import {
-  taskOperations,
-  showTaskBusyWarning,
+  runTrackedOperation,
+  TaskOperationHandle,
 } from "../utils/taskOperations";
 import { CHAT_HISTORY_FILENAME, CHAT_HISTORY_CORRUPT_FILENAME } from "../utils/chatHistoryConstants";
 
@@ -800,7 +805,9 @@ async function describePushDestination(
 export async function commitAndPushTask(
   inventory: TaskInventory,
   explicitArg?: CommitAndPushTaskArg,
-  currentTaskStore?: CurrentTaskStore
+  currentTaskStore?: CurrentTaskStore,
+  parentOperation?: TaskOperationHandle,
+  extensionContext?: vscode.ExtensionContext
 ): Promise<void> {
   const resolverArg = normalizeArg(explicitArg);
 
@@ -842,30 +849,78 @@ export async function commitAndPushTask(
   // staging, commit, or push work starts. A duplicate invocation (e.g. a
   // fast double-click) must be refused here, not partway through — lint runs
   // and the lint-failure modal below are not idempotent-safe against a
-  // second concurrent invocation on the same task.
+  // second concurrent invocation on the same task. When invoked as part of
+  // the Complete/Commit/Push composite, this registers as a child of that
+  // root (C1 nesting) instead of contending for the lock the root holds.
   const lockKey = resolvedTask.taskFolderPath;
-  const op = taskOperations.begin(lockKey, { label: "Commit and Push", taskName: resolvedTask.folderName });
-  if (!op) {
-    showTaskBusyWarning(lockKey);
-    return;
-  }
-  try {
+  await runTrackedOperation(
+    lockKey,
+    { label: "Commit and Push", taskName: resolvedTask.folderName, kind: "commit-push", parent: parentOperation },
+    async (op) => {
     // Always run fresh checks immediately before a commit. Persisted payloads
-    // are informational and may be stale after files were edited.
-    const lintPayload = await runCompletionLint(vscode.Uri.file(resolvedTask.taskFolderPath), resolvedTask.progress.implReviewFiles);
-    if (!lintPayload.passed) {
+    // are informational and may be stale after files were edited. Registered
+    // as a child (C1 publish model) so the Publish stage row spins while the
+    // pre-commit checks run. Every run — passing, failing, or a post-fix
+    // rerun — is also recorded in publish-review.md's managed Completion
+    // Checks section by runCompletionLint itself (completionLint.ts), so the
+    // artifact always reflects the latest result whatever the user decides
+    // below; the Publish Anyway branch only layers the override annotation on
+    // top of that record.
+    const runChecks = async (): Promise<CompletionLintResult> =>
+      (await runTrackedOperation(
+        lockKey,
+        { parent: op, label: "Completion checks", stage: "publish", kind: "completion-checks" },
+        () => runCompletionLint(vscode.Uri.file(resolvedTask.taskFolderPath), resolvedTask.progress.implReviewFiles)
+      ))!;
+    let lintPayload = await runChecks();
+    // Failing checks surface a three-way decision (C3): Publish Anyway,
+    // Fix with AI, or Cancel (the modal's dismiss affordance). Fix with AI
+    // runs the linting-fixes flow — editor autofixes plus the configured
+    // implementation agent fed the failing lint/test output — nested under
+    // this operation, then checks re-run before publishing can continue, so
+    // a fix pass that didn't resolve everything re-surfaces this decision.
+    while (!lintPayload.passed) {
       const summary = lintPayload.summary ? ` (${lintPayload.summary})` : "";
       const choice = await vscode.window.showWarningMessage(
-        `Lint reported failures for "${resolvedTask.folderName}"${summary}.\n\n` +
-          "The task was committed despite lint failures. Proceed anyway?",
+        `Completion checks failed for "${resolvedTask.folderName}"${summary}.\n\n` +
+          "Publish Anyway records the failing checks in the Publish review. " +
+          "Fix with AI applies automatic and AI fixes using the failing check output, then re-runs the checks.",
         { modal: true },
-        "Proceed",
-        "Cancel"
+        "Publish Anyway",
+        "Fix with AI"
       );
-      if (choice !== "Proceed") {
+      if (choice === "Publish Anyway") {
+        // The override lives here, in the publish flow (C3): task completion
+        // is ungated and never records overrides — publishing over failing
+        // checks is the decision worth an audit trail in publish-review.md.
+        await upsertCompletionChecksInPublishReview(
+          vscode.Uri.file(resolvedTask.taskFolderPath),
+          lintPayload,
+          { reason: "user chose Publish Anyway despite failing checks" }
+        );
+        break;
+      }
+      if (choice !== "Fix with AI") {
         NotificationRouter.showInformation("Commit and push cancelled.");
         return;
       }
+      if (!extensionContext) {
+        // Programmatic invocation without an ExtensionContext: the fix flow
+        // needs prompt templates and the AI-consent state, so point at the
+        // standalone command instead of failing partway through.
+        NotificationRouter.showWarning(
+          'Fix with AI is unavailable here — run "Linting Fixes" from the task\'s Publish actions, then retry Commit and Push.'
+        );
+        return;
+      }
+      await runLintingFixes(
+        inventory,
+        extensionContext.extensionUri,
+        { taskFolderPath: resolvedTask.taskFolderPath },
+        extensionContext,
+        op
+      );
+      lintPayload = await runChecks();
     }
 
   await vscode.window.withProgress(
@@ -1241,9 +1296,8 @@ export async function commitAndPushTask(
       }
     }
   );
-  } finally {
-    taskOperations.end(op);
-  }
+    }
+  );
 }
 
 /**
@@ -1253,7 +1307,8 @@ export async function commitAndPushTask(
 export async function completeCommitAndPushTask(
   inventory: TaskInventory,
   explicitArg?: CommitAndPushTaskArg,
-  currentTaskStore?: CurrentTaskStore
+  currentTaskStore?: CurrentTaskStore,
+  extensionContext?: vscode.ExtensionContext
 ): Promise<void> {
   const resolverArg = normalizeArg(explicitArg);
   const resolvedTask = await resolveTaskContext(inventory, resolverArg, {
@@ -1278,7 +1333,7 @@ export async function completeCommitAndPushTask(
   if (resolvedTask.progress.currentStage !== "impl-low-review") {
     if (resolvedTask.progress.currentStage === "publish") {
       // If already completed, fall back directly to commit & push
-      return commitAndPushTask(inventory, explicitArg, currentTaskStore);
+      return commitAndPushTask(inventory, explicitArg, currentTaskStore, undefined, extensionContext);
     }
     NotificationRouter.showWarning(
       `"Complete, Commit and Push" is only available when the task is at the final review stage (Implementation: Low-Level Review) or completed.`
@@ -1286,36 +1341,42 @@ export async function completeCommitAndPushTask(
     return;
   }
 
-  // Guard the lint/advance/complete portion against a concurrent invocation
-  // of this same command (or a sibling command on the same task) racing the
-  // stage-eligibility check above and double-advancing/double-completing.
-  // Released before step 4 so the commitAndPushTask call below can acquire
-  // its own lock on the same folder without self-deadlocking. This leaves a
-  // small window, between this lock's release and commitAndPushTask's own
-  // (now-earlier) guard acquisition, where a second invocation could begin —
-  // tolerated for now; durable cross-call serialization is out of scope here.
+  // One root operation guards the ENTIRE composite — lint, advance, complete,
+  // next-task selection, and the commit/push itself (registered below as a
+  // child of this root, so it never contends for the lock this root holds).
+  // This closes the former race window where the lock was released before
+  // commitAndPushTask reacquired it and a second invocation could slip in.
   const lockKey = resolvedTask.taskFolderPath;
-  const op = taskOperations.begin(lockKey, { label: "Complete, Commit and Push", taskName: resolvedTask.folderName });
-  if (!op) {
-    showTaskBusyWarning(lockKey);
-    return;
-  }
-  try {
-    // 1. Run fresh checks, then transition stage to "publish".
+  await runTrackedOperation(
+    lockKey,
+    { label: "Complete, Commit and Push", taskName: resolvedTask.folderName, kind: "complete-commit-push" },
+    async (op) => {
+    // 1. Transition stage to "publish". Completion itself is ungated (C3):
+    // no checks run here — commitAndPushTask below runs fresh checks and owns
+    // the failing-checks prompt/override flow, so the completion step can
+    // never be blocked by lint/test state.
     const taskFolderUri = vscode.Uri.file(resolvedTask.taskFolderPath);
-    const lintResult = await runCompletionLint(taskFolderUri);
-    if (!lintResult.passed) {
-      NotificationRouter.showWarning(`Lint issues found for "${resolvedTask.folderName}". Fix them before completing.`);
+    let transitionResult: Awaited<ReturnType<typeof advanceStage>>;
+    try {
+      transitionResult = await advanceStage(
+        taskFolderUri,
+        resolvedTask.progress.currentStage,
+        "publish",
+        false,
+        "complete-and-move-on",
+        false
+      );
+    } catch (error) {
+      // advanceStage throws (rather than resolving falsy) when its
+      // compare-and-set is rejected — e.g. a concurrent transition already
+      // moved this task's stage under the lock. Report it like any other
+      // failed transition instead of an unhandled rejection.
+      const message = error instanceof Error ? error.message : String(error);
+      NotificationRouter.showWarning(
+        `Could not persist completion for ${resolvedTask.folderName}: ${message}`
+      );
       return;
     }
-    const transitionResult = await advanceStage(
-      taskFolderUri,
-      resolvedTask.progress.currentStage,
-      "publish",
-      false,
-      "complete-and-move-on",
-      false
-    );
 
     if (!transitionResult?.persisted) {
       void vscode.window.showErrorMessage(
@@ -1346,21 +1407,22 @@ export async function completeCommitAndPushTask(
         await currentTaskStore.clear();
       }
     }
-  } finally {
-    taskOperations.end(op);
-  }
 
-  // 4. Run commit & push
-  const completedTask: IncompleteTask = {
-    folderUri: vscode.Uri.file(resolvedTask.taskFolderPath),
-    folderName: resolvedTask.folderName,
-    progress: {
-      ...resolvedTask.progress,
-      currentStage: "publish", // Since it was just advanced
-    },
-    canonicalId: resolvedTask.canonicalId,
-  };
-  await commitAndPushTask(inventory, { task: completedTask }, currentTaskStore);
+    // 4. Run commit & push as a child of this composite's root operation —
+    // still under the same exclusive lock, so no second invocation can start
+    // between completion and the commit/push handoff.
+    const completedTask: IncompleteTask = {
+      folderUri: vscode.Uri.file(resolvedTask.taskFolderPath),
+      folderName: resolvedTask.folderName,
+      progress: {
+        ...resolvedTask.progress,
+        currentStage: "publish", // Since it was just advanced
+      },
+      canonicalId: resolvedTask.canonicalId,
+    };
+    await commitAndPushTask(inventory, { task: completedTask }, currentTaskStore, op, extensionContext);
+    }
+  );
 }
 
 /**
@@ -1374,12 +1436,12 @@ export function registerCommitAndPushTaskCommand(
   const disposable = vscode.commands.registerCommand(
     "vs-code-ai-helper.commitAndPushTask",
     (arg?: CommitAndPushTaskArg) =>
-      commitAndPushTask(inventory, arg, currentTaskStore)
+      commitAndPushTask(inventory, arg, currentTaskStore, undefined, context)
   );
   const completeDisposable = vscode.commands.registerCommand(
     "vs-code-ai-helper.completeCommitAndPushTask",
     (arg?: CommitAndPushTaskArg) =>
-      completeCommitAndPushTask(inventory, arg, currentTaskStore)
+      completeCommitAndPushTask(inventory, arg, currentTaskStore, context)
   );
   context.subscriptions.push(disposable, completeDisposable);
 }

@@ -39,6 +39,7 @@ import {
 } from "../utils/taskProgressUtils";
 import { TaskProgress } from "../types/taskProgress";
 import { initNotificationRouter } from "../utils/notificationRouter";
+import { installOperationNotificationBridge } from "../utils/operationNotificationBridge";
 
 // Route NotificationRouter to the vscode stub's window methods, mirroring
 // commandArgNormalization.test.ts, so command-level assertions can inspect
@@ -300,6 +301,7 @@ void describe("resumePausedTask on a completed task", () => {
     const ws = installWorkspaceFoldersStub();
     const rf = installReadFileBridge();
     const msgs = installMessageCapture();
+    const bridge = installOperationNotificationBridge();
 
     let pickedItems: Array<{ label: string; stage: string }> | undefined;
     (vscode.window as unknown as Record<string, unknown>).showQuickPick = (
@@ -319,11 +321,13 @@ void describe("resumePausedTask on a completed task", () => {
       assert.equal(stored?.status, "active");
       assert.equal(stored?.completedAt, undefined);
       assert.equal(stored?.currentStage, "publish");
-      assert.ok(
-        msgs.captured.some((m) => m.method === "info" && m.message.includes("reopened")),
-        "expected a reopened confirmation message"
+      assert.equal(
+        msgs.captured.filter((m) => m.method === "info" && m.message.includes("Resume Task")).length,
+        1,
+        "the bridge produces exactly one terminal reopen notification"
       );
     } finally {
+      bridge.dispose();
       msgs.restore();
       ws.restore();
       rf.restore();
@@ -421,7 +425,7 @@ void describe("setTaskStage on a completed task", () => {
     };
 
     try {
-      await setTaskStage(inv, store, { canonicalId, stage: "impl-high-review" }, false);
+      await setTaskStage(inv, store, { canonicalId, stage: "impl-high-review" }, "jump");
 
       assert.equal(quickPickCalled, false, "an explicit stage must skip the picker entirely");
       const stored = await readTaskProgress(vscode.Uri.file(folderPath));
@@ -457,7 +461,7 @@ void describe("setTaskStage on a completed task", () => {
     };
 
     try {
-      await setTaskStage(inv, store, { canonicalId }, false);
+      await setTaskStage(inv, store, { canonicalId }, "jump");
 
       assert.ok(pickedItems?.some((i) => i.stage === "publish"), "Publish must be selectable for a completed task's reopen picker");
       assert.equal(pickedItems![0]!.stage, "publish", "Publish must be preselected");

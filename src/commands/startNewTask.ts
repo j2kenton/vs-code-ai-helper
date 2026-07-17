@@ -12,6 +12,7 @@ import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { activateTask } from "../state/taskActivationCoordinator";
 import { withMetaRootLock } from "../state/taskStateStore";
 import { safeOpenTextDocument } from "../utils/fileUtils";
+import { runTrackedOperation } from "../utils/taskOperations";
 
 /**
  * Format a date as YYYY-MM-DD
@@ -148,88 +149,17 @@ export async function startNewTask(
   }
 
   try {
-    // Resolve the task root, creating it if needed
-    const metaFolderPath = await resolveTaskRootForCreation(workspaceRoot);
-
-    // The meta-root lease is shared across extension hosts. Folder-number
-    // discovery, directory creation, and the initial files must be one
-    // operation: otherwise two VS Code windows can both choose task_2 and
-    // overwrite each other's seed files.
-    const created = await withMetaRootLock(metaFolderPath, async () => {
-      await recoverCompletedTaskCreations(metaFolderPath);
-      const dateStr = formatDate(new Date());
-      const taskNumber = await getNextTaskNumber(metaFolderPath, dateStr);
-      const taskFolderName = `${dateStr}_task_${taskNumber}`;
-      const taskFolderPath = path.join(metaFolderPath, taskFolderName);
-      const taskFolderUri = vscode.Uri.file(taskFolderPath);
-      const taskFileUri = vscode.Uri.joinPath(taskFolderUri, TASK_FILENAME);
-
-      await vscode.workspace.fs.createDirectory(taskFolderUri);
-
-      // "creating" is a durable creation sentinel. It is only promoted after
-      // task.md and task-progress.json have both been written successfully.
-      const progress = {
-        ...createTaskProgress(taskFolderName, "desc"),
-        displayName: taskFolderName,
-        nameIsDefault: true,
-        ownership: {
-          metaRoot: path.resolve(metaFolderPath),
-          projectRoot: path.resolve(workspaceRoot.uri.fsPath),
-          workspaceRoot: path.resolve(workspaceRoot.uri.fsPath),
-          boundAt: new Date().toISOString(),
-          state: "resolved" as const,
-        },
-      };
-      await writeTaskProgress(taskFolderUri, progress);
-
-      // task.md is the sole initial task document. Users can write freely in
-      // the editor before asking the stage AI to turn it into a structured task.
-      const taskTemplate = await loadTaskTemplate(extensionUri);
-      await vscode.workspace.fs.writeFile(
-        taskFileUri,
-        new TextEncoder().encode(taskTemplate)
-      );
-      await writeTaskProgress(taskFolderUri, { ...progress, status: "active" });
-      return { taskFolderName, taskFolderPath, taskFileUri };
-    });
-    const { taskFolderName, taskFolderPath, taskFileUri } = created;
-
-    // Refresh inventory so the new task is discoverable
-    await inventory.refresh();
-
-    // Resolve the newly created task back out of the inventory by its
-    // normalized canonical path (mirrors the normalization in taskRoot.ts).
-    const normalizedFolderPath = normalizePath(taskFolderPath);
-    const newTask =
-      inventory.getTaskById(normalizedFolderPath) ??
-      inventory.getTaskByPath(normalizedFolderPath) ??
-      // Fallback: match by folder name in case path normalization differs
-      inventory.getTasks().find((t) => t.folderName === taskFolderName);
-
-    if (newTask) {
-      // Persist the new task as the current task so the shortcut router
-      // finds it immediately, even before the user interacts with the tree.
-      if (!(await activateTask(inventory, currentTaskStore, taskFolderPath, newTask.canonicalId))) {
-        throw new Error("Could not activate the new task.");
-      }
-    } else {
-      // The task folder was created and the inventory was refreshed, but the
-      // task could not be re-resolved. This is unexpected (e.g. a race with
-      // discovery filters). Surface a warning so the user knows the shortcut
-      // may not work until they manually select the task in the tree.
-      const warningMsg = `Task "${taskFolderName}" was created but could not be set as the ` +
-        `current task automatically. Select it in the Tasks panel to activate it.`;
-      try {
-        const { NotificationRouter } = await import("../utils/notificationRouter.js");
-        NotificationRouter.showWarning(warningMsg);
-      } catch {
-        void vscode.window.showWarningMessage(warningMsg);
-      }
-    }
-
-    await safeOpenTextDocument(taskFileUri, "task.md");
-
-    return taskFolderName;
+    // Tracked instant mutation (taxonomy: create-task / terminal-always),
+    // keyed on the workspace root because the task folder does not exist yet.
+    // Registration is synchronous, so the Notifications row appears the moment
+    // the button is pressed; the terminal entry (including the new folder
+    // name, via report()) is recorded centrally by the operation-notification
+    // bridge.
+    return await runTrackedOperation(
+      workspaceRoot.uri.fsPath,
+      { label: "Create Task", taskName: workspaceRoot.name, kind: "create-task" },
+      (op) => createTask(inventory, extensionUri, currentTaskStore, workspaceRoot, op)
+    );
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     void vscode.window.showErrorMessage(
@@ -237,6 +167,101 @@ export async function startNewTask(
     );
     return undefined;
   }
+}
+
+async function createTask(
+  inventory: TaskInventory,
+  extensionUri: vscode.Uri,
+  currentTaskStore: CurrentTaskStore,
+  workspaceRoot: vscode.WorkspaceFolder,
+  op: { report(detail: string | undefined): void }
+): Promise<string> {
+  // Resolve the task root, creating it if needed
+  const metaFolderPath = await resolveTaskRootForCreation(workspaceRoot);
+
+  // The meta-root lease is shared across extension hosts. Folder-number
+  // discovery, directory creation, and the initial files must be one
+  // operation: otherwise two VS Code windows can both choose task_2 and
+  // overwrite each other's seed files.
+  const created = await withMetaRootLock(metaFolderPath, async () => {
+    await recoverCompletedTaskCreations(metaFolderPath);
+    const dateStr = formatDate(new Date());
+    const taskNumber = await getNextTaskNumber(metaFolderPath, dateStr);
+    const taskFolderName = `${dateStr}_task_${taskNumber}`;
+    const taskFolderPath = path.join(metaFolderPath, taskFolderName);
+    const taskFolderUri = vscode.Uri.file(taskFolderPath);
+    const taskFileUri = vscode.Uri.joinPath(taskFolderUri, TASK_FILENAME);
+
+    await vscode.workspace.fs.createDirectory(taskFolderUri);
+
+    // "creating" is a durable creation sentinel. It is only promoted after
+    // task.md and task-progress.json have both been written successfully.
+    const progress = {
+      ...createTaskProgress(taskFolderName, "desc"),
+      displayName: taskFolderName,
+      nameIsDefault: true,
+      ownership: {
+        metaRoot: path.resolve(metaFolderPath),
+        projectRoot: path.resolve(workspaceRoot.uri.fsPath),
+        workspaceRoot: path.resolve(workspaceRoot.uri.fsPath),
+        boundAt: new Date().toISOString(),
+        state: "resolved" as const,
+      },
+    };
+    await writeTaskProgress(taskFolderUri, progress);
+
+    // task.md is the sole initial task document. Users can write freely in
+    // the editor before asking the stage AI to turn it into a structured task.
+    const taskTemplate = await loadTaskTemplate(extensionUri);
+    await vscode.workspace.fs.writeFile(
+      taskFileUri,
+      new TextEncoder().encode(taskTemplate)
+    );
+    await writeTaskProgress(taskFolderUri, { ...progress, status: "active" });
+    return { taskFolderName, taskFolderPath, taskFileUri };
+  });
+  const { taskFolderName, taskFolderPath, taskFileUri } = created;
+
+  // Refresh inventory so the new task is discoverable
+  await inventory.refresh();
+
+  // Resolve the newly created task back out of the inventory by its
+  // normalized canonical path (mirrors the normalization in taskRoot.ts).
+  const normalizedFolderPath = normalizePath(taskFolderPath);
+  const newTask =
+    inventory.getTaskById(normalizedFolderPath) ??
+    inventory.getTaskByPath(normalizedFolderPath) ??
+    // Fallback: match by folder name in case path normalization differs
+    inventory.getTasks().find((t) => t.folderName === taskFolderName);
+
+  if (newTask) {
+    // Persist the new task as the current task so the shortcut router
+    // finds it immediately, even before the user interacts with the tree.
+    if (!(await activateTask(inventory, currentTaskStore, taskFolderPath, newTask.canonicalId))) {
+      throw new Error("Could not activate the new task.");
+    }
+  } else {
+    // The task folder was created and the inventory was refreshed, but the
+    // task could not be re-resolved. This is unexpected (e.g. a race with
+    // discovery filters). Surface a warning so the user knows the shortcut
+    // may not work until they manually select the task in the tree.
+    const warningMsg = `Task "${taskFolderName}" was created but could not be set as the ` +
+      `current task automatically. Select it in the Tasks panel to activate it.`;
+    try {
+      const { NotificationRouter } = await import("../utils/notificationRouter.js");
+      NotificationRouter.showWarning(warningMsg);
+    } catch {
+      void vscode.window.showWarningMessage(warningMsg);
+    }
+  }
+
+  // Surface the new folder name on the operation row (and in its terminal
+  // Notifications entry via the bridge).
+  op.report(taskFolderName);
+
+  await safeOpenTextDocument(taskFileUri, "task.md");
+
+  return taskFolderName;
 }
 
 /**

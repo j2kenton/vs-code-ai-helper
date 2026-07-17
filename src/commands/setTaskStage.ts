@@ -8,7 +8,7 @@ import { IncompleteTask } from "../utils/taskProgressUtils";
 import { TaskInventory } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { resolveTaskContext, ResolvedTaskContext } from "../utils/resolveTaskContext";
-import { advanceStage } from "../utils/stageTransition";
+import { advanceStage, AUTO_REVIEW_ELIGIBLE_KINDS, TransitionKind } from "../utils/stageTransition";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { runCompletionLint } from "../utils/completionLint";
 import { pickReopenStage, reopenCompletedTask } from "../utils/reopenTask";
@@ -74,15 +74,17 @@ function normalizeArg(node: SetTaskStageArg | undefined): {
  * it immediately — CurrentTaskStore is the single source of truth for all
  * surfaces (tree, status bar, task actions).
  *
- * @param triggerAutoReview - when true (Move on to next stage), advancing into
- *   a review stage auto-triggers the corresponding review AI run.
- *   Default: false (manual set-stage-as-current does not auto-trigger review).
+ * @param kind - why this transition is happening. Passed straight through to
+ *   `advanceStage`'s `kind` gate rather than being re-derived from a boolean,
+ *   so a caller can only ever get auto-review by actually claiming a kind
+ *   that's in `AUTO_REVIEW_ELIGIBLE_KINDS` — see stageTransition.ts.
+ *   Default: `"jump"` (manual set-stage-as-current does not auto-trigger review).
  */
 export async function setTaskStage(
   inventory: TaskInventory,
   currentTaskStore: CurrentTaskStore,
   node?: SetTaskStageArg,
-  triggerAutoReview = false
+  kind: TransitionKind = "jump"
 ): Promise<void> {
   const workspaceRoot = vscode.workspace.workspaceFolders?.[0];
   if (!workspaceRoot) {
@@ -162,7 +164,7 @@ export async function setTaskStage(
         canonicalId: selectedTaskItem.task.canonicalId,
         stage: requestedStage,
       },
-      triggerAutoReview
+      kind
     );
   }
 
@@ -207,18 +209,28 @@ export async function setTaskStage(
   // Persist the destination stage using the shared advanceStage helper.
   // This centralizes auto-review eligibility, transition sequencing, and persistence.
   const taskFolderUri = vscode.Uri.file(task.taskFolderPath);
-  const transitionResult = await advanceStage(
-    taskFolderUri,
-    task.progress.currentStage,
-    newStage,
-    false,
-    // A caller opting into auto-review (triggerAutoReview=true) is treating
-    // this like a "move on" transition rather than an arbitrary jump — the
-    // `kind` gate must reflect that, not the always-ineligible "jump" kind,
-    // or the eligible-kinds hard gate in advanceStage would silently drop it.
-    triggerAutoReview ? "complete-and-move-on" : "jump",
-    triggerAutoReview
-  );
+  let transitionResult: Awaited<ReturnType<typeof advanceStage>>;
+  try {
+    transitionResult = await advanceStage(
+      taskFolderUri,
+      task.progress.currentStage,
+      newStage,
+      false,
+      kind,
+      AUTO_REVIEW_ELIGIBLE_KINDS.has(kind)
+    );
+  } catch (error) {
+    // advanceStage throws (rather than resolving falsy) when its
+    // compare-and-set is rejected — e.g. a concurrent manual/auto transition
+    // already moved this task's stage under the lock. Report it the same way
+    // as any other failed transition instead of letting it surface as an
+    // unhandled rejection.
+    const message = error instanceof Error ? error.message : String(error);
+    NotificationRouter.showWarning(
+      `Could not set stage for ${task.folderName}: ${message}`
+    );
+    return;
+  }
 
   if (!transitionResult?.persisted) {
     void vscode.window.showErrorMessage(
@@ -327,7 +339,7 @@ export function registerSetTaskStageCommand(
   // When called from either tree view button, no auto-review — the user is
   // manually navigating stages.
   const handler = (node?: SetTaskStageArg): Promise<void> =>
-    setTaskStage(inventory, currentTaskStore, node, false);
+    setTaskStage(inventory, currentTaskStore, node, "jump");
 
   const disposable = vscode.commands.registerCommand(
     "vs-code-ai-helper.setTaskStage",

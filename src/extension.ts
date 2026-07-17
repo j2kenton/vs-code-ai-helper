@@ -37,7 +37,8 @@ import { CurrentTaskStore } from "./utils/currentTaskStore";
 import { TASK_PROGRESS_FILENAME } from "./types/taskProgress";
 import { warmCliModelCache } from "./utils/modelSelection";
 import { StatusTreeProvider, STATUS_VIEW_ID } from "./views/statusView";
-import { initNotificationRouter, deactivateNotificationRouter } from "./utils/notificationRouter";
+import { initNotificationRouter, deactivateNotificationRouter, NotificationRouter } from "./utils/notificationRouter";
+import { installOperationNotificationBridge } from "./utils/operationNotificationBridge";
 import { ViewProgressBinder } from "./utils/viewProgressBinder";
 import { taskOperations } from "./utils/taskOperations";
 import { cleanupOrphanedTempFiles } from "./state/writeAtomic";
@@ -231,9 +232,29 @@ export function activate(context: vscode.ExtensionContext): void {
   const statusTreeProvider = new StatusTreeProvider(context.workspaceState);
   context.subscriptions.push(statusTreeProvider);
   initNotificationRouter(statusTreeProvider);
+  // Central operation → terminal-entry bridge (contract C1): every root
+  // operation's end is recorded as a persistent Notifications entry from the
+  // registry's own lifecycle event, so the in-progress row never just
+  // vanishes and no command has to remember to post its own message.
+  context.subscriptions.push(installOperationNotificationBridge());
   context.subscriptions.push(vscode.commands.registerCommand(
     "vs-code-ai-helper.clearNotifications",
     () => statusTreeProvider.clear()
+  ));
+  // Inline cancel button on cancellable running-operation rows in the
+  // Notifications view. Cancellation is a request: it fires the operation's
+  // token (cascading to running children) and the row shows "cancelling…"
+  // until the run observes the token and ends.
+  context.subscriptions.push(vscode.commands.registerCommand(
+    "vs-code-ai-helper.cancelOperation",
+    (node?: { id?: string }) => {
+      if (typeof node?.id !== "string") return;
+      if (!taskOperations.cancelOperation(node.id)) {
+        NotificationRouter.showInformation(
+          "This operation can no longer be cancelled (it may have just finished)."
+        );
+      }
+    }
   ));
   registerOpenGeneralAssistantCommand(context, inventory, currentTaskStore);
 
@@ -299,6 +320,18 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(vscode.commands.registerCommand(
     "vs-code-ai-helper.resetTaskStatusFilter",
     () => taskTreeProvider.resetStatusFilter()
+  ));
+  // Bound as the click command for stage rows whose artifact doesn't exist
+  // on disk yet (e.g. an auto-triggered review is still generating it) so
+  // clicking gives feedback instead of silently doing nothing — see
+  // StageNode in taskTreeProvider.ts.
+  context.subscriptions.push(vscode.commands.registerCommand(
+    "vs-code-ai-helper.stageArtifactNotReady",
+    (message?: string) => {
+      NotificationRouter.showInformation(
+        message ?? "This stage's artifact has not been created yet."
+      );
+    }
   ));
   const statusBarMenuCommand = vscode.commands.registerCommand(
     "vs-code-ai-helper.statusBarMenu",

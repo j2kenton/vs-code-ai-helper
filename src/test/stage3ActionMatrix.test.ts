@@ -52,7 +52,9 @@ void describe("Stage 3 action matrix contracts", () => {
     );
 
     assert.ok(markTaskDone, "Expected markTaskDone command contribution");
-    assert.equal(markTaskDone.title, "Complete and Move On to Next Task");
+    // Final-stage control: the user settled on plain "Complete Task" for the
+    // Publish row's completion button.
+    assert.equal(markTaskDone.title, "Complete Task");
   });
 
   void it("declares nextStage menu for current desc stage row", () => {
