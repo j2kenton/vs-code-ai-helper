@@ -7,9 +7,11 @@
  * string engineered to look benign should still never slip past the gate.
  */
 import * as assert from "node:assert/strict";
+import * as path from "node:path";
 import { describe, it } from "node:test";
 import {
   isSafeReleaseScript,
+  orderReleaseTargetItems,
   resolveReleaseWorkspace,
 } from "../commands/reviewActions";
 
@@ -87,5 +89,49 @@ void describe("resolveReleaseWorkspace", () => {
     );
 
     assert.equal(resolved, undefined);
+  });
+});
+
+// The release-target QuickPick defaults to the current task's Publish
+// verification scope: its package.json is highlighted first (and labeled),
+// while the persisted release target itself stays independent of the scope.
+void describe("orderReleaseTargetItems", () => {
+  const root = path.resolve("C:\\Projects\\Helper");
+  const items = (): Array<{ label: string; description?: string }> => [
+    { label: path.join("packages", "app", "package.json") },
+    { label: "package.json" },
+    { label: path.join("packages", "lib", "package.json") },
+  ];
+
+  void it("moves the package.json inside the task's Publish scope to the front and labels it", () => {
+    const ordered = orderReleaseTargetItems(items(), root, path.join(root, "packages", "lib"));
+    assert.equal(ordered[0]?.label, path.join("packages", "lib", "package.json"));
+    assert.equal(ordered[0]?.description, "current task's Publish scope");
+    // The rest keep the shortest-path-first order.
+    assert.deepEqual(
+      ordered.slice(1).map((item) => item.label),
+      ["package.json", path.join("packages", "app", "package.json")]
+    );
+  });
+
+  void it("matches the workspace-root scope to the root package.json", () => {
+    const ordered = orderReleaseTargetItems(items(), root, root);
+    assert.equal(ordered[0]?.label, "package.json");
+    assert.equal(ordered[0]?.description, "current task's Publish scope");
+  });
+
+  void it("keeps plain shortest-path-first order when no scope is given or nothing matches", () => {
+    for (const scope of [undefined, path.join(root, "packages", "missing")]) {
+      const ordered = orderReleaseTargetItems(items(), root, scope);
+      assert.deepEqual(
+        ordered.map((item) => item.label),
+        [
+          "package.json",
+          path.join("packages", "app", "package.json"),
+          path.join("packages", "lib", "package.json"),
+        ]
+      );
+      assert.equal(ordered.every((item) => item.description === undefined), true);
+    }
   });
 });

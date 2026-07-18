@@ -59,32 +59,66 @@ export interface CompletionLintResult {
   verifiedFolder?: string;
 }
 
+/** True when the path exists on disk and is a directory. */
+function isExistingDirectory(candidate: string): boolean {
+  try {
+    return fs.statSync(candidate).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Resolve the folder the Publish stage verifies (lint/tests) against: the
- * task's persisted, workspace-folder-relative `publishScopePath` when set
- * and still present on disk; otherwise the workspace folder containing the
- * task. A persisted path that no longer exists is reported `stale` so
- * interactive callers can re-prompt (see choosePublishScope.ts).
+ * task's persisted `publishScopePath` when set and still present on disk;
+ * otherwise the task's durable `ownership.projectRoot` binding when one is
+ * recorded — persisted ownership takes precedence over task-folder
+ * containment (mirroring resolveReleaseWorkspace in reviewActions.ts),
+ * because a task can live in an external metadata root that happens to sit
+ * inside an unrelated open workspace, and that parent workspace is not the
+ * project. Only a legacy task with no recorded binding falls back to the
+ * workspace folder containing it, then to its own folder (pre-ownership
+ * layouts where the task folder was the project). Relative persisted paths
+ * resolve against that same default, so the picker (choosePublishScope.ts)
+ * and this resolver round-trip identically. `stale: true` means no valid
+ * scope could be resolved and interactive callers must re-prompt (or
+ * abort) — that covers both a persisted path that no longer exists and a
+ * recorded `ownership.projectRoot` that has vanished: a
+ * configured-but-missing binding must never silently degrade to verifying
+ * the metadata folder or whatever workspace happens to contain it.
  */
 export function resolvePublishScopeFolder(
   taskFolderUri: vscode.Uri,
-  progress: Pick<TaskProgress, "publishScopePath"> | undefined
+  progress: Pick<TaskProgress, "publishScopePath" | "ownership"> | undefined
 ): { folder: string; stale: boolean } {
   const workspaceFolder = vscode.workspace.getWorkspaceFolder(taskFolderUri);
-  const defaultFolder = workspaceFolder?.uri.fsPath ?? taskFolderUri.fsPath;
+  const ownershipRoot = progress?.ownership?.projectRoot?.trim();
+  const ownershipRootValid = !!ownershipRoot && isExistingDirectory(ownershipRoot);
+  // A recorded-but-missing project binding is authoritative staleness: the
+  // binding declares the project lives elsewhere, so neither a containing
+  // workspace nor the metadata folder may substitute for it.
+  const defaultUnresolvable = !!ownershipRoot && !ownershipRootValid;
+  const defaultFolder =
+    (ownershipRootValid ? ownershipRoot : undefined) ??
+    workspaceFolder?.uri.fsPath ??
+    taskFolderUri.fsPath;
   const persisted = progress?.publishScopePath?.trim();
   if (!persisted) {
-    return { folder: defaultFolder, stale: false };
+    return { folder: defaultFolder, stale: defaultUnresolvable };
   }
-  const absolute = path.isAbsolute(persisted)
-    ? persisted
-    : path.join(defaultFolder, persisted);
-  try {
-    if (fs.statSync(absolute).isDirectory()) {
+  if (path.isAbsolute(persisted)) {
+    return isExistingDirectory(persisted)
+      ? { folder: persisted, stale: false }
+      : { folder: defaultFolder, stale: true };
+  }
+  // A relative scope is only meaningful against a resolvable base — never
+  // resolve it against the metadata-folder fallback, where a coincidental
+  // directory match would silently verify task metadata.
+  if (!defaultUnresolvable) {
+    const absolute = path.join(defaultFolder, persisted);
+    if (isExistingDirectory(absolute)) {
       return { folder: absolute, stale: false };
     }
-  } catch {
-    // Fall through: the persisted path no longer exists.
   }
   return { folder: defaultFolder, stale: true };
 }
@@ -761,17 +795,31 @@ export async function runCompletionLint(folderUri: vscode.Uri, relevantFiles?: r
   const scope = resolvePublishScopeFolder(folderUri, progress);
   let scopeFolder = scope.folder;
   if (scope.stale) {
-    // The persisted scope no longer exists on disk. Silently verifying the
-    // workspace root instead would report results for the wrong project, so
-    // re-prompt for a valid scope; cancelling aborts the check outright.
+    // No valid scope resolved: either the persisted scope no longer exists
+    // on disk, or the task's recorded project binding has vanished (which
+    // also invalidates any relative persisted scope — it has no base left).
+    // Silently verifying the fallback folder instead would report results
+    // for the wrong project (or for task metadata), so re-prompt for a
+    // valid scope; cancelling — or having no project root left to offer —
+    // aborts the check outright. No command may run in the metadata folder
+    // or in a workspace that merely contains it.
+    const savedScope = progress?.publishScopePath?.trim();
+    const bindingRoot = progress?.ownership?.projectRoot?.trim();
+    const bindingVanished = !!bindingRoot && !isExistingDirectory(bindingRoot);
     const repicked = await promptAndPersistPublishScope(folderUri, {
-      title: "The saved Publish verification scope no longer exists — choose a new one",
+      title: bindingVanished
+        ? "The task's project-root binding no longer exists — choose a Publish verification scope"
+        : "The saved Publish verification scope no longer exists — choose a new one",
       currentRelPath: progress?.publishScopePath,
     });
     if (!repicked) {
       throw new Error(
-        `The saved Publish verification scope ("${progress?.publishScopePath ?? ""}") no longer exists. ` +
-          "Choose a valid scope to run the Publish checks against."
+        !bindingVanished && savedScope
+          ? `The saved Publish verification scope ("${savedScope}") no longer exists. ` +
+            "Choose a valid scope to run the Publish checks against."
+          : "No valid Publish verification scope could be resolved for this task — " +
+            "its recorded project-root binding no longer exists. Choose a valid " +
+            "scope to run the Publish checks against."
       );
     }
     scopeFolder = repicked;

@@ -318,7 +318,22 @@ export async function resolveTaskContext(
       },
     };
   }
-  if (workspaceRoots.length > 0 && !workspaceRoots.some(root => isSameOrUnder(resolved.taskFolderPath, root))) return undefined;
+  // Tasks can live in an external metadata root (a legacy absolute
+  // metaResourcesPath), where folder containment says nothing about
+  // ownership. Such a task is accepted only when it sits inside its own
+  // persisted ownership.metaRoot AND its persisted owner matched an open
+  // workspace folder above — cross-project references still fail closed
+  // (mirrors the release path's external-meta handling in reviewActions.ts).
+  const ownedMetaRoot = resolved.progress.ownership?.metaRoot;
+  const insideOwnedMetaRoot =
+    !!persistedOwner &&
+    !!ownedMetaRoot &&
+    isSameOrUnder(resolved.taskFolderPath, path.resolve(ownedMetaRoot));
+  if (
+    workspaceRoots.length > 0 &&
+    !insideOwnedMetaRoot &&
+    !workspaceRoots.some(root => isSameOrUnder(resolved.taskFolderPath, root))
+  ) return undefined;
 
   // Check paused status
   if (!options?.allowPaused && resolved.progress.status === "paused") {

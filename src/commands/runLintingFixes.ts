@@ -180,7 +180,8 @@ export async function runLintingFixes(
   const scope = resolvePublishScopeFolder(taskFolderUri, resolvedTask.progress);
   if (scope.stale) {
     const choice = await vscode.window.showWarningMessage(
-      "The saved Publish verification scope no longer exists. Re-run the " +
+      "No valid Publish verification scope could be resolved (the saved scope " +
+        "or the task's project-root binding no longer exists). Re-run the " +
         "Publish checks to choose a new scope before applying fixes.",
       "Run Publish Checks"
     );

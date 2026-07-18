@@ -4,18 +4,23 @@
  * carries the flush-guarantee capability flag AND the parsed event stream
  * was available and free of tool-use/file-edit events AND the working-tree
  * snapshot is unchanged. Every other combination refuses the retry. Also
- * covers the stdout event-stream analysis itself and the runLog-persisted
- * retry-audit rendering (attempt, classification, capability flag,
- * evidence, delay).
+ * covers the read-only (text-mode) retry rule — timeout-then-success retries
+ * freely, non-retryable classifications (auth errors, non-zero tool exits,
+ * content errors) never retry — plus the stdout event-stream analysis itself
+ * and the runLog-persisted retry-audit rendering (attempt, classification,
+ * capability flag, evidence, delay).
  */
 import * as assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
 import {
   analyzeCliEventStream,
+  CLI_RETRY_MAX_ATTEMPTS,
   evaluateEditRetryEligibility,
   formatRetryAuditLog,
+  shouldRetryReadOnlyRun,
 } from "../runners/cliAgentRunner";
+import { classifyCliFailure } from "../utils/quota";
 
 void describe("analyzeCliEventStream", () => {
   void it("reports no stream for plain-text output", () => {
@@ -118,6 +123,42 @@ void describe("evaluateEditRetryEligibility", () => {
     });
     assert.equal(decision.retry, true);
     assert.match(decision.reason, /clean event stream/);
+  });
+});
+
+void describe("shouldRetryReadOnlyRun", () => {
+  void it("timeout-then-success: retries a timed-out read-only run, then stops once the next attempt completes", () => {
+    // Attempt 1 times out — the one transport-transient failure shape.
+    const timedOut = { status: "failed", transient: true } as const;
+    assert.equal(shouldRetryReadOnlyRun(timedOut, 1, false), true);
+    // Attempt 2 succeeds — the loop must stop retrying.
+    const succeeded = { status: "completed" } as const;
+    assert.equal(shouldRetryReadOnlyRun(succeeded, 2, false), false);
+  });
+
+  void it("non-retryable classification: failures classified by classifyCliFailure are never transient", () => {
+    // Auth errors, non-zero tool exits, and content errors all flow through
+    // classifyCliFailure, which assigns a failureKind but never the
+    // transient flag — only the timeout path sets transient explicitly.
+    for (const errorMessage of [
+      "Invalid API key. Please run /login.",
+      "Claude Code CLI exited with code 1.",
+      "Claude Code CLI produced no output.",
+    ]) {
+      const classified = classifyCliFailure({ status: "failed", errorMessage });
+      assert.equal(
+        (classified as { transient?: boolean }).transient,
+        undefined,
+        `classification must not mark "${errorMessage}" transient`
+      );
+      assert.equal(shouldRetryReadOnlyRun(classified, 1, false), false);
+    }
+  });
+
+  void it("stops at the attempt cap and on cancellation even for transient timeouts", () => {
+    const timedOut = { status: "failed", transient: true } as const;
+    assert.equal(shouldRetryReadOnlyRun(timedOut, CLI_RETRY_MAX_ATTEMPTS, false), false);
+    assert.equal(shouldRetryReadOnlyRun(timedOut, 1, true), false);
   });
 });
 

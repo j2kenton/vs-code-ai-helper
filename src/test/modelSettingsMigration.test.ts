@@ -1,16 +1,19 @@
 import * as assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import * as vscode from "vscode";
-import { getModelSettings } from "../config/settings";
+import { getModelSettings, isProviderEnabled } from "../config/settings";
 
-function installModelSettings(raw: Record<string, unknown>): { restore: () => void } {
+function installModelSettings(
+  raw: Record<string, unknown>,
+  extra: Record<string, unknown> = {}
+): { restore: () => void } {
   const original = (vscode.workspace as unknown as Record<string, unknown>).getConfiguration;
   (vscode.workspace as unknown as Record<string, unknown>).getConfiguration = (): {
     get: (key: string, defaultValue?: unknown) => unknown;
     inspect: () => undefined;
   } => ({
     get: (key: string, defaultValue?: unknown): unknown =>
-      key === "modelSettings" ? raw : defaultValue,
+      key === "modelSettings" ? raw : key in extra ? extra[key] : defaultValue,
     inspect: () => undefined,
   });
 
@@ -77,6 +80,51 @@ void describe("getModelSettings — legacy fallbackEnabled migration", () => {
     try {
       const result = getModelSettings();
       assert.strictEqual(result.impl?.strategy, "switch-to-backup");
+    } finally {
+      settings.restore();
+    }
+  });
+});
+
+// Plan Workstream 1 coverage: removing the per-stage provider dropdowns must
+// never collapse or migrate stage model assignments. A stage whose selected
+// model belongs to a disabled provider keeps its stored value byte-for-byte
+// (the UI surfaces "provider disabled" and run time treats the stage as
+// unconfigured — see ensureStageModelConfigured); re-enabling the provider
+// restores the exact same selection with no data loss.
+void describe("getModelSettings — disabled-provider round trip", () => {
+  const raw = {
+    impl: {
+      primary: "codex-cli:gpt-5.4-codex",
+      backup: "claude-cli:sonnet@high",
+      strategy: "switch-to-backup",
+    },
+  };
+
+  void it("preserves a stage's stored model byte-for-byte while its provider is disabled", () => {
+    const settings = installModelSettings(raw, {
+      enabledProviders: { "claude-cli": true, "codex-cli": false },
+    });
+    try {
+      assert.strictEqual(isProviderEnabled("codex-cli"), false);
+      const result = getModelSettings();
+      assert.strictEqual(result.impl?.primary, "codex-cli:gpt-5.4-codex");
+      assert.strictEqual(result.impl?.backup, "claude-cli:sonnet@high");
+      assert.strictEqual(result.impl?.strategy, "switch-to-backup");
+    } finally {
+      settings.restore();
+    }
+  });
+
+  void it("returns the identical selection once the provider is re-enabled", () => {
+    const settings = installModelSettings(raw, {
+      enabledProviders: { "claude-cli": true, "codex-cli": true },
+    });
+    try {
+      assert.strictEqual(isProviderEnabled("codex-cli"), true);
+      const result = getModelSettings();
+      assert.strictEqual(result.impl?.primary, "codex-cli:gpt-5.4-codex");
+      assert.strictEqual(result.impl?.backup, "claude-cli:sonnet@high");
     } finally {
       settings.restore();
     }

@@ -405,6 +405,27 @@ export interface CliExecResult {
 export const CLI_RETRY_MAX_ATTEMPTS = 3; // 1 initial + 2 retries
 export const CLI_RETRY_DELAY_MS = 5_000;
 
+/**
+ * The read-only (text-mode) retry rule (exported for direct unit testing):
+ * retry only a failure classified transient — a run timeout; auth errors,
+ * non-zero tool exits, and content errors are never marked transient — while
+ * attempts remain and the run has not been cancelled. Read-only runs are
+ * side-effect free by construction, so unlike edit runs no further evidence
+ * is required.
+ */
+export function shouldRetryReadOnlyRun(
+  result: Pick<CliExecResult, "status" | "transient">,
+  attempt: number,
+  cancellationRequested: boolean
+): boolean {
+  return (
+    result.status === "failed" &&
+    result.transient === true &&
+    attempt < CLI_RETRY_MAX_ATTEMPTS &&
+    !cancellationRequested
+  );
+}
+
 /** Cancellable delay between retry attempts. */
 async function retryDelay(
   token: vscode.CancellationToken,
@@ -876,12 +897,7 @@ export class CliAgentRunner implements AgentRunner {
         cwd: request.workspaceUri.fsPath,
         token,
       });
-      const retryable =
-        result.status === "failed" &&
-        result.transient === true &&
-        attempt < CLI_RETRY_MAX_ATTEMPTS &&
-        !token.isCancellationRequested;
-      if (!retryable) {
+      if (!shouldRetryReadOnlyRun(result, attempt, token.isCancellationRequested)) {
         break;
       }
       retryAudit.push({

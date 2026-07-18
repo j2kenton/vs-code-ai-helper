@@ -70,7 +70,7 @@ import {
 } from "../utils/artifactBackups";
 import { meetsAutoAdvanceThreshold, parseReadiness } from "../utils/reviewReadiness";
 import { scheduleAutomationChain } from "../utils/automationChain";
-import { runCompletionLint } from "../utils/completionLint";
+import { resolvePublishScopeFolder, runCompletionLint } from "../utils/completionLint";
 import { improveReviewScore } from "../utils/reviewScoreLoop";
 import {
   getAutoAdvanceMode,
@@ -2896,17 +2896,50 @@ function releaseTargetStateKey(workspaceRoot: string): string {
 }
 
 /**
+ * Order the release-target QuickPick so the package.json inside the current
+ * task's Publish verification scope (when one is known) is listed — and
+ * therefore highlighted — first: the pick defaults to the task's Publish
+ * scope while the stored release target stays fully independent of it.
+ * Remaining entries keep the shortest-path-first order.
+ * @internal exported for testing
+ */
+export function orderReleaseTargetItems<T extends { label: string; description?: string }>(
+  items: T[],
+  workspaceRoot: string,
+  publishScopeFolder: string | undefined
+): T[] {
+  const sorted = [...items].sort((a, b) => a.label.length - b.label.length);
+  if (!publishScopeFolder) {
+    return sorted;
+  }
+  const scope = path.resolve(publishScopeFolder);
+  const index = sorted.findIndex(
+    (item) => path.resolve(workspaceRoot, path.dirname(item.label)) === scope
+  );
+  const match = sorted[index];
+  if (index < 0 || match === undefined) {
+    return sorted;
+  }
+  sorted.splice(index, 1);
+  match.description = "current task's Publish scope";
+  return [match, ...sorted];
+}
+
+/**
  * Resolve the release-target package.json for a workspace folder: the
  * explicit workspace-relative package.json path persisted per folder (so a
  * folder with several releasable packages is unambiguous). When unset — or
  * when the persisted path no longer exists — the user picks from the
- * detected package.json files and the choice is stored. `forcePrompt` is the
- * "change release target" path: always re-prompts, defaulting nothing away.
+ * detected package.json files (defaulting to the one in
+ * `publishScopeFolder`, the calling task's Publish verification scope, when
+ * given) and the choice is stored. `forcePrompt` is the "change release
+ * target" path: always re-prompts, defaulting nothing away.
  */
 async function resolveReleaseTargetPackageJson(
   context: vscode.ExtensionContext,
   workspaceRoot: string,
-  forcePrompt = false
+  forcePrompt = false,
+  publishScopeFolder?: string
 ): Promise<string | undefined> {
   const key = releaseTargetStateKey(workspaceRoot);
   const stored = context.workspaceState.get<string>(key);
@@ -2927,12 +2960,14 @@ async function resolveReleaseTargetPackageJson(
     void vscode.window.showErrorMessage("No package.json was found in this workspace.");
     return undefined;
   }
-  const items = uris
-    .map((uri) => ({
+  const items = orderReleaseTargetItems(
+    uris.map((uri) => ({
       label: path.relative(workspaceRoot, uri.fsPath) || "package.json",
       uri,
-    }))
-    .sort((a, b) => a.label.length - b.label.length);
+    })),
+    workspaceRoot,
+    publishScopeFolder
+  );
   const picked = await vscode.window.showQuickPick(items, {
     title: "Select the package.json to release",
     placeHolder: `The chosen file must define a "${RELEASE_SCRIPT_NAME}" script; the choice is remembered for this workspace folder`,
@@ -2983,8 +3018,14 @@ async function runRelease(context: vscode.ExtensionContext, arg?: TaskNodeArg): 
     // The release target is the explicit, per-workspace-folder persisted
     // package.json path (see resolveReleaseTargetPackageJson) — it may be a
     // nested package and can differ from any task's Publish verification
-    // scope. A persisted-but-invalid path re-prompts.
-    const packageJsonPath = await resolveReleaseTargetPackageJson(context, root);
+    // scope. A persisted-but-invalid path re-prompts, defaulting the pick to
+    // this task's Publish scope without ever storing it as the target.
+    const packageJsonPath = await resolveReleaseTargetPackageJson(
+      context,
+      root,
+      false,
+      resolvePublishScopeFolder(vscode.Uri.file(candidate), progress).folder
+    );
     if (!packageJsonPath) { return; }
     const packageDir = path.dirname(packageJsonPath);
 
