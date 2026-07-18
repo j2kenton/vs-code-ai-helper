@@ -157,3 +157,91 @@ void describe("global assistant authorization boundary", () => {
     assert.strictEqual(getGlobalAssistantOperation("anythingElse"), undefined);
   });
 });
+
+void describe("typed operation catalog — payload schemas and targeting", () => {
+  void it("covers the full lifecycle catalog", () => {
+    for (const id of [
+      "createTask",
+      "renameTask",
+      "setTaskStage",
+      "triggerStageAI",
+      "completeTask",
+      "completeStage",
+      "runReview",
+      "fastForwardReview",
+      "pauseTask",
+      "resumeTask",
+      "archiveTask",
+      "unarchiveTask",
+      "pinTask",
+      "unpinTask",
+      "archiveCompletedTasks",
+      "archiveTasks",
+      "unarchiveAllTasks",
+      "unarchiveTasks",
+      "repairStuckTask",
+    ]) {
+      assert.ok(getGlobalAssistantOperation(id), `registry must expose ${id}`);
+    }
+  });
+
+  void it("renameTask requires taskFolder and a non-blank newName", () => {
+    const op = getGlobalAssistantOperation("renameTask")!;
+    assert.ok(op.validatePayload(undefined));
+    assert.ok(op.validatePayload({ taskFolder: "t1" }));
+    assert.ok(op.validatePayload({ taskFolder: "t1", newName: "   " }));
+    assert.strictEqual(op.validatePayload({ taskFolder: "t1", newName: "Better name" }), undefined);
+  });
+
+  void it("setTaskStage validates the stage id against the known stages", () => {
+    const op = getGlobalAssistantOperation("setTaskStage")!;
+    assert.ok(op.validatePayload({ taskFolder: "t1" }));
+    assert.ok(op.validatePayload({ taskFolder: "t1", stage: "not-a-stage" }));
+    assert.strictEqual(op.validatePayload({ taskFolder: "t1", stage: "publish" }), undefined);
+    assert.strictEqual(op.requiresConfirmation, true, "stage moves are consequential");
+  });
+
+  void it("createTask accepts optional title/description and rejects unknown fields", () => {
+    const op = getGlobalAssistantOperation("createTask")!;
+    assert.strictEqual(op.validatePayload(undefined), undefined);
+    assert.strictEqual(op.validatePayload({ title: "T", description: "D" }), undefined);
+    assert.ok(op.validatePayload({ title: 5 }));
+    assert.ok(op.validatePayload({ folder: "x" }));
+  });
+
+  void it("archiveTasks requires an explicit selector and never means 'every task'", () => {
+    const op = getGlobalAssistantOperation("archiveTasks")!;
+    assert.ok(op.validatePayload({}), "an empty payload must be rejected");
+    assert.ok(op.validatePayload({ taskFolders: [] }));
+    assert.ok(op.validatePayload({ status: "archived" }), "cannot archive archived tasks");
+    assert.strictEqual(op.validatePayload({ taskFolders: ["t1"] }), undefined);
+    assert.strictEqual(op.validatePayload({ status: "completed" }), undefined);
+    assert.strictEqual(op.requiresConfirmation, true);
+  });
+
+  void it("archiveTasks resolves explicit and status-filter targets (union, deduped)", () => {
+    const op = getGlobalAssistantOperation("archiveTasks")!;
+    const ctx = makeContext([
+      makeTask("done-1", "completed"),
+      makeTask("done-2", "completed"),
+      makeTask("active-1", "active"),
+    ]);
+    const explicit = op.affectedTasks(ctx, { taskFolders: ["active-1"] });
+    assert.deepStrictEqual(explicit.map((t) => t.folderName), ["active-1"]);
+    const union = op.affectedTasks(ctx, { taskFolders: ["done-1"], status: "completed" });
+    assert.deepStrictEqual(
+      union.map((t) => t.folderName).sort(),
+      ["done-1", "done-2"],
+      "explicit + filter targets union without duplicates"
+    );
+  });
+
+  void it("unarchiveTasks requires an explicit taskFolders list and targets only archived tasks", () => {
+    const op = getGlobalAssistantOperation("unarchiveTasks")!;
+    assert.ok(op.validatePayload({ status: "archived" }), "a bare status filter is not enough");
+    assert.strictEqual(op.validatePayload({ taskFolders: ["t1"] }), undefined);
+    const ctx = makeContext([makeTask("parked", "archived"), makeTask("live", "active")]);
+    const targets = op.affectedTasks(ctx, { taskFolders: ["parked", "live"] });
+    assert.deepStrictEqual(targets.map((t) => t.folderName), ["parked"]);
+  });
+});

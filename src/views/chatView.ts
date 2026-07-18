@@ -9,6 +9,7 @@ import {
   loadTranscriptWithMigration,
   writeChatHistory,
 } from "../utils/chatHistoryStore";
+import { stripAttributionHeaders } from "../utils/fileUtils";
 
 export type { ChatMessage };
 
@@ -58,6 +59,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   private view?: vscode.WebviewView;
   private target?: ChatTarget;
   /**
+   * Resolves the default chat target when none has been chosen yet: the
+   * global assistant. Installed from extension.ts (the resolver lives with
+   * the openGeneralAssistant command) so the panel is usable immediately
+   * instead of showing a "select a task first" blocked state.
+   */
+  private defaultTargetFactory?: () => Promise<ChatTarget | undefined>;
+  /**
    * One write/read queue per task folder, so a slow or failing operation on
    * one task can never stall or lose a message for another. Reads
    * (transcript/render) are chained through the same queue as writes so a
@@ -82,6 +90,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
 
   dispose(): void {
     this.operationsSub.dispose();
+  }
+
+  setDefaultTargetFactory(factory: () => Promise<ChatTarget | undefined>): void {
+    this.defaultTargetFactory = factory;
   }
 
   resolveWebviewView(view: vscode.WebviewView): void {
@@ -205,6 +217,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   }
 
   private async render(): Promise<void> {
+    // No target chosen yet: default to the global assistant so the panel is
+    // usable immediately. The factory can legitimately fail (no workspace
+    // folder open yet); the panel then keeps its empty state.
+    if (!this.target && this.defaultTargetFactory) {
+      try {
+        const fallback = await this.defaultTargetFactory();
+        // Re-check: an open() may have landed while the factory resolved.
+        if (fallback && !this.target) {
+          this.target = fallback;
+        }
+      } catch {
+        // Keep the empty state.
+      }
+    }
     // Captured before the (now async, file-backed) transcript read so a
     // target switch mid-read can be detected and the stale render dropped
     // instead of painting one task's history into another's view.
@@ -245,13 +271,38 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       const taskLabel = target.taskName ?? target.taskFolderPath.replace(/\\/g, "/").split("/").pop() ?? "task";
       label = `${taskLabel} — ${STAGE_DISPLAY_NAMES[target.stage]} stage chat`;
     }
-    await this.view?.webview.postMessage({ type: "state", target: this.target, label, entries, busy });
+    // Attribution comments belong in generated artifact files, not in a
+    // conversation — strip them from every displayed message (including
+    // messages persisted before this stripping existed).
+    const displayEntries = entries.map((entry) => ({
+      ...entry,
+      text: stripAttributionHeaders(entry.text),
+    }));
+    await this.view?.webview.postMessage({ type: "state", target: this.target, label, entries: displayEntries, busy });
   }
 
   private html(): string {
     const nonce = crypto.randomBytes(16).toString("base64");
     return `<!doctype html><html><head><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';">
       <style>
+        body {
+          font-family: var(--vscode-font-family);
+          color: var(--vscode-foreground);
+          padding: 8px 10px;
+        }
+        #context {
+          color: var(--vscode-descriptionForeground);
+          margin: 0 0 10px;
+        }
+        #messages {
+          margin: 0 0 10px;
+        }
+        #messages p {
+          margin: 0 0 8px;
+          line-height: 1.4;
+          white-space: pre-wrap;
+          overflow-wrap: anywhere;
+        }
         .spinner {
           display: inline-block;
           width: 1em;
@@ -279,21 +330,42 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         #form {
           display: flex;
           flex-direction: column;
-          gap: 6px;
+          gap: 8px;
+          margin-top: 10px;
         }
         #form textarea {
           resize: vertical;
+          font-family: inherit;
+          font-size: inherit;
+          background-color: var(--vscode-input-background, var(--vscode-editor-background));
+          color: var(--vscode-input-foreground, var(--vscode-foreground));
+          border: 1px solid var(--vscode-input-border, var(--vscode-widget-border));
+          padding: 6px 8px;
+          border-radius: 2px;
+          box-sizing: border-box;
+        }
+        #form textarea:focus {
+          outline: 1px solid var(--vscode-focusBorder);
         }
         #form button {
           align-self: flex-end;
+          background-color: var(--vscode-button-background);
+          color: var(--vscode-button-foreground);
+          border: none;
+          padding: 6px 14px;
+          cursor: pointer;
+          border-radius: 2px;
+        }
+        #form button:hover {
+          background-color: var(--vscode-button-hoverBackground);
         }
       </style>
       </head><body>
-      <div id="context">Select an active task to start a stage conversation.</div><div id="messages"></div>
-      <div id="busy-indicator" style="display:none"><span class="spinner"></span>Waiting for the stage AI…</div>
-      <form id="form"><textarea id="message" rows="3" placeholder="Ask the current stage AI… (Ctrl+Enter to send)"></textarea><button>Send</button></form>
+      <div id="context">Open a workspace folder to start chatting with the AI.</div><div id="messages"></div>
+      <div id="busy-indicator" style="display:none"><span class="spinner"></span>Waiting for the AI…</div>
+      <form id="form"><textarea id="message" rows="3" placeholder="Message the AI… (Ctrl+Enter to send)"></textarea><button>Send</button></form>
       <script nonce="${nonce}">const v=acquireVsCodeApi(), c=document.getElementById('context'), m=document.getElementById('messages'), b=document.getElementById('busy-indicator'), f=document.getElementById('form'), i=document.getElementById('message');
-      window.addEventListener('message', e=>{const s=e.data;if(s.type!=='state')return;c.textContent=s.label??'Select an active task to start a stage conversation.';m.replaceChildren(...s.entries.map(x=>{const d=document.createElement('p');d.textContent='['+x.role+(x.pending?' — awaiting your answer':'')+'] '+x.text;return d;}));b.style.display=s.busy?'block':'none';});
+      window.addEventListener('message', e=>{const s=e.data;if(s.type!=='state')return;c.textContent=s.label??'Open a workspace folder to start chatting with the AI.';m.replaceChildren(...s.entries.map(x=>{const d=document.createElement('p');d.textContent='['+x.role+(x.pending?' — awaiting your answer':'')+'] '+x.text;return d;}));b.style.display=s.busy?'block':'none';});
       f.addEventListener('submit',e=>{e.preventDefault();v.postMessage({type:'send',text:i.value});i.value='';});
       i.addEventListener('keydown',e=>{if(e.key==='Enter'&&e.ctrlKey){e.preventDefault();f.requestSubmit();}});</script>
     </body></html>`;

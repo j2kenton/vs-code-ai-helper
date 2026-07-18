@@ -100,6 +100,10 @@ import {
 } from "../commands/resumeTask";
 import { setTaskStage } from "../commands/setTaskStage";
 import {
+  scheduleAutomationChain,
+  resetAutomationChainGuards,
+} from "../utils/automationChain";
+import {
   GENERATE_IMPL_ELIGIBLE_STAGES,
   normalizeReviewArg,
   runReviewForFolder,
@@ -1298,6 +1302,103 @@ void describe("setTaskStage auto-review delegation (production code)", () => {
         "setTaskStage with triggerAutoReview=false must NOT dispatch runReviewWithAI"
       );
     } finally {
+      msgs.restore();
+      memFs.restore();
+      wsFolders.restore();
+      execCmd.restore();
+    }
+  });
+
+  void it("drops the dispatch when an auto-review chain is already pending for the task", async () => {
+    const FOLDER_PATH = nodePath.join(REAL_TASK_ROOT, ".ensemble", "set-stage-auto-review-dedupe");
+    nodeFs.mkdirSync(FOLDER_PATH, { recursive: true });
+    const folderUri = vscode.Uri.file(FOLDER_PATH);
+
+    const store = new Map<string, string>();
+    const memFs = installMemStore(store);
+    const msgs = installMessageCapture();
+    const wsFolders = installWorkspaceFoldersStub();
+    const execCmd = installExecuteCommandStub();
+
+    // Same run-time model guard stub as the delegation test above — without a
+    // configured model, ensureStageModelConfigured would block before the
+    // dispatcher and this test would pass vacuously.
+    const wsRecord = vscode.workspace as unknown as Record<string, unknown>;
+    const origGetConfiguration = wsRecord.getConfiguration;
+    wsRecord.getConfiguration = () => ({
+      get: (key: string, defaultValue?: unknown): unknown => {
+        if (key === "modelSettings") {
+          return { "plan-high-review": { primary: "gpt-test-model" } };
+        }
+        return defaultValue;
+      },
+      inspect: (): undefined => undefined,
+    });
+
+    try {
+      const progress: TaskProgress = {
+        taskFolder: "set-stage-auto-review-dedupe",
+        currentStage: "plan",
+        status: "active",
+        createdAt: "2026-07-08T00:00:00.000Z",
+        updatedAt: "2026-07-08T00:00:00.000Z",
+      };
+      await seedProgress(store, folderUri, progress);
+
+      const inv = makeInventoryStubWithStage(
+        FOLDER_PATH,
+        FOLDER_PATH,
+        "plan",
+        "active"
+      );
+      const currentStore = makeCurrentTaskStoreStub(undefined);
+
+      // Occupy the (taskKey, "auto-review") guard slot with a chain deferred
+      // behind a root operation that never ends — exactly the state a racing
+      // auto-advance leaves while its review chain is still outstanding.
+      void scheduleAutomationChain(
+        {
+          command: "vs-code-ai-helper.runReviewWithAI",
+          arg: { taskFolderPath: FOLDER_PATH },
+          taskKey: FOLDER_PATH,
+          chainId: "auto-review",
+        },
+        { id: "never-ending-root" },
+        {
+          onDidEnd: () => ({ dispose: (): void => undefined }),
+          execute: () => Promise.resolve(undefined),
+        }
+      );
+
+      await setTaskStage(
+        inv,
+        currentStore,
+        { taskFolderPath: FOLDER_PATH, stage: "plan-high-review" },
+        "complete-and-move-on" /* kind */
+      );
+
+      // The transition itself must have persisted — proof the eligible
+      // auto-review path (not some earlier guard) is what dropped the chain.
+      const persisted = JSON.parse(
+        nodeFs.readFileSync(nodePath.join(FOLDER_PATH, "task-progress.json"), "utf8")
+      ) as TaskProgress;
+      assert.strictEqual(
+        persisted.currentStage,
+        "plan-high-review",
+        "stage transition must persist even when the follow-up chain is dropped"
+      );
+
+      const reviewDispatch = execCmd.captured.find(
+        (e) => e.command === "vs-code-ai-helper.runReviewWithAI"
+      );
+      assert.strictEqual(
+        reviewDispatch,
+        undefined,
+        "setTaskStage must drop its auto-review dispatch while an identical (taskKey, auto-review) chain is pending"
+      );
+    } finally {
+      resetAutomationChainGuards();
+      wsRecord.getConfiguration = origGetConfiguration;
       msgs.restore();
       memFs.restore();
       wsFolders.restore();

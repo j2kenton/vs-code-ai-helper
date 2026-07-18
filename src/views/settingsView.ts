@@ -14,7 +14,11 @@ import {
 } from "../config/settings";
 import { ModelSettings } from "../utils/modelFallback";
 import { getQuotaStatusText } from "../utils/quota";
-import { cliDisplayLabel, CLI_PROVIDERS } from "../runners/providers";
+import {
+  getProviderAccountEntry,
+  PROVIDER_ACCOUNT_ENTRIES,
+  ProviderAccountEntry,
+} from "../runners/providers";
 import { NotificationRouter } from "../utils/notificationRouter";
 
 type IncomingMessage =
@@ -25,7 +29,37 @@ type IncomingMessage =
   | { type: "validationError"; message: string }
   | { type: "refreshQuotaStatus" }
   | { type: "providerSignIn"; providerId: string }
+  | { type: "providerUsage"; providerId: string }
   | { type: "suppressUnsavedWarning" };
+
+/** Provider label for terminal titles/messages, without a doubled "CLI". */
+function accountEntryDisplayLabel(entry: ProviderAccountEntry): string {
+  return entry.label.replace(/\s+CLI$/i, "");
+}
+
+/**
+ * How long the interactive CLI gets to start before its in-session slash
+ * command is typed into the terminal. sendText writes straight to the
+ * terminal's stdin, so sending the slash command before the CLI is reading
+ * input would hand it to the shell instead; VS Code exposes no "CLI is now
+ * reading" signal, so a short fixed delay is the available approximation.
+ */
+const INTERACTIVE_SLASH_DELAY_MS = 3000;
+
+/**
+ * Dispatch an "interactive" provider capability: launch the provider's CLI
+ * in the given terminal, then send the in-session slash command (e.g.
+ * `/usage`, `/stats model`) into the running session. The two lines are
+ * deliberately never concatenated into one command line — the slash
+ * commands only exist inside the interactive session.
+ */
+function sendInteractiveSlashCommand(
+  terminal: vscode.Terminal,
+  capability: { launch: string; send: string }
+): void {
+  terminal.sendText(capability.launch, true);
+  setTimeout(() => terminal.sendText(capability.send, true), INTERACTIVE_SLASH_DELAY_MS);
+}
 
 export class SettingsViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = "vs-code-ai-helper.settingsView";
@@ -101,9 +135,62 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           break;
         }
         case "providerSignIn": {
-          const provider = CLI_PROVIDERS.find((candidate) => candidate.id === data.providerId);
+          const provider = getProviderAccountEntry(data.providerId);
           if (!provider) {
             return;
+          }
+          if (provider.signIn.kind === "vscode-command") {
+            // VS Code-native auth (Copilot): never a shell command — invoke
+            // the provider's own sign-in command, falling back to the
+            // Accounts menu when that command is not registered (e.g. the
+            // Copilot extension is missing). Registration is checked
+            // explicitly so an execution failure of an available command is
+            // reported as an error rather than silently rerouted.
+            const { command, fallbackCommand } = provider.signIn;
+            const registeredCommands = await vscode.commands.getCommands(true);
+            if (registeredCommands.includes(command)) {
+              try {
+                await vscode.commands.executeCommand(command);
+              } catch (error) {
+                const message = error instanceof Error ? error.message : String(error);
+                void vscode.window.showErrorMessage(
+                  `Could not start the ${accountEntryDisplayLabel(provider)} sign-in: ${message}. ` +
+                    "Use the Accounts menu (bottom-left) to sign in with GitHub."
+                );
+              }
+            } else if (fallbackCommand && registeredCommands.includes(fallbackCommand)) {
+              try {
+                await vscode.commands.executeCommand(fallbackCommand);
+                NotificationRouter.showInformation(
+                  `${accountEntryDisplayLabel(provider)} sign-in is managed by VS Code — ` +
+                    "use the Accounts menu to sign in or switch the GitHub account."
+                );
+              } catch (error) {
+                const message = error instanceof Error ? error.message : String(error);
+                void vscode.window.showErrorMessage(
+                  `Could not start the ${accountEntryDisplayLabel(provider)} sign-in: ${message}. ` +
+                    "Use the Accounts menu (bottom-left) to sign in with GitHub."
+                );
+              }
+            } else {
+              void vscode.window.showErrorMessage(
+                `Could not start the ${accountEntryDisplayLabel(provider)} sign-in — ` +
+                  "the provider's sign-in command is not available. " +
+                  "Use the Accounts menu (bottom-left) to sign in with GitHub."
+              );
+            }
+            break;
+          }
+          if (provider.signIn.kind === "manual") {
+            NotificationRouter.showInformation(provider.signIn.instructions);
+            if (provider.signIn.url) {
+              void vscode.env.openExternal(vscode.Uri.parse(provider.signIn.url));
+            }
+            break;
+          }
+          if (provider.signIn.kind === "unsupported") {
+            NotificationRouter.showInformation(provider.signIn.reason);
+            break;
           }
           // Run the interactive login/switch-account flow in a VISIBLE IDE
           // terminal. The extension reports the terminal as launched — it
@@ -111,18 +198,84 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           // from the next model-discovery pass.
           try {
             const terminal = vscode.window.createTerminal({
-              name: `Ensemble Sign-in (${cliDisplayLabel(provider)})`,
+              name: `Ensemble Sign-in (${accountEntryDisplayLabel(provider)})`,
             });
             terminal.show();
-            terminal.sendText(provider.signInCommand, true);
+            if (provider.signIn.kind === "interactive") {
+              sendInteractiveSlashCommand(terminal, provider.signIn);
+            } else {
+              terminal.sendText(provider.signIn.command, true);
+            }
             NotificationRouter.showInformation(
-              `${cliDisplayLabel(provider)} sign-in launched in the terminal. ` +
+              `${accountEntryDisplayLabel(provider)} sign-in launched in the terminal. ` +
                 (provider.signInGuidance ?? "Complete the sign-in there.")
             );
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
             void vscode.window.showErrorMessage(
-              `Could not open a terminal for the ${cliDisplayLabel(provider)} sign-in: ${message}`
+              `Could not open a terminal for the ${accountEntryDisplayLabel(provider)} sign-in: ${message}`
+            );
+          }
+          break;
+        }
+        case "providerUsage": {
+          const provider = getProviderAccountEntry(data.providerId);
+          if (!provider) {
+            return;
+          }
+          // Dispatch on the same capability descriptor the UI rendered the
+          // button from (single source of truth — see ProviderActionCapability).
+          const usage = provider.usage;
+          if (usage.kind === "unsupported") {
+            NotificationRouter.showInformation(usage.reason);
+            break;
+          }
+          if (usage.kind === "manual") {
+            NotificationRouter.showInformation(usage.instructions);
+            if (usage.url) {
+              void vscode.env.openExternal(vscode.Uri.parse(usage.url));
+            }
+            break;
+          }
+          if (usage.kind === "vscode-command") {
+            try {
+              await vscode.commands.executeCommand(usage.command);
+            } catch {
+              if (usage.fallbackCommand) {
+                try {
+                  await vscode.commands.executeCommand(usage.fallbackCommand);
+                } catch (error) {
+                  const message = error instanceof Error ? error.message : String(error);
+                  void vscode.window.showErrorMessage(
+                    `Could not run the ${accountEntryDisplayLabel(provider)} usage check: ${message}`
+                  );
+                }
+              }
+            }
+            break;
+          }
+          // Usage/quota is reported by the provider's own CLI in a visible
+          // terminal — the extension never fabricates a percentage.
+          // "interactive": the usage surface is an in-session slash command,
+          // so the CLI is launched first and the slash command is sent into
+          // the running session (never concatenated into one command line).
+          try {
+            const terminal = vscode.window.createTerminal({
+              name: `Ensemble Usage (${accountEntryDisplayLabel(provider)})`,
+            });
+            terminal.show();
+            if (usage.kind === "interactive") {
+              sendInteractiveSlashCommand(terminal, usage);
+            } else {
+              terminal.sendText(usage.command, true);
+            }
+            NotificationRouter.showInformation(
+              `${accountEntryDisplayLabel(provider)} usage check launched in the terminal.`
+            );
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            void vscode.window.showErrorMessage(
+              `Could not open a terminal for the ${accountEntryDisplayLabel(provider)} usage check: ${message}`
             );
           }
           break;
@@ -189,11 +342,25 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       enabledProviders: vscode.workspace
         .getConfiguration("vs-code-ai-helper")
         .get<Record<string, boolean>>("enabledProviders", {}),
-      providers: CLI_PROVIDERS.map((provider) => ({
+      providers: PROVIDER_ACCOUNT_ENTRIES.map((provider) => ({
         id: provider.id,
         label: provider.label,
         signInLabel: provider.signInLabel,
         signInGuidance: provider.signInGuidance ?? "",
+        // UI button state comes from the same capability descriptor the
+        // handler dispatches on: enabled for terminal/interactive/
+        // vscode-command/manual, disabled (with the reason as tooltip) for
+        // unsupported.
+        usageEnabled: provider.usage.kind !== "unsupported",
+        usageTooltip:
+          provider.usage.kind === "unsupported"
+            ? provider.usage.reason
+            : provider.usage.kind === "manual"
+              ? provider.usage.instructions
+              : provider.usage.kind === "interactive"
+                ? `Launches the provider's CLI in a terminal and runs its ${provider.usage.send} command there`
+                : "Runs the provider's usage command in a visible terminal",
+        enabledByDefault: provider.enabledByDefault,
       })),
       warnUnsavedSettings: isUnsavedSettingsWarningEnabled(),
     });
@@ -290,20 +457,6 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             padding: 10px;
             background-color: var(--vscode-editor-background);
           }
-          table {
-            width: 100%;
-            border-collapse: collapse;
-            margin-bottom: 20px;
-          }
-          th, td {
-            text-align: left;
-            padding: 8px 4px;
-            border-bottom: 1px solid var(--vscode-widget-border);
-            vertical-align: middle;
-          }
-          th {
-            font-weight: bold;
-          }
           select, input[type="text"] {
             width: 100%;
             background-color: var(--vscode-input-background, var(--vscode-editor-background));
@@ -396,6 +549,15 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           button.secondary:hover {
             background-color: var(--vscode-button-secondaryHoverBackground);
           }
+          .stage-row {
+            padding: 10px 0 6px;
+            border-bottom: 1px solid var(--vscode-widget-border);
+          }
+          .stage-heading {
+            margin: 0 0 8px;
+            font-size: 1em;
+            font-weight: bold;
+          }
           .stage-row.highlighted {
             background-color: var(--vscode-editor-findMatchHighlightBackground, rgba(234, 92, 0, 0.3));
           }
@@ -437,17 +599,16 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
 
         <div id="restored-note-container"></div>
 
-        <table id="settings-table" hidden>
-          <thead>
-            <tr>
-              <th scope="col">Stage</th>
-              <th scope="col">Models &amp; Fallbacks</th>
-            </tr>
-          </thead>
-          <tbody id="stages-tbody">
+        <!-- Single-column layout: one titled section per stage (stage name
+             as a heading, then primary model / fallback strategy / backup
+             models stacked vertically). The container keeps the historical
+             "settings-table"/"stages-tbody" ids so the show/hide and
+             delegated-listener wiring below is unchanged. -->
+        <div id="settings-table" hidden>
+          <div id="stages-tbody">
             <!-- Will be populated dynamically -->
-          </tbody>
-        </table>
+          </div>
+        </div>
 
         <div class="btn-container" id="model-settings-buttons" hidden>
           <button id="reset-btn" class="secondary">Reset to Defaults</button>
@@ -654,10 +815,19 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             return providers.some(p => p.id === prefix) ? prefix : 'copilot';
           }
 
+          function isProviderChecked(providerId) {
+            const provider = providers.find(p => p.id === providerId);
+            return provider && provider.enabledByDefault
+              ? enabledProviders[providerId] !== false
+              : enabledProviders[providerId] === true;
+          }
+
           function isStoredModelProviderDisabled(id) {
             if (!id) return false;
             const providerId = providerIdOfModelId(id);
-            if (providerId === 'copilot') return false;
+            // Copilot is enabled unless explicitly disabled; CLI providers
+            // are opt-in.
+            if (providerId === 'copilot') return enabledProviders['copilot'] === false;
             return enabledProviders[providerId] !== true;
           }
 
@@ -889,16 +1059,24 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               '<fieldset><legend>Provider Selection</legend>' +
               providers.map(provider =>
                 '<div style="margin:4px 0;display:flex;align-items:center;gap:8px;flex-wrap:wrap">' +
-                '<label><input type="checkbox" data-provider="' + escapeHtml(provider.id) + '" ' + (enabledProviders[provider.id] === true ? 'checked' : '') + '> ' + escapeHtml(provider.label) + '</label>' +
+                '<label><input type="checkbox" data-provider="' + escapeHtml(provider.id) + '" ' + (isProviderChecked(provider.id) ? 'checked' : '') + '> ' + escapeHtml(provider.label) + '</label>' +
                 '<button type="button" class="secondary provider-signin" data-signin-provider="' + escapeHtml(provider.id) + '" title="' + escapeHtml(provider.signInGuidance || 'Runs the provider\\'s login command in a visible terminal') + '">' + escapeHtml(provider.signInLabel || 'Sign in') + '</button>' +
+                (provider.usageEnabled
+                  ? '<button type="button" class="secondary provider-usage" data-usage-provider="' + escapeHtml(provider.id) + '" title="' + escapeHtml(provider.usageTooltip) + '">Check usage</button>'
+                  : '<button type="button" class="secondary provider-usage" disabled title="' + escapeHtml(provider.usageTooltip) + '">Check usage</button>') +
                 '</div>'
               ).join('') +
-              '<p style="margin:8px 0 0;font-size:0.9em">Enabled providers determine which models are offered below. Sign-in runs in a visible terminal; the extension reports it as launched, not as succeeded.</p>' +
+              '<p style="margin:8px 0 0;font-size:0.9em">Enabled providers determine which models are offered below. Sign-in and usage checks run in a visible terminal; the extension reports them as launched, not as succeeded.</p>' +
               '<div class="btn-container" style="margin-top:8px"><button id="save-providers-btn" class="secondary">Save Provider Selection</button></div>' +
               '</fieldset>';
             container.querySelectorAll('[data-signin-provider]').forEach(button => {
               button.addEventListener('click', () => {
                 vscode.postMessage({ type: 'providerSignIn', providerId: button.dataset.signinProvider });
+              });
+            });
+            container.querySelectorAll('[data-usage-provider]').forEach(button => {
+              button.addEventListener('click', () => {
+                vscode.postMessage({ type: 'providerUsage', providerId: button.dataset.usageProvider });
               });
             });
             container.querySelector('#save-providers-btn').addEventListener('click', () => {
@@ -916,7 +1094,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
 
             stagesList.forEach(stage => {
               const setting = currentSettings[stage] || { strategy: 'alert-and-wait' };
-              const row = document.createElement('tr');
+              const row = document.createElement('div');
               row.id = 'row-' + stage;
               row.className = 'stage-row';
 
@@ -928,30 +1106,28 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               const backupModels = (setting.backups && setting.backups.length ? setting.backups : (setting.backup ? [setting.backup] : []));
 
               row.innerHTML = \`
-                <td style="font-weight: bold; width: 35%;">\${stageDisplayNames[stage] || stage}</td>
-                <td>
-                  <div style="margin-bottom: 8px;">
-                    <label for="primary-input-\${stage}" style="font-size: 0.9em; display:block; margin-bottom: 2px;">Primary Model:</label>
-                    \${modelComboboxHtml('primary', stage, setting.primary || '', false)}
-                    \${quotaText}
-                  </div>
-                  <div style="margin-bottom: 8px;">
-                    <label for="strategy-\${stage}" style="font-size: 0.9em; display:block; margin-bottom: 2px;">Fallback Strategy:</label>
-                    <select id="strategy-\${stage}">
-                      <option value="switch-to-backup" \${setting.strategy === 'switch-to-backup' ? 'selected' : ''}>Switch to Backup</option>
-                      <option value="pause-and-resume" \${setting.strategy === 'pause-and-resume' ? 'selected' : ''}>Pause until available</option>
-                      <option value="alert-and-wait" \${setting.strategy === 'alert-and-wait' ? 'selected' : ''}>Alert and wait</option>
-                    </select>
-                  </div>
-                  <div style="margin-bottom: 8px;">
-                    <label for="backup-input-\${stage}" style="font-size: 0.9em; display:block; margin-bottom: 2px;">Backup models (tried in order):</label>
-                    \${modelComboboxHtml('backup', stage, backupModels[0] || '', false)}
-                    \${backupQuotaText}
-                    <div class="extra-backups"></div>
-                    <button type="button" class="add-backup" style="margin-top:4px">+ Add another backup</button>
-                    <span class="backup-limit" style="margin-left:4px;font-size:0.9em">1/10</span>
-                  </div>
-                </td>
+                <h3 class="stage-heading">\${stageDisplayNames[stage] || stage}</h3>
+                <div style="margin-bottom: 8px;">
+                  <label for="primary-input-\${stage}" style="font-size: 0.9em; display:block; margin-bottom: 2px;">Primary Model:</label>
+                  \${modelComboboxHtml('primary', stage, setting.primary || '', false)}
+                  \${quotaText}
+                </div>
+                <div style="margin-bottom: 8px;">
+                  <label for="strategy-\${stage}" style="font-size: 0.9em; display:block; margin-bottom: 2px;">Fallback Strategy:</label>
+                  <select id="strategy-\${stage}">
+                    <option value="switch-to-backup" \${setting.strategy === 'switch-to-backup' ? 'selected' : ''}>Switch to Backup</option>
+                    <option value="pause-and-resume" \${setting.strategy === 'pause-and-resume' ? 'selected' : ''}>Pause until available</option>
+                    <option value="alert-and-wait" \${setting.strategy === 'alert-and-wait' ? 'selected' : ''}>Alert and wait</option>
+                  </select>
+                </div>
+                <div style="margin-bottom: 8px;">
+                  <label for="backup-input-\${stage}" style="font-size: 0.9em; display:block; margin-bottom: 2px;">Backup models (tried in order):</label>
+                  \${modelComboboxHtml('backup', stage, backupModels[0] || '', false)}
+                  \${backupQuotaText}
+                  <div class="extra-backups"></div>
+                  <button type="button" class="add-backup" style="margin-top:4px">+ Add another backup</button>
+                  <span class="backup-limit" style="margin-left:4px;font-size:0.9em">1/10</span>
+                </div>
               \`;
 
               tbody.appendChild(row);
@@ -1028,12 +1204,33 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             clearDirty();
           });
 
+          // Always-on confirmation for destructive form actions (unlike the
+          // suppressible unsaved-changes warning above).
+          function confirmDestructiveAction(message, confirmLabel) {
+            return new Promise(resolve => {
+              const overlay = document.createElement('div');
+              overlay.id = 'unsaved-warning-overlay';
+              overlay.innerHTML =
+                '<div id="unsaved-warning-dialog" role="alertdialog" aria-modal="true">' +
+                '<p><strong>' + escapeHtml(message) + '</strong></p>' +
+                '<div class="btn-container">' +
+                '<button id="destructive-confirm">' + escapeHtml(confirmLabel) + '</button>' +
+                '<button id="destructive-cancel" class="secondary">Cancel</button>' +
+                '</div></div>';
+              document.body.appendChild(overlay);
+              overlay.querySelector('#destructive-confirm').addEventListener('click', () => { overlay.remove(); resolve(true); });
+              overlay.querySelector('#destructive-cancel').addEventListener('click', () => { overlay.remove(); resolve(false); });
+            });
+          }
+
           document.getElementById('reset-btn').addEventListener('click', async () => {
-            // Reset repopulates the form with empty settings; it is an
-            // interceptable discard of any dirty state, so it goes through
-            // the unsaved-changes warning first. Nothing is persisted until
-            // Save Settings is clicked.
-            const proceed = await confirmDiscardUnsaved('Resetting the form');
+            // Reset repopulates the form with empty settings. It always asks
+            // for confirmation (it discards the current selections, saved or
+            // not); nothing is persisted until Save Settings is clicked.
+            const proceed = await confirmDestructiveAction(
+              'Are you sure you want to reset all model settings to their defaults? Your current selections will be cleared (nothing is saved until you click Save Settings).',
+              'Reset to Defaults'
+            );
             if (!proceed) return;
             currentSettings = {};
             renderTable();

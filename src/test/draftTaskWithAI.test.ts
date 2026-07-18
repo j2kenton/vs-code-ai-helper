@@ -9,7 +9,12 @@
  */
 import * as assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { parseAIResponse } from "../commands/draftTaskWithAI";
+import {
+  DRAFT_UNSTRUCTURED_HEADING,
+  parseAIResponse,
+  validateDraftStructure,
+  wrapUnstructuredDraft,
+} from "../commands/draftTaskWithAI";
 
 void describe("parseAIResponse — tolerant heading matching", () => {
   // ── Baseline valid response ──────────────────────────────────────────────
@@ -279,5 +284,166 @@ void describe("parseAIResponse — body content extraction", () => {
     assert.ok(result.openQuestions.includes("Line 1."));
     assert.ok(result.openQuestions.includes("Line 2."));
     assert.ok(result.openQuestions.includes("Line 3."));
+  });
+});
+
+void describe("parseAIResponse — draft subsection headings are body content", () => {
+  void it("accepts the three required subsections under Draft with AI", () => {
+    const response = [
+      "## Draft with AI",
+      "",
+      "Goal sentence.",
+      "",
+      "### Behavior change",
+      "",
+      "The settings panel gains a third option.",
+      "",
+      "### Affected areas",
+      "",
+      "- settingsView.ts",
+      "",
+      "### Actionable changes",
+      "",
+      "- Add the enum.",
+      "",
+      "## Open Questions",
+      "",
+      "- None.",
+    ].join("\n");
+    const result = parseAIResponse(response);
+    assert.ok(
+      result !== undefined,
+      "subsection headings must not be treated as unrecognized sections"
+    );
+    assert.ok(result.draftWithAI.includes("### Behavior change"));
+    assert.ok(result.draftWithAI.includes("### Actionable changes"));
+  });
+
+  void it("still rejects genuinely unrecognized top-level headings", () => {
+    const response = [
+      "## Draft with AI",
+      "",
+      "Draft.",
+      "",
+      "## Random Section",
+      "",
+      "## Open Questions",
+      "",
+      "- Q1",
+    ].join("\n");
+    assert.strictEqual(parseAIResponse(response), undefined);
+  });
+});
+
+void describe("validateDraftStructure — three-subsection contract", () => {
+  void it("accepts a draft carrying all three subsections", () => {
+    const body = [
+      "Goal sentence.",
+      "### Behavior change",
+      "x",
+      "### Affected areas",
+      "y",
+      "### Actionable changes",
+      "z",
+    ].join("\n");
+    assert.deepStrictEqual(validateDraftStructure(body), {
+      valid: true,
+      missing: [],
+    });
+  });
+
+  void it("is tolerant of heading level and case", () => {
+    const body = [
+      "#### BEHAVIOR CHANGE",
+      "x",
+      "## affected areas",
+      "y",
+      "### Actionable Changes",
+      "z",
+    ].join("\n");
+    assert.strictEqual(validateDraftStructure(body).valid, true);
+  });
+
+  void it("names each missing subsection", () => {
+    const body = ["### Behavior change", "x"].join("\n");
+    const result = validateDraftStructure(body);
+    assert.strictEqual(result.valid, false);
+    assert.deepStrictEqual(result.missing, [
+      "Affected areas",
+      "Actionable changes",
+    ]);
+  });
+
+  void it("a plain unstructured draft is invalid (triggers the repair retry)", () => {
+    const result = validateDraftStructure("Just prose with no subsections.");
+    assert.strictEqual(result.valid, false);
+    assert.strictEqual(result.missing.length, 3);
+  });
+
+  void it("subsection titles in prose (not headings) do not count", () => {
+    const body =
+      "The behavior change is X; affected areas are Y; actionable changes are Z.";
+    assert.strictEqual(validateDraftStructure(body).valid, false);
+  });
+
+  void it("headings with EMPTY bodies are reported as missing", () => {
+    // Exactly the non-actionable output the contract exists to prevent:
+    // all three headings present, no content under any of them.
+    const body = [
+      "### Behavior change",
+      "",
+      "### Affected areas",
+      "",
+      "### Actionable changes",
+      "",
+    ].join("\n");
+    const result = validateDraftStructure(body);
+    assert.strictEqual(result.valid, false);
+    assert.deepStrictEqual(result.missing, [
+      "Behavior change",
+      "Affected areas",
+      "Actionable changes",
+    ]);
+  });
+
+  void it("a single empty subsection among filled ones is reported", () => {
+    const body = [
+      "### Behavior change",
+      "x",
+      "### Affected areas",
+      "",
+      "   ",
+      "### Actionable changes",
+      "z",
+    ].join("\n");
+    const result = validateDraftStructure(body);
+    assert.strictEqual(result.valid, false);
+    assert.deepStrictEqual(result.missing, ["Affected areas"]);
+  });
+
+  void it("a trailing subsection with content up to end-of-body is valid", () => {
+    const body = [
+      "### Behavior change",
+      "x",
+      "### Affected areas",
+      "y",
+      "### Actionable changes",
+      "final content with no trailing heading",
+    ].join("\n");
+    assert.strictEqual(validateDraftStructure(body).valid, true);
+  });
+});
+
+void describe("wrapUnstructuredDraft — fallback heading contract", () => {
+  void it("files the draft under the Draft (unstructured) heading with a notice", () => {
+    const wrapped = wrapUnstructuredDraft("Just prose.", [
+      "Behavior change",
+      "Affected areas",
+    ]);
+    assert.ok(wrapped.startsWith(DRAFT_UNSTRUCTURED_HEADING));
+    assert.match(wrapped, /Behavior change, Affected areas/);
+    assert.match(wrapped, /Just prose\.$/);
+    // The notice is a blockquote so it reads as an annotation, not content.
+    assert.match(wrapped, /^> /m);
   });
 });

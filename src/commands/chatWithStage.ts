@@ -15,7 +15,10 @@ import { checkAndConfirmPromptSize } from "../utils/promptSizeGuard";
 import { ChatViewProvider } from "../views/chatView";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { runTrackedOperation } from "../utils/taskOperations";
-import { safeOpenTextDocument, writeTextFile } from "../utils/fileUtils";
+import { safeOpenTextDocument, stripAttributionHeaders, writeTextFile } from "../utils/fileUtils";
+import { executeProposedAction } from "../utils/globalAssistantActions";
+import { PendingOperationsStore } from "../state/pendingOperationsStore";
+import { CurrentTaskStore } from "../utils/currentTaskStore";
 
 type ChatWithStageArg =
   | { task?: IncompleteTask; stage?: TaskStage; message?: string }
@@ -41,17 +44,162 @@ function normalizeArg(node: ChatWithStageArg | undefined): {
 
 /** Chat never invokes tools or edits code — the runner is the same text-only
  * planning/review runner used to answer questions (CLI providers run in
- * `mode: "text"`, native edit permissions withheld). The one exception is
- * markdown: a response may propose the full replacement content of a single
- * `.md` file that lives inside this task's own folder (its description,
- * plan, or a review artifact), which this command applies directly. Anything
- * outside that folder, or any non-markdown file, is never written. See
- * docs/design/c4-chat-edit-spike-decision.md for why this extension-mediated
- * envelope was chosen over enabling a provider's native edit mode. */
+ * `mode: "text"`, native edit permissions withheld). Two extension-mediated
+ * exceptions exist:
+ *  - markdown: a response may propose the full replacement content of a
+ *    single `.md` file that lives inside this task's own folder (its
+ *    description, plan, or a review artifact), which this command applies
+ *    directly. Anything outside that folder, or any non-markdown file, is
+ *    never written. See docs/design/c4-chat-edit-spike-decision.md for why
+ *    this envelope was chosen over enabling a provider's native edit mode.
+ *  - stage actions: a response may propose exactly one of the four pinned
+ *    stage actions for THIS task (see STAGE_CHAT_ACTIONS) via the shared
+ *    typed `[[ACTION:<id>]]` envelope (legacy `[[STAGE_ACTION:<id>]]` is
+ *    still accepted). The proposal is executed through the same typed action
+ *    executor the global assistant uses (executeProposedAction), so the
+ *    confirmation gate, state-accurate outcome verification, and audit
+ *    logging are identical — the model never executes anything itself, and
+ *    unlisted ids are rejected. */
+
+/** One of the four pinned stage actions the stage chat may propose (the
+ * approved catalog: complete stage, set this task's stage, trigger this
+ * task's AI action, complete task). Each id IS a global-assistant operation
+ * id: execution flows through the shared typed executor with the chat's own
+ * task pinned as the payload target, so the chat path reuses exactly the
+ * same confirmation, guards, and outcome verification as the global
+ * assistant (which in turn delegates to the UI buttons' commands).
+ * Task-lifecycle actions beyond the stage itself (pause, archive, pin,
+ * reviews across tasks, …) belong to the global assistant, not stage chat. */
+export interface StageChatActionDefinition {
+  /** Global-assistant operation id this action executes as. */
+  readonly id: string;
+  /** Human label used in the outcome note. */
+  readonly label: string;
+  /** Shown to the model in the prompt so it knows what it may propose. */
+  readonly description: string;
+  /**
+   * Payload keys the chat may pass through from the proposal envelope to the
+   * operation (e.g. setTaskStage's target "stage"). Everything else in the
+   * proposal payload is dropped, and the target task is ALWAYS the chat's
+   * own task — the model can never retarget another task from stage chat.
+   */
+  readonly allowedPayloadKeys?: readonly string[];
+}
+
+const STAGE_ID_LIST = Object.keys(STAGE_DISPLAY_NAMES).join(", ");
+
+export const STAGE_CHAT_ACTIONS: readonly StageChatActionDefinition[] = [
+  {
+    id: "completeStage",
+    label: "Complete Stage & Move On",
+    description: "complete the current stage and advance the task to its next stage",
+  },
+  {
+    id: "setTaskStage",
+    label: "Set Task Stage",
+    description:
+      `move this task to a specific stage — the envelope must carry the target stage, e.g. [[ACTION:setTaskStage {"stage": "<stage id>"}]] with a stage id from: ${STAGE_ID_LIST}`,
+    allowedPayloadKeys: ["stage"],
+  },
+  {
+    id: "triggerStageAI",
+    label: "Apply Current Stage Action",
+    description:
+      "run the primary AI action for this task's current stage (uses provider quota)",
+  },
+  {
+    id: "completeTask",
+    label: "Complete Task",
+    description: "mark this Publish-stage task as completed",
+  },
+];
+
+export function getStageChatAction(
+  id: string
+): StageChatActionDefinition | undefined {
+  return STAGE_CHAT_ACTIONS.find((action) => action.id === id);
+}
+
+/** A stage-chat action proposal extracted from a response envelope. The
+ * payload (when present and valid JSON) is filtered later against the
+ * action's `allowedPayloadKeys`; the target task is always pinned to the
+ * chat's own task regardless of what the payload claims. */
+export interface StageChatActionProposal {
+  id: string;
+  payload?: unknown;
+}
+
+/** Extracts every action envelope and returns the remaining text with all
+ * envelopes removed — no envelope may survive into the displayed response,
+ * whether or not it is executed. The stage chat shares the global
+ * assistant's typed action protocol (`[[ACTION:<id> <optional json>]]`) and
+ * still accepts the legacy `[[STAGE_ACTION:<id>]]` form. A JSON payload is
+ * captured so actions that need one (setTaskStage's target stage) can use
+ * it; unparseable payloads yield undefined and the operation's own
+ * validation rejects them with a useful message. Pure and VS-Code-free so
+ * the allowlist boundary is unit-testable without a host. */
+export function splitStageActionEnvelopes(
+  text: string
+): { text: string; actions: StageChatActionProposal[] } {
+  const actions: StageChatActionProposal[] = [];
+  const remaining = text
+    .replace(
+      /\[\[(?:STAGE_)?ACTION:([A-Za-z0-9_-]+)(?:\s+([\s\S]*?))?\]\]/gi,
+      (_whole, id: string, rawPayload: string | undefined) => {
+        let payload: unknown;
+        if (rawPayload && rawPayload.trim().length > 0) {
+          try {
+            payload = JSON.parse(rawPayload);
+          } catch {
+            payload = undefined;
+          }
+        }
+        actions.push({ id, payload });
+        return "";
+      }
+    )
+    .trim();
+  return { text: remaining, actions };
+}
+
+/**
+ * Build the payload the shared typed executor receives for a stage-chat
+ * action: the chat's own task is ALWAYS the target (pinned last so a
+ * proposal can never override it), and only the action's allowlisted keys
+ * are copied through from the proposal payload. Pure for unit testing.
+ */
+export function buildStageActionPayload(
+  action: StageChatActionDefinition,
+  taskFolderPath: string,
+  proposalPayload: unknown
+): Record<string, unknown> {
+  const payload: Record<string, unknown> = {};
+  if (
+    proposalPayload &&
+    typeof proposalPayload === "object" &&
+    action.allowedPayloadKeys
+  ) {
+    for (const key of action.allowedPayloadKeys) {
+      const value = (proposalPayload as Record<string, unknown>)[key];
+      if (value !== undefined) {
+        payload[key] = value;
+      }
+    }
+  }
+  payload.taskFolder = taskFolderPath;
+  return payload;
+}
+
+function describeStageActionsForPrompt(): string {
+  return STAGE_CHAT_ACTIONS.map(
+    (action) => `${action.id} — ${action.description}`
+  ).join("; ");
+}
+
 export function buildStageResponsePrompt(
   stageName: string, taskName: string, _artifactPath: string, contextPack: string, message: string, conversation = ""
 ): string {
-  return `You are answering a user question about the ${stageName} stage for task ${taskName}.\n\nDo not invoke tools or propose that code changes were applied. If the user asks you to make a code change, tell them to use the stage action that applies it explicitly instead. However, if the user asks you to update this task's own markdown files (its task description, plan, or a review file), you may do so directly: respond with the file's full new content wrapped in \`[[UPDATE_FILE:relative-filename.md]]\`...\`[[/UPDATE_FILE]]\`, using a path relative to this task's own folder. Only one file may be updated per response, only \`.md\` files inside this task's folder may be targeted this way, and you must never target a source code file. Give a concise, useful answer alongside any update. If you need clarification before the task can proceed, end with a single \`[[QUESTION]]your question[[/QUESTION]]\` envelope. Do not put task output in that envelope.\n\nConversation so far:\n${conversation.slice(-12000)}\n\nTask context:\n${contextPack.slice(0, 30000)}\n\nUser message:\n${message}`;
+  return `You are answering a user question about the ${stageName} stage for task ${taskName}.\n\nDo not invoke tools or propose that code changes were applied. If the user asks you to make a code change, tell them to use the stage action that applies it explicitly instead. However, if the user asks you to update this task's own markdown files (its task description, plan, or a review file), you may do so directly: respond with the file's full new content wrapped in \`[[UPDATE_FILE:relative-filename.md]]\`...\`[[/UPDATE_FILE]]\`, using a path relative to this task's own folder. Only one file may be updated per response, only \`.md\` files inside this task's folder may be targeted this way, and you must never target a source code file. You may also run this task's own stage actions when the user asks for one: end your response with a single \`[[ACTION:<actionId>]]\` envelope (the same typed action protocol the global assistant uses; the legacy \`[[STAGE_ACTION:<actionId>]]\` form is also accepted) and the extension will confirm with the user and run it. Available action ids: ${describeStageActionsForPrompt()}. Propose at most one action per response, only when the user clearly asked for it — never speculatively. For other task-lifecycle requests (pausing, archiving, pinning, renaming, running or fast-forwarding reviews, …), point the user at the Global Assistant chat, which can run those. Give a concise, useful answer alongside any update or action. If you need clarification before the task can proceed, end with a single \`[[QUESTION]]your question[[/QUESTION]]\` envelope. Do not put task output in that envelope.\n\nConversation so far:\n${conversation.slice(-12000)}\n\nTask context:\n${contextPack.slice(0, 30000)}\n\nUser message:\n${message}`;
 }
 
 function splitQuestionEnvelope(text: string): { answer: string; question?: string } {
@@ -155,7 +303,8 @@ export async function chatWithStage(
   context: vscode.ExtensionContext,
   inventory: TaskInventory,
   chatViewProvider: ChatViewProvider,
-  explicitArg?: ChatWithStageArg
+  explicitArg?: ChatWithStageArg,
+  currentTaskStore?: CurrentTaskStore
 ): Promise<void> {
   const { resolverArg, stage, message } = normalizeArg(explicitArg);
   const task = await resolveTaskContext(inventory, resolverArg, { allowPaused: true });
@@ -178,6 +327,11 @@ export async function chatWithStage(
   if (!(await ensureAiConsent(context))) return;
 
   const lockKey = task.taskFolderPath;
+  // Set inside the tracked operation, executed AFTER it ends: the proposed
+  // command claims the task's own operation lock (exclusively for reviews and
+  // stage transitions), so running it while the chat operation is still live
+  // would contend with it.
+  let proposedAction: StageChatActionProposal | undefined;
   try {
     // Tracked, cancellable chat-response operation (taxonomy: terminal entry
     // only on failure/cancel — a successful turn's answer in the chat panel is
@@ -227,8 +381,22 @@ export async function chatWithStage(
       return;
     }
     if (result.status !== "completed") throw new Error(result.errorMessage ?? "Stage chat did not complete.");
-    const rawResponse = new TextDecoder().decode(await vscode.workspace.fs.readFile(outputFile)).trim();
-    const { text: withoutUpdate, updates } = splitFileUpdateEnvelopes(rawResponse);
+    const rawResponse = stripAttributionHeaders(new TextDecoder().decode(await vscode.workspace.fs.readFile(outputFile)).trim());
+    const { text: withoutActions, actions } = splitStageActionEnvelopes(rawResponse);
+    let actionNote = "";
+    if (actions.length > 1) {
+      actionNote =
+        `\n\n_The response proposed ${actions.length} stage actions at once; ` +
+        `chat may propose only one action per response, so none were run._`;
+    } else if (actions.length === 1) {
+      const proposal = actions[0]!;
+      if (getStageChatAction(proposal.id)) {
+        proposedAction = proposal;
+      } else {
+        actionNote = `\n\n_The response proposed an action ("${proposal.id}") that is not in the allowlisted stage-action registry; it was rejected and nothing was executed._`;
+      }
+    }
+    const { text: withoutUpdate, updates } = splitFileUpdateEnvelopes(withoutActions);
     const plan = planFileUpdate(task.taskFolderPath, updates);
     let updateNote = "";
     if (plan.action === "write") {
@@ -239,7 +407,7 @@ export async function chatWithStage(
     } else if (plan.action === "reject") {
       updateNote = `\n\n${plan.note}`;
     }
-    const response = splitQuestionEnvelope(`${withoutUpdate}${updateNote}`.trim());
+    const response = splitQuestionEnvelope(`${withoutUpdate}${updateNote}${actionNote}`.trim());
     if (response.answer) await chatViewProvider.append("assistant", response.answer, targetStage, { canonicalId: task.canonicalId, taskFolderPath: task.taskFolderPath });
     if (response.question) await chatViewProvider.ask({ canonicalId: task.canonicalId, taskFolderPath: task.taskFolderPath, stage: targetStage, question: response.question });
     if (!response.answer && !response.question) await chatViewProvider.append("assistant", "The stage AI did not return an answer.", targetStage, { canonicalId: task.canonicalId, taskFolderPath: task.taskFolderPath });
@@ -252,12 +420,52 @@ export async function chatWithStage(
     // The operation-notification bridge owns terminal operation entries.
     // Keep the failure in the chat transcript, but do not add a second
     // Notifications entry (or a native toast) beside the bridge-backed one.
+    return;
+  }
+
+  // Runs after the chat's tracked operation has ended and released its slot:
+  // the executed operation's underlying command claims the task's own
+  // operation lock itself (and its eligibility guards run exactly as if the
+  // UI button had been clicked). Execution goes through the SAME typed
+  // action executor as the global assistant — confirmation gate, verified
+  // (state-accurate) outcome, and audit logging included — with the chat's
+  // own task pinned as the payload.
+  if (proposedAction) {
+    const action = getStageChatAction(proposedAction.id);
+    if (!action) return;
+    const chatTarget = { canonicalId: task.canonicalId, taskFolderPath: task.taskFolderPath };
+    if (!currentTaskStore) {
+      await chatViewProvider.append(
+        "assistant",
+        `_The proposed "${action.label}" action could not be executed in this context._`,
+        targetStage,
+        chatTarget
+      );
+      return;
+    }
+    const outcome = await executeProposedAction(
+      {
+        inventory,
+        currentTaskStore,
+        // Stage-chat action audits live in the task's own folder.
+        assistantFolderUri: vscode.Uri.file(task.taskFolderPath),
+        pendingOperations: new PendingOperationsStore(context.workspaceState),
+      },
+      {
+        operationId: action.id,
+        // The chat's own task is pinned as the target; only the action's
+        // allowlisted payload keys (e.g. setTaskStage's "stage") pass
+        // through from the proposal.
+        payload: buildStageActionPayload(action, task.taskFolderPath, proposedAction.payload),
+      }
+    );
+    await chatViewProvider.append("assistant", outcome, targetStage, chatTarget);
   }
 }
 
-export function registerChatWithStageCommand(context: vscode.ExtensionContext, inventory: TaskInventory, chatViewProvider: ChatViewProvider): void {
+export function registerChatWithStageCommand(context: vscode.ExtensionContext, inventory: TaskInventory, chatViewProvider: ChatViewProvider, currentTaskStore?: CurrentTaskStore): void {
   context.subscriptions.push(vscode.commands.registerCommand(
-    "vs-code-ai-helper.chatWithStage", (arg?: ChatWithStageArg) => chatWithStage(context, inventory, chatViewProvider, arg)
+    "vs-code-ai-helper.chatWithStage", (arg?: ChatWithStageArg) => chatWithStage(context, inventory, chatViewProvider, arg, currentTaskStore)
   ));
   context.subscriptions.push(vscode.commands.registerCommand(
     "vs-code-ai-helper.postStageQuestion",

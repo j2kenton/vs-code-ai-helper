@@ -69,14 +69,18 @@ import {
   previousVersionUri,
 } from "../utils/artifactBackups";
 import { meetsAutoAdvanceThreshold, parseReadiness } from "../utils/reviewReadiness";
+import { scheduleAutomationChain } from "../utils/automationChain";
 import { runCompletionLint } from "../utils/completionLint";
 import { improveReviewScore } from "../utils/reviewScoreLoop";
 import {
+  getAutoAdvanceMode,
   getAutoAdvanceScoreThreshold,
+  getAutoReviewAfterImplementationMode,
+  getCompleteAndMoveOnTriggersAIMode,
   getFastForwardMaxIterations,
   getFastForwardStopLevel,
   isAutoAdvanceEnabled,
-  shouldAutoReviewAfterImplementation,
+  strongestAutoTriggerMode,
   usesAcceptanceThresholdForFastForward,
   completeAndMoveOnTriggersAI,
 } from "../config/settings";
@@ -173,8 +177,34 @@ export interface TaskNodeArg {
  */
 type ReviewCommandArg =
   | TaskNodeArg
-  | { taskFolderPath: string }
+  | {
+      taskFolderPath: string;
+      /**
+       * Carried only by automation-chain dispatches from "Complete & Move On
+       * triggers AI: auto-fast-forward". When the triggered action lands on a
+       * review, the follow-up review runs as the Fast Forward loop even when
+       * that stage's own auto-review setting is off or plain "auto". Never
+       * set by UI surfaces.
+       */
+      followUpReviewMode?: "auto-fast-forward";
+    }
   | undefined;
+
+/**
+ * Extract the chained follow-up-review request from a ReviewCommandArg, if
+ * present. Only the exact "auto-fast-forward" marker is honored — anything
+ * else (including args from UI surfaces) yields undefined.
+ */
+function chainedFollowUpReviewMode(
+  arg: ReviewCommandArg
+): "auto-fast-forward" | undefined {
+  return arg &&
+    typeof arg === "object" &&
+    "followUpReviewMode" in arg &&
+    arg.followUpReviewMode === "auto-fast-forward"
+    ? arg.followUpReviewMode
+    : undefined;
+}
 
 interface ApplyReviewOptions {
   /** Skip repeated dirty/non-git workspace confirmations for internally chained runs. */
@@ -208,6 +238,14 @@ interface ExecuteImplementationRunOptions {
    * re-review runs.
    */
   parentOperation?: TaskOperationHandle;
+  /**
+   * Chained fast-forward request carried from "Complete & Move On triggers
+   * AI: auto-fast-forward". When set, a successful implementation run always
+   * schedules its follow-up review as the Fast Forward loop — even when
+   * auto-advance and the auto-review-after-implementation setting are off or
+   * plain "auto".
+   */
+  followUpReviewMode?: "auto-fast-forward";
 }
 
 /**
@@ -1138,28 +1176,17 @@ export async function runReviewForFolder(
               // implementation itself (which generates the checklist first
               // when absent). runImplementationWithAI claims the task's
               // exclusive operation lock, which this review still holds — so
-              // dispatch it once this root operation has ended successfully.
+              // the chain scheduler defers it until this root operation has
+              // ended successfully.
               if (next === "impl") {
-                const rootOperationId = options.operation?.id;
-                if (rootOperationId) {
-                  const endSub = taskOperations.onDidEnd((snapshot) => {
-                    if (snapshot.id !== rootOperationId) {
-                      return;
-                    }
-                    endSub.dispose();
-                    if (snapshot.state === "succeeded") {
-                      void vscode.commands.executeCommand(
-                        "vs-code-ai-helper.runImplementationWithAI",
-                        { taskFolderPath: folderUri.fsPath }
-                      );
-                    }
-                  });
-                } else {
-                  void vscode.commands.executeCommand(
-                    "vs-code-ai-helper.runImplementationWithAI",
-                    { taskFolderPath: folderUri.fsPath }
-                  );
-                }
+                void scheduleAutomationChain(
+                  {
+                    command: "vs-code-ai-helper.runImplementationWithAI",
+                    arg: { taskFolderPath: folderUri.fsPath },
+                    taskKey: folderUri.fsPath,
+                  },
+                  options.operation
+                );
               }
               // Auto-advancing into another review stage must itself kick off
               // that stage's review — otherwise the task silently sits on a
@@ -1168,41 +1195,22 @@ export async function runReviewForFolder(
               // mirrors nextStage's own Step 4 (manual "Complete Stage & Move
               // On" auto-review dispatch) for the auto-advance path.
               if (transition.shouldAutoReview) {
-                const freshProgress = await readTaskProgress(folderUri);
-                if (freshProgress) {
-                  const nextWorkspaceRoot = resolveOwnerWorkspace(freshProgress);
-                  if (nextWorkspaceRoot) {
-                    // This dispatch bypasses the runReviewWithAI command, so it
-                    // must register with the operation registry itself. It runs
-                    // while the caller's own tracked operation still holds the
-                    // task's exclusive lock, so it MUST register as a child of
-                    // that operation (options.operation) — claiming a fresh
-                    // exclusive lock here refuses against the caller's own lock
-                    // and the auto-started review silently never runs. As a
-                    // child it also moves the stage-row spinner onto the newly
-                    // entered review stage.
-                    const autoReviewLockKey = folderUri.fsPath;
-                    await runTrackedOperation(
-                      autoReviewLockKey,
-                      {
-                        label: "Review",
-                        stage: freshProgress.currentStage,
-                        kind: "review",
-                        cancellable: true,
-                        parent: options.operation,
-                      },
-                      (autoReviewOp) =>
-                        runReviewForFolder(
-                          extensionUri,
-                          folderUri,
-                          nextWorkspaceRoot,
-                          freshProgress.currentStage,
-                          true,
-                          { operation: autoReviewOp }
-                        )
-                    );
-                  }
-                }
+                // Deferred, never inline: the caller's tracked operation still
+                // holds this task's exclusive lock, so the follow-up review is
+                // scheduled through the single automation dispatcher and only
+                // dispatches after that root operation ends successfully. The
+                // command claims the lock itself and applies the same
+                // eligibility guards as the UI button; the shared "auto-review"
+                // chainId drops it if another review chain is already pending.
+                void scheduleAutomationChain(
+                  {
+                    command: "vs-code-ai-helper.runReviewWithAI",
+                    arg: { taskFolderPath: folderUri.fsPath },
+                    taskKey: folderUri.fsPath,
+                    chainId: "auto-review",
+                  },
+                  options.operation
+                );
               }
             }
           }
@@ -1617,9 +1625,14 @@ export async function fastForwardReviewWithAI(
     return;
   }
 
+  // Same eligibility as runReviewWithAI: review stages plus the pre-review
+  // stages (plan, impl, publish) that map to the review they produce. This
+  // lets automation dispatch the fast-forward loop right after a plan or
+  // implementation run, while the task still sits on the pre-review stage —
+  // the initial review below advances it onto the review stage itself.
   const resolved = await resolveTask(
     normalizeReviewArg(arg),
-    REVIEW_STAGES,
+    Object.keys(REVIEW_TARGETS) as TaskStage[],
     "Fast Forward Review with AI"
   );
   if (!resolved) {
@@ -1641,8 +1654,12 @@ export async function fastForwardReviewWithAI(
     },
     async (op) => {
   const stage = resolved.progress.currentStage;
-  const reviewUri = artifactUri(resolved.folderUri, stage);
-  if (!reviewUri) {
+  // At a review stage this is the stage itself; at a pre-review stage (plan,
+  // impl) it is the review that stage produces — the loop below always
+  // operates on the target review's artifact.
+  const targetStage = REVIEW_TARGETS[stage];
+  const reviewUri = targetStage && artifactUri(resolved.folderUri, targetStage);
+  if (!targetStage || !reviewUri) {
     NotificationRouter.showWarning(
       "Fast Forward Review: this stage does not have a review artifact."
     );
@@ -1650,6 +1667,12 @@ export async function fastForwardReviewWithAI(
   }
 
   let initialContent = await readNonEmptyText(reviewUri);
+  if (initialContent !== undefined && isStaleReviewArtifact(initialContent)) {
+    // A "# Review Stale" placeholder (written when the reviewed artifact
+    // changed after the review) has no score and describes an outdated
+    // state — treat it exactly like "no review yet" and run a fresh one.
+    initialContent = undefined;
+  }
   if (!initialContent) {
     // No review has been run yet at this stage — run the initial review
     // first, then continue straight into the normal fast-forward loop
@@ -1664,7 +1687,7 @@ export async function fastForwardReviewWithAI(
     await vscode.window.withProgress(
       {
         location: vscode.ProgressLocation.Window,
-        title: `Running initial ${STAGE_DISPLAY_NAMES[stage] ?? "review"} before fast-forwarding...`,
+        title: `Running initial ${STAGE_DISPLAY_NAMES[targetStage] ?? "review"} before fast-forwarding...`,
         cancellable: false,
       },
       () => runReviewForFolder(extensionUri, resolved.folderUri, workspaceRoot, stage, true, { operation: op })
@@ -1706,7 +1729,7 @@ export async function fastForwardReviewWithAI(
     outcome = await vscode.window.withProgress(
       {
         location: vscode.ProgressLocation.Window,
-        title: `Fast-forwarding ${STAGE_DISPLAY_NAMES[stage] ?? "review"}...`,
+        title: `Fast-forwarding ${STAGE_DISPLAY_NAMES[targetStage] ?? "review"}...`,
         cancellable: true,
       },
       (progress, token) => {
@@ -1716,7 +1739,7 @@ export async function fastForwardReviewWithAI(
         const linked = linkCancellationTokens(token, op.token);
         return improveReviewScore({
           context,
-          stage,
+          stage: targetStage,
           baselineScore,
           maxAttempts,
           stopAtScore: configuredStopLevel,
@@ -1955,7 +1978,7 @@ async function currentStageArtifactExists(
  *   5. show final info
  */
 export async function nextStage(
-  extensionUri: vscode.Uri,
+  _extensionUri: vscode.Uri,
   node?: TaskNodeArg
 ): Promise<void> {
   // Publish is the final executable stage: its review is generated here and
@@ -2063,23 +2086,49 @@ export async function nextStage(
   // A completion-driven transition is intentionally different from manually
   // selecting a stage: persist the destination first, then start its primary
   // AI action when the workspace setting allows it.
+  // All trigger-AI follow-ups route through the shared automation dispatcher
+  // (scheduleAutomationChain) so they pass the per-task duplicate-chain
+  // guard; nextStage holds no operation lock here, so dispatch is immediate.
   if (completeAndMoveOnTriggersAI()) {
-    const target = { taskFolderPath: resolved.folderUri.fsPath };
+    const taskKey = resolved.folderUri.fsPath;
+    // "auto-fast-forward" must follow the triggered action all the way to its
+    // review: Plan and Implementation are not themselves reviews, so the
+    // fast-forward request rides along on the dispatched command's arg and is
+    // honored when that command's successful run schedules its follow-up
+    // review — independent of the stage's own auto-review setting.
+    const followUpReviewMode =
+      getCompleteAndMoveOnTriggersAIMode() === "auto-fast-forward"
+        ? ("auto-fast-forward" as const)
+        : undefined;
+    const target = { taskFolderPath: resolved.folderUri.fsPath, followUpReviewMode };
     if (next === "plan") {
-      await vscode.commands.executeCommand("vs-code-ai-helper.generatePlanWithAI", target);
+      await scheduleAutomationChain({
+        command: "vs-code-ai-helper.generatePlanWithAI",
+        arg: target,
+        taskKey,
+      });
       return;
     }
     if (next === "impl") {
       // Merged action: "Implement Actual Work" generates the implementation
       // checklist first when it is absent, then implements — there is no
       // separate checklist command anymore.
-      await vscode.commands.executeCommand("vs-code-ai-helper.runImplementationWithAI", target);
+      await scheduleAutomationChain({
+        command: "vs-code-ai-helper.runImplementationWithAI",
+        arg: target,
+        taskKey,
+      });
       return;
     }
     if (next === "publish") {
       // Publish is also a destination-stage action.  Lint collection above is
       // supplementary; it must not prevent the requested Publish review.
-      await vscode.commands.executeCommand("vs-code-ai-helper.runReviewWithAI", target);
+      // "auto-fast-forward" runs the review + fixes loop where applicable —
+      // Publish lands on a review, so it applies here.
+      const publishCommand = getCompleteAndMoveOnTriggersAIMode() === "auto-fast-forward"
+        ? "vs-code-ai-helper.fastForwardReviewWithAI"
+        : "vs-code-ai-helper.runReviewWithAI";
+      await scheduleAutomationChain({ command: publishCommand, arg: target, taskKey, chainId: "auto-review" });
       return;
     }
   }
@@ -2088,40 +2137,18 @@ export async function nextStage(
   // transitionResult.shouldAutoReview is already computed by advanceStage
   // using exactly-once semantics tied to the persistence result.
   if (transitionResult.shouldAutoReview) {
-    // Re-read progress to get the newly persisted stage and fresh ownership
-    const freshProgress = await readTaskProgress(resolved.folderUri);
-    if (freshProgress) {
-      // Prefer the task's persisted ownership.workspaceRoot over the active-editor
-      // workspace so the context pack is generated from the correct workspace.
-      const workspaceRoot = resolveOwnerWorkspace(freshProgress);
-      if (workspaceRoot) {
-        // Bypass the consent gate for auto-triggered reviews — consent was
-        // already given by the user action that triggered nextStage. This
-        // dispatch bypasses the runReviewWithAI command, so it must claim the
-        // exclusive lock itself — otherwise a manual "Review with AI" click
-        // racing this auto-dispatch (the registry has no record of this run
-        // in progress) would start a second concurrent review for the same task.
-        const autoReviewLockKey = resolved.folderUri.fsPath;
-        await runTrackedOperation(
-          autoReviewLockKey,
-          {
-            label: "Review",
-            stage: freshProgress.currentStage,
-            kind: "review",
-            cancellable: true,
-          },
-          (autoReviewOp) =>
-            runReviewForFolder(
-              extensionUri,
-              resolved.folderUri,
-              workspaceRoot,
-              freshProgress.currentStage,
-              true,
-              { operation: autoReviewOp }
-            )
-        );
-      }
-    }
+    // Deferred, never inline: nextStage holds no operation lock here, so the
+    // dispatcher runs the review command immediately — but the chain still
+    // flows through the single guarded dispatch point, so a review chain
+    // already pending or running for this task drops this one. The command
+    // resolves the freshly persisted stage, claims the exclusive lock, and
+    // applies the same eligibility guards as the UI button.
+    await scheduleAutomationChain({
+      command: "vs-code-ai-helper.runReviewWithAI",
+      arg: { taskFolderPath: resolved.folderUri.fsPath },
+      taskKey: resolved.folderUri.fsPath,
+      chainId: "auto-review",
+    });
   }
 }
 
@@ -2304,7 +2331,7 @@ export const IMPLEMENTATION_CHECKLIST_MARKER = "<!-- ensemble:implementation-che
  * (where the prompt is assembled here).
  */
 async function executeImplementationRun(
-  extensionUri: vscode.Uri,
+  _extensionUri: vscode.Uri,
   folderUri: vscode.Uri,
   workspaceRoot: vscode.WorkspaceFolder,
   prompt: string,
@@ -2471,6 +2498,23 @@ async function executeImplementationRun(
     // starts that review. Runs before the legacy auto-review-in-place setting
     // below; when it fires, the legacy path is skipped to avoid a duplicate.
     let autoAdvancedToHighReview = false;
+    // Deferred, never inline: both follow-up shapes (a single review pass, or
+    // the "auto-fast-forward" review + fixes loop) are commands that acquire
+    // the task's exclusive lock themselves, so while this run's parent
+    // operation still holds that lock the chain scheduler defers the dispatch
+    // until the root operation ends successfully. Both share the
+    // "auto-review" chainId so they can never duplicate each other.
+    const dispatchReviewChainAfterLockRelease = (command: string): void => {
+      void scheduleAutomationChain(
+        {
+          command,
+          arg: { taskFolderPath: folderUri.fsPath },
+          taskKey: folderUri.fsPath,
+          chainId: "auto-review",
+        },
+        options.parentOperation
+      );
+    };
     if (isAutoAdvanceEnabled()) {
       try {
         const freshProgress = await readTaskProgress(folderUri);
@@ -2488,24 +2532,14 @@ async function executeImplementationRun(
               `Implementation complete. Advanced to ${STAGE_DISPLAY_NAMES["impl-high-review"]}.`
             );
             if (transition.shouldAutoReview) {
-              const runHighReview = (operation?: TaskOperationHandle): Promise<void> =>
-                runReviewForFolder(
-                  extensionUri,
-                  folderUri,
-                  workspaceRoot,
-                  "impl-high-review",
-                  true,
-                  { preserveActiveFallback: options.preserveActiveFallback, operation }
-                );
-              if (options.parentOperation) {
-                await runTrackedOperation(
-                  folderUri.fsPath,
-                  { parent: options.parentOperation, label: "Reviewing implementation", stage: "impl-high-review", kind: "review" },
-                  (reviewOp) => runHighReview(reviewOp)
-                );
-              } else {
-                await runHighReview();
-              }
+              dispatchReviewChainAfterLockRelease(
+                strongestAutoTriggerMode(
+                  getAutoAdvanceMode(),
+                  options.followUpReviewMode
+                ) === "auto-fast-forward"
+                  ? "vs-code-ai-helper.fastForwardReviewWithAI"
+                  : "vs-code-ai-helper.runReviewWithAI"
+              );
             }
           }
         }
@@ -2517,27 +2551,22 @@ async function executeImplementationRun(
       }
     }
 
-    // Optional: a completed implementation only starts review when enabled in Settings.
-    if (!autoAdvancedToHighReview && shouldAutoReviewAfterImplementation()) {
-      const runPostRunReview = (operation?: TaskOperationHandle): Promise<void> =>
-        runReviewForFolder(
-          extensionUri,
-          folderUri,
-          workspaceRoot,
-          postRunReviewStage,
-          true,
-          { preserveActiveFallback: options.preserveActiveFallback, operation }
+    // Optional: a completed implementation starts its review when enabled in
+    // Settings, or when this run carries a chained fast-forward request from
+    // "Complete & Move On triggers AI: auto-fast-forward" — the chained
+    // request must fire even with the standalone setting off, and must never
+    // be downgraded to a single review pass by a weaker standalone setting.
+    if (!autoAdvancedToHighReview) {
+      const reviewMode = strongestAutoTriggerMode(
+        getAutoReviewAfterImplementationMode(),
+        options.followUpReviewMode
+      );
+      if (reviewMode !== "off") {
+        dispatchReviewChainAfterLockRelease(
+          reviewMode === "auto-fast-forward"
+            ? "vs-code-ai-helper.fastForwardReviewWithAI"
+            : "vs-code-ai-helper.runReviewWithAI"
         );
-      if (options.parentOperation) {
-        // Child operation (C1 nesting): the stage-row spinner moves from the
-        // implementation row to the review row while the re-review runs.
-        await runTrackedOperation(
-          folderUri.fsPath,
-          { parent: options.parentOperation, label: "Reviewing implementation", stage: postRunReviewStage, kind: "review" },
-          (reviewOp) => runPostRunReview(reviewOp)
-        );
-      } else {
-        await runPostRunReview();
       }
     }
   } else if (result.status === "cancelled") {
@@ -2600,6 +2629,11 @@ export async function runImplementationWithAI(
     NotificationRouter.showInformation("This task is paused. Resume it before running implementation.");
     return;
   }
+
+  // Chained fast-forward request from "Complete & Move On triggers AI:
+  // auto-fast-forward" — the post-run follow-up review must run as the Fast
+  // Forward loop even when the standalone review settings are off.
+  const followUpReviewMode = chainedFollowUpReviewMode(arg);
 
   const lockKey = resolved.folderUri.fsPath;
   await runTrackedOperation(
@@ -2726,7 +2760,7 @@ export async function runImplementationWithAI(
       model.modelId,
       `Running implementation with ${providerLabel} (uses your ${providerLabel} quota)...`,
       postRunReviewStage,
-      { onBusyDetail: (d) => op.report(d), parentOperation: op }
+      { onBusyDetail: (d) => op.report(d), parentOperation: op, followUpReviewMode }
     );
     }
   );

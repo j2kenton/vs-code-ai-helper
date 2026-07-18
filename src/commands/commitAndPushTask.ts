@@ -24,6 +24,16 @@ import {
   TaskOperationHandle,
 } from "../utils/taskOperations";
 import { CHAT_HISTORY_FILENAME, CHAT_HISTORY_CORRUPT_FILENAME } from "../utils/chatHistoryConstants";
+import {
+  PendingCommitSession,
+  claimPendingCommitSession,
+  clearLiveCommitReviewWake,
+  closeCommitMessageEditor,
+  getPendingCommitSession,
+  registerLiveCommitReviewWake,
+  requestLiveCommitReviewWake,
+  storePendingCommitSession,
+} from "../utils/pendingCommitSession";
 
 /**
  * Accepted argument shapes for commitAndPushTask.
@@ -166,6 +176,286 @@ async function runGitCommand(
 }
 
 /**
+ * Settle the pending commit session: read the reviewed message from the
+ * untitled editor buffer, CLAIM the session, then stage → commit → push.
+ * Nothing touches the index before the claim succeeds (stage-after-confirm),
+ * and the claim makes settlement idempotent — a second concurrent invocation
+ * finds no session and does nothing. On commit failure the session is
+ * restored so the user can retry (the editor is still open). Returns true
+ * when a commit was created (push failure is reported but still counts as
+ * settled — the local commit exists and must not be retried).
+ */
+async function settlePendingCommitSession(
+  _extensionContext?: vscode.ExtensionContext
+): Promise<boolean> {
+  const session = getPendingCommitSession();
+  if (!session) {
+    NotificationRouter.showInformation("No commit message review is pending.");
+    return false;
+  }
+  // The untitled document IS the session: its buffer is the only message
+  // source, and a missing document means the review was closed (cancelled).
+  const doc = vscode.workspace.textDocuments.find(
+    (candidate) => candidate.uri.toString() === session.documentUri
+  );
+  const message = doc?.getText().trim() ?? "";
+  if (message.length === 0) {
+    claimPendingCommitSession();
+    NotificationRouter.showInformation(
+      "Commit and push cancelled — the commit message was empty or its editor was closed."
+    );
+    return false;
+  }
+
+  const claimed = claimPendingCommitSession();
+  if (!claimed || claimed.createdAt !== session.createdAt) {
+    // Another invocation already claimed (and is settling) this session.
+    return false;
+  }
+
+  try {
+    // Stage exactly the files the user confirmed in the preview dialog.
+    if (session.scopedFiles.length > 0) {
+      await runGitCommand(session.repoRoot, "add", ["--", ...session.scopedFiles]);
+    }
+    await runGitCommand(session.repoRoot, "commit", ["-m", message]);
+  } catch (error) {
+    // Undo our staging and restore the session so the settlement can be
+    // retried once the cause is fixed. (A plain reset also unstages anything
+    // the user had pre-staged — same behavior the pre-session flow had.)
+    try {
+      await runGitCommand(session.repoRoot, "reset", []);
+    } catch {
+      // Best effort.
+    }
+    storePendingCommitSession(session);
+    void vscode.window.showErrorMessage(
+      `Commit failed: ${getErrorMessage(error)}\n\n` +
+        "The commit message editor is still open — fix the cause and confirm again " +
+        "(the commit button in the editor title), or close the editor to cancel."
+    );
+    return false;
+  }
+
+  await closeCommitMessageEditor(session.documentUri);
+
+  try {
+    if (session.hasUpstream) {
+      await runGitCommand(session.repoRoot, "push", []);
+    } else if (session.singleRemote) {
+      await runGitCommand(session.repoRoot, "push", [
+        "-u",
+        session.singleRemote,
+        session.currentBranch,
+      ]);
+    }
+    NotificationRouter.showInformation(
+      `Successfully committed and pushed ${session.taskName} to ${session.pushDestination}`
+    );
+  } catch (error) {
+    // Push failed after commit was created — keep the local commit.
+    // Do NOT automatically roll back: this mutates the user's git history
+    // without their explicit instruction. Tell them how to undo manually.
+    void vscode.window.showErrorMessage(
+      `Push failed. Your local commit was kept — it has NOT been rolled back automatically.\n\n` +
+        `To undo the commit manually: git reset --mixed HEAD~1\n\n` +
+        `Error: ${getErrorMessage(error)}`
+    );
+  }
+  return true;
+}
+
+/**
+ * External settlement entry for the pending commit-message review — the
+ * editor-title "Confirm Commit Message" button and the command palette.
+ * While the originating Commit and Push operation is still awaiting the
+ * review notification it holds the task's exclusive operation lock, so
+ * claiming a second exclusive operation here would be refused as busy and
+ * the session would silently stay uncommitted; in that case wake the live
+ * review so it settles under the lock it already holds. Only when no live
+ * review is awaiting (the notification was dismissed and the originating
+ * operation has ended) does this run settlement under its own tracked
+ * operation.
+ */
+export async function confirmPendingCommitMessage(
+  extensionContext?: vscode.ExtensionContext
+): Promise<void> {
+  const session = getPendingCommitSession();
+  if (!session) {
+    NotificationRouter.showInformation("No commit message review is pending.");
+    return;
+  }
+  if (requestLiveCommitReviewWake()) {
+    return;
+  }
+  await runTrackedOperation(
+    session.taskFolderPath,
+    { label: "Commit and Push", taskName: session.taskName, kind: "commit-push" },
+    () => settlePendingCommitSession(extensionContext)
+  );
+}
+
+/**
+ * Review surface for the suggested commit message: an UNTITLED editor
+ * document in git-commit language mode, not an input box, so nothing is
+ * ever truncated and the user can write a multi-line message (subject +
+ * body). The editor's lifetime is the session: closing the editor cancels
+ * the review (nothing has been staged), exactly like closing a real
+ * `git commit` editor. No durable file is written and nothing survives a
+ * window reload — stage/commit/push only happen after confirmation, so an
+ * interrupted review simply never commits.
+ */
+async function runCommitMessageReview(
+  extensionContext: vscode.ExtensionContext | undefined,
+  sessionSeed: Omit<PendingCommitSession, "documentUri">,
+  suggested: string
+): Promise<"settled" | "cancelled" | "pending"> {
+  // git-commit language mode: subject/body editing affordances (rulers,
+  // comment handling) match a real `git commit` editor session; the confirm
+  // action lives in the editor title bar (package.json editor/title menu).
+  const doc = await vscode.workspace.openTextDocument({
+    language: "git-commit",
+    content: suggested,
+  });
+  await vscode.window.showTextDocument(doc, { preview: false });
+  const session: PendingCommitSession = {
+    ...sessionSeed,
+    documentUri: doc.uri.toString(),
+  };
+
+  // Close-cancel: closing the commit-message editor cancels the review,
+  // matching a closed `git commit` editor session. The listener is a no-op
+  // once the session has been settled or cancelled from another surface
+  // (the claim fails).
+  const closeSub = vscode.workspace.onDidCloseTextDocument((closed) => {
+    if (closed.uri.toString() !== session.documentUri) {
+      return;
+    }
+    closeSub.dispose();
+    const claimed = claimPendingCommitSession();
+    if (claimed && claimed.createdAt === session.createdAt) {
+      NotificationRouter.showInformation(
+        "Commit message editor closed — commit and push cancelled. Nothing was committed."
+      );
+    }
+    // If this operation is still awaiting the review notification below,
+    // wake it so it finishes as cancelled now instead of holding the task's
+    // exclusive lock until the notification is dismissed.
+    requestLiveCommitReviewWake();
+  });
+  extensionContext?.subscriptions.push(closeSub);
+
+  const settleUnderThisOperation = async (): Promise<"settled" | "cancelled" | "pending"> => {
+    const settled = await settlePendingCommitSession(extensionContext);
+    if (settled) {
+      closeSub.dispose();
+      return "settled";
+    }
+    // Commit failed (session restored) → still pending; otherwise the
+    // session was consumed (empty message / settled elsewhere).
+    if (getPendingCommitSession()) {
+      return "pending";
+    }
+    closeSub.dispose();
+    return "cancelled";
+  };
+
+  // A click on the review notification arriving AFTER an external wake has
+  // already resolved this operation: act only when THIS session is somehow
+  // still pending (a woken settlement failed and restored it) — a stale
+  // click must never touch a newer session.
+  const handleLateNotificationChoice = (late: string | undefined): void => {
+    const current = getPendingCommitSession();
+    if (
+      !current ||
+      current.createdAt !== session.createdAt ||
+      current.documentUri !== session.documentUri
+    ) {
+      return;
+    }
+    if (late === "Commit & Push") {
+      // The originating operation has ended by now, so this takes the
+      // normal external-settlement path (its own tracked operation).
+      void confirmPendingCommitMessage(extensionContext);
+    } else if (late === "Cancel") {
+      closeSub.dispose();
+      const claimed = claimPendingCommitSession();
+      if (claimed) {
+        void closeCommitMessageEditor(claimed.documentUri);
+        NotificationRouter.showInformation("Commit and push cancelled.");
+      }
+    }
+  };
+
+  // Storing the session exposes the editor-title confirm button. From here
+  // to the race below there must be no await, so a confirm command can never
+  // arrive before the wake channel is registered.
+  storePendingCommitSession(session);
+  const EXTERNAL_WAKE = "external-wake";
+  const wakePromise = new Promise<typeof EXTERNAL_WAKE>((resolve) => {
+    registerLiveCommitReviewWake(() => resolve(EXTERNAL_WAKE));
+  });
+
+  // Non-modal so the editor stays usable while the choice is pending. The
+  // editor-title "Confirm Commit Message" button is the primary confirm
+  // surface; these buttons mirror it. While this await is live, this
+  // operation still holds the task's exclusive lock — racing the wake
+  // channel lets the editor-title command and the close-cancel listener
+  // settle THROUGH this operation instead of being refused as busy by a
+  // second exclusive claim.
+  const notificationChoice = vscode.window.showInformationMessage(
+    "Review and edit the commit message in the opened editor (first line is the subject, optional body after a blank line), " +
+      "then confirm with the commit button in the editor title (or here). Closing the editor cancels.",
+    "Commit & Push",
+    "Cancel"
+  );
+  let choice: string | undefined;
+  try {
+    choice = await Promise.race([notificationChoice, wakePromise]);
+  } finally {
+    clearLiveCommitReviewWake();
+  }
+
+  if (choice === EXTERNAL_WAKE) {
+    // The still-open notification now belongs to a resolved review; route
+    // any late click through the session-state check above.
+    void Promise.resolve(notificationChoice).then(handleLateNotificationChoice);
+    if (getPendingCommitSession()?.createdAt !== session.createdAt) {
+      // Cancelled from another surface (the editor was closed) while this
+      // operation was awaiting the notification.
+      closeSub.dispose();
+      return "cancelled";
+    }
+    // Editor-title confirm while this operation holds the exclusive lock:
+    // settle under the existing operation instead of a second claim.
+    return settleUnderThisOperation();
+  }
+  if (choice === "Commit & Push") {
+    return settleUnderThisOperation();
+  }
+  if (choice === "Cancel") {
+    closeSub.dispose();
+    const claimed = claimPendingCommitSession();
+    if (claimed) {
+      await closeCommitMessageEditor(claimed.documentUri);
+      NotificationRouter.showInformation("Commit and push cancelled.");
+    }
+    return "cancelled";
+  }
+  // Notification dismissed without a choice: the editor remains the session
+  // surface — confirm from its title button, or close it to cancel.
+  if (!getPendingCommitSession()) {
+    // Settled or cancelled from another surface while the notification hung.
+    return "settled";
+  }
+  NotificationRouter.showInformation(
+    "Commit message review still open — confirm with the commit button in the editor title " +
+      '(or "Ensemble: Confirm Commit Message"), or close the editor to cancel.'
+  );
+  return "pending";
+}
+
+/**
  * Generate a suggested structured commit message. Only Copilot-hosted models can
  * service a one-off chat completion like this (CLI providers are agentic
  * file-editing runners with no simple text-completion surface), so this
@@ -181,10 +471,22 @@ async function buildCommitMessage(
   taskName: string,
   files: string[]
 ): Promise<string> {
-  const diff = await runGitCommand(repoRoot, "diff", ["--cached", "--no-color", "--", ...files]);
+  // Diff against HEAD (staged + unstaged): nothing has been staged yet when
+  // the suggestion is generated — staging happens only after the user
+  // confirms the reviewed message (stage-after-confirm).
+  let diffText = "";
+  try {
+    const diff = await runGitCommand(repoRoot, "diff", ["HEAD", "--no-color", "--", ...files]);
+    diffText = diff.stdout;
+  } catch {
+    // No HEAD yet (unborn branch) or diff failure — the deterministic
+    // fallback subject below still applies.
+  }
   const changed = files.length > 0 ? files.slice(0, 3).map((file) => path.basename(file)).join(", ") : "workspace changes";
   const suffix = files.length > 3 ? ` and ${files.length - 3} more files` : "";
-  const fallback = `Ensemble: update ${taskName}\n\nChanges:\n- Updated ${changed}${suffix}\n\nFiles: ${files.length}`;
+  // Deterministic single-line subject; kept within conventional git subject
+  // length. The richer summary already lives in pr-description.md.
+  const fallback = `Update ${changed}${suffix} (${taskName})`.slice(0, 72);
 
   const { modelId } = await resolveFreshModelForStage(taskFolderUri, "publish");
   const parsedProvider = parseModelSelection(modelId);
@@ -203,13 +505,19 @@ async function buildCommitMessage(
       : models.find((m) => m.id.toLowerCase() === "auto" || m.name.toLowerCase() === "auto") ?? models[0];
     if (model) {
       const response = await model.sendRequest([
-        vscode.LanguageModelChatMessage.User(`Write an informative git commit message for task ${taskName}. Use a short imperative subject (under 72 characters), then a blank line, then sections named Changes, Added, Removed, and Tests. Include only sections supported by the diff. Return only the commit message.\n\n${diff.stdout.slice(0, 12000)}`)
+        vscode.LanguageModelChatMessage.User(`Write a git commit message for the diff below, in standard subject-plus-body form:\n- Line 1 (subject): imperative mood, at most 72 characters, stating the concrete change (what behavior/files changed), not abstract planning language; no quotes, no trailing period.\n- For a non-trivial change, follow with a blank line and a short body (2-6 plain-text lines, wrapped at ~72 characters) explaining what changed and why.\n- For a trivial change, return the subject line alone.\nReturn only the commit message — no markdown fences, no commentary.\n\n${diffText.slice(0, 12000)}`)
       ], {}, cts.token);
-      let subject = "";
-      for await (const part of response.text) subject += part;
-      subject = subject.replace(/^['"`]|['"`]$/g, "").trim();
-      const subjectLine = subject.split(/\r?\n/, 1)[0] ?? "";
-      if (subject && subjectLine.length <= 72) return subject;
+      let message = "";
+      for await (const part of response.text) message += part;
+      message = message
+        .replace(/^```[a-z]*\r?\n?/i, "")
+        .replace(/\r?\n?```$/, "")
+        .replace(/^['"`]|['"`]$/g, "")
+        .trim();
+      // The review surface (an editor document) never truncates, so an
+      // over-length subject or long body is shown in full for the user to
+      // trim rather than being cut off here.
+      if (message) return message;
     }
   } catch { /* Provider unavailable: retain a deterministic safe fallback. */ } finally {
     cts.cancel();
@@ -1246,82 +1554,48 @@ export async function commitAndPushTask(
           overwrite: true,
         });
 
-        try {
-          // Final gate, reapplied immediately before the actual `git add` —
-          // the true invariant point. Nothing rebuilds scopedFiles between
-          // the confirmation preview and here today, but this call is what
-          // makes that a property of the code rather than an assumption.
-          scopedFiles = stripSensitiveTaskFiles(scopedFiles, repoRoot, resolvedTask.taskFolderPath);
+        // Final gate, reapplied immediately before the list is frozen into
+        // the pending session (whose settlement performs the actual
+        // `git add`) — the true invariant point. Nothing rebuilds scopedFiles
+        // between the confirmation preview and here today, but this call is
+        // what makes that a property of the code rather than an assumption.
+        scopedFiles = stripSensitiveTaskFiles(scopedFiles, repoRoot, resolvedTask.taskFolderPath);
 
-          // Stage changes — always exactly the scopedFiles list the user
-          // just confirmed in the preview dialog above (never a bare `-A`,
-          // which would silently stage excluded run artifacts too).
-          progress.report({ message: "Staging changes..." });
-          if (scopedFiles.length > 0) {
-            await runGitCommand(repoRoot, "add", [
-              "--",
-              ...scopedFiles,
-            ]);
-          }
-
-          // Commit message — generated from the configured Publish-stage
-          // model when possible, always shown to the user to review, edit,
-          // or accept before anything is committed.
-          progress.report({ message: "Generating commit message..." });
-          const suggestedMessage = await buildCommitMessage(
+        // Commit message — generated from the configured Publish-stage
+        // model when possible, always shown to the user to review, edit,
+        // or accept before anything is committed. Staging, commit, and push
+        // all happen at settlement, AFTER the user confirms the message
+        // (stage-after-confirm) — cancelling leaves the index untouched.
+        progress.report({ message: "Generating commit message..." });
+        const suggestedMessage = await buildCommitMessage(
+          repoRoot,
+          vscode.Uri.file(resolvedTask.taskFolderPath),
+          resolvedTask.folderName,
+          scopedFiles
+        );
+        progress.report({ message: "Waiting for commit message review..." });
+        const reviewOutcome = await runCommitMessageReview(
+          extensionContext,
+          {
+            version: 2,
+            taskFolderPath: resolvedTask.taskFolderPath,
+            taskName: resolvedTask.folderName,
             repoRoot,
-            vscode.Uri.file(resolvedTask.taskFolderPath),
-            resolvedTask.folderName,
-            scopedFiles
-          );
-          const commitMessage = await vscode.window.showInputBox({
-            title: "Commit Message — review before committing",
-            prompt: "Edit the commit message if needed, then press Enter to commit and push.",
-            value: suggestedMessage,
-            valueSelection: [0, suggestedMessage.length],
-            ignoreFocusOut: true,
-          });
-          if (!commitMessage || commitMessage.trim().length === 0) {
-            // Undo the staging performed above. Nothing else was staged
-            // before this run started (verified earlier in this function),
-            // so a plain reset cleanly restores the pre-run state.
-            await runGitCommand(repoRoot, "reset", []);
-            NotificationRouter.showInformation("Commit and push cancelled.");
-            return;
-          }
-
-          // Commit
-          progress.report({ message: "Creating commit..." });
-          await runGitCommand(repoRoot, "commit", ["-m", commitMessage]);
-
-          // Push with explicit destination
-          progress.report({ message: "Pushing to remote..." });
-          if (hasUpstream) {
-            // Upstream exists — push explicitly to avoid ambiguity
-            await runGitCommand(repoRoot, "push", []);
-          } else if (singleRemote) {
-            // First push — set upstream
-            await runGitCommand(repoRoot, "push", [
-              "-u",
-              singleRemote,
-              currentBranch,
-            ]);
-          }
-
-          NotificationRouter.showInformation(
-            `Successfully committed and pushed ${resolvedTask.folderName} to ${pushDestination}`
-          );
-        } catch (error: unknown) {
-          // Push failed after commit was created — keep the local commit.
-          // Do NOT automatically roll back: this mutates user's git history
-          // without their explicit instruction. Instead, tell them how to
-          // undo manually if they want to.
-          const errMsg = getErrorMessage(error);
-          void vscode.window.showErrorMessage(
-            `Push failed. Your local commit was kept — it has NOT been rolled back automatically.\n\n` +
-            `To undo the commit manually: git reset --mixed HEAD~1\n\n` +
-            `Error: ${errMsg}`
-          );
+            scopedFiles,
+            currentBranch,
+            hasUpstream,
+            singleRemote,
+            pushDestination,
+            createdAt: Date.now(),
+          },
+          suggestedMessage
+        );
+        if (reviewOutcome === "pending") {
+          // Nothing was committed yet; the still-open editor remains the
+          // session surface (its title button confirms, closing cancels).
+          // End this tracked operation as cancelled rather than falsely
+          // reporting success.
+          throw new vscode.CancellationError();
         }
       } catch (error: unknown) {
         if (error instanceof vscode.CancellationError) {

@@ -15,7 +15,8 @@ import { registerArchiveTaskCommands } from "./commands/archiveTask";
 import { registerPinTaskCommands } from "./commands/pinTask";
 import { registerApplyHighLevelReviewChangesCommand } from "./commands/applyHighLevelReviewChanges";
 import { registerApplyLowLevelReviewChangesCommand } from "./commands/applyLowLevelReviewChanges";
-import { registerCommitAndPushTaskCommand } from "./commands/commitAndPushTask";
+import { registerCommitAndPushTaskCommand, confirmPendingCommitMessage } from "./commands/commitAndPushTask";
+import { recoverRevertJournals } from "./utils/artifactRevertJournal";
 import {
   ensureAutomaticMetaGitIgnore,
 } from "./commands/toggleMetaResourcesGitIgnore";
@@ -25,7 +26,10 @@ import {
 } from "./utils/metaResourcesMigration";
 import { registerChoosePublishScopeCommand } from "./commands/choosePublishScope";
 import { registerChatWithStageCommand } from "./commands/chatWithStage";
-import { registerOpenGeneralAssistantCommand } from "./commands/openGeneralAssistant";
+import {
+  registerOpenGeneralAssistantCommand,
+  resolveGlobalAssistantTarget,
+} from "./commands/openGeneralAssistant";
 import { registerRunLintingFixesCommand } from "./commands/runLintingFixes";
 import { registerRunPublishChecksCommand } from "./commands/runPublishChecks";
 import { registerScheduleTaskResumeCommand } from "./commands/scheduleTaskResume";
@@ -153,6 +157,9 @@ export function activate(context: vscode.ExtensionContext): void {
   const settingsViewProvider = new SettingsViewProvider(context.extensionUri);
   const chatViewProvider = new ChatViewProvider(context.workspaceState);
   context.subscriptions.push(chatViewProvider);
+  // With no stage conversation selected, the Chat With AI panel defaults to
+  // the global assistant instead of a "select a task first" blocked state.
+  chatViewProvider.setDefaultTargetFactory(resolveGlobalAssistantTarget);
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(
       SettingsViewProvider.viewType,
@@ -196,13 +203,25 @@ export function activate(context: vscode.ExtensionContext): void {
   registerCommitAndPushTaskCommand(context, inventory, currentTaskStore);
   registerMetaResourcesMigrationCommand(context, inventory, currentTaskStore);
   registerChoosePublishScopeCommand(context, inventory);
-  registerChatWithStageCommand(context, inventory, chatViewProvider);
+  registerChatWithStageCommand(context, inventory, chatViewProvider, currentTaskStore);
   registerRunLintingFixesCommand(context, inventory);
   registerRunPublishChecksCommand(context, inventory);
   const taskActionScheduler = registerScheduleTaskResumeCommand(context, inventory);
   registerMarkTaskDoneCommand(context, inventory, currentTaskStore);
   registerViewStageChangesCommands(context, inventory);
   registerRenameTaskCommands(context, inventory);
+
+  // Settle a pending commit-message review (staging/commit/push happen only
+  // at settlement — see pendingCommitSession.ts). When the originating
+  // Commit and Push operation is still awaiting the review notification it
+  // owns the task's exclusive lock, so settlement goes THROUGH that live
+  // operation (wake channel) instead of claiming a second exclusive
+  // operation that would be refused as busy; otherwise it runs under its
+  // own tracked operation like every other commit path.
+  context.subscriptions.push(vscode.commands.registerCommand(
+    "vs-code-ai-helper.confirmCommitMessage",
+    () => confirmPendingCommitMessage(context)
+  ));
 
   // Register the hello world command (keeping for backward compat)
   const helloWorldDisposable = vscode.commands.registerCommand(
@@ -239,7 +258,10 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(taskTreeProvider);
   const tasksTreeView = vscode.window.createTreeView(TASKS_VIEW_ID, {
     treeDataProvider: taskTreeProvider,
-    showCollapseAll: true,
+    // The view-title bar already contributes explicit Expand All Tasks /
+    // Collapse All Tasks buttons; VS Code's built-in trailing collapse-all
+    // button would be a duplicate.
+    showCollapseAll: false,
   });
 
   // Initialize status view and notification router
@@ -455,6 +477,35 @@ export function activate(context: vscode.ExtensionContext): void {
       .catch(err => console.error("Meta resources migration offer failed", err));
   });
   void warmCliModelCache();
+
+  // Activation-time recovery for the one durable mid-flight artifact: an
+  // interrupted revert swap (journal beside the artifact). A commit-message
+  // review needs no recovery — its untitled editor is the session, closing
+  // it (or reloading the window) cancels with nothing committed.
+  // Runs after initNotificationRouter (above) so status routing is live.
+  void recoverRevertJournals(async (prompt) => {
+    const name = prompt.artifactPath.split(/[\\/]/).pop() ?? prompt.artifactPath;
+    const detail = prompt.artifactDiverged
+      ? `${name} was changed after the revert was interrupted; completing the revert would overwrite those changes.`
+      : prompt.backupDiverged
+        ? `The previous-version backup of ${name} was changed after the revert was interrupted; completing the revert would overwrite that backup.`
+        : `An interrupted revert of ${name} was found from a previous session.`;
+    const choice = await vscode.window.showWarningMessage(
+      `${detail} Complete the revert, or keep the file as it is now?`,
+      { modal: true },
+      "Complete Revert",
+      "Keep Current File"
+    );
+    if (choice === "Complete Revert") return "restore";
+    if (choice === "Keep Current File") return "keep";
+    return "defer"; // Dismissed — ask again on a later activation.
+  }).then((recovered) => {
+    if (recovered > 0) {
+      NotificationRouter.showInformation(
+        `Recovered ${recovered} interrupted stage-revert operation(s) from a previous session.`
+      );
+    }
+  }).catch((err) => console.error("Revert-journal recovery failed", err));
 
   // NOTE: The initial "using plans" popup has been intentionally removed.
   // Discovery is silent; no folder is created until a task is actually made.

@@ -21,7 +21,7 @@ class Uri {
   }
 
   toString() {
-    return `file://${this.path}`;
+    return this.scheme === "file" ? `file://${this.path}` : `${this.scheme}:${this.path}`;
   }
 
   static file(fsPath) {
@@ -332,7 +332,30 @@ const workspace = {
   // way an empty workspace would.
   findFiles: async () => [],
   textDocuments: [],
-  openTextDocument: async (uri) => ({ uri, getText: () => "", isDirty: false }),
+  // Untitled documents (openTextDocument({ language, content })) are minted
+  // with an untitled: uri and tracked in textDocuments until closed via
+  // _closeTextDocument, which also fires onDidCloseTextDocument — enough for
+  // editor-lifetime session surfaces (pendingCommitSession) to be exercised
+  // under plain node --test. The uri-argument form keeps its minimal shape.
+  openTextDocument: async (uriOrOptions) => {
+    if (uriOrOptions && typeof uriOrOptions === "object" && !("fsPath" in uriOrOptions)) {
+      workspace._untitledCounter += 1;
+      const uri = Uri.parse(`untitled:Untitled-${workspace._untitledCounter}`);
+      const content = uriOrOptions.content ?? "";
+      const doc = { uri, languageId: uriOrOptions.language, getText: () => content, isDirty: false };
+      workspace.textDocuments.push(doc);
+      return doc;
+    }
+    return { uri: uriOrOptions, getText: () => "", isDirty: false };
+  },
+  _untitledCounter: 0,
+  _documentCloses: new EventEmitter(),
+  onDidCloseTextDocument: (listener) => workspace._documentCloses.event(listener),
+  _closeTextDocument: (doc) => {
+    const index = workspace.textDocuments.indexOf(doc);
+    if (index !== -1) workspace.textDocuments.splice(index, 1);
+    workspace._documentCloses.fire(doc);
+  },
   createFileSystemWatcher: () => new FileSystemWatcher(),
   getConfiguration: () => ({
     get: (key, defaultValue) => {

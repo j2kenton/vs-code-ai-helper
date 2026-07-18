@@ -46,6 +46,7 @@ import { installOperationNotificationBridge } from "../utils/operationNotificati
 import { readTaskProgress, IncompleteTask } from "../utils/taskProgressUtils";
 import { REVIEW_STAGES, TaskProgress, TaskStage } from "../types/taskProgress";
 import type { AgentRunRequest, AgentRunResult } from "../types/agentRunner";
+import { DISCLAIMER_VERSION } from "../legal/disclaimerVersion";
 
 // ── Provider-boundary seams, monkey-patched via the shared CommonJS module
 // objects (the same technique as markTaskDoneUngated.test.ts /
@@ -152,9 +153,29 @@ function operationNodes(provider: StatusTreeProvider): StatusOperationNode[] {
 }
 
 function makeExtensionContext(): vscode.ExtensionContext {
+  // Minimal memento with AI consent pre-granted: the auto-review chain now
+  // dispatches the REAL runReviewWithAI command, whose consent gate reads
+  // workspaceState (aiConsent.ts) before running.
+  const backing = new Map<string, unknown>([
+    [
+      `aiHelper.consent.v${DISCLAIMER_VERSION}`,
+      { acceptedAt: "2026-01-01T00:00:00.000Z", version: DISCLAIMER_VERSION },
+    ],
+  ]);
+  const memento = {
+    keys: (): readonly string[] => [...backing.keys()],
+    get: <T>(key: string, defaultValue?: T): T | undefined =>
+      backing.has(key) ? (backing.get(key) as T) : defaultValue,
+    update: (key: string, value: unknown): Thenable<void> => {
+      if (value === undefined) { backing.delete(key); } else { backing.set(key, value); }
+      return Promise.resolve();
+    },
+  };
   return {
     subscriptions: [] as vscode.Disposable[],
     extensionUri: vscode.Uri.file(REAL_ROOT),
+    workspaceState: memento,
+    globalState: memento,
   } as unknown as vscode.ExtensionContext;
 }
 

@@ -324,6 +324,12 @@
         "icon": "$(diff)"
       },
       {
+        "command": "vs-code-ai-helper.revertStageChanges",
+        "title": "Revert Changes",
+        "category": "Ensemble",
+        "icon": "$(discard)"
+      },
+      {
         "command": "vs-code-ai-helper.deleteStageBackup",
         "title": "Delete Previous Version",
         "category": "Ensemble",
@@ -340,6 +346,12 @@
         "title": "Rename Task with AI",
         "category": "Ensemble",
         "icon": "$(sparkle)"
+      },
+      {
+        "command": "vs-code-ai-helper.confirmCommitMessage",
+        "title": "Confirm Commit Message",
+        "category": "Ensemble",
+        "icon": "$(git-commit)"
       }
     ],
     "keybindings": [
@@ -432,6 +444,13 @@
       }
     ],
     "menus": {
+      "editor/title": [
+        {
+          "command": "vs-code-ai-helper.confirmCommitMessage",
+          "when": "resourceScheme == untitled && resourceLangId == git-commit && resourceFilename in vs-code-ai-helper.pendingCommitFilenames",
+          "group": "navigation@1"
+        }
+      ],
       "view/title": [
         {
           "command": "vs-code-ai-helper.startNewTask",
@@ -528,7 +547,7 @@
         {
           "command": "vs-code-ai-helper.nextStage",
           "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage-desc-current/ && !(viewItem =~ /-paused/)",
-          "group": "inline@9"
+          "group": "inline@99"
         },
         {
           "command": "vs-code-ai-helper.setStageAsCurrent",
@@ -543,7 +562,7 @@
         {
           "command": "vs-code-ai-helper.nextStage",
           "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage-plan-current/ && !(viewItem =~ /-paused/)",
-          "group": "inline@9"
+          "group": "inline@99"
         },
         {
           "command": "vs-code-ai-helper.runImplementationWithAI",
@@ -553,7 +572,7 @@
         {
           "command": "vs-code-ai-helper.nextStage",
           "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage-impl-current/ && !(viewItem =~ /-paused/)",
-          "group": "inline@9"
+          "group": "inline@99"
         },
         {
           "command": "vs-code-ai-helper.runReviewWithAI",
@@ -573,12 +592,12 @@
         {
           "command": "vs-code-ai-helper.nextStage",
           "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage-review-current/ && !(viewItem =~ /-paused/)",
-          "group": "inline@9"
+          "group": "inline@99"
         },
         {
           "command": "vs-code-ai-helper.nextStage",
           "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage-impl-low-review-current/ && !(viewItem =~ /-paused/)",
-          "group": "inline@9"
+          "group": "inline@99"
         },
         {
           "command": "vs-code-ai-helper.runPublishChecks",
@@ -594,6 +613,11 @@
           "command": "vs-code-ai-helper.viewStageChanges",
           "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage-publish-current/ && !(viewItem =~ /-paused/)",
           "group": "inline@30"
+        },
+        {
+          "command": "vs-code-ai-helper.revertStageChanges",
+          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage-publish-current/ && viewItem =~ /-has-backup/ && !(viewItem =~ /-paused/)",
+          "group": "inline@35"
         },
         {
           "command": "vs-code-ai-helper.chatWithStage",
@@ -631,8 +655,13 @@
           "group": "inline@8"
         },
         {
+          "command": "vs-code-ai-helper.revertStageChanges",
+          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage/ && viewItem =~ /-has-backup/ && !(viewItem =~ /^stage-publish-current/)",
+          "group": "inline@9"
+        },
+        {
           "command": "vs-code-ai-helper.deleteStageBackup",
-          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage/",
+          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage/ && viewItem =~ /-has-backup/",
           "group": "stage@1"
         },
         {
@@ -702,16 +731,50 @@
           "description": "Maximum fast-forward iterations (1–99)."
         },
         "vs-code-ai-helper.autoAdvanceEnabled": {
-          "type": "boolean",
-          "default": false,
+          "type": [
+            "string",
+            "boolean"
+          ],
+          "enum": [
+            "off",
+            "auto",
+            "auto-fast-forward",
+            false,
+            true
+          ],
+          "enumDescriptions": [
+            "Do not auto-advance.",
+            "Automatically advance when the configured review score threshold is reached.",
+            "Auto-advance and run Fast Forward Fixes where applicable (when the destination is a review stage).",
+            "Legacy value — same as \"off\".",
+            "Legacy value — same as \"auto\"."
+          ],
+          "default": "off",
           "scope": "window",
-          "description": "Automatically advance when the configured review score threshold is reached."
+          "description": "Auto-advance when the configured review score threshold is reached. Legacy true/false values are still honored (true = auto)."
         },
         "vs-code-ai-helper.completeAndMoveOnTriggersAI": {
-          "type": "boolean",
-          "default": true,
+          "type": [
+            "string",
+            "boolean"
+          ],
+          "enum": [
+            "off",
+            "auto",
+            "auto-fast-forward",
+            false,
+            true
+          ],
+          "enumDescriptions": [
+            "Do not start the destination stage's AI action.",
+            "Automatically start the AI action for the destination stage.",
+            "Start the AI action and continue with Fast Forward Fixes once it reaches a review (directly for Publish, after plan generation or implementation for the other stages).",
+            "Legacy value — same as \"off\".",
+            "Legacy value — same as \"auto\"."
+          ],
+          "default": "auto",
           "scope": "window",
-          "description": "When completing a stage and moving on, automatically start the AI action for the destination stage."
+          "description": "When completing a stage and moving on, automatically start the AI action for the destination stage. Legacy true/false values are still honored (true = auto)."
         },
         "vs-code-ai-helper.autoAdvanceScoreThreshold": {
           "type": "integer",
@@ -736,16 +799,50 @@
           "description": "Use the review acceptance threshold instead of the fast-forward stop level."
         },
         "vs-code-ai-helper.autoReviewAfterPlan": {
-          "type": "boolean",
-          "default": false,
+          "type": [
+            "string",
+            "boolean"
+          ],
+          "enum": [
+            "off",
+            "auto",
+            "auto-fast-forward",
+            false,
+            true
+          ],
+          "enumDescriptions": [
+            "Do not review automatically.",
+            "Start high-level review after AI drafts a plan.",
+            "Start the review and run Fast Forward Fixes until the configured stop level.",
+            "Legacy value — same as \"off\".",
+            "Legacy value — same as \"auto\"."
+          ],
+          "default": "off",
           "scope": "window",
-          "description": "Start high-level review after AI drafts a plan."
+          "description": "Start high-level review after AI drafts a plan. Legacy true/false values are still honored (true = auto)."
         },
         "vs-code-ai-helper.autoReviewAfterImplementation": {
-          "type": "boolean",
-          "default": false,
+          "type": [
+            "string",
+            "boolean"
+          ],
+          "enum": [
+            "off",
+            "auto",
+            "auto-fast-forward",
+            false,
+            true
+          ],
+          "enumDescriptions": [
+            "Do not review automatically.",
+            "Start high-level review after AI completes initial implementation.",
+            "Start the review and run Fast Forward Fixes until the configured stop level.",
+            "Legacy value — same as \"off\".",
+            "Legacy value — same as \"auto\"."
+          ],
+          "default": "off",
           "scope": "window",
-          "description": "Start high-level review after AI completes initial implementation."
+          "description": "Start high-level review after AI completes initial implementation. Legacy true/false values are still honored (true = auto)."
         },
         "vs-code-ai-helper.maxImplementationIterations": {
           "type": "integer",

@@ -18,6 +18,8 @@ export interface StageContextInput {
   lintPassed?: boolean;
   isScheduled?: boolean;
   isMetaManaged?: boolean;
+  /** A previous artifact version exists — enables View/Revert/Delete backup actions. */
+  hasBackup?: boolean;
 }
 
 /**
@@ -146,6 +148,13 @@ export function buildStageContextValue(input: StageContextInput): string {
   // Meta-managed state
   if (input.isMetaManaged) {
     tokens.push("meta-managed");
+  }
+
+  // Backup availability: gates the Revert Changes / Delete Previous Version
+  // menu entries (menus match /-has-backup/). Kept before the trailing
+  // modelable token so /-modelable$/ clauses keep matching.
+  if (input.hasBackup) {
+    tokens.push("has-backup");
   }
 
   // Modelable state (always at the end for regex compatibility)

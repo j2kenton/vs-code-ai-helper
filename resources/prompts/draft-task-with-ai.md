@@ -6,7 +6,21 @@ Return ONLY the following two sections in this exact format (no other text befor
 
 ## Draft with AI
 
-[A clear, structured restatement of the task. Include: goal, scope, constraints, and key implementation notes where inferable. Be concise and actionable.]
+[A clear, structured restatement of the task. Start with a one-sentence goal that states the concrete change in plain words, then include EXACTLY these three subsections, in this order, using `###` headings:
+
+### Behavior change
+
+[What the software will do differently after this work, stated concretely from the user's point of view.]
+
+### Affected areas
+
+[The actual features, screens, commands, settings, or files being changed.]
+
+### Actionable changes
+
+[A bullet list of the specific changes to make. Be concise and actionable; include constraints and key implementation notes where inferable.]
+
+State the CONCRETE work throughout: name the actual features, behaviors, files, or UI elements being changed and what changes about them. Avoid abstract planning language ("independently shippable slices", "workstreams", "vertical slices") — a reader should learn what the software will do differently, not how the work is organized.]
 
 ## Open Questions
 

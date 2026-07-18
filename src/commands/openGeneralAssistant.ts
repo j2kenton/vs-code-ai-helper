@@ -19,6 +19,7 @@ import {
   stripActionEnvelopes,
 } from "../utils/globalAssistantActions";
 import { PendingOperationsStore } from "../state/pendingOperationsStore";
+import { stripAttributionHeaders } from "../utils/fileUtils";
 
 /** Stable identity for the global assistant's own, fully separate history. */
 export const GLOBAL_ASSISTANT_CANONICAL_ID = "global-assistant";
@@ -44,23 +45,49 @@ async function resolveGlobalAssistantFolder(): Promise<vscode.Uri | undefined> {
   }
 }
 
-export async function openGeneralAssistant(
-  chatViewProvider: ChatViewProvider
-): Promise<void> {
+/**
+ * The chat target describing the global assistant, or undefined when no
+ * workspace folder is open yet. Also used by the Chat With AI panel as its
+ * default target when the user hasn't picked a stage conversation.
+ */
+export async function resolveGlobalAssistantTarget(): Promise<
+  | {
+      canonicalId: string;
+      taskFolderPath: string;
+      stage: "desc";
+      taskName: string;
+      kind: "global";
+    }
+  | undefined
+> {
   const folder = await resolveGlobalAssistantFolder();
   if (!folder) {
-    void vscode.window.showWarningMessage(
-      "Open a workspace folder before opening the Global Assistant."
-    );
-    return;
+    return undefined;
   }
-  await chatViewProvider.open({
+  return {
     canonicalId: GLOBAL_ASSISTANT_CANONICAL_ID,
     taskFolderPath: folder.fsPath,
     stage: "desc",
     taskName: "Global Assistant",
     kind: "global",
-  });
+  };
+}
+
+/**
+ * Opening the assistant always (re)selects the global conversation — even if
+ * the user was previously chatting with a stage — and reveals the chat panel.
+ */
+export async function openGeneralAssistant(
+  chatViewProvider: ChatViewProvider
+): Promise<void> {
+  const target = await resolveGlobalAssistantTarget();
+  if (!target) {
+    void vscode.window.showWarningMessage(
+      "Open a workspace folder before opening the Global Assistant."
+    );
+    return;
+  }
+  await chatViewProvider.open(target);
 }
 
 /** Exported for testing: the prompt names only registry operations. */
@@ -73,12 +100,19 @@ export function buildGlobalAssistantPrompt(
     (op) => `- ${op.id}: ${op.description}`
   ).join("\n");
   return (
-    "You are the Ensemble Global Assistant: a task-section-level assistant for cross-task questions and actions. " +
-    "You are not attached to any single task or stage.\n\n" +
+    "You are the Ensemble Global Assistant: the workspace-level assistant for the Ensemble task manager. " +
+    "You help with anything about the user's tasks — answering questions about them, and performing task-lifecycle " +
+    "actions on one task, several tasks, or all of them (creating tasks, completing them, pausing/resuming, " +
+    "archiving and unarchiving, pinning, repairing stuck state).\n\n" +
+    "Be proactive and useful: when the user asks for something an operation below can do, propose that operation " +
+    "rather than saying you cannot help. When they ask for something outside the registry (for example editing code, " +
+    "or running a specific stage's AI action), explain the closest thing you CAN do and which button in the Tasks " +
+    "panel covers the rest.\n\n" +
     "You may propose at most one action per response, chosen ONLY from this registry (anything else is rejected without executing):\n" +
     `${operations}\n\n` +
     'To propose an action, include exactly one envelope of the form [[ACTION:<operationId> <json payload>]] (omit the payload when the operation takes none). ' +
-    "The user confirms consequential actions before they run. Never claim an action has already been performed.\n\n" +
+    "The user confirms consequential actions before they run. Never claim an action has already been performed. " +
+    "For a request that spans several tasks with no bulk operation available, propose the action for the first task and say you'll continue with the rest one at a time.\n\n" +
     `Current tasks in this workspace:\n${taskSummary}\n\n` +
     `Conversation so far:\n${conversation.slice(-12000)}\n\n` +
     `User message:\n${message}`
@@ -185,9 +219,11 @@ async function globalAssistantSend(
         if (result.status !== "completed") {
           throw new Error(result.errorMessage ?? "The Global Assistant did not respond.");
         }
-        const rawResponse = new TextDecoder()
-          .decode(await vscode.workspace.fs.readFile(outputFile))
-          .trim();
+        const rawResponse = stripAttributionHeaders(
+          new TextDecoder()
+            .decode(await vscode.workspace.fs.readFile(outputFile))
+            .trim()
+        );
         const displayed = stripActionEnvelopes(rawResponse);
         if (displayed) {
           await chatViewProvider.append("assistant", displayed, "desc", identity);

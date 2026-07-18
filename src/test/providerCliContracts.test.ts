@@ -5,9 +5,11 @@ import { describe, it } from "node:test";
 import {
   CLI_PROVIDERS,
   getCliProvider,
+  getProviderAccountEntry,
   parseCopilotModelSelection,
   parseCodexModelSelection,
   parseModelSelection,
+  PROVIDER_ACCOUNT_ENTRIES,
   type CliProviderDefinition,
 } from "../runners/providers";
 
@@ -243,25 +245,52 @@ void describe("provider CLI contracts", () => {
 
   void it("sign-in actions use each CLI's validated auth entry point", () => {
     // Pinned to the commands validated against installed CLI versions on
-    // 2026-07-17 (see the signInCommand doc comment in providers.ts).
-    // Changing a value here requires re-validating against that CLI.
-    const validatedSignInCommands: Record<string, string> = {
-      "claude-cli": "claude",
-      "codex-cli": "codex login",
-      "gemini-cli": "gemini",
-      "antigravity-cli": "agy",
-      "kiro-cli": "kiro-cli login",
+    // 2026-07-17 (see the signInCommand/signInAction doc comments in
+    // providers.ts). Changing a value here requires re-validating against
+    // that CLI. claude: `/login` is an IN-SESSION slash command — the CLI is
+    // launched interactively and the slash command is then sent (never a
+    // one-shot `claude /login` command line); kiro: logging out first allows
+    // switching an already-signed-in account (`kiro-cli login` alone refuses
+    // with "Already logged in").
+    const validatedSignIns: Record<
+      string,
+      { command: string } | { launch: string; send: string }
+    > = {
+      "claude-cli": { launch: "claude", send: "/login" },
+      "codex-cli": { command: "codex login" },
+      "gemini-cli": { command: "gemini" },
+      "antigravity-cli": { command: "agy" },
+      "kiro-cli": { command: "kiro-cli logout; kiro-cli login" },
     };
 
     for (const provider of CLI_PROVIDERS) {
-      const expected = validatedSignInCommands[provider.id];
+      const expected = validatedSignIns[provider.id];
       assert.ok(
         expected !== undefined,
-        `${provider.id} has no validated sign-in command on record`
+        `${provider.id} has no validated sign-in on record`
       );
-      assert.strictEqual(provider.signInCommand, expected, provider.id);
-
-      const executable = provider.signInCommand.split(" ")[0] ?? "";
+      let executable: string;
+      if ("launch" in expected) {
+        assert.deepStrictEqual(
+          provider.signInAction,
+          { launch: expected.launch, send: expected.send, validated: "verified" },
+          provider.id
+        );
+        assert.strictEqual(
+          provider.signInCommand,
+          undefined,
+          `${provider.id} must not also carry a one-shot sign-in command line`
+        );
+        assert.ok(
+          expected.send.startsWith("/"),
+          `${provider.id} in-session sign-in must be a slash command`
+        );
+        executable = expected.launch;
+      } else {
+        assert.strictEqual(provider.signInCommand, expected.command, provider.id);
+        assert.strictEqual(provider.signInAction, undefined, provider.id);
+        executable = provider.signInCommand?.split(" ")[0] ?? "";
+      }
       assert.ok(
         [provider.command, ...(provider.commandAliases ?? [])].includes(
           executable
@@ -281,6 +310,113 @@ void describe("provider CLI contracts", () => {
     const kiro = getCliProvider("kiro-cli");
     assert.ok(kiro);
     assert.match(kiro.signInGuidance ?? "", /KIRO_API_KEY/);
+  });
+
+  void it("Copilot sign-in is VS Code-native, never a shell command", () => {
+    // Copilot auth is the GitHub account VS Code itself is signed into —
+    // there is no CLI login for it. The sign-in button must go through
+    // github.copilot.signIn (with the Accounts menu as fallback), and must
+    // never launch a terminal command.
+    const copilot = getProviderAccountEntry("copilot");
+    assert.ok(copilot, "expected a copilot provider-account entry");
+    assert.strictEqual(copilot.signIn.kind, "vscode-command");
+    assert.strictEqual(copilot.signIn.command, "github.copilot.signIn");
+    if (copilot.signIn.kind === "vscode-command") {
+      assert.strictEqual(
+        copilot.signIn.fallbackCommand,
+        "workbench.action.showAccounts"
+      );
+    }
+    assert.strictEqual(copilot.enabledByDefault, true);
+
+    // Every CLI provider's account entry carries its validated sign-in:
+    // an interactive launch-then-send dispatch when the login surface is an
+    // in-session slash command (Claude), otherwise a terminal action with
+    // the validated command line.
+    for (const entry of PROVIDER_ACCOUNT_ENTRIES) {
+      if (entry.id === "copilot") continue;
+      const cli = getCliProvider(entry.id);
+      assert.ok(cli, `expected CLI definition for ${entry.id}`);
+      if (cli.signInAction) {
+        assert.strictEqual(entry.signIn.kind, "interactive", entry.id);
+        if (entry.signIn.kind === "interactive") {
+          assert.strictEqual(entry.signIn.launch, cli.signInAction.launch, entry.id);
+          assert.strictEqual(entry.signIn.send, cli.signInAction.send, entry.id);
+        }
+      } else {
+        assert.strictEqual(entry.signIn.kind, "terminal", entry.id);
+        if (entry.signIn.kind === "terminal") {
+          assert.strictEqual(entry.signIn.command, cli.signInCommand, entry.id);
+        }
+      }
+    }
+  });
+
+  void it("provider account entries carry the usage capability matrix", () => {
+    // The capability descriptor is the single source of truth for both the
+    // UI button state and dispatch behavior. Usage surfaces are IN-SESSION
+    // slash commands, so the interactive kind launches the CLI and then
+    // sends the slash command into the running session — never a one-shot
+    // command line. Only VERIFIED descriptors are automated: an unverified
+    // one (Gemini's /stats model) is downgraded to manual instructions until
+    // it is confirmed against the installed CLI. Copilot usage is
+    // unsupported (no command reports its quota); unsupported renders a
+    // disabled button with the reason.
+    const expectations: Record<
+      string,
+      { kind: string; launch?: string; send?: string }
+    > = {
+      copilot: { kind: "unsupported" },
+      "claude-cli": { kind: "interactive", launch: "claude", send: "/usage" },
+      "codex-cli": { kind: "interactive", launch: "codex", send: "/usage" },
+      "gemini-cli": { kind: "manual" },
+      "antigravity-cli": { kind: "unsupported" },
+      "kiro-cli": { kind: "unsupported" },
+    };
+    for (const entry of PROVIDER_ACCOUNT_ENTRIES) {
+      const expected = expectations[entry.id];
+      assert.ok(expected, `${entry.id} has no usage-capability expectation on record`);
+      assert.strictEqual(entry.usage.kind, expected.kind, entry.id);
+      if (entry.usage.kind === "interactive") {
+        assert.strictEqual(entry.usage.launch, expected.launch, entry.id);
+        assert.strictEqual(entry.usage.send, expected.send, entry.id);
+        assert.ok(
+          entry.usage.send.startsWith("/"),
+          `${entry.id} usage must be an in-session slash command`
+        );
+        // Only descriptors verified against an installed CLI may automate.
+        assert.strictEqual(entry.usage.validated, "verified", entry.id);
+      }
+      if (entry.usage.kind === "unsupported") {
+        assert.ok(entry.usage.reason.length > 0, `${entry.id} unsupported usage needs a reason`);
+      }
+      // Every provider's account button carries the switch-account label,
+      // matching the Claude Code button as requested.
+      assert.match(entry.signInLabel, /sign in \/ switch account/i, entry.id);
+    }
+
+    // Gemini's /stats invocation follows the CLI's documented slash-command
+    // surface but has not been re-confirmed against an installed binary —
+    // its descriptor stays "unverified" and the account entry is downgraded
+    // to manual instructions naming the launch command and slash command.
+    const geminiCli = getCliProvider("gemini-cli");
+    assert.ok(geminiCli?.usageAction);
+    assert.strictEqual(geminiCli.usageAction.validated, "unverified");
+    const gemini = getProviderAccountEntry("gemini-cli");
+    assert.ok(gemini);
+    assert.ok(gemini.usage.kind === "manual");
+    assert.match(gemini.usage.instructions, /gemini/);
+    assert.match(gemini.usage.instructions, /\/stats model/);
+    const claude = getProviderAccountEntry("claude-cli");
+    assert.ok(claude);
+    assert.ok(claude.usage.kind === "interactive");
+    assert.strictEqual(claude.usage.validated, "verified");
+
+    // Copilot's unsupported reason still tells the user where usage lives.
+    const copilot = getProviderAccountEntry("copilot");
+    assert.ok(copilot);
+    assert.ok(copilot.usage.kind === "unsupported");
+    assert.match(copilot.usage.reason, /github\.com\/settings\/copilot/);
   });
 
   void it("Kiro hints mention KIRO_API_KEY requirement", () => {

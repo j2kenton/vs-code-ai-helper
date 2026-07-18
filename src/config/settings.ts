@@ -40,10 +40,59 @@ export async function setLargeTokenRequestWarningEnabled(enabled: boolean): Prom
     .update(LARGE_TOKEN_REQUEST_WARNING_KEY, enabled, vscode.ConfigurationTarget.Global);
 }
 
+/**
+ * Three-state automation mode shared by the auto-review / auto-advance /
+ * complete-and-move-on settings:
+ *  - "off": no automatic action.
+ *  - "auto": run the automatic action (a single review / advance / trigger).
+ *  - "auto-fast-forward": run the automatic action and, where applicable
+ *    (when it produces or lands on a review), run Fast Forward Fixes.
+ */
+export type AutoTriggerMode = "off" | "auto" | "auto-fast-forward";
+
+const AUTO_TRIGGER_MODE_RANK: Record<AutoTriggerMode, number> = {
+  off: 0,
+  auto: 1,
+  "auto-fast-forward": 2,
+};
+
+/**
+ * Combine two automation modes, keeping the stronger one
+ * ("off" < "auto" < "auto-fast-forward").
+ *
+ * Used where two independent opt-ins can request the same follow-up review:
+ * a stage's own auto-review setting and a chained request carried from
+ * "Complete & Move On triggers AI: auto-fast-forward". Neither may downgrade
+ * the other.
+ */
+export function strongestAutoTriggerMode(
+  a: AutoTriggerMode,
+  b: AutoTriggerMode | undefined
+): AutoTriggerMode {
+  if (!b) return a;
+  return AUTO_TRIGGER_MODE_RANK[b] > AUTO_TRIGGER_MODE_RANK[a] ? b : a;
+}
+
+/**
+ * Read one of the three-state automation settings, honoring legacy boolean
+ * values still present in user settings (true = "auto", false = "off").
+ */
+function readAutoTriggerMode(key: string, defaultMode: AutoTriggerMode): AutoTriggerMode {
+  const raw = vscode.workspace.getConfiguration(CONFIG_SECTION).get<unknown>(key);
+  if (raw === true) return "auto";
+  if (raw === false) return "off";
+  if (raw === "off" || raw === "auto" || raw === "auto-fast-forward") return raw;
+  return defaultMode;
+}
+
+/** Mode for starting the destination stage's AI action after completing a stage. */
+export function getCompleteAndMoveOnTriggersAIMode(): AutoTriggerMode {
+  return readAutoTriggerMode(COMPLETE_AND_MOVE_ON_TRIGGERS_AI_KEY, "auto");
+}
+
 /** Whether completing a stage automatically starts the destination stage's AI action. */
 export function completeAndMoveOnTriggersAI(): boolean {
-  return vscode.workspace.getConfiguration("vs-code-ai-helper")
-    .get<boolean>(COMPLETE_AND_MOVE_ON_TRIGGERS_AI_KEY, true);
+  return getCompleteAndMoveOnTriggersAIMode() !== "off";
 }
 const FAST_FORWARD_STOP_LEVEL_KEY = "fastForwardStopLevel";
 const FAST_FORWARD_USE_ACCEPTANCE_KEY = "fastForwardUseAcceptanceThreshold";
@@ -173,6 +222,12 @@ export function isProviderSelectionConfigured(): boolean {
  * are already referenced by older model settings. */
 export function isProviderEnabled(provider: string): boolean {
   const enabled = vscode.workspace.getConfiguration(CONFIG_SECTION).get<Record<string, boolean>>(ENABLED_PROVIDERS_KEY, {});
+  // Copilot (the built-in VS Code Language Model integration) predates the
+  // provider selection: existing configurations have no "copilot" key, so it
+  // stays enabled unless the user explicitly unchecks it.
+  if (provider === "copilot") {
+    return enabled[provider] !== false;
+  }
   return enabled[provider] === true;
 }
 
@@ -208,8 +263,13 @@ export function getFastForwardMaxIterations(): number {
   return Math.max(1, Math.min(99, Math.floor(value)));
 }
 
+/** Mode for score-threshold auto-advance. */
+export function getAutoAdvanceMode(): AutoTriggerMode {
+  return readAutoTriggerMode(AUTO_ADVANCE_ENABLED_KEY, "off");
+}
+
 export function isAutoAdvanceEnabled(): boolean {
-  return vscode.workspace.getConfiguration(CONFIG_SECTION).get<boolean>(AUTO_ADVANCE_ENABLED_KEY, false);
+  return getAutoAdvanceMode() !== "off";
 }
 
 export function getAutoAdvanceScoreThreshold(): number {
@@ -226,12 +286,14 @@ export function usesAcceptanceThresholdForFastForward(): boolean {
   return vscode.workspace.getConfiguration(CONFIG_SECTION).get<boolean>(FAST_FORWARD_USE_ACCEPTANCE_KEY, false);
 }
 
-export function shouldAutoReviewAfterPlan(): boolean {
-  return vscode.workspace.getConfiguration(CONFIG_SECTION).get<boolean>(AUTO_REVIEW_AFTER_PLAN_KEY, false);
+/** Mode for auto-review after AI drafts a plan. */
+export function getAutoReviewAfterPlanMode(): AutoTriggerMode {
+  return readAutoTriggerMode(AUTO_REVIEW_AFTER_PLAN_KEY, "off");
 }
 
-export function shouldAutoReviewAfterImplementation(): boolean {
-  return vscode.workspace.getConfiguration(CONFIG_SECTION).get<boolean>(AUTO_REVIEW_AFTER_IMPLEMENTATION_KEY, false);
+/** Mode for auto-review after AI completes initial implementation. */
+export function getAutoReviewAfterImplementationMode(): AutoTriggerMode {
+  return readAutoTriggerMode(AUTO_REVIEW_AFTER_IMPLEMENTATION_KEY, "off");
 }
 
 /** Whether implementation/Fast Forward runs may proceed without prompting when the workspace has unrelated uncommitted changes. */

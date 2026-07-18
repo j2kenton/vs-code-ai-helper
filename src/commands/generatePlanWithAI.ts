@@ -23,7 +23,12 @@ import { IncompleteTask } from "../utils/taskProgressUtils";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { safeOpenTextDocument } from "../utils/fileUtils";
 
-import { shouldAutoReviewAfterPlan } from "../config/settings";
+import {
+  AutoTriggerMode,
+  getAutoReviewAfterPlanMode,
+  strongestAutoTriggerMode,
+} from "../config/settings";
+import { scheduleAutomationChain } from "../utils/automationChain";
 import {
   linkCancellationTokens,
   runTrackedOperation,
@@ -51,7 +56,17 @@ type GeneratePlanArg =
   | vscode.Uri
   | { canonicalId?: string }
   | { task?: IncompleteTask }
-  | { taskFolderPath?: string };
+  | {
+      taskFolderPath?: string;
+      /**
+       * Carried only by automation-chain dispatches from "Complete & Move On
+       * triggers AI: auto-fast-forward". A successful plan generation then
+       * advances to Plan High-Level Review and runs the Fast Forward loop,
+       * even when the standalone auto-review-after-plan setting is off or
+       * plain "auto". Never set by UI surfaces.
+       */
+      followUpReviewMode?: "auto-fast-forward";
+    };
 
 /**
  * Normalize a GeneratePlanArg into a resolved value for the caller to act on.
@@ -157,12 +172,27 @@ export async function generatePlanWithAI(
     return;
   }
 
+  // The stage's own auto-review setting combined with a chained fast-forward
+  // request from "Complete & Move On triggers AI: auto-fast-forward" —
+  // whichever is stronger wins, so the chained request fires even when the
+  // standalone setting is off, and a standalone "auto-fast-forward" is never
+  // downgraded by a plain chained dispatch.
+  const chainedReviewMode =
+    arg && !(arg instanceof vscode.Uri) && "followUpReviewMode" in arg &&
+    arg.followUpReviewMode === "auto-fast-forward"
+      ? arg.followUpReviewMode
+      : undefined;
+  const effectiveReviewMode = strongestAutoTriggerMode(
+    getAutoReviewAfterPlanMode(),
+    chainedReviewMode
+  );
+
   const lockKey = taskFolderUri.fsPath;
   const result = await runTrackedOperation(
     lockKey,
     { label: "Generate Plan", stage: "plan", kind: "generate-plan", cancellable: true },
     (op) =>
-      generatePlanWithAIForResolvedTask(context, inventory, taskFolderUri, op)
+      generatePlanWithAIForResolvedTask(context, inventory, taskFolderUri, op, effectiveReviewMode)
   );
   if (!result) {
     // Refused (another operation holds this task's lock) — the busy warning
@@ -170,11 +200,21 @@ export async function generatePlanWithAI(
     return;
   }
 
-  // Run only after this run's own lock is released above, since
-  // runReviewWithAI acquires the same per-task lock itself.
+  // Dispatched through the automation-chain scheduler. This run's own lock
+  // was already released above (runTrackedOperation returned), so no root
+  // operation is passed and the follow-up runs immediately — but the chain
+  // still goes through the single lock-safe dispatch point.
   if (result.triggerAutoReview && result.taskFolderPath) {
-    await vscode.commands.executeCommand("vs-code-ai-helper.runReviewWithAI", {
-      taskFolderPath: result.taskFolderPath,
+    // "auto-fast-forward" runs the review + fixes loop instead of a single
+    // review pass.
+    const command = effectiveReviewMode === "auto-fast-forward"
+      ? "vs-code-ai-helper.fastForwardReviewWithAI"
+      : "vs-code-ai-helper.runReviewWithAI";
+    await scheduleAutomationChain({
+      command,
+      arg: { taskFolderPath: result.taskFolderPath },
+      taskKey: result.taskFolderPath,
+      chainId: "auto-review",
     });
   }
 
@@ -191,7 +231,15 @@ async function generatePlanWithAIForResolvedTask(
   context: vscode.ExtensionContext,
   inventory: TaskInventory,
   taskFolderUri: vscode.Uri,
-  op: TaskOperationHandle
+  op: TaskOperationHandle,
+  /**
+   * Effective follow-up review mode: the auto-review-after-plan setting
+   * combined (strongest-wins) with any chained fast-forward request from
+   * "Complete & Move On triggers AI". Anything other than "off" advances a
+   * successful generation to Plan High-Level Review and asks the caller to
+   * dispatch that review.
+   */
+  effectiveReviewMode: AutoTriggerMode
 ): Promise<GeneratePlanResult> {
   const model = await resolveFreshModelForStage(taskFolderUri, "plan");
   if (!model.modelId) {
@@ -337,7 +385,7 @@ async function generatePlanWithAIForResolvedTask(
           // The destination stage must be persisted before its automatic
           // operation begins.  This keeps the tree/progress indicator and
           // review eligibility aligned with the operation actually running.
-          const destinationStage: TaskStage = shouldAutoReviewAfterPlan()
+          const destinationStage: TaskStage = effectiveReviewMode !== "off"
             ? "plan-high-review"
             : "plan";
           await patchTaskProgress(taskFolderUri, (existing) => {
@@ -352,7 +400,7 @@ async function generatePlanWithAIForResolvedTask(
           NotificationRouter.showInformation(
             `plan.md generated with ${providerLabel} (${result.summary ?? ""})`
           );
-          if (shouldAutoReviewAfterPlan()) {
+          if (effectiveReviewMode !== "off") {
             // Deferred: the review command acquires this same task's
             // operation lock, which this run still holds until the
             // outer `finally` below runs. Trigger it from the caller

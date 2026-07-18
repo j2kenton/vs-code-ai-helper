@@ -67,11 +67,9 @@ type EffectiveProvider =
  * defense for paths that never went through a guarded command entry point.
  */
 function isModelProviderDisabled(provider: ProviderId): boolean {
-  return (
-    provider !== "copilot" &&
-    isProviderSelectionConfigured() &&
-    !isProviderEnabled(provider)
-  );
+  // Copilot is not exempt: isProviderEnabled treats it as enabled unless the
+  // user explicitly disables it in Provider Selection.
+  return isProviderSelectionConfigured() && !isProviderEnabled(provider);
 }
 
 function resolveEffectiveProvider(

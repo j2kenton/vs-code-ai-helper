@@ -267,7 +267,7 @@ export async function ensureStageModelConfigured(
     return true;
   }
   const parsed = parseModelSelection(resolved.modelId);
-  if (parsed.provider !== "copilot" && !isProviderEnabled(parsed.provider)) {
+  if (!isProviderEnabled(parsed.provider)) {
     void vscode.window.showWarningMessage(
       `The model configured for the ${stageName} stage (${resolved.modelId}) belongs to a disabled provider. ` +
         "Enable the provider or choose another model in AI Models."
@@ -880,7 +880,9 @@ export async function getAvailableModels(): Promise<SelectableModel[]> {
     getDiscoveredCliModels;
 
   try {
-    const copilotModels = await getCopilotModels();
+    // Copilot is part of the provider selection too: enabled by default,
+    // but an explicit disable removes its models from every picker.
+    const copilotModels = isProviderEnabled("copilot") ? await getCopilotModels() : [];
     for (const model of copilotModels) {
       const baseName = normalizeCopilotModelName(model);
       pushSelectableModel(result, seenIds, {

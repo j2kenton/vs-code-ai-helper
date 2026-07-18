@@ -12,6 +12,7 @@ import { advanceStage, AUTO_REVIEW_ELIGIBLE_KINDS, TransitionKind } from "../uti
 import { NotificationRouter } from "../utils/notificationRouter";
 import { runCompletionLint } from "../utils/completionLint";
 import { ensureStageModelConfigured } from "../utils/modelSelection";
+import { scheduleAutomationChain } from "../utils/automationChain";
 import { pickReopenStage, reopenCompletedTask } from "../utils/reopenTask";
 
 /**
@@ -271,8 +272,16 @@ export async function setTaskStage(
     if (!(await ensureStageModelConfigured(taskFolderUri, newStage))) {
       return;
     }
-    await vscode.commands.executeCommand("vs-code-ai-helper.runReviewWithAI", {
-      taskFolderPath: task.taskFolderPath,
+    // Never dispatched inline: every auto-review chain flows through the
+    // single guarded dispatcher. setTaskStage holds no operation lock here,
+    // so the dispatch is immediate — but the shared "auto-review" chainId
+    // drops this chain when another review chain (e.g. one scheduled by a
+    // racing auto-advance) is already pending or running for this task.
+    await scheduleAutomationChain({
+      command: "vs-code-ai-helper.runReviewWithAI",
+      arg: { taskFolderPath: task.taskFolderPath },
+      taskKey: task.taskFolderPath,
+      chainId: "auto-review",
     });
   }
 }

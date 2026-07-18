@@ -13,6 +13,7 @@ import {
 import { IncompleteTask } from "../utils/taskProgressUtils";
 import { taskOperations, taskKey } from "../utils/taskOperations";
 import { resolveCurrentPlanUri, statIfExists } from "../utils/fileUtils";
+import { hasPreviousVersion } from "../utils/artifactBackups";
 import { resolveImplementationArtifact } from "../utils/implementationArtifactResolver";
 import { parseReadiness } from "../utils/reviewReadiness";
 import { TaskInventory, TaskWithProgress } from "../state/taskInventory";
@@ -255,7 +256,8 @@ export class StageNode extends vscode.TreeItem {
     modelInfo?: ResolvedStageModel,
     availableModels?: readonly SelectableModel[]  ,
     isScheduled: boolean = false,
-    isMetaManaged: boolean = false
+    isMetaManaged: boolean = false,
+    hasBackup: boolean = false
   ) {
     super(STAGE_DISPLAY_NAMES[stage], vscode.TreeItemCollapsibleState.None);
 
@@ -362,7 +364,8 @@ export class StageNode extends vscode.TreeItem {
       task.progress.lintPayload !== undefined,
       task.progress.lintPayload?.passed,
       isScheduled,
-      isMetaManaged
+      isMetaManaged,
+      hasBackup
     );
   }
 
@@ -383,7 +386,8 @@ export function getStageNodeContextValue(
   hasLintPayload: boolean = false,
   lintPassed?: boolean,
   isScheduled: boolean = false,
-  isMetaManaged: boolean = false
+  isMetaManaged: boolean = false,
+  hasBackup: boolean = false
 ): string {
   return buildStageContextValue({
     stage,
@@ -393,6 +397,7 @@ export function getStageNodeContextValue(
     lintPassed,
     isScheduled,
     isMetaManaged,
+    hasBackup,
   });
 }
 
@@ -842,6 +847,22 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
 
       const isStageScheduled = status === "current" && task.progress.scheduledRun !== undefined;
 
+      // Backup availability drives the has-backup context token (Revert
+      // Changes / Delete Previous Version menus). Resolved with the same
+      // artifact rule the revert command uses (viewStageChanges.artifactFor):
+      // plan → the current plan file, otherwise the stage's fixed filename.
+      let revertArtifact: vscode.Uri | undefined;
+      if (stage === "plan") {
+        revertArtifact = await resolveCurrentPlanUri(task.folderUri);
+      } else {
+        const revertArtifactName = STAGE_ARTIFACT_FILENAMES[stage];
+        revertArtifact = revertArtifactName
+          ? vscode.Uri.joinPath(task.folderUri, revertArtifactName)
+          : undefined;
+      }
+      const hasBackup =
+        revertArtifact !== undefined && (await hasPreviousVersion(revertArtifact));
+
       nodes.push(
         new StageNode(
           task,
@@ -852,7 +873,8 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
           modelInfo,
           this.availableModels,
           isStageScheduled,
-          this.isMetaManaged
+          this.isMetaManaged,
+          hasBackup
         )
       );
     }

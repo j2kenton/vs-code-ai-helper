@@ -162,6 +162,81 @@ export function buildTaskDocument(parsed: ParsedTaskDocument): string {
 }
 
 /**
+ * The fixed subsection contract for the AI draft: the `## Draft with AI`
+ * body must contain these three headed subsections so the draft states
+ * concrete work rather than abstract planning language. Enforced by
+ * `validateDraftStructure` with one repair retry; a response that still
+ * lacks them is accepted unstructured (fallback) with a notice rather than
+ * discarded.
+ */
+export const DRAFT_REQUIRED_SUBSECTIONS = [
+  "Behavior change",
+  "Affected areas",
+  "Actionable changes",
+] as const;
+
+/**
+ * Check the draft body for the three required subsections (any heading
+ * level, case-insensitive) AND a non-empty body under each — a response
+ * with the right headings but empty sections is exactly the non-actionable
+ * output the contract exists to prevent. Returns the missing/empty titles
+ * so a repair prompt can name them precisely.
+ */
+export function validateDraftStructure(
+  draftBody: string
+): { valid: boolean; missing: string[] } {
+  const lines = draftBody.split(/\r?\n/);
+  interface Heading {
+    lineIndex: number;
+    title: string;
+  }
+  const headings: Heading[] = [];
+  lines.forEach((line, lineIndex) => {
+    const match = /^#{1,6}\s*(.*?)\s*$/.exec(line);
+    if (match) {
+      headings.push({ lineIndex, title: match[1]!.toLowerCase() });
+    }
+  });
+  const missing = DRAFT_REQUIRED_SUBSECTIONS.filter((title) => {
+    const at = headings.findIndex((h) => h.title === title.toLowerCase());
+    if (at === -1) {
+      return true;
+    }
+    const bodyStart = headings[at]!.lineIndex + 1;
+    const bodyEnd =
+      at + 1 < headings.length ? headings[at + 1]!.lineIndex : lines.length;
+    return lines.slice(bodyStart, bodyEnd).join("\n").trim().length === 0;
+  });
+  return { valid: missing.length === 0, missing };
+}
+
+/**
+ * Heading a structurally invalid draft is filed under when it is accepted
+ * as a fallback (after the repair retry also failed), so the task document
+ * makes the unstructured state explicit instead of silently presenting the
+ * malformed draft as a finished one.
+ */
+export const DRAFT_UNSTRUCTURED_HEADING = "### Draft (unstructured)";
+
+/**
+ * Wrap a draft body that failed structure validation under the
+ * `Draft (unstructured)` heading with a notice naming the missing/empty
+ * subsections, so the fallback is visibly marked in task.md.
+ */
+export function wrapUnstructuredDraft(
+  draftBody: string,
+  missing: readonly string[]
+): string {
+  return [
+    DRAFT_UNSTRUCTURED_HEADING,
+    "",
+    `> The AI response was missing (or had empty) required subsection(s) — ${missing.join(", ")} — even after a repair attempt. Review this draft and structure it manually, or run Draft with AI again.`,
+    "",
+    draftBody,
+  ].join("\n");
+}
+
+/**
  * Normalize a heading line for robust matching:
  * - Strip leading `#` characters and whitespace (tolerate heading levels 1-6)
  * - Trim trailing whitespace
@@ -221,10 +296,17 @@ export function parseAIResponse(
   const questionsOccurrences = headings.filter(
     (h) => h.normalizedTitle === "open questions"
   );
+  // The draft body's own required subsections (see DRAFT_REQUIRED_SUBSECTIONS)
+  // are body content, not unknown top-level sections — they must not make the
+  // whole response "unrecognized".
+  const knownSubsectionTitles = new Set<string>(
+    DRAFT_REQUIRED_SUBSECTIONS.map((title) => title.toLowerCase())
+  );
   const otherOccurrences = headings.filter(
     (h) =>
       h.normalizedTitle !== "draft with ai" &&
-      h.normalizedTitle !== "open questions"
+      h.normalizedTitle !== "open questions" &&
+      !knownSubsectionTitles.has(h.normalizedTitle)
   );
 
   // Missing sections
@@ -510,50 +592,114 @@ export async function draftTaskWithAI(
         // Cancellable from either surface: the native progress toast and the
         // Notifications-row cancel button both abort the same provider run.
         const linked = linkCancellationTokens(token, op.token);
-        let result: Awaited<ReturnType<typeof runner.run>>;
-        try {
-          result = await runner.run(
+
+        interface DraftAttemptResult {
+          status: "completed" | "cancelled" | "failed";
+          parsed?: { draftWithAI: string; openQuestions: string };
+          errorMessage?: string;
+        }
+        const runAttempt = async (attemptPrompt: string): Promise<DraftAttemptResult> => {
+          await deleteDraftTmpFile(taskFolderUri);
+          const result = await runner.run(
             {
               taskFolderUri: taskFolderUri,
               workspaceUri: workspaceFolder.uri,
               stage: "desc",
-              prompt,
+              prompt: attemptPrompt,
               outputFile: tmpUri,
               modelId: nativeModelId,
             },
             linked.token
           );
-        } finally {
-          linked.dispose();
-        }
-
-        await writeRunLog(
-          taskFolderUri,
-          runner.id,
-          "desc",
-          `# Prompt\n\n${prompt}\n\n# Result\n\nStatus: ${result.status}\n\n${
-            result.summary ?? result.errorMessage ?? ""
-          }`
-        );
-
-        if (result.status === "completed") {
+          await writeRunLog(
+            taskFolderUri,
+            runner.id,
+            "desc",
+            `# Prompt\n\n${attemptPrompt}\n\n# Result\n\nStatus: ${result.status}\n\n${
+              result.summary ?? result.errorMessage ?? ""
+            }`
+          );
+          if (result.status !== "completed") {
+            return {
+              status: result.status === "cancelled" ? "cancelled" : "failed",
+              errorMessage: result.errorMessage,
+            };
+          }
           // Prefer the real temp output file over the runner summary.
           const tmpContent = await readDraftTmpFile(taskFolderUri);
           const outputText = tmpContent ?? result.summary ?? "";
-          const parsed = parseAIResponse(outputText);
-          if (parsed) {
-            aiOutput = parsed;
-          } else {
+          return { status: "completed", parsed: parseAIResponse(outputText) };
+        };
+
+        try {
+          const first = await runAttempt(prompt);
+          if (first.status === "cancelled") {
+            NotificationRouter.showInformation("Draft with AI cancelled.");
+            return;
+          }
+          if (first.status === "failed") {
+            void vscode.window.showErrorMessage(
+              `Draft with AI failed: ${first.errorMessage ?? "unknown error"}`
+            );
+            return;
+          }
+          if (!first.parsed) {
             void vscode.window.showErrorMessage(
               "AI returned a malformed response (missing, duplicate, or unrecognized sections). task.md was not changed."
             );
+            return;
           }
-        } else if (result.status === "cancelled") {
-          NotificationRouter.showInformation("Draft with AI cancelled.");
-        } else {
-          void vscode.window.showErrorMessage(
-            `Draft with AI failed: ${result.errorMessage ?? "unknown error"}`
-          );
+          const validation = validateDraftStructure(first.parsed.draftWithAI);
+          if (validation.valid) {
+            aiOutput = first.parsed;
+            return;
+          }
+          // One repair retry naming the missing/empty subsections, then fall
+          // back to accepting the draft filed under the explicit
+          // `Draft (unstructured)` heading rather than discarding it.
+          progress.report({ message: `Repairing draft structure with ${providerLabel}...` });
+          const repairPrompt =
+            `${prompt}\n\n---\n\nYour previous response was missing (or had empty) required subsection(s) under "## Draft with AI": ` +
+            `${validation.missing.join(", ")}. Return the complete response again in the same two-section format, `
+            + `this time with all three subsections (### Behavior change, ### Affected areas, ### Actionable changes) under "## Draft with AI", each with substantive content.`;
+          const second = await runAttempt(repairPrompt);
+          if (second.status === "cancelled") {
+            NotificationRouter.showInformation("Draft with AI cancelled.");
+            return;
+          }
+          if (second.status === "completed" && second.parsed) {
+            const secondValidation = validateDraftStructure(second.parsed.draftWithAI);
+            if (secondValidation.valid) {
+              aiOutput = second.parsed;
+            } else {
+              aiOutput = {
+                draftWithAI: wrapUnstructuredDraft(
+                  second.parsed.draftWithAI,
+                  secondValidation.missing
+                ),
+                openQuestions: second.parsed.openQuestions,
+              };
+              NotificationRouter.showWarning(
+                "The draft is still missing required subsections (Behavior change / Affected areas / Actionable changes) after a repair attempt; it was saved under a 'Draft (unstructured)' heading for manual review."
+              );
+            }
+          } else {
+            // Repair pass failed or came back malformed — keep the first
+            // (parseable, unstructured) draft instead of losing it, filed
+            // under the explicit unstructured heading.
+            aiOutput = {
+              draftWithAI: wrapUnstructuredDraft(
+                first.parsed.draftWithAI,
+                validation.missing
+              ),
+              openQuestions: first.parsed.openQuestions,
+            };
+            NotificationRouter.showWarning(
+              "The draft is missing required subsections (Behavior change / Affected areas / Actionable changes) and the repair attempt did not return a usable response; the first draft was saved under a 'Draft (unstructured)' heading for manual review."
+            );
+          }
+        } finally {
+          linked.dispose();
         }
       }
     );

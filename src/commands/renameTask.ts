@@ -59,12 +59,22 @@ export async function renameTask(
 }
 
 /**
+ * Lines of abstract process/planning language ("independently shippable
+ * slices", "decision gate", …) describe how the work is organized, not what
+ * it does — they make meaningless task names, so name derivation skips them
+ * in favor of the first line that states concrete work.
+ */
+const ABSTRACT_PLANNING_LINE =
+  /\b(shippable|workstream|decision gate|vertical slice|slices?\b.*\bcarved|carved out of|integration checkpoint|implementation checklist|checklist below|scope and requirements|open questions)\b/i;
+
+/**
  * Derive a concise task name from the task description text: the first
- * meaningful (non-heading, non-boilerplate) line, stripped of markdown
- * markup and truncated at a sentence boundary. Exported for testing.
+ * meaningful (non-heading, non-boilerplate, non-abstract) line, stripped of
+ * markdown markup and truncated at a sentence boundary. Exported for testing.
  */
 export function deriveNameFromDescription(text: string): string | undefined {
   const withoutCode = text.replace(/```[\s\S]*?```/g, " ");
+  let firstFallback: string | undefined;
   for (const rawLine of withoutCode.split(/\r?\n/)) {
     let line = rawLine.trim();
     if (!line || /^#{1,6}\s/.test(line) || /^<!--/.test(line)) {
@@ -75,6 +85,8 @@ export function deriveNameFromDescription(text: string): string | undefined {
       .replace(/^[-*>\d.)\s]+/, "")
       .replace(/[*_`]/g, "")
       .trim();
+    // Meta labels like "Goal:" / "Scope:" prefix real content — drop the label.
+    line = line.replace(/^(Goal|Scope|Objective|Summary|Task|Description)\s*:\s*/i, "").trim();
     if (line.length < 8) {
       continue;
     }
@@ -83,9 +95,16 @@ export function deriveNameFromDescription(text: string): string | undefined {
     if (sentenceEnd > 12) {
       line = line.slice(0, sentenceEnd);
     }
-    return line.slice(0, 100).trim();
+    const candidate = line.slice(0, 100).trim();
+    if (ABSTRACT_PLANNING_LINE.test(candidate)) {
+      // Remember it in case nothing concrete follows, but keep looking for a
+      // line that says what the work actually changes.
+      firstFallback = firstFallback ?? candidate;
+      continue;
+    }
+    return candidate;
   }
-  return undefined;
+  return firstFallback;
 }
 
 /**
