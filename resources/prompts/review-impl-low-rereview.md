@@ -13,6 +13,12 @@ Use these blocker categories consistently:
 
 Score the current implementation against the full approved plan. Explain any unchanged or lower score despite resolved findings, and keep newly discovered blockers separate from the previous blocker reconciliation.
 
+Do not accept an unapproved substitute merely because it is plausible or
+locally safer. When code materially changes an explicit plan contract or
+acceptance criterion, report the required behavior and actual behavior as a
+completion blocker unless the task records user approval. Implementation notes
+do not constitute that approval.
+
 Begin your response with a readiness score on its own line in this exact format:
 Readiness: N/10
 
@@ -24,6 +30,7 @@ Then structure your review as:
 - Score comparison in the form `Previous: X/10 -> Current: N/10`, explaining the movement.
 - Previous blockers, addressing every prior blocker individually as resolved / partially resolved / unresolved, with file-level evidence.
 - Per plan item: done / incomplete / defective / cannot assess.
+- Material plan deviations (if any): required behavior vs. actual behavior, and whether the task records user approval.
 - New defect blockers (if any), each with the file, problem, and concrete failure scenario.
 - New completion blockers (if any).
 - New review-confidence blockers (if any).

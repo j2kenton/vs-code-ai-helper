@@ -23,6 +23,13 @@ const REVIEW_TEMPLATES = [
   "review-publish-rereview.md",
 ];
 
+const IMPLEMENTATION_REVIEW_TEMPLATES = [
+  "review-impl-high.md",
+  "review-impl-low.md",
+  "review-impl-high-rereview.md",
+  "review-impl-low-rereview.md",
+];
+
 void describe("review scoring rubric", () => {
   const workspace = vscode.workspace as unknown as {
     fs: { readFile: (uri: vscode.Uri) => Promise<Uint8Array> };
@@ -66,6 +73,38 @@ void describe("review scoring rubric", () => {
         assert.doesNotMatch(raw, /needs minor changes/i);
       });
     }
+  });
+
+  void describe("implementation plan-contract prompts", () => {
+    for (const templateFile of IMPLEMENTATION_REVIEW_TEMPLATES) {
+      void it(`${templateFile} rejects unapproved material plan deviations`, () => {
+        const raw = fs.readFileSync(path.join(PROMPTS_DIR, templateFile), "utf8");
+        assert.match(raw, /unapproved (?:reduction|substitute)/i);
+        assert.match(raw, /Material plan deviations/);
+        assert.match(raw, /acceptance criteria/i);
+      });
+    }
+
+    void it("gives an implementation-review fix both the approved plan and implementation notes", async () => {
+      const rendered = await renderPromptTemplate(
+        extensionUri,
+        "apply-impl-review-code.md",
+        {
+          contextPack: "CONTEXT PACK",
+          approvedPlan: "APPROVED PLAN",
+          implementation: "IMPLEMENTATION NOTES",
+          review: "IMPLEMENTATION REVIEW",
+        }
+      );
+
+      assert.match(rendered, /## Approved Plan \(plan\.md\)/);
+      assert.match(rendered, /## Implementation Notes \(plan-final\.md\)/);
+      assert.ok(rendered.includes("APPROVED PLAN"));
+      assert.ok(rendered.includes("IMPLEMENTATION NOTES"));
+      assert.ok(rendered.includes("IMPLEMENTATION REVIEW"));
+      assert.ok(!rendered.includes("{{approvedPlan}}"));
+      assert.ok(!rendered.includes("{{implementation}}"));
+    });
   });
 
   void describe("renderPromptTemplate rubric injection", () => {

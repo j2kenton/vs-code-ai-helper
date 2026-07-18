@@ -1805,6 +1805,11 @@ export async function fastForwardReviewWithAI(
  *
  * Uses the `implementation` model for execution, not the review-stage model.
  *
+ * The implementation runner needs two distinct task artifacts:
+ * - plan.md is the approved contract the code must follow.
+ * - plan-final.md is the previous implementation summary, useful as history
+ *   but never an authority to waive a plan requirement.
+ *
  * Legacy tasks (implementation.md present, plan-final.md absent) are handled
  * via materializeCanonicalIfNeeded, which copies implementation.md →
  * plan-final.md before reading the canonical content. This mirrors the same
@@ -1829,10 +1834,30 @@ async function applyImplementationReviewWithAI(
     return;
   }
 
-  const planFinalContent = await readNonEmptyText(canonicalUri);
-  if (!planFinalContent) {
+  const implementationNotes = await readNonEmptyText(canonicalUri);
+  if (!implementationNotes) {
     NotificationRouter.showWarning(
       "No plan-final.md found. Nothing to apply the review to."
+    );
+    return;
+  }
+
+  // Do not make the implementation model infer the approved contract from a
+  // review or from its own prior summary. Review generation already uses the
+  // current plan artifact; review application must receive that same source.
+  let approvedPlan: string | undefined;
+  let planName = "plan.md";
+  try {
+    const approvedPlanUri = await resolveCurrentPlanUri(folderUri);
+    planName = path.basename(approvedPlanUri.fsPath);
+    approvedPlan = await readNonEmptyText(approvedPlanUri);
+  } catch {
+    // Handled by !approvedPlan guard below
+  }
+
+  if (!approvedPlan) {
+    NotificationRouter.showWarning(
+      `No approved plan found (or it is empty). Generate or restore ${planName} before applying an implementation review.`
     );
     return;
   }
@@ -1858,7 +1883,8 @@ async function applyImplementationReviewWithAI(
     "apply-impl-review-code.md",
     {
       contextPack: contextPackContent,
-      plan: planFinalContent,
+      approvedPlan,
+      implementation: implementationNotes,
       review: reviewContent,
     }
   );

@@ -6,6 +6,14 @@ Assess at the architectural level: is the implementation following the plan's ap
 
 Score the current implementation against the full approved plan, not merely the subset attempted in the implementation notes. A required major plan area or acceptance criterion that is missing, partially implemented, or unilaterally deferred is a completion blocker even when the partial code does not contradict the architecture.
 
+For every major plan area, compare the actual behavior to the explicit plan
+contract and acceptance criteria. Do not treat an unapproved reduction,
+substitute design, or changed user workflow as complete merely because it is
+plausible or simpler. It is a completion blocker when it materially changes
+the contract; implementation notes cannot approve that deviation. A detail is
+non-blocking only when the plan leaves it open or the alternative preserves all
+explicit acceptance criteria.
+
 Distinguish:
 - Architectural blockers: the implementation contradicts the plan's approach or introduces an unsafe major design.
 - Completion blockers: required major work or acceptance criteria remain incomplete.
@@ -20,6 +28,7 @@ Readiness: N/10
 
 - Summary verdict (on track / off track / cannot assess).
 - Per plan area: implemented / partially implemented / missing / cannot assess, with one line of evidence each (file + what you saw).
+- Material plan deviations (if any): required behavior vs. actual behavior, and whether the task records user approval.
 - Architectural blockers (if any).
 - Completion blockers (if any).
 - Review-confidence blockers (if any).

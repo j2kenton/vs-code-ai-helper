@@ -13,6 +13,14 @@ Use these blocker categories consistently:
 
 Score the current implementation against the full approved plan, not merely the subset attempted in the latest run. The score may stay the same or decrease when a material unresolved or new blocker justifies it, but explain that explicitly. Resolved blockers are real progress and must be reflected in the reconciliation even when the numerical band does not change.
 
+For every major plan area, compare the actual behavior to the explicit plan
+contract and acceptance criteria. Do not treat an unapproved reduction,
+substitute design, or changed user workflow as complete merely because it is
+plausible or simpler. It is a completion blocker when it materially changes
+the contract; implementation notes cannot approve that deviation. A detail is
+non-blocking only when the plan leaves it open or the alternative preserves all
+explicit acceptance criteria.
+
 Begin your response with a readiness score on its own line in this exact format:
 Readiness: N/10
 
@@ -24,6 +32,7 @@ Then structure your review as:
 - Score comparison in the form `Previous: X/10 -> Current: N/10`, explaining the movement.
 - Previous blockers, addressing every prior blocker individually as resolved / partially resolved / unresolved, with file-level evidence.
 - Per plan area: implemented / partially implemented / missing / cannot assess, with concise evidence.
+- Material plan deviations (if any): required behavior vs. actual behavior, and whether the task records user approval.
 - New architectural blockers (if any).
 - New completion blockers (if any).
 - New review-confidence blockers (if any).

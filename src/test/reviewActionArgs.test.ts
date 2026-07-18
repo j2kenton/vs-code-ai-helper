@@ -195,6 +195,33 @@ void describe("review apply model resolution contract", () => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// Implementation-review apply prompt contract
+// ---------------------------------------------------------------------------
+//
+// The approved plan is the implementation contract. plan-final.md is useful
+// historical context, but it must not replace plan.md in the apply prompt.
+
+void describe("implementation review apply prompt contract", () => {
+  void it("passes the approved plan separately from implementation notes", () => {
+    const source = fs.readFileSync(
+      path.join(process.cwd(), "src", "commands", "reviewActions.ts"),
+      "utf8"
+    );
+
+    assert.match(
+      source,
+      /resolveCurrentPlanUri\(folderUri\);/,
+      "implementation review application must load the approved plan"
+    );
+    assert.match(
+      source,
+      /approvedPlan,\s*implementation:\s*implementationNotes,\s*review:\s*reviewContent,/s,
+      "the apply prompt must receive both the contract and historical notes"
+    );
+  });
+});
+
 void describe("review and re-review prompt selection", () => {
   const cases = [
     {

@@ -6,6 +6,12 @@ Assess at the code level: correctness of the specific changes, edge cases, error
 
 Score the current implementation against the full approved plan, not merely the subset attempted in the implementation notes. Required plan items or acceptance criteria that remain incomplete or were unilaterally deferred are completion blockers. Keep missing evidence separate as a review-confidence blocker rather than guessing.
 
+Do not accept an unapproved substitute merely because it is plausible or
+locally safer. When code materially changes an explicit plan contract or
+acceptance criterion, report the required behavior and actual behavior as a
+completion blocker unless the task records user approval. Implementation notes
+do not constitute that approval.
+
 Structure your review as:
 
 Begin your response with a readiness score on its own line in this exact format:
@@ -15,6 +21,7 @@ Readiness: N/10
 
 - Summary verdict (ready to complete / needs changes / cannot fully assess).
 - Per plan item: done / incomplete / defective / cannot assess, with file-level evidence for each judgment.
+- Material plan deviations (if any): required behavior vs. actual behavior, and whether the task records user approval.
 - Defect blockers (if any), each with the file, the problem, and a concrete failure scenario.
 - Completion blockers (if any).
 - Review-confidence blockers (if any).
