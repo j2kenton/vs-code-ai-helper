@@ -134,13 +134,17 @@ export function formatQuotaStatus(observation: QuotaObservation | undefined): st
 }
 
 export function getQuotaStatusText(stage: TaskStage, modelId: string | undefined): string {
-  if (!modelId) return "-";
+  if (!modelId) {
+    return "-";
+  }
   return formatQuotaStatus(getQuotaObservation(stage, modelId));
 }
 
 /** Tooltip paired with getQuotaStatusText's "-" placeholder vs. observed text. */
 export function getQuotaStatusTooltip(modelId: string | undefined): string {
-  if (!modelId) return "No model configured for this slot — usage cannot be observed.";
+  if (!modelId) {
+    return "No model configured for this slot — usage cannot be observed.";
+  }
   return "Session-observed usage status, not a live percentage (no provider exposes numeric quota remaining).";
 }
 
