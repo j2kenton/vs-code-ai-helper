@@ -360,6 +360,20 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
         // Allow file edits in the workspace without per-edit prompts;
         // anything beyond edits (e.g. arbitrary shell) stays denied.
         args.push("--permission-mode", "acceptEdits");
+      } else {
+        // Text mode must stay read-only no matter what the invoking
+        // workspace's own .claude/settings.json permits: omitting this flag
+        // falls back to "default" permission mode, which still honors any
+        // project-level "allow Edit/Write" rule already in effect for that
+        // workspace (this extension's own repo included) — it is not a hard
+        // deny. A model that then decides to "produce" a requested file
+        // itself (via its own Write tool) instead of returning it as the
+        // response text ends up overwriting the real target with a short
+        // narrative summary instead of the generated content. "plan" forces
+        // no-side-effect tool access regardless of those settings, matching
+        // every other provider's text-mode contract (Codex `--sandbox
+        // read-only`, Kiro `--trust-tools fs_read,grep,glob`).
+        args.push("--permission-mode", "plan");
       }
       if (parsedModel.model) {
         args.push("--model", parsedModel.model);

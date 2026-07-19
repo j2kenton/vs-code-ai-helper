@@ -163,6 +163,8 @@ void describe("provider CLI contracts", () => {
       "-p",
       "--output-format",
       "text",
+      "--permission-mode",
+      "plan",
       "--model",
       "sonnet",
       "--max-thinking-tokens",

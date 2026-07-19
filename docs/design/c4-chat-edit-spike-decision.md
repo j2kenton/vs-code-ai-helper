@@ -20,7 +20,7 @@ just a prompt-level instruction:
 
 | Provider | `mode: "edit"` | `mode: "text"` |
 |---|---|---|
-| Claude Code CLI | `--permission-mode acceptEdits` | (flag omitted — default deny) |
+| Claude Code CLI | `--permission-mode acceptEdits` | `--permission-mode plan` |
 | Codex CLI | `--sandbox workspace-write` | `--sandbox read-only` |
 | Gemini CLI | `--approval-mode auto_edit` | (flag omitted) |
 | Kiro CLI | `--trust-all-tools` | `--trust-tools fs_read,grep,glob` |
