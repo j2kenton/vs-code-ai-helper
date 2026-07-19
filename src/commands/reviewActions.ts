@@ -1326,9 +1326,12 @@ export async function runReviewForFolder(
                 // command claims the lock itself and applies the same
                 // eligibility guards as the UI button; the shared "auto-review"
                 // chainId drops it if another review chain is already pending.
+                const reviewCommand = getAutoAdvanceMode() === "auto-fast-forward"
+                  ? "vs-code-ai-helper.fastForwardReviewWithAI"
+                  : "vs-code-ai-helper.runReviewWithAI";
                 void scheduleAutomationChain(
                   {
-                    command: "vs-code-ai-helper.runReviewWithAI",
+                    command: reviewCommand,
                     arg: { taskFolderPath: folderUri.fsPath },
                     taskKey: folderUri.fsPath,
                     chainId: "auto-review",
@@ -2301,8 +2304,11 @@ export async function nextStage(
     // already pending or running for this task drops this one. The command
     // resolves the freshly persisted stage, claims the exclusive lock, and
     // applies the same eligibility guards as the UI button.
+    const reviewCommand = getCompleteAndMoveOnTriggersAIMode() === "auto-fast-forward"
+      ? "vs-code-ai-helper.fastForwardReviewWithAI"
+      : "vs-code-ai-helper.runReviewWithAI";
     await scheduleAutomationChain({
-      command: "vs-code-ai-helper.runReviewWithAI",
+      command: reviewCommand,
       arg: { taskFolderPath: resolved.folderUri.fsPath },
       taskKey: resolved.folderUri.fsPath,
       chainId: "auto-review",

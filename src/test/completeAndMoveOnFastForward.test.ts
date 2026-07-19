@@ -283,6 +283,52 @@ void describe("Complete & Move On auto-fast-forward chaining", () => {
     }
   });
 
+  void it("completing Plan directly into review dispatches the Fast Forward loop in auto-fast-forward mode", async () => {
+    const { folderPath, progress } = makeTaskFolder(`ff_plan_review_${Math.floor(Math.random() * 1e9)}`, "plan");
+    const buttonArg = makeButtonPressArg(folderPath, progress);
+
+    const provider = new StatusTreeProvider();
+    initNotificationRouter(provider);
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const { dispatches, patched: dispatchSeam } = recordDispatches();
+
+    const patches: Patched[] = [
+      dispatchSeam,
+      patch(settingsModule, "completeAndMoveOnTriggersAI", () => true),
+      patch(settingsModule, "getCompleteAndMoveOnTriggersAIMode", () => "auto-fast-forward"),
+      patch(modelSelectionModule, "resolveConfiguredReviewStages", () =>
+        Promise.resolve(new Set(REVIEW_STAGES))),
+    ];
+
+    const context = makeExtensionContext();
+    registerReviewActionCommands(context);
+
+    try {
+      await vscode.commands.executeCommand("vs-code-ai-helper.nextStage", buttonArg);
+
+      const persisted = await readTaskProgress(vscode.Uri.file(folderPath));
+      assert.equal(persisted?.currentStage, "plan-high-review");
+      assert.equal(dispatches.length, 1, "exactly one follow-up review dispatch");
+      const dispatched = dispatches[0];
+      assert.ok(dispatched);
+      assert.equal(
+        dispatched.command,
+        "vs-code-ai-helper.fastForwardReviewWithAI",
+        "direct review-stage completion must honor auto-fast-forward mode"
+      );
+      assert.equal(dispatched.chainId, "auto-review");
+      assert.equal((dispatched.arg as ChainedArg).taskFolderPath, folderPath);
+    } finally {
+      for (const p of patches.reverse()) { p.restore(); }
+      for (const sub of context.subscriptions) { sub.dispose(); }
+      wsStub.restore();
+      fsBridge.restore();
+      provider.dispose();
+      deactivateNotificationRouter();
+    }
+  });
+
   void it("plain 'auto' mode does NOT attach the fast-forward marker", async () => {
     const { folderPath, progress } = makeTaskFolder(`auto_desc_${Math.floor(Math.random() * 1e9)}`, "desc");
     const buttonArg = makeButtonPressArg(folderPath, progress);

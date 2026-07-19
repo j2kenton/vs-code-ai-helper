@@ -339,6 +339,73 @@ void describe("nextStage command → auto-review chain (command-layer end-to-end
     }
   });
 
+  void it("score-based auto-advance into another review dispatches Fast Forward when auto-advance mode requests it", async () => {
+    const { folderPath } = makeTaskFolder(`auto-ff-review-${Math.floor(Math.random() * 1e9)}`, "plan-high-review");
+    const provider = new StatusTreeProvider();
+    initNotificationRouter(provider);
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const workspaceRoot = { uri: vscode.Uri.file(REAL_ROOT), name: "root", index: 0 } as vscode.WorkspaceFolder;
+    const dispatches: AutomationDispatch[] = [];
+    const fakeRunner = {
+      id: "stub-runner",
+      label: "Stub Provider",
+      capabilities: { planning: true, review: true, assistant: false },
+      isAvailable: (): Promise<{ available: boolean }> => Promise.resolve({ available: true }),
+      run: async (request: AgentRunRequest): Promise<AgentRunResult> => {
+        await fs.promises.writeFile(request.outputFile.fsPath, "Readiness: 9/10\n\n- Ready.\n", "utf8");
+        return { runnerId: "stub-runner", status: "completed" };
+      },
+    };
+
+    const contextPack = path.join(folderPath, "context-pack.md");
+    fs.writeFileSync(contextPack, "# Context\n", "utf8");
+
+    const patches: Patched[] = [
+      patch(settingsModule, "isAutoAdvanceEnabled", () => true),
+      patch(settingsModule, "getAutoAdvanceMode", () => "auto-fast-forward"),
+      patch(settingsModule, "getAutoAdvanceScoreThreshold", () => 8),
+      patch(modelSelectionModule, "resolveModelForStage", () => Promise.resolve({ source: "settings", modelId: "stub:model" })),
+      patch(modelSelectionModule, "resolveFreshModelForStage", () => Promise.resolve({ source: "settings", modelId: "stub:model" })),
+      patch(modelSelectionModule, "resolveConfiguredReviewStages", () => Promise.resolve(new Set(REVIEW_STAGES))),
+      patch(runnerRegistryModule, "resolveRunnerForModel", () => ({
+        runner: fakeRunner, provider: "copilot", providerLabel: "Stub Provider", nativeModelId: undefined,
+      })),
+      patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.resolve("stub prompt")),
+      patch(runLogModule, "writeRunLog", () => Promise.resolve(undefined)),
+      patch(contextPackModule, "writeContextPack", () => Promise.resolve(vscode.Uri.file(contextPack))),
+      patch(automationChainModule, "scheduleAutomationChain", (dispatch: AutomationDispatch): Promise<boolean> => {
+        dispatches.push(dispatch);
+        return Promise.resolve(true);
+      }),
+    ];
+
+    try {
+      await runReviewForFolder(
+        vscode.Uri.file(REAL_ROOT),
+        vscode.Uri.file(folderPath),
+        workspaceRoot,
+        "plan-high-review",
+        true
+      );
+
+      assert.equal((await readTaskProgress(vscode.Uri.file(folderPath)))?.currentStage, "plan-low-review");
+      assert.equal(dispatches.length, 1, "auto-advance should dispatch the next review-stage action");
+      assert.equal(
+        dispatches[0]?.command,
+        "vs-code-ai-helper.fastForwardReviewWithAI",
+        "auto-advance mode auto-fast-forward must dispatch the Fast Forward loop"
+      );
+      assert.equal(dispatches[0]?.chainId, "auto-review");
+    } finally {
+      for (const p of patches.reverse()) { p.restore(); }
+      wsStub.restore();
+      fsBridge.restore();
+      provider.dispose();
+      deactivateNotificationRouter();
+    }
+  });
+
   void it("a passing plan review advances to Implementation and dispatches only when auto-implement is armed", async () => {
     const provider = new StatusTreeProvider();
     initNotificationRouter(provider);
