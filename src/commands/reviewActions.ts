@@ -1646,14 +1646,22 @@ export async function applyReviewWithAI(
         await runTrackedOperation(
           lockKey,
           { parent: op, label: "Re-running review", stage, kind: "review" },
-          (reReviewOp) =>
+          // Deferred auto-advance dispatch inside runReviewForFolder waits for
+          // `operation` to end before dispatching the next stage's command.
+          // That must be the exclusive root (`op`), not this re-review's own
+          // child handle — the child ends almost immediately (children never
+          // hold the lock), while under Fast Forward the root keeps running
+          // for further attempts. Anchoring to the child let the follow-up
+          // dispatch fire while the root still held the exclusive lock, so it
+          // was refused as busy and silently dropped.
+          () =>
             runReviewForFolder(
               extensionUri,
               resolved.folderUri,
               workspaceRoot,
               stage,
               true,
-              { preserveActiveFallback: options.preserveActiveFallback, operation: reReviewOp }
+              { preserveActiveFallback: options.preserveActiveFallback, operation: op }
             )
         );
       }
@@ -1717,14 +1725,19 @@ export async function applyReviewWithAI(
       await runTrackedOperation(
         lockKey,
         { parent: op, label: "Re-running review", stage, kind: "review" },
-        (reReviewOp) =>
+        // See the impl-review branch above: anchor the deferred auto-advance
+        // dispatch to the exclusive root (`op`), not this re-review's own
+        // child handle, or the follow-up command fires while the root
+        // (e.g. Fast Forward's loop) is still holding the lock and is
+        // silently refused as busy.
+        () =>
           runReviewForFolder(
             extensionUri,
             resolved.folderUri,
             workspaceRoot,
             stage,
             true,
-            { preserveActiveFallback: options.preserveActiveFallback, operation: reReviewOp }
+            { preserveActiveFallback: options.preserveActiveFallback, operation: op }
           )
       );
     }
