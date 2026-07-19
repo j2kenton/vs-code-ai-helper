@@ -2,7 +2,7 @@
   "name": "vs-code-ai-helper",
   "displayName": "Ensemble",
   "description": "AI-assisted task planning and implementation workflow for VS Code. Uses your existing AI subscriptions (Copilot, Claude, Codex, Gemini, Antigravity, Kiro) — real usage costs apply. AI runs can modify workspace files. Provided as-is with no warranty. See README and DISCLAIMER.md.",
-  "version": "0.52.1",
+  "version": "0.53.0",
   "publisher": "j2kenton",
   "license": "MIT",
   "repository": {
@@ -689,24 +689,173 @@
     "configuration": {
       "title": "Ensemble",
       "properties": {
-        "ensemble.aiModelDefaults": { "type": "object", "default": {}, "scope": "window", "description": "Default AI models for Ensemble workflow stages." },
-        "ensemble.modelSettings": { "type": "object", "default": {}, "scope": "window", "description": "AI model and fallback settings for Ensemble workflow stages." },
-        "ensemble.warnings.unsavedSettings": { "type": "boolean", "default": true, "scope": "window", "description": "Warn before discarding unsaved AI model settings." },
-        "ensemble.warnings.largeTokenRequest": { "type": "boolean", "default": true, "scope": "window", "description": "Warn before a large AI token request." },
-        "ensemble.enabledProviders": { "type": "object", "default": {}, "scope": "window", "description": "Enabled AI providers." },
-        "ensemble.fastForwardMaxIterations": { "type": "integer", "default": 5, "minimum": 1, "maximum": 99, "scope": "window", "description": "Maximum Fast Forward iterations." },
-        "ensemble.autoAdvanceEnabled": { "type": ["string", "boolean"], "enum": ["off", "auto", "auto-fast-forward", false, true], "default": "off", "scope": "window", "description": "Automatically advance stages after reviews meet the configured score." },
-        "ensemble.completeAndMoveOnTriggersAI": { "type": ["string", "boolean"], "enum": ["off", "auto", "auto-fast-forward", false, true], "default": "auto", "scope": "window", "description": "Start the destination stage's AI action after completing a stage." },
-        "ensemble.autoAdvanceScoreThreshold": { "type": "integer", "default": 10, "minimum": 1, "maximum": 10, "scope": "window", "description": "Score required for Auto Advance." },
-        "ensemble.fastForwardStopLevel": { "type": "integer", "default": 0, "minimum": 0, "maximum": 10, "scope": "window", "description": "Fast Forward target score." },
-        "ensemble.fastForwardUseAcceptanceThreshold": { "type": "boolean", "default": false, "scope": "window", "description": "Use the review acceptance threshold for Fast Forward." },
-        "ensemble.autoReviewAfterPlan": { "type": ["string", "boolean"], "enum": ["off", "auto", "auto-fast-forward", false, true], "default": "off", "scope": "window", "description": "Review a generated plan automatically." },
-        "ensemble.autoReviewAfterImplementation": { "type": ["string", "boolean"], "enum": ["off", "auto", "auto-fast-forward", false, true], "default": "off", "scope": "window", "description": "Review completed implementation automatically." },
-        "ensemble.autoImplementAfterReview": { "type": "string", "enum": ["off", "auto"], "enumDescriptions": ["Do not start implementation automatically.", "Start implementation after Auto Advance accepts a plan review."], "default": "off", "scope": "window", "markdownDescription": "Start implementation after **Auto Advance** moves an accepted plan review to Implementation. **⚠️ Warning: this makes real code and file changes automatically. Do not use without continuous human supervision.**" },
-        "ensemble.maxImplementationIterations": { "type": "integer", "default": 200, "minimum": 1, "maximum": 200, "scope": "window", "description": "Maximum implementation tool-call rounds." },
-        "ensemble.allowDirtyWorktreeChanges": { "type": "boolean", "default": false, "scope": "window", "description": "Allow AI changes with unrelated uncommitted workspace changes." },
-        "ensemble.desktopNotifications": { "type": "boolean", "default": false, "scope": "window", "description": "Show native notifications for Ensemble attention requests." },
-        "ensemble.publishVerificationCommands": { "type": "array", "items": { "type": "string" }, "default": [], "scope": "resource", "description": "Explicit Publish verification commands." },
+        "ensemble.aiModelDefaults": {
+          "type": "object",
+          "default": {},
+          "scope": "window",
+          "description": "Default AI models for Ensemble workflow stages."
+        },
+        "ensemble.modelSettings": {
+          "type": "object",
+          "default": {},
+          "scope": "window",
+          "description": "AI model and fallback settings for Ensemble workflow stages."
+        },
+        "ensemble.warnings.unsavedSettings": {
+          "type": "boolean",
+          "default": true,
+          "scope": "window",
+          "description": "Warn before discarding unsaved AI model settings."
+        },
+        "ensemble.warnings.largeTokenRequest": {
+          "type": "boolean",
+          "default": true,
+          "scope": "window",
+          "description": "Warn before a large AI token request."
+        },
+        "ensemble.enabledProviders": {
+          "type": "object",
+          "default": {},
+          "scope": "window",
+          "description": "Enabled AI providers."
+        },
+        "ensemble.fastForwardMaxIterations": {
+          "type": "integer",
+          "default": 5,
+          "minimum": 1,
+          "maximum": 99,
+          "scope": "window",
+          "description": "Maximum Fast Forward iterations."
+        },
+        "ensemble.autoAdvanceEnabled": {
+          "type": [
+            "string",
+            "boolean"
+          ],
+          "enum": [
+            "off",
+            "auto",
+            "auto-fast-forward",
+            false,
+            true
+          ],
+          "default": "off",
+          "scope": "window",
+          "description": "Automatically advance stages after reviews meet the configured score."
+        },
+        "ensemble.completeAndMoveOnTriggersAI": {
+          "type": [
+            "string",
+            "boolean"
+          ],
+          "enum": [
+            "off",
+            "auto",
+            "auto-fast-forward",
+            false,
+            true
+          ],
+          "default": "auto",
+          "scope": "window",
+          "description": "Start the destination stage's AI action after completing a stage."
+        },
+        "ensemble.autoAdvanceScoreThreshold": {
+          "type": "integer",
+          "default": 10,
+          "minimum": 1,
+          "maximum": 10,
+          "scope": "window",
+          "description": "Score required for Auto Advance."
+        },
+        "ensemble.fastForwardStopLevel": {
+          "type": "integer",
+          "default": 0,
+          "minimum": 0,
+          "maximum": 10,
+          "scope": "window",
+          "description": "Fast Forward target score."
+        },
+        "ensemble.fastForwardUseAcceptanceThreshold": {
+          "type": "boolean",
+          "default": false,
+          "scope": "window",
+          "description": "Use the review acceptance threshold for Fast Forward."
+        },
+        "ensemble.autoReviewAfterPlan": {
+          "type": [
+            "string",
+            "boolean"
+          ],
+          "enum": [
+            "off",
+            "auto",
+            "auto-fast-forward",
+            false,
+            true
+          ],
+          "default": "off",
+          "scope": "window",
+          "description": "Review a generated plan automatically."
+        },
+        "ensemble.autoReviewAfterImplementation": {
+          "type": [
+            "string",
+            "boolean"
+          ],
+          "enum": [
+            "off",
+            "auto",
+            "auto-fast-forward",
+            false,
+            true
+          ],
+          "default": "off",
+          "scope": "window",
+          "description": "Review completed implementation automatically."
+        },
+        "ensemble.autoImplementAfterReview": {
+          "type": "string",
+          "enum": [
+            "off",
+            "auto"
+          ],
+          "enumDescriptions": [
+            "Do not start implementation automatically.",
+            "Start implementation after Auto Advance accepts a plan review."
+          ],
+          "default": "off",
+          "scope": "window",
+          "markdownDescription": "Start implementation after **Auto Advance** moves an accepted plan review to Implementation. **⚠️ Warning: this makes real code and file changes automatically. Do not use without continuous human supervision.**"
+        },
+        "ensemble.maxImplementationIterations": {
+          "type": "integer",
+          "default": 200,
+          "minimum": 1,
+          "maximum": 200,
+          "scope": "window",
+          "description": "Maximum implementation tool-call rounds."
+        },
+        "ensemble.allowDirtyWorktreeChanges": {
+          "type": "boolean",
+          "default": false,
+          "scope": "window",
+          "description": "Allow AI changes with unrelated uncommitted workspace changes."
+        },
+        "ensemble.desktopNotifications": {
+          "type": "boolean",
+          "default": false,
+          "scope": "window",
+          "description": "Show native notifications for Ensemble attention requests."
+        },
+        "ensemble.publishVerificationCommands": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "scope": "resource",
+          "description": "Explicit Publish verification commands."
+        },
         "vs-code-ai-helper.aiModelDefaults": {
           "deprecationMessage": "Use `ensemble.aiModelDefaults` instead.",
           "type": "object",
