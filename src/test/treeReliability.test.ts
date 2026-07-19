@@ -13,6 +13,9 @@
  */
 
 import * as assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { describe, it } from "node:test";
 import * as vscode from "vscode";
 
@@ -649,6 +652,79 @@ void describe("resolveTaskContext — clears stale persisted ID", () => {
       );
     } finally {
       (vscode.workspace as unknown as Record<string, unknown>).workspaceFolders = origWsFolders;
+    }
+  });
+
+  void it("accepts an external configured metadata root only when its owner is an open workspace", async () => {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { resolveTaskContext } = await import("../utils/resolveTaskContext.js");
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-external-root-"));
+    const workspaceRoot = path.join(root, "project");
+    const externalMetaRoot = path.join(root, "metadata");
+    const taskFolderPath = path.join(externalMetaRoot, "2026-01-01_task_1");
+    fs.mkdirSync(taskFolderPath, { recursive: true });
+
+    const workspaceApi = vscode.workspace as unknown as Record<string, unknown>;
+    const originalFolders = workspaceApi.workspaceFolders;
+    const originalGetConfiguration = workspaceApi.getConfiguration;
+    workspaceApi.workspaceFolders = [{ uri: vscode.Uri.file(workspaceRoot), name: "project", index: 0 }];
+    workspaceApi.getConfiguration = ((section?: string) => {
+      if (section !== "vs-code-ai-helper") return {};
+      return {
+        get: (key: string, fallback?: string): string => key === "metaResourcesPath" ? externalMetaRoot : fallback ?? "",
+        inspect: (key: string): { globalValue?: string } | undefined =>
+          key === "metaResourcesPath" ? { globalValue: externalMetaRoot } : undefined,
+      };
+    }) as unknown;
+
+    const taskForOwner = (owner: string) => ({
+      taskFolderPath,
+      canonicalId: taskFolderPath,
+      folderName: "2026-01-01_task_1",
+      sourceScopeKey: externalMetaRoot,
+      progress: {
+        currentStage: "desc" as const,
+        status: "active" as const,
+        taskFolder: "2026-01-01_task_1",
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        ownership: {
+          metaRoot: externalMetaRoot,
+          projectRoot: owner,
+          workspaceRoot: owner,
+          boundAt: new Date().toISOString(),
+          state: "resolved" as const,
+        },
+      },
+    });
+    const inventoryFor = (task: ReturnType<typeof taskForOwner>) => ({
+      getTasks: () => [task],
+      getTaskById: (id: string) => id === task.canonicalId ? task : undefined,
+      getTaskByPath: (taskPath: string) => taskPath === task.taskFolderPath ? task : undefined,
+      getVisibleTaskForSuppressedId: () => undefined,
+      getVisibleTaskForSuppressedPath: () => undefined,
+      refresh: async (): Promise<void> => {},
+      onDidChange: (_handler: () => void): { dispose: () => void } => ({ dispose(): void {} }),
+    }) as unknown as import("../state/taskInventory").TaskInventory;
+
+    try {
+      const accepted = await resolveTaskContext(
+        inventoryFor(taskForOwner(workspaceRoot)),
+        { taskFolderPath },
+        { allowPaused: true }
+      );
+      assert.ok(accepted, "a task under an explicit external metadata root should resolve for its open owner");
+
+      const rejected = await resolveTaskContext(
+        inventoryFor(taskForOwner(path.join(root, "unopened-project"))),
+        { taskFolderPath },
+        { allowPaused: true }
+      );
+      assert.equal(rejected, undefined, "an external task with no open owning workspace must fail closed");
+    } finally {
+      workspaceApi.workspaceFolders = originalFolders;
+      workspaceApi.getConfiguration = originalGetConfiguration;
+      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 });

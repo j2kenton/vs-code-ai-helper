@@ -66,7 +66,22 @@ function makeTaskFolder(name: string): string {
 
 const FOCUS_COMMAND = `${ChatViewProvider.viewType}.focus`;
 
+function chatWebviewHtml(): string {
+  const provider = new ChatViewProvider(makeMemento());
+  return (provider as unknown as { html(): string }).html();
+}
+
 void describe("ChatViewProvider.ask() task-switch behavior", () => {
+  void it("uses VS Code theme tokens and exposes an accessible in-view error state", () => {
+    const html = chatWebviewHtml();
+
+    assert.match(html, /background-color: var\(--vscode-editor-background\)/);
+    assert.match(html, /color: var\(--vscode-inputValidation-errorForeground\)/);
+    assert.match(html, /id="error" role="alert"/);
+    assert.match(html, /errorMessage/);
+    assert.match(html, /prefers-reduced-motion/);
+  });
+
   void it("writes the question to its own task but does not refocus/retarget the view when a different task is current", async () => {
     const rf = installReadFileBridge();
     const cmds = installExecuteCommandCapture();

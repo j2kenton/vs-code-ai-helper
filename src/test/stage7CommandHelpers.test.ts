@@ -1,7 +1,6 @@
 import * as assert from "node:assert/strict";
 import * as cp from "node:child_process";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import { test } from "node:test";
 import * as vscode from "vscode";
@@ -21,23 +20,8 @@ function git(cwd: string, args: string[]): void {
   cp.execFileSync("git", args, { cwd, stdio: "ignore", windowsHide: true });
 }
 
-function writableTempDir(): string {
-  for (const candidate of [process.env["TMPDIR"], "/tmp", os.tmpdir()]) {
-    if (!candidate) {
-      continue;
-    }
-    try {
-      fs.accessSync(candidate, fs.constants.W_OK);
-      return candidate;
-    } catch {
-      // Try the next platform-specific fallback.
-    }
-  }
-  return os.tmpdir();
-}
-
 function makeGitFixture(): { repoRoot: string; workspaceRoot: string; taskRoot: string } {
-  const repoRoot = fs.mkdtempSync(path.join(writableTempDir(), "ensemble-stage-scope-"));
+  const repoRoot = fs.mkdtempSync(path.join(process.cwd(), ".ensemble-stage-scope-"));
   const workspaceRoot = path.join(repoRoot, "workspace");
   const taskRoot = path.join(workspaceRoot, "plans", "2026-07-13_task_2");
   fs.mkdirSync(taskRoot, { recursive: true });

@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import * as fs from "fs";
 import * as path from "path";
-import { TaskInventory } from "../state/taskInventory";
+import type { TaskInventory } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import {
   DEFAULT_TASK_ROOT,
@@ -12,12 +12,155 @@ import {
 } from "./taskRoot";
 import { NotificationRouter } from "./notificationRouter";
 import { ensureAutomaticMetaGitIgnore } from "../commands/toggleMetaResourcesGitIgnore";
+import { TaskProgress } from "../types/taskProgress";
+import { readTaskProgress, writeTaskProgress } from "./taskProgressUtils";
 
 const CONFIG_SECTION = "vs-code-ai-helper";
 const META_RESOURCES_PATH_KEY = "metaResourcesPath";
 const DECLINED_KEY = "ensemble.metaMigration.declined";
 const LEGACY_ACTIVE_ROOT_KEY = "ensemble.metaMigration.legacyActiveRoot";
 const LEGACY_ROOTS = [".helper/plans", "plans"];
+const MIGRATION_JOURNAL_FILENAME = ".ensemble-migration.json";
+
+interface MigrationJournal { from: string; to: string; at: string; }
+
+function samePath(a: string, b: string): boolean {
+  const left = path.resolve(a);
+  const right = path.resolve(b);
+  return process.platform === "win32" ? left.toLowerCase() === right.toLowerCase() : left === right;
+}
+
+function isUnder(child: string, parent: string): boolean {
+  const normalizedChild = path.resolve(child);
+  const normalizedParent = path.resolve(parent);
+  const left = process.platform === "win32" ? normalizedChild.toLowerCase() : normalizedChild;
+  const right = process.platform === "win32" ? normalizedParent.toLowerCase() : normalizedParent;
+  return left === right || left.startsWith(right + path.sep);
+}
+
+function readJournal(root: string): MigrationJournal | undefined {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(path.join(root, MIGRATION_JOURNAL_FILENAME), "utf8")) as Partial<MigrationJournal>;
+    return typeof parsed.from === "string" && typeof parsed.to === "string" && typeof parsed.at === "string"
+      ? { from: parsed.from, to: parsed.to, at: parsed.at }
+      : undefined;
+  } catch (error) {
+    // A journal is the authorization record for custom-root repairs. Do not
+    // treat corruption as proof, but leave an actionable diagnostic instead
+    // of making it indistinguishable from an absent journal.
+    if (fs.existsSync(path.join(root, MIGRATION_JOURNAL_FILENAME))) {
+      console.warn(`Could not read Ensemble migration journal in ${root}; ownership will not be repaired automatically.`, error);
+    }
+    return undefined;
+  }
+}
+
+/**
+ * Repair only provenance-backed ownership after a legacy root was moved.
+ *
+ * The migration journal is phase-one evidence: it is written before the
+ * atomic root rename and travels with that rename. Phase two rewrites every
+ * applicable task ownership record and removes the journal only after a pass
+ * with no failures. Therefore a crash before the rename leaves no moved
+ * state, while a crash after it leaves deterministic, on-disk authorization
+ * for this lazy repair. A missing old root alone is never authorization.
+ */
+export async function repairLegacyOwnership(
+  taskFolderPath: string,
+  progress: TaskProgress,
+  resolvedTaskRootPath: string
+): Promise<{ repaired: boolean; progress: TaskProgress }> {
+  const ownership = progress.ownership;
+  if (!ownership?.metaRoot) return { repaired: false, progress };
+  const oldRoot = path.resolve(ownership.metaRoot);
+  const newRoot = path.resolve(resolvedTaskRootPath);
+  // A repair is specifically for a task that moved from its recorded root
+  // into the currently resolved root. Do not bless a task which is still in
+  // its old location, or an arbitrary direct child passed by a caller.
+  if (isUnder(taskFolderPath, oldRoot) || !isUnder(taskFolderPath, newRoot)) {
+    return { repaired: false, progress };
+  }
+  const legacyByLocation = LEGACY_ROOTS.some((legacy) =>
+    samePath(ownership.metaRoot, path.join(ownership.projectRoot ?? ownership.workspaceRoot ?? "", legacy))
+  );
+  const journal = readJournal(resolvedTaskRootPath);
+  const journalMatches = !!journal && samePath(journal.from, ownership.metaRoot) && samePath(journal.to, resolvedTaskRootPath);
+  if (!legacyByLocation && !journalMatches) return { repaired: false, progress };
+  // The root candidate can have different casing from a task URI on
+  // Windows. This is the same direct-parent check used to make nested roots
+  // unambiguous, so it must follow the platform-aware comparison rule too.
+  if (!samePath(path.dirname(path.resolve(taskFolderPath)), newRoot)) {
+    return { repaired: false, progress };
+  }
+  const rewriteRootedPath = (value: string | undefined): string | undefined =>
+    value && isUnder(value, oldRoot) ? path.join(resolvedTaskRootPath, path.relative(oldRoot, value)) : value;
+  const repaired: TaskProgress = {
+    ...progress,
+    ownership: {
+      ...ownership,
+      metaRoot: resolvedTaskRootPath,
+      projectRoot: rewriteRootedPath(ownership.projectRoot) ?? ownership.projectRoot,
+      workspaceRoot: rewriteRootedPath(ownership.workspaceRoot),
+    },
+  };
+  await writeTaskProgress(vscode.Uri.file(taskFolderPath), repaired);
+  await removeJournalIfOwnershipRewriteIsComplete(resolvedTaskRootPath);
+  return { repaired: true, progress: repaired };
+}
+
+/**
+ * A lazy repair can be the final phase-two rewrite after a crash or a failed
+ * pass. Remove the provenance journal only when every direct task folder now
+ * has a readable progress record rooted at this metadata directory.
+ */
+async function removeJournalIfOwnershipRewriteIsComplete(target: string): Promise<void> {
+  if (!fs.existsSync(path.join(target, MIGRATION_JOURNAL_FILENAME))) return;
+  try {
+    for (const entry of fs.readdirSync(target, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const progress = await readTaskProgress(vscode.Uri.file(path.join(target, entry.name)));
+      if (!progress || !samePath(progress.ownership?.metaRoot ?? "", target)) return;
+    }
+    fs.unlinkSync(path.join(target, MIGRATION_JOURNAL_FILENAME));
+  } catch (error) {
+    // Preserve recovery evidence if the completeness check itself cannot
+    // finish. A later migration or lazy repair retries the same safe check.
+    console.error(`Could not finalize Ensemble ownership migration in ${target}`, error);
+  }
+}
+
+/**
+ * Phase two of the journal-backed move. The journal is removed only after
+ * every task whose recorded root is stale has been repaired; tasks already
+ * rooted at `target` are not rewrites and do not keep recovery state alive.
+ */
+export async function finishMigrationOwnershipRewrite(target: string): Promise<boolean> {
+  let completed = true;
+  for (const entry of fs.readdirSync(target, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const taskFolder = path.join(target, entry.name);
+    const progress = await readTaskProgress(vscode.Uri.file(taskFolder));
+    if (!progress) {
+      completed = false;
+      console.error(`Could not read moved task ownership for ${taskFolder}`);
+      continue;
+    }
+    try {
+      const result = await repairLegacyOwnership(taskFolder, progress, target);
+      if (!result.repaired && progress.ownership?.metaRoot && !samePath(progress.ownership.metaRoot, target)) {
+        completed = false;
+        console.error(`Could not verify moved task ownership for ${taskFolder}`);
+      }
+    } catch (error) {
+      completed = false;
+      console.error(`Could not repair moved task ownership for ${taskFolder}`, error);
+    }
+  }
+  if (completed) {
+    try { fs.unlinkSync(path.join(target, MIGRATION_JOURNAL_FILENAME)); } catch { /* no journal */ }
+  }
+  return completed;
+}
 
 /** A folder counts as holding task state when any direct child has task.md. */
 function hasTaskState(root: string): boolean {
@@ -215,6 +358,11 @@ export async function maybeOfferMetaResourcesMigration(
       }
       fs.rmdirSync(target);
     }
+    // The journal moves with the directory, allowing a later activation to
+    // prove ownership before repairing a crash-interrupted phase two.
+    fs.writeFileSync(path.join(legacyRoot, MIGRATION_JOURNAL_FILENAME), JSON.stringify({
+      from: path.resolve(legacyRoot), to: path.resolve(target), at: new Date().toISOString(),
+    }));
     // Atomic on the same volume: either the whole tree moves or nothing does.
     fs.renameSync(legacyRoot, target);
   } catch (error) {
@@ -226,6 +374,8 @@ export async function maybeOfferMetaResourcesMigration(
     await keepLegacyRootActive(context, workspaceRoot, legacyRoot);
     return;
   }
+
+  await finishMigrationOwnershipRewrite(target);
 
   await clearMetaResourcesPathSetting();
   await context.workspaceState.update(DECLINED_KEY, undefined);

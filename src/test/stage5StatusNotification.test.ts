@@ -1,4 +1,7 @@
 import * as assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { describe, it } from "node:test";
 import * as vscode from "vscode";
 
@@ -65,6 +68,7 @@ type WindowStub = {
   showInputBox: typeof vscode.window.showInputBox;
   showTextDocument: typeof vscode.window.showTextDocument;
   showErrorMessage: typeof vscode.window.showErrorMessage;
+  showInformationMessage: typeof vscode.window.showInformationMessage;
   showWarningMessage: typeof vscode.window.showWarningMessage;
 };
 
@@ -106,6 +110,42 @@ function makeInventoryStub(
     ...overrides,
   };
   return stub as unknown as TaskInventory;
+}
+
+/**
+ * Task progress uses the filesystem-backed atomic writer rather than the VS
+ * Code workspace filesystem.  Creation tests otherwise try to write their
+ * synthetic /workspace path on the host machine before they reach the
+ * behaviour under test.
+ */
+function isolateTaskCreationFilesystem(writtenFiles?: Map<string, string>): { restore: () => void } {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const atomicModule = require("../state/writeAtomic") as {
+    writeAtomic: (uri: vscode.Uri, content: string) => Promise<void>;
+  };
+  const original = atomicModule.writeAtomic;
+  atomicModule.writeAtomic = (uri: vscode.Uri, content: string): Promise<void> => {
+    writtenFiles?.set(uri.path, content);
+    return Promise.resolve();
+  };
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const stateStore = require("../state/taskStateStore") as {
+    withMetaRootLock: <T>(root: string, operation: () => Promise<T>) => Promise<T>;
+    withTaskLock: <T>(taskFolderPath: string, operation: () => Promise<T>) => Promise<T>;
+  };
+  const originalLock = stateStore.withMetaRootLock;
+  stateStore.withMetaRootLock = <T>(_root: string, operation: () => Promise<T>): Promise<T> => operation();
+  const originalTaskLock = stateStore.withTaskLock;
+  stateStore.withTaskLock = <T>(_taskFolderPath: string, operation: () => Promise<T>): Promise<T> => operation();
+  return {
+    restore: (): void => {
+      atomicModule.writeAtomic = original;
+      stateStore.withMetaRootLock = originalLock;
+      stateStore.withTaskLock = originalTaskLock;
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -452,11 +492,18 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
 
       const inventory = makeInventoryStub();
       const store = makeStoreStub();
+      const creationFilesystem = isolateTaskCreationFilesystem(writtenFiles);
 
       try {
         await startNewTask(inventory, vscode.Uri.file("/extension"), store);
         assert.strictEqual(dirCreated, true);
+        const progressDocument = [...writtenFiles.entries()]
+          .find(([file]) => file.endsWith("task-progress.json"))?.[1];
+        assert.ok(progressDocument, "task progress should be persisted");
+        const progress = JSON.parse(progressDocument) as { status?: string };
+        assert.strictEqual(progress.status, "paused", "new tasks must never take over the active task");
       } finally {
+        creationFilesystem.restore();
         win.showErrorMessage = origShowErrorMessage;
         win.showWarningMessage = origShowWarningMessage;
         workspace.workspaceFolders = origWorkspaceFolders;
@@ -464,6 +511,191 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
         workspace.fs.writeFile = origWriteFile;
         workspace.openTextDocument = origOpenTextDocument;
         win.showTextDocument = origShowTextDocument;
+        deactivateNotificationRouter();
+      }
+    });
+
+    void it("offers Resume for the newly created paused task using its explicit folder path", async () => {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { startNewTask } = await import("../commands/startNewTask.js");
+      const surface: StatusSurface = { addEntry(): void {} };
+      initNotificationRouter(surface);
+
+      const win = getWindowStub();
+      const workspace = getWorkspaceStub();
+      const commandApi = vscode.commands as unknown as {
+        executeCommand: (command: string, ...args: unknown[]) => Thenable<unknown>;
+      };
+      const origWorkspaceFolders = workspace.workspaceFolders;
+      const origCreateDirectory = workspace.fs.createDirectory;
+      const origWriteFile = workspace.fs.writeFile;
+      const origOpenTextDocument = workspace.openTextDocument;
+      const origShowTextDocument = win.showTextDocument;
+      const origShowErrorMessage = win.showErrorMessage;
+      const origShowInformationMessage = win.showInformationMessage;
+      const origExecuteCommand = commandApi.executeCommand;
+      const writtenFiles = new Map<string, string>();
+      const commands: Array<{ command: string; args: unknown[] }> = [];
+      workspace.workspaceFolders = [{ uri: vscode.Uri.file("/workspace"), name: "workspace", index: 0 }];
+      workspace.fs.createDirectory = (): Promise<void> => Promise.resolve();
+      workspace.fs.writeFile = (uri: vscode.Uri, bytes: Uint8Array): Promise<void> => {
+        writtenFiles.set(uri.path, new TextDecoder().decode(bytes));
+        return Promise.resolve();
+      };
+      workspace.openTextDocument = (): Promise<vscode.TextDocument> => Promise.resolve({} as vscode.TextDocument);
+      win.showTextDocument = (): Promise<vscode.TextEditor> => Promise.resolve({} as vscode.TextEditor);
+      win.showErrorMessage = (): Thenable<string | undefined> => Promise.resolve(undefined);
+      win.showInformationMessage = (): Thenable<string | undefined> => Promise.resolve("Resume");
+      commandApi.executeCommand = (command: string, ...args: unknown[]): Thenable<unknown> => {
+        commands.push({ command, args });
+        return Promise.resolve(undefined);
+      };
+      const creationFilesystem = isolateTaskCreationFilesystem(writtenFiles);
+
+      try {
+        await startNewTask(makeInventoryStub(), vscode.Uri.file("/extension"), makeStoreStub());
+        await Promise.resolve();
+        await Promise.resolve();
+        const progressDocument = [...writtenFiles.entries()]
+          .find(([file]) => file.endsWith("task-progress.json"))?.[1];
+        assert.ok(progressDocument, "creation should persist progress for the new task");
+        const progress = JSON.parse(progressDocument) as { taskFolder: string; ownership?: { metaRoot?: string } };
+        const taskFolderPath = path.join(
+          workspace.workspaceFolders?.[0]?.uri.fsPath ?? "",
+          ".ensemble",
+          progress.taskFolder
+        );
+        assert.deepEqual(commands, [{
+          command: "vs-code-ai-helper.resumeTask",
+          args: [{ taskFolderPath }],
+        }]);
+      } finally {
+        creationFilesystem.restore();
+        commandApi.executeCommand = origExecuteCommand;
+        win.showInformationMessage = origShowInformationMessage;
+        win.showErrorMessage = origShowErrorMessage;
+        workspace.workspaceFolders = origWorkspaceFolders;
+        workspace.fs.createDirectory = origCreateDirectory;
+        workspace.fs.writeFile = origWriteFile;
+        workspace.openTextDocument = origOpenTextDocument;
+        win.showTextDocument = origShowTextDocument;
+        deactivateNotificationRouter();
+      }
+    });
+
+    void it("recovers a completed creation sentinel into the paused state", async () => {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { recoverTaskCreations } = await import("../commands/startNewTask.js");
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-create-recovery-"));
+      const taskName = "2026-01-01_task_1";
+      const creatingProgress = JSON.stringify({
+        taskFolder: "2026-01-01_task_1",
+        currentStage: "desc",
+        status: "creating",
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
+      const workspaceFs = vscode.workspace.fs as unknown as Record<string, unknown>;
+      const originalReadDirectory = workspaceFs.readDirectory;
+      const originalReadFile = workspaceFs.readFile;
+      const originalStat = workspaceFs.stat;
+      const writes = new Map<string, string>();
+      const creationFilesystem = isolateTaskCreationFilesystem(writes);
+      workspaceFs.readDirectory = (): Promise<[string, vscode.FileType][]> =>
+        Promise.resolve([[taskName, vscode.FileType.Directory]]);
+      workspaceFs.readFile = (): Promise<Uint8Array> =>
+        Promise.resolve(new TextEncoder().encode(creatingProgress));
+      workspaceFs.stat = (): Promise<vscode.FileStat> =>
+        Promise.resolve({ type: vscode.FileType.File, ctime: 0, mtime: 0, size: 0 });
+      try {
+        await recoverTaskCreations(root);
+        const recoveredDocument = [...writes.entries()]
+          .find(([file]) => file.endsWith("task-progress.json"))?.[1];
+        assert.ok(recoveredDocument, "recovery should persist the promoted progress record");
+        const recovered = JSON.parse(recoveredDocument) as { status?: string };
+        assert.equal(recovered.status, "paused");
+      } finally {
+        creationFilesystem.restore();
+        workspaceFs.readDirectory = originalReadDirectory;
+        workspaceFs.readFile = originalReadFile;
+        workspaceFs.stat = originalStat;
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    void it("does not pause an active review task when a new task is created", async () => {
+      // This is the reported race in production terms: review startup claims
+      // an already-active task after another task was created. Before the
+      // paused-at-creation change, creation activated itself and paused the
+      // original task, making this claim throw.
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { startNewTask } = await import("../commands/startNewTask.js");
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { claimReviewAttempt } = await import("../commands/reviewActions.js");
+
+      const surface: StatusSurface = { addEntry(): void {} };
+      initNotificationRouter(surface);
+      const win = getWindowStub();
+      const workspace = getWorkspaceStub();
+      const origWorkspaceFolders = workspace.workspaceFolders;
+      const origCreateDirectory = workspace.fs.createDirectory;
+      const origWriteFile = workspace.fs.writeFile;
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      const origReadFile = (workspace.fs as typeof vscode.workspace.fs).readFile;
+      const origOpenTextDocument = workspace.openTextDocument;
+      const origShowTextDocument = win.showTextDocument;
+      const origShowErrorMessage = win.showErrorMessage;
+      const origShowWarningMessage = win.showWarningMessage;
+      const writtenFiles = new Map<string, string>();
+      const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-review-startup-"));
+      const oldFolder = vscode.Uri.file(path.join(tempRoot, ".ensemble", "review-in-progress"));
+      const oldProgressUri = vscode.Uri.joinPath(oldFolder, "task-progress.json");
+      writtenFiles.set(oldProgressUri.path, JSON.stringify({
+        taskFolder: "review-in-progress",
+        currentStage: "plan",
+        status: "active",
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      }));
+      workspace.workspaceFolders = [{ uri: vscode.Uri.file(tempRoot), name: "workspace", index: 0 }];
+      workspace.fs.createDirectory = (): Promise<void> => Promise.resolve();
+      workspace.fs.writeFile = (uri: vscode.Uri, bytes: Uint8Array): Promise<void> => {
+        writtenFiles.set(uri.path, new TextDecoder().decode(bytes));
+        return Promise.resolve();
+      };
+      (workspace.fs as typeof vscode.workspace.fs).readFile = (uri: vscode.Uri): Promise<Uint8Array> => {
+        const content = writtenFiles.get(uri.path);
+        return content === undefined
+          ? Promise.reject(new Error(`missing ${uri.path}`))
+          : Promise.resolve(new TextEncoder().encode(content));
+      };
+      workspace.openTextDocument = (): Promise<vscode.TextDocument> => Promise.resolve({} as vscode.TextDocument);
+      win.showTextDocument = (): Promise<vscode.TextEditor> => Promise.resolve({} as vscode.TextEditor);
+      win.showErrorMessage = (): Thenable<string | undefined> => Promise.resolve(undefined);
+      win.showWarningMessage = (): Thenable<string | undefined> => Promise.resolve(undefined);
+      const creationFilesystem = isolateTaskCreationFilesystem(writtenFiles);
+
+      try {
+        await startNewTask(makeInventoryStub(), vscode.Uri.file("/extension"), makeStoreStub(oldFolder.fsPath));
+        const claim = await claimReviewAttempt(oldFolder, "review-attempt-after-new-task");
+        assert.equal(claim?.status, "active");
+        assert.equal(claim?.reviewAttemptId, "review-attempt-after-new-task");
+        assert.equal(
+          (JSON.parse(writtenFiles.get(oldProgressUri.path) ?? "{}") as { status?: string }).status,
+          "active",
+          "creating a task must not write a paused state to the task whose review is starting"
+        );
+      } finally {
+        creationFilesystem.restore();
+        win.showErrorMessage = origShowErrorMessage;
+        win.showWarningMessage = origShowWarningMessage;
+        workspace.workspaceFolders = origWorkspaceFolders;
+        workspace.fs.createDirectory = origCreateDirectory;
+        workspace.fs.writeFile = origWriteFile;
+        (workspace.fs as typeof vscode.workspace.fs).readFile = origReadFile;
+        workspace.openTextDocument = origOpenTextDocument;
+        win.showTextDocument = origShowTextDocument;
+        fs.rmSync(tempRoot, { recursive: true, force: true });
         deactivateNotificationRouter();
       }
     });
@@ -523,6 +755,7 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
       const inventory = makeInventoryStub();
       const store = makeStoreStub();
       const context = { workspaceState: new Map() } as unknown as vscode.ExtensionContext;
+      const creationFilesystem = isolateTaskCreationFilesystem();
 
       try {
         await startNewTask(inventory, vscode.Uri.file("/extension"), store, context);
@@ -542,6 +775,7 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
           "the maintenance must receive the workspace folder the task was created in"
         );
       } finally {
+        creationFilesystem.restore();
         gitIgnoreModule.ensureAutomaticMetaGitIgnore = origEnsure;
         win.showErrorMessage = origShowErrorMessage;
         win.showWarningMessage = origShowWarningMessage;
@@ -611,6 +845,7 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
       const inventory = makeInventoryStub();
       const store = makeStoreStub();
       const context = { workspaceState: new Map() } as unknown as vscode.ExtensionContext;
+      const creationFilesystem = isolateTaskCreationFilesystem();
 
       try {
         await startNewTask(inventory, vscode.Uri.file("/extension"), store, context);
@@ -625,6 +860,7 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
           "the maintenance must target the folder the user selected, not workspaceFolders[0]"
         );
       } finally {
+        creationFilesystem.restore();
         gitIgnoreModule.ensureAutomaticMetaGitIgnore = origEnsure;
         win.showQuickPick = origShowQuickPick;
         win.showErrorMessage = origShowErrorMessage;

@@ -1,7 +1,14 @@
 import * as assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import * as vscode from "vscode";
-import { migrateSettingsScope, targetFor } from "../config/settings";
+import {
+  AutoImplementConfirmationController,
+  getAutoImplementAfterReviewMode,
+  resetAutoImplementConfirmationForTests,
+  migrateSettingsNamespace,
+  migrateSettingsScope,
+  targetFor,
+} from "../config/settings";
 
 /**
  * Fake WorkspaceConfiguration backed by two plain maps (workspace/global),
@@ -79,8 +86,117 @@ void describe("targetFor", () => {
   });
 
   void it("routes every other known key to Global", () => {
-    for (const key of ["modelSettings", "enabledProviders", "autoAdvanceEnabled", "desktopNotifications"]) {
+    for (const key of ["modelSettings", "enabledProviders", "autoAdvanceEnabled", "autoImplementAfterReview", "desktopNotifications"]) {
       assert.strictEqual(targetFor(key), vscode.ConfigurationTarget.Global, key);
+    }
+  });
+});
+
+void describe("migrateSettingsNamespace", () => {
+  void it("copies explicit legacy values once without allowing an active schema default to mask them", async () => {
+    const workspace = vscode.workspace as unknown as Record<string, unknown>;
+    const original = workspace.getConfiguration;
+    const legacyGlobal: Record<string, unknown> = { autoAdvanceEnabled: "auto" };
+    const ensembleGlobal: Record<string, unknown> = {};
+    const state = new Map<string, unknown>();
+    workspace.getConfiguration = (section: string) => {
+      const values = section === "ensemble" ? ensembleGlobal : legacyGlobal;
+      return {
+        inspect: (key: string) => ({ key, globalValue: values[key], workspaceValue: undefined }),
+        update: (key: string, value: unknown): Promise<void> => {
+          if (value === undefined) delete values[key]; else values[key] = value;
+          return Promise.resolve();
+        },
+      };
+    };
+    const context = {
+      globalState: {
+        get: <T>(key: string, fallback?: T): T => (state.has(key) ? state.get(key) as T : fallback as T),
+        update: (key: string, value: unknown): Promise<void> => { state.set(key, value); return Promise.resolve(); },
+      },
+    } as unknown as vscode.ExtensionContext;
+    try {
+      await migrateSettingsNamespace(context);
+      assert.equal(ensembleGlobal.autoAdvanceEnabled, "auto");
+      ensembleGlobal.autoAdvanceEnabled = "off";
+      legacyGlobal.autoAdvanceEnabled = "auto-fast-forward";
+      await migrateSettingsNamespace(context);
+      assert.equal(ensembleGlobal.autoAdvanceEnabled, "off", "versioned migration is idempotent");
+    } finally {
+      workspace.getConfiguration = original;
+    }
+  });
+
+  void it("copies global, workspace, and each folder override to the matching Ensemble scope", async () => {
+    const workspace = vscode.workspace as unknown as Record<string, unknown>;
+    const originalConfiguration = workspace.getConfiguration;
+    const originalFolders = workspace.workspaceFolders;
+    const first = vscode.Uri.file("/workspace-one");
+    const second = vscode.Uri.file("/workspace-two");
+    const legacy: {
+      global: Record<string, unknown>;
+      workspace: Record<string, unknown>;
+      folders: Map<string, Record<string, unknown>>;
+    } = {
+      global: { autoAdvanceEnabled: "auto" },
+      workspace: { autoReviewAfterPlan: "auto" },
+      folders: new Map<string, Record<string, unknown>>([
+        [first.toString(), { enabledProviders: { "codex-cli": true } }],
+        [second.toString(), { enabledProviders: { "claude-cli": true } }],
+      ]),
+    };
+    const ensemble: {
+      global: Record<string, unknown>;
+      workspace: Record<string, unknown>;
+      folders: Map<string, Record<string, unknown>>;
+    } = {
+      global: {} as Record<string, unknown>,
+      workspace: {} as Record<string, unknown>,
+      folders: new Map<string, Record<string, unknown>>([
+        [first.toString(), {}], [second.toString(), {}],
+      ]),
+    };
+    workspace.workspaceFolders = [
+      { uri: first, name: "one", index: 0 },
+      { uri: second, name: "two", index: 1 },
+    ];
+    workspace.getConfiguration = (section: string, resource?: vscode.Uri) => {
+      const store = section === "ensemble" ? ensemble : legacy;
+      const folder = resource ? store.folders.get(resource.toString()) : undefined;
+      return {
+        inspect: (key: string) => ({
+          key,
+          globalValue: store.global[key],
+          workspaceValue: store.workspace[key],
+          workspaceFolderValue: folder?.[key],
+        }),
+        update: (key: string, value: unknown, target: vscode.ConfigurationTarget): Promise<void> => {
+          const destination = target === vscode.ConfigurationTarget.Global
+            ? store.global
+            : target === vscode.ConfigurationTarget.Workspace
+              ? store.workspace
+              : store.folders.get(resource!.toString())!;
+          if (value === undefined) delete destination[key]; else destination[key] = value;
+          return Promise.resolve();
+        },
+      };
+    };
+    const state = new Map<string, unknown>();
+    const context = {
+      globalState: {
+        get: <T>(key: string, fallback?: T): T => (state.has(key) ? state.get(key) as T : fallback as T),
+        update: (key: string, value: unknown): Promise<void> => { state.set(key, value); return Promise.resolve(); },
+      },
+    } as unknown as vscode.ExtensionContext;
+    try {
+      await migrateSettingsNamespace(context);
+      assert.equal(ensemble.global.autoAdvanceEnabled, "auto");
+      assert.equal(ensemble.workspace.autoReviewAfterPlan, "auto");
+      assert.deepEqual(ensemble.folders.get(first.toString())?.enabledProviders, { "codex-cli": true });
+      assert.deepEqual(ensemble.folders.get(second.toString())?.enabledProviders, { "claude-cli": true });
+    } finally {
+      workspace.getConfiguration = originalConfiguration;
+      workspace.workspaceFolders = originalFolders;
     }
   });
 });
@@ -171,6 +287,178 @@ void describe("migrateSettingsScope", () => {
     } finally {
       warning.restore();
       stub.restore();
+    }
+  });
+});
+
+void describe("automatic implementation confirmation gate", () => {
+  void it("treats an unconfirmed auto value as off and clears it when supervision is declined", async () => {
+    const workspace = vscode.workspace as unknown as Record<string, unknown>;
+    const originalConfiguration = workspace.getConfiguration;
+    const originalWarning = vscode.window.showWarningMessage;
+    let setting: unknown = "auto";
+    let prompts = 0;
+    workspace.getConfiguration = () => ({
+      get: (_key: string, fallback?: unknown): unknown => setting ?? fallback,
+      inspect: () => ({ globalValue: setting, workspaceValue: undefined }),
+      update: (_key: string, value: unknown): Promise<void> => {
+        setting = value;
+        return Promise.resolve();
+      },
+    });
+    (vscode.window as unknown as { showWarningMessage: unknown }).showWarningMessage = (): Promise<undefined> => {
+      prompts += 1;
+      return Promise.resolve(undefined);
+    };
+    const state = new Map<string, unknown>();
+    const context = {
+      globalState: {
+        get: <T>(_key: string, fallback?: T): T => fallback as T,
+        update: (key: string, value: unknown): Promise<void> => { state.set(key, value); return Promise.resolve(); },
+      },
+    } as unknown as vscode.ExtensionContext;
+    const controller = new AutoImplementConfirmationController(context);
+    try {
+      assert.equal(getAutoImplementAfterReviewMode(), "off", "raw auto must not arm implementation before confirmation");
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(prompts, 1);
+      assert.equal(setting, undefined, "declining clears only the enabled scope");
+      assert.equal(getAutoImplementAfterReviewMode(), "off");
+    } finally {
+      controller.dispose();
+      resetAutoImplementConfirmationForTests();
+      workspace.getConfiguration = originalConfiguration;
+      (vscode.window as unknown as { showWarningMessage: unknown }).showWarningMessage = originalWarning;
+    }
+  });
+
+  void it("arms the gate only when the setting is auto and this machine has confirmed it", () => {
+    const workspace = vscode.workspace as unknown as Record<string, unknown>;
+    const originalConfiguration = workspace.getConfiguration;
+    workspace.getConfiguration = () => ({
+      get: (): unknown => "auto",
+      inspect: () => ({ globalValue: "auto", workspaceValue: undefined }),
+      update: (): Promise<void> => Promise.resolve(),
+    });
+    const context = {
+      globalState: {
+        get: <T>(_key: string, _fallback?: T): T => true as unknown as T,
+        update: (): Promise<void> => Promise.resolve(),
+      },
+    } as unknown as vscode.ExtensionContext;
+    const controller = new AutoImplementConfirmationController(context);
+    try {
+      assert.equal(getAutoImplementAfterReviewMode(), "auto");
+    } finally {
+      controller.dispose();
+      resetAutoImplementConfirmationForTests();
+      workspace.getConfiguration = originalConfiguration;
+    }
+  });
+
+  void it("serializes changes made while a confirmation modal is open without losing the later scope", async () => {
+    const workspace = vscode.workspace as unknown as Record<string, unknown>;
+    const originalConfiguration = workspace.getConfiguration;
+    const originalWarning = vscode.window.showWarningMessage;
+    const global: Record<string, unknown> = {};
+    const workspaceValues: Record<string, unknown> = {};
+    workspace.getConfiguration = () => ({
+      get: (_key: string, fallback?: unknown): unknown => workspaceValues.autoImplementAfterReview ?? global.autoImplementAfterReview ?? fallback,
+      inspect: () => ({
+        globalValue: global.autoImplementAfterReview,
+        workspaceValue: workspaceValues.autoImplementAfterReview,
+      }),
+      update: (_key: string, value: unknown, target: vscode.ConfigurationTarget): Promise<void> => {
+        const destination = target === vscode.ConfigurationTarget.Global ? global : workspaceValues;
+        if (value === undefined) delete destination.autoImplementAfterReview;
+        else destination.autoImplementAfterReview = value;
+        return Promise.resolve();
+      },
+    });
+    let firstPrompt: (() => void) | undefined;
+    let promptCount = 0;
+    (vscode.window as unknown as { showWarningMessage: unknown }).showWarningMessage = (): Promise<undefined> => {
+      promptCount += 1;
+      if (promptCount > 1) return Promise.resolve(undefined);
+      return new Promise((resolve) => { firstPrompt = () => resolve(undefined); });
+    };
+    const context = {
+      globalState: { get: <T>(_key: string, fallback?: T): T => fallback as T, update: (): Promise<void> => Promise.resolve() },
+    } as unknown as vscode.ExtensionContext;
+    const controller = new AutoImplementConfirmationController(context);
+    const changes = (vscode.workspace as unknown as {
+      _configurationChanges: { fire(value: { affectsConfiguration(section: string): boolean }): void };
+    })._configurationChanges;
+    try {
+      await controller.whenIdle();
+      global.autoImplementAfterReview = "auto";
+      changes.fire({ affectsConfiguration: () => true });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.ok(firstPrompt, "the global change should open the first modal");
+
+      // This event occurs while the first modal is open. It must be handled
+      // after the global cancellation, not absorbed by that cancellation's
+      // post-write snapshot.
+      workspaceValues.autoImplementAfterReview = "auto";
+      changes.fire({ affectsConfiguration: () => true });
+      firstPrompt?.();
+      await controller.whenIdle();
+
+      assert.equal(promptCount, 2);
+      assert.equal(global.autoImplementAfterReview, undefined);
+      assert.equal(workspaceValues.autoImplementAfterReview, undefined);
+    } finally {
+      controller.dispose();
+      resetAutoImplementConfirmationForTests();
+      workspace.getConfiguration = originalConfiguration;
+      (vscode.window as unknown as { showWarningMessage: unknown }).showWarningMessage = originalWarning;
+    }
+  });
+
+  void it("cancels a folder-scoped auto value without clearing another scope", async () => {
+    const workspace = vscode.workspace as unknown as Record<string, unknown>;
+    const originalConfiguration = workspace.getConfiguration;
+    const originalFolders = workspace.workspaceFolders;
+    const originalWarning = vscode.window.showWarningMessage;
+    const folder = vscode.Uri.file("/workspace-folder-scope");
+    const global: Record<string, unknown> = { autoImplementAfterReview: "off" };
+    const folderValues: Record<string, unknown> = {};
+    workspace.workspaceFolders = [{ uri: folder, name: "folder", index: 0 }];
+    workspace.getConfiguration = (_section: string, resource?: vscode.Uri) => ({
+      get: (_key: string, fallback?: unknown): unknown => (resource ? folderValues.autoImplementAfterReview : global.autoImplementAfterReview) ?? fallback,
+      inspect: () => ({
+        globalValue: global.autoImplementAfterReview,
+        workspaceValue: undefined,
+        workspaceFolderValue: resource ? folderValues.autoImplementAfterReview : undefined,
+      }),
+      update: (_key: string, value: unknown, target: vscode.ConfigurationTarget): Promise<void> => {
+        const destination = target === vscode.ConfigurationTarget.WorkspaceFolder ? folderValues : global;
+        if (value === undefined) delete destination.autoImplementAfterReview;
+        else destination.autoImplementAfterReview = value;
+        return Promise.resolve();
+      },
+    });
+    (vscode.window as unknown as { showWarningMessage: unknown }).showWarningMessage = (): Promise<undefined> => Promise.resolve(undefined);
+    const context = {
+      globalState: { get: <T>(_key: string, fallback?: T): T => fallback as T, update: (): Promise<void> => Promise.resolve() },
+    } as unknown as vscode.ExtensionContext;
+    const controller = new AutoImplementConfirmationController(context);
+    const changes = (vscode.workspace as unknown as {
+      _configurationChanges: { fire(value: { affectsConfiguration(section: string): boolean }): void };
+    })._configurationChanges;
+    try {
+      await controller.whenIdle();
+      folderValues.autoImplementAfterReview = "auto";
+      changes.fire({ affectsConfiguration: () => true });
+      await controller.whenIdle();
+      assert.equal(folderValues.autoImplementAfterReview, undefined);
+      assert.equal(global.autoImplementAfterReview, "off");
+    } finally {
+      controller.dispose();
+      resetAutoImplementConfirmationForTests();
+      workspace.getConfiguration = originalConfiguration;
+      workspace.workspaceFolders = originalFolders;
+      (vscode.window as unknown as { showWarningMessage: unknown }).showWarningMessage = originalWarning;
     }
   });
 });

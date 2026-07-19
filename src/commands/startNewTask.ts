@@ -9,7 +9,6 @@ import {
 import { resolveTaskRootForCreation } from "../utils/taskRoot";
 import { TaskInventory } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
-import { activateTask } from "../state/taskActivationCoordinator";
 import { withMetaRootLock } from "../state/taskStateStore";
 import { safeOpenTextDocument } from "../utils/fileUtils";
 import { runTrackedOperation } from "../utils/taskOperations";
@@ -78,7 +77,7 @@ async function recoverCompletedTaskCreations(metaFolderPath: string): Promise<vo
     if (progress?.status !== "creating") continue;
     try {
       await vscode.workspace.fs.stat(vscode.Uri.joinPath(folder, TASK_FILENAME));
-      await writeTaskProgress(folder, { ...progress, status: "active" });
+      await writeTaskProgress(folder, { ...progress, status: "paused" });
     } catch {
       // The creation is genuinely incomplete. Preserve its sentinel rather
       // than risking deletion or silently repurposing its folder number.
@@ -110,23 +109,14 @@ async function loadTaskTemplate(extensionUri: vscode.Uri): Promise<string> {
   }
 }
 
-/**
- * Normalize a path consistently with taskRoot.ts: normalize separators and,
- * on Windows, lowercase for case-insensitive comparison.
- */
-function normalizePath(p: string): string {
-  const normalized = path.normalize(p);
-  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
-}
 
 /**
  * Creates a new task folder (YYYY-MM-DD_task_X) with progress tracking and
  * opens an almost-blank task.md for the user to describe the work. No input
  * popup or plan-generation prompt is shown.
  *
- * After a successful creation the new task is persisted as the current task
- * so the keyboard shortcut (Ctrl+Shift+Alt+I) works immediately without the
- * user having to navigate the tree first.
+ * New tasks deliberately start paused. Creating one must never replace the
+ * current task or mutate another task's lifecycle while it is running.
  *
  * Returns the created folder name, or undefined if cancelled/failed.
  */
@@ -174,7 +164,7 @@ export async function startNewTask(
 async function createTask(
   inventory: TaskInventory,
   extensionUri: vscode.Uri,
-  currentTaskStore: CurrentTaskStore,
+  _currentTaskStore: CurrentTaskStore,
   workspaceRoot: vscode.WorkspaceFolder,
   op: { report(detail: string | undefined): void },
   context?: vscode.ExtensionContext
@@ -220,7 +210,7 @@ async function createTask(
       taskFileUri,
       new TextEncoder().encode(taskTemplate)
     );
-    await writeTaskProgress(taskFolderUri, { ...progress, status: "active" });
+    await writeTaskProgress(taskFolderUri, { ...progress, status: "paused" });
     return { taskFolderName, taskFolderPath, taskFileUri };
   });
   const { taskFolderName, taskFolderPath, taskFileUri } = created;
@@ -243,35 +233,18 @@ async function createTask(
   // Refresh inventory so the new task is discoverable
   await inventory.refresh();
 
-  // Resolve the newly created task back out of the inventory by its
-  // normalized canonical path (mirrors the normalization in taskRoot.ts).
-  const normalizedFolderPath = normalizePath(taskFolderPath);
-  const newTask =
-    inventory.getTaskById(normalizedFolderPath) ??
-    inventory.getTaskByPath(normalizedFolderPath) ??
-    // Fallback: match by folder name in case path normalization differs
-    inventory.getTasks().find((t) => t.folderName === taskFolderName);
-
-  if (newTask) {
-    // Persist the new task as the current task so the shortcut router
-    // finds it immediately, even before the user interacts with the tree.
-    if (!(await activateTask(inventory, currentTaskStore, taskFolderPath, newTask.canonicalId))) {
-      throw new Error("Could not activate the new task.");
+  // Do not activate this task: an existing active task remains the target of
+  // shortcuts and in-flight operations. The explicit argument is essential;
+  // a bare resume command would instead resume the older current task.
+  void vscode.window.showInformationMessage(
+    "Task created in paused state.",
+    "Resume"
+  ).then((choice) => {
+    if (choice === "Resume") {
+      return vscode.commands.executeCommand("vs-code-ai-helper.resumeTask", { taskFolderPath });
     }
-  } else {
-    // The task folder was created and the inventory was refreshed, but the
-    // task could not be re-resolved. This is unexpected (e.g. a race with
-    // discovery filters). Surface a warning so the user knows the shortcut
-    // may not work until they manually select the task in the tree.
-    const warningMsg = `Task "${taskFolderName}" was created but could not be set as the ` +
-      `current task automatically. Select it in the Tasks panel to activate it.`;
-    try {
-      const { NotificationRouter } = await import("../utils/notificationRouter.js");
-      NotificationRouter.showWarning(warningMsg);
-    } catch {
-      void vscode.window.showWarningMessage(warningMsg);
-    }
-  }
+    return undefined;
+  });
 
   // Surface the new folder name on the operation row (and in its terminal
   // Notifications entry via the bridge).

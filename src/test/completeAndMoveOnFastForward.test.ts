@@ -228,10 +228,7 @@ void describe("Complete & Move On auto-fast-forward chaining", () => {
     }
   });
 
-  void it("completing Plan Low-Level Review into Implementation carries the fast-forward marker on the runImplementationWithAI dispatch", async () => {
-    const { folderPath, progress } = makeTaskFolder(`ff_impl_${Math.floor(Math.random() * 1e9)}`, "plan-low-review");
-    const buttonArg = makeButtonPressArg(folderPath, progress);
-
+  void it("completing Plan Low-Level Review into Implementation dispatches regardless of the auto-implement review gate", async () => {
     const provider = new StatusTreeProvider();
     initNotificationRouter(provider);
     const fsBridge = installFsBridge();
@@ -250,15 +247,32 @@ void describe("Complete & Move On auto-fast-forward chaining", () => {
     registerReviewActionCommands(context);
 
     try {
-      await vscode.commands.executeCommand("vs-code-ai-helper.nextStage", buttonArg);
+      for (const armed of [false, true]) {
+        const { folderPath, progress } = makeTaskFolder(
+          `ff_impl_${armed ? "armed" : "off"}`,
+          "plan-low-review"
+        );
+        const buttonArg = makeButtonPressArg(folderPath, progress);
+        const gateSeam = patch(settingsModule, "isAutoImplementAfterReviewEnabled", () => armed);
+        dispatches.length = 0;
+        try {
+          await vscode.commands.executeCommand("vs-code-ai-helper.nextStage", buttonArg);
 
-      const persisted = await readTaskProgress(vscode.Uri.file(folderPath));
-      assert.equal(persisted?.currentStage, "impl");
-      assert.equal(dispatches.length, 1, "exactly one destination-stage AI dispatch");
-      const dispatched = dispatches[0];
-      assert.ok(dispatched);
-      assert.equal(dispatched.command, "vs-code-ai-helper.runImplementationWithAI");
-      assert.equal((dispatched.arg as ChainedArg).followUpReviewMode, "auto-fast-forward");
+          const persisted = await readTaskProgress(vscode.Uri.file(folderPath));
+          assert.equal(persisted?.currentStage, "impl");
+          assert.equal(
+            dispatches.length,
+            1,
+            "manual Complete & Move On dispatches independently of the review auto-implement gate"
+          );
+          const dispatched = dispatches[0];
+          assert.ok(dispatched);
+          assert.equal(dispatched.command, "vs-code-ai-helper.runImplementationWithAI");
+          assert.equal((dispatched.arg as ChainedArg).followUpReviewMode, "auto-fast-forward");
+        } finally {
+          gateSeam.restore();
+        }
+      }
     } finally {
       for (const p of patches.reverse()) { p.restore(); }
       for (const sub of context.subscriptions) { sub.dispose(); }

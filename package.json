@@ -689,40 +689,64 @@
     "configuration": {
       "title": "Ensemble",
       "properties": {
+        "ensemble.aiModelDefaults": { "type": "object", "default": {}, "scope": "window", "description": "Default AI models for Ensemble workflow stages." },
+        "ensemble.modelSettings": { "type": "object", "default": {}, "scope": "window", "description": "AI model and fallback settings for Ensemble workflow stages." },
+        "ensemble.warnings.unsavedSettings": { "type": "boolean", "default": true, "scope": "window", "description": "Warn before discarding unsaved AI model settings." },
+        "ensemble.warnings.largeTokenRequest": { "type": "boolean", "default": true, "scope": "window", "description": "Warn before a large AI token request." },
+        "ensemble.enabledProviders": { "type": "object", "default": {}, "scope": "window", "description": "Enabled AI providers." },
+        "ensemble.fastForwardMaxIterations": { "type": "integer", "default": 5, "minimum": 1, "maximum": 99, "scope": "window", "description": "Maximum Fast Forward iterations." },
+        "ensemble.autoAdvanceEnabled": { "type": ["string", "boolean"], "enum": ["off", "auto", "auto-fast-forward", false, true], "default": "off", "scope": "window", "description": "Automatically advance stages after reviews meet the configured score." },
+        "ensemble.completeAndMoveOnTriggersAI": { "type": ["string", "boolean"], "enum": ["off", "auto", "auto-fast-forward", false, true], "default": "auto", "scope": "window", "description": "Start the destination stage's AI action after completing a stage." },
+        "ensemble.autoAdvanceScoreThreshold": { "type": "integer", "default": 10, "minimum": 1, "maximum": 10, "scope": "window", "description": "Score required for Auto Advance." },
+        "ensemble.fastForwardStopLevel": { "type": "integer", "default": 0, "minimum": 0, "maximum": 10, "scope": "window", "description": "Fast Forward target score." },
+        "ensemble.fastForwardUseAcceptanceThreshold": { "type": "boolean", "default": false, "scope": "window", "description": "Use the review acceptance threshold for Fast Forward." },
+        "ensemble.autoReviewAfterPlan": { "type": ["string", "boolean"], "enum": ["off", "auto", "auto-fast-forward", false, true], "default": "off", "scope": "window", "description": "Review a generated plan automatically." },
+        "ensemble.autoReviewAfterImplementation": { "type": ["string", "boolean"], "enum": ["off", "auto", "auto-fast-forward", false, true], "default": "off", "scope": "window", "description": "Review completed implementation automatically." },
+        "ensemble.autoImplementAfterReview": { "type": "string", "enum": ["off", "auto"], "enumDescriptions": ["Do not start implementation automatically.", "Start implementation after Auto Advance accepts a plan review."], "default": "off", "scope": "window", "markdownDescription": "Start implementation after **Auto Advance** moves an accepted plan review to Implementation. **⚠️ Warning: this makes real code and file changes automatically. Do not use without continuous human supervision.**" },
+        "ensemble.maxImplementationIterations": { "type": "integer", "default": 200, "minimum": 1, "maximum": 200, "scope": "window", "description": "Maximum implementation tool-call rounds." },
+        "ensemble.allowDirtyWorktreeChanges": { "type": "boolean", "default": false, "scope": "window", "description": "Allow AI changes with unrelated uncommitted workspace changes." },
+        "ensemble.desktopNotifications": { "type": "boolean", "default": false, "scope": "window", "description": "Show native notifications for Ensemble attention requests." },
+        "ensemble.publishVerificationCommands": { "type": "array", "items": { "type": "string" }, "default": [], "scope": "resource", "description": "Explicit Publish verification commands." },
         "vs-code-ai-helper.aiModelDefaults": {
+          "deprecationMessage": "Use `ensemble.aiModelDefaults` instead.",
           "type": "object",
           "default": {},
           "scope": "window",
-          "markdownDescription": "Legacy per-stage AI model IDs, superseded by `#vs-code-ai-helper.modelSettings#`. Bare IDs are GitHub Copilot models; prefixed IDs (e.g. `claude-cli:sonnet`, `codex-cli:default`, `gemini-cli:gemini-2.5-pro`, `antigravity-cli:default`, `kiro-cli:default`) run through the vendor's subscription CLI. Configure via **Ensemble: Configure AI Models per Step**.",
+          "markdownDescription": "Legacy per-stage AI model IDs, superseded by `#ensemble.modelSettings#`. Bare IDs are GitHub Copilot models; prefixed IDs (e.g. `claude-cli:sonnet`, `codex-cli:default`, `gemini-cli:gemini-2.5-pro`, `antigravity-cli:default`, `kiro-cli:default`) run through the vendor's subscription CLI. Configure via **Ensemble: Configure AI Models per Step**.",
           "additionalProperties": {
             "type": "string"
           }
         },
         "vs-code-ai-helper.modelSettings": {
+          "deprecationMessage": "Use `ensemble.modelSettings` instead.",
           "type": "object",
           "default": {},
           "scope": "window",
           "description": "Primary and backup models per stage, along with fallback strategy. Configure via Ensemble Settings."
         },
         "vs-code-ai-helper.warnings.unsavedSettings": {
+          "deprecationMessage": "Use `ensemble.warnings.unsavedSettings` instead.",
           "type": "boolean",
           "default": true,
           "scope": "window",
           "description": "Warn before discarding unsaved changes in the AI Models panel. The warning dialog offers \"Don't show again\", which sets this to false."
         },
         "vs-code-ai-helper.warnings.largeTokenRequest": {
+          "deprecationMessage": "Use `ensemble.warnings.largeTokenRequest` instead.",
           "type": "boolean",
           "default": true,
           "scope": "window",
           "description": "Warn before sending a large AI prompt that may use significant quota. The warning dialog offers \"Proceed and don't ask again\", which sets this to false."
         },
         "vs-code-ai-helper.enabledProviders": {
+          "deprecationMessage": "Use `ensemble.enabledProviders` instead.",
           "type": "object",
           "default": {},
           "scope": "window",
           "description": "Provider Selection. Providers are disabled until explicitly enabled."
         },
         "vs-code-ai-helper.fastForwardMaxIterations": {
+          "deprecationMessage": "Use `ensemble.fastForwardMaxIterations` instead.",
           "type": "integer",
           "default": 5,
           "minimum": 1,
@@ -731,6 +755,7 @@
           "description": "Maximum fast-forward iterations (1–99)."
         },
         "vs-code-ai-helper.autoAdvanceEnabled": {
+          "deprecationMessage": "Use `ensemble.autoAdvanceEnabled` instead.",
           "type": [
             "string",
             "boolean"
@@ -754,6 +779,7 @@
           "description": "Auto-advance when the configured review score threshold is reached. Legacy true/false values are still honored (true = auto)."
         },
         "vs-code-ai-helper.completeAndMoveOnTriggersAI": {
+          "deprecationMessage": "Use `ensemble.completeAndMoveOnTriggersAI` instead.",
           "type": [
             "string",
             "boolean"
@@ -777,6 +803,7 @@
           "description": "When completing a stage and moving on, automatically start the AI action for the destination stage. Legacy true/false values are still honored (true = auto)."
         },
         "vs-code-ai-helper.autoAdvanceScoreThreshold": {
+          "deprecationMessage": "Use `ensemble.autoAdvanceScoreThreshold` instead.",
           "type": "integer",
           "default": 10,
           "minimum": 1,
@@ -785,6 +812,7 @@
           "description": "Score required for auto-advance (1–10). Lower thresholds intentionally permit earlier advancement; the extension does not impose a universal minimum acceptable score."
         },
         "vs-code-ai-helper.fastForwardStopLevel": {
+          "deprecationMessage": "Use `ensemble.fastForwardStopLevel` instead.",
           "type": "integer",
           "default": 0,
           "minimum": 0,
@@ -793,12 +821,14 @@
           "description": "Fast-forward target score. 0 stops after any improvement; 1–10 continues until that score."
         },
         "vs-code-ai-helper.fastForwardUseAcceptanceThreshold": {
+          "deprecationMessage": "Use `ensemble.fastForwardUseAcceptanceThreshold` instead.",
           "type": "boolean",
           "default": false,
           "scope": "window",
           "description": "Use the review acceptance threshold instead of the fast-forward stop level."
         },
         "vs-code-ai-helper.autoReviewAfterPlan": {
+          "deprecationMessage": "Use `ensemble.autoReviewAfterPlan` instead.",
           "type": [
             "string",
             "boolean"
@@ -822,6 +852,7 @@
           "description": "Start high-level review after AI drafts a plan. Legacy true/false values are still honored (true = auto)."
         },
         "vs-code-ai-helper.autoReviewAfterImplementation": {
+          "deprecationMessage": "Use `ensemble.autoReviewAfterImplementation` instead.",
           "type": [
             "string",
             "boolean"
@@ -845,6 +876,7 @@
           "description": "Start high-level review after AI completes initial implementation. Legacy true/false values are still honored (true = auto)."
         },
         "vs-code-ai-helper.maxImplementationIterations": {
+          "deprecationMessage": "Use `ensemble.maxImplementationIterations` instead.",
           "type": "integer",
           "default": 200,
           "minimum": 1,
@@ -853,18 +885,21 @@
           "description": "Maximum Copilot implementation tool-call rounds (1-200)."
         },
         "vs-code-ai-helper.allowDirtyWorktreeChanges": {
+          "deprecationMessage": "Use `ensemble.allowDirtyWorktreeChanges` instead.",
           "type": "boolean",
           "default": false,
           "scope": "window",
           "description": "Automatically proceed with AI implementation/Fast Forward runs even when the workspace has unrelated uncommitted changes, without prompting first."
         },
         "vs-code-ai-helper.desktopNotifications": {
+          "deprecationMessage": "Use `ensemble.desktopNotifications` instead.",
           "type": "boolean",
           "default": false,
           "scope": "window",
           "description": "Show a native OS notification when Ensemble is waiting on you to answer a question or a run fails outright. Off by default."
         },
         "vs-code-ai-helper.publishVerificationCommands": {
+          "deprecationMessage": "Use `ensemble.publishVerificationCommands` instead.",
           "type": "array",
           "items": {
             "type": "string"

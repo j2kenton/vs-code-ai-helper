@@ -37,6 +37,8 @@ export interface DiscoveredTask {
   sourceScopeKey: string;
   /** Owning workspace folder, if applicable */
   workspaceFolder?: vscode.Uri;
+  /** The root candidate which directly contains this task. */
+  resolvedTaskRootPath?: string;
 }
 
 /**
@@ -208,6 +210,7 @@ async function discoverTasksInRoot(
           canonicalId: normalizePath(taskFolderPath),
           sourceScopeKey: candidate.sourceScopeKey,
           workspaceFolder: candidate.workspaceFolder,
+          resolvedTaskRootPath: candidate.absolutePath,
         });
       } catch {
         // No task.md, skip this folder

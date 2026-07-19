@@ -3,7 +3,8 @@ import * as path from "path";
 import * as crypto from "crypto";
 
 import { allowsDirtyWorktreeChanges } from "../config/settings";
-import { getConfiguredTaskRoot, normalizePath } from "../utils/taskRoot";
+import { getConfiguredTaskRoot, normalizePath, resolveTaskRootCandidates, TaskRootCandidate } from "../utils/taskRoot";
+import { repairLegacyOwnership } from "../utils/metaResourcesMigration";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import {
   taskOperations,
@@ -21,6 +22,7 @@ import {
   STAGE_ORDER,
   TaskStage,
 } from "../types/taskProgress";
+import { TaskProgress } from "../types/taskProgress";
 import {
   findAllTasks,
   IncompleteTask,
@@ -76,6 +78,7 @@ import { improveReviewScore } from "../utils/reviewScoreLoop";
 import {
   getAutoAdvanceMode,
   getAutoAdvanceScoreThreshold,
+  isAutoImplementAfterReviewEnabled,
   getAutoReviewAfterImplementationMode,
   getCompleteAndMoveOnTriggersAIMode,
   getFastForwardMaxIterations,
@@ -100,6 +103,113 @@ function isSameWorkspacePath(a: string, b: string): boolean {
   return process.platform === "win32"
     ? resolvedA.toLowerCase() === resolvedB.toLowerCase()
     : resolvedA === resolvedB;
+}
+
+/**
+ * Select the configured root that directly owns a task folder. Nested
+ * metadata-root configurations can both contain a task, so only the deepest
+ * direct parent is valid for ownership repair.
+ */
+export function selectReleaseTaskRootCandidate(
+  taskFolderPath: string,
+  candidates: readonly TaskRootCandidate[] = resolveTaskRootCandidates()
+): TaskRootCandidate | undefined {
+  return candidates
+    .filter((entry) => isPathWithin(taskFolderPath, entry.absolutePath))
+    .sort((a, b) => b.absolutePath.length - a.absolutePath.length)
+    .find((entry) => isSameWorkspacePath(path.dirname(taskFolderPath), entry.absolutePath));
+}
+
+/**
+ * Apply the single shared migration repair rule before release validation.
+ * Returning the repaired progress makes callers validate the persisted state
+ * in this invocation rather than a stale pre-repair read.
+ */
+export async function repairReleaseTaskOwnership(
+  taskFolderPath: string,
+  progress: TaskProgress,
+  candidates: readonly TaskRootCandidate[] = resolveTaskRootCandidates()
+): Promise<{ rootCandidate?: TaskRootCandidate; repaired: boolean; progress: TaskProgress }> {
+  const rootCandidate = selectReleaseTaskRootCandidate(taskFolderPath, candidates);
+  if (!rootCandidate) return { repaired: false, progress };
+  const result = await repairLegacyOwnership(taskFolderPath, progress, rootCandidate.absolutePath);
+  return { rootCandidate, ...result };
+}
+
+/**
+ * Validate release ownership after applying the shared lazy migration repair.
+ * Keeping this command-facing boundary separate makes it explicit that the
+ * release command validates the progress returned by a repair, rather than
+ * the stale progress it read before the repair was persisted.
+ */
+export async function validateReleaseTaskOwnership(
+  taskFolderPath: string,
+  progress: TaskProgress,
+  candidates: readonly TaskRootCandidate[] = resolveTaskRootCandidates()
+): Promise<{ ok: true; progress: TaskProgress } | { ok: false; message: string }> {
+  const repaired = await repairReleaseTaskOwnership(taskFolderPath, progress, candidates);
+  if (!repaired.rootCandidate) {
+    return {
+      ok: false,
+      message: `Task folder "${taskFolderPath}" is not inside a configured metadata root. This usually means the task folder was moved manually. Move it back, or re-create the task under the configured root.`,
+    };
+  }
+  const repairedProgress = repaired.progress;
+  const metaRoot = repairedProgress.ownership?.metaRoot;
+  if (metaRoot && !isPathWithin(taskFolderPath, metaRoot)) {
+    return {
+      ok: false,
+      message: `Task folder "${taskFolderPath}" is not inside its recorded metadata root "${metaRoot}". This usually means the task folder was moved manually. Move it back, or re-create the task under the configured root.`,
+    };
+  }
+  return { ok: true, progress: repairedProgress };
+}
+
+/** The plan-review automation gate; manual stage completion never calls it. */
+export function shouldScheduleAutomaticImplementation(
+  nextStage: TaskStage | undefined,
+  autoImplementEnabled: boolean
+): boolean {
+  return nextStage === "impl" && autoImplementEnabled;
+}
+
+/**
+ * Schedule the post-review implementation command through the same deferred
+ * automation chain used in the review completion path. Keeping this tiny
+ * side-effect boundary explicit lets tests assert the real dispatch contract
+ * (rather than only re-implementing its predicate).
+ */
+export function scheduleAutomaticImplementationAfterReview(
+  nextStage: TaskStage | undefined,
+  autoImplementEnabled: boolean,
+  taskFolderPath: string,
+  parentOperation: TaskOperationHandle | undefined
+): boolean {
+  if (!shouldScheduleAutomaticImplementation(nextStage, autoImplementEnabled)) {
+    return false;
+  }
+  void scheduleAutomationChain(
+    {
+      command: "vs-code-ai-helper.runImplementationWithAI",
+      arg: { taskFolderPath },
+      taskKey: taskFolderPath,
+    },
+    parentOperation
+  );
+  return true;
+}
+
+/** Claim the review attempt immediately before invoking the AI provider. */
+export async function claimReviewAttempt(
+  folderUri: vscode.Uri,
+  reviewAttemptId: string
+): Promise<TaskProgress | undefined> {
+  return patchTaskProgress(folderUri, (current) => {
+    if (current.status === "paused") {
+      throw new Error("The task was paused while the review was starting.");
+    }
+    return { ...current, reviewAttemptId };
+  });
 }
 
 /** Returns whether an absolute path is the supplied root or a descendant. */
@@ -1091,12 +1201,7 @@ export async function runReviewForFolder(
   // Claim the stage before starting the provider call. The token is checked
   // again by the transition CAS, so a late result cannot advance a newer run.
   const reviewAttemptId = crypto.randomUUID();
-  const claimed = await patchTaskProgress(folderUri, (current) => {
-    if (current.status === "paused") {
-      throw new Error("The task was paused while the review was starting.");
-    }
-    return { ...current, reviewAttemptId };
-  });
+  const claimed = await claimReviewAttempt(folderUri, reviewAttemptId);
   if (!claimed) return;
 
   // Review generation uses the review-stage model (no executionStage override).
@@ -1196,14 +1301,15 @@ export async function runReviewForFolder(
               // exclusive operation lock, which this review still holds — so
               // the chain scheduler defers it until this root operation has
               // ended successfully.
-              if (next === "impl") {
-                void scheduleAutomationChain(
-                  {
-                    command: "vs-code-ai-helper.runImplementationWithAI",
-                    arg: { taskFolderPath: folderUri.fsPath },
-                    taskKey: folderUri.fsPath,
-                  },
-                  options.operation
+              const automaticImplementationScheduled = scheduleAutomaticImplementationAfterReview(
+                next,
+                isAutoImplementAfterReviewEnabled(),
+                folderUri.fsPath,
+                options.operation
+              );
+              if (!automaticImplementationScheduled && next === "impl") {
+                NotificationRouter.showInformation(
+                  "Implementation is ready to start manually. Enable Automatically implement after review to run it automatically."
                 );
               }
               // Auto-advancing into another review stage must itself kick off
@@ -3013,20 +3119,21 @@ async function runRelease(context: vscode.ExtensionContext, arg?: TaskNodeArg): 
     void vscode.window.showWarningMessage("Release is available only from a task's Publish stage.");
     return;
   }
-  const progress = candidate ? await readTaskProgress(vscode.Uri.file(candidate)) : undefined;
+  let progress = candidate ? await readTaskProgress(vscode.Uri.file(candidate)) : undefined;
   if (!progress || progress.currentStage !== "publish" || progress.status === "paused") {
-    void vscode.window.showWarningMessage("Release requires an active task at the Publish stage.");
+    void vscode.window.showWarningMessage("Release requires an active task at the Publish stage. Resume the task first if it is paused.");
     return;
   }
   // Tasks can live in an external metadata root, so task-folder containment
   // is not a valid way to find their project. Prefer the persisted project
   // binding and only use containment for legacy tasks without ownership.
-  const persistedOwner = progress.ownership?.projectRoot ?? progress.ownership?.workspaceRoot;
-  const metaRoot = progress.ownership?.metaRoot;
-  if (metaRoot && !isPathWithin(candidate, metaRoot)) {
-    void vscode.window.showErrorMessage("This task is outside its configured metadata root and cannot be released.");
+  const ownershipValidation = await validateReleaseTaskOwnership(candidate, progress);
+  if (!ownershipValidation.ok) {
+    void vscode.window.showErrorMessage(ownershipValidation.message);
     return;
   }
+  progress = ownershipValidation.progress;
+  const persistedOwner = progress.ownership?.projectRoot ?? progress.ownership?.workspaceRoot;
   const owner = resolveReleaseWorkspace(
     candidate,
     progress.ownership,

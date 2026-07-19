@@ -5,6 +5,7 @@ import * as fs from "fs";
 import * as path from "path";
 import { taskRefFromResolved, TaskRef } from "../types/taskRef";
 import { patchTaskProgress } from "./taskProgressUtils";
+import { resolveTaskRootCandidates } from "./taskRoot";
 
 /**
  * Normalize a path for comparison: on Windows, path.resolve/normalize
@@ -329,9 +330,14 @@ export async function resolveTaskContext(
     !!persistedOwner &&
     !!ownedMetaRoot &&
     isSameOrUnder(resolved.taskFolderPath, path.resolve(ownedMetaRoot));
+  const insideConfiguredTaskRoot = resolveTaskRootCandidates().some((candidate) =>
+    normalizeForCompare(path.dirname(path.resolve(resolved.taskFolderPath))) ===
+    normalizeForCompare(path.resolve(candidate.absolutePath))
+  );
   if (
     workspaceRoots.length > 0 &&
     !insideOwnedMetaRoot &&
+    !insideConfiguredTaskRoot &&
     !workspaceRoots.some(root => isSameOrUnder(resolved.taskFolderPath, root))
   ) return undefined;
 

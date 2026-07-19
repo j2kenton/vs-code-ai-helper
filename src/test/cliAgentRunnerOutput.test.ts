@@ -40,7 +40,7 @@ void describe("CLI output normalization", () => {
 
   void it("loads Kiro's linked markdown artifact when stdout points to a file URI", () => {
     const tempFile = path.join(
-      "/tmp",
+      process.cwd(),
       `vs-code-ai-helper-kiro-output-${Date.now()}.md`
     );
     fs.writeFileSync(tempFile, "# Review\n\nOn Track\n", "utf8");

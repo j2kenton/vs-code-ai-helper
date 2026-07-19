@@ -236,6 +236,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     // instead of painting one task's history into another's view.
     const target = this.target;
     let entries: ChatMessage[] = [];
+    let errorMessage: string | undefined;
     if (target) {
       try {
         // Stage chats are fully isolated: a stage's view never shows another
@@ -257,6 +258,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
             `Could not load chat history for this task. (${error instanceof Error ? error.message : String(error)})`
           );
         }
+        errorMessage = "Chat history could not be loaded. Check the Notifications view for details.";
       }
     }
     if (!sameIdentity(target, this.target)) return;
@@ -278,36 +280,57 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       ...entry,
       text: stripAttributionHeaders(entry.text),
     }));
-    await this.view?.webview.postMessage({ type: "state", target: this.target, label, entries: displayEntries, busy });
+    await this.view?.webview.postMessage({
+      type: "state",
+      target: this.target,
+      label,
+      entries: displayEntries,
+      busy,
+      errorMessage,
+    });
   }
 
   private html(): string {
     const nonce = crypto.randomBytes(16).toString("base64");
     return `<!doctype html><html><head><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';">
       <style>
+        :root {
+          --ensemble-space-1: 4px;
+          --ensemble-space-2: 8px;
+          --ensemble-space-3: 12px;
+          --ensemble-space-4: 16px;
+          --ensemble-border-width: 1px;
+          --ensemble-focus-width: 2px;
+          --ensemble-radius: 3px;
+        }
         body {
           font-family: var(--vscode-font-family);
           color: var(--vscode-foreground);
-          padding: 8px 10px;
+          background-color: var(--vscode-editor-background);
+          padding: var(--ensemble-space-2) var(--ensemble-space-3);
+          margin: 0;
         }
         #context {
           color: var(--vscode-descriptionForeground);
-          margin: 0 0 10px;
+          margin: 0 0 var(--ensemble-space-2);
         }
         #messages {
-          margin: 0 0 10px;
+          margin: 0 0 var(--ensemble-space-2);
         }
         #messages p {
-          margin: 0 0 8px;
+          margin: 0 0 var(--ensemble-space-2);
           line-height: 1.4;
           white-space: pre-wrap;
           overflow-wrap: anywhere;
+          padding: var(--ensemble-space-2);
+          border-left: var(--ensemble-focus-width) solid var(--vscode-editorWidget-border);
+          background: var(--vscode-editor-inactiveSelectionBackground);
         }
         .spinner {
           display: inline-block;
           width: 1em;
           height: 1em;
-          border: 2px solid currentColor;
+          border: var(--ensemble-focus-width) solid currentColor;
           border-right-color: transparent;
           border-radius: 50%;
           animation: spin 1s linear infinite;
@@ -323,15 +346,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           }
         }
         #busy-indicator {
-          margin: 10px;
+          display: none;
+          margin: var(--ensemble-space-2) 0;
           font-style: italic;
-          opacity: 0.8;
+          color: var(--vscode-descriptionForeground);
+        }
+        #error {
+          display: none;
+          margin: var(--ensemble-space-2) 0;
+          padding: var(--ensemble-space-2);
+          color: var(--vscode-inputValidation-errorForeground);
+          background-color: var(--vscode-inputValidation-errorBackground);
+          border: var(--ensemble-border-width) solid var(--vscode-inputValidation-errorBorder);
         }
         #form {
           display: flex;
           flex-direction: column;
-          gap: 8px;
-          margin-top: 10px;
+          gap: var(--ensemble-space-2);
+          margin-top: var(--ensemble-space-3);
         }
         #form textarea {
           resize: vertical;
@@ -339,35 +371,38 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           font-size: inherit;
           background-color: var(--vscode-input-background, var(--vscode-editor-background));
           color: var(--vscode-input-foreground, var(--vscode-foreground));
-          border: 1px solid var(--vscode-input-border, var(--vscode-widget-border));
-          padding: 6px 8px;
-          border-radius: 2px;
+          border: var(--ensemble-border-width) solid var(--vscode-input-border, var(--vscode-widget-border));
+          padding: var(--ensemble-space-2);
+          border-radius: var(--ensemble-radius);
           box-sizing: border-box;
         }
         #form textarea:focus {
-          outline: 1px solid var(--vscode-focusBorder);
+          outline: var(--ensemble-focus-width) solid var(--vscode-focusBorder);
+          outline-offset: var(--ensemble-border-width);
         }
         #form button {
           align-self: flex-end;
           background-color: var(--vscode-button-background);
           color: var(--vscode-button-foreground);
           border: none;
-          padding: 6px 14px;
+          padding: var(--ensemble-space-1) var(--ensemble-space-3);
           cursor: pointer;
-          border-radius: 2px;
+          border-radius: var(--ensemble-radius);
         }
         #form button:hover {
           background-color: var(--vscode-button-hoverBackground);
         }
+        #form button:focus-visible { outline: var(--ensemble-focus-width) solid var(--vscode-focusBorder); outline-offset: var(--ensemble-border-width); }
       </style>
       </head><body>
-      <div id="context">Open a workspace folder to start chatting with the AI.</div><div id="messages"></div>
-      <div id="busy-indicator" style="display:none"><span class="spinner"></span>Waiting for the AI…</div>
-      <form id="form"><textarea id="message" rows="3" placeholder="Message the AI… (Ctrl+Enter to send)"></textarea><button>Send</button></form>
-      <script nonce="${nonce}">const v=acquireVsCodeApi(), c=document.getElementById('context'), m=document.getElementById('messages'), b=document.getElementById('busy-indicator'), f=document.getElementById('form'), i=document.getElementById('message');
-      window.addEventListener('message', e=>{const s=e.data;if(s.type!=='state')return;c.textContent=s.label??'Open a workspace folder to start chatting with the AI.';m.replaceChildren(...s.entries.map(x=>{const d=document.createElement('p');d.textContent='['+x.role+(x.pending?' — awaiting your answer':'')+'] '+x.text;return d;}));b.style.display=s.busy?'block':'none';});
+      <div id="context" role="status">Open a workspace folder to start chatting with the AI.</div><div id="messages" role="log" aria-live="polite" aria-label="Conversation"></div>
+      <div id="error" role="alert"></div>
+      <div id="busy-indicator" role="status" aria-live="polite"><span class="spinner"></span>Waiting for the AI…</div>
+      <form id="form"><textarea id="message" rows="3" aria-label="Message the AI" placeholder="Message the AI… (Ctrl+Enter to send)"></textarea><button type="submit">Send</button></form>
+      <script nonce="${nonce}">const v=acquireVsCodeApi(), c=document.getElementById('context'), m=document.getElementById('messages'), e=document.getElementById('error'), b=document.getElementById('busy-indicator'), f=document.getElementById('form'), i=document.getElementById('message');
+      window.addEventListener('message', event=>{const s=event.data;if(s.type!=='state')return;c.textContent=s.label??'Open a workspace folder to start chatting with the AI.';m.replaceChildren(...s.entries.map(x=>{const d=document.createElement('p');d.textContent='['+x.role+(x.pending?' — awaiting your answer':'')+'] '+x.text;return d;}));e.textContent=s.errorMessage??'';e.style.display=s.errorMessage?'block':'none';b.style.display=s.busy?'block':'none';});
       f.addEventListener('submit',e=>{e.preventDefault();v.postMessage({type:'send',text:i.value});i.value='';});
-      i.addEventListener('keydown',e=>{if(e.key==='Enter'&&e.ctrlKey){e.preventDefault();f.requestSubmit();}});</script>
+      i.addEventListener('keydown',e=>{if(e.key==='Enter'&&e.ctrlKey){e.preventDefault();f.requestSubmit();}else if(e.key==='Escape'){i.blur();}});</script>
     </body></html>`;
   }
 }

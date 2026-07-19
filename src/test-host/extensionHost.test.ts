@@ -7,6 +7,7 @@
  * (@vscode/test-cli + @vscode/test-electron; see .vscode-test.mjs).
  */
 import * as assert from "assert";
+import * as path from "path";
 import * as vscode from "vscode";
 
 // The mocha globals (tdd interface — the @vscode/test-cli runner's default)
@@ -38,11 +39,15 @@ const CRITICAL_CHAIN_COMMANDS = [
   "vs-code-ai-helper.unpinTask",
   "vs-code-ai-helper.runPublishChecks",
   "vs-code-ai-helper.runLintingFixes",
+  "vs-code-ai-helper.release",
   "vs-code-ai-helper.markTaskDone",
   "vs-code-ai-helper.commitAndPushTask",
   "vs-code-ai-helper.completeCommitAndPushTask",
   "vs-code-ai-helper.cancelOperation",
   "vs-code-ai-helper.chatWithStage",
+  "vs-code-ai-helper.configureStepModels",
+  "vs-code-ai-helper.openAiModels",
+  "vs-code-ai-helper.openGeneralAssistant",
 ];
 
 async function activatedExtension(): Promise<vscode.Extension<unknown>> {
@@ -69,6 +74,63 @@ suite("extension host activation (packaged entry point)", () => {
     );
   });
 
+  test("repairs legacy ownership through the registered Release command", async () => {
+    await activatedExtension();
+    const workspace = vscode.workspace.workspaceFolders?.[0];
+    assert.ok(workspace, "the extension-host test workspace must be open");
+
+    const folderName = `release-repair-${Date.now()}`;
+    const taskFolder = vscode.Uri.joinPath(workspace.uri, ".ensemble", folderName);
+    const legacyRoot = path.join(workspace.uri.fsPath, "plans");
+    const configuredRoot = path.join(workspace.uri.fsPath, ".ensemble");
+    const timestamp = new Date().toISOString();
+    const progress = {
+      taskFolder: folderName,
+      currentStage: "publish",
+      status: "active",
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      ownership: {
+        metaRoot: legacyRoot,
+        projectRoot: workspace.uri.fsPath,
+        workspaceRoot: workspace.uri.fsPath,
+        boundAt: timestamp,
+        state: "resolved",
+      },
+    };
+
+    try {
+      await vscode.workspace.fs.createDirectory(taskFolder);
+      await vscode.workspace.fs.writeFile(
+        vscode.Uri.joinPath(taskFolder, "task.md"),
+        new TextEncoder().encode("# Release repair fixture\n")
+      );
+      const progressUri = vscode.Uri.joinPath(taskFolder, "task-progress.json");
+      await vscode.workspace.fs.writeFile(progressUri, new TextEncoder().encode(JSON.stringify(progress)));
+
+      // No package.json exists in the dedicated host workspace, so Release
+      // exits safely after validation instead of opening a terminal. A stale
+      // legacy root must still be repaired by the actual registered command.
+      await vscode.commands.executeCommand("vs-code-ai-helper.release", {
+        task: { folderUri: taskFolder, folderName, progress },
+      });
+
+      const repaired = JSON.parse(
+        new TextDecoder().decode(await vscode.workspace.fs.readFile(progressUri))
+      ) as { ownership?: { metaRoot?: string } };
+      const comparableRoot = process.platform === "win32"
+        ? configuredRoot.toLowerCase()
+        : configuredRoot;
+      assert.equal(
+        repaired.ownership?.metaRoot,
+        comparableRoot,
+        "Release must persist the repair before continuing to release-target selection"
+      );
+    } finally {
+      await vscode.workspace.fs.delete(taskFolder, { recursive: true, useTrash: false });
+    }
+  });
+
   test("declares the Ensemble views in the packaged manifest", async () => {
     const extension = await activatedExtension();
     const manifest = extension.packageJSON as {
@@ -78,5 +140,15 @@ suite("extension host activation (packaged entry point)", () => {
       .flat()
       .map((view) => view.id);
     assert.ok(viewIds.length > 0, "the packaged manifest must contribute at least one view");
+  });
+
+  test("opens the AI Models webview entry point without command failures", async () => {
+    await activatedExtension();
+
+    // This executes the extension's user-visible entry point through the
+    // real host, rather than merely checking the manifest. The workbench's
+    // own focus commands run in the renderer process and are not available
+    // to extension-host tests, so this covers the registered bridge command.
+    await vscode.commands.executeCommand("vs-code-ai-helper.openAiModels");
   });
 });

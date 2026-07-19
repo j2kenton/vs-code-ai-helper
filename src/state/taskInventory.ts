@@ -3,6 +3,7 @@ import * as vscode from "vscode";
 import { discoverAllTasks, DiscoveredTask } from "../utils/taskRoot";
 import { readTaskProgress } from "../utils/taskProgressUtils";
 import { TaskProgress } from "../types/taskProgress";
+import { repairLegacyOwnership } from "../utils/metaResourcesMigration";
 
 /**
  * A task with its progress metadata loaded
@@ -95,9 +96,14 @@ export class TaskInventory {
           continue;
         }
 
+        const repaired = await repairLegacyOwnership(
+          task.taskFolderPath,
+          progress,
+          task.resolvedTaskRootPath ?? path.dirname(task.taskFolderPath)
+        );
         withProgress.push({
           ...task,
-          progress,
+          progress: repaired.progress,
         });
       } catch {
         // Task folder exists but no valid progress file, skip

@@ -352,11 +352,15 @@ class FakeNode {
   }
 }
 
-function extractWebviewScript(): string {
+function extractWebviewHtml(): string {
   const provider = new SettingsViewProvider(vscode.Uri.file("/fake/ext"));
-  const html = (
+  return (
     provider as unknown as { _getHtmlForWebview(webview: { cspSource: string }): string }
   )._getHtmlForWebview({ cspSource: "vscode-webview://fake" });
+}
+
+function extractWebviewScript(): string {
+  const html = extractWebviewHtml();
   const match = /<script nonce="[^"]*">([\s\S]*?)<\/script>/.exec(html);
   assert.ok(match, "expected the settings webview HTML to contain its inline script");
   return match[1]!;
@@ -442,6 +446,18 @@ function initMessage(): Record<string, unknown> {
 }
 
 void describe("SettingsViewProvider webview — draft restore across disposal", () => {
+  void it("uses theme tokens and does not repeat the AI Models section title", () => {
+    const html = extractWebviewHtml();
+
+    assert.match(html, /font-family: var\(--vscode-font-family\)/);
+    assert.match(html, /background-color: var\(--vscode-editor-background\)/);
+    assert.match(html, /color: var\(--vscode-foreground\)/);
+    assert.match(html, /button:focus-visible, select:focus-visible, input\[type="text"\]:focus-visible/);
+    assert.match(html, /role="status" aria-live="polite"/);
+    assert.doesNotMatch(html, /<h2[^>]*>\s*AI Models\s*<\/h2>/i);
+    assert.doesNotMatch(html, /#[0-9a-f]{3,8}\b|\b(?:rgb|hsl)a?\(/i);
+  });
+
   void it("restores a dirty draft, with a notice, after the document is disposed and recreated", async () => {
     const script = extractWebviewScript();
     const stateStore: { value: unknown } = { value: undefined };

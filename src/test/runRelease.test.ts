@@ -7,13 +7,57 @@
  * string engineered to look benign should still never slip past the gate.
  */
 import * as assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
+import * as vscode from "vscode";
 import {
   isSafeReleaseScript,
   orderReleaseTargetItems,
   resolveReleaseWorkspace,
+  scheduleAutomaticImplementationAfterReview,
+  selectReleaseTaskRootCandidate,
+  shouldScheduleAutomaticImplementation,
+  validateReleaseTaskOwnership,
 } from "../commands/reviewActions";
+import { TaskProgress } from "../types/taskProgress";
+import { TaskRootCandidate } from "../utils/taskRoot";
+import type { AutomationDispatch } from "../utils/automationChain";
+
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const automationChainModule = require("../utils/automationChain") as {
+  scheduleAutomationChain: (dispatch: AutomationDispatch, parent?: unknown) => Promise<boolean>;
+};
+
+function candidate(root: string): TaskRootCandidate {
+  return { absolutePath: root, isExplicit: true, sourceScopeKey: root };
+}
+
+function migratedProgress(oldRoot: string, workspaceRoot: string): TaskProgress {
+  return {
+    taskFolder: "2026-01-01_task_1",
+    currentStage: "publish",
+    status: "active",
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    ownership: {
+      metaRoot: oldRoot,
+      projectRoot: workspaceRoot,
+      workspaceRoot,
+      boundAt: new Date().toISOString(),
+      state: "resolved",
+    },
+  };
+}
+
+function suppressAtomicProgressWrite(): { restore(): void } {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const atomic = require("../state/writeAtomic") as { writeAtomic: (uri: vscode.Uri, content: string) => Promise<void> };
+  const original = atomic.writeAtomic;
+  atomic.writeAtomic = (): Promise<void> => Promise.resolve();
+  return { restore: (): void => { atomic.writeAtomic = original; } };
+}
 
 void describe("isSafeReleaseScript", () => {
   void it("accepts plain release commands with allowed characters", () => {
@@ -89,6 +133,105 @@ void describe("resolveReleaseWorkspace", () => {
     );
 
     assert.equal(resolved, undefined);
+  });
+});
+
+void describe("release ownership preparation", () => {
+  void it("chooses the deepest root only when it directly contains the task", () => {
+    const outer = path.resolve("/workspace/.ensemble");
+    const inner = path.join(outer, "nested");
+    const task = path.join(inner, "2026-01-01_task_1");
+    assert.equal(selectReleaseTaskRootCandidate(task, [candidate(outer), candidate(inner)])?.absolutePath, inner);
+    assert.equal(
+      selectReleaseTaskRootCandidate(task, [candidate(outer)]),
+      undefined,
+      "a containing root is not sufficient when the task is not its direct child"
+    );
+  });
+
+  void it("validates repaired progress in the same release invocation", async () => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-release-repair-"));
+    const oldRoot = path.join(workspace, "plans");
+    const newRoot = path.join(workspace, ".ensemble");
+    const task = path.join(newRoot, "2026-01-01_task_1");
+    const atomic = suppressAtomicProgressWrite();
+    try {
+      const result = await validateReleaseTaskOwnership(task, migratedProgress(oldRoot, workspace), [candidate(newRoot)]);
+      assert.equal(result.ok, true);
+      assert.equal(result.ok && result.progress.ownership?.metaRoot, newRoot);
+    } finally {
+      atomic.restore();
+      fs.rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+
+  void it("repairs a differently cased Windows task path selected by release", async function (this: { skip?: () => void }) {
+    if (process.platform !== "win32") {
+      this.skip?.();
+      return;
+    }
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "Ensemble-Release-Case-"));
+    const oldRoot = path.join(workspace, "plans");
+    const newRoot = path.join(workspace, ".Ensemble");
+    const task = path.join(newRoot, "2026-01-01_task_1");
+    const atomic = suppressAtomicProgressWrite();
+    try {
+      const result = await validateReleaseTaskOwnership(
+        task.toLowerCase(),
+        migratedProgress(oldRoot, workspace),
+        [candidate(newRoot)]
+      );
+      assert.equal(result.ok, true, "Windows path casing must not defeat the direct-parent repair check");
+    } finally {
+      atomic.restore();
+      fs.rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+});
+
+void describe("automatic implementation dispatch gate", () => {
+  void it("dispatches only an approved auto-advance into Implementation", () => {
+    assert.equal(shouldScheduleAutomaticImplementation("impl", false), false);
+    assert.equal(shouldScheduleAutomaticImplementation("impl", true), true);
+    assert.equal(shouldScheduleAutomaticImplementation("publish", true), false);
+    assert.equal(shouldScheduleAutomaticImplementation(undefined, true), false);
+  });
+
+  void it("uses the production review dispatch seam only when the gate is armed", () => {
+    const original = automationChainModule.scheduleAutomationChain;
+    const dispatches: AutomationDispatch[] = [];
+    automationChainModule.scheduleAutomationChain = (dispatch: AutomationDispatch): Promise<boolean> => {
+      dispatches.push(dispatch);
+      return Promise.resolve(true);
+    };
+    try {
+      assert.equal(
+        scheduleAutomaticImplementationAfterReview("impl", false, "/workspace/.ensemble/task", undefined),
+        false,
+        "gate off must leave an auto-advanced task ready for manual implementation"
+      );
+      assert.deepEqual(dispatches, []);
+
+      assert.equal(
+        scheduleAutomaticImplementationAfterReview("impl", true, "/workspace/.ensemble/task", undefined),
+        true
+      );
+      assert.equal(dispatches.length, 1);
+      assert.deepEqual(dispatches[0], {
+        command: "vs-code-ai-helper.runImplementationWithAI",
+        arg: { taskFolderPath: "/workspace/.ensemble/task" },
+        taskKey: "/workspace/.ensemble/task",
+      });
+
+      assert.equal(
+        scheduleAutomaticImplementationAfterReview("publish", true, "/workspace/.ensemble/task", undefined),
+        false,
+        "non-Implementation auto-advance must never schedule implementation"
+      );
+      assert.equal(dispatches.length, 1);
+    } finally {
+      automationChainModule.scheduleAutomationChain = original;
+    }
   });
 });
 

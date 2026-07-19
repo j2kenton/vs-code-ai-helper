@@ -36,6 +36,7 @@ import { registerScheduleTaskResumeCommand } from "./commands/scheduleTaskResume
 import { registerMarkTaskDoneCommand } from "./commands/markTaskDone";
 import { registerViewStageChangesCommands } from "./commands/viewStageChanges";
 import { registerRenameTaskCommands } from "./commands/renameTask";
+import { registerConfigureStepModelsCommand } from "./commands/configureStepModels";
 import { TaskTreeProvider, TASKS_VIEW_ID, TaskNode, StageNode, EmptyTasksNode } from "./views/taskTreeProvider";
 import { TaskStatusBar } from "./views/taskStatusBar";
 import { SettingsViewProvider } from "./views/settingsView";
@@ -55,7 +56,7 @@ import { finishFinalization, recoverFinalizationTree } from "./state/finalizatio
 import { PendingOperationsStore } from "./state/pendingOperationsStore";
 import { recoverActivationCheckpoint } from "./state/taskActivationCoordinator";
 import { readTaskProgress } from "./utils/taskProgressUtils";
-import { migrateEnabledProvidersForExistingModels, migrateSettingsScope } from "./config/settings";
+import { installAutoImplementConfirmation, migrateEnabledProvidersForExistingModels, migrateSettingsNamespace, migrateSettingsScope } from "./config/settings";
 
 /**
  * FileDecorationProvider for the synthetic `current-task:` URI scheme.
@@ -93,10 +94,12 @@ export function activate(context: vscode.ExtensionContext): void {
   // Scope migration must resolve before the provider migration, which
   // inspects enabledProviders' post-migration state to decide whether it
   // still needs to run.
-  void migrateSettingsScope()
+  void migrateSettingsNamespace(context)
+    .then(() => migrateSettingsScope())
     .catch(error => console.error("Settings scope migration failed", error))
     .then(() => migrateEnabledProvidersForExistingModels())
     .catch(error => console.error("Provider settings migration failed", error));
+  context.subscriptions.push(installAutoImplementConfirmation(context));
   void vscode.commands.executeCommand("setContext", "vs-code-ai-helper.tasksInitialized", false);
   // Recover interrupted operations before commands become available. They are
   // retained for reconciliation rather than silently discarded.
@@ -169,6 +172,7 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(ChatViewProvider.viewType, chatViewProvider)
   );
+  registerConfigureStepModelsCommand(context, settingsViewProvider);
 
   // Register commands — pass the shared inventory, currentTaskStore, and
   // context to every command that needs them.

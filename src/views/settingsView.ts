@@ -7,10 +7,11 @@ import {
 } from "../utils/modelSelection";
 import {
   getModelSettings,
+  getEnabledProviders,
   isUnsavedSettingsWarningEnabled,
+  setEnabledProviders,
   setModelSettings,
   setUnsavedSettingsWarningEnabled,
-  targetFor,
 } from "../config/settings";
 import { ModelSettings } from "../utils/modelFallback";
 import { getQuotaStatusText } from "../utils/quota";
@@ -125,8 +126,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           break;
         }
         case "saveProviders": {
-          const config = vscode.workspace.getConfiguration("vs-code-ai-helper");
-          await config.update("enabledProviders", data.enabledProviders, targetFor("enabledProviders"));
+          await setEnabledProviders(data.enabledProviders);
           NotificationRouter.showInformation("Provider selection saved.");
           break;
         }
@@ -304,7 +304,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     // itself guards this refresh with the unsaved-changes warning when its
     // form is dirty (an interceptable discard path).
     const configListener = vscode.workspace.onDidChangeConfiguration((event) => {
-      if (webviewView.visible && event.affectsConfiguration("vs-code-ai-helper")) {
+      if (webviewView.visible && event.affectsConfiguration("ensemble")) {
         void this._postInit(webviewView.webview);
       }
     });
@@ -339,9 +339,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       stages: AI_MODEL_STAGES,
       stageNames: STAGE_DISPLAY_NAMES,
       quotaStatus: this._buildQuotaStatus(),
-      enabledProviders: vscode.workspace
-        .getConfiguration("vs-code-ai-helper")
-        .get<Record<string, boolean>>("enabledProviders", {}),
+      enabledProviders: getEnabledProviders(),
       providers: PROVIDER_ACCOUNT_ENTRIES.map((provider) => ({
         id: provider.id,
         label: provider.label,
@@ -451,23 +449,45 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Ensemble AI Models</title>
         <style>
+          :root {
+            --ensemble-space-1: 4px;
+            --ensemble-space-2: 8px;
+            --ensemble-space-3: 12px;
+            --ensemble-space-4: 16px;
+            --ensemble-space-half: 2px;
+            --ensemble-border-width: 1px;
+            --ensemble-focus-width: 2px;
+            --ensemble-radius: 3px;
+            --ensemble-small-font-size: 0.9em;
+          }
           body {
             font-family: var(--vscode-font-family);
             color: var(--vscode-foreground);
-            padding: 10px;
+            padding: var(--ensemble-space-3);
+            margin: 0;
             background-color: var(--vscode-editor-background);
+          }
+          .visually-hidden {
+            position: absolute;
+            width: 1px;
+            height: 1px;
+            padding: 0;
+            margin: -1px;
+            overflow: hidden;
+            clip: rect(0, 0, 0, 0);
+            border: 0;
           }
           select, input[type="text"] {
             width: 100%;
             background-color: var(--vscode-input-background, var(--vscode-editor-background));
             color: var(--vscode-input-foreground, var(--vscode-foreground));
-            border: 1px solid var(--vscode-input-border, var(--vscode-widget-border));
-            padding: 4px;
-            border-radius: 2px;
+            border: var(--ensemble-border-width) solid var(--vscode-input-border, var(--vscode-widget-border));
+            padding: var(--ensemble-space-1);
+            border-radius: var(--ensemble-radius);
             box-sizing: border-box;
           }
           select:focus, input[type="text"]:focus {
-            outline: 1px solid var(--vscode-focusBorder);
+            outline: var(--ensemble-border-width) solid var(--vscode-focusBorder);
           }
           option {
             background-color: var(--vscode-dropdown-background, var(--vscode-editor-background));
@@ -484,59 +504,63 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             position: absolute;
             left: 0;
             right: 0;
-            top: calc(100% + 2px);
+            top: calc(100% + var(--ensemble-space-1));
             z-index: 10;
             max-height: 220px;
             overflow-y: auto;
             background-color: var(--vscode-dropdown-background, var(--vscode-editorWidget-background, var(--vscode-editor-background)));
             color: var(--vscode-dropdown-foreground, var(--vscode-foreground));
-            border: 1px solid var(--vscode-dropdown-border, var(--vscode-widget-border));
-            box-shadow: 0 2px 8px var(--vscode-widget-shadow, rgba(0, 0, 0, 0.35));
+            border: var(--ensemble-border-width) solid var(--vscode-dropdown-border, var(--vscode-widget-border));
+            box-shadow: 0 var(--ensemble-space-half) var(--ensemble-space-2) var(--vscode-widget-shadow);
           }
           .model-option {
-            padding: 5px 7px;
+            padding: var(--ensemble-space-1) var(--ensemble-space-2);
             cursor: pointer;
             white-space: normal;
             overflow-wrap: anywhere;
           }
           .model-option[aria-selected="true"],
           .model-option:hover {
-            background-color: var(--vscode-list-hoverBackground, var(--vscode-list-activeSelectionBackground, rgba(127, 127, 127, 0.25)));
-            color: var(--vscode-list-hoverForeground, var(--vscode-list-activeSelectionForeground, var(--vscode-foreground)));
+            background-color: var(--vscode-list-hoverBackground);
+            color: var(--vscode-list-hoverForeground);
           }
           .model-option.empty {
             color: var(--vscode-descriptionForeground);
             cursor: default;
           }
           .quota-text {
-            font-size: 0.85em;
+            font-size: var(--ensemble-small-font-size);
             color: var(--vscode-descriptionForeground);
-            margin-top: 2px;
+            margin-top: var(--ensemble-space-half);
           }
           .provider-disabled-note {
-            font-size: 0.85em;
-            color: var(--vscode-errorForeground, #f48771);
-            margin-top: 2px;
+            font-size: var(--ensemble-small-font-size);
+            color: var(--vscode-errorForeground);
+            margin-top: var(--ensemble-space-half);
           }
           .btn-container {
             display: flex;
-            gap: 10px;
-            margin-top: 15px;
+            gap: var(--ensemble-space-2);
+            margin-top: var(--ensemble-space-4);
           }
           #loading-indicator {
             color: var(--vscode-descriptionForeground);
-            padding: 12px 0;
+            padding: var(--ensemble-space-3) 0;
           }
           button {
             background-color: var(--vscode-button-background);
             color: var(--vscode-button-foreground);
             border: none;
-            padding: 6px 12px;
+            padding: var(--ensemble-space-1) var(--ensemble-space-3);
             cursor: pointer;
-            border-radius: 2px;
+            border-radius: var(--ensemble-radius);
           }
           button:hover {
             background-color: var(--vscode-button-hoverBackground);
+          }
+          button:focus-visible, select:focus-visible, input[type="text"]:focus-visible {
+            outline: var(--ensemble-focus-width) solid var(--vscode-focusBorder);
+            outline-offset: var(--ensemble-border-width);
           }
           button:disabled {
             opacity: 0.5;
@@ -550,21 +574,21 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             background-color: var(--vscode-button-secondaryHoverBackground);
           }
           .stage-row {
-            padding: 10px 0 6px;
-            border-bottom: 1px solid var(--vscode-widget-border);
+            padding: var(--ensemble-space-3) 0 var(--ensemble-space-2);
+            border-bottom: var(--ensemble-border-width) solid var(--vscode-widget-border);
           }
           .stage-heading {
-            margin: 0 0 8px;
+            margin: 0 0 var(--ensemble-space-2);
             font-size: 1em;
             font-weight: bold;
           }
           .stage-row.highlighted {
-            background-color: var(--vscode-editor-findMatchHighlightBackground, rgba(234, 92, 0, 0.3));
+            background-color: var(--vscode-editor-findMatchHighlightBackground);
           }
           #unsaved-warning-overlay {
             position: fixed;
             inset: 0;
-            background: rgba(0, 0, 0, 0.45);
+            background: var(--vscode-editorWidget-background);
             z-index: 50;
             display: flex;
             align-items: center;
@@ -572,24 +596,63 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           }
           #unsaved-warning-dialog {
             background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
-            border: 1px solid var(--vscode-widget-border);
-            box-shadow: 0 4px 16px var(--vscode-widget-shadow, rgba(0,0,0,0.5));
-            padding: 16px;
+            border: var(--ensemble-border-width) solid var(--vscode-widget-border);
+            box-shadow: 0 var(--ensemble-space-1) var(--ensemble-space-4) var(--vscode-widget-shadow);
+            padding: var(--ensemble-space-4);
             max-width: 420px;
           }
           .restored-note {
-            background: var(--vscode-inputValidation-infoBackground, rgba(64,128,255,0.15));
-            border: 1px solid var(--vscode-inputValidation-infoBorder, rgba(64,128,255,0.4));
-            padding: 6px 8px;
-            margin: 8px 0;
-            font-size: 0.9em;
+            background: var(--vscode-inputValidation-infoBackground);
+            border: var(--ensemble-border-width) solid var(--vscode-inputValidation-infoBorder);
+            padding: var(--ensemble-space-2);
+            margin: var(--ensemble-space-2) 0;
+            font-size: var(--ensemble-small-font-size);
+          }
+          .dialog-checkbox {
+            display: block;
+            margin: var(--ensemble-space-3) 0;
+          }
+          .provider-row {
+            display: flex;
+            align-items: center;
+            gap: var(--ensemble-space-2);
+            flex-wrap: wrap;
+            margin: var(--ensemble-space-1) 0;
+          }
+          .provider-help {
+            margin: var(--ensemble-space-2) 0 0;
+            font-size: var(--ensemble-small-font-size);
+            color: var(--vscode-descriptionForeground);
+          }
+          .form-row {
+            margin-bottom: var(--ensemble-space-2);
+          }
+          .field-label {
+            display: block;
+            margin-bottom: var(--ensemble-space-half);
+            font-size: var(--ensemble-small-font-size);
+          }
+          .extra-backup {
+            display: flex;
+            gap: var(--ensemble-space-1);
+            margin-top: var(--ensemble-space-1);
+            align-items: flex-start;
+          }
+          .extra-backup .model-combobox {
+            flex: 1;
+          }
+          .add-backup {
+            margin-top: var(--ensemble-space-1);
+          }
+          .backup-limit {
+            margin-left: var(--ensemble-space-1);
+            font-size: var(--ensemble-small-font-size);
           }
         </style>
       </head>
       <body>
-        <h2 style="font-size: 1.2em; margin-bottom: 10px;">AI Models</h2>
-        <div role="status" aria-live="polite" id="status-region" style="position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); border: 0;"></div>
-        <div role="alert" aria-live="assertive" id="alert-region" style="position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); border: 0;"></div>
+        <div role="status" aria-live="polite" id="status-region" class="visually-hidden"></div>
+        <div role="alert" aria-live="assertive" id="alert-region" class="visually-hidden"></div>
 
         <div id="loading-indicator">Loading settings…</div>
 
@@ -681,12 +744,13 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                 '<div id="unsaved-warning-dialog" role="alertdialog" aria-modal="true">' +
                 '<p><strong>You have unsaved model settings.</strong></p>' +
                 '<p>' + escapeHtml(actionLabel) + ' will discard them.</p>' +
-                '<label style="display:block;margin:10px 0"><input type="checkbox" id="unsaved-dont-show"> Don\\'t show again</label>' +
+                '<label class="dialog-checkbox"><input type="checkbox" id="unsaved-dont-show"> Don\\'t show again</label>' +
                 '<div class="btn-container">' +
                 '<button id="unsaved-discard">Discard Changes</button>' +
                 '<button id="unsaved-keep" class="secondary">Keep Editing</button>' +
                 '</div></div>';
               document.body.appendChild(overlay);
+              const opener = document.activeElement;
               const finish = (proceed) => {
                 const dontShow = overlay.querySelector('#unsaved-dont-show').checked;
                 if (dontShow) {
@@ -694,10 +758,18 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                   vscode.postMessage({ type: 'suppressUnsavedWarning' });
                 }
                 overlay.remove();
+                if (opener instanceof HTMLElement) opener.focus();
                 resolve(proceed);
               };
               overlay.querySelector('#unsaved-discard').addEventListener('click', () => finish(true));
               overlay.querySelector('#unsaved-keep').addEventListener('click', () => finish(false));
+              overlay.addEventListener('keydown', event => {
+                if (event.key === 'Escape') {
+                  event.preventDefault();
+                  finish(false);
+                }
+              });
+              overlay.querySelector('#unsaved-keep').focus();
             });
           }
 
@@ -1029,9 +1101,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             if (!container || container.children.length >= 9) return;
             const kind = 'backupx' + (++extraBackupSeq);
             const item = document.createElement('div');
-            item.style.cssText = 'display:flex;gap:4px;margin-top:4px;align-items:flex-start';
+            item.className = 'extra-backup';
             item.innerHTML =
-              '<div style="flex:1">' + modelComboboxHtml(kind, stage, selectedId || '', false) + '</div>' +
+              modelComboboxHtml(kind, stage, selectedId || '', false) +
               '<button type="button" class="remove-backup" aria-label="Remove backup">×</button>';
             item.querySelector('.remove-backup').addEventListener('click', () => {
               item.remove();
@@ -1058,7 +1130,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             container.innerHTML =
               '<fieldset><legend>Provider Selection</legend>' +
               providers.map(provider =>
-                '<div style="margin:4px 0;display:flex;align-items:center;gap:8px;flex-wrap:wrap">' +
+                '<div class="provider-row">' +
                 '<label><input type="checkbox" data-provider="' + escapeHtml(provider.id) + '" ' + (isProviderChecked(provider.id) ? 'checked' : '') + '> ' + escapeHtml(provider.label) + '</label>' +
                 '<button type="button" class="secondary provider-signin" data-signin-provider="' + escapeHtml(provider.id) + '" title="' + escapeHtml(provider.signInGuidance || 'Runs the provider\\'s login command in a visible terminal') + '">' + escapeHtml(provider.signInLabel || 'Sign in') + '</button>' +
                 (provider.usageEnabled
@@ -1066,8 +1138,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                   : '<button type="button" class="secondary provider-usage" disabled title="' + escapeHtml(provider.usageTooltip) + '">Check usage</button>') +
                 '</div>'
               ).join('') +
-              '<p style="margin:8px 0 0;font-size:0.9em">Enabled providers determine which models are offered below. Sign-in and usage checks run in a visible terminal; the extension reports them as launched, not as succeeded.</p>' +
-              '<div class="btn-container" style="margin-top:8px"><button id="save-providers-btn" class="secondary">Save Provider Selection</button></div>' +
+              '<p class="provider-help">Enabled providers determine which models are offered below. Sign-in and usage checks run in a visible terminal; the extension reports them as launched, not as succeeded.</p>' +
+              '<div class="btn-container"><button id="save-providers-btn" class="secondary">Save Provider Selection</button></div>' +
               '</fieldset>';
             container.querySelectorAll('[data-signin-provider]').forEach(button => {
               button.addEventListener('click', () => {
@@ -1107,26 +1179,26 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
 
               row.innerHTML = \`
                 <h3 class="stage-heading">\${stageDisplayNames[stage] || stage}</h3>
-                <div style="margin-bottom: 8px;">
-                  <label for="primary-input-\${stage}" style="font-size: 0.9em; display:block; margin-bottom: 2px;">Primary Model:</label>
+                <div class="form-row">
+                  <label for="primary-input-\${stage}" class="field-label">Primary model:</label>
                   \${modelComboboxHtml('primary', stage, setting.primary || '', false)}
                   \${quotaText}
                 </div>
-                <div style="margin-bottom: 8px;">
-                  <label for="strategy-\${stage}" style="font-size: 0.9em; display:block; margin-bottom: 2px;">Fallback Strategy:</label>
+                <div class="form-row">
+                  <label for="strategy-\${stage}" class="field-label">Fallback strategy:</label>
                   <select id="strategy-\${stage}">
                     <option value="switch-to-backup" \${setting.strategy === 'switch-to-backup' ? 'selected' : ''}>Switch to Backup</option>
                     <option value="pause-and-resume" \${setting.strategy === 'pause-and-resume' ? 'selected' : ''}>Pause until available</option>
                     <option value="alert-and-wait" \${setting.strategy === 'alert-and-wait' ? 'selected' : ''}>Alert and wait</option>
                   </select>
                 </div>
-                <div style="margin-bottom: 8px;">
-                  <label for="backup-input-\${stage}" style="font-size: 0.9em; display:block; margin-bottom: 2px;">Backup models (tried in order):</label>
+                <div class="form-row">
+                  <label for="backup-input-\${stage}" class="field-label">Backup models (tried in order):</label>
                   \${modelComboboxHtml('backup', stage, backupModels[0] || '', false)}
                   \${backupQuotaText}
                   <div class="extra-backups"></div>
-                  <button type="button" class="add-backup" style="margin-top:4px">+ Add another backup</button>
-                  <span class="backup-limit" style="margin-left:4px;font-size:0.9em">1/10</span>
+                  <button type="button" class="add-backup">+ Add another backup</button>
+                  <span class="backup-limit">1/10</span>
                 </div>
               \`;
 
@@ -1218,8 +1290,21 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                 '<button id="destructive-cancel" class="secondary">Cancel</button>' +
                 '</div></div>';
               document.body.appendChild(overlay);
-              overlay.querySelector('#destructive-confirm').addEventListener('click', () => { overlay.remove(); resolve(true); });
-              overlay.querySelector('#destructive-cancel').addEventListener('click', () => { overlay.remove(); resolve(false); });
+              const opener = document.activeElement;
+              const finish = (proceed) => {
+                overlay.remove();
+                if (opener instanceof HTMLElement) opener.focus();
+                resolve(proceed);
+              };
+              overlay.querySelector('#destructive-confirm').addEventListener('click', () => finish(true));
+              overlay.querySelector('#destructive-cancel').addEventListener('click', () => finish(false));
+              overlay.addEventListener('keydown', event => {
+                if (event.key === 'Escape') {
+                  event.preventDefault();
+                  finish(false);
+                }
+              });
+              overlay.querySelector('#destructive-cancel').focus();
             });
           }
 

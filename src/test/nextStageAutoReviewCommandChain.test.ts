@@ -30,7 +30,7 @@ import * as path from "node:path";
 import { describe, it } from "node:test";
 import * as vscode from "vscode";
 
-import { registerReviewActionCommands } from "../commands/reviewActions";
+import { registerReviewActionCommands, runReviewForFolder } from "../commands/reviewActions";
 import { StageNode } from "../views/taskTreeProvider";
 import {
   StatusTreeProvider,
@@ -47,6 +47,7 @@ import { readTaskProgress, IncompleteTask } from "../utils/taskProgressUtils";
 import { REVIEW_STAGES, TaskProgress, TaskStage } from "../types/taskProgress";
 import type { AgentRunRequest, AgentRunResult } from "../types/agentRunner";
 import { DISCLAIMER_VERSION } from "../legal/disclaimerVersion";
+import type { AutomationDispatch } from "../utils/automationChain";
 
 // ── Provider-boundary seams, monkey-patched via the shared CommonJS module
 // objects (the same technique as markTaskDoneUngated.test.ts /
@@ -59,9 +60,11 @@ const runnerRegistryModule = require("../runners/runnerRegistry") as Record<stri
 const promptTemplatesModule = require("../utils/promptTemplates") as Record<string, unknown>;
 const runLogModule = require("../utils/runLog") as Record<string, unknown>;
 const contextPackModule = require("../utils/contextPack") as Record<string, unknown>;
+const automationChainModule = require("../utils/automationChain") as Record<string, unknown>;
 /* eslint-enable @typescript-eslint/no-var-requires */
 
 const REAL_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-cmd-chain-"));
+let autoImplementationFolderCounter = 0;
 
 const FAKE_REVIEW =
   "Readiness: 6/10\n\n- Summary verdict: needs changes.\n- Blocking issues: one.\n";
@@ -329,6 +332,80 @@ void describe("nextStage command → auto-review chain (command-layer end-to-end
     } finally {
       for (const p of patches.reverse()) { p.restore(); }
       for (const sub of context.subscriptions) { sub.dispose(); }
+      wsStub.restore();
+      fsBridge.restore();
+      provider.dispose();
+      deactivateNotificationRouter();
+    }
+  });
+
+  void it("a passing plan review advances to Implementation and dispatches only when auto-implement is armed", async () => {
+    const provider = new StatusTreeProvider();
+    initNotificationRouter(provider);
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const workspaceRoot = { uri: vscode.Uri.file(REAL_ROOT), name: "root", index: 0 } as vscode.WorkspaceFolder;
+    const dispatches: AutomationDispatch[] = [];
+    const fakeRunner = {
+      id: "stub-runner",
+      label: "Stub Provider",
+      capabilities: { planning: true, review: true, assistant: false },
+      isAvailable: (): Promise<{ available: boolean }> => Promise.resolve({ available: true }),
+      run: async (request: AgentRunRequest): Promise<AgentRunResult> => {
+        await fs.promises.writeFile(request.outputFile.fsPath, "Readiness: 9/10\n\n- Ready.\n", "utf8");
+        return { runnerId: "stub-runner", status: "completed" };
+      },
+    };
+
+    const patches: Patched[] = [
+      patch(settingsModule, "isAutoAdvanceEnabled", () => true),
+      patch(settingsModule, "getAutoAdvanceScoreThreshold", () => 8),
+      patch(modelSelectionModule, "resolveModelForStage", () => Promise.resolve({ source: "settings", modelId: "stub:model" })),
+      patch(modelSelectionModule, "resolveFreshModelForStage", () => Promise.resolve({ source: "settings", modelId: "stub:model" })),
+      patch(modelSelectionModule, "resolveConfiguredReviewStages", () => Promise.resolve(new Set(REVIEW_STAGES))),
+      patch(runnerRegistryModule, "resolveRunnerForModel", () => ({
+        runner: fakeRunner, provider: "copilot", providerLabel: "Stub Provider", nativeModelId: undefined,
+      })),
+      patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.resolve("stub prompt")),
+      patch(runLogModule, "writeRunLog", () => Promise.resolve(undefined)),
+      patch(contextPackModule, "writeContextPack", (folder: vscode.Uri) =>
+        Promise.resolve(vscode.Uri.file(path.join(folder.fsPath, "context-pack.md")))),
+      patch(automationChainModule, "scheduleAutomationChain", (dispatch: AutomationDispatch): Promise<boolean> => {
+        dispatches.push(dispatch);
+        return Promise.resolve(true);
+      }),
+    ];
+
+    try {
+      for (const armed of [false, true]) {
+        dispatches.length = 0;
+        patches.push(patch(settingsModule, "isAutoImplementAfterReviewEnabled", () => armed));
+        const { folderPath } = makeTaskFolder(
+          `auto-impl-${armed}-${++autoImplementationFolderCounter}`,
+          "plan-low-review"
+        );
+        const contextPack = path.join(folderPath, "context-pack.md");
+        fs.writeFileSync(contextPack, "# Context\n", "utf8");
+        try {
+          await runReviewForFolder(
+            vscode.Uri.file(REAL_ROOT),
+            vscode.Uri.file(folderPath),
+            workspaceRoot,
+            "plan-low-review",
+            true
+          );
+          assert.equal((await readTaskProgress(vscode.Uri.file(folderPath)))?.currentStage, "impl");
+          assert.equal(fs.existsSync(path.join(folderPath, "plan-final.md")), true, "auto-advance promotes the plan before implementation");
+          assert.equal(dispatches.length, armed ? 1 : 0, "only an armed gate dispatches implementation");
+          if (armed) {
+            assert.equal(dispatches[0]?.command, "vs-code-ai-helper.runImplementationWithAI");
+          }
+        } finally {
+          patches.pop()?.restore();
+        }
+      }
+    } finally {
+      for (const p of patches.reverse()) { p.restore(); }
       wsStub.restore();
       fsBridge.restore();
       provider.dispose();

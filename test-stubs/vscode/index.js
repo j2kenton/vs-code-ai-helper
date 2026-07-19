@@ -368,6 +368,8 @@ const workspace = {
   }),
   onDidChangeConfiguration: (listener) => workspace._configurationChanges.event(listener),
   _configurationChanges: new EventEmitter(),
+  onDidChangeWorkspaceFolders: (listener) => workspace._workspaceFolderChanges.event(listener),
+  _workspaceFolderChanges: new EventEmitter(),
 };
 
 class TreeView {

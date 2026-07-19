@@ -3,7 +3,11 @@ import { AI_MODEL_STAGES, TaskStage } from "../types/taskProgress";
 import { FallbackStrategy, ModelSettings } from "../utils/modelFallback";
 import { normalizeQualifiedModelId, parseModelSelection } from "../runners/providers";
 
-const CONFIG_SECTION = "vs-code-ai-helper";
+/** Settings displayed to users. Command and extension identifiers deliberately
+ * retain their historical `vs-code-ai-helper` prefix for compatibility. */
+const CONFIG_SECTION = "ensemble";
+const LEGACY_CONFIG_SECTION = "vs-code-ai-helper";
+const SETTINGS_NAMESPACE_MIGRATION_KEY = "ensemble.settingsNamespace.v1";
 const META_RESOURCES_PATH_KEY = "metaResourcesPath";
 const AI_MODEL_DEFAULTS_KEY = "aiModelDefaults";
 const META_FILES_HIDDEN_KEY = "metaFilesHidden";
@@ -12,14 +16,48 @@ const PUBLISH_VERIFICATION_COMMANDS_KEY = "publishVerificationCommands";
 const FAST_FORWARD_MAX_ITERATIONS_KEY = "fastForwardMaxIterations";
 const AUTO_ADVANCE_ENABLED_KEY = "autoAdvanceEnabled";
 const AUTO_ADVANCE_SCORE_KEY = "autoAdvanceScoreThreshold";
+const AUTO_IMPLEMENT_AFTER_REVIEW_KEY = "autoImplementAfterReview";
+const AUTO_IMPLEMENT_CONFIRMED_KEY = "ensemble.autoImplementAfterReview.confirmed.v1";
 const COMPLETE_AND_MOVE_ON_TRIGGERS_AI_KEY = "completeAndMoveOnTriggersAI";
 const UNSAVED_SETTINGS_WARNING_KEY = "warnings.unsavedSettings";
 const LARGE_TOKEN_REQUEST_WARNING_KEY = "warnings.largeTokenRequest";
 
+const ALL_SETTING_KEYS = [
+  AI_MODEL_DEFAULTS_KEY, "modelSettings", UNSAVED_SETTINGS_WARNING_KEY,
+  LARGE_TOKEN_REQUEST_WARNING_KEY, ENABLED_PROVIDERS_KEY,
+  FAST_FORWARD_MAX_ITERATIONS_KEY, AUTO_ADVANCE_ENABLED_KEY,
+  COMPLETE_AND_MOVE_ON_TRIGGERS_AI_KEY, AUTO_ADVANCE_SCORE_KEY,
+  "fastForwardStopLevel", "fastForwardUseAcceptanceThreshold",
+  "autoReviewAfterPlan", "autoReviewAfterImplementation",
+  "maxImplementationIterations",
+  "allowDirtyWorktreeChanges", "desktopNotifications",
+  PUBLISH_VERIFICATION_COMMANDS_KEY,
+] as const;
+
+/**
+ * Read a setting without allowing the active schema default to mask an
+ * explicitly configured legacy value during the compatibility window.
+ * Values are resolved at each scope before proceeding to the next one.
+ */
+function readSetting<T>(key: string, fallback: T, resource?: vscode.Uri): T {
+  const activeConfiguration = vscode.workspace.getConfiguration(CONFIG_SECTION, resource);
+  const legacyConfiguration = vscode.workspace.getConfiguration(LEGACY_CONFIG_SECTION, resource);
+  const active = activeConfiguration.inspect<T>(key);
+  const legacy = legacyConfiguration.inspect<T>(key);
+  for (const field of ["workspaceFolderValue", "workspaceValue", "globalValue"] as const) {
+    if (active?.[field] !== undefined) return active[field] as T;
+    if (legacy?.[field] !== undefined) return legacy[field] as T;
+  }
+  // inspect() is authoritative for explicit-value precedence.  get() is only
+  // the final schema-default fallback (and keeps lightweight configuration
+  // adapters used by callers and tests compatible with VS Code's API).
+  const value = activeConfiguration.get<T>(key, fallback);
+  return value === undefined ? fallback : value;
+}
+
 /** Whether the unsaved-settings-change warning is shown (true = warn). */
 export function isUnsavedSettingsWarningEnabled(): boolean {
-  return vscode.workspace.getConfiguration(CONFIG_SECTION)
-    .get<boolean>(UNSAVED_SETTINGS_WARNING_KEY, true);
+  return readSetting(UNSAVED_SETTINGS_WARNING_KEY, true);
 }
 
 /** Persist the "Don't show again" opt-out for the unsaved-settings warning. */
@@ -30,8 +68,7 @@ export async function setUnsavedSettingsWarningEnabled(enabled: boolean): Promis
 
 /** Whether the large-AI-token-request warning is shown (true = warn). */
 export function isLargeTokenRequestWarningEnabled(): boolean {
-  return vscode.workspace.getConfiguration(CONFIG_SECTION)
-    .get<boolean>(LARGE_TOKEN_REQUEST_WARNING_KEY, true);
+  return readSetting(LARGE_TOKEN_REQUEST_WARNING_KEY, true);
 }
 
 /** Persist the "Proceed and don't ask again" opt-out for the large-token warning. */
@@ -78,7 +115,7 @@ export function strongestAutoTriggerMode(
  * values still present in user settings (true = "auto", false = "off").
  */
 function readAutoTriggerMode(key: string, defaultMode: AutoTriggerMode): AutoTriggerMode {
-  const raw = vscode.workspace.getConfiguration(CONFIG_SECTION).get<unknown>(key);
+  const raw = readSetting<unknown>(key, defaultMode);
   if (raw === true) return "auto";
   if (raw === false) return "off";
   if (raw === "off" || raw === "auto" || raw === "auto-fast-forward") return raw;
@@ -123,6 +160,50 @@ export function targetFor(key: string): vscode.ConfigurationTarget {
 }
 
 /**
+ * Copies explicitly configured legacy settings into the Ensemble namespace.
+ * Schema defaults never participate in this decision: a value already set in
+ * `ensemble.*` always wins, and every workspace-folder override is considered
+ * independently.  The old keys remain declared (and deprecated) for one
+ * release so VS Code can continue to read old settings.json files.
+ */
+export async function migrateSettingsNamespace(context: vscode.ExtensionContext): Promise<void> {
+  // Keep the marker machine-local. Re-running is still safe, but avoiding
+  // needless configuration writes prevents Settings Sync churn on activation.
+  if (context.globalState.get<boolean>(SETTINGS_NAMESPACE_MIGRATION_KEY, false)) return;
+
+  const copyScope = async (
+    key: string,
+    target: vscode.ConfigurationTarget,
+    resource?: vscode.Uri
+  ): Promise<void> => {
+    const legacy = vscode.workspace.getConfiguration(LEGACY_CONFIG_SECTION, resource).inspect<unknown>(key);
+    const active = vscode.workspace.getConfiguration(CONFIG_SECTION, resource).inspect<unknown>(key);
+    const legacyValue = target === vscode.ConfigurationTarget.Global
+      ? legacy?.globalValue
+      : target === vscode.ConfigurationTarget.Workspace
+        ? legacy?.workspaceValue
+        : legacy?.workspaceFolderValue;
+    const activeValue = target === vscode.ConfigurationTarget.Global
+      ? active?.globalValue
+      : target === vscode.ConfigurationTarget.Workspace
+        ? active?.workspaceValue
+        : active?.workspaceFolderValue;
+    if (activeValue === undefined && legacyValue !== undefined) {
+      await vscode.workspace.getConfiguration(CONFIG_SECTION, resource).update(key, legacyValue, target);
+    }
+  };
+
+  for (const key of ALL_SETTING_KEYS) {
+    await copyScope(key, vscode.ConfigurationTarget.Global);
+    await copyScope(key, vscode.ConfigurationTarget.Workspace);
+    for (const folder of vscode.workspace.workspaceFolders ?? []) {
+      await copyScope(key, vscode.ConfigurationTarget.WorkspaceFolder, folder.uri);
+    }
+  }
+  await context.globalState.update(SETTINGS_NAMESPACE_MIGRATION_KEY, true);
+}
+
+/**
  * One-time cutover of previously workspace-scoped settings to user (Global)
  * settings, so a new workspace inherits them instead of starting blank.
  * Must run before migrateEnabledProvidersForExistingModels(), which inspects
@@ -142,6 +223,7 @@ export async function migrateSettingsScope(): Promise<void> {
     FAST_FORWARD_USE_ACCEPTANCE_KEY,
     AUTO_REVIEW_AFTER_PLAN_KEY,
     AUTO_REVIEW_AFTER_IMPLEMENTATION_KEY,
+    AUTO_IMPLEMENT_AFTER_REVIEW_KEY,
     ALLOW_DIRTY_WORKTREE_CHANGES_KEY,
     DESKTOP_NOTIFICATIONS_KEY,
     MAX_IMPLEMENTATION_ITERATIONS_KEY,
@@ -189,8 +271,7 @@ export async function migrateSettingsScope(): Promise<void> {
  * package.json lint/test script detection in completionLint.ts.
  */
 export function getPublishVerificationCommands(): string[] {
-  const raw = vscode.workspace.getConfiguration(CONFIG_SECTION)
-    .get<unknown>(PUBLISH_VERIFICATION_COMMANDS_KEY, []);
+  const raw = readSetting<unknown>(PUBLISH_VERIFICATION_COMMANDS_KEY, []);
   if (!Array.isArray(raw)) {
     return [];
   }
@@ -208,20 +289,19 @@ export function getPublishVerificationCommands(): string[] {
  * guard stays inactive so nothing is blocked before migration runs.
  */
 export function isProviderSelectionConfigured(): boolean {
-  const inspected = vscode.workspace.getConfiguration(CONFIG_SECTION)
-    .inspect<Record<string, boolean>>(ENABLED_PROVIDERS_KEY);
-  return !!(
-    inspected &&
-    (inspected.globalValue !== undefined ||
-      inspected.workspaceValue !== undefined ||
-      inspected.workspaceFolderValue !== undefined)
-  );
+  const configured = (section: string): boolean => {
+    const inspected = vscode.workspace.getConfiguration(section)
+      .inspect<Record<string, boolean>>(ENABLED_PROVIDERS_KEY);
+    return !!(inspected && (inspected.globalValue !== undefined ||
+      inspected.workspaceValue !== undefined || inspected.workspaceFolderValue !== undefined));
+  };
+  return configured(CONFIG_SECTION) || configured(LEGACY_CONFIG_SECTION);
 }
 
 /** Providers are opt-in.  A migration on activation preserves providers that
  * are already referenced by older model settings. */
 export function isProviderEnabled(provider: string): boolean {
-  const enabled = vscode.workspace.getConfiguration(CONFIG_SECTION).get<Record<string, boolean>>(ENABLED_PROVIDERS_KEY, {});
+  const enabled = getEnabledProviders();
   // Copilot (the built-in VS Code Language Model integration) predates the
   // provider selection: existing configurations have no "copilot" key, so it
   // stays enabled unless the user explicitly unchecks it.
@@ -229,6 +309,16 @@ export function isProviderEnabled(provider: string): boolean {
     return enabled[provider] !== false;
   }
   return enabled[provider] === true;
+}
+
+/** Explicit provider selection shared by Settings and runner guards. */
+export function getEnabledProviders(): Record<string, boolean> {
+  return readSetting<Record<string, boolean>>(ENABLED_PROVIDERS_KEY, {});
+}
+
+export async function setEnabledProviders(enabled: Record<string, boolean>): Promise<void> {
+  await vscode.workspace.getConfiguration(CONFIG_SECTION)
+    .update(ENABLED_PROVIDERS_KEY, enabled, targetFor(ENABLED_PROVIDERS_KEY));
 }
 
 /**
@@ -259,7 +349,7 @@ export async function migrateEnabledProvidersForExistingModels(): Promise<void> 
 }
 
 export function getFastForwardMaxIterations(): number {
-  const value = vscode.workspace.getConfiguration(CONFIG_SECTION).get<number>(FAST_FORWARD_MAX_ITERATIONS_KEY, 5);
+  const value = readSetting(FAST_FORWARD_MAX_ITERATIONS_KEY, 5);
   return Math.max(1, Math.min(99, Math.floor(value)));
 }
 
@@ -272,18 +362,189 @@ export function isAutoAdvanceEnabled(): boolean {
   return getAutoAdvanceMode() !== "off";
 }
 
+/**
+ * Auto implementation is deliberately a separate opt-in from auto-advance.
+ * The setting may be synchronised or edited outside VS Code, so the value is
+ * not trusted until this machine has recorded the supervision acknowledgement.
+ */
+let autoImplementConfirmed = false;
+
+/**
+ * Reset the process-local acknowledgement between isolated test cases.
+ *
+ * The acknowledgement normally comes from ExtensionContext.globalState when
+ * the confirmation controller is constructed. Keeping this narrow reset seam
+ * prevents tests from depending on module execution order without changing
+ * the runtime's persisted, per-machine confirmation behavior.
+ * @internal Test support only.
+ */
+export function resetAutoImplementConfirmationForTests(): void {
+  autoImplementConfirmed = false;
+}
+
+export function getAutoImplementAfterReviewMode(): "off" | "auto" {
+  const raw = readSetting<unknown>(AUTO_IMPLEMENT_AFTER_REVIEW_KEY, "off");
+  return raw === "auto" && autoImplementConfirmed ? "auto" : "off";
+}
+
+export function isAutoImplementAfterReviewEnabled(): boolean {
+  return getAutoImplementAfterReviewMode() === "auto";
+}
+
+/**
+ * Owns the one-time, machine-local acknowledgement for automatic file
+ * changes. Configuration changes are serialised so rapid updates never show
+ * overlapping modals or accidentally clear an unrelated setting scope.
+ */
+export class AutoImplementConfirmationController implements vscode.Disposable {
+  private queue: Promise<void> = Promise.resolve();
+  private readonly listener: vscode.Disposable;
+  private readonly foldersListener: vscode.Disposable;
+  private snapshot?: AutoImplementScopeSnapshot;
+
+  constructor(private readonly context: vscode.ExtensionContext) {
+    autoImplementConfirmed = context.globalState.get<boolean>(AUTO_IMPLEMENT_CONFIRMED_KEY, false);
+    this.listener = vscode.workspace.onDidChangeConfiguration((event) => {
+      if (event.affectsConfiguration(`${CONFIG_SECTION}.${AUTO_IMPLEMENT_AFTER_REVIEW_KEY}`)) {
+        this.enqueue(false);
+      }
+    });
+    this.foldersListener = vscode.workspace.onDidChangeWorkspaceFolders(() => this.enqueue(false));
+    this.enqueue(true); // Covers settings-sync/offline edits present at activation.
+  }
+
+  dispose(): void {
+    this.listener.dispose();
+    this.foldersListener.dispose();
+  }
+
+  /**
+   * Wait until configuration changes observed before this call have been
+   * handled. This is useful to callers that need deterministic setup and
+   * keeps the controller's serialized-event contract observable in tests.
+   */
+  whenIdle(): Promise<void> {
+    return this.queue;
+  }
+
+  private enqueue(initial: boolean): void {
+    this.queue = this.queue.then(() => this.confirmOrReset(initial)).catch((error) => {
+      console.error("Auto implementation confirmation failed", error);
+    });
+  }
+
+  private async confirmOrReset(initial: boolean): Promise<void> {
+    const current = this.readSnapshot();
+    const previous = this.snapshot;
+    this.snapshot = current;
+
+    if (autoImplementConfirmed) return;
+    const enabledScopes = initial || !previous
+      ? current.autoScopes()
+      : current.transitionsToAuto(previous);
+    if (enabledScopes.length === 0) return;
+
+    const choice = await vscode.window.showWarningMessage(
+      "Automatically implement will make real code and file changes after an approved review. Use it only with continuous human supervision.",
+      { modal: true },
+      "Enable"
+    );
+    if (choice === "Enable") {
+      await this.context.globalState.update(AUTO_IMPLEMENT_CONFIRMED_KEY, true);
+      autoImplementConfirmed = true;
+      return;
+    }
+    // Clear only scopes which transitioned to auto for this event. A newly
+    // cancelled workspace override must never wipe an existing global value.
+    const cleared: AutoImplementScope[] = [];
+    for (const scope of enabledScopes) {
+      await vscode.workspace.getConfiguration(CONFIG_SECTION, scope.resource)
+        .update(AUTO_IMPLEMENT_AFTER_REVIEW_KEY, undefined, scope.target);
+      cleared.push(scope);
+    }
+    // Do not re-read the whole configuration here. A user may have changed a
+    // different scope while the modal was open; that event is already queued
+    // and must be compared with the pre-modal snapshot, not silently folded
+    // into this controller's self-write baseline.
+    this.snapshot = current.without(cleared);
+  }
+
+  private readSnapshot(): AutoImplementScopeSnapshot {
+    const inspect = (resource?: vscode.Uri) => vscode.workspace
+      .getConfiguration(CONFIG_SECTION, resource).inspect<unknown>(AUTO_IMPLEMENT_AFTER_REVIEW_KEY);
+    const root = inspect();
+    const folders = vscode.workspace.workspaceFolders ?? [];
+    return new AutoImplementScopeSnapshot(
+      root?.globalValue,
+      root?.workspaceValue,
+      new Map(folders.map(folder => [folder.uri.toString(), inspect(folder.uri)?.workspaceFolderValue])),
+      new Map(folders.map(folder => [folder.uri.toString(), folder.uri]))
+    );
+  }
+}
+
+type AutoImplementScope = { target: vscode.ConfigurationTarget; resource?: vscode.Uri };
+
+class AutoImplementScopeSnapshot {
+  constructor(
+    private readonly globalValue: unknown,
+    private readonly workspaceValue: unknown,
+    private readonly folderValues: Map<string, unknown>,
+    private readonly folderUris: Map<string, vscode.Uri>
+  ) {}
+
+  autoScopes(): AutoImplementScope[] {
+    const scopes: AutoImplementScope[] = [];
+    if (this.globalValue === "auto") scopes.push({ target: vscode.ConfigurationTarget.Global });
+    if (this.workspaceValue === "auto") scopes.push({ target: vscode.ConfigurationTarget.Workspace });
+    for (const [folder, value] of this.folderValues) {
+      if (value === "auto") scopes.push({ target: vscode.ConfigurationTarget.WorkspaceFolder, resource: this.folderUris.get(folder) });
+    }
+    return scopes;
+  }
+
+  transitionsToAuto(previous: AutoImplementScopeSnapshot): AutoImplementScope[] {
+    const changed: AutoImplementScope[] = [];
+    if (this.globalValue === "auto" && previous.globalValue !== "auto") changed.push({ target: vscode.ConfigurationTarget.Global });
+    if (this.workspaceValue === "auto" && previous.workspaceValue !== "auto") changed.push({ target: vscode.ConfigurationTarget.Workspace });
+    for (const [folder, value] of this.folderValues) {
+      if (value === "auto" && previous.folderValues.get(folder) !== "auto") {
+        changed.push({ target: vscode.ConfigurationTarget.WorkspaceFolder, resource: this.folderUris.get(folder) });
+      }
+    }
+    return changed;
+  }
+
+  /** Return this snapshot with only controller-cleared scopes removed. */
+  without(scopes: readonly AutoImplementScope[]): AutoImplementScopeSnapshot {
+    let globalValue = this.globalValue;
+    let workspaceValue = this.workspaceValue;
+    const folderValues = new Map(this.folderValues);
+    for (const scope of scopes) {
+      if (scope.target === vscode.ConfigurationTarget.Global) globalValue = undefined;
+      else if (scope.target === vscode.ConfigurationTarget.Workspace) workspaceValue = undefined;
+      else if (scope.resource) folderValues.set(scope.resource.toString(), undefined);
+    }
+    return new AutoImplementScopeSnapshot(globalValue, workspaceValue, folderValues, new Map(this.folderUris));
+  }
+}
+
+export function installAutoImplementConfirmation(context: vscode.ExtensionContext): vscode.Disposable {
+  return new AutoImplementConfirmationController(context);
+}
+
 export function getAutoAdvanceScoreThreshold(): number {
-  const value = vscode.workspace.getConfiguration(CONFIG_SECTION).get<number>(AUTO_ADVANCE_SCORE_KEY, 10);
+  const value = readSetting(AUTO_ADVANCE_SCORE_KEY, 10);
   return Math.max(1, Math.min(10, Math.floor(value)));
 }
 
 export function getFastForwardStopLevel(): number {
-  const value = vscode.workspace.getConfiguration(CONFIG_SECTION).get<number>(FAST_FORWARD_STOP_LEVEL_KEY, 0);
+  const value = readSetting(FAST_FORWARD_STOP_LEVEL_KEY, 0);
   return Math.max(0, Math.min(10, Math.floor(value)));
 }
 
 export function usesAcceptanceThresholdForFastForward(): boolean {
-  return vscode.workspace.getConfiguration(CONFIG_SECTION).get<boolean>(FAST_FORWARD_USE_ACCEPTANCE_KEY, false);
+  return readSetting(FAST_FORWARD_USE_ACCEPTANCE_KEY, false);
 }
 
 /** Mode for auto-review after AI drafts a plan. */
@@ -298,20 +559,19 @@ export function getAutoReviewAfterImplementationMode(): AutoTriggerMode {
 
 /** Whether implementation/Fast Forward runs may proceed without prompting when the workspace has unrelated uncommitted changes. */
 export function allowsDirtyWorktreeChanges(): boolean {
-  return vscode.workspace.getConfiguration(CONFIG_SECTION).get<boolean>(ALLOW_DIRTY_WORKTREE_CHANGES_KEY, false);
+  return readSetting(ALLOW_DIRTY_WORKTREE_CHANGES_KEY, false);
 }
 
 /** Whether native OS notifications fire for things that need attention (questions, warnings, errors). Off by default. */
 export function isDesktopNotificationsEnabled(): boolean {
-  return vscode.workspace.getConfiguration(CONFIG_SECTION).get<boolean>(DESKTOP_NOTIFICATIONS_KEY, false);
+  return readSetting(DESKTOP_NOTIFICATIONS_KEY, false);
 }
 
 /**
  * Get workspace-level default model IDs keyed by AI workflow stage.
  */
 export function getAiModelDefaults(): Partial<Record<TaskStage, string>> {
-  const config = vscode.workspace.getConfiguration(CONFIG_SECTION);
-  const raw = config.get<Record<string, unknown>>(AI_MODEL_DEFAULTS_KEY, {});
+  const raw = readSetting<Record<string, unknown>>(AI_MODEL_DEFAULTS_KEY, {});
   const defaults: Partial<Record<TaskStage, string>> = {};
 
   for (const stage of AI_MODEL_STAGES) {
@@ -359,13 +619,12 @@ const MODEL_SETTINGS_KEY = "modelSettings";
 const MAX_IMPLEMENTATION_ITERATIONS_KEY = "maxImplementationIterations";
 
 export function getMaxImplementationIterations(): number {
-  const value = vscode.workspace.getConfiguration(CONFIG_SECTION).get<number>(MAX_IMPLEMENTATION_ITERATIONS_KEY, 200);
+  const value = readSetting(MAX_IMPLEMENTATION_ITERATIONS_KEY, 200);
   return Math.max(1, Math.min(200, Math.floor(typeof value === "number" && Number.isFinite(value) ? value : 200)));
 }
 
 export function getModelSettings(): ModelSettings {
-  const config = vscode.workspace.getConfiguration(CONFIG_SECTION);
-  const raw = config.get<Record<string, unknown>>(MODEL_SETTINGS_KEY, {});
+  const raw = readSetting<Record<string, unknown>>(MODEL_SETTINGS_KEY, {});
   const result: ModelSettings = {};
   for (const stage of AI_MODEL_STAGES) {
     const value = raw[stage];

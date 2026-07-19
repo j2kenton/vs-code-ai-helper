@@ -2,6 +2,14 @@
 
 All notable changes to Ensemble (formerly VS Code AI Helper) are documented here.
 
+## [Unreleased] — Task lifecycle and automation safety
+
+### Changed
+
+- New tasks are created paused and no longer interrupt the task currently in progress.
+- Settings now use the `ensemble.*` namespace; existing `vs-code-ai-helper.*` values are copied once and remain available as deprecated compatibility keys.
+- Auto Advance no longer starts implementation unless **Ensemble: Automatically implement after review** is explicitly enabled and acknowledged. This setting can make real workspace changes and requires continuous human supervision.
+
 ## [Unreleased] — Safety Round 2: Consent Gate, Data Minimization & Commit Scoping
 
 ### Added
