@@ -357,6 +357,20 @@ interface ExecuteImplementationRunOptions {
    * plain "auto".
    */
   followUpReviewMode?: "auto-fast-forward";
+  /**
+   * Skip the post-run auto-review dispatch entirely. Set by
+   * applyImplementationReviewWithAI: that call's own `parentOperation` is a
+   * nested child registered just for stage-row UI purposes, not the
+   * operation actually holding the task's exclusive lock (Apply Review's own
+   * root, or — under Fast Forward — its whole multi-attempt loop). The
+   * deferred dispatch below waits for `parentOperation` to end and then
+   * tries to reacquire that lock via a fresh command; since the real holder
+   * is still running, it is refused as busy and silently dropped, leaving
+   * the review stuck on the "Review Stale" placeholder forever. The caller
+   * re-reviews inline instead (see applyReviewWithAI), under the lock it
+   * already holds.
+   */
+  suppressAutoReviewDispatch?: boolean;
 }
 
 /**
@@ -1600,9 +1614,7 @@ export async function applyReviewWithAI(
     if (!isPlanReview) {
       // Child operation (C1 nesting): while the fix is being implemented the
       // stage-row spinner sits on the Implementation row, not the review row.
-      // The re-review that follows registers its own child inside
-      // executeImplementationRun, moving the spinner back to the review row.
-      await runTrackedOperation(
+      const implementSucceeded = await runTrackedOperation(
         lockKey,
         { parent: op, label: "Applying implementation review", stage: "impl", kind: "run-implementation" },
         (child) =>
@@ -1619,6 +1631,32 @@ export async function applyReviewWithAI(
             }
           )
       );
+      if (implementSucceeded) {
+        // Re-review after applying (no confirmation, no stage change).
+        // Deliberately inline here, nested under `op` (which already holds
+        // the task's exclusive lock — C1 children never contend for it),
+        // rather than left to executeImplementationRun's own post-run
+        // auto-review dispatch: that dispatch is deferred until its
+        // (nested-child) parentOperation ends and then reacquires the lock
+        // through a fresh command — but this operation, or under Fast
+        // Forward its whole multi-attempt loop, is still holding that lock,
+        // so the dispatch is refused as busy and silently dropped, leaving
+        // the review stuck on the "Review Stale" placeholder. Mirrors the
+        // plan-review branch above.
+        await runTrackedOperation(
+          lockKey,
+          { parent: op, label: "Re-running review", stage, kind: "review" },
+          (reReviewOp) =>
+            runReviewForFolder(
+              extensionUri,
+              resolved.folderUri,
+              workspaceRoot,
+              stage,
+              true,
+              { preserveActiveFallback: options.preserveActiveFallback, operation: reReviewOp }
+            )
+        );
+      }
       return;
     }
 
@@ -1952,7 +1990,7 @@ async function applyImplementationReviewWithAI(
   stage: TaskStage,
   reviewContent: string,
   options: ApplyReviewOptions & ExecuteImplementationRunOptions = {}
-): Promise<void> {
+): Promise<boolean> {
   // Materialize canonical plan-final.md from legacy implementation.md if needed.
   let canonicalUri: vscode.Uri;
   try {
@@ -1961,7 +1999,7 @@ async function applyImplementationReviewWithAI(
     NotificationRouter.showWarning(
       "No plan-final.md found. Nothing to apply the review to."
     );
-    return;
+    return false;
   }
 
   const implementationNotes = await readNonEmptyText(canonicalUri);
@@ -1969,7 +2007,7 @@ async function applyImplementationReviewWithAI(
     NotificationRouter.showWarning(
       "No plan-final.md found. Nothing to apply the review to."
     );
-    return;
+    return false;
   }
 
   // Do not make the implementation model infer the approved contract from a
@@ -1989,7 +2027,7 @@ async function applyImplementationReviewWithAI(
     NotificationRouter.showWarning(
       `No approved plan found (or it is empty). Generate or restore ${planName} before applying an implementation review.`
     );
-    return;
+    return false;
   }
 
   // Use the `implementation` stage's model, not the review stage's model.
@@ -2003,7 +2041,7 @@ async function applyImplementationReviewWithAI(
     NotificationRouter.showWarning(
       `${providerLabel} is unavailable: ${availability.reason ?? "unknown reason"}. Address the review manually instead.`
     );
-    return;
+    return false;
   }
 
   const contextPackContent = await generateContextPack(folderUri, workspaceRoot.uri);
@@ -2022,10 +2060,13 @@ async function applyImplementationReviewWithAI(
   // ── Prompt-size gate ─────────────────────────────────────────────────────
   const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel);
   if (sizeCheck === "abort" || sizeCheck === "declined") {
-    return;
+    return false;
   }
 
-  await executeImplementationRun(
+  // suppressAutoReviewDispatch: the caller (applyReviewWithAI) re-reviews
+  // inline under the lock it already holds — see that option's doc comment
+  // for why the deferred dispatch here would otherwise be refused as busy.
+  return executeImplementationRun(
     extensionUri,
     folderUri,
     workspaceRoot,
@@ -2035,6 +2076,7 @@ async function applyImplementationReviewWithAI(
     stage,
     {
       ...options,
+      suppressAutoReviewDispatch: true,
       onBusyDetail: options.parentOperation ? (d) => options.parentOperation!.report(d) : undefined,
     }
   );
@@ -2504,7 +2546,7 @@ async function executeImplementationRun(
   progressTitle: string,
   postRunReviewStage: TaskStage = "impl",
   options: ExecuteImplementationRunOptions = {}
-): Promise<void> {
+): Promise<boolean> {
   const cwd = workspaceRoot.uri.fsPath;
 
   // Pre-run safety checks for agentic file-editing runs
@@ -2523,7 +2565,7 @@ async function executeImplementationRun(
       );
       if (proceed !== "Proceed Anyway") {
         NotificationRouter.showInformation("Implementation run cancelled.");
-        return;
+        return false;
       }
     } else {
       // Git workspace: unrelated changes can be overwritten or mixed into an
@@ -2545,7 +2587,7 @@ async function executeImplementationRun(
         );
         if (proceed !== "Proceed") {
           NotificationRouter.showInformation("Implementation run cancelled.");
-          return;
+          return false;
         }
       }
     }
@@ -2589,7 +2631,7 @@ async function executeImplementationRun(
   );
 
   if (!result) {
-    return;
+    return false;
   }
 
   const logContent = `# Implementation Run\n\nStatus: ${result.status}\n\nFiles changed:\n${
@@ -2609,7 +2651,7 @@ async function executeImplementationRun(
           "Review the implementation run log; the provider may have been blocked from writing files."
       );
       await safeOpenTextDocument(logUri, "implementation run log");
-      return;
+      return false;
     }
 
     const summary = result.summary?.trim();
@@ -2721,7 +2763,7 @@ async function executeImplementationRun(
     // "Complete & Move On triggers AI: auto-fast-forward" — the chained
     // request must fire even with the standalone setting off, and must never
     // be downgraded to a single review pass by a weaker standalone setting.
-    if (!autoAdvancedToHighReview) {
+    if (!autoAdvancedToHighReview && !options.suppressAutoReviewDispatch) {
       const reviewMode = strongestAutoTriggerMode(
         getAutoReviewAfterImplementationMode(),
         options.followUpReviewMode
@@ -2734,12 +2776,15 @@ async function executeImplementationRun(
         );
       }
     }
+    return true;
   } else if (result.status === "cancelled") {
     NotificationRouter.showInformation("Implementation cancelled.");
+    return false;
   } else {
     NotificationRouter.showError(
       `Implementation failed: ${result.errorMessage ?? "unknown error"}`
     );
+    return false;
   }
 }
 
