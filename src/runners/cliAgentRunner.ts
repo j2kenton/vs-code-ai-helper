@@ -42,7 +42,7 @@ const RESERVED_ROOT_ARTIFACT_NAMES: ReadonlySet<string> = new Set([
  * Hard cap on a single CLI run. Runs are also cancellable from the progress
  * notification; this only guards against a hung process left behind.
  */
-const RUN_TIMEOUT_MS = 30 * 60 * 1000;
+const RUN_TIMEOUT_MS = 60 * 60 * 1000;
 
 /**
  * Cache of PATH lookups so availability checks (which run on every model
