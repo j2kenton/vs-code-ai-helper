@@ -19,6 +19,7 @@ import {
   getProviderAccountEntry,
   PROVIDER_ACCOUNT_ENTRIES,
   ProviderAccountEntry,
+  ProviderSignInAction,
 } from "../runners/providers";
 import { NotificationRouter } from "../utils/notificationRouter";
 
@@ -45,21 +46,128 @@ function accountEntryDisplayLabel(entry: ProviderAccountEntry): string {
  * input would hand it to the shell instead; VS Code exposes no "CLI is now
  * reading" signal, so a short fixed delay is the available approximation.
  */
-const INTERACTIVE_SLASH_DELAY_MS = 3000;
+export const INTERACTIVE_SLASH_DELAY_MS = 3000;
+
+/**
+ * How long to wait, after typing the slash command's text, before sending
+ * the submit keystroke. These CLIs' interactive TUIs treat a burst of input
+ * ending in a newline as a paste, not a keypress, and only insert a literal
+ * newline instead of submitting; a short gap between the typed text and the
+ * submit byte gets it recognized as a real Enter press.
+ */
+export const INTERACTIVE_SLASH_SUBMIT_DELAY_MS = 150;
+
+/** The subset of vscode.Terminal that sendInteractiveSlashCommand needs — narrowed so tests can pass a plain stub. */
+export interface InteractiveTerminalLike {
+  sendText(text: string, shouldExecute?: boolean): void;
+}
+
+/** Injectable in place of setTimeout so tests can run the sequence synchronously. */
+export type InteractiveScheduler = (callback: () => void, delayMs: number) => void;
+
+const defaultInteractiveScheduler: InteractiveScheduler = (callback, delayMs) => {
+  setTimeout(callback, delayMs);
+};
 
 /**
  * Dispatch an "interactive" provider capability: launch the provider's CLI
  * in the given terminal, then send the in-session slash command (e.g.
- * `/usage`, `/stats model`) into the running session. The two lines are
- * deliberately never concatenated into one command line — the slash
- * commands only exist inside the interactive session.
+ * `/usage`, `/stats model`) into the running session. The launch and the
+ * slash command are deliberately never concatenated into one command line —
+ * the slash commands only exist inside the interactive session.
+ *
+ * The slash command's TEXT and its SUBMIT keystroke are sent as two separate
+ * sendText calls, both with shouldExecute=false. shouldExecute=true appends
+ * the platform newline, which on Windows is `\r\n` — a real key press only
+ * ever sends `\r`. Worse, sending text-plus-newline in a single write reads
+ * to these CLIs' raw-mode TUIs as a paste, whose trailing `\n` lands the
+ * cursor on a fresh input line instead of submitting (observed with Codex's
+ * `/usage`; Claude's TUI is susceptible to the same bug). Splitting the
+ * write into "type the text" then, after a short delay, "press Enter" (`\r`
+ * alone) avoids both problems.
  */
-function sendInteractiveSlashCommand(
-  terminal: vscode.Terminal,
-  capability: { launch: string; send: string }
+export function sendInteractiveSlashCommand(
+  terminal: InteractiveTerminalLike,
+  capability: { launch: string; send: string },
+  scheduler: InteractiveScheduler = defaultInteractiveScheduler
 ): void {
   terminal.sendText(capability.launch, true);
-  setTimeout(() => terminal.sendText(capability.send, true), INTERACTIVE_SLASH_DELAY_MS);
+  scheduler(() => {
+    terminal.sendText(capability.send, false);
+    scheduler(() => {
+      terminal.sendText("\r", false);
+    }, INTERACTIVE_SLASH_SUBMIT_DELAY_MS);
+  }, INTERACTIVE_SLASH_DELAY_MS);
+}
+
+/** Dependencies dispatchVsCodeCommandSignIn needs, injected so it's testable without a VS Code host. */
+export interface VsCodeCommandSignInDeps {
+  listCommands: () => Promise<readonly string[]>;
+  executeCommand: (command: string) => Promise<unknown>;
+  showInfo: (message: string) => void;
+  showError: (message: string) => void;
+}
+
+type VsCodeCommandSignInAction = Extract<ProviderSignInAction, { kind: "vscode-command" }>;
+
+/**
+ * Dispatch a "vscode-command" sign-in capability (Copilot). Both `commands`
+ * (primary) and `fallbackCommands` are ordered, newest-first candidate
+ * lists — see ProviderSignInAction's doc comment for why. Semantics:
+ *
+ *  - Registration is checked once via `listCommands()`; if that call itself
+ *    rejects, registration is treated as "unknown" (not "nothing
+ *    registered") so every candidate is attempted directly rather than the
+ *    handler crashing or short-circuiting straight to the terminal error.
+ *  - The first candidate on the primary list that is registered (or
+ *    unknown) is tried; if it throws, dispatch falls through to the
+ *    fallback list exactly as if no primary candidate had been registered.
+ *  - The first candidate on the fallback list that is registered (or
+ *    unknown) and succeeds shows the existing "managed by VS Code" info
+ *    message.
+ *  - The terminal error (naming the manual Accounts-menu path) fires only
+ *    when nothing on either list is registered, or the fallback candidate
+ *    that was tried also throws.
+ */
+export async function dispatchVsCodeCommandSignIn(
+  displayLabel: string,
+  capability: VsCodeCommandSignInAction,
+  deps: VsCodeCommandSignInDeps
+): Promise<void> {
+  let registered: readonly string[] | undefined;
+  try {
+    registered = await deps.listCommands();
+  } catch {
+    registered = undefined;
+  }
+  const isRegistered = (id: string): boolean => registered === undefined || registered.includes(id);
+
+  const tryRun = async (id: string): Promise<boolean> => {
+    try {
+      await deps.executeCommand(id);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  const primary = capability.commands.find(isRegistered);
+  if (primary && (await tryRun(primary))) {
+    return;
+  }
+
+  const fallback = capability.fallbackCommands.find(isRegistered);
+  if (fallback && (await tryRun(fallback))) {
+    deps.showInfo(
+      `${displayLabel} sign-in is managed by VS Code — use the Accounts menu to sign in or switch the GitHub account.`
+    );
+    return;
+  }
+
+  deps.showError(
+    `Could not start the ${displayLabel} sign-in — the provider's sign-in command is not available. ` +
+      "Use the Accounts menu (bottom-left) to sign in with GitHub."
+  );
 }
 
 export class SettingsViewProvider implements vscode.WebviewViewProvider {
@@ -140,45 +248,21 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             return;
           }
           if (provider.signIn.kind === "vscode-command") {
-            // VS Code-native auth (Copilot): never a shell command — invoke
-            // the provider's own sign-in command, falling back to the
-            // Accounts menu when that command is not registered (e.g. the
-            // Copilot extension is missing). Registration is checked
-            // explicitly so an execution failure of an available command is
-            // reported as an error rather than silently rerouted.
-            const { command, fallbackCommand } = provider.signIn;
-            const registeredCommands = await vscode.commands.getCommands(true);
-            if (registeredCommands.includes(command)) {
-              try {
-                await vscode.commands.executeCommand(command);
-              } catch (error) {
-                const message = error instanceof Error ? error.message : String(error);
-                void vscode.window.showErrorMessage(
-                  `Could not start the ${accountEntryDisplayLabel(provider)} sign-in: ${message}. ` +
-                    "Use the Accounts menu (bottom-left) to sign in with GitHub."
-                );
+            // VS Code-native auth (Copilot): never a shell command — try
+            // each candidate on the primary list, then each candidate on the
+            // Accounts-menu fallback list, first REGISTERED one wins. See
+            // dispatchVsCodeCommandSignIn's doc comment for the full
+            // fallback/error semantics.
+            await dispatchVsCodeCommandSignIn(
+              accountEntryDisplayLabel(provider),
+              provider.signIn,
+              {
+                listCommands: () => Promise.resolve(vscode.commands.getCommands(true)),
+                executeCommand: (command) => Promise.resolve(vscode.commands.executeCommand(command)),
+                showInfo: (message) => NotificationRouter.showInformation(message),
+                showError: (message) => void vscode.window.showErrorMessage(message),
               }
-            } else if (fallbackCommand && registeredCommands.includes(fallbackCommand)) {
-              try {
-                await vscode.commands.executeCommand(fallbackCommand);
-                NotificationRouter.showInformation(
-                  `${accountEntryDisplayLabel(provider)} sign-in is managed by VS Code — ` +
-                    "use the Accounts menu to sign in or switch the GitHub account."
-                );
-              } catch (error) {
-                const message = error instanceof Error ? error.message : String(error);
-                void vscode.window.showErrorMessage(
-                  `Could not start the ${accountEntryDisplayLabel(provider)} sign-in: ${message}. ` +
-                    "Use the Accounts menu (bottom-left) to sign in with GitHub."
-                );
-              }
-            } else {
-              void vscode.window.showErrorMessage(
-                `Could not start the ${accountEntryDisplayLabel(provider)} sign-in — ` +
-                  "the provider's sign-in command is not available. " +
-                  "Use the Accounts menu (bottom-left) to sign in with GitHub."
-              );
-            }
+            );
             break;
           }
           if (provider.signIn.kind === "manual") {
@@ -228,6 +312,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           const usage = provider.usage;
           if (usage.kind === "unsupported") {
             NotificationRouter.showInformation(usage.reason);
+            if (usage.url) {
+              void vscode.env.openExternal(vscode.Uri.parse(usage.url));
+            }
             break;
           }
           if (usage.kind === "manual") {
@@ -347,12 +434,16 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         signInGuidance: provider.signInGuidance ?? "",
         // UI button state comes from the same capability descriptor the
         // handler dispatches on: enabled for terminal/interactive/
-        // vscode-command/manual, disabled (with the reason as tooltip) for
-        // unsupported.
-        usageEnabled: provider.usage.kind !== "unsupported",
+        // vscode-command/manual, and also for unsupported when it carries a
+        // usage-page `url` (the button then opens that page instead of
+        // running anything); disabled (with the reason as tooltip) only for
+        // unsupported with no known page to send the user to.
+        usageEnabled: provider.usage.kind !== "unsupported" || provider.usage.url !== undefined,
         usageTooltip:
           provider.usage.kind === "unsupported"
-            ? provider.usage.reason
+            ? provider.usage.url
+              ? `${provider.usage.reason} Opens the usage page.`
+              : provider.usage.reason
             : provider.usage.kind === "manual"
               ? provider.usage.instructions
               : provider.usage.kind === "interactive"

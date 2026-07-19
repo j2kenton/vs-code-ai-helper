@@ -252,7 +252,7 @@ export class StageNode extends vscode.TreeItem {
     status: StageStatus,
     artifactUri: vscode.Uri | undefined,
     /** Optional readiness info for review stages */
-    readiness?: { label: string; icon: string; colorKey: string },
+    readiness?: { label: string },
     modelInfo?: ResolvedStageModel,
     availableModels?: readonly SelectableModel[]  ,
     isScheduled: boolean = false,
@@ -290,21 +290,17 @@ export class StageNode extends vscode.TreeItem {
           this.description = "done";
           break;
         case "current":
-          // Current review stages show the readiness icon so the user can see
-          // the AI's assessment at a glance without opening the artifact.
-          if (readiness) {
-            this.iconPath = new vscode.ThemeIcon(
-              readiness.icon,
-              new vscode.ThemeColor(readiness.colorKey)
-            );
-            this.description = `current · ${readiness.label}`;
-          } else {
-            this.iconPath = new vscode.ThemeIcon(
-              "arrow-right",
-              new vscode.ThemeColor("charts.blue")
-            );
-            this.description = "current";
-          }
+          // The current-stage icon is always the plain horizontal arrow,
+          // regardless of readiness — review-score indicator glyphs
+          // (check/arrow-right/arrow-down keyed to score bands) were removed
+          // from stage-level icons; a low score must not turn this into a
+          // down-arrow. The score itself still surfaces in the description
+          // text below, same as a "done" stage's tick never varies by score.
+          this.iconPath = new vscode.ThemeIcon(
+            "arrow-right",
+            new vscode.ThemeColor("charts.blue")
+          );
+          this.description = readiness ? `current · ${readiness.label}` : "current";
           break;
         case "outstanding":
           this.iconPath = new vscode.ThemeIcon(
@@ -417,7 +413,7 @@ type TaskTreeNode = TaskNode | StageNode | EmptyTasksNode;
  */
 async function tryReadReadiness(
   artifactUri: vscode.Uri | undefined
-): Promise<{ label: string; icon: string; colorKey: string } | undefined> {
+): Promise<{ label: string } | undefined> {
   if (!artifactUri) {
     return undefined;
   }
@@ -425,7 +421,7 @@ async function tryReadReadiness(
     const content = await vscode.workspace.fs.readFile(artifactUri);
     const text = new TextDecoder().decode(content);
     const result = parseReadiness(text);
-    return { label: result.label, icon: result.icon, colorKey: result.colorKey };
+    return { label: result.label };
   } catch {
     return undefined;
   }
@@ -833,7 +829,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
       // For review stages, only try to parse readiness when the stage is
       // current — done stages always render with the tick icon regardless of
       // readiness data present in the artifact.
-      let readiness: { label: string; icon: string; colorKey: string } | undefined;
+      let readiness: { label: string } | undefined;
       if (isReviewStage(stage) && status === "current") {
         readiness = await tryReadReadiness(artifactUri);
       }

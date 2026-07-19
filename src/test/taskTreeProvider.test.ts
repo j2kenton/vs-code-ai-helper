@@ -247,7 +247,7 @@ void describe("getStageNodeContextValue", () => {
 void describe("StageNode — done review stage icon", () => {
   void it('renders green "check" tick when status is "done" and readiness data is present', () => {
     const task = makeTask("impl"); // current stage is after plan-high-review
-    const readiness = { label: "9/10", icon: "check", colorKey: "charts.green" };
+    const readiness = { label: "9/10" };
     const node = new StageNode(task, "plan-high-review", "done", undefined, readiness);
 
     // The icon must be "check" regardless of readiness data
@@ -274,16 +274,31 @@ void describe("StageNode — done review stage icon", () => {
     assert.strictEqual(icon.id, "check");
   });
 
-  void it('renders readiness icon when status is "current" and readiness data is present', () => {
+  void it('renders plain arrow-right icon when status is "current", even with readiness data present', () => {
     const task = makeTask("plan-high-review");
-    const readiness = { label: "9/10", icon: "check", colorKey: "charts.green" };
+    const readiness = { label: "9/10" };
     const node = new StageNode(task, "plan-high-review", "current", undefined, readiness);
 
     const icon = node.iconPath as import("vscode").ThemeIcon;
     assert.strictEqual(
       icon.id,
-      "check",
-      `Expected readiness icon "check" for current review stage, got "${icon.id}"`
+      "arrow-right",
+      `Expected plain "arrow-right" for current stage regardless of readiness, got "${icon.id}"`
+    );
+    const color = icon.color as import("vscode").ThemeColor;
+    assert.strictEqual(color.id, "charts.blue");
+  });
+
+  void it('renders plain arrow-right icon when status is "current" and readiness score is low', () => {
+    const task = makeTask("plan-low-review");
+    const readiness = { label: "4/10" };
+    const node = new StageNode(task, "plan-low-review", "current", undefined, readiness);
+
+    const icon = node.iconPath as import("vscode").ThemeIcon;
+    assert.strictEqual(
+      icon.id,
+      "arrow-right",
+      `A low review score must not turn the current-stage icon into a down arrow, got "${icon.id}"`
     );
   });
 
@@ -297,7 +312,7 @@ void describe("StageNode — done review stage icon", () => {
 
   void it('has description "done" for a done review stage with readiness', () => {
     const task = makeTask("impl");
-    const readiness = { label: "7/10", icon: "arrow-right", colorKey: "charts.yellow" };
+    const readiness = { label: "7/10" };
     const node = new StageNode(task, "plan-low-review", "done", undefined, readiness);
 
     assert.strictEqual(
@@ -309,7 +324,7 @@ void describe("StageNode — done review stage icon", () => {
 
   void it('has description including "current" for a current review stage with readiness', () => {
     const task = makeTask("plan-low-review");
-    const readiness = { label: "4/10", icon: "arrow-down", colorKey: "charts.red" };
+    const readiness = { label: "4/10" };
     const node = new StageNode(task, "plan-low-review", "current", undefined, readiness);
 
     assert.ok(
@@ -350,68 +365,61 @@ void describe("Stage migration (migrateStage)", () => {
 });
 
 void describe("reviewReadiness.parseReadiness", () => {
-  void it('should parse "Readiness: 9/10" and return green thumbsup', () => {
+  void it('should parse "Readiness: 9/10"', () => {
     const result = parseReadiness("Readiness: 9/10\nSome content");
     assert.strictEqual(result.score, 9);
     assert.strictEqual(result.label, "9/10");
-    assert.strictEqual(result.icon, "check");
-    assert.strictEqual(result.colorKey, "charts.green");
   });
 
   void it('should parse "Readiness: 10/10"', () => {
     const result = parseReadiness("Readiness: 10/10");
     assert.strictEqual(result.score, 10);
-    assert.strictEqual(result.icon, "check");
+    assert.strictEqual(result.label, "10/10");
   });
 
-  void it('should parse "Readiness: 8/10" as green', () => {
+  void it('should parse "Readiness: 8/10"', () => {
     const result = parseReadiness("Readiness: 8/10");
     assert.strictEqual(result.score, 8);
-    assert.strictEqual(result.icon, "check");
+    assert.strictEqual(result.label, "8/10");
   });
 
-  void it('should parse "Readiness: 7/10" as yellow question', () => {
+  void it('should parse "Readiness: 7/10"', () => {
     const result = parseReadiness("Readiness: 7/10");
     assert.strictEqual(result.score, 7);
-    assert.strictEqual(result.icon, "arrow-right");
-    assert.strictEqual(result.colorKey, "charts.yellow");
+    assert.strictEqual(result.label, "7/10");
   });
 
-  void it('should parse "Readiness: 5/10" as yellow', () => {
+  void it('should parse "Readiness: 5/10"', () => {
     const result = parseReadiness("Readiness: 5/10");
     assert.strictEqual(result.score, 5);
-    assert.strictEqual(result.icon, "arrow-right");
+    assert.strictEqual(result.label, "5/10");
   });
 
-  void it('should parse "Readiness: 4/10" as red thumbsdown', () => {
+  void it('should parse "Readiness: 4/10"', () => {
     const result = parseReadiness("Readiness: 4/10");
     assert.strictEqual(result.score, 4);
-    assert.strictEqual(result.icon, "arrow-down");
-    assert.strictEqual(result.colorKey, "charts.red");
+    assert.strictEqual(result.label, "4/10");
   });
 
-  void it('should parse "Readiness: 0/10" as red', () => {
+  void it('should parse "Readiness: 0/10"', () => {
     const result = parseReadiness("Readiness: 0/10");
     assert.strictEqual(result.score, 0);
-    assert.strictEqual(result.icon, "arrow-down");
+    assert.strictEqual(result.label, "0/10");
   });
 
   void it('should use legacy fallback for case-insensitive readiness wording', () => {
     const result = parseReadiness("Overall readiness 7/10 based on analysis");
     assert.strictEqual(result.score, 7);
-    assert.strictEqual(result.icon, "arrow-right");
+    assert.strictEqual(result.label, "7/10");
   });
 
-  void it('should return neutral icon for missing readiness', () => {
+  void it('should return null score and neutral label for missing readiness', () => {
     const result = parseReadiness("No readiness score here");
     assert.strictEqual(result.score, null);
     assert.strictEqual(result.label, "—/10");
-    // Same-size circle as "outstanding" stage rows — a plain circle-outline
-    // rendered visibly smaller than every neighbouring stage icon.
-    assert.strictEqual(result.icon, "circle-large-outline");
   });
 
-  void it('should return neutral icon for empty content', () => {
+  void it('should return neutral label for empty content', () => {
     const result = parseReadiness("");
     assert.strictEqual(result.score, null);
     assert.strictEqual(result.label, "—/10");
@@ -707,10 +715,10 @@ void describe("Icon selection in StageNode", () => {
     assert.strictEqual((node.iconPath as vscode.ThemeIcon).id, "arrow-right");
   });
 
-  void it("uses readiness icon for current status when readiness is set", () => {
-    const readiness = { label: "Perfect", icon: "check", colorKey: "charts.green" };
+  void it("still uses the plain arrow-right icon for current status when readiness is set", () => {
+    const readiness = { label: "Perfect" };
     const node = new StageNode(mockTask, "plan-high-review", "current", undefined, readiness);
-    assert.strictEqual((node.iconPath as vscode.ThemeIcon).id, "check");
+    assert.strictEqual((node.iconPath as vscode.ThemeIcon).id, "arrow-right");
   });
 
   void it("uses circle-large-outline for outstanding status", () => {

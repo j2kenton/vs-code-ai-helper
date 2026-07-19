@@ -134,18 +134,17 @@ export interface CliProviderDefinition {
    */
   guaranteesEditEventFlushBeforeSideEffects?: boolean;
   /**
-   * Terminal command line(s) for the "Sign in / Switch account" action.
-   * Run in a visible IDE terminal so the provider's interactive login flow
-   * works. Validated against the currently supported CLI version before
-   * being wired to a button (loginHint text is evidence, not a contract).
-   * Last validated 2026-07-17 against installed CLIs: codex 0.144.4
-   * (binary exposes `codex login` / `codex login status`), gemini 0.50.0
-   * (interactive run offers the LOGIN_WITH_GOOGLE auth flow), agy
-   * (interactive run performs OAuth; no dedicated login subcommand), and
-   * kiro-cli kas 2.12.0 (its own auth-error recovery action is
-   * `kiro-cli login`). Re-validate before changing any signInCommand.
-   * Absent when the provider's sign-in is an IN-SESSION flow instead — see
-   * signInAction.
+   * Terminal command line(s) for the "Sign In" action. Run in a visible IDE
+   * terminal so the provider's interactive login flow works. Validated
+   * against the currently supported CLI version before being wired to a
+   * button (loginHint text is evidence, not a contract). Last validated
+   * 2026-07-17 against installed CLIs: codex 0.144.4 (binary exposes
+   * `codex login` / `codex login status`), gemini 0.50.0 (interactive run
+   * offers the LOGIN_WITH_GOOGLE auth flow), agy (interactive run performs
+   * OAuth; no dedicated login subcommand), and kiro-cli kas 2.12.0 (its own
+   * auth-error recovery action is `kiro-cli login`). Re-validate before
+   * changing any signInCommand. Absent when the provider's sign-in is an
+   * IN-SESSION flow instead — see signInAction.
    */
   signInCommand?: string;
   /**
@@ -157,7 +156,13 @@ export interface CliProviderDefinition {
    * Takes precedence over signInCommand when present.
    */
   signInAction?: { launch: string; send: string; validated: "verified" | "unverified" };
-  /** Label for the sign-in action; "Sign in" when the CLI has no distinct switch-account command. */
+  /**
+   * Label for the sign-in action. Always "Sign In" — none of these flows
+   * verifiably log the user out before logging back in, so the button must
+   * never claim "Switch account" (the terminal-based sign-in commands are
+   * effectively idempotent when already authenticated: rerunning them
+   * mostly re-confirms the existing session rather than swapping it).
+   */
   signInLabel: string;
   /** Extra guidance shown alongside the sign-in action (e.g. Kiro's headless API-key requirement). */
   signInGuidance?: string;
@@ -178,6 +183,13 @@ export interface CliProviderDefinition {
   usageAction?: { launch: string; send: string; validated: "verified" | "unverified" };
   /** Why usage checking is unsupported, when usageAction is absent. */
   usageUnsupportedReason?: string;
+  /**
+   * The provider's own account/usage page, when unsupported usage checking
+   * has a known one to send the user to instead (e.g. Kiro's account
+   * dashboard). Absent when no such page is known — the button then stays
+   * disabled rather than linking somewhere unconfirmed.
+   */
+  usageUnsupportedUrl?: string;
 }
 
 const CODEX_REASONING_EFFORTS = new Set([
@@ -316,14 +328,19 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
       "Run `claude` in a terminal and complete the sign-in with your Anthropic (Claude) account, then try again.",
     authErrorMarkers: ["log in", "login", "authenticate", "api key", "oauth"],
     authenticationCheckArgs: ["auth", "status"],
-    // `/login` is Claude Code's IN-SESSION login/switch-account flow: the
-    // CLI is launched interactively and the slash command is then sent into
-    // the running session (claude 2.1.209, validated 2026-07-17) — the same
+    // `/login` is Claude Code's IN-SESSION login flow: the CLI is launched
+    // interactively and the slash command is then sent into the running
+    // session (claude 2.1.209, validated 2026-07-17) — the same
     // launch-then-send dispatch as /usage, never a one-shot command line.
+    // NOTE: /login alone does NOT switch accounts when a session is already
+    // authenticated (confirmed 2026-07-19) — it just re-confirms the
+    // existing session. Switching accounts requires running /logout first;
+    // see signInGuidance.
     signInAction: { launch: "claude", send: "/login", validated: "verified" },
-    signInLabel: "Sign in / Switch account",
+    signInLabel: "Sign In",
     signInGuidance:
-      "Complete the Anthropic sign-in in the terminal. The CLI opens straight into its /login flow, which also switches accounts.",
+      "Complete the Anthropic sign-in in the terminal. Already signed in as a different " +
+      "account? Type /logout in the terminal first, then click Sign In again.",
     // `/usage` is Claude Code's in-session usage panel — launched
     // interactively, then sent as a slash command (validated 2026-07-17).
     usageAction: { launch: "claude", send: "/usage", validated: "verified" },
@@ -367,9 +384,11 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     authErrorMarkers: ["not logged in", "login", "authenticate", "api key"],
     authenticationCheckArgs: ["login", "status"],
     signInCommand: "codex login",
-    signInLabel: "Sign in / Switch account",
+    signInLabel: "Sign In",
     signInGuidance:
-      "Sign in with your ChatGPT account in the terminal. Running login again signs in as a different account.",
+      "Sign in with your ChatGPT account in the terminal. Running Sign In again mostly " +
+      "re-confirms the existing session rather than switching accounts; check the Codex " +
+      "CLI docs for how to sign out first if you need a different account.",
     // `/usage` is an in-session Codex TUI slash command (observed printing
     // the account's % used); launched interactively, then sent.
     usageAction: { launch: "codex", send: "/usage", validated: "verified" },
@@ -418,7 +437,7 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
       "Run `gemini` in a terminal and complete the Google sign-in, then try again.",
     authErrorMarkers: ["login", "authenticate", "credentials", "api key"],
     signInCommand: "gemini",
-    signInLabel: "Sign in / Switch account",
+    signInLabel: "Sign In",
     signInGuidance:
       "Complete the Google sign-in in the terminal. If already signed in, use the /auth command inside the CLI to switch the auth method or account.",
     // Per the approved capability matrix the Gemini CLI's usage surface is
@@ -458,7 +477,7 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
       "Run `agy` (or `antigravity`) in a terminal and complete the Google sign-in, then try again.",
     authErrorMarkers: ["login", "authenticate", "credentials", "api key"],
     signInCommand: "agy",
-    signInLabel: "Sign in / Switch account",
+    signInLabel: "Sign In",
     signInGuidance:
       "Complete the Google sign-in in the terminal. The CLI has no dedicated logout command; switching accounts may require clearing its stored credentials.",
     usageUnsupportedReason:
@@ -537,11 +556,12 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     // `kiro-cli login` refuses with "Already logged in" otherwise. `;` runs
     // both in PowerShell and POSIX shells.
     signInCommand: "kiro-cli logout; kiro-cli login",
-    signInLabel: "Sign in / Switch account",
+    signInLabel: "Sign In",
     signInGuidance:
       "Logs out first so you can switch accounts. Headless mode additionally requires KIRO_API_KEY — `kiro-cli login` alone does not satisfy `chat --no-interactive` auth.",
     usageUnsupportedReason:
-      "Kiro CLI has no known usage/quota command — check usage in your Kiro/AWS account.",
+      "Kiro CLI has no known usage/quota command — check usage on the Kiro account usage page.",
+    usageUnsupportedUrl: "https://app.kiro.dev/account/usage",
     promptTransport: "stdin",
     useShell: false,
     // Use stdin transport so large context packs are not constrained by
@@ -591,24 +611,49 @@ export function getCliProvider(
  *  - "vscode-command": invoke a VS Code command. Copilot auth is VS
  *    Code-native — its account is the GitHub account VS Code itself is
  *    signed into — so its sign-in must NEVER be a shell command; it goes
- *    through `github.copilot.signIn`, with the Accounts-menu command as the
- *    fallback when that command is unavailable (e.g. the Copilot extension
- *    is not installed).
+ *    through the sign-in candidate list, with the Accounts-menu candidate
+ *    list as the fallback when nothing on the primary list is registered
+ *    (e.g. the Copilot extension is not installed). See
+ *    `ProviderSignInAction`'s own doc comment for why sign-in uses candidate
+ *    lists instead of a single command.
  *  - "manual": no runnable command exists, but there is a documented manual
  *    path — the button stays enabled and shows `instructions` (opening
  *    `url` when present) instead of executing anything.
- *  - "unsupported": no known command or manual path — the button renders
- *    disabled with `reason` as its explanatory tooltip.
+ *  - "unsupported": no known command or manual path. When `url` is present
+ *    (a known usage/account page for the provider), the button stays
+ *    enabled and opens it instead of running anything; otherwise the button
+ *    renders disabled with `reason` as its explanatory tooltip.
  */
 export type ProviderActionCapability =
   | { kind: "terminal"; command: string; validated: "verified" | "unverified" }
   | { kind: "interactive"; launch: string; send: string; validated: "verified" | "unverified" }
   | { kind: "vscode-command"; command: string; fallbackCommand?: string }
   | { kind: "manual"; instructions: string; url?: string }
-  | { kind: "unsupported"; reason: string };
+  | { kind: "unsupported"; reason: string; url?: string };
 
-/** Sign-in actions use the same capability union. */
-export type ProviderSignInAction = ProviderActionCapability;
+/**
+ * Sign-in actions are a DISTINCT union from `ProviderActionCapability`, not
+ * an alias — every member matches except "vscode-command". Command IDs for
+ * VS Code-native sign-in (Copilot) drift across Copilot/Copilot Chat
+ * releases and across the supported `engines.vscode` range (^1.93 -> current
+ * stable): the command that used to start sign-in can stop being registered
+ * on a newer build, and the Accounts-menu fallback has already renamed once
+ * (`workbench.action.showAccounts` -> `workbench.action.manageAccounts`
+ * around VS Code 1.106). Both the primary and fallback are therefore ORDERED
+ * CANDIDATE LISTS, newest-first: dispatch tries each candidate in order and
+ * runs the first one that is actually registered ("first registered
+ * candidate wins"), so covering a future rename is a one-line append instead
+ * of a breaking rename of this type. The usage capability keeps the old
+ * single-command shape untouched — it has no equivalent drift problem today
+ * and splitting this union means extending sign-in's candidate lists can
+ * never break usage dispatch.
+ */
+export type ProviderSignInAction =
+  | { kind: "terminal"; command: string; validated: "verified" | "unverified" }
+  | { kind: "interactive"; launch: string; send: string; validated: "verified" | "unverified" }
+  | { kind: "vscode-command"; commands: readonly string[]; fallbackCommands: readonly string[] }
+  | { kind: "manual"; instructions: string; url?: string }
+  | { kind: "unsupported"; reason: string; url?: string };
 
 /**
  * One provider-account row in the settings UI: every CLI provider plus
@@ -620,7 +665,7 @@ export interface ProviderAccountEntry {
   id: ProviderId;
   label: string;
   signInLabel: string;
-  signIn: ProviderActionCapability;
+  signIn: ProviderSignInAction;
   signInGuidance?: string;
   /** Usage/quota check capability — always present, "unsupported" when no path exists. */
   usage: ProviderActionCapability;
@@ -632,25 +677,40 @@ export const PROVIDER_ACCOUNT_ENTRIES: readonly ProviderAccountEntry[] = [
   {
     id: "copilot",
     label: "GitHub Copilot",
-    signInLabel: "Sign in / Switch account",
-    // Never a shell command — Copilot auth is VS Code-native. The Accounts
-    // menu fallback lets the user switch GitHub accounts when the Copilot
-    // extension (and its sign-in command) is not available.
+    signInLabel: "Sign In",
+    // Never a shell command — Copilot auth is VS Code-native. Candidate
+    // lists, newest-first, first REGISTERED one wins (see
+    // ProviderSignInAction's doc comment for why this is a list, not a
+    // single ID). Verified against VS Code 1.129 + current Copilot Chat;
+    // supported range is engines.vscode ^1.93.
     signIn: {
       kind: "vscode-command",
-      command: "github.copilot.signIn",
-      fallbackCommand: "workbench.action.showAccounts",
+      commands: [
+        // Current Copilot Chat's sign-in entry point (observed VS Code 1.129).
+        "github.copilot.chat.triggerPermissiveSignIn",
+        // Legacy Copilot sign-in command, kept for older Copilot builds that
+        // still register it.
+        "github.copilot.signIn",
+      ],
+      fallbackCommands: [
+        // Current Accounts-menu command (VS Code >= ~1.106).
+        "workbench.action.manageAccounts",
+        // Legacy Accounts-menu command; no longer registered on current
+        // stable but kept for older VS Code within the supported range.
+        "workbench.action.showAccounts",
+      ],
     },
     signInGuidance:
       "Copilot models inside VS Code use the GitHub account VS Code itself is signed into. Switch accounts from the Accounts menu if needed.",
     // Per the approved capability matrix Copilot usage is UNSUPPORTED: no
-    // CLI or VS Code command reports Copilot quota, so the button renders
-    // disabled with this reason (which points at GitHub's own settings page)
-    // rather than executing anything.
+    // CLI or VS Code command reports Copilot quota. Because a `url` is set
+    // below, the button stays enabled and opens GitHub's Copilot settings
+    // page instead of executing anything.
     usage: {
       kind: "unsupported",
       reason:
         "No command reports Copilot quota — check usage on GitHub under Settings → Copilot (github.com/settings/copilot).",
+      url: "https://github.com/settings/copilot",
     },
     enabledByDefault: true,
   },
@@ -702,6 +762,7 @@ export const PROVIDER_ACCOUNT_ENTRIES: readonly ProviderAccountEntry[] = [
           reason:
             provider.usageUnsupportedReason ??
             "No usage/quota command is known for this provider — check usage on the provider's own site or app.",
+          ...(provider.usageUnsupportedUrl ? { url: provider.usageUnsupportedUrl } : {}),
         },
     enabledByDefault: false,
   })),

@@ -305,7 +305,9 @@ void describe("provider CLI contracts", () => {
 
     const claude = getCliProvider("claude-cli");
     assert.ok(claude);
-    assert.match(claude.signInLabel, /switch account/i);
+    // Never "Switch account": /login alone does not verifiably log out an
+    // already-authenticated session, so the button must not overpromise.
+    assert.strictEqual(claude.signInLabel, "Sign In");
 
     const kiro = getCliProvider("kiro-cli");
     assert.ok(kiro);
@@ -314,17 +316,29 @@ void describe("provider CLI contracts", () => {
 
   void it("Copilot sign-in is VS Code-native, never a shell command", () => {
     // Copilot auth is the GitHub account VS Code itself is signed into —
-    // there is no CLI login for it. The sign-in button must go through
-    // github.copilot.signIn (with the Accounts menu as fallback), and must
-    // never launch a terminal command.
+    // there is no CLI login for it. The sign-in button must go through the
+    // candidate command lists (newest-first, first REGISTERED one wins —
+    // see ProviderSignInAction's doc comment), and must never launch a
+    // terminal command.
     const copilot = getProviderAccountEntry("copilot");
     assert.ok(copilot, "expected a copilot provider-account entry");
     assert.strictEqual(copilot.signIn.kind, "vscode-command");
-    assert.strictEqual(copilot.signIn.command, "github.copilot.signIn");
     if (copilot.signIn.kind === "vscode-command") {
-      assert.strictEqual(
-        copilot.signIn.fallbackCommand,
-        "workbench.action.showAccounts"
+      assert.ok(
+        copilot.signIn.commands.includes("github.copilot.chat.triggerPermissiveSignIn"),
+        "expected the current Copilot Chat sign-in command among the candidates"
+      );
+      assert.ok(
+        copilot.signIn.commands.includes("github.copilot.signIn"),
+        "expected the legacy Copilot sign-in command among the candidates"
+      );
+      assert.ok(
+        copilot.signIn.fallbackCommands.includes("workbench.action.manageAccounts"),
+        "expected the current Accounts-menu command among the fallback candidates"
+      );
+      assert.ok(
+        copilot.signIn.fallbackCommands.includes("workbench.action.showAccounts"),
+        "expected the legacy Accounts-menu command among the fallback candidates"
       );
     }
     assert.strictEqual(copilot.enabledByDefault, true);
@@ -390,9 +404,9 @@ void describe("provider CLI contracts", () => {
       if (entry.usage.kind === "unsupported") {
         assert.ok(entry.usage.reason.length > 0, `${entry.id} unsupported usage needs a reason`);
       }
-      // Every provider's account button carries the switch-account label,
-      // matching the Claude Code button as requested.
-      assert.match(entry.signInLabel, /sign in \/ switch account/i, entry.id);
+      // No provider's sign-in button claims "Switch account" — none of these
+      // flows verifiably log the user out before logging back in.
+      assert.strictEqual(entry.signInLabel, "Sign In", entry.id);
     }
 
     // Gemini's /stats invocation follows the CLI's documented slash-command
@@ -412,11 +426,27 @@ void describe("provider CLI contracts", () => {
     assert.ok(claude.usage.kind === "interactive");
     assert.strictEqual(claude.usage.validated, "verified");
 
-    // Copilot's unsupported reason still tells the user where usage lives.
+    // Copilot's unsupported reason still tells the user where usage lives,
+    // and its button opens that page directly instead of staying disabled.
     const copilot = getProviderAccountEntry("copilot");
     assert.ok(copilot);
     assert.ok(copilot.usage.kind === "unsupported");
     assert.match(copilot.usage.reason, /github\.com\/settings\/copilot/);
+    assert.strictEqual(copilot.usage.url, "https://github.com/settings/copilot");
+
+    // Kiro has no usage command either, but links out to its account usage
+    // page rather than leaving the button dead.
+    const kiroEntry = getProviderAccountEntry("kiro-cli");
+    assert.ok(kiroEntry);
+    assert.ok(kiroEntry.usage.kind === "unsupported");
+    assert.strictEqual(kiroEntry.usage.url, "https://app.kiro.dev/account/usage");
+
+    // Antigravity has no known usage page to link to, so it stays a plain
+    // disabled button with just the explanatory reason.
+    const antigravity = getProviderAccountEntry("antigravity-cli");
+    assert.ok(antigravity);
+    assert.ok(antigravity.usage.kind === "unsupported");
+    assert.strictEqual(antigravity.usage.url, undefined);
   });
 
   void it("Kiro hints mention KIRO_API_KEY requirement", () => {

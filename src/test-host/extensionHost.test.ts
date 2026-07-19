@@ -151,4 +151,27 @@ suite("extension host activation (packaged entry point)", () => {
     // to extension-host tests, so this covers the registered bridge command.
     await vscode.commands.executeCommand("vs-code-ai-helper.openAiModels");
   });
+
+  test("registers workbench.action.manageAccounts, the Copilot sign-in fallback command", async () => {
+    // The Copilot sign-in dispatch (providers.ts ProviderSignInAction /
+    // settingsView.ts dispatchVsCodeCommandSignIn) tries
+    // "workbench.action.manageAccounts" as its primary fallback candidate,
+    // ahead of the legacy "workbench.action.showAccounts". Neither the
+    // Copilot nor Copilot Chat extension is installed in this test host, so
+    // the primary sign-in commands can't be verified here — but this
+    // fallback is a plain VS Code built-in, unrelated to Copilot being
+    // installed, and it is the load-bearing candidate for a user who hits
+    // the "sign-in command is not available" error with Copilot absent or
+    // its commands drifted. Runs against whatever VS Code build
+    // @vscode/test-electron downloads, so a future rename shows up here
+    // before a user reports it.
+    const registered = await vscode.commands.getCommands(true);
+    assert.ok(
+      registered.includes("workbench.action.manageAccounts"),
+      "expected the VS Code built-in Accounts-menu command " +
+        "\"workbench.action.manageAccounts\" to be registered in this host; " +
+        "if this fails, VS Code has renamed/removed it again and the " +
+        "fallback candidate list in providers.ts needs a new entry"
+    );
+  });
 });

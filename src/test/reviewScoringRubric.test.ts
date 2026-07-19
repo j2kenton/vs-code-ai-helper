@@ -166,22 +166,12 @@ void describe("review scoring rubric", () => {
     });
   });
 
-  void describe("parseReadiness display bands", () => {
-    void it("maps every score 0-10 to the expected band", () => {
+  void describe("parseReadiness", () => {
+    void it("parses every score 0-10 into its numeric score and label", () => {
       for (let score = 0; score <= 10; score++) {
         const result = parseReadiness(`Readiness: ${score}/10\nBody`);
         assert.strictEqual(result.score, score);
         assert.strictEqual(result.label, `${score}/10`);
-        if (score >= 8) {
-          assert.strictEqual(result.icon, "check");
-          assert.strictEqual(result.colorKey, "charts.green");
-        } else if (score >= 5) {
-          assert.strictEqual(result.icon, "arrow-right");
-          assert.strictEqual(result.colorKey, "charts.yellow");
-        } else {
-          assert.strictEqual(result.icon, "arrow-down");
-          assert.strictEqual(result.colorKey, "charts.red");
-        }
       }
     });
   });

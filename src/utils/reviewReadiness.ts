@@ -1,23 +1,19 @@
 /**
- * Centralizes review readiness parsing and icon-band mapping.
+ * Centralizes review readiness parsing.
  *
  * Review artifacts must include a top-level line in this exact form:
  *   Readiness: N/10
  *
- * Scores map to regular ticks/arrows (not thumbs/question glyphs):
- *   8-10 -> green positive  (check)
- *   5-7  -> yellow caution  (arrow-right)
- *   0-4  -> red negative    (arrow-down)
+ * The score/label are the only sidebar-facing output: stage-level tree icons
+ * no longer vary by score band (see taskTreeProvider.ts's StageNode — a
+ * current review stage always renders a plain blue horizontal arrow,
+ * regardless of readiness, so a low score can never render as a down arrow).
  */
 
 export interface ReadinessResult {
   score: number | null;
   /** Formatted label e.g. "9/10" or "—/10" */
   label: string;
-  /** VS Code codicon name */
-  icon: string;
-  /** VS Code ThemeColor key */
-  colorKey: string;
 }
 
 /** Primary regex: exact `Readiness: N/10` line */
@@ -27,7 +23,6 @@ const LEGACY_READINESS_RE = /readiness[^0-9]*(10|[0-9])\/10/i;
 
 /**
  * Parse readiness from a review artifact string.
- * Returns a ReadinessResult with icon/color for the sidebar.
  */
 export function parseReadiness(content: string): ReadinessResult {
   let score: number | null = null;
@@ -43,41 +38,10 @@ export function parseReadiness(content: string): ReadinessResult {
   }
 
   if (score === null) {
-    return {
-      score: null,
-      label: "—/10",
-      // Must be circle-LARGE-outline, matching the "outstanding" stage rows in
-      // taskTreeProvider. The smaller plain "circle-outline" made a current
-      // review stage whose artifact has no parseable score render with a
-      // visibly smaller circle than its neighbours (the reported intermittent
-      // "smaller circle on High-Level Review (Plan)").
-      icon: "circle-large-outline",
-      colorKey: "disabledForeground",
-    };
+    return { score: null, label: "—/10" };
   }
 
-  if (score >= 8) {
-    return {
-      score,
-      label: `${score}/10`,
-      icon: "check",
-      colorKey: "charts.green",
-    };
-  }
-  if (score >= 5) {
-    return {
-      score,
-      label: `${score}/10`,
-      icon: "arrow-right",
-      colorKey: "charts.yellow",
-    };
-  }
-  return {
-    score,
-    label: `${score}/10`,
-    icon: "arrow-down",
-    colorKey: "charts.red",
-  };
+  return { score, label: `${score}/10` };
 }
 
 /**

@@ -272,6 +272,79 @@ void describe("SettingsViewProvider — webview ready handshake", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Usage-button view-model (unsupported-with-URL vs unsupported-without)
+//
+// settingsView.ts computes usageEnabled/usageTooltip per provider inside
+// _postInit from each entry's usage capability. Providers whose usage is
+// "unsupported" but carry a `url` (Copilot, Kiro) must render an ENABLED
+// button that opens that page; providers with neither a command nor a URL
+// (Antigravity) must stay disabled with just the reason as the tooltip.
+// This is the exact compound condition a previous review cycle had to add
+// after the button silently stayed dead for providers that now have a
+// usage-page fallback — pinned here against the real "init" payload.
+// ---------------------------------------------------------------------------
+
+interface InitProviderViewModel {
+  id: string;
+  usageEnabled: boolean;
+  usageTooltip: string;
+}
+
+void describe("SettingsViewProvider — usage-button view-model", () => {
+  void it("enables the usage button with an 'Opens the usage page' tooltip for unsupported-with-URL providers, and keeps it disabled with just the reason for unsupported-without-URL providers", async () => {
+    __testOnly.setModelSelectionTestOverrides({
+      getAvailableCopilotModels: () => Promise.resolve([]),
+      cliCommandExists: () => Promise.resolve(false),
+    });
+    try {
+      const provider = new SettingsViewProvider(vscode.Uri.file("/fake/ext"));
+      const fake = createFakeWebviewView();
+
+      provider.resolveWebviewView(
+        fake.webviewView,
+        {} as vscode.WebviewViewResolveContext,
+        {} as vscode.CancellationToken
+      );
+      fake.simulateScriptLoaded();
+      await flushAsync();
+
+      const init = fake.postedMessages.find((m) => m.type === "init");
+      assert.ok(init, "expected an init message to have been posted");
+      const providers = init?.providers as InitProviderViewModel[];
+      assert.ok(Array.isArray(providers) && providers.length > 0);
+
+      const byId = new Map(providers.map((p) => [p.id, p]));
+
+      // Copilot: unsupported usage command, but a known usage page.
+      const copilot = byId.get("copilot");
+      assert.ok(copilot, "expected a copilot entry in the init payload");
+      assert.strictEqual(copilot?.usageEnabled, true, "Copilot's usage button must be enabled");
+      assert.match(copilot?.usageTooltip ?? "", /Opens the usage page\.$/);
+
+      // Kiro: same shape — unsupported command, known usage page.
+      const kiro = byId.get("kiro-cli");
+      assert.ok(kiro, "expected a kiro-cli entry in the init payload");
+      assert.strictEqual(kiro?.usageEnabled, true, "Kiro's usage button must be enabled");
+      assert.match(kiro?.usageTooltip ?? "", /Opens the usage page\.$/);
+
+      // Antigravity: unsupported with no known page — stays disabled, and
+      // the tooltip is just the reason (no "Opens the usage page" promise).
+      const antigravity = byId.get("antigravity-cli");
+      assert.ok(antigravity, "expected an antigravity-cli entry in the init payload");
+      assert.strictEqual(
+        antigravity?.usageEnabled,
+        false,
+        "Antigravity's usage button must stay disabled without a usage-page URL"
+      );
+      assert.doesNotMatch(antigravity?.usageTooltip ?? "", /Opens the usage page/);
+      assert.ok((antigravity?.usageTooltip ?? "").length > 0, "the disabled button still needs a reason tooltip");
+    } finally {
+      __testOnly.clearModelSelectionTestOverrides();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Draft preservation across webview disposal (plan step 29)
 //
 // The discard path VS Code owns — deallocating the webview document when the
