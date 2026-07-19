@@ -93,7 +93,12 @@ export function resolvePublishScopeFolder(
 ): { folder: string; stale: boolean } {
   const workspaceFolder = vscode.workspace.getWorkspaceFolder(taskFolderUri);
   const ownershipRoot = progress?.ownership?.projectRoot?.trim();
-  const ownershipRootValid = !!ownershipRoot && isExistingDirectory(ownershipRoot);
+  // Ownership is persisted as an absolute project-root binding.  Do not let
+  // malformed legacy data such as `.` resolve against the extension host's
+  // current working directory: that would make Publish verify an unrelated
+  // project rather than asking the user to re-bind the task.
+  const ownershipRootValid = !!ownershipRoot &&
+    path.isAbsolute(ownershipRoot) && isExistingDirectory(ownershipRoot);
   // A recorded-but-missing project binding is authoritative staleness: the
   // binding declares the project lives elsewhere, so neither a containing
   // workspace nor the metadata folder may substitute for it.

@@ -3,7 +3,8 @@ import * as path from "path";
 import * as crypto from "crypto";
 
 import { allowsDirtyWorktreeChanges } from "../config/settings";
-import { getConfiguredTaskRoot } from "../utils/taskRoot";
+import { getConfiguredTaskRoot, normalizePath } from "../utils/taskRoot";
+import { CurrentTaskStore } from "../utils/currentTaskStore";
 import {
   taskOperations,
   runTrackedOperation,
@@ -433,7 +434,8 @@ export const GENERATE_IMPL_ELIGIBLE_STAGES: readonly TaskStage[] = [
 async function resolveTask(
   node: TaskNodeArg | undefined,
   eligibleStages: readonly TaskStage[],
-  title: string
+  title: string,
+  context: vscode.ExtensionContext
 ): Promise<ResolvedTask | undefined> {
   if (node?.task) {
     const folderUri = node.task.folderUri;
@@ -512,9 +514,25 @@ async function resolveTask(
     return undefined;
   }
 
+  // A no-arg invocation (keyboard shortcut, command palette, an auto-advance
+  // chain that doesn't thread a folder through) has no explicit target. When
+  // exactly one task is eligible, auto-picking it is safe only if it's also
+  // the task the user is actually working on — otherwise a generic shortcut
+  // can silently run against an unrelated task that just happens to be the
+  // sole one sitting at an eligible stage right now, with no confirmation.
+  // Cross-check against the persisted current-task pointer; fall through to
+  // the picker (even for a single item) on any mismatch, so the user
+  // explicitly confirms rather than the command guessing for them.
+  const soleEligible = eligible.length === 1 ? eligible[0] : undefined;
+  const currentTaskId = new CurrentTaskStore(context.workspaceState).get();
+  const autoPickable =
+    soleEligible !== undefined &&
+    (!currentTaskId ||
+      currentTaskId === (soleEligible.canonicalId ?? normalizePath(soleEligible.folderUri.fsPath)));
+
   let picked: IncompleteTask | undefined;
-  if (eligible.length === 1) {
-    picked = eligible[0];
+  if (autoPickable) {
+    picked = soleEligible;
   } else {
     const items = eligible.map((task) => ({
       label: task.folderName,
@@ -1331,7 +1349,8 @@ export async function runReviewWithAI(
   const resolved = await resolveTask(
     normalizeReviewArg(arg),
     Object.keys(REVIEW_TARGETS) as TaskStage[],
-    "Review with AI"
+    "Review with AI",
+    context
   );
   if (!resolved) {
     return;
@@ -1421,7 +1440,8 @@ export async function applyReviewWithAI(
   const resolved = await resolveTask(
     normalizeReviewArg(arg),
     REVIEW_STAGES,
-    "Apply Review with AI"
+    "Apply Review with AI",
+    context
   );
   if (!resolved) {
     return;
@@ -1633,7 +1653,8 @@ export async function fastForwardReviewWithAI(
   const resolved = await resolveTask(
     normalizeReviewArg(arg),
     Object.keys(REVIEW_TARGETS) as TaskStage[],
-    "Fast Forward Review with AI"
+    "Fast Forward Review with AI",
+    context
   );
   if (!resolved) {
     return;
@@ -1913,7 +1934,10 @@ async function applyImplementationReviewWithAI(
 /**
  * Open the review artifact for the task's current review stage.
  */
-export async function viewReview(arg?: ReviewCommandArg): Promise<void> {
+export async function viewReview(
+  context: vscode.ExtensionContext,
+  arg?: ReviewCommandArg
+): Promise<void> {
   // ── Malformed-arg guard ───────────────────────────────────────────────────
   // Primitives ("x", 42, true) fall through to normalizeReviewArg safely.
   if (isMalformedReviewArg(arg as ReviewCommandArg | Record<string, unknown>)) {
@@ -1927,7 +1951,8 @@ export async function viewReview(arg?: ReviewCommandArg): Promise<void> {
   const resolved = await resolveTask(
     normalizeReviewArg(arg),
     REVIEW_STAGES,
-    "View Review"
+    "View Review",
+    context
   );
   if (!resolved) {
     return;
@@ -2005,12 +2030,13 @@ async function currentStageArtifactExists(
  */
 export async function nextStage(
   _extensionUri: vscode.Uri,
+  context: vscode.ExtensionContext,
   node?: TaskNodeArg
 ): Promise<void> {
   // Publish is the final executable stage: its review is generated here and
   // completion/release remain explicit actions. There is no stage after it.
   const advanceable = STAGE_ORDER;
-  const resolved = await resolveTask(node, advanceable, "Next Stage");
+  const resolved = await resolveTask(node, advanceable, "Next Stage", context);
   if (!resolved) {
     return;
   }
@@ -2240,7 +2266,8 @@ export async function generateImplementationWithAI(
   const resolved = await resolveTask(
     normalizeReviewArg(arg),
     GENERATE_IMPL_ELIGIBLE_STAGES,
-    "Generate Implementation with AI"
+    "Generate Implementation with AI",
+    context
   );
   if (!resolved) {
     return;
@@ -2646,7 +2673,8 @@ export async function runImplementationWithAI(
   const resolved = await resolveTask(
     normalizeReviewArg(arg),
     IMPLEMENTATION_ELIGIBLE_STAGES,
-    "Run Implementation with AI"
+    "Run Implementation with AI",
+    context
   );
   if (!resolved) {
     return;
@@ -2813,12 +2841,12 @@ export function registerReviewActionCommands(
     ),
     vscode.commands.registerCommand(
       "vs-code-ai-helper.viewReview",
-      (arg?: ReviewCommandArg) => viewReview(arg)
+      (arg?: ReviewCommandArg) => viewReview(context, arg)
     ),
     vscode.commands.registerCommand(
       "vs-code-ai-helper.nextStage",
       (node?: TaskNodeArg) =>
-        nextStage(context.extensionUri, node)
+        nextStage(context.extensionUri, context, node)
     ),
     // The standalone "Generate Implementation Checklist" command was merged
     // into "Implement Actual Work": runImplementationWithAI generates the

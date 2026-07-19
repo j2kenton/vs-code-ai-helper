@@ -65,7 +65,10 @@ async function resolvePickerRoot(taskFolderUri: vscode.Uri): Promise<PickerRootR
   const progress = await readTaskProgress(taskFolderUri);
   const projectRoot = progress?.ownership?.projectRoot?.trim();
   if (projectRoot) {
-    if (!isExistingDirectory(projectRoot)) {
+    // The task schema records an absolute binding.  A relative value would
+    // otherwise be interpreted relative to the extension host's cwd and
+    // could offer an unrelated project in the scope picker.
+    if (!path.isAbsolute(projectRoot) || !isExistingDirectory(projectRoot)) {
       return { kind: "stale-binding", projectRoot };
     }
     const matchingFolder = (vscode.workspace.workspaceFolders ?? []).find((folder) =>

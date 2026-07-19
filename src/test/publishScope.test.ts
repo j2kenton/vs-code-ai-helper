@@ -367,6 +367,28 @@ void describe("resolvePublishScopeFolder", () => {
     }
   });
 
+  void it("treats a malformed relative projectRoot binding as stale instead of resolving it from the host cwd", () => {
+    const root = path.join(TEST_ROOT, "relative-binding-parent");
+    const taskFolder = path.join(root, ".ensemble", "2026-01-01_task_1");
+    makeDirs([taskFolder]);
+    const ws = installWorkspaceFoldersStub([root]);
+    try {
+      const resolved = resolvePublishScopeFolder(vscode.Uri.file(taskFolder), {
+        ownership: {
+          metaRoot: path.resolve(path.dirname(taskFolder)),
+          // `.` normally exists relative to the test/extension host process,
+          // but it is not a durable project-root binding.
+          projectRoot: ".",
+          boundAt: "2026-01-01T00:00:00.000Z",
+        },
+      });
+      assert.equal(resolved.stale, true);
+      assert.notEqual(path.resolve(resolved.folder), path.resolve("."));
+    } finally {
+      ws.restore();
+    }
+  });
+
   void it("accepts an absolute persisted scope path", () => {
     const root = path.join(TEST_ROOT, "absolute-root");
     const taskFolder = path.join(root, ".ensemble", "2026-01-01_task_1");
