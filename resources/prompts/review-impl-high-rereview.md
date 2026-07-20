@@ -42,6 +42,8 @@ Then structure your review as:
 
 {{contextPack}}
 
+{{verifiedChecks}}
+
 ## Previous High-Level Implementation Review
 
 {{previousReview}}

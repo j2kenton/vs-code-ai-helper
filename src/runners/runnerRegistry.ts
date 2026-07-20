@@ -144,6 +144,19 @@ function filterEnabledBackupModels(models: readonly string[]): string[] {
   );
 }
 
+/**
+ * Configured backup models for a stage, excluding `modelId` itself and any
+ * provider currently disabled — but ONLY when the stage's fallback strategy
+ * is "switch-to-backup" (the quota-triggered automatic switch-over opt-in).
+ * A stage configured with "pause-and-resume" or "alert-and-wait" returns
+ * nothing here, by design: those strategies mean the user explicitly does
+ * NOT want an automatic provider swap on quota failure.
+ *
+ * Do not reuse this for a different question than "should a quota failure
+ * silently switch providers" — see getConfiguredBackupModelsForStage below
+ * for "what alternate models are configured for this stage at all",
+ * independent of that strategy choice.
+ */
 function backupModelsForStage(
   stage: TaskStage | undefined,
   modelId: string | undefined
@@ -157,6 +170,34 @@ function backupModelsForStage(
   }
   return filterEnabledBackupModels(
     getBackupModels(setting).filter(candidate => candidate !== modelId)
+  );
+}
+
+/**
+ * Every configured backup model for a stage, excluding `modelId` itself and
+ * any provider currently disabled — regardless of the stage's fallback
+ * strategy. Exported for the deliberate second-opinion mechanism in
+ * reviewActions.ts: when review-score iteration plateaus, one round is run
+ * against a different model from this list, turning what used to be an
+ * accidental quota-fallback reviewer swap into an intentional check.
+ *
+ * Deliberately does NOT gate on `strategy === "switch-to-backup"` the way
+ * backupModelsForStage does: a user who configured backups under
+ * "pause-and-resume" or "alert-and-wait" has explicitly opted OUT of
+ * automatic quota switch-over, but still has models genuinely available —
+ * gating a plateau-triggered second opinion on that unrelated setting would
+ * silently make the mechanism inert (always "no alternate model was
+ * available") for anyone who made that choice.
+ */
+export function getConfiguredBackupModelsForStage(
+  stage: TaskStage | undefined,
+  modelId: string | undefined
+): string[] {
+  if (!stage) {
+    return [];
+  }
+  return filterEnabledBackupModels(
+    getBackupModels(getModelSettings()[stage]).filter(candidate => candidate !== modelId)
   );
 }
 

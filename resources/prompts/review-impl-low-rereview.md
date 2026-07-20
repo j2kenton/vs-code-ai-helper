@@ -40,6 +40,8 @@ Then structure your review as:
 
 {{contextPack}}
 
+{{verifiedChecks}}
+
 ## Previous Low-Level Implementation Review
 
 {{previousReview}}

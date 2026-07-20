@@ -18,6 +18,8 @@ Readiness: N/10
 
 {{contextPack}}
 
+{{verifiedChecks}}
+
 ## Final Plan
 
 {{plan}}

@@ -3,7 +3,9 @@ import { TaskInventory } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { resolveTaskContext, ResolvedTaskContext } from "../utils/resolveTaskContext";
 import {
+  clearEscalation,
   IncompleteTask,
+  patchTaskProgress,
 } from "../utils/taskProgressUtils";
 import { STAGE_DISPLAY_NAMES } from "../types/taskProgress";
 
@@ -136,6 +138,17 @@ export async function resumePausedTask(
         if (!activated) {
           throw new Error("Could not read task progress.");
         }
+        // Resuming a task IS the human's "how would you like to proceed"
+        // answer to a stuck-review escalation — clear it as a small,
+        // additive follow-up write rather than threading it into
+        // activateTask's own checkpoint/rollback machinery. A stale
+        // escalation left behind here would otherwise linger in the task
+        // tree and (once the task plateaus again) skew
+        // secondOpinionTriedThisPlateau against a fresh attempt.
+        await patchTaskProgress(
+          vscode.Uri.file(resolvedTask.taskFolderPath),
+          (current) => clearEscalation(current)
+        );
       }
     );
   } catch (error) {

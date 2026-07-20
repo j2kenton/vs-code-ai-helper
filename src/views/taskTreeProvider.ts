@@ -291,19 +291,22 @@ export class StageNode extends vscode.TreeItem {
           );
           this.description = "done";
           break;
-        case "current":
+        case "current": {
           // The current-stage icon is always the plain horizontal arrow,
           // regardless of readiness — review-score indicator glyphs
           // (check/arrow-right/arrow-down keyed to score bands) were removed
           // from stage-level icons; a low score must not turn this into a
           // down-arrow. The score itself still surfaces in the description
           // text below, same as a "done" stage's tick never varies by score.
+          const escalated = task.progress.escalation?.stage === stage;
           this.iconPath = new vscode.ThemeIcon(
-            "arrow-right",
-            new vscode.ThemeColor("charts.blue")
+            escalated ? "warning" : "arrow-right",
+            new vscode.ThemeColor(escalated ? "charts.orange" : "charts.blue")
           );
-          this.description = readiness ? `current · ${readiness.label}` : "current";
+          const base = readiness ? `current · ${readiness.label}` : "current";
+          this.description = escalated ? `${base} · escalated` : base;
           break;
+        }
         case "outstanding":
           this.iconPath = new vscode.ThemeIcon(
             "circle-large-outline",
@@ -351,6 +354,9 @@ export class StageNode extends vscode.TreeItem {
         ? `${this.description} · scheduled`
         : "scheduled";
       tooltipStr += "\n\nThe current-stage action is scheduled.";
+    }
+    if (task.progress.escalation?.stage === stage) {
+      tooltipStr += `\n\nAutomated review iteration is stuck and needs your input: ${task.progress.escalation.reason}`;
     }
     this.tooltip = new vscode.MarkdownString(tooltipStr, true);
 

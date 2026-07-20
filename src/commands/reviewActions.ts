@@ -13,6 +13,7 @@ import {
   TaskOperationHandle,
 } from "../utils/taskOperations";
 import {
+  EscalationKind,
   isPlanReviewStage,
   isReviewStage,
   PLAN_FILENAME,
@@ -24,6 +25,7 @@ import {
 } from "../types/taskProgress";
 import { TaskProgress } from "../types/taskProgress";
 import {
+  appendReviewScoreHistory,
   findAllTasks,
   IncompleteTask,
   patchTaskProgress,
@@ -71,11 +73,14 @@ import {
   backupArtifactBeforeWrite,
   previousVersionUri,
 } from "../utils/artifactBackups";
-import { meetsAutoAdvanceThreshold, parseReadiness } from "../utils/reviewReadiness";
+import { meetsAutoAdvanceThreshold, parseReadiness, parseReviewBlockers } from "../utils/reviewReadiness";
 import { scheduleAutomationChain } from "../utils/automationChain";
-import { resolvePublishScopeFolder } from "../utils/completionLint";
+import { buildVerifiedChecksSection, collectCompletionLintPreview, resolvePublishScopeFolder } from "../utils/completionLint";
 import { checkPublishPreflight } from "../utils/publishPreflight";
 import { improveReviewScore } from "../utils/reviewScoreLoop";
+import { decideReviewRoute, detectPlateau } from "../utils/reviewRouting";
+import { escalateReviewToHuman } from "../utils/reviewEscalation";
+import { getConfiguredBackupModelsForStage } from "../runners/runnerRegistry";
 import {
   getAutoAdvanceMode,
   getAutoAdvanceScoreThreshold,
@@ -84,6 +89,7 @@ import {
   getCompleteAndMoveOnTriggersAIMode,
   getFastForwardMaxIterations,
   getFastForwardStopLevel,
+  getReviewPlateauRounds,
   isAutoAdvanceEnabled,
   strongestAutoTriggerMode,
   usesAcceptanceThresholdForFastForward,
@@ -372,6 +378,23 @@ interface ApplyReviewOptions {
    * changes no existing dispatch behavior.
    */
   suppressAutoPublishDispatch?: boolean;
+  /**
+   * Suppress plateau-driven second-opinion/escalation for internal re-review
+   * attempts within a single Fast Forward session. Fast Forward's own
+   * maxAttempts budget (default 5) sits right next to the default plateau
+   * window (3 rounds + 1 baseline = 4) — without this, a Fast Forward loop
+   * that plateaus on attempt 4 of its OWN sanctioned, expected multi-attempt
+   * budget would get escalated (pausing the task) mid-session, which then
+   * aborts the loop's remaining attempts early via the paused-status guard,
+   * contradicting Fast Forward's own "try up to N times" contract — and is
+   * redundant with the stalled/target-not-reached notification Fast Forward
+   * already shows when its own loop concludes. Round history is still
+   * recorded (so a plateau spanning separate, later invocations is still
+   * caught), only the second-opinion/escalate actions are skipped. Set by
+   * buildFastForwardApplyReviewOptions; unset (false) for a standalone
+   * Apply Review click.
+   */
+  suppressReviewRouting?: boolean;
 }
 
 interface ExecuteImplementationRunOptions {
@@ -425,6 +448,7 @@ export function buildFastForwardApplyReviewOptions(
     skipImplementationSafetyCheck: preserveActiveFallback,
     preserveActiveFallback,
     parentOperation,
+    suppressReviewRouting: true,
   };
 }
 
@@ -1090,6 +1114,423 @@ async function readPreviousReviewForRereview(
 // otherwise deadlock.
 
 /**
+ * Run the project's real lint/type-check/test commands (via
+ * collectCompletionLintPreview) and render the result as the
+ * `{{verifiedChecks}}` block injected into implementation/publish review
+ * prompts — see completionLint.ts's buildVerifiedChecksSection for why this
+ * exists: a reviewer with no way to confirm "tests pass" otherwise has to
+ * either trust the implementer's prose or try to run the suite itself, and
+ * if its own sandbox can't run anything it has no way to ever mark that
+ * criterion satisfied. Side-effect-free (does not persist to
+ * task-progress.json or publish-review.md — that only happens at an actual
+ * Publish attempt via runCompletionLint) and never throws: a stale/
+ * unresolvable Publish scope or any other failure degrades to an explicit
+ * "could not run" note rather than blocking the review that requested it.
+ *
+ * `token`, when supplied, is the enclosing tracked operation's cancellation
+ * token — linked through to every spawned check process so cancelling the
+ * review/Fast Forward from the UI actually stops a hung lint/test run
+ * instead of leaving it running with no way to recover short of reloading
+ * the window. Each check is additionally capped at
+ * ensemble.completionCheckTimeoutMs regardless of cancellation.
+ */
+async function buildVerifiedChecksVariable(
+  folderUri: vscode.Uri,
+  relevantFiles: readonly string[] | undefined,
+  token: vscode.CancellationToken | undefined
+): Promise<string> {
+  try {
+    // includeAiPlanVerification: false — buildVerifiedChecksSection never
+    // renders `planItems`, so running that AI-assisted pass here would be a
+    // full extra model call (against the Publish-stage model, regardless of
+    // which stage is actually under review) discarded on every single
+    // review round for output nothing displays.
+    const result = await collectCompletionLintPreview(folderUri, relevantFiles, {
+      allowScopePrompt: false,
+      includeAiPlanVerification: false,
+      token,
+    });
+    return buildVerifiedChecksSection(result);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    // Consistent with review-scoring-rubric.md's "## Verified Checks"
+    // section ("raise a blocker ... when it reports checks could not be
+    // run at all"): the extension host being UNABLE to run checks at all
+    // (a stale/unresolvable Publish scope, a scope-resolution failure) is
+    // itself missing evidence — a legitimate review-confidence concern, not
+    // the "you personally can't reproduce a test run" case the rubric tells
+    // reviewers to ignore. Do not tell reviewers to disregard this.
+    return (
+      "## Verified Checks (ground truth)\n\n" +
+      `Verified checks could not be run for this review: ${message}\n\n` +
+      "This means no ground-truth evidence is available for this round — treat the absence of verified checks itself as a review-confidence concern, not as neutral."
+    );
+  }
+}
+
+/**
+ * Run one review round against a model different from the stage's primary —
+ * the deliberate second-opinion mechanism (see decideReviewRoute's
+ * "second-opinion" route). Mirrors runAiPlanVerification's pattern in
+ * completionLint.ts: resolve a runner directly and execute to a scratch
+ * output file, rather than going through runAiToFile/the promoted-artifact
+ * machinery, since this must never touch the promoted review artifact or
+ * its CAS/backup bookkeeping — it is purely diagnostic input to a routing
+ * decision, never itself published.
+ *
+ * Deliberately always uses the INITIAL review template (REVIEW_PROMPTS),
+ * never whatever re-review template the primary round used, and strips
+ * `previousReview` out of the rendered variables. By the time a plateau can
+ * even be detected the primary is almost always mid re-review — reusing its
+ * template/variables would hand the second opinion the previous review and
+ * explicit instructions to "reconcile every blocker from the previous
+ * review," steering it to agree rather than form the independent verdict
+ * this mechanism exists to get. Everything else (context pack, plan,
+ * implementation, verifiedChecks) is still shared, since the second opinion
+ * should judge the same code, just without being anchored to the primary's
+ * own prior conclusions.
+ *
+ * Tries each configured backup in order and returns the first one that
+ * actually produces parseable output; returns undefined if none are
+ * available or none complete successfully (callers treat that as "no second
+ * opinion could be obtained" and escalate on the primary review alone), or
+ * if the enclosing operation is cancelled while a candidate is being tried.
+ */
+async function runSecondOpinionReview(
+  extensionUri: vscode.Uri,
+  folderUri: vscode.Uri,
+  workspaceUri: vscode.Uri,
+  targetStage: TaskStage,
+  variables: Record<string, string>,
+  outerToken: vscode.CancellationToken | undefined
+): Promise<{ content: string; modelId: string } | undefined> {
+  const initialTemplateFile = REVIEW_PROMPTS[targetStage];
+  if (!initialTemplateFile) {
+    return undefined;
+  }
+  const { previousReview: _previousReview, ...independentVariables } = variables;
+  const primary = await resolveModelForStage(folderUri, targetStage);
+  // getConfiguredBackupModelsForStage, not backupModelsForStage: the latter
+  // only returns anything when strategy === "switch-to-backup" — the quota-
+  // fallback opt-in. A user configuring backups under "pause-and-resume" or
+  // "alert-and-wait" (i.e. explicitly opting OUT of automatic quota
+  // switch-over) still has models genuinely configured and available for a
+  // deliberate second opinion, which is a different question from "should a
+  // quota failure silently switch providers".
+  const candidates = getConfiguredBackupModelsForStage(targetStage, primary.modelId);
+  const prompt = await renderPromptTemplate(extensionUri, initialTemplateFile, independentVariables);
+  for (const candidateModelId of candidates) {
+    if (outerToken?.isCancellationRequested) {
+      return undefined;
+    }
+    let resolved: ReturnType<typeof resolveRunnerForModel>;
+    try {
+      // No `stage` argument: resolveRunnerForModel only adds its own
+      // backup-fallback wrapping when given one. This candidate was already
+      // chosen from the stage's backup list above — wrapping it in another
+      // layer of automatic fallback could let the run silently execute
+      // against one of ITS backups instead, so the modelId reported back
+      // to the caller (and shown in the escalation reason) would name a
+      // model that never actually ran.
+      resolved = resolveRunnerForModel(candidateModelId, undefined, folderUri);
+    } catch {
+      continue;
+    }
+    let availability: Awaited<ReturnType<typeof resolved.runner.isAvailable>>;
+    try {
+      availability = await resolved.runner.isAvailable();
+    } catch {
+      // A throwing isAvailable() (a runner bug, a network error checking
+      // auth status) must not escape this loop: it would propagate up
+      // through handleReviewRoutingOutcome's own try/catch and abandon the
+      // ENTIRE escalation for this round — including the direct-escalate
+      // path this second-opinion attempt was itself already a step inside
+      // of — leaving nothing recorded and the plateau silently unresolved.
+      // Treat a flaky candidate as unavailable and try the next one.
+      continue;
+    }
+    if (!availability.available) {
+      continue;
+    }
+    const outputFile = vscode.Uri.file(
+      path.join(folderUri.fsPath, `.second-opinion.${crypto.randomUUID()}.tmp.md`)
+    );
+    // Linked to the enclosing operation's token (when it has one) so
+    // cancelling the review/Fast Forward from the UI actually stops this
+    // AI call instead of leaving it running orphaned while still holding
+    // the task's exclusive operation lock.
+    const linked = linkCancellationTokens(outerToken);
+    try {
+      const result = await resolved.runner.run(
+        {
+          taskFolderUri: folderUri,
+          workspaceUri,
+          stage: targetStage,
+          prompt,
+          outputFile,
+          modelId: resolved.nativeModelId,
+        },
+        linked.token
+      );
+      if (result.status !== "completed") {
+        continue;
+      }
+      let output = "";
+      try {
+        output = new TextDecoder().decode(await vscode.workspace.fs.readFile(outputFile));
+      } catch {
+        continue;
+      }
+      if (!output.trim() || parseReadiness(output).score === null) {
+        continue;
+      }
+      return { content: output, modelId: candidateModelId };
+    } catch {
+      // A throwing run() (network failure, runner crash) must not escape
+      // this loop for the same reason a throwing isAvailable() must not —
+      // see above. Try the next candidate instead of abandoning the whole
+      // escalation this attempt was itself already a step inside of.
+      //
+      // Cancellation does NOT reach this catch: AgentRunner.run()'s
+      // contract (agentRunner.ts) reports it as a resolved
+      // `{ status: "cancelled" }`, never a thrown CancellationError — both
+      // concrete runners (CliAgentRunner, CopilotLanguageModelRunner) honor
+      // this. That result already falls through the `result.status !==
+      // "completed"` check above into `continue`, and is caught for real by
+      // the `outerToken?.isCancellationRequested` check at the top of this
+      // loop on the next iteration. An earlier version of this catch had a
+      // `CancellationError`-specific branch here; it could never fire.
+      continue;
+    } finally {
+      linked.dispose();
+      try {
+        await vscode.workspace.fs.delete(outputFile);
+      } catch {
+        // Already absent (run failed before writing) — nothing to clean up.
+      }
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Reconcile a plateaued primary review against one second-opinion round.
+ * Deliberately never lets the second opinion advance the task on its own —
+ * a friendlier fallback model unilaterally clearing work its primary
+ * reviewer rejected is exactly the accidental failure mode this whole
+ * mechanism replaces (see the task this was built to fix: a quota-triggered
+ * fallback reviewer happened to be more lenient and that was the only thing
+ * that ever moved the score). Every outcome escalates; the difference is
+ * only in how confidently the escalation reason can tell the human what's
+ * actually going on.
+ *
+ * Only takes the second opinion — a `primaryBlockers` parameter existed in
+ * an earlier version, but this function's only call site is reached solely
+ * when the primary review has at least one task-fixable blocker (that's
+ * exactly what routes to "second-opinion" rather than a direct "escalate" —
+ * see decideReviewRoute), so "primary reports only non-fixable blockers"
+ * can never be true here. A predicate keyed on that was dead code.
+ *
+ * @internal exported for testing
+ */
+export function reconcileSecondOpinion(
+  secondOpinion: { content: string; modelId: string }
+): { kind: EscalationKind; reason: string } {
+  const second = parseReadiness(secondOpinion.content);
+  const secondBlockers = parseReviewBlockers(secondOpinion.content);
+  const secondOnlyNonFixable = secondBlockers.length > 0 &&
+    secondBlockers.every((b) => b.resolver !== "task-fixable");
+  const secondFoundNothingBlocking = secondBlockers.length === 0 && second.score !== null && second.score >= 8;
+
+  if (secondOnlyNonFixable) {
+    // The second reviewer independently found the same area of concern but
+    // classified it as something no re-implementation can fix — a genuinely
+    // useful reclassification signal, even though the primary called it
+    // task-fixable.
+    // secondOnlyNonFixable guarantees every resolver present is one of
+    // environmental/unverifiable/spec-defect (the non-task-fixable members
+    // of BlockerResolver) — all three are checked explicitly so an
+    // unverifiable-only second opinion is reported as such rather than
+    // silently collapsing into "environmental" via a duplicate fallback arm.
+    const resolverKinds = new Set(secondBlockers.map((b) => b.resolver));
+    const kind: EscalationKind = resolverKinds.has("environmental")
+      ? "environmental"
+      : resolverKinds.has("spec-defect")
+        ? "spec-defect"
+        : resolverKinds.has("unverifiable")
+          ? "unverifiable"
+          : "environmental"; // unreachable given the guarantee above; safe fallback
+    return {
+      kind,
+      reason:
+        `A second reviewer (${secondOpinion.modelId}, different from the primary) independently concluded the remaining ` +
+        `issue is outside automation's control (scored ${second.label}), despite the primary calling it fixable.`,
+    };
+  }
+  if (secondFoundNothingBlocking) {
+    // The second reviewer disagrees outright — it sees nothing wrong.
+    return {
+      kind: "reviewer-disagreement",
+      reason:
+        `A second reviewer (${secondOpinion.modelId}, different from the primary) found no blockers and scored this ` +
+        `${second.label}, disagreeing with the primary's assessment.`,
+    };
+  }
+  // The second reviewer also reports a real, in-theory-fixable issue —
+  // confirmation this is genuinely stuck, not a fluke of one model, but
+  // automated iteration still isn't resolving it.
+  return {
+    kind: "plateau",
+    reason:
+      `A second reviewer (${secondOpinion.modelId}, different from the primary) independently confirmed a real issue ` +
+      `remains (scored ${second.label}) — automated iteration has been unable to resolve it across multiple rounds.`,
+  };
+}
+
+/**
+ * The exit valve this whole mechanism exists for: after a review publishes
+ * below the auto-advance threshold, record this round in the durable score
+ * history, detect whether the stage has plateaued across rounds (which,
+ * unlike Fast Forward's own in-session stall detection, catches the case
+ * that actually happened — many separate review invocations across hours,
+ * not one exhausted apply/re-review loop), and either let iteration
+ * continue, get a deliberate second opinion, or escalate to the human.
+ *
+ * Does not itself perform stage advancement — the existing score-threshold
+ * auto-advance logic in runReviewForFolder still owns that. It DOES,
+ * however, report back when it escalated (paused the task this round): the
+ * caller must skip its own advance/publish scheduling in that case. Without
+ * that, a `meetsThreshold` computed moments earlier could still fire the
+ * independent auto-advance block in the same call — advancing (and, via
+ * updateTaskProgressStage, silently erasing) an escalation this function
+ * just recorded and paused the task for. That contradiction can genuinely
+ * occur: `decideReviewRoute` can escalate even when the score meets
+ * threshold, if a reported blocker is still task-fixable or a spec-defect —
+ * the rubric asks reviewers to keep such scores at 7 or below, but nothing
+ * here may assume a reviewer always follows that. Never throws: any failure
+ * here is logged as a warning and swallowed rather than risking the review
+ * pipeline that already succeeded in publishing (failure returns
+ * escalated: false, since nothing was actually paused).
+ */
+async function handleReviewRoutingOutcome(options: {
+  extensionUri: vscode.Uri;
+  folderUri: vscode.Uri;
+  workspaceUri: vscode.Uri;
+  targetStage: TaskStage;
+  variables: Record<string, string>;
+  reviewAttemptId: string;
+  content: string;
+  score: number | null;
+  threshold: number;
+  /** See ApplyReviewOptions.suppressReviewRouting — true for an internal
+   * re-review attempt inside an active Fast Forward session. */
+  suppressEscalation: boolean;
+  /** The enclosing tracked operation's cancellation token, when it has one
+   * (registered `cancellable: true`) — linked into the second-opinion AI
+   * call so cancelling the review/Fast Forward from the UI actually stops
+   * it instead of leaving it running orphaned while still holding the
+   * task's exclusive operation lock. */
+  cancellationToken: vscode.CancellationToken | undefined;
+}): Promise<{ escalated: boolean }> {
+  const { extensionUri, folderUri, workspaceUri, targetStage, variables, reviewAttemptId, content, score, threshold, suppressEscalation, cancellationToken } = options;
+  try {
+    const blockers = parseReviewBlockers(content);
+    const progressBefore = await readTaskProgress(folderUri);
+    if (!progressBefore) {
+      return { escalated: false };
+    }
+    const historyEntry = {
+      stage: targetStage,
+      score,
+      attemptId: reviewAttemptId,
+      at: new Date().toISOString(),
+      blockerCount: blockers.length,
+      taskFixableCount: blockers.filter((b) => b.resolver === "task-fixable").length,
+    };
+    // History is always recorded, even when suppressEscalation is set —
+    // Fast Forward's OWN internal rounds are still real evidence for
+    // detecting a plateau that later spans separate, later invocations.
+    const updated = await patchTaskProgress(folderUri, (current) =>
+      appendReviewScoreHistory(current, historyEntry)
+    );
+    if (!updated) {
+      return { escalated: false };
+    }
+
+    const plateauWindow = getReviewPlateauRounds();
+    const plateaued = detectPlateau(updated.reviewScoreHistory ?? [], targetStage, plateauWindow);
+    // A second opinion has already been "tried this plateau" once any round
+    // in the current unbroken run of plateaued rounds recorded one. Latches
+    // on `secondOpinionAttempted`, not `kind`: every kind a second-opinion
+    // attempt can actually produce (environmental/spec-defect on agreement,
+    // reviewer-disagreement, or plateau when no candidate model was
+    // available) must count, or a resumed task that plateaus again gets a
+    // redundant second-opinion round instead of escalating directly.
+    const secondOpinionTriedThisPlateau =
+      progressBefore.escalation?.stage === targetStage &&
+      progressBefore.escalation.secondOpinionAttempted === true;
+
+    const decision = decideReviewRoute({
+      score,
+      threshold,
+      blockers,
+      plateaued,
+      secondOpinionTriedThisPlateau,
+    });
+
+    if (decision.route === "advance" || decision.route === "iterate") {
+      return { escalated: false };
+    }
+    if (decision.route === "advance-with-note") {
+      NotificationRouter.showInformation(
+        `${STAGE_DISPLAY_NAMES[targetStage]} review scored ${score}/10 — ${decision.reason}`
+      );
+      return { escalated: false };
+    }
+    if (suppressEscalation) {
+      // Fast Forward's own maxAttempts budget already reports stalled/
+      // target-not-reached when its loop concludes — escalating (pausing
+      // the task) mid-session here would cut that budget short via the
+      // paused-status guard the very next attempt() call hits, and would be
+      // redundant with the notification Fast Forward is about to show
+      // anyway. The round is already recorded in history above.
+      return { escalated: false };
+    }
+    if (decision.route === "second-opinion") {
+      NotificationRouter.showInformation(
+        `${STAGE_DISPLAY_NAMES[targetStage]} review has plateaued at ${score}/10 — getting an independent second opinion before escalating.`
+      );
+      const secondOpinion = await runSecondOpinionReview(extensionUri, folderUri, workspaceUri, targetStage, variables, cancellationToken);
+      if (!secondOpinion) {
+        const escalated = await escalateReviewToHuman(
+          folderUri,
+          targetStage,
+          "plateau",
+          `${decision.reason} No alternate model was available to get a second opinion.`,
+          reviewAttemptId,
+          updated,
+          true
+        );
+        return { escalated };
+      }
+      const reconciled = reconcileSecondOpinion(secondOpinion);
+      const escalated = await escalateReviewToHuman(folderUri, targetStage, reconciled.kind, reconciled.reason, reviewAttemptId, updated, true);
+      return { escalated };
+    }
+    // decision.route === "escalate"
+    const escalated = await escalateReviewToHuman(folderUri, targetStage, "plateau", decision.reason, reviewAttemptId, updated, false);
+    return { escalated };
+  } catch (error) {
+    NotificationRouter.showWarning(
+      `Review routing check failed (the review itself still published successfully): ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    );
+    return { escalated: false };
+  }
+}
+
+/**
  * Core review logic for a known task folder: build variables, run the AI
  * review for the given stage, and advance the task to the review stage.
  * Called by runReviewWithAI (user-invoked) and by nextStage for auto-triggered reviews.
@@ -1151,6 +1592,8 @@ export async function runReviewForFolder(
     autoPublishOnSuccess?: boolean;
     /** See ApplyReviewOptions.suppressAutoPublishDispatch. */
     suppressAutoPublishDispatch?: boolean;
+    /** See ApplyReviewOptions.suppressReviewRouting. */
+    suppressReviewRouting?: boolean;
   } = {}
 ): Promise<void> {
   const targetStage = REVIEW_TARGETS[currentStage];
@@ -1238,6 +1681,7 @@ export async function runReviewForFolder(
 
     variables.plan = planContent;
     variables.implementation = implementationContent;
+    variables.verifiedChecks = await buildVerifiedChecksVariable(folderUri, undefined, options.operation?.token);
   }
 
   let contextPackContent: string;
@@ -1355,6 +1799,30 @@ export async function runReviewForFolder(
         const score = parseReadiness(content).score;
         const autoAdvanceThreshold = getAutoAdvanceScoreThreshold();
         const meetsThreshold = meetsAutoAdvanceThreshold(score, autoAdvanceThreshold);
+        // Records this round in the durable score history and decides
+        // whether to keep quietly iterating, get a deliberate second
+        // opinion, or escalate to the human. `escalated` is true only for
+        // the second two — in that case this round just paused the task, so
+        // the auto-publish/auto-advance blocks below (which independently
+        // re-derive "should this land" from the score alone) must not run:
+        // decideReviewRoute can escalate even when `meetsThreshold` is true
+        // (e.g. a reported blocker is still task-fixable despite the
+        // score), and advancing the stage right after would, via
+        // updateTaskProgressStage, silently erase the escalation this same
+        // call just recorded and paused the task for.
+        const { escalated } = await handleReviewRoutingOutcome({
+          extensionUri,
+          folderUri,
+          workspaceUri: workspaceRoot.uri,
+          targetStage,
+          variables,
+          reviewAttemptId,
+          content,
+          score,
+          threshold: autoAdvanceThreshold,
+          suppressEscalation: options.suppressReviewRouting ?? false,
+          cancellationToken: options.operation?.token,
+        });
         // Review-owned auto-publish is intentionally independent of the
         // general "auto-advance stage" setting below: this Publish review was
         // dispatched specifically because autoPublishOnSuccess was requested
@@ -1365,6 +1833,7 @@ export async function runReviewForFolder(
         // still shows its own confirmation dialogs, so this never silently
         // commits or pushes.
         if (
+          !escalated &&
           targetStage === "publish" &&
           options.autoPublishOnSuccess &&
           !options.suppressAutoPublishDispatch
@@ -1399,7 +1868,7 @@ export async function runReviewForFolder(
             );
           }
         }
-        if (isAutoAdvanceEnabled() && meetsThreshold) {
+        if (!escalated && isAutoAdvanceEnabled() && meetsThreshold) {
           NotificationRouter.showInformation(`Review score ${score}/10 reached the auto-advance threshold. Auto-advancing stage...`);
           const configuredStages = await resolveConfiguredReviewStages(folderUri);
           const next = computeNextStage(targetStage, configuredStages);
@@ -1974,6 +2443,7 @@ export async function applyReviewWithAI(
                 operation: op,
                 autoPublishOnSuccess: chainedAutoPublishOnSuccess(arg),
                 suppressAutoPublishDispatch: options.suppressAutoPublishDispatch,
+                suppressReviewRouting: options.suppressReviewRouting,
               }
             )
         );
@@ -2055,6 +2525,7 @@ export async function applyReviewWithAI(
               operation: op,
               autoPublishOnSuccess: chainedAutoPublishOnSuccess(arg),
               suppressAutoPublishDispatch: options.suppressAutoPublishDispatch,
+              suppressReviewRouting: options.suppressReviewRouting,
             }
           )
       );

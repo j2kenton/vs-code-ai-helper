@@ -28,6 +28,7 @@ import {
   deactivateNotificationRouter,
   initNotificationRouter,
 } from "../utils/notificationRouter";
+import { safeRemoveDir } from "./testFsUtils";
 
 // Both modules are required (not `import`ed) so their exported function
 // references can be monkey-patched for the duration of a test: TypeScript
@@ -194,7 +195,7 @@ function installGateHarness(
       vscode.window.showWarningMessage = originalShowWarningMessage;
       (vscode.workspace as unknown as Record<string, unknown>).workspaceFolders = originalWorkspaceFolders;
       deactivateNotificationRouter();
-      fs.rmSync(repoRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+      safeRemoveDir(repoRoot);
     },
   };
 }

@@ -127,6 +127,21 @@ void describe("createReopenMutation", () => {
     assert.equal(next.reviewAttemptId, undefined);
   });
 
+  void it("clears a stale escalation regardless of chosen stage — a completed task can carry one if the user chose Publish Anyway instead of resuming first", () => {
+    const mutate = createReopenMutation("publish", "2026-01-01T00:00:00.000Z");
+    const current = baseProgress({
+      escalation: {
+        stage: "publish",
+        kind: "plateau",
+        reason: "stuck before this task was published anyway",
+        at: "2025-12-31T00:00:00.000Z",
+        secondOpinionAttempted: true,
+      },
+    });
+    const next = mutate(current);
+    assert.equal(next.escalation, undefined);
+  });
+
   void it("preserves implReviewFiles when reopening at impl-high-review, impl-low-review, or publish", () => {
     for (const stage of ["impl-high-review", "impl-low-review", "publish"] as const) {
       const mutate = createReopenMutation(stage, "2026-01-01T00:00:00.000Z");

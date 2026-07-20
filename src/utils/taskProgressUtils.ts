@@ -2,6 +2,9 @@ import * as vscode from "vscode";
 import {
   migrateStage,
   migrateStatus,
+  MAX_REVIEW_SCORE_HISTORY,
+  ReviewScoreHistoryEntry,
+  TaskEscalation,
   TaskProgress,
   TaskStage,
   TaskStatus,
@@ -239,8 +242,12 @@ export function updateTaskProgressStage(
   const fallbackModelId = { ...progress.fallbackModelId };
   delete fallbackActive[newStage];
   delete fallbackModelId[newStage];
+  // A stage transition always resolves whatever iteration was stuck on the
+  // stage being left — an escalation recorded there would otherwise linger
+  // and be shown against the new stage it has nothing to do with.
+  const { escalation: _unused, ...withoutEscalation } = progress;
   return {
-    ...progress,
+    ...withoutEscalation,
     currentStage: newStage,
     fallbackActive: Object.keys(fallbackActive).length > 0
       ? fallbackActive
@@ -360,6 +367,61 @@ export function clearLintPayload(progress: TaskProgress): TaskProgress {
   };
 }
 
+
+/**
+ * Append one round to the durable review-score trail (see
+ * `TaskProgress.reviewScoreHistory`'s doc comment for why this must be
+ * cross-invocation state rather than in-memory-only). Trims from the front
+ * once the cap is exceeded so the file doesn't grow unbounded over a task's
+ * lifetime.
+ */
+export function appendReviewScoreHistory(
+  progress: TaskProgress,
+  entry: ReviewScoreHistoryEntry
+): TaskProgress {
+  const history = [...(progress.reviewScoreHistory ?? []), entry];
+  const trimmed = history.length > MAX_REVIEW_SCORE_HISTORY
+    ? history.slice(history.length - MAX_REVIEW_SCORE_HISTORY)
+    : history;
+  return {
+    ...progress,
+    reviewScoreHistory: trimmed,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * Record that automated review iteration has given up and needs a human
+ * decision. Does not itself change `status` — callers that want the
+ * automation chain to actually stop must also set `status: "paused"` (see
+ * `escalateReviewToHuman` in reviewEscalation.ts).
+ */
+export function recordEscalation(
+  progress: TaskProgress,
+  escalation: TaskEscalation
+): TaskProgress {
+  return {
+    ...progress,
+    escalation,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * Clear a recorded escalation — e.g. once the user resumes the task or the
+ * stage moves on. Stage transitions call this so a stale escalation reason
+ * from a previous stage never lingers into the next one.
+ */
+export function clearEscalation(progress: TaskProgress): TaskProgress {
+  if (!progress.escalation) {
+    return progress;
+  }
+  const { escalation: _unused, ...rest } = progress;
+  return {
+    ...rest,
+    updatedAt: new Date().toISOString(),
+  };
+}
 
 /**
  * Find all incomplete tasks in the meta folder

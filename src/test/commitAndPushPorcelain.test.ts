@@ -20,6 +20,7 @@ import {
   stripSensitiveTaskFiles,
 } from "../commands/commitAndPushTask";
 import { CHAT_HISTORY_FILENAME, CHAT_HISTORY_CORRUPT_FILENAME } from "../utils/chatHistoryConstants";
+import { safeRemoveDir } from "./testFsUtils";
 
 function git(cwd: string, args: string[]): void {
   cp.execFileSync("git", args, { cwd, stdio: "ignore", windowsHide: true });
@@ -115,7 +116,7 @@ void describe("getChangedFiles rename atomicity", () => {
       assert.ok(scopedFiles.includes("src/old.ts"), "origin path staged so the rename isn't split");
       assert.ok(!scopedFiles.some((f) => f.startsWith("plans/task_1/")), "task-folder file excluded by default");
     } finally {
-      fs.rmSync(repoRoot, { recursive: true, force: true });
+      safeRemoveDir(repoRoot);
     }
   });
 });
@@ -140,7 +141,7 @@ void describe("getChangedFiles chat-transcript exclusion (Option A staging polic
       );
       assert.ok(sensitiveFilePaths.includes(`plans/task_1/${CHAT_HISTORY_FILENAME}`));
     } finally {
-      fs.rmSync(repoRoot, { recursive: true, force: true });
+      safeRemoveDir(repoRoot);
     }
   });
 
@@ -168,7 +169,7 @@ void describe("getChangedFiles chat-transcript exclusion (Option A staging polic
       assert.ok(sensitiveFilePaths.includes(`plans/task_2/${CHAT_HISTORY_FILENAME}`));
       assert.ok(sensitiveFilePaths.includes(`plans/task_2/${CHAT_HISTORY_CORRUPT_FILENAME}`));
     } finally {
-      fs.rmSync(repoRoot, { recursive: true, force: true });
+      safeRemoveDir(repoRoot);
     }
   });
 
@@ -218,7 +219,7 @@ void describe("getChangedFiles chat-transcript exclusion (Option A staging polic
       assert.ok(sensitiveFilePaths.includes("src/archive.json"), "the destination must be classified as sensitive");
       assert.ok(sensitiveFilePaths.includes(`plans/task_1/${CHAT_HISTORY_FILENAME}`));
     } finally {
-      fs.rmSync(repoRoot, { recursive: true, force: true });
+      safeRemoveDir(repoRoot);
     }
   });
 
@@ -253,7 +254,7 @@ void describe("getChangedFiles chat-transcript exclusion (Option A staging polic
       );
       assert.ok(sensitiveFilePaths.includes("plans/task_1/notes.json"));
     } finally {
-      fs.rmSync(repoRoot, { recursive: true, force: true });
+      safeRemoveDir(repoRoot);
     }
   });
 
@@ -275,7 +276,7 @@ void describe("getChangedFiles chat-transcript exclusion (Option A staging polic
       );
       assert.ok(!sensitiveFilePaths.includes(`notes/${CHAT_HISTORY_FILENAME}`));
     } finally {
-      fs.rmSync(repoRoot, { recursive: true, force: true });
+      safeRemoveDir(repoRoot);
     }
   });
 });

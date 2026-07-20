@@ -20,3 +20,26 @@ How to apply the rubric:
 - Missing evidence should lower the score only when it prevents readiness from being established. Optional extra evidence is non-blocking.
 - Score the current artifact, not model effort, the number of changed files, or improvement since a previous attempt.
 - Scores need not be monotonic across re-reviews. When re-reviewing, reconcile previous findings and explain score movement whenever newly discovered real issues change the score.
+
+## Verified Checks
+
+When a "## Verified Checks (ground truth)" section is present below, it was produced by the extension host actually running the project's lint/type-check/test commands — it is not a claim from the implementer and not something you are being asked to verify yourself. Treat its overall result as ground truth for whether the checks pass. Do not raise a review-confidence blocker, and do not lower the score, merely because you have no way to independently run the tests yourself — that limitation is now covered by this section, not by you. A failure quarantined there as a "known flake" is explicitly not an outstanding blocker; do not re-raise it as one. Only raise a blocker from this section when it reports a real (non-quarantined) failure, or when it reports checks could not be run at all.
+
+## Blocker Classification
+
+In addition to the prose blocker sections below, end your response with a machine-readable block listing every blocker you named above (architectural, completion, defect, shipping, and review-confidence blockers all go in this one block; omit the block entirely only when you found zero blockers of any kind):
+
+```
+<!-- blockers:start -->
+- [completion] [task-fixable] one-line description matching a blocker above
+- [review-confidence] [environmental] one-line description matching a blocker above
+<!-- blockers:end -->
+```
+
+The first bracket is the blocker's category — use exactly one of: `architectural`, `completion` (also file a `defect` blocker under `completion`), `shipping` (Publish-review shipping blockers — this is the category most Publish reviews will use), or `review-confidence`. The second bracket is who/what can resolve it — pick exactly one:
+- `task-fixable`: another implementation round can address it (a missing feature, a bug, missing tests, a plan deviation).
+- `environmental`: an infrastructure/sandbox/OS issue unrelated to the task's code (e.g. a filesystem permission race in test cleanup) — not something re-implementing the task will fix.
+- `unverifiable`: you could not confirm readiness due to your own limits (truncated context, no verified evidence available) — not a code defect.
+- `spec-defect`: the acceptance criterion itself cannot be satisfied as written in this environment (e.g. "all tests pass" when one pre-existing test can never pass here) — not something any implementation of this task can fix.
+
+Classify conservatively: default to `task-fixable` unless you have concrete evidence the blocker genuinely cannot be resolved by changing the task's code.

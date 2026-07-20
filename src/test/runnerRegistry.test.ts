@@ -9,6 +9,7 @@ import * as vscode from "vscode";
 import {
   checkImplementationAvailabilityForModel,
   checkRunnerAvailabilityForModel,
+  getConfiguredBackupModelsForStage,
   isAuthenticationFailure,
   resolveRunnerForModel,
   runImplementationForModel,
@@ -97,6 +98,84 @@ void describe("isAuthenticationFailure", () => {
       assert.equal(isAuthenticationFailure(message), false);
     });
   }
+});
+
+// Regression coverage: the deliberate second-opinion mechanism (reviewActions.ts)
+// originally reused backupModelsForStage, which only returns anything when
+// strategy === "switch-to-backup" — the quota-triggered automatic switch-over
+// opt-in. A user with backups configured under "pause-and-resume" or
+// "alert-and-wait" (explicitly opting OUT of automatic quota switch-over)
+// still has models genuinely available, but that reuse made the second-opinion
+// mechanism silently inert ("no alternate model was available") for them.
+void describe("getConfiguredBackupModelsForStage", () => {
+  void it("returns configured backups under strategy 'switch-to-backup'", () => {
+    const stub = installModelSettings({
+      "impl-high-review": { primary: "codex-cli:gpt-5", backups: ["claude-cli:sonnet"], strategy: "switch-to-backup" },
+    });
+    try {
+      assert.deepEqual(
+        getConfiguredBackupModelsForStage("impl-high-review", "codex-cli:gpt-5"),
+        ["claude-cli:sonnet"]
+      );
+    } finally {
+      stub.restore();
+    }
+  });
+
+  void it("still returns configured backups under 'pause-and-resume' — the actual bug fixed here", () => {
+    const stub = installModelSettings({
+      "impl-high-review": { primary: "codex-cli:gpt-5", backups: ["claude-cli:sonnet"], strategy: "pause-and-resume" },
+    });
+    try {
+      assert.deepEqual(
+        getConfiguredBackupModelsForStage("impl-high-review", "codex-cli:gpt-5"),
+        ["claude-cli:sonnet"]
+      );
+    } finally {
+      stub.restore();
+    }
+  });
+
+  void it("still returns configured backups under 'alert-and-wait'", () => {
+    const stub = installModelSettings({
+      "impl-high-review": { primary: "codex-cli:gpt-5", backups: ["gemini-cli:default"], strategy: "alert-and-wait" },
+    });
+    try {
+      assert.deepEqual(
+        getConfiguredBackupModelsForStage("impl-high-review", "codex-cli:gpt-5"),
+        ["gemini-cli:default"]
+      );
+    } finally {
+      stub.restore();
+    }
+  });
+
+  void it("excludes the primary model itself even if it also appears in backups", () => {
+    const stub = installModelSettings({
+      "impl-high-review": { primary: "codex-cli:gpt-5", backups: ["codex-cli:gpt-5", "claude-cli:sonnet"], strategy: "alert-and-wait" },
+    });
+    try {
+      assert.deepEqual(
+        getConfiguredBackupModelsForStage("impl-high-review", "codex-cli:gpt-5"),
+        ["claude-cli:sonnet"]
+      );
+    } finally {
+      stub.restore();
+    }
+  });
+
+  void it("returns an empty array when no stage is given", () => {
+    assert.deepEqual(getConfiguredBackupModelsForStage(undefined, "codex-cli:gpt-5"), []);
+  });
+
+  void it("returns an empty array when nothing is configured for the stage", () => {
+    const stub = installModelSettings({});
+    try {
+      assert.deepEqual(getConfiguredBackupModelsForStage("impl-high-review", "codex-cli:gpt-5"), []);
+    } finally {
+      stub.restore();
+    }
+  });
 });
 
 /** Config stub with a recorded provider selection (enabledProviders present

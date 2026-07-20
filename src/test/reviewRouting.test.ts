@@ -1,0 +1,188 @@
+import * as assert from "node:assert/strict";
+import { describe, it } from "node:test";
+import { decideReviewRoute, detectPlateau } from "../utils/reviewRouting";
+import { ReviewBlocker } from "../utils/reviewReadiness";
+import { ReviewScoreHistoryEntry } from "../types/taskProgress";
+
+function entry(score: number | null, overrides: Partial<ReviewScoreHistoryEntry> = {}): ReviewScoreHistoryEntry {
+  return {
+    stage: "impl-high-review",
+    score,
+    attemptId: `attempt-${Math.random()}`,
+    at: new Date().toISOString(),
+    blockerCount: 0,
+    taskFixableCount: 0,
+    ...overrides,
+  };
+}
+
+function blocker(overrides: Partial<ReviewBlocker> = {}): ReviewBlocker {
+  return { category: "completion", resolver: "task-fixable", description: "x", ...overrides };
+}
+
+void describe("detectPlateau", () => {
+  void it("returns false with fewer than window + 1 rounds", () => {
+    const history = [entry(2), entry(5), entry(5)];
+    assert.strictEqual(detectPlateau(history, "impl-high-review", 3), false);
+  });
+
+  void it("returns false while the score keeps setting a new high-water mark", () => {
+    // window=3: baseline round(2), then 3 rounds each improving on the prior best.
+    const history = [entry(2), entry(5), entry(6), entry(7)];
+    assert.strictEqual(detectPlateau(history, "impl-high-review", 3), false);
+  });
+
+  void it("detects a flat plateau (the actual task 1.4 failure mode: 5,5,5,5)", () => {
+    const history = [entry(2), entry(5), entry(5), entry(5), entry(5)];
+    assert.strictEqual(detectPlateau(history, "impl-high-review", 3), true);
+  });
+
+  void it("detects an oscillating plateau (5,6,5,6 — never sets a new high beyond 6)", () => {
+    const history = [entry(2), entry(5), entry(6), entry(5), entry(6), entry(5)];
+    // Baseline best before the last-3 window is max(2,5,6)=6; the last-3
+    // window [6,5,6] never exceeds 6 -> plateaued.
+    assert.strictEqual(detectPlateau(history, "impl-high-review", 3), true);
+  });
+
+  void it("falls back to the default window instead of permanently returning false when window is NaN", () => {
+    // A malformed ensemble.reviewPlateauRounds value can reach here as NaN.
+    // Array.prototype.slice coerces a NaN offset to 0, which would make the
+    // "prior" comparison slice permanently empty (max = -Infinity) and this
+    // function permanently return false — silently disabling the escalation
+    // safety valve with no visible symptom. A clear flat plateau at the
+    // default window (3) must still be detected.
+    const history = [entry(2), entry(5), entry(5), entry(5), entry(5)];
+    assert.strictEqual(detectPlateau(history, "impl-high-review", NaN), true);
+  });
+
+  void it("a legitimate regression alone does not falsely read as a plateau", () => {
+    // 6 -> 5 (the task 1.4 run-054 regression) with nothing before it to
+    // compare against is just "not enough history yet".
+    const history = [entry(6), entry(5)];
+    assert.strictEqual(detectPlateau(history, "impl-high-review", 3), false);
+  });
+
+  void it("ignores rounds with a null score and ignores other stages", () => {
+    const history = [
+      entry(2, { stage: "impl-low-review" }), // different stage — ignored
+      entry(2), // baseline for impl-high-review
+      entry(null), // no parseable score — ignored, not counted toward the window
+      entry(5), // improves over baseline (2) — not yet a plateau
+      entry(5),
+      entry(5),
+      entry(5), // last 3 of [5,5,5,5] never exceed the pre-window best of 5
+    ];
+    assert.strictEqual(detectPlateau(history, "impl-high-review", 3), true);
+  });
+});
+
+void describe("decideReviewRoute", () => {
+  void it("advances when score meets threshold and no task-fixable/spec-defect blockers remain", () => {
+    const decision = decideReviewRoute({
+      score: 9,
+      threshold: 8,
+      blockers: [],
+      plateaued: false,
+      secondOpinionTriedThisPlateau: false,
+    });
+    assert.strictEqual(decision.route, "advance");
+  });
+
+  void it("advances-with-note when threshold is met but only environmental blockers remain", () => {
+    const decision = decideReviewRoute({
+      score: 8,
+      threshold: 8,
+      blockers: [blocker({ resolver: "environmental" })],
+      plateaued: false,
+      secondOpinionTriedThisPlateau: false,
+    });
+    assert.strictEqual(decision.route, "advance-with-note");
+  });
+
+  void it("iterates when below threshold, task-fixable work remains, and no plateau yet", () => {
+    const decision = decideReviewRoute({
+      score: 5,
+      threshold: 8,
+      blockers: [blocker({ resolver: "task-fixable" })],
+      plateaued: false,
+      secondOpinionTriedThisPlateau: false,
+    });
+    assert.strictEqual(decision.route, "iterate");
+  });
+
+  void it("iterates on the very first round even with no blockers parsed (older review, no structured signal)", () => {
+    const decision = decideReviewRoute({
+      score: 5,
+      threshold: 8,
+      blockers: [],
+      plateaued: false,
+      secondOpinionTriedThisPlateau: false,
+    });
+    assert.strictEqual(decision.route, "iterate");
+  });
+
+  void it("requests a second opinion when plateaued with task-fixable blockers still claimed", () => {
+    const decision = decideReviewRoute({
+      score: 5,
+      threshold: 8,
+      blockers: [blocker({ resolver: "task-fixable" })],
+      plateaued: true,
+      secondOpinionTriedThisPlateau: false,
+    });
+    assert.strictEqual(decision.route, "second-opinion");
+  });
+
+  void it("escalates directly when plateaued and every remaining blocker is non-task-fixable (the EPERM case)", () => {
+    const decision = decideReviewRoute({
+      score: 6,
+      threshold: 10,
+      blockers: [blocker({ resolver: "environmental" }), blocker({ resolver: "unverifiable" })],
+      plateaued: true,
+      secondOpinionTriedThisPlateau: false,
+    });
+    assert.strictEqual(decision.route, "escalate");
+  });
+
+  void it("never escalates or requests a second opinion on a zero-blocker plateau — stock-settings regression", () => {
+    // Default threshold is 10 (see getAutoAdvanceScoreThreshold's fallback)
+    // and the default plateau window is 3. A reviewer that consistently
+    // says "9/10, no blockers" across several rounds is not stuck — 9 means
+    // "ready, only trivial suggestions" per the rubric — it is only a
+    // strict numeric threshold that isn't met. Escalating here previously
+    // paused the task and blamed "no alternate model was available" on
+    // completely healthy default settings.
+    const decision = decideReviewRoute({
+      score: 9,
+      threshold: 10,
+      blockers: [],
+      plateaued: true,
+      secondOpinionTriedThisPlateau: false,
+    });
+    assert.strictEqual(decision.route, "iterate");
+  });
+
+  void it("escalates when plateaued and a second opinion has already been tried this plateau", () => {
+    const decision = decideReviewRoute({
+      score: 5,
+      threshold: 8,
+      blockers: [blocker({ resolver: "task-fixable" })],
+      plateaued: true,
+      secondOpinionTriedThisPlateau: true,
+    });
+    assert.strictEqual(decision.route, "escalate");
+  });
+
+  void it("never advances on threshold alone when a task-fixable blocker was explicitly reported", () => {
+    // A reviewer that scored >= threshold but still listed a task-fixable
+    // blocker must not silently advance — that would launder a real,
+    // fixable defect through a lenient score.
+    const decision = decideReviewRoute({
+      score: 9,
+      threshold: 8,
+      blockers: [blocker({ resolver: "task-fixable" })],
+      plateaued: false,
+      secondOpinionTriedThisPlateau: false,
+    });
+    assert.notStrictEqual(decision.route, "advance");
+  });
+});

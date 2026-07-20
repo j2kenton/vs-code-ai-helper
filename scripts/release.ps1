@@ -76,6 +76,18 @@ if ($LASTEXITCODE -ne 0) {
     throw "pnpm run package failed. Fix the errors above before publishing."
 }
 
+# --- Guard: the package must not contain task run logs, notes, or other private
+# files. v0.53.0-v0.56.1 shipped ~82 MB of AI prompts and run logs because a
+# folder rename updated .gitignore but not .vscodeignore, and vsce ignores
+# .gitignore whenever .vscodeignore exists. That failure was silent; this check
+# is not. See scripts/verify-package-contents.js. ---
+Write-Host ""
+Write-Host "Verifying package contents..." -ForegroundColor Cyan
+& node (Join-Path $repoRoot "scripts/verify-package-contents.js")
+if ($LASTEXITCODE -ne 0) {
+    throw "Package contents check failed. Fix .vscodeignore before publishing."
+}
+
 # --- vsce publish <bump> bumps package.json, commits "<version>", tags v<version>, and publishes ---
 Write-Host ""
 Write-Host "Publishing ($bump)..." -ForegroundColor Cyan

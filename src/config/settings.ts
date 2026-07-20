@@ -13,6 +13,9 @@ const AI_MODEL_DEFAULTS_KEY = "aiModelDefaults";
 const META_FILES_HIDDEN_KEY = "metaFilesHidden";
 const ENABLED_PROVIDERS_KEY = "enabledProviders";
 const PUBLISH_VERIFICATION_COMMANDS_KEY = "publishVerificationCommands";
+const KNOWN_FLAKY_CHECKS_KEY = "knownFlakyChecks";
+const REVIEW_PLATEAU_ROUNDS_KEY = "reviewPlateauRounds";
+const COMPLETION_CHECK_TIMEOUT_MS_KEY = "completionCheckTimeoutMs";
 const FAST_FORWARD_MAX_ITERATIONS_KEY = "fastForwardMaxIterations";
 const AUTO_ADVANCE_ENABLED_KEY = "autoAdvanceEnabled";
 const AUTO_ADVANCE_SCORE_KEY = "autoAdvanceScoreThreshold";
@@ -32,6 +35,8 @@ const ALL_SETTING_KEYS = [
   "maxImplementationIterations",
   "allowDirtyWorktreeChanges", "desktopNotifications",
   PUBLISH_VERIFICATION_COMMANDS_KEY,
+  KNOWN_FLAKY_CHECKS_KEY, REVIEW_PLATEAU_ROUNDS_KEY,
+  COMPLETION_CHECK_TIMEOUT_MS_KEY,
 ] as const;
 
 /**
@@ -279,6 +284,80 @@ export function getPublishVerificationCommands(): string[] {
     .filter((value): value is string => typeof value === "string")
     .map((value) => value.trim())
     .filter((value) => value.length > 0);
+}
+
+/** One quarantined known-flaky-check entry — see getKnownFlakyChecks(). */
+export interface KnownFlakyCheck {
+  /** Substring matched against a failed check's command line. */
+  match: string;
+  /** Substring matched against that failed check's combined stdout/stderr. */
+  failureSignature: string;
+  /** Shown next to the quarantined failure so it stays explainable, not silent. */
+  reason: string;
+}
+
+/**
+ * Known-flaky-check allowlist: completion checks whose failure is a known,
+ * pre-existing environmental issue (e.g. a Windows temp-dir cleanup race)
+ * rather than a real regression. A failure only ever moves from `failed` to
+ * `knownFlake` when BOTH `match` and `failureSignature` are found — this is
+ * deliberately narrow so the allowlist can't accidentally swallow a real
+ * failure that happens to share a command name. Never changes the raw
+ * `passed` verdict (see collectCompletionLint) — only the modulo-known-flakes
+ * one reviewers are told to treat as the readiness-relevant signal.
+ */
+export function getKnownFlakyChecks(): KnownFlakyCheck[] {
+  const raw = readSetting<unknown>(KNOWN_FLAKY_CHECKS_KEY, []);
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  const entries: KnownFlakyCheck[] = [];
+  for (const value of raw) {
+    if (!value || typeof value !== "object") continue;
+    const entry = value as Record<string, unknown>;
+    const match = typeof entry.match === "string" ? entry.match.trim() : "";
+    const failureSignature = typeof entry.failureSignature === "string" ? entry.failureSignature.trim() : "";
+    const reason = typeof entry.reason === "string" ? entry.reason.trim() : "";
+    if (match && failureSignature && reason) {
+      entries.push({ match, failureSignature, reason });
+    }
+  }
+  return entries;
+}
+
+/**
+ * Number of consecutive rounds with no new high-water-mark review score
+ * before a stage is considered plateaued (see reviewRouting.ts's
+ * detectPlateau). Lower values escalate to a human sooner; higher values
+ * give automated iteration more room before giving up.
+ */
+export function getReviewPlateauRounds(): number {
+  const value = readSetting(REVIEW_PLATEAU_ROUNDS_KEY, 3);
+  // A malformed configured value (non-numeric, NaN, Infinity — the schema
+  // is "integer" but workspace settings.json can still hold anything) must
+  // not propagate NaN into detectPlateau's window: Array.prototype.slice
+  // coerces a NaN offset to 0, which makes the "prior" comparison slice
+  // permanently empty and its max permanently -Infinity — plateau detection
+  // then silently returns false forever instead of ever firing, disabling
+  // the escalation safety valve with no visible symptom.
+  const numeric = Number.isFinite(value) ? Math.floor(value) : 3;
+  return Math.max(2, Math.min(20, numeric));
+}
+
+/**
+ * Wall-clock cap (milliseconds) on a single completion check (lint/type-
+ * check/test command, or an explicit verification command). Applies both at
+ * Publish and — since review-impl-high/impl-low/publish reviews now run
+ * these checks on every round to produce the {{verifiedChecks}} evidence
+ * block — to every review round. Without a cap, a hung command blocks that
+ * round indefinitely with no way to recover short of cancelling the whole
+ * operation from the UI. Default: 10 minutes, generous enough not to
+ * interrupt a legitimately slow real test suite.
+ */
+export function getCompletionCheckTimeoutMs(): number {
+  const value = readSetting(COMPLETION_CHECK_TIMEOUT_MS_KEY, 600_000);
+  const numeric = Number.isFinite(value) ? Math.floor(value) : 600_000;
+  return Math.max(10_000, numeric);
 }
 
 /**

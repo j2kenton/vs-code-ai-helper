@@ -36,6 +36,7 @@ import {
   initNotificationRouter,
   deactivateNotificationRouter,
 } from "../utils/notificationRouter";
+import { safeRemoveDir } from "./testFsUtils";
 import { DISCLAIMER_VERSION } from "../legal/disclaimerVersion";
 import type { ChatViewProvider } from "../views/chatView";
 import type { AgentRunRequest, AgentRunResult } from "../types/agentRunner";
@@ -292,7 +293,7 @@ void describe("draftTaskWithAI command (G18: Description-model routing regressio
       fsBridge.restore();
       wsStub.restore();
       deactivateNotificationRouter();
-      fs.rmSync(REAL_ROOT, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+      safeRemoveDir(REAL_ROOT);
     }
   });
 });

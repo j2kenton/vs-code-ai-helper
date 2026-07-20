@@ -26,6 +26,8 @@ Then structure your review as:
 
 {{contextPack}}
 
+{{verifiedChecks}}
+
 ## Previous Publish Review
 
 {{previousReview}}

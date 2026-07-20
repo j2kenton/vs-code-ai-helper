@@ -20,6 +20,7 @@ import {
   deactivateNotificationRouter,
   initNotificationRouter,
 } from "../utils/notificationRouter";
+import { safeRemoveDir } from "./testFsUtils";
 
 function installConfigStub(configuredTaskRoot: string): { restore: () => void } {
   const original = (vscode.workspace as unknown as Record<string, unknown>).getConfiguration;
@@ -151,9 +152,9 @@ function installHarness(extraWorkspaceRoots: readonly string[] = []): Harness {
       wsStub.restore();
       fsBridge.restore();
       deactivateNotificationRouter();
-      fs.rmSync(workspaceRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+      safeRemoveDir(workspaceRoot);
       for (const extra of extraWorkspaceRoots) {
-        fs.rmSync(extra, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+        safeRemoveDir(extra);
       }
     },
   };

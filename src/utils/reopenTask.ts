@@ -6,6 +6,7 @@ import {
   TaskStage,
 } from "../types/taskProgress";
 import {
+  clearEscalation,
   clearImplReviewFiles,
   clearLintPayload,
   clearStageFallbackReservation,
@@ -45,6 +46,13 @@ export { StaleReopenError };
  *   - fallbackActive, fallbackModelId: cleared for `chosenStage` and every
  *     later stage — no backup-model reservation may survive for a stage
  *     that's about to be (re-)run.
+ *   - escalation: always cleared — reopening (whether via Resume or
+ *     setTaskStage) is itself the human's answer to any stuck-review
+ *     escalation on record, and a task can reach "completed" with one still
+ *     attached (e.g. escalated at Publish, then the user chose Publish
+ *     Anyway rather than resuming through the paused state first). Without
+ *     this, a reopened task would show a stale "escalated" marker in the
+ *     tree for a review round that's no longer running.
  */
 export function createReopenMutation(
   chosenStage: TaskStage,
@@ -74,6 +82,7 @@ export function createReopenMutation(
     };
 
     next = clearLintPayload(next);
+    next = clearEscalation(next);
 
     if (chosenIndex <= implIndex) {
       next = clearImplReviewFiles(next);

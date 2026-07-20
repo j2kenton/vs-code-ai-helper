@@ -21,6 +21,7 @@ import {
   deactivateNotificationRouter,
   initNotificationRouter,
 } from "../utils/notificationRouter";
+import { safeRemoveDir } from "./testFsUtils";
 
 // completionLint.ts is required (not `import`ed) so its exported function
 // reference can be monkey-patched for the duration of a test: TypeScript
@@ -159,7 +160,7 @@ void describe("commitAndPushTask duplicate-invocation guard", () => {
       vscode.window.showErrorMessage = originalShowErrorMessage;
       (vscode.workspace as unknown as Record<string, unknown>).workspaceFolders = originalWorkspaceFolders;
       deactivateNotificationRouter();
-      fs.rmSync(repoRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+      safeRemoveDir(repoRoot);
     }
   });
 
@@ -218,7 +219,7 @@ void describe("commitAndPushTask duplicate-invocation guard", () => {
       vscode.window.showWarningMessage = originalShowWarningMessage;
       (vscode.workspace as unknown as Record<string, unknown>).workspaceFolders = originalWorkspaceFolders;
       deactivateNotificationRouter();
-      fs.rmSync(repoRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+      safeRemoveDir(repoRoot);
     }
   });
 });

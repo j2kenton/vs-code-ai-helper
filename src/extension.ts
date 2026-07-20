@@ -47,6 +47,7 @@ import { TASK_PROGRESS_FILENAME } from "./types/taskProgress";
 import { warmCliModelCache } from "./utils/modelSelection";
 import { StatusTreeProvider, STATUS_VIEW_ID } from "./views/statusView";
 import { initNotificationRouter, deactivateNotificationRouter, NotificationRouter } from "./utils/notificationRouter";
+import { initReviewEscalationChat } from "./utils/reviewEscalation";
 import { installOperationNotificationBridge } from "./utils/operationNotificationBridge";
 import { ENSEMBLE_NOTIFICATION_SCHEME, NotificationContentProvider } from "./utils/notificationContentProvider";
 import { ViewProgressBinder } from "./utils/viewProgressBinder";
@@ -261,6 +262,10 @@ export function activate(context: vscode.ExtensionContext): void {
   const statusTreeProvider = new StatusTreeProvider(context.workspaceState);
   context.subscriptions.push(statusTreeProvider);
   initNotificationRouter(statusTreeProvider);
+  // Lets stuck review iteration (reviewEscalation.ts) post its "what should
+  // I do?" question straight into Chat With AI, mirroring how
+  // draftTaskWithAI surfaces blocking open questions there.
+  initReviewEscalationChat(chatViewProvider);
   // Central operation → terminal-entry bridge (contract C1): every root
   // operation's end is recorded as a persistent Notifications entry from the
   // registry's own lifecycle event, so the in-progress row never just

@@ -5,7 +5,7 @@ import { patchTaskProgress, readTaskProgress, updateLintPayload } from "./taskPr
 import * as fs from "fs";
 import * as path from "path";
 import { STAGE_ARTIFACT_FILENAMES, TaskProgress } from "../types/taskProgress";
-import { getPublishVerificationCommands } from "../config/settings";
+import { getCompletionCheckTimeoutMs, getKnownFlakyChecks, getPublishVerificationCommands, KnownFlakyCheck } from "../config/settings";
 import { promptAndPersistPublishScope } from "../commands/choosePublishScope";
 import { resolveModelForStage } from "./modelSelection";
 import { resolveRunnerForModel } from "../runners/runnerRegistry";
@@ -47,6 +47,23 @@ export interface CompletionLintResult {
   summary: string;
   issueCount: number;
   failedChecks: Array<{ command: string; exitCode: number; output: string }>;
+  /** Entries of `failedChecks` that also matched a configured known-flaky-
+   * check allowlist entry (see settings.ts's `getKnownFlakyChecks`). `passed`
+   * above is never adjusted for these — this is a separate, additive signal
+   * consumed by `passedModuloKnownFlakes` and the verified-checks section
+   * shown to reviewers, so a quarantined failure stays visible and
+   * explainable rather than silently vanishing from the raw result. Optional
+   * (like `planItems`/`verifiedFolder` below) so callers that construct a
+   * result without running the real check — error fallbacks, test fixtures —
+   * aren't forced to populate it; treat absent as empty. */
+  knownFlakeFailures?: Array<{ command: string; exitCode: number; reason: string }>;
+  /** `passed`, but treating quarantined known-flake failures as non-blocking.
+   * This — not `passed` — is the readiness-relevant verdict shown to
+   * reviewers: a pre-existing environmental flake must not permanently cap
+   * a task's score the way it did before known-flake quarantine existed.
+   * Optional for the same reason as `knownFlakeFailures`; treat absent as
+   * equal to `passed`. */
+  passedModuloKnownFlakes?: boolean;
   /** `scripts` entries (from the conventional `lint`/`test` names) not found
    * in the workspace `package.json`, and therefore skipped rather than run.
    * Reported as `inconclusive` — an undetected toolchain is never a pass. */
@@ -534,7 +551,119 @@ function getOpenWorkspaceFiles(folder: string): string[] {
   return files;
 }
 
-function runCheck(cwd: string, args: string[]): Promise<{ code: number; output: string }> {
+/** Options threaded through to the actual spawn, shared by runCheck and
+ * runExplicitCheck. Both `token` and `timeoutMs` are optional: omitting
+ * both preserves the previous "run to completion, no way to stop it"
+ * behavior for any caller that doesn't pass them. */
+interface RunGuardOptions {
+  token?: vscode.CancellationToken;
+  timeoutMs?: number;
+}
+
+/**
+ * Kill a spawned check process. `child.kill()` alone only signals the
+ * immediate process — with shell:true (runCheck's Windows .cmd/.bat path,
+ * and runExplicitCheck always) that immediate process is a cmd.exe/shell
+ * wrapper, and its actual npm/node descendants are untouched by that
+ * signal: a "killed" hung check keeps running to completion in the
+ * background while the caller believes it was stopped (confirmed directly —
+ * an earlier version of this function that only called child.kill() left a
+ * 500ms-timeout test waiting the full 60s for an unrelated sleep to finish,
+ * with the orphaned node.exe still visible in Task Manager afterward). On
+ * Windows, `taskkill /T` kills the whole process tree; POSIX shells
+ * generally do forward signals to their children, so plain kill() is kept
+ * there.
+ *
+ * This is a BEST-EFFORT mitigation, not an airtight guarantee. Direct
+ * diagnostic runs against this exact code path showed Windows itself
+ * intermittently refuse to terminate the deepest descendant in a nested
+ * cmd.exe -> npm.cmd -> node.exe chain ("The operation attempted is not
+ * supported"), and separately that a kill issued very soon after spawn can
+ * simply miss a descendant that hasn't finished spawning yet — the same
+ * well-known difficulty that dedicated process-tree-kill packages exist to
+ * paper over. Retrying at increasing delays substantially narrows the
+ * window (most attempts succeed on the first or second try) without
+ * pretending to close it completely.
+ */
+function killProcessTree(child: ReturnType<typeof spawn>): void {
+  if (process.platform === "win32" && child.pid) {
+    const pid = child.pid;
+    const attemptKill = (): void => {
+      try {
+        execFileSync("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
+      } catch {
+        // Already exited, or taskkill itself failed — a later retry (or,
+        // worst case, the caller's own timeoutMs bound) is the fallback.
+      }
+    };
+    attemptKill();
+    setTimeout(attemptKill, 300);
+    setTimeout(attemptKill, 1500);
+    setTimeout(attemptKill, 5000);
+    return;
+  }
+  child.kill();
+}
+
+/**
+ * Wire cancellation and a wall-clock timeout onto an already-spawned check
+ * process, resolving exactly once regardless of which of "exited normally",
+ * "cancelled", or "timed out" happens first. Shared by runCheck and
+ * runExplicitCheck so a hung lint/test/type-check command — or an explicit
+ * verification command — can always be stopped from the UI (cancelling the
+ * review/Fast Forward operation) or by the configured
+ * ensemble.completionCheckTimeoutMs cap, instead of blocking the calling
+ * review round indefinitely with no recourse.
+ */
+function attachRunGuards(
+  child: ReturnType<typeof spawn>,
+  guard: RunGuardOptions | undefined,
+  resolve: (result: { code: number; output: string }) => void
+): void {
+  let output = "";
+  let settled = false;
+  child.stdout?.on("data", (data: Buffer | string) => { output += typeof data === "string" ? data : data.toString("utf8"); });
+  child.stderr?.on("data", (data: Buffer | string) => { output += typeof data === "string" ? data : data.toString("utf8"); });
+
+  // A token cancelled BEFORE this process even started must still kill it —
+  // onCancellationRequested is an event subscription, not a state check, so
+  // subscribing after the fact is not guaranteed to retroactively fire (the
+  // same gotcha taskOperations.ts's linkCancellationTokens already guards
+  // against for exactly this reason). Check the current state directly
+  // first, and only fall back to the subscription for a cancellation that
+  // happens later.
+  if (guard?.token?.isCancellationRequested) {
+    output += "\n[check cancelled]";
+    killProcessTree(child);
+  }
+  const tokenSub = guard?.token?.onCancellationRequested(() => {
+    if (settled) { return; }
+    output += "\n[check cancelled]";
+    killProcessTree(child);
+  });
+  const timer = guard?.timeoutMs !== undefined ? setTimeout(() => {
+    if (settled) { return; }
+    output += `\n[check timed out after ${guard.timeoutMs}ms and was terminated]`;
+    killProcessTree(child);
+  }, guard.timeoutMs) : undefined;
+
+  const finish = (result: { code: number; output: string }): void => {
+    if (settled) { return; }
+    settled = true;
+    tokenSub?.dispose();
+    if (timer) { clearTimeout(timer); }
+    resolve(result);
+  };
+
+  child.on("error", (error) => finish({ code: 1, output: output + error.message }));
+  child.on("close", (code) => finish({ code: code ?? 1, output }));
+}
+
+function runCheck(
+  cwd: string,
+  args: string[],
+  guard?: RunGuardOptions
+): Promise<{ code: number; output: string }> {
   return new Promise((resolve) => {
     const executable = args[0] ?? "npm";
     const resolved = resolveManagerExecutable(cwd, executable);
@@ -557,11 +686,7 @@ function runCheck(cwd: string, args: string[]): Promise<{ code: number; output: 
       useShell ? args.slice(1).map(quote) : args.slice(1),
       { cwd, shell: useShell }
     );
-    let output = "";
-    child.stdout?.on("data", (data: Buffer | string) => { output += typeof data === "string" ? data : data.toString("utf8"); });
-    child.stderr?.on("data", (data: Buffer | string) => { output += typeof data === "string" ? data : data.toString("utf8"); });
-    child.on("error", (error) => resolve({ code: 1, output: error.message }));
-    child.on("close", (code) => resolve({ code: code ?? 1, output }));
+    attachRunGuards(child, guard, resolve);
   });
 }
 
@@ -573,14 +698,14 @@ function packageManager(folder: string): string {
 }
 
 /** Run one user-authored verification command line through the shell. */
-function runExplicitCheck(cwd: string, command: string): Promise<{ code: number; output: string }> {
+function runExplicitCheck(
+  cwd: string,
+  command: string,
+  guard?: RunGuardOptions
+): Promise<{ code: number; output: string }> {
   return new Promise((resolve) => {
     const child = spawn(command, { cwd, shell: true });
-    let output = "";
-    child.stdout?.on("data", (data: Buffer | string) => { output += typeof data === "string" ? data : data.toString("utf8"); });
-    child.stderr?.on("data", (data: Buffer | string) => { output += typeof data === "string" ? data : data.toString("utf8"); });
-    child.on("error", (error) => resolve({ code: 1, output: error.message }));
-    child.on("close", (code) => resolve({ code: code ?? 1, output }));
+    attachRunGuards(child, guard, resolve);
   });
 }
 
@@ -592,6 +717,21 @@ export interface CollectCompletionLintOptions {
    * missing-script (inconclusive) reporting does not apply.
    */
   explicitCommands?: readonly string[];
+  /**
+   * Cancellation token linked to the enclosing operation (a review round,
+   * Fast Forward, a Publish attempt). When cancelled, every still-running
+   * check process is killed rather than left running orphaned.
+   */
+  token?: vscode.CancellationToken;
+  /**
+   * Wall-clock cap in milliseconds applied to EACH check independently (not
+   * to the whole batch). Defaults to getCompletionCheckTimeoutMs() when
+   * omitted — pass an explicit value only to override that default, e.g.
+   * in tests. A hung command is killed and reported as a failure with a
+   * "[check timed out ...]" marker in its output rather than blocking the
+   * caller indefinitely.
+   */
+  timeoutMs?: number;
 }
 
 /** Collect diagnostics after fresh lint/type/test checks have completed. */
@@ -605,13 +745,17 @@ export async function collectCompletionLint(
   const explicitCommands = (options?.explicitCommands ?? [])
     .map((command) => command.trim())
     .filter((command) => command.length > 0);
+  const guard: { token?: vscode.CancellationToken; timeoutMs?: number } = {
+    token: options?.token,
+    timeoutMs: options?.timeoutMs ?? getCompletionCheckTimeoutMs(),
+  };
 
   let checks: Array<{ command: string; code: number; output: string }>;
   if (explicitCommands.length > 0) {
     // Toolchain resolution order (publish pre-check contract): explicitly
     // configured verification commands win over conventional npm scripts.
     checks = await Promise.all(
-      explicitCommands.map(async (command) => ({ command, ...(await runExplicitCheck(folder, command)) }))
+      explicitCommands.map(async (command) => ({ command, ...(await runExplicitCheck(folder, command, guard)) }))
     );
   } else {
     const scripts = readPackageScripts(folder);
@@ -635,7 +779,7 @@ export async function collectCompletionLint(
     });
 
     checks = await Promise.all(
-      runnableChecks.map(async ([command, args]) => ({ command, ...(await runCheck(folder, [...args])) }))
+      runnableChecks.map(async ([command, args]) => ({ command, ...(await runCheck(folder, [...args], guard)) }))
     );
   }
 
@@ -667,17 +811,48 @@ export async function collectCompletionLint(
     ? `${baseSummary} (${missingScripts.join("/")} script(s) not configured — add them to package.json's ` +
       `"scripts" to enable publish checks for them. Checks are inconclusive, not passed.)`
     : baseSummary;
+  const knownFlakes = getKnownFlakyChecks();
+  const knownFlakeFailures = classifyKnownFlakeFailures(commandFailures, knownFlakes);
+  const unquarantinedFailureCount = commandFailures.length - knownFlakeFailures.length;
   return {
     runAt: new Date().toISOString(),
     // An undetected toolchain is never a pass: with a required check
     // inconclusive (missing lint/test script), the run cannot report passed
     // even when everything that could run came back clean.
     passed: issueCount === 0 && missingScripts.length === 0,
+    passedModuloKnownFlakes:
+      issues.length === 0 && unquarantinedFailureCount === 0 && missingScripts.length === 0,
     issueCount,
     summary,
     failedChecks: commandFailures.map(({ command, code, output }) => ({ command, exitCode: code, output })),
+    knownFlakeFailures,
     missingScripts,
   };
+}
+
+/**
+ * Match failed checks against the known-flaky-check allowlist. A failure is
+ * quarantined only when BOTH `match` (against the command line) and
+ * `failureSignature` (against the combined output) are found — deliberately
+ * narrow so the allowlist can't accidentally swallow an unrelated real
+ * failure that happens to share a command name.
+ *
+ * @internal exported for testing
+ */
+export function classifyKnownFlakeFailures(
+  failures: readonly { command: string; code: number; output: string }[],
+  knownFlakes: readonly KnownFlakyCheck[]
+): Array<{ command: string; exitCode: number; reason: string }> {
+  const quarantined: Array<{ command: string; exitCode: number; reason: string }> = [];
+  for (const failure of failures) {
+    const flake = knownFlakes.find(
+      (entry) => failure.command.includes(entry.match) && failure.output.includes(entry.failureSignature)
+    );
+    if (flake) {
+      quarantined.push({ command: failure.command, exitCode: failure.code, reason: flake.reason });
+    }
+  }
+  return quarantined;
 }
 
 const PUBLISH_CHECKS_SECTION_START = "<!-- completion-checks:start -->";
@@ -714,10 +889,17 @@ function renderCompletionChecksSection(
   if (result.failedChecks.length > 0) {
     lines.push("", "### Failed checks");
     for (const check of result.failedChecks) {
+      const flake = (result.knownFlakeFailures ?? []).find((f) => f.command === check.command && f.exitCode === check.exitCode);
       const output = check.output.length > PUBLISH_CHECKS_MAX_OUTPUT_CHARS
         ? `${check.output.slice(0, PUBLISH_CHECKS_MAX_OUTPUT_CHARS)}\n… (truncated)`
         : check.output;
-      lines.push("", `**${check.command}** (exit ${check.exitCode})`, "```", output, "```");
+      lines.push(
+        "",
+        `**${check.command}** (exit ${check.exitCode})${flake ? ` — _known flake: ${flake.reason}_` : ""}`,
+        "```",
+        output,
+        "```"
+      );
     }
   }
   if (result.planItems && result.planItems.length > 0) {
@@ -741,6 +923,90 @@ function renderCompletionChecksSection(
     lines.push("", `_Published anyway despite failing checks — ${override.reason}._`);
   }
   lines.push(PUBLISH_CHECKS_SECTION_END);
+  return lines.join("\n");
+}
+
+/** Cap per-failed-check output embedded in an AI prompt — generous enough to
+ * diagnose a failure, far short of flooding the reviewer's context with a
+ * full CI log. */
+const VERIFIED_CHECKS_PROMPT_MAX_OUTPUT_CHARS = 1500;
+
+/**
+ * Render the `{{verifiedChecks}}` block injected into impl-high, impl-low,
+ * and publish review prompts (see reviewActions.ts). This is the fix for
+ * the actual failure mode that motivated it: a reviewer with no way to
+ * confirm "all tests pass" either had to trust the implementer's prose or
+ * try to run the suite itself — and when its own sandbox couldn't run
+ * anything (e.g. a read-only review environment), it had no way to ever
+ * mark that criterion satisfied, capping the score indefinitely regardless
+ * of the actual state of the code.
+ *
+ * These results are produced by the extension host via `collectCompletionLint`
+ * (a real `child_process.spawn` of the project's own lint/type-check/test
+ * commands), not generated or claimed by any AI — the block says so
+ * explicitly so the reviewer treats it as ground truth rather than another
+ * claim to be skeptical of.
+ */
+export function buildVerifiedChecksSection(result: CompletionLintResult): string {
+  const lines: string[] = [
+    "## Verified Checks (ground truth)",
+    "",
+    "These results were produced by the extension host actually running the project's " +
+      "lint/type-check/test commands — they are not generated, claimed, or verifiable-only-by-you. " +
+      "Treat them as ground truth. Do not lower the score, and do not raise a review-confidence " +
+      "blocker, merely because you cannot independently reproduce a test run yourself.",
+    "",
+  ];
+  const knownFlakeFailures = result.knownFlakeFailures ?? [];
+  // Deliberately derived only from what this function actually lists below
+  // (failedChecks / knownFlakeFailures / missingScripts) — NOT from
+  // result.passed/result.issueCount, which also fold in live editor
+  // diagnostics (vscode.languages.getDiagnostics()) that can come from any
+  // open tab, unrelated to this review and to any command this block claims
+  // to have run. Using those here previously let an unrelated open file
+  // produce "Overall: One or more checks failed." immediately followed by
+  // "No command failures." with nothing named — an unfalsifiable failure
+  // signal, exactly what this block exists to eliminate.
+  const unquarantinedFailures = result.failedChecks.filter(
+    (check) => !knownFlakeFailures.some((f) => f.command === check.command && f.exitCode === check.exitCode)
+  );
+  const overall = unquarantinedFailures.length > 0
+    ? "One or more checks failed."
+    : result.missingScripts.length > 0
+      ? "Required checks could not run (inconclusive)."
+      : knownFlakeFailures.length > 0
+        ? "All checks passed except quarantined known flakes (see below) — treat as passing for readiness purposes."
+        : "All checks passed.";
+  lines.push(`- Overall: ${overall}`);
+  lines.push(`- Last run: ${result.runAt}`);
+  if (result.verifiedFolder) {
+    lines.push(`- Verified against: ${result.verifiedFolder}`);
+  }
+  if (result.missingScripts.length > 0) {
+    lines.push(`- Not configured (inconclusive, not passed): ${result.missingScripts.join(", ")}`);
+  }
+  if (result.failedChecks.length === 0) {
+    lines.push("", "No command failures.");
+    return lines.join("\n");
+  }
+  lines.push("", "### Command results");
+  for (const check of result.failedChecks) {
+    const flake = knownFlakeFailures.find(
+      (f) => f.command === check.command && f.exitCode === check.exitCode
+    );
+    if (flake) {
+      lines.push(
+        "",
+        `- **${check.command}** — exit ${check.exitCode}, **quarantined known flake**: ${flake.reason}. ` +
+          "This failure is excluded from the overall verdict above — do not treat it as an outstanding blocker."
+      );
+      continue;
+    }
+    const output = check.output.length > VERIFIED_CHECKS_PROMPT_MAX_OUTPUT_CHARS
+      ? `${check.output.slice(0, VERIFIED_CHECKS_PROMPT_MAX_OUTPUT_CHARS)}\n… (truncated)`
+      : check.output;
+    lines.push("", `- **${check.command}** — exit ${check.exitCode} (FAILED)`, "```", output, "```");
+  }
   return lines.join("\n");
 }
 
@@ -814,9 +1080,32 @@ export async function upsertCompletionChecksInPublishReview(
 export async function collectCompletionLintPreview(
   folderUri: vscode.Uri,
   relevantFiles?: readonly string[],
-  options?: { allowScopePrompt?: boolean }
+  options?: {
+    allowScopePrompt?: boolean;
+    /**
+     * Skip the AI-assisted plan-item verification pass (a real model call,
+     * separate from and in addition to the deterministic lint/type/test
+     * commands). Defaults to true (run it) to preserve existing behavior
+     * for callers that show `planItems` to the user (checkPublishPreflight,
+     * runCompletionLint). Pass false for callers that only use the
+     * deterministic command results and never render `planItems` — e.g.
+     * the `{{verifiedChecks}}` block injected into impl-high/impl-low/
+     * publish review prompts, which would otherwise fire a full extra AI
+     * call (using the Publish-stage model, regardless of which stage is
+     * actually being reviewed) on every single review round for output
+     * that section never displays.
+     */
+    includeAiPlanVerification?: boolean;
+    /** See CollectCompletionLintOptions.token — forwarded to the underlying
+     * collectCompletionLint call so cancelling the enclosing operation kills
+     * any still-running check process. */
+    token?: vscode.CancellationToken;
+    /** See CollectCompletionLintOptions.timeoutMs. */
+    timeoutMs?: number;
+  }
 ): Promise<CompletionLintResult> {
   const allowScopePrompt = options?.allowScopePrompt ?? true;
+  const includeAiPlanVerification = options?.includeAiPlanVerification ?? true;
   // Verify against the task's Publish scope (persisted per task; defaults to
   // the workspace folder containing the task), never just the task folder.
   const progress = await readTaskProgress(folderUri);
@@ -857,11 +1146,16 @@ export async function collectCompletionLintPreview(
   }
   const result = await collectCompletionLint(scopeFolder, relevantFiles, {
     explicitCommands: getPublishVerificationCommands(),
+    token: options?.token,
+    timeoutMs: options?.timeoutMs,
   });
   result.verifiedFolder = scopeFolder;
-  // Plan-item completion is AI-verified against the same scope the lint/test
-  // checks ran in — a checked box in plan-final.md alone never passes.
-  result.planItems = await collectAiVerifiedPlanItems(folderUri, scopeFolder);
+  if (includeAiPlanVerification) {
+    // Plan-item completion is AI-verified against the same scope the
+    // lint/test checks ran in — a checked box in plan-final.md alone
+    // never passes.
+    result.planItems = await collectAiVerifiedPlanItems(folderUri, scopeFolder);
+  }
   return result;
 }
 

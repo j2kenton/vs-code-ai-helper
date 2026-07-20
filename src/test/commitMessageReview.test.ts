@@ -26,6 +26,7 @@ import {
   deactivateNotificationRouter,
   initNotificationRouter,
 } from "../utils/notificationRouter";
+import { safeRemoveDir } from "./testFsUtils";
 
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const completionLintModule = require("../utils/completionLint") as {
@@ -184,7 +185,7 @@ function installHarness(
       workspaceFs.rename = originals.fsRename;
       (vscode.workspace as unknown as Record<string, unknown>).workspaceFolders = originals.workspaceFolders;
       deactivateNotificationRouter();
-      fs.rmSync(repoRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+      safeRemoveDir(repoRoot);
     },
   };
 }

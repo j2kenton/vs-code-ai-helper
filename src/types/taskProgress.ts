@@ -176,6 +176,68 @@ export interface TaskProgress {
   fallbackModelId?: Partial<Record<TaskStage, string>>;
   /** Monotonic token identifying the review run allowed to finalize this stage. */
   reviewAttemptId?: string;
+  /**
+   * Per-round review score trail, appended once per completed review round
+   * (initial reviews, re-reviews, and Fast Forward's internal re-reviews all
+   * go through the same publish point). This is the durable, cross-invocation
+   * record a single Fast Forward run's in-memory loop cannot provide on its
+   * own — it is what lets the extension notice a task has been stuck across
+   * many separate review invocations (e.g. hours apart), not just within one
+   * session. Capped at MAX_REVIEW_SCORE_HISTORY entries (oldest dropped).
+   */
+  reviewScoreHistory?: ReviewScoreHistoryEntry[];
+  /**
+   * Set when automated review iteration determined it cannot make further
+   * progress on its own and needs a human decision. Cleared on the next
+   * stage transition and whenever the user explicitly resumes iteration.
+   */
+  escalation?: TaskEscalation;
+}
+
+/** One row of `TaskProgress.reviewScoreHistory`. */
+export interface ReviewScoreHistoryEntry {
+  stage: TaskStage;
+  /** Parsed `Readiness: N/10`, or null if the round produced no parseable score. */
+  score: number | null;
+  /** The reviewAttemptId that produced this round, for correlation with run logs. */
+  attemptId: string;
+  /** ISO timestamp when this round's review was published. */
+  at: string;
+  /** Total classified blockers found by the reviewer this round. */
+  blockerCount: number;
+  /** Of those, how many were classified as fixable by another implementation round. */
+  taskFixableCount: number;
+}
+
+/** Cap on `TaskProgress.reviewScoreHistory` length (oldest entries dropped first). */
+export const MAX_REVIEW_SCORE_HISTORY = 200;
+
+/** Reasons automated review iteration stopped and asked for a human decision. */
+export type EscalationKind =
+  | "plateau"
+  | "spec-defect"
+  | "environmental"
+  | "unverifiable"
+  | "reviewer-disagreement";
+
+export interface TaskEscalation {
+  stage: TaskStage;
+  kind: EscalationKind;
+  /** Human-readable explanation shown in chat/notifications. */
+  reason: string;
+  at: string;
+  /**
+   * True when this escalation followed a deliberate second-opinion attempt
+   * (obtained-and-agreed, obtained-and-disagreed, or no alternate model was
+   * available to try) — as opposed to a direct escalation with no attempt
+   * at all. Explicit rather than inferred from `kind`, because a
+   * second-opinion attempt can produce any of "environmental"/"spec-defect"
+   * (agreement), "reviewer-disagreement", or "plateau" (no candidate
+   * available) — `kind` alone can't distinguish "already tried" from "never
+   * tried" the way a single boolean can. Used to cap second-opinion rounds
+   * at one per plateau (see secondOpinionTriedThisPlateau in reviewActions.ts).
+   */
+  secondOpinionAttempted?: boolean;
 }
 
 /**

@@ -57,6 +57,79 @@ export function meetsAutoAdvanceThreshold(
   return score !== null && score >= threshold;
 }
 
+/** A blocker's review category, as used by the existing free-text sections
+ * every review prompt already asks for: "Architectural blockers" and
+ * "Completion blockers" (plan/impl-high reviews), "Defect blockers" and
+ * "Completion blockers" (impl-low reviews, "defect" filed under
+ * "completion" — see the rubric), "Shipping blockers" (publish reviews —
+ * the ONLY substantive blocker category those prompts ask for, so omitting
+ * it here previously meant every Publish review parsed to zero structured
+ * blockers), and "Review-confidence blockers" (all review levels). */
+export type BlockerCategory = "architectural" | "completion" | "review-confidence" | "shipping";
+
+/**
+ * Who/what can resolve a blocker — the routing key `decideReviewRoute`
+ * (reviewRouting.ts) uses to tell "an implementer agent can fix this" apart
+ * from "no amount of re-implementation will fix this":
+ *  - task-fixable: another implementation round can address it.
+ *  - environmental: an infra/sandbox/OS issue unrelated to the task's code
+ *    (e.g. a temp-dir permission race), not something an implementer fixes.
+ *  - unverifiable: the reviewer could not confirm readiness due to its own
+ *    limits (no verified evidence, truncated context), not a code defect.
+ *  - spec-defect: the acceptance criterion itself cannot be satisfied as
+ *    written (e.g. "all tests pass" when one pre-existing test can never
+ *    pass in this environment).
+ */
+export type BlockerResolver = "task-fixable" | "environmental" | "unverifiable" | "spec-defect";
+
+export interface ReviewBlocker {
+  category: BlockerCategory;
+  resolver: BlockerResolver;
+  description: string;
+}
+
+const BLOCKERS_BLOCK_RE = /<!--\s*blockers:start\s*-->([\s\S]*?)<!--\s*blockers:end\s*-->/i;
+const BLOCKER_LINE_RE =
+  /^\s*[-*]\s*\[\s*(architectural|completion|review-confidence|shipping)\s*\]\s*\[\s*(task-fixable|environmental|unverifiable|spec-defect)\s*\]\s*(.+?)\s*$/i;
+
+/**
+ * Parse the machine-readable blocker block reviewers are asked to emit
+ * (see resources/prompts/review-scoring-rubric.md) in addition to their
+ * prose blocker sections:
+ *
+ *   <!-- blockers:start -->
+ *   - [completion] [task-fixable] short description
+ *   <!-- blockers:end -->
+ *
+ * Absent, malformed, or unparseable lines are simply skipped — a review
+ * that omits the block (older prompt version, or a provider that didn't
+ * follow instructions) yields an empty array rather than throwing, so
+ * routing degrades to "no structured blocker signal" instead of failing.
+ */
+export function parseReviewBlockers(content: string): ReviewBlocker[] {
+  const match = BLOCKERS_BLOCK_RE.exec(content);
+  if (!match?.[1]) {
+    return [];
+  }
+  const blockers: ReviewBlocker[] = [];
+  for (const line of match[1].split(/\r?\n/)) {
+    const lineMatch = BLOCKER_LINE_RE.exec(line);
+    if (!lineMatch) {
+      continue;
+    }
+    const [, category, resolver, description] = lineMatch;
+    if (!category || !resolver || !description) {
+      continue;
+    }
+    blockers.push({
+      category: category.toLowerCase() as BlockerCategory,
+      resolver: resolver.toLowerCase() as BlockerResolver,
+      description,
+    });
+  }
+  return blockers;
+}
+
 /** Strict gate used by automatic stage advancement. */
 export function isStrictPerfectReview(content: string): boolean {
   const lines = content.replace(/^\uFEFF/, "").replace(/\r\n/g, "\n").split("\n");

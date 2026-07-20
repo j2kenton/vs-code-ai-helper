@@ -876,6 +876,49 @@
           "scope": "resource",
           "description": "Explicit Publish verification commands."
         },
+        "ensemble.knownFlakyChecks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "match": {
+                "type": "string",
+                "description": "Substring matched against a failed check's command line."
+              },
+              "failureSignature": {
+                "type": "string",
+                "description": "Substring matched against that failed check's output."
+              },
+              "reason": {
+                "type": "string",
+                "description": "Shown next to the quarantined failure so it stays explainable."
+              }
+            },
+            "required": [
+              "match",
+              "failureSignature",
+              "reason"
+            ]
+          },
+          "default": [],
+          "scope": "resource",
+          "markdownDescription": "Completion checks whose failure is a known, pre-existing environmental issue rather than a real regression. A failure is only quarantined when both `match` and `failureSignature` are found — the raw pass/fail result is never altered, only the modulo-known-flakes signal shown to reviewers."
+        },
+        "ensemble.reviewPlateauRounds": {
+          "type": "integer",
+          "default": 3,
+          "minimum": 2,
+          "maximum": 20,
+          "scope": "window",
+          "description": "Consecutive review rounds with no new best score before a stage is considered plateaued and escalated for a human decision."
+        },
+        "ensemble.completionCheckTimeoutMs": {
+          "type": "integer",
+          "default": 600000,
+          "minimum": 10000,
+          "scope": "window",
+          "description": "Maximum time (milliseconds) a single completion check (lint/type-check/test/explicit verification command) may run before being terminated, both at Publish and during every review round's verified-checks evidence collection."
+        },
         "vs-code-ai-helper.aiModelDefaults": {
           "deprecationMessage": "Use `ensemble.aiModelDefaults` instead.",
           "type": "object",
@@ -1093,8 +1136,8 @@
     "test:unit": "node -e \"require('fs').rmSync('out/test',{recursive:true,force:true})\" && tsc --project tsconfig.test.json && node test-stubs/run-unit-tests.js",
     "test:targeted:tmp": "node --require ./test-stubs/register.js --test-timeout=20000 --test out/test/startNewTaskLifecycle.test.js",
     "test:host": "node esbuild.js && tsc --project tsconfig.test.json && vscode-test",
-    "test": "npm run test:unit",
     "vsix": "vsce package",
+    "test": "npm run test:unit",
     "publish": "vsce publish",
     "publish:patch": "vsce publish patch",
     "publish:minor": "vsce publish minor",
