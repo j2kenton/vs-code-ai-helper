@@ -432,6 +432,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         label: provider.label,
         signInLabel: provider.signInLabel,
         signInGuidance: provider.signInGuidance ?? "",
+        // Shown inline in the provider row, not as a tooltip: the user has
+        // to be able to read it before deciding to enable the provider.
+        permissionWarning: provider.permissionWarning ?? "",
         // UI button state comes from the same capability descriptor the
         // handler dispatches on: enabled for terminal/interactive/
         // vscode-command/manual, and also for unsupported when it carries a
@@ -714,6 +717,16 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             margin: var(--ensemble-space-2) 0 0;
             font-size: var(--ensemble-small-font-size);
             color: var(--vscode-descriptionForeground);
+          }
+          /* Sits directly under its provider row, indented to read as
+             belonging to that provider rather than to the whole list. */
+          .provider-warning {
+            margin: 0 0 var(--ensemble-space-2) var(--ensemble-space-3);
+            padding: var(--ensemble-space-1) var(--ensemble-space-2);
+            border-left: var(--ensemble-border-width) solid var(--vscode-inputValidation-warningBorder);
+            background: var(--vscode-inputValidation-warningBackground);
+            color: var(--vscode-inputValidation-warningForeground, var(--vscode-foreground));
+            font-size: var(--ensemble-small-font-size);
           }
           .form-row {
             margin-bottom: var(--ensemble-space-2);
@@ -1235,7 +1248,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                 (provider.usageEnabled
                   ? '<button type="button" class="secondary provider-usage" data-usage-provider="' + escapeHtml(provider.id) + '" title="' + escapeHtml(provider.usageTooltip) + '">Check usage</button>'
                   : '<button type="button" class="secondary provider-usage" disabled title="' + escapeHtml(provider.usageTooltip) + '">Check usage</button>') +
-                '</div>'
+                '</div>' +
+                (provider.permissionWarning
+                  ? '<p class="provider-warning">' + escapeHtml(provider.permissionWarning) + '</p>'
+                  : '')
               ).join('') +
               '<p class="provider-help">Enabled providers determine which models are offered below. Sign-in and usage checks run in a visible terminal; the extension reports them as launched, not as succeeded.</p>' +
               '<div class="btn-container"><button id="save-providers-btn">Save Provider Selection</button></div>' +

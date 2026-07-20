@@ -87,6 +87,63 @@ void describe("provider CLI contracts", () => {
     ]);
   });
 
+  void it("text mode stays permission-constrained unless the provider warns the user", () => {
+    // "text mode must keep the CLI read-only" is the contract stated on
+    // CliProviderDefinition.buildArgs. Antigravity is the one deliberate
+    // exception — its headless CLI grants no scoped access in any mode, and
+    // a run without the bypass flag does nothing at all (see the comment on
+    // its definition for the flags and allow-rule forms that were tested).
+    // The price of that exception is telling the user before they enable
+    // the provider, so any future provider that skips permissions in text
+    // mode must pay it too.
+    const PERMISSION_BYPASS_FLAGS = [
+      "--dangerously-skip-permissions",
+      "--dangerously-bypass-approvals-and-sandbox",
+      "--yolo",
+    ];
+
+    for (const provider of CLI_PROVIDERS) {
+      const textArgs = provider.buildArgs("text", undefined, undefined, {
+        promptFile: "/tmp/prompt.txt",
+      });
+      const bypassed = textArgs.filter((arg) =>
+        PERMISSION_BYPASS_FLAGS.includes(arg)
+      );
+      if (bypassed.length === 0) {
+        assert.strictEqual(
+          provider.permissionWarning,
+          undefined,
+          `${provider.id} constrains text mode and should not carry a permission warning`
+        );
+        continue;
+      }
+      assert.ok(
+        provider.permissionWarning,
+        `${provider.id} skips permissions in text mode (${bypassed.join(" ")}) and must carry a permissionWarning`
+      );
+      // The settings view renders from the account entry, not the CLI
+      // definition — a warning that stops here never reaches the user.
+      assert.strictEqual(
+        getProviderAccountEntry(provider.id)?.permissionWarning,
+        provider.permissionWarning,
+        `${provider.id}'s warning must reach its provider-account entry`
+      );
+    }
+
+    // Guard against the loop above passing vacuously: Antigravity is the
+    // known exception and must actually be flagged, naming the real flag so
+    // the warning means something to someone reading it.
+    const antigravity = getCliProvider("antigravity-cli");
+    assert.ok(
+      antigravity?.permissionWarning,
+      "expected Antigravity to carry a permission warning"
+    );
+    assert.match(
+      antigravity.permissionWarning,
+      /--dangerously-skip-permissions/
+    );
+  });
+
   void it("Codex model variants map to base model plus reasoning config", () => {
     const codex = getCliProvider("codex-cli");
     assert.ok(codex, "expected codex-cli provider definition");

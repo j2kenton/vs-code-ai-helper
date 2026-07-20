@@ -39,7 +39,7 @@ Ensemble can also drive vendor CLIs that authenticate against your existing subs
 | **Antigravity** | Install the Antigravity CLI, then run `agy` once | Google account |
 | **Kiro CLI** | Install from [kiro.dev/cli](https://kiro.dev/cli/) | Kiro login **and** a `KIRO_API_KEY` environment variable — `kiro-cli login` alone is not sufficient for headless runs |
 
-> **Note on Antigravity:** unlike the other providers, the Antigravity CLI offers no way to grant scoped read-only tool access in headless mode. Ensemble therefore runs it with permissions skipped in **all** modes, which means even a plan or review run could in principle write or delete files. Prefer another provider unless you are working in a repository you have committed or backed up.
+> **Note on Antigravity:** it runs with `--dangerously-skip-permissions` in **every** mode, including plan and review — so it can create, change, or delete any file in your workspace without asking, even on a run you'd expect to be read-only. The other providers restrict their read-only stages (Claude `--permission-mode plan`, Codex `--sandbox read-only`, Kiro `--trust-tools fs_read,grep,glob`); Antigravity's headless CLI offers no equivalent, and without the flag its runs fail having done nothing. Commit or back up before using it, or pick another provider.
 
 AI actions consume real quota or money, and implementation runs modify workspace files.
 

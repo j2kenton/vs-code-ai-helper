@@ -188,6 +188,15 @@ export interface CliProviderDefinition {
    * disabled rather than linking somewhere unconfirmed.
    */
   usageUnsupportedUrl?: string;
+  /**
+   * Set when this provider's runs are NOT constrained by the vendor's own
+   * permission system, so enabling it carries a risk the other providers
+   * don't. Surfaced next to the provider in Provider Selection, before the
+   * user enables it — the point is that nobody turns this on without being
+   * told what it does. Absent for every provider whose text and edit modes
+   * both run under vendor-enforced permissions (the normal case).
+   */
+  permissionWarning?: string;
 }
 
 const CODEX_REASONING_EFFORTS = new Set([
@@ -533,18 +542,34 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     promptTransport: "file",
     useShell: false,
     // Deliberate exception to the "text mode stays read-only" contract
-    // above: `agy --print` (headless) has no way to grant scoped, read-only
-    // tool trust the way Gemini's `--sandbox read-only` or Kiro's
-    // `--trust-tools` do. Its only approval surface is a fixed
-    // ~/.gemini/antigravity-cli/settings.json allowlist of exact shell
-    // commands, and `--sandbox` restricts what an *approved* command can do
-    // rather than granting approval — confirmed by testing both against the
-    // same denied call. Any verification command the model reaches for that
-    // isn't on that allowlist makes text-mode runs (plans, reviews) fail
-    // outright with zero output, since headless mode can't prompt. Passing
-    // --dangerously-skip-permissions here too trades that hard, silent
-    // failure for the (accepted) risk that a text-mode run could write or
-    // delete files.
+    // above, in BOTH modes: headless `agy --print` auto-denies any tool call
+    // whose permission it does not already hold and cannot prompt for
+    // approval, so without this flag a run fails having done nothing at all.
+    //
+    // Re-verified 2026-07-20 against agy 1.1.4 by direct testing, in an
+    // untrusted scratch directory and in a workspace listed under
+    // ~/.gemini/antigravity-cli/settings.json's trustedWorkspaces. A bare
+    // read_file of a file in the working directory was denied identically
+    // under `--sandbox`, under `--mode plan`, and with no mode flag at all —
+    // no mode flag loosens the permission gate, and workspace trust does not
+    // either. `--sandbox` is terminal-restriction only (`agy --help`: "Run in
+    // a sandbox with terminal restrictions enabled"), so it does not make a
+    // text-mode run read-only; only this flag's absence would, and its
+    // absence also makes the run useless. No broad grant exists either:
+    // `permissions.allow` was tested as a path prefix
+    // (`read_file(C:\<dir>)`), as a bare class grant (`read_file`), and as a
+    // literal target (`read_file(<name>)`) — none granted the call.
+    //
+    // So unlike Codex's `--sandbox read-only`/`workspace-write` or Kiro's
+    // `--trust-tools`, Antigravity exposes no scoped alternative in either
+    // direction. The accepted trade is to run with permissions skipped and
+    // tell the user plainly, up front, via permissionWarning below — rather
+    // than ship a provider whose plan and review stages always fail.
+    // Re-test if a future CLI version adds a scope flag or a class grant.
+    permissionWarning:
+      "Runs with --dangerously-skip-permissions in every mode, including plan " +
+      "and review. It can create, change, or delete any file in your workspace " +
+      "without asking. Its headless CLI offers no scoped alternative.",
     buildArgs(_mode, model, _lastMessageFile, context): string[] {
       const args: string[] = [
         `--print=${context?.promptFile ?? ""}`,
@@ -690,6 +715,12 @@ export interface ProviderAccountEntry {
   usage: ProviderActionCapability;
   /** True when the provider is enabled unless explicitly disabled. */
   enabledByDefault: boolean;
+  /**
+   * Carried through from the CLI definition so Provider Selection can show
+   * it before the user enables the provider. Absent for providers whose
+   * runs are constrained by the vendor's own permission system.
+   */
+  permissionWarning?: string;
 }
 
 export const PROVIDER_ACCOUNT_ENTRIES: readonly ProviderAccountEntry[] = [
@@ -790,6 +821,9 @@ export const PROVIDER_ACCOUNT_ENTRIES: readonly ProviderAccountEntry[] = [
           ...(provider.usageUnsupportedUrl ? { url: provider.usageUnsupportedUrl } : {}),
         },
     enabledByDefault: false,
+    ...(provider.permissionWarning
+      ? { permissionWarning: provider.permissionWarning }
+      : {}),
   })),
 ];
 
