@@ -2,6 +2,20 @@
 
 All notable changes to Ensemble (formerly VS Code AI Helper) are documented here.
 
+## [Unreleased] — Packaging fix: task run logs no longer shipped in the extension
+
+### Fixed
+
+- **`.vscodeignore`** — Task meta folders are excluded from the published package again. Version 0.53.0 renamed the meta folder from `plans/` to `.ensemble/` and updated `.gitignore`, but not `.vscodeignore`. Because `vsce` ignores `.gitignore` entirely whenever a `.vscodeignore` file exists, that rename silently removed the exclusion, and versions 0.53.0 through 0.56.1 packaged the author's local `.ensemble/` task folders — task run logs, which contain AI prompts and context packs. The package dropped from 1,927 files to 120. Both the current and legacy meta-folder names are now excluded, along with development-only material (`notes/`, `docs/`, `test-stubs/`, `dist/test/`).
+
+### Added
+
+- **`scripts/verify-package-contents.js`** — Publish guard that runs `vsce ls` and fails if the package would contain task meta folders, author notes, test sources, or more files than an explicit ceiling. Folder names are parsed from `DEFAULT_TASK_ROOT` and the legacy roots in `src/utils/taskRoot.ts` rather than duplicated, so renaming a task root trips the guard instead of bypassing it; the check also fails if those constants cannot be found, rather than assuming there is nothing to exclude. Wired into `scripts/release.ps1` between the build and the publish step.
+
+### Changed
+
+- **`README.md`** — Added a **Requirements** section. The minimum setup is VS Code and GitHub Copilot, which needs no additional install and is enabled by default; all CLI providers are optional and opt-in, with install commands and account requirements listed per provider.
+
 ## [Unreleased] — Task lifecycle and automation safety
 
 ### Changed
