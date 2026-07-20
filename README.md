@@ -21,6 +21,28 @@ The Tasks view and status bar show the current task and stage. Every AI action h
 
 ![Provider selection and fast-forward review settings](images/screenshots/screenshot-3.png)
 
+## Requirements
+
+**Minimum: VS Code 1.93+ and GitHub Copilot.** Copilot uses the GitHub account VS Code is already signed into, so there is nothing extra to install and it is enabled by default. Copilot's free tier is enough to try Ensemble; sustained use will run into its limits and need a paid Copilot plan.
+
+That is the whole requirement. Everything below is optional.
+
+### Optional: vendor CLI providers
+
+Ensemble can also drive vendor CLIs that authenticate against your existing subscription, so you can use a different model for each workflow step. Every CLI provider is **off by default** — enable the ones you want under **Ensemble: Configure AI Models**. None of them is required.
+
+| Provider | Install | Account |
+|---|---|---|
+| **Gemini CLI** | `npm i -g @google/gemini-cli`, then run `gemini` once | Google account; free tier available |
+| **Claude Code** | `npm i -g @anthropic-ai/claude-code`, then run `claude` once | Claude Pro or Max subscription |
+| **Codex CLI** | `npm i -g @openai/codex`, then `codex login` | ChatGPT Plus or Pro subscription |
+| **Antigravity** | Install the Antigravity CLI, then run `agy` once | Google account |
+| **Kiro CLI** | Install from [kiro.dev/cli](https://kiro.dev/cli/) | Kiro login **and** a `KIRO_API_KEY` environment variable — `kiro-cli login` alone is not sufficient for headless runs |
+
+> **Note on Antigravity:** unlike the other providers, the Antigravity CLI offers no way to grant scoped read-only tool access in headless mode. Ensemble therefore runs it with permissions skipped in **all** modes, which means even a plan or review run could in principle write or delete files. Prefer another provider unless you are working in a repository you have committed or backed up.
+
+AI actions consume real quota or money, and implementation runs modify workspace files.
+
 ## Quick start
 
 1. Install from the [Visual Studio Marketplace](https://marketplace.visualstudio.com/items?itemName=j2kenton.vs-code-ai-helper).
@@ -28,7 +50,7 @@ The Tasks view and status bar show the current task and stage. Every AI action h
 3. Run **Ensemble: Start New Task**, describe the work in `task.md`, and use **Generate Plan with AI** or write the plan yourself.
 4. Review and promote the plan, generate the implementation checklist, implement, and run the implementation reviews.
 
-AI providers may include GitHub Copilot and supported vendor CLIs (Claude, Codex, Gemini, Antigravity, and Kiro). Configure models per workflow step; provider availability depends on your subscriptions and local setup. AI actions consume real quota or money and may modify files.
+Configure models per workflow step under **Ensemble: Configure AI Models**.
 
 ## Safety and disclaimer
 
