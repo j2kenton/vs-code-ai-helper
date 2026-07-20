@@ -22,6 +22,7 @@ import { checkAndConfirmPromptSize } from "../utils/promptSizeGuard";
 import { ensureAiConsent } from "../utils/aiConsent";
 import {
   runTrackedOperation,
+  taskOperations,
   TaskOperationHandle,
 } from "../utils/taskOperations";
 
@@ -220,7 +221,10 @@ export async function runLintingFixes(
           cancellable: false,
         },
         async (progress) => {
-          NotificationRouter.emitProgressSummary("Running linting fixes...");
+          NotificationRouter.emitProgressSummary(
+            "Running linting fixes...",
+            taskOperations.rootOperationIdFor(lockKey)
+          );
           try {
             progress.report({ message: "Checking for linting errors..." });
 

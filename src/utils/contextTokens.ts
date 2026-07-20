@@ -20,6 +20,12 @@ export interface StageContextInput {
   isMetaManaged?: boolean;
   /** A previous artifact version exists — enables View/Revert/Delete backup actions. */
   hasBackup?: boolean;
+  /**
+   * The artifact currently sits on the reverted side of its durable redo
+   * sidecar (see utils/redoSidecar.ts) — enables the Redo Changes action.
+   * Survives reload/crash; never true without hasBackup also true.
+   */
+  redoAvailable?: boolean;
 }
 
 /**
@@ -150,11 +156,20 @@ export function buildStageContextValue(input: StageContextInput): string {
     tokens.push("meta-managed");
   }
 
-  // Backup availability: gates the Revert Changes / Delete Previous Version
-  // menu entries (menus match /-has-backup/). Kept before the trailing
-  // modelable token so /-modelable$/ clauses keep matching.
+  // Backup availability: gates the Delete Previous Version menu entry (menus
+  // match /-has-backup/), independent of swap direction. Kept before the
+  // trailing modelable token so /-modelable$/ clauses keep matching.
   if (input.hasBackup) {
     tokens.push("has-backup");
+  }
+
+  // Swap direction: exactly one of these two tokens is present whenever a
+  // backup exists, gating Revert Changes vs. Redo Changes as mutually
+  // exclusive menu entries (menus match /-revert-available/ /
+  // /-redo-available/) instead of deriving "revert" from the negation of
+  // "redo-available".
+  if (input.hasBackup) {
+    tokens.push(input.redoAvailable ? "redo-available" : "revert-available");
   }
 
   // Modelable state (always at the end for regex compatibility)

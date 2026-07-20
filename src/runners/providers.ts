@@ -157,11 +157,9 @@ export interface CliProviderDefinition {
    */
   signInAction?: { launch: string; send: string; validated: "verified" | "unverified" };
   /**
-   * Label for the sign-in action. Always "Sign In" — none of these flows
-   * verifiably log the user out before logging back in, so the button must
-   * never claim "Switch account" (the terminal-based sign-in commands are
-   * effectively idempotent when already authenticated: rerunning them
-   * mostly re-confirms the existing session rather than swapping it).
+   * Label for the sign-in action. "Sign in / Switch account" — re-running
+   * the same sign-in flow while already authenticated is how a user switches
+   * to a different account for CLIs with no dedicated logout/switch command.
    */
   signInLabel: string;
   /** Extra guidance shown alongside the sign-in action (e.g. Kiro's headless API-key requirement). */
@@ -337,7 +335,7 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     // existing session. Switching accounts requires running /logout first;
     // see signInGuidance.
     signInAction: { launch: "claude", send: "/login", validated: "verified" },
-    signInLabel: "Sign In",
+    signInLabel: "Sign in / Switch account",
     signInGuidance:
       "Complete the Anthropic sign-in in the terminal. Already signed in as a different " +
       "account? Type /logout in the terminal first, then click Sign In again.",
@@ -398,14 +396,15 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     authErrorMarkers: ["not logged in", "login", "authenticate", "api key"],
     authenticationCheckArgs: ["login", "status"],
     signInCommand: "codex login",
-    signInLabel: "Sign In",
+    signInLabel: "Sign in / Switch account",
     signInGuidance:
       "Sign in with your ChatGPT account in the terminal. Running Sign In again mostly " +
       "re-confirms the existing session rather than switching accounts; check the Codex " +
       "CLI docs for how to sign out first if you need a different account.",
-    // `/usage` is an in-session Codex TUI slash command (observed printing
-    // the account's % used); launched interactively, then sent.
-    usageAction: { launch: "codex", send: "/usage", validated: "verified" },
+    // `/status` is an in-session Codex TUI slash command that reports account
+    // and usage information — preferred over `/usage` as the more complete,
+    // more informative status view; launched interactively, then sent.
+    usageAction: { launch: "codex", send: "/status", validated: "verified" },
     // Keep the provider-level fallback to CLI default only. The picker can
     // seed temporary model options elsewhere without changing runner
     // semantics here, and any unsupported custom ID can still be set
@@ -451,15 +450,15 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
       "Run `gemini` in a terminal and complete the Google sign-in, then try again.",
     authErrorMarkers: ["login", "authenticate", "credentials", "api key"],
     signInCommand: "gemini",
-    signInLabel: "Sign In",
+    signInLabel: "Sign in / Switch account",
     signInGuidance:
       "Complete the Google sign-in in the terminal. If already signed in, use the /auth command inside the CLI to switch the auth method or account.",
     // Per the approved capability matrix the Gemini CLI's usage surface is
     // its in-session /stats slash command (model breakdown), not a /usage
     // command. Carried as "unverified" until re-confirmed against the
-    // installed CLI version — which downgrades the account entry to a
-    // "manual" capability (instructions, nothing sent automatically); flip
-    // to "verified" after confirming in a terminal to automate the button.
+    // installed CLI version — which renders the Check usage button disabled
+    // (see the "unverified always renders disabled" note below); flip to
+    // "verified" after confirming in a terminal to automate the button.
     usageAction: { launch: "gemini", send: "/stats model", validated: "unverified" },
     models: [
       { model: undefined, name: "Gemini (CLI default)" },
@@ -491,11 +490,17 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
       "Run `agy` (or `antigravity`) in a terminal and complete the Google sign-in, then try again.",
     authErrorMarkers: ["login", "authenticate", "credentials", "api key"],
     signInCommand: "agy",
-    signInLabel: "Sign In",
+    signInLabel: "Sign in / Switch account",
     signInGuidance:
       "Complete the Google sign-in in the terminal. The CLI has no dedicated logout command; switching accounts may require clearing its stored credentials.",
-    usageUnsupportedReason:
-      "The Antigravity CLI has no known usage/quota command — check usage in the Antigravity app or your Google account.",
+    // `/usage` is an in-session Antigravity TUI slash command; launched
+    // interactively, then sent. Not yet re-confirmed against an installed
+    // binary in this environment (interactive CLI sessions can't be driven
+    // headlessly here), so this stays "unverified" — the Check usage button
+    // renders disabled rather than shipping a nonfunctional or misleading
+    // manual-instructions action, following the same pattern as Gemini's
+    // /stats (see the "unverified always renders disabled" note below).
+    usageAction: { launch: "agy", send: "/usage", validated: "unverified" },
     // Keep the provider-level fallback to CLI default only. The picker seeds
     // temporary cached entries and still prefers live `agy models` results
     // when available.
@@ -570,7 +575,7 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     // `kiro-cli login` refuses with "Already logged in" otherwise. `;` runs
     // both in PowerShell and POSIX shells.
     signInCommand: "kiro-cli logout; kiro-cli login",
-    signInLabel: "Sign In",
+    signInLabel: "Sign in / Switch account",
     signInGuidance:
       "Logs out first so you can switch accounts. Headless mode additionally requires KIRO_API_KEY — `kiro-cli login` alone does not satisfy `chat --no-interactive` auth.",
     usageUnsupportedReason:
@@ -691,7 +696,7 @@ export const PROVIDER_ACCOUNT_ENTRIES: readonly ProviderAccountEntry[] = [
   {
     id: "copilot",
     label: "GitHub Copilot",
-    signInLabel: "Sign In",
+    signInLabel: "Sign in / Switch account",
     // Never a shell command — Copilot auth is VS Code-native. Candidate
     // lists, newest-first, first REGISTERED one wins (see
     // ProviderSignInAction's doc comment for why this is a list, not a
@@ -751,9 +756,16 @@ export const PROVIDER_ACCOUNT_ENTRIES: readonly ProviderAccountEntry[] = [
           validated: provider.signInCommand ? "verified" : "unverified",
         },
     signInGuidance: provider.signInGuidance,
-    // Usage dispatch: only a VERIFIED in-session descriptor is automated.
-    // An unverified one is downgraded to manual instructions (the button
-    // stays enabled but nothing is sent automatically) until it is
+    // Usage dispatch: only a VERIFIED in-session descriptor is automated OR
+    // even offered as a manual fallback. An "unverified" in-session slash
+    // command (e.g. Gemini's `/stats`, Antigravity's `/usage`) has not been
+    // confirmed to actually work inside the CLI's TUI — shipping it as an
+    // enabled "manual instructions" button would tell the user to try a
+    // command that may not exist, with no way to know it failed. Per the
+    // approved capability matrix: "If the retry still fails, leave the
+    // button disabled and document the unsupported behavior instead of
+    // shipping a nonfunctional action." So "unverified" always renders a
+    // DISABLED button (kind "unsupported", no url) until the command is
     // confirmed against the installed CLI and flipped to "verified".
     usage: provider.usageAction
       ? provider.usageAction.validated === "verified"
@@ -764,12 +776,11 @@ export const PROVIDER_ACCOUNT_ENTRIES: readonly ProviderAccountEntry[] = [
             validated: provider.usageAction.validated,
           }
         : {
-            kind: "manual",
-            instructions:
-              `Launch \`${provider.usageAction.launch}\` in a terminal, then type ` +
-              `${provider.usageAction.send} inside the session to check usage. ` +
-              `(This slash command has not been verified against the installed CLI, ` +
-              `so it is not sent automatically.)`,
+            kind: "unsupported",
+            reason:
+              `Checking ${provider.label} usage from here has not been verified against the installed CLI ` +
+              `(this would launch \`${provider.usageAction.launch}\` and send \`${provider.usageAction.send}\`, ` +
+              `but that is unconfirmed) — check usage directly in the ${provider.label} CLI or app instead.`,
           }
       : {
           kind: "unsupported",

@@ -15,7 +15,7 @@ import { registerArchiveTaskCommands } from "./commands/archiveTask";
 import { registerPinTaskCommands } from "./commands/pinTask";
 import { registerApplyHighLevelReviewChangesCommand } from "./commands/applyHighLevelReviewChanges";
 import { registerApplyLowLevelReviewChangesCommand } from "./commands/applyLowLevelReviewChanges";
-import { registerCommitAndPushTaskCommand, confirmPendingCommitMessage } from "./commands/commitAndPushTask";
+import { registerCommitAndPushTaskCommand } from "./commands/commitAndPushTask";
 import { recoverRevertJournals } from "./utils/artifactRevertJournal";
 import {
   ensureAutomaticMetaGitIgnore,
@@ -48,6 +48,7 @@ import { warmCliModelCache } from "./utils/modelSelection";
 import { StatusTreeProvider, STATUS_VIEW_ID } from "./views/statusView";
 import { initNotificationRouter, deactivateNotificationRouter, NotificationRouter } from "./utils/notificationRouter";
 import { installOperationNotificationBridge } from "./utils/operationNotificationBridge";
+import { ENSEMBLE_NOTIFICATION_SCHEME, NotificationContentProvider } from "./utils/notificationContentProvider";
 import { ViewProgressBinder } from "./utils/viewProgressBinder";
 import { taskOperations } from "./utils/taskOperations";
 import { cleanupOrphanedTempFiles } from "./state/writeAtomic";
@@ -194,7 +195,7 @@ export function activate(context: vscode.ExtensionContext): void {
     () => vscode.commands.executeCommand("vs-code-ai-helper.settingsView.focus")
   ));
   registerViewArtifactCommands(context);
-  registerDraftTaskWithAICommand(context, inventory);
+  registerDraftTaskWithAICommand(context, inventory, chatViewProvider);
   registerApplyCurrentStageActionCommand(context, inventory, currentTaskStore);
   registerOpenAndStartNewTaskCommand(context, inventory, currentTaskStore);
   registerReviewCurrentTaskCommand(context, inventory, currentTaskStore);
@@ -214,18 +215,6 @@ export function activate(context: vscode.ExtensionContext): void {
   registerMarkTaskDoneCommand(context, inventory, currentTaskStore);
   registerViewStageChangesCommands(context, inventory);
   registerRenameTaskCommands(context, inventory);
-
-  // Settle a pending commit-message review (staging/commit/push happen only
-  // at settlement — see pendingCommitSession.ts). When the originating
-  // Commit and Push operation is still awaiting the review notification it
-  // owns the task's exclusive lock, so settlement goes THROUGH that live
-  // operation (wake channel) instead of claiming a second exclusive
-  // operation that would be refused as busy; otherwise it runs under its
-  // own tracked operation like every other commit path.
-  context.subscriptions.push(vscode.commands.registerCommand(
-    "vs-code-ai-helper.confirmCommitMessage",
-    () => confirmPendingCommitMessage(context)
-  ));
 
   // Register the hello world command (keeping for backward compat)
   const helloWorldDisposable = vscode.commands.registerCommand(
@@ -277,6 +266,15 @@ export function activate(context: vscode.ExtensionContext): void {
   // registry's own lifecycle event, so the in-progress row never just
   // vanishes and no command has to remember to post its own message.
   context.subscriptions.push(installOperationNotificationBridge());
+  // Read-only fallback document for Notifications rows with no known
+  // click-to-open target (D11) — registered once, for the lifetime of the
+  // extension, so every ensemble-notification: URI it hands out resolves.
+  context.subscriptions.push(
+    vscode.workspace.registerTextDocumentContentProvider(
+      ENSEMBLE_NOTIFICATION_SCHEME,
+      new NotificationContentProvider()
+    )
+  );
   context.subscriptions.push(vscode.commands.registerCommand(
     "vs-code-ai-helper.clearNotifications",
     () => statusTreeProvider.clear()
@@ -291,13 +289,26 @@ export function activate(context: vscode.ExtensionContext): void {
   // until the run observes the token and ends.
   context.subscriptions.push(vscode.commands.registerCommand(
     "vs-code-ai-helper.cancelOperation",
-    (node?: { id?: string }) => {
-      if (typeof node?.id !== "string") return;
-      if (!taskOperations.cancelOperation(node.id)) {
+    (node?: { id?: string; sourceOperationId?: string }) => {
+      const operationId = typeof node?.id === "string" ? node.id : node?.sourceOperationId;
+      if (typeof operationId !== "string") return;
+      if (!taskOperations.cancelOperation(operationId)) {
         NotificationRouter.showInformation(
           "This operation can no longer be cancelled (it may have just finished)."
         );
       }
+    }
+  ));
+  // Inline "act on this" button on notification rows that carry a concrete
+  // follow-up (e.g. "Publish Anyway" after auto-publish was skipped). Kept
+  // separate from the row's own click command so clicking the row still
+  // navigates to the notification's full text/target (D11) and this
+  // dedicated action never gets silently dropped by that navigation.
+  context.subscriptions.push(vscode.commands.registerCommand(
+    "vs-code-ai-helper.runNotificationAction",
+    (node?: unknown) => {
+      if (!node) return;
+      statusTreeProvider.runAction(node as Parameters<StatusTreeProvider["runAction"]>[0]);
     }
   ));
   registerOpenGeneralAssistantCommand(context, inventory, currentTaskStore, chatViewProvider);
@@ -484,8 +495,9 @@ export function activate(context: vscode.ExtensionContext): void {
 
   // Activation-time recovery for the one durable mid-flight artifact: an
   // interrupted revert swap (journal beside the artifact). A commit-message
-  // review needs no recovery — its untitled editor is the session, closing
-  // it (or reloading the window) cancels with nothing committed.
+  // review needs no recovery — its modal preview/confirmation is the
+  // session, closing it (or reloading the window) cancels with nothing
+  // committed.
   // Runs after initNotificationRouter (above) so status routing is live.
   void recoverRevertJournals(async (prompt) => {
     const name = prompt.artifactPath.split(/[\\/]/).pop() ?? prompt.artifactPath;

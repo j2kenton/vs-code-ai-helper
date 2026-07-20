@@ -82,6 +82,47 @@ void describe("ChatViewProvider.ask() task-switch behavior", () => {
     assert.match(html, /prefers-reduced-motion/);
   });
 
+  void it("styles the task/stage header as a distinct title and gives user/agent messages different, theme-safe treatments", () => {
+    const html = chatWebviewHtml();
+
+    // Regression coverage for a review finding: the message background used
+    // --vscode-editor-inactiveSelectionBackground, a token meant for a
+    // transient selection highlight — in some high-contrast dark themes it
+    // resolves lighter than --vscode-foreground text sitting permanently on
+    // top of it, breaking contrast. That token must be gone.
+    assert.doesNotMatch(html, /inactiveSelectionBackground/);
+
+    // The task/stage header (#context) must read as a title, not body text:
+    // bold, larger, and visually separated from the message list — not the
+    // muted descriptionForeground color used for secondary status text.
+    const contextRule = /#context\s*\{([^}]*)\}/.exec(html);
+    assert.ok(contextRule, "expected a #context CSS rule");
+    assert.match(contextRule[1]!, /font-weight:\s*bold/);
+    assert.match(contextRule[1]!, /color:\s*var\(--vscode-foreground\)/);
+    assert.doesNotMatch(contextRule[1]!, /descriptionForeground/);
+
+    // User messages: foreground-on-editor-background with a foreground-
+    // colored border (the border stands in for a distinct background), so
+    // the same pairing that's already readable for the rest of the
+    // extension's text is what carries the message, in every theme.
+    const userRule = /#messages p\.msg-user\s*\{([^}]*)\}/.exec(html);
+    assert.ok(userRule, "expected a #messages p.msg-user CSS rule");
+    assert.match(userRule[1]!, /color:\s*var\(--vscode-foreground\)/);
+    assert.match(userRule[1]!, /background-color:\s*var\(--vscode-editor-background\)/);
+    assert.match(userRule[1]!, /border:\s*var\(--ensemble-border-width\)\s*solid\s*var\(--vscode-foreground\)/);
+
+    // Agent messages: a distinct surface (sideBar-background), not a border,
+    // so the two roles are never confused at a glance.
+    const agentRule = /#messages p\.msg-agent\s*\{([^}]*)\}/.exec(html);
+    assert.ok(agentRule, "expected a #messages p.msg-agent CSS rule");
+    assert.match(agentRule[1]!, /background-color:\s*var\(--vscode-sideBar-background\)/);
+    assert.match(agentRule[1]!, /border:\s*none/);
+
+    // The render script must actually apply msg-user only to the "user"
+    // role, routing every other role (assistant, question) to msg-agent.
+    assert.match(html, /className\s*=\s*x\.role\s*===\s*'user'\s*\?\s*'msg-user'\s*:\s*'msg-agent'/);
+  });
+
   void it("writes the question to its own task but does not refocus/retarget the view when a different task is current", async () => {
     const rf = installReadFileBridge();
     const cmds = installExecuteCommandCapture();

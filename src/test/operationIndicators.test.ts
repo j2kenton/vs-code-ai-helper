@@ -6,6 +6,11 @@ import { StatusTreeProvider, StatusTreeNode } from "../views/statusView";
 import { ViewProgressBinder } from "../utils/viewProgressBinder";
 import { taskOperations, TaskOperationHandle } from "../utils/taskOperations";
 import { IncompleteTask } from "../utils/taskProgressUtils";
+import {
+  NotificationRouter,
+  initNotificationRouter,
+  deactivateNotificationRouter,
+} from "../utils/notificationRouter";
 
 interface WithProgressCall {
   options: unknown;
@@ -16,12 +21,26 @@ interface WithProgressCall {
 type TestWindow = typeof vscode.window & { _withProgressCalls: WithProgressCall[] };
 const testWindow = vscode.window as TestWindow;
 
+/** Minimal in-memory vscode.Memento stand-in for exercising StatusTreeProvider persistence. */
+function makeMementoStub(initial: Record<string, unknown> = {}): vscode.Memento {
+  const store = new Map<string, unknown>(Object.entries(initial));
+  return {
+    get: (<T>(key: string, defaultValue?: T): T =>
+      (store.has(key) ? (store.get(key) as T) : (defaultValue as T))) as vscode.Memento["get"],
+    update: (key: string, value: unknown): Thenable<void> => {
+      store.set(key, value);
+      return Promise.resolve();
+    },
+    keys: () => [...store.keys()],
+  } as unknown as vscode.Memento;
+}
+
 void describe("operationIndicators", () => {
   beforeEach(() => {
     for (const op of taskOperations.getAll()) {
       // getAll() returns readonly snapshots; end() only needs the id/key pair
       // a real TaskOperationHandle carries, so build a minimal one for cleanup.
-      const handle: TaskOperationHandle = { id: op.id, key: op.key, label: op.label, stage: op.stage, report: () => {} };
+      const handle: TaskOperationHandle = { id: op.id, key: op.key, label: op.label, stage: op.stage, report: () => {}, setResultTargetUri: () => {} };
       taskOperations.end(handle);
     }
   });
@@ -91,6 +110,159 @@ void describe("operationIndicators", () => {
         assert.strictEqual(childrenAfterClear.length, 1);
         const [remaining] = childrenAfterClear;
         assert.ok(remaining && "kind" in remaining && remaining.kind === "operation");
+      } finally {
+        taskOperations.end(op);
+      }
+    });
+
+    void it("shows the inline cancel action on a history entry only while its sourceOperationId is still a live cancellable root operation (D10)", () => {
+      const op = taskOperations.begin("/dev/task_1", {
+        label: "Fast Forward",
+        taskName: "task_1",
+        cancellable: true,
+      });
+      assert.ok(op);
+
+      try {
+        provider.addEntry("Fast Forward — task_1: running", "info", undefined, undefined, op.id);
+        const children = provider.getChildren() as StatusTreeNode[];
+        const live = children.find((n) => !("kind" in n));
+        assert.ok(live && !("kind" in live));
+        const liveItem = provider.getTreeItem(live);
+        assert.strictEqual(liveItem.contextValue, "ensemble-notification-cancellable");
+
+        taskOperations.end(op, "succeeded");
+
+        const staleItem = provider.getTreeItem(live);
+        assert.notStrictEqual(staleItem.contextValue, "ensemble-notification-cancellable");
+      } catch (e) {
+        taskOperations.end(op);
+        throw e;
+      }
+    });
+
+    void it("a live progress-summary notification (emitProgressSummary) carries a sourceOperationId that resolves to the currently-running root operation, so it can be cancelled before the operation ends", () => {
+      // Regression coverage: progress-summary entries used to be created with
+      // no sourceOperationId at all (only the terminal bridge — which fires
+      // after the operation has already ended — attached one), so an
+      // in-progress "Fast Forward — task_1: running" row had no way to
+      // resolve to a live operation and never showed a cancel action while
+      // it actually mattered.
+      const op = taskOperations.begin("/dev/task_1", {
+        label: "Fast Forward",
+        taskName: "task_1",
+        cancellable: true,
+      });
+      assert.ok(op);
+
+      initNotificationRouter(provider);
+      try {
+        // Mirrors the real call sites (commitAndPushTask.ts, draftTaskWithAI.ts,
+        // etc.): resolve the live root id from the registry at emit time,
+        // while the operation is still running — not at termination.
+        NotificationRouter.emitProgressSummary(
+          "Fast Forward — task_1: running",
+          taskOperations.rootOperationIdFor("/dev/task_1")
+        );
+
+        const children = provider.getChildren() as StatusTreeNode[];
+        const live = children.find((n) => !("kind" in n) && n.message === "Fast Forward — task_1: running");
+        assert.ok(live && !("kind" in live));
+        const liveItem = provider.getTreeItem(live);
+        assert.strictEqual(
+          liveItem.contextValue,
+          "ensemble-notification-cancellable",
+          "a live progress-summary entry must resolve to a cancellable root operation while it is still running"
+        );
+
+        taskOperations.end(op, "succeeded");
+
+        const staleItem = provider.getTreeItem(live);
+        assert.notStrictEqual(
+          staleItem.contextValue,
+          "ensemble-notification-cancellable",
+          "once the operation ends, the same entry must no longer show a cancel action"
+        );
+      } finally {
+        deactivateNotificationRouter();
+        taskOperations.end(op);
+      }
+    });
+
+    void it("never shows the cancel action for an unknown/stale operation id", () => {
+      provider.addEntry("Old run — task_1: completed", "info", undefined, undefined, "not-a-real-op-id");
+      const [entry] = provider.getChildren() as StatusTreeNode[];
+      assert.ok(entry && !("kind" in entry));
+      const item = provider.getTreeItem(entry);
+      assert.notStrictEqual(item.contextValue, "ensemble-notification-cancellable");
+    });
+
+    void it("never restores a persisted sourceOperationId from workspace state, even when it exactly matches a currently-live cancellable operation's id (D10 cross-session collision)", () => {
+      // taskOperations mints ids from a counter that restarts at 0 every
+      // activation, so an id written to workspace state in a prior session
+      // can exactly match an unrelated operation's id in this session.
+      // Simulate the worst case directly — a persisted entry whose id is
+      // identical to a genuinely live, cancellable operation right now —
+      // and confirm the restored entry still never shows a cancel action.
+      const op = taskOperations.begin("/dev/task_2", {
+        label: "Fast Forward",
+        taskName: "task_2",
+        cancellable: true,
+      });
+      assert.ok(op);
+
+      try {
+        const memento = makeMementoStub({
+          "ensemble.notifications": [
+            {
+              message: "Old run — task_1: running",
+              level: "info",
+              timestamp: new Date().toISOString(),
+              sourceOperationId: op.id,
+            },
+          ],
+        });
+
+        const restoredProvider = new StatusTreeProvider(memento);
+        // The live "op" operation itself also renders as a running node
+        // (kind: "operation") alongside the restored entry — find the entry
+        // specifically rather than assuming it's first.
+        const children = restoredProvider.getChildren() as StatusTreeNode[];
+        const entry = children.find((n) => !("kind" in n));
+        assert.ok(entry && !("kind" in entry));
+        const item = restoredProvider.getTreeItem(entry);
+        assert.notStrictEqual(
+          item.contextValue,
+          "ensemble-notification-cancellable",
+          "a notification restored from workspace state must never show a cancel action, even if its persisted id collides with a genuinely live operation"
+        );
+      } finally {
+        taskOperations.end(op);
+      }
+    });
+
+    void it("does not write sourceOperationId when persisting notification entries to workspace state (D10)", async () => {
+      const memento = makeMementoStub();
+      const op = taskOperations.begin("/dev/task_3", {
+        label: "Fast Forward",
+        taskName: "task_3",
+        cancellable: true,
+      });
+      assert.ok(op);
+
+      try {
+        const freshProvider = new StatusTreeProvider(memento);
+        freshProvider.addEntry("Fast Forward — task_3: running", "info", undefined, undefined, op.id);
+        // persist() writes through a promise chain (this.writes), not
+        // synchronously — let it flush before inspecting the memento.
+        await new Promise((r) => setImmediate(r));
+
+        const persisted = memento.get<Array<Record<string, unknown>>>("ensemble.notifications", []);
+        assert.ok(persisted.length > 0, "expected the entry to have been persisted");
+        assert.ok(
+          !Object.prototype.hasOwnProperty.call(persisted[0], "sourceOperationId"),
+          `expected no sourceOperationId key in persisted state; got: ${JSON.stringify(persisted[0])}`
+        );
       } finally {
         taskOperations.end(op);
       }

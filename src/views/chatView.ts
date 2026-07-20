@@ -141,9 +141,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
    * from the user's point of view (see chatWithStage.ts, whose stage runs
    * capture the target task before any await, so a response can complete
    * well after the user has moved on to a different task's chat).
+   *
+   * `forceOpen` overrides that guard for callers where retargeting is the
+   * explicit point of the call — e.g. a newly drafted task's blocking open
+   * questions must actually surface in Chat With AI, not just persist unseen
+   * in a transcript the user isn't looking at.
    */
-  async ask(question: StageChatQuestion): Promise<void> {
-    if (!this.target || sameIdentity(this.target, question)) {
+  async ask(question: StageChatQuestion, forceOpen = false): Promise<void> {
+    if (forceOpen || !this.target || sameIdentity(this.target, question)) {
       await this.open(question);
     }
     await this.append("question", question.question, question.stage, question, true);
@@ -311,8 +316,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           margin: 0;
         }
         #context {
-          color: var(--vscode-descriptionForeground);
-          margin: 0 0 var(--ensemble-space-2);
+          color: var(--vscode-foreground);
+          font-weight: bold;
+          font-size: 1.1em;
+          margin: 0 0 var(--ensemble-space-3);
+          padding-bottom: var(--ensemble-space-2);
+          border-bottom: var(--ensemble-border-width) solid var(--vscode-panel-border);
         }
         #messages {
           margin: 0 0 var(--ensemble-space-2);
@@ -323,8 +332,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           white-space: pre-wrap;
           overflow-wrap: anywhere;
           padding: var(--ensemble-space-2);
-          border-left: var(--ensemble-focus-width) solid var(--vscode-editorWidget-border);
-          background: var(--vscode-editor-inactiveSelectionBackground);
+          border-radius: var(--ensemble-radius);
+        }
+        /* The user's own messages: same foreground-on-background pairing as
+           the rest of the extension's text, with a foreground-colored border
+           standing in for a distinct background (so it reads correctly in
+           high-contrast themes, where a "highlight" background token can end
+           up lighter than the foreground text meant to sit on it). */
+        #messages p.msg-user {
+          color: var(--vscode-foreground);
+          background-color: var(--vscode-editor-background);
+          border: var(--ensemble-border-width) solid var(--vscode-foreground);
+        }
+        /* Agent/assistant messages: a distinct surface instead of a border,
+           so the two roles are never confused at a glance. */
+        #messages p.msg-agent {
+          color: var(--vscode-editor-foreground);
+          background-color: var(--vscode-sideBar-background);
+          border: none;
         }
         .spinner {
           display: inline-block;
@@ -400,7 +425,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       <div id="busy-indicator" role="status" aria-live="polite"><span class="spinner"></span>Waiting for the AI…</div>
       <form id="form"><textarea id="message" rows="3" aria-label="Message the AI" placeholder="Message the AI… (Ctrl+Enter to send)"></textarea><button type="submit">Send</button></form>
       <script nonce="${nonce}">const v=acquireVsCodeApi(), c=document.getElementById('context'), m=document.getElementById('messages'), e=document.getElementById('error'), b=document.getElementById('busy-indicator'), f=document.getElementById('form'), i=document.getElementById('message');
-      window.addEventListener('message', event=>{const s=event.data;if(s.type!=='state')return;c.textContent=s.label??'Open a workspace folder to start chatting with the AI.';m.replaceChildren(...s.entries.map(x=>{const d=document.createElement('p');d.textContent='['+x.role+(x.pending?' — awaiting your answer':'')+'] '+x.text;return d;}));e.textContent=s.errorMessage??'';e.style.display=s.errorMessage?'block':'none';b.style.display=s.busy?'block':'none';});
+      window.addEventListener('message', event=>{const s=event.data;if(s.type!=='state')return;c.textContent=s.label??'Open a workspace folder to start chatting with the AI.';m.replaceChildren(...s.entries.map(x=>{const d=document.createElement('p');d.className=x.role==='user'?'msg-user':'msg-agent';d.textContent='['+x.role+(x.pending?' — awaiting your answer':'')+'] '+x.text;return d;}));e.textContent=s.errorMessage??'';e.style.display=s.errorMessage?'block':'none';b.style.display=s.busy?'block':'none';});
       f.addEventListener('submit',e=>{e.preventDefault();v.postMessage({type:'send',text:i.value});i.value='';});
       i.addEventListener('keydown',e=>{if(e.key==='Enter'&&e.ctrlKey){e.preventDefault();f.requestSubmit();}else if(e.key==='Escape'){i.blur();}});</script>
     </body></html>`;

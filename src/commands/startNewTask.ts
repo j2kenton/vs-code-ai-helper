@@ -1,18 +1,19 @@
 import * as vscode from "vscode";
 import * as path from "path";
-import { TASK_FILENAME } from "../types/taskProgress";
+import { TASK_FILENAME, TaskStatus } from "../types/taskProgress";
 import {
   createTaskProgress,
   readTaskProgress,
   writeTaskProgress,
 } from "../utils/taskProgressUtils";
-import { resolveTaskRootForCreation } from "../utils/taskRoot";
+import { getConfiguredTaskRoot, normalizePath, resolveTaskRootForCreation } from "../utils/taskRoot";
 import { TaskInventory } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
-import { withMetaRootLock } from "../state/taskStateStore";
+import { withMetaRootLock, withAllMetaRootsLock } from "../state/taskStateStore";
 import { safeOpenTextDocument } from "../utils/fileUtils";
 import { runTrackedOperation } from "../utils/taskOperations";
 import { ensureAutomaticMetaGitIgnore } from "./toggleMetaResourcesGitIgnore";
+import { NotificationRouter } from "../utils/notificationRouter";
 
 /**
  * Format a date as YYYY-MM-DD
@@ -91,6 +92,75 @@ export async function recoverTaskCreations(metaFolderPath: string): Promise<void
 }
 
 /**
+ * Every workspace folder's CONFIGURED meta root (never the legacy fallback
+ * roots `resolveTaskRootCandidates` also discovers for backward-compat task
+ * discovery — those aren't valid creation targets and, worse, several of
+ * them share a lock-file parent directory with the configured root, so
+ * treating them as independent lockable roots caused the two to collide on
+ * the same on-disk session lock and fail with "Another Ensemble session").
+ * A relative configured root resolves to one path per workspace folder, so a
+ * multi-root workspace can have several distinct meta roots reachable from
+ * this window; an absolute configured root is shared by every folder and
+ * resolves to exactly one.
+ *
+ * "No task is active" must be decided against ALL of these, not just the
+ * target root — an active task in a sibling workspace folder's meta root is
+ * still the task shortcuts and in-flight operations should keep targeting.
+ * This is a best-effort BROADER check, not an additional lock scope: only
+ * the target root (`primaryMetaFolderPath`, via the caller's existing
+ * `withMetaRootLock`) is locked, matching the same "lock the target, scan
+ * the rest" precedent `taskActivationCoordinator.ts`'s `activateTaskLocked`
+ * already uses when pausing other active tasks across the whole inventory.
+ */
+function allMetaRootPaths(primaryMetaFolderPath: string): string[] {
+  const configuredRoot = getConfiguredTaskRoot();
+  const paths = new Set<string>();
+  paths.add(normalizePath(primaryMetaFolderPath));
+  if (path.isAbsolute(configuredRoot)) {
+    paths.add(normalizePath(configuredRoot));
+  } else {
+    for (const ws of vscode.workspace.workspaceFolders ?? []) {
+      paths.add(normalizePath(path.join(ws.uri.fsPath, configuredRoot)));
+    }
+  }
+  return Array.from(paths);
+}
+
+/**
+ * Fresh from-disk scan for any task whose persisted status is "active",
+ * across every meta root in `metaFolderPaths`. Deliberately re-reads every
+ * task-progress.json rather than consulting TaskInventory's cached state —
+ * the inventory can be stale relative to another window's concurrent write.
+ * The PRIMARY root (metaFolderPaths[0] by convention — see allMetaRootPaths)
+ * is scanned under the caller's `withMetaRootLock`, so staleness there is
+ * fully excluded; the other, sibling-workspace-folder roots are scanned
+ * best-effort without an additional lock (seeSee allMetaRootPaths's doc
+ * comment for why this scope is intentional), so a wholly independent
+ * concurrent creation under a DIFFERENT meta root is a narrow, pre-existing-
+ * style race window rather than one this check newly closes.
+ */
+async function hasActiveTaskOnDisk(metaFolderPaths: readonly string[]): Promise<boolean> {
+  for (const metaFolderPath of metaFolderPaths) {
+    const root = vscode.Uri.file(metaFolderPath);
+    let entries: [string, vscode.FileType][];
+    try {
+      entries = await vscode.workspace.fs.readDirectory(root);
+    } catch {
+      continue;
+    }
+
+    for (const [name, type] of entries) {
+      if (type !== vscode.FileType.Directory) continue;
+      const progress = await readTaskProgress(vscode.Uri.joinPath(root, name));
+      if (progress?.status === "active") {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
  * Load the task template from the bundled template file.
  */
 async function loadTaskTemplate(extensionUri: vscode.Uri): Promise<string> {
@@ -115,8 +185,11 @@ async function loadTaskTemplate(extensionUri: vscode.Uri): Promise<string> {
  * opens an almost-blank task.md for the user to describe the work. No input
  * popup or plan-generation prompt is shown.
  *
- * New tasks deliberately start paused. Creating one must never replace the
- * current task or mutate another task's lifecycle while it is running.
+ * A new task starts active (and becomes the current task) only when no task
+ * under this meta root is already active; otherwise it starts paused,
+ * leaving the existing active task as the target of shortcuts and in-flight
+ * operations. Creating one must never mutate another task's lifecycle while
+ * it is running.
  *
  * Returns the created folder name, or undefined if cancelled/failed.
  */
@@ -164,7 +237,7 @@ export async function startNewTask(
 async function createTask(
   inventory: TaskInventory,
   extensionUri: vscode.Uri,
-  _currentTaskStore: CurrentTaskStore,
+  currentTaskStore: CurrentTaskStore,
   workspaceRoot: vscode.WorkspaceFolder,
   op: { report(detail: string | undefined): void },
   context?: vscode.ExtensionContext
@@ -175,9 +248,22 @@ async function createTask(
   // The meta-root lease is shared across extension hosts. Folder-number
   // discovery, directory creation, and the initial files must be one
   // operation: otherwise two VS Code windows can both choose task_2 and
-  // overwrite each other's seed files.
-  const created = await withMetaRootLock(metaFolderPath, async () => {
+  // overwrite each other's seed files. All meta roots reachable from this
+  // window are locked together (see withAllMetaRootsLock) so the "no active
+  // task exists anywhere" check below can't race a concurrent creation or
+  // activation under a sibling workspace folder's meta root.
+  const metaFolderPaths = allMetaRootPaths(metaFolderPath);
+  const created = await withAllMetaRootsLock(metaFolderPaths, async () => {
     await recoverCompletedTaskCreations(metaFolderPath);
+    // A new task starts active only when no other task under ANY meta root
+    // reachable from this window already is — an existing active task must
+    // remain the target of shortcuts and in-flight operations. The disk scan
+    // and this task's status write happen in the same locked section, so two
+    // windows can never both see "nothing active" and both create an active
+    // task.
+    const initialStatus: TaskStatus = (await hasActiveTaskOnDisk(metaFolderPaths))
+      ? "paused"
+      : "active";
     const dateStr = formatDate(new Date());
     const taskNumber = await getNextTaskNumber(metaFolderPath, dateStr);
     const taskFolderName = `${dateStr}_task_${taskNumber}`;
@@ -210,10 +296,10 @@ async function createTask(
       taskFileUri,
       new TextEncoder().encode(taskTemplate)
     );
-    await writeTaskProgress(taskFolderUri, { ...progress, status: "paused" });
-    return { taskFolderName, taskFolderPath, taskFileUri };
+    await writeTaskProgress(taskFolderUri, { ...progress, status: initialStatus });
+    return { taskFolderName, taskFolderPath, taskFileUri, initialStatus };
   });
-  const { taskFolderName, taskFolderPath, taskFileUri } = created;
+  const { taskFolderName, taskFolderPath, taskFileUri, initialStatus } = created;
 
   // Activation only runs Git-ignore maintenance when the inventory already
   // holds tasks, so the very first creation in a fresh workspace must apply
@@ -233,18 +319,25 @@ async function createTask(
   // Refresh inventory so the new task is discoverable
   await inventory.refresh();
 
-  // Do not activate this task: an existing active task remains the target of
-  // shortcuts and in-flight operations. The explicit argument is essential;
-  // a bare resume command would instead resume the older current task.
-  void vscode.window.showInformationMessage(
-    "Task created in paused state.",
-    "Resume"
-  ).then((choice) => {
-    if (choice === "Resume") {
-      return vscode.commands.executeCommand("vs-code-ai-helper.resumeTask", { taskFolderPath });
-    }
-    return undefined;
-  });
+  if (initialStatus === "active") {
+    // No other task under this meta root was active, so this one becomes the
+    // target of shortcuts and in-flight operations immediately.
+    await currentTaskStore.set(normalizePath(taskFolderPath));
+    NotificationRouter.showInformation(`${taskFolderName} created and set as the active task.`);
+  } else {
+    // An existing active task remains the target of shortcuts and in-flight
+    // operations. The explicit argument is essential; a bare resume command
+    // would instead resume the older current task.
+    void vscode.window.showInformationMessage(
+      "Task created in paused state.",
+      "Resume"
+    ).then((choice) => {
+      if (choice === "Resume") {
+        return vscode.commands.executeCommand("vs-code-ai-helper.resumeTask", { taskFolderPath });
+      }
+      return undefined;
+    });
+  }
 
   // Surface the new folder name on the operation row (and in its terminal
   // Notifications entry via the bridge).

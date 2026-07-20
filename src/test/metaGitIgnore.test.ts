@@ -112,7 +112,7 @@ function makeContext(): { context: vscode.ExtensionContext; state: Map<string, u
 function readPackageJson(): {
   contributes?: {
     commands?: Array<{ command: string; title: string }>;
-    keybindings?: Array<{ command: string; key: string; mac?: string }>;
+    keybindings?: Array<{ command: string; key: string; mac?: string; when?: string }>;
     menus?: { "view/title"?: Array<{ command: string; when?: string }> };
   };
 } {
@@ -121,7 +121,7 @@ function readPackageJson(): {
   ) as {
     contributes?: {
       commands?: Array<{ command: string; title: string }>;
-      keybindings?: Array<{ command: string; key: string; mac?: string }>;
+      keybindings?: Array<{ command: string; key: string; mac?: string; when?: string }>;
       menus?: { "view/title"?: Array<{ command: string; when?: string }> };
     };
   };
@@ -294,7 +294,10 @@ void describe("managed meta gitignore block", () => {
     );
   });
 
-  void it("keeps transcript patterns present when hiding (persistentPatterns merged with root patterns)", () => {
+  void it("drops persistent transcript patterns already covered by a root pattern when hiding (no redundant nested entry)", () => {
+    // Regression coverage for a review finding: /plans/**/chat-v1.json is
+    // already ignored by /plans/ itself once the whole folder is hidden —
+    // keeping both was confusing, redundant clutter in .gitignore.
     const content = applyManagedMetaGitIgnoreBlock(
       "",
       ["/plans/"],
@@ -302,9 +305,20 @@ void describe("managed meta gitignore block", () => {
       { persistentPatterns: ["/plans/**/chat-v1.json", "/plans/**/chat-v1.corrupt.json"] }
     );
 
-    assert.match(content, /\/plans\/\*\*\/chat-v1\.json/);
-    assert.match(content, /\/plans\/\*\*\/chat-v1\.corrupt\.json/);
+    assert.doesNotMatch(content, /chat-v1/);
     assert.match(content, /\/plans\//);
+  });
+
+  void it("keeps a persistent transcript pattern when hiding if no root pattern already covers it", () => {
+    const content = applyManagedMetaGitIgnoreBlock(
+      "",
+      ["/artifacts/helper/"],
+      true,
+      { persistentPatterns: ["/plans/**/chat-v1.json"] }
+    );
+
+    assert.match(content, /\/plans\/\*\*\/chat-v1\.json/, "an uncovered persistent pattern must still be written");
+    assert.match(content, /\/artifacts\/helper\//);
   });
 
   void it("replaces the block with a transcripts-only block on show, instead of removing it (Option A)", () => {
@@ -393,6 +407,27 @@ void describe("meta gitignore command contributions", () => {
     });
   });
 
+  void it("binds the open-task shortcut to Ctrl+Shift+O, scoped outside editor focus so it never shadows Go to Symbol", () => {
+    const keybindings = readPackageJson().contributes?.keybindings ?? [];
+    const bindingFor = (command: string) =>
+      keybindings.find((binding) => binding.command === command);
+
+    assert.deepEqual(bindingFor("vs-code-ai-helper.openAndStartNewTask"), {
+      command: "vs-code-ai-helper.openAndStartNewTask",
+      key: "ctrl+shift+o",
+      mac: "cmd+shift+o",
+      when: "!editorTextFocus",
+    });
+
+    // "N" is reserved for Next Stage — the open-task binding must never
+    // reuse it, and must not collide with any other contributed shortcut.
+    const openTaskKey = bindingFor("vs-code-ai-helper.openAndStartNewTask")?.key;
+    const collisions = keybindings.filter(
+      (binding) => binding.command !== "vs-code-ai-helper.openAndStartNewTask" && binding.key === openTaskKey
+    );
+    assert.deepEqual(collisions, [], `Ctrl+Shift+O must not collide with another contributed shortcut: ${JSON.stringify(collisions)}`);
+  });
+
   void it("keeps the removed hide/show/toggle commands out of the command manifest", () => {
     // Git-ignore handling is fully automatic now (ensureAutomaticMetaGitIgnore);
     // the manual hide/show/toggle command pathway was removed outright, so the
@@ -441,8 +476,10 @@ void describe("automatic managed .gitignore maintenance", () => {
       const written = fs.readFileSync(path.join(repoRoot, ".gitignore"), "utf8");
       assert.match(written, /# BEGIN Ensemble managed meta resources/);
       assert.match(written, /\/\.ensemble\//);
-      assert.match(written, /\/\.ensemble\/\*\*\/chat-v1\.json/);
-      assert.match(written, /\/\.ensemble\/\*\*\/chat-v1\.corrupt\.json/);
+      // The transcript-specific patterns are redundant once /.ensemble/
+      // itself is ignored (it already covers everything beneath it) and
+      // must not be written alongside it.
+      assert.doesNotMatch(written, /chat-v1/);
       assert.deepEqual(
         state.get("ensemble.autoGitIgnoreApplied"),
         { [gateKeyFor(repoRoot)]: ".ensemble" },

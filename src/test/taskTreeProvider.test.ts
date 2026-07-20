@@ -430,7 +430,9 @@ void describe("draftTaskWithAI.parseTaskDocument", () => {
   void it('should parse a new-style task.md with all three sections', () => {
     const shortcutNote = `Shortcut: Apply Current Stage Action${shortcutHint("vs-code-ai-helper.applyCurrentStageAction")}.`;
     const content = [
-      "Briefly describe what changes you want to be made, and then use AI to help you clarify the plan.",
+      "Describe the work you want to do here in as much detail as is useful. When",
+      "you're ready, use **Draft with AI** to turn these notes into a structured task",
+      "description. Questions from the stage AI appear in the **Chat With AI** panel.",
       "",
       shortcutNote,
       "",
@@ -449,7 +451,7 @@ void describe("draftTaskWithAI.parseTaskDocument", () => {
     ].join("\n");
 
     const parsed = parseTaskDocument(content);
-    assert.ok(parsed.introText.includes("Briefly describe"));
+    assert.ok(parsed.introText.includes("Describe the work you want to do here"));
     assert.ok(parsed.introText.includes("Shortcut:"));
     assert.strictEqual(parsed.taskDescription, "Add dark mode support.");
     assert.strictEqual(parsed.draftWithAI, "This task involves...");

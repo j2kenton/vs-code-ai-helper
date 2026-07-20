@@ -18,10 +18,18 @@ class Uri {
     this.fsPath = fsPath;
     this.scheme = "file";
     this.path = fsPath.split(path.sep).join("/");
+    this.authority = "";
+    this.query = "";
+    this.fragment = "";
   }
 
   toString() {
-    return this.scheme === "file" ? `file://${this.path}` : `${this.scheme}:${this.path}`;
+    if (this.scheme === "file") {
+      return `file://${this.path}`;
+    }
+    const query = this.query ? `?${this.query}` : "";
+    const fragment = this.fragment ? `#${this.fragment}` : "";
+    return `${this.scheme}:${this.path}${query}${fragment}`;
   }
 
   static file(fsPath) {
@@ -29,15 +37,18 @@ class Uri {
   }
 
   static parse(value) {
-    // Support non-file URIs by preserving scheme and authority
+    // Support non-file URIs by preserving scheme, path, and query.
     if (!value.startsWith("file://")) {
       const colonIdx = value.indexOf(":");
       if (colonIdx !== -1) {
         const scheme = value.slice(0, colonIdx);
         const rest = value.slice(colonIdx + 1);
-        const u = new Uri(rest);
+        const [pathPart, queryAndFragment = ""] = rest.split("?");
+        const [query = ""] = queryAndFragment.split("#");
+        const u = new Uri(pathPart);
         u.scheme = scheme;
-        u.path = rest;
+        u.path = pathPart;
+        u.query = query;
         return u;
       }
     }
@@ -50,6 +61,17 @@ class Uri {
 
   static joinPath(base, ...segments) {
     return new Uri(path.join(base.fsPath, ...segments));
+  }
+
+  /** Minimal stand-in for vscode.Uri.from({ scheme, authority, path, query, fragment }). */
+  static from(components) {
+    const u = new Uri(components.path ?? "");
+    u.scheme = components.scheme ?? "file";
+    u.path = components.path ?? "";
+    u.authority = components.authority ?? "";
+    u.query = components.query ?? "";
+    u.fragment = components.fragment ?? "";
+    return u;
   }
 }
 

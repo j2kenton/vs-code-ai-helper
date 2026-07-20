@@ -1,5 +1,24 @@
 export interface StatusSurface {
-  addEntry(message: string, level: "info" | "warning" | "error", filePath?: string): void;
+  /**
+   * `resultTargetUri` is a stringified vscode.Uri (parse with
+   * vscode.Uri.parse()) pointing at the operation's result artifact/run log,
+   * distinct from the legacy `filePath` (a bare fsPath, opened with
+   * vscode.Uri.file()). Never conflate the two.
+   *
+   * `sourceOperationId` is the id of the taskOperations root operation this
+   * entry is about, when known. The surface only shows an inline cancel
+   * action for it when that id still resolves to a currently live,
+   * cancellable root operation — a terminal/history entry for an already-
+   * ended operation renders with no cancel affordance.
+   */
+  addEntry(
+    message: string,
+    level: "info" | "warning" | "error",
+    filePath?: string,
+    resultTargetUri?: string,
+    sourceOperationId?: string,
+    actionCommand?: { command: string; title: string; args?: unknown[] }
+  ): void;
 }
 
 let activeStatusSurface: StatusSurface | undefined = undefined;
@@ -38,33 +57,47 @@ export const NotificationRouter = {
    * Route routine informational message.
    * NOTE: Routine notices must never raise an OS toast (desktop notification).
    */
-  showInformation(message: string, filePath?: string): void {
+  showInformation(message: string, filePath?: string, resultTargetUri?: string, sourceOperationId?: string): void {
     const surface = checkInitialized();
-    surface.addEntry(message, "info", filePath);
+    surface.addEntry(message, "info", filePath, resultTargetUri, sourceOperationId);
   },
 
   /**
    * Route routine warning message.
    * NOTE: Routine warning notices must never raise an OS toast (desktop notification).
    */
-  showWarning(message: string, filePath?: string): void {
+  showWarning(
+    message: string,
+    filePath?: string,
+    resultTargetUri?: string,
+    sourceOperationId?: string,
+    actionCommand?: { command: string; title: string; args?: unknown[] }
+  ): void {
     const surface = checkInitialized();
-    surface.addEntry(message, "warning", filePath);
+    surface.addEntry(message, "warning", filePath, resultTargetUri, sourceOperationId, actionCommand);
   },
 
   /**
    * Route routine error message.
    */
-  showError(message: string, filePath?: string): void {
+  showError(message: string, filePath?: string, resultTargetUri?: string, sourceOperationId?: string): void {
     const surface = checkInitialized();
-    surface.addEntry(message, "error", filePath);
+    surface.addEntry(message, "error", filePath, resultTargetUri, sourceOperationId);
   },
 
   /**
    * Route concise status summary (e.g. from progress notifications).
+   *
+   * `sourceOperationId` should be the LIVE root taskOperations id (e.g. from
+   * `taskOperations.rootOperationIdFor(taskPath)`), passed at call time while
+   * the operation is still running. Unlike the terminal bridge (which stamps
+   * an id only after the operation has already ended), this lets the
+   * in-progress Notifications row resolve to a currently-live, cancellable
+   * root operation and expose a working cancel action while work is still
+   * underway.
    */
-  emitProgressSummary(message: string): void {
+  emitProgressSummary(message: string, sourceOperationId?: string): void {
     const surface = checkInitialized();
-    surface.addEntry(message, "info");
+    surface.addEntry(message, "info", undefined, undefined, sourceOperationId);
   }
 };

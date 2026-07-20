@@ -99,8 +99,7 @@ function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
 
 void describe("commitAndPushTask duplicate-invocation guard", () => {
   void it("refuses a second invocation that arrives while the first is mid-lint, with no duplicate lint run", async () => {
-    const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-commit-push-guard-"));
-    fs.mkdirSync(path.join(repoRoot, "plans", "task_1"), { recursive: true });
+    const repoRoot = makeGitFixtureWithRemote();
     const taskFolderPath = path.join(repoRoot, "plans", "task_1");
     const canonicalId = taskFolderPath;
     const inventory = installFakeInventory(taskFolderPath, canonicalId);
@@ -124,24 +123,33 @@ void describe("commitAndPushTask duplicate-invocation guard", () => {
       return { passed: false, summary: "stub failure", runAt: new Date().toISOString(), issueCount: 1, failedChecks: [] };
     };
     // The lint-failure modal (reached once lintGate resolves) — resolve to
-    // "Cancel" so the first invocation exits cleanly without needing a real
-    // git repository.
+    // "Cancel" so the first invocation exits cleanly.
     vscode.window.showWarningMessage = (() => Promise.resolve("Cancel")) as unknown as typeof vscode.window.showWarningMessage;
     vscode.window.showErrorMessage = (() => Promise.resolve(undefined)) as unknown as typeof vscode.window.showErrorMessage;
 
     try {
       const firstCall = commitAndPushTask(inventory, { canonicalId });
-      // Let the first call reach and enter the mocked lint before firing the second.
+      // Let the first call proceed far enough to acquire the exclusive
+      // operation lock (past resolveTaskContext) before firing the second —
+      // the lock is what refuses the duplicate, not lint having started yet.
       await new Promise((r) => setImmediate(r));
 
       const secondCall = commitAndPushTask(inventory, { canonicalId });
       await secondCall;
 
-      assert.equal(lintCallCount, 1, "lint must not run a second time for the duplicate invocation");
       assert.ok(
         surface.entries.some((e) => /already in progress/.test(e.message)),
         `expected a busy warning; got: ${JSON.stringify(surface.entries)}`
       );
+
+      // The first call still has real git-readiness checks (child processes)
+      // to run before it reaches the mocked lint — poll rather than assume a
+      // single tick is enough, mirroring the confirmation-modal test below.
+      const deadline = Date.now() + 10_000;
+      while (lintCallCount === 0 && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      assert.equal(lintCallCount, 1, "lint must not run a second time for the duplicate invocation");
 
       lintGate.resolve();
       await firstCall;

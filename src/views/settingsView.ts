@@ -765,13 +765,16 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         </div>
 
         <div class="btn-container" id="model-settings-buttons" hidden>
-          <button id="reset-btn" class="secondary">Reset to Defaults</button>
-          <button id="save-btn" disabled>Save Settings</button>
+          <button id="discard-btn" class="secondary" disabled>Discard Unsaved Changes</button>
+          <button id="save-btn" disabled>Save Model Selection</button>
         </div>
 
         <script nonce="${nonce}">
           const vscode = acquireVsCodeApi();
           let currentSettings = {};
+          // The last-saved (persisted) settings snapshot, used by Discard
+          // Unsaved Changes to revert the form without wiping it to empty.
+          let savedSettings = {};
           let availableModels = [];
           let stagesList = [];
           let stageDisplayNames = {};
@@ -785,6 +788,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
 
           function updateSaveButtonState() {
             document.getElementById('save-btn').disabled = !formDirty;
+            document.getElementById('discard-btn').disabled = !formDirty;
           }
 
           function markDirty() {
@@ -880,6 +884,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                 }
               }
               currentSettings = message.settings || {};
+              // Snapshot BEFORE any draft restoration below, which may
+              // overwrite currentSettings with unsaved edits — the discard
+              // target must always be what is actually persisted on disk.
+              savedSettings = JSON.parse(JSON.stringify(currentSettings));
               availableModels = message.models || [];
               stagesList = message.stages || [];
               stageDisplayNames = message.stageNames || {};
@@ -905,7 +913,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               if (restoredDraft) {
                 const note = document.createElement('div');
                 note.className = 'restored-note';
-                note.textContent = 'Restored unsaved changes from your previous session. Click Save Settings to apply them.';
+                note.textContent = 'Restored unsaved changes from your previous session. Click Save Model Selection to apply them.';
                 const container = document.getElementById('restored-note-container');
                 container.innerHTML = '';
                 container.appendChild(note);
@@ -1195,7 +1203,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             item.className = 'extra-backup';
             item.innerHTML =
               modelComboboxHtml(kind, stage, selectedId || '', false) +
-              '<button type="button" class="remove-backup" aria-label="Remove backup">×</button>';
+              '<button type="button" class="secondary remove-backup" aria-label="Remove backup">×</button>';
             item.querySelector('.remove-backup').addEventListener('click', () => {
               item.remove();
               syncBackupLimitFor(row);
@@ -1230,7 +1238,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                 '</div>'
               ).join('') +
               '<p class="provider-help">Enabled providers determine which models are offered below. Sign-in and usage checks run in a visible terminal; the extension reports them as launched, not as succeeded.</p>' +
-              '<div class="btn-container"><button id="save-providers-btn" class="secondary">Save Provider Selection</button></div>' +
+              '<div class="btn-container"><button id="save-providers-btn">Save Provider Selection</button></div>' +
               '</fieldset>';
             container.querySelectorAll('[data-signin-provider]').forEach(button => {
               button.addEventListener('click', () => {
@@ -1288,7 +1296,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                   \${modelComboboxHtml('backup', stage, backupModels[0] || '', false)}
                   \${backupQuotaText}
                   <div class="extra-backups"></div>
-                  <button type="button" class="add-backup">+ Add another backup</button>
+                  <button type="button" class="secondary add-backup">+ Add another backup</button>
                   <span class="backup-limit">1/10</span>
                 </div>
               \`;
@@ -1362,6 +1370,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               settings: collected.settings
             });
 
+            // The discard target is whatever was just saved, not what was
+            // loaded at the start of this session.
+            savedSettings = JSON.parse(JSON.stringify(collected.settings));
             document.getElementById('status-region').innerText = 'Settings saved successfully.';
             document.getElementById('restored-note-container').innerHTML = '';
             clearDirty();
@@ -1399,18 +1410,18 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             });
           }
 
-          document.getElementById('reset-btn').addEventListener('click', async () => {
-            // Reset repopulates the form with empty settings. It always asks
-            // for confirmation (it discards the current selections, saved or
-            // not); nothing is persisted until Save Settings is clicked.
+          document.getElementById('discard-btn').addEventListener('click', async () => {
+            // Reverts the form to the last-saved model settings (not to
+            // empty — there is no "default" to reset to). Always asks for
+            // confirmation, since it discards whatever is currently unsaved.
             const proceed = await confirmDestructiveAction(
-              'Are you sure you want to reset all model settings to their defaults? Your current selections will be cleared (nothing is saved until you click Save Settings).',
-              'Reset to Defaults'
+              'Discard your unsaved model-selection changes? They will be reverted to the last saved settings.',
+              'Discard Unsaved Changes'
             );
             if (!proceed) return;
-            currentSettings = {};
+            currentSettings = JSON.parse(JSON.stringify(savedSettings));
             renderTable();
-            markDirty();
+            clearDirty();
           });
         </script>
       </body>

@@ -3,6 +3,7 @@ import { StatusSurface } from "../utils/notificationRouter";
 import { taskOperations } from "../utils/taskOperations";
 import { TaskOperationSnapshot } from "../utils/taskOperations";
 import { terminalEntryFor } from "../utils/operationNotificationBridge";
+import { notificationFallbackUri } from "../utils/notificationContentProvider";
 
 export const STATUS_VIEW_ID = "vs-code-ai-helper.statusView";
 
@@ -12,6 +13,31 @@ export interface StatusEntry {
   timestamp: Date;
   /** Absolute fsPath of the file this notification relates to, if any. Clicking the entry opens it. */
   filePath?: string;
+  /**
+   * Stringified vscode.Uri (vscode.Uri.parse() it, never vscode.Uri.file())
+   * of the operation's result artifact/run log, when known. Distinct from
+   * `filePath` — see TaskOperationSnapshot.resultTargetUri. Takes over the
+   * click-to-open behavior only when `filePath` is absent.
+   */
+  resultTargetUri?: string;
+  /**
+   * Id of the taskOperations root operation this entry is about, when known.
+   * Only used to conditionally show an inline cancel action (D10) when the
+   * id still resolves to a currently live, cancellable root operation — see
+   * getTreeItem. A terminal/history entry for an already-ended operation
+   * never shows a cancel action.
+   */
+  sourceOperationId?: string;
+  /**
+   * An actionable follow-up command for notifications that report a skipped
+   * automatic action the user can still trigger manually (e.g. "Auto-publish
+   * skipped: publish manually once checks pass"). When present, it is
+   * exposed as a separate inline action (see D11 below) alongside — not
+   * instead of — the usual open-file/open-result/fallback-document click
+   * behavior, so a prose-only warning still gives the user something to act
+   * on directly from the Notifications list.
+   */
+  actionCommand?: { command: string; title: string; args?: unknown[] };
 }
 
 export interface StatusOperationNode {
@@ -60,9 +86,13 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
     const persisted = state?.get<Array<Omit<StatusEntry, "timestamp"> & { timestamp: string }>>(STATUS_STATE_KEY, []) ?? [];
     // Notifications persist for the lifetime of this workspace with no
     // retention limit — the user only clears them explicitly via Clear All.
+    // sourceOperationId is stripped on load too, not just in persist() below
+    // — state written by a version before that fix can still carry one on
+    // disk, and loading it verbatim would reintroduce the same cross-session
+    // id collision (D10) this fix exists to close.
     this.entries = persisted
       .filter(entry => typeof entry.message === "string" && typeof entry.timestamp === "string")
-      .map(entry => ({ ...entry, timestamp: new Date(entry.timestamp) }))
+      .map(({ sourceOperationId: _sourceOperationId, ...entry }) => ({ ...entry, timestamp: new Date(entry.timestamp) }))
       .filter(entry => !Number.isNaN(entry.timestamp.getTime()));
 
     // Operations themselves are necessarily in-memory, but a tiny snapshot
@@ -100,7 +130,14 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
    * Add a new status entry to the surface.
    * Entries persist indefinitely (no retention cap); the user clears them via Clear All.
    */
-  addEntry(message: string, level: "info" | "warning" | "error", filePath?: string): void {
+  addEntry(
+    message: string,
+    level: "info" | "warning" | "error",
+    filePath?: string,
+    resultTargetUri?: string,
+    sourceOperationId?: string,
+    actionCommand?: { command: string; title: string; args?: unknown[] }
+  ): void {
     const entry: StatusEntry = {
       // Keep the complete process/result text. The tree label is compacted
       // separately, while the persisted entry remains useful after reload.
@@ -108,6 +145,9 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
       level,
       timestamp: new Date(),
       filePath,
+      resultTargetUri,
+      sourceOperationId,
+      actionCommand,
     };
 
     // Insert newest first
@@ -159,7 +199,18 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
 
   private persist(): void {
     if (!this.state) return;
-    const serialized = this.entries.map(entry => ({ ...entry, timestamp: entry.timestamp.toISOString() }));
+    // sourceOperationId is deliberately dropped here: taskOperations mints
+    // ids from a counter that restarts at 0 every activation, so an id
+    // persisted from a prior session can collide with an unrelated live
+    // operation's id in a later session — surfacing a cancel button on a
+    // stale entry that would abort the wrong, currently-running operation
+    // (D10). serializeOperation and the interrupted-restore path below
+    // already omit it for the same reason; this is the remaining path that
+    // wrote it to disk.
+    const serialized = this.entries.map(({ sourceOperationId: _sourceOperationId, ...rest }) => ({
+      ...rest,
+      timestamp: rest.timestamp.toISOString(),
+    }));
     this.writes = this.writes.then(() => this.state!.update(STATUS_STATE_KEY, serialized));
     void this.writes.catch(() => undefined);
   }
@@ -200,6 +251,11 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
 
     item.description = timeStr;
 
+    // Click still always navigates to the notification's full text/target
+    // (D11) — `actionCommand`, when present, is exposed as a separate inline
+    // context-menu button (see contextValue below) rather than hijacking the
+    // row click, so users can still read the full notification before
+    // deciding whether to act on it.
     if (element.filePath) {
       item.command = {
         command: "vscode.open",
@@ -209,9 +265,33 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
       item.tooltip = new vscode.MarkdownString(
         `**[${element.level.toUpperCase()}]** ${element.message}\n\nTime: ${element.timestamp.toLocaleString()}\n\nClick to open the related file.`
       );
+    } else if (element.resultTargetUri) {
+      let targetUri: vscode.Uri | undefined;
+      try {
+        targetUri = vscode.Uri.parse(element.resultTargetUri, true);
+      } catch {
+        targetUri = undefined;
+      }
+      if (targetUri) {
+        item.command = {
+          command: "vscode.open",
+          title: "Open Result",
+          arguments: [targetUri],
+        };
+        item.tooltip = new vscode.MarkdownString(
+          `**[${element.level.toUpperCase()}]** ${element.message}\n\nTime: ${element.timestamp.toLocaleString()}\n\nClick to open the result.`
+        );
+      } else {
+        item.tooltip = `[${element.level.toUpperCase()}] ${element.message}\n\nTime: ${element.timestamp.toLocaleString()}`;
+      }
     } else {
-      // Plain (non-Markdown, non-clickable-looking) tooltip when there's
-      // nothing for a click to navigate to.
+      // Nothing real to navigate to — open a read-only virtual document with
+      // the full notification text rather than leaving the row unclickable.
+      item.command = {
+        command: "vscode.open",
+        title: "Show Full Notification",
+        arguments: [notificationFallbackUri(element.message, element.level, element.timestamp)],
+      };
       item.tooltip = `[${element.level.toUpperCase()}] ${element.message}\n\nTime: ${element.timestamp.toLocaleString()}`;
     }
 
@@ -227,7 +307,48 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
     }
 
     item.iconPath = new vscode.ThemeIcon(iconName, new vscode.ThemeColor(iconColor));
+
+    // contextValue is a space-separated token list so an entry can expose
+    // both the cancel affordance (D10) and the actionable follow-up button
+    // at the same time; `when` clauses match individual tokens with `=~`.
+    const contextTokens: string[] = [];
+
+    // D10: a history/terminal entry gets the inline cancel action only when
+    // its recorded operation id still resolves to a currently live,
+    // cancellable root operation. Terminal, stale, and unknown ids
+    // intentionally render with no cancel affordance.
+    if (element.sourceOperationId && this.isLiveCancellableOperation(element.sourceOperationId)) {
+      contextTokens.push("ensemble-notification-cancellable");
+    }
+
+    // A concrete follow-up (e.g. "Publish Anyway") is exposed as a separate
+    // inline button, never as the row's click target — the click always
+    // navigates to the notification's full text/target above.
+    if (element.actionCommand) {
+      contextTokens.push("ensemble-notification-actionable");
+      const actionTitle = element.actionCommand.title;
+      const baseTooltip = item.tooltip instanceof vscode.MarkdownString
+        ? item.tooltip.value
+        : item.tooltip ?? `[${element.level.toUpperCase()}] ${element.message}`;
+      item.tooltip = new vscode.MarkdownString(`${baseTooltip}\n\nAction available: ${actionTitle}.`);
+    }
+
+    if (contextTokens.length > 0) {
+      item.contextValue = contextTokens.join(" ");
+    }
     return item;
+  }
+
+  runAction(element: StatusTreeNode): void {
+    if (isOperationNode(element) || !element.actionCommand) return;
+    const { command, args } = element.actionCommand;
+    void vscode.commands.executeCommand(command, ...(args ?? []));
+  }
+
+  private isLiveCancellableOperation(operationId: string): boolean {
+    return taskOperations
+      .getRootOperations()
+      .some((op) => op.id === operationId && op.state === "running" && op.cancellable);
   }
 
   getChildren(element?: StatusTreeNode): vscode.ProviderResult<StatusTreeNode[]> {

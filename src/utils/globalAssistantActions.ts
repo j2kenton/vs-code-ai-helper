@@ -14,7 +14,7 @@ import { writeRunLog } from "./runLog";
 import { cancelRunningOperationsForArchive } from "../commands/archiveTask";
 import { PendingOperationsStore } from "../state/pendingOperationsStore";
 import { recoverActivationCheckpoint } from "../state/taskActivationCoordinator";
-import { runTrackedOperation } from "./taskOperations";
+import { runTrackedOperation, taskOperations } from "./taskOperations";
 
 /**
  * The global assistant's structured action layer: a typed registry of
@@ -1060,7 +1060,7 @@ async function appendAudit(
   outcome: string
 ): Promise<void> {
   try {
-    await writeRunLog(
+    const auditLogUri = await writeRunLog(
       ctx.assistantFolderUri,
       "global-assistant",
       "desc",
@@ -1074,6 +1074,11 @@ async function appendAudit(
         `- At: ${new Date().toISOString()}`,
       ].join("\n")
     );
+    // executeProposedAction (this function's only caller) runs inside the
+    // "Global Assistant" tracked operation (openGeneralAssistant.ts), whose
+    // handle isn't threaded this deep — resolve it by task path instead.
+    // No-ops harmlessly if that operation has already ended.
+    taskOperations.setResultTargetUriForTask(ctx.assistantFolderUri.fsPath, auditLogUri);
   } catch {
     // Auditing is best-effort; a log failure must not undo an executed action.
   }

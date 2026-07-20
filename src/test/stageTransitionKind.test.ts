@@ -6,6 +6,7 @@ import { after, test } from "node:test";
 import * as vscode from "vscode";
 import {
   advanceStage,
+  AUTO_PUBLISH_ELIGIBLE_KINDS,
   AUTO_REVIEW_ELIGIBLE_KINDS,
   StageTransitionResult,
   TransitionKind,
@@ -65,6 +66,7 @@ const ALL_KINDS: TransitionKind[] = [
   "recovery",
   "fast-forward-internal",
   "review-run",
+  "complete-commit-push",
 ];
 
 void test("exactly complete-and-move-on and auto-advance are auto-review eligible", () => {
@@ -108,6 +110,119 @@ for (const kind of ALL_KINDS) {
     }
   );
 }
+
+void test("exactly jump, complete-and-move-on, and auto-advance are auto-publish eligible", () => {
+  assert.deepEqual(
+    [...AUTO_PUBLISH_ELIGIBLE_KINDS].sort(),
+    ["auto-advance", "complete-and-move-on", "jump"]
+  );
+});
+
+for (const kind of ALL_KINDS) {
+  const eligible = AUTO_PUBLISH_ELIGIBLE_KINDS.has(kind);
+  void test(
+    `advanceStage(kind="${kind}") landing on publish ${eligible ? "auto-publishes" : "never auto-publishes"}`,
+    async () => {
+      const store = new Map<string, string>();
+      installMemStore(store);
+      const folderUri = makeTaskFolderUri(`publish-kind-${kind}`);
+      seedProgress(store, folderUri, {
+        taskFolder: `publish-kind-${kind}`,
+        currentStage: "impl-low-review",
+        createdAt: "2026-07-07T00:00:00.000Z",
+        updatedAt: "2026-07-07T00:00:00.000Z",
+      });
+
+      const result = await advanceStage(
+        folderUri,
+        "impl-low-review",
+        "publish",
+        false,
+        kind
+      );
+
+      assert.ok(result?.persisted);
+      assert.equal(
+        result.shouldAutoPublish,
+        eligible,
+        `kind="${kind}" should${eligible ? "" : " never"} produce shouldAutoPublish: true`
+      );
+    }
+  );
+}
+
+void test("shouldAutoPublish is independent of the auto-review optIn flag", async () => {
+  const store = new Map<string, string>();
+  installMemStore(store);
+  const folderUri = makeTaskFolderUri("publish-optin-independence");
+  seedProgress(store, folderUri, {
+    taskFolder: "publish-optin-independence",
+    currentStage: "impl-low-review",
+    createdAt: "2026-07-07T00:00:00.000Z",
+    updatedAt: "2026-07-07T00:00:00.000Z",
+  });
+
+  const result = await advanceStage(
+    folderUri,
+    "impl-low-review",
+    "publish",
+    false,
+    "complete-and-move-on",
+    false // optIn: false — auto-review's opt-out must not affect auto-publish
+  );
+
+  assert.ok(result?.persisted);
+  assert.equal(result.shouldAutoPublish, true);
+});
+
+void test("a paused task never auto-publishes even on an eligible kind", async () => {
+  const store = new Map<string, string>();
+  installMemStore(store);
+  const folderUri = makeTaskFolderUri("publish-paused-suppression");
+  seedProgress(store, folderUri, {
+    taskFolder: "publish-paused-suppression",
+    currentStage: "impl-low-review",
+    createdAt: "2026-07-07T00:00:00.000Z",
+    updatedAt: "2026-07-07T00:00:00.000Z",
+    status: "paused",
+  });
+
+  const result = await advanceStage(
+    folderUri,
+    "impl-low-review",
+    "publish",
+    true, // isPaused
+    "complete-and-move-on",
+    true
+  );
+
+  assert.ok(result?.persisted);
+  assert.equal(result.shouldAutoPublish, false);
+});
+
+void test("an eligible kind landing on a non-publish stage never auto-publishes", async () => {
+  const store = new Map<string, string>();
+  installMemStore(store);
+  const folderUri = makeTaskFolderUri("publish-wrong-destination");
+  seedProgress(store, folderUri, {
+    taskFolder: "publish-wrong-destination",
+    currentStage: "plan",
+    createdAt: "2026-07-07T00:00:00.000Z",
+    updatedAt: "2026-07-07T00:00:00.000Z",
+  });
+
+  const result = await advanceStage(
+    folderUri,
+    "plan",
+    "plan-high-review",
+    false,
+    "complete-and-move-on",
+    true
+  );
+
+  assert.ok(result?.persisted);
+  assert.equal(result.shouldAutoPublish, false);
+});
 
 void test("advanceStage(kind=\"complete-and-move-on\", optIn=false) never auto-reviews even though the kind is eligible", async () => {
   const store = new Map<string, string>();

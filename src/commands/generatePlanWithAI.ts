@@ -32,6 +32,7 @@ import { scheduleAutomationChain } from "../utils/automationChain";
 import {
   linkCancellationTokens,
   runTrackedOperation,
+  taskOperations,
   TaskOperationHandle,
 } from "../utils/taskOperations";
 
@@ -345,7 +346,10 @@ async function generatePlanWithAIForResolvedTask(
         cancellable: true,
       },
       async (progress, token) => {
-        NotificationRouter.emitProgressSummary(`Generating plan with ${providerLabel}...`);
+        NotificationRouter.emitProgressSummary(
+          `Generating plan with ${providerLabel}...`,
+          taskOperations.rootOperationIdFor(taskFolderUri.fsPath)
+        );
         const planFileUri = vscode.Uri.joinPath(taskFolderUri, "plan.md");
 
         progress.report({ message: `Waiting for ${providerLabel} response...` });
@@ -370,7 +374,7 @@ async function generatePlanWithAIForResolvedTask(
           linked.dispose();
         }
 
-        await writeRunLog(
+        const planLogUri = await writeRunLog(
           taskFolderUri,
           runner.id,
           "plan",
@@ -378,6 +382,7 @@ async function generatePlanWithAIForResolvedTask(
             result.summary ?? result.errorMessage ?? ""
           }`
         );
+        op.setResultTargetUri(planLogUri);
 
         if (result.status === "completed") {
           // Use patchTaskProgress to preserve unrelated fields (e.g. implReviewFiles,

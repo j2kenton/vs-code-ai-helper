@@ -56,6 +56,13 @@ export interface StageTransitionResult {
   newStage: TaskStage;
   /** Whether auto-review should be triggered (caller is responsible for executing it). */
   shouldAutoReview: boolean;
+  /**
+   * Whether the caller should automatically run the publish command
+   * (commit and push) now that the task has landed on the Publish stage.
+   * Caller is responsible for actually dispatching it — see
+   * AUTO_PUBLISH_ELIGIBLE_KINDS for which transition kinds are eligible.
+   */
+  shouldAutoPublish: boolean;
 }
 
 /**
@@ -103,7 +110,16 @@ export type TransitionKind =
   /** Internal transition used only inside fast-forward's own retry loop. */
   | "fast-forward-internal"
   /** Running a review itself moves the task onto the review stage; must never re-dispatch a review. */
-  | "review-run";
+  | "review-run"
+  /**
+   * The "Complete, Commit and Push" composite's own internal advance to
+   * Publish. Distinct from "complete-and-move-on" so this transition is
+   * never eligible for auto-publish scheduling — the composite already
+   * calls commitAndPushTask itself immediately afterward, and scheduling a
+   * second auto-publish chain here would race a duplicate commit/push
+   * against that explicit call.
+   */
+  | "complete-commit-push";
 
 /**
  * The only two kinds that may ever produce `shouldAutoReview: true`. Every
@@ -111,6 +127,21 @@ export type TransitionKind =
  * `optIn` flag a caller passes.
  */
 export const AUTO_REVIEW_ELIGIBLE_KINDS: ReadonlySet<TransitionKind> = new Set([
+  "complete-and-move-on",
+  "auto-advance",
+]);
+
+/**
+ * The only kinds that may ever produce `shouldAutoPublish: true`. Unlike
+ * auto-review, there is no caller-side opt-in flag — reaching the Publish
+ * stage through any of these kinds always schedules the publish command
+ * (which still requires the user to confirm the commit in its own preview
+ * dialog, so this never silently commits or pushes). "reopen", "reset",
+ * "recovery", "fast-forward-internal", "review-run", and
+ * "complete-commit-push" are hard-excluded regardless of destination stage.
+ */
+export const AUTO_PUBLISH_ELIGIBLE_KINDS: ReadonlySet<TransitionKind> = new Set([
+  "jump",
   "complete-and-move-on",
   "auto-advance",
 ]);
@@ -198,6 +229,7 @@ async function advanceStageLocked(
       persisted: true,
       newStage,
       shouldAutoReview: false,
+      shouldAutoPublish: false,
     };
   }
 
@@ -234,10 +266,17 @@ async function advanceStageLocked(
     isReviewStage(newStage) &&
     AUTO_REVIEW_TRANSITIONS[sourceStage] === newStage;
 
+  // Independent of the auto-review `optIn` above — see AUTO_PUBLISH_ELIGIBLE_KINDS.
+  const shouldAutoPublish =
+    AUTO_PUBLISH_ELIGIBLE_KINDS.has(kind) &&
+    !isPaused &&
+    newStage === "publish";
+
   return {
     persisted: true,
     newStage,
     shouldAutoReview,
+    shouldAutoPublish,
   };
 }
 

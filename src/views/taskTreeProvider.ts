@@ -14,6 +14,7 @@ import { IncompleteTask } from "../utils/taskProgressUtils";
 import { taskOperations, taskKey } from "../utils/taskOperations";
 import { resolveCurrentPlanUri, statIfExists } from "../utils/fileUtils";
 import { hasPreviousVersion } from "../utils/artifactBackups";
+import { readRedoSidecar, isRedoAvailableFromRecord } from "../utils/redoSidecar";
 import { resolveImplementationArtifact } from "../utils/implementationArtifactResolver";
 import { parseReadiness } from "../utils/reviewReadiness";
 import { TaskInventory, TaskWithProgress } from "../state/taskInventory";
@@ -257,7 +258,8 @@ export class StageNode extends vscode.TreeItem {
     availableModels?: readonly SelectableModel[]  ,
     isScheduled: boolean = false,
     isMetaManaged: boolean = false,
-    hasBackup: boolean = false
+    hasBackup: boolean = false,
+    redoAvailable: boolean = false
   ) {
     super(STAGE_DISPLAY_NAMES[stage], vscode.TreeItemCollapsibleState.None);
 
@@ -361,7 +363,8 @@ export class StageNode extends vscode.TreeItem {
       task.progress.lintPayload?.passed,
       isScheduled,
       isMetaManaged,
-      hasBackup
+      hasBackup,
+      redoAvailable
     );
   }
 
@@ -383,7 +386,8 @@ export function getStageNodeContextValue(
   lintPassed?: boolean,
   isScheduled: boolean = false,
   isMetaManaged: boolean = false,
-  hasBackup: boolean = false
+  hasBackup: boolean = false,
+  redoAvailable: boolean = false
 ): string {
   return buildStageContextValue({
     stage,
@@ -394,6 +398,7 @@ export function getStageNodeContextValue(
     isScheduled,
     isMetaManaged,
     hasBackup,
+    redoAvailable,
   });
 }
 
@@ -858,6 +863,14 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
       }
       const hasBackup =
         revertArtifact !== undefined && (await hasPreviousVersion(revertArtifact));
+      // Durable across reloads/crashes: read from the on-disk redo sidecar
+      // (redoSidecar.ts), which performJournaledRevertSwap keeps in sync with
+      // which side of the artifact/backup swap the artifact currently sits
+      // on. A missing/unknown sidecar safely defaults to "no redo available".
+      const redoAvailable =
+        hasBackup &&
+        revertArtifact !== undefined &&
+        isRedoAvailableFromRecord(await readRedoSidecar(revertArtifact));
 
       nodes.push(
         new StageNode(
@@ -870,7 +883,8 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
           this.availableModels,
           isStageScheduled,
           this.isMetaManaged,
-          hasBackup
+          hasBackup,
+          redoAvailable
         )
       );
     }

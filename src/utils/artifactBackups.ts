@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import * as path from "path";
+import { deleteRedoSidecar } from "./redoSidecar";
 
 /** The single, user-visible previous version kept for an artifact. */
 export function previousVersionUri(fileUri: vscode.Uri): vscode.Uri {
@@ -20,6 +21,11 @@ export async function backupArtifactContents(
   contents: Uint8Array
 ): Promise<void> {
   await vscode.workspace.fs.writeFile(previousVersionUri(fileUri), contents);
+  // A fresh backup invalidates any prior revert/redo history: the new
+  // backup's content did not go through the swap the sidecar describes, so
+  // any "redo" it might have offered no longer means anything. Missing
+  // sidecar is the safe "applied" default, so deleting is always correct here.
+  await deleteRedoSidecar(fileUri);
 }
 
 /**

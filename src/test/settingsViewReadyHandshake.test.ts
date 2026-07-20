@@ -277,10 +277,13 @@ void describe("SettingsViewProvider — webview ready handshake", () => {
 // settingsView.ts computes usageEnabled/usageTooltip per provider inside
 // _postInit from each entry's usage capability. Providers whose usage is
 // "unsupported" but carry a `url` (Copilot, Kiro) must render an ENABLED
-// button that opens that page; providers with neither a command nor a URL
-// (Antigravity) must stay disabled with just the reason as the tooltip.
-// This is the exact compound condition a previous review cycle had to add
-// after the button silently stayed dead for providers that now have a
+// button that opens that page; providers with an unverified in-session usage
+// command (Antigravity, Gemini) render "unsupported" with no url — the
+// button stays DISABLED, since an unconfirmed slash command must never ship
+// as if it works (per the approved capability matrix: "If the retry still
+// fails, leave the button disabled ... instead of shipping a nonfunctional
+// action"). This is the exact compound condition a previous review cycle had
+// to add after the button silently stayed dead for providers that now have a
 // usage-page fallback — pinned here against the real "init" payload.
 // ---------------------------------------------------------------------------
 
@@ -327,17 +330,29 @@ void describe("SettingsViewProvider — usage-button view-model", () => {
       assert.strictEqual(kiro?.usageEnabled, true, "Kiro's usage button must be enabled");
       assert.match(kiro?.usageTooltip ?? "", /Opens the usage page\.$/);
 
-      // Antigravity: unsupported with no known page — stays disabled, and
-      // the tooltip is just the reason (no "Opens the usage page" promise).
+      // Antigravity: an unverified in-session usage command (agy → /usage)
+      // renders "unsupported" with no url — the button stays DISABLED rather
+      // than suggesting a command that has never been confirmed to work.
       const antigravity = byId.get("antigravity-cli");
       assert.ok(antigravity, "expected an antigravity-cli entry in the init payload");
       assert.strictEqual(
         antigravity?.usageEnabled,
         false,
-        "Antigravity's usage button must stay disabled without a usage-page URL"
+        "Antigravity's usage button must be disabled while its slash command is unverified"
       );
       assert.doesNotMatch(antigravity?.usageTooltip ?? "", /Opens the usage page/);
-      assert.ok((antigravity?.usageTooltip ?? "").length > 0, "the disabled button still needs a reason tooltip");
+      assert.match(antigravity?.usageTooltip ?? "", /agy/);
+
+      // Gemini gets the identical treatment — not special-cased to
+      // Antigravity: any provider whose usage descriptor is "unverified"
+      // must resolve to a disabled button, uniformly.
+      const gemini = byId.get("gemini-cli");
+      assert.ok(gemini, "expected a gemini-cli entry in the init payload");
+      assert.strictEqual(
+        gemini?.usageEnabled,
+        false,
+        "Gemini's usage button must be disabled while its slash command is unverified"
+      );
     } finally {
       __testOnly.clearModelSelectionTestOverrides();
     }
@@ -443,6 +458,8 @@ interface WebviewSession {
   byId(id: string): FakeNode;
   posted: Array<Record<string, unknown>>;
   deliver(message: Record<string, unknown>): Promise<void>;
+  /** document.body — appended overlays (confirmation dialogs) land here. */
+  body: FakeNode;
 }
 
 /** One webview document lifetime. `stateStore` outlives sessions, exactly
@@ -488,6 +505,11 @@ function runWebviewSession(script: string, stateStore: { value: unknown }): Webv
     setTimeout,
     console,
     Element: FakeNode,
+    // A real webview's document.activeElement is an HTMLElement; this stub's
+    // documentStub has no activeElement getter, so `opener` is always
+    // undefined and this check never actually matches — it only needs to
+    // exist so `instanceof HTMLElement` doesn't throw ReferenceError.
+    HTMLElement: FakeNode,
   };
   vm.createContext(sandbox);
   vm.runInContext(script, sandbox);
@@ -501,6 +523,7 @@ function runWebviewSession(script: string, stateStore: { value: unknown }): Webv
       // The init handler is async; let its awaited continuations settle.
       await new Promise((resolve) => setTimeout(resolve, 0));
     },
+    body: documentStub.body,
   };
 }
 
@@ -609,5 +632,103 @@ void describe("SettingsViewProvider webview — draft restore across disposal", 
       0,
       "after saving, a recreated document must not claim there are unsaved changes"
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AI Models tab: button labels/styling and Discard Unsaved Changes
+//
+// "Save Provider Selection" and the bottom "Save Model Selection" button must
+// share the same (primary, no "secondary" class) styling; "Add another
+// backup" and the per-backup remove ("×") control must match the
+// sign-in/check-usage secondary styling. The former "Reset to Defaults"
+// button is now "Discard Unsaved Changes": it reverts the form to the last
+// SAVED settings (not to empty) and requires confirmation.
+// ---------------------------------------------------------------------------
+
+void describe("SettingsViewProvider webview — AI Models tab labels and Discard Unsaved Changes", () => {
+  void it("labels and styles the save/discard/provider/backup buttons per the AI Models tab conventions", () => {
+    const html = extractWebviewHtml();
+
+    assert.match(html, /<button id="save-btn" disabled>Save Model Selection<\/button>/);
+    assert.match(
+      html,
+      /<button id="discard-btn" class="secondary" disabled>Discard Unsaved Changes<\/button>/
+    );
+    assert.doesNotMatch(html, /Reset to Defaults/);
+    assert.match(html, /<button id="save-providers-btn">Save Provider Selection<\/button>/);
+    assert.match(html, /class="secondary add-backup"/);
+    assert.match(html, /class="secondary remove-backup"/);
+  });
+
+  void it("Discard Unsaved Changes reverts the form to the last-saved settings and re-disables both buttons", async () => {
+    const script = extractWebviewScript();
+    const stateStore: { value: unknown } = { value: undefined };
+    const session = runWebviewSession(script, stateStore);
+
+    const init = initMessage();
+    init.settings = { impl: { primary: "claude-cli:sonnet", backups: [], strategy: "alert-and-wait" } };
+    await session.deliver(init);
+
+    assert.equal(session.byId("save-btn").disabled, true, "nothing unsaved right after init");
+    assert.equal(session.byId("discard-btn").disabled, true, "discard has nothing to discard right after init");
+
+    // Edit: the save/collect path reads the hidden model input directly by
+    // id (see reconcileModelInput), so this is exactly what a real edit to
+    // the primary-model combobox for "impl" produces.
+    session.byId("primary-impl").value = "claude-cli:opus";
+    await session.byId("stages-tbody").dispatch("input");
+
+    assert.equal(session.byId("save-btn").disabled, false, "editing a field must mark the form dirty");
+    assert.equal(session.byId("discard-btn").disabled, false, "discard must be enabled once the form is dirty");
+
+    // Do NOT await this dispatch yet — its click handler awaits
+    // confirmDestructiveAction()'s promise, which only resolves once the
+    // overlay's own confirm/cancel button is clicked below. The overlay
+    // itself is still built synchronously (up to that await), so it is
+    // already in document.body by the time this line returns control.
+    const discardClick = session.byId("discard-btn").dispatch("click");
+
+    // The confirmation overlay was appended to document.body; find and
+    // confirm it (mirrors the "destructive-confirm" button wiring).
+    const overlay = session.body.children[session.body.children.length - 1];
+    assert.ok(overlay, "expected a confirmation overlay to have been appended");
+    await overlay.querySelector("#destructive-confirm").dispatch("click");
+    await discardClick;
+
+    assert.equal(session.byId("save-btn").disabled, true, "confirming discard must clear the dirty flag");
+    assert.equal(session.byId("discard-btn").disabled, true, "confirming discard must re-disable itself");
+
+    // renderTable() rebuilt the impl row from the reverted currentSettings —
+    // the edited value ("opus") must be gone and the saved one ("sonnet")
+    // restored, not wiped to empty as the old Reset to Defaults did.
+    const tbody = session.byId("stages-tbody");
+    const implRow = tbody.children[tbody.children.length - 1];
+    assert.ok(implRow, "expected the impl stage row to have been re-rendered");
+    assert.match(implRow.innerHTML, /value="claude-cli:sonnet"/);
+    assert.doesNotMatch(implRow.innerHTML, /value="claude-cli:opus"/);
+  });
+
+  void it("dismissing the Discard Unsaved Changes confirmation leaves the dirty edit untouched", async () => {
+    const script = extractWebviewScript();
+    const stateStore: { value: unknown } = { value: undefined };
+    const session = runWebviewSession(script, stateStore);
+
+    const init = initMessage();
+    init.settings = { impl: { primary: "claude-cli:sonnet", backups: [], strategy: "alert-and-wait" } };
+    await session.deliver(init);
+
+    session.byId("primary-impl").value = "claude-cli:opus";
+    await session.byId("stages-tbody").dispatch("input");
+    assert.equal(session.byId("discard-btn").disabled, false);
+
+    const discardClick = session.byId("discard-btn").dispatch("click");
+    const overlay = session.body.children[session.body.children.length - 1];
+    assert.ok(overlay);
+    await overlay.querySelector("#destructive-cancel").dispatch("click");
+    await discardClick;
+
+    assert.equal(session.byId("save-btn").disabled, false, "cancelling discard must keep the form dirty");
+    assert.equal(session.byId("discard-btn").disabled, false, "cancelling discard must keep discard enabled");
   });
 });

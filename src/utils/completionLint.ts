@@ -792,8 +792,31 @@ export async function upsertCompletionChecksInPublishReview(
   await fs.promises.writeFile(targetPath, mergeCompletionChecksSection(existing, section), "utf8");
 }
 
-/** Persist the latest completion lint result without changing the task stage. */
-export async function runCompletionLint(folderUri: vscode.Uri, relevantFiles?: readonly string[]): Promise<CompletionLintResult> {
+/**
+ * Compute the completion lint result (verification commands + AI-verified
+ * plan items) without persisting anything to task-progress.json or
+ * publish-review.md. This is the side-effect-free half of
+ * `runCompletionLint`, used by `checkPublishPreflight` (publishPreflight.ts)
+ * for scheduling decisions — "should we schedule auto-publish?" — that must
+ * not mutate task state merely by asking the question.
+ *
+ * By default (`allowScopePrompt: true`), a stale persisted Publish scope
+ * still prompts the user to (re-)pick one via `promptAndPersistPublishScope`
+ * and persists that choice — this is what `runCompletionLint` (the
+ * execution-time, `persist: true` path) uses, where a blocking prompt and a
+ * scope write are expected as part of actually running a Publish attempt.
+ * Pass `allowScopePrompt: false` for pure scheduling decisions (the default
+ * `checkPublishPreflight` path): a stale scope there is reported as a
+ * structured failure instead of opening a QuickPick or writing
+ * `publishScopePath`, so deciding *whether* to schedule `auto-publish` never
+ * shows UI or mutates task state on its own.
+ */
+export async function collectCompletionLintPreview(
+  folderUri: vscode.Uri,
+  relevantFiles?: readonly string[],
+  options?: { allowScopePrompt?: boolean }
+): Promise<CompletionLintResult> {
+  const allowScopePrompt = options?.allowScopePrompt ?? true;
   // Verify against the task's Publish scope (persisted per task; defaults to
   // the workspace folder containing the task), never just the task folder.
   const progress = await readTaskProgress(folderUri);
@@ -805,12 +828,22 @@ export async function runCompletionLint(folderUri: vscode.Uri, relevantFiles?: r
     // also invalidates any relative persisted scope — it has no base left).
     // Silently verifying the fallback folder instead would report results
     // for the wrong project (or for task metadata), so re-prompt for a
-    // valid scope; cancelling — or having no project root left to offer —
-    // aborts the check outright. No command may run in the metadata folder
-    // or in a workspace that merely contains it.
+    // valid scope (when allowed) — cancelling, having no project root left
+    // to offer, or being disallowed from prompting at all aborts the check
+    // outright. No command may run in the metadata folder or in a
+    // workspace that merely contains it.
     const savedScope = progress?.publishScopePath?.trim();
     const bindingRoot = progress?.ownership?.projectRoot?.trim();
     const bindingVanished = !!bindingRoot && !isExistingDirectory(bindingRoot);
+    const staleReason = !bindingVanished && savedScope
+      ? `The saved Publish verification scope ("${savedScope}") no longer exists. ` +
+        "Choose a valid scope to run the Publish checks against."
+      : "No valid Publish verification scope could be resolved for this task — " +
+        "its recorded project-root binding no longer exists. Choose a valid " +
+        "scope to run the Publish checks against.";
+    if (!allowScopePrompt) {
+      throw new Error(staleReason);
+    }
     const repicked = await promptAndPersistPublishScope(folderUri, {
       title: bindingVanished
         ? "The task's project-root binding no longer exists — choose a Publish verification scope"
@@ -818,14 +851,7 @@ export async function runCompletionLint(folderUri: vscode.Uri, relevantFiles?: r
       currentRelPath: progress?.publishScopePath,
     });
     if (!repicked) {
-      throw new Error(
-        !bindingVanished && savedScope
-          ? `The saved Publish verification scope ("${savedScope}") no longer exists. ` +
-            "Choose a valid scope to run the Publish checks against."
-          : "No valid Publish verification scope could be resolved for this task — " +
-            "its recorded project-root binding no longer exists. Choose a valid " +
-            "scope to run the Publish checks against."
-      );
+      throw new Error(staleReason);
     }
     scopeFolder = repicked;
   }
@@ -836,6 +862,20 @@ export async function runCompletionLint(folderUri: vscode.Uri, relevantFiles?: r
   // Plan-item completion is AI-verified against the same scope the lint/test
   // checks ran in — a checked box in plan-final.md alone never passes.
   result.planItems = await collectAiVerifiedPlanItems(folderUri, scopeFolder);
+  return result;
+}
+
+/**
+ * Compute the completion lint result and persist it into task-progress.json
+ * and publish-review.md's managed Completion Checks section. This is the
+ * only entry point that writes lint state to disk — call it when a Publish
+ * attempt is actually executing (commitAndPushTask's pre-commit checks),
+ * never merely to decide whether to schedule one. Scheduling decisions
+ * should use `collectCompletionLintPreview` instead (see
+ * `checkPublishPreflight` in publishPreflight.ts).
+ */
+export async function runCompletionLint(folderUri: vscode.Uri, relevantFiles?: readonly string[]): Promise<CompletionLintResult> {
+  const result = await collectCompletionLintPreview(folderUri, relevantFiles, { allowScopePrompt: true });
   const persisted = await patchTaskProgress(folderUri, (current) => updateLintPayload(current, {
     runAt: result.runAt,
     passed: result.passed,

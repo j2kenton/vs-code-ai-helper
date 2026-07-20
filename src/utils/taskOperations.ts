@@ -56,6 +56,15 @@ export interface TaskOperationHandle {
   /** Present when the operation was registered with `cancellable: true`. */
   readonly token?: vscode.CancellationToken;
   report(detail: string | undefined): void;   // live-row sub-text, e.g. "waiting for your answer"
+  /**
+   * Record the click-to-open target for this operation's terminal
+   * Notifications entry (e.g. the vscode.Uri writeRunLog resolved to).
+   * Always resolves to the ROOT operation, even when called from a child
+   * handle, so a composite still leaves one clickable entry. No-ops
+   * predictably (does nothing, no error, no duplicate notification) if the
+   * operation has already ended by the time this is called.
+   */
+  setResultTargetUri(uri: vscode.Uri): void;
 }
 
 export interface TaskOperationSnapshot {
@@ -72,6 +81,15 @@ export interface TaskOperationSnapshot {
   readonly cancellable: boolean;
   readonly state: TaskOperationState;
   readonly finishedAt?: number;
+  /**
+   * Stringified vscode.Uri of the artifact/run-log this operation produced,
+   * when known (set via setResultTargetUri/setResultTargetUriForTask). Always
+   * recorded on the ROOT operation, even when set from a child, so the one
+   * Notifications row for a composite can open the result. Consumers must
+   * `vscode.Uri.parse()` this — it is never a bare fsPath like the legacy
+   * `filePath` field.
+   */
+  readonly resultTargetUri?: string;
 }
 
 /**
@@ -93,6 +111,7 @@ interface MutableOperation {
   cancellable: boolean;
   state: TaskOperationState;
   finishedAt?: number;
+  resultTargetUri?: string;
 }
 
 /**
@@ -226,6 +245,9 @@ export class TaskOperationRegistry implements vscode.Disposable {
       report: (d: string | undefined) => {
         operation.detail = d;
         this.triggerChange();
+      },
+      setResultTargetUri: (uri: vscode.Uri) => {
+        this.setResultTargetUri(id, uri);
       }
     };
 
@@ -250,6 +272,46 @@ export class TaskOperationRegistry implements vscode.Disposable {
   }
 
   /**
+   * Resolve `id` to its root operation (walking up parentId within the same
+   * task) and record the click-to-open target on it. Returns false without
+   * side effects when `id` is missing from the registry — meaning the
+   * operation is unknown or has already ended — matching the "fails
+   * predictably, no duplicate notification" contract (D11).
+   */
+  setResultTargetUri(id: string, uri: vscode.Uri): boolean {
+    if (!uri) {return false;} // Defensive: some callers' writeRunLog can resolve to nothing.
+    for (const keyMap of this.operations.values()) {
+      let op = keyMap.get(id);
+      if (!op) {continue;}
+      while (op.parentId !== undefined) {
+        const parent = keyMap.get(op.parentId);
+        if (!parent) {break;}
+        op = parent;
+      }
+      op.resultTargetUri = uri.toString();
+      this.triggerChange();
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Same as `setResultTargetUri`, addressed by task path instead of operation
+   * id, for code deep in the stack that never received the operation handle
+   * (mirrors `report`/`tokenFor` above). Finds the task's exclusive (root)
+   * operation directly — there is at most one, and it never has a parentId.
+   */
+  setResultTargetUriForTask(taskPath: string, uri: vscode.Uri): boolean {
+    if (!uri) {return false;} // Defensive: some callers' writeRunLog can resolve to nothing.
+    const key = taskKey(taskPath);
+    const exclusiveOp = [...(this.operations.get(key)?.values() ?? [])].find(op => op.exclusive);
+    if (!exclusiveOp) {return false;}
+    exclusiveOp.resultTargetUri = uri.toString();
+    this.triggerChange();
+    return true;
+  }
+
+  /**
    * The exclusive (root) operation's cancellation token for a task, for code
    * deep in the stack that launches the actual provider process without ever
    * receiving the operation handle (runAiToFile, executeImplementationRun).
@@ -261,6 +323,23 @@ export class TaskOperationRegistry implements vscode.Disposable {
     if (!keyMap) {return undefined;}
     const exclusiveOp = [...keyMap.values()].find(op => op.exclusive);
     return exclusiveOp ? this.tokenSources.get(exclusiveOp.id)?.token : undefined;
+  }
+
+  /**
+   * The id of a task's live exclusive (root) operation, for code deep in the
+   * stack that never received the handle — mirrors `tokenFor`. Used to stamp
+   * live progress-summary notifications with `sourceOperationId` at creation
+   * time (not just at termination), so the Notifications view can resolve
+   * and cancel a still-running operation from its in-progress row, not only
+   * after it has already ended. Returns undefined once the operation is no
+   * longer registered (ended or never started), matching the "unknown id ⇒
+   * no cancel affordance" invariant enforced by the surface that consumes it.
+   */
+  rootOperationIdFor(taskPath: string): string | undefined {
+    const keyMap = this.operations.get(taskKey(taskPath));
+    if (!keyMap) {return undefined;}
+    const exclusiveOp = [...keyMap.values()].find(op => op.exclusive);
+    return exclusiveOp?.id;
   }
 
   /**

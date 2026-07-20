@@ -24,6 +24,17 @@ import { policyForKind } from "./operationTaxonomy";
 export interface TerminalNotificationEntry {
   readonly message: string;
   readonly level: "info" | "warning" | "error";
+  /**
+   * Stringified vscode.Uri of the operation's result artifact/run log, when
+   * known (see TaskOperationHandle.setResultTargetUri). Consumers must
+   * vscode.Uri.parse() this — never a bare fsPath.
+   */
+  readonly resultTargetUri?: string;
+  /** The root operation this terminal entry is about. By the time this fires
+   * the operation has already ended, so the Notifications surface correctly
+   * shows no cancel affordance for it — the id is carried through so any
+   * other still-live operation that later reuses is never confused for it. */
+  readonly sourceOperationId: string;
 }
 
 export function terminalEntryFor(
@@ -51,6 +62,11 @@ export function terminalEntryFor(
   return {
     message: `${snap.label} — ${snap.taskName}: ${stateText}${suffix}`,
     level,
+    sourceOperationId: snap.id,
+    // Only present when set — keeps `terminalEntryFor` output free of
+    // stray `resultTargetUri: undefined` keys for the (still-common) case
+    // where no result target was recorded.
+    ...(snap.resultTargetUri !== undefined ? { resultTargetUri: snap.resultTargetUri } : {}),
   };
 }
 
@@ -66,11 +82,11 @@ export function installOperationNotificationBridge(): vscode.Disposable {
       return;
     }
     if (entry.level === "error") {
-      NotificationRouter.showError(entry.message);
+      NotificationRouter.showError(entry.message, undefined, entry.resultTargetUri, entry.sourceOperationId);
     } else if (entry.level === "warning") {
-      NotificationRouter.showWarning(entry.message);
+      NotificationRouter.showWarning(entry.message, undefined, entry.resultTargetUri, entry.sourceOperationId);
     } else {
-      NotificationRouter.showInformation(entry.message);
+      NotificationRouter.showInformation(entry.message, undefined, entry.resultTargetUri, entry.sourceOperationId);
     }
   });
 }

@@ -1,5 +1,11 @@
 import * as vscode from "vscode";
 import { createHash } from "crypto";
+import {
+  RedoDirection,
+  RedoSidecarFs,
+  fingerprintBytes,
+  writeRedoSidecar,
+} from "./redoSidecar";
 
 /**
  * Journal-backed revert swap for stage artifacts.
@@ -38,6 +44,16 @@ export interface RevertJournalRecord {
   artifactSha256: string;
   /** SHA-256 hex digest of the decoded backupContent (journal integrity). */
   backupSha256: string;
+  /**
+   * Intended post-swap redo-sidecar direction ("reverted" for a Revert
+   * Changes swap, "applied" for a Redo Changes swap). Recorded so that if the
+   * extension crashes between the file swap and the sidecar write, activation
+   * recovery (recoverRevertJournal) can finalize the sidecar to match
+   * whatever state the swap actually left the files in. Absent on legacy
+   * journals written before the sidecar existed — those are left without a
+   * sidecar action, matching the safe "applied" default.
+   */
+  direction?: RedoDirection;
 }
 
 /** Minimal file-system seam so the swap/recovery logic is unit-testable. */
@@ -125,6 +141,7 @@ export function parseRevertJournal(bytes: Uint8Array): RevertJournalRecord | und
         createdAt: typeof parsed.createdAt === "string" ? parsed.createdAt : new Date(0).toISOString(),
         artifactSha256: artifactSha,
         backupSha256: backupSha,
+        direction: parsed.direction === "applied" || parsed.direction === "reverted" ? parsed.direction : undefined,
       };
     }
   } catch {
@@ -140,14 +157,39 @@ export function parseRevertJournal(bytes: Uint8Array): RevertJournalRecord | und
  * a WorkspaceEdit when the file is open in an editor (the backup file is
  * always written through the file system).
  */
+/**
+ * Result of `performJournaledRevertSwap`. The file swap itself either lands
+ * completely or throws — `sidecarFinalized` separately reports whether the
+ * durable redo-direction sidecar was written to match it in THIS call.
+ *
+ * When `sidecarFinalized` is false, the swap succeeded but the sidecar write
+ * failed: the journal was deliberately kept (see below) so the next
+ * activation's recovery finalizes it, but the CURRENT session's sidecar read
+ * (e.g. contextTokens.ts, viewStageChanges.ts's pre-swap revalidation) still
+ * reflects the PRE-swap direction until then. Callers must not tell the user
+ * the swap is fully done (in particular, must not claim the opposite action
+ * — e.g. "Redo Changes" — is now available) when this is false.
+ */
+export interface JournaledRevertSwapResult {
+  sidecarFinalized: boolean;
+}
+
 export async function performJournaledRevertSwap(
   artifact: vscode.Uri,
   backup: vscode.Uri,
   currentBytes: Uint8Array,
   previousBytes: Uint8Array,
   writeArtifact: (content: Uint8Array) => Promise<void>,
-  fs: RevertJournalFs = defaultFs()
-): Promise<void> {
+  fs: RevertJournalFs = defaultFs(),
+  /**
+   * Intended post-swap redo-sidecar direction: "reverted" for Revert
+   * Changes, "applied" for Redo Changes. Recorded in the journal itself (so
+   * crash recovery can finalize the sidecar) and written to the sidecar
+   * right after the swap lands, before the journal is deleted.
+   */
+  direction?: RedoDirection,
+  sidecarFs: RedoSidecarFs = fs
+): Promise<JournaledRevertSwapResult> {
   const journal = revertJournalUri(artifact);
   const record: RevertJournalRecord = {
     version: 1,
@@ -158,6 +200,7 @@ export async function performJournaledRevertSwap(
     createdAt: new Date().toISOString(),
     artifactSha256: sha256Hex(previousBytes),
     backupSha256: sha256Hex(currentBytes),
+    direction,
   };
   await fs.writeFile(journal, encodeRecord(record));
   try {
@@ -178,7 +221,36 @@ export async function performJournaledRevertSwap(
     throw error;
   }
   await fs.writeFile(backup, currentBytes);
+  if (direction) {
+    // Write the sidecar to reflect the post-swap state BEFORE the journal is
+    // deleted: if the process dies between these two writes, the journal is
+    // still on disk and activation-time recovery (recoverRevertJournal) will
+    // finalize the sidecar to match the files' actual resulting content.
+    try {
+      await writeRedoSidecar(
+        artifact,
+        {
+          version: 1,
+          direction,
+          artifactFingerprint: fingerprintBytes(previousBytes),
+          backupFingerprint: fingerprintBytes(currentBytes),
+        },
+        sidecarFs
+      );
+    } catch {
+      // The swap itself landed, but the sidecar write failed — do NOT delete
+      // the journal. Leaving it in place means the next activation's
+      // recoverRevertJournal call finds the artifact already at its
+      // post-swap content and finalizes the sidecar then (see
+      // finalizeRedoSidecarFromRecord), instead of silently losing the
+      // durable redo direction. Report this back to the caller instead of
+      // returning as if fully successful — it must not tell the user the
+      // opposite action is now available until the sidecar actually reflects it.
+      return { sidecarFinalized: false };
+    }
+  }
   await fs.delete(journal, { useTrash: false });
+  return { sidecarFinalized: true };
 }
 
 /**
@@ -298,6 +370,11 @@ export async function recoverRevertJournal(
     // states — only the backup write is outstanding; finish it silently
     // (NOT finishing would leave both files holding the same version).
     await fs.writeFile(vscode.Uri.file(record.backupPath), preSwapArtifact);
+    if (!(await finalizeRedoSidecarFromRecord(record, postSwapArtifact, preSwapArtifact, fs))) {
+      // Sidecar write failed again — keep the journal so a later activation
+      // retries finalizing it instead of silently losing the direction.
+      return false;
+    }
     await fs.delete(journal, { useTrash: false });
     return true;
   }
@@ -322,8 +399,50 @@ export async function recoverRevertJournal(
   }
   await fs.writeFile(artifactUri, postSwapArtifact);
   await fs.writeFile(vscode.Uri.file(record.backupPath), preSwapArtifact);
+  if (!(await finalizeRedoSidecarFromRecord(record, postSwapArtifact, preSwapArtifact, fs))) {
+    // Sidecar write failed — keep the journal so a later activation retries
+    // finalizing it instead of silently losing the direction.
+    return false;
+  }
   await fs.delete(journal, { useTrash: false });
   return true;
+}
+
+/**
+ * Crash recovery: finalize the redo sidecar to match whatever state a
+ * recovered swap actually left the files in. Only acts when the journal
+ * carries a `direction` (all journals written since the sidecar was added);
+ * legacy journals are left without a sidecar action, which safely defaults
+ * to "applied" (no redo offered) on next read.
+ */
+/**
+ * Returns true when the sidecar was finalized (or there was nothing to
+ * finalize — a legacy journal with no recorded direction). Returns false only
+ * when a direction was recorded but the write failed, so the caller can keep
+ * the journal around for a later retry instead of losing the direction.
+ */
+async function finalizeRedoSidecarFromRecord(
+  record: RevertJournalRecord,
+  finalArtifactContent: Uint8Array,
+  finalBackupContent: Uint8Array,
+  fs: RevertJournalFs
+): Promise<boolean> {
+  if (!record.direction) return true;
+  try {
+    await writeRedoSidecar(
+      vscode.Uri.file(record.artifactPath),
+      {
+        version: 1,
+        direction: record.direction,
+        artifactFingerprint: fingerprintBytes(finalArtifactContent),
+        backupFingerprint: fingerprintBytes(finalBackupContent),
+      },
+      fs
+    );
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**

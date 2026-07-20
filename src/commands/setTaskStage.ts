@@ -10,7 +10,7 @@ import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { resolveTaskContext, ResolvedTaskContext } from "../utils/resolveTaskContext";
 import { advanceStage, AUTO_REVIEW_ELIGIBLE_KINDS, TransitionKind } from "../utils/stageTransition";
 import { NotificationRouter } from "../utils/notificationRouter";
-import { runCompletionLint } from "../utils/completionLint";
+import { checkPublishPreflight } from "../utils/publishPreflight";
 import { ensureStageModelConfigured } from "../utils/modelSelection";
 import { scheduleAutomationChain } from "../utils/automationChain";
 import { pickReopenStage, reopenCompletedTask } from "../utils/reopenTask";
@@ -244,14 +244,48 @@ export async function setTaskStage(
   // Refresh the inventory so the new stage is visible immediately
   await inventory.refresh();
 
+  let publishPreflight: Awaited<ReturnType<typeof checkPublishPreflight>> | undefined;
   if (newStage === "publish") {
-    await runCompletionLint(taskFolderUri);
+    publishPreflight = await checkPublishPreflight(taskFolderUri, task.progress.implReviewFiles);
     await inventory.refresh();
   }
 
   NotificationRouter.showInformation(
     `${task.folderName} set to stage: ${STAGE_DISPLAY_NAMES[newStage]}`
   );
+
+  // Entry-owned auto-publish: a manual stage jump onto Publish never
+  // dispatches a review (AUTO_REVIEW_ELIGIBLE_KINDS excludes "jump"), so
+  // nothing else will decide to run the publish command — schedule it
+  // directly. commitAndPushTask still shows its own confirmation dialogs, so
+  // this never silently commits or pushes. Gated on the preflight result
+  // (checkPublishPreflight, in its default side-effect-free mode — this is a
+  // scheduling decision, not a publish attempt, so it never persists a lint
+  // payload) computed just above — previously the completion lint ran here
+  // but its result was discarded, so auto-publish was scheduled even when
+  // the checks had just failed.
+  if (transitionResult.shouldAutoPublish) {
+    if (publishPreflight?.ok === false) {
+      NotificationRouter.showWarning(
+        `Auto-publish skipped for ${task.folderName}: ${publishPreflight.reason}. Publish manually once checks pass, or use Publish Anyway from Commit and Push.`,
+        undefined,
+        undefined,
+        undefined,
+        {
+          command: "vs-code-ai-helper.commitAndPushTask",
+          title: "Publish Anyway",
+          args: [{ taskFolderPath: task.taskFolderPath }],
+        }
+      );
+    } else {
+      await scheduleAutomationChain({
+        command: "vs-code-ai-helper.commitAndPushTask",
+        arg: { taskFolderPath: task.taskFolderPath },
+        taskKey: task.taskFolderPath,
+        chainId: "auto-publish",
+      });
+    }
+  }
 
   // Persist this task as the current task so the keyboard shortcut router and
   // status bar reflect the operated-on task immediately — CurrentTaskStore is

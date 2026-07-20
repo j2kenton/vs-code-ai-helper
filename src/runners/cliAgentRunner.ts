@@ -16,6 +16,7 @@ import { ImplementationRunResult } from "./copilotImplementationRunner";
 import { cliDisplayLabel, CliProviderDefinition, CliRunMode } from "./providers";
 import { classifyCliFailure } from "../utils/quota";
 import { writeRunLog } from "../utils/runLog";
+import { taskOperations } from "../utils/taskOperations";
 import {
   IMPLEMENTATION_FILENAME,
   LEGACY_IMPLEMENTATION_FILENAME,
@@ -374,12 +375,17 @@ async function persistRetryAuditLog(
     return;
   }
   try {
-    await writeRunLog(
+    const auditLogUri = await writeRunLog(
       taskFolderUri,
       `${runnerId}-retry`,
       stage ?? "impl",
       formatRetryAuditLog(providerLabel, mode, entries)
     );
+    // Best effort, and expected to be superseded once the run's own final
+    // log is written (this call site has no operation handle, so resolve
+    // the task's live root operation the same way taskOperations.tokenFor
+    // does for the run itself).
+    taskOperations.setResultTargetUriForTask(taskFolderUri.fsPath, auditLogUri);
   } catch {
     // Auditing is evidence, not control flow.
   }

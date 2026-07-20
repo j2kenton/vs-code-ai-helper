@@ -307,9 +307,9 @@ void describe("provider CLI contracts", () => {
 
     const claude = getCliProvider("claude-cli");
     assert.ok(claude);
-    // Never "Switch account": /login alone does not verifiably log out an
-    // already-authenticated session, so the button must not overpromise.
-    assert.strictEqual(claude.signInLabel, "Sign In");
+    // Re-running the sign-in flow while already authenticated is how a user
+    // switches accounts for CLIs with no dedicated logout/switch command.
+    assert.strictEqual(claude.signInLabel, "Sign in / Switch account");
 
     const kiro = getCliProvider("kiro-cli");
     assert.ok(kiro);
@@ -373,19 +373,23 @@ void describe("provider CLI contracts", () => {
     // UI button state and dispatch behavior. Usage surfaces are IN-SESSION
     // slash commands, so the interactive kind launches the CLI and then
     // sends the slash command into the running session — never a one-shot
-    // command line. Only VERIFIED descriptors are automated: an unverified
-    // one (Gemini's /stats model) is downgraded to manual instructions until
-    // it is confirmed against the installed CLI. Copilot usage is
-    // unsupported (no command reports its quota); unsupported renders a
-    // disabled button with the reason.
+    // command line. Only VERIFIED descriptors are automated OR even offered
+    // as a manual fallback: an unverified one (Gemini's /stats model,
+    // Antigravity's /usage) renders a DISABLED button ("unsupported", no
+    // url) rather than a nonfunctional "try this in a terminal" suggestion —
+    // per the approved capability matrix, an unconfirmed action must not
+    // ship as if it works. Copilot/Kiro usage is likewise "unsupported" (no
+    // command reports their quota at all); unsupported renders a disabled
+    // button with the reason (or an enabled link-out button when a url is
+    // present).
     const expectations: Record<
       string,
       { kind: string; launch?: string; send?: string }
     > = {
       copilot: { kind: "unsupported" },
       "claude-cli": { kind: "interactive", launch: "claude", send: "/usage" },
-      "codex-cli": { kind: "interactive", launch: "codex", send: "/usage" },
-      "gemini-cli": { kind: "manual" },
+      "codex-cli": { kind: "interactive", launch: "codex", send: "/status" },
+      "gemini-cli": { kind: "unsupported" },
       "antigravity-cli": { kind: "unsupported" },
       "kiro-cli": { kind: "unsupported" },
     };
@@ -406,23 +410,24 @@ void describe("provider CLI contracts", () => {
       if (entry.usage.kind === "unsupported") {
         assert.ok(entry.usage.reason.length > 0, `${entry.id} unsupported usage needs a reason`);
       }
-      // No provider's sign-in button claims "Switch account" — none of these
-      // flows verifiably log the user out before logging back in.
-      assert.strictEqual(entry.signInLabel, "Sign In", entry.id);
+      // Every provider's sign-in button reads "Sign in / Switch account":
+      // re-running the same flow while already authenticated is how a user
+      // switches accounts for CLIs with no dedicated logout/switch command.
+      assert.strictEqual(entry.signInLabel, "Sign in / Switch account", entry.id);
     }
 
     // Gemini's /stats invocation follows the CLI's documented slash-command
     // surface but has not been re-confirmed against an installed binary —
-    // its descriptor stays "unverified" and the account entry is downgraded
-    // to manual instructions naming the launch command and slash command.
+    // its descriptor stays "unverified", so the account entry renders a
+    // DISABLED usage button (no url) rather than a nonfunctional suggestion.
     const geminiCli = getCliProvider("gemini-cli");
     assert.ok(geminiCli?.usageAction);
     assert.strictEqual(geminiCli.usageAction.validated, "unverified");
     const gemini = getProviderAccountEntry("gemini-cli");
     assert.ok(gemini);
-    assert.ok(gemini.usage.kind === "manual");
-    assert.match(gemini.usage.instructions, /gemini/);
-    assert.match(gemini.usage.instructions, /\/stats model/);
+    assert.ok(gemini.usage.kind === "unsupported");
+    assert.strictEqual(gemini.usage.url, undefined, "unverified usage must not resolve to an enabled button");
+    assert.match(gemini.usage.reason, /gemini/);
     const claude = getProviderAccountEntry("claude-cli");
     assert.ok(claude);
     assert.ok(claude.usage.kind === "interactive");
@@ -443,12 +448,20 @@ void describe("provider CLI contracts", () => {
     assert.ok(kiroEntry.usage.kind === "unsupported");
     assert.strictEqual(kiroEntry.usage.url, "https://app.kiro.dev/account/usage");
 
-    // Antigravity has no known usage page to link to, so it stays a plain
-    // disabled button with just the explanatory reason.
+    // Antigravity's /usage invocation follows the CLI's documented
+    // slash-command surface but has not been re-confirmed against an
+    // installed binary — its descriptor stays "unverified", so its account
+    // entry renders a DISABLED usage button too, the same treatment as
+    // Gemini's /stats (no unverified provider may resolve to an enabled
+    // button anywhere).
+    const antigravityCli = getCliProvider("antigravity-cli");
+    assert.ok(antigravityCli?.usageAction);
+    assert.strictEqual(antigravityCli.usageAction.validated, "unverified");
     const antigravity = getProviderAccountEntry("antigravity-cli");
     assert.ok(antigravity);
     assert.ok(antigravity.usage.kind === "unsupported");
-    assert.strictEqual(antigravity.usage.url, undefined);
+    assert.strictEqual(antigravity.usage.url, undefined, "unverified usage must not resolve to an enabled button");
+    assert.match(antigravity.usage.reason, /agy/);
   });
 
   void it("Kiro hints mention KIRO_API_KEY requirement", () => {

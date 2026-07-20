@@ -13,6 +13,7 @@ import { ensureAiConsent } from "../utils/aiConsent";
 import { checkAndConfirmPromptSize } from "../utils/promptSizeGuard";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { safeOpenTextDocument } from "../utils/fileUtils";
+import { ChatViewProvider } from "../views/chatView";
 
 import { shortcutHint } from "../utils/shortcutHints";
 import { backupArtifactBeforeWrite, backupArtifactContents } from "../utils/artifactBackups";
@@ -20,9 +21,15 @@ import { patchTaskProgress, IncompleteTask } from "../utils/taskProgressUtils";
 import {
   linkCancellationTokens,
   runTrackedOperation,
+  taskOperations,
 } from "../utils/taskOperations";
 
-const INTRO_TEXT = `Briefly describe what changes you want to be made, and then use AI to help you clarify the plan.`;
+// Must match the placeholder paragraph in resources/prompts/task-template.md
+// verbatim (including its line breaks) so it strips cleanly out of a fresh,
+// undrafted task's pre-header content instead of leaking into
+// taskDescription — where it would otherwise be treated as the user's own
+// description (fed to the AI as such, and used to derive a task name).
+const INTRO_TEXT = `Describe the work you want to do here in as much detail as is useful. When\nyou're ready, use **Draft with AI** to turn these notes into a structured task\ndescription. Questions from the stage AI appear in the **Chat With AI** panel.`;
 const SHORTCUT_NOTE = `Shortcut: Apply Current Stage Action${shortcutHint("vs-code-ai-helper.applyCurrentStageAction")}.`;
 
 /** Filename for the temporary AI output file used during draft-task runs. */
@@ -445,6 +452,7 @@ export function normalizeDraftTaskArg(
 export async function draftTaskWithAI(
   inventory: TaskInventory,
   context: vscode.ExtensionContext,
+  chatViewProvider: ChatViewProvider,
   explicitArg?: DraftTaskArg
 ): Promise<boolean | undefined> {
   // ── Workspace guard (must come before consent) ──────────────────────────
@@ -586,7 +594,10 @@ export async function draftTaskWithAI(
         cancellable: true,
       },
       async (progress, token) => {
-        NotificationRouter.emitProgressSummary(`Drafting task with ${providerLabel}...`);
+        NotificationRouter.emitProgressSummary(
+          `Drafting task with ${providerLabel}...`,
+          taskOperations.rootOperationIdFor(taskFolderUri.fsPath)
+        );
         progress.report({ message: `Waiting for ${providerLabel} response...` });
 
         // Cancellable from either surface: the native progress toast and the
@@ -611,7 +622,7 @@ export async function draftTaskWithAI(
             },
             linked.token
           );
-          await writeRunLog(
+          const draftLogUri = await writeRunLog(
             taskFolderUri,
             runner.id,
             "desc",
@@ -619,6 +630,7 @@ export async function draftTaskWithAI(
               result.summary ?? result.errorMessage ?? ""
             }`
           );
+          op.setResultTargetUri(draftLogUri);
           if (result.status !== "completed") {
             return {
               status: result.status === "cancelled" ? "cancelled" : "failed",
@@ -776,7 +788,14 @@ export async function draftTaskWithAI(
   // been manually renamed. A draft heading is the best concise summary we
   // have without spending another model request.
   if (resolvedTask.progress.nameIsDefault !== false) {
-    const title = aiOutput.draftWithAI.match(/^#\s+(.+)$/m)?.[1]?.trim();
+    // The draft-task-with-ai prompt never emits an H1 — it opens "## Draft
+    // with AI" with a one-sentence goal line, then ### subsections. That
+    // opening line is the best concise summary already produced without an
+    // extra model request, so it (not a nonexistent H1) is the task name.
+    const title = aiOutput.draftWithAI
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .find((line) => line.length > 0 && !line.startsWith("#"));
     if (title) {
       await patchTaskProgress(taskFolderUri, (current) => ({
         ...current,
@@ -788,9 +807,35 @@ export async function draftTaskWithAI(
       }));
     }
   }
+
+  if (hasBlockingOpenQuestions(aiOutput.openQuestions)) {
+    // The drafted task can't proceed until these are answered — open Chat
+    // With AI on this task's Description stage and pose them directly rather
+    // than leaving them sitting unread in task.md's Open Questions section.
+    await chatViewProvider.ask(
+      {
+        canonicalId: resolvedTask.canonicalId,
+        taskFolderPath: resolvedTask.taskFolderPath,
+        stage: "desc",
+        question:
+          `Draft with AI raised open questions that need your input before this task can proceed:\n\n${aiOutput.openQuestions}`,
+      },
+      true
+    );
+  }
   return true;
     }
   );
+}
+
+/**
+ * Whether a drafted task's Open Questions section actually blocks progress
+ * (as opposed to the AI's explicit "nothing is unclear" sentinel — see the
+ * draft-task-with-ai prompt's "write exactly: - None." instruction).
+ */
+function hasBlockingOpenQuestions(openQuestions: string): boolean {
+  const normalized = openQuestions.trim().toLowerCase();
+  return normalized.length > 0 && normalized !== "- none." && normalized !== "none.";
 }
 
 /**
@@ -798,12 +843,13 @@ export async function draftTaskWithAI(
  */
 export function registerDraftTaskWithAICommand(
   context: vscode.ExtensionContext,
-  inventory: TaskInventory
+  inventory: TaskInventory,
+  chatViewProvider: ChatViewProvider
 ): void {
   const disposable = vscode.commands.registerCommand(
     "vs-code-ai-helper.draftTaskWithAI",
-    (explicitArg?: Parameters<typeof draftTaskWithAI>[2]) =>
-      draftTaskWithAI(inventory, context, explicitArg)
+    (explicitArg?: Parameters<typeof draftTaskWithAI>[3]) =>
+      draftTaskWithAI(inventory, context, chatViewProvider, explicitArg)
   );
   context.subscriptions.push(disposable);
 }

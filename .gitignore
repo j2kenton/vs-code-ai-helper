@@ -48,6 +48,4 @@ coverage/
 # Managed by Ensemble. Do not edit this block manually.
 /artifacts/helper/
 /.ensemble/
-/.ensemble/**/chat-v1.json
-/.ensemble/**/chat-v1.corrupt.json
 # END Ensemble managed meta resources

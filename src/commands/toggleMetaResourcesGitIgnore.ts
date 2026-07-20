@@ -300,6 +300,23 @@ function renderManagedBlock(patterns: readonly string[]): string[] {
   return [MANAGED_BEGIN, MANAGED_NOTE, ...patterns, MANAGED_END];
 }
 
+/**
+ * True when `pattern` is already ignored by one of `rootPatterns` — i.e. some
+ * root pattern is a directory ignore (`/foo/`) and `pattern` falls under it.
+ * Used to drop the transcript-specific persistent patterns
+ * (`/.ensemble/star-star/chat-v1.json`) when the task-root pattern itself
+ * (`/.ensemble/`) is already in the block: a nested pattern under an already
+ * fully-ignored directory adds nothing and is confusing clutter.
+ */
+function isCoveredByIgnoredRoot(
+  pattern: string,
+  rootPatterns: readonly string[]
+): boolean {
+  return rootPatterns.some(
+    (root) => root.endsWith("/") && pattern.startsWith(root)
+  );
+}
+
 export function applyManagedMetaGitIgnoreBlock(
   content: string,
   patterns: readonly string[],
@@ -344,11 +361,19 @@ export function applyManagedMetaGitIgnoreBlock(
     return `${nextLines.join(eol)}${eol}`;
   }
 
+  // A persistent pattern already covered by one of the root `patterns`
+  // (e.g. /.ensemble/**/chat-v1.json under /.ensemble/) is redundant here —
+  // the root pattern already ignores everything beneath it. It only earns
+  // its keep in the "Show Meta Files" branch above, where the root pattern
+  // is removed but the transcript files must still stay ignored.
+  const nonRedundantPersistent = persistentPatterns.filter(
+    (pattern) => !isCoveredByIgnoredRoot(pattern, patterns)
+  );
   const nextLines = [...withoutManaged];
   if (nextLines.length > 0) {
     nextLines.push("");
   }
-  nextLines.push(...renderManagedBlock([...new Set([...patterns, ...persistentPatterns])]));
+  nextLines.push(...renderManagedBlock([...new Set([...patterns, ...nonRedundantPersistent])]));
   return `${nextLines.join(eol)}${eol}`;
 }
 

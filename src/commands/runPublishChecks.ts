@@ -9,6 +9,7 @@ import { safeOpenTextDocument } from "../utils/fileUtils";
 import { STAGE_ARTIFACT_FILENAMES } from "../types/taskProgress";
 import {
   runTrackedOperation,
+  taskOperations,
   TaskOperationHandle,
 } from "../utils/taskOperations";
 
@@ -105,7 +106,10 @@ export async function runPublishChecks(
           cancellable: false,
         },
         async (progress) => {
-          NotificationRouter.emitProgressSummary("Running Publish checks...");
+          NotificationRouter.emitProgressSummary(
+            "Running Publish checks...",
+            taskOperations.rootOperationIdFor(lockKey)
+          );
           try {
             progress.report({ message: "Running lint, type and test checks..." });
             const result = await runCompletionLint(

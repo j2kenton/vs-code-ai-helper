@@ -74,7 +74,7 @@ type WindowStub = {
 
 type WorkspaceStub = {
   workspaceFolders: typeof vscode.workspace.workspaceFolders;
-  fs: Pick<typeof vscode.workspace.fs, "createDirectory" | "writeFile">;
+  fs: Pick<typeof vscode.workspace.fs, "createDirectory" | "writeFile" | "readDirectory" | "readFile">;
   openTextDocument: typeof vscode.workspace.openTextDocument;
 };
 
@@ -217,6 +217,79 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
       assert.strictEqual(newest.message, "message 59"); // Newest
       assert.strictEqual(oldest.message, "message 0"); // Oldest — nothing evicted
 
+      deactivateNotificationRouter();
+    });
+  });
+
+  void describe("Click-to-open target precedence (D11)", () => {
+    void it("opens the legacy filePath when present, even if resultTargetUri is also set", () => {
+      const surface = new StatusTreeProvider();
+      initNotificationRouter(surface);
+      surface.addEntry("Done", "info", "/dev/task_1/plan.md", "ensemble-notification:/other.txt");
+      const [entry] = surface.getEntries();
+      const item = surface.getTreeItem(requireValue(entry, "missing entry"));
+      assert.deepEqual(item.command?.arguments, [vscode.Uri.file("/dev/task_1/plan.md")]);
+      deactivateNotificationRouter();
+    });
+
+    void it("opens the resultTargetUri (parsed, not treated as a bare fsPath) when there is no filePath", () => {
+      const surface = new StatusTreeProvider();
+      initNotificationRouter(surface);
+      const runLogUri = vscode.Uri.file("/dev/task_1/runs/001-impl.md");
+      surface.addEntry("Run Implementation — task_1: completed", "info", undefined, runLogUri.toString());
+      const [entry] = surface.getEntries();
+      const item = surface.getTreeItem(requireValue(entry, "missing entry"));
+      assert.equal((item.command?.arguments?.[0] as vscode.Uri).toString(), runLogUri.toString());
+      deactivateNotificationRouter();
+    });
+
+    void it("keeps navigating to the fallback text on click, exposing actionCommand only as an inline action", () => {
+      const surface = new StatusTreeProvider();
+      initNotificationRouter(surface);
+      NotificationRouter.showWarning(
+        "Auto-publish skipped for task_1: Completion checks did not pass. Publish manually once checks pass, or use Publish Anyway from Commit and Push.",
+        undefined,
+        undefined,
+        undefined,
+        {
+          command: "vs-code-ai-helper.commitAndPushTask",
+          title: "Publish Anyway",
+          args: [{ taskFolderPath: "/dev/task_1" }],
+        }
+      );
+      const [entry] = surface.getEntries();
+      const item = surface.getTreeItem(requireValue(entry, "missing entry"));
+      // Click still opens the full notification text — actionCommand no
+      // longer hijacks row navigation (D11 regression fix).
+      assert.equal(item.command?.command, "vscode.open");
+      const uri = item.command?.arguments?.[0] as vscode.Uri;
+      assert.equal(uri.scheme, "ensemble-notification");
+      // The follow-up is available as a separate inline context-menu action.
+      assert.match(item.contextValue ?? "", /\bensemble-notification-actionable\b/);
+
+      let invokedArgs: unknown[] | undefined;
+      const registration = vscode.commands.registerCommand(
+        "vs-code-ai-helper.commitAndPushTask",
+        (...args: unknown[]) => { invokedArgs = args; }
+      );
+      try {
+        surface.runAction(requireValue(entry, "missing entry"));
+      } finally {
+        registration.dispose();
+      }
+      assert.deepEqual(invokedArgs, [{ taskFolderPath: "/dev/task_1" }]);
+      deactivateNotificationRouter();
+    });
+
+    void it("falls back to a read-only ensemble-notification: document when neither target is known", () => {
+      const surface = new StatusTreeProvider();
+      initNotificationRouter(surface);
+      surface.addEntry("Something happened with no target", "warning");
+      const [entry] = surface.getEntries();
+      const item = surface.getTreeItem(requireValue(entry, "missing entry"));
+      const uri = item.command?.arguments?.[0] as vscode.Uri;
+      assert.equal(uri.scheme, "ensemble-notification");
+      assert.match(decodeURIComponent(uri.query), /Something happened with no target/);
       deactivateNotificationRouter();
     });
   });
@@ -501,7 +574,11 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
           .find(([file]) => file.endsWith("task-progress.json"))?.[1];
         assert.ok(progressDocument, "task progress should be persisted");
         const progress = JSON.parse(progressDocument) as { status?: string };
-        assert.strictEqual(progress.status, "paused", "new tasks must never take over the active task");
+        assert.strictEqual(
+          progress.status,
+          "active",
+          "a new task starts active when no other task under this meta root is already active"
+        );
       } finally {
         creationFilesystem.restore();
         win.showErrorMessage = origShowErrorMessage;
@@ -534,6 +611,8 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
       const origShowErrorMessage = win.showErrorMessage;
       const origShowInformationMessage = win.showInformationMessage;
       const origExecuteCommand = commandApi.executeCommand;
+      const origReadDirectory = workspace.fs.readDirectory;
+      const origReadFile = workspace.fs.readFile;
       const writtenFiles = new Map<string, string>();
       const commands: Array<{ command: string; args: unknown[] }> = [];
       workspace.workspaceFolders = [{ uri: vscode.Uri.file("/workspace"), name: "workspace", index: 0 }];
@@ -541,6 +620,23 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
       workspace.fs.writeFile = (uri: vscode.Uri, bytes: Uint8Array): Promise<void> => {
         writtenFiles.set(uri.path, new TextDecoder().decode(bytes));
         return Promise.resolve();
+      };
+      // Simulate a pre-existing ACTIVE task under the same meta root, so the
+      // new task's disk scan finds it and starts paused — exercising the
+      // Resume-offer path this test is actually about.
+      workspace.fs.readDirectory = (): Promise<Array<[string, vscode.FileType]>> =>
+        Promise.resolve([["2026-01-01_task_1", vscode.FileType.Directory]]);
+      workspace.fs.readFile = (uri: vscode.Uri): Promise<Uint8Array> => {
+        if (uri.path.includes("2026-01-01_task_1") && uri.path.endsWith("task-progress.json")) {
+          return Promise.resolve(new TextEncoder().encode(JSON.stringify({
+            taskFolder: "2026-01-01_task_1",
+            currentStage: "desc",
+            status: "active",
+            createdAt: "2026-01-01T00:00:00.000Z",
+            updatedAt: "2026-01-01T00:00:00.000Z",
+          })));
+        }
+        return Promise.reject(new Error("ENOENT"));
       };
       workspace.openTextDocument = (): Promise<vscode.TextDocument> => Promise.resolve({} as vscode.TextDocument);
       win.showTextDocument = (): Promise<vscode.TextEditor> => Promise.resolve({} as vscode.TextEditor);
@@ -577,6 +673,8 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
         workspace.workspaceFolders = origWorkspaceFolders;
         workspace.fs.createDirectory = origCreateDirectory;
         workspace.fs.writeFile = origWriteFile;
+        workspace.fs.readDirectory = origReadDirectory;
+        workspace.fs.readFile = origReadFile;
         workspace.openTextDocument = origOpenTextDocument;
         win.showTextDocument = origShowTextDocument;
         deactivateNotificationRouter();

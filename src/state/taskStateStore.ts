@@ -104,6 +104,34 @@ export async function withMetaRootLock<T>(tasksRoot: string, operation: () => Pr
   });
 }
 
+/**
+ * Acquire the session+meta locks for every distinct meta root in
+ * `tasksRoots` before running `operation`, then release them all. Used by
+ * task creation, which must check "no active task exists under ANY meta root
+ * reachable from this window" and write this task's initial status in one
+ * atomic section spanning every one of those roots — a single `withMetaRootLock`
+ * only excludes concurrent mutation under its own root, so a sibling
+ * workspace folder's root could otherwise still race the disk scan.
+ *
+ * Roots are locked in a fixed (sorted) order regardless of the order they're
+ * passed in, so two callers locking the same set of roots in different
+ * argument order can never deadlock on each other.
+ */
+export async function withAllMetaRootsLock<T>(
+  tasksRoots: readonly string[],
+  operation: () => Promise<T>
+): Promise<T> {
+  const sorted = Array.from(new Set(tasksRoots.map((p) => path.resolve(p)))).sort();
+  const acquireNext = (index: number): Promise<T> => {
+    const root = sorted[index];
+    if (root === undefined) {
+      return operation();
+    }
+    return withMetaRootLock(root, () => acquireNext(index + 1));
+  };
+  return acquireNext(0);
+}
+
 /** Compare-and-set persistence for task JSON files. */
 export async function updateTaskState<T>(uri: vscode.Uri, mutate: (value: T) => T, expectedUpdatedAt?: string): Promise<T> {
   const raw = await fs.promises.readFile(uri.fsPath, "utf8");
