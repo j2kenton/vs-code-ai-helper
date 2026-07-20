@@ -11,7 +11,31 @@ src/**
 out/**
 coverage/**
 node_modules/**
+
+# Task meta folders. These hold run logs, which contain full AI prompts and
+# context packs (verbatim source excerpts, absolute local paths) — the same
+# content commitAndPushTask deliberately excludes from commits and DISCLAIMER.md
+# flags as sensitive. `plans/` is the pre-0.53.0 name, kept so an older or
+# custom-configured task root stays excluded too.
+#
+# NOTE: vsce ignores .gitignore entirely whenever a .vscodeignore exists, so
+# .gitignore offers NO protection here. If DEFAULT_TASK_ROOT in
+# src/utils/taskRoot.ts is ever renamed again, this list must be updated in the
+# same change or private data ships to the marketplace silently.
+.ensemble/**
 plans/**
+
+# Author working material — not user documentation.
+notes/**
+docs/**
+plan-final.md
+
+# Test and build tooling.
+test-stubs/**
+dist/test/**
+tsconfig.test.json
+scripts/**
+.pnpm-store/**
 
 .eslintrc.json
 .gitignore
@@ -19,6 +43,7 @@ tsconfig.json
 esbuild.js
 pnpm-lock.yaml
 package-lock.json
+pnpm-workspace.yaml
 yarn.lock
 
 *.vsix
