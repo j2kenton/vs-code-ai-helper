@@ -475,6 +475,13 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
       { model: "gemini-2.5-flash", name: "Gemini 2.5 Flash" },
     ],
     usesLastMessageFile: false,
+    // Text mode passes no approval flag at all — verified 2026-07-20 against
+    // gemini 0.51.0 by direct testing (trusted workspace, asked to write a
+    // file) that this is genuinely read-only, not merely unconfigured:
+    // headless gemini's default agent has no write_file/run_shell_command/
+    // invoke_agent tools available at all ("is not available to this
+    // agent"), and `--approval-mode auto_edit` (edit mode, below) is what
+    // grants them — there is no separate flag to omit. No file was written.
     buildArgs(mode, model): string[] {
       const args: string[] = [];
       if (mode === "edit") {
@@ -571,8 +578,24 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
       "and review. It can create, change, or delete any file in your workspace " +
       "without asking. Its headless CLI offers no scoped alternative.",
     buildArgs(_mode, model, _lastMessageFile, context): string[] {
+      // promptTransport: "file" is a contract with the caller (see
+      // CliBuildArgsContext.promptFile): cliAgentRunner always writes the
+      // prompt to disk and passes its path before calling buildArgs for a
+      // provider declared this way. A missing promptFile here means that
+      // contract was violated by the caller, not a normal runtime state.
+      // Verified 2026-07-20: agy itself rejects an empty `--print=` value
+      // outright ("Error: empty prompt. Usage: agy --print \"your prompt
+      // here\"", exit 1) rather than proceeding silently — so the failure
+      // wouldn't be silent, but it would read as a bad prompt rather than
+      // the actual defect (a missing promptFile upstream). Throwing here
+      // names the real cause instead of leaving it to agy's generic message.
+      if (!context?.promptFile) {
+        throw new Error(
+          "Antigravity CLI provider misconfiguration: promptTransport is \"file\" but no promptFile was provided to buildArgs."
+        );
+      }
       const args: string[] = [
-        `--print=${context?.promptFile ?? ""}`,
+        `--print=${context.promptFile}`,
         "--dangerously-skip-permissions",
       ];
       if (model) {

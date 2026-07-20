@@ -8,4 +8,4 @@
  * A unit test in src/test/disclaimerVersion.test.ts asserts that this
  * value matches the Version line in DISCLAIMER.md.
  */
-export const DISCLAIMER_VERSION = 1;
+export const DISCLAIMER_VERSION = 2;

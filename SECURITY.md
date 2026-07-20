@@ -2,7 +2,7 @@
 
 ## Overview
 
-VS Code AI Helper is a personal developer tool that orchestrates AI providers (GitHub Copilot, Claude, Codex, Gemini) to assist with task planning and implementation. This document describes what the extension enforces, what it does not enforce, and how to report vulnerabilities.
+VS Code AI Helper is a personal developer tool that orchestrates AI providers (GitHub Copilot, Claude, Codex, Gemini, Antigravity, Kiro) to assist with task planning and implementation. This document describes what the extension enforces, what it does not enforce, and how to report vulnerabilities.
 
 ---
 
@@ -35,12 +35,20 @@ This is an in-process software control — it does not prevent a user who has co
 - Paths that resolve outside the workspace are rejected with an error returned to the model.
 - This is an **internal software boundary**, not an OS-level sandbox.
 
-**CLI implementation runs (Claude, Codex, Gemini):**
+**CLI implementation runs (Claude, Codex, Gemini, Kiro):**
 
 - The CLI process runs with the workspace as its working directory.
-- Access is limited by the vendor's own permission flags: Claude `--permission-mode acceptEdits`, Codex `--sandbox workspace-write`, Gemini `--approval-mode auto_edit`.
+- Access is limited by the vendor's own permission flags: Claude `--permission-mode acceptEdits`, Codex `--sandbox workspace-write`, Gemini `--approval-mode auto_edit`, Kiro `--trust-all-tools`.
 - These flags are the **vendor CLIs' own enforcement** — the extension does not add an additional sandbox layer on top.
 - The model can still read, create, modify, and delete files anywhere within the workspace.
+- Outside implementation mode (plan, review, chat), these four stay read-only via their own flags instead: Claude `--permission-mode plan`, Codex `--sandbox read-only`, Kiro `--trust-tools fs_read,grep,glob`; Gemini's default agent has no write/shell tools available at all, so it needs no separate flag. This is the baseline Antigravity is the exception to, below.
+
+**Antigravity CLI (all modes, not just implementation):**
+
+- Antigravity runs with `--dangerously-skip-permissions` in **text mode and edit mode alike** — its headless CLI has no scoped-permission flag; every tool call an agent-mode session would otherwise need to prompt for is auto-approved instead.
+- Unlike the four CLIs above, this means Antigravity's plan and review runs are **not** read-only: they carry the same file-modification risk as an implementation run.
+- Verified 2026-07-20 against agy 1.1.4: no combination of `--sandbox`, `--mode plan`, or a `permissions.allow` grant (tested as a path prefix, a bare tool-class grant, and a literal-target grant) constrained a run — only the bypass flag's absence would, and its absence also makes the CLI refuse to run at all, since headless mode cannot prompt for approval.
+- Antigravity is **off by default**; enabling it is an explicit opt-in, and Provider Selection shows this risk before you enable it.
 
 ### Context sent to AI providers
 
@@ -59,7 +67,7 @@ Eligibility rules for open editors included in provider-bound context packs:
 - The extension itself contains no HTTP client code.
 - Network activity occurs through:
   - VS Code's Language Model API (for Copilot), which manages authentication and transmission internally.
-  - Vendor CLI processes (`claude`, `codex`, `gemini`) spawned as child processes; their network behaviour is governed by the vendor CLIs.
+  - Vendor CLI processes (`claude`, `codex`, `gemini`, `agy`/`antigravity`, `kiro-cli`) spawned as child processes; their network behaviour is governed by the vendor CLIs.
   - Git, spawned as a child process for the commit-and-push command.
 - The extension does not make direct outbound HTTP/HTTPS calls.
 
@@ -82,6 +90,7 @@ Eligibility rules for open editors included in provider-bound context packs:
 ### Temp files
 
 - Some CLI runs (Codex) write a temporary last-message file to `os.tmpdir()`.
+- Antigravity (`promptTransport: "file"`) writes the full prompt — including the entire context pack — to a temp file in `os.tmpdir()` before every run, since its CLI takes the prompt as a file path rather than via stdin. The file is written with mode `0600` and deleted after the run.
 - Deletion is best-effort only; the file may persist if cleanup fails.
 - On POSIX, the temp directory is created with mode `0700`.
 
@@ -91,7 +100,8 @@ Eligibility rules for open editors included in provider-bound context packs:
 
 - AI implementation runs can modify or delete **any file inside the workspace**, not just files related to the current task. This is by design — the AI needs broad access to implement code changes.
 - The secret-filename denylist catches well-known naming conventions only. A secret pasted into an arbitrarily-named file is not caught.
-- CLI sandbox flags (Claude `acceptEdits`, Codex `workspace-write`, Gemini `auto_edit`) do not prevent the model from issuing shell commands that the CLI itself approves; behaviour depends on the vendor CLI's own policy.
+- CLI sandbox flags (Claude `acceptEdits`, Codex `workspace-write`, Gemini `auto_edit`, Kiro `--trust-all-tools`) do not prevent the model from issuing shell commands that the CLI itself approves; behaviour depends on the vendor CLI's own policy.
+- Antigravity has no sandbox flag to begin with: `--dangerously-skip-permissions` runs in every mode, so its plan and review runs carry implementation-level file-modification risk. This is a deliberate, accepted exception — see the Antigravity CLI section above and the Antigravity note in the README.
 - There is no token-spending ceiling or cost estimate. Users are responsible for their own provider costs.
 - Run logs in `runs/` contain full prompt content. If pushed to a remote repository, that content becomes remotely accessible.
 - The git binary on PATH is trusted implicitly. Ensure your environment's PATH is not compromised.

@@ -1,6 +1,6 @@
 # Disclaimer & Terms of Use
 
-**Version: 1**
+**Version: 2**
 
 > **Read this before using any AI-powered feature of this extension.**
 > This document is the single canonical source of the extension's disclaimer.
@@ -49,6 +49,8 @@ Every "with AI" command consumes quota or usage from the AI subscription you hav
 | Claude (Anthropic) | Your Anthropic Pro/Max subscription or API credits |
 | OpenAI Codex | Your ChatGPT Plus/Pro subscription or OpenAI API credits |
 | Gemini CLI | Your Google account Gemini subscription or API quota |
+| Antigravity CLI | Your Google account Gemini/Antigravity subscription or API quota |
+| Kiro CLI | Your Kiro subscription, plus a `KIRO_API_KEY` for headless use |
 
 **Real money or subscription usage is consumed every time an AI command runs.**
 
@@ -75,6 +77,8 @@ When you run an AI implementation command, the selected AI model is given permis
 - Claude CLI uses `--permission-mode acceptEdits`.
 - Codex CLI uses `--sandbox workspace-write`.
 - Gemini CLI uses `--approval-mode auto_edit`.
+- Kiro CLI uses `--trust-all-tools`.
+- **Antigravity CLI uses `--dangerously-skip-permissions` — in every mode, not just implementation.** Its headless CLI has no scoped-permission flag at all, so plan and review runs carry the same full bypass as implementation runs. See the Antigravity note in the README before enabling it.
 
 The model can overwrite any file inside the workspace, including files unrelated to the task. There is no internal sandbox beyond the workspace boundary and the vendor's own permission flags. **Always commit or back up your workspace before running an implementation.**
 
@@ -156,7 +160,8 @@ Data you send to third-party providers is governed by **their** privacy and data
 - [GitHub Copilot Privacy](https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement)
 - [Anthropic Privacy](https://www.anthropic.com/privacy)
 - [OpenAI Privacy](https://openai.com/privacy/)
-- [Google Privacy](https://policies.google.com/privacy)
+- [Google Privacy](https://policies.google.com/privacy) — covers both Gemini CLI and Antigravity CLI (Google accounts)
+- [AWS Privacy](https://aws.amazon.com/privacy/) — covers Kiro CLI
 
 ---
 
@@ -203,7 +208,7 @@ Documentation and disclosures are not a substitute for legal review. No guarante
 
 - [ ] I have read this disclaimer and understand the risks.
 - [ ] I understand that AI runs consume real quota/money from my subscription.
-- [ ] I understand that AI implementation runs can modify or delete files in my workspace.
+- [ ] I understand that AI implementation runs — and, for providers without a scoped permission mode (see §4), any run including plan and review — can modify or delete files in my workspace.
 - [ ] I will supervise every AI action and review results before acting on them.
 - [ ] I have committed or backed up my workspace before running AI implementation commands.
 - [ ] I understand that all eligible open-editor file contents (including unsaved buffers) may be sent to the AI provider.

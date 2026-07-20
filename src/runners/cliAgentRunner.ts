@@ -657,10 +657,29 @@ export async function execCliAgent(options: {
     }
   };
 
-  const args = def.buildArgs(mode, model, lastMessageFile, {
-    cwd,
-    promptFile,
-  });
+  // A provider's buildArgs may throw on its own precondition violations
+  // (e.g. Antigravity's promptFile contract — see its buildArgs comment).
+  // Catch it here rather than let it propagate past cleanupPromptFile and
+  // persistRetryAuditLog (owned by the caller's retry loop, above this
+  // function on the stack): both would otherwise be skipped, leaking the
+  // 0600 temp prompt file and silently dropping the retry audit trail.
+  // Report it the same way every other transport-precondition check in
+  // this function does, via classifyCliFailure.
+  let args: string[];
+  try {
+    args = def.buildArgs(mode, model, lastMessageFile, {
+      cwd,
+      promptFile,
+    });
+  } catch (error) {
+    cleanupPromptFile();
+    const message = error instanceof Error ? error.message : String(error);
+    return classifyCliFailure({
+      status: "failed",
+      output: "",
+      errorMessage: message,
+    });
+  }
 
   if (promptTransport === "argv") {
     if (useShell) {

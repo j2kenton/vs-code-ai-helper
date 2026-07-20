@@ -85,6 +85,24 @@ void describe("provider CLI contracts", () => {
       "--model",
       "gemini-3-pro",
     ]);
+
+    // promptTransport: "file" is a contract with the caller — cliAgentRunner
+    // always writes the prompt to disk and supplies its path before calling
+    // buildArgs. A missing promptFile means that contract was violated, and
+    // must fail loudly rather than silently building `--print=` (an empty
+    // prompt indistinguishable from a real one downstream). Matching
+    // /misconfiguration/, not just /promptFile/: with a fully-omitted
+    // context argument, an unguarded `context.promptFile` access would
+    // throw its own TypeError containing the word "promptFile" even if the
+    // explicit guard were deleted, making a looser regex pass vacuously.
+    assert.throws(
+      () => antigravity.buildArgs("text", undefined, undefined, {}),
+      /misconfiguration/
+    );
+    assert.throws(
+      () => antigravity.buildArgs("text", undefined, undefined),
+      /misconfiguration/
+    );
   });
 
   void it("text mode stays permission-constrained unless the provider warns the user", () => {
