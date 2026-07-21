@@ -230,7 +230,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           break;
         }
         case "validationError": {
-          void vscode.window.showErrorMessage(data.message);
+          NotificationRouter.showError(data.message);
           break;
         }
         case "saveProviders": {
@@ -260,7 +260,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                 listCommands: () => Promise.resolve(vscode.commands.getCommands(true)),
                 executeCommand: (command) => Promise.resolve(vscode.commands.executeCommand(command)),
                 showInfo: (message) => NotificationRouter.showInformation(message),
-                showError: (message) => void vscode.window.showErrorMessage(message),
+                showError: (message) => NotificationRouter.showError(message),
               }
             );
             break;
@@ -296,7 +296,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             );
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
-            void vscode.window.showErrorMessage(
+            NotificationRouter.showError(
               `Could not open a terminal for the ${accountEntryDisplayLabel(provider)} sign-in: ${message}`
             );
           }
@@ -333,7 +333,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                   await vscode.commands.executeCommand(usage.fallbackCommand);
                 } catch (error) {
                   const message = error instanceof Error ? error.message : String(error);
-                  void vscode.window.showErrorMessage(
+                  NotificationRouter.showError(
                     `Could not run the ${accountEntryDisplayLabel(provider)} usage check: ${message}`
                   );
                 }
@@ -361,7 +361,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             );
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
-            void vscode.window.showErrorMessage(
+            NotificationRouter.showError(
               `Could not open a terminal for the ${accountEntryDisplayLabel(provider)} usage check: ${message}`
             );
           }
@@ -482,7 +482,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       for (const conflict of conflicts) {
         await clearTaskStageModels(conflict.taskFolderUri, conflict.stages);
       }
-      void vscode.window.showInformationMessage(
+      NotificationRouter.showInformation(
         `Cleared leftover per-task model overrides for ${conflicts.length} ${taskWord}.`
       );
     }
@@ -746,7 +746,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             flex: 1;
           }
           .add-backup {
-            margin-top: var(--ensemble-space-1);
+            margin-top: var(--ensemble-space-3);
           }
           .backup-limit {
             margin-left: var(--ensemble-space-1);
@@ -778,8 +778,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         </div>
 
         <div class="btn-container" id="model-settings-buttons" hidden>
-          <button id="discard-btn" class="secondary" disabled>Discard Unsaved Changes</button>
-          <button id="save-btn" disabled>Save Model Selection</button>
+          <button id="discard-btn" class="secondary" disabled title="Revert unsaved model selection changes back to the last saved settings">Discard Unsaved Changes</button>
+          <button id="save-btn" disabled title="Save the current model selection">Save Model Selection</button>
         </div>
 
         <script nonce="${nonce}">
@@ -854,8 +854,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                 '<p>' + escapeHtml(actionLabel) + ' will discard them.</p>' +
                 '<label class="dialog-checkbox"><input type="checkbox" id="unsaved-dont-show"> Don\\'t show again</label>' +
                 '<div class="btn-container">' +
-                '<button id="unsaved-discard">Discard Changes</button>' +
-                '<button id="unsaved-keep" class="secondary">Keep Editing</button>' +
+                '<button id="unsaved-discard" title="Discard the unsaved changes and proceed">Discard Changes</button>' +
+                '<button id="unsaved-keep" class="secondary" title="Cancel and keep editing your unsaved changes">Keep Editing</button>' +
                 '</div></div>';
               document.body.appendChild(overlay);
               const opener = document.activeElement;
@@ -1216,7 +1216,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             item.className = 'extra-backup';
             item.innerHTML =
               modelComboboxHtml(kind, stage, selectedId || '', false) +
-              '<button type="button" class="secondary remove-backup" aria-label="Remove backup">×</button>';
+              '<button type="button" class="secondary remove-backup" aria-label="Remove backup" title="Remove this backup model">×</button>';
             item.querySelector('.remove-backup').addEventListener('click', () => {
               item.remove();
               syncBackupLimitFor(row);
@@ -1233,7 +1233,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             if (!addBackupButton || !backupLimit) return;
             const count = 1 + row.querySelectorAll('.extra-backups .model-combobox').length;
             addBackupButton.disabled = count >= 10;
-            addBackupButton.title = count >= 10 ? 'A maximum of 10 backup models is allowed' : '';
+            addBackupButton.title = count >= 10 ? 'A maximum of 10 backup models is allowed' : 'Add another backup model for this stage';
             backupLimit.textContent = count + '/10';
           }
 
@@ -1254,7 +1254,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                   : '')
               ).join('') +
               '<p class="provider-help">Enabled providers determine which models are offered below. Sign-in and usage checks run in a visible terminal; the extension reports them as launched, not as succeeded.</p>' +
-              '<div class="btn-container"><button id="save-providers-btn">Save Provider Selection</button></div>' +
+              '<div class="btn-container"><button id="save-providers-btn" title="Save the enabled provider selection">Save Provider Selection</button></div>' +
               '</fieldset>';
             container.querySelectorAll('[data-signin-provider]').forEach(button => {
               button.addEventListener('click', () => {
@@ -1312,7 +1312,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                   \${modelComboboxHtml('backup', stage, backupModels[0] || '', false)}
                   \${backupQuotaText}
                   <div class="extra-backups"></div>
-                  <button type="button" class="secondary add-backup">+ Add another backup</button>
+                  <button type="button" class="secondary add-backup" title="Add another backup model for this stage">+ Add another backup</button>
                   <span class="backup-limit">1/10</span>
                 </div>
               \`;
@@ -1404,8 +1404,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                 '<div id="unsaved-warning-dialog" role="alertdialog" aria-modal="true">' +
                 '<p><strong>' + escapeHtml(message) + '</strong></p>' +
                 '<div class="btn-container">' +
-                '<button id="destructive-confirm">' + escapeHtml(confirmLabel) + '</button>' +
-                '<button id="destructive-cancel" class="secondary">Cancel</button>' +
+                '<button id="destructive-confirm" title="' + escapeHtml(confirmLabel) + '">' + escapeHtml(confirmLabel) + '</button>' +
+                '<button id="destructive-cancel" class="secondary" title="Cancel and keep the current settings">Cancel</button>' +
                 '</div></div>';
               document.body.appendChild(overlay);
               const opener = document.activeElement;

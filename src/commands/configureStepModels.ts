@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import { TaskStage } from "../types/taskProgress";
 import { IncompleteTask } from "../utils/taskProgressUtils";
 import { SettingsViewProvider } from "../views/settingsView";
+import { NotificationRouter } from "../utils/notificationRouter";
 
 export type StageSave =
   | { type: "workspace"; modelId: string | undefined }
@@ -70,7 +71,7 @@ async function revealSettingsView(
   try {
     await vscode.commands.executeCommand("workbench.view.extension.ai-helper");
   } catch {
-    void vscode.window.showWarningMessage(
+    NotificationRouter.showError(
       "Could not open Ensemble Settings automatically. Open the Ensemble sidebar and select Settings."
     );
   }

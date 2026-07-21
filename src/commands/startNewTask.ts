@@ -207,7 +207,7 @@ export async function startNewTask(
         { title: "Choose the workspace for this task", placeHolder: "Tasks must belong to exactly one workspace folder" }
       ).then(selection => selection?.folder);
   if (!workspaceRoot) {
-    void vscode.window.showErrorMessage(
+    NotificationRouter.showWarning(
       "Open your repo folder in VS Code before starting a task. Ensemble will create .ensemble there automatically."
     );
     return undefined;
@@ -227,7 +227,7 @@ export async function startNewTask(
     );
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    void vscode.window.showErrorMessage(
+    NotificationRouter.showError(
       `Failed to create task folder: ${message}`
     );
     return undefined;
@@ -328,15 +328,17 @@ async function createTask(
     // An existing active task remains the target of shortcuts and in-flight
     // operations. The explicit argument is essential; a bare resume command
     // would instead resume the older current task.
-    void vscode.window.showInformationMessage(
+    NotificationRouter.showWarning(
       "Task created in paused state.",
-      "Resume"
-    ).then((choice) => {
-      if (choice === "Resume") {
-        return vscode.commands.executeCommand("vs-code-ai-helper.resumeTask", { taskFolderPath });
+      undefined,
+      undefined,
+      undefined,
+      {
+        command: "vs-code-ai-helper.resumeTask",
+        title: "Resume",
+        args: [{ taskFolderPath }],
       }
-      return undefined;
-    });
+    );
   }
 
   // Surface the new folder name on the operation row (and in its terminal

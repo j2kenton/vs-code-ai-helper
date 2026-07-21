@@ -100,7 +100,7 @@ export async function archiveTask(
     currentTaskStore
   );
   if (!resolved) {
-    void vscode.window.showErrorMessage(
+    NotificationRouter.showError(
       "The task could not be found. Refresh the Tasks panel and try again."
     );
     return;
@@ -122,7 +122,7 @@ export async function archiveTask(
   // cancel the real run and wait for termination before touching state.
   const cancelResult = await cancelRunningOperationsForArchive(resolved.taskFolderPath);
   if (!cancelResult.ok) {
-    void vscode.window.showErrorMessage(
+    NotificationRouter.showError(
       `Could not archive "${resolved.folderName}": ${cancelResult.reason}`
     );
     return;
@@ -159,7 +159,7 @@ export async function archiveTask(
     );
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    void vscode.window.showErrorMessage(message);
+    NotificationRouter.showError(message);
   }
 }
 
@@ -187,7 +187,7 @@ export async function resumeArchivedTask(
     currentTaskStore
   );
   if (!resolved) {
-    void vscode.window.showErrorMessage(
+    NotificationRouter.showError(
       "The task could not be found. Refresh the Tasks panel and try again."
     );
     return;
@@ -240,7 +240,7 @@ export async function resumeArchivedTask(
     );
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    void vscode.window.showErrorMessage(message);
+    NotificationRouter.showError(message);
   }
 }
 

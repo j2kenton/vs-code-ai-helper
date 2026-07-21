@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import { TaskInventory } from "../state/taskInventory";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
+import { NotificationRouter } from "../utils/notificationRouter";
 
 /**
  * Apply low-level review changes. This command provides a concrete entry point
@@ -17,7 +18,7 @@ export async function applyLowLevelReviewChanges(
   });
 
   if (pausedCheck && pausedCheck.progress.status === "paused") {
-    void vscode.window.showInformationMessage(
+    NotificationRouter.showWarning(
       "Task is paused. Resume it before applying review changes."
     );
     return;
@@ -28,7 +29,7 @@ export async function applyLowLevelReviewChanges(
   });
 
   if (!resolvedTask) {
-    void vscode.window.showInformationMessage(
+    NotificationRouter.showWarning(
       "No tasks at the Low-Level Review stage."
     );
     return;
@@ -38,7 +39,7 @@ export async function applyLowLevelReviewChanges(
     resolvedTask.progress.currentStage !== "plan-low-review" &&
     resolvedTask.progress.currentStage !== "impl-low-review"
   ) {
-    void vscode.window.showInformationMessage(
+    NotificationRouter.showWarning(
       "Task is not at a Low-Level Review stage."
     );
     return;

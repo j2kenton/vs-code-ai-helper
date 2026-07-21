@@ -469,6 +469,12 @@ const commands = {
   registerCommand: (id, handler) => { commands._handlers.set(id, handler); return { dispose: () => commands._handlers.delete(id) }; },
 };
 
+// `setContext` is a built-in VS Code command (not something extension code
+// registers) used widely as a fire-and-forget side effect — e.g.
+// TaskInventory.refresh()'s loading-state context key. Tests that don't care
+// about it shouldn't need to stub it individually.
+commands._handlers.set("setContext", async () => undefined);
+
 // Minimal lm stub: selectChatModels is overridable by individual tests via
 // installRunnerStubs() in commandArgNormalization.test.ts. The default
 // returns [] (no models) so CopilotLanguageModelRunner.isAvailable() returns

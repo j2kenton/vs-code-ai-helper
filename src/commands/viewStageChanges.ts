@@ -263,7 +263,7 @@ async function performStageSwap(node: StageNode | undefined, kind: StageSwapKind
           kind === "revert" ? "reverted" : "applied"
         );
       } catch (error) {
-        void vscode.window.showErrorMessage(
+        NotificationRouter.showError(
           error instanceof Error ? error.message : String(error)
         );
         return;

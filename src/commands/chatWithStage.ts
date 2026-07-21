@@ -309,7 +309,7 @@ export async function chatWithStage(
   const { resolverArg, stage, message } = normalizeArg(explicitArg);
   const task = await resolveTaskContext(inventory, resolverArg, { allowPaused: true });
   if (!task) {
-    void vscode.window.showInformationMessage("No task found. Please select a task first.");
+    NotificationRouter.showWarning("No task found. Please select a task first.");
     return;
   }
   const targetStage = stage ?? task.progress.currentStage;
@@ -349,11 +349,13 @@ export async function chatWithStage(
     if (!workspaceFolder) throw new Error("The task is not inside an open workspace.");
     const { modelId } = await resolveFreshModelForStage(taskFolderUri, targetStage);
     if (!modelId) {
-      const choice = await vscode.window.showWarningMessage(
+      NotificationRouter.showWarning(
         "No model is configured for this stage. Open Ensemble Settings and choose a primary model before continuing.",
-        { modal: true }, "Open Settings"
+        undefined,
+        undefined,
+        undefined,
+        { command: "vs-code-ai-helper.openSettings", title: "Open Settings" }
       );
-      if (choice === "Open Settings") await vscode.commands.executeCommand("vs-code-ai-helper.openSettings");
       return;
     }
     const { runner, nativeModelId } = resolveRunnerForModel(modelId, targetStage, taskFolderUri);

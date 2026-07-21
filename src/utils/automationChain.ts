@@ -59,8 +59,14 @@ function defaultDeps(): AutomationChainDeps {
   };
 }
 
-/** Chains currently pending or running, keyed by `${taskKey}::${chainId}`. */
-const activeChainKeys = new Set<string>();
+/**
+ * Chains currently pending or running, keyed by `${taskKey}::${chainId}`,
+ * each mapped to a unique token identifying the specific claim. The token
+ * lets a superseded claim's own (delayed) release become a safe no-op
+ * instead of deleting a different, later claim that has since taken the
+ * same key — see releaseAutomationChain below.
+ */
+const activeChainKeys = new Map<string, symbol>();
 
 function chainGuardKey(taskKey: string, chainId: string): string {
   return `${taskKey}::${chainId}`;
@@ -80,9 +86,40 @@ export function resetAutomationChainGuards(): void {
 }
 
 /**
+ * Release a (taskKey, chainId) guard slot early, before the dispatch that
+ * currently holds it has settled.
+ *
+ * Needed specifically for a review that auto-advances directly into the
+ * *next* review stage and re-dispatches under the same "auto-review"
+ * chainId (e.g. plan-high-review scoring above threshold and starting
+ * plan-low-review): that follow-up call happens synchronously inside the
+ * still-running command this very chain slot was claimed for, so without
+ * releasing first, claimChainGuard sees its own not-yet-settled outer
+ * dispatch as a "duplicate" and silently drops the follow-up — the task is
+ * left sitting on the new review stage with nothing running. The caller
+ * must only call this when it is actually handing off to a successor link
+ * in the same logical chain, immediately before the next scheduleAutomationChain
+ * call (synchronously, so no unrelated trigger can claim the slot in between).
+ */
+export function releaseAutomationChain(
+  taskKey: string | undefined,
+  chainId: string
+): void {
+  if (!taskKey) {
+    return;
+  }
+  activeChainKeys.delete(chainGuardKey(taskKey, chainId));
+}
+
+/**
  * Claim the (taskKey, chainId) guard slot. Returns a release function, or
  * undefined when an identical chain is already pending/running (duplicate —
  * caller must drop the new chain).
+ *
+ * The returned release only clears the slot while it still holds THIS
+ * claim's token — if releaseAutomationChain (or a later claim) has already
+ * superseded it, release() is a safe no-op rather than deleting whatever
+ * newer claim now owns the key.
  */
 function claimChainGuard(
   taskKey: string | undefined,
@@ -95,8 +132,13 @@ function claimChainGuard(
   if (activeChainKeys.has(key)) {
     return undefined;
   }
-  activeChainKeys.add(key);
-  return () => activeChainKeys.delete(key);
+  const token = Symbol(key);
+  activeChainKeys.set(key, token);
+  return () => {
+    if (activeChainKeys.get(key) === token) {
+      activeChainKeys.delete(key);
+    }
+  };
 }
 
 /**

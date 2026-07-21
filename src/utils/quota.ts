@@ -3,6 +3,7 @@ import { AgentRunRequest, AgentRunResult } from "../types/agentRunner";
 import type { TaskStage } from "../types/taskProgress";
 import { notifyDesktop } from "./desktopNotifier";
 import { taskOperations } from "./taskOperations";
+import { NotificationRouter } from "./notificationRouter";
 
 export interface PendingResumeOperation {
   request: Omit<AgentRunRequest, "taskFolderUri" | "workspaceUri" | "outputFile"> & {
@@ -58,6 +59,11 @@ export async function handleQuotaFailure(context: vscode.ExtensionContext, reque
   await savePendingResume(context, request);
   notifyDesktop("Ensemble — question", "AI credits are exhausted. Resume when they restore, or switch model?");
   taskOperations.report(request.taskFolderUri.fsPath, "waiting for your answer — credits exhausted");
+  // Also route into the internal Notifications panel as a terminal/error
+  // record (per severity policy: exhausted credits block the run). The
+  // interactive choice itself must stay a real modal below — "Resume" vs
+  // "Switch model" are genuine alternative actions the caller branches on.
+  NotificationRouter.showError("AI credits are exhausted.");
   const choice = await vscode.window.showWarningMessage("AI credits are exhausted.", "Resume when credits restore", "Switch model");
   taskOperations.report(request.taskFolderUri.fsPath, undefined);
   if (choice === "Switch model") { await switchModel?.(); return "switch"; }

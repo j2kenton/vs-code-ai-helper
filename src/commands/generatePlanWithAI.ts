@@ -162,7 +162,7 @@ export async function generatePlanWithAI(
     if (retried) {
       taskFolderUri = vscode.Uri.file(retried.taskFolderPath);
     } else {
-      void vscode.window.showErrorMessage(
+      NotificationRouter.showError(
         `Task with ID "${normalized.canonicalId}" not found. It may have been deleted or moved.`
       );
       return;
@@ -244,14 +244,13 @@ async function generatePlanWithAIForResolvedTask(
 ): Promise<GeneratePlanResult> {
   const model = await resolveFreshModelForStage(taskFolderUri, "plan");
   if (!model.modelId) {
-    const openSettings = await vscode.window.showWarningMessage(
+    NotificationRouter.showWarning(
       "No model is configured for the Plan stage. Open Ensemble Settings and choose a primary model before continuing.",
-      { modal: true },
-      "Open Settings"
+      undefined,
+      undefined,
+      undefined,
+      { command: "vs-code-ai-helper.openSettings", title: "Open Settings" }
     );
-    if (openSettings === "Open Settings") {
-      await vscode.commands.executeCommand("vs-code-ai-helper.openSettings");
-    }
     return { succeeded: false, triggerAutoReview: false };
   }
 
@@ -259,13 +258,13 @@ async function generatePlanWithAIForResolvedTask(
   // resolve it so this command cannot write into an unrelated workspace.
   const ownedTask = inventory.getTaskByPath(taskFolderUri.fsPath);
   if (!ownedTask) {
-    void vscode.window.showErrorMessage("The selected task is not owned by this workspace.");
+    NotificationRouter.showError("The selected task is not owned by this workspace.");
     return { succeeded: false, triggerAutoReview: false };
   }
   taskFolderUri = vscode.Uri.file(ownedTask.taskFolderPath);
   const workspaceFolderUri = ownedTask.workspaceFolder;
   if (!workspaceFolderUri) {
-    void vscode.window.showErrorMessage("The selected task has no owning workspace.");
+    NotificationRouter.showError("The selected task has no owning workspace.");
     return { succeeded: false, triggerAutoReview: false };
   }
   const { runner, nativeModelId } = resolveRunnerForModel(
@@ -417,7 +416,7 @@ async function generatePlanWithAIForResolvedTask(
             "Plan generation cancelled."
           );
         } else {
-          void vscode.window.showErrorMessage(
+          NotificationRouter.showError(
             `Plan generation failed: ${
               result.errorMessage ?? "unknown error"
             }. Use the manual planning workflow instead.`

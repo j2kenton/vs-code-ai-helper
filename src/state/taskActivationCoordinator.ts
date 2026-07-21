@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import { TaskInventory } from "./taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
+import { NotificationRouter } from "../utils/notificationRouter";
 import { patchTaskProgress, readTaskProgress, updateTaskStatus } from "../utils/taskProgressUtils";
 import { withMetaRootLock } from "./taskStateStore";
 import type { TaskProgress, TaskStatus } from "../types/taskProgress";
@@ -208,7 +209,7 @@ async function activateTaskLocked(
  */
 function warnBestEffort(message: string): void {
   try {
-    void vscode.window.showWarningMessage(message);
+    NotificationRouter.showWarning(message);
   } catch {
     // Notification surface unavailable — the caller's boolean/checkpoint
     // state already reflects the pending condition; nothing else to do.

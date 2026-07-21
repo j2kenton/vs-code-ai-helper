@@ -81,54 +81,98 @@ export class TaskInventory {
   }
 
   /**
+   * True while a refresh() call is in flight. Mirrored to the
+   * `vs-code-ai-helper.isLoadingTasks` context key so the tasks view's
+   * "Loading tasks…" welcome content can distinguish "still discovering
+   * tasks" from "discovery finished and found nothing".
+   */
+  private loading = false;
+
+  /**
+   * True once refresh() has completed (successfully or not) at least once.
+   * Mirrored to `vs-code-ai-helper.tasksInitialized`. Kept separate from
+   * TaskTreeProvider's onDidLoadTasks event, which can fire against a
+   * still-empty inventory before the first refresh() resolves — using that
+   * event to drive tasksInitialized let the tasks view flash its "No tasks
+   * yet" empty state before the real (async) load had finished.
+   */
+  private loadedOnce = false;
+
+  /** Whether a refresh() is currently in flight. */
+  isLoading(): boolean {
+    return this.loading;
+  }
+
+  /** Whether refresh() has completed at least once since construction. */
+  hasLoadedOnce(): boolean {
+    return this.loadedOnce;
+  }
+
+  /**
    * Refresh the task inventory by discovering all tasks and loading their progress.
    */
   async refresh(): Promise<void> {
-    const discovered = await discoverAllTasks();
+    this.loading = true;
+    void vscode.commands.executeCommand("setContext", "vs-code-ai-helper.isLoadingTasks", true);
+    try {
+      const discovered = await discoverAllTasks();
 
-    // Load progress for visible tasks
-    const withProgress: TaskWithProgress[] = [];
+      // Load progress for visible tasks
+      const withProgress: TaskWithProgress[] = [];
 
-    for (const task of discovered) {
-      try {
-        const progress = await readTaskProgress(vscode.Uri.file(task.taskFolderPath));
-        if (!progress) {
-          continue;
+      for (const task of discovered) {
+        try {
+          const progress = await readTaskProgress(vscode.Uri.file(task.taskFolderPath));
+          if (!progress) {
+            continue;
+          }
+
+          const repaired = await repairLegacyOwnership(
+            task.taskFolderPath,
+            progress,
+            task.resolvedTaskRootPath ?? path.dirname(task.taskFolderPath)
+          );
+          withProgress.push({
+            ...task,
+            progress: repaired.progress,
+          });
+        } catch {
+          // Task folder exists but no valid progress file, skip
         }
-
-        const repaired = await repairLegacyOwnership(
-          task.taskFolderPath,
-          progress,
-          task.resolvedTaskRootPath ?? path.dirname(task.taskFolderPath)
-        );
-        withProgress.push({
-          ...task,
-          progress: repaired.progress,
-        });
-      } catch {
-        // Task folder exists but no valid progress file, skip
       }
+
+      // Keep a stable ID/date order, newest first. Status and activity must
+      // not reshuffle tasks, which made paused tasks appear to move
+      // unexpectedly.
+      withProgress.sort((a, b) => compareTasksNewestFirst(a.folderName, b.folderName));
+
+      this.visibleTasks = withProgress;
+
+      // Rebuild lookup maps
+      this.taskByCanonicalId.clear();
+      for (const task of withProgress) {
+        this.taskByCanonicalId.set(task.canonicalId, task);
+      }
+
+      // Suppression alias map is not currently implemented because
+      // duplicate suppression happens in taskRoot.ts before we get here.
+      // For now, clear it.
+      this.suppressionAliasMap.clear();
+
+      this._onDidChange.fire();
+    } finally {
+      // Runs on both the success path above and on a thrown error, so a
+      // failed discovery still clears the loading state instead of leaving
+      // the tasks view stuck on "Loading tasks…" forever. tasksInitialized
+      // is intentionally monotonic (never reset back to false by a later
+      // refresh) — once real data has been shown, subsequent background
+      // refreshes must not make the tasks view flash back to a loading/empty
+      // welcome state.
+      this.loading = false;
+      this.loadedOnce = true;
+      void vscode.commands.executeCommand("setContext", "vs-code-ai-helper.isLoadingTasks", false);
+      void vscode.commands.executeCommand("setContext", "vs-code-ai-helper.tasksInitialized", true);
     }
-
-    // Keep a stable ID/date order, newest first. Status and activity must
-    // not reshuffle tasks, which made paused tasks appear to move
-    // unexpectedly.
-    withProgress.sort((a, b) => compareTasksNewestFirst(a.folderName, b.folderName));
-
-    this.visibleTasks = withProgress;
-
-    // Rebuild lookup maps
-    this.taskByCanonicalId.clear();
-    for (const task of withProgress) {
-      this.taskByCanonicalId.set(task.canonicalId, task);
-    }
-
-    // Suppression alias map is not currently implemented because
-    // duplicate suppression happens in taskRoot.ts before we get here.
-    // For now, clear it.
-    this.suppressionAliasMap.clear();
-
-    this._onDidChange.fire();
   }
 
   /**

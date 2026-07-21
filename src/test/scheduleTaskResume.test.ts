@@ -8,6 +8,7 @@ import {
   TaskActionScheduler,
 } from "../commands/scheduleTaskResume";
 import { TaskProgress } from "../types/taskProgress";
+import { initNotificationRouter, deactivateNotificationRouter, StatusSurface } from "../utils/notificationRouter";
 
 class FakeClock implements SchedulerClock {
   private nextId = 0;
@@ -74,6 +75,8 @@ void test("scheduled action is skipped if the task moves to another stage before
     return Promise.resolve(undefined);
   }) as typeof commands.executeCommand;
   window.showInformationMessage = () => undefined;
+  const surface: StatusSurface = { addEntry(): void {} };
+  initNotificationRouter(surface);
 
   try {
     await scheduler.arm("C:\\tasks\\task", "task-id");
@@ -86,6 +89,7 @@ void test("scheduled action is skipped if the task moves to another stage before
   } finally {
     commands.executeCommand = original;
     window.showInformationMessage = originalInfo;
+    deactivateNotificationRouter();
     scheduler.dispose();
   }
 });

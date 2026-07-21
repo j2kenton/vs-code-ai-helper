@@ -74,7 +74,7 @@ import {
   previousVersionUri,
 } from "../utils/artifactBackups";
 import { meetsAutoAdvanceThreshold, parseReadiness, parseReviewBlockers } from "../utils/reviewReadiness";
-import { scheduleAutomationChain } from "../utils/automationChain";
+import { scheduleAutomationChain, releaseAutomationChain } from "../utils/automationChain";
 import { buildVerifiedChecksSection, collectCompletionLintPreview, resolvePublishScopeFolder } from "../utils/completionLint";
 import { checkPublishPreflight } from "../utils/publishPreflight";
 import { improveReviewScore } from "../utils/reviewScoreLoop";
@@ -627,7 +627,7 @@ async function resolveTask(
     const folderUri = node.task.folderUri;
     const progress = await readTaskProgress(folderUri);
     if (!progress) {
-      void vscode.window.showErrorMessage(
+      NotificationRouter.showError(
         `Could not read task progress for ${node.task.folderName}.`
       );
       return undefined;
@@ -645,7 +645,7 @@ async function resolveTask(
       owner && isSameWorkspacePath(folder.uri.fsPath, owner)
     );
     if (owner && !owningWorkspace) {
-      void vscode.window.showErrorMessage("This task belongs to a different workspace and cannot be operated on here.");
+      NotificationRouter.showError("This task belongs to a different workspace and cannot be operated on here.");
       return undefined;
     }
     return { folderUri, progress };
@@ -658,7 +658,7 @@ async function resolveTask(
   // persisted-owner-only rule.
   const allWorkspaceFolders = vscode.workspace.workspaceFolders ?? [];
   if (allWorkspaceFolders.length === 0) {
-    void vscode.window.showErrorMessage(
+    NotificationRouter.showError(
       "No workspace folder open. Please open a folder first."
     );
     return undefined;
@@ -896,14 +896,13 @@ async function runAiToFile(options: {
     ? await resolveModelForStage(options.taskFolderUri, modelStage)
     : await resolveFreshModelForStage(options.taskFolderUri, modelStage);
   if (!model.modelId) {
-    const openSettings = await vscode.window.showWarningMessage(
+    NotificationRouter.showWarning(
       `No model is configured for ${modelStage}. Open Ensemble Settings and choose a primary model before continuing.`,
-      { modal: true },
-      "Open Settings"
+      undefined,
+      undefined,
+      undefined,
+      { command: "vs-code-ai-helper.openSettings", title: "Open Settings" }
     );
-    if (openSettings === "Open Settings") {
-      await vscode.commands.executeCommand("vs-code-ai-helper.openSettings");
-    }
     return false;
   }
   const { runner, providerLabel, nativeModelId } = resolveRunnerForModel(
@@ -998,7 +997,7 @@ async function runAiToFile(options: {
           // Revert instead of leaving the invalid response in place — an
           // exit-0 CLI result is not proof the task was actually performed.
           await writeTextFile(stagedOutputUri, previousContent ?? "");
-          void vscode.window.showErrorMessage(
+          NotificationRouter.showError(
             `${options.outputLabel} generation from ${providerLabel} did not produce a valid result ` +
               `(${validation.reason}). The provider may not have followed the instructions — try again.`
           );
@@ -1022,7 +1021,7 @@ async function runAiToFile(options: {
           `${options.outputLabel} generation cancelled.`
         );
       } else {
-        void vscode.window.showErrorMessage(
+        NotificationRouter.showError(
           `${options.outputLabel} generation failed: ${
             result.errorMessage ?? "unknown error"
           }.`
@@ -1963,6 +1962,36 @@ export async function runReviewForFolder(
                 // honored for the follow-up this call controls.
                 const followUpOwnsAutoPublish =
                   publishFollowUpReview && !options.suppressAutoPublishDispatch;
+                // This review may itself have been dispatched under the same
+                // "auto-review" chainId (e.g. nextStage's Step 4, or this
+                // same handoff one stage earlier) and that outer dispatch's
+                // guard slot has not settled yet — we are still inside its
+                // call stack. Without releasing it first, claiming
+                // "auto-review" again for the follow-up below sees its own
+                // not-yet-settled predecessor as a duplicate and silently
+                // drops the follow-up, leaving the task parked on the new
+                // review stage with nothing running.
+                //
+                // Only release when we can PROVE any currently-held claim is
+                // our own ancestor's bookkeeping, never a genuinely separate
+                // pending chain: taskOperations enforces one exclusive root
+                // operation per task, so if we are that task's current live
+                // root operation, nothing else can be concurrently executing
+                // a conflicting review — and a still-pending "auto-review"
+                // claim can only be deferred waiting on an operation handle
+                // it was given, which (options.operation being locally
+                // scoped, never published anywhere else) only our own
+                // ancestor call chain could have obtained. Leave a claim
+                // alone whenever this can't be established (e.g. invoked
+                // directly/manually with no operation handle) — the existing
+                // duplicate-chain guard must keep protecting a genuinely
+                // separate pending chain in that case.
+                if (
+                  options.operation &&
+                  taskOperations.rootOperationIdFor(folderUri.fsPath) === options.operation.id
+                ) {
+                  releaseAutomationChain(folderUri.fsPath, "auto-review");
+                }
                 const reviewChainScheduled = scheduleAutomationChain(
                   {
                     command: reviewCommand,
@@ -2004,7 +2033,18 @@ export async function runReviewForFolder(
                     }
                   });
                 } else {
-                  void reviewChainScheduled;
+                  // No auto-publish ownership riding on this dispatch (a
+                  // plain review-to-review handoff, e.g. plan-high-review ->
+                  // plan-low-review) — still warn if it was dropped, or the
+                  // task is silently left parked on the new review stage
+                  // with nothing running and no way for the user to notice.
+                  void reviewChainScheduled.then((scheduled) => {
+                    if (!scheduled) {
+                      NotificationRouter.showWarning(
+                        `Auto-advance reached ${STAGE_DISPLAY_NAMES[next]} for ${folderUri.fsPath}, but its review could not be started automatically because another review is already in progress for this task. Run the review manually.`
+                      );
+                    }
+                  });
                 }
               }
               if (
@@ -2218,7 +2258,7 @@ export async function runReviewWithAI(
   // Fail fast if no workspace is open at all; the ownership-aware resolution
   // (resolveOwnerWorkspace) happens after task resolution below.
   if ((vscode.workspace.workspaceFolders ?? []).length === 0) {
-    void vscode.window.showErrorMessage(
+    NotificationRouter.showError(
       "No workspace folder open. Please open a folder first."
     );
     return;
@@ -2233,7 +2273,7 @@ export async function runReviewWithAI(
   // (safe QuickPick fallback). Only structured objects with wrong shapes are
   // rejected here to avoid showing an error for args the user never intended.
   if (isMalformedReviewArg(arg as ReviewCommandArg | Record<string, unknown>)) {
-    void vscode.window.showErrorMessage(
+    NotificationRouter.showError(
       "Review: unsupported argument shape. " +
         "Use { taskFolderPath } to target a specific task, or invoke without an argument to pick from a list."
     );
@@ -2264,7 +2304,7 @@ export async function runReviewWithAI(
   // workspace so the context pack is generated from the correct workspace.
   const workspaceRoot = resolveOwnerWorkspace(resolved.progress);
   if (!workspaceRoot) {
-    void vscode.window.showErrorMessage(
+    NotificationRouter.showError(
       "Could not determine the owning workspace for this task. Please open the workspace that created it."
     );
     return;
@@ -2312,7 +2352,7 @@ export async function applyReviewWithAI(
 ): Promise<void> {
   // ── Pre-flight workspace guard ────────────────────────────────────────────
   if ((vscode.workspace.workspaceFolders ?? []).length === 0) {
-    void vscode.window.showErrorMessage(
+    NotificationRouter.showError(
       "No workspace folder open. Please open a folder first."
     );
     return;
@@ -2324,7 +2364,7 @@ export async function applyReviewWithAI(
   // or { task: {} } without folderUri, via `as any` or untyped JS).
   // Primitives ("x", 42, true) fall through to normalizeReviewArg safely.
   if (isMalformedReviewArg(arg as ReviewCommandArg | Record<string, unknown>)) {
-    void vscode.window.showErrorMessage(
+    NotificationRouter.showError(
       "Apply Review: unsupported argument shape. " +
         "Use { taskFolderPath } to target a specific task, or invoke without an argument to pick from a list."
     );
@@ -2355,7 +2395,7 @@ export async function applyReviewWithAI(
   // workspace so context packs and AI runs target the correct workspace.
   const workspaceRoot = resolveOwnerWorkspace(resolved.progress);
   if (!workspaceRoot) {
-    void vscode.window.showErrorMessage(
+    NotificationRouter.showError(
       "Could not determine the owning workspace for this task. Please open the workspace that created it."
     );
     return;
@@ -2575,14 +2615,14 @@ export async function fastForwardReviewWithAI(
   arg?: ReviewCommandArg
 ): Promise<void> {
   if ((vscode.workspace.workspaceFolders ?? []).length === 0) {
-    void vscode.window.showErrorMessage(
+    NotificationRouter.showError(
       "No workspace folder open. Please open a folder first."
     );
     return;
   }
 
   if (isMalformedReviewArg(arg as ReviewCommandArg | Record<string, unknown>)) {
-    void vscode.window.showErrorMessage(
+    NotificationRouter.showError(
       "Fast Forward Review: unsupported argument shape. " +
         "Use { taskFolderPath } to target a specific task, or invoke without an argument to pick from a list."
     );
@@ -2646,7 +2686,7 @@ export async function fastForwardReviewWithAI(
     // rather than telling the user to click Review separately first.
     const workspaceRoot = resolveOwnerWorkspace(resolved.progress);
     if (!workspaceRoot) {
-      void vscode.window.showErrorMessage(
+      NotificationRouter.showError(
         "Could not determine the owning workspace for this task. Please open the workspace that created it."
       );
       return;
@@ -2951,7 +2991,7 @@ export async function viewReview(
   // ── Malformed-arg guard ───────────────────────────────────────────────────
   // Primitives ("x", 42, true) fall through to normalizeReviewArg safely.
   if (isMalformedReviewArg(arg as ReviewCommandArg | Record<string, unknown>)) {
-    void vscode.window.showErrorMessage(
+    NotificationRouter.showError(
       "View Review: unsupported argument shape. " +
         "Use { taskFolderPath } to target a specific task, or invoke without an argument to pick from a list."
     );
@@ -3120,7 +3160,7 @@ export async function nextStage(
   }
 
   if (!transitionResult?.persisted) {
-    void vscode.window.showErrorMessage(
+    NotificationRouter.showError(
       `Could not persist stage advance for ${resolved.progress.taskFolder}. Please try again.`
     );
     return;
@@ -3330,7 +3370,7 @@ export async function generateImplementationWithAI(
 ): Promise<void> {
   // ── Workspace guard ───────────────────────────────────────────────────────
   if ((vscode.workspace.workspaceFolders ?? []).length === 0) {
-    void vscode.window.showErrorMessage(
+    NotificationRouter.showError(
       "No workspace folder open. Please open a folder first."
     );
     return;
@@ -3349,7 +3389,7 @@ export async function generateImplementationWithAI(
   // fail the plan-final.md existence check below, so advertising it in the
   // QuickPick would be misleading.
   if (isMalformedReviewArg(arg as ReviewCommandArg | Record<string, unknown>)) {
-    void vscode.window.showErrorMessage(
+    NotificationRouter.showError(
       "Generate Implementation: unsupported argument shape. " +
         "Use { taskFolderPath } to target a specific task, or invoke without an argument to pick from a list."
     );
@@ -3383,7 +3423,7 @@ export async function generateImplementationWithAI(
     try {
       planFinalUri = await materializeCanonicalIfNeeded(resolved.folderUri);
     } catch (error) {
-      void vscode.window.showErrorMessage(
+      NotificationRouter.showError(
         error instanceof Error ? error.message : String(error)
       );
       return;
@@ -3399,7 +3439,7 @@ export async function generateImplementationWithAI(
 
     const workspaceRoot = resolveOwnerWorkspace(resolved.progress);
     if (!workspaceRoot) {
-      void vscode.window.showErrorMessage(
+      NotificationRouter.showError(
         "Could not determine the owning workspace for this task. Please open the workspace that created it."
       );
       return;
@@ -3748,7 +3788,7 @@ export async function runImplementationWithAI(
 ): Promise<void> {
   // ── Workspace guard ───────────────────────────────────────────────────────
   if ((vscode.workspace.workspaceFolders ?? []).length === 0) {
-    void vscode.window.showErrorMessage(
+    NotificationRouter.showError(
       "No workspace folder open. Please open a folder first."
     );
     return;
@@ -3764,7 +3804,7 @@ export async function runImplementationWithAI(
   // before resolving so an action for the current task can never fall back to
   // a QuickPick containing another eligible implementation task.
   if (isMalformedReviewArg(arg as ReviewCommandArg | Record<string, unknown>)) {
-    void vscode.window.showErrorMessage(
+    NotificationRouter.showError(
       "Run Implementation: unsupported argument shape. " +
         "Use { taskFolderPath } to target a specific task, or invoke without an argument to pick from a list."
     );
@@ -3800,7 +3840,7 @@ export async function runImplementationWithAI(
     try {
       canonicalUri = await materializeCanonicalIfNeeded(resolved.folderUri);
     } catch (error) {
-      void vscode.window.showErrorMessage(
+      NotificationRouter.showError(
         error instanceof Error ? error.message : String(error)
       );
       return;
@@ -3826,7 +3866,7 @@ export async function runImplementationWithAI(
     if (needsChecklist) {
       const checklistWorkspace = resolveOwnerWorkspace(resolved.progress);
       if (!checklistWorkspace) {
-        void vscode.window.showErrorMessage(
+        NotificationRouter.showError(
           "Could not determine the owning workspace for this task. Please open the workspace that created it."
         );
         return;
@@ -3880,7 +3920,7 @@ export async function runImplementationWithAI(
 
     const workspaceRoot = resolveOwnerWorkspace(resolved.progress);
     if (!workspaceRoot) {
-      void vscode.window.showErrorMessage(
+      NotificationRouter.showError(
         "Could not determine the owning workspace for this task. Please open the workspace that created it."
       );
       return;
@@ -3966,7 +4006,7 @@ export function registerReviewActionCommands(
       async () => {
         const folders = vscode.workspace.workspaceFolders ?? [];
         if (folders.length === 0) {
-          void vscode.window.showWarningMessage("Open a workspace before choosing a release target.");
+          NotificationRouter.showWarning("Open a workspace before choosing a release target.");
           return;
         }
         let folder = folders[0];
@@ -4018,6 +4058,87 @@ class ReleaseRunFailure extends Error {}
 
 /** Name of the required release script in the target package.json. */
 export const RELEASE_SCRIPT_NAME = "ensemble:release";
+
+/**
+ * Error shown when the `ensemble:release` script (or, after one hop of
+ * indirection resolution, the script it points to) fails isSafeReleaseScript
+ * / cannot be safely resolved. Documents both accepted forms: a plain safe
+ * command, or a one-line pass-through to another script.
+ */
+const RELEASE_UNSAFE_SCRIPT_MESSAGE =
+  `Release requires a safe package.json "${RELEASE_SCRIPT_NAME}" script: a single command with no shell ` +
+  `chaining, pipes, redirects, or quotes (e.g. "${RELEASE_SCRIPT_NAME}": "node scripts/release.js"), or a ` +
+  `one-line "npm run <script>" / "pnpm run <script>" / "yarn <script>" that points to another script. That ` +
+  `referenced script may itself chain multiple steps with "&&" (e.g. "${RELEASE_SCRIPT_NAME}": "npm run release" ` +
+  `with "release": "npm run type-check && npm run lint && npm run test:all && npm run build"), but no other ` +
+  `shell operators.`;
+
+/**
+ * Matches an `ensemble:release` value that is *exactly* a one-line
+ * pass-through to another script — "npm run <name>", "pnpm run <name>", or
+ * "yarn <name>" — with nothing else chained or appended alongside it (e.g.
+ * "npm run release && rm -rf ." does not match). Capture group 1 or 2 holds
+ * the target script's name.
+ * @internal exported for testing
+ */
+export const RELEASE_INDIRECTION_PATTERN =
+  /^(?:npm|pnpm)[ \t]+run[ \t]+([a-zA-Z0-9@_./:+%=-]+)$|^yarn[ \t]+([a-zA-Z0-9@_./:+%=-]+)$/;
+
+/**
+ * Resolve one hop of `ensemble:release` indirection so the safety check (and
+ * the release confirmation dialog) covers the script that actually ends up
+ * running, not just an innocuous-looking pass-through call to it. Running
+ * `<manager> run ensemble:release` only ever directly executes the literal
+ * text of the `ensemble:release` script — but when that text is itself
+ * `npm run <name>`, the package manager resolves `<name>` at run time, so
+ * without this the confirmation dialog could show a harmless one-liner while
+ * the script it actually triggers does something entirely different.
+ *
+ * Only ever follows a single hop: the resolved target's own value is never
+ * itself re-resolved, so this cannot loop on a cycle. A target that names
+ * `ensemble:release` again (a self-reference) or that does not exist
+ * resolves to an `undefined` value, which callers must treat as unsafe.
+ *
+ * @internal exported for testing
+ */
+export function resolveReleaseScript(
+  script: string,
+  scripts: Record<string, unknown> | undefined
+): { name: string; value: unknown } {
+  const match = RELEASE_INDIRECTION_PATTERN.exec(script);
+  const targetName = match?.[1] ?? match?.[2];
+  if (!targetName) {
+    // Not an indirection — the script's own text is what runs.
+    return { name: RELEASE_SCRIPT_NAME, value: script };
+  }
+  if (targetName === RELEASE_SCRIPT_NAME) {
+    // Self-reference — never follow it back to "ensemble:release" itself.
+    return { name: targetName, value: undefined };
+  }
+  return { name: targetName, value: scripts?.[targetName] };
+}
+
+/**
+ * Whether a package.json script value is safe for the *resolved* target of
+ * an `ensemble:release` indirection (e.g. the "release" script that
+ * `"ensemble:release": "npm run release"` points to). Unlike
+ * isSafeReleaseScript, this allows "&&" so a legitimate multi-step release
+ * pipeline (`"npm run type-check && npm run lint && npm run test:all && npm
+ * run build"`) can be expressed as the pass-through target — the accepted
+ * way to chain commands here, since the top-level `ensemble:release` script
+ * itself must stay a single command or a one-line pass-through. Every other
+ * shell metacharacter isSafeReleaseScript guards against (pipes,
+ * backgrounding, redirects, command substitution, quotes, newlines) is still
+ * rejected: the value is split on "&&" and each resulting segment must pass
+ * isSafeReleaseScript on its own.
+ *
+ * @internal exported for testing
+ */
+export function isSafeReleaseIndirectionTarget(script: unknown): script is string {
+  if (typeof script !== "string" || script.trim().length === 0) return false;
+  if (/[\r\n]/.test(script)) return false;
+  return script.split(/[ \t]*&&[ \t]*/).every((segment) => isSafeReleaseScript(segment));
+}
 
 function releaseTargetStateKey(workspaceRoot: string): string {
   const normalized = path.resolve(workspaceRoot);
@@ -4086,7 +4207,7 @@ async function resolveReleaseTargetPackageJson(
     50
   );
   if (uris.length === 0) {
-    void vscode.window.showErrorMessage("No package.json was found in this workspace.");
+    NotificationRouter.showError("No package.json was found in this workspace.");
     return undefined;
   }
   const items = orderReleaseTargetItems(
@@ -4111,12 +4232,12 @@ async function resolveReleaseTargetPackageJson(
 async function runRelease(context: vscode.ExtensionContext, arg?: TaskNodeArg): Promise<void> {
   const candidate = arg?.task?.folderUri.fsPath;
   if (!candidate) {
-    void vscode.window.showWarningMessage("Release is available only from a task's Publish stage.");
+    NotificationRouter.showWarning("Release is available only from a task's Publish stage.");
     return;
   }
   let progress = candidate ? await readTaskProgress(vscode.Uri.file(candidate)) : undefined;
   if (!progress || progress.currentStage !== "publish" || progress.status === "paused") {
-    void vscode.window.showWarningMessage("Release requires an active task at the Publish stage. Resume the task first if it is paused.");
+    NotificationRouter.showWarning("Release requires an active task at the Publish stage. Resume the task first if it is paused.");
     return;
   }
   // Tasks can live in an external metadata root, so task-folder containment
@@ -4124,7 +4245,7 @@ async function runRelease(context: vscode.ExtensionContext, arg?: TaskNodeArg): 
   // binding and only use containment for legacy tasks without ownership.
   const ownershipValidation = await validateReleaseTaskOwnership(candidate, progress);
   if (!ownershipValidation.ok) {
-    void vscode.window.showErrorMessage(ownershipValidation.message);
+    NotificationRouter.showError(ownershipValidation.message);
     return;
   }
   progress = ownershipValidation.progress;
@@ -4135,11 +4256,11 @@ async function runRelease(context: vscode.ExtensionContext, arg?: TaskNodeArg): 
     vscode.workspace.workspaceFolders ?? []
   );
   if (persistedOwner && !owner) {
-    void vscode.window.showErrorMessage("This task belongs to a different workspace and cannot be released here.");
+    NotificationRouter.showError("This task belongs to a different workspace and cannot be released here.");
     return;
   }
   const root = owner?.uri.fsPath;
-  if (!root) { void vscode.window.showWarningMessage("Open a workspace before releasing."); return; }
+  if (!root) { NotificationRouter.showWarning("Open a workspace before releasing."); return; }
 
   await runTrackedOperation(
     candidate,
@@ -4165,17 +4286,31 @@ async function runRelease(context: vscode.ExtensionContext, arg?: TaskNodeArg): 
       if (!parsed || typeof parsed !== "object") throw new Error("package.json is not an object");
       pkg = parsed as { scripts?: Record<string, unknown> };
     }
-    catch { void vscode.window.showErrorMessage("No valid package.json was found at the selected release target."); return; }
+    catch { NotificationRouter.showError("No valid package.json was found at the selected release target."); return; }
     const script = pkg.scripts?.[RELEASE_SCRIPT_NAME];
     if (script === undefined) {
-      void vscode.window.showErrorMessage(
+      NotificationRouter.showWarning(
         `Release requires a "${RELEASE_SCRIPT_NAME}" script in ${path.relative(root, packageJsonPath) || "package.json"}. ` +
           `Add one, e.g. "${RELEASE_SCRIPT_NAME}": "npm run release", then try again.`
       );
       return;
     }
-    if (!isSafeReleaseScript(script)) { void vscode.window.showErrorMessage(`Release requires a safe package.json "${RELEASE_SCRIPT_NAME}" script.`); return; }
-    if (!vscode.workspace.isTrusted) { void vscode.window.showErrorMessage("Release requires a trusted workspace."); return; }
+    if (!isSafeReleaseScript(script)) { NotificationRouter.showWarning(RELEASE_UNSAFE_SCRIPT_MESSAGE); return; }
+    // "ensemble:release" may be a one-line pass-through to another script
+    // (e.g. "npm run release"); resolve that single hop so the confirmation
+    // dialog below covers the script that actually runs, not just the
+    // pass-through call to it. See resolveReleaseScript. The resolved target
+    // is allowed to chain multiple commands with "&&" (a legitimate
+    // multi-step release pipeline) even though the top-level
+    // "ensemble:release" script may not — see isSafeReleaseIndirectionTarget.
+    const resolved = resolveReleaseScript(script, pkg.scripts);
+    const isIndirect = resolved.name !== RELEASE_SCRIPT_NAME;
+    const targetIsSafe = isIndirect
+      ? isSafeReleaseIndirectionTarget(resolved.value)
+      : isSafeReleaseScript(resolved.value);
+    if (!targetIsSafe) { NotificationRouter.showWarning(RELEASE_UNSAFE_SCRIPT_MESSAGE); return; }
+    const effectiveScript = resolved.value as string;
+    if (!vscode.workspace.isTrusted) { NotificationRouter.showWarning("Release requires a trusted workspace."); return; }
     const manager = fs.existsSync(path.join(packageDir, "pnpm-lock.yaml")) || fs.existsSync(`${root}/pnpm-lock.yaml`)
       ? "pnpm"
       : fs.existsSync(path.join(packageDir, "yarn.lock")) || fs.existsSync(`${root}/yarn.lock`)
@@ -4183,18 +4318,25 @@ async function runRelease(context: vscode.ExtensionContext, arg?: TaskNodeArg): 
         : fs.existsSync(path.join(packageDir, "bun.lockb")) || fs.existsSync(`${root}/bun.lockb`)
           ? "bun"
           : "npm";
-    const scriptHash = crypto.createHash("sha256").update(script).digest("hex");
+    const scriptHash = crypto.createHash("sha256").update(effectiveScript).digest("hex");
     const commandText = `${manager} run ${RELEASE_SCRIPT_NAME}`;
+    const scriptLabel = isIndirect ? `${RELEASE_SCRIPT_NAME} → ${resolved.name}` : RELEASE_SCRIPT_NAME;
     // Same safeguard as before the move to a terminal: the user reviews the
     // project-defined script body (and its hash) before anything runs, and a
-    // post-confirmation script change cancels the release.
-    const confirmation = await vscode.window.showWarningMessage(`Run release?\n\nCommand: ${commandText}\nWorking directory: ${packageDir}\nPackage manager: ${manager}\nScript: ${script}\nSHA-256: ${scriptHash}`, { modal: true }, "Run Release");
+    // post-confirmation script change cancels the release. When
+    // "ensemble:release" is a one-line indirection, the reviewed script is
+    // the resolved target's body — what will actually run — not the
+    // pass-through text.
+    const confirmation = await vscode.window.showWarningMessage(`Run release?\n\nCommand: ${commandText}\nWorking directory: ${packageDir}\nPackage manager: ${manager}\nScript (${scriptLabel}): ${effectiveScript}\nSHA-256: ${scriptHash}`, { modal: true }, "Run Release");
     if (confirmation !== "Run Release") return;
     // Re-read immediately before launching so a package.json edit cannot
-    // change the reviewed release command between confirmation and execution.
+    // change the reviewed release command between confirmation and
+    // execution — both the "ensemble:release" text itself and, if it is an
+    // indirection, the resolved target script it points to.
     const currentPackage = JSON.parse(await fs.promises.readFile(packageJsonPath, "utf8")) as { scripts?: Record<string, unknown> };
-    if (currentPackage.scripts?.[RELEASE_SCRIPT_NAME] !== script) { void vscode.window.showErrorMessage("The release script changed after confirmation; release was cancelled."); return; }
-    await fs.promises.writeFile(path.join(candidate, "release-operation.json"), JSON.stringify({ command: commandText, cwd: packageDir, packageManager: manager, script, scriptSha256: scriptHash, startedAt: new Date().toISOString() }, null, 2), "utf8");
+    const currentEffective = isIndirect ? currentPackage.scripts?.[resolved.name] : currentPackage.scripts?.[RELEASE_SCRIPT_NAME];
+    if (currentPackage.scripts?.[RELEASE_SCRIPT_NAME] !== script || currentEffective !== effectiveScript) { NotificationRouter.showError("The release script changed after confirmation; release was cancelled."); return; }
+    await fs.promises.writeFile(path.join(candidate, "release-operation.json"), JSON.stringify({ command: commandText, cwd: packageDir, packageManager: manager, script: effectiveScript, scriptSha256: scriptHash, startedAt: new Date().toISOString() }, null, 2), "utf8");
     // Run in a visible IDE terminal so interactive version prompts work.
     // The extension only reports that the release was STARTED — it does not
     // observe the terminal and never claims the release succeeded; the
@@ -4205,7 +4347,7 @@ async function runRelease(context: vscode.ExtensionContext, arg?: TaskNodeArg): 
       terminal.sendText(commandText, true);
     } catch (error) {
       const message = `Release failed to start: ${error instanceof Error ? error.message : String(error)}`;
-      void vscode.window.showErrorMessage(message);
+      NotificationRouter.showError(message);
       // Thrown so the tracked operation records a `failed` terminal state;
       // swallowed just below — the failure was already reported above.
       throw new ReleaseRunFailure(message);

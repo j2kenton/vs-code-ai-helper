@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import { TaskInventory } from "../state/taskInventory";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
+import { NotificationRouter } from "../utils/notificationRouter";
 
 /**
  * Keyboard shortcut router: runs Review with AI against the current task,
@@ -19,14 +20,14 @@ export async function reviewCurrentTask(
   );
 
   if (!resolvedTask) {
-    void vscode.window.showInformationMessage(
+    NotificationRouter.showWarning(
       "No active task found. Create or resume a task first."
     );
     return;
   }
 
   if (resolvedTask.progress.status === "paused") {
-    void vscode.window.showInformationMessage(
+    NotificationRouter.showWarning(
       "Task is paused. Resume it before using this shortcut."
     );
     return;

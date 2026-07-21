@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import { TaskInventory } from "../state/taskInventory";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
+import { NotificationRouter } from "../utils/notificationRouter";
 
 /**
  * Apply high-level review changes. This command provides a concrete entry point
@@ -17,7 +18,7 @@ export async function applyHighLevelReviewChanges(
   });
 
   if (pausedCheck && pausedCheck.progress.status === "paused") {
-    void vscode.window.showInformationMessage(
+    NotificationRouter.showWarning(
       "Task is paused. Resume it before applying review changes."
     );
     return;
@@ -28,7 +29,7 @@ export async function applyHighLevelReviewChanges(
   });
 
   if (!resolvedTask) {
-    void vscode.window.showInformationMessage(
+    NotificationRouter.showWarning(
       "No tasks at the High-Level Review stage."
     );
     return;
@@ -38,7 +39,7 @@ export async function applyHighLevelReviewChanges(
     resolvedTask.progress.currentStage !== "plan-high-review" &&
     resolvedTask.progress.currentStage !== "impl-high-review"
   ) {
-    void vscode.window.showInformationMessage(
+    NotificationRouter.showWarning(
       "Task is not at a High-Level Review stage."
     );
     return;

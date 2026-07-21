@@ -9,6 +9,7 @@ import {
   isLargeTokenRequestWarningEnabled,
   setLargeTokenRequestWarningEnabled,
 } from "../config/settings";
+import { NotificationRouter } from "./notificationRouter";
 
 /**
  * Check whether a prompt is safe to send, applying two enforcement rules:
@@ -37,7 +38,7 @@ export async function checkAndConfirmPromptSize(
   if (bytes > PROMPT_TOTAL_MAX_BYTES) {
     const kb = Math.round(bytes / 1024);
     const ceiling = Math.round(PROMPT_TOTAL_MAX_BYTES / 1024);
-    void vscode.window.showErrorMessage(
+    NotificationRouter.showError(
       `⛔ Prompt is too large to send (${kb} KB). The hard limit is ${ceiling} KB. ` +
         `Reduce the number of open editors, close large files, or shorten your task description.`
     );

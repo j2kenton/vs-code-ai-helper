@@ -50,6 +50,11 @@ function sameIdentity(a: ChatIdentity | undefined, b: ChatIdentity | undefined):
   return a.canonicalId === b.canonicalId && a.taskFolderPath === b.taskFolderPath;
 }
 
+/** Memento key the last-open chat target is persisted under, so the panel
+ * reopens on the same conversation instead of always resetting to the
+ * Global Assistant across window reloads. */
+const LAST_CHAT_TARGET_KEY = "vs-code-ai-helper.chatView.lastTarget";
+
 /** A workspace-scoped, persistent conversation surface for the active task.
  * Transcripts are persisted to `chat-v1.json` inside each task folder (see
  * chatHistoryStore.ts) so they travel with the task, with a lazy one-time
@@ -126,8 +131,31 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
 
   async open(target: ChatTarget): Promise<void> {
     this.target = target;
+    // Best-effort: a Memento write failing must never block opening the chat.
+    try {
+      await this.state.update(LAST_CHAT_TARGET_KEY, target);
+    } catch {
+      // Ignore — the panel just won't restore this target next time.
+    }
     await vscode.commands.executeCommand(`${ChatViewProvider.viewType}.focus`);
     void this.render();
+  }
+
+  /** The persisted last-open target, or undefined if none was saved or it no
+   * longer resolves to a real task (the global assistant is always valid —
+   * it isn't tied to any task folder). Used by `render()` to restore the
+   * previous conversation instead of always defaulting to the global
+   * assistant when the view is (re)created. */
+  private async loadPersistedTarget(): Promise<ChatTarget | undefined> {
+    const persisted = this.state.get<ChatTarget>(LAST_CHAT_TARGET_KEY);
+    if (!persisted) return undefined;
+    if (persisted.kind === "global") return persisted;
+    try {
+      await vscode.workspace.fs.stat(vscode.Uri.file(persisted.taskFolderPath));
+      return persisted;
+    } catch {
+      return undefined;
+    }
   }
 
   /**
@@ -222,9 +250,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   }
 
   private async render(): Promise<void> {
-    // No target chosen yet: default to the global assistant so the panel is
-    // usable immediately. The factory can legitimately fail (no workspace
-    // folder open yet); the panel then keeps its empty state.
+    // No target chosen yet: restore whatever conversation was last open
+    // (e.g. after a window reload) before falling back to the global
+    // assistant, so the panel is usable immediately either way. The
+    // factory/restore can both legitimately come up empty; the panel then
+    // keeps its empty state.
+    if (!this.target) {
+      try {
+        const restored = await this.loadPersistedTarget();
+        // Re-check: an open() may have landed while this resolved.
+        if (restored && !this.target) {
+          this.target = restored;
+        }
+      } catch {
+        // Fall through to the default-target factory below.
+      }
+    }
     if (!this.target && this.defaultTargetFactory) {
       try {
         const fallback = await this.defaultTargetFactory();
@@ -420,14 +461,35 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         #form button:focus-visible { outline: var(--ensemble-focus-width) solid var(--vscode-focusBorder); outline-offset: var(--ensemble-border-width); }
       </style>
       </head><body>
-      <div id="context" role="status">Open a workspace folder to start chatting with the AI.</div><div id="messages" role="log" aria-live="polite" aria-label="Conversation"></div>
+      <div id="context" role="status">Loading chat…</div><div id="messages" role="log" aria-live="polite" aria-label="Conversation"></div>
       <div id="error" role="alert"></div>
       <div id="busy-indicator" role="status" aria-live="polite"><span class="spinner"></span>Waiting for the AI…</div>
-      <form id="form"><textarea id="message" rows="3" aria-label="Message the AI" placeholder="Message the AI… (Ctrl+Enter to send)"></textarea><button type="submit">Send</button></form>
+      <form id="form"><textarea id="message" rows="3" aria-label="Message the AI" placeholder="Message the AI… (Enter to send, Shift+Enter for a new line)"></textarea><button type="submit" title="Send message (Enter)">Send</button></form>
       <script nonce="${nonce}">const v=acquireVsCodeApi(), c=document.getElementById('context'), m=document.getElementById('messages'), e=document.getElementById('error'), b=document.getElementById('busy-indicator'), f=document.getElementById('form'), i=document.getElementById('message');
-      window.addEventListener('message', event=>{const s=event.data;if(s.type!=='state')return;c.textContent=s.label??'Open a workspace folder to start chatting with the AI.';m.replaceChildren(...s.entries.map(x=>{const d=document.createElement('p');d.className=x.role==='user'?'msg-user':'msg-agent';d.textContent='['+x.role+(x.pending?' — awaiting your answer':'')+'] '+x.text;return d;}));e.textContent=s.errorMessage??'';e.style.display=s.errorMessage?'block':'none';b.style.display=s.busy?'block':'none';});
+      const savedState = v.getState() || {};
+      const scrollPositions = savedState.scrollPositions || {};
+      let currentKey;
+      function targetKey(t){ if(!t) return ''; return t.kind==='global' ? 'global' : (t.canonicalId+':'+t.stage); }
+      function isNearBottom(){ return (document.documentElement.scrollHeight-window.scrollY-window.innerHeight)<60; }
+      function persistScroll(){ if(currentKey===undefined) return; scrollPositions[currentKey]=window.scrollY; v.setState({scrollPositions:scrollPositions}); }
+      window.addEventListener('scroll', persistScroll);
+      window.addEventListener('message', event=>{
+        const s=event.data;if(s.type!=='state')return;
+        const nextKey=targetKey(s.target);
+        const switchedChat=nextKey!==currentKey;
+        const stick=!switchedChat&&isNearBottom();
+        c.textContent=s.label??'No chat available yet.';
+        m.replaceChildren(...s.entries.map(x=>{const d=document.createElement('p');d.className=x.role==='user'?'msg-user':'msg-agent';d.textContent='['+x.role+(x.pending?' — awaiting your answer':'')+'] '+x.text;return d;}));
+        e.textContent=s.errorMessage??'';e.style.display=s.errorMessage?'block':'none';b.style.display=s.busy?'block':'none';
+        currentKey=nextKey;
+        requestAnimationFrame(()=>{
+          if(stick){window.scrollTo(0,document.documentElement.scrollHeight);}
+          else if(switchedChat&&Object.prototype.hasOwnProperty.call(scrollPositions,nextKey)){window.scrollTo(0,scrollPositions[nextKey]);}
+          else if(switchedChat){window.scrollTo(0,document.documentElement.scrollHeight);}
+        });
+      });
       f.addEventListener('submit',e=>{e.preventDefault();v.postMessage({type:'send',text:i.value});i.value='';});
-      i.addEventListener('keydown',e=>{if(e.key==='Enter'&&e.ctrlKey){e.preventDefault();f.requestSubmit();}else if(e.key==='Escape'){i.blur();}});</script>
+      i.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.ctrlKey&&!e.metaKey&&!e.shiftKey){e.preventDefault();f.requestSubmit();}else if(e.key==='Escape'){i.blur();}});</script>
     </body></html>`;
   }
 }

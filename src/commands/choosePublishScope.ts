@@ -115,7 +115,7 @@ export async function promptAndPersistPublishScope(
 ): Promise<string | undefined> {
   const base = await resolvePickerRoot(taskFolderUri);
   if (base.kind === "stale-binding") {
-    void vscode.window.showWarningMessage(
+    NotificationRouter.showWarning(
       `The task's recorded project root ("${base.projectRoot}") no longer exists, so there ` +
         "is no valid folder to offer as a Publish verification scope. Re-bind the task to " +
         "its project and try again."
@@ -123,7 +123,7 @@ export async function promptAndPersistPublishScope(
     return undefined;
   }
   if (base.kind === "unbound") {
-    void vscode.window.showWarningMessage(
+    NotificationRouter.showWarning(
       "The task is not inside an open workspace folder and has no project binding to verify against."
     );
     return undefined;
@@ -182,7 +182,7 @@ export async function choosePublishScope(
     allowPaused: true,
   });
   if (!resolved) {
-    void vscode.window.showErrorMessage(
+    NotificationRouter.showError(
       "The task could not be found. Refresh the Tasks panel and try again."
     );
     return;

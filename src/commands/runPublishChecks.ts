@@ -139,7 +139,7 @@ export async function runPublishChecks(
               );
             }
           } catch (error) {
-            void vscode.window.showErrorMessage(
+            NotificationRouter.showError(
               `Publish checks failed to run: ${
                 error instanceof Error ? error.message : String(error)
               }`

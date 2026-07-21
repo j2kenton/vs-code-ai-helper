@@ -137,12 +137,12 @@ export async function markTaskDone(
 
   if (!resolvedTask) {
     if (hasExplicitArg) {
-      void vscode.window.showErrorMessage(
+      NotificationRouter.showError(
         "The task could not be found. It may have been deleted or moved. " +
           "Please refresh the Tasks panel and try again."
       );
     } else {
-      void vscode.window.showInformationMessage(
+      NotificationRouter.showWarning(
         "No active task found. Select a task first using the Tasks panel."
       );
     }
@@ -153,7 +153,7 @@ export async function markTaskDone(
   if (!isMarkTaskDoneEligible(resolvedTask.progress)) {
     const currentStageName =
       STAGE_DISPLAY_NAMES[resolvedTask.progress.currentStage];
-    void vscode.window.showWarningMessage(
+    NotificationRouter.showWarning(
       `"Complete Task" is only available once the task ` +
         `has reached ${STAGE_DISPLAY_NAMES["publish"]}. ` +
         `Current stage: ${currentStageName}.`

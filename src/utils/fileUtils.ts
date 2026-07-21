@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import { PLAN_FILENAME } from "../types/taskProgress";
 import { backupArtifactBeforeWrite } from "./artifactBackups";
+import { NotificationRouter } from "./notificationRouter";
 
 /**
  * Build a signed attribution line for AI-generated output, so the file
@@ -143,7 +144,7 @@ export async function safeOpenTextDocument(
     return true;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    void vscode.window.showWarningMessage(
+    NotificationRouter.showWarning(
       `Could not open ${label}: ${message}`
     );
     return false;

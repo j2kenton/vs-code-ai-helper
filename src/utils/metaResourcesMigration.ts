@@ -303,7 +303,7 @@ export async function maybeOfferMetaResourcesMigration(
   const workspace = vscode.workspace.workspaceFolders?.[0];
   if (!workspace) {
     if (force) {
-      void vscode.window.showWarningMessage("Open a workspace folder first.");
+      NotificationRouter.showWarning("Open a workspace folder first.");
     }
     return;
   }
@@ -348,7 +348,7 @@ export async function maybeOfferMetaResourcesMigration(
     if (fs.existsSync(target)) {
       const conflicting = fs.readdirSync(target).length > 0;
       if (conflicting) {
-        void vscode.window.showErrorMessage(
+        NotificationRouter.showError(
           `Could not move Ensemble resources: "${DEFAULT_TASK_ROOT}" already exists with content. ` +
             "The legacy location remains in use; resolve the conflict manually and run " +
             '"Ensemble: Move Ensemble Resources to .ensemble" again.'
@@ -366,7 +366,7 @@ export async function maybeOfferMetaResourcesMigration(
     // Atomic on the same volume: either the whole tree moves or nothing does.
     fs.renameSync(legacyRoot, target);
   } catch (error) {
-    void vscode.window.showErrorMessage(
+    NotificationRouter.showError(
       `Could not move Ensemble resources to "${DEFAULT_TASK_ROOT}": ${
         error instanceof Error ? error.message : String(error)
       }. The legacy location remains in use.`

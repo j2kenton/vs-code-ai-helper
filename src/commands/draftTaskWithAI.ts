@@ -488,7 +488,7 @@ export async function draftTaskWithAI(
     ? vscode.workspace.getWorkspaceFolder(resolvedTask.workspaceFolder)
     : undefined;
   if (!workspaceFolder) {
-    void vscode.window.showErrorMessage("Could not determine the owning workspace for this task.");
+    NotificationRouter.showError("Could not determine the owning workspace for this task.");
     return;
   }
 
@@ -545,14 +545,13 @@ export async function draftTaskWithAI(
 
   const model = await resolveFreshModelForStage(taskFolderUri, "desc");
   if (!model.modelId) {
-    const openSettings = await vscode.window.showWarningMessage(
+    NotificationRouter.showWarning(
       "No model is configured for the Description stage. Open Ensemble Settings and choose a primary model before continuing.",
-      { modal: true },
-      "Open Settings"
+      undefined,
+      undefined,
+      undefined,
+      { command: "vs-code-ai-helper.openSettings", title: "Open Settings" }
     );
-    if (openSettings === "Open Settings") {
-      await vscode.commands.executeCommand("vs-code-ai-helper.openSettings");
-    }
     return;
   }
   const { runner, nativeModelId } = resolveRunnerForModel(
@@ -650,13 +649,13 @@ export async function draftTaskWithAI(
             return;
           }
           if (first.status === "failed") {
-            void vscode.window.showErrorMessage(
+            NotificationRouter.showError(
               `Draft with AI failed: ${first.errorMessage ?? "unknown error"}`
             );
             return;
           }
           if (!first.parsed) {
-            void vscode.window.showErrorMessage(
+            NotificationRouter.showError(
               "AI returned a malformed response (missing, duplicate, or unrecognized sections). task.md was not changed."
             );
             return;
@@ -752,7 +751,7 @@ export async function draftTaskWithAI(
     edit.replace(taskFileUri, fullRange, newContent);
     const applied = await vscode.workspace.applyEdit(edit);
     if (!applied) {
-      void vscode.window.showErrorMessage(
+      NotificationRouter.showError(
         `Failed to update task.md in the editor. The file was not changed.`
       );
       return;
@@ -764,7 +763,7 @@ export async function draftTaskWithAI(
       ) ?? openDoc;
     const saved = await docToSave.save();
     if (!saved) {
-      void vscode.window.showErrorMessage(
+      NotificationRouter.showError(
         "Draft with AI completed but task.md could not be saved. The updated content is shown in the editor."
       );
     } else {

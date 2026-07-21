@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import { getConfiguredTaskRoot } from "./taskRoot";
 import { findIncompleteTasks } from "./taskProgressUtils";
 import { STAGE_DISPLAY_NAMES, TaskStage } from "../types/taskProgress";
+import { NotificationRouter } from "./notificationRouter";
 
 /**
  * Prompt the user to pick a task folder to operate on, restricted to
@@ -18,7 +19,7 @@ export async function pickTaskFolder(
 ): Promise<vscode.Uri | undefined> {
   const workspaceRoot = vscode.workspace.workspaceFolders?.[0];
   if (!workspaceRoot) {
-    void vscode.window.showErrorMessage(
+    NotificationRouter.showWarning(
       "No workspace folder open. Please open a folder first."
     );
     return undefined;
@@ -35,7 +36,7 @@ export async function pickTaskFolder(
   );
 
   if (tasks.length === 0) {
-    void vscode.window.showInformationMessage(
+    NotificationRouter.showWarning(
       allTasks.length === 0
         ? "No task folders found. Use 'Start New Task' to create one."
         : "No tasks are at a stage eligible for this action."

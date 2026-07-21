@@ -37,7 +37,7 @@ export async function pinTask(
     allowPaused: true,
   });
   if (!resolved) {
-    void vscode.window.showErrorMessage(
+    NotificationRouter.showError(
       "The task could not be found. Refresh the Tasks panel and try again."
     );
     return;
@@ -87,7 +87,7 @@ export async function unpinTask(
     allowPaused: true,
   });
   if (!resolved) {
-    void vscode.window.showErrorMessage(
+    NotificationRouter.showError(
       "The task could not be found. Refresh the Tasks panel and try again."
     );
     return;

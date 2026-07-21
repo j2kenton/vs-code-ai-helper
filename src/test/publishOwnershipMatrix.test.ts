@@ -32,6 +32,7 @@ import { initNotificationRouter, deactivateNotificationRouter } from "../utils/n
 import { upsertCompletionChecksInPublishReview, CompletionLintResult } from "../utils/completionLint";
 import { TaskInventory } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
+import { normalizePath } from "../utils/taskRoot";
 
 /* eslint-disable @typescript-eslint/no-var-requires */
 const settingsModule = require("../config/settings") as Record<string, unknown>;
@@ -91,6 +92,25 @@ function installFsBridge(): { restore: () => void } {
       }
     },
   };
+}
+
+/**
+ * Bridges vscode.workspace.fs.readDirectory to real fs — needed only by the
+ * resolveTask no-arg fallback (findAllTasks), which installFsBridge above
+ * doesn't cover since no other test in this file exercises that scan path.
+ */
+function installReadDirectoryBridge(): { restore: () => void } {
+  const target = vscode.workspace.fs as unknown as Record<string, unknown>;
+  const orig = target.readDirectory;
+  target.readDirectory = async (uri: vscode.Uri): Promise<Array<[string, number]>> => {
+    try {
+      const entries = await fs.promises.readdir(uri.fsPath, { withFileTypes: true });
+      return entries.map((entry) => [entry.name, entry.isDirectory() ? 2 : 1]);
+    } catch {
+      return [];
+    }
+  };
+  return { restore: (): void => { target.readDirectory = orig; } };
 }
 
 function installWorkspaceFoldersStub(): { restore: () => void } {
@@ -852,6 +872,83 @@ void describe("Publish auto-run ownership matrix — manual entry routes (comman
     }
   });
 
+  void it("nextStage: the keyboard-shortcut invocation (no tree-item arg) resolves the current task from CurrentTaskStore and actually advances it, exactly like the tree-button click", async () => {
+    // Ctrl+Shift+Alt+N invokes vs-code-ai-helper.nextStage with no argument —
+    // registerCommand's handler receives node === undefined, unlike a tree
+    // inline-button click which always carries a TaskNodeArg. This exercises
+    // resolveTask's no-arg fallback (single-eligible-task auto-pick, guarded
+    // by CurrentTaskStore) end-to-end through the real command handler, the
+    // same path a user's keypress takes.
+    //
+    // Uses its own isolated temp root (not the shared REAL_ROOT) because
+    // resolveTask's no-arg fallback scans the *entire* legacy "plans/"
+    // folder for eligible tasks: reusing REAL_ROOT would pick up every
+    // fixture task folder left behind by other tests in this file at the
+    // same stage, making "exactly one eligible task" untestable here.
+    const isolatedRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-nextstage-kbd-"));
+    const { folderPath } = (() => {
+      const folder = path.join(isolatedRoot, "plans", "solo-task");
+      fs.mkdirSync(folder, { recursive: true });
+      const progress: TaskProgress = {
+        taskFolder: "solo-task",
+        currentStage: "impl-low-review",
+        status: "active",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      };
+      fs.writeFileSync(path.join(folder, "task-progress.json"), JSON.stringify(progress, null, 2), "utf8");
+      fs.writeFileSync(path.join(folder, "task.md"), "# Task\n\nDo the thing.\n", "utf8");
+      fs.writeFileSync(path.join(folder, "plan.md"), "# Plan\n\n1. Do the thing.\n", "utf8");
+      fs.writeFileSync(path.join(folder, "plan-final.md"), "# Implementation\n\nDone.\n", "utf8");
+      return { folderPath: folder };
+    })();
+    const provider = new StatusTreeProvider();
+    initNotificationRouter(provider);
+    const fsBridge = installFsBridge();
+    const readDirBridge = installReadDirectoryBridge();
+    const ws = vscode.workspace as unknown as Record<string, unknown>;
+    const origWorkspaceFolders = ws.workspaceFolders;
+    ws.workspaceFolders = [{ uri: vscode.Uri.file(isolatedRoot), name: "root", index: 0 }];
+    const dispatches: AutomationDispatch[] = [];
+    const context = {
+      extensionUri: vscode.Uri.file(isolatedRoot),
+      workspaceState: {
+        // Production always stores the normalized canonical ID here (see
+        // taskRoot.ts's discoverAllTasks / setTaskStage.ts's
+        // currentTaskStore.set(task.canonicalId)) — never the raw fsPath.
+        get: (key: string): string | undefined => (key === "vs-code-ai-helper.currentTaskCanonicalId" ? normalizePath(folderPath) : undefined),
+        update: async (): Promise<void> => { /* no-op */ },
+      },
+    } as unknown as vscode.ExtensionContext;
+    const patches: Patched[] = [
+      patch(settingsModule, "completeAndMoveOnTriggersAI", () => false),
+      patch(modelSelectionModule, "resolveConfiguredReviewStages", () =>
+        Promise.resolve(new Set(REVIEW_STAGES))),
+      patch(automationChainModule, "scheduleAutomationChain", (dispatch: AutomationDispatch): Promise<boolean> => {
+        dispatches.push(dispatch);
+        return Promise.resolve(true);
+      }),
+      patch(publishPreflightModule, "checkPublishPreflight", () =>
+        Promise.resolve({ ok: true, lintPayload: { runAt: "now", passed: true, summary: "", issueCount: 0, failedChecks: [], missingScripts: [] } })),
+    ];
+    try {
+      await nextStage(vscode.Uri.file(isolatedRoot), context, undefined);
+
+      assert.equal(dispatches.length, 1, "the keyboard shortcut must resolve the current task and actually dispatch the same advance a tree-button click would");
+      assert.equal(dispatches[0]?.command, "vs-code-ai-helper.commitAndPushTask");
+      assert.equal(dispatches[0]?.chainId, "auto-publish");
+      assert.deepEqual(dispatches[0]?.arg, { taskFolderPath: folderPath });
+    } finally {
+      for (const p of patches.reverse()) { p.restore(); }
+      ws.workspaceFolders = origWorkspaceFolders;
+      readDirBridge.restore();
+      fsBridge.restore();
+      provider.dispose();
+      deactivateNotificationRouter();
+      fs.rmSync(isolatedRoot, { recursive: true, force: true });
+    }
+  });
+
   void it("nextStage: triggers-AI on — review-owned, dispatches exactly one Publish review carrying autoPublishOnSuccess, never a direct publish chain", async () => {
     const { folderPath } = makeTaskFolder(`nextstage-on-${Math.floor(Math.random() * 1e9)}`, "impl-low-review");
     const provider = new StatusTreeProvider();
@@ -1119,7 +1216,6 @@ void describe("Publish auto-run ownership matrix — passing review, composite, 
     const inv = makeLiveInventoryStub(folderPath);
     const currentStore = makeCurrentTaskStoreStub();
     let gitReadinessCalls = 0;
-    let capturedErrorMessage: string | undefined;
     const patches: Patched[] = [
       // At scheduling time (setTaskStage.ts / reviewActions.ts) checkPublishPreflight
       // would have observed a clean, push-ready repo — but between scheduling and
@@ -1131,17 +1227,19 @@ void describe("Publish auto-run ownership matrix — passing review, composite, 
         gitReadinessCalls += 1;
         return Promise.resolve({ ok: false, reason: "branch was deleted between scheduling and execution (test)" });
       }),
-      patch(vscode.window as unknown as Record<string, unknown>, "showErrorMessage", (message: string): Promise<undefined> => {
-        capturedErrorMessage = message;
-        return Promise.resolve(undefined);
-      }),
     ];
     try {
       await commitAndPushTask(inv, { taskFolderPath: folderPath }, currentStore, undefined);
 
       assert.equal(gitReadinessCalls, 1, "expected exactly one fresh git-readiness recheck at execution time");
+      // The failure is now routed to the internal Notifications panel
+      // (NotificationRouter.showError) rather than a native VS Code toast.
+      const entries = (provider.getChildren() ?? []) as Array<{ message?: string }>;
+      const capturedErrorMessage = entries.find((e) =>
+        typeof e.message === "string" && e.message.includes("branch was deleted between scheduling and execution")
+      )?.message;
       assert.ok(
-        capturedErrorMessage?.includes("branch was deleted between scheduling and execution"),
+        capturedErrorMessage,
         "expected the execution-time recheck's failure reason to be surfaced, proving publishing did not silently proceed"
       );
     } finally {

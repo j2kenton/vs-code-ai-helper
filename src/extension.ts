@@ -137,12 +137,12 @@ export function activate(context: vscode.ExtensionContext): void {
           if (progress) {
             await finishFinalization(journal.taskFolder);
           } else {
-            void vscode.window.showWarningMessage(`Could not verify an interrupted ${journal.operation} for task ${journal.taskFolder}. Please check its files manually.`);
+            NotificationRouter.showWarning(`Could not verify an interrupted ${journal.operation} for task ${journal.taskFolder}. Please check its files manually.`);
           }
         }
       }).catch(err => console.error("Finalization recovery failed", err));
       void recoverActivationCheckpoint(root, currentTaskStore).then(summary => {
-        if (summary) void vscode.window.showWarningMessage(summary);
+        if (summary) NotificationRouter.showWarning(summary);
       }).catch(err => console.error("Activation checkpoint recovery failed", err));
     }
   } catch (err) {
@@ -221,7 +221,7 @@ export function activate(context: vscode.ExtensionContext): void {
   const helloWorldDisposable = vscode.commands.registerCommand(
     "vs-code-ai-helper.helloWorld",
     () => {
-      void vscode.window.showInformationMessage(
+      NotificationRouter.showInformation(
         "Hello from Ensemble!"
       );
     }
@@ -328,7 +328,12 @@ export function activate(context: vscode.ExtensionContext): void {
 
   const taskStatusBar = new TaskStatusBar(currentTaskStore);
   const tasksLoadedListener = taskTreeProvider.onDidLoadTasks((tasks) => {
-    void vscode.commands.executeCommand("setContext", "vs-code-ai-helper.tasksInitialized", true);
+    // tasksInitialized/isLoadingTasks are now set authoritatively by
+    // TaskInventory.refresh() (see taskInventory.ts) rather than here: this
+    // event also fires from render-triggered loadTasks() calls that read a
+    // still-empty inventory before the first refresh() resolves, which used
+    // to flip tasksInitialized to true prematurely and made the tasks view
+    // briefly show its "No tasks yet" empty state on every activation.
     const currentTaskCanonicalId = currentTaskStore.get();
     const currentTaskStage = currentTaskCanonicalId
       ? inventory.getTaskById(currentTaskCanonicalId)?.progress.currentStage
@@ -387,7 +392,7 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(vscode.commands.registerCommand(
     "vs-code-ai-helper.stageArtifactNotReady",
     (message?: string) => {
-      NotificationRouter.showInformation(
+      NotificationRouter.showWarning(
         message ?? "This stage's artifact has not been created yet."
       );
     }

@@ -4,6 +4,7 @@ import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { STAGE_ARTIFACT_FILENAMES } from "../types/taskProgress";
 import { ensureStageModelConfigured } from "../utils/modelSelection";
+import { NotificationRouter } from "../utils/notificationRouter";
 
 type ApplyArg = { canonicalId?: string; taskFolderPath?: string };
 
@@ -32,14 +33,14 @@ export async function applyCurrentStageAction(
   );
 
   if (!resolvedTask) {
-    void vscode.window.showInformationMessage(
+    NotificationRouter.showWarning(
       "No active task found. Create or resume a task first."
     );
     return;
   }
 
   if (resolvedTask.progress.status === "paused") {
-    void vscode.window.showInformationMessage(
+    NotificationRouter.showWarning(
       "Task is paused. Resume it before using this shortcut."
     );
     return;
@@ -98,7 +99,7 @@ export async function applyCurrentStageAction(
         await execute("vs-code-ai-helper.applyHighLevelReviewChanges");
         return;
       } catch {
-        void vscode.window.showInformationMessage(
+        NotificationRouter.showWarning(
           "No high-level review artifact found yet. Run Review first."
         );
         return;
@@ -119,7 +120,7 @@ export async function applyCurrentStageAction(
         await execute("vs-code-ai-helper.applyLowLevelReviewChanges");
         return;
       } catch {
-        void vscode.window.showInformationMessage(
+        NotificationRouter.showWarning(
           "No low-level review artifact found yet. Run Review first."
         );
         return;
@@ -140,7 +141,7 @@ export async function applyCurrentStageAction(
         await execute("vs-code-ai-helper.applyHighLevelReviewChanges");
         return;
       } catch {
-        void vscode.window.showInformationMessage(
+        NotificationRouter.showWarning(
           "No high-level review artifact found yet. Run Review first."
         );
         return;
@@ -161,7 +162,7 @@ export async function applyCurrentStageAction(
         await execute("vs-code-ai-helper.applyLowLevelReviewChanges");
         return;
       } catch {
-        void vscode.window.showInformationMessage(
+        NotificationRouter.showWarning(
           "No low-level review artifact found yet. Run Review first."
         );
         return;

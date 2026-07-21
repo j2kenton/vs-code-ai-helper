@@ -5,6 +5,7 @@ import {
   isProviderEnabled,
 } from "../config/settings";
 import { getConfiguredTaskRoot } from "./taskRoot";
+import { NotificationRouter } from "./notificationRouter";
 import { canUseBackup, getBackupModels } from "./modelFallback";
 import { cliCommandExists, resolveCliCommand } from "../runners/cliAgentRunner";
 import {
@@ -258,7 +259,7 @@ export async function ensureStageModelConfigured(
     // when there is genuinely nothing configured AND no Copilot fallback.
     // resolveModelForStage returning source "none" means nothing configured.
     if (resolved.source === "none") {
-      void vscode.window.showWarningMessage(
+      NotificationRouter.showWarning(
         `No AI model is configured for the ${stageName} stage. Configure one in AI Models.`
       );
       void vscode.commands.executeCommand("vs-code-ai-helper.openAiModels");
@@ -268,7 +269,7 @@ export async function ensureStageModelConfigured(
   }
   const parsed = parseModelSelection(resolved.modelId);
   if (!isProviderEnabled(parsed.provider)) {
-    void vscode.window.showWarningMessage(
+    NotificationRouter.showWarning(
       `The model configured for the ${stageName} stage (${resolved.modelId}) belongs to a disabled provider. ` +
         "Enable the provider or choose another model in AI Models."
     );

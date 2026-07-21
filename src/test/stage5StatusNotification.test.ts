@@ -595,7 +595,16 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
     void it("offers Resume for the newly created paused task using its explicit folder path", async () => {
       // eslint-disable-next-line @typescript-eslint/no-require-imports
       const { startNewTask } = await import("../commands/startNewTask.js");
-      const surface: StatusSurface = { addEntry(): void {} };
+      const entries: Array<{
+        message: string;
+        level: "info" | "warning" | "error";
+        actionCommand?: { command: string; title: string; args?: unknown[] };
+      }> = [];
+      const surface: StatusSurface = {
+        addEntry(message, level, _filePath, _resultTargetUri, _sourceOperationId, actionCommand): void {
+          entries.push({ message, level, actionCommand });
+        },
+      };
       initNotificationRouter(surface);
 
       const win = getWindowStub();
@@ -661,10 +670,13 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
           ".ensemble",
           progress.taskFolder
         );
-        assert.deepEqual(commands, [{
-          command: "vs-code-ai-helper.resumeTask",
-          args: [{ taskFolderPath }],
-        }]);
+        // The Resume offer is now a non-blocking internal notification with an
+        // inline action, not a modal — so nothing auto-executes resumeTask.
+        assert.deepEqual(commands, []);
+        const resumeEntry = entries.find((e) => e.actionCommand?.command === "vs-code-ai-helper.resumeTask");
+        assert.ok(resumeEntry, "expected an internal notification offering to Resume");
+        assert.equal(resumeEntry?.level, "warning");
+        assert.deepEqual(resumeEntry?.actionCommand?.args, [{ taskFolderPath }]);
       } finally {
         creationFilesystem.restore();
         commandApi.executeCommand = origExecuteCommand;

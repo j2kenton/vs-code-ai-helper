@@ -139,17 +139,18 @@ export async function runLintingFixes(
   // exclusive task lock.
   const lastReport = resolvedTask.progress.lintPayload;
   if (!lastReport) {
-    const choice = await vscode.window.showWarningMessage(
+    NotificationRouter.showWarning(
       "No Publish report found. Run the Publish checks first to generate " +
         "the report this action fixes.",
-      "Run Publish Checks"
+      undefined,
+      undefined,
+      undefined,
+      {
+        command: "vs-code-ai-helper.runPublishChecks",
+        title: "Run Publish Checks",
+        args: [{ taskFolderPath: resolvedTask.taskFolderPath }],
+      }
     );
-    if (choice === "Run Publish Checks") {
-      await vscode.commands.executeCommand(
-        "vs-code-ai-helper.runPublishChecks",
-        { taskFolderPath: resolvedTask.taskFolderPath }
-      );
-    }
     return;
   }
   if (lastReport.passed) {
@@ -180,18 +181,19 @@ export async function runLintingFixes(
   // the fallback dispatch below never contends with this action's own lock.
   const scope = resolvePublishScopeFolder(taskFolderUri, resolvedTask.progress);
   if (scope.stale) {
-    const choice = await vscode.window.showWarningMessage(
+    NotificationRouter.showWarning(
       "No valid Publish verification scope could be resolved (the saved scope " +
         "or the task's project-root binding no longer exists). Re-run the " +
         "Publish checks to choose a new scope before applying fixes.",
-      "Run Publish Checks"
+      undefined,
+      undefined,
+      undefined,
+      {
+        command: "vs-code-ai-helper.runPublishChecks",
+        title: "Run Publish Checks",
+        args: [{ taskFolderPath: resolvedTask.taskFolderPath }],
+      }
     );
-    if (choice === "Run Publish Checks") {
-      await vscode.commands.executeCommand(
-        "vs-code-ai-helper.runPublishChecks",
-        { taskFolderPath: resolvedTask.taskFolderPath }
-      );
-    }
     return;
   }
   const fixScopeFolder = scope.folder;
@@ -371,7 +373,7 @@ export async function runLintingFixes(
                 `Linting run failed: ${error instanceof Error ? error.message : String(error)}`
               );
             }
-            void vscode.window.showErrorMessage(
+            NotificationRouter.showError(
               `Linting fixes failed: ${error instanceof Error ? error.message : String(error)}`
             );
           }

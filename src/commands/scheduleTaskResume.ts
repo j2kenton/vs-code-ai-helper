@@ -3,6 +3,7 @@ import { TaskInventory } from "../state/taskInventory";
 import { TaskProgress } from "../types/taskProgress";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { patchTaskProgress } from "../utils/taskProgressUtils";
+import { NotificationRouter } from "../utils/notificationRouter";
 
 type ScheduleArg = { canonicalId?: string; taskFolderPath?: string; task?: { folderUri: vscode.Uri } };
 
@@ -106,7 +107,7 @@ export class TaskActionScheduler implements vscode.Disposable {
     if (clearedByThisOwner && stageStillCurrent) {
       await vscode.commands.executeCommand("vs-code-ai-helper.applyCurrentStageAction", { canonicalId, taskFolderPath });
     } else if (clearedByThisOwner) {
-      void vscode.window.showInformationMessage("Scheduled action was skipped because the task moved to a different stage.");
+      NotificationRouter.showInformation("Scheduled action was skipped because the task moved to a different stage.");
     }
   }
 
@@ -179,12 +180,12 @@ export async function scheduleTaskResume(
   const value = await vscode.window.showInputBox({ prompt: "Schedule current-stage action (ISO date/time)", value: new Date(clock.now() + LEASE_DURATION_MS).toISOString() });
   const runAt = value ? new Date(value) : undefined;
   if (!runAt || Number.isNaN(runAt.getTime()) || runAt.getTime() <= clock.now()) {
-    if (value) void vscode.window.showErrorMessage("Enter a future date/time.");
+    if (value) NotificationRouter.showWarning("Enter a future date/time.");
     return;
   }
   await patchTaskProgress(vscode.Uri.file(task.taskFolderPath), p => ({ ...p, scheduledRun: { runAt: runAt.toISOString(), stage: p.currentStage }, scheduledResumeTime: undefined, updatedAt: new Date(clock.now()).toISOString() }));
   await scheduler.arm(task.taskFolderPath, task.canonicalId);
-  void vscode.window.showInformationMessage(`Current-stage action scheduled for ${runAt.toLocaleString()}.`);
+  NotificationRouter.showInformation(`Current-stage action scheduled for ${runAt.toLocaleString()}.`);
 }
 
 export async function cancelScheduledTaskAction(inventory: TaskInventory, scheduler: TaskActionScheduler, arg?: ScheduleArg): Promise<void> {

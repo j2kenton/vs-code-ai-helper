@@ -11,6 +11,7 @@ import {
   prepareArtifactPicker,
   type ArtifactPickerOptions,
 } from "../utils/artifactPicker";
+import { NotificationRouter } from "../utils/notificationRouter";
 
 interface ViewTaskArg {
   task?: IncompleteTask;
@@ -26,7 +27,7 @@ interface ViewPlanArg {
 export async function viewTask(arg?: ViewTaskArg): Promise<void> {
   const workspaceRoot = vscode.workspace.workspaceFolders?.[0];
   if (!workspaceRoot) {
-    void vscode.window.showErrorMessage(
+    NotificationRouter.showError(
       "No workspace folder open. Please open a folder first."
     );
     return;
@@ -56,7 +57,7 @@ export async function viewTask(arg?: ViewTaskArg): Promise<void> {
   const { items, emptyMessage } = prepareArtifactPicker(pickerOptions);
 
   if (emptyMessage) {
-    void vscode.window.showInformationMessage(emptyMessage);
+    NotificationRouter.showInformation(emptyMessage);
     return;
   }
 
@@ -80,7 +81,7 @@ export async function viewTask(arg?: ViewTaskArg): Promise<void> {
 export async function viewPlan(arg?: ViewPlanArg): Promise<void> {
   const workspaceRoot = vscode.workspace.workspaceFolders?.[0];
   if (!workspaceRoot) {
-    void vscode.window.showErrorMessage(
+    NotificationRouter.showError(
       "No workspace folder open. Please open a folder first."
     );
     return;
@@ -96,14 +97,14 @@ export async function viewPlan(arg?: ViewPlanArg): Promise<void> {
     try {
       const planUri = await resolveCurrentPlanUri(arg.task.folderUri);
       if (!(await statIfExists(planUri))) {
-        void vscode.window.showInformationMessage(
+        NotificationRouter.showWarning(
           `No plan found for ${arg.task.folderName}.`
         );
         return;
       }
       await safeOpenTextDocument(planUri, "plan.md");
     } catch (error) {
-      void vscode.window.showErrorMessage(
+      NotificationRouter.showError(
         `Failed to resolve plan: ${error instanceof Error ? error.message : String(error)}`
       );
     }
@@ -139,7 +140,7 @@ export async function viewPlan(arg?: ViewPlanArg): Promise<void> {
   const { items, emptyMessage } = prepareArtifactPicker(pickerOptions);
 
   if (emptyMessage) {
-    void vscode.window.showInformationMessage(emptyMessage);
+    NotificationRouter.showInformation(emptyMessage);
     return;
   }
 
@@ -156,7 +157,7 @@ export async function viewPlan(arg?: ViewPlanArg): Promise<void> {
     const planUri = await resolveCurrentPlanUri(selected.task.folderUri);
     await safeOpenTextDocument(planUri, "plan.md");
   } catch (error) {
-    void vscode.window.showErrorMessage(
+    NotificationRouter.showError(
       `Failed to resolve plan: ${error instanceof Error ? error.message : String(error)}`
     );
   }

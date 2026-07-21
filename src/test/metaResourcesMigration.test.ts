@@ -363,7 +363,7 @@ void describe("maybeOfferMetaResourcesMigration", () => {
       await maybeOfferMetaResourcesMigration(context, inventory, currentTaskStoreStub);
 
       assert.ok(
-        prompts.errors.some((message) => /already exists with content/.test(message)),
+        routedNotifications.some((n) => n.level === "error" && /already exists with content/.test(n.message)),
         "the conflict must be surfaced as an error"
       );
       assert.ok(fs.existsSync(path.join(root, "plans", "2026-01-01_task_1", "task.md")), "the legacy folder must remain in use");

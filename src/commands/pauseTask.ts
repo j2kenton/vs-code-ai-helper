@@ -99,7 +99,7 @@ export async function pauseTask(
     // folder path) but resolution failed, the task no longer exists or is not
     // discoverable. Silently redirecting to a different task would be wrong.
     if (hasExplicitTask) {
-      void vscode.window.showErrorMessage(
+      NotificationRouter.showError(
         "The task could not be found. It may have been deleted or moved. " +
           "Please refresh the Tasks panel and try again."
       );
@@ -136,7 +136,7 @@ export async function pauseTask(
     );
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    void vscode.window.showErrorMessage(message);
+    NotificationRouter.showError(message);
   }
 }
 

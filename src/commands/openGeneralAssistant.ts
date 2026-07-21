@@ -3,10 +3,12 @@ import { TaskInventory } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { ChatViewProvider } from "../views/chatView";
 import { RUNS_DIRNAME } from "../types/taskProgress";
+import { AgentRunResult } from "../types/agentRunner";
 import { resolveTaskRootForCreation } from "../utils/taskRoot";
 import { resolveFreshModelForStage } from "../utils/modelSelection";
 import {
-  checkRunnerAvailabilityForModel,
+  getConfiguredBackupModelsForStage,
+  isAuthenticationFailure,
   resolveRunnerForModel,
 } from "../runners/runnerRegistry";
 import { ensureAiConsent } from "../utils/aiConsent";
@@ -20,6 +22,7 @@ import {
 } from "../utils/globalAssistantActions";
 import { PendingOperationsStore } from "../state/pendingOperationsStore";
 import { stripAttributionHeaders } from "../utils/fileUtils";
+import { NotificationRouter } from "../utils/notificationRouter";
 
 /** Stable identity for the global assistant's own, fully separate history. */
 export const GLOBAL_ASSISTANT_CANONICAL_ID = "global-assistant";
@@ -82,7 +85,7 @@ export async function openGeneralAssistant(
 ): Promise<void> {
   const target = await resolveGlobalAssistantTarget();
   if (!target) {
-    void vscode.window.showWarningMessage(
+    NotificationRouter.showWarning(
       "Open a workspace folder before opening the Global Assistant."
     );
     return;
@@ -119,6 +122,115 @@ export function buildGlobalAssistantPrompt(
   );
 }
 
+/**
+ * Run the global assistant's prompt against its primary model, falling
+ * through the user's configured backup models on quota/temporary-
+ * unavailability failures — mirroring stage-specific calls.
+ *
+ * Stage-specific runs get this fallback for free from
+ * `resolveRunnerForModel(modelId, stage, taskFolderUri)`: its wrapped
+ * runner reserves the switch-over in `taskFolderUri`'s `task-progress.json`
+ * (see `reserveFallback` in runnerRegistry.ts) before trying any backup.
+ * The global assistant's folder is not a task and has no
+ * `task-progress.json`, so that reservation write silently no-ops
+ * (`patchTaskProgress` returns undefined when there's nothing to read) and
+ * the wrapped runner's fallback branch never runs — every quota failure on
+ * the primary model surfaced directly as a hard failure, with configured
+ * backups never attempted. Walk the candidate chain explicitly instead,
+ * resolving each candidate with `resolveRunnerForModel(candidate, undefined,
+ * folder)` (no `stage` argument, so no nested reservation-gated wrapping) —
+ * the same pattern `runSecondOpinionReview` in reviewActions.ts already
+ * uses for backup iteration outside the normal stage-reservation flow.
+ *
+ * Backup list choice: the global assistant isn't tied to a particular
+ * stage, but it already borrows the Task Description stage's primary model
+ * (see its chat label) — so its backups are taken from that same stage's
+ * configuration via `getConfiguredBackupModelsForStage("desc", ...)`, not
+ * gated on that stage's fallback *strategy* (a user who chose
+ * "pause-and-resume" or "alert-and-wait" for Task Description still has
+ * models configured and available; only the automatic quota-switch opt-in
+ * is stage-specific, and the global assistant was never wired into that
+ * per-stage opt-in to begin with). This choice can be revisited if a
+ * different backup source is wanted.
+ */
+async function runGlobalAssistantWithFallback(
+  folder: vscode.Uri,
+  workspaceUri: vscode.Uri,
+  primaryModelId: string,
+  prompt: string,
+  runsUri: vscode.Uri,
+  token: vscode.CancellationToken
+): Promise<{ result: AgentRunResult; outputFile?: vscode.Uri; providerLabel: string }> {
+  const candidateModelIds = [
+    primaryModelId,
+    ...getConfiguredBackupModelsForStage("desc", primaryModelId),
+  ];
+
+  let lastResult: AgentRunResult = {
+    runnerId: "none",
+    status: "failed",
+    failureKind: "generic",
+    errorMessage: "No model is configured for the Global Assistant.",
+  };
+  let lastProviderLabel = "";
+
+  for (const candidateModelId of candidateModelIds) {
+    let resolved: ReturnType<typeof resolveRunnerForModel>;
+    try {
+      resolved = resolveRunnerForModel(candidateModelId, undefined, folder);
+    } catch {
+      continue;
+    }
+    lastProviderLabel = resolved.providerLabel;
+
+    let availability: Awaited<ReturnType<typeof resolved.runner.isAvailable>>;
+    try {
+      availability = await resolved.runner.isAvailable();
+    } catch {
+      continue;
+    }
+    const authFailure = isAuthenticationFailure(availability.reason);
+    if (!availability.available && !authFailure) {
+      lastResult = {
+        runnerId: resolved.runner.id,
+        status: "failed",
+        failureKind: "temporarily-unavailable",
+        errorMessage: availability.reason ?? `${resolved.providerLabel} is unavailable.`,
+      };
+      continue;
+    }
+
+    const outputFile = vscode.Uri.joinPath(
+      runsUri,
+      `chat-${Date.now()}-${candidateModelId.replace(/[^a-z0-9]+/gi, "-")}.md`
+    );
+    const result = await resolved.runner.run(
+      {
+        taskFolderUri: folder,
+        workspaceUri,
+        stage: "desc",
+        prompt,
+        outputFile,
+        modelId: resolved.nativeModelId,
+      },
+      token
+    );
+    lastResult = result;
+    if (result.status === "cancelled" || result.status === "completed") {
+      return { result, outputFile, providerLabel: resolved.providerLabel };
+    }
+    // Never spend a backup on an authentication/config failure, and stop
+    // trying further candidates on any failure that isn't quota/temporary —
+    // matching resolveRunnerForModel's own fallback gating.
+    if (authFailure || (result.failureKind !== "quota" && result.failureKind !== "temporarily-unavailable")) {
+      return { result, providerLabel: resolved.providerLabel };
+    }
+    // Quota/temporary failure: fall through to the next candidate.
+  }
+
+  return { result: lastResult, providerLabel: lastProviderLabel };
+}
+
 async function globalAssistantSend(
   context: vscode.ExtensionContext,
   inventory: TaskInventory,
@@ -132,7 +244,7 @@ async function globalAssistantSend(
   }
   const folder = await resolveGlobalAssistantFolder();
   if (!folder) {
-    void vscode.window.showWarningMessage(
+    NotificationRouter.showWarning(
       "Open a workspace folder before using the Global Assistant."
     );
     return;
@@ -164,18 +276,12 @@ async function globalAssistantSend(
         // Task Description stage (as stated in its chat label).
         const { modelId } = await resolveFreshModelForStage(folder, "desc");
         if (!modelId) {
-          void vscode.window.showWarningMessage(
+          NotificationRouter.showWarning(
             "The Global Assistant uses the model configured for the Task Description stage, and none is set. Configure one in AI Models."
           );
           void vscode.commands.executeCommand("vs-code-ai-helper.openAiModels");
           return;
         }
-        const { runner, nativeModelId } = resolveRunnerForModel(modelId, "desc", folder);
-        const { availability, providerLabel } = await checkRunnerAvailabilityForModel(modelId, "desc");
-        if (!availability.available) {
-          throw new Error(availability.reason ?? `${providerLabel} is unavailable.`);
-        }
-
         const tasks = inventory.getTasks();
         const taskSummary =
           tasks.length === 0
@@ -193,6 +299,10 @@ async function globalAssistantSend(
           .map((entry) => `${entry.role.toUpperCase()}: ${entry.text}`)
           .join("\n");
         const prompt = buildGlobalAssistantPrompt(taskSummary, conversation, message);
+        // Provider label used only for the size-confirmation prompt text —
+        // the actual model attempted (and any backup fallback) is resolved
+        // fresh inside runGlobalAssistantWithFallback below.
+        const { providerLabel } = resolveRunnerForModel(modelId, undefined, folder);
         const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel);
         if (sizeCheck === "abort" || sizeCheck === "declined") {
           return;
@@ -200,23 +310,19 @@ async function globalAssistantSend(
 
         const runsUri = vscode.Uri.joinPath(folder, RUNS_DIRNAME);
         await vscode.workspace.fs.createDirectory(runsUri);
-        const outputFile = vscode.Uri.joinPath(runsUri, `chat-${Date.now()}.md`);
-        const result = await runner.run(
-          {
-            taskFolderUri: folder,
-            workspaceUri: workspaceFolder.uri,
-            stage: "desc",
-            prompt,
-            outputFile,
-            modelId: nativeModelId,
-          },
+        const { result, outputFile } = await runGlobalAssistantWithFallback(
+          folder,
+          workspaceFolder.uri,
+          modelId,
+          prompt,
+          runsUri,
           op.token!
         );
         if (result.status === "cancelled") {
           await chatViewProvider.append("assistant", "Global Assistant request was cancelled.", "desc", identity);
           return;
         }
-        if (result.status !== "completed") {
+        if (result.status !== "completed" || !outputFile) {
           throw new Error(result.errorMessage ?? "The Global Assistant did not respond.");
         }
         const rawResponse = stripAttributionHeaders(

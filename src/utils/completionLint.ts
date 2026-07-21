@@ -576,14 +576,18 @@ interface RunGuardOptions {
  *
  * This is a BEST-EFFORT mitigation, not an airtight guarantee. Direct
  * diagnostic runs against this exact code path showed Windows itself
- * intermittently refuse to terminate the deepest descendant in a nested
+ * intermittently refuses to terminate the deepest descendant in a nested
  * cmd.exe -> npm.cmd -> node.exe chain ("The operation attempted is not
- * supported"), and separately that a kill issued very soon after spawn can
- * simply miss a descendant that hasn't finished spawning yet — the same
- * well-known difficulty that dedicated process-tree-kill packages exist to
- * paper over. Retrying at increasing delays substantially narrows the
- * window (most attempts succeed on the first or second try) without
- * pretending to close it completely.
+ * supported") even while it successfully kills the root process we actually
+ * spawned. Retrying at increasing delays substantially narrows the window
+ * for a merely transient/slow taskkill failure (most attempts succeed on the
+ * first or second try) without pretending to close the "operation not
+ * supported" case completely — that specific descendant may never respond
+ * to any number of retries once the root pid it was scoped to is already
+ * gone. attachRunGuards (below) is what actually stops the caller from
+ * waiting on that unreachable descendant: it resolves as soon as the
+ * process we spawned exits, rather than waiting for every descendant to
+ * release the inherited stdio pipe.
  */
 function killProcessTree(child: ReturnType<typeof spawn>): void {
   if (process.platform === "win32" && child.pid) {
@@ -597,9 +601,9 @@ function killProcessTree(child: ReturnType<typeof spawn>): void {
       }
     };
     attemptKill();
-    setTimeout(attemptKill, 300);
-    setTimeout(attemptKill, 1500);
-    setTimeout(attemptKill, 5000);
+    for (const delayMs of [300, 1000, 2500, 5000, 9000, 15000, 22000, 30000]) {
+      setTimeout(attemptKill, delayMs);
+    }
     return;
   }
   child.kill();
@@ -622,6 +626,7 @@ function attachRunGuards(
 ): void {
   let output = "";
   let settled = false;
+  let killed = false;
   child.stdout?.on("data", (data: Buffer | string) => { output += typeof data === "string" ? data : data.toString("utf8"); });
   child.stderr?.on("data", (data: Buffer | string) => { output += typeof data === "string" ? data : data.toString("utf8"); });
 
@@ -634,16 +639,19 @@ function attachRunGuards(
   // happens later.
   if (guard?.token?.isCancellationRequested) {
     output += "\n[check cancelled]";
+    killed = true;
     killProcessTree(child);
   }
   const tokenSub = guard?.token?.onCancellationRequested(() => {
     if (settled) { return; }
     output += "\n[check cancelled]";
+    killed = true;
     killProcessTree(child);
   });
   const timer = guard?.timeoutMs !== undefined ? setTimeout(() => {
     if (settled) { return; }
     output += `\n[check timed out after ${guard.timeoutMs}ms and was terminated]`;
+    killed = true;
     killProcessTree(child);
   }, guard.timeoutMs) : undefined;
 
@@ -657,6 +665,20 @@ function attachRunGuards(
 
   child.on("error", (error) => finish({ code: 1, output: output + error.message }));
   child.on("close", (code) => finish({ code: code ?? 1, output }));
+  // 'close' waits for every process still holding the spawned child's stdio
+  // pipes to release them — with shell:true that pipe is inherited down the
+  // whole cmd.exe -> npm.cmd -> node.exe chain, and `taskkill /T` can force-
+  // kill the root we spawned while genuinely failing (Windows: "The operation
+  // attempted is not supported") on a deeper descendant that still holds the
+  // pipe open. That leaves 'close' waiting on an orphan we can never actually
+  // reach, for as long as that orphan keeps running (confirmed directly: the
+  // root process's own 'exit' fires almost immediately after the kill, while
+  // 'close' then blocks for the orphan's full remaining lifetime). Once we've
+  // deliberately killed this process, the tracked process itself exiting is
+  // sufficient to finish — an unreachable grandchild orphan is the same
+  // already-documented best-effort limitation as taskkill missing it in the
+  // first place, not a reason to keep waiting.
+  child.on("exit", (code) => { if (killed) { finish({ code: code ?? 1, output }); } });
 }
 
 function runCheck(

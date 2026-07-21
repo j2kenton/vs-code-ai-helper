@@ -33,7 +33,7 @@
       },
       {
         "command": "vs-code-ai-helper.startNewTask",
-        "title": "Start New Task",
+        "title": "Start New Task [Ctrl+Shift+O]",
         "category": "Ensemble",
         "icon": "$(add)"
       },
@@ -63,7 +63,7 @@
       },
       {
         "command": "vs-code-ai-helper.runReviewWithAI",
-        "title": "Review with AI",
+        "title": "Review with AI [Ctrl+Shift+Alt+R]",
         "category": "Ensemble",
         "icon": "$(law)"
       },
@@ -75,7 +75,7 @@
       },
       {
         "command": "vs-code-ai-helper.fastForwardReviewWithAI",
-        "title": "Fast Forward Fixes",
+        "title": "Fast Forward Fixes [Ctrl+Shift+Alt+F]",
         "category": "Ensemble",
         "icon": "$(run-all)"
       },
@@ -183,7 +183,7 @@
         "command": "vs-code-ai-helper.cancelOperation",
         "title": "Cancel Operation",
         "category": "Ensemble",
-        "icon": "$(stop-circle)"
+        "icon": "images/cancel-red.svg"
       },
       {
         "command": "vs-code-ai-helper.runNotificationAction",
@@ -392,6 +392,11 @@
         "command": "vs-code-ai-helper.nextStage",
         "key": "ctrl+shift+alt+n",
         "mac": "cmd+shift+alt+n"
+      },
+      {
+        "command": "workbench.view.extension.ai-helper",
+        "key": "ctrl+shift+alt+e",
+        "mac": "cmd+shift+alt+e"
       }
     ],
     "viewsContainers": {
@@ -437,17 +442,17 @@
       {
         "view": "vs-code-ai-helper.tasksView",
         "contents": "Loading tasks…",
-        "when": "!vs-code-ai-helper.tasksInitialized"
+        "when": "!vs-code-ai-helper.tasksInitialized || vs-code-ai-helper.isLoadingTasks"
       },
       {
         "view": "vs-code-ai-helper.tasksView",
         "contents": "Open a workspace folder to start tracking tasks. Ensemble stores task metadata in `.ensemble`.\n[Start New Task](command:vs-code-ai-helper.startNewTask)",
-        "when": "vs-code-ai-helper.tasksInitialized && !vs-code-ai-helper.hasMetaFolder"
+        "when": "vs-code-ai-helper.tasksInitialized && !vs-code-ai-helper.isLoadingTasks && !vs-code-ai-helper.hasMetaFolder"
       },
       {
         "view": "vs-code-ai-helper.tasksView",
         "contents": "No tasks yet. Start one to see its workflow progress here.\n[Start New Task](command:vs-code-ai-helper.startNewTask)",
-        "when": "vs-code-ai-helper.tasksInitialized && vs-code-ai-helper.hasMetaFolder && !vs-code-ai-helper.hasTasks"
+        "when": "vs-code-ai-helper.tasksInitialized && !vs-code-ai-helper.isLoadingTasks && vs-code-ai-helper.hasMetaFolder && !vs-code-ai-helper.hasTasks"
       }
     ],
     "menus": {

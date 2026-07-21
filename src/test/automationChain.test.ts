@@ -8,6 +8,7 @@ import * as assert from "node:assert/strict";
 import { test } from "node:test";
 import {
   isAutomationChainActive,
+  releaseAutomationChain,
   resetAutomationChainGuards,
   scheduleAutomationChain,
   type AutomationChainDeps,
@@ -184,4 +185,49 @@ void test("chains dispatching different commands share an explicit chainId guard
   );
   assert.equal(afterwards, true, "the guard is released once the first chain settles");
   assert.equal(chain.executed.length, 2);
+});
+
+void test("a review handing off to the next review stage under the same chainId, from inside its own still-pending dispatch, is not silently dropped", async () => {
+  // Regression: a review that auto-advances directly into the next review
+  // stage (e.g. plan-high-review scoring above threshold -> plan-low-review)
+  // re-dispatches under the same "auto-review" chainId, synchronously from
+  // within the command this very slot was claimed for — the outer dispatch's
+  // own promise has not settled yet. Without releaseAutomationChain, the
+  // follow-up's claim sees its own not-yet-settled predecessor as a
+  // duplicate and is silently dropped.
+  resetAutomationChainGuards();
+  const executed: Array<{ command: string; arg: unknown }> = [];
+  let followUpResult: boolean | undefined;
+  const deps: AutomationChainDeps = {
+    onDidEnd: () => ({ dispose(): void {} }),
+    execute: async (command, arg): Promise<unknown> => {
+      executed.push({ command, arg });
+      if (command === "x.highReview") {
+        // Simulate the review's own completion handler handing off to the
+        // next review stage before this outer call returns.
+        releaseAutomationChain("/task-a", "auto-review");
+        followUpResult = await scheduleAutomationChain(
+          { command: "x.lowReview", taskKey: "/task-a", chainId: "auto-review" },
+          undefined,
+          deps
+        );
+      }
+      return undefined;
+    },
+  };
+
+  const outerResult = await scheduleAutomationChain(
+    { command: "x.highReview", taskKey: "/task-a", chainId: "auto-review" },
+    undefined,
+    deps
+  );
+
+  assert.equal(outerResult, true);
+  assert.equal(followUpResult, true, "the follow-up review must not be dropped by its own predecessor's still-active guard slot");
+  assert.deepEqual(executed.map((e) => e.command), ["x.highReview", "x.lowReview"]);
+  // The outer's own (stale) release, firing after both calls above have
+  // already returned, must not clobber the follow-up's still-legitimate
+  // claim — but by the time everything has settled, nothing should be left
+  // dangling either.
+  assert.equal(isAutomationChainActive("/task-a", "auto-review"), false);
 });

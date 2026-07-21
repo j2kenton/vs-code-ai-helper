@@ -90,7 +90,7 @@ export async function setTaskStage(
 ): Promise<void> {
   const workspaceRoot = vscode.workspace.workspaceFolders?.[0];
   if (!workspaceRoot) {
-    void vscode.window.showErrorMessage(
+    NotificationRouter.showError(
       "No workspace folder open. Please open a folder first."
     );
     return;
@@ -117,7 +117,7 @@ export async function setTaskStage(
     // onto an unrelated task — exactly the wrong behaviour the resolver fix
     // was designed to prevent. Fail clearly for explicit-task callers.
     if (hasExplicitTask) {
-      void vscode.window.showErrorMessage(
+      NotificationRouter.showError(
         "The task could not be found. It may have been deleted or moved. " +
           "Please refresh the Tasks panel and try again."
       );
@@ -235,7 +235,7 @@ export async function setTaskStage(
   }
 
   if (!transitionResult?.persisted) {
-    void vscode.window.showErrorMessage(
+    NotificationRouter.showError(
       `Could not read or update task progress for ${task.folderName}.`
     );
     return;
@@ -357,11 +357,11 @@ async function setTaskStageOnCompletedTask(
   );
 
   if (result.outcome === "stale") {
-    void vscode.window.showWarningMessage(result.message!);
+    NotificationRouter.showWarning(result.message!);
     return;
   }
   if (result.outcome === "failed") {
-    void vscode.window.showErrorMessage(result.message ?? "Could not reopen the task.");
+    NotificationRouter.showError(result.message ?? "Could not reopen the task.");
     return;
   }
 

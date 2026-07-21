@@ -216,11 +216,11 @@ async function buildCommitMessage(
   // level, never a list of changed filenames (the diff already shows those;
   // enumerating them here was reported as unhelpful noise, not intent). The
   // richer per-file summary already lives in pr-description.md.
-  const fallback = `Complete ${taskName} changes for publish`.slice(0, 72);
+  const fallback = `chore: complete ${taskName} changes for publish`.slice(0, 72);
 
   const commitMessageInstructions =
-    "Write a git commit message for the diff below, in standard subject-plus-body form:\n" +
-    "- Line 1 (subject): imperative mood, at most 72 characters, describing the feature-level intent or behavior of the change (what it does and why), not abstract planning language; no quotes, no trailing period.\n" +
+    "Write a git commit message for the diff below, in standard subject-plus-body form, using the Conventional Commits format:\n" +
+    "- Line 1 (subject): must follow `type(scope): summary` (scope is optional — omit the parentheses entirely when there is no clear scope); `type` must be exactly one of feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert; the summary is imperative mood, describing the feature-level intent or behavior of the change (what it does and why), not abstract planning language; no quotes, no trailing period; the entire subject line (including the type/scope prefix) must be at most 72 characters.\n" +
     "- For a non-trivial change, follow with a blank line and a short body (2-6 plain-text lines, wrapped at ~72 characters) explaining the intent behind the change — what problem it solves or what capability it adds — in terms of behavior, not implementation mechanics.\n" +
     "- Never render the subject or body as a list or enumeration of changed files or filenames — the diff already shows exactly what changed; describe what the change accomplishes instead.\n" +
     "- For a trivial change, return the subject line alone.\n" +
@@ -832,7 +832,7 @@ async function saveDirtyDocuments(
   for (const doc of dirtyDocs) {
     const saved = await doc.save();
     if (!saved || doc.isDirty) {
-      void vscode.window.showErrorMessage(
+      NotificationRouter.showError(
         `Could not save ${path.basename(doc.uri.fsPath)}. Please save all files before committing.`
       );
       return false;
@@ -885,7 +885,7 @@ export async function commitAndPushTask(
     // a clear error was already shown by resolveTaskContext. If no arg and no
     // persisted task, guide the user.
     if (resolverArg) {
-      void vscode.window.showErrorMessage(
+      NotificationRouter.showError(
         "The task could not be found. It may have been deleted or moved. " +
           "Please refresh the Tasks panel and try again."
       );
@@ -936,7 +936,7 @@ export async function commitAndPushTask(
     // failing-checks modal below, which is reserved for lint/test failures.
     const gitReadinessCheck = await checkGitPublishReadiness(resolvedTask.taskFolderPath);
     if (!gitReadinessCheck.ok) {
-      void vscode.window.showErrorMessage(
+      NotificationRouter.showError(
         `Commit and push failed: ${gitReadinessCheck.reason}`
       );
       return;
@@ -1393,7 +1393,7 @@ export async function commitAndPushTask(
           } catch {
             // Best effort.
           }
-          void vscode.window.showErrorMessage(
+          NotificationRouter.showError(
             `Commit failed: ${getErrorMessage(error)}`
           );
           return;
@@ -1418,7 +1418,7 @@ export async function commitAndPushTask(
           // Do NOT automatically roll back: this mutates the user's git
           // history without their explicit instruction. Tell them how to
           // undo manually.
-          void vscode.window.showErrorMessage(
+          NotificationRouter.showError(
             `Push failed. Your local commit was kept — it has NOT been rolled back automatically.\n\n` +
               `To undo the commit manually: git reset --mixed HEAD~1\n\n` +
               `Error: ${getErrorMessage(error)}`
@@ -1430,7 +1430,7 @@ export async function commitAndPushTask(
           // operation as cancelled instead of falsely reporting success.
           throw error;
         }
-        void vscode.window.showErrorMessage(
+        NotificationRouter.showError(
           `Commit and push failed: ${getErrorMessage(error)}`
         );
       }
@@ -1462,7 +1462,7 @@ export async function completeCommitAndPushTask(
 
   if (!resolvedTask) {
     if (resolverArg) {
-      void vscode.window.showErrorMessage(
+      NotificationRouter.showError(
         "The task could not be found. It may have been deleted or moved. " +
           "Please refresh the Tasks panel and try again."
       );
@@ -1524,7 +1524,7 @@ export async function completeCommitAndPushTask(
     }
 
     if (!transitionResult?.persisted) {
-      void vscode.window.showErrorMessage(
+      NotificationRouter.showError(
         `Could not persist completion for ${resolvedTask.folderName}. Please try again.`
       );
       return;

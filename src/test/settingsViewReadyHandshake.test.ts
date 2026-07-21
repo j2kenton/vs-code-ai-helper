@@ -650,13 +650,13 @@ void describe("SettingsViewProvider webview — AI Models tab labels and Discard
   void it("labels and styles the save/discard/provider/backup buttons per the AI Models tab conventions", () => {
     const html = extractWebviewHtml();
 
-    assert.match(html, /<button id="save-btn" disabled>Save Model Selection<\/button>/);
+    assert.match(html, /<button id="save-btn" disabled title="[^"]+">Save Model Selection<\/button>/);
     assert.match(
       html,
-      /<button id="discard-btn" class="secondary" disabled>Discard Unsaved Changes<\/button>/
+      /<button id="discard-btn" class="secondary" disabled title="[^"]+">Discard Unsaved Changes<\/button>/
     );
     assert.doesNotMatch(html, /Reset to Defaults/);
-    assert.match(html, /<button id="save-providers-btn">Save Provider Selection<\/button>/);
+    assert.match(html, /<button id="save-providers-btn" title="[^"]+">Save Provider Selection<\/button>/);
     assert.match(html, /class="secondary add-backup"/);
     assert.match(html, /class="secondary remove-backup"/);
   });
