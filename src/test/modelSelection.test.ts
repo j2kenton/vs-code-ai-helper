@@ -634,6 +634,21 @@ void describe("getAvailableModels", () => {
             providerLabel: "Antigravity CLI (subscription CLI)",
           },
           {
+            id: "antigravity-cli:Gemini 3.6 Flash (Low)",
+            name: "Gemini 3.6 Flash (Low)",
+            providerLabel: "Antigravity CLI (subscription CLI)",
+          },
+          {
+            id: "antigravity-cli:Gemini 3.6 Flash (Medium)",
+            name: "Gemini 3.6 Flash (Medium)",
+            providerLabel: "Antigravity CLI (subscription CLI)",
+          },
+          {
+            id: "antigravity-cli:Gemini 3.6 Flash (High)",
+            name: "Gemini 3.6 Flash (High)",
+            providerLabel: "Antigravity CLI (subscription CLI)",
+          },
+          {
             id: "antigravity-cli:Gemini 3.5 Flash (Medium)",
             name: "Gemini 3.5 Flash (Medium)",
             providerLabel: "Antigravity CLI (subscription CLI)",

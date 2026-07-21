@@ -1008,6 +1008,9 @@ const SEEDED_CLI_MODELS: Readonly<
   // slug like `gemini-3.5-flash-medium` fails with "invalid --model"). Keep
   // these in sync with `agy models`' own output — see cliModelDiscovery.ts.
   "antigravity-cli": [
+    { model: "Gemini 3.6 Flash (Low)", name: "Gemini 3.6 Flash (Low)" },
+    { model: "Gemini 3.6 Flash (Medium)", name: "Gemini 3.6 Flash (Medium)" },
+    { model: "Gemini 3.6 Flash (High)", name: "Gemini 3.6 Flash (High)" },
     { model: "Gemini 3.5 Flash (Medium)", name: "Gemini 3.5 Flash (Medium)" },
     { model: "Gemini 3.5 Flash (High)", name: "Gemini 3.5 Flash (High)" },
     { model: "Gemini 3.5 Flash (Low)", name: "Gemini 3.5 Flash (Low)" },
