@@ -98,4 +98,12 @@ if ($LASTEXITCODE -ne 0) {
 
 $newVersion = (Get-Content (Join-Path $repoRoot "package.json") -Raw | ConvertFrom-Json).version
 Write-Host ""
-Write-Host "Published $newVersion ($bump). Don't forget to 'git push --follow-tags'." -ForegroundColor Green
+Write-Host "Published $newVersion ($bump)." -ForegroundColor Green
+
+# --- Push the version-bump commit and tag that vsce created locally ---
+Write-Host ""
+Write-Host "Pushing commit and tags..." -ForegroundColor Cyan
+& git push --follow-tags
+if ($LASTEXITCODE -ne 0) {
+    throw "git push --follow-tags failed. The extension is already published to the Marketplace - push manually to sync the repo."
+}
