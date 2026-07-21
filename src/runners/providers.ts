@@ -385,6 +385,22 @@ export function parseOpencodeModelSelection(
   return { model: split.model, variant: split.suffix || undefined };
 }
 
+/**
+ * Appended to Claude Code CLI's default system prompt for every headless
+ * text-mode ("--permission-mode plan") run. Exported so
+ * providerCliContracts.test.ts can assert on it without duplicating the
+ * literal string. See the buildArgs comment where this is pushed for why
+ * it's needed.
+ */
+export const CLAUDE_CLI_HEADLESS_PLAN_MODE_SYSTEM_PROMPT =
+  "This is a non-interactive, headless run. The ExitPlanMode and " +
+  "AskUserQuestion tools are not available in this session — do not " +
+  "attempt to call them, and do not write your plan or any partial " +
+  "output to a file (including anywhere under ~/.claude/plans). Instead, " +
+  "write your complete plan, review, or answer directly as this " +
+  "response's final text, including any open questions, decisions, or " +
+  "assumptions inline in that text.";
+
 export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
   {
     id: "claude-cli",
@@ -442,6 +458,27 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
         // every other provider's text-mode contract (Codex `--sandbox
         // read-only`, Kiro `--trust-tools fs_read,grep,glob`).
         args.push("--permission-mode", "plan");
+        // "plan" permission mode is Claude Code's interactive plan-approval
+        // flow repurposed for a one-shot headless call. The model still
+        // carries its baked-in system-prompt instructions to call
+        // ExitPlanMode (present the plan for approval) and AskUserQuestion
+        // (ask clarifying questions) — neither tool is offered under `-p`,
+        // since both need an interactive UI. Verified live 2026-07-21
+        // against claude 2.1.216 (`claude -p --permission-mode plan`, no
+        // append-system-prompt): the model notices the mismatch, writes its
+        // real answer to a scratch file under ~/.claude/plans/ instead of
+        // the requested output, and returns only a short pointer/"tools
+        // aren't available" note as the actual response text — which is
+        // what this extension captures as the stage's result (e.g.
+        // plan.md), so the task file ends up with that stub note instead of
+        // real content. Re-verified with this flag added: the model stops
+        // reaching for those tools and puts the full plan/review/answer
+        // (including any open questions, inline) directly in the response
+        // text instead.
+        args.push(
+          "--append-system-prompt",
+          CLAUDE_CLI_HEADLESS_PLAN_MODE_SYSTEM_PROMPT
+        );
       }
       if (parsedModel.model) {
         args.push("--model", parsedModel.model);

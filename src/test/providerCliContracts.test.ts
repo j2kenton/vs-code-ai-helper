@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, it } from "node:test";
 import {
+  CLAUDE_CLI_HEADLESS_PLAN_MODE_SYSTEM_PROMPT,
   CLI_PROVIDERS,
   getCliProvider,
   getProviderAccountEntry,
@@ -319,6 +320,8 @@ void describe("provider CLI contracts", () => {
       "text",
       "--permission-mode",
       "plan",
+      "--append-system-prompt",
+      CLAUDE_CLI_HEADLESS_PLAN_MODE_SYSTEM_PROMPT,
       "--model",
       "sonnet",
       "--max-thinking-tokens",
