@@ -814,6 +814,16 @@ export async function execCliAgent(options: {
             RUN_TIMEOUT_MS / 60000
           } minutes.`,
         }),
+        // Override classifyCliFailure's marker-matched result: the fixed
+        // timeout message never contains "quota"/"rate limit"/etc, so it
+        // would otherwise fall through to "generic" — which the fallback
+        // cascade in runnerRegistry.ts treats as terminal (never tries the
+        // next backup model). A provider that is silently unresponsive for
+        // the full timeout window (verified live: opencode hangs producing
+        // zero stdout, rather than erroring, when its model is over quota)
+        // is exactly the "temporarily unavailable" case that cascade exists
+        // to handle, so it must be classified that way rather than generic.
+        failureKind: "temporarily-unavailable",
         // A timeout is the one failure shape that is transport-transient and
         // therefore retry-eligible (read-only runs always; edit runs only
         // under the per-provider flush guarantee — see runImplementationWithCli).
