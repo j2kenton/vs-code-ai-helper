@@ -985,6 +985,19 @@ void describe("getAvailableModels", () => {
         models.some((m) => m.id === "opencode-cli:opencode/north-mini-code-free@none"),
         "expected north-mini-code-free's @none variant entry"
       );
+      // opencode-go is a cheaper "Zen Go" tier of the same models (verified
+      // live: a distinct providerID with its own cost/URL, not a separate
+      // CLI provider needing its own wiring) that appeared in the live
+      // catalog after the seed's first capture — its own entries must be
+      // present in the refreshed seed just like the base "opencode" tier's.
+      assert.ok(
+        models.some((m) => m.id === "opencode-cli:opencode-go/deepseek-v4-flash"),
+        "expected the opencode-go tier's deepseek-v4-flash entry"
+      );
+      assert.ok(
+        models.some((m) => m.id === "opencode-cli:opencode-go/deepseek-v4-flash@high"),
+        "expected the opencode-go tier's deepseek-v4-flash @high variant entry"
+      );
     } finally {
       __testOnly.clearModelSelectionTestOverrides();
       __testOnly.resetCliModelCache();

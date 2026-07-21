@@ -671,11 +671,14 @@ function createSeededCodexModels(): readonly DiscoveredCliModel[] {
 
 /**
  * Raw `opencode models --verbose` catalog snapshot (opencode 1.18.4,
- * captured 2026-07-21), compacted to one minified JSON object per line (only
- * the fields parseOpencodeModelsOutput reads: id, providerID, name,
- * variants — cost/limit/capabilities/etc. are dropped, they're irrelevant to
- * model selection) and run through that SAME parser used for live discovery
- * at module load, rather than a hand-expanded array of {model, name} pairs.
+ * captured 2026-07-21, refreshed 2026-07-21 to add the "opencode-go" and
+ * "github-copilot" provider tiers that appeared in the live catalog after
+ * the first capture — the catalog is server-side and grows over time),
+ * compacted to one minified JSON object per line (only the fields
+ * parseOpencodeModelsOutput reads: id, providerID, name, variants —
+ * cost/limit/capabilities/etc. are dropped, they're irrelevant to model
+ * selection) and run through that SAME parser used for live discovery at
+ * module load, rather than a hand-expanded array of {model, name} pairs.
  * This guarantees the seed and live discovery can never structurally
  * diverge — if parseOpencodeModelsOutput's variant-naming convention ever
  * changes, this seed picks up the change automatically instead of needing a
@@ -792,6 +795,68 @@ opencode/qwen3.5-plus
 {"id":"qwen3.5-plus","providerID":"opencode","name":"Qwen3.5 Plus","variants":{"high":{},"max":{}}}
 opencode/qwen3.6-plus
 {"id":"qwen3.6-plus","providerID":"opencode","name":"Qwen3.6 Plus","variants":{"high":{},"max":{}}}
+opencode-go/deepseek-v4-flash
+{"id":"deepseek-v4-flash","providerID":"opencode-go","name":"DeepSeek V4 Flash","variants":{"high":{},"max":{}}}
+opencode-go/deepseek-v4-pro
+{"id":"deepseek-v4-pro","providerID":"opencode-go","name":"DeepSeek V4 Pro","variants":{"high":{},"max":{}}}
+opencode-go/glm-5.1
+{"id":"glm-5.1","providerID":"opencode-go","name":"GLM-5.1","variants":{}}
+opencode-go/glm-5.2
+{"id":"glm-5.2","providerID":"opencode-go","name":"GLM-5.2","variants":{"high":{},"max":{}}}
+opencode-go/grok-4.5
+{"id":"grok-4.5","providerID":"opencode-go","name":"Grok 4.5","variants":{"low":{},"medium":{},"high":{}}}
+opencode-go/kimi-k2.6
+{"id":"kimi-k2.6","providerID":"opencode-go","name":"Kimi K2.6","variants":{}}
+opencode-go/kimi-k2.7-code
+{"id":"kimi-k2.7-code","providerID":"opencode-go","name":"Kimi K2.7 Code","variants":{}}
+opencode-go/kimi-k3
+{"id":"kimi-k3","providerID":"opencode-go","name":"Kimi K3 (2x usage)","variants":{"max":{}}}
+opencode-go/mimo-v2.5
+{"id":"mimo-v2.5","providerID":"opencode-go","name":"MiMo V2.5","variants":{}}
+opencode-go/mimo-v2.5-pro
+{"id":"mimo-v2.5-pro","providerID":"opencode-go","name":"MiMo V2.5 Pro","variants":{}}
+opencode-go/minimax-m2.7
+{"id":"minimax-m2.7","providerID":"opencode-go","name":"MiniMax-M2.7","variants":{}}
+opencode-go/minimax-m3
+{"id":"minimax-m3","providerID":"opencode-go","name":"MiniMax-M3","variants":{"none":{},"thinking":{}}}
+opencode-go/qwen3.6-plus
+{"id":"qwen3.6-plus","providerID":"opencode-go","name":"Qwen3.6 Plus","variants":{"high":{},"max":{}}}
+opencode-go/qwen3.7-max
+{"id":"qwen3.7-max","providerID":"opencode-go","name":"Qwen3.7 Max","variants":{"high":{},"max":{}}}
+opencode-go/qwen3.7-plus
+{"id":"qwen3.7-plus","providerID":"opencode-go","name":"Qwen3.7 Plus","variants":{"high":{},"max":{}}}
+github-copilot/claude-haiku-4.5
+{"id":"claude-haiku-4.5","providerID":"github-copilot","name":"Claude Haiku 4.5 (latest)","variants":{"max":{},"high":{}}}
+github-copilot/claude-sonnet-4.5
+{"id":"claude-sonnet-4.5","providerID":"github-copilot","name":"Claude Sonnet 4.5 (latest)","variants":{"max":{},"high":{}}}
+github-copilot/claude-sonnet-4.6
+{"id":"claude-sonnet-4.6","providerID":"github-copilot","name":"Claude Sonnet 4.6","variants":{"low":{},"medium":{},"high":{},"max":{}}}
+github-copilot/claude-sonnet-5
+{"id":"claude-sonnet-5","providerID":"github-copilot","name":"Claude Sonnet 5","variants":{"low":{},"medium":{},"high":{},"xhigh":{},"max":{}}}
+github-copilot/gemini-2.5-pro
+{"id":"gemini-2.5-pro","providerID":"github-copilot","name":"Gemini 2.5 Pro","variants":{"max":{},"high":{}}}
+github-copilot/gemini-3-flash-preview
+{"id":"gemini-3-flash-preview","providerID":"github-copilot","name":"Gemini 3 Flash Preview","variants":{"low":{},"medium":{},"high":{}}}
+github-copilot/gemini-3.1-pro-preview
+{"id":"gemini-3.1-pro-preview","providerID":"github-copilot","name":"Gemini 3.1 Pro Preview","variants":{"low":{},"medium":{},"high":{}}}
+github-copilot/gemini-3.5-flash
+{"id":"gemini-3.5-flash","providerID":"github-copilot","name":"Gemini 3.5 Flash","variants":{"minimal":{},"low":{},"medium":{},"high":{}}}
+github-copilot/gpt-5-mini
+{"id":"gpt-5-mini","providerID":"github-copilot","name":"GPT-5 Mini","variants":{"low":{},"medium":{},"high":{}}}
+github-copilot/gpt-5.3-codex
+{"id":"gpt-5.3-codex","providerID":"github-copilot","name":"GPT-5.3 Codex","variants":{"low":{},"medium":{},"high":{},"xhigh":{}}}
+github-copilot/gpt-5.4
+{"id":"gpt-5.4","providerID":"github-copilot","name":"GPT-5.4","variants":{"none":{},"low":{},"medium":{},"high":{},"xhigh":{}}}
+github-copilot/gpt-5.4-mini
+{"id":"gpt-5.4-mini","providerID":"github-copilot","name":"GPT-5.4 mini","variants":{"none":{},"low":{},"medium":{},"high":{},"xhigh":{}}}
+github-copilot/gpt-5.6-luna
+{"id":"gpt-5.6-luna","providerID":"github-copilot","name":"GPT-5.6 Luna","variants":{"none":{},"low":{},"medium":{},"high":{},"xhigh":{},"max":{}}}
+github-copilot/gpt-5.6-terra
+{"id":"gpt-5.6-terra","providerID":"github-copilot","name":"GPT-5.6 Terra","variants":{"none":{},"low":{},"medium":{},"high":{},"xhigh":{},"max":{}}}
+github-copilot/kimi-k2.7-code
+{"id":"kimi-k2.7-code","providerID":"github-copilot","name":"Kimi K2.7 Code","variants":{}}
+github-copilot/mai-code-1-flash-picker
+{"id":"mai-code-1-flash-picker","providerID":"github-copilot","name":"MAI-Code-1-Flash","variants":{"low":{},"medium":{},"high":{}}}
 openai/chatgpt-image-latest
 {"id":"chatgpt-image-latest","providerID":"openai","name":"chatgpt-image-latest","variants":{}}
 openai/gpt-3.5-turbo
