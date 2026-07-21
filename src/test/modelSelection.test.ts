@@ -23,6 +23,12 @@ function antigravityModels(
   return providerModels(models, "Antigravity CLI (subscription CLI)");
 }
 
+function opencodeModels(
+  models: readonly SelectableModel[]
+): SelectableModel[] {
+  return providerModels(models, "opencode (subscription CLI)");
+}
+
 function codexVariant(
   id: string,
   name: string
@@ -931,6 +937,131 @@ void describe("getAvailableModels", () => {
     } finally {
       __testOnly.clearModelSelectionTestOverrides();
       __testOnly.resetCliModelCache();
+    }
+  });
+
+  void it("surfaces opencode's hardcoded seeded catalog, including per-model @variant entries, with no live discovery", async () => {
+    // opencode's seed list (SEEDED_CLI_MODELS in modelSelection.ts) is a
+    // full ~466-entry snapshot of `opencode models --verbose`, unlike the
+    // small hand-curated lists for the other providers — verifying every
+    // entry here would be redundant with the snapshot itself, so this
+    // checks the shape (default fallback first, real seeded models present,
+    // @variant-suffixed entries present) rather than the full list.
+    //
+    // Deliberately does NOT override getDiscoveredCliModels: production's
+    // real implementation reads synchronously from cliModelCache, which
+    // restoreSeededCliModelCache() pre-populates from SEEDED_CLI_MODELS at
+    // module load — that's the actual "seed populates the picker with no
+    // live CLI call" path this test needs to exercise. Overriding it (as
+    // the Copilot/Antigravity fixtures above do to inject specific
+    // discovery results) would bypass the cache and defeat the point.
+    __testOnly.restoreSeededCliModelCache();
+    __testOnly.setModelSelectionTestOverrides({
+      getAvailableCopilotModels() {
+        return Promise.resolve([]);
+      },
+      cliCommandExists(command) {
+        return Promise.resolve(command === "opencode");
+      },
+    });
+
+    try {
+      const models = opencodeModels(await getAvailableModels());
+      assert.ok(models.length > 400, `expected the full seeded catalog, got ${models.length} entries`);
+      assert.deepStrictEqual(models[0], {
+        id: "opencode-cli:default",
+        name: "opencode (CLI default)",
+        providerLabel: "opencode (subscription CLI)",
+      });
+      assert.ok(
+        models.some((m) => m.id === "opencode-cli:opencode/deepseek-v4-flash"),
+        "expected the base deepseek-v4-flash entry"
+      );
+      assert.ok(
+        models.some((m) => m.id === "opencode-cli:opencode/deepseek-v4-flash@high"),
+        "expected deepseek-v4-flash's @high variant entry"
+      );
+      assert.ok(
+        models.some((m) => m.id === "opencode-cli:opencode/north-mini-code-free@none"),
+        "expected north-mini-code-free's @none variant entry"
+      );
+    } finally {
+      __testOnly.clearModelSelectionTestOverrides();
+      __testOnly.resetCliModelCache();
+      __testOnly.restoreSeededCliModelCache();
+    }
+  });
+
+  void it("resolveRefreshedCliModels keeps the current (seeded) list when a background refresh finds nothing, and replaces it wholesale when it does", () => {
+    // This is the actual merge-decision function queueCliModelRefresh calls
+    // in production to update cliModelCache after a live discovery call
+    // (getAvailableModels itself never merges anything — it just reads
+    // whatever is currently cached). Testing it directly, rather than
+    // hand-priming the cache with a pre-merged result via
+    // primeCliModelCache, is what actually exercises the merge behavior:
+    // a test that primes the cache with the answer it then asserts would
+    // pass even if this function were deleted entirely.
+    const seeded = [
+      { model: "opencode/deepseek-v4-flash", name: "DeepSeek V4 Flash" },
+      { model: "opencode/gpt-5", name: "GPT-5" },
+    ];
+
+    // A refresh that finds nothing (CLI hung, timed out, or genuinely
+    // returned an empty catalog) must not wipe out the seed.
+    assert.deepStrictEqual(
+      __testOnly.resolveRefreshedCliModels(seeded, []),
+      seeded
+    );
+
+    // A refresh that DOES find models replaces the list wholesale with
+    // whatever it found — the seed's own entries only survive if the fresh
+    // discovery call itself still reports them (which parseOpencodeModelsOutput
+    // does, since it always re-derives the full catalog from `opencode
+    // models --verbose`, not an incremental diff).
+    const discovered = [
+      { model: "opencode/deepseek-v4-flash", name: "DeepSeek V4 Flash" },
+      { model: "opencode/brand-new-model", name: "Brand New Model" },
+    ];
+    assert.deepStrictEqual(
+      __testOnly.resolveRefreshedCliModels(seeded, discovered),
+      discovered
+    );
+  });
+
+  void it("getAvailableModels reads whatever is currently in the opencode cache, seed or otherwise", async () => {
+    // Complements the resolveRefreshedCliModels test above: confirms
+    // getAvailableModels itself does no merging of its own and just
+    // surfaces the cache's current contents — including a case where the
+    // cache holds something other than the hardcoded seed (e.g. mid-way
+    // through a real warmCliModelCache() refresh cycle).
+    __testOnly.resetCliModelCache();
+    __testOnly.setModelSelectionTestOverrides({
+      getAvailableCopilotModels() {
+        return Promise.resolve([]);
+      },
+      cliCommandExists(command) {
+        return Promise.resolve(command === "opencode");
+      },
+    });
+    __testOnly.primeCliModelCache("opencode-cli", {
+      models: [{ model: "opencode/brand-new-model", name: "Brand New Model" }],
+    });
+
+    try {
+      const models = opencodeModels(await getAvailableModels());
+      assert.ok(
+        models.some((m) => m.id === "opencode-cli:opencode/brand-new-model"),
+        "expected the primed cache entry to surface"
+      );
+      assert.ok(
+        !models.some((m) => m.id === "opencode-cli:opencode/deepseek-v4-flash"),
+        "the seed's own entries should NOT appear once the cache holds a different list " +
+          "(getAvailableModels does not merge — production relies on resolveRefreshedCliModels for that)"
+      );
+    } finally {
+      __testOnly.clearModelSelectionTestOverrides();
+      __testOnly.resetCliModelCache();
+      __testOnly.restoreSeededCliModelCache();
     }
   });
 });

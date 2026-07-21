@@ -22,6 +22,7 @@ import {
   LEGACY_IMPLEMENTATION_FILENAME,
 } from "../types/taskProgress";
 import { looksLikeGeneratedImplementationSummary } from "../utils/implementationArtifactResolver";
+import { killProcessTree, sanitizedCliEnv } from "../utils/cliProcessUtils";
 
 /**
  * Reserved artifact filenames the implementation stage writes inside a task
@@ -147,73 +148,9 @@ export async function testCliProviderSetup(
   });
 }
 
-/**
- * Env var name prefixes/exact-names that identify an in-progress Claude Code
- * session hosting *this extension itself*. These must never reach a spawned
- * provider CLI: this extension host typically runs inside a Claude Code
- * session (e.g. the Claude Code VS Code extension), so process.env carries
- * that session's identity (CLAUDECODE, CLAUDE_CODE_*, CLAUDE_EFFORT, etc.).
- * Passed through unfiltered, a nested `claude -p ...` child can detect it's
- * being launched as an IDE-companion/child session and behave differently
- * than a fresh headless call.
- *
- * Deliberately scoped to Claude-session-identity variables only, not other
- * vendors' env namespaces: this extension host has no comparable reason to
- * ever itself be a Codex or Gemini session, and those vendors' own env vars
- * (e.g. CODEX_HOME) are the user's legitimate CLI config/auth — stripping
- * them would silently break an intentionally-configured login/profile
- * rather than prevent any actual leak.
- */
-const AGENTIC_SESSION_ENV_EXACT = new Set([
-  "CLAUDECODE",
-  "CLAUDE_EFFORT",
-  "CLAUDE_AGENT_SDK_VERSION",
-]);
-const AGENTIC_SESSION_ENV_PREFIXES = ["CLAUDE_CODE_"];
-
-function sanitizedCliEnv(): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = {};
-  for (const [key, value] of Object.entries(process.env)) {
-    if (AGENTIC_SESSION_ENV_EXACT.has(key)) {
-      continue;
-    }
-    if (AGENTIC_SESSION_ENV_PREFIXES.some((prefix) => key.startsWith(prefix))) {
-      continue;
-    }
-    env[key] = value;
-  }
-  return env;
-}
-
-/**
- * Kill a CLI process and its children (agent CLIs spawn helpers, and since
- * they're launched with shell:true there's always at least a shell process
- * in between). On Windows, taskkill /T walks the whole process tree by PID.
- * On POSIX, the child is spawned detached (see execCliAgent) so it heads
- * its own process group; signalling the negated PID sends SIGTERM to that
- * whole group — the shell, the exec'd CLI, and any children *it* forked —
- * rather than only the single PID Node handed back, which a plain
- * child.kill("SIGTERM") would otherwise leave running past cancellation.
- */
-function killProcessTree(child: cp.ChildProcess): void {
-  if (child.pid === undefined) {
-    return;
-  }
-  if (process.platform === "win32") {
-    cp.spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], {
-      windowsHide: true,
-    });
-  } else {
-    try {
-      process.kill(-child.pid, "SIGTERM");
-    } catch {
-      // Group may already be gone, or (if spawn's detached setup somehow
-      // failed) child.pid isn't a process-group leader — fall back to
-      // signalling the process directly so the run still terminates.
-      child.kill("SIGTERM");
-    }
-  }
-}
+// sanitizedCliEnv and killProcessTree moved to ../utils/cliProcessUtils so
+// cliModelDiscovery.ts's discovery spawns can share them too — see that
+// module's doc comments for why both spawn paths need the same guarantees.
 
 /**
  * What the CLI's own stdout event stream showed for a timed-out run —
@@ -515,6 +452,87 @@ function extractKiroFinalOutput(stdout: string): string {
   return cleaned;
 }
 
+/**
+ * opencode's `--format json` stdout is a JSON-lines event stream, not the
+ * final answer directly (verified live against opencode 1.18.4): each line
+ * is an event object, and the assistant's reply arrives as one or more
+ * `{"type":"text",...,"part":{"type":"text","text":"..."}}` lines — each
+ * carrying that part's FULL accumulated text, not an incremental delta
+ * (confirmed by direct testing: a two-sentence reply arrived as a single
+ * complete `text` event, not per-token chunks). A run may include several
+ * text parts interleaved with tool-use events (e.g. "I'll do X" ... tool
+ * call ... "Done."), so every text part is concatenated in stream order to
+ * reconstruct the full reply, rather than keeping only the last one.
+ */
+/** Placeholder returned when opencode's event stream parsed cleanly (real
+ * step/tool events were present) but contained no text reply at all — a
+ * genuine exit-0 outcome, verified live: a build-mode run instructed to
+ * "silently create this file, no confirmation text" ended on a step-finish
+ * with reason "stop" and zero text parts in the whole stream. Distinct from
+ * an empty string so execCliAgent's "produced no output" guard (which fails
+ * ANY zero-length result, in every mode) does not turn a legitimate silent
+ * edit into a false failure — the actual "did nothing" case is still caught
+ * downstream by runImplementationWithCli's filesChanged check for edit runs,
+ * and this placeholder makes a text-mode (plan/review) run that answered
+ * nothing meaningfully visible as such rather than silently empty either. */
+const OPENCODE_NO_TEXT_REPLY_PLACEHOLDER =
+  "(opencode completed the run without returning any text reply.)";
+
+function extractOpencodeFinalOutput(stdout: string): string {
+  const cleaned = stripAnsi(stdout).trim();
+  if (cleaned.length === 0) {
+    return cleaned;
+  }
+
+  const textParts: string[] = [];
+  let sawRecognizedEvent = false;
+  for (const rawLine of cleaned.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line.startsWith("{") || !line.endsWith("}")) {
+      continue;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (!parsed || typeof parsed !== "object") {
+      continue;
+    }
+    const event = parsed as {
+      type?: unknown;
+      part?: { type?: unknown; text?: unknown };
+    };
+    if (typeof event.type === "string") {
+      sawRecognizedEvent = true;
+    }
+    if (
+      event.type === "text" &&
+      event.part?.type === "text" &&
+      typeof event.part.text === "string"
+    ) {
+      textParts.push(event.part.text);
+    }
+  }
+
+  if (textParts.length > 0) {
+    return textParts.join("\n\n").trim();
+  }
+
+  if (sawRecognizedEvent) {
+    return OPENCODE_NO_TEXT_REPLY_PLACEHOLDER;
+  }
+
+  // Nothing in the output was a recognizable opencode JSON event at all
+  // (e.g. an "error" event line still parses as an object with a "type" of
+  // "error" and IS caught above — this branch is for genuinely unparseable
+  // or unrecognized stream shapes from a future opencode version). Fall
+  // back to the raw stream so the failure is still visible rather than
+  // silently empty or silently generic.
+  return cleaned;
+}
+
 function normalizeCliOutput(
   def: CliProviderDefinition,
   stdout: string,
@@ -536,12 +554,17 @@ function normalizeCliOutput(
     return extractKiroFinalOutput(output);
   }
 
+  if (def.id === "opencode-cli") {
+    return extractOpencodeFinalOutput(output);
+  }
+
   return output;
 }
 
 export const __testOnly = {
   stripAnsi,
   extractKiroFinalOutput,
+  extractOpencodeFinalOutput,
   normalizeCliOutput,
   toCliImplementationRunResult,
   sanitizedCliEnv,

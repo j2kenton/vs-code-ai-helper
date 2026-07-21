@@ -9,6 +9,7 @@ import {
   parseCopilotModelSelection,
   parseCodexModelSelection,
   parseModelSelection,
+  parseOpencodeModelSelection,
   PROVIDER_ACCOUNT_ENTRIES,
   type CliProviderDefinition,
 } from "../runners/providers";
@@ -103,6 +104,84 @@ void describe("provider CLI contracts", () => {
       () => antigravity.buildArgs("text", undefined, undefined),
       /misconfiguration/
     );
+  });
+
+  void it("opencode uses stdin prompt transport and an explicit --agent per mode", () => {
+    const opencode = getCliProvider("opencode-cli");
+    assert.ok(opencode, "expected opencode-cli provider definition");
+
+    assert.strictEqual(opencode.promptTransport, "stdin");
+    assert.strictEqual(opencode.useShell, undefined);
+    assert.strictEqual(opencode.usesLastMessageFile, false);
+
+    const textArgs = opencode.buildArgs("text", undefined, undefined);
+    assert.deepStrictEqual(textArgs, [
+      "run",
+      "--format",
+      "json",
+      "--agent",
+      "plan",
+    ]);
+
+    const editArgs = opencode.buildArgs("edit", "openai/gpt-5", undefined);
+    assert.deepStrictEqual(editArgs, [
+      "run",
+      "--format",
+      "json",
+      "--agent",
+      "build",
+      "--model",
+      "openai/gpt-5",
+    ]);
+  });
+
+  void it("opencode model selections carry an optional per-model @variant suffix", () => {
+    // opencode has no single fixed reasoning-effort ladder shared by every
+    // model (unlike Codex) — each model declares its own variant set
+    // (verified live via `opencode models --verbose`: "deepseek-v4-flash"
+    // has "high"/"max", "north-mini-code-free" has "none"/"high"), so the
+    // suffix is passed through to --variant verbatim rather than validated
+    // against an allowlist — see parseOpencodeModelSelection's doc comment.
+    assert.deepStrictEqual(parseOpencodeModelSelection(undefined), {
+      model: undefined,
+      variant: undefined,
+    });
+    assert.deepStrictEqual(parseOpencodeModelSelection("opencode/deepseek-v4-flash"), {
+      model: "opencode/deepseek-v4-flash",
+      variant: undefined,
+    });
+    assert.deepStrictEqual(
+      parseOpencodeModelSelection("opencode/deepseek-v4-flash@high"),
+      { model: "opencode/deepseek-v4-flash", variant: "high" }
+    );
+    assert.deepStrictEqual(
+      parseOpencodeModelSelection("opencode/north-mini-code-free@none"),
+      { model: "opencode/north-mini-code-free", variant: "none" }
+    );
+
+    const opencode = getCliProvider("opencode-cli");
+    assert.ok(opencode);
+    const editArgs = opencode.buildArgs("edit", "opencode/deepseek-v4-flash@high", undefined);
+    assert.deepStrictEqual(editArgs, [
+      "run",
+      "--format",
+      "json",
+      "--agent",
+      "build",
+      "--model",
+      "opencode/deepseek-v4-flash",
+      "--variant",
+      "high",
+    ]);
+
+    // Full round trip through the provider-qualified storage prefix too —
+    // parseModelSelection only splits on the FIRST ":", so the "@variant"
+    // suffix survives into the raw model string untouched and is split
+    // apart locally by buildArgs, the same way Codex's "@effort+tier"
+    // suffix already does.
+    const parsedStored = parseModelSelection("opencode-cli:opencode/deepseek-v4-flash@high");
+    assert.strictEqual(parsedStored.provider, "opencode-cli");
+    assert.strictEqual(parsedStored.model, "opencode/deepseek-v4-flash@high");
   });
 
   void it("text mode stays permission-constrained unless the provider warns the user", () => {
@@ -338,6 +417,7 @@ void describe("provider CLI contracts", () => {
       "gemini-cli": { command: "gemini" },
       "antigravity-cli": { command: "agy" },
       "kiro-cli": { command: "kiro-cli logout; kiro-cli login" },
+      "opencode-cli": { command: "opencode providers login" },
     };
 
     for (const provider of CLI_PROVIDERS) {
@@ -467,6 +547,7 @@ void describe("provider CLI contracts", () => {
       "gemini-cli": { kind: "unsupported" },
       "antigravity-cli": { kind: "unsupported" },
       "kiro-cli": { kind: "unsupported" },
+      "opencode-cli": { kind: "unsupported" },
     };
     for (const entry of PROVIDER_ACCOUNT_ENTRIES) {
       const expected = expectations[entry.id];
@@ -537,6 +618,16 @@ void describe("provider CLI contracts", () => {
     assert.ok(antigravity.usage.kind === "unsupported");
     assert.strictEqual(antigravity.usage.url, undefined, "unverified usage must not resolve to an enabled button");
     assert.match(antigravity.usage.reason, /agy/);
+
+    // opencode proxies whichever upstream provider(s) the user configured —
+    // there is no single opencode-level quota command, and no known account
+    // page to link out to either (unlike Kiro/Copilot), so its button stays
+    // disabled with an explanatory reason and no url.
+    const opencodeEntry = getProviderAccountEntry("opencode-cli");
+    assert.ok(opencodeEntry);
+    assert.ok(opencodeEntry.usage.kind === "unsupported");
+    assert.strictEqual(opencodeEntry.usage.url, undefined);
+    assert.match(opencodeEntry.usage.reason, /opencode/i);
   });
 
   void it("Kiro hints mention KIRO_API_KEY requirement", () => {

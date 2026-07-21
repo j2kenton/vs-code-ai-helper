@@ -38,8 +38,9 @@ Ensemble can also drive vendor CLIs that authenticate against your existing subs
 | **Codex CLI** | `npm i -g @openai/codex`, then `codex login` | ChatGPT Plus or Pro subscription |
 | **Antigravity** | Install the Antigravity CLI, then run `agy` once | Google account |
 | **Kiro CLI** | Install from [kiro.dev/cli](https://kiro.dev/cli/) | Kiro login **and** a `KIRO_API_KEY` environment variable — `kiro-cli login` alone is not sufficient for headless runs |
+| **opencode** | `npm i -g opencode-ai`, then `opencode providers login` (or set that provider's API key env var) | Whichever model provider(s) you sign into through opencode itself — it proxies OpenAI, Anthropic, and many others |
 
-> **Note on Antigravity:** it runs with `--dangerously-skip-permissions` in **every** mode, including plan and review — so it can create, change, or delete any file in your workspace without asking, even on a run you'd expect to be read-only. The other providers restrict their read-only stages (Claude `--permission-mode plan`, Codex `--sandbox read-only`, Kiro `--trust-tools fs_read,grep,glob`); Antigravity's headless CLI offers no equivalent, and without the flag its runs fail having done nothing. Commit or back up before using it, or pick another provider.
+> **Note on Antigravity:** it runs with `--dangerously-skip-permissions` in **every** mode, including plan and review — so it can create, change, or delete any file in your workspace without asking, even on a run you'd expect to be read-only. The other providers restrict their read-only stages (Claude `--permission-mode plan`, Codex `--sandbox read-only`, Kiro `--trust-tools fs_read,grep,glob`, opencode `--agent plan`); Antigravity's headless CLI offers no equivalent, and without the flag its runs fail having done nothing. Commit or back up before using it, or pick another provider.
 
 AI actions consume real quota or money, and implementation runs modify workspace files.
 

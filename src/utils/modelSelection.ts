@@ -22,7 +22,7 @@ import {
   toQualifiedModelId,
 } from "../runners/providers";
 import { AI_MODEL_STAGES, REVIEW_STAGES, STAGE_DISPLAY_NAMES, TaskStage } from "../types/taskProgress";
-import { type DiscoveredCliModel } from "./cliModelDiscovery";
+import { parseOpencodeModelsOutput, type DiscoveredCliModel } from "./cliModelDiscovery";
 
 export const TASK_MODEL_CONFIG_FILENAME = "task-models.json";
 
@@ -669,6 +669,267 @@ function createSeededCodexModels(): readonly DiscoveredCliModel[] {
   ];
 }
 
+/**
+ * Raw `opencode models --verbose` catalog snapshot (opencode 1.18.4,
+ * captured 2026-07-21), compacted to one minified JSON object per line (only
+ * the fields parseOpencodeModelsOutput reads: id, providerID, name,
+ * variants — cost/limit/capabilities/etc. are dropped, they're irrelevant to
+ * model selection) and run through that SAME parser used for live discovery
+ * at module load, rather than a hand-expanded array of {model, name} pairs.
+ * This guarantees the seed and live discovery can never structurally
+ * diverge — if parseOpencodeModelsOutput's variant-naming convention ever
+ * changes, this seed picks up the change automatically instead of needing a
+ * matching hand-edit elsewhere. Regenerate by piping a fresh `opencode
+ * models --verbose` through the same id/providerID/name/variants compaction
+ * when the catalog changes.
+ */
+const OPENCODE_SEEDED_CATALOG_RAW = `
+opencode/big-pickle
+{"id":"big-pickle","providerID":"opencode","name":"Big Pickle","variants":{}}
+opencode/claude-fable-5
+{"id":"claude-fable-5","providerID":"opencode","name":"Claude Fable 5","variants":{"low":{},"medium":{},"high":{},"xhigh":{},"max":{}}}
+opencode/claude-haiku-4-5
+{"id":"claude-haiku-4-5","providerID":"opencode","name":"Claude Haiku 4.5","variants":{"high":{},"max":{}}}
+opencode/claude-opus-4-1
+{"id":"claude-opus-4-1","providerID":"opencode","name":"Claude Opus 4.1","variants":{"high":{},"max":{}}}
+opencode/claude-opus-4-5
+{"id":"claude-opus-4-5","providerID":"opencode","name":"Claude Opus 4.5","variants":{"low":{},"medium":{},"high":{}}}
+opencode/claude-opus-4-6
+{"id":"claude-opus-4-6","providerID":"opencode","name":"Claude Opus 4.6","variants":{"low":{},"medium":{},"high":{},"max":{}}}
+opencode/claude-opus-4-7
+{"id":"claude-opus-4-7","providerID":"opencode","name":"Claude Opus 4.7","variants":{"low":{},"medium":{},"high":{},"xhigh":{},"max":{}}}
+opencode/claude-opus-4-8
+{"id":"claude-opus-4-8","providerID":"opencode","name":"Claude Opus 4.8","variants":{"low":{},"medium":{},"high":{},"xhigh":{},"max":{}}}
+opencode/claude-sonnet-4
+{"id":"claude-sonnet-4","providerID":"opencode","name":"Claude Sonnet 4","variants":{"high":{},"max":{}}}
+opencode/claude-sonnet-4-5
+{"id":"claude-sonnet-4-5","providerID":"opencode","name":"Claude Sonnet 4.5","variants":{"high":{},"max":{}}}
+opencode/claude-sonnet-4-6
+{"id":"claude-sonnet-4-6","providerID":"opencode","name":"Claude Sonnet 4.6","variants":{"low":{},"medium":{},"high":{},"max":{}}}
+opencode/claude-sonnet-5
+{"id":"claude-sonnet-5","providerID":"opencode","name":"Claude Sonnet 5","variants":{"low":{},"medium":{},"high":{},"xhigh":{},"max":{}}}
+opencode/deepseek-v4-flash
+{"id":"deepseek-v4-flash","providerID":"opencode","name":"DeepSeek V4 Flash","variants":{"high":{},"max":{}}}
+opencode/deepseek-v4-flash-free
+{"id":"deepseek-v4-flash-free","providerID":"opencode","name":"DeepSeek V4 Flash Free","variants":{"high":{},"max":{}}}
+opencode/deepseek-v4-pro
+{"id":"deepseek-v4-pro","providerID":"opencode","name":"DeepSeek V4 Pro","variants":{"high":{},"max":{}}}
+opencode/gemini-3-flash
+{"id":"gemini-3-flash","providerID":"opencode","name":"Gemini 3 Flash","variants":{"minimal":{},"low":{},"medium":{},"high":{}}}
+opencode/gemini-3.1-pro
+{"id":"gemini-3.1-pro","providerID":"opencode","name":"Gemini 3.1 Pro Preview","variants":{"low":{},"medium":{},"high":{}}}
+opencode/gemini-3.5-flash
+{"id":"gemini-3.5-flash","providerID":"opencode","name":"Gemini 3.5 Flash","variants":{"minimal":{},"low":{},"medium":{},"high":{}}}
+opencode/glm-5
+{"id":"glm-5","providerID":"opencode","name":"GLM-5","variants":{}}
+opencode/glm-5.1
+{"id":"glm-5.1","providerID":"opencode","name":"GLM-5.1","variants":{}}
+opencode/glm-5.2
+{"id":"glm-5.2","providerID":"opencode","name":"GLM-5.2","variants":{"high":{},"max":{}}}
+opencode/gpt-5
+{"id":"gpt-5","providerID":"opencode","name":"GPT-5","variants":{"minimal":{},"low":{},"medium":{},"high":{}}}
+opencode/gpt-5-codex
+{"id":"gpt-5-codex","providerID":"opencode","name":"GPT-5 Codex","variants":{"low":{},"medium":{},"high":{}}}
+opencode/gpt-5-nano
+{"id":"gpt-5-nano","providerID":"opencode","name":"GPT-5 Nano","variants":{"minimal":{},"low":{},"medium":{},"high":{}}}
+opencode/gpt-5.1
+{"id":"gpt-5.1","providerID":"opencode","name":"GPT-5.1","variants":{"none":{},"low":{},"medium":{},"high":{}}}
+opencode/gpt-5.1-codex
+{"id":"gpt-5.1-codex","providerID":"opencode","name":"GPT-5.1 Codex","variants":{"low":{},"medium":{},"high":{}}}
+opencode/gpt-5.1-codex-max
+{"id":"gpt-5.1-codex-max","providerID":"opencode","name":"GPT-5.1 Codex Max","variants":{"low":{},"medium":{},"high":{},"xhigh":{}}}
+opencode/gpt-5.1-codex-mini
+{"id":"gpt-5.1-codex-mini","providerID":"opencode","name":"GPT-5.1 Codex Mini","variants":{"low":{},"medium":{},"high":{}}}
+opencode/gpt-5.2
+{"id":"gpt-5.2","providerID":"opencode","name":"GPT-5.2","variants":{"none":{},"low":{},"medium":{},"high":{},"xhigh":{}}}
+opencode/gpt-5.2-codex
+{"id":"gpt-5.2-codex","providerID":"opencode","name":"GPT-5.2 Codex","variants":{"low":{},"medium":{},"high":{},"xhigh":{}}}
+opencode/gpt-5.3-codex
+{"id":"gpt-5.3-codex","providerID":"opencode","name":"GPT-5.3 Codex","variants":{"none":{},"low":{},"medium":{},"high":{},"xhigh":{}}}
+opencode/gpt-5.3-codex-spark
+{"id":"gpt-5.3-codex-spark","providerID":"opencode","name":"GPT-5.3 Codex Spark","variants":{"low":{},"medium":{},"high":{},"xhigh":{}}}
+opencode/gpt-5.4
+{"id":"gpt-5.4","providerID":"opencode","name":"GPT-5.4","variants":{"none":{},"low":{},"medium":{},"high":{},"xhigh":{}}}
+opencode/gpt-5.4-mini
+{"id":"gpt-5.4-mini","providerID":"opencode","name":"GPT-5.4 Mini","variants":{"none":{},"low":{},"medium":{},"high":{},"xhigh":{}}}
+opencode/gpt-5.4-nano
+{"id":"gpt-5.4-nano","providerID":"opencode","name":"GPT-5.4 Nano","variants":{"none":{},"low":{},"medium":{},"high":{},"xhigh":{}}}
+opencode/gpt-5.4-pro
+{"id":"gpt-5.4-pro","providerID":"opencode","name":"GPT-5.4 Pro","variants":{"medium":{},"high":{},"xhigh":{}}}
+opencode/gpt-5.5
+{"id":"gpt-5.5","providerID":"opencode","name":"GPT-5.5","variants":{"none":{},"low":{},"medium":{},"high":{},"xhigh":{}}}
+opencode/gpt-5.5-pro
+{"id":"gpt-5.5-pro","providerID":"opencode","name":"GPT-5.5 Pro","variants":{"medium":{},"high":{},"xhigh":{}}}
+opencode/gpt-5.6-luna
+{"id":"gpt-5.6-luna","providerID":"opencode","name":"GPT-5.6 Luna","variants":{"none":{},"low":{},"medium":{},"high":{},"xhigh":{},"max":{}}}
+opencode/gpt-5.6-sol
+{"id":"gpt-5.6-sol","providerID":"opencode","name":"GPT-5.6 Sol","variants":{"none":{},"low":{},"medium":{},"high":{},"xhigh":{},"max":{}}}
+opencode/gpt-5.6-terra
+{"id":"gpt-5.6-terra","providerID":"opencode","name":"GPT-5.6 Terra","variants":{"none":{},"low":{},"medium":{},"high":{},"xhigh":{},"max":{}}}
+opencode/grok-4.5
+{"id":"grok-4.5","providerID":"opencode","name":"Grok 4.5","variants":{"low":{},"medium":{},"high":{}}}
+opencode/grok-build-0.1
+{"id":"grok-build-0.1","providerID":"opencode","name":"Grok Build 0.1","variants":{}}
+opencode/kimi-k2.5
+{"id":"kimi-k2.5","providerID":"opencode","name":"Kimi K2.5","variants":{}}
+opencode/kimi-k2.6
+{"id":"kimi-k2.6","providerID":"opencode","name":"Kimi K2.6","variants":{}}
+opencode/kimi-k2.7-code
+{"id":"kimi-k2.7-code","providerID":"opencode","name":"Kimi K2.7 Code","variants":{}}
+opencode/mimo-v2.5-free
+{"id":"mimo-v2.5-free","providerID":"opencode","name":"MiMo V2.5 Free","variants":{}}
+opencode/minimax-m2.5
+{"id":"minimax-m2.5","providerID":"opencode","name":"MiniMax-M2.5","variants":{}}
+opencode/minimax-m2.7
+{"id":"minimax-m2.7","providerID":"opencode","name":"MiniMax-M2.7","variants":{}}
+opencode/minimax-m3
+{"id":"minimax-m3","providerID":"opencode","name":"MiniMax-M3","variants":{}}
+opencode/nemotron-3-ultra-free
+{"id":"nemotron-3-ultra-free","providerID":"opencode","name":"Nemotron 3 Ultra Free","variants":{}}
+opencode/north-mini-code-free
+{"id":"north-mini-code-free","providerID":"opencode","name":"North Mini Code Free","variants":{"none":{},"high":{}}}
+opencode/qwen3.5-plus
+{"id":"qwen3.5-plus","providerID":"opencode","name":"Qwen3.5 Plus","variants":{"high":{},"max":{}}}
+opencode/qwen3.6-plus
+{"id":"qwen3.6-plus","providerID":"opencode","name":"Qwen3.6 Plus","variants":{"high":{},"max":{}}}
+openai/chatgpt-image-latest
+{"id":"chatgpt-image-latest","providerID":"openai","name":"chatgpt-image-latest","variants":{}}
+openai/gpt-3.5-turbo
+{"id":"gpt-3.5-turbo","providerID":"openai","name":"GPT-3.5-turbo","variants":{}}
+openai/gpt-4
+{"id":"gpt-4","providerID":"openai","name":"GPT-4","variants":{}}
+openai/gpt-4-turbo
+{"id":"gpt-4-turbo","providerID":"openai","name":"GPT-4 Turbo","variants":{}}
+openai/gpt-4.1
+{"id":"gpt-4.1","providerID":"openai","name":"GPT-4.1","variants":{}}
+openai/gpt-4.1-mini
+{"id":"gpt-4.1-mini","providerID":"openai","name":"GPT-4.1 mini","variants":{}}
+openai/gpt-4.1-nano
+{"id":"gpt-4.1-nano","providerID":"openai","name":"GPT-4.1 nano","variants":{}}
+openai/gpt-4o
+{"id":"gpt-4o","providerID":"openai","name":"GPT-4o","variants":{}}
+openai/gpt-4o-2024-05-13
+{"id":"gpt-4o-2024-05-13","providerID":"openai","name":"GPT-4o (2024-05-13)","variants":{}}
+openai/gpt-4o-2024-08-06
+{"id":"gpt-4o-2024-08-06","providerID":"openai","name":"GPT-4o (2024-08-06)","variants":{}}
+openai/gpt-4o-2024-11-20
+{"id":"gpt-4o-2024-11-20","providerID":"openai","name":"GPT-4o (2024-11-20)","variants":{}}
+openai/gpt-4o-mini
+{"id":"gpt-4o-mini","providerID":"openai","name":"GPT-4o mini","variants":{}}
+openai/gpt-5
+{"id":"gpt-5","providerID":"openai","name":"GPT-5","variants":{"minimal":{},"low":{},"medium":{},"high":{}}}
+openai/gpt-5-codex
+{"id":"gpt-5-codex","providerID":"openai","name":"GPT-5-Codex","variants":{"low":{},"medium":{},"high":{}}}
+openai/gpt-5-mini
+{"id":"gpt-5-mini","providerID":"openai","name":"GPT-5 Mini","variants":{"minimal":{},"low":{},"medium":{},"high":{}}}
+openai/gpt-5-nano
+{"id":"gpt-5-nano","providerID":"openai","name":"GPT-5 Nano","variants":{"minimal":{},"low":{},"medium":{},"high":{}}}
+openai/gpt-5-pro
+{"id":"gpt-5-pro","providerID":"openai","name":"GPT-5 Pro","variants":{"high":{}}}
+openai/gpt-5.1
+{"id":"gpt-5.1","providerID":"openai","name":"GPT-5.1","variants":{"none":{},"low":{},"medium":{},"high":{}}}
+openai/gpt-5.1-chat-latest
+{"id":"gpt-5.1-chat-latest","providerID":"openai","name":"GPT-5.1 Chat","variants":{"medium":{}}}
+openai/gpt-5.1-codex
+{"id":"gpt-5.1-codex","providerID":"openai","name":"GPT-5.1 Codex","variants":{"low":{},"medium":{},"high":{}}}
+openai/gpt-5.1-codex-max
+{"id":"gpt-5.1-codex-max","providerID":"openai","name":"GPT-5.1 Codex Max","variants":{"low":{},"medium":{},"high":{},"xhigh":{}}}
+openai/gpt-5.1-codex-mini
+{"id":"gpt-5.1-codex-mini","providerID":"openai","name":"GPT-5.1 Codex mini","variants":{"low":{},"medium":{},"high":{}}}
+openai/gpt-5.2
+{"id":"gpt-5.2","providerID":"openai","name":"GPT-5.2","variants":{"none":{},"low":{},"medium":{},"high":{},"xhigh":{}}}
+openai/gpt-5.2-chat-latest
+{"id":"gpt-5.2-chat-latest","providerID":"openai","name":"GPT-5.2 Chat","variants":{"medium":{}}}
+openai/gpt-5.2-codex
+{"id":"gpt-5.2-codex","providerID":"openai","name":"GPT-5.2 Codex","variants":{"low":{},"medium":{},"high":{},"xhigh":{}}}
+openai/gpt-5.2-pro
+{"id":"gpt-5.2-pro","providerID":"openai","name":"GPT-5.2 Pro","variants":{"medium":{},"high":{},"xhigh":{}}}
+openai/gpt-5.3-chat-latest
+{"id":"gpt-5.3-chat-latest","providerID":"openai","name":"GPT-5.3 Chat (latest)","variants":{}}
+openai/gpt-5.3-codex
+{"id":"gpt-5.3-codex","providerID":"openai","name":"GPT-5.3 Codex","variants":{"none":{},"low":{},"medium":{},"high":{},"xhigh":{}}}
+openai/gpt-5.3-codex-spark
+{"id":"gpt-5.3-codex-spark","providerID":"openai","name":"GPT-5.3 Codex Spark","variants":{"none":{},"low":{},"medium":{},"high":{},"xhigh":{}}}
+openai/gpt-5.4
+{"id":"gpt-5.4","providerID":"openai","name":"GPT-5.4","variants":{"none":{},"low":{},"medium":{},"high":{},"xhigh":{}}}
+openai/gpt-5.4-fast
+{"id":"gpt-5.4-fast","providerID":"openai","name":"GPT-5.4 Fast","variants":{"none":{},"low":{},"medium":{},"high":{},"xhigh":{}}}
+openai/gpt-5.4-mini
+{"id":"gpt-5.4-mini","providerID":"openai","name":"GPT-5.4 mini","variants":{"none":{},"low":{},"medium":{},"high":{},"xhigh":{}}}
+openai/gpt-5.4-mini-fast
+{"id":"gpt-5.4-mini-fast","providerID":"openai","name":"GPT-5.4 mini Fast","variants":{"none":{},"low":{},"medium":{},"high":{},"xhigh":{}}}
+openai/gpt-5.4-nano
+{"id":"gpt-5.4-nano","providerID":"openai","name":"GPT-5.4 nano","variants":{"none":{},"low":{},"medium":{},"high":{},"xhigh":{}}}
+openai/gpt-5.4-pro
+{"id":"gpt-5.4-pro","providerID":"openai","name":"GPT-5.4 Pro","variants":{"medium":{},"high":{},"xhigh":{}}}
+openai/gpt-5.5
+{"id":"gpt-5.5","providerID":"openai","name":"GPT-5.5","variants":{"none":{},"low":{},"medium":{},"high":{},"xhigh":{}}}
+openai/gpt-5.5-fast
+{"id":"gpt-5.5-fast","providerID":"openai","name":"GPT-5.5 Fast","variants":{"none":{},"low":{},"medium":{},"high":{},"xhigh":{}}}
+openai/gpt-5.5-pro
+{"id":"gpt-5.5-pro","providerID":"openai","name":"GPT-5.5 Pro","variants":{"medium":{},"high":{},"xhigh":{}}}
+openai/gpt-5.6
+{"id":"gpt-5.6","providerID":"openai","name":"GPT-5.6","variants":{"none":{},"low":{},"medium":{},"high":{},"xhigh":{},"max":{}}}
+openai/gpt-5.6-fast
+{"id":"gpt-5.6-fast","providerID":"openai","name":"GPT-5.6 Fast","variants":{"none":{},"low":{},"medium":{},"high":{},"xhigh":{},"max":{}}}
+openai/gpt-5.6-luna
+{"id":"gpt-5.6-luna","providerID":"openai","name":"GPT-5.6 Luna","variants":{"none":{},"low":{},"medium":{},"high":{},"xhigh":{},"max":{}}}
+openai/gpt-5.6-luna-fast
+{"id":"gpt-5.6-luna-fast","providerID":"openai","name":"GPT-5.6 Luna Fast","variants":{"none":{},"low":{},"medium":{},"high":{},"xhigh":{},"max":{}}}
+openai/gpt-5.6-luna-pro
+{"id":"gpt-5.6-luna-pro","providerID":"openai","name":"GPT-5.6 Luna Pro","variants":{"none":{},"low":{},"medium":{},"high":{},"xhigh":{},"max":{}}}
+openai/gpt-5.6-pro
+{"id":"gpt-5.6-pro","providerID":"openai","name":"GPT-5.6 Pro","variants":{"none":{},"low":{},"medium":{},"high":{},"xhigh":{},"max":{}}}
+openai/gpt-5.6-sol
+{"id":"gpt-5.6-sol","providerID":"openai","name":"GPT-5.6 Sol","variants":{"none":{},"low":{},"medium":{},"high":{},"xhigh":{},"max":{}}}
+openai/gpt-5.6-sol-fast
+{"id":"gpt-5.6-sol-fast","providerID":"openai","name":"GPT-5.6 Sol Fast","variants":{"none":{},"low":{},"medium":{},"high":{},"xhigh":{},"max":{}}}
+openai/gpt-5.6-sol-pro
+{"id":"gpt-5.6-sol-pro","providerID":"openai","name":"GPT-5.6 Sol Pro","variants":{"none":{},"low":{},"medium":{},"high":{},"xhigh":{},"max":{}}}
+openai/gpt-5.6-terra
+{"id":"gpt-5.6-terra","providerID":"openai","name":"GPT-5.6 Terra","variants":{"none":{},"low":{},"medium":{},"high":{},"xhigh":{},"max":{}}}
+openai/gpt-5.6-terra-fast
+{"id":"gpt-5.6-terra-fast","providerID":"openai","name":"GPT-5.6 Terra Fast","variants":{"none":{},"low":{},"medium":{},"high":{},"xhigh":{},"max":{}}}
+openai/gpt-5.6-terra-pro
+{"id":"gpt-5.6-terra-pro","providerID":"openai","name":"GPT-5.6 Terra Pro","variants":{"none":{},"low":{},"medium":{},"high":{},"xhigh":{},"max":{}}}
+openai/gpt-image-1
+{"id":"gpt-image-1","providerID":"openai","name":"gpt-image-1","variants":{}}
+openai/gpt-image-1-mini
+{"id":"gpt-image-1-mini","providerID":"openai","name":"gpt-image-1-mini","variants":{}}
+openai/gpt-image-1.5
+{"id":"gpt-image-1.5","providerID":"openai","name":"gpt-image-1.5","variants":{}}
+openai/gpt-image-2
+{"id":"gpt-image-2","providerID":"openai","name":"gpt-image-2","variants":{}}
+openai/gpt-realtime-2.1
+{"id":"gpt-realtime-2.1","providerID":"openai","name":"GPT-Realtime-2.1","variants":{"minimal":{},"low":{},"medium":{},"high":{},"xhigh":{}}}
+openai/o1
+{"id":"o1","providerID":"openai","name":"o1","variants":{"low":{},"medium":{},"high":{}}}
+openai/o1-pro
+{"id":"o1-pro","providerID":"openai","name":"o1-pro","variants":{"low":{},"medium":{},"high":{}}}
+openai/o3
+{"id":"o3","providerID":"openai","name":"o3","variants":{"low":{},"medium":{},"high":{}}}
+openai/o3-deep-research
+{"id":"o3-deep-research","providerID":"openai","name":"o3-deep-research","variants":{"medium":{}}}
+openai/o3-mini
+{"id":"o3-mini","providerID":"openai","name":"o3-mini","variants":{"low":{},"medium":{},"high":{}}}
+openai/o3-pro
+{"id":"o3-pro","providerID":"openai","name":"o3-pro","variants":{"low":{},"medium":{},"high":{}}}
+openai/o4-mini
+{"id":"o4-mini","providerID":"openai","name":"o4-mini","variants":{"low":{},"medium":{},"high":{}}}
+openai/o4-mini-deep-research
+{"id":"o4-mini-deep-research","providerID":"openai","name":"o4-mini-deep-research","variants":{"medium":{}}}
+openai/text-embedding-3-large
+{"id":"text-embedding-3-large","providerID":"openai","name":"text-embedding-3-large","variants":{}}
+openai/text-embedding-3-small
+{"id":"text-embedding-3-small","providerID":"openai","name":"text-embedding-3-small","variants":{}}
+openai/text-embedding-ada-002
+{"id":"text-embedding-ada-002","providerID":"openai","name":"text-embedding-ada-002","variants":{}}
+`;
+
+function createSeededOpencodeModels(): readonly DiscoveredCliModel[] {
+  return parseOpencodeModelsOutput(OPENCODE_SEEDED_CATALOG_RAW);
+}
+
 const SEEDED_CLI_MODELS: Readonly<
   Partial<Record<CliProviderId, readonly DiscoveredCliModel[]>>
 > = {
@@ -707,6 +968,19 @@ const SEEDED_CLI_MODELS: Readonly<
     { model: "glm-5", name: "GLM-5" },
     { model: "qwen3-coder-next", name: "Qwen3 Coder Next" },
   ],
+  // Snapshot of `opencode models --verbose`'s full catalog (opencode 1.18.4,
+  // captured 2026-07-21), including each model's own reasoning-effort
+  // variants expanded to "<provider>/<model>@<variant>" entries — see
+  // parseOpencodeModelsOutput in cliModelDiscovery.ts, which produces this
+  // exact same shape from a live CLI call. This is a MUCH larger catalog
+  // than Claude's/Codex's curated lists (466 entries vs ~2 base models)
+  // because opencode proxies dozens of upstream providers rather than
+  // exposing one vendor's own lineup, and it goes stale as models.dev's
+  // catalog changes — unlike the small hand-curated lists above, this block
+  // is meant to be regenerated wholesale, not hand-edited entry-by-entry.
+  // Regenerate by running `opencode models --verbose` through
+  // discoverOpencodeModelsWithTimeout and re-pasting its output here.
+  "opencode-cli": createSeededOpencodeModels(),
 };
 
 function createSeededCliModelCache(): Map<

@@ -24,6 +24,7 @@ const EDIT_MODE_FLAG_NAMES: Readonly<Record<string, string>> = {
   "gemini-cli": "--approval-mode",
   "kiro-cli": "--trust-all-tools",
   "antigravity-cli": "--dangerously-skip-permissions",
+  "opencode-cli": "--agent",
 };
 
 // Which flag name each provider's text mode uses to stay read-only, quoted
@@ -39,6 +40,7 @@ const TEXT_MODE_FLAG_NAMES: Readonly<Partial<Record<string, string>>> = {
   "codex-cli": "--sandbox",
   "kiro-cli": "--trust-tools",
   "antigravity-cli": "--dangerously-skip-permissions",
+  "opencode-cli": "--agent",
 };
 
 function resolveProjectFile(fileName: string): string {
@@ -130,8 +132,14 @@ void test("DISCLAIMER.md and SECURITY.md quote each provider's actual edit-mode 
   }
 });
 
-void test("README.md quotes each provider's actual text-mode permission flag", () => {
+void test("README.md and SECURITY.md quote each provider's actual text-mode permission flag", () => {
+  // Both docs make the same "text mode stays read-only via this flag"
+  // claim (README's provider table/notes, SECURITY.md's implementation-run
+  // section) — checking only one previously let the other drift silently;
+  // opencode's SECURITY.md caveat about --agent plan's narrower exception
+  // is exactly the kind of claim this guard exists to keep honest.
   const readme = nodeFs.readFileSync(resolveProjectFile("README.md"), "utf8");
+  const security = nodeFs.readFileSync(resolveProjectFile("SECURITY.md"), "utf8");
 
   for (const def of CLI_PROVIDERS) {
     if (!(def.id in TEXT_MODE_FLAG_NAMES)) {
@@ -139,5 +147,6 @@ void test("README.md quotes each provider's actual text-mode permission flag", (
     }
     const flagText = permissionFlagText(def, "text", TEXT_MODE_FLAG_NAMES);
     assertDocQuotesFlag(readme, "README.md", def.id, flagText);
+    assertDocQuotesFlag(security, "SECURITY.md", def.id, flagText);
   }
 });

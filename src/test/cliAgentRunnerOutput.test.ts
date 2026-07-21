@@ -61,6 +61,94 @@ void describe("CLI output normalization", () => {
     }
   });
 
+  void it("extracts opencode's final answer from its --format json event stream", () => {
+    // Captured shape (trimmed) verified live against opencode 1.18.4: each
+    // line is a JSON event; the reply arrives as one or more type:"text"
+    // events whose part.text carries the FULL text for that part (not an
+    // incremental delta).
+    const stream = [
+      JSON.stringify({ type: "step_start", part: { type: "step-start" } }),
+      JSON.stringify({ type: "text", part: { type: "text", text: "PONG" } }),
+      JSON.stringify({ type: "step_finish", part: { type: "step-finish", reason: "stop" } }),
+    ].join("\n");
+
+    assert.strictEqual(__testOnly.extractOpencodeFinalOutput(stream), "PONG");
+  });
+
+  void it("concatenates multiple opencode text parts across tool-use steps in order", () => {
+    const stream = [
+      JSON.stringify({ type: "text", part: { type: "text", text: "I'll create the file." } }),
+      JSON.stringify({ type: "tool_use", part: { type: "tool", tool: "write" } }),
+      JSON.stringify({ type: "text", part: { type: "text", text: "Done." } }),
+    ].join("\n");
+
+    assert.strictEqual(
+      __testOnly.extractOpencodeFinalOutput(stream),
+      "I'll create the file.\n\nDone."
+    );
+  });
+
+  void it("returns a non-empty placeholder (not the raw JSON, not empty) for a recognized stream with no text reply", () => {
+    // Real, reproduced-live scenario (opencode 1.18.4): a build-mode run
+    // instructed to act silently ("create this file, no confirmation text")
+    // can exit 0 having only emitted tool_use/step_start/step_finish events
+    // and zero "text" parts. This must NOT return "" (execCliAgent's
+    // "produced no output" guard fails ANY zero-length result, in every
+    // mode — that would false-fail a legitimate silent edit run whose files
+    // really did change) and must NOT return the raw multi-line JSON
+    // transcript either (that used to leak into plan/review artifacts and
+    // implementation summaries verbatim). An "error"-typed event still
+    // counts as a recognized event (it has a string "type"), so it also
+    // resolves to the placeholder here rather than the raw dump — the
+    // non-zero exit code is what actually surfaces an error message
+    // upstream (toFriendlyError reads raw stderr/stdout, not this output).
+    const noTextStream = [
+      JSON.stringify({ type: "step_start", part: { type: "step-start" } }),
+      JSON.stringify({ type: "tool_use", part: { type: "tool", tool: "write" } }),
+      JSON.stringify({ type: "step_finish", part: { type: "step-finish", reason: "tool-calls" } }),
+      JSON.stringify({ type: "step_start", part: { type: "step-start" } }),
+      JSON.stringify({ type: "step_finish", part: { type: "step-finish", reason: "stop" } }),
+    ].join("\n");
+
+    const output = __testOnly.extractOpencodeFinalOutput(noTextStream);
+    assert.notStrictEqual(output, "");
+    assert.strictEqual(output, "(opencode completed the run without returning any text reply.)");
+
+    const errorLine = JSON.stringify({
+      type: "error",
+      error: { name: "UnknownError", data: { message: "boom" } },
+    });
+    assert.strictEqual(
+      __testOnly.extractOpencodeFinalOutput(errorLine),
+      "(opencode completed the run without returning any text reply.)"
+    );
+  });
+
+  void it("falls back to the raw stream when the output isn't a recognizable opencode event stream at all", () => {
+    // Distinct from the no-text-reply case above: this is output with no
+    // parseable {"type": ...} JSON object anywhere in it (a future
+    // opencode version emitting a wholly different, unrecognized format).
+    // The raw text is still surfaced here so the failure is visible rather
+    // than reporting the same generic placeholder for a shape this parser
+    // doesn't understand at all.
+    const notJson = "opencode: unexpected internal error, please file a bug report";
+
+    assert.strictEqual(__testOnly.extractOpencodeFinalOutput(notJson), notJson);
+  });
+
+  void it("normalizes opencode output via provider-specific extraction", () => {
+    const opencode = getCliProvider("opencode-cli");
+    assert.ok(opencode, "expected opencode-cli provider definition");
+
+    const stream = JSON.stringify({
+      type: "text",
+      part: { type: "text", text: "Hello there." },
+    });
+
+    const output = __testOnly.normalizeCliOutput(opencode, stream, undefined);
+    assert.strictEqual(output, "Hello there.");
+  });
+
   void it("normalizes Kiro output via provider-specific extraction", () => {
     const kiro = getCliProvider("kiro-cli");
     assert.ok(kiro, "expected kiro-cli provider definition");

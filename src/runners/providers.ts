@@ -9,6 +9,10 @@
  *  - Gemini CLI   (`gemini`) — Google account / Gemini Code Assist
  *  - Antigravity  (`agy` / `antigravity`) — Google Gemini/Antigravity CLI account
  *  - Kiro CLI     (`kiro-cli`) — AWS Kiro subscription/login
+ *  - opencode     (`opencode`) — multi-provider CLI; auth is whatever
+ *    upstream provider(s) the user configured via `opencode providers
+ *    login` or that provider's own API-key env var, not a single vendor
+ *    subscription
  *
  * Model IDs are stored as "<provider>:<model>" (e.g. "claude-cli:sonnet",
  * "gemini-cli:default"). Bare IDs with no known provider prefix are Copilot
@@ -18,6 +22,7 @@
 import {
   discoverAgyModels,
   discoverKiroModels,
+  discoverOpencodeModels,
   type DiscoveredCliModel,
 } from "../utils/cliModelDiscovery";
 
@@ -26,7 +31,8 @@ export type CliProviderId =
   | "codex-cli"
   | "gemini-cli"
   | "antigravity-cli"
-  | "kiro-cli";
+  | "kiro-cli"
+  | "opencode-cli";
 export type ProviderId = "copilot" | CliProviderId;
 
 /** How a CLI run may touch the workspace. */
@@ -199,6 +205,33 @@ export interface CliProviderDefinition {
   permissionWarning?: string;
 }
 
+/**
+ * Splits a stored model ID at its last "@" into a base model and a raw
+ * suffix, or returns undefined for the suffix when there is no "@" (or it's
+ * at index 0, meaning nothing precedes it — e.g. "@high" alone, which isn't
+ * a valid "model@suffix" pair). Shared scaffold for every provider that
+ * encodes reasoning-effort/variant info as a "model@suffix" qualified ID
+ * (Codex, Copilot, Claude, opencode) — each still does its OWN validation
+ * of what the suffix means (Codex/Copilot/Claude check the suffix against a
+ * fixed known set and fall back to treating the whole string as the model
+ * if it doesn't match; opencode has no fixed set to validate against since
+ * each model declares its own variants, so it passes the suffix through
+ * verbatim — see parseOpencodeModelSelection), only the split-and-empty-
+ * suffix-handling mechanics are shared.
+ */
+function splitModelAtLastAt(
+  model: string
+): { model: string; suffix: string | undefined } {
+  const separator = model.lastIndexOf("@");
+  if (separator <= 0) {
+    return { model, suffix: undefined };
+  }
+  return {
+    model: model.slice(0, separator) || model,
+    suffix: model.slice(separator + 1),
+  };
+}
+
 const CODEX_REASONING_EFFORTS = new Set([
   "low",
   "medium",
@@ -245,19 +278,18 @@ export function parseCodexModelSelection(
     };
   }
 
-  const separator = model.lastIndexOf("@");
-  if (separator <= 0) {
+  const split = splitModelAtLastAt(model);
+  if (split.suffix === undefined) {
     return { model, reasoningEffort: undefined, serviceTier: undefined };
   }
 
-  const selection = model.slice(separator + 1);
-  const [reasoningEffort, speedTier] = selection.split("+", 2);
+  const [reasoningEffort, speedTier] = split.suffix.split("+", 2);
   if (!reasoningEffort || !CODEX_REASONING_EFFORTS.has(reasoningEffort)) {
     return { model, reasoningEffort: undefined, serviceTier: undefined };
   }
 
   return {
-    model: model.slice(0, separator) || undefined,
+    model: split.model,
     reasoningEffort,
     serviceTier: speedTier === "fast" ? "priority" : undefined,
   };
@@ -276,19 +308,18 @@ export function parseCopilotModelSelection(
     return { model: undefined, reasoningEffort: undefined };
   }
 
-  const separator = model.lastIndexOf("@");
-  if (separator <= 0) {
+  const split = splitModelAtLastAt(model);
+  if (split.suffix === undefined) {
     return { model, reasoningEffort: undefined };
   }
 
-  const selection = model.slice(separator + 1);
-  const [reasoningEffort, contextWindow] = selection.split("+", 2);
+  const [reasoningEffort, contextWindow] = split.suffix.split("+", 2);
   if (!reasoningEffort || !COPILOT_REASONING_EFFORTS.has(reasoningEffort)) {
     return { model, reasoningEffort: undefined };
   }
 
   return {
-    model: model.slice(0, separator) || undefined,
+    model: split.model,
     reasoningEffort,
     ...(contextWindow === "long" ? { contextWindow: "long" } : {}),
   };
@@ -306,22 +337,52 @@ function parseClaudeCliModelSelection(
     return { model: undefined, maxThinkingTokens: undefined };
   }
 
-  const separator = model.lastIndexOf("@");
-  if (separator <= 0) {
+  const split = splitModelAtLastAt(model);
+  if (split.suffix === undefined) {
     return { model, maxThinkingTokens: undefined };
   }
 
-  const reasoningEffort = model.slice(separator + 1);
   const maxThinkingTokens =
-    CLAUDE_REASONING_EFFORT_TO_MAX_THINKING_TOKENS.get(reasoningEffort);
+    CLAUDE_REASONING_EFFORT_TO_MAX_THINKING_TOKENS.get(split.suffix);
   if (maxThinkingTokens === undefined) {
     return { model, maxThinkingTokens: undefined };
   }
 
   return {
-    model: model.slice(0, separator) || undefined,
+    model: split.model,
     maxThinkingTokens,
   };
+}
+
+export interface ParsedOpencodeModelSelection {
+  model: string | undefined;
+  variant: string | undefined;
+}
+
+/**
+ * Splits a stored opencode model ID into its base "<provider>/<model>" form
+ * plus an optional "@<variant>" reasoning-effort suffix. Unlike Codex/Claude,
+ * opencode has no single fixed set of valid variant names to validate
+ * against — each model declares its own (verified live via `opencode models
+ * --verbose`: e.g. "deepseek-v4-flash" has "high"/"max", "north-mini-code-
+ * free" has "none"/"high", "gpt-5" has "minimal"/"low"/"medium"/"high"), so
+ * whatever follows the last "@" is passed through verbatim as --variant
+ * rather than checked against an allowlist. This is safe only because the
+ * only source of `@variant`-suffixed IDs is parseOpencodeModelsOutput
+ * (cliModelDiscovery.ts), which derives them from that same model's real
+ * variants object — an unrecognized --variant value is silently ignored by
+ * the CLI rather than rejected (verified live), so a hand-typed bad variant
+ * would fail open (silently run without it) rather than error, which is why
+ * this must never be reachable from free-text user input.
+ */
+export function parseOpencodeModelSelection(
+  model: string | undefined
+): ParsedOpencodeModelSelection {
+  if (!model) {
+    return { model: undefined, variant: undefined };
+  }
+  const split = splitModelAtLastAt(model);
+  return { model: split.model, variant: split.suffix || undefined };
 }
 
 export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
@@ -646,6 +707,101 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
       }
       if (model) {
         args.push("--model", model);
+      }
+      return args;
+    },
+  },
+  {
+    id: "opencode-cli",
+    label: "opencode",
+    command: "opencode",
+    installHint:
+      "Install opencode (npm i -g opencode-ai), then run `opencode providers login` to sign in with a model provider, or set that provider's API key env var.",
+    loginHint:
+      "Run `opencode providers login` in a terminal and sign in with a model provider, then try again.",
+    authErrorMarkers: [
+      "not logged in",
+      "login",
+      "authenticate",
+      "api key",
+      "unauthorized",
+      "no credentials",
+    ],
+    // `opencode providers list` always exits 0 (it just reports "0
+    // credentials" when nothing is configured, verified live against
+    // opencode 1.18.4) — there is no non-interactive exit-code signal for
+    // "authenticated" the way `codex login status` or `claude auth status`
+    // give one, so — like Gemini and Antigravity — this stays unset and
+    // presence on PATH is the only thing checked headlessly.
+    signInCommand: "opencode providers login",
+    signInLabel: "Sign in / Switch account",
+    signInGuidance:
+      "Complete sign-in for a model provider in the terminal. opencode can hold credentials for " +
+      "several providers at once — run this again to add another, or use `opencode providers logout` " +
+      "to remove one first if you need to replace it.",
+    usageUnsupportedReason:
+      "opencode has no single quota/usage command — it proxies whichever upstream provider(s) you " +
+      "configured, so usage is billed and reported by that provider directly. `opencode stats` reports " +
+      "local token/cost totals opencode has observed, not a live remaining-quota check.",
+    // Model IDs are "<upstream-provider>/<model>" (e.g. "openai/gpt-4o",
+    // "anthropic/claude-opus-4-8") — opencode's own namespacing, distinct
+    // from this extension's "<CliProviderId>:<model>" qualified-ID prefix.
+    // A discovered model may additionally carry a "@<variant>" suffix (e.g.
+    // "opencode/deepseek-v4-flash@high") selecting one of that specific
+    // model's own reasoning-effort variants — see parseOpencodeModelSelection.
+    models: [{ model: undefined, name: "opencode (CLI default)" }],
+    discoverModels: discoverOpencodeModels,
+    // The prompt is read from stdin when `run` is given no message argv
+    // (verified live: `echo "..." | opencode run --format json -m ...`
+    // answers correctly) — preferred over the argv-positional form so large
+    // context packs aren't constrained by OS argv-length limits, matching
+    // Kiro's and Claude's stdin transport.
+    promptTransport: "stdin",
+    // The final answer is embedded in the --format json event stream
+    // (a "text"-typed part), not a separate last-message file — see
+    // normalizeCliOutput's opencode-cli branch in cliAgentRunner.ts.
+    usesLastMessageFile: false,
+    buildArgs(mode, model): string[] {
+      const args = ["run", "--format", "json"];
+      // Verified live against opencode 1.18.4 via `opencode agent list`:
+      // "plan" is a primary agent whose permission set denies `edit` on
+      // every path via a wildcard deny rule, followed by a MORE SPECIFIC
+      // allow rule scoped to its own `.opencode/plans/*.md` (inside the
+      // workspace) and the user's `~/.local/share/opencode/plans/*.md`.
+      // "build" (the CLI's own default agent when --agent is omitted,
+      // passed explicitly here anyway so the grant is a real, checkable
+      // flag rather than an implicit default) allows `edit: *` outright.
+      // Neither agent prompts interactively: `question`/`plan_enter`/
+      // `plan_exit` permissions are "deny" by default for both, so a
+      // headless run never blocks waiting for approval — confirmed by
+      // direct testing (a `plan` run wrote no file; a `build` run wrote a
+      // file with no prompt, in both cases with no hang).
+      //
+      // NOT fully verified: whether the plan agent's own system prompt
+      // (not this permission grant) ever lets it actually reach that
+      // .opencode/plans/*.md allow rule in a headless, non-interactive
+      // `opencode run` call. Three different models (opencode/deepseek-v4-
+      // flash-free, opencode/mimo-v2.5-free, and one attempt with --auto
+      // added) were each directly instructed to call the write tool for
+      // that exact path and every one refused at the text level without
+      // ever attempting the tool call — consistent with "plan mode" being
+      // baked into the agent's own prompt as a hard refusal independent of
+      // the permission grant, but not conclusive proof the grant is
+      // unreachable by a more compliant model or a future opencode
+      // version. Treat plan-mode as read-only for ordinary workspace files
+      // (nothing tested ever wrote outside .opencode/plans/), but do not
+      // treat the .opencode/plans/*.md exception as provably inert.
+      //
+      // --auto (bypass-all) is deliberately never used: unlike Antigravity,
+      // opencode's normal permission system already grants exactly what
+      // each mode needs headlessly, so there is no reason to skip it.
+      args.push("--agent", mode === "edit" ? "build" : "plan");
+      const parsedModel = parseOpencodeModelSelection(model);
+      if (parsedModel.model) {
+        args.push("--model", parsedModel.model);
+      }
+      if (parsedModel.variant) {
+        args.push("--variant", parsedModel.variant);
       }
       return args;
     },
