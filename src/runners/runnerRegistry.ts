@@ -19,6 +19,7 @@ import {
   cliDisplayLabel,
   CliProviderDefinition,
   getCliProvider,
+  normalizeQualifiedModelId,
   parseModelSelection,
   ProviderId,
 } from "./providers";
@@ -155,9 +156,14 @@ function filterEnabledBackupModels(models: readonly string[]): string[] {
  * Do not reuse this for a different question than "should a quota failure
  * silently switch providers" — see getConfiguredBackupModelsForStage below
  * for "what alternate models are configured for this stage at all",
- * independent of that strategy choice.
+ * independent of that strategy choice. Also exported for runAiToFile's
+ * content-validation retry (reviewActions.ts): a model that exits cleanly
+ * with unusable content is, from the user's automatic-switch-over
+ * preference's point of view, exactly the same question as a quota failure —
+ * so it must honor the same strategy gate, not the second-opinion mechanism's
+ * strategy-agnostic list below.
  */
-function backupModelsForStage(
+export function backupModelsForStage(
   stage: TaskStage | undefined,
   modelId: string | undefined
 ): string[] {
@@ -168,9 +174,16 @@ function backupModelsForStage(
   if (setting?.strategy !== "switch-to-backup") {
     return [];
   }
-  return filterEnabledBackupModels(
-    getBackupModels(setting).filter(candidate => candidate !== modelId)
-  );
+  const primary = normalizeQualifiedModelId(modelId);
+  const seen = new Set<string>();
+  return filterEnabledBackupModels(getBackupModels(setting)).filter((candidate) => {
+    const normalized = normalizeQualifiedModelId(candidate);
+    if (normalized === primary || seen.has(normalized)) {
+      return false;
+    }
+    seen.add(normalized);
+    return true;
+  });
 }
 
 /**
@@ -243,22 +256,68 @@ export async function checkRunnerAvailabilityForModel(
   return primary;
 }
 
-async function recordActiveFallbackModel(
+/**
+ * Persist which model actually served a stage after a fallback, so a later
+ * `resolveModelForStage` call honoring `fallbackActive` (e.g. a subsequent
+ * Fast Forward iteration passing `preserveActiveFallback`) routes straight to
+ * the known-working model instead of re-paying the cost of a known-flaky
+ * primary. Exported for runAiToFile's content-validation retry
+ * (reviewActions.ts), which needs to record the same outcome when ITS OWN
+ * backup search (not this file's quota/unavailable cascade) is what actually
+ * found the working model.
+ */
+export async function recordActiveFallbackModel(
   taskFolderUri: vscode.Uri,
   stage: TaskStage,
-  modelId: string
-): Promise<void> {
-  await patchTaskProgress(taskFolderUri, (current) => ({
-    ...current,
-    fallbackActive: {
-      ...current.fallbackActive,
-      [stage]: true,
-    },
-    fallbackModelId: {
-      ...current.fallbackModelId,
-      [stage]: modelId,
-    },
-  }));
+  modelId: string,
+  options: {
+    /** Decline the write if a newer review attempt now owns the stage. */
+    expectedReviewAttemptId?: string;
+    /** Claim and record in one locked write; decline an unrelated reservation. */
+    requireUnreserved?: boolean;
+    /**
+     * When `requireUnreserved` is set, still allow replacing the active route
+     * if it names the model this call intentionally started from. An active
+     * reservation without a model id is also replaceable: that is the
+     * intermediate state written by reserveFallback before a working backup
+     * has been identified. A different named model continues to win.
+     */
+    replaceActiveModelId?: string;
+  } = {}
+): Promise<boolean> {
+  let recorded = false;
+  await patchTaskProgress(taskFolderUri, (current) => {
+    if (
+      options.expectedReviewAttemptId !== undefined &&
+      current.reviewAttemptId !== options.expectedReviewAttemptId
+    ) {
+      return current;
+    }
+    if (options.requireUnreserved && current.fallbackActive?.[stage]) {
+      const activeModelId = current.fallbackModelId?.[stage];
+      if (
+        options.replaceActiveModelId === undefined ||
+        (activeModelId !== undefined &&
+          normalizeQualifiedModelId(activeModelId) !==
+            normalizeQualifiedModelId(options.replaceActiveModelId))
+      ) {
+        return current;
+      }
+    }
+    recorded = true;
+    return {
+      ...current,
+      fallbackActive: {
+        ...current.fallbackActive,
+        [stage]: true,
+      },
+      fallbackModelId: {
+        ...current.fallbackModelId,
+        [stage]: modelId,
+      },
+    };
+  });
+  return recorded;
 }
 
 function withQuotaObservation(
@@ -286,10 +345,17 @@ function withQuotaObservation(
  */
 async function reserveFallback(
   taskFolderUri: vscode.Uri,
-  stage: TaskStage
+  stage: TaskStage,
+  expectedReviewAttemptId?: string
 ): Promise<boolean> {
   let activated = false;
   await patchTaskProgress(taskFolderUri, (current) => {
+    if (
+      expectedReviewAttemptId !== undefined &&
+      current.reviewAttemptId !== expectedReviewAttemptId
+    ) {
+      return current;
+    }
     if (current.fallbackActive?.[stage]) {
       return current;
     }
@@ -313,11 +379,15 @@ async function reserveFallback(
 /**
  * Resolve the runner responsible for a stored stage model ID (plan/review
  * stages — see resolveEffectiveProvider for the auto-detection rules).
+ * `expectedReviewAttemptId` makes fallback reservation and routing writes
+ * conditional on that review still owning the stage after a long provider
+ * call; callers without review-attempt ownership leave it undefined.
  */
 export function resolveRunnerForModel(
   modelId: string | undefined,
   stage?: TaskStage,
-  taskFolderUri?: vscode.Uri
+  taskFolderUri?: vscode.Uri,
+  expectedReviewAttemptId?: string
 ): ResolvedRunner {
   const resolved = toResolvedRunner(resolveEffectiveProvider(modelId));
   if (!stage) {
@@ -372,7 +442,8 @@ export function resolveRunnerForModel(
               await recordActiveFallbackModel(
                 taskFolderUri ?? request.taskFolderUri,
                 stage,
-                backupModel
+                backupModel,
+                { expectedReviewAttemptId }
               );
               return fallbackResult;
             }
@@ -385,7 +456,7 @@ export function resolveRunnerForModel(
         const authenticationFailure = isAuthenticationFailure(availability.reason);
         if (!availability.available && !authenticationFailure) {
           const folder = taskFolderUri ?? request.taskFolderUri;
-          if (folder && await reserveFallback(folder, stage)) {
+          if (folder && await reserveFallback(folder, stage, expectedReviewAttemptId)) {
             return runBackups();
           }
           return { runnerId: primary.id, status: "failed", failureKind: "temporarily-unavailable", errorMessage: availability.reason ?? "Model is temporarily unavailable." };
@@ -400,7 +471,7 @@ export function resolveRunnerForModel(
         if (!folder) {
           return result;
         }
-        const reserved = await reserveFallback(folder, stage);
+        const reserved = await reserveFallback(folder, stage, expectedReviewAttemptId);
         if (!reserved) {
           return result;
         }

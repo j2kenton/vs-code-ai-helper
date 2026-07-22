@@ -105,7 +105,18 @@ export class CopilotLanguageModelRunner implements AgentRunner {
         runnerId: this.id,
         status: "completed",
         outputFile: request.outputFile,
-        modelId: model.id,
+        // Prefer echoing back exactly what was requested, not the resolved
+        // vscode.LanguageModelChat's own `.id`: parseCopilotModelSelection
+        // strips a "@reasoningEffort" suffix (e.g. "gpt-5.4@high") before
+        // matching it to a model by base id, so `model.id` alone would
+        // silently drop that suffix — making a stage's own configured
+        // variant look, to a caller reconciling "what model actually ran"
+        // against stored qualified ids (e.g. qualifiedRanModelId in
+        // reviewActions.ts), like a completely different model just ran.
+        // Falls back to `model.id` only when no specific model was
+        // requested (the provider's own default ran), so that case still
+        // names a real, concrete model instead of reporting nothing.
+        modelId: request.modelId ?? model.id,
         summary: `Generated ${output.length} characters using ${model.name}.`,
       };
     } catch (error) {

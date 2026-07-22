@@ -27,10 +27,17 @@ import { NotificationRouter } from "./notificationRouter";
  *
  * Call this AFTER consent has succeeded and BEFORE any provider process
  * is launched or any on-disk artifact is written for the run.
+ *
+ * `backupProviderCount`, when the caller may retry this exact prompt against
+ * configured backups (for quota/availability fallback or content-validation
+ * failure), discloses that in the confirmation text — the dialog otherwise
+ * names only `providerLabel`, which is misleading once the same prompt can
+ * silently fan out to other providers' quotas afterward.
  */
 export async function checkAndConfirmPromptSize(
   prompt: string,
-  providerLabel: string
+  providerLabel: string,
+  backupProviderCount = 0
 ): Promise<"ok" | "confirmed" | "declined" | "abort"> {
   const bytes = measurePromptBytes(prompt);
 
@@ -58,9 +65,13 @@ export async function checkAndConfirmPromptSize(
     const tokens = estimateTokensFromUtf8Bytes(bytes);
     const PROCEED = "Proceed";
     const PROCEED_DONT_ASK = "Proceed and don't ask again";
+    const backupNote = backupProviderCount > 0
+      ? ` If this run hits quota/availability limits or its response doesn't validate, this same prompt may also be retried against up to ` +
+        `${backupProviderCount} configured backup model${backupProviderCount === 1 ? "" : "s"}.`
+      : "";
     const choice = await vscode.window.showWarningMessage(
       `⚠️ This will send a prompt of ~${kb} KB (~${tokens.toLocaleString()} tokens) to ${providerLabel}. ` +
-        `This may use significant quota. Continue?`,
+        `This may use significant quota.${backupNote} Continue?`,
       { modal: true },
       PROCEED,
       PROCEED_DONT_ASK

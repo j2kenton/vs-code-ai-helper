@@ -7,10 +7,12 @@ import * as path from "node:path";
 import { describe, it } from "node:test";
 import * as vscode from "vscode";
 import {
+  backupModelsForStage,
   checkImplementationAvailabilityForModel,
   checkRunnerAvailabilityForModel,
   getConfiguredBackupModelsForStage,
   isAuthenticationFailure,
+  recordActiveFallbackModel,
   resolveRunnerForModel,
   runImplementationForModel,
 } from "../runners/runnerRegistry";
@@ -172,6 +174,92 @@ void describe("getConfiguredBackupModelsForStage", () => {
     const stub = installModelSettings({});
     try {
       assert.deepEqual(getConfiguredBackupModelsForStage("impl-high-review", "codex-cli:gpt-5"), []);
+    } finally {
+      stub.restore();
+    }
+  });
+});
+
+void describe("recordActiveFallbackModel review-attempt CAS", () => {
+  void it("does not persist routing after a newer review attempt claims the stage", async () => {
+    const metaRoot = fs.mkdtempSync(
+      path.join(os.tmpdir(), "ensemble-fallback-attempt-cas-")
+    );
+    const taskFolder = path.join(metaRoot, "tasks", "task-a");
+    fs.mkdirSync(taskFolder, { recursive: true });
+    const taskFolderUri = vscode.Uri.file(taskFolder);
+    const progressPath = path.join(taskFolder, "task-progress.json");
+    const now = new Date().toISOString();
+    fs.writeFileSync(
+      progressPath,
+      JSON.stringify(
+        {
+          taskFolder: "task-a",
+          currentStage: "impl-low-review",
+          status: "active",
+          createdAt: now,
+          updatedAt: now,
+          reviewAttemptId: "newer-attempt",
+        },
+        null,
+        2
+      ),
+      "utf8"
+    );
+
+    const workspace = vscode.workspace as unknown as {
+      fs: { readFile: (uri: vscode.Uri) => Promise<Uint8Array> };
+    };
+    const originalReadFile = workspace.fs.readFile;
+    workspace.fs.readFile = (uri: vscode.Uri): Promise<Uint8Array> =>
+      fs.promises.readFile(uri.fsPath);
+
+    try {
+      const recorded = await recordActiveFallbackModel(
+        taskFolderUri,
+        "impl-low-review",
+        "claude-cli:sonnet",
+        {
+          expectedReviewAttemptId: "older-attempt",
+          requireUnreserved: true,
+        }
+      );
+
+      assert.equal(recorded, false);
+      const progress = JSON.parse(fs.readFileSync(progressPath, "utf8")) as {
+        fallbackActive?: Partial<Record<string, boolean>>;
+        fallbackModelId?: Partial<Record<string, string>>;
+      };
+      assert.equal(progress.fallbackActive?.["impl-low-review"], undefined);
+      assert.equal(progress.fallbackModelId?.["impl-low-review"], undefined);
+    } finally {
+      workspace.fs.readFile = originalReadFile;
+    }
+  });
+});
+
+void describe("backupModelsForStage", () => {
+  void it("deduplicates canonical and legacy aliases and excludes an aliased primary", () => {
+    const stub = installModelSettings({
+      "impl-high-review": {
+        primary: "antigravity-cli:gemini-3.5-flash-medium",
+        backups: [
+          "antigravity-cli:Gemini 3.5 Flash (Medium)",
+          "antigravity-cli:gemini-3.5-flash-high",
+          "antigravity-cli:Gemini 3.5 Flash (High)",
+          "claude-cli:sonnet",
+        ],
+        strategy: "switch-to-backup",
+      },
+    });
+    try {
+      assert.deepEqual(
+        backupModelsForStage(
+          "impl-high-review",
+          "antigravity-cli:gemini-3.5-flash-medium"
+        ),
+        ["antigravity-cli:Gemini 3.5 Flash (High)", "claude-cli:sonnet"]
+      );
     } finally {
       stub.restore();
     }
@@ -364,6 +452,7 @@ void describe("resolveRunnerForModel", () => {
           status: "active",
           createdAt: now,
           updatedAt: now,
+          reviewAttemptId: "attempt-a",
         },
         null,
         2
@@ -411,7 +500,8 @@ void describe("resolveRunnerForModel", () => {
       const { runner } = resolveRunnerForModel(
         "copilot-gpt-5.6-sol",
         "plan",
-        taskFolderUri
+        taskFolderUri,
+        "attempt-a"
       );
 
       const result = await runner.run(

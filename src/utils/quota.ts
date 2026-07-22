@@ -158,4 +158,18 @@ export const __quotaTestOnly = {
   clear(): void {
     quotaObservations.clear();
   },
+  /**
+   * Directly set an observation with an arbitrary `observedAt`, bypassing
+   * recordQuotaObservation's "now" timestamp — needed to test callers that
+   * gate on observation recency (e.g. runAiToFile's backup-skip check in
+   * reviewActions.ts) against an observation old enough that it should no
+   * longer apply, which the public recording API can't produce on demand.
+   */
+  setObservation(
+    stage: TaskStage,
+    modelId: string | undefined,
+    observation: QuotaObservation
+  ): void {
+    quotaObservations.set(quotaKey(stage, modelId), observation);
+  },
 };

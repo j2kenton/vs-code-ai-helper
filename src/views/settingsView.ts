@@ -1314,6 +1314,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                   <div class="extra-backups"></div>
                   <button type="button" class="secondary add-backup" title="Add another backup model for this stage">+ Add another backup</button>
                   <span class="backup-limit">1/10</span>
+                  <p class="provider-help">With Fallback Strategy set to "Switch to Backup", these are tried automatically, in order — not only when the primary hits a quota/availability error, but also when its response comes back unusable (e.g. fails content validation). Each attempt sends the same prompt and uses that model's own quota.</p>
                 </div>
               \`;
 

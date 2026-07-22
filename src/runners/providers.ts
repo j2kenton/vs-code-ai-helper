@@ -1114,7 +1114,19 @@ export function toQualifiedModelId(
  * still runs correctly but shows as "Unknown model" and resets to default
  * the next time settings are saved. Copilot/bare IDs have no alias table
  * and are returned unchanged.
+ *
+ * Overloaded so a defined `string` input (including `""`) is known to
+ * produce a defined `string` output: the `if (!modelId)` branch returns
+ * `modelId` itself unchanged (`""` stays `""`, a string), and every other
+ * branch returns a real provider/qualified-ID string — only an `undefined`
+ * input round-trips to `undefined`. Without this a caller with a
+ * guaranteed-defined id still has to write a dead `?? id` fallback to
+ * satisfy the type checker.
  */
+export function normalizeQualifiedModelId(modelId: string): string;
+export function normalizeQualifiedModelId(
+  modelId: string | undefined
+): string | undefined;
 export function normalizeQualifiedModelId(
   modelId: string | undefined
 ): string | undefined {

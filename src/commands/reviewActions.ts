@@ -49,10 +49,14 @@ import { generateContextPack, writeContextPack, writeImplReviewContextPack } fro
 import { renderPromptTemplate } from "../utils/promptTemplates";
 import { writeRunLog } from "../utils/runLog";
 import {
+  backupModelsForStage,
   checkImplementationAvailabilityForModel,
+  recordActiveFallbackModel,
   resolveRunnerForModel,
   runImplementationForModel,
 } from "../runners/runnerRegistry";
+import { getCliProvider, normalizeQualifiedModelId, toQualifiedModelId, type CliProviderId } from "../runners/providers";
+import { getQuotaObservation, recordQuotaObservation } from "../utils/quota";
 import {
   resolveConfiguredReviewStages,
   resolveFreshModelForStage,
@@ -858,9 +862,12 @@ async function getUnrelatedWorkspaceChanges(
  * responds with a clarifying question instead of writing the review) —
  * `runner.run` has no way to tell that apart from a real answer, so this is
  * the only place callers who care about a specific output shape can reject
- * it. On failed validation the file is reverted to its pre-run content
- * (or left empty if there was none) instead of keeping the invalid response,
- * and the run is reported as not completed.
+ * it. On failed validation the response is discarded (written only to a
+ * staged temp file that gets deleted, never to `outputFileUri`), the
+ * promoted artifact is left exactly as it was before this call, other
+ * configured backup models are retried in turn (see the retry loop below),
+ * and the run is reported as not completed only once every candidate has
+ * failed validation.
  */
 async function runAiToFile(options: {
   extensionUri: vscode.Uri;
@@ -890,6 +897,19 @@ async function runAiToFile(options: {
   onValidatedOutput?: (content: string) => void;
   /** Preserve a stage's active fallback reservation across one internal retry loop. */
   preserveActiveFallback?: boolean;
+  /**
+   * The review-attempt token this call claimed via claimReviewAttempt,
+   * checked between backup candidates in the retry loop below: a newer
+   * attempt claiming the stage always wins the final CAS at advanceStage
+   * regardless (a late result can never itself corrupt anything), but
+   * without this check an older, already-superseded attempt would keep
+   * burning full agentic CLI runs against every remaining configured
+   * backup — real quota spent on an artifact that can never be published —
+   * before that final CAS ever gets a chance to reject it. Absent for
+   * callers with no review-attempt concept (e.g. plan generation), which
+   * skip the check entirely.
+   */
+  reviewAttemptId?: string;
 }): Promise<boolean> {
   const modelStage = options.executionStage ?? options.logStage;
   const model = options.preserveActiveFallback
@@ -905,8 +925,16 @@ async function runAiToFile(options: {
     );
     return false;
   }
+  // Snapshot the retry set before any async prompt rendering or confirmation.
+  // The runner captures the same settings synchronously just below, and this
+  // snapshot is then used for both quota disclosure and content retries, so a
+  // settings edit while the primary is running cannot silently expand fan-out.
+  const configuredBackupModels = backupModelsForStage(modelStage, model.modelId);
   const { runner, providerLabel, nativeModelId } = resolveRunnerForModel(
-    model.modelId, modelStage, options.taskFolderUri
+    model.modelId,
+    modelStage,
+    options.taskFolderUri,
+    options.reviewAttemptId
   );
   // Build the prompt here so we can apply the size gate before launching.
   const prompt = await renderPromptTemplate(
@@ -916,16 +944,15 @@ async function runAiToFile(options: {
   );
 
   // ── Prompt-size gate ─────────────────────────────────────────────────────
-  const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel);
+  // Every stage-aware runner can retry this prompt against configured backups
+  // on quota or availability failure. Callers that validate content can also
+  // use that same list for a content-validation retry below, but candidates
+  // are de-duplicated so the list remains the maximum fan-out to disclose.
+  const configuredBackupCount = configuredBackupModels.length;
+  const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel, configuredBackupCount);
   if (sizeCheck === "abort" || sizeCheck === "declined") {
     return false;
   }
-
-  // Snapshot pre-run content so a response that fails validation can be
-  // reverted instead of clobbering a previously valid file.
-  const previousContent = options.validateOutput
-    ? (await readNonEmptyText(options.outputFileUri)) ?? ""
-    : undefined;
 
   let completed = false;
   // Providers write their response to the requested path.  Isolate that
@@ -938,7 +965,18 @@ async function runAiToFile(options: {
   await vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Window,
-      title: `${options.progressAction} with ${providerLabel} (uses your ${providerLabel} quota)...`,
+      // Deliberately does not name a provider: VS Code's Window progress
+      // title is fixed for the whole withProgress call and has no API to
+      // revise it later, but a backup retry below can switch which provider
+      // is actually running. Naming it here would keep showing the primary
+      // (and its quota) for however long a backup then runs — the provider
+      // + quota attribution instead lives in progress.report's `message`,
+      // which IS updated per-candidate (see below and the backup retry). No
+      // trailing "..." here either: ProgressLocation.Window renders title
+      // and message joined as "title: message", and the message (below)
+      // always supplies its own "..." — a second one on the title would
+      // double up mid-sentence.
+      title: options.progressAction,
       cancellable: true,
     },
     async (progress, token) => {
@@ -946,19 +984,26 @@ async function runAiToFile(options: {
         `${options.progressAction} with ${providerLabel}...`,
         taskOperations.rootOperationIdFor(options.taskFolderUri.fsPath)
       );
-      progress.report({ message: `Waiting for ${providerLabel} response...` });
+      progress.report({ message: `Waiting for ${providerLabel} response (uses your ${providerLabel} quota)...` });
 
-      // The run must also honor the tracked operation's cancellation token
-      // (the Notifications-section cancel button), not just the native
-      // progress token — this call site is deep enough that it never
-      // receives the operation handle, so look it up by task key.
+      // The run — and every backup retry attempt below — must also honor the
+      // tracked operation's cancellation token (the Notifications-section
+      // cancel button), not just the native progress token. One link covers
+      // the whole function so a cancel raised between attempts is seen by
+      // the retry loop's own guard, not only by whichever run() call happens
+      // to be in flight at the time.
       const linked = linkCancellationTokens(
         token,
         taskOperations.tokenFor(options.taskFolderUri.fsPath)
       );
-      let result: Awaited<ReturnType<typeof runner.run>>;
       try {
-        result = await runner.run(
+        // Captured immediately before the primary run — see the retry
+        // loop's quota-observation skip below, which uses this (not a fixed
+        // time window) to tell "this backup was burned by MY OWN cascade,
+        // during this very call" from "this is a stale observation left
+        // over from earlier in the session."
+        const primaryRunStartedAt = Date.now();
+        const result: Awaited<ReturnType<typeof runner.run>> = await runner.run(
           {
             taskFolderUri: options.taskFolderUri,
             workspaceUri: options.workspaceUri,
@@ -969,36 +1014,313 @@ async function runAiToFile(options: {
           },
           linked.token
         );
-      } finally {
-        linked.dispose();
-      }
 
-      const runLogUri = await writeRunLog(
-        options.taskFolderUri,
-        runner.id,
-        options.logStage,
-        `# Prompt\n\n${prompt}\n\n# Result\n\nStatus: ${result.status}\n\n${
-          result.summary ?? result.errorMessage ?? ""
-        }`
-      );
-      // This call site never receives the operation handle — resolve the
-      // task's live root operation directly (mirrors taskOperations.tokenFor
-      // above, used for the same reason).
-      taskOperations.setResultTargetUriForTask(options.taskFolderUri.fsPath, runLogUri);
-
-      if (result.status === "completed") {
-        const newContentBytes = await vscode.workspace.fs.readFile(
-          stagedOutputUri
+        const runLogUri = await writeRunLog(
+          options.taskFolderUri,
+          runner.id,
+          options.logStage,
+          `# Prompt\n\n${prompt}\n\n# Result\n\nStatus: ${result.status}\n\n${
+            result.summary ?? result.errorMessage ?? ""
+          }`
         );
-        const newContent = new TextDecoder().decode(newContentBytes);
-        const validation = options.validateOutput?.(newContent);
+        // This call site never receives the operation handle — resolve the
+        // task's live root operation directly (mirrors taskOperations.tokenFor
+        // above, used for the same reason).
+        taskOperations.setResultTargetUriForTask(options.taskFolderUri.fsPath, runLogUri);
 
-        if (validation && !validation.valid) {
-          // Revert instead of leaving the invalid response in place — an
-          // exit-0 CLI result is not proof the task was actually performed.
-          await writeTextFile(stagedOutputUri, previousContent ?? "");
+        if (result.status === "cancelled") {
+          NotificationRouter.showInformation(
+            `${options.outputLabel} generation cancelled.`
+          );
+          return;
+        }
+
+        if (result.status !== "completed") {
+          // A genuine provider/transport failure. resolveRunnerForModel's own
+          // runner already cascaded through the stage's quota/unavailable-
+          // triggered backups (when configured) before returning this, so
+          // there is nothing more to retry here — report it as-is.
           NotificationRouter.showError(
-            `${options.outputLabel} generation from ${providerLabel} did not produce a valid result ` +
+            `${options.outputLabel} generation failed: ${
+              result.errorMessage ?? "unknown error"
+            }.`
+          );
+          return;
+        }
+
+        let newContent = new TextDecoder().decode(
+          await vscode.workspace.fs.readFile(stagedOutputUri)
+        );
+        let validation = options.validateOutput?.(newContent);
+        let acceptedProviderLabel = providerLabel;
+        let acceptedSummary = result.summary;
+        // Tracks whichever candidate `validation` currently describes —
+        // distinct from acceptedProviderLabel, which only ever names the
+        // provider of content that actually validated. Without this, a final
+        // failure message after every backup was also rejected would keep
+        // naming the primary provider while quoting the last backup's
+        // rejection reason.
+        let lastTriedProviderLabel = providerLabel;
+
+        // Content-shape validation (e.g. a review missing its required
+        // "Readiness: N/10" line) is invisible to resolveRunnerForModel's own
+        // quota/unavailable cascade above: that wrapper only reacts to
+        // CliExecResult.status/failureKind, so a model that exits cleanly
+        // with unusable content — a response truncated mid-stream by a
+        // rate-limited free-tier model, or a clarifying question instead of
+        // a review (verified live: opencode's "kimi-k3" backup model has
+        // done both) — is never handed off to a backup there. Retry across
+        // the stage's OTHER configured backups here, one at a time, gated on
+        // the SAME "switch-to-backup" strategy the quota cascade honors —
+        // a user who opted into "pause-and-resume"/"alert-and-wait" for this
+        // stage has explicitly opted OUT of an automatic provider swap here
+        // too, so backupModelsForStage (not the second-opinion mechanism's
+        // strategy-agnostic getConfiguredBackupModelsForStage) is the right
+        // source list. Each candidate is resolved without a `stage` argument
+        // (mirrors runSecondOpinionReview) so it is not wrapped in its own
+        // nested cascade. Only fires when the caller validates content at
+        // all — the plan-rewrite call (no validateOutput) is unaffected and
+        // keeps its original single-attempt behavior.
+        let cancelledDuringRetry = false;
+        let supersededDuringRetry = false;
+        if (validation && !validation.valid) {
+          // Exclude whichever model actually produced this content, not just
+          // the configured primary: resolveRunnerForModel's own cascade may
+          // have already silently substituted a backup before returning
+          // here, and retrying that same backup a second time would waste a
+          // whole attempt confirming what is already known. Normalized so a
+          // "(CLI default)" entry (native id undefined) and a legacy-aliased
+          // entry both compare equal to their canonical form — see
+          // qualifiedRanModelId.
+          const ranModelId = qualifiedRanModelId(result);
+          const alreadyTriedModelIds = new Set(
+            [model.modelId, ranModelId]
+              .filter((id): id is string => id !== undefined)
+              .map((id) => normalizeQualifiedModelId(id))
+          );
+          // True when the model that actually produced `result` differs from
+          // the primary model this call requested — i.e. resolveRunnerForModel's
+          // OWN quota/unavailable cascade (inside the `runner.run()` call
+          // above) already silently substituted a backup and, per its own
+          // bookkeeping (runnerRegistry.ts's runBackups), already called
+          // recordActiveFallbackModel for it — BEFORE this retry loop, which
+          // only reacts to content shape, ever ran. In that case this exact
+          // call already legitimately owns the stage's fallback reservation
+          // for its own primary attempt. The atomic persistence below may
+          // therefore replace that call's known-bad active model once this
+          // loop finds a response that actually validates.
+          const primaryCascadeAlreadySubstitutedBackup =
+            ranModelId !== undefined &&
+            ranModelId !== normalizeQualifiedModelId(model.modelId);
+          for (const backupModelId of configuredBackupModels) {
+            if (linked.token.isCancellationRequested) {
+              cancelledDuringRetry = true;
+              break;
+            }
+            // Each candidate here is a full agentic CLI run (routinely
+            // minutes long), so re-check between them whether a newer review
+            // attempt has already claimed this stage — the final CAS at
+            // advanceStage would reject this run's result anyway once it
+            // finishes, but only after every remaining backup below had
+            // already been spent chasing an artifact that can never be
+            // published. Skipped entirely for callers with no review-attempt
+            // concept (reviewAttemptId absent). Only a SUCCESSFUL read
+            // naming a different attempt counts as supersession —
+            // readTaskProgress returns undefined on any read/parse failure
+            // (plausible mid-retry-sequence, e.g. racing a concurrent
+            // patchTaskProgress read-modify-write on Windows), which is
+            // missing evidence, not proof a newer attempt exists; treating
+            // it as supersession would abandon every remaining backup and
+            // tell the user a newer attempt started when none did.
+            if (options.reviewAttemptId) {
+              const currentProgress = await readTaskProgress(options.taskFolderUri);
+              if (currentProgress && currentProgress.reviewAttemptId !== options.reviewAttemptId) {
+                supersededDuringRetry = true;
+                break;
+              }
+            }
+            if (alreadyTriedModelIds.has(normalizeQualifiedModelId(backupModelId))) {
+              continue;
+            }
+            // resolveRunnerForModel's OWN quota/unavailable cascade (above,
+            // for the primary) may have already walked past — and burned —
+            // one or more of these same backups before landing on the
+            // content-invalid result being retried here; recordQuotaObservation
+            // recorded each of those moments ago. Skip anything known
+            // exhausted/unavailable from THAT observation rather than
+            // re-spending it. Gated on it having been recorded DURING this
+            // very call (at/after primaryRunStartedAt, captured immediately
+            // before the primary run() above), not on a fixed time window:
+            // quota.ts's observations are explicitly "a live signal, not a
+            // persisted ledger" with no expiry of their own, so an
+            // observation left over from earlier in the same extension-host
+            // session (a quota window that reset hours ago) must not
+            // permanently disqualify a backup. A fixed window doesn't work
+            // either — the cascade's own runs (recorded here as the primary
+            // `result`) are full agentic CLI calls that can easily run
+            // longer than any reasonable window, ageing a moments-ago
+            // observation out before this loop ever reaches it. Anchoring to
+            // this call's own start time instead means the check is exactly
+            // "did MY OWN cascade, earlier in THIS call, already burn this
+            // backup" — true regardless of how long anything since has run.
+            const observation = getQuotaObservation(modelStage, backupModelId);
+            if (
+              observation &&
+              new Date(observation.observedAt).getTime() >= primaryRunStartedAt &&
+              (observation.state === "exhausted" || observation.state === "unavailable")
+            ) {
+              continue;
+            }
+
+            let backup: ReturnType<typeof resolveRunnerForModel>;
+            let backupResult: Awaited<ReturnType<typeof runner.run>>;
+            try {
+              backup = resolveRunnerForModel(backupModelId, undefined, options.taskFolderUri);
+              const backupAvailability = await backup.runner.isAvailable();
+              if (!backupAvailability.available) {
+                continue;
+              }
+              progress.report({ message: `Retrying with ${backup.providerLabel} (backup, uses your ${backup.providerLabel} quota)...` });
+              NotificationRouter.emitProgressSummary(
+                `${options.progressAction} with ${backup.providerLabel} (backup)...`,
+                taskOperations.rootOperationIdFor(options.taskFolderUri.fsPath)
+              );
+              backupResult = await backup.runner.run(
+                {
+                  taskFolderUri: options.taskFolderUri,
+                  workspaceUri: options.workspaceUri,
+                  stage: options.logStage,
+                  prompt,
+                  outputFile: stagedOutputUri,
+                  modelId: backup.nativeModelId,
+                },
+                linked.token
+              );
+            } catch {
+              // A flaky candidate — resolveRunnerForModel/isAvailable/run
+              // itself throwing — must not abort the whole retry sequence,
+              // same rationale as runSecondOpinionReview's identical guard.
+              continue;
+            }
+
+            // A newer review can claim the stage while this full backup run
+            // is in flight. Re-check before accepting its result or updating
+            // fallback routing state: advanceStage's final CAS protects the
+            // review artifact, but it cannot undo an earlier fallback-state
+            // write made by this superseded attempt.
+            if (options.reviewAttemptId) {
+              const currentProgress = await readTaskProgress(options.taskFolderUri);
+              if (currentProgress && currentProgress.reviewAttemptId !== options.reviewAttemptId) {
+                supersededDuringRetry = true;
+                break;
+              }
+            }
+
+            // Once run() has actually returned, everything below is
+            // bookkeeping around an already-obtained result. writeRunLog and
+            // setResultTargetUriForTask are real I/O (can throw, e.g. a
+            // transient file-lock error) and are best-effort only — wrapped
+            // so a logging hiccup can never propagate out of this loop and
+            // abort a run that may already hold a validated response.
+            try {
+              const backupLogUri = await writeRunLog(
+                options.taskFolderUri,
+                backup.runner.id,
+                options.logStage,
+                `# Prompt\n\n${prompt}\n\n# Result\n\nStatus: ${backupResult.status}\n\n${
+                  backupResult.summary ?? backupResult.errorMessage ?? ""
+                }`
+              );
+              taskOperations.setResultTargetUriForTask(options.taskFolderUri.fsPath, backupLogUri);
+            } catch {
+              // Best-effort — see comment above.
+            }
+
+            if (backupResult.status === "cancelled") {
+              // Terminal, same as the primary path above — do not spend
+              // further backups once the user has actually cancelled, and
+              // report it as a cancellation rather than a validation
+              // failure (see cancelledDuringRetry below). Recorded as neither
+              // a quota nor a temporary-unavailable observation below (a
+              // cancellation never actually observed the provider's quota
+              // state) — checked before recordQuotaObservation so a
+              // cancelled run can't be misrecorded as "ok" and overwrite a
+              // genuine recent "exhausted"/"unavailable" observation for
+              // this same backup.
+              cancelledDuringRetry = true;
+              break;
+            }
+            recordQuotaObservation(modelStage, backupModelId, backupResult.failureKind, backupResult.errorMessage);
+            if (backupResult.status !== "completed") {
+              continue;
+            }
+
+            let backupContent: string;
+            try {
+              backupContent = new TextDecoder().decode(
+                await vscode.workspace.fs.readFile(stagedOutputUri)
+              );
+            } catch {
+              // The staged file vanished or is unreadable despite a
+              // "completed" status — a flaky candidate, try the next one.
+              continue;
+            }
+            const backupValidation = options.validateOutput?.(backupContent);
+            lastTriedProviderLabel = backup.providerLabel;
+            if (backupValidation && !backupValidation.valid) {
+              validation = backupValidation;
+              continue;
+            }
+            newContent = backupContent;
+            validation = backupValidation;
+            acceptedProviderLabel = backup.providerLabel;
+            acceptedSummary = backupResult.summary;
+            // Persist the validated route in one locked compare-and-set. The
+            // review-attempt check must be inside that same state mutation:
+            // a separate read above cannot prevent a newer attempt claiming
+            // the stage between the read and this write. A reservation may be
+            // replaced when this call's own cascade created it, or when this
+            // preserved iteration started from that exact active model;
+            // otherwise the existing reservation still wins. Either way,
+            // routing persistence remains best-effort and never discards the
+            // validated review itself.
+            try {
+              await recordActiveFallbackModel(
+                options.taskFolderUri,
+                modelStage,
+                backupModelId,
+                {
+                  expectedReviewAttemptId: options.reviewAttemptId,
+                  requireUnreserved: !primaryCascadeAlreadySubstitutedBackup,
+                  // A preserved Fast Forward route is this attempt's actual
+                  // starting model, not an unrelated reservation. If that
+                  // model produced invalid content, atomically replace it
+                  // with the backup that just validated. The registry still
+                  // rejects the write if the active route changed to a
+                  // different named model while this backup was running.
+                  replaceActiveModelId: options.preserveActiveFallback
+                    ? model.modelId
+                    : undefined,
+                }
+              );
+            } catch {
+              // Best-effort — see comment above.
+            }
+            break;
+          }
+        }
+
+        if (cancelledDuringRetry) {
+          NotificationRouter.showInformation(
+            `${options.outputLabel} generation cancelled.`
+          );
+        } else if (supersededDuringRetry) {
+          NotificationRouter.showInformation(
+            `${options.outputLabel} generation stopped: a newer review attempt for this stage has already started.`
+          );
+        } else if (validation && !validation.valid) {
+          NotificationRouter.showError(
+            `${options.outputLabel} generation from ${lastTriedProviderLabel} did not produce a valid result ` +
               `(${validation.reason}). The provider may not have followed the instructions — try again.`
           );
         } else {
@@ -1011,28 +1333,51 @@ async function runAiToFile(options: {
             await safeOpenTextDocument(options.outputFileUri, options.outputLabel);
           }
           NotificationRouter.showInformation(
-            `${options.outputLabel} generated with ${providerLabel} (${
-              result.summary ?? ""
+            `${options.outputLabel} generated with ${acceptedProviderLabel} (${
+              acceptedSummary ?? ""
             })`
           );
         }
-      } else if (result.status === "cancelled") {
-        NotificationRouter.showInformation(
-          `${options.outputLabel} generation cancelled.`
-        );
-      } else {
-        NotificationRouter.showError(
-          `${options.outputLabel} generation failed: ${
-            result.errorMessage ?? "unknown error"
-          }.`
-        );
-      }
-      if (stagedOutputUri.fsPath !== options.outputFileUri.fsPath) {
-        try { await vscode.workspace.fs.delete(stagedOutputUri, { useTrash: false }); } catch { /* best effort */ }
+      } finally {
+        linked.dispose();
+        if (stagedOutputUri.fsPath !== options.outputFileUri.fsPath) {
+          try { await vscode.workspace.fs.delete(stagedOutputUri, { useTrash: false }); } catch { /* best effort */ }
+        }
       }
     }
   );
   return completed;
+}
+
+/**
+ * Reconstruct the fully qualified, canonical `<provider>:<model>` form of
+ * whichever model actually produced an AgentRunResult, so it can be compared
+ * directly against stage-config backup entries. Two things a naive
+ * `${runnerId}:${modelId}` join gets wrong, both handled here:
+ *
+ *  - An absent `modelId` from a CLI runner means the provider's own default
+ *    model ran (see parseModelSelection's "default" mapping) — that is a
+ *    real, nameable model (e.g. "opencode-cli:default"), not an unknown one,
+ *    and several providers ship exactly this as a seeded backup entry.
+ *  - A present `modelId` may be the post-alias-resolution name rather than
+ *    whatever raw string a backup entry happens to be stored under (e.g. a
+ *    legacy "antigravity-cli:gemini-3.5-flash-medium" entry runs and reports
+ *    back as "Gemini 3.5 Flash (Medium)"). normalizeQualifiedModelId — the
+ *    same helper the settings webview uses to reconcile stored ids against
+ *    the live catalog — resolves both sides back to the same canonical form.
+ *
+ * Copilot's stored ids have no alias table and are returned as reported
+ * (bare) — a Copilot result reporting no `modelId` at all can't be
+ * reconstructed (there is nothing to compare), so this returns undefined
+ * only in that case.
+ */
+function qualifiedRanModelId(result: { runnerId: string; modelId?: string }): string | undefined {
+  if (getCliProvider(result.runnerId)) {
+    return normalizeQualifiedModelId(
+      toQualifiedModelId(result.runnerId as CliProviderId, result.modelId)
+    );
+  }
+  return result.modelId;
 }
 
 /**
@@ -1710,7 +2055,11 @@ export async function runReviewForFolder(
   variables.contextPack = contextPackContent;
 
   // Claim the stage before starting the provider call. The token is checked
-  // again by the transition CAS, so a late result cannot advance a newer run.
+  // again by the transition CAS, so a late result can never advance a newer
+  // run — passed through to runAiToFile as reviewAttemptId as well, which
+  // additionally re-checks it between content-validation backup retries so a
+  // superseded attempt stops spending quota on backups well before it would
+  // eventually lose that final CAS anyway.
   const reviewAttemptId = crypto.randomUUID();
   const claimed = await claimReviewAttempt(folderUri, reviewAttemptId);
   if (!claimed) return;
@@ -1732,6 +2081,7 @@ export async function runReviewForFolder(
     promoteOutput: false,
     onValidatedOutput: (content) => { generatedReviewContent = content; },
     preserveActiveFallback: options.preserveActiveFallback,
+    reviewAttemptId,
   });
 
   if (reviewWritten) {
