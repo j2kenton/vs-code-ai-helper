@@ -269,7 +269,7 @@ void describe("CLI output normalization", () => {
     const cts = new vscode.CancellationTokenSource();
     const request: AgentRunRequest = {
       taskFolderUri: vscode.Uri.file("/fake-task"),
-      workspaceUri: vscode.Uri.file("/fake-workspace"),
+      workspaceUri: vscode.Uri.file(process.cwd()),
       stage: "plan",
       prompt: "irrelevant",
       outputFile: vscode.Uri.file("/fake-task/plan.md"),
@@ -279,6 +279,45 @@ void describe("CLI output normalization", () => {
 
     assert.strictEqual(result.status, "failed");
     assert.strictEqual(result.failureKind, "quota");
+  });
+
+  void it("gives an OpenCode Go-specific recovery path for a no-provider 401", () => {
+    const provider: CliProviderDefinition = {
+      id: "opencode-cli",
+      label: "OpenCode",
+      command: "node",
+      installHint: "install",
+      loginHint: "generic login",
+      loginHintForModel(model): string {
+        return model?.startsWith("opencode-go/")
+          ? "Connect OpenCode Go with `/connect` and confirm the Go subscription."
+          : "Connect OpenCode Zen with `/connect` and confirm Zen billing.";
+      },
+      authErrorMarkers: ["no provider available", "401"],
+      signInCommand: "opencode",
+      signInLabel: "Sign in",
+      useShell: false,
+      models: [],
+      usesLastMessageFile: false,
+      buildArgs(): string[] {
+        return [
+          "-e",
+          "process.stderr.write('No provider available (HTTP 401)'); process.exit(1);",
+        ];
+      },
+    };
+
+    const error = __testOnly.toFriendlyError(
+      provider,
+      "opencode-go/kimi-k3",
+      1,
+      "No provider available (HTTP 401)",
+      ""
+    );
+
+    assert.match(error, /OpenCode Go/);
+    assert.match(error, /Go subscription/);
+    assert.doesNotMatch(error, /Zen billing/);
   });
 });
 

@@ -990,12 +990,22 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             return availableModels.find(model => model.id === id);
           }
 
-          // Provider prefix of a stored model id ("claude-cli:sonnet" ->
-          // "claude-cli"); bare ids are Copilot models (always offered).
+          // Provider Selection account governing a stored model. Most IDs
+          // map directly from their storage prefix; OpenCode deliberately
+          // keeps one opencode-cli: runner prefix while its native model
+          // namespace chooses the independently enabled Zen or Go service.
           function providerIdOfModelId(id) {
             const sep = (id || '').indexOf(':');
             if (sep <= 0) return 'copilot';
             const prefix = id.slice(0, sep);
+            const nativeModel = id.slice(sep + 1);
+            if (prefix === 'opencode-cli') {
+              if (nativeModel.startsWith('opencode-go/')) return 'opencode-go';
+              if (nativeModel.startsWith('opencode/')) return 'opencode-zen';
+              // Legacy external OpenCode namespaces have no Zen/Go account
+              // row, so retain their adapter id instead of labeling them Zen.
+              return 'opencode-cli';
+            }
             return providers.some(p => p.id === prefix) ? prefix : 'copilot';
           }
 
@@ -1314,7 +1324,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                   <div class="extra-backups"></div>
                   <button type="button" class="secondary add-backup" title="Add another backup model for this stage">+ Add another backup</button>
                   <span class="backup-limit">1/10</span>
-                  <p class="provider-help">With Fallback Strategy set to "Switch to Backup", these are tried automatically, in order — not only when the primary hits a quota/availability error, but also when its response comes back unusable (e.g. fails content validation). Each attempt sends the same prompt and uses that model's own quota.</p>
+                  <p class="provider-help">With Fallback Strategy set to "Switch to Backup", these are tried automatically, in order — not only when the primary hits a quota/availability error, but also when its response comes back unusable (e.g. fails content validation). Each attempt sends the same prompt and uses that model's own quota. OpenCode Zen and OpenCode Go are separate services: selecting a backup from the other tier is an explicit cross-tier fallback and can use that tier's billing or subscription.</p>
                 </div>
               \`;
 

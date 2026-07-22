@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import {
   getAiModelDefaults,
   getModelSettings,
+  isModelProviderEnabled,
   isProviderEnabled,
 } from "../config/settings";
 import { getConfiguredTaskRoot } from "./taskRoot";
@@ -18,7 +19,7 @@ import {
   CLI_PROVIDERS,
   type CliProviderId,
   type CliProviderDefinition,
-  parseModelSelection,
+  providerAccountIdForModelId,
   toQualifiedModelId,
 } from "../runners/providers";
 import { AI_MODEL_STAGES, REVIEW_STAGES, STAGE_DISPLAY_NAMES, TaskStage } from "../types/taskProgress";
@@ -267,8 +268,7 @@ export async function ensureStageModelConfigured(
     }
     return true;
   }
-  const parsed = parseModelSelection(resolved.modelId);
-  if (!isProviderEnabled(parsed.provider)) {
+  if (!isModelProviderEnabled(resolved.modelId)) {
     NotificationRouter.showWarning(
       `The model configured for the ${stageName} stage (${resolved.modelId}) belongs to a disabled provider. ` +
         "Enable the provider or choose another model in AI Models."
@@ -1203,6 +1203,19 @@ export async function getAvailableCopilotModels(): Promise<
   return reordered;
 }
 
+/** Label a CLI model by the service that will actually authorize and bill it. */
+function modelProviderLabel(
+  def: CliProviderDefinition,
+  model: string | undefined
+): string {
+  if (def.id === "opencode-cli") {
+    return providerAccountIdForModelId(toQualifiedModelId(def.id, model)) === "opencode-go"
+      ? "OpenCode Go (shared OpenCode account; subscription)"
+      : "OpenCode Zen (shared OpenCode account; pay as you go)";
+  }
+  return `${def.label} (subscription CLI)`;
+}
+
 /**
  * All models selectable for a stage: Copilot models from the LM API plus,
  * for each vendor CLI that is installed (Claude Code, Codex, Gemini,
@@ -1245,9 +1258,13 @@ export async function getAvailableModels(): Promise<SelectableModel[]> {
   }
 
   const availability = await Promise.all(
-    CLI_PROVIDERS.map((def) =>
-      isProviderEnabled(def.id) && commandExists(def.command, def.commandAliases)
-    )
+    CLI_PROVIDERS.map((def) => {
+      const enabled =
+        def.id === "opencode-cli"
+          ? isProviderEnabled("opencode-zen") || isProviderEnabled("opencode-go")
+          : isProviderEnabled(def.id);
+      return enabled && commandExists(def.command, def.commandAliases);
+    })
   );
   for (const [index, def] of CLI_PROVIDERS.entries()) {
     if (!availability[index]) {
@@ -1255,19 +1272,44 @@ export async function getAvailableModels(): Promise<SelectableModel[]> {
     }
 
     for (const choice of def.models) {
+      const id = toQualifiedModelId(def.id, choice.model);
+      // OpenCode CLI can also list external upstream providers such as
+      // `openai/...` and `github-copilot/...`. This integration deliberately
+      // offers only its two explicit OpenCode services, Zen and Go; exposing
+      // those external namespaces under the Zen checkbox would misstate both
+      // the required credentials and billing route.
+      if (
+        def.id === "opencode-cli" &&
+        providerAccountIdForModelId(id) === "opencode-cli"
+      ) {
+        continue;
+      }
+      if (!isModelProviderEnabled(id)) {
+        continue;
+      }
       pushSelectableModel(result, seenIds, {
-        id: toQualifiedModelId(def.id, choice.model),
+        id,
         name: choice.name,
-        providerLabel: `${def.label} (subscription CLI)`,
+        providerLabel: modelProviderLabel(def, choice.model),
       });
     }
 
     const discoveredChoices = await discoverCliModels(def);
     for (const choice of discoveredChoices) {
+      const id = toQualifiedModelId(def.id, choice.model);
+      if (
+        def.id === "opencode-cli" &&
+        providerAccountIdForModelId(id) === "opencode-cli"
+      ) {
+        continue;
+      }
+      if (!isModelProviderEnabled(id)) {
+        continue;
+      }
       pushSelectableModel(result, seenIds, {
-        id: toQualifiedModelId(def.id, choice.model),
+        id,
         name: choice.name,
-        providerLabel: `${def.label} (subscription CLI)`,
+        providerLabel: modelProviderLabel(def, choice.model),
       });
     }
   }

@@ -11,6 +11,7 @@ import {
   parseCodexModelSelection,
   parseModelSelection,
   parseOpencodeModelSelection,
+  providerAccountIdForModelId,
   PROVIDER_ACCOUNT_ENTRIES,
   type CliProviderDefinition,
 } from "../runners/providers";
@@ -114,6 +115,14 @@ void describe("provider CLI contracts", () => {
     assert.strictEqual(opencode.promptTransport, "stdin");
     assert.strictEqual(opencode.useShell, undefined);
     assert.strictEqual(opencode.usesLastMessageFile, false);
+    assert.ok(
+      opencode.authErrorMarkers.includes("no provider available"),
+      "Zen's 401 provider-entitlement error must show opencode's sign-in recovery hint"
+    );
+    assert.ok(
+      opencode.authErrorMarkers.includes("401"),
+      "a JSON statusCode 401 must show opencode's sign-in recovery hint"
+    );
 
     const textArgs = opencode.buildArgs("text", undefined, undefined);
     assert.deepStrictEqual(textArgs, [
@@ -183,6 +192,46 @@ void describe("provider CLI contracts", () => {
     const parsedStored = parseModelSelection("opencode-cli:opencode/deepseek-v4-flash@high");
     assert.strictEqual(parsedStored.provider, "opencode-cli");
     assert.strictEqual(parsedStored.model, "opencode/deepseek-v4-flash@high");
+  });
+
+  void it("separates OpenCode Zen and Go account controls while keeping one CLI adapter", () => {
+    assert.strictEqual(
+      providerAccountIdForModelId("opencode-cli:opencode/deepseek-v4-flash@high"),
+      "opencode-zen"
+    );
+    assert.strictEqual(
+      providerAccountIdForModelId("opencode-cli:opencode-go/kimi-k3@max"),
+      "opencode-go"
+    );
+    assert.strictEqual(
+      providerAccountIdForModelId("opencode-cli:openai/gpt-5"),
+      "opencode-cli",
+      "external OpenCode CLI providers must not be labeled as Zen"
+    );
+
+    const zen = getProviderAccountEntry("opencode-zen");
+    const go = getProviderAccountEntry("opencode-go");
+    assert.ok(zen, "expected the OpenCode Zen provider-account row");
+    assert.ok(go, "expected the OpenCode Go provider-account row");
+    assert.strictEqual(getProviderAccountEntry("opencode-cli"), undefined);
+    assert.strictEqual(zen.label, "OpenCode Zen");
+    assert.strictEqual(go.label, "OpenCode Go");
+    assert.strictEqual(zen.signIn.kind, "interactive");
+    assert.strictEqual(go.signIn.kind, "interactive");
+    if (zen.signIn.kind === "interactive" && go.signIn.kind === "interactive") {
+      assert.deepStrictEqual(zen.signIn, {
+        kind: "interactive",
+        launch: "opencode",
+        send: "/connect",
+        validated: "verified",
+      });
+      assert.deepStrictEqual(go.signIn, zen.signIn);
+    }
+
+    const opencode = getCliProvider("opencode-cli");
+    assert.ok(opencode);
+    assert.match(opencode.loginHintForModel?.("opencode-go/kimi-k3") ?? "", /OpenCode Go/);
+    assert.match(opencode.loginHintForModel?.("opencode/glm-5.2") ?? "", /OpenCode Zen/);
   });
 
   void it("text mode stays permission-constrained unless the provider warns the user", () => {
@@ -420,7 +469,7 @@ void describe("provider CLI contracts", () => {
       "gemini-cli": { command: "gemini" },
       "antigravity-cli": { command: "agy" },
       "kiro-cli": { command: "kiro-cli logout; kiro-cli login" },
-      "opencode-cli": { command: "opencode providers login" },
+      "opencode-cli": { command: "opencode" },
     };
 
     for (const provider of CLI_PROVIDERS) {
@@ -503,12 +552,12 @@ void describe("provider CLI contracts", () => {
     }
     assert.strictEqual(copilot.enabledByDefault, true);
 
-    // Every CLI provider's account entry carries its validated sign-in:
+    // Every regular CLI provider's account entry carries its validated sign-in:
     // an interactive launch-then-send dispatch when the login surface is an
     // in-session slash command (Claude), otherwise a terminal action with
     // the validated command line.
     for (const entry of PROVIDER_ACCOUNT_ENTRIES) {
-      if (entry.id === "copilot") continue;
+      if (entry.id === "copilot" || entry.id === "opencode-zen" || entry.id === "opencode-go") continue;
       const cli = getCliProvider(entry.id);
       assert.ok(cli, `expected CLI definition for ${entry.id}`);
       if (cli.signInAction) {
@@ -550,7 +599,8 @@ void describe("provider CLI contracts", () => {
       "gemini-cli": { kind: "unsupported" },
       "antigravity-cli": { kind: "unsupported" },
       "kiro-cli": { kind: "unsupported" },
-      "opencode-cli": { kind: "unsupported" },
+      "opencode-zen": { kind: "unsupported" },
+      "opencode-go": { kind: "unsupported" },
     };
     for (const entry of PROVIDER_ACCOUNT_ENTRIES) {
       const expected = expectations[entry.id];
@@ -569,10 +619,13 @@ void describe("provider CLI contracts", () => {
       if (entry.usage.kind === "unsupported") {
         assert.ok(entry.usage.reason.length > 0, `${entry.id} unsupported usage needs a reason`);
       }
-      // Every provider's sign-in button reads "Sign in / Switch account":
-      // re-running the same flow while already authenticated is how a user
-      // switches accounts for CLIs with no dedicated logout/switch command.
-      assert.strictEqual(entry.signInLabel, "Sign in / Switch account", entry.id);
+      if (entry.id === "opencode-zen" || entry.id === "opencode-go") {
+        assert.match(entry.signInLabel, /^Connect OpenCode /, entry.id);
+      } else {
+        // Re-running the same flow while already authenticated is how a user
+        // switches accounts for the ordinary CLI provider rows.
+        assert.strictEqual(entry.signInLabel, "Sign in / Switch account", entry.id);
+      }
     }
 
     // Gemini's /stats invocation follows the CLI's documented slash-command
@@ -622,15 +675,16 @@ void describe("provider CLI contracts", () => {
     assert.strictEqual(antigravity.usage.url, undefined, "unverified usage must not resolve to an enabled button");
     assert.match(antigravity.usage.reason, /agy/);
 
-    // opencode proxies whichever upstream provider(s) the user configured —
-    // there is no single opencode-level quota command, and no known account
-    // page to link out to either (unlike Kiro/Copilot), so its button stays
-    // disabled with an explanatory reason and no url.
-    const opencodeEntry = getProviderAccountEntry("opencode-cli");
-    assert.ok(opencodeEntry);
-    assert.ok(opencodeEntry.usage.kind === "unsupported");
-    assert.strictEqual(opencodeEntry.usage.url, undefined);
-    assert.match(opencodeEntry.usage.reason, /opencode/i);
+    // Zen and Go each report their own entitlement in the OpenCode account,
+    // but neither has a safe non-interactive status command. Their buttons
+    // therefore stay disabled with tier-specific explanatory guidance.
+    for (const accountId of ["opencode-zen", "opencode-go"] as const) {
+      const opencodeEntry = getProviderAccountEntry(accountId);
+      assert.ok(opencodeEntry);
+      assert.ok(opencodeEntry.usage.kind === "unsupported");
+      assert.strictEqual(opencodeEntry.usage.url, undefined);
+      assert.match(opencodeEntry.usage.reason, /opencode/i);
+    }
   });
 
   void it("Kiro hints mention KIRO_API_KEY requirement", () => {

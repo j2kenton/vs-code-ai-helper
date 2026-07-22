@@ -23,10 +23,16 @@ function antigravityModels(
   return providerModels(models, "Antigravity CLI (subscription CLI)");
 }
 
-function opencodeModels(
+function openCodeZenModels(
   models: readonly SelectableModel[]
 ): SelectableModel[] {
-  return providerModels(models, "opencode (subscription CLI)");
+  return providerModels(models, "OpenCode Zen (shared OpenCode account; pay as you go)");
+}
+
+function openCodeGoModels(
+  models: readonly SelectableModel[]
+): SelectableModel[] {
+  return providerModels(models, "OpenCode Go (shared OpenCode account; subscription)");
 }
 
 function codexVariant(
@@ -981,36 +987,39 @@ void describe("getAvailableModels", () => {
     });
 
     try {
-      const models = opencodeModels(await getAvailableModels());
-      assert.ok(models.length > 400, `expected the full seeded catalog, got ${models.length} entries`);
-      assert.deepStrictEqual(models[0], {
-        id: "opencode-cli:default",
-        name: "opencode (CLI default)",
-        providerLabel: "opencode (subscription CLI)",
-      });
+      const allModels = await getAvailableModels();
+      const zenModels = openCodeZenModels(allModels);
+      const goModels = openCodeGoModels(allModels);
+      assert.ok(zenModels.length > 100, `expected Zen seeded models, got ${zenModels.length}`);
+      assert.ok(goModels.length > 20, `expected Go seeded models, got ${goModels.length}`);
       assert.ok(
-        models.some((m) => m.id === "opencode-cli:opencode/deepseek-v4-flash"),
+        !allModels.some((m) => m.id === "opencode-cli:default"),
+        "a generic OpenCode CLI default would hide the Zen/Go service choice"
+      );
+      assert.ok(
+        allModels.every((m) =>
+          /^opencode-cli:(?:opencode|opencode-go)\//.test(m.id)
+        ),
+        "only OpenCode Zen and Go namespaces should be offered by this integration"
+      );
+      assert.ok(
+        zenModels.some((m) => m.id === "opencode-cli:opencode/deepseek-v4-flash"),
         "expected the base deepseek-v4-flash entry"
       );
       assert.ok(
-        models.some((m) => m.id === "opencode-cli:opencode/deepseek-v4-flash@high"),
+        zenModels.some((m) => m.id === "opencode-cli:opencode/deepseek-v4-flash@high"),
         "expected deepseek-v4-flash's @high variant entry"
       );
       assert.ok(
-        models.some((m) => m.id === "opencode-cli:opencode/north-mini-code-free@none"),
+        zenModels.some((m) => m.id === "opencode-cli:opencode/north-mini-code-free@none"),
         "expected north-mini-code-free's @none variant entry"
       );
-      // opencode-go is a cheaper "Zen Go" tier of the same models (verified
-      // live: a distinct providerID with its own cost/URL, not a separate
-      // CLI provider needing its own wiring) that appeared in the live
-      // catalog after the seed's first capture — its own entries must be
-      // present in the refreshed seed just like the base "opencode" tier's.
       assert.ok(
-        models.some((m) => m.id === "opencode-cli:opencode-go/deepseek-v4-flash"),
+        goModels.some((m) => m.id === "opencode-cli:opencode-go/deepseek-v4-flash"),
         "expected the opencode-go tier's deepseek-v4-flash entry"
       );
       assert.ok(
-        models.some((m) => m.id === "opencode-cli:opencode-go/deepseek-v4-flash@high"),
+        goModels.some((m) => m.id === "opencode-cli:opencode-go/deepseek-v4-flash@high"),
         "expected the opencode-go tier's deepseek-v4-flash @high variant entry"
       );
     } finally {
@@ -1076,7 +1085,7 @@ void describe("getAvailableModels", () => {
     });
 
     try {
-      const models = opencodeModels(await getAvailableModels());
+      const models = openCodeZenModels(await getAvailableModels());
       assert.ok(
         models.some((m) => m.id === "opencode-cli:opencode/brand-new-model"),
         "expected the primed cache entry to surface"

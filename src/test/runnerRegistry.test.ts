@@ -314,6 +314,20 @@ void describe("runner-entry disabled-provider guard", () => {
     }
   });
 
+  void it("guards OpenCode Go independently from OpenCode Zen", () => {
+    const stub = installProviderSelection({ "opencode-zen": true, "opencode-go": false });
+    try {
+      const zen = resolveRunnerForModel("opencode-cli:opencode/glm-5.2", "impl-low-review");
+      assert.equal(zen.provider, "opencode-cli");
+      assert.throws(
+        () => resolveRunnerForModel("opencode-cli:opencode-go/kimi-k3", "impl-low-review"),
+        /OpenCode Go.*disabled in Provider Selection/
+      );
+    } finally {
+      stub.restore();
+    }
+  });
+
   void it("never blocks Copilot (bare/legacy) model ids", () => {
     const stub = installProviderSelection({ "claude-cli": true });
     try {
@@ -530,6 +544,117 @@ void describe("resolveRunnerForModel", () => {
       lm.selectChatModels = originalSelectChatModels;
       workspace.fs.readFile = originalReadFile;
       workspace.fs.writeFile = originalWriteFile;
+    }
+  });
+
+  void it("does not keep an authentication-failed backup as the next text-run route", async () => {
+    const metaRoot = fs.mkdtempSync(
+      path.join(os.tmpdir(), "ensemble-text-fallback-auth-")
+    );
+    const taskFolder = path.join(metaRoot, "tasks", "task-a");
+    fs.mkdirSync(taskFolder, { recursive: true });
+    const taskFolderUri = vscode.Uri.file(taskFolder);
+    const progressPath = path.join(taskFolder, "task-progress.json");
+    const now = new Date().toISOString();
+    fs.writeFileSync(
+      progressPath,
+      JSON.stringify(
+        {
+          taskFolder: "task-a",
+          currentStage: "plan",
+          status: "active",
+          createdAt: now,
+          updatedAt: now,
+        },
+        null,
+        2
+      ),
+      "utf8"
+    );
+
+    const settings = installModelSettings({
+      plan: {
+        primary: "quota-primary",
+        backup: "unauthenticated-backup",
+        strategy: "switch-to-backup",
+      },
+    });
+    const lm = lmStub();
+    const originalSelectChatModels = lm.selectChatModels;
+    const workspace = vscode.workspace as unknown as {
+      fs: {
+        readFile: (uri: vscode.Uri) => Promise<Uint8Array>;
+        writeFile: (uri: vscode.Uri, bytes: Uint8Array) => Promise<void>;
+      };
+    };
+    const originalReadFile = workspace.fs.readFile;
+    const originalWriteFile = workspace.fs.writeFile;
+    const attemptedModels: string[] = [];
+
+    workspace.fs.readFile = (uri: vscode.Uri): Promise<Uint8Array> =>
+      fs.promises.readFile(uri.fsPath);
+    workspace.fs.writeFile = (
+      uri: vscode.Uri,
+      bytes: Uint8Array
+    ): Promise<void> => fs.promises.writeFile(uri.fsPath, bytes);
+    lm.selectChatModels = (): Promise<vscode.LanguageModelChat[]> =>
+      Promise.resolve([
+        {
+          id: "quota-primary",
+          name: "Quota primary",
+          sendRequest: () => {
+            attemptedModels.push("quota-primary");
+            return Promise.reject(new Error("Rate limit exceeded."));
+          },
+        } as unknown as vscode.LanguageModelChat,
+        {
+          id: "unauthenticated-backup",
+          name: "Unauthenticated backup",
+          sendRequest: () => {
+            attemptedModels.push("unauthenticated-backup");
+            return Promise.reject(new Error("HTTP 401 Unauthorized."));
+          },
+        } as unknown as vscode.LanguageModelChat,
+      ]);
+
+    try {
+      const { runner } = resolveRunnerForModel(
+        "quota-primary",
+        "plan",
+        taskFolderUri
+      );
+      const result = await runner.run(
+        {
+          taskFolderUri,
+          workspaceUri: vscode.Uri.file(taskFolder),
+          stage: "plan",
+          prompt: "Create a plan.",
+          outputFile: vscode.Uri.file(path.join(taskFolder, "plan.md")),
+          modelId: "quota-primary",
+        },
+        new vscode.CancellationTokenSource().token
+      );
+
+      assert.equal(result.status, "failed");
+      assert.equal(result.failureKind, "generic");
+      assert.deepEqual(attemptedModels, ["quota-primary", "unauthenticated-backup"]);
+      const progress = JSON.parse(fs.readFileSync(progressPath, "utf8")) as {
+        fallbackActive?: Partial<Record<string, boolean>>;
+        fallbackModelId?: Partial<Record<string, string>>;
+      };
+      assert.equal(progress.fallbackActive?.plan, undefined);
+      assert.equal(progress.fallbackModelId?.plan, undefined);
+      assert.equal(
+        (await resolveModelForStage(taskFolderUri, "plan")).modelId,
+        "quota-primary",
+        "the next user action must retry the configured primary, not the failed backup"
+      );
+    } finally {
+      settings.restore();
+      lm.selectChatModels = originalSelectChatModels;
+      workspace.fs.readFile = originalReadFile;
+      workspace.fs.writeFile = originalWriteFile;
+      fs.rmSync(metaRoot, { recursive: true, force: true });
     }
   });
 
@@ -775,6 +900,110 @@ void describe("runImplementationForModel", () => {
       lm.selectChatModels = originalSelectChatModels;
       workspace.fs.readFile = originalReadFile;
       workspace.fs.writeFile = originalWriteFile;
+    }
+  });
+
+  void it("does not keep an authentication-failed backup as the next implementation route", async () => {
+    const metaRoot = fs.mkdtempSync(
+      path.join(os.tmpdir(), "ensemble-impl-fallback-auth-")
+    );
+    const taskFolder = path.join(metaRoot, "tasks", "task-a");
+    fs.mkdirSync(taskFolder, { recursive: true });
+    const taskFolderUri = vscode.Uri.file(taskFolder);
+    const progressPath = path.join(taskFolder, "task-progress.json");
+    const now = new Date().toISOString();
+    fs.writeFileSync(
+      progressPath,
+      JSON.stringify(
+        {
+          taskFolder: "task-a",
+          currentStage: "impl",
+          status: "active",
+          createdAt: now,
+          updatedAt: now,
+        },
+        null,
+        2
+      ),
+      "utf8"
+    );
+
+    const settings = installModelSettings({
+      impl: {
+        primary: "quota-primary",
+        backup: "unauthenticated-backup",
+        strategy: "switch-to-backup",
+      },
+    });
+    const lm = lmStub();
+    const originalSelectChatModels = lm.selectChatModels;
+    const workspace = vscode.workspace as unknown as {
+      fs: {
+        readFile: (uri: vscode.Uri) => Promise<Uint8Array>;
+        writeFile: (uri: vscode.Uri, bytes: Uint8Array) => Promise<void>;
+      };
+    };
+    const originalReadFile = workspace.fs.readFile;
+    const originalWriteFile = workspace.fs.writeFile;
+    const attemptedModels: string[] = [];
+
+    workspace.fs.readFile = (uri: vscode.Uri): Promise<Uint8Array> =>
+      fs.promises.readFile(uri.fsPath);
+    workspace.fs.writeFile = (
+      uri: vscode.Uri,
+      bytes: Uint8Array
+    ): Promise<void> => fs.promises.writeFile(uri.fsPath, bytes);
+    lm.selectChatModels = (): Promise<vscode.LanguageModelChat[]> =>
+      Promise.resolve([
+        {
+          id: "quota-primary",
+          name: "Quota primary",
+          sendRequest: () => {
+            attemptedModels.push("quota-primary");
+            return Promise.reject(new Error("Rate limit exceeded."));
+          },
+        } as unknown as vscode.LanguageModelChat,
+        {
+          id: "unauthenticated-backup",
+          name: "Unauthenticated backup",
+          sendRequest: () => {
+            attemptedModels.push("unauthenticated-backup");
+            return Promise.reject(new Error("HTTP 401 Unauthorized."));
+          },
+        } as unknown as vscode.LanguageModelChat,
+      ]);
+
+    try {
+      const result = await runImplementationForModel({
+        modelId: "quota-primary",
+        prompt: "Implement the requested change.",
+        workspaceUri: vscode.Uri.file(taskFolder),
+        token: new vscode.CancellationTokenSource().token,
+        onProgress: () => undefined,
+        stage: "impl",
+        taskFolderUri,
+      });
+
+      assert.equal(result.status, "failed");
+      assert.equal(result.failureKind, "generic");
+      assert.deepEqual(attemptedModels, ["quota-primary", "unauthenticated-backup"]);
+      const progress = JSON.parse(fs.readFileSync(progressPath, "utf8")) as {
+        fallbackActive?: Partial<Record<string, boolean>>;
+        fallbackModelId?: Partial<Record<string, string>>;
+      };
+      assert.equal(progress.fallbackActive?.impl, undefined);
+      assert.equal(progress.fallbackModelId?.impl, undefined);
+      assert.equal(
+        (await resolveModelForStage(taskFolderUri, "impl")).modelId,
+        "quota-primary",
+        "the next user action must retry the configured primary, not the failed backup"
+      );
+    } finally {
+      settings.restore();
+      lm.selectChatModels = originalSelectChatModels;
+      workspace.fs.readFile = originalReadFile;
+      workspace.fs.writeFile = originalWriteFile;
+      fs.rmSync(metaRoot, { recursive: true, force: true });
     }
   });
 

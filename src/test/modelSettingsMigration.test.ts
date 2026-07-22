@@ -1,7 +1,12 @@
 import * as assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import * as vscode from "vscode";
-import { getModelSettings, isProviderEnabled } from "../config/settings";
+import {
+  getEnabledProviders,
+  getModelSettings,
+  isModelProviderEnabled,
+  isProviderEnabled,
+} from "../config/settings";
 
 function installModelSettings(
   raw: Record<string, unknown>,
@@ -125,6 +130,43 @@ void describe("getModelSettings — disabled-provider round trip", () => {
       const result = getModelSettings();
       assert.strictEqual(result.impl?.primary, "codex-cli:gpt-5.4-codex");
       assert.strictEqual(result.impl?.backup, "claude-cli:sonnet@high");
+    } finally {
+      settings.restore();
+    }
+  });
+});
+
+void describe("OpenCode Zen/Go provider-selection compatibility", () => {
+  void it("maps the former single OpenCode checkbox to both explicit service rows", () => {
+    const settings = installModelSettings({}, {
+      enabledProviders: { "opencode-cli": true },
+    });
+    try {
+      assert.deepEqual(getEnabledProviders(), {
+        "opencode-cli": true,
+        "opencode-zen": true,
+        "opencode-go": true,
+      });
+      assert.strictEqual(isModelProviderEnabled("opencode-cli:opencode/glm-5.2"), true);
+      assert.strictEqual(isModelProviderEnabled("opencode-cli:opencode-go/kimi-k3"), true);
+      assert.strictEqual(isModelProviderEnabled("opencode-cli:openai/gpt-5"), true);
+    } finally {
+      settings.restore();
+    }
+  });
+
+  void it("keeps Zen and Go independently enabled for their native model namespaces", () => {
+    const settings = installModelSettings({}, {
+      enabledProviders: { "opencode-zen": true, "opencode-go": false },
+    });
+    try {
+      assert.strictEqual(isModelProviderEnabled("opencode-cli:opencode/glm-5.2"), true);
+      assert.strictEqual(isModelProviderEnabled("opencode-cli:opencode-go/kimi-k3"), false);
+      assert.strictEqual(
+        isModelProviderEnabled("opencode-cli:openai/gpt-5"),
+        false,
+        "Zen must not authorize a saved external OpenCode CLI provider"
+      );
     } finally {
       settings.restore();
     }

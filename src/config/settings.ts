@@ -1,7 +1,10 @@
 import * as vscode from "vscode";
 import { AI_MODEL_STAGES, TaskStage } from "../types/taskProgress";
 import { FallbackStrategy, ModelSettings } from "../utils/modelFallback";
-import { normalizeQualifiedModelId, parseModelSelection } from "../runners/providers";
+import {
+  normalizeQualifiedModelId,
+  providerAccountIdForModelId,
+} from "../runners/providers";
 
 /** Settings displayed to users. Command and extension identifiers deliberately
  * retain their historical `vs-code-ai-helper` prefix for compatibility. */
@@ -387,12 +390,48 @@ export function isProviderEnabled(provider: string): boolean {
   if (provider === "copilot") {
     return enabled[provider] !== false;
   }
+  // `opencode-cli` is the shared execution adapter retained in stored model
+  // IDs. Its visible account controls are OpenCode Zen and OpenCode Go, so
+  // callers that only know the adapter should regard either enabled service
+  // as available. Model-aware callers use isModelProviderEnabled below and
+  // therefore keep the two entitlements properly separate.
+  if (provider === "opencode-cli") {
+    return enabled[provider] === true || enabled["opencode-zen"] === true || enabled["opencode-go"] === true;
+  }
   return enabled[provider] === true;
+}
+
+/** Whether the Provider Selection row governing this exact model is enabled. */
+export function isModelProviderEnabled(modelId: string | undefined): boolean {
+  const accountId = providerAccountIdForModelId(modelId);
+  if (accountId === "opencode-cli") {
+    // This is a saved model from an external OpenCode CLI namespace, not Zen
+    // or Go. Preserve legacy selections while their old checkbox exists, but
+    // never let either new service checkbox implicitly authorize it.
+    return getEnabledProviders()[accountId] === true;
+  }
+  return isProviderEnabled(accountId);
 }
 
 /** Explicit provider selection shared by Settings and runner guards. */
 export function getEnabledProviders(): Record<string, boolean> {
-  return readSetting<Record<string, boolean>>(ENABLED_PROVIDERS_KEY, {});
+  const configured = readSetting<Record<string, boolean>>(ENABLED_PROVIDERS_KEY, {});
+  // Before Zen/Go became explicit Provider Selection rows, one
+  // `opencode-cli` checkbox covered both namespaces. Preserve that prior
+  // opt-in on read so existing configured models are not suddenly blocked;
+  // the next save writes the two explicit choices and drops the legacy key.
+  if (!Object.prototype.hasOwnProperty.call(configured, "opencode-cli")) {
+    return configured;
+  }
+  return {
+    ...configured,
+    ...(configured["opencode-zen"] === undefined
+      ? { "opencode-zen": configured["opencode-cli"] }
+      : {}),
+    ...(configured["opencode-go"] === undefined
+      ? { "opencode-go": configured["opencode-cli"] }
+      : {}),
+  };
 }
 
 export async function setEnabledProviders(enabled: Record<string, boolean>): Promise<void> {
@@ -419,7 +458,7 @@ export async function migrateEnabledProvidersForExistingModels(): Promise<void> 
   for (const setting of Object.values(settings)) {
     for (const model of [setting?.primary, setting?.backup, ...(setting?.backups ?? [])]) {
       if (!model) continue;
-      enabled[parseModelSelection(model).provider] = true;
+      enabled[providerAccountIdForModelId(model)] = true;
     }
   }
   if (Object.keys(enabled).length > 0) {

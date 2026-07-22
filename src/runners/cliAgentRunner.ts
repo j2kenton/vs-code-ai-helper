@@ -568,6 +568,7 @@ export const __testOnly = {
   normalizeCliOutput,
   toCliImplementationRunResult,
   sanitizedCliEnv,
+  toFriendlyError,
 };
 
 /**
@@ -597,6 +598,7 @@ function truncateCliDetail(text: string, maxLines = 8): string {
  */
 function toFriendlyError(
   def: CliProviderDefinition,
+  model: string | undefined,
   exitCode: number | null,
   stderr: string,
   stdout: string
@@ -609,7 +611,9 @@ function toFriendlyError(
     truncateCliDetail(stderr) ||
     truncateCliDetail(stdout) ||
     `exit code ${exitCode ?? "unknown"}`;
-  const authSuffix = looksLikeAuth ? ` ${def.loginHint}` : "";
+  const authSuffix = looksLikeAuth
+    ? ` ${def.loginHintForModel?.(model) ?? def.loginHint}`
+    : "";
   return `${cliDisplayLabel(def)} CLI failed: ${detail}${authSuffix}`;
 }
 
@@ -872,7 +876,7 @@ export async function execCliAgent(options: {
         finish(classifyCliFailure({
           status: "failed",
           output,
-          errorMessage: toFriendlyError(def, code, stderr, stdout),
+          errorMessage: toFriendlyError(def, model, code, stderr, stdout),
         }));
         return;
       }

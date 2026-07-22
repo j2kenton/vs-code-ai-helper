@@ -9,10 +9,11 @@
  *  - Gemini CLI   (`gemini`) — Google account / Gemini Code Assist
  *  - Antigravity  (`agy` / `antigravity`) — Google Gemini/Antigravity CLI account
  *  - Kiro CLI     (`kiro-cli`) — AWS Kiro subscription/login
- *  - opencode     (`opencode`) — multi-provider CLI; auth is whatever
- *    upstream provider(s) the user configured via `opencode providers
- *    login` or that provider's own API-key env var, not a single vendor
- *    subscription
+ *  - OpenCode Zen / OpenCode Go (`opencode`) — two OpenCode service plans
+ *    reached through the same CLI and OpenCode account/API key. Zen models
+ *    use the `opencode/` namespace; Go models use `opencode-go/`. They have
+ *    separate billing/entitlement, so the settings UI exposes them as two
+ *    logical providers even though runs share this one CLI adapter.
  *
  * Model IDs are stored as "<provider>:<model>" (e.g. "claude-cli:sonnet",
  * "gemini-cli:default"). Bare IDs with no known provider prefix are Copilot
@@ -34,6 +35,16 @@ export type CliProviderId =
   | "kiro-cli"
   | "opencode-cli";
 export type ProviderId = "copilot" | CliProviderId;
+
+/**
+ * IDs shown in Provider Selection. Most are the same as their runner ID;
+ * OpenCode is intentionally different: Zen and Go are independently
+ * enabled/configured logical services backed by the same `opencode` binary.
+ */
+export type ProviderAccountId = ProviderId | "opencode-zen" | "opencode-go";
+
+export const OPENCODE_ZEN_ACCOUNT_ID = "opencode-zen" as const;
+export const OPENCODE_GO_ACCOUNT_ID = "opencode-go" as const;
 
 /** How a CLI run may touch the workspace. */
 export type CliRunMode = "text" | "edit";
@@ -67,6 +78,12 @@ export interface CliProviderDefinition {
   installHint: string;
   /** Shown when the CLI reports an authentication problem. */
   loginHint: string;
+  /**
+   * Optional model-specific authentication recovery guidance. OpenCode's
+   * Zen and Go model namespaces share one CLI but require different account
+   * entitlements, so a generic "sign in" hint is not enough on a 401.
+   */
+  loginHintForModel?: (model: string | undefined) => string;
   /** Substrings in CLI output that indicate an auth problem. */
   authErrorMarkers: readonly string[];
   /** Non-interactive command that reports whether this CLI is authenticated. */
@@ -750,12 +767,27 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
   },
   {
     id: "opencode-cli",
-    label: "opencode",
+    label: "OpenCode",
     command: "opencode",
     installHint:
-      "Install opencode (npm i -g opencode-ai), then run `opencode providers login` to sign in with a model provider, or set that provider's API key env var.",
+      "Install OpenCode (npm i -g opencode-ai), then run `opencode`, use `/connect`, and connect the OpenCode Zen or OpenCode Go service you intend to use.",
     loginHint:
-      "Run `opencode providers login` in a terminal and sign in with a model provider, then try again.",
+      "Run `opencode` in a terminal, use `/connect`, and connect the OpenCode service for this model, then try again.",
+    loginHintForModel(model): string {
+      if (model?.startsWith("opencode-go/")) {
+        return (
+          "OpenCode Go is unavailable to the current OpenCode account. Run `opencode` in a terminal, " +
+          "use `/connect`, choose OpenCode Go, and paste the same OpenCode API key. Confirm that the Go subscription is active, then try again."
+        );
+      }
+      if (model?.startsWith("opencode/")) {
+        return (
+          "OpenCode Zen is unavailable to the current OpenCode account. Run `opencode` in a terminal, " +
+          "use `/connect`, choose OpenCode Zen, and paste the OpenCode API key. Confirm that Zen billing is enabled, then try again."
+        );
+      }
+      return this.loginHint;
+    },
     authErrorMarkers: [
       "not logged in",
       "login",
@@ -763,30 +795,37 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
       "api key",
       "unauthorized",
       "no credentials",
+      // Zen returns this exact JSON payload for an unentitled or missing
+      // OpenCode service. Treat it like the 401 it carries so the error
+      // includes the tier-specific `/connect` recovery instructions.
+      "no provider available",
+      "401",
     ],
-    // `opencode providers list` always exits 0 (it just reports "0
-    // credentials" when nothing is configured, verified live against
-    // opencode 1.18.4) — there is no non-interactive exit-code signal for
-    // "authenticated" the way `codex login status` or `claude auth status`
-    // give one, so — like Gemini and Antigravity — this stays unset and
-    // presence on PATH is the only thing checked headlessly.
-    signInCommand: "opencode providers login",
+    // OpenCode's documented connection flow is an in-session `/connect`
+    // command. There is no non-interactive, tier-specific entitlement/status
+    // command, so presence on PATH is the only safe headless check; the
+    // Provider Selection rows below launch `/connect` with guidance for the
+    // selected service.
+    signInCommand: "opencode",
     signInLabel: "Sign in / Switch account",
     signInGuidance:
-      "Complete sign-in for a model provider in the terminal. opencode can hold credentials for " +
-      "several providers at once — run this again to add another, or use `opencode providers logout` " +
-      "to remove one first if you need to replace it.",
+      "Run `/connect` in the OpenCode terminal and select either OpenCode Zen or OpenCode Go. " +
+      "They share your OpenCode account/API key, but each service needs its own billing or subscription entitlement.",
     usageUnsupportedReason:
-      "opencode has no single quota/usage command — it proxies whichever upstream provider(s) you " +
-      "configured, so usage is billed and reported by that provider directly. `opencode stats` reports " +
-      "local token/cost totals opencode has observed, not a live remaining-quota check.",
+      "OpenCode has no non-interactive, tier-specific quota or entitlement status command. " +
+      "Check Zen billing or the Go subscription in your OpenCode account; `opencode stats` only reports local observed usage.",
     // Model IDs are "<upstream-provider>/<model>" (e.g. "openai/gpt-4o",
     // "anthropic/claude-opus-4-8") — opencode's own namespacing, distinct
     // from this extension's "<CliProviderId>:<model>" qualified-ID prefix.
     // A discovered model may additionally carry a "@<variant>" suffix (e.g.
     // "opencode/deepseek-v4-flash@high") selecting one of that specific
     // model's own reasoning-effort variants — see parseOpencodeModelSelection.
-    models: [{ model: undefined, name: "opencode (CLI default)" }],
+    // No generic CLI-default picker option: an OpenCode default could point
+    // at either Zen, Go, or an unrelated upstream provider, which would
+    // defeat the explicit service choice this integration promises. Existing
+    // saved `opencode-cli:default` selections still run for compatibility;
+    // new choices are always a concrete model in one of the two tiers.
+    models: [],
     discoverModels: discoverOpencodeModels,
     // The prompt is read from stdin when `run` is given no message argv
     // (verified live: `echo "..." | opencode run --format json -m ...`
@@ -922,7 +961,7 @@ export type ProviderSignInAction =
  * controls. Copilot is enabled by default — see isProviderEnabled.
  */
 export interface ProviderAccountEntry {
-  id: ProviderId;
+  id: ProviderAccountId;
   label: string;
   signInLabel: string;
   signIn: ProviderSignInAction;
@@ -980,8 +1019,40 @@ export const PROVIDER_ACCOUNT_ENTRIES: readonly ProviderAccountEntry[] = [
     },
     enabledByDefault: true,
   },
-  ...CLI_PROVIDERS.map((provider): ProviderAccountEntry => ({
-    id: provider.id as ProviderId,
+  {
+    id: OPENCODE_ZEN_ACCOUNT_ID,
+    label: "OpenCode Zen",
+    signInLabel: "Connect OpenCode Zen",
+    signIn: { kind: "interactive", launch: "opencode", send: "/connect", validated: "verified" },
+    signInGuidance:
+      "In the terminal, select OpenCode Zen and complete the connection with your OpenCode API key. " +
+      "Zen uses the shared OpenCode account/key, but requires Zen billing. Only `opencode/...` models use this row.",
+    usage: {
+      kind: "unsupported",
+      reason:
+        "OpenCode does not expose a non-interactive Zen billing or remaining-usage check. " +
+        "Check Zen billing in your OpenCode account; `opencode stats` is only local observed usage.",
+    },
+    enabledByDefault: false,
+  },
+  {
+    id: OPENCODE_GO_ACCOUNT_ID,
+    label: "OpenCode Go",
+    signInLabel: "Connect OpenCode Go",
+    signIn: { kind: "interactive", launch: "opencode", send: "/connect", validated: "verified" },
+    signInGuidance:
+      "In the terminal, select OpenCode Go and paste the same OpenCode API key. " +
+      "Go requires an active Go subscription. Only `opencode-go/...` models use this row; enabling Zen does not enable Go.",
+    usage: {
+      kind: "unsupported",
+      reason:
+        "OpenCode does not expose a non-interactive Go subscription or remaining-usage check. " +
+        "Confirm the Go subscription in your OpenCode account; `opencode stats` is only local observed usage.",
+    },
+    enabledByDefault: false,
+  },
+  ...CLI_PROVIDERS.filter((provider) => provider.id !== "opencode-cli").map((provider): ProviderAccountEntry => ({
+    id: provider.id,
     label: provider.label,
     signInLabel: provider.signInLabel,
     // Sign-in dispatch: an in-session flow (Claude's /login) launches the
@@ -1094,6 +1165,37 @@ export function parseModelSelection(
     }
   }
   return { provider: "copilot", model: modelId };
+}
+
+/**
+ * Resolve the Provider Selection row that governs a stored model ID.
+ *
+ * `opencode-cli` remains the one execution adapter and storage prefix for
+ * compatibility, but its native model namespace identifies the OpenCode
+ * service that will actually bill and authorize the request. Only the
+ * `opencode/` and `opencode-go/` namespaces are those services; other
+ * OpenCode CLI namespaces are external upstream providers and must not be
+ * misrepresented as Zen. Keeping this mapping next to storage parsing
+ * prevents runner guards, model filtering, and the settings UI from each
+ * guessing a tier differently.
+ */
+export function providerAccountIdForModelId(
+  modelId: string | undefined
+): ProviderAccountId {
+  const parsed = parseModelSelection(modelId);
+  if (parsed.provider !== "opencode-cli") {
+    return parsed.provider;
+  }
+  if (parsed.model?.startsWith("opencode-go/")) {
+    return OPENCODE_GO_ACCOUNT_ID;
+  }
+  if (parsed.model?.startsWith("opencode/")) {
+    return OPENCODE_ZEN_ACCOUNT_ID;
+  }
+  // Retain the legacy adapter ID for saved external-provider selections.
+  // It deliberately has no visible Provider Selection row: new picker
+  // choices are limited to the explicitly supported Zen/Go services.
+  return "opencode-cli";
 }
 
 /** Build the qualified model ID stored in settings/task files. */

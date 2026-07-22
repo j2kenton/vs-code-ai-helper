@@ -19,18 +19,23 @@ import {
   cliDisplayLabel,
   CliProviderDefinition,
   getCliProvider,
+  getProviderAccountEntry,
   normalizeQualifiedModelId,
   parseModelSelection,
+  providerAccountIdForModelId,
   ProviderId,
 } from "./providers";
 import {
   getModelSettings,
-  isProviderEnabled,
+  isModelProviderEnabled,
   isProviderSelectionConfigured,
 } from "../config/settings";
 import { chooseFallback, getBackupModels } from "../utils/modelFallback";
 import { recordQuotaObservation } from "../utils/quota";
-import { patchTaskProgress } from "../utils/taskProgressUtils";
+import {
+  clearStageFallbackReservation,
+  patchTaskProgress,
+} from "../utils/taskProgressUtils";
 import { TaskStage } from "../types/taskProgress";
 
 type EffectiveProvider =
@@ -67,10 +72,10 @@ type EffectiveProvider =
  * additionally opens the AI Models view; this one is the last line of
  * defense for paths that never went through a guarded command entry point.
  */
-function isModelProviderDisabled(provider: ProviderId): boolean {
+function isModelProviderDisabled(modelId: string | undefined): boolean {
   // Copilot is not exempt: isProviderEnabled treats it as enabled unless the
   // user explicitly disables it in Provider Selection.
-  return isProviderSelectionConfigured() && !isProviderEnabled(provider);
+  return isProviderSelectionConfigured() && !isModelProviderEnabled(modelId);
 }
 
 function resolveEffectiveProvider(
@@ -80,9 +85,10 @@ function resolveEffectiveProvider(
   if (parsed.provider !== "copilot") {
     const def = getCliProvider(parsed.provider);
     if (def) {
-      if (isModelProviderDisabled(def.id)) {
+      if (isModelProviderDisabled(modelId)) {
+        const account = getProviderAccountEntry(providerAccountIdForModelId(modelId));
         throw new Error(
-          `The selected model ("${modelId}") belongs to ${def.label}, which is disabled in Provider Selection. ` +
+          `The selected model ("${modelId}") belongs to ${account?.label ?? def.label}, which is disabled in Provider Selection. ` +
             "Enable the provider or choose another model in AI Models."
         );
       }
@@ -141,7 +147,7 @@ function toResolvedRunner(effective: EffectiveProvider): ResolvedRunner {
  * route around the runner-entry guard above. */
 function filterEnabledBackupModels(models: readonly string[]): string[] {
   return models.filter(
-    (candidate) => !isModelProviderDisabled(parseModelSelection(candidate).provider)
+    (candidate) => !isModelProviderDisabled(candidate)
   );
 }
 
@@ -377,6 +383,36 @@ async function reserveFallback(
 }
 
 /**
+ * Release the short-lived fallback reservation when no backup actually
+ * completed. `reserveFallback` writes an active flag before a backup starts
+ * so concurrent runs cannot spend the same backup allocation. That flag must
+ * not outlive a failed, cancelled, or unauthenticated backup: model resolution
+ * would otherwise treat the failed backup as the stage's preferred route.
+ *
+ * A named fallback model is retained deliberately. It can only have been
+ * written after a completed backup, either by this run or a concurrent run
+ * that won the reservation, and is therefore a valid route to preserve.
+ */
+async function releaseUnresolvedFallbackReservation(
+  taskFolderUri: vscode.Uri,
+  stage: TaskStage,
+  expectedReviewAttemptId?: string
+): Promise<void> {
+  await patchTaskProgress(taskFolderUri, (current) => {
+    if (
+      expectedReviewAttemptId !== undefined &&
+      current.reviewAttemptId !== expectedReviewAttemptId
+    ) {
+      return current;
+    }
+    if (!current.fallbackActive?.[stage] || current.fallbackModelId?.[stage]) {
+      return current;
+    }
+    return clearStageFallbackReservation(current, stage);
+  });
+}
+
+/**
  * Resolve the runner responsible for a stored stage model ID (plan/review
  * stages — see resolveEffectiveProvider for the auto-detection rules).
  * `expectedReviewAttemptId` makes fallback reservation and routing writes
@@ -413,6 +449,12 @@ export function resolveRunnerForModel(
         (await checkRunnerAvailabilityForModel(modelId, stage)).availability,
       async run(request, token): Promise<AgentRunResult> {
         const runBackups = async (): Promise<AgentRunResult> => {
+          const releaseReservation = (): Promise<void> =>
+            releaseUnresolvedFallbackReservation(
+              taskFolderUri ?? request.taskFolderUri,
+              stage,
+              expectedReviewAttemptId
+            );
           let last: AgentRunResult | undefined;
           for (const backupModel of backupModels) {
             const fallback = toResolvedRunner(resolveEffectiveProvider(backupModel));
@@ -428,6 +470,7 @@ export function resolveRunnerForModel(
               };
               recordQuotaObservation(stage, backupModel, last.failureKind, last.errorMessage);
               if (isAuthenticationFailure(fallbackAvailability.reason)) {
+                await releaseReservation();
                 return last;
               }
               continue;
@@ -435,10 +478,7 @@ export function resolveRunnerForModel(
             const fallbackResult = await fallback.runner.run({ ...request, modelId: fallback.nativeModelId }, token);
             recordQuotaObservation(stage, backupModel, fallbackResult.failureKind, fallbackResult.errorMessage);
             last = fallbackResult;
-            if (
-              fallbackResult.failureKind !== "quota" &&
-              fallbackResult.failureKind !== "temporarily-unavailable"
-            ) {
+            if (fallbackResult.status === "completed") {
               await recordActiveFallbackModel(
                 taskFolderUri ?? request.taskFolderUri,
                 stage,
@@ -447,7 +487,19 @@ export function resolveRunnerForModel(
               );
               return fallbackResult;
             }
+            // A generic failure (including an auth error) and a user
+            // cancellation are terminal for this run, but neither makes this
+            // backup a known-good route for later runs.
+            if (
+              fallbackResult.status === "cancelled" ||
+              (fallbackResult.failureKind !== "quota" &&
+                fallbackResult.failureKind !== "temporarily-unavailable")
+            ) {
+              await releaseReservation();
+              return fallbackResult;
+            }
           }
+          await releaseReservation();
           return last ?? { runnerId: primary.id, status: "failed", failureKind: "temporarily-unavailable", errorMessage: "No backup model is available." };
         };
         const availability = await primary.isAvailable();
@@ -609,6 +661,8 @@ export async function runImplementationForModel(options: {
     if (!reserved) {
       return result;
     }
+    const releaseReservation = (): Promise<void> =>
+      releaseUnresolvedFallbackReservation(options.taskFolderUri!, options.stage!);
     for (const backupModel of filterEnabledBackupModels(getBackupModels(setting))) {
       if (backupModel === options.modelId) {
         continue;
@@ -626,17 +680,14 @@ export async function runImplementationForModel(options: {
         };
         recordQuotaObservation(options.stage, backupModel, fallbackFailure.failureKind, fallbackFailure.errorMessage);
         if (isAuthenticationFailure(fallbackAvailability.availability.reason)) {
+          await releaseReservation();
           return fallbackFailure;
         }
         continue;
       }
       const fallbackResult = await run(resolveEffectiveProvider(backupModel));
       recordQuotaObservation(options.stage, backupModel, fallbackResult.failureKind, fallbackResult.errorMessage);
-      if (
-        fallbackResult.status !== "failed" ||
-        (fallbackResult.failureKind !== "quota" &&
-          fallbackResult.failureKind !== "temporarily-unavailable")
-      ) {
+      if (fallbackResult.status === "completed") {
         await recordActiveFallbackModel(
           options.taskFolderUri,
           options.stage,
@@ -644,7 +695,19 @@ export async function runImplementationForModel(options: {
         );
         return fallbackResult;
       }
+      // A failed/cancelled backup cannot be the stage's sticky fallback.
+      // In particular, this prevents an OpenCode 401 from routing every
+      // later implementation attempt to the same unauthenticated model.
+      if (
+        fallbackResult.status === "cancelled" ||
+        (fallbackResult.failureKind !== "quota" &&
+          fallbackResult.failureKind !== "temporarily-unavailable")
+      ) {
+        await releaseReservation();
+        return fallbackResult;
+      }
     }
+    await releaseReservation();
   }
   return result;
 }
