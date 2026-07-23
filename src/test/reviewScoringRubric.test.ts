@@ -5,6 +5,7 @@ import { after, before, describe, it } from "node:test";
 import * as vscode from "vscode";
 import { renderPromptTemplate } from "../utils/promptTemplates";
 import { meetsAutoAdvanceThreshold, parseReadiness } from "../utils/reviewReadiness";
+import { REVIEW_RUBRIC_BLOCKER_SCORE_CAP } from "../utils/reviewRouting";
 
 const PROMPTS_DIR = path.resolve(__dirname, "../../resources/prompts");
 const RUBRIC_PLACEHOLDER = "{{reviewScoringRubric}}";
@@ -163,6 +164,28 @@ void describe("review scoring rubric", () => {
 
     void it("contains no workflow or gating language", () => {
       assert.match(rubricText, /does not authorize or prohibit any workflow action/);
+    });
+
+    void it("keeps the prose blocker-score cap in sync with REVIEW_RUBRIC_BLOCKER_SCORE_CAP", () => {
+      // reviewActions.ts's Fast Forward "target not reached" explanation
+      // (rubricCapLikelyBlockedAdvance) quotes this cap as a number — if this
+      // sentence is ever reworded to a different threshold, the constant
+      // must move with it or the explanation becomes actively wrong.
+      assert.strictEqual(REVIEW_RUBRIC_BLOCKER_SCORE_CAP, 7);
+      assert.match(
+        rubricText,
+        new RegExp(`keep the score at ${REVIEW_RUBRIC_BLOCKER_SCORE_CAP} or below`)
+      );
+    });
+
+    void it("classifies a blocker depending on an external party as unverifiable, not task-fixable", () => {
+      // The rubric's own scope-creep example: a reviewer that invents an
+      // approval gate or third-party evidence requirement and then defaults
+      // it to task-fixable traps the review loop forever, since no amount of
+      // re-implementing the task's code can produce someone else's approval.
+      assert.match(rubricText, /depends on something outside the task's own code/);
+      assert.match(rubricText, /approval/);
+      assert.match(rubricText, /credential or account entitlement/);
     });
   });
 

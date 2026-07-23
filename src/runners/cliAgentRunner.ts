@@ -14,7 +14,7 @@ import {
 import { withAttribution, writeTextFile } from "../utils/fileUtils";
 import { ImplementationRunResult } from "./copilotImplementationRunner";
 import { cliDisplayLabel, CliProviderDefinition, CliRunMode } from "./providers";
-import { classifyCliFailure } from "../utils/quota";
+import { classifyCliFailure, isAuthenticationFailure, isTransportError } from "../utils/quota";
 import { writeRunLog } from "../utils/runLog";
 import { taskOperations } from "../utils/taskOperations";
 import {
@@ -177,31 +177,23 @@ const TOOL_OR_EDIT_EVENT_PATTERN =
 /**
  * Parse a CLI's raw stdout as a JSON-lines event stream and report whether
  * one was present and whether it contained tool-use/file-edit activity.
- * Exported for direct unit testing of the retry-evidence matrix.
+ * Exported for direct unit testing of the retry-evidence matrix. Built on
+ * parseJsonLineEvents (defined below — hoisted, so the forward reference is
+ * fine) rather than re-implementing its own parse loop: re-serializing each
+ * already-parsed event and pattern-matching that is equivalent to matching
+ * the original raw line (JSON.parse then JSON.stringify preserves key order
+ * and string contents; only whitespace could differ, which the pattern
+ * already tolerates via `\s*`), without a second hand-written copy of the
+ * strip/split/shape-check/parse loop to keep in sync.
  */
 export function analyzeCliEventStream(stdoutRaw: string): CliEditEventEvidence {
-  let streamAvailable = false;
-  let sawToolOrEditEvent = false;
-  for (const line of stripAnsi(stdoutRaw).split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) {
-      continue;
-    }
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(trimmed);
-    } catch {
-      continue;
-    }
-    if (!parsed || typeof parsed !== "object") {
-      continue;
-    }
-    streamAvailable = true;
-    if (TOOL_OR_EDIT_EVENT_PATTERN.test(trimmed)) {
-      sawToolOrEditEvent = true;
-    }
-  }
-  return { streamAvailable, sawToolOrEditEvent };
+  const { events } = parseJsonLineEvents(stdoutRaw);
+  return {
+    streamAvailable: events.length > 0,
+    sawToolOrEditEvent: events.some((event) =>
+      TOOL_OR_EDIT_EVENT_PATTERN.test(JSON.stringify(event))
+    ),
+  };
 }
 
 export interface EditRetryDecision {
@@ -335,13 +327,52 @@ export interface CliExecResult {
   /** Set on failed results; absent for completed/cancelled. */
   failureKind?: "quota" | "temporarily-unavailable" | "generic";
   /**
-   * True when the failure is a transient transport-level condition (a run
-   * timeout) that is in principle retryable. Auth errors, non-zero tool
-   * exits, and content errors are never marked transient.
+   * True when the failure is a transient transport-level condition — a run
+   * timeout, or a mid-stream transport drop — that is in principle retryable.
+   * Auth errors, non-zero tool exits, and content errors are never marked
+   * transient. A run timeout sets this for BOTH modes (evaluateEditRetryEligibility
+   * is what actually gates whether an edit run may retry on it). A mid-stream
+   * transport drop, by contrast, is promoted to transient for read-only (text)
+   * runs ONLY: unlike a killed-after-buffering-everything timeout, a dropped
+   * stream is TRUNCATED, so the absence of tool/edit events in it proves
+   * nothing about whether files were already changed — see applyTransportTransience.
    */
   transient?: boolean;
-  /** Event-stream evidence captured for transient (timeout) failures. */
+  /**
+   * Event-stream evidence captured for timed-out runs. Deliberately NOT
+   * populated for transport drops: a truncated stream would look like a clean
+   * one to evaluateEditRetryEligibility.
+   */
   editEvidence?: CliEditEventEvidence;
+  /**
+   * The provider's own authErrorMarkers verdict, captured BEFORE the login
+   * hint is appended to errorMessage. Exists because that hint text itself
+   * contains the phrase "paste the OpenCode API key", which the downstream
+   * isAuthenticationFailure regex then matches — so an error that tripped a
+   * false-positive auth diagnosis was guaranteed to be re-confirmed as an auth
+   * failure by the very hint Ensemble added to explain it.
+   */
+  authFailure?: boolean;
+  /** errorMessage minus the appended login hint: the form safe to classify. */
+  authDiagnosticText?: string;
+}
+
+/**
+ * Everything toFriendlyError learned while rendering a failure. Returned as a
+ * struct rather than a bare string because the auth verdict used to be a local
+ * boolean that was collapsed into prose and thrown away, forcing downstream to
+ * re-derive it by regexing the returned message — which by then contained the
+ * login hint this function had just appended.
+ */
+interface CliFriendlyError {
+  /** User-facing message, login hint appended when authFailure is true. */
+  message: string;
+  /** Provider-marker verdict, computed BEFORE any hint is injected. */
+  authFailure: boolean;
+  /** `message` minus the hint — the classification-safe form of the same text. */
+  diagnosticText: string;
+  /** True when the provider's own error channel said the failure is retryable. */
+  retryableHint: boolean;
 }
 
 /** Bounded retry policy for transient CLI failures (timeouts). */
@@ -350,11 +381,11 @@ export const CLI_RETRY_DELAY_MS = 5_000;
 
 /**
  * The read-only (text-mode) retry rule (exported for direct unit testing):
- * retry only a failure classified transient — a run timeout; auth errors,
- * non-zero tool exits, and content errors are never marked transient — while
- * attempts remain and the run has not been cancelled. Read-only runs are
- * side-effect free by construction, so unlike edit runs no further evidence
- * is required.
+ * retry only a failure classified transient — a run timeout or a mid-stream
+ * transport drop; auth errors, non-zero tool exits, and content errors are
+ * never marked transient — while attempts remain and the run has not been
+ * cancelled. Read-only runs are side-effect free by provider permission
+ * configuration, so unlike edit runs no further evidence is required.
  */
 export function shouldRetryReadOnlyRun(
   result: Pick<CliExecResult, "status" | "transient">,
@@ -367,6 +398,81 @@ export function shouldRetryReadOnlyRun(
     attempt < CLI_RETRY_MAX_ATTEMPTS &&
     !cancellationRequested
   );
+}
+
+/**
+ * Promote a mid-stream transport drop from "generic" (terminal at both backup
+ * cascade gates) to "temporarily-unavailable" (cascade-eligible) — but only
+ * where doing so is actually safe. See the guards below for what "safe"
+ * excludes; this is intentionally the ONLY place TRANSPORT_MARKERS-style
+ * transport detection happens (classifyFailure/quota.ts deliberately does not
+ * do this itself — see its own comment), because this function is the only
+ * one with the provider and mode context needed to gate it correctly.
+ */
+function applyTransportTransience(
+  result: CliExecResult & { failureKind: "quota" | "temporarily-unavailable" | "generic" },
+  friendly: CliFriendlyError,
+  mode: CliRunMode,
+  def: CliProviderDefinition
+): CliExecResult {
+  // An authentication failure is terminal for the selected provider and must
+  // stay that way. This guard is load-bearing rather than defensive: the
+  // text-mode cascade gate in runnerRegistry checks failureKind ONLY and has no
+  // auth check of its own, so promoting an auth error here would start spending
+  // backup-model allocations on a credentials problem — exactly what callers
+  // must never do.
+  //
+  // Checks both signals, same as runnerRegistry's own gate: friendly.authFailure
+  // is only the provider's OWN authErrorMarkers verdict, which is narrower than
+  // isAuthenticationFailure's regex (e.g. claude-cli carries no 401/403/forbidden
+  // marker) — a 403 Forbidden that also happens to mention a transport phrase
+  // would otherwise pass this guard and get retried/cascaded as if it were a
+  // dropped connection instead of a credentials problem.
+  if (friendly.authFailure || isAuthenticationFailure(friendly.diagnosticText)) {
+    return result;
+  }
+  // Only promote from "generic": quota and (auth-gated) TEMPORARY_MARKERS
+  // classifications from classifyFailure are left exactly as they are.
+  if (result.failureKind !== "generic") {
+    return result;
+  }
+  // Edit-mode runs may have already written partial changes. The same-model
+  // retry path (evaluateEditRetryEligibility) refuses to retry without a
+  // clean git snapshot — but the backup CASCADE (runnerRegistry.ts) has no
+  // equivalent gate at all: it dispatches a different model at the current
+  // (possibly half-edited) working tree the moment failureKind is
+  // quota/temporarily-unavailable, with nothing checking whether the primary
+  // left it dirty. Promoting an edit-mode transport drop here would spend
+  // that ungated cascade on exactly the tree state its same-model sibling
+  // refuses to touch — a strictly worse hazard than the retry withheld below.
+  // Restricted to text mode (which never writes files, so no such risk
+  // exists) until the cascade itself gains real dirty-tree gating — a
+  // separate, larger fix than this one.
+  if (mode !== "text") {
+    return result;
+  }
+  // retryableHint is a structural signal (the provider's own error event
+  // reported isRetryable) and safe for any provider. Text-based matching via
+  // isTransportError is safe ONLY for structured-stream providers, whose
+  // diagnosticText is scoped to parsed error events and never raw stdout
+  // (see toFriendlyError) — for opaque-text providers (kiro-cli, codex-cli),
+  // diagnosticText IS raw stdout/model prose, and a transport phrase
+  // appearing in ordinary output would falsely promote (and retry) a
+  // deterministic failure. Opaque providers simply never set retryableHint,
+  // since they have no structured field to report it from — this is not an
+  // extra branch for them, just the natural result of the OR.
+  const transport =
+    friendly.retryableHint ||
+    (def.structuredEventStream !== undefined && isTransportError(friendly.diagnosticText));
+  if (!transport) {
+    return result;
+  }
+  return {
+    ...result,
+    failureKind: "temporarily-unavailable",
+    // mode is guaranteed "text" here (checked above).
+    transient: true,
+  };
 }
 
 /** Cancellable delay between retry attempts. */
@@ -478,7 +584,299 @@ function extractKiroFinalOutput(stdout: string): string {
 const OPENCODE_NO_TEXT_REPLY_PLACEHOLDER =
   "(opencode completed the run without returning any text reply.)";
 
-function extractOpencodeFinalOutput(stdout: string): string {
+/**
+ * Unwrap one level of JSON string encoding. opencode double-encodes some error
+ * messages — a captured production failure carried
+ * `"data":{"message":"\"Streaming response failed\""}`, i.e. the value is a
+ * JSON string whose content is itself a quoted string — so the raw value
+ * arrives with literal quote characters around it and would not match a
+ * transport marker.
+ *
+ * Single-level and string-results-only by design: never recurse, because a
+ * legitimate `responseBody` is itself quoted JSON and unwrapping it would
+ * discard structure rather than reveal it.
+ */
+function unwrapJsonString(value: string): string {
+  const trimmed = value.trim();
+  if (trimmed.length < 2 || !trimmed.startsWith('"') || !trimmed.endsWith('"')) {
+    return value;
+  }
+  try {
+    const parsed: unknown = JSON.parse(trimmed);
+    return typeof parsed === "string" ? parsed : value;
+  } catch {
+    return value;
+  }
+}
+
+interface ParsedCliEventLines {
+  /** Every line that parsed as a JSON object. */
+  events: Record<string, unknown>[];
+  /**
+   * Text from every line that did NOT parse as a JSON object — i.e. content
+   * no recognized event captured. Distinct from "no events were seen at
+   * all" (events.length === 0): a stream can contain SOME legitimate events
+   * (a few tool/text events, say) and then die writing a plain-text failure
+   * straight to stdout instead of a structured error event. A fallback
+   * gated on "did we see any event at all" would incorrectly suppress that
+   * trailing text — the right question is "was THIS content captured by
+   * any event", which is what this field answers directly.
+   *
+   * Includes lines that LOOK like a cut-off event object (start with "{" but
+   * never finished parsing) — safe for `detail` (a user-facing message can
+   * afford to show a partial line), but NOT safe for markerScanText: a
+   * mid-stream transport drop truncates whatever line was being written,
+   * which for a JSON-lines event stream is exactly a tool/text event, and a
+   * partial write of one can carry the same embedded file content
+   * extractStructuredCliDiagnostics exists to keep out of the auth scan. See
+   * unparsedScanSafeText for the subset actually safe to scan.
+   */
+  unparsedText: string;
+  /**
+   * Subset of unparsedText from lines that never even looked like a JSON
+   * object (don't start with "{") — plain text a CLI wrote outside the event
+   * stream entirely (e.g. before it enters --format json mode, or after a
+   * crash bypasses it). A truncated write always cuts off a line that WAS
+   * mid-way through being written as an event, so it necessarily starts with
+   * "{"; a line that never starts with "{" therefore cannot be a partial
+   * tool/text event, and is safe to include in markerScanText.
+   */
+  unparsedScanSafeText: string;
+}
+
+/**
+ * Strip ANSI escapes and parse a CLI's raw stdout as JSON-lines events.
+ * Shared by extractOpencodeFinalOutput and extractStructuredCliDiagnostics,
+ * which both accept an already-parsed result via their optional second
+ * parameter — execCliAgent's close handler parses once and passes it to
+ * both, since a failing opencode run's stream can be multi-megabyte (it
+ * re-emits the full text of every file the agent read), and parsing it
+ * twice for two different purposes is pure waste. Callers that don't have
+ * (or don't need) a shared result — every existing test, and any future
+ * direct caller — get identical behavior by omitting it, since the default
+ * parameter parses internally.
+ */
+function parseJsonLineEvents(stdout: string): ParsedCliEventLines {
+  const events: Record<string, unknown>[] = [];
+  const unparsed: string[] = [];
+  const unparsedScanSafe: string[] = [];
+  for (const rawLine of stripAnsi(stdout).split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) {
+      continue;
+    }
+    if (!line.startsWith("{")) {
+      // Never a truncated/malformed event write — see unparsedScanSafeText's
+      // doc comment on the interface above.
+      unparsed.push(line);
+      unparsedScanSafe.push(line);
+      continue;
+    }
+    if (!line.endsWith("}")) {
+      // Looks like a cut-off event write (e.g. a mid-stream transport drop)
+      // — may carry partial tool/text-event content. Safe for `detail`,
+      // NOT safe for markerScanText.
+      unparsed.push(line);
+      continue;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(line);
+    } catch {
+      // Starts and ends with brace-like characters but still didn't parse —
+      // an unverified shape, treated the same as a cut-off event rather
+      // than assumed safe.
+      unparsed.push(line);
+      continue;
+    }
+    if (parsed && typeof parsed === "object") {
+      events.push(parsed as Record<string, unknown>);
+    } else {
+      // Parsed successfully but wasn't actually an object (e.g. a bare JSON
+      // string or number on its own line) — genuinely not an event, safe to
+      // scan.
+      unparsed.push(line);
+      unparsedScanSafe.push(line);
+    }
+  }
+  return {
+    events,
+    unparsedText: unparsed.join("\n"),
+    unparsedScanSafeText: unparsedScanSafe.join("\n"),
+  };
+}
+
+interface StructuredCliDiagnostics {
+  /** Everything extractable, for authErrorMarkers matching only. */
+  markerScanText: string;
+  /** Human-readable summary, for the user-facing error message. */
+  detail: string;
+  /** Any error event reported the failure as retryable. */
+  retryable: boolean;
+  /** Whether stdout parsed as a JSON-lines event stream at all. */
+  sawAnyEvent: boolean;
+}
+
+/**
+ * Pull just the diagnosable content out of a structured (JSON-lines) CLI event
+ * stream: the stream's own "error" events, plus any trailing content no event
+ * captured — and nothing else.
+ *
+ * The "and nothing else" is the whole point. opencode's --format json stream
+ * embeds the full text of every file the agent reads inside its tool events, so
+ * scanning the raw stream for markers like "api key" / "login" / "authenticate"
+ * diagnoses an auth failure whenever the agent happened to read an auth-related
+ * source file. Only type === "error" events are read from `events`; text and
+ * tool events are skipped entirely — their content is exactly the risk this
+ * function exists to avoid. `unparsedScanSafeText` (lines that never even
+ * looked like a JSON object — see parseJsonLineEvents) is safe to include in
+ * markerScanText unconditionally, for the same reason: it cannot be a
+ * tool/text event's embedded content. The wider `unparsedText` ALSO includes
+ * lines that looked like a cut-off event but never finished parsing — e.g. a
+ * mid-stream transport drop truncates whatever line was being written, which
+ * for this stream shape is exactly a tool/text event — so it is used for
+ * `detail` only, never for the auth scan.
+ *
+ * Three separated products, because they have three different consumers:
+ *  - markerScanText feeds def.authErrorMarkers ONLY. It must include the status
+ *    code: a genuine balance-exhausted 401 from opencode reads "Insufficient
+ *    balance. Manage your billing here: ..." and matches none of opencode's
+ *    auth markers — the statusCode is the only auth signal it carries.
+ *  - detail feeds the user-facing message, and therefore classifyFailure's
+ *    input. responseBody is deliberately EXCLUDED from it: a 401 body can
+ *    contain "CreditsError", which lowercases into the "credits" quota marker
+ *    and would silently reclassify a credentials problem as a quota event.
+ *  - retryable is the structural transient signal, stronger than matching
+ *    transport phrases — though absent from the error shapes that carry no
+ *    such field, which is why TRANSPORT_MARKERS still exists (in
+ *    applyTransportTransience, not here).
+ */
+function extractStructuredCliDiagnostics(
+  stdout: string,
+  parsed: ParsedCliEventLines = parseJsonLineEvents(stdout)
+): StructuredCliDiagnostics {
+  const { events, unparsedText, unparsedScanSafeText } = parsed;
+  const scan: string[] = [];
+  const details: string[] = [];
+  let retryable = false;
+  // Any parsed object counts, regardless of whether it turns out to be an
+  // "error" event below — distinct from extractOpencodeFinalOutput's own
+  // narrower sawRecognizedEvent (which additionally requires a string
+  // `type` field), since the two functions use this signal for different
+  // purposes and must not be conflated.
+  const sawAnyEvent = events.length > 0;
+
+  for (const rawEvent of events) {
+    const event = rawEvent as { type?: unknown; error?: unknown };
+    if (event.type !== "error") {
+      continue;
+    }
+
+    const err = event.error;
+    if (!err || typeof err !== "object") {
+      // Unrecognized error-event shape (a future opencode version).
+      // Re-serialize rather than silently dropping a real failure — an
+      // error event never carries file contents, so this is safe.
+      const line = JSON.stringify(rawEvent);
+      scan.push(line);
+      details.push(line);
+      continue;
+    }
+
+    const errorObject = err as { name?: unknown; data?: unknown };
+    const name =
+      typeof errorObject.name === "string" ? errorObject.name : undefined;
+    if (name) {
+      scan.push(name);
+    }
+
+    const data = errorObject.data;
+    if (data && typeof data === "object") {
+      const fields = data as Record<string, unknown>;
+      const scanLengthBefore = scan.length;
+      let message: string | undefined;
+      let statusCode: number | undefined;
+
+      if (typeof fields.message === "string") {
+        message = unwrapJsonString(fields.message);
+        scan.push(message);
+      }
+      // "status" is another spelling of the same thing across error shapes.
+      // Only the delimited "HTTP 401" form is pushed — a bare number would
+      // let opencode's bare "401" marker match a coincidental substring
+      // inside an unrelated field (e.g. responseBody echoing a request id
+      // like "req_9401f2"). "HTTP 401" still contains "401" as a substring,
+      // so a provider marker of either form still matches it.
+      for (const key of ["statusCode", "status"] as const) {
+        const value = fields[key];
+        if (typeof value === "number") {
+          statusCode = statusCode ?? value;
+          scan.push(`HTTP ${value}`);
+        }
+      }
+      if (typeof fields.providerID === "string") {
+        scan.push(fields.providerID);
+      }
+      if (typeof fields.responseBody === "string") {
+        scan.push(fields.responseBody);
+      }
+      if (typeof fields.isRetryable === "boolean") {
+        scan.push(`isRetryable=${String(fields.isRetryable)}`);
+        if (fields.isRetryable) {
+          retryable = true;
+        }
+      }
+      // Several error shapes carry no fields at all, or only an opaque one, so
+      // fall back to the whole data object rather than extracting nothing.
+      if (scan.length === scanLengthBefore) {
+        scan.push(JSON.stringify(fields));
+      }
+
+      // Same exclusion as markerScanText vs. detail above: responseBody can
+      // contain "CreditsError"-style text that would silently reclassify
+      // this failure as a quota event once it reaches classifyFailure via
+      // `detail`. Only this text-fallback copy needs it stripped — scan's
+      // own JSON.stringify(fields) fallback above feeds markerScanText, not
+      // detail, so responseBody there is intentional and unchanged.
+      const { responseBody: _responseBody, ...fieldsForDetail } = fields;
+      const text =
+        [name, message].filter((part): part is string => Boolean(part)).join(": ") ||
+        name ||
+        JSON.stringify(fieldsForDetail);
+      details.push(
+        statusCode === undefined ? text : `${text} (HTTP ${statusCode})`
+      );
+    } else if (typeof data === "string") {
+      const text = unwrapJsonString(data);
+      scan.push(text);
+      details.push(name ? `${name}: ${text}` : text);
+    } else if (name) {
+      details.push(name);
+    }
+  }
+
+  return {
+    // unparsedScanSafeText is always safe to append: by construction it
+    // never came from a line that even looked like a JSON object, so it
+    // cannot be a truncated tool/text-event's embedded file content — see
+    // the interface doc. Deliberately narrower than unparsedText here: a
+    // cut-off event write is exactly the risk this scan must exclude.
+    markerScanText: [scan.join("\n"), unparsedScanSafeText].filter(Boolean).join("\n"),
+    // Fallback only (not always-appended): when a real error event WAS
+    // found, the user-facing message should stay that specific text rather
+    // than being diluted with unrelated trailing content. Uses the wider
+    // unparsedText — a partial line is still worth showing the user even
+    // though it isn't safe to auth-scan.
+    detail: details.join("\n") || unparsedText,
+    retryable,
+    sawAnyEvent,
+  };
+}
+
+function extractOpencodeFinalOutput(
+  stdout: string,
+  parsed: ParsedCliEventLines = parseJsonLineEvents(stdout)
+): string {
   const cleaned = stripAnsi(stdout).trim();
   if (cleaned.length === 0) {
     return cleaned;
@@ -486,21 +884,8 @@ function extractOpencodeFinalOutput(stdout: string): string {
 
   const textParts: string[] = [];
   let sawRecognizedEvent = false;
-  for (const rawLine of cleaned.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line.startsWith("{") || !line.endsWith("}")) {
-      continue;
-    }
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(line);
-    } catch {
-      continue;
-    }
-    if (!parsed || typeof parsed !== "object") {
-      continue;
-    }
-    const event = parsed as {
+  for (const rawEvent of parsed.events) {
+    const event = rawEvent as {
       type?: unknown;
       part?: { type?: unknown; text?: unknown };
     };
@@ -536,7 +921,8 @@ function extractOpencodeFinalOutput(stdout: string): string {
 function normalizeCliOutput(
   def: CliProviderDefinition,
   stdout: string,
-  lastMessageFile: string | undefined
+  lastMessageFile: string | undefined,
+  parsed?: ParsedCliEventLines
 ): string {
   let output = stripAnsi(stdout).trim();
   if (lastMessageFile) {
@@ -555,7 +941,14 @@ function normalizeCliOutput(
   }
 
   if (def.id === "opencode-cli") {
-    return extractOpencodeFinalOutput(output);
+    // parsed (when the caller already parsed stdout for another purpose) is
+    // only valid to reuse here when lastMessageFile didn't override output —
+    // opencode never sets usesLastMessageFile, so output is always derived
+    // from stdout for this provider and the shared parse stays correct.
+    // Passing `parsed` even when undefined is fine: extractOpencodeFinalOutput's
+    // own default parameter already parses internally in that case — an
+    // explicit undefined argument triggers a default the same as omitting it.
+    return extractOpencodeFinalOutput(output, parsed);
   }
 
   return output;
@@ -565,10 +958,15 @@ export const __testOnly = {
   stripAnsi,
   extractKiroFinalOutput,
   extractOpencodeFinalOutput,
+  extractStructuredCliDiagnostics,
+  parseJsonLineEvents,
+  unwrapJsonString,
+  applyTransportTransience,
   normalizeCliOutput,
   toCliImplementationRunResult,
   sanitizedCliEnv,
   toFriendlyError,
+  truncateCliDetail,
 };
 
 /**
@@ -582,39 +980,133 @@ export const __testOnly = {
  * and costs nothing for CLIs whose meaningful message is on the last line
  * instead (e.g. a Python-style traceback), since the tail is kept either way.
  */
-function truncateCliDetail(text: string, maxLines = 8): string {
+function truncateCliDetail(text: string, maxLines = 8, maxChars = 4000): string {
   const lines = text.trim().split(/\r?\n/);
+  let byLines: string;
   if (lines.length <= maxLines) {
-    return lines.join("\n").trim();
+    byLines = lines.join("\n").trim();
+  } else {
+    const head = lines[0]!;
+    const tail = lines.slice(-(maxLines - 1));
+    byLines = (tail.includes(head) ? tail : [head, ...tail]).join("\n").trim();
   }
-  const head = lines[0]!;
-  const tail = lines.slice(-(maxLines - 1));
-  return (tail.includes(head) ? tail : [head, ...tail]).join("\n").trim();
+  if (byLines.length <= maxChars) {
+    return byLines;
+  }
+  // The line-count bound above assumes each line is reasonably short —
+  // wrong for a single massive line (e.g. a JSON.stringify fallback for an
+  // unrecognized error shape, which can be hundreds of KB on one line and
+  // still satisfy "8 lines or fewer"). That is exactly the "megabytes of
+  // leaked content in a user-facing error" failure mode the structured
+  // scan was built to prevent, just via a different route. Keep a prefix
+  // and a suffix rather than truncating from one end only, mirroring the
+  // head+tail reasoning above at the character level.
+  // slice(-0) is equivalent to slice(0) — the whole string — not an empty
+  // one, since JS integer-conversion discards the sign of a negative-zero
+  // start index. A non-positive maxChars would otherwise make tailChars the
+  // ENTIRE string, so the "truncated" result comes out longer than the
+  // input. Guarding halfChars > 0 keeps this bounded for any maxChars.
+  const halfChars = Math.floor(maxChars / 2);
+  const headChars = byLines.slice(0, maxChars - halfChars);
+  const tailChars = halfChars > 0 ? byLines.slice(-halfChars) : "";
+  return `${headChars}\n… [truncated] …\n${tailChars}`;
 }
 
 /**
  * Convert raw CLI failure output into a user-facing error, surfacing the
  * provider's login hint when the output looks like an auth problem.
+ *
+ * Returns a struct rather than a string for two reasons:
+ *  1. The auth verdict used to be a local boolean collapsed into prose and
+ *     discarded. Downstream then re-derived it by regexing the returned
+ *     message — which by that point contained the login hint this function had
+ *     just appended ("...paste the OpenCode API key."), and that hint matches
+ *     the regex. Any error that tripped a false positive was therefore
+ *     guaranteed to be re-confirmed as an auth failure by our own hint text.
+ *  2. Structured-stream providers can report retryability directly, and that
+ *     signal has no string representation worth matching.
  */
 function toFriendlyError(
   def: CliProviderDefinition,
   model: string | undefined,
   exitCode: number | null,
   stderr: string,
-  stdout: string
-): string {
-  const combined = `${stderr}\n${stdout}`.toLowerCase();
-  const looksLikeAuth = def.authErrorMarkers.some((marker) =>
-    combined.includes(marker)
-  );
-  const detail =
-    truncateCliDetail(stderr) ||
-    truncateCliDetail(stdout) ||
-    `exit code ${exitCode ?? "unknown"}`;
-  const authSuffix = looksLikeAuth
+  stdout: string,
+  parsed?: ParsedCliEventLines,
+  /**
+   * Replaces the computed "CLI failed: <detail>" text wholesale (e.g. the
+   * "CLI produced no output" case has its own wording) while still running
+   * the auth scan and hint-append below against the real stderr/stdout —
+   * letting a caller with different wording reuse this function fully
+   * instead of hand-rebuilding a CliFriendlyError from its own pieces.
+   */
+  diagnosticTextOverride?: string
+): CliFriendlyError {
+  // Structured-stream providers are diagnosed from stderr plus the stream's own
+  // "error" events (plus any trailing unparsed text — see
+  // extractStructuredCliDiagnostics) only. stderr is still concatenated even
+  // though it is empirically always empty for opencode — costless today,
+  // correct if a future version starts using it. Scoping to stderr ALONE
+  // would be a total regression: a genuine opencode 401 arrives exclusively
+  // as a stdout event. Passing `parsed` even when undefined is fine:
+  // extractStructuredCliDiagnostics's own default parameter already parses
+  // internally in that case.
+  const structured = def.structuredEventStream
+    ? extractStructuredCliDiagnostics(stdout, parsed)
+    : undefined;
+
+  const scanSource = structured
+    ? `${stderr}\n${structured.markerScanText}`
+    : `${stderr}\n${stdout}`;
+  const combined = scanSource.toLowerCase();
+  // The provider's own marker list is necessarily narrow (opencode has no
+  // "403"/"forbidden" entry, for instance). isAuthenticationFailure's broader
+  // regex is ALSO checked, but the text it scans depends on the provider
+  // shape: for structured providers, the full scanSource — markerScanText is
+  // curated by extractStructuredCliDiagnostics to exclude tool/text-event
+  // content (safely including fields like responseBody that are deliberately
+  // excluded from `detail` below), so an auth signal living only in a field
+  // the provider's own markers don't cover is still caught. For opaque-text
+  // providers (kiro-cli, codex-cli), stdout is the model's own generated
+  // output — arbitrary prose or echoed file content that happens to mention
+  // "403"/"credentials"/"authenticate" would false-positive the whole run as
+  // an auth failure if scanned, which hard-blocks the backup cascade
+  // (runnerRegistry.ts checks authFailure before ever trying a fallback
+  // model). stderr, by contrast, is conventionally the CLI tool's OWN
+  // diagnostic channel (process/network/permission errors it reports about
+  // itself), not a place the model narrates or echoes file content — so it
+  // is safe to scan even for opaque providers, and is what still catches a
+  // marker-list gap like a bare "403 Forbidden" in stderr.
+  const authFailure =
+    def.authErrorMarkers.some((marker) => combined.includes(marker)) ||
+    isAuthenticationFailure(structured ? scanSource : stderr);
+
+  // Fallback order for structured providers: parsed error-event text (which
+  // already folds in trailing unparsed content — see
+  // extractStructuredCliDiagnostics), then stderr, then a bare exit code. A
+  // stream that DID fully parse as recognized events is never dumped raw;
+  // dumping it is what leaked file contents and thousands of characters of
+  // tool-call JSON into user-facing errors in the first place.
+  const diagnosticText =
+    diagnosticTextOverride ??
+    `${cliDisplayLabel(def)} CLI failed: ${
+      structured
+        ? truncateCliDetail(structured.detail) ||
+          truncateCliDetail(stderr) ||
+          `exit code ${exitCode ?? "unknown"}`
+        : truncateCliDetail(stderr) ||
+          truncateCliDetail(stdout) ||
+          `exit code ${exitCode ?? "unknown"}`
+    }`;
+  const authSuffix = authFailure
     ? ` ${def.loginHintForModel?.(model) ?? def.loginHint}`
     : "";
-  return `${cliDisplayLabel(def)} CLI failed: ${detail}${authSuffix}`;
+  return {
+    message: `${diagnosticText}${authSuffix}`,
+    authFailure,
+    diagnosticText,
+    retryableHint: structured?.retryable === true,
+  };
 }
 
 /**
@@ -870,25 +1362,62 @@ export async function execCliAgent(options: {
         return;
       }
 
-      const output = normalizeCliOutput(def, stdout, lastMessageFile);
+      // Parsed once and shared with toFriendlyError below (both call sites):
+      // a failing opencode run's stdout can be multi-megabyte (it re-emits
+      // every file the agent read), and parsing that same buffer twice for
+      // two different purposes is pure waste. Only structured providers pay
+      // for this parse at all — undefined here is a no-op for every other
+      // provider's normalizeCliOutput/toFriendlyError call.
+      const sharedParsedEvents = def.structuredEventStream
+        ? parseJsonLineEvents(stdout)
+        : undefined;
+      const output = normalizeCliOutput(def, stdout, lastMessageFile, sharedParsedEvents);
 
       if (code !== 0) {
-        finish(classifyCliFailure({
-          status: "failed",
-          output,
-          errorMessage: toFriendlyError(def, model, code, stderr, stdout),
-        }));
+        const friendly = toFriendlyError(def, model, code, stderr, stdout, sharedParsedEvents);
+        finish(applyTransportTransience(
+          classifyCliFailure({
+            status: "failed",
+            output,
+            errorMessage: friendly.message,
+            // Captured pre-hint so the backup-cascade gate never re-reads our
+            // own login hint as evidence of the auth failure that produced it.
+            authFailure: friendly.authFailure,
+            authDiagnosticText: friendly.diagnosticText,
+          }),
+          friendly,
+          mode,
+          def
+        ));
         return;
       }
 
       if (output.length === 0) {
-        finish(classifyCliFailure({
-          status: "failed",
-          output,
-          errorMessage: `${cliDisplayLabel(def)} CLI produced no output. ${
-            truncateCliDetail(stderr, 4)
-          }`.trim(),
-        }));
+        // A dropped stream can also surface as a clean exit that produced
+        // nothing, so this path gets the same transport treatment. The auth
+        // verdict must still come from actually scanning stderr/stdout —
+        // hardcoding it false here meant a genuine auth signal sitting in
+        // stderr was never even checked, and no login hint was ever offered
+        // for it. Reuses toFriendlyError fully via diagnosticTextOverride
+        // (the specific "produced no output" wording is more informative
+        // than toFriendlyError's own generic fallback for an empty result)
+        // rather than hand-rebuilding a CliFriendlyError from its pieces.
+        const emptyDetail = `${cliDisplayLabel(def)} CLI produced no output. ${
+          truncateCliDetail(stderr, 4)
+        }`.trim();
+        const friendly = toFriendlyError(def, model, code, stderr, stdout, sharedParsedEvents, emptyDetail);
+        finish(applyTransportTransience(
+          classifyCliFailure({
+            status: "failed",
+            output,
+            errorMessage: friendly.message,
+            authFailure: friendly.authFailure,
+            authDiagnosticText: friendly.diagnosticText,
+          }),
+          friendly,
+          mode,
+          def
+        ));
         return;
       }
 
@@ -964,9 +1493,15 @@ export class CliAgentRunner implements AgentRunner {
       }
       retryAudit.push({
         attempt,
-        classification: "transient (run timeout)",
+        // editEvidence is captured on the timeout path only, so its presence is
+        // what distinguishes a timeout from a mid-stream transport drop — both
+        // of which now classify transient for read-only runs.
+        classification: result.editEvidence
+          ? "transient (run timeout)"
+          : "transient (stream transport)",
         capabilityFlag: undefined,
-        evidence: "read-only (text-mode) run — side-effect free by construction",
+        evidence:
+          "read-only (text-mode) run — side-effect free by provider permission configuration",
         delayMs: CLI_RETRY_DELAY_MS,
         retried: true,
       });
@@ -994,6 +1529,10 @@ export class CliAgentRunner implements AgentRunner {
         status: "failed",
         errorMessage: result.errorMessage ?? "unknown error",
         failureKind: result.failureKind,
+        // Carried so a future auth check on a text/review-path result can
+        // prefer these over regexing errorMessage — see AgentRunResult's doc.
+        authFailure: result.authFailure,
+        authDiagnosticText: result.authDiagnosticText,
       };
     }
 
@@ -1168,6 +1707,11 @@ function toCliImplementationRunResult(
       filesChangedUnknown,
       errorMessage: result.errorMessage,
       failureKind: result.failureKind,
+      // Carried so the backup-cascade gate can consult the provider's own
+      // pre-hint verdict instead of regexing errorMessage, which by this point
+      // may contain the login hint that Ensemble itself appended.
+      authFailure: result.authFailure,
+      authDiagnosticText: result.authDiagnosticText,
     };
   }
   if (requireFileChange && !filesChangedUnknown && filesChanged.length === 0) {
@@ -1280,7 +1824,7 @@ export async function runImplementationWithCli(options: {
         ...result,
         transient: false,
         errorMessage:
-          `${result.errorMessage ?? "The run timed out."} ` +
+          `${result.errorMessage ?? "The run did not complete."} ` +
           "This run may already have made changes; review your working tree before retrying. " +
           `(${decision.reason})`,
       };

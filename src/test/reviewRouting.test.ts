@@ -1,6 +1,11 @@
 import * as assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { decideReviewRoute, detectPlateau } from "../utils/reviewRouting";
+import {
+  decideReviewRoute,
+  detectPlateau,
+  REVIEW_RUBRIC_BLOCKER_SCORE_CAP,
+  rubricCapLikelyBlockedAdvance,
+} from "../utils/reviewRouting";
 import { ReviewBlocker } from "../utils/reviewReadiness";
 import { ReviewScoreHistoryEntry } from "../types/taskProgress";
 
@@ -184,5 +189,37 @@ void describe("decideReviewRoute", () => {
       secondOpinionTriedThisPlateau: false,
     });
     assert.notStrictEqual(decision.route, "advance");
+  });
+});
+
+
+void describe("rubricCapLikelyBlockedAdvance", () => {
+  void it("flags the mismatch: best score at the rubric cap, stop level above it", () => {
+    // The exact stock-settings trap: default autoAdvanceScoreThreshold (10)
+    // and this user's fastForwardStopLevel (9) both sit above the rubric's
+    // structural cap (7) for as long as any blocker is reported.
+    assert.strictEqual(rubricCapLikelyBlockedAdvance(7, 9), true);
+    assert.strictEqual(rubricCapLikelyBlockedAdvance(REVIEW_RUBRIC_BLOCKER_SCORE_CAP, 10), true);
+  });
+
+  void it("does not flag a score below the cap for a reason unrelated to blockers", () => {
+    // A low score with a stop level also below the cap is a normal
+    // in-progress iteration, not the rubric/threshold deadlock.
+    assert.strictEqual(rubricCapLikelyBlockedAdvance(3, 7), false);
+  });
+
+  void it("does not flag when the stop level is achievable under the cap", () => {
+    assert.strictEqual(rubricCapLikelyBlockedAdvance(6, 7), false);
+    assert.strictEqual(rubricCapLikelyBlockedAdvance(5, 5), false);
+  });
+
+  void it("does not flag when the best score already exceeded the cap", () => {
+    // If 8+ was reached at some point, blockers were not the obstacle — some
+    // other reason (e.g. a later regression) is the real story.
+    assert.strictEqual(rubricCapLikelyBlockedAdvance(9, 10), false);
+  });
+
+  void it("does not flag an unparseable score", () => {
+    assert.strictEqual(rubricCapLikelyBlockedAdvance(null, 9), false);
   });
 });

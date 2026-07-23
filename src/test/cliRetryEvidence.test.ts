@@ -19,8 +19,30 @@ import {
   evaluateEditRetryEligibility,
   formatRetryAuditLog,
   shouldRetryReadOnlyRun,
+  __testOnly,
 } from "../runners/cliAgentRunner";
+import { CliProviderDefinition } from "../runners/providers";
 import { classifyCliFailure } from "../utils/quota";
+
+const { applyTransportTransience } = __testOnly;
+
+/** A structured-stream provider def — text-based transport matching is only
+ * trusted for providers like this (see applyTransportTransience). */
+const STRUCTURED_PROVIDER_LIKE: CliProviderDefinition = {
+  id: "opencode-cli",
+  label: "OpenCode",
+  command: "opencode",
+  installHint: "Install opencode.",
+  loginHint: "Run `opencode` and use /connect.",
+  authErrorMarkers: ["login", "api key"],
+  signInLabel: "Sign in",
+  models: [],
+  usesLastMessageFile: false,
+  structuredEventStream: "opencode",
+  buildArgs(): string[] {
+    return ["run", "--format", "json"];
+  },
+};
 
 void describe("analyzeCliEventStream", () => {
   void it("reports no stream for plain-text output", () => {
@@ -136,10 +158,11 @@ void describe("shouldRetryReadOnlyRun", () => {
     assert.equal(shouldRetryReadOnlyRun(succeeded, 2, false), false);
   });
 
-  void it("non-retryable classification: failures classified by classifyCliFailure are never transient", () => {
+  void it("non-retryable classifications (auth, tool exit, empty output) are never transient", () => {
     // Auth errors, non-zero tool exits, and content errors all flow through
-    // classifyCliFailure, which assigns a failureKind but never the
-    // transient flag — only the timeout path sets transient explicitly.
+    // classifyCliFailure, which assigns a failureKind but never the transient
+    // flag. Transience is set by the runner, on the two transport-level shapes
+    // only: a run timeout, and a mid-stream drop (see the positive case below).
     for (const errorMessage of [
       "Invalid API key. Please run /login.",
       "Claude Code CLI exited with code 1.",
@@ -153,6 +176,32 @@ void describe("shouldRetryReadOnlyRun", () => {
       );
       assert.equal(shouldRetryReadOnlyRun(classified, 1, false), false);
     }
+  });
+
+  void it("a mid-stream transport drop IS transient for a read-only run", () => {
+    // Paired with the negative case above so that list cannot drift back into
+    // a universal "nothing is ever transient" claim: before this was fixed, a
+    // dropped stream classified generic, which is terminal at both cascade
+    // gates — six consecutive real runs died that way with four healthy backup
+    // models configured and never tried.
+    const dropped = applyTransportTransience(
+      classifyCliFailure({
+        status: "failed",
+        output: "",
+        errorMessage: "OpenCode CLI failed: UnknownError: Streaming response failed",
+      }),
+      {
+        message: "OpenCode CLI failed: UnknownError: Streaming response failed",
+        authFailure: false,
+        diagnosticText: "OpenCode CLI failed: UnknownError: Streaming response failed",
+        retryableHint: false,
+      },
+      "text",
+      STRUCTURED_PROVIDER_LIKE
+    );
+
+    assert.equal(dropped.transient, true);
+    assert.equal(shouldRetryReadOnlyRun(dropped, 1, false), true);
   });
 
   void it("stops at the attempt cap and on cancellation even for transient timeouts", () => {

@@ -339,7 +339,6 @@ void describe("fast-forward fallback contract", () => {
         skipImplementationSafetyCheck: false,
         preserveActiveFallback: false,
         parentOperation,
-        suppressReviewRouting: true,
       }
     );
     assert.deepStrictEqual(
@@ -348,20 +347,8 @@ void describe("fast-forward fallback contract", () => {
         skipImplementationSafetyCheck: true,
         preserveActiveFallback: true,
         parentOperation,
-        suppressReviewRouting: true,
       }
     );
-  });
-
-  void it("always suppresses plateau-driven escalation for internal Fast Forward attempts", () => {
-    // Fast Forward's own maxAttempts budget (default 5) sits right next to
-    // the default plateau window (3 rounds + 1 baseline = 4) — without
-    // this, a Fast Forward loop that plateaus on its OWN sanctioned,
-    // expected multi-attempt budget would get escalated (pausing the task)
-    // mid-session, aborting the loop's remaining attempts early. True
-    // regardless of attempt number.
-    assert.strictEqual(buildFastForwardApplyReviewOptions(1, parentOperation).suppressReviewRouting, true);
-    assert.strictEqual(buildFastForwardApplyReviewOptions(5, parentOperation).suppressReviewRouting, true);
   });
 });
 

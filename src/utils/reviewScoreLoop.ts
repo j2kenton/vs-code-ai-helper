@@ -27,6 +27,16 @@ export interface ImproveReviewScoreResult {
    * distinguishing happened to compare against.
    */
   stalled: boolean;
+  /**
+   * True when apply() left the task paused (isPaused() returned true).
+   * Checked AFTER review() runs (so a score this attempt actually produced
+   * is still recorded — see isPaused's own doc comment) but takes priority
+   * over `stalled` in the returned outcome, so the two remain mutually
+   * exclusive: a pause means there is a real, known reason to stop — an
+   * escalation, most commonly — as opposed to stalled's "nothing changed and
+   * we don't know why". Always false when the caller doesn't pass isPaused.
+   */
+  paused: boolean;
 }
 
 /**
@@ -49,6 +59,16 @@ export async function improveReviewScore(options: {
   apply: () => Promise<void>;
   /** Returns the new score, or null if this attempt produced nothing to compare (stops the loop). */
   review: () => Promise<number | null>;
+  /**
+   * Checked immediately after review(), and takes priority over `stalled` in
+   * the returned outcome. When it returns true, the loop stops and reports
+   * `paused` instead of continuing — but review() still runs first so a
+   * score this same attempt actually produced (e.g. an internal re-review
+   * that itself triggered the pause via escalation) is recorded rather than
+   * discarded. Optional: a caller with no pausable task (e.g. a test, or a
+   * future non-task-scoped use of this loop) simply never sees this outcome.
+   */
+  isPaused?: () => Promise<boolean>;
   token?: vscode.CancellationToken;
   /** Maximum apply/review cycles for this run. */
   maxAttempts?: number;
@@ -68,18 +88,23 @@ export async function improveReviewScore(options: {
       throw new vscode.CancellationError();
     }
     const score = await options.review();
-    if (score === null) {
-      return { score: best, attempts: attempt, improved: false, stalled: true };
+    if (score !== null) {
+      best = Math.max(best ?? Number.NEGATIVE_INFINITY, score);
+      await recordBestReviewScore(options.context, options.stage, score);
     }
-    best = Math.max(best ?? Number.NEGATIVE_INFINITY, score);
-    await recordBestReviewScore(options.context, options.stage, score);
+    if ((await options.isPaused?.()) === true) {
+      return { score: best, attempts: attempt, improved: false, stalled: false, paused: true };
+    }
+    if (score === null) {
+      return { score: best, attempts: attempt, improved: false, stalled: true, paused: false };
+    }
     const improved = score >= options.baselineScore + 1;
     // Fast Forward is only successful after it has made measurable progress
     // from the score it started with.  A configured target may require more,
     // but must not let a task at (or above) that target stop without improving.
     if (improved && (stopAtScore === 0 || score >= stopAtScore)) {
-      return { score, attempts: attempt, improved: true, stalled: false };
+      return { score, attempts: attempt, improved: true, stalled: false, paused: false };
     }
   }
-  return { score: best, attempts: maxAttempts, improved: false, stalled: false };
+  return { score: best, attempts: maxAttempts, improved: false, stalled: false, paused: false };
 }

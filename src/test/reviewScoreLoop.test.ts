@@ -132,8 +132,86 @@ void describe("improveReviewScore", () => {
 
     assert.strictEqual(result.stalled, true);
     assert.strictEqual(result.improved, false);
+    assert.strictEqual(result.paused, false);
     assert.strictEqual(result.attempts, 1);
     assert.strictEqual(call, 1);
+  });
+
+  // Regression coverage: escalation (handleReviewRoutingOutcome,
+  // reviewActions.ts) can now fire inside Fast Forward and pause the task
+  // mid-loop. Before isPaused existed, apply() silently no-op'd on the
+  // paused guard, review() then saw unchanged content and returned null, and
+  // the loop reported `stalled` — blaming "the provider may have failed or
+  // been blocked" for what was actually a deliberate escalation.
+  void it("reports paused, not stalled, when isPaused() is true and review() also sees nothing new", async () => {
+    // Covers a pause unrelated to THIS attempt's own review (e.g. the task
+    // was already paused going in) — review() still runs (it must, so a real
+    // score from an escalation-triggering round is never skipped — see the
+    // next test), but here it correctly finds nothing changed.
+    const context = fakeContext();
+    let reviewCalls = 0;
+
+    const result = await improveReviewScore({
+      context,
+      stage: "impl-low-review",
+      baselineScore: 5,
+      apply: () => Promise.resolve(),
+      isPaused: () => Promise.resolve(true),
+      review: () => {
+        reviewCalls += 1;
+        return Promise.resolve(null);
+      },
+    });
+
+    assert.strictEqual(result.paused, true);
+    assert.strictEqual(result.stalled, false);
+    assert.strictEqual(result.improved, false);
+    assert.strictEqual(result.attempts, 1);
+    assert.strictEqual(reviewCalls, 1, "review() must still run so a real score isn't skipped when one exists");
+  });
+
+  // The actual escalation path: apply() itself runs a nested re-review that
+  // produces a real, different score and — because that score routed to
+  // "second-opinion"/"escalate" — pauses the task in the same breath. review()
+  // reading the SAME already-updated content back must still count.
+  void it("records the score from this attempt's own review even though isPaused() is true afterward", async () => {
+    const context = fakeContext();
+
+    const result = await improveReviewScore({
+      context,
+      stage: "impl-low-review",
+      baselineScore: 5,
+      apply: () => Promise.resolve(),
+      isPaused: () => Promise.resolve(true),
+      review: () => Promise.resolve(6),
+    });
+
+    assert.strictEqual(result.paused, true);
+    assert.strictEqual(result.stalled, false);
+    assert.strictEqual(result.score, 6);
+    assert.strictEqual(getBestReviewScore(context, "impl-low-review"), 6);
+  });
+
+  void it("keeps iterating normally when isPaused() is provided but returns false", async () => {
+    const context = fakeContext();
+    const scores = [4, 4, 6];
+    let call = 0;
+
+    const result = await improveReviewScore({
+      context,
+      stage: "impl-high-review",
+      baselineScore: 4,
+      apply: () => {
+        call += 1;
+        return Promise.resolve();
+      },
+      isPaused: () => Promise.resolve(false),
+      review: () => Promise.resolve(scores[call - 1] ?? null),
+    });
+
+    assert.strictEqual(result.improved, true);
+    assert.strictEqual(result.paused, false);
+    assert.strictEqual(result.attempts, 3);
   });
 
   void it("throws CancellationError when the token is already cancelled", async () => {

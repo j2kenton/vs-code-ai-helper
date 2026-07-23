@@ -31,7 +31,7 @@ import {
   isProviderSelectionConfigured,
 } from "../config/settings";
 import { chooseFallback, getBackupModels } from "../utils/modelFallback";
-import { recordQuotaObservation } from "../utils/quota";
+import { isAuthenticationFailure, recordQuotaObservation } from "../utils/quota";
 import {
   clearStageFallbackReservation,
   patchTaskProgress,
@@ -645,7 +645,23 @@ export async function runImplementationForModel(options: {
     recordQuotaObservation(options.stage, options.modelId, result.failureKind, result.errorMessage);
   }
   const setting = getModelSettings()[options.stage as keyof ReturnType<typeof getModelSettings>];
-  const authFailure = isAuthenticationFailure(result.errorMessage);
+  // Prefer the provider's own pre-hint verdict; fall back to the regex over the
+  // pre-hint diagnostic text, and only then over errorMessage. The layering is
+  // what breaks a self-reinforcing loop: toFriendlyError APPENDS the login hint
+  // ("...paste the OpenCode API key.") into errorMessage, and that hint text
+  // itself matches /api\s*key/i in isAuthenticationFailure — so any error that
+  // tripped a false-positive auth diagnosis was guaranteed to be re-confirmed
+  // as auth by the hint Ensemble added to explain it. authDiagnosticText is the
+  // same message without the hint.
+  //
+  // `||` rather than `??`: a false from a CLI provider means "this provider's
+  // marker list didn't match", not "this is definitely not auth". Provider
+  // marker lists are narrower than the regex (claude-cli carries no 401/403/
+  // forbidden markers), so the regex must still get its say. The Copilot runner
+  // leaves both fields undefined and lands on errorMessage — today's behavior.
+  const authFailure =
+    result.authFailure === true ||
+    isAuthenticationFailure(result.authDiagnosticText ?? result.errorMessage);
   if (
     !authFailure &&
     (result.failureKind === "quota" ||
@@ -710,21 +726,4 @@ export async function runImplementationForModel(options: {
     await releaseReservation();
   }
   return result;
-}
-
-// Authentication failures are terminal for the selected provider. Keep this
-// deliberately broad: providers often label expired credentials as generic
-// unavailability (or even "try again later"-style transient wording) rather
-// than a clean 401/403, so a narrow match would auto-fallback to the backup
-// model on what is actually an auth problem — exactly what callers must
-// never do (see the two call sites below). Exported for direct unit testing.
-export function isAuthenticationFailure(message: string | undefined): boolean {
-  const value = message ?? "";
-  if (/not\s+installed|command\s+not\s+found|could\s+not\s+start\b/i.test(value)) {
-    return false;
-  }
-  // "session"/"token" tolerate a short word gap (e.g. "session has timed
-  // out", "token has been revoked") instead of requiring the state word to
-  // sit directly next to the noun.
-  return /sign[\s-]*in|log(?:ged|ging)?[\s-]*(?:in|out)|session(?:\s+\w+){0,3}\s+(?:expired|invalid|missing|timed?\s*out)|authenticat\w*|authoris\w*|authoriz\w*|credential|re[-\s]?auth\w*|token(?:\s+\w+){0,3}\s+(?:expired|invalid|missing|revoked)|api\s*key|access\s*denied|permission\s*denied|forbidden|unauthori[sz]ed|\b(?:401|403)\b/i.test(value);
 }

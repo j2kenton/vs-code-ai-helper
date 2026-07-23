@@ -469,6 +469,15 @@ export interface ImplementationRunResult {
   errorMessage?: string;
   /** Stable provider-neutral failure classification; set on failed results only. */
   failureKind?: "quota" | "temporarily-unavailable" | "generic";
+  /**
+   * The provider's own authentication verdict, when the runner can produce
+   * one, captured before any login hint was appended to errorMessage. CLI
+   * runners set it; this Copilot runner leaves it undefined, so the
+   * backup-cascade gate falls back to the errorMessage regex exactly as before.
+   */
+  authFailure?: boolean;
+  /** errorMessage minus any appended login hint — the classification-safe form. */
+  authDiagnosticText?: string;
 }
 
 /**

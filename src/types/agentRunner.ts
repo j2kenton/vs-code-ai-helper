@@ -50,6 +50,17 @@ export interface AgentRunResult {
   /** Stable provider-neutral failure classification. */
   failureKind?: "quota" | "temporarily-unavailable" | "generic";
   modelId?: string;
+  /**
+   * The provider's own pre-hint authentication verdict, when the runner can
+   * produce one (CLI runners; Copilot leaves it undefined). Captured before
+   * any login hint was appended to errorMessage — any future auth check on
+   * this text/review-path result should prefer this (or authDiagnosticText)
+   * over regexing errorMessage, for the same reason the implementation path
+   * does: the appended hint text can itself trip an auth-pattern match.
+   */
+  authFailure?: boolean;
+  /** errorMessage minus any appended login hint — the classification-safe form. */
+  authDiagnosticText?: string;
 }
 
 /**

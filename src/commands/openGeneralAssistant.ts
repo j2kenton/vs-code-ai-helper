@@ -8,9 +8,9 @@ import { resolveTaskRootForCreation } from "../utils/taskRoot";
 import { resolveFreshModelForStage } from "../utils/modelSelection";
 import {
   getConfiguredBackupModelsForStage,
-  isAuthenticationFailure,
   resolveRunnerForModel,
 } from "../runners/runnerRegistry";
+import { isAuthenticationFailure } from "../utils/quota";
 import { ensureAiConsent } from "../utils/aiConsent";
 import { checkAndConfirmPromptSize } from "../utils/promptSizeGuard";
 import { runTrackedOperation } from "../utils/taskOperations";

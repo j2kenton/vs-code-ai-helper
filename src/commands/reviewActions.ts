@@ -82,7 +82,12 @@ import { scheduleAutomationChain, releaseAutomationChain } from "../utils/automa
 import { buildVerifiedChecksSection, collectCompletionLintPreview, resolvePublishScopeFolder } from "../utils/completionLint";
 import { checkPublishPreflight } from "../utils/publishPreflight";
 import { improveReviewScore } from "../utils/reviewScoreLoop";
-import { decideReviewRoute, detectPlateau } from "../utils/reviewRouting";
+import {
+  decideReviewRoute,
+  detectPlateau,
+  REVIEW_RUBRIC_BLOCKER_SCORE_CAP,
+  rubricCapLikelyBlockedAdvance,
+} from "../utils/reviewRouting";
 import { escalateReviewToHuman } from "../utils/reviewEscalation";
 import { getConfiguredBackupModelsForStage } from "../runners/runnerRegistry";
 import {
@@ -382,23 +387,6 @@ interface ApplyReviewOptions {
    * changes no existing dispatch behavior.
    */
   suppressAutoPublishDispatch?: boolean;
-  /**
-   * Suppress plateau-driven second-opinion/escalation for internal re-review
-   * attempts within a single Fast Forward session. Fast Forward's own
-   * maxAttempts budget (default 5) sits right next to the default plateau
-   * window (3 rounds + 1 baseline = 4) — without this, a Fast Forward loop
-   * that plateaus on attempt 4 of its OWN sanctioned, expected multi-attempt
-   * budget would get escalated (pausing the task) mid-session, which then
-   * aborts the loop's remaining attempts early via the paused-status guard,
-   * contradicting Fast Forward's own "try up to N times" contract — and is
-   * redundant with the stalled/target-not-reached notification Fast Forward
-   * already shows when its own loop concludes. Round history is still
-   * recorded (so a plateau spanning separate, later invocations is still
-   * caught), only the second-opinion/escalate actions are skipped. Set by
-   * buildFastForwardApplyReviewOptions; unset (false) for a standalone
-   * Apply Review click.
-   */
-  suppressReviewRouting?: boolean;
 }
 
 interface ExecuteImplementationRunOptions {
@@ -452,7 +440,6 @@ export function buildFastForwardApplyReviewOptions(
     skipImplementationSafetyCheck: preserveActiveFallback,
     preserveActiveFallback,
     parentOperation,
-    suppressReviewRouting: true,
   };
 }
 
@@ -1766,9 +1753,6 @@ async function handleReviewRoutingOutcome(options: {
   content: string;
   score: number | null;
   threshold: number;
-  /** See ApplyReviewOptions.suppressReviewRouting — true for an internal
-   * re-review attempt inside an active Fast Forward session. */
-  suppressEscalation: boolean;
   /** The enclosing tracked operation's cancellation token, when it has one
    * (registered `cancellable: true`) — linked into the second-opinion AI
    * call so cancelling the review/Fast Forward from the UI actually stops
@@ -1776,7 +1760,7 @@ async function handleReviewRoutingOutcome(options: {
    * task's exclusive operation lock. */
   cancellationToken: vscode.CancellationToken | undefined;
 }): Promise<{ escalated: boolean }> {
-  const { extensionUri, folderUri, workspaceUri, targetStage, variables, reviewAttemptId, content, score, threshold, suppressEscalation, cancellationToken } = options;
+  const { extensionUri, folderUri, workspaceUri, targetStage, variables, reviewAttemptId, content, score, threshold, cancellationToken } = options;
   try {
     const blockers = parseReviewBlockers(content);
     const progressBefore = await readTaskProgress(folderUri);
@@ -1791,9 +1775,6 @@ async function handleReviewRoutingOutcome(options: {
       blockerCount: blockers.length,
       taskFixableCount: blockers.filter((b) => b.resolver === "task-fixable").length,
     };
-    // History is always recorded, even when suppressEscalation is set —
-    // Fast Forward's OWN internal rounds are still real evidence for
-    // detecting a plateau that later spans separate, later invocations.
     const updated = await patchTaskProgress(folderUri, (current) =>
       appendReviewScoreHistory(current, historyEntry)
     );
@@ -1829,15 +1810,6 @@ async function handleReviewRoutingOutcome(options: {
       NotificationRouter.showInformation(
         `${STAGE_DISPLAY_NAMES[targetStage]} review scored ${score}/10 — ${decision.reason}`
       );
-      return { escalated: false };
-    }
-    if (suppressEscalation) {
-      // Fast Forward's own maxAttempts budget already reports stalled/
-      // target-not-reached when its loop concludes — escalating (pausing
-      // the task) mid-session here would cut that budget short via the
-      // paused-status guard the very next attempt() call hits, and would be
-      // redundant with the notification Fast Forward is about to show
-      // anyway. The round is already recorded in history above.
       return { escalated: false };
     }
     if (decision.route === "second-opinion") {
@@ -1936,8 +1908,6 @@ export async function runReviewForFolder(
     autoPublishOnSuccess?: boolean;
     /** See ApplyReviewOptions.suppressAutoPublishDispatch. */
     suppressAutoPublishDispatch?: boolean;
-    /** See ApplyReviewOptions.suppressReviewRouting. */
-    suppressReviewRouting?: boolean;
   } = {}
 ): Promise<void> {
   const targetStage = REVIEW_TARGETS[currentStage];
@@ -2169,7 +2139,6 @@ export async function runReviewForFolder(
           content,
           score,
           threshold: autoAdvanceThreshold,
-          suppressEscalation: options.suppressReviewRouting ?? false,
           cancellationToken: options.operation?.token,
         });
         // Review-owned auto-publish is intentionally independent of the
@@ -2833,7 +2802,6 @@ export async function applyReviewWithAI(
                 operation: op,
                 autoPublishOnSuccess: chainedAutoPublishOnSuccess(arg),
                 suppressAutoPublishDispatch: options.suppressAutoPublishDispatch,
-                suppressReviewRouting: options.suppressReviewRouting,
               }
             )
         );
@@ -2915,7 +2883,6 @@ export async function applyReviewWithAI(
               operation: op,
               autoPublishOnSuccess: chainedAutoPublishOnSuccess(arg),
               suppressAutoPublishDispatch: options.suppressAutoPublishDispatch,
-              suppressReviewRouting: options.suppressReviewRouting,
             }
           )
       );
@@ -3118,6 +3085,13 @@ export async function fastForwardReviewWithAI(
               buildFastForwardApplyReviewOptions(attemptNumber, op)
             );
           },
+          // Escalation (see handleReviewRoutingOutcome) can now fire inside
+          // Fast Forward and pause the task mid-loop. Without this check,
+          // the next attempt's applyReviewWithAI silently no-ops on the
+          // paused guard, review() then sees unchanged content and returns
+          // null, and the loop reports "stalled" — blaming the provider for
+          // a deliberate escalation it has no way to see otherwise.
+          isPaused: async () => (await readTaskProgress(resolved.folderUri))?.status === "paused",
           review: async () => {
             const newContent = await readNonEmptyText(reviewUri);
             if (!newContent || newContent === previousContent) {
@@ -3178,6 +3152,32 @@ export async function fastForwardReviewWithAI(
     NotificationRouter.showInformation(
       `Fast Forward Review: score improved to ${outcome.score}/10 after ${outcome.attempts} attempt(s).`
     );
+  } else if (outcome.paused) {
+    // The escalation that paused the task already showed its own
+    // notification (and chat question) with the actual reason — this just
+    // frames the Fast Forward stop correctly instead of falling through to
+    // "stalled", which would misattribute a deliberate pause to the provider.
+    // showWarning, not showInformation: only showWarning carries an action
+    // button, and this also matches the severity of both the escalation's
+    // own notification and every sibling branch below. Still offers Publish
+    // Anyway for the publish stage, matching those siblings: a user who
+    // decides the escalation is acceptable must have the same one-click
+    // recovery, not have to find Commit and Push manually.
+    NotificationRouter.showWarning(
+      `Fast Forward Review stopped after ${outcome.attempts} attempt(s): the task was paused for review — ` +
+        "see the notification above for why, and resume the task once you've decided how to proceed." +
+        (targetStage === "publish" ? " Publish manually once you're satisfied, or use Publish Anyway from Commit and Push." : ""),
+      undefined,
+      undefined,
+      undefined,
+      targetStage === "publish"
+        ? {
+            command: "vs-code-ai-helper.commitAndPushTask",
+            title: "Publish Anyway",
+            args: [{ taskFolderPath: resolved.folderUri.fsPath }],
+          }
+        : undefined
+    );
   } else if (outcome.stalled) {
     NotificationRouter.showWarning(
       `Fast Forward Review stopped after ${outcome.attempts} attempt(s): the review did not change. ` +
@@ -3195,10 +3195,31 @@ export async function fastForwardReviewWithAI(
         : undefined
     );
   } else {
+    // A best score already at or below the rubric's blocker cap, while the
+    // configured stop level asks for something higher, means "attempts
+    // exhausted" is not the real story: the rubric asks reviewers to keep
+    // the score at 7 or below whenever any blocker is reported, so a stop
+    // level above 7 cannot be reached for as long as any blocker keeps
+    // getting reported, no matter how many attempts remain. Naming that
+    // here turns a wasted 20-attempt run into an actionable next step
+    // instead of a generic "try again" warning.
+    //
+    // Which SETTING actually produced configuredStopLevel depends on
+    // usesAcceptanceThresholdForFastForward (see its assignment above) —
+    // telling the user to touch fastForwardStopLevel when this run was
+    // actually gated by autoAdvanceScoreThreshold (or vice versa) would send
+    // them to edit a setting that has no effect on this outcome at all.
+    const explainRubricCap = rubricCapLikelyBlockedAdvance(outcome.score, configuredStopLevel);
+    const stopLevelSettingName = usesAcceptanceThresholdForFastForward()
+      ? "autoAdvanceScoreThreshold"
+      : "fastForwardStopLevel";
     NotificationRouter.showWarning(
       `Fast Forward Review: target not reached after ${maxAttempts} attempts (best score ${
         outcome.score ?? "—"
       }/10).` +
+        (explainRubricCap
+          ? ` The review rubric normally keeps the score at ${REVIEW_RUBRIC_BLOCKER_SCORE_CAP} or below whenever any blocker is reported, so a configured ${stopLevelSettingName} of ${configuredStopLevel} cannot be reached while blockers remain — lower ${stopLevelSettingName} to ${REVIEW_RUBRIC_BLOCKER_SCORE_CAP} or resolve the outstanding blockers directly.`
+          : "") +
         (targetStage === "publish" ? " Publish manually once you're satisfied, or use Publish Anyway from Commit and Push." : ""),
       undefined,
       undefined,

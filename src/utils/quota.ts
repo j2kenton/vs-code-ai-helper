@@ -21,18 +21,108 @@ const KEY = "pendingQuotaResume";
 // or an argv-size cap message.
 const QUOTA_MARKERS = ["quota", "rate limit", "ratelimit", "credits", "credit limit", "usage limit", "session limit"];
 const TEMPORARY_MARKERS = ["temporarily unavailable", "service unavailable", "too many requests", "try again later"];
+// Transport-level failures: the request/stream died in transit rather than the
+// service answering with a refusal. Kept separate from TEMPORARY_MARKERS so the
+// two intents stay auditable — TEMPORARY_MARKERS means "the server said no for
+// now", these mean "nobody said anything, the pipe broke".
+//
+// Deliberately narrow. Anything vaguer ("network error", "connection closed",
+// "stream error") is a phrase that occurs in ordinary source code, and for
+// providers whose failure detail is still raw stdout (kiro-cli, codex-cli both
+// echo file contents / model prose into it) a loose marker would classify an
+// unrelated failure as retryable and burn a backup allocation.
+//
+// "streaming response failed" is opencode's wording, taken verbatim from a
+// captured production failure: an event-stream line
+// {"type":"error",...,"error":{"name":"UnknownError","data":{"message":"\"Streaming response failed\""}}}.
+// That shape carries no isRetryable field, so string matching — not the
+// structural signal — is what recognizes it.
+const TRANSPORT_MARKERS = [
+  "streaming response failed",
+  "socket hang up",
+  "econnreset",
+  "econnaborted",
+  "fetch failed",
+  "premature close",
+];
+
+// Authentication failures are terminal for the selected provider. Keep this
+// deliberately broad: providers often label expired credentials as generic
+// unavailability (or even "try again later"-style transient wording) rather
+// than a clean 401/403, so a narrow match would auto-fallback to the backup
+// model on what is actually an auth problem — exactly what callers must
+// never do. Exported for direct unit testing.
+export function isAuthenticationFailure(message: string | undefined): boolean {
+  const value = message ?? "";
+  if (/not\s+installed|command\s+not\s+found|could\s+not\s+start\b/i.test(value)) {
+    return false;
+  }
+  // "session"/"token" tolerate a short word gap (e.g. "session has timed
+  // out", "token has been revoked") instead of requiring the state word to
+  // sit directly next to the noun.
+  return /sign[\s-]*in|log(?:ged|ging)?[\s-]*(?:in|out)|session(?:\s+\w+){0,3}\s+(?:expired|invalid|missing|timed?\s*out)|authenticat\w*|authoris\w*|authoriz\w*|credential|re[-\s]?auth\w*|token(?:\s+\w+){0,3}\s+(?:expired|invalid|missing|revoked)|api\s*key|access\s*denied|permission\s*denied|forbidden|unauthori[sz]ed|\b(?:401|403)\b/i.test(value);
+}
 
 export function isQuotaError(message: string | undefined): boolean {
   const value = (message ?? "").toLowerCase();
   return QUOTA_MARKERS.some((marker) => value.includes(marker));
 }
 
-export function classifyFailure<T extends { errorMessage?: string }>(result: T): T & { failureKind: "quota" | "temporarily-unavailable" | "generic" } {
-  const message = (result.errorMessage ?? "").toLowerCase();
-  return { ...result, failureKind: isQuotaError(result.errorMessage) ? "quota" : TEMPORARY_MARKERS.some(m => message.includes(m)) ? "temporarily-unavailable" : "generic" };
+/**
+ * True when a failure message describes a transport-level drop rather than a
+ * refusal. Such failures are recoverable by retrying or by switching to
+ * another model, so they must not be classified "generic" — see classifyFailure.
+ */
+export function isTransportError(message: string | undefined): boolean {
+  const value = (message ?? "").toLowerCase();
+  return TRANSPORT_MARKERS.some((marker) => value.includes(marker));
 }
 
-export function classifyCliFailure<T extends { status: "completed" | "failed" | "cancelled"; errorMessage?: string }>(result: T): T & { failureKind: "quota" | "temporarily-unavailable" | "generic" } {
+export function classifyFailure<T extends { errorMessage?: string; authDiagnosticText?: string }>(result: T): T & { failureKind: "quota" | "temporarily-unavailable" | "generic" } {
+  const message = (result.errorMessage ?? "").toLowerCase();
+  // Quota first: a rate-limited request whose stream also dropped is a quota
+  // event, and reporting it as a transport blip would retry straight back into
+  // the same limit.
+  //
+  // TEMPORARY_MARKERS may not promote a message that is ALSO an
+  // authentication failure: the text-mode cascade gate (runnerRegistry.ts)
+  // keys on failureKind alone with no auth check of its own (unlike the
+  // implementation-mode gate, which separately consults authFailure before
+  // ever looking at this classification), so a credentials/entitlement
+  // message that happens to also read "service unavailable" would otherwise
+  // cascade through every configured backup model there — exactly what must
+  // never happen for an auth failure. Quota's own markers are left ungated:
+  // they are quota-specific vocabulary that does not plausibly overlap with
+  // an auth message, and a rate-limited request must keep classifying as
+  // quota regardless.
+  //
+  // TRANSPORT_MARKERS is deliberately NOT checked here, even though it once
+  // was: this function is shared with Copilot's own failure classification
+  // and has no provider context, so it cannot tell a structured-stream CLI
+  // (opencode, whose diagnostic text is scoped to parsed error events) from
+  // an opaque one (kiro-cli, codex-cli, whose diagnostic text IS raw
+  // stdout/model prose) — a distinction that matters enormously for whether
+  // a transport-phrase match is trustworthy. See applyTransportTransience
+  // (cliAgentRunner.ts), which has that provider context and applies
+  // TRANSPORT_MARKERS there instead, scoped accordingly.
+  // Prefers authDiagnosticText over errorMessage, mirroring runnerRegistry.ts's
+  // own auth check: on the CLI path errorMessage may already have the
+  // provider's login hint appended (see toFriendlyError in cliAgentRunner.ts),
+  // and that hint text itself contains phrases ("log in", "API key") that
+  // isAuthenticationFailure matches — so scanning errorMessage directly would
+  // let an appended hint re-confirm the very auth verdict that produced it.
+  // authDiagnosticText is absent for non-CLI callers (e.g. Copilot), which
+  // fall back to errorMessage exactly as before.
+  const isAuth = isAuthenticationFailure(result.authDiagnosticText ?? result.errorMessage);
+  const failureKind = isQuotaError(result.errorMessage)
+    ? "quota" as const
+    : !isAuth && TEMPORARY_MARKERS.some(m => message.includes(m))
+      ? "temporarily-unavailable" as const
+      : "generic" as const;
+  return { ...result, failureKind };
+}
+
+export function classifyCliFailure<T extends { status: "completed" | "failed" | "cancelled"; errorMessage?: string; authDiagnosticText?: string }>(result: T): T & { failureKind: "quota" | "temporarily-unavailable" | "generic" } {
   return classifyFailure(result);
 }
 

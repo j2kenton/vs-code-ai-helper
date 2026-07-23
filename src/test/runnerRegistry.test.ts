@@ -11,7 +11,6 @@ import {
   checkImplementationAvailabilityForModel,
   checkRunnerAvailabilityForModel,
   getConfiguredBackupModelsForStage,
-  isAuthenticationFailure,
   recordActiveFallbackModel,
   resolveRunnerForModel,
   runImplementationForModel,
@@ -20,6 +19,7 @@ import {
   resolveFreshModelForStage,
   resolveModelForStage,
 } from "../utils/modelSelection";
+import { isAuthenticationFailure } from "../utils/quota";
 
 const requireModule = createRequire(__filename);
 const childProcess = requireModule("node:child_process") as typeof import("node:child_process");
@@ -1000,6 +1000,172 @@ void describe("runImplementationForModel", () => {
       );
     } finally {
       settings.restore();
+      lm.selectChatModels = originalSelectChatModels;
+      workspace.fs.readFile = originalReadFile;
+      workspace.fs.writeFile = originalWriteFile;
+      fs.rmSync(metaRoot, { recursive: true, force: true });
+    }
+  });
+
+  // Regression coverage for a review finding: the gate combining a CLI
+  // result's structural authFailure verdict with its hint-stripped
+  // authDiagnosticText (runnerRegistry.ts, just above) had every one of its
+  // INGREDIENTS unit-tested in isolation (cliFailureClassification.test.ts),
+  // but nothing drove an actual CLI failure through runImplementationForModel
+  // itself to prove the gate's combination of those ingredients suppresses
+  // the backup cascade — so reverting the gate to its pre-fix form
+  // (`isAuthenticationFailure(result.errorMessage)` alone) left the full
+  // suite green (verified directly against the compiled output).
+  //
+  // The fixture needs TWO things at once, or the cascade's outer failureKind
+  // check makes the auth gate irrelevant either way: (1) opencode's "no
+  // provider available" marker, which matches authErrorMarkers
+  // (authFailure=true) but matches none of isAuthenticationFailure's own
+  // patterns on its own, using an UNQUALIFIED model selection so the
+  // appended login hint is the generic "...connect the OpenCode service for
+  // this model..." text (which also matches nothing) — so neither the
+  // message nor the hint independently trips the regex; and (2) wording
+  // that also classifies failureKind "temporarily-unavailable" (here,
+  // "service temporarily unavailable"), since the cascade is only reachable
+  // at all when failureKind is quota or temporarily-unavailable.
+  void it("does not cascade to backup on a CLI auth failure the errorMessage text alone would not catch", async () => {
+    const originalSpawn = childProcess.spawn;
+    const spawnedCommands: string[] = [];
+
+    childProcess.spawn = ((command: string) => {
+      const child = new EventEmitter() as import("node:child_process").ChildProcess;
+      Object.defineProperty(child, "pid", { value: 4321 });
+      child.stdout = new EventEmitter() as import("node:child_process").ChildProcess["stdout"];
+      child.stderr = new EventEmitter() as import("node:child_process").ChildProcess["stderr"];
+      child.stdin = Object.assign(new EventEmitter(), {
+        write: () => true,
+        end: () => undefined,
+      }) as unknown as import("node:child_process").ChildProcess["stdin"];
+
+      if (/^(which|where\.exe)$/.test(command)) {
+        // The PATH-existence check: report opencode as installed so
+        // resolution proceeds to a real invocation.
+        process.nextTick(() => child.emit("close", 0));
+        return child;
+      }
+
+      spawnedCommands.push(command);
+      process.nextTick(() => {
+        child.stdout?.emit(
+          "data",
+          Buffer.from(
+            `${JSON.stringify({
+              type: "error",
+              error: {
+                name: "APIError",
+                data: { message: "No provider available: service temporarily unavailable" },
+              },
+            })}\n`
+          )
+        );
+        child.emit("close", 1);
+      });
+      return child;
+    }) as typeof childProcess.spawn;
+
+    // The backup is Copilot (LM-stubbed), not a second real CLI provider —
+    // simulating a second CLI's own install-check/auth-check/run lifecycle
+    // through generic spawn mocking is its own can of worms unrelated to
+    // what this test is verifying; an LM stub gives the same yes/no signal
+    // ("was the backup attempted at all") far more simply.
+    const lm = lmStub();
+    const originalSelectChatModels = lm.selectChatModels;
+    let backupAttempted = false;
+    lm.selectChatModels = (): Promise<vscode.LanguageModelChat[]> =>
+      Promise.resolve([
+        {
+          id: "auto",
+          name: "Auto",
+          sendRequest: () => {
+            backupAttempted = true;
+            return Promise.reject(new Error("must not be reached"));
+          },
+        } as unknown as vscode.LanguageModelChat,
+      ]);
+
+    // The backup cascade's own reservation (reserveFallback) needs a real
+    // task-progress.json to CAS against, read/written through
+    // vscode.workspace.fs — which the global stub does not back with the real
+    // filesystem by default. Without this bridge readTaskProgress silently
+    // returns undefined, reserveFallback silently declines, and no backup is
+    // ever attempted regardless of the auth gate: this test passed vacuously
+    // in both directions until this bridge was added (verified directly).
+    const workspace = vscode.workspace as unknown as {
+      fs: {
+        readFile: (uri: vscode.Uri) => Promise<Uint8Array>;
+        writeFile: (uri: vscode.Uri, bytes: Uint8Array) => Promise<void>;
+      };
+    };
+    const originalReadFile = workspace.fs.readFile;
+    const originalWriteFile = workspace.fs.writeFile;
+    workspace.fs.readFile = (uri: vscode.Uri): Promise<Uint8Array> =>
+      fs.promises.readFile(uri.fsPath);
+    workspace.fs.writeFile = (uri: vscode.Uri, bytes: Uint8Array): Promise<void> =>
+      fs.promises.writeFile(uri.fsPath, bytes);
+
+    const metaRoot = fs.mkdtempSync(
+      path.join(os.tmpdir(), "ensemble-impl-auth-gate-")
+    );
+    const taskFolder = path.join(metaRoot, "tasks", "task-a");
+    fs.mkdirSync(taskFolder, { recursive: true });
+    const taskFolderUri = vscode.Uri.file(taskFolder);
+    // runImplementationWithCli's before/after git snapshot runs against
+    // workspaceUri (== taskFolder here). A bare mkdtemp directory under
+    // os.tmpdir() can sit beneath an unrelated, much larger git working tree
+    // on some machines, in which case `git status --untracked-files=all`
+    // walks up and scans THAT tree instead of the empty temp dir — verified
+    // directly: this hung for 8+ seconds against real ambient state before
+    // being made its own repo. `git init` gives it an immediate, empty
+    // status with nothing to walk past.
+    childProcess.execSync("git init", { cwd: taskFolder, stdio: "ignore" });
+    const now = new Date().toISOString();
+    fs.writeFileSync(
+      path.join(taskFolder, "task-progress.json"),
+      JSON.stringify(
+        { taskFolder: "task-a", currentStage: "impl", status: "active", createdAt: now, updatedAt: now },
+        null,
+        2
+      ),
+      "utf8"
+    );
+
+    try {
+      const settings = installModelSettings({
+        impl: {
+          primary: "opencode-cli:default",
+          backup: "auto",
+          strategy: "switch-to-backup",
+        },
+      });
+      try {
+        const result = await runImplementationForModel({
+          modelId: "opencode-cli:default",
+          prompt: "Implement the requested change.",
+          workspaceUri: taskFolderUri,
+          token: new vscode.CancellationTokenSource().token,
+          onProgress: () => undefined,
+          stage: "impl",
+          taskFolderUri,
+        });
+
+        assert.strictEqual(result.status, "failed");
+        assert.strictEqual(result.failureKind, "temporarily-unavailable");
+        assert.strictEqual(
+          backupAttempted,
+          false,
+          "the backup must never be attempted for an auth failure, regardless of what the bare error text says"
+        );
+        assert.deepStrictEqual(spawnedCommands, ["opencode"]);
+      } finally {
+        settings.restore();
+      }
+    } finally {
+      childProcess.spawn = originalSpawn;
       lm.selectChatModels = originalSelectChatModels;
       workspace.fs.readFile = originalReadFile;
       workspace.fs.writeFile = originalWriteFile;

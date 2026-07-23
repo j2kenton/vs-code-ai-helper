@@ -59,6 +59,36 @@ export interface RouteDecision {
 }
 
 /**
+ * The rubric instructs reviewers to keep the score at 7 or below whenever any
+ * blocker is reported (review-scoring-rubric.md: "Blockers of any category
+ * this review uses ... should normally keep the score at 7 or below"). A
+ * configured stop level or auto-advance threshold above this is therefore
+ * unreachable for as long as any blocker keeps getting reported — not a
+ * mis-configuration on the user's part, since the shipped default threshold
+ * (10) already sits above this same cap. See rubricCapLikelyBlockedAdvance.
+ */
+export const REVIEW_RUBRIC_BLOCKER_SCORE_CAP = 7;
+
+/**
+ * Whether a Fast Forward run that failed to reach its configured stop level
+ * most likely hit the rubric's structural cap rather than a genuinely
+ * unresolved implementation problem: the best score it ever reached was
+ * already at or below that cap, while the configured stop level asks for
+ * something higher. Used only to decide whether to explain WHY the target
+ * was never reached — never to change the configured level itself.
+ */
+export function rubricCapLikelyBlockedAdvance(
+  bestScore: number | null,
+  configuredStopLevel: number
+): boolean {
+  return (
+    bestScore !== null &&
+    bestScore <= REVIEW_RUBRIC_BLOCKER_SCORE_CAP &&
+    configuredStopLevel > REVIEW_RUBRIC_BLOCKER_SCORE_CAP
+  );
+}
+
+/**
  * Decide what should happen next for a review round, given its score,
  * classified blockers, and whether this stage has plateaued. This does not
  * itself gate stage advancement — the existing score-threshold auto-advance
@@ -158,3 +188,4 @@ export function decideReviewRoute(input: {
       : "No plateau detected yet.",
   };
 }
+

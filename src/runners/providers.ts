@@ -143,6 +143,24 @@ export interface CliProviderDefinition {
    */
   usesLastMessageFile: boolean;
   /**
+   * Set when this CLI's stdout is a structured JSON-lines EVENT stream whose
+   * non-error events embed arbitrary file contents (tool-read output,
+   * previews, diffs). Names the schema rather than being a bare boolean
+   * because the diagnostic extractor has to know the event shape, not merely
+   * that one exists. Absent (the default) means "stdout is opaque text", and
+   * failure diagnosis keeps scanning `${stderr}\n${stdout}` exactly as before.
+   *
+   * Why this exists: opencode's `run --format json` stream re-emits the full
+   * text of every file the agent reads. Scanning that raw stream for
+   * authErrorMarkers like "api key" / "login" / "authenticate" diagnoses an
+   * authentication failure on any run that merely happened to read an
+   * auth-related source file — observed live, where a mid-stream transport
+   * drop was reported to the user as a Zen billing problem because the agent
+   * had read a file whose prose mentioned an API key. See
+   * extractStructuredCliDiagnostics in cliAgentRunner.ts.
+   */
+  structuredEventStream?: "opencode";
+  /**
    * Retry-evidence capability flag: true ONLY when this provider's CLI
    * protocol verifiably guarantees that tool/edit boundary events are
    * emitted and flushed before any side effect occurs. Edit-capable runs
@@ -837,6 +855,15 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     // (a "text"-typed part), not a separate last-message file — see
     // normalizeCliOutput's opencode-cli branch in cliAgentRunner.ts.
     usesLastMessageFile: false,
+    // That same --format json stream also re-emits every file the agent reads,
+    // so failure diagnosis must read only the stream's own "error" events and
+    // never the raw stream — see extractStructuredCliDiagnostics. Note this
+    // does NOT narrow authErrorMarkers below: a genuine opencode 401 arrives
+    // exclusively as a stdout error event (opencode writes nothing to stderr,
+    // verified across live runs covering success, bad model, missing
+    // credentials and a real 401), and the extractor surfaces that event's
+    // statusCode so the "401" marker below still matches it.
+    structuredEventStream: "opencode",
     buildArgs(mode, model): string[] {
       const args = ["run", "--format", "json"];
       // Verified live against opencode 1.18.4 via `opencode agent list`:

@@ -101,7 +101,8 @@ void describe("CLI output normalization", () => {
     // counts as a recognized event (it has a string "type"), so it also
     // resolves to the placeholder here rather than the raw dump — the
     // non-zero exit code is what actually surfaces an error message
-    // upstream (toFriendlyError reads raw stderr/stdout, not this output).
+    // upstream (toFriendlyError diagnoses a structured-stream provider from
+    // stderr plus the stream's own "error" events, not from this output).
     const noTextStream = [
       JSON.stringify({ type: "step_start", part: { type: "step-start" } }),
       JSON.stringify({ type: "tool_use", part: { type: "tool", tool: "write" } }),
@@ -315,9 +316,14 @@ void describe("CLI output normalization", () => {
       ""
     );
 
-    assert.match(error, /OpenCode Go/);
-    assert.match(error, /Go subscription/);
-    assert.doesNotMatch(error, /Zen billing/);
+    assert.match(error.message, /OpenCode Go/);
+    assert.match(error.message, /Go subscription/);
+    assert.doesNotMatch(error.message, /Zen billing/);
+    // The auth verdict is now returned structurally rather than being left for
+    // downstream to re-derive by regexing a message that already contains the
+    // login hint this call appended.
+    assert.equal(error.authFailure, true);
+    assert.doesNotMatch(error.diagnosticText, /Go subscription/);
   });
 });
 
