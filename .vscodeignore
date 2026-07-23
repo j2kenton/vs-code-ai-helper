@@ -33,6 +33,7 @@ plan-final.md
 # Test and build tooling.
 test-stubs/**
 dist/test/**
+dist/test-host/**
 tsconfig.test.json
 scripts/**
 .pnpm-store/**
