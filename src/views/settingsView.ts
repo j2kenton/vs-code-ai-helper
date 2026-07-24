@@ -180,6 +180,15 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
   private _tableRendered = false;
   private _pendingFocus?: { stage: TaskStage; control: "primary" | "backup" };
   private _conflictsChecked = false;
+  // Set for the duration of this webview's own "saveProviders" write so the
+  // onDidChangeConfiguration listener below can tell "I just wrote this
+  // myself" apart from "provider selection changed some other way (settings
+  // editor, a different window, Global scope)". Provider selection and model
+  // selection are saved independently — saving one must never reset or
+  // discard unsaved edits to the other — so a self-originated provider write
+  // refreshes only the provider rows and each combobox's available options,
+  // never the model-selection form state a full re-init would overwrite.
+  private _selfOriginatedProviderWrite = false;
 
   constructor(private readonly extensionUri: vscode.Uri) {}
 
@@ -234,8 +243,24 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           break;
         }
         case "saveProviders": {
+          // Provider selection is a wholly separate saved setting from model
+          // selection: saving it must never reset or discard unsaved edits
+          // sitting in the model-selection form. Mark this write as
+          // self-originated so the onDidChangeConfiguration listener below
+          // refreshes only the provider rows/combobox options instead of
+          // doing a full re-init (which would overwrite the model form with
+          // whatever is last saved on disk). Left set until the listener
+          // itself consumes it (VS Code dispatches the change event
+          // asynchronously, so clearing it immediately after `await
+          // setEnabledProviders` here could race ahead of that event) —
+          // the fallback timeout below only guards against the event never
+          // arriving at all, so the flag can't leak and block a later,
+          // genuinely external config change.
+          this._selfOriginatedProviderWrite = true;
+          setTimeout(() => { this._selfOriginatedProviderWrite = false; }, 3000);
           await setEnabledProviders(data.enabledProviders);
           NotificationRouter.showInformation("Provider selection saved.");
+          await this._postProvidersRefresh(webviewView.webview);
           break;
         }
         case "refreshQuotaStatus": {
@@ -349,6 +374,11 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           try {
             const terminal = vscode.window.createTerminal({
               name: `Ensemble Usage (${accountEntryDisplayLabel(provider)})`,
+              // A terminal-kind command with a shell hint (e.g. Claude's
+              // usage one-liner, which relies on PowerShell-specific syntax)
+              // must run in that shell regardless of the user's own default
+              // integrated-terminal shell.
+              ...(usage.kind === "terminal" && usage.shell ? { shellPath: usage.shell } : {}),
             });
             terminal.show();
             if (usage.kind === "interactive") {
@@ -391,9 +421,18 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     // itself guards this refresh with the unsaved-changes warning when its
     // form is dirty (an interceptable discard path).
     const configListener = vscode.workspace.onDidChangeConfiguration((event) => {
-      if (webviewView.visible && event.affectsConfiguration("ensemble")) {
-        void this._postInit(webviewView.webview);
+      if (!webviewView.visible || !event.affectsConfiguration("ensemble")) {
+        return;
       }
+      if (this._selfOriginatedProviderWrite) {
+        // This webview's own "saveProviders" handler already posted a
+        // targeted providersRefreshed refresh — a full re-init here would
+        // needlessly re-send (and risk discarding) the model-selection form
+        // state on top of that. Consume the flag and skip.
+        this._selfOriginatedProviderWrite = false;
+        return;
+      }
+      void this._postInit(webviewView.webview);
     });
     webviewView.onDidDispose(() => { configListener.dispose(); });
 
@@ -427,34 +466,58 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       stageNames: STAGE_DISPLAY_NAMES,
       quotaStatus: this._buildQuotaStatus(),
       enabledProviders: getEnabledProviders(),
-      providers: PROVIDER_ACCOUNT_ENTRIES.map((provider) => ({
-        id: provider.id,
-        label: provider.label,
-        signInLabel: provider.signInLabel,
-        signInGuidance: provider.signInGuidance ?? "",
-        // Shown inline in the provider row, not as a tooltip: the user has
-        // to be able to read it before deciding to enable the provider.
-        permissionWarning: provider.permissionWarning ?? "",
-        // UI button state comes from the same capability descriptor the
-        // handler dispatches on: enabled for terminal/interactive/
-        // vscode-command/manual, and also for unsupported when it carries a
-        // usage-page `url` (the button then opens that page instead of
-        // running anything); disabled (with the reason as tooltip) only for
-        // unsupported with no known page to send the user to.
-        usageEnabled: provider.usage.kind !== "unsupported" || provider.usage.url !== undefined,
-        usageTooltip:
-          provider.usage.kind === "unsupported"
-            ? provider.usage.url
-              ? `${provider.usage.reason} Opens the usage page.`
-              : provider.usage.reason
-            : provider.usage.kind === "manual"
-              ? provider.usage.instructions
-              : provider.usage.kind === "interactive"
-                ? `Launches the provider's CLI in a terminal and runs its ${provider.usage.send} command there`
-                : "Runs the provider's usage command in a visible terminal",
-        enabledByDefault: provider.enabledByDefault,
-      })),
+      providers: this._buildProviderViewModels(),
       warnUnsavedSettings: isUnsavedSettingsWarningEnabled(),
+    });
+  }
+
+  /** Shared provider-row view-model builder — see _postInit and _postProvidersRefresh. */
+  private _buildProviderViewModels() {
+    return PROVIDER_ACCOUNT_ENTRIES.map((provider) => ({
+      id: provider.id,
+      label: provider.label,
+      signInLabel: provider.signInLabel,
+      signInGuidance: provider.signInGuidance ?? "",
+      // Shown inline in the provider row, not as a tooltip: the user has
+      // to be able to read it before deciding to enable the provider.
+      permissionWarning: provider.permissionWarning ?? "",
+      // UI button state comes from the same capability descriptor the
+      // handler dispatches on: enabled for terminal/interactive/
+      // vscode-command/manual, and also for unsupported when it carries a
+      // usage-page `url` (the button then opens that page instead of
+      // running anything); disabled (with the reason as tooltip) only for
+      // unsupported with no known page to send the user to.
+      usageEnabled: provider.usage.kind !== "unsupported" || provider.usage.url !== undefined,
+      usageTooltip:
+        provider.usage.kind === "unsupported"
+          ? provider.usage.url
+            ? `${provider.usage.reason} Opens the usage page.`
+            : provider.usage.reason
+          : provider.usage.kind === "manual"
+            ? provider.usage.instructions
+            : provider.usage.kind === "interactive"
+              ? `Launches the provider's CLI in a terminal and runs its ${provider.usage.send} command there`
+              : "Runs the provider's usage command in a visible terminal",
+      enabledByDefault: provider.enabledByDefault,
+    }));
+  }
+
+  /**
+   * Refresh ONLY the provider rows and each model combobox's available
+   * options after a "saveProviders" write — deliberately does NOT include
+   * `settings` (the model-selection form state). Provider selection and
+   * model selection are independently saved settings; a provider-selection
+   * save must never reset or discard unsaved edits sitting in the model
+   * form the way a full `_postInit` re-init would (see
+   * _selfOriginatedProviderWrite's doc comment).
+   */
+  private async _postProvidersRefresh(webview: vscode.Webview): Promise<void> {
+    const models = await getAvailableModels();
+    void webview.postMessage({
+      type: "providersRefreshed",
+      models,
+      enabledProviders: getEnabledProviders(),
+      providers: this._buildProviderViewModels(),
     });
   }
 
@@ -772,6 +835,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
              "settings-table"/"stages-tbody" ids so the show/hide and
              delegated-listener wiring below is unchanged. -->
         <div id="settings-table" hidden>
+          <p class="provider-help">Models labeled "free" are offered at no cost by their provider today, but that isn't guaranteed to stay true — check with the provider directly and keep an eye on your own usage. Free models may also be less reliable than paid ones (slower, more likely to be rate-limited or unavailable).</p>
           <div id="stages-tbody">
             <!-- Will be populated dynamically -->
           </div>
@@ -944,6 +1008,25 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               if (!formDirty) {
                 renderTable();
               }
+            } else if (message.type === 'providersRefreshed') {
+              // A provider-selection save, refreshed independently of the
+              // model-selection form: currentSettings (and formDirty) are
+              // deliberately left untouched here, so unsaved model edits
+              // survive a provider save intact. Re-rendering the table only
+              // when it isn't mid-edit mirrors the quotaStatus refresh above.
+              providers = message.providers || [];
+              enabledProviders = message.enabledProviders || {};
+              availableModels = message.models || [];
+              renderProviderSelection();
+              if (!formDirty) {
+                renderTable();
+              } else {
+                // Dirty form: don't rebuild the table (that would discard
+                // unsaved edits and dynamically-added extra backup rows),
+                // but still reflect the newly enabled/disabled providers on
+                // the already-rendered comboboxes.
+                refreshModelComboboxDisplays();
+              }
             } else if (message.type === 'focusStage') {
               const row = document.getElementById('row-' + message.stage);
               if (row) {
@@ -1060,6 +1143,48 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                 \${disabledNote}
               </div>
             \`;
+          }
+
+          // Refreshes each already-rendered combobox's displayed label and
+          // "provider disabled" note in place, without touching hidden.value
+          // or rebuilding the table — used after a provider-selection save
+          // while the model form is dirty, so unsaved edits (including
+          // dynamically-added extra backup rows) survive, but stage rows
+          // reflect the new provider-enabled set immediately rather than
+          // waiting for a later clean re-render. The dropdown choices
+          // themselves need no separate refresh: getChoices() reads the
+          // module-level availableModels directly, so it's already current.
+          function refreshModelComboboxDisplays() {
+            document.querySelectorAll('.model-combobox').forEach(box => {
+              const hidden = box.querySelector('input[type="hidden"]');
+              const input = box.querySelector('.model-combo-input');
+              if (!hidden || !input) return;
+              const selectedId = hidden.value;
+              if (!selectedId) {
+                // No confirmed selection — leave alone so in-progress typing
+                // (hidden.value is cleared as soon as the user types) isn't
+                // clobbered.
+                return;
+              }
+              const selectedModel = findModelById(selectedId);
+              const providerDisabled = !selectedModel && isStoredModelProviderDisabled(selectedId);
+              input.value = selectedModel
+                ? modelLabel(selectedModel)
+                : providerDisabled
+                  ? selectedId + ' (provider disabled)'
+                  : 'Unknown model: ' + selectedId;
+              let note = box.querySelector('.provider-disabled-note');
+              if (providerDisabled) {
+                if (!note) {
+                  note = document.createElement('div');
+                  note.className = 'provider-disabled-note';
+                  note.textContent = 'This model\\'s provider is disabled in Provider Selection above; the stage is treated as unconfigured until the provider is re-enabled or another model is chosen.';
+                  box.appendChild(note);
+                }
+              } else if (note) {
+                note.remove();
+              }
+            });
           }
 
           function setupModelCombobox(row, kind, stage) {
@@ -1263,7 +1388,6 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                   ? '<p class="provider-warning">' + escapeHtml(provider.permissionWarning) + '</p>'
                   : '')
               ).join('') +
-              '<p class="provider-help">Enabled providers determine which models are offered below. Sign-in and usage checks run in a visible terminal; the extension reports them as launched, not as succeeded.</p>' +
               '<div class="btn-container"><button id="save-providers-btn" title="Save the enabled provider selection">Save Provider Selection</button></div>' +
               '</fieldset>';
             container.querySelectorAll('[data-signin-provider]').forEach(button => {
@@ -1324,7 +1448,6 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                   <div class="extra-backups"></div>
                   <button type="button" class="secondary add-backup" title="Add another backup model for this stage">+ Add another backup</button>
                   <span class="backup-limit">1/10</span>
-                  <p class="provider-help">With Fallback Strategy set to "Switch to Backup", these are tried automatically, in order — not only when the primary hits a quota/availability error, but also when its response comes back unusable (e.g. fails content validation). Each attempt sends the same prompt and uses that model's own quota. OpenCode Zen and OpenCode Go are separate services: selecting a backup from the other tier is an explicit cross-tier fallback and can use that tier's billing or subscription.</p>
                 </div>
               \`;
 

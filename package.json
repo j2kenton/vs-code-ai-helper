@@ -445,6 +445,11 @@
         "when": "!vs-code-ai-helper.tasksInitialized || vs-code-ai-helper.isLoadingTasks"
       },
       {
+        "view": "vs-code-ai-helper.statusView",
+        "contents": "Loading…",
+        "when": "!vs-code-ai-helper.statusViewInitialized"
+      },
+      {
         "view": "vs-code-ai-helper.tasksView",
         "contents": "Open a workspace folder to start tracking tasks. Ensemble stores task metadata in `.ensemble`.\n[Start New Task](command:vs-code-ai-helper.startNewTask)",
         "when": "vs-code-ai-helper.tasksInitialized && !vs-code-ai-helper.isLoadingTasks && !vs-code-ai-helper.hasMetaFolder"

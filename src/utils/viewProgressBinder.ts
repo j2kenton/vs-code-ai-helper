@@ -28,13 +28,16 @@ export class ViewProgressBinder implements vscode.Disposable {
   }
 
   private sync(): void {
-    const busy = this.registry.hasAny();
+    // hasAnyRunning() (not hasAny()) — an operation that is only waiting on
+    // the user is not "in progress" from the user's point of view, so it
+    // must not keep the progress bar spinning either.
+    const busy = this.registry.hasAnyRunning();
     if (busy && !this.resolveIdle && !this.showTimer) {
       // Debounced show: only surface the bar if the registry is still busy
       // once the delay elapses, so sub-delay operations never flash it.
       this.showTimer = setTimeout(() => {
         this.showTimer = undefined;
-        if (!this.registry.hasAny() || this.resolveIdle) {
+        if (!this.registry.hasAnyRunning() || this.resolveIdle) {
           return;
         }
         const idle = new Promise<void>((r) => {

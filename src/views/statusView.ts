@@ -48,6 +48,8 @@ export interface StatusOperationNode {
   readonly detail?: string;
   /** Shows the inline cancel button (see the ensemble-operation-cancellable menu contribution). */
   readonly cancellable: boolean;
+  /** See TaskOperationHandle.setWaitingForUser — swaps the spinner for a non-spinning "waiting" icon. */
+  readonly waitingForUser: boolean;
 }
 
 export type StatusTreeNode = StatusEntry | StatusOperationNode;
@@ -100,7 +102,7 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
     // by reload rather than silently losing its Notifications row.
     const interrupted = state?.get<SerializedOperation[]>(RUNNING_OPERATIONS_STATE_KEY, []) ?? [];
     for (const snapshot of interrupted) {
-      const entry = terminalEntryFor({ ...snapshot, state: "interrupted" });
+      const entry = terminalEntryFor({ ...snapshot, state: "interrupted", waitingForUser: false });
       if (entry) {
         this.entries.unshift({
           message: entry.message,
@@ -227,8 +229,10 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
       const label = `${element.label} — ${element.taskName}`;
       const item = new vscode.TreeItem(label, vscode.TreeItemCollapsibleState.None);
       item.id = `running:${element.id}`;
-      item.description = element.detail ?? "running";
-      item.iconPath = new vscode.ThemeIcon("loading~spin", new vscode.ThemeColor("charts.blue"));
+      item.description = element.detail ?? (element.waitingForUser ? "waiting for you" : "running");
+      item.iconPath = element.waitingForUser
+        ? new vscode.ThemeIcon("comment-unresolved", new vscode.ThemeColor("charts.yellow"))
+        : new vscode.ThemeIcon("loading~spin", new vscode.ThemeColor("charts.blue"));
       // Cancellable operations get an inline stop button via the
       // view/item/context menu contribution keyed on this contextValue.
       item.contextValue = element.cancellable
@@ -363,6 +367,7 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
         taskName: op.taskName,
         detail: op.detail,
         cancellable: op.cancellable,
+        waitingForUser: op.waitingForUser,
       }));
       return [...runningNodes, ...this.entries.filter((entry) => this.levelFilter.has(entry.level))];
     }

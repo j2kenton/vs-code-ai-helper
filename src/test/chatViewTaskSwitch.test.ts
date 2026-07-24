@@ -19,6 +19,17 @@ import * as vscode from "vscode";
 
 import { ChatViewProvider } from "../views/chatView";
 import { readChatHistory } from "../utils/chatHistoryStore";
+import { initNotificationRouter, deactivateNotificationRouter, StatusSurface } from "../utils/notificationRouter";
+
+/** ask() now raises an internal Notifications entry for every question
+ * (see chatView.ts's notifyWaitingForFeedback) — a no-op stub surface so
+ * that doesn't throw "NotificationRouter is not initialized" in this file's
+ * tests, none of which assert on notification content. */
+function installNotificationRouterStub(): { restore: () => void } {
+  const stub: StatusSurface = { addEntry: (): void => { /* no-op */ } };
+  initNotificationRouter(stub);
+  return { restore: (): void => deactivateNotificationRouter() };
+}
 
 /** Bridges vscode.workspace.fs.readFile to the real filesystem, mirroring
  * chatHistoryStore.test.ts's installReadFileBridge. */
@@ -126,6 +137,7 @@ void describe("ChatViewProvider.ask() task-switch behavior", () => {
   void it("writes the question to its own task but does not refocus/retarget the view when a different task is current", async () => {
     const rf = installReadFileBridge();
     const cmds = installExecuteCommandCapture();
+    const notify = installNotificationRouterStub();
     const folderA = makeTaskFolder("a");
     const folderB = makeTaskFolder("b");
     const provider = new ChatViewProvider(makeMemento());
@@ -161,6 +173,7 @@ void describe("ChatViewProvider.ask() task-switch behavior", () => {
     } finally {
       rf.restore();
       cmds.restore();
+      notify.restore();
       fs.rmSync(folderA, { recursive: true, force: true });
       fs.rmSync(folderB, { recursive: true, force: true });
     }
@@ -169,6 +182,7 @@ void describe("ChatViewProvider.ask() task-switch behavior", () => {
   void it("focuses the view when the question's task is already the current target", async () => {
     const rf = installReadFileBridge();
     const cmds = installExecuteCommandCapture();
+    const notify = installNotificationRouterStub();
     const folderA = makeTaskFolder("same");
     const provider = new ChatViewProvider(makeMemento());
 
@@ -192,6 +206,7 @@ void describe("ChatViewProvider.ask() task-switch behavior", () => {
     } finally {
       rf.restore();
       cmds.restore();
+      notify.restore();
       fs.rmSync(folderA, { recursive: true, force: true });
     }
   });
@@ -199,6 +214,7 @@ void describe("ChatViewProvider.ask() task-switch behavior", () => {
   void it("focuses the view when nothing is currently open", async () => {
     const rf = installReadFileBridge();
     const cmds = installExecuteCommandCapture();
+    const notify = installNotificationRouterStub();
     const folder = makeTaskFolder("none-open");
     const provider = new ChatViewProvider(makeMemento());
 
@@ -219,6 +235,7 @@ void describe("ChatViewProvider.ask() task-switch behavior", () => {
     } finally {
       rf.restore();
       cmds.restore();
+      notify.restore();
       fs.rmSync(folder, { recursive: true, force: true });
     }
   });

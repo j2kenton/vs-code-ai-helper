@@ -16,6 +16,7 @@ import {
 import { looksLikeGeneratedImplementationSummary } from "../utils/implementationArtifactResolver";
 import { getMaxImplementationIterations } from "../config/settings";
 import { notifyDesktop } from "../utils/desktopNotifier";
+import { NotificationRouter } from "../utils/notificationRouter";
 
 /**
  * Reserved artifact filenames the implementation stage writes inside a task
@@ -492,8 +493,10 @@ export async function runImplementationWithCopilot(options: {
   token: vscode.CancellationToken;
   onProgress: (message: string) => void;
   onBusyDetail?: (detail: string | undefined) => void;
+  /** See TaskOperationHandle.setWaitingForUser — set around the round-limit pause below. */
+  onWaitingForUser?: (waiting: boolean) => void;
 }): Promise<ImplementationRunResult> {
-  const { prompt, modelId, workspaceUri, token, onProgress, onBusyDetail } = options;
+  const { prompt, modelId, workspaceUri, token, onProgress, onBusyDetail, onWaitingForUser } = options;
 
   const filesChanged = new Set<string>();
 
@@ -586,12 +589,20 @@ export async function runImplementationWithCopilot(options: {
       });
     }
     onBusyDetail?.("waiting for your answer — round limit reached");
+    onWaitingForUser?.(true);
     notifyDesktop("Ensemble — question", `The implementation reached its ${maxIterations}-round limit. Continue working?`);
+    // Genuinely blocking: the loop cannot resume without this choice, so it
+    // gets the "can't proceed" error rather than the softer "waiting for
+    // feedback" warning used for non-blocking questions.
+    NotificationRouter.showError(
+      `Can't proceed without your input — ${nodePath.basename(workspaceUri.fsPath)}: implementation reached its ${maxIterations}-round limit and needs "Continue" or "Cancel."`
+    );
     const choice = await vscode.window.showWarningMessage(
       `The implementation reached its ${maxIterations}-round limit. Continue working?`,
       "Continue", "Cancel"
     );
     onBusyDetail?.(undefined);
+    onWaitingForUser?.(false);
     if (choice !== "Continue") {
       return classifyFailure<ImplementationRunResult>({
         status: "failed",

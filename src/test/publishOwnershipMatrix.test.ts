@@ -1,17 +1,26 @@
 /**
  * Regression coverage for the Publish auto-run ownership matrix (plan area
- * A1): auto-advancing past the final Low-Level Code Review directly onto
- * Publish must have exactly one scheduling owner for the eventual publish
- * chain — never both a follow-up Publish review AND a direct auto-publish
- * dispatch racing for the same task.
+ * A1), for the "commit and push must never run automatically, only from the
+ * user's explicit button click" requirement: `stageTransition.ts` has no
+ * `shouldAutoPublish` concept, and neither `ReviewCommandArg` nor
+ * `ApplyReviewOptions` carries any auto-publish flag to thread from it — so
+ * there is no plumbing left anywhere in this file's call graph that could
+ * ever schedule `vs-code-ai-helper.commitAndPushTask` automatically. Landing
+ * on Publish, from every entry point covered here, only ever surfaces a
+ * manual "Publish" / "Publish Anyway" nudge (a `NotificationRouter.showWarning`
+ * pointing at the `commitAndPushTask` command) — the command itself is never
+ * dispatched by any of these paths.
  *
  * AUTO_REVIEW_TRANSITIONS deliberately has no entry landing on "publish"
  * (impl-low-review is itself a review stage, not the plain stage the map
  * requires), so `transition.shouldAutoReview` is always false there —
- * ownership for the Publish landing is decided directly from the auto-advance
- * mode instead: "auto-fast-forward" gets a follow-up Publish review (which
- * then owns auto-publish once its own score clears the threshold), plain
- * "auto" auto-publishes directly.
+ * whether a follow-up Publish review is dispatched at all is decided
+ * directly from the auto-advance mode: "auto-fast-forward" still gets a
+ * follow-up Publish review dispatched (that IS a review, not a commit/push,
+ * and remains in scope for automation); plain "auto" mode dispatches
+ * nothing further onto Publish, only the manual nudge. Either way, nothing
+ * this file exercises can ever reach `commitAndPushTask` without the user
+ * clicking it.
  */
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
@@ -262,7 +271,7 @@ async function runPassingReview(
 }
 
 void describe("Publish auto-run ownership matrix — auto-advance landing on Publish", () => {
-  void it("auto-fast-forward mode: dispatches exactly one follow-up Publish review carrying autoPublishOnSuccess, never a direct auto-publish chain", async () => {
+  void it("auto-fast-forward mode: dispatches exactly one follow-up Publish review — commit/push only runs from the user's explicit click", async () => {
     const { folderPath } = makeTaskFolder(`ff-${Math.floor(Math.random() * 1e9)}`);
     const provider = new StatusTreeProvider();
     initNotificationRouter(provider);
@@ -280,8 +289,6 @@ void describe("Publish auto-run ownership matrix — auto-advance landing on Pub
       assert.equal(dispatches.length, 1, "exactly one scheduling owner — no race between review and direct publish");
       assert.equal(dispatches[0]?.command, "vs-code-ai-helper.fastForwardReviewWithAI");
       assert.equal(dispatches[0]?.chainId, "auto-review");
-      const arg = dispatches[0]?.arg as { autoPublishOnSuccess?: boolean } | undefined;
-      assert.equal(arg?.autoPublishOnSuccess, true, "the follow-up Publish review must own auto-publish");
     } finally {
       for (const p of patches.reverse()) { p.restore(); }
       wsStub.restore();
@@ -291,7 +298,7 @@ void describe("Publish auto-run ownership matrix — auto-advance landing on Pub
     }
   });
 
-  void it("plain auto mode: dispatches the publish chain directly, with no follow-up review", async () => {
+  void it("plain auto mode: never auto-publishes and dispatches no follow-up review either — commit/push only runs from the user's explicit click", async () => {
     const { folderPath } = makeTaskFolder(`auto-${Math.floor(Math.random() * 1e9)}`);
     const provider = new StatusTreeProvider();
     initNotificationRouter(provider);
@@ -310,9 +317,11 @@ void describe("Publish auto-run ownership matrix — auto-advance landing on Pub
     try {
       await runPassingReview(folderPath, dispatches);
 
-      assert.equal(dispatches.length, 1, "exactly one scheduling owner");
-      assert.equal(dispatches[0]?.command, "vs-code-ai-helper.commitAndPushTask");
-      assert.equal(dispatches[0]?.chainId, "auto-publish");
+      assert.equal(
+        dispatches.length,
+        0,
+        "auto-advancing onto Publish in plain 'auto' mode never schedules the publish chain, and this mode never dispatches a follow-up review either"
+      );
     } finally {
       for (const p of patches.reverse()) { p.restore(); }
       wsStub.restore();
@@ -397,7 +406,7 @@ void describe("Publish auto-run ownership matrix — auto-advance landing on Pub
 });
 
 void describe("Publish auto-run ownership matrix — dropped auto-review chain warns instead of silently stalling", () => {
-  void it("auto-fast-forward landing on Publish: when the shared auto-review chain slot is already claimed, warns with Publish Anyway instead of leaving the task silently stuck", async () => {
+  void it("auto-fast-forward landing on Publish: when the shared auto-review chain slot is already claimed, warns with a Publish Anyway action", async () => {
     const { folderPath } = makeTaskFolder(`dropped-chain-${Math.floor(Math.random() * 1e9)}`);
     const taskFolderUri = vscode.Uri.file(folderPath);
     const provider = new StatusTreeProvider();
@@ -455,12 +464,22 @@ void describe("Publish auto-run ownership matrix — dropped auto-review chain w
         {}
       );
 
-      const warning = provider
+      // This follow-up review can never auto-publish (there is no
+      // auto-publish scheduling path anywhere in reviewActions.ts) — but
+      // landing on Publish always gets the manual "Publish Anyway" nudge
+      // once its follow-up review chain is dropped, regardless of why that
+      // review was dispatched in the first place.
+      const publishAnywayWarning = provider
         .getEntries()
         .find((entry) => entry.actionCommand?.command === "vs-code-ai-helper.commitAndPushTask");
-      assert.ok(warning, "expected a Notifications entry offering the manual publish action after the dropped review chain");
-      assert.equal(warning?.actionCommand?.title, "Publish Anyway");
-      assert.match(warning?.message ?? "", /could not be started automatically/);
+      assert.ok(publishAnywayWarning, "expected a Publish Anyway warning once the follow-up review chain was dropped");
+      assert.equal(publishAnywayWarning.actionCommand?.title, "Publish Anyway");
+      assert.deepEqual(publishAnywayWarning.actionCommand?.args, [{ taskFolderPath: taskFolderUri.fsPath }]);
+      assert.match(
+        publishAnywayWarning.message,
+        /could not be started automatically/,
+        "expected the warning to explain that the follow-up review was dropped"
+      );
     } finally {
       for (const p of patches.reverse()) { p.restore(); }
       resetAutomationChainGuards();
@@ -472,7 +491,7 @@ void describe("Publish auto-run ownership matrix — dropped auto-review chain w
   });
 });
 
-void describe("Publish review-owned auto-publish — failure/below-threshold outcomes still offer a manual publish action", () => {
+void describe("Publish review — failure/below-threshold outcomes still offer a manual publish action", () => {
   void it("below-threshold score: does not dispatch auto-publish, but warns with a Publish Anyway action", async () => {
     const { folderPath } = makeTaskFolder(`below-${Math.floor(Math.random() * 1e9)}`, "publish");
     const provider = new StatusTreeProvider();
@@ -489,8 +508,7 @@ void describe("Publish review-owned auto-publish — failure/below-threshold out
         folderPath,
         dispatches,
         "Readiness: 3/10\n\n- Not ready.\n",
-        "publish",
-        { autoPublishOnSuccess: true }
+        "publish"
       );
 
       assert.equal(dispatches.length, 0, "a below-threshold score must never schedule the publish chain");
@@ -529,8 +547,7 @@ void describe("Publish review-owned auto-publish — failure/below-threshold out
         folderPath,
         dispatches,
         "I have a clarifying question instead of a review.\n",
-        "publish",
-        { autoPublishOnSuccess: true }
+        "publish"
       );
 
       assert.equal(dispatches.length, 0, "an unusable review output must never schedule the publish chain");
@@ -608,7 +625,7 @@ async function runReviewWithOutcome(
   }
 }
 
-void describe("Publish review-owned auto-publish — genuine provider failure and cancellation outcomes", () => {
+void describe("Publish review — genuine provider failure and cancellation outcomes still offer a manual publish action", () => {
   void it("provider error (runner returns status 'failed'): does not dispatch auto-publish, but warns with a Publish Anyway action", async () => {
     const { folderPath } = makeTaskFolder(`provider-error-${Math.floor(Math.random() * 1e9)}`, "publish");
     const provider = new StatusTreeProvider();
@@ -626,8 +643,7 @@ void describe("Publish review-owned auto-publish — genuine provider failure an
         folderPath,
         dispatches,
         { runnerId: "stub-runner", status: "failed", errorMessage: "stub: provider returned a 500" },
-        "publish",
-        { autoPublishOnSuccess: true }
+        "publish"
       );
 
       assert.equal(dispatches.length, 0, "a genuine provider failure must never schedule the publish chain");
@@ -662,8 +678,7 @@ void describe("Publish review-owned auto-publish — genuine provider failure an
         folderPath,
         dispatches,
         { runnerId: "stub-runner", status: "cancelled" },
-        "publish",
-        { autoPublishOnSuccess: true }
+        "publish"
       );
 
       assert.equal(dispatches.length, 0, "a cancelled review must never schedule the publish chain");
@@ -754,7 +769,7 @@ void describe("Fast Forward Review — the Publish preflight's Completion Checks
 });
 
 void describe("Publish auto-run ownership matrix — manual entry routes (command-level)", () => {
-  void it("setTaskStage: manual jump onto Publish is entry-owned — dispatches auto-publish directly with { taskFolderPath }", async () => {
+  void it("setTaskStage: manual jump onto Publish never auto-publishes, even with a passing preflight — commit/push only runs from the user's explicit click", async () => {
     const { folderPath } = makeTaskFolder(`jump-${Math.floor(Math.random() * 1e9)}`, "impl-low-review");
     const provider = new StatusTreeProvider();
     initNotificationRouter(provider);
@@ -774,10 +789,10 @@ void describe("Publish auto-run ownership matrix — manual entry routes (comman
     try {
       await setTaskStage(inv, currentStore, { taskFolderPath: folderPath, stage: "publish" }, "jump");
 
-      assert.equal(dispatches.length, 1, "exactly one scheduling owner for a manual jump onto Publish");
-      assert.equal(dispatches[0]?.command, "vs-code-ai-helper.commitAndPushTask");
-      assert.equal(dispatches[0]?.chainId, "auto-publish");
-      assert.deepEqual(dispatches[0]?.arg, { taskFolderPath: folderPath });
+      // setTaskStage.ts has no auto-publish scheduling path at all — landing
+      // on Publish via a manual jump only ever computes the preflight result
+      // for its own nudge (below), never a scheduling decision.
+      assert.equal(dispatches.length, 0, "a manual jump onto Publish must never schedule the publish chain automatically, regardless of preflight outcome");
     } finally {
       for (const p of patches.reverse()) { p.restore(); }
       wsStub.restore();
@@ -787,7 +802,7 @@ void describe("Publish auto-run ownership matrix — manual entry routes (comman
     }
   });
 
-  void it("setTaskStage: manual jump onto Publish never dispatches when the preflight fails, and warns with Publish Anyway instead", async () => {
+  void it("setTaskStage: manual jump onto Publish with a failing preflight still never auto-publishes, but still warns with a Publish Anyway action", async () => {
     const { folderPath } = makeTaskFolder(`jump-fail-${Math.floor(Math.random() * 1e9)}`, "impl-low-review");
     const provider = new StatusTreeProvider();
     initNotificationRouter(provider);
@@ -808,12 +823,13 @@ void describe("Publish auto-run ownership matrix — manual entry routes (comman
       await setTaskStage(inv, currentStore, { taskFolderPath: folderPath, stage: "publish" }, "jump");
 
       assert.equal(dispatches.length, 0, "a failed preflight must never schedule the publish chain");
+      // setTaskStage.ts surfaces the failing-checks warning unconditionally on
+      // landing on Publish, so the user still learns checks are failing and
+      // gets a one-click way to publish anyway.
       const warning = provider
         .getEntries()
         .find((entry) => entry.actionCommand?.command === "vs-code-ai-helper.commitAndPushTask");
-      assert.ok(warning, "expected a Notifications entry offering the manual publish action");
-      assert.equal(warning?.actionCommand?.title, "Publish Anyway");
-      assert.deepEqual(warning?.actionCommand?.args, [{ taskFolderPath: folderPath }]);
+      assert.ok(warning, "a Publish Anyway warning should appear for the failing preflight");
     } finally {
       for (const p of patches.reverse()) { p.restore(); }
       wsStub.restore();
@@ -823,7 +839,7 @@ void describe("Publish auto-run ownership matrix — manual entry routes (comman
     }
   });
 
-  void it("nextStage: triggers-AI off — entry-owned, dispatches auto-publish directly after lint, no Publish review", async () => {
+  void it("nextStage: triggers-AI off — never auto-publishes and dispatches no Publish review either, regardless of a passing lint", async () => {
     const { folderPath } = makeTaskFolder(`nextstage-off-${Math.floor(Math.random() * 1e9)}`, "impl-low-review");
     const provider = new StatusTreeProvider();
     initNotificationRouter(provider);
@@ -860,10 +876,11 @@ void describe("Publish auto-run ownership matrix — manual entry routes (comman
         }
       );
 
-      assert.equal(dispatches.length, 1, "exactly one scheduling owner — triggers-AI off is entry-owned");
-      assert.equal(dispatches[0]?.command, "vs-code-ai-helper.commitAndPushTask");
-      assert.equal(dispatches[0]?.chainId, "auto-publish");
-      assert.deepEqual(dispatches[0]?.arg, { taskFolderPath: folderPath });
+      // Step 3b (nextStage's entry-owned Publish nudge) never schedules
+      // anything — it only reads the preflight result to choose which nudge
+      // wording to show — so this landing on Publish schedules nothing at
+      // all, even though the lint passed.
+      assert.equal(dispatches.length, 0, "triggers-AI off must never auto-publish, and dispatches no Publish review either");
     } finally {
       for (const p of patches.reverse()) { p.restore(); }
       wsStub.restore();
@@ -935,10 +952,13 @@ void describe("Publish auto-run ownership matrix — manual entry routes (comman
     try {
       await nextStage(vscode.Uri.file(isolatedRoot), context, undefined);
 
-      assert.equal(dispatches.length, 1, "the keyboard shortcut must resolve the current task and actually dispatch the same advance a tree-button click would");
-      assert.equal(dispatches[0]?.command, "vs-code-ai-helper.commitAndPushTask");
-      assert.equal(dispatches[0]?.chainId, "auto-publish");
-      assert.deepEqual(dispatches[0]?.arg, { taskFolderPath: folderPath });
+      // Landing on Publish never dispatches anything (there is no
+      // auto-publish scheduling path) — proving the keyboard shortcut
+      // resolved and actually advanced the right task has to go through the
+      // persisted stage instead of a dispatch.
+      const written = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as TaskProgress;
+      assert.equal(written.currentStage, "publish", "the keyboard shortcut must resolve the current task and actually advance it, exactly like the tree-button click");
+      assert.equal(dispatches.length, 0, "triggers-AI off must never auto-publish");
     } finally {
       for (const p of patches.reverse()) { p.restore(); }
       ws.workspaceFolders = origWorkspaceFolders;
@@ -950,7 +970,7 @@ void describe("Publish auto-run ownership matrix — manual entry routes (comman
     }
   });
 
-  void it("nextStage: triggers-AI on — review-owned, dispatches exactly one Publish review carrying autoPublishOnSuccess, never a direct publish chain", async () => {
+  void it("nextStage: triggers-AI on — review-owned, dispatches exactly one Publish review, never a direct publish chain", async () => {
     const { folderPath } = makeTaskFolder(`nextstage-on-${Math.floor(Math.random() * 1e9)}`, "impl-low-review");
     const provider = new StatusTreeProvider();
     initNotificationRouter(provider);
@@ -989,80 +1009,8 @@ void describe("Publish auto-run ownership matrix — manual entry routes (comman
       assert.equal(dispatches.length, 1, "exactly one scheduling owner — triggers-AI on is review-owned");
       assert.equal(dispatches[0]?.command, "vs-code-ai-helper.runReviewWithAI");
       assert.equal(dispatches[0]?.chainId, "auto-review");
-      const arg = dispatches[0]?.arg as { autoPublishOnSuccess?: boolean; taskFolderPath?: string } | undefined;
-      assert.equal(arg?.autoPublishOnSuccess, true, "the follow-up Publish review must own auto-publish");
+      const arg = dispatches[0]?.arg as { taskFolderPath?: string } | undefined;
       assert.equal(arg?.taskFolderPath, folderPath);
-    } finally {
-      for (const p of patches.reverse()) { p.restore(); }
-      wsStub.restore();
-      fsBridge.restore();
-      provider.dispose();
-      deactivateNotificationRouter();
-    }
-  });
-
-  void it("a manual Publish review dispatched WITHOUT autoPublishOnSuccess never auto-publishes, even on a passing score", async () => {
-    const { folderPath } = makeTaskFolder(`manual-review-${Math.floor(Math.random() * 1e9)}`, "publish");
-    const provider = new StatusTreeProvider();
-    initNotificationRouter(provider);
-    const fsBridge = installFsBridge();
-    const wsStub = installWorkspaceFoldersStub();
-    const dispatches: AutomationDispatch[] = [];
-    const patches: Patched[] = [
-      patch(settingsModule, "isAutoAdvanceEnabled", () => false),
-      patch(settingsModule, "getAutoAdvanceScoreThreshold", () => 8),
-    ];
-    try {
-      // reviewOptions omits autoPublishOnSuccess entirely — simulates a plain
-      // manual "Run Review with AI" click on the Publish stage, not a
-      // dispatch that threaded the auto-publish flag through.
-      await runPassingReview(
-        folderPath,
-        dispatches,
-        "Readiness: 9/10\n\n- Ready.\n",
-        "publish",
-        {}
-      );
-
-      assert.equal(
-        dispatches.length,
-        0,
-        "a manual review run without autoPublishOnSuccess must never schedule the publish chain, even at a passing score"
-      );
-    } finally {
-      for (const p of patches.reverse()) { p.restore(); }
-      wsStub.restore();
-      fsBridge.restore();
-      provider.dispose();
-      deactivateNotificationRouter();
-    }
-  });
-
-  void it("suppressAutoPublishDispatch on a passing, autoPublishOnSuccess-flagged review still suppresses the dispatch", async () => {
-    const { folderPath } = makeTaskFolder(`suppressed-${Math.floor(Math.random() * 1e9)}`, "publish");
-    const provider = new StatusTreeProvider();
-    initNotificationRouter(provider);
-    const fsBridge = installFsBridge();
-    const wsStub = installWorkspaceFoldersStub();
-    const dispatches: AutomationDispatch[] = [];
-    const patches: Patched[] = [
-      patch(settingsModule, "isAutoAdvanceEnabled", () => false),
-      patch(settingsModule, "getAutoAdvanceScoreThreshold", () => 8),
-    ];
-    try {
-      await runPassingReview(
-        folderPath,
-        dispatches,
-        "Readiness: 9/10\n\n- Ready.\n",
-        "publish",
-        { autoPublishOnSuccess: true, suppressAutoPublishDispatch: true }
-      );
-
-      assert.equal(
-        dispatches.length,
-        0,
-        "suppressAutoPublishDispatch must override a passing score + autoPublishOnSuccess and prevent dispatch"
-      );
     } finally {
       for (const p of patches.reverse()) { p.restore(); }
       wsStub.restore();
@@ -1074,8 +1022,8 @@ void describe("Publish auto-run ownership matrix — manual entry routes (comman
 });
 
 void describe("Publish auto-run ownership matrix — passing review, composite, reopen, and execution-time recheck", () => {
-  void it("a passing, autoPublishOnSuccess-flagged Publish review dispatches auto-publish directly with { taskFolderPath }", async () => {
-    const { folderPath } = makeTaskFolder(`passing-${Math.floor(Math.random() * 1e9)}`, "publish");
+  void it("a passing manual Publish review never auto-publishes — it only nudges toward the manual Publish action", async () => {
+    const { folderPath } = makeTaskFolder(`manual-review-${Math.floor(Math.random() * 1e9)}`, "publish");
     const provider = new StatusTreeProvider();
     initNotificationRouter(provider);
     const fsBridge = installFsBridge();
@@ -1086,18 +1034,25 @@ void describe("Publish auto-run ownership matrix — passing review, composite, 
       patch(settingsModule, "getAutoAdvanceScoreThreshold", () => 8),
     ];
     try {
+      // A plain manual "Run Review with AI" click on the Publish stage —
+      // reviewOptions carries nothing that could ever thread an auto-publish
+      // decision through, because reviewActions.ts has no such plumbing left
+      // anywhere in its call graph (see the file's header comment). This must
+      // never schedule commitAndPushTask, only nudge toward it.
       await runPassingReview(
         folderPath,
         dispatches,
         "Readiness: 9/10\n\n- Ready.\n",
-        "publish",
-        { autoPublishOnSuccess: true }
+        "publish"
       );
 
-      assert.equal(dispatches.length, 1, "a passing, flagged Publish review must schedule exactly one publish chain");
-      assert.equal(dispatches[0]?.command, "vs-code-ai-helper.commitAndPushTask");
-      assert.equal(dispatches[0]?.chainId, "auto-publish");
-      assert.deepEqual(dispatches[0]?.arg, { taskFolderPath: folderPath });
+      assert.equal(dispatches.length, 0, "a passing Publish review must never schedule the publish chain — only the user's own click may");
+      const nudge = provider
+        .getEntries()
+        .find((entry) => entry.actionCommand?.command === "vs-code-ai-helper.commitAndPushTask");
+      assert.ok(nudge, "expected a Notifications entry offering the manual publish action");
+      assert.equal(nudge?.actionCommand?.title, "Publish");
+      assert.deepEqual(nudge?.actionCommand?.args, [{ taskFolderPath: vscode.Uri.file(folderPath).fsPath }]);
     } finally {
       for (const p of patches.reverse()) { p.restore(); }
       wsStub.restore();
@@ -1133,11 +1088,10 @@ void describe("Publish auto-run ownership matrix — passing review, composite, 
         dispatches.push(dispatch);
         return Promise.resolve(true);
       }),
-      // The composite's own internal advance to Publish uses transition kind
-      // "complete-commit-push", which AUTO_PUBLISH_ELIGIBLE_KINDS hard-excludes
-      // (stageTransition.ts) — so no `shouldAutoPublish`-gated scheduling path
-      // is even reachable here. What must be proven at the COMMAND level is
-      // that the composite instead calls commitAndPushTask inline (which never
+      // The composite's own internal advance to Publish has no auto-publish
+      // scheduling path to begin with (stageTransition.ts has no such
+      // concept at all). What must be proven at the COMMAND level is that
+      // the composite instead calls commitAndPushTask inline (which never
       // itself calls scheduleAutomationChain — see grep of commitAndPushTask.ts)
       // and that its own fresh git-readiness recheck actually runs.
       patch(gitRepoInfoModule, "checkGitPublishReadiness", (): Promise<{ ok: false; reason: string }> => {
@@ -1360,7 +1314,7 @@ void describe("Publish auto-run ownership matrix — implReviewFiles scope consi
     }
   });
 
-  void it("auto-advance onto Publish (plain 'auto' mode, entry-owned): scopes the preflight to the task's implReviewFiles", async () => {
+  void it("auto-advance onto Publish (plain 'auto' mode, entry-owned nudge): scopes the preflight to the task's implReviewFiles and never schedules the publish chain", async () => {
     const { folderPath } = makeTaskFolder(`scope-autoadvance-${Math.floor(Math.random() * 1e9)}`);
     const progressPath = path.join(folderPath, "task-progress.json");
     const progress = JSON.parse(fs.readFileSync(progressPath, "utf8")) as TaskProgress;
@@ -1378,11 +1332,17 @@ void describe("Publish auto-run ownership matrix — implReviewFiles scope consi
       patch(settingsModule, "getAutoAdvanceScoreThreshold", () => 8),
     ];
     try {
+      // Landing on Publish in plain "auto" mode never dispatches a follow-up
+      // review or the publish chain — instead it always computes the
+      // preflight itself (reviewActions.ts's entry-owned "Publish manually"
+      // nudge, just above the auto-advance tail's return) so it can pick the
+      // right nudge wording. That preflight call must use the same
+      // implReviewFiles scope as every other entry point, complementing the
+      // sibling scope-jump/scope-nextstage tests above.
       const calls = await captureRelevantFiles(() => runPassingReview(folderPath, dispatches));
       assert.equal(calls.length, 1, "expected exactly one checkPublishPreflight call");
       assert.deepEqual(calls[0], scopeFiles);
-      assert.equal(dispatches.length, 1, "expected the entry-owned auto-publish chain to still be scheduled");
-      assert.equal(dispatches[0]?.chainId, "auto-publish");
+      assert.equal(dispatches.length, 0, "auto-advancing onto Publish in plain 'auto' mode must never schedule the publish chain");
     } finally {
       for (const p of patches.reverse()) { p.restore(); }
       wsStub.restore();

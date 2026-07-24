@@ -457,7 +457,14 @@ export async function chatWithStage(
     }
     const response = splitQuestionEnvelope(`${withoutUpdate}${updateNote}${actionNote}`.trim());
     if (response.answer) await chatViewProvider.append("assistant", response.answer, targetStage, { canonicalId: task.canonicalId, taskFolderPath: task.taskFolderPath });
-    if (response.question) await chatViewProvider.ask({ canonicalId: task.canonicalId, taskFolderPath: task.taskFolderPath, stage: targetStage, question: response.question });
+    if (response.question) {
+      // Non-blocking: this chat exchange has already completed (the AI's
+      // reply just happens to end in a question) — work elsewhere can still
+      // proceed without an answer. ask()'s default `notify` (a warning, not
+      // an error) reflects that; it also raises the internal Notifications
+      // entry, so no separate call is needed here.
+      await chatViewProvider.ask({ canonicalId: task.canonicalId, taskFolderPath: task.taskFolderPath, stage: targetStage, question: response.question });
+    }
     if (!response.answer && !response.question) await chatViewProvider.append("assistant", "The stage AI did not return an answer.", targetStage, { canonicalId: task.canonicalId, taskFolderPath: task.taskFolderPath });
     });
   } catch (error) {
@@ -517,6 +524,9 @@ export function registerChatWithStageCommand(context: vscode.ExtensionContext, i
   ));
   context.subscriptions.push(vscode.commands.registerCommand(
     "vs-code-ai-helper.postStageQuestion",
-    (question: import("../views/chatView").StageChatQuestion) => chatViewProvider.ask(question)
+    // This command IS the notification's own "Open Chat" action — the user
+    // already saw the "waiting for feedback" notification that led them
+    // here, so re-invoking ask() must not raise another one.
+    (question: import("../views/chatView").StageChatQuestion) => chatViewProvider.ask(question, false, false)
   ));
 }

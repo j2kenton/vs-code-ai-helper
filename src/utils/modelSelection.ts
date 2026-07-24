@@ -582,14 +582,14 @@ function createSeededClaudeCliModels(): readonly DiscoveredCliModel[] {
       ["xhigh", "Extra High"],
       ["max", "Max"],
     ]),
-    { model: "fable", name: "Fable 5 [only on Max plan]" },
+    { model: "fable", name: "Fable 5" },
     ...createVariants("fable", "Fable 5", [
       ["low", "Low"],
       ["medium", "Medium"],
       ["high", "High"],
       ["xhigh", "Extra High"],
       ["max", "Max"],
-    ], "only on Max plan"),
+    ]),
     { model: "opus", name: "Opus 4.8" },
     ...createVariants("opus", "Opus 4.8", [
       ["low", "Low"],
@@ -1460,25 +1460,3 @@ export function describeModelSource(
   }
 }
 
-export function describeResolvedModel(
-  resolved: ResolvedStageModel,
-  availableModels: readonly SelectableModel[]
-): string {
-  const modelId = resolved.modelId;
-  const source = resolved.source;
-
-  let modelName = "Automatic (no explicit selection)";
-  if (modelId) {
-    const found = availableModels.find((m) => m.id === modelId);
-    modelName = found ? `${found.name} (${modelId})` : `${modelId} (currently unavailable)`;
-  }
-
-  switch (source) {
-    case "task":
-      return `${modelName} (explicit task override)`;
-    case "workspace":
-      return `${modelName} (inherited workspace default)`;
-    case "none":
-      return "Automatic (no explicit selection)";
-  }
-}

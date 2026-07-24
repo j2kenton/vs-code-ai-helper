@@ -11,6 +11,7 @@ import {
   runTrackedOperation,
   linkCancellationTokens,
   TaskOperationHandle,
+  cancelRunningOperationsForTask,
 } from "../utils/taskOperations";
 import {
   EscalationKind,
@@ -314,15 +315,6 @@ type ReviewCommandArg =
        * set by UI surfaces.
        */
       followUpReviewMode?: "auto-fast-forward";
-      /**
-       * Carried only by automation-chain dispatches that landed on the
-       * Publish stage through an auto-publish-eligible transition (see
-       * AUTO_PUBLISH_ELIGIBLE_KINDS). When set, a Publish review (including
-       * every re-review inside a Fast Forward loop) that clears the
-       * auto-advance score threshold schedules the publish command
-       * (commit and push) itself. Never set by UI surfaces.
-       */
-      autoPublishOnSuccess?: boolean;
     }
   | undefined;
 
@@ -342,20 +334,6 @@ function chainedFollowUpReviewMode(
     : undefined;
 }
 
-/**
- * Extract the chained auto-publish-on-success request from a
- * ReviewCommandArg, if present. Defaults to false for any arg shape that
- * doesn't explicitly carry it (including all UI-triggered invocations).
- */
-function chainedAutoPublishOnSuccess(arg: ReviewCommandArg): boolean {
-  return !!(
-    arg &&
-    typeof arg === "object" &&
-    "autoPublishOnSuccess" in arg &&
-    arg.autoPublishOnSuccess
-  );
-}
-
 interface ApplyReviewOptions {
   /** Skip repeated dirty/non-git workspace confirmations for internally chained runs. */
   skipImplementationSafetyCheck?: boolean;
@@ -373,20 +351,6 @@ interface ApplyReviewOptions {
    * `options.parentOperation` checks around the `begin`/`end` calls below.
    */
   parentOperation?: TaskOperationHandle;
-  /**
-   * Skip runReviewForFolder's own review-owned auto-publish dispatch (the
-   * "auto-publish" scheduleAutomationChain calls gated on
-   * `transition.shouldAutoPublish` / `options.autoPublishOnSuccess`).
-   * Threaded alongside ExecuteImplementationRunOptions.suppressAutoReviewDispatch
-   * for the same reason: a caller that owns a multi-attempt loop over several
-   * internal re-review passes (e.g. a future Fast Forward step that wants to
-   * defer publish scheduling until the whole loop — not just one internal
-   * attempt — has settled) can suppress the per-attempt dispatch and decide
-   * when to schedule it itself. Not currently set by any call site; this is
-   * the plumbing for that case, off (undefined) everywhere today, so it
-   * changes no existing dispatch behavior.
-   */
-  suppressAutoPublishDispatch?: boolean;
 }
 
 interface ExecuteImplementationRunOptions {
@@ -395,6 +359,7 @@ interface ExecuteImplementationRunOptions {
   /** Preserve a stage's active fallback reservation across one internal retry loop. */
   preserveActiveFallback?: boolean;
   onBusyDetail?: (detail: string | undefined) => void;
+  onWaitingForUser?: (waiting: boolean) => void;
   /**
    * Tracked operation this run executes under. When set, the post-run
    * auto-review registers as a child of it (C1 nesting), so the stage-row
@@ -1868,15 +1833,6 @@ export async function runReviewForFolder(
      * defect).
      */
     operation?: TaskOperationHandle;
-    /**
-     * When set, a Publish review (targetStage "publish", which has no
-     * further stage to auto-advance into) that clears the auto-advance score
-     * threshold schedules the publish command (commit and push) itself —
-     * the review-owned auto-publish path. See AUTO_PUBLISH_ELIGIBLE_KINDS.
-     */
-    autoPublishOnSuccess?: boolean;
-    /** See ApplyReviewOptions.suppressAutoPublishDispatch. */
-    suppressAutoPublishDispatch?: boolean;
   } = {}
 ): Promise<void> {
   const targetStage = REVIEW_TARGETS[currentStage];
@@ -2060,17 +2016,14 @@ export async function runReviewForFolder(
         () => undefined
       );
       const message = error instanceof Error ? error.message : String(error);
-      const wantedAutoPublish =
-        targetStage === "publish" &&
-        !!options.autoPublishOnSuccess &&
-        !options.suppressAutoPublishDispatch;
+      const isPublishReview = targetStage === "publish";
       NotificationRouter.showWarning(
         `Review was generated but not published: ${message}` +
-          (wantedAutoPublish ? " Publish manually once you're satisfied." : ""),
+          (isPublishReview ? " Publish manually once you're satisfied." : ""),
         undefined,
         undefined,
         undefined,
-        wantedAutoPublish
+        isPublishReview
           ? {
               command: "vs-code-ai-helper.commitAndPushTask",
               title: "Publish Anyway",
@@ -2091,7 +2044,7 @@ export async function runReviewForFolder(
         // whether to keep quietly iterating, get a deliberate second
         // opinion, or escalate to the human. `escalated` is true only for
         // the second two — in that case this round just paused the task, so
-        // the auto-publish/auto-advance blocks below (which independently
+        // the publish-nudge/auto-advance blocks below (which independently
         // re-derive "should this land" from the score alone) must not run:
         // decideReviewRoute can escalate even when `meetsThreshold` is true
         // (e.g. a reported blocker is still task-fixable despite the
@@ -2110,39 +2063,28 @@ export async function runReviewForFolder(
           threshold: autoAdvanceThreshold,
           cancellationToken: options.operation?.token,
         });
-        // Review-owned auto-publish is intentionally independent of the
-        // general "auto-advance stage" setting below: this Publish review was
-        // dispatched specifically because autoPublishOnSuccess was requested
-        // (triggers-AI-on direct entry, or a configured follow-up Publish
-        // review after auto-advancing into Publish), so a passing score must
-        // schedule publishing regardless of whether the unrelated
-        // stage-auto-advance toggle happens to be on or off. commitAndPushTask
-        // still shows its own confirmation dialogs, so this never silently
-        // commits or pushes.
-        if (
-          !escalated &&
-          targetStage === "publish" &&
-          options.autoPublishOnSuccess &&
-          !options.suppressAutoPublishDispatch
-        ) {
+        // Publish has no further stage to auto-advance into (see the `next`
+        // block below), so this is the only notification a Publish review
+        // produces. Commit and Push must only ever run from the user's own
+        // button click — never scheduled here — so this always just nudges
+        // toward the manual action, regardless of how the review was
+        // triggered.
+        if (!escalated && targetStage === "publish") {
           if (meetsThreshold) {
-            NotificationRouter.showInformation(`Review score ${score}/10 reached the auto-advance threshold. Scheduling publish...`);
-            void scheduleAutomationChain(
+            NotificationRouter.showWarning(
+              `Review score ${score}/10 reached the auto-advance threshold. Publish manually when you're ready.`,
+              undefined,
+              undefined,
+              undefined,
               {
                 command: "vs-code-ai-helper.commitAndPushTask",
-                arg: { taskFolderPath: folderUri.fsPath },
-                taskKey: folderUri.fsPath,
-                chainId: "auto-publish",
-              },
-              options.operation
+                title: "Publish",
+                args: [{ taskFolderPath: folderUri.fsPath }],
+              }
             );
           } else {
-            // Review-owned auto-publish was requested but the score fell
-            // below the auto-advance threshold — do not schedule publishing,
-            // but still give the user a one-click way to publish anyway
-            // instead of leaving them to rediscover Commit and Push.
             NotificationRouter.showWarning(
-              `Auto-publish skipped for ${folderUri.fsPath}: Publish review scored ${score}/10, below the auto-advance threshold. ` +
+              `Publish review scored ${score}/10, below the auto-advance threshold for ${folderUri.fsPath}. ` +
                 "Publish manually once you're satisfied, or use Publish Anyway from Commit and Push.",
               undefined,
               undefined,
@@ -2182,8 +2124,7 @@ export async function runReviewForFolder(
             // review call above can run for minutes, during which the user
             // may pause the task specifically to stop automation. Passing a
             // stale/hardcoded "not paused" here would let shouldAutoReview
-            // and shouldAutoPublish fire anyway even though the task is now
-            // paused.
+            // fire anyway even though the task is now paused.
             const freshProgressForAdvance = await readTaskProgress(folderUri);
             const isPausedForAdvance = freshProgressForAdvance?.status === "paused";
             const transition = await advanceStage(folderUri, targetStage, next, isPausedForAdvance, "auto-advance", true, reviewAttemptId, publishArtifact);
@@ -2218,16 +2159,13 @@ export async function runReviewForFolder(
               // reached FROM its immediately preceding non-review stage
               // qualifies — impl-low-review is itself a review stage, so
               // transition.shouldAutoReview is always false when landing on
-              // Publish). Publish's follow-up-review ownership is therefore
+              // Publish). Publish's follow-up-review dispatch is therefore
               // decided separately, directly from the auto-advance mode: in
               // "auto-fast-forward" mode every other landed-on review stage
               // gets an immediate follow-up review via this same block, so
-              // Publish gets the same treatment for consistency — that
-              // review owns auto-publish (threaded autoPublishOnSuccess,
-              // scheduling the chain itself once its score clears the
-              // threshold). In plain "auto" mode there is no follow-up
-              // review, so this entry point owns scheduling the publish
-              // chain directly, exactly as before.
+              // Publish gets the same treatment for consistency. In plain
+              // "auto" mode there is no follow-up review, so the entry-owned
+              // block below nudges the user to publish manually instead.
               const publishFollowUpReview =
                 next === "publish" && getAutoAdvanceMode() === "auto-fast-forward";
               if (transition.shouldAutoReview || publishFollowUpReview) {
@@ -2241,15 +2179,6 @@ export async function runReviewForFolder(
                 const reviewCommand = getAutoAdvanceMode() === "auto-fast-forward"
                   ? "vs-code-ai-helper.fastForwardReviewWithAI"
                   : "vs-code-ai-helper.runReviewWithAI";
-                // suppressAutoPublishDispatch tells THIS run not to dispatch
-                // auto-publish itself; it must not leak past that into a
-                // downstream review claiming ownership on this run's behalf,
-                // even though ReviewCommandArg (the dispatched command's own
-                // arg shape) has no field to carry the suppression further —
-                // scoping it here is what actually keeps the suppress signal
-                // honored for the follow-up this call controls.
-                const followUpOwnsAutoPublish =
-                  publishFollowUpReview && !options.suppressAutoPublishDispatch;
                 // This review may itself have been dispatched under the same
                 // "auto-review" chainId (e.g. nextStage's Step 4, or this
                 // same handoff one stage earlier) and that outer dispatch's
@@ -2285,29 +2214,22 @@ export async function runReviewForFolder(
                     command: reviewCommand,
                     arg: {
                       taskFolderPath: folderUri.fsPath,
-                      autoPublishOnSuccess: followUpOwnsAutoPublish
-                        ? transition.shouldAutoPublish
-                        : undefined,
                     },
                     taskKey: folderUri.fsPath,
                     chainId: "auto-review",
                   },
                   options.operation
                 );
-                if (followUpOwnsAutoPublish && transition.shouldAutoPublish) {
-                  // This follow-up review is the sole owner of auto-publish for
-                  // this landing (the entry-owned fallback below is gated on
-                  // !publishFollowUpReview specifically to avoid double-owning
-                  // it). If the shared "auto-review" chainId drops this dispatch
+                if (next === "publish") {
+                  // If the shared "auto-review" chainId drops this dispatch
                   // because another review chain is already pending/running,
-                  // neither the review nor the publish it would have scheduled
-                  // ever happens — warn instead of leaving the task silently
-                  // stuck on Publish with nothing running, matching every
-                  // sibling skip path's Publish Anyway affordance.
+                  // the task is silently stuck on Publish with nothing
+                  // running — warn with the same Publish Anyway affordance
+                  // every sibling skip path uses.
                   void reviewChainScheduled.then((scheduled) => {
                     if (!scheduled) {
                       NotificationRouter.showWarning(
-                        `Auto-publish skipped for ${folderUri.fsPath}: the follow-up Publish review could not be started automatically because another review is already in progress for this task. ` +
+                        `${folderUri.fsPath}: the follow-up Publish review could not be started automatically because another review is already in progress for this task. ` +
                           "Run the review manually once it finishes, or use Publish Anyway from Commit and Push.",
                         undefined,
                         undefined,
@@ -2321,8 +2243,7 @@ export async function runReviewForFolder(
                     }
                   });
                 } else {
-                  // No auto-publish ownership riding on this dispatch (a
-                  // plain review-to-review handoff, e.g. plan-high-review ->
+                  // A plain review-to-review handoff (e.g. plan-high-review ->
                   // plan-low-review) — still warn if it was dropped, or the
                   // task is silently left parked on the new review stage
                   // with nothing running and no way for the user to notice.
@@ -2335,31 +2256,18 @@ export async function runReviewForFolder(
                   });
                 }
               }
-              if (
-                next === "publish" &&
-                transition.shouldAutoPublish &&
-                !publishFollowUpReview &&
-                !options.suppressAutoPublishDispatch
-              ) {
-                // Same gate as the entry-owned paths (setTaskStage.ts,
-                // nextStage's own Step 3 above): auto-advancing straight onto
-                // Publish must not schedule the publish chain before
-                // completion checks have even run once for this landing.
-                // commitAndPushTask still has its own gate/modal, but
-                // scheduling unconditionally here was a false promise that
-                // checks had passed — surface the failure and let the user
-                // publish manually instead of silently skipping the schedule.
-                // relevantFiles must match every other scheduling-decision
-                // call site (setTaskStage.ts, nextStage's Step 3, and this
-                // command's own execution-time recheck) — otherwise this gate
-                // and the recheck can disagree on identical state.
+              if (next === "publish" && !publishFollowUpReview) {
+                // Reached only in plain "auto" mode (no follow-up review is
+                // dispatched above): nudge the user to publish manually.
+                // Commit and Push must only ever run from the user's own
+                // button click — never scheduled here.
                 const autoAdvancePublishPreflight = await checkPublishPreflight(
                   folderUri,
                   freshProgressForAdvance?.implReviewFiles
                 );
                 if (autoAdvancePublishPreflight.ok === false) {
                   NotificationRouter.showWarning(
-                    `Auto-publish skipped for ${STAGE_DISPLAY_NAMES[next]}: ${autoAdvancePublishPreflight.reason}. ` +
+                    `${STAGE_DISPLAY_NAMES[next]} checks failed for ${folderUri.fsPath}: ${autoAdvancePublishPreflight.reason}. ` +
                       "Publish manually once checks pass, or use Publish Anyway from Commit and Push.",
                     undefined,
                     undefined,
@@ -2371,14 +2279,16 @@ export async function runReviewForFolder(
                     }
                   );
                 } else {
-                  void scheduleAutomationChain(
+                  NotificationRouter.showWarning(
+                    `${STAGE_DISPLAY_NAMES[next]} checks passed for ${folderUri.fsPath}. Publish manually when you're ready.`,
+                    undefined,
+                    undefined,
+                    undefined,
                     {
                       command: "vs-code-ai-helper.commitAndPushTask",
-                      arg: { taskFolderPath: folderUri.fsPath },
-                      taskKey: folderUri.fsPath,
-                      chainId: "auto-publish",
-                    },
-                    options.operation
+                      title: "Publish",
+                      args: [{ taskFolderPath: folderUri.fsPath }],
+                    }
                   );
                 }
               }
@@ -2386,27 +2296,21 @@ export async function runReviewForFolder(
           }
           // Publish has no further stage for computeNextStage to return, so
           // `next` is always falsy here when targetStage is "publish" — the
-          // review-owned auto-publish schedule for that case runs above,
-          // independent of isAutoAdvanceEnabled().
+          // Publish-review nudge for that case runs above (the `!escalated
+          // && targetStage === "publish"` block), independent of
+          // isAutoAdvanceEnabled().
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        // Same condition as the CAS/rename-failure catch above: only offer
-        // Publish Anyway when this review run was actually the one meant to
-        // own auto-publish — otherwise the button would be a non sequitur
-        // for a plan/impl review that has nothing to do with Publish.
-        const wantedAutoPublish =
-          targetStage === "publish" &&
-          !!options.autoPublishOnSuccess &&
-          !options.suppressAutoPublishDispatch;
+        const isPublishReview = targetStage === "publish";
         NotificationRouter.showWarning(
           `Review was published, but auto-advancing past the score threshold failed: ${message}. ` +
             "Advance the stage manually." +
-            (wantedAutoPublish ? " Publish manually once you're satisfied, or use Publish Anyway from Commit and Push." : ""),
+            (isPublishReview ? " Publish manually once you're satisfied, or use Publish Anyway from Commit and Push." : ""),
           undefined,
           undefined,
           undefined,
-          wantedAutoPublish
+          isPublishReview
             ? {
                 command: "vs-code-ai-helper.commitAndPushTask",
                 title: "Publish Anyway",
@@ -2426,14 +2330,13 @@ export async function runReviewForFolder(
         `The review for ${folderUri.fsPath} was generated but could not be recorded. Try running the review again.`
       );
     }
-  } else if (targetStage === "publish" && options.autoPublishOnSuccess && !options.suppressAutoPublishDispatch) {
+  } else if (targetStage === "publish") {
     // The Publish review failed, was cancelled, or was stalled (runAiToFile
-    // already surfaced the specific error/cancellation message). Because
-    // this review was dispatched specifically to own auto-publish, its
-    // failure must not leave the task silently stuck — give the user a
-    // one-click path to publish anyway instead of only a dead-end error.
+    // already surfaced the specific error/cancellation message). Give the
+    // user a one-click path to publish anyway instead of only a dead-end
+    // error.
     NotificationRouter.showWarning(
-      `Auto-publish skipped for ${folderUri.fsPath}: the Publish review did not complete successfully. ` +
+      `${folderUri.fsPath}: the Publish review did not complete successfully. ` +
         "Publish manually once you're satisfied, or use Publish Anyway from Commit and Push.",
       undefined,
       undefined,
@@ -2613,7 +2516,7 @@ export async function runReviewWithAI(
         workspaceRoot,
         resolved.progress.currentStage,
         true,
-        { operation: op, autoPublishOnSuccess: chainedAutoPublishOnSuccess(arg) }
+        { operation: op }
       )
   );
 }
@@ -2769,8 +2672,6 @@ export async function applyReviewWithAI(
               {
                 preserveActiveFallback: options.preserveActiveFallback,
                 operation: op,
-                autoPublishOnSuccess: chainedAutoPublishOnSuccess(arg),
-                suppressAutoPublishDispatch: options.suppressAutoPublishDispatch,
               }
             )
         );
@@ -2850,8 +2751,6 @@ export async function applyReviewWithAI(
             {
               preserveActiveFallback: options.preserveActiveFallback,
               operation: op,
-              autoPublishOnSuccess: chainedAutoPublishOnSuccess(arg),
-              suppressAutoPublishDispatch: options.suppressAutoPublishDispatch,
             }
           )
       );
@@ -2983,7 +2882,7 @@ export async function fastForwardReviewWithAI(
         title: `Running initial ${STAGE_DISPLAY_NAMES[targetStage] ?? "review"} before fast-forwarding...`,
         cancellable: false,
       },
-      () => runReviewForFolder(extensionUri, resolved.folderUri, workspaceRoot, stage, true, { operation: op, autoPublishOnSuccess: chainedAutoPublishOnSuccess(arg) })
+      () => runReviewForFolder(extensionUri, resolved.folderUri, workspaceRoot, stage, true, { operation: op })
     );
     initialContent = await readNonEmptyText(reviewUri);
     if (!initialContent) {
@@ -3014,7 +2913,6 @@ export async function fastForwardReviewWithAI(
   // resolveTask re-prompting (it already resolved the task once above).
   const concreteArg: ReviewCommandArg = {
     taskFolderPath: resolved.folderUri.fsPath,
-    autoPublishOnSuccess: chainedAutoPublishOnSuccess(arg),
   };
 
   let previousContent = initialContent;
@@ -3074,7 +2972,7 @@ export async function fastForwardReviewWithAI(
     );
   } catch (error) {
     if (error instanceof vscode.CancellationError) {
-      if (targetStage === "publish" && chainedAutoPublishOnSuccess(arg)) {
+      if (targetStage === "publish") {
         NotificationRouter.showWarning(
           `Fast Forward Review cancelled after ${attemptNumber} attempt(s). ` +
             "Publish manually once you're satisfied, or use Publish Anyway from Commit and Push.",
@@ -3094,12 +2992,11 @@ export async function fastForwardReviewWithAI(
       }
       return;
     }
-    if (targetStage === "publish" && chainedAutoPublishOnSuccess(arg)) {
+    if (targetStage === "publish") {
       // Any other failure (provider error, apply-review failure, etc.) also
-      // forfeits the scheduled auto-publish — give the same one-click way to
-      // publish anyway rather than only the generic operation-failed
-      // notification the tracked-operation wrapper will also emit once this
-      // rethrows.
+      // prevents publishing — give the same one-click way to publish anyway
+      // rather than only the generic operation-failed notification the
+      // tracked-operation wrapper will also emit once this rethrows.
       const message = error instanceof Error ? error.message : String(error);
       NotificationRouter.showWarning(
         `Fast Forward Review failed after ${attemptNumber} attempt(s): ${message} ` +
@@ -3317,6 +3214,9 @@ async function applyImplementationReviewWithAI(
       ...options,
       suppressAutoReviewDispatch: true,
       onBusyDetail: options.parentOperation ? (d) => options.parentOperation!.report(d) : undefined,
+      onWaitingForUser: options.parentOperation
+        ? (w) => options.parentOperation!.setWaitingForUser(w)
+        : undefined,
     }
   );
 }
@@ -3431,6 +3331,23 @@ export async function nextStage(
     return;
   }
 
+  // "Complete Stage & Move On" must abort whatever the current stage was
+  // still running FIRST — before resolving configured review stages (which
+  // can itself be slow), before the artifact-existence check below (which
+  // can itself return early), before any transition work (including the
+  // plan-promotion write), and before (when enabled) the next stage's own
+  // automation kicks off. Otherwise a still-running process for the
+  // outgoing stage either keeps running after this click returns early, or
+  // races the plan-promotion write / the incoming stage's own automation,
+  // instead of being handed off cleanly.
+  const cancelResult = await cancelRunningOperationsForTask(resolved.folderUri.fsPath);
+  if (!cancelResult.ok) {
+    NotificationRouter.showError(
+      `Could not advance ${resolved.progress.taskFolder}: ${cancelResult.reason}`
+    );
+    return;
+  }
+
   const configuredStages = await resolveConfiguredReviewStages(resolved.folderUri);
   const next = computeNextStage(resolved.progress.currentStage, configuredStages);
   if (!next) {
@@ -3521,17 +3438,13 @@ export async function nextStage(
   //   compute lint result — checkPublishPreflight below runs immediately on
   //     the transition to Publish, in its default side-effect-free mode (it
   //     does not persist anything; this is a scheduling decision, not a
-  //     publish attempt), and its result gates entry-owned auto-publish in
-  //     Step 3b below — previously that result was collected but never
-  //     consulted, so auto-publish was scheduled even when checks had just
-  //     failed. It is deliberately NOT computed (or consulted) for the
-  //     review-owned path: when a Publish review is about to be dispatched,
-  //     ownership of the auto-publish decision belongs to that review's
-  //     outcome (score + execution-time recheck in commitAndPushTask), not to
-  //     a snapshot taken before the review — and possibly before a
-  //     Fast Forward repair loop — has run. Gating the review dispatch on a
-  //     pre-review snapshot would let stale/repairable failures permanently
-  //     suppress auto-publish even after the review fixes them.
+  //     publish attempt), and its result feeds the entry-owned publish nudge
+  //     in Step 3b below. It is deliberately NOT computed (or consulted) for
+  //     the review-owned path: when a Publish review is about to be
+  //     dispatched, that review's own outcome (score + the recheck
+  //     commitAndPushTask does when the user actually clicks Publish) is
+  //     what matters, not a snapshot taken before the review — and possibly
+  //     before a Fast Forward repair loop — has run.
   //   refresh final rendered state — inventory watcher handles this
   let publishPreflight: Awaited<ReturnType<typeof checkPublishPreflight>> | undefined;
   if (next === "publish" && !completeAndMoveOnTriggersAI()) {
@@ -3558,16 +3471,6 @@ export async function nextStage(
     const target = {
       taskFolderPath: resolved.folderUri.fsPath,
       followUpReviewMode,
-      // Threaded through to the dispatched Publish review so that once its
-      // score clears the auto-advance threshold, the review itself schedules
-      // the publish command (review-owned auto-publish path). Harmless on
-      // the plan/impl branches below, which don't read this field.
-      // Intentionally not gated on any pre-review preflight snapshot: the
-      // review's own outcome (score threshold) plus commitAndPushTask's
-      // execution-time recheck are what actually decide whether publishing
-      // proceeds, so a Fast Forward repair that fixes a failing check can
-      // still result in the review completing publish.
-      autoPublishOnSuccess: transitionResult.shouldAutoPublish,
     };
     if (next === "plan") {
       await scheduleAutomationChain({
@@ -3591,10 +3494,10 @@ export async function nextStage(
     if (next === "publish") {
       // Publish is also a destination-stage action. No preflight is computed
       // here — the dispatched Publish review (and, for "auto-fast-forward",
-      // its repair loop) owns the auto-publish decision; commitAndPushTask
-      // rechecks preflight itself once the review actually schedules
-      // publishing. "auto-fast-forward" runs the review + fixes loop where
-      // applicable — Publish lands on a review, so it applies here.
+      // its repair loop) surfaces its own "Publish manually" nudge once it
+      // completes; commitAndPushTask rechecks preflight itself when the user
+      // actually clicks Publish. "auto-fast-forward" runs the review + fixes
+      // loop where applicable — Publish lands on a review, so it applies here.
       const publishCommand = getCompleteAndMoveOnTriggersAIMode() === "auto-fast-forward"
         ? "vs-code-ai-helper.fastForwardReviewWithAI"
         : "vs-code-ai-helper.runReviewWithAI";
@@ -3602,13 +3505,13 @@ export async function nextStage(
       if (!reviewScheduled) {
         // Dropped by the shared "auto-review" duplicate-chain guard — some
         // other review chain for this task is already pending or running.
-        // Do NOT fall through to Step 3b's entry-owned auto-publish: no
-        // review or check actually ran for this landing, so scheduling
-        // publish here would be the same false promise the preflight gate
-        // exists to prevent. Warn like every sibling skip path instead of
-        // leaving the task silently stuck on Publish with nothing running.
+        // Do NOT fall through to Step 3b: no review or check actually ran
+        // for this landing, so nudging to publish here would be the same
+        // false promise the preflight gate exists to prevent. Warn like
+        // every sibling skip path instead of leaving the task silently
+        // stuck on Publish with nothing running.
         NotificationRouter.showWarning(
-          `Auto-publish skipped for ${resolved.progress.taskFolder}: a Publish review could not be started automatically because another review is already in progress for this task. ` +
+          `${resolved.progress.taskFolder}: a Publish review could not be started automatically because another review is already in progress for this task. ` +
             "Run the review manually once it finishes, or use Publish Anyway from Commit and Push.",
           undefined,
           undefined,
@@ -3624,17 +3527,17 @@ export async function nextStage(
     }
   }
 
-  // ── Step 3b: Entry-owned auto-publish ────────────────────────────────
+  // ── Step 3b: Entry-owned publish nudge ────────────────────────────────
   // Reached here only when "Complete & Move On triggers AI" is off — no
   // Publish review will be dispatched (the triggersAI block above always
-  // returns before this point), so nothing else will decide to run the
-  // publish command. commitAndPushTask still shows its own confirmation
-  // dialogs, so this never silently commits or pushes. Gated on the
-  // checkPublishPreflight result captured in Step 3 above.
-  if (next === "publish" && transitionResult.shouldAutoPublish) {
+  // returns before this point), so nothing else will tell the user their
+  // task is ready to publish. Commit and Push must only ever run from the
+  // user's own button click, so this only nudges — never schedules it.
+  // Gated on the checkPublishPreflight result captured in Step 3 above.
+  if (next === "publish") {
     if (publishPreflight?.ok === false) {
       NotificationRouter.showWarning(
-        `Auto-publish skipped for ${resolved.progress.taskFolder}: ${publishPreflight.reason}. Publish manually once checks pass, or use Publish Anyway from Commit and Push.`,
+        `${resolved.progress.taskFolder} checks failed: ${publishPreflight.reason}. Publish manually once checks pass, or use Publish Anyway from Commit and Push.`,
         undefined,
         undefined,
         undefined,
@@ -3645,12 +3548,20 @@ export async function nextStage(
         }
       );
     } else {
-      await scheduleAutomationChain({
-        command: "vs-code-ai-helper.commitAndPushTask",
-        arg: { taskFolderPath: resolved.folderUri.fsPath },
-        taskKey: resolved.folderUri.fsPath,
-        chainId: "auto-publish",
-      });
+      // Commit and Push must only ever run from the user's own button
+      // click — never scheduled here, even once checks pass. Nudge toward
+      // the manual action instead.
+      NotificationRouter.showWarning(
+        `${resolved.progress.taskFolder} passed its Publish checks. Publish manually when you're ready.`,
+        undefined,
+        undefined,
+        undefined,
+        {
+          command: "vs-code-ai-helper.commitAndPushTask",
+          title: "Publish",
+          args: [{ taskFolderPath: resolved.folderUri.fsPath }],
+        }
+      );
     }
     return;
   }
@@ -3945,6 +3856,7 @@ async function executeImplementationRun(
         stage: "impl",
         taskFolderUri: folderUri,
         onBusyDetail: options.onBusyDetail,
+        onWaitingForUser: options.onWaitingForUser,
       });
       } finally {
         linked.dispose();
@@ -4295,7 +4207,12 @@ export async function runImplementationWithAI(
       model.modelId,
       `Running implementation with ${providerLabel} (uses your ${providerLabel} quota)...`,
       postRunReviewStage,
-      { onBusyDetail: (d) => op.report(d), parentOperation: op, followUpReviewMode }
+      {
+        onBusyDetail: (d) => op.report(d),
+        onWaitingForUser: (w) => op.setWaitingForUser(w),
+        parentOperation: op,
+        followUpReviewMode,
+      }
     );
     }
   );

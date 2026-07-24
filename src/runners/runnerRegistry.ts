@@ -611,6 +611,7 @@ export async function runImplementationForModel(options: {
    * has no equivalent no-op failure, so this only affects CLI providers. */
   requireFileChange?: boolean;
   onBusyDetail?: (detail: string | undefined) => void;
+  onWaitingForUser?: (waiting: boolean) => void;
 }): Promise<ImplementationRunResult & { runnerId: string }> {
   const effective = resolveEffectiveProvider(options.modelId);
 
@@ -637,6 +638,7 @@ export async function runImplementationForModel(options: {
       token: options.token,
       onProgress: options.onProgress,
       onBusyDetail: options.onBusyDetail,
+      onWaitingForUser: options.onWaitingForUser,
     });
     return { ...result, runnerId: "copilot-lm" };
   };

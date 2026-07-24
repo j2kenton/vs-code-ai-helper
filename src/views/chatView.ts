@@ -3,7 +3,7 @@ import * as crypto from "crypto";
 import { STAGE_DISPLAY_NAMES, TaskStage } from "../types/taskProgress";
 import { notifyDesktop } from "../utils/desktopNotifier";
 import { taskOperations } from "../utils/taskOperations";
-import { NotificationRouter } from "../utils/notificationRouter";
+import { NotificationRouter, getNotificationRouterStatus } from "../utils/notificationRouter";
 import {
   ChatMessage,
   loadTranscriptWithMigration,
@@ -39,6 +39,11 @@ function isSendMessage(value: unknown): value is SendMessage {
   if (!value || typeof value !== "object") return false;
   const candidate = value as Record<string, unknown>;
   return candidate.type === "send" && typeof candidate.text === "string";
+}
+
+function isReadyMessage(value: unknown): boolean {
+  if (!value || typeof value !== "object") return false;
+  return (value as Record<string, unknown>).type === "ready";
 }
 
 export interface StageChatQuestion extends ChatTarget {
@@ -106,6 +111,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     view.webview.options = { enableScripts: true };
     view.webview.html = this.html();
     view.webview.onDidReceiveMessage(async (message: unknown) => {
+      if (isReadyMessage(message)) {
+        // The webview's own script just finished installing its message
+        // listener — it may have missed the render() this method already
+        // triggered below (e.g. after being torn down and recreated), which
+        // is exactly what left the panel stuck on "Loading chat…". Send the
+        // current state now that we know someone is listening.
+        void this.render();
+        return;
+      }
       if (!isSendMessage(message) || !this.target) return;
       // Captured before any await, so a target switch mid-send still writes
       // to (and, if still current, renders) the task the message was sent to.
@@ -124,6 +138,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           ...target,
           message: text,
         });
+      }
+    });
+    // retainContextWhenHidden keeps the webview's DOM/script state alive
+    // across a hide/show cycle (e.g. switching to Source Control and back),
+    // but the underlying transcript on disk can still have changed while
+    // hidden — re-render on regaining visibility so the panel doesn't keep
+    // showing a stale snapshot (or, worse, appear stuck "loading" forever
+    // if the very first render raced the webview's readiness).
+    view.onDidChangeVisibility(() => {
+      if (view.visible) {
+        void this.render();
       }
     });
     void this.render();
@@ -174,13 +199,71 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
    * explicit point of the call — e.g. a newly drafted task's blocking open
    * questions must actually surface in Chat With AI, not just persist unseen
    * in a transcript the user isn't looking at.
+   *
+   * Every NEW question raised through this method also raises an internal
+   * Notifications entry — centralized here (rather than left to each caller
+   * to remember) so no question producer can silently skip it. By default
+   * that's a warning ("Waiting for user feedback": work can continue
+   * without an answer). Pass `notify: { blocking: true }` for questions
+   * that genuinely halt progress until answered — those raise an error
+   * ("Can't proceed without user feedback") instead. `blockedReason` lets a
+   * caller fold in why it's blocked (e.g. a round-limit or escalation
+   * reason) without duplicating the notification call itself.
+   *
+   * Pass `notify: false` for `vs-code-ai-helper.postStageQuestion` (the
+   * notification's own "Open Chat" action) re-invoking ask() on an
+   * already-raised question — re-notifying every time the user clicks
+   * through to the question they were already told about would spam a
+   * fresh Notifications entry on every click.
    */
-  async ask(question: StageChatQuestion, forceOpen = false): Promise<void> {
+  async ask(
+    question: StageChatQuestion,
+    forceOpen = false,
+    notify: { blocking?: boolean; blockedReason?: string } | false = {}
+  ): Promise<void> {
     if (forceOpen || !this.target || sameIdentity(this.target, question)) {
       await this.open(question);
     }
     await this.append("question", question.question, question.stage, question, true);
     notifyDesktop("Ensemble — question", question.question);
+    if (notify !== false) {
+      this.notifyWaitingForFeedback(question, notify);
+    }
+  }
+
+  private notifyWaitingForFeedback(
+    question: StageChatQuestion,
+    { blocking, blockedReason }: { blocking?: boolean; blockedReason?: string }
+  ): void {
+    // Guarded rather than assumed-initialized: production always has
+    // NotificationRouter up by the time a chat question can be raised, but
+    // this keeps ask() safe to call from any context (e.g. tests) that
+    // hasn't wired one up.
+    if (!getNotificationRouterStatus()) return;
+    const label = question.taskName ?? question.taskFolderPath;
+    const stageName = STAGE_DISPLAY_NAMES[question.stage];
+    const actionCommand = {
+      command: "vs-code-ai-helper.postStageQuestion",
+      title: "Open Chat",
+      args: [question],
+    };
+    if (blocking) {
+      NotificationRouter.showError(
+        `Can't proceed without user feedback — ${label}: ${blockedReason ?? `${stageName} needs your input.`}`,
+        undefined,
+        undefined,
+        undefined,
+        actionCommand
+      );
+    } else {
+      NotificationRouter.showWarning(
+        `Waiting for user feedback — ${label}: the ${stageName} stage asked a question.`,
+        undefined,
+        undefined,
+        undefined,
+        actionCommand
+      );
+    }
   }
 
   /**
@@ -308,7 +391,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       }
     }
     if (!sameIdentity(target, this.target)) return;
-    const busy = target ? taskOperations.getTaskOperations(target.canonicalId).some(op => !op.exclusive) : false;
+    // Distinguish genuinely-running work from an operation that is merely
+    // parked waiting on the user's answer (round-limit pause, a pending
+    // question, etc.) — the latter must never show the busy spinner, which
+    // reads as "the computer is working, leave it alone" and is exactly
+    // backwards when it's actually this chat that's waiting on the user.
+    const targetOps = target ? taskOperations.getTaskOperations(target.canonicalId) : [];
+    const busy = targetOps.some((op) => !op.waitingForUser);
+    const waitingForUser = !busy && targetOps.some((op) => op.waitingForUser);
     // Always show the associated task: the task name when available,
     // otherwise the folder's date/task-ID code — with no bracketed raw
     // stage id. The global assistant is labeled as a global assistant.
@@ -326,12 +416,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       ...entry,
       text: stripAttributionHeaders(entry.text),
     }));
+    // A trailing pending question (no reply after it yet) is the one case
+    // that genuinely needs the user's attention rather than just being more
+    // conversation — a small badge on the view itself draws the eye even
+    // when this panel is present but not the currently focused element,
+    // mirroring how other views badge unread/actionable counts.
+    const lastEntry = entries[entries.length - 1];
+    if (this.view) {
+      this.view.badge = lastEntry?.role === "question" && lastEntry.pending
+        ? { value: 1, tooltip: "Waiting for your answer" }
+        : undefined;
+    }
     await this.view?.webview.postMessage({
       type: "state",
       target: this.target,
       label,
       entries: displayEntries,
       busy,
+      waitingForUser,
       errorMessage,
     });
   }
@@ -463,9 +565,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       </head><body>
       <div id="context" role="status">Loading chat…</div><div id="messages" role="log" aria-live="polite" aria-label="Conversation"></div>
       <div id="error" role="alert"></div>
-      <div id="busy-indicator" role="status" aria-live="polite"><span class="spinner"></span>Waiting for the AI…</div>
+      <div id="busy-indicator" role="status" aria-live="polite"><span id="busy-spinner" class="spinner"></span><span id="busy-text">Waiting for the AI…</span></div>
       <form id="form"><textarea id="message" rows="3" aria-label="Message the AI" placeholder="Message the AI… (Enter to send, Shift+Enter for a new line)"></textarea><button type="submit" title="Send message (Enter)">Send</button></form>
-      <script nonce="${nonce}">const v=acquireVsCodeApi(), c=document.getElementById('context'), m=document.getElementById('messages'), e=document.getElementById('error'), b=document.getElementById('busy-indicator'), f=document.getElementById('form'), i=document.getElementById('message');
+      <script nonce="${nonce}">const v=acquireVsCodeApi(), c=document.getElementById('context'), m=document.getElementById('messages'), e=document.getElementById('error'), b=document.getElementById('busy-indicator'), bs=document.getElementById('busy-spinner'), bt=document.getElementById('busy-text'), f=document.getElementById('form'), i=document.getElementById('message');
       const savedState = v.getState() || {};
       const scrollPositions = savedState.scrollPositions || {};
       let currentKey;
@@ -480,7 +582,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         const stick=!switchedChat&&isNearBottom();
         c.textContent=s.label??'No chat available yet.';
         m.replaceChildren(...s.entries.map(x=>{const d=document.createElement('p');d.className=x.role==='user'?'msg-user':'msg-agent';d.textContent='['+x.role+(x.pending?' — awaiting your answer':'')+'] '+x.text;return d;}));
-        e.textContent=s.errorMessage??'';e.style.display=s.errorMessage?'block':'none';b.style.display=s.busy?'block':'none';
+        e.textContent=s.errorMessage??'';e.style.display=s.errorMessage?'block':'none';
+        if(s.busy){bs.style.display='inline-block';bt.textContent='Waiting for the AI…';b.style.display='block';}
+        else if(s.waitingForUser){bs.style.display='none';bt.textContent='Waiting for your answer';b.style.display='block';}
+        else{b.style.display='none';}
         currentKey=nextKey;
         requestAnimationFrame(()=>{
           if(stick){window.scrollTo(0,document.documentElement.scrollHeight);}
@@ -489,7 +594,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         });
       });
       f.addEventListener('submit',e=>{e.preventDefault();v.postMessage({type:'send',text:i.value});i.value='';});
-      i.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.ctrlKey&&!e.metaKey&&!e.shiftKey){e.preventDefault();f.requestSubmit();}else if(e.key==='Escape'){i.blur();}});</script>
+      i.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.ctrlKey&&!e.metaKey&&!e.shiftKey){e.preventDefault();f.requestSubmit();}else if(e.key==='Escape'){i.blur();}});
+      v.postMessage({type:'ready'});</script>
     </body></html>`;
   }
 }

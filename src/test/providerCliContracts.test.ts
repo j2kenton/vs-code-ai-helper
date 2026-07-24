@@ -732,11 +732,16 @@ void describe("provider CLI contracts", () => {
       { kind: string; launch?: string; send?: string }
     > = {
       copilot: { kind: "unsupported" },
-      "claude-cli": { kind: "interactive", launch: "claude", send: "/usage" },
+      // Claude's usage check is a one-shot `claude -p "/usage"` terminal
+      // command, not a launch-then-send interactive session — see
+      // usageCommand on the claude-cli provider definition.
+      "claude-cli": { kind: "terminal" },
       "codex-cli": { kind: "interactive", launch: "codex", send: "/status" },
       "gemini-cli": { kind: "unsupported" },
       "antigravity-cli": { kind: "unsupported" },
-      "kiro-cli": { kind: "unsupported" },
+      // Kiro's usage check pipes "/usage" into `kiro-cli chat` as a one-shot
+      // terminal command — see usageCommand on the kiro-cli provider definition.
+      "kiro-cli": { kind: "terminal" },
       "opencode-zen": { kind: "unsupported" },
       "opencode-go": { kind: "unsupported" },
       "cline-cli": { kind: "unsupported" },
@@ -753,6 +758,10 @@ void describe("provider CLI contracts", () => {
           `${entry.id} usage must be an in-session slash command`
         );
         // Only descriptors verified against an installed CLI may automate.
+        assert.strictEqual(entry.usage.validated, "verified", entry.id);
+      }
+      if (entry.usage.kind === "terminal") {
+        assert.ok(entry.usage.command.length > 0, `${entry.id} terminal usage needs a command`);
         assert.strictEqual(entry.usage.validated, "verified", entry.id);
       }
       if (entry.usage.kind === "unsupported") {
@@ -781,8 +790,10 @@ void describe("provider CLI contracts", () => {
     assert.match(gemini.usage.reason, /gemini/);
     const claude = getProviderAccountEntry("claude-cli");
     assert.ok(claude);
-    assert.ok(claude.usage.kind === "interactive");
+    assert.ok(claude.usage.kind === "terminal");
     assert.strictEqual(claude.usage.validated, "verified");
+    assert.match(claude.usage.command, /claude -p "\/usage"/);
+    assert.strictEqual(claude.usage.shell, "powershell.exe");
 
     // Copilot's unsupported reason still tells the user where usage lives,
     // and its button opens that page directly instead of staying disabled.
@@ -792,12 +803,12 @@ void describe("provider CLI contracts", () => {
     assert.match(copilot.usage.reason, /github\.com\/settings\/copilot/);
     assert.strictEqual(copilot.usage.url, "https://github.com/settings/copilot");
 
-    // Kiro has no usage command either, but links out to its account usage
-    // page rather than leaving the button dead.
+    // Kiro's usage check pipes "/usage" into `kiro-cli chat` as a one-shot
+    // terminal command.
     const kiroEntry = getProviderAccountEntry("kiro-cli");
     assert.ok(kiroEntry);
-    assert.ok(kiroEntry.usage.kind === "unsupported");
-    assert.strictEqual(kiroEntry.usage.url, "https://app.kiro.dev/account/usage");
+    assert.ok(kiroEntry.usage.kind === "terminal");
+    assert.strictEqual(kiroEntry.usage.command, 'echo "/usage" | kiro-cli chat');
 
     // Antigravity's /usage invocation follows the CLI's documented
     // slash-command surface but has not been re-confirmed against an
@@ -833,7 +844,7 @@ void describe("provider CLI contracts", () => {
     assert.ok(clineEntry.usage.kind === "unsupported");
     assert.strictEqual(
       clineEntry.usage.url,
-      "https://app.cline.bot/dashboard/subscription?personal=true"
+      "https://app.cline.bot/dashboard/subscription"
     );
   });
 

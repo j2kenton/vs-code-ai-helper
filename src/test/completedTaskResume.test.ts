@@ -40,6 +40,7 @@ import {
 import { TaskProgress } from "../types/taskProgress";
 import { initNotificationRouter } from "../utils/notificationRouter";
 import { installOperationNotificationBridge } from "../utils/operationNotificationBridge";
+import { runTrackedOperation } from "../utils/taskOperations";
 
 // Route NotificationRouter to the vscode stub's window methods, mirroring
 // commandArgNormalization.test.ts, so command-level assertions can inspect
@@ -484,6 +485,81 @@ void describe("setTaskStage on a completed task", () => {
       assert.equal(stored?.status, "active");
       assert.equal(stored?.currentStage, "publish");
     } finally {
+      msgs.restore();
+      ws.restore();
+      rf.restore();
+    }
+  });
+
+  void it("regression: cancels a stray tracked operation for the task before reopening it", async () => {
+    // A completed task should have nothing running against it, but a race
+    // (e.g. an operation still finishing when the task got marked complete)
+    // could leave one live in the registry. setTaskStageOnCompletedTask must
+    // cancel it BEFORE calling reopenCompletedTask, not after — otherwise the
+    // stray process keeps running underneath the newly-reopened stage. This
+    // is observed two ways: the operation's cancellation token actually
+    // fires, and it fires strictly before reopenCompletedTask is invoked.
+    const folderPath = makeTaskFolder("set-stage-completed-stray-op");
+    const canonicalId = folderPath;
+    const progress = baseProgress({ taskFolder: path.basename(folderPath) });
+    await writeProgress(folderPath, progress);
+
+    const inv = makeInventory([{ canonicalId, taskFolderPath: folderPath, progress }]);
+    const { store } = makeCurrentTaskStoreStub();
+    const ws = installWorkspaceFoldersStub();
+    const rf = installReadFileBridge();
+    const msgs = installMessageCapture();
+
+    const order: string[] = [];
+    let cancelled = false;
+    const stillRunning = runTrackedOperation(
+      folderPath,
+      { label: "Stub Stray Operation", stage: "publish", kind: "review", cancellable: true },
+      (handle) =>
+        new Promise<void>((resolve) => {
+          const token = handle.token;
+          if (!token || token.isCancellationRequested) {
+            cancelled = !!token?.isCancellationRequested;
+            order.push("cancel-observed");
+            resolve();
+            return;
+          }
+          token.onCancellationRequested(() => {
+            cancelled = true;
+            order.push("cancel-observed");
+            resolve();
+          });
+        })
+    );
+
+    // reopenTaskModule.reopenCompletedTask is patched (not stubbed away) so
+    // the real reopen still happens — only the call order relative to
+    // cancellation is observed.
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const reopenTaskModule = require("../utils/reopenTask") as {
+      reopenCompletedTask: typeof import("../utils/reopenTask").reopenCompletedTask;
+    };
+    const originalReopen = reopenTaskModule.reopenCompletedTask;
+    reopenTaskModule.reopenCompletedTask = (...args): ReturnType<typeof originalReopen> => {
+      order.push("reopen-called");
+      return originalReopen(...args);
+    };
+
+    try {
+      await setTaskStage(inv, store, { canonicalId, stage: "impl-high-review" }, "jump");
+      await stillRunning;
+
+      assert.equal(cancelled, true, "the stray operation must have been cancelled");
+      assert.deepEqual(
+        order,
+        ["cancel-observed", "reopen-called"],
+        "cancellation must complete before reopenCompletedTask is called"
+      );
+      const stored = await readTaskProgress(vscode.Uri.file(folderPath));
+      assert.equal(stored?.status, "active", "the reopen itself must still have succeeded");
+      assert.equal(stored?.currentStage, "impl-high-review");
+    } finally {
+      reopenTaskModule.reopenCompletedTask = originalReopen;
       msgs.restore();
       ws.restore();
       rf.restore();

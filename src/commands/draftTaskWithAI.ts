@@ -1103,16 +1103,20 @@ export async function draftTaskWithAI(
     // The drafted task can't proceed until these are answered — open Chat
     // With AI on this task's Description stage and pose them directly rather
     // than leaving them sitting unread in task.md's Open Questions section.
-    await chatViewProvider.ask(
-      {
-        canonicalId: resolvedTask.canonicalId,
-        taskFolderPath: resolvedTask.taskFolderPath,
-        stage: "desc",
-        question:
-          `Draft with AI raised open questions that need your input before this task can proceed:\n\n${aiOutput.openQuestions}`,
-      },
-      true
-    );
+    const question = {
+      canonicalId: resolvedTask.canonicalId,
+      taskFolderPath: resolvedTask.taskFolderPath,
+      stage: "desc" as const,
+      question:
+        `Draft with AI raised open questions that need your input before this task can proceed:\n\n${aiOutput.openQuestions}`,
+    };
+    // Genuinely blocking — the task cannot advance past Description until
+    // these are answered — so ask() raises an error, not a warning, per the
+    // "can't proceed without user feedback" contract.
+    await chatViewProvider.ask(question, true, {
+      blocking: true,
+      blockedReason: "Draft with AI raised open questions.",
+    });
   }
   return true;
     }

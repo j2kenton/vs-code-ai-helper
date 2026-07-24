@@ -80,9 +80,15 @@ export const NotificationRouter = {
   /**
    * Route routine error message.
    */
-  showError(message: string, filePath?: string, resultTargetUri?: string, sourceOperationId?: string): void {
+  showError(
+    message: string,
+    filePath?: string,
+    resultTargetUri?: string,
+    sourceOperationId?: string,
+    actionCommand?: { command: string; title: string; args?: unknown[] }
+  ): void {
     const surface = checkInitialized();
-    surface.addEntry(message, "error", filePath, resultTargetUri, sourceOperationId);
+    surface.addEntry(message, "error", filePath, resultTargetUri, sourceOperationId, actionCommand);
   },
 
   /**

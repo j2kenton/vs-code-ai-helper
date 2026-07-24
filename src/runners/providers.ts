@@ -237,6 +237,17 @@ export interface CliProviderDefinition {
    * button becomes automated.
    */
   usageAction?: { launch: string; send: string; validated: "verified" | "unverified" };
+  /**
+   * A one-shot, non-interactive usage/quota command line, for providers whose
+   * usage surface can be queried in a single command rather than an
+   * in-session slash command. Takes priority over `usageAction` when both are
+   * set (no provider currently sets both). `shell`, when set, is the
+   * integrated terminal's `shellPath` to launch with — needed when the
+   * command's syntax (e.g. PowerShell-specific `$OutputEncoding` assignment
+   * and backtick escapes) only parses correctly in a specific shell,
+   * regardless of the user's own default integrated-terminal shell.
+   */
+  usageCommand?: { command: string; shell?: string };
   /** Why usage checking is unsupported, when usageAction is absent. */
   usageUnsupportedReason?: string;
   /**
@@ -552,9 +563,20 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     signInGuidance:
       "Complete the Anthropic sign-in in the terminal. Already signed in as a different " +
       "account? Type /logout in the terminal first, then click Sign In again.",
-    // `/usage` is Claude Code's in-session usage panel — launched
-    // interactively, then sent as a slash command (validated 2026-07-17).
-    usageAction: { launch: "claude", send: "/usage", validated: "verified" },
+    // One-shot, non-interactive usage check: `claude -p "/usage"` prints the
+    // usage panel straight to stdout without opening an interactive session,
+    // so this runs as a plain terminal command instead of the
+    // launch-then-send interactive dispatch every other CLI's usage check
+    // uses. The pipeline trims the response down to the panel itself
+    // (dropping the trailing "What's contributing to my usage?" footer) and
+    // forces UTF-8 output encoding so the panel's box-drawing characters
+    // render correctly in the integrated terminal. Requires PowerShell
+    // syntax (backtick escapes, $OutputEncoding), hence the explicit shell.
+    usageCommand: {
+      command:
+        "$OutputEncoding = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Write-Host (((((claude -p \"/usage\") -join \"`n\") -split \"What's contributing\")[0].TrimEnd() -split \"`r?\\n\") -join \"`n`n\") \"`n`n`n\"",
+      shell: "powershell.exe",
+    },
     // Keep the provider-level fallback to CLI default only. Temporary picker
     // options are seeded separately until live loading is fixed.
     models: [
@@ -799,9 +821,10 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     // than ship a provider whose plan and review stages always fail.
     // Re-test if a future CLI version adds a scope flag or a class grant.
     permissionWarning:
-      "Runs with --dangerously-skip-permissions in every mode, including plan " +
-      "and review. It can create, change, or delete any file in your workspace " +
-      "without asking. Its headless CLI offers no scoped alternative.",
+      "Antigravity runs with --dangerously-skip-permissions in every mode, including " +
+      "plan and review. It can create, change, or delete any file in your workspace " +
+      "without asking. Its headless CLI offers no scoped alternative — this warning " +
+      "applies to Antigravity only, not to the other providers above.",
     buildArgs(_mode, model, _lastMessageFile, context): string[] {
       // promptTransport: "file" is a contract with the caller (see
       // CliBuildArgsContext.promptFile): cliAgentRunner always writes the
@@ -851,9 +874,9 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     signInLabel: "Sign in / Switch account",
     signInGuidance:
       "Logs out first so you can switch accounts. Headless mode additionally requires KIRO_API_KEY — `kiro-cli login` alone does not satisfy `chat --no-interactive` auth.",
-    usageUnsupportedReason:
-      "Kiro CLI has no known usage/quota command — check usage on the Kiro account usage page.",
-    usageUnsupportedUrl: "https://app.kiro.dev/account/usage",
+    // One-shot, non-interactive usage check: piping "/usage" into
+    // `kiro-cli chat` prints the usage panel without an interactive session.
+    usageCommand: { command: 'echo "/usage" | kiro-cli chat' },
     promptTransport: "stdin",
     useShell: false,
     // Use stdin transport so large context packs are not constrained by
@@ -1042,8 +1065,7 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     usageUnsupportedReason:
       "Cline CLI has no non-interactive usage/quota command — check ClinePass usage and " +
       "billing on the Cline dashboard.",
-    usageUnsupportedUrl:
-      "https://app.cline.bot/dashboard/subscription?personal=true",
+    usageUnsupportedUrl: "https://app.cline.bot/dashboard/subscription",
     // Deliberate exception to the "text mode stays read-only" contract, in
     // BOTH modes — verified live against cline 3.0.46: a run given --plan
     // and directly instructed to call its run_commands tool to create a
@@ -1167,7 +1189,7 @@ export function getCliProvider(
  *    renders disabled with `reason` as its explanatory tooltip.
  */
 export type ProviderActionCapability =
-  | { kind: "terminal"; command: string; validated: "verified" | "unverified" }
+  | { kind: "terminal"; command: string; validated: "verified" | "unverified"; shell?: string }
   | { kind: "interactive"; launch: string; send: string; validated: "verified" | "unverified" }
   | { kind: "vscode-command"; command: string; fallbackCommand?: string }
   | { kind: "manual"; instructions: string; url?: string }
@@ -1219,6 +1241,22 @@ export interface ProviderAccountEntry {
    * runs are constrained by the vendor's own permission system.
    */
   permissionWarning?: string;
+}
+
+/**
+ * Move the "antigravity-cli" entry (if present) to the end of the list,
+ * preserving the relative order of everything else. Antigravity is the only
+ * provider with a permission model loose enough to need its own warning
+ * (see its permissionWarning above) — listing it last keeps that warning
+ * from reading as if it applies to the providers around it.
+ */
+function reorderAntigravityLast<T extends { id: string }>(entries: readonly T[]): T[] {
+  const index = entries.findIndex((entry) => entry.id === "antigravity-cli");
+  if (index === -1) {
+    return [...entries];
+  }
+  const antigravity = entries[index]!;
+  return [...entries.slice(0, index), ...entries.slice(index + 1), antigravity];
 }
 
 export const PROVIDER_ACCOUNT_ENTRIES: readonly ProviderAccountEntry[] = [
@@ -1294,7 +1332,13 @@ export const PROVIDER_ACCOUNT_ENTRIES: readonly ProviderAccountEntry[] = [
     },
     enabledByDefault: false,
   },
-  ...CLI_PROVIDERS.filter((provider) => provider.id !== "opencode-cli").map((provider): ProviderAccountEntry => ({
+  // Antigravity is deliberately moved to the very end of the list (see
+  // reorderAntigravityLast below): its permissionWarning explicitly names
+  // Antigravity and is only meaningful when it's the last row, immediately
+  // followed by the account-selection controls — otherwise the warning
+  // could visually read as applying to the providers listed after it too.
+  ...reorderAntigravityLast(
+    CLI_PROVIDERS.filter((provider) => provider.id !== "opencode-cli").map((provider): ProviderAccountEntry => ({
     id: provider.id,
     label: provider.label,
     signInLabel: provider.signInLabel,
@@ -1328,7 +1372,14 @@ export const PROVIDER_ACCOUNT_ENTRIES: readonly ProviderAccountEntry[] = [
     // shipping a nonfunctional action." So "unverified" always renders a
     // DISABLED button (kind "unsupported", no url) until the command is
     // confirmed against the installed CLI and flipped to "verified".
-    usage: provider.usageAction
+    usage: provider.usageCommand
+      ? {
+          kind: "terminal",
+          command: provider.usageCommand.command,
+          validated: "verified",
+          ...(provider.usageCommand.shell ? { shell: provider.usageCommand.shell } : {}),
+        }
+      : provider.usageAction
       ? provider.usageAction.validated === "verified"
         ? {
             kind: "interactive",
@@ -1354,7 +1405,8 @@ export const PROVIDER_ACCOUNT_ENTRIES: readonly ProviderAccountEntry[] = [
     ...(provider.permissionWarning
       ? { permissionWarning: provider.permissionWarning }
       : {}),
-  })),
+    }))
+  ),
 ];
 
 export function getProviderAccountEntry(

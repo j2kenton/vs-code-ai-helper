@@ -149,13 +149,18 @@ export async function handleQuotaFailure(context: vscode.ExtensionContext, reque
   await savePendingResume(context, request);
   notifyDesktop("Ensemble — question", "AI credits are exhausted. Resume when they restore, or switch model?");
   taskOperations.report(request.taskFolderUri.fsPath, "waiting for your answer — credits exhausted");
+  // The run cannot proceed at all without this choice — swap the row's
+  // spinner for the "waiting for you" indicator so it doesn't read as
+  // background work quietly making progress.
+  taskOperations.setWaitingForUser(request.taskFolderUri.fsPath, true);
   // Also route into the internal Notifications panel as a terminal/error
   // record (per severity policy: exhausted credits block the run). The
   // interactive choice itself must stay a real modal below — "Resume" vs
   // "Switch model" are genuine alternative actions the caller branches on.
-  NotificationRouter.showError("AI credits are exhausted.");
+  NotificationRouter.showError("AI credits are exhausted. Can't proceed without your input — resume when credits restore, or switch model.");
   const choice = await vscode.window.showWarningMessage("AI credits are exhausted.", "Resume when credits restore", "Switch model");
   taskOperations.report(request.taskFolderUri.fsPath, undefined);
+  taskOperations.setWaitingForUser(request.taskFolderUri.fsPath, false);
   if (choice === "Switch model") { await switchModel?.(); return "switch"; }
   return choice === "Resume when credits restore" ? "resume" : undefined;
 }

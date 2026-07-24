@@ -57,6 +57,17 @@ export interface TaskOperationHandle {
   readonly token?: vscode.CancellationToken;
   report(detail: string | undefined): void;   // live-row sub-text, e.g. "waiting for your answer"
   /**
+   * Mark this operation as blocked on the user, not doing background work —
+   * e.g. a round-limit pause or a chat question the AI can't proceed past.
+   * Distinct from `detail` (which is just display text): views use this flag
+   * to swap the spinning "in progress" icon for a non-spinning "waiting"
+   * one, since a spinner over something that is actually sitting idle for a
+   * human response reads as "the computer is working, leave it alone" —
+   * exactly backwards. Toggle back to `false` once work resumes (the user
+   * answered, or the operation is proceeding without them).
+   */
+  setWaitingForUser(waiting: boolean): void;
+  /**
    * Record the click-to-open target for this operation's terminal
    * Notifications entry (e.g. the vscode.Uri writeRunLog resolved to).
    * Always resolves to the ROOT operation, even when called from a child
@@ -81,6 +92,8 @@ export interface TaskOperationSnapshot {
   readonly cancellable: boolean;
   readonly state: TaskOperationState;
   readonly finishedAt?: number;
+  /** See TaskOperationHandle.setWaitingForUser. */
+  readonly waitingForUser: boolean;
   /**
    * Stringified vscode.Uri of the artifact/run-log this operation produced,
    * when known (set via setResultTargetUri/setResultTargetUriForTask). Always
@@ -112,6 +125,7 @@ interface MutableOperation {
   state: TaskOperationState;
   finishedAt?: number;
   resultTargetUri?: string;
+  waitingForUser: boolean;
 }
 
 /**
@@ -219,6 +233,7 @@ export class TaskOperationRegistry implements vscode.Disposable {
       parentId: spec.parent?.id,
       cancellable,
       state: "running",
+      waitingForUser: false,
     };
 
     let keyMap = this.operations.get(key);
@@ -246,6 +261,10 @@ export class TaskOperationRegistry implements vscode.Disposable {
         operation.detail = d;
         this.triggerChange();
       },
+      setWaitingForUser: (waiting: boolean) => {
+        operation.waitingForUser = waiting;
+        this.triggerChange();
+      },
       setResultTargetUri: (uri: vscode.Uri) => {
         this.setResultTargetUri(id, uri);
       }
@@ -268,6 +287,20 @@ export class TaskOperationRegistry implements vscode.Disposable {
     const exclusiveOp = [...(this.operations.get(key)?.values() ?? [])].find(op => op.exclusive);
     if (!exclusiveOp) {return;}
     exclusiveOp.detail = detail;
+    this.triggerChange();
+  }
+
+  /**
+   * Same as `report`, addressed by task path, for `setWaitingForUser` —
+   * mirrors why `report(taskPath, ...)` exists alongside the handle's own
+   * `report`: some pause points (e.g. quota.ts's prompt) are deep in the
+   * stack without the operation handle in scope.
+   */
+  setWaitingForUser(taskPath: string, waiting: boolean): void {
+    const key = taskKey(taskPath);
+    const exclusiveOp = [...(this.operations.get(key)?.values() ?? [])].find(op => op.exclusive);
+    if (!exclusiveOp) {return;}
+    exclusiveOp.waitingForUser = waiting;
     this.triggerChange();
   }
 
@@ -458,15 +491,11 @@ export class TaskOperationRegistry implements vscode.Disposable {
   }
 
   /**
-   * The stages whose rows should show a spinner for this task: the stages of
-   * the *leaf* running operations (operations with no running children).
-   * During a composite (fast-forward, apply-review) the spinner therefore
-   * sits on the plan/implementation row while the fix is being implemented
-   * and moves back to the review row while re-reviewing, instead of parking
-   * on the root's stage for the whole run. A leaf without its own stage
-   * inherits the nearest ancestor's stage.
+   * The leaf running operations for a task (operations with no running
+   * children) — shared by getActiveStages/getWaitingStages so "which stage
+   * does this leaf's spinner belong to" logic lives in exactly one place.
    */
-  getActiveStages(taskPath: string): readonly TaskStage[] {
+  private leafStages(taskPath: string, predicate: (op: MutableOperation) => boolean): TaskStage[] {
     const keyMap = this.operations.get(taskKey(taskPath));
     if (!keyMap) {return [];}
     const ops = Array.from(keyMap.values());
@@ -476,6 +505,7 @@ export class TaskOperationRegistry implements vscode.Disposable {
     const stages = new Set<TaskStage>();
     for (const op of ops) {
       if (parentIds.has(op.id)) {continue;} // has running children — not a leaf
+      if (!predicate(op)) {continue;}
       let node: MutableOperation | undefined = op;
       while (node && node.stage === undefined) {
         node = node.parentId !== undefined ? keyMap.get(node.parentId) : undefined;
@@ -485,8 +515,49 @@ export class TaskOperationRegistry implements vscode.Disposable {
     return [...stages];
   }
 
+  /**
+   * The stages whose rows should show a SPINNER for this task: the stages of
+   * the *leaf* running operations (operations with no running children) that
+   * are NOT waiting on the user. During a composite (fast-forward,
+   * apply-review) the spinner therefore sits on the plan/implementation row
+   * while the fix is being implemented and moves back to the review row
+   * while re-reviewing, instead of parking on the root's stage for the whole
+   * run. A leaf without its own stage inherits the nearest ancestor's stage.
+   * See getWaitingStages for the complementary "waiting, not spinning" set.
+   */
+  getActiveStages(taskPath: string): readonly TaskStage[] {
+    return this.leafStages(taskPath, (op) => !op.waitingForUser);
+  }
+
+  /**
+   * The stages whose rows should show the "waiting for you" indicator
+   * instead of a spinner — the leaf running operations that ARE waiting on
+   * the user. Disjoint from getActiveStages: a leaf op is in exactly one of
+   * the two sets.
+   */
+  getWaitingStages(taskPath: string): readonly TaskStage[] {
+    return this.leafStages(taskPath, (op) => op.waitingForUser);
+  }
+
   hasAny(): boolean {
     return this.operations.size > 0;
+  }
+
+  /**
+   * True when at least one root operation, anywhere, is doing real
+   * background work — i.e. NOT just sitting waiting for a user response.
+   * Used to decide whether the activity-bar badge should show a live
+   * progress indicator (real work running) or fall back to the idle task
+   * count (nothing running, or everything running is actually waiting on
+   * the user and therefore not "in progress" from the user's perspective).
+   */
+  hasAnyRunning(): boolean {
+    for (const keyMap of this.operations.values()) {
+      for (const op of keyMap.values()) {
+        if (op.parentId === undefined && !op.waitingForUser) {return true;}
+      }
+    }
+    return false;
   }
 
   busyLabel(taskPath: string): string | undefined {
@@ -553,6 +624,46 @@ export async function runTrackedOperation<T>(
     taskOperations.end(handle, cancelled ? "cancelled" : "failed");
     throw error;
   }
+}
+
+/**
+ * Request cancellation of every running operation for the task and wait
+ * (bounded) for the operations to actually terminate. Shared by every
+ * caller that must guarantee no live process keeps running against a task
+ * before proceeding — archiving, and stage-transition handlers ("Set as
+ * Current Stage", "Complete Stage & Move On") that must abort whatever the
+ * previous stage was still doing before touching progress state or (for
+ * "Complete Stage & Move On") dispatching the next stage's own automation.
+ */
+export async function cancelRunningOperationsForTask(
+  taskFolderPath: string,
+  timeoutMs = 15_000
+): Promise<{ ok: boolean; reason?: string }> {
+  const ops = taskOperations.getTaskOperations(taskFolderPath);
+  if (ops.length === 0) {
+    return { ok: true };
+  }
+
+  const roots = ops.filter((op) => op.parentId === undefined);
+  const uncancellable = roots.filter((op) => !op.cancellable);
+  for (const op of roots) {
+    taskOperations.cancelOperation(op.id);
+  }
+
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (taskOperations.getTaskOperations(taskFolderPath).length === 0) {
+      return { ok: true };
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+
+  return {
+    ok: false,
+    reason: uncancellable.length > 0
+      ? `"${uncancellable[0]?.label}" cannot be cancelled — wait for it to finish, then try again.`
+      : "The running operation did not stop in time. Try again once it has finished.",
+  };
 }
 
 export function showTaskBusyWarning(taskPath: string): void {

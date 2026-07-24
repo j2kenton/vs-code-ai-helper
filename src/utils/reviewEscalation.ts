@@ -10,7 +10,8 @@ import { normalizePath } from "./taskRoot";
 export interface EscalationChatTarget {
   ask(
     question: { canonicalId: string; taskFolderPath: string; stage: TaskStage; taskName?: string; question: string },
-    forceOpen?: boolean
+    forceOpen?: boolean,
+    notify?: { blocking?: boolean; blockedReason?: string }
   ): Promise<void>;
 }
 
@@ -114,28 +115,37 @@ export async function escalateReviewToHuman(
         "or accept the current state and advance anyway?",
     };
 
-    // "vs-code-ai-helper.postStageQuestion" (registered in chatWithStage.ts)
-    // routes straight to chatViewProvider.ask(question) — this task's own
-    // conversation, not the unrelated Global Assistant. It only force-opens
-    // the panel when nothing else is already open or this task's chat is
-    // already the one showing (ask()'s own no-steal-focus rule — see
-    // chatView.ts); the chatTarget.ask(..., true) call below already
-    // force-opened it once at escalation time, so this button mainly
-    // matters for a user who dismissed that and comes back later.
-    NotificationRouter.showWarning(
-      `${stageName} is stuck and needs your input: ${reason} The task has been paused — resume it once you've decided how to proceed.`,
-      undefined,
-      undefined,
-      undefined,
-      {
-        command: "vs-code-ai-helper.postStageQuestion",
-        title: "Open Chat",
-        args: [question],
-      }
-    );
-
+    // Genuinely blocking (not just "here's a question, work continues"): the
+    // task is paused above and automated review iteration will not resume on
+    // its own — error level, not warning, per the "can't proceed without
+    // user feedback" contract for hard-blocked automation.
+    const blockedReason = `${stageName} is stuck: ${reason} The task has been paused — resume it once you've decided how to proceed.`;
     if (chatTarget) {
-      await chatTarget.ask(question, true);
+      // "vs-code-ai-helper.postStageQuestion" (registered in chatWithStage.ts)
+      // routes straight to chatViewProvider.ask(question) — this task's own
+      // conversation, not the unrelated Global Assistant. ask() raises the
+      // error notification itself (centralized there — see chatView.ts) with
+      // that same command as its action button; it only force-opens the
+      // panel when nothing else is already open or this task's chat is
+      // already the one showing (ask()'s own no-steal-focus rule), and this
+      // call already force-opens it once at escalation time, so the button
+      // mainly matters for a user who dismissed that and comes back later.
+      await chatTarget.ask(question, true, { blocking: true, blockedReason });
+    } else {
+      // No chat surface wired up (e.g. escalation running outside a full
+      // extension host) — fall back to a standalone notification so the
+      // escalation is still never silent.
+      NotificationRouter.showError(
+        `Can't proceed without user feedback — ${question.taskName ?? question.taskFolderPath}: ${blockedReason}`,
+        undefined,
+        undefined,
+        undefined,
+        {
+          command: "vs-code-ai-helper.postStageQuestion",
+          title: "Open Chat",
+          args: [question],
+        }
+      );
     }
     return true;
   } catch (error) {

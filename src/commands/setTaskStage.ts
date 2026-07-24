@@ -13,6 +13,7 @@ import { NotificationRouter } from "../utils/notificationRouter";
 import { checkPublishPreflight } from "../utils/publishPreflight";
 import { ensureStageModelConfigured } from "../utils/modelSelection";
 import { scheduleAutomationChain } from "../utils/automationChain";
+import { cancelRunningOperationsForTask } from "../utils/taskOperations";
 import { pickReopenStage, reopenCompletedTask } from "../utils/reopenTask";
 
 /**
@@ -208,6 +209,22 @@ export async function setTaskStage(
     return;
   }
 
+  // "Set Task Stage" / "Set as Current Stage" must abort whatever the
+  // task's current stage was still running BEFORE moving off it — otherwise
+  // the old stage's process keeps running in the background (writing into a
+  // stage the user just navigated away from), and this handler runs no AI
+  // automation of its own for the destination stage (kind="jump" is
+  // excluded from both AUTO_REVIEW_ELIGIBLE_KINDS and, unconditionally,
+  // publish scheduling — see stageTransition.ts), so there is nothing to
+  // "hand off" to here; the goal is purely to stop.
+  const cancelResult = await cancelRunningOperationsForTask(task.taskFolderPath);
+  if (!cancelResult.ok) {
+    NotificationRouter.showError(
+      `Could not set stage for ${task.folderName}: ${cancelResult.reason}`
+    );
+    return;
+  }
+
   // Persist the destination stage using the shared advanceStage helper.
   // This centralizes auto-review eligibility, transition sequencing, and persistence.
   const taskFolderUri = vscode.Uri.file(task.taskFolderPath);
@@ -254,37 +271,23 @@ export async function setTaskStage(
     `${task.folderName} set to stage: ${STAGE_DISPLAY_NAMES[newStage]}`
   );
 
-  // Entry-owned auto-publish: a manual stage jump onto Publish never
-  // dispatches a review (AUTO_REVIEW_ELIGIBLE_KINDS excludes "jump"), so
-  // nothing else will decide to run the publish command — schedule it
-  // directly. commitAndPushTask still shows its own confirmation dialogs, so
-  // this never silently commits or pushes. Gated on the preflight result
-  // (checkPublishPreflight, in its default side-effect-free mode — this is a
-  // scheduling decision, not a publish attempt, so it never persists a lint
-  // payload) computed just above — previously the completion lint ran here
-  // but its result was discarded, so auto-publish was scheduled even when
-  // the checks had just failed.
-  if (transitionResult.shouldAutoPublish) {
-    if (publishPreflight?.ok === false) {
-      NotificationRouter.showWarning(
-        `Auto-publish skipped for ${task.folderName}: ${publishPreflight.reason}. Publish manually once checks pass, or use Publish Anyway from Commit and Push.`,
-        undefined,
-        undefined,
-        undefined,
-        {
-          command: "vs-code-ai-helper.commitAndPushTask",
-          title: "Publish Anyway",
-          args: [{ taskFolderPath: task.taskFolderPath }],
-        }
-      );
-    } else {
-      await scheduleAutomationChain({
+  // Commit and push is never scheduled automatically — landing on Publish
+  // (from any entry point) never runs it; only the user's own "Commit and
+  // Push" button click does. Failing completion checks are still worth
+  // surfacing immediately, with a one-click "Publish Anyway" affordance,
+  // instead of only being discovered later inside Commit and Push's own gate.
+  if (newStage === "publish" && publishPreflight?.ok === false) {
+    NotificationRouter.showWarning(
+      `${task.folderName}: ${publishPreflight.reason}. Publish once checks pass, or use Publish Anyway from Commit and Push.`,
+      undefined,
+      undefined,
+      undefined,
+      {
         command: "vs-code-ai-helper.commitAndPushTask",
-        arg: { taskFolderPath: task.taskFolderPath },
-        taskKey: task.taskFolderPath,
-        chainId: "auto-publish",
-      });
-    }
+        title: "Publish Anyway",
+        args: [{ taskFolderPath: task.taskFolderPath }],
+      }
+    );
   }
 
   // Persist this task as the current task so the keyboard shortcut router and
@@ -344,6 +347,19 @@ async function setTaskStageOnCompletedTask(
   const capturedCompletedAt = task.progress.completedAt;
   const chosenStage = requestedStage ?? (await pickReopenStage(task.folderName));
   if (!chosenStage) {
+    return;
+  }
+
+  // Same "abort first" contract as the non-completed path above: a
+  // completed task should have nothing running against it, but a race (e.g.
+  // an in-flight operation that was still finishing when the task got
+  // marked complete) could leave one live. Reopening must not let that
+  // process keep running underneath the newly-reopened stage.
+  const cancelResult = await cancelRunningOperationsForTask(task.taskFolderPath);
+  if (!cancelResult.ok) {
+    NotificationRouter.showError(
+      `Could not reopen ${task.folderName}: ${cancelResult.reason}`
+    );
     return;
   }
 

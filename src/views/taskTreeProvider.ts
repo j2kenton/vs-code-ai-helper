@@ -1,7 +1,6 @@
 import * as vscode from "vscode";
 import * as path from "path";
 import {
-  AI_MODEL_STAGES,
   DEFAULT_HIDDEN_STATUSES,
   isReviewStage,
   STAGE_ARTIFACT_FILENAMES,
@@ -20,13 +19,6 @@ import { parseReadiness } from "../utils/reviewReadiness";
 import { TaskInventory, TaskWithProgress } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { buildTaskContextValue, buildStageContextValue } from "../utils/contextTokens";
-import {
-  resolveModelForStage,
-  type ResolvedStageModel,
-  type SelectableModel,
-  describeResolvedModel,
-  getAvailableModels,
-} from "../utils/modelSelection";
 import { getConfiguredTaskRoot } from "../utils/taskRoot";
 
 /**
@@ -186,7 +178,16 @@ export class TaskNode extends vscode.TreeItem {
       .getTaskOperations(tKey)
       .find(op => op.exclusive && op.stage === undefined);
 
-    if (taskLevelOp) {
+    if (taskLevelOp && taskLevelOp.waitingForUser) {
+      // Same "waiting is not running" distinction as StageNode below: a
+      // task-level op (commit/push, release) paused on the user shouldn't
+      // spin as if the computer is still working.
+      this.iconPath = new vscode.ThemeIcon(
+        "comment-unresolved",
+        new vscode.ThemeColor("charts.yellow")
+      );
+      this.description = `${taskLevelOp.label} · waiting for you · ${STAGE_DISPLAY_NAMES[currentStage]} · step ${stepNumber} of ${totalSteps}`;
+    } else if (taskLevelOp) {
       this.iconPath = new vscode.ThemeIcon(
         "loading~spin",
         new vscode.ThemeColor("charts.blue")
@@ -254,8 +255,6 @@ export class StageNode extends vscode.TreeItem {
     artifactUri: vscode.Uri | undefined,
     /** Optional readiness info for review stages */
     readiness?: { label: string },
-    modelInfo?: ResolvedStageModel,
-    availableModels?: readonly SelectableModel[]  ,
     isScheduled: boolean = false,
     isMetaManaged: boolean = false,
     hasBackup: boolean = false,
@@ -272,10 +271,18 @@ export class StageNode extends vscode.TreeItem {
     // row while a fix is being implemented, the review row while
     // re-reviewing — rather than parking on the composite root's stage.
     const isRunning = taskOperations.getActiveStages(tKey).includes(stage);
+    // Waiting on the user (a question, a round-limit pause) is NOT "in
+    // progress" from the user's point of view — a spinner over it reads as
+    // "the computer is working, leave it alone", exactly backwards. Show a
+    // distinct, non-spinning icon instead.
+    const isWaitingForUser = !isRunning && taskOperations.getWaitingStages(tKey).includes(stage);
 
     if (isRunning) {
       this.iconPath = new vscode.ThemeIcon("loading~spin", new vscode.ThemeColor("charts.blue"));
       this.description = "running";
+    } else if (isWaitingForUser) {
+      this.iconPath = new vscode.ThemeIcon("comment-unresolved", new vscode.ThemeColor("charts.yellow"));
+      this.description = "waiting for you";
     } else {
       switch (status) {
         case "done":
@@ -345,10 +352,6 @@ export class StageNode extends vscode.TreeItem {
       ? (artifactUri ? `Open ${artifactName}` : `${artifactName} has not been created yet`)
       : STAGE_DISPLAY_NAMES[stage];
 
-    if (modelInfo && availableModels) {
-      const effectiveStr = describeResolvedModel(modelInfo, availableModels);
-      tooltipStr += `\n\nEffective Model: ${effectiveStr}`;
-    }
     if (isScheduled) {
       this.description = this.description
         ? `${this.description} · scheduled`
@@ -464,7 +467,6 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
   // Bumped on every collapseAll() so TaskNode ids change and VS Code can't
   // reuse its own memorized (already-expanded) UI state for the same node.
   private collapseEpoch = 0;
-  private availableModels: SelectableModel[] = [];
   private readonly filterKey = "ensemble.taskStatusFilter";
   private readonly filterKnownStatusesKey = "ensemble.taskStatusFilterKnownStatuses";
   private selectedStatuses: Set<string>;
@@ -809,14 +811,6 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
   private async getStageNodes(task: IncompleteTask): Promise<StageNode[]> {
     const nodes: StageNode[] = [];
 
-    if (this.availableModels.length === 0) {
-      try {
-        this.availableModels = await getAvailableModels();
-      } catch {
-        // ignore
-      }
-    }
-
     for (const stage of STAGE_ORDER) {
       const status = getStageStatus(stage, task.progress.currentStage, task.progress.completedStages);
 
@@ -843,13 +837,6 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
       let readiness: { label: string } | undefined;
       if (isReviewStage(stage) && status === "current") {
         readiness = await tryReadReadiness(artifactUri);
-      }
-
-      let modelInfo: ResolvedStageModel | undefined;
-      if (AI_MODEL_STAGES.includes(stage)) {
-        modelInfo = await resolveModelForStage(task.folderUri, stage, {
-          ignoreActiveFallback: true,
-        });
       }
 
       const isStageScheduled = status === "current" && task.progress.scheduledRun !== undefined;
@@ -885,8 +872,6 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
           status,
           artifactUri,
           readiness,
-          modelInfo,
-          this.availableModels,
           isStageScheduled,
           this.isMetaManaged,
           hasBackup,

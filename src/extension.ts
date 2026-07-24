@@ -43,7 +43,7 @@ import { SettingsViewProvider } from "./views/settingsView";
 import { ChatViewProvider } from "./views/chatView";
 import { TaskInventory } from "./state/taskInventory";
 import { CurrentTaskStore } from "./utils/currentTaskStore";
-import { TASK_PROGRESS_FILENAME } from "./types/taskProgress";
+import { TASK_PROGRESS_FILENAME, TaskStatus } from "./types/taskProgress";
 import { warmCliModelCache } from "./utils/modelSelection";
 import { StatusTreeProvider, STATUS_VIEW_ID } from "./views/statusView";
 import { initNotificationRouter, deactivateNotificationRouter, NotificationRouter } from "./utils/notificationRouter";
@@ -57,7 +57,7 @@ import { resolveTaskRootCandidates } from "./utils/taskRoot";
 import { finishFinalization, recoverFinalizationTree } from "./state/finalizationJournal";
 import { PendingOperationsStore } from "./state/pendingOperationsStore";
 import { recoverActivationCheckpoint } from "./state/taskActivationCoordinator";
-import { readTaskProgress } from "./utils/taskProgressUtils";
+import { IncompleteTask, readTaskProgress } from "./utils/taskProgressUtils";
 import { installAutoImplementConfirmation, migrateEnabledProvidersForExistingModels, migrateSettingsNamespace, migrateSettingsScope } from "./config/settings";
 
 /**
@@ -93,6 +93,81 @@ class CurrentTaskDecorationProvider implements vscode.FileDecorationProvider {
  */
 export function activate(context: vscode.ExtensionContext): void {
   console.log("Ensemble is now active!");
+
+  // --- View provider registrations come first, before any other activation
+  // work below (migrations, recovery scans, the command-registration flood,
+  // etc.). activate() is synchronous, so every line that runs before a given
+  // registerWebviewViewProvider/createTreeView call adds to the real window
+  // where VS Code has already rendered that view's container but no provider
+  // is registered for it yet — which VS Code surfaces as "There is no data
+  // provider registered that can provide view data." Registration itself is
+  // cheap and synchronous; each provider's actual (possibly async) data
+  // loading happens later, inside resolveWebviewView/getChildren, once VS
+  // Code calls it — so moving registration up front does not change when
+  // data actually appears, only how early the container stops looking broken.
+  // Only each provider's minimal, side-effect-free constructor dependencies
+  // (workspaceState, extensionUri, and the shared inventory/currentTaskStore
+  // below) are pulled forward with it.
+
+  // Create a single shared CurrentTaskStore backed by workspaceState so the
+  // current-task selection survives reloads without being shared globally.
+  const currentTaskStore = new CurrentTaskStore(context.workspaceState);
+
+  // Create a single shared TaskInventory instance. All commands and the tree
+  // provider use this same instance so discovery results are always consistent.
+  const inventory = new TaskInventory();
+
+  const settingsViewProvider = new SettingsViewProvider(context.extensionUri);
+  const chatViewProvider = new ChatViewProvider(context.workspaceState);
+  context.subscriptions.push(chatViewProvider);
+  // With no stage conversation selected, the Chat With AI panel defaults to
+  // the global assistant instead of a "select a task first" blocked state.
+  chatViewProvider.setDefaultTargetFactory(resolveGlobalAssistantTarget);
+  context.subscriptions.push(
+    vscode.window.registerWebviewViewProvider(
+      SettingsViewProvider.viewType,
+      settingsViewProvider
+    )
+  );
+  context.subscriptions.push(
+    vscode.window.registerWebviewViewProvider(ChatViewProvider.viewType, chatViewProvider, {
+      // Keeps the chat webview's DOM/script state alive while it's hidden
+      // (e.g. the user switches to another view and back), instead of
+      // discarding and re-resolving it from scratch every time it's shown.
+      webviewOptions: { retainContextWhenHidden: true },
+    })
+  );
+
+  void vscode.commands.executeCommand("setContext", "vs-code-ai-helper.tasksInitialized", false);
+  // Tasks tree view: persistent visibility of workflow progress.
+  const taskTreeProvider = new TaskTreeProvider(inventory, currentTaskStore, context.workspaceState);
+  context.subscriptions.push(taskTreeProvider);
+  const tasksTreeView = vscode.window.createTreeView(TASKS_VIEW_ID, {
+    treeDataProvider: taskTreeProvider,
+    // The view-title bar already contributes explicit Expand All Tasks /
+    // Collapse All Tasks buttons; VS Code's built-in trailing collapse-all
+    // button would be a duplicate.
+    showCollapseAll: false,
+  });
+
+  // Status/Notifications tree view + router. StatusTreeProvider loads its
+  // (small, Memento-backed) entries synchronously in its constructor, so
+  // registering it here means it never has a real "loading" gap once
+  // created — only the pre-registration gap this reordering closes.
+  void vscode.commands.executeCommand("setContext", "vs-code-ai-helper.statusViewInitialized", false);
+  const statusTreeProvider = new StatusTreeProvider(context.workspaceState);
+  context.subscriptions.push(statusTreeProvider);
+  initNotificationRouter(statusTreeProvider);
+  const statusTreeView = vscode.window.createTreeView(STATUS_VIEW_ID, {
+    treeDataProvider: statusTreeProvider,
+    showCollapseAll: false,
+  });
+  void vscode.commands.executeCommand("setContext", "vs-code-ai-helper.statusViewInitialized", true);
+
+  // --- End of view-provider registrations; the rest of activation (settings
+  // migrations, startup recovery, and command registration) can now run
+  // without risking the "no data provider" window above.
+
   // Scope migration must resolve before the provider migration, which
   // inspects enabledProviders' post-migration state to decide whether it
   // still needs to run.
@@ -102,19 +177,12 @@ export function activate(context: vscode.ExtensionContext): void {
     .then(() => migrateEnabledProvidersForExistingModels())
     .catch(error => console.error("Provider settings migration failed", error));
   context.subscriptions.push(installAutoImplementConfirmation(context));
-  void vscode.commands.executeCommand("setContext", "vs-code-ai-helper.tasksInitialized", false);
   // Recover interrupted operations before commands become available. They are
   // retained for reconciliation rather than silently discarded.
   const pendingOperations = new PendingOperationsStore(context.workspaceState);
   for (const operation of pendingOperations.recoverable()) {
     void pendingOperations.update(operation.id, "needs-reconciliation");
   }
-
-  // Create a single shared CurrentTaskStore backed by workspaceState so the
-  // current-task selection survives reloads without being shared globally.
-  // Constructed before the startup recovery block below because activation
-  // checkpoint recovery needs to update it.
-  const currentTaskStore = new CurrentTaskStore(context.workspaceState);
 
   // Perform startup cleanup of orphaned temp files
   try {
@@ -149,31 +217,12 @@ export function activate(context: vscode.ExtensionContext): void {
     console.error("Startup temp file cleanup failed", err);
   }
 
-  // Create a single shared TaskInventory instance. All commands and the tree
-  // provider use this same instance so discovery results are always consistent.
-  const inventory = new TaskInventory();
-
   // Register the current-task decoration provider
   const decorationProvider = new CurrentTaskDecorationProvider();
   context.subscriptions.push(
     vscode.window.registerFileDecorationProvider(decorationProvider)
   );
 
-  const settingsViewProvider = new SettingsViewProvider(context.extensionUri);
-  const chatViewProvider = new ChatViewProvider(context.workspaceState);
-  context.subscriptions.push(chatViewProvider);
-  // With no stage conversation selected, the Chat With AI panel defaults to
-  // the global assistant instead of a "select a task first" blocked state.
-  chatViewProvider.setDefaultTargetFactory(resolveGlobalAssistantTarget);
-  context.subscriptions.push(
-    vscode.window.registerWebviewViewProvider(
-      SettingsViewProvider.viewType,
-      settingsViewProvider
-    )
-  );
-  context.subscriptions.push(
-    vscode.window.registerWebviewViewProvider(ChatViewProvider.viewType, chatViewProvider)
-  );
   registerConfigureStepModelsCommand(context, settingsViewProvider);
 
   // Register commands — pass the shared inventory, currentTaskStore, and
@@ -247,21 +296,9 @@ export function activate(context: vscode.ExtensionContext): void {
   );
   context.subscriptions.push(viewDisclaimerDisposable);
 
-  // Tasks tree view + status bar: persistent visibility of workflow progress
-  const taskTreeProvider = new TaskTreeProvider(inventory, currentTaskStore, context.workspaceState);
-  context.subscriptions.push(taskTreeProvider);
-  const tasksTreeView = vscode.window.createTreeView(TASKS_VIEW_ID, {
-    treeDataProvider: taskTreeProvider,
-    // The view-title bar already contributes explicit Expand All Tasks /
-    // Collapse All Tasks buttons; VS Code's built-in trailing collapse-all
-    // button would be a duplicate.
-    showCollapseAll: false,
-  });
-
-  // Initialize status view and notification router
-  const statusTreeProvider = new StatusTreeProvider(context.workspaceState);
-  context.subscriptions.push(statusTreeProvider);
-  initNotificationRouter(statusTreeProvider);
+  // taskTreeProvider/tasksTreeView and statusTreeProvider/statusTreeView were
+  // already constructed and registered above, alongside the other view
+  // providers; the rest of the status-view wiring continues here.
   // Lets stuck review iteration (reviewEscalation.ts) post its "what should
   // I do?" question straight into Chat With AI, mirroring how
   // draftTaskWithAI surfaces blocking open questions there.
@@ -318,15 +355,33 @@ export function activate(context: vscode.ExtensionContext): void {
   ));
   registerOpenGeneralAssistantCommand(context, inventory, currentTaskStore, chatViewProvider);
 
-  const statusTreeView = vscode.window.createTreeView(STATUS_VIEW_ID, {
-    treeDataProvider: statusTreeProvider,
-    showCollapseAll: false,
-  });
-
   const progressBinder = new ViewProgressBinder(taskOperations);
   context.subscriptions.push(progressBinder);
 
   const taskStatusBar = new TaskStatusBar(currentTaskStore);
+  // Mirrors Source Control's changed-file-count overlay on its activity-bar
+  // icon: when nothing is running, the Tasks view badge shows the count of
+  // active + paused tasks (there is no separate "resumed" status — a
+  // resumed task is just "active"). "creating" is excluded too: a task
+  // still being created isn't yet something the user needs to act on.
+  // While real background work is running, the
+  // native progress spinner (ViewProgressBinder, above) already occupies
+  // that same icon, so the badge steps aside rather than visually competing
+  // with it — recomputed on every task-list reload and on every
+  // taskOperations change (work starting/stopping).
+  let lastLoadedTasks: readonly IncompleteTask[] = [];
+  const ACTIVE_TASK_BADGE_STATUSES: ReadonlySet<TaskStatus> = new Set(["active", "paused"]);
+  const refreshTaskCountBadge = (): void => {
+    if (taskOperations.hasAnyRunning()) {
+      tasksTreeView.badge = undefined;
+      return;
+    }
+    const count = lastLoadedTasks.filter((t) => ACTIVE_TASK_BADGE_STATUSES.has(t.progress.status ?? "active")).length;
+    tasksTreeView.badge = count > 0
+      ? { value: count, tooltip: `${count} active task${count === 1 ? "" : "s"}` }
+      : undefined;
+  };
+  const badgeOperationsListener = taskOperations.onDidChange(refreshTaskCountBadge);
   const tasksLoadedListener = taskTreeProvider.onDidLoadTasks((tasks) => {
     // tasksInitialized/isLoadingTasks are now set authoritatively by
     // TaskInventory.refresh() (see taskInventory.ts) rather than here: this
@@ -344,6 +399,8 @@ export function activate(context: vscode.ExtensionContext): void {
       currentTaskStage
     );
     taskStatusBar.update(tasks, currentTaskCanonicalId);
+    lastLoadedTasks = tasks;
+    refreshTaskCountBadge();
   });
 
   const refreshCommand = vscode.commands.registerCommand(
@@ -468,6 +525,7 @@ export function activate(context: vscode.ExtensionContext): void {
     statusTreeView,
     taskStatusBar,
     tasksLoadedListener,
+    badgeOperationsListener,
     refreshCommand,
     expandAllCommand,
     collapseAllCommand,

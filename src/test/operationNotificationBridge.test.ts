@@ -43,6 +43,7 @@ function snap(overrides: {
     kind: overrides.kind,
     parentId: overrides.parentId,
     detail: overrides.detail,
+    waitingForUser: false,
   };
 }
 

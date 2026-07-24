@@ -4,6 +4,7 @@ import { describe, it } from "node:test";
 import * as vscode from "vscode";
 import { SettingsViewProvider } from "../views/settingsView";
 import { __testOnly } from "../utils/modelSelection";
+import { initNotificationRouter, deactivateNotificationRouter } from "../utils/notificationRouter";
 
 interface FakeMessage {
   type: string;
@@ -80,6 +81,36 @@ function createFakeWebviewView() {
     },
     simulateRendered() {
       send({ type: "rendered" });
+    },
+    /** Simulates the webview posting an arbitrary message to the extension
+     * host, e.g. "saveProviders" — the real onDidReceiveMessage dispatch. */
+    send,
+  };
+}
+
+/** Minimal `vscode.workspace.getConfiguration()` stand-in backed by a plain
+ * key/value store, generic enough for every setting readSetting() touches
+ * (getModelSettings, getEnabledProviders, isUnsavedSettingsWarningEnabled,
+ * ...) — not just the one key a given test cares about. `inspect()` only
+ * reports a globalValue once a key has actually been written, so unwritten
+ * settings correctly fall through readSetting() to their schema default. */
+function stubWorkspaceConfiguration(): { store: Record<string, unknown>; restore(): void } {
+  const workspace = vscode.workspace as unknown as Record<string, unknown>;
+  const original = workspace.getConfiguration;
+  const store: Record<string, unknown> = {};
+  workspace.getConfiguration = () => ({
+    get: (key: string, fallback?: unknown): unknown => (key in store ? store[key] : fallback),
+    inspect: (key: string): { globalValue: unknown; workspaceValue: unknown; workspaceFolderValue: unknown } | undefined =>
+      key in store ? { globalValue: store[key], workspaceValue: undefined, workspaceFolderValue: undefined } : undefined,
+    update: (key: string, value: unknown): Promise<void> => {
+      store[key] = value;
+      return Promise.resolve();
+    },
+  });
+  return {
+    store,
+    restore() {
+      workspace.getConfiguration = original;
     },
   };
 }
@@ -324,11 +355,12 @@ void describe("SettingsViewProvider — usage-button view-model", () => {
       assert.strictEqual(copilot?.usageEnabled, true, "Copilot's usage button must be enabled");
       assert.match(copilot?.usageTooltip ?? "", /Opens the usage page\.$/);
 
-      // Kiro: same shape — unsupported command, known usage page.
+      // Kiro: a one-shot, non-interactive usage command (piping "/usage"
+      // into `kiro-cli chat`) — a "terminal" capability, not "unsupported".
       const kiro = byId.get("kiro-cli");
       assert.ok(kiro, "expected a kiro-cli entry in the init payload");
       assert.strictEqual(kiro?.usageEnabled, true, "Kiro's usage button must be enabled");
-      assert.match(kiro?.usageTooltip ?? "", /Opens the usage page\.$/);
+      assert.match(kiro?.usageTooltip ?? "", /Runs the provider's usage command in a visible terminal/);
 
       // Antigravity: an unverified in-session usage command (agy → /usage)
       // renders "unsupported" with no url — the button stays DISABLED rather
@@ -354,6 +386,120 @@ void describe("SettingsViewProvider — usage-button view-model", () => {
         "Gemini's usage button must be disabled while its slash command is unverified"
       );
     } finally {
+      __testOnly.clearModelSelectionTestOverrides();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Provider save must not reset the model-selection form
+//
+// Provider selection and model selection are independently saved settings
+// (separate config keys). Saving providers must never discard unsaved edits
+// sitting in the model-selection form. The extension-host half of that fix
+// is _selfOriginatedProviderWrite: a "saveProviders" write flips it on for
+// the duration of VS Code's own asynchronous onDidChangeConfiguration
+// dispatch for that exact write, so the listener refreshes only the
+// provider rows/combobox options (via a targeted "providersRefreshed")
+// instead of re-running a full "init" that would flatten the model form to
+// whatever is last saved on disk. A genuinely external config change (a
+// different window, the settings editor, Global scope) must still trigger
+// the full re-init.
+// ---------------------------------------------------------------------------
+
+void describe("SettingsViewProvider — provider save does not reset model selections", () => {
+  void it("suppresses a full re-init when its own saveProviders write echoes back through onDidChangeConfiguration", async () => {
+    __testOnly.setModelSelectionTestOverrides({
+      getAvailableCopilotModels: () => Promise.resolve([]),
+      cliCommandExists: () => Promise.resolve(false),
+    });
+    const config = stubWorkspaceConfiguration();
+    initNotificationRouter({ addEntry: () => undefined });
+    try {
+      const provider = new SettingsViewProvider(vscode.Uri.file("/fake/ext"));
+      const fake = createFakeWebviewView();
+
+      provider.resolveWebviewView(
+        fake.webviewView,
+        {} as vscode.WebviewViewResolveContext,
+        {} as vscode.CancellationToken
+      );
+      fake.simulateScriptLoaded();
+      await flushAsync();
+      assert.strictEqual(fake.postedMessages.length, 1, "expected the initial init post");
+      assert.strictEqual(fake.postedMessages[0]?.type, "init");
+
+      fake.send({ type: "saveProviders", enabledProviders: { "claude-cli": true } });
+      await flushAsync();
+
+      // The handler itself posts a targeted refresh, never a second "init".
+      const afterSave = fake.postedMessages.slice(1);
+      assert.strictEqual(afterSave.length, 1, "saveProviders should post exactly one message");
+      assert.strictEqual(afterSave[0]?.type, "providersRefreshed");
+      assert.strictEqual((afterSave[0] as { settings?: unknown }).settings, undefined,
+        "providersRefreshed must not carry model-selection form state");
+
+      // Simulate VS Code's real, asynchronous dispatch of
+      // onDidChangeConfiguration for that same self-originated write — the
+      // stub's config.update() (unlike real VS Code) does not fire this on
+      // its own, so the test fires it explicitly, exactly like the write
+      // this webview just performed would in production.
+      const changes = (vscode.workspace as unknown as {
+        _configurationChanges: { fire(value: { affectsConfiguration(section: string): boolean }): void };
+      })._configurationChanges;
+      changes.fire({ affectsConfiguration: (section: string) => section === "ensemble" });
+      await flushAsync();
+
+      assert.strictEqual(
+        fake.postedMessages.filter((m) => m.type === "init").length,
+        1,
+        "the self-originated config-change echo must not trigger a second full re-init, " +
+          "which would overwrite unsaved model-selection edits"
+      );
+    } finally {
+      config.restore();
+      deactivateNotificationRouter();
+      __testOnly.clearModelSelectionTestOverrides();
+    }
+  });
+
+  void it("still re-inits on a genuinely external config change (not caused by this webview's own saveProviders write)", async () => {
+    __testOnly.setModelSelectionTestOverrides({
+      getAvailableCopilotModels: () => Promise.resolve([]),
+      cliCommandExists: () => Promise.resolve(false),
+    });
+    const config = stubWorkspaceConfiguration();
+    initNotificationRouter({ addEntry: () => undefined });
+    try {
+      const provider = new SettingsViewProvider(vscode.Uri.file("/fake/ext"));
+      const fake = createFakeWebviewView();
+
+      provider.resolveWebviewView(
+        fake.webviewView,
+        {} as vscode.WebviewViewResolveContext,
+        {} as vscode.CancellationToken
+      );
+      fake.simulateScriptLoaded();
+      await flushAsync();
+      assert.strictEqual(fake.postedMessages.length, 1, "expected the initial init post");
+
+      // No saveProviders in this test — the change below models an edit made
+      // in the settings editor, a different window, or Global scope, none of
+      // which set _selfOriginatedProviderWrite.
+      const changes = (vscode.workspace as unknown as {
+        _configurationChanges: { fire(value: { affectsConfiguration(section: string): boolean }): void };
+      })._configurationChanges;
+      changes.fire({ affectsConfiguration: (section: string) => section === "ensemble" });
+      await flushAsync();
+
+      assert.strictEqual(
+        fake.postedMessages.filter((m) => m.type === "init").length,
+        2,
+        "an externally-caused config change must still trigger a full re-init"
+      );
+    } finally {
+      config.restore();
+      deactivateNotificationRouter();
       __testOnly.clearModelSelectionTestOverrides();
     }
   });
@@ -478,6 +624,9 @@ function runWebviewSession(script: string, stateStore: { value: unknown }): Webv
     },
     createElement(): FakeNode {
       return new FakeNode();
+    },
+    querySelectorAll(): FakeNode[] {
+      return [];
     },
     body: new FakeNode(),
   };
@@ -631,6 +780,94 @@ void describe("SettingsViewProvider webview — draft restore across disposal", 
       third.byId("restored-note-container").children.length,
       0,
       "after saving, a recreated document must not claim there are unsaved changes"
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// "providersRefreshed" must never discard a dirty model-selection form
+//
+// This is the webview-script half of the provider-save-preservation fix (see
+// the extension-host tests above, "provider save does not reset model
+// selections"): a provider-selection save posts "providersRefreshed" rather
+// than a full "init", and the webview script's own handler for it must leave
+// currentSettings/formDirty untouched so an in-progress model edit survives.
+// ---------------------------------------------------------------------------
+
+void describe("SettingsViewProvider webview — providersRefreshed preserves an unsaved model edit", () => {
+  void it("leaves a dirty model-selection edit in place when providersRefreshed arrives", async () => {
+    const script = extractWebviewScript();
+    const stateStore: { value: unknown } = { value: undefined };
+    const session = runWebviewSession(script, stateStore);
+
+    const init = initMessage();
+    init.settings = { impl: { primary: "claude-cli:sonnet", backups: [], strategy: "alert-and-wait" } };
+    await session.deliver(init);
+
+    // Edit the primary model for "impl" without saving — mirrors a real
+    // combobox edit, which marks the form dirty via the delegated
+    // #stages-tbody listener.
+    session.byId("primary-impl").value = "claude-cli:opus";
+    await session.byId("stages-tbody").dispatch("input");
+    assert.equal(session.byId("save-btn").disabled, false, "the edit must have marked the form dirty");
+
+    // renderTable() rebuilds the whole tbody's innerHTML from currentSettings
+    // — capture it now so the assertion below can confirm providersRefreshed
+    // does NOT trigger that rebuild while the form is dirty (a rebuilt row's
+    // markup reflects currentSettings, not whatever the user has live-typed
+    // into the actual, not-yet-saved combobox — checking the rendered HTML
+    // for the edited value would not exercise the real bug at all).
+    const tbodyHtmlBeforeRefresh = session.byId("stages-tbody").innerHTML;
+
+    // A provider-selection save completes concurrently and refreshes the
+    // provider rows / available models — it must not know or care that the
+    // model form is mid-edit.
+    await session.deliver({
+      type: "providersRefreshed",
+      models: [{ id: "claude-cli:sonnet", name: "Sonnet", providerLabel: "Claude CLI" }],
+      enabledProviders: { "claude-cli": true },
+      providers: [],
+    });
+
+    assert.equal(
+      session.byId("save-btn").disabled,
+      false,
+      "providersRefreshed must not clear the dirty flag set by the unsaved model edit"
+    );
+    assert.equal(
+      session.byId("stages-tbody").innerHTML,
+      tbodyHtmlBeforeRefresh,
+      "the model table must not be rebuilt while an edit is unsaved — rebuilding it would discard " +
+        "the user's in-progress (unsaved) selection"
+    );
+    assert.equal(
+      session.byId("primary-impl").value,
+      "claude-cli:opus",
+      "the unsaved edit itself must survive a providersRefreshed message"
+    );
+  });
+
+  void it("re-renders the model table from providersRefreshed when the form is clean (not dirty)", async () => {
+    const script = extractWebviewScript();
+    const stateStore: { value: unknown } = { value: undefined };
+    const session = runWebviewSession(script, stateStore);
+
+    const init = initMessage();
+    init.settings = { impl: { primary: "claude-cli:sonnet", backups: [], strategy: "alert-and-wait" } };
+    await session.deliver(init);
+    assert.equal(session.byId("save-btn").disabled, true, "nothing unsaved right after init");
+
+    await session.deliver({
+      type: "providersRefreshed",
+      models: [{ id: "claude-cli:opus", name: "Opus", providerLabel: "Claude CLI" }],
+      enabledProviders: { "claude-cli": true },
+      providers: [],
+    });
+
+    assert.equal(
+      session.byId("save-btn").disabled,
+      true,
+      "a clean form must stay clean after a providersRefreshed re-render"
     );
   });
 });

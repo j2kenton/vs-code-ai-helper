@@ -9,7 +9,7 @@ import {
 } from "../utils/taskProgressUtils";
 import { MAX_PINNED_TASKS, TaskProgress, TaskStatus } from "../types/taskProgress";
 import { NotificationRouter } from "../utils/notificationRouter";
-import { runTrackedOperation, taskOperations } from "../utils/taskOperations";
+import { cancelRunningOperationsForTask, runTrackedOperation } from "../utils/taskOperations";
 import { PendingOperationsStore } from "../state/pendingOperationsStore";
 
 /**
@@ -39,42 +39,13 @@ function normalizeArg(
 const ARCHIVABLE_STATUSES: readonly TaskStatus[] = ["active", "paused", "completed"];
 
 /**
- * Request cancellation of every running operation for the task and wait
- * (bounded) for the operations to actually terminate. Archiving must never
- * leave a live process writing into an archived task — merely deleting the
- * record is not enough, so the archive aborts if cancellation fails or the
- * wait times out.
+ * Archiving must never leave a live process writing into an archived task —
+ * merely deleting the record is not enough, so the archive aborts if
+ * cancellation fails or the wait times out. Thin archive-flavored alias over
+ * the shared `cancelRunningOperationsForTask` (taskOperations.ts), kept so
+ * existing call sites/imports don't need to change.
  */
-export async function cancelRunningOperationsForArchive(
-  taskFolderPath: string,
-  timeoutMs = 15_000
-): Promise<{ ok: boolean; reason?: string }> {
-  const ops = taskOperations.getTaskOperations(taskFolderPath);
-  if (ops.length === 0) {
-    return { ok: true };
-  }
-
-  const roots = ops.filter((op) => op.parentId === undefined);
-  const uncancellable = roots.filter((op) => !op.cancellable);
-  for (const op of roots) {
-    taskOperations.cancelOperation(op.id);
-  }
-
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (taskOperations.getTaskOperations(taskFolderPath).length === 0) {
-      return { ok: true };
-    }
-    await new Promise((resolve) => setTimeout(resolve, 250));
-  }
-
-  return {
-    ok: false,
-    reason: uncancellable.length > 0
-      ? `"${uncancellable[0]?.label}" cannot be cancelled — wait for it to finish, then archive.`
-      : "The running operation did not stop in time. Try again once it has finished.",
-  };
-}
+export const cancelRunningOperationsForArchive = cancelRunningOperationsForTask;
 
 /**
  * Archive a task. Allowed from the active, paused, and completed states.

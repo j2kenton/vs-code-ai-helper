@@ -7,7 +7,6 @@ import {
   describeModel,
   getModelDisplayName,
   describeModelSource,
-  describeResolvedModel,
 } from "../utils/modelSelection";
 
 function providerModels(
@@ -516,7 +515,7 @@ void describe("getAvailableModels", () => {
           ]),
           {
             id: "claude-cli:fable",
-            name: "Fable 5 [only on Max plan]",
+            name: "Fable 5",
             providerLabel: "Claude Code (subscription CLI)",
           },
           ...claudeCliReasoningVariants(
@@ -528,8 +527,7 @@ void describe("getAvailableModels", () => {
               ["high", "High"],
               ["xhigh", "Extra High"],
               ["max", "Max"],
-            ],
-            "only on Max plan"
+            ]
           ),
           {
             id: "claude-cli:opus",
@@ -1186,35 +1184,4 @@ void describe("Model Selection Display States", () => {
     assert.strictEqual(describeModelSource("none"), "automatic selection");
   });
 
-  void it("describeResolvedModel covers explicit task override", () => {
-    const resolved = { modelId: "gemini-3.5-flash", source: "task" as const };
-    assert.strictEqual(
-      describeResolvedModel(resolved, mockModels),
-      "Gemini 3.5 Flash (gemini-3.5-flash) (explicit task override)"
-    );
-  });
-
-  void it("describeResolvedModel covers inherited workspace default", () => {
-    const resolved = { modelId: "claude-sonnet-4.5", source: "workspace" as const };
-    assert.strictEqual(
-      describeResolvedModel(resolved, mockModels),
-      "Claude Sonnet 4.5 (claude-sonnet-4.5) (inherited workspace default)"
-    );
-  });
-
-  void it("describeResolvedModel covers automatic / no selection", () => {
-    const resolved = { modelId: undefined, source: "none" as const };
-    assert.strictEqual(
-      describeResolvedModel(resolved, mockModels),
-      "Automatic (no explicit selection)"
-    );
-  });
-
-  void it("describeResolvedModel covers unavailable model", () => {
-    const resolved = { modelId: "gpt-5", source: "task" as const };
-    assert.strictEqual(
-      describeResolvedModel(resolved, mockModels),
-      "gpt-5 (currently unavailable) (explicit task override)"
-    );
-  });
 });

@@ -340,6 +340,146 @@ void describe("nextStage command → auto-review chain (command-layer end-to-end
     }
   });
 
+  void it("regression: cancels a running operation for the task before the artifact-existence check can short-circuit the transition", async () => {
+    // Reproduces the fixed bug: cancelRunningOperationsForTask used to run
+    // AFTER the artifact-existence check, which itself can return early — so
+    // a task with a missing/empty artifact left its previous stage's
+    // operation running underneath it even after "Complete Stage & Move On"
+    // was clicked. Emptying plan.md here deliberately drives nextStage down
+    // that early-return path, so this test can observe that cancellation
+    // still happened despite the transition itself not proceeding.
+    const { folderPath, progress } = makeTaskFolder(`abort-order-${Math.floor(Math.random() * 1e9)}`, "plan");
+    fs.writeFileSync(path.join(folderPath, "plan.md"), "", "utf8");
+    const buttonArg = makeButtonPressArg(folderPath, progress);
+
+    const provider = new StatusTreeProvider();
+    initNotificationRouter(provider);
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+
+    const patches: Patched[] = [
+      patch(modelSelectionModule, "resolveConfiguredReviewStages", () =>
+        Promise.resolve(new Set(REVIEW_STAGES))),
+    ];
+
+    let cancelled = false;
+    const stillRunning = runTrackedOperation(
+      folderPath,
+      { label: "Stub Long-Running", stage: "plan", kind: "review", cancellable: true },
+      (handle) =>
+        new Promise<void>((resolve) => {
+          const token = handle.token;
+          if (!token || token.isCancellationRequested) {
+            cancelled = !!token?.isCancellationRequested;
+            resolve();
+            return;
+          }
+          token.onCancellationRequested(() => {
+            cancelled = true;
+            resolve();
+          });
+        })
+    );
+
+    const context = makeExtensionContext();
+    registerReviewActionCommands(context);
+
+    try {
+      await vscode.commands.executeCommand("vs-code-ai-helper.nextStage", buttonArg);
+      await stillRunning;
+
+      assert.equal(
+        cancelled,
+        true,
+        "the pre-existing operation for this task must be cancelled by the transition handler"
+      );
+      const persisted = await readTaskProgress(vscode.Uri.file(folderPath));
+      assert.equal(
+        persisted?.currentStage,
+        "plan",
+        "the missing-artifact early return must still fire after cancellation — cancelling must not " +
+          "itself advance the stage or skip the artifact check"
+      );
+    } finally {
+      for (const p of patches.reverse()) { p.restore(); }
+      for (const sub of context.subscriptions) { sub.dispose(); }
+      wsStub.restore();
+      fsBridge.restore();
+      provider.dispose();
+      deactivateNotificationRouter();
+    }
+  });
+
+  void it("regression: cancels a running operation for the task before resolving configured review stages", async () => {
+    // Reproduces the fixed bug: cancelRunningOperationsForTask used to run
+    // AFTER resolveConfiguredReviewStages — a slow config/model-resolution
+    // path left the previous stage's operation running during transition
+    // preparation. This test observes whether the stray operation was
+    // already cancelled by the time resolveConfiguredReviewStages is called,
+    // which only holds if cancellation now runs strictly first.
+    // Empty plan.md deliberately drives nextStage down the missing-artifact
+    // early-return path (as the sibling ordering test above does), so this
+    // test observes cancel-before-config-resolution without also exercising
+    // the real review pipeline.
+    const { folderPath, progress } = makeTaskFolder(`abort-order-cfg-${Math.floor(Math.random() * 1e9)}`, "plan");
+    fs.writeFileSync(path.join(folderPath, "plan.md"), "", "utf8");
+    const buttonArg = makeButtonPressArg(folderPath, progress);
+
+    const provider = new StatusTreeProvider();
+    initNotificationRouter(provider);
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+
+    let cancelledBeforeConfigResolution: boolean | undefined;
+    const patches: Patched[] = [
+      patch(modelSelectionModule, "resolveConfiguredReviewStages", () => {
+        cancelledBeforeConfigResolution = cancelled;
+        return Promise.resolve(new Set(REVIEW_STAGES));
+      }),
+    ];
+
+    let cancelled = false;
+    const stillRunning = runTrackedOperation(
+      folderPath,
+      { label: "Stub Long-Running", stage: "plan", kind: "review", cancellable: true },
+      (handle) =>
+        new Promise<void>((resolve) => {
+          const token = handle.token;
+          if (!token || token.isCancellationRequested) {
+            cancelled = !!token?.isCancellationRequested;
+            resolve();
+            return;
+          }
+          token.onCancellationRequested(() => {
+            cancelled = true;
+            resolve();
+          });
+        })
+    );
+
+    const context = makeExtensionContext();
+    registerReviewActionCommands(context);
+
+    try {
+      await vscode.commands.executeCommand("vs-code-ai-helper.nextStage", buttonArg);
+      await stillRunning;
+
+      assert.equal(
+        cancelledBeforeConfigResolution,
+        true,
+        "the pre-existing operation for this task must already be cancelled by the time " +
+          "resolveConfiguredReviewStages runs — cancellation must come first"
+      );
+    } finally {
+      for (const p of patches.reverse()) { p.restore(); }
+      for (const sub of context.subscriptions) { sub.dispose(); }
+      wsStub.restore();
+      fsBridge.restore();
+      provider.dispose();
+      deactivateNotificationRouter();
+    }
+  });
+
   void it("score-based auto-advance into another review dispatches Fast Forward when auto-advance mode requests it", async () => {
     const { folderPath } = makeTaskFolder(`auto-ff-review-${Math.floor(Math.random() * 1e9)}`, "plan-high-review");
     const provider = new StatusTreeProvider();
