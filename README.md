@@ -4,22 +4,28 @@ Ensemble is an agentic workflow system for VS Code. It turns an idea into a supe
 
 ## The workflow
 
-The task → plan → implementation → review loop keeps human judgment in the driver’s seat:
+The task → plan → implementation → review → publish loop keeps human judgment in the driver’s seat:
 
-1. **Task:** describe the goal, scope, constraints, and acceptance criteria in `task.md`.
-2. **Plan:** draft or edit `plan.md`, then use high- and low-level reviews to improve it. Promote the approved plan to `plan-final.md` deliberately.
-3. **Implementation:** generate an `implementation.md` checklist and work through it. AI implementation runs can edit workspace files, so supervise and inspect every change.
-4. **Review:** review the changed files, apply fixes where appropriate, rerun checks, and complete the task only when the result is ready.
+1. **Task:** describe the goal, scope, constraints, and acceptance criteria in `task.md`. Write it yourself or generate a first draft with **Draft with AI**.
+2. **Plan:** draft or edit `plan.md`, then run the **high-level** and **low-level** plan reviews to improve it. Each review scores the plan's readiness and lists blockers; apply the fixes and re-review until it holds up.
+3. **Implementation:** the implementation stage works from the plan (captured in `plan-final.md`) and carries out the changes. AI implementation runs edit workspace files, so supervise and inspect every change — then the **high-level** and **low-level** code reviews check the result the same way the plan reviews checked the plan.
+4. **Publish:** run lint, tests, and any configured verification checks, inspect the accumulated diff, and finish the task — commit and push, cut a release, or mark it complete.
 
 The Tasks view and status bar show the current task and stage. Every AI action has a manual counterpart, and task artifacts remain ordinary Markdown and JSON files that you can edit, inspect, or use with another tool.
 
+### Optional: hands-off iteration
+
+Reviews score each stage out of 10, and Ensemble can drive the loop for you. **Fast Forward** repeatedly reviews and applies fixes until it reaches a target score, and **Auto Advance** moves a stage on once its review clears a threshold. Both are off by default and configurable in Ensemble's settings; because implementation and Fast Forward runs change real files, use them only under supervision.
+
 ## Screenshots
 
-![Task view with model configuration](images/screenshots/screenshot-1.png)
+![Task description stage - rough draft](images/screenshots/screenshot-1.png)
 
-![AI-generated low-level code review](images/screenshots/screenshot-2.png)
+![Task description stage - ai generated version](images/screenshots/screenshot-2.png)
 
-![Provider selection and fast-forward review settings](images/screenshots/screenshot-3.png)
+![High level plan review - diff](images/screenshots/screenshot-3.png)
+
+![Publish stage](images/screenshots/screenshot-4.png)
 
 ## Requirements
 
@@ -52,9 +58,9 @@ AI actions consume real quota or money, and implementation runs modify workspace
 ## Quick start
 
 1. Install from the [Visual Studio Marketplace](https://marketplace.visualstudio.com/items?itemName=j2kenton.vs-code-ai-helper).
-2. Open a workspace folder. Ensemble stores task metadata in `.ensemble` by default, or you can run **Ensemble: Select Meta Resources Folder** to choose a different workspace folder.
-3. Run **Ensemble: Start New Task**, describe the work in `task.md`, and use **Generate Plan with AI** or write the plan yourself.
-4. Review and promote the plan, generate the implementation checklist, implement, and run the implementation reviews.
+2. Open a workspace folder. Ensemble stores task metadata in `.ensemble` at the workspace root. If you have tasks from an older version in a different folder, run **Ensemble: Move Ensemble Resources to .ensemble** to migrate them.
+3. Run **Ensemble: Start New Task**, describe the work in `task.md`, and use **Generate Plan** or write the plan yourself.
+4. Run the plan reviews, implement, run the code reviews, then use the Publish stage to verify, commit, and complete the task.
 
 Configure models per workflow step under **Ensemble: Configure AI Models**.
 
