@@ -38,6 +38,7 @@ import { classifyCliFailure, isAuthenticationFailure, isTransportError } from ".
 const {
   toFriendlyError,
   extractStructuredCliDiagnostics,
+  extractClineStructuredDiagnostics,
   unwrapJsonString,
   applyTransportTransience,
   truncateCliDetail,
@@ -81,6 +82,31 @@ const OPENCODE_LIKE: CliProviderDefinition = {
   structuredEventStream: "opencode",
   buildArgs(): string[] {
     return ["run", "--format", "json"];
+  },
+};
+
+/** A cline-shaped provider: structured event stream, its real marker list. */
+const CLINE_LIKE: CliProviderDefinition = {
+  id: "cline-cli",
+  label: "Cline CLI",
+  command: "cline",
+  installHint: "Install the Cline CLI.",
+  loginHint: "Run `cline auth cline-pass` and sign in.",
+  authErrorMarkers: [
+    "not logged in",
+    "login",
+    "authenticate",
+    "api key",
+    "unauthorized",
+    "401",
+    "no credentials",
+  ],
+  signInLabel: "Sign in",
+  models: [],
+  usesLastMessageFile: false,
+  structuredEventStream: "cline",
+  buildArgs(): string[] {
+    return ["--json"];
   },
 };
 
@@ -537,6 +563,155 @@ void describe("extractStructuredCliDiagnostics", () => {
     // markerScanText is unaffected — responseBody there is intentional (see
     // "diagnoses a 401 whose message matches no auth marker" above).
     assert.match(diagnostics.markerScanText, /CreditsError/);
+  });
+});
+
+/**
+ * A cline tool-call event re-emitting a read file's contents verbatim —
+ * shape verified live against cline 3.0.46 (a `read_files` tool call on a
+ * file containing "api key"/"login"/"authenticate" text echoed those words
+ * straight back out into the event stream's `output` field).
+ */
+const CLINE_FILE_CONTENTS_ECHO_EVENT = JSON.stringify({
+  type: "agent_event",
+  event: {
+    type: "content_end",
+    contentType: "tool",
+    toolCallId: "call_1",
+    toolName: "read_files",
+    output: [
+      {
+        query: "secret.txt",
+        result:
+          "1 | This document mentions an api key and says you must login or authenticate before use.",
+        success: true,
+      },
+    ],
+  },
+});
+
+/** A genuine cline CLI/provider failure — verified live shape. */
+const CLINE_FAILED_RUN_RESULT_EVENT = JSON.stringify({
+  type: "run_result",
+  finishReason: "error",
+  text: "invalid model format. Expected format: modelType/model",
+  model: { id: "deepseek-v4-pro", provider: "cline-pass" },
+});
+
+void describe("extractClineStructuredDiagnostics", () => {
+  void it("reads only a failed run's own text, never tool events carrying file contents", () => {
+    const diagnostics = extractClineStructuredDiagnostics(
+      [CLINE_FILE_CONTENTS_ECHO_EVENT, CLINE_FAILED_RUN_RESULT_EVENT].join("\n")
+    );
+
+    assert.doesNotMatch(diagnostics.markerScanText, /api key|authenticate|login/);
+    assert.match(diagnostics.detail, /invalid model format/);
+    assert.equal(diagnostics.sawAnyEvent, true);
+  });
+
+  void it("reads a top-level error event's message", () => {
+    const diagnostics = extractClineStructuredDiagnostics(
+      JSON.stringify({ type: "error", message: "not logged in" })
+    );
+
+    assert.match(diagnostics.markerScanText, /not logged in/);
+    assert.match(diagnostics.detail, /not logged in/);
+  });
+
+  void it("ignores a benign error line that coexists with a successful run (hook-dispatch noise)", () => {
+    // Observed live: "hook dispatch failed: session.hook requires a valid
+    // hook event payload" appears as a bare {"type":"error",...} line even
+    // on exit-0 runs. This function still surfaces it (extraction has no way
+    // to know the exit code) — the caller (toFriendlyError, only invoked on
+    // a non-zero exit / empty output) is what keeps this from misclassifying
+    // a successful run, so this test only pins the extractor's own behavior:
+    // it must not crash and must still surface the noise line as detail.
+    const diagnostics = extractClineStructuredDiagnostics(
+      JSON.stringify({
+        type: "error",
+        message: "hook dispatch failed: session.hook requires a valid hook event payload",
+      })
+    );
+
+    assert.equal(diagnostics.sawAnyEvent, true);
+    assert.match(diagnostics.detail, /hook dispatch failed/);
+  });
+
+  void it("re-serializes an error event whose message isn't a flat string, instead of dropping it", () => {
+    // A future cline version could nest its error payload (e.g.
+    // {"error":{"code":401,...}}) instead of a flat "message" string. The
+    // event must still surface as diagnosable content — never silently
+    // vanish into a bare "exit code N" — mirroring
+    // extractStructuredCliDiagnostics's identical opencode fallback.
+    const diagnostics = extractClineStructuredDiagnostics(
+      JSON.stringify({ type: "error", error: { code: 401, reason: "unauthorized" } })
+    );
+
+    assert.notStrictEqual(diagnostics.detail, "");
+    assert.match(diagnostics.detail, /unauthorized/);
+    assert.match(diagnostics.markerScanText, /unauthorized/);
+  });
+
+  void it("re-serializes a failed run_result whose text isn't a string, instead of dropping it", () => {
+    const diagnostics = extractClineStructuredDiagnostics(
+      JSON.stringify({ type: "run_result", finishReason: "error", text: null })
+    );
+
+    assert.notStrictEqual(diagnostics.detail, "");
+    assert.match(diagnostics.detail, /"finishReason":"error"/);
+  });
+
+  void it("keeps an unverified finishReason's text out of the auth scan, but still shows it in detail", () => {
+    // Only finishReason "error" has been verified live to carry
+    // CLI-generated failure text; any other non-"completed" reason might
+    // instead carry a genuine partial MODEL answer (which, like a
+    // successful reply, can echo file contents). Its text is still shown to
+    // the user via detail (never fed to auth classification) but withheld
+    // from the scan.
+    const diagnostics = extractClineStructuredDiagnostics(
+      JSON.stringify({
+        type: "run_result",
+        finishReason: "length",
+        text: "...and the api key is used to login and authenticate the request.",
+      })
+    );
+
+    assert.doesNotMatch(diagnostics.markerScanText, /api key|login|authenticate/);
+    assert.match(diagnostics.detail, /api key/);
+  });
+
+  void it("excludes a successful run's own final answer text from the scan", () => {
+    // A successful run_result.text is the model's own free-form reply (which
+    // can itself quote file contents back to the user) and must never be
+    // scanned for auth markers — only extractClineFinalOutput reads it.
+    const diagnostics = extractClineStructuredDiagnostics(
+      JSON.stringify({
+        type: "run_result",
+        finishReason: "completed",
+        text: "The file mentions an api key and says to login or authenticate.",
+      })
+    );
+
+    assert.doesNotMatch(diagnostics.markerScanText, /api key|authenticate|login/);
+    assert.equal(diagnostics.sawAnyEvent, true);
+  });
+});
+
+void describe("toFriendlyError — Cline", () => {
+  void it("does not diagnose auth from file contents echoed into Cline's event stream", () => {
+    const stdout = [CLINE_FILE_CONTENTS_ECHO_EVENT, CLINE_FAILED_RUN_RESULT_EVENT].join("\n");
+    const friendly = toFriendlyError(CLINE_LIKE, "cline-pass/deepseek-v4-pro", 1, "", stdout);
+
+    assert.equal(friendly.authFailure, false);
+    assert.match(friendly.message, /invalid model format/);
+  });
+
+  void it("diagnoses auth from a top-level error event", () => {
+    const stdout = JSON.stringify({ type: "error", message: "not logged in" });
+    const friendly = toFriendlyError(CLINE_LIKE, "cline-pass/deepseek-v4-pro", 1, "", stdout);
+
+    assert.equal(friendly.authFailure, true);
+    assert.match(friendly.message, /cline auth cline-pass/);
   });
 });
 

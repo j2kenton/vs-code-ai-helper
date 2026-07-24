@@ -1029,6 +1029,65 @@ void describe("getAvailableModels", () => {
     }
   });
 
+  void it("surfaces Cline's hardcoded ClinePass seeded catalog, including deepseek and every @thinking-effort variant, with no live discovery", async () => {
+    // Cline has no `cline models`-style listing subcommand (see providers.ts's
+    // absent discoverModels for cline-cli), so — like Claude/Codex — its full
+    // catalog lives only in the seed, populated with no live CLI call.
+    __testOnly.restoreSeededCliModelCache();
+    __testOnly.setModelSelectionTestOverrides({
+      getAvailableCopilotModels() {
+        return Promise.resolve([]);
+      },
+      cliCommandExists(command) {
+        return Promise.resolve(command === "cline");
+      },
+    });
+
+    try {
+      const allModels = await getAvailableModels();
+      const clineModels = allModels.filter((m) => m.id.startsWith("cline-cli:"));
+
+      assert.ok(
+        clineModels.some((m) => m.id === "cline-cli:default"),
+        "expected the ClinePass account-default fallback entry"
+      );
+      assert.ok(
+        clineModels.some(
+          (m) => m.id === "cline-cli:cline-pass/deepseek-v4-pro"
+        ),
+        "expected the base DeepSeek V4 Pro entry"
+      );
+      assert.ok(
+        clineModels.some(
+          (m) => m.id === "cline-cli:cline-pass/deepseek-v4-pro@high"
+        ),
+        "expected DeepSeek V4 Pro's @high thinking-effort variant"
+      );
+      for (const effort of ["none", "low", "medium", "high", "xhigh"]) {
+        assert.ok(
+          clineModels.some(
+            (m) => m.id === `cline-cli:cline-pass/deepseek-v4-flash@${effort}`
+          ),
+          `expected DeepSeek V4 Flash's @${effort} thinking-effort variant`
+        );
+      }
+      assert.ok(
+        clineModels.some(
+          (m) => m.id === "cline-cli:deepseek/deepseek-v4-flash"
+        ),
+        "expected the free promotional DeepSeek V4 Flash entry"
+      );
+      assert.ok(
+        clineModels.every((m) => m.providerLabel === "Cline CLI (subscription CLI)"),
+        "every Cline model should carry the generic subscription-CLI label"
+      );
+    } finally {
+      __testOnly.clearModelSelectionTestOverrides();
+      __testOnly.resetCliModelCache();
+      __testOnly.restoreSeededCliModelCache();
+    }
+  });
+
   void it("resolveRefreshedCliModels keeps the current (seeded) list when a background refresh finds nothing, and replaces it wholesale when it does", () => {
     // This is the actual merge-decision function queueCliModelRefresh calls
     // in production to update cliModelCache after a live discovery call

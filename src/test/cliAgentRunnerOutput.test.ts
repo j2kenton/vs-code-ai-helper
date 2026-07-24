@@ -9,6 +9,64 @@ import { CliProviderDefinition, getCliProvider } from "../runners/providers";
 import { attributionHeader, withAttribution } from "../utils/fileUtils";
 import { AgentRunRequest } from "../types/agentRunner";
 
+void describe("quotePosixShellArg", () => {
+  // Codex review finding: Node's own spawn(..., {shell:true}) joins
+  // [command, ...args] with plain spaces and hands the whole string to
+  // `/bin/sh -c` on POSIX WITHOUT escaping any argv element (Node emits its
+  // own DEP0190 deprecation warning for exactly this) — the codebase's
+  // existing quoting only covered win32. Cline's fixed, multi-word
+  // CLINE_CLI_ARGV_PROMPT_PLACEHOLDER (providers.ts) is exactly the shape
+  // that broke on POSIX: a space-containing argv value with no quoting at
+  // all arrives at the spawned process split into multiple separate
+  // argv.slice(1) tokens.
+  //
+  // Every case below was round-tripped through a REAL shell (`eval "printf
+  // '%s' $quoted"` in Git Bash / POSIX sh) during development to confirm the
+  // escaping is correct, not just plausible-looking — including a
+  // command-substitution payload, to prove it stays inert as literal text
+  // rather than being executed.
+  void it("returns a plain value unchanged when wrapped in quotes", () => {
+    assert.strictEqual(
+      __testOnly.quotePosixShellArg("Complete the task described in the piped input above."),
+      "'Complete the task described in the piped input above.'"
+    );
+  });
+
+  void it("preserves internal spacing exactly", () => {
+    assert.strictEqual(
+      __testOnly.quotePosixShellArg("a  double   space"),
+      "'a  double   space'"
+    );
+  });
+
+  void it("escapes an embedded single quote using the close-escape-reopen sequence", () => {
+    assert.strictEqual(
+      __testOnly.quotePosixShellArg("it's a test"),
+      "'it'\\''s a test'"
+    );
+  });
+
+  void it("handles a value that is entirely a single quote", () => {
+    assert.strictEqual(__testOnly.quotePosixShellArg("'"), "''\\'''");
+  });
+
+  void it("neutralizes shell metacharacters as inert literal text", () => {
+    // Single-quoted POSIX strings perform NO expansion at all — not $vars,
+    // not command substitution, not backticks — so every metacharacter here
+    // must survive verbatim inside the quotes rather than being escaped
+    // individually.
+    const value = "semi;colon|pipe&amp$dollar`backtick$(echo pwned)";
+    assert.strictEqual(
+      __testOnly.quotePosixShellArg(value),
+      `'${value}'`
+    );
+  });
+
+  void it("quotes an empty string as an empty pair of quotes", () => {
+    assert.strictEqual(__testOnly.quotePosixShellArg(""), "''");
+  });
+});
+
 void describe("CLI output normalization", () => {
   void it("extracts Kiro's final review text from a streamed transcript", () => {
     const transcript = [
@@ -161,6 +219,97 @@ void describe("CLI output normalization", () => {
     );
 
     assert.strictEqual(output, "## Summary Verdict\n\nNeeds changes.");
+  });
+
+  void it("extracts Cline's final answer from the trailing run_result event", () => {
+    // Shape verified live against cline 3.0.46: intermediate agent_event
+    // lines stream token-by-token, but the run's complete final answer
+    // always lives in the LAST top-level run_result line's own text field —
+    // no part-concatenation needed, unlike opencode.
+    const stream = [
+      JSON.stringify({ type: "hook_event", hookEventName: "agent_start" }),
+      JSON.stringify({
+        type: "agent_event",
+        event: { type: "content_start", contentType: "text", text: "PO" },
+      }),
+      JSON.stringify({
+        type: "agent_event",
+        event: { type: "content_end", contentType: "text", text: "PONG" },
+      }),
+      JSON.stringify({
+        type: "run_result",
+        finishReason: "completed",
+        text: "PONG",
+        model: { id: "cline-pass/deepseek-v4-flash", provider: "cline-pass" },
+      }),
+    ].join("\n");
+
+    assert.strictEqual(__testOnly.extractClineFinalOutput(stream), "PONG");
+  });
+
+  void it("returns the placeholder (not empty string) when run_result.text is an explicit empty string", () => {
+    // A legitimate exit-0 run whose model returned nothing to say (a
+    // silent, tool-only turn) can plausibly emit run_result with text:""
+    // rather than omitting the field. That must still produce the
+    // placeholder, not "" — an empty return here is misread downstream
+    // (execCliAgent's close handler) as "CLI produced no output" and
+    // routed through the failure path instead.
+    const emptyTextStream = [
+      JSON.stringify({ type: "hook_event", hookEventName: "agent_start" }),
+      JSON.stringify({
+        type: "run_result",
+        finishReason: "completed",
+        text: "",
+      }),
+    ].join("\n");
+
+    assert.strictEqual(
+      __testOnly.extractClineFinalOutput(emptyTextStream),
+      "(cline completed the run without returning any text reply.)"
+    );
+  });
+
+  void it("takes the LAST run_result event's text when a stream carries more than one", () => {
+    const stream = [
+      JSON.stringify({ type: "run_result", finishReason: "completed", text: "FIRST" }),
+      JSON.stringify({ type: "run_result", finishReason: "completed", text: "SECOND" }),
+    ].join("\n");
+
+    assert.strictEqual(__testOnly.extractClineFinalOutput(stream), "SECOND");
+  });
+
+  void it("returns a non-empty placeholder for a recognized Cline stream with no run_result text", () => {
+    const noTextStream = [
+      JSON.stringify({ type: "hook_event", hookEventName: "agent_start" }),
+      JSON.stringify({
+        type: "agent_event",
+        event: { type: "iteration_end", iteration: 1 },
+      }),
+    ].join("\n");
+
+    assert.strictEqual(
+      __testOnly.extractClineFinalOutput(noTextStream),
+      "(cline completed the run without returning any text reply.)"
+    );
+  });
+
+  void it("falls back to the raw stream when the output isn't a recognizable Cline event stream at all", () => {
+    const notJson = "cline: unexpected internal error, please file a bug report";
+    assert.strictEqual(__testOnly.extractClineFinalOutput(notJson), notJson);
+  });
+
+  void it("normalizes Cline output via provider-specific extraction", () => {
+    const cline = getCliProvider("cline-cli");
+    assert.ok(cline, "expected cline-cli provider definition");
+
+    const stream = JSON.stringify({
+      type: "run_result",
+      finishReason: "completed",
+      text: "Hello there.",
+    });
+
+    const output = __testOnly.normalizeCliOutput(cline, stream, undefined);
+    assert.strictEqual(output, "Hello there.");
   });
 
   void it("fails CLI implementation runs that report completion without file changes", () => {

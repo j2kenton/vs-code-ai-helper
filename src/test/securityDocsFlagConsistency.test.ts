@@ -25,6 +25,7 @@ const EDIT_MODE_FLAG_NAMES: Readonly<Record<string, string>> = {
   "kiro-cli": "--trust-all-tools",
   "antigravity-cli": "--dangerously-skip-permissions",
   "opencode-cli": "--agent",
+  "cline-cli": "--auto-approve",
 };
 
 // Which flag name each provider's text mode uses to stay read-only, quoted
@@ -34,13 +35,19 @@ const EDIT_MODE_FLAG_NAMES: Readonly<Record<string, string>> = {
 // (see its buildArgs comment in providers.ts) — so README has nothing to
 // quote for it. antigravity-cli uses the SAME bypass flag in both modes
 // (there is no separate read-only flag to quote), which is itself the
-// point of its README note, so it's included here too.
+// point of its README note, so it's included here too. cline-cli DOES pass
+// a distinct text-mode flag (`--plan`) — but, like antigravity, it is not a
+// real read-only boundary (verified live: a shell command still wrote a
+// file with `--plan` set), which is exactly what the Cline README note
+// exists to document, so it's included here for the same reason
+// antigravity is.
 const TEXT_MODE_FLAG_NAMES: Readonly<Partial<Record<string, string>>> = {
   "claude-cli": "--permission-mode",
   "codex-cli": "--sandbox",
   "kiro-cli": "--trust-tools",
   "antigravity-cli": "--dangerously-skip-permissions",
   "opencode-cli": "--agent",
+  "cline-cli": "--plan",
 };
 
 function resolveProjectFile(fileName: string): string {

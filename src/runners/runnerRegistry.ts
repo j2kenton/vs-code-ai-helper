@@ -662,8 +662,28 @@ export async function runImplementationForModel(options: {
   const authFailure =
     result.authFailure === true ||
     isAuthenticationFailure(result.authDiagnosticText ?? result.errorMessage);
+  // A failed primary run may already have written partial changes before it
+  // failed (a timeout on a provider whose CLI keeps writing right up to the
+  // kill, e.g. Cline/Antigravity's unenforced text/edit modes — or, less
+  // likely but still possible on any provider, a mid-run failure after some
+  // tool calls already landed). filesChanged/filesChangedUnknown are already
+  // computed by runImplementationWithCli's before/after git snapshot for
+  // exactly this purpose (see its own doc comment) but were previously never
+  // consulted here — this cascade dispatched a DIFFERENT model at the
+  // current, possibly half-edited working tree the moment failureKind alone
+  // said quota/temporarily-unavailable, with no dirty-tree gate at all
+  // (unlike the same-model retry path in runImplementationWithCli, which
+  // already refuses to retry without a clean git snapshot). Treat "unknown"
+  // (git unavailable / not a repository) the same as "dirty" — genuinely not
+  // knowing is not evidence of safety. Copilot's runner has its own tool-path
+  // boundary rather than a git snapshot, but still always reports a real
+  // filesChanged array (see ImplementationRunResult), so this check applies
+  // uniformly to every runner kind, not just CLI providers.
+  const primaryLeftTreeClean =
+    result.filesChangedUnknown !== true && result.filesChanged.length === 0;
   if (
     !authFailure &&
+    primaryLeftTreeClean &&
     (result.failureKind === "quota" ||
       result.failureKind === "temporarily-unavailable") &&
     options.stage &&

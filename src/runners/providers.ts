@@ -14,6 +14,16 @@
  *    use the `opencode/` namespace; Go models use `opencode-go/`. They have
  *    separate billing/entitlement, so the settings UI exposes them as two
  *    logical providers even though runs share this one CLI adapter.
+ *  - Cline CLI    (`cline`) — ClinePass, Cline's own $9.99/mo subscription
+ *    (https://docs.cline.bot/getting-started/clinepass) that bundles a
+ *    curated open-weights model catalog (GLM, Kimi, DeepSeek, MiniMax,
+ *    MiMo, Qwen) behind one flat fee instead of per-vendor API keys. Cline
+ *    also supports bring-your-own-key providers (`-P anthropic`, `-P
+ *    openai-native`, etc.) but this integration deliberately only wires up
+ *    ClinePass (`-P cline-pass`), matching the subscription-over-API-key
+ *    preference every other CLI provider here follows. Models are namespaced
+ *    "cline-pass/<model>" (verified live: a bare "<model>" is rejected with
+ *    "invalid model format. Expected format: modelType/model").
  *
  * Model IDs are stored as "<provider>:<model>" (e.g. "claude-cli:sonnet",
  * "gemini-cli:default"). Bare IDs with no known provider prefix are Copilot
@@ -33,7 +43,8 @@ export type CliProviderId =
   | "gemini-cli"
   | "antigravity-cli"
   | "kiro-cli"
-  | "opencode-cli";
+  | "opencode-cli"
+  | "cline-cli";
 export type ProviderId = "copilot" | CliProviderId;
 
 /**
@@ -157,9 +168,15 @@ export interface CliProviderDefinition {
    * auth-related source file — observed live, where a mid-stream transport
    * drop was reported to the user as a Zen billing problem because the agent
    * had read a file whose prose mentioned an API key. See
-   * extractStructuredCliDiagnostics in cliAgentRunner.ts.
+   * extractStructuredCliDiagnostics in cliAgentRunner.ts. "cline" names the
+   * analogous shape for Cline's `--json` NDJSON stream — verified live to
+   * carry the SAME risk (its tool-call events re-emit full file/command
+   * output verbatim) via a differently-shaped envelope (top-level
+   * `{"type":"run_result",...,"text":...}` and `{"type":"error","message"}`
+   * lines rather than opencode's `{"type":"error","error":{...}}"` — see
+   * extractClineStructuredDiagnostics/extractClineFinalOutput.
    */
-  structuredEventStream?: "opencode";
+  structuredEventStream?: "opencode" | "cline";
   /**
    * Retry-evidence capability flag: true ONLY when this provider's CLI
    * protocol verifiably guarantees that tool/edit boundary events are
@@ -389,6 +406,43 @@ function parseClaudeCliModelSelection(
   };
 }
 
+/**
+ * Cline's `--thinking` flag (verified live against cline 3.0.46 via
+ * `cline --help` and a rejected `--thinking bogus` call, which errors with
+ * `invalid thinking level "bogus" (expected "none", "low", "medium", "high",
+ * or "xhigh")`): one fixed ladder applied uniformly to every model, unlike
+ * opencode's per-model variant sets — so this is modeled the same way as
+ * Codex/Copilot's fixed reasoning-effort ladders rather than opencode's
+ * per-model discovery.
+ */
+const CLINE_REASONING_EFFORTS = new Set([
+  "none",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+]);
+
+export interface ParsedClineModelSelection {
+  model: string | undefined;
+  reasoningEffort: string | undefined;
+}
+
+export function parseClineModelSelection(
+  model: string | undefined
+): ParsedClineModelSelection {
+  if (!model) {
+    return { model: undefined, reasoningEffort: undefined };
+  }
+
+  const split = splitModelAtLastAt(model);
+  if (split.suffix === undefined || !CLINE_REASONING_EFFORTS.has(split.suffix)) {
+    return { model, reasoningEffort: undefined };
+  }
+
+  return { model: split.model, reasoningEffort: split.suffix };
+}
+
 export interface ParsedOpencodeModelSelection {
   model: string | undefined;
   variant: string | undefined;
@@ -435,6 +489,44 @@ export const CLAUDE_CLI_HEADLESS_PLAN_MODE_SYSTEM_PROMPT =
   "write your complete plan, review, or answer directly as this " +
   "response's final text, including any open questions, decisions, or " +
   "assumptions inline in that text.";
+
+/**
+ * Fixed, extension-authored positional prompt argument for the Cline CLI.
+ *
+ * Cline has no true stdin-only prompt mode (verified live against cline
+ * 3.0.46): `--json` with only piped stdin and no positional argument fails
+ * with "JSON output mode requires a prompt argument or piped stdin
+ * (interactive mode is unsupported)", and a literal "-" positional is
+ * rejected outright ("Unknown command or unquoted prompt: -"). A prompt
+ * *is* required as a positional argv element.
+ *
+ * That collides with two things every other CLI provider here relies on:
+ *  1. Cline installs as an npm .cmd shim on Windows (confirmed:
+ *     `%APPDATA%\npm\cline.cmd`), which — like opencode — needs
+ *     `spawn(..., {shell:true})` to resolve at all (see the ENOENT note on
+ *     runCliModelDiscovery in cliModelDiscovery.ts).
+ *  2. `promptTransport: "argv"` requires `useShell: false` (enforced by
+ *     execCliAgent as a hard failure, not just a convention) precisely
+ *     because shell:true + an argv element built from arbitrary prompt
+ *     content is a command-injection risk: the Windows quoting in
+ *     execCliAgent only wraps space-containing args in double quotes, with
+ *     no escaping of embedded quotes/metacharacters.
+ *
+ * Verified live that this is resolvable: piped stdin content is NOT ignored
+ * just because a positional prompt is also present — it is merged into the
+ * model's effective input and actually followed as an instruction (a stdin
+ * payload of "Reply with exactly the single word: BANANA" produced exactly
+ * "BANANA" even though the positional argument was a generic wrapper
+ * sentence). So buildArgs pushes this FIXED string — never derived from user
+ * content — as the positional argument, and the provider uses ordinary
+ * `promptTransport: "stdin"` to deliver the real (possibly large, possibly
+ * adversarial) prompt safely, with `useShell` left at its default `true` for
+ * the .cmd shim to resolve. This gets Cline the same untruncated-length,
+ * injection-safe stdin transport every other subscription CLI here uses,
+ * despite Cline's own argv-only prompt contract.
+ */
+export const CLINE_CLI_ARGV_PROMPT_PLACEHOLDER =
+  "Complete the task described in the piped input above.";
 
 export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
   {
@@ -906,6 +998,130 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
       if (parsedModel.variant) {
         args.push("--variant", parsedModel.variant);
       }
+      return args;
+    },
+  },
+  {
+    id: "cline-cli",
+    label: "Cline CLI",
+    command: "cline",
+    installHint:
+      "Install the Cline CLI (npm i -g cline), then run `cline auth cline-pass` to sign in with ClinePass.",
+    loginHint:
+      "Run `cline auth cline-pass` in a terminal and complete the ClinePass sign-in, then try again.",
+    // Best-effort list, NOT verified against a real unauthenticated cline
+    // run: this dev environment's `cline` CLI was already signed in, and
+    // deliberately signing it out to observe a genuine auth failure would
+    // disrupt the user's real session/credentials. Matches the union of
+    // markers used by the other multi-upstream-provider CLIs (Kiro,
+    // OpenCode) rather than a narrower guess. Re-verify and narrow/widen
+    // once a real unauthenticated failure is observed.
+    authErrorMarkers: [
+      "not logged in",
+      "login",
+      "authenticate",
+      "api key",
+      "unauthorized",
+      "401",
+      "no credentials",
+    ],
+    // `cline auth cline-pass` is a genuine one-shot CLI subcommand (not an
+    // in-session slash command) that drives an OAuth flow in the terminal —
+    // verified via `cline auth --help` (`auth [options] [provider]`, with
+    // `provider` documented as "positional shorthand for -p"). Matches
+    // Codex's `codex login` terminal pattern rather than Claude's
+    // launch-then-send /login pattern.
+    signInCommand: "cline auth cline-pass",
+    signInLabel: "Sign in / Switch account",
+    signInGuidance:
+      "Completes ClinePass sign-in in the terminal (an OAuth flow opens in your browser). " +
+      "Running Sign In again is how you switch accounts.",
+    // No non-interactive auth-status subcommand was found in `cline --help`
+    // (unlike Claude's `auth status` / Codex's `login status`), so
+    // authenticationCheckArgs is left unset, same as Gemini/Antigravity.
+    usageUnsupportedReason:
+      "Cline CLI has no non-interactive usage/quota command — check ClinePass usage and " +
+      "billing on the Cline dashboard.",
+    usageUnsupportedUrl:
+      "https://app.cline.bot/dashboard/subscription?personal=true",
+    // Deliberate exception to the "text mode stays read-only" contract, in
+    // BOTH modes — verified live against cline 3.0.46: a run given --plan
+    // and directly instructed to call its run_commands tool to create a
+    // file DID create the file. --plan only changes the system prompt fed
+    // to the model ("Plan Mode: Do NOT edit files... run_commands is for
+    // read-only purposes") — it does not gate the tool itself, which stays
+    // available and auto-approved. Confirmed the alternative is unusable
+    // rather than safer: `--auto-approve false` blocks EVERY tool
+    // (including plain file reads) in headless mode with a graceful but
+    // fatal "requires interactive approval" error, since there is no TTY to
+    // grant that approval — so, like Antigravity, there is no scoped
+    // read-only mode to fall back to in either direction.
+    permissionWarning:
+      "Runs with all tools auto-approved in every mode, including plan and review. " +
+      "--plan only changes the model's own system-prompt instructions, not what the CLI " +
+      "will execute without asking: its run_commands tool stays available and auto-approved " +
+      "throughout, so a prompt that causes the model to run a shell command can still create, " +
+      "change, or delete files even during a nominally read-only stage. Its headless CLI offers " +
+      "no scoped alternative — disabling auto-approval blocks every tool, including reads, since " +
+      "there is no way to grant interactive approval in a non-interactive run.",
+    promptTransport: "stdin",
+    // Keep the provider-level fallback to the account's own default model
+    // only (mirroring Claude/Codex/Gemini). The full ClinePass catalog,
+    // including every reasoning-effort variant, is seeded in
+    // modelSelection.ts's SEEDED_CLI_MODELS the same way Claude/Codex seed
+    // theirs — cline has no `cline models`-style listing subcommand to
+    // discover live from, so there is no discoverModels function either.
+    models: [{ model: undefined, name: "ClinePass (account default)" }],
+    usesLastMessageFile: false,
+    structuredEventStream: "cline",
+    buildArgs(mode, model): string[] {
+      const parsedModel = parseClineModelSelection(model);
+      // The mode flag is pushed right after --json (verified live that
+      // cline's option parser doesn't care about flag order) specifically so
+      // it is never the last flag before the positional prompt placeholder
+      // below — a flag immediately followed by a non-flag token reads as
+      // "takes that token as its value" to this repo's own doc-consistency
+      // check (permissionFlagText in securityDocsFlagConsistency.test.ts),
+      // which would otherwise misread --plan as taking the whole placeholder
+      // sentence as its argument. -P/-m/--thinking (pushed after the mode
+      // flag below) already guarantee that separation regardless.
+      const args = ["--json"];
+      if (mode === "edit") {
+        // Explicit even though it's the CLI's own default (verified live) —
+        // defense against a future cline version flipping that default,
+        // matching Codex's always-explicit --sandbox flag.
+        args.push("--auto-approve", "true");
+      } else {
+        args.push("--plan");
+      }
+      // Deliberately no --cwd argv flag: execCliAgent always spawns with
+      // `cwd` set as a real spawn() option (not a shell-parsed argument),
+      // which is what actually determines the child process's working
+      // directory — verified live that Cline correctly resolves its own
+      // working directory from that alone, with no --cwd flag at all.
+      // Passing the workspace path through argv on top of that would gain
+      // nothing while adding a real risk on a shell:true spawn (useShell
+      // stays at its default true here, for the Windows .cmd shim — see
+      // CLINE_CLI_ARGV_PROMPT_PLACEHOLDER's doc comment): execCliAgent's
+      // Windows quoting only wraps space-containing args in bare double
+      // quotes, with no escaping of shell metacharacters, so a workspace
+      // path containing one (e.g. "Bob & Co" on Windows, or a POSIX path
+      // containing `;`/`|`) could be misparsed or, worse, alter the shell
+      // command actually run.
+      // Always the ClinePass provider tier — see the module doc comment on
+      // why this integration doesn't expose Cline's other (API-key) upstream
+      // providers.
+      args.push("-P", "cline-pass");
+      if (parsedModel.model) {
+        args.push("-m", parsedModel.model);
+      }
+      if (parsedModel.reasoningEffort) {
+        args.push("--thinking", parsedModel.reasoningEffort);
+      }
+      // See CLINE_CLI_ARGV_PROMPT_PLACEHOLDER's doc comment: this fixed
+      // string is the required positional prompt argument; the real prompt
+      // is delivered via stdin (promptTransport above) instead.
+      args.push(CLINE_CLI_ARGV_PROMPT_PLACEHOLDER);
       return args;
     },
   },

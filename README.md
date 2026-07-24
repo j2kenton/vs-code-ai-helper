@@ -39,10 +39,13 @@ Ensemble can also drive vendor CLIs that authenticate against your existing subs
 | **Antigravity** | Install the Antigravity CLI, then run `agy` once | Google account |
 | **Kiro CLI** | Install from [kiro.dev/cli](https://kiro.dev/cli/) | Kiro login **and** a `KIRO_API_KEY` environment variable — `kiro-cli login` alone is not sufficient for headless runs |
 | **OpenCode Zen / Go** | `npm i -g opencode-ai`, then run `opencode` and use `/connect` | Zen and Go share an OpenCode account/API key, but are separate services: Zen needs its own billing and Go needs an active Go subscription |
+| **Cline CLI** | `npm i -g cline`, then `cline auth cline-pass` | [ClinePass](https://docs.cline.bot/getting-started/clinepass) subscription ($9.99/mo) — a curated open-weights model catalog (DeepSeek, GLM, Kimi, MiniMax, MiMo, Qwen) |
 
 OpenCode appears as two separate provider rows in Ensemble: **OpenCode Zen** for `opencode/...` models and **OpenCode Go** for `opencode-go/...` models. They use the same `opencode` CLI and can use the same OpenCode key, but enabling or connecting one does not grant access to the other. Choose the tier explicitly; a Zen/Go backup is only used when you explicitly select it as a backup model.
 
 > **Note on Antigravity:** it runs with `--dangerously-skip-permissions` in **every** mode, including plan and review — so it can create, change, or delete any file in your workspace without asking, even on a run you'd expect to be read-only. The other providers restrict their read-only stages (Claude `--permission-mode plan`, Codex `--sandbox read-only`, Kiro `--trust-tools fs_read,grep,glob`, opencode `--agent plan`); Antigravity's headless CLI offers no equivalent, and without the flag its runs fail having done nothing. Commit or back up before using it, or pick another provider.
+
+> **Note on Cline:** like Antigravity, its headless CLI has no scoped read-only mode. Text-mode runs (plan/review) do pass `--plan`, but that only changes the model's own system-prompt instructions — its shell-command tool stays available and auto-approved regardless, so a plan/review run can still create, change, or delete files if a prompt causes it to do so (verified directly: an instructed shell command created a file even with `--plan` set). Edit-mode runs use `--auto-approve true` explicitly. Disabling auto-approval isn't a safer alternative either — it blocks every tool, including plain file reads, since headless mode has no way to grant interactive approval. Commit or back up before using it, or pick another provider.
 
 AI actions consume real quota or money, and implementation runs modify workspace files.
 

@@ -5,8 +5,10 @@ import { describe, it } from "node:test";
 import {
   CLAUDE_CLI_HEADLESS_PLAN_MODE_SYSTEM_PROMPT,
   CLI_PROVIDERS,
+  CLINE_CLI_ARGV_PROMPT_PLACEHOLDER,
   getCliProvider,
   getProviderAccountEntry,
+  parseClineModelSelection,
   parseCopilotModelSelection,
   parseCodexModelSelection,
   parseModelSelection,
@@ -256,7 +258,15 @@ void describe("provider CLI contracts", () => {
       const bypassed = textArgs.filter((arg) =>
         PERMISSION_BYPASS_FLAGS.includes(arg)
       );
-      if (bypassed.length === 0) {
+      // Cline is a second known exception, but not detectable via a
+      // bypass-flag literal the way Antigravity is: its text mode passes
+      // `--plan`, which LOOKS like a scoped read-only flag but (verified
+      // live — see its buildArgs comment) does not gate the tool that
+      // matters, so nothing in PERMISSION_BYPASS_FLAGS appears in its
+      // textArgs at all. The signal here has to come from the provider
+      // declaring permissionWarning itself.
+      const isKnownException = bypassed.length > 0 || provider.id === "cline-cli";
+      if (!isKnownException) {
         assert.strictEqual(
           provider.permissionWarning,
           undefined,
@@ -289,6 +299,17 @@ void describe("provider CLI contracts", () => {
       antigravity.permissionWarning,
       /--dangerously-skip-permissions/
     );
+
+    // Same guard for Cline: its warning must actually name the mechanism
+    // (--plan being non-enforcing, run_commands staying auto-approved), not
+    // just exist.
+    const cline = getCliProvider("cline-cli");
+    assert.ok(
+      cline?.permissionWarning,
+      "expected Cline to carry a permission warning"
+    );
+    assert.match(cline.permissionWarning, /--plan/);
+    assert.match(cline.permissionWarning, /run_commands/);
   });
 
   void it("Codex model variants map to base model plus reasoning config", () => {
@@ -376,6 +397,122 @@ void describe("provider CLI contracts", () => {
       "--max-thinking-tokens",
       "8192",
     ]);
+  });
+
+  void it("Cline model variants map to base model plus thinking effort; prompt is stdin-only", () => {
+    const cline = getCliProvider("cline-cli");
+    assert.ok(cline, "expected cline-cli provider definition");
+
+    assert.strictEqual(cline.promptTransport, "stdin");
+    assert.strictEqual(cline.structuredEventStream, "cline");
+
+    const parsed = parseClineModelSelection("cline-pass/deepseek-v4-pro@high");
+    assert.deepStrictEqual(parsed, {
+      model: "cline-pass/deepseek-v4-pro",
+      reasoningEffort: "high",
+    });
+
+    // An unrecognized suffix is not a reasoning effort — the whole string is
+    // kept as the model, mirroring Codex/Copilot's own fallback.
+    assert.deepStrictEqual(parseClineModelSelection("cline-pass/glm-5.2@bogus"), {
+      model: "cline-pass/glm-5.2@bogus",
+      reasoningEffort: undefined,
+    });
+
+    // Cline's ladder (none/low/medium/high/xhigh) is deliberately NARROWER
+    // than Codex's/Copilot's (which also accept "max"/"ultra") — a suffix
+    // valid on those sibling ladders must still be rejected here, not just
+    // an arbitrary nonsense one (which wouldn't catch an accidental
+    // copy-paste widening of CLINE_REASONING_EFFORTS to match them).
+    for (const foreignEffort of ["max", "ultra"]) {
+      assert.deepStrictEqual(
+        parseClineModelSelection(`cline-pass/glm-5.2@${foreignEffort}`),
+        { model: `cline-pass/glm-5.2@${foreignEffort}`, reasoningEffort: undefined },
+        `"${foreignEffort}" is valid for Codex/Copilot but must not be for Cline`
+      );
+    }
+
+    // No --cwd argv flag, even when the context supplies one: cwd is
+    // provided to the child process via spawn()'s own `cwd` option, never
+    // through a shell-parsed argument — see the buildArgs comment in
+    // providers.ts for why (a workspace path containing a shell
+    // metacharacter would otherwise be misparsed or worse, since this
+    // provider's Windows spawn goes through shell:true with only
+    // space-wrapping, not full escaping).
+    const textArgs = cline.buildArgs(
+      "text",
+      "cline-pass/deepseek-v4-pro@high",
+      undefined,
+      { cwd: "/workspace/project", promptFile: "/tmp/prompt.txt" }
+    );
+    assert.deepStrictEqual(textArgs, [
+      "--json",
+      "--plan",
+      "-P",
+      "cline-pass",
+      "-m",
+      "cline-pass/deepseek-v4-pro",
+      "--thinking",
+      "high",
+      CLINE_CLI_ARGV_PROMPT_PLACEHOLDER,
+    ]);
+    assert.ok(
+      !textArgs.includes("--cwd"),
+      "cline's buildArgs must never pass cwd through argv"
+    );
+
+    const editArgs = cline.buildArgs("edit", undefined, undefined, {
+      promptFile: "/tmp/prompt.txt",
+    });
+    assert.deepStrictEqual(editArgs, [
+      "--json",
+      "--auto-approve",
+      "true",
+      "-P",
+      "cline-pass",
+      CLINE_CLI_ARGV_PROMPT_PLACEHOLDER,
+    ]);
+
+    // The fixed placeholder is never derived from user content, and the
+    // real prompt is delivered via stdin instead (promptTransport above) —
+    // this is what makes it safe to also pass a positional argv element
+    // despite `useShell` staying at its default `true` (required so
+    // Windows resolves cline's npm .cmd shim). See
+    // CLINE_CLI_ARGV_PROMPT_PLACEHOLDER's doc comment in providers.ts.
+    assert.notStrictEqual(cline.useShell, false);
+  });
+
+  void it("round-trips a seeded Cline model id that itself contains a colon", () => {
+    // "poolside/laguna-m.1:free" (one of the seeded ClinePass free models —
+    // see createSeededClineModels in modelSelection.ts) is the only seeded
+    // model id anywhere in this codebase with an embedded colon. Storage
+    // uses "<provider>:<model>" with a FIRST-colon split (parseModelSelection)
+    // — pin that this specific real id, and its "@high"-suffixed variant,
+    // survive that split intact rather than being truncated at the model's
+    // own colon.
+    const cline = getCliProvider("cline-cli");
+    assert.ok(cline, "expected cline-cli provider definition");
+
+    const bare = parseModelSelection("cline-cli:poolside/laguna-m.1:free");
+    assert.strictEqual(bare.provider, "cline-cli");
+    assert.strictEqual(bare.model, "poolside/laguna-m.1:free");
+
+    const withEffort = parseModelSelection("cline-cli:poolside/laguna-m.1:free@high");
+    assert.strictEqual(withEffort.provider, "cline-cli");
+    assert.strictEqual(withEffort.model, "poolside/laguna-m.1:free@high");
+
+    const parsedEffort = parseClineModelSelection(withEffort.model);
+    assert.deepStrictEqual(parsedEffort, {
+      model: "poolside/laguna-m.1:free",
+      reasoningEffort: "high",
+    });
+
+    const args = cline.buildArgs("text", withEffort.model, undefined, {
+      promptFile: "/tmp/prompt.txt",
+    });
+    const modelIndex = args.indexOf("-m");
+    assert.ok(modelIndex >= 0, "expected -m flag in cline's buildArgs output");
+    assert.strictEqual(args[modelIndex + 1], "poolside/laguna-m.1:free");
   });
 
   void it("provider-qualified CLI selections pass only native model names to buildArgs", () => {
@@ -470,6 +607,7 @@ void describe("provider CLI contracts", () => {
       "antigravity-cli": { command: "agy" },
       "kiro-cli": { command: "kiro-cli logout; kiro-cli login" },
       "opencode-cli": { command: "opencode" },
+      "cline-cli": { command: "cline auth cline-pass" },
     };
 
     for (const provider of CLI_PROVIDERS) {
@@ -601,6 +739,7 @@ void describe("provider CLI contracts", () => {
       "kiro-cli": { kind: "unsupported" },
       "opencode-zen": { kind: "unsupported" },
       "opencode-go": { kind: "unsupported" },
+      "cline-cli": { kind: "unsupported" },
     };
     for (const entry of PROVIDER_ACCOUNT_ENTRIES) {
       const expected = expectations[entry.id];
@@ -685,6 +824,17 @@ void describe("provider CLI contracts", () => {
       assert.strictEqual(opencodeEntry.usage.url, undefined);
       assert.match(opencodeEntry.usage.reason, /opencode/i);
     }
+
+    // Cline has no non-interactive usage command either, but links out to
+    // the ClinePass billing/usage dashboard rather than leaving the button
+    // dead — the same treatment as Kiro's account usage page.
+    const clineEntry = getProviderAccountEntry("cline-cli");
+    assert.ok(clineEntry);
+    assert.ok(clineEntry.usage.kind === "unsupported");
+    assert.strictEqual(
+      clineEntry.usage.url,
+      "https://app.cline.bot/dashboard/subscription?personal=true"
+    );
   });
 
   void it("Kiro hints mention KIRO_API_KEY requirement", () => {

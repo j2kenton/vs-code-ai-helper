@@ -52,6 +52,7 @@ Every "with AI" command consumes quota or usage from the AI subscription you hav
 | Antigravity CLI | Your Google account Gemini/Antigravity subscription or API quota |
 | Kiro CLI | Your Kiro subscription, plus a `KIRO_API_KEY` for headless use |
 | opencode | Whichever model provider(s) you sign into through `opencode providers login` (or configure via that provider's API key env var) — opencode itself does not bill you directly |
+| Cline CLI | Your ClinePass subscription ($9.99/mo) |
 
 **Real money or subscription usage is consumed every time an AI command runs.**
 
@@ -81,6 +82,7 @@ When you run an AI implementation command, the selected AI model is given permis
 - Kiro CLI uses `--trust-all-tools`.
 - opencode uses `--agent build`.
 - **Antigravity CLI uses `--dangerously-skip-permissions` — in every mode, not just implementation.** Its headless CLI has no scoped-permission flag at all, so plan and review runs carry the same full bypass as implementation runs. See the Antigravity note in the README before enabling it.
+- **Cline CLI uses `--auto-approve true` for implementation, and carries the same full-bypass risk outside it.** Its text-mode (plan/review) runs pass `--plan` instead, but that only changes the model's own system-prompt instructions — its shell-command tool stays available and auto-approved regardless, so a plan/review run can still create, change, or delete files if a prompt causes it to do so. See the Cline note in the README before enabling it.
 
 The model can overwrite any file inside the workspace, including files unrelated to the task. There is no internal sandbox beyond the workspace boundary and the vendor's own permission flags. **Always commit or back up your workspace before running an implementation.**
 
@@ -164,6 +166,7 @@ Data you send to third-party providers is governed by **their** privacy and data
 - [OpenAI Privacy](https://openai.com/privacy/)
 - [Google Privacy](https://policies.google.com/privacy) — covers both Gemini CLI and Antigravity CLI (Google accounts)
 - [AWS Privacy](https://aws.amazon.com/privacy/) — covers Kiro CLI
+- [Cline Privacy Notice](https://cline.bot/privacy) — covers Cline CLI / ClinePass
 
 ---
 

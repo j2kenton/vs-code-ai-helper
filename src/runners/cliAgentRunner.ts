@@ -384,8 +384,14 @@ export const CLI_RETRY_DELAY_MS = 5_000;
  * retry only a failure classified transient — a run timeout or a mid-stream
  * transport drop; auth errors, non-zero tool exits, and content errors are
  * never marked transient — while attempts remain and the run has not been
- * cancelled. Read-only runs are side-effect free by provider permission
- * configuration, so unlike edit runs no further evidence is required.
+ * cancelled. Ordinary read-only runs are side-effect free by provider
+ * permission configuration, so unlike edit runs no further evidence is
+ * required here: `result.transient` alone is trusted. That trust is only
+ * correct because the two places that set it (the timeout handler and
+ * applyTransportTransience, both in execCliAgent above) already refuse to
+ * mark it true for a provider whose text mode is NOT actually enforced
+ * read-only — see isTextModeGuaranteedReadOnly. This function stays a
+ * simple, provider-agnostic check on that account.
  */
 export function shouldRetryReadOnlyRun(
   result: Pick<CliExecResult, "status" | "transient">,
@@ -398,6 +404,27 @@ export function shouldRetryReadOnlyRun(
     attempt < CLI_RETRY_MAX_ATTEMPTS &&
     !cancellationRequested
   );
+}
+
+/**
+ * Whether this provider's text (read-only) mode is actually guaranteed
+ * side-effect free — i.e. it carries no permissionWarning. Every ordinary
+ * provider's text mode is enforced read-only by the vendor CLI itself
+ * (Claude `--permission-mode plan`, Codex `--sandbox read-only`, etc.), which
+ * is the assumption `shouldRetryReadOnlyRun`'s "no further evidence
+ * required" free-retry rule and this function's own text-mode promotion
+ * below both rely on. Antigravity and Cline are the exception: BOTH modes
+ * run with every tool auto-approved (including shell/file-write-capable
+ * ones), so for them an ambiguous transient failure — a 60-minute timeout,
+ * or a mid-stream transport drop — proves nothing about whether the run
+ * already mutated the workspace before it failed. Reusing permissionWarning
+ * (rather than a new dedicated capability flag) keeps this tied to the SAME
+ * disclosure the settings UI already shows the user before they enable such
+ * a provider, and automatically covers any future provider that needs the
+ * same disclosure.
+ */
+function isTextModeGuaranteedReadOnly(def: CliProviderDefinition): boolean {
+  return !def.permissionWarning;
 }
 
 /**
@@ -445,10 +472,13 @@ function applyTransportTransience(
   // left it dirty. Promoting an edit-mode transport drop here would spend
   // that ungated cascade on exactly the tree state its same-model sibling
   // refuses to touch — a strictly worse hazard than the retry withheld below.
-  // Restricted to text mode (which never writes files, so no such risk
-  // exists) until the cascade itself gains real dirty-tree gating — a
-  // separate, larger fix than this one.
-  if (mode !== "text") {
+  // Restricted to text mode (which never writes files FOR PROVIDERS WHOSE
+  // TEXT MODE IS ENFORCED READ-ONLY, so no such risk exists there) until the
+  // cascade itself gains real dirty-tree gating — a separate, larger fix
+  // than this one. Antigravity/Cline's text mode carries the exact same
+  // risk edit mode does (see isTextModeGuaranteedReadOnly) and must be
+  // excluded here for the same reason edit mode is.
+  if (mode !== "text" || !isTextModeGuaranteedReadOnly(def)) {
     return result;
   }
   // retryableHint is a structural signal (the provider's own error event
@@ -498,6 +528,27 @@ const ANSI_ESCAPE_PATTERN =
 
 function stripAnsi(value: string): string {
   return value.replace(ANSI_ESCAPE_PATTERN, "");
+}
+
+/**
+ * Quote a single argv value for safe inclusion in a `/bin/sh -c "..."`
+ * command line, the shape Node's own `spawn(..., {shell:true})` constructs
+ * on POSIX by joining `[command, ...args]` with plain spaces and handing the
+ * whole string to the shell — see the spawnArgs comment in execCliAgent for
+ * why this is needed at all. Standard POSIX single-quote escaping: wrap the
+ * whole value in single quotes, and for each literal single quote inside it,
+ * close the quote, emit a backslash-escaped literal quote (valid unquoted),
+ * then reopen the quote — e.g. `it's` becomes `'it'\''s'`. Single-quoting
+ * is used (rather than double-quoting) because POSIX shells perform NO
+ * expansion at all inside single quotes — not `$variable`, not backticks,
+ * not `\` escapes — so this is safe for arbitrary content without needing
+ * to separately handle those cases. Applied unconditionally to every argv
+ * value (not just ones containing a space or other metacharacter): quoting
+ * a value that never needed it is always harmless, and a conditional check
+ * is one more thing to get subtly wrong.
+ */
+function quotePosixShellArg(value: string): string {
+  return `'${value.split("'").join("'\\''")}'`;
 }
 
 function tryReadFileUriContent(value: string): string | undefined {
@@ -873,6 +924,192 @@ function extractStructuredCliDiagnostics(
   };
 }
 
+/**
+ * Cline's `--json` stdout is also a JSON-lines event stream (verified live
+ * against cline 3.0.46), but a simpler shape than opencode's: every line has
+ * a top-level `type` of "hook_event", "agent_event", "run_result", or
+ * "error", and exactly one `{"type":"run_result",...}` line is emitted at
+ * the very end of every run carrying the run's complete final answer in its
+ * own `text` field — for BOTH a successful run and a failed one (a rejected
+ * model ID's `run_result.text` was literally "invalid model format.
+ * Expected format: modelType/model"). Unlike opencode there is no need to
+ * reconstruct the reply by concatenating multiple streamed text parts: the
+ * intermediate `agent_event`-wrapped `content_start`/`content_end` events
+ * stream token-by-token (and, for tool calls, re-emit full tool
+ * input/output — the same file-content-leak risk opencode has, see
+ * extractClineStructuredDiagnostics), but the LAST `run_result.text` is
+ * always the authoritative complete answer.
+ */
+const CLINE_NO_TEXT_REPLY_PLACEHOLDER =
+  "(cline completed the run without returning any text reply.)";
+
+interface ClineEnvelope {
+  type?: unknown;
+  message?: unknown;
+  finishReason?: unknown;
+  text?: unknown;
+}
+
+function extractClineFinalOutput(
+  stdout: string,
+  parsed: ParsedCliEventLines = parseJsonLineEvents(stdout)
+): string {
+  const cleaned = stripAnsi(stdout).trim();
+  if (cleaned.length === 0) {
+    return cleaned;
+  }
+
+  let sawRecognizedEvent = false;
+  let finalText: string | undefined;
+  for (const rawEvent of parsed.events) {
+    const event = rawEvent as ClineEnvelope;
+    if (typeof event.type === "string") {
+      sawRecognizedEvent = true;
+    }
+    if (event.type === "run_result" && typeof event.text === "string") {
+      // Last one wins — a single run emits exactly one run_result line in
+      // every observed case, but "last" is the same forward-compatible
+      // choice extractOpencodeFinalOutput makes for its own text parts.
+      finalText = event.text;
+    }
+  }
+
+  // An explicit empty string is treated the same as "no run_result.text at
+  // all": a legitimate exit-0 run whose model returned nothing to say (e.g.
+  // a silent tool-only turn) must still produce the placeholder below, not
+  // "" — an empty return here is misread downstream as "CLI produced no
+  // output" and routed through the failure path with a generic message
+  // instead of this placeholder.
+  if (finalText !== undefined && finalText.trim().length > 0) {
+    return finalText.trim();
+  }
+  if (sawRecognizedEvent) {
+    return CLINE_NO_TEXT_REPLY_PLACEHOLDER;
+  }
+  // Nothing parsed as a recognizable cline JSON event at all — fall back to
+  // the raw stream so the failure is still visible instead of silently
+  // empty or generic (same rationale as extractOpencodeFinalOutput's own
+  // final fallback).
+  return cleaned;
+}
+
+/**
+ * finishReason values verified LIVE to carry CLI/provider-generated failure
+ * text in `run_result.text` rather than the model's own free-form prose —
+ * currently only "error" (observed from a rejected model ID). A future
+ * cline version may report other non-"completed" reasons (a length cutoff,
+ * a cancellation, a tool-loop abort) whose `text` could instead be a
+ * genuine PARTIAL MODEL ANSWER — which, like a successful reply, can quote
+ * file/tool content back to the user. Only a value in this set is trusted
+ * enough to feed the auth-marker scan (markerScanText); any other
+ * non-"completed" reason's text still reaches `detail` (shown to the user,
+ * never fed to automated auth classification) but is withheld from `scan`.
+ * Widen this set only after verifying a new reason's text is genuinely
+ * CLI-generated, the same bar CLINE_FAILED_RUN_RESULT_EVENT-style fixtures
+ * hold real error text to elsewhere in this file's test suite.
+ */
+const CLINE_VERIFIED_CLI_TEXT_FINISH_REASONS: ReadonlySet<string> = new Set([
+  "error",
+]);
+
+/**
+ * Pull just the diagnosable content out of Cline's structured `--json`
+ * stream: its own top-level `{"type":"error",...}` lines, plus a FAILED
+ * run's final `run_result` — and nothing else.
+ *
+ * The exclusion is exactly opencode's: Cline's tool-call events re-emit full
+ * file contents and shell command output verbatim (verified live — a
+ * `read_files` tool call's output event carried a planted marker string from
+ * the file back out into the stream character-for-character), so scanning
+ * the raw stream for authErrorMarkers would diagnose an auth failure on any
+ * run that merely happened to read an auth-related file. A SUCCESSFUL run's
+ * `run_result.text` is the model's own free-form final answer (which can
+ * likewise quote file contents back to the user) and is therefore excluded
+ * here too — only consulted for output via extractClineFinalOutput, never
+ * for the auth/error scan. `run_result.finishReason` is the first gate: it
+ * must be a non-"completed" string for `text` to be considered a failure
+ * description at all; CLINE_VERIFIED_CLI_TEXT_FINISH_REASONS is the second,
+ * narrower gate on top of that for the scan specifically (see its own doc
+ * comment) — `detail` is intentionally less strict than `scan` here, mirroring
+ * markerScanText/detail's other asymmetries in this file (e.g. responseBody
+ * is scanned but never shown to the user in the opencode sibling above).
+ *
+ * A recognized error/failed-run_result event whose payload isn't the
+ * expected flat-string shape (`message` / `text`) is re-serialized via
+ * `JSON.stringify` rather than silently dropped — the same fallback
+ * extractStructuredCliDiagnostics uses for opencode's unrecognized error
+ * shapes, justified the same way: an error/failure event never carries file
+ * contents, so re-serializing it is safe, and dropping a real failure
+ * silently (leaving nothing but a bare "exit code N") is worse than a
+ * slightly noisier message.
+ *
+ * A bare `{"type":"error",...}` line is NOT on its own proof the overall run
+ * failed: an unrelated "hook dispatch failed: session.hook requires a valid
+ * hook event payload" line was observed on otherwise-fully-successful runs
+ * (exit code 0) during verification. This function is only ever invoked by
+ * toFriendlyError, which the caller (execCliAgent) only reaches when the
+ * process already exited non-zero or produced empty output — so that
+ * ambiguity is resolved by the caller's own gating, not by this function.
+ */
+function extractClineStructuredDiagnostics(
+  stdout: string,
+  parsed: ParsedCliEventLines = parseJsonLineEvents(stdout)
+): StructuredCliDiagnostics {
+  const { events, unparsedText, unparsedScanSafeText } = parsed;
+  const scan: string[] = [];
+  const details: string[] = [];
+  const sawAnyEvent = events.length > 0;
+
+  for (const rawEvent of events) {
+    const event = rawEvent as ClineEnvelope;
+    if (event.type === "error") {
+      if (typeof event.message === "string") {
+        scan.push(event.message);
+        details.push(event.message);
+      } else {
+        const line = JSON.stringify(rawEvent);
+        scan.push(line);
+        details.push(line);
+      }
+      continue;
+    }
+    if (
+      event.type === "run_result" &&
+      typeof event.finishReason === "string" &&
+      event.finishReason !== "completed"
+    ) {
+      const trustedForScan = CLINE_VERIFIED_CLI_TEXT_FINISH_REASONS.has(
+        event.finishReason
+      );
+      if (typeof event.text === "string") {
+        details.push(event.text);
+        if (trustedForScan) {
+          scan.push(event.text);
+        }
+      } else {
+        const line = JSON.stringify(rawEvent);
+        details.push(line);
+        if (trustedForScan) {
+          scan.push(line);
+        }
+      }
+    }
+  }
+
+  return {
+    markerScanText: [scan.join("\n"), unparsedScanSafeText].filter(Boolean).join("\n"),
+    detail: details.join("\n") || unparsedText,
+    // No structural retryable signal has been observed in cline's stream
+    // (unlike opencode's error.data.isRetryable) — leave false always and
+    // rely on applyTransportTransience's text-based isTransportError check
+    // against diagnosticText, which is safe here for the same reason it's
+    // safe for opencode: diagnosticText is scoped to error events / a
+    // failed run's own text, never raw stdout.
+    retryable: false,
+    sawAnyEvent,
+  };
+}
+
 function extractOpencodeFinalOutput(
   stdout: string,
   parsed: ParsedCliEventLines = parseJsonLineEvents(stdout)
@@ -951,14 +1188,26 @@ function normalizeCliOutput(
     return extractOpencodeFinalOutput(output, parsed);
   }
 
+  if (def.id === "cline-cli") {
+    // Same reasoning as opencode-cli above: cline never sets
+    // usesLastMessageFile either, so output is always derived from stdout
+    // and the shared parse (when the caller already produced one) stays
+    // valid to reuse.
+    return extractClineFinalOutput(output, parsed);
+  }
+
   return output;
 }
 
 export const __testOnly = {
   stripAnsi,
+  quotePosixShellArg,
   extractKiroFinalOutput,
   extractOpencodeFinalOutput,
   extractStructuredCliDiagnostics,
+  extractClineFinalOutput,
+  extractClineStructuredDiagnostics,
+  isTextModeGuaranteedReadOnly,
   parseJsonLineEvents,
   unwrapJsonString,
   applyTransportTransience,
@@ -1051,9 +1300,12 @@ function toFriendlyError(
   // as a stdout event. Passing `parsed` even when undefined is fine:
   // extractStructuredCliDiagnostics's own default parameter already parses
   // internally in that case.
-  const structured = def.structuredEventStream
-    ? extractStructuredCliDiagnostics(stdout, parsed)
-    : undefined;
+  const structured =
+    def.structuredEventStream === "opencode"
+      ? extractStructuredCliDiagnostics(stdout, parsed)
+      : def.structuredEventStream === "cline"
+        ? extractClineStructuredDiagnostics(stdout, parsed)
+        : undefined;
 
   const scanSource = structured
     ? `${stderr}\n${structured.markerScanText}`
@@ -1246,12 +1498,31 @@ export async function execCliAgent(options: {
     let stderr = "";
 
     // shell:true is the default so Windows resolves .cmd/.ps1 shims from
-    // npm/pnpm global installs. When shell:true on Windows, quote arguments
-    // containing spaces.
-    const spawnArgs =
-      useShell && process.platform === "win32"
-        ? args.map((a) => (a.includes(" ") ? `"${a}"` : a))
-        : args;
+    // npm/pnpm global installs. With shell:true, Node's own spawn joins
+    // `[command, ...args]` with plain spaces and hands that whole string to
+    // the shell (`cmd.exe /c "..."` on Windows, `/bin/sh -c "..."` on POSIX)
+    // WITHOUT escaping any argv element itself (Node emits its own DEP0190
+    // deprecation warning for exactly this) — so any argv value containing a
+    // space, if left unquoted, is split into multiple shell words. Verified
+    // live and directly reproduced (Windows, via the exact spawn shape here):
+    // an unquoted multi-word value comes out the other side as separate
+    // argv.slice(1) tokens in the spawned process. Every provider that both
+    // uses shell:true (the default) and can emit a multi-word argv value —
+    // currently Cline's fixed CLINE_CLI_ARGV_PROMPT_PLACEHOLDER positional,
+    // which cline's own parser additionally requires to be multi-word at
+    // all (a single-word positional is unconditionally rejected as an
+    // unrecognized command, verified live — so shortening the placeholder
+    // to one word is not a viable alternative fix) — needs this quoted on
+    // BOTH platforms, not just Windows.
+    const spawnArgs = useShell
+      ? args.map((a) =>
+          process.platform === "win32"
+            ? a.includes(" ")
+              ? `"${a}"`
+              : a
+            : quotePosixShellArg(a)
+        )
+      : args;
     let child: cp.ChildProcess;
     try {
       child = cp.spawn(resolvedCommand, spawnArgs, {
@@ -1302,6 +1573,18 @@ export async function execCliAgent(options: {
 
     const timeoutHandle = setTimeout(() => {
       killProcessTree(child);
+      // Edit-mode timeouts are always promoted: edit mode has its OWN
+      // separate, stricter retry gate downstream (evaluateEditRetryEligibility
+      // / guaranteesEditEventFlushBeforeSideEffects) that refuses to act on
+      // this promotion for any provider without a verified flush guarantee —
+      // Cline/Antigravity included, since neither sets that flag. Text-mode
+      // timeouts are only promoted for a provider whose text mode is
+      // actually enforced read-only: shouldRetryReadOnlyRun's free-retry
+      // rule (and the backup cascade, gated on failureKind alone) both trust
+      // this promotion as proof the run could not have mutated the
+      // workspace, which is false for Antigravity/Cline — see
+      // isTextModeGuaranteedReadOnly.
+      const promoteForRetry = mode === "edit" || isTextModeGuaranteedReadOnly(def);
       finish({
         ...classifyCliFailure({
           status: "failed",
@@ -1318,12 +1601,20 @@ export async function execCliAgent(options: {
         // the full timeout window (verified live: opencode hangs producing
         // zero stdout, rather than erroring, when its model is over quota)
         // is exactly the "temporarily unavailable" case that cascade exists
-        // to handle, so it must be classified that way rather than generic.
-        failureKind: "temporarily-unavailable",
-        // A timeout is the one failure shape that is transport-transient and
-        // therefore retry-eligible (read-only runs always; edit runs only
-        // under the per-provider flush guarantee — see runImplementationWithCli).
-        transient: true,
+        // to handle, so it must be classified that way rather than generic
+        // — but only when promoteForRetry allows it; otherwise this stays
+        // "generic" (cascade-terminal, not retried), which is what
+        // classifyCliFailure already produced above.
+        ...(promoteForRetry
+          ? {
+              failureKind: "temporarily-unavailable" as const,
+              // A timeout is the one failure shape that is transport-transient
+              // and therefore retry-eligible (read-only runs always, subject
+              // to promoteForRetry above; edit runs only under the
+              // per-provider flush guarantee — see runImplementationWithCli).
+              transient: true,
+            }
+          : {}),
         // What the event stream showed up to the kill — the primary
         // retry-evidence input for edit-capable runs.
         editEvidence: analyzeCliEventStream(stdout),

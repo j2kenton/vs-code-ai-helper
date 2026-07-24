@@ -2,7 +2,7 @@
 
 ## Overview
 
-VS Code AI Helper is a personal developer tool that orchestrates AI providers (GitHub Copilot, Claude, Codex, Gemini, Antigravity, Kiro, opencode) to assist with task planning and implementation. This document describes what the extension enforces, what it does not enforce, and how to report vulnerabilities.
+VS Code AI Helper is a personal developer tool that orchestrates AI providers (GitHub Copilot, Claude, Codex, Gemini, Antigravity, Kiro, opencode, Cline) to assist with task planning and implementation. This document describes what the extension enforces, what it does not enforce, and how to report vulnerabilities.
 
 ---
 
@@ -51,6 +51,13 @@ This is an in-process software control — it does not prevent a user who has co
 - Verified 2026-07-20 against agy 1.1.4: no combination of `--sandbox`, `--mode plan`, or a `permissions.allow` grant (tested as a path prefix, a bare tool-class grant, and a literal-target grant) constrained a run — only the bypass flag's absence would, and its absence also makes the CLI refuse to run at all, since headless mode cannot prompt for approval.
 - Antigravity is **off by default**; enabling it is an explicit opt-in, and Provider Selection shows this risk before you enable it.
 
+**Cline CLI (all modes, not just implementation):**
+
+- Cline runs with `--auto-approve true` for implementation (edit mode) — the CLI's own flag for auto-approving every tool call, documented as applying to "all tools", not a scoped grant.
+- Text mode (plan/review) passes `--plan` instead, which is **not an equivalent to the other CLIs' read-only flags**: it only changes the system-prompt instructions given to the model ("Plan Mode: Do NOT edit files... run_commands is for read-only purposes"). It does not gate the underlying tool. Verified live against cline 3.0.46: a run given `--plan` and directly instructed to call its `run_commands` tool to write a file **did write the file** — the model's own compliance with the plan-mode instruction is the only thing preventing a write, not an enforced permission boundary.
+- Disabling auto-approval (`--auto-approve false`) is not a safer alternative: verified live, it blocks every tool call — including plain file reads — with a graceful but fatal "requires interactive approval" error, since headless mode has no way to grant that approval. So, like Antigravity, there is no scoped read-only mode to fall back to in either direction.
+- Cline is **off by default**; enabling it is an explicit opt-in, and Provider Selection shows this risk before you enable it.
+
 ### Context sent to AI providers
 
 Eligibility rules for open editors included in provider-bound context packs:
@@ -68,7 +75,7 @@ Eligibility rules for open editors included in provider-bound context packs:
 - The extension itself contains no HTTP client code.
 - Network activity occurs through:
   - VS Code's Language Model API (for Copilot), which manages authentication and transmission internally.
-  - Vendor CLI processes (`claude`, `codex`, `gemini`, `agy`/`antigravity`, `kiro-cli`, `opencode`) spawned as child processes; their network behaviour is governed by the vendor CLIs.
+  - Vendor CLI processes (`claude`, `codex`, `gemini`, `agy`/`antigravity`, `kiro-cli`, `opencode`, `cline`) spawned as child processes; their network behaviour is governed by the vendor CLIs.
   - Git, spawned as a child process for the commit-and-push command.
 - The extension does not make direct outbound HTTP/HTTPS calls.
 
@@ -103,6 +110,7 @@ Eligibility rules for open editors included in provider-bound context packs:
 - The secret-filename denylist catches well-known naming conventions only. A secret pasted into an arbitrarily-named file is not caught.
 - CLI sandbox flags (Claude `acceptEdits`, Codex `workspace-write`, Gemini `auto_edit`, Kiro `--trust-all-tools`, opencode `--agent build`) do not prevent the model from issuing shell commands that the CLI itself approves; behaviour depends on the vendor CLI's own policy.
 - Antigravity has no sandbox flag to begin with: `--dangerously-skip-permissions` runs in every mode, so its plan and review runs carry implementation-level file-modification risk. This is a deliberate, accepted exception — see the Antigravity CLI section above and the Antigravity note in the README.
+- Cline's `--plan` flag is a system-prompt instruction, not an enforced permission boundary: its shell-command tool stays available and auto-approved in every mode, so plan and review runs carry the same file-modification risk as an implementation run if a prompt causes the model to use it. This is a deliberate, accepted exception — see the Cline CLI section above and the Cline note in the README.
 - There is no token-spending ceiling or cost estimate. Users are responsible for their own provider costs.
 - Run logs in `runs/` contain full prompt content. If pushed to a remote repository, that content becomes remotely accessible.
 - The git binary on PATH is trusted implicitly. Ensure your environment's PATH is not compromised.

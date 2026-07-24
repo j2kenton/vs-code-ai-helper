@@ -669,6 +669,105 @@ function createSeededCodexModels(): readonly DiscoveredCliModel[] {
   ];
 }
 
+function createClineReasoningVariant(
+  model: string,
+  label: string,
+  effort: string,
+  effortLabel: string
+): DiscoveredCliModel {
+  return {
+    model: `${model}@${effort}`,
+    name: `${label} (${effortLabel})`,
+  };
+}
+
+/**
+ * Curated ClinePass catalog snapshot (cline 3.0.46, captured 2026-07-23 from
+ * the CLI's own bundled model catalog and cross-checked against
+ * https://docs.cline.bot/getting-started/clinepass, which confirms the
+ * `cline-pass/<model>` id prefix). No `cline models`-style listing
+ * subcommand exists to discover this live the way opencode's does — see
+ * cline-cli's absent discoverModels in providers.ts — so, like Claude's and
+ * Codex's catalogs, this is a hand-curated static list rather than a parsed
+ * live-CLI snapshot, and is expected to go stale as ClinePass's own catalog
+ * changes.
+ *
+ * Cline's `--thinking` flag (none|low|medium|high|xhigh, verified live via
+ * `cline --help` and a rejected `--thinking bogus` call) is ONE fixed ladder
+ * applied uniformly to every model rather than opencode's per-model variant
+ * sets, so — like Codex/Claude — each model gets a bare entry (provider
+ * default reasoning) plus one variant per ladder rung, via
+ * parseClineModelSelection's "model@effort" convention (providers.ts).
+ *
+ * "DeepSeek V4 Flash (Free)", "Step 3.7 Flash (Free)", and "Laguna M.1
+ * (Free)" are separate, differently-namespaced $0 promotional entries inside
+ * the SAME `cline-pass` catalog grouping (ids "deepseek/deepseek-v4-flash",
+ * "stepfun/step-3.7-flash", "poolside/laguna-m.1:free"). Only the first was
+ * confirmed live (`-P cline-pass -m deepseek/deepseek-v4-flash` answered
+ * correctly); the other two follow the identical id/invocation shape but
+ * were not individually exercised — re-verify if either is reported broken.
+ * Kept separate from the price-listed "DeepSeek V4 Flash" entry above rather
+ * than merged, since they are distinct model ids that could disappear
+ * independently of the paid ones.
+ */
+function createSeededClineModels(): readonly DiscoveredCliModel[] {
+  const CLINE_THINKING_LEVELS: readonly (readonly [string, string])[] = [
+    ["none", "No Thinking"],
+    ["low", "Low"],
+    ["medium", "Medium"],
+    ["high", "High"],
+    ["xhigh", "Extra High"],
+  ];
+
+  const createModelWithVariants = (
+    model: string,
+    label: string
+  ): DiscoveredCliModel[] => {
+    const entries: DiscoveredCliModel[] = [{ model, name: label }];
+    for (const [effort, effortLabel] of CLINE_THINKING_LEVELS) {
+      entries.push(
+        createClineReasoningVariant(model, label, effort, effortLabel)
+      );
+    }
+    return entries;
+  };
+
+  return [
+    ...createModelWithVariants("cline-pass/deepseek-v4-pro", "DeepSeek V4 Pro"),
+    ...createModelWithVariants(
+      "cline-pass/deepseek-v4-flash",
+      "DeepSeek V4 Flash"
+    ),
+    ...createModelWithVariants("cline-pass/glm-5.2", "GLM-5.2"),
+    ...createModelWithVariants(
+      "cline-pass/kimi-k3",
+      "Kimi K3 [may be unstable, higher usage]"
+    ),
+    ...createModelWithVariants(
+      "cline-pass/kimi-k2.7-code",
+      "Kimi K2.7 Code"
+    ),
+    ...createModelWithVariants("cline-pass/kimi-k2.6", "Kimi K2.6"),
+    ...createModelWithVariants("cline-pass/mimo-v2.5-pro", "MiMo-V2.5-Pro"),
+    ...createModelWithVariants("cline-pass/mimo-v2.5", "MiMo-V2.5"),
+    ...createModelWithVariants("cline-pass/minimax-m3", "MiniMax-M3"),
+    ...createModelWithVariants("cline-pass/qwen3.7-max", "Qwen3.7 Max"),
+    ...createModelWithVariants("cline-pass/qwen3.7-plus", "Qwen3.7 Plus"),
+    ...createModelWithVariants(
+      "deepseek/deepseek-v4-flash",
+      "DeepSeek V4 Flash (Free)"
+    ),
+    ...createModelWithVariants(
+      "stepfun/step-3.7-flash",
+      "Step 3.7 Flash (Free)"
+    ),
+    ...createModelWithVariants(
+      "poolside/laguna-m.1:free",
+      "Laguna M.1 (Free)"
+    ),
+  ];
+}
+
 /**
  * Raw `opencode models --verbose` catalog snapshot (opencode 1.18.4,
  * captured 2026-07-21, refreshed 2026-07-21 to add the "opencode-go" and
@@ -1049,6 +1148,7 @@ const SEEDED_CLI_MODELS: Readonly<
   // Regenerate by running `opencode models --verbose` through
   // discoverOpencodeModelsWithTimeout and re-pasting its output here.
   "opencode-cli": createSeededOpencodeModels(),
+  "cline-cli": createSeededClineModels(),
 };
 
 function createSeededCliModelCache(): Map<

@@ -44,6 +44,22 @@ const STRUCTURED_PROVIDER_LIKE: CliProviderDefinition = {
   },
 };
 
+/**
+ * A structured-stream provider whose text mode is NOT enforced read-only
+ * (Cline/Antigravity-shaped): every tool, including shell/file-write ones,
+ * stays auto-approved regardless of mode. Its permissionWarning is the only
+ * signal isTextModeGuaranteedReadOnly / applyTransportTransience use to
+ * withhold the "text mode is side-effect free" trust an ordinary provider
+ * gets.
+ */
+const UNENFORCED_TEXT_MODE_PROVIDER_LIKE: CliProviderDefinition = {
+  ...STRUCTURED_PROVIDER_LIKE,
+  id: "cline-cli",
+  label: "Cline CLI",
+  permissionWarning:
+    "Runs with all tools auto-approved in every mode, including plan and review.",
+};
+
 void describe("analyzeCliEventStream", () => {
   void it("reports no stream for plain-text output", () => {
     const evidence = analyzeCliEventStream("Working on it...\nAll done.\n");
@@ -148,6 +164,19 @@ void describe("evaluateEditRetryEligibility", () => {
   });
 });
 
+void describe("isTextModeGuaranteedReadOnly", () => {
+  void it("is true for a provider with no permissionWarning", () => {
+    assert.equal(__testOnly.isTextModeGuaranteedReadOnly(STRUCTURED_PROVIDER_LIKE), true);
+  });
+
+  void it("is false for a provider that carries a permissionWarning", () => {
+    assert.equal(
+      __testOnly.isTextModeGuaranteedReadOnly(UNENFORCED_TEXT_MODE_PROVIDER_LIKE),
+      false
+    );
+  });
+});
+
 void describe("shouldRetryReadOnlyRun", () => {
   void it("timeout-then-success: retries a timed-out read-only run, then stops once the next attempt completes", () => {
     // Attempt 1 times out — the one transport-transient failure shape.
@@ -202,6 +231,37 @@ void describe("shouldRetryReadOnlyRun", () => {
 
     assert.equal(dropped.transient, true);
     assert.equal(shouldRetryReadOnlyRun(dropped, 1, false), true);
+  });
+
+  void it("a mid-stream transport drop is NOT transient in text mode for a provider whose text mode isn't enforced read-only", () => {
+    // Codex review P1: Cline (and pre-existingly Antigravity) run every tool
+    // auto-approved in EVERY mode, not just edit — so an ambiguous transient
+    // failure proves nothing about whether the run already mutated the
+    // workspace. Promoting it here would let shouldRetryReadOnlyRun retry the
+    // same model AND let the backup cascade (gated on failureKind alone in
+    // runnerRegistry.ts) dispatch a different model, both against a
+    // possibly-already-mutated tree. Paired with the positive case above so
+    // this list can't drift back into "every text-mode transport drop is
+    // always safe to promote".
+    const dropped = applyTransportTransience(
+      classifyCliFailure({
+        status: "failed",
+        output: "",
+        errorMessage: "Cline CLI failed: UnknownError: Streaming response failed",
+      }),
+      {
+        message: "Cline CLI failed: UnknownError: Streaming response failed",
+        authFailure: false,
+        diagnosticText: "Cline CLI failed: UnknownError: Streaming response failed",
+        retryableHint: false,
+      },
+      "text",
+      UNENFORCED_TEXT_MODE_PROVIDER_LIKE
+    );
+
+    assert.equal(dropped.transient, undefined);
+    assert.equal(dropped.failureKind, "generic");
+    assert.equal(shouldRetryReadOnlyRun(dropped, 1, false), false);
   });
 
   void it("stops at the attempt cap and on cancellation even for transient timeouts", () => {
