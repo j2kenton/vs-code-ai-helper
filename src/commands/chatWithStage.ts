@@ -196,10 +196,28 @@ function describeStageActionsForPrompt(): string {
   ).join("; ");
 }
 
+/**
+ * The markdown-update paragraph explicitly disclaims "any read-only or
+ * plan-mode restriction" — worded that way specifically for opencode's
+ * `plan` agent (see providers.ts's buildArgs comment), which stage chat
+ * always selects via `mode: "text"`. That agent's plan-mode refusal is baked
+ * into its own system prompt, not just its tool permissions, so a model can
+ * decline the `[[UPDATE_FILE:...]]` envelope in read-only/plan-mode terms
+ * even though the envelope invokes no tool at all. Live-verified against
+ * opencode 1.18.4: this wording took a free model
+ * (opencode/north-mini-code-free) that refused 100% of the time under the
+ * prior wording ("you may do so directly") to roughly 2 of 3 attempts
+ * emitting a valid envelope — a real improvement, NOT a guaranteed fix (the
+ * same model still refused outright on one of three identical retries).
+ * Models that already complied under the old wording (opencode/mimo-v2.5-free,
+ * opencode/ling-3.0-flash-free) kept complying. See
+ * isLikelyOpencodePlanModeRefusal below for the fallback when a refusal gets
+ * through anyway.
+ */
 export function buildStageResponsePrompt(
   stageName: string, taskName: string, _artifactPath: string, contextPack: string, message: string, conversation = ""
 ): string {
-  return `You are answering a user question about the ${stageName} stage for task ${taskName}.\n\nDo not invoke tools or propose that code changes were applied. If the user asks you to make a code change, tell them to use the stage action that applies it explicitly instead. However, if the user asks you to update this task's own markdown files (its task description, plan, or a review file), you may do so directly: respond with the file's full new content wrapped in \`[[UPDATE_FILE:relative-filename.md]]\`...\`[[/UPDATE_FILE]]\`, using a path relative to this task's own folder. Only one file may be updated per response, only \`.md\` files inside this task's folder may be targeted this way, and you must never target a source code file. You may also run this task's own stage actions when the user asks for one: end your response with a single \`[[ACTION:<actionId>]]\` envelope (the same typed action protocol the global assistant uses; the legacy \`[[STAGE_ACTION:<actionId>]]\` form is also accepted) and the extension will confirm with the user and run it. Available action ids: ${describeStageActionsForPrompt()}. Propose at most one action per response, only when the user clearly asked for it — never speculatively. For other task-lifecycle requests (pausing, archiving, pinning, renaming, running or fast-forwarding reviews, …), point the user at the Global Assistant chat, which can run those. Give a concise, useful answer alongside any update or action. If you need clarification before the task can proceed, end with a single \`[[QUESTION]]your question[[/QUESTION]]\` envelope. Do not put task output in that envelope.\n\nConversation so far:\n${conversation.slice(-12000)}\n\nTask context:\n${contextPack.slice(0, 30000)}\n\nUser message:\n${message}`;
+  return `You are answering a user question about the ${stageName} stage for task ${taskName}.\n\nDo not invoke tools or propose that code changes were applied. If the user asks you to make a code change, tell them to use the stage action that applies it explicitly instead. However, the user may ask you to update this task's own markdown files (its task description, plan, or a review file) — this is not a file-edit action and uses no edit or write tool, so it is unaffected by any read-only or plan-mode restriction on your tool use: you are only composing text in your reply, and a separate already-trusted process outside this conversation reads that text and applies it on your behalf, the same as if you were dictating a paragraph for someone else to type. To draft an update, put the file's full new content, and nothing else, wrapped in \`[[UPDATE_FILE:relative-filename.md]]\`...\`[[/UPDATE_FILE]]\`, using a path relative to this task's own folder. Only one file may be drafted per response, only \`.md\` files inside this task's folder may be targeted this way, and you must never target a source code file. You may also run this task's own stage actions when the user asks for one: end your response with a single \`[[ACTION:<actionId>]]\` envelope (the same typed action protocol the global assistant uses; the legacy \`[[STAGE_ACTION:<actionId>]]\` form is also accepted) and the extension will confirm with the user and run it. Available action ids: ${describeStageActionsForPrompt()}. Propose at most one action per response, only when the user clearly asked for it — never speculatively. For other task-lifecycle requests (pausing, archiving, pinning, renaming, running or fast-forwarding reviews, …), point the user at the Global Assistant chat, which can run those. Give a concise, useful answer alongside any update or action. If you need clarification before the task can proceed, end with a single \`[[QUESTION]]your question[[/QUESTION]]\` envelope. Do not put task output in that envelope.\n\nConversation so far:\n${conversation.slice(-12000)}\n\nTask context:\n${contextPack.slice(0, 30000)}\n\nUser message:\n${message}`;
 }
 
 function splitQuestionEnvelope(text: string): { answer: string; question?: string } {
@@ -299,6 +317,29 @@ export function resolveMarkdownUpdateTarget(
   return resolved;
 }
 
+/**
+ * Recognizes opencode's own `plan`-agent refusal language (READ-ONLY phase /
+ * plan mode / its `.opencode/plans/*.md` permission grant) surviving into a
+ * chat response with no `[[UPDATE_FILE:...]]` envelope. buildStageResponsePrompt's
+ * reframing (see its own doc comment) reduces how often this happens but does
+ * not eliminate it, since the refusal is baked into that agent's own system
+ * prompt rather than gated by our envelope's wording. Matching it lets the
+ * chat append a clarifying note instead of leaving opencode's confusing,
+ * extension-unaware "I can only edit .opencode/plans/*.md" framing as the
+ * user's entire answer. Deliberately narrow (three opencode-specific phrases)
+ * so it never fires on an ordinary answer that happens to mention read-only
+ * concepts for unrelated reasons.
+ */
+export function isLikelyOpencodePlanModeRefusal(responseText: string): boolean {
+  return /\.opencode[\\/]plans|\bplan mode\b|read-only phase/i.test(responseText);
+}
+
+export const OPENCODE_PLAN_MODE_REFUSAL_NOTE =
+  "_That refusal is opencode's own read-only \"plan\" mode declining to draft the update in its own terms — " +
+  "not a real limitation here. This chat never uses opencode's native edit tool for `.md` updates; it only " +
+  "reads the drafted text back and applies it itself. Try asking again, or switch this stage to a different " +
+  "model in AI Models if opencode keeps declining._";
+
 export async function chatWithStage(
   context: vscode.ExtensionContext,
   inventory: TaskInventory,
@@ -358,7 +399,7 @@ export async function chatWithStage(
       );
       return;
     }
-    const { runner, nativeModelId } = resolveRunnerForModel(modelId, targetStage, taskFolderUri);
+    const { runner, nativeModelId, provider } = resolveRunnerForModel(modelId, targetStage, taskFolderUri);
     const { availability: available, providerLabel } = await checkRunnerAvailabilityForModel(modelId, targetStage);
     if (!available.available) throw new Error(available.reason ?? `${providerLabel} is unavailable.`);
     // Stage-scoped: each stage has a fully separate conversation, so the
@@ -408,6 +449,11 @@ export async function chatWithStage(
       await safeOpenTextDocument(vscode.Uri.file(plan.targetPath), plan.relPath);
     } else if (plan.action === "reject") {
       updateNote = `\n\n${plan.note}`;
+    } else if (provider === "opencode-cli" && isLikelyOpencodePlanModeRefusal(withoutUpdate)) {
+      // No envelope was found ("none"), and the leftover text reads like
+      // opencode's own plan-mode agent declining in its own permission
+      // terms — see isLikelyOpencodePlanModeRefusal's doc comment.
+      updateNote = `\n\n${OPENCODE_PLAN_MODE_REFUSAL_NOTE}`;
     }
     const response = splitQuestionEnvelope(`${withoutUpdate}${updateNote}${actionNote}`.trim());
     if (response.answer) await chatViewProvider.append("assistant", response.answer, targetStage, { canonicalId: task.canonicalId, taskFolderPath: task.taskFolderPath });

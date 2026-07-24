@@ -9,6 +9,7 @@ import * as assert from "node:assert/strict";
 import * as path from "node:path";
 import { test } from "node:test";
 import {
+  isLikelyOpencodePlanModeRefusal,
   planFileUpdate,
   resolveMarkdownUpdateTarget,
   splitFileUpdateEnvelopes,
@@ -124,4 +125,42 @@ void test("rejects an absolute path outside the task folder", () => {
 
 void test("rejects an empty path", () => {
   assert.equal(resolveMarkdownUpdateTarget(TASK_FOLDER, "   "), undefined);
+});
+
+// ---------------------------------------------------------------------------
+// isLikelyOpencodePlanModeRefusal — live-verified refusal phrasings from
+// opencode 1.18.4's `plan` agent (see buildStageResponsePrompt's doc comment)
+// ---------------------------------------------------------------------------
+
+void test("matches a response citing the .opencode/plans permission grant", () => {
+  assert.ok(
+    isLikelyOpencodePlanModeRefusal(
+      "I cannot edit files in the .ensemble task folder — my permissions only allow editing .opencode/plans/*.md files."
+    )
+  );
+});
+
+void test("matches a response citing plan mode", () => {
+  assert.ok(
+    isLikelyOpencodePlanModeRefusal(
+      "I'm in plan mode (READ-ONLY phase), so I can't modify files yet."
+    )
+  );
+});
+
+void test("matches a response citing a read-only phase without the words 'plan mode'", () => {
+  assert.ok(
+    isLikelyOpencodePlanModeRefusal(
+      "I'm in READ-ONLY phase where ALL file edits are strictly forbidden."
+    )
+  );
+});
+
+void test("does not match an ordinary answer", () => {
+  assert.equal(
+    isLikelyOpencodePlanModeRefusal(
+      "The task looks ready to move to Draft — no blockers I can see."
+    ),
+    false
+  );
 });
