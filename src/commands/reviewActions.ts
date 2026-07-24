@@ -55,7 +55,7 @@ import {
   resolveRunnerForModel,
   runImplementationForModel,
 } from "../runners/runnerRegistry";
-import { getCliProvider, normalizeQualifiedModelId, toQualifiedModelId, type CliProviderId } from "../runners/providers";
+import { normalizeQualifiedModelId, qualifiedRanModelId } from "../runners/providers";
 import { getQuotaObservation, recordQuotaObservation } from "../utils/quota";
 import {
   resolveConfiguredReviewStages,
@@ -1334,37 +1334,6 @@ async function runAiToFile(options: {
     }
   );
   return completed;
-}
-
-/**
- * Reconstruct the fully qualified, canonical `<provider>:<model>` form of
- * whichever model actually produced an AgentRunResult, so it can be compared
- * directly against stage-config backup entries. Two things a naive
- * `${runnerId}:${modelId}` join gets wrong, both handled here:
- *
- *  - An absent `modelId` from a CLI runner means the provider's own default
- *    model ran (see parseModelSelection's "default" mapping) — that is a
- *    real, nameable model (e.g. "opencode-cli:default"), not an unknown one,
- *    and several providers ship exactly this as a seeded backup entry.
- *  - A present `modelId` may be the post-alias-resolution name rather than
- *    whatever raw string a backup entry happens to be stored under (e.g. a
- *    legacy "antigravity-cli:gemini-3.5-flash-medium" entry runs and reports
- *    back as "Gemini 3.5 Flash (Medium)"). normalizeQualifiedModelId — the
- *    same helper the settings webview uses to reconcile stored ids against
- *    the live catalog — resolves both sides back to the same canonical form.
- *
- * Copilot's stored ids have no alias table and are returned as reported
- * (bare) — a Copilot result reporting no `modelId` at all can't be
- * reconstructed (there is nothing to compare), so this returns undefined
- * only in that case.
- */
-function qualifiedRanModelId(result: { runnerId: string; modelId?: string }): string | undefined {
-  if (getCliProvider(result.runnerId)) {
-    return normalizeQualifiedModelId(
-      toQualifiedModelId(result.runnerId as CliProviderId, result.modelId)
-    );
-  }
-  return result.modelId;
 }
 
 /**

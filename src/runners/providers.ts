@@ -1484,3 +1484,37 @@ export function normalizeQualifiedModelId(
   }
   return toQualifiedModelId(parsed.provider, parsed.model);
 }
+
+/**
+ * Reconstruct the fully qualified, canonical `<provider>:<model>` form of
+ * whichever model actually produced an AgentRunResult, so it can be compared
+ * directly against stage-config backup entries (a run whose stage-wrapped
+ * runner silently substituted a backup reports that backup, not the requested
+ * model). Two things a naive `${runnerId}:${modelId}` join gets wrong, both
+ * handled here:
+ *
+ *  - An absent `modelId` from a CLI runner means the provider's own default
+ *    model ran (see parseModelSelection's "default" mapping) — a real,
+ *    nameable model (e.g. "opencode-cli:default"), which several providers
+ *    ship as a seeded backup entry.
+ *  - A present `modelId` may be the post-alias-resolution name rather than the
+ *    raw string a backup entry is stored under; normalizeQualifiedModelId (the
+ *    same helper the settings webview uses) resolves both sides to one form.
+ *
+ * Copilot's stored ids have no alias table and are returned as reported
+ * (bare); a Copilot result reporting no `modelId` can't be reconstructed and
+ * returns undefined. Shared by every stage cascade that dedupes or attributes
+ * runs by the model that truly ran (reviewActions' review cascade,
+ * draftTaskWithAI's Description cascade).
+ */
+export function qualifiedRanModelId(result: {
+  runnerId: string;
+  modelId?: string;
+}): string | undefined {
+  if (getCliProvider(result.runnerId)) {
+    return normalizeQualifiedModelId(
+      toQualifiedModelId(result.runnerId as CliProviderId, result.modelId)
+    );
+  }
+  return result.modelId;
+}
