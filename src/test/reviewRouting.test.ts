@@ -148,6 +148,37 @@ void describe("decideReviewRoute", () => {
     assert.strictEqual(decision.route, "escalate");
   });
 
+  void it("escalates immediately when every remaining blocker is non-task-fixable, even with no plateau yet", () => {
+    // A round can reach "nothing task-fixable remains" on its very first
+    // appearance (e.g. the last task-fixable item just got resolved, leaving
+    // only an environmental blocker). Waiting out a full plateau window
+    // first — as a stale "iterate" would — burns rounds that provably
+    // cannot change the outcome, since there is nothing left for another
+    // automated implementation pass to act on.
+    const decision = decideReviewRoute({
+      score: 4.2,
+      threshold: 9,
+      blockers: [blocker({ resolver: "environmental" })],
+      plateaued: false,
+      secondOpinionTriedThisPlateau: false,
+    });
+    assert.strictEqual(decision.route, "escalate");
+  });
+
+  void it("still iterates below threshold when task-fixable work remains, regardless of any environmental blocker also present", () => {
+    // onlyNonFixableRemain requires ALL blockers to be non-task-fixable — a
+    // mix must still iterate normally so real, fixable work keeps getting
+    // attempted.
+    const decision = decideReviewRoute({
+      score: 5,
+      threshold: 8,
+      blockers: [blocker({ resolver: "task-fixable" }), blocker({ resolver: "environmental" })],
+      plateaued: false,
+      secondOpinionTriedThisPlateau: false,
+    });
+    assert.strictEqual(decision.route, "iterate");
+  });
+
   void it("never escalates or requests a second opinion on a zero-blocker plateau — stock-settings regression", () => {
     // Default threshold is 10 (see getAutoAdvanceScoreThreshold's fallback)
     // and the default plateau window is 3. A reviewer that consistently

@@ -108,10 +108,11 @@ export function rubricCapLikelyBlockedAdvance(
  *  - second-opinion: plateaued with task-fixable blockers still claimed —
  *    worth one independent second reviewer before giving up (see
  *    reconcileReviews in reviewActions.ts).
- *  - escalate: plateaued and nothing left for automation to try — either
- *    every remaining blocker is environmental/unverifiable/spec-defect, or
- *    a second opinion has already been tried this plateau and didn't
- *    resolve it.
+ *  - escalate: nothing left for automation to try — either every remaining
+ *    blocker is environmental/unverifiable/spec-defect (no plateau required:
+ *    another round cannot act on these regardless of score trend), or the
+ *    stage has plateaued and a second opinion has already been tried this
+ *    plateau and didn't resolve it.
  */
 export function decideReviewRoute(input: {
   score: number | null;
@@ -163,10 +164,20 @@ export function decideReviewRoute(input: {
       reason: "No blockers were reported; the score alone has not reached the configured threshold. Not treated as stuck.",
     };
   }
-  if (plateaued && onlyNonFixableRemain) {
+  if (onlyNonFixableRemain) {
+    // Every reported blocker is environmental, unverifiable, or a spec
+    // defect — none is something another automated implementation round
+    // could act on. That is true independent of the score's trend: unlike
+    // "iterate" (below), where waiting to see whether task-fixable work
+    // lands over more rounds is worthwhile, there is nothing here for more
+    // rounds to change. Escalate immediately rather than waiting out a full
+    // plateau window (and, previously, a wasted second-opinion round) on
+    // rounds that could not have altered the outcome either way.
     return {
       route: "escalate",
-      reason: "The score has plateaued and every remaining blocker is outside automation's control (environmental, unverifiable, or a spec defect).",
+      reason: plateaued
+        ? "The score has plateaued and every remaining blocker is outside automation's control (environmental, unverifiable, or a spec defect)."
+        : "Every remaining blocker is outside automation's control (environmental, unverifiable, or a spec defect); no amount of further automated iteration can resolve it.",
     };
   }
   if (plateaued && !secondOpinionTriedThisPlateau) {
