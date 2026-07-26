@@ -531,12 +531,12 @@ void describe("getAvailableModels", () => {
           ),
           {
             id: "claude-cli:opus",
-            name: "Opus 4.8",
+            name: "Opus 5",
             providerLabel: "Claude Code (subscription CLI)",
           },
           ...claudeCliReasoningVariants(
             "opus",
-            "Opus 4.8",
+            "Opus 5",
             [
               ["low", "Low"],
               ["medium", "Medium"],

@@ -451,6 +451,7 @@ const COPILOT_MODEL_VARIANT_RULES: Readonly<
   { slug: "claude-sonnet-4.5", efforts: [], longContext: false },
   { slug: "claude-haiku-4.5", efforts: [], longContext: false },
   { slug: "claude-fable-5", efforts: COPILOT_REASONING_LEVELS.claude, longContext: true },
+  { slug: "claude-opus-5", efforts: COPILOT_REASONING_LEVELS.claude, longContext: true },
   { slug: "claude-opus-4.8", efforts: COPILOT_REASONING_LEVELS.claude, longContext: true },
   { slug: "claude-opus-4.8-fast", efforts: COPILOT_REASONING_LEVELS.claude, longContext: true },
   { slug: "claude-opus-4.7", efforts: COPILOT_REASONING_LEVELS.claude, longContext: true },
@@ -590,8 +591,8 @@ function createSeededClaudeCliModels(): readonly DiscoveredCliModel[] {
       ["xhigh", "Extra High"],
       ["max", "Max"],
     ]),
-    { model: "opus", name: "Opus 4.8" },
-    ...createVariants("opus", "Opus 4.8", [
+    { model: "opus", name: "Opus 5" },
+    ...createVariants("opus", "Opus 5", [
       ["low", "Low"],
       ["medium", "Medium"],
       ["high", "High"],
@@ -802,6 +803,8 @@ opencode/claude-opus-4-7
 {"id":"claude-opus-4-7","providerID":"opencode","name":"Claude Opus 4.7","variants":{"low":{},"medium":{},"high":{},"xhigh":{},"max":{}}}
 opencode/claude-opus-4-8
 {"id":"claude-opus-4-8","providerID":"opencode","name":"Claude Opus 4.8","variants":{"low":{},"medium":{},"high":{},"xhigh":{},"max":{}}}
+opencode/claude-opus-5
+{"id":"claude-opus-5","providerID":"opencode","name":"Claude Opus 5","variants":{"low":{},"medium":{},"high":{},"xhigh":{},"max":{}}}
 opencode/claude-sonnet-4
 {"id":"claude-sonnet-4","providerID":"opencode","name":"Claude Sonnet 4","variants":{"high":{},"max":{}}}
 opencode/claude-sonnet-4-5
