@@ -19,6 +19,20 @@ export const DEFAULT_PLATEAU_WINDOW = 3;
  * establish a baseline, plus a full window after it) — with fewer rounds
  * there isn't enough signal to distinguish "still improving" from "stuck",
  * so this conservatively returns false rather than guessing.
+ *
+ * Rounds that reported no task-fixable blocker are excluded entirely. A
+ * plateau is meant to answer "is automated iteration failing to fix what it
+ * was told to fix?", and a round with nothing fixable to act on is no
+ * evidence either way: most often it is a healthy review sitting below a
+ * strict numeric threshold (e.g. a staged plan legitimately capped at ~5/10
+ * while only a third of its ordered steps have landed) with the reviewer
+ * reporting zero blockers. Counting those rounds made a genuinely
+ * progressing task look stuck — observed 2026-07-26, where three clean
+ * zero-blocker rounds became the "prior best" that a later round carrying a
+ * brand-new blocker was then measured against, escalating on that blocker's
+ * FIRST appearance under the banner "unable to resolve it across multiple
+ * rounds". Rounds that did carry fixable work still count in full, so a real
+ * stall is still caught.
  */
 export function detectPlateau(
   history: readonly ReviewScoreHistoryEntry[],
@@ -34,7 +48,11 @@ export function detectPlateau(
   const safeWindow = Number.isFinite(window) && window > 0 ? Math.floor(window) : DEFAULT_PLATEAU_WINDOW;
   const scored = history.filter(
     (entry): entry is ReviewScoreHistoryEntry & { score: number } =>
-      entry.stage === stage && entry.score !== null
+      entry.stage === stage &&
+      entry.score !== null &&
+      // Legacy entries predate this field; treat them as countable rather
+      // than silently disabling plateau detection for older tasks.
+      (entry.taskFixableCount === undefined || entry.taskFixableCount > 0)
   );
   if (scored.length < safeWindow + 1) {
     return false;

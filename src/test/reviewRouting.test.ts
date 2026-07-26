@@ -15,8 +15,12 @@ function entry(score: number | null, overrides: Partial<ReviewScoreHistoryEntry>
     score,
     attemptId: `attempt-${Math.random()}`,
     at: new Date().toISOString(),
-    blockerCount: 0,
-    taskFixableCount: 0,
+    // Default to a round that DID carry fixable work: detectPlateau ignores
+    // rounds with nothing task-fixable to act on, so a zero default would
+    // filter every entry out and make the plateau cases below vacuous.
+    // Tests about clean rounds override this explicitly.
+    blockerCount: 1,
+    taskFixableCount: 1,
     ...overrides,
   };
 }
@@ -65,6 +69,48 @@ void describe("detectPlateau", () => {
     // compare against is just "not enough history yet".
     const history = [entry(6), entry(5)];
     assert.strictEqual(detectPlateau(history, "impl-high-review", 3), false);
+  });
+
+  void it("ignores rounds that had nothing task-fixable to act on", () => {
+    // Three clean zero-blocker rounds are not evidence that iteration is
+    // stuck — there was nothing for it to fix. Counting them made a
+    // genuinely progressing task escalate.
+    const history = [
+      entry(2, { taskFixableCount: 1, blockerCount: 1 }),
+      entry(5, { taskFixableCount: 0, blockerCount: 0 }),
+      entry(5, { taskFixableCount: 0, blockerCount: 0 }),
+      entry(5, { taskFixableCount: 0, blockerCount: 0 }),
+    ];
+    assert.strictEqual(detectPlateau(history, "impl-high-review", 3), false);
+  });
+
+  void it("does not let clean rounds become the 'prior best' a brand-new blocker is judged against", () => {
+    // Replay of task_5 on 2026-07-26: 5.8/5.9/5.9/5.9 all reported zero
+    // blockers, then a single round surfaced a NEW architectural blocker at
+    // 5.7 — and escalated on that blocker's first appearance, claiming
+    // automated iteration had failed "across multiple rounds".
+    const history = [
+      entry(5.5, { taskFixableCount: 1, blockerCount: 1 }),
+      entry(5.8, { taskFixableCount: 0, blockerCount: 0 }),
+      entry(5.9, { taskFixableCount: 0, blockerCount: 0 }),
+      entry(5.9, { taskFixableCount: 0, blockerCount: 0 }),
+      entry(5.9, { taskFixableCount: 0, blockerCount: 0 }),
+      entry(5.7, { taskFixableCount: 1, blockerCount: 1 }),
+    ];
+    assert.strictEqual(detectPlateau(history, "impl-high-review", 3), false);
+  });
+
+  void it("still detects a real stall across rounds that DID carry fixable work", () => {
+    // The safety valve must survive: when iteration repeatedly had something
+    // to fix and the score never improved, that is a genuine plateau.
+    const history = [
+      entry(2, { taskFixableCount: 2, blockerCount: 2 }),
+      entry(5, { taskFixableCount: 1, blockerCount: 1 }),
+      entry(5, { taskFixableCount: 1, blockerCount: 1 }),
+      entry(5, { taskFixableCount: 1, blockerCount: 1 }),
+      entry(5, { taskFixableCount: 1, blockerCount: 1 }),
+    ];
+    assert.strictEqual(detectPlateau(history, "impl-high-review", 3), true);
   });
 
   void it("ignores rounds with a null score and ignores other stages", () => {
