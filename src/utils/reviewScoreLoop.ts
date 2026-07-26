@@ -3,6 +3,19 @@ import * as vscode from "vscode";
 const KEY = "bestReviewScores";
 export const MAX_REVIEW_ATTEMPTS = 5;
 
+/**
+ * Smallest score gain that counts as real progress for the stop/plateau
+ * decision. For integer scores this is equivalent to the historical "+1"
+ * rule — there is no integer strictly between baselineScore and
+ * baselineScore + 1, so a whole-point jump still clears it and a flat score
+ * still fails it. It matters only for the fractional scores staged
+ * (multi-round) implementation reviews emit (see reviewReadiness.ts): a
+ * genuine but sub-band climb like 3.1 -> 3.4 now registers as improvement,
+ * so a large plan delivered incrementally is not misread as a plateau and
+ * escalated when it is in fact progressing.
+ */
+export const MIN_SCORE_IMPROVEMENT = 0.1;
+
 export function getBestReviewScore(context: vscode.ExtensionContext, stage: string): number | undefined {
   return context.workspaceState.get<Record<string, number>>(KEY)?.[stage];
 }
@@ -18,7 +31,8 @@ export interface ImproveReviewScoreResult {
   /** Last known score, or null if no attempt ever produced a parseable one. */
   score: number | null;
   attempts: number;
-  /** True once an attempt's score reached baselineScore + 1. */
+  /** True once an attempt's score reached baselineScore + MIN_SCORE_IMPROVEMENT
+   * (a whole point for integer scores; a fractional gain for staged reviews). */
   improved: boolean;
   /**
    * True when an attempt's review() returned null (the review artifact
@@ -42,7 +56,8 @@ export interface ImproveReviewScoreResult {
 /**
  * Runs exactly one apply followed by one re-review per attempt, up to
  * MAX_REVIEW_ATTEMPTS, stopping as soon as a later attempt's score beats
- * baselineScore by at least 1.
+ * baselineScore by at least MIN_SCORE_IMPROVEMENT (one whole point for
+ * integer scores; any real fractional gain for staged reviews).
  *
  * baselineScore must be the score of the review *before* this call starts
  * (read by the caller) — the loop does not consult any previously persisted
@@ -73,7 +88,8 @@ export async function improveReviewScore(options: {
   /** Maximum apply/review cycles for this run. */
   maxAttempts?: number;
   /** 0 stops at the first improvement; a positive target is an additional
-   * goal, but never replaces the mandatory baseline-plus-one improvement. */
+   * goal, but never replaces the mandatory baseline improvement (of at least
+   * MIN_SCORE_IMPROVEMENT). */
   stopAtScore?: number;
 }): Promise<ImproveReviewScoreResult> {
   let best: number | null = null;
@@ -98,7 +114,12 @@ export async function improveReviewScore(options: {
     if (score === null) {
       return { score: best, attempts: attempt, improved: false, stalled: true, paused: false };
     }
-    const improved = score >= options.baselineScore + 1;
+    // Compare in integer tenths: scores are normalized to one decimal
+    // (reviewReadiness.ts), and `baseline + 0.1` is not exactly representable
+    // in IEEE-754, so a direct `>=` misfires exactly at the boundary.
+    const improved =
+      Math.round(score * 10) >=
+      Math.round(options.baselineScore * 10) + Math.round(MIN_SCORE_IMPROVEMENT * 10);
     // Fast Forward is only successful after it has made measurable progress
     // from the score it started with.  A configured target may require more,
     // but must not let a task at (or above) that target stop without improving.

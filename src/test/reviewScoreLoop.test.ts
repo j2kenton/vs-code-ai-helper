@@ -71,6 +71,46 @@ void describe("improveReviewScore", () => {
     assert.strictEqual(call, 3);
   });
 
+  void it("treats a fractional gain as improvement (staged-plan scores) so a real climb is not read as a plateau", async () => {
+    // 3.1 -> 3.2 is only +0.1 — under the old integer "+1" gate this counted
+    // as no progress and drove the plateau escalation; it must now register.
+    const context = fakeContext();
+    const scores = [3.1, 3.2];
+    let call = 0;
+
+    const result = await improveReviewScore({
+      context,
+      stage: "impl-high-review",
+      baselineScore: 3.1,
+      apply: () => {
+        call += 1;
+        return Promise.resolve();
+      },
+      review: () => Promise.resolve(scores[call - 1] ?? null),
+    });
+
+    assert.strictEqual(result.improved, true);
+    assert.strictEqual(result.attempts, 2);
+    assert.strictEqual(result.score, 3.2);
+  });
+
+  void it("does NOT treat a flat fractional score as improvement", async () => {
+    // Real scores are normalized to tenths (reviewReadiness.ts), so "no
+    // progress" means the same tenth again — that must not count, so a
+    // genuinely stuck staged plan can still stall/escalate.
+    const context = fakeContext();
+    const result = await improveReviewScore({
+      context,
+      stage: "impl-high-review",
+      baselineScore: 3.1,
+      apply: () => Promise.resolve(),
+      review: () => Promise.resolve(3.1),
+    });
+
+    assert.strictEqual(result.improved, false);
+    assert.strictEqual(result.attempts, MAX_REVIEW_ATTEMPTS);
+  });
+
   void it("does NOT report improved on a fresh task with no persisted best just because there's no history", async () => {
     // Regression test: the original implementation used
     // `previous === undefined` (no persisted best yet) as a shortcut that

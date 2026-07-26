@@ -4,6 +4,13 @@
  * Review artifacts must include a top-level line in this exact form:
  *   Readiness: N/10
  *
+ * N is normally a whole number 0-10. Staged (multi-round) implementation
+ * reviews may instead emit one decimal place (e.g. `Readiness: 3.1/10`) so
+ * that incremental progress across rounds is visible and the Fast Forward
+ * improvement gate (reviewScoreLoop.ts) can see sub-band movement rather than
+ * reading a slow-but-real climb as a plateau. The value is clamped to [0, 10]
+ * and normalized to one decimal.
+ *
  * The score/label are the only sidebar-facing output: stage-level tree icons
  * no longer vary by score band (see taskTreeProvider.ts's StageNode — a
  * current review stage always renders a plain blue horizontal arrow,
@@ -16,10 +23,16 @@ export interface ReadinessResult {
   label: string;
 }
 
-/** Primary regex: exact `Readiness: N/10` line */
-const EXACT_READINESS_RE = /^Readiness:\s*(10|[0-9])\/10\s*$/m;
+/** Primary regex: exact `Readiness: N/10` line (N whole or one-plus decimals) */
+const EXACT_READINESS_RE = /^Readiness:\s*(10(?:\.0+)?|[0-9](?:\.[0-9]+)?)\/10\s*$/m;
 /** Legacy fallback: case-insensitive `readiness` keyword + N/10 anywhere */
-const LEGACY_READINESS_RE = /readiness[^0-9]*(10|[0-9])\/10/i;
+const LEGACY_READINESS_RE = /readiness[^0-9]*(10(?:\.0+)?|[0-9](?:\.[0-9]+)?)\/10/i;
+
+/** Clamp to [0, 10] and normalize to one decimal so a whole number stays a
+ * whole number (3 -> "3/10") and a decimal is tidy (3.14 -> "3.1/10"). */
+function normalizeScore(raw: number): number {
+  return Math.round(Math.min(10, Math.max(0, raw)) * 10) / 10;
+}
 
 /**
  * Parse readiness from a review artifact string.
@@ -29,11 +42,11 @@ export function parseReadiness(content: string): ReadinessResult {
 
   const exactMatch = EXACT_READINESS_RE.exec(content);
   if (exactMatch?.[1] !== undefined) {
-    score = parseInt(exactMatch[1], 10);
+    score = normalizeScore(parseFloat(exactMatch[1]));
   } else {
     const legacyMatch = LEGACY_READINESS_RE.exec(content);
     if (legacyMatch?.[1] !== undefined) {
-      score = parseInt(legacyMatch[1], 10);
+      score = normalizeScore(parseFloat(legacyMatch[1]));
     }
   }
 
@@ -143,7 +156,7 @@ export function isStrictPerfectReview(content: string): boolean {
     if (inFrontmatter || !line || line.startsWith("<!--") || line.endsWith("-->") || line.startsWith("#")) {
       continue;
     }
-    return line === "Readiness: 10/10";
+    return /^Readiness:\s*10(?:\.0+)?\/10$/.test(line);
   }
   return false;
 }

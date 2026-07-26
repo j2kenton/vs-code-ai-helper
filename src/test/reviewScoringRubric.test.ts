@@ -197,6 +197,24 @@ void describe("review scoring rubric", () => {
         assert.strictEqual(result.label, `${score}/10`);
       }
     });
+
+    void it("parses a one-decimal score (staged-plan reviews)", () => {
+      const result = parseReadiness("Readiness: 3.1/10\nBody");
+      assert.strictEqual(result.score, 3.1);
+      assert.strictEqual(result.label, "3.1/10");
+    });
+
+    void it("normalizes to one decimal and clamps to [0,10]", () => {
+      assert.strictEqual(parseReadiness("Readiness: 3.14/10").score, 3.1);
+      assert.strictEqual(parseReadiness("Readiness: 9.75/10").score, 9.8);
+      // A completed staged review may write the decimal perfect form.
+      assert.strictEqual(parseReadiness("Readiness: 10.0/10").score, 10);
+      assert.strictEqual(parseReadiness("Readiness: 10.0/10").label, "10/10");
+    });
+
+    void it("still returns null when no readiness line is present", () => {
+      assert.strictEqual(parseReadiness("No score here").score, null);
+    });
   });
 
   void describe("meetsAutoAdvanceThreshold", () => {
