@@ -23,6 +23,7 @@ import {
   collectCompletionLint,
   readPackageScripts,
   mergeCompletionChecksSection,
+  truncateCheckOutput,
   upsertCompletionChecksInPublishReview,
   CompletionLintResult,
 } from "../utils/completionLint";
@@ -262,5 +263,49 @@ void describe("upsertCompletionChecksInPublishReview", () => {
 
     const content = nodeFs.readFileSync(nodePath.join(dir, "publish-review.md"), "utf8");
     assert.match(content, /Published anyway despite failing checks — user chose Publish Anyway\./);
+  });
+});
+
+void describe("truncateCheckOutput", () => {
+  void it("returns short output unchanged", () => {
+    assert.strictEqual(truncateCheckOutput("all good", 1500), "all good");
+  });
+
+  void it("keeps the FAILING tail of a node --test log, not just the passing head", () => {
+    // The real regression (observed 2026-07-26): `node --test` streams its
+    // passes first and prints the failing test name plus the `fail N`
+    // summary last. A head-only slice preserved the passes and discarded
+    // the failure, leaving the reviewer with a red run it could not
+    // attribute and the implementer with no test to fix.
+    const passes = Array.from({ length: 400 }, (_, i) => `  ok ${i} - passing test ${i}`).join("\n");
+    const failure = [
+      "  not ok 401 - startNewTask reserves the folder",
+      "    error: Expected values to be strictly equal",
+      "ℹ tests 401",
+      "ℹ pass 400",
+      "ℹ fail 1",
+    ].join("\n");
+    const log = `${passes}\n${failure}`;
+
+    const truncated = truncateCheckOutput(log, 1500);
+
+    assert.ok(truncated.length < log.length, "long output should be truncated");
+    assert.match(truncated, /not ok 401 - startNewTask reserves the folder/);
+    assert.match(truncated, /fail 1/);
+    assert.match(truncated, /truncated \d+ characters/);
+  });
+
+  void it("also keeps the head, where fail-fast tools like tsc report errors first", () => {
+    const head = "src/a.ts(1,1): error TS2304: Cannot find name \x27foo\x27.";
+    const log = `${head}\n${"filler line\n".repeat(500)}`;
+
+    const truncated = truncateCheckOutput(log, 1500);
+
+    assert.match(truncated, /error TS2304: Cannot find name/);
+  });
+
+  void it("stays within the requested cap", () => {
+    const log = "x".repeat(50_000);
+    assert.ok(truncateCheckOutput(log, 1500).length <= 1500);
   });
 });

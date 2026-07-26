@@ -884,6 +884,47 @@ const PUBLISH_CHECKS_SECTION_END = "<!-- completion-checks:end -->";
  * output to identify the failure, not the full log. */
 const PUBLISH_CHECKS_MAX_OUTPUT_CHARS = 4000;
 
+/** Room reserved for the elision marker itself so the rendered output still
+ * respects the caller's cap. */
+const CHECK_OUTPUT_MARKER_ALLOWANCE = 64;
+
+/**
+ * Truncate a failed check's captured output to roughly `maxChars`, keeping
+ * BOTH ends of the log.
+ *
+ * A plain `slice(0, max)` keeps only the head, which is exactly the wrong
+ * half for the most important check: `node --test` streams its passing
+ * tests first and prints the failing test name, its error, and the trailing
+ * `fail N` summary at the very END. Head-only truncation therefore handed
+ * the reader a wall of ✔ passes and dropped the one thing that identifies
+ * the failure. That is not merely cosmetic — reviewers are instructed to
+ * treat Verified Checks as ground truth (see the rubric), so an
+ * unattributable failure becomes an *unfixable* blocker: the reviewer must
+ * report the red run, while the implementer is never told which test to
+ * look at, cannot reproduce it, changes nothing, and the round fails as
+ * "did not modify any workspace files" — a loop observed live on
+ * 2026-07-26, where a `pnpm run test` exit 1 could not be reproduced across
+ * seven subsequent full runs.
+ *
+ * Compilers fail the other way round (tsc reports its errors first), so
+ * keep both ends rather than simply swapping to a tail-only slice: a
+ * smaller head for tools that fail fast, the larger remainder for test
+ * runners that summarize last.
+ *
+ * @internal exported for testing
+ */
+export function truncateCheckOutput(output: string, maxChars: number): string {
+  if (output.length <= maxChars) {
+    return output;
+  }
+  const budget = Math.max(0, maxChars - CHECK_OUTPUT_MARKER_ALLOWANCE);
+  const headChars = Math.floor(budget * 0.4);
+  const tailChars = budget - headChars;
+  const omitted = output.length - headChars - tailChars;
+  const marker = `\n… (truncated ${omitted} characters) …\n`;
+  return `${output.slice(0, headChars)}${marker}${output.slice(output.length - tailChars)}`;
+}
+
 function renderCompletionChecksSection(
   result: CompletionLintResult,
   override?: { reason: string }
@@ -912,9 +953,7 @@ function renderCompletionChecksSection(
     lines.push("", "### Failed checks");
     for (const check of result.failedChecks) {
       const flake = (result.knownFlakeFailures ?? []).find((f) => f.command === check.command && f.exitCode === check.exitCode);
-      const output = check.output.length > PUBLISH_CHECKS_MAX_OUTPUT_CHARS
-        ? `${check.output.slice(0, PUBLISH_CHECKS_MAX_OUTPUT_CHARS)}\n… (truncated)`
-        : check.output;
+      const output = truncateCheckOutput(check.output, PUBLISH_CHECKS_MAX_OUTPUT_CHARS);
       lines.push(
         "",
         `**${check.command}** (exit ${check.exitCode})${flake ? ` — _known flake: ${flake.reason}_` : ""}`,
@@ -1024,9 +1063,7 @@ export function buildVerifiedChecksSection(result: CompletionLintResult): string
       );
       continue;
     }
-    const output = check.output.length > VERIFIED_CHECKS_PROMPT_MAX_OUTPUT_CHARS
-      ? `${check.output.slice(0, VERIFIED_CHECKS_PROMPT_MAX_OUTPUT_CHARS)}\n… (truncated)`
-      : check.output;
+    const output = truncateCheckOutput(check.output, VERIFIED_CHECKS_PROMPT_MAX_OUTPUT_CHARS);
     lines.push("", `- **${check.command}** — exit ${check.exitCode} (FAILED)`, "```", output, "```");
   }
   return lines.join("\n");
