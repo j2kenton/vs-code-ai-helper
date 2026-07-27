@@ -24,6 +24,17 @@
  *    preference every other CLI provider here follows. Models are namespaced
  *    "cline-pass/<model>" (verified live: a bare "<model>" is rejected with
  *    "invalid model format. Expected format: modelType/model").
+ *  - Kimi Code CLI (`kimi`) — Moonshot AI's own dedicated coding CLI
+ *    (https://github.com/MoonshotAI/kimi-code), distinct from the Kimi
+ *    models reachable through Cline's ClinePass catalog above. Auth is
+ *    `kimi login`'s OAuth device-code flow against the user's Moonshot/Kimi
+ *    account. See its buildArgs comment for why promptTransport is "argv"
+ *    (verified live: `-p/--prompt` is the CLI's only prompt input — piped
+ *    stdin is never read) and why it carries a permissionWarning stronger
+ *    than Antigravity's/Cline's (verified live: `--plan` cannot even be
+ *    passed alongside `-p` — "error: Cannot combine --prompt with --plan" —
+ *    so there is no read-only invocation shape at all, not merely an
+ *    unenforced one).
  *
  * Model IDs are stored as "<provider>:<model>" (e.g. "claude-cli:sonnet",
  * "gemini-cli:default"). Bare IDs with no known provider prefix are Copilot
@@ -32,6 +43,7 @@
 
 import {
   discoverAgyModels,
+  discoverKimiModels,
   discoverKiroModels,
   discoverOpencodeModels,
   type DiscoveredCliModel,
@@ -44,7 +56,8 @@ export type CliProviderId =
   | "antigravity-cli"
   | "kiro-cli"
   | "opencode-cli"
-  | "cline-cli";
+  | "cline-cli"
+  | "kimi-cli";
 export type ProviderId = "copilot" | CliProviderId;
 
 /**
@@ -1144,6 +1157,121 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
       // string is the required positional prompt argument; the real prompt
       // is delivered via stdin (promptTransport above) instead.
       args.push(CLINE_CLI_ARGV_PROMPT_PLACEHOLDER);
+      return args;
+    },
+  },
+  {
+    id: "kimi-cli",
+    label: "Kimi Code CLI",
+    command: "kimi",
+    installHint:
+      "Install Kimi Code CLI via the official installer (macOS/Linux: `curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash`; " +
+      "Windows PowerShell: `irm https://code.kimi.com/kimi-code/install.ps1 | iex`), then run `kimi login` to sign in. " +
+      "Do NOT install via `npm install -g @moonshot-ai/kimi-code` — that produces a Windows .cmd shim that this integration " +
+      "cannot safely drive (its only prompt-input mode requires shell:false; see the buildArgs comment below), while the " +
+      "official installer places a native `kimi` executable on PATH instead.",
+    loginHint:
+      "Run `kimi login` in a terminal and complete the device-code sign-in with your Moonshot AI / Kimi account, then try again.",
+    // Best-effort list, NOT verified against a real unauthenticated `kimi`
+    // run: this dev environment's CLI was already signed in via a prior
+    // session, and deliberately signing out to observe a genuine auth
+    // failure would disrupt the user's real credentials (same caution as
+    // cline-cli above). Matches the union of markers used by the other
+    // multi-model CLI providers here rather than a narrower guess.
+    authErrorMarkers: [
+      "not logged in",
+      "login",
+      "authenticate",
+      "api key",
+      "unauthorized",
+      "401",
+    ],
+    // A genuine one-shot CLI subcommand (verified via `kimi --help`'s
+    // Commands list), not an in-session slash command — matches Codex's
+    // `codex login` / Cline's `cline auth cline-pass` terminal pattern.
+    signInCommand: "kimi login",
+    signInLabel: "Sign in / Switch account",
+    signInGuidance:
+      "Completes the Kimi Code OAuth device-code sign-in in the terminal. Whether re-running this while " +
+      "already authenticated switches accounts or just re-confirms the existing session was not verified live " +
+      "(this environment's CLI was already signed in) — check the terminal output after running it.",
+    usageUnsupportedReason:
+      "Kimi Code CLI has no non-interactive usage/quota subcommand (verified against its full `--help` command " +
+      "list: export, provider, acp, web, doctor, vis, migrate, upgrade — no usage/status command among them). " +
+      "Check usage and billing on your Moonshot AI / Kimi Code account.",
+    // Deliberate exception to the "text mode stays read-only" contract, in
+    // BOTH modes, and worse than Antigravity's/Cline's: verified live
+    // against kimi-code 0.29.2 that a bare `kimi -p "..."` (no flags at all)
+    // both wrote a file and ran an arbitrary shell command without any
+    // approval prompt, and that `--plan` cannot even be combined with
+    // `-p`/`--prompt` at all ("error: Cannot combine --prompt with --plan.",
+    // exit code 2) — so unlike Antigravity/Cline, there isn't even an
+    // unenforced read-only *flag* to pass for a one-shot run; every `-p`
+    // invocation runs identically regardless of the extension's own
+    // text/edit mode distinction.
+    permissionWarning:
+      "Every one-shot `kimi -p` run — including plan and review stages — executes file edits and shell commands " +
+      "with no approval gate at all, verified live with zero permission flags passed. Worse still, `--plan` " +
+      "cannot even be passed alongside `-p` (the CLI rejects the combination outright), so there is no read-only " +
+      "invocation shape to fall back to in either direction, unlike Antigravity's/Cline's unenforced-but-present " +
+      "`--plan`/`--dangerously-skip-permissions` flags.",
+    // Verified live (kimi-code 0.29.2, `kimi -p "..."` with piped stdin and
+    // no `--output-format` flag): stdin content is NEVER read in prompt
+    // mode — the model reported "no stdin content arrived" even with a
+    // clear instruction piped in. `-p`/`--prompt` is the CLI's ONLY prompt
+    // input mechanism, so the prompt must be an argv element; per the
+    // "argv" contract this requires useShell: false, which in turn requires
+    // the native-installer executable (see installHint) rather than an npm
+    // .cmd shim.
+    promptTransport: "argv",
+    useShell: false,
+    // No `--prompt-file`-style flag exists (verified via `kimi --help`), so
+    // unlike Antigravity's file-transport escape hatch, a prompt here is
+    // hard-capped by the OS single-command-line length ceiling (~32K chars
+    // on Windows). This is a real, user-facing limitation: a large context
+    // pack that fits other providers' stdin/file transports can fail here
+    // with a clear cliPromptTooLarge error rather than a silent truncation.
+    // 20,000 UTF-8 bytes leaves headroom for the other argv elements and
+    // shell/OS overhead within Windows's ~32,767-character command-line cap.
+    maxArgvPromptBytes: 20_000,
+    // Model IDs are "<alias>" values straight out of `kimi provider list
+    // --json`'s "models" map (e.g. "kimi-code/k3") — verified live that a
+    // bare "k3" is rejected ("Model \"k3\" is not configured in
+    // config.toml") while the full alias works. No CLI default fallback
+    // entry is offered: unlike providers whose CLI silently uses its own
+    // default when `-m` is omitted, Kimi's config.toml already pins a
+    // `default_model`, and the extension has no way to discover what that
+    // is without an account-specific query — every choice is therefore a
+    // concrete model. Reasoning-effort selection (K3/K3-256k support
+    // low/high/max, verified live via the `KIMI_MODEL_THINKING_EFFORT`
+    // environment-variable override) is NOT wired up in this integration:
+    // it requires a per-invocation environment-variable hook this codebase's
+    // CLI transport does not currently expose, so each model runs at its own
+    // configured default_effort ("high" for both K3 variants, verified via
+    // `kimi provider list --json`). K2.7 Coding / K2.7 Coding Highspeed have
+    // no effort ladder at all (`always_thinking` capability, no
+    // `support_efforts` field) — thinking is always on for those two.
+    models: [],
+    discoverModels: discoverKimiModels,
+    usesLastMessageFile: false,
+    buildArgs(mode, model): string[] {
+      const args = ["--output-format", "text"];
+      if (mode === "edit") {
+        // Explicit even though it changes nothing observable (verified
+        // live: a bare run already executes tools with no approval gate) —
+        // defense against a future kimi-code version that starts actually
+        // enforcing this flag, matching Cline's always-explicit
+        // --auto-approve. See permissionWarning above for why text mode
+        // gets no analogous flag: --plan cannot be combined with -p at all.
+        args.push("--yolo");
+      }
+      if (model) {
+        args.push("-m", model);
+      }
+      // promptTransport: "argv" — the caller appends the prompt itself as
+      // the final argv element right after this, which must directly
+      // follow "-p" for it to be read as that flag's value.
+      args.push("-p");
       return args;
     },
   },

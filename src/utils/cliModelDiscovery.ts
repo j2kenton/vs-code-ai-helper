@@ -459,3 +459,67 @@ export async function discoverOpencodeModelsWithTimeout(
     parseOpencodeModelsOutput
   );
 }
+
+/**
+ * `kimi provider list --json`'s shape (verified live against kimi-code
+ * 0.29.2): a single JSON object with a "models" map keyed by the full
+ * "<provider>/<alias>" id, each value carrying a "displayName" field (e.g.
+ * `{"models":{"kimi-code/k3":{"displayName":"K3",...}}}`) — not an array
+ * and not opencode's repeating-text-block shape, so this is a dedicated
+ * parser rather than a reuse of parseModelListOutput/parseOpencodeVerboseModels.
+ */
+export function parseKimiModelsOutput(output: string): DiscoveredCliModel[] {
+  const trimmed = output.trim();
+  if (trimmed.length === 0) {
+    return [];
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return [];
+  }
+
+  if (!parsed || typeof parsed !== "object") {
+    return [];
+  }
+  const models = (parsed as { models?: unknown }).models;
+  if (!models || typeof models !== "object") {
+    return [];
+  }
+
+  const result: DiscoveredCliModel[] = [];
+  for (const [id, value] of Object.entries(models as Record<string, unknown>)) {
+    if (!id) {
+      continue;
+    }
+    const displayName =
+      value &&
+      typeof value === "object" &&
+      typeof (value as { displayName?: unknown }).displayName === "string" &&
+      (value as { displayName: string }).displayName.trim().length > 0
+        ? (value as { displayName: string }).displayName.trim()
+        : id;
+    result.push({ model: id, name: displayName });
+  }
+  return uniqueByModel(result);
+}
+
+export async function discoverKimiModels(command: string): Promise<
+  DiscoveredCliModel[]
+> {
+  return discoverKimiModelsWithTimeout(command, 30_000);
+}
+
+export async function discoverKimiModelsWithTimeout(
+  command: string,
+  timeoutMs: number
+): Promise<DiscoveredCliModel[]> {
+  return runCliModelDiscovery(
+    command,
+    ["provider", "list", "--json"],
+    timeoutMs,
+    parseKimiModelsOutput
+  );
+}

@@ -264,8 +264,14 @@ void describe("provider CLI contracts", () => {
       // live — see its buildArgs comment) does not gate the tool that
       // matters, so nothing in PERMISSION_BYPASS_FLAGS appears in its
       // textArgs at all. The signal here has to come from the provider
-      // declaring permissionWarning itself.
-      const isKnownException = bypassed.length > 0 || provider.id === "cline-cli";
+      // declaring permissionWarning itself. Kimi is a third: its text mode
+      // passes NO flag at all (verified live: `--plan` cannot even be
+      // combined with `-p`), which is even less detectable via a flag
+      // literal than Cline's case, so it needs the same explicit exception.
+      const isKnownException =
+        bypassed.length > 0 ||
+        provider.id === "cline-cli" ||
+        provider.id === "kimi-cli";
       if (!isKnownException) {
         assert.strictEqual(
           provider.permissionWarning,
@@ -310,6 +316,16 @@ void describe("provider CLI contracts", () => {
     );
     assert.match(cline.permissionWarning, /--plan/);
     assert.match(cline.permissionWarning, /run_commands/);
+
+    // Same guard for Kimi: its warning must name the mechanism (that
+    // --plan cannot even be combined with -p), not just exist.
+    const kimi = getCliProvider("kimi-cli");
+    assert.ok(
+      kimi?.permissionWarning,
+      "expected Kimi Code CLI to carry a permission warning"
+    );
+    assert.match(kimi.permissionWarning, /--plan/);
+    assert.match(kimi.permissionWarning, /-p/);
   });
 
   void it("Codex model variants map to base model plus reasoning config", () => {
@@ -608,6 +624,7 @@ void describe("provider CLI contracts", () => {
       "kiro-cli": { command: "kiro-cli logout; kiro-cli login" },
       "opencode-cli": { command: "opencode" },
       "cline-cli": { command: "cline auth cline-pass" },
+      "kimi-cli": { command: "kimi login" },
     };
 
     for (const provider of CLI_PROVIDERS) {
@@ -745,6 +762,10 @@ void describe("provider CLI contracts", () => {
       "opencode-zen": { kind: "unsupported" },
       "opencode-go": { kind: "unsupported" },
       "cline-cli": { kind: "unsupported" },
+      // Kimi Code CLI has no non-interactive usage/quota subcommand at all
+      // (verified against its full --help command list) — see
+      // usageUnsupportedReason on the kimi-cli provider definition.
+      "kimi-cli": { kind: "unsupported" },
     };
     for (const entry of PROVIDER_ACCOUNT_ENTRIES) {
       const expected = expectations[entry.id];

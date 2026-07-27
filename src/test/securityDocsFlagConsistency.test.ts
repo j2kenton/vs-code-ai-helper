@@ -26,6 +26,7 @@ const EDIT_MODE_FLAG_NAMES: Readonly<Record<string, string>> = {
   "antigravity-cli": "--dangerously-skip-permissions",
   "opencode-cli": "--agent",
   "cline-cli": "--auto-approve",
+  "kimi-cli": "--yolo",
 };
 
 // Which flag name each provider's text mode uses to stay read-only, quoted
@@ -40,7 +41,10 @@ const EDIT_MODE_FLAG_NAMES: Readonly<Record<string, string>> = {
 // real read-only boundary (verified live: a shell command still wrote a
 // file with `--plan` set), which is exactly what the Cline README note
 // exists to document, so it's included here for the same reason
-// antigravity is.
+// antigravity is. kimi-cli is deliberately absent too, same as gemini-cli,
+// but for the opposite reason: its text mode passes no flag at all because
+// `--plan` cannot even be combined with `-p` (verified live) — there is no
+// text-mode flag of any kind for README/SECURITY.md to quote.
 const TEXT_MODE_FLAG_NAMES: Readonly<Partial<Record<string, string>>> = {
   "claude-cli": "--permission-mode",
   "codex-cli": "--sandbox",

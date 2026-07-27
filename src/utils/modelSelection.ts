@@ -1152,6 +1152,22 @@ const SEEDED_CLI_MODELS: Readonly<
   // discoverOpencodeModelsWithTimeout and re-pasting its output here.
   "opencode-cli": createSeededOpencodeModels(),
   "cline-cli": createSeededClineModels(),
+  // Snapshot of `kimi provider list --json`'s "models" map (kimi-code
+  // 0.29.2, captured 2026-07-27 against the managed `kimi-code` OAuth
+  // provider) — see parseKimiModelsOutput in cliModelDiscovery.ts, which
+  // produces this exact same shape from a live CLI call. K2.7 Coding /
+  // K2.7 Coding Highspeed have no reasoning-effort ladder (always-on
+  // thinking); K3 / K3-256k support low/high/max but that per-invocation
+  // choice isn't wired up here — see the models comment in providers.ts.
+  "kimi-cli": [
+    { model: "kimi-code/kimi-for-coding", name: "K2.7 Coding" },
+    {
+      model: "kimi-code/kimi-for-coding-highspeed",
+      name: "K2.7 Coding Highspeed",
+    },
+    { model: "kimi-code/k3-256k", name: "K3-256k" },
+    { model: "kimi-code/k3", name: "K3" },
+  ],
 };
 
 function createSeededCliModelCache(): Map<
