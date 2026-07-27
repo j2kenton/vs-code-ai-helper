@@ -1203,18 +1203,19 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     // BOTH modes, and worse than Antigravity's/Cline's: verified live
     // against kimi-code 0.29.2 that a bare `kimi -p "..."` (no flags at all)
     // both wrote a file and ran an arbitrary shell command without any
-    // approval prompt, and that `--plan` cannot even be combined with
-    // `-p`/`--prompt` at all ("error: Cannot combine --prompt with --plan.",
-    // exit code 2) — so unlike Antigravity/Cline, there isn't even an
-    // unenforced read-only *flag* to pass for a one-shot run; every `-p`
+    // approval prompt, and that `-p`/`--prompt` rejects ALL of `--plan`,
+    // `--yolo`, AND `--auto` outright (each its own OptionConflictError,
+    // e.g. "error: Cannot combine --prompt with --plan.", exit code 1/2) —
+    // so unlike Antigravity/Cline, there isn't even an unenforced
+    // permission *flag* of any kind to pass for a one-shot run; every `-p`
     // invocation runs identically regardless of the extension's own
-    // text/edit mode distinction.
+    // text/edit mode distinction (see buildArgs below).
     permissionWarning:
-      "Every one-shot `kimi -p` run — including plan and review stages — executes file edits and shell commands " +
-      "with no approval gate at all, verified live with zero permission flags passed. Worse still, `--plan` " +
-      "cannot even be passed alongside `-p` (the CLI rejects the combination outright), so there is no read-only " +
-      "invocation shape to fall back to in either direction, unlike Antigravity's/Cline's unenforced-but-present " +
-      "`--plan`/`--dangerously-skip-permissions` flags.",
+      "Every one-shot `kimi -p` run — implementation, plan, and review stages alike — executes file edits and " +
+      "shell commands with no approval gate at all, verified live with zero permission flags passed. Worse " +
+      "still, none of `--plan`, `--yolo`, or `--auto` can even be passed alongside `-p` (the CLI rejects each " +
+      "combination outright), so there is no permission flag of any kind to fall back to in either direction, " +
+      "unlike Antigravity's/Cline's unenforced-but-present `--dangerously-skip-permissions`/`--auto-approve` flags.",
     // Verified live (kimi-code 0.29.2, `kimi -p "..."` with piped stdin and
     // no `--output-format` flag): stdin content is NEVER read in prompt
     // mode — the model reported "no stdin content arrived" even with a
@@ -1254,17 +1255,19 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     models: [],
     discoverModels: discoverKimiModels,
     usesLastMessageFile: false,
-    buildArgs(mode, model): string[] {
+    buildArgs(_mode, model): string[] {
+      // mode is deliberately NOT branched on for a permission flag here —
+      // unlike every other provider in this file. Verified live against
+      // kimi-code 0.29.2 that `-p`/`--prompt` rejects ALL THREE of
+      // `--yolo`, `--auto`, AND `--plan` outright (each throws its own
+      // OptionConflictError, e.g. "Cannot combine --prompt with --yolo.",
+      // exit code 1) — confirmed both live and in the CLI's own bundled
+      // source (dist/main.mjs's buildPromptModeOptions validation). So
+      // there is no flag of any kind this integration can pass alongside
+      // `-p` for either mode: edit mode gets the exact same args as text
+      // mode, both already running with full unattended tool access (see
+      // permissionWarning above).
       const args = ["--output-format", "text"];
-      if (mode === "edit") {
-        // Explicit even though it changes nothing observable (verified
-        // live: a bare run already executes tools with no approval gate) —
-        // defense against a future kimi-code version that starts actually
-        // enforcing this flag, matching Cline's always-explicit
-        // --auto-approve. See permissionWarning above for why text mode
-        // gets no analogous flag: --plan cannot be combined with -p at all.
-        args.push("--yolo");
-      }
       if (model) {
         args.push("-m", model);
       }

@@ -17,8 +17,9 @@ import { CLI_PROVIDERS, type CliProviderDefinition } from "../runners/providers"
 
 // Which flag name each provider's edit mode uses to grant permissions.
 // Adding a CLI_PROVIDERS entry without a matching line here fails the test
-// below instead of silently leaving that provider unchecked.
-const EDIT_MODE_FLAG_NAMES: Readonly<Record<string, string>> = {
+// below instead of silently leaving that provider unchecked — kimi-cli is
+// the sole deliberate exception, via KIMI_CLI_NO_PERMISSION_FLAG below.
+const EDIT_MODE_FLAG_NAMES: Readonly<Partial<Record<string, string>>> = {
   "claude-cli": "--permission-mode",
   "codex-cli": "--sandbox",
   "gemini-cli": "--approval-mode",
@@ -26,8 +27,16 @@ const EDIT_MODE_FLAG_NAMES: Readonly<Record<string, string>> = {
   "antigravity-cli": "--dangerously-skip-permissions",
   "opencode-cli": "--agent",
   "cline-cli": "--auto-approve",
-  "kimi-cli": "--yolo",
 };
+
+// kimi-cli has no permission flag to quote in EITHER mode, unlike every
+// other provider here (even Antigravity/Cline at least have an unenforced
+// flag to name) — verified live against kimi-code 0.29.2 that `-p`/`--prompt`
+// rejects `--yolo`, `--auto`, AND `--plan` outright, each its own
+// OptionConflictError. buildArgs therefore emits identical args for both
+// modes (see its comment in providers.ts), so there is nothing here for
+// DISCLAIMER.md/SECURITY.md to quote as an edit-mode grant either.
+const KIMI_CLI_NO_PERMISSION_FLAG = "kimi-cli";
 
 // Which flag name each provider's text mode uses to stay read-only, quoted
 // in README.md's provider table/notes. gemini-cli is deliberately absent:
@@ -137,6 +146,9 @@ void test("DISCLAIMER.md and SECURITY.md quote each provider's actual edit-mode 
   const security = nodeFs.readFileSync(resolveProjectFile("SECURITY.md"), "utf8");
 
   for (const def of CLI_PROVIDERS) {
+    if (def.id === KIMI_CLI_NO_PERMISSION_FLAG) {
+      continue;
+    }
     const flagText = permissionFlagText(def, "edit", EDIT_MODE_FLAG_NAMES);
     assertDocQuotesFlag(disclaimer, "DISCLAIMER.md", def.id, flagText);
     assertDocQuotesFlag(security, "SECURITY.md", def.id, flagText);

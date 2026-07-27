@@ -60,8 +60,7 @@ This is an in-process software control — it does not prevent a user who has co
 
 **Kimi Code CLI (all modes, not just implementation, and with no read-only flag at all):**
 
-- Kimi runs with `--yolo` for implementation (edit mode) — the CLI's own flag for auto-approving regular tool calls.
-- Unlike every other CLI here, text mode (plan/review) passes **no permission flag whatsoever**: verified live against kimi-code 0.29.2 that `--plan` cannot even be combined with `-p`/`--prompt` (`error: Cannot combine --prompt with --plan.`, exit code 2). This is stronger than Antigravity's/Cline's unenforced-but-present flags — there is no read-only invocation shape to pass at all.
+- Unlike every other CLI here, **no mode passes any permission flag at all**: verified live against kimi-code 0.29.2 that `-p`/`--prompt` rejects `--plan`, `--yolo`, AND `--auto` outright, each its own `OptionConflictError` (e.g. `error: Cannot combine --prompt with --plan.`). Implementation and plan/review runs use identical arguments. This is stronger than Antigravity's/Cline's unenforced-but-present flags — there is no permission flag of any kind to pass.
 - Also verified live: a bare `kimi -p "..."` with **zero** permission flags still wrote a file and ran an arbitrary shell command without any approval prompt — headless prompt-mode runs are unconditionally auto-approved regardless of any flag.
 - Kimi is **off by default**; enabling it is an explicit opt-in, and Provider Selection shows this risk before you enable it.
 
@@ -118,7 +117,7 @@ Eligibility rules for open editors included in provider-bound context packs:
 - CLI sandbox flags (Claude `acceptEdits`, Codex `workspace-write`, Gemini `auto_edit`, Kiro `--trust-all-tools`, opencode `--agent build`) do not prevent the model from issuing shell commands that the CLI itself approves; behaviour depends on the vendor CLI's own policy.
 - Antigravity has no sandbox flag to begin with: `--dangerously-skip-permissions` runs in every mode, so its plan and review runs carry implementation-level file-modification risk. This is a deliberate, accepted exception — see the Antigravity CLI section above and the Antigravity note in the README.
 - Cline's `--plan` flag is a system-prompt instruction, not an enforced permission boundary: its shell-command tool stays available and auto-approved in every mode, so plan and review runs carry the same file-modification risk as an implementation run if a prompt causes the model to use it. This is a deliberate, accepted exception — see the Cline CLI section above and the Cline note in the README.
-- Kimi Code CLI has no permission flag of any kind for plan/review runs — `--plan` cannot even be passed alongside `-p` — so those runs carry the same file-modification and shell-execution risk as an implementation run. This is a deliberate, accepted exception — see the Kimi CLI section above and the Kimi note in the README.
+- Kimi Code CLI has no permission flag of any kind in ANY mode — `-p`/`--prompt` rejects `--plan`, `--yolo`, and `--auto` alike — so plan/review runs carry the same file-modification and shell-execution risk as an implementation run. This is a deliberate, accepted exception — see the Kimi CLI section above and the Kimi note in the README.
 - There is no token-spending ceiling or cost estimate. Users are responsible for their own provider costs.
 - Run logs in `runs/` contain full prompt content. If pushed to a remote repository, that content becomes remotely accessible.
 - The git binary on PATH is trusted implicitly. Ensure your environment's PATH is not compromised.
