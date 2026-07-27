@@ -2,7 +2,13 @@ import * as vscode from "vscode";
 import * as path from "path";
 import { TaskInventory } from "../state/taskInventory";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
-import { STAGE_DISPLAY_NAMES, TaskStage, RUNS_DIRNAME } from "../types/taskProgress";
+import {
+  PLAN_FILENAME,
+  STAGE_ARTIFACT_FILENAMES,
+  STAGE_DISPLAY_NAMES,
+  TaskStage,
+  RUNS_DIRNAME,
+} from "../types/taskProgress";
 import { IncompleteTask } from "../utils/taskProgressUtils";
 import { resolveFreshModelForStage } from "../utils/modelSelection";
 import {
@@ -15,7 +21,12 @@ import { checkAndConfirmPromptSize } from "../utils/promptSizeGuard";
 import { ChatViewProvider } from "../views/chatView";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { runTrackedOperation } from "../utils/taskOperations";
-import { safeOpenTextDocument, stripAttributionHeaders, writeTextFile } from "../utils/fileUtils";
+import {
+  readTextIfExists,
+  safeOpenTextDocument,
+  stripAttributionHeaders,
+  writeTextFile,
+} from "../utils/fileUtils";
 import { executeProposedAction } from "../utils/globalAssistantActions";
 import { PendingOperationsStore } from "../state/pendingOperationsStore";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
@@ -216,9 +227,48 @@ function describeStageActionsForPrompt(): string {
  * through anyway.
  */
 export function buildStageResponsePrompt(
-  stageName: string, taskName: string, _artifactPath: string, contextPack: string, message: string, conversation = ""
+  stageName: string, taskName: string, taskArtifacts: string, contextPack: string, message: string, conversation = ""
 ): string {
-  return `You are answering a user question about the ${stageName} stage for task ${taskName}.\n\nDo not invoke tools or propose that code changes were applied. If the user asks you to make a code change, tell them to use the stage action that applies it explicitly instead. However, the user may ask you to update this task's own markdown files (its task description, plan, or a review file) — this is not a file-edit action and uses no edit or write tool, so it is unaffected by any read-only or plan-mode restriction on your tool use: you are only composing text in your reply, and a separate already-trusted process outside this conversation reads that text and applies it on your behalf, the same as if you were dictating a paragraph for someone else to type. To draft an update, put the file's full new content, and nothing else, wrapped in \`[[UPDATE_FILE:relative-filename.md]]\`...\`[[/UPDATE_FILE]]\`, using a path relative to this task's own folder. Only one file may be drafted per response, only \`.md\` files inside this task's folder may be targeted this way, and you must never target a source code file. You may also run this task's own stage actions when the user asks for one: end your response with a single \`[[ACTION:<actionId>]]\` envelope (the same typed action protocol the global assistant uses; the legacy \`[[STAGE_ACTION:<actionId>]]\` form is also accepted) and the extension will confirm with the user and run it. Available action ids: ${describeStageActionsForPrompt()}. Propose at most one action per response, only when the user clearly asked for it — never speculatively. For other task-lifecycle requests (pausing, archiving, pinning, renaming, running or fast-forwarding reviews, …), point the user at the Global Assistant chat, which can run those. Give a concise, useful answer alongside any update or action. If you need clarification before the task can proceed, end with a single \`[[QUESTION]]your question[[/QUESTION]]\` envelope. Do not put task output in that envelope.\n\nConversation so far:\n${conversation.slice(-12000)}\n\nTask context:\n${contextPack.slice(0, 30000)}\n\nUser message:\n${message}`;
+  const artifactsSection = taskArtifacts.trim().length > 0
+    ? `\n\nTask's plan and current stage artifact (always included, regardless of open editor tabs):\n${taskArtifacts}`
+    : "";
+  return `You are answering a user question about the ${stageName} stage for task ${taskName}.\n\nDo not invoke tools or propose that code changes were applied. If the user asks you to make a code change, tell them to use the stage action that applies it explicitly instead. However, the user may ask you to update this task's own markdown files (its task description, plan, or a review file) — this is not a file-edit action and uses no edit or write tool, so it is unaffected by any read-only or plan-mode restriction on your tool use: you are only composing text in your reply, and a separate already-trusted process outside this conversation reads that text and applies it on your behalf, the same as if you were dictating a paragraph for someone else to type. To draft an update, put the file's full new content, and nothing else, wrapped in \`[[UPDATE_FILE:relative-filename.md]]\`...\`[[/UPDATE_FILE]]\`, using a path relative to this task's own folder. Only one file may be drafted per response, only \`.md\` files inside this task's folder may be targeted this way, and you must never target a source code file. You may also run this task's own stage actions when the user asks for one: end your response with a single \`[[ACTION:<actionId>]]\` envelope (the same typed action protocol the global assistant uses; the legacy \`[[STAGE_ACTION:<actionId>]]\` form is also accepted) and the extension will confirm with the user and run it. Available action ids: ${describeStageActionsForPrompt()}. Propose at most one action per response, only when the user clearly asked for it — never speculatively. For other task-lifecycle requests (pausing, archiving, pinning, renaming, running or fast-forwarding reviews, …), point the user at the Global Assistant chat, which can run those. Give a concise, useful answer alongside any update or action. If you need clarification before the task can proceed, end with a single \`[[QUESTION]]your question[[/QUESTION]]\` envelope. Do not put task output in that envelope.\n\nConversation so far:\n${conversation.slice(-12000)}${artifactsSection}\n\nTask context:\n${contextPack.slice(0, 30000)}\n\nUser message:\n${message}`;
+}
+
+/**
+ * Reads the task's approved plan plus the current stage's own artifact
+ * (e.g. the review file for a review stage) directly from the task folder,
+ * so Chat With AI can always answer questions that reference them — instead
+ * of depending on generateContextPack's ambient open-editor-tab inclusion,
+ * which silently omits them whenever the user hasn't happened to have that
+ * file open. Skips a file that doesn't exist yet (e.g. plan.md before the
+ * Plan stage), and never reads the same file twice (targetStage === "plan"
+ * means the stage artifact IS plan.md).
+ */
+async function readStageArtifactsForChat(
+  taskFolderUri: vscode.Uri,
+  targetStage: TaskStage
+): Promise<string> {
+  const sections: string[] = [];
+
+  const planContent = await readTextIfExists(
+    vscode.Uri.joinPath(taskFolderUri, PLAN_FILENAME)
+  );
+  if (planContent?.trim()) {
+    sections.push(`### ${PLAN_FILENAME} (approved plan)\n\n${planContent}`);
+  }
+
+  const stageFilename = STAGE_ARTIFACT_FILENAMES[targetStage];
+  if (stageFilename && stageFilename !== PLAN_FILENAME) {
+    const stageContent = await readTextIfExists(
+      vscode.Uri.joinPath(taskFolderUri, stageFilename)
+    );
+    if (stageContent?.trim()) {
+      sections.push(`### ${stageFilename} (current stage artifact)\n\n${stageContent}`);
+    }
+  }
+
+  return sections.join("\n\n");
 }
 
 function splitQuestionEnvelope(text: string): { answer: string; question?: string } {
@@ -410,7 +460,8 @@ export async function chatWithStage(
       .slice(-20)
       .map(entry => `${entry.role.toUpperCase()}: ${entry.text}`)
       .join("\n");
-    const prompt = buildStageResponsePrompt(STAGE_DISPLAY_NAMES[targetStage], task.folderName, "",
+    const taskArtifacts = await readStageArtifactsForChat(taskFolderUri, targetStage);
+    const prompt = buildStageResponsePrompt(STAGE_DISPLAY_NAMES[targetStage], task.folderName, taskArtifacts,
       await generateContextPack(taskFolderUri, workspaceFolder.uri), message, conversation);
     const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel);
     if (sizeCheck === "abort" || sizeCheck === "declined") return;

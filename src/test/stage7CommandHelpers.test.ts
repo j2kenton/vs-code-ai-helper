@@ -60,6 +60,23 @@ void test("stage response prompt forbids tool calls and code edits, but permits 
   assert.match(prompt, /never target a source code file/);
   assert.match(prompt, /Important repository details/);
   assert.match(prompt, /What should I change\?/);
+  // The task's plan/current-stage artifact content is always spliced in as
+  // its own labeled section — previously accepted but silently discarded
+  // (see the taskArtifacts param's doc comment), leaving Chat With AI
+  // dependent on the user happening to have the file open as an editor tab.
+  assert.match(prompt, /Task's plan and current stage artifact/);
+  assert.match(prompt, /plans\/2026-07-13_task_2\/plan\.md/);
+});
+
+void test("stage response prompt omits the artifacts section when there is nothing to include", () => {
+  const prompt = buildStageResponsePrompt(
+    "Plan",
+    "task-42",
+    "",
+    "# Context",
+    "hello"
+  );
+  assert.doesNotMatch(prompt, /Task's plan and current stage artifact/);
 });
 
 void test("resolveStageResponseScopePath maps each stage to its one workspace-relative artifact", () => {
