@@ -1,0 +1,71 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://ensemble.ai/schemas/structured-answer-v1.schema.json",
+  "title": "StructuredAnswerV1",
+  "description": "The structured-answer wire format (plan §3.6). An answer submission is a JSON array of 1-16 records — exactly one per question, matched by questionId. Unknown properties are rejected; questionId and every selected option id use the same bounded ASCII stable-identifier pattern as the question schema. Constraints draft-07 cannot express — matching each record to its question's kind, skip/blank/selection validation against the question set, and the 128 KiB canonical-byte limit — are enforced by the runtime decoder and validator (src/types/structuredQuestionV1.ts) and mechanically checked, together with this schema, by scripts/verifyStructuredQuestions.mjs (verify:structured-questions).",
+  "type": "array",
+  "minItems": 1,
+  "maxItems": 16,
+  "items": {
+    "oneOf": [
+      {
+        "title": "skipped",
+        "type": "object",
+        "properties": {
+          "questionId": { "$ref": "#/definitions/stableId" },
+          "kind": { "type": "string", "enum": ["text", "singleChoice", "multipleChoice"] },
+          "state": { "type": "string", "const": "skipped" }
+        },
+        "required": ["questionId", "kind", "state"],
+        "additionalProperties": false
+      },
+      {
+        "title": "text answered",
+        "type": "object",
+        "properties": {
+          "questionId": { "$ref": "#/definitions/stableId" },
+          "kind": { "type": "string", "const": "text" },
+          "state": { "type": "string", "const": "answered" },
+          "value": { "type": "string" }
+        },
+        "required": ["questionId", "kind", "state", "value"],
+        "additionalProperties": false
+      },
+      {
+        "title": "singleChoice answered",
+        "type": "object",
+        "properties": {
+          "questionId": { "$ref": "#/definitions/stableId" },
+          "kind": { "type": "string", "const": "singleChoice" },
+          "state": { "type": "string", "const": "answered" },
+          "selectedOptionId": { "$ref": "#/definitions/stableId" }
+        },
+        "required": ["questionId", "kind", "state", "selectedOptionId"],
+        "additionalProperties": false
+      },
+      {
+        "title": "multipleChoice answered",
+        "type": "object",
+        "properties": {
+          "questionId": { "$ref": "#/definitions/stableId" },
+          "kind": { "type": "string", "const": "multipleChoice" },
+          "state": { "type": "string", "const": "answered" },
+          "selectedOptionIds": {
+            "type": "array",
+            "maxItems": 32,
+            "uniqueItems": true,
+            "items": { "$ref": "#/definitions/stableId" }
+          }
+        },
+        "required": ["questionId", "kind", "state", "selectedOptionIds"],
+        "additionalProperties": false
+      }
+    ]
+  },
+  "definitions": {
+    "stableId": {
+      "type": "string",
+      "pattern": "^[\\x21-\\x7E]{1,128}$"
+    }
+  }
+}

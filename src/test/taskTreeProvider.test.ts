@@ -257,8 +257,10 @@ void describe("StageNode — done review stage icon", () => {
       "check",
       `Expected icon "check" for done review stage, got "${icon.id}"`
     );
-    // The color must be the green theme color
-    const color = icon.color as import("vscode").ThemeColor;
+    // The color must be the green theme color. The pinned 1.93 ThemeColor
+    // declaration is opaque (no `id` member), so read the stub's id through a
+    // structural cast.
+    const color = icon.color as unknown as { id: string };
     assert.strictEqual(
       color.id,
       "charts.green",
@@ -285,7 +287,7 @@ void describe("StageNode — done review stage icon", () => {
       "arrow-right",
       `Expected plain "arrow-right" for current stage regardless of readiness, got "${icon.id}"`
     );
-    const color = icon.color as import("vscode").ThemeColor;
+    const color = icon.color as unknown as { id: string };
     assert.strictEqual(color.id, "charts.blue");
   });
 

@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import { TaskInventory } from "../state/taskInventory";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { NotificationRouter } from "../utils/notificationRouter";
+import { assertLegacyAiRouteAllowedV0 } from "../services/legacyAiActionSafetyGateV0";
 
 /**
  * Apply high-level review changes. This command provides a concrete entry point
@@ -12,6 +13,10 @@ export async function applyHighLevelReviewChanges(
   inventory: TaskInventory,
   explicitArg?: { canonicalId?: string; taskFolderPath?: string }
 ): Promise<void> {
+  // Concrete alias route of the apply-review action family (plan §1.3): the
+  // gate must run before this wrapper's own task-state reads, not only inside
+  // the downstream applyReviewWithAI handler it delegates to.
+  assertLegacyAiRouteAllowedV0("applyReview.v1");
   // First try with allowPaused: true to detect paused tasks
   const pausedCheck = await resolveTaskContext(inventory, explicitArg, {
     allowPaused: true,

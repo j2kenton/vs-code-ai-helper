@@ -1,0 +1,33 @@
+{
+  "transition": "nextStage",
+  "now": "2026-07-10T09:00:00.000Z",
+  "input": {
+    "taskFolder": "2026-07-01_task_1",
+    "currentStage": "impl",
+    "status": "active",
+    "ownership": {
+      "metaRoot": "c:/proj/.vscode/ai-helper-meta",
+      "projectRoot": "c:/proj",
+      "boundAt": "2026-07-01T10:00:00.000Z"
+    },
+    "createdAt": "2026-07-01T10:00:00.000Z",
+    "updatedAt": "2026-07-02T11:30:00.000Z",
+    "completedStages": ["desc", "plan", "plan-high-review", "plan-low-review"],
+    "legacyNote": "opaque survives"
+  },
+  "expected": {
+    "ensembleProgressVersion": 1,
+    "taskFolder": "2026-07-01_task_1",
+    "currentStage": "impl-high-review",
+    "status": "active",
+    "ownership": {
+      "metaRoot": "c:/proj/.vscode/ai-helper-meta",
+      "projectRoot": "c:/proj",
+      "boundAt": "2026-07-01T10:00:00.000Z"
+    },
+    "createdAt": "2026-07-01T10:00:00.000Z",
+    "updatedAt": "2026-07-10T09:00:00.000Z",
+    "completedStages": ["desc", "plan", "plan-high-review", "plan-low-review", "impl"],
+    "legacyNote": "opaque survives"
+  }
+}

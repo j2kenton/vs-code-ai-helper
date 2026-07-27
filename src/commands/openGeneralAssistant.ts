@@ -25,7 +25,8 @@ import { stripAttributionHeaders } from "../utils/fileUtils";
 import { NotificationRouter } from "../utils/notificationRouter";
 
 /** Stable identity for the global assistant's own, fully separate history. */
-export const GLOBAL_ASSISTANT_CANONICAL_ID = "global-assistant";
+import { GLOBAL_ASSISTANT_CANONICAL_ID } from "../utils/chatHistoryConstants";
+export { GLOBAL_ASSISTANT_CANONICAL_ID };
 const GLOBAL_ASSISTANT_DIRNAME = "global-assistant";
 
 /**

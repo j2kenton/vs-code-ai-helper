@@ -3,6 +3,7 @@ import { TaskInventory } from "../state/taskInventory";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { NotificationRouter } from "../utils/notificationRouter";
+import { assertLegacyAiRouteAllowedV0 } from "../services/legacyAiActionSafetyGateV0";
 
 /**
  * Keyboard shortcut router: runs Fast Forward Review against the current
@@ -12,6 +13,10 @@ export async function fastForwardCurrentTaskReview(
   inventory: TaskInventory,
   currentTaskStore: CurrentTaskStore
 ): Promise<void> {
+  // Concrete alias route of the fast-forward action family (plan §1.3): the
+  // gate must run before this wrapper's own task-state read, not only inside
+  // the downstream fastForwardReviewWithAI handler it delegates to.
+  assertLegacyAiRouteAllowedV0("fastForward.v1");
   const resolvedTask = await resolveTaskContext(
     inventory,
     undefined,

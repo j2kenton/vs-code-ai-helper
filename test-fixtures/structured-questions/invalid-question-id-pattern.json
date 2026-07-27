@@ -1,0 +1,3 @@
+[
+  { "questionId": "has interior spaces", "kind": "text", "prompt": "Q", "required": true, "allowBlank": false, "maxLength": 10 }
+]

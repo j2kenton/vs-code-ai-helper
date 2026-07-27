@@ -19,7 +19,9 @@ import { normalizePath } from "../utils/taskRoot";
 import {
   deactivateNotificationRouter,
   initNotificationRouter,
+  StatusSurface,
 } from "../utils/notificationRouter";
+import { LegacyCreatingStartupGateV0 } from "../state/legacyCreatingStartupGateV0";
 import { safeRemoveDir } from "./testFsUtils";
 
 function installConfigStub(configuredTaskRoot: string): { restore: () => void } {
@@ -276,4 +278,75 @@ void describe("startNewTask — active/paused lifecycle", () => {
       harness.restore();
     }
   });
+});
+
+void describe("startNewTask — legacy `creating` footprints are never auto-promoted", () => {
+  void it(
+    "leaves a stuck legacy creating folder untouched and warns instead of promoting it to paused",
+    async () => {
+      const harness = installHarness();
+      const entries: Array<{
+        message: string;
+        level: string;
+        filePath?: string;
+      }> = [];
+      const capturingSurface: StatusSurface = {
+        addEntry(message, level, filePath): void {
+          entries.push({ message, level, filePath });
+        },
+      };
+      LegacyCreatingStartupGateV0.resetForTests();
+      try {
+        // Seed a folder stuck in "creating" (as if the extension host died
+        // mid-creation) with a task.md already written — the exact shape the
+        // OLD recoverCompletedTaskCreations used to silently promote to
+        // "paused" the moment any other startNewTask ran.
+        const stuckTaskPath = path.join(harness.metaFolderPath, "2026-01-01_task_1");
+        fs.mkdirSync(stuckTaskPath, { recursive: true });
+        const stuckProgress: TaskProgress = {
+          taskFolder: "2026-01-01_task_1",
+          currentStage: "desc",
+          status: "creating",
+          createdAt: "2026-01-01T00:00:00.000Z",
+          updatedAt: "2026-01-01T00:00:00.000Z",
+        };
+        fs.writeFileSync(
+          path.join(stuckTaskPath, "task-progress.json"),
+          JSON.stringify(stuckProgress, null, 2)
+        );
+        fs.writeFileSync(path.join(stuckTaskPath, "task.md"), "# Task\n");
+
+        // installHarness() already called initNotificationRouter with a
+        // no-op surface; swap in one that records entries for this test.
+        initNotificationRouter(capturingSurface);
+
+        const folderName = await startNewTask(
+          harness.inventory,
+          vscode.Uri.file(harness.workspaceRoot),
+          harness.currentTaskStore
+        );
+        assert.ok(folderName, "a new task must still be created alongside the stuck one");
+        assert.notEqual(folderName, "2026-01-01_task_1", "the new task must be a distinct folder");
+
+        const stuckAfter = readProgress(stuckTaskPath);
+        assert.equal(
+          stuckAfter.status,
+          "creating",
+          "the stuck folder's status must be left exactly as found — no implicit promotion to paused"
+        );
+
+        const warning = entries.find((e) => e.message.includes("2026-01-01_task_1"));
+        assert.ok(warning, "expected a warning surfaced about the stuck creating folder");
+        assert.equal(warning?.level, "warning");
+        assert.equal(
+          warning?.filePath,
+          path.join(stuckTaskPath, "task.md"),
+          "the read-only Open affordance must point at the stuck folder's task.md"
+        );
+      } finally {
+        LegacyCreatingStartupGateV0.resetForTests();
+        harness.restore();
+      }
+    }
+  );
 });

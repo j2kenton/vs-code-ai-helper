@@ -26,7 +26,7 @@ import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { describe, it } from "node:test";
+import { after, describe, it } from "node:test";
 import * as vscode from "vscode";
 
 import { isUnusableAsExistingReview, nextStage, runReviewForFolder } from "../commands/reviewActions";
@@ -57,6 +57,20 @@ const gitRepoInfoModule = require("../utils/gitRepoInfo") as Record<string, unkn
 /* eslint-enable @typescript-eslint/no-var-requires */
 
 const REAL_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-publish-owner-"));
+
+// Never cleaned up before this: every run of this file left its entire
+// REAL_ROOT tree (task folders, progress files, review artifacts from every
+// `it()` below) behind in the OS temp directory permanently. Across many CI
+// and local runs that accumulates into thousands of stale directories in
+// os.tmpdir() — the kind of buildup that plausibly compounds the
+// filesystem/OS contention already suspected (not confirmed) as a
+// contributor to this file's intermittent, non-reproducible-on-demand
+// failure under the full suite's ~245 concurrently-spawned test processes.
+// `force: true` so a failed/half-written subtree from a killed run doesn't
+// turn cleanup itself into a new source of flakiness.
+after(() => {
+  fs.rmSync(REAL_ROOT, { recursive: true, force: true });
+});
 
 function makeTaskFolder(
   name: string,

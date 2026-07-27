@@ -1,0 +1,55 @@
+{
+  "taskFolder": "2026-07-01_task_2",
+  "displayName": "ff for 1 pt 2",
+  "nameIsDefault": false,
+  "currentStage": "impl",
+  "status": "active",
+  "ownership": {
+    "metaRoot": "c:/proj/.vscode/ai-helper-meta",
+    "projectRoot": "c:/proj",
+    "workspaceRoot": "c:/proj",
+    "boundAt": "2026-07-01T10:00:00.000Z",
+    "state": "resolved"
+  },
+  "createdAt": "2026-07-01T10:00:00.000Z",
+  "updatedAt": "2026-07-02T11:30:00.000Z",
+  "preImageDescription": "original description",
+  "completedStages": ["desc", "plan", "plan-high-review", "plan-low-review"],
+  "implReviewFiles": ["src/a.ts", "src/b.ts"],
+  "lintPayload": {
+    "runAt": "2026-07-02T11:00:00.000Z",
+    "passed": false,
+    "summary": "2 errors",
+    "issueCount": 2,
+    "failedChecks": [{ "command": "pnpm run lint", "exitCode": 1, "output": "2 problems" }]
+  },
+  "scheduledRun": {
+    "runAt": "2026-07-03T08:00:00.000Z",
+    "stage": "impl",
+    "leaseOwner": "window-1",
+    "leaseUntil": "2026-07-03T08:05:00.000Z"
+  },
+  "fallbackActive": { "impl": true },
+  "fallbackModelId": { "impl": "backup-model" },
+  "reviewAttemptId": "attempt-2",
+  "reviewScoreHistory": [
+    {
+      "stage": "plan-high-review",
+      "score": 8,
+      "attemptId": "attempt-1",
+      "at": "2026-07-01T12:00:00.000Z",
+      "blockerCount": 0,
+      "taskFixableCount": 0
+    }
+  ],
+  "escalation": {
+    "stage": "impl",
+    "kind": "plateau",
+    "reason": "stuck at 5.5",
+    "at": "2026-07-02T11:00:00.000Z",
+    "secondOpinionAttempted": true
+  },
+  "pinnedAt": "2026-07-01T11:00:00.000Z",
+  "publishScopePath": "packages/core",
+  "customVendorField": { "keep": ["me", "byte-identical"] }
+}

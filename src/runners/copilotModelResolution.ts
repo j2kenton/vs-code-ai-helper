@@ -3,6 +3,7 @@ import {
   parseCopilotModelSelection,
   type ParsedCopilotModelSelection,
 } from "./providers";
+import type { LmChatRequestOptionsV1 } from "../types/vscodeLmCompatV1";
 
 export interface ResolvedCopilotModel {
   ok: true;
@@ -59,10 +60,18 @@ export function resolveCopilotModel(
   return { ok: true, model, parsedModel };
 }
 
-/** Builds the modelOptions/requestOptions shared by every Copilot request. */
+/**
+ * Builds the modelOptions/requestOptions shared by every Copilot request.
+ *
+ * Returns the neutral `LmChatRequestOptionsV1` shape (plan §1.6) rather than
+ * `vscode.LanguageModelChatRequestOptions` directly: this function is called
+ * by both the simple text-completion runner and the tool-calling
+ * implementation runner, and only the latter needs the post-1.93 `tools`
+ * field, which `vscodeLmCompat.ts` attaches at the actual `sendRequest` call.
+ */
 export function buildCopilotRequestOptions(
   parsedModel: ParsedCopilotModelSelection
-): vscode.LanguageModelChatRequestOptions {
+): LmChatRequestOptionsV1 {
   const modelOptions: Record<string, unknown> = {};
   if (parsedModel.reasoningEffort) {
     modelOptions.model_reasoning_effort = parsedModel.reasoningEffort;

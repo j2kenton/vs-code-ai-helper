@@ -19,6 +19,7 @@ import { safeOpenTextDocument, stripAttributionHeaders, writeTextFile } from "..
 import { executeProposedAction } from "../utils/globalAssistantActions";
 import { PendingOperationsStore } from "../state/pendingOperationsStore";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
+import { assertLegacyAiRouteAllowedV0 } from "../services/legacyAiActionSafetyGateV0";
 
 type ChatWithStageArg =
   | { task?: IncompleteTask; stage?: TaskStage; message?: string }
@@ -347,6 +348,7 @@ export async function chatWithStage(
   explicitArg?: ChatWithStageArg,
   currentTaskStore?: CurrentTaskStore
 ): Promise<void> {
+  assertLegacyAiRouteAllowedV0("chatSend.v1");
   const { resolverArg, stage, message } = normalizeArg(explicitArg);
   const task = await resolveTaskContext(inventory, resolverArg, { allowPaused: true });
   if (!task) {

@@ -1,0 +1,5 @@
+{
+  "schemaVersion": 1,
+  "description": "Removed workflow routes (plan §1.2/§1.5): each entry records the removed route's source evidence, rationale, and the cohort that removed it. scripts/verifyWorkflowRoutes.mjs fails if a removed commandId reappears in the live registration scan. Empty until a cohort actually removes a route — no route has been removed since the route baseline was established.",
+  "removals": []
+}

@@ -15,6 +15,7 @@ import { ensureStageModelConfigured } from "../utils/modelSelection";
 import { scheduleAutomationChain } from "../utils/automationChain";
 import { cancelRunningOperationsForTask } from "../utils/taskOperations";
 import { pickReopenStage, reopenCompletedTask } from "../utils/reopenTask";
+import { LegacyCreatingStartupGateV0 } from "../state/legacyCreatingStartupGateV0";
 
 /**
  * Accepted argument shapes for setTaskStage.
@@ -89,6 +90,12 @@ export async function setTaskStage(
   node?: SetTaskStageArg,
   kind: TransitionKind = "jump"
 ): Promise<void> {
+  // Block on the startup gate's classification pass before this lifecycle
+  // command's first task-state read, so it cannot race the read-only
+  // creating-folder reconciliation extension.ts kicks off during activate()
+  // — same barrier contract as startNewTask/resumeTask (plan §1.4).
+  await LegacyCreatingStartupGateV0.waitUntilReady();
+
   const workspaceRoot = vscode.workspace.workspaceFolders?.[0];
   if (!workspaceRoot) {
     NotificationRouter.showError(

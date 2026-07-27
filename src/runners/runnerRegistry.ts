@@ -4,7 +4,14 @@ import {
   AgentRunner,
   AgentRunResult,
 } from "../types/agentRunner";
-import { CopilotLanguageModelRunner } from "./copilotLanguageModelRunner";
+import { AttemptIdV1 } from "../types/actionCorrelationV1";
+import { AgentExecutionModeV1, AgentTransportV1 } from "../types/agentExecutionV1";
+import { ProviderReservationHandleV1 } from "../types/providerReservationV1";
+import { ProviderSelectionSessionV1 } from "../services/providerSelectionPolicyV1";
+import {
+  CopilotLanguageModelRunner,
+  createCopilotLmTextTransportV1,
+} from "./copilotLanguageModelRunner";
 import {
   checkImplementationAvailability,
   ImplementationRunResult,
@@ -13,6 +20,8 @@ import {
 import {
   CliAgentRunner,
   cliCommandExists,
+  cliProviderSupportsV1StdoutCapture,
+  createCliTextTransportV1,
   runImplementationWithCli,
 } from "./cliAgentRunner";
 import {
@@ -37,6 +46,7 @@ import {
   patchTaskProgress,
 } from "../utils/taskProgressUtils";
 import { TaskStage } from "../types/taskProgress";
+import { assertNoUnauthorizedV1CorrelationV0 } from "../services/legacyAiActionSafetyGateV0";
 
 type EffectiveProvider =
   | { kind: "copilot"; model: string | undefined }
@@ -337,6 +347,7 @@ function withQuotaObservation(
     capabilities: runner.capabilities,
     isAvailable: () => runner.isAvailable(),
     async run(request, token): Promise<AgentRunResult> {
+      assertNoUnauthorizedV1CorrelationV0(request);
       const result = await runner.run(request, token);
       recordQuotaObservation(stage, modelId, result.failureKind, result.errorMessage);
       return result;
@@ -448,6 +459,7 @@ export function resolveRunnerForModel(
       isAvailable: async () =>
         (await checkRunnerAvailabilityForModel(modelId, stage)).availability,
       async run(request, token): Promise<AgentRunResult> {
+        assertNoUnauthorizedV1CorrelationV0(request);
         const runBackups = async (): Promise<AgentRunResult> => {
           const releaseReservation = (): Promise<void> =>
             releaseUnresolvedFallbackReservation(
@@ -613,6 +625,7 @@ export async function runImplementationForModel(options: {
   onBusyDetail?: (detail: string | undefined) => void;
   onWaitingForUser?: (waiting: boolean) => void;
 }): Promise<ImplementationRunResult & { runnerId: string }> {
+  assertNoUnauthorizedV1CorrelationV0(options);
   const effective = resolveEffectiveProvider(options.modelId);
 
   const run = async (selected: EffectiveProvider): Promise<ImplementationRunResult & { runnerId: string }> => {
@@ -748,4 +761,299 @@ export async function runImplementationForModel(options: {
     await releaseReservation();
   }
   return result;
+}
+
+/* ------------------------------------------------------------------------ *
+ * V1 reservation-based selection (plan §3.3/§3.4, executable-order step 5) *
+ * ------------------------------------------------------------------------ */
+
+/**
+ * A registry-selected, session-reserved provider candidate. The registry —
+ * not the caller — chose the runner/provider/model; the caller (the future
+ * action coordinator) claims the reservation through the selection session
+ * and invokes it exactly once through the execution broker.
+ */
+export interface V1ReservedProviderV1 {
+  readonly handle: ProviderReservationHandleV1;
+  /** Short display name for user-facing progress ("Copilot", "Claude Code"…). */
+  readonly providerLabel: string;
+  /**
+   * The stored (provider-qualified) model id this reservation ranks —
+   * exactly the id the registry's existing ranking policy produced.
+   */
+  readonly storedModelId: string;
+  /**
+   * Construct the transport for exactly this reservation's runner.
+   * Construction is not invocation: only the execution broker
+   * (`agentExecutionBrokerV1.ts`) invokes, after claiming the reservation,
+   * and it rejects a transport whose runnerId differs from the handle's.
+   */
+  createTransport(): AgentTransportV1;
+}
+
+export type V1ReserveNextResultV1 =
+  | { readonly kind: "reserved"; readonly reserved: V1ReservedProviderV1 }
+  | {
+      /**
+       * The next ranked candidate — primary or backup — cannot satisfy the
+       * requested mode. It is never silently bypassed: the caller's attempt
+       * has already been settled as `providerUnavailablePreInvocation`
+       * (a fallback-eligible outcome, plan §3.4: a supported runner that
+       * cannot satisfy V1 returns `providerModeUnavailable` rather than
+       * disappearing), so the skip is an explicit, auditable attempt record.
+       * The caller allocates a fresh attempt and calls `reserveNext` again
+       * to reach the next ranked candidate.
+       */
+      readonly kind: "candidateUnavailable";
+      readonly code: "providerModeUnavailable";
+      /** The ranked stored model id that could not be served. */
+      readonly storedModelId: string;
+      readonly providerLabel: string;
+      readonly runnerId: string;
+    }
+  | {
+      readonly kind: "noneRemaining";
+      /**
+       * `providerModeUnavailable`: no ranked candidate can satisfy the
+       * requested mode at all (maps to the stable coordinator outcome of the
+       * same name). `candidatesExhausted`: mode-capable candidates existed
+       * but each has already received its reservation (or been settled as an
+       * explicit unavailable attempt).
+       */
+      readonly code: "providerModeUnavailable" | "candidatesExhausted";
+    };
+
+export interface V1RunnerSelectionV1 {
+  /**
+   * Issue the single reservation for `attemptId`, bound to the next
+   * registry-ranked candidate. The selection session enforces that the
+   * attempt was allocated by the caller's session, that each attempt gets
+   * exactly one reservation, and that fallback only proceeds after a
+   * pre-response outcome — this function never invokes a provider
+   * (AC-RUNNER-04).
+   */
+  reserveNext(attemptId: AttemptIdV1): V1ReserveNextResultV1;
+}
+
+interface V1CandidateV1 {
+  readonly storedModelId: string;
+  readonly providerLabel: string;
+  readonly runnerId: string;
+  readonly providerId: ProviderId;
+  readonly nativeModelId: string | undefined;
+  readonly createTransport: () => AgentTransportV1;
+}
+
+/**
+ * Open the registry's V1 selection for one coordinator operation (plan §3.3:
+ * selection is split from invocation; plan product decisions: this registry
+ * "remains the sole source of provider/model ranking … and fallback policy,
+ * but does not invoke V1 fallback providers internally").
+ *
+ * Ranking reuses the exact legacy policy: the stage's stored primary model
+ * resolves through `resolveEffectiveProvider` (including the runner-entry
+ * disabled-provider guard), and fallback candidates come from
+ * `backupModelsForStage` — the same strategy-gated, provider-enabled,
+ * deduplicated list the legacy cascade consumes. Candidates that cannot
+ * satisfy the requested mode are rejected here, at selection time (plan
+ * §3.4: "Reject providers that cannot satisfy the requested mode"), and
+ * never silently bypassed:
+ *  - `text`: Copilot LM plus every CLI provider whose final answer is
+ *    capturable from bounded stdout (`cliProviderSupportsV1StdoutCapture`);
+ *  - `preflight`/`edit`: no provider qualifies until the request-local
+ *    Language Model tool adapter lands (plan §7/executable-order step 15).
+ *
+ * When NO ranked candidate can satisfy the mode, every `reserveNext` returns
+ * `providerModeUnavailable` for the whole selection. When a ranked candidate
+ * (the primary or a mid-list backup) cannot satisfy the mode but a later one
+ * can, `reserveNext` settles the caller's attempt as an explicit
+ * `providerUnavailablePreInvocation` outcome and returns
+ * `candidateUnavailable` naming the skipped candidate — the unavailable
+ * primary is represented as a settled attempt before any backup attempt is
+ * allocated, so fallback stays within the session's normal
+ * one-outcome-per-attempt accounting instead of hiding the skip.
+ */
+export function openV1RunnerSelection(options: {
+  session: ProviderSelectionSessionV1;
+  mode: AgentExecutionModeV1;
+  /** The stage's stored (provider-qualified) primary model id. */
+  modelId: string | undefined;
+  stage?: TaskStage;
+  /**
+   * Working directory CLI transports run in (the workspace root). Fixed at
+   * selection time by the caller — never carried inside a V1 request.
+   */
+  workspaceCwd: string;
+}): V1RunnerSelectionV1 {
+  const { session, mode, workspaceCwd } = options;
+
+  type RankedEntryV1 =
+    | { readonly supported: true; readonly candidate: V1CandidateV1 }
+    | {
+        readonly supported: false;
+        readonly storedModelId: string;
+        readonly providerLabel: string;
+        readonly runnerId: string;
+      };
+
+  const toRankedEntry = (storedModelId: string): RankedEntryV1 => {
+    const effective = resolveEffectiveProvider(storedModelId);
+    if (effective.kind === "copilot") {
+      if (mode !== "text") {
+        return {
+          supported: false,
+          storedModelId,
+          providerLabel: "Copilot",
+          runnerId: "copilot-lm",
+        };
+      }
+      const nativeModelId = effective.model;
+      return {
+        supported: true,
+        candidate: {
+          storedModelId,
+          providerLabel: "Copilot",
+          runnerId: "copilot-lm",
+          providerId: "copilot",
+          nativeModelId,
+          createTransport: () => createCopilotLmTextTransportV1({ model: nativeModelId }),
+        },
+      };
+    }
+    if (mode !== "text" || !cliProviderSupportsV1StdoutCapture(effective.def)) {
+      // CLI providers are unsupported for preflight/edit (plan product
+      // decisions), and a last-message-file CLI cannot satisfy AC-RUNNER-02
+      // ("CLI results are captured only from bounded stdout") yet. The
+      // candidate stays in the ranked list so `reserveNext` can surface it
+      // as an explicit settled attempt instead of silently bypassing it.
+      return {
+        supported: false,
+        storedModelId,
+        providerLabel: effective.def.label,
+        runnerId: effective.def.id,
+      };
+    }
+    const { def } = effective;
+    const nativeModelId = effective.model;
+    return {
+      supported: true,
+      candidate: {
+        storedModelId,
+        providerLabel: def.label,
+        runnerId: def.id,
+        providerId: def.id,
+        nativeModelId,
+        createTransport: () =>
+          createCliTextTransportV1({ def, model: nativeModelId, cwd: workspaceCwd }),
+      },
+    };
+  };
+
+  // Ranked stored ids: the primary first, then the strategy-gated backups.
+  // `resolveEffectiveProvider` throws for a disabled or unconfigured primary
+  // (the same fail-closed behavior as the legacy entry points), and
+  // `backupModelsForStage` already excludes disabled providers.
+  const rankedStoredIds: string[] = [];
+  if (options.modelId !== undefined) {
+    rankedStoredIds.push(options.modelId);
+  } else {
+    // Surface the exact legacy misconfiguration error at selection time.
+    resolveEffectiveProvider(undefined);
+  }
+  rankedStoredIds.push(...backupModelsForStage(options.stage, options.modelId));
+
+  const ranked = rankedStoredIds.map(toRankedEntry);
+  const anySupported = ranked.some((entry) => entry.supported);
+  let cursor = 0;
+
+  return {
+    reserveNext(attemptId: AttemptIdV1): V1ReserveNextResultV1 {
+      if (!anySupported) {
+        // No ranked candidate can satisfy this mode at all — the whole
+        // selection is mode-unavailable (there is nothing to fall back TO,
+        // so no per-candidate attempt accounting is warranted).
+        return { kind: "noneRemaining", code: "providerModeUnavailable" };
+      }
+      if (cursor >= ranked.length) {
+        return { kind: "noneRemaining", code: "candidatesExhausted" };
+      }
+      const entry = ranked[cursor]!;
+      cursor++;
+      if (!entry.supported) {
+        // Never silently bypass a ranked candidate (primary OR backup):
+        // record it as an explicit settled attempt with the fallback-eligible
+        // `providerUnavailablePreInvocation` outcome, so the skip is
+        // auditable in the session and the caller allocates a FRESH attempt
+        // for the next ranked candidate.
+        session.reportAttemptOutcome(attemptId, "providerUnavailablePreInvocation");
+        return {
+          kind: "candidateUnavailable",
+          code: "providerModeUnavailable",
+          storedModelId: entry.storedModelId,
+          providerLabel: entry.providerLabel,
+          runnerId: entry.runnerId,
+        };
+      }
+      const { candidate } = entry;
+      const handle = session.reserve({
+        attemptId,
+        mode,
+        runnerId: candidate.runnerId,
+        providerId: candidate.providerId,
+        modelId: candidate.storedModelId,
+      });
+      return {
+        kind: "reserved",
+        reserved: {
+          handle,
+          providerLabel: candidate.providerLabel,
+          storedModelId: candidate.storedModelId,
+          createTransport: candidate.createTransport,
+        },
+      };
+    },
+  };
+}
+
+/**
+ * Production opener for the action coordinator's provider boundary
+ * (`RunnerSelectionOpenerV1` in `taskActionCoordinatorV1.ts`, plan §3.8).
+ *
+ * Binds `openV1RunnerSelection` — keeping this registry the sole source of
+ * provider/model ranking and fallback policy — to the invocation-fixed
+ * workspace cwd and the invoking route's stage-model resolution. Per
+ * operation, the coordinator hands over its own selection session, the
+ * row's provider mode, and the request's canonical stage; the registry then
+ * ranks candidates and issues every reservation through that session. The
+ * opener never invokes a provider (AC-RUNNER-04) — invocation stays with
+ * the execution broker.
+ */
+export function createV1RunnerSelectionOpener(options: {
+  /** Working directory CLI transports run in (the workspace root). */
+  workspaceCwd: string;
+  /**
+   * Resolve the coordinator request's canonical stage to the stage's stored
+   * (provider-qualified) primary model id and stage key — exactly what the
+   * legacy entry points pass today. Returning `modelId: undefined` surfaces
+   * the legacy misconfiguration error at selection time.
+   */
+  resolveStagePrimaryModel: (taskStage: string) => {
+    readonly modelId: string | undefined;
+    readonly stage: TaskStage | undefined;
+  };
+}): (request: {
+  readonly session: ProviderSelectionSessionV1;
+  readonly mode: AgentExecutionModeV1;
+  readonly taskStage: string;
+}) => V1RunnerSelectionV1 {
+  return (request) => {
+    const resolved = options.resolveStagePrimaryModel(request.taskStage);
+    return openV1RunnerSelection({
+      session: request.session,
+      mode: request.mode,
+      modelId: resolved.modelId,
+      stage: resolved.stage,
+      workspaceCwd: options.workspaceCwd,
+    });
+  };
 }

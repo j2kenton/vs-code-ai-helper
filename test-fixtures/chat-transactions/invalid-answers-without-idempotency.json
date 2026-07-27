@@ -1,0 +1,81 @@
+{
+  "schemaVersion": 1,
+  "actionKey": "generatePlan.v1",
+  "operationId": "0f2b6c1d8a934e7fb5c2d90e814a3f66",
+  "sourceAttemptId": "1a2b3c4d5e6f708192a3b4c5d6e7f809",
+  "taskBindingId": "task-binding-digest",
+  "chatDocumentId": "chat-document-id",
+  "interactionId": "9e8d7c6b5a493827161504f3e2d1c0b9",
+  "stage": "impl",
+  "resumeSemantics": "sameOperation",
+  "inputSnapshot": {
+    "canonicalJson": "{\"advisoryRevision\":\"v1:120:99:7\",\"stage\":\"plan\",\"targetArtifact\":\"plan.md\"}",
+    "sha256": "95943b6d997eb4b47fb4670eb0f91e87e66eda4335b5f84682690e67942679f5"
+  },
+  "promptContract": {
+    "contractId": "ensemble-ai-result-contract",
+    "contractVersion": 1,
+    "promptInputSha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+  },
+  "questions": [
+    {
+      "questionId": "scope",
+      "kind": "singleChoice",
+      "prompt": "Which artifact should the plan target?",
+      "required": true,
+      "options": [
+        {
+          "optionId": "plan",
+          "label": "plan.md"
+        },
+        {
+          "optionId": "task",
+          "label": "task.md"
+        }
+      ]
+    },
+    {
+      "questionId": "notes",
+      "kind": "text",
+      "prompt": "Anything else the plan must honor?",
+      "required": false,
+      "allowBlank": true,
+      "maxLength": 500
+    }
+  ],
+  "questionSetSha256": "226968aa12e7e510872785ffd06a010bf8b186f7693f8067731c47ae8ca62ce1",
+  "answers": [
+    {
+      "questionId": "scope",
+      "kind": "singleChoice",
+      "state": "answered",
+      "selectedOptionId": "plan"
+    },
+    {
+      "questionId": "notes",
+      "kind": "text",
+      "state": "skipped"
+    }
+  ],
+  "state": "answersSubmitted",
+  "transitions": [
+    {
+      "receiptId": "01010101010101010101010101010101",
+      "from": null,
+      "to": "questionsPosted",
+      "at": "2026-07-26T10:00:00.000Z"
+    },
+    {
+      "receiptId": "02020202020202020202020202020202",
+      "from": "questionsPosted",
+      "to": "answersDraft",
+      "at": "2026-07-26T10:05:00.000Z"
+    },
+    {
+      "receiptId": "03030303030303030303030303030303",
+      "from": "answersDraft",
+      "to": "answersSubmitted",
+      "at": "2026-07-26T10:10:00.000Z"
+    }
+  ]
+}

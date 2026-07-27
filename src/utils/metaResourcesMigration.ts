@@ -14,13 +14,24 @@ import { NotificationRouter } from "./notificationRouter";
 import { ensureAutomaticMetaGitIgnore } from "../commands/toggleMetaResourcesGitIgnore";
 import { TaskProgress } from "../types/taskProgress";
 import { readTaskProgress, writeTaskProgress } from "./taskProgressUtils";
+import { LegacyCreatingStartupGateV0 } from "../state/legacyCreatingStartupGateV0";
 
 const CONFIG_SECTION = "vs-code-ai-helper";
 const META_RESOURCES_PATH_KEY = "metaResourcesPath";
 const DECLINED_KEY = "ensemble.metaMigration.declined";
 const LEGACY_ACTIVE_ROOT_KEY = "ensemble.metaMigration.legacyActiveRoot";
 const LEGACY_ROOTS = [".helper/plans", "plans"];
-const MIGRATION_JOURNAL_FILENAME = ".ensemble-migration.json";
+/**
+ * Phase-one provenance journal for a legacy meta-root move (see
+ * repairLegacyOwnership): written before the atomic root rename and removed
+ * only after every ownership record is rewritten, so it can survive a crash
+ * inside any migrated root. The privacy classifier
+ * (services/workflowPrivacyClassifierV1.ts) keeps a literal copy of this name
+ * in its workflow-control set (this module imports the VS Code API, which the
+ * classifier must stay free of); its unit test pins that copy against this
+ * export so the two cannot drift silently.
+ */
+export const MIGRATION_JOURNAL_FILENAME = ".ensemble-migration.json";
 
 interface MigrationJournal { from: string; to: string; at: string; }
 
@@ -300,6 +311,12 @@ export async function maybeOfferMetaResourcesMigration(
   _currentTaskStore: CurrentTaskStore,
   force = false
 ): Promise<void> {
+  // Activation-order barrier (plan §1.4): the migration reads and can
+  // rewrite task-progress ownership across the meta root, so it must never
+  // run while the startup creating-folder classification pass is still
+  // running. The activation-time offer already chains on startupGateReady;
+  // this covers the explicit "Move Ensemble Resources" command route.
+  await LegacyCreatingStartupGateV0.waitUntilReady();
   const workspace = vscode.workspace.workspaceFolders?.[0];
   if (!workspace) {
     if (force) {

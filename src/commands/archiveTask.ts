@@ -11,6 +11,7 @@ import { MAX_PINNED_TASKS, TaskProgress, TaskStatus } from "../types/taskProgres
 import { NotificationRouter } from "../utils/notificationRouter";
 import { cancelRunningOperationsForTask, runTrackedOperation } from "../utils/taskOperations";
 import { PendingOperationsStore } from "../state/pendingOperationsStore";
+import { LegacyCreatingStartupGateV0 } from "../state/legacyCreatingStartupGateV0";
 
 /**
  * Accepted argument shapes: the tree TaskNode (`{ task: IncompleteTask }`)
@@ -64,6 +65,11 @@ export async function archiveTask(
   explicitArg?: ArchiveTaskArg,
   pendingOperations?: PendingOperationsStore
 ): Promise<void> {
+  // Block on the startup gate's classification pass before this lifecycle
+  // command's first task-state read — same barrier contract as
+  // startNewTask/resumeTask (plan §1.4).
+  await LegacyCreatingStartupGateV0.waitUntilReady();
+
   const resolved = await resolveTaskContext(
     inventory,
     normalizeArg(explicitArg),
@@ -151,6 +157,9 @@ export async function resumeArchivedTask(
   currentTaskStore: CurrentTaskStore,
   explicitArg?: ArchiveTaskArg
 ): Promise<void> {
+  // Same activation-barrier contract as archiveTask above (plan §1.4).
+  await LegacyCreatingStartupGateV0.waitUntilReady();
+
   const resolved = await resolveTaskContext(
     inventory,
     normalizeArg(explicitArg),

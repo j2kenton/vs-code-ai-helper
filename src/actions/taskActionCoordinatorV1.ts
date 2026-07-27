@@ -1,0 +1,1267 @@
+/**
+ * Task action coordinator (plan §3.8, `src/actions/taskActionCoordinatorV1.ts`).
+ *
+ * The one component that may decode provider envelopes or promote completed
+ * content (plan product decisions). For a provider row it owns the complete
+ * §3.3 flow: allocate the operation, open one selection session, allocate a
+ * globally unique attempt, take exactly one claim-once reservation, invoke it
+ * through the execution broker, decode and correlate the framed result,
+ * report the attempt outcome exactly once, and map everything into the
+ * closed `TaskActionOutcomeV1` union. Fallback to another provider happens
+ * only after a pre-response outcome, with a fresh attempt and an explicit
+ * next reservation (AC-RUNNER-03/05).
+ *
+ * RESUME — `resumeAction` is the production Resume entrypoint (plan §5.5 /
+ * §6.1 / AC-QUESTION-03): it loads the durable Chat interaction transaction,
+ * revalidates the task/document binding, current registry eligibility, and
+ * the validated-input snapshot's advisory revisions through the row's own
+ * validator, settles the transaction exactly once per the row's declared
+ * `ResumeSemanticsV1`, and then reconstructs and runs the action — same
+ * operation with the linkage's recorded new attempt (`sameOperation`), or a
+ * fresh linked operation (`replacementOperation`) — with the recorded
+ * answers in the execution context. The §3.1 Resume idempotency id is
+ * CALLER-OWNED and required: callers allocate and persist it before driving
+ * Resume, and re-driving with the identical id after a crash replays the
+ * recorded resolution — a `sameOperation` replay executes under exactly the
+ * attempt id the settled transaction binds to, never an unbound fresh one.
+ * Every rejection before settlement (including duplicate rejection) leaves
+ * the interaction resumable.
+ *
+ * A settled resolution replaying idempotently is NOT the same as its
+ * provider invocation being safe to run twice (AC-RUNNER-03: invocation-once
+ * per attempt). `resumeAction` claims that specific invocation via
+ * `orchestrator.claimResumeInvocation` immediately before calling
+ * `runProviderRow` — the actual reservation/invocation boundary, deliberately
+ * AFTER local session/selection setup (which is pure in-memory bookkeeping,
+ * not itself "the invocation") so a crash during that setup leaves no claim
+ * at all and the interaction stays fully retryable. The claim is taken over
+ * the transaction store, so it survives a crash and is visible across
+ * extension-host instances, not just within this process's in-memory
+ * selection session.
+ *
+ * A bare claim alone cannot distinguish "the earlier drive completed", "it
+ * is still running", and "it crashed mid-invocation" — so once a claimed
+ * invocation runs `runProviderRow` to completion, `resumeAction` durably
+ * mirrors its exact `TaskActionOutcomeV1` via
+ * `orchestrator.recordResumeInvocationOutcome` (best-effort: the real
+ * outcome is still returned to the caller even if this write fails). A
+ * re-drive that finds `alreadyClaimed` now checks for that recorded outcome
+ * first: present means recover and return that EXACT outcome instead of
+ * invoking the provider again ("recover the claimed terminal result");
+ * absent means the outcome is genuinely unknown, and only then is the
+ * outcome the non-retryable `resumeInvocationAlreadyClaimed` failure — the
+ * provider is NOT invoked either way once `alreadyClaimed` is true.
+ *
+ * THE CLAIM'S EXACT POSITION — the claim is taken from INSIDE
+ * `runProviderRow`, immediately before the one line that is the true
+ * invocation boundary (the broker's `invoke` call), not before
+ * `runProviderRow` is called. Attempt allocation, reservation, the
+ * in-memory reservation claim (`session.claim`), prompt construction,
+ * execution-request assembly, TRANSPORT CONSTRUCTION, and the broker's
+ * entire pre-invocation phase (`prepareAgentInvocationV1`: request/
+ * reservation/transport validation, consumption of the reservation's
+ * single invocation, the pre-requested cancellation check, bounded-writer
+ * creation) all happen first — every one of them is local setup with no
+ * side effect outside this process — so a throw or crash anywhere in that
+ * work, or during the session/selection setup that precedes
+ * `runProviderRow` itself, leaves no durable claim at all and the
+ * interaction stays fully retryable. Only the (unavoidable) gap between the
+ * durable claim write actually landing and the broker `invoke` starting is
+ * ever at risk of "claimed but nothing to show for it" — every other step
+ * that used to sit inside that window has been moved out of it. The claim is
+ * taken exactly once per drive (via the `claimInvocationOnce` gate passed
+ * into `runProviderRow`): once it has passed for the drive's first real
+ * invocation attempt, any later fallback attempt within the SAME drive
+ * proceeds directly, since re-claiming an already-owned invocation would be
+ * meaningless. `resumeAction` only calls `recordResumeInvocationOutcome`
+ * when this drive itself won the claim — never when the gate reports
+ * `alreadyClaimed` (that outcome, recovered or not, was never this drive's
+ * to (re-)record) and never when no candidate provider was ever reached
+ * (nothing was claimed, so nothing to record).
+ *
+
+ * LEASE PHASES — plan §6.1 rule 6 releases leases before provider/user
+ * waits, so a provider operation never holds its task-operation lease across
+ * the broker invocation. The lease is taken in two short phases instead:
+ *  - START: acquired around duplicate rejection and selection setup, released
+ *    before the first provider invocation;
+ *  - SETTLEMENT: re-acquired only to promote completed content, released in
+ *    that phase's own finally. If another operation took the lease during
+ *    the provider wait, promotion is blocked fail-safe (`duplicateRejected`)
+ *    and nothing is promoted; the row's `promoteCompletedContent` remains the
+ *    revision-revalidation point (plan §6.2's revision-checked replacement),
+ *    so content staled by an interleaved operation cannot clobber artifacts.
+ * Lifecycle rows contain no provider/user wait and keep one short lease
+ * across their whole `execute`.
+ *
+ * PRESENTATION AND LOGGING — the coordinator centralizes both (plan §3.8):
+ * every invocation presents the row's declared `progressLabel` through the
+ * injected `TaskActionPresenterV1` for exactly the execution span, and every
+ * invocation emits exactly one sanitized settlement record through
+ * `TaskActionAuditLoggerV1` under the row's declared logging policy. The
+ * record shape is closed to §2.2's permitted fields: correlation IDs,
+ * timestamps, statuses, codes, byte counts, and digests — never prompt,
+ * question, artifact, or provider text.
+ *
+ * WHICH provider serves an attempt is not this module's decision: the
+ * coordinator consumes `runnerRegistry.ts`'s operation-bound V1 selection
+ * contract verbatim. `RunnerSelectionOpenerV1` opens a `V1RunnerSelectionV1`
+ * for the coordinator's own selection session, and every reservation is
+ * issued by the registry through `reserveNext(attemptId)` — the registry
+ * remains the sole source of provider/model ranking and fallback policy and
+ * never invokes a provider (plan product decisions; AC-RUNNER-04). The
+ * production opener is `createV1RunnerSelectionOpener` in `runnerRegistry.ts`,
+ * which binds `openV1RunnerSelection` to the invocation-fixed workspace cwd
+ * and the invoking route's stage-model resolution.
+ *
+ * After the lease is released, the coordinator consumes the row's declared
+ * `followUpActionKey` for a completed outcome — at most one follow-up per
+ * invocation (plan §3.8 / AC-LIFECYCLE-02) — through the injected
+ * `TaskActionFollowUpSchedulerV1`.
+ *
+ * ENFORCEMENT STATE — nothing in production constructs a coordinator yet.
+ * Every AI route remains gated (`LEGACY_AI_ROUTE_DISABLED_V0`), and the
+ * broker independently rejects any action key missing from
+ * `MIGRATED_ACTION_KEYS_V0`, so a coordinator built ahead of a cohort's
+ * migration cannot invoke anything even if constructed.
+ */
+import { createHash } from "crypto";
+import type * as vscode from "vscode";
+import {
+  ActionCorrelationV1,
+  ActionKeyV1,
+  allocateHex128IdV1,
+  isHex128IdV1,
+  OperationIdV1,
+  TaskBindingRefV1,
+} from "../types/actionCorrelationV1";
+import {
+  AgentExecutionModeV1,
+  AgentExecutionRequestV1,
+  SealedResultPayloadV1,
+} from "../types/agentExecutionV1";
+import { AiResultEnvelopeV1, parseAiResultEnvelopeV1 } from "../types/aiResultEnvelope";
+import { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
+import { unavailableV1 } from "../types/workflowAvailabilityV1";
+import {
+  AgentExecutionBrokerOptionsV1,
+  PreparedAgentInvocationV1,
+  prepareAgentInvocationV1,
+} from "../services/agentExecutionBrokerV1";
+import {
+  AttemptOutcomeKindV1,
+  openProviderSelectionSessionV1,
+  ProviderSelectionSessionV1,
+} from "../services/providerSelectionPolicyV1";
+import { WorkflowLeaseStoreV1 } from "../services/workflowLeaseStoreV1";
+import {
+  AI_RESULT_CONTRACT_ID_V1,
+  AI_RESULT_CONTRACT_VERSION_V1,
+  buildAiResultContractPromptV1,
+} from "../prompts/aiResultContractV1";
+import {
+  ActionConversationErrorV1,
+  ActionConversationOrchestratorV1,
+  InteractionRefV1,
+  ResumeResolutionV1,
+} from "./actionConversationOrchestratorV1";
+import {
+  ProviderTaskActionRowV1,
+  TaskActionExecutionContextV1,
+  TaskActionLoggingPolicyV1,
+  TaskActionRegistryRowV1,
+  TaskActionRegistryV1,
+} from "./taskActionRegistryV1";
+import type { StructuredAnswerV1 } from "../types/structuredQuestionV1";
+import type { V1RunnerSelectionV1 } from "../runners/runnerRegistry";
+import { STAGE_ORDER, TaskStage } from "../types/taskProgress";
+
+export class TaskActionCoordinatorErrorV1 extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "TaskActionCoordinatorErrorV1";
+  }
+}
+
+/**
+ * Everything the registry's selection needs from the coordinator to open one
+ * operation-bound ranked selection: the coordinator's own selection session
+ * (so every reservation flows through the session's claim-once accounting),
+ * the row's provider mode, and the request's canonical stage (the registry's
+ * ranking and fallback policy are stage-scoped).
+ */
+export interface RunnerSelectionOpenRequestV1 {
+  readonly session: ProviderSelectionSessionV1;
+  readonly mode: AgentExecutionModeV1;
+  readonly taskStage: string;
+}
+
+/**
+ * Opens `runnerRegistry.ts`'s V1 selection for one coordinator operation.
+ * The returned `V1RunnerSelectionV1` is the registry's own contract — the
+ * coordinator never chooses a runner/provider/model and never issues a
+ * reservation itself. Production wiring: `createV1RunnerSelectionOpener`
+ * (`runnerRegistry.ts`), which binds `openV1RunnerSelection`.
+ */
+export type RunnerSelectionOpenerV1 = (
+  request: RunnerSelectionOpenRequestV1
+) => V1RunnerSelectionV1;
+
+/** At most one declared follow-up per completed invocation (plan §3.8 / AC-LIFECYCLE-02). */
+export interface TaskActionFollowUpRequestV1 {
+  readonly followUpActionKey: ActionKeyV1;
+  readonly sourceActionKey: ActionKeyV1;
+  readonly sourceOperationId: OperationIdV1;
+  readonly taskBinding: TaskBindingRefV1;
+}
+
+export interface TaskActionFollowUpSchedulerV1 {
+  schedule(request: TaskActionFollowUpRequestV1): void;
+}
+
+/** What the coordinator presents for one invocation: the row's declared label plus correlation. */
+export interface TaskActionProgressPresentationV1 {
+  readonly actionKey: ActionKeyV1;
+  readonly operationId: OperationIdV1;
+  /** The registry row's declared user-facing `progressLabel` (plan §3.8). */
+  readonly progressLabel: string;
+}
+
+export interface TaskActionProgressHandleV1 {
+  /** Ends this invocation's progress presentation; called exactly once, in the outermost finally. */
+  end(): void;
+}
+
+/**
+ * Coordinator-owned progress presentation (plan §3.8: the coordinator owns
+ * presentation). Production wiring maps this onto the product's progress UI
+ * (e.g. `vscode.window.withProgress`); the coordinator itself only ever
+ * hands over the row's declared label and the invocation's correlation.
+ */
+export interface TaskActionPresenterV1 {
+  beginProgress(presentation: TaskActionProgressPresentationV1): TaskActionProgressHandleV1;
+}
+
+/**
+ * One sanitized settlement record per coordinator invocation. The shape is
+ * CLOSED to plan §2.2's permitted log content — correlation identifiers,
+ * timestamps, statuses, codes, byte counts, and digests. There is no field
+ * that could carry prompt, question, artifact, or provider text.
+ */
+export interface TaskActionSettlementRecordV1 {
+  readonly event: "taskActionSettled";
+  /** Coordinator-clock ISO timestamp. */
+  readonly at: string;
+  /** The row's declared logging channel (`loggingPolicy.channel`). */
+  readonly channel: string;
+  readonly actionKey: ActionKeyV1;
+  readonly taskBindingId: string;
+  /** Absent only when the invocation failed before an operation was allocated. */
+  readonly operationId?: OperationIdV1;
+  /** The settled attempt, when the outcome carries provider correlation. */
+  readonly attemptId?: string;
+  readonly outcomeKind: TaskActionOutcomeV1["kind"];
+  /** The outcome's stable code, when its variant declares one. */
+  readonly outcomeCode?: string;
+  /** Sealed-result byte count — only when the row's policy opts metrics in. */
+  readonly resultByteLength?: number;
+  /** Sealed-result SHA-256 — only when the row's policy opts metrics in. */
+  readonly resultSha256?: string;
+}
+
+export interface TaskActionAuditLoggerV1 {
+  log(record: TaskActionSettlementRecordV1): void;
+}
+
+export interface TaskActionRequestV1 {
+  readonly actionKey: ActionKeyV1;
+  readonly taskBinding: TaskBindingRefV1;
+  /** Persisted task status at invocation time (strictly decoded by the caller). */
+  readonly taskStatus: string;
+  /** Current canonical stage at invocation time. */
+  readonly taskStage: string;
+  readonly rawInput: unknown;
+  readonly cancellationToken: vscode.CancellationToken;
+}
+
+/**
+ * An explicit Resume of a structured-question interaction (plan §5.5 / §6.1).
+ * Unlike `TaskActionRequestV1` there is no `actionKey` or `rawInput`: both
+ * come from the persisted Chat interaction transaction — the recorded action
+ * key selects the registry row, and the validated-input snapshot is the only
+ * input the reconstructed action receives (AC-QUESTION-03).
+ */
+export interface TaskActionResumeRequestV1 {
+  /** The durable interaction address: operation id plus recorded interaction id. */
+  readonly interaction: InteractionRefV1;
+  /** The invoking task's current binding — revalidated against the transaction record. */
+  readonly taskBinding: TaskBindingRefV1;
+  /** Persisted task status at Resume time (strictly decoded by the caller). */
+  readonly taskStatus: string;
+  /** Current canonical stage at Resume time. */
+  readonly taskStage: string;
+  /**
+   * The CALLER-OWNED §3.1 Resume idempotency id (128-bit lowercase hex).
+   * Callers allocate it once per user Resume and persist it before driving
+   * the coordinator, so the id survives a crash. Re-driving with the
+   * identical id replays the recorded resolution — a `sameOperation` replay
+   * recovers the transaction's exactly-one recorded attempt linkage instead
+   * of invoking an unbound fresh attempt; any other id against a settled
+   * interaction is rejected by the persisted idempotency record.
+   */
+  readonly resumeIdempotencyId: string;
+  readonly cancellationToken: vscode.CancellationToken;
+}
+
+export interface TaskActionCoordinatorDepsV1 {
+  readonly registry: TaskActionRegistryV1;
+  readonly leaseStore: WorkflowLeaseStoreV1;
+  /**
+   * Opens the registry's ranked, session-bound selection for one operation
+   * (`openV1RunnerSelection` via `createV1RunnerSelectionOpener` in
+   * production). The registry — never the coordinator — ranks candidates,
+   * rejects mode-incapable ones, and issues every reservation.
+   */
+  readonly openRunnerSelection: RunnerSelectionOpenerV1;
+  /**
+   * The durable interaction ledger (plan §5.5): a `questions` result persists
+   * its Chat interaction transaction through this before the outcome surfaces.
+   */
+  readonly orchestrator: ActionConversationOrchestratorV1;
+  /** Consumes each completed row's declared follow-up, after lease release. */
+  readonly followUpScheduler: TaskActionFollowUpSchedulerV1;
+  /** Presents each invocation under the row's declared `progressLabel` (plan §3.8). */
+  readonly presenter: TaskActionPresenterV1;
+  /** Receives exactly one sanitized settlement record per invocation (plan §3.8 / §2.2). */
+  readonly auditLogger: TaskActionAuditLoggerV1;
+  /** Coordinator clock for settlement timestamps; defaults to the system clock. */
+  readonly now?: () => string;
+  readonly brokerOptions?: AgentExecutionBrokerOptionsV1;
+}
+
+export interface TaskActionCoordinatorV1 {
+  /** Execute one action invocation end to end and return its stable outcome. */
+  executeAction(request: TaskActionRequestV1): Promise<TaskActionOutcomeV1>;
+  /** Resolve the owning row for a route and execute it (fail-closed on unowned routes). */
+  executeRoute(
+    routeId: string,
+    request: Omit<TaskActionRequestV1, "actionKey">
+  ): Promise<TaskActionOutcomeV1>;
+  /**
+   * Execute an explicit Resume end to end (plan §5.5 / §6.1 / AC-QUESTION-03):
+   * load the persisted transaction, revalidate the task/document binding and
+   * current registry eligibility, reconstruct the action input from the
+   * validated snapshot and revalidate it (advisory revisions) through the
+   * row's own validator, settle the transaction exactly once per the row's
+   * declared `ResumeSemanticsV1`, then run the reconstructed action with the
+   * recorded answers. The request's caller-owned Resume idempotency id is
+   * the crash-recovery key: the identical id replays a settled Resume under
+   * its recorded attempt/operation linkage. No provider is invoked for an
+   * unknown, unanswerable, ineligible, already-settled, or duplicate-locked
+   * interaction — and every rejection before settlement leaves the
+   * interaction resumable.
+   */
+  resumeAction(request: TaskActionResumeRequestV1): Promise<TaskActionOutcomeV1>;
+}
+
+/**
+ * Narrow a request's plain `taskStage` string to a canonical `TaskStage` for
+ * everything downstream that needs one (the Chat interaction transaction,
+ * plan §5.1/§6.1's stage isolation) — `TaskActionRequestV1.taskStage` stays a
+ * plain string at the request boundary, but nothing may cross into the
+ * transaction store without a validated canonical stage.
+ */
+function isCanonicalTaskStageV0(value: string): value is TaskStage {
+  return (STAGE_ORDER as readonly string[]).includes(value);
+}
+
+function eligibilityFailure(
+  row: TaskActionRegistryRowV1,
+  status: string,
+  stage: string
+): TaskActionOutcomeV1 | undefined {
+  if (!row.eligibility.statuses.includes(status)) {
+    return { kind: "failed", code: "actionNotEligibleForStatus", retryable: false };
+  }
+  if (row.eligibility.stages !== "anyStage" && !row.eligibility.stages.includes(stage)) {
+    return { kind: "failed", code: "actionNotEligibleForStage", retryable: false };
+  }
+  return undefined;
+}
+
+/** Unseal a broker response payload into UTF-8 text, claiming a spool exactly once when needed. */
+async function unsealPayload(
+  payload: SealedResultPayloadV1,
+  correlation: ActionCorrelationV1,
+  brokerOptions: AgentExecutionBrokerOptionsV1 | undefined
+): Promise<
+  | { readonly ok: true; readonly text: string }
+  | { readonly ok: false; readonly outcome: TaskActionOutcomeV1; readonly attemptOutcome: AttemptOutcomeKindV1 }
+> {
+  if (payload.storage === "memory") {
+    return { ok: true, text: payload.utf8Text };
+  }
+  const store = brokerOptions?.spoolStore;
+  if (!store) {
+    return {
+      ok: false,
+      outcome: unavailableV1("workflowStorageUnavailable"),
+      attemptOutcome: "malformedResult",
+    };
+  }
+  const claim = await store.claimSpoolOnce(payload.spoolRef, correlation);
+  if (!claim.ok) {
+    if (claim.code === "spoolCorrelationMismatch") {
+      return {
+        ok: false,
+        outcome: { kind: "malformedResult", correlation, code: "resultCorrelationMismatch" },
+        attemptOutcome: "resultCorrelationMismatch",
+      };
+    }
+    return {
+      ok: false,
+      outcome: { kind: "failed", correlation, code: `resultSpool.${claim.code}`, retryable: false },
+      attemptOutcome: "malformedResult",
+    };
+  }
+  // Spools are removed after settlement (plan §3.2); a cleanup failure never
+  // invalidates the already-claimed, integrity-verified text.
+  try {
+    await store.removeSpool(payload.spoolRef);
+  } catch {
+    // Expiry sweeps collect the remainder within 24 hours.
+  }
+  return { ok: true, text: claim.utf8Text };
+}
+
+/**
+ * One short task-operation lease phase. `acquire` either holds the lease
+ * (release exactly once via `release`) or reports the stable
+ * `duplicateRejected` outcome. Rows that declare no lease requirement get a
+ * no-op phase so caller structure stays uniform.
+ */
+type TaskLeasePhaseV1 =
+  | { readonly ok: true; readonly release: () => void }
+  | { readonly ok: false; readonly outcome: TaskActionOutcomeV1 };
+
+type AcquireTaskLeasePhaseV1 = () => TaskLeasePhaseV1;
+
+/** Sanitized sealed-result metrics captured for the settlement record (§2.2: byte counts and digests only). */
+interface ResultMetricsCaptureV1 {
+  byteLength?: number;
+  sha256?: string;
+}
+
+/**
+ * Result of the Resume-only invocation-once gate `runProviderRow` checks
+ * immediately before the true invocation boundary (plan §3.1 / AC-RUNNER-03;
+ * see this module's header, "THE CLAIM'S EXACT POSITION"). `proceed: false`
+ * means this drive must not invoke the provider — either the durable claim
+ * itself could not be taken (storage failure), or another drive already
+ * claimed this invocation (whose exact outcome is recovered when known, or
+ * whose still-unknown outcome fails closed).
+ */
+type ResumeInvocationClaimGateResultV1 =
+  | { readonly proceed: true }
+  | { readonly proceed: false; readonly outcome: TaskActionOutcomeV1 };
+
+/**
+ * Settlement-record fallbacks for a Resume rejected before its interaction's
+ * registry row was resolved (unknown/corrupt transaction, binding mismatch):
+ * there is no row logging policy to honor yet, so the record goes to a fixed
+ * channel with metrics declined.
+ */
+const RESUME_FALLBACK_LOGGING_POLICY_V1: TaskActionLoggingPolicyV1 = {
+  channel: "action.resume",
+  includeResultMetrics: false,
+};
+const RESUME_UNRESOLVED_ACTION_KEY_V1 = "resume.unresolved";
+
+export function createTaskActionCoordinatorV1(
+  deps: TaskActionCoordinatorDepsV1
+): TaskActionCoordinatorV1 {
+  const now = deps.now ?? ((): string => new Date().toISOString());
+
+  async function runProviderRow(
+    row: ProviderTaskActionRowV1,
+    cancellationToken: vscode.CancellationToken,
+    session: ProviderSelectionSessionV1,
+    selection: V1RunnerSelectionV1,
+    validatedInput: unknown,
+    /** The stage this invocation is running in (plan §5.1/§6.1 stage isolation). */
+    stage: TaskStage,
+    acquireLeasePhase: AcquireTaskLeasePhaseV1,
+    metrics: ResultMetricsCaptureV1,
+    /** Recorded answers from a resumed structured-question interaction (plan §6.1). */
+    answers?: readonly StructuredAnswerV1[],
+    /**
+     * Resume-only invocation-once gate (plan §3.1 / AC-RUNNER-03): checked
+     * exactly once per drive, immediately before the true invocation
+     * boundary — see this module's header, "THE CLAIM'S EXACT POSITION".
+     * Absent for a fresh (non-Resume) action, which never durably claims an
+     * invocation.
+     */
+    claimInvocationOnce?: () => Promise<ResumeInvocationClaimGateResultV1>
+  ): Promise<TaskActionOutcomeV1> {
+    // No task-operation lease is held anywhere in this function except the
+    // settlement phase inside `settleEnvelope` (plan §6.1 rule 6: leases are
+    // released before provider waits).
+    let invocationGateChecked = claimInvocationOnce === undefined;
+    for (;;) {
+      const attemptId = session.allocateAttempt();
+
+      const next = selection.reserveNext(attemptId);
+      if (next.kind === "noneRemaining") {
+        // Nothing was reserved for this attempt — settle it explicitly so
+        // the session's one-outcome-per-attempt accounting stays complete,
+        // then map both exhaustion codes onto the stable mode-unavailable
+        // outcome (plan §3.7).
+        session.reportAttemptOutcome(attemptId, "providerUnavailablePreInvocation");
+        return unavailableV1("providerModeUnavailable");
+      }
+      if (next.kind === "candidateUnavailable") {
+        // The registry settled this attempt (providerUnavailablePreInvocation)
+        // for a ranked candidate that cannot satisfy the mode — an explicit,
+        // auditable skip, never a silent bypass. A FRESH attempt reaches the
+        // next ranked candidate (plan §3.4).
+        continue;
+      }
+
+      const { reserved } = next;
+      const correlation = reserved.handle.correlation;
+      const claimed = session.claim(reserved.handle.reservationId);
+
+      const context: TaskActionExecutionContextV1 = {
+        correlation,
+        stage,
+        validatedInput,
+        ...(answers !== undefined ? { answers } : {}),
+      };
+      const prompt =
+        row.buildPrompt(context) +
+        "\n\n" +
+        buildAiResultContractPromptV1({
+          correlation,
+          permittedResultKinds: row.permittedResultKinds,
+          completedContentType: row.completedContentType,
+          maxResponseBytes: row.maxResponseBytes,
+        });
+      // Recorded in the durable Chat transaction when questions come back
+      // (plan §5.5's prompt-input digest — a §2.2-permitted digest, never the
+      // prompt text itself).
+      const promptSha256 = createHash("sha256").update(prompt, "utf8").digest("hex");
+
+      const executionRequest: AgentExecutionRequestV1 = {
+        correlation,
+        reservationId: reserved.handle.reservationId,
+        mode: row.providerMode,
+        prompt,
+        maxResponseBytes: row.maxResponseBytes,
+        cancellationToken,
+      };
+
+      // PRE-INVOCATION SETUP (plan §3.1 / AC-RUNNER-03; module header,
+      // "THE CLAIM'S EXACT POSITION"): transport construction and the
+      // broker's full pre-invocation phase — request/reservation/transport
+      // validation, consumption of the reservation's single invocation,
+      // the pre-requested cancellation check, bounded-writer creation —
+      // all complete HERE, before the durable claim below. A throw or
+      // crash in this window therefore leaves no claim at all and the
+      // interaction stays fully retryable. A provider that cannot even be
+      // set up for invocation is reported as unavailable pre-invocation
+      // and the loop falls back to the next registry-ranked candidate.
+      let prepared: PreparedAgentInvocationV1;
+      try {
+        prepared = prepareAgentInvocationV1(executionRequest, claimed, reserved.createTransport());
+      } catch {
+        session.reportAttemptOutcome(attemptId, "providerUnavailablePreInvocation");
+        continue;
+      }
+
+      // THE TRUE INVOCATION BOUNDARY: everything above this point for
+      // this attempt — allocation, reservation, the in-memory reservation
+      // claim, prompt construction, execution-request assembly, transport
+      // construction, and broker preparation — is local, claim-free setup.
+      // The Resume-only durable claim is checked exactly once per drive,
+      // right here, immediately before the one call that actually reaches
+      // a provider. A pre-invocation outcome (a token already cancelled
+      // before any provider work) never reaches a provider, so it neither
+      // takes nor needs the claim.
+      if (prepared.kind === "prepared" && !invocationGateChecked) {
+        invocationGateChecked = true;
+        const gate = await claimInvocationOnce!();
+        if (!gate.proceed) {
+          return gate.outcome;
+        }
+      }
+
+      const raw =
+        prepared.kind === "preInvocationOutcome"
+          ? prepared.outcome
+          : await prepared.invoke(deps.brokerOptions ?? {});
+
+      switch (raw.kind) {
+        case "callerCancelled":
+          session.reportAttemptOutcome(attemptId, "callerCancelled");
+          return { kind: "cancelled", correlation, code: "userCancelled" };
+        case "providerCancelled":
+          session.reportAttemptOutcome(attemptId, "providerCancelled");
+          return { kind: "cancelled", correlation, code: "providerCancelled" };
+        case "overflow":
+          session.reportAttemptOutcome(attemptId, "overflow");
+          return { kind: "malformedResult", correlation, code: "resultLimitExceeded" };
+        case "transportFailure":
+          if (raw.responseStarted) {
+            session.reportAttemptOutcome(attemptId, "transportFailureResponseStarted");
+            return { kind: "failed", correlation, code: raw.code, retryable: false };
+          }
+          session.reportAttemptOutcome(attemptId, "transportFailurePreResponse");
+          // Pre-response failure is the fallback-eligible case: loop for the
+          // next registry-ranked candidate with a fresh attempt and an
+          // explicit next reservation.
+          continue;
+        case "response":
+          break;
+      }
+
+      // Sanitized metrics for the settlement record (byte count + digest —
+      // both §2.2-permitted), captured for every response-bearing outcome.
+      if (raw.payload.storage === "memory") {
+        metrics.byteLength = raw.payload.byteLength;
+        metrics.sha256 = raw.payload.sha256;
+      } else {
+        metrics.byteLength = raw.payload.spoolRef.byteLength;
+        metrics.sha256 = raw.payload.spoolRef.sha256;
+      }
+
+      const unsealed = await unsealPayload(raw.payload, correlation, deps.brokerOptions);
+      if (!unsealed.ok) {
+        session.reportAttemptOutcome(attemptId, unsealed.attemptOutcome);
+        return unsealed.outcome;
+      }
+
+      const parsed = parseAiResultEnvelopeV1(unsealed.text, correlation);
+      if (parsed.kind === "malformed") {
+        session.reportAttemptOutcome(
+          attemptId,
+          parsed.code === "resultCorrelationMismatch" ? "resultCorrelationMismatch" : "malformedResult"
+        );
+        return { kind: "malformedResult", correlation, code: parsed.code };
+      }
+
+      return settleEnvelope(row, parsed, session, attemptId, context, acquireLeasePhase, promptSha256);
+    }
+  }
+
+  async function settleEnvelope(
+    row: ProviderTaskActionRowV1,
+    envelope: AiResultEnvelopeV1,
+    session: ProviderSelectionSessionV1,
+    attemptId: string,
+    context: TaskActionExecutionContextV1,
+    acquireLeasePhase: AcquireTaskLeasePhaseV1,
+    promptSha256: string
+  ): Promise<TaskActionOutcomeV1> {
+    const correlation = context.correlation;
+    if (!row.permittedResultKinds.includes(envelope.kind)) {
+      session.reportAttemptOutcome(attemptId, "malformedResult");
+      return { kind: "malformedResult", correlation, code: "contentSchemaMismatch" };
+    }
+    switch (envelope.kind) {
+      case "completed": {
+        if (envelope.content.contentType !== row.completedContentType) {
+          session.reportAttemptOutcome(attemptId, "malformedResult");
+          return { kind: "malformedResult", correlation, code: "contentSchemaMismatch" };
+        }
+        session.reportAttemptOutcome(attemptId, "completed");
+        // SETTLEMENT lease phase: the lease was released before the provider
+        // wait (plan §6.1 rule 6), so promotion — the only task mutation on
+        // this path — re-acquires it briefly. If another operation took the
+        // task meanwhile, promotion is blocked fail-safe and nothing is
+        // written; when the lease IS re-acquired, the row's revision-checked
+        // `promoteCompletedContent` (plan §6.2) revalidates that the target
+        // artifact was not changed during the wait.
+        const settlement = acquireLeasePhase();
+        if (!settlement.ok) {
+          return settlement.outcome;
+        }
+        try {
+          const code = await row.promoteCompletedContent(envelope.content, context);
+          return { kind: "completed", correlation, code };
+        } catch {
+          return { kind: "failed", correlation, code: "promotionFailed", retryable: false };
+        } finally {
+          settlement.release();
+        }
+      }
+      case "questions": {
+        session.reportAttemptOutcome(attemptId, "questions");
+        // Plan §5.5 write-through: the durable Chat interaction transaction —
+        // carrying the validated input snapshot and prompt-contract identity
+        // Resume needs — is persisted BEFORE the questions outcome surfaces.
+        // If it cannot persist, the questions are not surfaced at all:
+        // without the record, Resume would not be reconstructible.
+        const posted = await deps.orchestrator.postQuestions({
+          correlation,
+          stage: context.stage,
+          resumeSemantics: row.resumeSemantics,
+          questions: envelope.questions,
+          validatedInput: context.validatedInput,
+          promptContract: {
+            contractId: AI_RESULT_CONTRACT_ID_V1,
+            contractVersion: AI_RESULT_CONTRACT_VERSION_V1,
+            promptInputSha256: promptSha256,
+          },
+        });
+        if (!posted.ok) {
+          if (posted.code === "workflowStorageUnavailable") {
+            return unavailableV1("workflowStorageUnavailable");
+          }
+          return { kind: "failed", correlation, code: "chatTransactionNotRecorded", retryable: true };
+        }
+        return { kind: "questions", correlation, interactionId: posted.record.interactionId };
+      }
+      case "cancelled": {
+        if (envelope.reason === "user") {
+          session.reportAttemptOutcome(attemptId, "callerCancelled");
+          return { kind: "cancelled", correlation, code: "userCancelled" };
+        }
+        session.reportAttemptOutcome(attemptId, "providerCancelled");
+        return { kind: "cancelled", correlation, code: "providerCancelled" };
+      }
+      case "failed": {
+        session.reportAttemptOutcome(attemptId, "providerDeclaredFailure");
+        return {
+          kind: "failed",
+          correlation,
+          code: envelope.code,
+          retryable: envelope.retryable,
+        };
+      }
+    }
+  }
+
+  function buildSettlementRecord(
+    loggingPolicy: TaskActionLoggingPolicyV1,
+    actionKey: ActionKeyV1,
+    taskBindingId: string,
+    operationId: OperationIdV1 | undefined,
+    outcome: TaskActionOutcomeV1,
+    metrics: ResultMetricsCaptureV1
+  ): TaskActionSettlementRecordV1 {
+    const correlation = "correlation" in outcome ? outcome.correlation : undefined;
+    const includeMetrics =
+      loggingPolicy.includeResultMetrics &&
+      metrics.byteLength !== undefined &&
+      metrics.sha256 !== undefined;
+    return {
+      event: "taskActionSettled",
+      at: now(),
+      channel: loggingPolicy.channel,
+      actionKey,
+      taskBindingId,
+      ...(operationId !== undefined ? { operationId } : {}),
+      ...(correlation !== undefined ? { attemptId: correlation.attemptId } : {}),
+      outcomeKind: outcome.kind,
+      ...("code" in outcome ? { outcomeCode: outcome.code } : {}),
+      ...(includeMetrics
+        ? { resultByteLength: metrics.byteLength, resultSha256: metrics.sha256 }
+        : {}),
+    };
+  }
+
+  async function executeValidatedAction(
+    row: TaskActionRegistryRowV1,
+    request: TaskActionRequestV1,
+    operationRef: { operationId?: OperationIdV1 },
+    metrics: ResultMetricsCaptureV1
+  ): Promise<TaskActionOutcomeV1> {
+    const ineligible = eligibilityFailure(row, request.taskStatus, request.taskStage);
+    if (ineligible) {
+      return ineligible;
+    }
+    if (!isCanonicalTaskStageV0(request.taskStage)) {
+      return { kind: "failed", code: "invalidTaskStage", retryable: false };
+    }
+    const stage = request.taskStage;
+
+    const validation = row.validateInput(request.rawInput);
+    if (!validation.ok) {
+      return { kind: "failed", code: "invalidActionInput", retryable: false };
+    }
+
+    if (request.cancellationToken.isCancellationRequested) {
+      return { kind: "cancelled", code: "userCancelled" };
+    }
+
+    const operationId = allocateHex128IdV1();
+    operationRef.operationId = operationId;
+
+    const acquireLeasePhase: AcquireTaskLeasePhaseV1 = () => {
+      if (!row.requiresTaskOperationLease) {
+        return { ok: true, release: (): void => undefined };
+      }
+      const acquired = deps.leaseStore.acquire(
+        request.taskBinding.taskBindingId,
+        row.actionKey,
+        operationId
+      );
+      if (!acquired.ok) {
+        return { ok: false, outcome: acquired.outcome };
+      }
+      const { leaseId } = acquired.lease;
+      return {
+        ok: true,
+        release: (): void => {
+          deps.leaseStore.release(leaseId);
+        },
+      };
+    };
+
+    // Coordinator-owned presentation (plan §3.8): the row's declared
+    // progress label covers exactly the execution span, ended in the
+    // outermost finally.
+    const progress = deps.presenter.beginProgress({
+      actionKey: row.actionKey,
+      operationId,
+      progressLabel: row.progressLabel,
+    });
+    try {
+      if (row.kind === "lifecycle") {
+        // Lifecycle rows contain no provider/user wait: one short lease
+        // covers the whole coordinated transition.
+        const phase = acquireLeasePhase();
+        if (!phase.ok) {
+          return phase.outcome;
+        }
+        try {
+          return await row.execute({
+            actionKey: row.actionKey,
+            operationId,
+            taskBindingId: request.taskBinding.taskBindingId,
+            chatDocumentId: request.taskBinding.chatDocumentId,
+            validatedInput: validation.input,
+          });
+        } finally {
+          phase.release();
+        }
+      }
+
+      // START lease phase for a provider row: duplicate rejection plus
+      // selection setup only, released BEFORE any provider wait (plan §6.1
+      // rule 6). The lease is re-acquired solely for completed-content
+      // promotion in `settleEnvelope`'s settlement phase.
+      const start = acquireLeasePhase();
+      if (!start.ok) {
+        return start.outcome;
+      }
+      let session: ProviderSelectionSessionV1;
+      let selection: V1RunnerSelectionV1;
+      try {
+        session = openProviderSelectionSessionV1({
+          actionKey: row.actionKey,
+          operationId,
+          taskBindingId: request.taskBinding.taskBindingId,
+          chatDocumentId: request.taskBinding.chatDocumentId,
+        });
+        // One ranked selection per operation: the registry owns the
+        // candidate order and issues every reservation through this session
+        // (plan §3.3).
+        selection = deps.openRunnerSelection({
+          session,
+          mode: row.providerMode,
+          taskStage: request.taskStage,
+        });
+      } finally {
+        start.release();
+      }
+      return await runProviderRow(
+        row,
+        request.cancellationToken,
+        session,
+        selection,
+        validation.input,
+        stage,
+        acquireLeasePhase,
+        metrics
+      );
+    } finally {
+      progress.end();
+    }
+  }
+
+  async function executeAction(request: TaskActionRequestV1): Promise<TaskActionOutcomeV1> {
+    const row = deps.registry.rowForActionKey(request.actionKey);
+    const operationRef: { operationId?: OperationIdV1 } = {};
+    const metrics: ResultMetricsCaptureV1 = {};
+
+    const outcome = await executeValidatedAction(row, request, operationRef, metrics);
+
+    // Exactly one sanitized settlement record per invocation, under the
+    // row's declared logging policy (plan §3.8; §2.2 log-content rule).
+    deps.auditLogger.log(
+      buildSettlementRecord(
+        row.loggingPolicy,
+        row.actionKey,
+        request.taskBinding.taskBindingId,
+        operationRef.operationId,
+        outcome,
+        metrics
+      )
+    );
+
+    // The row's declared follow-up is consumed here — no lease is held, so a
+    // synchronous scheduler may immediately coordinate the follow-up against
+    // the same task — and only for a completed outcome: at most one
+    // follow-up per invocation (plan §3.8 / AC-LIFECYCLE-02).
+    if (
+      outcome.kind === "completed" &&
+      row.followUpActionKey !== undefined &&
+      operationRef.operationId !== undefined
+    ) {
+      deps.followUpScheduler.schedule({
+        followUpActionKey: row.followUpActionKey,
+        sourceActionKey: row.actionKey,
+        sourceOperationId: operationRef.operationId,
+        taskBinding: request.taskBinding,
+      });
+    }
+
+    return outcome;
+  }
+
+  async function executeResume(
+    request: TaskActionResumeRequestV1,
+    operationRef: { operationId?: OperationIdV1 },
+    rowRef: { row?: ProviderTaskActionRowV1 },
+    metrics: ResultMetricsCaptureV1
+  ): Promise<TaskActionOutcomeV1> {
+    if (!isHex128IdV1(request.resumeIdempotencyId)) {
+      return { kind: "failed", code: "invalidResumeIdempotencyId", retryable: false };
+    }
+
+    const loaded = await deps.orchestrator.loadInteraction(request.interaction);
+    if (loaded.kind === "storageUnavailable") {
+      return unavailableV1("workflowStorageUnavailable");
+    }
+    if (loaded.kind !== "ok") {
+      // "unknown" (no transaction / mismatched interaction id) and
+      // "recoveryRequired" (corrupt record) are both AC-CHAT-TX-03's
+      // read-only, non-resumable states: Resume surfaces Chat recovery and
+      // never reaches a provider.
+      return { kind: "recoveryRequired", code: "chatRecoveryRequired" };
+    }
+    const record = loaded.record;
+
+    // §5.5 revalidation 1: the caller's task/document binding must be the
+    // transaction's recorded binding.
+    if (
+      record.correlation.taskBindingId !== request.taskBinding.taskBindingId ||
+      record.correlation.chatDocumentId !== request.taskBinding.chatDocumentId
+    ) {
+      return { kind: "failed", code: "resumeBindingMismatch", retryable: false };
+    }
+
+    // §5.5 revalidation 2: current registry eligibility. The recorded action
+    // must still be a registered provider row whose declared Resume
+    // semantics match what the transaction recorded — registry drift fails
+    // closed rather than resuming under semantics the record never bound.
+    if (!deps.registry.hasActionKey(record.correlation.actionKey)) {
+      return { kind: "failed", code: "resumeActionUnavailable", retryable: false };
+    }
+    const row = deps.registry.rowForActionKey(record.correlation.actionKey);
+    if (row.kind !== "provider") {
+      return { kind: "failed", code: "resumeActionUnavailable", retryable: false };
+    }
+    rowRef.row = row;
+    if (row.resumeSemantics !== record.resumeSemantics) {
+      return { kind: "failed", code: "resumeSemanticsChanged", retryable: false };
+    }
+    const ineligible = eligibilityFailure(row, request.taskStatus, request.taskStage);
+    if (ineligible) {
+      return ineligible;
+    }
+
+    // Resume requires submitted answers. A settled record is re-drivable
+    // only under the identical recorded idempotency id (§3.1's crash
+    // recovery) — the replay recovers the recorded resolution and its bound
+    // attempt; any other Resume of a settled interaction is the rejected
+    // second Resume.
+    if (record.state === "questionsPosted" || record.state === "answersDraft") {
+      return { kind: "failed", code: "answersNotSubmitted", retryable: false };
+    }
+    if (
+      record.state === "settled" &&
+      (record.resumeResolution === undefined ||
+        record.resumeIdempotencyId !== request.resumeIdempotencyId)
+    ) {
+      return { kind: "failed", code: "interactionAlreadySettled", retryable: false };
+    }
+    const answers = record.answers;
+    if (answers === undefined) {
+      return { kind: "failed", code: "answersNotSubmitted", retryable: false };
+    }
+
+    // §5.5 revalidation 3: reconstruct the action input from the persisted
+    // validated-input snapshot (already digest-verified by the store's
+    // strict decoder) and re-run the row's OWN validator — the snapshot's
+    // advisory revisions are revalidated by exactly the validator that
+    // produced them (AC-QUESTION-03).
+    let snapshotInput: unknown;
+    try {
+      snapshotInput = JSON.parse(record.inputSnapshot.canonicalJson) as unknown;
+    } catch {
+      return { kind: "recoveryRequired", code: "chatRecoveryRequired" };
+    }
+    const validation = row.validateInput(snapshotInput);
+    if (!validation.ok) {
+      return { kind: "failed", code: "invalidActionInput", retryable: false };
+    }
+
+    if (request.cancellationToken.isCancellationRequested) {
+      // Cancelled before settlement: the transaction is untouched and the
+      // interaction remains resumable.
+      return { kind: "cancelled", code: "userCancelled" };
+    }
+
+    // The task-operation lease closure is bound to the SOURCE operation:
+    // that is the interaction being consumed, and for a replacement Resume
+    // the fresh linked operation id does not exist until the transaction
+    // settles — which must happen strictly AFTER duplicate rejection, so a
+    // duplicateRejected Resume leaves the interaction resumable.
+    const acquireLeasePhase: AcquireTaskLeasePhaseV1 = () => {
+      if (!row.requiresTaskOperationLease) {
+        return { ok: true, release: (): void => undefined };
+      }
+      const acquired = deps.leaseStore.acquire(
+        request.taskBinding.taskBindingId,
+        row.actionKey,
+        record.correlation.operationId
+      );
+      if (!acquired.ok) {
+        return { ok: false, outcome: acquired.outcome };
+      }
+      const { leaseId } = acquired.lease;
+      return {
+        ok: true,
+        release: (): void => {
+          deps.leaseStore.release(leaseId);
+        },
+      };
+    };
+
+    // Presentation begins under the source operation's identity — for
+    // `sameOperation` semantics that IS the resumed operation; a replacement
+    // operation's id is allocated only at settlement, below.
+    const progress = deps.presenter.beginProgress({
+      actionKey: row.actionKey,
+      operationId: record.correlation.operationId,
+      progressLabel: row.progressLabel,
+    });
+    try {
+      // START lease phase: duplicate rejection plus settlement and selection
+      // setup, released before the provider wait (plan §6.1 rule 6).
+      const start = acquireLeasePhase();
+      if (!start.ok) {
+        return start.outcome;
+      }
+      let resolution: ResumeResolutionV1;
+      let session: ProviderSelectionSessionV1;
+      let selection: V1RunnerSelectionV1;
+      try {
+        try {
+          // Settle the transaction exactly once (§5.5): resolveResume
+          // journals `resumeScheduled` before settlement and replays the
+          // recorded resolution for the identical idempotency id.
+          resolution = await deps.orchestrator.resolveResume(
+            request.interaction,
+            request.resumeIdempotencyId
+          );
+        } catch (error) {
+          if (error instanceof ActionConversationErrorV1) {
+            // The persisted record refused the transition or storage failed
+            // mid-schedule; no provider ran, so the caller may retry.
+            return { kind: "failed", code: "resumeNotSettled", retryable: true };
+          }
+          throw error;
+        }
+        const operationId =
+          resolution.kind === "sameOperation"
+            ? resolution.operationId
+            : resolution.replacementOperationId;
+        operationRef.operationId = operationId;
+
+        // Local, in-memory bookkeeping only (no I/O, cannot itself be "the
+        // invocation") — this, and everything `runProviderRow` does before
+        // its own invocation-boundary gate (attempt allocation, reservation,
+        // prompt construction), happens before the durable claim, so a
+        // crash anywhere here leaves no claim at all and the interaction
+        // stays fully retryable (plan §3.1 / AC-RUNNER-03: "move the durable
+        // transition to the actual reservation/invocation boundary").
+        session = openProviderSelectionSessionV1(
+          {
+            actionKey: row.actionKey,
+            operationId,
+            taskBindingId: request.taskBinding.taskBindingId,
+            chatDocumentId: request.taskBinding.chatDocumentId,
+          },
+          // A `sameOperation` Resume executes under exactly the attempt id
+          // the settled linkage binds to (§3.1's exactly-one-attempt rule /
+          // AC-ID-04) — including an identical-id crash replay, whose
+          // replayed resolution carries the RECORDED `newAttemptId`, so the
+          // re-drive recovers the recorded attempt instead of invoking an
+          // unbound fresh one. Fallback attempts within the run still
+          // allocate globally fresh ids (AC-ID-02). A replacement
+          // operation's linkage is the operation id itself, so its attempts
+          // are always fresh.
+          resolution.kind === "sameOperation"
+            ? { firstAttemptId: resolution.newAttemptId }
+            : undefined
+        );
+        selection = deps.openRunnerSelection({
+          session,
+          mode: row.providerMode,
+          taskStage: request.taskStage,
+        });
+      } finally {
+        start.release();
+      }
+
+      // Durable invocation-once claim gate (plan §3.1 / AC-RUNNER-03):
+      // `runProviderRow` checks this exactly once, immediately before the
+      // TRUE invocation boundary — the broker's `invoke` call, after
+      // transport construction and broker pre-invocation setup, not its
+      // own attempt allocation, reservation, or prompt construction
+      // (module header, "THE CLAIM'S EXACT POSITION"). A settled Resume
+      // resolution replays idempotently for the identical
+      // resumeIdempotencyId (crash recovery), but the provider invocation it
+      // drives must run at most once. Claiming — over the durable
+      // transaction store, not just this in-memory session — is what makes
+      // that true across a restart: if a prior drive (this process or a
+      // concurrent one, e.g. a second extension-host window replaying the
+      // same crash) already claimed this invocation, this drive must not
+      // invoke the provider again.
+      let invocationClaimedByThisDrive = false;
+      const claimInvocationOnce = async (): Promise<ResumeInvocationClaimGateResultV1> => {
+        const claim = await deps.orchestrator.claimResumeInvocation(request.interaction);
+        if (!claim.ok) {
+          return {
+            proceed: false,
+            outcome:
+              claim.code === "workflowStorageUnavailable"
+                ? unavailableV1("workflowStorageUnavailable")
+                : { kind: "failed", code: "resumeInvocationClaimFailed", retryable: true },
+          };
+        }
+        if (claim.alreadyClaimed) {
+          if (claim.recoveredOutcome !== undefined) {
+            // The claimed invocation already ran to completion and its exact
+            // terminal outcome was durably recorded: recover and return it
+            // instead of invoking the provider again ("recover the claimed
+            // terminal result").
+            return { proceed: false, outcome: claim.recoveredOutcome };
+          }
+          // Claimed, with no recorded outcome yet: genuinely in-flight or
+          // unknown (still running elsewhere, or crashed mid-invocation).
+          // There is no way to tell those apart, so fail closed rather than
+          // risk a second invocation.
+          return {
+            proceed: false,
+            outcome: { kind: "failed", code: "resumeInvocationAlreadyClaimed", retryable: false },
+          };
+        }
+        invocationClaimedByThisDrive = true;
+        return { proceed: true };
+      };
+
+      // NOTE: a resumed `sameOperation` run that returns questions AGAIN
+      // cannot persist a second transaction for the same operation
+      // (AC-CHAT-TX-01's exclusive-create); the write-through failure path
+      // maps that to the retryable `chatTransactionNotRecorded` failure and
+      // surfaces nothing unresumable.
+      const outcome = await runProviderRow(
+        row,
+        request.cancellationToken,
+        session,
+        selection,
+        validation.input,
+        record.stage,
+        acquireLeasePhase,
+        metrics,
+        answers,
+        claimInvocationOnce
+      );
+      // Best-effort durable mirror of the claimed invocation's terminal
+      // outcome (plan §3.1 / AC-RUNNER-03): makes it recoverable by a later
+      // replay instead of only ever failing closed. The REAL outcome above
+      // is returned to this caller regardless of whether this write
+      // succeeds — a mirror failure just means a future replay falls back
+      // to the in-flight/unknown fail-closed path, exactly as before this
+      // outcome was ever recorded. Only recorded when THIS drive actually
+      // won the claim: a gate rejection (`alreadyClaimed`, storage failure,
+      // or no candidate ever reached) never claimed anything for this drive
+      // to mirror.
+      if (invocationClaimedByThisDrive) {
+        await deps.orchestrator.recordResumeInvocationOutcome(request.interaction, outcome);
+      }
+      return outcome;
+    } finally {
+      progress.end();
+    }
+  }
+
+  async function resumeAction(request: TaskActionResumeRequestV1): Promise<TaskActionOutcomeV1> {
+    const operationRef: { operationId?: OperationIdV1 } = {};
+    const rowRef: { row?: ProviderTaskActionRowV1 } = {};
+    const metrics: ResultMetricsCaptureV1 = {};
+
+    const outcome = await executeResume(request, operationRef, rowRef, metrics);
+
+    // Exactly one sanitized settlement record per Resume invocation. A
+    // Resume rejected before its interaction's row was resolved has no row
+    // policy to honor, so it logs under the fixed fallback channel with no
+    // metrics — still only §2.2-permitted fields.
+    const row = rowRef.row;
+    deps.auditLogger.log(
+      buildSettlementRecord(
+        row?.loggingPolicy ?? RESUME_FALLBACK_LOGGING_POLICY_V1,
+        row?.actionKey ?? RESUME_UNRESOLVED_ACTION_KEY_V1,
+        request.taskBinding.taskBindingId,
+        operationRef.operationId,
+        outcome,
+        metrics
+      )
+    );
+
+    // The row's declared follow-up applies to a resumed completion exactly
+    // as to a fresh one: at most one, consumed after lease release
+    // (plan §3.8 / AC-LIFECYCLE-02).
+    if (
+      outcome.kind === "completed" &&
+      row !== undefined &&
+      row.followUpActionKey !== undefined &&
+      operationRef.operationId !== undefined
+    ) {
+      deps.followUpScheduler.schedule({
+        followUpActionKey: row.followUpActionKey,
+        sourceActionKey: row.actionKey,
+        sourceOperationId: operationRef.operationId,
+        taskBinding: request.taskBinding,
+      });
+    }
+
+    return outcome;
+  }
+
+  return {
+    executeAction,
+    executeRoute(
+      routeId: string,
+      request: Omit<TaskActionRequestV1, "actionKey">
+    ): Promise<TaskActionOutcomeV1> {
+      const row = deps.registry.rowForRoute(routeId);
+      return executeAction({ ...request, actionKey: row.actionKey });
+    },
+    resumeAction,
+  };
+}

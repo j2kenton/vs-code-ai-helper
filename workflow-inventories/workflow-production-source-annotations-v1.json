@@ -1,0 +1,1063 @@
+{
+  "schemaVersion": 1,
+  "description": "Every addition, removal, or content modification in the production TS/JS bundle graph or shipped-asset set since the immutable pre-gate snapshot (workflow-production-source-pregate-v1.json, frozen at commit bdced3e / \"0.64.2\") must have exactly one entry here recording its cohort, rationale, owner, expiry cohort, and content-digest evidence, plus the four mandatory §1.5 descriptive evidence fields (symbol, sourceSpan, edgeKind, targetActionKey). resolveProductionSourceUniverse.mjs fails closed on any drift missing an entry, on any entry missing a required evidence field, and on any entry whose evidence.liveSha256 no longer matches the file it annotates (stale evidence). liveSha256 values are CANONICAL content digests (CRLF->LF-normalized for text, verbatim bytes for binary — scripts/lib/productionSourceScan.mjs), so the same committed content yields the same evidence digest on every OS and git line-ending checkout profile. Note: src/types/vscodeLmCompatV1.ts is intentionally NOT annotated — it is a type-only module that esbuild elides from the production bundle metafile, so it is not a member of the production source universe (the LM boundary verifier still treats it as a boundary file).",
+  "pregateGitRef": "bdced3e",
+  "annotations": [
+    {
+      "path": "src/services/workflowPrivacyClassifierV1.ts",
+      "disposition": "added",
+      "cohort": "privacy",
+      "planSection": "2.2",
+      "rationale": "The shared privacy classifier (Privacy cohort, executable-order step 7): classifyWorkflowPathV1 maps any task/workflow path into the plan's six data classes (artifact-safe, Chat-private, workflow-control, transient provider data, sanitized diagnostics, legacy Chat-private artifact) by path shape alone, and isWorkflowPrivatePathV1 answers §2.2's exclusion question (and §2.4's private-or-control staging rule) with one predicate. Enters the production bundle via its two Privacy-cohort consumers: contextPack.ts (isWorkflowPrivatePathV1 on every pack candidate) and runLog.ts (classifyWorkflowPathV1 on every log path). WorkflowPathRegistryV1 (plan §2.1, src/services/workflowPathRegistryV1.ts) landed in the same cohort as the allocation authority over the §2.1 path families; it is test-covered but not yet bundle-reachable — its adopting cohorts (Chat, Creation, Runner V1 spool wiring) pull it into the universe when they wire allocation through it, so it is intentionally absent from this inventory (same treatment as the Foundations file/lease stores). Evidence refresh 2026-07-27 (Privacy cohort, workflow-control completeness round — closing the implementation review's step-7 completion blocker): the classifier now also covers the two existing crash-surviving control records it previously defaulted to artifact-safe — the meta-root migration journal .ensemble-migration.json (owner utils/metaResourcesMigration.ts MIGRATION_JOURNAL_FILENAME, now exported for pinning) joins WORKFLOW_CONTROL_BASENAMES, and the new ATOMIC_WRITE_TEMP_RE classifies state/writeAtomic.ts's `<base>_temp_<session>_<time>_<rand>.tmp<ext>` temporaries (owner convention now exported as ATOMIC_TEMP_INFIX/ATOMIC_TEMP_SUFFIX and used by the owner's own filename construction) as workflow-control. workflowPrivacyClassifierV1.test.ts pins both against the owners' exports, and contextPackPrivacyExclusion.test.ts proves both record shapes are rejected from context packs end to end. Evidence refresh 2026-07-27 second pass (closing the review's remaining atomic-convention drift gap): the atomic pinning no longer reconstructs the layout from the ATOMIC_TEMP_INFIX/ATOMIC_TEMP_SUFFIX tokens — state/writeAtomic.ts now exports formatAtomicTempBasename as the single complete-layout owner, and production temp names plus both tests' fixtures are all built by that one function, so reordering the owner's layout cannot leave real files unclassified while the tests keep passing.",
+      "owner": "j2kenton",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "liveSha256": "77b08bf5e2a870a7c2fa56a2eacded96420d3a13b6593c998eedfb1a8a475fe5",
+        "symbol": "classifyWorkflowPathV1, isWorkflowPrivatePathV1, WorkflowPathClassV1",
+        "sourceSpan": "L1-L221 (whole file; WORKFLOW_CONTROL_BASENAMES incl. .ensemble-migration.json at L87-L94, ATOMIC_WRITE_TEMP_RE at L124, leaf check at L192-L198)",
+        "edgeKind": "privacy-classifier",
+        "targetActionKey": "n/a (shared §2.2 privacy contract; consumed by the non-AI path-consumer rows)"
+      }
+    },
+    {
+      "path": "src/utils/contextPack.ts",
+      "disposition": "modified",
+      "cohort": "privacy",
+      "planSection": "2.2",
+      "rationale": "Privacy-cohort wiring of the plan's named context-pack consumer (path-consumer row src/utils/contextPack.ts, migrationCohort privacy): isWorkflowPrivatePathV1 now runs on every pack candidate — open-editor documents (literal path in isEligibleDocument and the symlink-resolved target path), every tracked implementation-review path read from task-progress.json, and every deterministically mapped test path — rejecting Chat-private, workflow-control, transient-provider, and legacy Chat-artifact paths that the basename denylist alone could not catch (e.g. task-progress.json, runs/chat-*.md, workflow-runtime-v1/**). Exclusion notes in the generated pack now name the private/control category. Covered by contextPackPrivacyExclusion.test.ts.",
+      "owner": "j2kenton",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "liveSha256": "eb28dd8a724142b7664124f256a099821203021b148eb4efd01b10ec2c53b43b",
+        "symbol": "isEligibleDocument, generateImplReviewContextPack",
+        "sourceSpan": "L18 (import), L124-L131 + L176-L181 (open-editor candidate classification), L577-L586 (tracked-path classification), L629 (mapped test paths)",
+        "edgeKind": "context-pack",
+        "targetActionKey": "n/a (non-AI path consumer; plan §2.2/§2.3)"
+      }
+    },
+    {
+      "path": "src/utils/runLog.ts",
+      "disposition": "modified",
+      "cohort": "privacy",
+      "planSection": "2.2",
+      "rationale": "Privacy-cohort wiring of the plan's named log-attachment consumer (path-consumer row src/utils/runLog.ts, migrationCohort privacy): the exported assertRunLogPathArtifactSafe guard classifies every computed runs/ log path with classifyWorkflowPathV1 before any byte is written and refuses any name that does not classify artifact-safe — a legacy Chat-private runs/chat-*.md transcript can never be overwritten by (or minted as) a run log. writeRunLog calls the guard before its workspace.fs write. Covered by runLogPrivacyGuard.test.ts.",
+      "owner": "j2kenton",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "liveSha256": "90416bf849e84f33c6cc377ac80fe0ad3cc5a08d333ceb1c7f756ae12634308d",
+        "symbol": "assertRunLogPathArtifactSafe, writeRunLog",
+        "sourceSpan": "L4 (import), L40-L57 (guard), L74 (writeRunLog call)",
+        "edgeKind": "log-attachment",
+        "targetActionKey": "n/a (non-AI path consumer; plan §2.2)"
+      }
+    },
+    {
+      "path": "src/services/legacyAiActionSafetyGateV0.ts",
+      "disposition": "added",
+      "cohort": "safety",
+      "planSection": "1.3",
+      "rationale": "Fail-closed AI action safety gate: registers every baseline question-capable/edit-capable route identity, DISABLES all eleven of them via LEGACY_AI_ROUTE_DISABLED_V0 until each route's V1 coordinator replacement lands (plan §1.3/§8 staged migration), and rejects both unauthorized V1-correlated requests and legacy uncorrelated invocations at the shared runner/provider boundary (LEGACY_UNCORRELATED_RUNNER_INVOCATION_REJECTED_V0). Wired at the first statement of every gated handler and wrapper route (see src/test/legacyAiActionSafetyGateWiring.test.ts); the unit-test harness (test-stubs/register.js) suspends both switches so behavioral suites can keep covering the retained legacy machinery.",
+      "owner": "j2kenton",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "liveSha256": "9e105f159943b75209e5b6f408e00eb9034eef1fa6d2c0c82a48b599c23602ac",
+        "symbol": "assertLegacyAiRouteAllowedV0, isLegacyAiRouteDisabledV0, assertNoUnauthorizedV1CorrelationV0, LEGACY_AI_ROUTE_DISABLED_V0",
+        "sourceSpan": "L1-L226 (whole file)",
+        "edgeKind": "runner-boundary",
+        "targetActionKey": "multiple — every route id in LEGACY_AI_ROUTE_DISABLED_V0 (draft.v1 … commitPushMetadata.v1)"
+      }
+    },
+    {
+      "path": "src/state/legacyCreatingStartupGateV0.ts",
+      "disposition": "added",
+      "cohort": "safety",
+      "planSection": "1.4",
+      "rationale": "Replaces implicit `creating`-task promotion at both recoverCompletedTaskCreations() call sites (activation and inside startNewTask()) with a read-only classification pass that never rewrites progress, adopts ownership, or infers completion from task.md. Publishes the activation-order barrier every lifecycle command now awaits before its first task-state read. Doc comment additionally records that TaskInventory.refresh() self-gates on the same barrier (implementation-review hardening).",
+      "owner": "j2kenton",
+      "expiryCohort": "creation",
+      "evidence": {
+        "liveSha256": "e1db0aabc8f47d5f56b8bc56228bba31eb6ed3294f15f172b1ec0e85ab1a8f34",
+        "symbol": "LegacyCreatingStartupGateV0",
+        "sourceSpan": "L1-L159 (whole file)",
+        "edgeKind": "activation-barrier",
+        "targetActionKey": "creation lifecycle rows (plan §1.2 route table; superseded by TaskCreationStartupReconcilerV1 in §4.1)"
+      }
+    },
+    {
+      "path": "src/services/vscodeLmCompat.ts",
+      "disposition": "added",
+      "cohort": "lmIsolation",
+      "planSection": "1.6",
+      "rationale": "VS Code Language Model API compatibility boundary: moves every post-1.93 LM tool/stream/message-content access behind guarded `unknown` lookups against the structural VscodeLmModuleV1 shape, so production code (and normally-compiled tests) compile against the pinned @types/vscode@1.93.0 declarations with zero direct post-1.93 references. Includes the parts-array message builders (createLmAssistantMessageWithPartsV1 / createLmUserMessageWithPartsV1) that absorbed the runner's former inline casts.",
+      "owner": "j2kenton",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "liveSha256": "9d71af22862bde430ec2713a68088a3f59fcee100d3505cfaeaec6dddb505233",
+        "symbol": "probeLmToolCallingHostCapabilityV1, attachLmToolsV1, iterateLmResponsePartsV1, createLmAssistantMessageWithPartsV1, createLmUserMessageWithPartsV1",
+        "sourceSpan": "L1-L244 (whole file)",
+        "edgeKind": "lm-compat-boundary",
+        "targetActionKey": "implementation.v1 (sole production consumer: the Copilot implementation edit runner)"
+      }
+    },
+    {
+      "path": "package.json",
+      "disposition": "modified",
+      "cohort": "baseline",
+      "planSection": "1.1",
+      "rationale": "Added the package-manager scripts this plan's verification chain needs (generate:workflow-production-source-pregate, generate:workflow-inventory-pregate — the one-time immutable pre-gate route/path-consumer snapshot generator — generate:workflow-production-sources, verify:workflow-production-sources, verify:vscode-lm-boundary, check-types:vscode-1.93-compat, generate:task-progress-fields, verify:task-progress-fields, and — completing step 1's inventory surface — generate:workflow-routes, verify:workflow-route-baseline/-live, verify:route-annotations, verify:route-removals, generate:/verify:workflow-path-consumers, generate:/verify:task-progress-history), wired verify:vscode-lm-boundary + verify:workflow-production-sources into the \"package\" script, and pinned @types/vscode to exactly 1.93.0 (plan §1.6 step 6, together with the pnpm-lock.yaml resolution). No engine or contribution change. package.json is a first-party bundle input via the documented KNOWN_NON_SOURCE_INPUTS exception (scripts/resolveProductionSourceUniverse.mjs), which is why its digest is tracked here at all. Evidence refresh 2026-07-26: the user released 0.65.1 (a133430) and 0.65.2 (06aeaa6) after this annotation was recorded; substituting \"0.65.0\" back into the file reproduced the previously recorded digest exactly, proving the version field is the only change since review. Evidence refresh 2026-07-26 (Runner V1 cohort, executable-order step 5): added the two plan-named unit suites test:workflow:runner-output-capture (broker/spool-store/CLI-capture suites for §3.2's bounded result capture) and test:workflow:provider-reservations (§3.3's selection/reservation split suite) — script additions only, no dependency, engine, or contribution change. Evidence refresh 2026-07-26 (step-5 completion round): test:workflow:provider-reservations now additionally runs out/test/runnerRegistryV1Selection.test.js, covering the registry's openV1RunnerSelection reservation-based selection (the implementation review's step-5 integration blocker) — again a script-line-only change. Evidence refresh 2026-07-26 (step-5 CLI-cutover round): test:workflow:runner-output-capture now additionally runs out/test/cliTextTransportV1.test.js, the transport-level suite proving a structured-event CLI's captured payload parses as exactly one strict framed envelope (the implementation review's CLI-framing completion blocker) — again a script-line-only change. Evidence refresh 2026-07-26 (suite-green round): the user released 0.65.3 (bf2fc41) after the previous refresh; substituting \"0.65.2\" back into the current file reproduces the previously recorded digest (7ee538f2b44ca4138c56f06aec0ee0a8848b24db6791c75c5c662b2af5287742) exactly, proving the version field is again the only change since review. liveSha256 is the canonical (LF-normalized) digest of the current content per the digest-portability fix. Evidence refresh 2026-07-26 (Foundations cohort, executable-order step 6 slice): added the plan-named verify:progress-reader-fence script (plan §3.12 step 2 — scripts/verifyProgressReaderFence.mjs, the import-boundary verifier fencing V1 modules from utils/taskProgressUtils and its LegacyTaskProgressReaderV0/WriterV0 wrapper) — a single script-line addition; no dependency, engine, or contribution change. Evidence refresh 2026-07-26 (Foundations cohort, strict-progress-stack round): added the three plan-named verification scripts for §3.10/§3.11 — verify:task-progress-selection (out/test/taskProgressDecoderV1.test.js, strict version selection + fail-closed decoding), verify:task-progress-migration (out/test/taskProgressWriterV1.test.js, splice-based migration/byte-identical opaque preservation), and verify:task-progress-field-policy (out/test/taskProgressFieldPolicyV1.test.js, the exhaustive per-field transition policy) — script-line-only additions; no dependency, engine, or contribution change. Evidence refresh 2026-07-26 (Foundations cohort, registry/coordinator round): added the two plan-named suites test:workflow:correlation (out/test/taskActionRegistryV1.test.js + out/test/taskActionCoordinatorV1.test.js, §3.8 registry/coordinator with §3.1 correlation propagation) and test:workflow:resume-semantics (out/test/actionConversationOrchestratorV1.test.js, per-row ResumeSemanticsV1 / AC-ID-04); removing exactly those two script lines from the current LF-normalized content reproduces the previously recorded digest (c3494294f8d7208cb40e1e848de17c6448c6a94efe92fb0e353b40c183da07fb), proving they are the only change since review — script-line-only additions; no dependency, engine, or contribution change. Evidence refresh 2026-07-27 (Foundations cohort, structured-question schema-verification round): the user released 0.65.4 (e069caf) after the previous refresh, and this round added the plan-named verify:structured-questions script (plan §3.6 verification gate — compiles tsconfig.test.json, then runs scripts/verifyStructuredQuestions.mjs, the schema/fixture/decoder-parity verifier for the structured question/answer wire contract); removing exactly that script line and substituting \"0.65.3\" back into the current LF-normalized content reproduces the previously recorded digest (139eb32987334e7160313d172d833ec515bcb29c5488243ebb0eebd888ead572) exactly, proving the version bump and that single script line are the only changes since review — no dependency, engine, or contribution change. Evidence refresh 2026-07-27 (Chat cohort, executable-order step 8 / §5.5 transaction-store round): added the two plan-named script lines generate:chat-transaction-fixtures (compiles tsconfig.test.json, then runs scripts/generateChatTransactionFixtures.mjs — the digest-correct regenerator for test-fixtures/chat-transactions/) and test:workflow:chat-transactions (plan §11.2's Chat-transaction suite — out/test/chatInteractionTransactionStoreV1.test.js, the durable §5.5 store/decoder/fixture coverage); removing exactly those two script lines from the current LF-normalized content reproduces the previously recorded digest (e88049bfb4bc1160752999f836e4e828fa859133f079038f3d454573e26b918c) exactly, proving they are the only change since review — no dependency, engine, or contribution change. Evidence refresh 2026-07-27 (Chat cohort, recovery-command contribution round — closing the implementation review's step-8 recovery-UX gap): added the vs-code-ai-helper.openChatData and vs-code-ai-helper.resetChatHistory command contributions to the contributes.commands block (Open Chat Data / Reset Chat History, plan §5.1's recovery UX), wired to ChatViewProvider.openChatDataForCurrentTarget / resetHistoryForCurrentTarget in extension.ts (see that file's own evidence refresh) — a contribution-manifest addition only, no script/dependency/engine change.",
+      "owner": "j2kenton",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "liveSha256": "550ec76d245140ab1d98bb37688df10d8edab3d89fcbc5627345e5a41a639010",
+        "symbol": "scripts, contributes.commands, devDependencies[\"@types/vscode\"]",
+        "sourceSpan": "contributes.commands block (openChatData/resetChatHistory entries) + scripts block (incl. verify:task-progress-selection/-migration/-field-policy, verify:progress-reader-fence, verify:structured-questions, test:workflow:correlation/-resume-semantics, and generate:chat-transaction-fixtures / test:workflow:chat-transactions) + devDependencies block",
+        "edgeKind": "build-manifest",
+        "targetActionKey": "n/a (build manifest; not a route)"
+      }
+    },
+    {
+      "path": "src/extension.ts",
+      "disposition": "modified",
+      "cohort": "safety",
+      "planSection": "1.4",
+      "rationale": "Replaces the fire-and-forget recoverTaskCreations() activation call with LegacyCreatingStartupGateV0.beginClassification(), and gates the first inventory.refresh() plus the file-system-watcher and configuration-change refresh callbacks behind the resulting startupGateReady barrier so no code path can publish task inventory before the read-only creating-folder classification pass completes. (TaskInventory.refresh() now also awaits the barrier internally as defense-in-depth; these explicit chains remain the visible, test-asserted ordering contract.) Evidence refresh 2026-07-27 (Chat cohort, executable-order step 8 wiring round — closing the implementation review's completion blocker that this module was entirely unwired): configures the shared workflow private-storage root from context.globalStorageUri (creating the directory first, since VS Code does not), constructs the durable ChatInteractionTransactionStoreV1 and wires it into workflowRuntimeServicesV1.ts via setChatInteractionTransactionStoreV1, calls chatViewProvider.setInteractionServices(...) with real submitAnswers/cancel implementations, and registers the vs-code-ai-helper.openChatData / vs-code-ai-helper.resetChatHistory recovery commands. Resume is intentionally left unwired (requires the action coordinator, which nothing in production constructs yet). Evidence refresh 2026-07-27 second pass (closing the implementation review's completion blocker that Answer/Cancel validated only the interaction id, not the full task/document binding): submitAnswers/cancel now route through the new src/actions/actionConversationOrchestratorV1.ts (createActionConversationOrchestratorV1) instead of calling chatInteractionTransactionStore directly — the orchestrator's loadValidated rejects a reference whose taskBindingId/chatDocumentId (now supplied by chatView.ts, derived server-side) does not match the persisted transaction's own recorded binding, not only a mismatched interaction id. mapChatTransactionResultToServiceResultV1 is removed (dead once nothing calls the raw store directly) and replaced by runChatConversationAction, which maps the orchestrator's thrown ActionConversationErrorV1 / SubmitAnswersResultV1 onto the same webview-facing result shape.",
+      "owner": "j2kenton",
+      "expiryCohort": "creation",
+      "evidence": {
+        "liveSha256": "187d3ac63098d1d387c0e1c6fe61e2f04a195973abc685018ba15aff16c69323",
+        "symbol": "activate, runChatConversationAction",
+        "sourceSpan": "LegacyCreatingStartupGateV0 barrier wiring (beginClassification + watcher/inventory-refresh chains) plus the Chat cohort's private-storage/transaction-store/conversation-orchestrator wiring and setInteractionServices call, and the openChatData/resetChatHistory command registrations, all inside activate()",
+        "edgeKind": "activation-barrier",
+        "targetActionKey": "n/a (activation wiring for the creation lifecycle rows)"
+      }
+    },
+    {
+      "path": "src/commands/startNewTask.ts",
+      "disposition": "modified",
+      "cohort": "safety",
+      "planSection": "1.4",
+      "rationale": "Removes the in-command recoverCompletedTaskCreations() call (the second of the two implicit-promotion call sites named in the plan) and replaces it with LegacyCreatingStartupGateV0.waitUntilReady()/getFootprints(), surfacing a read-only notification instead of silently promoting a legacy `creating` folder to `paused`.",
+      "owner": "j2kenton",
+      "expiryCohort": "creation",
+      "evidence": {
+        "liveSha256": "a81e4282524ec950ce0d6f0e73b16637cefbac3c5b9f8d9ed78c5b89ea59a8cb",
+        "symbol": "startNewTask",
+        "sourceSpan": "L190-L260 (waitUntilReady at L196; read-only footprint consultation at L246-L260)",
+        "edgeKind": "command-handler",
+        "targetActionKey": "creation lifecycle rows (Retry/Open/Adopt-and-Retry/Safe Delete, plan §1.2)"
+      }
+    },
+    {
+      "path": "src/state/taskInventory.ts",
+      "disposition": "modified",
+      "cohort": "safety",
+      "planSection": "1.4",
+      "rationale": "Implementation-review hardening of the activation-order barrier: TaskInventory.refresh() now awaits LegacyCreatingStartupGateV0.waitUntilReady() itself, before its first task-discovery read, so inventory publication respects the barrier even if a future refresh() trigger forgets to chain on extension.ts's startupGateReady. The extension.ts call-site chains remain in place as the explicit, test-asserted ordering contract; the self-gate is statically proven by legacyCreatingStartupGateWiring.test.ts. Evidence digests are canonical (LF-normalized) since the 2026-07-26 digest-portability fix, so liveSha256 is the original LF-content digest recorded at review time — the interim CRLF checkout drift that briefly staled this entry can no longer recur (barrier await still at L126, discoverAllTasks at L127).",
+      "owner": "j2kenton",
+      "expiryCohort": "creation",
+      "evidence": {
+        "liveSha256": "088da07f9392798e6cd5c98f64adcb1d1555f838e8b86b125e700500b4638980",
+        "symbol": "TaskInventory.refresh",
+        "sourceSpan": "L115-L127 (barrier await at L126, before discoverAllTasks at L127)",
+        "edgeKind": "activation-barrier",
+        "targetActionKey": "n/a (inventory publication ordering for the creation lifecycle rows)"
+      }
+    },
+    {
+      "path": "src/commands/resumeTask.ts",
+      "disposition": "modified",
+      "cohort": "safety",
+      "planSection": "1.4",
+      "rationale": "resumePausedTask (which also handles the completed-task Resume/reopen path) awaits LegacyCreatingStartupGateV0.waitUntilReady() as its first statement, so this lifecycle command's first task-state read cannot race the startup classification pass, matching the pattern used by startNewTask.ts.",
+      "owner": "j2kenton",
+      "expiryCohort": "creation",
+      "evidence": {
+        "liveSha256": "6428c4fb1ba9ccb14368558ed8421cc000ee88cc090901d6cbbb297b64b73622",
+        "symbol": "resumePausedTask",
+        "sourceSpan": "L90-L100 (waitUntilReady at L98)",
+        "edgeKind": "command-handler",
+        "targetActionKey": "resumeTask.v1"
+      }
+    },
+    {
+      "path": "src/commands/commitAndPushTask.ts",
+      "disposition": "modified",
+      "cohort": "safety",
+      "planSection": "10.1",
+      "rationale": "Extracts commitAndPushTaskCore and adds the process-global commitPushTokenHeld guard acquired as the first statement of both public entry points (commitAndPushTask, completeCommitAndPushTask), rejecting a duplicate invocation before argument normalization, task resolution, lint, prompts, or git setup. buildCommitMessage consults the isLegacyAiRouteDisabledV0(\"commitPushMetadata.v1\") kill switch before any read — while the AI metadata route is disabled pending its V1 migration it returns the deterministic fallback subject, keeping the non-AI commit flow working — and both public callbacks await LegacyCreatingStartupGateV0.waitUntilReady() (after the token check, which reads no task state) before their first task-state read (plan §1.4).",
+      "owner": "j2kenton",
+      "expiryCohort": "git",
+      "evidence": {
+        "liveSha256": "64fe0953826bd21c6658b8a78ee800d65940264260d07f4556c0de14e9c22758",
+        "symbol": "commitAndPushTask, completeCommitAndPushTask, commitAndPushTaskCore, buildCommitMessage",
+        "sourceSpan": "L215-L225 (buildCommitMessage kill switch at L218), L1530-L1590 (public entries; barriers at L1539/L1575)",
+        "edgeKind": "command-handler",
+        "targetActionKey": "Commit/Push coordinator rows (plan §1.2; metadata sub-step → commitPushMetadata.v1)"
+      }
+    },
+    {
+      "path": "src/commands/applyCurrentStageAction.ts",
+      "disposition": "modified",
+      "cohort": "safety",
+      "planSection": "1.3",
+      "rationale": "Adds assertLegacyAiRouteAllowedV0(\"applyCurrentStage.v1\") as the first statement of applyCurrentStageAction (plan §1.3 route-identity gate), followed by the LegacyCreatingStartupGateV0.waitUntilReady() activation barrier before its first task-state read (plan §1.4).",
+      "owner": "j2kenton",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "liveSha256": "55c51001bbc5b796ba37164015222d6a2daadbcc3d645f8e8352a5cf5b10c140",
+        "symbol": "applyCurrentStageAction",
+        "sourceSpan": "L25-L40 (gate at L30, barrier at L34)",
+        "edgeKind": "command-handler",
+        "targetActionKey": "applyCurrentStage.v1"
+      }
+    },
+    {
+      "path": "src/commands/chatWithStage.ts",
+      "disposition": "modified",
+      "cohort": "safety",
+      "planSection": "1.3",
+      "rationale": "Adds assertLegacyAiRouteAllowedV0(\"chatSend.v1\") as the first statement of chatWithStage, per plan §1.3's route-identity gate.",
+      "owner": "j2kenton",
+      "expiryCohort": "text3",
+      "evidence": {
+        "liveSha256": "2c8445dfc25a4f43ed18d7dea783f25f73bc80b1dc4cad8a5344c4daeff2be10",
+        "symbol": "chatWithStage",
+        "sourceSpan": "L345-L355 (gate at L351)",
+        "edgeKind": "command-handler",
+        "targetActionKey": "chatSend.v1"
+      }
+    },
+    {
+      "path": "src/commands/draftTaskWithAI.ts",
+      "disposition": "modified",
+      "cohort": "safety",
+      "planSection": "1.3",
+      "rationale": "Adds assertLegacyAiRouteAllowedV0(\"draft.v1\") as the first statement of draftTaskWithAI, per plan §1.3's route-identity gate.",
+      "owner": "j2kenton",
+      "expiryCohort": "text2",
+      "evidence": {
+        "liveSha256": "4b89f143e97ba2668b3720ebae76c1394cd1246774ae0aa3ffb25960d79573ac",
+        "symbol": "draftTaskWithAI",
+        "sourceSpan": "L460-L470 (gate at L467)",
+        "edgeKind": "command-handler",
+        "targetActionKey": "draft.v1"
+      }
+    },
+    {
+      "path": "src/commands/generatePlanWithAI.ts",
+      "disposition": "modified",
+      "cohort": "safety",
+      "planSection": "1.3",
+      "rationale": "Adds assertLegacyAiRouteAllowedV0(\"generatePlan.v1\") as the first statement of generatePlanWithAI, per plan §1.3's route-identity gate.",
+      "owner": "j2kenton",
+      "expiryCohort": "text1",
+      "evidence": {
+        "liveSha256": "b8dc528e6278d5d91bb1dd6f0018c813394faa7d3cbdf68d9ce5d7bb739fbd47",
+        "symbol": "generatePlanWithAI",
+        "sourceSpan": "L135-L145 (gate at L141)",
+        "edgeKind": "command-handler",
+        "targetActionKey": "generatePlan.v1"
+      }
+    },
+    {
+      "path": "src/commands/reviewActions.ts",
+      "disposition": "modified",
+      "cohort": "safety",
+      "planSection": "1.3",
+      "rationale": "Adds assertLegacyAiRouteAllowedV0 as the first statement of runReviewWithAI (\"review.v1\"), applyReviewWithAI (\"applyReview.v1\"), fastForwardReviewWithAI (\"fastForward.v1\"), generateImplementationWithAI (\"generateImplementation.v1\"), and runImplementationWithAI (\"implementation.v1\"), per plan §1.3's route-identity gate.",
+      "owner": "j2kenton",
+      "expiryCohort": "text3",
+      "evidence": {
+        "liveSha256": "ceb7cd22c1dc4a986c7e6eadcab13a539fa5e36f8193fda552c00f410503535e",
+        "symbol": "runReviewWithAI, applyReviewWithAI, fastForwardReviewWithAI, generateImplementationWithAI, runImplementationWithAI",
+        "sourceSpan": "one gate per handler: L2449, L2546, L2805, L3626, L4046",
+        "edgeKind": "command-handler",
+        "targetActionKey": "review.v1, applyReview.v1, fastForward.v1, generateImplementation.v1, implementation.v1"
+      }
+    },
+    {
+      "path": "src/commands/runLintingFixes.ts",
+      "disposition": "modified",
+      "cohort": "safety",
+      "planSection": "1.3",
+      "rationale": "Adds assertLegacyAiRouteAllowedV0(\"lint.v1\") as the first statement of runLintingFixes, per plan §1.3's route-identity gate (composite lint stays gated until its deterministic work and AI fallback both migrate).",
+      "owner": "j2kenton",
+      "expiryCohort": "edit",
+      "evidence": {
+        "liveSha256": "8836bfcb3d33783066d3b35d3e328c1189870d7da5fbddc3a36955deab17fe56",
+        "symbol": "runLintingFixes",
+        "sourceSpan": "L108-L118 (gate at L113)",
+        "edgeKind": "command-handler",
+        "targetActionKey": "lint.v1"
+      }
+    },
+    {
+      "path": "src/runners/runnerRegistry.ts",
+      "disposition": "modified",
+      "cohort": "safety",
+      "planSection": "1.3",
+      "rationale": "Adds assertNoUnauthorizedV1CorrelationV0(request) at every path through the shared runner/provider boundary (withQuotaObservation's run, resolveRunnerForModel's run, runImplementationForModel) — the provider/runner backstop plan §1.3 calls for. With LEGACY_UNCORRELATED_RUNNER_INVOCATION_REJECTED_V0 enabled, this now rejects legacy uncorrelated invocations too, not only unauthorized V1-correlated ones. Runner V1 cohort (plan §3.3/§3.4, executable-order step 5, closing the implementation review's selection/invocation-split blocker): adds openV1RunnerSelection, the registry's V1 reservation-based selection — it reuses the exact legacy ranking policy (resolveEffectiveProvider for the stored primary, backupModelsForStage for strategy-gated fallbacks), rejects mode-incapable candidates at selection time (preflight/edit and last-message-file CLIs return providerModeUnavailable), issues every reservation through the caller's ProviderSelectionSessionV1, and never invokes a provider itself — the registry remains the sole ranking/fallback authority while invocation moves to the execution broker. Step-5 CLI-cutover round (closing the implementation review's silent-bypass completion blocker): a ranked candidate that cannot satisfy the requested mode is no longer silently filtered out of the candidate list — when no ranked candidate supports the mode the whole selection returns providerModeUnavailable, and when a mode-incapable candidate (the primary or a mid-list backup) precedes a capable one, reserveNext settles the caller's attempt as an explicit providerUnavailablePreInvocation outcome and returns the new candidateUnavailable result naming the skipped candidate, so the unavailable primary is represented as a settled, auditable attempt before any backup attempt is allocated. The legacy resolveRunnerForModel/runImplementationForModel cascades still invoke fallback internally, but only for legacy routes that remain fail-closed behind the §1.3 gates until their cohorts migrate. Foundations round (plan §3.8, closing the implementation review's coordinator-boundary architectural blocker): adds createV1RunnerSelectionOpener, the production RunnerSelectionOpenerV1 for the action coordinator — it binds openV1RunnerSelection to the invocation-fixed workspace cwd and the invoking route's stage-model resolution, so the coordinator consumes this registry's operation-bound reserveNext contract verbatim (the registry ranks and reserves through the coordinator's session; the coordinator never selects a candidate or issues a reservation itself, and invocation stays with the execution broker).",
+      "owner": "j2kenton",
+      "expiryCohort": "runnerV1",
+      "evidence": {
+        "liveSha256": "1a34362c936ecbef04149aa98ddca5a7350e1c42e9328ca096492e7e24290901",
+        "symbol": "resolveRunnerForModel, runImplementationForModel, openV1RunnerSelection, createV1RunnerSelectionOpener",
+        "sourceSpan": "backstop calls at L350, L462, L628; V1 reservation-based selection at L766-L1059 (openV1RunnerSelection at L876, createV1RunnerSelectionOpener at L1031)",
+        "edgeKind": "runner-boundary",
+        "targetActionKey": "n/a (provider boundary backstop covering every action key until MIGRATED_ACTION_KEYS_V0 admits migrated rows; openV1RunnerSelection serves every future migrated row via the coordinator)"
+      }
+    },
+    {
+      "path": "src/runners/cliAgentRunner.ts",
+      "disposition": "modified",
+      "cohort": "runnerV1",
+      "planSection": "3.4",
+      "rationale": "Runner V1 cohort (executable-order step 5): adapts the concrete CLI runner path to the V1 transport/capture contract. Adds cliProviderSupportsV1StdoutCapture (a last-message-file CLI cannot satisfy AC-RUNNER-02's stdout-only capture and is rejected at selection time instead of silently disappearing, plan §3.4) and createCliTextTransportV1, the path-free V1 transport: it spawns the CLI exactly like the legacy path (same argument builder, sanitized environment, shell quoting, kill-tree cancellation, run timeout), captures the framed result from bounded stdout only, and reports only the exit state — no artifact or result destination (AC-RUNNER-01), stderr bounded to 64 KiB and exposed only as a sanitized size/digest summary. Step-5 CLI-cutover round (closing the implementation review's CLI-framing completion blocker): structured-event CLIs (opencode --format json, cline --json), whose stdout WRAPS the model's final text in JSON event lines and could therefore never parse as a framed V1 result when forwarded raw, now buffer the raw stream (bounded by the new MAX_CLI_STRUCTURED_EVENT_STREAM_BYTES_V1) and on a successful exit unwrap the model's final text via the provider's own normalizeCliOutput extractor before writing it to the bounded writer, so a framed reply reaches the broker as one directly parseable envelope; opaque-text CLIs keep streaming raw stdout unchanged. The legacy CliAgentRunner remains for gated legacy routes until their cohorts migrate.",
+      "owner": "j2kenton",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "liveSha256": "6f14c64c264fa83234f1872917c19992ec8ca1655c11463f4125fd6cffb2117b",
+        "symbol": "cliProviderSupportsV1StdoutCapture, MAX_CLI_STRUCTURED_EVENT_STREAM_BYTES_V1, createCliTextTransportV1",
+        "sourceSpan": "L1209-L1484 (cliProviderSupportsV1StdoutCapture at L1218, MAX_CLI_STRUCTURED_EVENT_STREAM_BYTES_V1 at L1231, createCliTextTransportV1 at L1262)",
+        "edgeKind": "runner-boundary",
+        "targetActionKey": "n/a (V1 transport construction; reservations are issued per action row by openV1RunnerSelection)"
+      }
+    },
+    {
+      "path": "src/runners/copilotLanguageModelRunner.ts",
+      "disposition": "modified",
+      "cohort": "runnerV1",
+      "planSection": "3.4",
+      "rationale": "Runner V1 cohort (executable-order step 5): adapts the concrete Copilot Language Model text path to the V1 transport/capture contract. Adds COPILOT_LM_RUNNER_ID (the stable runner identity shared with the legacy runner and validated by the broker's reservation-runner match) and createCopilotLmTextTransportV1, which streams response fragments straight into the broker-owned bounded writer and reports only the exit state — no artifact destination and no file writes (AC-RUNNER-01). The legacy CopilotLanguageModelRunner remains for gated legacy routes until their cohorts migrate.",
+      "owner": "j2kenton",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "liveSha256": "83e6e320044f9771f33034bf8067e226c6b5ff646cf6575c3b535a09e3c2752b",
+        "symbol": "COPILOT_LM_RUNNER_ID, createCopilotLmTextTransportV1",
+        "sourceSpan": "L13-L86 (COPILOT_LM_RUNNER_ID at L23, createCopilotLmTextTransportV1 at L35)",
+        "edgeKind": "runner-boundary",
+        "targetActionKey": "n/a (V1 transport construction; reservations are issued per action row by openV1RunnerSelection)"
+      }
+    },
+    {
+      "path": "src/services/cliStdoutResultCaptureV1.ts",
+      "disposition": "added",
+      "cohort": "runnerV1",
+      "planSection": "3.2",
+      "rationale": "Runner V1 cohort (executable-order step 5): CLI stdout capture layer for bounded result capture (plan §3.2). Streams framed CLI stdout into the broker-owned BoundedResultWriterV1 (the transport receives no artifact or result path — AC-RUNNER-01/02), bounds retained stderr to 64 KiB, and exposes stderr only as a sanitized summary (byte count, digest, truncation flag) per the §2.2 logging policy. Reached from the production entrypoint via createCliTextTransportV1 in cliAgentRunner.ts, which is why it joins the production source universe in this cohort.",
+      "owner": "j2kenton",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "liveSha256": "6c2c3618be8149efbb29c49f50b372058571e9b7135a0c6ec1dfd275e1f9664b",
+        "symbol": "createCliStdoutResultCaptureV1, MAX_CLI_STDERR_RETAINED_BYTES_V1",
+        "sourceSpan": "L1-L79 (whole file; createCliStdoutResultCaptureV1 at L43)",
+        "edgeKind": "runner-boundary",
+        "targetActionKey": "n/a (capture layer under the execution broker; not a route)"
+      }
+    },
+    {
+      "path": "src/runners/copilotImplementationRunner.ts",
+      "disposition": "modified",
+      "cohort": "lmIsolation",
+      "planSection": "1.6",
+      "rationale": "Migrates off every direct post-1.93 Language Model reference (LanguageModelTextPart/ToolCallPart/ToolResultPart types and constructors, parts-array message content, raw response stream) in favor of the neutral vscodeLmCompatV1 shapes and vscodeLmCompat.ts helpers (attachLmToolsV1, createLmTextPartV1, createLmToolResultPartV1, createLmAssistantMessageWithPartsV1, createLmUserMessageWithPartsV1, iterateLmResponsePartsV1). The runner now compiles clean against the pinned @types/vscode@1.93.0 declarations, and the boundary verifier's inline allow-list is empty.",
+      "owner": "j2kenton",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "liveSha256": "3db2b36dffea8caa17ab06d6db61c8068deae33fae36f0356b3c87157cce6212",
+        "symbol": "runImplementationRounds, runImplementationWithCopilot, checkImplementationAvailability",
+        "sourceSpan": "L340-L470 (tool-call round loop), L505-L530 (host capability probe), L645-L660 (availability probe)",
+        "edgeKind": "lm-compat-boundary",
+        "targetActionKey": "implementation.v1"
+      }
+    },
+    {
+      "path": "src/runners/copilotModelResolution.ts",
+      "disposition": "modified",
+      "cohort": "lmIsolation",
+      "planSection": "1.6",
+      "rationale": "buildCopilotRequestOptions now returns the neutral LmChatRequestOptionsV1 shape instead of vscode.LanguageModelChatRequestOptions directly, so only vscodeLmCompat.ts's sendRequest call site attaches the post-1.93 `tools` field.",
+      "owner": "j2kenton",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "liveSha256": "c34f0f372ba6000cbb3e776523eab7d12fb0411a4583cfffdcf7e6e28ab90c61",
+        "symbol": "buildCopilotRequestOptions",
+        "sourceSpan": "L72-L90 (buildCopilotRequestOptions signature/return type)",
+        "edgeKind": "lm-compat-boundary",
+        "targetActionKey": "implementation.v1"
+      }
+    },
+    {
+      "path": "src/utils/modelSelection.ts",
+      "disposition": "modified",
+      "cohort": "nonPlan",
+      "planSection": "n/a",
+      "rationale": "Adds the claude-opus-5 model slug/variant to the CLI and Copilot model catalogs. Ordinary model-catalog maintenance unrelated to this plan's cohorts; recorded here only because the file is part of the tracked production bundle and its digest changed since the pre-gate snapshot.",
+      "owner": "j2kenton",
+      "expiryCohort": "nonPlan",
+      "evidence": {
+        "liveSha256": "dd7938fba7f401253f928fbf017573e51b8fbe2709c8ee95e2b699d7e83540b6",
+        "symbol": "Copilot/CLI model catalog entries (claude-opus-5)",
+        "sourceSpan": "catalog entries at L454 and L806-L807",
+        "edgeKind": "model-catalog",
+        "targetActionKey": "n/a (nonPlan product maintenance)"
+      }
+    },
+    {
+      "path": "src/commands/pauseTask.ts",
+      "disposition": "modified",
+      "cohort": "safety",
+      "planSection": "1.4",
+      "rationale": "pauseTask awaits LegacyCreatingStartupGateV0.waitUntilReady() as its first statement so this lifecycle command's first task-state read cannot race the startup classification pass (activation-barrier coverage extended beyond Start/Resume per implementation review).",
+      "owner": "j2kenton",
+      "expiryCohort": "creation",
+      "evidence": {
+        "liveSha256": "d4a07e2ed9810d921c507329ed38ea657b52410517314a0dc5d4f9f196b6d901",
+        "symbol": "pauseTask",
+        "sourceSpan": "L88-L98 (barrier at L93)",
+        "edgeKind": "command-handler",
+        "targetActionKey": "task lifecycle rows (plan §1.2; pause/resume surface)"
+      }
+    },
+    {
+      "path": "src/commands/markTaskDone.ts",
+      "disposition": "modified",
+      "cohort": "safety",
+      "planSection": "1.4",
+      "rationale": "markTaskDone awaits LegacyCreatingStartupGateV0.waitUntilReady() as its first statement so this lifecycle command's first task-state read cannot race the startup classification pass.",
+      "owner": "j2kenton",
+      "expiryCohort": "creation",
+      "evidence": {
+        "liveSha256": "fd5f35cddc1b09515edd166349d80791db4ba8666e1f179cf28a4dcfd837fb14",
+        "symbol": "markTaskDone",
+        "sourceSpan": "L127-L137 (barrier at L132)",
+        "edgeKind": "command-handler",
+        "targetActionKey": "markTaskDone.v1"
+      }
+    },
+    {
+      "path": "src/commands/setTaskStage.ts",
+      "disposition": "modified",
+      "cohort": "safety",
+      "planSection": "1.4",
+      "rationale": "setTaskStage (shared handler for setTaskStage and setStageAsCurrent) awaits LegacyCreatingStartupGateV0.waitUntilReady() as its first statement so this lifecycle command's first task-state read cannot race the startup classification pass.",
+      "owner": "j2kenton",
+      "expiryCohort": "creation",
+      "evidence": {
+        "liveSha256": "1660e82e103b14e8419c3df6a752b8edefdb52e3b667c8a12893583a0e64442f",
+        "symbol": "setTaskStage",
+        "sourceSpan": "L92-L102 (barrier at L97)",
+        "edgeKind": "command-handler",
+        "targetActionKey": "nextStage.v1"
+      }
+    },
+    {
+      "path": "src/commands/archiveTask.ts",
+      "disposition": "modified",
+      "cohort": "safety",
+      "planSection": "1.4",
+      "rationale": "archiveTask and resumeArchivedTask await LegacyCreatingStartupGateV0.waitUntilReady() before their first task-state read so these lifecycle commands cannot race the startup classification pass.",
+      "owner": "j2kenton",
+      "expiryCohort": "creation",
+      "evidence": {
+        "liveSha256": "e15a0e5f605808535ec9e736d1bb517b1a778d5f2dbfcfbb52d2041134e649ad",
+        "symbol": "archiveTask, resumeArchivedTask",
+        "sourceSpan": "barriers at L71 and L161",
+        "edgeKind": "command-handler",
+        "targetActionKey": "task lifecycle rows (plan §1.2; archive surface)"
+      }
+    },
+    {
+      "path": "src/commands/choosePublishScope.ts",
+      "disposition": "modified",
+      "cohort": "safety",
+      "planSection": "1.4",
+      "rationale": "choosePublishScope awaits LegacyCreatingStartupGateV0.waitUntilReady() as its first statement so this command's first task-state read cannot race the startup classification pass.",
+      "owner": "j2kenton",
+      "expiryCohort": "creation",
+      "evidence": {
+        "liveSha256": "6a3e82c86bf58a4ced63cd6f4bc7d9f57e5fde2f78ca108febf85cc6bd452ab8",
+        "symbol": "choosePublishScope",
+        "sourceSpan": "L180-L190 (barrier at L185)",
+        "edgeKind": "command-handler",
+        "targetActionKey": "Commit/Push coordinator rows (publish-scope input)"
+      }
+    },
+    {
+      "path": "src/commands/scheduleTaskResume.ts",
+      "disposition": "modified",
+      "cohort": "safety",
+      "planSection": "1.4",
+      "rationale": "scheduleTaskResume and cancelScheduledTaskAction await LegacyCreatingStartupGateV0.waitUntilReady() before their first task-state read so these lifecycle commands cannot race the startup classification pass.",
+      "owner": "j2kenton",
+      "expiryCohort": "creation",
+      "evidence": {
+        "liveSha256": "9b18a9b7b3441b54410b6faca5e6d8fbd7bb6fbf6824cf249bf37eea4d963696",
+        "symbol": "scheduleTaskResume, cancelScheduledTaskAction",
+        "sourceSpan": "barriers at L180 and L198",
+        "edgeKind": "scheduler",
+        "targetActionKey": "scheduled rows delegating to applyCurrentStage.v1 (plan §1.2)"
+      }
+    },
+    {
+      "path": "src/commands/renameTask.ts",
+      "disposition": "modified",
+      "cohort": "safety",
+      "planSection": "1.4",
+      "rationale": "renameTask and renameTaskWithAI await LegacyCreatingStartupGateV0.waitUntilReady() as their first statement so these commands' first task-state reads (and displayName progress patch) cannot race the startup classification pass.",
+      "owner": "j2kenton",
+      "expiryCohort": "creation",
+      "evidence": {
+        "liveSha256": "d252b25feb2ef8eeaf09a0dfc57d84bca105a9c7980f39b14eddf6f2817a894f",
+        "symbol": "renameTask, renameTaskWithAI",
+        "sourceSpan": "barriers at L34 and L127",
+        "edgeKind": "command-handler",
+        "targetActionKey": "task lifecycle rows (rename surface unchanged per plan product decisions)"
+      }
+    },
+    {
+      "path": "src/commands/reviewCurrentTask.ts",
+      "disposition": "modified",
+      "cohort": "safety",
+      "planSection": "1.3",
+      "rationale": "Concrete keyboard-shortcut alias route of the review family: adds assertLegacyAiRouteAllowedV0(\"review.v1\") as the first statement, BEFORE this wrapper's own resolveTaskContext read, closing the wrapper-reads-before-gate gap the implementation review identified (the downstream runReviewWithAI handler gate alone was insufficient).",
+      "owner": "j2kenton",
+      "expiryCohort": "text3",
+      "evidence": {
+        "liveSha256": "a605565abcefbf2d64e096965ec768462d6779891ff4ea299f504a2e99b84fc3",
+        "symbol": "reviewCurrentTask",
+        "sourceSpan": "L15-L22 (gate at L19)",
+        "edgeKind": "command-handler (alias)",
+        "targetActionKey": "review.v1"
+      }
+    },
+    {
+      "path": "src/commands/fastForwardCurrentTaskReview.ts",
+      "disposition": "modified",
+      "cohort": "safety",
+      "planSection": "1.3",
+      "rationale": "Concrete keyboard-shortcut alias route of the fast-forward family: adds assertLegacyAiRouteAllowedV0(\"fastForward.v1\") as the first statement, BEFORE this wrapper's own resolveTaskContext read (same wrapper-reads-before-gate fix as reviewCurrentTask.ts).",
+      "owner": "j2kenton",
+      "expiryCohort": "text3",
+      "evidence": {
+        "liveSha256": "19b2a7f08e0d47c8f36c2e81937408c2095cf7330e05ae6fc9e2dfd4bd8b0443",
+        "symbol": "fastForwardCurrentTaskReview",
+        "sourceSpan": "L15-L22 (gate at L19)",
+        "edgeKind": "command-handler (alias)",
+        "targetActionKey": "fastForward.v1"
+      }
+    },
+    {
+      "path": "src/commands/applyHighLevelReviewChanges.ts",
+      "disposition": "modified",
+      "cohort": "safety",
+      "planSection": "1.3",
+      "rationale": "Concrete wrapper route of the apply-review family: adds assertLegacyAiRouteAllowedV0(\"applyReview.v1\") as the first statement, BEFORE this wrapper's own resolveTaskContext reads (same wrapper-reads-before-gate fix as reviewCurrentTask.ts).",
+      "owner": "j2kenton",
+      "expiryCohort": "text3",
+      "evidence": {
+        "liveSha256": "97bed951f53cead3173a9a8cc616182b1cea98c19a1462ec92b5c8e621d7e9c4",
+        "symbol": "applyHighLevelReviewChanges",
+        "sourceSpan": "L15-L22 (gate at L19)",
+        "edgeKind": "command-handler (alias)",
+        "targetActionKey": "applyReview.v1"
+      }
+    },
+    {
+      "path": "src/commands/applyLowLevelReviewChanges.ts",
+      "disposition": "modified",
+      "cohort": "safety",
+      "planSection": "1.3",
+      "rationale": "Concrete wrapper route of the apply-review family: adds assertLegacyAiRouteAllowedV0(\"applyReview.v1\") as the first statement, BEFORE this wrapper's own resolveTaskContext reads (same wrapper-reads-before-gate fix as reviewCurrentTask.ts).",
+      "owner": "j2kenton",
+      "expiryCohort": "text3",
+      "evidence": {
+        "liveSha256": "70e5f2825f5857f471ab907662211df534aa41dcb2ece9814ce94237278e7624",
+        "symbol": "applyLowLevelReviewChanges",
+        "sourceSpan": "L15-L22 (gate at L19)",
+        "edgeKind": "command-handler (alias)",
+        "targetActionKey": "applyReview.v1"
+      }
+    },
+    {
+      "path": "src/views/chatView.ts",
+      "disposition": "modified",
+      "cohort": "safety",
+      "planSection": "1.3",
+      "rationale": "The webview Send route (a concrete route of the Chat Send family) now consults assertLegacyAiRouteAllowedV0(\"chatSend.v1\") BEFORE appending the user message to the transcript, so a disabled route rejects without mutating chat state — previously the append happened first and only the downstream chatWithStage gate would throw. Evidence refresh 2026-07-27 (Chat cohort, executable-order step 8 round — closing the implementation review's step-8 completion blockers): adds the structured-interaction surface alongside the legacy free-text ask() — StructuredChatQuestion (with an optional coordinator-derived binding field), askInteraction (posts an unresolved interaction via appendChatInteraction, threading the binding through when supplied), ChatInteractionServicesV1/ChatInteractionRefV1 (the production submitAnswers/cancel/resume surface installed from extension.ts), and the webview message handlers submitInteractionAnswers/cancelInteraction/resumeInteraction. Answer submission now writes through the durable transaction store BEFORE updating the task-local Chat mirror (plan §5.5's write-through ordering), and Resume surfaces a clear \"not available yet\" message until the action coordinator is wired. Adds openChatDataForCurrentTarget and resetHistoryForCurrentTarget (the Open Chat Data / Reset Chat History recovery commands' implementations, plan §5.1), and renders a chatRecoveryRequired failure from transcript() as an actionable recovery notification instead of crashing render(). Evidence refresh 2026-07-27 second pass (closing the implementation review's completion blockers: interaction reference under-binding, un-hydrated recovered answers, and missing required-blank-text/multiple-choice-cardinality enforcement): ChatInteractionRefV1 now REQUIRES taskBindingId/chatDocumentId (not only operationId/interactionId); the new resolveInteractionRef derives them server-side from the CURRENT task-local Chat document (chatHistoryStore.ts's readChatDocumentIdentityV1) for every Answer/Cancel/Resume call, never trusting the webview message. The webview's renderInteraction now hydrates prior interaction.answers into its controls instead of always starting blank (crash-recovered submitted interactions no longer render blank), and its getters enforce the same answer rules the durable store's strict decoder enforces: a required blank-allowed text question left blank submits as answered with an empty value rather than an invalid \"skipped\" state, and a non-empty multiple-choice selection is rejected client-side when it falls outside [minSelections, maxSelections]. Evidence refresh 2026-07-27 third pass (closing the implementation review's remaining completion blocker: \"structured Chat posting and interaction actions still do not require and validate the complete task, document, operation, source-attempt, and interaction binding\"): ChatInteractionRefV1 gained a required sourceAttemptId field; resolveInteractionRef now also looks up the referenced interaction's own mirrored sourceAttemptId (via readChatInteractions, matched by operationId+interactionId) and returns undefined — never a partial ref — when no matching interaction exists or it predates that field. StructuredChatQuestion's binding field is now REQUIRED (not optional): askInteraction always threads it through to appendChatInteraction's now-mandatory binding parameter, so posting a structured-question interaction can no longer omit the coordinator's task/document binding.",
+      "owner": "j2kenton",
+      "expiryCohort": "text3",
+      "evidence": {
+        "liveSha256": "057082d9eb7d94bd5b2365ee0f112518251127510057dbec78ec9e904661fe4b",
+        "symbol": "StructuredChatQuestion, askInteraction, ChatInteractionServicesV1, ChatInteractionRefV1, resolveInteractionRef, submitInteractionAnswers, cancelInteraction, resumeInteraction, openChatDataForCurrentTarget, resetHistoryForCurrentTarget",
+        "sourceSpan": "the webview Send-route gate (unchanged) plus the structured-interaction surface (StructuredChatQuestion/askInteraction), resolveInteractionRef (now also resolving sourceAttemptId) and the ChatInteractionServicesV1-backed submit/cancel/resume webview handlers, the openChatDataForCurrentTarget/resetHistoryForCurrentTarget recovery commands, and the webview script's renderInteraction (answer hydration, required-blank-text and multiple-choice cardinality enforcement)",
+        "edgeKind": "webview-route",
+        "targetActionKey": "chatSend.v1"
+      }
+    },
+    {
+      "path": "src/commands/pinTask.ts",
+      "disposition": "modified",
+      "cohort": "safety",
+      "planSection": "1.4",
+      "rationale": "pinTask and unpinTask await LegacyCreatingStartupGateV0.waitUntilReady() before their first task-state read (they read via resolveTaskContext and mutate task-progress pinnedAt via patchTaskProgress), closing the activation-barrier gap the implementation review identified for Pin/Unpin.",
+      "owner": "j2kenton",
+      "expiryCohort": "creation",
+      "evidence": {
+        "liveSha256": "b476c249f77211d16af5c791f4ee61abcf7ff38d26de1ec087a02269e62d030b",
+        "symbol": "pinTask, unpinTask",
+        "sourceSpan": "barriers at L39 and L91",
+        "edgeKind": "command-handler",
+        "targetActionKey": "task lifecycle rows (plan §1.2; pin surface)"
+      }
+    },
+    {
+      "path": "src/commands/runPublishChecks.ts",
+      "disposition": "modified",
+      "cohort": "safety",
+      "planSection": "1.4",
+      "rationale": "runPublishChecks awaits LegacyCreatingStartupGateV0.waitUntilReady() before its first task-state read (resolveTaskContext + inventory refresh), extending activation-barrier coverage to the publish-check command route.",
+      "owner": "j2kenton",
+      "expiryCohort": "creation",
+      "evidence": {
+        "liveSha256": "c2838974c87aa85ae91bdc546e06f69e23198126543cc3d19567b87035d11509",
+        "symbol": "runPublishChecks",
+        "sourceSpan": "L58-L68 (barrier at L62)",
+        "edgeKind": "command-handler",
+        "targetActionKey": "Commit/Push coordinator rows (publish checks input)"
+      }
+    },
+    {
+      "path": "src/utils/metaResourcesMigration.ts",
+      "disposition": "modified",
+      "cohort": "safety",
+      "planSection": "1.4",
+      "rationale": "maybeOfferMetaResourcesMigration awaits LegacyCreatingStartupGateV0.waitUntilReady() as its first statement: the migration reads and can rewrite task-progress ownership across the meta root, so the explicit \"Move Ensemble Resources\" command route must not race the startup classification pass (the activation-time offer already chained on startupGateReady). Evidence refresh 2026-07-27 (Privacy cohort, workflow-control completeness round): MIGRATION_JOURNAL_FILENAME (.ensemble-migration.json) is now exported with a doc comment so workflowPrivacyClassifierV1.test.ts can pin the classifier's literal workflow-control copy against this owner (plan §2.2 — the crash-surviving migration journal was previously classified artifact-safe); no behavior change, the constant's value and every use are identical.",
+      "owner": "j2kenton",
+      "expiryCohort": "creation",
+      "evidence": {
+        "liveSha256": "eaedf6d957355c30d8c1abaf5456322f007808324871bb6a139e3065b0b5f71f",
+        "symbol": "maybeOfferMetaResourcesMigration, MIGRATION_JOURNAL_FILENAME",
+        "sourceSpan": "L312-L322 (barrier at L319); MIGRATION_JOURNAL_FILENAME export at L24-L34",
+        "edgeKind": "command-handler",
+        "targetActionKey": "n/a (meta-root migration; outside the §1.2 action-route table)"
+      }
+    },
+    {
+      "path": "src/state/writeAtomic.ts",
+      "disposition": "modified",
+      "cohort": "privacy",
+      "planSection": "2.2",
+      "rationale": "Privacy cohort (workflow-control completeness round, closing the implementation review's step-7 completion blocker; second pass 2026-07-27 closes the review's remaining atomic-convention drift gap): the complete atomic-temp filename layout (`<base>_temp_<sessionId>_<time>_<rand>.tmp<ext>`) now has exactly one owner definition — the exported formatAtomicTempBasename formatter. writeAtomic builds every production temp name through it, and the privacy drift tests (workflowPrivacyClassifierV1.test.ts fixtures, contextPackPrivacyExclusion.test.ts fixture) build their names through the same function instead of reconstructing the layout from the ATOMIC_TEMP_INFIX/ATOMIC_TEMP_SUFFIX tokens, so any reorder or extension of the layout changes real temp names and test fixtures identically and fails the classifier test until its ATOMIC_WRITE_TEMP_RE literal copy is updated to match. The token exports remain for both cleanupOrphanedTempFiles matchers. These temps survive a crash between the temp write and the rename (startup cleanup reaps them only after 24 hours), which is why the classifier treats the shape as workflow-control. No behavior change: constructed filenames and cleanup matches are byte-identical to the previous inline construction.",
+      "owner": "j2kenton",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "liveSha256": "046d5c22df13d8f44d925eac7710ab6dfaf8d9f2eafbd1492767e23f2b77f7c2",
+        "symbol": "ATOMIC_TEMP_INFIX, ATOMIC_TEMP_SUFFIX, formatAtomicTempBasename, writeAtomic, cleanupOrphanedTempFiles",
+        "sourceSpan": "L9-L37 (exported convention and formatAtomicTempBasename), L86-L89 (temp filename construction via the formatter), L210 + L226 (cleanup matchers)",
+        "edgeKind": "workflow-control-record-owner",
+        "targetActionKey": "n/a (shared atomic-write utility; not a route — classified by the §2.2 privacy contract)"
+      }
+    },
+    {
+      "path": "src/utils/reviewReadiness.ts",
+      "disposition": "modified",
+      "cohort": "nonPlan",
+      "planSection": "n/a",
+      "rationale": "Extends the `Readiness: N/10` parser to accept one-decimal scores for staged (multi-round) implementation reviews (normalizeScore clamp/rounding, decimal-tolerant regexes, decimal-tolerant strict-perfect check). Ordinary product change unrelated to this plan's cohorts, previously missing from this evidence file even though its digest had drifted from the pre-gate snapshot.",
+      "owner": "j2kenton",
+      "expiryCohort": "nonPlan",
+      "evidence": {
+        "liveSha256": "d8131a392471b62201203a55395eb0d908278a88c7f4d8fd96b647ac900852b3",
+        "symbol": "parseReadiness, isStrictPerfectReview",
+        "sourceSpan": "L40-L64 (parseReadiness), L147-L160 (isStrictPerfectReview)",
+        "edgeKind": "review-score-utility",
+        "targetActionKey": "n/a (nonPlan product change)"
+      }
+    },
+    {
+      "path": "src/utils/reviewScoreLoop.ts",
+      "disposition": "modified",
+      "cohort": "nonPlan",
+      "planSection": "n/a",
+      "rationale": "Adapts the Fast Forward review-score improvement gate to the decimal readiness scores introduced in reviewReadiness.ts so sub-band movement across staged review rounds is not misread as a plateau. Ordinary product change unrelated to this plan's cohorts, previously missing from this evidence file even though its digest had drifted from the pre-gate snapshot.",
+      "owner": "j2kenton",
+      "expiryCohort": "nonPlan",
+      "evidence": {
+        "liveSha256": "959accbc503f1f98ea77eb611524c9346ee9516fd76307384443161a5f0e7c92",
+        "symbol": "getBestReviewScore and the score-improvement gate",
+        "sourceSpan": "L19 onward (getBestReviewScore and comparison logic)",
+        "edgeKind": "review-score-utility",
+        "targetActionKey": "n/a (nonPlan product change)"
+      }
+    },
+    {
+      "path": "src/utils/reviewRouting.ts",
+      "disposition": "modified",
+      "cohort": "nonPlan",
+      "planSection": "n/a",
+      "rationale": "decideReviewRoute now escalates immediately when every remaining blocker is non-fixable by automation (environmental, unverifiable, or a spec defect), instead of first waiting out a full score plateau and a second-opinion round that could not have altered the outcome; the escalation reason string distinguishes the plateaued and immediate cases. User commit f202bb5 (with accompanying tests in src/test/reviewRouting.test.ts). Ordinary review-routing product change unrelated to this plan's cohorts; recorded because the file is part of the tracked production bundle and its digest changed since the pre-gate snapshot. Evidence refresh 2026-07-27: user commit a88a6d5 subsequently changed detectPlateau to exclude rounds that reported no task-fixable blocker (legacy history entries lacking taskFixableCount still count), so clean zero-blocker rounds cannot form the plateau baseline a later first-appearance blocker is measured against, plus the explanatory doc comment; the previously recorded digest (dbaa79090bc5a6f3e55a01bfba5fbec545e8547bc620acc80b5965e66e032cbf) is exactly the LF-normalized blob at a88a6d5~1 and the current digest is exactly the blob at a88a6d5 (which the clean worktree matches), proving that commit is the only change since review. Again an ordinary nonPlan review-routing product change.",
+      "owner": "j2kenton",
+      "expiryCohort": "nonPlan",
+      "evidence": {
+        "liveSha256": "50b3abbee8d2fff1985b9f2e29f7e2e111ad3097eb1e2e5016ceb736c782d49b",
+        "symbol": "decideReviewRoute, detectPlateau",
+        "sourceSpan": "L23-L35 (detectPlateau task-fixable-round doc), L37-L55 (detectPlateau incl. the taskFixableCount filter), L135 onward (decideReviewRoute incl. the immediate-escalation branch around L191)",
+        "edgeKind": "review-score-utility",
+        "targetActionKey": "n/a (nonPlan product change)"
+      }
+    },
+    {
+      "path": "src/utils/completionLint.ts",
+      "disposition": "modified",
+      "cohort": "nonPlan",
+      "planSection": "n/a",
+      "rationale": "Fixes a PID-reuse hazard in killProcessTree's Windows taskkill retry schedule: retries used to keep firing `taskkill /PID <pid> /T /F` against a fixed PID at delays up to 30s with no regard for whether the tracked child had already exited, so a stale retry could force-kill an unrelated process that Windows had assigned the reused PID in the meantime (observed as the intermittent `pnpm run test` red flagged by the implementation review: the cancellation-guard test's freshly spawned npm check was killed by a sibling test's stale retry — non-zero exit, empty output, no \"[check cancelled]\" marker). Each retry now no-ops once child.exitCode/signalCode is set, all pending retry timers are cleared on the child's 'exit' event, and the timers are unref'd so a pending retry never holds the process open. Once the spawned root has exited a retry could only ever hit a reused PID or fail — `/T` scopes the tree walk to that root, so it could never reach a surviving orphaned descendant anyway. killProcessTree is now exported @internal for the regression test (src/test/completionLintKillPidReuse.test.ts). The doc comment additionally records — per the implementation review's non-blocking suggestion — that the two guards are deliberately redundant and must BOTH survive any refactor. A follow-up review round noted the end-to-end regression test alone passes with either guard present, so per that round's non-blocking suggestion the function now accepts an @internal optional KillProcessTreeGuardSeam parameter (omitFireTimeExitCheck / omitExitTimeTimerCleanup) that disables exactly one guard at a time; two Windows-only seam tests in the same test file each disable one guard and fail if the other has been removed, making both guards independently machine-enforced. Production callers pass no seam, so shipped behavior is unchanged. Defect fix plus test seam in existing product code, unrelated to this plan's cohorts; recorded because the file is part of the tracked production bundle and its digest changed since the pre-gate snapshot.",
+      "owner": "j2kenton",
+      "expiryCohort": "nonPlan",
+      "evidence": {
+        "liveSha256": "26658e9f87c232e55cf2279dab063985ecba6932fae6107acfbecd8f71663ca6",
+        "symbol": "killProcessTree",
+        "sourceSpan": "L563-L670 (KillProcessTreeGuardSeam test seam at L563-L583; doc + function at L585-L670; export at L636, fire-time exited-guard in attemptKill at L644, exit-time retry-timer cleanup at L662-L666, preserve-both-guards constraint recorded at L624-L632)",
+        "edgeKind": "check-runner-utility",
+        "targetActionKey": "n/a (publish/review completion-check runner; defect fix, not a route change)"
+      }
+    },
+    {
+      "path": "resources/prompts/review-publish.md",
+      "disposition": "modified",
+      "cohort": "nonPlan",
+      "planSection": "n/a",
+      "rationale": "One added paragraph instructing publish-readiness reviews that staged-progress credit from earlier implementation-review rounds does not carry over: undelivered required scope from a plan's executable order is itself a shipping blocker. User commit 04fdac7. Ordinary prompt maintenance unrelated to this plan's cohorts; tracked because prompt templates are shipped runtime-resource copies.",
+      "owner": "j2kenton",
+      "expiryCohort": "nonPlan",
+      "evidence": {
+        "liveSha256": "1b54685fb87ced76738f823ddeb80cef7f3c83bcca2040fbbede62db0bb35eca",
+        "symbol": "n/a (markdown prompt template; no code symbol)",
+        "sourceSpan": "added staged-progress paragraph at L3",
+        "edgeKind": "shipped-prompt-asset",
+        "targetActionKey": "n/a (nonPlan prompt maintenance)"
+      }
+    },
+    {
+      "path": "resources/prompts/review-publish-rereview.md",
+      "disposition": "modified",
+      "cohort": "nonPlan",
+      "planSection": "n/a",
+      "rationale": "One added paragraph instructing publish-readiness re-reviews that staged-progress credit from earlier implementation-review rounds (or a previous publish review) does not carry over: undelivered required scope from a plan's executable order is itself a shipping blocker. User commit 04fdac7. Ordinary prompt maintenance unrelated to this plan's cohorts; tracked because prompt templates are shipped runtime-resource copies.",
+      "owner": "j2kenton",
+      "expiryCohort": "nonPlan",
+      "evidence": {
+        "liveSha256": "baeaee50b6713e076be67592bf877ef54d8666901653bbc23db82a744151e6eb",
+        "symbol": "n/a (markdown prompt template; no code symbol)",
+        "sourceSpan": "added staged-progress paragraph at L9",
+        "edgeKind": "shipped-prompt-asset",
+        "targetActionKey": "n/a (nonPlan prompt maintenance)"
+      }
+    },
+    {
+      "path": "resources/prompts/review-impl-high.md",
+      "disposition": "modified",
+      "cohort": "nonPlan",
+      "planSection": "n/a",
+      "rationale": "Two-line prompt clarification instructing staged-plan implementation reviews on decimal readiness scoring. Ordinary prompt maintenance unrelated to this plan's cohorts; tracked because prompt templates are shipped runtime-resource copies.",
+      "owner": "j2kenton",
+      "expiryCohort": "nonPlan",
+      "evidence": {
+        "liveSha256": "a82acafbb1992094ca0a0e02ea499e946d6b7378a3f4588e8fd01249e292451c",
+        "symbol": "n/a (markdown prompt template; no code symbol)",
+        "sourceSpan": "readiness-scoring guidance lines",
+        "edgeKind": "shipped-prompt-asset",
+        "targetActionKey": "n/a (nonPlan prompt maintenance)"
+      }
+    },
+    {
+      "path": "resources/prompts/review-impl-high-rereview.md",
+      "disposition": "modified",
+      "cohort": "nonPlan",
+      "planSection": "n/a",
+      "rationale": "Two-line prompt clarification instructing staged-plan implementation re-reviews on decimal readiness scoring. Ordinary prompt maintenance unrelated to this plan's cohorts; tracked because prompt templates are shipped runtime-resource copies.",
+      "owner": "j2kenton",
+      "expiryCohort": "nonPlan",
+      "evidence": {
+        "liveSha256": "0656b878e2746b9ca80c1481c242f7099349eacbac23f1ca037461a8c3323d88",
+        "symbol": "n/a (markdown prompt template; no code symbol)",
+        "sourceSpan": "readiness-scoring guidance lines",
+        "edgeKind": "shipped-prompt-asset",
+        "targetActionKey": "n/a (nonPlan prompt maintenance)"
+      }
+    },
+    {
+      "owner": "j2kenton",
+      "path": "src/services/workflowPathSafetyV1.ts",
+      "disposition": "added",
+      "cohort": "foundations",
+      "planSection": "1.8",
+      "rationale": "Foundations cohort (executable-order step 6, filesystem boundary — plan §1.8): the root/path shape layer shared by every workflow root. classifyWorkflowRootV1 accepts only absolute, non-UNC local roots; validateWorkflowRelativePathV1 rejects traversal, absolute, and backslash-containing registered-family locators; resolveWorkflowFsPathV1 joins a validated root+relative path and confirms containment; the reparse check refuses any symlink/junction/reparse-point path component so mutation never crosses a link. Consumed by workflowPathRegistryV1.ts (root/locator registration) and workflowFileStoreV1.ts (pre-mutation revalidation), both reached from the production bundle via chatHistoryStore.ts's workflowRuntimeServicesV1.ts wiring.",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "liveSha256": "5c56647b7dc91dd997e27170c3e1b9016f52332e37d33ad1cb2bf9f7afb1e32e",
+        "symbol": "classifyWorkflowRootV1, validateWorkflowRelativePathV1, resolveWorkflowFsPathV1, WorkflowReparseCheckV1",
+        "sourceSpan": "L1-L167 (whole file)",
+        "edgeKind": "filesystem-boundary",
+        "targetActionKey": "n/a (shared §1.8 root/path safety layer; not a route)"
+      }
+    },
+    {
+      "owner": "j2kenton",
+      "path": "src/services/workflowFileStoreV1.ts",
+      "disposition": "added",
+      "cohort": "foundations",
+      "planSection": "1.8",
+      "rationale": "Foundations cohort (executable-order step 6, cooperative file store — plan §1.8): the one filesystem mutation surface every workflow consumer uses — exclusive creation, same-directory revision-guarded replacement, bounded reads, nonrecursive directory creation/removal, exact-file unlink, and a bounded directory listing — built over workflowPathSafetyV1.ts's root/path validation and revalidating immediately before every mutation. Returns the stable §1.8 unavailable outcomes for unsupported/unsafe roots rather than throwing. Reached from the production bundle via chatHistoryStore.ts's workflowRuntimeServicesV1.ts wiring (task-local chat-v1.json reads/writes) and the durable chatInteractionTransactionStoreV1.ts.",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "liveSha256": "082f89147931ad55a67d74f7545a66a78d1bf53db0e6e3255dbb83987335e049",
+        "symbol": "WorkflowFileStoreV1, createWorkflowFileStoreV1",
+        "sourceSpan": "L1-L526 (whole file; createWorkflowFileStoreV1 at L524)",
+        "edgeKind": "filesystem-boundary",
+        "targetActionKey": "n/a (shared §1.8 mutation surface; not a route)"
+      }
+    },
+    {
+      "owner": "j2kenton",
+      "path": "src/services/workflowPathRegistryV1.ts",
+      "disposition": "added",
+      "cohort": "privacy",
+      "planSection": "2.1",
+      "rationale": "Privacy cohort (executable-order step 7, the one path registry — plan §2.1): the single allocation authority for every registered workflow-family path (task-local chat-v1.json, the private-storage workflow-runtime-v1 tree including chat-transactions/<operation-id>/ and chat-recovery/<document-id>/<reset-id>/, and creation/lease families as they land). Root ids are stable and idempotent per canonical path; every vended locator is root-relative, never a raw absolute path. Reached from the production bundle via chatHistoryStore.ts's workflowRuntimeServicesV1.ts wiring, which holds the one shared registry instance every V1 workflow consumer (task-local Chat, the durable transaction store) allocates through. Evidence refresh 2026-07-27 (the implementation review's \"separate the Global Assistant's non-task storage registration from task-folder registration\" contract): WorkflowRootKindV1 gains the distinct \"nonTaskStorage\" root kind for dedicated non-task storage (today exactly the Global Assistant's own chat folder); the new rootKind(rootId) lookup lets the two registration tiers in workflowRuntimeServicesV1.ts enforce one-path-one-kind (a path already registered as a task folder can never be silently re-registered as non-task storage, nor vice versa); taskChatFile now vends chat-v1.json under exactly the two legitimate kinds (taskFolder, nonTaskStorage) while creationSentinelFile and every other family stay taskFolder-only, so a weaker-tier root can never allocate task-only families.",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "liveSha256": "9c7f922771358c8fbe35a184d0cd54f58199edc57c0587eb23bc032f9119001b",
+        "symbol": "WorkflowPathRegistryV1, WorkflowRootKindV1, createWorkflowPathRegistryV1, rootKind, taskChatFile, creationSentinelFile",
+        "sourceSpan": "L1-L428 (whole file; WorkflowRootKindV1 at L86, taskChatFile's two-kind rule at L278-L284, creationSentinelFile's taskFolder-only rule at L286-L289, createWorkflowPathRegistryV1 at L426)",
+        "edgeKind": "path-registry",
+        "targetActionKey": "n/a (shared §2.1 allocation authority; not a route)"
+      }
+    },
+    {
+      "owner": "j2kenton",
+      "path": "src/types/actionCorrelationV1.ts",
+      "disposition": "added",
+      "cohort": "foundations",
+      "planSection": "3.1",
+      "rationale": "Foundations cohort (executable-order step 6, correlation identity contract — plan §3.1): the distinct identifier types (ActionKeyV1, OperationIdV1, AttemptIdV1, ReservationIdV1, InteractionIdV1), the per-row ResumeSemanticsV1 declaration, the task/document TaskBindingRefV1 and full ActionCorrelationV1 tuple, and the 128-bit hex identity allocator/validator (allocateHex128IdV1, isHex128IdV1) every correlation-bearing record in the Chat cohort is built on. Reached from the production bundle via the durable chatInteractionTransactionStoreV1.ts (itself reached through chatHistoryStore.ts's workflowRuntimeServicesV1.ts wiring).",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "liveSha256": "450f406d99ea4d4a58089c2d391d2cb38097720d5e38e57f21b139a3470a3f38",
+        "symbol": "ActionCorrelationV1, ResumeSemanticsV1, allocateHex128IdV1, isHex128IdV1, correlationMatchesV1",
+        "sourceSpan": "L1-L104 (whole file)",
+        "edgeKind": "correlation-contract",
+        "targetActionKey": "n/a (shared §3.1 identity contract; not a route)"
+      }
+    },
+    {
+      "owner": "j2kenton",
+      "path": "src/types/workflowAvailabilityV1.ts",
+      "disposition": "added",
+      "cohort": "foundations",
+      "planSection": "1.8",
+      "rationale": "Foundations cohort (executable-order step 6 — plan §1.8/§3.7): the stable `{ kind: \"unavailable\", code }` outcome shared by the file store, path registry, and the durable Chat transaction store for unsupported/unsafe roots and workflow-storage failures. Reached from the production bundle via chatInteractionTransactionStoreV1.ts (itself reached through chatHistoryStore.ts's workflowRuntimeServicesV1.ts wiring).",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "liveSha256": "4056d0d2cb2c81689445aa82a838070d41400282ec6bb829eaced2fd26b8f4b9",
+        "symbol": "WorkflowUnavailableV1, unavailableV1",
+        "sourceSpan": "L1-L26 (whole file)",
+        "edgeKind": "shared-outcome-type",
+        "targetActionKey": "n/a (shared §1.8/§3.7 outcome type; not a route)"
+      }
+    },
+    {
+      "owner": "j2kenton",
+      "path": "src/types/fallbackStateV1.ts",
+      "disposition": "added",
+      "cohort": "foundations",
+      "planSection": "3.9",
+      "rationale": "Foundations cohort (executable-order step 6, strict progress foundation — plan §3.9): decodes task-progress.json's `fallbackActive` exclusively as the existing per-stage boolean map, rejecting a scalar boolean (the plan's fail-closed rule for this field). Reached from the production bundle via taskProgressDecoderV1.ts, which is in turn reached through chatHistoryStore.ts's workflowRuntimeServicesV1.ts wiring (the file-store root registration path strictly re-validates a folder's task-progress.json before trusting it as a task root, closing part of the review's trusted-mutation-root gap).",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "liveSha256": "9801c33570a7c157c6015404983fe561d656fa115c4f98097e05635eb76119b3",
+        "symbol": "FallbackStateV1, decodeFallbackStateV1",
+        "sourceSpan": "L1-L48 (whole file)",
+        "edgeKind": "progress-field-decoder",
+        "targetActionKey": "n/a (shared §3.9 field decoder; not a route)"
+      }
+    },
+    {
+      "owner": "j2kenton",
+      "path": "src/services/taskProgressDecoderV1.ts",
+      "disposition": "added",
+      "cohort": "foundations",
+      "planSection": "3.10",
+      "rationale": "Foundations cohort (executable-order step 6, strict task-progress foundation — plan §3.10): the fail-closed replacement for the permissive legacy reader — strict `ensembleProgressVersion` family selection, exact per-field validation with zero coercion, exact raw byte-span capture for the splice-based migration path, and (per this round's fix) an `expectedTaskFolder` self-consistency check callers may opt into. Reached from the production bundle via workflowRuntimeServicesV1.ts's `ensureWorkflowTaskFolderRootV1`, which now decodes a candidate task folder's task-progress.json with `decodeTaskProgressTextV1(text, { expectedTaskFolder: path.basename(fsPath) })` before trusting the folder as a task root — refusing registration when the persisted `taskFolder` field names a different folder than the one physically being registered (closing the implementation review's \"wrong/stale/tampered path\" trust gap for any folder that does carry a task-progress.json).",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "liveSha256": "959d049bbe330b99f0098518122f420581c95ab85f7417a303e128b2a93171da",
+        "symbol": "decodeTaskProgressTextV1, selectTaskProgressFamilyV1, DecodeTaskProgressOptionsV1",
+        "sourceSpan": "L1-L1148 (whole file; expectedTaskFolder cross-check at L1125-L1133; DecodeTaskProgressOptionsV1 at L94-L97)",
+        "edgeKind": "progress-decoder",
+        "targetActionKey": "n/a (shared §3.10 strict decoder; consumed by workflowRuntimeServicesV1.ts's task-folder root trust check)"
+      }
+    },
+    {
+      "owner": "j2kenton",
+      "path": "src/types/structuredQuestionV1.ts",
+      "disposition": "added",
+      "cohort": "foundations",
+      "planSection": "3.6",
+      "rationale": "Foundations cohort (executable-order step 6, structured-question wire contract — plan §3.6): the closed StructuredQuestionV1/StructuredAnswerV1 unions, their strict decoders and cross-validation against a question set, and the canonical-JSON helpers (canonicalJsonTextV1/canonicalJsonByteLengthV1) the Chat interaction transaction store digests and limits are computed over. Reached from the production bundle via chatHistoryStore.ts (interaction question/answer validation) and chatInteractionTransactionStoreV1.ts (canonical digesting), both through workflowRuntimeServicesV1.ts / the durable transaction store wiring.",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "liveSha256": "c6f480f0efe5808a8c428fc667e0cd0718fdf2f5bd8f1eed99ae0a5a4b239fe1",
+        "symbol": "StructuredQuestionV1, StructuredAnswerV1, decodeStructuredQuestionsV1, decodeStructuredAnswersArrayV1, validateStructuredAnswersV1, canonicalJsonTextV1",
+        "sourceSpan": "L1-L564 (whole file)",
+        "edgeKind": "structured-question-contract",
+        "targetActionKey": "n/a (shared §3.6 wire contract; not a route)"
+      }
+    },
+    {
+      "owner": "j2kenton",
+      "path": "src/types/taskActionOutcomeV1.ts",
+      "disposition": "added",
+      "cohort": "foundations",
+      "planSection": "3.7",
+      "rationale": "Foundations cohort (executable-order step 6, stable coordinator outcomes — plan §3.7): the closed TaskActionOutcomeV1 union every product/UI surface is meant to consume, its strict decoder (used to validate a durably-recorded resume-invocation outcome), and outcomeCorrelationV1/duplicateRejectedV1. Reached from the production bundle via chatInteractionTransactionStoreV1.ts, which persists a claimed Resume invocation's exact recorded outcome (recordResumeInvocationOutcome) — reached through chatHistoryStore.ts's workflowRuntimeServicesV1.ts wiring.",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "liveSha256": "ab40207ad0ab39384804c58f28a5b47991254289cf26bc32ea21d711cb4d00ba",
+        "symbol": "TaskActionOutcomeV1, decodeTaskActionOutcomeV1, outcomeCorrelationV1, duplicateRejectedV1",
+        "sourceSpan": "L1-L400 (whole file)",
+        "edgeKind": "coordinator-outcome-contract",
+        "targetActionKey": "n/a (shared §3.7 outcome contract; not a route)"
+      }
+    },
+    {
+      "owner": "j2kenton",
+      "path": "src/types/chatInteractionTransactionV1.ts",
+      "disposition": "added",
+      "cohort": "chat",
+      "planSection": "5.5",
+      "rationale": "Chat cohort (executable-order step 8, Chat interaction transactions — plan §5.5): the persisted ChatInteractionTransactionV1 record (question-time correlation, declared Resume semantics, the validated original-input snapshot, prompt-contract identity, the canonical question/answer sets and their digests, the invocation-once claim/outcome mirror, and journaled transition receipts) plus its strict fail-closed decoder and canonical encoder. This round adds the required `stage` field (Chat is fully stage-isolated) so a transaction with no Chat mirror record can still be reconciled into the correct per-stage view (closing the implementation review's transaction-to-Chat reconciliation completion blocker) — encoder/decoder, the JSON Schema, and the checked-in test-fixtures/chat-transactions/ fixtures were all updated together. Reached from the production bundle via chatInteractionTransactionStoreV1.ts and chatHistoryStore.ts, both through workflowRuntimeServicesV1.ts's wiring.",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "liveSha256": "505350102782e0d06e88361aaade04ac5bc1d70c774729556e6f7aaeaa778132",
+        "symbol": "ChatInteractionTransactionV1, decodeChatInteractionTransactionV1, encodeChatInteractionTransactionV1",
+        "sourceSpan": "L1-L878 (whole file; stage field added at the interface declaration and TOP_LEVEL_FIELDS/decode/construct sites)",
+        "edgeKind": "chat-transaction-record",
+        "targetActionKey": "n/a (shared §5.5 transaction record; not a route)"
+      }
+    },
+    {
+      "owner": "j2kenton",
+      "path": "src/services/chatInteractionTransactionStoreV1.ts",
+      "disposition": "added",
+      "cohort": "chat",
+      "planSection": "5.5",
+      "rationale": "Chat cohort (executable-order step 8, the durable §5.5 ledger): persists exactly one transaction record per question-returning operation under registered private storage, enforcing AC-CHAT-TX-01's exactly-one-record rule, the full questionsPosted→...→settled state machine, answer/Resume idempotency, the invocation-once claim and recoverable-terminal-outcome mirror (AC-RUNNER-03), and retention sweeping. This round adds `listUnresolvedForChatDocument` (bounded family-directory listing filtered by chatDocumentId and not-yet-settled state) so chatHistoryStore.ts's readChatInteractions can discover a transaction that was begun but never mirrored into task-local Chat — closing AC-CHAT-TX-03's \"transaction without a Chat record\" direction, the implementation review's remaining Chat-cohort reconciliation blocker — and threads the new required `stage` field through `begin()`. Reached from the production bundle via extension.ts (constructs the store at activation) and chatHistoryStore.ts (via workflowRuntimeServicesV1.ts's activation-wired singleton).",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "liveSha256": "581b4e0c953d9b97769e662eadacb11324f0afba87dd49459031a09339ef1f4b",
+        "symbol": "ChatInteractionTransactionStoreV1, createChatInteractionTransactionStoreV1, listUnresolvedForChatDocument",
+        "sourceSpan": "L1-L1029 (whole file; listUnresolvedForChatDocument added alongside sweepExpired)",
+        "edgeKind": "chat-transaction-store",
+        "targetActionKey": "n/a (durable §5.5 store; consumed by extension.ts's Chat wiring, not itself a route)"
+      }
+    },
+    {
+      "owner": "j2kenton",
+      "path": "src/services/workflowRuntimeServicesV1.ts",
+      "disposition": "added",
+      "cohort": "chat",
+      "planSection": "2.1",
+      "rationale": "Chat cohort (executable-order step 8, closing the prior review's \"second uncoordinated path authority\" blocker): the extension host's single WorkflowPathRegistryV1 + WorkflowFileStoreV1 authority, the configured private-storage root, and the activation-wired durable ChatInteractionTransactionStoreV1 singleton. `ensureWorkflowTaskFolderRootV1` registers a task folder as a trusted mutation root once, idempotently. This round closes the review's remaining architectural blocker (\"trusted mutation authority without validated ownership\"): when a physically-present, self-consistent task-progress.json carries a persisted `ownership` record, the function now derives its `TaskBindingV1` via `deriveTaskBindingV1` (refusing registration if the binding cannot be derived — e.g. `ownership.state === \"ownership-unresolved\"`) and, when `ownership.workspaceRoot` is present, additionally requires it to match one of the currently open `vscode.workspace.workspaceFolders` — mirroring `resolveTaskContext.ts`'s own live-ownership check — refusing registration otherwise. A successfully derived, live-matching binding is exposed via the new `getVerifiedTaskBindingIdV1(rootId)` so chatHistoryStore.ts can use a real ownership-backed binding id instead of a path/canonicalId digest stand-in whenever one is available. Full binding validation against a coordinator-derived TaskBindingV1 supplied by an actual action coordinator remains deferred to whichever cohort wires the coordinator into a real caller (plan §3.9), since no production caller constructs one yet. Reached from the production bundle directly by extension.ts (private-storage configuration + transaction-store wiring) and by chatHistoryStore.ts (task-folder root registration for chat-v1.json). Evidence refresh 2026-07-27 (closing the implementation review's remaining completion blocker within this file: \"registration is permanently cached\"): the progress-file read/decode/ownership/live-workspace check that used to run only on a root's FIRST registration now re-runs on EVERY call — only the underlying `registerRoot` call (which throws on a duplicate id) stays genuinely one-time — so a folder whose progress becomes corrupt, loses its ownership record, or gets repointed at a workspace that is no longer open after its first successful registration is refused (and `isWorkflowTaskFolderRootVerifiedV1`/`getVerifiedTaskBindingIdV1` correctly report not-verified) on every later call too, not only the first. Evidence refresh 2026-07-27 second pass (closing the implementation review's remaining architectural sub-complaint: \"no containment check against ownership.metaRoot/a configured task root/the owning workspace\"): every registration — shape-only, self-consistency-only, and ownership-backed alike — now also requires the folder to sit beneath a recognized location (its own ownership.metaRoot, a configured task-root candidate, or any currently open workspace folder) via the new `isContainedInRecognizedLocationV1`, mirroring resolveTaskContext.ts's own command-layer containment policy verbatim, including its \"skip when no workspace is open at all\" permissiveness. A folder that decodes and derives a binding successfully but sits at some unrelated absolute path is now refused instead of earning a trusted mutation root purely by decoding. Validating a caller-supplied, coordinator-derived TaskBindingV1 against this exact path remains the one sub-gap still deferred to the action-coordinator cohort (plan §3.9), since no production caller constructs one yet. Evidence refresh 2026-07-27 third pass (closing the implementation review's fail-open evidence item \"missing, unreadable, or non-regular task-progress.json is still treated as absence\"): the task-progress.json read now distinguishes genuine absence (ENOENT — the only legitimate fallback to shape-only trust, confirmed as production-reachable solely for the Global Assistant's own folder plus test fixtures, since every real task folder has task-progress.json with `ownership` from the moment `startNewTask.ts` creates it, before task.md or any chat interaction) from any other read failure (permission denied, a directory or other non-regular file sitting at that path, a symlink cycle, or any other I/O error), which now refuses registration instead of silently folding into \"absent\". The read moved inside the existing clear-on-throw try block so the fix reuses the same verified-state-clearing path as every other refusal in this function. The deeper sub-gap — validating a caller-supplied, coordinator-derived TaskBindingV1 against this exact path, and requiring validated ownership rather than permitting shape-only trust for any contained folder with no progress file at all — remains deferred to the action-coordinator cohort (plan §3.9): closing it fully would mean threading an independently-sourced binding through chatHistoryStore.ts's three call sites (and, transitively, chatView.ts/chatWithStage.ts/openGeneralAssistant.ts), which is the coordinator cohort's own job, not a same-file fix. Evidence refresh 2026-07-27 fourth pass (closing the implementation review's architectural blocker outright — \"task-folder mutation authority without validated persisted ownership and an exact coordinator-derived task binding\"; every deferral recorded earlier in this rationale is now closed): registration is split into two kind-separated tiers. `ensureWorkflowTaskFolderRootV1` now REQUIRES all of: an existing, readable task-progress.json (missing progress is not a task folder, full stop); a strict decode pinned to the folder's own basename; a persisted `ownership` record (ownership-free historical progress gets NO mutation trust — it must be rebound through the strict progress migration/recovery path, plan §3.10-§3.12); a derivable TaskBindingV1; a live open-workspace match when ownership.workspaceRoot is present; and STRICT containment via the new `isContainedInRecognizedLocationStrictV1` against the folder's own validated ownership.metaRoot (always present once ownership validates), a configured task-root candidate, or an open workspace folder — with NO skip-when-no-workspace-is-open escape. It also accepts an optional caller-supplied `expected.bindingId` (a coordinator-derived TaskBindingV1.bindingId or the authoritative binding a task-local Chat document already records) which must EQUAL the binding freshly derived from the folder's current persisted ownership — a stale, foreign, or rebound claim refuses registration — and every successfully verified root exposes its ownership-derived binding via `getVerifiedTaskBindingIdV1`. The Global Assistant's dedicated, progress-free folder registers through the NEW separate `ensureWorkflowNonTaskStorageRootV1` (shape+containment trust only, under the distinct \"nonTaskStorage\" root kind), which refuses any folder carrying task progress — the weaker tier can never bypass the strict one, and one path can never hold two root kinds. Re-verification still re-runs every check on EVERY call, clearing recorded verified/binding state on any failure.",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "liveSha256": "faa31d2f91bfc357b817f8b7990174e4b39c8297473e72b63a0d14af814f8d2b",
+        "symbol": "ensureWorkflowTaskFolderRootV1, ensureWorkflowNonTaskStorageRootV1, verifyTaskFolderOwnershipBindingV1, isContainedInRecognizedLocationStrictV1, isWorkflowTaskFolderRootVerifiedV1, getVerifiedTaskBindingIdV1, configureWorkflowPrivateStorageRootV1, setChatInteractionTransactionStoreV1",
+        "sourceSpan": "L1-L550 (whole file; the strict ownership-backed task contract at L254-L400, the separated non-task storage tier at L429-L476)",
+        "edgeKind": "shared-runtime-wiring",
+        "targetActionKey": "n/a (shared §2.1 runtime wiring; consumed by extension.ts and chatHistoryStore.ts, not itself a route)"
+      }
+    },
+    {
+      "owner": "j2kenton",
+      "path": "src/utils/chatHistoryConstants.ts",
+      "disposition": "modified",
+      "cohort": "chat",
+      "planSection": "5.1",
+      "rationale": "Chat cohort: the task-local Chat filename constants (chat-v1.json, its chat-v1.corrupt.json quarantine sibling) plus, added this round, CHAT_RECOVERY_SNAPSHOT_FILENAME — the verified pre-reset snapshot filename Reset Chat History writes under the private-storage chat-recovery/<document-id>/<reset-id>/ family before clearing any unresolved interaction (plan §5.1). Evidence refresh 2026-07-27 (the implementation review's \"separate the Global Assistant's non-task storage registration from task-folder registration\" contract): GLOBAL_ASSISTANT_CANONICAL_ID moved here from commands/openGeneralAssistant.ts (which now re-exports it) — chatHistoryStore.ts's task-vs-non-task registration dispatch (ensureConversationChatRootV1) tests this identity to route the Global Assistant's dedicated, progress-free folder through ensureWorkflowNonTaskStorageRootV1, and owning the constant at the dependency-free utils layer keeps that dispatch free of a command-layer import cycle through views/chatView.ts.",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "liveSha256": "cc3a165eb3350a43dc15d1fb16084e659122e639356e74fc21626f7865d43dc7",
+        "symbol": "CHAT_HISTORY_FILENAME, CHAT_HISTORY_CORRUPT_FILENAME, CHAT_RECOVERY_SNAPSHOT_FILENAME, GLOBAL_ASSISTANT_CANONICAL_ID",
+        "sourceSpan": "L1-L40 (whole file; GLOBAL_ASSISTANT_CANONICAL_ID moved here at L26-L40)",
+        "edgeKind": "chat-storage-constants",
+        "targetActionKey": "n/a (shared Chat filename constants; not a route)"
+      }
+    },
+    {
+      "owner": "j2kenton",
+      "path": "src/utils/chatHistoryStore.ts",
+      "disposition": "modified",
+      "cohort": "chat",
+      "planSection": "5.1",
+      "rationale": "Chat cohort (executable-order step 8): task-local chat-v1.json persistence — bounded transcript read/write with oldest-settled-first compaction, structured-question interaction CRUD reconciled against the durable transaction store, legacy Memento migration, and Reset Chat History with a verified private-storage snapshot. This round closes three further completion gaps the implementation review identified: (1) new documents (and the pre-binding legacy-shape upgrade) now prefer `resolveDefaultTaskBindingV1`'s ownership-derived binding (`workflowRuntimeServicesV1.ts`'s `getVerifiedTaskBindingIdV1`, tagged `taskBindingSource: \"ownershipDerived\"`) over the bare path/canonicalId `localDigest` stand-in whenever the task folder has genuine, live-validated ownership to derive one from — `appendChatInteraction`'s binding-conflict check now also treats an `ownershipDerived` document as authoritative, matching `coordinatorSupplied`; (2) `readChatInteractions` now also backfills a durable transaction's own `answers` (present from `answersDraft` onward) into a still-`unresolved` mirror record whenever they differ, not only a settlement, so a crash between `doSubmitInteractionAnswers`'s durable-first write and its mirror write (chatView.ts) cannot leave the mirror showing a blank, already-submitted question again; (3) `resetChatHistoryV1` no longer marks a mirror interaction `resetByChatRecovery` when its durable transaction counterpart genuinely FAILS to settle (only a benign `ok`/`missing` outcome counts as settled) — the interaction is left `unresolved` instead, so a later read's reconciliation keeps retrying it rather than the two records permanently disagreeing — and its no-document branch now applies the exact same private-storage-availability gate as the with-document path, rather than silently bypassing it. Evidence refresh 2026-07-27 second pass (closing three further implementation-review completion blockers): (a) `resetChatHistoryV1`'s Reset contract — \"every unresolved interaction is cleared\" — is now enforced as a whole-operation guarantee: if ANY unresolved interaction's durable settlement fails, the entire Reset now fails (`ok: false`) and leaves chat-v1.json completely untouched (no resetEpoch bump, no interaction changes at all) instead of returning `ok: true` while an interaction remains unresolved; (b) the no-document Reset path no longer skips the write-and-verify-a-snapshot contract — it now provisions the same registered chat-recovery locators and writes/verifies the fresh empty document itself as the snapshot (the true pre-reset state) before committing it as chat-v1.json, exactly like the with-document path; (c) adds `readChatDocumentIdentityV1`, a new exported read of the CURRENT document's own `{documentId, taskBindingId}` — consumed by chatView.ts's `resolveInteractionRef` so Answer/Cancel/Resume can supply a server-derived, non-client-controlled task/document binding for the conversation orchestrator to validate. Reached from the production bundle via chatView.ts (already-tracked). Evidence refresh 2026-07-27 third pass (closing the implementation review's remaining completion blocker: structured posting must always carry the complete coordinator binding): `NewChatDocumentInteractionV1.binding` is now REQUIRED (not optional), and `appendChatInteraction` runtime-validates its presence/shape and rejects a call that omits it — it can no longer silently fall back to a bare path/canonicalId stand-in the way a plain message append still legitimately may. `emptyDocumentFor` was split into two functions: the original (folder-path + canonicalId, `resolveDefaultTaskBindingV1` fallback) now serves ONLY the unrelated Reset-with-no-prior-document path, while the new `emptyDocumentForInteractionV1(binding)` seeds a brand-new document exclusively from a structured-question posting's mandatory coordinator-supplied binding. Evidence refresh 2026-07-27 fourth pass (closing the implementation review's architectural blocker on the consumer side — \"Chat self-registers a bare path and synthesizes a localDigest binding when no ownership binding is available\"): ALL Chat storage registration now flows through one dispatch point, `ensureConversationChatRootV1` — a TASK conversation's folder goes through workflowRuntimeServicesV1.ts's strict, ownership-backed `ensureWorkflowTaskFolderRootV1` (missing progress, missing ownership, an underivable binding, a dead workspace owner, an uncontained location, or a mismatched caller binding all REFUSE the operation), and ONLY the Global Assistant's reserved conversation identity (`isGlobalAssistantConversationV1`) goes through the separated `ensureWorkflowNonTaskStorageRootV1`. `localTaskBindingId`'s path/canonicalId stand-in is now used EXCLUSIVELY for that one non-task conversation — a task conversation's default binding is ALWAYS the folder's ownership-derived binding (`resolveDefaultTaskBindingV1` reads it back from the strict registration and throws an invariant violation rather than falling back if it is somehow absent), so the review's \"localDigest when no ownership binding is available\" case can no longer occur for any task. `appendChatInteraction` additionally enforces the exact-binding contract for task conversations: the required coordinator-supplied `binding.taskBindingId` must EQUAL the binding freshly derived from the folder's current persisted ownership (via `ensureWorkflowTaskFolderRootV1(folder, { bindingId })`) before any document read or write — a stale, foreign, or rebound claim fails closed.",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "liveSha256": "6b7c973069546a0a0b1fcf52016c1a43db7ca62883637ea28b29ebb24f598528",
+        "symbol": "ensureConversationChatRootV1, isGlobalAssistantConversationV1, localTaskBindingId, resolveDefaultTaskBindingV1, readChatDocumentIdentityV1, appendChatInteraction, readChatInteractions, resetChatHistoryV1, emptyDocumentForInteractionV1",
+        "sourceSpan": "L1-L1581 (whole file; the task/non-task registration dispatch at L315-L345, the ownership-derived default binding at L374-L392, readChatDocumentIdentityV1 at L785, appendChatInteraction's required-binding + exact-binding-vs-folder fail-closed checks at L1193-L1237)",
+        "edgeKind": "chat-storage",
+        "targetActionKey": "n/a (task-local Chat persistence; not itself a route — consumed by chatView.ts's Chat Send/interaction routes)"
+      }
+    },
+    {
+      "owner": "j2kenton",
+      "path": "src/commands/openGeneralAssistant.ts",
+      "disposition": "modified",
+      "cohort": "chat",
+      "planSection": "5.1",
+      "rationale": "Chat cohort (the implementation review's \"separate the Global Assistant's non-task storage registration from task-folder registration\" contract): ownership of the Global Assistant's reserved conversation identity, GLOBAL_ASSISTANT_CANONICAL_ID, moved from this command module down to the dependency-free utils/chatHistoryConstants.ts so chatHistoryStore.ts's task-vs-non-task registration dispatch (ensureConversationChatRootV1) can test it without a command-layer import cycle through views/chatView.ts; this module now imports it locally and re-exports it unchanged for its existing consumers (the Chat With AI panel's default global target, chatStageIsolation.test.ts). The Global Assistant's dedicated, progress-free folder is thereby registered exclusively through ensureWorkflowNonTaskStorageRootV1 (shape+containment trust under the distinct \"nonTaskStorage\" root kind), never through the strict ownership-backed task-folder path — and a folder carrying task progress can never take the non-task path, so the two tiers cannot be confused or bypassed.",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "liveSha256": "fc2dc920cb454755720a71aad923a5f62750a486ea1274488d167710d5c770bc",
+        "symbol": "GLOBAL_ASSISTANT_CANONICAL_ID, resolveGlobalAssistantTarget, openGeneralAssistant, globalAssistantSend",
+        "sourceSpan": "L1-L376 (whole file; the import-and-re-export split at L27-L29)",
+        "edgeKind": "chat-command",
+        "targetActionKey": "n/a (Global Assistant command surface; not a registry route)"
+      }
+    },
+    {
+      "owner": "j2kenton",
+      "path": "src/actions/actionConversationOrchestratorV1.ts",
+      "disposition": "added",
+      "cohort": "chat",
+      "planSection": "5.5",
+      "rationale": "Newly production-reachable this round (closing the implementation review's completion blocker that Answer/Cancel validated only the interaction id, not the full task/document binding): extension.ts now constructs `createActionConversationOrchestratorV1({ transactionStore: chatInteractionTransactionStore })` and routes the webview's structured Answer/Cancel controls through it instead of calling `chatInteractionTransactionStoreV1` directly. The orchestrator's `loadValidated` (already present, already covered by actionConversationOrchestratorV1.test.ts, but never wired to a real production caller until now) rejects a reference whose `interactionId` does not match the persisted transaction's own recorded interaction — and, since this round adds optional `taskBindingId`/`chatDocumentId` fields to `InteractionRefV1` that `loadValidated` also checks when present, a reference whose task/document binding does not match the transaction's own recorded binding either. chatView.ts's `resolveInteractionRef` supplies both, derived server-side from the CURRENT task-local Chat document (`chatHistoryStore.ts`'s `readChatDocumentIdentityV1`) rather than trusted from the webview message, so a stale or foreign operation/interaction reference is rejected even without the full action coordinator this module still awaits for Resume (`postQuestions`/`resolveResume` remain unreached from production — nothing yet calls them). Only `submitAnswers` and `cancel` are exercised from the production bundle today. Evidence refresh 2026-07-27 second pass (closing the implementation review's remaining completion blocker: \"InteractionRefV1 still makes task/document binding optional and contains no sourceAttemptId\"): `taskBindingId` and `chatDocumentId` are now REQUIRED fields (no longer optional), and a new required `sourceAttemptId` field was added; `loadValidated` now unconditionally validates all three against the persisted transaction's own recorded `taskBindingId`/`chatDocumentId`/`sourceAttemptId` — previously these checks only ran \"when supplied\". chatView.ts's `resolveInteractionRef` now also derives `sourceAttemptId` from the mirrored interaction's own recorded value (via `readChatInteractions`) so every production caller (Answer/Cancel/Resume) always supplies the complete tuple.",
+      "expiryCohort": "text1",
+      "evidence": {
+        "liveSha256": "de7aee1d2279c333e5011bc7930c0d97c0febed2d50d78d48d83651ab761e999",
+        "symbol": "createActionConversationOrchestratorV1, InteractionRefV1, submitAnswers, cancel",
+        "sourceSpan": "L1-L640 (whole file; InteractionRefV1's required taskBindingId/chatDocumentId/sourceAttemptId at L107-L124, loadValidated's unconditional binding checks at L411-L449, submitAnswers, cancel)",
+        "edgeKind": "action-coordinator",
+        "targetActionKey": "n/a (Chat interaction lifecycle wrapper over the durable transaction store; not itself a registry-owned action route)"
+      }
+    },
+    {
+      "owner": "j2kenton",
+      "path": "src/types/taskBindingV1.ts",
+      "disposition": "added",
+      "cohort": "chat",
+      "planSection": "3.9",
+      "rationale": "Newly reached from the production bundle this round: `workflowRuntimeServicesV1.ts`'s `ensureWorkflowTaskFolderRootV1` now imports `deriveTaskBindingV1`/`computeTaskBindingIdV1` to derive a task folder's ownership-backed `TaskBindingV1.bindingId` (closing the implementation review's \"trusted mutation authority without validated ownership\" architectural blocker) — previously this module was reachable only from `src/test/taskBindingV1.test.ts`. The module itself is unchanged: it defines the `TaskBindingV1` shape (`ownership` + `taskFolder` + a SHA-256 `bindingId` over their canonical preimage) and `deriveTaskBindingV1`, which fails closed on missing/unresolved/ambiguous ownership.",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "liveSha256": "94b0ff68db29198b4a599546d930141cf02a14154c70618cf2b99abb605946b5",
+        "symbol": "TaskBindingV1, deriveTaskBindingV1, computeTaskBindingIdV1",
+        "sourceSpan": "L1-L111 (whole file)",
+        "edgeKind": "task-binding-model",
+        "targetActionKey": "n/a (shared §3.9 binding model; consumed by workflowRuntimeServicesV1.ts, not itself a route)"
+      }
+    }
+  ]
+}

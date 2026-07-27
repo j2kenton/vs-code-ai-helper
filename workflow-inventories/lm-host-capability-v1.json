@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "description": "The capability contract src/services/vscodeLmCompat.ts's probeLmToolCallingHostCapabilityV1 checks before any model selection or file read in the implementation-edit runner, and the expected outcome per host tier. This is a static description of the probe's own logic (kept in sync manually with vscodeLmCompat.ts pending scripts/verifyVscodeLmApiBoundary.mjs growing an automated cross-check); it is not itself evidence that a real host of each version behaves this way — that requires the host-matrix tests plan §1.6 §1.7 describe, which this environment cannot run.",
+  "probe": "probeLmToolCallingHostCapabilityV1",
+  "probeLocation": "src/services/vscodeLmCompat.ts",
+  "requiredForSupported": [
+    { "member": "LanguageModelTextPart", "kind": "constructor" },
+    { "member": "LanguageModelToolCallPart", "kind": "constructor" },
+    { "member": "LanguageModelToolResultPart", "kind": "constructor" },
+    { "member": "lm.selectChatModels", "kind": "function" }
+  ],
+  "hostTiers": [
+    {
+      "vscodeVersion": "1.93.0",
+      "expected": "hostToolApiUnavailable",
+      "rationale": "Declared engines.vscode floor; tool-calling constructors are not guaranteed present. probeLmToolCallingHostCapabilityV1 must return supported:false before vscode.lm.selectChatModels or any file read.",
+      "verifiedAgainstRealHost": false
+    },
+    {
+      "vscodeVersion": "1.100.0",
+      "expected": "supported",
+      "rationale": "Plan §1.6/§7.5 floor for request-local preflight/edit actions.",
+      "verifiedAgainstRealHost": false
+    },
+    {
+      "vscodeVersion": "1.110.0",
+      "expected": "supported",
+      "rationale": "Forward-compatibility check.",
+      "verifiedAgainstRealHost": false
+    }
+  ],
+  "currentEvidence": {
+    "kind": "test-stub-only",
+    "location": "src/test/vscodeLmCompat.test.ts, src/test/copilotImplementationRunnerHostCapability.test.ts",
+    "description": "Proves the probe's own fail-closed logic (naming what's missing, never throwing, running before model selection) against test-stubs/vscode, which exposes every constructor. Does not prove real-host behavior at any of the three version tiers above."
+  },
+  "notCoveredYet": [
+    "No @vscode/test-electron acquisition/run exists for 1.93.0, 1.100.0, or 1.110.0 (plan §1.6 step 7, AC-HOST-02/03). This requires downloading and running real VS Code binaries on pinned Windows/Linux/macOS runners, which this sandbox cannot do."
+  ]
+}

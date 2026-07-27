@@ -1,0 +1,5 @@
+[
+  { "questionId": "q1", "kind": "text", "state": "answered", "value": "The service crashes on startup" },
+  { "questionId": "q2", "kind": "singleChoice", "state": "answered", "selectedOptionId": "high" },
+  { "questionId": "q3", "kind": "multipleChoice", "state": "answered", "selectedOptionIds": ["api", "db"] }
+]

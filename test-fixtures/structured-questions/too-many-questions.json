@@ -1,0 +1,19 @@
+[
+  { "questionId": "q0", "kind": "text", "prompt": "Q", "required": false, "allowBlank": true, "maxLength": 10 },
+  { "questionId": "q1", "kind": "text", "prompt": "Q", "required": false, "allowBlank": true, "maxLength": 10 },
+  { "questionId": "q2", "kind": "text", "prompt": "Q", "required": false, "allowBlank": true, "maxLength": 10 },
+  { "questionId": "q3", "kind": "text", "prompt": "Q", "required": false, "allowBlank": true, "maxLength": 10 },
+  { "questionId": "q4", "kind": "text", "prompt": "Q", "required": false, "allowBlank": true, "maxLength": 10 },
+  { "questionId": "q5", "kind": "text", "prompt": "Q", "required": false, "allowBlank": true, "maxLength": 10 },
+  { "questionId": "q6", "kind": "text", "prompt": "Q", "required": false, "allowBlank": true, "maxLength": 10 },
+  { "questionId": "q7", "kind": "text", "prompt": "Q", "required": false, "allowBlank": true, "maxLength": 10 },
+  { "questionId": "q8", "kind": "text", "prompt": "Q", "required": false, "allowBlank": true, "maxLength": 10 },
+  { "questionId": "q9", "kind": "text", "prompt": "Q", "required": false, "allowBlank": true, "maxLength": 10 },
+  { "questionId": "q10", "kind": "text", "prompt": "Q", "required": false, "allowBlank": true, "maxLength": 10 },
+  { "questionId": "q11", "kind": "text", "prompt": "Q", "required": false, "allowBlank": true, "maxLength": 10 },
+  { "questionId": "q12", "kind": "text", "prompt": "Q", "required": false, "allowBlank": true, "maxLength": 10 },
+  { "questionId": "q13", "kind": "text", "prompt": "Q", "required": false, "allowBlank": true, "maxLength": 10 },
+  { "questionId": "q14", "kind": "text", "prompt": "Q", "required": false, "allowBlank": true, "maxLength": 10 },
+  { "questionId": "q15", "kind": "text", "prompt": "Q", "required": false, "allowBlank": true, "maxLength": 10 },
+  { "questionId": "q16", "kind": "text", "prompt": "Q", "required": false, "allowBlank": true, "maxLength": 10 }
+]

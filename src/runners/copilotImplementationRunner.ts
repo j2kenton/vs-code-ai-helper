@@ -10,6 +10,21 @@ import {
 import { sanitizeRelativePath } from "../utils/pathSafety";
 import { classifyFailure } from "../utils/quota";
 import {
+  LmChatRequestOptionsV1,
+  LmChatResponseV1,
+  LmToolCallPartV1,
+  LmToolDescriptorV1,
+} from "../types/vscodeLmCompatV1";
+import {
+  attachLmToolsV1,
+  createLmAssistantMessageWithPartsV1,
+  createLmTextPartV1,
+  createLmToolResultPartV1,
+  createLmUserMessageWithPartsV1,
+  iterateLmResponsePartsV1,
+  probeLmToolCallingHostCapabilityV1,
+} from "../services/vscodeLmCompat";
+import {
   IMPLEMENTATION_FILENAME,
   LEGACY_IMPLEMENTATION_FILENAME,
 } from "../types/taskProgress";
@@ -40,7 +55,7 @@ const RESERVED_ROOT_ARTIFACT_NAMES: ReadonlySet<string> = new Set([
 /**
  * Tools exposed to the language model for reading and writing workspace files.
  */
-const IMPLEMENTATION_TOOLS: vscode.LanguageModelChatTool[] = [
+const IMPLEMENTATION_TOOLS: LmToolDescriptorV1[] = [
   {
     name: "read_file",
     description:
@@ -209,11 +224,11 @@ function safeResolve(
  * filesChanged is mutated to track paths written by the model.
  */
 async function executeToolCall(
-  call: vscode.LanguageModelToolCallPart,
+  call: LmToolCallPartV1,
   workspaceUri: vscode.Uri,
   filesChanged: Set<string>
 ): Promise<string> {
-  const input = call.input as Record<string, unknown>;
+  const input = call.input;
 
   switch (call.name) {
     case "read_file": {
@@ -333,7 +348,7 @@ interface ImplementationRoundResult {
 async function runImplementationRounds(
   model: vscode.LanguageModelChat,
   messages: vscode.LanguageModelChatMessage[],
-  requestOptions: vscode.LanguageModelChatRequestOptions,
+  requestOptions: LmChatRequestOptionsV1,
   workspaceUri: vscode.Uri,
   filesChanged: Set<string>,
   token: vscode.CancellationToken,
@@ -351,11 +366,11 @@ async function runImplementationRounds(
     iteration++;
     onProgress(`Waiting for Copilot (round ${iteration})...`);
 
-    let response: vscode.LanguageModelChatResponse;
+    let response: LmChatResponseV1;
     try {
       response = await model.sendRequest(
         messages,
-        { ...requestOptions, tools: IMPLEMENTATION_TOOLS },
+        attachLmToolsV1(requestOptions, IMPLEMENTATION_TOOLS),
         token
       );
     } catch (e) {
@@ -377,18 +392,23 @@ async function runImplementationRounds(
       };
     }
 
-    // Collect all response parts
+    // Collect all response parts. `toolCallParts` keeps the real
+    // vscode.LanguageModelToolCallPart instances (needed to round-trip back
+    // into the assistant message below); `toolCalls` is the neutral
+    // extraction this function's own logic reads.
     const textParts: string[] = [];
-    const toolCalls: vscode.LanguageModelToolCallPart[] = [];
+    const toolCallParts: unknown[] = [];
+    const toolCalls: LmToolCallPartV1[] = [];
 
     try {
-      for await (const part of response.stream) {
+      for await (const { part, raw } of iterateLmResponsePartsV1(vscode, response)) {
         if (token.isCancellationRequested) {
           return { iteration, completedCleanly: false, cancelled: true, finalSummary: "" };
         }
-        if (part instanceof vscode.LanguageModelTextPart) {
+        if (part.kind === "text") {
           textParts.push(part.value);
-        } else if (part instanceof vscode.LanguageModelToolCallPart) {
+        } else {
+          toolCallParts.push(raw);
           toolCalls.push(part);
         }
       }
@@ -413,17 +433,15 @@ async function runImplementationRounds(
 
     const assistantText = textParts.join("");
 
-    // Record the assistant turn (text + tool calls)
-    const assistantContent: (
-      | vscode.LanguageModelTextPart
-      | vscode.LanguageModelToolCallPart
-    )[] = [];
+    // Record the assistant turn (text + tool calls). toolCallParts holds the
+    // real instances the host returned, so they round-trip back unchanged.
+    const assistantContent: unknown[] = [];
     if (assistantText) {
-      assistantContent.push(new vscode.LanguageModelTextPart(assistantText));
+      assistantContent.push(createLmTextPartV1(vscode, assistantText));
     }
-    assistantContent.push(...toolCalls);
+    assistantContent.push(...toolCallParts);
     if (assistantContent.length > 0) {
-      messages.push(vscode.LanguageModelChatMessage.Assistant(assistantContent));
+      messages.push(createLmAssistantMessageWithPartsV1(vscode, assistantContent));
     }
 
     if (toolCalls.length === 0) {
@@ -432,22 +450,18 @@ async function runImplementationRounds(
     }
 
     // Execute each tool call and collect results
-    const toolResults: vscode.LanguageModelToolResultPart[] = [];
+    const toolResults: unknown[] = [];
     for (const call of toolCalls) {
       if (token.isCancellationRequested) {
         return { iteration, completedCleanly: false, cancelled: true, finalSummary: "" };
       }
-      onProgress(`Tool: ${call.name}("${String((call.input as Record<string, unknown>)["path"] ?? "")}")`);
+      onProgress(`Tool: ${call.name}("${String(call.input["path"] ?? "")}")`);
       const result = await executeToolCall(call, workspaceUri, filesChanged);
-      toolResults.push(
-        new vscode.LanguageModelToolResultPart(call.callId, [
-          new vscode.LanguageModelTextPart(result),
-        ])
-      );
+      toolResults.push(createLmToolResultPartV1(vscode, call.callId, result));
     }
 
     // Send tool results back as a User message
-    messages.push(vscode.LanguageModelChatMessage.User(toolResults));
+    messages.push(createLmUserMessageWithPartsV1(vscode, toolResults));
   }
 
   return { iteration, completedCleanly: false, cancelled: false, finalSummary: "" };
@@ -497,6 +511,19 @@ export async function runImplementationWithCopilot(options: {
   onWaitingForUser?: (waiting: boolean) => void;
 }): Promise<ImplementationRunResult> {
   const { prompt, modelId, workspaceUri, token, onProgress, onBusyDetail, onWaitingForUser } = options;
+
+  // Fail closed, before any model selection or file read, on a host that
+  // lacks the tool-calling runtime constructors this loop depends on (plan
+  // §1.6) — instead of throwing partway through the first round.
+  const hostCapability = probeLmToolCallingHostCapabilityV1(vscode);
+  if (!hostCapability.supported) {
+    return {
+      status: "failed",
+      filesChanged: [],
+      failureKind: "temporarily-unavailable",
+      errorMessage: hostCapability.reason,
+    };
+  }
 
   const filesChanged = new Set<string>();
 
@@ -618,6 +645,10 @@ export async function runImplementationWithCopilot(options: {
  * Check whether Copilot LM is available for implementation runs.
  */
 export async function checkImplementationAvailability(): Promise<AgentAvailability> {
+  const hostCapability = probeLmToolCallingHostCapabilityV1(vscode);
+  if (!hostCapability.supported) {
+    return { available: false, reason: hostCapability.reason };
+  }
   try {
     const models = await vscode.lm.selectChatModels({ vendor: "copilot" });
     if (models.length === 0) {

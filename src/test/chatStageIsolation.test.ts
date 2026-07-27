@@ -22,6 +22,7 @@ import * as vscode from "vscode";
 import { ChatViewProvider } from "../views/chatView";
 import { CHAT_HISTORY_FILENAME } from "../utils/chatHistoryStore";
 import { GLOBAL_ASSISTANT_CANONICAL_ID } from "../commands/openGeneralAssistant";
+import { makeOwnedTaskFolder } from "./taskFolderFixture";
 
 /** Bridges vscode.workspace.fs.readFile to the real filesystem, mirroring
  * chatViewTaskSwitch.test.ts's installReadFileBridge. */
@@ -46,14 +47,20 @@ function makeMemento(): vscode.Memento {
   } as unknown as vscode.Memento;
 }
 
-function makeFolder(name: string): string {
+/** Task conversations require the strict, ownership-backed task-folder root contract (see workflowRuntimeServicesV1.ts). */
+function makeTaskFolder(name: string): string {
+  return makeOwnedTaskFolder(`ensemble-chat-isolation-${name}-`).folder;
+}
+
+/** The Global Assistant's dedicated folder is non-task storage and must stay progress-free. */
+function makeGlobalFolder(name: string): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), `ensemble-chat-isolation-${name}-`));
 }
 
 void describe("stage chat isolation", () => {
   void it("a stage's transcript never contains another stage's messages", async () => {
     const rf = installReadFileBridge();
-    const folder = makeFolder("stages");
+    const folder = makeTaskFolder("stages");
     const provider = new ChatViewProvider(makeMemento());
     const identity = { canonicalId: folder, taskFolderPath: folder };
 
@@ -91,8 +98,8 @@ void describe("stage chat isolation", () => {
 
   void it("the global assistant's history is fully separate from every task's stage chats", async () => {
     const rf = installReadFileBridge();
-    const taskFolder = makeFolder("task");
-    const globalFolder = makeFolder("global");
+    const taskFolder = makeTaskFolder("task");
+    const globalFolder = makeGlobalFolder("global");
     const provider = new ChatViewProvider(makeMemento());
     const taskIdentity = { canonicalId: taskFolder, taskFolderPath: taskFolder };
     const globalIdentity = {

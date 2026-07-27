@@ -693,9 +693,9 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
       }
     });
 
-    void it("recovers a completed creation sentinel into the paused state", async () => {
+    void it("classifies a legacy creating sentinel read-only instead of promoting it to paused", async () => {
       // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const { recoverTaskCreations } = await import("../commands/startNewTask.js");
+      const { LegacyCreatingStartupGateV0 } = await import("../state/legacyCreatingStartupGateV0.js");
       const root = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-create-recovery-"));
       const taskName = "2026-01-01_task_1";
       const creatingProgress = JSON.stringify({
@@ -709,26 +709,35 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
       const originalReadDirectory = workspaceFs.readDirectory;
       const originalReadFile = workspaceFs.readFile;
       const originalStat = workspaceFs.stat;
+      const originalWriteFile = workspaceFs.writeFile;
       const writes = new Map<string, string>();
-      const creationFilesystem = isolateTaskCreationFilesystem(writes);
       workspaceFs.readDirectory = (): Promise<[string, vscode.FileType][]> =>
         Promise.resolve([[taskName, vscode.FileType.Directory]]);
       workspaceFs.readFile = (): Promise<Uint8Array> =>
         Promise.resolve(new TextEncoder().encode(creatingProgress));
       workspaceFs.stat = (): Promise<vscode.FileStat> =>
         Promise.resolve({ type: vscode.FileType.File, ctime: 0, mtime: 0, size: 0 });
+      workspaceFs.writeFile = (uri: vscode.Uri, bytes: Uint8Array): Promise<void> => {
+        writes.set(uri.path, new TextDecoder().decode(bytes));
+        return Promise.resolve();
+      };
+      LegacyCreatingStartupGateV0.resetForTests();
       try {
-        await recoverTaskCreations(root);
-        const recoveredDocument = [...writes.entries()]
-          .find(([file]) => file.endsWith("task-progress.json"))?.[1];
-        assert.ok(recoveredDocument, "recovery should persist the promoted progress record");
-        const recovered = JSON.parse(recoveredDocument) as { status?: string };
-        assert.equal(recovered.status, "paused");
+        const footprints = await LegacyCreatingStartupGateV0.getFootprints(root);
+        assert.equal(footprints.length, 1, "the creating folder must be classified, not silently skipped");
+        assert.equal(footprints[0]?.taskFolderName, taskName);
+        assert.equal(footprints[0]?.hasTaskMd, true, "task.md's presence is recorded, but only informationally");
+        assert.equal(
+          [...writes.entries()].find(([file]) => file.endsWith("task-progress.json")),
+          undefined,
+          "classification must never rewrite task-progress.json — the old promote-to-paused behavior is removed"
+        );
       } finally {
-        creationFilesystem.restore();
+        LegacyCreatingStartupGateV0.resetForTests();
         workspaceFs.readDirectory = originalReadDirectory;
         workspaceFs.readFile = originalReadFile;
         workspaceFs.stat = originalStat;
+        workspaceFs.writeFile = originalWriteFile;
         fs.rmSync(root, { recursive: true, force: true });
       }
     });

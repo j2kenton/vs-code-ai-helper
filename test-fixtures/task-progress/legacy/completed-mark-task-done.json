@@ -1,0 +1,11 @@
+{
+  "taskFolder": "2026-07-01_task_7",
+  "displayName": "ff for 1 pt 2",
+  "nameIsDefault": false,
+  "currentStage": "publish",
+  "status": "completed",
+  "completedAt": "2026-07-09T00:00:00.000Z",
+  "completedStages": ["publish"],
+  "createdAt": "2026-07-01T10:00:00.000Z",
+  "updatedAt": "2026-07-09T00:00:00.000Z"
+}

@@ -853,8 +853,13 @@ void describe("runImplementationForModel", () => {
     const originalReadFile = workspace.fs.readFile;
     const originalWriteFile = workspace.fs.writeFile;
 
-    function* responseStream(): Iterable<vscode.LanguageModelTextPart> {
-      yield new vscode.LanguageModelTextPart("backup implementation");
+    // The pinned 1.93 declarations do not define LanguageModelTextPart; the
+    // stub provides it at runtime, so name it through a structural cast.
+    const { LanguageModelTextPart } = vscode as unknown as {
+      LanguageModelTextPart: new (value: string) => { value: string };
+    };
+    function* responseStream(): Iterable<unknown> {
+      yield new LanguageModelTextPart("backup implementation");
     }
 
     workspace.fs.readFile = (uri: vscode.Uri): Promise<Uint8Array> =>

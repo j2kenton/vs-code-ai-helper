@@ -11,6 +11,13 @@ import {
   AgentRunResult,
   AgentWorkflowStage,
 } from "../types/agentRunner";
+import {
+  AgentExecutionRequestV1,
+  AgentTransportExitV1,
+  AgentTransportV1,
+  BoundedResultWriterV1,
+} from "../types/agentExecutionV1";
+import { createCliStdoutResultCaptureV1 } from "../services/cliStdoutResultCaptureV1";
 import { withAttribution, writeTextFile } from "../utils/fileUtils";
 import { ImplementationRunResult } from "./copilotImplementationRunner";
 import { cliDisplayLabel, CliProviderDefinition, CliRunMode } from "./providers";
@@ -1197,6 +1204,283 @@ function normalizeCliOutput(
   }
 
   return output;
+}
+
+/**
+ * True when this provider can satisfy the V1 text-mode capture contract:
+ * its final answer arrives on stdout (AC-RUNNER-02: "CLI results are
+ * captured only from bounded stdout"). A provider that writes its final
+ * message to a last-message temp file cannot satisfy V1 yet — plan §3.4:
+ * such a runner does not silently disappear, it returns
+ * `providerModeUnavailable` at selection time (`openV1RunnerSelection` in
+ * runnerRegistry.ts) until it implements stdout framing.
+ */
+export function cliProviderSupportsV1StdoutCapture(def: CliProviderDefinition): boolean {
+  return !def.usesLastMessageFile;
+}
+
+/**
+ * At most this many raw stdout bytes are buffered while unwrapping a
+ * structured (JSON-lines) CLI event stream into its final text. The bound
+ * exists because opencode's/cline's streams re-emit the full text of every
+ * file the agent reads, so a legitimate run's raw stream can be far larger
+ * than its final framed result — but it must still be finite before the
+ * extraction pass runs. Exceeding it kills the process and fails the
+ * transport; nothing is ever written to the result writer.
+ */
+export const MAX_CLI_STRUCTURED_EVENT_STREAM_BYTES_V1 = 64 * 1024 * 1024;
+
+/**
+ * V1 transport (plan §3.2/§3.4) for a vendor CLI's read-only text mode:
+ * spawns the CLI exactly like the legacy path (same argument builder,
+ * sanitized environment, shell quoting, kill-tree cancellation, and run
+ * timeout), captures the framed result from bounded stdout only, and reports
+ * how the process exited. It receives no artifact or result path
+ * (AC-RUNNER-01), and stderr participates solely in the capture layer's
+ * sanitized size/digest summary.
+ *
+ * Two stdout shapes are supported (AC-RUNNER-02 — the result is captured
+ * only from bounded stdout in both):
+ *  - opaque-text CLIs (no `structuredEventStream`): stdout IS the model's
+ *    final answer, so bytes stream straight into the broker-owned bounded
+ *    writer as they arrive;
+ *  - structured-event CLIs (opencode's `--format json`, cline's `--json`):
+ *    stdout is a JSON-lines event stream that WRAPS the model's final text
+ *    in event objects (and re-emits file contents in tool events), so
+ *    forwarding it raw could never parse as a framed V1 result. The raw
+ *    stream is buffered (bounded by
+ *    `MAX_CLI_STRUCTURED_EVENT_STREAM_BYTES_V1`), and on a successful exit
+ *    the provider's own final-text extractor (`normalizeCliOutput` — the
+ *    same one the legacy path uses) unwraps the model's reply, which is then
+ *    written to the bounded writer as the single captured payload. A framed
+ *    result the model emitted inside its reply therefore reaches the broker
+ *    as directly parseable framed bytes.
+ *
+ * Selection happens in `runnerRegistry.ts`; constructing this transport is
+ * not an invocation.
+ */
+export function createCliTextTransportV1(options: {
+  def: CliProviderDefinition;
+  /** Provider-native (unqualified) model id; undefined runs the CLI default. */
+  model: string | undefined;
+  /**
+   * Working directory for the CLI process (the workspace root). This is
+   * transport configuration fixed at construction by the registry — the V1
+   * request itself never carries a filesystem path.
+   */
+  cwd: string;
+  /**
+   * Test seam: overrides `MAX_CLI_STRUCTURED_EVENT_STREAM_BYTES_V1` so the
+   * raw-stream bound is exercisable without emitting 64 MiB. Production
+   * callers (the registry) never set it.
+   */
+  maxEventStreamBytes?: number;
+}): AgentTransportV1 {
+  const { def, model, cwd } = options;
+  const maxEventStreamBytes =
+    options.maxEventStreamBytes ?? MAX_CLI_STRUCTURED_EVENT_STREAM_BYTES_V1;
+  return {
+    runnerId: def.id,
+    invoke(
+      request: AgentExecutionRequestV1,
+      output: BoundedResultWriterV1
+    ): Promise<AgentTransportExitV1> {
+      if (request.mode !== "text") {
+        // General-workspace CLI processes are unsupported for preflight and
+        // edit execution (plan product decisions); the registry never
+        // reserves them for those modes, so this is a defensive backstop.
+        return Promise.resolve({ kind: "transportFailure", code: "cliModeUnsupported" });
+      }
+      if (!cliProviderSupportsV1StdoutCapture(def)) {
+        return Promise.resolve({
+          kind: "transportFailure",
+          code: "cliStdoutCaptureUnsupported",
+        });
+      }
+
+      const promptTransport = def.promptTransport ?? "stdin";
+      const useShell = def.useShell ?? true;
+      if ((promptTransport === "file" || promptTransport === "argv") && useShell) {
+        return Promise.resolve({
+          kind: "transportFailure",
+          code: "cliPromptTransportMisconfigured",
+        });
+      }
+
+      let promptFile: string | undefined;
+      if (promptTransport === "file") {
+        promptFile = nodePath.join(
+          os.tmpdir(),
+          `vs-code-ai-helper-${def.id}-prompt-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`
+        );
+        try {
+          // mode 0o600 for the same reason as the legacy path: prompts can
+          // embed full context packs on a world-readable shared tmpdir.
+          nodeFs.writeFileSync(promptFile, request.prompt, { encoding: "utf8", mode: 0o600 });
+        } catch {
+          return Promise.resolve({ kind: "transportFailure", code: "cliPromptFileWriteFailed" });
+        }
+      }
+      const cleanupPromptFile = (): void => {
+        if (promptFile) {
+          try {
+            nodeFs.unlinkSync(promptFile);
+          } catch {
+            // Best-effort cleanup.
+          }
+        }
+      };
+
+      let args: string[];
+      try {
+        // No last-message file: V1 results are captured from stdout only.
+        args = def.buildArgs("text", model, undefined, { cwd, promptFile });
+      } catch {
+        cleanupPromptFile();
+        return Promise.resolve({ kind: "transportFailure", code: "cliArgumentBuildFailed" });
+      }
+      if (promptTransport === "argv") {
+        const promptBytes = Buffer.byteLength(request.prompt, "utf8");
+        if (
+          typeof def.maxArgvPromptBytes === "number" &&
+          promptBytes > def.maxArgvPromptBytes
+        ) {
+          return Promise.resolve({ kind: "transportFailure", code: "cliPromptTooLarge" });
+        }
+        args.push(request.prompt);
+      }
+
+      return (async (): Promise<AgentTransportExitV1> => {
+        const resolvedCommand = await resolveCliCommand(def.command, def.commandAliases);
+        if (!resolvedCommand) {
+          cleanupPromptFile();
+          return { kind: "transportFailure", code: "cliNotInstalled" };
+        }
+
+        return new Promise<AgentTransportExitV1>((resolve) => {
+          let settled = false;
+          let cancelled = false;
+          const capture = createCliStdoutResultCaptureV1(output);
+          // Structured-event CLIs buffer raw stdout for post-exit extraction
+          // (see the function doc comment); opaque-text CLIs stream directly.
+          const structuredStream = def.structuredEventStream !== undefined;
+          const rawEventChunks: Buffer[] = [];
+          let rawEventBytes = 0;
+
+          // Same shell-quoting rule as execCliAgent: with shell:true Node
+          // joins argv with plain spaces, so multi-word values must be
+          // quoted on both platforms.
+          const spawnArgs = useShell
+            ? args.map((a) =>
+                process.platform === "win32"
+                  ? a.includes(" ")
+                    ? `"${a}"`
+                    : a
+                  : quotePosixShellArg(a)
+              )
+            : args;
+          let child: cp.ChildProcess;
+          try {
+            child = cp.spawn(resolvedCommand, spawnArgs, {
+              cwd,
+              shell: useShell,
+              windowsHide: true,
+              env: sanitizedCliEnv(),
+              detached: process.platform !== "win32",
+            });
+          } catch {
+            cleanupPromptFile();
+            resolve({ kind: "transportFailure", code: "cliSpawnFailed" });
+            return;
+          }
+
+          const finish = (exit: AgentTransportExitV1): void => {
+            if (settled) {
+              return;
+            }
+            settled = true;
+            clearTimeout(timeoutHandle);
+            cancellationListener.dispose();
+            cleanupPromptFile();
+            resolve(exit);
+          };
+
+          const timeoutHandle = setTimeout(() => {
+            killProcessTree(child);
+            finish({ kind: "transportFailure", code: "cliRunTimeout" });
+          }, RUN_TIMEOUT_MS);
+
+          const cancellationListener = request.cancellationToken.onCancellationRequested(() => {
+            cancelled = true;
+            killProcessTree(child);
+            finish({ kind: "callerCancelled" });
+          });
+
+          child.on("error", () => {
+            finish({ kind: "transportFailure", code: "cliSpawnFailed" });
+          });
+
+          child.stdout?.on("data", (chunk: Buffer) => {
+            if (!structuredStream) {
+              capture.handleStdout(chunk);
+              return;
+            }
+            if (settled) {
+              return;
+            }
+            rawEventBytes += chunk.length;
+            if (rawEventBytes > maxEventStreamBytes) {
+              // The raw event stream is unboundedly large — discard it and
+              // fail without writing anything: no bytes ever reached the
+              // result writer, so this stays a pre-response failure.
+              rawEventChunks.length = 0;
+              killProcessTree(child);
+              finish({ kind: "transportFailure", code: "cliEventStreamTooLarge" });
+              return;
+            }
+            rawEventChunks.push(Buffer.from(chunk));
+          });
+          child.stderr?.on("data", (chunk: Buffer) => {
+            capture.handleStderr(chunk);
+          });
+
+          child.on("close", (code) => {
+            if (cancelled) {
+              finish({ kind: "callerCancelled" });
+              return;
+            }
+            if (code === 0) {
+              if (structuredStream && !settled) {
+                // Unwrap the model's final text from the event stream with
+                // the provider's own extractor and write it as the single
+                // captured payload — a framed result the model emitted
+                // arrives at the broker as directly parseable framed bytes.
+                const rawStdout = Buffer.concat(rawEventChunks).toString("utf8");
+                rawEventChunks.length = 0;
+                capture.handleStdout(normalizeCliOutput(def, rawStdout, undefined));
+              }
+              finish({ kind: "completed" });
+              return;
+            }
+            // A structured-event CLI's failed run wrote nothing to the result
+            // writer (its final text only materializes on exit 0), so the
+            // broker correctly reports this as a pre-response failure.
+            rawEventChunks.length = 0;
+            finish({ kind: "transportFailure", code: `cliExit.${String(code)}` });
+          });
+
+          if (promptTransport === "stdin") {
+            child.stdin?.on("error", () => {
+              // Ignore EPIPE when the process exits before consuming the
+              // prompt; the close handler reports the real failure.
+            });
+            child.stdin?.write(request.prompt);
+          }
+          child.stdin?.end();
+        });
+      })();
+    },
+  };
 }
 
 export const __testOnly = {

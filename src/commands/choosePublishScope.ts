@@ -5,6 +5,7 @@ import { TaskInventory } from "../state/taskInventory";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { IncompleteTask, patchTaskProgress, readTaskProgress } from "../utils/taskProgressUtils";
 import { NotificationRouter } from "../utils/notificationRouter";
+import { LegacyCreatingStartupGateV0 } from "../state/legacyCreatingStartupGateV0";
 
 type ChoosePublishScopeArg =
   | { task?: IncompleteTask }
@@ -178,6 +179,11 @@ export async function choosePublishScope(
   inventory: TaskInventory,
   explicitArg?: ChoosePublishScopeArg
 ): Promise<void> {
+  // Block on the startup gate's classification pass before this command's
+  // first task-state read — same barrier contract as startNewTask/resumeTask
+  // (plan §1.4).
+  await LegacyCreatingStartupGateV0.waitUntilReady();
+
   const resolved = await resolveTaskContext(inventory, normalizeArg(explicitArg), {
     allowPaused: true,
   });

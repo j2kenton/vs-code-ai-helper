@@ -22,6 +22,7 @@ import { NotificationRouter } from "../utils/notificationRouter";
 import { safeOpenTextDocument } from "../utils/fileUtils";
 import { ChatViewProvider } from "../views/chatView";
 import type { AgentRunResult } from "../types/agentRunner";
+import { assertLegacyAiRouteAllowedV0 } from "../services/legacyAiActionSafetyGateV0";
 
 import { shortcutHint } from "../utils/shortcutHints";
 import { backupArtifactBeforeWrite, backupArtifactContents } from "../utils/artifactBackups";
@@ -463,6 +464,7 @@ export async function draftTaskWithAI(
   chatViewProvider: ChatViewProvider,
   explicitArg?: DraftTaskArg
 ): Promise<boolean | undefined> {
+  assertLegacyAiRouteAllowedV0("draft.v1");
   // ── Workspace guard (must come before consent) ──────────────────────────
   // ── Consent gate ─────────────────────────────────────────────────────────
   const consented = await ensureAiConsent(context);

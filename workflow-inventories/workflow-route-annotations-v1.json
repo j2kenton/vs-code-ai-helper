@@ -1,0 +1,594 @@
+{
+  "schemaVersion": 1,
+  "description": "Route-inventory annotations (plan §1.2/§1.5): recorded evidence for every dynamic (non-literal) executeCommand dispatch site, every internal reference to a command VS Code auto-registers rather than the extension, and every route whose mechanical surface drifted from the immutable pre-gate snapshot (workflow-route-pregate-v1.json). Verified by scripts/verifyWorkflowRoutes.mjs: an unannotated dynamic dispatch or pre-gate drift fails closed, a stale sourceSpan or stability digest fails, and an annotation matching no live site/drift fails. Annotations cannot replace an early gate (edgeKind \"gateReplacement\" is rejected).",
+  "annotations": [
+    {
+      "annotationKind": "dynamicCommandDispatch",
+      "path": "src/commands/applyCurrentStageAction.ts",
+      "expressionText": "command",
+      "planSection": "§1.2 route table (Current stage: every branch and caller)",
+      "rationale": "The composite current-stage dispatcher resolves the stage's action command from its static per-stage table and forwards via executeCommand. Every resolvable value is one of the registered per-stage AI commands, each of which carries its own first-statement legacy AI gate; the dispatcher itself is additionally gated by applyCurrentStage.v1 before this line can run.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "edit",
+      "expiryCohort": "edit",
+      "evidence": {
+        "symbol": "execute",
+        "sourceSpan": "L71-L74",
+        "edgeKind": "dynamicCommandDispatch",
+        "targetActionKey": "applyCurrentStage.v1"
+      }
+    },
+    {
+      "annotationKind": "dynamicCommandDispatch",
+      "path": "src/utils/automationChain.ts",
+      "expressionText": "command",
+      "planSection": "§1.2 route table (auto-advance/follow-up edges)",
+      "rationale": "The automation chain's default dependency executes the follow-up command chosen from its static chain definition (stage follow-up commands only). Each target is a registered command whose own gate/barrier discipline applies at the callee; no computed/user-supplied command id can enter the chain.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "lifecycle",
+      "expiryCohort": "edit",
+      "evidence": {
+        "symbol": "defaultDeps",
+        "sourceSpan": "L58-L58",
+        "edgeKind": "dynamicCommandDispatch",
+        "targetActionKey": "nextStage.v1"
+      }
+    },
+    {
+      "annotationKind": "dynamicCommandDispatch",
+      "path": "src/utils/globalAssistantActions.ts",
+      "expressionText": "options.command",
+      "planSection": "§1.2 route table (webview/assistant entrypoints)",
+      "rationale": "The global assistant's action table binds each assistant action to a fixed registered command (see the treeBindings recorded on the corresponding route rows: markTaskDone, nextStage, runReviewWithAI, fastForwardReviewWithAI, pauseTask, resumeTask, archive/unarchive, pin/unpin). The dispatch expression reads only from that static table; gates apply at each callee.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "chat",
+      "expiryCohort": "edit",
+      "evidence": {
+        "symbol": "execute",
+        "sourceSpan": "L301-L303",
+        "edgeKind": "dynamicCommandDispatch",
+        "targetActionKey": "applyCurrentStage.v1"
+      }
+    },
+    {
+      "annotationKind": "dynamicCommandDispatch",
+      "path": "src/views/chatView.ts",
+      "expressionText": "`${ChatViewProvider.viewType}.focus`",
+      "planSection": "§1.2 (webview entrypoints)",
+      "rationale": "Template over the class's constant viewType — resolves to the single constant string \"vs-code-ai-helper.chatView.focus\", the focus command VS Code auto-registers for the contributed chat view. Pure UI focus; no workflow route.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "chat",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "symbol": "open",
+        "sourceSpan": "L327-L327",
+        "edgeKind": "dynamicCommandDispatch",
+        "targetActionKey": "none"
+      }
+    },
+    {
+      "annotationKind": "dynamicCommandDispatch",
+      "path": "src/views/settingsView.ts",
+      "expressionText": "id",
+      "planSection": "§1.2 (webview entrypoints)",
+      "rationale": "tryRun executes a command id taken from the settings webview's own static command wiring (model-configuration commands registered in configureStepModels.ts). Pure settings UI; no AI/workflow route is reachable through it.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "nonPlan",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "symbol": "tryRun",
+        "sourceSpan": "L147-L147",
+        "edgeKind": "dynamicCommandDispatch",
+        "targetActionKey": "none"
+      }
+    },
+    {
+      "annotationKind": "dynamicCommandDispatch",
+      "path": "src/views/settingsView.ts",
+      "expressionText": "command",
+      "planSection": "§1.2 (webview entrypoints)",
+      "rationale": "The webview-deps executeCommand adapter passed into the settings view's message handling — a thin promise wrapper around vscode.commands.executeCommand used only by the static settings-command wiring above it.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "nonPlan",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "symbol": "resolveWebviewView",
+        "sourceSpan": "L286-L286",
+        "edgeKind": "dynamicCommandDispatch",
+        "targetActionKey": "none"
+      }
+    },
+    {
+      "annotationKind": "dynamicCommandDispatch",
+      "path": "src/views/settingsView.ts",
+      "expressionText": "usage.command",
+      "planSection": "§1.2 (webview entrypoints)",
+      "rationale": "Runs the usage-hint command declared in the settings view's static usage table (settings/model configuration commands only).",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "nonPlan",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "symbol": "resolveWebviewView",
+        "sourceSpan": "L354-L354",
+        "edgeKind": "dynamicCommandDispatch",
+        "targetActionKey": "none"
+      }
+    },
+    {
+      "annotationKind": "dynamicCommandDispatch",
+      "path": "src/views/settingsView.ts",
+      "expressionText": "usage.fallbackCommand",
+      "planSection": "§1.2 (webview entrypoints)",
+      "rationale": "Fallback variant of the usage-hint dispatch above; same static table, same settings-only reachability.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "nonPlan",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "symbol": "resolveWebviewView",
+        "sourceSpan": "L358-L358",
+        "edgeKind": "dynamicCommandDispatch",
+        "targetActionKey": "none"
+      }
+    },
+    {
+      "annotationKind": "dynamicCommandDispatch",
+      "path": "src/views/statusView.ts",
+      "expressionText": "command",
+      "planSection": "§1.2 route table (tree entrypoints)",
+      "rationale": "runAction re-dispatches a notification row's stored follow-up command. Action descriptors are created only by production code posting notifications (e.g. \"Publish Anyway\" → commitAndPushTask) with literal command ids that appear as treeBindings on their route rows; each callee's own gate/guard applies at dispatch time.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "nonPlan",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "symbol": "runAction",
+        "sourceSpan": "L349-L349",
+        "edgeKind": "dynamicCommandDispatch",
+        "targetActionKey": "none"
+      }
+    },
+    {
+      "annotationKind": "dynamicCommandDispatch",
+      "path": "src/views/taskStatusBar.ts",
+      "expressionText": "selected.command",
+      "planSection": "§1.2 route table (tree/status-bar entrypoints)",
+      "rationale": "The status-bar quick-pick menu dispatches the selected item's command from its static menu definition (resumeTask, viewTask, startNewTask — recorded as treeBindings on those rows); gates/guards apply at each callee.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "nonPlan",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "symbol": "showMenu",
+        "sourceSpan": "L159-L159",
+        "edgeKind": "dynamicCommandDispatch",
+        "targetActionKey": "none"
+      }
+    },
+    {
+      "annotationKind": "unregisteredCommandTarget",
+      "commandId": "vs-code-ai-helper.statusView.focus",
+      "path": "src/views/statusView.ts",
+      "planSection": "§1.2 (edge-target resolution)",
+      "rationale": "\"<viewId>.focus\" commands are auto-registered by VS Code for every contributed view; the extension registers its own settingsView.focus (missing-model guard) but relies on the host-provided statusView.focus here. Not a workflow route.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "nonPlan",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "symbol": "focusStatusView",
+        "sourceSpan": "L160-L160",
+        "edgeKind": "unregisteredCommandTarget",
+        "targetActionKey": "none"
+      }
+    },
+    {
+      "annotationKind": "pregateModifiedRoute",
+      "routeKey": "command:vs-code-ai-helper.applyCurrentStageAction",
+      "path": "src/commands/applyCurrentStageAction.ts",
+      "planSection": "§1.3 (fail-closed AI gates) / §8 Safety cohort",
+      "rationale": "The Safety cohort (plan §1.3) installed the first-statement legacy AI route gate for applyCurrentStage.v1 in this route's registering file — the only mechanical change since the pre-gate snapshot is fileGateRouteIds [] -> [applyCurrentStage.v1]. Gate-before-read ordering is wiring-tested in legacyAiActionSafetyGateWiring.test.ts.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "safety",
+      "expiryCohort": "edit",
+      "evidence": {
+        "symbol": "disposable",
+        "sourceSpan": "L190-L193",
+        "edgeKind": "pregateModifiedRoute",
+        "targetActionKey": "applyCurrentStage.v1",
+        "pregateStabilitySha256": "1d8f3a81fb8639a1b7c4dc888b35b2a5dd5b6407805ffd7e81f59b384b8b6cd0",
+        "liveStabilitySha256": "537bcaa273d5a824dcacf952f1b6d7fe3596a3530bdd51633e68eece48420e3d"
+      }
+    },
+    {
+      "annotationKind": "pregateModifiedRoute",
+      "routeKey": "command:vs-code-ai-helper.applyHighLevelReviewChanges",
+      "path": "src/commands/applyHighLevelReviewChanges.ts",
+      "planSection": "§1.3 (fail-closed AI gates) / §8 Safety cohort",
+      "rationale": "The Safety cohort (plan §1.3) installed the first-statement legacy AI route gate for applyReview.v1 in this route's registering file — the only mechanical change since the pre-gate snapshot is fileGateRouteIds [] -> [applyReview.v1]. Gate-before-read ordering is wiring-tested in legacyAiActionSafetyGateWiring.test.ts.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "safety",
+      "expiryCohort": "text3",
+      "evidence": {
+        "symbol": "disposable",
+        "sourceSpan": "L67-L71",
+        "edgeKind": "pregateModifiedRoute",
+        "targetActionKey": "applyReview.v1",
+        "pregateStabilitySha256": "c811910e0861c359cfc9b63f543074e10b818635d4132427a0ad0fb4812ffcc0",
+        "liveStabilitySha256": "b4a8e691cde0f87903c32e3c5e8c1410fb0ef3dd2afb5607678861f7fd1e5acd"
+      }
+    },
+    {
+      "annotationKind": "pregateModifiedRoute",
+      "routeKey": "command:vs-code-ai-helper.applyLowLevelReviewChanges",
+      "path": "src/commands/applyLowLevelReviewChanges.ts",
+      "planSection": "§1.3 (fail-closed AI gates) / §8 Safety cohort",
+      "rationale": "The Safety cohort (plan §1.3) installed the first-statement legacy AI route gate for applyReview.v1 in this route's registering file — the only mechanical change since the pre-gate snapshot is fileGateRouteIds [] -> [applyReview.v1]. Gate-before-read ordering is wiring-tested in legacyAiActionSafetyGateWiring.test.ts.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "safety",
+      "expiryCohort": "text3",
+      "evidence": {
+        "symbol": "disposable",
+        "sourceSpan": "L67-L71",
+        "edgeKind": "pregateModifiedRoute",
+        "targetActionKey": "applyReview.v1",
+        "pregateStabilitySha256": "0fe3a2f4431c5b381c4cd74f84d17dfd11c714124efa94b1a9a5972af2d8fa18",
+        "liveStabilitySha256": "469740f9cd28fdba363dc4a90700f63ba891679e60d93adca31d3840c38eeba1"
+      }
+    },
+    {
+      "annotationKind": "pregateModifiedRoute",
+      "routeKey": "command:vs-code-ai-helper.applyReviewWithAI",
+      "path": "src/commands/reviewActions.ts",
+      "planSection": "§1.3 (fail-closed AI gates) / §8 Safety cohort",
+      "rationale": "The Safety cohort (plan §1.3) installed the first-statement legacy AI route gate for applyReview.v1 in this route's registering file — the only mechanical change since the pre-gate snapshot is fileGateRouteIds [] -> [applyReview.v1]. The file-level rollup also includes the other four reviewActions.ts family gates (fastForward.v1, generateImplementation.v1, implementation.v1, review.v1) installed by the same cohort; gate-before-read ordering is wiring-tested in legacyAiActionSafetyGateWiring.test.ts.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "safety",
+      "expiryCohort": "text3",
+      "evidence": {
+        "symbol": "registerReviewActionCommands",
+        "sourceSpan": "L4238-L4241",
+        "edgeKind": "pregateModifiedRoute",
+        "targetActionKey": "applyReview.v1",
+        "pregateStabilitySha256": "209d1fae09f2f2239c1bc8d01be4e17d6cea0c5a36bece7cf1b05f451c7024dd",
+        "liveStabilitySha256": "fd3880c1f2e5282f834844662bd93a12b1d56af0a034d0f9c5743bda46168ad9"
+      }
+    },
+    {
+      "annotationKind": "pregateModifiedRoute",
+      "routeKey": "command:vs-code-ai-helper.chatWithStage",
+      "path": "src/commands/chatWithStage.ts",
+      "planSection": "§1.3 (fail-closed AI gates) / §8 Safety cohort",
+      "rationale": "The Safety cohort (plan §1.3) installed the first-statement legacy AI route gate for chatSend.v1 in this route's registering file — the only mechanical change since the pre-gate snapshot is fileGateRouteIds [] -> [chatSend.v1]. Gate-before-read ordering is wiring-tested in legacyAiActionSafetyGateWiring.test.ts.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "safety",
+      "expiryCohort": "text3",
+      "evidence": {
+        "symbol": "registerChatWithStageCommand",
+        "sourceSpan": "L524-L526",
+        "edgeKind": "pregateModifiedRoute",
+        "targetActionKey": "chatSend.v1",
+        "pregateStabilitySha256": "e33c20e006a89921f578b0068dd78f32c87086c0de049599b67cf2c14060d373",
+        "liveStabilitySha256": "a0939ec4503b44343fe0be4b8f02ed69aed55e6bd4838ddb8780e7437711032e"
+      }
+    },
+    {
+      "annotationKind": "pregateModifiedRoute",
+      "routeKey": "command:vs-code-ai-helper.chooseReleaseTarget",
+      "path": "src/commands/reviewActions.ts",
+      "planSection": "§1.3 (fail-closed AI gates) / §8 Safety cohort",
+      "rationale": "This row itself is not an AI route and carries no gate of its own; its registering file (reviewActions.ts) gained the five per-family gate calls (applyReview.v1, fastForward.v1, generateImplementation.v1, implementation.v1, review.v1) when the Safety cohort landed, and fileGateRouteIds is a per-file rollup — that rollup is the only mechanical change since the pre-gate snapshot.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "safety",
+      "expiryCohort": "edit",
+      "evidence": {
+        "symbol": "registerReviewActionCommands",
+        "sourceSpan": "L4267-L4291",
+        "edgeKind": "pregateModifiedRoute",
+        "targetActionKey": "none",
+        "pregateStabilitySha256": "64bc6c0f077fcf452439955e041e604754e638a10e6361e5b4480e63207f3d13",
+        "liveStabilitySha256": "75e64fbc5dd46cd825c606e03d81c6ad172b43b23b671311be2e0ad2c8d3cf1e"
+      }
+    },
+    {
+      "annotationKind": "pregateModifiedRoute",
+      "routeKey": "command:vs-code-ai-helper.commitAndPushTask",
+      "path": "src/commands/commitAndPushTask.ts",
+      "planSection": "§1.3 (fail-closed AI gates) / §8 Safety cohort",
+      "rationale": "The Safety cohort (plan §1.3/§10.1) installed the non-throwing isLegacyAiRouteDisabledV0(\"commitPushMetadata.v1\") query in commitAndPushTask.ts so the disabled AI metadata sub-step degrades to the deterministic fallback subject without breaking the non-AI commit flow; fileGateRouteIds [] -> [commitPushMetadata.v1] is the only mechanical change since the pre-gate snapshot. The early duplicate-invocation token (CommitPushEarlyGateV0) landed in the same cohort but does not alter this row's mechanical identity.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "safety",
+      "expiryCohort": "git",
+      "evidence": {
+        "symbol": "disposable",
+        "sourceSpan": "L1704-L1708",
+        "edgeKind": "pregateModifiedRoute",
+        "targetActionKey": "commitPush.v1",
+        "pregateStabilitySha256": "26a1ae5ca069da240649bfabcaa8087a5d807aba0db27f1f84a154a21b5d9b83",
+        "liveStabilitySha256": "bf40582f92fe19f94fbafd1663af3c325b66c3481fc25a5485d1a18a91548efd"
+      }
+    },
+    {
+      "annotationKind": "pregateModifiedRoute",
+      "routeKey": "command:vs-code-ai-helper.completeCommitAndPushTask",
+      "path": "src/commands/commitAndPushTask.ts",
+      "planSection": "§1.3 (fail-closed AI gates) / §8 Safety cohort",
+      "rationale": "Same Safety-cohort change as commitAndPushTask (shared registering file): the commitPushMetadata.v1 query gate appears in the file-level rollup; fileGateRouteIds [] -> [commitPushMetadata.v1] is the only mechanical change since the pre-gate snapshot.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "safety",
+      "expiryCohort": "git",
+      "evidence": {
+        "symbol": "completeDisposable",
+        "sourceSpan": "L1709-L1713",
+        "edgeKind": "pregateModifiedRoute",
+        "targetActionKey": "commitPush.v1",
+        "pregateStabilitySha256": "6297df0b6b1ad5d1bcc0f7640dfbb9d1b9728baab9c8437805e1cd20eb7900aa",
+        "liveStabilitySha256": "d6ac8f4273227ebc957c9c1d9eec8f1c5479cbfabcd3bad6b6d6814a56cc2f03"
+      }
+    },
+    {
+      "annotationKind": "pregateModifiedRoute",
+      "routeKey": "command:vs-code-ai-helper.draftTaskWithAI",
+      "path": "src/commands/draftTaskWithAI.ts",
+      "planSection": "§1.3 (fail-closed AI gates) / §8 Safety cohort",
+      "rationale": "The Safety cohort (plan §1.3) installed the first-statement legacy AI route gate for draft.v1 in this route's registering file — the only mechanical change since the pre-gate snapshot is fileGateRouteIds [] -> [draft.v1]. Gate-before-read ordering is wiring-tested in legacyAiActionSafetyGateWiring.test.ts.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "safety",
+      "expiryCohort": "text2",
+      "evidence": {
+        "symbol": "disposable",
+        "sourceSpan": "L1146-L1150",
+        "edgeKind": "pregateModifiedRoute",
+        "targetActionKey": "draft.v1",
+        "pregateStabilitySha256": "5ad50a2f84a0fea9a826095bd356d7c641feec3ea18ae6d572f626e279e99676",
+        "liveStabilitySha256": "b8357099910b80c9755514a2a6f8b9fd0e72b16a7447b148d0a8f5e659d751dd"
+      }
+    },
+    {
+      "annotationKind": "pregateModifiedRoute",
+      "routeKey": "command:vs-code-ai-helper.fastForwardCurrentTaskReview",
+      "path": "src/commands/fastForwardCurrentTaskReview.ts",
+      "planSection": "§1.3 (fail-closed AI gates) / §8 Safety cohort",
+      "rationale": "The Safety cohort (plan §1.3) installed the first-statement legacy AI route gate for fastForward.v1 in this route's registering file — the only mechanical change since the pre-gate snapshot is fileGateRouteIds [] -> [fastForward.v1]. Gate-before-read ordering is wiring-tested in legacyAiActionSafetyGateWiring.test.ts.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "safety",
+      "expiryCohort": "edit",
+      "evidence": {
+        "symbol": "disposable",
+        "sourceSpan": "L54-L57",
+        "edgeKind": "pregateModifiedRoute",
+        "targetActionKey": "fastForward.v1",
+        "pregateStabilitySha256": "86d663bd9b318d040e213d8c93e7989c369b5a5bdcf6fe60187172842d6f2400",
+        "liveStabilitySha256": "26e16d8a5a857f9935132ad8b7c1b8e947093f9db5b6e0175ff4af585b47facc"
+      }
+    },
+    {
+      "annotationKind": "pregateModifiedRoute",
+      "routeKey": "command:vs-code-ai-helper.fastForwardReviewWithAI",
+      "path": "src/commands/reviewActions.ts",
+      "planSection": "§1.3 (fail-closed AI gates) / §8 Safety cohort",
+      "rationale": "The Safety cohort (plan §1.3) installed the first-statement legacy AI route gate for fastForward.v1 in this route's registering file — the only mechanical change since the pre-gate snapshot is fileGateRouteIds [] -> [fastForward.v1]. The file-level rollup also includes the other four reviewActions.ts family gates installed by the same cohort; wiring-tested in legacyAiActionSafetyGateWiring.test.ts.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "safety",
+      "expiryCohort": "edit",
+      "evidence": {
+        "symbol": "registerReviewActionCommands",
+        "sourceSpan": "L4242-L4245",
+        "edgeKind": "pregateModifiedRoute",
+        "targetActionKey": "fastForward.v1",
+        "pregateStabilitySha256": "6d8dbe4ba01266d910ddca1e83d2f1eecdf8f01ea3debf78b73a004c379ab9d8",
+        "liveStabilitySha256": "c54ade0291f6404fb9fc29a426a7b08d71ccf056497063e61a4b0c61e7635ad1"
+      }
+    },
+    {
+      "annotationKind": "pregateModifiedRoute",
+      "routeKey": "command:vs-code-ai-helper.generatePlanWithAI",
+      "path": "src/commands/generatePlanWithAI.ts",
+      "planSection": "§1.3 (fail-closed AI gates) / §8 Safety cohort",
+      "rationale": "The Safety cohort (plan §1.3) installed the first-statement legacy AI route gate for generatePlan.v1 in this route's registering file — the only mechanical change since the pre-gate snapshot is fileGateRouteIds [] -> [generatePlan.v1]. Gate-before-read ordering is wiring-tested in legacyAiActionSafetyGateWiring.test.ts.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "safety",
+      "expiryCohort": "text1",
+      "evidence": {
+        "symbol": "disposable",
+        "sourceSpan": "L439-L443",
+        "edgeKind": "pregateModifiedRoute",
+        "targetActionKey": "generatePlan.v1",
+        "pregateStabilitySha256": "e6fd108dce486c5dff6cd92cc9c1f55693f539f474a9388c587da5ec61b02e8b",
+        "liveStabilitySha256": "c3ac94674336c49de93f395471d49d3429e186bdabaea65964e0de38433bc222"
+      }
+    },
+    {
+      "annotationKind": "pregateModifiedRoute",
+      "routeKey": "command:vs-code-ai-helper.nextStage",
+      "path": "src/commands/reviewActions.ts",
+      "planSection": "§1.3 (fail-closed AI gates) / §8 Safety cohort",
+      "rationale": "This row itself is not an AI route and carries no gate of its own; its registering file (reviewActions.ts) gained the five per-family gate calls (applyReview.v1, fastForward.v1, generateImplementation.v1, implementation.v1, review.v1) when the Safety cohort landed, and fileGateRouteIds is a per-file rollup — that rollup is the only mechanical change since the pre-gate snapshot.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "safety",
+      "expiryCohort": "edit",
+      "evidence": {
+        "symbol": "registerReviewActionCommands",
+        "sourceSpan": "L4250-L4254",
+        "edgeKind": "pregateModifiedRoute",
+        "targetActionKey": "nextStage.v1",
+        "pregateStabilitySha256": "3848711024dcab654c2669a4e53d551bc2950744760d269e4c6ddf40b86e16c2",
+        "liveStabilitySha256": "a07f9267780e055d82dc56328230107c59b082618db8406f392ca3e05b3b98d4"
+      }
+    },
+    {
+      "annotationKind": "pregateModifiedRoute",
+      "routeKey": "command:vs-code-ai-helper.postStageQuestion",
+      "path": "src/commands/chatWithStage.ts",
+      "planSection": "§1.3 (fail-closed AI gates) / §8 Safety cohort",
+      "rationale": "Registered in chatWithStage.ts, whose chatSend.v1 first-statement gate the Safety cohort installed (plan §1.3); fileGateRouteIds [] -> [chatSend.v1] is the file-level rollup and the only mechanical change since the pre-gate snapshot.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "safety",
+      "expiryCohort": "text3",
+      "evidence": {
+        "symbol": "registerChatWithStageCommand",
+        "sourceSpan": "L527-L533",
+        "edgeKind": "pregateModifiedRoute",
+        "targetActionKey": "chatSend.v1",
+        "pregateStabilitySha256": "01858d7518da8222f35024e68588a10967456cc6e6db655a9fb7c66203ce3e84",
+        "liveStabilitySha256": "8f4696ba1e64ac2a17bbc6d8753f1bcd2554c7518d3d2f1be0b8e18d2f638752"
+      }
+    },
+    {
+      "annotationKind": "pregateModifiedRoute",
+      "routeKey": "command:vs-code-ai-helper.release",
+      "path": "src/commands/reviewActions.ts",
+      "planSection": "§1.3 (fail-closed AI gates) / §8 Safety cohort",
+      "rationale": "This row itself is not an AI route and carries no gate of its own; its registering file (reviewActions.ts) gained the five per-family gate calls (applyReview.v1, fastForward.v1, generateImplementation.v1, implementation.v1, review.v1) when the Safety cohort landed, and fileGateRouteIds is a per-file rollup — that rollup is the only mechanical change since the pre-gate snapshot.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "safety",
+      "expiryCohort": "edit",
+      "evidence": {
+        "symbol": "registerReviewActionCommands",
+        "sourceSpan": "L4263-L4266",
+        "edgeKind": "pregateModifiedRoute",
+        "targetActionKey": "none",
+        "pregateStabilitySha256": "a1ffcd6c586c2a152fda5bd49fe5991e0f2057d76a400bf648ed726c22ce80ac",
+        "liveStabilitySha256": "839e242de2df8495424bc13922ef21329f382387219c4d8eb580eb62ca047d06"
+      }
+    },
+    {
+      "annotationKind": "pregateModifiedRoute",
+      "routeKey": "command:vs-code-ai-helper.reviewCurrentTask",
+      "path": "src/commands/reviewCurrentTask.ts",
+      "planSection": "§1.3 (fail-closed AI gates) / §8 Safety cohort",
+      "rationale": "The Safety cohort (plan §1.3) installed the first-statement legacy AI route gate for review.v1 in this route's registering file — the only mechanical change since the pre-gate snapshot is fileGateRouteIds [] -> [review.v1]. Gate-before-read ordering is wiring-tested in legacyAiActionSafetyGateWiring.test.ts.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "safety",
+      "expiryCohort": "text3",
+      "evidence": {
+        "symbol": "disposable",
+        "sourceSpan": "L54-L57",
+        "edgeKind": "pregateModifiedRoute",
+        "targetActionKey": "review.v1",
+        "pregateStabilitySha256": "f64bf5d17202a0eab71340feda8395b44bc2045facf39977f50519eaf43a518d",
+        "liveStabilitySha256": "4010d3fdceee75443dff73a81d6ea0e531a99b0679db6aeea74c8842b0c4a89e"
+      }
+    },
+    {
+      "annotationKind": "pregateModifiedRoute",
+      "routeKey": "command:vs-code-ai-helper.runImplementationWithAI",
+      "path": "src/commands/reviewActions.ts",
+      "planSection": "§1.3 (fail-closed AI gates) / §8 Safety cohort",
+      "rationale": "The Safety cohort (plan §1.3) installed the first-statement legacy AI route gate for implementation.v1 in this route's registering file — the only mechanical change since the pre-gate snapshot is fileGateRouteIds [] -> [implementation.v1]. The file-level rollup also includes the other four reviewActions.ts family gates installed by the same cohort; wiring-tested in legacyAiActionSafetyGateWiring.test.ts.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "safety",
+      "expiryCohort": "edit",
+      "evidence": {
+        "symbol": "registerReviewActionCommands",
+        "sourceSpan": "L4258-L4262",
+        "edgeKind": "pregateModifiedRoute",
+        "targetActionKey": "implementation.v1",
+        "pregateStabilitySha256": "07c1848dfe3d6e74173c21d8069b6e4891c1784dbdc5f39cdfe63aa17aac1ae9",
+        "liveStabilitySha256": "1dc40566cfc2e8fd4c091b66b972cf105d90e53e63519bf01a930cd50cf18af4"
+      }
+    },
+    {
+      "annotationKind": "pregateModifiedRoute",
+      "routeKey": "command:vs-code-ai-helper.runLintingFixes",
+      "path": "src/commands/runLintingFixes.ts",
+      "planSection": "§1.3 (fail-closed AI gates) / §8 Safety cohort",
+      "rationale": "The Safety cohort (plan §1.3) installed the first-statement legacy AI route gate for lint.v1 in this route's registering file — the only mechanical change since the pre-gate snapshot is fileGateRouteIds [] -> [lint.v1]. Gate-before-read ordering is wiring-tested in legacyAiActionSafetyGateWiring.test.ts.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "safety",
+      "expiryCohort": "edit",
+      "evidence": {
+        "symbol": "disposable",
+        "sourceSpan": "L395-L399",
+        "edgeKind": "pregateModifiedRoute",
+        "targetActionKey": "lint.v1",
+        "pregateStabilitySha256": "44fb9bf585b7c25b843cfa33eebc2444b12e754d01e45fc99c15169d7d1487fd",
+        "liveStabilitySha256": "3078964dd801148f27ff818c34479f81e70801bea7043b43768bbed547b4747b"
+      }
+    },
+    {
+      "annotationKind": "pregateModifiedRoute",
+      "routeKey": "command:vs-code-ai-helper.runReviewWithAI",
+      "path": "src/commands/reviewActions.ts",
+      "planSection": "§1.3 (fail-closed AI gates) / §8 Safety cohort",
+      "rationale": "The Safety cohort (plan §1.3) installed the first-statement legacy AI route gate for review.v1 in this route's registering file — the only mechanical change since the pre-gate snapshot is fileGateRouteIds [] -> [review.v1]. The file-level rollup also includes the other four reviewActions.ts family gates installed by the same cohort; wiring-tested in legacyAiActionSafetyGateWiring.test.ts.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "safety",
+      "expiryCohort": "text3",
+      "evidence": {
+        "symbol": "registerReviewActionCommands",
+        "sourceSpan": "L4234-L4237",
+        "edgeKind": "pregateModifiedRoute",
+        "targetActionKey": "review.v1",
+        "pregateStabilitySha256": "e7975c133a957f99b60574b871f3687161ff878cc9c03fefdec4e97f8d798be5",
+        "liveStabilitySha256": "268388a9abc15ab6ab4efffcbc41def347a9d991a25ab5d3ca91a306656289ea"
+      }
+    },
+    {
+      "annotationKind": "pregateModifiedRoute",
+      "routeKey": "command:vs-code-ai-helper.viewReview",
+      "path": "src/commands/reviewActions.ts",
+      "planSection": "§1.3 (fail-closed AI gates) / §8 Safety cohort",
+      "rationale": "This row itself is not an AI route and carries no gate of its own; its registering file (reviewActions.ts) gained the five per-family gate calls (applyReview.v1, fastForward.v1, generateImplementation.v1, implementation.v1, review.v1) when the Safety cohort landed, and fileGateRouteIds is a per-file rollup — that rollup is the only mechanical change since the pre-gate snapshot.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "safety",
+      "expiryCohort": "edit",
+      "evidence": {
+        "symbol": "registerReviewActionCommands",
+        "sourceSpan": "L4246-L4249",
+        "edgeKind": "pregateModifiedRoute",
+        "targetActionKey": "none",
+        "pregateStabilitySha256": "ec04b4dae126a297b79f40be00e2c504b09313d2d8a6fdb48ad13e15898508b6",
+        "liveStabilitySha256": "bec5d0f453b386b5b4d79a3da49b5906086379bdd3a3f7d46cc4808be97e9f2a"
+      }
+    },
+    {
+      "annotationKind": "pregateModifiedRoute",
+      "routeKey": "webview:src/views/chatView.ts#resolveWebviewView",
+      "path": "src/views/chatView.ts",
+      "planSection": "§1.3 (fail-closed AI gates) / §8 Safety cohort",
+      "rationale": "The chat webview's Send message handler gained a first-statement assertLegacyAiRouteAllowedV0(\"chatSend.v1\") call (chatView.ts L136) when the Safety cohort landed — fileGateRouteIds [] -> [chatSend.v1] is the only mechanical change since the pre-gate snapshot.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "safety",
+      "expiryCohort": "text3",
+      "evidence": {
+        "symbol": "resolveWebviewView",
+        "sourceSpan": "L114-L157",
+        "edgeKind": "pregateModifiedRoute",
+        "targetActionKey": "chatSend.v1",
+        "pregateStabilitySha256": "0f4c4f378c511d3a813121e6c54492b184af71e79930959582de5418df6b2e5e",
+        "liveStabilitySha256": "c142d6dec7d7645999e0048e4fe419d5b6038113a5583434ff0296f697fe5cf9"
+      }
+    },
+    {
+      "annotationKind": "pregateAddedRoute",
+      "routeKey": "command:vs-code-ai-helper.openChatData",
+      "path": "src/extension.ts",
+      "planSection": "§5.1 (Chat-limit recovery: Open Chat Data) / §8 Chat cohort",
+      "rationale": "The Chat cohort (executable-order step 8, plan §5.1) added this palette command as the inspect-first half of the chatRecoveryRequired UX: it delegates to chatViewProvider.openChatDataForCurrentTarget() so the user can open the preserved chat-v1.json (or its quarantined sibling) read-only before choosing Reset. It invokes no provider, writes no artifact, and needs no legacy AI gate — targetActionKey is none.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "chat",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "symbol": "activate",
+        "sourceSpan": "L439-L441",
+        "edgeKind": "pregateAddedRoute",
+        "targetActionKey": "none",
+        "liveStabilitySha256": "10757865dd0d9ab76b07d4671f92109969ab6e6e9c0208c48507627f9dc14ae9"
+      }
+    },
+    {
+      "annotationKind": "pregateAddedRoute",
+      "routeKey": "command:vs-code-ai-helper.resetChatHistory",
+      "path": "src/extension.ts",
+      "planSection": "§5.1 (Chat-limit recovery: Reset Chat History) / §8 Chat cohort",
+      "rationale": "The Chat cohort (executable-order step 8, plan §5.1) added this palette command as the actionable half of the chatRecoveryRequired UX: it delegates to chatViewProvider.resetHistoryForCurrentTarget(), which requires confirmation and a verified private snapshot under chat-recovery/<document-id>/<reset-id>/ before the reset commits. It is also the notification action button on the recovery warning (treeBinding chatView.ts L865). It invokes no provider and needs no legacy AI gate — targetActionKey is none.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "chat",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "symbol": "activate",
+        "sourceSpan": "L444-L446",
+        "edgeKind": "pregateAddedRoute",
+        "targetActionKey": "none",
+        "liveStabilitySha256": "39b8bb6512a51e5b5a3dc6b4eb652e3eb642313268344512fd97d68ea30549a6"
+      }
+    }
+  ]
+}

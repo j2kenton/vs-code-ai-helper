@@ -9,11 +9,15 @@ import {
 import { getConfiguredTaskRoot, normalizePath, resolveTaskRootForCreation } from "../utils/taskRoot";
 import { TaskInventory } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
-import { withMetaRootLock, withAllMetaRootsLock } from "../state/taskStateStore";
+import { withAllMetaRootsLock } from "../state/taskStateStore";
 import { safeOpenTextDocument } from "../utils/fileUtils";
 import { runTrackedOperation } from "../utils/taskOperations";
 import { ensureAutomaticMetaGitIgnore } from "./toggleMetaResourcesGitIgnore";
 import { NotificationRouter } from "../utils/notificationRouter";
+import {
+  LegacyCreatingStartupGateV0,
+  LegacyCreatingFootprintV0,
+} from "../state/legacyCreatingStartupGateV0";
 
 /**
  * Format a date as YYYY-MM-DD
@@ -58,37 +62,23 @@ async function getNextTaskNumber(
 }
 
 /**
- * Finish a creation that was interrupted after both durable seed files were
- * written but before its sentinel could be promoted. Incomplete sentinels are
- * deliberately retained for inspection and never reused for a new task.
+ * Surface a read-only "Open" affordance for a legacy `status: "creating"`
+ * folder found by `LegacyCreatingStartupGateV0`. This deliberately does not
+ * mutate the folder's progress in any way — see the gate's doc comment for
+ * why implicitly promoting `creating` to `paused` (the old behavior) was
+ * removed. Full retry/adopt/safe-delete recovery is a separate, larger piece
+ * of work; until it lands, the only available action is to open the file for
+ * manual inspection.
  */
-async function recoverCompletedTaskCreations(metaFolderPath: string): Promise<void> {
-  const root = vscode.Uri.file(metaFolderPath);
-  let entries: [string, vscode.FileType][];
-  try {
-    entries = await vscode.workspace.fs.readDirectory(root);
-  } catch {
-    return;
-  }
-
-  for (const [name, type] of entries) {
-    if (type !== vscode.FileType.Directory) continue;
-    const folder = vscode.Uri.joinPath(root, name);
-    const progress = await readTaskProgress(folder);
-    if (progress?.status !== "creating") continue;
-    try {
-      await vscode.workspace.fs.stat(vscode.Uri.joinPath(folder, TASK_FILENAME));
-      await writeTaskProgress(folder, { ...progress, status: "paused" });
-    } catch {
-      // The creation is genuinely incomplete. Preserve its sentinel rather
-      // than risking deletion or silently repurposing its folder number.
-    }
-  }
-}
-
-/** Recover durable task-creation sentinels during extension startup. */
-export async function recoverTaskCreations(metaFolderPath: string): Promise<void> {
-  await withMetaRootLock(metaFolderPath, () => recoverCompletedTaskCreations(metaFolderPath));
+function notifyLegacyCreatingFootprint(footprint: LegacyCreatingFootprintV0): void {
+  const taskFileUri = vscode.Uri.joinPath(vscode.Uri.file(footprint.taskFolderPath), TASK_FILENAME);
+  NotificationRouter.showWarning(
+    `${footprint.taskFolderName} was left in an incomplete "creating" state (likely an interrupted extension host). ` +
+      (footprint.hasTaskMd
+        ? "It was not automatically resumed — open it to inspect and finish it manually."
+        : "It has no task.md yet — open its folder to inspect it manually."),
+    footprint.hasTaskMd ? taskFileUri.fsPath : undefined
+  );
 }
 
 /**
@@ -199,6 +189,12 @@ export async function startNewTask(
   currentTaskStore: CurrentTaskStore,
   context?: vscode.ExtensionContext
 ): Promise<string | undefined> {
+  // Block on the startup gate's classification pass before this command body
+  // performs its first read, so it cannot race the read-only reconciliation
+  // extension.ts kicks off during activate() — see
+  // LegacyCreatingStartupGateV0's doc comment.
+  await LegacyCreatingStartupGateV0.waitUntilReady();
+
   const workspaceFolders = vscode.workspace.workspaceFolders ?? [];
   const workspaceRoot = workspaceFolders.length <= 1
     ? workspaceFolders[0]
@@ -245,6 +241,15 @@ async function createTask(
   // Resolve the task root, creating it if needed
   const metaFolderPath = await resolveTaskRootForCreation(workspaceRoot);
 
+  // Read-only: surface (but never auto-fix) any legacy `creating` folders
+  // left behind under this meta root. This replaces the old implicit
+  // promotion to `paused` — see LegacyCreatingStartupGateV0's doc comment for
+  // why that was unsafe. It does not block creating the new task; the two
+  // are independent folders/folder numbers.
+  for (const footprint of await LegacyCreatingStartupGateV0.getFootprints(metaFolderPath)) {
+    notifyLegacyCreatingFootprint(footprint);
+  }
+
   // The meta-root lease is shared across extension hosts. Folder-number
   // discovery, directory creation, and the initial files must be one
   // operation: otherwise two VS Code windows can both choose task_2 and
@@ -254,7 +259,6 @@ async function createTask(
   // activation under a sibling workspace folder's meta root.
   const metaFolderPaths = allMetaRootPaths(metaFolderPath);
   const created = await withAllMetaRootsLock(metaFolderPaths, async () => {
-    await recoverCompletedTaskCreations(metaFolderPath);
     // A new task starts active only when no other task under ANY meta root
     // reachable from this window already is — an existing active task must
     // remain the target of shortcuts and in-flight operations. The disk scan

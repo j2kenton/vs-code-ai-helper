@@ -1,0 +1,12 @@
+[
+  {
+    "questionId": "q1",
+    "kind": "singleChoice",
+    "prompt": "Pick one",
+    "required": true,
+    "options": [
+      { "optionId": "same", "label": "First" },
+      { "optionId": "same", "label": "Second with a duplicate id" }
+    ]
+  }
+]

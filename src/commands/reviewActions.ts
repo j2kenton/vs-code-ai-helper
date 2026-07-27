@@ -38,6 +38,7 @@ import {
   advanceStage,
   computeNextStage,
 } from "../utils/stageTransition";
+import { assertLegacyAiRouteAllowedV0 } from "../services/legacyAiActionSafetyGateV0";
 import {
   openOrCreateDocument,
   readNonEmptyText,
@@ -2445,6 +2446,7 @@ export async function runReviewWithAI(
   context: vscode.ExtensionContext,
   arg?: ReviewCommandArg
 ): Promise<void> {
+  assertLegacyAiRouteAllowedV0("review.v1");
   // ── Pre-flight workspace guard ────────────────────────────────────────────
   // Fail fast if no workspace is open at all; the ownership-aware resolution
   // (resolveOwnerWorkspace) happens after task resolution below.
@@ -2541,6 +2543,7 @@ export async function applyReviewWithAI(
   arg?: ReviewCommandArg,
   options: ApplyReviewOptions = {}
 ): Promise<void> {
+  assertLegacyAiRouteAllowedV0("applyReview.v1");
   // ── Pre-flight workspace guard ────────────────────────────────────────────
   if ((vscode.workspace.workspaceFolders ?? []).length === 0) {
     NotificationRouter.showError(
@@ -2799,6 +2802,7 @@ export async function fastForwardReviewWithAI(
   context: vscode.ExtensionContext,
   arg?: ReviewCommandArg
 ): Promise<void> {
+  assertLegacyAiRouteAllowedV0("fastForward.v1");
   if ((vscode.workspace.workspaceFolders ?? []).length === 0) {
     NotificationRouter.showError(
       "No workspace folder open. Please open a folder first."
@@ -3619,6 +3623,7 @@ export async function generateImplementationWithAI(
   context: vscode.ExtensionContext,
   arg?: ReviewCommandArg
 ): Promise<void> {
+  assertLegacyAiRouteAllowedV0("generateImplementation.v1");
   // ── Workspace guard ───────────────────────────────────────────────────────
   if ((vscode.workspace.workspaceFolders ?? []).length === 0) {
     NotificationRouter.showError(
@@ -4038,6 +4043,7 @@ export async function runImplementationWithAI(
   context: vscode.ExtensionContext,
   arg?: ReviewCommandArg
 ): Promise<void> {
+  assertLegacyAiRouteAllowedV0("implementation.v1");
   // ── Workspace guard ───────────────────────────────────────────────────────
   if ((vscode.workspace.workspaceFolders ?? []).length === 0) {
     NotificationRouter.showError(

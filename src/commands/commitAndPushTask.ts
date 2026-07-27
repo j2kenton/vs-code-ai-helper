@@ -26,6 +26,8 @@ import {
   TaskOperationHandle,
 } from "../utils/taskOperations";
 import { CHAT_HISTORY_FILENAME, CHAT_HISTORY_CORRUPT_FILENAME } from "../utils/chatHistoryConstants";
+import { isLegacyAiRouteDisabledV0 } from "../services/legacyAiActionSafetyGateV0";
+import { LegacyCreatingStartupGateV0 } from "../state/legacyCreatingStartupGateV0";
 
 /**
  * Accepted argument shapes for commitAndPushTask.
@@ -200,6 +202,23 @@ async function buildCommitMessage(
   files: string[],
   cancellationToken: vscode.CancellationToken
 ): Promise<string> {
+  // Deterministic single-line subject used when no model is configured, the
+  // resolved runner is unavailable, the run fails, or the AI metadata route
+  // is disabled — intentionally task-level, never a list of changed
+  // filenames (the diff already shows those; enumerating them here was
+  // reported as unhelpful noise, not intent). The richer per-file summary
+  // already lives in pr-description.md.
+  const fallback = `chore: complete ${taskName} changes for publish`.slice(0, 72);
+
+  // Route-identity + kill-switch check (plan §1.3), before any workspace
+  // read or provider work. Commit/Push is a COMPOSITE flow: only this AI
+  // metadata suggestion is a gated AI route — while it is disabled pending
+  // its V1 migration, the commit flow itself must keep working, so degrade
+  // to the deterministic fallback subject instead of throwing.
+  if (isLegacyAiRouteDisabledV0("commitPushMetadata.v1")) {
+    return fallback;
+  }
+
   // Diff against HEAD (staged + unstaged): nothing has been staged yet when
   // the suggestion is generated — staging happens only after the user
   // confirms the reviewed message (stage-after-confirm).
@@ -211,12 +230,6 @@ async function buildCommitMessage(
     // No HEAD yet (unborn branch) or diff failure — the deterministic
     // fallback subject below still applies.
   }
-  // Deterministic single-line subject used only when no model is configured,
-  // the resolved runner is unavailable, or the run fails — intentionally task-
-  // level, never a list of changed filenames (the diff already shows those;
-  // enumerating them here was reported as unhelpful noise, not intent). The
-  // richer per-file summary already lives in pr-description.md.
-  const fallback = `chore: complete ${taskName} changes for publish`.slice(0, 72);
 
   const commitMessageInstructions =
     "Write a git commit message for the diff below, in standard subject-plus-body form, using the Conventional Commits format:\n" +
@@ -843,7 +856,61 @@ async function saveDirtyDocuments(
 }
 
 /**
- * Commit and push the current task.
+ * Stable outcome returned when the process-global Commit/Push guard (below)
+ * rejects a duplicate invocation. Modeled after the coordinator outcome
+ * union's `duplicateRejected` shape (plan §3.7 / §10.1) without pulling in
+ * the rest of that union, which nothing else in the codebase produces yet.
+ */
+export interface CommitPushDuplicateRejectedV1 {
+  readonly kind: "duplicateRejected";
+  readonly code: "operationAlreadyRunning";
+}
+
+/**
+ * Process-global (NOT per-task) nonblocking token guarding the two public
+ * Commit/Push entry points end to end. Acquired as the very first statement
+ * in each public callback — before argument normalization, task resolution,
+ * or any other read — so a duplicate click is rejected before touching the
+ * task, workspace, lint, prompts, or git index, regardless of which task it
+ * targets. Deliberately global rather than keyed per task: both commands
+ * stage/commit/push against one repository working tree and index at a
+ * time, so an overlapping run against a *different* task is exactly as
+ * unsafe as a second click on the same one.
+ *
+ * This is separate from — and sits in front of — the per-task exclusive
+ * `runTrackedOperation` lock still used inside `commitAndPushTaskCore` below,
+ * which continues to guard against a *different* operation (e.g. a stage AI
+ * action) running concurrently on the same task, and supplies the
+ * Notifications-row/cancel/nesting plumbing the flow relies on.
+ */
+let commitPushTokenHeld = false;
+
+function acquireCommitPushToken(): boolean {
+  if (commitPushTokenHeld) {
+    return false;
+  }
+  commitPushTokenHeld = true;
+  return true;
+}
+
+function releaseCommitPushToken(): void {
+  commitPushTokenHeld = false;
+}
+
+function rejectDuplicateCommitPush(): CommitPushDuplicateRejectedV1 {
+  NotificationRouter.showInformation(
+    "Commit and Push is already in progress. Please wait for it to finish."
+  );
+  return { kind: "duplicateRejected", code: "operationAlreadyRunning" };
+}
+
+/**
+ * Commit and push the current task — the named private core (plan §10.1),
+ * containing all of the actual behavior. Never acquires or releases the
+ * process-global token itself: only the two exported entry points below do
+ * that, so a caller that already holds the token (the composite flow in
+ * `completeCommitAndPushTask`) can invoke this directly, borrowing the held
+ * token, without a self-rejection.
  *
  * ⚠️ RISK NOTICE (IMPORTANT — READ BEFORE MODIFYING):
  *
@@ -863,7 +930,7 @@ async function saveDirtyDocuments(
  *
  * See DISCLAIMER.md §4 for the full risk disclosure.
  */
-export async function commitAndPushTask(
+async function commitAndPushTaskCore(
   inventory: TaskInventory,
   explicitArg?: CommitAndPushTaskArg,
   currentTaskStore?: CurrentTaskStore,
@@ -898,27 +965,29 @@ export async function commitAndPushTask(
     return;
   }
 
-  // Allow committing from completed stage only
-  if (resolvedTask.progress.currentStage !== "publish") {
-    NotificationRouter.showWarning(
-      `Task is at stage "${STAGE_DISPLAY_NAMES[resolvedTask.progress.currentStage]}" — must be completed before committing and pushing.`
-    );
-    return;
-  }
-
-  // Acquire the exclusive task-operation guard BEFORE any lint, prompts,
-  // staging, commit, or push work starts. A duplicate invocation (e.g. a
-  // fast double-click) must be refused here, not partway through — lint runs
-  // and the lint-failure modal below are not idempotent-safe against a
-  // second concurrent invocation on the same task. When invoked as part of
-  // the Complete/Commit/Push composite, this registers as a child of that
-  // root (C1 nesting) instead of contending for the lock the root holds.
+  // Per-task exclusive lock (contract C1). The process-global duplicate-
+  // invocation guard for Commit and Push itself already ran in the public
+  // entry point (commitAndPushTask / completeCommitAndPushTask) before this
+  // function — or any read, lint, prompt, staging, commit, or push logic —
+  // ever started. This lock's remaining job is guarding against a DIFFERENT
+  // operation (e.g. a stage AI action) already running for this same task,
+  // and providing the Notifications-row/cancel/nesting plumbing used
+  // throughout this flow. When invoked as part of the Complete/Commit/Push
+  // composite, this registers as a child of that root (C1 nesting) instead
+  // of contending for the lock the root holds.
   const lockKey = resolvedTask.taskFolderPath;
   try {
   await runTrackedOperation(
     lockKey,
     { label: "Commit and Push", taskName: resolvedTask.folderName, kind: "commit-push", parent: parentOperation },
     async (op) => {
+    // Allow committing from completed stage only
+    if (resolvedTask.progress.currentStage !== "publish") {
+      NotificationRouter.showWarning(
+        `Task is at stage "${STAGE_DISPLAY_NAMES[resolvedTask.progress.currentStage]}" — must be completed before committing and pushing.`
+      );
+      return;
+    }
     // Always run fresh checks immediately before a commit. Persisted payloads
     // are informational and may be stale after files were edited. Registered
     // as a child (C1 publish model) so the Publish stage row spins while the
@@ -1446,128 +1515,182 @@ export async function commitAndPushTask(
 }
 
 /**
+ * Commit and push the current task (public command entry point).
+ *
+ * Acquires the process-global Commit/Push token before anything else — a
+ * duplicate invocation is rejected immediately, before argument
+ * normalization, task resolution, lint, prompts, staging, commit, or push
+ * setup. See `commitAndPushTaskCore` above for the actual behavior.
+ */
+export async function commitAndPushTask(
+  inventory: TaskInventory,
+  explicitArg?: CommitAndPushTaskArg,
+  currentTaskStore?: CurrentTaskStore,
+  parentOperation?: TaskOperationHandle,
+  extensionContext?: vscode.ExtensionContext
+): Promise<CommitPushDuplicateRejectedV1 | void> {
+  if (!acquireCommitPushToken()) {
+    return rejectDuplicateCommitPush();
+  }
+  try {
+    // Duplicate rejection stays first (the token check above reads no task
+    // state); after that, block on the startup gate's classification pass
+    // before the core's first task-state read (plan §1.4).
+    await LegacyCreatingStartupGateV0.waitUntilReady();
+    await commitAndPushTaskCore(
+      inventory,
+      explicitArg,
+      currentTaskStore,
+      parentOperation,
+      extensionContext
+    );
+  } finally {
+    releaseCommitPushToken();
+  }
+}
+
+/**
  * Combined complete + commit + push command.
  * Marks the task completed, selects the next task, and commits/pushes the completed task.
+ *
+ * Acquires the same process-global Commit/Push token as `commitAndPushTask`
+ * before anything else, then — holding that token — calls
+ * `commitAndPushTaskCore` directly rather than the public `commitAndPushTask`
+ * command, so it never tries (and fails) to acquire a token it already
+ * holds.
  */
 export async function completeCommitAndPushTask(
   inventory: TaskInventory,
   explicitArg?: CommitAndPushTaskArg,
   currentTaskStore?: CurrentTaskStore,
   extensionContext?: vscode.ExtensionContext
-): Promise<void> {
-  const resolverArg = normalizeArg(explicitArg);
-  const resolvedTask = await resolveTaskContext(inventory, resolverArg, {
-    allowPaused: false,
-  }, currentTaskStore);
-
-  if (!resolvedTask) {
-    if (resolverArg) {
-      NotificationRouter.showError(
-        "The task could not be found. It may have been deleted or moved. " +
-          "Please refresh the Tasks panel and try again."
-      );
-    } else {
-      NotificationRouter.showInformation(
-        "No active task found to complete, commit, and push."
-      );
-    }
-    return;
+): Promise<CommitPushDuplicateRejectedV1 | void> {
+  if (!acquireCommitPushToken()) {
+    return rejectDuplicateCommitPush();
   }
+  try {
+    // Duplicate rejection stays first (the token check above reads no task
+    // state); after that, block on the startup gate's classification pass
+    // before this callback's first task-state read (plan §1.4).
+    await LegacyCreatingStartupGateV0.waitUntilReady();
+    const resolverArg = normalizeArg(explicitArg);
+    const resolvedTask = await resolveTaskContext(inventory, resolverArg, {
+      allowPaused: false,
+    }, currentTaskStore);
 
-  // Check stage eligibility: must be at final review stage (impl-low-review) or completed
-  if (resolvedTask.progress.currentStage !== "impl-low-review") {
-    if (resolvedTask.progress.currentStage === "publish") {
-      // If already completed, fall back directly to commit & push
-      return commitAndPushTask(inventory, explicitArg, currentTaskStore, undefined, extensionContext);
-    }
-    NotificationRouter.showWarning(
-      `"Complete, Commit and Push" is only available when the task is at the final review stage (Implementation: Low-Level Review) or completed.`
-    );
-    return;
-  }
-
-  // One root operation guards the ENTIRE composite — lint, advance, complete,
-  // next-task selection, and the commit/push itself (registered below as a
-  // child of this root, so it never contends for the lock this root holds).
-  // This closes the former race window where the lock was released before
-  // commitAndPushTask reacquired it and a second invocation could slip in.
-  const lockKey = resolvedTask.taskFolderPath;
-  await runTrackedOperation(
-    lockKey,
-    { label: "Complete, Commit and Push", taskName: resolvedTask.folderName, kind: "complete-commit-push" },
-    async (op) => {
-    // 1. Transition stage to "publish". Completion itself is ungated (C3):
-    // no checks run here — commitAndPushTask below runs fresh checks and owns
-    // the failing-checks prompt/override flow, so the completion step can
-    // never be blocked by lint/test state.
-    const taskFolderUri = vscode.Uri.file(resolvedTask.taskFolderPath);
-    let transitionResult: Awaited<ReturnType<typeof advanceStage>>;
-    try {
-      transitionResult = await advanceStage(
-        taskFolderUri,
-        resolvedTask.progress.currentStage,
-        "publish",
-        false,
-        "complete-commit-push",
-        false
-      );
-    } catch (error) {
-      // advanceStage throws (rather than resolving falsy) when its
-      // compare-and-set is rejected — e.g. a concurrent transition already
-      // moved this task's stage under the lock. Report it like any other
-      // failed transition instead of an unhandled rejection.
-      const message = error instanceof Error ? error.message : String(error);
-      NotificationRouter.showWarning(
-        `Could not persist completion for ${resolvedTask.folderName}: ${message}`
-      );
-      return;
-    }
-
-    if (!transitionResult?.persisted) {
-      NotificationRouter.showError(
-        `Could not persist completion for ${resolvedTask.folderName}. Please try again.`
-      );
-      return;
-    }
-
-    // Completing this command is a lifecycle transition, not merely reaching
-    // Publish. Persist completion before selecting another task so the one
-    // active-task invariant remains true across refreshes and reloads.
-    await patchTaskProgress(taskFolderUri, (current) => ({
-      ...current,
-      status: "completed",
-      completedAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    }));
-
-    // 2. Refresh inventory
-    await inventory.refresh();
-
-    // 3. Select next active task deterministically
-    if (currentTaskStore) {
-      const nextCanonicalId = selectNextTask(inventory, resolvedTask.canonicalId);
-      if (nextCanonicalId) {
-        await currentTaskStore.set(nextCanonicalId);
+    if (!resolvedTask) {
+      if (resolverArg) {
+        NotificationRouter.showError(
+          "The task could not be found. It may have been deleted or moved. " +
+            "Please refresh the Tasks panel and try again."
+        );
       } else {
-        await currentTaskStore.clear();
+        NotificationRouter.showInformation(
+          "No active task found to complete, commit, and push."
+        );
       }
+      return;
     }
 
-    // 4. Run commit & push as a child of this composite's root operation —
-    // still under the same exclusive lock, so no second invocation can start
-    // between completion and the commit/push handoff.
-    const completedTask: IncompleteTask = {
-      folderUri: vscode.Uri.file(resolvedTask.taskFolderPath),
-      folderName: resolvedTask.folderName,
-      progress: {
-        ...resolvedTask.progress,
-        currentStage: "publish", // Since it was just advanced
-      },
-      canonicalId: resolvedTask.canonicalId,
-    };
-    await commitAndPushTask(inventory, { task: completedTask }, currentTaskStore, op, extensionContext);
+    // Check stage eligibility: must be at final review stage (impl-low-review) or completed
+    if (resolvedTask.progress.currentStage !== "impl-low-review") {
+      if (resolvedTask.progress.currentStage === "publish") {
+        // Already completed: borrow the token this callback already holds
+        // and run the core directly.
+        await commitAndPushTaskCore(inventory, explicitArg, currentTaskStore, undefined, extensionContext);
+        return;
+      }
+      NotificationRouter.showWarning(
+        `"Complete, Commit and Push" is only available when the task is at the final review stage (Implementation: Low-Level Review) or completed.`
+      );
+      return;
     }
-  );
+
+    // One root operation guards the ENTIRE composite — lint, advance, complete,
+    // next-task selection, and the commit/push itself (registered below as a
+    // child of this root, so it never contends for the lock this root holds).
+    const lockKey = resolvedTask.taskFolderPath;
+    await runTrackedOperation(
+      lockKey,
+      { label: "Complete, Commit and Push", taskName: resolvedTask.folderName, kind: "complete-commit-push" },
+      async (op) => {
+      // 1. Transition stage to "publish". Completion itself is ungated (C3):
+      // no checks run here — commitAndPushTaskCore below runs fresh checks and
+      // owns the failing-checks prompt/override flow, so the completion step
+      // can never be blocked by lint/test state.
+      const taskFolderUri = vscode.Uri.file(resolvedTask.taskFolderPath);
+      let transitionResult: Awaited<ReturnType<typeof advanceStage>>;
+      try {
+        transitionResult = await advanceStage(
+          taskFolderUri,
+          resolvedTask.progress.currentStage,
+          "publish",
+          false,
+          "complete-commit-push",
+          false
+        );
+      } catch (error) {
+        // advanceStage throws (rather than resolving falsy) when its
+        // compare-and-set is rejected — e.g. a concurrent transition already
+        // moved this task's stage under the lock. Report it like any other
+        // failed transition instead of an unhandled rejection.
+        const message = error instanceof Error ? error.message : String(error);
+        NotificationRouter.showWarning(
+          `Could not persist completion for ${resolvedTask.folderName}: ${message}`
+        );
+        return;
+      }
+
+      if (!transitionResult?.persisted) {
+        NotificationRouter.showError(
+          `Could not persist completion for ${resolvedTask.folderName}. Please try again.`
+        );
+        return;
+      }
+
+      // Completing this command is a lifecycle transition, not merely reaching
+      // Publish. Persist completion before selecting another task so the one
+      // active-task invariant remains true across refreshes and reloads.
+      await patchTaskProgress(taskFolderUri, (current) => ({
+        ...current,
+        status: "completed",
+        completedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      }));
+
+      // 2. Refresh inventory
+      await inventory.refresh();
+
+      // 3. Select next active task deterministically
+      if (currentTaskStore) {
+        const nextCanonicalId = selectNextTask(inventory, resolvedTask.canonicalId);
+        if (nextCanonicalId) {
+          await currentTaskStore.set(nextCanonicalId);
+        } else {
+          await currentTaskStore.clear();
+        }
+      }
+
+      // 4. Run commit & push (the core, not the public command — this
+      // callback already holds the process-global token) as a child of this
+      // composite's root operation — still under the same exclusive lock, so
+      // no second invocation can start between completion and the
+      // commit/push handoff.
+      const completedTask: IncompleteTask = {
+        folderUri: vscode.Uri.file(resolvedTask.taskFolderPath),
+        folderName: resolvedTask.folderName,
+        progress: {
+          ...resolvedTask.progress,
+          currentStage: "publish", // Since it was just advanced
+        },
+        canonicalId: resolvedTask.canonicalId,
+      };
+      await commitAndPushTaskCore(inventory, { task: completedTask }, currentTaskStore, op, extensionContext);
+      }
+    );
+  } finally {
+    releaseCommitPushToken();
+  }
 }
 
 /**

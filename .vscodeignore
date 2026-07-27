@@ -32,16 +32,20 @@ plan-final.md
 
 # Test and build tooling.
 test-stubs/**
+test-fixtures/**
 dist/test/**
 dist/test-host/**
 tsconfig.test.json
+tsconfig.vscode-1.93-compat.json
 scripts/**
+workflow-inventories/**
 .pnpm-store/**
 
 .eslintrc.json
 .gitignore
 tsconfig.json
 esbuild.js
+esbuild.config.js
 pnpm-lock.yaml
 package-lock.json
 pnpm-workspace.yaml

@@ -1,0 +1,10 @@
+[
+  {
+    "questionId": "q1",
+    "kind": "text",
+    "prompt": "Describe the architecture",
+    "required": true,
+    "allowBlank": false,
+    "maxLength": 500
+  }
+]

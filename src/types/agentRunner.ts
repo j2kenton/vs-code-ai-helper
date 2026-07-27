@@ -77,3 +77,15 @@ export interface AgentRunner {
     token: vscode.CancellationToken
   ): Promise<AgentRunResult>;
 }
+
+/**
+ * The isolated LEGACY runner interface (plan §3.4 step 1). `AgentRunner` and
+ * its `outputFile`-carrying `AgentRunRequest` are the pre-V1 contract: they
+ * remain only for routes still behind `legacyAiActionSafetyGateV0.ts`, reject
+ * V1-correlated requests at the runner boundary
+ * (`assertNoUnauthorizedV1CorrelationV0`), and are removed by the Cleanup
+ * cohort. New V1 execution uses the path-free `AgentTransportV1`
+ * (`src/types/agentExecutionV1.ts`) with broker-owned bounded result capture.
+ */
+export type LegacyAgentRunnerV0 = AgentRunner;
+export type LegacyAgentRunRequestV0 = AgentRunRequest;

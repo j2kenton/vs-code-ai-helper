@@ -1,0 +1,400 @@
+/**
+ * Closed coordinator outcome union (plan §3.7).
+ *
+ * Provider envelopes (aiResultEnvelope.ts) are INPUTS to the action
+ * coordinator; product and UI code consumes only this union. The codes here
+ * are stable UI/test contracts: they name what the product should do next
+ * (show questions, offer recovery, offer a fresh preflight, ...), not what a
+ * provider happened to emit. Nothing outside the coordinator may synthesize
+ * a "completed" outcome, which is what makes "only the coordinator may
+ * decode provider envelopes or promote completed content" enforceable.
+ *
+ * The coordinator itself lands with the registry (plan §3.8); until then
+ * this module is the shared contract its collaborators (lease store, file
+ * store, Commit/Push early gate) are written against.
+ */
+import { ActionCorrelationV1, InteractionIdV1, isActionCorrelationV1 } from "./actionCorrelationV1";
+import { MalformedAiResultV1 } from "./aiResultEnvelope";
+import { WorkflowUnavailableCodeV1 } from "./workflowAvailabilityV1";
+
+/** Malformed-result codes are shared verbatim with the envelope parser. */
+export type MalformedResultCodeV1 = MalformedAiResultV1["code"];
+
+export type RecoveryRequiredCodeV1 =
+  | "taskProgressRecoveryRequired"
+  | "chatRecoveryRequired"
+  | "taskCreationRecoveryRequired";
+
+export interface DuplicateRejectedOutcomeV1 {
+  readonly kind: "duplicateRejected";
+  readonly code: "operationAlreadyRunning";
+}
+
+export type TaskActionOutcomeV1 =
+  | {
+      readonly kind: "completed";
+      readonly correlation: ActionCorrelationV1;
+      readonly code: "completed" | "noChanges";
+    }
+  | {
+      readonly kind: "questions";
+      readonly correlation: ActionCorrelationV1;
+      readonly interactionId: InteractionIdV1;
+    }
+  | {
+      readonly kind: "cancelled";
+      readonly correlation?: ActionCorrelationV1;
+      readonly code: "userCancelled" | "providerCancelled";
+    }
+  | {
+      readonly kind: "failed";
+      readonly correlation?: ActionCorrelationV1;
+      readonly code: string;
+      readonly retryable: boolean;
+    }
+  | {
+      readonly kind: "malformedResult";
+      readonly correlation: ActionCorrelationV1;
+      readonly code: MalformedResultCodeV1;
+    }
+  | {
+      readonly kind: "unavailable";
+      readonly code: WorkflowUnavailableCodeV1;
+    }
+  | {
+      readonly kind: "recoveryRequired";
+      readonly code: RecoveryRequiredCodeV1;
+    }
+  | {
+      readonly kind: "stalePreflight";
+      readonly correlation: ActionCorrelationV1;
+      readonly planId: string;
+    }
+  | {
+      readonly kind: "partialEditBlocked";
+      readonly correlation: ActionCorrelationV1;
+      readonly executionId: string;
+      readonly appliedReceiptIds: readonly string[];
+    }
+  | DuplicateRejectedOutcomeV1;
+
+/** The one duplicate-invocation outcome (plan §10.1's early guard emits it too). */
+export function duplicateRejectedV1(): DuplicateRejectedOutcomeV1 {
+  return { kind: "duplicateRejected", code: "operationAlreadyRunning" };
+}
+
+/**
+ * Extract an outcome's correlation, uniformly across the closed union: some
+ * variants carry it required (`completed`, `questions`, `malformedResult`,
+ * `stalePreflight`, `partialEditBlocked`), some optional (`cancelled`,
+ * `failed`), and some never (`unavailable`, `recoveryRequired`,
+ * `duplicateRejected` — none of these ever reach a provider invocation, so
+ * there is nothing to correlate). Used to bind a persisted
+ * `resumeInvocationOutcome` back to the transaction it was recorded against
+ * (plan §3.1 / AC-RUNNER-03) instead of trusting an unrelated correlation as
+ * this interaction's authoritative recovery data.
+ */
+export function outcomeCorrelationV1(outcome: TaskActionOutcomeV1): ActionCorrelationV1 | undefined {
+  switch (outcome.kind) {
+    case "completed":
+    case "questions":
+    case "malformedResult":
+    case "stalePreflight":
+    case "partialEditBlocked":
+      return outcome.correlation;
+    case "cancelled":
+    case "failed":
+      return outcome.correlation;
+    case "unavailable":
+    case "recoveryRequired":
+    case "duplicateRejected":
+      return undefined;
+  }
+}
+
+/**
+ * Strict decoder for one persisted `TaskActionOutcomeV1` (plan §3.1 /
+ * AC-RUNNER-03's "recover the claimed terminal result"): the durable mirror
+ * `chatInteractionTransactionV1.ts` stores as `resumeInvocationOutcome` round
+ * -trips through this decoder, fail-closed on unknown fields or an
+ * unrecognized "kind" exactly like every other §5.5 sub-decoder. The stored
+ * content is already §2.2-permitted (correlation ids, codes, digests, byte
+ * counts) — never provider text — so persisting the exact closed outcome is
+ * safe.
+ */
+export type DecodeTaskActionOutcomeResultV1 =
+  | { readonly ok: true; readonly outcome: TaskActionOutcomeV1 }
+  | { readonly ok: false; readonly reason: string };
+
+function isPlainRecordV1(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function unknownOutcomeField(
+  raw: Record<string, unknown>,
+  allowed: ReadonlySet<string>,
+  label: string
+): string | undefined {
+  for (const key of Object.keys(raw)) {
+    if (!allowed.has(key)) {
+      return `${label} has an unknown field: ${key}`;
+    }
+  }
+  return undefined;
+}
+
+function fail(reason: string): DecodeTaskActionOutcomeResultV1 {
+  return { ok: false, reason };
+}
+
+/** The same bounded failure-code shape the envelope parser enforces (plan §3.5). */
+const FAILURE_CODE_PATTERN_V1 = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+
+const MALFORMED_RESULT_CODES_V1: ReadonlySet<string> = new Set<MalformedResultCodeV1>([
+  "invalidFrame",
+  "invalidJson",
+  "invalidEnvelope",
+  "contentSchemaMismatch",
+  "resultCorrelationMismatch",
+  "resultLimitExceeded",
+]);
+
+const WORKFLOW_UNAVAILABLE_CODES_V1: ReadonlySet<string> = new Set<WorkflowUnavailableCodeV1>([
+  "hostToolApiUnavailable",
+  "providerModeUnavailable",
+  "workspaceRootUnsupported",
+  "workspacePathUnsafe",
+  "workflowStorageUnavailable",
+]);
+
+const RECOVERY_REQUIRED_CODES_V1: ReadonlySet<string> = new Set<RecoveryRequiredCodeV1>([
+  "taskProgressRecoveryRequired",
+  "chatRecoveryRequired",
+  "taskCreationRecoveryRequired",
+]);
+
+/** Decode a required or optional correlation field, rejecting unknown sub-fields. */
+function decodeCorrelation(raw: unknown): ActionCorrelationV1 | string {
+  if (!isPlainRecordV1(raw) || !isActionCorrelationV1(raw)) {
+    return "\"correlation\" is not a valid correlation tuple";
+  }
+  const unknown = unknownOutcomeField(
+    raw,
+    new Set(["actionKey", "operationId", "attemptId", "taskBindingId", "chatDocumentId"]),
+    "correlation"
+  );
+  if (unknown) {
+    return unknown;
+  }
+  return {
+    actionKey: raw.actionKey,
+    operationId: raw.operationId,
+    attemptId: raw.attemptId,
+    taskBindingId: raw.taskBindingId,
+    chatDocumentId: raw.chatDocumentId,
+  };
+}
+
+function decodeOptionalCorrelation(raw: unknown): ActionCorrelationV1 | undefined | string {
+  if (raw === undefined) {
+    return undefined;
+  }
+  return decodeCorrelation(raw);
+}
+
+/**
+ * Strictly decode a raw parsed JSON value as a persisted `TaskActionOutcomeV1`.
+ * Fail-closed: unknown fields, malformed correlations, and unrecognized codes
+ * all reject rather than silently coercing.
+ */
+export function decodeTaskActionOutcomeV1(raw: unknown): DecodeTaskActionOutcomeResultV1 {
+  if (!isPlainRecordV1(raw)) {
+    return fail("outcome is not an object");
+  }
+  switch (raw.kind) {
+    case "completed": {
+      const unknown = unknownOutcomeField(raw, new Set(["kind", "correlation", "code"]), "completed outcome");
+      if (unknown) {
+        return fail(unknown);
+      }
+      const correlation = decodeCorrelation(raw.correlation);
+      if (typeof correlation === "string") {
+        return fail(correlation);
+      }
+      if (raw.code !== "completed" && raw.code !== "noChanges") {
+        return fail(`invalid completed outcome "code": ${JSON.stringify(raw.code)}`);
+      }
+      return { ok: true, outcome: { kind: "completed", correlation, code: raw.code } };
+    }
+    case "questions": {
+      const unknown = unknownOutcomeField(
+        raw,
+        new Set(["kind", "correlation", "interactionId"]),
+        "questions outcome"
+      );
+      if (unknown) {
+        return fail(unknown);
+      }
+      const correlation = decodeCorrelation(raw.correlation);
+      if (typeof correlation === "string") {
+        return fail(correlation);
+      }
+      if (typeof raw.interactionId !== "string" || raw.interactionId.length === 0) {
+        return fail("questions outcome is missing a valid \"interactionId\"");
+      }
+      return {
+        ok: true,
+        outcome: { kind: "questions", correlation, interactionId: raw.interactionId },
+      };
+    }
+    case "cancelled": {
+      const unknown = unknownOutcomeField(raw, new Set(["kind", "correlation", "code"]), "cancelled outcome");
+      if (unknown) {
+        return fail(unknown);
+      }
+      const correlation = decodeOptionalCorrelation(raw.correlation);
+      if (typeof correlation === "string") {
+        return fail(correlation);
+      }
+      if (raw.code !== "userCancelled" && raw.code !== "providerCancelled") {
+        return fail(`invalid cancelled outcome "code": ${JSON.stringify(raw.code)}`);
+      }
+      return {
+        ok: true,
+        outcome: { kind: "cancelled", ...(correlation !== undefined ? { correlation } : {}), code: raw.code },
+      };
+    }
+    case "failed": {
+      const unknown = unknownOutcomeField(
+        raw,
+        new Set(["kind", "correlation", "code", "retryable"]),
+        "failed outcome"
+      );
+      if (unknown) {
+        return fail(unknown);
+      }
+      const correlation = decodeOptionalCorrelation(raw.correlation);
+      if (typeof correlation === "string") {
+        return fail(correlation);
+      }
+      if (typeof raw.code !== "string" || !FAILURE_CODE_PATTERN_V1.test(raw.code)) {
+        return fail("failed outcome is missing a valid \"code\"");
+      }
+      if (typeof raw.retryable !== "boolean") {
+        return fail("failed outcome is missing a boolean \"retryable\"");
+      }
+      return {
+        ok: true,
+        outcome: {
+          kind: "failed",
+          ...(correlation !== undefined ? { correlation } : {}),
+          code: raw.code,
+          retryable: raw.retryable,
+        },
+      };
+    }
+    case "malformedResult": {
+      const unknown = unknownOutcomeField(
+        raw,
+        new Set(["kind", "correlation", "code"]),
+        "malformedResult outcome"
+      );
+      if (unknown) {
+        return fail(unknown);
+      }
+      const correlation = decodeCorrelation(raw.correlation);
+      if (typeof correlation === "string") {
+        return fail(correlation);
+      }
+      if (typeof raw.code !== "string" || !MALFORMED_RESULT_CODES_V1.has(raw.code)) {
+        return fail(`invalid malformedResult outcome "code": ${JSON.stringify(raw.code)}`);
+      }
+      return {
+        ok: true,
+        outcome: { kind: "malformedResult", correlation, code: raw.code as MalformedResultCodeV1 },
+      };
+    }
+    case "unavailable": {
+      const unknown = unknownOutcomeField(raw, new Set(["kind", "code"]), "unavailable outcome");
+      if (unknown) {
+        return fail(unknown);
+      }
+      if (typeof raw.code !== "string" || !WORKFLOW_UNAVAILABLE_CODES_V1.has(raw.code)) {
+        return fail(`invalid unavailable outcome "code": ${JSON.stringify(raw.code)}`);
+      }
+      return { ok: true, outcome: { kind: "unavailable", code: raw.code as WorkflowUnavailableCodeV1 } };
+    }
+    case "recoveryRequired": {
+      const unknown = unknownOutcomeField(raw, new Set(["kind", "code"]), "recoveryRequired outcome");
+      if (unknown) {
+        return fail(unknown);
+      }
+      if (typeof raw.code !== "string" || !RECOVERY_REQUIRED_CODES_V1.has(raw.code)) {
+        return fail(`invalid recoveryRequired outcome "code": ${JSON.stringify(raw.code)}`);
+      }
+      return { ok: true, outcome: { kind: "recoveryRequired", code: raw.code as RecoveryRequiredCodeV1 } };
+    }
+    case "stalePreflight": {
+      const unknown = unknownOutcomeField(
+        raw,
+        new Set(["kind", "correlation", "planId"]),
+        "stalePreflight outcome"
+      );
+      if (unknown) {
+        return fail(unknown);
+      }
+      const correlation = decodeCorrelation(raw.correlation);
+      if (typeof correlation === "string") {
+        return fail(correlation);
+      }
+      if (typeof raw.planId !== "string" || raw.planId.length === 0) {
+        return fail("stalePreflight outcome is missing a valid \"planId\"");
+      }
+      return { ok: true, outcome: { kind: "stalePreflight", correlation, planId: raw.planId } };
+    }
+    case "partialEditBlocked": {
+      const unknown = unknownOutcomeField(
+        raw,
+        new Set(["kind", "correlation", "executionId", "appliedReceiptIds"]),
+        "partialEditBlocked outcome"
+      );
+      if (unknown) {
+        return fail(unknown);
+      }
+      const correlation = decodeCorrelation(raw.correlation);
+      if (typeof correlation === "string") {
+        return fail(correlation);
+      }
+      if (typeof raw.executionId !== "string" || raw.executionId.length === 0) {
+        return fail("partialEditBlocked outcome is missing a valid \"executionId\"");
+      }
+      if (
+        !Array.isArray(raw.appliedReceiptIds) ||
+        raw.appliedReceiptIds.some((id) => typeof id !== "string" || id.length === 0)
+      ) {
+        return fail("partialEditBlocked outcome is missing valid \"appliedReceiptIds\"");
+      }
+      return {
+        ok: true,
+        outcome: {
+          kind: "partialEditBlocked",
+          correlation,
+          executionId: raw.executionId,
+          appliedReceiptIds: raw.appliedReceiptIds as readonly string[],
+        },
+      };
+    }
+    case "duplicateRejected": {
+      const unknown = unknownOutcomeField(raw, new Set(["kind", "code"]), "duplicateRejected outcome");
+      if (unknown) {
+        return fail(unknown);
+      }
+      if (raw.code !== "operationAlreadyRunning") {
+        return fail(`invalid duplicateRejected outcome "code": ${JSON.stringify(raw.code)}`);
+      }
+      return { ok: true, outcome: { kind: "duplicateRejected", code: "operationAlreadyRunning" } };
+    }
+    default:
+      return fail(`unrecognized outcome "kind": ${JSON.stringify(raw.kind)}`);
+  }
+}

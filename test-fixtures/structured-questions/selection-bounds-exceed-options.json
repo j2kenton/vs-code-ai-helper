@@ -1,0 +1,14 @@
+[
+  {
+    "questionId": "q1",
+    "kind": "multipleChoice",
+    "prompt": "Pick several",
+    "required": true,
+    "minSelections": 1,
+    "maxSelections": 5,
+    "options": [
+      { "optionId": "a", "label": "A" },
+      { "optionId": "b", "label": "B" }
+    ]
+  }
+]

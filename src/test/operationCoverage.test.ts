@@ -18,7 +18,14 @@ const REPO_ROOT = path.resolve(__dirname, "..", "..");
 const SRC_DIR = path.join(REPO_ROOT, "src");
 
 /** Modules that define the run helpers themselves, rather than invoking them. */
-const EXEMPT = new Set(["taskOperations.ts", "runnerRegistry.ts"]);
+const EXEMPT = new Set([
+  "taskOperations.ts",
+  "runnerRegistry.ts",
+  // Doc comments name runImplementationForModel/resolveRunnerForModel as the
+  // boundary it guards (plan §1.3) without invoking either — it is called
+  // FROM inside those functions, not the other way around.
+  "legacyAiActionSafetyGateV0.ts",
+]);
 
 const STARTS_A_RUN = /runAiToFile|runImplementationForModel/;
 const REGISTERS_OPERATION = /taskOperations/;

@@ -3,6 +3,7 @@ import { TaskInventory } from "../state/taskInventory";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { NotificationRouter } from "../utils/notificationRouter";
+import { assertLegacyAiRouteAllowedV0 } from "../services/legacyAiActionSafetyGateV0";
 
 /**
  * Keyboard shortcut router: runs Review with AI against the current task,
@@ -12,6 +13,10 @@ export async function reviewCurrentTask(
   inventory: TaskInventory,
   currentTaskStore: CurrentTaskStore
 ): Promise<void> {
+  // Concrete alias route of the review action family (plan §1.3): the gate
+  // must run before this wrapper's own task-state read, not only inside the
+  // downstream runReviewWithAI handler it delegates to.
+  assertLegacyAiRouteAllowedV0("review.v1");
   const resolvedTask = await resolveTaskContext(
     inventory,
     undefined,

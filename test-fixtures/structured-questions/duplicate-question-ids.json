@@ -1,0 +1,4 @@
+[
+  { "questionId": "q1", "kind": "text", "prompt": "First question", "required": true, "allowBlank": false, "maxLength": 100 },
+  { "questionId": "q1", "kind": "text", "prompt": "Second question with the same id", "required": true, "allowBlank": false, "maxLength": 100 }
+]

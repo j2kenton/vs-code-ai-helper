@@ -5,6 +5,8 @@ import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { STAGE_ARTIFACT_FILENAMES } from "../types/taskProgress";
 import { ensureStageModelConfigured } from "../utils/modelSelection";
 import { NotificationRouter } from "../utils/notificationRouter";
+import { assertLegacyAiRouteAllowedV0 } from "../services/legacyAiActionSafetyGateV0";
+import { LegacyCreatingStartupGateV0 } from "../state/legacyCreatingStartupGateV0";
 
 type ApplyArg = { canonicalId?: string; taskFolderPath?: string };
 
@@ -25,6 +27,11 @@ export async function applyCurrentStageAction(
   currentTaskStore: CurrentTaskStore,
   explicitArg?: ApplyArg
 ): Promise<void> {
+  assertLegacyAiRouteAllowedV0("applyCurrentStage.v1");
+  // Block on the startup gate's classification pass before this command's
+  // first task-state read (plan §1.4). Runs after the synchronous route gate
+  // above, which reads no state.
+  await LegacyCreatingStartupGateV0.waitUntilReady();
   const resolvedTask = await resolveTaskContext(
     inventory,
     explicitArg,

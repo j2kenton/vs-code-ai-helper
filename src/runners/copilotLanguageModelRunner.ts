@@ -10,8 +10,79 @@ import {
   AgentRunRequest,
   AgentRunResult,
 } from "../types/agentRunner";
+import {
+  AgentExecutionRequestV1,
+  AgentTransportExitV1,
+  AgentTransportV1,
+  BoundedResultWriterV1,
+} from "../types/agentExecutionV1";
 import { withAttribution, writeTextFile } from "../utils/fileUtils";
 import { classifyFailure } from "../utils/quota";
+
+/** Stable runner identity shared by the legacy runner and the V1 transport. */
+export const COPILOT_LM_RUNNER_ID = "copilot-lm";
+
+/**
+ * V1 transport (plan §3.2/§3.4) for the Copilot Language Model text path:
+ * streams the model's response fragments straight into the broker-owned
+ * bounded writer and reports only how the provider exited. Unlike the legacy
+ * runner below it receives no artifact destination and writes no file — the
+ * broker (`agentExecutionBrokerV1.ts`) owns all result capture, sealing, and
+ * hashing (AC-RUNNER-01). Selection happens in `runnerRegistry.ts`
+ * (`openV1RunnerSelection`); this factory only binds the reserved
+ * provider-native model id into a transport, which is not an invocation.
+ */
+export function createCopilotLmTextTransportV1(options: {
+  /** Provider-native (unqualified) model id; undefined runs the provider default. */
+  model: string | undefined;
+}): AgentTransportV1 {
+  return {
+    runnerId: COPILOT_LM_RUNNER_ID,
+    async invoke(
+      request: AgentExecutionRequestV1,
+      output: BoundedResultWriterV1
+    ): Promise<AgentTransportExitV1> {
+      let models: vscode.LanguageModelChat[];
+      try {
+        models = await vscode.lm.selectChatModels({ vendor: "copilot" });
+      } catch {
+        return { kind: "transportFailure", code: "copilotModelSelectionFailed" };
+      }
+      if (models.length === 0) {
+        return { kind: "transportFailure", code: "copilotNoModelsAvailable" };
+      }
+      const resolved = resolveCopilotModel(models, options.model);
+      if (!resolved.ok) {
+        return { kind: "transportFailure", code: "copilotModelUnresolved" };
+      }
+      const messages = [vscode.LanguageModelChatMessage.User(request.prompt)];
+      const requestOptions = buildCopilotRequestOptions(resolved.parsedModel);
+      try {
+        const response = await resolved.model.sendRequest(
+          messages,
+          requestOptions,
+          request.cancellationToken
+        );
+        for await (const fragment of response.text) {
+          if (!output.write(fragment)) {
+            // Overflowed: the writer has discarded everything and accepts no
+            // more; the broker reports the terminal overflow state.
+            break;
+          }
+        }
+      } catch {
+        if (request.cancellationToken.isCancellationRequested) {
+          return { kind: "callerCancelled" };
+        }
+        return { kind: "transportFailure", code: "copilotRequestFailed" };
+      }
+      if (request.cancellationToken.isCancellationRequested) {
+        return { kind: "callerCancelled" };
+      }
+      return { kind: "completed" };
+    },
+  };
+}
 
 /**
  * Runner that uses the user's existing GitHub Copilot access through

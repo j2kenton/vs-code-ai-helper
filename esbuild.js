@@ -1,31 +1,14 @@
 const esbuild = require("esbuild");
 const fs = require("fs");
+const { createProductionBuildOptions, createEsbuildProblemMatcherPlugin } = require("./esbuild.config.js");
 
 const production = process.argv.includes("--production");
 const watch = process.argv.includes("--watch");
 
-/**
- * @type {import('esbuild').Plugin}
- */
-const esbuildProblemMatcherPlugin = {
-  name: "esbuild-problem-matcher",
-  setup(build) {
-    build.onStart(() => {
-      console.log("[watch] build started");
-    });
-    build.onEnd((result) => {
-      result.errors.forEach(({ text, location }) => {
-        console.error(`✘ [ERROR] ${text}`);
-        if (location) {
-          console.error(
-            `    ${location.file}:${location.line}:${location.column}:`
-          );
-        }
-      });
-      console.log("[watch] build finished");
-    });
-  },
-};
+// Console chatter ("[watch] build started/finished") is only useful for the
+// long-running `watch:esbuild` task; the one-shot production build stays
+// quiet, matching its previous behavior before this plugin was factored out.
+const esbuildProblemMatcherPlugin = createEsbuildProblemMatcherPlugin({ quiet: !watch });
 
 async function main() {
   // dist/ has no outDir of its own in this build — it only exists because
@@ -41,16 +24,7 @@ async function main() {
   fs.rmSync("dist", { recursive: true, force: true });
 
   const ctx = await esbuild.context({
-    entryPoints: ["src/extension.ts"],
-    bundle: true,
-    format: "cjs",
-    minify: production,
-    sourcemap: !production,
-    sourcesContent: false,
-    platform: "node",
-    outfile: "dist/extension.js",
-    external: ["vscode"],
-    logLevel: "silent",
+    ...createProductionBuildOptions({ production }),
     plugins: [esbuildProblemMatcherPlugin],
   });
 

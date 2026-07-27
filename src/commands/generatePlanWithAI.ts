@@ -22,6 +22,7 @@ import { TaskInventory } from "../state/taskInventory";
 import { IncompleteTask } from "../utils/taskProgressUtils";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { safeOpenTextDocument } from "../utils/fileUtils";
+import { assertLegacyAiRouteAllowedV0 } from "../services/legacyAiActionSafetyGateV0";
 
 import {
   AutoTriggerMode,
@@ -137,6 +138,7 @@ export async function generatePlanWithAI(
   inventory: TaskInventory,
   arg?: GeneratePlanArg
 ): Promise<boolean | undefined> {
+  assertLegacyAiRouteAllowedV0("generatePlan.v1");
   // ── Consent gate ─────────────────────────────────────────────────────────
   const consented = await ensureAiConsent(context);
   if (!consented) {

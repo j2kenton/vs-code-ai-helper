@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
-import { recoverTaskCreations, registerStartNewTaskCommand } from "./commands/startNewTask";
+import { registerStartNewTaskCommand } from "./commands/startNewTask";
+import { LegacyCreatingStartupGateV0 } from "./state/legacyCreatingStartupGateV0";
 import { registerResumeTaskCommand } from "./commands/resumeTask";
 import { registerGeneratePlanWithAICommand } from "./commands/generatePlanWithAI";
 import { registerReviewActionCommands } from "./commands/reviewActions";
@@ -40,7 +41,17 @@ import { registerConfigureStepModelsCommand } from "./commands/configureStepMode
 import { TaskTreeProvider, TASKS_VIEW_ID, TaskNode, StageNode, EmptyTasksNode } from "./views/taskTreeProvider";
 import { TaskStatusBar } from "./views/taskStatusBar";
 import { SettingsViewProvider } from "./views/settingsView";
-import { ChatViewProvider } from "./views/chatView";
+import { ChatViewProvider, ChatInteractionServiceResultV1 } from "./views/chatView";
+import {
+  createChatInteractionTransactionStoreV1,
+} from "./services/chatInteractionTransactionStoreV1";
+import { ActionConversationErrorV1, createActionConversationOrchestratorV1 } from "./actions/actionConversationOrchestratorV1";
+import {
+  configureWorkflowPrivateStorageRootV1,
+  getWorkflowFileStoreV1,
+  getWorkflowPathRegistryV1,
+  setChatInteractionTransactionStoreV1,
+} from "./services/workflowRuntimeServicesV1";
 import { TaskInventory } from "./state/taskInventory";
 import { CurrentTaskStore } from "./utils/currentTaskStore";
 import { TASK_PROGRESS_FILENAME, TaskStatus } from "./types/taskProgress";
@@ -59,6 +70,30 @@ import { PendingOperationsStore } from "./state/pendingOperationsStore";
 import { recoverActivationCheckpoint } from "./state/taskActivationCoordinator";
 import { IncompleteTask, readTaskProgress } from "./utils/taskProgressUtils";
 import { installAutoImplementConfirmation, migrateEnabledProvidersForExistingModels, migrateSettingsNamespace, migrateSettingsScope } from "./config/settings";
+
+/**
+ * Run an orchestrator call that throws `ActionConversationErrorV1` on
+ * rejection (Cancel/Resume) and map it onto the webview-facing
+ * `ChatInteractionServiceResultV1` (plan §5.4/§6.1) — the only translation
+ * `ChatInteractionServicesV1`'s consumer (chatView.ts) needs. Routing through
+ * `actionConversationOrchestratorV1` (rather than calling the durable
+ * transaction store directly) is what makes Answer/Cancel actually validate
+ * the full interaction reference — operation, interaction id, AND the
+ * caller-asserted task/document binding chatView.ts derives server-side —
+ * against the persisted transaction's own recorded identity, not only the
+ * operation id.
+ */
+async function runChatConversationAction(action: () => Promise<void>): Promise<ChatInteractionServiceResultV1> {
+  try {
+    await action();
+    return { ok: true };
+  } catch (error) {
+    return {
+      ok: false,
+      reason: error instanceof ActionConversationErrorV1 || error instanceof Error ? error.message : String(error),
+    };
+  }
+}
 
 /**
  * FileDecorationProvider for the synthetic `current-task:` URI scheme.
@@ -123,6 +158,46 @@ export function activate(context: vscode.ExtensionContext): void {
   // With no stage conversation selected, the Chat With AI panel defaults to
   // the global assistant instead of a "select a task first" blocked state.
   chatViewProvider.setDefaultTargetFactory(resolveGlobalAssistantTarget);
+
+  // Wire the shared workflow runtime's private-storage root and the durable
+  // Chat interaction transaction store (plan §2.1/§5.5) so the structured
+  // Answer/Cancel controls in Chat With AI persist through the durable store
+  // before the display mirror changes (plan §5.5), instead of only ever
+  // touching the mirror. `context.globalStorageUri`'s directory is not
+  // guaranteed to exist yet — VS Code does not create it automatically — so
+  // it is created (idempotently) before anything is provisioned under it.
+  // Resume is intentionally left unwired here: it requires the action
+  // coordinator, which nothing in production constructs yet (see
+  // ChatInteractionServicesV1's doc comment in chatView.ts) — Chat With AI
+  // surfaces a clear "not available yet" message for Resume until then.
+  void vscode.workspace.fs.createDirectory(context.globalStorageUri).then(
+    () => undefined,
+    (err: unknown) => console.error("Could not create the extension's global storage directory", err)
+  );
+  const workflowPrivateStorageRootId = configureWorkflowPrivateStorageRootV1(context.globalStorageUri.fsPath);
+  const chatInteractionTransactionStore = createChatInteractionTransactionStoreV1({
+    registry: getWorkflowPathRegistryV1(),
+    fileStore: getWorkflowFileStoreV1(),
+    privateRootId: workflowPrivateStorageRootId,
+  });
+  setChatInteractionTransactionStoreV1(chatInteractionTransactionStore);
+  // Answer/Cancel route through the conversation orchestrator, not the raw
+  // transaction store directly: the orchestrator validates the FULL
+  // interaction reference (operation id, interaction id, and — since
+  // chatView.ts now derives and supplies them server-side — the recorded
+  // taskBindingId/chatDocumentId) against the persisted transaction before
+  // any mutation, closing the "reference names the right interaction but the
+  // wrong task/document" gap for these two production-wired controls.
+  const chatConversationOrchestrator = createActionConversationOrchestratorV1({
+    transactionStore: chatInteractionTransactionStore,
+  });
+  chatViewProvider.setInteractionServices({
+    submitAnswers: async (ref, rawAnswers, answerIdempotencyId) => {
+      const submitted = await chatConversationOrchestrator.submitAnswers(ref, rawAnswers, answerIdempotencyId);
+      return submitted.ok ? { ok: true } : { ok: false, reason: submitted.reason };
+    },
+    cancel: async (ref) => runChatConversationAction(() => chatConversationOrchestrator.cancel(ref)),
+  });
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(
       SettingsViewProvider.viewType,
@@ -184,15 +259,21 @@ export function activate(context: vscode.ExtensionContext): void {
     void pendingOperations.update(operation.id, "needs-reconciliation");
   }
 
+  // Read-only classification of legacy `creating` folders, published as a
+  // barrier that both the first task-inventory publication (below) and every
+  // creation/recovery command body (see LegacyCreatingStartupGateV0's doc
+  // comment, and startNewTask's use of waitUntilReady/getFootprints) must
+  // await before their first read. This replaces the old fire-and-forget
+  // recoverTaskCreations call, which raced both of those.
+  let startupGateReady: Promise<void> = Promise.resolve();
+
   // Perform startup cleanup of orphaned temp files
   try {
     const candidates = resolveTaskRootCandidates();
     const rootPaths = candidates.map((c) => c.absolutePath);
     void cleanupOrphanedTempFiles(rootPaths);
+    startupGateReady = LegacyCreatingStartupGateV0.beginClassification(rootPaths);
     for (const root of rootPaths) {
-      void recoverTaskCreations(root).catch(err =>
-        console.error("Task creation recovery failed", err)
-      );
       void recoverFinalizationTree(root).then(async journals => {
         for (const journal of journals) {
           // The journaled write itself is atomic (writeAtomic rename), so a
@@ -354,6 +435,16 @@ export function activate(context: vscode.ExtensionContext): void {
     }
   ));
   registerOpenGeneralAssistantCommand(context, inventory, currentTaskStore, chatViewProvider);
+  context.subscriptions.push(
+    vscode.commands.registerCommand("vs-code-ai-helper.openChatData", () =>
+      chatViewProvider.openChatDataForCurrentTarget()
+    )
+  );
+  context.subscriptions.push(
+    vscode.commands.registerCommand("vs-code-ai-helper.resetChatHistory", () =>
+      chatViewProvider.resetHistoryForCurrentTarget()
+    )
+  );
 
   const progressBinder = new ViewProgressBinder(taskOperations);
   context.subscriptions.push(progressBinder);
@@ -459,12 +550,18 @@ export function activate(context: vscode.ExtensionContext): void {
     () => taskStatusBar.showMenu()
   );
 
-  // Refresh inventory and tree whenever any task's progress file changes
+  // Refresh inventory and tree whenever any task's progress file changes.
+  // Awaits startupGateReady first (like the first refresh below) so a
+  // watcher event firing during activation — e.g. another window finishing a
+  // write to task-progress.json — can never publish inventory ahead of the
+  // read-only creating-folder classification pass. (inventory.refresh() also
+  // awaits the same barrier internally as defense-in-depth; these explicit
+  // chains stay as the visible, test-asserted ordering contract.)
   const progressWatcher = vscode.workspace.createFileSystemWatcher(
     `**/${TASK_PROGRESS_FILENAME}`
   );
   const onProgressChange = (): void => {
-    void inventory.refresh().then(async () => {
+    void startupGateReady.then(() => inventory.refresh()).then(async () => {
       await taskActionScheduler.armAll();
       taskTreeProvider.refresh();
     });
@@ -480,10 +577,11 @@ export function activate(context: vscode.ExtensionContext): void {
     void taskActionScheduler.armAll();
   }, 5 * 60 * 1000);
 
-  // Refresh when the meta resources folder setting changes
+  // Refresh when the meta resources folder setting changes. Also gated on
+  // startupGateReady — see onProgressChange above for why.
   const configListener = vscode.workspace.onDidChangeConfiguration((event) => {
     if (event.affectsConfiguration("vs-code-ai-helper.metaResourcesPath")) {
-      void inventory.refresh().then(async () => {
+      void startupGateReady.then(() => inventory.refresh()).then(async () => {
         await taskActionScheduler.armAll();
         taskTreeProvider.refresh();
       });
@@ -546,7 +644,9 @@ export function activate(context: vscode.ExtensionContext): void {
   // Populate the inventory and status bar immediately (silent — no folder creation)
   // Schedules are persisted in task-progress.json. The inventory must be
   // populated before arming them or activation would miss every schedule.
-  void inventory.refresh().then(async () => {
+  // Awaiting startupGateReady first means the first inventory publication can
+  // never race the legacy-creating classification pass above.
+  void startupGateReady.then(() => inventory.refresh()).then(async () => {
     await taskActionScheduler.armAll();
     taskTreeProvider.refresh();
     // Git-ignore handling for Ensemble resources is automatic (no settings

@@ -1,0 +1,8 @@
+{
+  "taskFolder": "2026-07-01_task_1",
+  "currentStage": "impl",
+  "createdAt": "2026-07-01T10:00:00.000Z",
+  "updatedAt": "2026-07-01T10:00:00.000Z",
+  "scheduledRun": { "runAt": "2026-07-05T08:00:00.000Z", "stage": "impl" },
+  "scheduledResumeTime": "2026-07-05T08:00:00.000Z"
+}

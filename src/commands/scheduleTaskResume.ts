@@ -4,6 +4,7 @@ import { TaskProgress } from "../types/taskProgress";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { patchTaskProgress } from "../utils/taskProgressUtils";
 import { NotificationRouter } from "../utils/notificationRouter";
+import { LegacyCreatingStartupGateV0 } from "../state/legacyCreatingStartupGateV0";
 
 type ScheduleArg = { canonicalId?: string; taskFolderPath?: string; task?: { folderUri: vscode.Uri } };
 
@@ -174,6 +175,10 @@ export async function scheduleTaskResume(
   arg?: ScheduleArg,
   clock: SchedulerClock = systemSchedulerClock
 ): Promise<void> {
+  // Block on the startup gate's classification pass before this lifecycle
+  // command's first task-state read (plan §1.4).
+  await LegacyCreatingStartupGateV0.waitUntilReady();
+
   const resolverArg = arg?.task ? { taskFolderPath: arg.task.folderUri.fsPath } : arg && (arg.canonicalId || arg.taskFolderPath) ? { canonicalId: arg.canonicalId, taskFolderPath: arg.taskFolderPath } : undefined;
   const task = await resolveTaskContext(inventory, resolverArg, { allowPaused: false });
   if (!task) return;
@@ -189,6 +194,8 @@ export async function scheduleTaskResume(
 }
 
 export async function cancelScheduledTaskAction(inventory: TaskInventory, scheduler: TaskActionScheduler, arg?: ScheduleArg): Promise<void> {
+  // Same activation-barrier contract as scheduleTaskResume above (plan §1.4).
+  await LegacyCreatingStartupGateV0.waitUntilReady();
   const task = await resolveTaskContext(inventory, arg?.task ? { taskFolderPath: arg.task.folderUri.fsPath } : arg, { allowPaused: true });
   if (task) await scheduler.cancel(task.taskFolderPath);
 }

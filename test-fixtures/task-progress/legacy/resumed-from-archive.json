@@ -1,0 +1,11 @@
+{
+  "taskFolder": "2026-07-01_task_8",
+  "displayName": "resumed task",
+  "nameIsDefault": false,
+  "currentStage": "publish",
+  "status": "active",
+  "completedAt": "2026-07-08T00:00:00.000Z",
+  "completedStages": ["publish"],
+  "createdAt": "2026-07-01T10:00:00.000Z",
+  "updatedAt": "2026-07-10T09:00:00.000Z"
+}

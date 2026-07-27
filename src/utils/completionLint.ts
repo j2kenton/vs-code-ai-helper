@@ -561,6 +561,28 @@ interface RunGuardOptions {
 }
 
 /**
+ * Test seam for killProcessTree: disables exactly one of the two
+ * deliberately redundant PID-reuse guards so a test can prove the OTHER
+ * is independently present (see the killProcessTree doc comment for why
+ * no black-box test can distinguish them). Production callers must never
+ * pass this — with no seam both guards are always active.
+ *
+ * @internal exported for testing only
+ */
+export interface KillProcessTreeGuardSeam {
+  /**
+   * Skip attemptKill's fire-time hasExited() re-check, proving the
+   * exit-time timer cleanup alone stops post-exit retries.
+   */
+  omitFireTimeExitCheck?: boolean;
+  /**
+   * Skip the 'exit' listener that clears queued retry timers, proving the
+   * fire-time re-check alone suppresses post-exit retries.
+   */
+  omitExitTimeTimerCleanup?: boolean;
+}
+
+/**
  * Kill a spawned check process. `child.kill()` alone only signals the
  * immediate process — with shell:true (runCheck's Windows .cmd/.bat path,
  * and runExplicitCheck always) that immediate process is a cmd.exe/shell
@@ -588,21 +610,59 @@ interface RunGuardOptions {
  * waiting on that unreachable descendant: it resolves as soon as the
  * process we spawned exits, rather than waiting for every descendant to
  * release the inherited stdio pipe.
+ *
+ * Every retry stops the moment the tracked child exits. Windows reuses
+ * freed PIDs aggressively, so a taskkill retry aimed at a PID whose process
+ * is already gone can land on a completely unrelated process that was
+ * assigned the same number in the meantime — up to 30s later with the
+ * retry schedule below. Once the root we spawned has exited, a retry can
+ * only ever hit a reused PID or fail ("not found"): `/T` scopes the tree
+ * walk to that root, so it cannot reach a surviving orphaned descendant
+ * either way. (Observed as a real kill of a sibling test's freshly spawned
+ * npm chain while the full suite ran concurrently.)
+ *
+ * Two deliberately redundant guards enforce that stop, and BOTH must
+ * survive any refactor: attemptKill re-checks hasExited() at fire time
+ * (covering a timer that fires in the window before Node emits 'exit'),
+ * and the 'exit' listener clears every queued retry timer (covering
+ * everything after). The observable behavior — no taskkill after exit —
+ * is identical with either guard alone, so an end-to-end test cannot
+ * tell them apart; KillProcessTreeGuardSeam exists so the seam tests in
+ * completionLintKillPidReuse.test.ts (Windows-only) can disable one
+ * guard at a time and fail if the other has been removed.
+ *
+ * @internal exported for testing
  */
-function killProcessTree(child: ReturnType<typeof spawn>): void {
+export function killProcessTree(
+  child: ReturnType<typeof spawn>,
+  guardSeam?: KillProcessTreeGuardSeam
+): void {
   if (process.platform === "win32" && child.pid) {
     const pid = child.pid;
+    const hasExited = (): boolean => child.exitCode !== null || child.signalCode !== null;
     const attemptKill = (): void => {
+      if (!guardSeam?.omitFireTimeExitCheck && hasExited()) { return; }
       try {
         execFileSync("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
       } catch {
-        // Already exited, or taskkill itself failed — a later retry (or,
+        // Still running but taskkill itself failed — a later retry (or,
         // worst case, the caller's own timeoutMs bound) is the fallback.
       }
     };
     attemptKill();
+    const retries: NodeJS.Timeout[] = [];
     for (const delayMs of [300, 1000, 2500, 5000, 9000, 15000, 22000, 30000]) {
-      setTimeout(attemptKill, delayMs);
+      const timer = setTimeout(attemptKill, delayMs);
+      // Never hold the process open just for a pending kill retry — if the
+      // child outlives every other piece of work, the caller's timeoutMs
+      // bound is the backstop, not this schedule.
+      timer.unref?.();
+      retries.push(timer);
+    }
+    if (!guardSeam?.omitExitTimeTimerCleanup) {
+      child.once("exit", () => {
+        for (const timer of retries) { clearTimeout(timer); }
+      });
     }
     return;
   }

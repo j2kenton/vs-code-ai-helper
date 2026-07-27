@@ -4,6 +4,7 @@ import { discoverAllTasks, DiscoveredTask } from "../utils/taskRoot";
 import { readTaskProgress } from "../utils/taskProgressUtils";
 import { TaskProgress } from "../types/taskProgress";
 import { repairLegacyOwnership } from "../utils/metaResourcesMigration";
+import { LegacyCreatingStartupGateV0 } from "./legacyCreatingStartupGateV0";
 
 /**
  * A task with its progress metadata loaded
@@ -115,6 +116,14 @@ export class TaskInventory {
     this.loading = true;
     void vscode.commands.executeCommand("setContext", "vs-code-ai-helper.isLoadingTasks", true);
     try {
+      // Self-gate on the activation-order barrier (plan §1.4): the first
+      // inventory publication must observe the startup gate's completed
+      // read-only classification of legacy `creating` folders. extension.ts
+      // also chains its refresh triggers on startupGateReady, but enforcing
+      // the barrier here means a future refresh() caller that forgets that
+      // chain still cannot publish inventory ahead of the classification
+      // pass. Resolves immediately outside activation.
+      await LegacyCreatingStartupGateV0.waitUntilReady();
       const discovered = await discoverAllTasks();
 
       // Load progress for visible tasks

@@ -1,0 +1,2039 @@
+{
+  "schemaVersion": 1,
+  "generatedBy": "scripts/generateWorkflowRoutes.mjs",
+  "description": "Mechanically extracted workflow route surface of the current working tree (plan §1.2): command registrations, contribution/menu references, internal executeCommand edges, dynamic dispatch sites, webview message roots, tree-item command bindings, provider-boundary call sites, legacy output destinations, and per-file legacy-AI-gate calls — every edge a concrete route row. Scanned over the exact §1.1 production source universe (never a filesystem walk). Regenerated every run; classification lives in workflow-route-baseline-v1.json; the immutable pre-gate reference is workflow-route-pregate-v1.json. Known mechanical bound: tree-item/status-row command bindings are collected only when the bound command ID is a string literal — dynamically bound commands are enforced at their executeCommand dispatch sites instead (dynamicDispatches, which fail closed without an annotation). sourceUniverseSha256 is the CANONICAL (line-ending-independent) digest of the source-universe JSON, so provenance is identical across LF and CRLF checkouts.",
+  "sourceUniverse": "workflow-inventories/workflow-production-source-baseline-v1.json",
+  "sourceUniverseSha256": "8bfd89bda71dd21f515f051394ae7b323abf33a3737bf443cda52c1d04c839ca",
+  "routeCount": 117,
+  "routes": [
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.applyCurrentStageAction",
+      "path": "src/commands/applyCurrentStageAction.ts",
+      "span": "L190-L193",
+      "registrationSymbol": "disposable",
+      "contributed": true,
+      "keybound": true,
+      "menus": [],
+      "treeBindings": [],
+      "fileGateRouteIds": [
+        "applyCurrentStage.v1"
+      ],
+      "fileEdgesOut": []
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.applyHighLevelReviewChanges",
+      "path": "src/commands/applyHighLevelReviewChanges.ts",
+      "span": "L67-L71",
+      "registrationSymbol": "disposable",
+      "contributed": true,
+      "keybound": false,
+      "menus": [],
+      "treeBindings": [],
+      "fileGateRouteIds": [
+        "applyReview.v1"
+      ],
+      "fileEdgesOut": [
+        "vs-code-ai-helper.applyReviewWithAI"
+      ]
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.applyLowLevelReviewChanges",
+      "path": "src/commands/applyLowLevelReviewChanges.ts",
+      "span": "L67-L71",
+      "registrationSymbol": "disposable",
+      "contributed": true,
+      "keybound": false,
+      "menus": [],
+      "treeBindings": [],
+      "fileGateRouteIds": [
+        "applyReview.v1"
+      ],
+      "fileEdgesOut": [
+        "vs-code-ai-helper.applyReviewWithAI"
+      ]
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.applyReviewWithAI",
+      "path": "src/commands/reviewActions.ts",
+      "span": "L4238-L4241",
+      "registrationSymbol": "registerReviewActionCommands",
+      "contributed": true,
+      "keybound": false,
+      "menus": [
+        "view/item/context"
+      ],
+      "treeBindings": [],
+      "fileGateRouteIds": [
+        "applyReview.v1",
+        "fastForward.v1",
+        "generateImplementation.v1",
+        "implementation.v1",
+        "review.v1"
+      ],
+      "fileEdgesOut": [
+        "vs-code-ai-helper.runReviewWithAI"
+      ]
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.archiveTask",
+      "path": "src/commands/archiveTask.ts",
+      "span": "L234-L237",
+      "registrationSymbol": "registerArchiveTaskCommands",
+      "contributed": true,
+      "keybound": false,
+      "menus": [
+        "view/item/context"
+      ],
+      "treeBindings": [
+        "src/utils/globalAssistantActions.ts#L926-L926"
+      ],
+      "fileGateRouteIds": [],
+      "fileEdgesOut": []
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.cancelOperation",
+      "path": "src/extension.ts",
+      "span": "L413-L424",
+      "registrationSymbol": "activate",
+      "contributed": true,
+      "keybound": false,
+      "menus": [
+        "view/item/context"
+      ],
+      "treeBindings": [],
+      "fileGateRouteIds": [],
+      "fileEdgesOut": [
+        "vs-code-ai-helper.settingsView.focus"
+      ]
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.cancelScheduledTaskAction",
+      "path": "src/commands/scheduleTaskResume.ts",
+      "span": "L207-L207",
+      "registrationSymbol": "registerScheduleTaskResumeCommand",
+      "contributed": true,
+      "keybound": false,
+      "menus": [
+        "view/item/context"
+      ],
+      "treeBindings": [],
+      "fileGateRouteIds": [],
+      "fileEdgesOut": [
+        "vs-code-ai-helper.applyCurrentStageAction"
+      ]
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.chatWithStage",
+      "path": "src/commands/chatWithStage.ts",
+      "span": "L524-L526",
+      "registrationSymbol": "registerChatWithStageCommand",
+      "contributed": true,
+      "keybound": false,
+      "menus": [
+        "view/item/context"
+      ],
+      "treeBindings": [],
+      "fileGateRouteIds": [
+        "chatSend.v1"
+      ],
+      "fileEdgesOut": []
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.choosePublishScope",
+      "path": "src/commands/choosePublishScope.ts",
+      "span": "L221-L224",
+      "registrationSymbol": "registerChoosePublishScopeCommand",
+      "contributed": true,
+      "keybound": false,
+      "menus": [],
+      "treeBindings": [],
+      "fileGateRouteIds": [],
+      "fileEdgesOut": []
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.chooseReleaseTarget",
+      "path": "src/commands/reviewActions.ts",
+      "span": "L4267-L4291",
+      "registrationSymbol": "registerReviewActionCommands",
+      "contributed": true,
+      "keybound": false,
+      "menus": [],
+      "treeBindings": [],
+      "fileGateRouteIds": [
+        "applyReview.v1",
+        "fastForward.v1",
+        "generateImplementation.v1",
+        "implementation.v1",
+        "review.v1"
+      ],
+      "fileEdgesOut": [
+        "vs-code-ai-helper.runReviewWithAI"
+      ]
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.clearNotifications",
+      "path": "src/extension.ts",
+      "span": "L401-L404",
+      "registrationSymbol": "activate",
+      "contributed": true,
+      "keybound": false,
+      "menus": [
+        "view/title"
+      ],
+      "treeBindings": [],
+      "fileGateRouteIds": [],
+      "fileEdgesOut": [
+        "vs-code-ai-helper.settingsView.focus"
+      ]
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.collapseAllTasks",
+      "path": "src/extension.ts",
+      "span": "L512-L522",
+      "registrationSymbol": "collapseAllCommand",
+      "contributed": true,
+      "keybound": false,
+      "menus": [
+        "view/title"
+      ],
+      "treeBindings": [],
+      "fileGateRouteIds": [],
+      "fileEdgesOut": [
+        "vs-code-ai-helper.settingsView.focus"
+      ]
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.commitAndPushTask",
+      "path": "src/commands/commitAndPushTask.ts",
+      "span": "L1704-L1708",
+      "registrationSymbol": "disposable",
+      "contributed": true,
+      "keybound": true,
+      "menus": [
+        "view/item/context"
+      ],
+      "treeBindings": [
+        "src/commands/reviewActions.ts#L2029-L2029",
+        "src/commands/reviewActions.ts#L2081-L2081",
+        "src/commands/reviewActions.ts#L2094-L2094",
+        "src/commands/reviewActions.ts#L2239-L2239",
+        "src/commands/reviewActions.ts#L2277-L2277",
+        "src/commands/reviewActions.ts#L2289-L2289",
+        "src/commands/reviewActions.ts#L2316-L2316",
+        "src/commands/reviewActions.ts#L2346-L2346",
+        "src/commands/reviewActions.ts#L2987-L2987",
+        "src/commands/reviewActions.ts#L3012-L3012",
+        "src/commands/reviewActions.ts#L3045-L3045",
+        "src/commands/reviewActions.ts#L3061-L3061",
+        "src/commands/reviewActions.ts#L3099-L3099",
+        "src/commands/reviewActions.ts#L3524-L3524",
+        "src/commands/reviewActions.ts#L3549-L3549",
+        "src/commands/reviewActions.ts#L3564-L3564",
+        "src/commands/setTaskStage.ts#L293-L293"
+      ],
+      "fileGateRouteIds": [
+        "commitPushMetadata.v1"
+      ],
+      "fileEdgesOut": []
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.completeCommitAndPushTask",
+      "path": "src/commands/commitAndPushTask.ts",
+      "span": "L1709-L1713",
+      "registrationSymbol": "completeDisposable",
+      "contributed": true,
+      "keybound": false,
+      "menus": [],
+      "treeBindings": [],
+      "fileGateRouteIds": [
+        "commitPushMetadata.v1"
+      ],
+      "fileEdgesOut": []
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.configureStepModels",
+      "path": "src/commands/configureStepModels.ts",
+      "span": "L84-L87",
+      "registrationSymbol": "disposable",
+      "contributed": false,
+      "keybound": false,
+      "menus": [],
+      "treeBindings": [],
+      "fileGateRouteIds": [],
+      "fileEdgesOut": []
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.configureTaskStepModels",
+      "path": "src/commands/configureStepModels.ts",
+      "span": "L90-L93",
+      "registrationSymbol": "taskDisposable",
+      "contributed": false,
+      "keybound": false,
+      "menus": [],
+      "treeBindings": [],
+      "fileGateRouteIds": [],
+      "fileEdgesOut": []
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.deleteStageBackup",
+      "path": "src/commands/viewStageChanges.ts",
+      "span": "L318-L337",
+      "registrationSymbol": "registerViewStageChangesCommands",
+      "contributed": true,
+      "keybound": false,
+      "menus": [
+        "view/item/context"
+      ],
+      "treeBindings": [],
+      "fileGateRouteIds": [],
+      "fileEdgesOut": []
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.draftTaskWithAI",
+      "path": "src/commands/draftTaskWithAI.ts",
+      "span": "L1146-L1150",
+      "registrationSymbol": "disposable",
+      "contributed": true,
+      "keybound": false,
+      "menus": [
+        "view/item/context"
+      ],
+      "treeBindings": [],
+      "fileGateRouteIds": [
+        "draft.v1"
+      ],
+      "fileEdgesOut": []
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.expandAllTasks",
+      "path": "src/extension.ts",
+      "span": "L501-L511",
+      "registrationSymbol": "expandAllCommand",
+      "contributed": true,
+      "keybound": false,
+      "menus": [
+        "view/title"
+      ],
+      "treeBindings": [],
+      "fileGateRouteIds": [],
+      "fileEdgesOut": [
+        "vs-code-ai-helper.settingsView.focus"
+      ]
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.fastForwardCurrentTaskReview",
+      "path": "src/commands/fastForwardCurrentTaskReview.ts",
+      "span": "L54-L57",
+      "registrationSymbol": "disposable",
+      "contributed": true,
+      "keybound": true,
+      "menus": [],
+      "treeBindings": [],
+      "fileGateRouteIds": [
+        "fastForward.v1"
+      ],
+      "fileEdgesOut": [
+        "vs-code-ai-helper.fastForwardReviewWithAI"
+      ]
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.fastForwardReviewWithAI",
+      "path": "src/commands/reviewActions.ts",
+      "span": "L4242-L4245",
+      "registrationSymbol": "registerReviewActionCommands",
+      "contributed": true,
+      "keybound": false,
+      "menus": [
+        "view/item/context"
+      ],
+      "treeBindings": [
+        "src/utils/globalAssistantActions.ts#L898-L898"
+      ],
+      "fileGateRouteIds": [
+        "applyReview.v1",
+        "fastForward.v1",
+        "generateImplementation.v1",
+        "implementation.v1",
+        "review.v1"
+      ],
+      "fileEdgesOut": [
+        "vs-code-ai-helper.runReviewWithAI"
+      ]
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.filterNotifications",
+      "path": "src/extension.ts",
+      "span": "L405-L408",
+      "registrationSymbol": "activate",
+      "contributed": true,
+      "keybound": false,
+      "menus": [
+        "view/title"
+      ],
+      "treeBindings": [],
+      "fileGateRouteIds": [],
+      "fileEdgesOut": [
+        "vs-code-ai-helper.settingsView.focus"
+      ]
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.filterTasksByStatus",
+      "path": "src/extension.ts",
+      "span": "L528-L531",
+      "registrationSymbol": "activate",
+      "contributed": true,
+      "keybound": false,
+      "menus": [
+        "view/title"
+      ],
+      "treeBindings": [],
+      "fileGateRouteIds": [],
+      "fileEdgesOut": [
+        "vs-code-ai-helper.settingsView.focus"
+      ]
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.generatePlanWithAI",
+      "path": "src/commands/generatePlanWithAI.ts",
+      "span": "L439-L443",
+      "registrationSymbol": "disposable",
+      "contributed": true,
+      "keybound": false,
+      "menus": [
+        "view/item/context"
+      ],
+      "treeBindings": [
+        "src/commands/reviewActions.ts#L3481-L3481"
+      ],
+      "fileGateRouteIds": [
+        "generatePlan.v1"
+      ],
+      "fileEdgesOut": []
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.globalAssistantSend",
+      "path": "src/commands/openGeneralAssistant.ts",
+      "span": "L371-L375",
+      "registrationSymbol": "registerOpenGeneralAssistantCommand",
+      "contributed": false,
+      "keybound": false,
+      "menus": [],
+      "treeBindings": [],
+      "fileGateRouteIds": [],
+      "fileEdgesOut": [
+        "vs-code-ai-helper.openAiModels"
+      ]
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.helloWorld",
+      "path": "src/extension.ts",
+      "span": "L351-L358",
+      "registrationSymbol": "helloWorldDisposable",
+      "contributed": true,
+      "keybound": false,
+      "menus": [],
+      "treeBindings": [],
+      "fileGateRouteIds": [],
+      "fileEdgesOut": [
+        "vs-code-ai-helper.settingsView.focus"
+      ]
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.markTaskDone",
+      "path": "src/commands/markTaskDone.ts",
+      "span": "L226-L229",
+      "registrationSymbol": "disposable",
+      "contributed": true,
+      "keybound": false,
+      "menus": [
+        "view/item/context"
+      ],
+      "treeBindings": [
+        "src/utils/globalAssistantActions.ts#L867-L867"
+      ],
+      "fileGateRouteIds": [],
+      "fileEdgesOut": []
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.migrateMetaResources",
+      "path": "src/utils/metaResourcesMigration.ts",
+      "span": "L416-L418",
+      "registrationSymbol": "registerMetaResourcesMigrationCommand",
+      "contributed": true,
+      "keybound": false,
+      "menus": [],
+      "treeBindings": [],
+      "fileGateRouteIds": [],
+      "fileEdgesOut": []
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.nextStage",
+      "path": "src/commands/reviewActions.ts",
+      "span": "L4250-L4254",
+      "registrationSymbol": "registerReviewActionCommands",
+      "contributed": true,
+      "keybound": true,
+      "menus": [
+        "view/item/context"
+      ],
+      "treeBindings": [
+        "src/utils/globalAssistantActions.ts#L878-L878"
+      ],
+      "fileGateRouteIds": [
+        "applyReview.v1",
+        "fastForward.v1",
+        "generateImplementation.v1",
+        "implementation.v1",
+        "review.v1"
+      ],
+      "fileEdgesOut": [
+        "vs-code-ai-helper.runReviewWithAI"
+      ]
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.openAiModels",
+      "path": "src/extension.ts",
+      "span": "L324-L327",
+      "registrationSymbol": "activate",
+      "contributed": true,
+      "keybound": false,
+      "menus": [],
+      "treeBindings": [],
+      "fileGateRouteIds": [],
+      "fileEdgesOut": [
+        "vs-code-ai-helper.settingsView.focus"
+      ]
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.openAndStartNewTask",
+      "path": "src/commands/openAndStartNewTask.ts",
+      "span": "L28-L31",
+      "registrationSymbol": "disposable",
+      "contributed": true,
+      "keybound": true,
+      "menus": [],
+      "treeBindings": [],
+      "fileGateRouteIds": [],
+      "fileEdgesOut": []
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.openChatData",
+      "path": "src/extension.ts",
+      "span": "L439-L441",
+      "registrationSymbol": "activate",
+      "contributed": true,
+      "keybound": false,
+      "menus": [],
+      "treeBindings": [],
+      "fileGateRouteIds": [],
+      "fileEdgesOut": [
+        "vs-code-ai-helper.settingsView.focus"
+      ]
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.openGeneralAssistant",
+      "path": "src/commands/openGeneralAssistant.ts",
+      "span": "L368-L370",
+      "registrationSymbol": "registerOpenGeneralAssistantCommand",
+      "contributed": true,
+      "keybound": false,
+      "menus": [
+        "view/title"
+      ],
+      "treeBindings": [],
+      "fileGateRouteIds": [],
+      "fileEdgesOut": [
+        "vs-code-ai-helper.openAiModels"
+      ]
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.openSettings",
+      "path": "src/extension.ts",
+      "span": "L320-L323",
+      "registrationSymbol": "activate",
+      "contributed": true,
+      "keybound": false,
+      "menus": [
+        "view/title"
+      ],
+      "treeBindings": [
+        "src/commands/chatWithStage.ts#L400-L400",
+        "src/commands/draftTaskWithAI.ts#L563-L563",
+        "src/commands/generatePlanWithAI.ts#L254-L254",
+        "src/commands/reviewActions.ts#L877-L877"
+      ],
+      "fileGateRouteIds": [],
+      "fileEdgesOut": [
+        "vs-code-ai-helper.settingsView.focus"
+      ]
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.pauseTask",
+      "path": "src/commands/pauseTask.ts",
+      "span": "L158-L162",
+      "registrationSymbol": "disposable",
+      "contributed": true,
+      "keybound": false,
+      "menus": [
+        "view/item/context"
+      ],
+      "treeBindings": [
+        "src/utils/globalAssistantActions.ts#L906-L906"
+      ],
+      "fileGateRouteIds": [],
+      "fileEdgesOut": []
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.pinTask",
+      "path": "src/commands/pinTask.ts",
+      "span": "L117-L120",
+      "registrationSymbol": "registerPinTaskCommands",
+      "contributed": true,
+      "keybound": false,
+      "menus": [
+        "view/item/context"
+      ],
+      "treeBindings": [
+        "src/utils/globalAssistantActions.ts#L946-L946"
+      ],
+      "fileGateRouteIds": [],
+      "fileEdgesOut": []
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.postStageQuestion",
+      "path": "src/commands/chatWithStage.ts",
+      "span": "L527-L533",
+      "registrationSymbol": "registerChatWithStageCommand",
+      "contributed": true,
+      "keybound": false,
+      "menus": [],
+      "treeBindings": [
+        "src/utils/reviewEscalation.ts#L144-L144",
+        "src/views/chatView.ts#L453-L453"
+      ],
+      "fileGateRouteIds": [
+        "chatSend.v1"
+      ],
+      "fileEdgesOut": []
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.redoStageChanges",
+      "path": "src/commands/viewStageChanges.ts",
+      "span": "L315-L317",
+      "registrationSymbol": "registerViewStageChangesCommands",
+      "contributed": true,
+      "keybound": false,
+      "menus": [
+        "view/item/context"
+      ],
+      "treeBindings": [],
+      "fileGateRouteIds": [],
+      "fileEdgesOut": []
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.refreshTasksView",
+      "path": "src/extension.ts",
+      "span": "L497-L500",
+      "registrationSymbol": "refreshCommand",
+      "contributed": true,
+      "keybound": false,
+      "menus": [
+        "view/title"
+      ],
+      "treeBindings": [],
+      "fileGateRouteIds": [],
+      "fileEdgesOut": [
+        "vs-code-ai-helper.settingsView.focus"
+      ]
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.release",
+      "path": "src/commands/reviewActions.ts",
+      "span": "L4263-L4266",
+      "registrationSymbol": "registerReviewActionCommands",
+      "contributed": true,
+      "keybound": false,
+      "menus": [
+        "view/item/context"
+      ],
+      "treeBindings": [],
+      "fileGateRouteIds": [
+        "applyReview.v1",
+        "fastForward.v1",
+        "generateImplementation.v1",
+        "implementation.v1",
+        "review.v1"
+      ],
+      "fileEdgesOut": [
+        "vs-code-ai-helper.runReviewWithAI"
+      ]
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.renameTask",
+      "path": "src/commands/renameTask.ts",
+      "span": "L156-L158",
+      "registrationSymbol": "registerRenameTaskCommands",
+      "contributed": true,
+      "keybound": false,
+      "menus": [
+        "view/item/context"
+      ],
+      "treeBindings": [],
+      "fileGateRouteIds": [],
+      "fileEdgesOut": []
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.renameTaskWithAI",
+      "path": "src/commands/renameTask.ts",
+      "span": "L161-L164",
+      "registrationSymbol": "registerRenameTaskCommands",
+      "contributed": true,
+      "keybound": false,
+      "menus": [
+        "view/item/context"
+      ],
+      "treeBindings": [],
+      "fileGateRouteIds": [],
+      "fileEdgesOut": []
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.resetChatHistory",
+      "path": "src/extension.ts",
+      "span": "L444-L446",
+      "registrationSymbol": "activate",
+      "contributed": true,
+      "keybound": false,
+      "menus": [],
+      "treeBindings": [
+        "src/views/chatView.ts#L865-L865"
+      ],
+      "fileGateRouteIds": [],
+      "fileEdgesOut": [
+        "vs-code-ai-helper.settingsView.focus"
+      ]
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.resetTaskStatusFilter",
+      "path": "src/extension.ts",
+      "span": "L532-L535",
+      "registrationSymbol": "activate",
+      "contributed": true,
+      "keybound": false,
+      "menus": [],
+      "treeBindings": [
+        "src/views/taskTreeProvider.ts#L419-L419"
+      ],
+      "fileGateRouteIds": [],
+      "fileEdgesOut": [
+        "vs-code-ai-helper.settingsView.focus"
+      ]
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.resumeTask",
+      "path": "src/commands/resumeTask.ts",
+      "span": "L237-L241",
+      "registrationSymbol": "disposable",
+      "contributed": true,
+      "keybound": false,
+      "menus": [
+        "view/item/context"
+      ],
+      "treeBindings": [
+        "src/commands/startNewTask.ts#L341-L341",
+        "src/utils/globalAssistantActions.ts#L916-L916",
+        "src/views/taskStatusBar.ts#L133-L133"
+      ],
+      "fileGateRouteIds": [],
+      "fileEdgesOut": []
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.revertStageChanges",
+      "path": "src/commands/viewStageChanges.ts",
+      "span": "L312-L314",
+      "registrationSymbol": "registerViewStageChangesCommands",
+      "contributed": true,
+      "keybound": false,
+      "menus": [
+        "view/item/context"
+      ],
+      "treeBindings": [],
+      "fileGateRouteIds": [],
+      "fileEdgesOut": []
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.reviewCurrentTask",
+      "path": "src/commands/reviewCurrentTask.ts",
+      "span": "L54-L57",
+      "registrationSymbol": "disposable",
+      "contributed": true,
+      "keybound": true,
+      "menus": [],
+      "treeBindings": [],
+      "fileGateRouteIds": [
+        "review.v1"
+      ],
+      "fileEdgesOut": [
+        "vs-code-ai-helper.runReviewWithAI"
+      ]
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.runImplementationWithAI",
+      "path": "src/commands/reviewActions.ts",
+      "span": "L4258-L4262",
+      "registrationSymbol": "registerReviewActionCommands",
+      "contributed": true,
+      "keybound": false,
+      "menus": [
+        "view/item/context"
+      ],
+      "treeBindings": [
+        "src/commands/reviewActions.ts#L211-L211",
+        "src/commands/reviewActions.ts#L3492-L3492"
+      ],
+      "fileGateRouteIds": [
+        "applyReview.v1",
+        "fastForward.v1",
+        "generateImplementation.v1",
+        "implementation.v1",
+        "review.v1"
+      ],
+      "fileEdgesOut": [
+        "vs-code-ai-helper.runReviewWithAI"
+      ]
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.runLintingFixes",
+      "path": "src/commands/runLintingFixes.ts",
+      "span": "L395-L399",
+      "registrationSymbol": "disposable",
+      "contributed": true,
+      "keybound": false,
+      "menus": [
+        "view/item/context"
+      ],
+      "treeBindings": [],
+      "fileGateRouteIds": [
+        "lint.v1"
+      ],
+      "fileEdgesOut": []
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.runNotificationAction",
+      "path": "src/extension.ts",
+      "span": "L430-L436",
+      "registrationSymbol": "activate",
+      "contributed": true,
+      "keybound": false,
+      "menus": [
+        "view/item/context"
+      ],
+      "treeBindings": [],
+      "fileGateRouteIds": [],
+      "fileEdgesOut": [
+        "vs-code-ai-helper.settingsView.focus"
+      ]
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.runPublishChecks",
+      "path": "src/commands/runPublishChecks.ts",
+      "span": "L165-L168",
+      "registrationSymbol": "disposable",
+      "contributed": true,
+      "keybound": false,
+      "menus": [
+        "view/item/context"
+      ],
+      "treeBindings": [
+        "src/commands/runLintingFixes.ts#L151-L151",
+        "src/commands/runLintingFixes.ts#L194-L194"
+      ],
+      "fileGateRouteIds": [],
+      "fileEdgesOut": []
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.runReviewWithAI",
+      "path": "src/commands/reviewActions.ts",
+      "span": "L4234-L4237",
+      "registrationSymbol": "registerReviewActionCommands",
+      "contributed": true,
+      "keybound": false,
+      "menus": [
+        "view/item/context"
+      ],
+      "treeBindings": [
+        "src/commands/setTaskStage.ts#L325-L325",
+        "src/utils/globalAssistantActions.ts#L890-L890"
+      ],
+      "fileGateRouteIds": [
+        "applyReview.v1",
+        "fastForward.v1",
+        "generateImplementation.v1",
+        "implementation.v1",
+        "review.v1"
+      ],
+      "fileEdgesOut": [
+        "vs-code-ai-helper.runReviewWithAI"
+      ]
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.scheduleTaskResume",
+      "path": "src/commands/scheduleTaskResume.ts",
+      "span": "L206-L206",
+      "registrationSymbol": "registerScheduleTaskResumeCommand",
+      "contributed": true,
+      "keybound": false,
+      "menus": [
+        "view/item/context"
+      ],
+      "treeBindings": [],
+      "fileGateRouteIds": [],
+      "fileEdgesOut": [
+        "vs-code-ai-helper.applyCurrentStageAction"
+      ]
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.setStageAsCurrent",
+      "path": "src/commands/setTaskStage.ts",
+      "span": "L421-L424",
+      "registrationSymbol": "stageDisposable",
+      "contributed": true,
+      "keybound": false,
+      "menus": [
+        "view/item/context"
+      ],
+      "treeBindings": [],
+      "fileGateRouteIds": [],
+      "fileEdgesOut": []
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.setStageBackupModel",
+      "path": "src/commands/configureStepModels.ts",
+      "span": "L102-L105",
+      "registrationSymbol": "backupDisposable",
+      "contributed": false,
+      "keybound": false,
+      "menus": [],
+      "treeBindings": [],
+      "fileGateRouteIds": [],
+      "fileEdgesOut": []
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.setStageModel",
+      "path": "src/commands/configureStepModels.ts",
+      "span": "L96-L99",
+      "registrationSymbol": "stageDisposable",
+      "contributed": false,
+      "keybound": false,
+      "menus": [],
+      "treeBindings": [],
+      "fileGateRouteIds": [],
+      "fileEdgesOut": []
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.setTaskStage",
+      "path": "src/commands/setTaskStage.ts",
+      "span": "L417-L420",
+      "registrationSymbol": "disposable",
+      "contributed": true,
+      "keybound": false,
+      "menus": [],
+      "treeBindings": [],
+      "fileGateRouteIds": [],
+      "fileEdgesOut": []
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.settingsView.focus",
+      "path": "src/commands/configureStepModels.ts",
+      "span": "L108-L111",
+      "registrationSymbol": "focusDisposable",
+      "contributed": false,
+      "keybound": false,
+      "menus": [],
+      "treeBindings": [],
+      "fileGateRouteIds": [],
+      "fileEdgesOut": []
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.stageArtifactNotReady",
+      "path": "src/extension.ts",
+      "span": "L540-L547",
+      "registrationSymbol": "activate",
+      "contributed": false,
+      "keybound": false,
+      "menus": [],
+      "treeBindings": [
+        "src/views/taskTreeProvider.ts#L345-L345"
+      ],
+      "fileGateRouteIds": [],
+      "fileEdgesOut": [
+        "vs-code-ai-helper.settingsView.focus"
+      ]
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.startNewTask",
+      "path": "src/commands/startNewTask.ts",
+      "span": "L365-L368",
+      "registrationSymbol": "disposable",
+      "contributed": true,
+      "keybound": false,
+      "menus": [
+        "view/title"
+      ],
+      "treeBindings": [
+        "src/views/taskStatusBar.ts#L150-L150"
+      ],
+      "fileGateRouteIds": [],
+      "fileEdgesOut": []
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.statusBarMenu",
+      "path": "src/extension.ts",
+      "span": "L548-L551",
+      "registrationSymbol": "statusBarMenuCommand",
+      "contributed": false,
+      "keybound": false,
+      "menus": [],
+      "treeBindings": [],
+      "fileGateRouteIds": [],
+      "fileEdgesOut": [
+        "vs-code-ai-helper.settingsView.focus"
+      ]
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.unarchiveTask",
+      "path": "src/commands/archiveTask.ts",
+      "span": "L238-L241",
+      "registrationSymbol": "registerArchiveTaskCommands",
+      "contributed": true,
+      "keybound": false,
+      "menus": [
+        "view/item/context"
+      ],
+      "treeBindings": [
+        "src/utils/globalAssistantActions.ts#L936-L936"
+      ],
+      "fileGateRouteIds": [],
+      "fileEdgesOut": []
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.unpinTask",
+      "path": "src/commands/pinTask.ts",
+      "span": "L121-L124",
+      "registrationSymbol": "registerPinTaskCommands",
+      "contributed": true,
+      "keybound": false,
+      "menus": [
+        "view/item/context"
+      ],
+      "treeBindings": [
+        "src/utils/globalAssistantActions.ts#L956-L956"
+      ],
+      "fileGateRouteIds": [],
+      "fileEdgesOut": []
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.viewDisclaimer",
+      "path": "src/extension.ts",
+      "span": "L365-L377",
+      "registrationSymbol": "viewDisclaimerDisposable",
+      "contributed": true,
+      "keybound": false,
+      "menus": [],
+      "treeBindings": [],
+      "fileGateRouteIds": [],
+      "fileEdgesOut": [
+        "vs-code-ai-helper.settingsView.focus"
+      ]
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.viewPlan",
+      "path": "src/commands/viewArtifacts.ts",
+      "span": "L178-L181",
+      "registrationSymbol": "viewPlanDisposable",
+      "contributed": true,
+      "keybound": false,
+      "menus": [],
+      "treeBindings": [],
+      "fileGateRouteIds": [],
+      "fileEdgesOut": []
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.viewReview",
+      "path": "src/commands/reviewActions.ts",
+      "span": "L4246-L4249",
+      "registrationSymbol": "registerReviewActionCommands",
+      "contributed": true,
+      "keybound": false,
+      "menus": [],
+      "treeBindings": [],
+      "fileGateRouteIds": [
+        "applyReview.v1",
+        "fastForward.v1",
+        "generateImplementation.v1",
+        "implementation.v1",
+        "review.v1"
+      ],
+      "fileEdgesOut": [
+        "vs-code-ai-helper.runReviewWithAI"
+      ]
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.viewStageChanges",
+      "path": "src/commands/viewStageChanges.ts",
+      "span": "L300-L311",
+      "registrationSymbol": "registerViewStageChangesCommands",
+      "contributed": true,
+      "keybound": false,
+      "menus": [
+        "view/item/context"
+      ],
+      "treeBindings": [],
+      "fileGateRouteIds": [],
+      "fileEdgesOut": []
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.viewTask",
+      "path": "src/commands/viewArtifacts.ts",
+      "span": "L172-L175",
+      "registrationSymbol": "viewTaskDisposable",
+      "contributed": true,
+      "keybound": false,
+      "menus": [],
+      "treeBindings": [
+        "src/views/taskStatusBar.ts#L141-L141"
+      ],
+      "fileGateRouteIds": [],
+      "fileEdgesOut": []
+    },
+    {
+      "kind": "internalEdge",
+      "commandId": "vs-code-ai-helper.applyReviewWithAI",
+      "path": "src/commands/applyHighLevelReviewChanges.ts",
+      "span": "L55-L57",
+      "enclosingSymbol": "applyHighLevelReviewChanges",
+      "occurrence": 1
+    },
+    {
+      "kind": "internalEdge",
+      "commandId": "vs-code-ai-helper.applyReviewWithAI",
+      "path": "src/commands/applyLowLevelReviewChanges.ts",
+      "span": "L55-L57",
+      "enclosingSymbol": "applyLowLevelReviewChanges",
+      "occurrence": 1
+    },
+    {
+      "kind": "internalEdge",
+      "commandId": "vs-code-ai-helper.fastForwardReviewWithAI",
+      "path": "src/commands/fastForwardCurrentTaskReview.ts",
+      "span": "L41-L43",
+      "enclosingSymbol": "fastForwardCurrentTaskReview",
+      "occurrence": 1
+    },
+    {
+      "kind": "internalEdge",
+      "commandId": "vs-code-ai-helper.openAiModels",
+      "path": "src/commands/openGeneralAssistant.ts",
+      "span": "L283-L283",
+      "enclosingSymbol": "globalAssistantSend",
+      "occurrence": 1
+    },
+    {
+      "kind": "internalEdge",
+      "commandId": "vs-code-ai-helper.runReviewWithAI",
+      "path": "src/commands/reviewActions.ts",
+      "span": "L3267-L3270",
+      "enclosingSymbol": "viewReview",
+      "occurrence": 1
+    },
+    {
+      "kind": "internalEdge",
+      "commandId": "vs-code-ai-helper.runReviewWithAI",
+      "path": "src/commands/reviewCurrentTask.ts",
+      "span": "L41-L43",
+      "enclosingSymbol": "reviewCurrentTask",
+      "occurrence": 1
+    },
+    {
+      "kind": "internalEdge",
+      "commandId": "vs-code-ai-helper.applyCurrentStageAction",
+      "path": "src/commands/scheduleTaskResume.ts",
+      "span": "L109-L109",
+      "enclosingSymbol": "fire",
+      "occurrence": 1
+    },
+    {
+      "kind": "internalEdge",
+      "commandId": "vs-code-ai-helper.settingsView.focus",
+      "path": "src/extension.ts",
+      "span": "L326-L326",
+      "enclosingSymbol": "activate",
+      "occurrence": 1
+    },
+    {
+      "kind": "internalEdge",
+      "commandId": "vs-code-ai-helper.viewDisclaimer",
+      "path": "src/utils/aiConsent.ts",
+      "span": "L79-L81",
+      "enclosingSymbol": "ensureAiConsent",
+      "occurrence": 1
+    },
+    {
+      "kind": "internalEdge",
+      "commandId": "vs-code-ai-helper.applyCurrentStageAction",
+      "path": "src/utils/globalAssistantActions.ts",
+      "span": "L669-L671",
+      "enclosingSymbol": "execute",
+      "occurrence": 1
+    },
+    {
+      "kind": "internalEdge",
+      "commandId": "vs-code-ai-helper.setTaskStage",
+      "path": "src/utils/globalAssistantActions.ts",
+      "span": "L609-L612",
+      "enclosingSymbol": "execute",
+      "occurrence": 1
+    },
+    {
+      "kind": "internalEdge",
+      "commandId": "vs-code-ai-helper.startNewTask",
+      "path": "src/utils/globalAssistantActions.ts",
+      "span": "L387-L389",
+      "enclosingSymbol": "folderName",
+      "occurrence": 1
+    },
+    {
+      "kind": "internalEdge",
+      "commandId": "vs-code-ai-helper.unarchiveTask",
+      "path": "src/utils/globalAssistantActions.ts",
+      "span": "L442-L444",
+      "enclosingSymbol": "unarchiveOneTaskVerified",
+      "occurrence": 1
+    },
+    {
+      "kind": "internalEdge",
+      "commandId": "vs-code-ai-helper.openAiModels",
+      "path": "src/utils/modelSelection.ts",
+      "span": "L266-L266",
+      "enclosingSymbol": "ensureStageModelConfigured",
+      "occurrence": 1
+    },
+    {
+      "kind": "internalEdge",
+      "commandId": "vs-code-ai-helper.openAiModels",
+      "path": "src/utils/modelSelection.ts",
+      "span": "L276-L276",
+      "enclosingSymbol": "ensureStageModelConfigured",
+      "occurrence": 2
+    },
+    {
+      "kind": "internalEdge",
+      "commandId": "vs-code-ai-helper.chatWithStage",
+      "path": "src/views/chatView.ts",
+      "span": "L299-L302",
+      "enclosingSymbol": "resolveWebviewView",
+      "occurrence": 1
+    },
+    {
+      "kind": "internalEdge",
+      "commandId": "vs-code-ai-helper.globalAssistantSend",
+      "path": "src/views/chatView.ts",
+      "span": "L295-L297",
+      "enclosingSymbol": "resolveWebviewView",
+      "occurrence": 1
+    },
+    {
+      "kind": "internalEdge",
+      "commandId": "vs-code-ai-helper.statusView.focus",
+      "path": "src/views/statusView.ts",
+      "span": "L160-L160",
+      "enclosingSymbol": "addEntry",
+      "occurrence": 1
+    },
+    {
+      "kind": "providerEdge",
+      "callee": "resolveRunnerForModel",
+      "path": "src/commands/chatWithStage.ts",
+      "span": "L404-L404",
+      "enclosingSymbol": "chatWithStage",
+      "occurrence": 1
+    },
+    {
+      "kind": "providerEdge",
+      "callee": "resolveRunnerForModel",
+      "path": "src/commands/commitAndPushTask.ts",
+      "span": "L247-L247",
+      "enclosingSymbol": "buildCommitMessage",
+      "occurrence": 1
+    },
+    {
+      "kind": "providerEdge",
+      "callee": "resolveRunnerForModel",
+      "path": "src/commands/draftTaskWithAI.ts",
+      "span": "L570-L572",
+      "enclosingSymbol": "draftTaskWithAI",
+      "occurrence": 1
+    },
+    {
+      "kind": "providerEdge",
+      "callee": "resolveRunnerForModel",
+      "path": "src/commands/draftTaskWithAI.ts",
+      "span": "L901-L905",
+      "enclosingSymbol": "draftTaskWithAI",
+      "occurrence": 2
+    },
+    {
+      "kind": "providerEdge",
+      "callee": "resolveRunnerForModel",
+      "path": "src/commands/generatePlanWithAI.ts",
+      "span": "L272-L274",
+      "enclosingSymbol": "generatePlanWithAIForResolvedTask",
+      "occurrence": 1
+    },
+    {
+      "kind": "providerEdge",
+      "callee": "resolveRunnerForModel",
+      "path": "src/commands/openGeneralAssistant.ts",
+      "span": "L306-L306",
+      "enclosingSymbol": "globalAssistantSend",
+      "occurrence": 1
+    },
+    {
+      "kind": "providerEdge",
+      "callee": "resolveRunnerForModel",
+      "path": "src/commands/openGeneralAssistant.ts",
+      "span": "L181-L181",
+      "enclosingSymbol": "runGlobalAssistantWithFallback",
+      "occurrence": 1
+    },
+    {
+      "kind": "providerEdge",
+      "callee": "runImplementationForModel",
+      "path": "src/commands/reviewActions.ts",
+      "span": "L3851-L3865",
+      "enclosingSymbol": "executeImplementationRun",
+      "occurrence": 1
+    },
+    {
+      "kind": "providerEdge",
+      "callee": "resolveRunnerForModel",
+      "path": "src/commands/reviewActions.ts",
+      "span": "L886-L891",
+      "enclosingSymbol": "runAiToFile",
+      "occurrence": 1
+    },
+    {
+      "kind": "providerEdge",
+      "callee": "resolveRunnerForModel",
+      "path": "src/commands/reviewActions.ts",
+      "span": "L1131-L1131",
+      "enclosingSymbol": "runAiToFile",
+      "occurrence": 2
+    },
+    {
+      "kind": "providerEdge",
+      "callee": "resolveRunnerForModel",
+      "path": "src/commands/reviewActions.ts",
+      "span": "L1501-L1501",
+      "enclosingSymbol": "runSecondOpinionReview",
+      "occurrence": 1
+    },
+    {
+      "kind": "providerEdge",
+      "callee": "runImplementationForModel",
+      "path": "src/commands/runLintingFixes.ts",
+      "span": "L337-L337",
+      "enclosingSymbol": "runLintingFixes",
+      "occurrence": 1
+    },
+    {
+      "kind": "providerEdge",
+      "callee": "resolveRunnerForModel",
+      "path": "src/utils/completionLint.ts",
+      "span": "L388-L388",
+      "enclosingSymbol": "runAiPlanVerification",
+      "occurrence": 1
+    },
+    {
+      "kind": "webviewMessage",
+      "path": "src/views/chatView.ts",
+      "span": "L247-L304",
+      "handlerSymbol": "resolveWebviewView",
+      "fileGateRouteIds": [
+        "chatSend.v1"
+      ],
+      "fileEdgesOut": [
+        "vs-code-ai-helper.chatWithStage",
+        "vs-code-ai-helper.globalAssistantSend"
+      ]
+    },
+    {
+      "kind": "webviewMessage",
+      "path": "src/views/settingsView.ts",
+      "span": "L210-L407",
+      "handlerSymbol": "resolveWebviewView",
+      "fileGateRouteIds": [],
+      "fileEdgesOut": []
+    },
+    {
+      "kind": "writerEdge",
+      "propertyName": "outputFile",
+      "path": "src/commands/chatWithStage.ts",
+      "span": "L423-L423",
+      "enclosingSymbol": "result",
+      "occurrence": 1
+    },
+    {
+      "kind": "writerEdge",
+      "propertyName": "outputFile",
+      "path": "src/commands/commitAndPushTask.ts",
+      "span": "L259-L259",
+      "enclosingSymbol": "result",
+      "occurrence": 1
+    },
+    {
+      "kind": "writerEdge",
+      "propertyName": "outputFile",
+      "path": "src/commands/draftTaskWithAI.ts",
+      "span": "L675-L675",
+      "enclosingSymbol": "result",
+      "occurrence": 1
+    },
+    {
+      "kind": "writerEdge",
+      "propertyName": "outputFile",
+      "path": "src/commands/generatePlanWithAI.ts",
+      "span": "L369-L369",
+      "enclosingSymbol": "generatePlanWithAIForResolvedTask",
+      "occurrence": 1
+    },
+    {
+      "kind": "writerEdge",
+      "propertyName": "outputFile",
+      "path": "src/commands/openGeneralAssistant.ts",
+      "span": "L214-L214",
+      "enclosingSymbol": "result",
+      "occurrence": 1
+    },
+    {
+      "kind": "writerEdge",
+      "propertyName": "outputFile",
+      "path": "src/commands/openGeneralAssistant.ts",
+      "span": "L221-L221",
+      "enclosingSymbol": "runGlobalAssistantWithFallback",
+      "occurrence": 1
+    },
+    {
+      "kind": "writerEdge",
+      "propertyName": "outputFileUri",
+      "path": "src/commands/reviewActions.ts",
+      "span": "L2727-L2727",
+      "enclosingSymbol": "applySucceeded",
+      "occurrence": 1
+    },
+    {
+      "kind": "writerEdge",
+      "propertyName": "outputFileUri",
+      "path": "src/commands/reviewActions.ts",
+      "span": "L4147-L4147",
+      "enclosingSymbol": "generated",
+      "occurrence": 1
+    },
+    {
+      "kind": "writerEdge",
+      "propertyName": "outputFile",
+      "path": "src/commands/reviewActions.ts",
+      "span": "L965-L965",
+      "enclosingSymbol": "result",
+      "occurrence": 1
+    },
+    {
+      "kind": "writerEdge",
+      "propertyName": "outputFile",
+      "path": "src/commands/reviewActions.ts",
+      "span": "L1536-L1536",
+      "enclosingSymbol": "result",
+      "occurrence": 2
+    },
+    {
+      "kind": "writerEdge",
+      "propertyName": "outputFileUri",
+      "path": "src/commands/reviewActions.ts",
+      "span": "L1973-L1973",
+      "enclosingSymbol": "reviewWritten",
+      "occurrence": 1
+    },
+    {
+      "kind": "writerEdge",
+      "propertyName": "outputFile",
+      "path": "src/commands/reviewActions.ts",
+      "span": "L1147-L1147",
+      "enclosingSymbol": "runAiToFile",
+      "occurrence": 1
+    },
+    {
+      "kind": "writerEdge",
+      "propertyName": "outputFileUri",
+      "path": "src/commands/reviewActions.ts",
+      "span": "L3719-L3719",
+      "enclosingSymbol": "succeeded",
+      "occurrence": 1
+    },
+    {
+      "kind": "writerEdge",
+      "propertyName": "outputFile",
+      "path": "src/runners/cliAgentRunner.ts",
+      "span": "L2123-L2123",
+      "enclosingSymbol": "run",
+      "occurrence": 1
+    },
+    {
+      "kind": "writerEdge",
+      "propertyName": "outputFile",
+      "path": "src/runners/copilotLanguageModelRunner.ts",
+      "span": "L178-L178",
+      "enclosingSymbol": "run",
+      "occurrence": 1
+    },
+    {
+      "kind": "writerEdge",
+      "propertyName": "outputFile",
+      "path": "src/utils/completionLint.ts",
+      "span": "L416-L416",
+      "enclosingSymbol": "result",
+      "occurrence": 1
+    }
+  ],
+  "dynamicDispatches": [
+    {
+      "path": "src/commands/applyCurrentStageAction.ts",
+      "span": "L71-L74",
+      "enclosingSymbol": "execute",
+      "expressionText": "command"
+    },
+    {
+      "path": "src/utils/automationChain.ts",
+      "span": "L58-L58",
+      "enclosingSymbol": "defaultDeps",
+      "expressionText": "command"
+    },
+    {
+      "path": "src/utils/globalAssistantActions.ts",
+      "span": "L301-L303",
+      "enclosingSymbol": "execute",
+      "expressionText": "options.command"
+    },
+    {
+      "path": "src/views/chatView.ts",
+      "span": "L327-L327",
+      "enclosingSymbol": "open",
+      "expressionText": "`${ChatViewProvider.viewType}.focus`"
+    },
+    {
+      "path": "src/views/settingsView.ts",
+      "span": "L147-L147",
+      "enclosingSymbol": "tryRun",
+      "expressionText": "id"
+    },
+    {
+      "path": "src/views/settingsView.ts",
+      "span": "L286-L286",
+      "enclosingSymbol": "resolveWebviewView",
+      "expressionText": "command"
+    },
+    {
+      "path": "src/views/settingsView.ts",
+      "span": "L354-L354",
+      "enclosingSymbol": "resolveWebviewView",
+      "expressionText": "usage.command"
+    },
+    {
+      "path": "src/views/settingsView.ts",
+      "span": "L358-L358",
+      "enclosingSymbol": "resolveWebviewView",
+      "expressionText": "usage.fallbackCommand"
+    },
+    {
+      "path": "src/views/statusView.ts",
+      "span": "L349-L349",
+      "enclosingSymbol": "runAction",
+      "expressionText": "command"
+    },
+    {
+      "path": "src/views/taskStatusBar.ts",
+      "span": "L159-L159",
+      "enclosingSymbol": "showMenu",
+      "expressionText": "selected.command"
+    }
+  ],
+  "unresolvedRegistrations": [],
+  "commandEdges": [
+    {
+      "commandId": "vs-code-ai-helper.applyReviewWithAI",
+      "path": "src/commands/applyHighLevelReviewChanges.ts",
+      "span": "L55-L57",
+      "enclosingSymbol": "applyHighLevelReviewChanges"
+    },
+    {
+      "commandId": "vs-code-ai-helper.applyReviewWithAI",
+      "path": "src/commands/applyLowLevelReviewChanges.ts",
+      "span": "L55-L57",
+      "enclosingSymbol": "applyLowLevelReviewChanges"
+    },
+    {
+      "commandId": "vs-code-ai-helper.fastForwardReviewWithAI",
+      "path": "src/commands/fastForwardCurrentTaskReview.ts",
+      "span": "L41-L43",
+      "enclosingSymbol": "fastForwardCurrentTaskReview"
+    },
+    {
+      "commandId": "vs-code-ai-helper.openAiModels",
+      "path": "src/commands/openGeneralAssistant.ts",
+      "span": "L283-L283",
+      "enclosingSymbol": "globalAssistantSend"
+    },
+    {
+      "commandId": "vs-code-ai-helper.runReviewWithAI",
+      "path": "src/commands/reviewActions.ts",
+      "span": "L3267-L3270",
+      "enclosingSymbol": "viewReview"
+    },
+    {
+      "commandId": "vs-code-ai-helper.runReviewWithAI",
+      "path": "src/commands/reviewCurrentTask.ts",
+      "span": "L41-L43",
+      "enclosingSymbol": "reviewCurrentTask"
+    },
+    {
+      "commandId": "vs-code-ai-helper.applyCurrentStageAction",
+      "path": "src/commands/scheduleTaskResume.ts",
+      "span": "L109-L109",
+      "enclosingSymbol": "fire"
+    },
+    {
+      "commandId": "vs-code-ai-helper.settingsView.focus",
+      "path": "src/extension.ts",
+      "span": "L326-L326",
+      "enclosingSymbol": "activate"
+    },
+    {
+      "commandId": "vs-code-ai-helper.viewDisclaimer",
+      "path": "src/utils/aiConsent.ts",
+      "span": "L79-L81",
+      "enclosingSymbol": "ensureAiConsent"
+    },
+    {
+      "commandId": "vs-code-ai-helper.startNewTask",
+      "path": "src/utils/globalAssistantActions.ts",
+      "span": "L387-L389",
+      "enclosingSymbol": "folderName"
+    },
+    {
+      "commandId": "vs-code-ai-helper.unarchiveTask",
+      "path": "src/utils/globalAssistantActions.ts",
+      "span": "L442-L444",
+      "enclosingSymbol": "unarchiveOneTaskVerified"
+    },
+    {
+      "commandId": "vs-code-ai-helper.setTaskStage",
+      "path": "src/utils/globalAssistantActions.ts",
+      "span": "L609-L612",
+      "enclosingSymbol": "execute"
+    },
+    {
+      "commandId": "vs-code-ai-helper.applyCurrentStageAction",
+      "path": "src/utils/globalAssistantActions.ts",
+      "span": "L669-L671",
+      "enclosingSymbol": "execute"
+    },
+    {
+      "commandId": "vs-code-ai-helper.openAiModels",
+      "path": "src/utils/modelSelection.ts",
+      "span": "L266-L266",
+      "enclosingSymbol": "ensureStageModelConfigured"
+    },
+    {
+      "commandId": "vs-code-ai-helper.openAiModels",
+      "path": "src/utils/modelSelection.ts",
+      "span": "L276-L276",
+      "enclosingSymbol": "ensureStageModelConfigured"
+    },
+    {
+      "commandId": "vs-code-ai-helper.globalAssistantSend",
+      "path": "src/views/chatView.ts",
+      "span": "L295-L297",
+      "enclosingSymbol": "resolveWebviewView"
+    },
+    {
+      "commandId": "vs-code-ai-helper.chatWithStage",
+      "path": "src/views/chatView.ts",
+      "span": "L299-L302",
+      "enclosingSymbol": "resolveWebviewView"
+    },
+    {
+      "commandId": "vs-code-ai-helper.statusView.focus",
+      "path": "src/views/statusView.ts",
+      "span": "L160-L160",
+      "enclosingSymbol": "addEntry"
+    }
+  ],
+  "providerBoundaryCalls": [
+    {
+      "callee": "resolveRunnerForModel",
+      "path": "src/commands/chatWithStage.ts",
+      "span": "L404-L404",
+      "enclosingSymbol": "chatWithStage"
+    },
+    {
+      "callee": "resolveRunnerForModel",
+      "path": "src/commands/commitAndPushTask.ts",
+      "span": "L247-L247",
+      "enclosingSymbol": "buildCommitMessage"
+    },
+    {
+      "callee": "resolveRunnerForModel",
+      "path": "src/commands/draftTaskWithAI.ts",
+      "span": "L570-L572",
+      "enclosingSymbol": "draftTaskWithAI"
+    },
+    {
+      "callee": "resolveRunnerForModel",
+      "path": "src/commands/draftTaskWithAI.ts",
+      "span": "L901-L905",
+      "enclosingSymbol": "draftTaskWithAI"
+    },
+    {
+      "callee": "resolveRunnerForModel",
+      "path": "src/commands/generatePlanWithAI.ts",
+      "span": "L272-L274",
+      "enclosingSymbol": "generatePlanWithAIForResolvedTask"
+    },
+    {
+      "callee": "resolveRunnerForModel",
+      "path": "src/commands/openGeneralAssistant.ts",
+      "span": "L181-L181",
+      "enclosingSymbol": "runGlobalAssistantWithFallback"
+    },
+    {
+      "callee": "resolveRunnerForModel",
+      "path": "src/commands/openGeneralAssistant.ts",
+      "span": "L306-L306",
+      "enclosingSymbol": "globalAssistantSend"
+    },
+    {
+      "callee": "resolveRunnerForModel",
+      "path": "src/commands/reviewActions.ts",
+      "span": "L1131-L1131",
+      "enclosingSymbol": "runAiToFile"
+    },
+    {
+      "callee": "resolveRunnerForModel",
+      "path": "src/commands/reviewActions.ts",
+      "span": "L1501-L1501",
+      "enclosingSymbol": "runSecondOpinionReview"
+    },
+    {
+      "callee": "runImplementationForModel",
+      "path": "src/commands/reviewActions.ts",
+      "span": "L3851-L3865",
+      "enclosingSymbol": "executeImplementationRun"
+    },
+    {
+      "callee": "resolveRunnerForModel",
+      "path": "src/commands/reviewActions.ts",
+      "span": "L886-L891",
+      "enclosingSymbol": "runAiToFile"
+    },
+    {
+      "callee": "runImplementationForModel",
+      "path": "src/commands/runLintingFixes.ts",
+      "span": "L337-L337",
+      "enclosingSymbol": "runLintingFixes"
+    },
+    {
+      "callee": "resolveRunnerForModel",
+      "path": "src/utils/completionLint.ts",
+      "span": "L388-L388",
+      "enclosingSymbol": "runAiPlanVerification"
+    }
+  ],
+  "legacyOutputDestinations": [
+    {
+      "propertyName": "outputFile",
+      "path": "src/commands/chatWithStage.ts",
+      "span": "L423-L423",
+      "enclosingSymbol": "result"
+    },
+    {
+      "propertyName": "outputFile",
+      "path": "src/commands/commitAndPushTask.ts",
+      "span": "L259-L259",
+      "enclosingSymbol": "result"
+    },
+    {
+      "propertyName": "outputFile",
+      "path": "src/commands/draftTaskWithAI.ts",
+      "span": "L675-L675",
+      "enclosingSymbol": "result"
+    },
+    {
+      "propertyName": "outputFile",
+      "path": "src/commands/generatePlanWithAI.ts",
+      "span": "L369-L369",
+      "enclosingSymbol": "generatePlanWithAIForResolvedTask"
+    },
+    {
+      "propertyName": "outputFile",
+      "path": "src/commands/openGeneralAssistant.ts",
+      "span": "L214-L214",
+      "enclosingSymbol": "result"
+    },
+    {
+      "propertyName": "outputFile",
+      "path": "src/commands/openGeneralAssistant.ts",
+      "span": "L221-L221",
+      "enclosingSymbol": "runGlobalAssistantWithFallback"
+    },
+    {
+      "propertyName": "outputFile",
+      "path": "src/commands/reviewActions.ts",
+      "span": "L1147-L1147",
+      "enclosingSymbol": "runAiToFile"
+    },
+    {
+      "propertyName": "outputFile",
+      "path": "src/commands/reviewActions.ts",
+      "span": "L1536-L1536",
+      "enclosingSymbol": "result"
+    },
+    {
+      "propertyName": "outputFileUri",
+      "path": "src/commands/reviewActions.ts",
+      "span": "L1973-L1973",
+      "enclosingSymbol": "reviewWritten"
+    },
+    {
+      "propertyName": "outputFileUri",
+      "path": "src/commands/reviewActions.ts",
+      "span": "L2727-L2727",
+      "enclosingSymbol": "applySucceeded"
+    },
+    {
+      "propertyName": "outputFileUri",
+      "path": "src/commands/reviewActions.ts",
+      "span": "L3719-L3719",
+      "enclosingSymbol": "succeeded"
+    },
+    {
+      "propertyName": "outputFileUri",
+      "path": "src/commands/reviewActions.ts",
+      "span": "L4147-L4147",
+      "enclosingSymbol": "generated"
+    },
+    {
+      "propertyName": "outputFile",
+      "path": "src/commands/reviewActions.ts",
+      "span": "L965-L965",
+      "enclosingSymbol": "result"
+    },
+    {
+      "propertyName": "outputFile",
+      "path": "src/runners/cliAgentRunner.ts",
+      "span": "L2123-L2123",
+      "enclosingSymbol": "run"
+    },
+    {
+      "propertyName": "outputFile",
+      "path": "src/runners/copilotLanguageModelRunner.ts",
+      "span": "L178-L178",
+      "enclosingSymbol": "run"
+    },
+    {
+      "propertyName": "outputFile",
+      "path": "src/utils/completionLint.ts",
+      "span": "L416-L416",
+      "enclosingSymbol": "result"
+    }
+  ],
+  "gateCalls": [
+    {
+      "routeId": "applyCurrentStage.v1",
+      "gateKind": "throwing",
+      "path": "src/commands/applyCurrentStageAction.ts",
+      "span": "L30-L30",
+      "enclosingSymbol": "applyCurrentStageAction"
+    },
+    {
+      "routeId": "applyReview.v1",
+      "gateKind": "throwing",
+      "path": "src/commands/applyHighLevelReviewChanges.ts",
+      "span": "L19-L19",
+      "enclosingSymbol": "applyHighLevelReviewChanges"
+    },
+    {
+      "routeId": "applyReview.v1",
+      "gateKind": "throwing",
+      "path": "src/commands/applyLowLevelReviewChanges.ts",
+      "span": "L19-L19",
+      "enclosingSymbol": "applyLowLevelReviewChanges"
+    },
+    {
+      "routeId": "chatSend.v1",
+      "gateKind": "throwing",
+      "path": "src/commands/chatWithStage.ts",
+      "span": "L351-L351",
+      "enclosingSymbol": "chatWithStage"
+    },
+    {
+      "routeId": "commitPushMetadata.v1",
+      "gateKind": "query",
+      "path": "src/commands/commitAndPushTask.ts",
+      "span": "L218-L218",
+      "enclosingSymbol": "buildCommitMessage"
+    },
+    {
+      "routeId": "draft.v1",
+      "gateKind": "throwing",
+      "path": "src/commands/draftTaskWithAI.ts",
+      "span": "L467-L467",
+      "enclosingSymbol": "draftTaskWithAI"
+    },
+    {
+      "routeId": "fastForward.v1",
+      "gateKind": "throwing",
+      "path": "src/commands/fastForwardCurrentTaskReview.ts",
+      "span": "L19-L19",
+      "enclosingSymbol": "fastForwardCurrentTaskReview"
+    },
+    {
+      "routeId": "generatePlan.v1",
+      "gateKind": "throwing",
+      "path": "src/commands/generatePlanWithAI.ts",
+      "span": "L141-L141",
+      "enclosingSymbol": "generatePlanWithAI"
+    },
+    {
+      "routeId": "review.v1",
+      "gateKind": "throwing",
+      "path": "src/commands/reviewActions.ts",
+      "span": "L2449-L2449",
+      "enclosingSymbol": "runReviewWithAI"
+    },
+    {
+      "routeId": "applyReview.v1",
+      "gateKind": "throwing",
+      "path": "src/commands/reviewActions.ts",
+      "span": "L2546-L2546",
+      "enclosingSymbol": "applyReviewWithAI"
+    },
+    {
+      "routeId": "fastForward.v1",
+      "gateKind": "throwing",
+      "path": "src/commands/reviewActions.ts",
+      "span": "L2805-L2805",
+      "enclosingSymbol": "fastForwardReviewWithAI"
+    },
+    {
+      "routeId": "generateImplementation.v1",
+      "gateKind": "throwing",
+      "path": "src/commands/reviewActions.ts",
+      "span": "L3626-L3626",
+      "enclosingSymbol": "generateImplementationWithAI"
+    },
+    {
+      "routeId": "implementation.v1",
+      "gateKind": "throwing",
+      "path": "src/commands/reviewActions.ts",
+      "span": "L4046-L4046",
+      "enclosingSymbol": "runImplementationWithAI"
+    },
+    {
+      "routeId": "review.v1",
+      "gateKind": "throwing",
+      "path": "src/commands/reviewCurrentTask.ts",
+      "span": "L19-L19",
+      "enclosingSymbol": "reviewCurrentTask"
+    },
+    {
+      "routeId": "lint.v1",
+      "gateKind": "throwing",
+      "path": "src/commands/runLintingFixes.ts",
+      "span": "L113-L113",
+      "enclosingSymbol": "runLintingFixes"
+    },
+    {
+      "routeId": "chatSend.v1",
+      "gateKind": "throwing",
+      "path": "src/views/chatView.ts",
+      "span": "L283-L283",
+      "enclosingSymbol": "resolveWebviewView"
+    }
+  ]
+}

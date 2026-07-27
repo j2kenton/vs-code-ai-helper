@@ -1,0 +1,294 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://ensemble.ai/schemas/chat-interaction-transaction-v1.schema.json",
+  "title": "ChatInteractionTransactionV1",
+  "description": "The persisted Chat interaction transaction record (plan §5.5), stored at chat-transactions/<operation-id>/transaction-v1.json under registered private storage. One record per question-returning operation. Unknown properties are rejected at every level. Constraints draft-07 cannot express — digest correctness (questionSetSha256, answersSha256, inputSnapshot.sha256 recomputed over canonical bytes), canonical-form verification of inputSnapshot.canonicalJson, the transition-receipt chain rules (first receipt from null, each receipt chaining from its predecessor, legal edges only, final receipt ending at the record's state), per-state field-presence rules, settlement/resumeSemantics/resumeResolution consistency, the Resume settlement chain rule (a resumed / supersededByReplacementOperation settlement must settle from a resumeScheduled receipt, and a resumeIdempotencyId is present exactly when the chain entered resumeScheduled), §3.6 answer validation against the question set, and the 1 MiB record / 256 KiB snapshot byte limits — are enforced by the runtime decoder (src/types/chatInteractionTransactionV1.ts) and pinned by src/test/chatInteractionTransactionStoreV1.test.ts against the fixtures under test-fixtures/chat-transactions/.",
+  "type": "object",
+  "properties": {
+    "schemaVersion": { "type": "integer", "const": 1 },
+    "actionKey": { "type": "string", "minLength": 1 },
+    "operationId": { "$ref": "#/definitions/hex128Id" },
+    "sourceAttemptId": { "$ref": "#/definitions/hex128Id" },
+    "taskBindingId": { "type": "string", "minLength": 1 },
+    "chatDocumentId": { "type": "string", "minLength": 1 },
+    "interactionId": { "$ref": "#/definitions/hex128Id" },
+    "stage": {
+      "type": "string",
+      "enum": [
+        "desc",
+        "plan",
+        "plan-high-review",
+        "plan-low-review",
+        "impl",
+        "impl-high-review",
+        "impl-low-review",
+        "publish"
+      ]
+    },
+    "resumeSemantics": { "type": "string", "enum": ["sameOperation", "replacementOperation"] },
+    "inputSnapshot": {
+      "type": "object",
+      "properties": {
+        "canonicalJson": { "type": "string", "minLength": 1 },
+        "sha256": { "$ref": "#/definitions/sha256Hex" }
+      },
+      "required": ["canonicalJson", "sha256"],
+      "additionalProperties": false
+    },
+    "promptContract": {
+      "type": "object",
+      "properties": {
+        "contractId": { "type": "string", "pattern": "^[\\x21-\\x7E]{1,128}$" },
+        "contractVersion": { "type": "integer", "minimum": 1 },
+        "promptInputSha256": { "$ref": "#/definitions/sha256Hex" }
+      },
+      "required": ["contractId", "contractVersion", "promptInputSha256"],
+      "additionalProperties": false
+    },
+    "questions": { "$ref": "structured-question-v1.schema.json" },
+    "questionSetSha256": { "$ref": "#/definitions/sha256Hex" },
+    "answers": { "$ref": "structured-answer-v1.schema.json" },
+    "answerIdempotencyId": { "$ref": "#/definitions/hex128Id" },
+    "answersSha256": { "$ref": "#/definitions/sha256Hex" },
+    "resumeIdempotencyId": { "$ref": "#/definitions/hex128Id" },
+    "state": {
+      "type": "string",
+      "enum": ["questionsPosted", "answersDraft", "answersSubmitted", "resumeScheduled", "settled"]
+    },
+    "settlement": {
+      "type": "string",
+      "enum": ["resumed", "cancelled", "supersededByReplacementOperation", "expired", "resetByChatRecovery"]
+    },
+    "resumeResolution": {
+      "oneOf": [
+        {
+          "title": "sameOperation",
+          "type": "object",
+          "properties": {
+            "kind": { "type": "string", "const": "sameOperation" },
+            "newAttemptId": { "$ref": "#/definitions/hex128Id" }
+          },
+          "required": ["kind", "newAttemptId"],
+          "additionalProperties": false
+        },
+        {
+          "title": "replacementOperation",
+          "type": "object",
+          "properties": {
+            "kind": { "type": "string", "const": "replacementOperation" },
+            "replacementOperationId": { "$ref": "#/definitions/hex128Id" }
+          },
+          "required": ["kind", "replacementOperationId"],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "resumeInvocationClaimedAt": { "type": "string" },
+    "resumeInvocationOutcome": { "$ref": "#/definitions/taskActionOutcome" },
+    "transitions": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 8,
+      "items": { "$ref": "#/definitions/transitionReceipt" }
+    }
+  },
+  "required": [
+    "schemaVersion",
+    "actionKey",
+    "operationId",
+    "sourceAttemptId",
+    "taskBindingId",
+    "chatDocumentId",
+    "interactionId",
+    "stage",
+    "resumeSemantics",
+    "inputSnapshot",
+    "promptContract",
+    "questions",
+    "questionSetSha256",
+    "state",
+    "transitions"
+  ],
+  "additionalProperties": false,
+  "definitions": {
+    "hex128Id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$"
+    },
+    "sha256Hex": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "transitionReceipt": {
+      "type": "object",
+      "properties": {
+        "receiptId": { "$ref": "#/definitions/hex128Id" },
+        "from": {
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "string",
+              "enum": ["questionsPosted", "answersDraft", "answersSubmitted", "resumeScheduled"]
+            }
+          ]
+        },
+        "to": {
+          "type": "string",
+          "enum": ["questionsPosted", "answersDraft", "answersSubmitted", "resumeScheduled", "settled"]
+        },
+        "at": { "type": "string" }
+      },
+      "required": ["receiptId", "from", "to", "at"],
+      "additionalProperties": false
+    },
+    "correlation": {
+      "type": "object",
+      "properties": {
+        "actionKey": { "type": "string", "minLength": 1 },
+        "operationId": { "$ref": "#/definitions/hex128Id" },
+        "attemptId": { "$ref": "#/definitions/hex128Id" },
+        "taskBindingId": { "type": "string", "minLength": 1 },
+        "chatDocumentId": { "type": "string", "minLength": 1 }
+      },
+      "required": ["actionKey", "operationId", "attemptId", "taskBindingId", "chatDocumentId"],
+      "additionalProperties": false
+    },
+    "taskActionOutcome": {
+      "description": "Closed TaskActionOutcomeV1 mirror (plan §3.7 / §3.1's 'recover the claimed terminal result'), stored verbatim -- §2.2-permitted correlation ids, codes, and digests only, never provider text.",
+      "oneOf": [
+        {
+          "title": "completed",
+          "type": "object",
+          "properties": {
+            "kind": { "const": "completed" },
+            "correlation": { "$ref": "#/definitions/correlation" },
+            "code": { "enum": ["completed", "noChanges"] }
+          },
+          "required": ["kind", "correlation", "code"],
+          "additionalProperties": false
+        },
+        {
+          "title": "questions",
+          "type": "object",
+          "properties": {
+            "kind": { "const": "questions" },
+            "correlation": { "$ref": "#/definitions/correlation" },
+            "interactionId": { "type": "string", "minLength": 1 }
+          },
+          "required": ["kind", "correlation", "interactionId"],
+          "additionalProperties": false
+        },
+        {
+          "title": "cancelled",
+          "type": "object",
+          "properties": {
+            "kind": { "const": "cancelled" },
+            "correlation": { "$ref": "#/definitions/correlation" },
+            "code": { "enum": ["userCancelled", "providerCancelled"] }
+          },
+          "required": ["kind", "code"],
+          "additionalProperties": false
+        },
+        {
+          "title": "failed",
+          "type": "object",
+          "properties": {
+            "kind": { "const": "failed" },
+            "correlation": { "$ref": "#/definitions/correlation" },
+            "code": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" },
+            "retryable": { "type": "boolean" }
+          },
+          "required": ["kind", "code", "retryable"],
+          "additionalProperties": false
+        },
+        {
+          "title": "malformedResult",
+          "type": "object",
+          "properties": {
+            "kind": { "const": "malformedResult" },
+            "correlation": { "$ref": "#/definitions/correlation" },
+            "code": {
+              "enum": [
+                "invalidFrame",
+                "invalidJson",
+                "invalidEnvelope",
+                "contentSchemaMismatch",
+                "resultCorrelationMismatch",
+                "resultLimitExceeded"
+              ]
+            }
+          },
+          "required": ["kind", "correlation", "code"],
+          "additionalProperties": false
+        },
+        {
+          "title": "unavailable",
+          "type": "object",
+          "properties": {
+            "kind": { "const": "unavailable" },
+            "code": {
+              "enum": [
+                "hostToolApiUnavailable",
+                "providerModeUnavailable",
+                "workspaceRootUnsupported",
+                "workspacePathUnsafe",
+                "workflowStorageUnavailable"
+              ]
+            }
+          },
+          "required": ["kind", "code"],
+          "additionalProperties": false
+        },
+        {
+          "title": "recoveryRequired",
+          "type": "object",
+          "properties": {
+            "kind": { "const": "recoveryRequired" },
+            "code": {
+              "enum": [
+                "taskProgressRecoveryRequired",
+                "chatRecoveryRequired",
+                "taskCreationRecoveryRequired"
+              ]
+            }
+          },
+          "required": ["kind", "code"],
+          "additionalProperties": false
+        },
+        {
+          "title": "stalePreflight",
+          "type": "object",
+          "properties": {
+            "kind": { "const": "stalePreflight" },
+            "correlation": { "$ref": "#/definitions/correlation" },
+            "planId": { "type": "string", "minLength": 1 }
+          },
+          "required": ["kind", "correlation", "planId"],
+          "additionalProperties": false
+        },
+        {
+          "title": "partialEditBlocked",
+          "type": "object",
+          "properties": {
+            "kind": { "const": "partialEditBlocked" },
+            "correlation": { "$ref": "#/definitions/correlation" },
+            "executionId": { "type": "string", "minLength": 1 },
+            "appliedReceiptIds": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+          },
+          "required": ["kind", "correlation", "executionId", "appliedReceiptIds"],
+          "additionalProperties": false
+        },
+        {
+          "title": "duplicateRejected",
+          "type": "object",
+          "properties": {
+            "kind": { "const": "duplicateRejected" },
+            "code": { "const": "operationAlreadyRunning" }
+          },
+          "required": ["kind", "code"],
+          "additionalProperties": false
+        }
+      ]
+    }
+  }
+}

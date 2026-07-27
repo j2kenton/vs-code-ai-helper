@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "data": {
+    "taskFolder": "2026-07-01_task_3",
+    "currentStage": "plan-final",
+    "createdAt": "2026-07-01T10:00:00.000Z",
+    "updatedAt": "2026-07-01T10:00:00.000Z",
+    "legacyNote": "opaque inside the historical envelope"
+  }
+}

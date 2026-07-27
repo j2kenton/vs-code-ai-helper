@@ -1,0 +1,34 @@
+[
+  {
+    "questionId": "q1",
+    "kind": "text",
+    "prompt": "Describe the problem",
+    "required": true,
+    "allowBlank": false,
+    "maxLength": 1000
+  },
+  {
+    "questionId": "q2",
+    "kind": "singleChoice",
+    "prompt": "Choose severity",
+    "required": true,
+    "options": [
+      { "optionId": "low", "label": "Low" },
+      { "optionId": "med", "label": "Medium" },
+      { "optionId": "high", "label": "High" }
+    ]
+  },
+  {
+    "questionId": "q3",
+    "kind": "multipleChoice",
+    "prompt": "Affected components",
+    "required": false,
+    "minSelections": 0,
+    "maxSelections": 3,
+    "options": [
+      { "optionId": "ui", "label": "UI" },
+      { "optionId": "api", "label": "API" },
+      { "optionId": "db", "label": "Database" }
+    ]
+  }
+]

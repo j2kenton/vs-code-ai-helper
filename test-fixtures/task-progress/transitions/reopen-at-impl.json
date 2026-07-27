@@ -1,0 +1,29 @@
+{
+  "transition": "reopen",
+  "now": "2026-07-10T09:00:00.000Z",
+  "selectedStage": "impl",
+  "input": {
+    "taskFolder": "2026-07-01_task_5",
+    "currentStage": "publish",
+    "status": "completed",
+    "completedAt": "2026-07-09T00:00:00.000Z",
+    "createdAt": "2026-07-01T10:00:00.000Z",
+    "updatedAt": "2026-07-09T00:00:00.000Z",
+    "completedStages": ["publish"],
+    "implReviewFiles": ["src/a.ts"],
+    "fallbackActive": { "plan": true, "impl": true },
+    "fallbackModelId": { "plan": "model-a", "impl": "model-b" }
+  },
+  "expected": {
+    "ensembleProgressVersion": 1,
+    "taskFolder": "2026-07-01_task_5",
+    "currentStage": "impl",
+    "status": "active",
+    "createdAt": "2026-07-01T10:00:00.000Z",
+    "updatedAt": "2026-07-10T09:00:00.000Z",
+    "completedStages": ["desc", "plan", "plan-high-review", "plan-low-review"],
+    "implReviewFiles": [],
+    "fallbackActive": { "plan": true, "impl": false },
+    "fallbackModelId": { "plan": "model-a" }
+  }
+}

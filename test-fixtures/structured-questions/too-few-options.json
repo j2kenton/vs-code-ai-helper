@@ -1,0 +1,11 @@
+[
+  {
+    "questionId": "q1",
+    "kind": "singleChoice",
+    "prompt": "Only one option",
+    "required": true,
+    "options": [
+      { "optionId": "only", "label": "Only" }
+    ]
+  }
+]

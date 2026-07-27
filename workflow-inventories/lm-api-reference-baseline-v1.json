@@ -1,0 +1,50 @@
+{
+  "schemaVersion": 1,
+  "generatedBy": "manual (plan §1.6 slice); scripts/verifyVscodeLmApiBoundary.mjs enforces this baseline on every run",
+  "description": "Every post-1.93 VS Code Language Model tool-calling symbol the extension depends on, and where its runtime isolation lives. `package.json` still declares `engines.vscode: ^1.93.0`; these are the symbols that are NOT part of the earlier, simpler `vscode.lm` surface (selectChatModels, LanguageModelChat, sendRequest, response.text) every runner already uses.",
+  "boundaryModule": "src/services/vscodeLmCompat.ts",
+  "neutralTypesModule": "src/types/vscodeLmCompatV1.ts",
+  "symbols": [
+    {
+      "name": "LanguageModelTextPart",
+      "kind": "constructor",
+      "isolatedVia": ["isLmTextPartV1", "createLmTextPartV1", "iterateLmResponsePartsV1"],
+      "onlyProductionConsumer": "src/runners/copilotImplementationRunner.ts"
+    },
+    {
+      "name": "LanguageModelToolCallPart",
+      "kind": "constructor",
+      "isolatedVia": ["isLmToolCallPartV1", "toNeutralToolCallV1", "iterateLmResponsePartsV1"],
+      "onlyProductionConsumer": "src/runners/copilotImplementationRunner.ts"
+    },
+    {
+      "name": "LanguageModelToolResultPart",
+      "kind": "constructor",
+      "isolatedVia": ["createLmToolResultPartV1"],
+      "onlyProductionConsumer": "src/runners/copilotImplementationRunner.ts"
+    },
+    {
+      "name": "LanguageModelChatRequestOptions",
+      "kind": "request-option-type",
+      "isolatedVia": ["LmChatRequestOptionsV1", "attachLmToolsV1"],
+      "onlyProductionConsumer": "src/runners/copilotModelResolution.ts, src/runners/copilotImplementationRunner.ts",
+      "note": "The plain (no-tools) shape is also used by the simpler text runner (copilotLanguageModelRunner.ts) via buildCopilotRequestOptions; only the tool-calling runner attaches `tools` via attachLmToolsV1."
+    },
+    {
+      "name": "response.stream (tool-calling shape)",
+      "kind": "response-stream-shape",
+      "isolatedVia": ["iterateLmResponsePartsV1", "LmChatResponseV1"],
+      "onlyProductionConsumer": "src/runners/copilotImplementationRunner.ts",
+      "note": "The simpler response.text shape used by copilotLanguageModelRunner.ts is NOT isolated — it is part of the earlier, always-supported vscode.lm surface."
+    }
+  ],
+  "documentedExceptions": [],
+  "documentedExceptionsNote": "Formerly two message hand-off casts in copilotImplementationRunner.ts (LanguageModelTextPart/ToolCallPart at the Assistant() hand-off, LanguageModelToolResultPart at the User() hand-off). Both were eliminated when the boundary was rewritten to guarded-unknown structural access for the 1.93 pin: the parts-array casts now live inside vscodeLmCompat.ts's createLmAssistantMessageWithPartsV1/createLmUserMessageWithPartsV1 builders, and the verifier's allow-list is empty.",
+  "verifiedBy": "scripts/verifyVscodeLmApiBoundary.mjs",
+  "notCoveredYet": [
+    "Real VS Code 1.93.0/1.100.0/1.110.0 host-matrix acceptance (AC-HOST-02/03) has not been run — see lm-host-capability-v1.json for the capability contract those hosts would be asserting against."
+  ],
+  "resolvedSincePreviousRevision": [
+    "@types/vscode IS now pinned to exactly 1.93.0 in package.json and pnpm-lock.yaml (plan §1.6 step 6), and production, test, and 1.93-compat builds all compile against the pinned declarations (check-types, tsconfig.test.json, check-types:vscode-1.93-compat)."
+  ]
+}

@@ -10,6 +10,7 @@ import {
 
 import { NotificationRouter } from "../utils/notificationRouter";
 import { runTrackedOperation } from "../utils/taskOperations";
+import { LegacyCreatingStartupGateV0 } from "../state/legacyCreatingStartupGateV0";
 
 /**
  * Accepted argument shapes for pauseTask.
@@ -85,6 +86,12 @@ export async function pauseTask(
   currentTaskStore: CurrentTaskStore,
   explicitArg?: PauseTaskArg
 ): Promise<void> {
+  // Block on the startup gate's classification pass before this lifecycle
+  // command's first task-state read, so it cannot race the read-only
+  // creating-folder reconciliation extension.ts kicks off during activate()
+  // — same barrier contract as startNewTask/resumeTask (plan §1.4).
+  await LegacyCreatingStartupGateV0.waitUntilReady();
+
   const hasExplicitTask = pauseTaskArgHasExplicitTask(explicitArg);
   const resolverArg = normalizePauseTaskArg(explicitArg);
   const resolvedTask = await resolveTaskContext(

@@ -6,6 +6,36 @@ import { validatePersistedTaskProgress } from "./persistedSchema";
 // Unique session ID for this extension activation
 const sessionId = `${process.pid}_${Math.random().toString(36).substring(2, 10)}`;
 
+/**
+ * Atomic-write temporary-file naming convention:
+ * `<base>_temp_<sessionId>_<time>_<rand>.tmp<ext>`. A crash between the temp
+ * write and the rename leaves these records on disk next to the file they
+ * were meant to replace, so the privacy classifier
+ * (services/workflowPrivacyClassifierV1.ts) treats any basename matching this
+ * convention as a workflow-control record. The classifier keeps a literal
+ * copy of the pattern (this module imports the VS Code API, which it must
+ * stay free of); its unit test builds its fixtures through
+ * `formatAtomicTempBasename` below — the same function every production temp
+ * name comes from — so no change to this layout can land without a matching
+ * classifier update.
+ */
+export const ATOMIC_TEMP_INFIX = "_temp_";
+export const ATOMIC_TEMP_SUFFIX = ".tmp";
+
+/**
+ * The single owner definition of the complete atomic-temp filename layout.
+ * `writeAtomic` builds every production temp name through this function and
+ * the privacy-classifier drift test builds its fixtures through it too, so
+ * the two can never describe different shapes: reordering or extending the
+ * layout here changes real temp names and test fixtures identically, and the
+ * classifier test fails until the classifier's pattern matches the new shape.
+ */
+export function formatAtomicTempBasename(targetBasename: string, uniqueTag: string): string {
+  const ext = path.extname(targetBasename);
+  const base = path.basename(targetBasename, ext);
+  return `${base}${ATOMIC_TEMP_INFIX}${uniqueTag}${ATOMIC_TEMP_SUFFIX}${ext}`;
+}
+
 export interface AtomicWriteError extends Error {
   operation: string;
   targetPath: string;
@@ -35,8 +65,6 @@ function getErrorCode(error: unknown): string | undefined {
 export async function writeAtomic(targetUri: vscode.Uri, content: string): Promise<void> {
   const targetPath = targetUri.fsPath;
   const dir = path.dirname(targetPath);
-  const ext = path.extname(targetPath);
-  const base = path.basename(targetPath, ext);
 
   // Validate the real persisted task document, not just an envelope type that
   // callers could accidentally bypass. Other atomic artifacts remain opaque.
@@ -55,8 +83,10 @@ export async function writeAtomic(targetUri: vscode.Uri, content: string): Promi
     await fs.promises.mkdir(dir, { recursive: true });
   }
 
-  // Naming convention: task_<id>_temp_<session_id>.tmp.json
-  const tempFilename = `${base}_temp_${sessionId}_${Date.now()}_${Math.random().toString(36).slice(2)}.tmp${ext}`;
+  const tempFilename = formatAtomicTempBasename(
+    path.basename(targetPath),
+    `${sessionId}_${Date.now()}_${Math.random().toString(36).slice(2)}`
+  );
   const tempPath = path.join(dir, tempFilename);
   if (path.dirname(tempPath) !== dir || !path.resolve(tempPath).startsWith(`${path.resolve(dir)}${path.sep}`)) {
     throw new Error("Atomic write temporary path escaped its target directory.");
@@ -177,7 +207,7 @@ export async function cleanupOrphanedTempFiles(taskRootDirs: string[]): Promise<
           const taskDirPath = path.join(rootDir, entry.name);
           const taskFiles = await fs.promises.readdir(taskDirPath, { withFileTypes: true });
           for (const taskFile of taskFiles) {
-            if (taskFile.isFile() && taskFile.name.includes("_temp_") && taskFile.name.endsWith(".tmp.json")) {
+            if (taskFile.isFile() && taskFile.name.includes(ATOMIC_TEMP_INFIX) && taskFile.name.endsWith(`${ATOMIC_TEMP_SUFFIX}.json`)) {
               const filePath = path.join(taskDirPath, taskFile.name);
               const stat = await fs.promises.stat(filePath);
               const age = now - stat.mtimeMs;
@@ -193,7 +223,7 @@ export async function cleanupOrphanedTempFiles(taskRootDirs: string[]): Promise<
               }
             }
           }
-        } else if (entry.isFile() && entry.name.includes("_temp_") && entry.name.endsWith(".tmp.json")) {
+        } else if (entry.isFile() && entry.name.includes(ATOMIC_TEMP_INFIX) && entry.name.endsWith(`${ATOMIC_TEMP_SUFFIX}.json`)) {
           const filePath = path.join(rootDir, entry.name);
           const stat = await fs.promises.stat(filePath);
           const age = now - stat.mtimeMs;

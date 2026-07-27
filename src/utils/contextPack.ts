@@ -15,6 +15,7 @@ import {
   CONTEXT_TOTAL_MAX_BYTES,
   isDenylisted,
 } from "./contextEligibility";
+import { isWorkflowPrivatePathV1 } from "../services/workflowPrivacyClassifierV1";
 
 /**
  * Resolve the real, symlink-free path of the nearest existing ancestor of
@@ -82,6 +83,9 @@ function basename(fsPath: string): string {
  *  - scheme is not "file"
  *  - out-of-workspace (lexical check; realpath check follows for existing files)
  *  - basename or resolved-target basename matches the secret denylist
+ *  - the literal or resolved-target path classifies as Chat-private,
+ *    workflow-control, transient provider data, or a legacy Chat artifact
+ *    (workflowPrivacyClassifierV1, plan §2.2 — packs must exclude all of them)
  *  - realpath resolves outside the workspace (symlink escape)
  *  - realpath resolution fails for a reason other than "file doesn't exist yet"
  *  - lstatSync fails for any reason other than ENOENT (e.g. EPERM) — fail closed
@@ -115,6 +119,13 @@ function isEligibleDocument(
 
   // Denylist check on the literal basename
   if (isDenylisted(basename(doc.uri.fsPath))) {
+    return false;
+  }
+
+  // Privacy classification on the literal path (plan §2.2): Chat-private,
+  // workflow-control, transient provider data, and legacy Chat artifacts
+  // must never enter provider-bound context packs.
+  if (isWorkflowPrivatePathV1(doc.uri.fsPath)) {
     return false;
   }
 
@@ -162,10 +173,10 @@ function isEligibleDocument(
   // so a symlink whose target is outside the workspace is excluded here.
   try {
     const realFilePath = nodeFs.realpathSync.native(doc.uri.fsPath);
-    // Denylist check on the resolved target basename too (catches symlinks
-    // where the link name is innocuous but the target name is secret-like,
-    // e.g. a symlink "notes.txt" → ".env").
-    if (isDenylisted(nodePath.basename(realFilePath))) {
+    // Denylist + privacy classification on the resolved target too (catches
+    // symlinks where the link name is innocuous but the target is secret- or
+    // private-like, e.g. a symlink "notes.txt" → ".env" or → "chat-v1.json").
+    if (isDenylisted(nodePath.basename(realFilePath)) || isWorkflowPrivatePathV1(realFilePath)) {
       return false;
     }
     const realInWorkspace =
@@ -190,6 +201,7 @@ function isEligibleDocument(
  *  - file: scheme only (no untitled:, virtual, notebook, diff)
  *  - lexically and via realpath inside the workspace
  *  - basename not in the secret-filename denylist
+ *  - not classified private/control by workflowPrivacyClassifierV1 (plan §2.2)
  *  - symlink escapes are caught via realpath containment
  *  - lstatSync errors other than ENOENT cause the file to be excluded (fail closed)
  *
@@ -319,7 +331,7 @@ export async function generateContextPack(
     lines.push("_No eligible open editors._");
   }
   if (excludedCount > 0) {
-    lines.push(`_${excludedCount} editor(s) excluded for safety (out-of-workspace, denylist, or symlink escape)._`);
+    lines.push(`_${excludedCount} editor(s) excluded for safety (out-of-workspace, denylist, private/control path, or symlink escape)._`);
   }
   lines.push("");
 
@@ -564,6 +576,15 @@ export async function generateImplReviewContextPack(
         continue;
       }
 
+      // Privacy classification on the tracked path (plan §2.2): a tracked
+      // list read from task-progress.json is untrusted input and must not
+      // pull Chat-private, workflow-control, transient provider, or legacy
+      // Chat files into a provider-bound pack.
+      if (isWorkflowPrivatePathV1(normalized)) {
+        rejectedPaths.push(rawPath);
+        continue;
+      }
+
       // Defence-in-depth: verify the resolved absolute path stays inside
       // the workspace, e.g. to catch encoded traversal that slipped past
       // the string check.
@@ -605,7 +626,7 @@ export async function generateImplReviewContextPack(
     const mappedTestPaths = new Set<string>();
     for (const relPath of trackedRelPaths) {
       const mapped = mapSourceToTestPath(relPath);
-      if (mapped && !trackedRelPaths.has(mapped)) {
+      if (mapped && !trackedRelPaths.has(mapped) && !isWorkflowPrivatePathV1(mapped)) {
         mappedTestPaths.add(mapped);
       }
     }
@@ -619,7 +640,7 @@ export async function generateImplReviewContextPack(
 
     if (rejectedPaths.length > 0) {
       lines.push(
-        `⚠ ${rejectedPaths.length} tracked path(s) rejected (unsafe, denylisted, or outside workspace):`
+        `⚠ ${rejectedPaths.length} tracked path(s) rejected (unsafe, denylisted, private/control, or outside workspace):`
       );
       lines.push("");
       for (const p of rejectedPaths) {

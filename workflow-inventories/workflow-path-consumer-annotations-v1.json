@@ -1,0 +1,239 @@
+{
+  "schemaVersion": 1,
+  "description": "Non-AI path-consumer annotations (plan §2.3/§1.5): recorded evidence for every production consumer that can spawn a process (dynamicPathConsumption — a spawned process consumes paths the static scanner cannot resolve, so it fails closed without this evidence) and for every consumer added, removed, or whose per-signal call-site profile changed since the immutable pre-gate snapshot (workflow-path-consumer-pregate-v1.json). Verified by scripts/verifyWorkflowPathConsumers.mjs: a child_process consumer without a dynamicPathConsumption entry fails, a stale sourceSpan or stability digest fails, and an annotation matching no live consumer/drift fails.",
+  "annotations": [
+    {
+      "annotationKind": "dynamicPathConsumption",
+      "path": "src/commands/reviewActions.ts",
+      "planSection": "§2.3 (unresolved dynamic path consumption)",
+      "rationale": "cp.execFile(\"git\", [\"rev-parse\", …]) repository checks (isGitWorkspace and siblings) run with the workspace root as cwd during review/publish flows. Arguments are fixed git subcommands; the only path consumed is the cwd, never a task-artifact or Chat-private path. Spawned git can read repository state, so it stays inventoried until the privacy classifier bounds it.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "text3",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "symbol": "(module)",
+        "sourceSpan": "L75-L75",
+        "edgeKind": "dynamicPathConsumption",
+        "targetActionKey": "none"
+      }
+    },
+    {
+      "annotationKind": "dynamicPathConsumption",
+      "path": "src/commands/toggleMetaResourcesGitIgnore.ts",
+      "planSection": "§2.3 (unresolved dynamic path consumption)",
+      "rationale": "cp.execFile(\"git\", …) used to consult/update ignore state for the Ensemble meta-resources folder; fixed git subcommands with the workspace root as cwd plus the meta-resources relative path. No Chat-private or provider data reaches the spawned process.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "git",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "symbol": "(module)",
+        "sourceSpan": "L3-L3",
+        "edgeKind": "dynamicPathConsumption",
+        "targetActionKey": "none"
+      }
+    },
+    {
+      "annotationKind": "dynamicPathConsumption",
+      "path": "src/runners/cliAgentRunner.ts",
+      "planSection": "§2.3 (unresolved dynamic path consumption) / §3.4 runner cutover",
+      "rationale": "The CLI provider runner spawns configured agent CLIs (plus where.exe/which resolution, auth checks, and process-tree cleanup) and hands them workspace/task paths by design — the definitional unresolved dynamic consumer. Plan boundaries already constrain it: general-workspace CLI processes are unsupported for preflight/edit execution, CLI runners are excluded from edit execution, and the runnerV1 cohort replaces its artifact-destination protocol with bounded stdout capture (no artifact/result path in any V1 request, AC-RUNNER-01/02).",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "runnerV1",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "symbol": "(module)",
+        "sourceSpan": "L2-L2",
+        "edgeKind": "dynamicPathConsumption",
+        "targetActionKey": "none"
+      }
+    },
+    {
+      "annotationKind": "dynamicPathConsumption",
+      "path": "src/utils/cliModelDiscovery.ts",
+      "planSection": "§2.3 (unresolved dynamic path consumption)",
+      "rationale": "Spawns CLI provider model-listing commands (cp.spawn with manual timeout + killProcessTree). Command and arguments come from static provider definitions; no task or workspace paths are passed. Inventoried because a spawned process can still read the environment it runs in.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "runnerV1",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "symbol": "(module)",
+        "sourceSpan": "L1-L1",
+        "edgeKind": "dynamicPathConsumption",
+        "targetActionKey": "none"
+      }
+    },
+    {
+      "annotationKind": "dynamicPathConsumption",
+      "path": "src/utils/cliProcessUtils.ts",
+      "planSection": "§2.3 (unresolved dynamic path consumption)",
+      "rationale": "Spawns taskkill for process-tree termination of CLI provider children; arguments are PIDs only, never paths.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "runnerV1",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "symbol": "(module)",
+        "sourceSpan": "L1-L1",
+        "edgeKind": "dynamicPathConsumption",
+        "targetActionKey": "none"
+      }
+    },
+    {
+      "annotationKind": "dynamicPathConsumption",
+      "path": "src/utils/completionLint.ts",
+      "planSection": "§2.3 (unresolved dynamic path consumption)",
+      "rationale": "Spawns package-manager check scripts (verified checks: locator resolution via execFileSync, then spawn of pnpm/npm run … in the publish-scope cwd). Consumes workspace-root/publish-scope paths as cwd; spawned checks can read the whole workspace, which is why the row also carries diagnostics/artifactReadWrite sinks and stays behind this evidence until the classifier lands.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "edit",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "symbol": "(module)",
+        "sourceSpan": "L2-L2",
+        "edgeKind": "dynamicPathConsumption",
+        "targetActionKey": "none"
+      }
+    },
+    {
+      "annotationKind": "dynamicPathConsumption",
+      "path": "src/utils/desktopNotifier.ts",
+      "planSection": "§2.3 (unresolved dynamic path consumption)",
+      "rationale": "OS desktop-notification helper (cp.execFile of the platform notifier with a 15s timeout). Arguments are notification title/body strings; sanitized-diagnostics classification applies to what may enter them — no paths or private payloads are passed.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "nonPlan",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "symbol": "(module)",
+        "sourceSpan": "L1-L1",
+        "edgeKind": "dynamicPathConsumption",
+        "targetActionKey": "none"
+      }
+    },
+    {
+      "annotationKind": "dynamicPathConsumption",
+      "path": "src/utils/gitRepoInfo.ts",
+      "planSection": "§2.3 (unresolved dynamic path consumption)",
+      "rationale": "Spawns git for repository info (branch/remote discovery) with the workspace root as cwd and fixed subcommands; feeds Commit/Push and publish-scope decisions. The git cohort's index/privacy checks (§2.4) are the enforcement point for what may be staged.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "git",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "symbol": "(module)",
+        "sourceSpan": "L1-L1",
+        "edgeKind": "dynamicPathConsumption",
+        "targetActionKey": "none"
+      }
+    },
+    {
+      "annotationKind": "pregateModifiedConsumer",
+      "path": "src/commands/startNewTask.ts",
+      "planSection": "§1.4 (remove implicit creation promotion) / §8 Safety cohort",
+      "rationale": "The Safety cohort replaced both recoverCompletedTaskCreations() call sites (activation and the in-command promotion pass) with consultation of LegacyCreatingStartupGateV0's published read-only classification, moving the creation-footprint reads into the gate module — the file's workspace.fs call-site profile dropped from 7 to 5 sites. No new consumption was added here.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "safety",
+      "expiryCohort": "creation",
+      "evidence": {
+        "symbol": "hasActiveTaskOnDisk",
+        "sourceSpan": "L137-L137",
+        "edgeKind": "pregateModifiedConsumer",
+        "targetActionKey": "taskCreationLifecycle.v1",
+        "pregateStabilitySha256": "3e3e245fc1e4cef0acfe60fb8e793f96c80ac111659382ae44bdd047aa84e0d5",
+        "liveStabilitySha256": "09c57870bba2d6483174e88a217bdbd35f824ae8942232bc3e8a262ac2f5ecab"
+      }
+    },
+    {
+      "annotationKind": "pregateAddedConsumer",
+      "path": "src/state/legacyCreatingStartupGateV0.ts",
+      "planSection": "§1.4 (LegacyCreatingStartupGateV0) / §8 Safety cohort",
+      "rationale": "New Safety-cohort module: the read-only classification pass over legacy `creating` footprints (classifyMetaRoot reads meta-root directory entries and task-progress bytes via workspace.fs at two sites). It performs no writes, no promotion, no ownership adoption, and no provider invocation; superseded by TaskCreationStartupReconcilerV1 in the creation cohort.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "safety",
+      "expiryCohort": "creation",
+      "evidence": {
+        "symbol": "classifyMetaRoot",
+        "sourceSpan": "L24-L24",
+        "edgeKind": "pregateAddedConsumer",
+        "targetActionKey": "taskCreationLifecycle.v1",
+        "liveStabilitySha256": "884e95755f18bb6ece3e1fc843c55677502071853dd41ed52dc5d9c59209d5ae"
+      }
+    },
+    {
+      "annotationKind": "pregateAddedConsumer",
+      "path": "src/extension.ts",
+      "planSection": "§5.1 (Chat cohort, private-storage root)",
+      "rationale": "Chat cohort, executable-order step 8: activate() now creates the extension's global-storage directory via vscode.workspace.fs.createDirectory(context.globalStorageUri) before configuring the workflow private-storage root — VS Code does not create that directory automatically, and the private-storage root (chat-transactions/, chat-recovery/) is provisioned under it. Best-effort (logs and continues on failure); no task or Chat-private path is involved, only the extension's own storage directory.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "chat",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "symbol": "activate",
+        "sourceSpan": "L172-L172",
+        "edgeKind": "pregateAddedConsumer",
+        "targetActionKey": "n/a (activation wiring for the Chat cohort's private-storage root)",
+        "liveStabilitySha256": "9bf649defdb3eb5874fa48d89f76044cfaafbc043c79f13d43e1430bbd414399"
+      }
+    },
+    {
+      "annotationKind": "pregateAddedConsumer",
+      "path": "src/services/workflowFileStoreV1.ts",
+      "planSection": "§1.8 (Foundations cohort, cooperative file store)",
+      "rationale": "Foundations cohort, executable-order step 6: the one filesystem mutation surface every workflow consumer (task-local Chat, the durable Chat transaction store) uses — exclusive creation, revision-guarded replacement, bounded reads, nonrecursive directory create/remove, exact-file unlink. Imports node:fs directly; this is the API-touching module the plan's consumer inventory expects other workflow modules (chatHistoryStore.ts, chatInteractionTransactionStoreV1.ts) to be covered transitively through, per this file's own \"Known mechanical bound\" note.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "foundations",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "symbol": "(module)",
+        "sourceSpan": "L30-L30",
+        "edgeKind": "pregateAddedConsumer",
+        "targetActionKey": "n/a (shared §1.8 mutation surface; not a route)",
+        "liveStabilitySha256": "18605174472cc6f85afaf5f0e69eaa162d61b920085c45402d0e3e75a53bfa01"
+      }
+    },
+    {
+      "annotationKind": "pregateAddedConsumer",
+      "path": "src/services/workflowPathSafetyV1.ts",
+      "planSection": "§1.8 (Foundations cohort, root/path safety)",
+      "rationale": "Foundations cohort, executable-order step 6: root/path shape validation and reparse-point rejection (classifyWorkflowRootV1, validateWorkflowRelativePathV1, resolveWorkflowFsPathV1). Imports node:fs to stat path components for the reparse check.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "foundations",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "symbol": "(module)",
+        "sourceSpan": "L16-L16",
+        "edgeKind": "pregateAddedConsumer",
+        "targetActionKey": "n/a (shared §1.8 root/path safety layer; not a route)",
+        "liveStabilitySha256": "de6a6c82020bac7323ce1c10c5581404690f7d1f6b2fdd47598304bfaa675fc9"
+      }
+    },
+    {
+      "annotationKind": "pregateAddedConsumer",
+      "path": "src/services/workflowRuntimeServicesV1.ts",
+      "planSection": "§2.1 (Chat cohort, shared runtime wiring)",
+      "rationale": "Chat cohort, executable-order step 8: the extension host's single WorkflowPathRegistryV1 + WorkflowFileStoreV1 authority and the activation-wired durable Chat transaction store singleton. Imports node:fs directly for the task-folder root trust check (reading a candidate folder's task-progress.json before registering it as a trusted mutation root, per this round's expectedTaskFolder self-consistency fix).",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "chat",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "symbol": "(module)",
+        "sourceSpan": "L28-L28",
+        "edgeKind": "pregateAddedConsumer",
+        "targetActionKey": "n/a (shared §2.1 runtime wiring; not a route)",
+        "liveStabilitySha256": "05a48570f7b6e31eb99cc44c1aec2279d4f195ceadef2f8697f0740653614cab"
+      }
+    },
+    {
+      "annotationKind": "pregateRemovedConsumer",
+      "path": "src/utils/chatHistoryStore.ts",
+      "planSection": "§2.1/§1.8 (Chat cohort, single path/file-store authority)",
+      "rationale": "Chat cohort, executable-order step 8: this module's task-local chat-v1.json reads/writes no longer call vscode.workspace.fs directly (the pregate snapshot's two call sites in chatHistoryFileExists/readChatHistory) — every filesystem operation now goes exclusively through the shared WorkflowFileStoreV1 (its own consumer row, src/services/workflowFileStoreV1.ts), reached via workflowRuntimeServicesV1.ts's registered task-folder root. This module now only passes locators/paths to that store, matching the inventory's documented mechanical bound: a module with no fs/workspace.fs API of its own is covered transitively by the consumer module it calls.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "chat",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "symbol": "chatHistoryFileExists, readChatHistory (former call sites; now routed through workflowFileStoreV1.ts)",
+        "sourceSpan": "L112-L112 / L179-L179 (pregate)",
+        "edgeKind": "pregateRemovedConsumer",
+        "targetActionKey": "n/a (superseded by src/services/workflowFileStoreV1.ts's consumer row)",
+        "pregateStabilitySha256": "3c581042b4ebf56076bde1d5066cfed4f263c4abb4c71f9bd9d61f2720317d9b"
+      }
+    }
+  ]
+}

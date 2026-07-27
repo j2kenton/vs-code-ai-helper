@@ -1,0 +1,79 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "workflow-route-annotation-v1.schema.json",
+  "title": "Workflow route annotations (plan §1.2/§1.5)",
+  "description": "Shape of workflow-route-annotations-v1.json. Each annotation carries the full §1.5 evidence set (exact path/span, symbol, edge kind, target action key, rationale, owner, expiry cohort). Dynamic executeCommand dispatch sites and unregistered command targets require dynamicCommandDispatch / unregisteredCommandTarget entries; every route added, removed, or mechanically changed since the immutable pre-gate snapshot (workflow-route-pregate-v1.json) requires a pregateAddedRoute / pregateRemovedRoute / pregateModifiedRoute entry whose stability digests match the currently computed span-independent projections. Annotations cannot suppress provider-to-writer routes, authorize unknown public entrypoints, replace an early gate, or assert runtime safety — the verifier rejects edgeKind \"gateReplacement\", stale sourceSpans, and stale stability digests.",
+  "type": "object",
+  "required": ["schemaVersion", "description", "annotations"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "description": { "type": "string", "minLength": 1 },
+    "annotations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["annotationKind", "planSection", "rationale", "owner", "cohort", "expiryCohort", "evidence"],
+        "properties": {
+          "annotationKind": {
+            "enum": [
+              "dynamicCommandDispatch", "unregisteredCommandTarget",
+              "pregateAddedRoute", "pregateRemovedRoute", "pregateModifiedRoute"
+            ]
+          },
+          "path": { "type": "string", "pattern": "^src/" },
+          "routeKey": { "type": "string", "pattern": "^(command|webview|edge|provider|writer):" },
+          "expressionText": { "type": "string", "minLength": 1 },
+          "commandId": { "type": "string", "pattern": "^vs-code-ai-helper\\." },
+          "planSection": { "type": "string", "minLength": 1 },
+          "rationale": { "type": "string", "minLength": 1 },
+          "owner": { "type": "string", "minLength": 1 },
+          "cohort": { "type": "string", "minLength": 1 },
+          "expiryCohort": { "type": "string", "minLength": 1 },
+          "evidence": {
+            "type": "object",
+            "required": ["symbol", "sourceSpan", "edgeKind", "targetActionKey"],
+            "properties": {
+              "symbol": { "type": "string", "minLength": 1 },
+              "sourceSpan": { "type": "string", "pattern": "^L[0-9]+-L[0-9]+$" },
+              "edgeKind": { "type": "string", "minLength": 1, "not": { "const": "gateReplacement" } },
+              "targetActionKey": { "type": "string", "minLength": 1 },
+              "liveStabilitySha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+              "pregateStabilitySha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+            }
+          }
+        },
+        "allOf": [
+          {
+            "if": { "properties": { "annotationKind": { "const": "dynamicCommandDispatch" } } },
+            "then": { "required": ["path", "expressionText"] }
+          },
+          {
+            "if": { "properties": { "annotationKind": { "const": "unregisteredCommandTarget" } } },
+            "then": { "required": ["path", "commandId"] }
+          },
+          {
+            "if": { "properties": { "annotationKind": { "const": "pregateAddedRoute" } } },
+            "then": {
+              "required": ["routeKey"],
+              "properties": { "evidence": { "required": ["liveStabilitySha256"] } }
+            }
+          },
+          {
+            "if": { "properties": { "annotationKind": { "const": "pregateRemovedRoute" } } },
+            "then": {
+              "required": ["routeKey"],
+              "properties": { "evidence": { "required": ["pregateStabilitySha256"] } }
+            }
+          },
+          {
+            "if": { "properties": { "annotationKind": { "const": "pregateModifiedRoute" } } },
+            "then": {
+              "required": ["routeKey"],
+              "properties": { "evidence": { "required": ["liveStabilitySha256", "pregateStabilitySha256"] } }
+            }
+          }
+        ]
+      }
+    }
+  }
+}

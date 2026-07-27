@@ -1,0 +1,84 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://ensemble.ai/schemas/structured-question-v1.schema.json",
+  "title": "StructuredQuestionV1",
+  "description": "The structured-question wire format (plan §3.6). A question set is a JSON array of 1-16 question objects. Unknown properties are rejected. Constraints draft-07 cannot express — unique questionId values across the set, unique optionId values within a question, multipleChoice selection bounds within the actual option count, and the 256 KiB canonical-byte limit — are enforced by the runtime decoder (src/types/structuredQuestionV1.ts) and mechanically checked, together with this schema, by scripts/verifyStructuredQuestions.mjs (verify:structured-questions).",
+  "type": "array",
+  "minItems": 1,
+  "maxItems": 16,
+  "items": {
+    "oneOf": [
+      {
+        "title": "text",
+        "type": "object",
+        "properties": {
+          "questionId": { "$ref": "#/definitions/stableId" },
+          "kind": { "type": "string", "const": "text" },
+          "prompt": { "type": "string", "minLength": 1 },
+          "helpText": { "type": "string" },
+          "required": { "type": "boolean" },
+          "allowBlank": { "type": "boolean" },
+          "maxLength": { "type": "integer", "minimum": 0 }
+        },
+        "required": ["questionId", "kind", "prompt", "required", "allowBlank", "maxLength"],
+        "additionalProperties": false
+      },
+      {
+        "title": "singleChoice",
+        "type": "object",
+        "properties": {
+          "questionId": { "$ref": "#/definitions/stableId" },
+          "kind": { "type": "string", "const": "singleChoice" },
+          "prompt": { "type": "string", "minLength": 1 },
+          "helpText": { "type": "string" },
+          "required": { "type": "boolean" },
+          "options": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 32,
+            "items": { "$ref": "#/definitions/questionOption" }
+          }
+        },
+        "required": ["questionId", "kind", "prompt", "required", "options"],
+        "additionalProperties": false
+      },
+      {
+        "title": "multipleChoice",
+        "type": "object",
+        "properties": {
+          "questionId": { "$ref": "#/definitions/stableId" },
+          "kind": { "type": "string", "const": "multipleChoice" },
+          "prompt": { "type": "string", "minLength": 1 },
+          "helpText": { "type": "string" },
+          "required": { "type": "boolean" },
+          "minSelections": { "type": "integer", "minimum": 0, "maximum": 32 },
+          "maxSelections": { "type": "integer", "minimum": 0, "maximum": 32 },
+          "options": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 32,
+            "items": { "$ref": "#/definitions/questionOption" }
+          }
+        },
+        "required": ["questionId", "kind", "prompt", "required", "minSelections", "maxSelections", "options"],
+        "additionalProperties": false
+      }
+    ]
+  },
+  "definitions": {
+    "stableId": {
+      "type": "string",
+      "pattern": "^[\\x21-\\x7E]{1,128}$"
+    },
+    "questionOption": {
+      "type": "object",
+      "properties": {
+        "optionId": { "$ref": "#/definitions/stableId" },
+        "label": { "type": "string", "minLength": 1 },
+        "description": { "type": "string" }
+      },
+      "required": ["optionId", "label"],
+      "additionalProperties": false
+    }
+  }
+}

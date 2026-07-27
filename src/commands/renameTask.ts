@@ -6,6 +6,7 @@ import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { runTrackedOperation } from "../utils/taskOperations";
 import { parseTaskDocument } from "../utils/taskDescriptionDocument";
 import { TaskNode } from "../views/taskTreeProvider";
+import { LegacyCreatingStartupGateV0 } from "../state/legacyCreatingStartupGateV0";
 
 type TaskArg = TaskNode | { canonicalId?: string; taskFolderPath?: string };
 
@@ -28,6 +29,10 @@ export async function renameTask(
   arg?: TaskArg,
   suggestedName?: string
 ): Promise<void> {
+  // Block on the startup gate's classification pass before this command's
+  // first task-state read (plan §1.4).
+  await LegacyCreatingStartupGateV0.waitUntilReady();
+
   const task = await resolve(inventory, arg);
   if (!task) return;
 
@@ -118,6 +123,9 @@ export async function renameTaskWithAI(
   inventory: TaskInventory,
   arg?: TaskArg
 ): Promise<void> {
+  // Same activation-barrier contract as renameTask above (plan §1.4).
+  await LegacyCreatingStartupGateV0.waitUntilReady();
+
   const task = await resolve(inventory, arg);
   if (!task) return;
 

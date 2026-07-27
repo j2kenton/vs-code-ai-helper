@@ -1,0 +1,12 @@
+[
+  {
+    "questionId": "q1",
+    "kind": "singleChoice",
+    "prompt": "Which module?",
+    "required": true,
+    "options": [
+      { "optionId": "a", "label": "Module A", "unknownProperty": "bad" },
+      { "optionId": "b", "label": "Module B" }
+    ]
+  }
+]

@@ -1,0 +1,15 @@
+[
+  {
+    "questionId": "q1",
+    "kind": "multipleChoice",
+    "prompt": "Which features?",
+    "required": true,
+    "minSelections": 1,
+    "maxSelections": 3,
+    "options": [
+      { "optionId": "featA", "label": "Feature A" },
+      { "optionId": "featB", "label": "Feature B" },
+      { "optionId": "featC", "label": "Feature C" }
+    ]
+  }
+]

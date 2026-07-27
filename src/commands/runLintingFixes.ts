@@ -20,6 +20,7 @@ import {
 import { runImplementationForModel } from "../runners/runnerRegistry";
 import { checkAndConfirmPromptSize } from "../utils/promptSizeGuard";
 import { ensureAiConsent } from "../utils/aiConsent";
+import { assertLegacyAiRouteAllowedV0 } from "../services/legacyAiActionSafetyGateV0";
 import {
   runTrackedOperation,
   taskOperations,
@@ -109,6 +110,7 @@ export async function runLintingFixes(
   context?: vscode.ExtensionContext,
   parentOperation?: TaskOperationHandle
 ): Promise<void> {
+  assertLegacyAiRouteAllowedV0("lint.v1");
   const resolverArg = normalizeArg(explicitArg);
 
   const resolvedTask = await resolveTaskContext(inventory, resolverArg, {

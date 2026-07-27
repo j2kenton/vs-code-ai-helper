@@ -1,0 +1,31 @@
+{
+  "transition": "markTaskDone",
+  "now": "2026-07-10T09:00:00.000Z",
+  "input": {
+    "taskFolder": "2026-07-01_task_3",
+    "currentStage": "publish",
+    "status": "active",
+    "createdAt": "2026-07-01T10:00:00.000Z",
+    "updatedAt": "2026-07-08T11:30:00.000Z",
+    "lintPayload": { "runAt": "2026-07-09T00:00:00.000Z", "passed": true }
+  },
+  "expected": {
+    "ensembleProgressVersion": 1,
+    "taskFolder": "2026-07-01_task_3",
+    "currentStage": "publish",
+    "status": "completed",
+    "completedAt": "2026-07-10T09:00:00.000Z",
+    "createdAt": "2026-07-01T10:00:00.000Z",
+    "updatedAt": "2026-07-10T09:00:00.000Z",
+    "completedStages": [
+      "desc",
+      "plan",
+      "plan-high-review",
+      "plan-low-review",
+      "impl",
+      "impl-high-review",
+      "impl-low-review",
+      "publish"
+    ]
+  }
+}
