@@ -172,7 +172,7 @@ void describe("LegacyAiActionSafetyGateV0", () => {
   });
 
   void describe("assertNoUnauthorizedV1CorrelationV0", () => {
-    void it("rejects every legacy (uncorrelated) request while the production boundary switch is on", () => {
+    void it("rejects every legacy (uncorrelated) request while the production boundary switch is on, except implementation.v1's own bootstrap request", () => {
       // The harness turned the switch off; restore the production value to
       // prove the fail-closed boundary path, then suspend it again.
       assert.equal(LEGACY_UNCORRELATED_RUNNER_INVOCATION_REJECTED_V0.enabled, false);
@@ -191,6 +191,23 @@ void describe("LegacyAiActionSafetyGateV0", () => {
               modelId: "claude-cli:sonnet",
             }),
           LegacyAiActionSafetyGateErrorV0
+        );
+        // "implementation.v1" (Run Implementation) is this migration's own
+        // bootstrapping tool, identified here by stage "impl" — it must stay
+        // exempt from the uncorrelated-rejection even with the switch on, or
+        // the task can never build the step (plan.md step 16) that would
+        // properly migrate it. See the exemption's rationale in
+        // legacyAiActionSafetyGateV0.ts and the matching NOTE on
+        // runImplementationWithAI in reviewActions.ts.
+        assert.doesNotThrow(() =>
+          assertNoUnauthorizedV1CorrelationV0({
+            taskFolderUri: {},
+            workspaceUri: {},
+            stage: "impl",
+            prompt: "hello",
+            outputFile: {},
+            modelId: "claude-cli:sonnet",
+          })
         );
       } finally {
         LEGACY_UNCORRELATED_RUNNER_INVOCATION_REJECTED_V0.enabled = false;

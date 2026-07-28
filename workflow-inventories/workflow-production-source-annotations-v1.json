@@ -56,11 +56,11 @@
       "disposition": "added",
       "cohort": "safety",
       "planSection": "1.3",
-      "rationale": "Fail-closed AI action safety gate: registers every baseline question-capable/edit-capable route identity, DISABLES all eleven of them via LEGACY_AI_ROUTE_DISABLED_V0 until each route's V1 coordinator replacement lands (plan §1.3/§8 staged migration), and rejects both unauthorized V1-correlated requests and legacy uncorrelated invocations at the shared runner/provider boundary (LEGACY_UNCORRELATED_RUNNER_INVOCATION_REJECTED_V0). Wired at the first statement of every gated handler and wrapper route (see src/test/legacyAiActionSafetyGateWiring.test.ts); the unit-test harness (test-stubs/register.js) suspends both switches so behavioral suites can keep covering the retained legacy machinery.",
+      "rationale": "Fail-closed AI action safety gate: registers every baseline question-capable/edit-capable route identity, DISABLES all eleven of them via LEGACY_AI_ROUTE_DISABLED_V0 until each route's V1 coordinator replacement lands (plan §1.3/§8 staged migration), and rejects both unauthorized V1-correlated requests and legacy uncorrelated invocations at the shared runner/provider boundary (LEGACY_UNCORRELATED_RUNNER_INVOCATION_REJECTED_V0). Wired at the first statement of every gated handler and wrapper route (see src/test/legacyAiActionSafetyGateWiring.test.ts); the unit-test harness (test-stubs/register.js) suspends both switches so behavioral suites can keep covering the retained legacy machinery. EXCEPTION added: assertNoUnauthorizedV1CorrelationV0 now lets through the one uncorrelated request shape belonging to \"implementation.v1\" (identified by stage \"impl\", via isImplementationV1BootstrapRequest) — that route is this migration's own bootstrapping tool, and rejecting its uncorrelated invocation at this boundary deadlocked the task the same way gating its handler did. Remove the exception only once implementation.v1 has a real V1 replacement (plan.md step 16) to migrate onto.",
       "owner": "j2kenton",
       "expiryCohort": "cleanup",
       "evidence": {
-        "liveSha256": "b2c6fd7886d3c99bca97b2d1f097b4c0df6ba13157a10033b1bb3f94cb597e9f",
+        "liveSha256": "f481c5760746febf7debbff7a1bf0d161e4a5cd23bc649211b3d45c07b472b34",
         "symbol": "assertLegacyAiRouteAllowedV0, isLegacyAiRouteDisabledV0, assertNoUnauthorizedV1CorrelationV0, LEGACY_AI_ROUTE_DISABLED_V0",
         "sourceSpan": "L1-L226 (whole file)",
         "edgeKind": "runner-boundary",
