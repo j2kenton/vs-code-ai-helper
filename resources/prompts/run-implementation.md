@@ -17,7 +17,8 @@ Before producing the final summary, make sure the workspace files were actually 
 
 Do NOT create or edit a `plan-final.md` or `implementation.md` file at the repository root — those filenames are reserved there for the extension's own task-tracking artifacts (nested paths, e.g. `docs/implementation.md`, are unaffected and fine to touch if the plan calls for it). When you have finished all changes, output your summary as plain Markdown text in your final response (not written to any file):
 
-- A one-or-two sentence statement of what was implemented
+- If the "Final Plan" below starts with `<!-- ensemble:implementation-checklist -->` followed by a checklist of `- [ ]`/`- [x]` items, your response's FIRST section must reproduce that entire checklist marker and list verbatim, with only the checkbox state changed for items you completed or made progress on this round (`- [ ]` → `- [x]`) — do not remove, renumber, reword, or add items. This is the only persistent record of overall plan progress across rounds: if you omit it here, the next round will not know what remains, and will incorrectly treat the plan as finished. If some items remain incomplete, they MUST stay `- [ ]` and MUST still be listed — do not drop them because this round didn't touch them.
+- A one-or-two sentence statement of what was implemented this round
 - A `## Files Changed` section listing each file created or modified with one line describing the change
 - A `## Verification` section with a short checklist of how to confirm the implementation is correct
 
