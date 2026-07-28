@@ -28,11 +28,11 @@
     },
     {
       "path": "src/actions/rows/chatSendRowV1.ts",
-      "sha256": "e30448e40cb58373072b8a197e6314656e57e191e9f606bd89faa2c1272d9c91"
+      "sha256": "f6a57903dc8a994d98f8d2c665db4662d43731a94f2b7e9137192b1ec0dd4d53"
     },
     {
       "path": "src/actions/rows/commitPushMetadataRowV1.ts",
-      "sha256": "bdb21237ba81f351073473d1c0378a5c58ce011d1ee0690a20a39f75d5346cfa"
+      "sha256": "2f76833eae3305141c8a27683a31cdc06cc3dd2e9d108dc9e5ac90f9a81b32d7"
     },
     {
       "path": "src/actions/rows/draftRowV1.ts",
