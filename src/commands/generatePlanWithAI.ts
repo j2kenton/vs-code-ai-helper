@@ -10,10 +10,7 @@ import {
 import { renderPromptTemplate } from "../utils/promptTemplates";
 import { writeRunLog } from "../utils/runLog";
 import { pickTaskFolder } from "../utils/pickTaskFolder";
-import {
-  checkRunnerAvailabilityForModel,
-  resolveRunnerForModel,
-} from "../runners/runnerRegistry";
+import { checkRunnerAvailabilityForModel } from "../runners/runnerRegistry";
 import { resolveFreshModelForStage } from "../utils/modelSelection";
 import { TASK_FILENAME, TaskStage } from "../types/taskProgress";
 import { ensureAiConsent } from "../utils/aiConsent";
@@ -36,6 +33,33 @@ import {
   taskOperations,
   TaskOperationHandle,
 } from "../utils/taskOperations";
+import {
+  ensureWorkflowTaskFolderRootV1,
+  getVerifiedTaskBindingIdV1,
+  getWorkflowFileStoreV1,
+} from "../services/workflowRuntimeServicesV1";
+import { readChatDocumentIdentityV1 } from "../utils/chatHistoryStore";
+import { allocateHex128IdV1 } from "../types/actionCorrelationV1";
+import {
+  createProductionTaskActionCoordinatorV1,
+  getProductionActionConversationOrchestratorV1,
+} from "../actions/productionTaskActionRuntimeV1";
+import { TaskActionCoordinatorV1 } from "../actions/taskActionCoordinatorV1";
+import {
+  ActionConversationOrchestratorV1,
+  InteractionRefV1,
+} from "../actions/actionConversationOrchestratorV1";
+import {
+  GENERATE_PLAN_ACTION_KEY_V1,
+  GENERATE_PLAN_TARGET_RELATIVE_PATH_V1,
+  GeneratePlanActionInputV1,
+} from "../actions/rows/generatePlanRowV1";
+import { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
+import {
+  ChatInteractionRefV1,
+  ChatInteractionResumeResultV1,
+  ChatViewProvider,
+} from "../views/chatView";
 
 /**
  * Stages a task may be in for plan generation to be safe: either at the
@@ -136,6 +160,7 @@ export function normalizeGeneratePlanArg(
 export async function generatePlanWithAI(
   context: vscode.ExtensionContext,
   inventory: TaskInventory,
+  chatViewProvider: ChatViewProvider,
   arg?: GeneratePlanArg
 ): Promise<boolean | undefined> {
   assertLegacyAiRouteAllowedV0("generatePlan.v1");
@@ -195,7 +220,9 @@ export async function generatePlanWithAI(
     lockKey,
     { label: "Generate Plan", stage: "plan", kind: "generate-plan", cancellable: true },
     (op) =>
-      generatePlanWithAIForResolvedTask(context, inventory, taskFolderUri, op, effectiveReviewMode)
+      generatePlanWithAIForResolvedTask(
+        context, inventory, chatViewProvider, taskFolderUri, op, effectiveReviewMode
+      )
   );
   if (!result) {
     // Refused (another operation holds this task's lock) — the busy warning
@@ -230,9 +257,214 @@ interface GeneratePlanResult {
   taskFolderPath?: string;
 }
 
+/** A resolved provider/coordinator pair for one generatePlan.v1 invocation. */
+interface ResolvedGeneratePlanCoordinatorV1 {
+  readonly coordinator: TaskActionCoordinatorV1;
+  readonly providerLabel: string;
+}
+
+type ResolveGeneratePlanCoordinatorFailureV1 =
+  | { readonly kind: "noModel" }
+  | { readonly kind: "unavailable"; readonly providerLabel: string; readonly reason: string };
+
+/**
+ * Resolve the stage's configured model, confirm the provider is available,
+ * and build a task action coordinator bound to this invocation's workspace
+ * cwd and resolved stage model (plan §3.8's registry/runner boundary —
+ * `RunnerSelectionOpenerV1` requires a synchronous stage-model resolver, so
+ * the async resolution happens once here and the returned closure just
+ * echoes the already-resolved value). Shared by the direct command
+ * invocation and by an explicit Chat Resume of a `generatePlan.v1`
+ * structured-question interaction (plan §6.1).
+ */
+async function resolveGeneratePlanCoordinatorV1(
+  taskFolderUri: vscode.Uri,
+  workspaceFolderUri: vscode.Uri
+): Promise<
+  | { readonly ok: true; readonly value: ResolvedGeneratePlanCoordinatorV1 }
+  | { readonly ok: false; readonly failure: ResolveGeneratePlanCoordinatorFailureV1 }
+> {
+  const model = await resolveFreshModelForStage(taskFolderUri, "plan");
+  if (!model.modelId) {
+    return { ok: false, failure: { kind: "noModel" } };
+  }
+  const { availability, providerLabel } = await checkRunnerAvailabilityForModel(
+    model.modelId,
+    "plan"
+  );
+  if (!availability.available) {
+    return {
+      ok: false,
+      failure: { kind: "unavailable", providerLabel, reason: availability.reason ?? "unknown reason" },
+    };
+  }
+  const modelId = model.modelId;
+  const coordinator = createProductionTaskActionCoordinatorV1({
+    workspaceCwd: workspaceFolderUri.fsPath,
+    resolveStagePrimaryModel: () => ({ modelId, stage: "plan" as TaskStage }),
+  });
+  return { ok: true, value: { coordinator, providerLabel } };
+}
+
+/** Minimal task identity `handleGeneratePlanOutcomeV1` needs — never a raw filesystem path beyond the task's own folder. */
+interface GeneratePlanOutcomeTaskRefV1 {
+  readonly taskFolderPath: string;
+  readonly canonicalId: string;
+  readonly taskName?: string;
+}
+
+interface GeneratePlanOutcomeContextV1 {
+  readonly taskRef: GeneratePlanOutcomeTaskRefV1;
+  readonly chatViewProvider: ChatViewProvider;
+  readonly orchestrator: ActionConversationOrchestratorV1;
+  /** The action-specific prompt sent this drive, recorded in the run log only. */
+  readonly prompt: string;
+  readonly effectiveReviewMode: AutoTriggerMode;
+}
+
+interface GeneratePlanOutcomeResultV1 {
+  readonly succeeded: boolean;
+  readonly triggerAutoReview: boolean;
+  readonly runLogUri?: vscode.Uri;
+}
+
+/** One short, sanitized status line for the run log — never provider text (plan §2.2/§3.7's closed outcome contract carries none anyway). */
+function describeGeneratePlanOutcomeForLogV1(outcome: TaskActionOutcomeV1): string {
+  switch (outcome.kind) {
+    case "completed":
+      return `Status: completed (${outcome.code})`;
+    case "questions":
+      return `Status: questions (interactionId=${outcome.interactionId}) — the AI asked a clarifying question in Chat With AI instead of writing plan.md.`;
+    case "cancelled":
+      return `Status: cancelled (${outcome.code})`;
+    case "failed":
+      return `Status: failed (code=${outcome.code}, retryable=${outcome.retryable})`;
+    case "malformedResult":
+      return `Status: malformed result (${outcome.code})`;
+    case "unavailable":
+      return `Status: unavailable (${outcome.code})`;
+    case "recoveryRequired":
+      return `Status: recovery required (${outcome.code})`;
+    case "duplicateRejected":
+      return "Status: duplicate rejected (another operation is already running for this task)";
+    case "stalePreflight":
+      return `Status: stale preflight (${outcome.planId})`;
+    case "partialEditBlocked":
+      return `Status: partial edit blocked (${outcome.executionId})`;
+    default:
+      return `Status: ${(outcome as TaskActionOutcomeV1).kind}`;
+  }
+}
+
+/** User-facing failure text for a non-completed, non-cancelled, non-questions outcome. */
+function describeGeneratePlanFailureV1(outcome: TaskActionOutcomeV1): string {
+  switch (outcome.kind) {
+    case "failed":
+      return `${outcome.code}${outcome.retryable ? " (retryable)" : ""}`;
+    case "malformedResult":
+      return `the model's response was malformed (${outcome.code})`;
+    case "unavailable":
+      return outcome.code;
+    case "recoveryRequired":
+      return outcome.code;
+    case "duplicateRejected":
+      return "another operation is already running for this task";
+    case "stalePreflight":
+      return "a stale preflight plan was rejected";
+    case "partialEditBlocked":
+      return "a partial edit was blocked";
+    default:
+      return outcome.kind;
+  }
+}
+
+/**
+ * Handle one `generatePlan.v1` coordinator outcome: promote a completed
+ * result's already-written plan.md into the task's lifecycle (stage
+ * transition, opening the document, notifying the user), raise a `questions`
+ * outcome in Chat With AI (never in plan.md — plan §6's universal question
+ * flow), or notify the user of cancellation/failure. Shared by the direct
+ * command invocation and by an explicit Chat Resume, so both paths behave
+ * identically once the coordinator has produced an outcome.
+ */
+async function handleGeneratePlanOutcomeV1(
+  outcome: TaskActionOutcomeV1,
+  ctx: GeneratePlanOutcomeContextV1
+): Promise<GeneratePlanOutcomeResultV1> {
+  const taskFolderUri = vscode.Uri.file(ctx.taskRef.taskFolderPath);
+  const planFileUri = vscode.Uri.joinPath(taskFolderUri, GENERATE_PLAN_TARGET_RELATIVE_PATH_V1);
+
+  let succeeded = false;
+  let triggerAutoReview = false;
+
+  if (outcome.kind === "completed") {
+    // Preserve unrelated fields (implReviewFiles, scheduled metadata, lint
+    // results, ...) while updating the stage. The destination stage must be
+    // persisted before its automatic follow-up operation begins, so the
+    // tree/progress indicator and review eligibility stay aligned with what
+    // actually runs next.
+    const destinationStage: TaskStage = ctx.effectiveReviewMode !== "off" ? "plan-high-review" : "plan";
+    await patchTaskProgress(taskFolderUri, (existing) => {
+      if (!ELIGIBLE_STAGES.includes(existing.currentStage)) {
+        return existing;
+      }
+      return updateTaskProgressStage(existing, destinationStage);
+    });
+    succeeded = true;
+    triggerAutoReview = ctx.effectiveReviewMode !== "off";
+    await safeOpenTextDocument(planFileUri, GENERATE_PLAN_TARGET_RELATIVE_PATH_V1);
+    NotificationRouter.showInformation(`${GENERATE_PLAN_TARGET_RELATIVE_PATH_V1} generated.`);
+  } else if (outcome.kind === "questions") {
+    // Plan §6.1: questions surface in Chat With AI, never in plan.md. The
+    // durable Chat interaction transaction is already persisted (the
+    // coordinator wrote it through before this outcome surfaced); fetch the
+    // full record to mirror it into the task-local Chat display.
+    const record = await ctx.orchestrator.getRecord({
+      operationId: outcome.correlation.operationId,
+      interactionId: outcome.interactionId,
+      taskBindingId: outcome.correlation.taskBindingId,
+      chatDocumentId: outcome.correlation.chatDocumentId,
+      sourceAttemptId: outcome.correlation.attemptId,
+    });
+    if (record) {
+      await ctx.chatViewProvider.askInteraction({
+        canonicalId: ctx.taskRef.canonicalId,
+        taskFolderPath: ctx.taskRef.taskFolderPath,
+        stage: record.stage,
+        taskName: ctx.taskRef.taskName,
+        interactionId: record.interactionId,
+        operationId: record.correlation.operationId,
+        actionKey: record.correlation.actionKey,
+        sourceAttemptId: record.correlation.attemptId,
+        questions: record.questions,
+        binding: {
+          taskBindingId: record.correlation.taskBindingId,
+          chatDocumentId: record.correlation.chatDocumentId,
+        },
+      });
+    }
+  } else if (outcome.kind === "cancelled") {
+    NotificationRouter.showInformation("Plan generation cancelled.");
+  } else {
+    NotificationRouter.showError(
+      `Plan generation failed: ${describeGeneratePlanFailureV1(outcome)}. Use the manual planning workflow instead.`
+    );
+  }
+
+  const runLogUri = await writeRunLog(
+    taskFolderUri,
+    "generatePlan-v1",
+    "plan",
+    `# Prompt\n\n${ctx.prompt}\n\n# Result\n\n${describeGeneratePlanOutcomeForLogV1(outcome)}`
+  );
+
+  return { succeeded, triggerAutoReview, runLogUri };
+}
+
 async function generatePlanWithAIForResolvedTask(
   context: vscode.ExtensionContext,
   inventory: TaskInventory,
+  chatViewProvider: ChatViewProvider,
   taskFolderUri: vscode.Uri,
   op: TaskOperationHandle,
   /**
@@ -244,18 +476,6 @@ async function generatePlanWithAIForResolvedTask(
    */
   effectiveReviewMode: AutoTriggerMode
 ): Promise<GeneratePlanResult> {
-  const model = await resolveFreshModelForStage(taskFolderUri, "plan");
-  if (!model.modelId) {
-    NotificationRouter.showWarning(
-      "No model is configured for the Plan stage. Open Ensemble Settings and choose a primary model before continuing.",
-      undefined,
-      undefined,
-      undefined,
-      { command: "vs-code-ai-helper.openSettings", title: "Open Settings" }
-    );
-    return { succeeded: false, triggerAutoReview: false };
-  }
-
   // A direct URI is not an ownership proof. Require the live inventory to
   // resolve it so this command cannot write into an unrelated workspace.
   const ownedTask = inventory.getTaskByPath(taskFolderUri.fsPath);
@@ -269,21 +489,25 @@ async function generatePlanWithAIForResolvedTask(
     NotificationRouter.showError("The selected task has no owning workspace.");
     return { succeeded: false, triggerAutoReview: false };
   }
-  const { runner, nativeModelId } = resolveRunnerForModel(
-    model.modelId, "plan", taskFolderUri
-  );
-  const { availability, providerLabel } = await checkRunnerAvailabilityForModel(
-    model.modelId,
-    "plan"
-  );
-  if (!availability.available) {
-    NotificationRouter.showWarning(
-      `${providerLabel} is unavailable: ${
-        availability.reason ?? "unknown reason"
-      }. Use the manual planning workflow instead.`
-    );
+
+  const resolved = await resolveGeneratePlanCoordinatorV1(taskFolderUri, workspaceFolderUri);
+  if (!resolved.ok) {
+    if (resolved.failure.kind === "noModel") {
+      NotificationRouter.showWarning(
+        "No model is configured for the Plan stage. Open Ensemble Settings and choose a primary model before continuing.",
+        undefined,
+        undefined,
+        undefined,
+        { command: "vs-code-ai-helper.openSettings", title: "Open Settings" }
+      );
+    } else {
+      NotificationRouter.showWarning(
+        `${resolved.failure.providerLabel} is unavailable: ${resolved.failure.reason}. Use the manual planning workflow instead.`
+      );
+    }
     return { succeeded: false, triggerAutoReview: false };
   }
+  const { coordinator, providerLabel } = resolved.value;
 
   const taskFileUri = vscode.Uri.joinPath(taskFolderUri, TASK_FILENAME);
   let taskContent: string;
@@ -336,6 +560,55 @@ async function generatePlanWithAIForResolvedTask(
   // if open buffers change between the two calls.
   await writeContextPackContent(taskFolderUri, contextPackContent);
 
+  // Register (or reconfirm) this task folder as a trusted workflow mutation
+  // root and derive its ownership-backed binding (plan §3.9) — the identity
+  // every coordinator invocation correlates against.
+  let taskBindingId: string;
+  try {
+    const rootId = ensureWorkflowTaskFolderRootV1(taskFolderUri.fsPath);
+    const verified = getVerifiedTaskBindingIdV1(rootId);
+    if (!verified) {
+      NotificationRouter.showError(
+        "Plan generation failed: this task's ownership binding could not be verified."
+      );
+      return { succeeded: false, triggerAutoReview: false };
+    }
+    taskBindingId = verified;
+  } catch (error) {
+    NotificationRouter.showError(
+      `Plan generation failed: ${error instanceof Error ? error.message : String(error)}`
+    );
+    return { succeeded: false, triggerAutoReview: false };
+  }
+  const chatIdentity = await readChatDocumentIdentityV1(
+    taskFolderUri.fsPath,
+    ownedTask.canonicalId ?? taskFolderUri.fsPath
+  );
+  const chatDocumentId = chatIdentity?.documentId ?? allocateHex128IdV1();
+
+  // Capture plan.md's current revision (if it exists) so the row's
+  // promotion is a revision-checked replacement (plan §6.2): a concurrent
+  // edit made while the provider is thinking is detected and refused rather
+  // than clobbered.
+  const rootId = ensureWorkflowTaskFolderRootV1(taskFolderUri.fsPath);
+  const targetLocator = { rootId, relativePath: GENERATE_PLAN_TARGET_RELATIVE_PATH_V1 };
+  const fileStore = getWorkflowFileStoreV1();
+  const statResult = await fileStore.stat(targetLocator);
+  if (statResult.kind === "unavailable" || statResult.kind === "failed") {
+    NotificationRouter.showError(
+      `Plan generation failed: could not check ${GENERATE_PLAN_TARGET_RELATIVE_PATH_V1} (${statResult.code}).`
+    );
+    return { succeeded: false, triggerAutoReview: false };
+  }
+  const baselineRevision =
+    statResult.value.kind === "file" ? statResult.value.revision : undefined;
+
+  const validatedInput: GeneratePlanActionInputV1 = {
+    prompt,
+    targetLocator,
+    ...(baselineRevision !== undefined ? { baselineRevision } : {}),
+  };
+
   let succeeded = false;
   let triggerAutoReview = false;
 
@@ -351,78 +624,41 @@ async function generatePlanWithAIForResolvedTask(
           `Generating plan with ${providerLabel}...`,
           taskOperations.rootOperationIdFor(taskFolderUri.fsPath)
         );
-        const planFileUri = vscode.Uri.joinPath(taskFolderUri, "plan.md");
 
         progress.report({ message: `Waiting for ${providerLabel} response...` });
 
         // Cancellable from either surface: the native progress toast and the
         // Notifications-row cancel button both abort the same provider run.
         const linked = linkCancellationTokens(token, op.token);
-        let result: Awaited<ReturnType<typeof runner.run>>;
+        let outcome: TaskActionOutcomeV1;
         try {
-          result = await runner.run(
-            {
-              taskFolderUri: taskFolderUri,
-              workspaceUri: workspaceFolderUri,
-              stage: "plan",
-              prompt,
-              outputFile: planFileUri,
-              modelId: nativeModelId,
-            },
-            linked.token
-          );
+          outcome = await coordinator.executeAction({
+            actionKey: GENERATE_PLAN_ACTION_KEY_V1,
+            taskBinding: { taskBindingId, chatDocumentId },
+            taskStatus: ownedTask.progress.status ?? "active",
+            taskStage: ownedTask.progress.currentStage,
+            rawInput: validatedInput,
+            cancellationToken: linked.token,
+          });
         } finally {
           linked.dispose();
         }
 
-        const planLogUri = await writeRunLog(
-          taskFolderUri,
-          runner.id,
-          "plan",
-          `# Prompt\n\n${prompt}\n\n# Result\n\nStatus: ${result.status}\n\n${
-            result.summary ?? result.errorMessage ?? ""
-          }`
-        );
-        op.setResultTargetUri(planLogUri);
-
-        if (result.status === "completed") {
-          // Use patchTaskProgress to preserve unrelated fields (e.g. implReviewFiles,
-          // scheduled metadata, lint results) while updating the stage.
-          // The destination stage must be persisted before its automatic
-          // operation begins.  This keeps the tree/progress indicator and
-          // review eligibility aligned with the operation actually running.
-          const destinationStage: TaskStage = effectiveReviewMode !== "off"
-            ? "plan-high-review"
-            : "plan";
-          await patchTaskProgress(taskFolderUri, (existing) => {
-            if (!ELIGIBLE_STAGES.includes(existing.currentStage)) {
-              return existing;
-            }
-            return updateTaskProgressStage(existing, destinationStage);
-          });
-          succeeded = true;
-
-          await safeOpenTextDocument(planFileUri, "plan.md");
-          NotificationRouter.showInformation(
-            `plan.md generated with ${providerLabel} (${result.summary ?? ""})`
-          );
-          if (effectiveReviewMode !== "off") {
-            // Deferred: the review command acquires this same task's
-            // operation lock, which this run still holds until the
-            // outer `finally` below runs. Trigger it from the caller
-            // after that lock has been released instead of here.
-            triggerAutoReview = true;
-          }
-        } else if (result.status === "cancelled") {
-          NotificationRouter.showInformation(
-            "Plan generation cancelled."
-          );
-        } else {
-          NotificationRouter.showError(
-            `Plan generation failed: ${
-              result.errorMessage ?? "unknown error"
-            }. Use the manual planning workflow instead.`
-          );
+        const handled = await handleGeneratePlanOutcomeV1(outcome, {
+          taskRef: {
+            taskFolderPath: taskFolderUri.fsPath,
+            canonicalId: ownedTask.canonicalId ?? taskFolderUri.fsPath,
+            taskName: ownedTask.progress.displayName,
+          },
+          chatViewProvider,
+          orchestrator: getProductionActionConversationOrchestratorV1(),
+          prompt,
+          effectiveReviewMode,
+        });
+        succeeded = handled.succeeded;
+        triggerAutoReview = handled.triggerAutoReview;
+        if (handled.runLogUri) {
+          op.setResultTargetUri(handled.runLogUri);
         }
       }
     );
@@ -430,16 +666,136 @@ async function generatePlanWithAIForResolvedTask(
 }
 
 /**
+ * Drive an explicit Chat Resume of a `generatePlan.v1` structured-question
+ * interaction (plan §5.5 / §6.1 / AC-QUESTION-03): re-resolve the stage
+ * model/provider, run the coordinator's `resumeAction`, and handle the
+ * resulting outcome exactly like a fresh invocation (promote a completed
+ * result, raise a fresh `questions` interaction, or notify cancellation/
+ * failure). Called from extension.ts's `ChatInteractionServicesV1.resume`
+ * wiring once the interaction's recorded actionKey resolves to
+ * `generatePlan.v1`.
+ */
+export async function resumeGeneratePlanInteractionV1(
+  inventory: TaskInventory,
+  chatViewProvider: ChatViewProvider,
+  ref: ChatInteractionRefV1,
+  resumeIdempotencyId: string,
+  cancellationToken: vscode.CancellationToken
+): Promise<ChatInteractionResumeResultV1> {
+  const ownedTask = inventory.getTaskByBindingId(ref.taskBindingId);
+  if (!ownedTask) {
+    return { ok: false, reason: "the task that asked this question could not be found" };
+  }
+  const taskFolderUri = vscode.Uri.file(ownedTask.taskFolderPath);
+  const workspaceFolderUri = ownedTask.workspaceFolder;
+  if (!workspaceFolderUri) {
+    return { ok: false, reason: "the task has no owning workspace" };
+  }
+
+  const resolved = await resolveGeneratePlanCoordinatorV1(taskFolderUri, workspaceFolderUri);
+  if (!resolved.ok) {
+    return {
+      ok: false,
+      reason:
+        resolved.failure.kind === "noModel"
+          ? "no model is configured for the Plan stage"
+          : `${resolved.failure.providerLabel} is unavailable: ${resolved.failure.reason}`,
+    };
+  }
+  const { coordinator } = resolved.value;
+  const orchestrator = getProductionActionConversationOrchestratorV1();
+
+  const interactionRef: InteractionRefV1 = {
+    operationId: ref.operationId,
+    interactionId: ref.interactionId,
+    taskBindingId: ref.taskBindingId,
+    chatDocumentId: ref.chatDocumentId,
+    sourceAttemptId: ref.sourceAttemptId,
+  };
+
+  // The persisted transaction's validated-input snapshot carries this
+  // drive's original prompt (recorded for the run log only — the coordinator
+  // itself reconstructs and revalidates the action from the snapshot).
+  const before = await orchestrator.loadInteraction(interactionRef);
+  let prompt = "(prompt unavailable)";
+  if (before.kind === "ok") {
+    try {
+      const snapshot = JSON.parse(before.record.inputSnapshot.canonicalJson) as { prompt?: unknown };
+      if (typeof snapshot.prompt === "string") {
+        prompt = snapshot.prompt;
+      }
+    } catch {
+      // Best-effort for the run log only.
+    }
+  }
+
+  const outcome = await coordinator.resumeAction({
+    interaction: interactionRef,
+    taskBinding: { taskBindingId: ref.taskBindingId, chatDocumentId: ref.chatDocumentId },
+    taskStatus: ownedTask.progress.status ?? "active",
+    taskStage: ownedTask.progress.currentStage,
+    resumeIdempotencyId,
+    cancellationToken,
+  });
+
+  const handled = await handleGeneratePlanOutcomeV1(outcome, {
+    taskRef: {
+      taskFolderPath: ownedTask.taskFolderPath,
+      canonicalId: ownedTask.canonicalId ?? ownedTask.taskFolderPath,
+      taskName: ownedTask.progress.displayName,
+    },
+    chatViewProvider,
+    orchestrator,
+    prompt,
+    // Resume has no chained "Complete & Move On" request of its own to
+    // combine with — only the standalone stage setting applies.
+    effectiveReviewMode: getAutoReviewAfterPlanMode(),
+  });
+
+  if (handled.triggerAutoReview) {
+    const command = getAutoReviewAfterPlanMode() === "auto-fast-forward"
+      ? "vs-code-ai-helper.fastForwardReviewWithAI"
+      : "vs-code-ai-helper.runReviewWithAI";
+    await scheduleAutomationChain({
+      command,
+      arg: { taskFolderPath: ownedTask.taskFolderPath },
+      taskKey: ownedTask.taskFolderPath,
+      chainId: "auto-review",
+    });
+  }
+
+  // Report the ORIGINAL interaction's actual settlement (re-read after
+  // resumeAction, rather than inferred from this drive's outcome kind): a
+  // resumed run that itself asks again, fails, or is cancelled still means
+  // the interaction being resumed settled exactly once (plan §5.5) — only a
+  // rejection BEFORE settlement (binding mismatch, unanswered, already
+  // settled under a different id, ...) leaves it unsettled and resumable.
+  const after = await orchestrator.loadInteraction(interactionRef);
+  const settlement =
+    after.kind === "ok" &&
+    after.record.state === "settled" &&
+    (after.record.settlement === "resumed" || after.record.settlement === "supersededByReplacementOperation")
+      ? after.record.settlement
+      : undefined;
+
+  if (settlement === undefined) {
+    return { ok: false, reason: describeGeneratePlanFailureV1(outcome) };
+  }
+  return { ok: true, settlement };
+}
+
+/**
  * Register the generatePlanWithAI command
  */
 export function registerGeneratePlanWithAICommand(
   context: vscode.ExtensionContext,
-  inventory: TaskInventory
+  inventory: TaskInventory,
+  chatViewProvider: ChatViewProvider
 ): void {
   const disposable = vscode.commands.registerCommand(
     "vs-code-ai-helper.generatePlanWithAI",
     (arg?: GeneratePlanArg) =>
-      generatePlanWithAI(context, inventory, arg)
+      generatePlanWithAI(context, inventory, chatViewProvider, arg)
   );
   context.subscriptions.push(disposable);
 }

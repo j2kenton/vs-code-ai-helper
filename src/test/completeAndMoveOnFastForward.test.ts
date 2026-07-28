@@ -34,14 +34,36 @@ import {
 import { StatusTreeProvider } from "../views/statusView";
 import { readTaskProgress, IncompleteTask } from "../utils/taskProgressUtils";
 import { REVIEW_STAGES, TaskProgress, TaskStage } from "../types/taskProgress";
-import type { AgentRunRequest, AgentRunResult } from "../types/agentRunner";
 import { DISCLAIMER_VERSION } from "../legal/disclaimerVersion";
 import type { AutomationDispatch } from "../utils/automationChain";
+import { createChatInteractionTransactionStoreV1 } from "../services/chatInteractionTransactionStoreV1";
+import {
+  configureWorkflowPrivateStorageRootV1,
+  getWorkflowFileStoreV1,
+  getWorkflowPathRegistryV1,
+  resetWorkflowRuntimeServicesForTestV1,
+  setChatInteractionTransactionStoreV1,
+} from "../services/workflowRuntimeServicesV1";
+import { resetProductionTaskActionRegistryForTestV1 } from "../actions/productionTaskActionRuntimeV1";
+import type { ChatViewProvider } from "../views/chatView";
+
+/**
+ * Neither test in this file exercises the `questions` outcome (both fake a
+ * completed provider response), so a Chat view is never actually needed —
+ * this stub only exists to satisfy generatePlanWithAI's signature, and
+ * throws loudly if a future change ever routes through it unexpectedly.
+ */
+const fakeChatViewProviderV1 = {
+  askInteraction: (): Promise<void> => {
+    throw new Error("unexpected askInteraction call in a completed-outcome test");
+  },
+} as unknown as ChatViewProvider;
 
 /* eslint-disable @typescript-eslint/no-var-requires */
 const settingsModule = require("../config/settings") as Record<string, unknown>;
 const modelSelectionModule = require("../utils/modelSelection") as Record<string, unknown>;
 const runnerRegistryModule = require("../runners/runnerRegistry") as Record<string, unknown>;
+const copilotLmTransportModule = require("../runners/copilotLanguageModelRunner") as Record<string, unknown>;
 const promptTemplatesModule = require("../utils/promptTemplates") as Record<string, unknown>;
 const promptSizeGuardModule = require("../utils/promptSizeGuard") as Record<string, unknown>;
 const runLogModule = require("../utils/runLog") as Record<string, unknown>;
@@ -49,6 +71,66 @@ const contextPackModule = require("../utils/contextPack") as Record<string, unkn
 const fileUtilsModule = require("../utils/fileUtils") as Record<string, unknown>;
 const automationChainModule = require("../utils/automationChain") as Record<string, unknown>;
 /* eslint-enable @typescript-eslint/no-var-requires */
+
+/**
+ * Fake the V1 broker's Copilot text transport (generatePlanWithAI.ts now
+ * drives its provider call through the task action coordinator, not a
+ * legacy AgentRunner) so a "generatePlanWithAI directly" test can prove a
+ * completed markdown-artifact.v1 result reaches plan.md without a real
+ * Copilot/CLI invocation. Echoes the request's own correlation, exactly like
+ * production transports must (plan §3.1).
+ */
+function fakeCompletedCopilotTransportFactory(
+  markdown: string
+): () => { runnerId: string; invoke: (request: unknown, output: { write: (chunk: string) => boolean }) => Promise<{ kind: "completed" }> } {
+  return () => ({
+    // Must match the reservation's runnerId for the real "copilot" candidate
+    // (openV1RunnerSelection's toRankedEntry hardcodes "copilot-lm") — the
+    // broker rejects a transport whose runnerId differs from its claimed
+    // reservation's (agentExecutionBrokerV1.ts's prepareAgentInvocationV1).
+    runnerId: "copilot-lm",
+    invoke: (
+      request: unknown,
+      output: { write: (chunk: string) => boolean }
+    ): Promise<{ kind: "completed" }> => {
+      const correlation = (request as { correlation: unknown }).correlation;
+      const envelope = {
+        version: 1,
+        correlation,
+        kind: "completed",
+        content: { contentType: "markdown-artifact.v1", schemaVersion: 1, markdown },
+      };
+      output.write(`<<<ENSEMBLE_AI_RESULT_V1>>>\n${JSON.stringify(envelope)}\n<<<END_ENSEMBLE_AI_RESULT_V1>>>\n`);
+      return Promise.resolve({ kind: "completed" });
+    },
+  });
+}
+
+/**
+ * Set up the shared workflow-runtime singletons (path registry, file store,
+ * lease store, Chat interaction transaction store) a real coordinator
+ * invocation needs, backed by a throwaway private-storage directory. Returns
+ * a teardown function that restores the pristine, unconfigured state.
+ */
+function setUpTaskActionRuntimeForTestV1(): { tearDown: () => void } {
+  resetWorkflowRuntimeServicesForTestV1();
+  resetProductionTaskActionRegistryForTestV1();
+  const privateStorageDir = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-ff-chain-private-"));
+  const privateRootId = configureWorkflowPrivateStorageRootV1(privateStorageDir);
+  setChatInteractionTransactionStoreV1(
+    createChatInteractionTransactionStoreV1({
+      registry: getWorkflowPathRegistryV1(),
+      fileStore: getWorkflowFileStoreV1(),
+      privateRootId,
+    })
+  );
+  return {
+    tearDown: (): void => {
+      resetWorkflowRuntimeServicesForTestV1();
+      resetProductionTaskActionRegistryForTestV1();
+    },
+  };
+}
 
 const REAL_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-ff-chain-"));
 
@@ -381,40 +463,33 @@ void describe("Complete & Move On auto-fast-forward chaining", () => {
     const wsStub = installWorkspaceFoldersStub();
     const { dispatches, patched: dispatchSeam } = recordDispatches();
 
-    const fakeRunner = {
-      id: "stub-runner",
-      label: "Stub Provider",
-      capabilities: { planning: true, review: true, assistant: false },
-      isAvailable: (): Promise<{ available: boolean }> => Promise.resolve({ available: true }),
-      run: async (request: AgentRunRequest): Promise<AgentRunResult> => {
-        await fs.promises.writeFile(request.outputFile.fsPath, "# Plan\n\n1. Generated.\n", "utf8");
-        return { runnerId: "stub-runner", status: "completed", summary: "stub run" };
-      },
-    };
-
     const inventory = {
       getTaskById: (): undefined => undefined,
-      getTaskByPath: (fsPath: string): { taskFolderPath: string; workspaceFolder: vscode.Uri } => ({
+      getTaskByPath: (
+        fsPath: string
+      ): { taskFolderPath: string; workspaceFolder: vscode.Uri; canonicalId: string; progress: { status: string; currentStage: string } } => ({
         taskFolderPath: fsPath,
         workspaceFolder: vscode.Uri.file(REAL_ROOT),
+        canonicalId: fsPath,
+        progress: { status: "active", currentStage: "desc" },
       }),
       refresh: (): Promise<void> => Promise.resolve(),
     } as unknown as TaskInventory;
 
+    const runtime = setUpTaskActionRuntimeForTestV1();
     const patches: Patched[] = [
       dispatchSeam,
       // The standalone setting is OFF — only the chained request may fire.
       patch(settingsModule, "getAutoReviewAfterPlanMode", () => "off"),
       patch(modelSelectionModule, "resolveFreshModelForStage", () =>
         Promise.resolve({ source: "settings", modelId: "stub:model" })),
-      patch(runnerRegistryModule, "resolveRunnerForModel", () => ({
-        runner: fakeRunner,
-        provider: "copilot",
-        providerLabel: "Stub Provider",
-        nativeModelId: undefined,
-      })),
       patch(runnerRegistryModule, "checkRunnerAvailabilityForModel", () =>
         Promise.resolve({ availability: { available: true }, providerLabel: "Stub Provider" })),
+      patch(
+        copilotLmTransportModule,
+        "createCopilotLmTextTransportV1",
+        fakeCompletedCopilotTransportFactory("# Plan\n\n1. Generated.\n")
+      ),
       patch(contextPackModule, "generateContextPack", () => Promise.resolve("# Context Pack (stub)\n")),
       patch(contextPackModule, "writeContextPackContent", () => Promise.resolve(undefined)),
       patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.resolve("stub prompt")),
@@ -426,7 +501,7 @@ void describe("Complete & Move On auto-fast-forward chaining", () => {
     const context = makeExtensionContext();
 
     try {
-      const succeeded = await generatePlanWithAI(context, inventory, {
+      const succeeded = await generatePlanWithAI(context, inventory, fakeChatViewProviderV1, {
         taskFolderPath: folderPath,
         followUpReviewMode: "auto-fast-forward",
       });
@@ -446,6 +521,7 @@ void describe("Complete & Move On auto-fast-forward chaining", () => {
       assert.equal((dispatched.arg as ChainedArg).taskFolderPath, folderPath);
     } finally {
       for (const p of patches.reverse()) { p.restore(); }
+      runtime.tearDown();
       wsStub.restore();
       fsBridge.restore();
       provider.dispose();
@@ -462,39 +538,32 @@ void describe("Complete & Move On auto-fast-forward chaining", () => {
     const wsStub = installWorkspaceFoldersStub();
     const { dispatches, patched: dispatchSeam } = recordDispatches();
 
-    const fakeRunner = {
-      id: "stub-runner",
-      label: "Stub Provider",
-      capabilities: { planning: true, review: true, assistant: false },
-      isAvailable: (): Promise<{ available: boolean }> => Promise.resolve({ available: true }),
-      run: async (request: AgentRunRequest): Promise<AgentRunResult> => {
-        await fs.promises.writeFile(request.outputFile.fsPath, "# Plan\n\n1. Generated.\n", "utf8");
-        return { runnerId: "stub-runner", status: "completed", summary: "stub run" };
-      },
-    };
-
     const inventory = {
       getTaskById: (): undefined => undefined,
-      getTaskByPath: (fsPath: string): { taskFolderPath: string; workspaceFolder: vscode.Uri } => ({
+      getTaskByPath: (
+        fsPath: string
+      ): { taskFolderPath: string; workspaceFolder: vscode.Uri; canonicalId: string; progress: { status: string; currentStage: string } } => ({
         taskFolderPath: fsPath,
         workspaceFolder: vscode.Uri.file(REAL_ROOT),
+        canonicalId: fsPath,
+        progress: { status: "active", currentStage: "desc" },
       }),
       refresh: (): Promise<void> => Promise.resolve(),
     } as unknown as TaskInventory;
 
+    const runtime = setUpTaskActionRuntimeForTestV1();
     const patches: Patched[] = [
       dispatchSeam,
       patch(settingsModule, "getAutoReviewAfterPlanMode", () => "off"),
       patch(modelSelectionModule, "resolveFreshModelForStage", () =>
         Promise.resolve({ source: "settings", modelId: "stub:model" })),
-      patch(runnerRegistryModule, "resolveRunnerForModel", () => ({
-        runner: fakeRunner,
-        provider: "copilot",
-        providerLabel: "Stub Provider",
-        nativeModelId: undefined,
-      })),
       patch(runnerRegistryModule, "checkRunnerAvailabilityForModel", () =>
         Promise.resolve({ availability: { available: true }, providerLabel: "Stub Provider" })),
+      patch(
+        copilotLmTransportModule,
+        "createCopilotLmTextTransportV1",
+        fakeCompletedCopilotTransportFactory("# Plan\n\n1. Generated.\n")
+      ),
       patch(contextPackModule, "generateContextPack", () => Promise.resolve("# Context Pack (stub)\n")),
       patch(contextPackModule, "writeContextPackContent", () => Promise.resolve(undefined)),
       patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.resolve("stub prompt")),
@@ -506,7 +575,7 @@ void describe("Complete & Move On auto-fast-forward chaining", () => {
     const context = makeExtensionContext();
 
     try {
-      const succeeded = await generatePlanWithAI(context, inventory, {
+      const succeeded = await generatePlanWithAI(context, inventory, fakeChatViewProviderV1, {
         taskFolderPath: folderPath,
       });
       assert.equal(succeeded, true, "plan generation completed");
@@ -516,6 +585,7 @@ void describe("Complete & Move On auto-fast-forward chaining", () => {
       assert.equal(dispatches.length, 0, "no follow-up review dispatched");
     } finally {
       for (const p of patches.reverse()) { p.restore(); }
+      runtime.tearDown();
       wsStub.restore();
       fsBridge.restore();
       provider.dispose();

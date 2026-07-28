@@ -117,17 +117,15 @@ void describe("Stage 3 action matrix contracts", () => {
     );
   });
 
-  void it("uses the same free-form task-entry guidance in packaged and fallback templates", () => {
-    const expected =
-      "# Instructions\n\nDescribe the work you want to do here in as much detail as is useful. When\nyou're ready, use **Draft with AI** to turn these notes into a structured task\ndescription. Questions from the stage AI appear in the **Chat With AI** panel.\n\n# User's Description of the Task\n" +
-      "\n".repeat(10);
+  void it("uses the same canonical task document template in packaged and fallback templates", () => {
+    const expected = "# Task\n\n## Task Description\n\n## Draft with AI\n";
     const packagedTemplate = readWorkspaceFile(
       path.join("resources", "prompts", "task-template.md")
     ).replace(/\r\n/g, "\n");
     assert.equal(packagedTemplate, expected);
     assert.match(
       readWorkspaceFile(path.join("src", "commands", "startNewTask.ts")),
-      /return "# Instructions\\n\\nDescribe the work you want to do here/
+      /return "# Task\\n\\n## Task Description\\n\\n## Draft with AI\\n"/
     );
   });
 

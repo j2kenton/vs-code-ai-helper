@@ -589,6 +589,91 @@
         "targetActionKey": "none",
         "liveStabilitySha256": "39b8bb6512a51e5b5a3dc6b4eb652e3eb642313268344512fd97d68ea30549a6"
       }
+    },
+    {
+      "annotationKind": "pregateRemovedRoute",
+      "routeKey": "provider:src/commands/draftTaskWithAI.ts#draftTaskWithAI->resolveRunnerForModel#1",
+      "path": "src/commands/draftTaskWithAI.ts",
+      "planSection": "§6.3 (Migrate Draft atomically)",
+      "rationale": "Migrated to V1 action coordinator, replacing legacy runner/writer call site.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "text2",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "symbol": "draftTaskWithAI",
+        "sourceSpan": "L568-L570",
+        "edgeKind": "pregateRemovedRoute",
+        "targetActionKey": "draft.v1",
+        "pregateStabilitySha256": "5b5daa0cd3b177ca03aa5056fc2c3f6c07444685abd5777d082982cb5c383881"
+      }
+    },
+    {
+      "annotationKind": "pregateRemovedRoute",
+      "routeKey": "provider:src/commands/draftTaskWithAI.ts#draftTaskWithAI->resolveRunnerForModel#2",
+      "path": "src/commands/draftTaskWithAI.ts",
+      "planSection": "§6.3 (Migrate Draft atomically)",
+      "rationale": "Migrated to V1 action coordinator, replacing legacy runner/writer call site.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "text2",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "symbol": "draftTaskWithAI",
+        "sourceSpan": "L899-L903",
+        "edgeKind": "pregateRemovedRoute",
+        "targetActionKey": "draft.v1",
+        "pregateStabilitySha256": "40a6716b911b599d60dc00291e46b3a6c00af303f13032e565fe274c68ce9b16"
+      }
+    },
+    {
+      "annotationKind": "pregateRemovedRoute",
+      "routeKey": "provider:src/commands/generatePlanWithAI.ts#generatePlanWithAIForResolvedTask->resolveRunnerForModel#1",
+      "path": "src/commands/generatePlanWithAI.ts",
+      "planSection": "§6.2 (Implement Generate Plan first)",
+      "rationale": "Migrated to V1 action coordinator, replacing legacy runner/writer call site.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "text1",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "symbol": "generatePlanWithAIForResolvedTask",
+        "sourceSpan": "L270-L272",
+        "edgeKind": "pregateRemovedRoute",
+        "targetActionKey": "generatePlan.v1",
+        "pregateStabilitySha256": "386633697e63cfefcc996d6da5d6a73c3c659415b02bd926eb4e88cbc3e8ab13"
+      }
+    },
+    {
+      "annotationKind": "pregateRemovedRoute",
+      "routeKey": "writer:src/commands/draftTaskWithAI.ts#result.outputFile#1",
+      "path": "src/commands/draftTaskWithAI.ts",
+      "planSection": "§6.3 (Migrate Draft atomically)",
+      "rationale": "Migrated to V1 action coordinator, replacing legacy runner/writer call site.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "text2",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "symbol": "result",
+        "sourceSpan": "L673-L673",
+        "edgeKind": "pregateRemovedRoute",
+        "targetActionKey": "draft.v1",
+        "pregateStabilitySha256": "ce6008990e04bba265bbfb2d05a467937a1515dc4ce8af7b589bce8ef8273b36"
+      }
+    },
+    {
+      "annotationKind": "pregateRemovedRoute",
+      "routeKey": "writer:src/commands/generatePlanWithAI.ts#generatePlanWithAIForResolvedTask.outputFile#1",
+      "path": "src/commands/generatePlanWithAI.ts",
+      "planSection": "§6.2 (Implement Generate Plan first)",
+      "rationale": "Migrated to V1 action coordinator, replacing legacy runner/writer call site.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "text1",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "symbol": "generatePlanWithAIForResolvedTask",
+        "sourceSpan": "L367-L367",
+        "edgeKind": "pregateRemovedRoute",
+        "targetActionKey": "generatePlan.v1",
+        "pregateStabilitySha256": "fc0b1f841c6147e2d43c59d4c0e5cbe566ad433c4b2c969510edf1b1ea82c63f"
+      }
     }
   ]
 }

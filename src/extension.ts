@@ -2,11 +2,19 @@ import * as vscode from "vscode";
 import { registerStartNewTaskCommand } from "./commands/startNewTask";
 import { LegacyCreatingStartupGateV0 } from "./state/legacyCreatingStartupGateV0";
 import { registerResumeTaskCommand } from "./commands/resumeTask";
-import { registerGeneratePlanWithAICommand } from "./commands/generatePlanWithAI";
+import {
+  registerGeneratePlanWithAICommand,
+  resumeGeneratePlanInteractionV1,
+} from "./commands/generatePlanWithAI";
+import { GENERATE_PLAN_ACTION_KEY_V1 } from "./actions/rows/generatePlanRowV1";
+import { DRAFT_ACTION_KEY_V1 } from "./actions/rows/draftRowV1";
 import { registerReviewActionCommands } from "./commands/reviewActions";
 import { registerSetTaskStageCommand } from "./commands/setTaskStage";
 import { registerViewArtifactCommands } from "./commands/viewArtifacts";
-import { registerDraftTaskWithAICommand } from "./commands/draftTaskWithAI";
+import {
+  registerDraftTaskWithAICommand,
+  resumeDraftInteractionV1,
+} from "./commands/draftTaskWithAI";
 import { registerApplyCurrentStageActionCommand } from "./commands/applyCurrentStageAction";
 import { registerOpenAndStartNewTaskCommand } from "./commands/openAndStartNewTask";
 import { registerReviewCurrentTaskCommand } from "./commands/reviewCurrentTask";
@@ -166,10 +174,11 @@ export function activate(context: vscode.ExtensionContext): void {
   // touching the mirror. `context.globalStorageUri`'s directory is not
   // guaranteed to exist yet — VS Code does not create it automatically — so
   // it is created (idempotently) before anything is provisioned under it.
-  // Resume is intentionally left unwired here: it requires the action
-  // coordinator, which nothing in production constructs yet (see
-  // ChatInteractionServicesV1's doc comment in chatView.ts) — Chat With AI
-  // surfaces a clear "not available yet" message for Resume until then.
+  // Resume dispatches by the interaction's recorded actionKey (plan §6.1):
+  // today generatePlan.v1 (plan §6.2) and draft.v1 (plan §6.3) have migrated
+  // onto the coordinator, so those are the only keys this routes to a real
+  // handler — any other (not-yet-migrated) actionKey still surfaces the
+  // "not available yet" message via the fallback branch below.
   void vscode.workspace.fs.createDirectory(context.globalStorageUri).then(
     () => undefined,
     (err: unknown) => console.error("Could not create the extension's global storage directory", err)
@@ -197,6 +206,43 @@ export function activate(context: vscode.ExtensionContext): void {
       return submitted.ok ? { ok: true } : { ok: false, reason: submitted.reason };
     },
     cancel: async (ref) => runChatConversationAction(() => chatConversationOrchestrator.cancel(ref)),
+    resume: async (ref, resumeIdempotencyId) => {
+      const loaded = await chatConversationOrchestrator.loadInteraction(ref);
+      if (loaded.kind !== "ok") {
+        return {
+          ok: false,
+          reason: loaded.kind === "storageUnavailable" ? "workflow storage is unavailable" : loaded.reason,
+        };
+      }
+      const actionKey = loaded.record.correlation.actionKey;
+      const cancellation = new vscode.CancellationTokenSource();
+      try {
+        if (actionKey === GENERATE_PLAN_ACTION_KEY_V1) {
+          return await resumeGeneratePlanInteractionV1(
+            inventory,
+            chatViewProvider,
+            ref,
+            resumeIdempotencyId,
+            cancellation.token
+          );
+        }
+        if (actionKey === DRAFT_ACTION_KEY_V1) {
+          return await resumeDraftInteractionV1(
+            inventory,
+            chatViewProvider,
+            ref,
+            resumeIdempotencyId,
+            cancellation.token
+          );
+        }
+        return {
+          ok: false,
+          reason: "Resume isn't available yet for this question — the action that asked it hasn't been migrated to the new Resume flow.",
+        };
+      } finally {
+        cancellation.dispose();
+      }
+    },
   });
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(
@@ -311,7 +357,7 @@ export function activate(context: vscode.ExtensionContext): void {
   registerStartNewTaskCommand(context, inventory, currentTaskStore);
   registerResumeTaskCommand(context, inventory, currentTaskStore);
   // AI commands receive the full context so they can call ensureAiConsent
-  registerGeneratePlanWithAICommand(context, inventory);
+  registerGeneratePlanWithAICommand(context, inventory, chatViewProvider);
   registerReviewActionCommands(context);
   registerSetTaskStageCommand(context, inventory, currentTaskStore);
   // The extension-level Settings button (beside the overflow menu) opens

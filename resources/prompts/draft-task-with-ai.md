@@ -1,12 +1,11 @@
 You are helping a developer clarify and structure a software task description.
 
-Given the task description below, produce a structured draft and a list of open questions.
+Given the task description below, produce a structured draft of the work as
+your completed content's Markdown.
 
-Return ONLY the following two sections in this exact format (no other text before or after):
-
-## Draft with AI
-
-[A clear, structured restatement of the task. Start with a one-sentence goal that states the concrete change in plain words, then include EXACTLY these three subsections, in this order, using `###` headings:
+Start with a one-sentence goal that states the concrete change in plain
+words, then include EXACTLY these three subsections, in this order, using
+`###` headings:
 
 ### Behavior change
 
@@ -20,11 +19,15 @@ Return ONLY the following two sections in this exact format (no other text befor
 
 [A bullet list of the specific changes to make. Be concise and actionable; include constraints and key implementation notes where inferable.]
 
-State the CONCRETE work throughout: name the actual features, behaviors, files, or UI elements being changed and what changes about them. Avoid abstract planning language ("independently shippable slices", "workstreams", "vertical slices") — a reader should learn what the software will do differently, not how the work is organized.]
+State the CONCRETE work throughout: name the actual features, behaviors,
+files, or UI elements being changed and what changes about them. Avoid
+abstract planning language ("independently shippable slices", "workstreams",
+"vertical slices") — a reader should learn what the software will do
+differently, not how the work is organized.
 
-## Open Questions
-
-[A bullet list of open questions that need clarification before implementation can begin. If everything is clear, write exactly: - None.]
+If you need the user to clarify something before you can produce a useful
+draft, ask them instead of guessing — do not fabricate an assumption and
+write it into the draft as if it were given.
 
 ---
 

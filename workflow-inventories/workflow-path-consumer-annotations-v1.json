@@ -234,6 +234,23 @@
         "targetActionKey": "n/a (superseded by src/services/workflowFileStoreV1.ts's consumer row)",
         "pregateStabilitySha256": "3c581042b4ebf56076bde1d5066cfed4f263c4abb4c71f9bd9d61f2720317d9b"
       }
+    },
+    {
+      "annotationKind": "pregateModifiedConsumer",
+      "path": "src/commands/draftTaskWithAI.ts",
+      "planSection": "§6.3 (Draft atomic cutover) / §8 Text 2 cohort",
+      "rationale": "Text 2 cohort: draftTaskWithAI.ts refactored to delegate to draft.v1 registry row / coordinator.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "text2",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "symbol": "draftTaskWithAI",
+        "sourceSpan": "L246-L246",
+        "edgeKind": "pregateModifiedConsumer",
+        "targetActionKey": "draft.v1",
+        "pregateStabilitySha256": "aee6d208a735f6bbde4d631de7b3d16d89ecddd0d09f12e20c67c7500ae6a81e",
+        "liveStabilitySha256": "2f2047e09a300a0f1d47ed95a744e9cd3b1ebc05129bacb5d4ccf27877fbfab4"
+      }
     }
   ]
 }

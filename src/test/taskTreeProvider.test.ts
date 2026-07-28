@@ -11,7 +11,7 @@ import {
   type TaskStage,
 } from "../types/taskProgress";
 import { parseReadiness } from "../utils/reviewReadiness";
-import { parseTaskDocument, buildTaskDocument, parseAIResponse } from "../commands/draftTaskWithAI";
+import { parseTaskDocument, buildTaskDocument } from "../utils/taskDescriptionDocument";
 import { shortcutHint } from "../utils/shortcutHints";
 
 // Mock dependencies before importing the module under test
@@ -540,72 +540,14 @@ void describe("draftTaskWithAI.buildTaskDocument", () => {
       draftWithAI: "Draft here.",
       openQuestions: "- Q1",
     });
-    const introIdx = doc.indexOf("Intro text.");
+    const headerIdx = doc.indexOf("# Task");
     const taskIdx = doc.indexOf("## Task Description");
     const draftIdx = doc.indexOf("## Draft with AI");
     const questionsIdx = doc.indexOf("## Open Questions");
 
-    assert.ok(introIdx < taskIdx);
+    assert.ok(headerIdx < taskIdx);
     assert.ok(taskIdx < draftIdx);
-    assert.ok(draftIdx < questionsIdx);
-  });
-});
-
-void describe("draftTaskWithAI.parseAIResponse", () => {
-  void it('should parse a valid AI response with both required sections', () => {
-    const response = [
-      "## Draft with AI",
-      "",
-      "This is the draft content.",
-      "",
-      "## Open Questions",
-      "",
-      "- What is the scope?",
-      "- Which files?",
-    ].join("\n");
-
-    const result = parseAIResponse(response);
-    assert.ok(result !== undefined);
-    if (!result) {
-      assert.fail("Expected parseAIResponse to return a result");
-    }
-    assert.strictEqual(result.draftWithAI, "This is the draft content.");
-    assert.ok(result.openQuestions.includes("- What is the scope?"));
-  });
-
-  void it('should return undefined when Draft with AI header is missing', () => {
-    const response = "## Open Questions\n\n- Some question.";
-    assert.strictEqual(parseAIResponse(response), undefined);
-  });
-
-  void it('should return undefined when Open Questions header is missing', () => {
-    const response = "## Draft with AI\n\nSome draft.";
-    assert.strictEqual(parseAIResponse(response), undefined);
-  });
-
-  void it('should return undefined when headers are in wrong order', () => {
-    const response = "## Open Questions\n\n- Q1\n\n## Draft with AI\n\nDraft.";
-    assert.strictEqual(parseAIResponse(response), undefined);
-  });
-
-  void it('should return undefined when Draft with AI appears twice', () => {
-    const response = "## Draft with AI\n\nDraft 1.\n\n## Open Questions\n\n- Q1\n\n## Draft with AI\n\nDraft 2.";
-    assert.strictEqual(parseAIResponse(response), undefined);
-  });
-
-  void it('should return undefined when Open Questions appears twice', () => {
-    const response = "## Draft with AI\n\nDraft.\n\n## Open Questions\n\n- Q1\n\n## Open Questions\n\n- Q2";
-    assert.strictEqual(parseAIResponse(response), undefined);
-  });
-
-  void it('should parse "- None." as a valid empty open questions response', () => {
-    const response = "## Draft with AI\n\nDraft.\n\n## Open Questions\n\n- None.";
-    const result = parseAIResponse(response);
-    assert.ok(result !== undefined);
-    if (!result) {
-      assert.fail("Expected parseAIResponse to return a result");
-    }
-    assert.strictEqual(result.openQuestions, "- None.");
+    assert.strictEqual(questionsIdx, -1);
   });
 });
 

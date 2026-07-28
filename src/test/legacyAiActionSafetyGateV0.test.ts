@@ -40,6 +40,24 @@ const REGISTERED_ROUTE_IDS = [
   "commitPushMetadata.v1",
 ];
 
+/**
+ * Route ids that have migrated onto the coordinator (plan §6.2 onward): each
+ * one's LEGACY invocation path is no longer in `LEGACY_AI_ROUTE_DISABLED_V0`
+ * (its real handler now routes through the coordinator instead), and its
+ * actionKey is in `MIGRATED_ACTION_KEYS_V0`. Still a REGISTERED route id
+ * (assertLegacyAiRouteAllowedV0 still recognizes it), just no longer
+ * disabled.
+ */
+const MIGRATED_ROUTE_IDS = [
+  "generatePlan.v1",
+  "draft.v1",
+  "generateImplementation.v1",
+  "review.v1",
+  "applyReview.v1",
+  "chatSend.v1",
+  "commitPushMetadata.v1",
+];
+
 const GATE_SOURCE_PATH = path.resolve(
   __dirname,
   "..",
@@ -57,7 +75,7 @@ void describe("LegacyAiActionSafetyGateV0", () => {
     // same source-order technique the wiring tests use.
     const source = fs.readFileSync(GATE_SOURCE_PATH, "utf8");
 
-    void it("LEGACY_AI_ROUTE_DISABLED_V0's initializer disables every registered route", () => {
+    void it("LEGACY_AI_ROUTE_DISABLED_V0's initializer disables every registered, not-yet-migrated route", () => {
       const initializerStart = source.indexOf(
         "export const LEGACY_AI_ROUTE_DISABLED_V0: ReadonlySet<string> = new Set<string>(["
       );
@@ -66,6 +84,13 @@ void describe("LegacyAiActionSafetyGateV0", () => {
       assert.ok(initializerEnd > initializerStart, "could not find the end of the initializer");
       const initializer = source.slice(initializerStart, initializerEnd);
       for (const routeId of REGISTERED_ROUTE_IDS) {
+        if (MIGRATED_ROUTE_IDS.includes(routeId)) {
+          assert.ok(
+            !initializer.includes(`"${routeId}"`),
+            `production LEGACY_AI_ROUTE_DISABLED_V0 must NOT disable migrated route "${routeId}"`
+          );
+          continue;
+        }
         assert.ok(
           initializer.includes(`"${routeId}"`),
           `production LEGACY_AI_ROUTE_DISABLED_V0 must disable "${routeId}" until its V1 migration lands`
@@ -82,8 +107,14 @@ void describe("LegacyAiActionSafetyGateV0", () => {
       );
     });
 
-    void it("MIGRATED_ACTION_KEYS_V0 is empty (no action has migrated yet)", () => {
-      assert.equal(MIGRATED_ACTION_KEYS_V0.size, 0);
+    void it("MIGRATED_ACTION_KEYS_V0 contains exactly the migrated route ids", () => {
+      assert.equal(MIGRATED_ACTION_KEYS_V0.size, MIGRATED_ROUTE_IDS.length);
+      for (const routeId of MIGRATED_ROUTE_IDS) {
+        assert.ok(
+          MIGRATED_ACTION_KEYS_V0.has(routeId),
+          `MIGRATED_ACTION_KEYS_V0 must contain "${routeId}"`
+        );
+      }
     });
   });
 
@@ -188,7 +219,10 @@ void describe("LegacyAiActionSafetyGateV0", () => {
           assertNoUnauthorizedV1CorrelationV0({
             prompt: "hello",
             correlation: {
-              actionKey: "generatePlan.v1",
+              // "fastForward.v1" has not migrated yet — "generatePlan.v1" and
+              // "draft.v1" are covered by the "allows... once migrated" test
+              // below instead.
+              actionKey: "fastForward.v1",
               operationId: "a".repeat(32),
               attemptId: "b".repeat(32),
               taskBindingId: "tb",
@@ -210,23 +244,21 @@ void describe("LegacyAiActionSafetyGateV0", () => {
     });
 
     void it("allows a V1-correlated request once its actionKey is migrated", () => {
-      // MIGRATED_ACTION_KEYS_V0 is empty in production today (plan §8 has not
-      // migrated any action yet) — mutate the underlying Set directly here
-      // (it is a real Set at runtime; only its exported type is read-only) to
-      // prove the "allowed" branch actually exists, then restore it so this
-      // test cannot leak state into any other test in the process.
-      const mutable = MIGRATED_ACTION_KEYS_V0 as unknown as Set<string>;
-      assert.equal(mutable.has("generatePlan.v1"), false);
-      mutable.add("generatePlan.v1");
-      try {
-        assert.doesNotThrow(() =>
-          assertNoUnauthorizedV1CorrelationV0({
-            correlation: { actionKey: "generatePlan.v1" },
-          })
-        );
-      } finally {
-        mutable.delete("generatePlan.v1");
-      }
+      // "generatePlan.v1" and "draft.v1" are genuinely migrated in
+      // production today (plan §6.2/§6.3) — no mutation needed to prove the
+      // "allowed" branch, unlike before any action had migrated.
+      assert.equal(MIGRATED_ACTION_KEYS_V0.has("generatePlan.v1"), true);
+      assert.equal(MIGRATED_ACTION_KEYS_V0.has("draft.v1"), true);
+      assert.doesNotThrow(() =>
+        assertNoUnauthorizedV1CorrelationV0({
+          correlation: { actionKey: "generatePlan.v1" },
+        })
+      );
+      assert.doesNotThrow(() =>
+        assertNoUnauthorizedV1CorrelationV0({
+          correlation: { actionKey: "draft.v1" },
+        })
+      );
     });
   });
 });

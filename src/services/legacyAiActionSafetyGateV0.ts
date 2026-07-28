@@ -99,17 +99,13 @@ export class LegacyAiActionSafetyGateErrorV0 extends Error {
  * real V1 migration landing in the same change.
  */
 export const LEGACY_AI_ROUTE_DISABLED_V0: ReadonlySet<string> = new Set<string>([
-  "draft.v1",
-  "generatePlan.v1",
-  "review.v1",
-  "applyReview.v1",
+  // Text 1 (generatePlan.v1), Text 2 (draft.v1), Text 3 (generateImplementation.v1,
+  // review.v1, applyReview.v1, chatSend.v1, commitPushMetadata.v1) migrated onto
+  // the coordinator — see MIGRATED_ACTION_KEYS_V0 below.
   "fastForward.v1",
-  "generateImplementation.v1",
   "implementation.v1",
   "applyCurrentStage.v1",
   "lint.v1",
-  "chatSend.v1",
-  "commitPushMetadata.v1",
 ]);
 
 /**
@@ -160,12 +156,20 @@ export function isLegacyAiRouteDisabledV0(routeId: string): boolean {
 
 /**
  * Action keys allowed to carry V1 correlation data (plan §3.1) through the
- * shared runner/provider boundary. Empty until the registry/coordinator
- * (plan §3.8) exists and a real action migrates (plan §8, "Text 1" cohort
- * onward) — populate this set only as part of that migration, never ahead
- * of it.
+ * shared runner/provider boundary. Populated one action at a time, in the
+ * same change that removes its route id from `LEGACY_AI_ROUTE_DISABLED_V0`
+ * above — "generatePlan.v1" was the first (plan §6.2's Generate Plan
+ * vertical slice); "draft.v1" is the second (plan §6.3's Draft migration).
  */
-export const MIGRATED_ACTION_KEYS_V0: ReadonlySet<string> = new Set<string>();
+export const MIGRATED_ACTION_KEYS_V0: ReadonlySet<string> = new Set<string>([
+  "generatePlan.v1",
+  "draft.v1",
+  "generateImplementation.v1",
+  "review.v1",
+  "applyReview.v1",
+  "chatSend.v1",
+  "commitPushMetadata.v1",
+]);
 
 /**
  * Enforcement switch for the boundary-level rejection of legacy

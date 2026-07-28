@@ -33,6 +33,7 @@ import * as fs from "fs";
 import * as path from "path";
 import * as vscode from "vscode";
 import { ChatInteractionTransactionStoreV1 } from "./chatInteractionTransactionStoreV1";
+import { createWorkflowLeaseStoreV1, WorkflowLeaseStoreV1 } from "./workflowLeaseStoreV1";
 import { decodeTaskProgressTextV1 } from "./taskProgressDecoderV1";
 import { TASK_PROGRESS_FILENAME } from "../types/taskProgress";
 import { deriveTaskBindingV1 } from "../types/taskBindingV1";
@@ -54,6 +55,16 @@ let registry: WorkflowPathRegistryV1 = createWorkflowPathRegistryV1();
 let fileStore: WorkflowFileStoreV1 = createWorkflowFileStoreV1(registry.registeredRoots());
 let privateRootId: string | undefined;
 let transactionStore: ChatInteractionTransactionStoreV1 | undefined;
+/**
+ * The one shared task-operation lease store (plan §1.8/§3.9) the action
+ * coordinator acquires against for every provider/lifecycle row — a runtime,
+ * in-memory-only concern, never persisted (see workflowLeaseStoreV1.ts's
+ * module header). A fresh coordinator instance may be constructed per
+ * invocation (it is a stateless factory over its injected deps), but every
+ * instance must share THIS lease store so a duplicate invocation against the
+ * same task binding is actually caught.
+ */
+let leaseStore: WorkflowLeaseStoreV1 = createWorkflowLeaseStoreV1();
 /**
  * Root ids that passed the strict, ownership-backed task-folder verification
  * (see ensureWorkflowTaskFolderRootV1) — every successfully registered
@@ -548,12 +559,18 @@ export function getChatInteractionTransactionStoreV1(): ChatInteractionTransacti
   return transactionStore;
 }
 
+/** The one shared runtime task-operation lease store (see the field's own doc comment above). */
+export function getWorkflowLeaseStoreV1(): WorkflowLeaseStoreV1 {
+  return leaseStore;
+}
+
 /** Test isolation: restore the pristine, unconfigured state. Production never calls this. */
 export function resetWorkflowRuntimeServicesForTestV1(): void {
   registry = createWorkflowPathRegistryV1();
   fileStore = createWorkflowFileStoreV1(registry.registeredRoots());
   privateRootId = undefined;
   transactionStore = undefined;
+  leaseStore = createWorkflowLeaseStoreV1();
   verifiedTaskFolderRootIds = new Set<string>();
   verifiedTaskFolderBindingIds = new Map<string, string>();
 }

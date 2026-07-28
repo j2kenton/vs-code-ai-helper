@@ -1,8 +1,8 @@
 /**
  * Command-level coverage for draftTaskWithAI (G18): invokes the REAL command
- * function (not just its pure helpers, already covered in
- * draftTaskWithAI.test.ts) to prove three things together, which no existing
- * test asserted in combination:
+ * function (not just draft.v1's row, already covered in draftRowV1.test.ts)
+ * to prove three things together, which no existing test asserted in
+ * combination:
  *
  *  1. Description-model routing: the model resolved for the "desc" stage is
  *     the one actually used both to generate the draft AND (since the task
@@ -15,11 +15,13 @@
  *  3. The derived task name comes from the AI response, not the placeholder
  *     or the raw folder slug.
  *
- * Only the provider boundary is faked (model resolution, the runner process,
- * prompt template rendering, run-log writer) — consent, task resolution,
- * parsing/validation, and the task.md / task-progress.json writes are the
- * real production code paths, run against a real temp-directory fixture (the
- * same technique as nextStageAutoReviewCommandChain.test.ts).
+ * draftTaskWithAI.ts now drives its provider call through the task action
+ * coordinator (plan §6.3), not a legacy AgentRunner — so, like
+ * completeAndMoveOnFastForward.test.ts's generatePlanWithAI coverage, only
+ * the V1 broker's Copilot text transport is faked; task resolution,
+ * prompt/size-gate wiring, coordinator promotion (the real read-merge-write
+ * into task.md), and the task.md / task-progress.json writes are the real
+ * production code paths, run against a real temp-directory fixture.
  */
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
@@ -39,13 +41,24 @@ import {
 import { safeRemoveDir } from "./testFsUtils";
 import { DISCLAIMER_VERSION } from "../legal/disclaimerVersion";
 import type { ChatViewProvider } from "../views/chatView";
-import type { AgentRunRequest, AgentRunResult } from "../types/agentRunner";
+import { createChatInteractionTransactionStoreV1 } from "../services/chatInteractionTransactionStoreV1";
+import {
+  configureWorkflowPrivateStorageRootV1,
+  getWorkflowFileStoreV1,
+  getWorkflowPathRegistryV1,
+  resetWorkflowRuntimeServicesForTestV1,
+  setChatInteractionTransactionStoreV1,
+} from "../services/workflowRuntimeServicesV1";
+import { resetProductionTaskActionRegistryForTestV1 } from "../actions/productionTaskActionRuntimeV1";
 
 /* eslint-disable @typescript-eslint/no-var-requires */
 const modelSelectionModule = require("../utils/modelSelection") as Record<string, unknown>;
 const runnerRegistryModule = require("../runners/runnerRegistry") as Record<string, unknown>;
+const copilotLmTransportModule = require("../runners/copilotLanguageModelRunner") as Record<string, unknown>;
 const promptTemplatesModule = require("../utils/promptTemplates") as Record<string, unknown>;
+const promptSizeGuardModule = require("../utils/promptSizeGuard") as Record<string, unknown>;
 const runLogModule = require("../utils/runLog") as Record<string, unknown>;
+const fileUtilsModule = require("../utils/fileUtils") as Record<string, unknown>;
 /* eslint-enable @typescript-eslint/no-var-requires */
 
 const REAL_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-draft-cmd-"));
@@ -55,11 +68,80 @@ const PLACEHOLDER_INTRO =
   "you're ready, use **Draft with AI** to turn these notes into a structured task\n" +
   "description. Questions from the stage AI appear in the **Chat With AI** panel.";
 
+const VALID_DRAFT_BODY =
+  "Add a background export queue.\n\n" +
+  "### Behavior change\n\nExports run off the UI thread.\n\n" +
+  "### Affected areas\n\n- exportService.ts\n\n" +
+  "### Actionable changes\n\n- Add the queue.";
+
 interface Patched { restore: () => void }
 function patch(module: Record<string, unknown>, name: string, replacement: unknown): Patched {
   const orig = module[name];
   module[name] = replacement;
   return { restore: (): void => { module[name] = orig; } };
+}
+
+/**
+ * Fake the V1 broker's Copilot text transport (draftTaskWithAI.ts drives its
+ * provider call through the task action coordinator, not a legacy
+ * AgentRunner) so this test can prove a completed markdown-artifact.v1
+ * result reaches task.md without a real Copilot/CLI invocation. Echoes the
+ * request's own correlation, exactly like production transports must (plan
+ * §3.1). `onCreate` lets the test observe which native model id the
+ * coordinator actually selected.
+ */
+function fakeCompletedCopilotTransportFactory(
+  markdown: string,
+  onCreate: (options: { model?: string }) => void
+): (options: { model?: string }) => {
+  runnerId: string;
+  invoke: (request: unknown, output: { write: (chunk: string) => boolean }) => Promise<{ kind: "completed" }>;
+} {
+  return (options) => {
+    onCreate(options);
+    return {
+      runnerId: "copilot-lm",
+      invoke: (
+        request: unknown,
+        output: { write: (chunk: string) => boolean }
+      ): Promise<{ kind: "completed" }> => {
+        const correlation = (request as { correlation: unknown }).correlation;
+        const envelope = {
+          version: 1,
+          correlation,
+          kind: "completed",
+          content: { contentType: "markdown-artifact.v1", schemaVersion: 1, markdown },
+        };
+        output.write(`<<<ENSEMBLE_AI_RESULT_V1>>>\n${JSON.stringify(envelope)}\n<<<END_ENSEMBLE_AI_RESULT_V1>>>\n`);
+        return Promise.resolve({ kind: "completed" });
+      },
+    };
+  };
+}
+
+/**
+ * Set up the shared workflow-runtime singletons (path registry, file store,
+ * lease store, Chat interaction transaction store) a real coordinator
+ * invocation needs, backed by a throwaway private-storage directory.
+ */
+function setUpTaskActionRuntimeForTestV1(): { tearDown: () => void } {
+  resetWorkflowRuntimeServicesForTestV1();
+  resetProductionTaskActionRegistryForTestV1();
+  const privateStorageDir = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-draft-cmd-private-"));
+  const privateRootId = configureWorkflowPrivateStorageRootV1(privateStorageDir);
+  setChatInteractionTransactionStoreV1(
+    createChatInteractionTransactionStoreV1({
+      registry: getWorkflowPathRegistryV1(),
+      fileStore: getWorkflowFileStoreV1(),
+      privateRootId,
+    })
+  );
+  return {
+    tearDown: (): void => {
+      resetWorkflowRuntimeServicesForTestV1();
+      resetProductionTaskActionRegistryForTestV1();
+    },
+  };
 }
 
 function makeTaskFolder(name: string, taskDescription: string): string {
@@ -89,7 +171,7 @@ function makeTaskFolder(name: string, taskDescription: string): string {
   // description in the Task Description section.
   fs.writeFileSync(
     path.join(folderPath, "task.md"),
-    `${PLACEHOLDER_INTRO}\n\n## Task Description\n\n${taskDescription}\n\n## Draft with AI\n\n## Open Questions\n`,
+    `${PLACEHOLDER_INTRO}\n\n## Task Description\n\n${taskDescription}\n\n## Draft with AI\n\n`,
     "utf8"
   );
   return folderPath;
@@ -172,14 +254,6 @@ function installWorkspaceFoldersStub(): { restore: () => void } {
   return { restore: (): void => { ws.workspaceFolders = orig; } };
 }
 
-const VALID_AI_RESPONSE =
-  "## Draft with AI\n\n" +
-  "Add a background export queue.\n\n" +
-  "### Behavior change\n\nExports run off the UI thread.\n\n" +
-  "### Affected areas\n\n- exportService.ts\n\n" +
-  "### Actionable changes\n\n- Add the queue.\n\n" +
-  "## Open Questions\n\n- None.\n";
-
 void describe("draftTaskWithAI command (G18: Description-model routing regression)", () => {
   void it("routes both the draft generation and the derived task name through the Description-stage model, and never sends the placeholder intro to the AI", async () => {
     const folderPath = makeTaskFolder(
@@ -193,9 +267,10 @@ void describe("draftTaskWithAI command (G18: Description-model routing regressio
     initNotificationRouter(surface);
     const fsBridge = installFsBridge();
     const wsStub = installWorkspaceFoldersStub();
+    const runtime = setUpTaskActionRuntimeForTestV1();
 
     const modelStageCalls: string[] = [];
-    const runInvokedWithModelId: string[] = [];
+    const transportCreatedWithModel: (string | undefined)[] = [];
     let promptSeenByRenderer: string | undefined;
 
     const patches: Patched[] = [
@@ -209,23 +284,15 @@ void describe("draftTaskWithAI command (G18: Description-model routing regressio
         // rather than two different models silently diverging.
         return Promise.resolve({ modelId: stage === "desc" ? "fake-desc-model:v1" : "wrong-model:v1" });
       }),
-      patch(runnerRegistryModule, "resolveRunnerForModel", (modelId: string) => ({
-        runner: {
-          run: (_request: AgentRunRequest): Promise<AgentRunResult> => {
-            runInvokedWithModelId.push(modelId);
-            return Promise.resolve({
-              runnerId: "stub-runner",
-              status: "completed" as const,
-              summary: VALID_AI_RESPONSE,
-            });
-          },
-        },
-        provider: "claude-cli",
-        providerLabel: "Stub Provider",
-        nativeModelId: modelId,
-      })),
       patch(runnerRegistryModule, "checkRunnerAvailabilityForModel", () =>
         Promise.resolve({ availability: { available: true }, providerLabel: "Stub Provider" })
+      ),
+      patch(
+        copilotLmTransportModule,
+        "createCopilotLmTextTransportV1",
+        fakeCompletedCopilotTransportFactory(VALID_DRAFT_BODY, (options) => {
+          transportCreatedWithModel.push(options.model);
+        })
       ),
       patch(promptTemplatesModule, "renderPromptTemplate", (
         _extensionUri: unknown,
@@ -235,11 +302,15 @@ void describe("draftTaskWithAI command (G18: Description-model routing regressio
         promptSeenByRenderer = variables.taskDescription;
         return Promise.resolve(`stub prompt: ${variables.taskDescription}`);
       }),
+      patch(promptSizeGuardModule, "checkAndConfirmPromptSize", () => Promise.resolve("ok")),
       patch(runLogModule, "writeRunLog", () => Promise.resolve(vscode.Uri.file(path.join(folderPath, "run.log")))),
+      patch(fileUtilsModule, "safeOpenTextDocument", () => Promise.resolve(undefined)),
     ];
 
     const fakeChatViewProvider = {
-      ask: () => Promise.resolve(undefined),
+      askInteraction: (): Promise<void> => {
+        throw new Error("unexpected askInteraction call in a completed-outcome test");
+      },
     } as unknown as ChatViewProvider;
 
     try {
@@ -260,10 +331,10 @@ void describe("draftTaskWithAI command (G18: Description-model routing regressio
 
       // 2. The runner that actually generated the content was launched with
       //    the Description-stage model, not some other/default model.
-      assert.ok(runInvokedWithModelId.length > 0, "the runner must have been invoked");
+      assert.ok(transportCreatedWithModel.length > 0, "the transport must have been created");
       assert.ok(
-        runInvokedWithModelId.every((id) => id === "fake-desc-model:v1"),
-        `the runner must be invoked with the Description-stage model; got: ${JSON.stringify(runInvokedWithModelId)}`
+        transportCreatedWithModel.every((id) => id === "fake-desc-model:v1"),
+        `the transport must be created with the Description-stage model; got: ${JSON.stringify(transportCreatedWithModel)}`
       );
 
       // 3. Placeholder exclusion: the instructional intro paragraph must
@@ -288,8 +359,16 @@ void describe("draftTaskWithAI command (G18: Description-model routing regressio
       assert.equal(persisted?.nameIsDefault, false, "a drafted name must replace the default label");
       assert.match(persisted?.displayName ?? "", /background export queue/i);
       assert.doesNotMatch(persisted?.displayName ?? "", /Describe the work you want to do here/);
+
+      // 5. task.md's Task Description section is preserved untouched, and no
+      //    fresh Open Questions section is emitted (plan §6.3).
+      const taskMd = fs.readFileSync(path.join(folderPath, "task.md"), "utf8");
+      assert.match(taskMd, /export large datasets/);
+      assert.match(taskMd, /Add a background export queue\./);
+      assert.doesNotMatch(taskMd, /## Open Questions/);
     } finally {
       for (const p of patches) {p.restore();}
+      runtime.tearDown();
       fsBridge.restore();
       wsStub.restore();
       deactivateNotificationRouter();

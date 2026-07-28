@@ -3,7 +3,7 @@
   "generatedBy": "scripts/resolveProductionSourceUniverse.mjs",
   "description": "Production source universe as of the current working tree, resolved from the exact bundler options that produce dist/extension.js (esbuild.config.js) plus the contribution-asset and runtime-resource-copy rules in scripts/lib/productionSourceScan.mjs. Regenerated every run; diffed against the immutable pre-gate snapshot (workflow-production-source-pregate-v1.json), not authoritative on its own.",
   "packageName": "vs-code-ai-helper",
-  "packageVersion": "0.65.4",
+  "packageVersion": "0.66.1",
   "declaredMain": "./dist/extension.js",
   "entrypoint": "src/extension.ts",
   "outfile": "dist/extension.js",
@@ -12,15 +12,51 @@
   "typescriptVersion": "5.9.3",
   "buildOptionsDigestSha256": "59b9af38338f674e6503e84e1945f3c7b2e65f3aab5e1acec211ca45a20c3d07",
   "lockfileSha256": "8df5712b6f8e20446c74bb0ebf444ca707fb666b5a35214b92ad7d155c4b28f6",
-  "fileCount": 123,
+  "fileCount": 137,
   "files": [
-    {
-      "path": "package.json",
-      "sha256": "550ec76d245140ab1d98bb37688df10d8edab3d89fcbc5627345e5a41a639010"
-    },
     {
       "path": "src/actions/actionConversationOrchestratorV1.ts",
       "sha256": "de7aee1d2279c333e5011bc7930c0d97c0febed2d50d78d48d83651ab761e999"
+    },
+    {
+      "path": "src/actions/productionTaskActionRuntimeV1.ts",
+      "sha256": "318380a7e826e13fb05744aa030e25b4f77633630cabcb771983a8b878d2965a"
+    },
+    {
+      "path": "src/actions/rows/applyReviewRowV1.ts",
+      "sha256": "0eb415d9af121f1e853cc7f63259fc5a71b16ae0d05a0bc4f2f8d0ddf0a29491"
+    },
+    {
+      "path": "src/actions/rows/chatSendRowV1.ts",
+      "sha256": "e30448e40cb58373072b8a197e6314656e57e191e9f606bd89faa2c1272d9c91"
+    },
+    {
+      "path": "src/actions/rows/commitPushMetadataRowV1.ts",
+      "sha256": "bdb21237ba81f351073473d1c0378a5c58ce011d1ee0690a20a39f75d5346cfa"
+    },
+    {
+      "path": "src/actions/rows/draftRowV1.ts",
+      "sha256": "8e8b67a3bec2b67964e30e5db773e1bc3ce93345758994d4b940c57392e06a37"
+    },
+    {
+      "path": "src/actions/rows/generateImplementationRowV1.ts",
+      "sha256": "4d3dac39aa99008791b1e9d0717bf75da335da03a02f9b8a353a1e9bd05201b8"
+    },
+    {
+      "path": "src/actions/rows/generatePlanRowV1.ts",
+      "sha256": "8c98661dcfc5ce894d34a1e780ed13468f725de4855658ee1eeed6eaa8755a4b"
+    },
+    {
+      "path": "src/actions/rows/reviewRowV1.ts",
+      "sha256": "eae554868119ddd3d0a3b7058fbc6f7af957e07f30cf8de4d38514c275b020e5"
+    },
+    {
+      "path": "src/actions/taskActionCoordinatorV1.ts",
+      "sha256": "d10cd1f8d5dc7497d97ce9fe2d44a1cf7d38d0f05b6d245abebf824afa4ca90d"
+    },
+    {
+      "path": "src/actions/taskActionRegistryV1.ts",
+      "sha256": "5885b2e594bdf842e7cfd6e99c85cc331c195db16d92f2ea57cee0db3c5bbdb6"
     },
     {
       "path": "src/commands/applyCurrentStageAction.ts",
@@ -40,7 +76,7 @@
     },
     {
       "path": "src/commands/chatWithStage.ts",
-      "sha256": "2c8445dfc25a4f43ed18d7dea783f25f73bc80b1dc4cad8a5344c4daeff2be10"
+      "sha256": "5dfdeb985718558bbb09abcb1d14767b277cb73a9e906619dc1609ff577007ae"
     },
     {
       "path": "src/commands/choosePublishScope.ts",
@@ -56,7 +92,7 @@
     },
     {
       "path": "src/commands/draftTaskWithAI.ts",
-      "sha256": "4b89f143e97ba2668b3720ebae76c1394cd1246774ae0aa3ffb25960d79573ac"
+      "sha256": "6e0427945c522031904e42ec41e7a19a982638cd00292f7d206f636b42e0e2f8"
     },
     {
       "path": "src/commands/fastForwardCurrentTaskReview.ts",
@@ -64,7 +100,7 @@
     },
     {
       "path": "src/commands/generatePlanWithAI.ts",
-      "sha256": "b8dc528e6278d5d91bb1dd6f0018c813394faa7d3cbdf68d9ce5d7bb739fbd47"
+      "sha256": "60a18525fa0a19f7206b728f8eeef2e937a4114d60bb05fa74101bb49b4c60d1"
     },
     {
       "path": "src/commands/markTaskDone.ts",
@@ -120,7 +156,7 @@
     },
     {
       "path": "src/commands/startNewTask.ts",
-      "sha256": "a81e4282524ec950ce0d6f0e73b16637cefbac3c5b9f8d9ed78c5b89ea59a8cb"
+      "sha256": "03fb401a441f7db3bb5504797cf387627be170503952516d1184f5e6b93cce1c"
     },
     {
       "path": "src/commands/toggleMetaResourcesGitIgnore.ts",
@@ -140,11 +176,15 @@
     },
     {
       "path": "src/extension.ts",
-      "sha256": "187d3ac63098d1d387c0e1c6fe61e2f04a195973abc685018ba15aff16c69323"
+      "sha256": "13f9fd5cd36d06dcf5df004cbb26c3d60916051277874a2ea56c582af0c1e537"
     },
     {
       "path": "src/legal/disclaimerVersion.ts",
       "sha256": "34a90cb78d3c0f598ab0e10d63dc31e09d925de0977613b199b2c616bff80564"
+    },
+    {
+      "path": "src/prompts/aiResultContractV1.ts",
+      "sha256": "e942af07428d160e6edbbecf14fc9a51c842650b50e6d3d883285237b0fda012"
     },
     {
       "path": "src/runners/cliAgentRunner.ts",
@@ -164,11 +204,15 @@
     },
     {
       "path": "src/runners/providers.ts",
-      "sha256": "fb1444736a93b35fa58831dfcb3291e967c8a13eb8afa932a61699f63d628a90"
+      "sha256": "c78f8708bb185e8f9836cee7422716fc60182ce7268bb4c4ad40e8823def6349"
     },
     {
       "path": "src/runners/runnerRegistry.ts",
       "sha256": "1a34362c936ecbef04149aa98ddca5a7350e1c42e9328ca096492e7e24290901"
+    },
+    {
+      "path": "src/services/agentExecutionBrokerV1.ts",
+      "sha256": "5f886e2a9e738efdb1ae9d305450b97fd7718d519455df9ed47907aa43a8bc79"
     },
     {
       "path": "src/services/chatInteractionTransactionStoreV1.ts",
@@ -180,7 +224,11 @@
     },
     {
       "path": "src/services/legacyAiActionSafetyGateV0.ts",
-      "sha256": "9e105f159943b75209e5b6f408e00eb9034eef1fa6d2c0c82a48b599c23602ac"
+      "sha256": "b2c6fd7886d3c99bca97b2d1f097b4c0df6ba13157a10033b1bb3f94cb597e9f"
+    },
+    {
+      "path": "src/services/providerSelectionPolicyV1.ts",
+      "sha256": "fe80c2952ea5d64ec869ad942a91853e34232802c441b5426da86d494f960008"
     },
     {
       "path": "src/services/taskProgressDecoderV1.ts",
@@ -192,15 +240,19 @@
     },
     {
       "path": "src/services/workflowFileStoreV1.ts",
-      "sha256": "082f89147931ad55a67d74f7545a66a78d1bf53db0e6e3255dbb83987335e049"
+      "sha256": "83a30245b08b810c49d86f8a5a13f33572ecaeff71e7b334775735eec300de01"
+    },
+    {
+      "path": "src/services/workflowLeaseStoreV1.ts",
+      "sha256": "a30d2343a271e109cd13f08a9f56ecd0c427aa981cb3ff3b10e6cb4025f17248"
     },
     {
       "path": "src/services/workflowPathRegistryV1.ts",
-      "sha256": "9c7f922771358c8fbe35a184d0cd54f58199edc57c0587eb23bc032f9119001b"
+      "sha256": "9f5bd37c22b25cb1a92e39fdad7908a67ff36488bd132c4511922336c26c5b47"
     },
     {
       "path": "src/services/workflowPathSafetyV1.ts",
-      "sha256": "5c56647b7dc91dd997e27170c3e1b9016f52332e37d33ad1cb2bf9f7afb1e32e"
+      "sha256": "4987113b2bce5124351682ae026a09b57a192b2075bf5cc07e940e55950a8bdc"
     },
     {
       "path": "src/services/workflowPrivacyClassifierV1.ts",
@@ -208,7 +260,7 @@
     },
     {
       "path": "src/services/workflowRuntimeServicesV1.ts",
-      "sha256": "faa31d2f91bfc357b817f8b7990174e4b39c8297473e72b63a0d14af814f8d2b"
+      "sha256": "d7e52f3f6b35e5cc325a2bb2d38b633d0b79a41f3a8e7c8979416021d15d8858"
     },
     {
       "path": "src/state/finalizationJournal.ts",
@@ -244,7 +296,7 @@
     },
     {
       "path": "src/state/taskInventory.ts",
-      "sha256": "088da07f9392798e6cd5c98f64adcb1d1555f838e8b86b125e700500b4638980"
+      "sha256": "d48272521f6b15e54a514fc641406487ad8d82ca05d03e490f465fac5ebb8b0d"
     },
     {
       "path": "src/state/taskStateStore.ts",
@@ -257,6 +309,14 @@
     {
       "path": "src/types/actionCorrelationV1.ts",
       "sha256": "450f406d99ea4d4a58089c2d391d2cb38097720d5e38e57f21b139a3470a3f38"
+    },
+    {
+      "path": "src/types/agentExecutionV1.ts",
+      "sha256": "e8161ac44086c5537c0b381de809ee8fd11cfed42b2b757f1118c490cb5da0cf"
+    },
+    {
+      "path": "src/types/aiResultEnvelope.ts",
+      "sha256": "fd1c9f3391462f5dea17c366308e8a4c835edf4c0742bc55ec933278d4d9b673"
     },
     {
       "path": "src/types/chatInteractionTransactionV1.ts",
@@ -320,7 +380,7 @@
     },
     {
       "path": "src/utils/cliModelDiscovery.ts",
-      "sha256": "ce886287767057a7d1257d6f7f0704b305bdd6a98a0177aa55e1367a036c46d1"
+      "sha256": "511f0638bc8474d9535af757e92376bb0221707fbe226f41fa5fb6dc46bcd1d2"
     },
     {
       "path": "src/utils/cliProcessUtils.ts",
@@ -384,7 +444,7 @@
     },
     {
       "path": "src/utils/modelSelection.ts",
-      "sha256": "dd7938fba7f401253f928fbf017573e51b8fbe2709c8ee95e2b699d7e83540b6"
+      "sha256": "6a25b573769b9cb7887d71cb3f1608dd3e73127f58296c0745ab47b7a72c9c18"
     },
     {
       "path": "src/utils/notificationContentProvider.ts",
@@ -424,7 +484,7 @@
     },
     {
       "path": "src/utils/quota.ts",
-      "sha256": "a5058d11dd86280676eda8f9f21617021b6653dd57511ab4822a69f14dc8c6c2"
+      "sha256": "6062047ee7764efd289543283d424f83ae494951ab5398f01aa6578c95bbd8ce"
     },
     {
       "path": "src/utils/redoSidecar.ts",
@@ -459,16 +519,12 @@
       "sha256": "90416bf849e84f33c6cc377ac80fe0ad3cc5a08d333ceb1c7f756ae12634308d"
     },
     {
-      "path": "src/utils/shortcutHints.ts",
-      "sha256": "6d567286fdd0b0132e92f3ac3614ad239d64d2c95529fda3f72eedda711d8c11"
-    },
-    {
       "path": "src/utils/stageTransition.ts",
       "sha256": "c3ca9d2a1da8959587cb438b9a1117d7cc457eb64e7339e230887ed0d00f7d49"
     },
     {
       "path": "src/utils/taskDescriptionDocument.ts",
-      "sha256": "10ce6b6f94be031054387449e913539aee17f47e2822544adcb0b0903289346b"
+      "sha256": "eba1c18ccf0d14582af5fc051eb2da501878fe24ec6cbdf8a34d46ff5a2b4421"
     },
     {
       "path": "src/utils/taskOperations.ts",
@@ -550,7 +606,7 @@
     },
     {
       "path": "resources/prompts/apply-impl-review-code.md",
-      "sha256": "ba60aa837595953178a1b069a5b370190c75a571442b749b7f2492d56b1bef51",
+      "sha256": "4b4d97d2da63d3e3132a8a602dd136c89a96308c55468030880edb80d16ce5db",
       "category": "runtimeResourceCopy"
     },
     {
@@ -570,7 +626,7 @@
     },
     {
       "path": "resources/prompts/draft-task-with-ai.md",
-      "sha256": "137bf9eca9a5b053ae077b87009348a3709ae8e03d46299c10c4f513859f0421",
+      "sha256": "43ed08fceca288222c91b80725aed1d8d7846f05e232f19645887fe6d53a903a",
       "category": "runtimeResourceCopy"
     },
     {
@@ -635,12 +691,12 @@
     },
     {
       "path": "resources/prompts/run-implementation.md",
-      "sha256": "99f3d714ee5b1390ff1b4164311a83a3dc86375d1b0d5f7dd160faf955f462e8",
+      "sha256": "993771b2d6b9eed03bb92dd2cd710c31d77de1114478a28c2bc3f82abbae2098",
       "category": "runtimeResourceCopy"
     },
     {
       "path": "resources/prompts/task-template.md",
-      "sha256": "a417e5ca3b122270796e37b8fc382527e6b60330ac8247183ad7951b9619b6ba",
+      "sha256": "2175edf8904bf4d77b54edc1eb2f0403b5e0048ec2d41f1f0eb99e48eaebc19e",
       "category": "runtimeResourceCopy"
     }
   ]

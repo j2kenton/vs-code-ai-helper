@@ -5,6 +5,7 @@ import { readTaskProgress } from "../utils/taskProgressUtils";
 import { TaskProgress } from "../types/taskProgress";
 import { repairLegacyOwnership } from "../utils/metaResourcesMigration";
 import { LegacyCreatingStartupGateV0 } from "./legacyCreatingStartupGateV0";
+import { deriveTaskBindingV1 } from "../types/taskBindingV1";
 
 /**
  * A task with its progress metadata loaded
@@ -203,6 +204,24 @@ export class TaskInventory {
    */
   getTaskByPath(absolutePath: string): TaskWithProgress | undefined {
     return this.taskByCanonicalId.get(TaskInventory.normalizePath(absolutePath));
+  }
+
+  /**
+   * Get a task by its ownership-derived `TaskBindingV1.bindingId` (plan
+   * §3.9). Used where only the digest identity is available — never a raw
+   * path — such as reconstructing a Chat interaction's owning task from its
+   * durable transaction's `taskBindingId` (plan §3.1) for an explicit Resume.
+   * `O(n)` over currently visible tasks; fine for the rare Resume path, not
+   * meant for hot lookups.
+   */
+  getTaskByBindingId(taskBindingId: string): TaskWithProgress | undefined {
+    for (const task of this.visibleTasks) {
+      const derived = deriveTaskBindingV1(task.progress);
+      if (derived.ok && derived.binding.bindingId === taskBindingId) {
+        return task;
+      }
+    }
+    return undefined;
   }
 
   /**
