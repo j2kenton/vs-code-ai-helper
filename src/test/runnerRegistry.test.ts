@@ -20,6 +20,10 @@ import {
   resolveModelForStage,
 } from "../utils/modelSelection";
 import { isAuthenticationFailure } from "../utils/quota";
+import {
+  LEGACY_UNCORRELATED_RUNNER_INVOCATION_REJECTED_V0,
+  LegacyAiActionSafetyGateErrorV0,
+} from "../services/legacyAiActionSafetyGateV0";
 
 const requireModule = createRequire(__filename);
 const childProcess = requireModule("node:child_process") as typeof import("node:child_process");
@@ -889,6 +893,7 @@ void describe("runImplementationForModel", () => {
         onProgress: () => undefined,
         stage: "impl",
         taskFolderUri,
+        isImplementationV1Bootstrap: true,
       });
 
       assert.strictEqual(result.runnerId, "copilot-lm");
@@ -901,6 +906,94 @@ void describe("runImplementationForModel", () => {
       assert.strictEqual(progress.fallbackActive?.impl, true);
       assert.strictEqual(progress.fallbackModelId?.impl, "auto");
     } finally {
+      settings.restore();
+      lm.selectChatModels = originalSelectChatModels;
+      workspace.fs.readFile = originalReadFile;
+      workspace.fs.writeFile = originalWriteFile;
+    }
+  });
+
+  // Regression coverage for a review finding on the "implementation.v1"
+  // bootstrap exemption: an earlier version keyed it off `stage === "impl"`
+  // inside the SHARED assertNoUnauthorizedV1CorrelationV0, which also
+  // matched generateImplementationWithAI's unrelated uncorrelated call. The
+  // real exemption now lives only here, as an explicit, required,
+  // per-call-site parameter — proven directly against the production
+  // boundary switch rather than relying only on the (now stricter, no
+  // exception) coverage in legacyAiActionSafetyGateV0.test.ts.
+  void it("isImplementationV1Bootstrap: true bypasses the uncorrelated-runner boundary; false does not", async () => {
+    const metaRoot = fs.mkdtempSync(
+      path.join(os.tmpdir(), "ensemble-impl-bootstrap-flag-")
+    );
+    const taskFolder = path.join(metaRoot, "tasks", "task-a");
+    fs.mkdirSync(taskFolder, { recursive: true });
+    const taskFolderUri = vscode.Uri.file(taskFolder);
+    const progressPath = path.join(taskFolder, "task-progress.json");
+    const now = new Date().toISOString();
+    fs.writeFileSync(
+      progressPath,
+      JSON.stringify(
+        { taskFolder: "task-a", currentStage: "impl", status: "active", createdAt: now, updatedAt: now },
+        null,
+        2
+      ),
+      "utf8"
+    );
+
+    const settings = installModelSettings({
+      impl: { primary: "copilot-gpt-5.6-sol", strategy: "switch-to-backup" },
+    });
+    const lm = lmStub();
+    const originalSelectChatModels = lm.selectChatModels;
+    const workspace = vscode.workspace as unknown as {
+      fs: {
+        readFile: (uri: vscode.Uri) => Promise<Uint8Array>;
+        writeFile: (uri: vscode.Uri, bytes: Uint8Array) => Promise<void>;
+      };
+    };
+    const originalReadFile = workspace.fs.readFile;
+    const originalWriteFile = workspace.fs.writeFile;
+    const { LanguageModelTextPart } = vscode as unknown as {
+      LanguageModelTextPart: new (value: string) => { value: string };
+    };
+    function* responseStream(): Iterable<unknown> {
+      yield new LanguageModelTextPart("done");
+    }
+    workspace.fs.readFile = (uri: vscode.Uri): Promise<Uint8Array> =>
+      fs.promises.readFile(uri.fsPath);
+    workspace.fs.writeFile = (uri: vscode.Uri, bytes: Uint8Array): Promise<void> =>
+      fs.promises.writeFile(uri.fsPath, bytes);
+    lm.selectChatModels = (): Promise<vscode.LanguageModelChat[]> =>
+      Promise.resolve([
+        {
+          id: "auto",
+          name: "Auto",
+          sendRequest: () => Promise.resolve({ stream: responseStream() }),
+        } as unknown as vscode.LanguageModelChat,
+      ]);
+
+    assert.equal(LEGACY_UNCORRELATED_RUNNER_INVOCATION_REJECTED_V0.enabled, false);
+    LEGACY_UNCORRELATED_RUNNER_INVOCATION_REJECTED_V0.enabled = true;
+    try {
+      const baseRequest = {
+        modelId: "copilot-gpt-5.6-sol",
+        prompt: "Implement the requested change.",
+        workspaceUri: vscode.Uri.file(taskFolder),
+        token: new vscode.CancellationTokenSource().token,
+        onProgress: () => undefined,
+        stage: "impl" as const,
+        taskFolderUri,
+      };
+
+      await assert.doesNotReject(
+        runImplementationForModel({ ...baseRequest, isImplementationV1Bootstrap: true })
+      );
+      await assert.rejects(
+        runImplementationForModel({ ...baseRequest, isImplementationV1Bootstrap: false }),
+        LegacyAiActionSafetyGateErrorV0
+      );
+    } finally {
+      LEGACY_UNCORRELATED_RUNNER_INVOCATION_REJECTED_V0.enabled = false;
       settings.restore();
       lm.selectChatModels = originalSelectChatModels;
       workspace.fs.readFile = originalReadFile;
@@ -987,6 +1080,7 @@ void describe("runImplementationForModel", () => {
         onProgress: () => undefined,
         stage: "impl",
         taskFolderUri,
+        isImplementationV1Bootstrap: true,
       });
 
       assert.equal(result.status, "failed");
@@ -1156,6 +1250,7 @@ void describe("runImplementationForModel", () => {
           onProgress: () => undefined,
           stage: "impl",
           taskFolderUri,
+          isImplementationV1Bootstrap: true,
         });
 
         assert.strictEqual(result.status, "failed");
@@ -1295,6 +1390,7 @@ void describe("runImplementationForModel", () => {
           onProgress: () => undefined,
           stage: "impl",
           taskFolderUri,
+          isImplementationV1Bootstrap: true,
         });
 
         // Checked FIRST and deliberately independent of `result`'s own
@@ -1356,6 +1452,7 @@ void describe("runImplementationForModel", () => {
         onProgress: () => undefined,
         stage: "impl",
         taskFolderUri: vscode.Uri.file(process.cwd()),
+        isImplementationV1Bootstrap: true,
       });
 
       assert.strictEqual(result.runnerId, "codex-cli");

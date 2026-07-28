@@ -3,7 +3,7 @@
   "generatedBy": "scripts/resolveProductionSourceUniverse.mjs",
   "description": "Production source universe as of the current working tree, resolved from the exact bundler options that produce dist/extension.js (esbuild.config.js) plus the contribution-asset and runtime-resource-copy rules in scripts/lib/productionSourceScan.mjs. Regenerated every run; diffed against the immutable pre-gate snapshot (workflow-production-source-pregate-v1.json), not authoritative on its own.",
   "packageName": "vs-code-ai-helper",
-  "packageVersion": "0.67.1",
+  "packageVersion": "0.67.2",
   "declaredMain": "./dist/extension.js",
   "entrypoint": "src/extension.ts",
   "outfile": "dist/extension.js",
@@ -132,7 +132,7 @@
     },
     {
       "path": "src/commands/reviewActions.ts",
-      "sha256": "302dc48e4c20d425ce4629a2c983e498c40d5d051c195fd76f0d6fbb78f8fd7f"
+      "sha256": "0713fc091a1da786cb717797a0ba8da67c1de147ed03d8be1dd1d91d071a18bc"
     },
     {
       "path": "src/commands/reviewCurrentTask.ts",
@@ -140,7 +140,7 @@
     },
     {
       "path": "src/commands/runLintingFixes.ts",
-      "sha256": "8836bfcb3d33783066d3b35d3e328c1189870d7da5fbddc3a36955deab17fe56"
+      "sha256": "879f7e38c4af3c2e6563520438b2159d4a5bb8af935f53bd394a0f588f211376"
     },
     {
       "path": "src/commands/runPublishChecks.ts",
@@ -208,7 +208,7 @@
     },
     {
       "path": "src/runners/runnerRegistry.ts",
-      "sha256": "1a34362c936ecbef04149aa98ddca5a7350e1c42e9328ca096492e7e24290901"
+      "sha256": "5caef0f9ad1a074eaf1303120a1ad34534531afe8b2f1c5cd21375cd8f4b369c"
     },
     {
       "path": "src/services/agentExecutionBrokerV1.ts",
@@ -224,7 +224,7 @@
     },
     {
       "path": "src/services/legacyAiActionSafetyGateV0.ts",
-      "sha256": "f481c5760746febf7debbff7a1bf0d161e4a5cd23bc649211b3d45c07b472b34"
+      "sha256": "bc7ec02f2eda75686e1465b2cae49d46fdc2644f84c400ccd64a6549a9d52867"
     },
     {
       "path": "src/services/providerSelectionPolicyV1.ts",

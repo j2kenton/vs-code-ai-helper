@@ -390,6 +390,16 @@ interface ExecuteImplementationRunOptions {
    * already holds.
    */
   suppressAutoReviewDispatch?: boolean;
+  /**
+   * REQUIRED, not defaulted: threaded straight through to
+   * runImplementationForModel's own required field of the same name (see its
+   * doc comment in runnerRegistry.ts). executeImplementationRun is shared by
+   * BOTH runImplementationWithAI ("implementation.v1", not yet migrated —
+   * pass `true`) and applyReviewWithAI ("applyReview.v1", already migrated —
+   * pass `false`), so this cannot be hardcoded inside this shared function;
+   * only each call site knows which top-level action it is.
+   */
+  isImplementationV1Bootstrap: boolean;
 }
 
 /**
@@ -2639,6 +2649,10 @@ export async function applyReviewWithAI(
               skipPreRunSafetyCheck: options.skipImplementationSafetyCheck,
               preserveActiveFallback: options.preserveActiveFallback,
               parentOperation: child,
+              // applyReviewWithAI's own call ("applyReview.v1", already
+              // migrated) — must NOT get the "implementation.v1" bootstrap
+              // exemption.
+              isImplementationV1Bootstrap: false,
             }
           )
       );
@@ -3129,7 +3143,7 @@ async function applyImplementationReviewWithAI(
   workspaceRoot: vscode.WorkspaceFolder,
   stage: TaskStage,
   reviewContent: string,
-  options: ApplyReviewOptions & ExecuteImplementationRunOptions = {}
+  options: ApplyReviewOptions & ExecuteImplementationRunOptions
 ): Promise<boolean> {
   // Materialize canonical plan-final.md from legacy implementation.md if needed.
   let canonicalUri: vscode.Uri;
@@ -3221,6 +3235,10 @@ async function applyImplementationReviewWithAI(
       onWaitingForUser: options.parentOperation
         ? (w) => options.parentOperation!.setWaitingForUser(w)
         : undefined,
+      // This is applyReviewWithAI's own call ("applyReview.v1", already
+      // migrated) — must NOT get the "implementation.v1" bootstrap
+      // exemption. See the field's doc comment on ExecuteImplementationRunOptions.
+      isImplementationV1Bootstrap: false,
     }
   );
 }
@@ -3780,7 +3798,7 @@ async function executeImplementationRun(
   modelId: string | undefined,
   progressTitle: string,
   postRunReviewStage: TaskStage = "impl",
-  options: ExecuteImplementationRunOptions = {}
+  options: ExecuteImplementationRunOptions
 ): Promise<boolean> {
   const cwd = workspaceRoot.uri.fsPath;
 
@@ -3862,6 +3880,7 @@ async function executeImplementationRun(
         taskFolderUri: folderUri,
         onBusyDetail: options.onBusyDetail,
         onWaitingForUser: options.onWaitingForUser,
+        isImplementationV1Bootstrap: options.isImplementationV1Bootstrap,
       });
       } finally {
         linked.dispose();
@@ -4228,6 +4247,10 @@ export async function runImplementationWithAI(
         onWaitingForUser: (w) => op.setWaitingForUser(w),
         parentOperation: op,
         followUpReviewMode,
+        // This IS runImplementationWithAI's own call — "implementation.v1"'s
+        // real bootstrap invocation. See the field's doc comment on
+        // ExecuteImplementationRunOptions / runImplementationForModel.
+        isImplementationV1Bootstrap: true,
       }
     );
     }

@@ -172,7 +172,7 @@ void describe("LegacyAiActionSafetyGateV0", () => {
   });
 
   void describe("assertNoUnauthorizedV1CorrelationV0", () => {
-    void it("rejects every legacy (uncorrelated) request while the production boundary switch is on, except implementation.v1's own bootstrap request", () => {
+    void it("rejects every legacy (uncorrelated) request while the production boundary switch is on, with NO exception for stage alone", () => {
       // The harness turned the switch off; restore the production value to
       // prove the fail-closed boundary path, then suspend it again.
       assert.equal(LEGACY_UNCORRELATED_RUNNER_INVOCATION_REJECTED_V0.enabled, false);
@@ -192,22 +192,28 @@ void describe("LegacyAiActionSafetyGateV0", () => {
             }),
           LegacyAiActionSafetyGateErrorV0
         );
-        // "implementation.v1" (Run Implementation) is this migration's own
-        // bootstrapping tool, identified here by stage "impl" — it must stay
-        // exempt from the uncorrelated-rejection even with the switch on, or
-        // the task can never build the step (plan.md step 16) that would
-        // properly migrate it. See the exemption's rationale in
-        // legacyAiActionSafetyGateV0.ts and the matching NOTE on
-        // runImplementationWithAI in reviewActions.ts.
-        assert.doesNotThrow(() =>
-          assertNoUnauthorizedV1CorrelationV0({
-            taskFolderUri: {},
-            workspaceUri: {},
-            stage: "impl",
-            prompt: "hello",
-            outputFile: {},
-            modelId: "claude-cli:sonnet",
-          })
+        // Regression coverage for a review finding: an earlier version of the
+        // "implementation.v1" bootstrap exemption lived HERE, keyed on
+        // `stage === "impl"` alone — but generateImplementationWithAI's
+        // (already-migrated) uncorrelated runAiToFile call ALSO passes
+        // `stage: "impl"`, so that exemption silently let a genuinely-legacy,
+        // unrelated request through this boundary too. This function must
+        // reject EVERY uncorrelated request, stage "impl" included, with no
+        // exception — the real, unforgeable exemption now lives only at
+        // runImplementationForModel's explicit isImplementationV1Bootstrap
+        // parameter (runnerRegistry.ts), which this function has no
+        // knowledge of.
+        assert.throws(
+          () =>
+            assertNoUnauthorizedV1CorrelationV0({
+              taskFolderUri: {},
+              workspaceUri: {},
+              stage: "impl",
+              prompt: "hello",
+              outputFile: {},
+              modelId: "claude-cli:sonnet",
+            }),
+          LegacyAiActionSafetyGateErrorV0
         );
       } finally {
         LEGACY_UNCORRELATED_RUNNER_INVOCATION_REJECTED_V0.enabled = false;

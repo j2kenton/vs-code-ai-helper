@@ -193,26 +193,6 @@ function hasV1CorrelationShape(
 }
 
 /**
- * True for a legacy (uncorrelated) request belonging to "implementation.v1"
- * — identified by `stage === "impl"`, the same value only that action's own
- * provider invocation uses when it reaches this uncorrelated boundary check
- * (verified against reviewActions.ts: applyReviewWithAI/generateImplementationWithAI
- * also pass `stage: "impl"` in places, but both are already in
- * MIGRATED_ACTION_KEYS_V0, so their requests carry real V1 correlation data
- * by the time they reach here and take the OTHER branch of
- * assertNoUnauthorizedV1CorrelationV0 entirely — this predicate is only ever
- * consulted for the genuinely uncorrelated case, so it can't misfire on
- * them). See the exemption's rationale on assertNoUnauthorizedV1CorrelationV0
- * below and the matching NOTE on runImplementationWithAI in reviewActions.ts.
- */
-function isImplementationV1BootstrapRequest(request: unknown): boolean {
-  if (typeof request !== "object" || request === null) {
-    return false;
-  }
-  return (request as Record<string, unknown>).stage === "impl";
-}
-
-/**
  * Provider-boundary backstop (plan §1.3). Throws if `request`:
  *  - carries a V1 `correlation` field whose `actionKey` is not in
  *    `MIGRATED_ACTION_KEYS_V0` (a not-yet-migrated action can never slip
@@ -224,27 +204,23 @@ function isImplementationV1BootstrapRequest(request: unknown): boolean {
  *    invocation path that reached the provider boundary without a
  *    handler-level route gate.
  *
- * EXCEPTION: an uncorrelated request identified as "implementation.v1"'s own
- * invocation (`isImplementationV1BootstrapRequest`) is let through even
- * though it is genuinely uncorrelated. "implementation.v1" (Run
- * Implementation) is this migration's own bootstrapping tool — every step of
- * the plan, including the step 16 replacement for this exact action, is
- * implemented BY running it. Rejecting its uncorrelated invocation here
- * deadlocks the task the same way gating it in its handler did (see the
- * removed assertLegacyAiRouteAllowedV0("implementation.v1") call and its
- * NOTE comment in reviewActions.ts) — just one layer deeper. Remove this
- * exception only once implementation.v1 has a real V1 coordinator
- * replacement (plan.md step 16) to migrate onto.
+ * This function has NO knowledge of "implementation.v1" or any other route
+ * id for the uncorrelated case, and must not gain one via a shared,
+ * reusable field like `stage`: a prior version exempted any request with
+ * `stage === "impl"`, which also matched generateImplementationWithAI's
+ * (already "migrated") uncorrelated runAiToFile call — silently letting a
+ * genuinely-legacy request through this boundary under a route id it does
+ * not belong to. The one legitimate "implementation.v1" bootstrap exemption
+ * lives at its actual unique call site instead — see
+ * runImplementationForModel in runnerRegistry.ts, which is the only caller
+ * with an explicit, single-purpose marker for it.
  *
  * Call this immediately before delegating to a concrete `AgentRunner.run`,
  * at every path through `runnerRegistry.ts`.
  */
 export function assertNoUnauthorizedV1CorrelationV0(request: unknown): void {
   if (!hasV1CorrelationShape(request)) {
-    if (
-      LEGACY_UNCORRELATED_RUNNER_INVOCATION_REJECTED_V0.enabled &&
-      !isImplementationV1BootstrapRequest(request)
-    ) {
+    if (LEGACY_UNCORRELATED_RUNNER_INVOCATION_REJECTED_V0.enabled) {
       throw new LegacyAiActionSafetyGateErrorV0(
         "Rejected a legacy (uncorrelated) provider invocation at the runner boundary: no AI action is " +
           "authorized to invoke a provider until its V1 coordinator migration lands " +
