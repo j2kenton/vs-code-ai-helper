@@ -75,6 +75,25 @@ void describe("classifyFailure", () => {
     }
   });
 
+  // A provider's argv-only prompt transport (e.g. Kimi's `-p`, which has no
+  // stdin/file input at all) can reject a prompt outright for being too
+  // large for THAT provider's transport — a structural per-provider limit,
+  // not a code defect and not quota exhaustion (isQuotaError deliberately
+  // excludes this exact phrasing above, in the "does not classify unrelated
+  // 'exceeded' errors" test). It IS safe to cascade to a backup model on,
+  // since a different provider very likely has a higher or no such ceiling —
+  // the same reasoning that makes "temporarily-unavailable" cascade-eligible.
+  void it("classifies a provider's own prompt-too-large rejection as temporarily-unavailable", () => {
+    assert.strictEqual(
+      classifyFailure({
+        errorMessage:
+          "Kimi Code CLI prompt is too large for this CLI mode (118611 bytes; max 20000 bytes). " +
+          "Reduce context or choose a provider that accepts stdin prompts.",
+      }).failureKind,
+      "temporarily-unavailable"
+    );
+  });
+
   // classifyFailure deliberately does NOT recognize transport phrases
   // ("streaming response failed", "fetch failed", etc.) at all — it is
   // shared with Copilot and has no provider context, so it cannot tell a
