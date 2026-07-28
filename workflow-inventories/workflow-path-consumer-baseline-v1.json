@@ -257,72 +257,72 @@
       "callSites": [
         {
           "signal": "import:child_process",
-          "span": "L75-L75",
+          "span": "L78-L78",
           "enclosingSymbol": "(module)"
         },
         {
           "signal": "import:fs",
-          "span": "L76-L76",
+          "span": "L79-L79",
           "enclosingSymbol": "(module)"
         },
         {
           "signal": "workspace.fs",
-          "span": "L1005-L1005",
+          "span": "L1034-L1034",
           "enclosingSymbol": "newContent"
         },
         {
           "signal": "workspace.fs",
-          "span": "L1214-L1214",
+          "span": "L1243-L1243",
           "enclosingSymbol": "runAiToFile"
         },
         {
           "signal": "workspace.fs",
-          "span": "L1297-L1297",
+          "span": "L1326-L1326",
           "enclosingSymbol": "runAiToFile"
         },
         {
           "signal": "workspace.fs",
-          "span": "L1546-L1546",
+          "span": "L1575-L1575",
           "enclosingSymbol": "runSecondOpinionReview"
         },
         {
           "signal": "workspace.fs",
-          "span": "L1573-L1573",
+          "span": "L1602-L1602",
           "enclosingSymbol": "runSecondOpinionReview"
         },
         {
           "signal": "workspace.fs",
-          "span": "L1931-L1931",
+          "span": "L1960-L1960",
           "enclosingSymbol": "runReviewForFolder"
         },
         {
           "signal": "workspace.fs",
-          "span": "L1948-L1948",
+          "span": "L1977-L1977",
           "enclosingSymbol": "runReviewForFolder"
         },
         {
           "signal": "workspace.fs",
-          "span": "L1994-L1994",
+          "span": "L2023-L2023",
           "enclosingSymbol": "runReviewForFolder"
         },
         {
           "signal": "workspace.fs",
-          "span": "L2007-L2007",
+          "span": "L2036-L2036",
           "enclosingSymbol": "runReviewForFolder"
         },
         {
           "signal": "workspace.fs",
-          "span": "L2015-L2015",
+          "span": "L2044-L2044",
           "enclosingSymbol": "runReviewForFolder"
         },
         {
           "signal": "workspace.fs",
-          "span": "L2039-L2039",
+          "span": "L2068-L2068",
           "enclosingSymbol": "contentBytes"
         },
         {
           "signal": "workspace.fs",
-          "span": "L2703-L2703",
+          "span": "L2736-L2736",
           "enclosingSymbol": "runApply"
         }
       ],
@@ -460,7 +460,7 @@
       "callSites": [
         {
           "signal": "workspace.fs",
-          "span": "L182-L182",
+          "span": "L186-L186",
           "enclosingSymbol": "activate"
         }
       ],

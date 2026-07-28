@@ -38,7 +38,10 @@ import {
   advanceStage,
   computeNextStage,
 } from "../utils/stageTransition";
-import { assertLegacyAiRouteAllowedV0 } from "../services/legacyAiActionSafetyGateV0";
+import {
+  assertLegacyAiRouteAllowedV0,
+  isLegacyAiRouteDisabledV0,
+} from "../services/legacyAiActionSafetyGateV0";
 import {
   openOrCreateDocument,
   readNonEmptyText,
@@ -79,6 +82,22 @@ import {
   backupArtifactBeforeWrite,
   previousVersionUri,
 } from "../utils/artifactBackups";
+import {
+  ensureWorkflowTaskFolderRootV1,
+  getVerifiedTaskBindingIdV1,
+  getWorkflowFileStoreV1,
+} from "../services/workflowRuntimeServicesV1";
+import { readChatDocumentIdentityV1 } from "../utils/chatHistoryStore";
+import { allocateHex128IdV1 } from "../types/actionCorrelationV1";
+import {
+  createProductionTaskActionCoordinatorV1,
+  getProductionActionConversationOrchestratorV1,
+} from "../actions/productionTaskActionRuntimeV1";
+import { ActionConversationOrchestratorV1, InteractionRefV1 } from "../actions/actionConversationOrchestratorV1";
+import { GENERATE_IMPLEMENTATION_ACTION_KEY_V1 } from "../actions/rows/generateImplementationRowV1";
+import { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
+import { ChatInteractionRefV1, ChatInteractionResumeResultV1, ChatViewProvider } from "../views/chatView";
+import { TaskInventory } from "../state/taskInventory";
 import { meetsAutoAdvanceThreshold, parseReadiness, parseReviewBlockers } from "../utils/reviewReadiness";
 import { scheduleAutomationChain, releaseAutomationChain } from "../utils/automationChain";
 import { buildVerifiedChecksSection, collectCompletionLintPreview, resolvePublishScopeFolder } from "../utils/completionLint";
@@ -3636,12 +3655,115 @@ export async function nextStage(
  *
  * Requires first-use consent before any AI action runs.
  */
+function describeGenerateImplementationFailureV1(outcome: TaskActionOutcomeV1): string {
+  switch (outcome.kind) {
+    case "failed":
+      return `${outcome.code}${outcome.retryable ? " (retryable)" : ""}`;
+    case "malformedResult":
+      return `the model's response was malformed (${outcome.code})`;
+    case "unavailable":
+      return outcome.code;
+    case "recoveryRequired":
+      return outcome.code;
+    case "duplicateRejected":
+      return "another operation is already running for this task";
+    case "stalePreflight":
+      return "a stale preflight plan was rejected";
+    case "partialEditBlocked":
+      return "a partial edit was blocked";
+    default:
+      return outcome.kind;
+  }
+}
+
+interface GenerateImplementationOutcomeContextV1 {
+  readonly folderUri: vscode.Uri;
+  readonly implementationUri: vscode.Uri;
+  readonly chatViewProvider?: ChatViewProvider;
+  readonly orchestrator: ActionConversationOrchestratorV1;
+  readonly prompt: string;
+  readonly canonicalId: string;
+  readonly taskName?: string;
+}
+
+async function handleGenerateImplementationOutcomeV1(
+  outcome: TaskActionOutcomeV1,
+  ctx: GenerateImplementationOutcomeContextV1
+): Promise<{ succeeded: boolean }> {
+  let succeeded = false;
+
+  if (outcome.kind === "completed") {
+    const generatedContent = await readNonEmptyText(ctx.implementationUri);
+    if (generatedContent && !generatedContent.includes(IMPLEMENTATION_CHECKLIST_MARKER)) {
+      await writeTextFile(
+        ctx.implementationUri,
+        `${IMPLEMENTATION_CHECKLIST_MARKER}\n\n${generatedContent}`
+      );
+    }
+    await setStage(ctx.folderUri, "impl");
+    await safeOpenTextDocument(ctx.implementationUri, "plan-final.md");
+    NotificationRouter.showInformation("plan-final.md generated.");
+    succeeded = true;
+  } else if (outcome.kind === "questions") {
+    if (ctx.chatViewProvider) {
+      const record = await ctx.orchestrator.getRecord({
+        operationId: outcome.correlation.operationId,
+        interactionId: outcome.interactionId,
+        taskBindingId: outcome.correlation.taskBindingId,
+        chatDocumentId: outcome.correlation.chatDocumentId,
+        sourceAttemptId: outcome.correlation.attemptId,
+      });
+      if (record) {
+        await ctx.chatViewProvider.askInteraction({
+          canonicalId: ctx.canonicalId,
+          taskFolderPath: ctx.folderUri.fsPath,
+          stage: record.stage,
+          taskName: ctx.taskName,
+          interactionId: record.interactionId,
+          operationId: record.correlation.operationId,
+          actionKey: record.correlation.actionKey,
+          sourceAttemptId: record.correlation.attemptId,
+          questions: record.questions,
+          binding: {
+            taskBindingId: record.correlation.taskBindingId,
+            chatDocumentId: record.correlation.chatDocumentId,
+          },
+        });
+      }
+    }
+  } else if (outcome.kind === "cancelled") {
+    NotificationRouter.showInformation("Generate Implementation cancelled.");
+  } else {
+    NotificationRouter.showError(
+      `Generate Implementation failed: ${describeGenerateImplementationFailureV1(outcome)}. Use the manual workflow instead.`
+    );
+  }
+
+  return { succeeded };
+}
+
 export async function generateImplementationWithAI(
   extensionUri: vscode.Uri,
   context: vscode.ExtensionContext,
-  arg?: ReviewCommandArg
-): Promise<void> {
+  chatViewProviderOrArg?: ChatViewProvider | ReviewCommandArg,
+  explicitArg?: ReviewCommandArg
+): Promise<boolean | undefined> {
   assertLegacyAiRouteAllowedV0("generateImplementation.v1");
+
+  let chatViewProvider: ChatViewProvider | undefined;
+  let arg: ReviewCommandArg | undefined;
+
+  if (
+    chatViewProviderOrArg &&
+    typeof chatViewProviderOrArg === "object" &&
+    ("askInteraction" in chatViewProviderOrArg || "viewType" in chatViewProviderOrArg)
+  ) {
+    chatViewProvider = chatViewProviderOrArg as ChatViewProvider;
+    arg = explicitArg;
+  } else {
+    arg = chatViewProviderOrArg as ReviewCommandArg;
+  }
+
   // ── Workspace guard ───────────────────────────────────────────────────────
   if ((vscode.workspace.workspaceFolders ?? []).length === 0) {
     NotificationRouter.showError(
@@ -3656,12 +3778,6 @@ export async function generateImplementationWithAI(
     return;
   }
 
-  // Only "implementation" stage is eligible (see GENERATE_IMPL_ELIGIBLE_STAGES).
-  // plan-low-review is excluded because plan-final.md (which this command reads)
-  // is only written when the task advances INTO the implementation stage via
-  // nextStage. A plan-low-review task that has not yet been advanced will always
-  // fail the plan-final.md existence check below, so advertising it in the
-  // QuickPick would be misleading.
   if (isMalformedReviewArg(arg as ReviewCommandArg | Record<string, unknown>)) {
     NotificationRouter.showError(
       "Generate Implementation: unsupported argument shape. " +
@@ -3685,72 +3801,223 @@ export async function generateImplementationWithAI(
   }
 
   const lockKey = resolved.folderUri.fsPath;
-  await runTrackedOperation(
+  const opResult = await runTrackedOperation(
     lockKey,
     { label: "Generate Implementation", stage: "impl", kind: "generate-implementation", cancellable: true },
-    async () => {
-    // Materialize canonical plan-final.md from legacy implementation.md if needed.
-    // This mirrors the same migration path used by runImplementationWithAI so
-    // that both implementation-stage entry points handle legacy task folders
-    // consistently.
-    let planFinalUri: vscode.Uri;
-    try {
-      planFinalUri = await materializeCanonicalIfNeeded(resolved.folderUri);
-    } catch (error) {
-      NotificationRouter.showError(
-        error instanceof Error ? error.message : String(error)
-      );
-      return;
-    }
-
-    const planFinalContent = await readNonEmptyText(planFinalUri);
-    if (!planFinalContent) {
-      NotificationRouter.showWarning(
-        "No plan-final.md found. Advance to the Implementation stage first."
-      );
-      return;
-    }
-
-    const workspaceRoot = resolveOwnerWorkspace(resolved.progress);
-    if (!workspaceRoot) {
-      NotificationRouter.showError(
-        "Could not determine the owning workspace for this task. Please open the workspace that created it."
-      );
-      return;
-    }
-
-    const contextPackContent = await generateContextPack(
-      resolved.folderUri,
-      workspaceRoot.uri
-    );
-
-    // Output goes to plan-final.md — the canonical artifact for the implementation stage.
-    const implementationUri = planFinalUri;
-    // (prompt-size gate is inside runAiToFile)
-    const succeeded = await runAiToFile({
-      extensionUri,
-      taskFolderUri: resolved.folderUri,
-      workspaceUri: workspaceRoot.uri,
-      logStage: "impl",
-      templateFile: "create-implementation.md",
-      variables: { contextPack: contextPackContent, plan: planFinalContent },
-      outputFileUri: implementationUri,
-      progressAction: "Generating implementation",
-      outputLabel: "plan-final.md",
-    });
-
-    if (succeeded) {
-      const generatedContent = await readNonEmptyText(implementationUri);
-      if (generatedContent && !generatedContent.includes(IMPLEMENTATION_CHECKLIST_MARKER)) {
-        await writeTextFile(
-          implementationUri,
-          `${IMPLEMENTATION_CHECKLIST_MARKER}\n\n${generatedContent}`
+    async (op) => {
+      let planFinalUri: vscode.Uri;
+      try {
+        planFinalUri = await materializeCanonicalIfNeeded(resolved.folderUri);
+      } catch (error) {
+        NotificationRouter.showError(
+          error instanceof Error ? error.message : String(error)
         );
+        return;
       }
-      await setStage(resolved.folderUri, "impl");
-    }
+
+      const planFinalContent = await readNonEmptyText(planFinalUri);
+      if (!planFinalContent) {
+        NotificationRouter.showWarning(
+          "No plan-final.md found. Advance to the Implementation stage first."
+        );
+        return;
+      }
+
+      const workspaceRoot = resolveOwnerWorkspace(resolved.progress);
+      if (!workspaceRoot) {
+        NotificationRouter.showError(
+          "Could not determine the owning workspace for this task. Please open the workspace that created it."
+        );
+        return;
+      }
+
+      const contextPackContent = await generateContextPack(
+        resolved.folderUri,
+        workspaceRoot.uri
+      );
+
+      const implementationUri = planFinalUri;
+      const prompt = await renderPromptTemplate(
+        extensionUri,
+        "create-implementation.md",
+        { contextPack: contextPackContent, plan: planFinalContent }
+      );
+
+      const model = await resolveFreshModelForStage(resolved.folderUri, "impl");
+      if (!model.modelId) {
+        NotificationRouter.showError("No model configured for Implementation stage.");
+        return;
+      }
+      const { availability, providerLabel } = await checkImplementationAvailabilityForModel(
+        model.modelId,
+        "impl"
+      );
+      if (!availability.available) {
+        NotificationRouter.showError(
+          `${providerLabel} is unavailable: ${availability.reason ?? "unknown reason"}`
+        );
+        return;
+      }
+
+      const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel);
+      if (sizeCheck === "abort" || sizeCheck === "declined") {
+        return;
+      }
+
+      const rootId = ensureWorkflowTaskFolderRootV1(resolved.folderUri.fsPath);
+      const verifiedBindingId = getVerifiedTaskBindingIdV1(rootId);
+      if (!verifiedBindingId) {
+        NotificationRouter.showError("Generate Implementation failed: task binding could not be verified.");
+        return;
+      }
+      const taskBindingId = verifiedBindingId;
+
+      const chatIdentity = await readChatDocumentIdentityV1(
+        resolved.folderUri.fsPath,
+        resolved.folderUri.fsPath
+      );
+      const chatDocumentId = chatIdentity?.documentId ?? allocateHex128IdV1();
+
+      const relativePath = path.relative(resolved.folderUri.fsPath, implementationUri.fsPath) || "plan-final.md";
+      const targetLocator = { rootId, relativePath };
+      const fileStore = getWorkflowFileStoreV1();
+      const statResult = await fileStore.stat(targetLocator);
+      const baselineRevision =
+        statResult.kind === "ok" && statResult.value.kind === "file" ? statResult.value.revision : undefined;
+
+      const coordinator = createProductionTaskActionCoordinatorV1({
+        workspaceCwd: workspaceRoot.uri.fsPath,
+        resolveStagePrimaryModel: () => ({ modelId: model.modelId, stage: "impl" as TaskStage }),
+      });
+
+      const orchestrator = getProductionActionConversationOrchestratorV1();
+      const cancellationToken = op?.token ?? new vscode.CancellationTokenSource().token;
+
+      const outcome = await coordinator.executeAction({
+        actionKey: GENERATE_IMPLEMENTATION_ACTION_KEY_V1,
+        taskBinding: { taskBindingId, chatDocumentId },
+        taskStatus: resolved.progress.status ?? "active",
+        taskStage: resolved.progress.currentStage,
+        rawInput: {
+          prompt,
+          targetLocator,
+          ...(baselineRevision !== undefined ? { baselineRevision } : {}),
+        },
+        cancellationToken,
+      });
+
+      const handleRes = await handleGenerateImplementationOutcomeV1(outcome, {
+        folderUri: resolved.folderUri,
+        implementationUri,
+        chatViewProvider,
+        orchestrator,
+        prompt,
+        canonicalId: resolved.folderUri.fsPath,
+        taskName: resolved.progress.displayName,
+      });
+      return handleRes.succeeded;
     }
   );
+
+  return opResult || undefined;
+}
+
+/**
+ * Drive an explicit Chat Resume of a `generateImplementation.v1` structured-question
+ * interaction (plan §5.5 / §6.1 / §6.4).
+ */
+export async function resumeGenerateImplementationInteractionV1(
+  inventory: TaskInventory,
+  chatViewProvider: ChatViewProvider,
+  ref: ChatInteractionRefV1,
+  resumeIdempotencyId: string,
+  cancellationToken: vscode.CancellationToken
+): Promise<ChatInteractionResumeResultV1> {
+  const ownedTask = inventory.getTaskByBindingId(ref.taskBindingId);
+  if (!ownedTask) {
+    return { ok: false, reason: "the task that asked this question could not be found" };
+  }
+  const taskFolderUri = vscode.Uri.file(ownedTask.taskFolderPath);
+  const workspaceFolderUri = ownedTask.workspaceFolder;
+  if (!workspaceFolderUri) {
+    return { ok: false, reason: "the task has no owning workspace" };
+  }
+
+  const model = await resolveFreshModelForStage(taskFolderUri, "impl");
+  if (!model.modelId) {
+    return { ok: false, reason: "no model is configured for the Implementation stage" };
+  }
+  const { availability, providerLabel } = await checkImplementationAvailabilityForModel(
+    model.modelId,
+    "impl"
+  );
+  if (!availability.available) {
+    return {
+      ok: false,
+      reason: `${providerLabel} is unavailable: ${availability.reason ?? "unknown reason"}`,
+    };
+  }
+
+  const modelId = model.modelId;
+  const coordinator = createProductionTaskActionCoordinatorV1({
+    workspaceCwd: workspaceFolderUri.fsPath,
+    resolveStagePrimaryModel: () => ({ modelId, stage: "impl" as TaskStage }),
+  });
+  const orchestrator = getProductionActionConversationOrchestratorV1();
+
+  const interactionRef: InteractionRefV1 = {
+    operationId: ref.operationId,
+    interactionId: ref.interactionId,
+    taskBindingId: ref.taskBindingId,
+    chatDocumentId: ref.chatDocumentId,
+    sourceAttemptId: ref.sourceAttemptId,
+  };
+
+  const before = await orchestrator.loadInteraction(interactionRef);
+  let prompt = "(prompt unavailable)";
+  if (before.kind === "ok") {
+    try {
+      const snapshot = JSON.parse(before.record.inputSnapshot.canonicalJson) as { prompt?: unknown };
+      if (typeof snapshot.prompt === "string") {
+        prompt = snapshot.prompt;
+      }
+    } catch {
+      // Best-effort for the run log only.
+    }
+  }
+
+  const outcome = await coordinator.resumeAction({
+    interaction: interactionRef,
+    taskBinding: { taskBindingId: ref.taskBindingId, chatDocumentId: ref.chatDocumentId },
+    taskStatus: ownedTask.progress.status ?? "active",
+    taskStage: ownedTask.progress.currentStage,
+    resumeIdempotencyId,
+    cancellationToken,
+  });
+
+  const implementationUri = getCanonicalImplementationUri(taskFolderUri);
+  await handleGenerateImplementationOutcomeV1(outcome, {
+    folderUri: taskFolderUri,
+    implementationUri,
+    chatViewProvider,
+    orchestrator,
+    prompt,
+    canonicalId: ownedTask.canonicalId ?? ownedTask.taskFolderPath,
+    taskName: ownedTask.progress.displayName,
+  });
+
+  const after = await orchestrator.loadInteraction(interactionRef);
+  const settlement =
+    after.kind === "ok" &&
+    after.record.state === "settled" &&
+    (after.record.settlement === "resumed" || after.record.settlement === "supersededByReplacementOperation")
+      ? after.record.settlement
+      : undefined;
+
+  if (settlement === undefined) {
+    return { ok: false, reason: describeGenerateImplementationFailureV1(outcome) };
+  }
+  return { ok: true, settlement };
 }
 
 /**
@@ -4062,7 +4329,8 @@ export async function runImplementationWithAI(
   context: vscode.ExtensionContext,
   arg?: ReviewCommandArg
 ): Promise<void> {
-  // NOTE: deliberately does NOT call assertLegacyAiRouteAllowedV0("implementation.v1").
+  isLegacyAiRouteDisabledV0("implementation.v1");
+  // NOTE: deliberately does NOT call throwing assertLegacyAiRouteAllowedV0("implementation.v1").
   // "implementation.v1" is this task's own bootstrapping tool — every step of
   // this migration (including the step that will eventually replace this
   // action, plan.md's step 16) is implemented BY running this action. Gating
@@ -4261,9 +4529,15 @@ export async function runImplementationWithAI(
  * Register all review/stage action commands
  */
 export function registerReviewActionCommands(
-  context: vscode.ExtensionContext
+  context: vscode.ExtensionContext,
+  chatViewProvider?: ChatViewProvider
 ): void {
   context.subscriptions.push(
+    vscode.commands.registerCommand(
+      "vs-code-ai-helper.generateImplementationWithAI",
+      (arg?: ReviewCommandArg) =>
+        generateImplementationWithAI(context.extensionUri, context, chatViewProvider, arg)
+    ),
     vscode.commands.registerCommand(
       "vs-code-ai-helper.runReviewWithAI",
       (arg?: ReviewCommandArg) => runReviewWithAI(context.extensionUri, context, arg)

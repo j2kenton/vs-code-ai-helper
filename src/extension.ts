@@ -8,7 +8,11 @@ import {
 } from "./commands/generatePlanWithAI";
 import { GENERATE_PLAN_ACTION_KEY_V1 } from "./actions/rows/generatePlanRowV1";
 import { DRAFT_ACTION_KEY_V1 } from "./actions/rows/draftRowV1";
-import { registerReviewActionCommands } from "./commands/reviewActions";
+import { GENERATE_IMPLEMENTATION_ACTION_KEY_V1 } from "./actions/rows/generateImplementationRowV1";
+import {
+  registerReviewActionCommands,
+  resumeGenerateImplementationInteractionV1,
+} from "./commands/reviewActions";
 import { registerSetTaskStageCommand } from "./commands/setTaskStage";
 import { registerViewArtifactCommands } from "./commands/viewArtifacts";
 import {
@@ -235,6 +239,15 @@ export function activate(context: vscode.ExtensionContext): void {
             cancellation.token
           );
         }
+        if (actionKey === GENERATE_IMPLEMENTATION_ACTION_KEY_V1) {
+          return await resumeGenerateImplementationInteractionV1(
+            inventory,
+            chatViewProvider,
+            ref,
+            resumeIdempotencyId,
+            cancellation.token
+          );
+        }
         return {
           ok: false,
           reason: "Resume isn't available yet for this question — the action that asked it hasn't been migrated to the new Resume flow.",
@@ -358,7 +371,7 @@ export function activate(context: vscode.ExtensionContext): void {
   registerResumeTaskCommand(context, inventory, currentTaskStore);
   // AI commands receive the full context so they can call ensureAiConsent
   registerGeneratePlanWithAICommand(context, inventory, chatViewProvider);
-  registerReviewActionCommands(context);
+  registerReviewActionCommands(context, chatViewProvider);
   registerSetTaskStageCommand(context, inventory, currentTaskStore);
   // The extension-level Settings button (beside the overflow menu) opens
   // native VS Code Settings scoped to this extension; the AI Models webview
