@@ -59,7 +59,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.applyReviewWithAI",
       "path": "src/commands/reviewActions.ts",
-      "span": "L4238-L4241",
+      "span": "L4248-L4251",
       "registrationSymbol": "registerReviewActionCommands",
       "contributed": true,
       "keybound": false,
@@ -71,7 +71,6 @@
         "applyReview.v1",
         "fastForward.v1",
         "generateImplementation.v1",
-        "implementation.v1",
         "review.v1"
       ],
       "fileEdgesOut": [
@@ -163,7 +162,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.chooseReleaseTarget",
       "path": "src/commands/reviewActions.ts",
-      "span": "L4267-L4291",
+      "span": "L4277-L4301",
       "registrationSymbol": "registerReviewActionCommands",
       "contributed": true,
       "keybound": false,
@@ -173,7 +172,6 @@
         "applyReview.v1",
         "fastForward.v1",
         "generateImplementation.v1",
-        "implementation.v1",
         "review.v1"
       ],
       "fileEdgesOut": [
@@ -360,7 +358,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.fastForwardReviewWithAI",
       "path": "src/commands/reviewActions.ts",
-      "span": "L4242-L4245",
+      "span": "L4252-L4255",
       "registrationSymbol": "registerReviewActionCommands",
       "contributed": true,
       "keybound": false,
@@ -374,7 +372,6 @@
         "applyReview.v1",
         "fastForward.v1",
         "generateImplementation.v1",
-        "implementation.v1",
         "review.v1"
       ],
       "fileEdgesOut": [
@@ -498,7 +495,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.nextStage",
       "path": "src/commands/reviewActions.ts",
-      "span": "L4250-L4254",
+      "span": "L4260-L4264",
       "registrationSymbol": "registerReviewActionCommands",
       "contributed": true,
       "keybound": true,
@@ -512,7 +509,6 @@
         "applyReview.v1",
         "fastForward.v1",
         "generateImplementation.v1",
-        "implementation.v1",
         "review.v1"
       ],
       "fileEdgesOut": [
@@ -689,7 +685,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.release",
       "path": "src/commands/reviewActions.ts",
-      "span": "L4263-L4266",
+      "span": "L4273-L4276",
       "registrationSymbol": "registerReviewActionCommands",
       "contributed": true,
       "keybound": false,
@@ -701,7 +697,6 @@
         "applyReview.v1",
         "fastForward.v1",
         "generateImplementation.v1",
-        "implementation.v1",
         "review.v1"
       ],
       "fileEdgesOut": [
@@ -827,7 +822,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.runImplementationWithAI",
       "path": "src/commands/reviewActions.ts",
-      "span": "L4258-L4262",
+      "span": "L4268-L4272",
       "registrationSymbol": "registerReviewActionCommands",
       "contributed": true,
       "keybound": false,
@@ -842,7 +837,6 @@
         "applyReview.v1",
         "fastForward.v1",
         "generateImplementation.v1",
-        "implementation.v1",
         "review.v1"
       ],
       "fileEdgesOut": [
@@ -905,7 +899,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.runReviewWithAI",
       "path": "src/commands/reviewActions.ts",
-      "span": "L4234-L4237",
+      "span": "L4244-L4247",
       "registrationSymbol": "registerReviewActionCommands",
       "contributed": true,
       "keybound": false,
@@ -920,7 +914,6 @@
         "applyReview.v1",
         "fastForward.v1",
         "generateImplementation.v1",
-        "implementation.v1",
         "review.v1"
       ],
       "fileEdgesOut": [
@@ -1126,7 +1119,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.viewReview",
       "path": "src/commands/reviewActions.ts",
-      "span": "L4246-L4249",
+      "span": "L4256-L4259",
       "registrationSymbol": "registerReviewActionCommands",
       "contributed": true,
       "keybound": false,
@@ -1136,7 +1129,6 @@
         "applyReview.v1",
         "fastForward.v1",
         "generateImplementation.v1",
-        "implementation.v1",
         "review.v1"
       ],
       "fileEdgesOut": [
@@ -1462,7 +1454,7 @@
       "kind": "writerEdge",
       "propertyName": "outputFileUri",
       "path": "src/commands/reviewActions.ts",
-      "span": "L4147-L4147",
+      "span": "L4157-L4157",
       "enclosingSymbol": "generated",
       "occurrence": 1
     },
@@ -1824,7 +1816,7 @@
     {
       "propertyName": "outputFileUri",
       "path": "src/commands/reviewActions.ts",
-      "span": "L4147-L4147",
+      "span": "L4157-L4157",
       "enclosingSymbol": "generated"
     },
     {
@@ -1936,13 +1928,6 @@
       "path": "src/commands/reviewActions.ts",
       "span": "L3626-L3626",
       "enclosingSymbol": "generateImplementationWithAI"
-    },
-    {
-      "routeId": "implementation.v1",
-      "gateKind": "throwing",
-      "path": "src/commands/reviewActions.ts",
-      "span": "L4046-L4046",
-      "enclosingSymbol": "runImplementationWithAI"
     },
     {
       "routeId": "review.v1",

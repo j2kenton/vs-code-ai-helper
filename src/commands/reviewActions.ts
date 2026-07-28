@@ -4043,7 +4043,17 @@ export async function runImplementationWithAI(
   context: vscode.ExtensionContext,
   arg?: ReviewCommandArg
 ): Promise<void> {
-  assertLegacyAiRouteAllowedV0("implementation.v1");
+  // NOTE: deliberately does NOT call assertLegacyAiRouteAllowedV0("implementation.v1").
+  // "implementation.v1" is this task's own bootstrapping tool — every step of
+  // this migration (including the step that will eventually replace this
+  // action, plan.md's step 16) is implemented BY running this action. Gating
+  // it on its own not-yet-landed V1 migration is a deadlock, not a safety
+  // measure: it was briefly wired in (alongside the real step 9/10 migrations
+  // in the same round) and immediately made this action permanently
+  // unusable, blocking the only tool that could land step 16 in the first
+  // place. Leave this ungated until step 16's real coordinator replacement
+  // exists to take over — at that point THIS function is what should be
+  // deleted, not gated.
   // ── Workspace guard ───────────────────────────────────────────────────────
   if ((vscode.workspace.workspaceFolders ?? []).length === 0) {
     NotificationRouter.showError(

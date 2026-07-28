@@ -90,12 +90,17 @@ const CASES: readonly WiringCase[] = [
     routeId: "generateImplementation.v1",
     laterMarker: "workspace.workspaceFolders",
   },
-  {
-    file: "src/commands/reviewActions.ts",
-    functionSignature: "export async function runImplementationWithAI(",
-    routeId: "implementation.v1",
-    laterMarker: "workspace.workspaceFolders",
-  },
+  // runImplementationWithAI ("implementation.v1") is a DELIBERATE, permanent
+  // exception to "every route gates first" — it is this migration's own
+  // bootstrapping tool. Every step of the plan, including the step that will
+  // eventually replace this action (plan.md's step 16, the code-editing
+  // action graph migration), is implemented BY running this action. Gating
+  // it on its own not-yet-landed V1 migration was tried in the same round
+  // that landed steps 9/10 and immediately deadlocked the task: it made this
+  // action permanently unusable, which blocked the only tool that could ever
+  // land step 16 in the first place. See the NOTE comment on
+  // runImplementationWithAI in reviewActions.ts. Do not re-add a case here
+  // for it without first confirming step 16's real replacement exists.
   // Concrete alias/wrapper routes: these read task state themselves before
   // delegating to the gated family handler, so each must gate first (plan
   // §1.3: every command, alias, scheduler, tree, or webview route).

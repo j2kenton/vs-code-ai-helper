@@ -471,7 +471,7 @@
       "routeKey": "command:vs-code-ai-helper.runImplementationWithAI",
       "path": "src/commands/reviewActions.ts",
       "planSection": "§1.3 (fail-closed AI gates) / §8 Safety cohort",
-      "rationale": "The Safety cohort (plan §1.3) installed the first-statement legacy AI route gate for implementation.v1 in this route's registering file — the only mechanical change since the pre-gate snapshot is fileGateRouteIds [] -> [implementation.v1]. The file-level rollup also includes the other four reviewActions.ts family gates installed by the same cohort; wiring-tested in legacyAiActionSafetyGateWiring.test.ts.",
+      "rationale": "The Safety cohort (plan §1.3) installed the first-statement legacy AI route gate for implementation.v1, then removed it in the same cohort once it was discovered to deadlock the task: implementation.v1 is this migration's own bootstrapping tool (every step, including the step 16 replacement for this action, is implemented by running it), so gating it on its own not-yet-landed migration blocks the only tool that could ever land step 16. Mechanical state is now fileGateRouteIds [] -> [] (net no-op for this route specifically) — see the NOTE comment on runImplementationWithAI in reviewActions.ts and the corresponding removed case in legacyAiActionSafetyGateWiring.test.ts. The file-level rollup still includes the other four reviewActions.ts family gates (review.v1, applyReview.v1, fastForward.v1, generateImplementation.v1), which remain gated and wiring-tested.",
       "owner": "ensemble-workflow-migration",
       "cohort": "safety",
       "expiryCohort": "edit",
@@ -481,7 +481,7 @@
         "edgeKind": "pregateModifiedRoute",
         "targetActionKey": "implementation.v1",
         "pregateStabilitySha256": "07c1848dfe3d6e74173c21d8069b6e4891c1784dbdc5f39cdfe63aa17aac1ae9",
-        "liveStabilitySha256": "1dc40566cfc2e8fd4c091b66b972cf105d90e53e63519bf01a930cd50cf18af4"
+        "liveStabilitySha256": "391bcc15d224134d64ac1c7069551db9139cc588a3c3b4f3765897291e6446ec"
       }
     },
     {

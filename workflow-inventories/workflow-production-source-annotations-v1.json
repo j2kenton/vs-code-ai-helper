@@ -265,13 +265,13 @@
       "disposition": "modified",
       "cohort": "safety",
       "planSection": "1.3",
-      "rationale": "Adds assertLegacyAiRouteAllowedV0 as the first statement of runReviewWithAI (\"review.v1\"), applyReviewWithAI (\"applyReview.v1\"), fastForwardReviewWithAI (\"fastForward.v1\"), generateImplementationWithAI (\"generateImplementation.v1\"), and runImplementationWithAI (\"implementation.v1\"), per plan §1.3's route-identity gate.",
+      "rationale": "Adds assertLegacyAiRouteAllowedV0 as the first statement of runReviewWithAI (\"review.v1\"), applyReviewWithAI (\"applyReview.v1\"), fastForwardReviewWithAI (\"fastForward.v1\"), and generateImplementationWithAI (\"generateImplementation.v1\"), per plan §1.3's route-identity gate. runImplementationWithAI (\"implementation.v1\") is a deliberate, permanent exception: it is this migration's own bootstrapping tool (every step, including step 16 which will eventually replace it, is implemented BY running it), so gating it on its own not-yet-landed migration deadlocks the task instead of protecting anything. That gate call was added and then removed in this same cohort once the deadlock was discovered live; see the NOTE comment on runImplementationWithAI.",
       "owner": "j2kenton",
       "expiryCohort": "text3",
       "evidence": {
-        "liveSha256": "ceb7cd22c1dc4a986c7e6eadcab13a539fa5e36f8193fda552c00f410503535e",
+        "liveSha256": "302dc48e4c20d425ce4629a2c983e498c40d5d051c195fd76f0d6fbb78f8fd7f",
         "symbol": "runReviewWithAI, applyReviewWithAI, fastForwardReviewWithAI, generateImplementationWithAI, runImplementationWithAI",
-        "sourceSpan": "one gate per handler: L2449, L2546, L2805, L3626, L4046",
+        "sourceSpan": "one gate per handler: L2449, L2546, L2805, L3626 (runImplementationWithAI at L4041 is deliberately NOT gated)",
         "edgeKind": "command-handler",
         "targetActionKey": "review.v1, applyReview.v1, fastForward.v1, generateImplementation.v1, implementation.v1"
       }
