@@ -65,7 +65,7 @@ class ChatSendPromotionErrorV1 extends Error {
   }
 }
 
-async function promoteChatSendContentV1(
+function promoteChatSendContentV1(
   content: CompletedContentV1,
   _context: TaskActionExecutionContextV1
 ): Promise<TaskActionPromotionCodeV1> {
@@ -73,7 +73,7 @@ async function promoteChatSendContentV1(
     throw new ChatSendPromotionErrorV1("chatSend.v1 received a non-chat-message completed content");
   }
   // Chat message promotion is handled directly by the orchestrator/Chat store.
-  return "completed";
+  return Promise.resolve("completed");
 }
 
 export function createChatSendRowV1(): ProviderTaskActionRowV1 {

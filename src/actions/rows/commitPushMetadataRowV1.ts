@@ -65,7 +65,7 @@ class CommitPushMetadataPromotionErrorV1 extends Error {
   }
 }
 
-async function promoteCommitPushMetadataContentV1(
+function promoteCommitPushMetadataContentV1(
   content: CompletedContentV1,
   _context: TaskActionExecutionContextV1
 ): Promise<TaskActionPromotionCodeV1> {
@@ -75,7 +75,7 @@ async function promoteCommitPushMetadataContentV1(
     );
   }
   // Commit metadata promotion is handled by the caller/commit flow.
-  return "completed";
+  return Promise.resolve("completed");
 }
 
 export function createCommitPushMetadataRowV1(): ProviderTaskActionRowV1 {
