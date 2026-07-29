@@ -700,16 +700,17 @@ function createClineReasoningVariant(
  * default reasoning) plus one variant per ladder rung, via
  * parseClineModelSelection's "model@effort" convention (providers.ts).
  *
- * "DeepSeek V4 Flash (Free)", "Step 3.7 Flash (Free)", and "Laguna M.1
- * (Free)" are separate, differently-namespaced $0 promotional entries inside
- * the SAME `cline-pass` catalog grouping (ids "deepseek/deepseek-v4-flash",
- * "stepfun/step-3.7-flash", "poolside/laguna-m.1:free"). Only the first was
- * confirmed live (`-P cline-pass -m deepseek/deepseek-v4-flash` answered
- * correctly); the other two follow the identical id/invocation shape but
- * were not individually exercised — re-verify if either is reported broken.
- * Kept separate from the price-listed "DeepSeek V4 Flash" entry above rather
- * than merged, since they are distinct model ids that could disappear
- * independently of the paid ones.
+ * "GLM-5.2 (Free)", "DeepSeek V4 Flash (Free)", "Step 3.7 Flash (Free)",
+ * and "Laguna M.1 (Free)" are separate, differently-namespaced $0
+ * promotional entries inside the SAME `cline-pass` catalog grouping (ids
+ * "cline-free/glm-5.2", "deepseek/deepseek-v4-flash",
+ * "stepfun/step-3.7-flash", "poolside/laguna-m.1:free"). Only
+ * "deepseek/deepseek-v4-flash" was confirmed live (`-P cline-pass -m
+ * deepseek/deepseek-v4-flash` answered correctly); the others follow the
+ * identical id/invocation shape but were not individually exercised —
+ * re-verify if any is reported broken. Kept separate from the price-listed
+ * "DeepSeek V4 Flash" entry above rather than merged, since they are
+ * distinct model ids that could disappear independently of the paid ones.
  */
 function createSeededClineModels(): readonly DiscoveredCliModel[] {
   const CLINE_THINKING_LEVELS: readonly (readonly [string, string])[] = [
@@ -740,6 +741,7 @@ function createSeededClineModels(): readonly DiscoveredCliModel[] {
       "DeepSeek V4 Flash"
     ),
     ...createModelWithVariants("cline-pass/glm-5.2", "GLM-5.2"),
+    ...createModelWithVariants("cline-free/glm-5.2", "GLM-5.2 (Free)"),
     ...createModelWithVariants(
       "cline-pass/kimi-k3",
       "Kimi K3 [may be unstable, higher usage]"

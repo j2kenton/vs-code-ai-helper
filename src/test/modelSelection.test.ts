@@ -1076,6 +1076,14 @@ void describe("getAvailableModels", () => {
         "expected the free promotional DeepSeek V4 Flash entry"
       );
       assert.ok(
+        clineModels.some((m) => m.id === "cline-cli:cline-free/glm-5.2"),
+        "expected the free promotional GLM-5.2 entry"
+      );
+      assert.ok(
+        clineModels.some((m) => m.id === "cline-cli:cline-free/glm-5.2@high"),
+        "expected free GLM-5.2's @high thinking-effort variant"
+      );
+      assert.ok(
         clineModels.every((m) => m.providerLabel === "Cline CLI (subscription CLI)"),
         "every Cline model should carry the generic subscription-CLI label"
       );
