@@ -3,7 +3,7 @@
   "generatedBy": "scripts/resolveProductionSourceUniverse.mjs",
   "description": "Production source universe as of the current working tree, resolved from the exact bundler options that produce dist/extension.js (esbuild.config.js) plus the contribution-asset and runtime-resource-copy rules in scripts/lib/productionSourceScan.mjs. Regenerated every run; diffed against the immutable pre-gate snapshot (workflow-production-source-pregate-v1.json), not authoritative on its own.",
   "packageName": "vs-code-ai-helper",
-  "packageVersion": "0.67.3",
+  "packageVersion": "0.68.1",
   "declaredMain": "./dist/extension.js",
   "entrypoint": "src/extension.ts",
   "outfile": "dist/extension.js",
@@ -52,7 +52,7 @@
     },
     {
       "path": "src/actions/taskActionCoordinatorV1.ts",
-      "sha256": "a35909c945d5ae4e2f2f6739cbfbe3dd4377f8295d36ed3990eb44a8224e2f7e"
+      "sha256": "5198d2eb120924ef598521806d0a514ded011e027684493470a4d9feae2d643c"
     },
     {
       "path": "src/actions/taskActionRegistryV1.ts",
@@ -64,11 +64,11 @@
     },
     {
       "path": "src/commands/applyHighLevelReviewChanges.ts",
-      "sha256": "8ffc9b9e9a96e0aca635ffebad61685ecfe984db62c095199c8d0d98957df66f"
+      "sha256": "e12d1f48c5d37c763a8fddaf2b0844c35b69c6170583e8b0d29bc46ab58cdfaf"
     },
     {
       "path": "src/commands/applyLowLevelReviewChanges.ts",
-      "sha256": "20c1011d253a4389d173a08041f55d1fee199d48d75a9ecf9d19790cfb7170ab"
+      "sha256": "36227d23efea76ae2a694b42e3585f0f435474fa8b99c2e3571211d48e8657eb"
     },
     {
       "path": "src/commands/archiveTask.ts",
@@ -76,7 +76,7 @@
     },
     {
       "path": "src/commands/chatWithStage.ts",
-      "sha256": "f20735520fbaca6b920587cf059695f756cf8e6210a4ee37fb59272dbf90150a"
+      "sha256": "023ea3b9d2e0b641ee2c84362acb97cb080fd8c9060d9997e4178b8c5ff2d657"
     },
     {
       "path": "src/commands/choosePublishScope.ts",
@@ -132,7 +132,7 @@
     },
     {
       "path": "src/commands/reviewActions.ts",
-      "sha256": "f1f71b5c15bdd29851ff029fe264eb508547f801a065c90590a5cb25be25f170"
+      "sha256": "360d638c2139270f9e3842d7343995d2bd56ddc1a34878de5d70a9bbdb5a99f9"
     },
     {
       "path": "src/commands/reviewCurrentTask.ts",
@@ -204,7 +204,7 @@
     },
     {
       "path": "src/runners/providers.ts",
-      "sha256": "a1deaac7e95337ebda4ae6b658aabed726952f60213f732c4d069e5ef95ce414"
+      "sha256": "f4ac3c8307d785c556f9d9e146450271a5f514d454aa77de4a2cc4ae14637d15"
     },
     {
       "path": "src/runners/runnerRegistry.ts",
@@ -452,7 +452,7 @@
     },
     {
       "path": "src/utils/modelSelection.ts",
-      "sha256": "6a25b573769b9cb7887d71cb3f1608dd3e73127f58296c0745ab47b7a72c9c18"
+      "sha256": "b5b4d6a8640c45162c23e70c2adff651632d72ecb9979c50c6e338d241026afa"
     },
     {
       "path": "src/utils/notificationContentProvider.ts",
