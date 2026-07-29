@@ -441,13 +441,13 @@
       "disposition": "modified",
       "cohort": "nonPlan",
       "planSection": "n/a",
-      "rationale": "Adds the claude-opus-5 model slug/variant to the CLI and Copilot model catalogs. Ordinary model-catalog maintenance unrelated to this plan's cohorts; recorded here only because the file is part of the tracked production bundle and its digest changed since the pre-gate snapshot.",
+      "rationale": "Adds the claude-opus-5 model slug/variant to the CLI and Copilot model catalogs. Ordinary model-catalog maintenance unrelated to this plan's cohorts; recorded here only because the file is part of the tracked production bundle and its digest changed since the pre-gate snapshot. Evidence refresh 2026-07-29 (release-gate re-review of commit 5370610): adds the \"cline-free/glm-5.2\" \"GLM-5.2 (Free)\" $0 promotional entry (with thinking-effort variants via createModelWithVariants) to createSeededClineModels' cline-pass catalog grouping, and rewords that grouping's doc comment to cover all four free entries; covered by new modelSelection.test.ts assertions for the model and its @high variant. Same nonPlan catalog maintenance as the original note.",
       "owner": "j2kenton",
       "expiryCohort": "nonPlan",
       "evidence": {
-        "liveSha256": "6a25b573769b9cb7887d71cb3f1608dd3e73127f58296c0745ab47b7a72c9c18",
-        "symbol": "Copilot/CLI model catalog entries (claude-opus-5)",
-        "sourceSpan": "catalog entries at L454 and L806-L807",
+        "liveSha256": "b5b4d6a8640c45162c23e70c2adff651632d72ecb9979c50c6e338d241026afa",
+        "symbol": "Copilot/CLI model catalog entries (claude-opus-5); createSeededClineModels (cline-free/glm-5.2)",
+        "sourceSpan": "catalog entries at L454 and L808-L809; GLM-5.2 (Free) seeded entry at L744 (grouping doc comment at L700-L714)",
         "edgeKind": "model-catalog",
         "targetActionKey": "n/a (nonPlan product maintenance)"
       }
