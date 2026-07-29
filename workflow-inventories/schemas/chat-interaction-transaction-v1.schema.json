@@ -53,7 +53,7 @@
     "resumeIdempotencyId": { "$ref": "#/definitions/hex128Id" },
     "state": {
       "type": "string",
-      "enum": ["questionsPosted", "answersDraft", "answersSubmitted", "resumeScheduled", "settled"]
+      "enum": ["invocationPending", "questionsPosted", "answersDraft", "answersSubmitted", "resumeScheduled", "settled"]
     },
     "settlement": {
       "type": "string",
@@ -104,12 +104,14 @@
     "resumeSemantics",
     "inputSnapshot",
     "promptContract",
-    "questions",
-    "questionSetSha256",
     "state",
     "transitions"
   ],
   "additionalProperties": false,
+  "dependencies": {
+    "questions": ["questionSetSha256"],
+    "questionSetSha256": ["questions"]
+  },
   "definitions": {
     "hex128Id": {
       "type": "string",
@@ -128,13 +130,13 @@
             { "type": "null" },
             {
               "type": "string",
-              "enum": ["questionsPosted", "answersDraft", "answersSubmitted", "resumeScheduled"]
+              "enum": ["invocationPending", "questionsPosted", "answersDraft", "answersSubmitted", "resumeScheduled"]
             }
           ]
         },
         "to": {
           "type": "string",
-          "enum": ["questionsPosted", "answersDraft", "answersSubmitted", "resumeScheduled", "settled"]
+          "enum": ["invocationPending", "questionsPosted", "answersDraft", "answersSubmitted", "resumeScheduled", "settled"]
         },
         "at": { "type": "string" }
       },

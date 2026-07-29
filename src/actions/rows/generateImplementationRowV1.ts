@@ -91,6 +91,8 @@ class GenerateImplementationPromotionErrorV1 extends Error {
   }
 }
 
+const IMPLEMENTATION_CHECKLIST_MARKER = "<!-- ensemble:implementation-checklist -->";
+
 async function promoteGenerateImplementationContentV1(
   content: CompletedContentV1,
   context: TaskActionExecutionContextV1
@@ -102,7 +104,11 @@ async function promoteGenerateImplementationContentV1(
   }
   const input = context.validatedInput as GenerateImplementationActionInputV1;
   const fileStore = getWorkflowFileStoreV1();
-  const bytes = Buffer.from(content.markdown, "utf8");
+  let markdown = content.markdown;
+  if (!markdown.includes(IMPLEMENTATION_CHECKLIST_MARKER)) {
+    markdown = `${IMPLEMENTATION_CHECKLIST_MARKER}\n\n${markdown}`;
+  }
+  const bytes = Buffer.from(markdown, "utf8");
   const result =
     input.baselineRevision === undefined
       ? await fileStore.createFileExclusive(input.targetLocator, bytes)

@@ -78,6 +78,7 @@ void describe("provider CLI contracts", () => {
     });
     assert.deepStrictEqual(textArgs, [
       "--print=/tmp/prompt.txt",
+      "--print-timeout=55m0s",
       "--dangerously-skip-permissions",
     ]);
 
@@ -86,9 +87,24 @@ void describe("provider CLI contracts", () => {
     });
     assert.deepStrictEqual(editArgs, [
       "--print=/tmp/prompt.txt",
+      "--print-timeout=55m0s",
       "--dangerously-skip-permissions",
       "--model",
       "gemini-3-pro",
+    ]);
+
+    const resumedArgs = antigravity.buildArgs("edit", undefined, undefined, {
+      promptFile: "/tmp/prompt.txt",
+      resumePreviousConversation: true,
+    });
+    assert.deepStrictEqual(resumedArgs, [
+      "--print=/tmp/prompt.txt",
+      "--print-timeout=55m0s",
+      "--dangerously-skip-permissions",
+      "--continue",
+    ]);
+    assert.deepStrictEqual(antigravity.conversationResume?.errorMarkers, [
+      "error: timeout waiting for response",
     ]);
 
     // promptTransport: "file" is a contract with the caller — cliAgentRunner

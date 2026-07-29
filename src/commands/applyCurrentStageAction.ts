@@ -71,6 +71,9 @@ export async function applyCurrentStageAction(
     await vscode.commands.executeCommand(command, {
       canonicalId: resolvedTask.canonicalId,
       taskFolderPath: resolvedTask.taskFolderPath,
+      task: {
+        progress: resolvedTask.progress,
+      },
     });
   };
 

@@ -33,7 +33,7 @@ import * as path from "node:path";
 import { describe, it } from "node:test";
 import * as vscode from "vscode";
 
-import { applyReviewWithAI, registerReviewActionCommands } from "../commands/reviewActions";
+import { applyReviewWithAI, registerReviewActionCommands, resumeApplyReviewInteractionV1 } from "../commands/reviewActions";
 import { taskOperations } from "../utils/taskOperations";
 import { isAutomationChainActive, resetAutomationChainGuards } from "../utils/automationChain";
 import {
@@ -43,8 +43,19 @@ import {
 import { StatusTreeProvider } from "../views/statusView";
 import { readTaskProgress } from "../utils/taskProgressUtils";
 import { REVIEW_STAGES, TaskProgress, TaskStage } from "../types/taskProgress";
-import type { AgentRunRequest, AgentRunResult } from "../types/agentRunner";
+import type { AgentTransportV1 } from "../types/agentExecutionV1";
 import { DISCLAIMER_VERSION } from "../legal/disclaimerVersion";
+import { createChatInteractionTransactionStoreV1 } from "../services/chatInteractionTransactionStoreV1";
+import {
+  configureWorkflowPrivateStorageRootV1,
+  getWorkflowFileStoreV1,
+  getWorkflowPathRegistryV1,
+  setChatInteractionTransactionStoreV1,
+} from "../services/workflowRuntimeServicesV1";
+import { getProductionActionConversationOrchestratorV1 } from "../actions/productionTaskActionRuntimeV1";
+import { ChatViewProvider, ChatInteractionRefV1 } from "../views/chatView";
+import { allocateHex128IdV1 } from "../types/actionCorrelationV1";
+import { TaskInventory } from "../state/taskInventory";
 
 /* eslint-disable @typescript-eslint/no-var-requires */
 const settingsModule = require("../config/settings") as Record<string, unknown>;
@@ -56,6 +67,30 @@ const contextPackModule = require("../utils/contextPack") as Record<string, unkn
 /* eslint-enable @typescript-eslint/no-var-requires */
 
 const REAL_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-nested-lock-"));
+
+// applyReviewWithAI's re-review path runs through the real production
+// coordinator (createProductionTaskActionCoordinatorV1), which requires the
+// Chat interaction transaction store to be wired exactly as extension.ts
+// does at activation — otherwise getProductionActionConversationOrchestratorV1
+// throws "not wired yet" before this test's actual lock-contention behavior
+// ever runs.
+const PRIVATE_STORAGE_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-nested-lock-private-"));
+// configureWorkflowPrivateStorageRootV1 MUST run (and its `rebuildFileStore()`
+// side effect complete) before getWorkflowFileStoreV1() is called below —
+// object-literal property evaluation runs top-to-bottom, so folding the
+// configure call into the `privateRootId` property here would capture the
+// PRE-registration (root-less) fileStore instance and every `begin()` write
+// through it would fail closed with `workspaceRootUnsupported`, exactly as
+// extension.ts's own activation wiring avoids by registering the root in its
+// own statement first (src/extension.ts, `workflowPrivateStorageRootId`).
+const PRIVATE_STORAGE_ROOT_ID = configureWorkflowPrivateStorageRootV1(PRIVATE_STORAGE_ROOT);
+setChatInteractionTransactionStoreV1(
+  createChatInteractionTransactionStoreV1({
+    registry: getWorkflowPathRegistryV1(),
+    fileStore: getWorkflowFileStoreV1(),
+    privateRootId: PRIVATE_STORAGE_ROOT_ID,
+  })
+);
 
 function makeTaskFolder(name: string, stage: TaskStage): { folderPath: string; progress: TaskProgress } {
   const folderPath = path.join(REAL_ROOT, "plans", name);
@@ -126,6 +161,190 @@ function patch(module: Record<string, unknown>, name: string, replacement: unkno
   return { restore: (): void => { module[name] = orig; } };
 }
 
+/**
+ * applyReviewWithAI/runReviewForFolder now run through the real V1 action
+ * coordinator (createProductionTaskActionCoordinatorV1), which selects
+ * providers via runnerRegistry's `createV1RunnerSelectionOpener` — NOT the
+ * legacy `resolveRunnerForModel` cascade this file used to patch. Framing a
+ * fake response requires the V1 envelope format and this seam instead
+ * (mirrors publishOwnershipMatrix.test.ts's identical helpers).
+ */
+function frame(json: unknown): string {
+  return `<<<ENSEMBLE_AI_RESULT_V1>>>\n${JSON.stringify(json)}\n<<<END_ENSEMBLE_AI_RESULT_V1>>>\n`;
+}
+
+/** A V1 transport that frames a completed markdown-artifact.v1 envelope. */
+function markdownTransportV1(markdown: string, runnerId = "stub-runner"): AgentTransportV1 {
+  return {
+    runnerId,
+    invoke: (request, output): Promise<{ kind: "completed" }> => {
+      output.write(
+        frame({
+          version: 1,
+          correlation: request.correlation,
+          kind: "completed",
+          content: { contentType: "markdown-artifact.v1", schemaVersion: 1, markdown },
+        })
+      );
+      return Promise.resolve({ kind: "completed" as const });
+    },
+  };
+}
+
+/** A V1 transport that frames a `questions` envelope with a single required text question. */
+function questionsTransportV1(runnerId = "stub-runner"): AgentTransportV1 {
+  return {
+    runnerId,
+    invoke: (request, output): Promise<{ kind: "completed" }> => {
+      output.write(
+        frame({
+          version: 1,
+          correlation: request.correlation,
+          kind: "questions",
+          questions: [
+            {
+              questionId: "q1",
+              kind: "text",
+              prompt: "Which revision should the plan favor?",
+              required: true,
+              allowBlank: false,
+              maxLength: 200,
+            },
+          ],
+        })
+      );
+      return Promise.resolve({ kind: "completed" as const });
+    },
+  };
+}
+
+/** Minimal vscode.Memento backing store for a standalone ChatViewProvider instance. */
+function makeMemento(): vscode.Memento {
+  const store = new Map<string, unknown>();
+  return {
+    get: <T>(key: string, defaultValue?: T): T => (store.has(key) ? (store.get(key) as T) : (defaultValue as T)),
+    update: (key: string, value: unknown): Promise<void> => {
+      if (value === undefined) store.delete(key);
+      else store.set(key, value);
+      return Promise.resolve();
+    },
+    keys: (): readonly string[] => [...store.keys()],
+  } as unknown as vscode.Memento;
+}
+
+/**
+ * ChatViewProvider.askInteraction's first call for a task opens the webview
+ * via `executeCommand("vs-code-ai-helper.chatView.focus")` (chatView.ts's
+ * `open()`), which this test process never registers — mirrors
+ * chatInteractionUI.test.ts's identical harness.
+ */
+function installExecuteCommandCapture(): { restore: () => void } {
+  const commandsObj = vscode.commands as unknown as {
+    _executeCommandOverride?: (id: string, ...args: unknown[]) => Promise<unknown>;
+  };
+  const orig = commandsObj._executeCommandOverride;
+  commandsObj._executeCommandOverride = (): Promise<unknown> => Promise.resolve(undefined);
+  return {
+    restore: (): void => {
+      commandsObj._executeCommandOverride = orig;
+    },
+  };
+}
+
+/**
+ * A TaskInventory stub whose task's `progress` carries the same
+ * `ownership`/`taskFolder` binding `makeTaskFolder` writes to disk — required
+ * for `TaskInventory.getTaskByBindingId` (the real, un-stubbed prototype
+ * method) to resolve the task a durable Chat interaction transaction's
+ * `taskBindingId` names, exactly as `resumeApplyReviewInteractionV1` looks it
+ * up.
+ */
+function makeBindingInventoryStub(folderPath: string, stage: TaskStage): TaskInventory {
+  const inv = Object.create(TaskInventory.prototype) as TaskInventory;
+  const folderName = folderPath.split(/[/\\]/).pop() ?? "";
+  const task = {
+    canonicalId: folderPath,
+    taskFolderPath: folderPath,
+    folderName,
+    sourceScopeKey: folderPath,
+    workspaceFolder: vscode.Uri.file(REAL_ROOT),
+    progress: {
+      taskFolder: folderName,
+      currentStage: stage,
+      status: "active" as const,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      ownership: {
+        metaRoot: path.join(REAL_ROOT, "plans"),
+        projectRoot: REAL_ROOT,
+        workspaceRoot: REAL_ROOT,
+        boundAt: "2026-01-01T00:00:00.000Z",
+      },
+    },
+  };
+  // @ts-expect-error — direct field init on stub
+  inv.visibleTasks = [task];
+  // @ts-expect-error — direct field init on stub
+  inv.taskByCanonicalId = new Map([[folderPath, task]]);
+  // @ts-expect-error — direct field init on stub
+  inv.suppressionAliasMap = new Map();
+  inv.refresh = async (): Promise<void> => { /* no-op */ };
+  inv.getTasks = (): Array<typeof task> => [task];
+  inv.getTaskById = (id: string): typeof task | undefined => (id === folderPath ? task : undefined);
+  inv.getTaskByPath = (p: string): typeof task | undefined => (p === folderPath ? task : undefined);
+  inv.getVisibleTaskForSuppressedId = (): undefined => undefined;
+  inv.getVisibleTaskForSuppressedPath = (): undefined => undefined;
+  return inv;
+}
+
+function fakeToken(cancelled = false): vscode.CancellationToken {
+  return {
+    isCancellationRequested: cancelled,
+    onCancellationRequested: () => ({ dispose: (): void => undefined }),
+  } as unknown as vscode.CancellationToken;
+}
+
+/**
+ * Patches runnerRegistry's `createV1RunnerSelectionOpener` factory so a
+ * coordinator-run action never reaches a real CLI or Copilot provider.
+ * Transports are offered strictly in order across every coordinator
+ * operation opened while this patch is installed.
+ */
+function stubV1RunnerSelection(transports: readonly AgentTransportV1[]): Patched {
+  let cursor = 0;
+  const fakeOpener = (request: {
+    session: { reserve: (input: Record<string, unknown>) => unknown };
+    mode: unknown;
+  }) => ({
+    reserveNext(attemptId: string): unknown {
+      const transport = transports[cursor];
+      if (!transport) {
+        return cursor === 0
+          ? { kind: "noneRemaining", code: "providerModeUnavailable" }
+          : { kind: "noneRemaining", code: "candidatesExhausted" };
+      }
+      cursor += 1;
+      const handle = request.session.reserve({
+        attemptId,
+        mode: request.mode,
+        runnerId: transport.runnerId,
+        providerId: "copilot",
+        modelId: "copilot:test",
+      });
+      return {
+        kind: "reserved",
+        reserved: {
+          handle,
+          providerLabel: "Test Provider",
+          storedModelId: "copilot:test",
+          createTransport: () => transport,
+        },
+      };
+    },
+  });
+  return patch(runnerRegistryModule, "createV1RunnerSelectionOpener", () => fakeOpener);
+}
+
 function makeExtensionContext(): vscode.ExtensionContext {
   const backing = new Map<string, unknown>([
     [
@@ -174,21 +393,6 @@ void describe("applyReviewWithAI re-review auto-advance dispatch (real operation
     const contextPack = path.join(folderPath, "context-pack.md");
     fs.writeFileSync(contextPack, "# Context\n", "utf8");
 
-    const fakeRunner = {
-      id: "stub-runner",
-      label: "Stub Provider",
-      capabilities: { planning: true, review: true, assistant: false },
-      isAvailable: (): Promise<{ available: boolean }> => Promise.resolve({ available: true }),
-      run: async (request: AgentRunRequest): Promise<AgentRunResult> => {
-        const target = request.outputFile.fsPath;
-        const content = target.endsWith("plan.md")
-          ? "# Plan\n\n1. Do the thing (revised).\n"
-          : "Readiness: 9/10\n\n- Ready.\n";
-        await fs.promises.writeFile(target, content, "utf8");
-        return { runnerId: "stub-runner", status: "completed" };
-      },
-    };
-
     const patches: Patched[] = [
       patch(settingsModule, "isAutoAdvanceEnabled", () => true),
       patch(settingsModule, "getAutoAdvanceMode", () => "auto"),
@@ -199,12 +403,15 @@ void describe("applyReviewWithAI re-review auto-advance dispatch (real operation
         Promise.resolve({ source: "settings", modelId: "stub:model" })),
       patch(modelSelectionModule, "resolveConfiguredReviewStages", () =>
         Promise.resolve(new Set(REVIEW_STAGES))),
-      patch(runnerRegistryModule, "resolveRunnerForModel", () => ({
-        runner: fakeRunner,
-        provider: "copilot",
-        providerLabel: "Stub Provider",
-        nativeModelId: undefined,
-      })),
+      // First call is applyReview.v1 (rewrites plan.md); every call after
+      // that is review.v1 (the inline re-review, then the deferred
+      // follow-up once the true root operation ends) — supply several in
+      // case routing performs more than one review.v1 round, mirroring the
+      // old always-available resolveRunnerForModel stub this replaces.
+      stubV1RunnerSelection([
+        markdownTransportV1("# Plan\n\n1. Do the thing (revised).\n"),
+        ...Array.from({ length: 6 }, () => markdownTransportV1("Readiness: 9/10\n\n- Ready.\n")),
+      ]),
       patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.resolve("stub prompt")),
       patch(runLogModule, "writeRunLog", () => Promise.resolve(undefined)),
       patch(contextPackModule, "writeContextPack", () => Promise.resolve(vscode.Uri.file(contextPack))),
@@ -281,6 +488,146 @@ void describe("applyReviewWithAI re-review auto-advance dispatch (real operation
     } finally {
       for (const p of patches.reverse()) { p.restore(); }
       for (const sub of context.subscriptions) { sub.dispose(); }
+      wsStub.restore();
+      fsBridge.restore();
+      provider.dispose();
+      deactivateNotificationRouter();
+    }
+  });
+});
+
+/**
+ * Direct coverage for the production `resumeApplyReviewInteractionV1`
+ * delegate (reviewActions.ts) — the wiring extension.ts calls from the Chat
+ * "Resume" control for the text-only Apply Review action (plan §5.5/§6.1).
+ * The generic coordinator-level `resumeAction` machinery already has
+ * thorough coverage in taskActionCoordinatorV1.test.ts; what was previously
+ * untested is the production glue this delegate adds: looking the task up by
+ * its durable `taskBindingId` via `TaskInventory.getTaskByBindingId`,
+ * resolving a fresh model for the "plan" stage, and — on a completed resume —
+ * actually promoting the resumed content to plan.md and re-running the
+ * review, mirroring applyReviewWithAI's own synchronous completion path.
+ */
+void describe("resumeApplyReviewInteractionV1 — production Resume delegate", () => {
+  void it("resumes a questions-returning Apply Review end to end: settles \"resumed\", rewrites plan.md, and re-runs the review", async () => {
+    const { folderPath } = makeTaskFolder(`resume-apply-review-${Math.floor(Math.random() * 1e9)}`, "plan-high-review");
+    const provider = new StatusTreeProvider();
+    initNotificationRouter(provider);
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const execCapture = installExecuteCommandCapture();
+    const contextPack = path.join(folderPath, "context-pack.md");
+    fs.writeFileSync(contextPack, "# Context\n", "utf8");
+
+    const chatViewProvider = new ChatViewProvider(makeMemento());
+    const askedRefs: ChatInteractionRefV1[] = [];
+    const originalAskInteraction = chatViewProvider.askInteraction.bind(chatViewProvider);
+    chatViewProvider.askInteraction = (async (question) => {
+      askedRefs.push({
+        operationId: question.operationId,
+        interactionId: question.interactionId,
+        taskBindingId: question.binding.taskBindingId,
+        chatDocumentId: question.binding.chatDocumentId,
+        sourceAttemptId: question.sourceAttemptId,
+      });
+      return originalAskInteraction(question);
+    }) as typeof chatViewProvider.askInteraction;
+
+    const context = makeExtensionContext();
+    registerReviewActionCommands(context);
+
+    try {
+      const initialPatches: Patched[] = [
+        patch(settingsModule, "isAutoAdvanceEnabled", () => false),
+        patch(modelSelectionModule, "resolveModelForStage", () =>
+          Promise.resolve({ source: "settings", modelId: "stub:model" })),
+        patch(modelSelectionModule, "resolveFreshModelForStage", () =>
+          Promise.resolve({ source: "settings", modelId: "stub:model" })),
+        patch(modelSelectionModule, "resolveConfiguredReviewStages", () =>
+          Promise.resolve(new Set(REVIEW_STAGES))),
+        stubV1RunnerSelection([questionsTransportV1()]),
+        patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.resolve("stub prompt")),
+        patch(runLogModule, "writeRunLog", () => Promise.resolve(undefined)),
+        patch(contextPackModule, "writeContextPack", () => Promise.resolve(vscode.Uri.file(contextPack))),
+      ];
+      try {
+        await applyReviewWithAI(
+          vscode.Uri.file(REAL_ROOT),
+          context,
+          { taskFolderPath: folderPath },
+          { chatViewProvider }
+        );
+      } finally {
+        for (const p of initialPatches.reverse()) { p.restore(); }
+      }
+
+      assert.equal(askedRefs.length, 1, "the apply-review clarifying question must reach Chat With AI exactly once");
+      assert.equal(
+        fs.readFileSync(path.join(folderPath, "plan.md"), "utf8"),
+        "# Plan\n\n1. Do the thing.\n",
+        "a questions outcome must not rewrite plan.md"
+      );
+
+      const submitted = await getProductionActionConversationOrchestratorV1().submitAnswers(
+        askedRefs[0]!,
+        [{ questionId: "q1", kind: "text", state: "answered", value: "Favor the revised approach." }],
+        allocateHex128IdV1()
+      );
+      assert.equal(submitted.ok, true, "the clarifying answer must be accepted before Resume");
+
+      const inventory = makeBindingInventoryStub(folderPath, "plan-high-review");
+      const resumePatches: Patched[] = [
+        patch(settingsModule, "isAutoAdvanceEnabled", () => false),
+        patch(modelSelectionModule, "resolveModelForStage", () =>
+          Promise.resolve({ source: "settings", modelId: "stub:model" })),
+        patch(modelSelectionModule, "resolveFreshModelForStage", () =>
+          Promise.resolve({ source: "settings", modelId: "stub:model" })),
+        patch(modelSelectionModule, "resolveConfiguredReviewStages", () =>
+          Promise.resolve(new Set(REVIEW_STAGES))),
+        // First transport is the resumed applyReview.v1 attempt (rewrites
+        // plan.md); the second is the completion path's own re-review.
+        stubV1RunnerSelection([
+          markdownTransportV1("# Plan\n\n1. Do the thing (revised via Resume).\n"),
+          markdownTransportV1("Readiness: 9/10\n\n- Ready.\n"),
+        ]),
+        patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.resolve("stub prompt")),
+        patch(runLogModule, "writeRunLog", () => Promise.resolve(undefined)),
+        patch(contextPackModule, "writeContextPack", () => Promise.resolve(vscode.Uri.file(contextPack))),
+      ];
+      try {
+        const result = await resumeApplyReviewInteractionV1(
+          vscode.Uri.file(REAL_ROOT),
+          inventory,
+          chatViewProvider,
+          askedRefs[0]!,
+          allocateHex128IdV1(),
+          fakeToken()
+        );
+
+        assert.equal(result.ok, true, `expected Resume to settle successfully: ${result.ok ? "" : result.reason}`);
+        if (result.ok) {
+          assert.equal(result.settlement, "resumed", "applyReview.v1 declares sameOperation resume semantics");
+        }
+        assert.equal(
+          fs.readFileSync(path.join(folderPath, "plan.md"), "utf8"),
+          "# Plan\n\n1. Do the thing (revised via Resume).\n",
+          "the resumed attempt's own content must be the one actually promoted to plan.md"
+        );
+        // REVIEW_TARGETS["plan-high-review"] is "plan-high-review" itself
+        // (a self-review), so the completion path's re-review — already
+        // awaited inside resumeApplyReviewInteractionV1 before it returns —
+        // overwrites the SAME review artifact the original
+        // applyReviewWithAI call applied.
+        assert.equal(
+          fs.readFileSync(path.join(folderPath, "plan-high-review.md"), "utf8"),
+          "Readiness: 9/10\n\n- Ready.\n",
+          "the re-review triggered by Resume's completion must have run and overwritten the review artifact"
+        );
+      } finally {
+        for (const p of resumePatches.reverse()) { p.restore(); }
+      }
+    } finally {
+      execCapture.restore();
       wsStub.restore();
       fsBridge.restore();
       provider.dispose();

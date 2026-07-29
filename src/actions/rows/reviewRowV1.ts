@@ -15,6 +15,7 @@ import { maxResponseBytesCeilingForModeV1 } from "../../types/agentExecutionV1";
 import { CompletedContentV1 } from "../../types/aiResultEnvelope";
 import { getWorkflowFileStoreV1 } from "../../services/workflowRuntimeServicesV1";
 import { WorkflowFileRevisionV1 } from "../../services/workflowFileStoreV1";
+import { parseReadiness } from "../../utils/reviewReadiness";
 
 export const REVIEW_ACTION_KEY_V1 = "review.v1";
 
@@ -96,6 +97,16 @@ async function promoteReviewContentV1(
   if (!isMarkdownArtifactV1(content)) {
     throw new ReviewPromotionErrorV1("review.v1 received a non-markdown-artifact completed content");
   }
+  // Every review prompt requires a leading `Readiness: N/10` line (see
+  // reviewActions.ts's validateReviewOutput, the same rule this mirrors). A
+  // response missing it is a strong signal the provider didn't actually
+  // perform the review (e.g. it asked a clarifying question instead) and
+  // must never be promoted to a review artifact — rejecting it here, before
+  // any write, keeps this a terminal `promotionFailed` outcome rather than a
+  // fallback-eligible one (AC-RUNNER-05: malformed results are terminal).
+  if (parseReadiness(content.markdown).score === null) {
+    throw new ReviewPromotionErrorV1('review.v1 response has no "Readiness: N/10" line');
+  }
   const input = context.validatedInput as ReviewActionInputV1;
   const fileStore = getWorkflowFileStoreV1();
   const bytes = Buffer.from(content.markdown, "utf8");
@@ -120,7 +131,15 @@ export function createReviewRowV1(): ProviderTaskActionRowV1 {
     routes: ["vs-code-ai-helper.runReviewWithAI", "vs-code-ai-helper.reviewCurrentTask"],
     eligibility: {
       statuses: ["active"],
-      stages: ["plan-high-review", "plan-low-review", "impl-low-review", "review"],
+      stages: [
+        "plan",
+        "plan-high-review",
+        "plan-low-review",
+        "impl",
+        "impl-high-review",
+        "impl-low-review",
+        "publish",
+      ],
     },
     requiresTaskOperationLease: true,
     progressLabel: "Running review…",

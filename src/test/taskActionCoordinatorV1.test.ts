@@ -657,6 +657,186 @@ void describe("taskActionCoordinatorV1", () => {
     assert.equal(harness.leaseStore.heldLease(TASK_BINDING.taskBindingId), undefined);
   });
 
+  void it("admitAction settles duplicate/ineligible/invalid/cancelled rejections without ever admitting a ticket (plan §5.4/AC-CHAT-TX-02)", async () => {
+    const harness = makeHarness([
+      envelopeTransport(() => {
+        throw new Error("provider must not be invoked for a rejected admission");
+      }),
+    ]);
+    const held = harness.leaseStore.acquire(TASK_BINDING.taskBindingId, "otherAction.v1", allocateHex128IdV1());
+    assert.equal(held.ok, true);
+    const duplicate = await harness.coordinator.admitAction(baseRequest());
+    assert.equal(duplicate.kind, "settled");
+    if (duplicate.kind === "settled") {
+      assert.deepEqual(duplicate.outcome, { kind: "duplicateRejected", code: "operationAlreadyRunning" });
+    }
+    harness.leaseStore.release(held.ok ? held.lease.leaseId : "");
+
+    const wrongStatus = await harness.coordinator.admitAction({ ...baseRequest(), taskStatus: "completed" });
+    assert.equal(wrongStatus.kind, "settled");
+    assert.equal(wrongStatus.kind === "settled" && wrongStatus.outcome.kind, "failed");
+
+    const badInput = await harness.coordinator.admitAction(baseRequest("invalid"));
+    assert.equal(badInput.kind, "settled");
+    assert.equal(
+      badInput.kind === "settled" && badInput.outcome.kind === "failed" && badInput.outcome.code,
+      "invalidActionInput"
+    );
+
+    const preCancelled = await harness.coordinator.admitAction({ ...baseRequest(), cancellationToken: fakeToken(true) });
+    assert.equal(preCancelled.kind, "settled");
+    assert.equal(
+      preCancelled.kind === "settled" && preCancelled.outcome.kind === "cancelled" && preCancelled.outcome.code,
+      "userCancelled"
+    );
+
+    // Every rejection is already audited by admitAction itself — a caller
+    // that only calls admitAction (never continueAdmittedAction) for a
+    // "settled" result still gets exactly one settlement record per call.
+    assert.equal(harness.settlementRecords.length, 4);
+    assert.equal(harness.selection.opened, 0);
+    assert.equal(harness.selection.reserved, 0);
+  });
+
+  void it("admitAction admits a ticket without invoking the provider, and continueAdmittedAction runs it to the same outcome executeAction would produce (plan §5.4/AC-CHAT-TX-02)", async () => {
+    let invoked = false;
+    const transport: AgentTransportV1 = {
+      runnerId: "admit-continue-transport",
+      invoke: (request, output): Promise<{ kind: "completed" }> => {
+        invoked = true;
+        output.write(
+          frame({
+            version: 1,
+            correlation: request.correlation,
+            kind: "completed",
+            content: { contentType: "markdown-artifact.v1", schemaVersion: 1, markdown: "# ok" },
+          })
+        );
+        return Promise.resolve({ kind: "completed" as const });
+      },
+    };
+    const harness = makeHarness([transport]);
+
+    const admission = await harness.coordinator.admitAction(baseRequest());
+    assert.equal(admission.kind, "admitted");
+    // Selection is opened during admission (provider-selection precedes any
+    // caller-visible "safe to proceed" point), but the provider transport
+    // itself has not run yet.
+    assert.equal(harness.selection.opened, 1);
+    assert.equal(invoked, false);
+    assert.equal(harness.settlementRecords.length, 0);
+    assert.equal(harness.followUps.length, 0);
+
+    if (admission.kind !== "admitted") {
+      assert.fail("expected an admitted ticket");
+    }
+    const outcome = await harness.coordinator.continueAdmittedAction(admission.ticket);
+    assert.equal(invoked, true);
+    assert.equal(outcome.kind, "completed");
+    assert.equal(harness.promoted.length, 1);
+    // Exactly one settlement record — not one from admission and a second
+    // from continuation.
+    assert.equal(harness.settlementRecords.length, 1);
+    assert.equal(harness.presentationEnded.value, true);
+  });
+
+  void it("abortAdmittedAction retires an admitted ticket without invoking the provider, settling exactly once (plan §5.4/AC-CHAT-TX-02)", async () => {
+    let invoked = false;
+    const harness = makeHarness([
+      envelopeTransport((correlation) => {
+        invoked = true;
+        return frame({
+          version: 1,
+          correlation,
+          kind: "completed",
+          content: { contentType: "markdown-artifact.v1", schemaVersion: 1, markdown: "# ok" },
+        });
+      }),
+    ]);
+
+    const admission = await harness.coordinator.admitAction(baseRequest());
+    assert.equal(admission.kind, "admitted");
+    if (admission.kind !== "admitted") {
+      assert.fail("expected an admitted ticket");
+    }
+    assert.equal(harness.presentationEnded.value, false);
+
+    const outcome = await harness.coordinator.abortAdmittedAction(admission.ticket, "callerWorkFailed");
+    assert.equal(invoked, false, "aborting an admitted ticket must never reach the provider");
+    assert.equal(outcome.kind, "failed");
+    if (outcome.kind !== "failed") {
+      assert.fail("expected a failed outcome");
+    }
+    assert.equal(outcome.code, "admissionAborted.callerWorkFailed");
+    assert.equal(outcome.retryable, true);
+    // Ends progress and audits exactly once — the same exactly-once tail
+    // continueAdmittedAction uses, so an admitted ticket that is aborted
+    // instead of continued still settles instead of leaking.
+    assert.equal(harness.presentationEnded.value, true);
+    assert.equal(harness.settlementRecords.length, 1);
+    assert.equal(harness.followUps.length, 0);
+  });
+
+  void it("rejects a second retirement of the same admitted ticket, in either order (plan §5.4/AC-CHAT-TX-02)", async () => {
+    const completedTransport = envelopeTransport((correlation) =>
+      frame({
+        version: 1,
+        correlation,
+        kind: "completed",
+        content: { contentType: "markdown-artifact.v1", schemaVersion: 1, markdown: "# ok" },
+      })
+    );
+
+    // continueAdmittedAction called twice for the same ticket.
+    {
+      const harness = makeHarness([completedTransport]);
+      const admission = await harness.coordinator.admitAction(baseRequest());
+      if (admission.kind !== "admitted") {
+        assert.fail("expected an admitted ticket");
+      }
+      await harness.coordinator.continueAdmittedAction(admission.ticket);
+      await assert.rejects(() => harness.coordinator.continueAdmittedAction(admission.ticket));
+      // The rejected second call must not re-audit or re-follow-up.
+      assert.equal(harness.settlementRecords.length, 1);
+    }
+
+    // abortAdmittedAction called twice for the same ticket.
+    {
+      const harness = makeHarness([completedTransport]);
+      const admission = await harness.coordinator.admitAction(baseRequest());
+      if (admission.kind !== "admitted") {
+        assert.fail("expected an admitted ticket");
+      }
+      await harness.coordinator.abortAdmittedAction(admission.ticket, "callerWorkFailed");
+      await assert.rejects(() => harness.coordinator.abortAdmittedAction(admission.ticket, "callerWorkFailed"));
+      assert.equal(harness.settlementRecords.length, 1);
+    }
+
+    // abortAdmittedAction after continueAdmittedAction for the same ticket.
+    {
+      const harness = makeHarness([completedTransport]);
+      const admission = await harness.coordinator.admitAction(baseRequest());
+      if (admission.kind !== "admitted") {
+        assert.fail("expected an admitted ticket");
+      }
+      await harness.coordinator.continueAdmittedAction(admission.ticket);
+      await assert.rejects(() => harness.coordinator.abortAdmittedAction(admission.ticket, "tooLate"));
+      assert.equal(harness.settlementRecords.length, 1);
+    }
+
+    // continueAdmittedAction after abortAdmittedAction for the same ticket.
+    {
+      const harness = makeHarness([completedTransport]);
+      const admission = await harness.coordinator.admitAction(baseRequest());
+      if (admission.kind !== "admitted") {
+        assert.fail("expected an admitted ticket");
+      }
+      await harness.coordinator.abortAdmittedAction(admission.ticket, "callerWorkFailed");
+      await assert.rejects(() => harness.coordinator.continueAdmittedAction(admission.ticket));
+      assert.equal(harness.settlementRecords.length, 1);
+    }
+  });
+
   void it("consumes the row's declared follow-up exactly once, after lease release, and only when completed", async () => {
     const followUpTarget: LifecycleTaskActionRowV1 = {
       kind: "lifecycle",

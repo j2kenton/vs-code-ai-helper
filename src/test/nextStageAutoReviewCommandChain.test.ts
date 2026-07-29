@@ -45,10 +45,17 @@ import {
 import { installOperationNotificationBridge } from "../utils/operationNotificationBridge";
 import { readTaskProgress, IncompleteTask } from "../utils/taskProgressUtils";
 import { REVIEW_STAGES, TaskProgress, TaskStage } from "../types/taskProgress";
-import type { AgentRunRequest, AgentRunResult } from "../types/agentRunner";
+import type { AgentTransportV1 } from "../types/agentExecutionV1";
 import { DISCLAIMER_VERSION } from "../legal/disclaimerVersion";
 import { scheduleAutomationChain, resetAutomationChainGuards, type AutomationDispatch } from "../utils/automationChain";
 import { runTrackedOperation } from "../utils/taskOperations";
+import { createChatInteractionTransactionStoreV1 } from "../services/chatInteractionTransactionStoreV1";
+import {
+  configureWorkflowPrivateStorageRootV1,
+  getWorkflowFileStoreV1,
+  getWorkflowPathRegistryV1,
+  setChatInteractionTransactionStoreV1,
+} from "../services/workflowRuntimeServicesV1";
 
 // ── Provider-boundary seams, monkey-patched via the shared CommonJS module
 // objects (the same technique as markTaskDoneUngated.test.ts /
@@ -66,6 +73,29 @@ const automationChainModule = require("../utils/automationChain") as Record<stri
 
 const REAL_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-cmd-chain-"));
 let autoImplementationFolderCounter = 0;
+
+// runReviewForFolder runs through the real production coordinator
+// (createProductionTaskActionCoordinatorV1), which requires the Chat
+// interaction transaction store to be wired exactly as extension.ts does at
+// activation — otherwise getProductionActionConversationOrchestratorV1
+// throws "not wired yet" before this test's actual command chain ever runs.
+const PRIVATE_STORAGE_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-cmd-chain-private-"));
+// configureWorkflowPrivateStorageRootV1 MUST run (and its `rebuildFileStore()`
+// side effect complete) before getWorkflowFileStoreV1() is called below —
+// object-literal property evaluation runs top-to-bottom, so folding the
+// configure call into the `privateRootId` property here would capture the
+// PRE-registration (root-less) fileStore instance and every `begin()` write
+// through it would fail closed with `workspaceRootUnsupported`, exactly as
+// extension.ts's own activation wiring avoids by registering the root in its
+// own statement first (src/extension.ts, `workflowPrivateStorageRootId`).
+const PRIVATE_STORAGE_ROOT_ID = configureWorkflowPrivateStorageRootV1(PRIVATE_STORAGE_ROOT);
+setChatInteractionTransactionStoreV1(
+  createChatInteractionTransactionStoreV1({
+    registry: getWorkflowPathRegistryV1(),
+    fileStore: getWorkflowFileStoreV1(),
+    privateRootId: PRIVATE_STORAGE_ROOT_ID,
+  })
+);
 
 const FAKE_REVIEW =
   "Readiness: 6/10\n\n- Summary verdict: needs changes.\n- Blocking issues: one.\n";
@@ -149,6 +179,86 @@ function patch(module: Record<string, unknown>, name: string, replacement: unkno
   return { restore: (): void => { module[name] = orig; } };
 }
 
+/**
+ * runReviewForFolder now runs through the real V1 action coordinator
+ * (createProductionTaskActionCoordinatorV1), which selects providers via
+ * runnerRegistry's `createV1RunnerSelectionOpener` — NOT the legacy
+ * `resolveRunnerForModel` cascade this file used to patch. Framing a fake
+ * response requires the V1 envelope format and this seam instead (mirrors
+ * publishOwnershipMatrix.test.ts's identical helpers).
+ */
+function frame(json: unknown): string {
+  return `<<<ENSEMBLE_AI_RESULT_V1>>>\n${JSON.stringify(json)}\n<<<END_ENSEMBLE_AI_RESULT_V1>>>\n`;
+}
+
+/** A V1 transport that frames a completed markdown-artifact.v1 envelope, running `produceMarkdown` at invoke time. */
+function scriptedMarkdownTransportV1(
+  produceMarkdown: () => string,
+  runnerId = "stub-runner"
+): AgentTransportV1 {
+  return {
+    runnerId,
+    invoke: (request, output): Promise<{ kind: "completed" }> => {
+      output.write(
+        frame({
+          version: 1,
+          correlation: request.correlation,
+          kind: "completed",
+          content: { contentType: "markdown-artifact.v1", schemaVersion: 1, markdown: produceMarkdown() },
+        })
+      );
+      return Promise.resolve({ kind: "completed" as const });
+    },
+  };
+}
+
+/** A V1 transport that frames a fixed completed markdown-artifact.v1 envelope. */
+function markdownTransportV1(markdown: string, runnerId = "stub-runner"): AgentTransportV1 {
+  return scriptedMarkdownTransportV1(() => markdown, runnerId);
+}
+
+/**
+ * Patches runnerRegistry's `createV1RunnerSelectionOpener` factory so a
+ * coordinator-run review never reaches a real CLI or Copilot provider.
+ * Reservations still flow through the caller's own selection session, so
+ * claim-once/one-reservation-per-attempt stay session-enforced exactly like
+ * production; only WHICH runner/model is offered is stubbed.
+ */
+function stubV1RunnerSelection(transports: readonly AgentTransportV1[]): Patched {
+  let cursor = 0;
+  const fakeOpener = (request: {
+    session: { reserve: (input: Record<string, unknown>) => unknown };
+    mode: unknown;
+  }) => ({
+    reserveNext(attemptId: string): unknown {
+      const transport = transports[cursor];
+      if (!transport) {
+        return cursor === 0
+          ? { kind: "noneRemaining", code: "providerModeUnavailable" }
+          : { kind: "noneRemaining", code: "candidatesExhausted" };
+      }
+      cursor += 1;
+      const handle = request.session.reserve({
+        attemptId,
+        mode: request.mode,
+        runnerId: transport.runnerId,
+        providerId: "copilot",
+        modelId: "copilot:test",
+      });
+      return {
+        kind: "reserved",
+        reserved: {
+          handle,
+          providerLabel: "Test Provider",
+          storedModelId: "copilot:test",
+          createTransport: () => transport,
+        },
+      };
+    },
+  });
+  return patch(runnerRegistryModule, "createV1RunnerSelectionOpener", () => fakeOpener);
+}
+
 function operationNodes(provider: StatusTreeProvider): StatusOperationNode[] {
   const children = (provider.getChildren() ?? []) as StatusTreeNode[];
   return children.filter(
@@ -195,28 +305,22 @@ void describe("nextStage command → auto-review chain (command-layer end-to-end
     const wsStub = installWorkspaceFoldersStub();
 
     // Snapshots captured from INSIDE the provider call — i.e. while the
-    // auto-started review operation is running.
+    // auto-started review operation is running. (V1 requests carry no
+    // artifact/result path — AC-RUNNER-01 — so there is no outputFile to
+    // snapshot here anymore; the staged-artifact assertion below instead
+    // checks the published content directly.)
     const midRun: {
       reviewRows?: StatusOperationNode[];
       stageSpinnerIconId?: string;
-      outputFile?: string;
     } = {};
 
-    const fakeRunner = {
-      id: "stub-runner",
-      label: "Stub Provider",
-      capabilities: { planning: true, review: true, assistant: false },
-      isAvailable: (): Promise<{ available: boolean }> => Promise.resolve({ available: true }),
-      run: async (request: AgentRunRequest): Promise<AgentRunResult> => {
-        midRun.reviewRows = operationNodes(provider).filter((n) => n.label === "Review");
-        const stageRow = new StageNode(buttonArg.task, "plan-high-review", "current", undefined);
-        midRun.stageSpinnerIconId =
-          stageRow.iconPath instanceof vscode.ThemeIcon ? stageRow.iconPath.id : "";
-        midRun.outputFile = request.outputFile.fsPath;
-        await fs.promises.writeFile(request.outputFile.fsPath, FAKE_REVIEW, "utf8");
-        return { runnerId: "stub-runner", status: "completed", summary: "stub run" };
-      },
-    };
+    const fakeTransport = scriptedMarkdownTransportV1(() => {
+      midRun.reviewRows = operationNodes(provider).filter((n) => n.label === "Review");
+      const stageRow = new StageNode(buttonArg.task, "plan-high-review", "current", undefined);
+      midRun.stageSpinnerIconId =
+        stageRow.iconPath instanceof vscode.ThemeIcon ? stageRow.iconPath.id : "";
+      return FAKE_REVIEW;
+    });
 
     const contextPackUri = vscode.Uri.file(path.join(folderPath, "context-pack.md"));
     fs.writeFileSync(contextPackUri.fsPath, "# Context Pack (stub)\n", "utf8");
@@ -230,12 +334,7 @@ void describe("nextStage command → auto-review chain (command-layer end-to-end
         Promise.resolve({ source: "settings", modelId: "stub:model" })),
       patch(modelSelectionModule, "resolveConfiguredReviewStages", () =>
         Promise.resolve(new Set(REVIEW_STAGES))),
-      patch(runnerRegistryModule, "resolveRunnerForModel", () => ({
-        runner: fakeRunner,
-        provider: "copilot",
-        providerLabel: "Stub Provider",
-        nativeModelId: undefined,
-      })),
+      stubV1RunnerSelection([fakeTransport]),
       patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.resolve("stub prompt")),
       patch(runLogModule, "writeRunLog", () => Promise.resolve(undefined)),
       patch(contextPackModule, "writeContextPack", () => Promise.resolve(contextPackUri)),
@@ -260,10 +359,6 @@ void describe("nextStage command → auto-review chain (command-layer end-to-end
       assert.equal(midRun.reviewRows?.length, 1, "exactly one in-progress Review row during the run");
       assert.equal(midRun.reviewRows?.[0]?.cancellable, true, "the auto-started review is cancellable");
       assert.equal(midRun.stageSpinnerIconId, "loading~spin", "the review stage row spins during the run");
-      assert.ok(
-        midRun.outputFile?.includes("plan-high-review.md"),
-        "the provider was pointed at the staged review artifact"
-      );
 
       // 3. The review artifact was published with EXACTLY the validated
       //    provider output (staging tmp → CAS → rename, the production path).
@@ -488,17 +583,6 @@ void describe("nextStage command → auto-review chain (command-layer end-to-end
     const wsStub = installWorkspaceFoldersStub();
     const workspaceRoot = { uri: vscode.Uri.file(REAL_ROOT), name: "root", index: 0 } as vscode.WorkspaceFolder;
     const dispatches: AutomationDispatch[] = [];
-    const fakeRunner = {
-      id: "stub-runner",
-      label: "Stub Provider",
-      capabilities: { planning: true, review: true, assistant: false },
-      isAvailable: (): Promise<{ available: boolean }> => Promise.resolve({ available: true }),
-      run: async (request: AgentRunRequest): Promise<AgentRunResult> => {
-        await fs.promises.writeFile(request.outputFile.fsPath, "Readiness: 9/10\n\n- Ready.\n", "utf8");
-        return { runnerId: "stub-runner", status: "completed" };
-      },
-    };
-
     const contextPack = path.join(folderPath, "context-pack.md");
     fs.writeFileSync(contextPack, "# Context\n", "utf8");
 
@@ -509,9 +593,7 @@ void describe("nextStage command → auto-review chain (command-layer end-to-end
       patch(modelSelectionModule, "resolveModelForStage", () => Promise.resolve({ source: "settings", modelId: "stub:model" })),
       patch(modelSelectionModule, "resolveFreshModelForStage", () => Promise.resolve({ source: "settings", modelId: "stub:model" })),
       patch(modelSelectionModule, "resolveConfiguredReviewStages", () => Promise.resolve(new Set(REVIEW_STAGES))),
-      patch(runnerRegistryModule, "resolveRunnerForModel", () => ({
-        runner: fakeRunner, provider: "copilot", providerLabel: "Stub Provider", nativeModelId: undefined,
-      })),
+      stubV1RunnerSelection([markdownTransportV1("Readiness: 9/10\n\n- Ready.\n")]),
       patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.resolve("stub prompt")),
       patch(runLogModule, "writeRunLog", () => Promise.resolve(undefined)),
       patch(contextPackModule, "writeContextPack", () => Promise.resolve(vscode.Uri.file(contextPack))),
@@ -567,16 +649,6 @@ void describe("nextStage command → auto-review chain (command-layer end-to-end
     const contextPack = path.join(folderPath, "context-pack.md");
     fs.writeFileSync(contextPack, "# Context\n", "utf8");
     const dispatchedCommands: string[] = [];
-    const fakeRunner = {
-      id: "stub-runner",
-      label: "Stub Provider",
-      capabilities: { planning: true, review: true, assistant: false },
-      isAvailable: (): Promise<{ available: boolean }> => Promise.resolve({ available: true }),
-      run: async (request: AgentRunRequest): Promise<AgentRunResult> => {
-        await fs.promises.writeFile(request.outputFile.fsPath, "Readiness: 9/10\n\n- Ready.\n", "utf8");
-        return { runnerId: "stub-runner", status: "completed" };
-      },
-    };
     const commandsApi = vscode.commands as unknown as {
       executeCommand: (command: string, ...args: unknown[]) => Thenable<unknown>;
     };
@@ -589,9 +661,10 @@ void describe("nextStage command → auto-review chain (command-layer end-to-end
       patch(modelSelectionModule, "resolveModelForStage", () => Promise.resolve({ source: "settings", modelId: "stub:model" })),
       patch(modelSelectionModule, "resolveFreshModelForStage", () => Promise.resolve({ source: "settings", modelId: "stub:model" })),
       patch(modelSelectionModule, "resolveConfiguredReviewStages", () => Promise.resolve(new Set(REVIEW_STAGES))),
-      patch(runnerRegistryModule, "resolveRunnerForModel", () => ({
-        runner: fakeRunner, provider: "copilot", providerLabel: "Stub Provider", nativeModelId: undefined,
-      })),
+      stubV1RunnerSelection([
+        markdownTransportV1("Readiness: 9/10\n\n- Ready.\n"),
+        markdownTransportV1("Readiness: 9/10\n\n- Ready.\n"),
+      ]),
       patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.resolve("stub prompt")),
       patch(runLogModule, "writeRunLog", () => Promise.resolve(undefined)),
       patch(contextPackModule, "writeContextPack", () => Promise.resolve(vscode.Uri.file(contextPack))),
@@ -685,16 +758,6 @@ void describe("nextStage command → auto-review chain (command-layer end-to-end
     const wsStub = installWorkspaceFoldersStub();
     const workspaceRoot = { uri: vscode.Uri.file(REAL_ROOT), name: "root", index: 0 } as vscode.WorkspaceFolder;
     const dispatches: AutomationDispatch[] = [];
-    const fakeRunner = {
-      id: "stub-runner",
-      label: "Stub Provider",
-      capabilities: { planning: true, review: true, assistant: false },
-      isAvailable: (): Promise<{ available: boolean }> => Promise.resolve({ available: true }),
-      run: async (request: AgentRunRequest): Promise<AgentRunResult> => {
-        await fs.promises.writeFile(request.outputFile.fsPath, "Readiness: 9/10\n\n- Ready.\n", "utf8");
-        return { runnerId: "stub-runner", status: "completed" };
-      },
-    };
 
     const patches: Patched[] = [
       patch(settingsModule, "isAutoAdvanceEnabled", () => true),
@@ -702,9 +765,16 @@ void describe("nextStage command → auto-review chain (command-layer end-to-end
       patch(modelSelectionModule, "resolveModelForStage", () => Promise.resolve({ source: "settings", modelId: "stub:model" })),
       patch(modelSelectionModule, "resolveFreshModelForStage", () => Promise.resolve({ source: "settings", modelId: "stub:model" })),
       patch(modelSelectionModule, "resolveConfiguredReviewStages", () => Promise.resolve(new Set(REVIEW_STAGES))),
-      patch(runnerRegistryModule, "resolveRunnerForModel", () => ({
-        runner: fakeRunner, provider: "copilot", providerLabel: "Stub Provider", nativeModelId: undefined,
-      })),
+      // Each loop iteration below (armed: [false, true]) may drive more than
+      // one provider call internally (e.g. a same-stage re-review round plus
+      // routing/second-opinion work) before landing on Implementation — the
+      // legacy `resolveRunnerForModel` stub this replaces served an unbounded
+      // number of calls from one always-available runner, so this supplies
+      // a generous, identical-content transport per possible call instead of
+      // pinning an exact count unrelated to this test's actual assertions.
+      stubV1RunnerSelection(
+        Array.from({ length: 8 }, () => markdownTransportV1("Readiness: 9/10\n\n- Ready.\n"))
+      ),
       patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.resolve("stub prompt")),
       patch(runLogModule, "writeRunLog", () => Promise.resolve(undefined)),
       patch(contextPackModule, "writeContextPack", (folder: vscode.Uri) =>

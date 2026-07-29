@@ -89,9 +89,19 @@ export interface ChatInteractionServicesV1 {
     ref: ChatInteractionRefV1,
     resumeIdempotencyId: string
   ): Promise<ChatInteractionResumeResultV1>;
+  /**
+   * Validates a Chat Send BEFORE the user's message is appended to the
+   * transcript (plan §5.4/AC-CHAT-TX-02) — resolves the target task so a
+   * stale/deleted reference is rejected without ever persisting a message
+   * for a send `chatWithStage` would only reject moments later anyway.
+   * Optional: when unset, Send proceeds straight to append (matches
+   * pre-wiring behavior, and the "global" assistant target, which has no
+   * task to validate).
+   */
+  validateSend?(target: ChatTarget, text: string): Promise<ChatInteractionServiceResultV1>;
 }
 
-interface ChatTarget {
+export interface ChatTarget {
   canonicalId: string;
   taskFolderPath: string;
   stage: TaskStage;
@@ -287,17 +297,32 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           );
           return;
         }
-      }
-      await this.append("user", text, target.stage, target);
-      if (target.kind === "global") {
-        // The global assistant has its own send path — it is not a task or
-        // stage chat, and chatWithStage cannot resolve its synthetic folder.
-        await vscode.commands.executeCommand("vs-code-ai-helper.globalAssistantSend", {
+        // Plan §5.4/AC-CHAT-TX-02: validate the send BEFORE the user message
+        // is persisted, so a stale/deleted task reference is rejected without
+        // ever mutating chat-v1.json for a send chatWithStage would only
+        // reject moments later anyway.
+        if (this.interactionServices?.validateSend) {
+          const validated = await this.interactionServices.validateSend(target, text);
+          if (!validated.ok) {
+            NotificationRouter.showWarning(validated.reason);
+            return;
+          }
+        }
+        // chatWithStage itself persists the user message (plan
+        // §5.4/AC-CHAT-TX-02) once every precondition it independently
+        // checks — consent, workspace/model/runner availability, task
+        // ownership binding — has passed, so a failure there never leaves
+        // an unanswerable message in chat-v1.json. Do not also append here.
+        await vscode.commands.executeCommand("vs-code-ai-helper.chatWithStage", {
+          ...target,
           message: text,
         });
       } else {
-        await vscode.commands.executeCommand("vs-code-ai-helper.chatWithStage", {
-          ...target,
+        // The global assistant has its own send path — it is not a task or
+        // stage chat, chatWithStage cannot resolve its synthetic folder, and
+        // globalAssistantSend does not persist the user message itself.
+        await this.append("user", text, target.stage, target);
+        await vscode.commands.executeCommand("vs-code-ai-helper.globalAssistantSend", {
           message: text,
         });
       }

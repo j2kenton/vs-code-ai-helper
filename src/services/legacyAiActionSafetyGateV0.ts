@@ -61,6 +61,7 @@ export type LegacyAiRouteIdV0 =
   | "generatePlan.v1"
   | "review.v1"
   | "applyReview.v1"
+  | "applyReviewEdit.v1"
   | "fastForward.v1"
   | "generateImplementation.v1"
   | "implementation.v1"
@@ -74,6 +75,7 @@ const REGISTERED_LEGACY_AI_ROUTE_IDS_V0: ReadonlySet<string> = new Set<LegacyAiR
   "generatePlan.v1",
   "review.v1",
   "applyReview.v1",
+  "applyReviewEdit.v1",
   "fastForward.v1",
   "generateImplementation.v1",
   "implementation.v1",
@@ -102,6 +104,16 @@ export const LEGACY_AI_ROUTE_DISABLED_V0: ReadonlySet<string> = new Set<string>(
   // Text 1 (generatePlan.v1), Text 2 (draft.v1), Text 3 (generateImplementation.v1,
   // review.v1, applyReview.v1, chatSend.v1, commitPushMetadata.v1) migrated onto
   // the coordinator — see MIGRATED_ACTION_KEYS_V0 below.
+  //
+  // The migrated applyReview.v1 route id above only covers the TEXT
+  // (plan-review) branch of Apply Review. applyReviewEdit below is a
+  // distinct route id for its edit-capable sibling (implementation-review
+  // stages), gated separately (checked at the top of
+  // applyImplementationReviewWithAI in reviewActions.ts) because edit-based
+  // Apply Review does not migrate until plan §7/§7.8's step 16 (read-only
+  // preflight + sealed edit execution). Enabling the text route above must
+  // never implicitly unblock this one.
+  "applyReviewEdit.v1",
   "fastForward.v1",
   "implementation.v1",
   "applyCurrentStage.v1",
@@ -210,10 +222,12 @@ function hasV1CorrelationShape(
  * `stage === "impl"`, which also matched generateImplementationWithAI's
  * (already "migrated") uncorrelated runAiToFile call — silently letting a
  * genuinely-legacy request through this boundary under a route id it does
- * not belong to. The one legitimate "implementation.v1" bootstrap exemption
- * lives at its actual unique call site instead — see
- * runImplementationForModel in runnerRegistry.ts, which is the only caller
- * with an explicit, single-purpose marker for it.
+ * not belong to. That "implementation.v1" bootstrap exemption has since been
+ * removed entirely: this check is enforced unconditionally for every caller,
+ * including runImplementationWithAI's own invocation, which now calls
+ * `assertLegacyAiRouteAllowedV0("implementation.v1")` as its first statement
+ * and never reaches the runner boundary while "implementation.v1" stays in
+ * `LEGACY_AI_ROUTE_DISABLED_V0`.
  *
  * Call this immediately before delegating to a concrete `AgentRunner.run`,
  * at every path through `runnerRegistry.ts`.

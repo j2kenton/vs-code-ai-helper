@@ -47,6 +47,15 @@ export function getCanonicalImplementationUri(
 }
 
 /**
+ * Returns the legacy URI (implementation.md) for fallback reading.
+ */
+export function getLegacyImplementationUri(
+  taskFolderUri: vscode.Uri
+): vscode.Uri {
+  return vscode.Uri.joinPath(taskFolderUri, LEGACY_IMPLEMENTATION_FILENAME);
+}
+
+/**
  * Resolve the best URI to open/read for the Implementation stage:
  * - plan-final.md when present (canonical)
  * - implementation.md when plan-final.md absent (legacy fallback)

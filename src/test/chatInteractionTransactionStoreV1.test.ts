@@ -270,8 +270,6 @@ void describe("chatInteractionTransactionV1 decoder fixtures", () => {
       "interactionId",
       "operationId",
       "promptContract",
-      "questionSetSha256",
-      "questions",
       "resumeSemantics",
       "schemaVersion",
       "sourceAttemptId",
@@ -290,8 +288,13 @@ void describe("chatInteractionTransactionStoreV1", () => {
     expectOk(first);
     assert.equal(first.transaction.state, "questionsPosted");
     assert.equal(first.transaction.sourceAttemptId, input.correlation.attemptId);
-    assert.equal(first.transaction.transitions.length, 1);
+    // A direct `begin` with no prior `beginInvocation` admission spans both
+    // receipts (null -> invocationPending -> questionsPosted) in one write.
+    assert.equal(first.transaction.transitions.length, 2);
     assert.equal(first.transaction.transitions[0]!.from, null);
+    assert.equal(first.transaction.transitions[0]!.to, "invocationPending");
+    assert.equal(first.transaction.transitions[1]!.from, "invocationPending");
+    assert.equal(first.transaction.transitions[1]!.to, "questionsPosted");
 
     const second = await store.begin(input);
     assert.equal(second.kind, "rejected");
@@ -345,7 +348,7 @@ void describe("chatInteractionTransactionStoreV1", () => {
     const receipts = settled.transaction.transitions;
     assert.deepEqual(
       receipts.map((r) => r.to),
-      ["questionsPosted", "answersDraft", "answersSubmitted", "resumeScheduled", "settled"]
+      ["invocationPending", "questionsPosted", "answersDraft", "answersSubmitted", "resumeScheduled", "settled"]
     );
     assert.equal(receipts[0]!.from, null);
     for (let i = 1; i < receipts.length; i++) {

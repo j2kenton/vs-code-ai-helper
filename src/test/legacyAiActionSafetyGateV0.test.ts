@@ -31,6 +31,7 @@ const REGISTERED_ROUTE_IDS = [
   "generatePlan.v1",
   "review.v1",
   "applyReview.v1",
+  "applyReviewEdit.v1",
   "fastForward.v1",
   "generateImplementation.v1",
   "implementation.v1",
@@ -197,12 +198,14 @@ void describe("LegacyAiActionSafetyGateV0", () => {
         // `stage === "impl"` alone — but generateImplementationWithAI's
         // (already-migrated) uncorrelated runAiToFile call ALSO passes
         // `stage: "impl"`, so that exemption silently let a genuinely-legacy,
-        // unrelated request through this boundary too. This function must
-        // reject EVERY uncorrelated request, stage "impl" included, with no
-        // exception — the real, unforgeable exemption now lives only at
-        // runImplementationForModel's explicit isImplementationV1Bootstrap
-        // parameter (runnerRegistry.ts), which this function has no
-        // knowledge of.
+        // unrelated request through this boundary too. A later version moved
+        // the exemption to runnerRegistry.ts's `isImplementationV1Bootstrap`
+        // parameter instead, which was itself removed once the real fix
+        // landed: `runImplementationWithAI` calls the throwing
+        // `assertLegacyAiRouteAllowedV0("implementation.v1")` as its first
+        // statement, and this function rejects EVERY uncorrelated request —
+        // stage "impl" included, `isImplementationV1Bootstrap` included —
+        // with no exception at all.
         assert.throws(
           () =>
             assertNoUnauthorizedV1CorrelationV0({

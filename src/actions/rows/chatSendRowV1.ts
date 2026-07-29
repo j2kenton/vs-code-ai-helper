@@ -14,10 +14,15 @@ import {
 import { maxResponseBytesCeilingForModeV1 } from "../../types/agentExecutionV1";
 import { CompletedContentV1 } from "../../types/aiResultEnvelope";
 
+import { readChatHistory, writeChatHistory } from "../../utils/chatHistoryStore";
+import { TaskStage } from "../../types/taskProgress";
+
 export const CHAT_SEND_ACTION_KEY_V1 = "chatSend.v1";
 
 export interface ChatSendActionInputV1 {
   readonly prompt: string;
+  readonly taskFolderPath?: string;
+  readonly canonicalId?: string;
 }
 
 const MAX_PROMPT_LENGTH_V1 = 8 * 1024 * 1024;
@@ -40,7 +45,13 @@ export function validateChatSendInputV1(
   if (Buffer.byteLength(raw.prompt, "utf8") > MAX_PROMPT_LENGTH_V1) {
     return { ok: false, reason: "input \"prompt\" exceeds the maximum length" };
   }
-  const allowedKeys = new Set(["prompt"]);
+  if (raw.taskFolderPath !== undefined && !isNonEmptyString(raw.taskFolderPath)) {
+    return { ok: false, reason: "input \"taskFolderPath\" must be a non-empty string when present" };
+  }
+  if (raw.canonicalId !== undefined && !isNonEmptyString(raw.canonicalId)) {
+    return { ok: false, reason: "input \"canonicalId\" must be a non-empty string when present" };
+  }
+  const allowedKeys = new Set(["prompt", "taskFolderPath", "canonicalId"]);
   for (const key of Object.keys(raw)) {
     if (!allowedKeys.has(key)) {
       return { ok: false, reason: `input has an unknown field: ${key}` };
@@ -48,6 +59,8 @@ export function validateChatSendInputV1(
   }
   const validated: ChatSendActionInputV1 = {
     prompt: raw.prompt,
+    ...(raw.taskFolderPath !== undefined ? { taskFolderPath: raw.taskFolderPath } : {}),
+    ...(raw.canonicalId !== undefined ? { canonicalId: raw.canonicalId } : {}),
   };
   return { ok: true, input: validated };
 }
@@ -65,15 +78,26 @@ class ChatSendPromotionErrorV1 extends Error {
   }
 }
 
-function promoteChatSendContentV1(
+async function promoteChatSendContentV1(
   content: CompletedContentV1,
-  _context: TaskActionExecutionContextV1
+  context: TaskActionExecutionContextV1
 ): Promise<TaskActionPromotionCodeV1> {
   if (!isChatMessageV1(content)) {
     throw new ChatSendPromotionErrorV1("chatSend.v1 received a non-chat-message completed content");
   }
-  // Chat message promotion is handled directly by the orchestrator/Chat store.
-  return Promise.resolve("completed");
+  const input = context.validatedInput as ChatSendActionInputV1;
+  if (input.taskFolderPath) {
+    const canonicalId = input.canonicalId ?? input.taskFolderPath;
+    const history = await readChatHistory(input.taskFolderPath, canonicalId);
+    history.push({
+      role: "assistant",
+      text: content.text,
+      stage: (context.stage as TaskStage) ?? "desc",
+      at: new Date().toISOString(),
+    });
+    await writeChatHistory(input.taskFolderPath, history, canonicalId);
+  }
+  return "completed";
 }
 
 export function createChatSendRowV1(): ProviderTaskActionRowV1 {

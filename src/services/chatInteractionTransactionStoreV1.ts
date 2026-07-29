@@ -99,6 +99,7 @@ import {
   ChatInteractionTransactionV1,
   ChatTransactionPromptContractV1,
   ChatTransactionResumeResolutionV1,
+  ChatTransactionTransitionReceiptV1,
   computeChatTransactionAnswersSha256V1,
   computeChatTransactionInputSha256V1,
   computeChatTransactionQuestionSetSha256V1,
@@ -175,6 +176,21 @@ export interface BeginChatTransactionInputV1 {
   readonly questions: readonly StructuredQuestionV1[];
 }
 
+/**
+ * Input for `beginInvocation` (plan §6.1 step 5 / AC-CHAT-TX-02): admits a
+ * record in `invocationPending` BEFORE the provider ever runs, carrying
+ * everything known at that point — everything except `questions`, which
+ * cannot be known yet.
+ */
+export interface BeginInvocationInputV1 {
+  readonly correlation: ActionCorrelationV1;
+  readonly interactionId: string;
+  readonly stage: TaskStage;
+  readonly resumeSemantics: ResumeSemanticsV1;
+  readonly validatedInput: unknown;
+  readonly promptContract: ChatTransactionPromptContractV1;
+}
+
 export interface ChatTransactionSweepResultV1 {
   /** Unresolved records past expiry that were settled as `expired`. */
   readonly expired: number;
@@ -183,8 +199,36 @@ export interface ChatTransactionSweepResultV1 {
 }
 
 export interface ChatInteractionTransactionStoreV1 {
-  /** Create the operation's single durable record in `questionsPosted`. */
+  /**
+   * Create the operation's single durable record already carrying its
+   * posted questions. If a record was already admitted for this operation
+   * via `beginInvocation` (still `invocationPending`), that record is
+   * transitioned into `questionsPosted` in place, reusing its
+   * `interactionId` (`input.interactionId` is then ignored — the admitted
+   * record's identity wins). Otherwise a fresh record is created spanning
+   * both the `invocationPending` and `questionsPosted` receipts in one
+   * write, for callers that never pre-admit (plan §6.1's own coordinator
+   * always pre-admits via `beginInvocation`; this direct path exists for
+   * any other caller and stays fully backward compatible).
+   */
   begin(input: BeginChatTransactionInputV1): Promise<ChatTransactionStoreResultV1>;
+  /**
+   * Admit the operation's single durable record in `invocationPending`,
+   * before its provider invocation ever runs (plan §6.1 step 5 /
+   * AC-CHAT-TX-02). Not yet a real, renderable interaction — carries no
+   * questions and is invisible to `listUnresolvedForChatDocument`.
+   */
+  beginInvocation(input: BeginInvocationInputV1): Promise<ChatTransactionStoreResultV1>;
+  /**
+   * Discard an admitted `invocationPending` record whose invocation resolved
+   * to anything OTHER than questions (completed, cancelled, failed,
+   * malformed) — it was never a real interaction, so this deletes the
+   * record outright rather than inventing a terminal settlement for it.
+   * Rejects if the record has since progressed past `invocationPending`
+   * (e.g. a racing caller already posted questions); a missing record is a
+   * no-op success.
+   */
+  discardPendingInvocation(operationId: string): Promise<ChatTransactionStoreResultV1>;
   /** Load and strictly decode one operation's record. */
   load(operationId: string): Promise<ChatTransactionStoreResultV1>;
   /** Save a (possibly partial) answers draft; repeat saves rewrite in place. */
@@ -510,19 +554,90 @@ export function createChatInteractionTransactionStoreV1(options: {
     return claimDeleted.kind === "ok";
   }
 
+  /** Shared validation for a correlation + interactionId pair (begin/beginInvocation). */
+  function rejectMalformedCorrelation(
+    correlation: ActionCorrelationV1,
+    interactionId: string
+  ): ChatTransactionStoreResultV1 | undefined {
+    if (
+      !isHex128IdV1(correlation.operationId) ||
+      !isHex128IdV1(correlation.attemptId) ||
+      !isHex128IdV1(interactionId) ||
+      correlation.actionKey.length === 0 ||
+      correlation.taskBindingId.length === 0 ||
+      correlation.chatDocumentId.length === 0
+    ) {
+      return rejected("a transaction requires a complete, well-formed correlation tuple");
+    }
+    return undefined;
+  }
+
+  /** Canonicalize + digest the validated input snapshot (begin/beginInvocation). */
+  function buildInputSnapshot(
+    validatedInput: unknown
+  ): { canonicalJson: string; sha256: string } | ChatTransactionStoreResultV1 {
+    try {
+      const canonicalJson = canonicalJsonTextV1(validatedInput);
+      return { canonicalJson, sha256: computeChatTransactionInputSha256V1(canonicalJson) };
+    } catch (error) {
+      if (error instanceof CanonicalJsonErrorV1) {
+        return rejected(`transaction content has no canonical JSON form: ${error.message}`);
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Nonrecursive provisioning of the registry-vended parents, root downward
+   * (plan §1.8: no implicit mkdir -p), then an exclusive-create write of one
+   * self-checked candidate record. Shared by `begin` (no pre-existing
+   * pending record) and `beginInvocation`.
+   */
+  async function createRecordExclusive(
+    operationId: string,
+    candidate: ChatInteractionTransactionV1
+  ): Promise<ChatTransactionStoreResultV1> {
+    const selfCheck = decodeChatInteractionTransactionV1(
+      JSON.parse(encodeChatInteractionTransactionV1(candidate).toString("utf8"))
+    );
+    if (!selfCheck.ok) {
+      return rejected(`transaction record would not decode: ${selfCheck.reason}`);
+    }
+    for (const allocated of [
+      registry.workflowRuntimeDir(privateRootId),
+      registry.chatTransactionsFamilyDir(privateRootId),
+      registry.chatTransactionDir(privateRootId, operationId),
+    ]) {
+      const failure = await ensureDirectory(fileStore.createDirectory(allocated.locator));
+      if (failure) {
+        return failure;
+      }
+    }
+    const created = await fileStore.createFileExclusive(
+      registry.chatTransactionFile(privateRootId, operationId).locator,
+      encodeChatInteractionTransactionV1(selfCheck.transaction)
+    );
+    if (created.kind === "unavailable") {
+      return created;
+    }
+    if (created.kind === "failed") {
+      if (created.code === "targetExists") {
+        return rejected(
+          "a transaction already exists for this operation (exactly one per question-returning operation)"
+        );
+      }
+      return storageFailure(created);
+    }
+    return { kind: "ok", transaction: selfCheck.transaction };
+  }
+
   return {
     begin(input: BeginChatTransactionInputV1): Promise<ChatTransactionStoreResultV1> {
       const { correlation } = input;
       return serialized(correlation.operationId, async () => {
-        if (
-          !isHex128IdV1(correlation.operationId) ||
-          !isHex128IdV1(correlation.attemptId) ||
-          !isHex128IdV1(input.interactionId) ||
-          correlation.actionKey.length === 0 ||
-          correlation.taskBindingId.length === 0 ||
-          correlation.chatDocumentId.length === 0
-        ) {
-          return rejected("a transaction requires a complete, well-formed correlation tuple");
+        const malformed = rejectMalformedCorrelation(correlation, input.interactionId);
+        if (malformed) {
+          return malformed;
         }
         if (
           !Array.isArray(input.questions) ||
@@ -532,10 +647,8 @@ export function createChatInteractionTransactionStoreV1(options: {
           return rejected("a transaction requires 1-16 structured questions");
         }
         let questionBytes: number;
-        let inputCanonicalJson: string;
         try {
           questionBytes = canonicalJsonByteLengthV1(input.questions);
-          inputCanonicalJson = canonicalJsonTextV1(input.validatedInput);
         } catch (error) {
           if (error instanceof CanonicalJsonErrorV1) {
             return rejected(`transaction content has no canonical JSON form: ${error.message}`);
@@ -547,6 +660,57 @@ export function createChatInteractionTransactionStoreV1(options: {
             `question set exceeds the ${MAX_QUESTION_SET_CANONICAL_BYTES_V1}-byte canonical limit`
           );
         }
+
+        // Pre-invocation admission (plan §6.1 step 5): if `beginInvocation`
+        // already admitted this operation, transition ITS pending record
+        // into `questionsPosted` in place — reusing its own interactionId,
+        // stage, resumeSemantics, inputSnapshot, and promptContract (this
+        // call's corresponding input fields are ignored; the admitted
+        // record's identity is authoritative) — rather than creating a
+        // second record or rejecting on "already exists".
+        const existing = await loadForMutation(correlation.operationId);
+        if (existing.ok) {
+          if (existing.transaction.state !== "invocationPending") {
+            return rejected(
+              "a transaction already exists for this operation (exactly one per question-returning operation)"
+            );
+          }
+          const next: ChatInteractionTransactionV1 = {
+            ...existing.transaction,
+            questions: input.questions,
+            questionSetSha256: computeChatTransactionQuestionSetSha256V1(input.questions),
+            state: "questionsPosted",
+            transitions: appendReceipt(existing.transaction, "questionsPosted"),
+          };
+          const selfCheck = decodeChatInteractionTransactionV1(
+            JSON.parse(encodeChatInteractionTransactionV1(next).toString("utf8"))
+          );
+          if (!selfCheck.ok) {
+            return rejected(`transaction record would not decode: ${selfCheck.reason}`);
+          }
+          return replaceRecord(correlation.operationId, selfCheck.transaction, existing.revision);
+        }
+        if (existing.result.kind !== "missing") {
+          // A storage hiccup, unsupported root, or corrupt record must not be
+          // silently treated as "no pending record" and papered over with a
+          // fresh create.
+          return existing.result;
+        }
+
+        const inputSnapshot = buildInputSnapshot(input.validatedInput);
+        if (!("canonicalJson" in inputSnapshot)) {
+          return inputSnapshot;
+        }
+        // No pre-admission happened: create a fresh record spanning both
+        // receipts (null -> invocationPending -> questionsPosted) in one
+        // write — for any caller that does not pre-admit via
+        // `beginInvocation` (plan §6.1's own coordinator always does).
+        const pendingReceipt: ChatTransactionTransitionReceiptV1 = {
+          receiptId: allocateHex128IdV1(),
+          from: null,
+          to: "invocationPending",
+          at: now().toISOString(),
+        };
         const candidate: ChatInteractionTransactionV1 = {
           schemaVersion: 1,
           actionKey: correlation.actionKey,
@@ -557,61 +721,91 @@ export function createChatInteractionTransactionStoreV1(options: {
           interactionId: input.interactionId,
           stage: input.stage,
           resumeSemantics: input.resumeSemantics,
-          inputSnapshot: {
-            canonicalJson: inputCanonicalJson,
-            sha256: computeChatTransactionInputSha256V1(inputCanonicalJson),
-          },
+          inputSnapshot,
           promptContract: input.promptContract,
           questions: input.questions,
           questionSetSha256: computeChatTransactionQuestionSetSha256V1(input.questions),
           state: "questionsPosted",
           transitions: [
+            pendingReceipt,
             {
               receiptId: allocateHex128IdV1(),
-              from: null,
+              from: "invocationPending",
               to: "questionsPosted",
               at: now().toISOString(),
             },
           ],
         };
-        // Round-trip through the strict decoder so nothing undecodable is
-        // ever persisted (e.g. an oversized input snapshot or a malformed
-        // prompt contract) — the write path and the read path enforce the
-        // identical contract.
-        const selfCheck = decodeChatInteractionTransactionV1(
-          JSON.parse(encodeChatInteractionTransactionV1(candidate).toString("utf8"))
+        return createRecordExclusive(correlation.operationId, candidate);
+      });
+    },
+
+    beginInvocation(input: BeginInvocationInputV1): Promise<ChatTransactionStoreResultV1> {
+      const { correlation } = input;
+      return serialized(correlation.operationId, async () => {
+        const malformed = rejectMalformedCorrelation(correlation, input.interactionId);
+        if (malformed) {
+          return malformed;
+        }
+        const inputSnapshot = buildInputSnapshot(input.validatedInput);
+        if (!("canonicalJson" in inputSnapshot)) {
+          return inputSnapshot;
+        }
+        const candidate: ChatInteractionTransactionV1 = {
+          schemaVersion: 1,
+          actionKey: correlation.actionKey,
+          operationId: correlation.operationId,
+          sourceAttemptId: correlation.attemptId,
+          taskBindingId: correlation.taskBindingId,
+          chatDocumentId: correlation.chatDocumentId,
+          interactionId: input.interactionId,
+          stage: input.stage,
+          resumeSemantics: input.resumeSemantics,
+          inputSnapshot,
+          promptContract: input.promptContract,
+          state: "invocationPending",
+          transitions: [
+            {
+              receiptId: allocateHex128IdV1(),
+              from: null,
+              to: "invocationPending",
+              at: now().toISOString(),
+            },
+          ],
+        };
+        return createRecordExclusive(correlation.operationId, candidate);
+      });
+    },
+
+    discardPendingInvocation(operationId: string): Promise<ChatTransactionStoreResultV1> {
+      return serialized(operationId, async () => {
+        const loaded = await loadForMutation(operationId);
+        if (!loaded.ok) {
+          // "missing" (nothing to discard) and any storage failure both pass
+          // through as-is; the caller treats "missing" as a successful no-op.
+          return loaded.result;
+        }
+        if (loaded.transaction.state !== "invocationPending") {
+          return rejected(
+            `cannot discard: the record has already progressed to ${loaded.transaction.state}`
+          );
+        }
+        const deleted = await fileStore.deleteFileExact(
+          registry.chatTransactionFile(privateRootId, operationId).locator,
+          loaded.revision
         );
-        if (!selfCheck.ok) {
-          return rejected(`transaction record would not decode: ${selfCheck.reason}`);
+        if (deleted.kind === "unavailable") {
+          return deleted;
         }
-        // Nonrecursive provisioning of the registry-vended parents, root
-        // downward (plan §1.8: no implicit mkdir -p).
-        for (const allocated of [
-          registry.workflowRuntimeDir(privateRootId),
-          registry.chatTransactionsFamilyDir(privateRootId),
-          registry.chatTransactionDir(privateRootId, correlation.operationId),
-        ]) {
-          const failure = await ensureDirectory(fileStore.createDirectory(allocated.locator));
-          if (failure) {
-            return failure;
-          }
+        if (deleted.kind === "failed") {
+          return storageFailure(deleted);
         }
-        const created = await fileStore.createFileExclusive(
-          registry.chatTransactionFile(privateRootId, correlation.operationId).locator,
-          encodeChatInteractionTransactionV1(selfCheck.transaction)
+        // Best-effort: an admitted-but-never-progressed record never had a
+        // resume-invocation claim marker, so only the directory remains.
+        await fileStore.deleteEmptyDirectory(
+          registry.chatTransactionDir(privateRootId, operationId).locator
         );
-        if (created.kind === "unavailable") {
-          return created;
-        }
-        if (created.kind === "failed") {
-          if (created.code === "targetExists") {
-            return rejected(
-              "a transaction already exists for this operation (exactly one per question-returning operation)"
-            );
-          }
-          return storageFailure(created);
-        }
-        return { kind: "ok", transaction: selfCheck.transaction };
+        return { kind: "ok", transaction: loaded.transaction };
       });
     },
 
@@ -703,6 +897,12 @@ export function createChatInteractionTransactionStoreV1(options: {
         }
         if (transaction.state !== "questionsPosted" && transaction.state !== "answersDraft") {
           return rejected(`answers cannot be submitted in state ${transaction.state}`);
+        }
+        if (transaction.questions === undefined) {
+          // Unreachable: both states above are only entered via a
+          // questionsPosted transition receipt, which the decoder requires
+          // to carry "questions" — defensive, not a real runtime path.
+          return rejected("transaction has no posted question set to answer");
         }
         const validation = validateStructuredAnswersV1(transaction.questions, answers);
         if (!validation.ok) {
@@ -968,7 +1168,14 @@ export function createChatInteractionTransactionStoreV1(options: {
           continue;
         }
         const { transaction } = loaded.result;
-        if (transaction.chatDocumentId === chatDocumentId && transaction.state !== "settled") {
+        // "invocationPending" is never a real, renderable interaction (no
+        // questions exist yet — module header, "PRE-INVOCATION ADMISSION")
+        // and must not surface here as an orphaned unresolved question.
+        if (
+          transaction.chatDocumentId === chatDocumentId &&
+          transaction.state !== "settled" &&
+          transaction.state !== "invocationPending"
+        ) {
           matches.push(transaction);
         }
       }

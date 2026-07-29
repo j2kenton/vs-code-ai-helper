@@ -38,32 +38,6 @@
       "migrationCohort": "edit"
     },
     {
-      "path": "src/commands/chatWithStage.ts",
-      "signals": [
-        "workspace.fs"
-      ],
-      "callSites": [
-        {
-          "signal": "workspace.fs",
-          "span": "L470-L470",
-          "enclosingSymbol": "chatWithStage"
-        },
-        {
-          "signal": "workspace.fs",
-          "span": "L480-L480",
-          "enclosingSymbol": "rawResponse"
-        }
-      ],
-      "sinkCategories": [
-        "artifactReadWrite",
-        "providerPromptAttachment"
-      ],
-      "pathSource": "Task-folder artifact paths (stage artifacts read into the chat prompt) from the resolved task context.",
-      "expectedHandling": "Artifact content may enter prompts; Chat-private data must never flow the other way into artifacts. The chat cohort replaces transcript storage with <task-folder>/chat-v1.json via the path registry.",
-      "classifierCall": "pending:privacy — isWorkflowPrivatePathV1 before any prompt attachment (plan §2.2)",
-      "migrationCohort": "chat"
-    },
-    {
       "path": "src/commands/choosePublishScope.ts",
       "signals": [
         "import:fs"
@@ -91,47 +65,37 @@
       "callSites": [
         {
           "signal": "workspace.fs",
-          "span": "L251-L251",
-          "enclosingSymbol": "buildCommitMessage"
-        },
-        {
-          "signal": "workspace.fs",
-          "span": "L265-L265",
-          "enclosingSymbol": "raw"
-        },
-        {
-          "signal": "workspace.fs",
-          "span": "L628-L628",
+          "span": "L905-L905",
           "enclosingSymbol": "taskBytes"
         },
         {
           "signal": "workspace.fs",
-          "span": "L707-L707",
+          "span": "L984-L984",
           "enclosingSymbol": "taskBytes"
         },
         {
           "signal": "workspace.fs",
-          "span": "L728-L728",
+          "span": "L1005-L1005",
           "enclosingSymbol": "implBytes"
         },
         {
           "signal": "workspace.fs",
-          "span": "L749-L749",
+          "span": "L1026-L1026",
           "enclosingSymbol": "implBytes"
         },
         {
           "signal": "workspace.fs",
-          "span": "L759-L759",
+          "span": "L1036-L1036",
           "enclosingSymbol": "lowLevelBytes"
         },
         {
           "signal": "workspace.fs",
-          "span": "L1409-L1409",
+          "span": "L1703-L1703",
           "enclosingSymbol": "commitAndPushTaskCore"
         },
         {
           "signal": "workspace.fs",
-          "span": "L1413-L1413",
+          "span": "L1707-L1707",
           "enclosingSymbol": "commitAndPushTaskCore"
         }
       ],
@@ -157,12 +121,12 @@
         },
         {
           "signal": "workspace.fs",
-          "span": "L389-L389",
+          "span": "L392-L392",
           "enclosingSymbol": "bytes"
         },
         {
           "signal": "workspace.fs",
-          "span": "L402-L402",
+          "span": "L405-L405",
           "enclosingSymbol": "description"
         }
       ],
@@ -183,7 +147,7 @@
       "callSites": [
         {
           "signal": "workspace.fs",
-          "span": "L522-L522",
+          "span": "L525-L525",
           "enclosingSymbol": "content"
         }
       ],
@@ -257,73 +221,73 @@
       "callSites": [
         {
           "signal": "import:child_process",
-          "span": "L78-L78",
+          "span": "L77-L77",
           "enclosingSymbol": "(module)"
         },
         {
           "signal": "import:fs",
-          "span": "L79-L79",
+          "span": "L78-L78",
           "enclosingSymbol": "(module)"
         },
         {
           "signal": "workspace.fs",
-          "span": "L1034-L1034",
+          "span": "L670-L670",
+          "enclosingSymbol": "entries"
+        },
+        {
+          "signal": "workspace.fs",
+          "span": "L683-L683",
+          "enclosingSymbol": "legacyEntries"
+        },
+        {
+          "signal": "workspace.fs",
+          "span": "L1135-L1135",
           "enclosingSymbol": "newContent"
         },
         {
           "signal": "workspace.fs",
-          "span": "L1243-L1243",
+          "span": "L1344-L1344",
           "enclosingSymbol": "runAiToFile"
         },
         {
           "signal": "workspace.fs",
-          "span": "L1326-L1326",
+          "span": "L1427-L1427",
           "enclosingSymbol": "runAiToFile"
         },
         {
           "signal": "workspace.fs",
-          "span": "L1575-L1575",
+          "span": "L1676-L1676",
           "enclosingSymbol": "runSecondOpinionReview"
         },
         {
           "signal": "workspace.fs",
-          "span": "L1602-L1602",
+          "span": "L1703-L1703",
           "enclosingSymbol": "runSecondOpinionReview"
         },
         {
           "signal": "workspace.fs",
-          "span": "L1960-L1960",
-          "enclosingSymbol": "runReviewForFolder"
-        },
-        {
-          "signal": "workspace.fs",
-          "span": "L1977-L1977",
-          "enclosingSymbol": "runReviewForFolder"
-        },
-        {
-          "signal": "workspace.fs",
-          "span": "L2023-L2023",
-          "enclosingSymbol": "runReviewForFolder"
-        },
-        {
-          "signal": "workspace.fs",
-          "span": "L2036-L2036",
-          "enclosingSymbol": "runReviewForFolder"
-        },
-        {
-          "signal": "workspace.fs",
-          "span": "L2044-L2044",
-          "enclosingSymbol": "runReviewForFolder"
-        },
-        {
-          "signal": "workspace.fs",
-          "span": "L2068-L2068",
+          "span": "L2016-L2016",
           "enclosingSymbol": "contentBytes"
         },
         {
           "signal": "workspace.fs",
-          "span": "L2736-L2736",
+          "span": "L2470-L2470",
+          "enclosingSymbol": "runReviewForFolder"
+        },
+        {
+          "signal": "workspace.fs",
+          "span": "L2487-L2487",
+          "enclosingSymbol": "runReviewForFolder"
+        },
+        {
+          "signal": "workspace.fs",
+          "span": "L2918-L2918",
           "enclosingSymbol": "runApply"
+        },
+        {
+          "signal": "workspace.fs",
+          "span": "L5394-L5394",
+          "enclosingSymbol": "buildReviewResumeVariablesV1"
         }
       ],
       "sinkCategories": [
@@ -460,7 +424,7 @@
       "callSites": [
         {
           "signal": "workspace.fs",
-          "span": "L186-L186",
+          "span": "L194-L194",
           "enclosingSymbol": "activate"
         }
       ],
@@ -531,6 +495,26 @@
       "expectedHandling": "The edit-capable runner. The edit cohort replaces direct tool file access with the request-local read tools + sealed-manifest broker (plan §7); until then the route gate and boundary backstop keep it unreachable.",
       "classifierCall": "pending:privacy — classifyWorkflowPathV1 inside every tool read/write handler (plan §2.2/§7.2)",
       "migrationCohort": "edit"
+    },
+    {
+      "path": "src/services/taskProgressReaderV1.ts",
+      "signals": [
+        "workspace.fs"
+      ],
+      "callSites": [
+        {
+          "signal": "workspace.fs",
+          "span": "L37-L37",
+          "enclosingSymbol": "content"
+        }
+      ],
+      "sinkCategories": [
+        "artifactReadWrite"
+      ],
+      "pathSource": "Task progress file (task-progress.json) under a registered task-folder root.",
+      "expectedHandling": "Strict V1 progress reader: reads task-progress.json without silent coercion, returning missing vs unsupported/invalid recovery states for strict consumers.",
+      "classifierCall": "pending:privacy — call site to be assigned with the classifier (plan §2.2)",
+      "migrationCohort": "text3"
     },
     {
       "path": "src/services/workflowFileStoreV1.ts",
@@ -1021,17 +1005,17 @@
       "callSites": [
         {
           "signal": "workspace.fs",
-          "span": "L101-L101",
+          "span": "L110-L110",
           "enclosingSymbol": "content"
         },
         {
           "signal": "workspace.fs",
-          "span": "L103-L103",
+          "span": "L112-L112",
           "enclosingSymbol": "materializeCanonicalIfNeeded"
         },
         {
           "signal": "workspace.fs",
-          "span": "L160-L160",
+          "span": "L169-L169",
           "enclosingSymbol": "preparePlanPromotion"
         }
       ],
@@ -1257,7 +1241,7 @@
       "callSites": [
         {
           "signal": "workspace.fs",
-          "span": "L401-L401",
+          "span": "L426-L426",
           "enclosingSymbol": "loadPersistedTarget"
         }
       ],

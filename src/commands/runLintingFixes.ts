@@ -334,7 +334,7 @@ export async function runLintingFixes(
                   await vscode.window.withProgress({ location: vscode.ProgressLocation.Window, title: "Applying AI final fixes...", cancellable: true }, async (aiProgress, token) => {
                     // `model` is resolved from the "publish" stage above —
                     // fallback bookkeeping must use that same stage.
-                    result = await runImplementationForModel({ modelId: model.modelId, prompt, workspaceUri: workspaceFolder.uri, token, stage: "publish", taskFolderUri: taskFolderUri, onProgress: (message) => aiProgress.report({ message }), isImplementationV1Bootstrap: false });
+                    result = await runImplementationForModel({ modelId: model.modelId, prompt, workspaceUri: workspaceFolder.uri, token, stage: "publish", taskFolderUri: taskFolderUri, onProgress: (message) => aiProgress.report({ message }) });
                   });
                   if (result?.status === "completed") {
                     await runCompletionLint(taskFolderUri, relevantFiles);

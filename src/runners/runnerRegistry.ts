@@ -624,33 +624,8 @@ export async function runImplementationForModel(options: {
   requireFileChange?: boolean;
   onBusyDetail?: (detail: string | undefined) => void;
   onWaitingForUser?: (waiting: boolean) => void;
-  /**
-   * REQUIRED, not defaulted: every caller must explicitly declare whether
-   * this call is "implementation.v1"'s own bootstrap invocation (Run
-   * Implementation, via executeImplementationRun in reviewActions.ts — the
-   * ONLY caller that may pass `true`) or a different action reusing this
-   * shared primitive (e.g. runLintingFixes.ts's AI-fallback for `lint.v1`,
-   * which must pass `false`).
-   *
-   * When `true`, this function skips assertNoUnauthorizedV1CorrelationV0
-   * for this call: "implementation.v1" is this migration's own bootstrapping
-   * tool — every step of the plan, including the step 16 replacement for
-   * this exact action, is implemented BY running it, so rejecting its
-   * uncorrelated invocation here deadlocks the task (see the NOTE on
-   * runImplementationWithAI in reviewActions.ts). This is a single-purpose,
-   * explicit marker rather than an inference from `stage` or any other
-   * reusable field — a prior version keyed the exemption off `stage ===
-   * "impl"` and it silently also exempted generateImplementationWithAI's
-   * unrelated uncorrelated call, which happens to share that same stage
-   * value. Remove this parameter (and always enforce the assertion) only
-   * once implementation.v1 has a real V1 coordinator replacement (plan.md
-   * step 16) to migrate onto.
-   */
-  isImplementationV1Bootstrap: boolean;
 }): Promise<ImplementationRunResult & { runnerId: string }> {
-  if (!options.isImplementationV1Bootstrap) {
-    assertNoUnauthorizedV1CorrelationV0(options);
-  }
+  assertNoUnauthorizedV1CorrelationV0(options);
   const effective = resolveEffectiveProvider(options.modelId);
 
   const run = async (selected: EffectiveProvider): Promise<ImplementationRunResult & { runnerId: string }> => {

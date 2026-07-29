@@ -110,9 +110,22 @@ import {
   runReviewWithAI,
 } from "../commands/reviewActions";
 import { TaskInventory } from "../state/taskInventory";
+import { applyHighLevelReviewChanges } from "../commands/applyHighLevelReviewChanges";
+import { applyLowLevelReviewChanges } from "../commands/applyLowLevelReviewChanges";
+import {
+  LEGACY_AI_ROUTE_DISABLED_V0,
+  LegacyAiActionSafetyGateErrorV0,
+} from "../services/legacyAiActionSafetyGateV0";
 import { getCanonicalImplementationUri } from "../utils/implementationArtifactResolver";
 import { initNotificationRouter } from "../utils/notificationRouter";
 import { installOperationNotificationBridge } from "../utils/operationNotificationBridge";
+import { createChatInteractionTransactionStoreV1 } from "../services/chatInteractionTransactionStoreV1";
+import {
+  configureWorkflowPrivateStorageRootV1,
+  getWorkflowFileStoreV1,
+  getWorkflowPathRegistryV1,
+  setChatInteractionTransactionStoreV1,
+} from "../services/workflowRuntimeServicesV1";
 
 // Initialize notification router to forward to vscode stubs so tests can intercept them
 initNotificationRouter({
@@ -419,6 +432,32 @@ const REAL_TASK_ROOT = nodeFs.mkdtempSync(
 after(() => {
   nodeFs.rmSync(REAL_TASK_ROOT, { recursive: true, force: true });
 });
+
+// runReviewForFolder runs through the real production coordinator
+// (createProductionTaskActionCoordinatorV1), which requires the Chat
+// interaction transaction store to be wired exactly as extension.ts does at
+// activation — otherwise getProductionActionConversationOrchestratorV1
+// throws "not wired yet" before this file's actual argument-normalization
+// behavior ever runs.
+const PRIVATE_STORAGE_ROOT = nodeFs.mkdtempSync(
+  nodePath.join(nodeOs.tmpdir(), "ensemble-cmdargs-test-private-")
+);
+// configureWorkflowPrivateStorageRootV1 MUST run (and its `rebuildFileStore()`
+// side effect complete) before getWorkflowFileStoreV1() is called below —
+// object-literal property evaluation runs top-to-bottom, so folding the
+// configure call into the `privateRootId` property here would capture the
+// PRE-registration (root-less) fileStore instance and every `begin()` write
+// through it would fail closed with `workspaceRootUnsupported`, exactly as
+// extension.ts's own activation wiring avoids by registering the root in its
+// own statement first (src/extension.ts, `workflowPrivateStorageRootId`).
+const PRIVATE_STORAGE_ROOT_ID = configureWorkflowPrivateStorageRootV1(PRIVATE_STORAGE_ROOT);
+setChatInteractionTransactionStoreV1(
+  createChatInteractionTransactionStoreV1({
+    registry: getWorkflowPathRegistryV1(),
+    fileStore: getWorkflowFileStoreV1(),
+    privateRootId: PRIVATE_STORAGE_ROOT_ID,
+  })
+);
 
 function makeTaskFolderUri(name: string): vscode.Uri {
   const dir = nodePath.join(REAL_TASK_ROOT, ".ensemble", name);
@@ -1727,6 +1766,12 @@ void describe("runReviewForFolder impl-review variable sourcing (production code
         createdAt: "2026-07-08T00:00:00.000Z",
         updatedAt: "2026-07-08T00:00:00.000Z",
         implReviewFiles: [],
+        ownership: {
+          metaRoot: nodePath.dirname(folderUri.fsPath),
+          projectRoot: nodePath.dirname(folderUri.fsPath),
+          boundAt: "2026-07-08T00:00:00.000Z",
+          state: "resolved",
+        },
       });
 
       // Call the PRODUCTION function directly with an impl-review stage.
@@ -1797,6 +1842,12 @@ void describe("runReviewForFolder impl-review variable sourcing (production code
         createdAt: "2026-07-08T00:00:00.000Z",
         updatedAt: "2026-07-08T00:00:00.000Z",
         implReviewFiles: [],
+        ownership: {
+          metaRoot: nodePath.dirname(folderUri.fsPath),
+          projectRoot: nodePath.dirname(folderUri.fsPath),
+          boundAt: "2026-07-08T00:00:00.000Z",
+          state: "resolved",
+        },
       });
 
       await runReviewForFolder(
@@ -1876,6 +1927,12 @@ void describe("runReviewForFolder impl-review variable sourcing (production code
         createdAt: "2026-07-08T00:00:00.000Z",
         updatedAt: "2026-07-08T00:00:00.000Z",
         implReviewFiles: [],
+        ownership: {
+          metaRoot: nodePath.dirname(folderUri.fsPath),
+          projectRoot: nodePath.dirname(folderUri.fsPath),
+          boundAt: "2026-07-08T00:00:00.000Z",
+          state: "resolved",
+        },
       });
 
       await runReviewForFolder(
@@ -2315,10 +2372,16 @@ void describe("runReviewForFolder legacy-task fallback (suite 14)", () => {
 
   void it("legacy task with only implementation.md proceeds to runner stage (no plan-final.md warning)", async () => {
     // Seed plan.md and implementation.md but NOT plan-final.md.
-    // materializeCanonicalIfNeeded must copy implementation.md → plan-final.md
-    // so the review can proceed. The runner-unavailable warning fires last,
-    // confirming both variable gates (plan.md and plan-final.md, which is now
-    // materialized from implementation.md) were passed.
+    // runReviewForFolder reads implementation.md through a read-only
+    // canonical-then-legacy fallback (getCanonicalImplementationUri, then
+    // getLegacyImplementationUri) so the review can proceed — it must NOT
+    // write plan-final.md as a side effect of preparing the review prompt
+    // (a review that is later cancelled, fails, or returns questions must
+    // leave the implementation artifact byte-identical; only the writing
+    // materializeCanonicalIfNeeded, used by the still-gated edit-capable
+    // applyImplementationReviewWithAI path, may do that). The
+    // runner-unavailable warning fires last, confirming both variable gates
+    // (plan.md and the legacy implementation.md fallback) were passed.
     const store = new Map<string, string>();
     const fs = installMemStore(store);
     const msgs = installMessageCapture();
@@ -2347,6 +2410,12 @@ void describe("runReviewForFolder legacy-task fallback (suite 14)", () => {
         createdAt: "2026-07-08T00:00:00.000Z",
         updatedAt: "2026-07-08T00:00:00.000Z",
         implReviewFiles: [],
+        ownership: {
+          metaRoot: nodePath.dirname(folderUri.fsPath),
+          projectRoot: nodePath.dirname(folderUri.fsPath),
+          boundAt: "2026-07-08T00:00:00.000Z",
+          state: "resolved",
+        },
       });
 
       await runReviewForFolder(
@@ -2382,12 +2451,14 @@ void describe("runReviewForFolder legacy-task fallback (suite 14)", () => {
 
       // Reaching here without throw confirms the review reached AI execution.
 
-      // plan-final.md must have been materialized in the store
+      // plan-final.md must NOT have been materialized as a side effect of
+      // preparing the review prompt — read-only fallback, not a write.
       const canonicalUri = vscode.Uri.joinPath(folderUri, "plan-final.md");
       const materialized = store.get(canonicalUri.toString());
-      assert.ok(
-        materialized !== undefined && materialized.includes("Legacy Implementation"),
-        "plan-final.md must be materialized from implementation.md content"
+      assert.equal(
+        materialized,
+        undefined,
+        "plan-final.md must NOT be materialized by review preparation — it only reads implementation.md via the read-only fallback"
       );
     } finally {
       msgs.restore();
@@ -2427,6 +2498,12 @@ void describe("runReviewForFolder legacy-task fallback (suite 14)", () => {
         createdAt: "2026-07-08T00:00:00.000Z",
         updatedAt: "2026-07-08T00:00:00.000Z",
         implReviewFiles: [],
+        ownership: {
+          metaRoot: nodePath.dirname(folderUri.fsPath),
+          projectRoot: nodePath.dirname(folderUri.fsPath),
+          boundAt: "2026-07-08T00:00:00.000Z",
+          state: "resolved",
+        },
       });
 
       await runReviewForFolder(
@@ -2839,4 +2916,410 @@ void describe("generateImplementationWithAI eligibility (suite 16)", () => {
       "plan-low-review must not pass the production eligibleStages filter for Generate Implementation"
     );
   });
+});
+
+// ---------------------------------------------------------------------------
+// applyHighLevelReviewChanges / applyLowLevelReviewChanges delegation to
+// applyReviewWithAI (production code, plan §1.3): these keyboard-shortcut
+// commands already read real progress via resolveTaskContext before
+// delegating. They must forward { task: IncompleteTask } carrying that
+// already-known progress — not { taskFolderPath } — so applyReviewWithAI's
+// early gate check can trust arg.task.progress.currentStage and fire the
+// applyReviewEdit.v1 gate BEFORE it performs any read of its own for an
+// impl-review-stage (edit-branch) target. A { taskFolderPath } delegation is
+// deliberately re-wrapped with an untrustworthy placeholder stage by
+// normalizeReviewArg and would fall through to a fresh, post-gate read.
+// ---------------------------------------------------------------------------
+
+void describe("applyHighLevelReviewChanges / applyLowLevelReviewChanges delegation (production code)", () => {
+  function installExecuteCommandStub(): {
+    captured: Array<{ command: string; arg: unknown }>;
+    restore: () => void;
+  } {
+    const captured: Array<{ command: string; arg: unknown }> = [];
+    if (!(vscode as unknown as Record<string, unknown>).commands) {
+      (vscode as unknown as Record<string, unknown>).commands = {};
+    }
+    const orig = (vscode.commands as unknown as Record<string, unknown>).executeCommand;
+    (vscode.commands as unknown as Record<string, unknown>).executeCommand = async (
+      command: string,
+      arg?: unknown
+    ): Promise<undefined> => {
+      captured.push({ command, arg });
+      return Promise.resolve(undefined);
+    };
+    return {
+      captured,
+      restore: (): void => {
+        (vscode.commands as unknown as Record<string, unknown>).executeCommand = orig;
+      },
+    };
+  }
+
+  void it("applyHighLevelReviewChanges delegates with { task } (real progress) for an impl-high-review target", async () => {
+    const FOLDER_PATH = nodePath.join(REAL_TASK_ROOT, ".ensemble", "apply-high-review-edit-delegation");
+    nodeFs.mkdirSync(FOLDER_PATH, { recursive: true });
+    const folderUri = vscode.Uri.file(FOLDER_PATH);
+
+    const store = new Map<string, string>();
+    const memFs = installMemStore(store);
+    const msgs = installMessageCapture();
+    const wsFolders = installWorkspaceFoldersStub();
+    const execCmd = installExecuteCommandStub();
+
+    try {
+      const progress: TaskProgress = {
+        taskFolder: "apply-high-review-edit-delegation",
+        currentStage: "impl-high-review",
+        status: "active",
+        createdAt: "2026-07-08T00:00:00.000Z",
+        updatedAt: "2026-07-08T00:00:00.000Z",
+      };
+      await seedProgress(store, folderUri, progress);
+
+      const inv = makeInventoryStubWithStage(
+        FOLDER_PATH,
+        FOLDER_PATH,
+        "impl-high-review",
+        "active"
+      );
+
+      await applyHighLevelReviewChanges(inv, { taskFolderPath: FOLDER_PATH });
+
+      // Route separation (AC-ROUTE-01): an impl-high-review (edit-capable)
+      // target dispatches to the dedicated edit-root command, not the
+      // shared text-root applyReviewWithAI.
+      const dispatch = execCmd.captured.find(
+        (e) => e.command === "vs-code-ai-helper.applyReviewEditWithAI"
+      );
+      assert.ok(dispatch, "applyHighLevelReviewChanges must delegate to applyReviewEditWithAI for an edit-capable target");
+      assert.equal(
+        execCmd.captured.some((e) => e.command === "vs-code-ai-helper.applyReviewWithAI"),
+        false,
+        "must not also dispatch to the shared text-root applyReviewWithAI"
+      );
+      const arg = dispatch.arg as Record<string, unknown>;
+      assert.ok(
+        "task" in arg && arg.task !== undefined,
+        "delegation must carry { task }, not a bare { taskFolderPath }, so the caller's already-known " +
+          "stage can gate the edit branch before any further read"
+      );
+      assert.strictEqual("taskFolderPath" in arg, false, "delegation must not carry taskFolderPath");
+      const taskArg = arg.task as { progress: TaskProgress };
+      assert.strictEqual(
+        taskArg.progress.currentStage,
+        "impl-high-review",
+        "the forwarded task node must carry the real, already-resolved stage"
+      );
+    } finally {
+      msgs.restore();
+      memFs.restore();
+      wsFolders.restore();
+      execCmd.restore();
+    }
+  });
+
+  void it("applyLowLevelReviewChanges delegates with { task } (real progress) for an impl-low-review target", async () => {
+    const FOLDER_PATH = nodePath.join(REAL_TASK_ROOT, ".ensemble", "apply-low-review-edit-delegation");
+    nodeFs.mkdirSync(FOLDER_PATH, { recursive: true });
+    const folderUri = vscode.Uri.file(FOLDER_PATH);
+
+    const store = new Map<string, string>();
+    const memFs = installMemStore(store);
+    const msgs = installMessageCapture();
+    const wsFolders = installWorkspaceFoldersStub();
+    const execCmd = installExecuteCommandStub();
+
+    try {
+      const progress: TaskProgress = {
+        taskFolder: "apply-low-review-edit-delegation",
+        currentStage: "impl-low-review",
+        status: "active",
+        createdAt: "2026-07-08T00:00:00.000Z",
+        updatedAt: "2026-07-08T00:00:00.000Z",
+      };
+      await seedProgress(store, folderUri, progress);
+
+      const inv = makeInventoryStubWithStage(
+        FOLDER_PATH,
+        FOLDER_PATH,
+        "impl-low-review",
+        "active"
+      );
+
+      await applyLowLevelReviewChanges(inv, { taskFolderPath: FOLDER_PATH });
+
+      // Route separation (AC-ROUTE-01): an impl-low-review (edit-capable)
+      // target dispatches to the dedicated edit-root command, not the
+      // shared text-root applyReviewWithAI.
+      const dispatch = execCmd.captured.find(
+        (e) => e.command === "vs-code-ai-helper.applyReviewEditWithAI"
+      );
+      assert.ok(dispatch, "applyLowLevelReviewChanges must delegate to applyReviewEditWithAI for an edit-capable target");
+      assert.equal(
+        execCmd.captured.some((e) => e.command === "vs-code-ai-helper.applyReviewWithAI"),
+        false,
+        "must not also dispatch to the shared text-root applyReviewWithAI"
+      );
+      const arg = dispatch.arg as Record<string, unknown>;
+      assert.ok(
+        "task" in arg && arg.task !== undefined,
+        "delegation must carry { task }, not a bare { taskFolderPath }, so the caller's already-known " +
+          "stage can gate the edit branch before any further read"
+      );
+      assert.strictEqual("taskFolderPath" in arg, false, "delegation must not carry taskFolderPath");
+      const taskArg = arg.task as { progress: TaskProgress };
+      assert.strictEqual(
+        taskArg.progress.currentStage,
+        "impl-low-review",
+        "the forwarded task node must carry the real, already-resolved stage"
+      );
+    } finally {
+      msgs.restore();
+      memFs.restore();
+      wsFolders.restore();
+      execCmd.restore();
+    }
+  });
+
+  void it(
+    "applyHighLevelReviewChanges gates applyReviewEdit.v1 itself for an impl-high-review target, " +
+      "before any dispatch to applyReviewWithAI, when the edit route is disabled",
+    async () => {
+      const FOLDER_PATH = nodePath.join(
+        REAL_TASK_ROOT,
+        ".ensemble",
+        "apply-high-review-edit-gate-in-wrapper"
+      );
+      nodeFs.mkdirSync(FOLDER_PATH, { recursive: true });
+      const folderUri = vscode.Uri.file(FOLDER_PATH);
+
+      const store = new Map<string, string>();
+      const memFs = installMemStore(store);
+      const msgs = installMessageCapture();
+      const wsFolders = installWorkspaceFoldersStub();
+      const execCmd = installExecuteCommandStub();
+
+      // The unit-test harness clears LEGACY_AI_ROUTE_DISABLED_V0 for the whole
+      // suite so the retained legacy handlers stay exercisable; re-add
+      // "applyReviewEdit.v1" here to prove this wrapper's own gate call is
+      // real and load-bearing (plan §1.3), not merely relying on the
+      // downstream applyReviewWithAI delegate to catch it later.
+      const mutableDisabled = LEGACY_AI_ROUTE_DISABLED_V0 as unknown as Set<string>;
+      assert.equal(mutableDisabled.has("applyReviewEdit.v1"), false);
+      mutableDisabled.add("applyReviewEdit.v1");
+
+      try {
+        const progress: TaskProgress = {
+          taskFolder: "apply-high-review-edit-gate-in-wrapper",
+          currentStage: "impl-high-review",
+          status: "active",
+          createdAt: "2026-07-08T00:00:00.000Z",
+          updatedAt: "2026-07-08T00:00:00.000Z",
+        };
+        await seedProgress(store, folderUri, progress);
+
+        const inv = makeInventoryStubWithStage(
+          FOLDER_PATH,
+          FOLDER_PATH,
+          "impl-high-review",
+          "active"
+        );
+
+        await assert.rejects(
+          () => applyHighLevelReviewChanges(inv, { taskFolderPath: FOLDER_PATH }),
+          LegacyAiActionSafetyGateErrorV0,
+          "the wrapper must itself throw on the disabled applyReviewEdit.v1 route for an impl-high-review target"
+        );
+
+        assert.equal(
+          execCmd.captured.length,
+          0,
+          "no dispatch to either applyReviewWithAI or applyReviewEditWithAI may occur once the wrapper's own edit gate has thrown"
+        );
+      } finally {
+        mutableDisabled.delete("applyReviewEdit.v1");
+        msgs.restore();
+        memFs.restore();
+        wsFolders.restore();
+        execCmd.restore();
+      }
+    }
+  );
+
+  void it(
+    "applyHighLevelReviewChanges still dispatches for a plan-high-review (text) target " +
+      "while applyReviewEdit.v1 stays disabled",
+    async () => {
+      const FOLDER_PATH = nodePath.join(
+        REAL_TASK_ROOT,
+        ".ensemble",
+        "apply-high-review-text-unaffected-by-edit-gate"
+      );
+      nodeFs.mkdirSync(FOLDER_PATH, { recursive: true });
+      const folderUri = vscode.Uri.file(FOLDER_PATH);
+
+      const store = new Map<string, string>();
+      const memFs = installMemStore(store);
+      const msgs = installMessageCapture();
+      const wsFolders = installWorkspaceFoldersStub();
+      const execCmd = installExecuteCommandStub();
+
+      const mutableDisabled = LEGACY_AI_ROUTE_DISABLED_V0 as unknown as Set<string>;
+      assert.equal(mutableDisabled.has("applyReviewEdit.v1"), false);
+      mutableDisabled.add("applyReviewEdit.v1");
+
+      try {
+        const progress: TaskProgress = {
+          taskFolder: "apply-high-review-text-unaffected-by-edit-gate",
+          currentStage: "plan-high-review",
+          status: "active",
+          createdAt: "2026-07-08T00:00:00.000Z",
+          updatedAt: "2026-07-08T00:00:00.000Z",
+        };
+        await seedProgress(store, folderUri, progress);
+
+        const inv = makeInventoryStubWithStage(
+          FOLDER_PATH,
+          FOLDER_PATH,
+          "plan-high-review",
+          "active"
+        );
+
+        await applyHighLevelReviewChanges(inv, { taskFolderPath: FOLDER_PATH });
+
+        const dispatch = execCmd.captured.find(
+          (e) => e.command === "vs-code-ai-helper.applyReviewWithAI"
+        );
+        assert.ok(
+          dispatch,
+          "a plan-high-review (text) target must still dispatch even while the unrelated edit route is disabled"
+        );
+      } finally {
+        mutableDisabled.delete("applyReviewEdit.v1");
+        msgs.restore();
+        memFs.restore();
+        wsFolders.restore();
+        execCmd.restore();
+      }
+    }
+  );
+
+  void it(
+    "applyLowLevelReviewChanges gates applyReviewEdit.v1 itself for an impl-low-review target, " +
+      "before any dispatch to applyReviewWithAI, when the edit route is disabled",
+    async () => {
+      const FOLDER_PATH = nodePath.join(
+        REAL_TASK_ROOT,
+        ".ensemble",
+        "apply-low-review-edit-gate-in-wrapper"
+      );
+      nodeFs.mkdirSync(FOLDER_PATH, { recursive: true });
+      const folderUri = vscode.Uri.file(FOLDER_PATH);
+
+      const store = new Map<string, string>();
+      const memFs = installMemStore(store);
+      const msgs = installMessageCapture();
+      const wsFolders = installWorkspaceFoldersStub();
+      const execCmd = installExecuteCommandStub();
+
+      const mutableDisabled = LEGACY_AI_ROUTE_DISABLED_V0 as unknown as Set<string>;
+      assert.equal(mutableDisabled.has("applyReviewEdit.v1"), false);
+      mutableDisabled.add("applyReviewEdit.v1");
+
+      try {
+        const progress: TaskProgress = {
+          taskFolder: "apply-low-review-edit-gate-in-wrapper",
+          currentStage: "impl-low-review",
+          status: "active",
+          createdAt: "2026-07-08T00:00:00.000Z",
+          updatedAt: "2026-07-08T00:00:00.000Z",
+        };
+        await seedProgress(store, folderUri, progress);
+
+        const inv = makeInventoryStubWithStage(
+          FOLDER_PATH,
+          FOLDER_PATH,
+          "impl-low-review",
+          "active"
+        );
+
+        await assert.rejects(
+          () => applyLowLevelReviewChanges(inv, { taskFolderPath: FOLDER_PATH }),
+          LegacyAiActionSafetyGateErrorV0,
+          "the wrapper must itself throw on the disabled applyReviewEdit.v1 route for an impl-low-review target"
+        );
+
+        assert.equal(
+          execCmd.captured.length,
+          0,
+          "no dispatch to either applyReviewWithAI or applyReviewEditWithAI may occur once the wrapper's own edit gate has thrown"
+        );
+      } finally {
+        mutableDisabled.delete("applyReviewEdit.v1");
+        msgs.restore();
+        memFs.restore();
+        wsFolders.restore();
+        execCmd.restore();
+      }
+    }
+  );
+
+  void it(
+    "applyLowLevelReviewChanges still dispatches for a plan-low-review (text) target " +
+      "while applyReviewEdit.v1 stays disabled",
+    async () => {
+      const FOLDER_PATH = nodePath.join(
+        REAL_TASK_ROOT,
+        ".ensemble",
+        "apply-low-review-text-unaffected-by-edit-gate"
+      );
+      nodeFs.mkdirSync(FOLDER_PATH, { recursive: true });
+      const folderUri = vscode.Uri.file(FOLDER_PATH);
+
+      const store = new Map<string, string>();
+      const memFs = installMemStore(store);
+      const msgs = installMessageCapture();
+      const wsFolders = installWorkspaceFoldersStub();
+      const execCmd = installExecuteCommandStub();
+
+      const mutableDisabled = LEGACY_AI_ROUTE_DISABLED_V0 as unknown as Set<string>;
+      assert.equal(mutableDisabled.has("applyReviewEdit.v1"), false);
+      mutableDisabled.add("applyReviewEdit.v1");
+
+      try {
+        const progress: TaskProgress = {
+          taskFolder: "apply-low-review-text-unaffected-by-edit-gate",
+          currentStage: "plan-low-review",
+          status: "active",
+          createdAt: "2026-07-08T00:00:00.000Z",
+          updatedAt: "2026-07-08T00:00:00.000Z",
+        };
+        await seedProgress(store, folderUri, progress);
+
+        const inv = makeInventoryStubWithStage(
+          FOLDER_PATH,
+          FOLDER_PATH,
+          "plan-low-review",
+          "active"
+        );
+
+        await applyLowLevelReviewChanges(inv, { taskFolderPath: FOLDER_PATH });
+
+        const dispatch = execCmd.captured.find(
+          (e) => e.command === "vs-code-ai-helper.applyReviewWithAI"
+        );
+        assert.ok(
+          dispatch,
+          "a plan-low-review (text) target must still dispatch even while the unrelated edit route is disabled"
+        );
+      } finally {
+        mutableDisabled.delete("applyReviewEdit.v1");
+        msgs.restore();
+        memFs.restore();
+        wsFolders.restore();
+        execCmd.restore();
+      }
+    }
+  );
 });

@@ -362,6 +362,12 @@ export interface CliExecResult {
   authFailure?: boolean;
   /** errorMessage minus the appended login hint: the form safe to classify. */
   authDiagnosticText?: string;
+  /**
+   * True when this provider can recover the failed turn by continuing the
+   * conversation it just persisted. This is distinct from replay eligibility:
+   * continuation intentionally keeps prior context and partial workspace edits.
+   */
+  resumeConversation?: boolean;
 }
 
 /**
@@ -387,18 +393,12 @@ export const CLI_RETRY_MAX_ATTEMPTS = 3; // 1 initial + 2 retries
 export const CLI_RETRY_DELAY_MS = 5_000;
 
 /**
- * The read-only (text-mode) retry rule (exported for direct unit testing):
- * retry only a failure classified transient — a run timeout or a mid-stream
- * transport drop; auth errors, non-zero tool exits, and content errors are
- * never marked transient — while attempts remain and the run has not been
- * cancelled. Ordinary read-only runs are side-effect free by provider
- * permission configuration, so unlike edit runs no further evidence is
- * required here: `result.transient` alone is trusted. That trust is only
- * correct because the two places that set it (the timeout handler and
- * applyTransportTransience, both in execCliAgent above) already refuse to
- * mark it true for a provider whose text mode is NOT actually enforced
- * read-only — see isTextModeGuaranteedReadOnly. This function stays a
- * simple, provider-agnostic check on that account.
+ * The text-mode retry rule (exported for direct unit testing): retry only a
+ * failure classified transient while attempts remain and the run has not been
+ * cancelled. Ordinary providers replay only when their text mode is enforced
+ * read-only. A provider with `resumeConversation` set takes the separate
+ * same-conversation path instead, which intentionally preserves its prior
+ * context and any partial edits rather than replaying the original prompt.
  */
 export function shouldRetryReadOnlyRun(
   result: Pick<CliExecResult, "status" | "transient">,
@@ -469,6 +469,22 @@ function applyTransportTransience(
   // classifications from classifyFailure are left exactly as they are.
   if (result.failureKind !== "generic") {
     return result;
+  }
+  const normalizedDiagnostic = friendly.diagnosticText.toLowerCase();
+  const canResumeConversation =
+    def.conversationResume?.errorMarkers.some((marker) =>
+      normalizedDiagnostic.includes(marker.toLowerCase())
+    ) === true;
+  if (canResumeConversation) {
+    // Keep failureKind generic. A temporarily-unavailable classification is
+    // eligible for the backup cascade, but a resumable run may already have
+    // edited the working tree. Only the same-provider retry loop may consume
+    // this signal, and it does so with --continue rather than prompt replay.
+    return {
+      ...result,
+      transient: true,
+      resumeConversation: true,
+    };
   }
   // Edit-mode runs may have already written partial changes. The same-model
   // retry path (evaluateEditRetryEligibility) refuses to retry without a
@@ -1657,8 +1673,19 @@ export async function execCliAgent(options: {
   cwd: string;
   token: vscode.CancellationToken;
   onProgress?: (message: string) => void;
+  /** Continue the provider conversation persisted by the previous attempt. */
+  resumePreviousConversation?: boolean;
 }): Promise<CliExecResult> {
-  const { def, mode, model, prompt, cwd, token, onProgress } = options;
+  const {
+    def,
+    mode,
+    model,
+    prompt,
+    cwd,
+    token,
+    onProgress,
+    resumePreviousConversation,
+  } = options;
 
   let lastMessageFile: string | undefined;
   if (def.usesLastMessageFile) {
@@ -1725,6 +1752,7 @@ export async function execCliAgent(options: {
     args = def.buildArgs(mode, model, lastMessageFile, {
       cwd,
       promptFile,
+      resumePreviousConversation,
     });
   } catch (error) {
     cleanupPromptFile();
@@ -1868,7 +1896,9 @@ export async function execCliAgent(options: {
       // this promotion as proof the run could not have mutated the
       // workspace, which is false for Antigravity/Cline — see
       // isTextModeGuaranteedReadOnly.
-      const promoteForRetry = mode === "edit" || isTextModeGuaranteedReadOnly(def);
+      const resumeConversation = def.conversationResume !== undefined;
+      const promoteForRetry =
+        mode === "edit" || isTextModeGuaranteedReadOnly(def) || resumeConversation;
       finish({
         ...classifyCliFailure({
           status: "failed",
@@ -1891,12 +1921,17 @@ export async function execCliAgent(options: {
         // classifyCliFailure already produced above.
         ...(promoteForRetry
           ? {
-              failureKind: "temporarily-unavailable" as const,
+              // A same-conversation continuation keeps this generic so the
+              // backup cascade cannot consume a partially edited tree.
+              failureKind: resumeConversation
+                ? "generic" as const
+                : "temporarily-unavailable" as const,
               // A timeout is the one failure shape that is transport-transient
               // and therefore retry-eligible (read-only runs always, subject
               // to promoteForRetry above; edit runs only under the
               // per-provider flush guarantee — see runImplementationWithCli).
               transient: true,
+              ...(resumeConversation ? { resumeConversation: true } : {}),
             }
           : {}),
         // What the event stream showed up to the kill — the primary
@@ -2048,35 +2083,39 @@ export class CliAgentRunner implements AgentRunner {
     request: AgentRunRequest,
     token: vscode.CancellationToken
   ): Promise<AgentRunResult> {
-    // Read-only (text) runs are side-effect free, so transient timeouts are
-    // retried freely: up to CLI_RETRY_MAX_ATTEMPTS with a short delay. Each
-    // attempt is audited to the task's run log (attempt, classification,
-    // evidence, delay), not just the debug console.
+    // Ordinary read-only text runs replay transient failures. Providers with
+    // a conversationResume contract instead continue the just-failed
+    // conversation, preserving its context and any partial workspace edits.
     const retryAudit: RetryAuditEntry[] = [];
     let result: CliExecResult | undefined;
+    let resumePreviousConversation = false;
     for (let attempt = 1; attempt <= CLI_RETRY_MAX_ATTEMPTS; attempt++) {
       result = await execCliAgent({
         def: this.def,
         mode: "text",
         model: request.modelId,
-        prompt: request.prompt,
+        prompt: resumePreviousConversation
+          ? this.def.conversationResume!.continuationPrompt
+          : request.prompt,
         cwd: request.workspaceUri.fsPath,
         token,
+        resumePreviousConversation,
       });
       if (!shouldRetryReadOnlyRun(result, attempt, token.isCancellationRequested)) {
         break;
       }
+      const willResumeConversation = result.resumeConversation === true;
       retryAudit.push({
         attempt,
-        // editEvidence is captured on the timeout path only, so its presence is
-        // what distinguishes a timeout from a mid-stream transport drop — both
-        // of which now classify transient for read-only runs.
-        classification: result.editEvidence
-          ? "transient (run timeout)"
-          : "transient (stream transport)",
+        classification: willResumeConversation
+          ? "transient (provider response timeout)"
+          : result.editEvidence
+            ? "transient (run timeout)"
+            : "transient (stream transport)",
         capabilityFlag: undefined,
-        evidence:
-          "read-only (text-mode) run — side-effect free by provider permission configuration",
+        evidence: willResumeConversation
+          ? "same-conversation continuation — preserves prior provider context and workspace state"
+          : "read-only (text-mode) run — side-effect free by provider permission configuration",
         delayMs: CLI_RETRY_DELAY_MS,
         retried: true,
       });
@@ -2087,6 +2126,7 @@ export class CliAgentRunner implements AgentRunner {
         );
         return { runnerId: this.id, status: "cancelled" };
       }
+      resumePreviousConversation = willResumeConversation;
     }
     await persistRetryAuditLog(
       request.taskFolderUri, this.id, request.stage, this.label, "text", retryAudit
@@ -2340,6 +2380,8 @@ export async function runImplementationWithCli(options: {
   /** When provided, retry attempts/refusals are audited to this task's run log. */
   taskFolderUri?: vscode.Uri;
   stage?: AgentWorkflowStage;
+  /** Test seam; production uses CLI_RETRY_DELAY_MS. */
+  retryDelayMs?: number;
 }): Promise<ImplementationRunResult> {
   const { def, model, prompt, workspaceUri, token, onProgress, requireFileChange } = options;
   const cwd = workspaceUri.fsPath;
@@ -2357,16 +2399,12 @@ export async function runImplementationWithCli(options: {
     onProgress,
   });
 
-  // Edit-capable runs may auto-retry a transient timeout ONLY on providers
-  // whose CLI protocol guarantees tool/edit boundary events are flushed
-  // before any side effect (per-provider capability flag, default off), and
-  // even then only with double evidence: the parsed event stream must be
-  // available and free of tool-use/file-edit events, AND the working-tree
-  // snapshot must be unchanged. On any other combination the timed-out run
-  // may already have made changes, so it is never auto-retried — the user
-  // must review and retry explicitly. Every decision (retry or refusal) is
-  // audited to the task's run log.
+  // Edit-capable runs normally replay only when a provider flush guarantee,
+  // clean event stream, and unchanged working tree prove that safe. A
+  // provider-specific conversationResume signal is different: it continues
+  // the persisted conversation and intentionally preserves prior edits.
   const retryAudit: RetryAuditEntry[] = [];
+  const retryDelayMs = options.retryDelayMs ?? CLI_RETRY_DELAY_MS;
   let attempt = 1;
   while (
     result.status === "failed" &&
@@ -2374,24 +2412,37 @@ export async function runImplementationWithCli(options: {
     attempt < CLI_RETRY_MAX_ATTEMPTS &&
     !token.isCancellationRequested
   ) {
+    const resumeConversation =
+      result.resumeConversation === true && def.conversationResume !== undefined;
     const capabilityFlag = def.guaranteesEditEventFlushBeforeSideEffects === true;
-    const snapshotNow = capabilityFlag && before ? await gitStatusSnapshot(cwd) : undefined;
+    const snapshotNow =
+      !resumeConversation && capabilityFlag && before
+        ? await gitStatusSnapshot(cwd)
+        : undefined;
     const snapshotClean =
       before !== undefined &&
       snapshotNow !== undefined &&
       changedPathsSince(before, snapshotNow).length === 0;
-    const decision = evaluateEditRetryEligibility({
-      providerLabel: def.label,
-      guaranteesEditEventFlushBeforeSideEffects: capabilityFlag,
-      evidence: result.editEvidence,
-      snapshotClean,
-    });
+    const decision: EditRetryDecision = resumeConversation
+      ? {
+          retry: true,
+          reason:
+            "same-conversation continuation — preserves prior provider context and workspace state",
+        }
+      : evaluateEditRetryEligibility({
+          providerLabel: def.label,
+          guaranteesEditEventFlushBeforeSideEffects: capabilityFlag,
+          evidence: result.editEvidence,
+          snapshotClean,
+        });
     retryAudit.push({
       attempt,
-      classification: "transient (run timeout)",
+      classification: resumeConversation
+        ? "transient (provider response timeout)"
+        : "transient (run timeout)",
       capabilityFlag,
       evidence: decision.reason,
-      delayMs: CLI_RETRY_DELAY_MS,
+      delayMs: retryDelayMs,
       retried: decision.retry,
     });
     if (!decision.retry) {
@@ -2405,10 +2456,11 @@ export async function runImplementationWithCli(options: {
       };
       break;
     }
-    onProgress(
-      `${def.label} timed out with no observed changes; retrying (attempt ${attempt + 1}/${CLI_RETRY_MAX_ATTEMPTS})...`
+    onProgress(resumeConversation
+      ? `${def.label} response timed out; resuming the same conversation (attempt ${attempt + 1}/${CLI_RETRY_MAX_ATTEMPTS})...`
+      : `${def.label} timed out with no observed changes; retrying (attempt ${attempt + 1}/${CLI_RETRY_MAX_ATTEMPTS})...`
     );
-    await retryDelay(token);
+    await retryDelay(token, retryDelayMs);
     if (token.isCancellationRequested) {
       break;
     }
@@ -2417,10 +2469,13 @@ export async function runImplementationWithCli(options: {
       def,
       mode: "edit",
       model,
-      prompt,
+      prompt: resumeConversation
+        ? def.conversationResume!.continuationPrompt
+        : prompt,
       cwd,
       token,
       onProgress,
+      resumePreviousConversation: resumeConversation,
     });
   }
   await persistRetryAuditLog(

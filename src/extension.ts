@@ -9,9 +9,15 @@ import {
 import { GENERATE_PLAN_ACTION_KEY_V1 } from "./actions/rows/generatePlanRowV1";
 import { DRAFT_ACTION_KEY_V1 } from "./actions/rows/draftRowV1";
 import { GENERATE_IMPLEMENTATION_ACTION_KEY_V1 } from "./actions/rows/generateImplementationRowV1";
+import { REVIEW_ACTION_KEY_V1 } from "./actions/rows/reviewRowV1";
+import { APPLY_REVIEW_ACTION_KEY_V1 } from "./actions/rows/applyReviewRowV1";
+import { CHAT_SEND_ACTION_KEY_V1 } from "./actions/rows/chatSendRowV1";
+import { COMMIT_PUSH_METADATA_ACTION_KEY_V1 } from "./actions/rows/commitPushMetadataRowV1";
 import {
   registerReviewActionCommands,
   resumeGenerateImplementationInteractionV1,
+  resumeReviewInteractionV1,
+  resumeApplyReviewInteractionV1,
 } from "./commands/reviewActions";
 import { registerSetTaskStageCommand } from "./commands/setTaskStage";
 import { registerViewArtifactCommands } from "./commands/viewArtifacts";
@@ -19,6 +25,8 @@ import {
   registerDraftTaskWithAICommand,
   resumeDraftInteractionV1,
 } from "./commands/draftTaskWithAI";
+import { resumeChatSendInteractionV1, validateChatSendV1 } from "./commands/chatWithStage";
+import { resumeCommitPushMetadataInteractionV1 } from "./commands/commitAndPushTask";
 import { registerApplyCurrentStageActionCommand } from "./commands/applyCurrentStageAction";
 import { registerOpenAndStartNewTaskCommand } from "./commands/openAndStartNewTask";
 import { registerReviewCurrentTaskCommand } from "./commands/reviewCurrentTask";
@@ -210,6 +218,17 @@ export function activate(context: vscode.ExtensionContext): void {
       return submitted.ok ? { ok: true } : { ok: false, reason: submitted.reason };
     },
     cancel: async (ref) => runChatConversationAction(() => chatConversationOrchestrator.cancel(ref)),
+    validateSend: async (target, _text) => {
+      if (target.kind === "global") {
+        return { ok: true };
+      }
+      const validated = await validateChatSendV1(
+        inventory,
+        { canonicalId: target.canonicalId, taskFolderPath: target.taskFolderPath },
+        target.stage
+      );
+      return validated.ok ? { ok: true } : { ok: false, reason: validated.reason };
+    },
     resume: async (ref, resumeIdempotencyId) => {
       const loaded = await chatConversationOrchestrator.loadInteraction(ref);
       if (loaded.kind !== "ok") {
@@ -246,6 +265,49 @@ export function activate(context: vscode.ExtensionContext): void {
             ref,
             resumeIdempotencyId,
             cancellation.token
+          );
+        }
+        if (actionKey === REVIEW_ACTION_KEY_V1) {
+          return await resumeReviewInteractionV1(
+            context.extensionUri,
+            inventory,
+            chatViewProvider,
+            ref,
+            resumeIdempotencyId,
+            cancellation.token
+          );
+        }
+        if (actionKey === APPLY_REVIEW_ACTION_KEY_V1) {
+          return await resumeApplyReviewInteractionV1(
+            context.extensionUri,
+            inventory,
+            chatViewProvider,
+            ref,
+            resumeIdempotencyId,
+            cancellation.token
+          );
+        }
+        if (actionKey === CHAT_SEND_ACTION_KEY_V1) {
+          return await resumeChatSendInteractionV1(
+            inventory,
+            chatViewProvider,
+            ref,
+            resumeIdempotencyId,
+            cancellation.token
+          );
+        }
+        if (actionKey === COMMIT_PUSH_METADATA_ACTION_KEY_V1) {
+          // Not threaded through `cancellation.token`: Resume here starts a
+          // fresh, linked public Commit and Push operation (plan §10.2
+          // point 5), which owns its own tracked-operation cancellation
+          // token rather than reusing this Chat-scoped one.
+          return await resumeCommitPushMetadataInteractionV1(
+            inventory,
+            chatViewProvider,
+            ref,
+            resumeIdempotencyId,
+            currentTaskStore,
+            context
           );
         }
         return {
@@ -395,7 +457,7 @@ export function activate(context: vscode.ExtensionContext): void {
   registerPinTaskCommands(context, inventory);
   registerApplyHighLevelReviewChangesCommand(context, inventory);
   registerApplyLowLevelReviewChangesCommand(context, inventory);
-  registerCommitAndPushTaskCommand(context, inventory, currentTaskStore);
+  registerCommitAndPushTaskCommand(context, inventory, currentTaskStore, chatViewProvider);
   registerMetaResourcesMigrationCommand(context, inventory, currentTaskStore);
   registerChoosePublishScopeCommand(context, inventory);
   registerChatWithStageCommand(context, inventory, chatViewProvider, currentTaskStore);

@@ -32,7 +32,7 @@ import * as assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
 import { __testOnly } from "../runners/cliAgentRunner";
-import { CliProviderDefinition } from "../runners/providers";
+import { CliProviderDefinition, getCliProvider } from "../runners/providers";
 import { classifyCliFailure, isAuthenticationFailure, isTransportError } from "../utils/quota";
 
 const {
@@ -903,6 +903,46 @@ void describe("stream-transport failures are cascade-eligible", () => {
 
     assert.equal(promoted.failureKind, "generic");
     assert.equal(promoted.transient, undefined);
+  });
+
+  void it("marks Antigravity's captured response timeout for same-conversation resume in edit mode", () => {
+    const antigravity = getCliProvider("antigravity-cli");
+    assert.ok(antigravity, "expected antigravity-cli provider definition");
+    const diagnostic = "Antigravity CLI failed: Error: timeout waiting for response";
+    const promoted = applyTransportTransience(
+      classifyFailed(diagnostic),
+      {
+        message: diagnostic,
+        authFailure: false,
+        diagnosticText: diagnostic,
+        retryableHint: false,
+      },
+      "edit",
+      antigravity
+    );
+
+    assert.equal(promoted.failureKind, "generic");
+    assert.equal(promoted.transient, true);
+    assert.equal(promoted.resumeConversation, true);
+  });
+
+  void it("does not treat the Antigravity timeout phrase as resumable for an unrelated opaque provider", () => {
+    const diagnostic = "Claude Code CLI failed: Error: timeout waiting for response";
+    const promoted = applyTransportTransience(
+      classifyFailed(diagnostic),
+      {
+        message: diagnostic,
+        authFailure: false,
+        diagnosticText: diagnostic,
+        retryableHint: false,
+      },
+      "edit",
+      OPAQUE_TEXT_LIKE
+    );
+
+    assert.equal(promoted.failureKind, "generic");
+    assert.equal(promoted.transient, undefined);
+    assert.equal(promoted.resumeConversation, undefined);
   });
 
   void it("does NOT populate editEvidence on a transport drop", () => {

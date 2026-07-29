@@ -109,6 +109,22 @@ export function buildStageContextValue(input: StageContextInput): string {
       case "impl-low-review":
         tokens.push("stage-impl-low-review-current");
         break;
+      case "impl-high-review":
+        // Distinct token from the generic "stage-review-current" (previously
+        // this case fell through to the isReviewStage default below, which
+        // emitted the SAME literal token as the text-only plan review
+        // stages). That conflation is what let the tree's Apply Review menu
+        // binding route an edit-capable review stage through the identical
+        // command entry point used for text-only plan reviews — the review's
+        // "one dynamic public command used for both branches" finding. Giving
+        // this stage its own token (mirroring impl-low-review) is the
+        // prerequisite for the menu/command surface to eventually bind
+        // edit-capable review stages to a distinct, statically edit-gated
+        // route. Package.json's when-clauses that used to rely on
+        // "stage-review-current" matching this stage now explicitly OR in
+        // this new token so behavior is unchanged until that split lands.
+        tokens.push("stage-impl-high-review-current");
+        break;
       case "publish":
         tokens.push("stage-publish-current");
         break;

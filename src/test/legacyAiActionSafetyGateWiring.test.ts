@@ -90,17 +90,27 @@ const CASES: readonly WiringCase[] = [
     routeId: "generateImplementation.v1",
     laterMarker: "workspace.workspaceFolders",
   },
-  // runImplementationWithAI ("implementation.v1") is a DELIBERATE, permanent
-  // exception to "every route gates first" — it is this migration's own
-  // bootstrapping tool. Every step of the plan, including the step that will
-  // eventually replace this action (plan.md's step 16, the code-editing
-  // action graph migration), is implemented BY running this action. Gating
-  // it on its own not-yet-landed V1 migration was tried in the same round
-  // that landed steps 9/10 and immediately deadlocked the task: it made this
-  // action permanently unusable, which blocked the only tool that could ever
-  // land step 16 in the first place. See the NOTE comment on
-  // runImplementationWithAI in reviewActions.ts. Do not re-add a case here
-  // for it without first confirming step 16's real replacement exists.
+  {
+    // Edit-capable sibling of the migrated "applyReview.v1" text route (plan
+    // §7.8 step 16, not yet landed): gated under its own, always-disabled
+    // route id so enabling "applyReview.v1" for plan-review stages never
+    // implicitly reaches this uncoordinated editing path.
+    file: "src/commands/reviewActions.ts",
+    functionSignature: "async function applyImplementationReviewWithAI(",
+    routeId: "applyReviewEdit.v1",
+    laterMarker: "materializeCanonicalIfNeeded(folderUri)",
+  },
+  {
+    // A prior "bootstrap" exemption let this route skip the throwing gate
+    // (calling the non-throwing isLegacyAiRouteDisabledV0 query instead),
+    // leaving a live, edit-capable AI route with no read-only preflight in
+    // front of it. It now gates identically to every other unmigrated route
+    // and stays disabled until plan §7/§7.8 step 16 lands its replacement.
+    file: "src/commands/reviewActions.ts",
+    functionSignature: "export async function runImplementationWithAI(",
+    routeId: "implementation.v1",
+    laterMarker: "workspace.workspaceFolders",
+  },
   // Concrete alias/wrapper routes: these read task state themselves before
   // delegating to the gated family handler, so each must gate first (plan
   // §1.3: every command, alias, scheduler, tree, or webview route).

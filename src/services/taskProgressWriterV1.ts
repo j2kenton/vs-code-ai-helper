@@ -12,8 +12,10 @@
  * reader/writer (scripts/verifyProgressReaderFence.mjs).
  */
 import * as vscode from "vscode";
+import * as path from "path";
 import { TASK_PROGRESS_FILENAME, TaskProgress } from "../types/taskProgress";
 import { writeAtomic } from "../state/writeAtomic";
+import { readTaskProgressStrictV1 } from "./taskProgressReaderV1";
 import {
   DecodeTaskProgressOptionsV1,
   DecodedTaskProgressV1,
@@ -125,4 +127,25 @@ export async function writeTaskProgressV1(
 ): Promise<void> {
   const progressFileUri = vscode.Uri.joinPath(taskFolderUri, TASK_PROGRESS_FILENAME);
   await writeAtomic(progressFileUri, encodeTaskProgressV1(progress, entries));
+}
+
+/**
+  * Read-modify-write progress mutation using strict decoding and encoding (plan §3.10 / §3.12).
+  */
+export async function patchTaskProgressStrictV1(
+  taskFolderUri: vscode.Uri,
+  update: (current: TaskProgress) => TaskProgress | undefined
+): Promise<TaskProgress | undefined> {
+  const folderName = path.basename(taskFolderUri.fsPath);
+  const strict = await readTaskProgressStrictV1(taskFolderUri, { expectedTaskFolder: folderName });
+  if (!strict.ok) {
+    return undefined;
+  }
+  const current = strict.decoded.progress;
+  const patched = update(current);
+  if (!patched) {
+    return current;
+  }
+  await writeTaskProgressV1(taskFolderUri, { ...patched, ensembleProgressVersion: 1 }, strict.decoded.entries);
+  return patched;
 }

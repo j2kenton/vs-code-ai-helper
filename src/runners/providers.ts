@@ -88,6 +88,22 @@ export interface CliBuildArgsContext {
    * argument it returns (e.g. `--print=${promptFile}`).
    */
   promptFile?: string;
+  /**
+   * Continue the provider's most recently persisted conversation instead of
+   * starting a new one. Set only by the bounded retry path for providers that
+   * declare conversationResume below.
+   */
+  resumePreviousConversation?: boolean;
+}
+
+export interface CliConversationResumeDefinition {
+  /**
+   * Exact, provider-owned diagnostic fragments that mean a failed process can
+   * be recovered by continuing the conversation it just persisted.
+   */
+  errorMarkers: readonly string[];
+  /** Follow-up prompt sent when continuing that conversation. */
+  continuationPrompt: string;
 }
 
 export interface CliProviderDefinition {
@@ -204,6 +220,13 @@ export interface CliProviderDefinition {
    * observed behavior for the currently supported CLI version.
    */
   guaranteesEditEventFlushBeforeSideEffects?: boolean;
+  /**
+   * Optional same-conversation recovery for a provider whose headless CLI
+   * persists a failed turn and exposes a continuation flag. Unlike replaying
+   * the original prompt, this deliberately preserves the provider's prior
+   * context and any workspace edits it already made.
+   */
+  conversationResume?: CliConversationResumeDefinition;
   /**
    * Terminal command line(s) for the "Sign In" action. Run in a visible IDE
    * terminal so the provider's interactive login flow works. Validated
@@ -808,6 +831,17 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     // `--print=<prompt>` value would hit on large context packs.
     promptTransport: "file",
     useShell: false,
+    conversationResume: {
+      // Production capture from five consecutive implementation runs on
+      // 2026-07-29. This is agy's own --print timeout, not Ensemble's outer
+      // process timeout.
+      errorMarkers: ["error: timeout waiting for response"],
+      continuationPrompt:
+        "Continue the same task from where the previous response timed out. " +
+        "Inspect the current workspace state and your existing changes first, then finish " +
+        "the remaining requested work without restarting or reverting completed work. " +
+        "Run the relevant verification and return the requested final summary.",
+    },
     // Deliberate exception to the "text mode stays read-only" contract
     // above, in BOTH modes: headless `agy --print` auto-denies any tool call
     // whose permission it does not already hold and cannot prompt for
@@ -857,8 +891,21 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
       }
       const args: string[] = [
         `--print=${context.promptFile}`,
+        // agy's own default is only five minutes, which repeatedly cut off
+        // healthy implementation runs after they had already edited files.
+        // Leave a five-minute cushion inside Ensemble's one-hour process cap.
+        "--print-timeout=55m0s",
         "--dangerously-skip-permissions",
       ];
+      if (context.resumePreviousConversation) {
+        // agy currently exposes no caller-supplied conversation id for an
+        // initial --print run. --continue is therefore necessarily scoped to
+        // its globally most recent conversation. The retry loop invokes it
+        // immediately while the same extension operation still owns this
+        // task, which minimizes but cannot eliminate races with another agy
+        // process or extension window.
+        args.push("--continue");
+      }
       if (model) {
         args.push("--model", model);
       }

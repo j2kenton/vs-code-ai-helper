@@ -439,7 +439,7 @@ void describe("draftRowV1", () => {
           sourceAttemptId: outcome.correlation.attemptId,
         });
         assert.ok(record, "the durable Chat interaction transaction must exist");
-        assert.equal(record?.questions.length, 1);
+        assert.equal(record?.questions?.length, 1);
         assert.equal(record?.resumeSemantics, "sameOperation");
       }
     });

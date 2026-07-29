@@ -401,8 +401,8 @@
     },
     {
       "path": "src/commands/reviewActions.ts",
-      "imports": ["appendReviewScoreHistory", "findAllTasks", "IncompleteTask", "patchTaskProgress", "readTaskProgress", "updateImplReviewFiles", "updateTaskProgressStage"],
-      "purpose": "Reads and patches review/implementation progress (score history, review files, stage advancement) across the review action family.",
+      "imports": ["appendReviewScoreHistory", "IncompleteTask"],
+      "purpose": "Reads and patches review/implementation progress (score history, review files, stage advancement) across the review action family. Fully migrated off both permissive reader and writer: every read uses strict decoding via readTaskProgressStrictV1 (or readTaskProgressAdvisoryV1), and every patch uses patchTaskProgressStrictV1.",
       "migrationCohort": "text3"
     },
     {

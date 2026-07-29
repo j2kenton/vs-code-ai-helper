@@ -282,6 +282,7 @@ export interface TaskActionRequestV1 {
   readonly taskStage: string;
   readonly rawInput: unknown;
   readonly cancellationToken: vscode.CancellationToken;
+  readonly preInvocationHook?: () => Promise<void>;
 }
 
 /**
@@ -339,6 +340,41 @@ export interface TaskActionCoordinatorDepsV1 {
   readonly brokerOptions?: AgentExecutionBrokerOptionsV1;
 }
 
+/**
+ * Opaque handle produced by `admitAction` once an action has survived every
+ * check that can independently reject it WITHOUT invoking a provider
+ * (eligibility, input validation, cancellation, duplicate-lease rejection,
+ * provider selection). Callers must not inspect its fields — only pass it to
+ * `continueAdmittedAction`, exactly once.
+ */
+export interface AdmittedProviderActionTicketV1 {
+  readonly row: ProviderTaskActionRowV1;
+  readonly request: TaskActionRequestV1;
+  readonly operationId: OperationIdV1;
+  readonly stage: TaskStage;
+  readonly validatedInput: unknown;
+  readonly session: ProviderSelectionSessionV1;
+  readonly selection: V1RunnerSelectionV1;
+  readonly acquireLeasePhase: AcquireTaskLeasePhaseV1;
+  readonly progress: TaskActionProgressHandleV1;
+  readonly metrics: ResultMetricsCaptureV1;
+  readonly preInvocationHook?: () => Promise<void>;
+}
+
+/**
+ * Result of `admitAction` (plan §5.4/AC-CHAT-TX-02 two-phase split):
+ * `"settled"` means the action already ran to a final outcome (a rejection
+ * before any provider row was reached, or a lifecycle row's complete
+ * transition — neither has a provider wait to admit around) and has already
+ * been audited/follow-up-scheduled; the caller returns the outcome as-is.
+ * `"admitted"` means every pre-provider check passed for a provider row; the
+ * caller may now safely do work that must not happen before a rejection is
+ * possible, then MUST call `continueAdmittedAction(ticket)` exactly once.
+ */
+export type TaskActionAdmissionResultV1 =
+  | { readonly kind: "settled"; readonly outcome: TaskActionOutcomeV1 }
+  | { readonly kind: "admitted"; readonly ticket: AdmittedProviderActionTicketV1 };
+
 export interface TaskActionCoordinatorV1 {
   /** Execute one action invocation end to end and return its stable outcome. */
   executeAction(request: TaskActionRequestV1): Promise<TaskActionOutcomeV1>;
@@ -346,6 +382,43 @@ export interface TaskActionCoordinatorV1 {
   executeRoute(
     routeId: string,
     request: Omit<TaskActionRequestV1, "actionKey">
+  ): Promise<TaskActionOutcomeV1>;
+  /**
+   * Two-phase execution split (plan §5.4/AC-CHAT-TX-02), used by callers that
+   * must persist caller-owned state (e.g. Chat Send's user message) only
+   * once an action can no longer be rejected on eligibility, input
+   * validation, cancellation, duplicate-lease, or provider-selection
+   * grounds — but before the provider is actually invoked. `executeAction`
+   * is exactly `admitAction` followed by `continueAdmittedAction` when
+   * admission is not itself terminal; most callers should keep using
+   * `executeAction` directly.
+   */
+  admitAction(request: TaskActionRequestV1): Promise<TaskActionAdmissionResultV1>;
+  /**
+   * Runs the provider, settles the outcome, and audits/schedules follow-up
+   * exactly once. Call exactly once per `"admitted"` ticket — a runtime
+   * claim rejects a second call for the same ticket (whether the first call
+   * was to this function or to `abortAdmittedAction`) instead of silently
+   * double-settling.
+   */
+  continueAdmittedAction(ticket: AdmittedProviderActionTicketV1): Promise<TaskActionOutcomeV1>;
+  /**
+   * Retire an admitted ticket that will never be continued (plan §5.4/
+   * AC-CHAT-TX-02) — e.g. caller-owned work required between admission and
+   * continuation itself failed. Ends progress presentation and audits/
+   * schedules follow-up exactly once via the same tail `continueAdmittedAction`
+   * uses, so an admitted ticket always settles through exactly one of these
+   * two functions, never neither. `reason` is a short machine-readable
+   * label folded into the terminal `failed` outcome's code
+   * (`admissionAborted.<reason>`); it is not free text and must not carry
+   * caller-owned content. Call at most once per ticket, and never after
+   * `continueAdmittedAction` has been called for the same ticket — a runtime
+   * claim rejects a second retirement of the same ticket through either
+   * function.
+   */
+  abortAdmittedAction(
+    ticket: AdmittedProviderActionTicketV1,
+    reason: string
   ): Promise<TaskActionOutcomeV1>;
   /**
    * Execute an explicit Resume end to end (plan §5.5 / §6.1 / AC-QUESTION-03):
@@ -482,6 +555,33 @@ export function createTaskActionCoordinatorV1(
 ): TaskActionCoordinatorV1 {
   const now = deps.now ?? ((): string => new Date().toISOString());
 
+  /**
+   * Runtime claim-once state for admitted tickets (plan §5.4/AC-CHAT-TX-02).
+   * `continueAdmittedAction` and `abortAdmittedAction` are documented as
+   * mutually exclusive, call-at-most-once retirement paths for the same
+   * ticket, but nothing previously enforced that at runtime: calling either
+   * twice, or aborting after continuing, would run `finalizeOutcome` (and
+   * its follow-up scheduling) and `progress.end()` more than once for a
+   * single operation. Claiming a ticket here — synchronously, before any
+   * `await` in either retirement function — makes a second retirement
+   * attempt fail fast instead of silently double-settling.
+   */
+  const retiredAdmissionTickets = new WeakSet<AdmittedProviderActionTicketV1>();
+
+  function claimTicketForRetirement(
+    ticket: AdmittedProviderActionTicketV1,
+    caller: "continueAdmittedAction" | "abortAdmittedAction"
+  ): void {
+    if (retiredAdmissionTickets.has(ticket)) {
+      throw new Error(
+        `TaskActionCoordinatorV1.${caller}: this admitted ticket was already retired via ` +
+          "continueAdmittedAction or abortAdmittedAction. Each admitted ticket may settle " +
+          "through exactly one of those two functions, exactly once."
+      );
+    }
+    retiredAdmissionTickets.add(ticket);
+  }
+
   async function runProviderRow(
     row: ProviderTaskActionRowV1,
     cancellationToken: vscode.CancellationToken,
@@ -501,12 +601,30 @@ export function createTaskActionCoordinatorV1(
      * Absent for a fresh (non-Resume) action, which never durably claims an
      * invocation.
      */
-    claimInvocationOnce?: () => Promise<ResumeInvocationClaimGateResultV1>
+    claimInvocationOnce?: () => Promise<ResumeInvocationClaimGateResultV1>,
+    /**
+     * Optional hook (plan §5.4/AC-CHAT-TX-02) called after the durable
+     * invocation admission succeeds but before the provider is invoked.
+     * Used by Chat Send to persist the user message only after the
+     * transaction record exists, so a validation/storage failure never
+     * leaves an unanswerable orphan message in the transcript.
+     */
+    preInvocationHook?: () => Promise<void>
   ): Promise<TaskActionOutcomeV1> {
     // No task-operation lease is held anywhere in this function except the
     // settlement phase inside `settleEnvelope` (plan §6.1 rule 6: leases are
     // released before provider waits).
     let invocationGateChecked = claimInvocationOnce === undefined;
+    // Pre-invocation admission (plan §6.1 step 5 / AC-CHAT-TX-02) applies
+    // only to a FRESH (non-Resume) question-capable invocation. A Resume
+    // drive (claimInvocationOnce present) reuses its ORIGINAL operationId,
+    // whose transaction record already exists (settled) — admitting a new
+    // record at that same operationId would collide with AC-CHAT-TX-01's
+    // exclusive-create rather than support it, so Resume drives are left on
+    // their pre-existing behavior entirely.
+    const isFreshInvocation = claimInvocationOnce === undefined;
+    const questionCapableInvocation =
+      isFreshInvocation && row.permittedResultKinds.includes("questions");
     for (;;) {
       const attemptId = session.allocateAttempt();
 
@@ -550,6 +668,36 @@ export function createTaskActionCoordinatorV1(
       // (plan §5.5's prompt-input digest — a §2.2-permitted digest, never the
       // prompt text itself).
       const promptSha256 = createHash("sha256").update(prompt, "utf8").digest("hex");
+
+      if (questionCapableInvocation) {
+        await deps.orchestrator.discardInvocation(correlation.operationId);
+        const admitted = await deps.orchestrator.admitInvocation({
+          correlation,
+          stage,
+          resumeSemantics: row.resumeSemantics,
+          validatedInput,
+          promptContract: {
+            contractId: AI_RESULT_CONTRACT_ID_V1,
+            contractVersion: AI_RESULT_CONTRACT_VERSION_V1,
+            promptInputSha256: promptSha256,
+          },
+        });
+        if (!admitted.ok) {
+          session.reportAttemptOutcome(attemptId, "providerUnavailablePreInvocation");
+          return admitted.code === "workflowStorageUnavailable"
+            ? unavailableV1("workflowStorageUnavailable")
+            : {
+                kind: "failed",
+                correlation,
+                code: `chatTransaction.${admitted.code}`,
+                retryable: true,
+              };
+        }
+      }
+
+      if (preInvocationHook) {
+        await preInvocationHook();
+      }
 
       const executionRequest: AgentExecutionRequestV1 = {
         correlation,
@@ -770,32 +918,78 @@ export function createTaskActionCoordinatorV1(
     };
   }
 
-  async function executeValidatedAction(
+  /**
+   * Exactly one sanitized settlement record plus (for a completed outcome)
+   * at most one scheduled follow-up (plan §3.8 / AC-LIFECYCLE-02; §2.2
+   * log-content rule) — the shared tail both `admitAction`'s terminal
+   * ("settled") branches and `continueAdmittedAction` run, so every path
+   * through the coordinator audits and follows up exactly once regardless
+   * of whether admission alone was terminal or a provider ran.
+   */
+  function finalizeOutcome(
     row: TaskActionRegistryRowV1,
     request: TaskActionRequestV1,
-    operationRef: { operationId?: OperationIdV1 },
+    operationId: OperationIdV1 | undefined,
+    outcome: TaskActionOutcomeV1,
     metrics: ResultMetricsCaptureV1
-  ): Promise<TaskActionOutcomeV1> {
+  ): TaskActionOutcomeV1 {
+    deps.auditLogger.log(
+      buildSettlementRecord(
+        row.loggingPolicy,
+        row.actionKey,
+        request.taskBinding.taskBindingId,
+        operationId,
+        outcome,
+        metrics
+      )
+    );
+    if (outcome.kind === "completed" && row.followUpActionKey !== undefined && operationId !== undefined) {
+      deps.followUpScheduler.schedule({
+        followUpActionKey: row.followUpActionKey,
+        sourceActionKey: row.actionKey,
+        sourceOperationId: operationId,
+        taskBinding: request.taskBinding,
+      });
+    }
+    return outcome;
+  }
+
+  /**
+   * Admission phase (plan §5.4/AC-CHAT-TX-02): everything that can
+   * independently reject an action WITHOUT invoking a provider — eligibility,
+   * stage validity, input validation, cancellation, duplicate-lease
+   * rejection, and (for a provider row) selection-session setup. A lifecycle
+   * row has no provider wait to admit around, so it runs to completion here
+   * and returns `"settled"`; a provider row that is admitted returns an
+   * opaque ticket for `continueAdmittedAction`, with progress presentation
+   * left open across the gap (ended only once the ticket is continued).
+   */
+  async function admitAction(request: TaskActionRequestV1): Promise<TaskActionAdmissionResultV1> {
+    const row = deps.registry.rowForActionKey(request.actionKey);
+    const metrics: ResultMetricsCaptureV1 = {};
+
     const ineligible = eligibilityFailure(row, request.taskStatus, request.taskStage);
     if (ineligible) {
-      return ineligible;
+      return { kind: "settled", outcome: finalizeOutcome(row, request, undefined, ineligible, metrics) };
     }
     if (!isCanonicalTaskStageV0(request.taskStage)) {
-      return { kind: "failed", code: "invalidTaskStage", retryable: false };
+      const outcome: TaskActionOutcomeV1 = { kind: "failed", code: "invalidTaskStage", retryable: false };
+      return { kind: "settled", outcome: finalizeOutcome(row, request, undefined, outcome, metrics) };
     }
     const stage = request.taskStage;
 
     const validation = row.validateInput(request.rawInput);
     if (!validation.ok) {
-      return { kind: "failed", code: "invalidActionInput", retryable: false };
+      const outcome: TaskActionOutcomeV1 = { kind: "failed", code: "invalidActionInput", retryable: false };
+      return { kind: "settled", outcome: finalizeOutcome(row, request, undefined, outcome, metrics) };
     }
 
     if (request.cancellationToken.isCancellationRequested) {
-      return { kind: "cancelled", code: "userCancelled" };
+      const outcome: TaskActionOutcomeV1 = { kind: "cancelled", code: "userCancelled" };
+      return { kind: "settled", outcome: finalizeOutcome(row, request, undefined, outcome, metrics) };
     }
 
     const operationId = allocateHex128IdV1();
-    operationRef.operationId = operationId;
 
     const acquireLeasePhase: AcquireTaskLeasePhaseV1 = () => {
       if (!row.requiresTaskOperationLease) {
@@ -819,115 +1013,250 @@ export function createTaskActionCoordinatorV1(
     };
 
     // Coordinator-owned presentation (plan §3.8): the row's declared
-    // progress label covers exactly the execution span, ended in the
-    // outermost finally.
+    // progress label covers exactly the execution span. For a lifecycle row
+    // (no provider wait) it is ended below before returning. For an admitted
+    // provider row it is deliberately left open — `continueAdmittedAction`
+    // ends it once the provider wait and settlement are done.
     const progress = deps.presenter.beginProgress({
       actionKey: row.actionKey,
       operationId,
       progressLabel: row.progressLabel,
     });
-    try {
-      if (row.kind === "lifecycle") {
-        // Lifecycle rows contain no provider/user wait: one short lease
-        // covers the whole coordinated transition.
-        const phase = acquireLeasePhase();
-        if (!phase.ok) {
-          return phase.outcome;
-        }
-        try {
-          return await row.execute({
-            actionKey: row.actionKey,
-            operationId,
-            taskBindingId: request.taskBinding.taskBindingId,
-            chatDocumentId: request.taskBinding.chatDocumentId,
-            validatedInput: validation.input,
-          });
-        } finally {
-          phase.release();
-        }
-      }
 
-      // START lease phase for a provider row: duplicate rejection plus
-      // selection setup only, released BEFORE any provider wait (plan §6.1
-      // rule 6). The lease is re-acquired solely for completed-content
-      // promotion in `settleEnvelope`'s settlement phase.
-      const start = acquireLeasePhase();
-      if (!start.ok) {
-        return start.outcome;
+    if (row.kind === "lifecycle") {
+      // Lifecycle rows contain no provider/user wait: one short lease
+      // covers the whole coordinated transition.
+      const phase = acquireLeasePhase();
+      if (!phase.ok) {
+        progress.end();
+        return { kind: "settled", outcome: finalizeOutcome(row, request, operationId, phase.outcome, metrics) };
       }
-      let session: ProviderSelectionSessionV1;
-      let selection: V1RunnerSelectionV1;
       try {
-        session = openProviderSelectionSessionV1({
+        const outcome = await row.execute({
           actionKey: row.actionKey,
           operationId,
           taskBindingId: request.taskBinding.taskBindingId,
           chatDocumentId: request.taskBinding.chatDocumentId,
+          validatedInput: validation.input,
         });
-        // One ranked selection per operation: the registry owns the
-        // candidate order and issues every reservation through this session
-        // (plan §3.3).
-        selection = deps.openRunnerSelection({
-          session,
-          mode: row.providerMode,
-          taskStage: request.taskStage,
-        });
+        return { kind: "settled", outcome: finalizeOutcome(row, request, operationId, outcome, metrics) };
       } finally {
-        start.release();
+        phase.release();
+        progress.end();
       }
-      return await runProviderRow(
+    }
+
+    // START lease phase for a provider row: duplicate rejection plus
+    // selection setup only, released BEFORE any provider wait (plan §6.1
+    // rule 6). The lease is re-acquired solely for completed-content
+    // promotion in `settleEnvelope`'s settlement phase.
+    const start = acquireLeasePhase();
+    if (!start.ok) {
+      progress.end();
+      return { kind: "settled", outcome: finalizeOutcome(row, request, operationId, start.outcome, metrics) };
+    }
+    let session: ProviderSelectionSessionV1;
+    let selection: V1RunnerSelectionV1;
+    try {
+      session = openProviderSelectionSessionV1({
+        actionKey: row.actionKey,
+        operationId,
+        taskBindingId: request.taskBinding.taskBindingId,
+        chatDocumentId: request.taskBinding.chatDocumentId,
+      });
+      // One ranked selection per operation: the registry owns the
+      // candidate order and issues every reservation through this session
+      // (plan §3.3).
+      selection = deps.openRunnerSelection({
+        session,
+        mode: row.providerMode,
+        taskStage: request.taskStage,
+      });
+    } finally {
+      start.release();
+    }
+
+    if (row.permittedResultKinds.includes("questions")) {
+      const attemptId = session.allocateAttempt();
+      const next = selection.reserveNext(attemptId);
+      if (next.kind === "noneRemaining") {
+        session.reportAttemptOutcome(attemptId, "providerUnavailablePreInvocation");
+        progress.end();
+        return { kind: "settled", outcome: finalizeOutcome(row, request, operationId, unavailableV1("providerModeUnavailable"), metrics) };
+      }
+      if (next.kind !== "candidateUnavailable") {
+        const correlation = next.reserved.handle.correlation;
+        const context: TaskActionExecutionContextV1 = {
+          correlation,
+          stage,
+          validatedInput: validation.input,
+        };
+        const prompt =
+          row.buildPrompt(context) +
+          "\n\n" +
+          buildAiResultContractPromptV1({
+            correlation,
+            permittedResultKinds: row.permittedResultKinds,
+            completedContentType: row.completedContentType,
+            maxResponseBytes: row.maxResponseBytes,
+          });
+        const promptSha256 = createHash("sha256").update(prompt, "utf8").digest("hex");
+
+        await deps.orchestrator.discardInvocation(operationId);
+        const admitted = await deps.orchestrator.admitInvocation({
+          correlation,
+          stage,
+          resumeSemantics: row.resumeSemantics,
+          validatedInput: validation.input,
+          promptContract: {
+            contractId: AI_RESULT_CONTRACT_ID_V1,
+            contractVersion: AI_RESULT_CONTRACT_VERSION_V1,
+            promptInputSha256: promptSha256,
+          },
+        });
+
+        if (!admitted.ok) {
+          session.reportAttemptOutcome(attemptId, "providerUnavailablePreInvocation");
+          progress.end();
+          return {
+            kind: "settled",
+            outcome: finalizeOutcome(
+              row,
+              request,
+              operationId,
+              admitted.code === "workflowStorageUnavailable"
+                ? unavailableV1("workflowStorageUnavailable")
+                : {
+                    kind: "failed",
+                    correlation,
+                    code: `chatTransaction.${admitted.code}`,
+                    retryable: true,
+                  },
+              metrics
+            ),
+          };
+        }
+      }
+    }
+
+    return {
+      kind: "admitted",
+      ticket: {
         row,
-        request.cancellationToken,
+        request,
+        operationId,
+        stage,
+        validatedInput: validation.input,
         session,
         selection,
-        validation.input,
-        stage,
         acquireLeasePhase,
-        metrics
-      );
+        progress,
+        metrics,
+        preInvocationHook: request.preInvocationHook,
+      },
+    };
+  }
+
+  /** Continuation phase: run the provider, settle, and finalize exactly once for an admitted ticket. */
+  async function continueAdmittedAction(
+    ticket: AdmittedProviderActionTicketV1
+  ): Promise<TaskActionOutcomeV1> {
+    claimTicketForRetirement(ticket, "continueAdmittedAction");
+    try {
+      let outcome: TaskActionOutcomeV1;
+      try {
+        outcome = await runProviderRow(
+          ticket.row,
+          ticket.request.cancellationToken,
+          ticket.session,
+          ticket.selection,
+          ticket.validatedInput,
+          ticket.stage,
+          ticket.acquireLeasePhase,
+          ticket.metrics,
+          undefined,
+          undefined,
+          ticket.preInvocationHook
+        );
+      } catch {
+        outcome = {
+          kind: "failed",
+          correlation: {
+            actionKey: ticket.row.actionKey,
+            operationId: ticket.operationId,
+            attemptId: "",
+            taskBindingId: ticket.request.taskBinding.taskBindingId,
+            chatDocumentId: ticket.request.taskBinding.chatDocumentId,
+          },
+          code: "preInvocationHookFailed",
+          retryable: true,
+        };
+      }
+      if (outcome.kind !== "questions" && ticket.row.permittedResultKinds.includes("questions")) {
+        await deps.orchestrator.discardInvocation(ticket.operationId);
+      }
+      return finalizeOutcome(ticket.row, ticket.request, ticket.operationId, outcome, ticket.metrics);
     } finally {
-      progress.end();
+      ticket.progress.end();
     }
   }
 
   async function executeAction(request: TaskActionRequestV1): Promise<TaskActionOutcomeV1> {
-    const row = deps.registry.rowForActionKey(request.actionKey);
-    const operationRef: { operationId?: OperationIdV1 } = {};
-    const metrics: ResultMetricsCaptureV1 = {};
-
-    const outcome = await executeValidatedAction(row, request, operationRef, metrics);
-
-    // Exactly one sanitized settlement record per invocation, under the
-    // row's declared logging policy (plan §3.8; §2.2 log-content rule).
-    deps.auditLogger.log(
-      buildSettlementRecord(
-        row.loggingPolicy,
-        row.actionKey,
-        request.taskBinding.taskBindingId,
-        operationRef.operationId,
-        outcome,
-        metrics
-      )
-    );
-
-    // The row's declared follow-up is consumed here — no lease is held, so a
-    // synchronous scheduler may immediately coordinate the follow-up against
-    // the same task — and only for a completed outcome: at most one
-    // follow-up per invocation (plan §3.8 / AC-LIFECYCLE-02).
-    if (
-      outcome.kind === "completed" &&
-      row.followUpActionKey !== undefined &&
-      operationRef.operationId !== undefined
-    ) {
-      deps.followUpScheduler.schedule({
-        followUpActionKey: row.followUpActionKey,
-        sourceActionKey: row.actionKey,
-        sourceOperationId: operationRef.operationId,
-        taskBinding: request.taskBinding,
-      });
+    const admission = await admitAction(request);
+    if (admission.kind === "settled") {
+      return admission.outcome;
     }
+    return continueAdmittedAction(admission.ticket);
+  }
 
-    return outcome;
+  /**
+   * Abort an admitted ticket without invoking a provider (plan §5.4/
+   * AC-CHAT-TX-02). An admitted ticket is a claim on an `operationId` and an
+   * open progress presentation with no accounted-for terminal outcome yet —
+   * `continueAdmittedAction` is the ONLY other function that may retire it.
+   * A caller that does required work between `admitAction` and
+   * `continueAdmittedAction` (e.g. Chat Send persisting the user's message)
+   * and finds that work itself fails must call this exactly once instead of
+   * discarding the ticket: discarding it would leave the ticket's progress
+   * presentation open forever and the operation unaudited/un-followed-up —
+   * silently violating "coordinator owns complete action settlement". This
+   * never reaches a provider (no attempt was allocated for an admitted
+   * ticket — see `admitAction`), so it needs no session/attempt bookkeeping;
+   * it settles with the same exactly-once audit/follow-up tail as every
+   * other coordinator exit path.
+   */
+  function abortAdmittedAction(
+    ticket: AdmittedProviderActionTicketV1,
+    reason: string
+  ): Promise<TaskActionOutcomeV1> {
+    // A second retirement of the same ticket (claimTicketForRetirement
+    // throwing) must reject the returned promise per this function's
+    // declared `Promise<...>` contract, the same as `continueAdmittedAction`
+    // — not throw synchronously out of the call — so it is caught explicitly
+    // here and turned into Promise.reject rather than left to propagate.
+    try {
+      claimTicketForRetirement(ticket, "abortAdmittedAction");
+    } catch (error) {
+      return Promise.reject(error instanceof Error ? error : new Error(String(error)));
+    }
+    const outcome: TaskActionOutcomeV1 = {
+      kind: "failed",
+      code: `admissionAborted.${reason}`,
+      retryable: true,
+    };
+    const cleanup = ticket.row.permittedResultKinds.includes("questions")
+      ? deps.orchestrator.discardInvocation(ticket.operationId).then(() => undefined, () => undefined)
+      : Promise.resolve();
+    return cleanup.then(
+      () => {
+        ticket.progress.end();
+        return finalizeOutcome(ticket.row, ticket.request, ticket.operationId, outcome, ticket.metrics);
+      },
+      () => {
+        ticket.progress.end();
+        return finalizeOutcome(ticket.row, ticket.request, ticket.operationId, outcome, ticket.metrics);
+      }
+    );
   }
 
   async function executeResume(
@@ -1262,6 +1591,9 @@ export function createTaskActionCoordinatorV1(
       const row = deps.registry.rowForRoute(routeId);
       return executeAction({ ...request, actionKey: row.actionKey });
     },
+    admitAction,
+    continueAdmittedAction,
+    abortAdmittedAction,
     resumeAction,
   };
 }

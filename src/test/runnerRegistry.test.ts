@@ -893,7 +893,6 @@ void describe("runImplementationForModel", () => {
         onProgress: () => undefined,
         stage: "impl",
         taskFolderUri,
-        isImplementationV1Bootstrap: true,
       });
 
       assert.strictEqual(result.runnerId, "copilot-lm");
@@ -913,15 +912,16 @@ void describe("runImplementationForModel", () => {
     }
   });
 
-  // Regression coverage for a review finding on the "implementation.v1"
-  // bootstrap exemption: an earlier version keyed it off `stage === "impl"`
-  // inside the SHARED assertNoUnauthorizedV1CorrelationV0, which also
-  // matched generateImplementationWithAI's unrelated uncorrelated call. The
-  // real exemption now lives only here, as an explicit, required,
-  // per-call-site parameter — proven directly against the production
-  // boundary switch rather than relying only on the (now stricter, no
-  // exception) coverage in legacyAiActionSafetyGateV0.test.ts.
-  void it("isImplementationV1Bootstrap: true bypasses the uncorrelated-runner boundary; false does not", async () => {
+  // Regression coverage for a review finding: an earlier version let a
+  // now-removed `isImplementationV1Bootstrap: true` flag skip
+  // assertNoUnauthorizedV1CorrelationV0 entirely, so an uncorrelated
+  // "implementation.v1" request could reach a provider — a real
+  // edit-capable invocation — with no read-only preflight in front of it.
+  // The backstop is enforced unconditionally now; the flag itself was
+  // removed rather than left inert. Proven directly against the production
+  // boundary switch rather than relying only on the coverage in
+  // legacyAiActionSafetyGateV0.test.ts.
+  void it("assertNoUnauthorizedV1CorrelationV0 rejects an uncorrelated call", async () => {
     const metaRoot = fs.mkdtempSync(
       path.join(os.tmpdir(), "ensemble-impl-bootstrap-flag-")
     );
@@ -985,11 +985,8 @@ void describe("runImplementationForModel", () => {
         taskFolderUri,
       };
 
-      await assert.doesNotReject(
-        runImplementationForModel({ ...baseRequest, isImplementationV1Bootstrap: true })
-      );
       await assert.rejects(
-        runImplementationForModel({ ...baseRequest, isImplementationV1Bootstrap: false }),
+        runImplementationForModel(baseRequest),
         LegacyAiActionSafetyGateErrorV0
       );
     } finally {
@@ -1080,7 +1077,6 @@ void describe("runImplementationForModel", () => {
         onProgress: () => undefined,
         stage: "impl",
         taskFolderUri,
-        isImplementationV1Bootstrap: true,
       });
 
       assert.equal(result.status, "failed");
@@ -1250,7 +1246,6 @@ void describe("runImplementationForModel", () => {
           onProgress: () => undefined,
           stage: "impl",
           taskFolderUri,
-          isImplementationV1Bootstrap: true,
         });
 
         assert.strictEqual(result.status, "failed");
@@ -1390,7 +1385,6 @@ void describe("runImplementationForModel", () => {
           onProgress: () => undefined,
           stage: "impl",
           taskFolderUri,
-          isImplementationV1Bootstrap: true,
         });
 
         // Checked FIRST and deliberately independent of `result`'s own
@@ -1452,7 +1446,6 @@ void describe("runImplementationForModel", () => {
         onProgress: () => undefined,
         stage: "impl",
         taskFolderUri: vscode.Uri.file(process.cwd()),
-        isImplementationV1Bootstrap: true,
       });
 
       assert.strictEqual(result.runnerId, "codex-cli");

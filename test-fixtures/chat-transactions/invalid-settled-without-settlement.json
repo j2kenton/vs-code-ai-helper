@@ -47,8 +47,14 @@
   "state": "settled",
   "transitions": [
     {
-      "receiptId": "01010101010101010101010101010101",
+      "receiptId": "00000000000000000000000000000000",
       "from": null,
+      "to": "invocationPending",
+      "at": "2026-07-26T09:59:00.000Z"
+    },
+    {
+      "receiptId": "01010101010101010101010101010101",
+      "from": "invocationPending",
       "to": "questionsPosted",
       "at": "2026-07-26T10:00:00.000Z"
     },

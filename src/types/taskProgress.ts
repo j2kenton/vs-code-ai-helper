@@ -290,6 +290,16 @@ export const STAGE_ARTIFACT_FILENAMES: Record<TaskStage, string | undefined> =
     publish: "publish-review.md",
   };
 
+export const PLAN_REVIEW_STAGES: readonly TaskStage[] = [
+  "plan-high-review",
+  "plan-low-review",
+] as const;
+
+export const IMPL_REVIEW_STAGES: readonly TaskStage[] = [
+  "impl-high-review",
+  "impl-low-review",
+] as const;
+
 /**
  * The stages that are review stages, in which the review actions
  * (view / apply / next stage) are available.

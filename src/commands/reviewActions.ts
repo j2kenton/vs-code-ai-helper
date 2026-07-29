@@ -15,9 +15,11 @@ import {
 } from "../utils/taskOperations";
 import {
   EscalationKind,
+  IMPL_REVIEW_STAGES,
   isPlanReviewStage,
   isReviewStage,
   PLAN_FILENAME,
+  PLAN_REVIEW_STAGES,
   REVIEW_STAGES,
   STAGE_ARTIFACT_FILENAMES,
   STAGE_DISPLAY_NAMES,
@@ -27,21 +29,15 @@ import {
 import { TaskProgress } from "../types/taskProgress";
 import {
   appendReviewScoreHistory,
-  findAllTasks,
   IncompleteTask,
-  patchTaskProgress,
-  readTaskProgress,
-  updateImplReviewFiles,
-  updateTaskProgressStage,
 } from "../utils/taskProgressUtils";
+import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
+import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import {
   advanceStage,
   computeNextStage,
 } from "../utils/stageTransition";
-import {
-  assertLegacyAiRouteAllowedV0,
-  isLegacyAiRouteDisabledV0,
-} from "../services/legacyAiActionSafetyGateV0";
+import { assertLegacyAiRouteAllowedV0 } from "../services/legacyAiActionSafetyGateV0";
 import {
   openOrCreateDocument,
   readNonEmptyText,
@@ -69,6 +65,7 @@ import {
 } from "../utils/modelSelection";
 import {
   getCanonicalImplementationUri,
+  getLegacyImplementationUri,
   resolveImplementationArtifact,
   materializeCanonicalIfNeeded,
   preparePlanPromotion,
@@ -95,6 +92,8 @@ import {
 } from "../actions/productionTaskActionRuntimeV1";
 import { ActionConversationOrchestratorV1, InteractionRefV1 } from "../actions/actionConversationOrchestratorV1";
 import { GENERATE_IMPLEMENTATION_ACTION_KEY_V1 } from "../actions/rows/generateImplementationRowV1";
+import { REVIEW_ACTION_KEY_V1, ReviewActionInputV1 } from "../actions/rows/reviewRowV1";
+import { APPLY_REVIEW_ACTION_KEY_V1, ApplyReviewActionInputV1 } from "../actions/rows/applyReviewRowV1";
 import { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
 import { ChatInteractionRefV1, ChatInteractionResumeResultV1, ChatViewProvider } from "../views/chatView";
 import { TaskInventory } from "../state/taskInventory";
@@ -241,7 +240,7 @@ export async function claimReviewAttempt(
   folderUri: vscode.Uri,
   reviewAttemptId: string
 ): Promise<TaskProgress | undefined> {
-  return patchTaskProgress(folderUri, (current) => {
+  return patchTaskProgressStrictV1(folderUri, (current) => {
     if (current.status === "paused") {
       throw new Error("The task was paused while the review was starting.");
     }
@@ -371,6 +370,8 @@ interface ApplyReviewOptions {
    * `options.parentOperation` checks around the `begin`/`end` calls below.
    */
   parentOperation?: TaskOperationHandle;
+  /** Routes `applyReview.v1` structured questions into Chat With AI. */
+  chatViewProvider?: ChatViewProvider;
 }
 
 interface ExecuteImplementationRunOptions {
@@ -409,16 +410,6 @@ interface ExecuteImplementationRunOptions {
    * already holds.
    */
   suppressAutoReviewDispatch?: boolean;
-  /**
-   * REQUIRED, not defaulted: threaded straight through to
-   * runImplementationForModel's own required field of the same name (see its
-   * doc comment in runnerRegistry.ts). executeImplementationRun is shared by
-   * BOTH runImplementationWithAI ("implementation.v1", not yet migrated —
-   * pass `true`) and applyReviewWithAI ("applyReview.v1", already migrated —
-   * pass `false`), so this cannot be hardcoded inside this shared function;
-   * only each call site knows which top-level action it is.
-   */
-  isImplementationV1Bootstrap: boolean;
 }
 
 /**
@@ -428,13 +419,15 @@ interface ExecuteImplementationRunOptions {
  */
 export function buildFastForwardApplyReviewOptions(
   attemptNumber: number,
-  parentOperation?: TaskOperationHandle
+  parentOperation?: TaskOperationHandle,
+  chatViewProvider?: ChatViewProvider
 ): ApplyReviewOptions {
   const preserveActiveFallback = attemptNumber > 1;
   return {
     skipImplementationSafetyCheck: preserveActiveFallback,
     preserveActiveFallback,
     parentOperation,
+    chatViewProvider,
   };
 }
 
@@ -447,8 +440,8 @@ export function buildFastForwardApplyReviewOptions(
  * a truthy object with a truthy `folderUri` property. Passing `{ task: {} }`
  * or `{ task: { folderUri: undefined } }` is not a valid `TaskNodeArg`
  * because `resolveTask` dereferences `task.folderUri` and passes it straight
- * to `readTaskProgress` → `vscode.Uri.joinPath`, which would throw before
- * the function's `try/catch`. Requiring `task.folderUri` to be truthy here
+ * to `readTaskProgressStrictV1` → `vscode.Uri.joinPath`, which would throw
+ * before that function's own `try/catch`. Requiring `task.folderUri` to be truthy here
  * catches those stale/untyped callers before they can cause an unhandled
  * exception.
  *
@@ -524,7 +517,7 @@ function isMalformedReviewArg(arg: ReviewCommandArg | Record<string, unknown>): 
 
 interface ResolvedTask {
   folderUri: vscode.Uri;
-  progress: NonNullable<Awaited<ReturnType<typeof readTaskProgress>>>;
+  progress: TaskProgress;
 }
 
 /**
@@ -611,13 +604,30 @@ async function resolveTask(
 ): Promise<ResolvedTask | undefined> {
   if (node?.task) {
     const folderUri = node.task.folderUri;
-    const progress = await readTaskProgress(folderUri);
-    if (!progress) {
+    // Strict decode (plan §3.10/§3.12 Text-3 cutover): this is the single
+    // most common resolution path shared by every review-family command, so
+    // migrating it off the permissive reader closes the largest share of
+    // this file's remaining permissive-reader exposure. Unlike the
+    // permissive reader's single collapsed `undefined`, an unsupported/
+    // invalid document is surfaced as its own recovery message rather than
+    // silently treated the same as "no file".
+    // expectedTaskFolder activates the decoder's folder-binding mismatch
+    // check (taskProgressDecoderV1.ts): the persisted `taskFolder` must equal
+    // this progress file's own containing folder's basename, so a copy/move
+    // of a task-progress.json into a different folder is caught here rather
+    // than silently trusted.
+    const strict = await readTaskProgressStrictV1(folderUri, {
+      expectedTaskFolder: path.basename(folderUri.fsPath),
+    });
+    if (!strict.ok) {
       NotificationRouter.showError(
-        `Could not read task progress for ${node.task.folderName}.`
+        strict.code === "missing"
+          ? `Could not read task progress for ${node.task.folderName}.`
+          : `Task progress for ${node.task.folderName} could not be read (${strict.code}) and needs recovery: ${strict.reason}`
       );
       return undefined;
     }
+    const progress: TaskProgress = strict.decoded.progress;
     if (!eligibleStages.includes(progress.currentStage)) {
       NotificationRouter.showWarning(
         `${node.task.folderName} is at stage "${
@@ -650,51 +660,86 @@ async function resolveTask(
     return undefined;
   }
 
-  const combinedTasks: IncompleteTask[] = [];
+  const discoveredUris: vscode.Uri[] = [];
   for (const wsFolder of allWorkspaceFolders) {
-    // Attempt to discover tasks using the configured path, or the default meta root.
     const metaFolderUri = vscode.Uri.joinPath(wsFolder.uri, getConfiguredTaskRoot());
 
     try {
-      const wsTasks = await findAllTasks(metaFolderUri);
-      combinedTasks.push(...wsTasks);
+      const entries = await vscode.workspace.fs.readDirectory(metaFolderUri);
+      for (const [name, type] of entries) {
+        if (type === vscode.FileType.Directory) {
+          discoveredUris.push(vscode.Uri.joinPath(metaFolderUri, name));
+        }
+      }
     } catch {
-      // Skip workspace folders where the meta folder doesn't exist
+      // Skip workspace folders where the meta folder doesn't exist.
     }
 
-    // Also check legacy plans/ folder if different
     try {
       const legacyUri = vscode.Uri.joinPath(wsFolder.uri, "plans");
       if (legacyUri.fsPath !== metaFolderUri.fsPath) {
-        const legacyTasks = await findAllTasks(legacyUri);
-        combinedTasks.push(...legacyTasks);
+        const legacyEntries = await vscode.workspace.fs.readDirectory(legacyUri);
+        for (const [name, type] of legacyEntries) {
+          if (type === vscode.FileType.Directory) {
+            discoveredUris.push(vscode.Uri.joinPath(legacyUri, name));
+          }
+        }
       }
     } catch {
-      // Ignore errors reading legacy folder
+      // Ignore errors reading legacy folder.
     }
   }
 
-  const eligible = combinedTasks.filter((task) =>
-    eligibleStages.includes(task.progress.currentStage)
+  type DiscoveredTaskItem =
+    | IncompleteTask
+    | {
+        folderUri: vscode.Uri;
+        folderName: string;
+        canonicalId: string;
+        corrupt: true;
+        code: string;
+        reason: string;
+      };
+
+  const discoveredTasks: DiscoveredTaskItem[] = [];
+  for (const folderUri of discoveredUris) {
+    const folderName = path.basename(folderUri.fsPath);
+    const strict = await readTaskProgressStrictV1(folderUri, {
+      expectedTaskFolder: folderName,
+    });
+    if (!strict.ok) {
+      if (strict.code !== "missing") {
+        discoveredTasks.push({
+          folderUri,
+          folderName,
+          canonicalId: normalizePath(folderUri.fsPath),
+          corrupt: true,
+          code: strict.code,
+          reason: strict.reason,
+        });
+      }
+      continue;
+    }
+    discoveredTasks.push({
+      folderUri,
+      folderName,
+      progress: strict.decoded.progress,
+      canonicalId: normalizePath(folderUri.fsPath),
+    });
+  }
+
+  const eligible = discoveredTasks.filter((task) =>
+    "corrupt" in task ? true : eligibleStages.includes(task.progress.currentStage)
   );
   if (eligible.length === 0) {
     NotificationRouter.showInformation(
-      combinedTasks.length === 0
+      discoveredUris.length === 0
         ? "No task folders found. Use 'Start New Task' to create one."
         : "No tasks are at a stage eligible for this action."
     );
     return undefined;
   }
 
-  // A no-arg invocation (keyboard shortcut, command palette, an auto-advance
-  // chain that doesn't thread a folder through) has no explicit target. When
-  // exactly one task is eligible, auto-picking it is safe only if it's also
-  // the task the user is actually working on — otherwise a generic shortcut
-  // can silently run against an unrelated task that just happens to be the
-  // sole one sitting at an eligible stage right now, with no confirmation.
-  // Cross-check against the persisted current-task pointer; fall through to
-  // the picker (even for a single item) on any mismatch, so the user
-  // explicitly confirms rather than the command guessing for them.
   const soleEligible = eligible.length === 1 ? eligible[0] : undefined;
   const currentTaskId = new CurrentTaskStore(context.workspaceState).get();
   const autoPickable =
@@ -702,13 +747,16 @@ async function resolveTask(
     (!currentTaskId ||
       currentTaskId === (soleEligible.canonicalId ?? normalizePath(soleEligible.folderUri.fsPath)));
 
-  let picked: IncompleteTask | undefined;
+  let picked: DiscoveredTaskItem | undefined;
   if (autoPickable) {
     picked = soleEligible;
   } else {
     const items = eligible.map((task) => ({
       label: task.folderName,
-      description: `Stage: ${STAGE_DISPLAY_NAMES[task.progress.currentStage]}`,
+      description:
+        "corrupt" in task
+          ? `[Recovery Required] ${task.reason}`
+          : `Stage: ${STAGE_DISPLAY_NAMES[task.progress.currentStage]}`,
       task,
     }));
     const selected = await vscode.window.showQuickPick(items, {
@@ -720,7 +768,69 @@ async function resolveTask(
   if (!picked) {
     return undefined;
   }
-  return { folderUri: picked.folderUri, progress: picked.progress };
+
+  if ("corrupt" in picked) {
+    NotificationRouter.showError(
+      `Task progress for ${picked.folderName} could not be read (${picked.code}) and needs recovery: ${picked.reason}`
+    );
+    return undefined;
+  }
+
+  const strictPicked = await readTaskProgressStrictV1(picked.folderUri, {
+    expectedTaskFolder: path.basename(picked.folderUri.fsPath),
+  });
+  if (!strictPicked.ok) {
+    NotificationRouter.showError(
+      strictPicked.code === "missing"
+        ? `Could not read task progress for ${picked.folderName}.`
+        : `Task progress for ${picked.folderName} could not be read (${strictPicked.code}) and needs recovery: ${strictPicked.reason}`
+    );
+    return undefined;
+  }
+  const pickedProgress = strictPicked.decoded.progress;
+  if (!eligibleStages.includes(pickedProgress.currentStage)) {
+    NotificationRouter.showWarning(
+      `${picked.folderName} is at stage "${
+        STAGE_DISPLAY_NAMES[pickedProgress.currentStage]
+      }", which this action doesn't apply to.`
+    );
+    return undefined;
+  }
+  return { folderUri: picked.folderUri, progress: pickedProgress };
+}
+
+/**
+ * Strict-decode read for internal advisory/defensive checks that already
+ * tolerate a missing or unreadable progress file by falling back to
+ * `undefined` (freshness re-checks, best-effort context, pause polling).
+ * Unlike the permissive `readTaskProgress`, this never silently coerces
+ * unsupported/legacy field shapes into a plausible-looking `TaskProgress` —
+ * an unsupported/invalid document collapses to `undefined` exactly like a
+ * missing file, so these call sites keep their existing conservative
+ * "no evidence" handling without risking a fabricated value (plan §3.12
+ * Text-3 cutover). Callers that must actually distinguish and surface
+ * recovery (e.g. a top-level command's stage/status gate) should call
+ * `readTaskProgressStrictV1` directly instead, as `resolveTask` and
+ * `runRelease` do.
+ */
+async function readTaskProgressAdvisoryV1(
+  folderUri: vscode.Uri
+): Promise<TaskProgress | undefined> {
+  const strict = await readTaskProgressStrictV1(folderUri, {
+    expectedTaskFolder: path.basename(folderUri.fsPath),
+  });
+  if (strict.ok) {
+    return strict.decoded.progress;
+  }
+  if (strict.code !== "missing") {
+    NotificationRouter.showError(
+      `Task progress for ${path.basename(folderUri.fsPath)} could not be read (${strict.code}) and needs recovery: ${strict.reason}`
+    );
+    throw new Error(
+      `Task progress recovery required for ${path.basename(folderUri.fsPath)} (${strict.code}): ${strict.reason}`
+    );
+  }
+  return undefined;
 }
 
 function getWorkspaceRoot(): vscode.WorkspaceFolder | undefined {
@@ -743,7 +853,7 @@ function getWorkspaceRoot(): vscode.WorkspaceFolder | undefined {
  * (e.g. tasks created before the ownership field was introduced).
  */
 function resolveOwnerWorkspace(
-  progress: NonNullable<Awaited<ReturnType<typeof readTaskProgress>>>
+  progress: TaskProgress
 ): vscode.WorkspaceFolder | undefined {
   const persistedRoot = progress.ownership?.workspaceRoot;
   if (persistedRoot) {
@@ -789,7 +899,7 @@ async function getUnrelatedWorkspaceChanges(
   cwd: string,
   taskFolderUri: vscode.Uri
 ): Promise<string[]> {
-  const progress = await readTaskProgress(taskFolderUri).catch(() => undefined);
+  const progress = await readTaskProgressAdvisoryV1(taskFolderUri);
   const taskRelative = path.relative(cwd, taskFolderUri.fsPath).replace(/\\/g, "/");
   const relatedPaths = new Set(
     (progress?.implReviewFiles ?? []).map((file) => file.replace(/\\/g, "/"))
@@ -1108,14 +1218,14 @@ async function runAiToFile(options: {
             // published. Skipped entirely for callers with no review-attempt
             // concept (reviewAttemptId absent). Only a SUCCESSFUL read
             // naming a different attempt counts as supersession —
-            // readTaskProgress returns undefined on any read/parse failure
-            // (plausible mid-retry-sequence, e.g. racing a concurrent
+            // readTaskProgressAdvisoryV1 returns undefined on any read/decode
+            // failure (plausible mid-retry-sequence, e.g. racing a concurrent
             // patchTaskProgress read-modify-write on Windows), which is
             // missing evidence, not proof a newer attempt exists; treating
             // it as supersession would abandon every remaining backup and
             // tell the user a newer attempt started when none did.
             if (options.reviewAttemptId) {
-              const currentProgress = await readTaskProgress(options.taskFolderUri);
+              const currentProgress = await readTaskProgressAdvisoryV1(options.taskFolderUri);
               if (currentProgress && currentProgress.reviewAttemptId !== options.reviewAttemptId) {
                 supersededDuringRetry = true;
                 break;
@@ -1191,7 +1301,7 @@ async function runAiToFile(options: {
             // review artifact, but it cannot undo an earlier fallback-state
             // write made by this superseded attempt.
             if (options.reviewAttemptId) {
-              const currentProgress = await readTaskProgress(options.taskFolderUri);
+              const currentProgress = await readTaskProgressAdvisoryV1(options.taskFolderUri);
               if (currentProgress && currentProgress.reviewAttemptId !== options.reviewAttemptId) {
                 supersededDuringRetry = true;
                 break;
@@ -1339,11 +1449,11 @@ async function setStage(
   folderUri: vscode.Uri,
   newStage: TaskStage
 ): Promise<void> {
-  await patchTaskProgress(folderUri, (current) => {
+  await patchTaskProgressStrictV1(folderUri, (current) => {
     if (current.currentStage === newStage) {
       return current;
     }
-    return updateTaskProgressStage(current, newStage);
+    return { ...current, currentStage: newStage };
   });
 }
 
@@ -1727,7 +1837,7 @@ async function handleReviewRoutingOutcome(options: {
   const { extensionUri, folderUri, workspaceUri, targetStage, variables, reviewAttemptId, content, score, threshold, cancellationToken } = options;
   try {
     const blockers = parseReviewBlockers(content);
-    const progressBefore = await readTaskProgress(folderUri);
+    const progressBefore = await readTaskProgressAdvisoryV1(folderUri);
     if (!progressBefore) {
       return { escalated: false };
     }
@@ -1739,7 +1849,7 @@ async function handleReviewRoutingOutcome(options: {
       blockerCount: blockers.length,
       taskFixableCount: blockers.filter((b) => b.resolver === "task-fixable").length,
     };
-    const updated = await patchTaskProgress(folderUri, (current) =>
+    const updated = await patchTaskProgressStrictV1(folderUri, (current) =>
       appendReviewScoreHistory(current, historyEntry)
     );
     if (!updated) {
@@ -1840,187 +1950,60 @@ async function handleReviewRoutingOutcome(options: {
  *     executeImplementationRun writes the run summary back here. The two
  *     variables therefore always carry distinct content.
  *
- *   Legacy tasks that still have only `implementation.md` are handled via
- *   `materializeCanonicalIfNeeded`: the legacy file is copied to plan-final.md
- *   before the review starts, so subsequent reads always see the canonical
- *   path. This mirrors the same migration path used by generateImplementationWithAI
- *   and runImplementationWithAI.
+ *   Legacy tasks that still have only `implementation.md` are handled with a
+ *   read-only canonical-then-legacy fallback read — plan-final.md is never
+ *   materialized here as a side effect of preparing a review prompt, so a
+ *   review that is cancelled, fails, or returns questions leaves the
+ *   implementation artifact byte-identical. (generateImplementationWithAI
+ *   uses the same read-only fallback for the same reason; only the
+ *   edit-capable, still-gated applyImplementationReviewWithAI path uses the
+ *   writing `materializeCanonicalIfNeeded`.)
  */
-export async function runReviewForFolder(
-  extensionUri: vscode.Uri,
-  folderUri: vscode.Uri,
-  workspaceRoot: vscode.WorkspaceFolder,
-  currentStage: TaskStage,
-  _skipOverwriteConfirmation: boolean,  // kept for API compat, always skipped now
-  options: {
-    preserveActiveFallback?: boolean;
-    /**
-     * The tracked operation this review runs under. The auto-advance tail
-     * below registers its follow-up review as a CHILD of it — claiming a new
-     * exclusive lock there while the caller still holds this one would refuse
-     * itself and surface a spurious "Review is already in progress" warning
-     * instead of starting the next stage's review (the reported auto-advance
-     * defect).
-     */
-    operation?: TaskOperationHandle;
-  } = {}
+/** Context {@link handleReviewOutcomeV1} needs to route a `review.v1` outcome
+ * (from either the initial run or an explicit Chat Resume) through stage
+ * advancement, score-based auto-advance/escalation, and follow-up dispatch. */
+interface ReviewOutcomeContextV1 {
+  extensionUri: vscode.Uri;
+  folderUri: vscode.Uri;
+  workspaceUri: vscode.Uri;
+  currentStage: TaskStage;
+  targetStage: TaskStage;
+  reviewUri: vscode.Uri;
+  variables: Record<string, string>;
+  reviewAttemptId: string;
+  operation?: TaskOperationHandle;
+  chatViewProvider?: ChatViewProvider;
+}
+
+/**
+ * Shared `review.v1` outcome handler: stage advancement, score-based
+ * auto-advance/escalation/second-opinion routing, follow-up review/
+ * implementation dispatch, Chat question routing, and Publish nudges.
+ *
+ * Used by BOTH the initial run (runReviewForFolder, immediately after
+ * `coordinator.executeAction`) and explicit Chat Resume
+ * (resumeReviewInteractionV1, immediately after `coordinator.resumeAction`) —
+ * a resumed review that completes must reach the exact same routing/
+ * escalation/follow-up logic as an initial review that completes, not a bare
+ * same-stage no-op advance.
+ */
+async function handleReviewOutcomeV1(
+  outcome: TaskActionOutcomeV1,
+  ctx: ReviewOutcomeContextV1
 ): Promise<void> {
-  const targetStage = REVIEW_TARGETS[currentStage];
-  const reviewUri = targetStage && artifactUri(folderUri, targetStage);
-  if (!targetStage || !reviewUri) {
-    return;
-  }
-
-  const variables: Record<string, string> = {};
-  const isPlanReview = isPlanReviewStage(targetStage);
-  const previousReview =
-    currentStage === targetStage
-      ? await readPreviousReviewForRereview(reviewUri)
-      : undefined;
-  const templateFile = selectReviewPromptTemplate(
-    targetStage,
-    currentStage,
-    previousReview
-  );
-  if (!templateFile) {
-    return;
-  }
-  if (previousReview !== undefined) {
-    variables.previousReview = previousReview;
-  }
-
-  if (isPlanReview) {
-    const planUri = await resolveCurrentPlanUri(folderUri);
-    const planContent = await readNonEmptyText(planUri);
-    if (!planContent) {
-      NotificationRouter.showWarning(
-        "No plan found (or it is empty). Generate or write a plan first."
-      );
-      return;
-    }
-    variables.plan = planContent;
-  } else {
-    // Implementation reviews need two distinct artifacts:
-    //
-    //   {{plan}} — the plan the implementation was supposed to follow.
-    //     Source: plan.md (resolveCurrentPlanUri), NOT plan-final.md.
-    //     Using plan-final.md here would inject implementation notes into
-    //     both slots and the reviewer would compare the same text against
-    //     itself.
-    //
-    //   {{implementation}} — the run summary / implementation notes.
-    //     Source: plan-final.md (getCanonicalImplementationUri).
-    //     executeImplementationRun writes the summary here on completion.
-    //
-    //   Legacy tasks (implementation.md present, plan-final.md absent):
-    //     materializeCanonicalIfNeeded copies implementation.md → plan-final.md
-    //     so the canonical path always exists after this point. This mirrors
-    //     the same migration used by generateImplementationWithAI and
-    //     runImplementationWithAI.
-
-    const planUri = await resolveCurrentPlanUri(folderUri);
-    const planContent = await readNonEmptyText(planUri);
-    if (!planContent) {
-      NotificationRouter.showWarning(
-        "No plan found (or it is empty). Generate or write a plan before reviewing implementation."
-      );
-      return;
-    }
-
-    // Materialize canonical plan-final.md from legacy implementation.md if needed.
-    let canonicalImplUri: vscode.Uri;
-    try {
-      canonicalImplUri = await materializeCanonicalIfNeeded(folderUri);
-    } catch {
-      NotificationRouter.showWarning(
-        "No implementation notes found (plan-final.md is missing or empty). " +
-          "Run the implementation step first."
-      );
-      return;
-    }
-
-    const implementationContent = await readNonEmptyText(canonicalImplUri);
-    if (!implementationContent) {
-      NotificationRouter.showWarning(
-        "No implementation notes found (plan-final.md is missing or empty). " +
-          "Run the implementation step first."
-      );
-      return;
-    }
-
-    variables.plan = planContent;
-    variables.implementation = implementationContent;
-    variables.verifiedChecks = await buildVerifiedChecksVariable(folderUri, undefined, options.operation?.token);
-  }
-
-  let contextPackContent: string;
-  if (isPlanReview) {
-    const contextPackUri = await writeContextPack(folderUri, workspaceRoot.uri, false);
-    contextPackContent = new TextDecoder().decode(
-      await vscode.workspace.fs.readFile(contextPackUri)
-    );
-  } else {
-    const taskProgress = await readTaskProgress(folderUri);
-    const { contextPackUri, isFallback } = await writeImplReviewContextPack(
-      folderUri,
-      workspaceRoot.uri,
-      taskProgress?.implReviewFiles
-    );
-    if (isFallback) {
-      NotificationRouter.showWarning(
-        "No tracked implementation file set found for this task. " +
-          "The review will be based on currently open editors. " +
-          "For best results, open the files you changed before running the review."
-      );
-    }
-    contextPackContent = new TextDecoder().decode(
-      await vscode.workspace.fs.readFile(contextPackUri)
-    );
-  }
-  variables.contextPack = contextPackContent;
-
-  // Claim the stage before starting the provider call. The token is checked
-  // again by the transition CAS, so a late result can never advance a newer
-  // run — passed through to runAiToFile as reviewAttemptId as well, which
-  // additionally re-checks it between content-validation backup retries so a
-  // superseded attempt stops spending quota on backups well before it would
-  // eventually lose that final CAS anyway.
-  const reviewAttemptId = crypto.randomUUID();
-  const claimed = await claimReviewAttempt(folderUri, reviewAttemptId);
-  if (!claimed) return;
-
-  // Review generation uses the review-stage model (no executionStage override).
-  // Only apply flows separate logStage from executionStage.
-  let generatedReviewContent: string | undefined;
-  const reviewWritten = await runAiToFile({
+  const {
     extensionUri,
-    taskFolderUri: folderUri,
-    workspaceUri: workspaceRoot.uri,
-    logStage: targetStage,
-    templateFile,
+    folderUri,
+    workspaceUri,
+    currentStage,
+    targetStage,
+    reviewUri,
     variables,
-    outputFileUri: reviewUri,
-    progressAction: `Reviewing ${STAGE_DISPLAY_NAMES[targetStage]}`,
-    outputLabel: STAGE_ARTIFACT_FILENAMES[targetStage] ?? "review",
-    validateOutput: validateReviewOutput,
-    promoteOutput: false,
-    onValidatedOutput: (content) => { generatedReviewContent = content; },
-    preserveActiveFallback: options.preserveActiveFallback,
     reviewAttemptId,
-  });
-
-  if (reviewWritten) {
-    // Stage the artifact first. A unique temporary file prevents a stale
-    // review from touching the accepted artifact while it is competing for
-    // the attempt CAS. The rename itself is passed as advanceStage's
-    // publishArtifact side effect, so it runs atomically with the CAS check
-    // under the task lock: a newer review attempt can only claim and publish
-    // strictly before or after this attempt's whole CAS+publish, never in
-    // between. Doing the rename here, unlocked and after the fact, allowed a
-    // slower stale attempt to pass its own CAS and then clobber a faster
-    // attempt's already-published artifact.
-    const stagedReviewUri = vscode.Uri.file(`${reviewUri.fsPath}.attempt-${reviewAttemptId}.tmp`);
-    await vscode.workspace.fs.writeFile(stagedReviewUri, new TextEncoder().encode(generatedReviewContent ?? ""));
+    operation,
+    chatViewProvider,
+  } = ctx;
+  if (outcome.kind === "completed") {
     let transitionToTarget: Awaited<ReturnType<typeof advanceStage>>;
     try {
       transitionToTarget = await advanceStage(
@@ -2029,41 +2012,15 @@ export async function runReviewForFolder(
         targetStage,
         false,
         "review-run",
-        false,
-        reviewAttemptId,
-        async () => {
-          await backupReviewUnlessStale(reviewUri);
-          await vscode.workspace.fs.rename(stagedReviewUri, reviewUri, { overwrite: true });
-        }
+        false
       );
     } catch (error) {
-      // A stale/rejected CAS (a newer attempt already owns the stage) or a
-      // rename failure both throw before progress is ever written, so there
-      // is nothing to revert — just discard this attempt's orphaned staged
-      // file and tell the user, instead of leaving the failure silent.
-      await vscode.workspace.fs.delete(stagedReviewUri).then(
-        () => undefined,
-        () => undefined
-      );
       const message = error instanceof Error ? error.message : String(error);
-      const isPublishReview = targetStage === "publish";
-      NotificationRouter.showWarning(
-        `Review was generated but not published: ${message}` +
-          (isPublishReview ? " Publish manually once you're satisfied." : ""),
-        undefined,
-        undefined,
-        undefined,
-        isPublishReview
-          ? {
-              command: "vs-code-ai-helper.commitAndPushTask",
-              title: "Publish Anyway",
-              args: [{ taskFolderPath: folderUri.fsPath }],
-            }
-          : undefined
-      );
+      NotificationRouter.showWarning(`Review was generated but stage could not advance: ${message}`);
       return;
     }
-    if (transitionToTarget?.persisted && generatedReviewContent !== undefined) {
+    if (transitionToTarget?.persisted) {
+      await safeOpenTextDocument(reviewUri, STAGE_ARTIFACT_FILENAMES[targetStage]);
       try {
         const contentBytes = await vscode.workspace.fs.readFile(reviewUri);
         const content = new TextDecoder().decode(contentBytes);
@@ -2084,14 +2041,14 @@ export async function runReviewForFolder(
         const { escalated } = await handleReviewRoutingOutcome({
           extensionUri,
           folderUri,
-          workspaceUri: workspaceRoot.uri,
+          workspaceUri,
           targetStage,
           variables,
           reviewAttemptId,
           content,
           score,
           threshold: autoAdvanceThreshold,
-          cancellationToken: options.operation?.token,
+          cancellationToken: operation?.token,
         });
         // Publish has no further stage to auto-advance into (see the `next`
         // block below), so this is the only notification a Publish review
@@ -2155,7 +2112,7 @@ export async function runReviewForFolder(
             // may pause the task specifically to stop automation. Passing a
             // stale/hardcoded "not paused" here would let shouldAutoReview
             // fire anyway even though the task is now paused.
-            const freshProgressForAdvance = await readTaskProgress(folderUri);
+            const freshProgressForAdvance = await readTaskProgressAdvisoryV1(folderUri);
             const isPausedForAdvance = freshProgressForAdvance?.status === "paused";
             const transition = await advanceStage(folderUri, targetStage, next, isPausedForAdvance, "auto-advance", true, reviewAttemptId, publishArtifact);
             if (transition?.persisted) {
@@ -2170,7 +2127,7 @@ export async function runReviewForFolder(
                 next,
                 isAutoImplementAfterReviewEnabled(),
                 folderUri.fsPath,
-                options.operation
+                operation
               );
               if (!automaticImplementationScheduled && next === "impl") {
                 NotificationRouter.showInformation(
@@ -2226,16 +2183,16 @@ export async function runReviewForFolder(
                 // root operation, nothing else can be concurrently executing
                 // a conflicting review — and a still-pending "auto-review"
                 // claim can only be deferred waiting on an operation handle
-                // it was given, which (options.operation being locally
-                // scoped, never published anywhere else) only our own
-                // ancestor call chain could have obtained. Leave a claim
-                // alone whenever this can't be established (e.g. invoked
-                // directly/manually with no operation handle) — the existing
-                // duplicate-chain guard must keep protecting a genuinely
-                // separate pending chain in that case.
+                // it was given, which (`operation` being locally scoped,
+                // never published anywhere else) only our own ancestor call
+                // chain could have obtained. Leave a claim alone whenever
+                // this can't be established (e.g. invoked directly/manually
+                // with no operation handle) — the existing duplicate-chain
+                // guard must keep protecting a genuinely separate pending
+                // chain in that case.
                 if (
-                  options.operation &&
-                  taskOperations.rootOperationIdFor(folderUri.fsPath) === options.operation.id
+                  operation &&
+                  taskOperations.rootOperationIdFor(folderUri.fsPath) === operation.id
                 ) {
                   releaseAutomationChain(folderUri.fsPath, "auto-review");
                 }
@@ -2248,7 +2205,7 @@ export async function runReviewForFolder(
                     taskKey: folderUri.fsPath,
                     chainId: "auto-review",
                   },
-                  options.operation
+                  operation
                 );
                 if (next === "publish") {
                   // If the shared "auto-review" chainId drops this dispatch
@@ -2351,18 +2308,46 @@ export async function runReviewForFolder(
       }
     } else {
       // advanceStage can resolve undefined without throwing — distinct from
-      // the stale-CAS/rename-failure case above (which throws and is already
-      // handled by the surrounding catch) — when patchTaskProgress could not
-      // read task-progress.json at write time. Falling through silently here
-      // left the user with no indication the review artifact/stage
-      // transition failed to persist.
+      // the throwing case above (already handled by the surrounding catch) —
+      // when patchTaskProgress could not read task-progress.json at write
+      // time. Falling through silently here left the user with no
+      // indication the review artifact/stage transition failed to persist.
       NotificationRouter.showWarning(
         `The review for ${folderUri.fsPath} was generated but could not be recorded. Try running the review again.`
       );
     }
+  } else if (outcome.kind === "questions") {
+    if (chatViewProvider) {
+      const orchestrator = getProductionActionConversationOrchestratorV1();
+      const record = await orchestrator.getRecord({
+        operationId: outcome.correlation.operationId,
+        interactionId: outcome.interactionId,
+        taskBindingId: outcome.correlation.taskBindingId,
+        chatDocumentId: outcome.correlation.chatDocumentId,
+        sourceAttemptId: outcome.correlation.attemptId,
+      });
+      if (record) {
+        await chatViewProvider.askInteraction({
+          canonicalId: folderUri.fsPath,
+          taskFolderPath: folderUri.fsPath,
+          stage: record.stage,
+          interactionId: record.interactionId,
+          operationId: record.correlation.operationId,
+          actionKey: record.correlation.actionKey,
+          sourceAttemptId: record.correlation.attemptId,
+          // safe: this call site only loads a record already known (via a
+          // "questions" outcome or an existing unresolved interaction) to
+          // carry posted questions — never invocationPending.
+          questions: record.questions!,
+          binding: {
+            taskBindingId: record.correlation.taskBindingId,
+            chatDocumentId: record.correlation.chatDocumentId,
+          },
+        });
+      }
+    }
   } else if (targetStage === "publish") {
-    // The Publish review failed, was cancelled, or was stalled (runAiToFile
-    // already surfaced the specific error/cancellation message). Give the
+    // The Publish review failed, was cancelled, or was stalled. Give the
     // user a one-click path to publish anyway instead of only a dead-end
     // error.
     NotificationRouter.showWarning(
@@ -2378,6 +2363,209 @@ export async function runReviewForFolder(
       }
     );
   }
+}
+
+export async function runReviewForFolder(
+  extensionUri: vscode.Uri,
+  folderUri: vscode.Uri,
+  workspaceRoot: vscode.WorkspaceFolder,
+  currentStage: TaskStage,
+  _skipOverwriteConfirmation: boolean,  // kept for API compat, always skipped now
+  options: {
+    preserveActiveFallback?: boolean;
+    /**
+     * The tracked operation this review runs under. The auto-advance tail
+     * below registers its follow-up review as a CHILD of it — claiming a new
+     * exclusive lock there while the caller still holds this one would refuse
+     * itself and surface a spurious "Review is already in progress" warning
+     * instead of starting the next stage's review (the reported auto-advance
+     * defect).
+     */
+    operation?: TaskOperationHandle;
+    /** Routes `review.v1` structured questions into Chat With AI. */
+    chatViewProvider?: ChatViewProvider;
+  } = {}
+): Promise<void> {
+  const targetStage = REVIEW_TARGETS[currentStage];
+  const reviewUri = targetStage && artifactUri(folderUri, targetStage);
+  if (!targetStage || !reviewUri) {
+    return;
+  }
+
+  const variables: Record<string, string> = {};
+  const isPlanReview = isPlanReviewStage(targetStage);
+  const previousReview =
+    currentStage === targetStage
+      ? await readPreviousReviewForRereview(reviewUri)
+      : undefined;
+  const templateFile = selectReviewPromptTemplate(
+    targetStage,
+    currentStage,
+    previousReview
+  );
+  if (!templateFile) {
+    return;
+  }
+  if (previousReview !== undefined) {
+    variables.previousReview = previousReview;
+  }
+
+  if (isPlanReview) {
+    const planUri = await resolveCurrentPlanUri(folderUri);
+    const planContent = await readNonEmptyText(planUri);
+    if (!planContent) {
+      NotificationRouter.showWarning(
+        "No plan found (or it is empty). Generate or write a plan first."
+      );
+      return;
+    }
+    variables.plan = planContent;
+  } else {
+    // Implementation reviews need two distinct artifacts:
+    //
+    //   {{plan}} — the plan the implementation was supposed to follow.
+    //     Source: plan.md (resolveCurrentPlanUri), NOT plan-final.md.
+    //     Using plan-final.md here would inject implementation notes into
+    //     both slots and the reviewer would compare the same text against
+    //     itself.
+    //
+    //   {{implementation}} — the run summary / implementation notes.
+    //     Source: plan-final.md (getCanonicalImplementationUri).
+    //     executeImplementationRun writes the summary here on completion.
+    //
+    //   Legacy tasks (implementation.md present, plan-final.md absent):
+    //     materializeCanonicalIfNeeded copies implementation.md → plan-final.md
+    //     so the canonical path always exists after this point. This mirrors
+    //     the same migration used by generateImplementationWithAI and
+    //     runImplementationWithAI.
+
+    const planUri = await resolveCurrentPlanUri(folderUri);
+    const planContent = await readNonEmptyText(planUri);
+    if (!planContent) {
+      NotificationRouter.showWarning(
+        "No plan found (or it is empty). Generate or write a plan before reviewing implementation."
+      );
+      return;
+    }
+
+    // Read-only: never materialize plan-final.md from legacy implementation.md
+    // here. This function only reads content to build a review prompt — a
+    // review that is later cancelled, fails, or returns questions must leave
+    // the implementation artifact byte-identical. Eagerly writing plan-final.md
+    // as a side effect of preparing a prompt was the same defect already fixed
+    // in generateImplementationWithAI; the canonical-vs-legacy fallback read
+    // mirrors that fix instead of reusing the writing materializeCanonicalIfNeeded.
+    let implementationContent = await readNonEmptyText(getCanonicalImplementationUri(folderUri));
+    if (!implementationContent) {
+      implementationContent = await readNonEmptyText(getLegacyImplementationUri(folderUri));
+    }
+    if (!implementationContent) {
+      NotificationRouter.showWarning(
+        "No implementation notes found (plan-final.md is missing or empty). " +
+          "Run the implementation step first."
+      );
+      return;
+    }
+
+    variables.plan = planContent;
+    variables.implementation = implementationContent;
+    variables.verifiedChecks = await buildVerifiedChecksVariable(folderUri, undefined, options.operation?.token);
+  }
+
+  let contextPackContent: string;
+  if (isPlanReview) {
+    const contextPackUri = await writeContextPack(folderUri, workspaceRoot.uri, false);
+    contextPackContent = new TextDecoder().decode(
+      await vscode.workspace.fs.readFile(contextPackUri)
+    );
+  } else {
+    const taskProgress = await readTaskProgressAdvisoryV1(folderUri);
+    const { contextPackUri, isFallback } = await writeImplReviewContextPack(
+      folderUri,
+      workspaceRoot.uri,
+      taskProgress?.implReviewFiles
+    );
+    if (isFallback) {
+      NotificationRouter.showWarning(
+        "No tracked implementation file set found for this task. " +
+          "The review will be based on currently open editors. " +
+          "For best results, open the files you changed before running the review."
+      );
+    }
+    contextPackContent = new TextDecoder().decode(
+      await vscode.workspace.fs.readFile(contextPackUri)
+    );
+  }
+  variables.contextPack = contextPackContent;
+
+  // Claim the stage before starting the provider call. The token is checked
+  // again by the transition CAS, so a late result can never advance a newer
+  // run — passed through to runAiToFile as reviewAttemptId as well, which
+  // additionally re-checks it between content-validation backup retries so a
+  // superseded attempt stops spending quota on backups well before it would
+  // eventually lose that final CAS anyway.
+  const reviewAttemptId = crypto.randomUUID();
+  const claimed = await claimReviewAttempt(folderUri, reviewAttemptId);
+  if (!claimed) return;
+
+  assertLegacyAiRouteAllowedV0("review.v1");
+
+  const prompt = await renderPromptTemplate(extensionUri, templateFile, variables);
+
+  const rootId = ensureWorkflowTaskFolderRootV1(folderUri.fsPath);
+  const verifiedBindingId = getVerifiedTaskBindingIdV1(rootId);
+  if (!verifiedBindingId) {
+    throw new Error("Task ownership binding could not be verified.");
+  }
+  const chatIdentity = await readChatDocumentIdentityV1(folderUri.fsPath, folderUri.fsPath);
+  const chatDocumentId = chatIdentity?.documentId ?? allocateHex128IdV1();
+
+  const { modelId } = await resolveFreshModelForStage(folderUri, targetStage);
+  if (!modelId) {
+    NotificationRouter.showWarning("No model is configured for this stage.");
+    return;
+  }
+
+  const coordinator = createProductionTaskActionCoordinatorV1({
+    workspaceCwd: workspaceRoot.uri.fsPath,
+    resolveStagePrimaryModel: () => ({ modelId, stage: targetStage }),
+  });
+
+  const relativePath = path.relative(folderUri.fsPath, reviewUri.fsPath) || STAGE_ARTIFACT_FILENAMES[targetStage] || "review.md";
+  const targetLocator = { rootId, relativePath };
+  const reviewFileStore = getWorkflowFileStoreV1();
+  const reviewStatResult = await reviewFileStore.stat(targetLocator);
+  const reviewBaselineRevision =
+    reviewStatResult.kind === "ok" && reviewStatResult.value.kind === "file"
+      ? reviewStatResult.value.revision
+      : undefined;
+  const validatedInput: ReviewActionInputV1 = {
+    prompt,
+    targetLocator,
+    ...(reviewBaselineRevision !== undefined ? { baselineRevision: reviewBaselineRevision } : {}),
+  };
+
+  const outcome = await coordinator.executeAction({
+    actionKey: REVIEW_ACTION_KEY_V1,
+    taskBinding: { taskBindingId: verifiedBindingId, chatDocumentId },
+    taskStatus: "active",
+    taskStage: currentStage,
+    rawInput: validatedInput,
+    cancellationToken: options.operation?.token ?? new vscode.CancellationTokenSource().token,
+  });
+
+  await handleReviewOutcomeV1(outcome, {
+    extensionUri,
+    folderUri,
+    workspaceUri: workspaceRoot.uri,
+    currentStage,
+    targetStage,
+    reviewUri,
+    variables,
+    reviewAttemptId,
+    operation: options.operation,
+    chatViewProvider: options.chatViewProvider,
+  });
 }
 
 /**
@@ -2473,7 +2661,8 @@ async function markReviewArtifactStale(
 export async function runReviewWithAI(
   extensionUri: vscode.Uri,
   context: vscode.ExtensionContext,
-  arg?: ReviewCommandArg
+  arg?: ReviewCommandArg,
+  chatViewProvider?: ChatViewProvider
 ): Promise<void> {
   assertLegacyAiRouteAllowedV0("review.v1");
   // ── Pre-flight workspace guard ────────────────────────────────────────────
@@ -2547,7 +2736,7 @@ export async function runReviewWithAI(
         workspaceRoot,
         resolved.progress.currentStage,
         true,
-        { operation: op }
+        { operation: op, chatViewProvider }
       )
   );
 }
@@ -2573,10 +2762,16 @@ export async function applyReviewWithAI(
   options: ApplyReviewOptions = {}
 ): Promise<void> {
   assertLegacyAiRouteAllowedV0("applyReview.v1");
-  // ── Pre-flight workspace guard ────────────────────────────────────────────
-  if ((vscode.workspace.workspaceFolders ?? []).length === 0) {
-    NotificationRouter.showError(
-      "No workspace folder open. Please open a folder first."
+
+  const targetStage =
+    arg && typeof arg === "object" && "task" in arg && arg.task && typeof arg.task === "object" && "progress" in arg.task && arg.task.progress && typeof arg.task.progress === "object" && "currentStage" in arg.task.progress
+      ? (arg.task.progress as { currentStage?: string }).currentStage
+      : undefined;
+
+  if (targetStage && IMPL_REVIEW_STAGES.includes(targetStage as TaskStage)) {
+    assertLegacyAiRouteAllowedV0("applyReviewEdit.v1");
+    NotificationRouter.showWarning(
+      "Apply Review with AI is only for plan review stages. For implementation review stages, use Apply Review Edit with AI."
     );
     return;
   }
@@ -2584,7 +2779,8 @@ export async function applyReviewWithAI(
   // ── Malformed-arg guard ───────────────────────────────────────────────────
   // Catch stale or untyped callers that pass an unsupported arg shape (e.g.
   // { canonicalId } without taskFolderPath, or { taskFolderPath: undefined },
-  // or { task: {} } without folderUri, via `as any` or untyped JS).
+  // or { task: {} } without folderUri, via `as any` or untyped JS). Pure
+  // shape check on `arg` itself — no I/O — so it belongs before any read.
   // Primitives ("x", 42, true) fall through to normalizeReviewArg safely.
   if (isMalformedReviewArg(arg as ReviewCommandArg | Record<string, unknown>)) {
     NotificationRouter.showError(
@@ -2594,15 +2790,24 @@ export async function applyReviewWithAI(
     return;
   }
 
-  // ── Consent gate ─────────────────────────────────────────────────────────
-  const consented = await ensureAiConsent(context);
-  if (!consented) {
-    return;
+  const node = normalizeReviewArg(arg);
+
+  if (node.taskFolderPath) {
+    const strictCheck = await readTaskProgressStrictV1(vscode.Uri.file(node.taskFolderPath), {
+      expectedTaskFolder: path.basename(node.taskFolderPath),
+    });
+    if (strictCheck.ok && IMPL_REVIEW_STAGES.includes(strictCheck.decoded.progress.currentStage)) {
+      assertLegacyAiRouteAllowedV0("applyReviewEdit.v1");
+      NotificationRouter.showWarning(
+        "Apply Review with AI is only for plan review stages. For implementation review stages, use Apply Review Edit with AI."
+      );
+      return;
+    }
   }
 
   const resolved = await resolveTask(
-    normalizeReviewArg(arg),
-    REVIEW_STAGES,
+    node,
+    PLAN_REVIEW_STAGES,
     "Apply Review with AI",
     context
   );
@@ -2611,6 +2816,12 @@ export async function applyReviewWithAI(
   }
   if (resolved.progress.status === "paused") {
     NotificationRouter.showInformation("This task is paused. Resume it before applying a review.");
+    return;
+  }
+
+  // ── Consent gate ─────────────────────────────────────────────────────────
+  const consented = await ensureAiConsent(context);
+  if (!consented) {
     return;
   }
 
@@ -2649,71 +2860,7 @@ export async function applyReviewWithAI(
       return;
     }
 
-    const isPlanReview = isPlanReviewStage(stage);
 
-    if (!isPlanReview) {
-      // Child operation (C1 nesting): while the fix is being implemented the
-      // stage-row spinner sits on the Implementation row, not the review row.
-      const implementSucceeded = await runTrackedOperation(
-        lockKey,
-        { parent: op, label: "Applying implementation review", stage: "impl", kind: "run-implementation" },
-        (child) =>
-          applyImplementationReviewWithAI(
-            extensionUri,
-            resolved.folderUri,
-            workspaceRoot,
-            stage,
-            reviewContent,
-            {
-              skipPreRunSafetyCheck: options.skipImplementationSafetyCheck,
-              preserveActiveFallback: options.preserveActiveFallback,
-              parentOperation: child,
-              // applyReviewWithAI's own call ("applyReview.v1", already
-              // migrated) — must NOT get the "implementation.v1" bootstrap
-              // exemption.
-              isImplementationV1Bootstrap: false,
-            }
-          )
-      );
-      if (implementSucceeded) {
-        // Re-review after applying (no confirmation, no stage change).
-        // Deliberately inline here, nested under `op` (which already holds
-        // the task's exclusive lock — C1 children never contend for it),
-        // rather than left to executeImplementationRun's own post-run
-        // auto-review dispatch: that dispatch is deferred until its
-        // (nested-child) parentOperation ends and then reacquires the lock
-        // through a fresh command — but this operation, or under Fast
-        // Forward its whole multi-attempt loop, is still holding that lock,
-        // so the dispatch is refused as busy and silently dropped, leaving
-        // the review stuck on the "Review Stale" placeholder. Mirrors the
-        // plan-review branch above.
-        await runTrackedOperation(
-          lockKey,
-          { parent: op, label: "Re-running review", stage, kind: "review" },
-          // Deferred auto-advance dispatch inside runReviewForFolder waits for
-          // `operation` to end before dispatching the next stage's command.
-          // That must be the exclusive root (`op`), not this re-review's own
-          // child handle — the child ends almost immediately (children never
-          // hold the lock), while under Fast Forward the root keeps running
-          // for further attempts. Anchoring to the child let the follow-up
-          // dispatch fire while the root still held the exclusive lock, so it
-          // was refused as busy and silently dropped.
-          () =>
-            runReviewForFolder(
-              extensionUri,
-              resolved.folderUri,
-              workspaceRoot,
-              stage,
-              true,
-              {
-                preserveActiveFallback: options.preserveActiveFallback,
-                operation: op,
-              }
-            )
-        );
-      }
-      return;
-    }
 
     const variables: Record<string, string> = {
       review: reviewContent,
@@ -2735,39 +2882,56 @@ export async function applyReviewWithAI(
     variables.contextPack = new TextDecoder().decode(
       await vscode.workspace.fs.readFile(contextPackUri)
     );
-    // Always write to the canonical plan.md
-    const outputFileUri = vscode.Uri.joinPath(resolved.folderUri, PLAN_FILENAME);
-    const templateFile = "apply-review.md";
-    const outputLabel = PLAN_FILENAME;
+    assertLegacyAiRouteAllowedV0("applyReview.v1");
 
-    // No overwrite confirmation — user triggered this deliberately.
-    // Log under the review stage label but execute with the `plan` model so
-    // the plan-rewrite uses plan-stage model configuration, not the review model.
-    // Child operation (C1 nesting): the spinner sits on the Plan row while the
-    // plan is being rewritten, then moves back to the review row below.
-    const applySucceeded = await runTrackedOperation(
-      lockKey,
-      { parent: op, label: `Applying review to ${outputLabel}`, stage: "plan", kind: "apply-review" },
-      () =>
-        runAiToFile({
-          extensionUri,
-          taskFolderUri: resolved.folderUri,
-          workspaceUri: workspaceRoot.uri,
-          logStage: stage,          // review stage — for run logs and progress labels
-          executionStage: "plan",   // plan model — for actual AI model resolution
-          templateFile,
-          variables,
-          outputFileUri,
-          progressAction: `Applying review to ${outputLabel}`,
-          outputLabel,
-          preserveActiveFallback: options.preserveActiveFallback,
-        })
-    );
+    const prompt = await renderPromptTemplate(extensionUri, "apply-review.md", variables);
 
-    if (applySucceeded) {
+    const rootId = ensureWorkflowTaskFolderRootV1(resolved.folderUri.fsPath);
+    const verifiedBindingId = getVerifiedTaskBindingIdV1(rootId);
+    if (!verifiedBindingId) {
+      throw new Error("Task ownership binding could not be verified.");
+    }
+    const chatIdentity = await readChatDocumentIdentityV1(resolved.folderUri.fsPath, resolved.folderUri.fsPath);
+    const chatDocumentId = chatIdentity?.documentId ?? allocateHex128IdV1();
+
+    const { modelId } = await resolveFreshModelForStage(resolved.folderUri, "plan");
+    if (!modelId) {
+      NotificationRouter.showWarning("No model is configured for plan stage.");
+      return;
+    }
+
+    const coordinator = createProductionTaskActionCoordinatorV1({
+      workspaceCwd: workspaceRoot.uri.fsPath,
+      resolveStagePrimaryModel: () => ({ modelId, stage: "plan" }),
+    });
+
+    const targetLocator = { rootId, relativePath: PLAN_FILENAME };
+    const applyReviewFileStore = getWorkflowFileStoreV1();
+    const applyReviewStatResult = await applyReviewFileStore.stat(targetLocator);
+    const applyReviewBaselineRevision =
+      applyReviewStatResult.kind === "ok" && applyReviewStatResult.value.kind === "file"
+        ? applyReviewStatResult.value.revision
+        : undefined;
+    const validatedInput: ApplyReviewActionInputV1 = {
+      prompt,
+      targetLocator,
+      ...(applyReviewBaselineRevision !== undefined ? { baselineRevision: applyReviewBaselineRevision } : {}),
+    };
+
+    const outcome = await coordinator.executeAction({
+      actionKey: APPLY_REVIEW_ACTION_KEY_V1,
+      taskBinding: { taskBindingId: verifiedBindingId, chatDocumentId },
+      taskStatus: "active",
+      taskStage: stage,
+      rawInput: validatedInput,
+      cancellationToken: op.token ?? new vscode.CancellationTokenSource().token,
+    });
+
+    if (outcome.kind === "completed") {
       if (reviewUri) {
         await markReviewArtifactStale(reviewUri, PLAN_FILENAME);
       }
+      await safeOpenTextDocument(vscode.Uri.joinPath(resolved.folderUri, PLAN_FILENAME), PLAN_FILENAME);
       // Re-review after applying (no confirmation, no stage change)
       await runTrackedOperation(
         lockKey,
@@ -2787,9 +2951,38 @@ export async function applyReviewWithAI(
             {
               preserveActiveFallback: options.preserveActiveFallback,
               operation: op,
+              chatViewProvider: options.chatViewProvider,
             }
           )
       );
+    } else if (outcome.kind === "questions") {
+      if (options.chatViewProvider) {
+        const orchestrator = getProductionActionConversationOrchestratorV1();
+        const record = await orchestrator.getRecord({
+          operationId: outcome.correlation.operationId,
+          interactionId: outcome.interactionId,
+          taskBindingId: outcome.correlation.taskBindingId,
+          chatDocumentId: outcome.correlation.chatDocumentId,
+          sourceAttemptId: outcome.correlation.attemptId,
+        });
+        if (record) {
+          await options.chatViewProvider.askInteraction({
+            canonicalId: resolved.folderUri.fsPath,
+            taskFolderPath: resolved.folderUri.fsPath,
+            stage: record.stage,
+            interactionId: record.interactionId,
+            operationId: record.correlation.operationId,
+            actionKey: record.correlation.actionKey,
+            sourceAttemptId: record.correlation.attemptId,
+            // safe: see the other askInteraction call sites' comment.
+            questions: record.questions!,
+            binding: {
+              taskBindingId: record.correlation.taskBindingId,
+              chatDocumentId: record.correlation.chatDocumentId,
+            },
+          });
+        }
+      }
     }
   };
 
@@ -2833,7 +3026,8 @@ export async function applyReviewWithAI(
 export async function fastForwardReviewWithAI(
   extensionUri: vscode.Uri,
   context: vscode.ExtensionContext,
-  arg?: ReviewCommandArg
+  arg?: ReviewCommandArg,
+  chatViewProvider?: ChatViewProvider
 ): Promise<void> {
   assertLegacyAiRouteAllowedV0("fastForward.v1");
   if ((vscode.workspace.workspaceFolders ?? []).length === 0) {
@@ -2919,7 +3113,7 @@ export async function fastForwardReviewWithAI(
         title: `Running initial ${STAGE_DISPLAY_NAMES[targetStage] ?? "review"} before fast-forwarding...`,
         cancellable: false,
       },
-      () => runReviewForFolder(extensionUri, resolved.folderUri, workspaceRoot, stage, true, { operation: op })
+      () => runReviewForFolder(extensionUri, resolved.folderUri, workspaceRoot, stage, true, { operation: op, chatViewProvider })
     );
     initialContent = await readNonEmptyText(reviewUri);
     if (!initialContent) {
@@ -2946,10 +3140,24 @@ export async function fastForwardReviewWithAI(
     ? getAutoAdvanceScoreThreshold()
     : getFastForwardStopLevel();
 
-  // Concrete taskFolderPath so every attempt targets this same task without
-  // resolveTask re-prompting (it already resolved the task once above).
+  // Concrete, already-resolved task node so every attempt targets this same
+  // task without resolveTask re-prompting (it already resolved the task once
+  // above). Deliberately `{ task }` rather than `{ taskFolderPath }` (plan
+  // §1.3): applyReviewWithAI's early gate check trusts an `arg.task`'s
+  // already-known `progress.currentStage` to fire the applyReviewEdit.v1
+  // gate BEFORE it performs any read of its own, whereas a `{ taskFolderPath
+  // }` arg is deliberately re-wrapped with an untrustworthy placeholder stage
+  // and must fall through to a fresh resolveTask read first. Fast Forward
+  // already holds real, just-read progress here (apply review never changes
+  // stage — the loop re-reviews without advancing), so passing it through
+  // lets the edit-eligible case (impl-review targets) gate before any read
+  // instead of after resolveTask's read inside applyReviewWithAI.
   const concreteArg: ReviewCommandArg = {
-    taskFolderPath: resolved.folderUri.fsPath,
+    task: {
+      folderUri: resolved.folderUri,
+      folderName: path.basename(resolved.folderUri.fsPath),
+      progress: resolved.progress,
+    },
   };
 
   let previousContent = initialContent;
@@ -2986,7 +3194,7 @@ export async function fastForwardReviewWithAI(
               extensionUri,
               context,
               concreteArg,
-              buildFastForwardApplyReviewOptions(attemptNumber, op)
+              buildFastForwardApplyReviewOptions(attemptNumber, op, chatViewProvider)
             );
           },
           // Escalation (see handleReviewRoutingOutcome) can now fire inside
@@ -2995,7 +3203,7 @@ export async function fastForwardReviewWithAI(
           // paused guard, review() then sees unchanged content and returns
           // null, and the loop reports "stalled" — blaming the provider for
           // a deliberate escalation it has no way to see otherwise.
-          isPaused: async () => (await readTaskProgress(resolved.folderUri))?.status === "paused",
+          isPaused: async () => (await readTaskProgressAdvisoryV1(resolved.folderUri))?.status === "paused",
           review: async () => {
             const newContent = await readNonEmptyText(reviewUri);
             if (!newContent || newContent === previousContent) {
@@ -3164,6 +3372,11 @@ async function applyImplementationReviewWithAI(
   reviewContent: string,
   options: ApplyReviewOptions & ExecuteImplementationRunOptions
 ): Promise<boolean> {
+  // Edit-capable sibling of the migrated "applyReview.v1" text route (plan
+  // §7.8 step 16, not yet landed) — gated under its own route id so
+  // enabling "applyReview.v1" for plan-review stages never implicitly
+  // unblocks implementation-review edit runs.
+  assertLegacyAiRouteAllowedV0("applyReviewEdit.v1");
   // Materialize canonical plan-final.md from legacy implementation.md if needed.
   let canonicalUri: vscode.Uri;
   try {
@@ -3254,10 +3467,6 @@ async function applyImplementationReviewWithAI(
       onWaitingForUser: options.parentOperation
         ? (w) => options.parentOperation!.setWaitingForUser(w)
         : undefined,
-      // This is applyReviewWithAI's own call ("applyReview.v1", already
-      // migrated) — must NOT get the "implementation.v1" bootstrap
-      // exemption. See the field's doc comment on ExecuteImplementationRunOptions.
-      isImplementationV1Bootstrap: false,
     }
   );
 }
@@ -3693,13 +3902,6 @@ async function handleGenerateImplementationOutcomeV1(
   let succeeded = false;
 
   if (outcome.kind === "completed") {
-    const generatedContent = await readNonEmptyText(ctx.implementationUri);
-    if (generatedContent && !generatedContent.includes(IMPLEMENTATION_CHECKLIST_MARKER)) {
-      await writeTextFile(
-        ctx.implementationUri,
-        `${IMPLEMENTATION_CHECKLIST_MARKER}\n\n${generatedContent}`
-      );
-    }
     await setStage(ctx.folderUri, "impl");
     await safeOpenTextDocument(ctx.implementationUri, "plan-final.md");
     NotificationRouter.showInformation("plan-final.md generated.");
@@ -3723,7 +3925,8 @@ async function handleGenerateImplementationOutcomeV1(
           operationId: record.correlation.operationId,
           actionKey: record.correlation.actionKey,
           sourceAttemptId: record.correlation.attemptId,
-          questions: record.questions,
+          // safe: see the other askInteraction call sites' comment.
+          questions: record.questions!,
           binding: {
             taskBindingId: record.correlation.taskBindingId,
             chatDocumentId: record.correlation.chatDocumentId,
@@ -3805,20 +4008,19 @@ export async function generateImplementationWithAI(
     lockKey,
     { label: "Generate Implementation", stage: "impl", kind: "generate-implementation", cancellable: true },
     async (op) => {
-      let planFinalUri: vscode.Uri;
-      try {
-        planFinalUri = await materializeCanonicalIfNeeded(resolved.folderUri);
-      } catch (error) {
-        NotificationRouter.showError(
-          error instanceof Error ? error.message : String(error)
-        );
-        return;
+      const implementationUri = getCanonicalImplementationUri(resolved.folderUri);
+      let planFinalContent = await readNonEmptyText(implementationUri);
+      if (!planFinalContent) {
+        const legacyUri = getLegacyImplementationUri(resolved.folderUri);
+        planFinalContent = await readNonEmptyText(legacyUri);
       }
-
-      const planFinalContent = await readNonEmptyText(planFinalUri);
+      if (!planFinalContent) {
+        const planUri = await resolveCurrentPlanUri(resolved.folderUri);
+        planFinalContent = await readNonEmptyText(planUri);
+      }
       if (!planFinalContent) {
         NotificationRouter.showWarning(
-          "No plan-final.md found. Advance to the Implementation stage first."
+          "No plan found. Advance to the Implementation stage first."
         );
         return;
       }
@@ -3836,7 +4038,6 @@ export async function generateImplementationWithAI(
         workspaceRoot.uri
       );
 
-      const implementationUri = planFinalUri;
       const prompt = await renderPromptTemplate(
         extensionUri,
         "create-implementation.md",
@@ -4147,7 +4348,6 @@ async function executeImplementationRun(
         taskFolderUri: folderUri,
         onBusyDetail: options.onBusyDetail,
         onWaitingForUser: options.onWaitingForUser,
-        isImplementationV1Bootstrap: options.isImplementationV1Bootstrap,
       });
       } finally {
         linked.dispose();
@@ -4201,19 +4401,19 @@ async function executeImplementationRun(
       );
     }
 
-    // Use patchTaskProgress to avoid overwriting unrelated fields.
-    await patchTaskProgress(folderUri, (currentProgress) => {
+    // Use patchTaskProgressStrictV1 to avoid overwriting unrelated fields.
+    await patchTaskProgressStrictV1(folderUri, (currentProgress) => {
       const alreadyAtOrPastImplementation =
         currentProgress.currentStage === "impl" ||
         isReviewStage(currentProgress.currentStage);
       const stageUpdated = alreadyAtOrPastImplementation
         ? currentProgress
-        : updateTaskProgressStage(currentProgress, "impl");
+        : { ...currentProgress, currentStage: "impl" as TaskStage };
 
       // filesChangedUnknown means THIS run's own change detection failed.
       // Leave implReviewFiles untouched rather than clearing it.
       if (!result!.filesChangedUnknown) {
-        return updateImplReviewFiles(stageUpdated, result!.filesChanged);
+        return { ...stageUpdated, implReviewFiles: result!.filesChanged };
       }
       return stageUpdated;
     });
@@ -4251,7 +4451,7 @@ async function executeImplementationRun(
     };
     if (isAutoAdvanceEnabled()) {
       try {
-        const freshProgress = await readTaskProgress(folderUri);
+        const freshProgress = await readTaskProgressAdvisoryV1(folderUri);
         if (freshProgress?.currentStage === "impl" && freshProgress.status !== "paused") {
           const transition = await advanceStage(
             folderUri,
@@ -4329,18 +4529,16 @@ export async function runImplementationWithAI(
   context: vscode.ExtensionContext,
   arg?: ReviewCommandArg
 ): Promise<void> {
-  isLegacyAiRouteDisabledV0("implementation.v1");
-  // NOTE: deliberately does NOT call throwing assertLegacyAiRouteAllowedV0("implementation.v1").
-  // "implementation.v1" is this task's own bootstrapping tool — every step of
-  // this migration (including the step that will eventually replace this
-  // action, plan.md's step 16) is implemented BY running this action. Gating
-  // it on its own not-yet-landed V1 migration is a deadlock, not a safety
-  // measure: it was briefly wired in (alongside the real step 9/10 migrations
-  // in the same round) and immediately made this action permanently
-  // unusable, blocking the only tool that could land step 16 in the first
-  // place. Leave this ungated until step 16's real coordinator replacement
-  // exists to take over — at that point THIS function is what should be
-  // deleted, not gated.
+  // "implementation.v1" remains in LEGACY_AI_ROUTE_DISABLED_V0 (plan §1.3,
+  // §8's Edit cohort) until its read-only preflight + sealed edit execution
+  // replacement lands (plan §7/§7.8, step 16). This is the real, throwing
+  // route gate — the first statement of the handler, before any
+  // task/workspace/artifact read, consent prompt, or provider selection —
+  // matching every other unmigrated edit-capable route. A prior "bootstrap"
+  // exemption called the non-throwing query here instead so this action
+  // could keep running unmigrated; that left a live, edit-capable AI route
+  // with no read-only preflight in front of it and no plan authorization.
+  assertLegacyAiRouteAllowedV0("implementation.v1");
   // ── Workspace guard ───────────────────────────────────────────────────────
   if ((vscode.workspace.workspaceFolders ?? []).length === 0) {
     NotificationRouter.showError(
@@ -4515,13 +4713,154 @@ export async function runImplementationWithAI(
         onWaitingForUser: (w) => op.setWaitingForUser(w),
         parentOperation: op,
         followUpReviewMode,
-        // This IS runImplementationWithAI's own call — "implementation.v1"'s
-        // real bootstrap invocation. See the field's doc comment on
-        // ExecuteImplementationRunOptions / runImplementationForModel.
-        isImplementationV1Bootstrap: true,
       }
     );
     }
+  );
+}
+
+/**
+ * Genuinely separate edit-root entry point for Apply Review (plan §1.3 /
+ * AC-ROUTE-01). The shared `applyReviewWithAI` above must still dynamically
+ * discover a `{ taskFolderPath }` or no-arg dispatch's stage before it knows
+ * whether it is on the text or edit branch — this command's mere existence
+ * already proves edit intent, since every caller (the impl-review-only tree
+ * menu binding; the keyboard-shortcut routers, once THEY resolve an
+ * impl-review stage) invokes it specifically because the target is
+ * edit-capable. The gate therefore runs unconditionally as the literal first
+ * statement, before any argument normalization or read whatsoever —
+ * stronger than the shared entry point can offer its own dynamically
+ * discovered dispatch shapes, and satisfies AC-ROUTE-01's "gate before every
+ * read" contract with no dependency on stage discovery.
+ *
+ * Delegates to the same underlying implementation as the text route
+ * (`applyReviewWithAI`, whose own internal `isPlanReviewStage` check remains
+ * as a defense-in-depth safety net for any caller that reaches it directly,
+ * e.g. a stale custom keybinding) — sharing behavior is not the architectural
+ * problem the plan flags; one dynamic PUBLIC COMMAND identity for both
+ * branches is. `applyReviewEdit.v1` is disabled until plan §7/§7.8's edit
+ * migration lands, so this route currently always rejects, identically to
+ * the shared command's own edit branch today.
+ */
+export async function applyReviewEditWithAI(
+  extensionUri: vscode.Uri,
+  context: vscode.ExtensionContext,
+  arg?: ReviewCommandArg,
+  options: ApplyReviewOptions = {}
+): Promise<void> {
+  assertLegacyAiRouteAllowedV0("applyReviewEdit.v1");
+
+  if (isMalformedReviewArg(arg as ReviewCommandArg | Record<string, unknown>)) {
+    NotificationRouter.showError(
+      "Apply Review: unsupported argument shape. " +
+        "Use { taskFolderPath } to target a specific task, or invoke without an argument to pick from a list."
+    );
+    return;
+  }
+
+  const node = normalizeReviewArg(arg);
+
+  const resolved = await resolveTask(
+    node,
+    IMPL_REVIEW_STAGES,
+    "Apply Review Edit with AI",
+    context
+  );
+  if (!resolved) {
+    return;
+  }
+  if (resolved.progress.status === "paused") {
+    NotificationRouter.showInformation("This task is paused. Resume it before applying a review.");
+    return;
+  }
+
+  const consented = await ensureAiConsent(context);
+  if (!consented) {
+    return;
+  }
+
+  const workspaceRoot = resolveOwnerWorkspace(resolved.progress);
+  if (!workspaceRoot) {
+    NotificationRouter.showError(
+      "Could not determine the owning workspace for this task. Please open the workspace that created it."
+    );
+    return;
+  }
+
+  const lockKey = resolved.folderUri.fsPath;
+  const stage = resolved.progress.currentStage;
+  const runApply = async (op: TaskOperationHandle): Promise<void> => {
+    const reviewUri = artifactUri(resolved.folderUri, stage);
+    const reviewContent = reviewUri && (await readNonEmptyText(reviewUri));
+    if (!reviewContent) {
+      NotificationRouter.showWarning(
+        "No review found (or it is empty). Run the review before applying it."
+      );
+      return;
+    }
+    if (isStaleReviewArtifact(reviewContent)) {
+      NotificationRouter.showWarning(
+        "The review is stale. Run the review again before applying it."
+      );
+      return;
+    }
+    const reviewValidation = validateReviewOutput(reviewContent);
+    if (!reviewValidation.valid) {
+      NotificationRouter.showWarning(
+        `The review content is invalid (${reviewValidation.reason}). Run the review again before applying it.`
+      );
+      return;
+    }
+
+    assertLegacyAiRouteAllowedV0("applyReviewEdit.v1");
+
+    const implementSucceeded = await runTrackedOperation(
+      lockKey,
+      { parent: op, label: "Applying implementation review", stage: "impl", kind: "run-implementation" },
+      (child) =>
+        applyImplementationReviewWithAI(
+          extensionUri,
+          resolved.folderUri,
+          workspaceRoot,
+          stage,
+          reviewContent,
+          {
+            skipPreRunSafetyCheck: options.skipImplementationSafetyCheck,
+            preserveActiveFallback: options.preserveActiveFallback,
+            parentOperation: child,
+          }
+        )
+    );
+    if (implementSucceeded) {
+      await runTrackedOperation(
+        lockKey,
+        { parent: op, label: "Re-running review", stage, kind: "review" },
+        () =>
+          runReviewForFolder(
+            extensionUri,
+            resolved.folderUri,
+            workspaceRoot,
+            stage,
+            true,
+            {
+              preserveActiveFallback: options.preserveActiveFallback,
+              operation: op,
+              chatViewProvider: options.chatViewProvider,
+            }
+          )
+      );
+    }
+  };
+
+  await runTrackedOperation(
+    lockKey,
+    {
+      label: "Apply Review",
+      stage,
+      kind: "apply-review",
+      cancellable: true,
+    },
+    runApply
   );
 }
 
@@ -4540,15 +4879,22 @@ export function registerReviewActionCommands(
     ),
     vscode.commands.registerCommand(
       "vs-code-ai-helper.runReviewWithAI",
-      (arg?: ReviewCommandArg) => runReviewWithAI(context.extensionUri, context, arg)
+      (arg?: ReviewCommandArg) => runReviewWithAI(context.extensionUri, context, arg, chatViewProvider)
     ),
     vscode.commands.registerCommand(
       "vs-code-ai-helper.applyReviewWithAI",
-      (arg?: ReviewCommandArg) => applyReviewWithAI(context.extensionUri, context, arg)
+      (arg?: ReviewCommandArg) =>
+        applyReviewWithAI(context.extensionUri, context, arg, { chatViewProvider })
+    ),
+    vscode.commands.registerCommand(
+      "vs-code-ai-helper.applyReviewEditWithAI",
+      (arg?: ReviewCommandArg) =>
+        applyReviewEditWithAI(context.extensionUri, context, arg, { chatViewProvider })
     ),
     vscode.commands.registerCommand(
       "vs-code-ai-helper.fastForwardReviewWithAI",
-      (arg?: ReviewCommandArg) => fastForwardReviewWithAI(context.extensionUri, context, arg)
+      (arg?: ReviewCommandArg) =>
+        fastForwardReviewWithAI(context.extensionUri, context, arg, chatViewProvider)
     ),
     vscode.commands.registerCommand(
       "vs-code-ai-helper.viewReview",
@@ -4805,8 +5151,25 @@ async function runRelease(context: vscode.ExtensionContext, arg?: TaskNodeArg): 
     NotificationRouter.showWarning("Release is available only from a task's Publish stage.");
     return;
   }
-  let progress = candidate ? await readTaskProgress(vscode.Uri.file(candidate)) : undefined;
-  if (!progress || progress.currentStage !== "publish" || progress.status === "paused") {
+  // Strict decode (plan §3.10/§3.12 Text-3 cutover): this is a top-level
+  // command gate, not a best-effort freshness check, so an unsupported/
+  // invalid document must surface as its own recovery message rather than
+  // collapsing into the same "resume the task" warning a merely-missing file
+  // gets.
+  const candidateUri = vscode.Uri.file(candidate);
+  const strictRelease = await readTaskProgressStrictV1(candidateUri, {
+    expectedTaskFolder: path.basename(candidateUri.fsPath),
+  });
+  if (!strictRelease.ok) {
+    NotificationRouter.showWarning(
+      strictRelease.code === "missing"
+        ? "Release requires an active task at the Publish stage. Resume the task first if it is paused."
+        : `Task progress could not be read (${strictRelease.code}) and needs recovery: ${strictRelease.reason}`
+    );
+    return;
+  }
+  let progress: TaskProgress = strictRelease.decoded.progress;
+  if (progress.currentStage !== "publish" || progress.status === "paused") {
     NotificationRouter.showWarning("Release requires an active task at the Publish stage. Resume the task first if it is paused.");
     return;
   }
@@ -4929,4 +5292,287 @@ async function runRelease(context: vscode.ExtensionContext, arg?: TaskNodeArg): 
   ).catch(error => {
     if (!(error instanceof ReleaseRunFailure)) { throw error; }
   });
+}
+
+/**
+ * Drive an explicit Chat Resume of a `review.v1` structured-question interaction.
+ */
+/**
+ * Read-only rebuild of the `variables` a `review.v1` prompt was built from,
+ * for use by an explicit Chat Resume. The coordinator itself replays the
+ * ORIGINAL prompt from the persisted interaction transaction's input
+ * snapshot — this is only needed so a completed Resume can feed
+ * {@link handleReviewOutcomeV1}'s escalation/second-opinion routing (which
+ * may render a fresh independent-model prompt from these same variables),
+ * mirroring the read/prep logic in runReviewForFolder minus the
+ * previousReview/template-selection concerns that only affect which
+ * template the (already-resumed) primary call rendered.
+ */
+async function buildReviewResumeVariablesV1(
+  folderUri: vscode.Uri,
+  workspaceUri: vscode.Uri,
+  targetStage: TaskStage,
+  operationToken: vscode.CancellationToken | undefined
+): Promise<{ ok: true; variables: Record<string, string> } | { ok: false; warning: string }> {
+  const variables: Record<string, string> = {};
+  const isPlanReview = isPlanReviewStage(targetStage);
+
+  const planUri = await resolveCurrentPlanUri(folderUri);
+  const planContent = await readNonEmptyText(planUri);
+  if (!planContent) {
+    return {
+      ok: false,
+      warning: isPlanReview
+        ? "No plan found (or it is empty). Generate or write a plan first."
+        : "No plan found (or it is empty). Generate or write a plan before reviewing implementation.",
+    };
+  }
+  variables.plan = planContent;
+
+  if (!isPlanReview) {
+    // Read-only fallback (see the identical rationale in runReviewForFolder):
+    // never materialize plan-final.md here as a side effect of rebuilding
+    // second-opinion prompt variables.
+    let implementationContent = await readNonEmptyText(getCanonicalImplementationUri(folderUri));
+    if (!implementationContent) {
+      implementationContent = await readNonEmptyText(getLegacyImplementationUri(folderUri));
+    }
+    if (!implementationContent) {
+      return {
+        ok: false,
+        warning: "No implementation notes found (plan-final.md is missing or empty). Run the implementation step first.",
+      };
+    }
+    variables.implementation = implementationContent;
+    variables.verifiedChecks = await buildVerifiedChecksVariable(folderUri, undefined, operationToken);
+  }
+
+  const contextPackUri = isPlanReview
+    ? await writeContextPack(folderUri, workspaceUri, false)
+    : (
+        await writeImplReviewContextPack(
+          folderUri,
+          workspaceUri,
+          (await readTaskProgressAdvisoryV1(folderUri))?.implReviewFiles
+        )
+      ).contextPackUri;
+  variables.contextPack = new TextDecoder().decode(await vscode.workspace.fs.readFile(contextPackUri));
+
+  return { ok: true, variables };
+}
+
+export async function resumeReviewInteractionV1(
+  extensionUri: vscode.Uri,
+  inventory: TaskInventory,
+  chatViewProvider: ChatViewProvider,
+  ref: ChatInteractionRefV1,
+  resumeIdempotencyId: string,
+  cancellationToken: vscode.CancellationToken
+): Promise<ChatInteractionResumeResultV1> {
+  const ownedTask = inventory.getTaskByBindingId(ref.taskBindingId);
+  if (!ownedTask) {
+    return { ok: false, reason: "the task that asked this question could not be found" };
+  }
+  const taskFolderUri = vscode.Uri.file(ownedTask.taskFolderPath);
+  const workspaceFolderUri = ownedTask.workspaceFolder;
+  if (!workspaceFolderUri) {
+    return { ok: false, reason: "the task has no owning workspace" };
+  }
+
+  const currentStage = ownedTask.progress.currentStage;
+  const targetStage = REVIEW_TARGETS[currentStage];
+  const reviewUri = targetStage && artifactUri(taskFolderUri, targetStage);
+  if (!targetStage || !reviewUri) {
+    return { ok: false, reason: "this task is no longer at a stage a review can be resumed from" };
+  }
+
+  // Model resolution must key off targetStage (the review being produced),
+  // not currentStage (the underlying task stage the review was launched
+  // from) — this mirrors the initial call in runReviewForFolder, which
+  // resolves the model for targetStage, not currentStage.
+  const model = await resolveFreshModelForStage(taskFolderUri, targetStage);
+  if (!model.modelId) {
+    return { ok: false, reason: "no model is configured for this stage" };
+  }
+  const modelId = model.modelId;
+  const coordinator = createProductionTaskActionCoordinatorV1({
+    workspaceCwd: workspaceFolderUri.fsPath,
+    resolveStagePrimaryModel: () => ({ modelId, stage: targetStage }),
+  });
+  const orchestrator = getProductionActionConversationOrchestratorV1();
+
+  const interactionRef: InteractionRefV1 = {
+    operationId: ref.operationId,
+    interactionId: ref.interactionId,
+    taskBindingId: ref.taskBindingId,
+    chatDocumentId: ref.chatDocumentId,
+    sourceAttemptId: ref.sourceAttemptId,
+  };
+
+  // A fresh attempt for this resume's own score-history/escalation
+  // bookkeeping (see the identical claim before the initial call in
+  // runReviewForFolder) — distinct from the coordinator's own fresh
+  // provider attemptId for the resumed operation.
+  const reviewAttemptId = crypto.randomUUID();
+  const claimed = await claimReviewAttempt(taskFolderUri, reviewAttemptId);
+  if (!claimed) {
+    return { ok: false, reason: "could not claim the review attempt (the task may have been paused)" };
+  }
+
+  const outcome = await coordinator.resumeAction({
+    interaction: interactionRef,
+    taskBinding: { taskBindingId: ref.taskBindingId, chatDocumentId: ref.chatDocumentId },
+    taskStatus: ownedTask.progress.status ?? "active",
+    taskStage: currentStage,
+    resumeIdempotencyId,
+    cancellationToken,
+  });
+
+  const variablesResult = await buildReviewResumeVariablesV1(
+    taskFolderUri,
+    workspaceFolderUri,
+    targetStage,
+    cancellationToken
+  );
+  if (!variablesResult.ok) {
+    NotificationRouter.showWarning(variablesResult.warning);
+  }
+
+  await handleReviewOutcomeV1(outcome, {
+    extensionUri,
+    folderUri: taskFolderUri,
+    workspaceUri: workspaceFolderUri,
+    currentStage,
+    targetStage,
+    reviewUri,
+    variables: variablesResult.ok ? variablesResult.variables : {},
+    reviewAttemptId,
+    chatViewProvider,
+  });
+
+  const after = await orchestrator.loadInteraction(interactionRef);
+  const settlement =
+    after.kind === "ok" &&
+    after.record.state === "settled" &&
+    (after.record.settlement === "resumed" || after.record.settlement === "supersededByReplacementOperation")
+      ? after.record.settlement
+      : undefined;
+
+  if (settlement === undefined) {
+    return { ok: false, reason: "Resume failed to settle the interaction" };
+  }
+  return { ok: true, settlement };
+}
+
+/**
+ * Drive an explicit Chat Resume of an `applyReview.v1` structured-question interaction.
+ */
+export async function resumeApplyReviewInteractionV1(
+  extensionUri: vscode.Uri,
+  inventory: TaskInventory,
+  chatViewProvider: ChatViewProvider,
+  ref: ChatInteractionRefV1,
+  resumeIdempotencyId: string,
+  cancellationToken: vscode.CancellationToken
+): Promise<ChatInteractionResumeResultV1> {
+  const ownedTask = inventory.getTaskByBindingId(ref.taskBindingId);
+  if (!ownedTask) {
+    return { ok: false, reason: "the task that asked this question could not be found" };
+  }
+  const taskFolderUri = vscode.Uri.file(ownedTask.taskFolderPath);
+  const workspaceFolderUri = ownedTask.workspaceFolder;
+  if (!workspaceFolderUri) {
+    return { ok: false, reason: "the task has no owning workspace" };
+  }
+
+  const model = await resolveFreshModelForStage(taskFolderUri, "plan");
+  if (!model.modelId) {
+    return { ok: false, reason: "no model is configured for plan stage" };
+  }
+  const modelId = model.modelId;
+  const coordinator = createProductionTaskActionCoordinatorV1({
+    workspaceCwd: workspaceFolderUri.fsPath,
+    resolveStagePrimaryModel: () => ({ modelId, stage: "plan" }),
+  });
+  const orchestrator = getProductionActionConversationOrchestratorV1();
+
+  const interactionRef: InteractionRefV1 = {
+    operationId: ref.operationId,
+    interactionId: ref.interactionId,
+    taskBindingId: ref.taskBindingId,
+    chatDocumentId: ref.chatDocumentId,
+    sourceAttemptId: ref.sourceAttemptId,
+  };
+
+  const outcome = await coordinator.resumeAction({
+    interaction: interactionRef,
+    taskBinding: { taskBindingId: ref.taskBindingId, chatDocumentId: ref.chatDocumentId },
+    taskStatus: ownedTask.progress.status ?? "active",
+    taskStage: ownedTask.progress.currentStage,
+    resumeIdempotencyId,
+    cancellationToken,
+  });
+
+  if (outcome.kind === "completed") {
+    // Mirror the initial applyReviewWithAI completion path exactly: mark the
+    // just-applied-to review stale, open the updated plan, and re-run the
+    // review — Resume must not silently skip the re-review follow-up that
+    // the original synchronous flow always performs.
+    const stage = ownedTask.progress.currentStage;
+    const reviewUri = artifactUri(taskFolderUri, stage);
+    if (reviewUri) {
+      await markReviewArtifactStale(reviewUri, PLAN_FILENAME);
+    }
+    const currentPlanUri = vscode.Uri.joinPath(taskFolderUri, PLAN_FILENAME);
+    await safeOpenTextDocument(currentPlanUri, PLAN_FILENAME);
+    const workspaceFolder = vscode.workspace.getWorkspaceFolder(workspaceFolderUri);
+    if (workspaceFolder) {
+      await runTrackedOperation(
+        taskFolderUri.fsPath,
+        { label: "Re-running review", stage, kind: "review" },
+        (op) =>
+          runReviewForFolder(
+            extensionUri,
+            taskFolderUri,
+            workspaceFolder,
+            stage,
+            true,
+            { operation: op, chatViewProvider }
+          )
+      );
+    }
+  } else if (outcome.kind === "questions") {
+    const record = await orchestrator.getRecord(interactionRef);
+    if (record) {
+      await chatViewProvider.askInteraction({
+        canonicalId: ownedTask.canonicalId ?? ownedTask.taskFolderPath,
+        taskFolderPath: ownedTask.taskFolderPath,
+        stage: record.stage,
+        taskName: ownedTask.progress.displayName,
+        interactionId: record.interactionId,
+        operationId: record.correlation.operationId,
+        actionKey: record.correlation.actionKey,
+        sourceAttemptId: record.correlation.attemptId,
+        // safe: see the other askInteraction call sites' comment.
+        questions: record.questions!,
+        binding: {
+          taskBindingId: record.correlation.taskBindingId,
+          chatDocumentId: record.correlation.chatDocumentId,
+        },
+      });
+    }
+  }
+
+  const after = await orchestrator.loadInteraction(interactionRef);
+  const settlement =
+    after.kind === "ok" &&
+    after.record.state === "settled" &&
+    (after.record.settlement === "resumed" || after.record.settlement === "supersededByReplacementOperation")
+      ? after.record.settlement
+      : undefined;
+
+  if (settlement === undefined) {
+    return { ok: false, reason: "Resume failed to settle the interaction" };
+  }
+  return { ok: true, settlement };
 }

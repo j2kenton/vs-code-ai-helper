@@ -148,9 +148,14 @@ export interface ActionInteractionRecordV1 {
    * (AC-QUESTION-03). Chat-private — never loggable.
    */
   readonly inputSnapshot: ChatTransactionInputSnapshotV1;
-  readonly questions: readonly StructuredQuestionV1[];
-  /** SHA-256 of the canonical question set — answer submissions validate against it. */
-  readonly questionSetDigest: string;
+  /**
+   * Absent while `state` is `invocationPending` (admitted before the
+   * provider ran; not yet a real interaction — plan §6.1 step 5). Present
+   * from `questionsPosted` onward.
+   */
+  readonly questions?: readonly StructuredQuestionV1[];
+  /** SHA-256 of the canonical question set — answer submissions validate against it. Present exactly when `questions` is. */
+  readonly questionSetDigest?: string;
   readonly state: InteractionStateV1;
   readonly answers?: readonly StructuredAnswerV1[];
   readonly answerIdempotencyId?: string;
@@ -195,6 +200,28 @@ export type RecordResumeInvocationOutcomeResultV1 =
       readonly ok: false;
       /** `workflowStorageUnavailable` — the stable §3.7 code; otherwise a sanitized rejection reason. */
       readonly code: "workflowStorageUnavailable" | "recordRejected";
+      readonly reason: string;
+    };
+
+/**
+ * Input for `admitInvocation` (plan §6.1 step 5 / AC-CHAT-TX-02): admits a
+ * durable, invisible `invocationPending` record BEFORE the provider ever
+ * runs. Every field the interaction will eventually need is already known at
+ * this point except the questions themselves.
+ */
+export interface AdmitInvocationInputV1 {
+  readonly correlation: ActionCorrelationV1;
+  readonly stage: TaskStage;
+  readonly resumeSemantics: ResumeSemanticsV1;
+  readonly validatedInput: unknown;
+  readonly promptContract: ChatTransactionPromptContractV1;
+}
+
+export type AdmitInvocationResultV1 =
+  | { readonly ok: true }
+  | {
+      readonly ok: false;
+      readonly code: "workflowStorageUnavailable" | "chatTransactionRejected";
       readonly reason: string;
     };
 
@@ -247,10 +274,31 @@ export type LoadInteractionResultV1 =
 
 export interface ActionConversationOrchestratorV1 {
   /**
+   * Admit a durable `invocationPending` record for this operation BEFORE its
+   * provider invocation ever runs (plan §6.1 step 5 / AC-CHAT-TX-02). Not a
+   * real, renderable interaction — carries no questions and is invisible to
+   * unresolved-interaction listings. Every question-capable coordinator
+   * invocation calls this first, then either `postQuestions` (if the
+   * provider returns questions — transitions this same record in place,
+   * preserving its `invocationPending` receipt) or `discardInvocation` (any
+   * other outcome — the record is deleted; it was never a real interaction).
+   */
+  admitInvocation(input: AdmitInvocationInputV1): Promise<AdmitInvocationResultV1>;
+  /**
+   * Discard an admitted `invocationPending` record whose invocation resolved
+   * to anything other than questions. Best-effort: a leftover record is
+   * harmless (it expires and is swept within 24h), so failures here are
+   * swallowed rather than propagated as a coordinator-level error.
+   */
+  discardInvocation(operationId: string): Promise<void>;
+  /**
    * Record a `questions` result as a new unresolved interaction backed by
    * exactly one durable Chat interaction transaction. The record is written
    * through — and self-verified by the store's strict decoder — before this
    * resolves; a failure leaves nothing persisted and nothing displayable.
+   * Transitions the `admitInvocation`-created pending record in place when
+   * one exists for this operation; otherwise creates a fresh record spanning
+   * both receipts (callers that skip `admitInvocation`).
    */
   postQuestions(input: PostQuestionsInputV1): Promise<PostQuestionsResultV1>;
   /**
@@ -352,8 +400,9 @@ function toRecord(transaction: ChatInteractionTransactionV1): ActionInteractionR
     stage: transaction.stage,
     resumeSemantics: transaction.resumeSemantics,
     inputSnapshot: transaction.inputSnapshot,
-    questions: transaction.questions,
-    questionSetDigest: transaction.questionSetSha256,
+    ...(transaction.questions !== undefined
+      ? { questions: transaction.questions, questionSetDigest: transaction.questionSetSha256 }
+      : {}),
     state: transaction.state,
     ...(transaction.answers !== undefined ? { answers: transaction.answers } : {}),
     ...(transaction.answerIdempotencyId !== undefined
@@ -466,6 +515,33 @@ export function createActionConversationOrchestratorV1(options: {
   }
 
   return {
+    async admitInvocation(input: AdmitInvocationInputV1): Promise<AdmitInvocationResultV1> {
+      const begun = await store.beginInvocation({
+        correlation: input.correlation,
+        interactionId: allocateHex128IdV1(),
+        stage: input.stage,
+        resumeSemantics: input.resumeSemantics,
+        validatedInput: input.validatedInput,
+        promptContract: input.promptContract,
+      });
+      if (begun.kind === "ok") {
+        return { ok: true };
+      }
+      if (begun.kind === "rejected") {
+        return { ok: false, code: "chatTransactionRejected", reason: begun.reason };
+      }
+      return { ok: false, code: "workflowStorageUnavailable", reason: storeFailureReason(begun) };
+    },
+
+    async discardInvocation(operationId: string): Promise<void> {
+      try {
+        await store.discardPendingInvocation(operationId);
+      } catch {
+        // Best-effort cleanup (see the interface doc comment): a leftover
+        // pending record is harmless and expires within 24h.
+      }
+    },
+
     async postQuestions(input: PostQuestionsInputV1): Promise<PostQuestionsResultV1> {
       const begun = await store.begin({
         correlation: input.correlation,

@@ -1,19 +1,17 @@
 import * as vscode from "vscode";
 import * as path from "path";
 import { TaskInventory } from "../state/taskInventory";
-import { resolveTaskContext } from "../utils/resolveTaskContext";
+import { resolveTaskContext, ResolvedTaskContext } from "../utils/resolveTaskContext";
 import {
   PLAN_FILENAME,
   STAGE_ARTIFACT_FILENAMES,
   STAGE_DISPLAY_NAMES,
   TaskStage,
-  RUNS_DIRNAME,
 } from "../types/taskProgress";
 import { IncompleteTask } from "../utils/taskProgressUtils";
 import { resolveFreshModelForStage } from "../utils/modelSelection";
 import {
   checkRunnerAvailabilityForModel,
-  resolveRunnerForModel,
 } from "../runners/runnerRegistry";
 import { generateContextPack } from "../utils/contextPack";
 import { ensureAiConsent } from "../utils/aiConsent";
@@ -23,14 +21,24 @@ import { NotificationRouter } from "../utils/notificationRouter";
 import { runTrackedOperation } from "../utils/taskOperations";
 import {
   readTextIfExists,
-  safeOpenTextDocument,
-  stripAttributionHeaders,
-  writeTextFile,
 } from "../utils/fileUtils";
 import { executeProposedAction } from "../utils/globalAssistantActions";
 import { PendingOperationsStore } from "../state/pendingOperationsStore";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { assertLegacyAiRouteAllowedV0 } from "../services/legacyAiActionSafetyGateV0";
+import {
+  ensureWorkflowTaskFolderRootV1,
+  getVerifiedTaskBindingIdV1,
+} from "../services/workflowRuntimeServicesV1";
+import { readChatDocumentIdentityV1, ChatMessage } from "../utils/chatHistoryStore";
+import { allocateHex128IdV1 } from "../types/actionCorrelationV1";
+import {
+  createProductionTaskActionCoordinatorV1,
+  getProductionActionConversationOrchestratorV1,
+} from "../actions/productionTaskActionRuntimeV1";
+import { CHAT_SEND_ACTION_KEY_V1, ChatSendActionInputV1, validateChatSendInputV1 } from "../actions/rows/chatSendRowV1";
+import { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
+import { ChatInteractionRefV1, ChatInteractionResumeResultV1 } from "../views/chatView";
 
 type ChatWithStageArg =
   | { task?: IncompleteTask; stage?: TaskStage; message?: string }
@@ -52,6 +60,33 @@ function normalizeArg(node: ChatWithStageArg | undefined): {
     stage: value.stage,
     message: value.message,
   };
+}
+
+export type ChatSendValidationResultV1 =
+  | { ok: true; task: ResolvedTaskContext; targetStage: TaskStage }
+  | { ok: false; reason: string };
+
+/**
+ * Validates a Chat Send BEFORE the user's message is persisted to
+ * `chat-v1.json` (plan §5.4/§6.1, AC-CHAT-TX-02): resolves and confirms the
+ * target task actually exists. chatView.ts's webview handler calls this
+ * (via ChatInteractionServicesV1.validateSend) immediately before appending
+ * the user's display message, so a validation failure — most commonly a
+ * stale/deleted task reference — leaves the transcript untouched instead of
+ * recording a message for a send that chatWithStage will only reject moments
+ * later anyway. chatWithStage itself also calls this (rather than
+ * duplicating the resolution logic) so both paths apply identical rules.
+ */
+export async function validateChatSendV1(
+  inventory: TaskInventory,
+  resolverArg: { canonicalId?: string; taskFolderPath?: string } | undefined,
+  stage: TaskStage | undefined
+): Promise<ChatSendValidationResultV1> {
+  const task = await resolveTaskContext(inventory, resolverArg, { allowPaused: true });
+  if (!task) {
+    return { ok: false, reason: "No task found. Please select a task first." };
+  }
+  return { ok: true, task, targetStage: stage ?? task.progress.currentStage };
 }
 
 /** Chat never invokes tools or edits code — the runner is the same text-only
@@ -271,13 +306,6 @@ async function readStageArtifactsForChat(
   return sections.join("\n\n");
 }
 
-function splitQuestionEnvelope(text: string): { answer: string; question?: string } {
-  const match = /\[\[QUESTION\]\]([\s\S]*?)\[\[\/QUESTION\]\]/i.exec(text);
-  if (!match) return { answer: text };
-  const question = (match[1] ?? "").trim();
-  return { answer: text.replace(match[0], "").trim(), question: question || undefined };
-}
-
 export interface FileUpdateEnvelope {
   relPath: string;
   content: string;
@@ -391,6 +419,8 @@ export const OPENCODE_PLAN_MODE_REFUSAL_NOTE =
   "reads the drafted text back and applies it itself. Try asking again, or switch this stage to a different " +
   "model in AI Models if opencode keeps declining._";
 
+
+
 export async function chatWithStage(
   context: vscode.ExtensionContext,
   inventory: TaskInventory,
@@ -400,19 +430,17 @@ export async function chatWithStage(
 ): Promise<void> {
   assertLegacyAiRouteAllowedV0("chatSend.v1");
   const { resolverArg, stage, message } = normalizeArg(explicitArg);
-  const task = await resolveTaskContext(inventory, resolverArg, { allowPaused: true });
-  if (!task) {
-    NotificationRouter.showWarning("No task found. Please select a task first.");
+  const validated = await validateChatSendV1(inventory, resolverArg, stage);
+  if (!validated.ok) {
+    NotificationRouter.showWarning(validated.reason);
     return;
   }
-  const targetStage = stage ?? task.progress.currentStage;
+  const { task, targetStage } = validated;
   if (!message?.trim()) {
     await chatViewProvider.open({
       canonicalId: task.canonicalId,
       taskFolderPath: task.taskFolderPath,
       stage: targetStage,
-      // Chat labels always show the associated task: the display name when
-      // set, otherwise the view falls back to the folder's date/task-ID code.
       taskName: task.progress.displayName,
     });
     return;
@@ -420,15 +448,15 @@ export async function chatWithStage(
   if (!(await ensureAiConsent(context))) return;
 
   const lockKey = task.taskFolderPath;
-  // Set inside the tracked operation, executed AFTER it ends: the proposed
-  // command claims the task's own operation lock (exclusively for reviews and
-  // stage transitions), so running it while the chat operation is still live
-  // would contend with it.
   let proposedAction: StageChatActionProposal | undefined;
+  // Tracks whether the user's message has actually been written to
+  // chat-v1.json yet. Persisted only after every deterministic
+  // precondition below has passed (plan §5.4/AC-CHAT-TX-02) — a failure
+  // before that point must never mutate the transcript, so the catch
+  // block below reports it as a notification instead of an assistant
+  // reply to a message that was never shown.
+  let userMessagePersisted = false;
   try {
-    // Tracked, cancellable chat-response operation (taxonomy: terminal entry
-    // only on failure/cancel — a successful turn's answer in the chat panel is
-    // its own confirmation, so no per-turn success notification is emitted).
     await runTrackedOperation(lockKey, {
       label: "Chat",
       stage: targetStage,
@@ -451,12 +479,31 @@ export async function chatWithStage(
       );
       return;
     }
-    const { runner, nativeModelId, provider } = resolveRunnerForModel(modelId, targetStage, taskFolderUri);
     const { availability: available, providerLabel } = await checkRunnerAvailabilityForModel(modelId, targetStage);
     if (!available.available) throw new Error(available.reason ?? `${providerLabel} is unavailable.`);
-    // Stage-scoped: each stage has a fully separate conversation, so the
-    // prompt context never mixes in another stage's messages.
-    const conversation = (await chatViewProvider.transcript(task.taskFolderPath, task.canonicalId, targetStage))
+
+    const rootId = ensureWorkflowTaskFolderRootV1(task.taskFolderPath);
+    const verifiedBindingId = getVerifiedTaskBindingIdV1(rootId);
+    if (!verifiedBindingId) {
+      throw new Error("Task ownership binding could not be verified.");
+    }
+    const chatIdentity = await readChatDocumentIdentityV1(task.taskFolderPath, task.canonicalId);
+    const chatDocumentId = chatIdentity?.documentId ?? allocateHex128IdV1();
+
+    // Build the prompt from the transcript as it stands BEFORE this send is
+    // persisted, with the pending message spliced in only for prompt
+    // construction — mirroring what the transcript will look like once the
+    // message lands, without writing it yet (plan §5.4/AC-CHAT-TX-02). Every
+    // precondition that can still independently reject this send — prompt
+    // size confirmation, coordinator input validation, and (via
+    // `coordinator.admitAction` below) eligibility, cancellation,
+    // duplicate-lease rejection, and provider selection — is checked against
+    // that in-memory view first; only once none of them reject does the
+    // user's message actually get written to chat-v1.json, so a rejection
+    // never leaves an unanswerable orphan message in the transcript.
+    const existingTranscript = await chatViewProvider.transcript(task.taskFolderPath, task.canonicalId, targetStage);
+    const pendingEntry: ChatMessage = { role: "user", text: message, stage: targetStage, at: new Date().toISOString() };
+    const conversation = [...existingTranscript, pendingEntry]
       .slice(-20)
       .map(entry => `${entry.role.toUpperCase()}: ${entry.text}`)
       .join("\n");
@@ -466,78 +513,119 @@ export async function chatWithStage(
     const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel);
     if (sizeCheck === "abort" || sizeCheck === "declined") return;
 
-    const runsUri = vscode.Uri.joinPath(taskFolderUri, RUNS_DIRNAME);
-    await vscode.workspace.fs.createDirectory(runsUri);
-    const outputFile = vscode.Uri.joinPath(runsUri, `chat-${Date.now()}.md`);
-    // The operation's own token guards the provider process, so the
-    // Notifications-row cancel button aborts the real run.
-    const result = await runner.run({ taskFolderUri, workspaceUri: workspaceFolder.uri, stage: targetStage, prompt, outputFile, modelId: nativeModelId }, op.token!);
-    if (result.status === "cancelled") {
-      await chatViewProvider.append("assistant", "Stage chat was cancelled.", targetStage, { canonicalId: task.canonicalId, taskFolderPath: task.taskFolderPath });
+    const validatedInput: ChatSendActionInputV1 = {
+      prompt,
+      taskFolderPath: task.taskFolderPath,
+      canonicalId: task.canonicalId,
+    };
+    const inputValidation = validateChatSendInputV1(validatedInput);
+    if (!inputValidation.ok) {
+      NotificationRouter.showError(`Unable to send: ${inputValidation.reason}`);
       return;
     }
-    if (result.status !== "completed") throw new Error(result.errorMessage ?? "Stage chat did not complete.");
-    const rawResponse = stripAttributionHeaders(new TextDecoder().decode(await vscode.workspace.fs.readFile(outputFile)).trim());
-    const { text: withoutActions, actions } = splitStageActionEnvelopes(rawResponse);
-    let actionNote = "";
-    if (actions.length > 1) {
-      actionNote =
-        `\n\n_The response proposed ${actions.length} stage actions at once; ` +
-        `chat may propose only one action per response, so none were run._`;
-    } else if (actions.length === 1) {
-      const proposal = actions[0]!;
-      if (getStageChatAction(proposal.id)) {
-        proposedAction = proposal;
-      } else {
-        actionNote = `\n\n_The response proposed an action ("${proposal.id}") that is not in the allowlisted stage-action registry; it was rejected and nothing was executed._`;
+
+    const coordinator = createProductionTaskActionCoordinatorV1({
+      workspaceCwd: workspaceFolder.uri.fsPath,
+      resolveStagePrimaryModel: () => ({ modelId, stage: targetStage }),
+    });
+
+    // Admission (plan §5.4/AC-CHAT-TX-02): eligibility, input validation,
+    // cancellation, duplicate-lease rejection, and provider selection all
+    // run here, still without touching chat-v1.json. Only once the action
+    // has survived every one of those and is genuinely about to run a
+    // provider does the user's message get persisted — a rejection at any
+    // of these stages leaves the transcript untouched, same as a rejection
+    // from the prompt-size confirmation or input validation just above.
+    const admission = await coordinator.admitAction({
+      actionKey: CHAT_SEND_ACTION_KEY_V1,
+      taskBinding: { taskBindingId: verifiedBindingId, chatDocumentId },
+      taskStatus: task.progress.status ?? "active",
+      taskStage: targetStage,
+      rawInput: validatedInput,
+      cancellationToken: op.token!,
+      preInvocationHook: async () => {
+        if (!userMessagePersisted) {
+          await chatViewProvider.append("user", message, targetStage, {
+            canonicalId: task.canonicalId,
+            taskFolderPath: task.taskFolderPath,
+          });
+          userMessagePersisted = true;
+        }
+      },
+    });
+
+    let outcome: TaskActionOutcomeV1;
+    if (admission.kind === "settled") {
+      outcome = admission.outcome;
+    } else {
+      if (!userMessagePersisted) {
+        await chatViewProvider.append("user", message, targetStage, {
+          canonicalId: task.canonicalId,
+          taskFolderPath: task.taskFolderPath,
+        });
+        userMessagePersisted = true;
       }
+      outcome = await coordinator.continueAdmittedAction(admission.ticket);
     }
-    const { text: withoutUpdate, updates } = splitFileUpdateEnvelopes(withoutActions);
-    const plan = planFileUpdate(task.taskFolderPath, updates);
-    let updateNote = "";
-    if (plan.action === "write") {
-      await writeTextFile(vscode.Uri.file(plan.targetPath), plan.content);
-      updateNote = `\n\n_Updated \`${plan.relPath}\`._`;
-      NotificationRouter.showInformation(`Chat AI updated ${plan.relPath} for ${task.folderName}.`, plan.targetPath);
-      await safeOpenTextDocument(vscode.Uri.file(plan.targetPath), plan.relPath);
-    } else if (plan.action === "reject") {
-      updateNote = `\n\n${plan.note}`;
-    } else if (provider === "opencode-cli" && isLikelyOpencodePlanModeRefusal(withoutUpdate)) {
-      // No envelope was found ("none"), and the leftover text reads like
-      // opencode's own plan-mode agent declining in its own permission
-      // terms — see isLikelyOpencodePlanModeRefusal's doc comment.
-      updateNote = `\n\n${OPENCODE_PLAN_MODE_REFUSAL_NOTE}`;
+
+    if (outcome.kind === "completed") {
+      // Completed message has already been written to chat-v1.json by promoteChatSendContentV1.
+      // Now trigger transcript refresh in chat view.
+      await chatViewProvider.open({
+        canonicalId: task.canonicalId,
+        taskFolderPath: task.taskFolderPath,
+        stage: targetStage,
+        taskName: task.progress.displayName,
+      });
+    } else if (outcome.kind === "questions") {
+      const orchestrator = getProductionActionConversationOrchestratorV1();
+      const record = await orchestrator.getRecord({
+        operationId: outcome.correlation.operationId,
+        interactionId: outcome.interactionId,
+        taskBindingId: outcome.correlation.taskBindingId,
+        chatDocumentId: outcome.correlation.chatDocumentId,
+        sourceAttemptId: outcome.correlation.attemptId,
+      });
+      if (record) {
+        await chatViewProvider.askInteraction({
+          canonicalId: task.canonicalId,
+          taskFolderPath: task.taskFolderPath,
+          stage: record.stage,
+          taskName: task.progress.displayName,
+          interactionId: record.interactionId,
+          operationId: record.correlation.operationId,
+          actionKey: record.correlation.actionKey,
+          sourceAttemptId: record.correlation.attemptId,
+          // safe: this call site only loads a record already known (via a
+          // "questions" outcome or an existing unresolved interaction) to
+          // carry posted questions — never invocationPending.
+          questions: record.questions!,
+          binding: {
+            taskBindingId: record.correlation.taskBindingId,
+            chatDocumentId: record.correlation.chatDocumentId,
+          },
+        });
+      }
+    } else if (outcome.kind === "cancelled") {
+      await chatViewProvider.append("assistant", "Stage chat was cancelled.", targetStage, { canonicalId: task.canonicalId, taskFolderPath: task.taskFolderPath });
+    } else {
+      const code = "code" in outcome ? outcome.code : outcome.kind;
+      await chatViewProvider.append("assistant", `Unable to respond: ${code}`, targetStage, { canonicalId: task.canonicalId, taskFolderPath: task.taskFolderPath });
     }
-    const response = splitQuestionEnvelope(`${withoutUpdate}${updateNote}${actionNote}`.trim());
-    if (response.answer) await chatViewProvider.append("assistant", response.answer, targetStage, { canonicalId: task.canonicalId, taskFolderPath: task.taskFolderPath });
-    if (response.question) {
-      // Non-blocking: this chat exchange has already completed (the AI's
-      // reply just happens to end in a question) — work elsewhere can still
-      // proceed without an answer. ask()'s default `notify` (a warning, not
-      // an error) reflects that; it also raises the internal Notifications
-      // entry, so no separate call is needed here.
-      await chatViewProvider.ask({ canonicalId: task.canonicalId, taskFolderPath: task.taskFolderPath, stage: targetStage, question: response.question });
-    }
-    if (!response.answer && !response.question) await chatViewProvider.append("assistant", "The stage AI did not return an answer.", targetStage, { canonicalId: task.canonicalId, taskFolderPath: task.taskFolderPath });
     });
   } catch (error) {
-    // Rethrown out of the tracked operation so its terminal state is
-    // `failed` (or `cancelled` when the token fired); reported here.
     const text = error instanceof Error ? error.message : String(error);
-    await chatViewProvider.append("assistant", `Unable to respond: ${text}`, targetStage, { canonicalId: task.canonicalId, taskFolderPath: task.taskFolderPath });
-    // The operation-notification bridge owns terminal operation entries.
-    // Keep the failure in the chat transcript, but do not add a second
-    // Notifications entry (or a native toast) beside the bridge-backed one.
+    if (userMessagePersisted) {
+      await chatViewProvider.append("assistant", `Unable to respond: ${text}`, targetStage, { canonicalId: task.canonicalId, taskFolderPath: task.taskFolderPath });
+    } else {
+      // Nothing was ever written to chat-v1.json for this send, so report
+      // the failure as a notification rather than an assistant reply with
+      // no visible user message to answer.
+      NotificationRouter.showError(`Unable to send: ${text}`);
+    }
     return;
   }
 
-  // Runs after the chat's tracked operation has ended and released its slot:
-  // the executed operation's underlying command claims the task's own
-  // operation lock itself (and its eligibility guards run exactly as if the
-  // UI button had been clicked). Execution goes through the SAME typed
-  // action executor as the global assistant — confirmation gate, verified
-  // (state-accurate) outcome, and audit logging included — with the chat's
-  // own task pinned as the payload.
   if (proposedAction) {
     const action = getStageChatAction(proposedAction.id);
     if (!action) return;
@@ -555,21 +643,120 @@ export async function chatWithStage(
       {
         inventory,
         currentTaskStore,
-        // Stage-chat action audits live in the task's own folder.
         assistantFolderUri: vscode.Uri.file(task.taskFolderPath),
         pendingOperations: new PendingOperationsStore(context.workspaceState),
       },
       {
         operationId: action.id,
-        // The chat's own task is pinned as the target; only the action's
-        // allowlisted payload keys (e.g. setTaskStage's "stage") pass
-        // through from the proposal.
         payload: buildStageActionPayload(action, task.taskFolderPath, proposedAction.payload),
       }
     );
     await chatViewProvider.append("assistant", outcome, targetStage, chatTarget);
   }
 }
+
+/**
+ * Drive an explicit Chat Resume of a `chatSend.v1` structured-question interaction.
+ */
+export async function resumeChatSendInteractionV1(
+  inventory: TaskInventory,
+  chatViewProvider: ChatViewProvider,
+  ref: ChatInteractionRefV1,
+  resumeIdempotencyId: string,
+  cancellationToken: vscode.CancellationToken
+): Promise<ChatInteractionResumeResultV1> {
+  const ownedTask = inventory.getTaskByBindingId(ref.taskBindingId);
+  if (!ownedTask) {
+    return { ok: false, reason: "the task that asked this question could not be found" };
+  }
+  const taskFolderUri = vscode.Uri.file(ownedTask.taskFolderPath);
+  const workspaceFolderUri = ownedTask.workspaceFolder;
+  if (!workspaceFolderUri) {
+    return { ok: false, reason: "the task has no owning workspace" };
+  }
+
+  const model = await resolveFreshModelForStage(taskFolderUri, ownedTask.progress.currentStage);
+  if (!model.modelId) {
+    return { ok: false, reason: "no model is configured for this stage" };
+  }
+  const { availability, providerLabel } = await checkRunnerAvailabilityForModel(
+    model.modelId,
+    ownedTask.progress.currentStage
+  );
+  if (!availability.available) {
+    return {
+      ok: false,
+      reason: `${providerLabel} is unavailable: ${availability.reason ?? "unknown reason"}`,
+    };
+  }
+  const modelId = model.modelId;
+  const coordinator = createProductionTaskActionCoordinatorV1({
+    workspaceCwd: workspaceFolderUri.fsPath,
+    resolveStagePrimaryModel: () => ({ modelId, stage: ownedTask.progress.currentStage }),
+  });
+  const orchestrator = getProductionActionConversationOrchestratorV1();
+
+  const interactionRef = {
+    operationId: ref.operationId,
+    interactionId: ref.interactionId,
+    taskBindingId: ref.taskBindingId,
+    chatDocumentId: ref.chatDocumentId,
+    sourceAttemptId: ref.sourceAttemptId,
+  };
+
+  const outcome = await coordinator.resumeAction({
+    interaction: interactionRef,
+    taskBinding: { taskBindingId: ref.taskBindingId, chatDocumentId: ref.chatDocumentId },
+    taskStatus: ownedTask.progress.status ?? "active",
+    taskStage: ownedTask.progress.currentStage,
+    resumeIdempotencyId,
+    cancellationToken,
+  });
+
+  if (outcome.kind === "completed") {
+    await chatViewProvider.open({
+      canonicalId: ownedTask.canonicalId ?? ownedTask.taskFolderPath,
+      taskFolderPath: ownedTask.taskFolderPath,
+      stage: ownedTask.progress.currentStage,
+      taskName: ownedTask.progress.displayName,
+    });
+  } else if (outcome.kind === "questions") {
+    const record = await orchestrator.getRecord(interactionRef);
+    if (record) {
+      await chatViewProvider.askInteraction({
+        canonicalId: ownedTask.canonicalId ?? ownedTask.taskFolderPath,
+        taskFolderPath: ownedTask.taskFolderPath,
+        stage: record.stage,
+        taskName: ownedTask.progress.displayName,
+        interactionId: record.interactionId,
+        operationId: record.correlation.operationId,
+        actionKey: record.correlation.actionKey,
+        sourceAttemptId: record.correlation.attemptId,
+        // safe: see the other askInteraction call site's comment above.
+        questions: record.questions!,
+        binding: {
+          taskBindingId: record.correlation.taskBindingId,
+          chatDocumentId: record.correlation.chatDocumentId,
+        },
+      });
+    }
+  }
+
+  const after = await orchestrator.loadInteraction(interactionRef);
+  const settlement =
+    after.kind === "ok" &&
+    after.record.state === "settled" &&
+    (after.record.settlement === "resumed" || after.record.settlement === "supersededByReplacementOperation")
+      ? after.record.settlement
+      : undefined;
+
+  if (settlement === undefined) {
+    return { ok: false, reason: "Resume failed to settle the interaction" };
+  }
+  return { ok: true, settlement };
+}
+
+
 
 export function registerChatWithStageCommand(context: vscode.ExtensionContext, inventory: TaskInventory, chatViewProvider: ChatViewProvider, currentTaskStore?: CurrentTaskStore): void {
   context.subscriptions.push(vscode.commands.registerCommand(

@@ -2,7 +2,7 @@ import * as vscode from "vscode";
 import * as path from "path";
 import { TaskInventory } from "../state/taskInventory";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
-import { TASK_FILENAME, STAGE_DISPLAY_NAMES, RUNS_DIRNAME, TaskProgress } from "../types/taskProgress";
+import { TASK_FILENAME, STAGE_DISPLAY_NAMES, TaskProgress } from "../types/taskProgress";
 import { resolveImplementationArtifact } from "../utils/implementationArtifactResolver";
 import { getLowLevelPlanUri } from "../utils/lowLevelPlanArtifactResolver";
 import { IncompleteTask, patchTaskProgress } from "../utils/taskProgressUtils";
@@ -18,8 +18,6 @@ import { checkPublishPreflight } from "../utils/publishPreflight";
 import { runGitCommand, resolveGitRepo, checkGitPublishReadiness } from "../utils/gitRepoInfo";
 import { runLintingFixes } from "./runLintingFixes";
 import { resolveFreshModelForStage } from "../utils/modelSelection";
-import { parseCopilotModelSelection, parseModelSelection } from "../runners/providers";
-import { checkRunnerAvailabilityForModel, resolveRunnerForModel } from "../runners/runnerRegistry";
 import {
   runTrackedOperation,
   taskOperations,
@@ -28,6 +26,39 @@ import {
 import { CHAT_HISTORY_FILENAME, CHAT_HISTORY_CORRUPT_FILENAME } from "../utils/chatHistoryConstants";
 import { isLegacyAiRouteDisabledV0 } from "../services/legacyAiActionSafetyGateV0";
 import { LegacyCreatingStartupGateV0 } from "../state/legacyCreatingStartupGateV0";
+import {
+  ensureWorkflowTaskFolderRootV1,
+  getVerifiedTaskBindingIdV1,
+  getWorkflowFileStoreV1,
+} from "../services/workflowRuntimeServicesV1";
+import { readChatDocumentIdentityV1 } from "../utils/chatHistoryStore";
+import { allocateHex128IdV1 } from "../types/actionCorrelationV1";
+import {
+  createProductionTaskActionCoordinatorV1,
+  getProductionActionConversationOrchestratorV1,
+} from "../actions/productionTaskActionRuntimeV1";
+import {
+  COMMIT_PUSH_METADATA_ACTION_KEY_V1,
+  CommitPushMetadataActionInputV1,
+} from "../actions/rows/commitPushMetadataRowV1";
+import { ChatInteractionRefV1, ChatInteractionResumeResultV1, ChatViewProvider } from "../views/chatView";
+
+/**
+ * A pending `commitPushMetadata.v1` Chat interaction being explicitly
+ * resumed (plan §10.2 point 5). Threaded privately through
+ * `commitAndPushTaskCore` into `reviewCommitMessage`/`resumeCommitMessage` so
+ * the metadata attempt (`coordinator.resumeAction`) runs as part of THIS
+ * fresh operation's own token acquisition, index/privacy checks, and lint —
+ * never generated ahead of that validation. `onSettled` reports the
+ * interaction's terminal settlement (or a failure reason) back to
+ * `resumeCommitPushMetadataInteractionV1`'s caller exactly once. Never set by
+ * UI surfaces; only that function constructs one.
+ */
+interface CommitPushMetadataResumeRequestV1 {
+  ref: ChatInteractionRefV1;
+  resumeIdempotencyId: string;
+  onSettled: (result: ChatInteractionResumeResultV1) => void;
+}
 
 /**
  * Accepted argument shapes for commitAndPushTask.
@@ -35,8 +66,16 @@ import { LegacyCreatingStartupGateV0 } from "../state/legacyCreatingStartupGateV
  * - Resolver-aware callers pass { canonicalId?, taskFolderPath? }
  */
 type CommitAndPushTaskArg =
-  | { task?: IncompleteTask }
-  | { canonicalId?: string; taskFolderPath?: string };
+  | { task?: IncompleteTask; resumeInteraction?: CommitPushMetadataResumeRequestV1 }
+  | { canonicalId?: string; taskFolderPath?: string; resumeInteraction?: CommitPushMetadataResumeRequestV1 };
+
+function extractResumeInteraction(
+  node: CommitAndPushTaskArg | undefined
+): CommitPushMetadataResumeRequestV1 | undefined {
+  return node && typeof node === "object" && "resumeInteraction" in node
+    ? node.resumeInteraction
+    : undefined;
+}
 
 /**
  * Normalize a command argument into the shape resolveTaskContext expects.
@@ -146,7 +185,10 @@ async function reviewCommitMessage(
   runArtifactPaths: string[],
   pushDestination: string,
   workspaceUri: vscode.Uri,
-  cancellationToken: vscode.CancellationToken
+  cancellationToken: vscode.CancellationToken,
+  taskStatus: string | undefined,
+  chatViewProvider?: ChatViewProvider,
+  resumeInteraction?: CommitPushMetadataResumeRequestV1
 ): Promise<string | undefined> {
   const MAX_PREVIEW_FILES = 15;
   const previewFiles = scopedFiles.slice(0, MAX_PREVIEW_FILES);
@@ -159,7 +201,51 @@ async function reviewCommitMessage(
     .join("\n");
   const moreNote = remaining > 0 ? `\n  … and ${remaining} more file(s)` : "";
 
-  let message = await buildCommitMessage(repoRoot, taskFolderUri, workspaceUri, taskName, scopedFiles, cancellationToken);
+  // Plan §10.2 point 4: when metadata generation returns questions, this
+  // Commit and Push attempt must end here rather than falling back to a
+  // placeholder message the user could unknowingly accept — no modal is
+  // shown, the token this attempt holds is released by the caller's
+  // outermost finally, and the question itself already reached the user
+  // via Chat With AI inside buildCommitMessage.
+  //
+  // Plan §10.2 point 5: when this attempt was started by an explicit Resume
+  // (resumeInteraction set), the FIRST generation call resumes that pending
+  // interaction — via coordinator.resumeAction, after this operation's own
+  // token acquisition, index/privacy checks, and lint have already run —
+  // instead of starting a brand-new attempt from scratch. A resume
+  // idempotency ID is single-use, so a later "Regenerate" click (if the
+  // resume itself completed) falls back to ordinary fresh generation.
+  let resumeAttempted = false;
+  const generate = async (): Promise<string | undefined> => {
+    let result: CommitMessageResultV1;
+    if (resumeInteraction && !resumeAttempted) {
+      resumeAttempted = true;
+      result = await resumeCommitMessage(
+        taskFolderUri,
+        workspaceUri,
+        taskName,
+        cancellationToken,
+        taskStatus,
+        chatViewProvider,
+        resumeInteraction
+      );
+    } else {
+      result = await buildCommitMessage(repoRoot, taskFolderUri, workspaceUri, taskName, scopedFiles, cancellationToken, chatViewProvider);
+    }
+    if (result.kind === "questionsPosted") {
+      NotificationRouter.showWarning(
+        "Commit and Push needs more information before it can generate a commit message. " +
+          "Answer the question in Chat With AI, then start Commit and Push again."
+      );
+      return undefined;
+    }
+    return result.text;
+  };
+
+  let message = await generate();
+  if (message === undefined) {
+    return undefined;
+  }
   for (;;) {
     const confirmText =
       `Commit message:\n\n${message}\n\n` +
@@ -172,7 +258,11 @@ async function reviewCommitMessage(
       "Regenerate"
     );
     if (choice === "Regenerate") {
-      message = await buildCommitMessage(repoRoot, taskFolderUri, workspaceUri, taskName, scopedFiles, cancellationToken);
+      const regenerated = await generate();
+      if (regenerated === undefined) {
+        return undefined;
+      }
+      message = regenerated;
       continue;
     }
     if (choice === "Commit & Push") {
@@ -194,41 +284,31 @@ async function reviewCommitMessage(
  * always shows this suggestion to the user for review/edit/accept before it
  * is ever committed.
  */
+type CommitMessageResultV1 =
+  | { kind: "message"; text: string }
+  | { kind: "questionsPosted" };
+
 async function buildCommitMessage(
   repoRoot: string,
   taskFolderUri: vscode.Uri,
   workspaceUri: vscode.Uri,
   taskName: string,
   files: string[],
-  cancellationToken: vscode.CancellationToken
-): Promise<string> {
-  // Deterministic single-line subject used when no model is configured, the
-  // resolved runner is unavailable, the run fails, or the AI metadata route
-  // is disabled — intentionally task-level, never a list of changed
-  // filenames (the diff already shows those; enumerating them here was
-  // reported as unhelpful noise, not intent). The richer per-file summary
-  // already lives in pr-description.md.
+  cancellationToken: vscode.CancellationToken,
+  chatViewProvider?: ChatViewProvider
+): Promise<CommitMessageResultV1> {
   const fallback = `chore: complete ${taskName} changes for publish`.slice(0, 72);
 
-  // Route-identity + kill-switch check (plan §1.3), before any workspace
-  // read or provider work. Commit/Push is a COMPOSITE flow: only this AI
-  // metadata suggestion is a gated AI route — while it is disabled pending
-  // its V1 migration, the commit flow itself must keep working, so degrade
-  // to the deterministic fallback subject instead of throwing.
   if (isLegacyAiRouteDisabledV0("commitPushMetadata.v1")) {
-    return fallback;
+    return { kind: "message", text: fallback };
   }
 
-  // Diff against HEAD (staged + unstaged): nothing has been staged yet when
-  // the suggestion is generated — staging happens only after the user
-  // confirms the reviewed message (stage-after-confirm).
   let diffText = "";
   try {
     const diff = await runGitCommand(repoRoot, "diff", ["HEAD", "--no-color", "--", ...files]);
     diffText = diff.stdout;
   } catch {
-    // No HEAD yet (unborn branch) or diff failure — the deterministic
-    // fallback subject below still applies.
+    // diffText stays empty; message generation falls back to the deterministic subject below.
   }
 
   const commitMessageInstructions =
@@ -240,69 +320,266 @@ async function buildCommitMessage(
     "Return only the commit message — no markdown fences, no commentary.\n\n";
 
   const { modelId } = await resolveFreshModelForStage(taskFolderUri, "publish");
-  const parsedProvider = parseModelSelection(modelId);
-  if (parsedProvider.provider !== "copilot") {
-    if (!modelId) return fallback;
-    try {
-      const { runner, nativeModelId } = resolveRunnerForModel(modelId, "publish", taskFolderUri);
-      const { availability } = await checkRunnerAvailabilityForModel(modelId, "publish");
-      if (!availability.available) return fallback;
-      const runsUri = vscode.Uri.joinPath(taskFolderUri, RUNS_DIRNAME);
-      await vscode.workspace.fs.createDirectory(runsUri);
-      const outputFile = vscode.Uri.joinPath(runsUri, `commit-message-${Date.now()}.md`);
-      const result = await runner.run(
-        {
-          taskFolderUri,
-          workspaceUri,
-          stage: "publish",
-          prompt: commitMessageInstructions + diffText.slice(0, 12000),
-          outputFile,
-          modelId: nativeModelId,
-        },
-        cancellationToken
-      );
-      if (result.status !== "completed") return fallback;
-      const raw = new TextDecoder().decode(await vscode.workspace.fs.readFile(outputFile)).trim();
-      const message = raw
-        .replace(/^```[a-z]*\r?\n?/i, "")
-        .replace(/\r?\n?```$/, "")
-        .replace(/^['"`]|['"`]$/g, "")
-        .trim();
-      if (message) return message;
-    } catch {
-      // Runner unavailable or the run failed: retain a deterministic fallback.
-    }
-    return fallback;
-  }
-  const parsedCopilot = parseCopilotModelSelection(parsedProvider.model);
+  if (!modelId) return { kind: "message", text: fallback };
 
-  const cts = new vscode.CancellationTokenSource();
   try {
-    const models = await vscode.lm.selectChatModels({ vendor: "copilot" });
-    const model = parsedCopilot.model
-      ? models.find((m) => m.id === parsedCopilot.model)
-      : models.find((m) => m.id.toLowerCase() === "auto" || m.name.toLowerCase() === "auto") ?? models[0];
-    if (model) {
-      const response = await model.sendRequest([
-        vscode.LanguageModelChatMessage.User(commitMessageInstructions + diffText.slice(0, 12000))
-      ], {}, cts.token);
-      let message = "";
-      for await (const part of response.text) message += part;
-      message = message
-        .replace(/^```[a-z]*\r?\n?/i, "")
-        .replace(/\r?\n?```$/, "")
-        .replace(/^['"`]|['"`]$/g, "")
-        .trim();
-      // The review surface (a modal confirmation dialog) never truncates, so
-      // an over-length subject or long body is shown in full for the user to
-      // trim rather than being cut off here.
-      if (message) return message;
+    const rootId = ensureWorkflowTaskFolderRootV1(taskFolderUri.fsPath);
+    const verifiedBindingId = getVerifiedTaskBindingIdV1(rootId);
+    if (!verifiedBindingId) return { kind: "message", text: fallback };
+
+    const chatIdentity = await readChatDocumentIdentityV1(taskFolderUri.fsPath, taskFolderUri.fsPath);
+    const chatDocumentId = chatIdentity?.documentId ?? allocateHex128IdV1();
+
+    const coordinator = createProductionTaskActionCoordinatorV1({
+      workspaceCwd: workspaceUri.fsPath,
+      resolveStagePrimaryModel: () => ({ modelId, stage: "publish" }),
+    });
+
+    const targetLocator = { rootId, relativePath: `runs/commit-metadata-${Date.now()}.json` };
+    const validatedInput: CommitPushMetadataActionInputV1 = {
+      prompt: commitMessageInstructions + diffText.slice(0, 12000),
+      targetLocator,
+    };
+
+    const outcome = await coordinator.executeAction({
+      actionKey: COMMIT_PUSH_METADATA_ACTION_KEY_V1,
+      taskBinding: { taskBindingId: verifiedBindingId, chatDocumentId },
+      taskStatus: "active",
+      taskStage: "publish",
+      rawInput: validatedInput,
+      cancellationToken,
+    });
+
+    if (outcome.kind === "completed") {
+      const fileStore = getWorkflowFileStoreV1();
+      const readResult = await fileStore.readFileBounded(targetLocator, 64 * 1024);
+      if (readResult.kind === "ok") {
+        const jsonText = readResult.value.bytes.toString("utf8");
+        const parsed = JSON.parse(jsonText) as { subject?: string; body?: string };
+        if (parsed.subject) {
+          const subject = parsed.subject.trim();
+          const body = parsed.body ? parsed.body.trim() : "";
+          return { kind: "message", text: body ? `${subject}\n\n${body}` : subject };
+        }
+      }
+    } else if (outcome.kind === "questions" && chatViewProvider) {
+      // Plan §6.1/§10.2 point 4: structured questions route to Chat With
+      // AI, never silently dropped, and this attempt ends here instead of
+      // falling back to a placeholder message the caller could commit
+      // without realizing clarification was needed. Answering/Resuming in
+      // Chat completes a linked replacement operation (resumeSemantics:
+      // "replacementOperation") and notifies the user to start a fresh
+      // Commit and Push, seeded with the resumed message, once it's ready.
+      const orchestrator = getProductionActionConversationOrchestratorV1();
+      const record = await orchestrator.getRecord({
+        operationId: outcome.correlation.operationId,
+        interactionId: outcome.interactionId,
+        taskBindingId: outcome.correlation.taskBindingId,
+        chatDocumentId: outcome.correlation.chatDocumentId,
+        sourceAttemptId: outcome.correlation.attemptId,
+      });
+      if (record) {
+        await chatViewProvider.askInteraction({
+          canonicalId: taskFolderUri.fsPath,
+          taskFolderPath: taskFolderUri.fsPath,
+          stage: record.stage,
+          taskName,
+          interactionId: record.interactionId,
+          operationId: record.correlation.operationId,
+          actionKey: record.correlation.actionKey,
+          sourceAttemptId: record.correlation.attemptId,
+          // safe: this call site only loads a record already known (via a
+          // "questions" outcome or an existing unresolved interaction) to
+          // carry posted questions — never invocationPending.
+          questions: record.questions!,
+          binding: {
+            taskBindingId: record.correlation.taskBindingId,
+            chatDocumentId: record.correlation.chatDocumentId,
+          },
+        });
+      }
+      return { kind: "questionsPosted" };
     }
-  } catch { /* Provider unavailable: retain a deterministic safe fallback. */ } finally {
-    cts.cancel();
-    cts.dispose();
+  } catch {
+    // Any failure resolving/parsing the coordinator result falls back to the deterministic subject below.
   }
-  return fallback;
+  return { kind: "message", text: fallback };
+}
+
+/**
+ * Resume a pending `commitPushMetadata.v1` Chat interaction as part of THIS
+ * (already token-acquired, already index/lint-validated) Commit and Push
+ * attempt, instead of generating fresh content. Calls `resumeInteraction`'s
+ * `onSettled` exactly once, on every path, so the caller that kicked off
+ * this whole attempt (`resumeCommitPushMetadataInteractionV1`) always learns
+ * the outcome even when this attempt goes on to fail, get cancelled, or have
+ * its result declined in the modal preview.
+ */
+async function resumeCommitMessage(
+  taskFolderUri: vscode.Uri,
+  workspaceUri: vscode.Uri,
+  taskName: string,
+  cancellationToken: vscode.CancellationToken,
+  taskStatus: string | undefined,
+  chatViewProvider: ChatViewProvider | undefined,
+  resumeInteraction: CommitPushMetadataResumeRequestV1
+): Promise<CommitMessageResultV1> {
+  const fallback = `chore: complete ${taskName} changes for publish`.slice(0, 72);
+  const { ref, resumeIdempotencyId, onSettled } = resumeInteraction;
+
+  const model = await resolveFreshModelForStage(taskFolderUri, "publish");
+  if (!model.modelId) {
+    onSettled({ ok: false, reason: "no model is configured for publish stage" });
+    return { kind: "message", text: fallback };
+  }
+  const modelId = model.modelId;
+  const coordinator = createProductionTaskActionCoordinatorV1({
+    workspaceCwd: workspaceUri.fsPath,
+    resolveStagePrimaryModel: () => ({ modelId, stage: "publish" }),
+  });
+  const orchestrator = getProductionActionConversationOrchestratorV1();
+
+  const interactionRef = {
+    operationId: ref.operationId,
+    interactionId: ref.interactionId,
+    taskBindingId: ref.taskBindingId,
+    chatDocumentId: ref.chatDocumentId,
+    sourceAttemptId: ref.sourceAttemptId,
+  };
+
+  const outcome = await coordinator.resumeAction({
+    interaction: interactionRef,
+    taskBinding: { taskBindingId: ref.taskBindingId, chatDocumentId: ref.chatDocumentId },
+    taskStatus: taskStatus ?? "active",
+    taskStage: "publish",
+    resumeIdempotencyId,
+    cancellationToken,
+  });
+
+  if (outcome.kind === "questions" && chatViewProvider) {
+    const record = await orchestrator.getRecord(interactionRef);
+    if (record) {
+      await chatViewProvider.askInteraction({
+        canonicalId: taskFolderUri.fsPath,
+        taskFolderPath: taskFolderUri.fsPath,
+        stage: record.stage,
+        taskName,
+        interactionId: record.interactionId,
+        operationId: record.correlation.operationId,
+        actionKey: record.correlation.actionKey,
+        sourceAttemptId: record.correlation.attemptId,
+        // safe: see the other askInteraction call site's comment above.
+        questions: record.questions!,
+        binding: {
+          taskBindingId: record.correlation.taskBindingId,
+          chatDocumentId: record.correlation.chatDocumentId,
+        },
+      });
+    }
+  }
+
+  const after = await orchestrator.loadInteraction(interactionRef);
+  const settlement =
+    after.kind === "ok" &&
+    after.record.state === "settled" &&
+    (after.record.settlement === "resumed" || after.record.settlement === "supersededByReplacementOperation")
+      ? after.record.settlement
+      : undefined;
+
+  if (settlement === undefined) {
+    onSettled({ ok: false, reason: "Resume failed to settle the interaction" });
+    return outcome.kind === "questions" ? { kind: "questionsPosted" } : { kind: "message", text: fallback };
+  }
+  onSettled({ ok: true, settlement });
+
+  if (outcome.kind === "questions") {
+    return { kind: "questionsPosted" };
+  }
+
+  if (outcome.kind === "completed" && after.kind === "ok") {
+    try {
+      const snapshot = JSON.parse(after.record.inputSnapshot.canonicalJson) as {
+        targetLocator?: { rootId: string; relativePath: string };
+      };
+      if (snapshot.targetLocator) {
+        const fileStore = getWorkflowFileStoreV1();
+        const readResult = await fileStore.readFileBounded(snapshot.targetLocator, 64 * 1024);
+        if (readResult.kind === "ok") {
+          const parsed = JSON.parse(readResult.value.bytes.toString("utf8")) as {
+            subject?: string;
+            body?: string;
+          };
+          if (parsed.subject) {
+            const subject = parsed.subject.trim();
+            const body = parsed.body ? parsed.body.trim() : "";
+            return { kind: "message", text: body ? `${subject}\n\n${body}` : subject };
+          }
+        }
+      }
+    } catch {
+      // Falls through to the deterministic fallback below.
+    }
+  }
+  return { kind: "message", text: fallback };
+}
+
+/**
+ * Explicit Resume for a `commitPushMetadata.v1` question (plan §10.2 point
+ * 5). This action's row declares `resumeSemantics: "replacementOperation"`
+ * (its process-global token was released when the question was first
+ * posted, and there is no live modal to feed a message into), so Resume
+ * must start a genuinely fresh, linked PUBLIC Commit and Push operation —
+ * its own token acquisition, index/privacy checks, and lint — and only run
+ * the metadata attempt itself once that validation has passed, inside that
+ * fresh operation's own `reviewCommitMessage` step. This function is a thin
+ * wrapper around the public `commitAndPushTask` entry point: it never
+ * generates metadata ahead of time and never hands off to a separate,
+ * later-clicked button.
+ */
+export async function resumeCommitPushMetadataInteractionV1(
+  inventory: TaskInventory,
+  chatViewProvider: ChatViewProvider,
+  ref: ChatInteractionRefV1,
+  resumeIdempotencyId: string,
+  currentTaskStore?: CurrentTaskStore,
+  extensionContext?: vscode.ExtensionContext
+): Promise<ChatInteractionResumeResultV1> {
+  const ownedTask = inventory.getTaskByBindingId(ref.taskBindingId);
+  if (!ownedTask) {
+    return { ok: false, reason: "the task that asked this question could not be found" };
+  }
+
+  let settled: ChatInteractionResumeResultV1 | undefined;
+  const resumeInteraction: CommitPushMetadataResumeRequestV1 = {
+    ref,
+    resumeIdempotencyId,
+    onSettled: (result) => {
+      settled = result;
+    },
+  };
+
+  const entryOutcome = await commitAndPushTask(
+    inventory,
+    { taskFolderPath: ownedTask.taskFolderPath, resumeInteraction },
+    currentTaskStore,
+    undefined,
+    extensionContext,
+    chatViewProvider
+  );
+
+  if (settled) {
+    return settled;
+  }
+  if (entryOutcome && entryOutcome.kind === "duplicateRejected") {
+    return {
+      ok: false,
+      reason: "Commit and Push is already in progress. Please wait for it to finish, then resume again.",
+    };
+  }
+  return {
+    ok: false,
+    reason: "Commit and Push ended before the metadata attempt could resume. Please try again.",
+  };
 }
 
 /**
@@ -935,9 +1212,11 @@ async function commitAndPushTaskCore(
   explicitArg?: CommitAndPushTaskArg,
   currentTaskStore?: CurrentTaskStore,
   parentOperation?: TaskOperationHandle,
-  extensionContext?: vscode.ExtensionContext
+  extensionContext?: vscode.ExtensionContext,
+  chatViewProvider?: ChatViewProvider
 ): Promise<void> {
   const resolverArg = normalizeArg(explicitArg);
+  const resumeInteraction = extractResumeInteraction(explicitArg);
 
   // Resolution order (matches resolveTaskContext contract):
   //   1. explicit task arg (tree node, canonical ID, folder path) — highest precedence
@@ -979,7 +1258,22 @@ async function commitAndPushTaskCore(
   try {
   await runTrackedOperation(
     lockKey,
-    { label: "Commit and Push", taskName: resolvedTask.folderName, kind: "commit-push", parent: parentOperation },
+    {
+      label: "Commit and Push",
+      taskName: resolvedTask.folderName,
+      kind: "commit-push",
+      parent: parentOperation,
+      // The V1 action coordinator requires a real CancellationToken for
+      // every provider action (TaskActionRequestV1.cancellationToken is not
+      // optional) — commit-message generation below passes op.token into it.
+      // Without `cancellable: true` here, taskOperations never creates a
+      // token source, op.token stays undefined, and the coordinator's
+      // admission phase throws on `cancellationToken.isCancellationRequested`
+      // before ever reaching a provider — silently caught by
+      // buildCommitMessage's catch-all, so every real invocation fell back
+      // to the deterministic subject instead of the configured AI message.
+      cancellable: true,
+    },
     async (op) => {
     // Allow committing from completed stage only
     if (resolvedTask.progress.currentStage !== "publish") {
@@ -1441,7 +1735,10 @@ async function commitAndPushTaskCore(
           runArtifactPaths,
           pushDestination,
           resolvedTask.workspaceFolder ?? vscode.Uri.file(resolvedTask.taskFolderPath),
-          op.token!
+          op.token!,
+          resolvedTask.progress.status,
+          chatViewProvider,
+          resumeInteraction
         );
         if (!confirmedMessage) {
           NotificationRouter.showInformation("Commit and push cancelled.");
@@ -1527,7 +1824,8 @@ export async function commitAndPushTask(
   explicitArg?: CommitAndPushTaskArg,
   currentTaskStore?: CurrentTaskStore,
   parentOperation?: TaskOperationHandle,
-  extensionContext?: vscode.ExtensionContext
+  extensionContext?: vscode.ExtensionContext,
+  chatViewProvider?: ChatViewProvider
 ): Promise<CommitPushDuplicateRejectedV1 | void> {
   if (!acquireCommitPushToken()) {
     return rejectDuplicateCommitPush();
@@ -1542,7 +1840,8 @@ export async function commitAndPushTask(
       explicitArg,
       currentTaskStore,
       parentOperation,
-      extensionContext
+      extensionContext,
+      chatViewProvider
     );
   } finally {
     releaseCommitPushToken();
@@ -1563,7 +1862,8 @@ export async function completeCommitAndPushTask(
   inventory: TaskInventory,
   explicitArg?: CommitAndPushTaskArg,
   currentTaskStore?: CurrentTaskStore,
-  extensionContext?: vscode.ExtensionContext
+  extensionContext?: vscode.ExtensionContext,
+  chatViewProvider?: ChatViewProvider
 ): Promise<CommitPushDuplicateRejectedV1 | void> {
   if (!acquireCommitPushToken()) {
     return rejectDuplicateCommitPush();
@@ -1597,7 +1897,7 @@ export async function completeCommitAndPushTask(
       if (resolvedTask.progress.currentStage === "publish") {
         // Already completed: borrow the token this callback already holds
         // and run the core directly.
-        await commitAndPushTaskCore(inventory, explicitArg, currentTaskStore, undefined, extensionContext);
+        await commitAndPushTaskCore(inventory, explicitArg, currentTaskStore, undefined, extensionContext, chatViewProvider);
         return;
       }
       NotificationRouter.showWarning(
@@ -1685,7 +1985,7 @@ export async function completeCommitAndPushTask(
         },
         canonicalId: resolvedTask.canonicalId,
       };
-      await commitAndPushTaskCore(inventory, { task: completedTask }, currentTaskStore, op, extensionContext);
+      await commitAndPushTaskCore(inventory, { task: completedTask }, currentTaskStore, op, extensionContext, chatViewProvider);
       }
     );
   } finally {
@@ -1699,17 +1999,18 @@ export async function completeCommitAndPushTask(
 export function registerCommitAndPushTaskCommand(
   context: vscode.ExtensionContext,
   inventory: TaskInventory,
-  currentTaskStore?: CurrentTaskStore
+  currentTaskStore?: CurrentTaskStore,
+  chatViewProvider?: ChatViewProvider
 ): void {
   const disposable = vscode.commands.registerCommand(
     "vs-code-ai-helper.commitAndPushTask",
     (arg?: CommitAndPushTaskArg) =>
-      commitAndPushTask(inventory, arg, currentTaskStore, undefined, context)
+      commitAndPushTask(inventory, arg, currentTaskStore, undefined, context, chatViewProvider)
   );
   const completeDisposable = vscode.commands.registerCommand(
     "vs-code-ai-helper.completeCommitAndPushTask",
     (arg?: CommitAndPushTaskArg) =>
-      completeCommitAndPushTask(inventory, arg, currentTaskStore, context)
+      completeCommitAndPushTask(inventory, arg, currentTaskStore, context, chatViewProvider)
   );
   context.subscriptions.push(disposable, completeDisposable);
 }

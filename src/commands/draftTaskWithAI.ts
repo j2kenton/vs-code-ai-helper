@@ -305,7 +305,10 @@ async function handleDraftOutcomeV1(
         operationId: record.correlation.operationId,
         actionKey: record.correlation.actionKey,
         sourceAttemptId: record.correlation.attemptId,
-        questions: record.questions,
+        // safe: this call site only loads a record already known (via a
+        // "questions" outcome or an existing unresolved interaction) to
+        // carry posted questions — never invocationPending.
+        questions: record.questions!,
         binding: {
           taskBindingId: record.correlation.taskBindingId,
           chatDocumentId: record.correlation.chatDocumentId,

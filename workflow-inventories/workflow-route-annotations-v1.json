@@ -13,7 +13,7 @@
       "expiryCohort": "edit",
       "evidence": {
         "symbol": "execute",
-        "sourceSpan": "L71-L74",
+        "sourceSpan": "L71-L77",
         "edgeKind": "dynamicCommandDispatch",
         "targetActionKey": "applyCurrentStage.v1"
       }
@@ -61,7 +61,7 @@
       "expiryCohort": "cleanup",
       "evidence": {
         "symbol": "open",
-        "sourceSpan": "L327-L327",
+        "sourceSpan": "L352-L352",
         "edgeKind": "dynamicCommandDispatch",
         "targetActionKey": "none"
       }
@@ -200,36 +200,87 @@
       "annotationKind": "pregateModifiedRoute",
       "routeKey": "command:vs-code-ai-helper.applyHighLevelReviewChanges",
       "path": "src/commands/applyHighLevelReviewChanges.ts",
-      "planSection": "§1.3 (fail-closed AI gates) / §8 Safety cohort",
-      "rationale": "The Safety cohort (plan §1.3) installed the first-statement legacy AI route gate for applyReview.v1 in this route's registering file — the only mechanical change since the pre-gate snapshot is fileGateRouteIds [] -> [applyReview.v1]. Gate-before-read ordering is wiring-tested in legacyAiActionSafetyGateWiring.test.ts.",
+      "planSection": "§1.3 (fail-closed AI gates) / §8 Safety cohort / §7.8 edit-branch routing",
+      "rationale": "The Safety cohort (plan §1.3) installed the first-statement legacy AI route gate for applyReview.v1 in this route's registering file. A subsequent Text-3/edit-routing fix (plan §1.3's 'gate before any read' requirement, review round addressing the Apply Review text/edit split) collapsed the wrapper's two sequential resolveTaskContext reads into one, and added an explicit assertLegacyAiRouteAllowedV0(\"applyReviewEdit.v1\") check immediately after that single resolution — before the paused check, consent, or any further read — for an impl-high-review target, instead of relying solely on the downstream applyReviewWithAI delegate to gate it one function call later. A further round (AC-ROUTE-01 architectural blocker: 'genuinely separate static text/edit-root commands, not one dynamic command reading progress to branch') split the delegate target itself: the impl-high-review branch now issues its own literal executeCommand(\"vs-code-ai-helper.applyReviewEditWithAI\", ...) call instead of forwarding to the shared applyReviewWithAI, so the edit route is reachable through a dedicated statically-registered command end to end. The mechanical change is fileGateRouteIds [applyReview.v1] -> [applyReview.v1, applyReviewEdit.v1] plus the new literal edge to applyReviewEditWithAI. Gate-before-read ordering is wiring-tested in legacyAiActionSafetyGateWiring.test.ts; the edit-gate-fires-in-the-wrapper behavior (and that the plan-review/text branch is unaffected) is covered by dedicated regression tests in commandArgNormalization.test.ts.",
       "owner": "ensemble-workflow-migration",
       "cohort": "safety",
       "expiryCohort": "text3",
       "evidence": {
         "symbol": "disposable",
-        "sourceSpan": "L67-L71",
+        "sourceSpan": "L119-L123",
         "edgeKind": "pregateModifiedRoute",
         "targetActionKey": "applyReview.v1",
         "pregateStabilitySha256": "c811910e0861c359cfc9b63f543074e10b818635d4132427a0ad0fb4812ffcc0",
-        "liveStabilitySha256": "b4a8e691cde0f87903c32e3c5e8c1410fb0ef3dd2afb5607678861f7fd1e5acd"
+        "liveStabilitySha256": "7d53ec164797e426c81a70787a4290854063955e4c5118c35f34d7fb7057f161"
       }
     },
     {
       "annotationKind": "pregateModifiedRoute",
       "routeKey": "command:vs-code-ai-helper.applyLowLevelReviewChanges",
       "path": "src/commands/applyLowLevelReviewChanges.ts",
-      "planSection": "§1.3 (fail-closed AI gates) / §8 Safety cohort",
-      "rationale": "The Safety cohort (plan §1.3) installed the first-statement legacy AI route gate for applyReview.v1 in this route's registering file — the only mechanical change since the pre-gate snapshot is fileGateRouteIds [] -> [applyReview.v1]. Gate-before-read ordering is wiring-tested in legacyAiActionSafetyGateWiring.test.ts.",
+      "planSection": "§1.3 (fail-closed AI gates) / §8 Safety cohort / §7.8 edit-branch routing",
+      "rationale": "The Safety cohort (plan §1.3) installed the first-statement legacy AI route gate for applyReview.v1 in this route's registering file. A subsequent Text-3/edit-routing fix (plan §1.3's 'gate before any read' requirement, review round addressing the Apply Review text/edit split) collapsed the wrapper's two sequential resolveTaskContext reads into one, and added an explicit assertLegacyAiRouteAllowedV0(\"applyReviewEdit.v1\") check immediately after that single resolution — before the paused check, consent, or any further read — for an impl-low-review target, instead of relying solely on the downstream applyReviewWithAI delegate to gate it one function call later. A further round (AC-ROUTE-01 architectural blocker: 'genuinely separate static text/edit-root commands, not one dynamic command reading progress to branch') split the delegate target itself: the impl-low-review branch now issues its own literal executeCommand(\"vs-code-ai-helper.applyReviewEditWithAI\", ...) call instead of forwarding to the shared applyReviewWithAI, so the edit route is reachable through a dedicated statically-registered command end to end. The mechanical change is fileGateRouteIds [applyReview.v1] -> [applyReview.v1, applyReviewEdit.v1] plus the new literal edge to applyReviewEditWithAI. Gate-before-read ordering is wiring-tested in legacyAiActionSafetyGateWiring.test.ts; the edit-gate-fires-in-the-wrapper behavior (and that the plan-review/text branch is unaffected) is covered by dedicated regression tests in commandArgNormalization.test.ts.",
       "owner": "ensemble-workflow-migration",
       "cohort": "safety",
       "expiryCohort": "text3",
       "evidence": {
         "symbol": "disposable",
-        "sourceSpan": "L67-L71",
+        "sourceSpan": "L119-L123",
         "edgeKind": "pregateModifiedRoute",
         "targetActionKey": "applyReview.v1",
         "pregateStabilitySha256": "0fe3a2f4431c5b381c4cd74f84d17dfd11c714124efa94b1a9a5972af2d8fa18",
-        "liveStabilitySha256": "469740f9cd28fdba363dc4a90700f63ba891679e60d93adca31d3840c38eeba1"
+        "liveStabilitySha256": "d1bfcf14773304729c593db0a83ac41f2aa4a34133598fc1ae78040e99481bed"
+      }
+    },
+    {
+      "annotationKind": "pregateAddedRoute",
+      "routeKey": "command:vs-code-ai-helper.applyReviewEditWithAI",
+      "path": "src/commands/reviewActions.ts",
+      "planSection": "§1.3 / §7.8 (Apply Review edit-branch routing) / AC-ROUTE-01",
+      "rationale": "New dedicated edit-root command for Apply Review (AC-ROUTE-01 architectural blocker: 'genuinely separate static text/edit-root commands, not one dynamic command reading progress to branch'). Unlike the shared applyReviewWithAI, which must dynamically discover a {taskFolderPath}/no-arg dispatch's stage before it knows its branch, this command's mere existence proves edit intent: its handler asserts assertLegacyAiRouteAllowedV0(\"applyReviewEdit.v1\") unconditionally as the literal first statement, before any argument normalization or read, then delegates to the same underlying applyReviewWithAI implementation (shared behavior is not the architectural problem the plan flags; one shared PUBLIC COMMAND identity for both branches was). applyReviewEdit.v1 remains disabled until plan §7/§7.8's edit migration lands, so this route currently always rejects, identically to the shared command's own edit branch today.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "safety",
+      "expiryCohort": "edit",
+      "evidence": {
+        "symbol": "registerReviewActionCommands",
+        "sourceSpan": "L4803-L4807",
+        "edgeKind": "pregateAddedRoute",
+        "targetActionKey": "applyReviewEdit.v1",
+        "liveStabilitySha256": "a3750f7a5a6d771a21d1eff92dfab4d119285b2f6a5188dd4fc034963ffc9932"
+      }
+    },
+    {
+      "annotationKind": "pregateAddedRoute",
+      "routeKey": "edge:src/commands/applyHighLevelReviewChanges.ts#applyHighLevelReviewChanges->vs-code-ai-helper.applyReviewEditWithAI#1",
+      "path": "src/commands/applyHighLevelReviewChanges.ts",
+      "planSection": "§1.3 / §7.8 (Apply Review edit-branch routing) / AC-ROUTE-01",
+      "rationale": "The keyboard-shortcut router's High-Level Review delegate now dispatches an impl-high-review target to the new dedicated applyReviewEditWithAI command via a literal executeCommand call (not a computed command id), instead of forwarding every target to the shared applyReviewWithAI. This keeps the edge statically resolvable by the route inventory's extractor while completing the two-command split at this call site.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "safety",
+      "expiryCohort": "edit",
+      "evidence": {
+        "symbol": "applyHighLevelReviewChanges",
+        "sourceSpan": "L78-L84",
+        "edgeKind": "pregateAddedRoute",
+        "targetActionKey": "applyReviewEdit.v1",
+        "liveStabilitySha256": "828ffcad1d0fe16359aaa536c8ad6c26b0ce3a525fec63aa651091bdbf017f02"
+      }
+    },
+    {
+      "annotationKind": "pregateAddedRoute",
+      "routeKey": "edge:src/commands/applyLowLevelReviewChanges.ts#applyLowLevelReviewChanges->vs-code-ai-helper.applyReviewEditWithAI#1",
+      "path": "src/commands/applyLowLevelReviewChanges.ts",
+      "planSection": "§1.3 / §7.8 (Apply Review edit-branch routing) / AC-ROUTE-01",
+      "rationale": "The keyboard-shortcut router's Low-Level Review delegate now dispatches an impl-low-review target to the new dedicated applyReviewEditWithAI command via a literal executeCommand call (not a computed command id), instead of forwarding every target to the shared applyReviewWithAI. This keeps the edge statically resolvable by the route inventory's extractor while completing the two-command split at this call site.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "safety",
+      "expiryCohort": "edit",
+      "evidence": {
+        "symbol": "applyLowLevelReviewChanges",
+        "sourceSpan": "L78-L84",
+        "edgeKind": "pregateAddedRoute",
+        "targetActionKey": "applyReviewEdit.v1",
+        "liveStabilitySha256": "8cf72a0a4456a31527e5417193143963d816aa4e0270620e6a2d95578ce461e3"
       }
     },
     {
@@ -237,7 +288,7 @@
       "routeKey": "command:vs-code-ai-helper.applyReviewWithAI",
       "path": "src/commands/reviewActions.ts",
       "planSection": "§1.3 (fail-closed AI gates) / §8 Safety cohort",
-      "rationale": "The Safety cohort (plan §1.3) installed the first-statement legacy AI route gate for applyReview.v1 in this route's registering file — the only mechanical change since the pre-gate snapshot is fileGateRouteIds [] -> [applyReview.v1]. The file-level rollup also includes the other four reviewActions.ts family gates (fastForward.v1, generateImplementation.v1, implementation.v1, review.v1) installed by the same cohort; gate-before-read ordering is wiring-tested in legacyAiActionSafetyGateWiring.test.ts.",
+      "rationale": "The Safety cohort (plan §1.3) installed the first-statement legacy AI route gate for applyReview.v1 in this route's registering file — the only mechanical change since the pre-gate snapshot was originally fileGateRouteIds [] -> [applyReview.v1]. The Text-3 completion round added a second, earlier gate check inside applyReviewWithAI itself (assertLegacyAiRouteAllowedV0(\"applyReviewEdit.v1\"), checked immediately after task/stage resolution and before any workspace or artifact read) so the edit-capable implementation-review branch is rejected before those reads instead of only inside applyImplementationReviewWithAI further downstream. The file-level rollup also includes the other four reviewActions.ts family gates (fastForward.v1, generateImplementation.v1, implementation.v1, review.v1) installed by the same cohort; gate-before-read ordering is wiring-tested in legacyAiActionSafetyGateWiring.test.ts.",
       "owner": "ensemble-workflow-migration",
       "cohort": "safety",
       "expiryCohort": "text3",
@@ -247,7 +298,7 @@
         "edgeKind": "pregateModifiedRoute",
         "targetActionKey": "applyReview.v1",
         "pregateStabilitySha256": "209d1fae09f2f2239c1bc8d01be4e17d6cea0c5a36bece7cf1b05f451c7024dd",
-        "liveStabilitySha256": "fd3880c1f2e5282f834844662bd93a12b1d56af0a034d0f9c5743bda46168ad9"
+        "liveStabilitySha256": "9d2c0f107f72d3fe0ca6e6c75178d295f6e9d13f6a3eb73aa05b770d163fc9c9"
       }
     },
     {
@@ -283,7 +334,7 @@
         "edgeKind": "pregateModifiedRoute",
         "targetActionKey": "none",
         "pregateStabilitySha256": "64bc6c0f077fcf452439955e041e604754e638a10e6361e5b4480e63207f3d13",
-        "liveStabilitySha256": "75e64fbc5dd46cd825c606e03d81c6ad172b43b23b671311be2e0ad2c8d3cf1e"
+        "liveStabilitySha256": "b8f7fbf27d962b43c3576e3791132ec7ccb4ba9ff286f3637eaec63d49829d14"
       }
     },
     {
@@ -291,7 +342,7 @@
       "routeKey": "command:vs-code-ai-helper.commitAndPushTask",
       "path": "src/commands/commitAndPushTask.ts",
       "planSection": "§1.3 (fail-closed AI gates) / §8 Safety cohort",
-      "rationale": "The Safety cohort (plan §1.3/§10.1) installed the non-throwing isLegacyAiRouteDisabledV0(\"commitPushMetadata.v1\") query in commitAndPushTask.ts so the disabled AI metadata sub-step degrades to the deterministic fallback subject without breaking the non-AI commit flow; fileGateRouteIds [] -> [commitPushMetadata.v1] is the only mechanical change since the pre-gate snapshot. The early duplicate-invocation token (CommitPushEarlyGateV0) landed in the same cohort but does not alter this row's mechanical identity.",
+      "rationale": "The Safety cohort (plan §1.3/§10.1) installed the non-throwing isLegacyAiRouteDisabledV0(\"commitPushMetadata.v1\") query in commitAndPushTask.ts so the disabled AI metadata sub-step degrades to the deterministic fallback subject without breaking the non-AI commit flow; fileGateRouteIds [] -> [commitPushMetadata.v1] was the only mechanical change since the pre-gate snapshot. The Text-3 completion round (plan §10.2 point 4) further changed buildCommitMessage's return shape to a discriminated CommitMessageResultV1 so a \"questions\" outcome ends this Commit and Push attempt (no modal shown, no fallback-subject commit) instead of silently falling back, and threaded an optional seedCommitMessage argument through commitAndPushTaskCore/reviewCommitMessage so Resume's resumed metadata seeds a fresh attempt's review dialog directly. The early duplicate-invocation token (CommitPushEarlyGateV0) landed in an earlier cohort but does not alter this row's mechanical identity. Evidence refresh 2026-07-29 (closing an implementation-review completion blocker: metadata Resume generated content ahead of fresh Git validation/lint and only afterward offered a separate unlinked public-command notification): seedCommitMessage/extractSeedCommitMessage are removed entirely. resumeCommitPushMetadataInteractionV1 (commitAndPushTask.ts) now calls this SAME public commitAndPushTask entry point directly (with a private resumeInteraction request carrying the pending interaction ref, never set by UI surfaces) instead of calling coordinator.resumeAction itself — so an explicit Chat Resume of a commitPushMetadata.v1 question is now itself one more caller of this exact route: it acquires this row's own process-global token, runs this row's own fresh git-readiness/index checks and lint, and only then runs the metadata attempt inside reviewCommitMessage. This is a genuinely new caller of the route (raising its stability digest) but not a new route or a change to the route's own gate/guard/target.",
       "owner": "ensemble-workflow-migration",
       "cohort": "safety",
       "expiryCohort": "git",
@@ -373,7 +424,7 @@
         "edgeKind": "pregateModifiedRoute",
         "targetActionKey": "fastForward.v1",
         "pregateStabilitySha256": "6d8dbe4ba01266d910ddca1e83d2f1eecdf8f01ea3debf78b73a004c379ab9d8",
-        "liveStabilitySha256": "c54ade0291f6404fb9fc29a426a7b08d71ccf056497063e61a4b0c61e7635ad1"
+        "liveStabilitySha256": "efbdcc1fcc0992f13bbc839969a2953f084525cc9c51853c28f15bc049793790"
       }
     },
     {
@@ -409,7 +460,7 @@
         "edgeKind": "pregateModifiedRoute",
         "targetActionKey": "nextStage.v1",
         "pregateStabilitySha256": "3848711024dcab654c2669a4e53d551bc2950744760d269e4c6ddf40b86e16c2",
-        "liveStabilitySha256": "a07f9267780e055d82dc56328230107c59b082618db8406f392ca3e05b3b98d4"
+        "liveStabilitySha256": "fc2a6bf4c5a9b92a04bd27004157c658b612ab7040052c16323096db0869dae8"
       }
     },
     {
@@ -445,7 +496,7 @@
         "edgeKind": "pregateModifiedRoute",
         "targetActionKey": "none",
         "pregateStabilitySha256": "a1ffcd6c586c2a152fda5bd49fe5991e0f2057d76a400bf648ed726c22ce80ac",
-        "liveStabilitySha256": "839e242de2df8495424bc13922ef21329f382387219c4d8eb580eb62ca047d06"
+        "liveStabilitySha256": "8b84aa572b266d5c18f12282fe2ac78f977e25d7479333d4826e8c4ccecfc52f"
       }
     },
     {
@@ -471,17 +522,17 @@
       "routeKey": "command:vs-code-ai-helper.runImplementationWithAI",
       "path": "src/commands/reviewActions.ts",
       "planSection": "§1.3 (fail-closed AI gates) / §8 Safety cohort",
-      "rationale": "The Safety cohort (plan §1.3) installed the first-statement legacy AI route gate for implementation.v1, then removed it in the same cohort once it was discovered to deadlock the task: implementation.v1 is this migration's own bootstrapping tool (every step, including the step 16 replacement for this action, is implemented by running it), so gating it on its own not-yet-landed migration blocks the only tool that could ever land step 16. Mechanical state is now fileGateRouteIds [] -> [] (net no-op for this route specifically) — see the NOTE comment on runImplementationWithAI in reviewActions.ts and the corresponding removed case in legacyAiActionSafetyGateWiring.test.ts. The file-level rollup still includes the other four reviewActions.ts family gates (review.v1, applyReview.v1, fastForward.v1, generateImplementation.v1), which remain gated and wiring-tested.",
+      "rationale": "The Safety cohort (plan §1.3) installed the first-statement legacy AI route gate for implementation.v1. An earlier round of this cohort had temporarily replaced the throwing gate with a non-throwing 'bootstrap' query so this action could keep running unmigrated while it was still the only tool that could land its own step-16 replacement; that exemption left a live, edit-capable AI route with no read-only preflight in front of it and no plan authorization, so it was removed and the real, throwing assertLegacyAiRouteAllowedV0(\"implementation.v1\") call was restored as the first statement of runImplementationWithAI, before any task/workspace/artifact read, consent prompt, or provider selection. Mechanical state is fileGateRouteIds [] -> [implementation.v1] (this route is now genuinely gated, matching every other unmigrated edit-capable route) — see the NOTE comment on runImplementationWithAI in reviewActions.ts and the corresponding case in legacyAiActionSafetyGateWiring.test.ts. The file-level rollup also includes the other four reviewActions.ts family gates (review.v1, applyReview.v1, fastForward.v1, generateImplementation.v1), which remain gated and wiring-tested.",
       "owner": "ensemble-workflow-migration",
       "cohort": "safety",
       "expiryCohort": "edit",
       "evidence": {
         "symbol": "registerReviewActionCommands",
-        "sourceSpan": "L4258-L4262",
+        "sourceSpan": "L4721-L4725",
         "edgeKind": "pregateModifiedRoute",
         "targetActionKey": "implementation.v1",
         "pregateStabilitySha256": "07c1848dfe3d6e74173c21d8069b6e4891c1784dbdc5f39cdfe63aa17aac1ae9",
-        "liveStabilitySha256": "1dc40566cfc2e8fd4c091b66b972cf105d90e53e63519bf01a930cd50cf18af4"
+        "liveStabilitySha256": "a9cbd2a4cb722c58b3b6be7e25ab2412dd82d3ef92a13b6e75b31a64e7f326e9"
       }
     },
     {
@@ -517,7 +568,7 @@
         "edgeKind": "pregateModifiedRoute",
         "targetActionKey": "review.v1",
         "pregateStabilitySha256": "e7975c133a957f99b60574b871f3687161ff878cc9c03fefdec4e97f8d798be5",
-        "liveStabilitySha256": "268388a9abc15ab6ab4efffcbc41def347a9d991a25ab5d3ca91a306656289ea"
+        "liveStabilitySha256": "2a25034a429b8538393a9ae7e688becc7995bcf0d25b6d19463393be41b5413d"
       }
     },
     {
@@ -535,7 +586,7 @@
         "edgeKind": "pregateModifiedRoute",
         "targetActionKey": "none",
         "pregateStabilitySha256": "ec04b4dae126a297b79f40be00e2c504b09313d2d8a6fdb48ad13e15898508b6",
-        "liveStabilitySha256": "bec5d0f453b386b5b4d79a3da49b5906086379bdd3a3f7d46cc4808be97e9f2a"
+        "liveStabilitySha256": "6cf4296bc3e6cfbdab4b2a1a8df52291c53fb357eb23d3b94a86b4ce5f02195e"
       }
     },
     {
@@ -689,7 +740,7 @@
         "sourceSpan": "L4238-L4241",
         "edgeKind": "pregateAddedRoute",
         "targetActionKey": "generateImplementation.v1",
-        "liveStabilitySha256": "dd3791a628e00fd1b452e3373559b4dea87be433325c26561001814c946e20aa"
+        "liveStabilitySha256": "67ea3d68db51603f5cb6f880c14cf7f0ee48510741fa70e8fbbacc717e813677"
       }
     },
     {
@@ -707,6 +758,108 @@
         "edgeKind": "pregateRemovedRoute",
         "targetActionKey": "generateImplementation.v1",
         "pregateStabilitySha256": "9e3ae6bf3c6c79b124e60813727d0c147d1498fcb25752ddc2527fe3f0610a37"
+      }
+    },
+    {
+      "annotationKind": "pregateRemovedRoute",
+      "routeKey": "provider:src/commands/chatWithStage.ts#chatWithStage->resolveRunnerForModel#1",
+      "path": "src/commands/chatWithStage.ts",
+      "planSection": "§6.5 (Migrate remaining text actions: Chat Send and Chat Resume)",
+      "rationale": "Migrated Chat Send to the chatSend.v1 V1 action coordinator (createProductionTaskActionCoordinatorV1 + coordinator.executeAction), replacing the legacy direct resolveRunnerForModel call site.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "text3",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "symbol": "chatWithStage",
+        "sourceSpan": "L402-L402",
+        "edgeKind": "pregateRemovedRoute",
+        "targetActionKey": "chatSend.v1",
+        "pregateStabilitySha256": "7464161b34b86aa32aec51e536e4f254a013ebfcfef757506700b000f5552bd4"
+      }
+    },
+    {
+      "annotationKind": "pregateRemovedRoute",
+      "routeKey": "provider:src/commands/commitAndPushTask.ts#buildCommitMessage->resolveRunnerForModel#1",
+      "path": "src/commands/commitAndPushTask.ts",
+      "planSection": "§6.5 (Migrate remaining text actions: Commit/Push metadata generation)",
+      "rationale": "Migrated commit-message metadata generation to the commitPushMetadata.v1 V1 action coordinator (createProductionTaskActionCoordinatorV1 + coordinator.executeAction), replacing the legacy direct resolveRunnerForModel call site.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "text3",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "symbol": "buildCommitMessage",
+        "sourceSpan": "L234-L234",
+        "edgeKind": "pregateRemovedRoute",
+        "targetActionKey": "commitPushMetadata.v1",
+        "pregateStabilitySha256": "6f29b0e7a09baab4e708c991a189de04bb889d547dffcfd56fc4a6d2038dc4a8"
+      }
+    },
+    {
+      "annotationKind": "pregateRemovedRoute",
+      "routeKey": "writer:src/commands/chatWithStage.ts#result.outputFile#1",
+      "path": "src/commands/chatWithStage.ts",
+      "planSection": "§6.5 (Migrate remaining text actions: Chat Send and Chat Resume)",
+      "rationale": "Migrated Chat Send to the V1 coordinator, replacing the legacy runner/outputFile writer call site — a completed chatSend.v1 result is now promoted into chat-v1.json by the coordinator itself, not written to a legacy run-log outputFile.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "text3",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "symbol": "result",
+        "sourceSpan": "L421-L421",
+        "edgeKind": "pregateRemovedRoute",
+        "targetActionKey": "chatSend.v1",
+        "pregateStabilitySha256": "2dc55981553a95c2bcc15069ae102ee9d828d6cdae0d2bd89253a904ee03faa4"
+      }
+    },
+    {
+      "annotationKind": "pregateRemovedRoute",
+      "routeKey": "writer:src/commands/commitAndPushTask.ts#result.outputFile#1",
+      "path": "src/commands/commitAndPushTask.ts",
+      "planSection": "§6.5 (Migrate remaining text actions: Commit/Push metadata generation)",
+      "rationale": "Migrated commit-message metadata generation to the V1 coordinator, replacing the legacy runner/outputFile writer call site — a completed commitPushMetadata.v1 result is now read back from the coordinator's own workflow file store target locator, not a legacy run-log outputFile.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "text3",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "symbol": "result",
+        "sourceSpan": "L246-L246",
+        "edgeKind": "pregateRemovedRoute",
+        "targetActionKey": "commitPushMetadata.v1",
+        "pregateStabilitySha256": "b867bac8e43669447d63fe540d5f8004be5ff5711624ecf228ff0d72707c3354"
+      }
+    },
+    {
+      "annotationKind": "pregateRemovedRoute",
+      "routeKey": "writer:src/commands/reviewActions.ts#applySucceeded.outputFileUri#1",
+      "path": "src/commands/reviewActions.ts",
+      "planSection": "§6.5 (Migrate remaining text actions: text-only Apply Review)",
+      "rationale": "Migrated the text-only (plan-review) branch of Apply Review to the applyReview.v1 V1 action coordinator, replacing the legacy runner/outputFileUri writer call site — a completed result now promotes plan.md through the coordinator's own file-store target locator, not a legacy outputFileUri write.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "text3",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "symbol": "applySucceeded",
+        "sourceSpan": "L2724-L2724",
+        "edgeKind": "pregateRemovedRoute",
+        "targetActionKey": "applyReview.v1",
+        "pregateStabilitySha256": "bfa05f5b3af990eb22cb69d344fbd9c112cce4e04bff453c56452c626a8fd834"
+      }
+    },
+    {
+      "annotationKind": "pregateRemovedRoute",
+      "routeKey": "writer:src/commands/reviewActions.ts#reviewWritten.outputFileUri#1",
+      "path": "src/commands/reviewActions.ts",
+      "planSection": "§6.5 (Migrate remaining text actions: reviews)",
+      "rationale": "Migrated Review generation to the review.v1 V1 action coordinator, replacing the legacy runner/outputFileUri writer call site — a completed review result now promotes the review artifact through the coordinator's own file-store target locator, not a legacy outputFileUri write.",
+      "owner": "ensemble-workflow-migration",
+      "cohort": "text3",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "symbol": "reviewWritten",
+        "sourceSpan": "L1972-L1972",
+        "edgeKind": "pregateRemovedRoute",
+        "targetActionKey": "review.v1",
+        "pregateStabilitySha256": "24e3bd6f0733bb2bf7ee0c6d846f968d52938488274453bd4106dcfa3c65c879"
       }
     }
   ]

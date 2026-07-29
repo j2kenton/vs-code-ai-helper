@@ -1,36 +1,41 @@
 import * as vscode from "vscode";
+import * as path from "path";
 import { TaskInventory } from "../state/taskInventory";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { assertLegacyAiRouteAllowedV0 } from "../services/legacyAiActionSafetyGateV0";
 
+import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
+
 /**
  * Apply low-level review changes. This command provides a concrete entry point
- * for the keyboard shortcut router and delegates to the unified applyReviewWithAI
- * command.
+ * for the keyboard shortcut router and delegates to the text-root
+ * (applyReviewWithAI) or edit-root (applyReviewEditWithAI) command, whichever
+ * matches the resolved task's stage (plan §1.3 / AC-ROUTE-01).
  */
 export async function applyLowLevelReviewChanges(
   inventory: TaskInventory,
-  explicitArg?: { canonicalId?: string; taskFolderPath?: string }
+  explicitArg?: { canonicalId?: string; taskFolderPath?: string; task?: { progress: { currentStage: string } } }
 ): Promise<void> {
-  // Concrete alias route of the apply-review action family (plan §1.3): the
-  // gate must run before this wrapper's own task-state reads, not only inside
-  // the downstream applyReviewWithAI handler it delegates to.
+  // Static edit and text safety gates MUST be asserted BEFORE any task, stage,
+  // workspace, artifact, or task-progress reads occur (plan §1.3 / AC-ROUTE-01).
   assertLegacyAiRouteAllowedV0("applyReview.v1");
-  // First try with allowPaused: true to detect paused tasks
-  const pausedCheck = await resolveTaskContext(inventory, explicitArg, {
-    allowPaused: true,
-  });
+  assertLegacyAiRouteAllowedV0("applyReviewEdit.v1");
 
-  if (pausedCheck && pausedCheck.progress.status === "paused") {
-    NotificationRouter.showWarning(
-      "Task is paused. Resume it before applying review changes."
-    );
-    return;
+  const explicitStage = explicitArg?.task?.progress?.currentStage;
+
+  let stage = explicitStage;
+  if (!stage && explicitArg?.taskFolderPath) {
+    const strict = await readTaskProgressStrictV1(vscode.Uri.file(explicitArg.taskFolderPath), {
+      expectedTaskFolder: path.basename(explicitArg.taskFolderPath),
+    });
+    if (strict.ok) {
+      stage = strict.decoded.progress.currentStage;
+    }
   }
 
   const resolvedTask = await resolveTaskContext(inventory, explicitArg, {
-    allowPaused: false,
+    allowPaused: true,
   });
 
   if (!resolvedTask) {
@@ -50,10 +55,39 @@ export async function applyLowLevelReviewChanges(
     return;
   }
 
-  // Delegate to the unified review apply command using taskFolderPath so the
-  // normalizeReviewArg helper in reviewActions can resolve the task correctly.
+  if (resolvedTask.progress.currentStage === "impl-low-review") {
+    assertLegacyAiRouteAllowedV0("applyReviewEdit.v1");
+
+    if (resolvedTask.progress.status === "paused") {
+      NotificationRouter.showWarning(
+        "Task is paused. Resume it before applying review changes."
+      );
+      return;
+    }
+
+    await vscode.commands.executeCommand("vs-code-ai-helper.applyReviewEditWithAI", {
+      task: {
+        folderUri: vscode.Uri.file(resolvedTask.taskFolderPath),
+        folderName: path.basename(resolvedTask.taskFolderPath),
+        progress: resolvedTask.progress,
+      },
+    });
+    return;
+  }
+
+  if (resolvedTask.progress.status === "paused") {
+    NotificationRouter.showWarning(
+      "Task is paused. Resume it before applying review changes."
+    );
+    return;
+  }
+
   await vscode.commands.executeCommand("vs-code-ai-helper.applyReviewWithAI", {
-    taskFolderPath: resolvedTask.taskFolderPath,
+    task: {
+      folderUri: vscode.Uri.file(resolvedTask.taskFolderPath),
+      folderName: path.basename(resolvedTask.taskFolderPath),
+      progress: resolvedTask.progress,
+    },
   });
 }
 

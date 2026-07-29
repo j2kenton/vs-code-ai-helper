@@ -172,7 +172,7 @@ void describe("actionConversationOrchestratorV1", () => {
     assert.equal(record.state, "questionsPosted");
     assert.equal(record.resumeSemantics, "sameOperation");
     assert.deepEqual(record.correlation, correlation);
-    assert.match(record.questionSetDigest, /^[0-9a-f]{64}$/);
+    assert.match(record.questionSetDigest!, /^[0-9a-f]{64}$/);
 
     // The record sits at the registry-vended §2.1 locator.
     assert.ok(

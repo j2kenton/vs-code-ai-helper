@@ -1,8 +1,10 @@
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { describe, it } from "node:test";
 import * as vscode from "vscode";
-import { execCliAgent } from "../runners/cliAgentRunner";
+import { execCliAgent, runImplementationWithCli } from "../runners/cliAgentRunner";
 import { CliProviderDefinition, getCliProvider } from "../runners/providers";
 
 void describe("execCliAgent argv prompt limits", () => {
@@ -142,5 +144,63 @@ void describe("execCliAgent argv prompt limits", () => {
       false,
       "expected the temp prompt file to be cleaned up even though the command was never found"
     );
+  });
+
+  void it("resumes an Antigravity-shaped implementation after the captured response timeout", async () => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-agy-resume-"));
+    const resumeFlags: Array<boolean | undefined> = [];
+    const prompts: string[] = [];
+    const continuationPrompt = "Continue the interrupted task from the existing workspace state.";
+    const provider: CliProviderDefinition = {
+      id: "antigravity-cli",
+      label: "Fake Antigravity CLI",
+      command: "node",
+      installHint: "install",
+      loginHint: "login",
+      authErrorMarkers: ["login"],
+      signInLabel: "Sign in",
+      promptTransport: "file",
+      useShell: false,
+      models: [{ model: undefined, name: "default" }],
+      usesLastMessageFile: false,
+      conversationResume: {
+        errorMarkers: ["error: timeout waiting for response"],
+        continuationPrompt,
+      },
+      buildArgs(_mode, _model, _lastMessageFile, context): string[] {
+        resumeFlags.push(context?.resumePreviousConversation);
+        prompts.push(fs.readFileSync(context?.promptFile ?? "", "utf8"));
+        return context?.resumePreviousConversation
+          ? ["-e", "process.stdout.write('resumed successfully')"]
+          : [
+              "-e",
+              "process.stderr.write('Error: timeout waiting for response'); process.exit(1)",
+            ];
+      },
+    };
+
+    try {
+      const cts = new vscode.CancellationTokenSource();
+      const result = await runImplementationWithCli({
+        def: provider,
+        model: undefined,
+        prompt: "original implementation prompt",
+        workspaceUri: vscode.Uri.file(workspace),
+        token: cts.token,
+        onProgress: () => undefined,
+        requireFileChange: false,
+        retryDelayMs: 0,
+      });
+
+      assert.strictEqual(result.status, "completed");
+      assert.strictEqual(result.summary, "resumed successfully");
+      assert.deepStrictEqual(resumeFlags, [undefined, true]);
+      assert.deepStrictEqual(prompts, [
+        "original implementation prompt",
+        continuationPrompt,
+      ]);
+    } finally {
+      fs.rmSync(workspace, { recursive: true, force: true });
+    }
   });
 });

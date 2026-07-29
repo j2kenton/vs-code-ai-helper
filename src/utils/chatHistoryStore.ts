@@ -1369,6 +1369,12 @@ export async function readChatInteractions(
         if (knownInteractionIds.has(transaction.interactionId)) {
           continue;
         }
+        if (transaction.questions === undefined) {
+          // listUnresolvedForChatDocument excludes invocationPending records
+          // (never a real, renderable interaction — plan §6.1 step 5); this
+          // is defensive, not a real runtime path.
+          continue;
+        }
         const postedAt = transaction.transitions[0]?.at ?? new Date(0).toISOString();
         reconciled.push({
           interactionId: transaction.interactionId,

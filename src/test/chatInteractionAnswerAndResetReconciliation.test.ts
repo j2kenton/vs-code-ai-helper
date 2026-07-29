@@ -139,6 +139,8 @@ function makeSettleFailingStore(
   };
   return {
     begin: notImplemented,
+    beginInvocation: notImplemented,
+    discardPendingInvocation: notImplemented,
     load: notImplemented,
     saveAnswersDraft: notImplemented,
     submitAnswers: notImplemented,

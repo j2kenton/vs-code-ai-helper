@@ -12,9 +12,9 @@
  * digest, per-question answer records with the answer-submission idempotency
  * id, and the current state plus journaled transition receipts.
  *
- * State machine (plan §5.5, verbatim):
+ * State machine (plan §5.5/§6.1, verbatim):
  *
- *   questionsPosted → answersDraft → answersSubmitted → resumeScheduled → settled
+ *   invocationPending → questionsPosted → answersDraft → answersSubmitted → resumeScheduled → settled
  *
  * with exactly one terminal settlement per record: `resumed`, `cancelled`,
  * `supersededByReplacementOperation`, `expired`, or `resetByChatRecovery`.
@@ -26,6 +26,28 @@
  * `supersededByReplacementOperation`) must settle from a `resumeScheduled`
  * receipt — the journaled chain, not the settlement label, proves the record
  * actually traversed answersSubmitted → resumeScheduled → settled.
+ *
+ * PRE-INVOCATION ADMISSION (plan §6.1 step 5 / AC-CHAT-TX-02) — the
+ * coordinator admits a record in `invocationPending` for EVERY
+ * question-capable action's provider invocation, before that invocation
+ * ever runs (`chatInteractionTransactionStoreV1.ts`'s `beginInvocation`),
+ * not only for invocations that turn out to return questions. `questions`
+ * and `questionSetSha256` are therefore optional on this type: absent in
+ * `invocationPending`, required from `questionsPosted` onward (once a
+ * record's transition chain ever reaches `questionsPosted` it keeps them for
+ * good, even after later settling). Only reaching `questionsPosted` makes an
+ * interaction a real, user-visible Chat question — `invocationPending` never
+ * carries anything renderable and is invisible to `listUnresolvedForChatDocument`.
+ * A pending record whose invocation resolves to anything OTHER than
+ * questions never becomes a settled record at all: the store discards it
+ * outright (`discardPendingInvocation`), because it was never a real
+ * interaction and forcing it through a terminal settlement would invent a
+ * settlement label (e.g. "cancelled") for an ordinary completed/failed
+ * outcome that a user never saw. A record only reaches `settled` directly
+ * from `invocationPending` via the ordinary cancel/expire/reset paths
+ * (crash-recovery cleanup of an abandoned pending record, or a genuine
+ * whole-operation cancellation that raced admission) — never via a Resume
+ * settlement, which requires the `resumeScheduled` chain exactly as before.
  *
  * This module owns the persisted shape: the closed record type, the strict
  * fail-closed decoder (unknown fields, digest mismatches, non-canonical
@@ -116,13 +138,14 @@ export const MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1 = 256 * 1024;
 /**
  * Journaled transition receipts are bounded because draft re-saves do not
  * append (see module header): the longest legal chain is
- * null → questionsPosted → answersDraft → answersSubmitted → resumeScheduled
- * → settled (5 receipts). 8 leaves headroom without permitting unbounded
- * growth.
+ * null → invocationPending → questionsPosted → answersDraft →
+ * answersSubmitted → resumeScheduled → settled (6 receipts). 8 leaves
+ * headroom without permitting unbounded growth.
  */
 export const MAX_TRANSITION_RECEIPTS_V1 = 8;
 
 export type ChatInteractionTransactionStateV1 =
+  | "invocationPending"
   | "questionsPosted"
   | "answersDraft"
   | "answersSubmitted"
@@ -201,9 +224,16 @@ export interface ChatInteractionTransactionV1 {
   readonly resumeSemantics: ResumeSemanticsV1;
   readonly inputSnapshot: ChatTransactionInputSnapshotV1;
   readonly promptContract: ChatTransactionPromptContractV1;
-  readonly questions: readonly StructuredQuestionV1[];
-  /** SHA-256 over the domain-prefixed canonical question-set JSON. */
-  readonly questionSetSha256: string;
+  /**
+   * Absent while `state` is `invocationPending` (admitted before the
+   * provider ever ran, questions not yet known); required from
+   * `questionsPosted` onward and preserved through every later state,
+   * including a Resume settlement (module header, "PRE-INVOCATION
+   * ADMISSION").
+   */
+  readonly questions?: readonly StructuredQuestionV1[];
+  /** SHA-256 over the domain-prefixed canonical question-set JSON. Present exactly when `questions` is. */
+  readonly questionSetSha256?: string;
   /**
    * Present from `answersDraft` onward. In `answersDraft` (or a record
    * settled directly from a draft) the set may be partial; from
@@ -242,6 +272,7 @@ export interface ChatInteractionTransactionV1 {
 }
 
 const STATES_V1: readonly ChatInteractionTransactionStateV1[] = [
+  "invocationPending",
   "questionsPosted",
   "answersDraft",
   "answersSubmitted",
@@ -265,7 +296,8 @@ const LEGAL_TRANSITIONS_V1: ReadonlyMap<
   ChatInteractionTransactionStateV1 | null,
   readonly ChatInteractionTransactionStateV1[]
 > = new Map<ChatInteractionTransactionStateV1 | null, readonly ChatInteractionTransactionStateV1[]>([
-  [null, ["questionsPosted"]],
+  [null, ["invocationPending"]],
+  ["invocationPending", ["questionsPosted", "settled"]],
   ["questionsPosted", ["answersDraft", "answersSubmitted", "settled"]],
   ["answersDraft", ["answersSubmitted", "settled"]],
   ["answersSubmitted", ["resumeScheduled", "settled"]],
@@ -601,19 +633,27 @@ export function decodeChatInteractionTransactionV1(
     return fail(promptContract);
   }
 
-  const questionsResult = decodeStructuredQuestionsV1(raw.questions);
-  if (!questionsResult.ok || !questionsResult.questions) {
-    return fail(`invalid question set: ${questionsResult.reason ?? "unknown"}`);
-  }
-  const questions = questionsResult.questions;
-  if (canonicalJsonByteLengthV1(questions) > MAX_QUESTION_SET_CANONICAL_BYTES_V1) {
-    return fail(`question set exceeds the ${MAX_QUESTION_SET_CANONICAL_BYTES_V1}-byte canonical limit`);
-  }
-  if (
-    !isSha256Hex(raw.questionSetSha256) ||
-    raw.questionSetSha256 !== computeChatTransactionQuestionSetSha256V1(questions)
-  ) {
-    return fail("\"questionSetSha256\" does not match the canonical question set");
+  // "questions"/"questionSetSha256" are absent while `invocationPending`
+  // (module header, "PRE-INVOCATION ADMISSION") and required together from
+  // `questionsPosted` onward — decoded here whenever either is present so a
+  // record carrying just one of the pair (a corrupt/partial write) is
+  // rejected rather than silently treated as absent.
+  let questions: readonly StructuredQuestionV1[] | undefined;
+  if (raw.questions !== undefined || raw.questionSetSha256 !== undefined) {
+    const questionsResult = decodeStructuredQuestionsV1(raw.questions);
+    if (!questionsResult.ok || !questionsResult.questions) {
+      return fail(`invalid question set: ${questionsResult.reason ?? "unknown"}`);
+    }
+    questions = questionsResult.questions;
+    if (canonicalJsonByteLengthV1(questions) > MAX_QUESTION_SET_CANONICAL_BYTES_V1) {
+      return fail(`question set exceeds the ${MAX_QUESTION_SET_CANONICAL_BYTES_V1}-byte canonical limit`);
+    }
+    if (
+      !isSha256Hex(raw.questionSetSha256) ||
+      raw.questionSetSha256 !== computeChatTransactionQuestionSetSha256V1(questions)
+    ) {
+      return fail("\"questionSetSha256\" does not match the canonical question set");
+    }
   }
 
   const state = raw.state;
@@ -643,6 +683,9 @@ export function decodeChatInteractionTransactionV1(
     if (answers === undefined) {
       return fail("a record with an \"answerIdempotencyId\" must carry its \"answers\"");
     }
+    if (questions === undefined) {
+      return fail("submitted answers require a posted question set");
+    }
     const validation = validateStructuredAnswersV1(questions, answers);
     if (!validation.ok) {
       return fail(`submitted answers do not validate: ${validation.reason ?? "unknown"}`);
@@ -655,6 +698,9 @@ export function decodeChatInteractionTransactionV1(
     }
     answersSha256 = raw.answersSha256;
   } else if (answers !== undefined) {
+    if (questions === undefined) {
+      return fail("draft answers require a posted question set");
+    }
     const draftProblem = validateDraftAnswers(questions, answers);
     if (draftProblem) {
       return fail(draftProblem);
@@ -677,7 +723,18 @@ export function decodeChatInteractionTransactionV1(
 
   // --- per-state field consistency ----------------------------------------
   switch (typedState) {
+    case "invocationPending":
+      if (questions !== undefined) {
+        return fail("an invocationPending record cannot carry a posted question set");
+      }
+      if (answers !== undefined || answerIdempotencyId !== undefined) {
+        return fail("an invocationPending record cannot carry answers");
+      }
+      break;
     case "questionsPosted":
+      if (questions === undefined) {
+        return fail("a questionsPosted record must carry its posted question set");
+      }
       if (answers !== undefined || answerIdempotencyId !== undefined) {
         return fail("a questionsPosted record cannot carry answers");
       }
@@ -863,6 +920,20 @@ export function decodeChatInteractionTransactionV1(
     return fail("a record that entered resumeScheduled must carry its \"resumeIdempotencyId\"");
   }
 
+  // A record only ever becomes a real, user-visible Chat question once its
+  // chain actually reaches `questionsPosted` (module header, "PRE-INVOCATION
+  // ADMISSION") — this is the authoritative test, not the CURRENT state,
+  // since a settled record may have reached `questionsPosted` long before
+  // settling. A record that never posted questions (settled straight from
+  // `invocationPending` via cancel/expire/reset) must never carry them.
+  const enteredQuestionsPosted = transitions.some((receipt) => receipt.to === "questionsPosted");
+  if (enteredQuestionsPosted && questions === undefined) {
+    return fail("a record that entered questionsPosted must carry its posted question set");
+  }
+  if (!enteredQuestionsPosted && questions !== undefined) {
+    return fail("a record cannot carry a posted question set without a questionsPosted transition receipt");
+  }
+
   return {
     ok: true,
     transaction: {
@@ -877,8 +948,7 @@ export function decodeChatInteractionTransactionV1(
       resumeSemantics,
       inputSnapshot,
       promptContract,
-      questions,
-      questionSetSha256: raw.questionSetSha256,
+      ...(questions !== undefined ? { questions, questionSetSha256: raw.questionSetSha256 as string } : {}),
       ...(answers !== undefined ? { answers } : {}),
       ...(answerIdempotencyId !== undefined ? { answerIdempotencyId } : {}),
       ...(answersSha256 !== undefined ? { answersSha256 } : {}),

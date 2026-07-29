@@ -29,20 +29,31 @@ import * as path from "node:path";
 import { after, describe, it } from "node:test";
 import * as vscode from "vscode";
 
-import { isUnusableAsExistingReview, nextStage, runReviewForFolder } from "../commands/reviewActions";
+import { isUnusableAsExistingReview, nextStage, resumeReviewInteractionV1, runReviewForFolder } from "../commands/reviewActions";
 import { setTaskStage } from "../commands/setTaskStage";
 import { commitAndPushTask, completeCommitAndPushTask } from "../commands/commitAndPushTask";
 import { REVIEW_STAGES, TaskProgress, TaskStage } from "../types/taskProgress";
-import type { AgentRunRequest, AgentRunResult } from "../types/agentRunner";
+import type { AgentRunResult } from "../types/agentRunner";
+import type { AgentTransportV1 } from "../types/agentExecutionV1";
+import { ChatViewProvider, ChatInteractionRefV1 } from "../views/chatView";
+import { allocateHex128IdV1 } from "../types/actionCorrelationV1";
+import { getProductionActionConversationOrchestratorV1 } from "../actions/productionTaskActionRuntimeV1";
 import type { AutomationDispatch } from "../utils/automationChain";
 import { scheduleAutomationChain, resetAutomationChainGuards } from "../utils/automationChain";
 import { StatusTreeProvider } from "../views/statusView";
+import { createChatInteractionTransactionStoreV1 } from "../services/chatInteractionTransactionStoreV1";
+import {
+  configureWorkflowPrivateStorageRootV1,
+  getWorkflowFileStoreV1,
+  getWorkflowPathRegistryV1,
+  setChatInteractionTransactionStoreV1,
+} from "../services/workflowRuntimeServicesV1";
 import { initNotificationRouter, deactivateNotificationRouter } from "../utils/notificationRouter";
 import { upsertCompletionChecksInPublishReview, CompletionLintResult } from "../utils/completionLint";
 import { TaskInventory } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { normalizePath } from "../utils/taskRoot";
-import { __quotaTestOnly, getQuotaObservation, recordQuotaObservation } from "../utils/quota";
+import { __quotaTestOnly } from "../utils/quota";
 
 /* eslint-disable @typescript-eslint/no-var-requires */
 const settingsModule = require("../config/settings") as Record<string, unknown>;
@@ -57,6 +68,30 @@ const gitRepoInfoModule = require("../utils/gitRepoInfo") as Record<string, unkn
 /* eslint-enable @typescript-eslint/no-var-requires */
 
 const REAL_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-publish-owner-"));
+
+// runReviewForFolder/commitAndPushTask's AI metadata path run through the
+// real production coordinator (createProductionTaskActionCoordinatorV1),
+// which requires the Chat interaction transaction store to be wired exactly
+// as extension.ts does at activation — otherwise
+// getProductionActionConversationOrchestratorV1 throws "not wired yet"
+// before this file's actual ownership-matrix behavior ever runs.
+const PRIVATE_STORAGE_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-publish-owner-private-"));
+// configureWorkflowPrivateStorageRootV1 MUST run (and its `rebuildFileStore()`
+// side effect complete) before getWorkflowFileStoreV1() is called below —
+// object-literal property evaluation runs top-to-bottom, so folding the
+// configure call into the `privateRootId` property here would capture the
+// PRE-registration (root-less) fileStore instance and every `begin()` write
+// through it would fail closed with `workspaceRootUnsupported`, exactly as
+// extension.ts's own activation wiring avoids by registering the root in its
+// own statement first (src/extension.ts, `workflowPrivateStorageRootId`).
+const PRIVATE_STORAGE_ROOT_ID = configureWorkflowPrivateStorageRootV1(PRIVATE_STORAGE_ROOT);
+setChatInteractionTransactionStoreV1(
+  createChatInteractionTransactionStoreV1({
+    registry: getWorkflowPathRegistryV1(),
+    fileStore: getWorkflowFileStoreV1(),
+    privateRootId: PRIVATE_STORAGE_ROOT_ID,
+  })
+);
 
 // Never cleaned up before this: every run of this file left its entire
 // REAL_ROOT tree (task folders, progress files, review artifacts from every
@@ -84,6 +119,13 @@ function makeTaskFolder(
     status: "active",
     createdAt: "2026-01-01T00:00:00.000Z",
     updatedAt: "2026-01-01T00:00:00.000Z",
+    ownership: {
+      metaRoot: path.dirname(folderPath),
+      projectRoot: path.dirname(folderPath),
+      workspaceRoot: REAL_ROOT,
+      boundAt: "2026-01-01T00:00:00.000Z",
+      state: "resolved",
+    },
   };
   fs.writeFileSync(path.join(folderPath, "task-progress.json"), JSON.stringify(progress, null, 2), "utf8");
   fs.writeFileSync(path.join(folderPath, "task.md"), "# Task\n\nDo the thing.\n", "utf8");
@@ -152,6 +194,149 @@ function patch(module: Record<string, unknown>, name: string, replacement: unkno
   return { restore: (): void => { module[name] = orig; } };
 }
 
+function fakeToken(cancelled = false): vscode.CancellationToken {
+  return {
+    isCancellationRequested: cancelled,
+    onCancellationRequested: () => ({ dispose: (): void => undefined }),
+  } as unknown as vscode.CancellationToken;
+}
+
+/**
+ * ChatViewProvider.askInteraction's first call for a task opens the webview
+ * via `executeCommand("vs-code-ai-helper.chatView.focus")` (chatView.ts's
+ * `open()`), which this test process never registers — mirrors
+ * chatInteractionUI.test.ts's identical harness.
+ */
+function installExecuteCommandCapture(): { restore: () => void } {
+  const commandsObj = vscode.commands as unknown as {
+    _executeCommandOverride?: (id: string, ...args: unknown[]) => Promise<unknown>;
+  };
+  const orig = commandsObj._executeCommandOverride;
+  commandsObj._executeCommandOverride = (): Promise<unknown> => Promise.resolve(undefined);
+  return {
+    restore: (): void => {
+      commandsObj._executeCommandOverride = orig;
+    },
+  };
+}
+
+/**
+ * runReviewForFolder/applyReviewWithAI now run through the real V1 action
+ * coordinator (createProductionTaskActionCoordinatorV1), which selects
+ * providers via runnerRegistry's `createV1RunnerSelectionOpener` — NOT the
+ * legacy `resolveRunnerForModel`/`backupModelsForStage` cascade this file
+ * used to patch. Framing a fake response therefore requires the V1 envelope
+ * format and this seam instead.
+ */
+function frame(json: unknown): string {
+  return `<<<ENSEMBLE_AI_RESULT_V1>>>\n${JSON.stringify(json)}\n<<<END_ENSEMBLE_AI_RESULT_V1>>>\n`;
+}
+
+/**
+ * A V1 transport that frames a completed markdown-artifact.v1 envelope
+ * echoing the request's correlation. `produceMarkdown` is invoked at invoke
+ * time (not eagerly), so a caller can run a side effect (e.g. simulating a
+ * mid-review pause) exactly when the "provider" would have been running.
+ */
+function scriptedMarkdownTransportV1(
+  produceMarkdown: () => string,
+  runnerId = "stub-runner"
+): AgentTransportV1 {
+  return {
+    runnerId,
+    invoke: (request, output): Promise<{ kind: "completed" }> => {
+      output.write(
+        frame({
+          version: 1,
+          correlation: request.correlation,
+          kind: "completed",
+          content: { contentType: "markdown-artifact.v1", schemaVersion: 1, markdown: produceMarkdown() },
+        })
+      );
+      return Promise.resolve({ kind: "completed" as const });
+    },
+  };
+}
+
+/** A V1 transport that frames a fixed completed markdown-artifact.v1 envelope. */
+function markdownTransportV1(markdown: string, runnerId = "stub-runner"): AgentTransportV1 {
+  return scriptedMarkdownTransportV1(() => markdown, runnerId);
+}
+
+/** A V1 transport that frames a `questions` envelope with a single required text question. */
+function questionsTransportV1(runnerId = "stub-runner"): AgentTransportV1 {
+  return {
+    runnerId,
+    invoke: (request, output): Promise<{ kind: "completed" }> => {
+      output.write(
+        frame({
+          version: 1,
+          correlation: request.correlation,
+          kind: "questions",
+          questions: [
+            {
+              questionId: "q1",
+              kind: "text",
+              prompt: "Which approach should the review favor?",
+              required: true,
+              allowBlank: false,
+              maxLength: 200,
+            },
+          ],
+        })
+      );
+      return Promise.resolve({ kind: "completed" as const });
+    },
+  };
+}
+
+/**
+ * Patches runnerRegistry's `createV1RunnerSelectionOpener` factory — the seam
+ * `createProductionTaskActionCoordinatorV1` calls internally — so a
+ * coordinator-run review/apply-review never reaches a real CLI or Copilot
+ * provider. Reservations still flow through the caller's own selection
+ * session (`session.reserve`), so claim-once/one-reservation-per-attempt stay
+ * session-enforced exactly like production; only WHICH runner/model is
+ * offered is stubbed, mirroring the ranked-candidate contract
+ * `openV1RunnerSelection` implements: transports are offered in order, and
+ * running out reports `providerModeUnavailable` (nothing reserved yet) or
+ * `candidatesExhausted` (at least one candidate already offered).
+ */
+function stubV1RunnerSelection(transports: readonly AgentTransportV1[]): Patched {
+  let cursor = 0;
+  const fakeOpener = (request: {
+    session: { reserve: (input: Record<string, unknown>) => unknown };
+    mode: unknown;
+  }) => ({
+    reserveNext(attemptId: string): unknown {
+      const transport = transports[cursor];
+      if (!transport) {
+        return cursor === 0
+          ? { kind: "noneRemaining", code: "providerModeUnavailable" }
+          : { kind: "noneRemaining", code: "candidatesExhausted" };
+      }
+      cursor += 1;
+      const handle = request.session.reserve({
+        attemptId,
+        mode: request.mode,
+        runnerId: transport.runnerId,
+        providerId: "copilot",
+        modelId: "copilot:test",
+      });
+      return {
+        kind: "reserved",
+        reserved: {
+          handle,
+          providerLabel: "Test Provider",
+          storedModelId: "copilot:test",
+          createTransport: () => transport,
+        },
+      };
+    },
+  });
+  return patch(runnerRegistryModule, "createV1RunnerSelectionOpener", () => fakeOpener);
+}
+
 /** Minimal TaskInventory stub — enough for setTaskStage's resolveTaskContext + refresh(). */
 function makeInventoryStub(
   taskFolderPath: string,
@@ -190,6 +375,73 @@ function makeInventoryStub(
   inv.getVisibleTaskForSuppressedId = (): undefined => undefined;
   inv.getVisibleTaskForSuppressedPath = (): undefined => undefined;
   return inv;
+}
+
+/**
+ * Like makeInventoryStub, but the stubbed task's `progress` carries the same
+ * `ownership`/`taskFolder` binding written to disk by `makeTaskFolder`, and
+ * the task carries a `workspaceFolder` — both required for
+ * `TaskInventory.getTaskByBindingId` (the real, un-stubbed prototype method,
+ * which derives a `TaskBindingV1` from `progress` via `deriveTaskBindingV1`)
+ * to resolve the task that a durable Chat interaction transaction's
+ * `taskBindingId` names, exactly as the production Resume delegates
+ * (`resumeReviewInteractionV1`, `resumeApplyReviewInteractionV1`,
+ * `resumeCommitPushMetadataInteractionV1`) look it up.
+ */
+function makeBindingInventoryStub(
+  folderPath: string,
+  currentStage: TaskStage
+): TaskInventory {
+  const inv = Object.create(TaskInventory.prototype) as TaskInventory;
+  const folderName = folderPath.split(/[/\\]/).pop() ?? "";
+  const task = {
+    canonicalId: folderPath,
+    taskFolderPath: folderPath,
+    folderName,
+    sourceScopeKey: folderPath,
+    workspaceFolder: vscode.Uri.file(REAL_ROOT),
+    progress: {
+      taskFolder: folderName,
+      currentStage,
+      status: "active" as const,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      ownership: {
+        metaRoot: path.dirname(folderPath),
+        projectRoot: path.dirname(folderPath),
+        workspaceRoot: REAL_ROOT,
+        boundAt: "2026-01-01T00:00:00.000Z",
+        state: "resolved" as const,
+      },
+    },
+  };
+  // @ts-expect-error — direct field init on stub
+  inv.visibleTasks = [task];
+  // @ts-expect-error — direct field init on stub
+  inv.taskByCanonicalId = new Map([[folderPath, task]]);
+  // @ts-expect-error — direct field init on stub
+  inv.suppressionAliasMap = new Map();
+  inv.refresh = async (): Promise<void> => { /* no-op */ };
+  inv.getTasks = (): Array<typeof task> => [task];
+  inv.getTaskById = (id: string): typeof task | undefined => (id === folderPath ? task : undefined);
+  inv.getTaskByPath = (p: string): typeof task | undefined => (p === folderPath ? task : undefined);
+  inv.getVisibleTaskForSuppressedId = (): undefined => undefined;
+  inv.getVisibleTaskForSuppressedPath = (): undefined => undefined;
+  return inv;
+}
+
+/** Minimal vscode.Memento backing store for a standalone ChatViewProvider instance. */
+function makeMemento(): vscode.Memento {
+  const store = new Map<string, unknown>();
+  return {
+    get: <T>(key: string, defaultValue?: T): T => (store.has(key) ? (store.get(key) as T) : (defaultValue as T)),
+    update: (key: string, value: unknown): Promise<void> => {
+      if (value === undefined) store.delete(key);
+      else store.set(key, value);
+      return Promise.resolve();
+    },
+    keys: (): readonly string[] => [...store.keys()],
+  } as unknown as vscode.Memento;
 }
 
 /**
@@ -239,16 +491,6 @@ async function runPassingReview(
   reviewOptions: Parameters<typeof runReviewForFolder>[5] = {}
 ): Promise<void> {
   const workspaceRoot = { uri: vscode.Uri.file(REAL_ROOT), name: "root", index: 0 } as vscode.WorkspaceFolder;
-  const fakeRunner = {
-    id: "stub-runner",
-    label: "Stub Provider",
-    capabilities: { planning: true, review: true, assistant: false },
-    isAvailable: (): Promise<{ available: boolean }> => Promise.resolve({ available: true }),
-    run: async (request: AgentRunRequest): Promise<AgentRunResult> => {
-      await fs.promises.writeFile(request.outputFile.fsPath, reviewText, "utf8");
-      return { runnerId: "stub-runner", status: "completed" };
-    },
-  };
   const contextPack = path.join(folderPath, "context-pack.md");
   fs.writeFileSync(contextPack, "# Context\n", "utf8");
 
@@ -259,9 +501,7 @@ async function runPassingReview(
       Promise.resolve({ source: "settings", modelId: "stub:model" })),
     patch(modelSelectionModule, "resolveConfiguredReviewStages", () =>
       Promise.resolve(new Set(REVIEW_STAGES))),
-    patch(runnerRegistryModule, "resolveRunnerForModel", () => ({
-      runner: fakeRunner, provider: "copilot", providerLabel: "Stub Provider", nativeModelId: undefined,
-    })),
+    stubV1RunnerSelection([markdownTransportV1(reviewText)]),
     patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.resolve("stub prompt")),
     patch(runLogModule, "writeRunLog", () => Promise.resolve(undefined)),
     patch(contextPackModule, "writeContextPack", () => Promise.resolve(vscode.Uri.file(contextPack))),
@@ -360,19 +600,6 @@ void describe("Publish auto-run ownership matrix — auto-advance landing on Pub
     // The AI review call is where a real review spends most of its (possibly
     // multi-minute) wall-clock time — simulate the user pausing the task
     // from the UI while it is still in flight, before the review resolves.
-    const fakeRunner = {
-      id: "stub-runner",
-      label: "Stub Provider",
-      capabilities: { planning: true, review: true, assistant: false },
-      isAvailable: (): Promise<{ available: boolean }> => Promise.resolve({ available: true }),
-      run: async (request: AgentRunRequest): Promise<AgentRunResult> => {
-        const progress = JSON.parse(fs.readFileSync(progressPath, "utf8")) as TaskProgress;
-        progress.status = "paused";
-        fs.writeFileSync(progressPath, JSON.stringify(progress, null, 2), "utf8");
-        await fs.promises.writeFile(request.outputFile.fsPath, "Readiness: 9/10\n\n- Ready.\n", "utf8");
-        return { runnerId: "stub-runner", status: "completed" };
-      },
-    };
     const patches: Patched[] = [
       patch(settingsModule, "isAutoAdvanceEnabled", () => true),
       patch(settingsModule, "getAutoAdvanceMode", () => "auto"),
@@ -383,9 +610,14 @@ void describe("Publish auto-run ownership matrix — auto-advance landing on Pub
         Promise.resolve({ source: "settings", modelId: "stub:model" })),
       patch(modelSelectionModule, "resolveConfiguredReviewStages", () =>
         Promise.resolve(new Set(REVIEW_STAGES))),
-      patch(runnerRegistryModule, "resolveRunnerForModel", () => ({
-        runner: fakeRunner, provider: "copilot", providerLabel: "Stub Provider", nativeModelId: undefined,
-      })),
+      stubV1RunnerSelection([
+        scriptedMarkdownTransportV1(() => {
+          const progress = JSON.parse(fs.readFileSync(progressPath, "utf8")) as TaskProgress;
+          progress.status = "paused";
+          fs.writeFileSync(progressPath, JSON.stringify(progress, null, 2), "utf8");
+          return "Readiness: 9/10\n\n- Ready.\n";
+        }),
+      ]),
       patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.resolve("stub prompt")),
       patch(runLogModule, "writeRunLog", () => Promise.resolve(undefined)),
       patch(contextPackModule, "writeContextPack", () => Promise.resolve(vscode.Uri.file(contextPack))),
@@ -430,16 +662,6 @@ void describe("Publish auto-run ownership matrix — dropped auto-review chain w
     const workspaceRoot = { uri: vscode.Uri.file(REAL_ROOT), name: "root", index: 0 } as vscode.WorkspaceFolder;
     const contextPack = path.join(folderPath, "context-pack.md");
     fs.writeFileSync(contextPack, "# Context\n", "utf8");
-    const fakeRunner = {
-      id: "stub-runner",
-      label: "Stub Provider",
-      capabilities: { planning: true, review: true, assistant: false },
-      isAvailable: (): Promise<{ available: boolean }> => Promise.resolve({ available: true }),
-      run: async (request: AgentRunRequest): Promise<AgentRunResult> => {
-        await fs.promises.writeFile(request.outputFile.fsPath, "Readiness: 9/10\n\n- Ready.\n", "utf8");
-        return { runnerId: "stub-runner", status: "completed" };
-      },
-    };
     const patches: Patched[] = [
       patch(settingsModule, "isAutoAdvanceEnabled", () => true),
       patch(settingsModule, "getAutoAdvanceMode", () => "auto-fast-forward"),
@@ -450,9 +672,7 @@ void describe("Publish auto-run ownership matrix — dropped auto-review chain w
         Promise.resolve({ source: "settings", modelId: "stub:model" })),
       patch(modelSelectionModule, "resolveConfiguredReviewStages", () =>
         Promise.resolve(new Set(REVIEW_STAGES))),
-      patch(runnerRegistryModule, "resolveRunnerForModel", () => ({
-        runner: fakeRunner, provider: "copilot", providerLabel: "Stub Provider", nativeModelId: undefined,
-      })),
+      stubV1RunnerSelection([markdownTransportV1("Readiness: 9/10\n\n- Ready.\n")]),
       patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.resolve("stub prompt")),
       patch(runLogModule, "writeRunLog", () => Promise.resolve(undefined)),
       patch(contextPackModule, "writeContextPack", () => Promise.resolve(vscode.Uri.file(contextPack))),
@@ -927,6 +1147,13 @@ void describe("Publish auto-run ownership matrix — manual entry routes (comman
         status: "active",
         createdAt: "2026-01-01T00:00:00.000Z",
         updatedAt: "2026-01-01T00:00:00.000Z",
+        ownership: {
+          metaRoot: path.dirname(folder),
+          projectRoot: path.dirname(folder),
+          workspaceRoot: isolatedRoot,
+          boundAt: "2026-01-01T00:00:00.000Z",
+          state: "resolved",
+        },
       };
       fs.writeFileSync(path.join(folder, "task-progress.json"), JSON.stringify(progress, null, 2), "utf8");
       fs.writeFileSync(path.join(folder, "task.md"), "# Task\n\nDo the thing.\n", "utf8");
@@ -1086,6 +1313,13 @@ void describe("Publish auto-run ownership matrix — passing review, composite, 
       status: "active",
       createdAt: "2026-01-01T00:00:00.000Z",
       updatedAt: "2026-01-01T00:00:00.000Z",
+      ownership: {
+        metaRoot: path.dirname(folderPath),
+        projectRoot: path.dirname(folderPath),
+        workspaceRoot: REAL_ROOT,
+        boundAt: "2026-01-01T00:00:00.000Z",
+        state: "resolved",
+      },
     };
     fs.writeFileSync(path.join(folderPath, "task-progress.json"), JSON.stringify(progress, null, 2), "utf8");
 
@@ -1143,6 +1377,13 @@ void describe("Publish auto-run ownership matrix — passing review, composite, 
       completedAt,
       createdAt: "2026-01-01T00:00:00.000Z",
       updatedAt: "2026-01-01T00:00:00.000Z",
+      ownership: {
+        metaRoot: path.dirname(folderPath),
+        projectRoot: path.dirname(folderPath),
+        workspaceRoot: REAL_ROOT,
+        boundAt: "2026-01-01T00:00:00.000Z",
+        state: "resolved",
+      },
     };
     fs.writeFileSync(path.join(folderPath, "task-progress.json"), JSON.stringify(progress, null, 2), "utf8");
 
@@ -1368,22 +1609,49 @@ void describe("Publish auto-run ownership matrix — implReviewFiles scope consi
 });
 
 /**
- * Regression coverage for a real production bug: a primary model that exits
- * cleanly (status "completed") but with unusable review content — no
- * "Readiness: N/10" line — is invisible to resolveRunnerForModel's own
- * quota/unavailable-triggered backup cascade, since that wrapper only reacts
- * to CliExecResult.status/failureKind. Verified live: opencode's
- * "opencode-go/kimi-k3" backup model did exactly this (a truncated
- * mid-generation response, still exit-0) when rate-limited, and the review
- * was rejected with no automatic retry against the task's other configured
- * backup models — the user had to notice and manually re-run the review,
- * which just retried the same flaky primary again. runAiToFile now retries
- * the stage's configured backups itself when content validation rejects the
- * primary's output.
+ * This describe block used to cover reviewActions.ts's own content-validation
+ * backup-retry cascade (runAiToFile retrying a stage's configured backups
+ * when the primary's output had no "Readiness: N/10" line, with dedup against
+ * already-tried models, quota-observation gating, and atomic
+ * fallbackActive/fallbackModelId persistence). Review generation now runs
+ * through the V1 action coordinator (review.v1, reviewRowV1.ts), which
+ * changes this behavior deliberately, not by omission:
+ *
+ *  - Provider selection and fallback move to providerSelectionPolicyV1.ts /
+ *    runnerRegistry.ts's openV1RunnerSelection. Per plan §3.3/AC-RUNNER-05,
+ *    fallback to another provider is allowed ONLY after a pre-response
+ *    outcome (a candidate that can't satisfy the requested mode, or a
+ *    pre-response transport failure) — NOT after a malformed/invalid
+ *    completed result. A response with no Readiness line now decodes fine as
+ *    a well-formed `markdown-artifact.v1` completed envelope, so by the time
+ *    reviewRowV1.ts's promoteReviewContentV1 rejects it for missing
+ *    readiness, the provider selection session has already reported that
+ *    attempt "completed" and closed — there is no backup retry to trigger.
+ *  - The old dedup-against-already-tried-model logic
+ *    (qualifiedRanModelId/normalizeQualifiedModelId) lived entirely inside
+ *    runAiToFile's own cascade and has no V1 equivalent to test here: ranking
+ *    and dedup of primary vs. configured backups is runnerRegistry.ts's
+ *    openV1RunnerSelection's responsibility now (covered by
+ *    runnerRegistry.test.ts and taskActionCoordinatorV1.test.ts), not
+ *    something reviewActions.ts's callers orchestrate per-attempt.
+ *  - fallbackActive/fallbackModelId persistence tied to a content-validation
+ *    retry no longer applies for the same reason: there is no retry to
+ *    persist the outcome of.
+ *
+ * What replaces this coverage: reviewRowV1.ts's own promotion-time readiness
+ * check (a malformed/no-Readiness response is a terminal `promotionFailed`
+ * outcome, never retried) and the provider-unavailable-cascades-to-next-
+ * candidate contract already covered directly against
+ * openV1RunnerSelection/providerSelectionPolicyV1 in runnerRegistry.test.ts
+ * and taskActionCoordinatorV1.test.ts. The test below pins the
+ * reviewActions.ts-level, end-to-end half of that contract: a real
+ * runReviewForFolder call whose provider produces well-formed but invalid
+ * (no Readiness line) content must reject it as terminal, never falling back
+ * to a second configured candidate and never publishing the artifact.
  */
-void describe("Review generation — content-validation failure falls back to a configured backup model", () => {
-  void it("primary returns clean status but no Readiness line: retries a configured backup and promotes its valid output", async () => {
-    const { folderPath } = makeTaskFolder(`content-fallback-${Math.floor(Math.random() * 1e9)}`, "impl-low-review");
+void describe("Review generation — a malformed (no Readiness line) response is a terminal failure, never retried", () => {
+  void it("a review response with no Readiness line is rejected as a terminal failure — no fallback candidate is ever reached, and nothing is published", async () => {
+    const { folderPath } = makeTaskFolder(`content-invalid-terminal-${Math.floor(Math.random() * 1e9)}`, "impl-low-review");
     const provider = new StatusTreeProvider();
     initNotificationRouter(provider);
     const fsBridge = installFsBridge();
@@ -1392,35 +1660,7 @@ void describe("Review generation — content-validation failure falls back to a 
     const contextPack = path.join(folderPath, "context-pack.md");
     fs.writeFileSync(contextPack, "# Context\n", "utf8");
 
-    let primaryRunCount = 0;
-    let backupRunCount = 0;
-    let backupListReadCount = 0;
-    const primaryRunner = {
-      id: "primary-stub-runner",
-      label: "Primary Stub Provider",
-      capabilities: { planning: true, review: true, assistant: false },
-      isAvailable: (): Promise<{ available: boolean }> => Promise.resolve({ available: true }),
-      run: async (request: AgentRunRequest): Promise<AgentRunResult> => {
-        primaryRunCount += 1;
-        // No "Readiness: N/10" line — the exact shape a rate-limited free-tier
-        // model returned live (a response truncated mid-generation, still
-        // exit 0), which validateReviewOutput rejects.
-        await fs.promises.writeFile(request.outputFile.fsPath, "I'll verify the plan's claims before scoring.", "utf8");
-        return { runnerId: "primary-stub-runner", status: "completed", summary: "Generated 47 characters" };
-      },
-    };
-    const backupRunner = {
-      id: "backup-stub-runner",
-      label: "Backup Stub Provider",
-      capabilities: { planning: true, review: true, assistant: false },
-      isAvailable: (): Promise<{ available: boolean }> => Promise.resolve({ available: true }),
-      run: async (request: AgentRunRequest): Promise<AgentRunResult> => {
-        backupRunCount += 1;
-        await fs.promises.writeFile(request.outputFile.fsPath, "Readiness: 8/10\n\n- Ready to proceed.\n", "utf8");
-        return { runnerId: "backup-stub-runner", status: "completed", summary: "Generated 40 characters" };
-      },
-    };
-
+    let secondCandidateInvoked = false;
     const patches: Patched[] = [
       patch(settingsModule, "isAutoAdvanceEnabled", () => false),
       patch(settingsModule, "getAutoAdvanceScoreThreshold", () => 8),
@@ -1430,19 +1670,17 @@ void describe("Review generation — content-validation failure falls back to a 
         Promise.resolve({ source: "settings", modelId: "primary-cli:model" })),
       patch(modelSelectionModule, "resolveConfiguredReviewStages", () =>
         Promise.resolve(new Set(REVIEW_STAGES))),
-      // The primary attempt is resolved with a defined `stage` argument;
-      // runAiToFile's content-validation retry resolves each backup with
-      // `stage: undefined` (mirrors runSecondOpinionReview, so a backup is
-      // never wrapped in its own nested quota cascade) — that difference is
-      // exactly what this stub keys off of to hand back the right runner.
-      patch(runnerRegistryModule, "resolveRunnerForModel", (_modelId: string, stage: TaskStage | undefined) =>
-        stage === undefined
-          ? { runner: backupRunner, provider: "backup-cli", providerLabel: "Backup Stub Provider", nativeModelId: undefined }
-          : { runner: primaryRunner, provider: "primary-cli", providerLabel: "Primary Stub Provider", nativeModelId: undefined }),
-      patch(runnerRegistryModule, "backupModelsForStage", () => {
-        backupListReadCount += 1;
-        return ["backup-cli:model"];
-      }),
+      // Two candidates offered: the first returns well-formed but invalid
+      // (no Readiness line) content; the second would produce a valid
+      // review. Only the first may ever be invoked — a malformed completed
+      // result is terminal (AC-RUNNER-05), not fallback-eligible.
+      stubV1RunnerSelection([
+        markdownTransportV1("I have a clarifying question instead of a review."),
+        scriptedMarkdownTransportV1(() => {
+          secondCandidateInvoked = true;
+          return "Readiness: 9/10\n\n- Ready.\n";
+        }),
+      ]),
       patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.resolve("stub prompt")),
       patch(runLogModule, "writeRunLog", () => Promise.resolve(undefined)),
       patch(contextPackModule, "writeContextPack", () => Promise.resolve(vscode.Uri.file(contextPack))),
@@ -1462,1194 +1700,9 @@ void describe("Review generation — content-validation failure falls back to a 
         {}
       );
 
-      assert.equal(primaryRunCount, 1, "the primary should be tried exactly once");
-      assert.equal(backupRunCount, 1, "the backup should be tried exactly once after the primary's content was rejected");
-      assert.equal(backupListReadCount, 1, "the disclosed backup list must be snapshotted once and reused for retries");
-      assert.equal(dispatches.length, 0, "isAutoAdvanceEnabled is off, so no automation chain should fire");
-
-      const reviewContent = fs.readFileSync(path.join(folderPath, "impl-low-review.md"), "utf8");
-      assert.match(reviewContent, /Readiness: 8\/10/, "the backup's valid review must be promoted, not the primary's rejected text");
-      assert.doesNotMatch(reviewContent, /verify the plan's claims/, "the primary's rejected content must not survive into the artifact");
-    } finally {
-      for (const p of patches.reverse()) { p.restore(); }
-      wsStub.restore();
-      fsBridge.restore();
-      provider.dispose();
-      deactivateNotificationRouter();
-    }
-  });
-
-  void it("primary and its one configured backup both return content with no Readiness line: tries both, publishes nothing, and blames the backup (the last one actually tried) rather than the primary", async () => {
-    const { folderPath } = makeTaskFolder(`content-fallback-exhausted-${Math.floor(Math.random() * 1e9)}`, "impl-low-review");
-    const provider = new StatusTreeProvider();
-    initNotificationRouter(provider);
-    const fsBridge = installFsBridge();
-    const wsStub = installWorkspaceFoldersStub();
-    const dispatches: AutomationDispatch[] = [];
-    const contextPack = path.join(folderPath, "context-pack.md");
-    fs.writeFileSync(contextPack, "# Context\n", "utf8");
-
-    let primaryRunCount = 0;
-    let backupRunCount = 0;
-    const invalidPrimaryRunner = {
-      id: "invalid-primary-stub-runner",
-      label: "Invalid Primary Provider",
-      capabilities: { planning: true, review: true, assistant: false },
-      isAvailable: (): Promise<{ available: boolean }> => Promise.resolve({ available: true }),
-      run: async (request: AgentRunRequest): Promise<AgentRunResult> => {
-        primaryRunCount += 1;
-        await fs.promises.writeFile(request.outputFile.fsPath, "(no text reply)", "utf8");
-        return { runnerId: "invalid-primary-stub-runner", status: "completed", summary: "Generated 16 characters" };
-      },
-    };
-    const invalidBackupRunner = {
-      id: "invalid-backup-stub-runner",
-      label: "Invalid Backup Provider",
-      capabilities: { planning: true, review: true, assistant: false },
-      isAvailable: (): Promise<{ available: boolean }> => Promise.resolve({ available: true }),
-      run: async (request: AgentRunRequest): Promise<AgentRunResult> => {
-        backupRunCount += 1;
-        await fs.promises.writeFile(request.outputFile.fsPath, "Also just a clarifying question.", "utf8");
-        return { runnerId: "invalid-backup-stub-runner", status: "completed", summary: "Generated 33 characters" };
-      },
-    };
-
-    const patches: Patched[] = [
-      patch(settingsModule, "isAutoAdvanceEnabled", () => false),
-      patch(settingsModule, "getAutoAdvanceScoreThreshold", () => 8),
-      patch(modelSelectionModule, "resolveModelForStage", () =>
-        Promise.resolve({ source: "settings", modelId: "primary-cli:model" })),
-      patch(modelSelectionModule, "resolveFreshModelForStage", () =>
-        Promise.resolve({ source: "settings", modelId: "primary-cli:model" })),
-      patch(modelSelectionModule, "resolveConfiguredReviewStages", () =>
-        Promise.resolve(new Set(REVIEW_STAGES))),
-      patch(runnerRegistryModule, "resolveRunnerForModel", (_modelId: string, stage: TaskStage | undefined) =>
-        stage === undefined
-          ? { runner: invalidBackupRunner, provider: "backup-cli", providerLabel: "Invalid Backup Provider", nativeModelId: undefined }
-          : { runner: invalidPrimaryRunner, provider: "primary-cli", providerLabel: "Invalid Primary Provider", nativeModelId: undefined }),
-      patch(runnerRegistryModule, "backupModelsForStage", () => ["backup-cli:model"]),
-      patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.resolve("stub prompt")),
-      patch(runLogModule, "writeRunLog", () => Promise.resolve(undefined)),
-      patch(contextPackModule, "writeContextPack", () => Promise.resolve(vscode.Uri.file(contextPack))),
-      patch(automationChainModule, "scheduleAutomationChain", (dispatch: AutomationDispatch): Promise<boolean> => {
-        dispatches.push(dispatch);
-        return Promise.resolve(true);
-      }),
-      patch(vscode.window as unknown as Record<string, unknown>, "showErrorMessage", () => Promise.resolve(undefined)),
-    ];
-    try {
-      const workspaceRoot = { uri: vscode.Uri.file(REAL_ROOT), name: "root", index: 0 } as vscode.WorkspaceFolder;
-      await runReviewForFolder(
-        vscode.Uri.file(REAL_ROOT),
-        vscode.Uri.file(folderPath),
-        workspaceRoot,
-        "impl-low-review",
-        true,
-        {}
-      );
-
-      assert.equal(primaryRunCount, 1, "the primary must be tried exactly once");
-      assert.equal(backupRunCount, 1, "the one configured backup must be tried exactly once");
-      assert.equal(dispatches.length, 0, "nothing usable was ever produced, so no automation chain should fire");
-      assert.equal(fs.existsSync(path.join(folderPath, "impl-low-review.md")), false, "no review artifact should be published when every candidate is rejected");
-
-      const errorEntry = provider.getEntries().find((entry) => entry.level === "error");
-      assert.ok(errorEntry, "expected an error entry reporting the failed generation");
-      assert.match(
-        errorEntry.message,
-        /Invalid Backup Provider/,
-        "the failure message must blame the backup that was actually last tried, not the primary"
-      );
-      assert.doesNotMatch(
-        errorEntry.message,
-        /Invalid Primary Provider/,
-        "the failure message must not misattribute the backup's rejection reason to the primary"
-      );
-    } finally {
-      for (const p of patches.reverse()) { p.restore(); }
-      wsStub.restore();
-      fsBridge.restore();
-      provider.dispose();
-      deactivateNotificationRouter();
-    }
-  });
-
-  void it("the model that already ran (reported with no modelId, i.e. a CLI provider's own default) is not re-run when it also appears in the backup list as '<provider>:default'", async () => {
-    // Regression coverage: qualifiedRanModelId used to bail out (return
-    // undefined) whenever the reported modelId was undefined, which is
-    // exactly what every CLI provider's "(CLI default)" catalog entry
-    // reports back — silently defeating the dedup for the most common
-    // configuration shape (six providers ship one of these entries).
-    const { folderPath } = makeTaskFolder(`content-fallback-default-dedup-${Math.floor(Math.random() * 1e9)}`, "impl-low-review");
-    const provider = new StatusTreeProvider();
-    initNotificationRouter(provider);
-    const fsBridge = installFsBridge();
-    const wsStub = installWorkspaceFoldersStub();
-    const dispatches: AutomationDispatch[] = [];
-    const contextPack = path.join(folderPath, "context-pack.md");
-    fs.writeFileSync(contextPack, "# Context\n", "utf8");
-
-    const attemptedBackupModelIds: string[] = [];
-    const primaryRunner = {
-      id: "primary-stub-runner",
-      label: "Primary Stub Provider",
-      capabilities: { planning: true, review: true, assistant: false },
-      isAvailable: (): Promise<{ available: boolean }> => Promise.resolve({ available: true }),
-      run: async (request: AgentRunRequest): Promise<AgentRunResult> => {
-        await fs.promises.writeFile(request.outputFile.fsPath, "no readiness line here", "utf8");
-        // Simulates resolveRunnerForModel's own quota cascade having already
-        // silently substituted "opencode-cli"'s own default model (a real
-        // CLI provider id — getCliProvider("opencode-cli") is genuinely
-        // registered, unstubbed here) before returning this content-invalid
-        // result. A CliAgentRunner reports an unconfigured/"default" native
-        // id back as modelId: undefined (see cliAgentRunner.ts).
-        return { runnerId: "opencode-cli", status: "completed", summary: "Generated 23 characters" };
-      },
-    };
-    const claudeBackupRunner = {
-      id: "claude-cli",
-      label: "Claude Backup",
-      capabilities: { planning: true, review: true, assistant: false },
-      isAvailable: (): Promise<{ available: boolean }> => Promise.resolve({ available: true }),
-      run: async (request: AgentRunRequest): Promise<AgentRunResult> => {
-        await fs.promises.writeFile(request.outputFile.fsPath, "Readiness: 9/10\n\n- Ready.\n", "utf8");
-        return { runnerId: "claude-cli", status: "completed", summary: "Generated 30 characters" };
-      },
-    };
-
-    const patches: Patched[] = [
-      patch(settingsModule, "isAutoAdvanceEnabled", () => false),
-      patch(settingsModule, "getAutoAdvanceScoreThreshold", () => 8),
-      patch(modelSelectionModule, "resolveModelForStage", () =>
-        Promise.resolve({ source: "settings", modelId: "primary-cli:model" })),
-      patch(modelSelectionModule, "resolveFreshModelForStage", () =>
-        Promise.resolve({ source: "settings", modelId: "primary-cli:model" })),
-      patch(modelSelectionModule, "resolveConfiguredReviewStages", () =>
-        Promise.resolve(new Set(REVIEW_STAGES))),
-      patch(runnerRegistryModule, "resolveRunnerForModel", (modelId: string, stage: TaskStage | undefined) => {
-        if (stage === undefined) {
-          attemptedBackupModelIds.push(modelId);
-          return { runner: claudeBackupRunner, provider: "claude-cli", providerLabel: "Claude Backup", nativeModelId: undefined };
-        }
-        return { runner: primaryRunner, provider: "primary-cli", providerLabel: "Primary Stub Provider", nativeModelId: undefined };
-      }),
-      patch(runnerRegistryModule, "backupModelsForStage", () => ["opencode-cli:default", "claude-cli:sonnet"]),
-      patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.resolve("stub prompt")),
-      patch(runLogModule, "writeRunLog", () => Promise.resolve(undefined)),
-      patch(contextPackModule, "writeContextPack", () => Promise.resolve(vscode.Uri.file(contextPack))),
-      patch(automationChainModule, "scheduleAutomationChain", (dispatch: AutomationDispatch): Promise<boolean> => {
-        dispatches.push(dispatch);
-        return Promise.resolve(true);
-      }),
-    ];
-    try {
-      const workspaceRoot = { uri: vscode.Uri.file(REAL_ROOT), name: "root", index: 0 } as vscode.WorkspaceFolder;
-      await runReviewForFolder(
-        vscode.Uri.file(REAL_ROOT),
-        vscode.Uri.file(folderPath),
-        workspaceRoot,
-        "impl-low-review",
-        true,
-        {}
-      );
-
-      assert.deepEqual(
-        attemptedBackupModelIds,
-        ["claude-cli:sonnet"],
-        "opencode-cli:default must be skipped as the model that already ran, not re-invoked"
-      );
-      const reviewContent = fs.readFileSync(path.join(folderPath, "impl-low-review.md"), "utf8");
-      assert.match(reviewContent, /Readiness: 9\/10/, "the real, un-skipped backup's valid review must be promoted");
-    } finally {
-      for (const p of patches.reverse()) { p.restore(); }
-      wsStub.restore();
-      fsBridge.restore();
-      provider.dispose();
-      deactivateNotificationRouter();
-    }
-  });
-
-  void it("the model that already ran under its canonical (post-alias) name is not re-run when the backup list stores it under its legacy alias", async () => {
-    // Regression coverage: qualifiedRanModelId used to join runnerId:modelId
-    // literally, but a CLI provider's modelId is the ALIAS-RESOLVED name
-    // (parseModelSelection applies legacyModelAliases before returning it),
-    // while a backup list entry may still be stored under the raw legacy
-    // key — the two would never compare equal without normalizing both
-    // through normalizeQualifiedModelId first.
-    const { folderPath } = makeTaskFolder(`content-fallback-alias-dedup-${Math.floor(Math.random() * 1e9)}`, "impl-low-review");
-    const provider = new StatusTreeProvider();
-    initNotificationRouter(provider);
-    const fsBridge = installFsBridge();
-    const wsStub = installWorkspaceFoldersStub();
-    const dispatches: AutomationDispatch[] = [];
-    const contextPack = path.join(folderPath, "context-pack.md");
-    fs.writeFileSync(contextPack, "# Context\n", "utf8");
-
-    const attemptedBackupModelIds: string[] = [];
-    const primaryRunner = {
-      id: "primary-stub-runner",
-      label: "Primary Stub Provider",
-      capabilities: { planning: true, review: true, assistant: false },
-      isAvailable: (): Promise<{ available: boolean }> => Promise.resolve({ available: true }),
-      run: async (request: AgentRunRequest): Promise<AgentRunResult> => {
-        await fs.promises.writeFile(request.outputFile.fsPath, "no readiness line here", "utf8");
-        // "antigravity-cli" is a real, unstubbed provider whose
-        // legacyModelAliases maps "gemini-3.5-flash-medium" (the old stored
-        // key) to "Gemini 3.5 Flash (Medium)" (the canonical name it now
-        // reports back — see providers.ts).
-        return { runnerId: "antigravity-cli", status: "completed", modelId: "Gemini 3.5 Flash (Medium)", summary: "Generated 23 characters" };
-      },
-    };
-    const claudeBackupRunner = {
-      id: "claude-cli",
-      label: "Claude Backup",
-      capabilities: { planning: true, review: true, assistant: false },
-      isAvailable: (): Promise<{ available: boolean }> => Promise.resolve({ available: true }),
-      run: async (request: AgentRunRequest): Promise<AgentRunResult> => {
-        await fs.promises.writeFile(request.outputFile.fsPath, "Readiness: 9/10\n\n- Ready.\n", "utf8");
-        return { runnerId: "claude-cli", status: "completed", summary: "Generated 30 characters" };
-      },
-    };
-
-    const patches: Patched[] = [
-      patch(settingsModule, "isAutoAdvanceEnabled", () => false),
-      patch(settingsModule, "getAutoAdvanceScoreThreshold", () => 8),
-      patch(modelSelectionModule, "resolveModelForStage", () =>
-        Promise.resolve({ source: "settings", modelId: "primary-cli:model" })),
-      patch(modelSelectionModule, "resolveFreshModelForStage", () =>
-        Promise.resolve({ source: "settings", modelId: "primary-cli:model" })),
-      patch(modelSelectionModule, "resolveConfiguredReviewStages", () =>
-        Promise.resolve(new Set(REVIEW_STAGES))),
-      patch(runnerRegistryModule, "resolveRunnerForModel", (modelId: string, stage: TaskStage | undefined) => {
-        if (stage === undefined) {
-          attemptedBackupModelIds.push(modelId);
-          return { runner: claudeBackupRunner, provider: "claude-cli", providerLabel: "Claude Backup", nativeModelId: undefined };
-        }
-        return { runner: primaryRunner, provider: "primary-cli", providerLabel: "Primary Stub Provider", nativeModelId: undefined };
-      }),
-      patch(runnerRegistryModule, "backupModelsForStage", () => ["antigravity-cli:gemini-3.5-flash-medium", "claude-cli:sonnet"]),
-      patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.resolve("stub prompt")),
-      patch(runLogModule, "writeRunLog", () => Promise.resolve(undefined)),
-      patch(contextPackModule, "writeContextPack", () => Promise.resolve(vscode.Uri.file(contextPack))),
-      patch(automationChainModule, "scheduleAutomationChain", (dispatch: AutomationDispatch): Promise<boolean> => {
-        dispatches.push(dispatch);
-        return Promise.resolve(true);
-      }),
-    ];
-    try {
-      const workspaceRoot = { uri: vscode.Uri.file(REAL_ROOT), name: "root", index: 0 } as vscode.WorkspaceFolder;
-      await runReviewForFolder(
-        vscode.Uri.file(REAL_ROOT),
-        vscode.Uri.file(folderPath),
-        workspaceRoot,
-        "impl-low-review",
-        true,
-        {}
-      );
-
-      assert.deepEqual(
-        attemptedBackupModelIds,
-        ["claude-cli:sonnet"],
-        "the legacy-aliased antigravity entry must be skipped as the model that already ran, not re-invoked"
-      );
-      const reviewContent = fs.readFileSync(path.join(folderPath, "impl-low-review.md"), "utf8");
-      assert.match(reviewContent, /Readiness: 9\/10/, "the real, un-skipped backup's valid review must be promoted");
-    } finally {
-      for (const p of patches.reverse()) { p.restore(); }
-      wsStub.restore();
-      fsBridge.restore();
-      provider.dispose();
-      deactivateNotificationRouter();
-    }
-  });
-
-  void it("a stage configured with strategy 'pause-and-resume' performs zero backup retries on content-validation failure (real, unstubbed backupModelsForStage)", async () => {
-    // End-to-end coverage for the strategy gate itself: the previous tests
-    // in this file all stub backupModelsForStage directly, which proves the
-    // retry loop calls SOME backup source but never actually exercises the
-    // real function's "switch-to-backup"-only gate — reverting the fix back
-    // to the strategy-agnostic getConfiguredBackupModelsForStage would leave
-    // every other test in this suite green. This test uses the real
-    // backupModelsForStage (via a real modelSettings config) so that
-    // regression would be caught.
-    const { folderPath } = makeTaskFolder(`content-fallback-strategy-gate-${Math.floor(Math.random() * 1e9)}`, "impl-low-review");
-    const provider = new StatusTreeProvider();
-    initNotificationRouter(provider);
-    const fsBridge = installFsBridge();
-    const wsStub = installWorkspaceFoldersStub();
-    const dispatches: AutomationDispatch[] = [];
-    const contextPack = path.join(folderPath, "context-pack.md");
-    fs.writeFileSync(contextPack, "# Context\n", "utf8");
-
-    let backupAttempts = 0;
-    const primaryRunner = {
-      id: "primary-stub-runner",
-      label: "Primary Stub Provider",
-      capabilities: { planning: true, review: true, assistant: false },
-      isAvailable: (): Promise<{ available: boolean }> => Promise.resolve({ available: true }),
-      run: async (request: AgentRunRequest): Promise<AgentRunResult> => {
-        await fs.promises.writeFile(request.outputFile.fsPath, "no readiness line here", "utf8");
-        return { runnerId: "primary-stub-runner", status: "completed", summary: "Generated 23 characters" };
-      },
-    };
-
-    const patches: Patched[] = [
-      patch(settingsModule, "isAutoAdvanceEnabled", () => false),
-      patch(settingsModule, "getAutoAdvanceScoreThreshold", () => 8),
-      // A real modelSettings config for "impl-low-review" with backups
-      // present but strategy "pause-and-resume" — the real backupModelsForStage
-      // (unstubbed) must return [] for this, per its own gate.
-      patch(settingsModule, "getModelSettings", () => ({
-        "impl-low-review": {
-          primary: "primary-cli:model",
-          backups: ["claude-cli:sonnet"],
-          strategy: "pause-and-resume",
-        },
-      })),
-      patch(modelSelectionModule, "resolveModelForStage", () =>
-        Promise.resolve({ source: "settings", modelId: "primary-cli:model" })),
-      patch(modelSelectionModule, "resolveFreshModelForStage", () =>
-        Promise.resolve({ source: "settings", modelId: "primary-cli:model" })),
-      patch(modelSelectionModule, "resolveConfiguredReviewStages", () =>
-        Promise.resolve(new Set(REVIEW_STAGES))),
-      patch(runnerRegistryModule, "resolveRunnerForModel", (_modelId: string, stage: TaskStage | undefined) => {
-        if (stage === undefined) {
-          backupAttempts += 1;
-        }
-        return { runner: primaryRunner, provider: "primary-cli", providerLabel: "Primary Stub Provider", nativeModelId: undefined };
-      }),
-      patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.resolve("stub prompt")),
-      patch(runLogModule, "writeRunLog", () => Promise.resolve(undefined)),
-      patch(contextPackModule, "writeContextPack", () => Promise.resolve(vscode.Uri.file(contextPack))),
-      patch(automationChainModule, "scheduleAutomationChain", (dispatch: AutomationDispatch): Promise<boolean> => {
-        dispatches.push(dispatch);
-        return Promise.resolve(true);
-      }),
-      patch(vscode.window as unknown as Record<string, unknown>, "showErrorMessage", () => Promise.resolve(undefined)),
-    ];
-    try {
-      const workspaceRoot = { uri: vscode.Uri.file(REAL_ROOT), name: "root", index: 0 } as vscode.WorkspaceFolder;
-      await runReviewForFolder(
-        vscode.Uri.file(REAL_ROOT),
-        vscode.Uri.file(folderPath),
-        workspaceRoot,
-        "impl-low-review",
-        true,
-        {}
-      );
-
-      assert.equal(backupAttempts, 0, "a stage that opted out of automatic switch-over must see zero backup attempts, even with backups configured");
-      assert.equal(fs.existsSync(path.join(folderPath, "impl-low-review.md")), false, "no review artifact should be published");
-    } finally {
-      for (const p of patches.reverse()) { p.restore(); }
-      wsStub.restore();
-      fsBridge.restore();
-      provider.dispose();
-      deactivateNotificationRouter();
-    }
-  });
-
-  void it("a backup with a quota-exhausted observation recorded during THIS call's own primary run is skipped, while one with only a stale observation from earlier in the session still is", async () => {
-    // Regression coverage: the skip must be gated on the observation having
-    // been recorded during this specific call, not on a fixed recency
-    // window — an agentic CLI candidate can easily run longer than any fixed
-    // window, ageing out a moments-ago observation before this loop ever
-    // reaches it, while quotaObservations (utils/quota.ts) is documented as
-    // "a live signal, not a persisted ledger" with no expiry of its own, so
-    // an observation left over from earlier in the same extension-host
-    // session (a quota window that has long since reset) must not
-    // permanently disqualify a backup either. This test pins both halves:
-    // backup-a's observation is recorded from INSIDE the primary's own run()
-    // — simulating resolveRunnerForModel's own cascade having burned it
-    // moments earlier in this exact call — and must still gate; backup-b's
-    // observation is recorded before the call even starts — simulating a
-    // stale leftover from earlier in the session — and must not.
-    const { folderPath } = makeTaskFolder(`content-fallback-quota-skip-${Math.floor(Math.random() * 1e9)}`, "impl-low-review");
-    const provider = new StatusTreeProvider();
-    initNotificationRouter(provider);
-    const fsBridge = installFsBridge();
-    const wsStub = installWorkspaceFoldersStub();
-    const dispatches: AutomationDispatch[] = [];
-    const contextPack = path.join(folderPath, "context-pack.md");
-    fs.writeFileSync(contextPack, "# Context\n", "utf8");
-
-    __quotaTestOnly.clear();
-    // Recorded an hour before the call even starts — must NOT gate the
-    // skip; this backup must still be tried.
-    __quotaTestOnly.setObservation("impl-low-review", "backup-b-cli:model", {
-      state: "unavailable",
-      observedAt: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
-    });
-
-    const attemptedBackupModelIds: string[] = [];
-    const primaryRunner = {
-      id: "primary-stub-runner",
-      label: "Primary Stub Provider",
-      capabilities: { planning: true, review: true, assistant: false },
-      isAvailable: (): Promise<{ available: boolean }> => Promise.resolve({ available: true }),
-      run: async (request: AgentRunRequest): Promise<AgentRunResult> => {
-        // Simulates resolveRunnerForModel's own quota cascade (inside this
-        // same primary run() call) having already tried and quota-failed
-        // backup-a moments ago, in this exact call.
-        recordQuotaObservation("impl-low-review", "backup-a-cli:model", "quota", "quota exceeded");
-        await fs.promises.writeFile(request.outputFile.fsPath, "no readiness line here", "utf8");
-        return { runnerId: "primary-stub-runner", status: "completed", summary: "Generated 23 characters" };
-      },
-    };
-    const backupBRunner = {
-      id: "backup-b-cli",
-      label: "Backup B Provider",
-      capabilities: { planning: true, review: true, assistant: false },
-      isAvailable: (): Promise<{ available: boolean }> => Promise.resolve({ available: true }),
-      run: async (request: AgentRunRequest): Promise<AgentRunResult> => {
-        await fs.promises.writeFile(request.outputFile.fsPath, "Readiness: 9/10\n\n- Ready.\n", "utf8");
-        return { runnerId: "backup-b-cli", status: "completed", summary: "Generated 30 characters" };
-      },
-    };
-
-    const patches: Patched[] = [
-      patch(settingsModule, "isAutoAdvanceEnabled", () => false),
-      patch(settingsModule, "getAutoAdvanceScoreThreshold", () => 8),
-      patch(modelSelectionModule, "resolveModelForStage", () =>
-        Promise.resolve({ source: "settings", modelId: "primary-cli:model" })),
-      patch(modelSelectionModule, "resolveFreshModelForStage", () =>
-        Promise.resolve({ source: "settings", modelId: "primary-cli:model" })),
-      patch(modelSelectionModule, "resolveConfiguredReviewStages", () =>
-        Promise.resolve(new Set(REVIEW_STAGES))),
-      patch(runnerRegistryModule, "resolveRunnerForModel", (modelId: string, stage: TaskStage | undefined) => {
-        if (stage === undefined) {
-          attemptedBackupModelIds.push(modelId);
-          return { runner: backupBRunner, provider: "backup-b-cli", providerLabel: "Backup B Provider", nativeModelId: undefined };
-        }
-        return { runner: primaryRunner, provider: "primary-cli", providerLabel: "Primary Stub Provider", nativeModelId: undefined };
-      }),
-      patch(runnerRegistryModule, "backupModelsForStage", () => ["backup-a-cli:model", "backup-b-cli:model"]),
-      patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.resolve("stub prompt")),
-      patch(runLogModule, "writeRunLog", () => Promise.resolve(undefined)),
-      patch(contextPackModule, "writeContextPack", () => Promise.resolve(vscode.Uri.file(contextPack))),
-      patch(automationChainModule, "scheduleAutomationChain", (dispatch: AutomationDispatch): Promise<boolean> => {
-        dispatches.push(dispatch);
-        return Promise.resolve(true);
-      }),
-    ];
-    try {
-      const workspaceRoot = { uri: vscode.Uri.file(REAL_ROOT), name: "root", index: 0 } as vscode.WorkspaceFolder;
-      await runReviewForFolder(
-        vscode.Uri.file(REAL_ROOT),
-        vscode.Uri.file(folderPath),
-        workspaceRoot,
-        "impl-low-review",
-        true,
-        {}
-      );
-
-      assert.deepEqual(
-        attemptedBackupModelIds,
-        ["backup-b-cli:model"],
-        "backup-a (recent exhausted observation) must be skipped; backup-b (stale observation) must still be tried"
-      );
-      const reviewContent = fs.readFileSync(path.join(folderPath, "impl-low-review.md"), "utf8");
-      assert.match(reviewContent, /Readiness: 9\/10/, "the un-skipped backup's valid review must be promoted");
-    } finally {
-      for (const p of patches.reverse()) { p.restore(); }
-      wsStub.restore();
-      fsBridge.restore();
-      provider.dispose();
-      deactivateNotificationRouter();
-      __quotaTestOnly.clear();
-    }
-  });
-
-  void it("a successful backup retry atomically persists fallbackActive/fallbackModelId for the stage", async () => {
-    // The claim and model write are one locked compare-and-set. This pins the
-    // observable outcome for the common case (nothing else holds the
-    // reservation): the persisted state after a promoted backup must name
-    // that exact backup, the same contract resolveRunnerForModel's own quota
-    // cascade provides for a quota-triggered switch.
-    const { folderPath } = makeTaskFolder(`content-fallback-persist-${Math.floor(Math.random() * 1e9)}`, "impl-low-review");
-    const provider = new StatusTreeProvider();
-    initNotificationRouter(provider);
-    const fsBridge = installFsBridge();
-    const wsStub = installWorkspaceFoldersStub();
-    const dispatches: AutomationDispatch[] = [];
-    const contextPack = path.join(folderPath, "context-pack.md");
-    fs.writeFileSync(contextPack, "# Context\n", "utf8");
-
-    const primaryRunner = {
-      id: "primary-stub-runner",
-      label: "Primary Stub Provider",
-      capabilities: { planning: true, review: true, assistant: false },
-      isAvailable: (): Promise<{ available: boolean }> => Promise.resolve({ available: true }),
-      run: async (request: AgentRunRequest): Promise<AgentRunResult> => {
-        await fs.promises.writeFile(request.outputFile.fsPath, "no readiness line here", "utf8");
-        return { runnerId: "primary-stub-runner", status: "completed", summary: "Generated 23 characters" };
-      },
-    };
-    const backupRunner = {
-      id: "backup-cli",
-      label: "Backup Stub Provider",
-      capabilities: { planning: true, review: true, assistant: false },
-      isAvailable: (): Promise<{ available: boolean }> => Promise.resolve({ available: true }),
-      run: async (request: AgentRunRequest): Promise<AgentRunResult> => {
-        await fs.promises.writeFile(request.outputFile.fsPath, "Readiness: 8/10\n\n- Ready.\n", "utf8");
-        return { runnerId: "backup-cli", status: "completed", summary: "Generated 30 characters" };
-      },
-    };
-
-    const patches: Patched[] = [
-      patch(settingsModule, "isAutoAdvanceEnabled", () => false),
-      patch(settingsModule, "getAutoAdvanceScoreThreshold", () => 8),
-      patch(modelSelectionModule, "resolveModelForStage", () =>
-        Promise.resolve({ source: "settings", modelId: "primary-cli:model" })),
-      patch(modelSelectionModule, "resolveFreshModelForStage", () =>
-        Promise.resolve({ source: "settings", modelId: "primary-cli:model" })),
-      patch(modelSelectionModule, "resolveConfiguredReviewStages", () =>
-        Promise.resolve(new Set(REVIEW_STAGES))),
-      patch(runnerRegistryModule, "resolveRunnerForModel", (_modelId: string, stage: TaskStage | undefined) =>
-        stage === undefined
-          ? { runner: backupRunner, provider: "backup-cli", providerLabel: "Backup Stub Provider", nativeModelId: undefined }
-          : { runner: primaryRunner, provider: "primary-cli", providerLabel: "Primary Stub Provider", nativeModelId: undefined }),
-      patch(runnerRegistryModule, "backupModelsForStage", () => ["backup-cli:model"]),
-      patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.resolve("stub prompt")),
-      patch(runLogModule, "writeRunLog", () => Promise.resolve(undefined)),
-      patch(contextPackModule, "writeContextPack", () => Promise.resolve(vscode.Uri.file(contextPack))),
-      patch(automationChainModule, "scheduleAutomationChain", (dispatch: AutomationDispatch): Promise<boolean> => {
-        dispatches.push(dispatch);
-        return Promise.resolve(true);
-      }),
-    ];
-    try {
-      const workspaceRoot = { uri: vscode.Uri.file(REAL_ROOT), name: "root", index: 0 } as vscode.WorkspaceFolder;
-      await runReviewForFolder(
-        vscode.Uri.file(REAL_ROOT),
-        vscode.Uri.file(folderPath),
-        workspaceRoot,
-        "impl-low-review",
-        true,
-        {}
-      );
-
-      const progress = JSON.parse(
-        fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")
-      ) as TaskProgress;
-      assert.equal(
-        progress.fallbackActive?.["impl-low-review"],
-        true,
-        "fallbackActive must be persisted for the stage once a backup's output is promoted"
-      );
-      assert.equal(
-        progress.fallbackModelId?.["impl-low-review"],
-        "backup-cli:model",
-        "fallbackModelId must record which backup actually served the stage"
-      );
-    } finally {
-      for (const p of patches.reverse()) { p.restore(); }
-      wsStub.restore();
-      fsBridge.restore();
-      provider.dispose();
-      deactivateNotificationRouter();
-    }
-  });
-
-  void it("a preserved active fallback that returns invalid content is replaced by the next backup that validates", async () => {
-    const { folderPath } = makeTaskFolder(`content-fallback-replace-active-${Math.floor(Math.random() * 1e9)}`, "impl-low-review");
-    const progressPath = path.join(folderPath, "task-progress.json");
-    const existingProgress = JSON.parse(fs.readFileSync(progressPath, "utf8")) as TaskProgress;
-    existingProgress.fallbackActive = { "impl-low-review": true };
-    existingProgress.fallbackModelId = { "impl-low-review": "active-cli:model" };
-    fs.writeFileSync(progressPath, JSON.stringify(existingProgress, null, 2), "utf8");
-
-    const provider = new StatusTreeProvider();
-    initNotificationRouter(provider);
-    const fsBridge = installFsBridge();
-    const wsStub = installWorkspaceFoldersStub();
-    const contextPack = path.join(folderPath, "context-pack.md");
-    fs.writeFileSync(contextPack, "# Context\n", "utf8");
-
-    const activeRunner = {
-      id: "active-cli",
-      label: "Active Fallback Provider",
-      capabilities: { planning: true, review: true, assistant: false },
-      isAvailable: (): Promise<{ available: boolean }> => Promise.resolve({ available: true }),
-      run: async (request: AgentRunRequest): Promise<AgentRunResult> => {
-        await fs.promises.writeFile(request.outputFile.fsPath, "no readiness line here", "utf8");
-        return {
-          runnerId: "active-cli",
-          status: "completed",
-          modelId: "model",
-          summary: "Generated 23 characters",
-        };
-      },
-    };
-    const backupRunner = {
-      id: "backup-cli",
-      label: "Backup Provider",
-      capabilities: { planning: true, review: true, assistant: false },
-      isAvailable: (): Promise<{ available: boolean }> => Promise.resolve({ available: true }),
-      run: async (request: AgentRunRequest): Promise<AgentRunResult> => {
-        await fs.promises.writeFile(request.outputFile.fsPath, "Readiness: 8/10\n\n- Ready.\n", "utf8");
-        return { runnerId: "backup-cli", status: "completed", summary: "Generated 30 characters" };
-      },
-    };
-
-    const patches: Patched[] = [
-      patch(settingsModule, "isAutoAdvanceEnabled", () => false),
-      patch(settingsModule, "getAutoAdvanceScoreThreshold", () => 8),
-      patch(modelSelectionModule, "resolveModelForStage", () =>
-        Promise.resolve({ source: "settings", modelId: "active-cli:model" })),
-      patch(modelSelectionModule, "resolveFreshModelForStage", () =>
-        Promise.resolve({ source: "settings", modelId: "primary-cli:model" })),
-      patch(modelSelectionModule, "resolveConfiguredReviewStages", () =>
-        Promise.resolve(new Set(REVIEW_STAGES))),
-      patch(runnerRegistryModule, "resolveRunnerForModel", (_modelId: string, stage: TaskStage | undefined) =>
-        stage === undefined
-          ? { runner: backupRunner, provider: "backup-cli", providerLabel: "Backup Provider", nativeModelId: undefined }
-          : { runner: activeRunner, provider: "active-cli", providerLabel: "Active Fallback Provider", nativeModelId: "model" }),
-      patch(runnerRegistryModule, "backupModelsForStage", () => ["backup-cli:model"]),
-      patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.resolve("stub prompt")),
-      patch(runLogModule, "writeRunLog", () => Promise.resolve(undefined)),
-      patch(contextPackModule, "writeContextPack", () => Promise.resolve(vscode.Uri.file(contextPack))),
-    ];
-    try {
-      const workspaceRoot = { uri: vscode.Uri.file(REAL_ROOT), name: "root", index: 0 } as vscode.WorkspaceFolder;
-      await runReviewForFolder(
-        vscode.Uri.file(REAL_ROOT),
-        vscode.Uri.file(folderPath),
-        workspaceRoot,
-        "impl-low-review",
-        true,
-        { preserveActiveFallback: true }
-      );
-
-      const progress = JSON.parse(fs.readFileSync(progressPath, "utf8")) as TaskProgress;
-      assert.equal(progress.fallbackActive?.["impl-low-review"], true);
-      assert.equal(
-        progress.fallbackModelId?.["impl-low-review"],
-        "backup-cli:model",
-        "the next iteration should start directly from the backup whose content validated"
-      );
-    } finally {
-      for (const p of patches.reverse()) { p.restore(); }
-      wsStub.restore();
-      fsBridge.restore();
-      provider.dispose();
-      deactivateNotificationRouter();
-    }
-  });
-
-  void it("a backup retry does not overwrite a pre-existing fallback reservation held by a different run", async () => {
-    // The retry loop's atomic write may replace an active model when this
-    // call's own primary-resolution cascade selected it, or when a preserved
-    // Fast Forward iteration deliberately started from that exact route.
-    // Neither applies here: the primary genuinely ran and reported itself,
-    // exactly as this test's stub does. A pre-existing reservation made by a
-    // genuinely different run (e.g. another VS Code window) must therefore
-    // still be respected: this run's own backup content is promoted locally,
-    // but the persisted fallbackModelId is not clobbered.
-    const { folderPath } = makeTaskFolder(`content-fallback-preexisting-${Math.floor(Math.random() * 1e9)}`, "impl-low-review");
-    const progressPath = path.join(folderPath, "task-progress.json");
-    const existingProgress = JSON.parse(fs.readFileSync(progressPath, "utf8")) as TaskProgress;
-    existingProgress.fallbackActive = { "impl-low-review": true };
-    existingProgress.fallbackModelId = { "impl-low-review": "someone-elses-cli:model" };
-    fs.writeFileSync(progressPath, JSON.stringify(existingProgress, null, 2), "utf8");
-
-    const provider = new StatusTreeProvider();
-    initNotificationRouter(provider);
-    const fsBridge = installFsBridge();
-    const wsStub = installWorkspaceFoldersStub();
-    const dispatches: AutomationDispatch[] = [];
-    const contextPack = path.join(folderPath, "context-pack.md");
-    fs.writeFileSync(contextPack, "# Context\n", "utf8");
-
-    const primaryRunner = {
-      id: "primary-stub-runner",
-      label: "Primary Stub Provider",
-      capabilities: { planning: true, review: true, assistant: false },
-      isAvailable: (): Promise<{ available: boolean }> => Promise.resolve({ available: true }),
-      // No modelId on the result (same shape the sibling "persists
-      // fallbackActive/fallbackModelId" test above uses): qualifiedRanModelId
-      // then returns undefined, so primaryCascadeAlreadySubstitutedBackup is
-      // false — this run's own primary genuinely ran, no internal cascade
-      // substitution — exercising the unreserved-only CAS path.
-      run: async (request: AgentRunRequest): Promise<AgentRunResult> => {
-        await fs.promises.writeFile(request.outputFile.fsPath, "no readiness line here", "utf8");
-        return { runnerId: "primary-stub-runner", status: "completed", summary: "Generated 23 characters" };
-      },
-    };
-    const backupRunner = {
-      id: "backup-cli",
-      label: "Backup Stub Provider",
-      capabilities: { planning: true, review: true, assistant: false },
-      isAvailable: (): Promise<{ available: boolean }> => Promise.resolve({ available: true }),
-      run: async (request: AgentRunRequest): Promise<AgentRunResult> => {
-        await fs.promises.writeFile(request.outputFile.fsPath, "Readiness: 8/10\n\n- Ready.\n", "utf8");
-        return { runnerId: "backup-cli", status: "completed", summary: "Generated 30 characters" };
-      },
-    };
-
-    const patches: Patched[] = [
-      patch(settingsModule, "isAutoAdvanceEnabled", () => false),
-      patch(settingsModule, "getAutoAdvanceScoreThreshold", () => 8),
-      patch(modelSelectionModule, "resolveModelForStage", () =>
-        Promise.resolve({ source: "settings", modelId: "primary-cli:model" })),
-      patch(modelSelectionModule, "resolveFreshModelForStage", () =>
-        Promise.resolve({ source: "settings", modelId: "primary-cli:model" })),
-      patch(modelSelectionModule, "resolveConfiguredReviewStages", () =>
-        Promise.resolve(new Set(REVIEW_STAGES))),
-      patch(runnerRegistryModule, "resolveRunnerForModel", (_modelId: string, stage: TaskStage | undefined) =>
-        stage === undefined
-          ? { runner: backupRunner, provider: "backup-cli", providerLabel: "Backup Stub Provider", nativeModelId: undefined }
-          : { runner: primaryRunner, provider: "primary-cli", providerLabel: "Primary Stub Provider", nativeModelId: undefined }),
-      patch(runnerRegistryModule, "backupModelsForStage", () => ["backup-cli:model"]),
-      patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.resolve("stub prompt")),
-      patch(runLogModule, "writeRunLog", () => Promise.resolve(undefined)),
-      patch(contextPackModule, "writeContextPack", () => Promise.resolve(vscode.Uri.file(contextPack))),
-      patch(automationChainModule, "scheduleAutomationChain", (dispatch: AutomationDispatch): Promise<boolean> => {
-        dispatches.push(dispatch);
-        return Promise.resolve(true);
-      }),
-    ];
-    try {
-      const workspaceRoot = { uri: vscode.Uri.file(REAL_ROOT), name: "root", index: 0 } as vscode.WorkspaceFolder;
-      await runReviewForFolder(
-        vscode.Uri.file(REAL_ROOT),
-        vscode.Uri.file(folderPath),
-        workspaceRoot,
-        "impl-low-review",
-        true,
-        {}
-      );
-
-      const reviewContent = fs.readFileSync(path.join(folderPath, "impl-low-review.md"), "utf8");
-      assert.match(
-        reviewContent,
-        /Readiness: 8\/10/,
-        "the validated backup content must still be promoted for THIS run regardless of who owns the reservation"
-      );
-
-      const progress = JSON.parse(fs.readFileSync(progressPath, "utf8")) as TaskProgress;
-      assert.equal(
-        progress.fallbackModelId?.["impl-low-review"],
-        "someone-elses-cli:model",
-        "a pre-existing reservation held by a different run must not be overwritten by this run's own backup search"
-      );
-    } finally {
-      for (const p of patches.reverse()) { p.restore(); }
-      wsStub.restore();
-      fsBridge.restore();
-      provider.dispose();
-      deactivateNotificationRouter();
-    }
-  });
-
-  void it("a backup that returns status 'cancelled' during the content-validation retry reports a cancellation, not a validation-failure error, and records no false quota observation", async () => {
-    // Regression coverage for two related bugs: (1) recordQuotaObservation
-    // used to run unconditionally before the cancelled check, so a
-    // cancellation — which never actually observed the provider's quota
-    // state — was recorded as a healthy "ok" observation; (2) a cancelled
-    // backup result must surface the same "generation cancelled" message the
-    // primary path already gives for the identical user action, not the
-    // generic "did not produce a valid result" validation-failure error.
-    const { folderPath } = makeTaskFolder(`content-fallback-cancel-${Math.floor(Math.random() * 1e9)}`, "impl-low-review");
-    const provider = new StatusTreeProvider();
-    initNotificationRouter(provider);
-    const fsBridge = installFsBridge();
-    const wsStub = installWorkspaceFoldersStub();
-    const dispatches: AutomationDispatch[] = [];
-    const contextPack = path.join(folderPath, "context-pack.md");
-    fs.writeFileSync(contextPack, "# Context\n", "utf8");
-
-    __quotaTestOnly.clear();
-
-    const primaryRunner = {
-      id: "primary-stub-runner",
-      label: "Primary Stub Provider",
-      capabilities: { planning: true, review: true, assistant: false },
-      isAvailable: (): Promise<{ available: boolean }> => Promise.resolve({ available: true }),
-      run: async (request: AgentRunRequest): Promise<AgentRunResult> => {
-        await fs.promises.writeFile(request.outputFile.fsPath, "no readiness line here", "utf8");
-        return { runnerId: "primary-stub-runner", status: "completed", summary: "Generated 23 characters" };
-      },
-    };
-    const cancelledBackupRunner = {
-      id: "cancelled-backup-stub-runner",
-      label: "Cancelled Backup Provider",
-      capabilities: { planning: true, review: true, assistant: false },
-      isAvailable: (): Promise<{ available: boolean }> => Promise.resolve({ available: true }),
-      run: (): Promise<AgentRunResult> =>
-        Promise.resolve({ runnerId: "cancelled-backup-stub-runner", status: "cancelled" }),
-    };
-
-    const patches: Patched[] = [
-      patch(settingsModule, "isAutoAdvanceEnabled", () => false),
-      patch(settingsModule, "getAutoAdvanceScoreThreshold", () => 8),
-      patch(modelSelectionModule, "resolveModelForStage", () =>
-        Promise.resolve({ source: "settings", modelId: "primary-cli:model" })),
-      patch(modelSelectionModule, "resolveFreshModelForStage", () =>
-        Promise.resolve({ source: "settings", modelId: "primary-cli:model" })),
-      patch(modelSelectionModule, "resolveConfiguredReviewStages", () =>
-        Promise.resolve(new Set(REVIEW_STAGES))),
-      patch(runnerRegistryModule, "resolveRunnerForModel", (_modelId: string, stage: TaskStage | undefined) =>
-        stage === undefined
-          ? { runner: cancelledBackupRunner, provider: "backup-cli", providerLabel: "Cancelled Backup Provider", nativeModelId: undefined }
-          : { runner: primaryRunner, provider: "primary-cli", providerLabel: "Primary Stub Provider", nativeModelId: undefined }),
-      patch(runnerRegistryModule, "backupModelsForStage", () => ["backup-cli:model"]),
-      patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.resolve("stub prompt")),
-      patch(runLogModule, "writeRunLog", () => Promise.resolve(undefined)),
-      patch(contextPackModule, "writeContextPack", () => Promise.resolve(vscode.Uri.file(contextPack))),
-      patch(automationChainModule, "scheduleAutomationChain", (dispatch: AutomationDispatch): Promise<boolean> => {
-        dispatches.push(dispatch);
-        return Promise.resolve(true);
-      }),
-    ];
-    try {
-      const workspaceRoot = { uri: vscode.Uri.file(REAL_ROOT), name: "root", index: 0 } as vscode.WorkspaceFolder;
-      await runReviewForFolder(
-        vscode.Uri.file(REAL_ROOT),
-        vscode.Uri.file(folderPath),
-        workspaceRoot,
-        "impl-low-review",
-        true,
-        {}
-      );
-
-      assert.equal(fs.existsSync(path.join(folderPath, "impl-low-review.md")), false, "no artifact should be published when the only backup was cancelled");
+      assert.equal(secondCandidateInvoked, false, "a malformed completed result must never trigger a fallback candidate");
+      assert.equal(fs.existsSync(path.join(folderPath, "impl-low-review.md")), false, "no review artifact should be published for a rejected (no Readiness line) response");
       assert.equal(dispatches.length, 0, "nothing was ever produced, so no automation chain should fire");
-
-      const infoEntry = provider.getEntries().find((entry) => entry.level === "info" && /cancelled/i.test(entry.message));
-      assert.ok(infoEntry, "expected an information entry reporting cancellation");
-      const errorEntry = provider.getEntries().find((entry) => entry.level === "error");
-      assert.equal(errorEntry, undefined, "a cancelled backup must not be reported as a validation-failure error");
-      assert.equal(
-        getQuotaObservation("impl-low-review", "backup-cli:model"),
-        undefined,
-        "a cancelled run never observed the provider's quota state and must not be recorded as ok"
-      );
-    } finally {
-      for (const p of patches.reverse()) { p.restore(); }
-      wsStub.restore();
-      fsBridge.restore();
-      provider.dispose();
-      deactivateNotificationRouter();
-      __quotaTestOnly.clear();
-    }
-  });
-
-  void it("when the primary's own cascade already substituted a backup, a further content-validation retry corrects the persisted fallbackModelId instead of being blocked by its own earlier reservation", async () => {
-    // Regression coverage for the primaryCascadeAlreadySubstitutedBackup
-    // replacement branch, which the
-    // sibling "pre-existing reservation" test deliberately does NOT cover
-    // (it pins the other side: no substitution, so the real CAS must still
-    // apply). Here the primary's OWN result reports a different model than
-    // what was requested (simulating resolveRunnerForModel's own internal
-    // quota cascade having already substituted a backup and recorded it),
-    // with fallbackActive/fallbackModelId already set to that first,
-    // content-invalid backup. A second, later backup in the list then
-    // produces valid content — the persisted fallbackModelId must be
-    // corrected to that one, not left pointing at the known-bad model,
-    // and must NOT be blocked by the atomic write seeing its own earlier
-    // (same-call) reservation as already active.
-    const { folderPath } = makeTaskFolder(`content-fallback-correct-${Math.floor(Math.random() * 1e9)}`, "impl-low-review");
-    const progressPath = path.join(folderPath, "task-progress.json");
-    const existingProgress = JSON.parse(fs.readFileSync(progressPath, "utf8")) as TaskProgress;
-    existingProgress.fallbackActive = { "impl-low-review": true };
-    existingProgress.fallbackModelId = { "impl-low-review": "already-cli:model" };
-    fs.writeFileSync(progressPath, JSON.stringify(existingProgress, null, 2), "utf8");
-
-    const provider = new StatusTreeProvider();
-    initNotificationRouter(provider);
-    const fsBridge = installFsBridge();
-    const wsStub = installWorkspaceFoldersStub();
-    const dispatches: AutomationDispatch[] = [];
-    const contextPack = path.join(folderPath, "context-pack.md");
-    fs.writeFileSync(contextPack, "# Context\n", "utf8");
-
-    const attemptedBackupModelIds: string[] = [];
-    const primaryRunner = {
-      id: "primary-stub-runner",
-      label: "Primary Stub Provider",
-      capabilities: { planning: true, review: true, assistant: false },
-      isAvailable: (): Promise<{ available: boolean }> => Promise.resolve({ available: true }),
-      run: async (request: AgentRunRequest): Promise<AgentRunResult> => {
-        await fs.promises.writeFile(request.outputFile.fsPath, "no readiness line here", "utf8");
-        // Reports back a DIFFERENT model than the configured primary
-        // ("primary-cli:model") — simulating the internal cascade having
-        // already silently substituted "already-cli:model" (the same one
-        // already recorded as fallbackModelId above) before this content
-        // was even produced.
-        return { runnerId: "primary-stub-runner", status: "completed", modelId: "already-cli:model", summary: "Generated 23 characters" };
-      },
-    };
-    const realBackupRunner = {
-      id: "real-backup-cli",
-      label: "Real Backup Provider",
-      capabilities: { planning: true, review: true, assistant: false },
-      isAvailable: (): Promise<{ available: boolean }> => Promise.resolve({ available: true }),
-      run: async (request: AgentRunRequest): Promise<AgentRunResult> => {
-        await fs.promises.writeFile(request.outputFile.fsPath, "Readiness: 8/10\n\n- Ready.\n", "utf8");
-        return { runnerId: "real-backup-cli", status: "completed", summary: "Generated 30 characters" };
-      },
-    };
-
-    const patches: Patched[] = [
-      patch(settingsModule, "isAutoAdvanceEnabled", () => false),
-      patch(settingsModule, "getAutoAdvanceScoreThreshold", () => 8),
-      patch(modelSelectionModule, "resolveModelForStage", () =>
-        Promise.resolve({ source: "settings", modelId: "primary-cli:model" })),
-      patch(modelSelectionModule, "resolveFreshModelForStage", () =>
-        Promise.resolve({ source: "settings", modelId: "primary-cli:model" })),
-      patch(modelSelectionModule, "resolveConfiguredReviewStages", () =>
-        Promise.resolve(new Set(REVIEW_STAGES))),
-      patch(runnerRegistryModule, "resolveRunnerForModel", (modelId: string, stage: TaskStage | undefined) => {
-        if (stage === undefined) {
-          attemptedBackupModelIds.push(modelId);
-          return { runner: realBackupRunner, provider: "real-backup-cli", providerLabel: "Real Backup Provider", nativeModelId: undefined };
-        }
-        return { runner: primaryRunner, provider: "primary-cli", providerLabel: "Primary Stub Provider", nativeModelId: undefined };
-      }),
-      // "already-cli:model" (the model that already ran, per the primary's
-      // own reported modelId above) must be skipped as already-tried;
-      // "real-backup-cli:model" is the one that should actually run.
-      patch(runnerRegistryModule, "backupModelsForStage", () => ["already-cli:model", "real-backup-cli:model"]),
-      patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.resolve("stub prompt")),
-      patch(runLogModule, "writeRunLog", () => Promise.resolve(undefined)),
-      patch(contextPackModule, "writeContextPack", () => Promise.resolve(vscode.Uri.file(contextPack))),
-      patch(automationChainModule, "scheduleAutomationChain", (dispatch: AutomationDispatch): Promise<boolean> => {
-        dispatches.push(dispatch);
-        return Promise.resolve(true);
-      }),
-    ];
-    try {
-      const workspaceRoot = { uri: vscode.Uri.file(REAL_ROOT), name: "root", index: 0 } as vscode.WorkspaceFolder;
-      await runReviewForFolder(
-        vscode.Uri.file(REAL_ROOT),
-        vscode.Uri.file(folderPath),
-        workspaceRoot,
-        "impl-low-review",
-        true,
-        {}
-      );
-
-      assert.deepEqual(
-        attemptedBackupModelIds,
-        ["real-backup-cli:model"],
-        "already-cli:model must be skipped as already-tried; real-backup-cli:model must be the one actually attempted"
-      );
-      const reviewContent = fs.readFileSync(path.join(folderPath, "impl-low-review.md"), "utf8");
-      assert.match(reviewContent, /Readiness: 8\/10/, "the validated backup content must be promoted");
-
-      const progress = JSON.parse(fs.readFileSync(progressPath, "utf8")) as TaskProgress;
-      assert.equal(
-        progress.fallbackModelId?.["impl-low-review"],
-        "real-backup-cli:model",
-        "fallbackModelId must be CORRECTED to the validated backup, not left pointing at the known-bad model the internal cascade recorded"
-      );
-    } finally {
-      for (const p of patches.reverse()) { p.restore(); }
-      wsStub.restore();
-      fsBridge.restore();
-      provider.dispose();
-      deactivateNotificationRouter();
-    }
-  });
-
-  void it("a newer review attempt claiming the stage mid-retry stops the loop before spending further backups, publishes nothing, and reports an information notice", async () => {
-    // Regression coverage for the reviewAttemptId supersession check, which
-    // previously had zero coverage. Configures two backups; the first
-    // backup's own stub rewrites task-progress.json's reviewAttemptId (the
-    // same technique the existing "paused mid-review" test in this file uses
-    // to mutate progress mid-flight), simulating a newer review attempt
-    // claiming the stage while this run's retry loop is still in progress.
-    // The second backup — which would otherwise produce valid content —
-    // must never be attempted.
-    const { folderPath } = makeTaskFolder(`content-fallback-superseded-${Math.floor(Math.random() * 1e9)}`, "impl-low-review");
-    const progressPath = path.join(folderPath, "task-progress.json");
-    const provider = new StatusTreeProvider();
-    initNotificationRouter(provider);
-    const fsBridge = installFsBridge();
-    const wsStub = installWorkspaceFoldersStub();
-    const dispatches: AutomationDispatch[] = [];
-    const contextPack = path.join(folderPath, "context-pack.md");
-    fs.writeFileSync(contextPack, "# Context\n", "utf8");
-
-    let backupBAttempted = false;
-    const primaryRunner = {
-      id: "primary-stub-runner",
-      label: "Primary Stub Provider",
-      capabilities: { planning: true, review: true, assistant: false },
-      isAvailable: (): Promise<{ available: boolean }> => Promise.resolve({ available: true }),
-      run: async (request: AgentRunRequest): Promise<AgentRunResult> => {
-        await fs.promises.writeFile(request.outputFile.fsPath, "no readiness line here", "utf8");
-        return { runnerId: "primary-stub-runner", status: "completed", summary: "Generated 23 characters" };
-      },
-    };
-    const backupARunner = {
-      id: "backup-a-cli",
-      label: "Backup A Provider",
-      capabilities: { planning: true, review: true, assistant: false },
-      isAvailable: (): Promise<{ available: boolean }> => Promise.resolve({ available: true }),
-      run: async (request: AgentRunRequest): Promise<AgentRunResult> => {
-        // Simulates a newer review attempt (e.g. a second VS Code window)
-        // claiming this stage while this run's own backup A is in flight.
-        const current = JSON.parse(fs.readFileSync(progressPath, "utf8")) as TaskProgress;
-        current.reviewAttemptId = "a-newer-attempt-claimed-this-stage";
-        fs.writeFileSync(progressPath, JSON.stringify(current, null, 2), "utf8");
-        await fs.promises.writeFile(request.outputFile.fsPath, "no readiness line here either", "utf8");
-        return { runnerId: "backup-a-cli", status: "completed", summary: "Generated 30 characters" };
-      },
-    };
-    const backupBRunner = {
-      id: "backup-b-cli",
-      label: "Backup B Provider",
-      capabilities: { planning: true, review: true, assistant: false },
-      isAvailable: (): Promise<{ available: boolean }> => Promise.resolve({ available: true }),
-      run: async (request: AgentRunRequest): Promise<AgentRunResult> => {
-        backupBAttempted = true;
-        await fs.promises.writeFile(request.outputFile.fsPath, "Readiness: 9/10\n\n- Ready.\n", "utf8");
-        return { runnerId: "backup-b-cli", status: "completed", summary: "Generated 30 characters" };
-      },
-    };
-
-    const patches: Patched[] = [
-      patch(settingsModule, "isAutoAdvanceEnabled", () => false),
-      patch(settingsModule, "getAutoAdvanceScoreThreshold", () => 8),
-      patch(modelSelectionModule, "resolveModelForStage", () =>
-        Promise.resolve({ source: "settings", modelId: "primary-cli:model" })),
-      patch(modelSelectionModule, "resolveFreshModelForStage", () =>
-        Promise.resolve({ source: "settings", modelId: "primary-cli:model" })),
-      patch(modelSelectionModule, "resolveConfiguredReviewStages", () =>
-        Promise.resolve(new Set(REVIEW_STAGES))),
-      patch(runnerRegistryModule, "resolveRunnerForModel", (modelId: string, stage: TaskStage | undefined) => {
-        if (stage === undefined) {
-          return modelId === "backup-a-cli:model"
-            ? { runner: backupARunner, provider: "backup-a-cli", providerLabel: "Backup A Provider", nativeModelId: undefined }
-            : { runner: backupBRunner, provider: "backup-b-cli", providerLabel: "Backup B Provider", nativeModelId: undefined };
-        }
-        return { runner: primaryRunner, provider: "primary-cli", providerLabel: "Primary Stub Provider", nativeModelId: undefined };
-      }),
-      patch(runnerRegistryModule, "backupModelsForStage", () => ["backup-a-cli:model", "backup-b-cli:model"]),
-      patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.resolve("stub prompt")),
-      patch(runLogModule, "writeRunLog", () => Promise.resolve(undefined)),
-      patch(contextPackModule, "writeContextPack", () => Promise.resolve(vscode.Uri.file(contextPack))),
-      patch(automationChainModule, "scheduleAutomationChain", (dispatch: AutomationDispatch): Promise<boolean> => {
-        dispatches.push(dispatch);
-        return Promise.resolve(true);
-      }),
-    ];
-    try {
-      const workspaceRoot = { uri: vscode.Uri.file(REAL_ROOT), name: "root", index: 0 } as vscode.WorkspaceFolder;
-      await runReviewForFolder(
-        vscode.Uri.file(REAL_ROOT),
-        vscode.Uri.file(folderPath),
-        workspaceRoot,
-        "impl-low-review",
-        true,
-        {}
-      );
-
-      assert.equal(backupBAttempted, false, "backup B must never be attempted once a newer review attempt has claimed the stage");
-      assert.equal(fs.existsSync(path.join(folderPath, "impl-low-review.md")), false, "no artifact should be published");
-      assert.equal(dispatches.length, 0, "nothing was ever produced, so no automation chain should fire");
-
-      const infoEntry = provider.getEntries().find(
-        (entry) => entry.level === "info" && /newer review attempt/i.test(entry.message)
-      );
-      assert.ok(infoEntry, "expected an information entry reporting supersession by a newer review attempt");
-      const errorEntry = provider.getEntries().find((entry) => entry.level === "error");
-      assert.equal(errorEntry, undefined, "supersession must not be reported as a validation-failure error");
-    } finally {
-      for (const p of patches.reverse()) { p.restore(); }
-      wsStub.restore();
-      fsBridge.restore();
-      provider.dispose();
-      deactivateNotificationRouter();
-    }
-  });
-
-  void it("a newer review attempt claiming the stage while a valid backup is running cannot persist stale fallback routing", async () => {
-    const { folderPath } = makeTaskFolder(`content-fallback-superseded-valid-${Math.floor(Math.random() * 1e9)}`, "impl-low-review");
-    const progressPath = path.join(folderPath, "task-progress.json");
-    const provider = new StatusTreeProvider();
-    initNotificationRouter(provider);
-    const fsBridge = installFsBridge();
-    const wsStub = installWorkspaceFoldersStub();
-    const dispatches: AutomationDispatch[] = [];
-    const contextPack = path.join(folderPath, "context-pack.md");
-    fs.writeFileSync(contextPack, "# Context\n", "utf8");
-
-    let backupRunCount = 0;
-    const primaryRunner = {
-      id: "primary-stub-runner",
-      label: "Primary Stub Provider",
-      capabilities: { planning: true, review: true, assistant: false },
-      isAvailable: (): Promise<{ available: boolean }> => Promise.resolve({ available: true }),
-      run: async (request: AgentRunRequest): Promise<AgentRunResult> => {
-        await fs.promises.writeFile(request.outputFile.fsPath, "no readiness line here", "utf8");
-        return { runnerId: "primary-stub-runner", status: "completed", summary: "Generated 23 characters" };
-      },
-    };
-    const backupRunner = {
-      id: "backup-cli",
-      label: "Backup Provider",
-      capabilities: { planning: true, review: true, assistant: false },
-      isAvailable: (): Promise<{ available: boolean }> => Promise.resolve({ available: true }),
-      run: async (request: AgentRunRequest): Promise<AgentRunResult> => {
-        backupRunCount += 1;
-        // Simulates another VS Code window claiming the stage while this
-        // otherwise-valid backup response is in flight.
-        const current = JSON.parse(fs.readFileSync(progressPath, "utf8")) as TaskProgress;
-        current.reviewAttemptId = "a-newer-attempt-claimed-this-stage";
-        fs.writeFileSync(progressPath, JSON.stringify(current, null, 2), "utf8");
-        await fs.promises.writeFile(request.outputFile.fsPath, "Readiness: 9/10\n\n- Ready.\n", "utf8");
-        return { runnerId: "backup-cli", status: "completed", summary: "Generated 30 characters" };
-      },
-    };
-
-    const patches: Patched[] = [
-      patch(settingsModule, "isAutoAdvanceEnabled", () => false),
-      patch(settingsModule, "getAutoAdvanceScoreThreshold", () => 8),
-      patch(modelSelectionModule, "resolveModelForStage", () =>
-        Promise.resolve({ source: "settings", modelId: "primary-cli:model" })),
-      patch(modelSelectionModule, "resolveFreshModelForStage", () =>
-        Promise.resolve({ source: "settings", modelId: "primary-cli:model" })),
-      patch(modelSelectionModule, "resolveConfiguredReviewStages", () =>
-        Promise.resolve(new Set(REVIEW_STAGES))),
-      patch(runnerRegistryModule, "resolveRunnerForModel", (_modelId: string, stage: TaskStage | undefined) =>
-        stage === undefined
-          ? { runner: backupRunner, provider: "backup-cli", providerLabel: "Backup Provider", nativeModelId: undefined }
-          : { runner: primaryRunner, provider: "primary-cli", providerLabel: "Primary Stub Provider", nativeModelId: undefined }),
-      patch(runnerRegistryModule, "backupModelsForStage", () => ["backup-cli:model"]),
-      patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.resolve("stub prompt")),
-      patch(runLogModule, "writeRunLog", () => Promise.resolve(undefined)),
-      patch(contextPackModule, "writeContextPack", () => Promise.resolve(vscode.Uri.file(contextPack))),
-      patch(automationChainModule, "scheduleAutomationChain", (dispatch: AutomationDispatch): Promise<boolean> => {
-        dispatches.push(dispatch);
-        return Promise.resolve(true);
-      }),
-    ];
-    try {
-      const workspaceRoot = { uri: vscode.Uri.file(REAL_ROOT), name: "root", index: 0 } as vscode.WorkspaceFolder;
-      await runReviewForFolder(
-        vscode.Uri.file(REAL_ROOT),
-        vscode.Uri.file(folderPath),
-        workspaceRoot,
-        "impl-low-review",
-        true,
-        {}
-      );
-
-      assert.equal(backupRunCount, 1, "the configured backup should have started exactly once");
-      assert.equal(fs.existsSync(path.join(folderPath, "impl-low-review.md")), false, "a superseded backup result must not be published");
-      assert.equal(dispatches.length, 0, "a superseded attempt must not schedule automation");
-
-      const progress = JSON.parse(fs.readFileSync(progressPath, "utf8")) as TaskProgress;
-      assert.equal(progress.fallbackActive?.["impl-low-review"], undefined, "a superseded backup must not activate fallback routing");
-      assert.equal(progress.fallbackModelId?.["impl-low-review"], undefined, "a superseded backup must not select a fallback model");
-
-      const infoEntry = provider.getEntries().find(
-        (entry) => entry.level === "info" && /newer review attempt/i.test(entry.message)
-      );
-      assert.ok(infoEntry, "expected an information entry reporting supersession");
     } finally {
       for (const p of patches.reverse()) { p.restore(); }
       wsStub.restore();
@@ -2659,3 +1712,148 @@ void describe("Review generation — content-validation failure falls back to a 
     }
   });
 });
+
+/**
+ * Direct coverage for the production `resumeReviewInteractionV1` delegate
+ * (reviewActions.ts) — the wiring extension.ts calls from the Chat "Resume"
+ * control (plan §5.5/§6.1, AC-QUESTION-03). The generic coordinator-level
+ * `resumeAction` machinery already has thorough coverage in
+ * taskActionCoordinatorV1.test.ts; what was previously untested is the
+ * production glue this delegate adds on top: looking the task up by its
+ * durable `taskBindingId` via `TaskInventory.getTaskByBindingId`, resolving a
+ * fresh model for the review's target stage, claiming a review attempt, and
+ * — on a completed resume — actually promoting the resumed content to the
+ * review artifact via the normal `handleReviewOutcomeV1` path.
+ */
+void describe("resumeReviewInteractionV1 — production Resume delegate", () => {
+  void it("resumes a questions-returning review end to end: settles \"resumed\" and promotes the resumed content", async () => {
+    const { folderPath } = makeTaskFolder(`resume-review-${Math.floor(Math.random() * 1e9)}`, "impl-low-review");
+    const provider = new StatusTreeProvider();
+    initNotificationRouter(provider);
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const execCapture = installExecuteCommandCapture();
+    const workspaceRoot = { uri: vscode.Uri.file(REAL_ROOT), name: "root", index: 0 } as vscode.WorkspaceFolder;
+    const contextPack = path.join(folderPath, "context-pack.md");
+    fs.writeFileSync(contextPack, "# Context\n", "utf8");
+
+    const chatViewProvider = new ChatViewProvider(makeMemento());
+    const askedRefs: ChatInteractionRefV1[] = [];
+    const originalAskInteraction = chatViewProvider.askInteraction.bind(chatViewProvider);
+    chatViewProvider.askInteraction = (async (question) => {
+      askedRefs.push({
+        operationId: question.operationId,
+        interactionId: question.interactionId,
+        taskBindingId: question.binding.taskBindingId,
+        chatDocumentId: question.binding.chatDocumentId,
+        sourceAttemptId: question.sourceAttemptId,
+      });
+      return originalAskInteraction(question);
+    }) as typeof chatViewProvider.askInteraction;
+
+    try {
+      const initialPatches: Patched[] = [
+        patch(modelSelectionModule, "resolveModelForStage", () =>
+          Promise.resolve({ source: "settings", modelId: "stub:model" })),
+        patch(modelSelectionModule, "resolveFreshModelForStage", () =>
+          Promise.resolve({ source: "settings", modelId: "stub:model" })),
+        patch(modelSelectionModule, "resolveConfiguredReviewStages", () =>
+          Promise.resolve(new Set(REVIEW_STAGES))),
+        stubV1RunnerSelection([questionsTransportV1()]),
+        patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.resolve("stub prompt")),
+        patch(runLogModule, "writeRunLog", () => Promise.resolve(undefined)),
+        patch(contextPackModule, "writeContextPack", () => Promise.resolve(vscode.Uri.file(contextPack))),
+      ];
+      try {
+        await runReviewForFolder(
+          vscode.Uri.file(REAL_ROOT),
+          vscode.Uri.file(folderPath),
+          workspaceRoot,
+          "impl-low-review",
+          true,
+          { chatViewProvider }
+        );
+      } finally {
+        for (const p of initialPatches.reverse()) { p.restore(); }
+      }
+
+      assert.equal(askedRefs.length, 1, "the review's questions must reach Chat With AI exactly once");
+      assert.equal(
+        fs.existsSync(path.join(folderPath, "impl-low-review.md")),
+        false,
+        "a questions outcome must not promote any review content"
+      );
+
+      // Resume is only valid after the interaction's questions have been
+      // answered (questionsPosted -> answersSubmitted); the transaction
+      // state machine rejects a bare Resume straight from questionsPosted
+      // (outcomeCode "answersNotSubmitted").
+      const submitted = await getProductionActionConversationOrchestratorV1().submitAnswers(
+        askedRefs[0]!,
+        [{ questionId: "q1", kind: "text", state: "answered", value: "Favor correctness over speed." }],
+        allocateHex128IdV1()
+      );
+      assert.equal(submitted.ok, true, "the clarifying answer must be accepted before Resume");
+
+      const inventory = makeBindingInventoryStub(folderPath, "impl-low-review");
+      const resumePatches: Patched[] = [
+        patch(modelSelectionModule, "resolveFreshModelForStage", () =>
+          Promise.resolve({ source: "settings", modelId: "stub:model" })),
+        stubV1RunnerSelection([markdownTransportV1("Readiness: 9/10\n\n- Ready after clarification.\n")]),
+      ];
+      try {
+        const result = await resumeReviewInteractionV1(
+          vscode.Uri.file(REAL_ROOT),
+          inventory,
+          chatViewProvider,
+          askedRefs[0]!,
+          allocateHex128IdV1(),
+          fakeToken()
+        );
+
+        assert.equal(result.ok, true, `expected Resume to settle successfully: ${result.ok ? "" : result.reason}`);
+        if (result.ok) {
+          assert.equal(result.settlement, "resumed", "review.v1 declares sameOperation resume semantics");
+        }
+        assert.equal(
+          fs.readFileSync(path.join(folderPath, "impl-low-review.md"), "utf8").includes("Ready after clarification"),
+          true,
+          "the resumed attempt's own content must be the one actually promoted to the review artifact"
+        );
+      } finally {
+        for (const p of resumePatches.reverse()) { p.restore(); }
+      }
+
+      // A second Resume of the same interaction, with a fresh idempotency id,
+      // must be rejected without invoking a provider (AC-ID-04) — proven here
+      // via the production delegate's own return value, not only at the
+      // generic coordinator level.
+      const replayPatches: Patched[] = [
+        stubV1RunnerSelection([
+          markdownTransportV1("must not be invoked for a replay"),
+        ]),
+      ];
+      try {
+        const replay = await resumeReviewInteractionV1(
+          vscode.Uri.file(REAL_ROOT),
+          inventory,
+          chatViewProvider,
+          askedRefs[0]!,
+          allocateHex128IdV1(),
+          fakeToken()
+        );
+        assert.equal(replay.ok, false, "a second Resume of an already-settled interaction must not report success");
+      } finally {
+        for (const p of replayPatches.reverse()) { p.restore(); }
+      }
+    } finally {
+      execCapture.restore();
+      wsStub.restore();
+      fsBridge.restore();
+      provider.dispose();
+      deactivateNotificationRouter();
+    }
+  });
+});
+
+

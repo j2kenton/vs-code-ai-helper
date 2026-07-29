@@ -100,37 +100,49 @@ void describe("normalizeReviewArg contract", () => {
 // applyHighLevelReviewChanges / applyLowLevelReviewChanges delegation contract
 // ---------------------------------------------------------------------------
 //
-// These tests document the expected delegation arg shape: the commands must
-// pass taskFolderPath (not canonicalId) when delegating to applyReviewWithAI,
-// so normalizeReviewArg can construct a synthetic IncompleteTask for
-// resolveTask to re-read fresh progress from disk.
+// These tests document the expected delegation arg shape. The commands must
+// delegate with { task: IncompleteTask } carrying the already-read, real
+// progress — not { taskFolderPath } — so that applyReviewWithAI's early gate
+// check (plan §1.3) can trust arg.task.progress.currentStage to fire the
+// applyReviewEdit.v1 gate BEFORE performing any read of its own. A
+// { taskFolderPath } arg is deliberately re-wrapped by normalizeReviewArg
+// with an untrustworthy placeholder stage and must fall through to a fresh
+// resolveTask read (and thus a post-read gate check) instead.
 
 void describe("review-apply delegation arg contract", () => {
-  void it("applyHighLevelReviewChanges delegates with taskFolderPath", () => {
+  void it("applyHighLevelReviewChanges delegates with { task } carrying real progress", () => {
     // Simulate the delegation: after resolveTaskContext resolves, the command
-    // should delegate { taskFolderPath: resolvedTask.taskFolderPath }.
+    // should delegate { task: { folderUri, folderName, progress } } built
+    // from the already-read progress, not a bare taskFolderPath.
     const resolvedTask = {
       taskFolderPath: "/workspace/.helper/plans/2026-07-08_task_1",
       canonicalId: "/workspace/.helper/plans/2026-07-08_task_1",
+      progress: { currentStage: "impl-high-review", status: "active" },
     };
 
-    // The delegation shape must use taskFolderPath so normalizeReviewArg works
-    const delegationArg = { taskFolderPath: resolvedTask.taskFolderPath };
+    const delegationArg = {
+      task: {
+        folderUri: {},
+        folderName: "2026-07-08_task_1",
+        progress: resolvedTask.progress,
+      },
+    };
     const normalized = normalizeReviewArgSpec(delegationArg);
 
     assert.strictEqual(normalized.hasTask, true,
       "delegation arg must result in a resolvable task"
     );
-    assert.strictEqual(
-      normalized.taskFolderPath,
-      resolvedTask.taskFolderPath,
-      "task folder path must be passed through"
-    );
+    // A { task } delegation carries no separate taskFolderPath field — the
+    // real stage travels on task.progress.currentStage instead, which is
+    // exactly what lets the caller's already-known stage gate the edit
+    // branch before any read.
+    assert.strictEqual(normalized.taskFolderPath, undefined);
   });
 
   void it("delegation with canonicalId only would NOT resolve correctly", () => {
-    // Contrast: if the delegation used canonicalId instead of taskFolderPath,
-    // normalizeReviewArg would fall through to QuickPick — wrong behavior.
+    // Contrast: canonicalId alone (neither task nor taskFolderPath) falls
+    // through to QuickPick — wrong behavior for a keyboard-shortcut command
+    // that already resolved a specific task.
     const resolvedTask = {
       taskFolderPath: "/workspace/.helper/plans/2026-07-08_task_1",
       canonicalId: "/workspace/.helper/plans/2026-07-08_task_1",
@@ -141,7 +153,7 @@ void describe("review-apply delegation arg contract", () => {
 
     // canonicalId-only delegation falls through: no task, would show QuickPick
     assert.strictEqual(normalized.hasTask, false,
-      "canonicalId-only delegation does NOT resolve — confirms taskFolderPath is required"
+      "canonicalId-only delegation does NOT resolve — confirms task/taskFolderPath is required"
     );
   });
 });
@@ -339,6 +351,7 @@ void describe("fast-forward fallback contract", () => {
         skipImplementationSafetyCheck: false,
         preserveActiveFallback: false,
         parentOperation,
+        chatViewProvider: undefined,
       }
     );
     assert.deepStrictEqual(
@@ -347,6 +360,7 @@ void describe("fast-forward fallback contract", () => {
         skipImplementationSafetyCheck: true,
         preserveActiveFallback: true,
         parentOperation,
+        chatViewProvider: undefined,
       }
     );
   });

@@ -122,7 +122,7 @@ export function createApplyReviewRowV1(): ProviderTaskActionRowV1 {
       "vs-code-ai-helper.applyHighLevelReviewChanges",
       "vs-code-ai-helper.applyLowLevelReviewChanges",
     ],
-    eligibility: { statuses: ["active"], stages: "anyStage" },
+    eligibility: { statuses: ["active"], stages: ["plan-high-review", "plan-low-review", "plan"] },
     requiresTaskOperationLease: true,
     progressLabel: "Applying review fixes…",
     validateInput: validateApplyReviewInputV1,

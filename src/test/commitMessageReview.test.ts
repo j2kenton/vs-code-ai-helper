@@ -19,7 +19,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
 import * as vscode from "vscode";
-import { commitAndPushTask } from "../commands/commitAndPushTask";
+import { commitAndPushTask, resumeCommitPushMetadataInteractionV1 } from "../commands/commitAndPushTask";
 import { TaskInventory } from "../state/taskInventory";
 import { TaskProgress } from "../types/taskProgress";
 import {
@@ -27,6 +27,44 @@ import {
   initNotificationRouter,
 } from "../utils/notificationRouter";
 import { safeRemoveDir } from "./testFsUtils";
+import { createChatInteractionTransactionStoreV1 } from "../services/chatInteractionTransactionStoreV1";
+import {
+  configureWorkflowPrivateStorageRootV1,
+  getWorkflowFileStoreV1,
+  getWorkflowPathRegistryV1,
+  setChatInteractionTransactionStoreV1,
+} from "../services/workflowRuntimeServicesV1";
+import { getProductionActionConversationOrchestratorV1 } from "../actions/productionTaskActionRuntimeV1";
+import { ChatViewProvider, ChatInteractionRefV1 } from "../views/chatView";
+import { allocateHex128IdV1 } from "../types/actionCorrelationV1";
+import { deriveTaskBindingV1 } from "../types/taskBindingV1";
+
+// buildCommitMessage's AI path runs through the real production coordinator
+// (createProductionTaskActionCoordinatorV1), which requires the Chat
+// interaction transaction store to be wired exactly as extension.ts does at
+// activation — otherwise getProductionActionConversationOrchestratorV1
+// throws "not wired yet", which buildCommitMessage's catch-all silently
+// swallows into the deterministic fallback subject, masking whether the
+// configured provider was actually invoked.
+const PRIVATE_STORAGE_ROOT = fs.mkdtempSync(
+  path.join(os.tmpdir(), "ensemble-commit-message-review-private-")
+);
+// configureWorkflowPrivateStorageRootV1 MUST run (and its `rebuildFileStore()`
+// side effect complete) before getWorkflowFileStoreV1() is called below —
+// object-literal property evaluation runs top-to-bottom, so folding the
+// configure call into the `privateRootId` property here would capture the
+// PRE-registration (root-less) fileStore instance and every `begin()` write
+// through it would fail closed with `workspaceRootUnsupported`, exactly as
+// extension.ts's own activation wiring avoids by registering the root in its
+// own statement first (src/extension.ts, `workflowPrivateStorageRootId`).
+const PRIVATE_STORAGE_ROOT_ID = configureWorkflowPrivateStorageRootV1(PRIVATE_STORAGE_ROOT);
+setChatInteractionTransactionStoreV1(
+  createChatInteractionTransactionStoreV1({
+    registry: getWorkflowPathRegistryV1(),
+    fileStore: getWorkflowFileStoreV1(),
+    privateRootId: PRIVATE_STORAGE_ROOT_ID,
+  })
+);
 
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const completionLintModule = require("../utils/completionLint") as {
@@ -40,7 +78,132 @@ const modelSelectionModule = require("../utils/modelSelection") as {
 const runnerRegistryModule = require("../runners/runnerRegistry") as {
   resolveRunnerForModel: (...args: unknown[]) => unknown;
   checkRunnerAvailabilityForModel: (...args: unknown[]) => Promise<unknown>;
+  createV1RunnerSelectionOpener: (...args: unknown[]) => unknown;
 };
+
+/**
+ * commitAndPushTask's metadata generation now runs through the real V1
+ * action coordinator (createProductionTaskActionCoordinatorV1), which
+ * selects providers via runnerRegistry's `createV1RunnerSelectionOpener` —
+ * NOT the legacy `resolveRunnerForModel` cascade. Framing a fake response
+ * requires the V1 envelope format and this seam instead (mirrors
+ * publishOwnershipMatrix.test.ts's identical helpers).
+ */
+function frameV1(json: unknown): string {
+  return `<<<ENSEMBLE_AI_RESULT_V1>>>\n${JSON.stringify(json)}\n<<<END_ENSEMBLE_AI_RESULT_V1>>>\n`;
+}
+
+interface FakeAgentTransportV1 {
+  readonly runnerId: string;
+  invoke(
+    request: { correlation: unknown },
+    output: { write: (chunk: string) => boolean }
+  ): Promise<{ kind: "completed" }>;
+}
+
+/** A V1 transport that frames a completed commit-metadata.v1 envelope. */
+function commitMetadataTransportV1(
+  subject: string,
+  body?: string,
+  runnerId = "stub-runner"
+): FakeAgentTransportV1 {
+  return {
+    runnerId,
+    invoke: (request, output): Promise<{ kind: "completed" }> => {
+      output.write(
+        frameV1({
+          version: 1,
+          correlation: request.correlation,
+          kind: "completed",
+          content: {
+            contentType: "commit-metadata.v1",
+            schemaVersion: 1,
+            subject,
+            ...(body !== undefined ? { body } : {}),
+          },
+        })
+      );
+      return Promise.resolve({ kind: "completed" as const });
+    },
+  };
+}
+
+/** A V1 transport that frames a `questions` envelope with a single required text question. */
+function questionsTransportV1(runnerId = "stub-runner"): FakeAgentTransportV1 {
+  return {
+    runnerId,
+    invoke: (request, output): Promise<{ kind: "completed" }> => {
+      output.write(
+        frameV1({
+          version: 1,
+          correlation: request.correlation,
+          kind: "questions",
+          questions: [
+            {
+              questionId: "q1",
+              kind: "text",
+              prompt: "What's the primary intent of this change?",
+              required: true,
+              allowBlank: false,
+              maxLength: 200,
+            },
+          ],
+        })
+      );
+      return Promise.resolve({ kind: "completed" as const });
+    },
+  };
+}
+
+/**
+ * Patches runnerRegistry's `createV1RunnerSelectionOpener` factory so a
+ * coordinator-run commit-metadata generation never reaches a real CLI or
+ * Copilot provider. `runInvokedWithStage` records the taskStage each
+ * reservation was opened for — the equivalent of the legacy stub's
+ * `request.stage` observation.
+ */
+function stubV1RunnerSelection(
+  transports: readonly FakeAgentTransportV1[],
+  onOpen?: (taskStage: string) => void
+): { restore: () => void } {
+  const orig = runnerRegistryModule.createV1RunnerSelectionOpener;
+  let cursor = 0;
+  runnerRegistryModule.createV1RunnerSelectionOpener = () => (request: {
+    session: { reserve: (input: Record<string, unknown>) => unknown };
+    mode: unknown;
+    taskStage: string;
+  }) => {
+    onOpen?.(request.taskStage);
+    return {
+      reserveNext(attemptId: string): unknown {
+        const transport = transports[cursor];
+        if (!transport) {
+          return cursor === 0
+            ? { kind: "noneRemaining", code: "providerModeUnavailable" }
+            : { kind: "noneRemaining", code: "candidatesExhausted" };
+        }
+        cursor += 1;
+        const handle = request.session.reserve({
+          attemptId,
+          mode: request.mode,
+          runnerId: transport.runnerId,
+          providerId: "copilot",
+          modelId: "copilot:test",
+        });
+        return {
+          kind: "reserved",
+          reserved: {
+            handle,
+            providerLabel: "Test Provider",
+            storedModelId: "copilot:test",
+            createTransport: () => transport,
+          },
+        };
+      },
+    };
+  };
+  return { restore: (): void => { runnerRegistryModule.createV1RunnerSelectionOpener = orig; } };
+}
 
 function git(cwd: string, args: string[]): string {
   return cp.execFileSync("git", args, { cwd, windowsHide: true }).toString("utf8");
@@ -62,13 +225,20 @@ function makeGitFixtureWithRemote(): string {
   return repoRoot;
 }
 
-function fixtureTaskProgress(): TaskProgress {
+function fixtureTaskProgress(taskFolderPath: string): TaskProgress {
   return {
     taskFolder: "task_1",
     currentStage: "publish",
     status: "active",
     createdAt: "2026-01-01T00:00:00.000Z",
     updatedAt: "2026-01-01T00:00:00.000Z",
+    ownership: {
+      metaRoot: path.dirname(taskFolderPath),
+      projectRoot: path.dirname(taskFolderPath),
+      workspaceRoot: path.dirname(path.dirname(taskFolderPath)),
+      boundAt: "2026-01-01T00:00:00.000Z",
+      state: "resolved",
+    },
   };
 }
 
@@ -90,7 +260,7 @@ function installFakeInventory(
     canonicalId,
     sourceScopeKey: "test",
     workspaceFolder: undefined,
-    progress: { ...fixtureTaskProgress(), ...progressOverrides },
+    progress: { ...fixtureTaskProgress(taskFolderPath), ...progressOverrides },
   };
   return {
     getTaskById: (id: string) => (id === canonicalId ? task : undefined),
@@ -99,6 +269,13 @@ function installFakeInventory(
     getVisibleTaskForSuppressedPath: () => undefined,
     getTasks: () => [task],
     refresh: () => Promise.resolve(undefined),
+    // resumeCommitPushMetadataInteractionV1 looks the task up by its
+    // durable Chat-transaction taskBindingId (plan §3.9), derived from this
+    // task's own `progress.ownership`/`taskFolder`.
+    getTaskByBindingId: (taskBindingId: string) => {
+      const derived = deriveTaskBindingV1(task.progress);
+      return derived.ok && derived.binding.bindingId === taskBindingId ? task : undefined;
+    },
   } as unknown as TaskInventory;
 }
 
@@ -120,6 +297,15 @@ function installHarness(
 ): Harness {
   const repoRoot = makeGitFixtureWithRemote();
   const taskFolderPath = path.join(repoRoot, "plans", "task_1");
+  // A real task-progress.json (with a validated ownership binding) is required
+  // on disk: ensureWorkflowTaskFolderRootV1 (plan §3.9) reads it via raw node
+  // fs, independent of the in-memory inventory stub / workspaceFs mock below,
+  // and refuses to register a task-folder root with no ownership binding.
+  fs.writeFileSync(
+    path.join(taskFolderPath, "task-progress.json"),
+    JSON.stringify({ ...fixtureTaskProgress(taskFolderPath), ...progressOverrides }, null, 2),
+    "utf8"
+  );
   const inventory = installFakeInventory(taskFolderPath, taskFolderPath, progressOverrides);
 
   const surface = new RecordingSurface();
@@ -186,6 +372,39 @@ function installHarness(
       (vscode.workspace as unknown as Record<string, unknown>).workspaceFolders = originals.workspaceFolders;
       deactivateNotificationRouter();
       safeRemoveDir(repoRoot);
+    },
+  };
+}
+
+/** Minimal vscode.Memento backing store for a standalone ChatViewProvider instance. */
+function makeMemento(): vscode.Memento {
+  const store = new Map<string, unknown>();
+  return {
+    get: <T>(key: string, defaultValue?: T): T => (store.has(key) ? (store.get(key) as T) : (defaultValue as T)),
+    update: (key: string, value: unknown): Promise<void> => {
+      if (value === undefined) store.delete(key);
+      else store.set(key, value);
+      return Promise.resolve();
+    },
+    keys: (): readonly string[] => [...store.keys()],
+  } as unknown as vscode.Memento;
+}
+
+/**
+ * ChatViewProvider.askInteraction's first call for a task opens the webview
+ * via `executeCommand("vs-code-ai-helper.chatView.focus")` (chatView.ts's
+ * `open()`), which this test process never registers — mirrors
+ * chatInteractionUI.test.ts's identical harness.
+ */
+function installExecuteCommandCapture(): { restore: () => void } {
+  const commandsObj = vscode.commands as unknown as {
+    _executeCommandOverride?: (id: string, ...args: unknown[]) => Promise<unknown>;
+  };
+  const orig = commandsObj._executeCommandOverride;
+  commandsObj._executeCommandOverride = (): Promise<unknown> => Promise.resolve(undefined);
+  return {
+    restore: (): void => {
+      commandsObj._executeCommandOverride = orig;
     },
   };
 }
@@ -311,28 +530,26 @@ void describe("commit-message review (in-UI modal, no editor session)", () => {
     const workspaceFs = vscode.workspace.fs as unknown as Record<string, unknown>;
     const originalReadFile = workspaceFs.readFile;
     const originalCreateDirectory = workspaceFs.createDirectory;
-    const originalResolveRunner = runnerRegistryModule.resolveRunnerForModel;
-    const originalCheckAvailability = runnerRegistryModule.checkRunnerAvailabilityForModel;
-    const cliMessage = "Add background export queue\n\nLets large exports finish without blocking the UI.";
+    const subject = "Add background export queue";
+    const body = "Lets large exports finish without blocking the UI.";
     let runInvokedWithStage: string | undefined;
+    const runnerPatch = stubV1RunnerSelection(
+      [commitMetadataTransportV1(subject, body)],
+      (taskStage) => { runInvokedWithStage = taskStage; }
+    );
     try {
       modelSelectionModule.resolveFreshModelForStage = () =>
         Promise.resolve({ modelId: "claude-cli:sonnet" });
-      runnerRegistryModule.resolveRunnerForModel = () => ({
-        runner: {
-          run: (request: { stage: string }) => {
-            runInvokedWithStage = request.stage;
-            return Promise.resolve({ status: "completed" });
-          },
-        },
-        provider: "claude-cli",
-        providerLabel: "Claude Code",
-        nativeModelId: undefined,
-      });
-      runnerRegistryModule.checkRunnerAvailabilityForModel = () =>
-        Promise.resolve({ availability: { available: true } });
       workspaceFs.createDirectory = () => Promise.resolve();
-      workspaceFs.readFile = () => Promise.resolve(new TextEncoder().encode(cliMessage));
+      workspaceFs.readFile = () => Promise.resolve(new TextEncoder().encode(""));
+      // commitPushMetadataRowV1's promotion writes the generated metadata to
+      // <task-folder>/runs/commit-metadata-<ts>.json via the real (raw-fs,
+      // nonrecursive-mkdir) WorkflowFileStoreV1 — independent of the
+      // vscode.workspace.fs mocking above. In production "runs/" already
+      // exists by the time a task reaches Publish (every prior review/
+      // implementation run writes a log there); this minimal harness never
+      // creates it, so it must be seeded here.
+      fs.mkdirSync(path.join(harness.taskFolderPath, "runs"), { recursive: true });
 
       await commitAndPushTask(harness.inventory, { canonicalId: harness.taskFolderPath });
 
@@ -347,8 +564,7 @@ void describe("commit-message review (in-UI modal, no editor session)", () => {
     } finally {
       workspaceFs.readFile = originalReadFile;
       workspaceFs.createDirectory = originalCreateDirectory;
-      runnerRegistryModule.resolveRunnerForModel = originalResolveRunner;
-      runnerRegistryModule.checkRunnerAvailabilityForModel = originalCheckAvailability;
+      runnerPatch.restore();
       harness.restore();
     }
   });
@@ -373,6 +589,126 @@ void describe("commit-message review (in-UI modal, no editor session)", () => {
         "cancellation must be reported"
       );
     } finally {
+      harness.restore();
+    }
+  });
+});
+
+/**
+ * Direct coverage for the production `resumeCommitPushMetadataInteractionV1`
+ * delegate (commitAndPushTask.ts) — the wiring extension.ts calls from the
+ * Chat "Resume" control for Commit and Push's `commitPushMetadata.v1`
+ * question (plan §5.5/§10.2 point 5). Unlike the review/apply-review rows,
+ * this row declares `resumeSemantics: "replacementOperation"` (its
+ * process-global token was released when the question was first posted), so
+ * Resume must start a genuinely fresh, linked public Commit and Push
+ * operation — its own token acquisition, index/privacy checks, and lint —
+ * rather than resuming the original operation in place.
+ */
+void describe("resumeCommitPushMetadataInteractionV1 — production Resume delegate", () => {
+  void it("resumes a questions-returning commit-metadata attempt end to end: settles \"supersededByReplacementOperation\" and commits with the resumed message", async () => {
+    const harness = installHarness(() => "Commit & Push");
+    // commitPushMetadataRowV1's promotion writes to
+    // <task-folder>/runs/commit-metadata-<ts>.json via the real
+    // WorkflowFileStoreV1 (see the identical seeding above).
+    fs.mkdirSync(path.join(harness.taskFolderPath, "runs"), { recursive: true });
+
+    const chatViewProvider = new ChatViewProvider(makeMemento());
+    const execCapture = installExecuteCommandCapture();
+    const askedRefs: ChatInteractionRefV1[] = [];
+    const originalAskInteraction = chatViewProvider.askInteraction.bind(chatViewProvider);
+    chatViewProvider.askInteraction = (async (question) => {
+      askedRefs.push({
+        operationId: question.operationId,
+        interactionId: question.interactionId,
+        taskBindingId: question.binding.taskBindingId,
+        chatDocumentId: question.binding.chatDocumentId,
+        sourceAttemptId: question.sourceAttemptId,
+      });
+      return originalAskInteraction(question);
+    }) as typeof chatViewProvider.askInteraction;
+
+    try {
+      const initialRunnerPatch = stubV1RunnerSelection([questionsTransportV1()]);
+      try {
+        await commitAndPushTask(
+          harness.inventory,
+          { canonicalId: harness.taskFolderPath },
+          undefined,
+          undefined,
+          undefined,
+          chatViewProvider
+        );
+      } finally {
+        initialRunnerPatch.restore();
+      }
+
+      assert.equal(askedRefs.length, 1, "the commit-metadata clarifying question must reach Chat With AI exactly once");
+      assert.equal(harness.infoCalls.length, 0, "a questions outcome must never reach the commit-message review modal");
+      assert.equal(
+        git(harness.repoRoot, ["rev-list", "--count", "HEAD"]).trim(),
+        "1",
+        "a questions outcome must not commit anything"
+      );
+
+      const submitted = await getProductionActionConversationOrchestratorV1().submitAnswers(
+        askedRefs[0]!,
+        [{ questionId: "q1", kind: "text", state: "answered", value: "A background export queue." }],
+        allocateHex128IdV1()
+      );
+      assert.equal(submitted.ok, true, "the clarifying answer must be accepted before Resume");
+
+      const resumeRunnerPatch = stubV1RunnerSelection([
+        commitMetadataTransportV1("Add background export queue", "Lets large exports finish without blocking the UI."),
+      ]);
+      try {
+        const result = await resumeCommitPushMetadataInteractionV1(
+          harness.inventory,
+          chatViewProvider,
+          askedRefs[0]!,
+          allocateHex128IdV1()
+        );
+
+        assert.equal(result.ok, true, `expected Resume to settle successfully: ${result.ok ? "" : result.reason}`);
+        if (result.ok) {
+          assert.equal(
+            result.settlement,
+            "supersededByReplacementOperation",
+            "commitPushMetadata.v1 declares replacementOperation resume semantics"
+          );
+        }
+        assert.equal(
+          git(harness.repoRoot, ["rev-list", "--count", "HEAD"]).trim(),
+          "2",
+          "the fresh linked operation Resume starts must actually commit and push"
+        );
+        assert.equal(
+          git(harness.repoRoot, ["log", "-1", "--format=%s"]).trim(),
+          "Add background export queue",
+          "the commit must use the resumed attempt's own generated subject"
+        );
+
+        // A second Resume of the same interaction, with a fresh idempotency
+        // id, must be rejected without starting another operation (AC-ID-04).
+        const replayRunnerPatch = stubV1RunnerSelection([
+          commitMetadataTransportV1("must not be invoked for a replay"),
+        ]);
+        try {
+          const replay = await resumeCommitPushMetadataInteractionV1(
+            harness.inventory,
+            chatViewProvider,
+            askedRefs[0]!,
+            allocateHex128IdV1()
+          );
+          assert.equal(replay.ok, false, "a second Resume of an already-settled interaction must not report success");
+        } finally {
+          replayRunnerPatch.restore();
+        }
+      } finally {
+        resumeRunnerPatch.restore();
+      }
+    } finally {
+      execCapture.restore();
       harness.restore();
     }
   });
