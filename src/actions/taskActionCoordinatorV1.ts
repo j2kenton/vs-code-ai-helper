@@ -138,6 +138,7 @@ import {
 import {
   AgentExecutionModeV1,
   AgentExecutionRequestV1,
+  AgentTransportV1,
   SealedResultPayloadV1,
 } from "../types/agentExecutionV1";
 import { AiResultEnvelopeV1, parseAiResultEnvelopeV1 } from "../types/aiResultEnvelope";
@@ -355,6 +356,15 @@ export interface AdmittedProviderActionTicketV1 {
   readonly validatedInput: unknown;
   readonly session: ProviderSelectionSessionV1;
   readonly selection: V1RunnerSelectionV1;
+  readonly initialCandidate?: {
+    readonly attemptId: string;
+    readonly reserved: {
+      readonly handle: { readonly reservationId: string; readonly correlation: ActionCorrelationV1 };
+      readonly providerLabel: string;
+      readonly storedModelId: string;
+      readonly createTransport: () => AgentTransportV1;
+    };
+  };
   readonly acquireLeasePhase: AcquireTaskLeasePhaseV1;
   readonly progress: TaskActionProgressHandleV1;
   readonly metrics: ResultMetricsCaptureV1;
@@ -609,7 +619,8 @@ export function createTaskActionCoordinatorV1(
      * transaction record exists, so a validation/storage failure never
      * leaves an unanswerable orphan message in the transcript.
      */
-    preInvocationHook?: () => Promise<void>
+    preInvocationHook?: () => Promise<void>,
+    initialCandidate?: AdmittedProviderActionTicketV1["initialCandidate"]
   ): Promise<TaskActionOutcomeV1> {
     // No task-operation lease is held anywhere in this function except the
     // settlement phase inside `settleEnvelope` (plan §6.1 rule 6: leases are
@@ -623,29 +634,84 @@ export function createTaskActionCoordinatorV1(
     // exclusive-create rather than support it, so Resume drives are left on
     // their pre-existing behavior entirely.
     const isFreshInvocation = claimInvocationOnce === undefined;
-    const questionCapableInvocation =
-      isFreshInvocation && row.permittedResultKinds.includes("questions");
+    let pendingCandidate = initialCandidate;
     for (;;) {
-      const attemptId = session.allocateAttempt();
+      let attemptId: string;
+      let reserved: NonNullable<AdmittedProviderActionTicketV1["initialCandidate"]>["reserved"];
 
-      const next = selection.reserveNext(attemptId);
-      if (next.kind === "noneRemaining") {
-        // Nothing was reserved for this attempt — settle it explicitly so
-        // the session's one-outcome-per-attempt accounting stays complete,
-        // then map both exhaustion codes onto the stable mode-unavailable
-        // outcome (plan §3.7).
-        session.reportAttemptOutcome(attemptId, "providerUnavailablePreInvocation");
-        return unavailableV1("providerModeUnavailable");
-      }
-      if (next.kind === "candidateUnavailable") {
-        // The registry settled this attempt (providerUnavailablePreInvocation)
-        // for a ranked candidate that cannot satisfy the mode — an explicit,
-        // auditable skip, never a silent bypass. A FRESH attempt reaches the
-        // next ranked candidate (plan §3.4).
-        continue;
-      }
+      if (pendingCandidate) {
+        attemptId = pendingCandidate.attemptId;
+        reserved = pendingCandidate.reserved;
+        pendingCandidate = undefined;
+      } else {
+        attemptId = session.allocateAttempt();
 
-      const { reserved } = next;
+        const next = selection.reserveNext(attemptId);
+        if (next.kind === "noneRemaining") {
+          // Nothing was reserved for this attempt — settle it explicitly so
+          // the session's one-outcome-per-attempt accounting stays complete,
+          // then map both exhaustion codes onto the stable mode-unavailable
+          // outcome (plan §3.7).
+          session.reportAttemptOutcome(attemptId, "providerUnavailablePreInvocation");
+          return unavailableV1("providerModeUnavailable");
+        }
+        if (next.kind === "candidateUnavailable") {
+          // The registry settled this attempt (providerUnavailablePreInvocation)
+          // for a ranked candidate that cannot satisfy the mode — an explicit,
+          // auditable skip, never a silent bypass. A FRESH attempt reaches the
+          // next ranked candidate (plan §3.4).
+          continue;
+        }
+
+        reserved = next.reserved;
+
+        const questionCapableInvocation =
+          isFreshInvocation && row.permittedResultKinds.includes("questions");
+
+        if (questionCapableInvocation) {
+          const correlation = reserved.handle.correlation;
+          const context: TaskActionExecutionContextV1 = {
+            correlation,
+            stage,
+            validatedInput,
+            ...(answers !== undefined ? { answers } : {}),
+          };
+          const prompt =
+            row.buildPrompt(context) +
+            "\n\n" +
+            buildAiResultContractPromptV1({
+              correlation,
+              permittedResultKinds: row.permittedResultKinds,
+              completedContentType: row.completedContentType,
+              maxResponseBytes: row.maxResponseBytes,
+            });
+          const promptSha256 = createHash("sha256").update(prompt, "utf8").digest("hex");
+
+          await deps.orchestrator.discardInvocation(correlation.operationId);
+          const admitted = await deps.orchestrator.admitInvocation({
+            correlation,
+            stage,
+            resumeSemantics: row.resumeSemantics,
+            validatedInput,
+            promptContract: {
+              contractId: AI_RESULT_CONTRACT_ID_V1,
+              contractVersion: AI_RESULT_CONTRACT_VERSION_V1,
+              promptInputSha256: promptSha256,
+            },
+          });
+          if (!admitted.ok) {
+            session.reportAttemptOutcome(attemptId, "providerUnavailablePreInvocation");
+            return admitted.code === "workflowStorageUnavailable"
+              ? unavailableV1("workflowStorageUnavailable")
+              : {
+                  kind: "failed",
+                  correlation,
+                  code: `chatTransaction.${admitted.code}`,
+                  retryable: true,
+                };
+          }
+        }
+      }
       const correlation = reserved.handle.correlation;
       const claimed = session.claim(reserved.handle.reservationId);
 
@@ -664,37 +730,7 @@ export function createTaskActionCoordinatorV1(
           completedContentType: row.completedContentType,
           maxResponseBytes: row.maxResponseBytes,
         });
-      // Recorded in the durable Chat transaction when questions come back
-      // (plan §5.5's prompt-input digest — a §2.2-permitted digest, never the
-      // prompt text itself).
       const promptSha256 = createHash("sha256").update(prompt, "utf8").digest("hex");
-
-      if (questionCapableInvocation) {
-        await deps.orchestrator.discardInvocation(correlation.operationId);
-        const admitted = await deps.orchestrator.admitInvocation({
-          correlation,
-          stage,
-          resumeSemantics: row.resumeSemantics,
-          validatedInput,
-          promptContract: {
-            contractId: AI_RESULT_CONTRACT_ID_V1,
-            contractVersion: AI_RESULT_CONTRACT_VERSION_V1,
-            promptInputSha256: promptSha256,
-          },
-        });
-        if (!admitted.ok) {
-          session.reportAttemptOutcome(attemptId, "providerUnavailablePreInvocation");
-          return admitted.code === "workflowStorageUnavailable"
-            ? unavailableV1("workflowStorageUnavailable")
-            : {
-                kind: "failed",
-                correlation,
-                code: `chatTransaction.${admitted.code}`,
-                retryable: true,
-              };
-        }
-      }
-
       if (preInvocationHook) {
         await preInvocationHook();
       }
@@ -1076,7 +1112,8 @@ export function createTaskActionCoordinatorV1(
       start.release();
     }
 
-    if (row.permittedResultKinds.includes("questions")) {
+    let initialCandidate: AdmittedProviderActionTicketV1["initialCandidate"] | undefined;
+    for (;;) {
       const attemptId = session.allocateAttempt();
       const next = selection.reserveNext(attemptId);
       if (next.kind === "noneRemaining") {
@@ -1084,58 +1121,64 @@ export function createTaskActionCoordinatorV1(
         progress.end();
         return { kind: "settled", outcome: finalizeOutcome(row, request, operationId, unavailableV1("providerModeUnavailable"), metrics) };
       }
-      if (next.kind !== "candidateUnavailable") {
-        const correlation = next.reserved.handle.correlation;
-        const context: TaskActionExecutionContextV1 = {
-          correlation,
-          stage,
-          validatedInput: validation.input,
-        };
-        const prompt =
-          row.buildPrompt(context) +
-          "\n\n" +
-          buildAiResultContractPromptV1({
-            correlation,
-            permittedResultKinds: row.permittedResultKinds,
-            completedContentType: row.completedContentType,
-            maxResponseBytes: row.maxResponseBytes,
-          });
-        const promptSha256 = createHash("sha256").update(prompt, "utf8").digest("hex");
+      if (next.kind === "candidateUnavailable") {
+        continue;
+      }
+      initialCandidate = { attemptId, reserved: next.reserved };
+      break;
+    }
 
-        await deps.orchestrator.discardInvocation(operationId);
-        const admitted = await deps.orchestrator.admitInvocation({
+    if (row.permittedResultKinds.includes("questions")) {
+      const correlation = initialCandidate.reserved.handle.correlation;
+      const context: TaskActionExecutionContextV1 = {
+        correlation,
+        stage,
+        validatedInput: validation.input,
+      };
+      const prompt =
+        row.buildPrompt(context) +
+        "\n\n" +
+        buildAiResultContractPromptV1({
           correlation,
-          stage,
-          resumeSemantics: row.resumeSemantics,
-          validatedInput: validation.input,
-          promptContract: {
-            contractId: AI_RESULT_CONTRACT_ID_V1,
-            contractVersion: AI_RESULT_CONTRACT_VERSION_V1,
-            promptInputSha256: promptSha256,
-          },
+          permittedResultKinds: row.permittedResultKinds,
+          completedContentType: row.completedContentType,
+          maxResponseBytes: row.maxResponseBytes,
         });
+      const promptSha256 = createHash("sha256").update(prompt, "utf8").digest("hex");
 
-        if (!admitted.ok) {
-          session.reportAttemptOutcome(attemptId, "providerUnavailablePreInvocation");
-          progress.end();
-          return {
-            kind: "settled",
-            outcome: finalizeOutcome(
-              row,
-              request,
-              operationId,
-              admitted.code === "workflowStorageUnavailable"
-                ? unavailableV1("workflowStorageUnavailable")
-                : {
-                    kind: "failed",
-                    correlation,
-                    code: `chatTransaction.${admitted.code}`,
-                    retryable: true,
-                  },
-              metrics
-            ),
-          };
-        }
+      await deps.orchestrator.discardInvocation(operationId);
+      const admitted = await deps.orchestrator.admitInvocation({
+        correlation,
+        stage,
+        resumeSemantics: row.resumeSemantics,
+        validatedInput: validation.input,
+        promptContract: {
+          contractId: AI_RESULT_CONTRACT_ID_V1,
+          contractVersion: AI_RESULT_CONTRACT_VERSION_V1,
+          promptInputSha256: promptSha256,
+        },
+      });
+
+      if (!admitted.ok) {
+        session.reportAttemptOutcome(initialCandidate.attemptId, "providerUnavailablePreInvocation");
+        progress.end();
+        return {
+          kind: "settled",
+          outcome: finalizeOutcome(
+            row,
+            request,
+            operationId,
+            admitted.code === "workflowStorageUnavailable"
+              ? unavailableV1("workflowStorageUnavailable")
+              : {
+                  kind: "failed",
+                  correlation,
+                  code: `chatTransaction.${admitted.code}`,
+                  retryable: true,
+                },
+            metrics
+          ),
+        };
       }
     }
 
@@ -1149,6 +1192,7 @@ export function createTaskActionCoordinatorV1(
         validatedInput: validation.input,
         session,
         selection,
+        initialCandidate,
         acquireLeasePhase,
         progress,
         metrics,
@@ -1176,9 +1220,11 @@ export function createTaskActionCoordinatorV1(
           ticket.metrics,
           undefined,
           undefined,
-          ticket.preInvocationHook
+          ticket.preInvocationHook,
+          ticket.initialCandidate
         );
-      } catch {
+      } catch (err) {
+        console.error("continueAdmittedAction error:", err);
         outcome = {
           kind: "failed",
           correlation: {
@@ -1188,7 +1234,7 @@ export function createTaskActionCoordinatorV1(
             taskBindingId: ticket.request.taskBinding.taskBindingId,
             chatDocumentId: ticket.request.taskBinding.chatDocumentId,
           },
-          code: "preInvocationHookFailed",
+          code: `preInvocationHookFailed.${err instanceof Error ? err.message : String(err)}`,
           retryable: true,
         };
       }

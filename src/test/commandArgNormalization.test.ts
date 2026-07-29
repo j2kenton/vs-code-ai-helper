@@ -105,6 +105,7 @@ import {
 } from "../utils/automationChain";
 import {
   GENERATE_IMPL_ELIGIBLE_STAGES,
+  applyReviewWithAI,
   normalizeReviewArg,
   runReviewForFolder,
   runReviewWithAI,
@@ -3319,6 +3320,57 @@ void describe("applyHighLevelReviewChanges / applyLowLevelReviewChanges delegati
         memFs.restore();
         wsFolders.restore();
         execCmd.restore();
+      }
+    }
+  );
+
+  void it(
+    "applyReviewWithAI with { taskFolderPath } targeting an impl-review stage asserts applyReviewEdit.v1 gate and rejects",
+    async () => {
+      const folderUri = makeTaskFolderUri("task-folder-impl-review-gate");
+      const FOLDER_PATH = folderUri.fsPath;
+      const store = new Map<string, string>();
+      const memFs = installMemStore(store);
+      const msgs = installMessageCapture();
+      const wsFolders = installWorkspaceFoldersStub();
+
+      const mutableDisabled = LEGACY_AI_ROUTE_DISABLED_V0 as unknown as Set<string>;
+      assert.equal(mutableDisabled.has("applyReviewEdit.v1"), false);
+      mutableDisabled.add("applyReviewEdit.v1");
+
+      try {
+        const progress: TaskProgress = {
+          taskFolder: "task-folder-impl-review-gate",
+          currentStage: "impl-high-review",
+          status: "active",
+          createdAt: "2026-07-08T00:00:00.000Z",
+          updatedAt: "2026-07-08T00:00:00.000Z",
+        };
+        await seedProgress(store, folderUri, progress);
+
+        let gateThrown = false;
+        try {
+          await applyReviewWithAI(
+            vscode.Uri.file("c:/test-ext"),
+            {} as vscode.ExtensionContext,
+            { taskFolderPath: FOLDER_PATH }
+          );
+        } catch (err: unknown) {
+          if (err instanceof Error && err.message.includes("applyReviewEdit.v1")) {
+            gateThrown = true;
+          } else {
+            throw err;
+          }
+        }
+        assert.ok(
+          gateThrown,
+          "applyReviewWithAI with { taskFolderPath } pointing to an impl-review task must assert applyReviewEdit.v1 gate"
+        );
+      } finally {
+        mutableDisabled.delete("applyReviewEdit.v1");
+        msgs.restore();
+        memFs.restore();
+        wsFolders.restore();
       }
     }
   );

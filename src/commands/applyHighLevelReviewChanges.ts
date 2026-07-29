@@ -20,7 +20,6 @@ export async function applyHighLevelReviewChanges(
   // Static edit and text safety gates MUST be asserted BEFORE any task, stage,
   // workspace, artifact, or task-progress reads occur (plan §1.3 / AC-ROUTE-01).
   assertLegacyAiRouteAllowedV0("applyReview.v1");
-  assertLegacyAiRouteAllowedV0("applyReviewEdit.v1");
 
   const explicitStage = explicitArg?.task?.progress?.currentStage;
 

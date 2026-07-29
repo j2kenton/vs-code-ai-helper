@@ -558,13 +558,6 @@ export async function chatWithStage(
     if (admission.kind === "settled") {
       outcome = admission.outcome;
     } else {
-      if (!userMessagePersisted) {
-        await chatViewProvider.append("user", message, targetStage, {
-          canonicalId: task.canonicalId,
-          taskFolderPath: task.taskFolderPath,
-        });
-        userMessagePersisted = true;
-      }
       outcome = await coordinator.continueAdmittedAction(admission.ticket);
     }
 

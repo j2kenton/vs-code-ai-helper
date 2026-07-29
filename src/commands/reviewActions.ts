@@ -2792,9 +2792,10 @@ export async function applyReviewWithAI(
 
   const node = normalizeReviewArg(arg);
 
-  if (node.taskFolderPath) {
-    const strictCheck = await readTaskProgressStrictV1(vscode.Uri.file(node.taskFolderPath), {
-      expectedTaskFolder: path.basename(node.taskFolderPath),
+  const taskFolderUri = node.task?.folderUri;
+  if (taskFolderUri) {
+    const strictCheck = await readTaskProgressStrictV1(taskFolderUri, {
+      expectedTaskFolder: path.basename(taskFolderUri.fsPath),
     });
     if (strictCheck.ok && IMPL_REVIEW_STAGES.includes(strictCheck.decoded.progress.currentStage)) {
       assertLegacyAiRouteAllowedV0("applyReviewEdit.v1");
