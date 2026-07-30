@@ -48,7 +48,7 @@ import { REVIEW_STAGES, TaskProgress, TaskStage } from "../types/taskProgress";
 import type { AgentTransportV1 } from "../types/agentExecutionV1";
 import { DISCLAIMER_VERSION } from "../legal/disclaimerVersion";
 import { scheduleAutomationChain, resetAutomationChainGuards, type AutomationDispatch } from "../utils/automationChain";
-import { runTrackedOperation } from "../utils/taskOperations";
+import { runTrackedOperation, taskOperations } from "../utils/taskOperations";
 import { createChatInteractionTransactionStoreV1 } from "../services/chatInteractionTransactionStoreV1";
 import {
   configureWorkflowPrivateStorageRootV1,
@@ -177,6 +177,27 @@ function patch(module: Record<string, unknown>, name: string, replacement: unkno
   const orig = module[name];
   module[name] = replacement;
   return { restore: (): void => { module[name] = orig; } };
+}
+
+/**
+ * `scheduleAutomationChain`'s deferred branch is intentionally
+ * fire-and-forget once a root operation ends (see its own doc comment):
+ * nothing awaits the follow-up command it dispatches. A test that exercises
+ * that real, un-mocked path (rather than a mock that captures dispatches
+ * synchronously) can therefore return while that follow-up is still running
+ * as a detached operation. Left undrained, the detached chain resolves its
+ * production imports (settings, scheduleAutomationChain itself) dynamically
+ * at whatever moment it happens to finish — which can be after a *later*
+ * test has installed its own patches, silently leaking a call into that
+ * test's assertions. Wait for the task's operation registry to go quiet
+ * before restoring mocks so nothing from this test's chain can bleed
+ * forward.
+ */
+async function waitForTaskOperationsIdle(taskFolderPath: string, timeoutMs = 5000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (taskOperations.rootOperationIdFor(taskFolderPath) !== undefined && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
 }
 
 /**
@@ -740,6 +761,11 @@ void describe("nextStage command → auto-review chain (command-layer end-to-end
         dispatchedCommands.filter((c) => c === "vs-code-ai-helper.runReviewWithAI").length >= 1,
         "the follow-up review for plan-low-review must actually be dispatched, not silently dropped by its own predecessor's still-active guard slot"
       );
+      // The plan-low-review follow-up above may itself pass and auto-advance
+      // into "impl" through the same deferred, fire-and-forget dispatch path
+      // — drain it (still under this test's own mocks/intercepts) before
+      // tearing down, so a later test never observes its trailing effects.
+      await waitForTaskOperationsIdle(folderPath);
     } finally {
       commandsApi.executeCommand = originalExecuteCommand;
       for (const p of patches.reverse()) { p.restore(); }
@@ -752,6 +778,7 @@ void describe("nextStage command → auto-review chain (command-layer end-to-end
   });
 
   void it("a passing plan review advances to Implementation and dispatches only when auto-implement is armed", async () => {
+    resetAutomationChainGuards();
     const provider = new StatusTreeProvider();
     initNotificationRouter(provider);
     const fsBridge = installFsBridge();

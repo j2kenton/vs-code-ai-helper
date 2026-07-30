@@ -329,217 +329,328 @@
   "permissiveReaderConsumers": [
     {
       "path": "src/commands/archiveTask.ts",
-      "imports": ["IncompleteTask", "patchTaskProgress"],
+      "imports": [
+        "IncompleteTask",
+        "patchTaskProgress"
+      ],
       "purpose": "Patches status/archivedFrom when archiving and resuming archived tasks.",
       "migrationCohort": "lifecycle"
     },
     {
       "path": "src/commands/chatWithStage.ts",
-      "imports": ["IncompleteTask"],
+      "imports": [
+        "IncompleteTask"
+      ],
       "purpose": "Type-only use of the permissive task shape for chat-target resolution.",
       "migrationCohort": "chat"
     },
     {
       "path": "src/commands/choosePublishScope.ts",
-      "imports": ["IncompleteTask", "patchTaskProgress", "readTaskProgress"],
+      "imports": [
+        "IncompleteTask",
+        "patchTaskProgress",
+        "readTaskProgress"
+      ],
       "purpose": "Reads and patches publishScopePath for the Publish stage.",
       "migrationCohort": "git"
     },
     {
       "path": "src/commands/commitAndPushTask.ts",
-      "imports": ["IncompleteTask", "patchTaskProgress"],
+      "imports": [
+        "IncompleteTask",
+        "patchTaskProgress"
+      ],
       "purpose": "Patches lint/publish progress state during the commit-and-push flow.",
       "migrationCohort": "git"
     },
     {
       "path": "src/commands/configureStepModels.ts",
-      "imports": ["IncompleteTask"],
+      "imports": [
+        "IncompleteTask"
+      ],
       "purpose": "Type-only use of the permissive task shape for per-stage model configuration.",
       "migrationCohort": "runnerV1"
     },
     {
       "path": "src/commands/draftTaskWithAI.ts",
-      "imports": ["IncompleteTask", "patchTaskProgress"],
+      "imports": [
+        "IncompleteTask",
+        "patchTaskProgress"
+      ],
       "purpose": "Patches preImageDescription/displayName after an AI draft is applied.",
       "migrationCohort": "text2"
     },
     {
       "path": "src/commands/generatePlanWithAI.ts",
-      "imports": ["IncompleteTask", "patchTaskProgress", "updateTaskProgressStage"],
+      "imports": [
+        "IncompleteTask",
+        "patchTaskProgress",
+        "updateTaskProgressStage"
+      ],
       "purpose": "Advances stage and patches progress after plan generation.",
       "migrationCohort": "text1"
     },
     {
       "path": "src/commands/markTaskDone.ts",
-      "imports": ["IncompleteTask", "patchTaskProgress"],
+      "imports": [
+        "IncompleteTask"
+      ],
       "purpose": "Sets completed status/completedAt/completedStages on terminal completion.",
       "migrationCohort": "lifecycle"
     },
     {
       "path": "src/commands/pauseTask.ts",
-      "imports": ["IncompleteTask", "patchTaskProgress", "updateTaskStatus"],
+      "imports": [
+        "IncompleteTask",
+        "patchTaskProgress",
+        "updateTaskStatus"
+      ],
       "purpose": "Sets paused status on the pause lifecycle action.",
       "migrationCohort": "lifecycle"
     },
     {
       "path": "src/commands/pinTask.ts",
-      "imports": ["IncompleteTask", "patchTaskProgress"],
+      "imports": [
+        "IncompleteTask",
+        "patchTaskProgress"
+      ],
       "purpose": "Patches pinnedAt for the pin/unpin surface.",
       "migrationCohort": "lifecycle"
     },
     {
       "path": "src/commands/renameTask.ts",
-      "imports": ["patchTaskProgress"],
+      "imports": [
+        "patchTaskProgress"
+      ],
       "purpose": "Patches displayName/nameIsDefault on rename.",
       "migrationCohort": "lifecycle"
     },
     {
       "path": "src/commands/resumeTask.ts",
-      "imports": ["clearEscalation", "IncompleteTask", "patchTaskProgress"],
+      "imports": [
+        "clearEscalation",
+        "IncompleteTask",
+        "patchTaskProgress"
+      ],
       "purpose": "Reactivates paused/completed tasks (status, stage, completion ticks, escalation).",
       "migrationCohort": "resume"
     },
     {
       "path": "src/commands/reviewActions.ts",
-      "imports": ["appendReviewScoreHistory", "IncompleteTask"],
+      "imports": [
+        "appendReviewScoreHistory",
+        "IncompleteTask"
+      ],
       "purpose": "Reads and patches review/implementation progress (score history, review files, stage advancement) across the review action family. Fully migrated off both permissive reader and writer: every read uses strict decoding via readTaskProgressStrictV1 (or readTaskProgressAdvisoryV1), and every patch uses patchTaskProgressStrictV1.",
       "migrationCohort": "text3"
     },
     {
       "path": "src/commands/runLintingFixes.ts",
-      "imports": ["IncompleteTask", "patchTaskProgress", "updateLintPayload"],
+      "imports": [
+        "IncompleteTask",
+        "patchTaskProgress",
+        "updateLintPayload"
+      ],
       "purpose": "Patches lintPayload after lint runs.",
       "migrationCohort": "edit"
     },
     {
       "path": "src/commands/runPublishChecks.ts",
-      "imports": ["IncompleteTask"],
+      "imports": [
+        "IncompleteTask"
+      ],
       "purpose": "Type-only use of the permissive task shape for publish-check resolution.",
       "migrationCohort": "git"
     },
     {
       "path": "src/commands/scheduleTaskResume.ts",
-      "imports": ["patchTaskProgress"],
+      "imports": [
+        "patchTaskProgress"
+      ],
       "purpose": "Patches scheduledRun for one-shot scheduled stage actions.",
       "migrationCohort": "lifecycle"
     },
     {
       "path": "src/commands/setTaskStage.ts",
-      "imports": ["IncompleteTask"],
+      "imports": [
+        "IncompleteTask"
+      ],
       "purpose": "Type-only use of the permissive task shape for manual stage moves.",
       "migrationCohort": "lifecycle"
     },
     {
       "path": "src/commands/startNewTask.ts",
-      "imports": ["createTaskProgress", "readTaskProgress", "writeTaskProgress"],
+      "imports": [
+        "createTaskProgress",
+        "readTaskProgress",
+        "writeTaskProgress"
+      ],
       "purpose": "Creates initial creating-state progress and reads it back during task creation.",
       "migrationCohort": "creation"
     },
     {
       "path": "src/commands/viewArtifacts.ts",
-      "imports": ["findAllTasks", "IncompleteTask"],
+      "imports": [
+        "findAllTasks",
+        "IncompleteTask"
+      ],
       "purpose": "Enumerates tasks to open their artifacts read-only.",
       "migrationCohort": "resume"
     },
     {
       "path": "src/extension.ts",
-      "imports": ["IncompleteTask", "readTaskProgress"],
+      "imports": [
+        "IncompleteTask",
+        "readTaskProgress"
+      ],
       "purpose": "Activation wiring: startup reads for inventory/checkpoint/status-bar publication.",
       "migrationCohort": "creation"
     },
     {
       "path": "src/runners/runnerRegistry.ts",
-      "imports": ["clearStageFallbackReservation", "patchTaskProgress"],
+      "imports": [
+        "clearStageFallbackReservation",
+        "patchTaskProgress"
+      ],
       "purpose": "Patches fallbackActive/fallbackModelId reservations at the provider boundary.",
       "migrationCohort": "runnerV1"
     },
     {
       "path": "src/state/legacyCreatingStartupGateV0.ts",
-      "imports": ["readTaskProgress"],
+      "imports": [
+        "readTaskProgress"
+      ],
       "purpose": "Read-only classification of legacy creating folders (startup gate; superseded by the §4.1 reconciler).",
       "migrationCohort": "creation"
     },
     {
       "path": "src/state/taskActivationCoordinator.ts",
-      "imports": ["patchTaskProgress", "readTaskProgress", "updateTaskStatus"],
+      "imports": [
+        "patchTaskProgress",
+        "readTaskProgress",
+        "updateTaskStatus"
+      ],
       "purpose": "Coordinates sole-active-task transitions (pausing others, activating one).",
       "migrationCohort": "lifecycle"
     },
     {
       "path": "src/state/taskInventory.ts",
-      "imports": ["readTaskProgress"],
+      "imports": [
+        "readTaskProgress"
+      ],
       "purpose": "Directory-scan classification of task folders into the derived inventory.",
       "migrationCohort": "creation"
     },
     {
       "path": "src/utils/completionLint.ts",
-      "imports": ["patchTaskProgress", "readTaskProgress", "updateLintPayload"],
+      "imports": [
+        "patchTaskProgress",
+        "readTaskProgress",
+        "updateLintPayload"
+      ],
       "purpose": "Reads/patches lintPayload for completion lint gating.",
       "migrationCohort": "git"
     },
     {
       "path": "src/utils/globalAssistantActions.ts",
-      "imports": ["patchTaskProgress"],
+      "imports": [
+        "patchTaskProgress"
+      ],
       "purpose": "Global-assistant bulk operations patch task progress on behalf of lifecycle routes.",
       "migrationCohort": "chat"
     },
     {
       "path": "src/utils/legacyTaskProgressV0.ts",
-      "imports": ["createTaskProgress", "findAllTasks", "findIncompleteTasks", "patchTaskProgress", "readTaskProgress", "writeTaskProgress"],
+      "imports": [
+        "createTaskProgress",
+        "findAllTasks",
+        "findIncompleteTasks",
+        "patchTaskProgress",
+        "readTaskProgress",
+        "writeTaskProgress"
+      ],
       "purpose": "Plan §3.12 step 1's named V0 boundary: wraps the permissive reader/writer as LegacyTaskProgressReaderV0/LegacyTaskProgressWriterV0 by reference (no behavior change); fenced V1 modules are barred from it by verify:progress-reader-fence.",
       "migrationCohort": "cleanup"
     },
     {
       "path": "src/utils/metaResourcesMigration.ts",
-      "imports": ["readTaskProgress", "writeTaskProgress"],
+      "imports": [
+        "readTaskProgress",
+        "writeTaskProgress"
+      ],
       "purpose": "Reads and rewrites ownership bindings during meta-root migration/repair.",
       "migrationCohort": "creation"
     },
     {
       "path": "src/utils/modelSelection.ts",
-      "imports": ["clearStageFallbackReservation", "findAllTasks", "patchTaskProgress", "readTaskProgress"],
+      "imports": [
+        "clearStageFallbackReservation",
+        "findAllTasks",
+        "patchTaskProgress",
+        "readTaskProgress"
+      ],
       "purpose": "Reads/patches per-stage fallback reservations during model selection.",
       "migrationCohort": "runnerV1"
     },
     {
       "path": "src/utils/pickTaskFolder.ts",
-      "imports": ["findIncompleteTasks"],
+      "imports": [
+        "findIncompleteTasks"
+      ],
       "purpose": "Task-folder picker enumerating incomplete tasks.",
       "migrationCohort": "lifecycle"
     },
     {
       "path": "src/utils/reopenTask.ts",
-      "imports": ["clearEscalation", "clearImplReviewFiles", "clearLintPayload", "clearStageFallbackReservation"],
+      "imports": [
+        "clearEscalation",
+        "clearImplReviewFiles",
+        "clearLintPayload",
+        "clearStageFallbackReservation"
+      ],
       "purpose": "Clears later-stage state when reopening a completed task at an earlier stage.",
       "migrationCohort": "resume"
     },
     {
       "path": "src/utils/resolveTaskContext.ts",
-      "imports": ["patchTaskProgress"],
+      "imports": [
+        "patchTaskProgress"
+      ],
       "purpose": "Shared task-context resolver used by command handlers; patches on demand.",
       "migrationCohort": "lifecycle"
     },
     {
       "path": "src/utils/reviewEscalation.ts",
-      "imports": ["patchTaskProgress", "recordEscalation", "updateTaskStatus"],
+      "imports": [
+        "patchTaskProgress",
+        "recordEscalation",
+        "updateTaskStatus"
+      ],
       "purpose": "Records/clears review escalation state and pauses stuck tasks.",
       "migrationCohort": "text3"
     },
     {
       "path": "src/utils/stageTransition.ts",
-      "imports": ["patchTaskProgress", "updateTaskProgressStage"],
+      "imports": [
+        "patchTaskProgress",
+        "updateTaskProgressStage"
+      ],
       "purpose": "Shared stage-advancement helper (completedStages, currentStage, updatedAt).",
       "migrationCohort": "lifecycle"
     },
     {
       "path": "src/views/taskStatusBar.ts",
-      "imports": ["IncompleteTask"],
+      "imports": [
+        "IncompleteTask"
+      ],
       "purpose": "Type-only use of the permissive task shape for status-bar rendering.",
       "migrationCohort": "resume"
     },
     {
       "path": "src/views/taskTreeProvider.ts",
-      "imports": ["IncompleteTask"],
+      "imports": [
+        "IncompleteTask"
+      ],
       "purpose": "Type-only use of the permissive task shape for task-tree rendering and menus.",
       "migrationCohort": "resume"
     }

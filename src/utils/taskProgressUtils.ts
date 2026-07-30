@@ -315,16 +315,24 @@ export function clearStageFallbackReservation(
  * diff would silently discard the earlier runs' files from the review scope.
  * Use `clearImplReviewFiles` for the one case where discarding the set is
  * actually intended: an explicit "start over" action, not a routine re-run.
+ *
+ * The union is ordered most-recently-changed first: the latest run's files
+ * move to the front (re-touched files included), ahead of files only earlier
+ * runs touched. The implementation-review context pack applies its total
+ * size budget in this order (see applyContentCaps), so on long tasks whose
+ * accumulated set exceeds the budget the omissions fall on the oldest —
+ * already reviewed in earlier rounds — files, never on the current round's
+ * work the reviewer has not seen yet.
  */
 export function updateImplReviewFiles(
   progress: TaskProgress,
   files: string[]
 ): TaskProgress {
   const existing = progress.implReviewFiles ?? [];
-  const union = new Set([...existing, ...files]);
+  const union = new Set([...files, ...existing]);
   return {
     ...progress,
-    implReviewFiles: [...union].sort(),
+    implReviewFiles: [...union],
     updatedAt: new Date().toISOString(),
   };
 }

@@ -3,7 +3,7 @@
   "generatedBy": "scripts/generateWorkflowPathConsumers.mjs",
   "description": "Mechanically derived production path-consumer surface of the current working tree (plan §2.3): every module of the §1.1 production source universe importing node fs/child_process or touching the vscode workspace.fs API, with every concrete call site (compiler span + enclosing symbol). Scanned over the exact source-universe file list — never a filesystem walk. Regenerated every run; classification lives in workflow-path-consumer-baseline-v1.json; the immutable pre-gate reference is workflow-path-consumer-pregate-v1.json. Known mechanical bound: modules that only pass path STRINGS to another module (no fs/process API of their own) are covered transitively by the consumer module they call — the classifier enforcement point (plan §2.2) sits at the API-touching module. sourceUniverseSha256 is the CANONICAL (line-ending-independent) digest of the source-universe JSON, so provenance is identical across LF and CRLF checkouts.",
   "sourceUniverse": "workflow-inventories/workflow-production-source-baseline-v1.json",
-  "sourceUniverseSha256": "b1c27d526c986afe6d2992620804b4e92483fe1737f3cfff76bd530e68818d32",
+  "sourceUniverseSha256": "e2f80df32b608e763332f22a62f9050d1eb05fe6cb98465eb27c708eea27fedc",
   "consumerCount": 46,
   "consumers": [
     {
@@ -172,72 +172,72 @@
       "callSites": [
         {
           "signal": "import:child_process",
-          "span": "L75-L75",
+          "span": "L77-L77",
           "enclosingSymbol": "(module)"
         },
         {
           "signal": "import:fs",
-          "span": "L76-L76",
+          "span": "L78-L78",
           "enclosingSymbol": "(module)"
         },
         {
           "signal": "workspace.fs",
-          "span": "L668-L668",
+          "span": "L672-L672",
           "enclosingSymbol": "entries"
         },
         {
           "signal": "workspace.fs",
-          "span": "L681-L681",
+          "span": "L685-L685",
           "enclosingSymbol": "legacyEntries"
         },
         {
           "signal": "workspace.fs",
-          "span": "L1141-L1141",
+          "span": "L1148-L1148",
           "enclosingSymbol": "newContent"
         },
         {
           "signal": "workspace.fs",
-          "span": "L1350-L1350",
+          "span": "L1357-L1357",
           "enclosingSymbol": "runAiToFile"
         },
         {
           "signal": "workspace.fs",
-          "span": "L1433-L1433",
+          "span": "L1440-L1440",
           "enclosingSymbol": "runAiToFile"
         },
         {
           "signal": "workspace.fs",
-          "span": "L1682-L1682",
+          "span": "L1689-L1689",
           "enclosingSymbol": "runSecondOpinionReview"
         },
         {
           "signal": "workspace.fs",
-          "span": "L1709-L1709",
+          "span": "L1716-L1716",
           "enclosingSymbol": "runSecondOpinionReview"
         },
         {
           "signal": "workspace.fs",
-          "span": "L2022-L2022",
+          "span": "L2029-L2029",
           "enclosingSymbol": "contentBytes"
         },
         {
           "signal": "workspace.fs",
-          "span": "L2476-L2476",
+          "span": "L2483-L2483",
           "enclosingSymbol": "runReviewForFolder"
         },
         {
           "signal": "workspace.fs",
-          "span": "L2493-L2493",
+          "span": "L2500-L2500",
           "enclosingSymbol": "runReviewForFolder"
         },
         {
           "signal": "workspace.fs",
-          "span": "L2866-L2866",
+          "span": "L2888-L2888",
           "enclosingSymbol": "runApply"
         },
         {
           "signal": "workspace.fs",
-          "span": "L5342-L5342",
+          "span": "L5416-L5416",
           "enclosingSymbol": "buildReviewResumeVariablesV1"
         }
       ]
@@ -868,7 +868,7 @@
         },
         {
           "signal": "workspace.fs",
-          "span": "L451-L451",
+          "span": "L459-L459",
           "enclosingSymbol": "entries"
         }
       ]

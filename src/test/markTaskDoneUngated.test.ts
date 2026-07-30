@@ -43,9 +43,9 @@ function writeProgress(folderPath: string, progress: TaskProgress): void {
   fs.writeFileSync(path.join(folderPath, "task-progress.json"), JSON.stringify(progress, null, 2), "utf8");
 }
 
-function fixtureProgress(): TaskProgress {
+function fixtureProgress(taskFolderPath: string): TaskProgress {
   return {
-    taskFolder: path.basename(REAL_ROOT),
+    taskFolder: path.basename(taskFolderPath),
     currentStage: "publish",
     status: "active",
     createdAt: "2026-01-01T00:00:00.000Z",
@@ -77,7 +77,7 @@ function makeInventory(taskFolderPath: string): TaskInventory {
     canonicalId: taskFolderPath,
     sourceScopeKey: "test",
     workspaceFolder: undefined,
-    progress: fixtureProgress(),
+    progress: fixtureProgress(taskFolderPath),
   };
   return {
     getTaskById: (id: string) => (id === taskFolderPath ? item : undefined),
@@ -108,7 +108,7 @@ class RecordingSurface {
 void describe("markTaskDone is ungated (C3: Complete Task never runs or blocks on checks)", () => {
   void it("completes the task without running completion checks, prompting, or invoking fixes", async () => {
     const taskFolderPath = makeTaskFolder("ungated-complete");
-    writeProgress(taskFolderPath, fixtureProgress());
+    writeProgress(taskFolderPath, fixtureProgress(taskFolderPath));
 
     const surface = new RecordingSurface();
     initNotificationRouter(surface);
@@ -173,7 +173,7 @@ void describe("markTaskDone is ungated (C3: Complete Task never runs or blocks o
 
   void it("clears the current task when no other active task remains", async () => {
     const taskFolderPath = makeTaskFolder("ungated-next-selection");
-    writeProgress(taskFolderPath, fixtureProgress());
+    writeProgress(taskFolderPath, fixtureProgress(taskFolderPath));
 
     const surface = new RecordingSurface();
     initNotificationRouter(surface);

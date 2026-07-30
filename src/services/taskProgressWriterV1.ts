@@ -15,6 +15,7 @@ import * as vscode from "vscode";
 import * as path from "path";
 import { TASK_PROGRESS_FILENAME, TaskProgress } from "../types/taskProgress";
 import { writeAtomic } from "../state/writeAtomic";
+import { withTaskLock } from "../state/taskStateStore";
 import { readTaskProgressStrictV1 } from "./taskProgressReaderV1";
 import {
   DecodeTaskProgressOptionsV1,
@@ -131,21 +132,31 @@ export async function writeTaskProgressV1(
 
 /**
   * Read-modify-write progress mutation using strict decoding and encoding (plan §3.10 / §3.12).
+  *
+  * Runs under the same per-task-folder lock (`withTaskLock`) the legacy
+  * `patchTaskProgress` (`src/utils/taskProgressUtils.ts`) acquires, keyed
+  * identically by `taskFolderUri.fsPath`. Without this, a V1 read-modify-write
+  * here and a legacy transition running concurrently (e.g. a manual "Complete
+  * Stage & Move On" racing an auto-advance) could interleave and silently
+  * clobber or double-apply a transition — the lock makes the two paths
+  * mutually exclusive on one task, exactly like two legacy callers today.
   */
 export async function patchTaskProgressStrictV1(
   taskFolderUri: vscode.Uri,
-  update: (current: TaskProgress) => TaskProgress | undefined
+  update: (current: PersistedTaskProgressV1) => TaskProgress | undefined
 ): Promise<TaskProgress | undefined> {
-  const folderName = path.basename(taskFolderUri.fsPath);
-  const strict = await readTaskProgressStrictV1(taskFolderUri, { expectedTaskFolder: folderName });
-  if (!strict.ok) {
-    return undefined;
-  }
-  const current = strict.decoded.progress;
-  const patched = update(current);
-  if (!patched) {
-    return current;
-  }
-  await writeTaskProgressV1(taskFolderUri, { ...patched, ensembleProgressVersion: 1 }, strict.decoded.entries);
-  return patched;
+  return withTaskLock(taskFolderUri.fsPath, async () => {
+    const folderName = path.basename(taskFolderUri.fsPath);
+    const strict = await readTaskProgressStrictV1(taskFolderUri, { expectedTaskFolder: folderName });
+    if (!strict.ok) {
+      return undefined;
+    }
+    const current = strict.decoded.progress;
+    const patched = update(current);
+    if (!patched) {
+      return current;
+    }
+    await writeTaskProgressV1(taskFolderUri, { ...patched, ensembleProgressVersion: 1 }, strict.decoded.entries);
+    return patched;
+  });
 }

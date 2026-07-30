@@ -35,7 +35,9 @@ import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import {
   advanceStage,
+  AUTO_REVIEW_TRANSITIONS,
   computeNextStage,
+  StageTransitionResult,
 } from "../utils/stageTransition";
 import { assertLegacyAiRouteAllowedV0 } from "../services/legacyAiActionSafetyGateV0";
 import {
@@ -89,11 +91,13 @@ import { allocateHex128IdV1 } from "../types/actionCorrelationV1";
 import {
   createProductionTaskActionCoordinatorV1,
   getProductionActionConversationOrchestratorV1,
+  invokeLifecycleRowV1,
 } from "../actions/productionTaskActionRuntimeV1";
 import { ActionConversationOrchestratorV1, InteractionRefV1 } from "../actions/actionConversationOrchestratorV1";
 import { GENERATE_IMPLEMENTATION_ACTION_KEY_V1 } from "../actions/rows/generateImplementationRowV1";
 import { REVIEW_ACTION_KEY_V1, ReviewActionInputV1 } from "../actions/rows/reviewRowV1";
 import { APPLY_REVIEW_ACTION_KEY_V1, ApplyReviewActionInputV1 } from "../actions/rows/applyReviewRowV1";
+import { NEXT_STAGE_ACTION_KEY_V1 } from "../actions/rows/nextStageRowV1";
 import { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
 import { ChatInteractionRefV1, ChatInteractionResumeResultV1, ChatViewProvider } from "../views/chatView";
 import { TaskInventory } from "../state/taskInventory";
@@ -3569,6 +3573,43 @@ async function currentStageArtifactExists(
  *   4. (future: persist lint payload)
  *   5. show final info
  */
+/**
+ * Persist "Complete Stage & Move On" through the `nextStage.v1` registry
+ * row (plan §6.6) — typed coordinator delegation for the literal
+ * `STAGE_ORDER` successor. Throws (mirroring `advanceStage`'s CAS-mismatch
+ * throw) on any non-`completed` outcome, so callers can share one catch
+ * block with the legacy path.
+ */
+async function advanceStageViaNextStageRowV1(
+  folderUri: vscode.Uri,
+  progress: TaskProgress,
+  next: TaskStage,
+  isPaused: boolean,
+  optIn: boolean
+): Promise<StageTransitionResult> {
+  // Exactly like the tree/inventory's own canonicalId (a normalized
+  // absolute task-folder path) — see invokeLifecycleRowV1's own header for
+  // why a lifecycle row needs neither a workflow file-store root nor a real
+  // Chat document identity.
+  const taskBindingId = normalizePath(folderUri.fsPath);
+  const outcome: TaskActionOutcomeV1 = await invokeLifecycleRowV1({
+    actionKey: NEXT_STAGE_ACTION_KEY_V1,
+    taskFolderPath: folderUri.fsPath,
+    taskBindingId,
+    chatDocumentIdentitySeed: folderUri.fsPath,
+    workspaceCwd: path.dirname(folderUri.fsPath),
+    taskStatus: progress.status ?? "active",
+    taskStage: progress.currentStage,
+    rawInput: { taskFolderPath: folderUri.fsPath, expectedSourceStage: progress.currentStage },
+  });
+  if (outcome.kind !== "completed") {
+    throw new Error(outcome.kind === "failed" ? outcome.code : outcome.kind);
+  }
+  const shouldAutoReview =
+    optIn && !isPaused && isReviewStage(next) && AUTO_REVIEW_TRANSITIONS[progress.currentStage] === next;
+  return { persisted: true, newStage: next, shouldAutoReview };
+}
+
 export async function nextStage(
   _extensionUri: vscode.Uri,
   context: vscode.ExtensionContext,
@@ -3640,26 +3681,41 @@ export async function nextStage(
     }
   }
 
-  // ── Step 1: Persist stage transition using shared helper ──────────────────
-  let transitionResult: Awaited<ReturnType<typeof advanceStage>>;
+  // ── Step 1: Persist stage transition ───────────────────────────────────
+  // The literal STAGE_ORDER successor delegates to the nextStage.v1
+  // registry row (plan §6.6's typed coordinator delegation). A
+  // configured-review-stage skip (an optional review stage with no model
+  // configured for this workspace) isn't representable by that row's
+  // single ordered-step transition yet, so it keeps using the legacy
+  // advanceStage helper — see nextStageRowV1.ts's SCOPE note.
+  const literalNext = computeNextStage(resolved.progress.currentStage);
+  let transitionResult: StageTransitionResult | undefined;
   try {
-    transitionResult = await advanceStage(
-      resolved.folderUri,
-      resolved.progress.currentStage,
-      next,
-      resolved.progress.status === "paused",
-      "complete-and-move-on",
-      // Completing a stage may start work in its destination only when the
-      // workspace explicitly enables that behavior.  Manual stage selection
-      // deliberately does not use this path.
-      completeAndMoveOnTriggersAI()
-    );
+    transitionResult = next === literalNext
+      ? await advanceStageViaNextStageRowV1(
+          resolved.folderUri,
+          resolved.progress,
+          next,
+          resolved.progress.status === "paused",
+          // Completing a stage may start work in its destination only when
+          // the workspace explicitly enables that behavior. Manual stage
+          // selection deliberately does not use this path.
+          completeAndMoveOnTriggersAI()
+        )
+      : await advanceStage(
+          resolved.folderUri,
+          resolved.progress.currentStage,
+          next,
+          resolved.progress.status === "paused",
+          "complete-and-move-on",
+          completeAndMoveOnTriggersAI()
+        );
   } catch (error) {
-    // advanceStage throws (rather than resolving falsy) when its
-    // compare-and-set is rejected — e.g. an auto-advance already moved this
-    // task off the expected source stage under the lock while this manual
-    // "Complete Stage & Move On" was in flight. Report it like any other
-    // failed transition instead of an unhandled rejection.
+    // Both paths throw (rather than resolving falsy) on a rejected
+    // transition — e.g. an auto-advance already moved this task off the
+    // expected source stage while this manual "Complete Stage & Move On"
+    // was in flight. Report it like any other failed transition instead of
+    // an unhandled rejection.
     const message = error instanceof Error ? error.message : String(error);
     NotificationRouter.showWarning(
       `Could not advance ${resolved.progress.taskFolder}: ${message}`

@@ -1,12 +1,15 @@
 import * as vscode from "vscode";
+import * as path from "path";
 import { TaskInventory, TaskWithProgress } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { STAGE_DISPLAY_NAMES } from "../types/taskProgress";
-import { IncompleteTask, patchTaskProgress } from "../utils/taskProgressUtils";
+import { IncompleteTask } from "../utils/taskProgressUtils";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { runTrackedOperation } from "../utils/taskOperations";
 import { LegacyCreatingStartupGateV0 } from "../state/legacyCreatingStartupGateV0";
+import { invokeLifecycleRowV1 } from "../actions/productionTaskActionRuntimeV1";
+import { MARK_TASK_DONE_ACTION_KEY_V1 } from "../actions/rows/markTaskDoneRowV1";
 
 /**
  * Accepted argument shapes for markTaskDone.
@@ -180,19 +183,29 @@ export async function markTaskDone(
     { label: "Complete Task", taskName: resolvedTask.folderName, kind: "complete-task" },
     async () => {
     // Completion is an explicit user action. Reaching Publish alone never
-    // changes lifecycle status, but this command is the durable terminal edge.
-    await patchTaskProgress(taskFolderUri, (current) => ({
-      ...current,
-      status: "completed",
-      completedAt: new Date().toISOString(),
-      // Publish is the final stage. Record it explicitly so its row retains a
-      // completion tick after the task moves to the completed lifecycle state.
-      completedStages: Array.from(new Set([...(current.completedStages ?? []), "publish"])),
-      // A completed task must never retain an actionable timer. Besides being
-      // misleading, that state makes tree context validation reject the task.
-      scheduledRun: undefined,
-      scheduledResumeTime: undefined,
-    }));
+    // changes lifecycle status, but this command is the durable terminal
+    // edge — persisted through the markTaskDone.v1 registry row (plan §6.6),
+    // which applies the field policy via the strict progress stack.
+    // Exactly like resolveTaskContext's own canonicalId (a normalized
+    // absolute task-folder path) — see invokeLifecycleRowV1's own header
+    // for why a lifecycle row needs neither a workflow file-store root nor
+    // a real Chat document identity.
+    const taskBindingId = resolvedTask.canonicalId;
+    const outcome = await invokeLifecycleRowV1({
+      actionKey: MARK_TASK_DONE_ACTION_KEY_V1,
+      taskFolderPath: taskFolderUri.fsPath,
+      taskBindingId,
+      chatDocumentIdentitySeed: resolvedTask.canonicalId,
+      workspaceCwd: resolvedTask.workspaceFolder?.fsPath ?? path.dirname(taskFolderUri.fsPath),
+      taskStatus: resolvedTask.progress.status ?? "active",
+      taskStage: resolvedTask.progress.currentStage,
+      rawInput: { taskFolderPath: taskFolderUri.fsPath },
+    });
+    if (outcome.kind !== "completed") {
+      const detail = outcome.kind === "failed" ? outcome.code : outcome.kind;
+      NotificationRouter.showError(`Could not complete ${resolvedTask.folderName}: ${detail}.`);
+      return;
+    }
     await inventory.refresh();
 
     // ── Step 2: Select next active task deterministically ──────────────────

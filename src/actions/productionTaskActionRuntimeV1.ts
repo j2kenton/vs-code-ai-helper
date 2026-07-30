@@ -33,13 +33,19 @@ import { createReviewRowV1 } from "./rows/reviewRowV1";
 import { createApplyReviewRowV1 } from "./rows/applyReviewRowV1";
 import { createChatSendRowV1 } from "./rows/chatSendRowV1";
 import { createCommitPushMetadataRowV1 } from "./rows/commitPushMetadataRowV1";
+import { createNextStageRowV1 } from "./rows/nextStageRowV1";
+import { createMarkTaskDoneRowV1 } from "./rows/markTaskDoneRowV1";
 import { createV1RunnerSelectionOpener } from "../runners/runnerRegistry";
 import {
   getChatInteractionTransactionStoreV1,
   getWorkflowLeaseStoreV1,
 } from "../services/workflowRuntimeServicesV1";
-import { TaskStage } from "../types/taskProgress";
+import { TaskProgress, TaskStage } from "../types/taskProgress";
 import { NotificationRouter } from "../utils/notificationRouter";
+import { allocateHex128IdV1 } from "../types/actionCorrelationV1";
+import { readChatDocumentIdentityV1 } from "../utils/chatHistoryStore";
+import { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
+import * as vscode from "vscode";
 
 let registry: TaskActionRegistryV1 | undefined;
 
@@ -54,6 +60,8 @@ export function getProductionTaskActionRegistryV1(): TaskActionRegistryV1 {
       createApplyReviewRowV1(),
       createChatSendRowV1(),
       createCommitPushMetadataRowV1(),
+      createNextStageRowV1(),
+      createMarkTaskDoneRowV1(),
     ]);
   }
   return registry;
@@ -101,6 +109,34 @@ export function getProductionActionConversationOrchestratorV1(): ActionConversat
 }
 
 /**
+ * A `TaskActionCoordinatorV1` never touches its `orchestrator` dependency
+ * for a lifecycle row (plan §6.6): only `runProviderRow`/`settleEnvelope`
+ * (provider-only paths) call it. Resolving the real orchestrator eagerly at
+ * coordinator-construction time would therefore require every lifecycle-only
+ * caller (e.g. nextStage/markTaskDone) to have the full Chat interaction
+ * transaction store wired at activation, even though it will never actually
+ * be used. This lazily resolves on first real method access instead, so a
+ * lifecycle-only invocation works without that wiring while a provider row
+ * still gets the real orchestrator, resolved just slightly later.
+ */
+function lazyProductionActionConversationOrchestratorV1(): ActionConversationOrchestratorV1 {
+  let cached: ActionConversationOrchestratorV1 | undefined;
+  const resolve = (): ActionConversationOrchestratorV1 => {
+    if (!cached) {
+      cached = getProductionActionConversationOrchestratorV1();
+    }
+    return cached;
+  };
+  return new Proxy({} as ActionConversationOrchestratorV1, {
+    get(_target, prop, receiver): unknown {
+      const orchestrator = resolve();
+      const value: unknown = Reflect.get(orchestrator as object, prop, receiver);
+      return typeof value === "function" ? (value as (...args: unknown[]) => unknown).bind(orchestrator) : value;
+    },
+  });
+}
+
+/**
  * Build a coordinator bound to one invocation's already-resolved workspace
  * cwd and stage-model resolution. `resolveStagePrimaryModel` must be
  * synchronous — callers resolve the stage's stored model id asynchronously
@@ -120,11 +156,70 @@ export function createProductionTaskActionCoordinatorV1(options: {
       workspaceCwd: options.workspaceCwd,
       resolveStagePrimaryModel: options.resolveStagePrimaryModel,
     }),
-    orchestrator: getProductionActionConversationOrchestratorV1(),
+    orchestrator: lazyProductionActionConversationOrchestratorV1(),
     followUpScheduler: noopFollowUpSchedulerV1,
     presenter: notificationPresenterV1(),
     auditLogger: consoleAuditLoggerV1,
   });
+}
+
+/**
+ * Shared invocation path for a non-provider (lifecycle) row — `nextStage.v1`
+ * and `markTaskDone.v1` are both callers (`reviewActions.ts`,
+ * `markTaskDone.ts`). A lifecycle row never writes through the workflow file
+ * store, so it needs no registered/verified workflow task-folder root — just
+ * a stable per-task lease/audit key — and never posts to Chat (that's
+ * provider-only coordinator plumbing), so `chatDocumentId` here is inert
+ * correlation/audit metadata only; a synthetic id when the real one can't be
+ * resolved is safe.
+ */
+export async function invokeLifecycleRowV1(options: {
+  readonly actionKey: string;
+  readonly taskFolderPath: string;
+  readonly taskBindingId: string;
+  readonly chatDocumentIdentitySeed: string;
+  readonly workspaceCwd: string;
+  readonly taskStatus: TaskProgress["status"];
+  readonly taskStage: TaskStage;
+  readonly rawInput: Record<string, unknown>;
+}): Promise<TaskActionOutcomeV1> {
+  let chatDocumentId: string;
+  try {
+    const chatIdentity = await readChatDocumentIdentityV1(
+      options.taskFolderPath,
+      options.chatDocumentIdentitySeed
+    );
+    chatDocumentId = chatIdentity?.documentId ?? allocateHex128IdV1();
+  } catch {
+    // Inert correlation metadata (see this function's header) — a lifecycle
+    // row never consults chatDocumentId, so a synthetic id is safe. Logged
+    // (no paths, no content) so a future row that does depend on it isn't
+    // silently working from a random id.
+    chatDocumentId = allocateHex128IdV1();
+    console.warn("[ensemble:taskAction] lifecycle row chat identity read failed; using synthetic id", {
+      actionKey: options.actionKey,
+    });
+  }
+
+  const coordinator = createProductionTaskActionCoordinatorV1({
+    workspaceCwd: options.workspaceCwd,
+    // A lifecycle row never consults provider selection, so this resolver
+    // is never actually invoked.
+    resolveStagePrimaryModel: () => ({ modelId: undefined, stage: undefined }),
+  });
+  const cancellation = new vscode.CancellationTokenSource();
+  try {
+    return await coordinator.executeAction({
+      actionKey: options.actionKey,
+      taskBinding: { taskBindingId: options.taskBindingId, chatDocumentId },
+      taskStatus: options.taskStatus ?? "active",
+      taskStage: options.taskStage,
+      rawInput: options.rawInput,
+      cancellationToken: cancellation.token,
+    });
+  } finally {
+    cancellation.dispose();
+  }
 }
 
 /** Test isolation: forget the cached registry singleton. Production never calls this. */

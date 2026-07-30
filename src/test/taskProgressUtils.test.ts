@@ -35,10 +35,10 @@ void test("first run with no prior tracked files records exactly its own files",
   assert.deepEqual(updated.implReviewFiles, ["a.ts", "b.ts"]);
 });
 
-void test("a later run's new files are unioned with the previously tracked set", () => {
+void test("a later run's new files are unioned ahead of the previously tracked set", () => {
   const progress = makeProgress(["a.ts", "b.ts"]);
   const updated = updateImplReviewFiles(progress, ["c.ts"]);
-  assert.deepEqual(updated.implReviewFiles, ["a.ts", "b.ts", "c.ts"]);
+  assert.deepEqual(updated.implReviewFiles, ["c.ts", "a.ts", "b.ts"]);
 });
 
 void test(
@@ -51,10 +51,10 @@ void test(
   }
 );
 
-void test("duplicate paths across runs are not repeated in the union", () => {
+void test("duplicate paths across runs are not repeated, and re-touched files move to the front", () => {
   const progress = makeProgress(["a.ts", "b.ts"]);
   const updated = updateImplReviewFiles(progress, ["b.ts", "c.ts"]);
-  assert.deepEqual(updated.implReviewFiles, ["a.ts", "b.ts", "c.ts"]);
+  assert.deepEqual(updated.implReviewFiles, ["b.ts", "c.ts", "a.ts"]);
 });
 
 void test("updateImplReviewFiles bumps updatedAt", () => {
@@ -64,11 +64,11 @@ void test("updateImplReviewFiles bumps updatedAt", () => {
 });
 
 void test(
-  "the union is sorted alphabetically regardless of insertion order across runs",
+  "the union is ordered most-recently-changed first regardless of alphabetical order",
   () => {
     const progress = makeProgress(["z.ts", "m.ts"]);
     const updated = updateImplReviewFiles(progress, ["a.ts", "q.ts"]);
-    assert.deepEqual(updated.implReviewFiles, ["a.ts", "m.ts", "q.ts", "z.ts"]);
+    assert.deepEqual(updated.implReviewFiles, ["a.ts", "q.ts", "z.ts", "m.ts"]);
   }
 );
 
@@ -335,7 +335,7 @@ void test("patchTaskProgress applies a callback update", async () => {
     updateImplReviewFiles(current, ["b.ts"])
   );
   assert.ok(result !== undefined);
-  assert.deepEqual(result.implReviewFiles, ["a.ts", "b.ts"]);
+  assert.deepEqual(result.implReviewFiles, ["b.ts", "a.ts"]);
 });
 
 void test("patchTaskProgress persists changes to disk", async () => {

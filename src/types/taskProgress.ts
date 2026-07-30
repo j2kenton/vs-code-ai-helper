@@ -146,7 +146,9 @@ export interface TaskProgress {
   /**
    * Workspace-relative paths changed across all AI implementation runs for
    * this task, accumulated (unioned, not replaced) as each run completes —
-   * see `updateImplReviewFiles`. Sorted alphabetically. Used as the primary
+   * see `updateImplReviewFiles`. Ordered most-recently-changed first so the
+   * implementation-review pack's size budget serves the latest run's files.
+   * Used as the primary
    * review scope for implementation reviews so the review is not limited to
    * whatever files happen to be open, and so a later run that happens to
    * touch no new files doesn't erase an earlier run's tracked files.

@@ -10,22 +10,22 @@
       "callSites": [
         {
           "signal": "workspace.fs",
-          "span": "L105-L105",
+          "span": "L108-L108",
           "enclosingSymbol": "applyCurrentStageAction"
         },
         {
           "signal": "workspace.fs",
-          "span": "L126-L126",
+          "span": "L129-L129",
           "enclosingSymbol": "applyCurrentStageAction"
         },
         {
           "signal": "workspace.fs",
-          "span": "L147-L147",
+          "span": "L150-L150",
           "enclosingSymbol": "applyCurrentStageAction"
         },
         {
           "signal": "workspace.fs",
-          "span": "L168-L168",
+          "span": "L171-L171",
           "enclosingSymbol": "applyCurrentStageAction"
         }
       ],
@@ -231,62 +231,62 @@
         },
         {
           "signal": "workspace.fs",
-          "span": "L670-L670",
+          "span": "L672-L672",
           "enclosingSymbol": "entries"
         },
         {
           "signal": "workspace.fs",
-          "span": "L683-L683",
+          "span": "L685-L685",
           "enclosingSymbol": "legacyEntries"
         },
         {
           "signal": "workspace.fs",
-          "span": "L1135-L1135",
+          "span": "L1148-L1148",
           "enclosingSymbol": "newContent"
         },
         {
           "signal": "workspace.fs",
-          "span": "L1344-L1344",
+          "span": "L1357-L1357",
           "enclosingSymbol": "runAiToFile"
         },
         {
           "signal": "workspace.fs",
-          "span": "L1427-L1427",
+          "span": "L1440-L1440",
           "enclosingSymbol": "runAiToFile"
         },
         {
           "signal": "workspace.fs",
-          "span": "L1676-L1676",
+          "span": "L1689-L1689",
           "enclosingSymbol": "runSecondOpinionReview"
         },
         {
           "signal": "workspace.fs",
-          "span": "L1703-L1703",
+          "span": "L1716-L1716",
           "enclosingSymbol": "runSecondOpinionReview"
         },
         {
           "signal": "workspace.fs",
-          "span": "L2016-L2016",
+          "span": "L2029-L2029",
           "enclosingSymbol": "contentBytes"
         },
         {
           "signal": "workspace.fs",
-          "span": "L2470-L2470",
+          "span": "L2483-L2483",
           "enclosingSymbol": "runReviewForFolder"
         },
         {
           "signal": "workspace.fs",
-          "span": "L2487-L2487",
+          "span": "L2500-L2500",
           "enclosingSymbol": "runReviewForFolder"
         },
         {
           "signal": "workspace.fs",
-          "span": "L2918-L2918",
+          "span": "L2888-L2888",
           "enclosingSymbol": "runApply"
         },
         {
           "signal": "workspace.fs",
-          "span": "L5394-L5394",
+          "span": "L5416-L5416",
           "enclosingSymbol": "buildReviewResumeVariablesV1"
         }
       ],
@@ -1190,7 +1190,7 @@
         },
         {
           "signal": "workspace.fs",
-          "span": "L451-L451",
+          "span": "L459-L459",
           "enclosingSymbol": "entries"
         }
       ],
