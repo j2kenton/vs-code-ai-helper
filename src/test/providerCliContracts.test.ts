@@ -641,6 +641,7 @@ void describe("provider CLI contracts", () => {
       "opencode-cli": { command: "opencode" },
       "cline-cli": { command: "cline auth cline-pass" },
       "kimi-cli": { command: "kimi login" },
+      "devpass-cli": { command: "devpass-code providers login" },
     };
 
     for (const provider of CLI_PROVIDERS) {
@@ -782,6 +783,11 @@ void describe("provider CLI contracts", () => {
       // (verified against its full --help command list) — see
       // usageUnsupportedReason on the kimi-cli provider definition.
       "kimi-cli": { kind: "unsupported" },
+      // devpass-code has no non-interactive quota/entitlement command —
+      // `devpass-code stats` only reports local observed usage, not
+      // remaining LLM Gateway DevPass quota — see usageUnsupportedReason on
+      // the devpass-cli provider definition.
+      "devpass-cli": { kind: "unsupported" },
     };
     for (const entry of PROVIDER_ACCOUNT_ENTRIES) {
       const expected = expectations[entry.id];

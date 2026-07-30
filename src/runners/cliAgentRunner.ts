@@ -1200,14 +1200,19 @@ function normalizeCliOutput(
     return extractKiroFinalOutput(output);
   }
 
-  if (def.id === "opencode-cli") {
-    // parsed (when the caller already parsed stdout for another purpose) is
-    // only valid to reuse here when lastMessageFile didn't override output —
-    // opencode never sets usesLastMessageFile, so output is always derived
-    // from stdout for this provider and the shared parse stays correct.
-    // Passing `parsed` even when undefined is fine: extractOpencodeFinalOutput's
-    // own default parameter already parses internally in that case — an
-    // explicit undefined argument triggers a default the same as omitting it.
+  if (def.structuredEventStream === "opencode") {
+    // Keyed off the tag, not the literal provider ID: devpass-cli is a
+    // rebrand/fork of OpenCode emitting the byte-for-byte same --format
+    // json event-stream shape (verified live), so it shares this same
+    // extractor rather than needing its own. parsed (when the caller
+    // already parsed stdout for another purpose) is only valid to reuse
+    // here when lastMessageFile didn't override output — neither
+    // opencode-cli nor devpass-cli ever sets usesLastMessageFile, so output
+    // is always derived from stdout for both and the shared parse stays
+    // correct. Passing `parsed` even when undefined is fine:
+    // extractOpencodeFinalOutput's own default parameter already parses
+    // internally in that case — an explicit undefined argument triggers a
+    // default the same as omitting it.
     return extractOpencodeFinalOutput(output, parsed);
   }
 

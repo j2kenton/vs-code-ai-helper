@@ -2,7 +2,7 @@
 
 ## Overview
 
-VS Code AI Helper is a personal developer tool that orchestrates AI providers (GitHub Copilot, Claude, Codex, Gemini, Antigravity, Kiro, opencode, Cline) to assist with task planning and implementation. This document describes what the extension enforces, what it does not enforce, and how to report vulnerabilities.
+VS Code AI Helper is a personal developer tool that orchestrates AI providers (GitHub Copilot, Claude, Codex, Gemini, Antigravity, Kiro, opencode, Cline, Kimi, devpass-code) to assist with task planning and implementation. This document describes what the extension enforces, what it does not enforce, and how to report vulnerabilities.
 
 ---
 
@@ -35,14 +35,15 @@ This is an in-process software control — it does not prevent a user who has co
 - Paths that resolve outside the workspace are rejected with an error returned to the model.
 - This is an **internal software boundary**, not an OS-level sandbox.
 
-**CLI implementation runs (Claude, Codex, Gemini, Kiro, opencode):**
+**CLI implementation runs (Claude, Codex, Gemini, Kiro, opencode, devpass-code):**
 
 - The CLI process runs with the workspace as its working directory.
-- Access is limited by the vendor's own permission flags: Claude `--permission-mode acceptEdits`, Codex `--sandbox workspace-write`, Gemini `--approval-mode auto_edit`, Kiro `--trust-all-tools`, opencode `--agent build`.
+- Access is limited by the vendor's own permission flags: Claude `--permission-mode acceptEdits`, Codex `--sandbox workspace-write`, Gemini `--approval-mode auto_edit`, Kiro `--trust-all-tools`, opencode `--agent build`, devpass-code `--agent build`.
 - These flags are the **vendor CLIs' own enforcement** — the extension does not add an additional sandbox layer on top.
 - The model can still read, create, modify, and delete files anywhere within the workspace.
-- Outside implementation mode (plan, review, chat), these five stay read-only via their own flags instead: Claude `--permission-mode plan`, Codex `--sandbox read-only`, Kiro `--trust-tools fs_read,grep,glob`, opencode `--agent plan`; Gemini's default agent has no write/shell tools available at all, so it needs no separate flag. This is the baseline Antigravity is the exception to, below.
+- Outside implementation mode (plan, review, chat), these six stay read-only via their own flags instead: Claude `--permission-mode plan`, Codex `--sandbox read-only`, Kiro `--trust-tools fs_read,grep,glob`, opencode `--agent plan`, devpass-code `--agent plan`; Gemini's default agent has no write/shell tools available at all, so it needs no separate flag. This is the baseline Antigravity is the exception to, below.
 - **Caveat on opencode's `--agent plan`:** its permission set denies `edit` on the workspace generally, but carries a narrower allow rule scoped to `.opencode/plans/*.md` (inside the workspace) alongside a path under the user's home directory — read-only for ordinary workspace files was directly tested and held, but whether that narrower path is reachable from a headless, non-interactive run was not conclusively verified (see the buildArgs comment for opencode in `src/runners/providers.ts` for what was and wasn't tested).
+- **Same caveat applies to devpass-code's `--agent plan`:** it is a rebrand/fork of opencode and its `plan` agent carries the identical narrow allow-rule exception (even the literal `.opencode/plans/*.md` pattern, verified live via `devpass-code agent list`) alongside its own `~/.local/share/devpass-code/plans/*.md` path — the same "read-only for ordinary files, unverified reachability of the narrow exception" caveat holds.
 
 **Antigravity CLI (all modes, not just implementation):**
 
@@ -81,7 +82,7 @@ Eligibility rules for open editors included in provider-bound context packs:
 - The extension itself contains no HTTP client code.
 - Network activity occurs through:
   - VS Code's Language Model API (for Copilot), which manages authentication and transmission internally.
-  - Vendor CLI processes (`claude`, `codex`, `gemini`, `agy`/`antigravity`, `kiro-cli`, `opencode`, `cline`, `kimi`) spawned as child processes; their network behaviour is governed by the vendor CLIs.
+  - Vendor CLI processes (`claude`, `codex`, `gemini`, `agy`/`antigravity`, `kiro-cli`, `opencode`, `cline`, `kimi`, `devpass-code`) spawned as child processes; their network behaviour is governed by the vendor CLIs.
   - Git, spawned as a child process for the commit-and-push command.
 - The extension does not make direct outbound HTTP/HTTPS calls.
 
@@ -114,7 +115,7 @@ Eligibility rules for open editors included in provider-bound context packs:
 
 - AI implementation runs can modify or delete **any file inside the workspace**, not just files related to the current task. This is by design — the AI needs broad access to implement code changes.
 - The secret-filename denylist catches well-known naming conventions only. A secret pasted into an arbitrarily-named file is not caught.
-- CLI sandbox flags (Claude `acceptEdits`, Codex `workspace-write`, Gemini `auto_edit`, Kiro `--trust-all-tools`, opencode `--agent build`) do not prevent the model from issuing shell commands that the CLI itself approves; behaviour depends on the vendor CLI's own policy.
+- CLI sandbox flags (Claude `acceptEdits`, Codex `workspace-write`, Gemini `auto_edit`, Kiro `--trust-all-tools`, opencode `--agent build`, devpass-code `--agent build`) do not prevent the model from issuing shell commands that the CLI itself approves; behaviour depends on the vendor CLI's own policy.
 - Antigravity has no sandbox flag to begin with: `--dangerously-skip-permissions` runs in every mode, so its plan and review runs carry implementation-level file-modification risk. This is a deliberate, accepted exception — see the Antigravity CLI section above and the Antigravity note in the README.
 - Cline's `--plan` flag is a system-prompt instruction, not an enforced permission boundary: its shell-command tool stays available and auto-approved in every mode, so plan and review runs carry the same file-modification risk as an implementation run if a prompt causes the model to use it. This is a deliberate, accepted exception — see the Cline CLI section above and the Cline note in the README.
 - Kimi Code CLI has no permission flag of any kind in ANY mode — `-p`/`--prompt` rejects `--plan`, `--yolo`, and `--auto` alike — so plan/review runs carry the same file-modification and shell-execution risk as an implementation run. This is a deliberate, accepted exception — see the Kimi CLI section above and the Kimi note in the README.

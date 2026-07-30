@@ -43,6 +43,7 @@
 
 import {
   discoverAgyModels,
+  discoverDevpassModels,
   discoverKimiModels,
   discoverKiroModels,
   discoverOpencodeModels,
@@ -57,7 +58,8 @@ export type CliProviderId =
   | "kiro-cli"
   | "opencode-cli"
   | "cline-cli"
-  | "kimi-cli";
+  | "kimi-cli"
+  | "devpass-cli";
 export type ProviderId = "copilot" | CliProviderId;
 
 /**
@@ -1322,6 +1324,88 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
       // the final argv element right after this, which must directly
       // follow "-p" for it to be read as that flag's value.
       args.push("-p");
+      return args;
+    },
+  },
+  {
+    // devpass-code (verified live, v1.17.13) is a rebrand/fork of OpenCode:
+    // identical subcommand surface (`run`, `models`, `providers`, `agent
+    // list`), identical --format json event-stream shape, and its `plan`
+    // agent's permission rules still carry the literal OpenCode path
+    // `.opencode\plans\*.md` verbatim in its one edit-allow exception. It
+    // fronts a single "LLM Gateway DevPass" API-key credential (`devpass-code
+    // providers list`) rather than OpenCode's per-service Zen/Go split, so
+    // this is a normal single-account entry — no ProviderAccountId split
+    // needed, unlike opencode-cli above.
+    id: "devpass-cli",
+    label: "devpass-code",
+    command: "devpass-code",
+    installHint:
+      "Install devpass-code, then run `devpass-code providers login` and connect the LLM Gateway DevPass credential.",
+    loginHint:
+      "Run `devpass-code providers login` in a terminal and complete the LLM Gateway DevPass sign-in, then try again.",
+    // Not verified against a genuine unauthenticated run (this environment's
+    // CLI was already signed in) — matches the union of markers used by the
+    // other OpenCode-shaped/multi-model CLI providers here.
+    authErrorMarkers: [
+      "not logged in",
+      "login",
+      "authenticate",
+      "api key",
+      "unauthorized",
+      "no credentials",
+      "no provider available",
+      "401",
+    ],
+    // `devpass-code providers login` is a genuine one-shot CLI subcommand
+    // (verified via `devpass-code providers --help`), not an in-session
+    // slash command like OpenCode's `/connect`.
+    signInCommand: "devpass-code providers login",
+    signInLabel: "Sign in / Switch account",
+    signInGuidance:
+      "Completes the LLM Gateway DevPass sign-in in the terminal. Whether re-running this while already " +
+      "authenticated switches accounts or just re-confirms the existing session was not verified live " +
+      "(this environment's CLI was already signed in) — check the terminal output after running it.",
+    usageUnsupportedReason:
+      "devpass-code has no non-interactive quota/entitlement command — `devpass-code stats` only reports " +
+      "local observed token/cost totals, not remaining LLM Gateway DevPass quota. Check usage on the LLM " +
+      "Gateway DevPass account directly.",
+    // Model IDs are "llmgateway-devpass/<model>" (verified live via
+    // `devpass-code models`), devpass-code's own namespacing — every model
+    // in the catalog is served through this single upstream account, unlike
+    // OpenCode's per-model distinct upstream providers. A discovered model
+    // may carry a "@<variant>" suffix selecting one of that model's own
+    // reasoning-effort variants, reusing parseOpencodeModelSelection — the
+    // suffix scheme is identical, verified via `devpass-code models
+    // --verbose`.
+    models: [],
+    discoverModels: discoverDevpassModels,
+    // Verified live: `echo "..." | devpass-code run --format json -m ...`
+    // answers correctly, matching OpenCode's stdin transport.
+    promptTransport: "stdin",
+    // The final answer is embedded in the --format json event stream (a
+    // "text"-typed part), identical to OpenCode — see structuredEventStream
+    // below and normalizeCliOutput's opencode-cli branch in
+    // cliAgentRunner.ts, which keys off that tag value, not the provider ID.
+    usesLastMessageFile: false,
+    structuredEventStream: "opencode",
+    buildArgs(mode, model): string[] {
+      const args = ["run", "--format", "json"];
+      // Verified live against devpass-code 1.17.13 via `devpass-code agent
+      // list`: "plan" carries the same wildcard edit-deny plus a narrow
+      // .opencode/plans- and ~/.local/share/devpass-code/plans-scoped allow
+      // exception as OpenCode's plan agent; "build" (the CLI's own default
+      // agent) allows `edit: *` outright. Directly tested: a `plan` run
+      // asked to write a file refused and wrote nothing; a `build` run
+      // asked to write the same file wrote it immediately with no prompt.
+      args.push("--agent", mode === "edit" ? "build" : "plan");
+      const parsedModel = parseOpencodeModelSelection(model);
+      if (parsedModel.model) {
+        args.push("--model", parsedModel.model);
+      }
+      if (parsedModel.variant) {
+        args.push("--variant", parsedModel.variant);
+      }
       return args;
     },
   },

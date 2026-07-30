@@ -461,6 +461,30 @@ export async function discoverOpencodeModelsWithTimeout(
 }
 
 /**
+ * devpass-code is a rebrand/fork of OpenCode (verified live, v1.17.13): its
+ * `models --verbose` output is byte-for-byte the same repeating
+ * "<provider>/<id>\n{json}" shape opencode emits, so this reuses
+ * parseOpencodeModelsOutput rather than a dedicated parser.
+ */
+export async function discoverDevpassModels(command: string): Promise<
+  DiscoveredCliModel[]
+> {
+  return discoverDevpassModelsWithTimeout(command, 30_000);
+}
+
+export async function discoverDevpassModelsWithTimeout(
+  command: string,
+  timeoutMs: number
+): Promise<DiscoveredCliModel[]> {
+  return runCliModelDiscovery(
+    command,
+    ["models", "--verbose"],
+    timeoutMs,
+    parseOpencodeModelsOutput
+  );
+}
+
+/**
  * `kimi provider list --json`'s shape (verified live against kimi-code
  * 0.29.2): a single JSON object with a "models" map keyed by the full
  * "<provider>/<alias>" id, each value carrying a "displayName" field (e.g.

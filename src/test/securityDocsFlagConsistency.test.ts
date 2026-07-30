@@ -27,6 +27,7 @@ const EDIT_MODE_FLAG_NAMES: Readonly<Partial<Record<string, string>>> = {
   "antigravity-cli": "--dangerously-skip-permissions",
   "opencode-cli": "--agent",
   "cline-cli": "--auto-approve",
+  "devpass-cli": "--agent",
 };
 
 // kimi-cli has no permission flag to quote in EITHER mode, unlike every
@@ -61,6 +62,7 @@ const TEXT_MODE_FLAG_NAMES: Readonly<Partial<Record<string, string>>> = {
   "antigravity-cli": "--dangerously-skip-permissions",
   "opencode-cli": "--agent",
   "cline-cli": "--plan",
+  "devpass-cli": "--agent",
 };
 
 function resolveProjectFile(fileName: string): string {

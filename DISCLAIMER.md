@@ -54,6 +54,7 @@ Every "with AI" command consumes quota or usage from the AI subscription you hav
 | opencode | Whichever model provider(s) you sign into through `opencode providers login` (or configure via that provider's API key env var) — opencode itself does not bill you directly |
 | Cline CLI | Your ClinePass subscription ($9.99/mo) |
 | Kimi Code CLI | Your Moonshot AI / Kimi Code account subscription or API quota |
+| devpass-code | Your LLM Gateway DevPass credential |
 
 **Real money or subscription usage is consumed every time an AI command runs.**
 
@@ -82,6 +83,7 @@ When you run an AI implementation command, the selected AI model is given permis
 - Gemini CLI uses `--approval-mode auto_edit`.
 - Kiro CLI uses `--trust-all-tools`.
 - opencode uses `--agent build`.
+- devpass-code uses `--agent build`.
 - **Antigravity CLI uses `--dangerously-skip-permissions` — in every mode, not just implementation.** Its headless CLI has no scoped-permission flag at all, so plan and review runs carry the same full bypass as implementation runs. See the Antigravity note in the README before enabling it.
 - **Cline CLI uses `--auto-approve true` for implementation, and carries the same full-bypass risk outside it.** Its text-mode (plan/review) runs pass `--plan` instead, but that only changes the model's own system-prompt instructions — its shell-command tool stays available and auto-approved regardless, so a plan/review run can still create, change, or delete files if a prompt causes it to do so. See the Cline note in the README before enabling it.
 - **Kimi Code CLI passes no permission flag at all, in any mode.** Unlike every other CLI here, `--plan`, `--yolo`, and `--auto` are all rejected outright alongside its one-shot prompt flag — implementation and plan/review runs use identical arguments and carry identical full-bypass risk. See the Kimi note in the README before enabling it.

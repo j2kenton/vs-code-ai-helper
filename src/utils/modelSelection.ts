@@ -1099,6 +1099,310 @@ function createSeededOpencodeModels(): readonly DiscoveredCliModel[] {
   return parseOpencodeModelsOutput(OPENCODE_SEEDED_CATALOG_RAW);
 }
 
+/**
+ * Raw `devpass-code models --verbose` catalog snapshot (devpass-code
+ * 1.17.13, captured 2026-07-30), compacted the same way as
+ * OPENCODE_SEEDED_CATALOG_RAW above and run through the SAME
+ * parseOpencodeModelsOutput parser — devpass-code is a rebrand/fork of
+ * OpenCode with a byte-for-byte identical `models --verbose` shape (see
+ * discoverDevpassModels in cliModelDiscovery.ts). Filtered to models whose
+ * `capabilities.toolcall` was true in the live capture: the full catalog
+ * (204 entries) includes embedding, image-generation, transcription, and
+ * reranker models with no tool-calling support at all, which this agentic
+ * coding integration can never usefully drive. Regenerate by piping a
+ * fresh `devpass-code models --verbose` through the same
+ * id/providerID/name/variants compaction, re-applying the toolcall filter,
+ * when the catalog changes.
+ */
+const DEVPASS_SEEDED_CATALOG_RAW = `
+llmgateway-devpass/auto
+{"id":"auto","providerID":"llmgateway-devpass","name":"Auto Route","variants":{}}
+llmgateway-devpass/claude-3-opus
+{"id":"claude-3-opus","providerID":"llmgateway-devpass","name":"Claude 3 Opus","variants":{}}
+llmgateway-devpass/claude-fable-5
+{"id":"claude-fable-5","providerID":"llmgateway-devpass","name":"Claude Fable 5","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/claude-haiku-4-5
+{"id":"claude-haiku-4-5","providerID":"llmgateway-devpass","name":"Claude Haiku 4.5","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/claude-haiku-4-5-20251001
+{"id":"claude-haiku-4-5-20251001","providerID":"llmgateway-devpass","name":"Claude Haiku 4.5 (2025-10-01)","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/claude-haiku-4-5-free
+{"id":"claude-haiku-4-5-free","providerID":"llmgateway-devpass","name":"Claude Haiku 4.5 (Free)","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/claude-opus-4-1-20250805
+{"id":"claude-opus-4-1-20250805","providerID":"llmgateway-devpass","name":"Claude Opus 4.1","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/claude-opus-4-5-20251101
+{"id":"claude-opus-4-5-20251101","providerID":"llmgateway-devpass","name":"Claude Opus 4.5","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/claude-opus-4-6
+{"id":"claude-opus-4-6","providerID":"llmgateway-devpass","name":"Claude Opus 4.6","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/claude-opus-4-7
+{"id":"claude-opus-4-7","providerID":"llmgateway-devpass","name":"Claude Opus 4.7","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/claude-opus-4-8
+{"id":"claude-opus-4-8","providerID":"llmgateway-devpass","name":"Claude Opus 4.8","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/claude-opus-5
+{"id":"claude-opus-5","providerID":"llmgateway-devpass","name":"Claude Opus 5","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/claude-sonnet-4-5
+{"id":"claude-sonnet-4-5","providerID":"llmgateway-devpass","name":"Claude Sonnet 4.5","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/claude-sonnet-4-5-20250929
+{"id":"claude-sonnet-4-5-20250929","providerID":"llmgateway-devpass","name":"Claude Sonnet 4.5 (2025-09-29)","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/claude-sonnet-4-6
+{"id":"claude-sonnet-4-6","providerID":"llmgateway-devpass","name":"Claude Sonnet 4.6","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/claude-sonnet-5
+{"id":"claude-sonnet-5","providerID":"llmgateway-devpass","name":"Claude Sonnet 5","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/cosmos3-super-reasoner
+{"id":"cosmos3-super-reasoner","providerID":"llmgateway-devpass","name":"Cosmos 3 Super Reasoner","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/deepseek-v3.2
+{"id":"deepseek-v3.2","providerID":"llmgateway-devpass","name":"DeepSeek V3.2","variants":{}}
+llmgateway-devpass/deepseek-v4-flash
+{"id":"deepseek-v4-flash","providerID":"llmgateway-devpass","name":"DeepSeek V4 Flash","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"},"max":{"reasoningEffort":"max"}}}
+llmgateway-devpass/deepseek-v4-pro
+{"id":"deepseek-v4-pro","providerID":"llmgateway-devpass","name":"DeepSeek V4 Pro","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"},"max":{"reasoningEffort":"max"}}}
+llmgateway-devpass/fugu-ultra
+{"id":"fugu-ultra","providerID":"llmgateway-devpass","name":"Fugu Ultra","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/gemini-3-flash-preview
+{"id":"gemini-3-flash-preview","providerID":"llmgateway-devpass","name":"Gemini 3 Flash (Preview)","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/gemini-3.1-flash-lite
+{"id":"gemini-3.1-flash-lite","providerID":"llmgateway-devpass","name":"Gemini 3.1 Flash Lite","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/gemini-3.1-pro-preview
+{"id":"gemini-3.1-pro-preview","providerID":"llmgateway-devpass","name":"Gemini 3.1 Pro (Preview)","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/gemini-3.5-flash
+{"id":"gemini-3.5-flash","providerID":"llmgateway-devpass","name":"Gemini 3.5 Flash","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/gemini-3.5-flash-lite
+{"id":"gemini-3.5-flash-lite","providerID":"llmgateway-devpass","name":"Gemini 3.5 Flash Lite","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/gemini-3.6-flash
+{"id":"gemini-3.6-flash","providerID":"llmgateway-devpass","name":"Gemini 3.6 Flash","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/gemini-pro-latest
+{"id":"gemini-pro-latest","providerID":"llmgateway-devpass","name":"Gemini Pro Latest","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/gemma-4-26b-a4b-it
+{"id":"gemma-4-26b-a4b-it","providerID":"llmgateway-devpass","name":"Gemma 4 26B A4B IT","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/gemma-4-31b-it
+{"id":"gemma-4-31b-it","providerID":"llmgateway-devpass","name":"Gemma 4 31B IT","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/glm-4-32b-0414-128k
+{"id":"glm-4-32b-0414-128k","providerID":"llmgateway-devpass","name":"GLM-4 32B (0414-128k)","variants":{}}
+llmgateway-devpass/glm-4.5
+{"id":"glm-4.5","providerID":"llmgateway-devpass","name":"GLM-4.5","variants":{}}
+llmgateway-devpass/glm-4.5-air
+{"id":"glm-4.5-air","providerID":"llmgateway-devpass","name":"GLM-4.5 Air","variants":{}}
+llmgateway-devpass/glm-4.5-airx
+{"id":"glm-4.5-airx","providerID":"llmgateway-devpass","name":"GLM-4.5 AirX","variants":{}}
+llmgateway-devpass/glm-4.5-x
+{"id":"glm-4.5-x","providerID":"llmgateway-devpass","name":"GLM-4.5 X","variants":{}}
+llmgateway-devpass/glm-4.5v
+{"id":"glm-4.5v","providerID":"llmgateway-devpass","name":"GLM-4.5V","variants":{}}
+llmgateway-devpass/glm-4.6
+{"id":"glm-4.6","providerID":"llmgateway-devpass","name":"GLM-4.6","variants":{}}
+llmgateway-devpass/glm-4.6v
+{"id":"glm-4.6v","providerID":"llmgateway-devpass","name":"GLM-4.6V","variants":{}}
+llmgateway-devpass/glm-4.6v-flashx
+{"id":"glm-4.6v-flashx","providerID":"llmgateway-devpass","name":"GLM-4.6V FlashX","variants":{}}
+llmgateway-devpass/glm-4.7
+{"id":"glm-4.7","providerID":"llmgateway-devpass","name":"GLM-4.7","variants":{}}
+llmgateway-devpass/glm-4.7-flash
+{"id":"glm-4.7-flash","providerID":"llmgateway-devpass","name":"GLM-4.7 Flash","variants":{}}
+llmgateway-devpass/glm-4.7-flashx
+{"id":"glm-4.7-flashx","providerID":"llmgateway-devpass","name":"GLM-4.7 FlashX","variants":{}}
+llmgateway-devpass/glm-5
+{"id":"glm-5","providerID":"llmgateway-devpass","name":"GLM-5","variants":{}}
+llmgateway-devpass/glm-5.1
+{"id":"glm-5.1","providerID":"llmgateway-devpass","name":"GLM-5.1","variants":{}}
+llmgateway-devpass/glm-5.2
+{"id":"glm-5.2","providerID":"llmgateway-devpass","name":"GLM-5.2","variants":{"high":{"reasoningEffort":"high"},"max":{"reasoningEffort":"max"}}}
+llmgateway-devpass/gpt-3.5-turbo
+{"id":"gpt-3.5-turbo","providerID":"llmgateway-devpass","name":"GPT-3.5 Turbo","variants":{}}
+llmgateway-devpass/gpt-4
+{"id":"gpt-4","providerID":"llmgateway-devpass","name":"GPT-4","variants":{}}
+llmgateway-devpass/gpt-4-turbo
+{"id":"gpt-4-turbo","providerID":"llmgateway-devpass","name":"GPT-4 Turbo","variants":{}}
+llmgateway-devpass/gpt-4.1
+{"id":"gpt-4.1","providerID":"llmgateway-devpass","name":"GPT-4.1","variants":{}}
+llmgateway-devpass/gpt-4.1-mini
+{"id":"gpt-4.1-mini","providerID":"llmgateway-devpass","name":"GPT-4.1 Mini","variants":{}}
+llmgateway-devpass/gpt-4.1-nano
+{"id":"gpt-4.1-nano","providerID":"llmgateway-devpass","name":"GPT-4.1 Nano","variants":{}}
+llmgateway-devpass/gpt-4o
+{"id":"gpt-4o","providerID":"llmgateway-devpass","name":"GPT-4o","variants":{}}
+llmgateway-devpass/gpt-4o-mini
+{"id":"gpt-4o-mini","providerID":"llmgateway-devpass","name":"GPT-4o Mini","variants":{}}
+llmgateway-devpass/gpt-5.1
+{"id":"gpt-5.1","providerID":"llmgateway-devpass","name":"GPT-5.1","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/gpt-5.1-codex
+{"id":"gpt-5.1-codex","providerID":"llmgateway-devpass","name":"GPT-5.1 Codex","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/gpt-5.1-codex-mini
+{"id":"gpt-5.1-codex-mini","providerID":"llmgateway-devpass","name":"GPT-5.1 Codex mini","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/gpt-5.2
+{"id":"gpt-5.2","providerID":"llmgateway-devpass","name":"GPT-5.2","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/gpt-5.2-codex
+{"id":"gpt-5.2-codex","providerID":"llmgateway-devpass","name":"GPT-5.2 Codex","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/gpt-5.2-pro
+{"id":"gpt-5.2-pro","providerID":"llmgateway-devpass","name":"GPT-5.2 Pro","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/gpt-5.3-codex
+{"id":"gpt-5.3-codex","providerID":"llmgateway-devpass","name":"GPT-5.3 Codex","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/gpt-5.4
+{"id":"gpt-5.4","providerID":"llmgateway-devpass","name":"GPT-5.4","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/gpt-5.4-mini
+{"id":"gpt-5.4-mini","providerID":"llmgateway-devpass","name":"GPT-5.4 Mini","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/gpt-5.4-nano
+{"id":"gpt-5.4-nano","providerID":"llmgateway-devpass","name":"GPT-5.4 Nano","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/gpt-5.4-pro
+{"id":"gpt-5.4-pro","providerID":"llmgateway-devpass","name":"GPT-5.4 Pro","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/gpt-5.5
+{"id":"gpt-5.5","providerID":"llmgateway-devpass","name":"GPT-5.5","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/gpt-5.5-pro
+{"id":"gpt-5.5-pro","providerID":"llmgateway-devpass","name":"GPT-5.5 Pro","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/gpt-5.6-luna
+{"id":"gpt-5.6-luna","providerID":"llmgateway-devpass","name":"GPT-5.6 Luna","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/gpt-5.6-sol
+{"id":"gpt-5.6-sol","providerID":"llmgateway-devpass","name":"GPT-5.6 Sol","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/gpt-5.6-terra
+{"id":"gpt-5.6-terra","providerID":"llmgateway-devpass","name":"GPT-5.6 Terra","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/gpt-oss-120b
+{"id":"gpt-oss-120b","providerID":"llmgateway-devpass","name":"GPT OSS 120B","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/gpt-oss-20b
+{"id":"gpt-oss-20b","providerID":"llmgateway-devpass","name":"GPT OSS 20B","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/gpt-realtime-2.1
+{"id":"gpt-realtime-2.1","providerID":"llmgateway-devpass","name":"GPT Realtime 2.1","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/gpt-realtime-2.1-mini
+{"id":"gpt-realtime-2.1-mini","providerID":"llmgateway-devpass","name":"GPT Realtime 2.1 Mini","variants":{}}
+llmgateway-devpass/grok-4
+{"id":"grok-4","providerID":"llmgateway-devpass","name":"Grok 4","variants":{}}
+llmgateway-devpass/grok-4-1-fast-non-reasoning
+{"id":"grok-4-1-fast-non-reasoning","providerID":"llmgateway-devpass","name":"Grok 4.1 Fast Non-Reasoning","variants":{}}
+llmgateway-devpass/grok-4-1-fast-reasoning
+{"id":"grok-4-1-fast-reasoning","providerID":"llmgateway-devpass","name":"Grok 4.1 Fast Reasoning","variants":{}}
+llmgateway-devpass/grok-4-20-beta-0309-non-reasoning
+{"id":"grok-4-20-beta-0309-non-reasoning","providerID":"llmgateway-devpass","name":"Grok 4.20 Beta Non-Reasoning (0309)","variants":{}}
+llmgateway-devpass/grok-4-20-beta-0309-reasoning
+{"id":"grok-4-20-beta-0309-reasoning","providerID":"llmgateway-devpass","name":"Grok 4.20 Beta Reasoning (0309)","variants":{}}
+llmgateway-devpass/grok-4-20-non-reasoning
+{"id":"grok-4-20-non-reasoning","providerID":"llmgateway-devpass","name":"Grok 4.20 Non-Reasoning","variants":{}}
+llmgateway-devpass/grok-4-20-reasoning
+{"id":"grok-4-20-reasoning","providerID":"llmgateway-devpass","name":"Grok 4.20 Reasoning","variants":{}}
+llmgateway-devpass/grok-4-3
+{"id":"grok-4-3","providerID":"llmgateway-devpass","name":"Grok 4.3","variants":{}}
+llmgateway-devpass/grok-4-5
+{"id":"grok-4-5","providerID":"llmgateway-devpass","name":"Grok 4.5","variants":{}}
+llmgateway-devpass/grok-build-0-1
+{"id":"grok-build-0-1","providerID":"llmgateway-devpass","name":"Grok Build 0.1","variants":{}}
+llmgateway-devpass/hermes-4-405b
+{"id":"hermes-4-405b","providerID":"llmgateway-devpass","name":"Hermes 4 405B","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/hermes-4-70b
+{"id":"hermes-4-70b","providerID":"llmgateway-devpass","name":"Hermes 4 70B","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/kimi-k2
+{"id":"kimi-k2","providerID":"llmgateway-devpass","name":"Kimi K2","variants":{}}
+llmgateway-devpass/kimi-k2.5
+{"id":"kimi-k2.5","providerID":"llmgateway-devpass","name":"Kimi K2.5","variants":{}}
+llmgateway-devpass/kimi-k2.6
+{"id":"kimi-k2.6","providerID":"llmgateway-devpass","name":"Kimi K2.6","variants":{}}
+llmgateway-devpass/kimi-k2.7-code
+{"id":"kimi-k2.7-code","providerID":"llmgateway-devpass","name":"Kimi K2.7 Code","variants":{}}
+llmgateway-devpass/kimi-k2.7-code-highspeed
+{"id":"kimi-k2.7-code-highspeed","providerID":"llmgateway-devpass","name":"Kimi K2.7 Code Highspeed","variants":{}}
+llmgateway-devpass/kimi-k3
+{"id":"kimi-k3","providerID":"llmgateway-devpass","name":"Kimi K3","variants":{}}
+llmgateway-devpass/llama-3.3-70b-instruct
+{"id":"llama-3.3-70b-instruct","providerID":"llmgateway-devpass","name":"Llama 3.3 70B Instruct","variants":{}}
+llmgateway-devpass/llama-4-maverick-17b-instruct
+{"id":"llama-4-maverick-17b-instruct","providerID":"llmgateway-devpass","name":"Llama 4 Maverick 17B Instruct","variants":{}}
+llmgateway-devpass/mimo-v2.5
+{"id":"mimo-v2.5","providerID":"llmgateway-devpass","name":"MiMo V2.5","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/mimo-v2.5-pro
+{"id":"mimo-v2.5-pro","providerID":"llmgateway-devpass","name":"MiMo V2.5 Pro","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/minimax-m2
+{"id":"minimax-m2","providerID":"llmgateway-devpass","name":"MiniMax M2","variants":{}}
+llmgateway-devpass/minimax-m2.1
+{"id":"minimax-m2.1","providerID":"llmgateway-devpass","name":"MiniMax M2.1","variants":{}}
+llmgateway-devpass/minimax-m2.1-lightning
+{"id":"minimax-m2.1-lightning","providerID":"llmgateway-devpass","name":"MiniMax M2.1 Lightning","variants":{}}
+llmgateway-devpass/minimax-m2.5
+{"id":"minimax-m2.5","providerID":"llmgateway-devpass","name":"MiniMax M2.5","variants":{}}
+llmgateway-devpass/minimax-m2.5-highspeed
+{"id":"minimax-m2.5-highspeed","providerID":"llmgateway-devpass","name":"MiniMax M2.5 Highspeed","variants":{}}
+llmgateway-devpass/minimax-m2.7
+{"id":"minimax-m2.7","providerID":"llmgateway-devpass","name":"MiniMax M2.7","variants":{}}
+llmgateway-devpass/minimax-m2.7-highspeed
+{"id":"minimax-m2.7-highspeed","providerID":"llmgateway-devpass","name":"MiniMax M2.7 Highspeed","variants":{}}
+llmgateway-devpass/minimax-m3
+{"id":"minimax-m3","providerID":"llmgateway-devpass","name":"MiniMax M3","variants":{"none":{"thinking":{"type":"disabled"}},"thinking":{"thinking":{"type":"adaptive"}}}}
+llmgateway-devpass/minimax-text-01
+{"id":"minimax-text-01","providerID":"llmgateway-devpass","name":"MiniMax Text 01","variants":{}}
+llmgateway-devpass/muse-spark-1.1
+{"id":"muse-spark-1.1","providerID":"llmgateway-devpass","name":"Muse Spark 1.1","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/nemotron-3-nano-30b
+{"id":"nemotron-3-nano-30b","providerID":"llmgateway-devpass","name":"Nemotron 3 Nano 30B","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/nemotron-3-nano-omni
+{"id":"nemotron-3-nano-omni","providerID":"llmgateway-devpass","name":"Nemotron 3 Nano Omni","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/nemotron-3-super-120b
+{"id":"nemotron-3-super-120b","providerID":"llmgateway-devpass","name":"Nemotron 3 Super 120B","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/nemotron-3-ultra-550b
+{"id":"nemotron-3-ultra-550b","providerID":"llmgateway-devpass","name":"Nemotron 3 Ultra 550B","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/o4-mini
+{"id":"o4-mini","providerID":"llmgateway-devpass","name":"o4 Mini","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/qwen-coder-plus
+{"id":"qwen-coder-plus","providerID":"llmgateway-devpass","name":"Qwen Coder Plus","variants":{}}
+llmgateway-devpass/qwen-flash
+{"id":"qwen-flash","providerID":"llmgateway-devpass","name":"Qwen Flash","variants":{}}
+llmgateway-devpass/qwen-max
+{"id":"qwen-max","providerID":"llmgateway-devpass","name":"Qwen Max","variants":{}}
+llmgateway-devpass/qwen-max-latest
+{"id":"qwen-max-latest","providerID":"llmgateway-devpass","name":"Qwen Max Latest","variants":{}}
+llmgateway-devpass/qwen-plus
+{"id":"qwen-plus","providerID":"llmgateway-devpass","name":"Qwen Plus","variants":{}}
+llmgateway-devpass/qwen-plus-latest
+{"id":"qwen-plus-latest","providerID":"llmgateway-devpass","name":"Qwen Plus Latest","variants":{}}
+llmgateway-devpass/qwen3-235b-a22b-instruct-2507
+{"id":"qwen3-235b-a22b-instruct-2507","providerID":"llmgateway-devpass","name":"Qwen3 235B A22B Instruct 2507","variants":{}}
+llmgateway-devpass/qwen3-235b-a22b-thinking-2507
+{"id":"qwen3-235b-a22b-thinking-2507","providerID":"llmgateway-devpass","name":"Qwen3 235B A22B Thinking 2507","variants":{}}
+llmgateway-devpass/qwen3-30b-a3b-instruct-2507
+{"id":"qwen3-30b-a3b-instruct-2507","providerID":"llmgateway-devpass","name":"Qwen3 30B A3B Instruct 2507","variants":{}}
+llmgateway-devpass/qwen3-32b
+{"id":"qwen3-32b","providerID":"llmgateway-devpass","name":"Qwen3 32B","variants":{}}
+llmgateway-devpass/qwen3-coder-30b-a3b-instruct
+{"id":"qwen3-coder-30b-a3b-instruct","providerID":"llmgateway-devpass","name":"Qwen3 Coder 30B A3B Instruct","variants":{}}
+llmgateway-devpass/qwen3-coder-480b-a35b-instruct
+{"id":"qwen3-coder-480b-a35b-instruct","providerID":"llmgateway-devpass","name":"Qwen3 Coder 480B A35B Instruct","variants":{}}
+llmgateway-devpass/qwen3-coder-flash
+{"id":"qwen3-coder-flash","providerID":"llmgateway-devpass","name":"Qwen3 Coder Flash","variants":{}}
+llmgateway-devpass/qwen3-coder-next
+{"id":"qwen3-coder-next","providerID":"llmgateway-devpass","name":"Qwen3 Coder Next","variants":{}}
+llmgateway-devpass/qwen3-max
+{"id":"qwen3-max","providerID":"llmgateway-devpass","name":"Qwen3 Max","variants":{}}
+llmgateway-devpass/qwen3-next-80b-a3b-instruct
+{"id":"qwen3-next-80b-a3b-instruct","providerID":"llmgateway-devpass","name":"Qwen3 Next 80B A3B Instruct","variants":{}}
+llmgateway-devpass/qwen3-next-80b-a3b-thinking
+{"id":"qwen3-next-80b-a3b-thinking","providerID":"llmgateway-devpass","name":"Qwen3 Next 80B A3B Thinking","variants":{}}
+llmgateway-devpass/qwen3-vl-235b-a22b-instruct
+{"id":"qwen3-vl-235b-a22b-instruct","providerID":"llmgateway-devpass","name":"Qwen3 VL 235B A22B Instruct","variants":{}}
+llmgateway-devpass/qwen3-vl-30b-a3b-instruct
+{"id":"qwen3-vl-30b-a3b-instruct","providerID":"llmgateway-devpass","name":"Qwen3 VL 30B A3B Instruct","variants":{}}
+llmgateway-devpass/qwen3.5-9b
+{"id":"qwen3.5-9b","providerID":"llmgateway-devpass","name":"Qwen3.5 9B","variants":{}}
+llmgateway-devpass/qwen3.6-35b-a3b
+{"id":"qwen3.6-35b-a3b","providerID":"llmgateway-devpass","name":"Qwen3.6 35B A3B","variants":{}}
+llmgateway-devpass/qwen3.6-flash
+{"id":"qwen3.6-flash","providerID":"llmgateway-devpass","name":"Qwen3.6 Flash","variants":{}}
+llmgateway-devpass/qwen3.6-plus
+{"id":"qwen3.6-plus","providerID":"llmgateway-devpass","name":"Qwen3.6 Plus","variants":{}}
+llmgateway-devpass/qwen3.7-flash
+{"id":"qwen3.7-flash","providerID":"llmgateway-devpass","name":"Qwen3.7 Flash","variants":{}}
+llmgateway-devpass/qwen3.7-max
+{"id":"qwen3.7-max","providerID":"llmgateway-devpass","name":"Qwen3.7 Max","variants":{}}
+llmgateway-devpass/qwen3.7-plus
+{"id":"qwen3.7-plus","providerID":"llmgateway-devpass","name":"Qwen3.7 Plus","variants":{}}
+llmgateway-devpass/qwen35-397b-a17b
+{"id":"qwen35-397b-a17b","providerID":"llmgateway-devpass","name":"Qwen3.5 397B A17B","variants":{}}
+llmgateway-devpass/seed-1-6-250615
+{"id":"seed-1-6-250615","providerID":"llmgateway-devpass","name":"Seed 1.6 (250615)","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/seed-1-6-250915
+{"id":"seed-1-6-250915","providerID":"llmgateway-devpass","name":"Seed 1.6 (250915)","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/seed-1-6-flash-250715
+{"id":"seed-1-6-flash-250715","providerID":"llmgateway-devpass","name":"Seed 1.6 Flash (250715)","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/seed-1-8-251228
+{"id":"seed-1-8-251228","providerID":"llmgateway-devpass","name":"Seed 1.8 (251228)","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+`;
+
+function createSeededDevpassModels(): readonly DiscoveredCliModel[] {
+  return parseOpencodeModelsOutput(DEVPASS_SEEDED_CATALOG_RAW);
+}
+
 const SEEDED_CLI_MODELS: Readonly<
   Partial<Record<CliProviderId, readonly DiscoveredCliModel[]>>
 > = {
@@ -1153,6 +1457,7 @@ const SEEDED_CLI_MODELS: Readonly<
   // Regenerate by running `opencode models --verbose` through
   // discoverOpencodeModelsWithTimeout and re-pasting its output here.
   "opencode-cli": createSeededOpencodeModels(),
+  "devpass-cli": createSeededDevpassModels(),
   "cline-cli": createSeededClineModels(),
   // Snapshot of `kimi provider list --json`'s "models" map (kimi-code
   // 0.29.2, captured 2026-07-27 against the managed `kimi-code` OAuth
