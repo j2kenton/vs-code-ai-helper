@@ -85,6 +85,94 @@ void describe("TaskCreationStartupReconcilerV1 activation-barrier wiring", () =>
     );
   });
 
+  void it("extension.ts runs the stranded-deletion sweep inside startupGateReady, before beginClassification", () => {
+    // Plan §4.1 startup order: step 1 (resume Safe Delete journals) must
+    // complete before step 4 (classification), and AC-CREATE-STARTUP-03
+    // forbids fire-and-forget reconciliation anywhere in activation — the
+    // sweep clears the current-task checkpoint and refreshes inventory, so
+    // it must be awaited by the same barrier everything else waits on.
+    const content = readRepoFile("src/extension.ts");
+
+    assert.ok(
+      content.includes('resumeStrandedTaskDeletionsV1 } from "./commands/taskCreationRecovery"') ||
+        content.includes('resumeStrandedTaskDeletionsV1,'),
+      "extension.ts must import resumeStrandedTaskDeletionsV1 from taskCreationRecovery"
+    );
+
+    const sweepCallIndex = content.indexOf("resumeStrandedTaskDeletionsV1(");
+    assert.ok(sweepCallIndex >= 0, "could not find the resumeStrandedTaskDeletionsV1 call in extension.ts");
+
+    const chainIndex = content.indexOf("startupGateReady = Promise.all(strandedDeletionSweeps).then(");
+    assert.ok(
+      chainIndex >= 0,
+      "startupGateReady must be assigned from Promise.all(strandedDeletionSweeps).then(...) — the sweep is " +
+        "awaited by the barrier, never detached"
+    );
+
+    const classificationIndex = content.indexOf("TaskCreationStartupReconcilerV1.beginClassification(");
+    assert.ok(classificationIndex >= 0, "could not find beginClassification in extension.ts");
+
+    assert.ok(
+      sweepCallIndex < classificationIndex,
+      "the stranded-deletion sweep must precede beginClassification " +
+        `(sweep at ${sweepCallIndex}, classification at ${classificationIndex})`
+    );
+    assert.ok(
+      chainIndex < classificationIndex,
+      "beginClassification must be chained AFTER the sweeps inside the startupGateReady assignment " +
+        `(chain at ${chainIndex}, classification at ${classificationIndex})`
+    );
+
+    const statementEnd = content.indexOf(";", chainIndex);
+    assert.ok(
+      classificationIndex > chainIndex && classificationIndex < statementEnd,
+      "beginClassification must sit inside the startupGateReady = Promise.all(...).then(...) statement, " +
+        "so classification cannot begin until every sweep settles"
+    );
+  });
+
+  void it("startNewTask.ts allocates the work-<digest> staging directory through the path registry (plan §2.1/§4.2)", () => {
+    // The registry is the sole allocator under `creation-intents-v1/`
+    // (plan §2.1); `creationWorkDir` is its staging locator. A raw
+    // `work-${...}` template outside the registry would silently fork the
+    // path contract the §4.2 crash-recovery scanners rely on.
+    const content = readRepoFile("src/commands/startNewTask.ts");
+
+    assert.ok(
+      content.includes(".creationWorkDir("),
+      "startNewTask.ts must allocate the staging directory via WorkflowPathRegistryV1.creationWorkDir"
+    );
+    assert.ok(
+      content.includes("ensureWorkflowMetaRootV1("),
+      "startNewTask.ts must register the meta root before allocating the staging directory"
+    );
+
+    function walkProduction(dir: string, out: string[] = []): string[] {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          if (entry.name === "test" || entry.name === "test-host") continue;
+          walkProduction(full, out);
+        } else if (entry.isFile() && full.endsWith(".ts")) {
+          out.push(full);
+        }
+      }
+      return out;
+    }
+
+    for (const filePath of walkProduction(path.join(REPO_ROOT, "src"))) {
+      if (path.basename(filePath) === "workflowPathRegistryV1.ts") {
+        continue; // the registry itself is the one legitimate template site.
+      }
+      const fileContent = fs.readFileSync(filePath, "utf8");
+      assert.ok(
+        !fileContent.includes("`work-${"),
+        `${path.relative(REPO_ROOT, filePath)} hand-builds a work-<digest> staging path — allocation belongs to ` +
+          "WorkflowPathRegistryV1.creationWorkDir alone (plan §2.1)"
+      );
+    }
+  });
+
   void it("taskInventory.ts self-gates refresh() on waitUntilReady() before its first discovery read", () => {
     // Defense-in-depth beyond the extension.ts call-site chains asserted
     // above: TaskInventory.refresh() awaits the barrier internally, so a

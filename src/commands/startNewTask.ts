@@ -27,7 +27,11 @@ import {
   taskCreationIntentDigestV1,
 } from "../services/taskCreationIntentStoreV1";
 import { fileCreationIntentEntryV1, TaskCreationIntentEntryV1 } from "../types/taskCreationIntentV1";
-import { CREATION_INTENTS_DIRNAME_V1 } from "../services/workflowPrivacyClassifierV1";
+import {
+  ensureWorkflowMetaRootV1,
+  getWorkflowPathRegistryV1,
+  resolveWorkflowAllocatedFsPathV1,
+} from "../services/workflowRuntimeServicesV1";
 
 /**
  * Describe a `TaskCreationIntentStoreResultV1` for a diagnostics log line.
@@ -397,18 +401,18 @@ async function createTask(
       })
     );
     const digest = taskCreationIntentDigestV1(taskFolderPath);
-    // Staging lives under `creation-intents-v1/work-<digest>` (plan §4.2,
-    // matching `WorkflowPathRegistryV1.creationWorkDir`'s own locator) rather
-    // than directly under the meta root — nesting it there keeps a crashed
-    // staging folder out of both `discoverTasksInRoot` (taskRoot.ts) and
-    // `classifyMetaRoot` (taskCreationStartupReconcilerV1.ts), which only
+    // Staging is ALLOCATED by the path registry (plan §2.1: the registry is
+    // the sole allocator under `creation-intents-v1/`): `creationWorkDir`
+    // yields `creation-intents-v1/work-<digest>`. Nesting it there keeps a
+    // crashed staging folder out of both `discoverTasksInRoot` (taskRoot.ts)
+    // and `classifyMetaRoot` (taskCreationStartupReconcilerV1.ts), which only
     // scan the meta root's DIRECT children, so it can never surface as a
-    // phantom task or a duplicate recovery node.
-    const workFolderUri = vscode.Uri.joinPath(
-      vscode.Uri.file(metaFolderPath),
-      CREATION_INTENTS_DIRNAME_V1,
-      `work-${digest}`
-    );
+    // phantom task or a duplicate recovery node (plan §4.2). Registration is
+    // fail-loud here — unlike the best-effort journal writes above, a staging
+    // path we cannot allocate means task creation cannot proceed safely.
+    const metaRootId = ensureWorkflowMetaRootV1(metaFolderPath);
+    const workDirAllocation = getWorkflowPathRegistryV1().creationWorkDir(metaRootId, digest);
+    const workFolderUri = vscode.Uri.file(resolveWorkflowAllocatedFsPathV1(workDirAllocation));
 
     await vscode.workspace.fs.createDirectory(workFolderUri);
 

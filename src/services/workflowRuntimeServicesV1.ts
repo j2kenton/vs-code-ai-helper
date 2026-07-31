@@ -44,10 +44,12 @@ import {
 } from "./workflowFileStoreV1";
 import {
   createWorkflowPathRegistryV1,
+  WorkflowAllocatedPathV1,
   WorkflowPathRegistryV1,
 } from "./workflowPathRegistryV1";
 import {
   classifyWorkflowRootV1,
+  resolveWorkflowFsPathV1,
   WorkflowRootV1,
 } from "./workflowPathSafetyV1";
 
@@ -570,6 +572,37 @@ export function ensureWorkflowMetaRootV1(fsPath: string): string {
     rebuildFileStore();
   }
   return rootId;
+}
+
+/**
+ * Resolve a registry-allocated locator to an absolute filesystem path.
+ *
+ * For consumers that need an allocated path as a raw fsPath/URI (directory
+ * staging via `vscode.workspace.fs`, for example) rather than through the
+ * file store's own operations. Throws on an unregistered root or a locator
+ * that fails path-safety resolution — both are programmer errors for a
+ * registry-vended `WorkflowAllocatedPathV1`, never runtime conditions
+ * (plan §2.1: the registry is the sole allocator; a locator it produced
+ * must resolve under the root it named).
+ */
+export function resolveWorkflowAllocatedFsPathV1(allocated: WorkflowAllocatedPathV1): string {
+  const root = registry
+    .registeredRoots()
+    .find((candidate) => candidate.rootId === allocated.locator.rootId);
+  if (!root) {
+    throw new Error(
+      `Cannot resolve allocated workflow path ${JSON.stringify(allocated.locator.relativePath)}: ` +
+        `root ${JSON.stringify(allocated.locator.rootId)} is not registered.`
+    );
+  }
+  const resolution = resolveWorkflowFsPathV1(root, allocated.locator.relativePath);
+  if (!resolution.ok) {
+    throw new Error(
+      `Cannot resolve allocated workflow path ${JSON.stringify(allocated.locator.relativePath)} ` +
+        `under root ${JSON.stringify(allocated.locator.rootId)}: ${resolution.reason}.`
+    );
+  }
+  return resolution.fsPath;
 }
 
 /**

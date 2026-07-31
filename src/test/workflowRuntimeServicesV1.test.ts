@@ -27,6 +27,7 @@ import {
   getWorkflowPathRegistryV1,
   isWorkflowTaskFolderRootVerifiedV1,
   resetWorkflowRuntimeServicesForTestV1,
+  resolveWorkflowAllocatedFsPathV1,
 } from "../services/workflowRuntimeServicesV1";
 import { computeTaskBindingIdV1 } from "../types/taskBindingV1";
 import { TASK_PROGRESS_FILENAME } from "../types/taskProgress";
@@ -474,5 +475,44 @@ void describe("workflowRuntimeServicesV1 — dedicated non-task storage roots", 
     } finally {
       fs.rmSync(folder, { recursive: true, force: true });
     }
+  });
+});
+
+void describe("workflowRuntimeServicesV1 — resolveWorkflowAllocatedFsPathV1", () => {
+  void it("resolves a registry-vended locator to the absolute path under its registered root", () => {
+    resetWorkflowRuntimeServicesForTestV1();
+    const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-workflow-runtime-ws-"));
+    const folder = fs.mkdtempSync(path.join(workspaceRoot, "ensemble-workflow-runtime-"));
+    const stub = installWorkspaceFoldersStub([workspaceRoot]);
+    try {
+      const ownership = {
+        metaRoot: path.join(workspaceRoot, ".ensemble"),
+        projectRoot: workspaceRoot,
+        workspaceRoot,
+        boundAt: "2026-07-01T09:00:00.000Z",
+        state: "resolved" as const,
+      };
+      writeProgress(folder, { ownership });
+      const rootId = ensureWorkflowTaskFolderRootV1(folder);
+      const allocated = getWorkflowPathRegistryV1().taskChatFile(rootId);
+      const resolved = resolveWorkflowAllocatedFsPathV1(allocated);
+      assert.equal(resolved, path.join(path.resolve(folder), "chat-v1.json"));
+    } finally {
+      stub.restore();
+      fs.rmSync(folder, { recursive: true, force: true });
+      fs.rmSync(workspaceRoot, { recursive: true, force: true });
+    }
+  });
+
+  void it("throws for a locator naming an unregistered root — never silently invents a base path", () => {
+    resetWorkflowRuntimeServicesForTestV1();
+    assert.throws(
+      () =>
+        resolveWorkflowAllocatedFsPathV1({
+          locator: { rootId: "not-a-registered-root", relativePath: "chat-v1.json" },
+          classification: "chatPrivate",
+        }),
+      /not registered/
+    );
   });
 });
