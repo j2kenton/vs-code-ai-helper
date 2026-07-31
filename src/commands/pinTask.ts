@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import { TaskInventory } from "../state/taskInventory";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
-import { patchTaskProgress } from "../utils/taskProgressUtils";
+import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { IncompleteTask } from "../types/incompleteTask";
 import { MAX_PINNED_TASKS } from "../types/taskProgress";
 import { NotificationRouter } from "../utils/notificationRouter";
@@ -66,7 +66,7 @@ export async function pinTask(
   if (pinned.length >= MAX_PINNED_TASKS) {
     const oldest = pinned[0];
     if (oldest) {
-      await patchTaskProgress(vscode.Uri.file(oldest.taskFolderPath), (current) => ({
+      await patchTaskProgressStrictV1(vscode.Uri.file(oldest.taskFolderPath), (current) => ({
         ...current,
         pinnedAt: undefined,
       }));
@@ -76,7 +76,7 @@ export async function pinTask(
     }
   }
 
-  await patchTaskProgress(vscode.Uri.file(resolved.taskFolderPath), (current) => ({
+  await patchTaskProgressStrictV1(vscode.Uri.file(resolved.taskFolderPath), (current) => ({
     ...current,
     pinnedAt: new Date().toISOString(),
   }));
@@ -103,7 +103,7 @@ export async function unpinTask(
     NotificationRouter.showInformation("Task is not pinned.");
     return;
   }
-  await patchTaskProgress(vscode.Uri.file(resolved.taskFolderPath), (current) => ({
+  await patchTaskProgressStrictV1(vscode.Uri.file(resolved.taskFolderPath), (current) => ({
     ...current,
     pinnedAt: undefined,
   }));

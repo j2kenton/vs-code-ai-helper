@@ -3,7 +3,8 @@ import * as fs from "fs";
 import * as path from "path";
 import { TaskInventory } from "../state/taskInventory";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
-import { patchTaskProgress, readTaskProgress } from "../utils/taskProgressUtils";
+import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
+import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { IncompleteTask } from "../types/incompleteTask";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
@@ -64,7 +65,8 @@ type PickerRootResolution =
  * same absolute folder.
  */
 async function resolvePickerRoot(taskFolderUri: vscode.Uri): Promise<PickerRootResolution> {
-  const progress = await readTaskProgress(taskFolderUri);
+  const readResult = await readTaskProgressStrictV1(taskFolderUri);
+  const progress = readResult.ok ? readResult.decoded.progress : undefined;
   const projectRoot = progress?.ownership?.projectRoot?.trim();
   if (projectRoot) {
     // The task schema records an absolute binding.  A relative value would
@@ -162,7 +164,7 @@ export async function promptAndPersistPublishScope(
     return undefined;
   }
 
-  await patchTaskProgress(taskFolderUri, (progress) => ({
+  await patchTaskProgressStrictV1(taskFolderUri, (progress) => ({
     ...progress,
     publishScopePath: picked.relPath || undefined,
     updatedAt: new Date().toISOString(),
@@ -208,9 +210,11 @@ export async function choosePublishScope(
   // The persisted value is already relative to the picker root (workspace
   // folder or ownership projectRoot), so it is the right display form for
   // external-metadata-root tasks too.
-  const stored = await readTaskProgress(taskFolderUri);
+  const stored = await readTaskProgressStrictV1(taskFolderUri);
   NotificationRouter.showInformation(
-    `Publish verification scope set to ${stored?.publishScopePath ?? "the project root"}.`
+    `Publish verification scope set to ${
+      (stored.ok ? stored.decoded.progress.publishScopePath : undefined) ?? "the project root"
+    }.`
   );
 }
 

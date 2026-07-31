@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import { EscalationKind, STAGE_DISPLAY_NAMES, TaskProgress, TaskStage } from "../types/taskProgress";
-import { patchTaskProgress } from "./taskProgressUtils";
+import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { recordEscalation, updateTaskStatus } from "./taskProgressTransforms";
 import { NotificationRouter } from "./notificationRouter";
 import { normalizePath } from "./taskRoot";
@@ -58,7 +58,7 @@ export async function escalateReviewToHuman(
 ): Promise<boolean> {
   try {
     let applied = false;
-    await patchTaskProgress(folderUri, (current) => {
+    await patchTaskProgressStrictV1(folderUri, (current) => {
       // Terminal-status guard: a task the user has already completed or
       // archived must never be forced back to "paused" by an escalation
       // decision that was computed against an earlier, now-stale snapshot

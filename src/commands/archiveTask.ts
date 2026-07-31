@@ -3,7 +3,7 @@ import { TaskInventory } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { activateTask } from "../state/taskActivationCoordinator";
-import { patchTaskProgress } from "../utils/taskProgressUtils";
+import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { IncompleteTask } from "../types/incompleteTask";
 import { MAX_PINNED_TASKS, TaskProgress, TaskStatus } from "../types/taskProgress";
 import { NotificationRouter } from "../utils/notificationRouter";
@@ -109,7 +109,7 @@ export async function archiveTask(
       resolved.taskFolderPath,
       { label: "Archive Task", taskName: resolved.folderName, kind: "pause-task" },
       async () => {
-        const patched = await patchTaskProgress(taskUri, (current) => ({
+        const patched = await patchTaskProgressStrictV1(taskUri, (current) => ({
           ...current,
           status: "archived" as TaskStatus,
           archivedFrom: current.status ?? "active",

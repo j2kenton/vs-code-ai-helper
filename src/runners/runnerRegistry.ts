@@ -41,7 +41,7 @@ import {
 } from "../config/settings";
 import { chooseFallback, getBackupModels } from "../utils/modelFallback";
 import { isAuthenticationFailure, recordQuotaObservation } from "../utils/quota";
-import { patchTaskProgress } from "../utils/taskProgressUtils";
+import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { clearStageFallbackReservation } from "../utils/taskProgressTransforms";
 import { TaskStage } from "../types/taskProgress";
 import { assertNoUnauthorizedV1CorrelationV0 } from "../services/legacyAiActionSafetyGateV0";
@@ -300,7 +300,7 @@ export async function recordActiveFallbackModel(
   } = {}
 ): Promise<boolean> {
   let recorded = false;
-  await patchTaskProgress(taskFolderUri, (current) => {
+  await patchTaskProgressStrictV1(taskFolderUri, (current) => {
     if (
       options.expectedReviewAttemptId !== undefined &&
       current.reviewAttemptId !== options.expectedReviewAttemptId
@@ -364,7 +364,7 @@ async function reserveFallback(
   expectedReviewAttemptId?: string
 ): Promise<boolean> {
   let activated = false;
-  await patchTaskProgress(taskFolderUri, (current) => {
+  await patchTaskProgressStrictV1(taskFolderUri, (current) => {
     if (
       expectedReviewAttemptId !== undefined &&
       current.reviewAttemptId !== expectedReviewAttemptId
@@ -407,7 +407,7 @@ async function releaseUnresolvedFallbackReservation(
   stage: TaskStage,
   expectedReviewAttemptId?: string
 ): Promise<void> {
-  await patchTaskProgress(taskFolderUri, (current) => {
+  await patchTaskProgressStrictV1(taskFolderUri, (current) => {
     if (
       expectedReviewAttemptId !== undefined &&
       current.reviewAttemptId !== expectedReviewAttemptId

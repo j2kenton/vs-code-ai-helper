@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import { patchTaskProgress } from "../utils/taskProgressUtils";
+import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { updateTaskProgressStage } from "../utils/taskProgressTransforms";
 import { IncompleteTask } from "../types/incompleteTask";
 import {
@@ -402,7 +402,7 @@ async function handleGeneratePlanOutcomeV1(
     // tree/progress indicator and review eligibility stay aligned with what
     // actually runs next.
     const destinationStage: TaskStage = ctx.effectiveReviewMode !== "off" ? "plan-high-review" : "plan";
-    await patchTaskProgress(taskFolderUri, (existing) => {
+    await patchTaskProgressStrictV1(taskFolderUri, (existing) => {
       if (!ELIGIBLE_STAGES.includes(existing.currentStage)) {
         return existing;
       }

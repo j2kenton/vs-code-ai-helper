@@ -16,7 +16,7 @@ import {
   isReviewStage,
   TaskStage,
 } from "../types/taskProgress";
-import { patchTaskProgress } from "./taskProgressUtils";
+import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { updateTaskProgressStage } from "./taskProgressTransforms";
 
 // The disk-level CAS below protects multiple windows. This in-memory queue
@@ -191,12 +191,12 @@ async function advanceStageLocked(
   // Short-circuit: no-op when source and destination are the same
   if (sourceStage === newStage) {
     if (expectedReviewAttemptId !== undefined) {
-      const current = await patchTaskProgress(taskFolderUri, (progress) => {
+      const current = await patchTaskProgressStrictV1(taskFolderUri, (progress) => {
         if (progress.currentStage !== sourceStage || progress.reviewAttemptId !== expectedReviewAttemptId) {
           throw new Error("Review result is stale; a newer review attempt owns this transition.");
         }
         return progress;
-      }, false, publishArtifact);
+      }, { beforeWrite: publishArtifact });
       if (!current) return undefined;
     } else if (publishArtifact) {
       await publishArtifact();
@@ -211,7 +211,7 @@ async function advanceStageLocked(
   // Persist the stage transition before any other action.
   // patchTaskProgress preserves all unrelated fields (implReviewFiles,
   // scheduledAt, lintPayload, status, etc.).
-  const patched = await patchTaskProgress(taskFolderUri, (current) => {
+  const patched = await patchTaskProgressStrictV1(taskFolderUri, (current) => {
     // Compare-and-set the source stage inside the task lock. This prevents a
     // delayed review/shortcut from advancing a newer run a second time.
     if (current.currentStage !== sourceStage) {
@@ -223,7 +223,7 @@ async function advanceStageLocked(
       throw new Error("Review result is stale; a newer review attempt owns this transition.");
     }
     return updateTaskProgressStage(current, newStage);
-  }, false, publishArtifact);
+  }, { beforeWrite: publishArtifact });
 
   if (!patched) {
     return undefined;

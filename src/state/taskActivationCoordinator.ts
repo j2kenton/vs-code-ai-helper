@@ -2,7 +2,8 @@ import * as vscode from "vscode";
 import { TaskInventory } from "./taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { NotificationRouter } from "../utils/notificationRouter";
-import { patchTaskProgress, readTaskProgress } from "../utils/taskProgressUtils";
+import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
+import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { updateTaskStatus } from "../utils/taskProgressTransforms";
 import { withMetaRootLock } from "./taskStateStore";
 import type { TaskProgress, TaskStatus } from "../types/taskProgress";
@@ -143,9 +144,10 @@ async function activateTaskLocked(
   for (const task of inventory.getTasks()) {
     if (task.taskFolderPath !== taskFolderPath &&
         (task.progress.status === "active" || task.progress.status === "creating")) {
-      const paused = await patchTaskProgress(
+      const paused = await patchTaskProgressStrictV1(
         vscode.Uri.file(task.taskFolderPath),
-        (current) => updateTaskStatus(current, "paused"), true
+        (current) => updateTaskStatus(current, "paused"),
+        { skipLock: true }
       );
       if (!paused) {
         await rollback(previous, changed);
@@ -170,10 +172,10 @@ async function activateTaskLocked(
   try {
     activated = options?.writeTarget
       ? await options.writeTarget()
-      : await patchTaskProgress(
+      : await patchTaskProgressStrictV1(
           vscode.Uri.file(taskFolderPath),
           (current) => updateTaskStatus(options?.mutateTarget ? options.mutateTarget(current) : current, "active"),
-          true
+          { skipLock: true }
         );
   } catch (error) {
     if (error instanceof StaleReopenError) {
@@ -240,7 +242,7 @@ function warnBestEffort(message: string): void {
 async function rollback(previous: Array<{ taskFolderPath: string; status: string }>, changed: string[]): Promise<void> {
   for (const folder of changed) {
     const old = previous.find(item => item.taskFolderPath === folder);
-    if (old) await patchTaskProgress(vscode.Uri.file(folder), current => updateTaskStatus(current, old.status as TaskStatus), true);
+    if (old) await patchTaskProgressStrictV1(vscode.Uri.file(folder), current => updateTaskStatus(current, old.status as TaskStatus), { skipLock: true });
   }
 }
 
@@ -268,10 +270,11 @@ async function resolveTargetWritePending(
   checkpoint: Omit<ActivationCheckpoint, "checksum">,
   currentTaskStore: CurrentTaskStore
 ): Promise<"forward" | "back" | "ambiguous"> {
-  const targetProgress = await readTaskProgress(vscode.Uri.file(checkpoint.targetTaskFolderPath));
-  if (!targetProgress) {
+  const targetRead = await readTaskProgressStrictV1(vscode.Uri.file(checkpoint.targetTaskFolderPath));
+  if (!targetRead.ok) {
     return "ambiguous";
   }
+  const targetProgress = targetRead.decoded.progress;
 
   if (targetProgress.status === "active") {
     await writeActivationCheckpoint(root, { ...checkpoint, phase: "target-activated" });
@@ -345,7 +348,7 @@ async function ensureNoPendingActivation(
   for (const folder of checkpoint.pausedFolders) {
     const old = checkpoint.previousStatuses.find(item => item.taskFolderPath === folder);
     if (old) {
-      await patchTaskProgress(vscode.Uri.file(folder), current => updateTaskStatus(current, old.status as TaskStatus), true);
+      await patchTaskProgressStrictV1(vscode.Uri.file(folder), current => updateTaskStatus(current, old.status as TaskStatus), { skipLock: true });
     }
   }
   await clearActivationCheckpoint(root);
@@ -414,7 +417,7 @@ async function recoverActivationCheckpointLocked(
   for (const folder of checkpoint.pausedFolders) {
     const old = checkpoint.previousStatuses.find(item => item.taskFolderPath === folder);
     if (old) {
-      await patchTaskProgress(vscode.Uri.file(folder), current => updateTaskStatus(current, old.status as TaskStatus));
+      await patchTaskProgressStrictV1(vscode.Uri.file(folder), current => updateTaskStatus(current, old.status as TaskStatus));
     }
   }
   await clearActivationCheckpoint(root);

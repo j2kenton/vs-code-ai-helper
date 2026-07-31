@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import { TaskInventory } from "../state/taskInventory";
 import { TASK_DESCRIPTION_FILENAME, TASK_FILENAME } from "../types/taskProgress";
-import { patchTaskProgress } from "../utils/taskProgressUtils";
+import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { runTrackedOperation } from "../utils/taskOperations";
 import { parseTaskDocument } from "../utils/taskDescriptionDocument";
@@ -52,7 +52,7 @@ export async function renameTask(
     task.taskFolderPath,
     { label: "Rename Task", taskName: task.folderName, kind: "rename-task" },
     async (op) => {
-      await patchTaskProgress(vscode.Uri.file(task.taskFolderPath), (current) => ({
+      await patchTaskProgressStrictV1(vscode.Uri.file(task.taskFolderPath), (current) => ({
         ...current,
         displayName: name.trim(),
         nameIsDefault: false,

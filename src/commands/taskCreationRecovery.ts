@@ -2,7 +2,7 @@ import * as vscode from "vscode";
 import * as path from "path";
 import { createHash } from "crypto";
 import { TASK_FILENAME, TASK_PROGRESS_FILENAME, TaskStatus } from "../types/taskProgress";
-import { createTaskProgress, writeTaskProgress } from "../utils/taskProgressUtils";
+import { createTaskProgressV1, writeTaskProgressV1 } from "../services/taskProgressWriterV1";
 import { IncompleteTask } from "../types/incompleteTask";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import { normalizePath } from "../utils/taskRoot";
@@ -210,13 +210,13 @@ export async function retryTaskCreation(
             ? existingProgressResult.decoded.progress.createdAt
             : undefined;
           const progress = {
-            ...createTaskProgress(taskFolderName, "desc"),
+            ...createTaskProgressV1(taskFolderName, "desc"),
             ...(existingCreatedAt ? { createdAt: existingCreatedAt } : {}),
             displayName: taskFolderName,
             nameIsDefault: true,
             ownership,
           };
-          await writeTaskProgress(taskFolderUri, progress);
+          await writeTaskProgressV1(taskFolderUri, progress);
           // "Never overwrites an existing entry" (plan §4.5): `fresh` can be
           // retryWithoutAdoptionEligible with task.md ALREADY present — the
           // journal-verified branch also covers a folder that reached
@@ -245,7 +245,7 @@ export async function retryTaskCreation(
             commitCreationSentinelV1(metaFolderPath, taskFolderPath)
           );
 
-          await writeTaskProgress(taskFolderUri, { ...progress, status: initialStatus });
+          await writeTaskProgressV1(taskFolderUri, { ...progress, status: initialStatus });
           const finalProgressEntry = await tryReadCreatedFileEntryV1(
             vscode.Uri.joinPath(taskFolderUri, TASK_PROGRESS_FILENAME),
             TASK_PROGRESS_FILENAME,
@@ -514,7 +514,7 @@ export async function adoptAndRetryTaskCreation(
           // task.md is left completely untouched — only task-progress.json is
           // rewritten, exactly like Retry's tail (plan §4.5: "never replaces
           // task.md").
-          await writeTaskProgress(taskFolderUri, { ...progress, status: initialStatus });
+          await writeTaskProgressV1(taskFolderUri, { ...progress, status: initialStatus });
 
           return { ok: true as const, initialStatus, workspaceRoot: ownership.workspaceRoot };
         });

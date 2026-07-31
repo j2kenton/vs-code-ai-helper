@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import { TaskInventory } from "../state/taskInventory";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
-import { patchTaskProgress } from "../utils/taskProgressUtils";
+import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { updateLintPayload } from "../utils/taskProgressTransforms";
 import { IncompleteTask } from "../types/incompleteTask";
 import { NotificationRouter } from "../utils/notificationRouter";
@@ -203,7 +203,7 @@ export async function runLintingFixes(
     passed: boolean,
     summary: string
   ): Promise<void> => {
-    await patchTaskProgress(taskFolderUri, (current) =>
+    await patchTaskProgressStrictV1(taskFolderUri, (current) =>
       updateLintPayload(current, {
         runAt: new Date().toISOString(),
         passed,

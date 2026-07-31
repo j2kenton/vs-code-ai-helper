@@ -1,7 +1,8 @@
 import * as vscode from "vscode";
 import { spawn, execSync, execFileSync } from "child_process";
 import * as crypto from "crypto";
-import { patchTaskProgress, readTaskProgress } from "./taskProgressUtils";
+import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
+import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { updateLintPayload } from "./taskProgressTransforms";
 import * as fs from "fs";
 import * as path from "path";
@@ -1228,7 +1229,8 @@ export async function collectCompletionLintPreview(
   const includeAiPlanVerification = options?.includeAiPlanVerification ?? true;
   // Verify against the task's Publish scope (persisted per task; defaults to
   // the workspace folder containing the task), never just the task folder.
-  const progress = await readTaskProgress(folderUri);
+  const readResult = await readTaskProgressStrictV1(folderUri);
+  const progress = readResult.ok ? readResult.decoded.progress : undefined;
   const scope = resolvePublishScopeFolder(folderUri, progress);
   let scopeFolder = scope.folder;
   if (scope.stale) {
@@ -1290,7 +1292,7 @@ export async function collectCompletionLintPreview(
  */
 export async function runCompletionLint(folderUri: vscode.Uri, relevantFiles?: readonly string[]): Promise<CompletionLintResult> {
   const result = await collectCompletionLintPreview(folderUri, relevantFiles, { allowScopePrompt: true });
-  const persisted = await patchTaskProgress(folderUri, (current) => updateLintPayload(current, {
+  const persisted = await patchTaskProgressStrictV1(folderUri, (current) => updateLintPayload(current, {
     runAt: result.runAt,
     passed: result.passed,
     summary: result.summary,

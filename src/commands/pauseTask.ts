@@ -2,7 +2,7 @@ import * as vscode from "vscode";
 import { TaskInventory } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
-import { patchTaskProgress } from "../utils/taskProgressUtils";
+import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { updateTaskStatus } from "../utils/taskProgressTransforms";
 import { IncompleteTask } from "../types/incompleteTask";
 
@@ -142,7 +142,7 @@ export async function pauseTask(
       resolvedTask.taskFolderPath,
       { label: "Pause Task", taskName: resolvedTask.folderName, kind: "pause-task" },
       async () => {
-        const patched = await patchTaskProgress(taskUri, (current) =>
+        const patched = await patchTaskProgressStrictV1(taskUri, (current) =>
           updateTaskStatus(current, "paused")
         );
         if (!patched) {

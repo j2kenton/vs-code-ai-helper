@@ -2,7 +2,7 @@ import * as vscode from "vscode";
 import { TaskInventory } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { resolveTaskContext, ResolvedTaskContext } from "../utils/resolveTaskContext";
-import { patchTaskProgress } from "../utils/taskProgressUtils";
+import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { clearEscalation } from "../utils/taskProgressTransforms";
 import { IncompleteTask } from "../types/incompleteTask";
 import { STAGE_DISPLAY_NAMES } from "../types/taskProgress";
@@ -151,7 +151,7 @@ export async function resumePausedTask(
         // escalation left behind here would otherwise linger in the task
         // tree and (once the task plateaus again) skew
         // secondOpinionTriedThisPlateau against a fresh attempt.
-        await patchTaskProgress(
+        await patchTaskProgressStrictV1(
           vscode.Uri.file(resolvedTask.taskFolderPath),
           (current) => clearEscalation(current)
         );

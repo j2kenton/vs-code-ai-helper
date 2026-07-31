@@ -4,7 +4,7 @@ import { CurrentTaskStore } from "./currentTaskStore";
 import * as fs from "fs";
 import * as path from "path";
 import { taskRefFromResolved, TaskRef } from "../types/taskRef";
-import { patchTaskProgress } from "./taskProgressUtils";
+import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { resolveTaskRootCandidates } from "./taskRoot";
 
 /**
@@ -106,7 +106,7 @@ async function resolveAmbiguousOwnership(
     return undefined;
   }
 
-  const patched = await patchTaskProgress(vscode.Uri.file(task.taskFolderPath), (current) => ({
+  const patched = await patchTaskProgressStrictV1(vscode.Uri.file(task.taskFolderPath), (current) => ({
     ...current,
     ownership: {
       metaRoot: current.ownership?.metaRoot ?? path.resolve(task.taskFolderPath, ".."),

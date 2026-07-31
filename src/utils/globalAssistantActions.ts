@@ -2,7 +2,7 @@ import * as vscode from "vscode";
 import * as path from "path";
 import { TaskInventory, TaskWithProgress } from "../state/taskInventory";
 import { CurrentTaskStore } from "./currentTaskStore";
-import { patchTaskProgress } from "./taskProgressUtils";
+import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import {
   STAGE_DISPLAY_NAMES,
   TASK_DESCRIPTION_FILENAME,
@@ -74,7 +74,7 @@ async function archiveOneTask(
   if (!cancelResult.ok) {
     return cancelResult.reason ?? "running operation could not be cancelled";
   }
-  const patched = await patchTaskProgress(vscode.Uri.file(task.taskFolderPath), (current) => ({
+  const patched = await patchTaskProgressStrictV1(vscode.Uri.file(task.taskFolderPath), (current) => ({
     ...current,
     status: "archived" as TaskStatus,
     archivedFrom: current.status ?? "active",
@@ -194,7 +194,7 @@ const repairStuckTask: GlobalAssistantOperation = {
     }
     const label = task.progress.displayName ?? task.folderName;
     try {
-      const patched = await patchTaskProgress(vscode.Uri.file(task.taskFolderPath), (current) => ({
+      const patched = await patchTaskProgressStrictV1(vscode.Uri.file(task.taskFolderPath), (current) => ({
         ...current,
         scheduledRun: undefined,
         scheduledResumeTime: undefined,
@@ -397,7 +397,7 @@ const createTask: GlobalAssistantOperation = {
       const notes: string[] = [];
       if (created && parsed.title?.trim()) {
         const title = parsed.title.trim().slice(0, 120);
-        await patchTaskProgress(vscode.Uri.file(created.taskFolderPath), (current) => ({
+        await patchTaskProgressStrictV1(vscode.Uri.file(created.taskFolderPath), (current) => ({
           ...current,
           displayName: title,
           nameIsDefault: false,
@@ -544,7 +544,7 @@ const renameTaskOperation: GlobalAssistantOperation = {
         task.taskFolderPath,
         { label: "Rename Task", taskName: task.folderName, kind: "rename-task" },
         async (op) => {
-          await patchTaskProgress(vscode.Uri.file(task.taskFolderPath), (current) => ({
+          await patchTaskProgressStrictV1(vscode.Uri.file(task.taskFolderPath), (current) => ({
             ...current,
             displayName: newName,
             nameIsDefault: false,

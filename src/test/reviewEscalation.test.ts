@@ -72,7 +72,11 @@ function makeTaskFolderUri(name: string): vscode.Uri {
 
 function seedProgress(store: MemStore, folderUri: vscode.Uri, progress: TaskProgress): void {
   const uri = vscode.Uri.joinPath(folderUri, "task-progress.json");
-  store.set(uri.toString(), JSON.stringify(progress, null, 2));
+  // The strict patch (§3.12 cutover) validates taskFolder self-names the
+  // folder — fixtures must agree with the directory they are seeded into,
+  // or every write declines for the wrong reason.
+  const named: TaskProgress = { ...progress, taskFolder: path.basename(folderUri.fsPath) };
+  store.set(uri.toString(), JSON.stringify(named, null, 2));
 }
 
 function readProgress(store: MemStore, folderUri: vscode.Uri): TaskProgress {

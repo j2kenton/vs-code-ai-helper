@@ -13,7 +13,7 @@ import { safeOpenTextDocument } from "../utils/fileUtils";
 import { ChatViewProvider, ChatInteractionRefV1, ChatInteractionResumeResultV1 } from "../views/chatView";
 import { assertLegacyAiRouteAllowedV0 } from "../services/legacyAiActionSafetyGateV0";
 
-import { patchTaskProgress } from "../utils/taskProgressUtils";
+import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { IncompleteTask } from "../types/incompleteTask";
 import {
   linkCancellationTokens,
@@ -271,7 +271,7 @@ async function handleDraftOutcomeV1(
         .map((line) => line.trim())
         .find((line) => line.length > 0 && !line.startsWith("#") && !line.startsWith(">"));
       if (title) {
-        await patchTaskProgress(taskFolderUri, (current) => ({
+        await patchTaskProgressStrictV1(taskFolderUri, (current) => ({
           ...current,
           displayName: title.slice(0, 120),
           // An AI-derived summary replaces the generated folder-name label.

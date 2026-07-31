@@ -2,7 +2,7 @@ import * as vscode from "vscode";
 import { TaskInventory } from "../state/taskInventory";
 import { TaskProgress } from "../types/taskProgress";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
-import { patchTaskProgress } from "../utils/taskProgressUtils";
+import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
 
@@ -19,7 +19,7 @@ export interface SchedulerProgressStore {
 }
 
 export const systemSchedulerClock: SchedulerClock = { now: () => Date.now(), setTimeout, clearTimeout };
-const progressStore: SchedulerProgressStore = { patch: patchTaskProgress };
+const progressStore: SchedulerProgressStore = { patch: patchTaskProgressStrictV1 };
 const MAX_TIMER_DELAY = 0x7fffffff;
 const LEASE_DURATION_MS = 60 * 60 * 1000;
 
@@ -188,7 +188,7 @@ export async function scheduleTaskResume(
     if (value) NotificationRouter.showWarning("Enter a future date/time.");
     return;
   }
-  await patchTaskProgress(vscode.Uri.file(task.taskFolderPath), p => ({ ...p, scheduledRun: { runAt: runAt.toISOString(), stage: p.currentStage }, scheduledResumeTime: undefined, updatedAt: new Date(clock.now()).toISOString() }));
+  await patchTaskProgressStrictV1(vscode.Uri.file(task.taskFolderPath), p => ({ ...p, scheduledRun: { runAt: runAt.toISOString(), stage: p.currentStage }, scheduledResumeTime: undefined, updatedAt: new Date(clock.now()).toISOString() }));
   await scheduler.arm(task.taskFolderPath, task.canonicalId);
   NotificationRouter.showInformation(`Current-stage action scheduled for ${runAt.toLocaleString()}.`);
 }

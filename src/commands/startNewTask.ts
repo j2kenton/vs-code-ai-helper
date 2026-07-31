@@ -1,7 +1,8 @@
 import * as vscode from "vscode";
 import * as path from "path";
 import { TASK_FILENAME, TASK_PROGRESS_FILENAME, TaskStatus } from "../types/taskProgress";
-import { createTaskProgress, readTaskProgress, writeTaskProgress } from "../utils/taskProgressUtils";
+import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
+import { createTaskProgressV1, writeTaskProgressV1 } from "../services/taskProgressWriterV1";
 import { getConfiguredTaskRoot, normalizePath, resolveTaskRootForCreation } from "../utils/taskRoot";
 import { TaskInventory } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
@@ -234,8 +235,8 @@ export async function hasActiveTaskOnDisk(metaFolderPaths: readonly string[]): P
 
     for (const [name, type] of entries) {
       if (type !== vscode.FileType.Directory) continue;
-      const progress = await readTaskProgress(vscode.Uri.joinPath(root, name));
-      if (progress?.status === "active") {
+      const result = await readTaskProgressStrictV1(vscode.Uri.joinPath(root, name));
+      if (result.ok && result.decoded.progress.status === "active") {
         return true;
       }
     }
@@ -415,12 +416,12 @@ async function createTask(
     // "creating" is a durable creation sentinel. It is only promoted after
     // task.md and task-progress.json have both been written successfully.
     const progress = {
-      ...createTaskProgress(taskFolderName, "desc"),
+      ...createTaskProgressV1(taskFolderName, "desc"),
       displayName: taskFolderName,
       nameIsDefault: true,
       ownership,
     };
-    await writeTaskProgress(workFolderUri, progress);
+    await writeTaskProgressV1(workFolderUri, progress);
     await vscode.workspace.fs.writeFile(
       vscode.Uri.joinPath(workFolderUri, TASK_FILENAME),
       new TextEncoder().encode(taskTemplate)
@@ -448,7 +449,7 @@ async function createTask(
       commitCreationSentinelV1(metaFolderPath, taskFolderPath)
     );
 
-    await writeTaskProgress(taskFolderUri, { ...progress, status: initialStatus });
+    await writeTaskProgressV1(taskFolderUri, { ...progress, status: initialStatus });
     // task-progress.json was just rewritten (status flipped from "creating" to
     // its real initial value) -- re-read it so the journal's recorded hash for
     // this path reflects the FINAL bytes, not the transient "creating" write

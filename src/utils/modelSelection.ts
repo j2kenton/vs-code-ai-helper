@@ -9,7 +9,9 @@ import { getConfiguredTaskRoot } from "./taskRoot";
 import { NotificationRouter } from "./notificationRouter";
 import { canUseBackup, getBackupModels } from "./modelFallback";
 import { cliCommandExists, resolveCliCommand } from "../runners/cliAgentRunner";
-import { findAllTasks, patchTaskProgress, readTaskProgress } from "./taskProgressUtils";
+import { findAllTasksStrictV1 } from "../services/taskProgressDiscoveryV1";
+import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
+import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { clearStageFallbackReservation } from "./taskProgressTransforms";
 import {
   CLI_PROVIDERS,
@@ -149,7 +151,7 @@ export async function findTaskModelConflicts(): Promise<TaskModelConflict[]> {
 
     let tasks;
     try {
-      tasks = await findAllTasks(metaFolderUri);
+      tasks = (await findAllTasksStrictV1(metaFolderUri)).tasks;
     } catch {
       continue;
     }
@@ -197,7 +199,8 @@ export async function resolveModelForStage(
       // If fallback is enabled, check if task progress has fallback active
       // for this stage.
       try {
-        const progress = await readTaskProgress(taskFolderUri);
+        const readResult = await readTaskProgressStrictV1(taskFolderUri);
+        const progress = readResult.ok ? readResult.decoded.progress : undefined;
         if (
           progress &&
           progress.fallbackActive &&
@@ -286,9 +289,9 @@ export async function resolveFreshModelForStage(
 ): Promise<ResolvedStageModel> {
   if (isConfigurableStage(stage)) {
     try {
-      const progress = await readTaskProgress(taskFolderUri);
-      if (progress?.fallbackActive?.[stage]) {
-        await patchTaskProgress(
+      const readResult = await readTaskProgressStrictV1(taskFolderUri);
+      if (readResult.ok && readResult.decoded.progress.fallbackActive?.[stage]) {
+        await patchTaskProgressStrictV1(
           taskFolderUri,
           (current) => clearStageFallbackReservation(current, stage)
         );
