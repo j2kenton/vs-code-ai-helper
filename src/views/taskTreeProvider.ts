@@ -9,7 +9,7 @@ import {
   TASK_STATUSES,
   TaskStage,
 } from "../types/taskProgress";
-import { IncompleteTask } from "../utils/taskProgressUtils";
+import { IncompleteTask } from "../types/incompleteTask";
 import { taskOperations, taskKey } from "../utils/taskOperations";
 import { resolveCurrentPlanUri, statIfExists } from "../utils/fileUtils";
 import { hasPreviousVersion } from "../utils/artifactBackups";

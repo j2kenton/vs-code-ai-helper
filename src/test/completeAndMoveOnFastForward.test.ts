@@ -32,7 +32,8 @@ import {
   deactivateNotificationRouter,
 } from "../utils/notificationRouter";
 import { StatusTreeProvider } from "../views/statusView";
-import { readTaskProgress, IncompleteTask } from "../utils/taskProgressUtils";
+import { readTaskProgress } from "../utils/taskProgressUtils";
+import { IncompleteTask } from "../types/incompleteTask";
 import { REVIEW_STAGES, TaskProgress, TaskStage } from "../types/taskProgress";
 import { DISCLAIMER_VERSION } from "../legal/disclaimerVersion";
 import type { AutomationDispatch } from "../utils/automationChain";

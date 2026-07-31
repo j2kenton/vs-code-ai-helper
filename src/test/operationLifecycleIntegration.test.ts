@@ -33,7 +33,7 @@ import {
   deactivateNotificationRouter,
 } from "../utils/notificationRouter";
 import { installOperationNotificationBridge } from "../utils/operationNotificationBridge";
-import { IncompleteTask } from "../utils/taskProgressUtils";
+import { IncompleteTask } from "../types/incompleteTask";
 
 function makeTask(folder: string): IncompleteTask {
   return {

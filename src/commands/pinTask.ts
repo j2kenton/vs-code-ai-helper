@@ -1,7 +1,8 @@
 import * as vscode from "vscode";
 import { TaskInventory } from "../state/taskInventory";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
-import { IncompleteTask, patchTaskProgress } from "../utils/taskProgressUtils";
+import { patchTaskProgress } from "../utils/taskProgressUtils";
+import { IncompleteTask } from "../types/incompleteTask";
 import { MAX_PINNED_TASKS } from "../types/taskProgress";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";

@@ -3,10 +3,8 @@ import { TaskInventory } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { activateTask } from "../state/taskActivationCoordinator";
-import {
-  IncompleteTask,
-  patchTaskProgress,
-} from "../utils/taskProgressUtils";
+import { patchTaskProgress } from "../utils/taskProgressUtils";
+import { IncompleteTask } from "../types/incompleteTask";
 import { MAX_PINNED_TASKS, TaskProgress, TaskStatus } from "../types/taskProgress";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { cancelRunningOperationsForTask, runTrackedOperation } from "../utils/taskOperations";

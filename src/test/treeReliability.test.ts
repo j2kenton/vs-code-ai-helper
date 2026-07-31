@@ -20,7 +20,7 @@ import { describe, it } from "node:test";
 import * as vscode from "vscode";
 
 import { TASK_STATUSES } from "../types/taskProgress";
-import type { IncompleteTask } from "../utils/taskProgressUtils";
+import type { IncompleteTask } from "../types/incompleteTask";
 import { TaskStatusBar } from "../views/taskStatusBar";
 import { TaskNode, TaskTreeProvider } from "../views/taskTreeProvider";
 

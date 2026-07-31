@@ -4,7 +4,7 @@ import {
   STAGE_ORDER,
   TaskStage,
 } from "../types/taskProgress";
-import { IncompleteTask } from "../utils/taskProgressUtils";
+import { IncompleteTask } from "../types/incompleteTask";
 import { TaskInventory } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { resolveTaskContext, ResolvedTaskContext } from "../utils/resolveTaskContext";

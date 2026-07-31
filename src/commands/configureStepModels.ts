@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import { TaskStage } from "../types/taskProgress";
-import { IncompleteTask } from "../utils/taskProgressUtils";
+import { IncompleteTask } from "../types/incompleteTask";
 import { SettingsViewProvider } from "../views/settingsView";
 import { NotificationRouter } from "../utils/notificationRouter";
 

@@ -3,16 +3,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { after, test } from "node:test";
-import {
-  appendReviewScoreHistory,
-  clearEscalation,
-  clearStageFallbackReservation,
-  recordEscalation,
-  updateImplReviewFiles,
-  clearImplReviewFiles,
-  updateTaskProgressStage,
-  patchTaskProgress,
-} from "../utils/taskProgressUtils";
+import { patchTaskProgress } from "../utils/taskProgressUtils";
+import { appendReviewScoreHistory, clearEscalation, clearStageFallbackReservation, recordEscalation, updateImplReviewFiles, clearImplReviewFiles, updateTaskProgressStage } from "../utils/taskProgressTransforms";
 import { MAX_REVIEW_SCORE_HISTORY, ReviewScoreHistoryEntry, type TaskProgress } from "../types/taskProgress";
 
 function makeProgress(implReviewFiles?: string[]): TaskProgress {

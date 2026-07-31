@@ -3,7 +3,8 @@ import * as fs from "fs";
 import * as path from "path";
 import { TaskInventory } from "../state/taskInventory";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
-import { IncompleteTask, patchTaskProgress, readTaskProgress } from "../utils/taskProgressUtils";
+import { patchTaskProgress, readTaskProgress } from "../utils/taskProgressUtils";
+import { IncompleteTask } from "../types/incompleteTask";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
 

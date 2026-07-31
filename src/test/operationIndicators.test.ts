@@ -5,7 +5,7 @@ import { StageNode } from "../views/taskTreeProvider";
 import { StatusTreeProvider, StatusTreeNode } from "../views/statusView";
 import { ViewProgressBinder } from "../utils/viewProgressBinder";
 import { taskOperations, TaskOperationHandle } from "../utils/taskOperations";
-import { IncompleteTask } from "../utils/taskProgressUtils";
+import { IncompleteTask } from "../types/incompleteTask";
 import {
   NotificationRouter,
   initNotificationRouter,

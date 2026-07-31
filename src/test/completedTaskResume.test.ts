@@ -30,10 +30,7 @@ import { TaskInventory } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { resumePausedTask } from "../commands/resumeTask";
 import { setTaskStage } from "../commands/setTaskStage";
-import {
-  patchTaskProgress,
-  readTaskProgress,
-} from "../utils/taskProgressUtils";
+import { patchTaskProgress, readTaskProgress } from "../utils/taskProgressUtils";
 import { TaskProgress } from "../types/taskProgress";
 import { initNotificationRouter } from "../utils/notificationRouter";
 import { installOperationNotificationBridge } from "../utils/operationNotificationBridge";

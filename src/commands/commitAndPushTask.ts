@@ -5,7 +5,7 @@ import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { TASK_FILENAME, STAGE_DISPLAY_NAMES, TaskProgress } from "../types/taskProgress";
 import { resolveImplementationArtifact } from "../utils/implementationArtifactResolver";
 import { getLowLevelPlanUri } from "../utils/lowLevelPlanArtifactResolver";
-import { IncompleteTask } from "../utils/taskProgressUtils";
+import { IncompleteTask } from "../types/incompleteTask";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { selectNextTask } from "./markTaskDone";
 import { NotificationRouter } from "../utils/notificationRouter";

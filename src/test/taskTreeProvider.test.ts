@@ -2,7 +2,7 @@ import * as assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import * as vscode from "vscode";
 import { getStageNodeContextValue, orderTasksForDisplay, StageNode } from "../views/taskTreeProvider";
-import type { IncompleteTask } from "../utils/taskProgressUtils";
+import type { IncompleteTask } from "../types/incompleteTask";
 import { buildTaskContextValue, buildStageContextValue, CREATION_RECOVERY_CONTEXT_V1 } from "../utils/contextTokens";
 import {
   AI_MODEL_STAGES,

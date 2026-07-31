@@ -4,7 +4,7 @@ import { TaskInventory, TaskWithProgress } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { STAGE_DISPLAY_NAMES } from "../types/taskProgress";
-import { IncompleteTask } from "../utils/taskProgressUtils";
+import { IncompleteTask } from "../types/incompleteTask";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { runTrackedOperation } from "../utils/taskOperations";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";

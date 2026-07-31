@@ -1,7 +1,8 @@
 import * as vscode from "vscode";
 import { spawn, execSync, execFileSync } from "child_process";
 import * as crypto from "crypto";
-import { patchTaskProgress, readTaskProgress, updateLintPayload } from "./taskProgressUtils";
+import { patchTaskProgress, readTaskProgress } from "./taskProgressUtils";
+import { updateLintPayload } from "./taskProgressTransforms";
 import * as fs from "fs";
 import * as path from "path";
 import { STAGE_ARTIFACT_FILENAMES, TaskProgress } from "../types/taskProgress";

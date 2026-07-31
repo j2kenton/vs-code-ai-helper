@@ -41,10 +41,8 @@ import {
 } from "../config/settings";
 import { chooseFallback, getBackupModels } from "../utils/modelFallback";
 import { isAuthenticationFailure, recordQuotaObservation } from "../utils/quota";
-import {
-  clearStageFallbackReservation,
-  patchTaskProgress,
-} from "../utils/taskProgressUtils";
+import { patchTaskProgress } from "../utils/taskProgressUtils";
+import { clearStageFallbackReservation } from "../utils/taskProgressTransforms";
 import { TaskStage } from "../types/taskProgress";
 import { assertNoUnauthorizedV1CorrelationV0 } from "../services/legacyAiActionSafetyGateV0";
 

@@ -2,11 +2,9 @@ import * as vscode from "vscode";
 import { TaskInventory } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
-import {
-  IncompleteTask,
-  patchTaskProgress,
-  updateTaskStatus,
-} from "../utils/taskProgressUtils";
+import { patchTaskProgress } from "../utils/taskProgressUtils";
+import { updateTaskStatus } from "../utils/taskProgressTransforms";
+import { IncompleteTask } from "../types/incompleteTask";
 
 import { NotificationRouter } from "../utils/notificationRouter";
 import { runTrackedOperation } from "../utils/taskOperations";

@@ -2,11 +2,9 @@ import * as vscode from "vscode";
 import { TaskInventory } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { resolveTaskContext, ResolvedTaskContext } from "../utils/resolveTaskContext";
-import {
-  clearEscalation,
-  IncompleteTask,
-  patchTaskProgress,
-} from "../utils/taskProgressUtils";
+import { patchTaskProgress } from "../utils/taskProgressUtils";
+import { clearEscalation } from "../utils/taskProgressTransforms";
+import { IncompleteTask } from "../types/incompleteTask";
 import { STAGE_DISPLAY_NAMES } from "../types/taskProgress";
 
 import { NotificationRouter } from "../utils/notificationRouter";

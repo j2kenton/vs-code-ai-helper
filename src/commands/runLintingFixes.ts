@@ -1,11 +1,9 @@
 import * as vscode from "vscode";
 import { TaskInventory } from "../state/taskInventory";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
-import {
-  IncompleteTask,
-  patchTaskProgress,
-  updateLintPayload,
-} from "../utils/taskProgressUtils";
+import { patchTaskProgress } from "../utils/taskProgressUtils";
+import { updateLintPayload } from "../utils/taskProgressTransforms";
+import { IncompleteTask } from "../types/incompleteTask";
 import { NotificationRouter } from "../utils/notificationRouter";
 import {
   runCompletionLint,

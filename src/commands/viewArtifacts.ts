@@ -1,7 +1,8 @@
 import * as vscode from "vscode";
 import { getConfiguredTaskRoot } from "../utils/taskRoot";
 import { TASK_FILENAME } from "../types/taskProgress";
-import { findAllTasks, IncompleteTask } from "../utils/taskProgressUtils";
+import { findAllTasks } from "../utils/taskProgressUtils";
+import { IncompleteTask } from "../types/incompleteTask";
 import {
   resolveCurrentPlanUri,
   safeOpenTextDocument,

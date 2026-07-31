@@ -9,12 +9,8 @@ import { getConfiguredTaskRoot } from "./taskRoot";
 import { NotificationRouter } from "./notificationRouter";
 import { canUseBackup, getBackupModels } from "./modelFallback";
 import { cliCommandExists, resolveCliCommand } from "../runners/cliAgentRunner";
-import {
-  clearStageFallbackReservation,
-  findAllTasks,
-  patchTaskProgress,
-  readTaskProgress,
-} from "./taskProgressUtils";
+import { findAllTasks, patchTaskProgress, readTaskProgress } from "./taskProgressUtils";
+import { clearStageFallbackReservation } from "./taskProgressTransforms";
 import {
   CLI_PROVIDERS,
   type CliProviderId,

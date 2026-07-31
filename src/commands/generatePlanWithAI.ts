@@ -1,8 +1,7 @@
 import * as vscode from "vscode";
-import {
-  patchTaskProgress,
-  updateTaskProgressStage,
-} from "../utils/taskProgressUtils";
+import { patchTaskProgress } from "../utils/taskProgressUtils";
+import { updateTaskProgressStage } from "../utils/taskProgressTransforms";
+import { IncompleteTask } from "../types/incompleteTask";
 import {
   generateContextPack,
   writeContextPackContent,
@@ -16,7 +15,6 @@ import { TASK_FILENAME, TaskStage } from "../types/taskProgress";
 import { ensureAiConsent } from "../utils/aiConsent";
 import { checkAndConfirmPromptSize } from "../utils/promptSizeGuard";
 import { TaskInventory } from "../state/taskInventory";
-import { IncompleteTask } from "../utils/taskProgressUtils";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { safeOpenTextDocument } from "../utils/fileUtils";
 import { assertLegacyAiRouteAllowedV0 } from "../services/legacyAiActionSafetyGateV0";

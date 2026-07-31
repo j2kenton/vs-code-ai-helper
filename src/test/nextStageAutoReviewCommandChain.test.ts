@@ -43,7 +43,8 @@ import {
   deactivateNotificationRouter,
 } from "../utils/notificationRouter";
 import { installOperationNotificationBridge } from "../utils/operationNotificationBridge";
-import { readTaskProgress, IncompleteTask } from "../utils/taskProgressUtils";
+import { readTaskProgress } from "../utils/taskProgressUtils";
+import { IncompleteTask } from "../types/incompleteTask";
 import { REVIEW_STAGES, TaskProgress, TaskStage } from "../types/taskProgress";
 import type { AgentTransportV1 } from "../types/agentExecutionV1";
 import { DISCLAIMER_VERSION } from "../legal/disclaimerVersion";

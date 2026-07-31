@@ -16,7 +16,7 @@ import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { TaskStage } from "../types/taskProgress";
 import { StatusTreeProvider } from "../views/statusView";
 import { TaskStatusBar } from "../views/taskStatusBar";
-import { IncompleteTask } from "../utils/taskProgressUtils";
+import { IncompleteTask } from "../types/incompleteTask";
 
 // ---------------------------------------------------------------------------
 // Helpers

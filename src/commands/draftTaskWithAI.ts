@@ -13,7 +13,8 @@ import { safeOpenTextDocument } from "../utils/fileUtils";
 import { ChatViewProvider, ChatInteractionRefV1, ChatInteractionResumeResultV1 } from "../views/chatView";
 import { assertLegacyAiRouteAllowedV0 } from "../services/legacyAiActionSafetyGateV0";
 
-import { patchTaskProgress, IncompleteTask } from "../utils/taskProgressUtils";
+import { patchTaskProgress } from "../utils/taskProgressUtils";
+import { IncompleteTask } from "../types/incompleteTask";
 import {
   linkCancellationTokens,
   runTrackedOperation,

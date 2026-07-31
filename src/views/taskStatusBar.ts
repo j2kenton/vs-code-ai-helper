@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import { STAGE_DISPLAY_NAMES, STAGE_ORDER } from "../types/taskProgress";
-import { IncompleteTask } from "../utils/taskProgressUtils";
+import { IncompleteTask } from "../types/incompleteTask";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { taskOperations } from "../utils/taskOperations";
 

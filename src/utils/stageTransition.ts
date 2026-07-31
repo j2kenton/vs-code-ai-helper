@@ -16,10 +16,8 @@ import {
   isReviewStage,
   TaskStage,
 } from "../types/taskProgress";
-import {
-  patchTaskProgress,
-  updateTaskProgressStage,
-} from "./taskProgressUtils";
+import { patchTaskProgress } from "./taskProgressUtils";
+import { updateTaskProgressStage } from "./taskProgressTransforms";
 
 // The disk-level CAS below protects multiple windows. This in-memory queue
 // additionally serializes transition dispatch within this extension host, so

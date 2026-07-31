@@ -27,10 +27,8 @@ import {
   TaskStage,
 } from "../types/taskProgress";
 import { TaskProgress } from "../types/taskProgress";
-import {
-  appendReviewScoreHistory,
-  IncompleteTask,
-} from "../utils/taskProgressUtils";
+import { appendReviewScoreHistory } from "../utils/taskProgressTransforms";
+import { IncompleteTask } from "../types/incompleteTask";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import {

@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import { EscalationKind, STAGE_DISPLAY_NAMES, TaskProgress, TaskStage } from "../types/taskProgress";
-import { patchTaskProgress, recordEscalation, updateTaskStatus } from "./taskProgressUtils";
+import { patchTaskProgress } from "./taskProgressUtils";
+import { recordEscalation, updateTaskStatus } from "./taskProgressTransforms";
 import { NotificationRouter } from "./notificationRouter";
 import { normalizePath } from "./taskRoot";
 

@@ -8,7 +8,7 @@ import {
   STAGE_DISPLAY_NAMES,
   TaskStage,
 } from "../types/taskProgress";
-import { IncompleteTask } from "../utils/taskProgressUtils";
+import { IncompleteTask } from "../types/incompleteTask";
 import { resolveFreshModelForStage } from "../utils/modelSelection";
 import {
   checkRunnerAvailabilityForModel,

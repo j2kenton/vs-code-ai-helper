@@ -1,11 +1,7 @@
 import * as vscode from "vscode";
 import * as path from "path";
 import { TASK_FILENAME, TASK_PROGRESS_FILENAME, TaskStatus } from "../types/taskProgress";
-import {
-  createTaskProgress,
-  readTaskProgress,
-  writeTaskProgress,
-} from "../utils/taskProgressUtils";
+import { createTaskProgress, readTaskProgress, writeTaskProgress } from "../utils/taskProgressUtils";
 import { getConfiguredTaskRoot, normalizePath, resolveTaskRootForCreation } from "../utils/taskRoot";
 import { TaskInventory } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";

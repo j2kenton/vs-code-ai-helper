@@ -89,7 +89,8 @@ import { resolveTaskRootCandidates } from "./utils/taskRoot";
 import { finishFinalization, recoverFinalizationTree } from "./state/finalizationJournal";
 import { PendingOperationsStore } from "./state/pendingOperationsStore";
 import { recoverActivationCheckpoint } from "./state/taskActivationCoordinator";
-import { IncompleteTask, readTaskProgress } from "./utils/taskProgressUtils";
+import { readTaskProgress } from "./utils/taskProgressUtils";
+import { IncompleteTask } from "./types/incompleteTask";
 import { installAutoImplementConfirmation, migrateEnabledProvidersForExistingModels, migrateSettingsNamespace, migrateSettingsScope } from "./config/settings";
 
 /**
