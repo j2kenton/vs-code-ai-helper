@@ -6,13 +6,13 @@
       "annotationKind": "dynamicPathConsumption",
       "path": "src/commands/reviewActions.ts",
       "planSection": "§2.3 (unresolved dynamic path consumption)",
-      "rationale": "cp.execFile(\"git\", [\"rev-parse\", …]) repository checks (isGitWorkspace and siblings) run with the workspace root as cwd during review/publish flows. Arguments are fixed git subcommands; the only path consumed is the cwd, never a task-artifact or Chat-private path. Spawned git can read repository state, so it stays inventoried until the privacy classifier bounds it.",
+      "rationale": "cp.execFile(\"git\", [\"rev-parse\", …]) repository checks (isGitWorkspace and siblings) run with the workspace root as cwd during review/publish flows. Arguments are fixed git subcommands; the only path consumed is the cwd, never a task-artifact or Chat-private path. Spawned git can read repository state, so it stays inventoried until the privacy classifier bounds it. Span refresh 2026-07-31 (completion round): the child_process import moved to L74 when the §7.8 cutover replaced the legacy implementation-run imports; the git call sites themselves are unchanged.",
       "owner": "ensemble-workflow-migration",
       "cohort": "text3",
       "expiryCohort": "cleanup",
       "evidence": {
         "symbol": "(module)",
-        "sourceSpan": "L76-L76",
+        "sourceSpan": "L74-L74",
         "edgeKind": "dynamicPathConsumption",
         "targetActionKey": "none"
       }
@@ -314,6 +314,38 @@
         "edgeKind": "pregateAddedConsumer",
         "targetActionKey": "n/a (shared strict-read primitive)",
         "liveStabilitySha256": "dd4e478d9cd2154c0a7c1f4eb650d36cd0b8712dc2cc0570a0b30fd4e61f1da3"
+      }
+    },
+    {
+      "annotationKind": "pregateAddedConsumer",
+      "path": "src/services/taskProgressDiscoveryV1.ts",
+      "planSection": "§3.12 (strict discovery replacing permissive findAllTasks)",
+      "rationale": "New strict task-discovery module (plan §3.12): findAllTasksStrictV1 lists candidate task folders via one workspace.fs.readDirectory call on the recognized tasks root, then strict-reads each folder's task-progress.json through taskProgressReaderV1 — returning { tasks, recovery } so undecodable folders surface as recovery entries instead of being permissively coerced. Read-only; never writes. Replaces the retired permissive discovery in src/utils/taskProgressUtils.ts (see its pregateRemovedConsumer row).",
+      "owner": "j2kenton",
+      "cohort": "cleanup",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "symbol": "findAllTasksStrictV1",
+        "sourceSpan": "L43-L43",
+        "edgeKind": "pregateAddedConsumer",
+        "targetActionKey": "n/a (shared discovery primitive)",
+        "liveStabilitySha256": "c1c8d449227e073811c1c4f0792f572147d20481067b3e04cff7e483a3a3135d"
+      }
+    },
+    {
+      "annotationKind": "pregateRemovedConsumer",
+      "path": "src/utils/taskProgressUtils.ts",
+      "planSection": "§3.12 (permissive progress reader retirement, endgame)",
+      "rationale": "Permissive task-progress reader/writer retired and DELETED (plan §3.12 endgame): its two pregate workspace.fs call sites (readTaskProgress at L55, findAllTasks directory listing at L451) are superseded by the strict stack — taskProgressReaderV1.ts for single reads, taskProgressWriterV1.ts for writes, and taskProgressDiscoveryV1.ts (its own pregateAddedConsumer row) for discovery. The module basename is banned repo-wide by verify:progress-reader-fence, which also verifies the file stays deleted.",
+      "owner": "j2kenton",
+      "cohort": "cleanup",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "symbol": "readTaskProgress, findAllTasks (former call sites; module deleted)",
+        "sourceSpan": "L55-L55 / L451-L451 (pregate)",
+        "edgeKind": "pregateRemovedConsumer",
+        "targetActionKey": "n/a (superseded by the strict V1 progress stack)",
+        "pregateStabilitySha256": "3adfcff5073836d321dabcdad5492e2afc0f49d52ebb4ae3c3213a8ac7198d82"
       }
     }
   ]
