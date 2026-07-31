@@ -21,10 +21,7 @@ import * as path from "node:path";
 import { describe, it } from "node:test";
 import * as vscode from "vscode";
 
-import {
-  createReopenMutation,
-  StaleReopenError,
-} from "../utils/reopenTask";
+import { StaleReopenError } from "../utils/reopenTask";
 import {
   activateTask,
   recoverActivationCheckpoint,
@@ -66,6 +63,8 @@ const writeAtomicModule = require("../state/writeAtomic") as {
   writeAtomic: (uri: vscode.Uri, content: string) => Promise<void>;
 };
 
+const REAL_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-reopen-test-"));
+
 function baseProgress(overrides: Partial<TaskProgress> = {}): TaskProgress {
   return {
     taskFolder: "task",
@@ -75,122 +74,23 @@ function baseProgress(overrides: Partial<TaskProgress> = {}): TaskProgress {
     completedStages: ["publish"],
     createdAt: "2025-12-01T00:00:00.000Z",
     updatedAt: "2026-01-01T00:00:00.000Z",
+    // The strict reopen row (resumeTask.v1) validates the persisted binding
+    // before mutating (plan §9.1) — every completed fixture must carry a
+    // derivable ownership record or the reopen reports recoveryRequired.
+    ownership: {
+      metaRoot: path.join(REAL_ROOT, ".ensemble"),
+      projectRoot: REAL_ROOT,
+      workspaceRoot: REAL_ROOT,
+      boundAt: "2025-12-01T00:00:00.000Z",
+      state: "resolved",
+    },
     ...overrides,
   };
 }
 
 // ---------------------------------------------------------------------------
-// 1. createReopenMutation — pure function
-// ---------------------------------------------------------------------------
-
-void describe("createReopenMutation", () => {
-  void it("throws StaleReopenError when status is no longer completed", () => {
-    const mutate = createReopenMutation("publish", "2026-01-01T00:00:00.000Z");
-    const current = baseProgress({ status: "active" });
-    assert.throws(() => mutate(current), StaleReopenError);
-  });
-
-  void it("throws StaleReopenError when completedAt no longer matches the captured marker", () => {
-    const mutate = createReopenMutation("publish", "2026-01-01T00:00:00.000Z");
-    const current = baseProgress({ completedAt: "2026-01-02T00:00:00.000Z" });
-    assert.throws(() => mutate(current), StaleReopenError);
-  });
-
-  void it("reopening at Publish clears completedAt and removes publish from completedStages", () => {
-    const mutate = createReopenMutation("publish", "2026-01-01T00:00:00.000Z");
-    const next = mutate(baseProgress());
-    assert.equal(next.completedAt, undefined);
-    assert.equal(next.currentStage, "publish");
-    assert.ok(!next.completedStages?.includes("publish"));
-  });
-
-  void it("reopening at an earlier stage clears completedStages entries at or after it", () => {
-    const mutate = createReopenMutation("impl-high-review", "2026-01-01T00:00:00.000Z");
-    const current = baseProgress({
-      completedStages: ["desc", "plan", "plan-high-review", "plan-low-review", "impl", "publish"],
-    });
-    const next = mutate(current);
-    assert.deepEqual(next.completedStages, ["desc", "plan", "plan-high-review", "plan-low-review", "impl"]);
-  });
-
-  void it("clears lintPayload, scheduledRun, scheduledResumeTime, and reviewAttemptId regardless of chosen stage", () => {
-    const mutate = createReopenMutation("impl-low-review", "2026-01-01T00:00:00.000Z");
-    const current = baseProgress({
-      lintPayload: { runAt: "x", passed: true, summary: "ok" },
-      scheduledRun: { runAt: "2026-01-01T01:00:00.000Z", stage: "publish" },
-      scheduledResumeTime: "2026-01-01T01:00:00.000Z",
-      reviewAttemptId: "attempt-1",
-    });
-    const next = mutate(current);
-    assert.equal(next.lintPayload, undefined);
-    assert.equal(next.scheduledRun, undefined);
-    assert.equal(next.scheduledResumeTime, undefined);
-    assert.equal(next.reviewAttemptId, undefined);
-  });
-
-  void it("clears a stale escalation regardless of chosen stage — a completed task can carry one if the user chose Publish Anyway instead of resuming first", () => {
-    const mutate = createReopenMutation("publish", "2026-01-01T00:00:00.000Z");
-    const current = baseProgress({
-      escalation: {
-        stage: "publish",
-        kind: "plateau",
-        reason: "stuck before this task was published anyway",
-        at: "2025-12-31T00:00:00.000Z",
-        secondOpinionAttempted: true,
-      },
-    });
-    const next = mutate(current);
-    assert.equal(next.escalation, undefined);
-  });
-
-  void it("preserves implReviewFiles when reopening at impl-high-review, impl-low-review, or publish", () => {
-    for (const stage of ["impl-high-review", "impl-low-review", "publish"] as const) {
-      const mutate = createReopenMutation(stage, "2026-01-01T00:00:00.000Z");
-      const current = baseProgress({ implReviewFiles: ["src/a.ts", "src/b.ts"] });
-      const next = mutate(current);
-      assert.deepEqual(next.implReviewFiles, ["src/a.ts", "src/b.ts"], `implReviewFiles must survive reopen at ${stage}`);
-    }
-  });
-
-  void it("clears implReviewFiles when reopening at impl or earlier", () => {
-    for (const stage of ["desc", "plan", "plan-high-review", "plan-low-review", "impl"] as const) {
-      const mutate = createReopenMutation(stage, "2026-01-01T00:00:00.000Z");
-      const current = baseProgress({ implReviewFiles: ["src/a.ts"] });
-      const next = mutate(current);
-      assert.equal(next.implReviewFiles, undefined, `implReviewFiles must be cleared when reopening at ${stage}`);
-    }
-  });
-
-  void it("clears fallback reservations for the chosen stage and every later stage, preserves earlier ones", () => {
-    const mutate = createReopenMutation("impl", "2026-01-01T00:00:00.000Z");
-    const current = baseProgress({
-      fallbackActive: { plan: true, impl: true, "impl-low-review": true },
-      fallbackModelId: { plan: "backup-a", impl: "backup-b", "impl-low-review": "backup-c" },
-    });
-    const next = mutate(current);
-    assert.deepEqual(next.fallbackActive, { plan: true });
-    assert.deepEqual(next.fallbackModelId, { plan: "backup-a" });
-  });
-
-  void it("preserves non-stage data: taskFolder, displayName, ownership, createdAt", () => {
-    const mutate = createReopenMutation("publish", "2026-01-01T00:00:00.000Z");
-    const current = baseProgress({
-      displayName: "My Task",
-      ownership: { metaRoot: "/root", projectRoot: "/proj", boundAt: "2025-12-01T00:00:00.000Z" },
-    });
-    const next = mutate(current);
-    assert.equal(next.taskFolder, current.taskFolder);
-    assert.equal(next.displayName, "My Task");
-    assert.deepEqual(next.ownership, current.ownership);
-    assert.equal(next.createdAt, current.createdAt);
-  });
-});
-
-// ---------------------------------------------------------------------------
 // Shared fixture helpers for command/coordinator integration tests
 // ---------------------------------------------------------------------------
-
-const REAL_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-reopen-test-"));
 
 function makeTaskFolder(name: string): string {
   const dir = path.join(REAL_ROOT, ".ensemble", name);
@@ -571,6 +471,34 @@ void describe("setTaskStage on a completed task", () => {
 // 4. Activation-coordinator fault injection at target-write-pending
 // ---------------------------------------------------------------------------
 
+/**
+ * Local stand-in for the retired createReopenMutation: production reopen now
+ * flows through the resumeTask.v1 registry row (utils/reopenTask.ts routes it
+ * as activateTask's writeTarget), but these fault-injection tests exercise
+ * the activation coordinator's target-write machinery directly via the
+ * mutateTarget seam, which needs a reopen-shaped mutation with the same
+ * pre-persistence staleness contract.
+ */
+function reopenMutationForTest(
+  chosenStage: TaskProgress["currentStage"],
+  capturedCompletedAt: string | undefined
+): (current: TaskProgress) => TaskProgress {
+  return (current: TaskProgress): TaskProgress => {
+    if (current.status !== "completed" || current.completedAt !== capturedCompletedAt) {
+      throw new StaleReopenError(
+        `Task "${current.taskFolder}" was updated elsewhere before the reopen could be applied.`
+      );
+    }
+    return {
+      ...current,
+      completedAt: undefined,
+      currentStage: chosenStage,
+      completedStages: (current.completedStages ?? []).filter((s) => s !== chosenStage),
+      updatedAt: new Date().toISOString(),
+    };
+  };
+}
+
 void describe("activateTask target-write-pending fault injection", () => {
   function patchWriteAtomicForTarget(
     targetProgressPath: string,
@@ -612,7 +540,7 @@ void describe("activateTask target-write-pending fault injection", () => {
 
     try {
       const result = await activateTask(inv, store, targetPath, targetCanonicalId, {
-        mutateTarget: createReopenMutation("publish", targetProgress.completedAt),
+        mutateTarget: reopenMutationForTest("publish", targetProgress.completedAt),
       });
       assert.equal(result, false);
 
@@ -656,7 +584,7 @@ void describe("activateTask target-write-pending fault injection", () => {
 
     try {
       const result = await activateTask(inv, store, targetPath, targetCanonicalId, {
-        mutateTarget: createReopenMutation("publish", targetProgress.completedAt),
+        mutateTarget: reopenMutationForTest("publish", targetProgress.completedAt),
       });
       assert.equal(result, true, "must resolve forward since the write actually landed");
       assert.deepEqual(setCalls, [targetCanonicalId], "focus must be set to the reopened target");
@@ -702,7 +630,7 @@ void describe("activateTask target-write-pending fault injection", () => {
 
     try {
       const result = await activateTask(inv, store, targetPath, targetCanonicalId, {
-        mutateTarget: createReopenMutation("publish", targetProgress.completedAt),
+        mutateTarget: reopenMutationForTest("publish", targetProgress.completedAt),
       });
       assert.equal(result, false, "ambiguous resolution must not report success");
 
@@ -751,7 +679,7 @@ void describe("activateTask target-write-pending fault injection", () => {
 
     try {
       const firstResult = await activateTask(inv, store, targetPath, targetCanonicalId, {
-        mutateTarget: createReopenMutation("publish", targetProgress.completedAt),
+        mutateTarget: reopenMutationForTest("publish", targetProgress.completedAt),
       });
       assert.equal(firstResult, false, "first attempt resolves ambiguous");
       assert.ok(fs.existsSync(checkpointPath));
@@ -825,7 +753,7 @@ void describe("activateTask cross-window stale-inventory rollback", () => {
       ]);
       const { store: freshStore } = makeCurrentTaskStoreStub();
       const windowTwoResult = await activateTask(freshInv, freshStore, completedPath, completedCanonicalId, {
-        mutateTarget: createReopenMutation("publish", completedProgress.completedAt),
+        mutateTarget: reopenMutationForTest("publish", completedProgress.completedAt),
       });
       assert.equal(windowTwoResult, true, "window 2's own reopen must succeed");
 
@@ -843,7 +771,7 @@ void describe("activateTask cross-window stale-inventory rollback", () => {
       // tasks exposure the checkpoint/rollback machinery exists to prevent.
       await assert.rejects(
         activateTask(staleInv, staleStore, completedPath, completedCanonicalId, {
-          mutateTarget: createReopenMutation("publish", completedProgress.completedAt),
+          mutateTarget: reopenMutationForTest("publish", completedProgress.completedAt),
         }),
         StaleReopenError
       );

@@ -88,6 +88,16 @@ export interface LifecycleExecutionContextV1 {
    * transition that requires it actually wins its compare-and-swap).
    */
   readonly beforeWrite?: (patched: TaskProgress) => Promise<void>;
+  /**
+   * Lifecycle-only side channel like `beforeWrite` (never provider rows,
+   * never serialized): when true, the row's strict progress patch skips the
+   * per-task lock because the CALLER already holds a covering lock —
+   * `taskActivationCoordinator.activateTask` holds the shared meta-root lock
+   * while invoking `resumeTask.v1` as its target write, and `withTaskLock`
+   * queues on the same per-process key, so re-acquiring here would
+   * self-deadlock. Threaded from `TaskActionRequestV1.lifecycleSkipTaskLock`.
+   */
+  readonly skipTaskLock?: boolean;
 }
 
 export type TaskActionPromotionCodeV1 = "completed" | "noChanges";

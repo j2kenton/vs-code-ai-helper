@@ -20,6 +20,22 @@ export class LifecycleStageMismatchError extends Error {}
  */
 export class LifecycleReviewAttemptMismatchError extends Error {}
 
+/**
+ * Thrown by `resumeTaskRowV1.ts` when the freshly re-read progress under the
+ * lock is no longer the completed snapshot the caller captured before showing
+ * the reopen picker — the status left `"completed"`, or the `completedAt`
+ * marker moved (another window resumed or re-completed the task meanwhile).
+ */
+export class LifecycleCompletionMarkerMismatchError extends Error {}
+
+/**
+ * Thrown when the freshly re-read progress has no persisted `ownership` or
+ * its task binding does not derive (`deriveTaskBindingV1`) — per §9.1 an
+ * ownership/task-folder mismatch is a `taskProgressRecoveryRequired`
+ * condition, never a silently-tolerated mutation.
+ */
+export class LifecycleBindingInvalidError extends Error {}
+
 /** Thrown to carry a `taskProgressFieldPolicyV1` rejection code out of the locked callback. */
 export class LifecyclePolicyFailureError extends Error {
   constructor(public readonly code: string) {

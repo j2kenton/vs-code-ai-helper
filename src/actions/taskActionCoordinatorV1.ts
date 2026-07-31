@@ -294,6 +294,15 @@ export interface TaskActionRequestV1 {
    * transaction's input snapshot; lifecycle rows have no such transaction.
    */
   readonly lifecycleBeforeWrite?: (patched: TaskProgress) => Promise<void>;
+  /**
+   * Lifecycle-row-only side channel like `lifecycleBeforeWrite`: forwarded
+   * verbatim into `LifecycleExecutionContextV1.skipTaskLock` for a
+   * `"lifecycle"` row and otherwise ignored. See that field's header — the
+   * caller already holds a covering lock (e.g. the activation coordinator's
+   * meta-root lock), so the row's strict patch must not re-queue on the same
+   * per-process task-lock key.
+   */
+  readonly lifecycleSkipTaskLock?: boolean;
 }
 
 /**
@@ -1085,6 +1094,7 @@ export function createTaskActionCoordinatorV1(
           chatDocumentId: request.taskBinding.chatDocumentId,
           validatedInput: validation.input,
           beforeWrite: request.lifecycleBeforeWrite,
+          skipTaskLock: request.lifecycleSkipTaskLock,
         });
         return { kind: "settled", outcome: finalizeOutcome(row, request, operationId, outcome, metrics) };
       } finally {

@@ -197,8 +197,7 @@ async function resumeCompletedTask(
         result = await reopenCompletedTask(
           inventory,
           currentTaskStore,
-          resolvedTask.taskFolderPath,
-          resolvedTask.canonicalId,
+          resolvedTask,
           chosenStage,
           capturedCompletedAt
         );

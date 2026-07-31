@@ -373,8 +373,7 @@ async function setTaskStageOnCompletedTask(
   const result = await reopenCompletedTask(
     inventory,
     currentTaskStore,
-    task.taskFolderPath,
-    task.canonicalId,
+    task,
     chosenStage,
     capturedCompletedAt
   );

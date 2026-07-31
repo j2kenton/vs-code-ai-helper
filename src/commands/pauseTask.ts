@@ -116,6 +116,18 @@ export async function pauseTask(
     return;
   }
 
+  // §9.2: Pause is only for active tasks. Menus already hide Pause on
+  // completed rows (contextTokens/package.json), but a programmatic
+  // invocation (command palette arg, automation) could still reach here —
+  // pausing a completed task would strand it outside both the completed and
+  // active lifecycles, with Resume's reopen flow no longer applicable.
+  if (resolvedTask.progress.status === "completed") {
+    NotificationRouter.showInformation(
+      "This task is completed — use Resume to reopen it at a stage."
+    );
+    return;
+  }
+
   // If already paused, show message
   if (resolvedTask.progress.status === "paused") {
     NotificationRouter.showInformation(`Task is already paused.`);

@@ -41,6 +41,24 @@ export interface ActivateTaskOptions {
    * construction, so it is always safe to roll back.
    */
   mutateTarget?: (current: TaskProgress) => TaskProgress;
+  /**
+   * Replace the coordinator's own target write entirely (mutually exclusive
+   * with `mutateTarget`): the callback must itself persist the target task's
+   * activation (status flip included) and return whether the write landed.
+   * Used by the strict reopen path (plan §9) — `utils/reopenTask.ts` routes
+   * the target write through the `resumeTask.v1` registry row so the field
+   * policy and strict progress stack own the mutation, while THIS
+   * coordinator keeps owning the surrounding sequence (pause-others,
+   * checkpoint, rollback, sole-active focus). Contract mirrors
+   * `mutateTarget`'s error semantics: throw `StaleReopenError` for a
+   * pre-persistence staleness rejection (always safe to roll back); return
+   * false when the target's progress could not be read/decoded (rolled back
+   * like an unreadable legacy target); any other throw is resolved through
+   * `resolveTargetWritePending`, exactly like a throwing direct write.
+   * Runs INSIDE the meta-root lock — a strict patch invoked from here must
+   * skip the per-task lock (see `patchTaskProgressStrictV1`'s `skipLock`).
+   */
+  writeTarget?: () => Promise<boolean>;
 }
 
 /**
@@ -147,13 +165,15 @@ async function activateTaskLocked(
   const pendingCheckpoint = { ...checkpointBase, pausedFolders: [...changed], phase: "target-write-pending" as const };
   await writeActivationCheckpoint(root, pendingCheckpoint);
 
-  let activated: TaskProgress | undefined;
+  let activated: TaskProgress | boolean | undefined;
   try {
-    activated = await patchTaskProgress(
-      vscode.Uri.file(taskFolderPath),
-      (current) => updateTaskStatus(options?.mutateTarget ? options.mutateTarget(current) : current, "active"),
-      true
-    );
+    activated = options?.writeTarget
+      ? await options.writeTarget()
+      : await patchTaskProgress(
+          vscode.Uri.file(taskFolderPath),
+          (current) => updateTaskStatus(options?.mutateTarget ? options.mutateTarget(current) : current, "active"),
+          true
+        );
   } catch (error) {
     if (error instanceof StaleReopenError) {
       // Thrown by mutateTarget itself, before any persistence — always safe

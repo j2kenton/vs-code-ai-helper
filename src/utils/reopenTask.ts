@@ -5,97 +5,16 @@ import {
   TaskProgress,
   TaskStage,
 } from "../types/taskProgress";
-import {
-  clearEscalation,
-  clearImplReviewFiles,
-  clearLintPayload,
-  clearStageFallbackReservation,
-} from "./taskProgressUtils";
 import { TaskInventory } from "../state/taskInventory";
 import { CurrentTaskStore } from "./currentTaskStore";
 import { activateTask, StaleReopenError } from "../state/taskActivationCoordinator";
+import {
+  invokeLifecycleRowV1,
+} from "../actions/productionTaskActionRuntimeV1";
+import { RESUME_TASK_ACTION_KEY_V1 } from "../actions/rows/resumeTaskRowV1";
+import * as path from "path";
 
 export { StaleReopenError };
-
-/**
- * Build the mutation applied to a completed task's progress when it is
- * reopened at `chosenStage`. Composed by the activation coordinator as
- * `updateTaskStatus(mutateTarget(current), "active")`, so this function is
- * NOT responsible for the `status` flip itself — only for validating that
- * the reopen is still valid and for invalidating/preserving the rest of the
- * task's fields.
- *
- * Field-by-field audit against TaskProgress (types/taskProgress.ts):
- *   - taskFolder, displayName, nameIsDefault, preImageDescription, ownership,
- *     createdAt: non-stage data, untouched.
- *   - status: left alone here; the coordinator's `updateTaskStatus` call sets it.
- *   - completedAt: cleared — the task is no longer in the completed lifecycle.
- *   - completedStages: filtered to stages strictly before `chosenStage` — a
- *     stage can't be simultaneously completed and current/outstanding.
- *   - currentStage: set to `chosenStage`.
- *   - updatedAt: bumped.
- *   - implReviewFiles: cleared only when reopening at "impl" or earlier — the
- *     impl-review stages and Publish consume this as their review scope over
- *     the existing implementation, so a reopen at those stages must keep it.
- *   - lintPayload: always cleared — it's Publish-stage output, stale for any
- *     re-run regardless of which stage is reopened.
- *   - scheduledRun, scheduledResumeTime: always cleared — a one-shot schedule
- *     recorded before completion must not fire against the reopened task.
- *   - reviewAttemptId: always cleared — a stale in-flight review run from
- *     before completion must never finalize a reopened stage.
- *   - fallbackActive, fallbackModelId: cleared for `chosenStage` and every
- *     later stage — no backup-model reservation may survive for a stage
- *     that's about to be (re-)run.
- *   - escalation: always cleared — reopening (whether via Resume or
- *     setTaskStage) is itself the human's answer to any stuck-review
- *     escalation on record, and a task can reach "completed" with one still
- *     attached (e.g. escalated at Publish, then the user chose Publish
- *     Anyway rather than resuming through the paused state first). Without
- *     this, a reopened task would show a stale "escalated" marker in the
- *     tree for a review round that's no longer running.
- */
-export function createReopenMutation(
-  chosenStage: TaskStage,
-  capturedCompletedAt: string | undefined
-): (current: TaskProgress) => TaskProgress {
-  return (current: TaskProgress): TaskProgress => {
-    if (current.status !== "completed" || current.completedAt !== capturedCompletedAt) {
-      throw new StaleReopenError(
-        `Task "${current.taskFolder}" was updated elsewhere before the reopen could be applied.`
-      );
-    }
-
-    const chosenIndex = STAGE_ORDER.indexOf(chosenStage);
-    const implIndex = STAGE_ORDER.indexOf("impl");
-
-    let next: TaskProgress = {
-      ...current,
-      completedAt: undefined,
-      currentStage: chosenStage,
-      completedStages: (current.completedStages ?? []).filter(
-        (stage) => STAGE_ORDER.indexOf(stage) < chosenIndex
-      ),
-      scheduledRun: undefined,
-      scheduledResumeTime: undefined,
-      reviewAttemptId: undefined,
-      updatedAt: new Date().toISOString(),
-    };
-
-    next = clearLintPayload(next);
-    next = clearEscalation(next);
-
-    if (chosenIndex <= implIndex) {
-      next = clearImplReviewFiles(next);
-    }
-
-    for (let i = chosenIndex; i < STAGE_ORDER.length; i++) {
-      const stage = STAGE_ORDER[i];
-      if (stage) next = clearStageFallbackReservation(next, stage);
-    }
-
-    return next;
-  };
-}
 
 /** One item per workflow stage, with Publish listed first (see `pickReopenStage`). */
 function reopenStageItems(): Array<{ label: string; stage: TaskStage }> {
@@ -123,6 +42,15 @@ export interface ReopenCompletedTaskResult {
   message?: string;
 }
 
+/** The slice of a resolved task context the reopen transition needs. */
+export interface ReopenCompletedTaskTargetV1 {
+  readonly taskFolderPath: string;
+  readonly canonicalId: string;
+  readonly folderName: string;
+  readonly progress: TaskProgress;
+  readonly workspaceFolder?: vscode.Uri;
+}
+
 /**
  * Shared reopen transition for a completed task, used by both the Resume
  * command and setTaskStage/setStageAsCurrent so marker capture, stale
@@ -132,25 +60,87 @@ export interface ReopenCompletedTaskResult {
  * any picker/confirmation, so the in-write validation can detect the task
  * being reopened, resumed, or re-completed by another window in the
  * meantime.
+ *
+ * The reopen mutation itself runs through the `resumeTask.v1` registry row
+ * (plan §9): strict decode, persisted-binding validation, and
+ * `applyReopenPolicyV1`'s exhaustive Reopen field column — never the legacy
+ * permissive reader/writer (§9.1). The activation coordinator keeps owning
+ * the surrounding §9.2 sequence (meta-root lock, pause-others, checkpoint,
+ * sole-active focus, refresh) and invokes the row as its target write via
+ * `writeTarget`; `skipTaskLock` rides along because the coordinator already
+ * holds the covering meta-root lock.
  */
 export async function reopenCompletedTask(
   inventory: TaskInventory,
   currentTaskStore: CurrentTaskStore,
-  taskFolderPath: string,
-  canonicalId: string,
+  task: ReopenCompletedTaskTargetV1,
   chosenStage: TaskStage,
   capturedCompletedAt: string | undefined
 ): Promise<ReopenCompletedTaskResult> {
-  const mutateTarget = createReopenMutation(chosenStage, capturedCompletedAt);
+  // Captured across the writeTarget boundary so a non-throwing row rejection
+  // (recovery/failure) can surface its specific message after activateTask
+  // returns false.
+  let rejection: ReopenCompletedTaskResult | undefined;
+
+  const writeTarget = async (): Promise<boolean> => {
+    const outcome = await invokeLifecycleRowV1({
+      actionKey: RESUME_TASK_ACTION_KEY_V1,
+      taskFolderPath: task.taskFolderPath,
+      taskBindingId: task.canonicalId,
+      chatDocumentIdentitySeed: task.canonicalId,
+      workspaceCwd: task.workspaceFolder?.fsPath ?? path.dirname(task.taskFolderPath),
+      taskStatus: task.progress.status ?? "active",
+      taskStage: task.progress.currentStage,
+      rawInput: {
+        taskFolderPath: task.taskFolderPath,
+        selectedStage: chosenStage,
+        ...(capturedCompletedAt !== undefined ? { expectedCompletedAt: capturedCompletedAt } : {}),
+      },
+      skipTaskLock: true,
+    });
+    if (outcome.kind === "completed") {
+      return true;
+    }
+    if (outcome.kind === "failed" && outcome.code === "resumeTask.staleCompletedAt") {
+      // Pre-persistence by construction (the row's CAS threw before any
+      // write) — activateTask rolls back the pause-others writes on this.
+      throw new StaleReopenError(
+        `Task "${task.folderName}" was updated elsewhere before the reopen could be applied.`
+      );
+    }
+    if (outcome.kind === "recoveryRequired") {
+      rejection = {
+        outcome: "failed",
+        message:
+          "Could not reopen the task — its progress file needs recovery. " +
+          "See the task's entry in the Tasks panel.",
+      };
+      return false;
+    }
+    const detail = outcome.kind === "failed" ? outcome.code : outcome.kind;
+    rejection = {
+      outcome: "failed",
+      message: `Could not reopen the task (${detail}). Please refresh the Tasks panel and try again.`,
+    };
+    return false;
+  };
+
   try {
     const activated = await activateTask(
-      inventory, currentTaskStore, taskFolderPath, canonicalId, { mutateTarget }
+      inventory,
+      currentTaskStore,
+      task.taskFolderPath,
+      task.canonicalId,
+      { writeTarget }
     );
     if (!activated) {
-      return {
-        outcome: "failed",
-        message: "Could not reopen the task — its progress file could not be read. Please refresh the Tasks panel and try again.",
-      };
+      return (
+        rejection ?? {
+          outcome: "failed",
+          message:
+            "Could not reopen the task — its progress file could not be read. Please refresh the Tasks panel and try again.",
+        }
+      );
     }
     return { outcome: "reopened" };
   } catch (error) {

@@ -35,6 +35,7 @@ import { createChatSendRowV1 } from "./rows/chatSendRowV1";
 import { createCommitPushMetadataRowV1 } from "./rows/commitPushMetadataRowV1";
 import { createNextStageRowV1 } from "./rows/nextStageRowV1";
 import { createMarkTaskDoneRowV1 } from "./rows/markTaskDoneRowV1";
+import { createResumeTaskRowV1 } from "./rows/resumeTaskRowV1";
 import { createV1RunnerSelectionOpener } from "../runners/runnerRegistry";
 import {
   getChatInteractionTransactionStoreV1,
@@ -62,6 +63,7 @@ export function getProductionTaskActionRegistryV1(): TaskActionRegistryV1 {
       createCommitPushMetadataRowV1(),
       createNextStageRowV1(),
       createMarkTaskDoneRowV1(),
+      createResumeTaskRowV1(),
     ]);
   }
   return registry;
@@ -198,6 +200,8 @@ export async function invokeLifecycleRowV1(options: {
   readonly rawInput: Record<string, unknown>;
   /** Forwarded to `TaskActionRequestV1.lifecycleBeforeWrite` — see its header. */
   readonly beforeWrite?: (patched: TaskProgress) => Promise<void>;
+  /** Forwarded to `TaskActionRequestV1.lifecycleSkipTaskLock` — see its header. */
+  readonly skipTaskLock?: boolean;
 }): Promise<TaskActionOutcomeV1> {
   let chatDocumentId: string;
   try {
@@ -233,6 +237,7 @@ export async function invokeLifecycleRowV1(options: {
       rawInput: options.rawInput,
       cancellationToken: cancellation.token,
       lifecycleBeforeWrite: options.beforeWrite,
+      lifecycleSkipTaskLock: options.skipTaskLock,
     });
   } finally {
     cancellation.dispose();
