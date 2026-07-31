@@ -822,7 +822,7 @@ void describe("resumeTaskArgHasExplicitTask", () => {
 
 import { pauseTask } from "../commands/pauseTask";
 import { resumePausedTask } from "../commands/resumeTask";
-import { patchTaskProgress } from "../utils/taskProgressUtils";
+import { patchTaskProgressStrictV1 as patchTaskProgress } from "../services/taskProgressWriterV1";
 import { updateTaskStatus, updateTaskProgressStage, updateImplReviewFiles } from "../utils/taskProgressTransforms";
 import type { TaskProgress } from "../types/taskProgress";
 

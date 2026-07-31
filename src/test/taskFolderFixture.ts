@@ -23,6 +23,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { TASK_PROGRESS_FILENAME } from "../types/taskProgress";
 import { PersistedTaskOwnershipV1, computeTaskBindingIdV1 } from "../types/taskBindingV1";
+import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 
 /** Fixed `boundAt` for fixture ownership records (any parseable timestamp works). */
 export const OWNED_FIXTURE_BOUND_AT = "2026-07-01T09:00:00.000Z";
@@ -90,4 +91,18 @@ export function makeOwnedTaskFolder(prefix: string): OwnedTaskFolderFixtureV1 {
   fs.mkdirSync(folder, { recursive: true });
   const ownership = writeOwnershipBackedTaskProgress(folder);
   return { folder, ownership, bindingId: computeTaskBindingIdV1(ownership, path.basename(folder)) };
+}
+
+/**
+ * Assertion-read helper for suites that verify on-disk progress after a
+ * command ran (§3.12 endgame: the permissive readTaskProgress is deleted).
+ * Same call shape as the retired reader — undefined for missing/undecodable
+ * — but through the strict decoder, so a fixture a test writes that strict
+ * decode rejects fails loudly at the assertion instead of silently passing.
+ */
+export async function readTaskProgressForTest(
+  taskFolderUri: import("vscode").Uri
+): Promise<import("../types/taskProgress").TaskProgress | undefined> {
+  const result = await readTaskProgressStrictV1(taskFolderUri);
+  return result.ok ? result.decoded.progress : undefined;
 }

@@ -41,7 +41,7 @@ import {
   deactivateNotificationRouter,
 } from "../utils/notificationRouter";
 import { StatusTreeProvider } from "../views/statusView";
-import { readTaskProgress } from "../utils/taskProgressUtils";
+import { readTaskProgressForTest as readTaskProgress } from "./taskFolderFixture";
 import { REVIEW_STAGES, TaskProgress, TaskStage } from "../types/taskProgress";
 import type { AgentTransportV1 } from "../types/agentExecutionV1";
 import { DISCLAIMER_VERSION } from "../legal/disclaimerVersion";

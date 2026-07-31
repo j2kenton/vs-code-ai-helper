@@ -327,13 +327,15 @@ function loadRosteredPaths(failures) {
     return new Set();
   }
   const rows = parsed?.permissiveReaderConsumers;
-  if (!Array.isArray(rows) || rows.length === 0) {
+  if (!Array.isArray(rows)) {
     failures.push(
-      `${FIELDS_INVENTORY_RELATIVE} has no permissiveReaderConsumers rows — the fence fails closed ` +
+      `${FIELDS_INVENTORY_RELATIVE} has no permissiveReaderConsumers array — the fence fails closed ` +
         "rather than treating every consumer location as migrated."
     );
     return new Set();
   }
+  // An EMPTY roster is the §3.12 endgame state: every consumer migrated and
+  // the permissive module deleted. The repo-wide ban below keeps it deleted.
   const rostered = new Set();
   for (const row of rows) {
     if (typeof row?.path !== "string" || row.path.length === 0) {
@@ -351,44 +353,20 @@ function loadRosteredPaths(failures) {
   return rostered;
 }
 
-/** The named V0 boundary must exist, wrap only taskProgressUtils, and export both surfaces. */
-function verifyWrapper(failures, rosteredPaths) {
-  const wrapperPath = path.join(repoRoot, WRAPPER_RELATIVE);
-  if (!fs.existsSync(wrapperPath)) {
-    failures.push(
-      `${WRAPPER_RELATIVE} is missing — plan §3.12 step 1 requires the permissive utilities to be ` +
-        "wrapped as LegacyTaskProgressReaderV0 / LegacyTaskProgressWriterV0."
-    );
-    return;
-  }
-  const wrapperText = fs.readFileSync(wrapperPath, "utf8");
-  const { references, unresolved } = collectModuleReferences(WRAPPER_RELATIVE, wrapperText);
-  const foreign = references.filter((ref) => {
-    const lastSegment = ref.specifier.split("/").pop() ?? ref.specifier;
-    return lastSegment.replace(/\.(js|mjs|cjs|ts|mts|cts)$/, "") !== "taskProgressUtils";
-  });
-  if (foreign.length > 0) {
-    failures.push(
-      `${WRAPPER_RELATIVE} must wrap utils/taskProgressUtils and nothing else, but references: ` +
-        foreign.map((ref) => `${ref.specifier} (${ref.kind})`).join(", ")
-    );
-  }
-  for (const entry of unresolved) {
-    failures.push(
-      `${WRAPPER_RELATIVE}:${entry.line} has a ${entry.kind} with a non-literal module specifier — ` +
-        "the wrapper's imports must be statically verifiable."
-    );
-  }
-  for (const requiredExport of ["LegacyTaskProgressReaderV0", "LegacyTaskProgressWriterV0"]) {
-    if (!wrapperText.includes(`export const ${requiredExport}`)) {
-      failures.push(`${WRAPPER_RELATIVE} does not export ${requiredExport}.`);
+/**
+ * §3.12 step 5 (the Cleanup cohort, landed): the permissive module and its
+ * V0 boundary wrapper are DELETED and may never return. Their basenames
+ * stay in FORBIDDEN_MODULE_NAMES so no file can ever import them again;
+ * this check keeps the module FILES themselves from being recreated.
+ */
+function verifyLegacyModulesStayDeleted(failures) {
+  for (const relative of ["src/utils/taskProgressUtils.ts", WRAPPER_RELATIVE, "src/state/migratePersistedState.ts"]) {
+    if (fs.existsSync(path.join(repoRoot, relative))) {
+      failures.push(
+        `${relative} exists — the permissive legacy progress reader/writer was removed by the Cleanup ` +
+          "cohort (plan §3.12 step 5) and must never be reintroduced; use the strict progress stack."
+      );
     }
-  }
-  if (!rosteredPaths.has(WRAPPER_RELATIVE)) {
-    failures.push(
-      `${WRAPPER_RELATIVE} has lost its permissiveReaderConsumers inventory row — the wrapper must ` +
-        "stay inventoried (cohort cleanup) until the Cleanup cohort removes it with single-owner proof."
-    );
   }
 }
 
@@ -406,33 +384,28 @@ function main() {
   }
 
   const rosteredPaths = loadRosteredPaths(failures);
-  verifyWrapper(failures, rosteredPaths);
+  verifyLegacyModulesStayDeleted(failures);
 
   const files = walkProductionSources(SRC_DIR);
   let fencedV1Count = 0;
-  let armedLocationCount = 0;
-  let trackedConsumerCount = 0;
+  let scannedCount = 0;
   for (const file of files) {
     const relative = toPosix(path.relative(repoRoot, file));
-    if (relative === WRAPPER_RELATIVE) {
-      continue; // verified separately above
-    }
     const isV1Module = FENCED_PATTERNS.some((pattern) => pattern.test(relative));
-    const isConsumerLocation = CONSUMER_LOCATIONS.has(relative);
     const isRostered = rosteredPaths.has(relative);
-    if (isV1Module && isRostered) {
+    if (isRostered) {
+      // Post-endgame the roster is empty; any row that reappears must name
+      // a real, fence-known consumer location (a stale row is an error).
       failures.push(
-        `${relative} matches the fenced V1 module set but holds a permissiveReaderConsumers inventory ` +
-          "row — a V1 module may never be an inventoried consumer of the legacy reader/writer."
+        `${relative} holds a permissiveReaderConsumers inventory row, but the permissive legacy ` +
+          "reader/writer was removed by the Cleanup cohort — remove the stale row."
       );
     }
-    const fenced = isV1Module || (isConsumerLocation && !isRostered);
-    if (!fenced) {
-      if (isConsumerLocation) trackedConsumerCount++;
-      continue;
-    }
+    // §3.12 step 5: the ban is REPO-WIDE — every production file is verified
+    // free of permissive progress imports, so the deleted modules can never
+    // acquire a new consumer.
     if (isV1Module) fencedV1Count++;
-    else armedLocationCount++;
+    scannedCount++;
     const { references, unresolved } = collectModuleReferences(
       relative,
       fs.readFileSync(file, "utf8")
@@ -440,16 +413,18 @@ function main() {
     for (const ref of references) {
       if (isForbiddenSpecifier(ref.specifier)) {
         failures.push(
-          `${relative}:${ref.line} ${ref.kind} of "${ref.specifier}" reaches the permissive legacy ` +
-            "progress reader/writer — fenced modules must use the strict progress stack (plan §3.12 step 2)."
+          `${relative}:${ref.line} ${ref.kind} of "${ref.specifier}" reaches the removed permissive ` +
+            "legacy progress reader/writer — use the strict progress stack (plan §3.12 step 5)."
         );
       }
     }
-    for (const entry of unresolved) {
-      failures.push(
-        `${relative}:${entry.line} has a ${entry.kind} with a non-literal module specifier — the fence ` +
-          "cannot statically verify it; fenced modules must use literal import specifiers."
-      );
+    if (isV1Module) {
+      for (const entry of unresolved) {
+        failures.push(
+          `${relative}:${entry.line} has a ${entry.kind} with a non-literal module specifier — the fence ` +
+            "cannot statically verify it; fenced modules must use literal import specifiers."
+        );
+      }
     }
   }
 
@@ -462,10 +437,9 @@ function main() {
   }
   console.log(
     `✓ progressReaderFence: detector self-test passed (${SELF_TEST_FIXTURES.length} fixtures); ` +
-      `${fencedV1Count} fenced V1 module(s) and ${armedLocationCount} armed migrated location(s) verified ` +
-      "free of permissive progress imports (incl. multiline/re-export/require/dynamic forms); " +
-      `${trackedConsumerCount} inventoried legacy consumer location(s) deferred to verify:task-progress-fields; ` +
-      "the V0 boundary wrapper is present and clean."
+      `${scannedCount} production module(s) verified free of permissive progress imports ` +
+      `(repo-wide ban, incl. multiline/re-export/require/dynamic forms; ${fencedV1Count} strict V1 module(s) ` +
+      "also checked for literal specifiers); the removed legacy modules stay deleted."
   );
 }
 

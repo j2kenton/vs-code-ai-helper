@@ -43,7 +43,7 @@ import {
   deactivateNotificationRouter,
 } from "../utils/notificationRouter";
 import { installOperationNotificationBridge } from "../utils/operationNotificationBridge";
-import { readTaskProgress } from "../utils/taskProgressUtils";
+import { readTaskProgressForTest as readTaskProgress } from "./taskFolderFixture";
 import { IncompleteTask } from "../types/incompleteTask";
 import { REVIEW_STAGES, TaskProgress, TaskStage } from "../types/taskProgress";
 import type { AgentTransportV1 } from "../types/agentExecutionV1";

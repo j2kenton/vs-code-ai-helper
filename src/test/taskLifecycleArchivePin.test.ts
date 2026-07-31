@@ -37,7 +37,7 @@ import {
 } from "../utils/completionLint";
 import { archiveTask, resumeArchivedTask } from "../commands/archiveTask";
 import { isMarkTaskDoneEligible, markTaskDone, selectNextTask } from "../commands/markTaskDone";
-import { readTaskProgress } from "../utils/taskProgressUtils";
+import { readTaskProgressForTest as readTaskProgress } from "./taskFolderFixture";
 import { TaskInventory } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { initNotificationRouter } from "../utils/notificationRouter";

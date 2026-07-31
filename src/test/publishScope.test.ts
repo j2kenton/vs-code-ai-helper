@@ -42,7 +42,7 @@ import * as vscode from "vscode";
 
 import { resolvePublishScopeFolder, runCompletionLint } from "../utils/completionLint";
 import { choosePublishScope } from "../commands/choosePublishScope";
-import { readTaskProgress } from "../utils/taskProgressUtils";
+import { readTaskProgressForTest as readTaskProgress } from "./taskFolderFixture";
 import { TaskInventory } from "../state/taskInventory";
 import { TaskProgress } from "../types/taskProgress";
 import { initNotificationRouter } from "../utils/notificationRouter";

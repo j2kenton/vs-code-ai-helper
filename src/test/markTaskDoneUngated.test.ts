@@ -16,7 +16,7 @@ import { markTaskDone } from "../commands/markTaskDone";
 import { TaskInventory } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { TaskProgress } from "../types/taskProgress";
-import { readTaskProgress } from "../utils/taskProgressUtils";
+import { readTaskProgressForTest as readTaskProgress } from "./taskFolderFixture";
 import {
   deactivateNotificationRouter,
   initNotificationRouter,

@@ -33,7 +33,7 @@ import * as vscode from "vscode";
 import { draftTaskWithAI } from "../commands/draftTaskWithAI";
 import { TaskInventory } from "../state/taskInventory";
 import { TaskProgress } from "../types/taskProgress";
-import { readTaskProgress } from "../utils/taskProgressUtils";
+import { readTaskProgressForTest as readTaskProgress } from "./taskFolderFixture";
 import {
   initNotificationRouter,
   deactivateNotificationRouter,

@@ -326,19 +326,5 @@
       }
     }
   ],
-  "permissiveReaderConsumers": [
-    {
-      "path": "src/utils/legacyTaskProgressV0.ts",
-      "imports": [
-        "createTaskProgress",
-        "findAllTasks",
-        "findIncompleteTasks",
-        "patchTaskProgress",
-        "readTaskProgress",
-        "writeTaskProgress"
-      ],
-      "purpose": "Plan §3.12 step 1's named V0 boundary: wraps the permissive reader/writer as LegacyTaskProgressReaderV0/LegacyTaskProgressWriterV0 by reference (no behavior change); fenced V1 modules are barred from it by verify:progress-reader-fence.",
-      "migrationCohort": "cleanup"
-    }
-  ]
+  "permissiveReaderConsumers": []
 }
