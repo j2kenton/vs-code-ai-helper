@@ -88,7 +88,13 @@ function isModelProviderDisabled(modelId: string | undefined): boolean {
   return isProviderSelectionConfigured() && !isModelProviderEnabled(modelId);
 }
 
-function resolveEffectiveProvider(
+/**
+ * Exported for `runEditActionV1.ts`'s §7.5 availability check ("at least
+ * one selected-provider path supporting request-local tools"): the stage's
+ * stored model must resolve to a Copilot path before an edit action may
+ * begin any task or source read.
+ */
+export function resolveEffectiveProvider(
   modelId: string | undefined
 ): EffectiveProvider {
   const parsed = parseModelSelection(modelId);

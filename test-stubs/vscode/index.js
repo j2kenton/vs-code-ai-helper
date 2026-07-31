@@ -530,4 +530,7 @@ module.exports = {
   env,
   languages,
   TreeView,
+  // The stub models a tool-capable host (the LanguageModel*Part classes
+  // above exist), so it reports the §7.5 host floor.
+  version: "1.100.0",
 };
