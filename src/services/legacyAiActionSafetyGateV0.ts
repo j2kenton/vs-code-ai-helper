@@ -101,23 +101,13 @@ export class LegacyAiActionSafetyGateErrorV0 extends Error {
  * real V1 migration landing in the same change.
  */
 export const LEGACY_AI_ROUTE_DISABLED_V0: ReadonlySet<string> = new Set<string>([
-  // Text 1 (generatePlan.v1), Text 2 (draft.v1), Text 3 (generateImplementation.v1,
-  // review.v1, applyReview.v1, chatSend.v1, commitPushMetadata.v1) migrated onto
-  // the coordinator — see MIGRATED_ACTION_KEYS_V0 below.
-  //
-  // The migrated applyReview.v1 route id above only covers the TEXT
-  // (plan-review) branch of Apply Review. applyReviewEdit below is a
-  // distinct route id for its edit-capable sibling (implementation-review
-  // stages), gated separately (checked at the top of
-  // applyImplementationReviewWithAI in reviewActions.ts) because edit-based
-  // Apply Review does not migrate until plan §7/§7.8's step 16 (read-only
-  // preflight + sealed edit execution). Enabling the text route above must
-  // never implicitly unblock this one.
-  "applyReviewEdit.v1",
-  "fastForward.v1",
-  "implementation.v1",
-  "applyCurrentStage.v1",
-  "lint.v1",
+  // EMPTY since the §7.8 Edit-cohort cutover: the final five ids
+  // (implementation.v1, fastForward.v1, applyReviewEdit.v1,
+  // applyCurrentStage.v1, lint.v1) migrated onto the sealed two-phase
+  // preflight/edit pipeline (runEditActionV1.ts → preflight rows →
+  // editExecution.v1) in the same change that emptied this set. The set —
+  // and the fail-closed assert below — stay in place so a future route
+  // lands disabled-by-default again by adding its id here.
 ]);
 
 /**
@@ -181,6 +171,17 @@ export const MIGRATED_ACTION_KEYS_V0: ReadonlySet<string> = new Set<string>([
   "applyReview.v1",
   "chatSend.v1",
   "commitPushMetadata.v1",
+  // Edit cohort (§7.8): the four preflight actions and the composite
+  // dispatcher, plus the internal mutation session — all running through
+  // the sealed two-phase pipeline. applyCurrentStage.v1 itself never
+  // reaches the provider boundary (it dispatches to the others) but is
+  // migrated in the route sense: its legacy gate id left the disabled set.
+  "implementation.v1",
+  "fastForward.v1",
+  "applyReviewEdit.v1",
+  "lint.v1",
+  "applyCurrentStage.v1",
+  "editExecution.v1",
 ]);
 
 /**

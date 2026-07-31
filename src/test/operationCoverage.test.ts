@@ -21,6 +21,11 @@ const SRC_DIR = path.join(REPO_ROOT, "src");
 const EXEMPT = new Set([
   "taskOperations.ts",
   "runnerRegistry.ts",
+  // The two-phase sealed edit driver (§7.8) always executes UNDER its
+  // callers' tracked operations (executeImplementationRun in
+  // reviewActions.ts and runLintingFixes.ts both wrap it) — it starts no
+  // run of its own.
+  "runEditActionV1.ts",
   // Doc comments name runImplementationForModel/resolveRunnerForModel as the
   // boundary it guards (plan §1.3) without invoking either — it is called
   // FROM inside those functions, not the other way around.

@@ -53,8 +53,8 @@ import {
   checkImplementationAvailabilityForModel,
   recordActiveFallbackModel,
   resolveRunnerForModel,
-  runImplementationForModel,
 } from "../runners/runnerRegistry";
+import { runSealedImplementationV1 } from "./runEditActionV1";
 import { normalizeQualifiedModelId, qualifiedRanModelId } from "../runners/providers";
 import { getQuotaObservation, recordQuotaObservation } from "../utils/quota";
 import {
@@ -411,6 +411,13 @@ interface ExecuteImplementationRunOptions {
    * already holds.
    */
   suppressAutoReviewDispatch?: boolean;
+  /**
+   * The §7.8 registry action key this edit run executes as
+   * ("implementation.v1" by default; applyImplementationReviewWithAI passes
+   * "applyReviewEdit.v1"). Selects the preflight row the sealed two-phase
+   * pipeline runs under — see runSealedImplementationV1.
+   */
+  editActionKey?: string;
 }
 
 /**
@@ -3486,6 +3493,7 @@ async function applyImplementationReviewWithAI(
     {
       ...options,
       suppressAutoReviewDispatch: true,
+      editActionKey: "applyReviewEdit.v1",
       onBusyDetail: options.parentOperation ? (d) => options.parentOperation!.report(d) : undefined,
       onWaitingForUser: options.parentOperation
         ? (w) => options.parentOperation!.setWaitingForUser(w)
@@ -4416,7 +4424,7 @@ async function executeImplementationRun(
     }
   }
 
-  let result: Awaited<ReturnType<typeof runImplementationForModel>> | undefined;
+  let result: Awaited<ReturnType<typeof runSealedImplementationV1>> | undefined;
 
   await vscode.window.withProgress(
     {
@@ -4436,7 +4444,12 @@ async function executeImplementationRun(
         taskOperations.tokenFor(folderUri.fsPath)
       );
       try {
-      result = await runImplementationForModel({
+      // §7.8 cutover: the sealed two-phase pipeline (read-only preflight →
+      // sealed plan → receipted mutation session) replaces the retired
+      // direct-edit runners. Provider/model fallback lives in the
+      // coordinator's ranked selection now.
+      result = await runSealedImplementationV1({
+        editActionKey: options.editActionKey ?? "implementation.v1",
         prompt,
         modelId,
         workspaceUri: workspaceRoot.uri,
@@ -4448,8 +4461,6 @@ async function executeImplementationRun(
         // review stage used only to pick which review to auto-run below).
         stage: "impl",
         taskFolderUri: folderUri,
-        onBusyDetail: options.onBusyDetail,
-        onWaitingForUser: options.onWaitingForUser,
       });
       } finally {
         linked.dispose();

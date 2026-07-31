@@ -19,10 +19,14 @@
  *   `stalePreflight` / `partialEditBlocked` (§7.7) — never auto-retried.
  */
 import * as vscode from "vscode";
+import * as path from "path";
 import { createHash } from "crypto";
 import {
   createProductionTaskActionCoordinatorV1,
 } from "../actions/productionTaskActionRuntimeV1";
+import { ImplementationRunResult } from "../runners/copilotImplementationRunner";
+import { readChatDocumentIdentityV1 } from "../utils/chatHistoryStore";
+import { allocateHex128IdV1 } from "../types/actionCorrelationV1";
 import { EditPreflightActionInputV1 } from "../actions/rows/editPreflightRowsV1";
 import { EDIT_EXECUTION_ACTION_KEY_V1 } from "../actions/rows/editExecutionRowV1";
 import { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
@@ -126,7 +130,12 @@ export function checkEditActionAvailabilityV1(options: {
 }
 
 export type TwoPhaseEditResultV1 =
-  | { readonly kind: "completed"; readonly appliedReceiptIds: readonly string[] }
+  | {
+      readonly kind: "completed";
+      readonly appliedReceiptIds: readonly string[];
+      /** Workspace-relative FILE paths the sealed plan wrote or deleted. */
+      readonly changedPaths: readonly string[];
+    }
   | { readonly kind: "noChanges" }
   | { readonly kind: "questions"; readonly outcome: TaskActionOutcomeV1 }
   | {
@@ -142,6 +151,8 @@ export type TwoPhaseEditResultV1 =
   | {
       readonly kind: "partialEditBlocked";
       readonly appliedReceiptIds: readonly string[];
+      /** File paths of the steps that verifiably applied before the block. */
+      readonly changedPaths: readonly string[];
       readonly reason: string;
     }
   | { readonly kind: "failed"; readonly outcome: TaskActionOutcomeV1 };
@@ -255,16 +266,46 @@ export async function continueSealedEditExecutionV1(
     cancellationToken: options.cancellationToken,
   });
 
+  // FILE paths only (created/replaced/deleted) — directory-only steps are
+  // not "files changed" in the ImplementationRunResult sense.
+  const filePathOfStep = (index: number): string | undefined => {
+    const operation = sealed.operations[index];
+    if (!operation) {
+      return undefined;
+    }
+    return operation.kind === "createFile" ||
+      operation.kind === "replaceFile" ||
+      operation.kind === "deleteFile"
+      ? operation.relativePath
+      : undefined;
+  };
+  const changedPathsForApplied = (count: number): string[] => {
+    const paths: string[] = [];
+    for (let i = 0; i < count; i++) {
+      const filePath = filePathOfStep(i);
+      if (filePath !== undefined) {
+        paths.push(filePath);
+      }
+    }
+    return paths;
+  };
+
   const execution = broker.executionOutcome(sealed.executionId);
   if (editOutcome.kind === "completed" && execution?.state === "completed") {
-    return { kind: "completed", appliedReceiptIds: execution.appliedReceiptIds };
+    return {
+      kind: "completed",
+      appliedReceiptIds: execution.appliedReceiptIds,
+      changedPaths: changedPathsForApplied(sealed.operations.length),
+    };
   }
   // §7.7: the broker's authoritative state — not the provider's own story —
   // decides how a non-clean execution surfaces.
   if (execution?.state === "partialEditBlocked" || (execution?.appliedReceiptIds.length ?? 0) > 0) {
+    const appliedReceiptIds = execution?.appliedReceiptIds ?? [];
     return {
       kind: "partialEditBlocked",
-      appliedReceiptIds: execution?.appliedReceiptIds ?? [],
+      appliedReceiptIds,
+      changedPaths: changedPathsForApplied(appliedReceiptIds.length),
       reason:
         "The edit session stopped after some steps were verified and applied. Applied edits remain in place; " +
         "review them and run a fresh preflight for the remainder.",
@@ -277,4 +318,146 @@ export async function continueSealedEditExecutionV1(
     };
   }
   return { kind: "failed", outcome: editOutcome };
+}
+
+// ---------------------------------------------------------------------------
+// §7.8 cutover adapter: the drop-in replacement for the retired
+// runImplementationForModel call sites (executeImplementationRun in
+// reviewActions.ts, runLintingFixes.ts). Keeps the ImplementationRunResult
+// contract those flows render (run logs, filesChanged review scope,
+// warnings), while the underlying execution is the sealed two-phase
+// pipeline. Provider/model fallback now lives in the coordinator's ranked
+// selection, superseding the legacy in-runner cascade.
+// ---------------------------------------------------------------------------
+
+/** Canonical identity key rule used by CurrentTaskStore/TaskInventory. */
+function canonicalPathKey(fsPath: string): string {
+  const normalized = path.normalize(fsPath);
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+
+export interface RunSealedImplementationOptionsV1 {
+  /** The registry action key of the edit-capable action being run. */
+  readonly editActionKey: string;
+  readonly modelId: string | undefined;
+  readonly prompt: string;
+  readonly workspaceUri: vscode.Uri;
+  readonly token: vscode.CancellationToken;
+  readonly onProgress: (message: string) => void;
+  readonly stage?: TaskStage;
+  readonly taskFolderUri?: vscode.Uri;
+  /** Mirrors the retired runner option: false lets a no-op plan complete. */
+  readonly requireFileChange?: boolean;
+}
+
+export async function runSealedImplementationV1(
+  options: RunSealedImplementationOptionsV1
+): Promise<ImplementationRunResult & { runnerId: string }> {
+  options.onProgress("Preflighting edits (read-only)...");
+
+  const taskBindingId = options.taskFolderUri
+    ? canonicalPathKey(options.taskFolderUri.fsPath)
+    : `workspace:${canonicalPathKey(options.workspaceUri.fsPath)}`;
+  let chatDocumentId: string;
+  try {
+    const identity = options.taskFolderUri
+      ? await readChatDocumentIdentityV1(options.taskFolderUri.fsPath, taskBindingId)
+      : undefined;
+    chatDocumentId = identity?.documentId ?? allocateHex128IdV1();
+  } catch {
+    chatDocumentId = allocateHex128IdV1();
+  }
+
+  const stage = options.stage ?? "impl";
+  const result = await runTwoPhaseEditActionV1({
+    actionKey: options.editActionKey,
+    prompt: options.prompt,
+    taskBinding: { taskBindingId, chatDocumentId },
+    taskStatus: "active",
+    taskStage: stage,
+    workspaceCwd: options.workspaceUri.fsPath,
+    resolveStagePrimaryModel: () => ({ modelId: options.modelId, stage }),
+    stageModelId: options.modelId,
+    cancellationToken: options.token,
+  });
+
+  const runnerId = "copilot-lm";
+  switch (result.kind) {
+    case "completed":
+      options.onProgress("Applied sealed edit plan.");
+      return {
+        status: "completed",
+        filesChanged: [...result.changedPaths],
+        summary:
+          `Applied ${result.appliedReceiptIds.length} sealed edit step(s) with ordered receipts ` +
+          `(${result.changedPaths.length} file(s) changed).`,
+        runnerId,
+      };
+    case "noChanges":
+      if (options.requireFileChange === false) {
+        return {
+          status: "completed",
+          filesChanged: [],
+          summary: "The preflight produced an empty plan — no changes were needed.",
+          runnerId,
+        };
+      }
+      return {
+        status: "failed",
+        filesChanged: [],
+        failureKind: "generic",
+        errorMessage:
+          "The preflight produced no file changes. Review the prompt/plan and run the action again.",
+        runnerId,
+      };
+    case "questions":
+      return {
+        status: "failed",
+        filesChanged: [],
+        failureKind: "generic",
+        errorMessage:
+          "The AI returned structured questions instead of an edit plan. Answer them in Chat With AI and resume the action.",
+        runnerId,
+      };
+    case "unavailable":
+      return {
+        status: "failed",
+        filesChanged: [],
+        failureKind: "temporarily-unavailable",
+        errorMessage: result.reason,
+        runnerId,
+      };
+    case "stalePreflight":
+      return {
+        status: "failed",
+        filesChanged: [],
+        failureKind: "generic",
+        errorMessage: result.reason,
+        runnerId,
+      };
+    case "partialEditBlocked":
+      return {
+        status: "failed",
+        filesChanged: [...result.changedPaths],
+        failureKind: "generic",
+        errorMessage: result.reason,
+        runnerId,
+      };
+    case "failed": {
+      if (result.outcome.kind === "cancelled") {
+        return { status: "cancelled", filesChanged: [], runnerId };
+      }
+      const code =
+        result.outcome.kind === "failed" || result.outcome.kind === "unavailable"
+          ? result.outcome.code
+          : result.outcome.kind;
+      return {
+        status: "failed",
+        filesChanged: [],
+        failureKind: "generic",
+        errorMessage: `The edit action did not complete (${code}).`,
+        runnerId,
+      };
+    }
+  }
 }

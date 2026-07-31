@@ -15,7 +15,7 @@ import {
   ensureStageModelConfigured,
   resolveFreshModelForStage,
 } from "../utils/modelSelection";
-import { runImplementationForModel } from "../runners/runnerRegistry";
+import { runSealedImplementationV1 } from "./runEditActionV1";
 import { checkAndConfirmPromptSize } from "../utils/promptSizeGuard";
 import { ensureAiConsent } from "../utils/aiConsent";
 import { assertLegacyAiRouteAllowedV0 } from "../services/legacyAiActionSafetyGateV0";
@@ -328,11 +328,13 @@ export async function runLintingFixes(
                   if (!context || !(await ensureAiConsent(context))) {
                     return;
                   }
-                  let result: Awaited<ReturnType<typeof runImplementationForModel>> | undefined;
+                  let result: Awaited<ReturnType<typeof runSealedImplementationV1>> | undefined;
                   await vscode.window.withProgress({ location: vscode.ProgressLocation.Window, title: "Applying AI final fixes...", cancellable: true }, async (aiProgress, token) => {
-                    // `model` is resolved from the "publish" stage above —
-                    // fallback bookkeeping must use that same stage.
-                    result = await runImplementationForModel({ modelId: model.modelId, prompt, workspaceUri: workspaceFolder.uri, token, stage: "publish", taskFolderUri: taskFolderUri, onProgress: (message) => aiProgress.report({ message }) });
+                    // §7.8 cutover: the sealed two-phase pipeline replaces
+                    // the retired direct-edit runner. `model` is resolved
+                    // from the "publish" stage above — fallback bookkeeping
+                    // lives in the coordinator's ranked selection.
+                    result = await runSealedImplementationV1({ editActionKey: "lint.v1", modelId: model.modelId, prompt, workspaceUri: workspaceFolder.uri, token, stage: "publish", taskFolderUri: taskFolderUri, onProgress: (message) => aiProgress.report({ message }) });
                   });
                   if (result?.status === "completed") {
                     await runCompletionLint(taskFolderUri, relevantFiles);

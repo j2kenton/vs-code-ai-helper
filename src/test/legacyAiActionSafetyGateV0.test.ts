@@ -57,7 +57,19 @@ const MIGRATED_ROUTE_IDS = [
   "applyReview.v1",
   "chatSend.v1",
   "commitPushMetadata.v1",
+  // Edit cohort (§7.8): migrated onto the sealed two-phase pipeline.
+  "implementation.v1",
+  "fastForward.v1",
+  "applyReviewEdit.v1",
+  "lint.v1",
+  "applyCurrentStage.v1",
 ];
+
+/**
+ * Migrated action keys with NO registered legacy route id: internal-only
+ * actions launched by the two-phase driver, never by a user-facing route.
+ */
+const INTERNAL_MIGRATED_ACTION_KEYS = ["editExecution.v1"];
 
 const GATE_SOURCE_PATH = path.resolve(
   __dirname,
@@ -108,9 +120,12 @@ void describe("LegacyAiActionSafetyGateV0", () => {
       );
     });
 
-    void it("MIGRATED_ACTION_KEYS_V0 contains exactly the migrated route ids", () => {
-      assert.equal(MIGRATED_ACTION_KEYS_V0.size, MIGRATED_ROUTE_IDS.length);
-      for (const routeId of MIGRATED_ROUTE_IDS) {
+    void it("MIGRATED_ACTION_KEYS_V0 contains exactly the migrated route ids plus the internal edit-session key", () => {
+      assert.equal(
+        MIGRATED_ACTION_KEYS_V0.size,
+        MIGRATED_ROUTE_IDS.length + INTERNAL_MIGRATED_ACTION_KEYS.length
+      );
+      for (const routeId of [...MIGRATED_ROUTE_IDS, ...INTERNAL_MIGRATED_ACTION_KEYS]) {
         assert.ok(
           MIGRATED_ACTION_KEYS_V0.has(routeId),
           `MIGRATED_ACTION_KEYS_V0 must contain "${routeId}"`
@@ -245,10 +260,9 @@ void describe("LegacyAiActionSafetyGateV0", () => {
           assertNoUnauthorizedV1CorrelationV0({
             prompt: "hello",
             correlation: {
-              // "fastForward.v1" has not migrated yet — "generatePlan.v1" and
-              // "draft.v1" are covered by the "allows... once migrated" test
-              // below instead.
-              actionKey: "fastForward.v1",
+              // A syntactically plausible key that is genuinely NOT in
+              // MIGRATED_ACTION_KEYS_V0 — every real action has migrated.
+              actionKey: "someFutureAction.v1",
               operationId: "a".repeat(32),
               attemptId: "b".repeat(32),
               taskBindingId: "tb",
