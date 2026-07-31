@@ -43,6 +43,8 @@ import { chooseFallback, getBackupModels } from "../utils/modelFallback";
 import { isAuthenticationFailure, recordQuotaObservation } from "../utils/quota";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { clearStageFallbackReservation } from "../utils/taskProgressTransforms";
+import { createCopilotLmToolSessionTransportV1 } from "../services/languageModelToolSessionV1";
+import { RequestLocalToolHandlerV1 } from "../services/requestLocalToolHandlerV1";
 import { TaskStage } from "../types/taskProgress";
 import { assertNoUnauthorizedV1CorrelationV0 } from "../services/legacyAiActionSafetyGateV0";
 
@@ -785,8 +787,13 @@ export interface V1ReservedProviderV1 {
    * Construction is not invocation: only the execution broker
    * (`agentExecutionBrokerV1.ts`) invokes, after claiming the reservation,
    * and it rejects a transport whose runnerId differs from the handle's.
+   *
+   * `toolHandler` (plan §7.2/§7.4) carries the per-attempt request-local
+   * tool session for `preflight`/`edit` modes — required there, ignored by
+   * `text` transports. The COORDINATOR creates it (read session or edit
+   * broker handler) so the registry stays a pure selection authority.
    */
-  createTransport(): AgentTransportV1;
+  createTransport(toolHandler?: RequestLocalToolHandlerV1): AgentTransportV1;
 }
 
 export type V1ReserveNextResultV1 =
@@ -839,7 +846,7 @@ interface V1CandidateV1 {
   readonly runnerId: string;
   readonly providerId: ProviderId;
   readonly nativeModelId: string | undefined;
-  readonly createTransport: () => AgentTransportV1;
+  readonly createTransport: (toolHandler?: RequestLocalToolHandlerV1) => AgentTransportV1;
 }
 
 /**
@@ -858,8 +865,10 @@ interface V1CandidateV1 {
  * never silently bypassed:
  *  - `text`: Copilot LM plus every CLI provider whose final answer is
  *    capturable from bounded stdout (`cliProviderSupportsV1StdoutCapture`);
- *  - `preflight`/`edit`: no provider qualifies until the request-local
- *    Language Model tool adapter lands (plan §7/executable-order step 15).
+ *  - `preflight`/`edit`: the Copilot LM path only, through the request-local
+ *    tool-session transport (`languageModelToolSessionV1.ts`, plan §7.2);
+ *    CLI providers stay `providerModeUnavailable` — §7.5 explicitly requires
+ *    the absence of a general-workspace CLI edit path.
  *
  * When NO ranked candidate can satisfy the mode, every `reserveNext` returns
  * `providerModeUnavailable` for the whole selection. When a ranked candidate
@@ -897,15 +906,34 @@ export function openV1RunnerSelection(options: {
   const toRankedEntry = (storedModelId: string): RankedEntryV1 => {
     const effective = resolveEffectiveProvider(storedModelId);
     if (effective.kind === "copilot") {
+      const nativeModelId = effective.model;
       if (mode !== "text") {
+        // Preflight/edit run through the request-local LM tool session
+        // (plan §7.2/§7.6): the coordinator supplies the per-attempt tool
+        // handler; constructing without one is a programmer error, never a
+        // model-reachable state.
         return {
-          supported: false,
-          storedModelId,
-          providerLabel: "Copilot",
-          runnerId: "copilot-lm",
+          supported: true,
+          candidate: {
+            storedModelId,
+            providerLabel: "Copilot",
+            runnerId: "copilot-lm",
+            providerId: "copilot",
+            nativeModelId,
+            createTransport: (toolHandler) => {
+              if (!toolHandler) {
+                throw new Error(
+                  `A ${mode} transport requires the coordinator's request-local tool handler.`
+                );
+              }
+              return createCopilotLmToolSessionTransportV1({
+                model: nativeModelId,
+                toolHandler,
+              });
+            },
+          },
         };
       }
-      const nativeModelId = effective.model;
       return {
         supported: true,
         candidate: {

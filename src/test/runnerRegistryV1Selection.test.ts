@@ -173,7 +173,7 @@ void describe("openV1RunnerSelection", () => {
     }
   });
 
-  void it("returns providerModeUnavailable for preflight and edit modes", () => {
+  void it("reserves the Copilot LM tool-session path for preflight and edit modes; CLI backups stay unavailable", () => {
     const stub = installModelSettings({
       "impl-high-review": {
         primary: "copilot:gpt-5",
@@ -185,10 +185,44 @@ void describe("openV1RunnerSelection", () => {
       for (const mode of ["preflight", "edit"] as const) {
         const session = openSession();
         const selection = openSelection({ session, mode, modelId: "copilot:gpt-5" });
+        const firstAttempt = session.allocateAttempt();
+        const first = selection.reserveNext(firstAttempt);
+        assert.equal(first.kind, "reserved", `Copilot must qualify for "${mode}" (plan §7.2)`);
+        if (first.kind === "reserved") {
+          assert.equal(first.reserved.handle.runnerId, "copilot-lm");
+          // The tool-session transport REQUIRES the coordinator's per-attempt
+          // handler — constructing without one is a programmer error.
+          assert.throws(() => first.reserved.createTransport(), /tool handler/);
+        }
+        // Settle the first attempt with a fallback-eligible outcome so the
+        // session permits a fresh attempt for the ranked backup.
+        session.reportAttemptOutcome(firstAttempt, "transportFailurePreResponse");
+        // The CLI backup remains mode-unavailable (§7.5: no general-workspace
+        // CLI edit path) — surfaced as an explicit settled attempt.
+        const second = selection.reserveNext(session.allocateAttempt());
+        assert.equal(second.kind, "candidateUnavailable");
+        if (second.kind === "candidateUnavailable") {
+          assert.equal(second.code, "providerModeUnavailable");
+          assert.equal(second.runnerId, "claude-cli");
+        }
+      }
+    } finally {
+      stub.restore();
+    }
+  });
+
+  void it("returns providerModeUnavailable for preflight/edit when only CLI providers are configured", () => {
+    const stub = installModelSettings({
+      "impl-high-review": { primary: "claude-cli:sonnet", strategy: "switch-to-backup" },
+    });
+    try {
+      for (const mode of ["preflight", "edit"] as const) {
+        const session = openSession();
+        const selection = openSelection({ session, mode, modelId: "claude-cli:sonnet" });
         assert.deepEqual(
           selection.reserveNext(session.allocateAttempt()),
           { kind: "noneRemaining", code: "providerModeUnavailable" },
-          `no provider may qualify for "${mode}" until the request-local tool adapter lands`
+          `a CLI-only configuration must stay unavailable for "${mode}" (§7.5)`
         );
       }
     } finally {
