@@ -5,9 +5,8 @@ import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { TASK_FILENAME, STAGE_DISPLAY_NAMES, TaskProgress } from "../types/taskProgress";
 import { resolveImplementationArtifact } from "../utils/implementationArtifactResolver";
 import { getLowLevelPlanUri } from "../utils/lowLevelPlanArtifactResolver";
-import { IncompleteTask, patchTaskProgress } from "../utils/taskProgressUtils";
+import { IncompleteTask } from "../utils/taskProgressUtils";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
-import { advanceStage } from "../utils/stageTransition";
 import { selectNextTask } from "./markTaskDone";
 import { NotificationRouter } from "../utils/notificationRouter";
 import {
@@ -24,6 +23,7 @@ import {
   TaskOperationHandle,
 } from "../utils/taskOperations";
 import { CHAT_HISTORY_FILENAME, CHAT_HISTORY_CORRUPT_FILENAME } from "../utils/chatHistoryConstants";
+import { isWorkflowPrivatePathV1 } from "../services/workflowPrivacyClassifierV1";
 import { isLegacyAiRouteDisabledV0 } from "../services/legacyAiActionSafetyGateV0";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
 import {
@@ -36,11 +36,14 @@ import { allocateHex128IdV1 } from "../types/actionCorrelationV1";
 import {
   createProductionTaskActionCoordinatorV1,
   getProductionActionConversationOrchestratorV1,
+  invokeLifecycleRowV1,
 } from "../actions/productionTaskActionRuntimeV1";
 import {
   COMMIT_PUSH_METADATA_ACTION_KEY_V1,
   CommitPushMetadataActionInputV1,
 } from "../actions/rows/commitPushMetadataRowV1";
+import { NEXT_STAGE_ACTION_KEY_V1 } from "../actions/rows/nextStageRowV1";
+import { MARK_TASK_DONE_ACTION_KEY_V1 } from "../actions/rows/markTaskDoneRowV1";
 import { ChatInteractionRefV1, ChatInteractionResumeResultV1, ChatViewProvider } from "../views/chatView";
 
 /**
@@ -739,8 +742,61 @@ export function stripSensitiveTaskFiles(
   taskFolderPath: string
 ): string[] {
   const taskRootRelative = taskRootRelativeFor(repoRoot, taskFolderPath);
-  if (taskRootRelative === undefined) return scopedFiles;
-  return scopedFiles.filter((f) => !isSensitiveTaskFile(f, taskRootRelative));
+  return scopedFiles.filter((f) => {
+    // §2.4 rule 5: private/workflow-control paths (the §2.2 classifier's
+    // shape contract — locks, creation-intents, sentinels, atomic temps,
+    // chat transcripts by basename, workflow-runtime families) are never
+    // staged by this command through any list-building path.
+    if (isWorkflowPrivatePathV1(f)) {
+      return false;
+    }
+    return !isSensitiveTaskFile(f, taskRootRelative);
+  });
+}
+
+/**
+ * Read the CURRENT git index (§10.2 step 1 / §2.4 rule 4): every porcelain-v2
+ * record whose staged (X) column reports index content — ordinary staged
+ * changes, staged renames/copies (both endpoints), staged deletions, and
+ * unmerged entries (whose index slots hold conflict content). Untracked and
+ * ignored records carry no index content and are excluded.
+ */
+export async function collectStagedIndexRecordsV1(repoRoot: string): Promise<PorcelainV2Entry[]> {
+  const { stdout } = await runGitCommand(repoRoot, "status", [
+    "--porcelain=v2",
+    "-z",
+    "--untracked-files=all",
+  ]);
+  return parsePorcelainV2Z(stdout).filter((entry) => {
+    const stagedColumn = entry.status.charAt(0);
+    return stagedColumn !== "" && stagedColumn !== "." && stagedColumn !== "?" && stagedColumn !== "!";
+  });
+}
+
+/**
+ * §2.4's index-content rule over already-staged records: a record is
+ * forbidden when EITHER endpoint (destination, or a rename/copy origin) is a
+ * private/workflow-control path per the §2.2 classifier, or a chat
+ * transcript under the task root. Rename tainting must use both endpoints —
+ * a transcript `git mv`'d to an innocuous destination still carries its
+ * content into the index. Callers BLOCK on any hit (§2.4 rule 4: content
+ * someone already put in the index is refused, never silently dropped) —
+ * contrast with `getChangedFiles`, whose exclusions merely OMIT paths from
+ * the staging proposals this command builds itself.
+ */
+export function findForbiddenStagedRecordsV1(
+  entries: readonly PorcelainV2Entry[],
+  repoRoot: string,
+  taskFolderPath: string
+): PorcelainV2Entry[] {
+  const taskRootRelative = taskRootRelativeFor(repoRoot, taskFolderPath);
+  return entries.filter(
+    (entry) =>
+      isWorkflowPrivatePathV1(entry.path) ||
+      (entry.origPath !== undefined && isWorkflowPrivatePathV1(entry.origPath)) ||
+      isSensitiveTaskFile(entry.path, taskRootRelative) ||
+      (entry.origPath !== undefined && isSensitiveTaskFile(entry.origPath, taskRootRelative))
+  );
 }
 
 /**
@@ -769,6 +825,15 @@ export async function getChangedFiles(
   repoFiles: string[];
   runArtifactPaths: string[];
   sensitiveFilePaths: string[];
+  /**
+   * Private/workflow-control paths per the §2.2 classifier
+   * (`isWorkflowPrivatePathV1`) — locks, creation-intents records, sentinels,
+   * atomic-temp debris, workflow-runtime families. Excluded (omitted) from
+   * every staging proposal in every mode (§2.4 rule 5), like
+   * `sensitiveFilePaths` but for control records rather than transcripts;
+   * surfaced to the user so an unexpectedly shrinking commit is explainable.
+   */
+  excludedControlPaths: string[];
 }> {
   try {
     const { stdout } = await runGitCommand(repoRoot, "status", [
@@ -788,6 +853,7 @@ export async function getChangedFiles(
     // Identify run-artifact paths (runs/ and context-pack.md under the task folder)
     const runArtifactPaths: string[] = [];
     const sensitiveFilePaths: string[] = [];
+    const excludedControlPaths: string[] = [];
     const scopedFiles: string[] = [];
     const repoFiles: string[] = [];
 
@@ -815,6 +881,25 @@ export async function getChangedFiles(
         sensitiveFilePaths.push(entry.path);
         if (entry.origPath !== undefined && entry.origPath !== entry.path) {
           sensitiveFilePaths.push(entry.origPath);
+        }
+        continue;
+      }
+
+      // §2.4 rule 5: private/workflow-control paths (the §2.2 classifier)
+      // are omitted from every proposal in every mode. Same either-endpoint
+      // tainting as transcripts above — a control record renamed to an
+      // innocuous destination still carries its content. Omit (not block):
+      // these proposals are built by this command itself, and stray control
+      // debris (a crashed .ensemble-*.lock, an atomic-temp leftover) must
+      // not dead-end publishing — blocking is reserved for content already
+      // in the INDEX (findForbiddenStagedRecordsV1) and post-add divergence.
+      if (
+        isWorkflowPrivatePathV1(entry.path) ||
+        (entry.origPath !== undefined && isWorkflowPrivatePathV1(entry.origPath))
+      ) {
+        excludedControlPaths.push(entry.path);
+        if (entry.origPath !== undefined && entry.origPath !== entry.path) {
+          excludedControlPaths.push(entry.origPath);
         }
         continue;
       }
@@ -859,9 +944,16 @@ export async function getChangedFiles(
       repoFiles: repoFiles.filter((f) => f.length > 0),
       runArtifactPaths,
       sensitiveFilePaths,
+      excludedControlPaths,
     };
   } catch {
-    return { scopedFiles: [], repoFiles: [], runArtifactPaths: [], sensitiveFilePaths: [] };
+    return {
+      scopedFiles: [],
+      repoFiles: [],
+      runArtifactPaths: [],
+      sensitiveFilePaths: [],
+      excludedControlPaths: [],
+    };
   }
 }
 
@@ -1282,6 +1374,46 @@ async function commitAndPushTaskCore(
       );
       return;
     }
+
+    // §10.2 step 1 / §2.4 rule 4: index/privacy checks run FIRST — before
+    // git readiness, lint, and every prompt. Content someone already put in
+    // the INDEX is refused outright (block, no index mutation): unlike the
+    // staging proposals this command builds itself (where control paths are
+    // merely omitted — see getChangedFiles), staged private content would be
+    // published verbatim by the eventual commit, and no later filter of OUR
+    // proposal list can un-stage it.
+    const repoRoot = await resolveGitRepo(resolvedTask.taskFolderPath);
+    if (!repoRoot) {
+      NotificationRouter.showError(
+        "Commit and push failed: Could not find git repository. Make sure the task is inside a git repository."
+      );
+      return;
+    }
+    const stagedIndexRecords = await collectStagedIndexRecordsV1(repoRoot);
+    const forbiddenStaged = findForbiddenStagedRecordsV1(
+      stagedIndexRecords,
+      repoRoot,
+      resolvedTask.taskFolderPath
+    );
+    if (forbiddenStaged.length > 0) {
+      const channel = getCommitPreviewChannel();
+      channel.clear();
+      channel.appendLine("=== Ensemble: Commit and Push blocked — private/workflow-control content in the git index ===");
+      channel.appendLine("");
+      channel.appendLine("These staged entries are Ensemble-private or workflow-control paths and must never be committed:");
+      for (const record of forbiddenStaged) {
+        const rename = record.origPath !== undefined ? `  (from ${renderPath(record.origPath)})` : "";
+        channel.appendLine(`  ${renderPath(record.path)}${rename}`);
+      }
+      channel.appendLine("");
+      channel.appendLine("Unstage them (git restore --staged <path>) and run Commit and Push again.");
+      channel.show(true);
+      NotificationRouter.showError(
+        `Commit and push blocked: ${forbiddenStaged.length} private/workflow-control file(s) are already staged in the git index. ` +
+          "See 'Ensemble: Commit Preview' for the list — unstage them and retry."
+      );
+      return;
+    }
     // Always run fresh checks immediately before a commit. Persisted payloads
     // are informational and may be stale after files were edited. Registered
     // as a child (C1 publish model) so the Publish stage row spins while the
@@ -1399,14 +1531,8 @@ async function commitAndPushTaskCore(
         taskOperations.rootOperationIdFor(lockKey)
       );
       try {
-        // Resolve repository
-        progress.report({ message: "Resolving git repository..." });
-        const repoRoot = await resolveGitRepo(resolvedTask.taskFolderPath);
-        if (!repoRoot) {
-          throw new Error(
-            "Could not find git repository. Make sure the task is inside a git repository."
-          );
-        }
+        // Repository already resolved by the §10.2 index/privacy gate above,
+        // before lint and every prompt — reused here unchanged.
 
         // Handle pre-existing staged changes. When EVERYTHING that changed
         // is already staged, commit/push proceeds without raising an error
@@ -1456,11 +1582,8 @@ async function commitAndPushTaskCore(
         // metadata (task.md, plan.md, run logs), not the code changes.
         progress.report({ message: "Collecting changed files..." });
         let includeTaskFolder = false;
-        let { scopedFiles, repoFiles, runArtifactPaths, sensitiveFilePaths } = await getChangedFiles(
-          repoRoot,
-          resolvedTask.taskFolderPath,
-          includeTaskFolder
-        );
+        let { scopedFiles, repoFiles, runArtifactPaths, sensitiveFilePaths, excludedControlPaths } =
+          await getChangedFiles(repoRoot, resolvedTask.taskFolderPath, includeTaskFolder);
 
         if (scopedFiles.length === 0) {
           // No source changes — everything that changed lives inside the
@@ -1485,11 +1608,8 @@ async function commitAndPushTaskCore(
             return;
           }
           includeTaskFolder = true;
-          ({ scopedFiles, repoFiles, runArtifactPaths, sensitiveFilePaths } = await getChangedFiles(
-            repoRoot,
-            resolvedTask.taskFolderPath,
-            includeTaskFolder
-          ));
+          ({ scopedFiles, repoFiles, runArtifactPaths, sensitiveFilePaths, excludedControlPaths } =
+            await getChangedFiles(repoRoot, resolvedTask.taskFolderPath, includeTaskFolder));
 
           if (scopedFiles.length === 0) {
             // All task-folder changes were run artifacts
@@ -1516,7 +1636,9 @@ async function commitAndPushTaskCore(
               // getChangedFiles has already tagged as sensitive because its
               // rename origin was a transcript, but whose own basename would
               // pass a plain SENSITIVE_TASK_FILE_BASENAMES check.
-              const sensitivePathSet = new Set(sensitiveFilePaths);
+              // Workflow-control paths are equally ineligible for the
+              // run-artifact override (§2.4 rule 5 applies in every mode).
+              const sensitivePathSet = new Set([...sensitiveFilePaths, ...excludedControlPaths]);
               scopedFiles.push(...repoFiles.filter((f) => {
                 if (!(f === taskRelative || f.startsWith(taskRelative + "/"))) return false;
                 return !sensitivePathSet.has(f);
@@ -1592,6 +1714,10 @@ async function commitAndPushTaskCore(
           sensitiveFilePaths.length > 0
             ? `\n\n(${sensitiveFilePaths.length} chat transcript file(s) excluded — plaintext prompt/response content, never staged by this command)`
             : "";
+        const controlExtra =
+          excludedControlPaths.length > 0
+            ? `\n\n(${excludedControlPaths.length} workflow-control/private file(s) excluded — Ensemble runtime records, never staged by this command)`
+            : "";
 
         const confirmMessage =
           `⚠️ Commit and push — please review carefully\n\n` +
@@ -1603,6 +1729,7 @@ async function commitAndPushTaskCore(
           moreNote +
           repoExtra +
           sensitiveExtra +
+          controlExtra +
           `\n\nPushing is outward-facing and largely irreversible.\n` +
           `Run artifacts (runs/, context-pack.md) contain AI prompts and file contents.\n` +
           `See DISCLAIMER.md §4-5 for full risk details.\n\n` +
@@ -1651,6 +1778,13 @@ async function commitAndPushTaskCore(
             channel.appendLine("");
             channel.appendLine("Excluded — chat transcripts (plaintext prompt/response content, never staged by this command):");
             for (const f of sensitiveFilePaths) {
+              channel.appendLine(`  ${renderPath(f)}`);
+            }
+          }
+          if (excludedControlPaths.length > 0) {
+            channel.appendLine("");
+            channel.appendLine("Excluded — workflow-control/private files (Ensemble runtime records, never staged by this command):");
+            for (const f of excludedControlPaths) {
               channel.appendLine(`  ${renderPath(f)}`);
             }
           }
@@ -1749,6 +1883,23 @@ async function commitAndPushTaskCore(
         try {
           if (scopedFiles.length > 0) {
             await runGitCommand(repoRoot, "add", ["--", ...scopedFiles]);
+          }
+          // §2.4 rule 7: re-read the INDEX after staging and verify no
+          // private/workflow-control content slipped in — e.g. a path that
+          // changed shape between the proposal build and the add, or
+          // pre-staged records swept in by the "Commit Everything Together"
+          // path. A hit rolls the staging back (the catch below runs
+          // `git reset`) and aborts before any commit exists.
+          const postAddForbidden = findForbiddenStagedRecordsV1(
+            await collectStagedIndexRecordsV1(repoRoot),
+            repoRoot,
+            resolvedTask.taskFolderPath
+          );
+          if (postAddForbidden.length > 0) {
+            throw new Error(
+              `staging was rolled back — ${postAddForbidden.length} private/workflow-control file(s) reached the git index ` +
+                `(first: ${postAddForbidden[0]!.path}). Unstage or remove them and retry.`
+            );
           }
           progress.report({ message: "Creating commit..." });
           await runGitCommand(repoRoot, "commit", ["-m", confirmedMessage]);
@@ -1914,49 +2065,64 @@ export async function completeCommitAndPushTask(
       lockKey,
       { label: "Complete, Commit and Push", taskName: resolvedTask.folderName, kind: "complete-commit-push" },
       async (op) => {
-      // 1. Transition stage to "publish". Completion itself is ungated (C3):
-      // no checks run here — commitAndPushTaskCore below runs fresh checks and
-      // owns the failing-checks prompt/override flow, so the completion step
-      // can never be blocked by lint/test state.
-      const taskFolderUri = vscode.Uri.file(resolvedTask.taskFolderPath);
-      let transitionResult: Awaited<ReturnType<typeof advanceStage>>;
-      try {
-        transitionResult = await advanceStage(
-          taskFolderUri,
-          resolvedTask.progress.currentStage,
-          "publish",
-          false,
-          "complete-commit-push",
-          false
-        );
-      } catch (error) {
-        // advanceStage throws (rather than resolving falsy) when its
-        // compare-and-set is rejected — e.g. a concurrent transition already
-        // moved this task's stage under the lock. Report it like any other
-        // failed transition instead of an unhandled rejection.
-        const message = error instanceof Error ? error.message : String(error);
+      // 1. Transition stage to "publish", then persist completion — both
+      // through the coordinator's lifecycle rows (§10.2's transfer: the
+      // strict progress stack and the exhaustive field policy own these
+      // writes, never the permissive patch). Completion itself is ungated
+      // (C3): no checks run here — commitAndPushTaskCore below runs fresh
+      // checks and owns the failing-checks prompt/override flow, so the
+      // completion step can never be blocked by lint/test state.
+      const workspaceCwd =
+        resolvedTask.workspaceFolder?.fsPath ?? path.dirname(resolvedTask.taskFolderPath);
+      const stageOutcome = await invokeLifecycleRowV1({
+        actionKey: NEXT_STAGE_ACTION_KEY_V1,
+        taskFolderPath: resolvedTask.taskFolderPath,
+        taskBindingId: resolvedTask.canonicalId,
+        chatDocumentIdentitySeed: resolvedTask.canonicalId,
+        workspaceCwd,
+        taskStatus: resolvedTask.progress.status ?? "active",
+        taskStage: resolvedTask.progress.currentStage,
+        rawInput: {
+          taskFolderPath: resolvedTask.taskFolderPath,
+          // The eligibility check above pinned the stage to impl-low-review;
+          // the row re-validates it as a CAS against the freshly re-read
+          // progress (mirroring the retired advanceStage compare-and-set).
+          expectedSourceStage: "impl-low-review",
+          targetStage: "publish",
+        },
+      });
+      if (stageOutcome.kind !== "completed") {
+        const detail = stageOutcome.kind === "failed" ? stageOutcome.code : stageOutcome.kind;
         NotificationRouter.showWarning(
-          `Could not persist completion for ${resolvedTask.folderName}: ${message}`
-        );
-        return;
-      }
-
-      if (!transitionResult?.persisted) {
-        NotificationRouter.showError(
-          `Could not persist completion for ${resolvedTask.folderName}. Please try again.`
+          `Could not persist completion for ${resolvedTask.folderName}: ${detail}.`
         );
         return;
       }
 
       // Completing this command is a lifecycle transition, not merely reaching
-      // Publish. Persist completion before selecting another task so the one
-      // active-task invariant remains true across refreshes and reloads.
-      await patchTaskProgress(taskFolderUri, (current) => ({
-        ...current,
-        status: "completed",
-        completedAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-      }));
+      // Publish. Persist completion (status + completedAt + the completedStages
+      // tick the markTaskDone policy column owns) before selecting another
+      // task so the one active-task invariant remains true across refreshes
+      // and reloads.
+      const doneOutcome = await invokeLifecycleRowV1({
+        actionKey: MARK_TASK_DONE_ACTION_KEY_V1,
+        taskFolderPath: resolvedTask.taskFolderPath,
+        taskBindingId: resolvedTask.canonicalId,
+        chatDocumentIdentitySeed: resolvedTask.canonicalId,
+        workspaceCwd,
+        // The nextStage row above just landed the task at active/publish —
+        // exactly markTaskDone's eligibility gate.
+        taskStatus: "active",
+        taskStage: "publish",
+        rawInput: { taskFolderPath: resolvedTask.taskFolderPath },
+      });
+      if (doneOutcome.kind !== "completed") {
+        const detail = doneOutcome.kind === "failed" ? doneOutcome.code : doneOutcome.kind;
+        NotificationRouter.showError(
+          `Could not persist completion for ${resolvedTask.folderName}: ${detail}. Please try again.`
+        );
+        return;
+      }
 
       // 2. Refresh inventory
       await inventory.refresh();

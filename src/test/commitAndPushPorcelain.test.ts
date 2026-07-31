@@ -258,23 +258,31 @@ void describe("getChangedFiles chat-transcript exclusion (Option A staging polic
     }
   });
 
-  void it("does not exclude an unrelated file outside the task root that happens to share the transcript basename", async () => {
+  void it("excludes a transcript-basename file even outside the task root — via the §2.2 classifier, into excludedControlPaths", async () => {
+    // Historical behavior staged a same-named file outside the task root
+    // normally (transcript exclusion was task-root-scoped). §2.4's cutover
+    // consults the workflow privacy CLASSIFIER, whose documented contract
+    // treats chat-transcript basenames as private ANYWHERE by path shape —
+    // deliberately conservative, since a transcript's location cannot be
+    // proven from the path alone. Such files are now omitted from staging
+    // proposals and surfaced in excludedControlPaths.
     const repoRoot = makeGitFixture();
     try {
       fs.mkdirSync(path.join(repoRoot, "plans", "task_1"), { recursive: true });
       fs.mkdirSync(path.join(repoRoot, "notes"), { recursive: true });
       fs.writeFileSync(path.join(repoRoot, "notes", CHAT_HISTORY_FILENAME), "unrelated file with the same basename");
 
-      const { scopedFiles, sensitiveFilePaths } = await getChangedFiles(
+      const { scopedFiles, sensitiveFilePaths, excludedControlPaths } = await getChangedFiles(
         repoRoot,
         path.join(repoRoot, "plans", "task_1"),
         false
       );
       assert.ok(
-        scopedFiles.includes(`notes/${CHAT_HISTORY_FILENAME}`),
-        "a same-named file outside the task root must be staged normally"
+        !scopedFiles.includes(`notes/${CHAT_HISTORY_FILENAME}`),
+        "a transcript-basename file must never reach a staging proposal (§2.4 rule 5)"
       );
       assert.ok(!sensitiveFilePaths.includes(`notes/${CHAT_HISTORY_FILENAME}`));
+      assert.ok(excludedControlPaths.includes(`notes/${CHAT_HISTORY_FILENAME}`));
     } finally {
       safeRemoveDir(repoRoot);
     }
@@ -282,17 +290,19 @@ void describe("getChangedFiles chat-transcript exclusion (Option A staging polic
 });
 
 void describe("stripSensitiveTaskFiles (final staging gate)", () => {
-  void it("removes only transcript basenames under the task root", () => {
+  void it("removes transcript basenames everywhere (the §2.2 classifier is repo-wide by path shape)", () => {
     const repoRoot = path.resolve("repo-root");
     const taskFolderPath = path.join(repoRoot, "plans", "task_1");
     const scopedFiles = [
       "src/foo.ts",
       `plans/task_1/${CHAT_HISTORY_FILENAME}`,
       `plans/task_2/${CHAT_HISTORY_CORRUPT_FILENAME}`,
-      "notes/chat-v1.json", // outside the task root — same basename, must survive
+      // Outside the task root — the same basename is still dropped: §2.4's
+      // classifier consult treats transcript basenames as private anywhere.
+      "notes/chat-v1.json",
     ];
     const result = stripSensitiveTaskFiles(scopedFiles, repoRoot, taskFolderPath);
-    assert.deepEqual(result, ["src/foo.ts", "notes/chat-v1.json"]);
+    assert.deepEqual(result, ["src/foo.ts"]);
   });
 
   void it("is a no-op for a list with no sensitive files", () => {
