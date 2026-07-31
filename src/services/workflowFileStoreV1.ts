@@ -179,6 +179,15 @@ class WorkflowFileStoreImplV1 implements WorkflowFileStoreV1 {
     if (forMutation && root.isCurrentlyTrustedForMutation && !root.isCurrentlyTrustedForMutation()) {
       return { ok: false, outcome: unavailableV1("workspaceRootUnsupported") };
     }
+    // READ-ONLY root self-locator: `"."` addresses the registered root
+    // itself — the §7.2 read session must be able to list a root's own
+    // top-level entries (and seed discovery walks) even though the path-
+    // safety rules reject `.` segments inside deeper locators. Mutations
+    // never accept it: the safety resolution below rejects it as before,
+    // so the root directory itself can never be a mutation target.
+    if (!forMutation && locator.relativePath === ".") {
+      return { ok: true, fsPath: path.resolve(root.fsPath), segments: [], root };
+    }
     const resolution = resolveWorkflowFsPathV1(root, locator.relativePath);
     if (!resolution.ok) {
       return { ok: false, outcome: unavailableV1("workspacePathUnsafe") };

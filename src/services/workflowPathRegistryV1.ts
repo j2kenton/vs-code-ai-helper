@@ -85,7 +85,13 @@ import {
  *  - `privateStorage`: the `<context.storageUri>` runtime root (plan §2.1).
  *  - `metaRoot`: a meta root for creation-intent allocation (plan §4.2).
  */
-export type WorkflowRootKindV1 = "taskFolder" | "nonTaskStorage" | "privateStorage" | "metaRoot";
+export type WorkflowRootKindV1 =
+  | "taskFolder"
+  | "nonTaskStorage"
+  | "privateStorage"
+  | "metaRoot"
+  /** An open workspace folder registered for §7 preflight/edit sessions. */
+  | "workspaceFolder";
 
 export interface WorkflowRootRegistrationV1 {
   readonly rootId: string;

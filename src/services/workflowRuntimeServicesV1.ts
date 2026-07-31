@@ -93,7 +93,7 @@ let verifiedTaskFolderBindingIds = new Map<string, string>();
  * its tasks) must never collide with the task-folder/non-task-storage id
  * space above.
  */
-function rootIdFor(kind: "taskfolder" | "private" | "meta", fsPath: string): string {
+function rootIdFor(kind: "taskfolder" | "private" | "meta" | "workspace", fsPath: string): string {
   return `${kind}:${createHash("sha256").update(fsPath, "utf8").digest("hex").slice(0, 16)}`;
 }
 
@@ -572,6 +572,58 @@ export function ensureWorkflowMetaRootV1(fsPath: string): string {
     rebuildFileStore();
   }
   return rootId;
+}
+
+/**
+ * Register one open workspace folder as a §7 preflight/edit root (plan
+ * §7.5's workspace-root gate). Shape rules via `classifyWorkflowRootV1`;
+ * mutation trust is LIVE `vscode.workspace.isTrusted` — an untrusted (or
+ * later-untrusted) workspace can still be read by preflight but never
+ * mutated by the edit broker. Idempotent per path. Throws with the §7.5
+ * failure kind in the message when the folder cannot be registered:
+ * callers map that to `workspaceRootUnsupported`/`workspacePathUnsafe`.
+ */
+export function ensureWorkflowWorkspaceRootV1(fsPath: string): string {
+  const classification = classifyWorkflowRootV1(fsPath);
+  if (!classification.ok) {
+    throw new Error(`workspacePathUnsafe: ${classification.reason}`);
+  }
+  const isOpenWorkspaceFolder = (vscode.workspace.workspaceFolders ?? []).some(
+    (folder) => normalizeForCompareV1(path.resolve(folder.uri.fsPath)) === normalizeForCompareV1(path.resolve(fsPath))
+  );
+  if (!isOpenWorkspaceFolder) {
+    throw new Error("workspaceRootUnsupported: the path is not a currently open workspace folder");
+  }
+  const rootId = rootIdFor("workspace", fsPath);
+  const registeredKind = registry.rootKind(rootId);
+  if (registeredKind !== undefined && registeredKind !== "workspaceFolder") {
+    throw new Error(
+      `workspaceRootUnsupported: this path is already registered as a ${registeredKind} root`
+    );
+  }
+  if (registeredKind === undefined) {
+    registry.registerRoot({
+      rootId,
+      fsPath,
+      kind: "workspaceFolder",
+      trustedForMutation: true,
+      // Live: Workspace Trust can be revoked while a sealed plan is waiting
+      // to execute — the file store consults this before every mutation.
+      isCurrentlyTrustedForMutation: () => vscode.workspace.isTrusted !== false,
+    });
+    rebuildFileStore();
+  }
+  return rootId;
+}
+
+/**
+ * The §7.3 `rootBindingId`: a digest binding a preflight plan to the exact
+ * root registration (id + absolute path) its observations were made under.
+ */
+export function computeWorkspaceRootBindingIdV1(rootId: string, fsPath: string): string {
+  return createHash("sha256")
+    .update(`ensemble-workspace-root-binding-v1\n${JSON.stringify({ fsPath, rootId })}`, "utf8")
+    .digest("hex");
 }
 
 /**
