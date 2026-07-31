@@ -30,7 +30,7 @@ import {
 import { CompletedContentV1 } from "../types/aiResultEnvelope";
 import { StructuredAnswerV1 } from "../types/structuredQuestionV1";
 import { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
-import { TaskStage } from "../types/taskProgress";
+import { TaskProgress, TaskStage } from "../types/taskProgress";
 import {
   CompletedContentTypeNameV1,
   PermittedEnvelopeKindV1,
@@ -75,6 +75,19 @@ export interface LifecycleExecutionContextV1 {
   readonly taskBindingId: string;
   readonly chatDocumentId: string;
   readonly validatedInput: unknown;
+  /**
+   * Lifecycle-only side channel (never available to provider rows, never
+   * part of `validatedInput`/Chat-transaction input snapshots, since it
+   * carries an in-process closure that cannot be canonically digested or
+   * replayed by Resume): an optional effect a row may run atomically inside
+   * its own locked read-modify-write, after its own CAS checks succeed but
+   * before the patched progress is persisted. Threaded from
+   * `TaskActionRequestV1.lifecycleBeforeWrite` — see that field's header for
+   * why this exists (publishing a staged artifact atomically with a stage
+   * transition, e.g. promoting `plan.md` to `plan-final.md` only when the
+   * transition that requires it actually wins its compare-and-swap).
+   */
+  readonly beforeWrite?: (patched: TaskProgress) => Promise<void>;
 }
 
 export type TaskActionPromotionCodeV1 = "completed" | "noChanges";

@@ -1,20 +1,24 @@
 /**
  * Static wiring proof that the activation-order barrier
- * (LegacyCreatingStartupGateV0, plan §1.4) is actually consulted at every
- * site that can publish task inventory or read task state during/after
+ * (TaskCreationStartupReconcilerV1, plan §1.4/§4.1) is actually consulted at
+ * every site that can publish task inventory or read task state during/after
  * activation — not just the first `inventory.refresh()` call.
  *
- * An earlier implementation review found two bypasses: the file-system
- * watcher and configuration-change inventory refreshes in extension.ts
- * called `inventory.refresh()` directly (no `startupGateReady` await), and
- * `resumeTask.ts`'s lifecycle command began task resolution without waiting
- * on the barrier at all. Both are fixed by gating on `startupGateReady` /
- * `LegacyCreatingStartupGateV0.waitUntilReady()` before the first read, and
- * this test proves the gating call's source position precedes the read it
- * guards — mirroring the source-order approach in
- * legacyAiActionSafetyGateWiring.test.ts, since constructing the full
- * ExtensionContext/TaskInventory graph to prove this at runtime is out of
- * scope for this check.
+ * This supersedes legacyCreatingStartupGateWiring.test.ts, which proved the
+ * same call sites against the now-deleted `LegacyCreatingStartupGateV0`. That
+ * module and its dedicated test were removed once every one of its callers
+ * (below) was migrated onto `TaskCreationStartupReconcilerV1` in the same
+ * change (plan §4.1's "wiring cutover" — see that module's own header
+ * comment). The two bypasses an earlier implementation review found — the
+ * file-system watcher and configuration-change inventory refreshes in
+ * extension.ts calling `inventory.refresh()` directly, and `resumeTask.ts`
+ * beginning task resolution without waiting on the barrier at all — remain
+ * fixed by gating on `startupGateReady` / `TaskCreationStartupReconcilerV1.
+ * waitUntilReady()` before the first read; this test proves the gating
+ * call's source position precedes the read it guards — mirroring the
+ * source-order approach in legacyAiActionSafetyGateWiring.test.ts, since
+ * constructing the full ExtensionContext/TaskInventory graph to prove this at
+ * runtime is out of scope for this check.
  */
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
@@ -27,7 +31,7 @@ function readRepoFile(relPath: string): string {
   return fs.readFileSync(path.join(REPO_ROOT, relPath), "utf8");
 }
 
-void describe("LegacyCreatingStartupGateV0 activation-barrier wiring", () => {
+void describe("TaskCreationStartupReconcilerV1 activation-barrier wiring", () => {
   void it("extension.ts gates the progress-watcher refresh callback on startupGateReady before inventory.refresh()", () => {
     const content = readRepoFile("src/extension.ts");
 
@@ -44,6 +48,11 @@ void describe("LegacyCreatingStartupGateV0 activation-barrier wiring", () => {
       gateIndex < refreshIndex,
       "startupGateReady.then(...) must precede inventory.refresh() in onProgressChange " +
         `(gate at ${gateIndex}, refresh at ${refreshIndex})`
+    );
+
+    assert.ok(
+      content.includes('from "./state/taskCreationStartupReconcilerV1"'),
+      "extension.ts derives startupGateReady from TaskCreationStartupReconcilerV1 but does not import it"
     );
   });
 
@@ -68,6 +77,14 @@ void describe("LegacyCreatingStartupGateV0 activation-barrier wiring", () => {
     );
   });
 
+  void it("extension.ts assigns startupGateReady from TaskCreationStartupReconcilerV1.beginClassification", () => {
+    const content = readRepoFile("src/extension.ts");
+    assert.ok(
+      content.includes("TaskCreationStartupReconcilerV1.beginClassification("),
+      "extension.ts must derive startupGateReady from TaskCreationStartupReconcilerV1.beginClassification"
+    );
+  });
+
   void it("taskInventory.ts self-gates refresh() on waitUntilReady() before its first discovery read", () => {
     // Defense-in-depth beyond the extension.ts call-site chains asserted
     // above: TaskInventory.refresh() awaits the barrier internally, so a
@@ -78,45 +95,73 @@ void describe("LegacyCreatingStartupGateV0 activation-barrier wiring", () => {
     const fnIndex = content.indexOf("async refresh(): Promise<void> {");
     assert.ok(fnIndex >= 0, "could not find refresh() in taskInventory.ts");
 
-    const gateIndex = content.indexOf("LegacyCreatingStartupGateV0.waitUntilReady()", fnIndex);
-    assert.ok(gateIndex > fnIndex, "refresh() must await LegacyCreatingStartupGateV0.waitUntilReady()");
+    const gateIndex = content.indexOf("TaskCreationStartupReconcilerV1.waitUntilReady()", fnIndex);
+    assert.ok(gateIndex > fnIndex, "refresh() must await TaskCreationStartupReconcilerV1.waitUntilReady()");
 
     const readIndex = content.indexOf("discoverAllTasks()", fnIndex);
     assert.ok(readIndex > fnIndex, "could not find discoverAllTasks() in refresh()");
 
     assert.ok(
       gateIndex < readIndex,
-      "LegacyCreatingStartupGateV0.waitUntilReady() must precede discoverAllTasks() in refresh() " +
+      "TaskCreationStartupReconcilerV1.waitUntilReady() must precede discoverAllTasks() in refresh() " +
         `(gate at ${gateIndex}, read at ${readIndex})`
     );
 
     assert.ok(
-      content.includes('from "./legacyCreatingStartupGateV0"'),
-      "taskInventory.ts calls LegacyCreatingStartupGateV0.waitUntilReady() but does not import LegacyCreatingStartupGateV0"
+      content.includes('from "./taskCreationStartupReconcilerV1"'),
+      "taskInventory.ts calls TaskCreationStartupReconcilerV1.waitUntilReady() but does not import TaskCreationStartupReconcilerV1"
     );
   });
 
-  void it("resumeTask.ts awaits LegacyCreatingStartupGateV0.waitUntilReady() before its first task-state read", () => {
+  void it("resumeTask.ts awaits TaskCreationStartupReconcilerV1.waitUntilReady() before its first task-state read", () => {
     const content = readRepoFile("src/commands/resumeTask.ts");
 
     const fnIndex = content.indexOf("export async function resumePausedTask(");
     assert.ok(fnIndex >= 0, "could not find resumePausedTask in resumeTask.ts");
 
-    const gateIndex = content.indexOf("LegacyCreatingStartupGateV0.waitUntilReady()", fnIndex);
-    assert.ok(gateIndex > fnIndex, "resumePausedTask must await LegacyCreatingStartupGateV0.waitUntilReady()");
+    const gateIndex = content.indexOf("TaskCreationStartupReconcilerV1.waitUntilReady()", fnIndex);
+    assert.ok(gateIndex > fnIndex, "resumePausedTask must await TaskCreationStartupReconcilerV1.waitUntilReady()");
 
     const readIndex = content.indexOf("resolveTaskContext(", fnIndex);
     assert.ok(readIndex > fnIndex, "could not find resolveTaskContext( in resumePausedTask");
 
     assert.ok(
       gateIndex < readIndex,
-      "LegacyCreatingStartupGateV0.waitUntilReady() must precede resolveTaskContext( in resumePausedTask " +
+      "TaskCreationStartupReconcilerV1.waitUntilReady() must precede resolveTaskContext( in resumePausedTask " +
         `(gate at ${gateIndex}, read at ${readIndex})`
     );
 
     assert.ok(
-      content.includes('from "../state/legacyCreatingStartupGateV0"'),
-      "resumeTask.ts calls LegacyCreatingStartupGateV0.waitUntilReady() but does not import LegacyCreatingStartupGateV0"
+      content.includes('from "../state/taskCreationStartupReconcilerV1"'),
+      "resumeTask.ts calls TaskCreationStartupReconcilerV1.waitUntilReady() but does not import TaskCreationStartupReconcilerV1"
+    );
+  });
+
+  void it("startNewTask.ts awaits TaskCreationStartupReconcilerV1.waitUntilReady() before its first workspace read", () => {
+    const content = readRepoFile("src/commands/startNewTask.ts");
+
+    const fnIndex = content.indexOf("export async function startNewTask(");
+    assert.ok(fnIndex >= 0, "could not find startNewTask in startNewTask.ts");
+
+    const gateIndex = content.indexOf("TaskCreationStartupReconcilerV1.waitUntilReady()", fnIndex);
+    assert.ok(gateIndex > fnIndex, "startNewTask must await TaskCreationStartupReconcilerV1.waitUntilReady()");
+
+    const readIndex = content.indexOf("vscode.workspace.workspaceFolders", fnIndex);
+    assert.ok(readIndex > fnIndex, "could not find the workspaceFolders read in startNewTask");
+
+    assert.ok(
+      gateIndex < readIndex,
+      "TaskCreationStartupReconcilerV1.waitUntilReady() must precede the workspaceFolders read in startNewTask " +
+        `(gate at ${gateIndex}, read at ${readIndex})`
+    );
+
+    assert.ok(
+      content.includes('from "../state/taskCreationStartupReconcilerV1"'),
+      "startNewTask.ts calls TaskCreationStartupReconcilerV1.waitUntilReady() but does not import TaskCreationStartupReconcilerV1"
+    );
+    assert.ok(
+      content.includes("TaskCreationStartupReconcilerV1.getClassifiedFootprints("),
+      "startNewTask.ts must surface legacy `creating` footprints via TaskCreationStartupReconcilerV1.getClassifiedFootprints"
     );
   });
 
@@ -159,10 +204,10 @@ void describe("LegacyCreatingStartupGateV0 activation-barrier wiring", () => {
       const fnIndex = content.indexOf(testCase.fn);
       assert.ok(fnIndex >= 0, `could not find ${testCase.fn} in ${testCase.file}`);
 
-      const gateIndex = content.indexOf("LegacyCreatingStartupGateV0.waitUntilReady()", fnIndex);
+      const gateIndex = content.indexOf("TaskCreationStartupReconcilerV1.waitUntilReady()", fnIndex);
       assert.ok(
         gateIndex > fnIndex,
-        `${testCase.fn} must await LegacyCreatingStartupGateV0.waitUntilReady()`
+        `${testCase.fn} must await TaskCreationStartupReconcilerV1.waitUntilReady()`
       );
 
       const readIndex = content.indexOf(testCase.firstRead, fnIndex);
@@ -170,14 +215,52 @@ void describe("LegacyCreatingStartupGateV0 activation-barrier wiring", () => {
 
       assert.ok(
         gateIndex < readIndex,
-        `LegacyCreatingStartupGateV0.waitUntilReady() must precede ${testCase.firstRead} in ${testCase.fn} ` +
+        `TaskCreationStartupReconcilerV1.waitUntilReady() must precede ${testCase.firstRead} in ${testCase.fn} ` +
           `(gate at ${gateIndex}, read at ${readIndex})`
       );
 
       assert.ok(
-        content.includes('from "../state/legacyCreatingStartupGateV0"'),
-        `${testCase.file} calls LegacyCreatingStartupGateV0.waitUntilReady() but does not import LegacyCreatingStartupGateV0`
+        content.includes('from "../state/taskCreationStartupReconcilerV1"'),
+        `${testCase.file} calls TaskCreationStartupReconcilerV1.waitUntilReady() but does not import TaskCreationStartupReconcilerV1`
       );
     });
   }
+
+  void it("LegacyCreatingStartupGateV0 no longer exists anywhere in the production source tree", () => {
+    // Proves the retirement is complete, not just "unused" — a stray import
+    // left behind would silently keep the old, un-triggered barrier alive
+    // for any caller that still referenced it.
+    const legacyModulePath = path.join(REPO_ROOT, "src", "state", "legacyCreatingStartupGateV0.ts");
+    assert.equal(fs.existsSync(legacyModulePath), false, "legacyCreatingStartupGateV0.ts must be deleted");
+
+    function walk(dir: string, out: string[] = []): string[] {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          walk(full, out);
+        } else if (entry.isFile() && full.endsWith(".ts")) {
+          out.push(full);
+        }
+      }
+      return out;
+    }
+
+    // Checks for the retired module's import specifier (its lowercase file
+    // path), not the exported class-name text: a handful of files' prose
+    // legitimately explains what replaced it and why (this file's own
+    // header/assertions above, and taskCreationStartupReconcilerV1.ts's own
+    // header comment) — that history is useful, not a bypass. An actual
+    // import naming the deleted module would fail to compile in the first
+    // place, but this also catches a stray require()/dynamic-import string.
+    for (const file of walk(path.join(REPO_ROOT, "src"))) {
+      if (path.basename(file) === "taskCreationStartupReconcilerWiring.test.ts") {
+        continue; // this file's own assertions above name the retired path.
+      }
+      const content = fs.readFileSync(file, "utf8");
+      assert.ok(
+        !content.includes("legacyCreatingStartupGateV0"),
+        `${path.relative(REPO_ROOT, file)} still references the retired module path legacyCreatingStartupGateV0`
+      );
+    }
+  });
 });

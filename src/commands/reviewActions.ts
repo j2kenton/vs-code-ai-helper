@@ -34,7 +34,6 @@ import {
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import {
-  advanceStage,
   AUTO_REVIEW_TRANSITIONS,
   computeNextStage,
   StageTransitionResult,
@@ -2008,16 +2007,27 @@ async function handleReviewOutcomeV1(
     chatViewProvider,
   } = ctx;
   if (outcome.kind === "completed") {
-    let transitionToTarget: Awaited<ReturnType<typeof advanceStage>>;
+    let transitionToTarget: StageTransitionResult | undefined;
     try {
-      transitionToTarget = await advanceStage(
-        folderUri,
-        currentStage,
-        targetStage,
-        false,
-        "review-run",
-        false
-      );
+      if (currentStage === targetStage) {
+        // Re-review in place (regenerating a review while the task is
+        // already on its own review stage) is not a stage "advance" —
+        // nextStage.v1 only accepts a strictly-forward targetStage (§3.11),
+        // and this call site never passes an expectedReviewAttemptId or
+        // publishArtifact for the row to enforce anyway. Mirrors legacy
+        // `advanceStage`'s same-stage short circuit as a plain no-op.
+        transitionToTarget = { persisted: true, newStage: targetStage, shouldAutoReview: false };
+      } else {
+        const freshProgressForTransition = await readTaskProgressAdvisoryV1(folderUri);
+        transitionToTarget = await advanceStageViaNextStageRowV1(
+          folderUri,
+          freshProgressForTransition?.status,
+          currentStage,
+          targetStage,
+          false,
+          false
+        );
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       NotificationRouter.showWarning(`Review was generated but stage could not advance: ${message}`);
@@ -2095,11 +2105,12 @@ async function handleReviewOutcomeV1(
           if (next) {
             // Advancing into "impl" must promote plan.md -> plan-final.md,
             // mirroring nextStage's manual handling below. The write itself
-            // is deferred into advanceStage's publishArtifact hook so it
-            // only lands atomically with — and only when — this review
-            // attempt actually wins the CAS. Writing it eagerly here would
-            // let a stale attempt that loses the race still materialize
-            // plan-final.md for a transition that never happens.
+            // is deferred into advanceStageViaNextStageRowV1's publishArtifact
+            // (nextStage.v1's beforeWrite side channel) so it only lands
+            // atomically with — and only when — this review attempt actually
+            // wins the CAS. Writing it eagerly here would let a stale attempt
+            // that loses the race still materialize plan-final.md for a
+            // transition that never happens.
             let publishArtifact: (() => Promise<void>) | undefined;
             if (next === "impl") {
               const promotion = await preparePlanPromotion(folderUri);
@@ -2118,7 +2129,16 @@ async function handleReviewOutcomeV1(
             // fire anyway even though the task is now paused.
             const freshProgressForAdvance = await readTaskProgressAdvisoryV1(folderUri);
             const isPausedForAdvance = freshProgressForAdvance?.status === "paused";
-            const transition = await advanceStage(folderUri, targetStage, next, isPausedForAdvance, "auto-advance", true, reviewAttemptId, publishArtifact);
+            const transition = await advanceStageViaNextStageRowV1(
+              folderUri,
+              freshProgressForAdvance?.status,
+              targetStage,
+              next,
+              isPausedForAdvance,
+              true,
+              reviewAttemptId,
+              publishArtifact
+            );
             if (transition?.persisted) {
               NotificationRouter.showInformation(`Review accepted. Advanced to ${STAGE_DISPLAY_NAMES[next]}.`);
               // Auto-advancing into Implementation must also start the
@@ -2311,11 +2331,11 @@ async function handleReviewOutcomeV1(
         );
       }
     } else {
-      // advanceStage can resolve undefined without throwing — distinct from
-      // the throwing case above (already handled by the surrounding catch) —
-      // when patchTaskProgress could not read task-progress.json at write
-      // time. Falling through silently here left the user with no
-      // indication the review artifact/stage transition failed to persist.
+      // Defensive only: both branches above that set transitionToTarget
+      // either produce persisted:true or throw (caught above), so this is
+      // never actually reached today — kept so a falling-through silent
+      // failure is never left with no indication the review artifact/stage
+      // transition failed to persist.
       NotificationRouter.showWarning(
         `The review for ${folderUri.fsPath} was generated but could not be recorded. Try running the review again.`
       );
@@ -3574,18 +3594,45 @@ async function currentStageArtifactExists(
  *   5. show final info
  */
 /**
- * Persist "Complete Stage & Move On" through the `nextStage.v1` registry
- * row (plan §6.6) — typed coordinator delegation for the literal
- * `STAGE_ORDER` successor. Throws (mirroring `advanceStage`'s CAS-mismatch
- * throw) on any non-`completed` outcome, so callers can share one catch
- * block with the legacy path.
+ * Persist a forward stage transition through the `nextStage.v1` registry row
+ * (plan §6.6) — typed coordinator delegation, including a configured-review-
+ * stage skip (`next` may be beyond the literal `STAGE_ORDER` successor; the
+ * row's `targetStage` input carries it through the same field-policy
+ * transition rather than a synthetic intermediate hop). Throws (mirroring
+ * `advanceStage`'s CAS-mismatch throw) on any non-`completed` outcome, so
+ * callers can share one catch block with other transition kinds still on the
+ * legacy path (manual stage jumps, resets, reopen, recovery).
+ *
+ * Used both by manual "Complete Stage & Move On" and by every review-
+ * triggered forward transition (a review's own stage-advance, and score-based
+ * auto-advance after a review or an implementation run) — see
+ * `nextStageRowV1.ts`'s header for why a same-stage re-review confirmation is
+ * handled by the caller instead of going through this helper.
+ *
+ * @param status  The task's persisted status, read fresh by the caller
+ *   immediately before calling (mirrors `advanceStage`'s own no-staleness
+ *   contract) — used only for the coordinator's eligibility pre-check;
+ *   the row's own field policy independently re-validates `active` inside
+ *   the lock.
+ * @param currentStage  The stage the caller observed as current immediately
+ *   before this call — the row's `expectedSourceStage` CAS.
+ * @param expectedReviewAttemptId  Optional CAS against the freshly re-read
+ *   progress's `reviewAttemptId` (mirrors `advanceStage`'s parameter of the
+ *   same name) — rejects a stale review attempt that lost the race to a
+ *   newer one on the same stage.
+ * @param publishArtifact  Optional side effect (e.g. renaming a staged plan
+ *   into `plan-final.md`) run atomically with the row's CAS check/write via
+ *   `nextStage.v1`'s `beforeWrite` side channel — see that field's header.
  */
 async function advanceStageViaNextStageRowV1(
   folderUri: vscode.Uri,
-  progress: TaskProgress,
+  status: TaskProgress["status"] | undefined,
+  currentStage: TaskStage,
   next: TaskStage,
   isPaused: boolean,
-  optIn: boolean
+  optIn: boolean,
+  expectedReviewAttemptId?: string,
+  publishArtifact?: () => Promise<void>
 ): Promise<StageTransitionResult> {
   // Exactly like the tree/inventory's own canonicalId (a normalized
   // absolute task-folder path) — see invokeLifecycleRowV1's own header for
@@ -3598,15 +3645,24 @@ async function advanceStageViaNextStageRowV1(
     taskBindingId,
     chatDocumentIdentitySeed: folderUri.fsPath,
     workspaceCwd: path.dirname(folderUri.fsPath),
-    taskStatus: progress.status ?? "active",
-    taskStage: progress.currentStage,
-    rawInput: { taskFolderPath: folderUri.fsPath, expectedSourceStage: progress.currentStage },
+    taskStatus: status ?? "active",
+    taskStage: currentStage,
+    rawInput: {
+      taskFolderPath: folderUri.fsPath,
+      expectedSourceStage: currentStage,
+      // Passed explicitly (rather than relying on the row's own default
+      // STAGE_ORDER successor) so a configured-review-stage skip lands
+      // directly on `next` — see this function's header.
+      targetStage: next,
+      ...(expectedReviewAttemptId !== undefined ? { expectedReviewAttemptId } : {}),
+    },
+    beforeWrite: publishArtifact ? async (): Promise<void> => { await publishArtifact(); } : undefined,
   });
   if (outcome.kind !== "completed") {
     throw new Error(outcome.kind === "failed" ? outcome.code : outcome.kind);
   }
   const shouldAutoReview =
-    optIn && !isPaused && isReviewStage(next) && AUTO_REVIEW_TRANSITIONS[progress.currentStage] === next;
+    optIn && !isPaused && isReviewStage(next) && AUTO_REVIEW_TRANSITIONS[currentStage] === next;
   return { persisted: true, newStage: next, shouldAutoReview };
 }
 
@@ -3682,34 +3738,25 @@ export async function nextStage(
   }
 
   // ── Step 1: Persist stage transition ───────────────────────────────────
-  // The literal STAGE_ORDER successor delegates to the nextStage.v1
-  // registry row (plan §6.6's typed coordinator delegation). A
-  // configured-review-stage skip (an optional review stage with no model
-  // configured for this workspace) isn't representable by that row's
-  // single ordered-step transition yet, so it keeps using the legacy
-  // advanceStage helper — see nextStageRowV1.ts's SCOPE note.
-  const literalNext = computeNextStage(resolved.progress.currentStage);
+  // "Complete Stage & Move On" always delegates to the nextStage.v1
+  // registry row (plan §6.6's typed coordinator delegation), including a
+  // configured-review-stage skip — see advanceStageViaNextStageRowV1's
+  // header. The legacy advanceStage helper remains in use for other
+  // transition kinds (manual "Set Task Stage" jumps, resets, reopen,
+  // recovery).
   let transitionResult: StageTransitionResult | undefined;
   try {
-    transitionResult = next === literalNext
-      ? await advanceStageViaNextStageRowV1(
-          resolved.folderUri,
-          resolved.progress,
-          next,
-          resolved.progress.status === "paused",
-          // Completing a stage may start work in its destination only when
-          // the workspace explicitly enables that behavior. Manual stage
-          // selection deliberately does not use this path.
-          completeAndMoveOnTriggersAI()
-        )
-      : await advanceStage(
-          resolved.folderUri,
-          resolved.progress.currentStage,
-          next,
-          resolved.progress.status === "paused",
-          "complete-and-move-on",
-          completeAndMoveOnTriggersAI()
-        );
+    transitionResult = await advanceStageViaNextStageRowV1(
+      resolved.folderUri,
+      resolved.progress.status,
+      resolved.progress.currentStage,
+      next,
+      resolved.progress.status === "paused",
+      // Completing a stage may start work in its destination only when
+      // the workspace explicitly enables that behavior. Manual stage
+      // selection deliberately does not use this path.
+      completeAndMoveOnTriggersAI()
+    );
   } catch (error) {
     // Both paths throw (rather than resolving falsy) on a rejected
     // transition — e.g. an auto-advance already moved this task off the
@@ -4510,12 +4557,13 @@ async function executeImplementationRun(
       try {
         const freshProgress = await readTaskProgressAdvisoryV1(folderUri);
         if (freshProgress?.currentStage === "impl" && freshProgress.status !== "paused") {
-          const transition = await advanceStage(
+          const transition = await advanceStageViaNextStageRowV1(
             folderUri,
+            freshProgress.status,
             "impl",
             "impl-high-review",
             false,
-            "auto-advance"
+            true
           );
           if (transition?.persisted) {
             autoAdvancedToHighReview = true;

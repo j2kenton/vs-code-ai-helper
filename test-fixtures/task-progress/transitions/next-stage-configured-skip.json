@@ -1,0 +1,26 @@
+{
+  "transition": "nextStage",
+  "now": "2026-07-10T09:00:00.000Z",
+  "targetStage": "impl",
+  "input": {
+    "taskFolder": "2026-07-01_task_3",
+    "currentStage": "plan",
+    "status": "active",
+    "createdAt": "2026-07-01T10:00:00.000Z",
+    "updatedAt": "2026-07-02T11:30:00.000Z",
+    "completedStages": ["desc"],
+    "fallbackActive": { "plan": true, "plan-high-review": true },
+    "fallbackModelId": { "plan": "model-x", "plan-high-review": "model-z" }
+  },
+  "expected": {
+    "ensembleProgressVersion": 1,
+    "taskFolder": "2026-07-01_task_3",
+    "currentStage": "impl",
+    "status": "active",
+    "createdAt": "2026-07-01T10:00:00.000Z",
+    "updatedAt": "2026-07-10T09:00:00.000Z",
+    "completedStages": ["desc", "plan"],
+    "fallbackActive": { "plan": false, "plan-high-review": true },
+    "fallbackModelId": { "plan-high-review": "model-z" }
+  }
+}

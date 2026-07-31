@@ -175,7 +175,7 @@ import {
 } from "./taskActionRegistryV1";
 import type { StructuredAnswerV1 } from "../types/structuredQuestionV1";
 import type { V1RunnerSelectionV1 } from "../runners/runnerRegistry";
-import { STAGE_ORDER, TaskStage } from "../types/taskProgress";
+import { STAGE_ORDER, TaskProgress, TaskStage } from "../types/taskProgress";
 
 export class TaskActionCoordinatorErrorV1 extends Error {
   constructor(message: string) {
@@ -284,6 +284,16 @@ export interface TaskActionRequestV1 {
   readonly rawInput: unknown;
   readonly cancellationToken: vscode.CancellationToken;
   readonly preInvocationHook?: () => Promise<void>;
+  /**
+   * Lifecycle-row-only side channel (plan §6.6's `nextStage.v1`): forwarded
+   * verbatim into `LifecycleExecutionContextV1.beforeWrite` for a `"lifecycle"`
+   * row and otherwise ignored (a provider row's admission path never reads
+   * this field). Carries an in-process closure (e.g. promoting a staged
+   * review artifact into place), so — unlike `rawInput` — it is never
+   * validated, digested, or persisted as part of a Chat interaction
+   * transaction's input snapshot; lifecycle rows have no such transaction.
+   */
+  readonly lifecycleBeforeWrite?: (patched: TaskProgress) => Promise<void>;
 }
 
 /**
@@ -1074,6 +1084,7 @@ export function createTaskActionCoordinatorV1(
           taskBindingId: request.taskBinding.taskBindingId,
           chatDocumentId: request.taskBinding.chatDocumentId,
           validatedInput: validation.input,
+          beforeWrite: request.lifecycleBeforeWrite,
         });
         return { kind: "settled", outcome: finalizeOutcome(row, request, operationId, outcome, metrics) };
       } finally {

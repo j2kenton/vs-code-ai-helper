@@ -167,6 +167,63 @@ void describe("taskProgressFieldPolicyV1", () => {
     }
   });
 
+  void it("nextStage honors an explicit targetStage for a configured-review-stage skip", () => {
+    // "plan" -> "impl" directly (skipping both plan review stages), as a
+    // workspace with no plan-review model configured would request.
+    const skipped = applyNextStagePolicyV1(
+      baseProgress({
+        currentStage: "plan",
+        completedStages: ["desc"],
+        fallbackActive: { plan: true, "plan-high-review": true },
+        fallbackModelId: { plan: "model-a", "plan-high-review": "model-b" },
+      }),
+      { now: NOW, targetStage: "impl" }
+    );
+    assert.equal(skipped.ok, true);
+    if (skipped.ok) {
+      assert.equal(skipped.progress.currentStage, "impl");
+      // Only the departing stage ("plan") is marked complete — the skipped
+      // review stages are never ticked by this transition.
+      assert.deepEqual(skipped.progress.completedStages, ["desc", "plan"]);
+      // Only the departing stage's fallback entry is deactivated; the
+      // skipped stage's entry (never a party to this transition) survives.
+      assert.deepEqual(skipped.progress.fallbackActive, {
+        plan: false,
+        "plan-high-review": true,
+      });
+      assert.deepEqual(skipped.progress.fallbackModelId, { "plan-high-review": "model-b" });
+    }
+  });
+
+  void it("nextStage rejects a targetStage that is not strictly forward of the current stage", () => {
+    const equal = applyNextStagePolicyV1(baseProgress({ currentStage: "plan" }), {
+      now: NOW,
+      targetStage: "plan",
+    });
+    assert.equal(equal.ok, false);
+    if (!equal.ok) {
+      assert.equal(equal.code, "invalidTargetStage");
+    }
+
+    const backward = applyNextStagePolicyV1(baseProgress({ currentStage: "impl" }), {
+      now: NOW,
+      targetStage: "plan",
+    });
+    assert.equal(backward.ok, false);
+    if (!backward.ok) {
+      assert.equal(backward.code, "invalidTargetStage");
+    }
+
+    const notAStage = applyNextStagePolicyV1(baseProgress({ currentStage: "plan" }), {
+      now: NOW,
+      targetStage: "not-a-real-stage" as TaskStage,
+    });
+    assert.equal(notAStage.ok, false);
+    if (!notAStage.ok) {
+      assert.equal(notAStage.code, "invalidTargetStage");
+    }
+  });
+
   void it("markTaskDone completes an active task exactly once from the coordinator clock", () => {
     const input = baseProgress({
       currentStage: "publish",
@@ -361,6 +418,7 @@ void describe("taskProgressFieldPolicyV1", () => {
         transition: "nextStage" | "markTaskDone" | "reopen";
         now: string;
         selectedStage?: string;
+        targetStage?: string;
         input: Record<string, unknown>;
         expected: Record<string, unknown>;
       };
@@ -372,7 +430,12 @@ void describe("taskProgressFieldPolicyV1", () => {
       const progress = decoded.decoded.progress;
       const result =
         fixture.transition === "nextStage"
-          ? applyNextStagePolicyV1(progress, { now: fixture.now })
+          ? applyNextStagePolicyV1(progress, {
+              now: fixture.now,
+              ...(fixture.targetStage !== undefined
+                ? { targetStage: fixture.targetStage as TaskStage }
+                : {}),
+            })
           : fixture.transition === "markTaskDone"
             ? applyMarkTaskDonePolicyV1(progress, { now: fixture.now })
             : applyReopenPolicyV1(progress, {

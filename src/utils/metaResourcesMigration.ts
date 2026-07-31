@@ -14,7 +14,7 @@ import { NotificationRouter } from "./notificationRouter";
 import { ensureAutomaticMetaGitIgnore } from "../commands/toggleMetaResourcesGitIgnore";
 import { TaskProgress } from "../types/taskProgress";
 import { readTaskProgress, writeTaskProgress } from "./taskProgressUtils";
-import { LegacyCreatingStartupGateV0 } from "../state/legacyCreatingStartupGateV0";
+import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
 
 const CONFIG_SECTION = "vs-code-ai-helper";
 const META_RESOURCES_PATH_KEY = "metaResourcesPath";
@@ -316,7 +316,7 @@ export async function maybeOfferMetaResourcesMigration(
   // run while the startup creating-folder classification pass is still
   // running. The activation-time offer already chains on startupGateReady;
   // this covers the explicit "Move Ensemble Resources" command route.
-  await LegacyCreatingStartupGateV0.waitUntilReady();
+  await TaskCreationStartupReconcilerV1.waitUntilReady();
   const workspace = vscode.workspace.workspaceFolders?.[0];
   if (!workspace) {
     if (force) {

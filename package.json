@@ -152,6 +152,30 @@
         "icon": "$(pinned)"
       },
       {
+        "command": "vs-code-ai-helper.openFailedTaskCreation",
+        "title": "Open (Recovery)",
+        "category": "Ensemble",
+        "icon": "$(go-to-file)"
+      },
+      {
+        "command": "vs-code-ai-helper.retryTaskCreation",
+        "title": "Retry Task Creation",
+        "category": "Ensemble",
+        "icon": "$(debug-restart)"
+      },
+      {
+        "command": "vs-code-ai-helper.adoptAndRetryTaskCreation",
+        "title": "Adopt and Retry (Keep task.md)",
+        "category": "Ensemble",
+        "icon": "$(debug-restart)"
+      },
+      {
+        "command": "vs-code-ai-helper.safeDeleteFailedTaskCreation",
+        "title": "Safe Delete Task",
+        "category": "Ensemble",
+        "icon": "$(trash)"
+      },
+      {
         "command": "vs-code-ai-helper.filterNotifications",
         "title": "Filter Notifications by Type",
         "category": "Ensemble",
@@ -554,6 +578,26 @@
           "command": "vs-code-ai-helper.unarchiveTask",
           "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^task-archived/",
           "group": "inline@1"
+        },
+        {
+          "command": "vs-code-ai-helper.retryTaskCreation",
+          "when": "view == vs-code-ai-helper.tasksView && viewItem == 'ensemble.task.creationRecovery.v1Recoverable'",
+          "group": "inline@1"
+        },
+        {
+          "command": "vs-code-ai-helper.adoptAndRetryTaskCreation",
+          "when": "view == vs-code-ai-helper.tasksView && viewItem == 'ensemble.task.creationRecovery.preservable'",
+          "group": "inline@1"
+        },
+        {
+          "command": "vs-code-ai-helper.openFailedTaskCreation",
+          "when": "view == vs-code-ai-helper.tasksView && (viewItem == 'ensemble.task.creationRecovery.v1Recoverable' || viewItem == 'ensemble.task.creationRecovery.reconstructible' || viewItem == 'ensemble.task.creationRecovery.pristine' || viewItem == 'ensemble.task.creationRecovery.preservable' || viewItem == 'ensemble.task.creationRecovery.inspectionOnly')",
+          "group": "inline@2"
+        },
+        {
+          "command": "vs-code-ai-helper.safeDeleteFailedTaskCreation",
+          "when": "view == vs-code-ai-helper.tasksView && (viewItem == 'ensemble.task.creationRecovery.v1Recoverable' || viewItem == 'ensemble.task.creationRecovery.preservable')",
+          "group": "inline@3"
         },
         {
           "command": "vs-code-ai-helper.archiveTask",

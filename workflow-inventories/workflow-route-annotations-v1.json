@@ -861,6 +861,92 @@
         "targetActionKey": "review.v1",
         "pregateStabilitySha256": "24e3bd6f0733bb2bf7ee0c6d846f968d52938488274453bd4106dcfa3c65c879"
       }
+    },
+    {
+      "annotationKind": "pregateModifiedRoute",
+      "routeKey": "command:vs-code-ai-helper.resumeTask",
+      "path": "src/commands/resumeTask.ts",
+      "planSection": "§4.5/§4.7 (creation recovery Retry/Adopt-and-Retry Resume follow-up)",
+      "rationale": "Adopt-and-Retry and Safe Delete (commands/taskCreationRecovery.ts) both surface a paused-state notification with a \"Resume\" action bound to vs-code-ai-helper.resumeTask (mirroring Retry's existing identical binding), adding two new treeBindings edges from taskCreationRecovery.ts. No change to resumeTask.ts's own gating/behavior — only the set of literal call sites referencing it.",
+      "owner": "j2kenton",
+      "cohort": "creation",
+      "expiryCohort": "creation",
+      "evidence": {
+        "symbol": "registerResumeTaskCommand",
+        "sourceSpan": "L237-L241",
+        "edgeKind": "pregateModifiedRoute",
+        "targetActionKey": "resumeTask.v1",
+        "pregateStabilitySha256": "2dcd447ffc886d72b5aa5bf20caf85a6f30f2f241453bf8eabb87c4e00cf15d8",
+        "liveStabilitySha256": "fc8dd69cc4258e3aa0d517caccfb0c629486bd821001ae841fe74916c312cd87"
+      }
+    },
+    {
+      "annotationKind": "pregateAddedRoute",
+      "routeKey": "command:vs-code-ai-helper.openFailedTaskCreation",
+      "path": "src/commands/taskCreationRecovery.ts",
+      "planSection": "§4.5/§4.7 (creation recovery commands)",
+      "rationale": "Open recovery command for a `status: \"creating\"` task row (plan §4.5): always safe, no adoption or mutation, works for every plan §4.3 footprint class. Registered via registerTaskCreationRecoveryCommands, gated in package.json's tasksView item-context menu on the six plan §4.7 ensemble.task.creationRecovery.* contextValue tokens (contextTokens.ts).",
+      "owner": "j2kenton",
+      "cohort": "creation",
+      "expiryCohort": "creation",
+      "evidence": {
+        "symbol": "registerTaskCreationRecoveryCommands",
+        "sourceSpan": "L805-L808",
+        "edgeKind": "pregateAddedRoute",
+        "targetActionKey": "creation lifecycle rows (plan §1.2 route table)",
+        "liveStabilitySha256": "f712a52f6e8ae653b87d642f15c94150bc426bf2f07b73eaaf280d8364b851b8"
+      }
+    },
+    {
+      "annotationKind": "pregateAddedRoute",
+      "routeKey": "command:vs-code-ai-helper.retryTaskCreation",
+      "path": "src/commands/taskCreationRecovery.ts",
+      "planSection": "§4.5/§4.7 (creation recovery commands)",
+      "rationale": "Retry recovery command for a `status: \"creating\"` task row (plan §4.5): proceeds only for the \"verified V1 journal\" branch (retryWithoutAdoptionEligible) of a fresh reclassification taken immediately before mutating. Registered via registerTaskCreationRecoveryCommands, gated in package.json on the ensemble.task.creationRecovery.v1Recoverable contextValue token only.",
+      "owner": "j2kenton",
+      "cohort": "creation",
+      "expiryCohort": "creation",
+      "evidence": {
+        "symbol": "registerTaskCreationRecoveryCommands",
+        "sourceSpan": "L809-L813",
+        "edgeKind": "pregateAddedRoute",
+        "targetActionKey": "creation lifecycle rows (plan §1.2 route table)",
+        "liveStabilitySha256": "b3890eefb401c2f493000adef0cd84059ec97c3be6ae953bcda8d6e249c18497"
+      }
+    },
+    {
+      "annotationKind": "pregateAddedRoute",
+      "routeKey": "command:vs-code-ai-helper.adoptAndRetryTaskCreation",
+      "path": "src/commands/taskCreationRecovery.ts",
+      "planSection": "§4.4/§4.5/§4.7 (creation recovery commands)",
+      "rationale": "Adopt-and-Retry recovery command (plan §§4.4/4.5): only for a `preservable` footprint — records the folder's existing task.md as `preservedUser` (never overwritten) via the new taskAdoptionIntentStoreV1.ts, then finishes creation like Retry's tail. Registered via registerTaskCreationRecoveryCommands, gated in package.json on the ensemble.task.creationRecovery.preservable contextValue token only.",
+      "owner": "j2kenton",
+      "cohort": "creation",
+      "expiryCohort": "creation",
+      "evidence": {
+        "symbol": "registerTaskCreationRecoveryCommands",
+        "sourceSpan": "L814-L818",
+        "edgeKind": "pregateAddedRoute",
+        "targetActionKey": "creation lifecycle rows (plan §1.2 route table)",
+        "liveStabilitySha256": "02db0895a89a8fba1e2d4cc135c4cc1172d32978ef815adc42821b5a75059943"
+      }
+    },
+    {
+      "annotationKind": "pregateAddedRoute",
+      "routeKey": "command:vs-code-ai-helper.safeDeleteFailedTaskCreation",
+      "path": "src/commands/taskCreationRecovery.ts",
+      "planSection": "§4.6/§4.7 (creation recovery commands)",
+      "rationale": "Safe Delete recovery command (plan §4.6): only for `retryWithoutAdoptionEligible`/v1Recoverable folders (entries proven by the creation journal) and `preservable` folders (adopted-for-deletion first via taskAdoptionIntentStoreV1.ts). Writes a durable deleteRequested journal via the new taskDeletionIntentStoreV1.ts BEFORE touching disk. Registered via registerTaskCreationRecoveryCommands, gated in package.json on the v1Recoverable/preservable contextValue tokens only.",
+      "owner": "j2kenton",
+      "cohort": "creation",
+      "expiryCohort": "creation",
+      "evidence": {
+        "symbol": "registerTaskCreationRecoveryCommands",
+        "sourceSpan": "L819-L823",
+        "edgeKind": "pregateAddedRoute",
+        "targetActionKey": "creation lifecycle rows (plan §1.2 route table)",
+        "liveStabilitySha256": "4cf5ffb36fc65257e4afcb8cdad81b9aba108bca4661f400832eeb810dd700b6"
+      }
     }
   ]
 }

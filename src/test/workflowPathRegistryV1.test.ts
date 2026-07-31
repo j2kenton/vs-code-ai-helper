@@ -174,6 +174,19 @@ void describe("workflowPathRegistryV1", () => {
       classification: "workflowControl",
     });
 
+    const SHA256_A = "a".repeat(64);
+    const intentFile = registry.creationIntentFile("meta", SHA256_A);
+    assert.deepEqual(intentFile, {
+      locator: { rootId: "meta", relativePath: `creation-intents-v1/intent-${SHA256_A}.json` },
+      classification: "workflowControl",
+    });
+
+    const journalFile = registry.creationJournalFile("meta", SHA256_A);
+    assert.deepEqual(journalFile, {
+      locator: { rootId: "meta", relativePath: `creation-intents-v1/journal-${SHA256_A}.json` },
+      classification: "workflowControl",
+    });
+
     // Every vended locator passes the shared §1.8 relative-path rules.
     for (const allocated of [
       chat,
@@ -188,6 +201,8 @@ void describe("workflowPathRegistryV1", () => {
       editRun,
       leases,
       intents,
+      intentFile,
+      journalFile,
     ]) {
       assert.equal(validateWorkflowRelativePathV1(allocated.locator.relativePath).ok, true);
     }
@@ -207,6 +222,11 @@ void describe("workflowPathRegistryV1", () => {
     );
     assert.throws(() => registry.leasesDir("meta"), WorkflowPathRegistryErrorV1);
     assert.throws(() => registry.creationIntentsDir("storage"), WorkflowPathRegistryErrorV1);
+    assert.throws(() => registry.creationIntentFile("storage", "a".repeat(64)), WorkflowPathRegistryErrorV1);
+    assert.throws(() => registry.creationJournalFile("task", "a".repeat(64)), WorkflowPathRegistryErrorV1);
+    // Malformed digest: wrong length, not a hex128 id (32 chars, too short for a 64-char sha256 digest).
+    assert.throws(() => registry.creationIntentFile("meta", HEX_A), WorkflowPathRegistryErrorV1);
+    assert.throws(() => registry.creationJournalFile("meta", "a".repeat(64).toUpperCase()), WorkflowPathRegistryErrorV1);
 
     assert.throws(() => registry.workflowRuntimeDir("task"), WorkflowPathRegistryErrorV1);
     assert.throws(() => registry.chatTransactionsFamilyDir("meta"), WorkflowPathRegistryErrorV1);

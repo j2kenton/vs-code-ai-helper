@@ -4,7 +4,7 @@ import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { IncompleteTask, patchTaskProgress } from "../utils/taskProgressUtils";
 import { MAX_PINNED_TASKS } from "../types/taskProgress";
 import { NotificationRouter } from "../utils/notificationRouter";
-import { LegacyCreatingStartupGateV0 } from "../state/legacyCreatingStartupGateV0";
+import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
 
 type PinTaskArg =
   | { task?: IncompleteTask }
@@ -36,7 +36,7 @@ export async function pinTask(
 ): Promise<void> {
   // Activation-order barrier (plan §1.4): never read or patch task state
   // while the startup creating-folder classification pass is still running.
-  await LegacyCreatingStartupGateV0.waitUntilReady();
+  await TaskCreationStartupReconcilerV1.waitUntilReady();
   const resolved = await resolveTaskContext(inventory, normalizeArg(explicitArg), {
     allowPaused: true,
   });
@@ -88,7 +88,7 @@ export async function unpinTask(
   explicitArg?: PinTaskArg
 ): Promise<void> {
   // Activation-order barrier (plan §1.4) — same rationale as pinTask above.
-  await LegacyCreatingStartupGateV0.waitUntilReady();
+  await TaskCreationStartupReconcilerV1.waitUntilReady();
   const resolved = await resolveTaskContext(inventory, normalizeArg(explicitArg), {
     allowPaused: true,
   });

@@ -13,7 +13,7 @@ import { NotificationRouter } from "../utils/notificationRouter";
 import { activateTask } from "../state/taskActivationCoordinator";
 import { pickReopenStage, reopenCompletedTask } from "../utils/reopenTask";
 import { runTrackedOperation } from "../utils/taskOperations";
-import { LegacyCreatingStartupGateV0 } from "../state/legacyCreatingStartupGateV0";
+import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
 
 /**
  * Accepted argument shapes for resumeTask.
@@ -93,9 +93,9 @@ export async function resumePausedTask(
   // Block on the startup gate's classification pass before this lifecycle
   // command's first task-state read, so it cannot race the read-only
   // creating-folder reconciliation extension.ts kicks off during activate()
-  // — see LegacyCreatingStartupGateV0's doc comment and startNewTask.ts's
+  // — see TaskCreationStartupReconcilerV1's doc comment and startNewTask.ts's
   // identical use of waitUntilReady().
-  await LegacyCreatingStartupGateV0.waitUntilReady();
+  await TaskCreationStartupReconcilerV1.waitUntilReady();
 
   const hasExplicitTask = resumeTaskArgHasExplicitTask(explicitArg);
   const resolverArg = normalizeResumeTaskArg(explicitArg);

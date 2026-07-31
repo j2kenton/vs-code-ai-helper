@@ -21,7 +21,7 @@ import {
   initNotificationRouter,
   StatusSurface,
 } from "../utils/notificationRouter";
-import { LegacyCreatingStartupGateV0 } from "../state/legacyCreatingStartupGateV0";
+import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
 import { safeRemoveDir } from "./testFsUtils";
 
 function installConfigStub(configuredTaskRoot: string): { restore: () => void } {
@@ -65,6 +65,7 @@ function installRealFsBridge(): { restore: () => void } {
     writeFile: target.writeFile,
     createDirectory: target.createDirectory,
     readDirectory: target.readDirectory,
+    rename: target.rename,
   };
   target.readFile = (uri: vscode.Uri): Promise<Uint8Array> =>
     fs.promises.readFile(uri.fsPath).then((buf) => new Uint8Array(buf));
@@ -79,12 +80,15 @@ function installRealFsBridge(): { restore: () => void } {
       entry.isDirectory() ? vscode.FileType.Directory : vscode.FileType.File,
     ]);
   };
+  target.rename = (source: vscode.Uri, destination: vscode.Uri): Promise<void> =>
+    fs.promises.rename(source.fsPath, destination.fsPath);
   return {
     restore: (): void => {
       target.readFile = originals.readFile;
       target.writeFile = originals.writeFile;
       target.createDirectory = originals.createDirectory;
       target.readDirectory = originals.readDirectory;
+      target.rename = originals.rename;
     },
   };
 }
@@ -295,7 +299,7 @@ void describe("startNewTask — legacy `creating` footprints are never auto-prom
           entries.push({ message, level, filePath });
         },
       };
-      LegacyCreatingStartupGateV0.resetForTests();
+      TaskCreationStartupReconcilerV1.resetForTests();
       try {
         // Seed a folder stuck in "creating" (as if the extension host died
         // mid-creation) with a task.md already written — the exact shape the
@@ -344,7 +348,7 @@ void describe("startNewTask — legacy `creating` footprints are never auto-prom
           "the read-only Open affordance must point at the stuck folder's task.md"
         );
       } finally {
-        LegacyCreatingStartupGateV0.resetForTests();
+        TaskCreationStartupReconcilerV1.resetForTests();
         harness.restore();
       }
     }

@@ -48,6 +48,8 @@ import {
   CHAT_TRANSACTION_FILENAME_V1,
   CHAT_TRANSACTION_RESUME_INVOCATION_CLAIM_FILENAME_V1,
 } from "../types/chatInteractionTransactionV1";
+import { creationIntentFileNameV1, creationJournalFileNameV1 } from "../types/taskCreationIntentV1";
+import { adoptionIntentFileNameV1, adoptionJournalFileNameV1 } from "../types/taskAdoptionIntentV1";
 import { CHAT_HISTORY_FILENAME, CHAT_RECOVERY_SNAPSHOT_FILENAME } from "../utils/chatHistoryConstants";
 import { WorkflowFileLocatorV1 } from "./workflowFileStoreV1";
 import {
@@ -181,10 +183,20 @@ export interface WorkflowPathRegistryV1 {
   ): WorkflowAllocatedPathV1;
   /** `workflow-runtime-v1/edit-runs/<execution-id>` — workflow-control (plan §7). */
   editRunDir(privateRootId: string, executionId: string): WorkflowAllocatedPathV1;
-  /** `workflow-runtime-v1/leases` — workflow-control (plan §2.1). */
+  /** `<meta-root>/leases` — workflow-control (plan §2.1). */
   leasesDir(privateRootId: string): WorkflowAllocatedPathV1;
+  /** `<meta-root>/creation-intents-v1/work-<digest>` — workflow-control (plan §4.2). */
+  creationWorkDir(metaRootId: string, digest: string): WorkflowAllocatedPathV1;
   /** `<meta-root>/creation-intents-v1` — workflow-control (plan §4.2). */
   creationIntentsDir(metaRootId: string): WorkflowAllocatedPathV1;
+  /** `<meta-root>/creation-intents-v1/intent-<digest>.json` — workflow-control (plan §4.2). */
+  creationIntentFile(metaRootId: string, digest: string): WorkflowAllocatedPathV1;
+  /** `<meta-root>/creation-intents-v1/journal-<digest>.json` — workflow-control (plan §4.2). */
+  creationJournalFile(metaRootId: string, digest: string): WorkflowAllocatedPathV1;
+  /** `<meta-root>/creation-intents-v1/adoption-<digest>.json` — workflow-control (plan §4.4). */
+  adoptionIntentFile(metaRootId: string, digest: string): WorkflowAllocatedPathV1;
+  /** `<meta-root>/creation-intents-v1/adoption-journal-<digest>.json` — workflow-control (plan §4.4). */
+  adoptionJournalFile(metaRootId: string, digest: string): WorkflowAllocatedPathV1;
 }
 
 class WorkflowPathRegistryImplV1 implements WorkflowPathRegistryV1 {
@@ -248,6 +260,14 @@ class WorkflowPathRegistryImplV1 implements WorkflowPathRegistryV1 {
     if (!isHex128IdV1(value)) {
       throw new WorkflowPathRegistryErrorV1(
         `${label} must be a 128-bit lowercase 32-hex identity (plan §3.1); refused a malformed value.`
+      );
+    }
+  }
+
+  private static requireSha256Digest(label: string, value: string): void {
+    if (!/^[0-9a-f]{64}$/.test(value)) {
+      throw new WorkflowPathRegistryErrorV1(
+        `${label} must be a lowercase 64-hex SHA-256 digest (plan §4.2); refused a malformed value.`
       );
     }
   }
@@ -422,9 +442,59 @@ class WorkflowPathRegistryImplV1 implements WorkflowPathRegistryV1 {
     );
   }
 
+  creationWorkDir(metaRootId: string, digest: string): WorkflowAllocatedPathV1 {
+    this.requireRootOfKind(metaRootId, "metaRoot");
+    WorkflowPathRegistryImplV1.requireSha256Digest("digest", digest);
+    return this.sealed(
+      metaRootId,
+      `${CREATION_INTENTS_DIRNAME_V1}/work-${digest}`,
+      "workflowControl"
+    );
+  }
+
   creationIntentsDir(metaRootId: string): WorkflowAllocatedPathV1 {
     this.requireRootOfKind(metaRootId, "metaRoot");
     return this.sealed(metaRootId, CREATION_INTENTS_DIRNAME_V1, "workflowControl");
+  }
+
+  creationIntentFile(metaRootId: string, digest: string): WorkflowAllocatedPathV1 {
+    this.requireRootOfKind(metaRootId, "metaRoot");
+    WorkflowPathRegistryImplV1.requireSha256Digest("digest", digest);
+    return this.sealed(
+      metaRootId,
+      `${CREATION_INTENTS_DIRNAME_V1}/${creationIntentFileNameV1(digest)}`,
+      "workflowControl"
+    );
+  }
+
+  creationJournalFile(metaRootId: string, digest: string): WorkflowAllocatedPathV1 {
+    this.requireRootOfKind(metaRootId, "metaRoot");
+    WorkflowPathRegistryImplV1.requireSha256Digest("digest", digest);
+    return this.sealed(
+      metaRootId,
+      `${CREATION_INTENTS_DIRNAME_V1}/${creationJournalFileNameV1(digest)}`,
+      "workflowControl"
+    );
+  }
+
+  adoptionIntentFile(metaRootId: string, digest: string): WorkflowAllocatedPathV1 {
+    this.requireRootOfKind(metaRootId, "metaRoot");
+    WorkflowPathRegistryImplV1.requireSha256Digest("digest", digest);
+    return this.sealed(
+      metaRootId,
+      `${CREATION_INTENTS_DIRNAME_V1}/${adoptionIntentFileNameV1(digest)}`,
+      "workflowControl"
+    );
+  }
+
+  adoptionJournalFile(metaRootId: string, digest: string): WorkflowAllocatedPathV1 {
+    this.requireRootOfKind(metaRootId, "metaRoot");
+    WorkflowPathRegistryImplV1.requireSha256Digest("digest", digest);
+    return this.sealed(
+      metaRootId,
+      `${CREATION_INTENTS_DIRNAME_V1}/${adoptionJournalFileNameV1(digest)}`,
+      "workflowControl"
+    );
   }
 }
 

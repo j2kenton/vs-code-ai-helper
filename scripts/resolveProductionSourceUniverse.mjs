@@ -158,6 +158,17 @@ function loadAnnotations(record) {
       if (entry.disposition === "removed" && !SHA256_RE.test(evidence.pregateSha256 || "")) {
         record(`Annotation ${label} must carry evidence.pregateSha256 (the removed path's digest in the pre-gate snapshot).`);
       }
+      // A "removed" row has no live content, so evidence.liveSha256 (if present) is never
+      // read or compared by this script — it would read as evidence but function as
+      // decoration, exactly the kind of unverified checked-in claim this file exists to
+      // rule out. Only evidence.pregateSha256 applies to removed rows.
+      if (entry.disposition === "removed" && typeof evidence?.liveSha256 === "string" && evidence.liveSha256.length > 0) {
+        record(
+          `Annotation ${label} carries evidence.liveSha256, but a "removed" disposition has no live content to check ` +
+            `it against and this script never reads liveSha256 for removed rows. Delete the field — only ` +
+            `evidence.pregateSha256 applies to removed rows.`
+        );
+      }
       // Plan §1.5: every annotation carries exact span, symbol, edge kind,
       // and target action key — descriptive evidence is mandatory, not
       // optional, so a bare digest can never stand in for a reviewed claim
@@ -557,11 +568,34 @@ async function main() {
     const addedAssets = [...liveAssets].filter((f) => !baselineAssets.has(f));
     const removedAssets = [...baselineAssets].filter((f) => !liveAssets.has(f));
 
-    if (addedFiles.length > 0 || removedFiles.length > 0 || addedAssets.length > 0 || removedAssets.length > 0) {
+    // Membership diffing alone misses in-place content edits to a path the
+    // baseline and live scan both already know about — a stale baseline
+    // digest for an unchanged path set would previously pass silently
+    // (the exact species of gap an implementation review found once for
+    // taskCreationSeedHistoryV1.ts). Compare content digests for every path
+    // present in both, using the same baseline/live digest maps already
+    // computed for the pre-gate comparison above.
+    const baselineDigestsByPath = new Map([
+      ...(baseline.files || []).map((f) => [f.path, f.sha256]),
+      ...(baseline.shippedAssets || []).map((a) => [a.path, a.sha256]),
+    ]);
+    const modifiedFromBaseline = [...liveFiles, ...liveAssets]
+      .filter((p) => baselineFiles.has(p) || baselineAssets.has(p))
+      .filter((p) => baselineDigestsByPath.get(p) !== digestsByPath.get(p))
+      .sort((a, b) => a.localeCompare(b));
+
+    if (
+      addedFiles.length > 0 ||
+      removedFiles.length > 0 ||
+      addedAssets.length > 0 ||
+      removedAssets.length > 0 ||
+      modifiedFromBaseline.length > 0
+    ) {
       record(
         `Production source universe drifted from the checked-in baseline. ` +
           `Files added: ${addedFiles.join(", ") || "(none)"}; removed: ${removedFiles.join(", ") || "(none)"}. ` +
           `Assets added: ${addedAssets.join(", ") || "(none)"}; removed: ${removedAssets.join(", ") || "(none)"}. ` +
+          `Content changed (digest mismatch) for path(s) present in both: ${modifiedFromBaseline.join(", ") || "(none)"}. ` +
           `If this drift is intentional and annotated, re-run with --generate and commit the updated baseline.`
       );
     }

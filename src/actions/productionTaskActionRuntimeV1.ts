@@ -118,6 +118,13 @@ export function getProductionActionConversationOrchestratorV1(): ActionConversat
  * be used. This lazily resolves on first real method access instead, so a
  * lifecycle-only invocation works without that wiring while a provider row
  * still gets the real orchestrator, resolved just slightly later.
+ *
+ * Implemented as an explicit method-by-method delegate rather than a
+ * generic `Proxy` `get` trap: a `Proxy` forwards any property silently, so a
+ * future member added to `ActionConversationOrchestratorV1` would resolve at
+ * runtime with no compile-time signal that this lazy wrapper needs a
+ * matching delegate. Listing every method here makes that omission a build
+ * error instead.
  */
 function lazyProductionActionConversationOrchestratorV1(): ActionConversationOrchestratorV1 {
   let cached: ActionConversationOrchestratorV1 | undefined;
@@ -127,13 +134,20 @@ function lazyProductionActionConversationOrchestratorV1(): ActionConversationOrc
     }
     return cached;
   };
-  return new Proxy({} as ActionConversationOrchestratorV1, {
-    get(_target, prop, receiver): unknown {
-      const orchestrator = resolve();
-      const value: unknown = Reflect.get(orchestrator as object, prop, receiver);
-      return typeof value === "function" ? (value as (...args: unknown[]) => unknown).bind(orchestrator) : value;
-    },
-  });
+  return {
+    admitInvocation: (input) => resolve().admitInvocation(input),
+    discardInvocation: (operationId) => resolve().discardInvocation(operationId),
+    postQuestions: (input) => resolve().postQuestions(input),
+    submitAnswers: (ref, rawAnswers, answerIdempotencyId) =>
+      resolve().submitAnswers(ref, rawAnswers, answerIdempotencyId),
+    resolveResume: (ref, resumeIdempotencyId) => resolve().resolveResume(ref, resumeIdempotencyId),
+    claimResumeInvocation: (ref) => resolve().claimResumeInvocation(ref),
+    recordResumeInvocationOutcome: (ref, outcome) => resolve().recordResumeInvocationOutcome(ref, outcome),
+    cancel: (ref) => resolve().cancel(ref),
+    expire: (ref) => resolve().expire(ref),
+    getRecord: (ref) => resolve().getRecord(ref),
+    loadInteraction: (ref) => resolve().loadInteraction(ref),
+  };
 }
 
 /**
@@ -182,6 +196,8 @@ export async function invokeLifecycleRowV1(options: {
   readonly taskStatus: TaskProgress["status"];
   readonly taskStage: TaskStage;
   readonly rawInput: Record<string, unknown>;
+  /** Forwarded to `TaskActionRequestV1.lifecycleBeforeWrite` — see its header. */
+  readonly beforeWrite?: (patched: TaskProgress) => Promise<void>;
 }): Promise<TaskActionOutcomeV1> {
   let chatDocumentId: string;
   try {
@@ -216,6 +232,7 @@ export async function invokeLifecycleRowV1(options: {
       taskStage: options.taskStage,
       rawInput: options.rawInput,
       cancellationToken: cancellation.token,
+      lifecycleBeforeWrite: options.beforeWrite,
     });
   } finally {
     cancellation.dispose();

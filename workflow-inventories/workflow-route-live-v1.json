@@ -3,9 +3,24 @@
   "generatedBy": "scripts/generateWorkflowRoutes.mjs",
   "description": "Mechanically extracted workflow route surface of the current working tree (plan §1.2): command registrations, contribution/menu references, internal executeCommand edges, dynamic dispatch sites, webview message roots, tree-item command bindings, provider-boundary call sites, legacy output destinations, and per-file legacy-AI-gate calls — every edge a concrete route row. Scanned over the exact §1.1 production source universe (never a filesystem walk). Regenerated every run; classification lives in workflow-route-baseline-v1.json; the immutable pre-gate reference is workflow-route-pregate-v1.json. Known mechanical bound: tree-item/status-row command bindings are collected only when the bound command ID is a string literal — dynamically bound commands are enforced at their executeCommand dispatch sites instead (dynamicDispatches, which fail closed without an annotation). sourceUniverseSha256 is the CANONICAL (line-ending-independent) digest of the source-universe JSON, so provenance is identical across LF and CRLF checkouts.",
   "sourceUniverse": "workflow-inventories/workflow-production-source-baseline-v1.json",
-  "sourceUniverseSha256": "e2f80df32b608e763332f22a62f9050d1eb05fe6cb98465eb27c708eea27fedc",
-  "routeCount": 109,
+  "sourceUniverseSha256": "79e620bb086243566851daebe706d74688e3bae024fd6ddaa92cf957f00166f9",
+  "routeCount": 113,
   "routes": [
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.adoptAndRetryTaskCreation",
+      "path": "src/commands/taskCreationRecovery.ts",
+      "span": "L971-L975",
+      "registrationSymbol": "registerTaskCreationRecoveryCommands",
+      "contributed": true,
+      "keybound": false,
+      "menus": [
+        "view/item/context"
+      ],
+      "treeBindings": [],
+      "fileGateRouteIds": [],
+      "fileEdgesOut": []
+    },
     {
       "kind": "command",
       "commandId": "vs-code-ai-helper.applyCurrentStageAction",
@@ -63,7 +78,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.applyReviewEditWithAI",
       "path": "src/commands/reviewActions.ts",
-      "span": "L4946-L4950",
+      "span": "L4994-L4998",
       "registrationSymbol": "registerReviewActionCommands",
       "contributed": true,
       "keybound": false,
@@ -87,7 +102,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.applyReviewWithAI",
       "path": "src/commands/reviewActions.ts",
-      "span": "L4941-L4945",
+      "span": "L4989-L4993",
       "registrationSymbol": "registerReviewActionCommands",
       "contributed": true,
       "keybound": false,
@@ -128,7 +143,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.cancelOperation",
       "path": "src/extension.ts",
-      "span": "L534-L545",
+      "span": "L556-L567",
       "registrationSymbol": "activate",
       "contributed": true,
       "keybound": false,
@@ -192,7 +207,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.chooseReleaseTarget",
       "path": "src/commands/reviewActions.ts",
-      "span": "L4977-L5001",
+      "span": "L5025-L5049",
       "registrationSymbol": "registerReviewActionCommands",
       "contributed": true,
       "keybound": false,
@@ -214,7 +229,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.clearNotifications",
       "path": "src/extension.ts",
-      "span": "L522-L525",
+      "span": "L544-L547",
       "registrationSymbol": "activate",
       "contributed": true,
       "keybound": false,
@@ -231,7 +246,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.collapseAllTasks",
       "path": "src/extension.ts",
-      "span": "L633-L643",
+      "span": "L655-L665",
       "registrationSymbol": "collapseAllCommand",
       "contributed": true,
       "keybound": false,
@@ -256,21 +271,21 @@
         "view/item/context"
       ],
       "treeBindings": [
-        "src/commands/reviewActions.ts#L2071-L2071",
-        "src/commands/reviewActions.ts#L2084-L2084",
-        "src/commands/reviewActions.ts#L2229-L2229",
-        "src/commands/reviewActions.ts#L2267-L2267",
-        "src/commands/reviewActions.ts#L2279-L2279",
-        "src/commands/reviewActions.ts#L2306-L2306",
-        "src/commands/reviewActions.ts#L2364-L2364",
-        "src/commands/reviewActions.ts#L3233-L3233",
-        "src/commands/reviewActions.ts#L3258-L3258",
-        "src/commands/reviewActions.ts#L3291-L3291",
-        "src/commands/reviewActions.ts#L3307-L3307",
-        "src/commands/reviewActions.ts#L3345-L3345",
-        "src/commands/reviewActions.ts#L3827-L3827",
-        "src/commands/reviewActions.ts#L3852-L3852",
-        "src/commands/reviewActions.ts#L3867-L3867",
+        "src/commands/reviewActions.ts#L2081-L2081",
+        "src/commands/reviewActions.ts#L2094-L2094",
+        "src/commands/reviewActions.ts#L2249-L2249",
+        "src/commands/reviewActions.ts#L2287-L2287",
+        "src/commands/reviewActions.ts#L2299-L2299",
+        "src/commands/reviewActions.ts#L2326-L2326",
+        "src/commands/reviewActions.ts#L2384-L2384",
+        "src/commands/reviewActions.ts#L3253-L3253",
+        "src/commands/reviewActions.ts#L3278-L3278",
+        "src/commands/reviewActions.ts#L3311-L3311",
+        "src/commands/reviewActions.ts#L3327-L3327",
+        "src/commands/reviewActions.ts#L3365-L3365",
+        "src/commands/reviewActions.ts#L3874-L3874",
+        "src/commands/reviewActions.ts#L3899-L3899",
+        "src/commands/reviewActions.ts#L3914-L3914",
         "src/commands/setTaskStage.ts#L293-L293"
       ],
       "fileGateRouteIds": [
@@ -355,7 +370,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.expandAllTasks",
       "path": "src/extension.ts",
-      "span": "L622-L632",
+      "span": "L644-L654",
       "registrationSymbol": "expandAllCommand",
       "contributed": true,
       "keybound": false,
@@ -389,7 +404,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.fastForwardReviewWithAI",
       "path": "src/commands/reviewActions.ts",
-      "span": "L4951-L4955",
+      "span": "L4999-L5003",
       "registrationSymbol": "registerReviewActionCommands",
       "contributed": true,
       "keybound": false,
@@ -415,7 +430,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.filterNotifications",
       "path": "src/extension.ts",
-      "span": "L526-L529",
+      "span": "L548-L551",
       "registrationSymbol": "activate",
       "contributed": true,
       "keybound": false,
@@ -432,7 +447,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.filterTasksByStatus",
       "path": "src/extension.ts",
-      "span": "L649-L652",
+      "span": "L671-L674",
       "registrationSymbol": "activate",
       "contributed": true,
       "keybound": false,
@@ -449,7 +464,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.generateImplementationWithAI",
       "path": "src/commands/reviewActions.ts",
-      "span": "L4932-L4936",
+      "span": "L4980-L4984",
       "registrationSymbol": "registerReviewActionCommands",
       "contributed": false,
       "keybound": false,
@@ -479,7 +494,7 @@
         "view/item/context"
       ],
       "treeBindings": [
-        "src/commands/reviewActions.ts#L3784-L3784"
+        "src/commands/reviewActions.ts#L3831-L3831"
       ],
       "fileGateRouteIds": [
         "generatePlan.v1"
@@ -505,7 +520,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.helloWorld",
       "path": "src/extension.ts",
-      "span": "L472-L479",
+      "span": "L494-L501",
       "registrationSymbol": "helloWorldDisposable",
       "contributed": true,
       "keybound": false,
@@ -550,7 +565,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.nextStage",
       "path": "src/commands/reviewActions.ts",
-      "span": "L4960-L4964",
+      "span": "L5008-L5012",
       "registrationSymbol": "registerReviewActionCommands",
       "contributed": true,
       "keybound": true,
@@ -576,7 +591,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.openAiModels",
       "path": "src/extension.ts",
-      "span": "L445-L448",
+      "span": "L466-L469",
       "registrationSymbol": "activate",
       "contributed": true,
       "keybound": false,
@@ -604,7 +619,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.openChatData",
       "path": "src/extension.ts",
-      "span": "L560-L562",
+      "span": "L582-L584",
       "registrationSymbol": "activate",
       "contributed": true,
       "keybound": false,
@@ -614,6 +629,21 @@
       "fileEdgesOut": [
         "vs-code-ai-helper.settingsView.focus"
       ]
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.openFailedTaskCreation",
+      "path": "src/commands/taskCreationRecovery.ts",
+      "span": "L962-L965",
+      "registrationSymbol": "registerTaskCreationRecoveryCommands",
+      "contributed": true,
+      "keybound": false,
+      "menus": [
+        "view/item/context"
+      ],
+      "treeBindings": [],
+      "fileGateRouteIds": [],
+      "fileEdgesOut": []
     },
     {
       "kind": "command",
@@ -636,7 +666,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.openSettings",
       "path": "src/extension.ts",
-      "span": "L441-L444",
+      "span": "L462-L465",
       "registrationSymbol": "activate",
       "contributed": true,
       "keybound": false,
@@ -647,7 +677,7 @@
         "src/commands/chatWithStage.ts#L478-L478",
         "src/commands/draftTaskWithAI.ts#L426-L426",
         "src/commands/generatePlanWithAI.ts#L504-L504",
-        "src/commands/reviewActions.ts#L1020-L1020"
+        "src/commands/reviewActions.ts#L1019-L1019"
       ],
       "fileGateRouteIds": [],
       "fileEdgesOut": [
@@ -725,7 +755,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.refreshTasksView",
       "path": "src/extension.ts",
-      "span": "L618-L621",
+      "span": "L640-L643",
       "registrationSymbol": "refreshCommand",
       "contributed": true,
       "keybound": false,
@@ -742,7 +772,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.release",
       "path": "src/commands/reviewActions.ts",
-      "span": "L4973-L4976",
+      "span": "L5021-L5024",
       "registrationSymbol": "registerReviewActionCommands",
       "contributed": true,
       "keybound": false,
@@ -796,7 +826,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.resetChatHistory",
       "path": "src/extension.ts",
-      "span": "L565-L567",
+      "span": "L587-L589",
       "registrationSymbol": "activate",
       "contributed": true,
       "keybound": false,
@@ -813,13 +843,13 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.resetTaskStatusFilter",
       "path": "src/extension.ts",
-      "span": "L653-L656",
+      "span": "L675-L678",
       "registrationSymbol": "activate",
       "contributed": true,
       "keybound": false,
       "menus": [],
       "treeBindings": [
-        "src/views/taskTreeProvider.ts#L419-L419"
+        "src/views/taskTreeProvider.ts#L440-L440"
       ],
       "fileGateRouteIds": [],
       "fileEdgesOut": [
@@ -838,10 +868,27 @@
         "view/item/context"
       ],
       "treeBindings": [
-        "src/commands/startNewTask.ts#L341-L341",
+        "src/commands/startNewTask.ts#L505-L505",
+        "src/commands/taskCreationRecovery.ts#L296-L296",
+        "src/commands/taskCreationRecovery.ts#L557-L557",
         "src/utils/globalAssistantActions.ts#L916-L916",
         "src/views/taskStatusBar.ts#L133-L133"
       ],
+      "fileGateRouteIds": [],
+      "fileEdgesOut": []
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.retryTaskCreation",
+      "path": "src/commands/taskCreationRecovery.ts",
+      "span": "L966-L970",
+      "registrationSymbol": "registerTaskCreationRecoveryCommands",
+      "contributed": true,
+      "keybound": false,
+      "menus": [
+        "view/item/context"
+      ],
+      "treeBindings": [],
       "fileGateRouteIds": [],
       "fileEdgesOut": []
     },
@@ -881,7 +928,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.runImplementationWithAI",
       "path": "src/commands/reviewActions.ts",
-      "span": "L4968-L4972",
+      "span": "L5016-L5020",
       "registrationSymbol": "registerReviewActionCommands",
       "contributed": true,
       "keybound": false,
@@ -889,8 +936,8 @@
         "view/item/context"
       ],
       "treeBindings": [
-        "src/commands/reviewActions.ts#L233-L233",
-        "src/commands/reviewActions.ts#L3795-L3795"
+        "src/commands/reviewActions.ts#L232-L232",
+        "src/commands/reviewActions.ts#L3842-L3842"
       ],
       "fileGateRouteIds": [
         "applyReview.v1",
@@ -925,7 +972,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.runNotificationAction",
       "path": "src/extension.ts",
-      "span": "L551-L557",
+      "span": "L573-L579",
       "registrationSymbol": "activate",
       "contributed": true,
       "keybound": false,
@@ -960,7 +1007,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.runReviewWithAI",
       "path": "src/commands/reviewActions.ts",
-      "span": "L4937-L4940",
+      "span": "L4985-L4988",
       "registrationSymbol": "registerReviewActionCommands",
       "contributed": true,
       "keybound": false,
@@ -982,6 +1029,21 @@
       "fileEdgesOut": [
         "vs-code-ai-helper.runReviewWithAI"
       ]
+    },
+    {
+      "kind": "command",
+      "commandId": "vs-code-ai-helper.safeDeleteFailedTaskCreation",
+      "path": "src/commands/taskCreationRecovery.ts",
+      "span": "L976-L980",
+      "registrationSymbol": "registerTaskCreationRecoveryCommands",
+      "contributed": true,
+      "keybound": false,
+      "menus": [
+        "view/item/context"
+      ],
+      "treeBindings": [],
+      "fileGateRouteIds": [],
+      "fileEdgesOut": []
     },
     {
       "kind": "command",
@@ -1071,13 +1133,13 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.stageArtifactNotReady",
       "path": "src/extension.ts",
-      "span": "L661-L668",
+      "span": "L683-L690",
       "registrationSymbol": "activate",
       "contributed": false,
       "keybound": false,
       "menus": [],
       "treeBindings": [
-        "src/views/taskTreeProvider.ts#L345-L345"
+        "src/views/taskTreeProvider.ts#L366-L366"
       ],
       "fileGateRouteIds": [],
       "fileEdgesOut": [
@@ -1088,7 +1150,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.startNewTask",
       "path": "src/commands/startNewTask.ts",
-      "span": "L365-L368",
+      "span": "L529-L532",
       "registrationSymbol": "disposable",
       "contributed": true,
       "keybound": false,
@@ -1105,7 +1167,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.statusBarMenu",
       "path": "src/extension.ts",
-      "span": "L669-L672",
+      "span": "L691-L694",
       "registrationSymbol": "statusBarMenuCommand",
       "contributed": false,
       "keybound": false,
@@ -1154,7 +1216,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.viewDisclaimer",
       "path": "src/extension.ts",
-      "span": "L486-L498",
+      "span": "L508-L520",
       "registrationSymbol": "viewDisclaimerDisposable",
       "contributed": true,
       "keybound": false,
@@ -1182,7 +1244,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.viewReview",
       "path": "src/commands/reviewActions.ts",
-      "span": "L4956-L4959",
+      "span": "L5004-L5007",
       "registrationSymbol": "registerReviewActionCommands",
       "contributed": true,
       "keybound": false,
@@ -1282,7 +1344,7 @@
       "kind": "internalEdge",
       "commandId": "vs-code-ai-helper.runReviewWithAI",
       "path": "src/commands/reviewActions.ts",
-      "span": "L3518-L3521",
+      "span": "L3538-L3541",
       "enclosingSymbol": "viewReview",
       "occurrence": 1
     },
@@ -1306,7 +1368,7 @@
       "kind": "internalEdge",
       "commandId": "vs-code-ai-helper.settingsView.focus",
       "path": "src/extension.ts",
-      "span": "L447-L447",
+      "span": "L468-L468",
       "enclosingSymbol": "activate",
       "occurrence": 1
     },
@@ -1410,7 +1472,7 @@
       "kind": "providerEdge",
       "callee": "runImplementationForModel",
       "path": "src/commands/reviewActions.ts",
-      "span": "L4394-L4408",
+      "span": "L4441-L4455",
       "enclosingSymbol": "executeImplementationRun",
       "occurrence": 1
     },
@@ -1418,7 +1480,7 @@
       "kind": "providerEdge",
       "callee": "resolveRunnerForModel",
       "path": "src/commands/reviewActions.ts",
-      "span": "L1029-L1034",
+      "span": "L1028-L1033",
       "enclosingSymbol": "runAiToFile",
       "occurrence": 1
     },
@@ -1426,7 +1488,7 @@
       "kind": "providerEdge",
       "callee": "resolveRunnerForModel",
       "path": "src/commands/reviewActions.ts",
-      "span": "L1274-L1274",
+      "span": "L1273-L1273",
       "enclosingSymbol": "runAiToFile",
       "occurrence": 2
     },
@@ -1434,7 +1496,7 @@
       "kind": "providerEdge",
       "callee": "resolveRunnerForModel",
       "path": "src/commands/reviewActions.ts",
-      "span": "L1644-L1644",
+      "span": "L1643-L1643",
       "enclosingSymbol": "runSecondOpinionReview",
       "occurrence": 1
     },
@@ -1495,7 +1557,7 @@
       "kind": "writerEdge",
       "propertyName": "outputFileUri",
       "path": "src/commands/reviewActions.ts",
-      "span": "L4699-L4699",
+      "span": "L4747-L4747",
       "enclosingSymbol": "generated",
       "occurrence": 1
     },
@@ -1503,7 +1565,7 @@
       "kind": "writerEdge",
       "propertyName": "outputFile",
       "path": "src/commands/reviewActions.ts",
-      "span": "L1108-L1108",
+      "span": "L1107-L1107",
       "enclosingSymbol": "result",
       "occurrence": 1
     },
@@ -1511,7 +1573,7 @@
       "kind": "writerEdge",
       "propertyName": "outputFile",
       "path": "src/commands/reviewActions.ts",
-      "span": "L1679-L1679",
+      "span": "L1678-L1678",
       "enclosingSymbol": "result",
       "occurrence": 2
     },
@@ -1519,7 +1581,7 @@
       "kind": "writerEdge",
       "propertyName": "outputFile",
       "path": "src/commands/reviewActions.ts",
-      "span": "L1290-L1290",
+      "span": "L1289-L1289",
       "enclosingSymbol": "runAiToFile",
       "occurrence": 1
     },
@@ -1651,7 +1713,7 @@
     {
       "commandId": "vs-code-ai-helper.runReviewWithAI",
       "path": "src/commands/reviewActions.ts",
-      "span": "L3518-L3521",
+      "span": "L3538-L3541",
       "enclosingSymbol": "viewReview"
     },
     {
@@ -1669,7 +1731,7 @@
     {
       "commandId": "vs-code-ai-helper.settingsView.focus",
       "path": "src/extension.ts",
-      "span": "L447-L447",
+      "span": "L468-L468",
       "enclosingSymbol": "activate"
     },
     {
@@ -1749,25 +1811,25 @@
     {
       "callee": "resolveRunnerForModel",
       "path": "src/commands/reviewActions.ts",
-      "span": "L1029-L1034",
+      "span": "L1028-L1033",
       "enclosingSymbol": "runAiToFile"
     },
     {
       "callee": "resolveRunnerForModel",
       "path": "src/commands/reviewActions.ts",
-      "span": "L1274-L1274",
+      "span": "L1273-L1273",
       "enclosingSymbol": "runAiToFile"
     },
     {
       "callee": "resolveRunnerForModel",
       "path": "src/commands/reviewActions.ts",
-      "span": "L1644-L1644",
+      "span": "L1643-L1643",
       "enclosingSymbol": "runSecondOpinionReview"
     },
     {
       "callee": "runImplementationForModel",
       "path": "src/commands/reviewActions.ts",
-      "span": "L4394-L4408",
+      "span": "L4441-L4455",
       "enclosingSymbol": "executeImplementationRun"
     },
     {
@@ -1799,25 +1861,25 @@
     {
       "propertyName": "outputFile",
       "path": "src/commands/reviewActions.ts",
-      "span": "L1108-L1108",
+      "span": "L1107-L1107",
       "enclosingSymbol": "result"
     },
     {
       "propertyName": "outputFile",
       "path": "src/commands/reviewActions.ts",
-      "span": "L1290-L1290",
+      "span": "L1289-L1289",
       "enclosingSymbol": "runAiToFile"
     },
     {
       "propertyName": "outputFile",
       "path": "src/commands/reviewActions.ts",
-      "span": "L1679-L1679",
+      "span": "L1678-L1678",
       "enclosingSymbol": "result"
     },
     {
       "propertyName": "outputFileUri",
       "path": "src/commands/reviewActions.ts",
-      "span": "L4699-L4699",
+      "span": "L4747-L4747",
       "enclosingSymbol": "generated"
     },
     {
@@ -1914,84 +1976,84 @@
       "routeId": "review.v1",
       "gateKind": "throwing",
       "path": "src/commands/reviewActions.ts",
-      "span": "L2515-L2515",
+      "span": "L2535-L2535",
       "enclosingSymbol": "runReviewForFolder"
     },
     {
       "routeId": "review.v1",
       "gateKind": "throwing",
       "path": "src/commands/reviewActions.ts",
-      "span": "L2671-L2671",
+      "span": "L2691-L2691",
       "enclosingSymbol": "runReviewWithAI"
     },
     {
       "routeId": "applyReview.v1",
       "gateKind": "throwing",
       "path": "src/commands/reviewActions.ts",
-      "span": "L2768-L2768",
+      "span": "L2788-L2788",
       "enclosingSymbol": "applyReviewWithAI"
     },
     {
       "routeId": "applyReviewEdit.v1",
       "gateKind": "throwing",
       "path": "src/commands/reviewActions.ts",
-      "span": "L2776-L2776",
+      "span": "L2796-L2796",
       "enclosingSymbol": "applyReviewWithAI"
     },
     {
       "routeId": "applyReviewEdit.v1",
       "gateKind": "throwing",
       "path": "src/commands/reviewActions.ts",
-      "span": "L2805-L2805",
+      "span": "L2825-L2825",
       "enclosingSymbol": "applyReviewWithAI"
     },
     {
       "routeId": "applyReview.v1",
       "gateKind": "throwing",
       "path": "src/commands/reviewActions.ts",
-      "span": "L2890-L2890",
+      "span": "L2910-L2910",
       "enclosingSymbol": "runApply"
     },
     {
       "routeId": "fastForward.v1",
       "gateKind": "throwing",
       "path": "src/commands/reviewActions.ts",
-      "span": "L3037-L3037",
+      "span": "L3057-L3057",
       "enclosingSymbol": "fastForwardReviewWithAI"
     },
     {
       "routeId": "applyReviewEdit.v1",
       "gateKind": "throwing",
       "path": "src/commands/reviewActions.ts",
-      "span": "L3384-L3384",
+      "span": "L3404-L3404",
       "enclosingSymbol": "applyImplementationReviewWithAI"
     },
     {
       "routeId": "generateImplementation.v1",
       "gateKind": "throwing",
       "path": "src/commands/reviewActions.ts",
-      "span": "L4011-L4011",
+      "span": "L4058-L4058",
       "enclosingSymbol": "generateImplementationWithAI"
     },
     {
       "routeId": "implementation.v1",
       "gateKind": "throwing",
       "path": "src/commands/reviewActions.ts",
-      "span": "L4598-L4598",
+      "span": "L4646-L4646",
       "enclosingSymbol": "runImplementationWithAI"
     },
     {
       "routeId": "applyReviewEdit.v1",
       "gateKind": "throwing",
       "path": "src/commands/reviewActions.ts",
-      "span": "L4808-L4808",
+      "span": "L4856-L4856",
       "enclosingSymbol": "applyReviewEditWithAI"
     },
     {
       "routeId": "applyReviewEdit.v1",
       "gateKind": "throwing",
       "path": "src/commands/reviewActions.ts",
-      "span": "L4872-L4872",
+      "span": "L4920-L4920",
       "enclosingSymbol": "runApply"
     },
     {

@@ -3,7 +3,7 @@ import { TaskInventory } from "../state/taskInventory";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { IncompleteTask } from "../utils/taskProgressUtils";
 import { NotificationRouter } from "../utils/notificationRouter";
-import { LegacyCreatingStartupGateV0 } from "../state/legacyCreatingStartupGateV0";
+import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
 import { runCompletionLint } from "../utils/completionLint";
 import { ensureStageModelConfigured } from "../utils/modelSelection";
 import { safeOpenTextDocument } from "../utils/fileUtils";
@@ -59,7 +59,7 @@ export async function runPublishChecks(
 ): Promise<void> {
   // Activation-order barrier (plan §1.4): never read task state while the
   // startup creating-folder classification pass is still running.
-  await LegacyCreatingStartupGateV0.waitUntilReady();
+  await TaskCreationStartupReconcilerV1.waitUntilReady();
   const resolverArg = normalizeArg(explicitArg);
 
   const resolvedTask = await resolveTaskContext(inventory, resolverArg, {

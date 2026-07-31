@@ -81,7 +81,7 @@
               "liveSha256": {
                 "type": "string",
                 "pattern": "^[0-9a-f]{64}$",
-                "description": "Required for added/modified: the sha256 of the file content this annotation's rationale was written against."
+                "description": "Required for added/modified: the sha256 of the file content this annotation's rationale was written against. Must be absent for \"removed\" rows — a removed path has no live content, resolveProductionSourceUniverse.mjs never reads this field for a removed row, and a value there would read as evidence without ever being checked."
               },
               "pregateSha256": {
                 "type": "string",
@@ -112,7 +112,17 @@
             "additionalProperties": false
           }
         },
-        "additionalProperties": false
+        "additionalProperties": false,
+        "if": {
+          "properties": { "disposition": { "const": "removed" } }
+        },
+        "then": {
+          "properties": {
+            "evidence": {
+              "not": { "required": ["liveSha256"] }
+            }
+          }
+        }
       }
     }
   },

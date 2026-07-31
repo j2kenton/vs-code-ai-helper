@@ -9,6 +9,23 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// Polls instead of sleeping a fixed window: under heavy parallel test load a
+// setTimeout can fire later than its nominal delay, so a fixed short sleep
+// (e.g. 5ms after a 0ms delay) is a timing race, not a correctness check.
+// Polling still resolves immediately in the common case but tolerates
+// scheduler latency up to maxWaitMs.
+//
+// Asserts on timeout so a starved poll fails here, with an explicit message,
+// rather than falling through silently into the caller's next assertion
+// (which would otherwise have to infer "timed out" from an empty array).
+async function waitUntil(condition: () => boolean, maxWaitMs: number, message: string): Promise<void> {
+  const deadline = Date.now() + maxWaitMs;
+  while (!condition() && Date.now() < deadline) {
+    await sleep(5);
+  }
+  assert.ok(condition(), message);
+}
+
 void describe("ViewProgressBinder", () => {
   void it("shows the view progress line only in Notifications, not Tasks", async () => {
     const registry = new TaskOperationRegistry();
@@ -22,7 +39,7 @@ void describe("ViewProgressBinder", () => {
 
     try {
       const operation = registry.begin("/dev/progress-binder", { label: "Review", stage: "plan-high-review" });
-      await sleep(5);
+      await waitUntil(() => calls.length > 0, 500, "expected a withProgress call within 500ms of begin()");
 
       assert.equal(operation !== null, true);
       assert.deepEqual(calls.map((call) => call.options.location?.viewId), [STATUS_VIEW_ID]);
@@ -73,7 +90,11 @@ void describe("ViewProgressBinder", () => {
     try {
       const operation = registry.begin("/dev/progress-binder-long", { label: "Review", stage: "plan-low-review" });
       assert.equal(operation !== null, true);
-      await sleep(40);
+      await waitUntil(
+        () => calls.length > 0,
+        500,
+        "expected the long-running operation to surface a withProgress call within 500ms of the show delay"
+      );
 
       assert.deepEqual(
         calls.map((call) => call.options.location?.viewId),

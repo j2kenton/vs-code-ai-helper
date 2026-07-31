@@ -140,10 +140,19 @@ export async function writeTaskProgressV1(
   * Stage & Move On" racing an auto-advance) could interleave and silently
   * clobber or double-apply a transition — the lock makes the two paths
   * mutually exclusive on one task, exactly like two legacy callers today.
+  *
+  * @param beforeWrite  Optional side effect run after `update` has validated/
+  *   computed the patched value but before it is persisted, still inside the
+  *   same lease as `update`'s own CAS checks — mirrors legacy
+  *   `patchTaskProgress`'s `beforeWrite` param (`src/utils/taskProgressUtils.ts`).
+  *   Use this to publish a file artifact (e.g. rename a staged review into
+  *   place) atomically with the progress write, so a superseded caller's
+  *   `update` throwing prevents both the write AND the side effect.
   */
 export async function patchTaskProgressStrictV1(
   taskFolderUri: vscode.Uri,
-  update: (current: PersistedTaskProgressV1) => TaskProgress | undefined
+  update: (current: PersistedTaskProgressV1) => TaskProgress | undefined,
+  beforeWrite?: (patched: TaskProgress) => Promise<void>
 ): Promise<TaskProgress | undefined> {
   return withTaskLock(taskFolderUri.fsPath, async () => {
     const folderName = path.basename(taskFolderUri.fsPath);
@@ -155,6 +164,9 @@ export async function patchTaskProgressStrictV1(
     const patched = update(current);
     if (!patched) {
       return current;
+    }
+    if (beforeWrite) {
+      await beforeWrite(patched);
     }
     await writeTaskProgressV1(taskFolderUri, { ...patched, ensembleProgressVersion: 1 }, strict.decoded.entries);
     return patched;

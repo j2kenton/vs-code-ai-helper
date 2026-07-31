@@ -43,6 +43,7 @@ void describe("operationTaxonomy", () => {
   void it("classifies every concrete operation kind into its settled category", () => {
     const expected: Record<OperationKind, OperationCategory> = {
       "create-task": "instant-mutation",
+      "delete-task": "instant-mutation",
       "rename-task": "instant-mutation",
       "pause-task": "instant-mutation",
       "resume-task": "instant-mutation",

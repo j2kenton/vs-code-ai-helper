@@ -74,7 +74,7 @@ type WindowStub = {
 
 type WorkspaceStub = {
   workspaceFolders: typeof vscode.workspace.workspaceFolders;
-  fs: Pick<typeof vscode.workspace.fs, "createDirectory" | "writeFile" | "readDirectory" | "readFile">;
+  fs: Pick<typeof vscode.workspace.fs, "createDirectory" | "writeFile" | "readDirectory" | "readFile" | "rename">;
   openTextDocument: typeof vscode.workspace.openTextDocument;
 };
 
@@ -146,6 +146,25 @@ function isolateTaskCreationFilesystem(writtenFiles?: Map<string, string>): { re
       stateStore.withTaskLock = originalTaskLock;
     },
   };
+}
+
+/**
+ * A minimal in-memory stand-in for `vscode.workspace.fs.rename` over the
+ * `writtenFiles` map these tests use instead of real disk: moves every entry
+ * whose key sits under `source`'s path to the equivalent key under
+ * `destination`, mirroring a real directory rename (startNewTask.ts stages
+ * task-progress.json/task.md under a work-<digest> folder, then renames it
+ * into place — without this, the stale staging-path entry would still be
+ * found first by a plain `.find(file => file.endsWith(...))` lookup).
+ */
+function renameWrittenFiles(writtenFiles: Map<string, string>, source: vscode.Uri, destination: vscode.Uri): void {
+  const prefix = source.path.endsWith("/") ? source.path : `${source.path}/`;
+  for (const [key, value] of [...writtenFiles.entries()]) {
+    if (key === source.path || key.startsWith(prefix)) {
+      writtenFiles.delete(key);
+      writtenFiles.set(destination.path + key.slice(source.path.length), value);
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -536,6 +555,7 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
 
       const origCreateDirectory = workspace.fs.createDirectory;
       const origWriteFile = workspace.fs.writeFile;
+      const origRename = workspace.fs.rename;
       const origOpenTextDocument = workspace.openTextDocument;
       const origShowTextDocument = win.showTextDocument;
       const origShowErrorMessage = win.showErrorMessage;
@@ -552,6 +572,13 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
         bytes: Uint8Array
       ): Promise<void> => {
         writtenFiles.set(uri.path, new TextDecoder().decode(bytes));
+        return Promise.resolve();
+      };
+      // The staging folder is claimed into its final location via rename
+      // (see startNewTask.ts) — mirror that over the in-memory map so the
+      // final task-progress.json is the only one findable by suffix.
+      workspace.fs.rename = (source: vscode.Uri, destination: vscode.Uri): Promise<void> => {
+        renameWrittenFiles(writtenFiles, source, destination);
         return Promise.resolve();
       };
       workspace.openTextDocument = (): Promise<vscode.TextDocument> =>
@@ -586,6 +613,7 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
         workspace.workspaceFolders = origWorkspaceFolders;
         workspace.fs.createDirectory = origCreateDirectory;
         workspace.fs.writeFile = origWriteFile;
+        workspace.fs.rename = origRename;
         workspace.openTextDocument = origOpenTextDocument;
         win.showTextDocument = origShowTextDocument;
         deactivateNotificationRouter();
@@ -615,6 +643,7 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
       const origWorkspaceFolders = workspace.workspaceFolders;
       const origCreateDirectory = workspace.fs.createDirectory;
       const origWriteFile = workspace.fs.writeFile;
+      const origRename = workspace.fs.rename;
       const origOpenTextDocument = workspace.openTextDocument;
       const origShowTextDocument = win.showTextDocument;
       const origShowErrorMessage = win.showErrorMessage;
@@ -628,6 +657,12 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
       workspace.fs.createDirectory = (): Promise<void> => Promise.resolve();
       workspace.fs.writeFile = (uri: vscode.Uri, bytes: Uint8Array): Promise<void> => {
         writtenFiles.set(uri.path, new TextDecoder().decode(bytes));
+        return Promise.resolve();
+      };
+      // See "creates the task document" above: mirror the staging-to-final
+      // rename over the in-memory map.
+      workspace.fs.rename = (source: vscode.Uri, destination: vscode.Uri): Promise<void> => {
+        renameWrittenFiles(writtenFiles, source, destination);
         return Promise.resolve();
       };
       // Simulate a pre-existing ACTIVE task under the same meta root, so the
@@ -685,6 +720,7 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
         workspace.workspaceFolders = origWorkspaceFolders;
         workspace.fs.createDirectory = origCreateDirectory;
         workspace.fs.writeFile = origWriteFile;
+        workspace.fs.rename = origRename;
         workspace.fs.readDirectory = origReadDirectory;
         workspace.fs.readFile = origReadFile;
         workspace.openTextDocument = origOpenTextDocument;
@@ -694,46 +730,73 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
     });
 
     void it("classifies a legacy creating sentinel read-only instead of promoting it to paused", async () => {
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const { LegacyCreatingStartupGateV0 } = await import("../state/legacyCreatingStartupGateV0.js");
+      const { TaskCreationStartupReconcilerV1 } = await import("../state/taskCreationStartupReconcilerV1.js");
+      const { resetCreationSeedHistoryCacheForTests } = await import("../services/taskCreationSeedHistoryV1.js");
       const root = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-create-recovery-"));
       const taskName = "2026-01-01_task_1";
-      const creatingProgress = JSON.stringify({
-        taskFolder: "2026-01-01_task_1",
-        currentStage: "desc",
-        status: "creating",
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-      });
+      const taskFolderPath = path.join(root, taskName);
+      fs.mkdirSync(taskFolderPath, { recursive: true });
+      fs.writeFileSync(
+        path.join(taskFolderPath, "task-progress.json"),
+        JSON.stringify({
+          taskFolder: taskName,
+          currentStage: "desc",
+          status: "creating",
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        })
+      );
+      fs.writeFileSync(path.join(taskFolderPath, "task.md"), "# Task\n");
+
+      // Real-fs bridge (mirrors taskCreationStartupReconcilerV1.test.ts's
+      // installRealFsBridge): the reconciler reads the meta root AND every
+      // candidate task folder's directory listing, so — unlike the old
+      // gate's single-shape readDirectory mock this replaced — the bridge
+      // must resolve each URI against the real temp tree rather than
+      // returning one fixed shape for every call.
       const workspaceFs = vscode.workspace.fs as unknown as Record<string, unknown>;
       const originalReadDirectory = workspaceFs.readDirectory;
       const originalReadFile = workspaceFs.readFile;
       const originalStat = workspaceFs.stat;
       const originalWriteFile = workspaceFs.writeFile;
-      const writes = new Map<string, string>();
-      workspaceFs.readDirectory = (): Promise<[string, vscode.FileType][]> =>
-        Promise.resolve([[taskName, vscode.FileType.Directory]]);
-      workspaceFs.readFile = (): Promise<Uint8Array> =>
-        Promise.resolve(new TextEncoder().encode(creatingProgress));
-      workspaceFs.stat = (): Promise<vscode.FileStat> =>
-        Promise.resolve({ type: vscode.FileType.File, ctime: 0, mtime: 0, size: 0 });
-      workspaceFs.writeFile = (uri: vscode.Uri, bytes: Uint8Array): Promise<void> => {
-        writes.set(uri.path, new TextDecoder().decode(bytes));
-        return Promise.resolve();
+      workspaceFs.readFile = (uri: vscode.Uri): Promise<Uint8Array> =>
+        fs.promises.readFile(uri.fsPath).then((buf) => new Uint8Array(buf));
+      workspaceFs.readDirectory = async (uri: vscode.Uri): Promise<Array<[string, vscode.FileType]>> => {
+        const entries = await fs.promises.readdir(uri.fsPath, { withFileTypes: true });
+        return entries.map((entry) => [
+          entry.name,
+          entry.isDirectory() ? vscode.FileType.Directory : vscode.FileType.File,
+        ]);
       };
-      LegacyCreatingStartupGateV0.resetForTests();
+      workspaceFs.stat = async (uri: vscode.Uri): Promise<vscode.FileStat> => {
+        const s = await fs.promises.stat(uri.fsPath);
+        return {
+          type: s.isDirectory() ? vscode.FileType.Directory : vscode.FileType.File,
+          ctime: s.ctimeMs,
+          mtime: s.mtimeMs,
+          size: s.size,
+        };
+      };
+      workspaceFs.writeFile = (): Promise<void> => {
+        throw new Error("TaskCreationStartupReconcilerV1 must never write");
+      };
+      TaskCreationStartupReconcilerV1.resetForTests();
+      resetCreationSeedHistoryCacheForTests();
       try {
-        const footprints = await LegacyCreatingStartupGateV0.getFootprints(root);
+        const footprints = await TaskCreationStartupReconcilerV1.getClassifiedFootprints(
+          root,
+          vscode.Uri.file(path.resolve(__dirname, "..", ".."))
+        );
         assert.equal(footprints.length, 1, "the creating folder must be classified, not silently skipped");
         assert.equal(footprints[0]?.taskFolderName, taskName);
         assert.equal(footprints[0]?.hasTaskMd, true, "task.md's presence is recorded, but only informationally");
-        assert.equal(
-          [...writes.entries()].find(([file]) => file.endsWith("task-progress.json")),
-          undefined,
-          "classification must never rewrite task-progress.json — the old promote-to-paused behavior is removed"
-        );
+        // workspaceFs.writeFile throws unconditionally above, so simply
+        // reaching this assertion without an error proves classification
+        // never rewrote task-progress.json — the old promote-to-paused
+        // behavior stays removed.
       } finally {
-        LegacyCreatingStartupGateV0.resetForTests();
+        TaskCreationStartupReconcilerV1.resetForTests();
+        resetCreationSeedHistoryCacheForTests();
         workspaceFs.readDirectory = originalReadDirectory;
         workspaceFs.readFile = originalReadFile;
         workspaceFs.stat = originalStat;
@@ -759,6 +822,7 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
       const origWorkspaceFolders = workspace.workspaceFolders;
       const origCreateDirectory = workspace.fs.createDirectory;
       const origWriteFile = workspace.fs.writeFile;
+      const origRename = workspace.fs.rename;
       // eslint-disable-next-line @typescript-eslint/unbound-method
       const origReadFile = (workspace.fs as typeof vscode.workspace.fs).readFile;
       const origOpenTextDocument = workspace.openTextDocument;
@@ -782,6 +846,7 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
         writtenFiles.set(uri.path, new TextDecoder().decode(bytes));
         return Promise.resolve();
       };
+      workspace.fs.rename = (): Promise<void> => Promise.resolve();
       (workspace.fs as typeof vscode.workspace.fs).readFile = (uri: vscode.Uri): Promise<Uint8Array> => {
         const content = writtenFiles.get(uri.path);
         return content === undefined
@@ -811,6 +876,7 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
         workspace.workspaceFolders = origWorkspaceFolders;
         workspace.fs.createDirectory = origCreateDirectory;
         workspace.fs.writeFile = origWriteFile;
+        workspace.fs.rename = origRename;
         (workspace.fs as typeof vscode.workspace.fs).readFile = origReadFile;
         workspace.openTextDocument = origOpenTextDocument;
         win.showTextDocument = origShowTextDocument;
@@ -845,6 +911,7 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
 
       const origCreateDirectory = workspace.fs.createDirectory;
       const origWriteFile = workspace.fs.writeFile;
+      const origRename = workspace.fs.rename;
       const origOpenTextDocument = workspace.openTextDocument;
       const origShowTextDocument = win.showTextDocument;
       const origShowErrorMessage = win.showErrorMessage;
@@ -853,6 +920,7 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
 
       workspace.fs.createDirectory = (): Promise<void> => Promise.resolve();
       workspace.fs.writeFile = (): Promise<void> => Promise.resolve();
+      workspace.fs.rename = (): Promise<void> => Promise.resolve();
       workspace.openTextDocument = (): Promise<vscode.TextDocument> =>
         Promise.resolve({} as vscode.TextDocument);
       win.showTextDocument = (): Promise<vscode.TextEditor> =>
@@ -901,6 +969,7 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
         workspace.workspaceFolders = origWorkspaceFolders;
         workspace.fs.createDirectory = origCreateDirectory;
         workspace.fs.writeFile = origWriteFile;
+        workspace.fs.rename = origRename;
         workspace.openTextDocument = origOpenTextDocument;
         win.showTextDocument = origShowTextDocument;
         deactivateNotificationRouter();
@@ -932,6 +1001,7 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
 
       const origCreateDirectory = workspace.fs.createDirectory;
       const origWriteFile = workspace.fs.writeFile;
+      const origRename = workspace.fs.rename;
       const origOpenTextDocument = workspace.openTextDocument;
       const origShowTextDocument = win.showTextDocument;
       const origShowErrorMessage = win.showErrorMessage;
@@ -941,6 +1011,7 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
 
       workspace.fs.createDirectory = (): Promise<void> => Promise.resolve();
       workspace.fs.writeFile = (): Promise<void> => Promise.resolve();
+      workspace.fs.rename = (): Promise<void> => Promise.resolve();
       workspace.openTextDocument = (): Promise<vscode.TextDocument> =>
         Promise.resolve({} as vscode.TextDocument);
       win.showTextDocument = (): Promise<vscode.TextEditor> =>
@@ -987,6 +1058,7 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
         workspace.workspaceFolders = origWorkspaceFolders;
         workspace.fs.createDirectory = origCreateDirectory;
         workspace.fs.writeFile = origWriteFile;
+        workspace.fs.rename = origRename;
         workspace.openTextDocument = origOpenTextDocument;
         win.showTextDocument = origShowTextDocument;
         deactivateNotificationRouter();

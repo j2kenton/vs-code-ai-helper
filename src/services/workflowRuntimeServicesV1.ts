@@ -86,8 +86,12 @@ let verifiedTaskFolderBindingIds = new Map<string, string>();
  * `"taskfolder"` id space, so the SAME path always maps to one root id and a
  * cross-kind re-registration attempt is caught by the kind guard in each
  * ensure function rather than silently producing two roots for one folder.
+ * Meta roots use their own `"meta"` id space, since a meta root's PARENT
+ * directory relationship to its task folders (a meta root always CONTAINS
+ * its tasks) must never collide with the task-folder/non-task-storage id
+ * space above.
  */
-function rootIdFor(kind: "taskfolder" | "private", fsPath: string): string {
+function rootIdFor(kind: "taskfolder" | "private" | "meta", fsPath: string): string {
   return `${kind}:${createHash("sha256").update(fsPath, "utf8").digest("hex").slice(0, 16)}`;
 }
 
@@ -522,6 +526,50 @@ export function isWorkflowTaskFolderRootVerifiedV1(rootId: string): boolean {
  */
 export function getVerifiedTaskBindingIdV1(rootId: string): string | undefined {
   return verifiedTaskFolderBindingIds.get(rootId);
+}
+
+/**
+ * Validate and register a META ROOT (plan §4.2: `<meta-root>/creation-intents-v1/`)
+ * as a trusted mutation root, once and idempotently, returning its stable
+ * root id. Meta roots have no `task-progress.json` of their own to derive
+ * ownership from — trust is shape (§1.8 root rules) plus an EXACT match
+ * against a currently resolvable task-root candidate
+ * (`resolveTaskRootCandidates()`, the same configured/legacy-discovery list
+ * `startNewTask.ts`'s own `resolveTaskRootForCreation` resolves against): an
+ * arbitrary absolute path can never be registered as a meta root merely
+ * because a caller claims it is one.
+ *
+ * Revalidated on EVERY call (the candidate-membership check re-runs), not
+ * only the first — matching the other `ensure*` functions in this module.
+ */
+export function ensureWorkflowMetaRootV1(fsPath: string): string {
+  const classification = classifyWorkflowRootV1(fsPath);
+  if (!classification.ok) {
+    throw new Error(`Unsupported meta root: ${classification.reason}`);
+  }
+  const rootId = rootIdFor("meta", fsPath);
+  const registeredKind = registry.rootKind(rootId);
+  if (registeredKind !== undefined && registeredKind !== "metaRoot") {
+    throw new Error(
+      `Refused to register meta root ${JSON.stringify(fsPath)}: this path is already registered as a ` +
+        `${registeredKind} root.`
+    );
+  }
+  const resolvedFsPath = path.resolve(fsPath);
+  const isKnownCandidate = resolveTaskRootCandidates().some(
+    (candidate) => normalizeForCompareV1(path.resolve(candidate.absolutePath)) === normalizeForCompareV1(resolvedFsPath)
+  );
+  if (!isKnownCandidate) {
+    throw new Error(
+      `Refused to register meta root ${JSON.stringify(fsPath)}: it does not match a currently resolvable ` +
+        `configured or legacy task-root candidate.`
+    );
+  }
+  if (registeredKind === undefined) {
+    registry.registerRoot({ rootId, fsPath, kind: "metaRoot", trustedForMutation: true });
+    rebuildFileStore();
+  }
+  return rootId;
 }
 
 /**

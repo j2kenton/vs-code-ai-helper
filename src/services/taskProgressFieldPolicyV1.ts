@@ -285,12 +285,23 @@ export function applyNextStagePolicyV1(
   }
   const departing = progress.currentStage;
   const departingIndex = stageIndex(departing);
-  const nextStage = STAGE_ORDER[departingIndex + 1];
-  if (departingIndex < 0 || nextStage === undefined) {
+  const defaultNextStage = STAGE_ORDER[departingIndex + 1];
+  if (departingIndex < 0 || defaultNextStage === undefined) {
     return failure(
       "noNextStage",
       `stage ${JSON.stringify(departing)} has no immediate next stage — terminal completion is markTaskDone.v1's job`
     );
+  }
+  let nextStage: TaskStage = defaultNextStage;
+  if (input.targetStage !== undefined) {
+    const targetIndex = stageIndex(input.targetStage);
+    if (targetIndex < 0 || targetIndex <= departingIndex) {
+      return failure(
+        "invalidTargetStage",
+        `targetStage ${JSON.stringify(input.targetStage)} is not strictly forward of ${JSON.stringify(departing)}`
+      );
+    }
+    nextStage = input.targetStage;
   }
   const result: PersistedTaskProgressV1 = {
     ensembleProgressVersion: 1,

@@ -34,6 +34,15 @@ export interface TaskProgressFieldPolicyRowV1 {
 export interface NextStagePolicyInputV1 {
   /** Coordinator clock (ISO timestamp) applied to updatedAt. */
   readonly now: string;
+  /**
+   * Explicit destination stage, overriding the default literal `STAGE_ORDER`
+   * successor. Lets a caller land on a configured-review-stage-aware target
+   * (skipping an optional review stage the workspace has no model
+   * configured for) through this same coordinated transition, instead of a
+   * separate legacy path. Must be strictly forward of the current stage;
+   * omit to advance to the immediate `STAGE_ORDER` successor.
+   */
+  readonly targetStage?: TaskStage;
 }
 
 export interface MarkTaskDonePolicyInputV1 {
@@ -53,6 +62,7 @@ export type TaskProgressPolicyErrorCodeV1 =
   | "statusNotActive"
   | "statusNotCompleted"
   | "noNextStage"
+  | "invalidTargetStage"
   | "invalidSelectedStage";
 
 export type TaskProgressPolicyResultV1 =

@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import * as path from "path";
-import { TASK_FILENAME, TaskStatus } from "../types/taskProgress";
+import { TASK_FILENAME, TASK_PROGRESS_FILENAME, TaskStatus } from "../types/taskProgress";
 import {
   createTaskProgress,
   readTaskProgress,
@@ -14,10 +14,102 @@ import { safeOpenTextDocument } from "../utils/fileUtils";
 import { runTrackedOperation } from "../utils/taskOperations";
 import { ensureAutomaticMetaGitIgnore } from "./toggleMetaResourcesGitIgnore";
 import { NotificationRouter } from "../utils/notificationRouter";
+import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
+import { ClassifiedCreatingFootprintV1 } from "../types/taskCreationRecoveryV1";
 import {
-  LegacyCreatingStartupGateV0,
-  LegacyCreatingFootprintV0,
-} from "../state/legacyCreatingStartupGateV0";
+  commitCreationSentinelV1,
+  recordFinalFolderClaimedV1,
+  recordProgressCommittedV1,
+  recordTaskCreationIntentV1,
+  recordWorkMaterializedV1,
+  resolveTaskCreationV1,
+  TaskCreationIntentStoreResultV1,
+  taskCreationIntentDigestV1,
+} from "../services/taskCreationIntentStoreV1";
+import { fileCreationIntentEntryV1, TaskCreationIntentEntryV1 } from "../types/taskCreationIntentV1";
+import { CREATION_INTENTS_DIRNAME_V1 } from "../services/workflowPrivacyClassifierV1";
+
+/**
+ * Describe a `TaskCreationIntentStoreResultV1` for a diagnostics log line.
+ * Never includes a raw filesystem path (only the caller-supplied
+ * `taskFolderName`/step label do that) — matching the sanitized-diagnostics
+ * convention `taskCreationStartupReconcilerV1.ts` documents.
+ */
+function describeCreationIntentOutcome(result: TaskCreationIntentStoreResultV1): string {
+  switch (result.kind) {
+    case "ok":
+      return "ok";
+    case "missing":
+      return "missing";
+    case "rejected":
+      return `rejected: ${result.reason}`;
+    case "recoveryRequired":
+      return `recoveryRequired: ${result.reason}`;
+    case "storageFailure":
+      return `storageFailure${result.errno ? ` (${result.errno})` : ""}`;
+    case "unavailable":
+      return `unavailable (${result.code})`;
+    default:
+      return "unknown outcome";
+  }
+}
+
+/**
+ * Best-effort journal bookkeeping (plan §4.2): a failure here must never
+ * fail the task creation that already succeeded (or is about to) — the same
+ * "non-fatal" policy `ensureAutomaticMetaGitIgnore`'s call site already
+ * documents for its own auxiliary bookkeeping. The journal exists to make a
+ * FUTURE interrupted creation more precisely recoverable, and is now also
+ * consumed directly by `commands/taskCreationRecovery.ts`'s Retry command
+ * (plan §4.5's "verified V1 journal" branch), so a journal write failure is
+ * logged for diagnostics and otherwise ignored rather than failing the
+ * caller — Retry's own re-verification immediately before mutating is what
+ * actually protects correctness, not this bookkeeping call succeeding.
+ */
+export async function journalCreationStep(
+  stepLabel: string,
+  taskFolderName: string,
+  run: () => Promise<TaskCreationIntentStoreResultV1>
+): Promise<void> {
+  try {
+    const result = await run();
+    if (result.kind !== "ok") {
+      console.error(
+        `Task creation journal step "${stepLabel}" for "${taskFolderName}" did not succeed: ${describeCreationIntentOutcome(result)}`
+      );
+    }
+  } catch (error) {
+    console.error(`Task creation journal step "${stepLabel}" for "${taskFolderName}" threw`, error);
+  }
+}
+
+/**
+ * Reads back a just-written file's ACTUAL on-disk bytes and builds its
+ * `createdV1` journal entry from them (content hash + size), rather than
+ * hashing the in-memory string this call site intended to write — so the
+ * journal's recorded evidence always matches what the filesystem really has,
+ * even if some write-path normalization (encoding, line endings) differs
+ * from the in-memory value. Best-effort like `journalCreationStep`: a read
+ * failure here must never fail task creation, it only means this entry is
+ * omitted from the journal (so `classifyFromVerifiedJournalV1` correctly
+ * declines to vouch for the folder later, rather than recording a wrong hash).
+ */
+export async function tryReadCreatedFileEntryV1(
+  fileUri: vscode.Uri,
+  relativePath: string,
+  taskFolderName: string
+): Promise<TaskCreationIntentEntryV1 | undefined> {
+  try {
+    const bytes = await vscode.workspace.fs.readFile(fileUri);
+    return fileCreationIntentEntryV1(relativePath, "createdV1", bytes);
+  } catch (error) {
+    console.error(
+      `Task creation journal: could not read "${relativePath}" for "${taskFolderName}" to record its content hash`,
+      error
+    );
+    return undefined;
+  }
+}
 
 /**
  * Format a date as YYYY-MM-DD
@@ -63,14 +155,15 @@ async function getNextTaskNumber(
 
 /**
  * Surface a read-only "Open" affordance for a legacy `status: "creating"`
- * folder found by `LegacyCreatingStartupGateV0`. This deliberately does not
- * mutate the folder's progress in any way — see the gate's doc comment for
- * why implicitly promoting `creating` to `paused` (the old behavior) was
- * removed. Full retry/adopt/safe-delete recovery is a separate, larger piece
- * of work; until it lands, the only available action is to open the file for
- * manual inspection.
+ * folder found by `TaskCreationStartupReconcilerV1`. This deliberately does
+ * not mutate the folder's progress in any way — see the reconciler's doc
+ * comment for why implicitly promoting `creating` to `paused` (the old
+ * behavior) was removed. Full retry/adopt/safe-delete recovery (plan
+ * §§4.4-4.6) is a separate, larger piece of work keyed off `footprintClass`;
+ * until it lands, every class still only gets this same read-only Open
+ * affordance.
  */
-function notifyLegacyCreatingFootprint(footprint: LegacyCreatingFootprintV0): void {
+function notifyLegacyCreatingFootprint(footprint: ClassifiedCreatingFootprintV1): void {
   const taskFileUri = vscode.Uri.joinPath(vscode.Uri.file(footprint.taskFolderPath), TASK_FILENAME);
   NotificationRouter.showWarning(
     `${footprint.taskFolderName} was left in an incomplete "creating" state (likely an interrupted extension host). ` +
@@ -102,7 +195,7 @@ function notifyLegacyCreatingFootprint(footprint: LegacyCreatingFootprintV0): vo
  * the rest" precedent `taskActivationCoordinator.ts`'s `activateTaskLocked`
  * already uses when pausing other active tasks across the whole inventory.
  */
-function allMetaRootPaths(primaryMetaFolderPath: string): string[] {
+export function allMetaRootPaths(primaryMetaFolderPath: string): string[] {
   const configuredRoot = getConfiguredTaskRoot();
   const paths = new Set<string>();
   paths.add(normalizePath(primaryMetaFolderPath));
@@ -129,7 +222,7 @@ function allMetaRootPaths(primaryMetaFolderPath: string): string[] {
  * concurrent creation under a DIFFERENT meta root is a narrow, pre-existing-
  * style race window rather than one this check newly closes.
  */
-async function hasActiveTaskOnDisk(metaFolderPaths: readonly string[]): Promise<boolean> {
+export async function hasActiveTaskOnDisk(metaFolderPaths: readonly string[]): Promise<boolean> {
   for (const metaFolderPath of metaFolderPaths) {
     const root = vscode.Uri.file(metaFolderPath);
     let entries: [string, vscode.FileType][];
@@ -153,7 +246,7 @@ async function hasActiveTaskOnDisk(metaFolderPaths: readonly string[]): Promise<
 /**
  * Load the task template from the bundled template file.
  */
-async function loadTaskTemplate(extensionUri: vscode.Uri): Promise<string> {
+export async function loadTaskTemplate(extensionUri: vscode.Uri): Promise<string> {
   const templateUri = vscode.Uri.joinPath(
     extensionUri,
     "resources",
@@ -192,8 +285,8 @@ export async function startNewTask(
   // Block on the startup gate's classification pass before this command body
   // performs its first read, so it cannot race the read-only reconciliation
   // extension.ts kicks off during activate() — see
-  // LegacyCreatingStartupGateV0's doc comment.
-  await LegacyCreatingStartupGateV0.waitUntilReady();
+  // TaskCreationStartupReconcilerV1's doc comment.
+  await TaskCreationStartupReconcilerV1.waitUntilReady();
 
   const workspaceFolders = vscode.workspace.workspaceFolders ?? [];
   const workspaceRoot = workspaceFolders.length <= 1
@@ -243,10 +336,10 @@ async function createTask(
 
   // Read-only: surface (but never auto-fix) any legacy `creating` folders
   // left behind under this meta root. This replaces the old implicit
-  // promotion to `paused` — see LegacyCreatingStartupGateV0's doc comment for
-  // why that was unsafe. It does not block creating the new task; the two
-  // are independent folders/folder numbers.
-  for (const footprint of await LegacyCreatingStartupGateV0.getFootprints(metaFolderPath)) {
+  // promotion to `paused` — see TaskCreationStartupReconcilerV1's doc comment
+  // for why that was unsafe. It does not block creating the new task; the
+  // two are independent folders/folder numbers.
+  for (const footprint of await TaskCreationStartupReconcilerV1.getClassifiedFootprints(metaFolderPath, extensionUri)) {
     notifyLegacyCreatingFootprint(footprint);
   }
 
@@ -275,7 +368,49 @@ async function createTask(
     const taskFolderUri = vscode.Uri.file(taskFolderPath);
     const taskFileUri = vscode.Uri.joinPath(taskFolderUri, TASK_FILENAME);
 
-    await vscode.workspace.fs.createDirectory(taskFolderUri);
+    const ownership = {
+      metaRoot: path.resolve(metaFolderPath),
+      projectRoot: path.resolve(workspaceRoot.uri.fsPath),
+      workspaceRoot: path.resolve(workspaceRoot.uri.fsPath),
+      boundAt: new Date().toISOString(),
+      state: "resolved" as const,
+    };
+
+    // task.md is the sole initial task document. Users can write freely in
+    // the editor before asking the stage AI to turn it into a structured task.
+    // Loaded before any disk mutation so the §4.2 "workMaterialized" journal
+    // step (below) genuinely reflects content being ready, not yet written.
+    const taskTemplate = await loadTaskTemplate(extensionUri);
+
+    // §4.2 creation journal (plan): best-effort bookkeeping, never fatal to
+    // task creation itself — see journalCreationStep's doc comment.
+    await journalCreationStep("recordIntent", taskFolderName, () =>
+      recordTaskCreationIntentV1({
+        metaFolderPath,
+        taskFolderPath,
+        taskFolderName,
+        ownership: {
+          metaRoot: ownership.metaRoot,
+          projectRoot: ownership.projectRoot,
+          workspaceRoot: ownership.workspaceRoot,
+        },
+      })
+    );
+    const digest = taskCreationIntentDigestV1(taskFolderPath);
+    // Staging lives under `creation-intents-v1/work-<digest>` (plan §4.2,
+    // matching `WorkflowPathRegistryV1.creationWorkDir`'s own locator) rather
+    // than directly under the meta root — nesting it there keeps a crashed
+    // staging folder out of both `discoverTasksInRoot` (taskRoot.ts) and
+    // `classifyMetaRoot` (taskCreationStartupReconcilerV1.ts), which only
+    // scan the meta root's DIRECT children, so it can never surface as a
+    // phantom task or a duplicate recovery node.
+    const workFolderUri = vscode.Uri.joinPath(
+      vscode.Uri.file(metaFolderPath),
+      CREATION_INTENTS_DIRNAME_V1,
+      `work-${digest}`
+    );
+
+    await vscode.workspace.fs.createDirectory(workFolderUri);
 
     // "creating" is a durable creation sentinel. It is only promoted after
     // task.md and task-progress.json have both been written successfully.
@@ -283,27 +418,56 @@ async function createTask(
       ...createTaskProgress(taskFolderName, "desc"),
       displayName: taskFolderName,
       nameIsDefault: true,
-      ownership: {
-        metaRoot: path.resolve(metaFolderPath),
-        projectRoot: path.resolve(workspaceRoot.uri.fsPath),
-        workspaceRoot: path.resolve(workspaceRoot.uri.fsPath),
-        boundAt: new Date().toISOString(),
-        state: "resolved" as const,
-      },
+      ownership,
     };
-    await writeTaskProgress(taskFolderUri, progress);
-
-    // task.md is the sole initial task document. Users can write freely in
-    // the editor before asking the stage AI to turn it into a structured task.
-    const taskTemplate = await loadTaskTemplate(extensionUri);
+    await writeTaskProgress(workFolderUri, progress);
     await vscode.workspace.fs.writeFile(
-      taskFileUri,
+      vscode.Uri.joinPath(workFolderUri, TASK_FILENAME),
       new TextEncoder().encode(taskTemplate)
     );
+
+    const [progressEntry, taskMdEntry] = await Promise.all([
+      tryReadCreatedFileEntryV1(vscode.Uri.joinPath(workFolderUri, TASK_PROGRESS_FILENAME), TASK_PROGRESS_FILENAME, taskFolderName),
+      tryReadCreatedFileEntryV1(vscode.Uri.joinPath(workFolderUri, TASK_FILENAME), TASK_FILENAME, taskFolderName),
+    ]);
+    const createdEntries: TaskCreationIntentEntryV1[] = [progressEntry, taskMdEntry].filter(
+      (entry): entry is TaskCreationIntentEntryV1 => entry !== undefined
+    );
+
+    await journalCreationStep("recordWorkMaterialized", taskFolderName, () =>
+      recordWorkMaterializedV1(metaFolderPath, taskFolderPath, createdEntries)
+    );
+
+    // Atomically claim the staging directory into the final task folder
+    await vscode.workspace.fs.rename(workFolderUri, taskFolderUri, { overwrite: false });
+
+    await journalCreationStep("recordFinalFolderClaimed", taskFolderName, () =>
+      recordFinalFolderClaimedV1(metaFolderPath, taskFolderPath, createdEntries)
+    );
+    await journalCreationStep("commitCreationSentinel", taskFolderName, () =>
+      commitCreationSentinelV1(metaFolderPath, taskFolderPath)
+    );
+
     await writeTaskProgress(taskFolderUri, { ...progress, status: initialStatus });
+    // task-progress.json was just rewritten (status flipped from "creating" to
+    // its real initial value) -- re-read it so the journal's recorded hash for
+    // this path reflects the FINAL bytes, not the transient "creating" write
+    // recorded above.
+    const finalProgressEntry = await tryReadCreatedFileEntryV1(
+      vscode.Uri.joinPath(taskFolderUri, TASK_PROGRESS_FILENAME),
+      TASK_PROGRESS_FILENAME,
+      taskFolderName
+    );
+    await journalCreationStep("recordProgressCommitted", taskFolderName, () =>
+      recordProgressCommittedV1(metaFolderPath, taskFolderPath, finalProgressEntry ? [finalProgressEntry] : [])
+    );
     return { taskFolderName, taskFolderPath, taskFileUri, initialStatus };
   });
   const { taskFolderName, taskFolderPath, taskFileUri, initialStatus } = created;
+
+  await journalCreationStep("resolveTaskCreation", taskFolderName, () =>
+    resolveTaskCreationV1(metaFolderPath, taskFolderPath)
+  );
 
   // Activation only runs Git-ignore maintenance when the inventory already
   // holds tasks, so the very first creation in a fresh workspace must apply

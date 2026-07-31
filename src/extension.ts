@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import { registerStartNewTaskCommand } from "./commands/startNewTask";
-import { LegacyCreatingStartupGateV0 } from "./state/legacyCreatingStartupGateV0";
+import { TaskCreationStartupReconcilerV1 } from "./state/taskCreationStartupReconcilerV1";
 import { registerResumeTaskCommand } from "./commands/resumeTask";
 import {
   registerGeneratePlanWithAICommand,
@@ -34,6 +34,7 @@ import { registerFastForwardCurrentTaskReviewCommand } from "./commands/fastForw
 import { registerPauseTaskCommand } from "./commands/pauseTask";
 import { registerArchiveTaskCommands } from "./commands/archiveTask";
 import { registerPinTaskCommands } from "./commands/pinTask";
+import { registerTaskCreationRecoveryCommands, resumeStrandedTaskDeletionsV1 } from "./commands/taskCreationRecovery";
 import { registerApplyHighLevelReviewChangesCommand } from "./commands/applyHighLevelReviewChanges";
 import { registerApplyLowLevelReviewChangesCommand } from "./commands/applyLowLevelReviewChanges";
 import { registerCommitAndPushTaskCommand } from "./commands/commitAndPushTask";
@@ -382,9 +383,9 @@ export function activate(context: vscode.ExtensionContext): void {
 
   // Read-only classification of legacy `creating` folders, published as a
   // barrier that both the first task-inventory publication (below) and every
-  // creation/recovery command body (see LegacyCreatingStartupGateV0's doc
-  // comment, and startNewTask's use of waitUntilReady/getFootprints) must
-  // await before their first read. This replaces the old fire-and-forget
+  // creation/recovery command body (see TaskCreationStartupReconcilerV1's doc
+  // comment, and startNewTask's use of waitUntilReady/getClassifiedFootprints)
+  // must await before their first read. This replaces the old fire-and-forget
   // recoverTaskCreations call, which raced both of those.
   let startupGateReady: Promise<void> = Promise.resolve();
 
@@ -393,7 +394,27 @@ export function activate(context: vscode.ExtensionContext): void {
     const candidates = resolveTaskRootCandidates();
     const rootPaths = candidates.map((c) => c.absolutePath);
     void cleanupOrphanedTempFiles(rootPaths);
-    startupGateReady = LegacyCreatingStartupGateV0.beginClassification(rootPaths);
+    // Plan §4.1 startup step 1 ("Resume verified Safe Delete
+    // journals/tombstones"), ahead of step 4's classification below: a
+    // deletion journal stuck at `folderRemoved` (crash between physically
+    // removing the folder and recording `externalStateResolved`) is
+    // invisible to `TaskCreationStartupReconcilerV1`'s own scan, which only
+    // walks folders that still exist. Unlike the other best-effort startup
+    // recovery calls below (`recoverFinalizationTree`,
+    // `recoverActivationCheckpoint`), this sweep can clear the current-task
+    // checkpoint and trigger an inventory refresh — side effects that must
+    // themselves complete before the activation barrier opens (AC-CREATE-
+    // STARTUP-03: "no fire-and-forget reconciliation remains anywhere in
+    // activation"), so it is folded into `startupGateReady` ahead of
+    // `beginClassification` rather than run detached.
+    const strandedDeletionSweeps = rootPaths.map((root) =>
+      resumeStrandedTaskDeletionsV1(root, currentTaskStore, inventory).catch((err) =>
+        console.error("Stranded task-deletion sweep failed", err)
+      )
+    );
+    startupGateReady = Promise.all(strandedDeletionSweeps).then(() =>
+      TaskCreationStartupReconcilerV1.beginClassification(rootPaths, context.extensionUri)
+    );
     for (const root of rootPaths) {
       void recoverFinalizationTree(root).then(async journals => {
         for (const journal of journals) {
@@ -455,6 +476,7 @@ export function activate(context: vscode.ExtensionContext): void {
   registerPauseTaskCommand(context, inventory, currentTaskStore);
   registerArchiveTaskCommands(context, inventory, currentTaskStore);
   registerPinTaskCommands(context, inventory);
+  registerTaskCreationRecoveryCommands(context, inventory, currentTaskStore);
   registerApplyHighLevelReviewChangesCommand(context, inventory);
   registerApplyLowLevelReviewChangesCommand(context, inventory);
   registerCommitAndPushTaskCommand(context, inventory, currentTaskStore, chatViewProvider);

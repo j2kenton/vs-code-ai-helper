@@ -25,7 +25,7 @@ import {
 } from "../utils/taskOperations";
 import { CHAT_HISTORY_FILENAME, CHAT_HISTORY_CORRUPT_FILENAME } from "../utils/chatHistoryConstants";
 import { isLegacyAiRouteDisabledV0 } from "../services/legacyAiActionSafetyGateV0";
-import { LegacyCreatingStartupGateV0 } from "../state/legacyCreatingStartupGateV0";
+import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
 import {
   ensureWorkflowTaskFolderRootV1,
   getVerifiedTaskBindingIdV1,
@@ -1834,7 +1834,7 @@ export async function commitAndPushTask(
     // Duplicate rejection stays first (the token check above reads no task
     // state); after that, block on the startup gate's classification pass
     // before the core's first task-state read (plan §1.4).
-    await LegacyCreatingStartupGateV0.waitUntilReady();
+    await TaskCreationStartupReconcilerV1.waitUntilReady();
     await commitAndPushTaskCore(
       inventory,
       explicitArg,
@@ -1872,7 +1872,7 @@ export async function completeCommitAndPushTask(
     // Duplicate rejection stays first (the token check above reads no task
     // state); after that, block on the startup gate's classification pass
     // before this callback's first task-state read (plan §1.4).
-    await LegacyCreatingStartupGateV0.waitUntilReady();
+    await TaskCreationStartupReconcilerV1.waitUntilReady();
     const resolverArg = normalizeArg(explicitArg);
     const resolvedTask = await resolveTaskContext(inventory, resolverArg, {
       allowPaused: false,

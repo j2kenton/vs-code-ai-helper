@@ -126,6 +126,9 @@ const ATOMIC_WRITE_TEMP_RE = /_temp_.+\.tmp(\.[^.]+)?$/;
 /** Legacy Chat run logs: `runs/chat-*.md` (plan §5.3 — never migration inputs). */
 const LEGACY_CHAT_RUN_LOG_RE = /^chat-.*\.md$/;
 
+/** Creation cohort staging directory (plan §4.2). */
+const CREATION_WORK_DIR_RE_V1 = /^work-[0-9a-f]{64}$/;
+
 const CHAT_PRIVATE_BASENAMES = new Set<string>([
   CHAT_HISTORY_FILENAME.toLowerCase(),
   CHAT_HISTORY_CORRUPT_FILENAME.toLowerCase(),
@@ -186,6 +189,10 @@ export function classifyWorkflowPathV1(pathLike: string): WorkflowPathClassV1 {
   }
 
   if (segments.includes(CREATION_INTENTS_DIRNAME_V1)) {
+    return "workflowControl";
+  }
+
+  if (segments.some((segment) => CREATION_WORK_DIR_RE_V1.test(segment))) {
     return "workflowControl";
   }
 

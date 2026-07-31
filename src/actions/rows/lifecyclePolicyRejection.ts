@@ -12,6 +12,14 @@
  */
 export class LifecycleStageMismatchError extends Error {}
 
+/**
+ * Thrown when a row was invoked with an `expectedReviewAttemptId` CAS and the
+ * freshly re-read progress's `reviewAttemptId` no longer matches — e.g. a
+ * newer review attempt already claimed (and possibly auto-advanced) this
+ * task while an older attempt's follow-up transition was still in flight.
+ */
+export class LifecycleReviewAttemptMismatchError extends Error {}
+
 /** Thrown to carry a `taskProgressFieldPolicyV1` rejection code out of the locked callback. */
 export class LifecyclePolicyFailureError extends Error {
   constructor(public readonly code: string) {

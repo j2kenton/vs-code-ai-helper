@@ -3,7 +3,7 @@ import { describe, it } from "node:test";
 import * as vscode from "vscode";
 import { getStageNodeContextValue, orderTasksForDisplay, StageNode } from "../views/taskTreeProvider";
 import type { IncompleteTask } from "../utils/taskProgressUtils";
-import { buildTaskContextValue, buildStageContextValue } from "../utils/contextTokens";
+import { buildTaskContextValue, buildStageContextValue, CREATION_RECOVERY_CONTEXT_V1 } from "../utils/contextTokens";
 import {
   AI_MODEL_STAGES,
   STAGE_ORDER,
@@ -607,6 +607,64 @@ void describe("Context Tokens Emission", () => {
     assert.strictEqual(
       buildTaskContextValue({ status: "paused", currentStage: "plan", isScheduled: true, isMetaManaged: true }),
       "task-paused-scheduled-meta-managed"
+    );
+  });
+
+  void it("buildTaskContextValue emits exactly one plan §4.7 recovery context for a creating row, never a suffix blend", () => {
+    // AC-CREATE-UI-01: a live deletion journal wins outright, regardless of
+    // the underlying footprintClass — Open/Retry/Adopt-and-Retry/Safe Delete
+    // must all be hidden while a deletion is in flight.
+    assert.strictEqual(
+      buildTaskContextValue({
+        status: "creating",
+        currentStage: "desc",
+        creationFootprint: { footprintClass: "reconstructible", retryWithoutAdoptionEligible: true, deletionPending: true },
+      }),
+      CREATION_RECOVERY_CONTEXT_V1.deletionPending
+    );
+    // A verified §4.2 journal (retryWithoutAdoptionEligible) overrides the
+    // conservative footprintClass, even though the classifier only ever
+    // produces "reconstructible" for it today.
+    assert.strictEqual(
+      buildTaskContextValue({
+        status: "creating",
+        currentStage: "desc",
+        creationFootprint: { footprintClass: "reconstructible", retryWithoutAdoptionEligible: true, deletionPending: false },
+      }),
+      CREATION_RECOVERY_CONTEXT_V1.v1Recoverable
+    );
+    // Without a verified journal, each footprintClass gets its own distinct
+    // context — critically, "preservable" and "inspectionOnly" must NEVER
+    // resolve to "v1Recoverable" (the only context Retry's menu matches).
+    for (const footprintClass of ["reconstructible", "pristine", "preservable", "inspectionOnly"] as const) {
+      assert.strictEqual(
+        buildTaskContextValue({
+          status: "creating",
+          currentStage: "desc",
+          creationFootprint: { footprintClass, retryWithoutAdoptionEligible: false, deletionPending: false },
+        }),
+        CREATION_RECOVERY_CONTEXT_V1[footprintClass],
+        `footprintClass "${footprintClass}" must map to its own context, not v1Recoverable`
+      );
+    }
+    // No classification published yet falls back to the most restrictive
+    // context (Open only), never to something more permissive.
+    assert.strictEqual(
+      buildTaskContextValue({ status: "creating", currentStage: "desc" }),
+      CREATION_RECOVERY_CONTEXT_V1.inspectionOnly
+    );
+    // A creating row must never carry any of the normal suffix tokens
+    // (scheduled/meta-managed/pinned) blended into its recovery context.
+    assert.strictEqual(
+      buildTaskContextValue({
+        status: "creating",
+        currentStage: "desc",
+        isScheduled: true,
+        isMetaManaged: true,
+        isPinned: true,
+        creationFootprint: { footprintClass: "preservable", retryWithoutAdoptionEligible: false, deletionPending: false },
+      }),
+      CREATION_RECOVERY_CONTEXT_V1.preservable
     );
   });
 

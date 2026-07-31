@@ -57,6 +57,7 @@ export const OPERATION_CATEGORY_POLICIES: Record<OperationCategory, OperationCat
 export type OperationKind =
   // Instant user mutations
   | "create-task"
+  | "delete-task"
   | "rename-task"
   | "pause-task"
   | "resume-task"
@@ -80,6 +81,7 @@ export type OperationKind =
 
 export const OPERATION_KINDS: Record<OperationKind, { label: string; category: OperationCategory }> = {
   "create-task": { label: "Create Task", category: "instant-mutation" },
+  "delete-task": { label: "Safe Delete Task", category: "instant-mutation" },
   "rename-task": { label: "Rename Task", category: "instant-mutation" },
   "pause-task": { label: "Pause Task", category: "instant-mutation" },
   "resume-task": { label: "Resume Task", category: "instant-mutation" },

@@ -3,8 +3,8 @@
   "generatedBy": "scripts/generateWorkflowPathConsumers.mjs",
   "description": "Mechanically derived production path-consumer surface of the current working tree (plan §2.3): every module of the §1.1 production source universe importing node fs/child_process or touching the vscode workspace.fs API, with every concrete call site (compiler span + enclosing symbol). Scanned over the exact source-universe file list — never a filesystem walk. Regenerated every run; classification lives in workflow-path-consumer-baseline-v1.json; the immutable pre-gate reference is workflow-path-consumer-pregate-v1.json. Known mechanical bound: modules that only pass path STRINGS to another module (no fs/process API of their own) are covered transitively by the consumer module they call — the classifier enforcement point (plan §2.2) sits at the API-touching module. sourceUniverseSha256 is the CANONICAL (line-ending-independent) digest of the source-universe JSON, so provenance is identical across LF and CRLF checkouts.",
   "sourceUniverse": "workflow-inventories/workflow-production-source-baseline-v1.json",
-  "sourceUniverseSha256": "e2f80df32b608e763332f22a62f9050d1eb05fe6cb98465eb27c708eea27fedc",
-  "consumerCount": 46,
+  "sourceUniverseSha256": "79e620bb086243566851daebe706d74688e3bae024fd6ddaa92cf957f00166f9",
+  "consumerCount": 48,
   "consumers": [
     {
       "path": "src/commands/applyCurrentStageAction.ts",
@@ -172,72 +172,72 @@
       "callSites": [
         {
           "signal": "import:child_process",
-          "span": "L77-L77",
+          "span": "L76-L76",
           "enclosingSymbol": "(module)"
         },
         {
           "signal": "import:fs",
-          "span": "L78-L78",
+          "span": "L77-L77",
           "enclosingSymbol": "(module)"
         },
         {
           "signal": "workspace.fs",
-          "span": "L672-L672",
+          "span": "L671-L671",
           "enclosingSymbol": "entries"
         },
         {
           "signal": "workspace.fs",
-          "span": "L685-L685",
+          "span": "L684-L684",
           "enclosingSymbol": "legacyEntries"
         },
         {
           "signal": "workspace.fs",
-          "span": "L1148-L1148",
+          "span": "L1147-L1147",
           "enclosingSymbol": "newContent"
         },
         {
           "signal": "workspace.fs",
-          "span": "L1357-L1357",
+          "span": "L1356-L1356",
           "enclosingSymbol": "runAiToFile"
         },
         {
           "signal": "workspace.fs",
-          "span": "L1440-L1440",
+          "span": "L1439-L1439",
           "enclosingSymbol": "runAiToFile"
         },
         {
           "signal": "workspace.fs",
-          "span": "L1689-L1689",
+          "span": "L1688-L1688",
           "enclosingSymbol": "runSecondOpinionReview"
         },
         {
           "signal": "workspace.fs",
-          "span": "L1716-L1716",
+          "span": "L1715-L1715",
           "enclosingSymbol": "runSecondOpinionReview"
         },
         {
           "signal": "workspace.fs",
-          "span": "L2029-L2029",
+          "span": "L2039-L2039",
           "enclosingSymbol": "contentBytes"
         },
         {
           "signal": "workspace.fs",
-          "span": "L2483-L2483",
+          "span": "L2503-L2503",
           "enclosingSymbol": "runReviewForFolder"
         },
         {
           "signal": "workspace.fs",
-          "span": "L2500-L2500",
+          "span": "L2520-L2520",
           "enclosingSymbol": "runReviewForFolder"
         },
         {
           "signal": "workspace.fs",
-          "span": "L2888-L2888",
+          "span": "L2908-L2908",
           "enclosingSymbol": "runApply"
         },
         {
           "signal": "workspace.fs",
-          "span": "L5416-L5416",
+          "span": "L5464-L5464",
           "enclosingSymbol": "buildReviewResumeVariablesV1"
         }
       ]
@@ -250,28 +250,71 @@
       "callSites": [
         {
           "signal": "workspace.fs",
-          "span": "L44-L44",
-          "enclosingSymbol": "entries"
-        },
-        {
-          "signal": "workspace.fs",
-          "span": "L137-L137",
-          "enclosingSymbol": "hasActiveTaskOnDisk"
-        },
-        {
-          "signal": "workspace.fs",
-          "span": "L164-L164",
+          "span": "L103-L103",
           "enclosingSymbol": "bytes"
         },
         {
           "signal": "workspace.fs",
-          "span": "L278-L278",
+          "span": "L136-L136",
+          "enclosingSymbol": "entries"
+        },
+        {
+          "signal": "workspace.fs",
+          "span": "L230-L230",
+          "enclosingSymbol": "hasActiveTaskOnDisk"
+        },
+        {
+          "signal": "workspace.fs",
+          "span": "L257-L257",
+          "enclosingSymbol": "bytes"
+        },
+        {
+          "signal": "workspace.fs",
+          "span": "L413-L413",
           "enclosingSymbol": "created"
         },
         {
           "signal": "workspace.fs",
-          "span": "L299-L299",
+          "span": "L424-L424",
           "enclosingSymbol": "created"
+        },
+        {
+          "signal": "workspace.fs",
+          "span": "L442-L442",
+          "enclosingSymbol": "created"
+        }
+      ]
+    },
+    {
+      "path": "src/commands/taskCreationRecovery.ts",
+      "signals": [
+        "workspace.fs"
+      ],
+      "callSites": [
+        {
+          "signal": "workspace.fs",
+          "span": "L226-L226",
+          "enclosingSymbol": "outcome"
+        },
+        {
+          "signal": "workspace.fs",
+          "span": "L388-L388",
+          "enclosingSymbol": "bytes"
+        },
+        {
+          "signal": "workspace.fs",
+          "span": "L807-L807",
+          "enclosingSymbol": "outcome"
+        },
+        {
+          "signal": "workspace.fs",
+          "span": "L827-L827",
+          "enclosingSymbol": "outcome"
+        },
+        {
+          "signal": "workspace.fs",
+          "span": "L835-L835",
+          "enclosingSymbol": "outcome"
         }
       ]
     },
@@ -340,7 +383,7 @@
       "callSites": [
         {
           "signal": "workspace.fs",
-          "span": "L194-L194",
+          "span": "L195-L195",
           "enclosingSymbol": "activate"
         }
       ]
@@ -385,6 +428,19 @@
           "signal": "workspace.fs",
           "span": "L291-L291",
           "enclosingSymbol": "entries"
+        }
+      ]
+    },
+    {
+      "path": "src/services/taskCreationSeedHistoryV1.ts",
+      "signals": [
+        "workspace.fs"
+      ],
+      "callSites": [
+        {
+          "signal": "workspace.fs",
+          "span": "L93-L93",
+          "enclosingSymbol": "bytes"
         }
       ]
     },
@@ -454,24 +510,6 @@
       ]
     },
     {
-      "path": "src/state/legacyCreatingStartupGateV0.ts",
-      "signals": [
-        "workspace.fs"
-      ],
-      "callSites": [
-        {
-          "signal": "workspace.fs",
-          "span": "L24-L24",
-          "enclosingSymbol": "classifyMetaRoot"
-        },
-        {
-          "signal": "workspace.fs",
-          "span": "L47-L47",
-          "enclosingSymbol": "classifyMetaRoot"
-        }
-      ]
-    },
-    {
       "path": "src/state/primarySessionLock.ts",
       "signals": [
         "import:fs"
@@ -507,6 +545,34 @@
           "signal": "import:fs",
           "span": "L9-L9",
           "enclosingSymbol": "(module)"
+        }
+      ]
+    },
+    {
+      "path": "src/state/taskCreationStartupReconcilerV1.ts",
+      "signals": [
+        "workspace.fs"
+      ],
+      "callSites": [
+        {
+          "signal": "workspace.fs",
+          "span": "L95-L95",
+          "enclosingSymbol": "bytes"
+        },
+        {
+          "signal": "workspace.fs",
+          "span": "L136-L136",
+          "enclosingSymbol": "verifyJournalFileEntryV1"
+        },
+        {
+          "signal": "workspace.fs",
+          "span": "L240-L240",
+          "enclosingSymbol": "classifyMetaRoot"
+        },
+        {
+          "signal": "workspace.fs",
+          "span": "L261-L261",
+          "enclosingSymbol": "classifyMetaRoot"
         }
       ]
     },
@@ -917,12 +983,12 @@
       "callSites": [
         {
           "signal": "workspace.fs",
-          "span": "L435-L435",
+          "span": "L456-L456",
           "enclosingSymbol": "content"
         },
         {
           "signal": "workspace.fs",
-          "span": "L695-L695",
+          "span": "L716-L716",
           "enclosingSymbol": "fileContent"
         }
       ]

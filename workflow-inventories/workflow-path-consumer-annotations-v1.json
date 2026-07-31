@@ -12,7 +12,7 @@
       "expiryCohort": "cleanup",
       "evidence": {
         "symbol": "(module)",
-        "sourceSpan": "L77-L77",
+        "sourceSpan": "L76-L76",
         "edgeKind": "dynamicPathConsumption",
         "targetActionKey": "none"
       }
@@ -123,36 +123,51 @@
       }
     },
     {
-      "annotationKind": "pregateModifiedConsumer",
-      "path": "src/commands/startNewTask.ts",
-      "planSection": "§1.4 (remove implicit creation promotion) / §8 Safety cohort",
-      "rationale": "The Safety cohort replaced both recoverCompletedTaskCreations() call sites (activation and the in-command promotion pass) with consultation of LegacyCreatingStartupGateV0's published read-only classification, moving the creation-footprint reads into the gate module — the file's workspace.fs call-site profile dropped from 7 to 5 sites. No new consumption was added here.",
+      "annotationKind": "pregateAddedConsumer",
+      "path": "src/services/taskCreationSeedHistoryV1.ts",
+      "planSection": "§4.1/§4.3 (Creation cohort) / plan §4.1 wiring-cutover round",
+      "rationale": "Newly bundle-reachable this round (previously present on disk but not part of the production source universe, since nothing shipped imported its sole caller, TaskCreationStartupReconcilerV1): matchCreationSeedV1 reads the shipped resources/prompts/creation-seed-legacy-*.md copies via workspace.fs to compare a candidate task.md byte-for-byte against historical creation seeds (plan §4.3's `pristine` classification). Read-only; never writes.",
       "owner": "ensemble-workflow-migration",
-      "cohort": "safety",
+      "cohort": "creation",
       "expiryCohort": "creation",
       "evidence": {
-        "symbol": "hasActiveTaskOnDisk",
-        "sourceSpan": "L137-L137",
-        "edgeKind": "pregateModifiedConsumer",
+        "symbol": "matchCreationSeedV1",
+        "sourceSpan": "L1-L1",
+        "edgeKind": "pregateAddedConsumer",
         "targetActionKey": "taskCreationLifecycle.v1",
-        "pregateStabilitySha256": "3e3e245fc1e4cef0acfe60fb8e793f96c80ac111659382ae44bdd047aa84e0d5",
-        "liveStabilitySha256": "09c57870bba2d6483174e88a217bdbd35f824ae8942232bc3e8a262ac2f5ecab"
+        "liveStabilitySha256": "2d3d4d3716e0809853faaea00a0fd84eb47770ef9c86af33c13b2a279339e52e"
       }
     },
     {
       "annotationKind": "pregateAddedConsumer",
-      "path": "src/state/legacyCreatingStartupGateV0.ts",
-      "planSection": "§1.4 (LegacyCreatingStartupGateV0) / §8 Safety cohort",
-      "rationale": "New Safety-cohort module: the read-only classification pass over legacy `creating` footprints (classifyMetaRoot reads meta-root directory entries and task-progress bytes via workspace.fs at two sites). It performs no writes, no promotion, no ownership adoption, and no provider invocation; superseded by TaskCreationStartupReconcilerV1 in the creation cohort.",
+      "path": "src/state/taskCreationStartupReconcilerV1.ts",
+      "planSection": "§4.1/§4.3 (Creation cohort) / plan §4.1 wiring-cutover round",
+      "rationale": "Newly bundle-reachable this round: this module replaces LegacyCreatingStartupGateV0 (deleted in the same change) as the activation-order barrier and read-only classification pass over legacy `creating` footprints (classifyMetaRoot reads meta-root directory entries, task-progress bytes, and each candidate's task.md via workspace.fs). It performs no writes, no promotion, no ownership adoption, and no provider invocation — identical safety envelope to the module it replaces. Evidence refresh (this round, plan §4.6/§4.7): classifyMetaRoot gained a new read-only workspace.fs call site (verifyJournalFileEntryV1, already present in an earlier round but never re-baselined) and the deletionPending check (hasLiveDeletionJournalV1) reads only through taskDeletionIntentStoreV1.ts's own WorkflowFileStoreV1-mediated store, not workspace.fs directly — still purely read-only, still no promotion/adoption/provider invocation.",
       "owner": "ensemble-workflow-migration",
-      "cohort": "safety",
+      "cohort": "creation",
       "expiryCohort": "creation",
       "evidence": {
         "symbol": "classifyMetaRoot",
-        "sourceSpan": "L24-L24",
+        "sourceSpan": "L1-L1",
         "edgeKind": "pregateAddedConsumer",
         "targetActionKey": "taskCreationLifecycle.v1",
-        "liveStabilitySha256": "884e95755f18bb6ece3e1fc843c55677502071853dd41ed52dc5d9c59209d5ae"
+        "liveStabilitySha256": "52e294b72ff51ff81a5e4f4ed310ef8f51de19c2ad40886dcd01110520b152ea"
+      }
+    },
+    {
+      "annotationKind": "pregateAddedConsumer",
+      "path": "src/commands/taskCreationRecovery.ts",
+      "planSection": "§4.4/§4.5/§4.6/§4.7 (Creation cohort)",
+      "rationale": "Retry/Open/Adopt-and-Retry/Safe Delete recovery commands (plan §§4.4-4.7) for a `status: \"creating\"` task row: reads task.md/task-progress.json via workspace.fs to build journal/sentinel entries and revalidate before mutating, and writes task.md (Retry only, never overwriting an existing one) plus deletes the folder's own files (Safe Delete only, after durable deleteRequested journaling and immediate-before-mutation revalidation). Every mutating path is gated on a fresh reclassification taken immediately beforehand; adoption (Adopt-and-Retry, Safe Delete's preservable branch) is itself journaled via taskAdoptionIntentStoreV1.ts before any sentinel commit.",
+      "owner": "j2kenton",
+      "cohort": "creation",
+      "expiryCohort": "creation",
+      "evidence": {
+        "symbol": "retryTaskCreation, adoptAndRetryTaskCreation, safeDeleteFailedTaskCreation",
+        "sourceSpan": "L1-L1",
+        "edgeKind": "pregateAddedConsumer",
+        "targetActionKey": "taskCreationLifecycle.v1",
+        "liveStabilitySha256": "52d6e872cae8d9fe296a8eb05f0baf1d493f4c466118800984d6761d76860adc"
       }
     },
     {

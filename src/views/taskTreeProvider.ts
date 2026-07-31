@@ -18,7 +18,8 @@ import { resolveImplementationArtifact } from "../utils/implementationArtifactRe
 import { parseReadiness } from "../utils/reviewReadiness";
 import { TaskInventory, TaskWithProgress } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
-import { buildTaskContextValue, buildStageContextValue } from "../utils/contextTokens";
+import { buildTaskContextValue, buildStageContextValue, TaskCreationContextInput } from "../utils/contextTokens";
+import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
 import { getConfiguredTaskRoot } from "../utils/taskRoot";
 
 /**
@@ -144,13 +145,22 @@ export class TaskNode extends vscode.TreeItem {
     isCurrent: boolean = false,
     isScheduled: boolean = false,
     isMetaManaged: boolean = false,
-    collapseEpoch: number = 0
+    collapseEpoch: number = 0,
+    /** Plan §4.7 classification for a `creating`-status row; ignored otherwise. */
+    creationFootprint?: TaskCreationContextInput
   ) {
+    // An interrupted creation (plan §4.7 recovery row) has no stages to show
+    // — getStageNodes() is never called for it (see getChildren) — so it
+    // renders as a non-expandable leaf rather than a row with a dead
+    // disclosure arrow.
+    const isCreating = task.progress.status === "creating";
     super(
       task.progress.displayName ?? task.folderName,
-      expanded
-        ? vscode.TreeItemCollapsibleState.Expanded
-        : vscode.TreeItemCollapsibleState.Collapsed
+      isCreating
+        ? vscode.TreeItemCollapsibleState.None
+        : expanded
+          ? vscode.TreeItemCollapsibleState.Expanded
+          : vscode.TreeItemCollapsibleState.Collapsed
     );
 
     // Stable identity so VS Code can preserve expansion state across
@@ -178,7 +188,17 @@ export class TaskNode extends vscode.TreeItem {
       .getTaskOperations(tKey)
       .find(op => op.exclusive && op.stage === undefined);
 
-    if (taskLevelOp && taskLevelOp.waitingForUser) {
+    if (isCreating) {
+      // No taskLevelOp/paused/archived/completed branch below applies to an
+      // interrupted creation — it is its own lifecycle state (plan §4.7).
+      this.description = creationFootprint?.deletionPending
+        ? "Deletion in progress"
+        : "Incomplete creation — needs recovery";
+      this.iconPath = new vscode.ThemeIcon(
+        "warning",
+        new vscode.ThemeColor("charts.red")
+      );
+    } else if (taskLevelOp && taskLevelOp.waitingForUser) {
       // Same "waiting is not running" distinction as StageNode below: a
       // task-level op (commit/push, release) paused on the user shouldn't
       // spin as if the computer is still working.
@@ -239,7 +259,8 @@ export class TaskNode extends vscode.TreeItem {
       lintPassed: task.progress.lintPayload?.passed,
       isScheduled,
       isMetaManaged,
-      isPinned: task.progress.pinnedAt !== undefined
+      isPinned: task.progress.pinnedAt !== undefined,
+      creationFootprint
     });
   }
 }
@@ -708,6 +729,13 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
       await this.updateMetaManagedStatus();
     }
     if (element instanceof TaskNode) {
+      // An interrupted creation (plan §4.7) has no stage/AI menu surface —
+      // its TaskNode already renders non-expandable (see the constructor),
+      // but VS Code can still ask for children (e.g. a stale expand request
+      // from before a refresh), so this must independently return none.
+      if (element.task.progress.status === "creating") {
+        return [];
+      }
       return this.getStageNodes(element.task);
     }
     if (element) {
@@ -789,13 +817,21 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
         // scheduledResumeTime belonged to the removed in-session scheduler.
         // Treat legacy values as inert so old completed tasks keep rendering.
         const isScheduled = task.progress.scheduledRun !== undefined;
+        const creationFootprint =
+          task.progress.status === "creating"
+            ? TaskCreationStartupReconcilerV1.getLastKnownFootprint(
+                path.dirname(task.folderUri.fsPath),
+                task.folderUri.fsPath
+              )
+            : undefined;
         return new TaskNode(
           task,
           shouldExpand(task, index),
           isCurrent,
           isScheduled,
           this.isMetaManaged,
-          this.collapseEpoch
+          this.collapseEpoch,
+          creationFootprint
         );
       }
     );

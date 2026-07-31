@@ -4,7 +4,7 @@ import { discoverAllTasks, DiscoveredTask } from "../utils/taskRoot";
 import { readTaskProgress } from "../utils/taskProgressUtils";
 import { TaskProgress } from "../types/taskProgress";
 import { repairLegacyOwnership } from "../utils/metaResourcesMigration";
-import { LegacyCreatingStartupGateV0 } from "./legacyCreatingStartupGateV0";
+import { TaskCreationStartupReconcilerV1 } from "./taskCreationStartupReconcilerV1";
 import { deriveTaskBindingV1 } from "../types/taskBindingV1";
 
 /**
@@ -124,7 +124,7 @@ export class TaskInventory {
       // the barrier here means a future refresh() caller that forgets that
       // chain still cannot publish inventory ahead of the classification
       // pass. Resolves immediately outside activation.
-      await LegacyCreatingStartupGateV0.waitUntilReady();
+      await TaskCreationStartupReconcilerV1.waitUntilReady();
       const discovered = await discoverAllTasks();
 
       // Load progress for visible tasks

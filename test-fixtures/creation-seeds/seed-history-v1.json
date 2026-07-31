@@ -2,34 +2,32 @@
   "schemaVersion": 1,
   "seeds": [
     {
-      "id": "legacy-pre-draft-cutover-v0",
-      "fixture": "legacy-pre-draft-cutover-seed.md",
-      "version": "v0",
-      "hasOpenQuestionsHeading": true
-    },
-    {
       "id": "legacy-instructions-user-description-v0",
       "fixture": "legacy-instructions-user-description-seed.md",
       "version": "v0",
-      "hasOpenQuestionsHeading": false
+      "hasOpenQuestionsHeading": false,
+      "provenance": "pinned: resources/prompts/task-template.md@15d81a4, sha256:a417e5ca…"
     },
     {
       "id": "legacy-single-body-task-v0",
       "fixture": "legacy-single-body-task-seed.md",
       "version": "v0",
-      "hasOpenQuestionsHeading": false
+      "hasOpenQuestionsHeading": false,
+      "provenance": "pinned: resources/prompts/task-template.md@876cca8, sha256:e8b9ab91…"
     },
     {
       "id": "legacy-early-inline-fallback-v0",
       "fixture": "legacy-early-inline-fallback-seed.md",
       "version": "v0",
-      "hasOpenQuestionsHeading": true
+      "hasOpenQuestionsHeading": true,
+      "provenance": "pinned: resources/prompts/task-template.md@486aab4 (oldest committed revision), sha256:83a43f9a… — also matches the startNewTask.ts inline fallback string at the same revision; see README.md"
     },
     {
       "id": "v1-canonical",
       "fixture": "v1-canonical-seed.md",
       "version": "v1",
-      "hasOpenQuestionsHeading": false
+      "hasOpenQuestionsHeading": false,
+      "provenance": "pinned: resources/prompts/task-template.md@3e467f7 (current), sha256:2175edf8…"
     }
   ]
 }

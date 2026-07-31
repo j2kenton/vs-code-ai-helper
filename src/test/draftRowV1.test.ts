@@ -632,7 +632,7 @@ void describe("draftRowV1", () => {
         seeds: Array<{ id: string; fixture: string; version: string; hasOpenQuestionsHeading: boolean }>;
       };
 
-      assert.equal(manifest.seeds.length, 5, "seed history must inventory all 5 historical and V1 creation seeds");
+      assert.equal(manifest.seeds.length, 4, "seed history must inventory all 4 historical and V1 creation seeds");
 
       const templatePath = path.join(process.cwd(), "resources", "prompts", "task-template.md");
       assert.equal(fs.existsSync(templatePath), true, "task-template.md must exist");

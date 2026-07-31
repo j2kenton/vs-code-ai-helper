@@ -34,6 +34,21 @@ function contextFor(folder: string, expectedSourceStage: string): LifecycleExecu
   };
 }
 
+function contextForWith(
+  folder: string,
+  input: Record<string, unknown>,
+  beforeWrite?: LifecycleExecutionContextV1["beforeWrite"]
+): LifecycleExecutionContextV1 {
+  return {
+    actionKey: NEXT_STAGE_ACTION_KEY_V1,
+    operationId: allocateHex128IdV1(),
+    taskBindingId: "test-task-binding",
+    chatDocumentId: "test-chat-doc",
+    validatedInput: { taskFolderPath: folder, ...input },
+    ...(beforeWrite !== undefined ? { beforeWrite } : {}),
+  };
+}
+
 function setProgress(folder: string, patch: Record<string, unknown>): void {
   const progressPath = path.join(folder, "task-progress.json");
   const raw = JSON.parse(fs.readFileSync(progressPath, "utf8")) as Record<string, unknown>;
@@ -70,6 +85,50 @@ void describe("nextStage.v1 registry row", () => {
     );
     assert.equal(
       validateNextStageInputV1({ taskFolderPath: "/x", expectedSourceStage: "plan", extra: 1 }).ok,
+      false
+    );
+  });
+
+  void it("validateNextStageInputV1 accepts targetStage and expectedReviewAttemptId, rejecting invalid values", () => {
+    assert.deepEqual(
+      validateNextStageInputV1({
+        taskFolderPath: "/x",
+        expectedSourceStage: "plan",
+        targetStage: "impl",
+        expectedReviewAttemptId: "attempt-1",
+      }),
+      {
+        ok: true,
+        input: {
+          taskFolderPath: "/x",
+          expectedSourceStage: "plan",
+          targetStage: "impl",
+          expectedReviewAttemptId: "attempt-1",
+        },
+      }
+    );
+    assert.equal(
+      validateNextStageInputV1({
+        taskFolderPath: "/x",
+        expectedSourceStage: "plan",
+        targetStage: "not-a-stage",
+      }).ok,
+      false
+    );
+    assert.equal(
+      validateNextStageInputV1({
+        taskFolderPath: "/x",
+        expectedSourceStage: "plan",
+        expectedReviewAttemptId: "",
+      }).ok,
+      false
+    );
+    assert.equal(
+      validateNextStageInputV1({
+        taskFolderPath: "/x",
+        expectedSourceStage: "plan",
+        expectedReviewAttemptId: 7,
+      }).ok,
       false
     );
   });
@@ -192,5 +251,132 @@ void describe("nextStage.v1 registry row", () => {
     if (strict.ok) {
       assert.equal(strict.decoded.progress.currentStage, "plan");
     }
+  });
+
+  void it("lands directly on an explicit targetStage, skipping the configured review stage's completion tick", async () => {
+    const fixture = makeOwnedTaskFolder("ensemble-nextstage-row-skip-");
+    setProgress(fixture.folder, { status: "active", currentStage: "plan" });
+
+    const outcome = await executeNextStageV1(
+      contextForWith(fixture.folder, { expectedSourceStage: "plan", targetStage: "impl" })
+    );
+    assert.equal(outcome.kind, "completed");
+
+    const strict = await readTaskProgressStrictV1(vscode.Uri.file(fixture.folder));
+    assert.equal(strict.ok, true);
+    if (strict.ok) {
+      assert.equal(strict.decoded.progress.currentStage, "impl");
+      assert.ok(strict.decoded.progress.completedStages?.includes("plan"));
+      // The skipped review stages were never landed on, so they are never
+      // ticked complete by this transition.
+      assert.equal(strict.decoded.progress.completedStages?.includes("plan-high-review"), false);
+      assert.equal(strict.decoded.progress.completedStages?.includes("plan-low-review"), false);
+    }
+  });
+
+  void it("rejects a backward/equal targetStage with invalidTargetStage and never mutates", async () => {
+    const fixture = makeOwnedTaskFolder("ensemble-nextstage-row-badtarget-");
+    setProgress(fixture.folder, { status: "active", currentStage: "impl" });
+
+    const outcome = await executeNextStageV1(
+      contextForWith(fixture.folder, { expectedSourceStage: "impl", targetStage: "plan" })
+    );
+    assert.equal(outcome.kind, "failed");
+    if (outcome.kind === "failed") {
+      assert.equal(outcome.code, "nextStage.invalidTargetStage");
+      assert.equal(outcome.retryable, false);
+    }
+
+    const strict = await readTaskProgressStrictV1(vscode.Uri.file(fixture.folder));
+    assert.equal(strict.ok, true);
+    if (strict.ok) {
+      assert.equal(strict.decoded.progress.currentStage, "impl");
+    }
+  });
+
+  void it("advances when expectedReviewAttemptId matches the freshly re-read progress", async () => {
+    const fixture = makeOwnedTaskFolder("ensemble-nextstage-row-attempt-match-");
+    setProgress(fixture.folder, { status: "active", currentStage: "plan", reviewAttemptId: "attempt-1" });
+
+    const outcome = await executeNextStageV1(
+      contextForWith(fixture.folder, { expectedSourceStage: "plan", expectedReviewAttemptId: "attempt-1" })
+    );
+    assert.equal(outcome.kind, "completed");
+
+    const strict = await readTaskProgressStrictV1(vscode.Uri.file(fixture.folder));
+    assert.equal(strict.ok, true);
+    if (strict.ok) {
+      assert.equal(strict.decoded.progress.currentStage, "plan-high-review");
+      assert.equal(strict.decoded.progress.reviewAttemptId, undefined);
+    }
+  });
+
+  void it("rejects with staleReviewAttempt and never mutates when a newer review attempt owns the transition", async () => {
+    const fixture = makeOwnedTaskFolder("ensemble-nextstage-row-attempt-stale-");
+    setProgress(fixture.folder, { status: "active", currentStage: "plan", reviewAttemptId: "attempt-2" });
+
+    // Caller claimed "attempt-1" before its provider call started, but a
+    // newer review attempt ("attempt-2") already claimed and possibly
+    // advanced this stage — the stale attempt's follow-up transition must
+    // be rejected instead of silently advancing on the newer attempt's behalf.
+    const outcome = await executeNextStageV1(
+      contextForWith(fixture.folder, { expectedSourceStage: "plan", expectedReviewAttemptId: "attempt-1" })
+    );
+    assert.equal(outcome.kind, "failed");
+    if (outcome.kind === "failed") {
+      assert.equal(outcome.code, "nextStage.staleReviewAttempt");
+      assert.equal(outcome.retryable, false);
+    }
+
+    const strict = await readTaskProgressStrictV1(vscode.Uri.file(fixture.folder));
+    assert.equal(strict.ok, true);
+    if (strict.ok) {
+      assert.equal(strict.decoded.progress.currentStage, "plan");
+      assert.equal(strict.decoded.progress.reviewAttemptId, "attempt-2");
+    }
+  });
+
+  void it("runs beforeWrite atomically with a winning CAS, before the write", async () => {
+    const fixture = makeOwnedTaskFolder("ensemble-nextstage-row-beforewrite-");
+    setProgress(fixture.folder, { status: "active", currentStage: "plan" });
+
+    const calls: string[] = [];
+    const outcome = await executeNextStageV1(
+      contextForWith(
+        fixture.folder,
+        { expectedSourceStage: "plan" },
+        async () => {
+          calls.push("beforeWrite");
+          // The freshly re-read (pre-transition) progress must still be on
+          // disk when beforeWrite runs — it fires BEFORE the transition write.
+          const strictDuringWrite = await readTaskProgressStrictV1(vscode.Uri.file(fixture.folder));
+          assert.equal(strictDuringWrite.ok, true);
+          if (strictDuringWrite.ok) {
+            assert.equal(strictDuringWrite.decoded.progress.currentStage, "plan");
+          }
+        }
+      )
+    );
+    assert.equal(outcome.kind, "completed");
+    assert.deepEqual(calls, ["beforeWrite"]);
+  });
+
+  void it("never runs beforeWrite when the CAS is rejected", async () => {
+    const fixture = makeOwnedTaskFolder("ensemble-nextstage-row-beforewrite-rejected-");
+    setProgress(fixture.folder, { status: "active", currentStage: "plan-high-review" });
+
+    let called = false;
+    const outcome = await executeNextStageV1(
+      contextForWith(
+        fixture.folder,
+        { expectedSourceStage: "plan" },
+        () => { called = true; return Promise.resolve(); }
+      )
+    );
+    assert.equal(outcome.kind, "failed");
+    if (outcome.kind === "failed") {
+      assert.equal(outcome.code, "nextStage.staleSourceStage");
+    }
+    assert.equal(called, false);
   });
 });

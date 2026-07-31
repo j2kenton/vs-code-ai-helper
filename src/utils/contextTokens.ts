@@ -1,4 +1,16 @@
 import { TaskStage, TaskStatus, isReviewStage, AI_MODEL_STAGES } from "../types/taskProgress";
+import { TaskCreationFootprintClassV1 } from "../types/taskCreationRecoveryV1";
+
+/**
+ * A `status: "creating"` row's plan §4.3 classification, as last published by
+ * `TaskCreationStartupReconcilerV1.getLastKnownFootprint` — `undefined` means
+ * no classification pass has published anything for this folder yet.
+ */
+export interface TaskCreationContextInput {
+  footprintClass: TaskCreationFootprintClassV1;
+  retryWithoutAdoptionEligible: boolean;
+  deletionPending: boolean;
+}
 
 export interface TaskContextInput {
   status: TaskStatus;
@@ -8,6 +20,46 @@ export interface TaskContextInput {
   isScheduled?: boolean;
   isMetaManaged?: boolean;
   isPinned?: boolean;
+  /** Present only when `status === "creating"` and a classification has published. */
+  creationFootprint?: TaskCreationContextInput;
+}
+
+/**
+ * The six plan §4.7 recovery contexts, in the precedence order
+ * `buildTaskContextValue` applies. Exported so `taskTreeProvider.ts` and its
+ * tests can reference the exact literals instead of re-deriving them.
+ */
+export const CREATION_RECOVERY_CONTEXT_V1 = {
+  deletionPending: "ensemble.task.creationRecovery.deletionPending",
+  v1Recoverable: "ensemble.task.creationRecovery.v1Recoverable",
+  reconstructible: "ensemble.task.creationRecovery.reconstructible",
+  pristine: "ensemble.task.creationRecovery.pristine",
+  preservable: "ensemble.task.creationRecovery.preservable",
+  inspectionOnly: "ensemble.task.creationRecovery.inspectionOnly",
+} as const;
+
+/**
+ * Chooses exactly one of the six plan §4.7 contexts for a `creating` row.
+ * `deletionPending` wins outright (a deletion in flight must never also
+ * offer Open/Retry/Adopt-and-Retry/Safe Delete); otherwise
+ * `retryWithoutAdoptionEligible` (the verified-§4.2-journal branch — plan
+ * §4.5) overrides the four conservative `footprintClass` values, since it is
+ * strictly stronger evidence than any of them. `undefined` (no classification
+ * published yet) conservatively falls back to `inspectionOnly` — Open only,
+ * never Retry/Adopt-and-Retry/Safe Delete, until a real classification
+ * publishes.
+ */
+function creationRecoveryContextValue(footprint: TaskCreationContextInput | undefined): string {
+  if (!footprint) {
+    return CREATION_RECOVERY_CONTEXT_V1.inspectionOnly;
+  }
+  if (footprint.deletionPending) {
+    return CREATION_RECOVERY_CONTEXT_V1.deletionPending;
+  }
+  if (footprint.retryWithoutAdoptionEligible) {
+    return CREATION_RECOVERY_CONTEXT_V1.v1Recoverable;
+  }
+  return CREATION_RECOVERY_CONTEXT_V1[footprint.footprintClass];
 }
 
 export interface StageContextInput {
@@ -44,6 +96,16 @@ export function validateTaskContextInput(input: TaskContextInput): void {
  */
 export function buildTaskContextValue(input: TaskContextInput): string {
   validateTaskContextInput(input);
+
+  // Creating is checked first and returns immediately: an interrupted
+  // creation (plan §4.7 recovery row) has no stage/AI menu surface at all,
+  // and must expose only the ONE recovery context its own classification
+  // warrants (AC-CREATE-UI-01) — never a hyphen-joined blend with the
+  // lint/scheduled/meta-managed/pinned suffixes below, none of which apply to
+  // a row with no stages and no lint/schedule state of its own.
+  if (input.status === "creating") {
+    return creationRecoveryContextValue(input.creationFootprint);
+  }
 
   const tokens: string[] = [];
 
