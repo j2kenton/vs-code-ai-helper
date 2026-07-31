@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import { getConfiguredTaskRoot } from "./taskRoot";
-import { findIncompleteTasks } from "./taskProgressUtils";
+import { findIncompleteTasksStrictV1 } from "../services/taskProgressDiscoveryV1";
 import { STAGE_DISPLAY_NAMES, TaskStage } from "../types/taskProgress";
 import { NotificationRouter } from "./notificationRouter";
 
@@ -30,7 +30,9 @@ export async function pickTaskFolder(
     getConfiguredTaskRoot()
   );
 
-  const allTasks = await findIncompleteTasks(metaFolderUri);
+  // Strict discovery (plan §3.12): undecodable folders are excluded from the
+  // picker — they surface as recovery nodes in the Tasks view instead.
+  const allTasks = (await findIncompleteTasksStrictV1(metaFolderUri)).tasks;
   const tasks = allTasks.filter((task) =>
     eligibleStages.includes(task.progress.currentStage)
   );

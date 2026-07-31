@@ -89,7 +89,7 @@ import { resolveTaskRootCandidates } from "./utils/taskRoot";
 import { finishFinalization, recoverFinalizationTree } from "./state/finalizationJournal";
 import { PendingOperationsStore } from "./state/pendingOperationsStore";
 import { recoverActivationCheckpoint } from "./state/taskActivationCoordinator";
-import { readTaskProgress } from "./utils/taskProgressUtils";
+import { readTaskProgressStrictV1 } from "./services/taskProgressReaderV1";
 import { IncompleteTask } from "./types/incompleteTask";
 import { installAutoImplementConfirmation, migrateEnabledProvidersForExistingModels, migrateSettingsNamespace, migrateSettingsScope } from "./config/settings";
 
@@ -425,11 +425,14 @@ export function activate(context: vscode.ExtensionContext): void {
           // clearing the journal marker, so verifying the file still reads
           // back as valid progress is sufficient to reconcile automatically
           // instead of leaving a stale journal that would re-warn forever.
-          const progress = await readTaskProgress(vscode.Uri.file(journal.taskFolder));
-          if (progress) {
+          const progressResult = await readTaskProgressStrictV1(vscode.Uri.file(journal.taskFolder));
+          if (progressResult.ok) {
             await finishFinalization(journal.taskFolder);
           } else {
-            NotificationRouter.showWarning(`Could not verify an interrupted ${journal.operation} for task ${journal.taskFolder}. Please check its files manually.`);
+            // Strict cutover (plan §3.12): a corrupt progress file now warns
+            // with the decoder's specific reason instead of being
+            // indistinguishable from a missing one.
+            NotificationRouter.showWarning(`Could not verify an interrupted ${journal.operation} for task ${journal.taskFolder} (${progressResult.reason}). Please check its files manually.`);
           }
         }
       }).catch(err => console.error("Finalization recovery failed", err));

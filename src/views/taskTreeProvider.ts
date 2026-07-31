@@ -17,6 +17,7 @@ import { readRedoSidecar, isRedoAvailableFromRecord } from "../utils/redoSidecar
 import { resolveImplementationArtifact } from "../utils/implementationArtifactResolver";
 import { parseReadiness } from "../utils/reviewReadiness";
 import { TaskInventory, TaskWithProgress } from "../state/taskInventory";
+import { TaskProgressRecoveryEntryV1 } from "../services/taskProgressDiscoveryV1";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { buildTaskContextValue, buildStageContextValue, TaskCreationContextInput } from "../utils/contextTokens";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
@@ -441,7 +442,33 @@ export class EmptyTasksNode extends vscode.TreeItem {
   }
 }
 
-type TaskTreeNode = TaskNode | StageNode | EmptyTasksNode;
+/**
+ * Inspection-only node for a folder whose `task-progress.json` exists but
+ * did not strictly decode (plan §3.12 step 4): the task is no longer
+ * silently omitted from the list — it renders here with the decoder's
+ * recovery code, and clicking it opens the progress file for manual repair.
+ * Folders the creation reconciler already claims never reach this node
+ * (TaskInventory skips them), so one folder can't grow two recovery surfaces.
+ */
+export class ProgressRecoveryNode extends vscode.TreeItem {
+  constructor(public readonly entry: TaskProgressRecoveryEntryV1) {
+    super(entry.folderName, vscode.TreeItemCollapsibleState.None);
+    this.description = `needs recovery — ${entry.code}`;
+    this.tooltip =
+      `${entry.reason}\n\n` +
+      "This task's task-progress.json did not strictly decode. Open it to " +
+      "inspect and repair the recorded fields, then refresh the Tasks panel.";
+    this.iconPath = new vscode.ThemeIcon("warning");
+    this.contextValue = "ensemble.task.progressRecovery";
+    this.command = {
+      command: "vscode.open",
+      title: "Open task-progress.json",
+      arguments: [vscode.Uri.file(path.join(entry.taskFolderPath, "task-progress.json"))],
+    };
+  }
+}
+
+type TaskTreeNode = TaskNode | StageNode | EmptyTasksNode | ProgressRecoveryNode;
 
 /**
  * Try to read review readiness from an artifact file.
@@ -678,7 +705,13 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
   }
 
   getParent(element: TaskTreeNode): TaskNode | undefined {
-    if (element instanceof TaskNode || element instanceof EmptyTasksNode) return undefined;
+    if (
+      element instanceof TaskNode ||
+      element instanceof EmptyTasksNode ||
+      element instanceof ProgressRecoveryNode
+    ) {
+      return undefined;
+    }
     return this.taskNodesByFolder.get(element.task.folderUri.toString());
   }
 
@@ -841,7 +874,20 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
     for (const node of nodes) {
       if (node instanceof TaskNode) this.taskNodesByFolder.set(node.task.folderUri.toString(), node);
     }
-    return nodes.length === 0 && tasks.length > 0 ? [new EmptyTasksNode()] : nodes;
+
+    // Undecodable progress files render as inspection-only recovery nodes
+    // (plan §3.12 step 4) — after the real tasks, unaffected by the status
+    // filter (a recovery entry has no trustworthy status to filter on).
+    // Optional call: minimal test stubs build inventories as plain objects
+    // without the prototype; a missing method simply means no recovery rows.
+    const recoveryNodes = (this.inventory.getRecoveryEntries?.() ?? []).map(
+      (entry) => new ProgressRecoveryNode(entry)
+    );
+
+    if (nodes.length === 0 && recoveryNodes.length === 0 && tasks.length > 0) {
+      return [new EmptyTasksNode()];
+    }
+    return [...nodes, ...recoveryNodes];
   }
 
   private async getStageNodes(task: IncompleteTask): Promise<StageNode[]> {

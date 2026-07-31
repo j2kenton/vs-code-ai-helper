@@ -170,9 +170,17 @@ function installGitIgnoreRecorder(): { calls: () => number; restore: () => void 
 const DECLINED_KEY = "ensemble.metaMigration.declined";
 const LEGACY_ACTIVE_ROOT_KEY = "ensemble.metaMigration.legacyActiveRoot";
 
-function migratedProgress(metaRoot: string, projectRoot: string): TaskProgress {
+function migratedProgress(
+  metaRoot: string,
+  projectRoot: string,
+  taskFolder: string = "2026-01-01_task_1"
+): TaskProgress {
+  // `taskFolder` must self-name the on-disk folder: the strict repair path
+  // (patchTaskProgressStrictV1 inside repairLegacyOwnership) re-reads the
+  // document with expectedTaskFolder = basename, so a mismatched fixture is
+  // a recovery condition, not a repairable task.
   return {
-    taskFolder: "2026-01-01_task_1",
+    taskFolder,
     currentStage: "publish",
     status: "active",
     createdAt: new Date().toISOString(),
@@ -429,7 +437,11 @@ void describe("repairLegacyOwnership", () => {
     const root = makeWorkspace("repair-known-legacy");
     const oldRoot = path.join(root, "plans");
     const newRoot = path.join(root, ".ensemble");
-    const task = path.join(newRoot, "2026-01-01_task_1");
+    // The strict repair re-reads the document from disk inside its locked
+    // patch, so the fixture must actually exist (the retired permissive
+    // rewrite trusted the in-memory progress it was handed).
+    const task = writeMigratedTask(newRoot, "2026-01-01_task_1", migratedProgress(oldRoot, root));
+    const bridge = installReadFileBridge();
     const atomic = suppressAtomicProgressWrite();
     try {
       const result = await repairLegacyOwnership(task, migratedProgress(oldRoot, root), newRoot);
@@ -437,6 +449,7 @@ void describe("repairLegacyOwnership", () => {
       assert.equal(result.progress.ownership?.metaRoot, newRoot);
     } finally {
       atomic.restore();
+      bridge.restore();
     }
   });
 
@@ -444,11 +457,11 @@ void describe("repairLegacyOwnership", () => {
     const root = makeWorkspace("repair-journal");
     const oldRoot = path.join(root, "task-metadata");
     const newRoot = path.join(root, ".ensemble");
-    const task = path.join(newRoot, "2026-01-01_task_1");
-    fs.mkdirSync(newRoot, { recursive: true });
+    const task = writeMigratedTask(newRoot, "2026-01-01_task_1", migratedProgress(oldRoot, root));
     fs.writeFileSync(path.join(newRoot, ".ensemble-migration.json"), JSON.stringify({
       from: oldRoot, to: newRoot, at: new Date().toISOString(),
     }));
+    const bridge = installReadFileBridge();
     const atomic = suppressAtomicProgressWrite();
     try {
       const result = await repairLegacyOwnership(task, migratedProgress(oldRoot, root), newRoot);
@@ -456,6 +469,7 @@ void describe("repairLegacyOwnership", () => {
       assert.equal(result.progress.ownership?.metaRoot, newRoot);
     } finally {
       atomic.restore();
+      bridge.restore();
     }
   });
 
@@ -484,7 +498,7 @@ void describe("repairLegacyOwnership", () => {
     const newRoot = path.join(root, ".ensemble");
     const alreadyRewritten = migratedProgress(newRoot, root);
     writeMigratedTask(newRoot, "2026-01-01_task_1", alreadyRewritten);
-    writeMigratedTask(newRoot, "2026-01-01_task_2", migratedProgress(oldRoot, root));
+    writeMigratedTask(newRoot, "2026-01-01_task_2", migratedProgress(oldRoot, root, "2026-01-01_task_2"));
     fs.writeFileSync(path.join(newRoot, ".ensemble-migration.json"), JSON.stringify({
       from: oldRoot, to: newRoot, at: new Date().toISOString(),
     }));
@@ -504,7 +518,11 @@ void describe("repairLegacyOwnership", () => {
     const oldRoot = path.join(root, "custom-metadata");
     const newRoot = path.join(root, ".ensemble");
     const releaseTask = writeMigratedTask(newRoot, "2026-01-01_task_1", migratedProgress(oldRoot, root));
-    const inventoryTask = writeMigratedTask(newRoot, "2026-01-01_task_2", migratedProgress(oldRoot, root));
+    const inventoryTask = writeMigratedTask(
+      newRoot,
+      "2026-01-01_task_2",
+      migratedProgress(oldRoot, root, "2026-01-01_task_2")
+    );
     fs.writeFileSync(path.join(newRoot, ".ensemble-migration.json"), JSON.stringify({
       from: oldRoot, to: newRoot, at: new Date().toISOString(),
     }));

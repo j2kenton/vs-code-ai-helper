@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import { getConfiguredTaskRoot } from "../utils/taskRoot";
 import { TASK_FILENAME } from "../types/taskProgress";
-import { findAllTasks } from "../utils/taskProgressUtils";
+import { findAllTasksStrictV1 } from "../services/taskProgressDiscoveryV1";
 import { IncompleteTask } from "../types/incompleteTask";
 import {
   resolveCurrentPlanUri,
@@ -46,7 +46,7 @@ export async function viewTask(arg?: ViewTaskArg): Promise<void> {
     return;
   }
 
-  const tasks = await findAllTasks(metaFolderUri);
+  const tasks = (await findAllTasksStrictV1(metaFolderUri)).tasks;
 
   // Prepare picker using artifactPicker helper (no filtering for viewTask)
   const hasPlanMap = new Map<string, boolean>();
@@ -112,7 +112,7 @@ export async function viewPlan(arg?: ViewPlanArg): Promise<void> {
     return;
   }
 
-  const tasks = await findAllTasks(metaFolderUri);
+  const tasks = (await findAllTasksStrictV1(metaFolderUri)).tasks;
 
   // Build hasPlanMap by checking each task's plan existence in parallel
   const hasPlanResults = await Promise.all(

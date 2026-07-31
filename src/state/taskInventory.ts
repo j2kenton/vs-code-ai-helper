@@ -1,7 +1,8 @@
 import * as path from "path";
 import * as vscode from "vscode";
 import { discoverAllTasks, DiscoveredTask } from "../utils/taskRoot";
-import { readTaskProgress } from "../utils/taskProgressUtils";
+import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
+import { TaskProgressRecoveryEntryV1 } from "../services/taskProgressDiscoveryV1";
 import { TaskProgress } from "../types/taskProgress";
 import { repairLegacyOwnership } from "../utils/metaResourcesMigration";
 import { TaskCreationStartupReconcilerV1 } from "./taskCreationStartupReconcilerV1";
@@ -66,6 +67,7 @@ export function compareTasksNewestFirst(a: string, b: string): number {
  */
 export class TaskInventory {
   private visibleTasks: TaskWithProgress[] = [];
+  private recoveryEntries: TaskProgressRecoveryEntryV1[] = [];
   private taskByCanonicalId = new Map<string, TaskWithProgress>();
   private suppressionAliasMap = new Map<string, string>();
   private readonly _onDidChange = new vscode.EventEmitter<void>();
@@ -127,19 +129,43 @@ export class TaskInventory {
       await TaskCreationStartupReconcilerV1.waitUntilReady();
       const discovered = await discoverAllTasks();
 
-      // Load progress for visible tasks
+      // Load progress for visible tasks — strictly (plan §3.12 step 4):
+      // a missing file still means "not a task folder" (skipped, exactly
+      // like before), but an invalid/unknown-version document now surfaces
+      // as an explicit recovery entry instead of a silently omitted task.
       const withProgress: TaskWithProgress[] = [];
+      const recovery: TaskProgressRecoveryEntryV1[] = [];
 
       for (const task of discovered) {
         try {
-          const progress = await readTaskProgress(vscode.Uri.file(task.taskFolderPath));
-          if (!progress) {
+          const result = await readTaskProgressStrictV1(vscode.Uri.file(task.taskFolderPath), {
+            expectedTaskFolder: task.folderName,
+          });
+          if (!result.ok) {
+            if (result.code === "missing") {
+              continue;
+            }
+            // Folders the creation reconciler already claims keep their
+            // dedicated creation-recovery surface — one folder must never
+            // render two competing recovery nodes.
+            const claimedByCreationRecovery = TaskCreationStartupReconcilerV1.getLastKnownFootprint(
+              path.dirname(task.taskFolderPath),
+              task.taskFolderPath
+            );
+            if (!claimedByCreationRecovery) {
+              recovery.push({
+                folderName: task.folderName,
+                taskFolderPath: task.taskFolderPath,
+                code: result.code,
+                reason: result.reason,
+              });
+            }
             continue;
           }
 
           const repaired = await repairLegacyOwnership(
             task.taskFolderPath,
-            progress,
+            result.decoded.progress,
             task.resolvedTaskRootPath ?? path.dirname(task.taskFolderPath)
           );
           withProgress.push({
@@ -147,7 +173,7 @@ export class TaskInventory {
             progress: repaired.progress,
           });
         } catch {
-          // Task folder exists but no valid progress file, skip
+          // Task folder exists but its progress could not be examined, skip
         }
       }
 
@@ -157,6 +183,7 @@ export class TaskInventory {
       withProgress.sort((a, b) => compareTasksNewestFirst(a.folderName, b.folderName));
 
       this.visibleTasks = withProgress;
+      this.recoveryEntries = recovery;
 
       // Rebuild lookup maps
       this.taskByCanonicalId.clear();
@@ -190,6 +217,17 @@ export class TaskInventory {
    */
   getTasks(): readonly TaskWithProgress[] {
     return this.visibleTasks;
+  }
+
+  /**
+   * Folders whose `task-progress.json` exists but did not strictly decode
+   * (plan §3.12 step 4) — rendered by the task tree as inspection-only
+   * recovery nodes rather than silently omitted tasks. Rebuilt per refresh.
+   */
+  getRecoveryEntries(): readonly TaskProgressRecoveryEntryV1[] {
+    // Nullish fallback: test doubles built via Object.create(prototype)
+    // inherit this method without running the field initializer.
+    return this.recoveryEntries ?? [];
   }
 
   /**

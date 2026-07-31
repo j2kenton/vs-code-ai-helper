@@ -62,6 +62,31 @@ function suppressAtomicProgressWrite(): { restore(): void } {
   return { restore: (): void => { atomic.writeAtomic = original; } };
 }
 
+/**
+ * The strict ownership repair (§3.12: patchTaskProgressStrictV1 inside
+ * repairLegacyOwnership) re-reads the document from disk under its lock, so
+ * repair-path fixtures must actually exist and workspace.fs.readFile must be
+ * bridged to the real filesystem (the retired permissive rewrite trusted the
+ * in-memory progress object it was handed).
+ */
+function writeTaskFixtureOnDisk(taskFolderPath: string, progress: TaskProgress): void {
+  fs.mkdirSync(taskFolderPath, { recursive: true });
+  fs.writeFileSync(path.join(taskFolderPath, "task.md"), "# Task\n", "utf8");
+  fs.writeFileSync(path.join(taskFolderPath, "task-progress.json"), JSON.stringify(progress), "utf8");
+}
+
+function installReadFileBridge(): { restore: () => void } {
+  const workspaceFs = vscode.workspace.fs as unknown as Record<string, unknown>;
+  const originalReadFile = workspaceFs.readFile;
+  workspaceFs.readFile = (uri: vscode.Uri): Promise<Uint8Array> =>
+    fs.promises.readFile(uri.fsPath).then((content) => new Uint8Array(content));
+  return {
+    restore: (): void => {
+      workspaceFs.readFile = originalReadFile;
+    },
+  };
+}
+
 void describe("isSafeReleaseScript", () => {
   void it("accepts plain release commands with allowed characters", () => {
     assert.strictEqual(isSafeReleaseScript("vsce publish"), true);
@@ -245,6 +270,8 @@ void describe("release ownership preparation", () => {
     const oldRoot = path.join(workspace, "plans");
     const newRoot = path.join(workspace, ".ensemble");
     const task = path.join(newRoot, "2026-01-01_task_1");
+    writeTaskFixtureOnDisk(task, migratedProgress(oldRoot, workspace));
+    const bridge = installReadFileBridge();
     const atomic = suppressAtomicProgressWrite();
     try {
       const result = await validateReleaseTaskOwnership(task, migratedProgress(oldRoot, workspace), [candidate(newRoot)]);
@@ -252,6 +279,7 @@ void describe("release ownership preparation", () => {
       assert.equal(result.ok && result.progress.ownership?.metaRoot, newRoot);
     } finally {
       atomic.restore();
+      bridge.restore();
       fs.rmSync(workspace, { recursive: true, force: true });
     }
   });
@@ -265,6 +293,8 @@ void describe("release ownership preparation", () => {
     const oldRoot = path.join(workspace, "plans");
     const newRoot = path.join(workspace, ".Ensemble");
     const task = path.join(newRoot, "2026-01-01_task_1");
+    writeTaskFixtureOnDisk(task, migratedProgress(oldRoot, workspace));
+    const bridge = installReadFileBridge();
     const atomic = suppressAtomicProgressWrite();
     try {
       const result = await validateReleaseTaskOwnership(
@@ -275,6 +305,7 @@ void describe("release ownership preparation", () => {
       assert.equal(result.ok, true, "Windows path casing must not defeat the direct-parent repair check");
     } finally {
       atomic.restore();
+      bridge.restore();
       fs.rmSync(workspace, { recursive: true, force: true });
     }
   });

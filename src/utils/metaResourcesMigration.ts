@@ -13,7 +13,8 @@ import {
 import { NotificationRouter } from "./notificationRouter";
 import { ensureAutomaticMetaGitIgnore } from "../commands/toggleMetaResourcesGitIgnore";
 import { TaskProgress } from "../types/taskProgress";
-import { readTaskProgress, writeTaskProgress } from "./taskProgressUtils";
+import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
+import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
 
 const CONFIG_SECTION = "vs-code-ai-helper";
@@ -105,18 +106,33 @@ export async function repairLegacyOwnership(
   }
   const rewriteRootedPath = (value: string | undefined): string | undefined =>
     value && isUnder(value, oldRoot) ? path.join(resolvedTaskRootPath, path.relative(oldRoot, value)) : value;
-  const repaired: TaskProgress = {
-    ...progress,
-    ownership: {
-      ...ownership,
-      metaRoot: resolvedTaskRootPath,
-      projectRoot: rewriteRootedPath(ownership.projectRoot) ?? ownership.projectRoot,
-      workspaceRoot: rewriteRootedPath(ownership.workspaceRoot),
-    },
-  };
-  await writeTaskProgress(vscode.Uri.file(taskFolderPath), repaired);
+  // Strict read-modify-write (plan §3.12): the rewrite re-derives from the
+  // freshly locked read (opaque fields splice through byte-identically, the
+  // file gains its ensembleProgressVersion marker on first repair) and
+  // declines if another window already repaired or changed the recorded
+  // root while this one was deciding.
+  let applied = false;
+  const patched = await patchTaskProgressStrictV1(vscode.Uri.file(taskFolderPath), (current) => {
+    const currentOwnership = current.ownership;
+    if (!currentOwnership?.metaRoot || !samePath(currentOwnership.metaRoot, ownership.metaRoot)) {
+      return undefined;
+    }
+    applied = true;
+    return {
+      ...current,
+      ownership: {
+        ...currentOwnership,
+        metaRoot: resolvedTaskRootPath,
+        projectRoot: rewriteRootedPath(currentOwnership.projectRoot) ?? currentOwnership.projectRoot,
+        workspaceRoot: rewriteRootedPath(currentOwnership.workspaceRoot),
+      },
+    };
+  });
+  if (!patched || !applied) {
+    return { repaired: false, progress };
+  }
   await removeJournalIfOwnershipRewriteIsComplete(resolvedTaskRootPath);
-  return { repaired: true, progress: repaired };
+  return { repaired: true, progress: patched };
 }
 
 /**
@@ -129,8 +145,8 @@ async function removeJournalIfOwnershipRewriteIsComplete(target: string): Promis
   try {
     for (const entry of fs.readdirSync(target, { withFileTypes: true })) {
       if (!entry.isDirectory()) continue;
-      const progress = await readTaskProgress(vscode.Uri.file(path.join(target, entry.name)));
-      if (!progress || !samePath(progress.ownership?.metaRoot ?? "", target)) return;
+      const result = await readTaskProgressStrictV1(vscode.Uri.file(path.join(target, entry.name)));
+      if (!result.ok || !samePath(result.decoded.progress.ownership?.metaRoot ?? "", target)) return;
     }
     fs.unlinkSync(path.join(target, MIGRATION_JOURNAL_FILENAME));
   } catch (error) {
@@ -150,12 +166,13 @@ export async function finishMigrationOwnershipRewrite(target: string): Promise<b
   for (const entry of fs.readdirSync(target, { withFileTypes: true })) {
     if (!entry.isDirectory()) continue;
     const taskFolder = path.join(target, entry.name);
-    const progress = await readTaskProgress(vscode.Uri.file(taskFolder));
-    if (!progress) {
+    const readResult = await readTaskProgressStrictV1(vscode.Uri.file(taskFolder));
+    if (!readResult.ok) {
       completed = false;
-      console.error(`Could not read moved task ownership for ${taskFolder}`);
+      console.error(`Could not read moved task ownership for ${taskFolder}: ${readResult.reason}`);
       continue;
     }
+    const progress = readResult.decoded.progress;
     try {
       const result = await repairLegacyOwnership(taskFolder, progress, target);
       if (!result.repaired && progress.ownership?.metaRoot && !samePath(progress.ownership.metaRoot, target)) {

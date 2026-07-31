@@ -428,22 +428,6 @@
       "migrationCohort": "creation"
     },
     {
-      "path": "src/commands/viewArtifacts.ts",
-      "imports": [
-        "findAllTasks"
-      ],
-      "purpose": "Enumerates tasks to open their artifacts read-only.",
-      "migrationCohort": "resume"
-    },
-    {
-      "path": "src/extension.ts",
-      "imports": [
-        "readTaskProgress"
-      ],
-      "purpose": "Activation wiring: startup reads for inventory/checkpoint/status-bar publication.",
-      "migrationCohort": "creation"
-    },
-    {
       "path": "src/runners/runnerRegistry.ts",
       "imports": [
         "patchTaskProgress"
@@ -459,14 +443,6 @@
       ],
       "purpose": "Coordinates sole-active-task transitions (pausing others, activating one).",
       "migrationCohort": "lifecycle"
-    },
-    {
-      "path": "src/state/taskInventory.ts",
-      "imports": [
-        "readTaskProgress"
-      ],
-      "purpose": "Directory-scan classification of task folders into the derived inventory.",
-      "migrationCohort": "creation"
     },
     {
       "path": "src/utils/completionLint.ts",
@@ -499,15 +475,6 @@
       "migrationCohort": "cleanup"
     },
     {
-      "path": "src/utils/metaResourcesMigration.ts",
-      "imports": [
-        "readTaskProgress",
-        "writeTaskProgress"
-      ],
-      "purpose": "Reads and rewrites ownership bindings during meta-root migration/repair.",
-      "migrationCohort": "creation"
-    },
-    {
       "path": "src/utils/modelSelection.ts",
       "imports": [
         "findAllTasks",
@@ -516,14 +483,6 @@
       ],
       "purpose": "Reads/patches per-stage fallback reservations during model selection.",
       "migrationCohort": "runnerV1"
-    },
-    {
-      "path": "src/utils/pickTaskFolder.ts",
-      "imports": [
-        "findIncompleteTasks"
-      ],
-      "purpose": "Task-folder picker enumerating incomplete tasks.",
-      "migrationCohort": "lifecycle"
     },
     {
       "path": "src/utils/resolveTaskContext.ts",
