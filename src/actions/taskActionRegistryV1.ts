@@ -28,6 +28,7 @@ import {
   maxResponseBytesCeilingForModeV1,
 } from "../types/agentExecutionV1";
 import { CompletedContentV1 } from "../types/aiResultEnvelope";
+import { ObservationLedgerV1 } from "../types/preflightPlanV1";
 import { StructuredAnswerV1 } from "../types/structuredQuestionV1";
 import { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
 import { TaskProgress, TaskStage } from "../types/taskProgress";
@@ -66,6 +67,16 @@ export interface TaskActionExecutionContextV1 {
   readonly validatedInput: unknown;
   /** Validated answers from a resumed structured-question interaction, when resuming. */
   readonly answers?: readonly StructuredAnswerV1[];
+  /**
+   * The attempt's own observation ledger and workspace root for a
+   * `providerMode: "preflight"` row (plan §7.3): promotion validates the
+   * returned plan against exactly the observations THIS attempt's read
+   * session minted — never another attempt's. Absent for text/edit rows.
+   */
+  readonly preflight?: {
+    readonly ledger: ObservationLedgerV1;
+    readonly rootId: string;
+  };
 }
 
 /** Execution context for non-provider (lifecycle) rows: an operation, but no provider attempt. */

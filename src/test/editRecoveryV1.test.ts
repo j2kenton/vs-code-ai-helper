@@ -34,7 +34,7 @@ void describe("editRecoveryV1", () => {
 
       // A rebooted broker has no in-memory record of this execution and
       // refuses to claim an id it cannot verify.
-      const rebooted = createEditPlanBrokerV1({ fileStore: h.store, privateRootId: PRIVATE_ROOT_ID });
+      const rebooted = createEditPlanBrokerV1({ getFileStore: () => h.store, privateRootId: PRIVATE_ROOT_ID });
       const unknown = await rebooted.claimExecutionPermit(executionId);
       assert.equal(unknown.ok === false && unknown.code, "unknownExecution");
     } finally {

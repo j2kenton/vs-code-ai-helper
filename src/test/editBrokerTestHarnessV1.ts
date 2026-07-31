@@ -65,7 +65,7 @@ export async function installEditBrokerHarnessV1(): Promise<EditBrokerHarnessV1>
     { rootId: WORKSPACE_ROOT_ID, fsPath: workspaceRoot, trustedForMutation: true },
     { rootId: PRIVATE_ROOT_ID, fsPath: privateRoot, trustedForMutation: true },
   ]);
-  const broker = createEditPlanBrokerV1({ fileStore: store, privateRootId: PRIVATE_ROOT_ID });
+  const broker = createEditPlanBrokerV1({ getFileStore: () => store, privateRootId: PRIVATE_ROOT_ID });
   const ledger = createObservationLedgerV1();
 
   // Real observations: revisions/digests come from the actual filesystem.

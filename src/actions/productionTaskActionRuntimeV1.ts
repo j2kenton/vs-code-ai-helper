@@ -36,11 +36,23 @@ import { createCommitPushMetadataRowV1 } from "./rows/commitPushMetadataRowV1";
 import { createNextStageRowV1 } from "./rows/nextStageRowV1";
 import { createMarkTaskDoneRowV1 } from "./rows/markTaskDoneRowV1";
 import { createResumeTaskRowV1 } from "./rows/resumeTaskRowV1";
+import {
+  createApplyReviewEditPreflightRowV1,
+  createFastForwardPreflightRowV1,
+  createImplementationPreflightRowV1,
+  createLintPreflightRowV1,
+  EditPreflightActionInputV1,
+} from "./rows/editPreflightRowsV1";
+import { createEditExecutionRowV1, EditExecutionActionInputV1 } from "./rows/editExecutionRowV1";
 import { createV1RunnerSelectionOpener } from "../runners/runnerRegistry";
 import {
   getChatInteractionTransactionStoreV1,
+  getEditPlanBrokerV1,
+  getWorkflowFileStoreV1,
   getWorkflowLeaseStoreV1,
 } from "../services/workflowRuntimeServicesV1";
+import { createReadToolSessionHandlerV1 } from "../services/readToolSessionHandlerV1";
+import { createObservationLedgerV1 } from "../types/preflightPlanV1";
 import { TaskProgress, TaskStage } from "../types/taskProgress";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { allocateHex128IdV1 } from "../types/actionCorrelationV1";
@@ -64,6 +76,11 @@ export function getProductionTaskActionRegistryV1(): TaskActionRegistryV1 {
       createNextStageRowV1(),
       createMarkTaskDoneRowV1(),
       createResumeTaskRowV1(),
+      createImplementationPreflightRowV1(),
+      createFastForwardPreflightRowV1(),
+      createApplyReviewEditPreflightRowV1(),
+      createLintPreflightRowV1(),
+      createEditExecutionRowV1(),
     ]);
   }
   return registry;
@@ -176,6 +193,28 @@ export function createProductionTaskActionCoordinatorV1(options: {
     followUpScheduler: noopFollowUpSchedulerV1,
     presenter: notificationPresenterV1(),
     auditLogger: consoleAuditLoggerV1,
+    // §7.2/§7.6 request-local tool sessions: a fresh read session (with its
+    // own observation ledger) per preflight attempt, and the broker's
+    // mutation-session handler per edit attempt. Text rows never touch this.
+    toolSessions: {
+      createPreflightSession(validatedInput) {
+        const input = validatedInput as EditPreflightActionInputV1;
+        const ledger = createObservationLedgerV1();
+        return {
+          handler: createReadToolSessionHandlerV1({
+            view: getWorkflowFileStoreV1(),
+            rootId: input.rootId,
+            ledger,
+          }),
+          ledger,
+          rootId: input.rootId,
+        };
+      },
+      createEditSession(validatedInput) {
+        const input = validatedInput as EditExecutionActionInputV1;
+        return getEditPlanBrokerV1().createEditSessionHandler(input.executionId);
+      },
+    },
   });
 }
 

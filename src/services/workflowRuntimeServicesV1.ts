@@ -33,6 +33,7 @@ import * as fs from "fs";
 import * as path from "path";
 import * as vscode from "vscode";
 import { ChatInteractionTransactionStoreV1 } from "./chatInteractionTransactionStoreV1";
+import { createEditPlanBrokerV1, EditPlanBrokerV1 } from "./editBrokerToolSessionHandlerV1";
 import { createWorkflowLeaseStoreV1, WorkflowLeaseStoreV1 } from "./workflowLeaseStoreV1";
 import { decodeTaskProgressTextV1 } from "./taskProgressDecoderV1";
 import { TASK_PROGRESS_FILENAME } from "../types/taskProgress";
@@ -57,6 +58,7 @@ let registry: WorkflowPathRegistryV1 = createWorkflowPathRegistryV1();
 let fileStore: WorkflowFileStoreV1 = createWorkflowFileStoreV1(registry.registeredRoots());
 let privateRootId: string | undefined;
 let transactionStore: ChatInteractionTransactionStoreV1 | undefined;
+let editPlanBroker: EditPlanBrokerV1 | undefined;
 /**
  * The one shared task-operation lease store (plan §1.8/§3.9) the action
  * coordinator acquires against for every provider/lifecycle row — a runtime,
@@ -697,12 +699,35 @@ export function getWorkflowLeaseStoreV1(): WorkflowLeaseStoreV1 {
   return leaseStore;
 }
 
+/**
+ * The one shared edit plan broker (plan §7.4/§7.6). Requires the private-
+ * storage root (sealed plans/receipts persist under
+ * `workflow-runtime-v1/edit-runs/`) — activation configures it before any
+ * edit action can run, so an unconfigured call is a programmer error.
+ */
+export function getEditPlanBrokerV1(): EditPlanBrokerV1 {
+  const boundPrivateRootId = privateRootId;
+  if (boundPrivateRootId === undefined) {
+    throw new Error(
+      "The workflow private-storage root is not configured — edit plans cannot be sealed (configureWorkflowPrivateStorageRootV1 runs at activation)."
+    );
+  }
+  if (!editPlanBroker) {
+    editPlanBroker = createEditPlanBrokerV1({
+      getFileStore: () => fileStore,
+      privateRootId: boundPrivateRootId,
+    });
+  }
+  return editPlanBroker;
+}
+
 /** Test isolation: restore the pristine, unconfigured state. Production never calls this. */
 export function resetWorkflowRuntimeServicesForTestV1(): void {
   registry = createWorkflowPathRegistryV1();
   fileStore = createWorkflowFileStoreV1(registry.registeredRoots());
   privateRootId = undefined;
   transactionStore = undefined;
+  editPlanBroker = undefined;
   leaseStore = createWorkflowLeaseStoreV1();
   verifiedTaskFolderRootIds = new Set<string>();
   verifiedTaskFolderBindingIds = new Map<string, string>();

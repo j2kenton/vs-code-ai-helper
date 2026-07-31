@@ -762,10 +762,14 @@ export function stripSensitiveTaskFiles(
  * ignored records carry no index content and are excluded.
  */
 export async function collectStagedIndexRecordsV1(repoRoot: string): Promise<PorcelainV2Entry[]> {
+  // `--untracked-files=no`: untracked entries carry no INDEX content, and
+  // enumerating them is unbounded work on large repos (resolveGitRepo can
+  // legitimately resolve to a huge ancestor repository) — the index gate
+  // needs exactly the staged records.
   const { stdout } = await runGitCommand(repoRoot, "status", [
     "--porcelain=v2",
     "-z",
-    "--untracked-files=all",
+    "--untracked-files=no",
   ]);
   return parsePorcelainV2Z(stdout).filter((entry) => {
     const stagedColumn = entry.status.charAt(0);
@@ -1389,7 +1393,17 @@ async function commitAndPushTaskCore(
       );
       return;
     }
-    const stagedIndexRecords = await collectStagedIndexRecordsV1(repoRoot);
+    let stagedIndexRecords: PorcelainV2Entry[];
+    try {
+      stagedIndexRecords = await collectStagedIndexRecordsV1(repoRoot);
+    } catch (error) {
+      // Fail CLOSED: publishing without having verified the index would
+      // defeat the §2.4 gate entirely.
+      NotificationRouter.showError(
+        `Commit and push failed: could not read the git index (${getErrorMessage(error)}).`
+      );
+      return;
+    }
     const forbiddenStaged = findForbiddenStagedRecordsV1(
       stagedIndexRecords,
       repoRoot,

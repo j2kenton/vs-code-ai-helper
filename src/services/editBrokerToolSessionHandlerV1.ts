@@ -101,7 +101,12 @@ interface ExecutionStateV1 {
 }
 
 export interface EditPlanBrokerDepsV1 {
-  readonly fileStore: WorkflowFileStoreV1;
+  /**
+   * LIVE file-store accessor: the shared store is rebuilt whenever a new
+   * root registers (workflowRuntimeServicesV1.rebuildFileStore), so the
+   * broker must never capture one instance for its whole lifetime.
+   */
+  readonly getFileStore: () => WorkflowFileStoreV1;
   /** The configured private-storage root id (workflowRuntimeServicesV1). */
   readonly privateRootId: string;
 }
@@ -126,7 +131,7 @@ export function createEditPlanBrokerV1(deps: EditPlanBrokerDepsV1): EditPlanBrok
       runDirPath(executionId),
     ];
     for (const relativePath of parents) {
-      const created = await deps.fileStore.createDirectory({
+      const created = await deps.getFileStore().createDirectory({
         rootId: deps.privateRootId,
         relativePath,
       });
@@ -172,7 +177,7 @@ export function createEditPlanBrokerV1(deps: EditPlanBrokerDepsV1): EditPlanBrok
         return { ok: false, code: "sealPersistFailed", reason: "could not provision the edit-run directory" };
       }
       const sealedJson = JSON.stringify(sealed, null, 2);
-      const persisted = await deps.fileStore.createFileExclusive(
+      const persisted = await deps.getFileStore().createFileExclusive(
         runFileLocator(executionId, "sealed-plan-v1.json"),
         Buffer.from(sealedJson, "utf8")
       );
@@ -181,7 +186,7 @@ export function createEditPlanBrokerV1(deps: EditPlanBrokerDepsV1): EditPlanBrok
       }
       // §7.6 step 1: read the persisted record BACK and verify what is
       // actually on disk, byte for byte, before any session may consume it.
-      const readBack = await deps.fileStore.readFileBounded(
+      const readBack = await deps.getFileStore().readFileBounded(
         runFileLocator(executionId, "sealed-plan-v1.json"),
         32 * 1024 * 1024
       );
@@ -224,7 +229,7 @@ export function createEditPlanBrokerV1(deps: EditPlanBrokerDepsV1): EditPlanBrok
       }
       // Durable claim-once: an exclusive create can succeed exactly once for
       // this executionId, across crashes and processes.
-      const claim = await deps.fileStore.createFileExclusive(
+      const claim = await deps.getFileStore().createFileExclusive(
         runFileLocator(executionId, "execution-claim-v1.json"),
         Buffer.from(
           JSON.stringify({ executionId, claimedAt: new Date().toISOString() }, null, 2),
@@ -318,7 +323,7 @@ export function createEditPlanBrokerV1(deps: EditPlanBrokerDepsV1): EditPlanBrok
             blockExecution(execution);
             return errorJson("stalePreflight", "sealed parent observation is missing");
           }
-          const parentStat = await deps.fileStore.stat({
+          const parentStat = await deps.getFileStore().stat({
             rootId: sealed.rootId,
             relativePath: parentObservation.relativePath,
           });
@@ -345,12 +350,12 @@ export function createEditPlanBrokerV1(deps: EditPlanBrokerDepsV1): EditPlanBrok
               return errorJson("stalePreflight", "sealed content failed re-verification");
             }
             if (operation.kind === "createFile") {
-              const preStat = await deps.fileStore.stat(targetLocator);
+              const preStat = await deps.getFileStore().stat(targetLocator);
               if (preStat.kind !== "ok" || preStat.value.kind !== "missing") {
                 blockExecution(execution);
                 return errorJson("stalePreflight", "create target is no longer missing");
               }
-              const created = await deps.fileStore.createFileExclusive(targetLocator, bytes);
+              const created = await deps.getFileStore().createFileExclusive(targetLocator, bytes);
               if (created.kind !== "ok") {
                 blockExecution(execution);
                 return errorJson("stalePreflight", "exclusive create failed");
@@ -360,7 +365,7 @@ export function createEditPlanBrokerV1(deps: EditPlanBrokerDepsV1): EditPlanBrok
                 sha256: created.value.sha256,
               });
             } else {
-              const replaced = await deps.fileStore.replaceFileExact(
+              const replaced = await deps.getFileStore().replaceFileExact(
                 targetLocator,
                 bytes,
                 targetObservation.revision
@@ -377,12 +382,12 @@ export function createEditPlanBrokerV1(deps: EditPlanBrokerDepsV1): EditPlanBrok
             break;
           }
           case "createDirectory": {
-            const preStat = await deps.fileStore.stat(targetLocator);
+            const preStat = await deps.getFileStore().stat(targetLocator);
             if (preStat.kind !== "ok" || preStat.value.kind !== "missing") {
               blockExecution(execution);
               return errorJson("stalePreflight", "createDirectory target is no longer missing");
             }
-            const created = await deps.fileStore.createDirectory(targetLocator);
+            const created = await deps.getFileStore().createDirectory(targetLocator);
             if (created.kind !== "ok") {
               blockExecution(execution);
               return errorJson("stalePreflight", "nonrecursive mkdir failed");
@@ -391,7 +396,7 @@ export function createEditPlanBrokerV1(deps: EditPlanBrokerDepsV1): EditPlanBrok
             break;
           }
           case "deleteFile": {
-            const deleted = await deps.fileStore.deleteFileExact(
+            const deleted = await deps.getFileStore().deleteFileExact(
               targetLocator,
               targetObservation.revision
             );
@@ -403,7 +408,7 @@ export function createEditPlanBrokerV1(deps: EditPlanBrokerDepsV1): EditPlanBrok
             break;
           }
           case "deleteEmptyDirectory": {
-            const listing = await deps.fileStore.listDirectoryBounded(
+            const listing = await deps.getFileStore().listDirectoryBounded(
               targetLocator,
               MAX_DIRECTORY_ENTRIES_V1
             );
@@ -411,7 +416,7 @@ export function createEditPlanBrokerV1(deps: EditPlanBrokerDepsV1): EditPlanBrok
               blockExecution(execution);
               return errorJson("stalePreflight", "directory is no longer verifiably empty");
             }
-            const removed = await deps.fileStore.deleteEmptyDirectory(targetLocator);
+            const removed = await deps.getFileStore().deleteEmptyDirectory(targetLocator);
             if (removed.kind !== "ok") {
               blockExecution(execution);
               return errorJson("stalePreflight", "empty-directory rmdir failed");
@@ -437,7 +442,7 @@ export function createEditPlanBrokerV1(deps: EditPlanBrokerDepsV1): EditPlanBrok
           outcome: "applied",
         };
         // Receipts are durable BEFORE the tool result returns (§7.4).
-        const persisted = await deps.fileStore.createFileExclusive(
+        const persisted = await deps.getFileStore().createFileExclusive(
           runFileLocator(executionId, `receipt-${execution.cursor + 1}-v1.json`),
           Buffer.from(JSON.stringify(receipt, null, 2), "utf8")
         );

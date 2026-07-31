@@ -141,6 +141,8 @@ import {
   AgentTransportV1,
   SealedResultPayloadV1,
 } from "../types/agentExecutionV1";
+import { RequestLocalToolHandlerV1 } from "../services/requestLocalToolHandlerV1";
+import { ObservationLedgerV1 } from "../types/preflightPlanV1";
 import { AiResultEnvelopeV1, parseAiResultEnvelopeV1 } from "../types/aiResultEnvelope";
 import { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
 import { unavailableV1 } from "../types/workflowAvailabilityV1";
@@ -358,6 +360,29 @@ export interface TaskActionCoordinatorDepsV1 {
   /** Coordinator clock for settlement timestamps; defaults to the system clock. */
   readonly now?: () => string;
   readonly brokerOptions?: AgentExecutionBrokerOptionsV1;
+  /**
+   * Request-local tool-session factories for `preflight`/`edit` provider
+   * rows (plan §7.2/§7.6). Optional and consulted ONLY when a row's
+   * `providerMode` is not `"text"` — every migrated text action runs
+   * exactly as before without it. Each provider ATTEMPT gets a fresh
+   * session, so observations from one attempt can never authorize a plan
+   * returned by another.
+   */
+  readonly toolSessions?: TaskActionToolSessionsV1;
+}
+
+export interface TaskActionPreflightSessionV1 {
+  readonly handler: RequestLocalToolHandlerV1;
+  readonly ledger: ObservationLedgerV1;
+  /** The single registered workspace root this session exposes. */
+  readonly rootId: string;
+}
+
+export interface TaskActionToolSessionsV1 {
+  /** Create one attempt's preflight read session (§7.2). May throw when the input names no valid root. */
+  createPreflightSession(validatedInput: unknown): TaskActionPreflightSessionV1;
+  /** Create one attempt's mutation session for an already-claimed execution (§7.6). */
+  createEditSession(validatedInput: unknown): RequestLocalToolHandlerV1;
 }
 
 /**
@@ -381,7 +406,7 @@ export interface AdmittedProviderActionTicketV1 {
       readonly handle: { readonly reservationId: string; readonly correlation: ActionCorrelationV1 };
       readonly providerLabel: string;
       readonly storedModelId: string;
-      readonly createTransport: () => AgentTransportV1;
+      readonly createTransport: (toolHandler?: RequestLocalToolHandlerV1) => AgentTransportV1;
     };
   };
   readonly acquireLeasePhase: AcquireTaskLeasePhaseV1;
@@ -734,11 +759,38 @@ export function createTaskActionCoordinatorV1(
       const correlation = reserved.handle.correlation;
       const claimed = session.claim(reserved.handle.reservationId);
 
+      // Per-ATTEMPT request-local tool session for preflight/edit rows
+      // (plan §7.2): a fresh ledger/handler every attempt, so a fallback or
+      // retry can never mix observations across attempts. Text rows skip
+      // this entirely — no new code runs on the migrated text paths.
+      let preflightSession: TaskActionPreflightSessionV1 | undefined;
+      let toolHandler: RequestLocalToolHandlerV1 | undefined;
+      if (row.providerMode !== "text") {
+        if (!deps.toolSessions) {
+          session.reportAttemptOutcome(attemptId, "providerUnavailablePreInvocation");
+          return { kind: "failed", correlation, code: "toolSessionsUnavailable", retryable: false };
+        }
+        try {
+          if (row.providerMode === "preflight") {
+            preflightSession = deps.toolSessions.createPreflightSession(validatedInput);
+            toolHandler = preflightSession.handler;
+          } else {
+            toolHandler = deps.toolSessions.createEditSession(validatedInput);
+          }
+        } catch {
+          session.reportAttemptOutcome(attemptId, "providerUnavailablePreInvocation");
+          return { kind: "failed", correlation, code: "toolSessionUnavailable", retryable: false };
+        }
+      }
+
       const context: TaskActionExecutionContextV1 = {
         correlation,
         stage,
         validatedInput,
         ...(answers !== undefined ? { answers } : {}),
+        ...(preflightSession !== undefined
+          ? { preflight: { ledger: preflightSession.ledger, rootId: preflightSession.rootId } }
+          : {}),
       };
       const prompt =
         row.buildPrompt(context) +
@@ -775,7 +827,7 @@ export function createTaskActionCoordinatorV1(
       // and the loop falls back to the next registry-ranked candidate.
       let prepared: PreparedAgentInvocationV1;
       try {
-        prepared = prepareAgentInvocationV1(executionRequest, claimed, reserved.createTransport());
+        prepared = prepareAgentInvocationV1(executionRequest, claimed, reserved.createTransport(toolHandler));
       } catch {
         session.reportAttemptOutcome(attemptId, "providerUnavailablePreInvocation");
         continue;
