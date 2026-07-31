@@ -61,7 +61,7 @@ function renderValue(value: unknown, path: string, seen: Set<object>): string {
       throw new CanonicalJsonErrorV1(`unsupported ${typeof value} value at ${path}`);
   }
 
-  const objectValue = value as object;
+  const objectValue: object = value;
   if (seen.has(objectValue)) {
     throw new CanonicalJsonErrorV1(`circular reference at ${path}`);
   }
@@ -71,7 +71,7 @@ function renderValue(value: unknown, path: string, seen: Set<object>): string {
       const items = objectValue.map((item, index) => renderValue(item, `${path}[${index}]`, seen));
       return `[${items.join(",")}]`;
     }
-    const prototype = Object.getPrototypeOf(objectValue);
+    const prototype: unknown = Object.getPrototypeOf(objectValue);
     if (prototype !== Object.prototype && prototype !== null) {
       throw new CanonicalJsonErrorV1(`non-plain object at ${path}`);
     }

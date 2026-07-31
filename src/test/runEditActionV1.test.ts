@@ -83,7 +83,7 @@ void describe("runEditActionV1 — §7.5 availability", () => {
 
   void it("fails as hostToolApiUnavailable when the host lacks the tool-calling constructors, before any root check", () => {
     resetWorkflowRuntimeServicesForTestV1();
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    // eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/no-var-requires
     const raw = require("vscode") as Record<string, unknown>;
     const original = raw.LanguageModelToolResultPart;
     delete raw.LanguageModelToolResultPart;

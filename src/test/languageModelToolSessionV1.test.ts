@@ -179,7 +179,7 @@ void describe("languageModelToolSessionV1", () => {
   void it("fails closed with lmToolApiUnavailable when the host lacks the tool-calling constructors", async () => {
     // Mutate the RAW require("vscode") module object — the `import * as`
     // namespace binding is not configurable (see vscodeLmCompat.test.ts).
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    // eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/no-var-requires
     const target = require("vscode") as Record<string, unknown>;
     const original = target.LanguageModelToolCallPart;
     delete target.LanguageModelToolCallPart;
