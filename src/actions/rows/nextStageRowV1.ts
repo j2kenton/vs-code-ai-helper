@@ -176,7 +176,7 @@ export async function executeNextStageV1(
         }
         return result.progress;
       },
-      context.beforeWrite
+      { beforeWrite: context.beforeWrite }
     );
   } catch (error) {
     if (error instanceof LifecyclePolicyFailureError) {

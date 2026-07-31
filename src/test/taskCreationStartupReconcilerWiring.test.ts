@@ -151,7 +151,9 @@ void describe("TaskCreationStartupReconcilerV1 activation-barrier wiring", () =>
       for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
         const full = path.join(dir, entry.name);
         if (entry.isDirectory()) {
-          if (entry.name === "test" || entry.name === "test-host") continue;
+          if (entry.name === "test" || entry.name === "test-host") {
+            continue;
+          }
           walkProduction(full, out);
         } else if (entry.isFile() && full.endsWith(".ts")) {
           out.push(full);

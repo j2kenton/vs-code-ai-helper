@@ -71,9 +71,23 @@ export function writeOwnershipBackedTaskProgress(folder: string): PersistedTaskO
   return ownership;
 }
 
-/** `mkdtemp` plus an ownership-backed `task-progress.json` — a folder the strict registration accepts. */
+/**
+ * `mkdtemp` plus an ownership-backed `task-progress.json` — a folder the
+ * strict registration accepts.
+ *
+ * Lock-scope isolation: `withTaskLock` derives the shared session lock TWO
+ * levels above the task folder and the meta lock ONE level above. A task
+ * folder created directly in `os.tmpdir()` therefore shares those lock files
+ * with every other concurrently running test process (`node --test` runs
+ * files in parallel child processes), and `PrimarySessionLock` treats a
+ * concurrently held lease as another live Ensemble session and THROWS.
+ * Nesting each fixture two levels inside its own mkdtemp container keeps
+ * every fixture's lock paths private to its own test.
+ */
 export function makeOwnedTaskFolder(prefix: string): OwnedTaskFolderFixtureV1 {
-  const folder = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  const container = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  const folder = path.join(container, "tasks", `${path.basename(container)}-task`);
+  fs.mkdirSync(folder, { recursive: true });
   const ownership = writeOwnershipBackedTaskProgress(folder);
   return { folder, ownership, bindingId: computeTaskBindingIdV1(ownership, path.basename(folder)) };
 }

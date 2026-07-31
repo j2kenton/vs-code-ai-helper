@@ -13,9 +13,10 @@
  */
 import * as vscode from "vscode";
 import * as path from "path";
-import { TASK_PROGRESS_FILENAME, TaskProgress } from "../types/taskProgress";
+import { TASK_PROGRESS_FILENAME, TaskProgress, TaskStage } from "../types/taskProgress";
 import { writeAtomic } from "../state/writeAtomic";
 import { withTaskLock } from "../state/taskStateStore";
+import { beginFinalization, finishFinalization } from "../state/finalizationJournal";
 import { readTaskProgressStrictV1 } from "./taskProgressReaderV1";
 import {
   DecodeTaskProgressOptionsV1,
@@ -130,6 +131,30 @@ export async function writeTaskProgressV1(
   await writeAtomic(progressFileUri, encodeTaskProgressV1(progress, entries));
 }
 
+/** Options for `patchTaskProgressStrictV1` — mirrors the legacy `patchTaskProgress` knobs. */
+export interface PatchTaskProgressStrictOptionsV1 {
+  /**
+   * Skip acquiring the per-task lock: the caller already holds an equivalent
+   * or covering lock (e.g. task activation holding the shared meta-root
+   * lock). `withTaskLock` queues on the same per-process key regardless of
+   * which lock file backs it, so re-acquiring under a held covering lock
+   * would self-deadlock — exactly the legacy `patchTaskProgress` `skipLock`
+   * contract.
+   */
+  readonly skipLock?: boolean;
+  /**
+   * Side effect run after `update` has validated/computed the patched value
+   * but before it is persisted, still inside the same lease as `update`'s
+   * own CAS checks. Use this to publish a file artifact (e.g. rename a
+   * staged review into place) atomically with the progress write, so a
+   * superseded caller's `update` throwing prevents both the write AND the
+   * side effect. Runs even when the patch turns out to be a byte-identical
+   * no-op — a validated no-op CAS may still have a side effect (same-stage
+   * review refreshes publish their staged artifact this way).
+   */
+  readonly beforeWrite?: (patched: TaskProgress) => Promise<void>;
+}
+
 /**
   * Read-modify-write progress mutation using strict decoding and encoding (plan §3.10 / §3.12).
   *
@@ -141,20 +166,21 @@ export async function writeTaskProgressV1(
   * clobber or double-apply a transition — the lock makes the two paths
   * mutually exclusive on one task, exactly like two legacy callers today.
   *
-  * @param beforeWrite  Optional side effect run after `update` has validated/
-  *   computed the patched value but before it is persisted, still inside the
-  *   same lease as `update`'s own CAS checks — mirrors legacy
-  *   `patchTaskProgress`'s `beforeWrite` param (`src/utils/taskProgressUtils.ts`).
-  *   Use this to publish a file artifact (e.g. rename a staged review into
-  *   place) atomically with the progress write, so a superseded caller's
-  *   `update` throwing prevents both the write AND the side effect.
+  * Write-side parity with the legacy patch (which lifecycle recovery and the
+  * file watcher depend on):
+  *  - the write is journaled via `beginFinalization`/`finishFinalization`, so
+  *    startup recovery can reconcile an interrupted mutation;
+  *  - a byte-identical patch (canonical encoding unchanged) performs NO write
+  *    — callers use an unchanged return value to decline a compare-and-swap
+  *    update, and task-progress.json is watched, so no-op writes would
+  *    re-trigger inventory refreshes and scheduler loops forever.
   */
 export async function patchTaskProgressStrictV1(
   taskFolderUri: vscode.Uri,
   update: (current: PersistedTaskProgressV1) => TaskProgress | undefined,
-  beforeWrite?: (patched: TaskProgress) => Promise<void>
+  options?: PatchTaskProgressStrictOptionsV1
 ): Promise<TaskProgress | undefined> {
-  return withTaskLock(taskFolderUri.fsPath, async () => {
+  const operation = async (): Promise<TaskProgress | undefined> => {
     const folderName = path.basename(taskFolderUri.fsPath);
     const strict = await readTaskProgressStrictV1(taskFolderUri, { expectedTaskFolder: folderName });
     if (!strict.ok) {
@@ -165,10 +191,44 @@ export async function patchTaskProgressStrictV1(
     if (!patched) {
       return current;
     }
-    if (beforeWrite) {
-      await beforeWrite(patched);
+    // `update` already threw for a stale/rejected CAS, so reaching here means
+    // this caller owns the transition. The side effect runs before the
+    // no-op check on purpose — see `PatchTaskProgressStrictOptionsV1.beforeWrite`.
+    if (options?.beforeWrite) {
+      await options.beforeWrite(patched);
     }
-    await writeTaskProgressV1(taskFolderUri, { ...patched, ensembleProgressVersion: 1 }, strict.decoded.entries);
+    const encoded = encodeTaskProgressV1({ ...patched, ensembleProgressVersion: 1 }, strict.decoded.entries);
+    if (encoded === encodeTaskProgressV1(current, strict.decoded.entries)) {
+      return current;
+    }
+    await beginFinalization(taskFolderUri.fsPath, taskFolderUri.fsPath, "task-progress mutation");
+    // Keep the intent journal on failure. Startup recovery needs the record
+    // to reconcile an interrupted mutation instead of losing the evidence.
+    await writeAtomic(vscode.Uri.joinPath(taskFolderUri, TASK_PROGRESS_FILENAME), encoded);
+    await finishFinalization(taskFolderUri.fsPath);
     return patched;
-  });
+  };
+  return options?.skipLock ? operation() : withTaskLock(taskFolderUri.fsPath, operation);
+}
+
+/**
+ * Fresh strict creation progress (plan §3.10): the V1 counterpart of the
+ * legacy `createTaskProgress`, emitting `ensembleProgressVersion: 1` from
+ * birth so the file is unambiguously V1 input on its first read. Status
+ * starts as `"creating"` — the durable creation sentinel — exactly like the
+ * legacy creator.
+ */
+export function createTaskProgressV1(
+  taskFolder: string,
+  stage: TaskStage = "desc"
+): PersistedTaskProgressV1 {
+  const now = new Date().toISOString();
+  return {
+    ensembleProgressVersion: 1,
+    taskFolder,
+    currentStage: stage,
+    status: "creating",
+    createdAt: now,
+    updatedAt: now,
+  };
 }
