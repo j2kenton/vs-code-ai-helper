@@ -23,21 +23,40 @@ import * as path from "path";
 import { createHash } from "crypto";
 import {
   createProductionTaskActionCoordinatorV1,
+  getProductionActionConversationOrchestratorV1,
 } from "../actions/productionTaskActionRuntimeV1";
 import { ImplementationRunResult } from "../runners/copilotImplementationRunner";
 import { readChatDocumentIdentityV1 } from "../utils/chatHistoryStore";
 import { allocateHex128IdV1 } from "../types/actionCorrelationV1";
-import { EditPreflightActionInputV1 } from "../actions/rows/editPreflightRowsV1";
+import {
+  APPLY_REVIEW_EDIT_ACTION_KEY_V1,
+  EditPreflightActionInputV1,
+  FAST_FORWARD_ACTION_KEY_V1,
+  IMPLEMENTATION_ACTION_KEY_V1,
+  LINT_ACTION_KEY_V1,
+} from "../actions/rows/editPreflightRowsV1";
 import { EDIT_EXECUTION_ACTION_KEY_V1 } from "../actions/rows/editExecutionRowV1";
 import { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
 import { TaskStage } from "../types/taskProgress";
 import {
   computeWorkspaceRootBindingIdV1,
+  ensureWorkflowTaskFolderRootV1,
   ensureWorkflowWorkspaceRootV1,
   getEditPlanBrokerV1,
+  getVerifiedTaskBindingIdV1,
 } from "../services/workflowRuntimeServicesV1";
 import { probeLmToolCallingHostCapabilityV1, VscodeLmModuleV1 } from "../services/vscodeLmCompat";
 import { resolveEffectiveProvider } from "../runners/runnerRegistry";
+import { resolveFreshModelForStage } from "../utils/modelSelection";
+import { writeRunLog } from "../utils/runLog";
+import { NotificationRouter } from "../utils/notificationRouter";
+import type { TaskInventory } from "../state/taskInventory";
+import type {
+  ChatViewProvider,
+  ChatInteractionRefV1,
+  ChatInteractionResumeResultV1,
+} from "../views/chatView";
+import type { InteractionRefV1 } from "../actions/actionConversationOrchestratorV1";
 
 /** §7.5's host floor for request-local preflight/edit (workflow-inventories/lm-host-capability-v1.json). */
 export const EDIT_ACTION_HOST_FLOOR_V1 = "1.100.0";
@@ -69,6 +88,29 @@ function hostVersionAtLeast(version: unknown, floor: string): boolean {
     }
   }
   return true;
+}
+
+/**
+ * The task/model-INDEPENDENT half of the §7.5 gate: host floor + runtime
+ * tool-shape probe. Public edit handlers call this as their first statement
+ * — before consent, task resolution, or any artifact read — so a 1.93 host
+ * returns `hostToolApiUnavailable` before any task/source read (AC-HOST-03).
+ */
+export function checkEditActionHostGateV1():
+  | { readonly ok: true }
+  | { readonly ok: false; readonly code: "hostToolApiUnavailable"; readonly reason: string } {
+  if (!hostVersionAtLeast(vscode.version, EDIT_ACTION_HOST_FLOOR_V1)) {
+    return {
+      ok: false,
+      code: "hostToolApiUnavailable",
+      reason: `VS Code ${EDIT_ACTION_HOST_FLOOR_V1}+ is required for AI-assisted edits (running ${vscode.version}).`,
+    };
+  }
+  const capability = probeLmToolCallingHostCapabilityV1(vscode as unknown as VscodeLmModuleV1);
+  if (!capability.supported) {
+    return { ok: false, code: "hostToolApiUnavailable", reason: capability.reason };
+  }
+  return { ok: true };
 }
 
 /**
@@ -344,24 +386,87 @@ export interface RunSealedImplementationOptionsV1 {
   readonly workspaceUri: vscode.Uri;
   readonly token: vscode.CancellationToken;
   readonly onProgress: (message: string) => void;
+  /** Model/quota stage — the stage whose configured model runs the session. */
   readonly stage?: TaskStage;
+  /**
+   * The task's ACTUAL current stage, used for registry-row eligibility
+   * (editPreflightRowsV1 declares real stage lists). Defaults to `stage`.
+   */
+  readonly taskStage?: TaskStage;
   readonly taskFolderUri?: vscode.Uri;
   /** Mirrors the retired runner option: false lets a no-op plan complete. */
   readonly requireFileChange?: boolean;
+  /**
+   * Invoked when the preflight returns structured questions, BEFORE the
+   * failed-status result is returned — call sites mirror the persisted
+   * interaction into task-local Chat (askInteraction) here so the question
+   * gets its full Answer/Resume lifecycle (AC-PREFLIGHT-04, AC-QUESTION-02).
+   */
+  readonly onQuestions?: (outcome: TaskActionOutcomeV1 & { kind: "questions" }) => Promise<void>;
 }
 
 export async function runSealedImplementationV1(
   options: RunSealedImplementationOptionsV1
 ): Promise<ImplementationRunResult & { runnerId: string }> {
+  // §7.5: the FULL availability gate runs before this adapter reads anything
+  // at all — including the task's Chat identity and ownership binding below.
+  const availability = checkEditActionAvailabilityV1({
+    workspaceFsPath: options.workspaceUri.fsPath,
+    stageModelId: options.modelId,
+  });
+  if (!availability.ok) {
+    return {
+      status: "failed",
+      filesChanged: [],
+      failureKind: "temporarily-unavailable",
+      errorMessage: availability.reason,
+      runnerId: "copilot-lm",
+    };
+  }
+
   options.onProgress("Preflighting edits (read-only)...");
 
-  const taskBindingId = options.taskFolderUri
-    ? canonicalPathKey(options.taskFolderUri.fsPath)
-    : `workspace:${canonicalPathKey(options.workspaceUri.fsPath)}`;
+  // §3.9: the coordinator correlates against the ownership-DERIVED binding
+  // digest, never a raw filesystem path (which would leak local paths into
+  // provider correlation, leases, and audit records). Task-scoped runs
+  // derive it from the strict progress ownership record; workspace-scoped
+  // runs use the workspace-root binding digest from the availability gate.
+  let taskBindingId: string;
+  if (options.taskFolderUri) {
+    try {
+      const taskRootId = ensureWorkflowTaskFolderRootV1(options.taskFolderUri.fsPath);
+      const verified = getVerifiedTaskBindingIdV1(taskRootId);
+      if (!verified) {
+        return {
+          status: "failed",
+          filesChanged: [],
+          failureKind: "generic",
+          errorMessage:
+            "This task's ownership binding could not be verified — its task-progress.json needs recovery before AI edits can run.",
+          runnerId: "copilot-lm",
+        };
+      }
+      taskBindingId = verified;
+    } catch (error) {
+      return {
+        status: "failed",
+        filesChanged: [],
+        failureKind: "generic",
+        errorMessage: error instanceof Error ? error.message : String(error),
+        runnerId: "copilot-lm",
+      };
+    }
+  } else {
+    taskBindingId = availability.rootBindingId;
+  }
+
   let chatDocumentId: string;
   try {
     const identity = options.taskFolderUri
-      ? await readChatDocumentIdentityV1(options.taskFolderUri.fsPath, taskBindingId)
+      ? await readChatDocumentIdentityV1(
+          options.taskFolderUri.fsPath,
+          canonicalPathKey(options.taskFolderUri.fsPath)
+        )
       : undefined;
     chatDocumentId = identity?.documentId ?? allocateHex128IdV1();
   } catch {
@@ -374,7 +479,7 @@ export async function runSealedImplementationV1(
     prompt: options.prompt,
     taskBinding: { taskBindingId, chatDocumentId },
     taskStatus: "active",
-    taskStage: stage,
+    taskStage: options.taskStage ?? stage,
     workspaceCwd: options.workspaceUri.fsPath,
     resolveStagePrimaryModel: () => ({ modelId: options.modelId, stage }),
     stageModelId: options.modelId,
@@ -411,12 +516,18 @@ export async function runSealedImplementationV1(
         runnerId,
       };
     case "questions":
+      // The durable Chat interaction transaction is already persisted (the
+      // coordinator wrote it through before this outcome surfaced); the call
+      // site mirrors it into task-local Chat so Answer/Resume work (§5.5).
+      if (options.onQuestions) {
+        await options.onQuestions(result.outcome as TaskActionOutcomeV1 & { kind: "questions" });
+      }
       return {
         status: "failed",
         filesChanged: [],
         failureKind: "generic",
         errorMessage:
-          "The AI returned structured questions instead of an edit plan. Answer them in Chat With AI and resume the action.",
+          "The AI returned structured questions instead of an edit plan. Answer them in Chat With AI and use Resume there to continue.",
         runnerId,
       };
     case "unavailable":
@@ -460,4 +571,188 @@ export async function runSealedImplementationV1(
       };
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Explicit Chat Resume for edit-preflight structured questions (plan §5.5 /
+// §7.3 / AC-PREFLIGHT-04 / AC-QUESTION-03): the extension.ts interaction
+// dispatcher routes the four edit action keys here. Resume follows the rows'
+// declared `sameOperation` semantics — the coordinator reconstructs the
+// action from the persisted transaction's validated input snapshot and runs
+// a FRESH attempt, whose read session mints a fresh observation baseline; a
+// sealed plan then continues into the mutation session exactly like a fresh
+// invocation.
+// ---------------------------------------------------------------------------
+
+const EDIT_PREFLIGHT_ACTION_KEYS_V1: readonly string[] = [
+  IMPLEMENTATION_ACTION_KEY_V1,
+  FAST_FORWARD_ACTION_KEY_V1,
+  APPLY_REVIEW_EDIT_ACTION_KEY_V1,
+  LINT_ACTION_KEY_V1,
+];
+
+export function isEditPreflightActionKeyV1(actionKey: string): boolean {
+  return EDIT_PREFLIGHT_ACTION_KEYS_V1.includes(actionKey);
+}
+
+/** Model/quota stage for an edit action key (lint runs on the Publish model). */
+function modelStageForEditActionKeyV1(actionKey: string): TaskStage {
+  return actionKey === LINT_ACTION_KEY_V1 ? "publish" : "impl";
+}
+
+export async function resumeEditPreflightInteractionV1(
+  inventory: TaskInventory,
+  chatViewProvider: ChatViewProvider,
+  ref: ChatInteractionRefV1,
+  resumeIdempotencyId: string,
+  cancellationToken: vscode.CancellationToken
+): Promise<ChatInteractionResumeResultV1> {
+  const ownedTask = inventory.getTaskByBindingId(ref.taskBindingId);
+  if (!ownedTask) {
+    return { ok: false, reason: "the task that asked this question could not be found" };
+  }
+  const workspaceFolderUri = ownedTask.workspaceFolder;
+  if (!workspaceFolderUri) {
+    return { ok: false, reason: "the task has no owning workspace" };
+  }
+  const taskFolderUri = vscode.Uri.file(ownedTask.taskFolderPath);
+
+  const orchestrator = getProductionActionConversationOrchestratorV1();
+  const interactionRef: InteractionRefV1 = {
+    operationId: ref.operationId,
+    interactionId: ref.interactionId,
+    taskBindingId: ref.taskBindingId,
+    chatDocumentId: ref.chatDocumentId,
+    sourceAttemptId: ref.sourceAttemptId,
+  };
+  const loaded = await orchestrator.loadInteraction(interactionRef);
+  if (loaded.kind !== "ok") {
+    return {
+      ok: false,
+      reason: loaded.kind === "storageUnavailable" ? "workflow storage is unavailable" : loaded.reason,
+    };
+  }
+  const actionKey = loaded.record.correlation.actionKey;
+  if (!isEditPreflightActionKeyV1(actionKey)) {
+    return { ok: false, reason: `unexpected action key ${actionKey} for an edit-preflight Resume` };
+  }
+
+  // §7.5 applies to Resume drives too: gate before any further task or
+  // source read (the strict inventory lookup above is the binding lookup the
+  // transaction revalidation itself requires).
+  const modelStage = modelStageForEditActionKeyV1(actionKey);
+  const model = await resolveFreshModelForStage(taskFolderUri, modelStage);
+  const availability = checkEditActionAvailabilityV1({
+    workspaceFsPath: workspaceFolderUri.fsPath,
+    stageModelId: model.modelId,
+  });
+  if (!availability.ok) {
+    return { ok: false, reason: availability.reason };
+  }
+
+  const coordinator = createProductionTaskActionCoordinatorV1({
+    workspaceCwd: workspaceFolderUri.fsPath,
+    resolveStagePrimaryModel: () => ({ modelId: model.modelId, stage: modelStage }),
+  });
+
+  const outcome = await coordinator.resumeAction({
+    interaction: interactionRef,
+    taskBinding: { taskBindingId: ref.taskBindingId, chatDocumentId: ref.chatDocumentId },
+    taskStatus: ownedTask.progress.status ?? "active",
+    taskStage: ownedTask.progress.currentStage,
+    resumeIdempotencyId,
+    cancellationToken,
+  });
+
+  if (outcome.kind === "questions") {
+    // The resumed attempt asked again — mirror the NEW persisted interaction
+    // into task-local Chat exactly like a fresh invocation would.
+    const record = await orchestrator.getRecord({
+      operationId: outcome.correlation.operationId,
+      interactionId: outcome.interactionId,
+      taskBindingId: outcome.correlation.taskBindingId,
+      chatDocumentId: outcome.correlation.chatDocumentId,
+      sourceAttemptId: outcome.correlation.attemptId,
+    });
+    if (record) {
+      await chatViewProvider.askInteraction({
+        canonicalId: ownedTask.canonicalId ?? ownedTask.taskFolderPath,
+        taskFolderPath: ownedTask.taskFolderPath,
+        stage: record.stage,
+        taskName: ownedTask.progress.displayName,
+        interactionId: record.interactionId,
+        operationId: record.correlation.operationId,
+        actionKey: record.correlation.actionKey,
+        sourceAttemptId: record.correlation.attemptId,
+        // safe: loaded via a "questions" outcome, so questions are posted.
+        questions: record.questions!,
+        binding: {
+          taskBindingId: record.correlation.taskBindingId,
+          chatDocumentId: record.correlation.chatDocumentId,
+        },
+      });
+    }
+  } else if (outcome.kind === "completed" && outcome.code === "noChanges") {
+    NotificationRouter.showInformation(
+      "Resumed edit preflight produced an empty plan — no changes were needed."
+    );
+  } else if (outcome.kind === "completed") {
+    // A sealed plan exists for the resumed attempt: continue into the
+    // mutation-only session exactly like a fresh two-phase run.
+    const execution = await continueSealedEditExecutionV1(
+      coordinator,
+      outcome.correlation.operationId,
+      {
+        taskBinding: { taskBindingId: ref.taskBindingId, chatDocumentId: ref.chatDocumentId },
+        taskStatus: ownedTask.progress.status ?? "active",
+        taskStage: ownedTask.progress.currentStage,
+        cancellationToken,
+      }
+    );
+    const logContent =
+      `# Resumed ${actionKey} run\n\nResult: ${execution.kind}\n\n` +
+      ("changedPaths" in execution && execution.changedPaths.length > 0
+        ? `Files changed:\n${execution.changedPaths.map((p) => `- ${p}`).join("\n")}`
+        : "_no files changed_");
+    const logUri = await writeRunLog(taskFolderUri, "copilot-lm", modelStage, logContent);
+    if (execution.kind === "completed") {
+      NotificationRouter.showInformation(
+        `Resumed ${actionKey}: applied ${execution.appliedReceiptIds.length} sealed edit step(s) ` +
+          `(${execution.changedPaths.length} file(s) changed).`
+      );
+    } else {
+      const reason =
+        "reason" in execution
+          ? execution.reason
+          : execution.kind === "failed" && execution.outcome.kind === "cancelled"
+            ? "the edit session was cancelled"
+            : "the edit session did not complete";
+      NotificationRouter.showWarning(`Resumed ${actionKey} did not apply cleanly: ${reason}`);
+      await vscode.window.showTextDocument(logUri, { preview: true }).then(
+        () => undefined,
+        () => undefined
+      );
+    }
+  } else if (outcome.kind === "cancelled") {
+    NotificationRouter.showInformation("Resumed edit preflight was cancelled.");
+  } else {
+    NotificationRouter.showWarning(
+      `Resumed edit preflight failed (${outcome.kind === "failed" || outcome.kind === "unavailable" ? outcome.code : outcome.kind}).`
+    );
+  }
+
+  // Report the ORIGINAL interaction's actual settlement (re-read after
+  // resumeAction): a resumed run that itself asks again, fails, or is
+  // cancelled still means the interaction being resumed settled exactly once
+  // (plan §5.5) — only a rejection BEFORE settlement leaves it resumable.
+  const after = await orchestrator.loadInteraction(interactionRef);
+  if (
+    after.kind === "ok" &&
+    after.record.state === "settled" &&
+    (after.record.settlement === "resumed" ||
+      after.record.settlement === "supersededByReplacementOperation")
+  ) {
+    return { ok: true, settlement: after.record.settlement };
+  }
+  return { ok: false, reason: "the interaction did not settle for this Resume — it may already be settled or still awaiting answers" };
 }

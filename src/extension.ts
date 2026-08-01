@@ -27,6 +27,10 @@ import {
 } from "./commands/draftTaskWithAI";
 import { resumeChatSendInteractionV1, validateChatSendV1 } from "./commands/chatWithStage";
 import { resumeCommitPushMetadataInteractionV1 } from "./commands/commitAndPushTask";
+import {
+  isEditPreflightActionKeyV1,
+  resumeEditPreflightInteractionV1,
+} from "./commands/runEditActionV1";
 import { registerApplyCurrentStageActionCommand } from "./commands/applyCurrentStageAction";
 import { registerOpenAndStartNewTaskCommand } from "./commands/openAndStartNewTask";
 import { registerReviewCurrentTaskCommand } from "./commands/reviewCurrentTask";
@@ -312,6 +316,20 @@ export function activate(context: vscode.ExtensionContext): void {
             context
           );
         }
+        if (isEditPreflightActionKeyV1(actionKey)) {
+          // The four edit-capable preflight actions (implementation.v1,
+          // fastForward.v1, applyReviewEdit.v1, lint.v1) share sameOperation
+          // Resume semantics: a fresh preflight attempt with a fresh
+          // observation baseline, continuing into the sealed edit session
+          // when a plan seals (plan §7.3 / AC-PREFLIGHT-04).
+          return await resumeEditPreflightInteractionV1(
+            inventory,
+            chatViewProvider,
+            ref,
+            resumeIdempotencyId,
+            cancellation.token
+          );
+        }
         return {
           ok: false,
           reason: "Resume isn't available yet for this question — the action that asked it hasn't been migrated to the new Resume flow.",
@@ -400,24 +418,22 @@ export function activate(context: vscode.ExtensionContext): void {
     // deletion journal stuck at `folderRemoved` (crash between physically
     // removing the folder and recording `externalStateResolved`) is
     // invisible to `TaskCreationStartupReconcilerV1`'s own scan, which only
-    // walks folders that still exist. Unlike the other best-effort startup
-    // recovery calls below (`recoverFinalizationTree`,
-    // `recoverActivationCheckpoint`), this sweep can clear the current-task
-    // checkpoint and trigger an inventory refresh — side effects that must
-    // themselves complete before the activation barrier opens (AC-CREATE-
-    // STARTUP-03: "no fire-and-forget reconciliation remains anywhere in
-    // activation"), so it is folded into `startupGateReady` ahead of
-    // `beginClassification` rather than run detached.
+    // walks folders that still exist.
     const strandedDeletionSweeps = rootPaths.map((root) =>
       resumeStrandedTaskDeletionsV1(root, currentTaskStore, inventory).catch((err) =>
         console.error("Stranded task-deletion sweep failed", err)
       )
     );
-    startupGateReady = Promise.all(strandedDeletionSweeps).then(() =>
-      TaskCreationStartupReconcilerV1.beginClassification(rootPaths, context.extensionUri)
-    );
-    for (const root of rootPaths) {
-      void recoverFinalizationTree(root).then(async journals => {
+    // Finalization-journal and activation-checkpoint recovery are startup
+    // reconciliation too: both can mutate lifecycle/checkpoint state that
+    // inventory publication and command reads must not observe mid-repair.
+    // The plan's activation-order contract ("reconciliation completes before
+    // inventory publication and command reads"; AC-CREATE-STARTUP-03: no
+    // fire-and-forget reconciliation remains anywhere in activation) folds
+    // them into `startupGateReady` alongside the stranded-deletion sweeps,
+    // ahead of `beginClassification` — never run detached.
+    const finalizationRecoveries = rootPaths.map((root) =>
+      recoverFinalizationTree(root).then(async journals => {
         for (const journal of journals) {
           // The journaled write itself is atomic (writeAtomic rename), so a
           // crash mid-write leaves task-progress.json either fully old or
@@ -435,11 +451,20 @@ export function activate(context: vscode.ExtensionContext): void {
             NotificationRouter.showWarning(`Could not verify an interrupted ${journal.operation} for task ${journal.taskFolder} (${progressResult.reason}). Please check its files manually.`);
           }
         }
-      }).catch(err => console.error("Finalization recovery failed", err));
-      void recoverActivationCheckpoint(root, currentTaskStore).then(summary => {
+      }).catch(err => console.error("Finalization recovery failed", err))
+    );
+    const checkpointRecoveries = rootPaths.map((root) =>
+      recoverActivationCheckpoint(root, currentTaskStore).then(summary => {
         if (summary) NotificationRouter.showWarning(summary);
-      }).catch(err => console.error("Activation checkpoint recovery failed", err));
-    }
+      }).catch(err => console.error("Activation checkpoint recovery failed", err))
+    );
+    startupGateReady = Promise.all([
+      ...strandedDeletionSweeps,
+      ...finalizationRecoveries,
+      ...checkpointRecoveries,
+    ]).then(() =>
+      TaskCreationStartupReconcilerV1.beginClassification(rootPaths, context.extensionUri)
+    );
   } catch (err) {
     console.error("Startup temp file cleanup failed", err);
   }
@@ -487,7 +512,7 @@ export function activate(context: vscode.ExtensionContext): void {
   registerMetaResourcesMigrationCommand(context, inventory, currentTaskStore);
   registerChoosePublishScopeCommand(context, inventory);
   registerChatWithStageCommand(context, inventory, chatViewProvider, currentTaskStore);
-  registerRunLintingFixesCommand(context, inventory);
+  registerRunLintingFixesCommand(context, inventory, chatViewProvider);
   registerRunPublishChecksCommand(context, inventory);
   const taskActionScheduler = registerScheduleTaskResumeCommand(context, inventory);
   registerMarkTaskDoneCommand(context, inventory, currentTaskStore);

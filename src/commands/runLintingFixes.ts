@@ -15,7 +15,12 @@ import {
   ensureStageModelConfigured,
   resolveFreshModelForStage,
 } from "../utils/modelSelection";
-import { runSealedImplementationV1 } from "./runEditActionV1";
+import {
+  checkEditActionAvailabilityV1,
+  runSealedImplementationV1,
+} from "./runEditActionV1";
+import { getProductionActionConversationOrchestratorV1 } from "../actions/productionTaskActionRuntimeV1";
+import type { ChatViewProvider } from "../views/chatView";
 import { checkAndConfirmPromptSize } from "../utils/promptSizeGuard";
 import { ensureAiConsent } from "../utils/aiConsent";
 import { assertLegacyAiRouteAllowedV0 } from "../services/legacyAiActionSafetyGateV0";
@@ -106,7 +111,8 @@ export async function runLintingFixes(
   extensionUri: vscode.Uri,
   explicitArg?: RunLintingFixesArg,
   context?: vscode.ExtensionContext,
-  parentOperation?: TaskOperationHandle
+  parentOperation?: TaskOperationHandle,
+  chatViewProvider?: ChatViewProvider
 ): Promise<void> {
   assertLegacyAiRouteAllowedV0("lint.v1");
   const resolverArg = normalizeArg(explicitArg);
@@ -313,6 +319,22 @@ export async function runLintingFixes(
                 // a specialized Publish model must not have their lint/test
                 // fixes run by the unrelated Implementation model.
                 const model = await resolveFreshModelForStage(taskFolderUri, "publish");
+                // §7.5: the AI fix pass is the edit action here — its full
+                // availability gate (host floor + tool probe + Copilot path +
+                // workspace root) runs BEFORE the context pack and prompt
+                // reads below. The deterministic autofixes above are not
+                // edit-action work and run on any host.
+                const editAvailability = checkEditActionAvailabilityV1({
+                  workspaceFsPath: workspaceFolder.uri.fsPath,
+                  stageModelId: model.modelId,
+                });
+                if (!editAvailability.ok) {
+                  NotificationRouter.showWarning(
+                    `AI final fixes are unavailable: ${editAvailability.reason} ` +
+                      "The deterministic autofixes above were still applied."
+                  );
+                  return;
+                }
                 const postFixDiagnostics = vscode.languages.getDiagnostics().filter(([uri, ds]) => isFileInFolder(uri, fixScopeFolder) && ds.some((d) => d.source === "eslint" || d.source === "ts" || d.source === "typescript"));
                 const lint = JSON.stringify({
                   summary: postFixLint.summary,
@@ -334,7 +356,50 @@ export async function runLintingFixes(
                     // the retired direct-edit runner. `model` is resolved
                     // from the "publish" stage above — fallback bookkeeping
                     // lives in the coordinator's ranked selection.
-                    result = await runSealedImplementationV1({ editActionKey: "lint.v1", modelId: model.modelId, prompt, workspaceUri: workspaceFolder.uri, token, stage: "publish", taskFolderUri: taskFolderUri, onProgress: (message) => aiProgress.report({ message }) });
+                    result = await runSealedImplementationV1({
+                      editActionKey: "lint.v1",
+                      modelId: model.modelId,
+                      prompt,
+                      workspaceUri: workspaceFolder.uri,
+                      token,
+                      stage: "publish",
+                      taskStage: "publish",
+                      taskFolderUri: taskFolderUri,
+                      onProgress: (message) => aiProgress.report({ message }),
+                      // Mirror structured preflight questions into task-local
+                      // Chat so Answer/Resume work (plan §5.5).
+                      onQuestions: async (questionsOutcome) => {
+                        if (!chatViewProvider) {
+                          return;
+                        }
+                        const orchestrator = getProductionActionConversationOrchestratorV1();
+                        const record = await orchestrator.getRecord({
+                          operationId: questionsOutcome.correlation.operationId,
+                          interactionId: questionsOutcome.interactionId,
+                          taskBindingId: questionsOutcome.correlation.taskBindingId,
+                          chatDocumentId: questionsOutcome.correlation.chatDocumentId,
+                          sourceAttemptId: questionsOutcome.correlation.attemptId,
+                        });
+                        if (record) {
+                          await chatViewProvider.askInteraction({
+                            canonicalId: taskFolderUri.fsPath,
+                            taskFolderPath: taskFolderUri.fsPath,
+                            stage: record.stage,
+                            taskName: resolvedTask.progress.displayName,
+                            interactionId: record.interactionId,
+                            operationId: record.correlation.operationId,
+                            actionKey: record.correlation.actionKey,
+                            sourceAttemptId: record.correlation.attemptId,
+                            // safe: loaded via a "questions" outcome.
+                            questions: record.questions!,
+                            binding: {
+                              taskBindingId: record.correlation.taskBindingId,
+                              chatDocumentId: record.correlation.chatDocumentId,
+                            },
+                          });
+                        }
+                      },
+                    });
                   });
                   if (result?.status === "completed") {
                     await runCompletionLint(taskFolderUri, relevantFiles);
@@ -390,12 +455,13 @@ export async function runLintingFixes(
  */
 export function registerRunLintingFixesCommand(
   context: vscode.ExtensionContext,
-  inventory: TaskInventory
+  inventory: TaskInventory,
+  chatViewProvider?: ChatViewProvider
 ): void {
   const disposable = vscode.commands.registerCommand(
     "vs-code-ai-helper.runLintingFixes",
     (arg?: RunLintingFixesArg) =>
-      runLintingFixes(inventory, context.extensionUri, arg, context)
+      runLintingFixes(inventory, context.extensionUri, arg, context, undefined, chatViewProvider)
   );
   context.subscriptions.push(disposable);
 }

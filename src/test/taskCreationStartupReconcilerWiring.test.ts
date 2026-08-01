@@ -102,11 +102,31 @@ void describe("TaskCreationStartupReconcilerV1 activation-barrier wiring", () =>
     const sweepCallIndex = content.indexOf("resumeStrandedTaskDeletionsV1(");
     assert.ok(sweepCallIndex >= 0, "could not find the resumeStrandedTaskDeletionsV1 call in extension.ts");
 
-    const chainIndex = content.indexOf("startupGateReady = Promise.all(strandedDeletionSweeps).then(");
+    const chainIndex = content.indexOf("startupGateReady = Promise.all([");
     assert.ok(
       chainIndex >= 0,
-      "startupGateReady must be assigned from Promise.all(strandedDeletionSweeps).then(...) — the sweep is " +
+      "startupGateReady must be assigned from Promise.all([...]).then(...) — startup reconciliation is " +
         "awaited by the barrier, never detached"
+    );
+    // AC-CREATE-STARTUP-03: ALL startup reconciliation runs inside the
+    // barrier — the stranded-deletion sweeps AND the finalization-journal /
+    // activation-checkpoint recoveries (previously fire-and-forget).
+    const barrierStatementEnd = content.indexOf(";", chainIndex);
+    const barrierStatement = content.slice(chainIndex, barrierStatementEnd);
+    for (const member of [
+      "...strandedDeletionSweeps",
+      "...finalizationRecoveries",
+      "...checkpointRecoveries",
+    ]) {
+      assert.ok(
+        barrierStatement.includes(member),
+        `the startupGateReady barrier must await ${member} before classification`
+      );
+    }
+    assert.ok(
+      !content.includes("void recoverFinalizationTree") &&
+        !content.includes("void recoverActivationCheckpoint"),
+      "finalization/checkpoint recovery must never run detached (fire-and-forget) during activation"
     );
 
     const classificationIndex = content.indexOf("TaskCreationStartupReconcilerV1.beginClassification(");

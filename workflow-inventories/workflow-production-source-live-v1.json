@@ -40,11 +40,11 @@
     },
     {
       "path": "src/actions/rows/editExecutionRowV1.ts",
-      "sha256": "3ebac631bd58ccc4c38a3513b6d05486079d44fe71cd0a9a8b7d0f6384cc5a5a"
+      "sha256": "daa753e2762947053def88409b5446712f5216aacba0c4093d1d098a52076834"
     },
     {
       "path": "src/actions/rows/editPreflightRowsV1.ts",
-      "sha256": "ab2f37a3fdb7aeb1e27d4742958ddad7158352cac4128d753ec7857c7fbce8f7"
+      "sha256": "cb8a27144415c2d85fc6a15f0d309a00b23f4a4eddfe546f403887d938d4197e"
     },
     {
       "path": "src/actions/rows/generateImplementationRowV1.ts",
@@ -156,7 +156,7 @@
     },
     {
       "path": "src/commands/reviewActions.ts",
-      "sha256": "63b78821a3efe8059adda929c59c9a887d96e459778dd0e1ec5c9f6be616d551"
+      "sha256": "b4654cc81d7fe4f5be3017528a0d92a5f39189083661f91b3a6e54b61b5150ac"
     },
     {
       "path": "src/commands/reviewCurrentTask.ts",
@@ -164,11 +164,11 @@
     },
     {
       "path": "src/commands/runEditActionV1.ts",
-      "sha256": "6aa0d23afc500cdef28f6a5d3afadfb98dd1585b2b7c025e0841e83f39e9295b"
+      "sha256": "a92c85ac4b15afd03c731e49c52786d2dc536afa57a6057dff42b60c544a43f5"
     },
     {
       "path": "src/commands/runLintingFixes.ts",
-      "sha256": "b21191278a37df0e794548e035c59e769f02f68e951feaa733ff2086c25c0434"
+      "sha256": "a66420e1fbdf84454598d4d646415d053a5dfb548e655122635e4da5b9e92c04"
     },
     {
       "path": "src/commands/runPublishChecks.ts",
@@ -208,7 +208,7 @@
     },
     {
       "path": "src/extension.ts",
-      "sha256": "8779e1d0953af1026e43341414d2166b9b6c7e0c3f85a3e3feb8d479cb63bfb7"
+      "sha256": "b93b183e8a75d723af0d9b427688382ef9315cfecd7c79ce571d5959f7421544"
     },
     {
       "path": "src/legal/disclaimerVersion.ts",
@@ -416,7 +416,7 @@
     },
     {
       "path": "src/types/preflightPlanV1.ts",
-      "sha256": "5b8263646cad162a2bf748a435f298680b683784b862e638bbb5c08789b20a10"
+      "sha256": "6628869924723daae1c1024a0f28bdb57297afab14782b856003ae7034a510b1"
     },
     {
       "path": "src/types/structuredQuestionV1.ts",

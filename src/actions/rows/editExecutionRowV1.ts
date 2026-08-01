@@ -105,7 +105,12 @@ export function createEditExecutionRowV1(): ProviderTaskActionRowV1 {
     // two-phase wrapper (runEditActionV1.ts) launches it after a sealed,
     // permit-claimed preflight.
     routes: ["internal:editExecution.v1"],
-    eligibility: { statuses: ["active"], stages: "anyStage" },
+    // Union of the four preflight rows' declared stages (editPreflightRowsV1)
+    // — a sealed execution can only follow a stage-eligible preflight.
+    eligibility: {
+      statuses: ["active"],
+      stages: ["impl", "impl-high-review", "impl-low-review", "publish"],
+    },
     requiresTaskOperationLease: true,
     progressLabel: "Applying planned edits…",
     validateInput: validateEditExecutionInputV1,

@@ -139,6 +139,8 @@ interface EditPreflightRowConfigV1 {
   readonly routes: readonly string[];
   readonly progressLabel: string;
   readonly loggingChannel: string;
+  /** The registry-declared stages this edit action may run at (§3.2). */
+  readonly stages: readonly string[];
 }
 
 function createEditPreflightRowV1(config: EditPreflightRowConfigV1): ProviderTaskActionRowV1 {
@@ -146,9 +148,11 @@ function createEditPreflightRowV1(config: EditPreflightRowConfigV1): ProviderTas
     kind: "provider",
     actionKey: config.actionKey,
     routes: config.routes,
-    // Stage discipline stays with the command layer (as it is for these
-    // actions today); every edit-capable action requires an active task.
-    eligibility: { statuses: ["active"], stages: "anyStage" },
+    // Stage eligibility is REGISTRY-declared (not delegated to command
+    // code): callers pass the task's actual current stage as `taskStage`,
+    // and the coordinator refuses stages outside this list. Every
+    // edit-capable action requires an active task.
+    eligibility: { statuses: ["active"], stages: config.stages },
     requiresTaskOperationLease: true,
     progressLabel: config.progressLabel,
     validateInput: validateEditPreflightInputV1,
@@ -171,6 +175,9 @@ export function createImplementationPreflightRowV1(): ProviderTaskActionRowV1 {
     routes: ["vs-code-ai-helper.runImplementationWithAI"],
     progressLabel: "Planning implementation edits…",
     loggingChannel: "action.implementation",
+    // Mirrors IMPLEMENTATION_ELIGIBLE_STAGES (reviewActions.ts): a re-run is
+    // legal while the task sits at either implementation review stage.
+    stages: ["impl", "impl-high-review", "impl-low-review"],
   });
 }
 
@@ -183,6 +190,10 @@ export function createFastForwardPreflightRowV1(): ProviderTaskActionRowV1 {
     ],
     progressLabel: "Planning fast-forward edits…",
     loggingChannel: "action.fastForward",
+    // The Fast Forward loop starts from implementation or either of its
+    // review stages; its chained apply/edit attempts run as
+    // applyReviewEdit.v1 (same stage set).
+    stages: ["impl", "impl-high-review", "impl-low-review"],
   });
 }
 
@@ -195,6 +206,7 @@ export function createApplyReviewEditPreflightRowV1(): ProviderTaskActionRowV1 {
     routes: ["internal:applyReviewEdit.v1"],
     progressLabel: "Planning review-fix edits…",
     loggingChannel: "action.applyReviewEdit",
+    stages: ["impl", "impl-high-review", "impl-low-review"],
   });
 }
 
@@ -204,5 +216,7 @@ export function createLintPreflightRowV1(): ProviderTaskActionRowV1 {
     routes: ["vs-code-ai-helper.runLintingFixes"],
     progressLabel: "Planning lint fixes…",
     loggingChannel: "action.lint",
+    // The AI lint-fix fallback is a Publish-stage action only.
+    stages: ["publish"],
   });
 }

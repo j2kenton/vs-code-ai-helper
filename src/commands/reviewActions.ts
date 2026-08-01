@@ -54,7 +54,11 @@ import {
   recordActiveFallbackModel,
   resolveRunnerForModel,
 } from "../runners/runnerRegistry";
-import { runSealedImplementationV1 } from "./runEditActionV1";
+import {
+  checkEditActionAvailabilityV1,
+  checkEditActionHostGateV1,
+  runSealedImplementationV1,
+} from "./runEditActionV1";
 import { normalizeQualifiedModelId, qualifiedRanModelId } from "../runners/providers";
 import { getQuotaObservation, recordQuotaObservation } from "../utils/quota";
 import {
@@ -418,6 +422,13 @@ interface ExecuteImplementationRunOptions {
    * pipeline runs under — see runSealedImplementationV1.
    */
   editActionKey?: string;
+  /**
+   * Task-local Chat surface for structured preflight questions: when the
+   * sealed pipeline's preflight returns questions, the persisted interaction
+   * is mirrored here (askInteraction) so it gets the full Answer/Resume
+   * lifecycle (plan §5.5 / AC-PREFLIGHT-04).
+   */
+  chatViewProvider?: ChatViewProvider;
 }
 
 /**
@@ -3060,6 +3071,14 @@ export async function fastForwardReviewWithAI(
   chatViewProvider?: ChatViewProvider
 ): Promise<void> {
   assertLegacyAiRouteAllowedV0("fastForward.v1");
+  // §7.5 host gate (AC-HOST-03): the Fast Forward loop's apply attempts are
+  // edit-capable, so a host without the LM tool API refuses here — before
+  // any task/source read.
+  const ffHostGate = checkEditActionHostGateV1();
+  if (!ffHostGate.ok) {
+    NotificationRouter.showWarning(ffHostGate.reason);
+    return;
+  }
   if ((vscode.workspace.workspaceFolders ?? []).length === 0) {
     NotificationRouter.showError(
       "No workspace folder open. Please open a folder first."
@@ -3402,11 +3421,19 @@ async function applyImplementationReviewWithAI(
   reviewContent: string,
   options: ApplyReviewOptions & ExecuteImplementationRunOptions
 ): Promise<boolean> {
-  // Edit-capable sibling of the migrated "applyReview.v1" text route (plan
-  // §7.8 step 16, not yet landed) — gated under its own route id so
-  // enabling "applyReview.v1" for plan-review stages never implicitly
-  // unblocks implementation-review edit runs.
+  // Edit-capable sibling of the "applyReview.v1" text route, MIGRATED by
+  // §7.8: it runs the sealed two-phase pipeline (runSealedImplementationV1
+  // with editActionKey "applyReviewEdit.v1"). The assertion is kept under
+  // its own route id so re-gating "applyReview.v1" for plan-review stages
+  // never implicitly toggles implementation-review edit runs.
   assertLegacyAiRouteAllowedV0("applyReviewEdit.v1");
+  // §7.5 host gate (AC-HOST-03): before the plan-final materialization and
+  // review-content reads below.
+  const hostGate = checkEditActionHostGateV1();
+  if (!hostGate.ok) {
+    NotificationRouter.showWarning(hostGate.reason);
+    return false;
+  }
   // Materialize canonical plan-final.md from legacy implementation.md if needed.
   let canonicalUri: vscode.Uri;
   try {
@@ -4460,7 +4487,45 @@ async function executeImplementationRun(
         // must use that same stage, not postRunReviewStage (which may be a
         // review stage used only to pick which review to auto-run below).
         stage: "impl",
+        // Registry-row stage eligibility checks against the task's ACTUAL
+        // current stage: both callers pass postRunReviewStage = the current
+        // review stage when at review, "impl" otherwise.
+        taskStage: postRunReviewStage,
         taskFolderUri: folderUri,
+        // Structured preflight questions get their full Chat lifecycle
+        // (mirror → Answer → Resume via extension.ts's dispatcher).
+        onQuestions: async (questionsOutcome) => {
+          const provider = options.chatViewProvider;
+          if (!provider) {
+            return;
+          }
+          const orchestrator = getProductionActionConversationOrchestratorV1();
+          const record = await orchestrator.getRecord({
+            operationId: questionsOutcome.correlation.operationId,
+            interactionId: questionsOutcome.interactionId,
+            taskBindingId: questionsOutcome.correlation.taskBindingId,
+            chatDocumentId: questionsOutcome.correlation.chatDocumentId,
+            sourceAttemptId: questionsOutcome.correlation.attemptId,
+          });
+          if (record) {
+            await provider.askInteraction({
+              canonicalId: folderUri.fsPath,
+              taskFolderPath: folderUri.fsPath,
+              stage: record.stage,
+              interactionId: record.interactionId,
+              operationId: record.correlation.operationId,
+              actionKey: record.correlation.actionKey,
+              sourceAttemptId: record.correlation.attemptId,
+              // safe: loaded via a "questions" outcome, so questions are
+              // posted — never invocationPending.
+              questions: record.questions!,
+              binding: {
+                taskBindingId: record.correlation.taskBindingId,
+                chatDocumentId: record.correlation.chatDocumentId,
+              },
+            });
+          }
+        },
       });
       } finally {
         linked.dispose();
@@ -4641,18 +4706,22 @@ async function executeImplementationRun(
 export async function runImplementationWithAI(
   extensionUri: vscode.Uri,
   context: vscode.ExtensionContext,
-  arg?: ReviewCommandArg
+  arg?: ReviewCommandArg,
+  chatViewProvider?: ChatViewProvider
 ): Promise<void> {
-  // "implementation.v1" remains in LEGACY_AI_ROUTE_DISABLED_V0 (plan §1.3,
-  // §8's Edit cohort) until its read-only preflight + sealed edit execution
-  // replacement lands (plan §7/§7.8, step 16). This is the real, throwing
-  // route gate — the first statement of the handler, before any
-  // task/workspace/artifact read, consent prompt, or provider selection —
-  // matching every other unmigrated edit-capable route. A prior "bootstrap"
-  // exemption called the non-throwing query here instead so this action
-  // could keep running unmigrated; that left a live, edit-capable AI route
-  // with no read-only preflight in front of it and no plan authorization.
+  // Post-§7.8 route gate: "implementation.v1" is MIGRATED (it runs the
+  // sealed two-phase pipeline via runSealedImplementationV1), so this
+  // assertion passes and exists to fail closed if the key is ever re-gated.
   assertLegacyAiRouteAllowedV0("implementation.v1");
+  // ── §7.5 host gate (AC-HOST-03) ──────────────────────────────────────────
+  // First real check, before consent, task resolution, or ANY task/source
+  // read: a pre-1.100 host (or one whose LM tool API probes unavailable)
+  // reports hostToolApiUnavailable here and nothing has been read.
+  const hostGate = checkEditActionHostGateV1();
+  if (!hostGate.ok) {
+    NotificationRouter.showWarning(hostGate.reason);
+    return;
+  }
   // ── Workspace guard ───────────────────────────────────────────────────────
   if ((vscode.workspace.workspaceFolders ?? []).length === 0) {
     NotificationRouter.showError(
@@ -4696,6 +4765,28 @@ export async function runImplementationWithAI(
   // auto-fast-forward" — the post-run follow-up review must run as the Fast
   // Forward loop even when the standalone review settings are off.
   const followUpReviewMode = chainedFollowUpReviewMode(arg);
+
+  // ── §7.5 full availability gate, BEFORE any artifact read ────────────────
+  // The remaining (task/model-dependent) halves of the gate run as soon as
+  // the owning workspace and stage model are knowable — ahead of
+  // materializeCanonicalIfNeeded, plan-final reads, checklist generation,
+  // and context-pack collection below.
+  const workspaceRoot = resolveOwnerWorkspace(resolved.progress);
+  if (!workspaceRoot) {
+    NotificationRouter.showError(
+      "Could not determine the owning workspace for this task. Please open the workspace that created it."
+    );
+    return;
+  }
+  const model = await resolveFreshModelForStage(resolved.folderUri, "impl");
+  const editAvailability = checkEditActionAvailabilityV1({
+    workspaceFsPath: workspaceRoot.uri.fsPath,
+    stageModelId: model.modelId,
+  });
+  if (!editAvailability.ok) {
+    NotificationRouter.showWarning(editAvailability.reason);
+    return;
+  }
 
   const lockKey = resolved.folderUri.fsPath;
   await runTrackedOperation(
@@ -4773,22 +4864,15 @@ export async function runImplementationWithAI(
       planFinalContent = (await readNonEmptyText(canonicalUri)) ?? planFinalContent;
     }
 
-    // Resolve implementation model for execution
-    const model = await resolveFreshModelForStage(resolved.folderUri, "impl");
-
+    // The implementation model + owning workspace were resolved (and the
+    // §7.5 gate passed) before this tracked operation began; this is only
+    // the provider-liveness check, which can change while the checklist
+    // generation above runs.
     const { availability, providerLabel } =
       await checkImplementationAvailabilityForModel(model.modelId, "impl");
     if (!availability.available) {
       NotificationRouter.showWarning(
         `${providerLabel} is unavailable: ${availability.reason ?? "unknown reason"}. Implement the plan manually instead.`
-      );
-      return;
-    }
-
-    const workspaceRoot = resolveOwnerWorkspace(resolved.progress);
-    if (!workspaceRoot) {
-      NotificationRouter.showError(
-        "Could not determine the owning workspace for this task. Please open the workspace that created it."
       );
       return;
     }
@@ -4827,6 +4911,7 @@ export async function runImplementationWithAI(
         onWaitingForUser: (w) => op.setWaitingForUser(w),
         parentOperation: op,
         followUpReviewMode,
+        chatViewProvider,
       }
     );
     }
@@ -4852,9 +4937,8 @@ export async function runImplementationWithAI(
  * as a defense-in-depth safety net for any caller that reaches it directly,
  * e.g. a stale custom keybinding) — sharing behavior is not the architectural
  * problem the plan flags; one dynamic PUBLIC COMMAND identity for both
- * branches is. `applyReviewEdit.v1` is disabled until plan §7/§7.8's edit
- * migration lands, so this route currently always rejects, identically to
- * the shared command's own edit branch today.
+ * branches is. Post-§7.8, `applyReviewEdit.v1` is MIGRATED: the edit branch
+ * runs the sealed two-phase pipeline via runSealedImplementationV1.
  */
 export async function applyReviewEditWithAI(
   extensionUri: vscode.Uri,
@@ -4863,6 +4947,12 @@ export async function applyReviewEditWithAI(
   options: ApplyReviewOptions = {}
 ): Promise<void> {
   assertLegacyAiRouteAllowedV0("applyReviewEdit.v1");
+  // §7.5 host gate (AC-HOST-03): before any task/source read.
+  const hostGate = checkEditActionHostGateV1();
+  if (!hostGate.ok) {
+    NotificationRouter.showWarning(hostGate.reason);
+    return;
+  }
 
   if (isMalformedReviewArg(arg as ReviewCommandArg | Record<string, unknown>)) {
     NotificationRouter.showError(
@@ -5025,7 +5115,7 @@ export function registerReviewActionCommands(
     vscode.commands.registerCommand(
       "vs-code-ai-helper.runImplementationWithAI",
       (arg?: ReviewCommandArg) =>
-        runImplementationWithAI(context.extensionUri, context, arg)
+        runImplementationWithAI(context.extensionUri, context, arg, chatViewProvider)
     ),
     vscode.commands.registerCommand(
       "vs-code-ai-helper.release",

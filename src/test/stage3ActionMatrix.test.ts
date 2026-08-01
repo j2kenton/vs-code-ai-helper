@@ -286,7 +286,7 @@ void describe("Stage 3 action matrix contracts", () => {
     );
     assert.match(
       fixesSource,
-      /stage: "publish", taskFolderUri/,
+      /stage: "publish",\s+taskStage: "publish",\s+taskFolderUri/,
       "The AI fix run must execute under the Publish stage, not Implementation"
     );
 
