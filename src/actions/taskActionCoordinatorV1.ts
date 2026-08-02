@@ -156,7 +156,7 @@ import {
   openProviderSelectionSessionV1,
   ProviderSelectionSessionV1,
 } from "../services/providerSelectionPolicyV1";
-import { WorkflowLeaseStoreV1 } from "../services/workflowLeaseStoreV1";
+import { TaskOperationLeaseAcquireResultV1, WorkflowLeaseStoreV1 } from "../services/workflowLeaseStoreV1";
 import {
   AI_RESULT_CONTRACT_ID_V1,
   AI_RESULT_CONTRACT_VERSION_V1,
@@ -305,6 +305,26 @@ export interface TaskActionRequestV1 {
    * per-process task-lock key.
    */
   readonly lifecycleSkipTaskLock?: boolean;
+  /**
+   * Lifecycle-row-only side channel like `lifecycleBeforeWrite`: forwarded
+   * verbatim into `LifecycleExecutionContextV1.services` for a `"lifecycle"`
+   * row and otherwise ignored. See that field's header.
+   */
+  readonly lifecycleServices?: unknown;
+  /**
+   * Set ONLY by a lifecycle row's own `execute` when it drives a nested
+   * provider-row invocation against the SAME task binding while its own
+   * coordinator lease is still held — e.g. `commitPush.v1` invoking
+   * `commitPushMetadata.v1` (`commitAndPushTask.ts`'s `buildCommitMessage`/
+   * `resumeCommitMessage`). Names the PARENT's own `operationId`: when set,
+   * lease acquisition below calls `leaseStore.acquireChild` instead of
+   * `acquire`, which succeeds ONLY while this exact operation currently
+   * holds the binding's lease (see `workflowLeaseStoreV1.ts`'s header) — so
+   * this can never be used to let an unrelated operation bypass the
+   * binding's exclusivity, only to avoid a legitimate nested call
+   * self-deadlocking against its own already-held lease.
+   */
+  readonly parentOperationId?: OperationIdV1;
 }
 
 /**
@@ -334,6 +354,8 @@ export interface TaskActionResumeRequestV1 {
    */
   readonly resumeIdempotencyId: string;
   readonly cancellationToken: vscode.CancellationToken;
+  /** See `TaskActionRequestV1.parentOperationId` — identical nested-lease meaning for a Resume drive. */
+  readonly parentOperationId?: OperationIdV1;
 }
 
 export interface TaskActionCoordinatorDepsV1 {
@@ -572,6 +594,28 @@ type TaskLeasePhaseV1 =
   | { readonly ok: false; readonly outcome: TaskActionOutcomeV1 };
 
 type AcquireTaskLeasePhaseV1 = () => TaskLeasePhaseV1;
+
+/**
+ * Shared lease-acquisition body for both `admitAction` and `executeResume`'s
+ * `acquireLeasePhase` closures: plain `acquire` for a normal top-level
+ * invocation, or `acquireChild` when `parentOperationId` is set (a lifecycle
+ * row's own nested provider-row invocation against the SAME binding while
+ * its own lease is held — see `TaskActionRequestV1.parentOperationId`).
+ * `acquireChild` only ever succeeds while `parentOperationId` names the
+ * binding's CURRENTLY held lease, so this cannot weaken the binding's
+ * exclusivity for any other caller.
+ */
+function acquireTaskLease(
+  leaseStore: WorkflowLeaseStoreV1,
+  taskBindingId: string,
+  actionKey: ActionKeyV1,
+  operationId: OperationIdV1,
+  parentOperationId: OperationIdV1 | undefined
+): TaskOperationLeaseAcquireResultV1 {
+  return parentOperationId === undefined
+    ? leaseStore.acquire(taskBindingId, actionKey, operationId)
+    : leaseStore.acquireChild(taskBindingId, parentOperationId, actionKey, operationId);
+}
 
 /** Sanitized sealed-result metrics captured for the settlement record (§2.2: byte counts and digests only). */
 interface ResultMetricsCaptureV1 {
@@ -1102,10 +1146,12 @@ export function createTaskActionCoordinatorV1(
       if (!row.requiresTaskOperationLease) {
         return { ok: true, release: (): void => undefined };
       }
-      const acquired = deps.leaseStore.acquire(
+      const acquired = acquireTaskLease(
+        deps.leaseStore,
         request.taskBinding.taskBindingId,
         row.actionKey,
-        operationId
+        operationId,
+        request.parentOperationId
       );
       if (!acquired.ok) {
         return { ok: false, outcome: acquired.outcome };
@@ -1147,6 +1193,7 @@ export function createTaskActionCoordinatorV1(
           validatedInput: validation.input,
           beforeWrite: request.lifecycleBeforeWrite,
           skipTaskLock: request.lifecycleSkipTaskLock,
+          services: request.lifecycleServices,
         });
         return { kind: "settled", outcome: finalizeOutcome(row, request, operationId, outcome, metrics) };
       } finally {
@@ -1481,10 +1528,12 @@ export function createTaskActionCoordinatorV1(
       if (!row.requiresTaskOperationLease) {
         return { ok: true, release: (): void => undefined };
       }
-      const acquired = deps.leaseStore.acquire(
+      const acquired = acquireTaskLease(
+        deps.leaseStore,
         request.taskBinding.taskBindingId,
         row.actionKey,
-        record.correlation.operationId
+        record.correlation.operationId,
+        request.parentOperationId
       );
       if (!acquired.ok) {
         return { ok: false, outcome: acquired.outcome };

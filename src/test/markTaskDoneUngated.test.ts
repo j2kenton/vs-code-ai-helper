@@ -16,7 +16,7 @@ import { markTaskDone } from "../commands/markTaskDone";
 import { TaskInventory } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { TaskProgress } from "../types/taskProgress";
-import { readTaskProgressForTest as readTaskProgress } from "./taskFolderFixture";
+import { readTaskProgressForTest as readTaskProgress, fixtureOwnershipFor } from "./taskFolderFixture";
 import {
   deactivateNotificationRouter,
   initNotificationRouter,
@@ -51,6 +51,7 @@ function fixtureProgress(taskFolderPath: string): TaskProgress {
     createdAt: "2026-01-01T00:00:00.000Z",
     updatedAt: "2026-01-01T00:00:00.000Z",
     scheduledResumeTime: "2026-01-02T00:00:00.000Z",
+    ownership: fixtureOwnershipFor(taskFolderPath),
   };
 }
 

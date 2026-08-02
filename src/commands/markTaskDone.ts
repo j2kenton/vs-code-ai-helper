@@ -10,6 +10,7 @@ import { runTrackedOperation } from "../utils/taskOperations";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
 import { invokeLifecycleRowV1 } from "../actions/productionTaskActionRuntimeV1";
 import { MARK_TASK_DONE_ACTION_KEY_V1 } from "../actions/rows/markTaskDoneRowV1";
+import { deriveTaskBindingV1 } from "../types/taskBindingV1";
 
 /**
  * Accepted argument shapes for markTaskDone.
@@ -186,11 +187,19 @@ export async function markTaskDone(
     // changes lifecycle status, but this command is the durable terminal
     // edge — persisted through the markTaskDone.v1 registry row (plan §6.6),
     // which applies the field policy via the strict progress stack.
-    // Exactly like resolveTaskContext's own canonicalId (a normalized
-    // absolute task-folder path) — see invokeLifecycleRowV1's own header
-    // for why a lifecycle row needs neither a workflow file-store root nor
-    // a real Chat document identity.
-    const taskBindingId = resolvedTask.canonicalId;
+    // Plan §3.9: the task-binding identity is the digest derived from this
+    // task's persisted ownership + taskFolder, never the raw canonical
+    // folder path — the same derivation every provider row uses for the
+    // same task, so leases and audit records key on one identity per task.
+    const derivedBinding = deriveTaskBindingV1(resolvedTask.progress);
+    if (!derivedBinding.ok) {
+      NotificationRouter.showError(
+        `Could not complete ${resolvedTask.folderName}: its ownership binding could not be verified. ` +
+          `The task's progress file needs recovery.`
+      );
+      return;
+    }
+    const taskBindingId = derivedBinding.binding.bindingId;
     const outcome = await invokeLifecycleRowV1({
       actionKey: MARK_TASK_DONE_ACTION_KEY_V1,
       taskFolderPath: taskFolderUri.fsPath,

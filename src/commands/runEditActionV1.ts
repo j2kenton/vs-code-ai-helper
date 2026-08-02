@@ -48,6 +48,7 @@ import {
 import { probeLmToolCallingHostCapabilityV1, VscodeLmModuleV1 } from "../services/vscodeLmCompat";
 import { resolveEffectiveProvider } from "../runners/runnerRegistry";
 import { resolveFreshModelForStage } from "../utils/modelSelection";
+import { getAiModelDefaults, getModelSettings } from "../config/settings";
 import { writeRunLog } from "../utils/runLog";
 import { NotificationRouter } from "../utils/notificationRouter";
 import type { TaskInventory } from "../state/taskInventory";
@@ -111,6 +112,62 @@ export function checkEditActionHostGateV1():
     return { ok: false, code: "hostToolApiUnavailable", reason: capability.reason };
   }
   return { ok: true };
+}
+
+/**
+ * §7.5's task/model-INDEPENDENT half of "at least one selected-provider path
+ * supporting request-local tools": true when `stage`'s globally configured
+ * primary model — the model the calling edit action actually resolves
+ * against (Implementation, Fast Forward, and Apply Review Edit all call
+ * `resolveFreshModelForStage(..., "impl")`; the AI lint fallback, the one
+ * edit action whose registry row is scoped to `["publish"]`, calls
+ * `resolveFreshModelForStage(..., "publish")` — see
+ * `modelStageForEditActionKeyV1` in runEditActionV1.ts) — currently resolves
+ * to a Copilot-backed path. Reads ONLY global settings (`getModelSettings`/
+ * `getAiModelDefaults`, both parameterless) — no `taskFolderUri`, so no
+ * per-task read — because `resolveFreshModelForStage` always calls
+ * `resolveModelForStage` with `ignoreActiveFallback: true`, whose returned
+ * model id is exactly `getModelSettings()[stage]?.primary ??
+ * getAiModelDefaults()[stage]` regardless of any task's own state; the
+ * per-task read it performs is solely to clear a stale fallback flag, a side
+ * effect this coarse pre-check does not need to reproduce.
+ *
+ * Command handlers call this immediately after `checkEditActionHostGateV1()`
+ * — before `resolveTask` or any other task read — so a globally CLI-only
+ * configuration is rejected before any task/source read (§7.5). Callers MUST
+ * pass the stage the invoked action key actually resolves its model
+ * against — passing the wrong stage (e.g. defaulting every caller to
+ * `"impl"`) can reject an otherwise-valid action solely because an unrelated
+ * stage's model is CLI-backed. This is a coarse pre-check, not a replacement
+ * for `checkEditActionAvailabilityV1`: the exact per-task capability (plus
+ * the workspace-root check, which genuinely needs the resolved task's
+ * ownership) is still revalidated by that function immediately before the
+ * first source read (§7.6).
+ */
+export function checkEditActionProviderPathGateV1(
+  stage: TaskStage
+):
+  | { readonly ok: true }
+  | { readonly ok: false; readonly code: "providerModeUnavailable"; readonly reason: string } {
+  const modelId = getModelSettings()[stage]?.primary ?? getAiModelDefaults()[stage];
+  try {
+    if (resolveEffectiveProvider(modelId).kind === "copilot") {
+      return { ok: true };
+    }
+  } catch (error) {
+    return {
+      ok: false,
+      code: "providerModeUnavailable",
+      reason: error instanceof Error ? error.message : String(error),
+    };
+  }
+  return {
+    ok: false,
+    code: "providerModeUnavailable",
+    reason:
+      "AI-assisted edits run through the request-local Copilot Language Model tool session — " +
+      `configure a Copilot model for the ${stage} stage (CLI providers cannot run sealed edit sessions).`,
+  };
 }
 
 /**
@@ -600,13 +657,47 @@ function modelStageForEditActionKeyV1(actionKey: string): TaskStage {
   return actionKey === LINT_ACTION_KEY_V1 ? "publish" : "impl";
 }
 
+/**
+ * `actionKey` is the interaction's own recorded correlation key — the
+ * dispatcher in extension.ts already loads the interaction transaction (to
+ * decide which Resume handler to call at all) and passes its
+ * `correlation.actionKey` straight through, so this function never needs a
+ * SECOND transaction load just to learn it. Threading it in as a parameter
+ * (rather than re-deriving it here) is what lets the stage-scoped provider
+ * gate below run with the RIGHT stage — lint.v1 resolves against the
+ * Publish-stage model, not Implementation's — before any further read
+ * (§7.5; a hardcoded "impl" gate here would reject a valid lint.v1 Resume
+ * solely because an unrelated stage's model is CLI-backed).
+ */
 export async function resumeEditPreflightInteractionV1(
   inventory: TaskInventory,
   chatViewProvider: ChatViewProvider,
   ref: ChatInteractionRefV1,
+  actionKey: string,
   resumeIdempotencyId: string,
   cancellationToken: vscode.CancellationToken
 ): Promise<ChatInteractionResumeResultV1> {
+  if (!isEditPreflightActionKeyV1(actionKey)) {
+    return { ok: false, reason: `unexpected action key ${actionKey} for an edit-preflight Resume` };
+  }
+  // §7.5, applied to Resume drives too: the task/model-INDEPENDENT halves of
+  // the gate run first — before the inventory lookup below (a task read) or
+  // any transaction/binding revalidation — so a pre-1.100 host or a globally
+  // CLI-only configuration is rejected before any task/source read, exactly
+  // like a fresh invocation (checkEditActionAvailabilityV1's workspace-root
+  // half genuinely needs the resolved task's workspace and is revalidated
+  // further down once that is known). The stage passed here is the stage
+  // THIS actionKey actually resolves its model against, not a hardcoded one.
+  const modelStage = modelStageForEditActionKeyV1(actionKey);
+  const hostGate = checkEditActionHostGateV1();
+  if (!hostGate.ok) {
+    return { ok: false, reason: hostGate.reason };
+  }
+  const providerPathGate = checkEditActionProviderPathGateV1(modelStage);
+  if (!providerPathGate.ok) {
+    return { ok: false, reason: providerPathGate.reason };
+  }
+
   const ownedTask = inventory.getTaskByBindingId(ref.taskBindingId);
   if (!ownedTask) {
     return { ok: false, reason: "the task that asked this question could not be found" };
@@ -625,22 +716,6 @@ export async function resumeEditPreflightInteractionV1(
     chatDocumentId: ref.chatDocumentId,
     sourceAttemptId: ref.sourceAttemptId,
   };
-  const loaded = await orchestrator.loadInteraction(interactionRef);
-  if (loaded.kind !== "ok") {
-    return {
-      ok: false,
-      reason: loaded.kind === "storageUnavailable" ? "workflow storage is unavailable" : loaded.reason,
-    };
-  }
-  const actionKey = loaded.record.correlation.actionKey;
-  if (!isEditPreflightActionKeyV1(actionKey)) {
-    return { ok: false, reason: `unexpected action key ${actionKey} for an edit-preflight Resume` };
-  }
-
-  // §7.5 applies to Resume drives too: gate before any further task or
-  // source read (the strict inventory lookup above is the binding lookup the
-  // transaction revalidation itself requires).
-  const modelStage = modelStageForEditActionKeyV1(actionKey);
   const model = await resolveFreshModelForStage(taskFolderUri, modelStage);
   const availability = checkEditActionAvailabilityV1({
     workspaceFsPath: workspaceFolderUri.fsPath,

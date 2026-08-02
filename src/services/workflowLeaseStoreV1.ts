@@ -37,10 +37,42 @@ export interface WorkflowLeaseStoreV1 {
   release(leaseId: string): boolean;
   /** The lease currently held for a binding, if any. */
   heldLease(taskBindingId: string): TaskOperationLeaseV1 | undefined;
+  /**
+   * Acquire a NESTED lease for a child action that runs, on the SAME task
+   * binding, strictly inside an already-admitted parent operation's own held
+   * lease — e.g. `commitPush.v1`'s `execute` invoking the `commitPushMetadata.v1`
+   * provider row against the same task while its own lease is still held,
+   * which a plain `acquire` against an already-locked binding would reject
+   * as a (false-positive) duplicate and self-deadlock.
+   *
+   * Legal ONLY while `parentOperationId` names the binding's CURRENTLY held
+   * lease's operation: only the workflow that already proved exclusive
+   * access to this binding can ever learn its own `operationId` and pass it
+   * back in, so this can never let two INDEPENDENT operations hold the same
+   * binding concurrently — the base `acquire`/`heldLease` exclusivity for
+   * that binding is unchanged (plan §3.9/§10: a real concurrency-safety
+   * property, not cosmetic access).
+   *
+   * A child lease is tracked separately from the binding-level slot: it
+   * never appears in `heldLease`, and releasing it (via the ordinary
+   * `release(leaseId)`) never frees the parent's hold. Releasing the PARENT
+   * also releases any of its still-open children, so a caller that forgets
+   * to release a child before its parent can never leak a phantom lock.
+   */
+  acquireChild(
+    taskBindingId: string,
+    parentOperationId: OperationIdV1,
+    actionKey: ActionKeyV1,
+    operationId: OperationIdV1
+  ): TaskOperationLeaseAcquireResultV1;
 }
 
 class WorkflowLeaseStoreImplV1 implements WorkflowLeaseStoreV1 {
   private readonly leasesByBinding = new Map<string, TaskOperationLeaseV1>();
+  private readonly childLeasesById = new Map<
+    string,
+    { readonly parentLeaseId: string; readonly lease: TaskOperationLeaseV1 }
+  >();
 
   constructor(private readonly now: () => string) {}
 
@@ -63,10 +95,44 @@ class WorkflowLeaseStoreImplV1 implements WorkflowLeaseStoreV1 {
     return { ok: true, lease };
   }
 
+  acquireChild(
+    taskBindingId: string,
+    parentOperationId: OperationIdV1,
+    actionKey: ActionKeyV1,
+    operationId: OperationIdV1
+  ): TaskOperationLeaseAcquireResultV1 {
+    const parent = this.leasesByBinding.get(taskBindingId);
+    if (!parent || parent.operationId !== parentOperationId) {
+      // No matching parent hold for THIS binding: reject exactly like a
+      // duplicate. This is the entire safety property — a child can only
+      // ever be granted to the operation that already exclusively holds the
+      // binding, never to an unrelated caller.
+      return { ok: false, outcome: duplicateRejectedV1() };
+    }
+    const lease: TaskOperationLeaseV1 = {
+      leaseId: allocateHex128IdV1(),
+      actionKey,
+      operationId,
+      taskBindingId,
+      acquiredAt: this.now(),
+    };
+    this.childLeasesById.set(lease.leaseId, { parentLeaseId: parent.leaseId, lease });
+    return { ok: true, lease };
+  }
+
   release(leaseId: string): boolean {
+    if (this.childLeasesById.has(leaseId)) {
+      this.childLeasesById.delete(leaseId);
+      return true;
+    }
     for (const [bindingId, lease] of this.leasesByBinding) {
       if (lease.leaseId === leaseId) {
         this.leasesByBinding.delete(bindingId);
+        for (const [childId, entry] of this.childLeasesById) {
+          if (entry.parentLeaseId === leaseId) {
+            this.childLeasesById.delete(childId);
+          }
+        }
         return true;
       }
     }

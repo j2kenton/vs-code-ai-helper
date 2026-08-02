@@ -27,6 +27,7 @@ import {
   TaskStage,
 } from "../types/taskProgress";
 import { TaskProgress } from "../types/taskProgress";
+import { deriveTaskBindingV1 } from "../types/taskBindingV1";
 import { appendReviewScoreHistory } from "../utils/taskProgressTransforms";
 import { IncompleteTask } from "../types/incompleteTask";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
@@ -57,11 +58,13 @@ import {
 import {
   checkEditActionAvailabilityV1,
   checkEditActionHostGateV1,
+  checkEditActionProviderPathGateV1,
   runSealedImplementationV1,
 } from "./runEditActionV1";
 import { normalizeQualifiedModelId, qualifiedRanModelId } from "../runners/providers";
 import { getQuotaObservation, recordQuotaObservation } from "../utils/quota";
 import {
+  ResolvedStageModel,
   resolveConfiguredReviewStages,
   resolveFreshModelForStage,
   resolveModelForStage,
@@ -2037,6 +2040,10 @@ async function handleReviewOutcomeV1(
         const freshProgressForTransition = await readTaskProgressAdvisoryV1(folderUri);
         transitionToTarget = await advanceStageViaNextStageRowV1(
           folderUri,
+          {
+            ownership: freshProgressForTransition?.ownership,
+            taskFolder: freshProgressForTransition?.taskFolder ?? path.basename(folderUri.fsPath),
+          },
           freshProgressForTransition?.status,
           currentStage,
           targetStage,
@@ -2147,6 +2154,10 @@ async function handleReviewOutcomeV1(
             const isPausedForAdvance = freshProgressForAdvance?.status === "paused";
             const transition = await advanceStageViaNextStageRowV1(
               folderUri,
+              {
+                ownership: freshProgressForAdvance?.ownership,
+                taskFolder: freshProgressForAdvance?.taskFolder ?? path.basename(folderUri.fsPath),
+              },
               freshProgressForAdvance?.status,
               targetStage,
               next,
@@ -3064,6 +3075,98 @@ export async function applyReviewWithAI(
  *
  * Requires first-use consent before any AI action runs (same as Apply Review).
  */
+/**
+ * §7.5 routing pre-check for Fast Forward: a cheap, ZERO-I/O determination of
+ * whether THIS invocation's apply loop will reach the edit-capable branch
+ * (impl review) or stay on the text-only branch (plan review), using only an
+ * already-known `arg.task.progress.currentStage` already sitting in memory.
+ * Returns `true`/`false` only when the target is knowable from the supplied
+ * arg without any read; `undefined` whenever it isn't — a bare QuickPick
+ * invocation (no task arg), a `{ taskFolderPath }`-only arg, or any other
+ * shape that doesn't already carry `task.progress`. §7.5 forbids reading
+ * task-progress.json just to answer this routing question (that read would
+ * itself run before the host/provider gate below), so an `undefined` result
+ * defers entirely to the per-task gate further down in
+ * fastForwardReviewWithAI, which runs once resolveTask's read — needed
+ * regardless, to pick the target task at all — has made the stage known,
+ * still before any review-artifact read. Safe to call before
+ * `isMalformedReviewArg` has run: every branch here defensively type-narrows
+ * or falls through to `undefined` rather than throwing on an unrecognized
+ * shape.
+ *
+ * Exported so other zero-I/O command wrappers with their own already-known
+ * task/progress (e.g. `fastForwardCurrentTaskReview.ts`'s keyboard-shortcut
+ * router, which peeks the current task from the in-memory inventory before
+ * doing its own heavier `resolveTaskContext` read) can reuse this exact
+ * routing decision instead of re-deriving `REVIEW_TARGETS`/`IMPL_REVIEW_STAGES`
+ * logic.
+ */
+export function fastForwardTargetsImplReviewV1(
+  arg: ReviewCommandArg | undefined
+): boolean | undefined {
+  if (
+    arg &&
+    typeof arg === "object" &&
+    "task" in arg &&
+    arg.task &&
+    typeof arg.task === "object" &&
+    "progress" in arg.task &&
+    arg.task.progress &&
+    typeof arg.task.progress === "object" &&
+    "currentStage" in arg.task.progress
+  ) {
+    const stage = (arg.task.progress as { currentStage?: TaskStage }).currentStage;
+    const knownTargetStage = stage ? REVIEW_TARGETS[stage] : undefined;
+    if (knownTargetStage) {
+      return IMPL_REVIEW_STAGES.includes(knownTargetStage);
+    }
+  }
+  return undefined;
+}
+
+/**
+ * §7.5/AC-HOST-03 companion peek for the `{ taskFolderPath }` shape, which
+ * `fastForwardTargetsImplReviewV1` above cannot resolve (it only reads an
+ * already-supplied `arg.task.progress`, never touching disk). Unlike a bare
+ * (no-arg) invocation — which is genuinely ambiguous until `resolveTask`
+ * discovers and filters every eligible task across every workspace folder —
+ * `{ taskFolderPath }` already names exactly one concrete task folder, so its
+ * category is knowable from a single targeted read: the same
+ * `readTaskProgressStrictV1` call `resolveTask`'s `node.task` branch performs
+ * for a task node. Doing that one read here lets the caller enforce the
+ * already-computed host/provider gate before the workspace-folder guard, the
+ * malformed-arg guard, and `ensureAiConsent`'s modal all run — instead of
+ * only after, as `resolveTask` would otherwise leave it for this shape.
+ *
+ * Returns `undefined` — never a notification, never a thrown error — for any
+ * read failure (missing file, corrupt/unsupported progress, folder-binding
+ * mismatch) or a stage with no review target, so the caller always falls
+ * through to the existing `resolveTask` call, which performs the
+ * authoritative read and shows the real recovery/error message. This peek
+ * exists only to move enforcement of an already-decidable gate earlier; it
+ * never substitutes for or duplicates normal error reporting.
+ *
+ * Exported so `fastForwardCurrentTaskReview.ts`'s keyboard-shortcut router
+ * can reuse it for its own cache-miss case: when the persisted current-task
+ * pointer names an id that isn't in the in-memory `TaskInventory` snapshot
+ * (a stale cache, not genuine ambiguity), the pointer is still a concrete
+ * folder path, so this same targeted read resolves its category instead of
+ * falling straight through to the heavier `resolveTaskContext` call.
+ */
+export async function peekFastForwardTargetsImplReviewFromPathV1(
+  taskFolderPath: string
+): Promise<boolean | undefined> {
+  const folderUri = vscode.Uri.file(taskFolderPath);
+  const strict = await readTaskProgressStrictV1(folderUri, {
+    expectedTaskFolder: path.basename(folderUri.fsPath),
+  });
+  if (!strict.ok) {
+    return undefined;
+  }
+  const knownTargetStage = REVIEW_TARGETS[strict.decoded.progress.currentStage];
+  return knownTargetStage ? IMPL_REVIEW_STAGES.includes(knownTargetStage) : undefined;
+}
+
 export async function fastForwardReviewWithAI(
   extensionUri: vscode.Uri,
   context: vscode.ExtensionContext,
@@ -3071,13 +3174,60 @@ export async function fastForwardReviewWithAI(
   chatViewProvider?: ChatViewProvider
 ): Promise<void> {
   assertLegacyAiRouteAllowedV0("fastForward.v1");
-  // §7.5 host gate (AC-HOST-03): the Fast Forward loop's apply attempts are
-  // edit-capable, so a host without the LM tool API refuses here — before
-  // any task/source read.
-  const ffHostGate = checkEditActionHostGateV1();
-  if (!ffHostGate.ok) {
-    NotificationRouter.showWarning(ffHostGate.reason);
-    return;
+  // §7.5 host+provider gate (AC-HOST-03): both checks are pure/zero-I/O —
+  // checkEditActionHostGateV1 reads only `vscode.version` and probes the
+  // host API shape; checkEditActionProviderPathGateV1 reads only global
+  // model settings (see their own headers in runEditActionV1.ts) — neither
+  // touches TaskInventory, current-task state, or any per-task file. Calling
+  // them here, unconditionally, is the first thing this function does after
+  // the legacy-route gate — strictly before ANY task or source read,
+  // including an in-memory TaskInventory lookup.
+  //
+  // Fast Forward's apply loop only reaches the edit-capable branch
+  // (applyReviewEditWithAI's edit branch) when the target review is an
+  // implementation review (IMPL_REVIEW_STAGES) — plan-review fast-forwarding
+  // stays on the text-only applyReview.v1 route and must keep working on a
+  // host/provider that can't run edits (e.g. the 1.93 baseline). But this
+  // invocation's category is not always knowable without a read (a bare
+  // QuickPick call, a `{ taskFolderPath }` arg, or an ambiguous shape all
+  // require `resolveTask`'s read — or the targeted peek below — to learn the
+  // stage). AC-HOST-03 requires the unavailable result to precede ANY
+  // task/source read, so the gate below is enforced whenever zero-I/O data
+  // has NOT already proven the target is plan-review-only (`=== false`):
+  // that covers the known-impl-review case (enforced immediately, as
+  // before), and also the "don't know yet" case (`undefined`) — for that
+  // case the gate now runs BEFORE the `{ taskFolderPath }` peek's disk read
+  // below and before the workspace-folder guard, the malformed-arg guard,
+  // `ensureAiConsent`'s modal, and `resolveTask`'s own read for a bare or
+  // ambiguous invocation. Only an invocation zero-I/O already proves is
+  // plan-review-only (`fastForwardTargetsImplReviewV1(arg) === false`) skips
+  // this gate, since it can never reach the edit-capable branch.
+  const earlyHostGate = checkEditActionHostGateV1();
+  const earlyProviderPathGate = checkEditActionProviderPathGateV1("impl");
+  let knownTargetsImplReview = fastForwardTargetsImplReviewV1(arg);
+  if (knownTargetsImplReview !== false) {
+    if (!earlyHostGate.ok) {
+      NotificationRouter.showWarning(earlyHostGate.reason);
+      return;
+    }
+    if (!earlyProviderPathGate.ok) {
+      NotificationRouter.showWarning(earlyProviderPathGate.reason);
+      return;
+    }
+  }
+  if (knownTargetsImplReview === undefined && arg && typeof arg === "object") {
+    // §7.5/AC-HOST-03: `fastForwardTargetsImplReviewV1` only resolves a
+    // caller-supplied `arg.task.progress` (zero-I/O). A `{ taskFolderPath }`
+    // arg — the keyboard-shortcut/automation shape — names exactly one
+    // concrete task folder, so unlike a genuinely ambiguous bare invocation
+    // its category IS knowable from a single targeted read. This read only
+    // runs once the gate above has already passed (or the target was
+    // already proven plan-review-only, which can't reach this branch), so it
+    // can never precede an enforced unavailability result.
+    const rec = arg as Record<string, unknown>;
+    if (!("task" in rec) && typeof rec.taskFolderPath === "string" && rec.taskFolderPath.length > 0) {
+      knownTargetsImplReview = await peekFastForwardTargetsImplReviewFromPathV1(rec.taskFolderPath);
+    }
   }
   if ((vscode.workspace.workspaceFolders ?? []).length === 0) {
     NotificationRouter.showError(
@@ -3139,6 +3289,53 @@ export async function fastForwardReviewWithAI(
       "Fast Forward Review: this stage does not have a review artifact."
     );
     return;
+  }
+
+  // ── §7.5 full availability gate, BEFORE any review artifact read ────────
+  // Fast Forward's apply loop only reaches the sealed edit pipeline
+  // (applyReviewEditWithAI's edit branch) when targetStage is an
+  // implementation-review stage; plan-review fast-forwarding stays on the
+  // text-only applyReview.v1 route and must not be blocked by the
+  // Copilot-only edit requirement. This block ALWAYS runs for an
+  // edit-eligible target, even when the coarse gate above already cleared
+  // (or already rejected) it before resolveTask, because only here is the
+  // resolved task's owning workspace known (the root-binding half of
+  // checkEditActionAvailabilityV1 cannot run any earlier). Gate here —
+  // before the review-content read below and before the initial-review run
+  // further down — mirroring runImplementationWithAI's placement.
+  if (IMPL_REVIEW_STAGES.includes(targetStage)) {
+    // Enforce the coarse host/provider result computed at the very top of
+    // fastForwardReviewWithAI — before resolveTask's read — FIRST, so a
+    // bare/path-only/ambiguous invocation whose target only became known to
+    // be an implementation review just now (via resolveTask, not via a
+    // cache) still rejects without the further resolveOwnerWorkspace /
+    // resolveFreshModelForStage reads below. No new check runs here; this
+    // just applies the already-computed result at the earliest point its
+    // relevance is known.
+    if (!earlyHostGate.ok) {
+      NotificationRouter.showWarning(earlyHostGate.reason);
+      return;
+    }
+    if (!earlyProviderPathGate.ok) {
+      NotificationRouter.showWarning(earlyProviderPathGate.reason);
+      return;
+    }
+    const editWorkspaceRoot = resolveOwnerWorkspace(resolved.progress);
+    if (!editWorkspaceRoot) {
+      NotificationRouter.showError(
+        "Could not determine the owning workspace for this task. Please open the workspace that created it."
+      );
+      return;
+    }
+    const gateModel = await resolveFreshModelForStage(resolved.folderUri, "impl");
+    const editAvailability = checkEditActionAvailabilityV1({
+      workspaceFsPath: editWorkspaceRoot.uri.fsPath,
+      stageModelId: gateModel.modelId,
+    });
+    if (!editAvailability.ok) {
+      NotificationRouter.showWarning(editAvailability.reason);
+      return;
+    }
   }
 
   let initialContent = await readNonEmptyText(reviewUri);
@@ -3419,6 +3616,11 @@ async function applyImplementationReviewWithAI(
   workspaceRoot: vscode.WorkspaceFolder,
   stage: TaskStage,
   reviewContent: string,
+  // Resolved by the caller (applyReviewEditWithAI) BEFORE its full §7.5
+  // availability gate and before any review/plan/plan-final artifact read —
+  // passed through rather than re-resolved here so the model the gate
+  // checked is exactly the model this run uses.
+  model: ResolvedStageModel,
   options: ApplyReviewOptions & ExecuteImplementationRunOptions
 ): Promise<boolean> {
   // Edit-capable sibling of the "applyReview.v1" text route, MIGRATED by
@@ -3427,8 +3629,11 @@ async function applyImplementationReviewWithAI(
   // its own route id so re-gating "applyReview.v1" for plan-review stages
   // never implicitly toggles implementation-review edit runs.
   assertLegacyAiRouteAllowedV0("applyReviewEdit.v1");
-  // §7.5 host gate (AC-HOST-03): before the plan-final materialization and
-  // review-content reads below.
+  // §7.5 host gate (AC-HOST-03): the full provider/root availability gate
+  // already ran in the caller before any read; this cheap host-only check is
+  // kept as defense-in-depth for any other caller reaching this function
+  // directly, before the plan-final materialization and review-content reads
+  // below.
   const hostGate = checkEditActionHostGateV1();
   if (!hostGate.ok) {
     NotificationRouter.showWarning(hostGate.reason);
@@ -3473,11 +3678,9 @@ async function applyImplementationReviewWithAI(
     return false;
   }
 
-  // Use the `implementation` stage's model, not the review stage's model.
-  const model = options.preserveActiveFallback
-    ? await resolveModelForStage(folderUri, "impl")
-    : await resolveFreshModelForStage(folderUri, "impl");
-
+  // The `implementation` stage's model was already resolved by the caller
+  // (before its full §7.5 gate) — re-check liveness only, since availability
+  // can change while the reads above ran.
   const { availability, providerLabel } =
     await checkImplementationAvailabilityForModel(model.modelId, "impl");
   if (!availability.available) {
@@ -3659,6 +3862,7 @@ async function currentStageArtifactExists(
  */
 async function advanceStageViaNextStageRowV1(
   folderUri: vscode.Uri,
+  binding: Pick<TaskProgress, "ownership" | "taskFolder">,
   status: TaskProgress["status"] | undefined,
   currentStage: TaskStage,
   next: TaskStage,
@@ -3667,11 +3871,19 @@ async function advanceStageViaNextStageRowV1(
   expectedReviewAttemptId?: string,
   publishArtifact?: () => Promise<void>
 ): Promise<StageTransitionResult> {
-  // Exactly like the tree/inventory's own canonicalId (a normalized
-  // absolute task-folder path) — see invokeLifecycleRowV1's own header for
-  // why a lifecycle row needs neither a workflow file-store root nor a real
-  // Chat document identity.
-  const taskBindingId = normalizePath(folderUri.fsPath);
+  // Plan §3.9: the task-binding identity is the digest derived from this
+  // task's persisted ownership + taskFolder EXACTLY AS PERSISTED (never a
+  // re-normalized filesystem path) — the same derivation every provider row
+  // (generatePlan.v1, draft.v1, ...) uses for the same task via
+  // verifyTaskFolderOwnershipBindingV1, so leases and audit records key on
+  // one identity per task regardless of which action touches it. An
+  // underivable binding (missing/unresolved ownership) throws below exactly
+  // like every other non-`completed` outcome this function already throws on.
+  const derivedBinding = deriveTaskBindingV1(binding);
+  if (!derivedBinding.ok) {
+    throw new Error("taskBindingUnavailable");
+  }
+  const taskBindingId = derivedBinding.binding.bindingId;
   const outcome: TaskActionOutcomeV1 = await invokeLifecycleRowV1({
     actionKey: NEXT_STAGE_ACTION_KEY_V1,
     taskFolderPath: folderUri.fsPath,
@@ -3781,6 +3993,7 @@ export async function nextStage(
   try {
     transitionResult = await advanceStageViaNextStageRowV1(
       resolved.folderUri,
+      resolved.progress,
       resolved.progress.status,
       resolved.progress.currentStage,
       next,
@@ -3966,9 +4179,32 @@ export async function nextStage(
     const reviewCommand = getCompleteAndMoveOnTriggersAIMode() === "auto-fast-forward"
       ? "vs-code-ai-helper.fastForwardReviewWithAI"
       : "vs-code-ai-helper.runReviewWithAI";
+    // §7.5 (AC-HOST-03): this dispatch already knows the freshly persisted
+    // destination stage (`next`, === `transitionResult.newStage`) — it was
+    // JUST written by advanceStageViaNextStageRowV1 above, in this same
+    // call. Passing it through as `task.progress.currentStage` (instead of
+    // a bare `taskFolderPath`) lets fastForwardReviewWithAI's zero-I/O
+    // routing pre-check (fastForwardTargetsImplReviewV1) decide — and, when
+    // the target is an implementation review, enforce the host/provider
+    // edit-availability gate — BEFORE its own resolveTask call re-reads
+    // task-progress.json, instead of only after. `next` can genuinely be an
+    // implementation-review stage here (AUTO_REVIEW_TRANSITIONS maps
+    // "impl" -> "impl-high-review" and "impl-high-review" ->
+    // "impl-low-review"), unlike the trigger-AI "publish" dispatch above
+    // (REVIEW_TARGETS["publish"] is never in IMPL_REVIEW_STAGES, so that one
+    // never needs the gate at all). The rest of `resolved.progress` is
+    // stale-but-unused: resolveTask never trusts a caller-supplied
+    // `task.progress` for anything but this routing hint — it always
+    // re-reads the authoritative document itself.
     await scheduleAutomationChain({
       command: reviewCommand,
-      arg: { taskFolderPath: resolved.folderUri.fsPath },
+      arg: {
+        task: {
+          folderUri: resolved.folderUri,
+          folderName: resolved.progress.taskFolder,
+          progress: { ...resolved.progress, currentStage: next },
+        },
+      },
       taskKey: resolved.folderUri.fsPath,
       chainId: "auto-review",
     });
@@ -4633,6 +4869,7 @@ async function executeImplementationRun(
         if (freshProgress?.currentStage === "impl" && freshProgress.status !== "paused") {
           const transition = await advanceStageViaNextStageRowV1(
             folderUri,
+            freshProgress,
             freshProgress.status,
             "impl",
             "impl-high-review",
@@ -4720,6 +4957,16 @@ export async function runImplementationWithAI(
   const hostGate = checkEditActionHostGateV1();
   if (!hostGate.ok) {
     NotificationRouter.showWarning(hostGate.reason);
+    return;
+  }
+  // §7.5's task/model-INDEPENDENT provider-path check: still before any
+  // task/source read (Implementation always resolves against the impl
+  // stage's model — see checkEditActionProviderPathGateV1's header). The
+  // exact per-task/stage capability (workspace root included) is revalidated
+  // by checkEditActionAvailabilityV1 below, once resolveTask makes it known.
+  const providerPathGate = checkEditActionProviderPathGateV1("impl");
+  if (!providerPathGate.ok) {
+    NotificationRouter.showWarning(providerPathGate.reason);
     return;
   }
   // ── Workspace guard ───────────────────────────────────────────────────────
@@ -4953,6 +5200,16 @@ export async function applyReviewEditWithAI(
     NotificationRouter.showWarning(hostGate.reason);
     return;
   }
+  // §7.5's task/model-INDEPENDENT provider-path check: still before any
+  // task/source read (the edit branch always resolves against the impl
+  // stage's model — see checkEditActionProviderPathGateV1's header). The
+  // exact per-task/stage capability (workspace root included) is revalidated
+  // by checkEditActionAvailabilityV1 below, once resolveTask makes it known.
+  const providerPathGate = checkEditActionProviderPathGateV1("impl");
+  if (!providerPathGate.ok) {
+    NotificationRouter.showWarning(providerPathGate.reason);
+    return;
+  }
 
   if (isMalformedReviewArg(arg as ReviewCommandArg | Record<string, unknown>)) {
     NotificationRouter.showError(
@@ -4991,8 +5248,27 @@ export async function applyReviewEditWithAI(
     return;
   }
 
-  const lockKey = resolved.folderUri.fsPath;
+  // ── §7.5 full availability gate, BEFORE any review/plan artifact read ────
+  // Mirrors runImplementationWithAI's placement: the remaining (task/model-
+  // dependent) half of the gate runs as soon as the owning workspace and
+  // stage model are knowable, ahead of the review-content read below and
+  // everything applyImplementationReviewWithAI reads/materializes. The
+  // resolved model is threaded through to applyImplementationReviewWithAI so
+  // the model this gate checked is exactly the model the run uses.
   const stage = resolved.progress.currentStage;
+  const model = options.preserveActiveFallback
+    ? await resolveModelForStage(resolved.folderUri, "impl")
+    : await resolveFreshModelForStage(resolved.folderUri, "impl");
+  const editAvailability = checkEditActionAvailabilityV1({
+    workspaceFsPath: workspaceRoot.uri.fsPath,
+    stageModelId: model.modelId,
+  });
+  if (!editAvailability.ok) {
+    NotificationRouter.showWarning(editAvailability.reason);
+    return;
+  }
+
+  const lockKey = resolved.folderUri.fsPath;
   const runApply = async (op: TaskOperationHandle): Promise<void> => {
     const reviewUri = artifactUri(resolved.folderUri, stage);
     const reviewContent = reviewUri && (await readNonEmptyText(reviewUri));
@@ -5028,10 +5304,17 @@ export async function applyReviewEditWithAI(
           workspaceRoot,
           stage,
           reviewContent,
+          model,
           {
             skipPreRunSafetyCheck: options.skipImplementationSafetyCheck,
             preserveActiveFallback: options.preserveActiveFallback,
             parentOperation: child,
+            // Without this, executeImplementationRun's onQuestions callback
+            // sees an undefined provider and silently skips askInteraction,
+            // leaving a posted preflight question with no task-local Chat
+            // mirror (plan §7.5/AC-PREFLIGHT-04) — see this file's
+            // ExecuteImplementationRunOptions.chatViewProvider doc comment.
+            chatViewProvider: options.chatViewProvider,
           }
         )
     );

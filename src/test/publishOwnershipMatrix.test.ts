@@ -42,6 +42,7 @@ import type { AutomationDispatch } from "../utils/automationChain";
 import { scheduleAutomationChain, resetAutomationChainGuards } from "../utils/automationChain";
 import { StatusTreeProvider } from "../views/statusView";
 import { createChatInteractionTransactionStoreV1 } from "../services/chatInteractionTransactionStoreV1";
+import { fixtureOwnershipFor } from "./taskFolderFixture";
 import {
   configureWorkflowPrivateStorageRootV1,
   getWorkflowFileStoreV1,
@@ -360,6 +361,7 @@ function makeInventoryStub(
       implReviewFiles,
       createdAt: "2026-01-01T00:00:00.000Z",
       updatedAt: "2026-01-01T00:00:00.000Z",
+      ownership: fixtureOwnershipFor(taskFolderPath),
     },
   };
   // @ts-expect-error — direct field init on stub

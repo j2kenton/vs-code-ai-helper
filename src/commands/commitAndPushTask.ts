@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import * as path from "path";
 import { TaskInventory } from "../state/taskInventory";
-import { resolveTaskContext } from "../utils/resolveTaskContext";
+import { resolveTaskContext, ResolvedTaskContext } from "../utils/resolveTaskContext";
 import { TASK_FILENAME, STAGE_DISPLAY_NAMES, TaskProgress } from "../types/taskProgress";
 import { resolveImplementationArtifact } from "../utils/implementationArtifactResolver";
 import { getLowLevelPlanUri } from "../utils/lowLevelPlanArtifactResolver";
@@ -32,7 +32,7 @@ import {
   getWorkflowFileStoreV1,
 } from "../services/workflowRuntimeServicesV1";
 import { readChatDocumentIdentityV1 } from "../utils/chatHistoryStore";
-import { allocateHex128IdV1 } from "../types/actionCorrelationV1";
+import { ActionCorrelationV1, allocateHex128IdV1, InteractionIdV1, OperationIdV1 } from "../types/actionCorrelationV1";
 import {
   createProductionTaskActionCoordinatorV1,
   getProductionActionConversationOrchestratorV1,
@@ -44,6 +44,8 @@ import {
 } from "../actions/rows/commitPushMetadataRowV1";
 import { NEXT_STAGE_ACTION_KEY_V1 } from "../actions/rows/nextStageRowV1";
 import { MARK_TASK_DONE_ACTION_KEY_V1 } from "../actions/rows/markTaskDoneRowV1";
+import { COMMIT_PUSH_ACTION_KEY_V1, CommitPushServicesV1 } from "../actions/rows/commitPushRowV1";
+import { deriveTaskBindingV1 } from "../types/taskBindingV1";
 import { ChatInteractionRefV1, ChatInteractionResumeResultV1, ChatViewProvider } from "../views/chatView";
 
 /**
@@ -68,7 +70,7 @@ interface CommitPushMetadataResumeRequestV1 {
  * - Tree-view task node passes { task: IncompleteTask }
  * - Resolver-aware callers pass { canonicalId?, taskFolderPath? }
  */
-type CommitAndPushTaskArg =
+export type CommitAndPushTaskArg =
   | { task?: IncompleteTask; resumeInteraction?: CommitPushMetadataResumeRequestV1 }
   | { canonicalId?: string; taskFolderPath?: string; resumeInteraction?: CommitPushMetadataResumeRequestV1 };
 
@@ -179,7 +181,21 @@ function isFileInFolder(filePath: string, folderPath: string): boolean {
  * confirmation. Nothing is staged, committed, or pushed until the user picks
  * "Commit & Push" here — cancelling (or dismissing the dialog) leaves the
  * working tree and index exactly as they were.
+ *
+ * Returns a discriminated result rather than a bare `string | undefined` so
+ * the caller can settle `commitAndPushTaskCore`'s result correctly: metadata
+ * generation returning structured questions is not the same event as the
+ * user explicitly dismissing the confirmation modal, even though both used
+ * to collapse into the same `undefined` — the former needs a `questions`
+ * outcome carrying the real question's correlation/interactionId (routed to
+ * Chat With AI, resumable), the latter a plain `cancelled` outcome (nothing
+ * to resume, the user just said no).
  */
+type CommitMessageReviewResultV1 =
+  | { kind: "confirmed"; message: string }
+  | { kind: "questionsPosted"; interactionId: InteractionIdV1; correlation: ActionCorrelationV1 }
+  | { kind: "declined" };
+
 async function reviewCommitMessage(
   repoRoot: string,
   taskFolderUri: vscode.Uri,
@@ -191,8 +207,10 @@ async function reviewCommitMessage(
   cancellationToken: vscode.CancellationToken,
   taskStatus: string | undefined,
   chatViewProvider?: ChatViewProvider,
-  resumeInteraction?: CommitPushMetadataResumeRequestV1
-): Promise<string | undefined> {
+  resumeInteraction?: CommitPushMetadataResumeRequestV1,
+  /** See `commitAndPushTaskCore`'s `coordinatorOperationId` param — passed straight through. */
+  coordinatorOperationId?: OperationIdV1
+): Promise<CommitMessageReviewResultV1> {
   const MAX_PREVIEW_FILES = 15;
   const previewFiles = scopedFiles.slice(0, MAX_PREVIEW_FILES);
   const remaining = scopedFiles.length - previewFiles.length;
@@ -219,7 +237,7 @@ async function reviewCommitMessage(
   // idempotency ID is single-use, so a later "Regenerate" click (if the
   // resume itself completed) falls back to ordinary fresh generation.
   let resumeAttempted = false;
-  const generate = async (): Promise<string | undefined> => {
+  const generate = async (): Promise<CommitMessageResultV1> => {
     let result: CommitMessageResultV1;
     if (resumeInteraction && !resumeAttempted) {
       resumeAttempted = true;
@@ -230,25 +248,35 @@ async function reviewCommitMessage(
         cancellationToken,
         taskStatus,
         chatViewProvider,
-        resumeInteraction
+        resumeInteraction,
+        coordinatorOperationId
       );
     } else {
-      result = await buildCommitMessage(repoRoot, taskFolderUri, workspaceUri, taskName, scopedFiles, cancellationToken, chatViewProvider);
+      result = await buildCommitMessage(
+        repoRoot,
+        taskFolderUri,
+        workspaceUri,
+        taskName,
+        scopedFiles,
+        cancellationToken,
+        chatViewProvider,
+        coordinatorOperationId
+      );
     }
     if (result.kind === "questionsPosted") {
       NotificationRouter.showWarning(
         "Commit and Push needs more information before it can generate a commit message. " +
           "Answer the question in Chat With AI, then start Commit and Push again."
       );
-      return undefined;
     }
-    return result.text;
+    return result;
   };
 
-  let message = await generate();
-  if (message === undefined) {
-    return undefined;
+  const generated = await generate();
+  if (generated.kind === "questionsPosted") {
+    return { kind: "questionsPosted", interactionId: generated.interactionId, correlation: generated.correlation };
   }
+  let message = generated.text;
   for (;;) {
     const confirmText =
       `Commit message:\n\n${message}\n\n` +
@@ -262,16 +290,16 @@ async function reviewCommitMessage(
     );
     if (choice === "Regenerate") {
       const regenerated = await generate();
-      if (regenerated === undefined) {
-        return undefined;
+      if (regenerated.kind === "questionsPosted") {
+        return { kind: "questionsPosted", interactionId: regenerated.interactionId, correlation: regenerated.correlation };
       }
-      message = regenerated;
+      message = regenerated.text;
       continue;
     }
     if (choice === "Commit & Push") {
-      return message;
+      return { kind: "confirmed", message };
     }
-    return undefined;
+    return { kind: "declined" };
   }
 }
 
@@ -289,7 +317,7 @@ async function reviewCommitMessage(
  */
 type CommitMessageResultV1 =
   | { kind: "message"; text: string }
-  | { kind: "questionsPosted" };
+  | { kind: "questionsPosted"; interactionId: InteractionIdV1; correlation: ActionCorrelationV1 };
 
 async function buildCommitMessage(
   repoRoot: string,
@@ -298,7 +326,9 @@ async function buildCommitMessage(
   taskName: string,
   files: string[],
   cancellationToken: vscode.CancellationToken,
-  chatViewProvider?: ChatViewProvider
+  chatViewProvider?: ChatViewProvider,
+  /** See `commitAndPushTaskCore`'s `coordinatorOperationId` param — passed straight through. */
+  coordinatorOperationId?: OperationIdV1
 ): Promise<CommitMessageResultV1> {
   const fallback = `chore: complete ${taskName} changes for publish`.slice(0, 72);
 
@@ -351,6 +381,10 @@ async function buildCommitMessage(
       taskStage: "publish",
       rawInput: validatedInput,
       cancellationToken,
+      // Opens a CHILD lease on this same task binding instead of
+      // self-deadlocking against commitPush.v1's own held lease (see
+      // commitPushRowV1.ts and TaskActionRequestV1.parentOperationId).
+      parentOperationId: coordinatorOperationId,
     });
 
     if (outcome.kind === "completed") {
@@ -401,7 +435,7 @@ async function buildCommitMessage(
           },
         });
       }
-      return { kind: "questionsPosted" };
+      return { kind: "questionsPosted", interactionId: outcome.interactionId, correlation: outcome.correlation };
     }
   } catch {
     // Any failure resolving/parsing the coordinator result falls back to the deterministic subject below.
@@ -425,7 +459,9 @@ async function resumeCommitMessage(
   cancellationToken: vscode.CancellationToken,
   taskStatus: string | undefined,
   chatViewProvider: ChatViewProvider | undefined,
-  resumeInteraction: CommitPushMetadataResumeRequestV1
+  resumeInteraction: CommitPushMetadataResumeRequestV1,
+  /** See `commitAndPushTaskCore`'s `coordinatorOperationId` param — passed straight through. */
+  coordinatorOperationId?: OperationIdV1
 ): Promise<CommitMessageResultV1> {
   const fallback = `chore: complete ${taskName} changes for publish`.slice(0, 72);
   const { ref, resumeIdempotencyId, onSettled } = resumeInteraction;
@@ -457,6 +493,11 @@ async function resumeCommitMessage(
     taskStage: "publish",
     resumeIdempotencyId,
     cancellationToken,
+    // Same nested-lease reasoning as buildCommitMessage's executeAction call:
+    // this fresh commitPush.v1 invocation's own operationId, so this nested
+    // commitPushMetadata.v1 Resume opens a CHILD lease instead of
+    // self-deadlocking against the lease this row's own execute holds.
+    parentOperationId: coordinatorOperationId,
   });
 
   if (outcome.kind === "questions" && chatViewProvider) {
@@ -491,12 +532,14 @@ async function resumeCommitMessage(
 
   if (settlement === undefined) {
     onSettled({ ok: false, reason: "Resume failed to settle the interaction" });
-    return outcome.kind === "questions" ? { kind: "questionsPosted" } : { kind: "message", text: fallback };
+    return outcome.kind === "questions"
+      ? { kind: "questionsPosted", interactionId: outcome.interactionId, correlation: outcome.correlation }
+      : { kind: "message", text: fallback };
   }
   onSettled({ ok: true, settlement });
 
   if (outcome.kind === "questions") {
-    return { kind: "questionsPosted" };
+    return { kind: "questionsPosted", interactionId: outcome.interactionId, correlation: outcome.correlation };
   }
 
   if (outcome.kind === "completed" && after.kind === "ok") {
@@ -1303,25 +1346,83 @@ function rejectDuplicateCommitPush(): CommitPushDuplicateRejectedV1 {
  *
  * See DISCLAIMER.md §4 for the full risk disclosure.
  */
-async function commitAndPushTaskCore(
+/**
+ * The specific stopping point behind a `{ kind: "notCompleted" }` result
+ * (plan §3.8's "the coordinator owns ... detailed outcomes"). Every
+ * non-success exit from `commitAndPushTaskCore` sets one of these — instead
+ * of leaving `commitPush.v1` (`commitPushRowV1.ts`) unable to distinguish
+ * "the user declined a prompt" from "git rejected the push" beyond a single
+ * generic `commitPush.notCompleted` code. The user-facing explanation is
+ * still shown via `NotificationRouter` at the exact point that set the
+ * reason, unchanged from before this signal existed — this is a machine-
+ * readable classification of that same moment, not a new message.
+ */
+export type CommitAndPushNotCompletedReasonV1 =
+  | "ineligibleStage"
+  | "noGitRepository"
+  | "gitIndexReadFailed"
+  | "privateContentStaged"
+  | "gitNotReady"
+  | "checksDeclined"
+  | "fixWithAiUnavailable"
+  | "taskFolderChangesDeclined"
+  | "runArtifactsDeclined"
+  | "viewedFullFileList"
+  | "userCancelled"
+  | "saveFailed"
+  | "commitMessageCancelled"
+  | "gitCommitFailed"
+  | "pushFailed"
+  | "unexpectedError";
+
+/**
+ * `commitPush.v1`'s completion signal — set to `{ kind: "completed" }` or
+ * `{ kind: "noChanges" }` ONLY at the two genuinely-terminal-success points
+ * below ("nothing to commit" and "push succeeded"); every other exit from
+ * this function sets `{ kind: "notCompleted", reason }` with the specific
+ * `CommitAndPushNotCompletedReasonV1` for that exit, rather than a single
+ * undifferentiated failure signal.
+ */
+export type CommitAndPushCoreResultV1 =
+  | { readonly kind: "completed" }
+  | { readonly kind: "noChanges" }
+  | { readonly kind: "notCompleted"; readonly reason: CommitAndPushNotCompletedReasonV1 }
+  | {
+      /**
+       * The commit-message step returned structured questions instead of a
+       * message to review (fresh generation or Resume) — distinct from
+       * `notCompleted`'s `"commitMessageCancelled"` reason, which is the
+       * user explicitly dismissing the confirmation modal. Carries the real
+       * metadata attempt's correlation/interactionId (not this Commit/Push
+       * attempt's own) so `commitPushRowV1.ts` can map it straight to the
+       * standard `{ kind: "questions" }` coordinator outcome — the question
+       * already reached Chat With AI before this result was set.
+       */
+      readonly kind: "questionsPosted";
+      readonly interactionId: InteractionIdV1;
+      readonly correlation: ActionCorrelationV1;
+    };
+
+/**
+ * Shared task resolution for the Commit/Push flow (resolution order matches
+ * `resolveTaskContext`'s own contract: explicit task arg, then the
+ * persisted current-task canonical ID). Factored out so `commitPush.v1`
+ * (`commitPushRowV1.ts`) can resolve the SAME task the SAME way — with
+ * identical not-found messaging — before invoking the coordinator, without
+ * that pre-check and `commitAndPushTaskCore`'s own resolution ever drifting
+ * apart. Shows the appropriate not-found message itself and returns
+ * `undefined` on failure; malformed explicit args are hard failures (no
+ * redirect to an unrelated task).
+ */
+async function resolveCommitPushTargetTaskV1(
   inventory: TaskInventory,
   explicitArg?: CommitAndPushTaskArg,
-  currentTaskStore?: CurrentTaskStore,
-  parentOperation?: TaskOperationHandle,
-  extensionContext?: vscode.ExtensionContext,
-  chatViewProvider?: ChatViewProvider
-): Promise<void> {
+  currentTaskStore?: CurrentTaskStore
+): Promise<ResolvedTaskContext | undefined> {
   const resolverArg = normalizeArg(explicitArg);
-  const resumeInteraction = extractResumeInteraction(explicitArg);
-
-  // Resolution order (matches resolveTaskContext contract):
-  //   1. explicit task arg (tree node, canonical ID, folder path) — highest precedence
-  //   2. persisted current-task canonical ID from CurrentTaskStore
-  // Malformed explicit args are hard failures (no redirect to unrelated tasks).
   const resolvedTask = await resolveTaskContext(inventory, resolverArg, {
     allowPaused: true,
   }, currentTaskStore);
-
   if (!resolvedTask) {
     // If an explicit arg was supplied but resolution failed, the task is gone;
     // a clear error was already shown by resolveTaskContext. If no arg and no
@@ -1337,8 +1438,119 @@ async function commitAndPushTaskCore(
           "or invoke this command from that task's completed row."
       );
     }
-    return;
+    return undefined;
   }
+  return resolvedTask;
+}
+
+/**
+ * §10.2 step 1 / §2.4 rule 4, factored out as its own coordinator-native
+ * step (plan §3.8: "The coordinator owns ... sequencing"). Index/privacy
+ * checks run FIRST — before git readiness, lint, staging, and every prompt.
+ * Content someone already put in the INDEX is refused outright (block, no
+ * index mutation): unlike the staging proposals this command builds itself
+ * (where control paths are merely omitted — see getChangedFiles), staged
+ * private content would be published verbatim by the eventual commit, and
+ * no later filter of OUR proposal list can un-stage it.
+ *
+ * `commitPushRowV1.ts`'s `executeCommitPushV1` calls this SAME function
+ * itself, before ever invoking `commitAndPushTaskCore` below — a genuine,
+ * distinct, coordinator-owned first step with its own outcome, rather than
+ * the whole flow being one opaque call into the core. `commitAndPushTaskCore`
+ * also calls this exact function again, under its own per-task lock,
+ * immediately before it actually needs the result — the coordinator's copy
+ * is a fast, lock-free pre-check for real sequencing and fast rejection
+ * (skipping the core's tracked-operation UI row entirely for a
+ * privacy-blocked attempt), not a replacement for the lock-protected,
+ * authoritative recheck that actually gates the git work (§7.7's
+ * "revalidate immediately before mutation" philosophy, applied here).
+ *
+ * @internal exported for the commitPush.v1 row and for testing
+ */
+export async function checkCommitPushIndexPrivacyV1(
+  resolvedTask: ResolvedTaskContext
+): Promise<
+  | { readonly ok: true; readonly repoRoot: string }
+  | {
+      readonly ok: false;
+      readonly reason: "noGitRepository" | "gitIndexReadFailed" | "privateContentStaged";
+    }
+> {
+  const repoRoot = await resolveGitRepo(resolvedTask.taskFolderPath);
+  if (!repoRoot) {
+    NotificationRouter.showError(
+      "Commit and push failed: Could not find git repository. Make sure the task is inside a git repository."
+    );
+    return { ok: false, reason: "noGitRepository" };
+  }
+  let stagedIndexRecords: PorcelainV2Entry[];
+  try {
+    stagedIndexRecords = await collectStagedIndexRecordsV1(repoRoot);
+  } catch (error) {
+    // Fail CLOSED: publishing without having verified the index would
+    // defeat the §2.4 gate entirely.
+    NotificationRouter.showError(
+      `Commit and push failed: could not read the git index (${getErrorMessage(error)}).`
+    );
+    return { ok: false, reason: "gitIndexReadFailed" };
+  }
+  const forbiddenStaged = findForbiddenStagedRecordsV1(
+    stagedIndexRecords,
+    repoRoot,
+    resolvedTask.taskFolderPath
+  );
+  if (forbiddenStaged.length > 0) {
+    const channel = getCommitPreviewChannel();
+    channel.clear();
+    channel.appendLine("=== Ensemble: Commit and Push blocked — private/workflow-control content in the git index ===");
+    channel.appendLine("");
+    channel.appendLine("These staged entries are Ensemble-private or workflow-control paths and must never be committed:");
+    for (const record of forbiddenStaged) {
+      const rename = record.origPath !== undefined ? `  (from ${renderPath(record.origPath)})` : "";
+      channel.appendLine(`  ${renderPath(record.path)}${rename}`);
+    }
+    channel.appendLine("");
+    channel.appendLine("Unstage them (git restore --staged <path>) and run Commit and Push again.");
+    channel.show(true);
+    NotificationRouter.showError(
+      `Commit and push blocked: ${forbiddenStaged.length} private/workflow-control file(s) are already staged in the git index. ` +
+        "See 'Ensemble: Commit Preview' for the list — unstage them and retry."
+    );
+    return { ok: false, reason: "privateContentStaged" };
+  }
+  return { ok: true, repoRoot };
+}
+
+export async function commitAndPushTaskCore(
+  inventory: TaskInventory,
+  resolvedTask: ResolvedTaskContext,
+  explicitArg?: CommitAndPushTaskArg,
+  parentOperation?: TaskOperationHandle,
+  extensionContext?: vscode.ExtensionContext,
+  chatViewProvider?: ChatViewProvider,
+  // The commitPush.v1 ROW's own coordinator operationId (commitPushRowV1.ts),
+  // NOT `parentOperation` above (that's the unrelated tracked-operation UI
+  // nesting handle). Threaded down to reviewCommitMessage's nested
+  // commitPushMetadata.v1 invocation so it opens a CHILD lease on this same
+  // task binding instead of self-deadlocking against this row's own held
+  // lease. Undefined only for a hypothetical caller outside the commitPush.v1
+  // row (none exists in production today), in which case the nested call
+  // falls back to a plain top-level acquire — unchanged prior behavior.
+  coordinatorOperationId?: OperationIdV1
+): Promise<CommitAndPushCoreResultV1> {
+  let coreResult: CommitAndPushCoreResultV1 = { kind: "notCompleted", reason: "unexpectedError" };
+  const resumeInteraction = extractResumeInteraction(explicitArg);
+
+  // `resolvedTask` is a SEALED value: the caller (the commitPush.v1 row,
+  // via invokeCommitPushRowV1) already resolved and bound this exact task
+  // to the coordinator's correlation/eligibility check before invoking this
+  // core. Re-resolving here from `explicitArg`/current-task state — as this
+  // function used to do — could pick a DIFFERENT task than the one just
+  // bound (e.g. a no-argument invocation racing a concurrent
+  // currentTaskStore update), letting the acted-on task diverge from its
+  // own correlation. Never re-derive the target task from mutable state
+  // inside the core; resolve it exactly once, at the boundary, and thread
+  // that same object through.
 
   // Per-task exclusive lock (contract C1). The process-global duplicate-
   // invocation guard for Commit and Push itself already ran in the public
@@ -1376,58 +1588,23 @@ async function commitAndPushTaskCore(
       NotificationRouter.showWarning(
         `Task is at stage "${STAGE_DISPLAY_NAMES[resolvedTask.progress.currentStage]}" — must be completed before committing and pushing.`
       );
+      coreResult = { kind: "notCompleted", reason: "ineligibleStage" };
       return;
     }
 
     // §10.2 step 1 / §2.4 rule 4: index/privacy checks run FIRST — before
-    // git readiness, lint, and every prompt. Content someone already put in
-    // the INDEX is refused outright (block, no index mutation): unlike the
-    // staging proposals this command builds itself (where control paths are
-    // merely omitted — see getChangedFiles), staged private content would be
-    // published verbatim by the eventual commit, and no later filter of OUR
-    // proposal list can un-stage it.
-    const repoRoot = await resolveGitRepo(resolvedTask.taskFolderPath);
-    if (!repoRoot) {
-      NotificationRouter.showError(
-        "Commit and push failed: Could not find git repository. Make sure the task is inside a git repository."
-      );
+    // git readiness, lint, and every prompt. This is the SAME lock-free
+    // check commitPushRowV1's `executeCommitPushV1` already ran, as the
+    // coordinator-native first step, before ever calling into this core;
+    // repeating it here, under this function's per-task lock, is the
+    // authoritative revalidation immediately before the result is actually
+    // used (§7.7) — not redundant duplication of a decision already made.
+    const indexCheck = await checkCommitPushIndexPrivacyV1(resolvedTask);
+    if (!indexCheck.ok) {
+      coreResult = { kind: "notCompleted", reason: indexCheck.reason };
       return;
     }
-    let stagedIndexRecords: PorcelainV2Entry[];
-    try {
-      stagedIndexRecords = await collectStagedIndexRecordsV1(repoRoot);
-    } catch (error) {
-      // Fail CLOSED: publishing without having verified the index would
-      // defeat the §2.4 gate entirely.
-      NotificationRouter.showError(
-        `Commit and push failed: could not read the git index (${getErrorMessage(error)}).`
-      );
-      return;
-    }
-    const forbiddenStaged = findForbiddenStagedRecordsV1(
-      stagedIndexRecords,
-      repoRoot,
-      resolvedTask.taskFolderPath
-    );
-    if (forbiddenStaged.length > 0) {
-      const channel = getCommitPreviewChannel();
-      channel.clear();
-      channel.appendLine("=== Ensemble: Commit and Push blocked — private/workflow-control content in the git index ===");
-      channel.appendLine("");
-      channel.appendLine("These staged entries are Ensemble-private or workflow-control paths and must never be committed:");
-      for (const record of forbiddenStaged) {
-        const rename = record.origPath !== undefined ? `  (from ${renderPath(record.origPath)})` : "";
-        channel.appendLine(`  ${renderPath(record.path)}${rename}`);
-      }
-      channel.appendLine("");
-      channel.appendLine("Unstage them (git restore --staged <path>) and run Commit and Push again.");
-      channel.show(true);
-      NotificationRouter.showError(
-        `Commit and push blocked: ${forbiddenStaged.length} private/workflow-control file(s) are already staged in the git index. ` +
-          "See 'Ensemble: Commit Preview' for the list — unstage them and retry."
-      );
-      return;
-    }
+    const repoRoot = indexCheck.repoRoot;
     // Always run fresh checks immediately before a commit. Persisted payloads
     // are informational and may be stale after files were edited. Registered
     // as a child (C1 publish model) so the Publish stage row spins while the
@@ -1448,6 +1625,7 @@ async function commitAndPushTaskCore(
       NotificationRouter.showError(
         `Commit and push failed: ${gitReadinessCheck.reason}`
       );
+      coreResult = { kind: "notCompleted", reason: "gitNotReady" };
       return;
     }
     // Routed through the same checkPublishPreflight helper the automatic
@@ -1512,6 +1690,7 @@ async function commitAndPushTaskCore(
       }
       if (choice !== "Fix with AI") {
         NotificationRouter.showInformation("Commit and push cancelled.");
+        coreResult = { kind: "notCompleted", reason: "checksDeclined" };
         return;
       }
       if (!extensionContext) {
@@ -1521,6 +1700,7 @@ async function commitAndPushTaskCore(
         NotificationRouter.showWarning(
           'Fix with AI is unavailable here — run "Linting Fixes" from the task\'s Publish actions, then retry Commit and Push.'
         );
+        coreResult = { kind: "notCompleted", reason: "fixWithAiUnavailable" };
         return;
       }
       await runLintingFixes(
@@ -1585,6 +1765,7 @@ async function commitAndPushTaskCore(
               NotificationRouter.showInformation(
                 "Commit and push cancelled — handle the existing staged changes manually, then retry."
               );
+              coreResult = { kind: "notCompleted", reason: "userCancelled" };
               throw new vscode.CancellationError();
             }
           }
@@ -1607,6 +1788,7 @@ async function commitAndPushTaskCore(
             NotificationRouter.showInformation(
               "No changes to commit — the repository is clean."
             );
+            coreResult = { kind: "noChanges" };
             return;
           }
 
@@ -1619,6 +1801,7 @@ async function commitAndPushTaskCore(
           );
           if (choice !== "Include Task Folder Changes") {
             NotificationRouter.showInformation("Commit and push cancelled.");
+            coreResult = { kind: "notCompleted", reason: "taskFolderChangesDeclined" };
             return;
           }
           includeTaskFolder = true;
@@ -1659,6 +1842,7 @@ async function commitAndPushTaskCore(
               }));
             } else {
               NotificationRouter.showInformation("Commit and push cancelled.");
+              coreResult = { kind: "notCompleted", reason: "runArtifactsDeclined" };
               return;
             }
           }
@@ -1808,6 +1992,7 @@ async function commitAndPushTaskCore(
           NotificationRouter.showInformation(
             "Full file list shown in 'Ensemble: Commit Preview'. Re-run the command to proceed."
           );
+          coreResult = { kind: "notCompleted", reason: "viewedFullFileList" };
           // End the tracked operation as cancelled, not succeeded — nothing
           // was committed or pushed, so a "completed" terminal entry here
           // would falsely report success. Swallowed at the outer call.
@@ -1818,6 +2003,7 @@ async function commitAndPushTaskCore(
           NotificationRouter.showInformation(
             "Commit and push cancelled."
           );
+          coreResult = { kind: "notCompleted", reason: "userCancelled" };
           return;
         }
 
@@ -1829,6 +2015,7 @@ async function commitAndPushTaskCore(
           includeTaskFolder
         );
         if (!saved) {
+          coreResult = { kind: "notCompleted", reason: "saveFailed" };
           return;
         }
 
@@ -1875,7 +2062,7 @@ async function commitAndPushTaskCore(
           resolvedTask.folderName,
           resolvedTask.progress
         );
-        const confirmedMessage = await reviewCommitMessage(
+        const reviewResult = await reviewCommitMessage(
           repoRoot,
           vscode.Uri.file(resolvedTask.taskFolderPath),
           commitTaskTitle,
@@ -1886,12 +2073,29 @@ async function commitAndPushTaskCore(
           op.token!,
           resolvedTask.progress.status,
           chatViewProvider,
-          resumeInteraction
+          resumeInteraction,
+          coordinatorOperationId
         );
-        if (!confirmedMessage) {
-          NotificationRouter.showInformation("Commit and push cancelled.");
+        if (reviewResult.kind === "questionsPosted") {
+          // No "cancelled" notification here — buildCommitMessage/
+          // resumeCommitMessage already warned the user and routed the
+          // question to Chat With AI. This is a genuine `questions` outcome,
+          // not a decline: carry the metadata attempt's own
+          // correlation/interactionId so commitPushRowV1.ts can map it to
+          // the standard coordinator `questions` outcome.
+          coreResult = {
+            kind: "questionsPosted",
+            interactionId: reviewResult.interactionId,
+            correlation: reviewResult.correlation,
+          };
           return;
         }
+        if (reviewResult.kind === "declined") {
+          NotificationRouter.showInformation("Commit and push cancelled.");
+          coreResult = { kind: "notCompleted", reason: "commitMessageCancelled" };
+          return;
+        }
+        const confirmedMessage = reviewResult.message;
 
         progress.report({ message: "Staging changes..." });
         try {
@@ -1927,6 +2131,7 @@ async function commitAndPushTaskCore(
           NotificationRouter.showError(
             `Commit failed: ${getErrorMessage(error)}`
           );
+          coreResult = { kind: "notCompleted", reason: "gitCommitFailed" };
           return;
         }
 
@@ -1944,6 +2149,7 @@ async function commitAndPushTaskCore(
           NotificationRouter.showInformation(
             `Successfully committed and pushed ${resolvedTask.folderName} to ${pushDestination}`
           );
+          coreResult = { kind: "completed" };
         } catch (error) {
           // Push failed after commit was created — keep the local commit.
           // Do NOT automatically roll back: this mutates the user's git
@@ -1954,6 +2160,7 @@ async function commitAndPushTaskCore(
               `To undo the commit manually: git reset --mixed HEAD~1\n\n` +
               `Error: ${getErrorMessage(error)}`
           );
+          coreResult = { kind: "notCompleted", reason: "pushFailed" };
         }
       } catch (error: unknown) {
         if (error instanceof vscode.CancellationError) {
@@ -1964,6 +2171,7 @@ async function commitAndPushTaskCore(
         NotificationRouter.showError(
           `Commit and push failed: ${getErrorMessage(error)}`
         );
+        coreResult = { kind: "notCompleted", reason: "unexpectedError" };
       }
     }
   );
@@ -1974,6 +2182,92 @@ async function commitAndPushTaskCore(
       throw error;
     }
   }
+  return coreResult;
+}
+
+/**
+ * Invoke the `commitPush.v1` registry row (plan §3.8/§10.1/§10.2) for an
+ * ALREADY-RESOLVED task — used by every call site below, so eligibility and
+ * settlement logging run through the coordinator exactly once per
+ * invocation, regardless of which public entry point (or internal composite
+ * step) is driving it. The row's `execute` passes THIS exact `resolvedTask`
+ * straight into `commitAndPushTaskCore` (never re-resolving one), so the
+ * task the coordinator bound its correlation/eligibility check to is
+ * guaranteed to be the task actually acted on. Every outcome except a
+ * pre-`execute` rejection (ineligible stage/status, or duplicate lease) has
+ * already had its specific reason shown to the user via `NotificationRouter`
+ * from inside the core itself, so this helper only surfaces a message for
+ * the pre-`execute` cases nothing has said anything about yet.
+ */
+/** @internal exported for testing */
+export async function invokeCommitPushRowV1(
+  resolvedTask: ResolvedTaskContext,
+  services: Omit<CommitPushServicesV1, "resolvedTask">
+): Promise<void> {
+  const derivedBinding = deriveTaskBindingV1(resolvedTask.progress);
+  if (!derivedBinding.ok) {
+    NotificationRouter.showError(
+      `Commit and push failed: this task's ownership binding could not be verified. ` +
+        `The task's progress file needs recovery.`
+    );
+    return;
+  }
+  const outcome = await invokeLifecycleRowV1({
+    actionKey: COMMIT_PUSH_ACTION_KEY_V1,
+    taskFolderPath: resolvedTask.taskFolderPath,
+    taskBindingId: derivedBinding.binding.bindingId,
+    chatDocumentIdentitySeed: resolvedTask.canonicalId,
+    workspaceCwd: resolvedTask.workspaceFolder?.fsPath ?? path.dirname(resolvedTask.taskFolderPath),
+    taskStatus: resolvedTask.progress.status ?? "active",
+    taskStage: resolvedTask.progress.currentStage,
+    rawInput: { taskFolderPath: resolvedTask.taskFolderPath },
+    // The row's `execute` (commitPushRowV1.ts) must act on this EXACT
+    // resolved/bound task, never re-resolve one from mutable current-task
+    // state — see commitAndPushTaskCore's header comment.
+    services: { ...services, resolvedTask },
+  });
+  if (outcome.kind === "completed") {
+    return;
+  }
+  if (outcome.kind === "questions") {
+    // Not a failure: commit-message generation returned structured
+    // questions. The question already reached Chat With AI and the
+    // "answer in Chat With AI, then start Commit and Push again" warning
+    // was already shown from inside reviewCommitMessage/buildCommitMessage
+    // (commitAndPushTask.ts's `generate` helper) at the exact point this
+    // outcome was produced — nothing more to show here, and definitely not
+    // the generic "could not start" error below.
+    return;
+  }
+  if (outcome.kind === "cancelled" && outcome.code === "userCancelled") {
+    // commitAndPushTaskCore already showed "Commit and push cancelled." via
+    // NotificationRouter at the exact point that produced this outcome
+    // (commitPushRowV1.ts's `userCancelled` mapping) — nothing more to show.
+    return;
+  }
+  if (outcome.kind === "failed" && outcome.code.startsWith("commitPush.") && outcome.code !== "commitPush.servicesUnavailable") {
+    // commitAndPushTaskCore already showed the specific reason for every
+    // `commitPush.<CommitAndPushNotCompletedReasonV1>` code (see that type's
+    // header) — this just recognizes the whole family instead of one
+    // now-retired exact string, so a caller doesn't ALSO get the generic
+    // "could not start" message below on top of the real one.
+    return;
+  }
+  if (outcome.kind === "failed" && outcome.code === "actionNotEligibleForStage") {
+    // The row's real, coordinator-owned stage eligibility (commitPushRowV1.ts)
+    // rejected this before commitAndPushTaskCore ever ran — same user-facing
+    // message core used to show internally after its own now-redundant (but
+    // still present, defense-in-depth) stage check.
+    NotificationRouter.showWarning(
+      `Task is at stage "${STAGE_DISPLAY_NAMES[resolvedTask.progress.currentStage]}" — must be completed before committing and pushing.`
+    );
+    return;
+  }
+  // A pre-execute rejection (ineligible task status, or another coordinator
+  // action already holding this task's lease) — nothing has told the user
+  // anything yet.
+  const detail = outcome.kind === "failed" ? outcome.code : outcome.kind;
+  NotificationRouter.showError(`Commit and push could not start: ${detail}.`);
 }
 
 /**
@@ -1982,7 +2276,8 @@ async function commitAndPushTaskCore(
  * Acquires the process-global Commit/Push token before anything else — a
  * duplicate invocation is rejected immediately, before argument
  * normalization, task resolution, lint, prompts, staging, commit, or push
- * setup. See `commitAndPushTaskCore` above for the actual behavior.
+ * setup. See `commitAndPushTaskCore` above for the actual behavior; both
+ * public entries reach it through the `commitPush.v1` registry row.
  */
 export async function commitAndPushTask(
   inventory: TaskInventory,
@@ -2000,14 +2295,17 @@ export async function commitAndPushTask(
     // state); after that, block on the startup gate's classification pass
     // before the core's first task-state read (plan §1.4).
     await TaskCreationStartupReconcilerV1.waitUntilReady();
-    await commitAndPushTaskCore(
+    const resolvedTask = await resolveCommitPushTargetTaskV1(inventory, explicitArg, currentTaskStore);
+    if (!resolvedTask) {
+      return;
+    }
+    await invokeCommitPushRowV1(resolvedTask, {
       inventory,
       explicitArg,
-      currentTaskStore,
       parentOperation,
       extensionContext,
-      chatViewProvider
-    );
+      chatViewProvider,
+    });
   } finally {
     releaseCommitPushToken();
   }
@@ -2061,8 +2359,13 @@ export async function completeCommitAndPushTask(
     if (resolvedTask.progress.currentStage !== "impl-low-review") {
       if (resolvedTask.progress.currentStage === "publish") {
         // Already completed: borrow the token this callback already holds
-        // and run the core directly.
-        await commitAndPushTaskCore(inventory, explicitArg, currentTaskStore, undefined, extensionContext, chatViewProvider);
+        // and route through the commitPush.v1 row directly.
+        await invokeCommitPushRowV1(resolvedTask, {
+          inventory,
+          explicitArg,
+          extensionContext,
+          chatViewProvider,
+        });
         return;
       }
       NotificationRouter.showWarning(
@@ -2088,10 +2391,26 @@ export async function completeCommitAndPushTask(
       // completion step can never be blocked by lint/test state.
       const workspaceCwd =
         resolvedTask.workspaceFolder?.fsPath ?? path.dirname(resolvedTask.taskFolderPath);
+      // Plan §3.9: the task-binding identity is the digest derived from this
+      // task's persisted ownership + taskFolder, never the raw canonical
+      // folder path — the same derivation every provider row uses for the
+      // same task, so leases and audit records key on one identity per task
+      // regardless of which action touches it. Derived once and reused for
+      // both lifecycle calls below (ownership does not change across a stage
+      // transition).
+      const derivedBinding = deriveTaskBindingV1(resolvedTask.progress);
+      if (!derivedBinding.ok) {
+        NotificationRouter.showError(
+          `Could not complete ${resolvedTask.folderName}: its ownership binding could not be verified. ` +
+            `The task's progress file needs recovery.`
+        );
+        return;
+      }
+      const taskBindingId = derivedBinding.binding.bindingId;
       const stageOutcome = await invokeLifecycleRowV1({
         actionKey: NEXT_STAGE_ACTION_KEY_V1,
         taskFolderPath: resolvedTask.taskFolderPath,
-        taskBindingId: resolvedTask.canonicalId,
+        taskBindingId,
         chatDocumentIdentitySeed: resolvedTask.canonicalId,
         workspaceCwd,
         taskStatus: resolvedTask.progress.status ?? "active",
@@ -2121,7 +2440,7 @@ export async function completeCommitAndPushTask(
       const doneOutcome = await invokeLifecycleRowV1({
         actionKey: MARK_TASK_DONE_ACTION_KEY_V1,
         taskFolderPath: resolvedTask.taskFolderPath,
-        taskBindingId: resolvedTask.canonicalId,
+        taskBindingId,
         chatDocumentIdentitySeed: resolvedTask.canonicalId,
         workspaceCwd,
         // The nextStage row above just landed the task at active/publish —
@@ -2165,7 +2484,16 @@ export async function completeCommitAndPushTask(
         },
         canonicalId: resolvedTask.canonicalId,
       };
-      await commitAndPushTaskCore(inventory, { task: completedTask }, currentTaskStore, op, extensionContext, chatViewProvider);
+      await invokeCommitPushRowV1(
+        { ...resolvedTask, progress: completedTask.progress },
+        {
+          inventory,
+          explicitArg: { task: completedTask },
+          parentOperation: op,
+          extensionContext,
+          chatViewProvider,
+        }
+      );
       }
     );
   } finally {

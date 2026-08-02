@@ -22,6 +22,7 @@ import {
   initNotificationRouter,
 } from "../utils/notificationRouter";
 import { safeRemoveDir } from "./testFsUtils";
+import { fixtureOwnershipFor } from "./taskFolderFixture";
 
 // completionLint.ts is required (not `import`ed) so its exported function
 // reference can be monkey-patched for the duration of a test: TypeScript
@@ -55,13 +56,14 @@ function makeGitFixtureWithRemote(): string {
   return repoRoot;
 }
 
-function fixtureTaskProgress(): TaskProgress {
+function fixtureTaskProgress(taskFolderPath: string): TaskProgress {
   return {
     taskFolder: "task_1",
     currentStage: "publish",
     status: "active",
     createdAt: "2026-01-01T00:00:00.000Z",
     updatedAt: "2026-01-01T00:00:00.000Z",
+    ownership: fixtureOwnershipFor(taskFolderPath),
   };
 }
 
@@ -79,7 +81,7 @@ function installFakeInventory(taskFolderPath: string, canonicalId: string): Task
     canonicalId,
     sourceScopeKey: "test",
     workspaceFolder: undefined,
-    progress: fixtureTaskProgress(),
+    progress: fixtureTaskProgress(taskFolderPath),
   };
   return {
     getTaskById: (id: string) => (id === canonicalId ? task : undefined),

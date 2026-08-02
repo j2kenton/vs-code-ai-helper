@@ -65,37 +65,37 @@
       "callSites": [
         {
           "signal": "workspace.fs",
-          "span": "L1001-L1001",
+          "span": "L1044-L1044",
           "enclosingSymbol": "taskBytes"
         },
         {
           "signal": "workspace.fs",
-          "span": "L1080-L1080",
+          "span": "L1123-L1123",
           "enclosingSymbol": "taskBytes"
         },
         {
           "signal": "workspace.fs",
-          "span": "L1101-L1101",
+          "span": "L1144-L1144",
           "enclosingSymbol": "implBytes"
         },
         {
           "signal": "workspace.fs",
-          "span": "L1122-L1122",
+          "span": "L1165-L1165",
           "enclosingSymbol": "implBytes"
         },
         {
           "signal": "workspace.fs",
-          "span": "L1132-L1132",
+          "span": "L1175-L1175",
           "enclosingSymbol": "lowLevelBytes"
         },
         {
           "signal": "workspace.fs",
-          "span": "L1851-L1851",
+          "span": "L2038-L2038",
           "enclosingSymbol": "commitAndPushTaskCore"
         },
         {
           "signal": "workspace.fs",
-          "span": "L1855-L1855",
+          "span": "L2042-L2042",
           "enclosingSymbol": "commitAndPushTaskCore"
         }
       ],
@@ -221,72 +221,72 @@
       "callSites": [
         {
           "signal": "import:child_process",
-          "span": "L78-L78",
+          "span": "L81-L81",
           "enclosingSymbol": "(module)"
         },
         {
           "signal": "import:fs",
-          "span": "L79-L79",
+          "span": "L82-L82",
           "enclosingSymbol": "(module)"
         },
         {
           "signal": "workspace.fs",
-          "span": "L687-L687",
+          "span": "L690-L690",
           "enclosingSymbol": "entries"
         },
         {
           "signal": "workspace.fs",
-          "span": "L700-L700",
+          "span": "L703-L703",
           "enclosingSymbol": "legacyEntries"
         },
         {
           "signal": "workspace.fs",
-          "span": "L1163-L1163",
+          "span": "L1166-L1166",
           "enclosingSymbol": "newContent"
         },
         {
           "signal": "workspace.fs",
-          "span": "L1372-L1372",
+          "span": "L1375-L1375",
           "enclosingSymbol": "runAiToFile"
         },
         {
           "signal": "workspace.fs",
-          "span": "L1455-L1455",
+          "span": "L1458-L1458",
           "enclosingSymbol": "runAiToFile"
         },
         {
           "signal": "workspace.fs",
-          "span": "L1704-L1704",
+          "span": "L1707-L1707",
           "enclosingSymbol": "runSecondOpinionReview"
         },
         {
           "signal": "workspace.fs",
-          "span": "L1731-L1731",
+          "span": "L1734-L1734",
           "enclosingSymbol": "runSecondOpinionReview"
         },
         {
           "signal": "workspace.fs",
-          "span": "L2055-L2055",
+          "span": "L2062-L2062",
           "enclosingSymbol": "contentBytes"
         },
         {
           "signal": "workspace.fs",
-          "span": "L2519-L2519",
+          "span": "L2530-L2530",
           "enclosingSymbol": "runReviewForFolder"
         },
         {
           "signal": "workspace.fs",
-          "span": "L2536-L2536",
+          "span": "L2547-L2547",
           "enclosingSymbol": "runReviewForFolder"
         },
         {
           "signal": "workspace.fs",
-          "span": "L2924-L2924",
+          "span": "L2935-L2935",
           "enclosingSymbol": "runApply"
         },
         {
           "signal": "workspace.fs",
-          "span": "L5563-L5563",
+          "span": "L5846-L5846",
           "enclosingSymbol": "buildReviewResumeVariablesV1"
         }
       ],

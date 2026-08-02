@@ -12,6 +12,7 @@ import {
   invokeLifecycleRowV1,
 } from "../actions/productionTaskActionRuntimeV1";
 import { RESUME_TASK_ACTION_KEY_V1 } from "../actions/rows/resumeTaskRowV1";
+import { deriveTaskBindingV1 } from "../types/taskBindingV1";
 import * as path from "path";
 
 export { StaleReopenError };
@@ -83,10 +84,27 @@ export async function reopenCompletedTask(
   let rejection: ReopenCompletedTaskResult | undefined;
 
   const writeTarget = async (): Promise<boolean> => {
+    // Plan §3.9: the coordinator's task-binding identity is the digest
+    // derived from this task's persisted ownership + taskFolder, never the
+    // raw canonical folder path — the same derivation every provider row
+    // (generatePlan.v1, draft.v1, ...) uses for the same task, so leases and
+    // audit records key on one identity per task regardless of which action
+    // touches it. An underivable binding (missing/unresolved ownership) is a
+    // recovery condition, surfaced before invokeLifecycleRowV1 is even called.
+    const derivedBinding = deriveTaskBindingV1(task.progress);
+    if (!derivedBinding.ok) {
+      rejection = {
+        outcome: "failed",
+        message:
+          "Could not reopen the task — its ownership binding could not be verified. " +
+          "See the task's entry in the Tasks panel.",
+      };
+      return false;
+    }
     const outcome = await invokeLifecycleRowV1({
       actionKey: RESUME_TASK_ACTION_KEY_V1,
       taskFolderPath: task.taskFolderPath,
-      taskBindingId: task.canonicalId,
+      taskBindingId: derivedBinding.binding.bindingId,
       chatDocumentIdentitySeed: task.canonicalId,
       workspaceCwd: task.workspaceFolder?.fsPath ?? path.dirname(task.taskFolderPath),
       taskStatus: task.progress.status ?? "active",

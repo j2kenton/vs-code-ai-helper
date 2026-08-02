@@ -401,7 +401,15 @@ void describe("Complete & Move On auto-fast-forward chaining", () => {
         "direct review-stage completion must honor auto-fast-forward mode"
       );
       assert.equal(dispatched.chainId, "auto-review");
-      assert.equal((dispatched.arg as ChainedArg).taskFolderPath, folderPath);
+      // This dispatch already knows the freshly persisted destination stage
+      // (plan-high-review) in memory — plan §7.5/AC-HOST-03 — so it carries
+      // a `{ task: { folderUri, folderName, progress } }` arg (letting
+      // fastForwardReviewWithAI's zero-I/O routing pre-check run before its
+      // own resolveTask read) instead of a bare `{ taskFolderPath }`.
+      const taskArg = (dispatched.arg as { task?: { folderUri?: vscode.Uri; progress?: { currentStage?: string } } }).task;
+      assert.ok(taskArg, "dispatch carries a task arg, not a bare taskFolderPath");
+      assert.equal(taskArg?.folderUri?.fsPath, folderPath);
+      assert.equal(taskArg?.progress?.currentStage, "plan-high-review");
     } finally {
       for (const p of patches.reverse()) { p.restore(); }
       for (const sub of context.subscriptions) { sub.dispose(); }

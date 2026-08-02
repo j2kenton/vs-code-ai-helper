@@ -6,13 +6,13 @@
       "annotationKind": "dynamicPathConsumption",
       "path": "src/commands/reviewActions.ts",
       "planSection": "§2.3 (unresolved dynamic path consumption)",
-      "rationale": "cp.execFile(\"git\", [\"rev-parse\", …]) repository checks (isGitWorkspace and siblings) run with the workspace root as cwd during review/publish flows. Arguments are fixed git subcommands; the only path consumed is the cwd, never a task-artifact or Chat-private path. Spawned git can read repository state, so it stays inventoried until the privacy classifier bounds it. Span refresh 2026-07-31 (completion round): the child_process import moved to L74 when the §7.8 cutover replaced the legacy implementation-run imports; the git call sites themselves are unchanged.",
+      "rationale": "cp.execFile(\"git\", [\"rev-parse\", …]) repository checks (isGitWorkspace and siblings) run with the workspace root as cwd during review/publish flows. Arguments are fixed git subcommands; the only path consumed is the cwd, never a task-artifact or Chat-private path. Spawned git can read repository state, so it stays inventoried until the privacy classifier bounds it. Span refresh 2026-07-31 (completion round): the child_process import moved to L74 when the §7.8 cutover replaced the legacy implementation-run imports; the git call sites themselves are unchanged. Span refresh 2026-08-02 (impl-high-review round): the import shifted to L80 when this round's deriveTaskBindingV1 import (plan §3.9) was added near the top of the file; the git call sites are still unchanged. Span refresh 2026-08-02 second pass (impl-high-review round 2): the import shifted to L81 when this round's checkEditActionProviderPathGateV1 import was added; the git call sites are still unchanged.",
       "owner": "ensemble-workflow-migration",
       "cohort": "text3",
       "expiryCohort": "cleanup",
       "evidence": {
         "symbol": "(module)",
-        "sourceSpan": "L78-L78",
+        "sourceSpan": "L81-L81",
         "edgeKind": "dynamicPathConsumption",
         "targetActionKey": "none"
       }

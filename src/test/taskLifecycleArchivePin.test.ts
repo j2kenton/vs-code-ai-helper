@@ -37,7 +37,7 @@ import {
 } from "../utils/completionLint";
 import { archiveTask, resumeArchivedTask } from "../commands/archiveTask";
 import { isMarkTaskDoneEligible, markTaskDone, selectNextTask } from "../commands/markTaskDone";
-import { readTaskProgressForTest as readTaskProgress } from "./taskFolderFixture";
+import { readTaskProgressForTest as readTaskProgress, fixtureOwnershipFor } from "./taskFolderFixture";
 import { TaskInventory } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { initNotificationRouter } from "../utils/notificationRouter";
@@ -320,6 +320,7 @@ void describe("archive → resume → re-complete round trip", () => {
       pinnedAt: "2026-01-02T00:00:00.000Z",
       createdAt: "2025-12-01T00:00:00.000Z",
       updatedAt: originalCompletedAt,
+      ownership: fixtureOwnershipFor(folderPath),
     };
     await fs.promises.writeFile(
       path.join(folderPath, "task-progress.json"),

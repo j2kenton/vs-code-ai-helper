@@ -326,6 +326,7 @@ export function activate(context: vscode.ExtensionContext): void {
             inventory,
             chatViewProvider,
             ref,
+            actionKey,
             resumeIdempotencyId,
             cancellation.token
           );

@@ -33,6 +33,7 @@ import { createReviewRowV1 } from "./rows/reviewRowV1";
 import { createApplyReviewRowV1 } from "./rows/applyReviewRowV1";
 import { createChatSendRowV1 } from "./rows/chatSendRowV1";
 import { createCommitPushMetadataRowV1 } from "./rows/commitPushMetadataRowV1";
+import { createCommitPushRowV1 } from "./rows/commitPushRowV1";
 import { createNextStageRowV1 } from "./rows/nextStageRowV1";
 import { createMarkTaskDoneRowV1 } from "./rows/markTaskDoneRowV1";
 import { createResumeTaskRowV1 } from "./rows/resumeTaskRowV1";
@@ -73,6 +74,7 @@ export function getProductionTaskActionRegistryV1(): TaskActionRegistryV1 {
       createApplyReviewRowV1(),
       createChatSendRowV1(),
       createCommitPushMetadataRowV1(),
+      createCommitPushRowV1(),
       createNextStageRowV1(),
       createMarkTaskDoneRowV1(),
       createResumeTaskRowV1(),
@@ -219,14 +221,22 @@ export function createProductionTaskActionCoordinatorV1(options: {
 }
 
 /**
- * Shared invocation path for a non-provider (lifecycle) row — `nextStage.v1`
- * and `markTaskDone.v1` are both callers (`reviewActions.ts`,
- * `markTaskDone.ts`). A lifecycle row never writes through the workflow file
- * store, so it needs no registered/verified workflow task-folder root — just
- * a stable per-task lease/audit key — and never posts to Chat (that's
- * provider-only coordinator plumbing), so `chatDocumentId` here is inert
- * correlation/audit metadata only; a synthetic id when the real one can't be
- * resolved is safe.
+ * Shared invocation path for a non-provider (lifecycle) row — `nextStage.v1`,
+ * `markTaskDone.v1`, and `resumeTask.v1` are all callers (`reviewActions.ts`,
+ * `markTaskDone.ts`, `reopenTask.ts`, `commitAndPushTask.ts`). A lifecycle row
+ * never writes through the workflow file store, so it needs no registered/
+ * verified workflow task-folder root — but `options.taskBindingId` MUST still
+ * be the ownership-derived `TaskBindingV1.bindingId` (plan §3.9,
+ * `deriveTaskBindingV1` in `types/taskBindingV1.ts`), never a raw or
+ * normalized filesystem path: leases (`workflowLeaseStoreV1`) and audit
+ * records key on this value, and it must equal the SAME task's binding as
+ * derived by every provider row (generatePlan.v1, draft.v1, ...) so a single
+ * active-operation-per-task invariant and Resume's task lookup
+ * (`TaskInventory.getTaskByBindingId`) hold across action kinds, and so raw
+ * paths never reach audit logs (plan §2.2). A lifecycle row never posts to
+ * Chat (that's provider-only coordinator plumbing), so `chatDocumentId` here
+ * is inert correlation/audit metadata only; a synthetic id when the real one
+ * can't be resolved is safe.
  */
 export async function invokeLifecycleRowV1(options: {
   readonly actionKey: string;
@@ -241,6 +251,8 @@ export async function invokeLifecycleRowV1(options: {
   readonly beforeWrite?: (patched: TaskProgress) => Promise<void>;
   /** Forwarded to `TaskActionRequestV1.lifecycleSkipTaskLock` — see its header. */
   readonly skipTaskLock?: boolean;
+  /** Forwarded to `TaskActionRequestV1.lifecycleServices` — see its header. */
+  readonly services?: unknown;
 }): Promise<TaskActionOutcomeV1> {
   let chatDocumentId: string;
   try {
@@ -277,6 +289,7 @@ export async function invokeLifecycleRowV1(options: {
       cancellationToken: cancellation.token,
       lifecycleBeforeWrite: options.beforeWrite,
       lifecycleSkipTaskLock: options.skipTaskLock,
+      lifecycleServices: options.services,
     });
   } finally {
     cancellation.dispose();

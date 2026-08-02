@@ -129,7 +129,13 @@ export function createCommitPushMetadataRowV1(): ProviderTaskActionRowV1 {
   return {
     kind: "provider",
     actionKey: COMMIT_PUSH_METADATA_ACTION_KEY_V1,
-    routes: ["vs-code-ai-helper.commitAndPushTask", "vs-code-ai-helper.completeCommitAndPushTask"],
+    // Internal, like editExecution.v1: this row is never invoked directly
+    // from a route/command — it runs nested inside commitPush.v1's Git
+    // workflow (reviewCommitMessage's AI commit-message generation). The
+    // real public route ids (vs-code-ai-helper.commitAndPushTask /
+    // completeCommitAndPushTask) belong to commitPush.v1 (commitPushRowV1.ts),
+    // which is what those commands now reach first through the coordinator.
+    routes: ["internal:commitPushMetadata.v1"],
     eligibility: { statuses: ["active"], stages: ["publish"] },
     requiresTaskOperationLease: true,
     progressLabel: "Generating commit metadata…",

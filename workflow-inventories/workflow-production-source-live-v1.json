@@ -12,7 +12,7 @@
   "typescriptVersion": "5.9.3",
   "buildOptionsDigestSha256": "59b9af38338f674e6503e84e1945f3c7b2e65f3aab5e1acec211ca45a20c3d07",
   "lockfileSha256": "8df5712b6f8e20446c74bb0ebf444ca707fb666b5a35214b92ad7d155c4b28f6",
-  "fileCount": 164,
+  "fileCount": 165,
   "files": [
     {
       "path": "src/actions/actionConversationOrchestratorV1.ts",
@@ -20,7 +20,7 @@
     },
     {
       "path": "src/actions/productionTaskActionRuntimeV1.ts",
-      "sha256": "3b179ad49aa6df9f58099ad6f2dfbf9a446b9ab7fdb28ddf4de48712446ab0b7"
+      "sha256": "bc9572ca76a5d1b889839a1a4eb21230621289958908c4a376f4b86c0a3c2081"
     },
     {
       "path": "src/actions/rows/applyReviewRowV1.ts",
@@ -32,7 +32,11 @@
     },
     {
       "path": "src/actions/rows/commitPushMetadataRowV1.ts",
-      "sha256": "f6a75d17af1cfdeab29de7f7480be868108fc6f181b8bed85654098782a5f166"
+      "sha256": "b32b7ea8bb8b539440619ea54d20acfab1e2a63c7cb1315d9b52f94bc3d8aeb7"
+    },
+    {
+      "path": "src/actions/rows/commitPushRowV1.ts",
+      "sha256": "0099de2d687860fb553c6f449989b1e4c74703e7d9e60550d51d75b7296924bd"
     },
     {
       "path": "src/actions/rows/draftRowV1.ts",
@@ -76,11 +80,11 @@
     },
     {
       "path": "src/actions/taskActionCoordinatorV1.ts",
-      "sha256": "5bd3279fea8c277e6253ca19325a6723ac7944988dd1ed620411eeb57188e88b"
+      "sha256": "e2f47c6e7c8b3b8ad6f0d86bc0411b4b0ac9951e2f215797c74f0fdb01c189bb"
     },
     {
       "path": "src/actions/taskActionRegistryV1.ts",
-      "sha256": "35ec28171f9425ba6107713c71769c46964a7837c18c00155dee0fa8647baac6"
+      "sha256": "24dab6e482a8f66c4f53478eb3a5c758ad828e2c8419b1788c25e0b0022c5071"
     },
     {
       "path": "src/commands/applyCurrentStageAction.ts",
@@ -108,7 +112,7 @@
     },
     {
       "path": "src/commands/commitAndPushTask.ts",
-      "sha256": "b025a26ae060a838a622ea767c064e27ebcfe091a311f2ab3b55474742e573eb"
+      "sha256": "1d1866219a478c54fe721a86d2203a6adf15b40a9a312a6da1a3d521e72add72"
     },
     {
       "path": "src/commands/configureStepModels.ts",
@@ -120,7 +124,7 @@
     },
     {
       "path": "src/commands/fastForwardCurrentTaskReview.ts",
-      "sha256": "19b2a7f08e0d47c8f36c2e81937408c2095cf7330e05ae6fc9e2dfd4bd8b0443"
+      "sha256": "b750ea6707d57bdc35d2ebe57fcc60c00abdd6e671436698d2d93adb17d87dbe"
     },
     {
       "path": "src/commands/generatePlanWithAI.ts",
@@ -128,7 +132,7 @@
     },
     {
       "path": "src/commands/markTaskDone.ts",
-      "sha256": "0da5a2186ad59a711b3909b7fc7f08a5dcfaf51495c7bb8914a94f71459e71eb"
+      "sha256": "144207fe47cf9216a238c09582b40c7934aee0336ece1b8e3ba52fb6329dc473"
     },
     {
       "path": "src/commands/openAndStartNewTask.ts",
@@ -156,7 +160,7 @@
     },
     {
       "path": "src/commands/reviewActions.ts",
-      "sha256": "b4654cc81d7fe4f5be3017528a0d92a5f39189083661f91b3a6e54b61b5150ac"
+      "sha256": "2e8b6d739430c7caff41dd58256b0b2cd1b24e30f96c7df5ed118295d3ce2adf"
     },
     {
       "path": "src/commands/reviewCurrentTask.ts",
@@ -164,7 +168,7 @@
     },
     {
       "path": "src/commands/runEditActionV1.ts",
-      "sha256": "a92c85ac4b15afd03c731e49c52786d2dc536afa57a6057dff42b60c544a43f5"
+      "sha256": "07e252e83fc145cc4c77d0cad29b56d767b8a0f64f135555d548404b8acd268b"
     },
     {
       "path": "src/commands/runLintingFixes.ts",
@@ -208,7 +212,7 @@
     },
     {
       "path": "src/extension.ts",
-      "sha256": "b93b183e8a75d723af0d9b427688382ef9315cfecd7c79ce571d5959f7421544"
+      "sha256": "b0bb055cfd32e2d821d9f029846a43caa806cb95bf0d657bdfd924d2434b1c44"
     },
     {
       "path": "src/legal/disclaimerVersion.ts",
@@ -332,7 +336,7 @@
     },
     {
       "path": "src/services/workflowLeaseStoreV1.ts",
-      "sha256": "a30d2343a271e109cd13f08a9f56ecd0c427aa981cb3ff3b10e6cb4025f17248"
+      "sha256": "a1f836c4e118110b2381a52e3f71675ae36e3ee35d993fb7d1133bae51b65c16"
     },
     {
       "path": "src/services/workflowPathRegistryV1.ts",
@@ -600,7 +604,7 @@
     },
     {
       "path": "src/utils/reopenTask.ts",
-      "sha256": "678dc4886dedcca160b87ad0d4805ca66bebd99099a664f3058c274dbd792d64"
+      "sha256": "68c162ea96ef94e85e73a86f63640a82ffa2250244fe6f04ae9df9ece494ca5f"
     },
     {
       "path": "src/utils/resolveTaskContext.ts",

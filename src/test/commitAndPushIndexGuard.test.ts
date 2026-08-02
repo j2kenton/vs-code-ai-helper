@@ -150,11 +150,25 @@ void describe("commitAndPushTaskCore source order (§10.2 steps 1-2)", () => {
   );
 
   void it("runs the index/privacy gate before git readiness, lint, and the first prompt", () => {
+    // §10.2 step 1 is now factored into its own coordinator-native helper,
+    // checkCommitPushIndexPrivacyV1 (defined just above commitAndPushTaskCore
+    // in source order) — commitPushRowV1.ts's executeCommitPushV1 calls it
+    // itself before ever invoking commitAndPushTaskCore, and the core calls
+    // the SAME function again, under its own lock, as its own first step.
+    // The real collectStagedIndexRecordsV1 read now lives inside that helper
+    // rather than inline in the core, so source-order wiring is checked via
+    // the core's call to the helper, not the raw index-read call.
+    const helperStart = source.indexOf("async function checkCommitPushIndexPrivacyV1(");
+    assert.ok(helperStart >= 0, "could not find checkCommitPushIndexPrivacyV1");
+    const helperGateIdx = source.indexOf("collectStagedIndexRecordsV1(repoRoot)", helperStart);
+    assert.ok(helperGateIdx > helperStart, "the helper must read the staged index");
+
     const coreStart = source.indexOf("async function commitAndPushTaskCore(");
     assert.ok(coreStart >= 0, "could not find commitAndPushTaskCore");
+    assert.ok(helperStart < coreStart, "checkCommitPushIndexPrivacyV1 must be defined before commitAndPushTaskCore");
 
-    const gateIdx = source.indexOf("collectStagedIndexRecordsV1(repoRoot)", coreStart);
-    assert.ok(gateIdx > coreStart, "the core must read the staged index");
+    const gateIdx = source.indexOf("checkCommitPushIndexPrivacyV1(resolvedTask)", coreStart);
+    assert.ok(gateIdx > coreStart, "the core must call checkCommitPushIndexPrivacyV1");
 
     const readinessIdx = source.indexOf("checkGitPublishReadiness(", coreStart);
     assert.ok(readinessIdx > coreStart, "could not find the readiness check");
@@ -168,6 +182,46 @@ void describe("commitAndPushTaskCore source order (§10.2 steps 1-2)", () => {
     assert.ok(
       gateIdx < readinessIdx && readinessIdx < lintIdx && lintIdx < promptIdx,
       `index gate (${gateIdx}) must precede readiness (${readinessIdx}), lint (${lintIdx}), and prompts (${promptIdx})`
+    );
+  });
+
+  void it("commitPushRowV1's executeCommitPushV1 calls the index/privacy gate before ever calling commitAndPushTaskCore", () => {
+    const rowSource = fs.readFileSync(
+      path.resolve(__dirname, "..", "..", "src", "actions", "rows", "commitPushRowV1.ts"),
+      "utf8"
+    );
+    const executeStart = rowSource.indexOf("export async function executeCommitPushV1(");
+    assert.ok(executeStart >= 0, "could not find executeCommitPushV1");
+    const gateIdx = rowSource.indexOf("checkCommitPushIndexPrivacyV1(services.resolvedTask)", executeStart);
+    assert.ok(gateIdx > executeStart, "executeCommitPushV1 must call checkCommitPushIndexPrivacyV1");
+    const coreCallIdx = rowSource.indexOf("await commitAndPushTaskCore(", executeStart);
+    assert.ok(coreCallIdx > executeStart, "could not find the commitAndPushTaskCore call");
+    assert.ok(
+      gateIdx < coreCallIdx,
+      `the coordinator-native gate (${gateIdx}) must precede the delegated commitAndPushTaskCore call (${coreCallIdx})`
+    );
+  });
+
+  void it("commitPushRowV1's executeCommitPushV1 also calls the read-only git readiness check before commitAndPushTaskCore (§10.2 step 2)", () => {
+    const rowSource = fs.readFileSync(
+      path.resolve(__dirname, "..", "..", "src", "actions", "rows", "commitPushRowV1.ts"),
+      "utf8"
+    );
+    const executeStart = rowSource.indexOf("export async function executeCommitPushV1(");
+    assert.ok(executeStart >= 0, "could not find executeCommitPushV1");
+    const indexGateIdx = rowSource.indexOf("checkCommitPushIndexPrivacyV1(services.resolvedTask)", executeStart);
+    assert.ok(indexGateIdx > executeStart, "executeCommitPushV1 must call checkCommitPushIndexPrivacyV1");
+    const readinessGateIdx = rowSource.indexOf(
+      "checkGitPublishReadiness(services.resolvedTask.taskFolderPath)",
+      executeStart
+    );
+    assert.ok(readinessGateIdx > executeStart, "executeCommitPushV1 must call checkGitPublishReadiness");
+    const coreCallIdx = rowSource.indexOf("await commitAndPushTaskCore(", executeStart);
+    assert.ok(coreCallIdx > executeStart, "could not find the commitAndPushTaskCore call");
+    assert.ok(
+      indexGateIdx < readinessGateIdx && readinessGateIdx < coreCallIdx,
+      `the index gate (${indexGateIdx}) must precede the readiness gate (${readinessGateIdx}), which must precede ` +
+        `the delegated commitAndPushTaskCore call (${coreCallIdx})`
     );
   });
 

@@ -622,6 +622,120 @@ void describe("taskActionCoordinatorV1", () => {
     assert.equal(harness.selection.reserved, 0);
   });
 
+  void describe("parentOperationId — nested child lease (commitPush.v1's self-deadlock fix)", () => {
+    /**
+     * Mirrors commitPush.v1's real shape: a lifecycle row holds its lease for
+     * the whole coordinated transition (plan §3.8) and, from inside that same
+     * `execute`, drives a nested provider-row call against the SAME task
+     * binding (commitPushMetadata.v1 in production). Proves both halves of
+     * the safety property in one flow: (1) the nested call succeeds via
+     * `parentOperationId` instead of self-deadlocking as a false-positive
+     * duplicate, and (2) while the parent's lease is held, an UNRELATED
+     * caller on the same binding — including one that supplies a
+     * `parentOperationId` it does not actually hold — is still rejected, so
+     * this can never be used to let two independent operations act on the
+     * same task concurrently.
+     */
+    void it("admits a nested provider-row call via parentOperationId, and still rejects an unrelated caller on the same binding", async () => {
+      const coordinatorRef: { current?: TaskActionCoordinatorV1 } = {};
+      let unrelatedOutcome: unknown;
+      let impostorOutcome: unknown;
+      const parentRow: LifecycleTaskActionRowV1 = {
+        kind: "lifecycle",
+        actionKey: "parentLifecycle.v1",
+        routes: ["vs-code-ai-helper.parentLifecycleTestRoute"],
+        eligibility: { statuses: ["active"], stages: ["plan"] },
+        requiresTaskOperationLease: true,
+        progressLabel: "Parent…",
+        validateInput: (input) => ({ ok: true, input }),
+        loggingPolicy: { channel: "action.parentTest", includeResultMetrics: false },
+        execute: async (context) => {
+          // An unrelated caller with NO parentOperationId must still be
+          // rejected while this row's lease is held — base exclusivity for
+          // this binding is unchanged.
+          unrelatedOutcome = await coordinatorRef.current!.executeAction({
+            actionKey: TEST_ACTION_KEY,
+            taskBinding: { taskBindingId: context.taskBindingId, chatDocumentId: context.chatDocumentId },
+            taskStatus: "active",
+            taskStage: "plan",
+            rawInput: "input",
+            cancellationToken: fakeToken(),
+          });
+          // An impostor asserting a FABRICATED parentOperationId (not this
+          // row's real operationId) must also be rejected — a child can only
+          // ever be granted to the operation that actually holds the lease.
+          impostorOutcome = await coordinatorRef.current!.executeAction({
+            actionKey: TEST_ACTION_KEY,
+            taskBinding: { taskBindingId: context.taskBindingId, chatDocumentId: context.chatDocumentId },
+            taskStatus: "active",
+            taskStage: "plan",
+            rawInput: "input",
+            cancellationToken: fakeToken(),
+            parentOperationId: allocateHex128IdV1(),
+          });
+          // The legitimate nested call, naming THIS execution's own
+          // operationId, must succeed.
+          const nested = await coordinatorRef.current!.executeAction({
+            actionKey: TEST_ACTION_KEY,
+            taskBinding: { taskBindingId: context.taskBindingId, chatDocumentId: context.chatDocumentId },
+            taskStatus: "active",
+            taskStage: "plan",
+            rawInput: "input",
+            cancellationToken: fakeToken(),
+            parentOperationId: context.operationId,
+          });
+          if (nested.kind !== "completed") {
+            return { kind: "failed", code: `nestedNotCompleted:${nested.kind}`, retryable: false };
+          }
+          return {
+            kind: "completed",
+            correlation: {
+              actionKey: context.actionKey,
+              operationId: context.operationId,
+              attemptId: allocateHex128IdV1(),
+              taskBindingId: context.taskBindingId,
+              chatDocumentId: context.chatDocumentId,
+            },
+            code: "completed",
+          };
+        },
+      };
+      const harness = makeHarness(
+        [
+          envelopeTransport((correlation) =>
+            frame({
+              version: 1,
+              correlation,
+              kind: "completed",
+              content: { contentType: "markdown-artifact.v1", schemaVersion: 1, markdown: "# nested" },
+            })
+          ),
+        ],
+        {},
+        [parentRow]
+      );
+      coordinatorRef.current = harness.coordinator;
+
+      const outcome = await harness.coordinator.executeAction({
+        actionKey: "parentLifecycle.v1",
+        taskBinding: TASK_BINDING,
+        taskStatus: "active",
+        taskStage: "plan",
+        rawInput: "input",
+        cancellationToken: fakeToken(),
+      });
+
+      assert.deepEqual(unrelatedOutcome, { kind: "duplicateRejected", code: "operationAlreadyRunning" });
+      assert.deepEqual(impostorOutcome, { kind: "duplicateRejected", code: "operationAlreadyRunning" });
+      assert.equal(outcome.kind, "completed");
+      // Exactly one provider invocation actually ran: the legitimate child.
+      assert.equal(harness.promoted.length, 1);
+      assert.equal(harness.selection.opened, 1);
+      // The parent's own lease is released once its execute returns.
+      assert.equal(harness.leaseStore.heldLease(TASK_BINDING.taskBindingId), undefined);
+    });
+  });
+
   void it("checks eligibility, input, and cancellation before allocating anything", async () => {
     const harness = makeHarness([
       envelopeTransport(() => {

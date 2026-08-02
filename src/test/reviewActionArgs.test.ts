@@ -7,8 +7,9 @@
  */
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
-import { describe, it } from "node:test";
+import { after, before, describe, it } from "node:test";
 
 // ---------------------------------------------------------------------------
 // normalizeReviewArg logic (tested by re-implementing the same logic)
@@ -25,10 +26,20 @@ import { describe, it } from "node:test";
 import * as vscode from "vscode";
 import {
   buildFastForwardApplyReviewOptions,
+  fastForwardReviewWithAI,
+  peekFastForwardTargetsImplReviewFromPathV1,
   selectReviewPromptTemplate,
 } from "../commands/reviewActions";
+import { fastForwardCurrentTaskReview } from "../commands/fastForwardCurrentTaskReview";
 import { TaskOperationHandle } from "../utils/taskOperations";
 import { parseReadiness } from "../utils/reviewReadiness";
+import { fixtureOwnershipFor, makeOwnedTaskFolder } from "./taskFolderFixture";
+import {
+  deactivateNotificationRouter,
+  initNotificationRouter,
+} from "../utils/notificationRouter";
+import type { TaskInventory } from "../state/taskInventory";
+import type { CurrentTaskStore } from "../utils/currentTaskStore";
 
 /**
  * Re-implement the normalizeReviewArg contract for test verification.
@@ -449,5 +460,271 @@ void describe("vscode.Uri.file for task folder normalization", () => {
     assert.ok(joined.fsPath.endsWith("task-progress.json") || joined.path.endsWith("task-progress.json"),
       `expected path to end with task-progress.json, got: ${joined.path}`
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// peekFastForwardTargetsImplReviewFromPathV1 (plan §7.5/AC-HOST-03): the
+// `{ taskFolderPath }` companion to fastForwardTargetsImplReviewV1's
+// zero-I/O arg.task.progress peek. Unlike that zero-I/O peek, this one does
+// perform a single targeted disk read, so its contract is what matters most:
+// a known impl-review target resolves `true`, a known plan-review (or any
+// other non-edit-eligible) target resolves `false`/`undefined`, and any read
+// failure (missing, corrupt/unbound) resolves `undefined` — never throws,
+// never shows a notification — so callers always fall through to the
+// existing, authoritative resolveTask/resolveTaskContext read instead.
+// ---------------------------------------------------------------------------
+
+/** The test vscode stub does not implement workspace.fs.readFile; bridge it to real fs. */
+function installReadFileBridge(): { restore: () => void } {
+  const target = vscode.workspace.fs as unknown as Record<string, unknown>;
+  const orig = target.readFile;
+  target.readFile = (uri: vscode.Uri): Promise<Uint8Array> =>
+    fs.promises.readFile(uri.fsPath).then((buf) => new Uint8Array(buf));
+  return { restore: (): void => { target.readFile = orig; } };
+}
+
+void describe("peekFastForwardTargetsImplReviewFromPathV1 contract", () => {
+  let bridge: { restore: () => void };
+  before(() => { bridge = installReadFileBridge(); });
+  after(() => { bridge.restore(); });
+
+  void it("resolves true for a task at an implementation-review-mapped stage (impl)", async () => {
+    const fixture = makeOwnedTaskFolder("ff-peek-impl-");
+    try {
+      const result = await peekFastForwardTargetsImplReviewFromPathV1(fixture.folder);
+      assert.equal(result, true);
+    } finally {
+      fs.rmSync(path.dirname(fixture.folder), { recursive: true, force: true });
+    }
+  });
+
+  void it("resolves false for a task at a plan-review-mapped stage (plan)", async () => {
+    const container = fs.mkdtempSync(path.join(os.tmpdir(), "ff-peek-plan-"));
+    const folder = path.join(container, "tasks", `${path.basename(container)}-task`);
+    fs.mkdirSync(folder, { recursive: true });
+    const ownership = fixtureOwnershipFor(folder);
+    const progress = {
+      taskFolder: path.basename(folder),
+      currentStage: "plan",
+      createdAt: "2026-07-01T10:00:00.000Z",
+      updatedAt: "2026-07-02T11:30:00.000Z",
+      ownership,
+    };
+    fs.writeFileSync(path.join(folder, "task-progress.json"), JSON.stringify(progress, null, 2));
+    try {
+      const result = await peekFastForwardTargetsImplReviewFromPathV1(folder);
+      assert.equal(result, false);
+    } finally {
+      fs.rmSync(container, { recursive: true, force: true });
+    }
+  });
+
+  void it("resolves undefined (never throws) for a folder with no task-progress.json", async () => {
+    const container = fs.mkdtempSync(path.join(os.tmpdir(), "ff-peek-missing-"));
+    const folder = path.join(container, "tasks", `${path.basename(container)}-task`);
+    fs.mkdirSync(folder, { recursive: true });
+    try {
+      const result = await peekFastForwardTargetsImplReviewFromPathV1(folder);
+      assert.equal(result, undefined);
+    } finally {
+      fs.rmSync(container, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// fastForwardReviewWithAI / fastForwardCurrentTaskReview — §7.5/AC-HOST-03
+// read-before-gate ordering. The prior peek-then-enforce structure ran a
+// task-progress read (directly, or via resolveTask/resolveTaskContext) before
+// the coarse host/provider gate was ever enforced for the "don't know the
+// target's category yet" case (bare invocations, a `{ taskFolderPath }` arg,
+// and the shortcut's cache-miss/ambiguous branches). These tests force the
+// host gate to fail and prove the gate is enforced before ANY disk read for
+// every one of those shapes: a bare invocation, a `{ taskFolderPath }`
+// invocation naming a real implementation-review task, and the shortcut
+// router's cache-miss case (a persisted pointer not present in the in-memory
+// inventory snapshot).
+// ---------------------------------------------------------------------------
+
+/** Force checkEditActionHostGateV1() to fail without touching any task/workspace state. */
+function installFailingHostGate(): { restore: () => void } {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/no-var-requires
+  const raw = require("vscode") as Record<string, unknown>;
+  const original = raw.LanguageModelToolResultPart;
+  delete raw.LanguageModelToolResultPart;
+  return {
+    restore: (): void => {
+      raw.LanguageModelToolResultPart = original;
+    },
+  };
+}
+
+/** Count vscode.workspace.fs.readFile calls, bridging through to real fs (test stub has no readFile). */
+function installReadFileCounter(): { count: () => number; restore: () => void } {
+  const target = vscode.workspace.fs as unknown as Record<string, unknown>;
+  const original = target.readFile;
+  let calls = 0;
+  target.readFile = (uri: vscode.Uri): Promise<Uint8Array> => {
+    calls += 1;
+    return fs.promises.readFile(uri.fsPath).then((buf) => new Uint8Array(buf));
+  };
+  return {
+    count: () => calls,
+    restore: (): void => {
+      target.readFile = original;
+    },
+  };
+}
+
+/** Recording notification surface: captures warning messages without requiring the real status view. */
+function installRecordingNotificationSurface(): { warnings: string[]; restore: () => void } {
+  const warnings: string[] = [];
+  initNotificationRouter({
+    addEntry: (message: string, level: "info" | "warning" | "error"): void => {
+      if (level === "warning") {
+        warnings.push(message);
+      }
+    },
+  });
+  return {
+    warnings,
+    restore: (): void => {
+      deactivateNotificationRouter();
+    },
+  };
+}
+
+void describe("fastForwardReviewWithAI — read-before-gate ordering (§7.5/AC-HOST-03)", () => {
+  void it("rejects a bare (no-arg) invocation before any task read when the host gate fails", async () => {
+    const gate = installFailingHostGate();
+    const reads = installReadFileCounter();
+    const notif = installRecordingNotificationSurface();
+    try {
+      await fastForwardReviewWithAI(
+        vscode.Uri.file("/dummy"),
+        {} as vscode.ExtensionContext,
+        undefined,
+        undefined
+      );
+      assert.equal(reads.count(), 0, "must not read any task/source state before rejecting");
+      assert.equal(notif.warnings.length, 1);
+    } finally {
+      notif.restore();
+      reads.restore();
+      gate.restore();
+    }
+  });
+
+  void it("rejects a { taskFolderPath } invocation before its targeted disk read when the host gate fails", async () => {
+    const fixture = makeOwnedTaskFolder("ff-order-path-");
+    const gate = installFailingHostGate();
+    const reads = installReadFileCounter();
+    const notif = installRecordingNotificationSurface();
+    try {
+      await fastForwardReviewWithAI(
+        vscode.Uri.file("/dummy"),
+        {} as vscode.ExtensionContext,
+        { taskFolderPath: fixture.folder },
+        undefined
+      );
+      assert.equal(reads.count(), 0, "must not read task-progress.json before rejecting");
+      assert.equal(notif.warnings.length, 1);
+    } finally {
+      notif.restore();
+      reads.restore();
+      gate.restore();
+      fs.rmSync(path.dirname(fixture.folder), { recursive: true, force: true });
+    }
+  });
+});
+
+/**
+ * Build a fake TaskInventory/CurrentTaskStore pair that records every
+ * accessor call, so ordering tests can assert zero in-memory task-state
+ * reads occurred before rejection — not just zero disk reads. A prior
+ * version of fastForwardCurrentTaskReview.ts read `currentTaskStore.get()`
+ * and the in-memory inventory (getTaskById/getVisibleTaskForSuppressedId/
+ * getTasks) to answer a "is this target plan-review-only" pre-check before
+ * enforcing the gate; those are task-state reads even though they never
+ * touch disk, which is exactly what the review flagged as unproven by a
+ * readFile-only counter.
+ */
+function installSpyingTaskState(pointer: string | undefined): {
+  inventory: TaskInventory;
+  currentTaskStore: CurrentTaskStore;
+  calls: () => number;
+} {
+  let calls = 0;
+  const inventory = {
+    getTaskById: (): undefined => {
+      calls += 1;
+      return undefined;
+    },
+    getVisibleTaskForSuppressedId: (): undefined => {
+      calls += 1;
+      return undefined;
+    },
+    getTasks: (): unknown[] => {
+      calls += 1;
+      return [];
+    },
+  } as unknown as TaskInventory;
+  const currentTaskStore = {
+    get: (): string | undefined => {
+      calls += 1;
+      return pointer;
+    },
+  } as unknown as CurrentTaskStore;
+  return { inventory, currentTaskStore, calls: () => calls };
+}
+
+void describe("fastForwardCurrentTaskReview — read-before-gate ordering (§7.5/AC-HOST-03)", () => {
+  void it("rejects a cache-miss current-task pointer before touching CurrentTaskStore or TaskInventory when the host gate fails", async () => {
+    const fixture = makeOwnedTaskFolder("ff-order-shortcut-");
+    const gate = installFailingHostGate();
+    const reads = installReadFileCounter();
+    const notif = installRecordingNotificationSurface();
+    // The persisted pointer names a real, existing task folder, but the
+    // in-memory inventory snapshot has no record of it — the "stale cache"
+    // case fastForwardCurrentTaskReview.ts's own comments describe, which
+    // previously fell through to its own targeted disk peek unchecked.
+    const spies = installSpyingTaskState(fixture.folder);
+    try {
+      await fastForwardCurrentTaskReview(spies.inventory, spies.currentTaskStore);
+      assert.equal(reads.count(), 0, "must not read task-progress.json before rejecting");
+      assert.equal(
+        spies.calls(),
+        0,
+        "must not call CurrentTaskStore.get or any TaskInventory accessor before rejecting"
+      );
+      assert.equal(notif.warnings.length, 1);
+    } finally {
+      notif.restore();
+      reads.restore();
+      gate.restore();
+      fs.rmSync(path.dirname(fixture.folder), { recursive: true, force: true });
+    }
+  });
+
+  void it("rejects a no-pointer, no-sole-active-task invocation before touching CurrentTaskStore or TaskInventory when the host gate fails", async () => {
+    const gate = installFailingHostGate();
+    const reads = installReadFileCounter();
+    const notif = installRecordingNotificationSurface();
+    const spies = installSpyingTaskState(undefined);
+    try {
+      await fastForwardCurrentTaskReview(spies.inventory, spies.currentTaskStore);
+      assert.equal(reads.count(), 0, "must not read any task state before rejecting");
+      assert.equal(
+        spies.calls(),
+        0,
+        "must not call CurrentTaskStore.get or any TaskInventory accessor before rejecting"
+      );
+      assert.equal(notif.warnings.length, 1);
+    } finally {
+      notif.restore();
+      reads.restore();
+      gate.restore();
+    }
   });
 });

@@ -109,6 +109,18 @@ export interface LifecycleExecutionContextV1 {
    * self-deadlock. Threaded from `TaskActionRequestV1.lifecycleSkipTaskLock`.
    */
   readonly skipTaskLock?: boolean;
+  /**
+   * Lifecycle-only side channel like `beforeWrite`/`skipTaskLock` (never
+   * provider rows, never serialized, never part of a Chat transaction's
+   * input snapshot): an opaque bag of in-process, non-JSON-serializable
+   * dependencies (e.g. `TaskInventory`, `CurrentTaskStore`, a
+   * `ChatViewProvider`, a `vscode.ExtensionContext`) that a row needing more
+   * than `validatedInput` can carry. Only `commitPush.v1` (plan §10.1/§10.2 —
+   * the Git workflow needs live service objects `rawInput` cannot represent)
+   * uses this today; every row casts it to its own expected shape, exactly
+   * like `validatedInput`. Threaded from `TaskActionRequestV1.lifecycleServices`.
+   */
+  readonly services?: unknown;
 }
 
 export type TaskActionPromotionCodeV1 = "completed" | "noChanges";
