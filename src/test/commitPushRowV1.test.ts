@@ -1,12 +1,15 @@
 /**
  * Coverage for `commitPushRowV1.ts`'s `mapCommitAndPushCoreResultToOutcomeV1`
  * (plan §3.8/§10.2, implementation-review round: "detailed outcome"
- * ownership): `commitAndPushTaskCore` now returns a discriminated
- * `CommitAndPushCoreResultV1` whose `notCompleted` case carries a specific
+ * ownership): `executeCommitPushV1` composes a discriminated
+ * `CommitAndPushCoreResultV1` from whichever coordinator-native step
+ * (staging-scope resolution, confirmation, save, PR description,
+ * commit-message review, staging/commit, or push) settled the attempt,
+ * whose `notCompleted` case carries a specific
  * `CommitAndPushNotCompletedReasonV1` (ineligible stage, declined
  * confirmation, failed git command, ...) instead of one undifferentiated
- * signal. This proves that mapping — not the real git/UI flow inside
- * `commitAndPushTaskCore`, which is exercised by the other
+ * signal. This proves that mapping — not the real git/UI flow in
+ * `commitAndPushTask.ts`, which is exercised by the other
  * commitAndPush*.test.ts files — turns each reason into a distinct
  * `commitPush.<reason>` coordinator outcome code, and that `completed`/
  * `noChanges` still produce the expected `{ kind: "completed" }` outcome.

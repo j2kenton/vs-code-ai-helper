@@ -9,8 +9,8 @@
  *    (staged changes, staged renames with origins, staged deletions), never
  *    untracked/unstaged-only entries. Real-git fixture.
  *  - Source-order wiring: the index gate runs before git readiness, lint,
- *    and the first prompt inside commitAndPushTaskCore, and the post-add
- *    re-verification sits between `git add` and `git commit` (§2.4 rule 7).
+ *    and the first prompt, and the post-add re-verification sits between
+ *    `git add` and `git commit` (§2.4 rule 7).
  *  - `getChangedFiles`/`stripSensitiveTaskFiles` — workflow-control paths
  *    are omitted from staging proposals into `excludedControlPaths`.
  */
@@ -143,49 +143,121 @@ void describe("collectStagedIndexRecordsV1", () => {
   });
 });
 
-void describe("commitAndPushTaskCore source order (§10.2 steps 1-2)", () => {
+void describe("commitAndPushTask.ts / commitPushRowV1.ts source order (§10.2, full coordinator sequencing)", () => {
   const source = fs.readFileSync(
     path.resolve(__dirname, "..", "..", "src", "commands", "commitAndPushTask.ts"),
     "utf8"
   );
 
-  void it("runs the index/privacy gate before git readiness, lint, and the first prompt", () => {
-    // §10.2 step 1 is now factored into its own coordinator-native helper,
-    // checkCommitPushIndexPrivacyV1 (defined just above commitAndPushTaskCore
-    // in source order) — commitPushRowV1.ts's executeCommitPushV1 calls it
-    // itself before ever invoking commitAndPushTaskCore, and the core calls
-    // the SAME function again, under its own lock, as its own first step.
-    // The real collectStagedIndexRecordsV1 read now lives inside that helper
-    // rather than inline in the core, so source-order wiring is checked via
-    // the core's call to the helper, not the raw index-read call.
+  void it("runs the index/privacy gate before git readiness and the first prompt, inside resolveCommitPushStagingScopeV1, and nowhere else in commitAndPushTask.ts", () => {
+    // §10.2 step 1 is factored into its own coordinator-native helper,
+    // checkCommitPushIndexPrivacyV1 (defined just above
+    // resolveCommitPushStagingScopeV1 in source order) — commitPushRowV1.ts's
+    // executeCommitPushV1 calls it itself before ever invoking
+    // resolveCommitPushStagingScopeV1, and resolveCommitPushStagingScopeV1
+    // calls the SAME function again, at its own top, as its own revalidation
+    // (§7.7) before the real staging-scope work (the pre-existing-staged
+    // prompt, then the default/"Include Task Folder"/"Include Run Artifacts"
+    // prompts) begins. The real collectStagedIndexRecordsV1 read now lives
+    // inside that helper rather than inline in resolveCommitPushStagingScopeV1,
+    // so source-order wiring is checked via the call to the helper, not the
+    // raw index-read call.
+    //
+    // Completion checks (the former "lint" step) run exactly once, in the
+    // coordinator, via runCommitPushCompletionChecksV1, BEFORE
+    // resolveCommitPushStagingScopeV1 or any of the remaining save/
+    // PR-description/commit-message/staging/commit/push steps are ever
+    // invoked (see the "coordinator opens the operation..." test below) —
+    // neither asserts a lint call of its own.
     const helperStart = source.indexOf("async function checkCommitPushIndexPrivacyV1(");
     assert.ok(helperStart >= 0, "could not find checkCommitPushIndexPrivacyV1");
     const helperGateIdx = source.indexOf("collectStagedIndexRecordsV1(repoRoot)", helperStart);
     assert.ok(helperGateIdx > helperStart, "the helper must read the staged index");
 
-    const coreStart = source.indexOf("async function commitAndPushTaskCore(");
-    assert.ok(coreStart >= 0, "could not find commitAndPushTaskCore");
-    assert.ok(helperStart < coreStart, "checkCommitPushIndexPrivacyV1 must be defined before commitAndPushTaskCore");
+    const scopeStart = source.indexOf("export async function resolveCommitPushStagingScopeV1(");
+    assert.ok(scopeStart >= 0, "could not find resolveCommitPushStagingScopeV1");
+    assert.ok(helperStart < scopeStart, "checkCommitPushIndexPrivacyV1 must be defined before resolveCommitPushStagingScopeV1");
 
-    const gateIdx = source.indexOf("checkCommitPushIndexPrivacyV1(resolvedTask)", coreStart);
-    assert.ok(gateIdx > coreStart, "the core must call checkCommitPushIndexPrivacyV1");
+    const gateIdx = source.indexOf("checkCommitPushIndexPrivacyV1(resolvedTask)", scopeStart);
+    assert.ok(gateIdx > scopeStart, "resolveCommitPushStagingScopeV1 must call checkCommitPushIndexPrivacyV1");
 
-    const readinessIdx = source.indexOf("checkGitPublishReadiness(", coreStart);
-    assert.ok(readinessIdx > coreStart, "could not find the readiness check");
-
-    const lintIdx = source.indexOf("await runChecks()", coreStart);
-    assert.ok(lintIdx > coreStart, "could not find the lint run");
+    const readinessIdx = source.indexOf("checkGitPublishReadiness(", scopeStart);
+    assert.ok(readinessIdx > scopeStart, "could not find the readiness check");
 
     const promptIdx = source.indexOf("showWarningMessage", gateIdx);
     assert.ok(promptIdx > gateIdx, "could not find a prompt after the gate");
 
     assert.ok(
-      gateIdx < readinessIdx && readinessIdx < lintIdx && lintIdx < promptIdx,
-      `index gate (${gateIdx}) must precede readiness (${readinessIdx}), lint (${lintIdx}), and prompts (${promptIdx})`
+      gateIdx < readinessIdx && readinessIdx < promptIdx,
+      `index gate (${gateIdx}) must precede readiness (${readinessIdx}) and prompts (${promptIdx})`
+    );
+
+    // None of the remaining save/PR-description/commit-message/staging/
+    // commit/push functions may re-run the index/privacy gate — it is
+    // settled once, by resolveCommitPushStagingScopeV1 (called exactly once
+    // more by executeCommitPushV1's own coordinator-native pre-check), and
+    // never a single opaque "core" call anymore.
+    const callSites = source.split("checkCommitPushIndexPrivacyV1(resolvedTask)").length - 1;
+    assert.equal(
+      callSites,
+      1,
+      "checkCommitPushIndexPrivacyV1 must be called exactly once in commitAndPushTask.ts, inside resolveCommitPushStagingScopeV1"
     );
   });
 
-  void it("commitPushRowV1's executeCommitPushV1 calls the index/privacy gate before ever calling commitAndPushTaskCore", () => {
+  void it("commitPushRowV1's executeCommitPushV1 calls resolveCommitPushStagingScopeV1 then confirmCommitPushScopeV1, before the remaining save/PR-description/commit-message/staging/commit/push steps (§3.8/§10.2 steps 6-7)", () => {
+    // The blocker this closes: staging-scope resolution, final preview/
+    // confirmation, save, PR-description generation, commit-message review,
+    // staging/commit, and push each now run as their own coordinator-native
+    // steps, called directly by executeCommitPushV1, in this order — there
+    // is no longer a single opaque delegated "core" call for any of them.
+    const rowSource = fs.readFileSync(
+      path.resolve(__dirname, "..", "..", "src", "actions", "rows", "commitPushRowV1.ts"),
+      "utf8"
+    );
+    const executeStart = rowSource.indexOf("export async function executeCommitPushV1(");
+    assert.ok(executeStart >= 0, "could not find executeCommitPushV1");
+
+    const checksIdx = rowSource.indexOf("runCommitPushCompletionChecksV1(", executeStart);
+    assert.ok(checksIdx > executeStart, "executeCommitPushV1 must call runCommitPushCompletionChecksV1");
+
+    const scopeIdx = rowSource.indexOf("resolveCommitPushStagingScopeV1(", executeStart);
+    assert.ok(scopeIdx > executeStart, "executeCommitPushV1 must call resolveCommitPushStagingScopeV1");
+
+    const confirmIdx = rowSource.indexOf("confirmCommitPushScopeV1(", executeStart);
+    assert.ok(confirmIdx > executeStart, "executeCommitPushV1 must call confirmCommitPushScopeV1");
+
+    const saveIdx = rowSource.indexOf("saveCommitPushDocumentsV1(", executeStart);
+    assert.ok(saveIdx > executeStart, "executeCommitPushV1 must call saveCommitPushDocumentsV1");
+
+    const prIdx = rowSource.indexOf("generateCommitPushPrDescriptionV1(", executeStart);
+    assert.ok(prIdx > executeStart, "executeCommitPushV1 must call generateCommitPushPrDescriptionV1");
+
+    const messageIdx = rowSource.indexOf("reviewCommitPushMessageV1(", executeStart);
+    assert.ok(messageIdx > executeStart, "executeCommitPushV1 must call reviewCommitPushMessageV1");
+
+    const stageCommitIdx = rowSource.indexOf("stageAndCommitCommitPushV1(", executeStart);
+    assert.ok(stageCommitIdx > executeStart, "executeCommitPushV1 must call stageAndCommitCommitPushV1");
+
+    const pushIdx = rowSource.indexOf("pushCommitPushV1(", executeStart);
+    assert.ok(pushIdx > executeStart, "executeCommitPushV1 must call pushCommitPushV1");
+
+    assert.ok(
+      checksIdx < scopeIdx &&
+        scopeIdx < confirmIdx &&
+        confirmIdx < saveIdx &&
+        saveIdx < prIdx &&
+        prIdx < messageIdx &&
+        messageIdx < stageCommitIdx &&
+        stageCommitIdx < pushIdx,
+      `completion checks (${checksIdx}) must precede staging-scope resolution (${scopeIdx}), which must precede ` +
+        `confirmation (${confirmIdx}), which must precede save (${saveIdx}), which must precede PR description ` +
+        `(${prIdx}), which must precede commit-message review (${messageIdx}), which must precede staging/commit ` +
+        `(${stageCommitIdx}), which must precede push (${pushIdx})`
+    );
+  });
+
+  void it("commitPushRowV1's executeCommitPushV1 calls the index/privacy gate before ever calling the remaining coordinator-native steps", () => {
     const rowSource = fs.readFileSync(
       path.resolve(__dirname, "..", "..", "src", "actions", "rows", "commitPushRowV1.ts"),
       "utf8"
@@ -194,15 +266,15 @@ void describe("commitAndPushTaskCore source order (§10.2 steps 1-2)", () => {
     assert.ok(executeStart >= 0, "could not find executeCommitPushV1");
     const gateIdx = rowSource.indexOf("checkCommitPushIndexPrivacyV1(services.resolvedTask)", executeStart);
     assert.ok(gateIdx > executeStart, "executeCommitPushV1 must call checkCommitPushIndexPrivacyV1");
-    const coreCallIdx = rowSource.indexOf("await commitAndPushTaskCore(", executeStart);
-    assert.ok(coreCallIdx > executeStart, "could not find the commitAndPushTaskCore call");
+    const pushCallIdx = rowSource.indexOf("await pushCommitPushV1(", executeStart);
+    assert.ok(pushCallIdx > executeStart, "could not find the pushCommitPushV1 call");
     assert.ok(
-      gateIdx < coreCallIdx,
-      `the coordinator-native gate (${gateIdx}) must precede the delegated commitAndPushTaskCore call (${coreCallIdx})`
+      gateIdx < pushCallIdx,
+      `the coordinator-native gate (${gateIdx}) must precede the final pushCommitPushV1 call (${pushCallIdx})`
     );
   });
 
-  void it("commitPushRowV1's executeCommitPushV1 also calls the read-only git readiness check before commitAndPushTaskCore (§10.2 step 2)", () => {
+  void it("commitPushRowV1's executeCommitPushV1 also calls the read-only git readiness check before the remaining coordinator-native steps (§10.2 step 2)", () => {
     const rowSource = fs.readFileSync(
       path.resolve(__dirname, "..", "..", "src", "actions", "rows", "commitPushRowV1.ts"),
       "utf8"
@@ -216,12 +288,71 @@ void describe("commitAndPushTaskCore source order (§10.2 steps 1-2)", () => {
       executeStart
     );
     assert.ok(readinessGateIdx > executeStart, "executeCommitPushV1 must call checkGitPublishReadiness");
-    const coreCallIdx = rowSource.indexOf("await commitAndPushTaskCore(", executeStart);
-    assert.ok(coreCallIdx > executeStart, "could not find the commitAndPushTaskCore call");
+    const pushCallIdx = rowSource.indexOf("await pushCommitPushV1(", executeStart);
+    assert.ok(pushCallIdx > executeStart, "could not find the pushCommitPushV1 call");
     assert.ok(
-      indexGateIdx < readinessGateIdx && readinessGateIdx < coreCallIdx,
+      indexGateIdx < readinessGateIdx && readinessGateIdx < pushCallIdx,
       `the index gate (${indexGateIdx}) must precede the readiness gate (${readinessGateIdx}), which must precede ` +
-        `the delegated commitAndPushTaskCore call (${coreCallIdx})`
+        `the final pushCommitPushV1 call (${pushCallIdx})`
+    );
+  });
+
+  void it("commitPushRowV1's executeCommitPushV1 opens the tracked operation and runs completion checks itself, before the remaining coordinator-native steps (§3.8/§10.2 step 3)", () => {
+    // The blocker this closes: completion checks (Publish Anyway / Fix with
+    // AI / Cancel), and now every remaining save/PR-description/
+    // commit-message/staging/commit/push step too, run in the coordinator,
+    // under an operation handle the coordinator itself opens via
+    // taskOperations.begin — the same acquire/release pair
+    // runTrackedOperation was always built on — never inside one opaque
+    // delegated "core" call.
+    const rowSource = fs.readFileSync(
+      path.resolve(__dirname, "..", "..", "src", "actions", "rows", "commitPushRowV1.ts"),
+      "utf8"
+    );
+    const executeStart = rowSource.indexOf("export async function executeCommitPushV1(");
+    assert.ok(executeStart >= 0, "could not find executeCommitPushV1");
+
+    const readinessGateIdx = rowSource.indexOf(
+      "checkGitPublishReadiness(services.resolvedTask.taskFolderPath)",
+      executeStart
+    );
+    assert.ok(readinessGateIdx > executeStart, "executeCommitPushV1 must call checkGitPublishReadiness");
+
+    const beginIdx = rowSource.indexOf("taskOperations.begin(lockKey", executeStart);
+    assert.ok(beginIdx > executeStart, "executeCommitPushV1 must open the tracked operation itself");
+
+    const checksIdx = rowSource.indexOf("runCommitPushCompletionChecksV1(", executeStart);
+    assert.ok(checksIdx > executeStart, "executeCommitPushV1 must call runCommitPushCompletionChecksV1");
+
+    const pushCallIdx = rowSource.indexOf("await pushCommitPushV1(", executeStart);
+    assert.ok(pushCallIdx > executeStart, "could not find the pushCommitPushV1 call");
+
+    const endIdx = rowSource.indexOf("taskOperations.end(op", executeStart);
+    assert.ok(endIdx > executeStart, "executeCommitPushV1 must end the tracked operation itself");
+
+    assert.ok(
+      readinessGateIdx < beginIdx &&
+        beginIdx < checksIdx &&
+        checksIdx < pushCallIdx &&
+        pushCallIdx < endIdx,
+      `readiness (${readinessGateIdx}) must precede opening the operation (${beginIdx}), which must precede ` +
+        `completion checks (${checksIdx}), which must precede the final pushCommitPushV1 call ` +
+        `(${pushCallIdx}), which must precede ending the operation (${endIdx})`
+    );
+  });
+
+  void it("the completion-checks decision loop runs exactly once, in runCommitPushCompletionChecksV1, never inside any of the remaining coordinator-native steps", () => {
+    // runChecks is a const local to runCommitPushCompletionChecksV1's own
+    // lexical scope, so it can only ever be called from within that
+    // function — this asserts the two expected call sites (the initial
+    // check and the post-fix re-check inside the Publish Anyway / Fix with
+    // AI loop) and that no other occurrence exists in the file.
+    const occurrences = source.split("await runChecks()").length - 1;
+    assert.equal(
+      occurrences,
+      2,
+      "await runChecks() must appear exactly twice, both inside runCommitPushCompletionChecksV1 — " +
+        "completion checks run exactly once per attempt, never re-run by a different function"
     );
   });
 

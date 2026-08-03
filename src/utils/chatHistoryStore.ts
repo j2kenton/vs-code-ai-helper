@@ -350,8 +350,13 @@ function ensureConversationChatRootV1(
  * conversation with no ownership to derive a real binding from — see
  * `resolveDefaultTaskBindingV1`). An explicit `coordinatorSupplied` binding
  * always takes precedence (see `taskBindingSource`).
+ *
+ * Exported so `globalAssistantSend.v1` (openGeneralAssistant.ts) can derive
+ * the SAME id to pass as the coordinator's `taskBinding.taskBindingId` —
+ * there must be exactly one formula for the Global Assistant's binding, not
+ * a second one recomputed at the call site.
  */
-function localTaskBindingId(canonicalId: string): string {
+export function localTaskBindingId(canonicalId: string): string {
   return sha256Hex(`chat-task-binding:${canonicalId}`);
 }
 

@@ -1,31 +1,30 @@
 import * as vscode from "vscode";
 import { TaskInventory } from "../state/taskInventory";
-import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { ChatViewProvider } from "../views/chatView";
-import { RUNS_DIRNAME } from "../types/taskProgress";
-import { AgentRunResult } from "../types/agentRunner";
 import { resolveTaskRootForCreation } from "../utils/taskRoot";
 import { resolveFreshModelForStage } from "../utils/modelSelection";
-import {
-  getConfiguredBackupModelsForStage,
-  resolveRunnerForModel,
-} from "../runners/runnerRegistry";
-import { isAuthenticationFailure } from "../utils/quota";
+import { checkRunnerAvailabilityForModel } from "../runners/runnerRegistry";
 import { ensureAiConsent } from "../utils/aiConsent";
 import { checkAndConfirmPromptSize } from "../utils/promptSizeGuard";
 import { runTrackedOperation } from "../utils/taskOperations";
-import {
-  executeProposedAction,
-  GLOBAL_ASSISTANT_OPERATIONS,
-  parseProposedAction,
-  stripActionEnvelopes,
-} from "../utils/globalAssistantActions";
-import { PendingOperationsStore } from "../state/pendingOperationsStore";
-import { stripAttributionHeaders } from "../utils/fileUtils";
+import { GLOBAL_ASSISTANT_OPERATIONS } from "../utils/globalAssistantActions";
 import { NotificationRouter } from "../utils/notificationRouter";
+import { assertLegacyAiRouteAllowedV0 } from "../services/legacyAiActionSafetyGateV0";
+import { ensureWorkflowNonTaskStorageRootV1 } from "../services/workflowRuntimeServicesV1";
+import {
+  GLOBAL_ASSISTANT_CANONICAL_ID,
+  localTaskBindingId,
+  readChatDocumentIdentityV1,
+} from "../utils/chatHistoryStore";
+import { allocateHex128IdV1 } from "../types/actionCorrelationV1";
+import { createProductionTaskActionCoordinatorV1 } from "../actions/productionTaskActionRuntimeV1";
+import {
+  GLOBAL_ASSISTANT_SEND_ACTION_KEY_V1,
+  GlobalAssistantSendActionInputV1,
+  validateGlobalAssistantSendInputV1,
+} from "../actions/rows/globalAssistantSendRowV1";
+import { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
 
-/** Stable identity for the global assistant's own, fully separate history. */
-import { GLOBAL_ASSISTANT_CANONICAL_ID } from "../utils/chatHistoryConstants";
 export { GLOBAL_ASSISTANT_CANONICAL_ID };
 const GLOBAL_ASSISTANT_DIRNAME = "global-assistant";
 
@@ -94,7 +93,16 @@ export async function openGeneralAssistant(
   await chatViewProvider.open(target);
 }
 
-/** Exported for testing: the prompt names only registry operations. */
+/** Chat never invokes tools or edits code — the runner is the same text-only
+ * planning/review runner used to answer questions (CLI providers run in
+ * `mode: "text"`, native edit permissions withheld). The response may
+ * propose at most one allowlisted cross-task operation (see
+ * GLOBAL_ASSISTANT_OPERATIONS) via `[[ACTION:<id> <json payload>]]`; the
+ * proposal is executed through the shared typed action executor
+ * (executeProposedAction), so the confirmation gate, state-accurate outcome
+ * verification, and audit logging are identical regardless of which UI
+ * surface triggered it — the model never executes anything itself, and
+ * unlisted ids are rejected. */
 export function buildGlobalAssistantPrompt(
   taskSummary: string,
   conversation: string,
@@ -124,121 +132,25 @@ export function buildGlobalAssistantPrompt(
 }
 
 /**
- * Run the global assistant's prompt against its primary model, falling
- * through the user's configured backup models on quota/temporary-
- * unavailability failures — mirroring stage-specific calls.
- *
- * Stage-specific runs get this fallback for free from
- * `resolveRunnerForModel(modelId, stage, taskFolderUri)`: its wrapped
- * runner reserves the switch-over in `taskFolderUri`'s `task-progress.json`
- * (see `reserveFallback` in runnerRegistry.ts) before trying any backup.
- * The global assistant's folder is not a task and has no
- * `task-progress.json`, so that reservation write silently no-ops
- * (`patchTaskProgress` returns undefined when there's nothing to read) and
- * the wrapped runner's fallback branch never runs — every quota failure on
- * the primary model surfaced directly as a hard failure, with configured
- * backups never attempted. Walk the candidate chain explicitly instead,
- * resolving each candidate with `resolveRunnerForModel(candidate, undefined,
- * folder)` (no `stage` argument, so no nested reservation-gated wrapping) —
- * the same pattern `runSecondOpinionReview` in reviewActions.ts already
- * uses for backup iteration outside the normal stage-reservation flow.
- *
- * Backup list choice: the global assistant isn't tied to a particular
- * stage, but it already borrows the Task Description stage's primary model
- * (see its chat label) — so its backups are taken from that same stage's
- * configuration via `getConfiguredBackupModelsForStage("desc", ...)`, not
- * gated on that stage's fallback *strategy* (a user who chose
- * "pause-and-resume" or "alert-and-wait" for Task Description still has
- * models configured and available; only the automatic quota-switch opt-in
- * is stage-specific, and the global assistant was never wired into that
- * per-stage opt-in to begin with). This choice can be revisited if a
- * different backup source is wanted.
+ * Send a message to the global assistant. Reaches a provider through
+ * `globalAssistantSend.v1`'s coordinator row (globalAssistantSendRowV1.ts)
+ * — the same V1-correlated runner boundary every other AI action uses —
+ * rather than a direct `resolveRunnerForModel(...).runner.run(...)` call:
+ * the shared boundary (`assertNoUnauthorizedV1CorrelationV0` in
+ * runnerRegistry.ts) unconditionally rejects an uncorrelated invocation, so
+ * the assistant needs a real `actionKey` to reach a model at all. The
+ * coordinator also gives it primary→backup model fallback for free, using
+ * the Task Description stage's configured backups (via
+ * `resolveStagePrimaryModel`) — the same stage its primary model is borrowed
+ * from (see its chat label).
  */
-async function runGlobalAssistantWithFallback(
-  folder: vscode.Uri,
-  workspaceUri: vscode.Uri,
-  primaryModelId: string,
-  prompt: string,
-  runsUri: vscode.Uri,
-  token: vscode.CancellationToken
-): Promise<{ result: AgentRunResult; outputFile?: vscode.Uri; providerLabel: string }> {
-  const candidateModelIds = [
-    primaryModelId,
-    ...getConfiguredBackupModelsForStage("desc", primaryModelId),
-  ];
-
-  let lastResult: AgentRunResult = {
-    runnerId: "none",
-    status: "failed",
-    failureKind: "generic",
-    errorMessage: "No model is configured for the Global Assistant.",
-  };
-  let lastProviderLabel = "";
-
-  for (const candidateModelId of candidateModelIds) {
-    let resolved: ReturnType<typeof resolveRunnerForModel>;
-    try {
-      resolved = resolveRunnerForModel(candidateModelId, undefined, folder);
-    } catch {
-      continue;
-    }
-    lastProviderLabel = resolved.providerLabel;
-
-    let availability: Awaited<ReturnType<typeof resolved.runner.isAvailable>>;
-    try {
-      availability = await resolved.runner.isAvailable();
-    } catch {
-      continue;
-    }
-    const authFailure = isAuthenticationFailure(availability.reason);
-    if (!availability.available && !authFailure) {
-      lastResult = {
-        runnerId: resolved.runner.id,
-        status: "failed",
-        failureKind: "temporarily-unavailable",
-        errorMessage: availability.reason ?? `${resolved.providerLabel} is unavailable.`,
-      };
-      continue;
-    }
-
-    const outputFile = vscode.Uri.joinPath(
-      runsUri,
-      `chat-${Date.now()}-${candidateModelId.replace(/[^a-z0-9]+/gi, "-")}.md`
-    );
-    const result = await resolved.runner.run(
-      {
-        taskFolderUri: folder,
-        workspaceUri,
-        stage: "desc",
-        prompt,
-        outputFile,
-        modelId: resolved.nativeModelId,
-      },
-      token
-    );
-    lastResult = result;
-    if (result.status === "cancelled" || result.status === "completed") {
-      return { result, outputFile, providerLabel: resolved.providerLabel };
-    }
-    // Never spend a backup on an authentication/config failure, and stop
-    // trying further candidates on any failure that isn't quota/temporary —
-    // matching resolveRunnerForModel's own fallback gating.
-    if (authFailure || (result.failureKind !== "quota" && result.failureKind !== "temporarily-unavailable")) {
-      return { result, providerLabel: resolved.providerLabel };
-    }
-    // Quota/temporary failure: fall through to the next candidate.
-  }
-
-  return { result: lastResult, providerLabel: lastProviderLabel };
-}
-
 async function globalAssistantSend(
   context: vscode.ExtensionContext,
   inventory: TaskInventory,
-  currentTaskStore: CurrentTaskStore,
   chatViewProvider: ChatViewProvider,
   arg?: { message?: string }
 ): Promise<void> {
+  assertLegacyAiRouteAllowedV0("globalAssistantSend.v1");
   const message = arg?.message?.trim();
   if (!message) {
     return;
@@ -283,6 +195,21 @@ async function globalAssistantSend(
           void vscode.commands.executeCommand("vs-code-ai-helper.openAiModels");
           return;
         }
+        const { availability: available, providerLabel } = await checkRunnerAvailabilityForModel(
+          modelId,
+          "desc"
+        );
+        if (!available.available) throw new Error(available.reason ?? `${providerLabel} is unavailable.`);
+
+        // Registration side-effect matters (the file store resolves against
+        // it); the non-task root carries no ownership binding to read back —
+        // its coordinator binding is the same local digest stand-in
+        // chatHistoryStore.ts already uses as this conversation's default.
+        ensureWorkflowNonTaskStorageRootV1(folder.fsPath);
+        const taskBindingId = localTaskBindingId(GLOBAL_ASSISTANT_CANONICAL_ID);
+        const chatIdentity = await readChatDocumentIdentityV1(folder.fsPath, GLOBAL_ASSISTANT_CANONICAL_ID);
+        const chatDocumentId = chatIdentity?.documentId ?? allocateHex128IdV1();
+
         const tasks = inventory.getTasks();
         const taskSummary =
           tasks.length === 0
@@ -294,61 +221,71 @@ async function globalAssistantSend(
                 )
                 .join("\n");
         const conversation = (
-          await chatViewProvider.transcript(identity.taskFolderPath, identity.canonicalId)
+          await chatViewProvider.transcript(identity.taskFolderPath, identity.canonicalId, "desc")
         )
           .slice(-20)
           .map((entry) => `${entry.role.toUpperCase()}: ${entry.text}`)
           .join("\n");
         const prompt = buildGlobalAssistantPrompt(taskSummary, conversation, message);
-        // Provider label used only for the size-confirmation prompt text —
-        // the actual model attempted (and any backup fallback) is resolved
-        // fresh inside runGlobalAssistantWithFallback below.
-        const { providerLabel } = resolveRunnerForModel(modelId, undefined, folder);
         const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel);
         if (sizeCheck === "abort" || sizeCheck === "declined") {
           return;
         }
 
-        const runsUri = vscode.Uri.joinPath(folder, RUNS_DIRNAME);
-        await vscode.workspace.fs.createDirectory(runsUri);
-        const { result, outputFile } = await runGlobalAssistantWithFallback(
-          folder,
-          workspaceFolder.uri,
-          modelId,
+        const validatedInput: GlobalAssistantSendActionInputV1 = {
           prompt,
-          runsUri,
-          op.token!
-        );
-        if (result.status === "cancelled") {
-          await chatViewProvider.append("assistant", "Global Assistant request was cancelled.", "desc", identity);
+          taskFolderPath: folder.fsPath,
+          canonicalId: GLOBAL_ASSISTANT_CANONICAL_ID,
+        };
+        const inputValidation = validateGlobalAssistantSendInputV1(validatedInput);
+        if (!inputValidation.ok) {
+          NotificationRouter.showError(`Unable to send: ${inputValidation.reason}`);
           return;
         }
-        if (result.status !== "completed" || !outputFile) {
-          throw new Error(result.errorMessage ?? "The Global Assistant did not respond.");
+
+        const coordinator = createProductionTaskActionCoordinatorV1({
+          workspaceCwd: workspaceFolder.uri.fsPath,
+          resolveStagePrimaryModel: () => ({ modelId, stage: "desc" }),
+        });
+
+        // Unlike chatSend.v1, the user's message is already persisted by the
+        // time this command runs — chatView.ts's Send handler appends it
+        // itself for the "global" target before dispatching here (the
+        // global assistant has no task/stage-existence precondition to
+        // validate first, unlike chatWithStage's append-after-validation
+        // ordering) — so there is no preInvocationHook to persist it here.
+        const admission = await coordinator.admitAction({
+          actionKey: GLOBAL_ASSISTANT_SEND_ACTION_KEY_V1,
+          taskBinding: { taskBindingId, chatDocumentId },
+          taskStatus: "active",
+          taskStage: "desc",
+          rawInput: validatedInput,
+          cancellationToken: op.token!,
+        });
+
+        let outcome: TaskActionOutcomeV1;
+        if (admission.kind === "settled") {
+          outcome = admission.outcome;
+        } else {
+          outcome = await coordinator.continueAdmittedAction(admission.ticket);
         }
-        const rawResponse = stripAttributionHeaders(
-          new TextDecoder()
-            .decode(await vscode.workspace.fs.readFile(outputFile))
-            .trim()
-        );
-        const displayed = stripActionEnvelopes(rawResponse);
-        if (displayed) {
-          await chatViewProvider.append("assistant", displayed, "desc", identity);
-        }
-        const proposal = parseProposedAction(rawResponse);
-        if (proposal) {
-          const outcome = await executeProposedAction(
-            {
-              inventory,
-              currentTaskStore,
-              assistantFolderUri: folder,
-              pendingOperations: new PendingOperationsStore(context.workspaceState),
-            },
-            proposal
-          );
-          await chatViewProvider.append("assistant", outcome, "desc", identity);
-        } else if (!displayed) {
-          await chatViewProvider.append("assistant", "The Global Assistant did not return an answer.", "desc", identity);
+
+        if (outcome.kind === "completed") {
+          // Completed content has already been written to chat-v1.json by
+          // globalAssistantSendRowV1.ts's promoteCompletedContent. Refresh
+          // the chat view's transcript.
+          await chatViewProvider.open({
+            canonicalId: GLOBAL_ASSISTANT_CANONICAL_ID,
+            taskFolderPath: folder.fsPath,
+            stage: "desc",
+            taskName: "Global Assistant",
+            kind: "global",
+          });
+        } else if (outcome.kind === "cancelled") {
+          await chatViewProvider.append("assistant", "Global Assistant request was cancelled.", "desc", identity);
+        } else {
+          const code = "code" in outcome ? outcome.code : outcome.kind;
+          await chatViewProvider.append("assistant", `Unable to respond: ${code}`, "desc", identity);
         }
       }
     );
@@ -361,7 +298,6 @@ async function globalAssistantSend(
 export function registerOpenGeneralAssistantCommand(
   context: vscode.ExtensionContext,
   inventory: TaskInventory,
-  currentTaskStore: CurrentTaskStore,
   chatViewProvider: ChatViewProvider
 ): void {
   context.subscriptions.push(
@@ -370,8 +306,7 @@ export function registerOpenGeneralAssistantCommand(
     ),
     vscode.commands.registerCommand(
       "vs-code-ai-helper.globalAssistantSend",
-      (arg?: { message?: string }) =>
-        globalAssistantSend(context, inventory, currentTaskStore, chatViewProvider, arg)
+      (arg?: { message?: string }) => globalAssistantSend(context, inventory, chatViewProvider, arg)
     )
   );
 }

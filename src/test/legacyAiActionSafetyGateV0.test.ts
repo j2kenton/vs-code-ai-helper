@@ -39,6 +39,7 @@ const REGISTERED_ROUTE_IDS = [
   "lint.v1",
   "chatSend.v1",
   "commitPushMetadata.v1",
+  "globalAssistantSend.v1",
 ];
 
 /**
@@ -57,6 +58,7 @@ const MIGRATED_ROUTE_IDS = [
   "applyReview.v1",
   "chatSend.v1",
   "commitPushMetadata.v1",
+  "globalAssistantSend.v1",
   // Edit cohort (§7.8): migrated onto the sealed two-phase pipeline.
   "implementation.v1",
   "fastForward.v1",

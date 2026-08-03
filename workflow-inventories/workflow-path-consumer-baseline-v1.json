@@ -90,13 +90,13 @@
         },
         {
           "signal": "workspace.fs",
-          "span": "L2038-L2038",
-          "enclosingSymbol": "commitAndPushTaskCore"
+          "span": "L2220-L2220",
+          "enclosingSymbol": "generateCommitPushPrDescriptionV1"
         },
         {
           "signal": "workspace.fs",
-          "span": "L2042-L2042",
-          "enclosingSymbol": "commitAndPushTaskCore"
+          "span": "L2224-L2224",
+          "enclosingSymbol": "generateCommitPushPrDescriptionV1"
         }
       ],
       "sinkCategories": [
@@ -168,27 +168,16 @@
       "callSites": [
         {
           "signal": "workspace.fs",
-          "span": "L45-L45",
+          "span": "L44-L44",
           "enclosingSymbol": "resolveGlobalAssistantFolder"
-        },
-        {
-          "signal": "workspace.fs",
-          "span": "L313-L313",
-          "enclosingSymbol": "globalAssistantSend"
-        },
-        {
-          "signal": "workspace.fs",
-          "span": "L331-L331",
-          "enclosingSymbol": "rawResponse"
         }
       ],
       "sinkCategories": [
-        "providerPromptAttachment",
-        "folderEnumeration"
+        "artifactReadWrite"
       ],
-      "pathSource": "Workspace/task paths gathered for global-assistant context answers.",
-      "expectedHandling": "Global assistant reads workspace state for answers; must never attach Chat-private or workflow-control files once classification exists.",
-      "classifierCall": "pending:privacy — isWorkflowPrivatePathV1 on every attachment candidate (plan §2.2)",
+      "pathSource": "The Global Assistant's own dedicated non-task folder, joined from the resolved task-root candidate (resolveTaskRootForCreation) and a fixed \"global-assistant\" name — never a task/workflow path a caller supplies.",
+      "expectedHandling": "Creates the Global Assistant's dedicated folder if absent (idempotent createDirectory); the folder itself then registers as dedicated non-task storage (ensureWorkflowNonTaskStorageRootV1), never a task-folder root. No task artifact or Chat-private content is read/written at this call site.",
+      "classifierCall": "pending:privacy — classifyWorkflowPathV1 not required at this call site (fixed non-task storage folder path, no caller-supplied path reaches it)",
       "migrationCohort": "chat"
     },
     {
@@ -221,72 +210,47 @@
       "callSites": [
         {
           "signal": "import:child_process",
-          "span": "L81-L81",
+          "span": "L74-L74",
           "enclosingSymbol": "(module)"
         },
         {
           "signal": "import:fs",
-          "span": "L82-L82",
+          "span": "L75-L75",
           "enclosingSymbol": "(module)"
         },
         {
           "signal": "workspace.fs",
-          "span": "L690-L690",
+          "span": "L682-L682",
           "enclosingSymbol": "entries"
         },
         {
           "signal": "workspace.fs",
-          "span": "L703-L703",
+          "span": "L695-L695",
           "enclosingSymbol": "legacyEntries"
         },
         {
           "signal": "workspace.fs",
-          "span": "L1166-L1166",
-          "enclosingSymbol": "newContent"
-        },
-        {
-          "signal": "workspace.fs",
-          "span": "L1375-L1375",
-          "enclosingSymbol": "runAiToFile"
-        },
-        {
-          "signal": "workspace.fs",
-          "span": "L1458-L1458",
-          "enclosingSymbol": "runAiToFile"
-        },
-        {
-          "signal": "workspace.fs",
-          "span": "L1707-L1707",
-          "enclosingSymbol": "runSecondOpinionReview"
-        },
-        {
-          "signal": "workspace.fs",
-          "span": "L1734-L1734",
-          "enclosingSymbol": "runSecondOpinionReview"
-        },
-        {
-          "signal": "workspace.fs",
-          "span": "L2062-L2062",
+          "span": "L1390-L1390",
           "enclosingSymbol": "contentBytes"
         },
         {
           "signal": "workspace.fs",
-          "span": "L2530-L2530",
+          "span": "L1854-L1854",
           "enclosingSymbol": "runReviewForFolder"
         },
         {
           "signal": "workspace.fs",
-          "span": "L2547-L2547",
+          "span": "L1871-L1871",
           "enclosingSymbol": "runReviewForFolder"
         },
         {
           "signal": "workspace.fs",
-          "span": "L2935-L2935",
+          "span": "L2259-L2259",
           "enclosingSymbol": "runApply"
         },
         {
           "signal": "workspace.fs",
-          "span": "L5846-L5846",
+          "span": "L5267-L5267",
           "enclosingSymbol": "buildReviewResumeVariablesV1"
         }
       ],
@@ -475,7 +439,7 @@
       "callSites": [
         {
           "signal": "workspace.fs",
-          "span": "L200-L200",
+          "span": "L205-L205",
           "enclosingSymbol": "activate"
         }
       ],
@@ -921,8 +885,7 @@
       "path": "src/utils/completionLint.ts",
       "signals": [
         "import:child_process",
-        "import:fs",
-        "workspace.fs"
+        "import:fs"
       ],
       "callSites": [
         {
@@ -932,18 +895,8 @@
         },
         {
           "signal": "import:fs",
-          "span": "L7-L7",
+          "span": "L6-L6",
           "enclosingSymbol": "(module)"
-        },
-        {
-          "signal": "workspace.fs",
-          "span": "L432-L432",
-          "enclosingSymbol": "runAiPlanVerification"
-        },
-        {
-          "signal": "workspace.fs",
-          "span": "L447-L447",
-          "enclosingSymbol": "runAiPlanVerification"
         }
       ],
       "sinkCategories": [
@@ -1084,7 +1037,7 @@
       "callSites": [
         {
           "signal": "workspace.fs",
-          "span": "L408-L408",
+          "span": "L442-L442",
           "enclosingSymbol": "execute"
         }
       ],
@@ -1317,7 +1270,7 @@
       "callSites": [
         {
           "signal": "workspace.fs",
-          "span": "L426-L426",
+          "span": "L438-L438",
           "enclosingSymbol": "loadPersistedTarget"
         }
       ],

@@ -18,6 +18,7 @@ import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, it } from "node:test";
+import { MIGRATED_ACTION_KEYS_V0 } from "../services/legacyAiActionSafetyGateV0";
 
 const REPO_ROOT = path.resolve(__dirname, "..", "..");
 
@@ -178,18 +179,45 @@ void describe("LegacyAiActionSafetyGateV0 wiring", () => {
     });
   }
 
-  void it('chatView.ts :: the webview Send route gates on "chatSend.v1" before appending the user message', () => {
+  void it('chatView.ts :: the webview Send route gates on "chatSend.v1"/"globalAssistantSend.v1" before mutating the transcript or dispatching', () => {
     const filePath = path.join(REPO_ROOT, "src/views/chatView.ts");
     const content = fs.readFileSync(filePath, "utf8");
 
-    const gateCall = 'assertLegacyAiRouteAllowedV0("chatSend.v1")';
-    const gateIndex = content.indexOf(gateCall);
-    assert.ok(gateIndex >= 0, "chatView.ts webview Send route does not call the chatSend.v1 gate");
+    // Stage branch: the gate must precede the chatWithStage dispatch (the
+    // meaningful invariant — chatWithStage itself persists the user message,
+    // so there is no separate append call in this branch to anchor on).
+    const stageGateCall = 'assertLegacyAiRouteAllowedV0("chatSend.v1")';
+    const stageGateIndex = content.indexOf(stageGateCall);
+    assert.ok(stageGateIndex >= 0, "chatView.ts webview Send route does not call the chatSend.v1 gate");
 
-    const appendIndex = content.indexOf('await this.append("user", text', gateIndex);
+    const stageDispatchIndex = content.indexOf('"vs-code-ai-helper.chatWithStage"', stageGateIndex);
     assert.ok(
-      appendIndex > gateIndex,
-      "the chatSend.v1 gate must precede the user-message transcript append in chatView.ts"
+      stageDispatchIndex > stageGateIndex,
+      "the chatSend.v1 gate must precede the chatWithStage dispatch in chatView.ts"
+    );
+
+    // Global-assistant branch: this one DOES append the user message itself
+    // (globalAssistantSend does not persist it), so the gate must precede
+    // both that append and the dispatch — a disabled route must reject
+    // before the transcript is mutated, exactly like the stage branch above.
+    const globalGateCall = 'assertLegacyAiRouteAllowedV0("globalAssistantSend.v1")';
+    const globalGateIndex = content.indexOf(globalGateCall);
+    assert.ok(globalGateIndex >= 0, "chatView.ts webview Send route does not call the globalAssistantSend.v1 gate");
+    assert.ok(
+      globalGateIndex > stageGateIndex,
+      "the globalAssistantSend.v1 gate must be a distinct call from the stage branch's chatSend.v1 gate"
+    );
+
+    const globalAppendIndex = content.indexOf('await this.append("user", text', globalGateIndex);
+    assert.ok(
+      globalAppendIndex > globalGateIndex,
+      "the globalAssistantSend.v1 gate must precede the user-message transcript append for the global target"
+    );
+
+    const globalDispatchIndex = content.indexOf('"vs-code-ai-helper.globalAssistantSend"', globalGateIndex);
+    assert.ok(
+      globalDispatchIndex > globalAppendIndex,
+      "the globalAssistantSend.v1 gate must precede the globalAssistantSend dispatch"
     );
 
     assert.ok(
@@ -224,6 +252,77 @@ void describe("LegacyAiActionSafetyGateV0 wiring", () => {
     );
   });
 
+  void it(
+    "runImplementationWithAI's first-run checklist branch reaches the coordinator, not an " +
+      "uncorrelated legacy runner invocation (regression: the legacy runAiToFile helper used " +
+      "to be called directly here, so its runner.run call carried no V1 correlation and was " +
+      "rejected by runnerRegistry.ts's assertNoUnauthorizedV1CorrelationV0 backstop once " +
+      "LEGACY_UNCORRELATED_RUNNER_INVOCATION_REJECTED_V0 was enabled, even though " +
+      '"implementation.v1"\'s own route gate passed)',
+    () => {
+      const filePath = path.join(REPO_ROOT, "src/commands/reviewActions.ts");
+      const content = fs.readFileSync(filePath, "utf8");
+
+      // The legacy uncorrelated helper is deleted outright, not merely
+      // unreferenced, so it cannot be silently re-wired to a new call site.
+      assert.ok(
+        !content.includes("function runAiToFile("),
+        "the legacy runAiToFile helper must stay deleted from reviewActions.ts"
+      );
+
+      const runImplSigIndex = content.indexOf("export async function runImplementationWithAI(");
+      assert.ok(runImplSigIndex >= 0, "could not find runImplementationWithAI in reviewActions.ts");
+
+      const needsChecklistIndex = content.indexOf("if (needsChecklist)", runImplSigIndex);
+      assert.ok(needsChecklistIndex > runImplSigIndex, "could not find the needsChecklist branch");
+
+      // The branch's own closing brace: the next top-level "planFinalContent ="
+      // reassignment after the branch marks its end (mirrors the source shape
+      // asserted elsewhere in this suite rather than a brittle brace-counter).
+      const branchEndMarker = "planFinalContent = (await readNonEmptyText(canonicalUri)) ?? planFinalContent;";
+      const branchEndIndex = content.indexOf(branchEndMarker, needsChecklistIndex);
+      assert.ok(branchEndIndex > needsChecklistIndex, "could not find the end of the needsChecklist branch");
+
+      const branchBody = content.slice(needsChecklistIndex, branchEndIndex);
+      assert.ok(
+        branchBody.includes("invokeGenerateImplementationActionV1("),
+        "runImplementationWithAI's checklist branch must invoke the shared " +
+          "invokeGenerateImplementationActionV1 coordinator helper, not a legacy runner"
+      );
+      assert.ok(
+        !branchBody.includes("runAiToFile("),
+        "runImplementationWithAI's checklist branch must not call the deleted runAiToFile helper " +
+          "(a historical mention in an explanatory comment is fine — an actual call is not)"
+      );
+
+      // invokeGenerateImplementationActionV1 itself must route through
+      // coordinator.executeAction with the migrated "generateImplementation.v1"
+      // action key, so the checklist step's provider invocation carries real
+      // V1 correlation and is authorized at the runner/provider boundary.
+      const helperSigIndex = content.indexOf("async function invokeGenerateImplementationActionV1(");
+      assert.ok(helperSigIndex >= 0, "could not find invokeGenerateImplementationActionV1 in reviewActions.ts");
+      const helperEndIndex = content.indexOf(
+        "export async function generateImplementationWithAI(",
+        helperSigIndex
+      );
+      assert.ok(helperEndIndex > helperSigIndex, "could not find the end of invokeGenerateImplementationActionV1");
+      const helperBody = content.slice(helperSigIndex, helperEndIndex);
+      assert.ok(
+        helperBody.includes("coordinator.executeAction({") &&
+          helperBody.includes("actionKey: GENERATE_IMPLEMENTATION_ACTION_KEY_V1,"),
+        "invokeGenerateImplementationActionV1 must call coordinator.executeAction with " +
+          "actionKey: GENERATE_IMPLEMENTATION_ACTION_KEY_V1"
+      );
+
+      assert.equal(
+        MIGRATED_ACTION_KEYS_V0.has("generateImplementation.v1"),
+        true,
+        '"generateImplementation.v1" must be a migrated action key so this checklist-step ' +
+          "invocation is authorized at the runner/provider boundary"
+      );
+    }
+  );
+
   void it("the runner/provider boundary in runnerRegistry.ts calls the V1 correlation backstop", () => {
     const filePath = path.join(REPO_ROOT, "src/runners/runnerRegistry.ts");
     const content = fs.readFileSync(filePath, "utf8");
@@ -232,13 +331,17 @@ void describe("LegacyAiActionSafetyGateV0 wiring", () => {
       "runnerRegistry.ts does not import assertNoUnauthorizedV1CorrelationV0"
     );
     const occurrences = content.split("assertNoUnauthorizedV1CorrelationV0(").length - 1;
-    // The three call sites this round wired: resolveRunnerForModel's
-    // no-backup wrapper (withQuotaObservation), its backup-capable wrapper,
-    // and runImplementationForModel. (The import itself uses named-import
-    // syntax with no trailing "(", so it does not add to this count.)
+    // The four call sites: resolveRunnerForModel's no-backup wrapper
+    // (withQuotaObservation), its backup-capable wrapper,
+    // runImplementationForModel, and — closing a review finding that the
+    // stage-less branch returned the raw runner untouched, bypassing this
+    // assertion entirely rather than merely being subject to it —
+    // resolveRunnerForModel's stage-less wrapper (withUnauthorizedV1CorrelationBackstop).
+    // (The import itself uses named-import syntax with no trailing "(", so it
+    // does not add to this count.)
     assert.ok(
-      occurrences >= 3,
-      `expected assertNoUnauthorizedV1CorrelationV0 to be called at least 3 times, found ${occurrences}`
+      occurrences >= 4,
+      `expected assertNoUnauthorizedV1CorrelationV0 to be called at least 4 times, found ${occurrences}`
     );
   });
 });

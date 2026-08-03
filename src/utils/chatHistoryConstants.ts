@@ -24,17 +24,18 @@ export const CHAT_HISTORY_CORRUPT_FILENAME = "chat-v1.corrupt.json";
 export const CHAT_RECOVERY_SNAPSHOT_FILENAME = "snapshot-v1.json";
 
 /**
- * The Global Assistant's reserved conversation identity (its `canonicalId` in
- * every Chat With AI target and every chatHistoryStore call). Owned here, at
- * the utils layer, because chatHistoryStore.ts dispatches task-folder vs.
- * non-task-storage root registration on it — commands/openGeneralAssistant.ts
- * (which re-exports it) sits ABOVE this module in the dependency graph and
- * importing it from here would create a cycle through views/chatView.ts.
+ * The Global Assistant's reserved conversation identity. Its command surface
+ * (Open AI Assistant, Send) was retired during the Cleanup cohort's
+ * disposition of supplementary legacy AI routes (see
+ * legacyAiActionSafetyGateV0.ts's file header) and no longer exists, but this
+ * identity remains owned here, at the utils layer, because chatHistoryStore.ts
+ * still dispatches task-folder vs. non-task-storage root registration on it
+ * for the dedicated folder's historical/direct-storage-API test coverage.
  *
  * This is the ONLY conversation identity whose folder is registered through
- * the non-task storage path (`ensureWorkflowNonTaskStorageRootV1`): the Global
- * Assistant's dedicated folder is not a task and carries no task-progress.json
- * ownership binding. Every other conversation is a task conversation and its
- * folder must satisfy the strict, ownership-backed task-folder root contract.
+ * the non-task storage path (`ensureWorkflowNonTaskStorageRootV1`): its
+ * dedicated folder is not a task and carries no task-progress.json ownership
+ * binding. Every other conversation is a task conversation and its folder
+ * must satisfy the strict, ownership-backed task-folder root contract.
  */
 export const GLOBAL_ASSISTANT_CANONICAL_ID = "global-assistant";

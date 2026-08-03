@@ -1,6 +1,5 @@
 import * as vscode from "vscode";
 import { spawn, execSync, execFileSync } from "child_process";
-import * as crypto from "crypto";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { updateLintPayload } from "./taskProgressTransforms";
@@ -9,8 +8,6 @@ import * as path from "path";
 import { STAGE_ARTIFACT_FILENAMES, TaskProgress } from "../types/taskProgress";
 import { getCompletionCheckTimeoutMs, getKnownFlakyChecks, getPublishVerificationCommands, KnownFlakyCheck } from "../config/settings";
 import { promptAndPersistPublishScope } from "../commands/choosePublishScope";
-import { resolveModelForStage } from "./modelSelection";
-import { resolveRunnerForModel } from "../runners/runnerRegistry";
 
 /**
  * Resolve a package manager executable to an absolute path, preferring a
@@ -311,48 +308,6 @@ export function mergeAiPlanVerdicts(
   });
 }
 
-const PLAN_VERIFICATION_MAX_PLAN_CHARS = 20_000;
-
-function buildPlanVerificationPrompt(
-  items: readonly PlanItemVerification[],
-  planContent: string,
-  scopeFolder: string
-): string {
-  const numbered = items
-    .map((item, index) => `${index + 1}. ${item.text}`)
-    .join("\n");
-  const plan =
-    planContent.length > PLAN_VERIFICATION_MAX_PLAN_CHARS
-      ? `${planContent.slice(0, PLAN_VERIFICATION_MAX_PLAN_CHARS)}\n… (truncated)`
-      : planContent;
-  return [
-    "You are verifying whether a development task's plan items were actually implemented in the codebase.",
-    "",
-    `Verification scope (project folder): ${scopeFolder}`,
-    "",
-    "Inspect the repository READ-ONLY — do not create, modify, or delete any file. For every numbered plan item below decide:",
-    '- "passed": you found concrete evidence in the source code that the item is implemented.',
-    '- "failed": the item is not implemented, only partially implemented, or was deferred/descoped.',
-    '- "inconclusive": the code does not let you determine it either way.',
-    "",
-    "A checked checkbox in the plan is NOT evidence — verify against the actual source files.",
-    "",
-    "Plan items:",
-    numbered,
-    "",
-    "Full plan for context:",
-    "",
-    plan,
-    "",
-    "Respond with ONLY a fenced json code block containing an array with exactly one object per numbered item:",
-    "```json",
-    '[',
-    '  { "item": 1, "status": "passed", "note": "one-sentence evidence naming the file/function" }',
-    ']',
-    "```",
-  ].join("\n");
-}
-
 interface PlanVerificationCacheEntry {
   /** Scope + plan content — a changed plan or scope invalidates the entry. */
   contentKey: string;
@@ -371,84 +326,28 @@ export function clearPlanVerificationCache(): void {
   planVerificationCache.clear();
 }
 
-async function runAiPlanVerification(
-  taskFolderUri: vscode.Uri,
-  scopeFolder: string,
-  baseline: readonly PlanItemVerification[],
-  planContent: string
-): Promise<PlanItemVerification[]> {
-  const model = await resolveModelForStage(taskFolderUri, "publish");
-  if (!model.modelId) {
-    return markAiVerificationUnavailable(
-      baseline,
-      "no AI model is configured for the Publish stage"
-    );
-  }
-
-  let resolved: ReturnType<typeof resolveRunnerForModel>;
-  try {
-    resolved = resolveRunnerForModel(model.modelId, "publish", taskFolderUri);
-  } catch (error) {
-    return markAiVerificationUnavailable(
-      baseline,
-      error instanceof Error ? error.message : String(error)
-    );
-  }
-
-  const availability = await resolved.runner.isAvailable();
-  if (!availability.available) {
-    return markAiVerificationUnavailable(
-      baseline,
-      availability.reason ?? `${resolved.providerLabel} is unavailable`
-    );
-  }
-
-  const prompt = buildPlanVerificationPrompt(baseline, planContent, scopeFolder);
-  const outputFile = vscode.Uri.file(
-    path.join(taskFolderUri.fsPath, `.plan-verification.${crypto.randomUUID()}.tmp.md`)
+/**
+ * The AI-assisted verdict pass over the deterministic plan-item baseline.
+ *
+ * Retired during the Cleanup cohort's disposition of the three supplementary
+ * legacy AI routes discovered outside the plan's baseline route table (plan
+ * §8, legacyAiActionSafetyGateV0.ts's file header): this pass had no V1
+ * coordinator replacement, and its only invocation path — the legacy
+ * `resolveRunnerForModel`/`AgentRunner.run()` boundary — is now permanently
+ * and unconditionally rejected for every uncorrelated caller
+ * (`LEGACY_UNCORRELATED_RUNNER_INVOCATION_REJECTED_V0`), so the dead
+ * model-resolution/prompt/runner code that used to live here has been
+ * removed rather than left unreachable. `collectAiVerifiedPlanItems`'s only
+ * caller already treats this as a legitimate "AI verification unavailable"
+ * outcome and degrades to the deterministic baseline.
+ */
+function runAiPlanVerification(
+  baseline: readonly PlanItemVerification[]
+): PlanItemVerification[] {
+  return markAiVerificationUnavailable(
+    baseline,
+    "AI-assisted plan verification was retired and has no replacement pending a new implementation decision; status below reflects the deterministic checklist baseline only"
   );
-  const tokenSource = new vscode.CancellationTokenSource();
-  try {
-    const result = await resolved.runner.run(
-      {
-        taskFolderUri,
-        workspaceUri: vscode.Uri.file(scopeFolder),
-        stage: "publish",
-        prompt,
-        outputFile,
-        modelId: resolved.nativeModelId,
-      },
-      tokenSource.token
-    );
-    if (result.status !== "completed") {
-      return markAiVerificationUnavailable(
-        baseline,
-        result.errorMessage ??
-          `the ${resolved.providerLabel} verification run did not complete`
-      );
-    }
-    let output = "";
-    try {
-      output = new TextDecoder().decode(await vscode.workspace.fs.readFile(outputFile));
-    } catch {
-      // Missing/unreadable output file → treated as an empty response below.
-    }
-    const verdicts = parseAiPlanVerdicts(output, baseline.length);
-    if (verdicts.size === 0) {
-      return markAiVerificationUnavailable(
-        baseline,
-        "the AI response contained no parseable per-item verdicts"
-      );
-    }
-    return mergeAiPlanVerdicts(baseline, verdicts);
-  } finally {
-    tokenSource.dispose();
-    try {
-      await vscode.workspace.fs.delete(outputFile);
-    } catch {
-      // Already absent (run failed before writing) — nothing to clean up.
-    }
-  }
 }
 
 /**
@@ -457,10 +356,10 @@ async function runAiPlanVerification(
  * caching keyed on the plan content so back-to-back Publish checks don't
  * repeat the AI call. Absent/empty plan → undefined (no section rendered).
  */
-export async function collectAiVerifiedPlanItems(
+export function collectAiVerifiedPlanItems(
   taskFolderUri: vscode.Uri,
   scopeFolder: string
-): Promise<PlanItemVerification[] | undefined> {
+): PlanItemVerification[] | undefined {
   let planContent: string;
   try {
     planContent = fs.readFileSync(
@@ -486,15 +385,7 @@ export async function collectAiVerifiedPlanItems(
     return cached.items.map((item) => ({ ...item }));
   }
 
-  let items: PlanItemVerification[];
-  try {
-    items = await runAiPlanVerification(taskFolderUri, scopeFolder, baseline, planContent);
-  } catch (error) {
-    items = markAiVerificationUnavailable(
-      baseline,
-      error instanceof Error ? error.message : String(error)
-    );
-  }
+  const items = runAiPlanVerification(baseline);
   planVerificationCache.set(cacheKey, { contentKey, at: Date.now(), items });
   return items.map((item) => ({ ...item }));
 }
@@ -1034,7 +925,7 @@ function renderCompletionChecksSection(
       "",
       "### Plan Item Verification",
       "",
-      `_AI-assisted completion check of the plan checklist against the implementation (not a completion gate): ${counts.passed} passed, ${counts.failed} failed, ${counts.inconclusive} inconclusive._`,
+      `_Deterministic completion check of the plan checklist against the implementation (not a completion gate; AI-assisted verdicts are unavailable in this build — see the per-item notes below): ${counts.passed} passed, ${counts.failed} failed, ${counts.inconclusive} inconclusive._`,
       ""
     );
     for (const item of result.planItems) {
@@ -1276,7 +1167,7 @@ export async function collectCompletionLintPreview(
     // Plan-item completion is AI-verified against the same scope the
     // lint/test checks ran in — a checked box in plan-final.md alone
     // never passes.
-    result.planItems = await collectAiVerifiedPlanItems(folderUri, scopeFolder);
+    result.planItems = collectAiVerifiedPlanItems(folderUri, scopeFolder);
   }
   return result;
 }

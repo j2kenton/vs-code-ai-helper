@@ -21,7 +21,7 @@ import * as vscode from "vscode";
 
 import { ChatViewProvider } from "../views/chatView";
 import { CHAT_HISTORY_FILENAME } from "../utils/chatHistoryStore";
-import { GLOBAL_ASSISTANT_CANONICAL_ID } from "../commands/openGeneralAssistant";
+import { GLOBAL_ASSISTANT_CANONICAL_ID } from "../utils/chatHistoryConstants";
 import { makeOwnedTaskFolder } from "./taskFolderFixture";
 
 /** Bridges vscode.workspace.fs.readFile to the real filesystem, mirroring

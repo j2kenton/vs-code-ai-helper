@@ -56,6 +56,7 @@ import {
   registerOpenGeneralAssistantCommand,
   resolveGlobalAssistantTarget,
 } from "./commands/openGeneralAssistant";
+import { setGlobalAssistantRuntimeDepsV1 } from "./utils/globalAssistantActions";
 import { registerRunLintingFixesCommand } from "./commands/runLintingFixes";
 import { registerRunPublishChecksCommand } from "./commands/runPublishChecks";
 import { registerScheduleTaskResumeCommand } from "./commands/scheduleTaskResume";
@@ -184,6 +185,10 @@ export function activate(context: vscode.ExtensionContext): void {
   // With no stage conversation selected, the Chat With AI panel defaults to
   // the global assistant instead of a "select a task first" blocked state.
   chatViewProvider.setDefaultTargetFactory(resolveGlobalAssistantTarget);
+  // globalAssistantSendRowV1.ts's promoteCompletedContent runs from the
+  // process-lifetime action registry singleton, not a per-call closure, so
+  // it reads inventory/currentTaskStore/workspaceState from here instead.
+  setGlobalAssistantRuntimeDepsV1({ inventory, currentTaskStore, workspaceState: context.workspaceState });
 
   // Wire the shared workflow runtime's private-storage root and the durable
   // Chat interaction transaction store (plan §2.1/§5.5) so the structured
@@ -607,7 +612,7 @@ export function activate(context: vscode.ExtensionContext): void {
       statusTreeProvider.runAction(node as Parameters<StatusTreeProvider["runAction"]>[0]);
     }
   ));
-  registerOpenGeneralAssistantCommand(context, inventory, currentTaskStore, chatViewProvider);
+  registerOpenGeneralAssistantCommand(context, inventory, chatViewProvider);
   context.subscriptions.push(
     vscode.commands.registerCommand("vs-code-ai-helper.openChatData", () =>
       chatViewProvider.openChatDataForCurrentTarget()

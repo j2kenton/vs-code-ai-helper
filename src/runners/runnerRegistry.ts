@@ -178,12 +178,7 @@ function filterEnabledBackupModels(models: readonly string[]): string[] {
  * Do not reuse this for a different question than "should a quota failure
  * silently switch providers" — see getConfiguredBackupModelsForStage below
  * for "what alternate models are configured for this stage at all",
- * independent of that strategy choice. Also exported for runAiToFile's
- * content-validation retry (reviewActions.ts): a model that exits cleanly
- * with unusable content is, from the user's automatic-switch-over
- * preference's point of view, exactly the same question as a quota failure —
- * so it must honor the same strategy gate, not the second-opinion mechanism's
- * strategy-agnostic list below.
+ * independent of that strategy choice.
  */
 export function backupModelsForStage(
   stage: TaskStage | undefined,
@@ -283,10 +278,7 @@ export async function checkRunnerAvailabilityForModel(
  * `resolveModelForStage` call honoring `fallbackActive` (e.g. a subsequent
  * Fast Forward iteration passing `preserveActiveFallback`) routes straight to
  * the known-working model instead of re-paying the cost of a known-flaky
- * primary. Exported for runAiToFile's content-validation retry
- * (reviewActions.ts), which needs to record the same outcome when ITS OWN
- * backup search (not this file's quota/unavailable cascade) is what actually
- * found the working model.
+ * primary.
  */
 export async function recordActiveFallbackModel(
   taskFolderUri: vscode.Uri,
@@ -357,6 +349,38 @@ function withQuotaObservation(
       const result = await runner.run(request, token);
       recordQuotaObservation(stage, modelId, result.failureKind, result.errorMessage);
       return result;
+    },
+  };
+}
+
+/**
+ * Regression coverage for a review finding: the stage-less branch of
+ * `resolveRunnerForModel` returned the raw runner from `toResolvedRunner`
+ * untouched, so a caller that never passes `stage` (historically
+ * `runSecondOpinionReview` in reviewActions.ts and the Global Assistant in
+ * openGeneralAssistant.ts — both call sites were later removed entirely
+ * during the Cleanup cohort's disposition of those two routes, see
+ * legacyAiActionSafetyGateV0.ts's file header) reached the concrete
+ * `CliAgentRunner`/`CopilotLanguageModelRunner` `.run()` directly — bypassing
+ * `assertNoUnauthorizedV1CorrelationV0` entirely, not merely being subject to
+ * it. `withQuotaObservation` and the backup-model wrapper below both already
+ * assert before delegating; this gives the stage-less path the identical
+ * guarantee so EVERY exit of this function enforces the same boundary, per
+ * the plan's "shared runner/provider boundary ... rejects ... any legacy
+ * (uncorrelated) request" rule (plan §1.3) with no caller-shape exemption —
+ * kept even though no production caller of this branch remains today, since
+ * `resolveRunnerForModel`/`AgentRunner.run()` stays retained, tested legacy
+ * infrastructure (plan §3.4: "No supported text runner silently disappears").
+ */
+function withUnauthorizedV1CorrelationBackstop(runner: AgentRunner): AgentRunner {
+  return {
+    id: runner.id,
+    label: runner.label,
+    capabilities: runner.capabilities,
+    isAvailable: () => runner.isAvailable(),
+    async run(request, token): Promise<AgentRunResult> {
+      assertNoUnauthorizedV1CorrelationV0(request);
+      return runner.run(request, token);
     },
   };
 }
@@ -444,7 +468,7 @@ export function resolveRunnerForModel(
 ): ResolvedRunner {
   const resolved = toResolvedRunner(resolveEffectiveProvider(modelId));
   if (!stage) {
-    return resolved;
+    return { ...resolved, runner: withUnauthorizedV1CorrelationBackstop(resolved.runner) };
   }
   const primary = resolved.runner;
   // Record what every run reveals about this stage+model's quota state

@@ -320,7 +320,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       } else {
         // The global assistant has its own send path — it is not a task or
         // stage chat, chatWithStage cannot resolve its synthetic folder, and
-        // globalAssistantSend does not persist the user message itself.
+        // globalAssistantSend does not persist the user message itself. Same
+        // reasoning as the stage branch above: consult the gate BEFORE
+        // appending, so a disabled route rejects without mutating the
+        // transcript instead of leaving an unanswerable message behind an
+        // unhandled rejection from the command dispatch below.
+        try {
+          assertLegacyAiRouteAllowedV0("globalAssistantSend.v1");
+        } catch (error) {
+          NotificationRouter.showError(
+            error instanceof Error ? error.message : String(error)
+          );
+          return;
+        }
         await this.append("user", text, target.stage, target);
         await vscode.commands.executeCommand("vs-code-ai-helper.globalAssistantSend", {
           message: text,

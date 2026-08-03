@@ -14,7 +14,7 @@ import {
   upsertCompletionChecksInPublishReview,
 } from "../utils/completionLint";
 import { checkPublishPreflight } from "../utils/publishPreflight";
-import { runGitCommand, resolveGitRepo, checkGitPublishReadiness } from "../utils/gitRepoInfo";
+import { runGitCommand, resolveGitRepo, checkGitPublishReadiness, GitPublishReadiness } from "../utils/gitRepoInfo";
 import { runLintingFixes } from "./runLintingFixes";
 import { resolveFreshModelForStage } from "../utils/modelSelection";
 import {
@@ -51,8 +51,8 @@ import { ChatInteractionRefV1, ChatInteractionResumeResultV1, ChatViewProvider }
 /**
  * A pending `commitPushMetadata.v1` Chat interaction being explicitly
  * resumed (plan §10.2 point 5). Threaded privately through
- * `commitAndPushTaskCore` into `reviewCommitMessage`/`resumeCommitMessage` so
- * the metadata attempt (`coordinator.resumeAction`) runs as part of THIS
+ * `reviewCommitPushMessageV1` into `reviewCommitMessage`/`resumeCommitMessage`
+ * so the metadata attempt (`coordinator.resumeAction`) runs as part of THIS
  * fresh operation's own token acquisition, index/privacy checks, and lint —
  * never generated ahead of that validation. `onSettled` reports the
  * interaction's terminal settlement (or a failure reason) back to
@@ -183,7 +183,7 @@ function isFileInFolder(filePath: string, folderPath: string): boolean {
  * working tree and index exactly as they were.
  *
  * Returns a discriminated result rather than a bare `string | undefined` so
- * the caller can settle `commitAndPushTaskCore`'s result correctly: metadata
+ * the caller can settle `reviewCommitPushMessageV1`'s result correctly: metadata
  * generation returning structured questions is not the same event as the
  * user explicitly dismissing the confirmation modal, even though both used
  * to collapse into the same `undefined` — the former needs a `questions`
@@ -208,7 +208,7 @@ async function reviewCommitMessage(
   taskStatus: string | undefined,
   chatViewProvider?: ChatViewProvider,
   resumeInteraction?: CommitPushMetadataResumeRequestV1,
-  /** See `commitAndPushTaskCore`'s `coordinatorOperationId` param — passed straight through. */
+  /** See `reviewCommitPushMessageV1`'s `coordinatorOperationId` param — passed straight through. */
   coordinatorOperationId?: OperationIdV1
 ): Promise<CommitMessageReviewResultV1> {
   const MAX_PREVIEW_FILES = 15;
@@ -327,7 +327,7 @@ async function buildCommitMessage(
   files: string[],
   cancellationToken: vscode.CancellationToken,
   chatViewProvider?: ChatViewProvider,
-  /** See `commitAndPushTaskCore`'s `coordinatorOperationId` param — passed straight through. */
+  /** See `reviewCommitPushMessageV1`'s `coordinatorOperationId` param — passed straight through. */
   coordinatorOperationId?: OperationIdV1
 ): Promise<CommitMessageResultV1> {
   const fallback = `chore: complete ${taskName} changes for publish`.slice(0, 72);
@@ -460,7 +460,7 @@ async function resumeCommitMessage(
   taskStatus: string | undefined,
   chatViewProvider: ChatViewProvider | undefined,
   resumeInteraction: CommitPushMetadataResumeRequestV1,
-  /** See `commitAndPushTaskCore`'s `coordinatorOperationId` param — passed straight through. */
+  /** See `reviewCommitPushMessageV1`'s `coordinatorOperationId` param — passed straight through. */
   coordinatorOperationId?: OperationIdV1
 ): Promise<CommitMessageResultV1> {
   const fallback = `chore: complete ${taskName} changes for publish`.slice(0, 72);
@@ -1226,7 +1226,7 @@ async function saveDirtyDocuments(
   taskFolderPath: string,
   repoRoot: string,
   includeTaskFolder: boolean
-): Promise<boolean> {
+): Promise<{ readonly ok: true } | { readonly ok: false; readonly detail: string }> {
   const taskFileUri = vscode.Uri.file(path.join(taskFolderPath, TASK_FILENAME));
   const taskFolderUri = vscode.Uri.file(taskFolderPath);
   const implementationArtifact = await resolveImplementationArtifact(
@@ -1261,14 +1261,14 @@ async function saveDirtyDocuments(
   for (const doc of dirtyDocs) {
     const saved = await doc.save();
     if (!saved || doc.isDirty) {
-      NotificationRouter.showError(
-        `Could not save ${path.basename(doc.uri.fsPath)}. Please save all files before committing.`
-      );
-      return false;
+      return {
+        ok: false,
+        detail: `Could not save ${path.basename(doc.uri.fsPath)}. Please save all files before committing.`,
+      };
     }
   }
 
-  return true;
+  return { ok: true };
 }
 
 /**
@@ -1294,10 +1294,11 @@ export interface CommitPushDuplicateRejectedV1 {
  * unsafe as a second click on the same one.
  *
  * This is separate from — and sits in front of — the per-task exclusive
- * `runTrackedOperation` lock still used inside `commitAndPushTaskCore` below,
- * which continues to guard against a *different* operation (e.g. a stage AI
- * action) running concurrently on the same task, and supplies the
- * Notifications-row/cancel/nesting plumbing the flow relies on.
+ * tracked-operation lock `commitPushRowV1.ts`'s `executeCommitPushV1` opens
+ * directly (via `taskOperations.begin`/`taskOperations.end`), which continues
+ * to guard against a *different* operation (e.g. a stage AI action) running
+ * concurrently on the same task, and supplies the Notifications-row/cancel/
+ * nesting plumbing the flow relies on.
  */
 let commitPushTokenHeld = false;
 
@@ -1321,12 +1322,13 @@ function rejectDuplicateCommitPush(): CommitPushDuplicateRejectedV1 {
 }
 
 /**
- * Commit and push the current task — the named private core (plan §10.1),
- * containing all of the actual behavior. Never acquires or releases the
- * process-global token itself: only the two exported entry points below do
- * that, so a caller that already holds the token (the composite flow in
- * `completeCommitAndPushTask`) can invoke this directly, borrowing the held
- * token, without a self-rejection.
+ * Commit and push the current task — the coordinator-owned sequence of
+ * steps below (plan §3.8/§10.1/§10.2), containing all of the actual
+ * behavior. None of these steps acquire or release the process-global token
+ * themselves: only the two exported entry points below do that, so a caller
+ * that already holds the token (the composite flow in
+ * `completeCommitAndPushTask`) can invoke `invokeCommitPushRowV1` directly,
+ * borrowing the held token, without a self-rejection.
  *
  * ⚠️ RISK NOTICE (IMPORTANT — READ BEFORE MODIFYING):
  *
@@ -1349,13 +1351,16 @@ function rejectDuplicateCommitPush(): CommitPushDuplicateRejectedV1 {
 /**
  * The specific stopping point behind a `{ kind: "notCompleted" }` result
  * (plan §3.8's "the coordinator owns ... detailed outcomes"). Every
- * non-success exit from `commitAndPushTaskCore` sets one of these — instead
- * of leaving `commitPush.v1` (`commitPushRowV1.ts`) unable to distinguish
+ * non-success exit from the coordinator-native steps below (staging-scope
+ * resolution, confirmation, save, PR description, commit-message review,
+ * staging/commit, and push) sets one of these — instead of leaving
+ * `commitPush.v1` (`commitPushRowV1.ts`) unable to distinguish
  * "the user declined a prompt" from "git rejected the push" beyond a single
- * generic `commitPush.notCompleted` code. The user-facing explanation is
- * still shown via `NotificationRouter` at the exact point that set the
- * reason, unchanged from before this signal existed — this is a machine-
- * readable classification of that same moment, not a new message.
+ * generic `commitPush.notCompleted` code. The user-facing explanation for
+ * each reason is shown exactly once, from `commitPushRowV1.ts`'s
+ * `presentCommitPushCoreResultV1` (plan §3.8: "the coordinator owns ...
+ * presentation") — none of the coordinator-native step functions below show
+ * their own notification for a reason they set.
  */
 export type CommitAndPushNotCompletedReasonV1 =
   | "ineligibleStage"
@@ -1382,11 +1387,19 @@ export type CommitAndPushNotCompletedReasonV1 =
  * this function sets `{ kind: "notCompleted", reason }` with the specific
  * `CommitAndPushNotCompletedReasonV1` for that exit, rather than a single
  * undifferentiated failure signal.
+ *
+ * `detail` (present on `completed` and `notCompleted`) is the exact
+ * user-facing text for that stopping point — a caught error's message, a
+ * git-readiness reason, the resolved push destination, .... None of the
+ * coordinator-native steps that build this result show their own
+ * notification (plan §3.8: "the coordinator owns ... presentation");
+ * `executeCommitPushV1` (`commitPushRowV1.ts`) presents it exactly once, via
+ * `presentCommitPushCoreResultV1`, once the terminal result is known.
  */
 export type CommitAndPushCoreResultV1 =
-  | { readonly kind: "completed" }
+  | { readonly kind: "completed"; readonly detail?: string }
   | { readonly kind: "noChanges" }
-  | { readonly kind: "notCompleted"; readonly reason: CommitAndPushNotCompletedReasonV1 }
+  | { readonly kind: "notCompleted"; readonly reason: CommitAndPushNotCompletedReasonV1; readonly detail?: string }
   | {
       /**
        * The commit-message step returned structured questions instead of a
@@ -1409,7 +1422,7 @@ export type CommitAndPushCoreResultV1 =
  * persisted current-task canonical ID). Factored out so `commitPush.v1`
  * (`commitPushRowV1.ts`) can resolve the SAME task the SAME way — with
  * identical not-found messaging — before invoking the coordinator, without
- * that pre-check and `commitAndPushTaskCore`'s own resolution ever drifting
+ * that pre-check and the row's own sealed task binding ever drifting
  * apart. Shows the appropriate not-found message itself and returns
  * `undefined` on failure; malformed explicit args are hard failures (no
  * redirect to an unrelated task).
@@ -1454,13 +1467,14 @@ async function resolveCommitPushTargetTaskV1(
  * no later filter of OUR proposal list can un-stage it.
  *
  * `commitPushRowV1.ts`'s `executeCommitPushV1` calls this SAME function
- * itself, before ever invoking `commitAndPushTaskCore` below — a genuine,
- * distinct, coordinator-owned first step with its own outcome, rather than
- * the whole flow being one opaque call into the core. `commitAndPushTaskCore`
- * also calls this exact function again, under its own per-task lock,
- * immediately before it actually needs the result — the coordinator's copy
- * is a fast, lock-free pre-check for real sequencing and fast rejection
- * (skipping the core's tracked-operation UI row entirely for a
+ * itself, before ever opening the tracked "Commit and Push" operation — a
+ * genuine, distinct, coordinator-owned first step with its own outcome,
+ * rather than the whole flow being one opaque delegated call.
+ * `resolveCommitPushStagingScopeV1` below also calls this exact function
+ * again, under the per-task lock the coordinator already opened by that
+ * point, immediately before it actually needs the result — the
+ * coordinator's copy is a fast, lock-free pre-check for real sequencing and
+ * fast rejection (skipping the tracked-operation UI row entirely for a
  * privacy-blocked attempt), not a replacement for the lock-protected,
  * authoritative recheck that actually gates the git work (§7.7's
  * "revalidate immediately before mutation" philosophy, applied here).
@@ -1474,14 +1488,21 @@ export async function checkCommitPushIndexPrivacyV1(
   | {
       readonly ok: false;
       readonly reason: "noGitRepository" | "gitIndexReadFailed" | "privateContentStaged";
+      // The exact user-facing text for this stopping point (plan §3.8: "the
+      // coordinator owns ... presentation") — `executeCommitPushV1` shows
+      // this itself, exactly once, via `presentCommitPushCoreResultV1`;
+      // this function performs no notification/UI side effect of its own.
+      readonly detail: string;
     }
 > {
   const repoRoot = await resolveGitRepo(resolvedTask.taskFolderPath);
   if (!repoRoot) {
-    NotificationRouter.showError(
-      "Commit and push failed: Could not find git repository. Make sure the task is inside a git repository."
-    );
-    return { ok: false, reason: "noGitRepository" };
+    return {
+      ok: false,
+      reason: "noGitRepository",
+      detail:
+        "Commit and push failed: Could not find git repository. Make sure the task is inside a git repository.",
+    };
   }
   let stagedIndexRecords: PorcelainV2Entry[];
   try {
@@ -1489,10 +1510,11 @@ export async function checkCommitPushIndexPrivacyV1(
   } catch (error) {
     // Fail CLOSED: publishing without having verified the index would
     // defeat the §2.4 gate entirely.
-    NotificationRouter.showError(
-      `Commit and push failed: could not read the git index (${getErrorMessage(error)}).`
-    );
-    return { ok: false, reason: "gitIndexReadFailed" };
+    return {
+      ok: false,
+      reason: "gitIndexReadFailed",
+      detail: `Commit and push failed: could not read the git index (${getErrorMessage(error)}).`,
+    };
   }
   const forbiddenStaged = findForbiddenStagedRecordsV1(
     stagedIndexRecords,
@@ -1512,222 +1534,256 @@ export async function checkCommitPushIndexPrivacyV1(
     channel.appendLine("");
     channel.appendLine("Unstage them (git restore --staged <path>) and run Commit and Push again.");
     channel.show(true);
-    NotificationRouter.showError(
-      `Commit and push blocked: ${forbiddenStaged.length} private/workflow-control file(s) are already staged in the git index. ` +
-        "See 'Ensemble: Commit Preview' for the list — unstage them and retry."
-    );
-    return { ok: false, reason: "privateContentStaged" };
+    return {
+      ok: false,
+      reason: "privateContentStaged",
+      detail:
+        `Commit and push blocked: ${forbiddenStaged.length} private/workflow-control file(s) are already staged in the git index. ` +
+        "See 'Ensemble: Commit Preview' for the list — unstage them and retry.",
+    };
   }
   return { ok: true, repoRoot };
 }
 
-export async function commitAndPushTaskCore(
+export type CommitPushCompletionChecksResultV1 =
+  | { readonly ok: true }
+  | {
+      readonly ok: false;
+      readonly reason: Extract<CommitAndPushNotCompletedReasonV1, "checksDeclined" | "fixWithAiUnavailable">;
+    };
+
+/**
+ * §10.2's failing-checks decision (Publish Anyway / Fix with AI / Cancel,
+ * plan C3) as its own coordinator-native step: `commitPushRowV1.ts`'s
+ * `executeCommitPushV1` opens the "Commit and Push" tracked operation
+ * itself and calls this function DIRECTLY, before it ever calls into any of
+ * the remaining save/PR-description/commit-message/staging/commit/push
+ * steps below — genuine sequencing ownership of this step, not just
+ * admission/leasing wrapped around one opaque delegated call. Runs under
+ * `op`, the SAME handle the coordinator opened and will end, so the
+ * Notifications row and its nested "Completion checks"/"Fix with AI"
+ * children present exactly as they did when this loop used to run inside a
+ * single delegated core call.
+ *
+ * Unlike the index/privacy and git-readiness checks (cheap, side-effect-free
+ * reads that are safely re-run as an "authoritative revalidation immediately
+ * before mutation", §7.7, by `resolveCommitPushStagingScopeV1`/
+ * `confirmCommitPushScopeV1` below), this step cannot also be re-run later
+ * in the sequence — it can execute a real test/build suite and drives its
+ * own interactive modal, so running it twice would double-run expensive
+ * work or double-prompt the user. It therefore runs exactly ONCE, here, and
+ * every step below starts from its result.
+ *
+ * @internal exported for the commitPush.v1 row and for testing
+ */
+export async function runCommitPushCompletionChecksV1(
   inventory: TaskInventory,
   resolvedTask: ResolvedTaskContext,
-  explicitArg?: CommitAndPushTaskArg,
-  parentOperation?: TaskOperationHandle,
-  extensionContext?: vscode.ExtensionContext,
-  chatViewProvider?: ChatViewProvider,
-  // The commitPush.v1 ROW's own coordinator operationId (commitPushRowV1.ts),
-  // NOT `parentOperation` above (that's the unrelated tracked-operation UI
-  // nesting handle). Threaded down to reviewCommitMessage's nested
-  // commitPushMetadata.v1 invocation so it opens a CHILD lease on this same
-  // task binding instead of self-deadlocking against this row's own held
-  // lease. Undefined only for a hypothetical caller outside the commitPush.v1
-  // row (none exists in production today), in which case the nested call
-  // falls back to a plain top-level acquire — unchanged prior behavior.
-  coordinatorOperationId?: OperationIdV1
-): Promise<CommitAndPushCoreResultV1> {
-  let coreResult: CommitAndPushCoreResultV1 = { kind: "notCompleted", reason: "unexpectedError" };
-  const resumeInteraction = extractResumeInteraction(explicitArg);
-
-  // `resolvedTask` is a SEALED value: the caller (the commitPush.v1 row,
-  // via invokeCommitPushRowV1) already resolved and bound this exact task
-  // to the coordinator's correlation/eligibility check before invoking this
-  // core. Re-resolving here from `explicitArg`/current-task state — as this
-  // function used to do — could pick a DIFFERENT task than the one just
-  // bound (e.g. a no-argument invocation racing a concurrent
-  // currentTaskStore update), letting the acted-on task diverge from its
-  // own correlation. Never re-derive the target task from mutable state
-  // inside the core; resolve it exactly once, at the boundary, and thread
-  // that same object through.
-
-  // Per-task exclusive lock (contract C1). The process-global duplicate-
-  // invocation guard for Commit and Push itself already ran in the public
-  // entry point (commitAndPushTask / completeCommitAndPushTask) before this
-  // function — or any read, lint, prompt, staging, commit, or push logic —
-  // ever started. This lock's remaining job is guarding against a DIFFERENT
-  // operation (e.g. a stage AI action) already running for this same task,
-  // and providing the Notifications-row/cancel/nesting plumbing used
-  // throughout this flow. When invoked as part of the Complete/Commit/Push
-  // composite, this registers as a child of that root (C1 nesting) instead
-  // of contending for the lock the root holds.
-  const lockKey = resolvedTask.taskFolderPath;
-  try {
-  await runTrackedOperation(
-    lockKey,
-    {
-      label: "Commit and Push",
-      taskName: resolvedTask.folderName,
-      kind: "commit-push",
-      parent: parentOperation,
-      // The V1 action coordinator requires a real CancellationToken for
-      // every provider action (TaskActionRequestV1.cancellationToken is not
-      // optional) — commit-message generation below passes op.token into it.
-      // Without `cancellable: true` here, taskOperations never creates a
-      // token source, op.token stays undefined, and the coordinator's
-      // admission phase throws on `cancellationToken.isCancellationRequested`
-      // before ever reaching a provider — silently caught by
-      // buildCommitMessage's catch-all, so every real invocation fell back
-      // to the deterministic subject instead of the configured AI message.
-      cancellable: true,
-    },
-    async (op) => {
-    // Allow committing from completed stage only
-    if (resolvedTask.progress.currentStage !== "publish") {
-      NotificationRouter.showWarning(
-        `Task is at stage "${STAGE_DISPLAY_NAMES[resolvedTask.progress.currentStage]}" — must be completed before committing and pushing.`
-      );
-      coreResult = { kind: "notCompleted", reason: "ineligibleStage" };
-      return;
+  extensionContext: vscode.ExtensionContext | undefined,
+  op: TaskOperationHandle,
+  lockKey: string
+): Promise<CommitPushCompletionChecksResultV1> {
+  // Always run fresh checks immediately before a commit. Persisted payloads
+  // are informational and may be stale after files were edited. Registered
+  // as a child (C1 publish model) so the Publish stage row spins while the
+  // pre-commit checks run. Every run — passing, failing, or a post-fix
+  // rerun — is also recorded in publish-review.md's managed Completion
+  // Checks section by runCompletionLint itself (completionLint.ts), so the
+  // artifact always reflects the latest result whatever the user decides
+  // below; the Publish Anyway branch only layers the override annotation on
+  // top of that record.
+  // checkPublishPreflight now checks read-only git readiness (repo,
+  // branch, remote — via checkGitPublishReadiness) before it ever runs
+  // the lint. A git-readiness failure can't be fixed by "Fix with AI" or
+  // meaningfully overridden by "Publish Anyway" (there is nowhere to
+  // push), so it's surfaced directly by executeCommitPushV1's own pre-check
+  // instead of going through the failing-checks modal below, which is
+  // reserved for lint/test failures.
+  const runChecks = async (): Promise<CompletionLintResult> => {
+    const preflight = (await runTrackedOperation(
+      lockKey,
+      { parent: op, label: "Completion checks", stage: "publish", kind: "completion-checks" },
+      () => checkPublishPreflight(vscode.Uri.file(resolvedTask.taskFolderPath), resolvedTask.progress.implReviewFiles, { persist: true })
+    ))!;
+    if (preflight.lintPayload) {
+      return preflight.lintPayload;
     }
-
-    // §10.2 step 1 / §2.4 rule 4: index/privacy checks run FIRST — before
-    // git readiness, lint, and every prompt. This is the SAME lock-free
-    // check commitPushRowV1's `executeCommitPushV1` already ran, as the
-    // coordinator-native first step, before ever calling into this core;
-    // repeating it here, under this function's per-task lock, is the
-    // authoritative revalidation immediately before the result is actually
-    // used (§7.7) — not redundant duplication of a decision already made.
-    const indexCheck = await checkCommitPushIndexPrivacyV1(resolvedTask);
-    if (!indexCheck.ok) {
-      coreResult = { kind: "notCompleted", reason: indexCheck.reason };
-      return;
-    }
-    const repoRoot = indexCheck.repoRoot;
-    // Always run fresh checks immediately before a commit. Persisted payloads
-    // are informational and may be stale after files were edited. Registered
-    // as a child (C1 publish model) so the Publish stage row spins while the
-    // pre-commit checks run. Every run — passing, failing, or a post-fix
-    // rerun — is also recorded in publish-review.md's managed Completion
-    // Checks section by runCompletionLint itself (completionLint.ts), so the
-    // artifact always reflects the latest result whatever the user decides
-    // below; the Publish Anyway branch only layers the override annotation on
-    // top of that record.
-    // checkPublishPreflight now checks read-only git readiness (repo,
-    // branch, remote — via checkGitPublishReadiness) before it ever runs
-    // the lint. A git-readiness failure can't be fixed by "Fix with AI" or
-    // meaningfully overridden by "Publish Anyway" (there is nowhere to
-    // push), so it's surfaced directly here instead of going through the
-    // failing-checks modal below, which is reserved for lint/test failures.
-    const gitReadinessCheck = await checkGitPublishReadiness(resolvedTask.taskFolderPath);
-    if (!gitReadinessCheck.ok) {
-      NotificationRouter.showError(
-        `Commit and push failed: ${gitReadinessCheck.reason}`
-      );
-      coreResult = { kind: "notCompleted", reason: "gitNotReady" };
-      return;
-    }
-    // Routed through the same checkPublishPreflight helper the automatic
-    // entry paths (setTaskStage.ts, reviewActions.ts) use before scheduling
-    // auto-publish, so manual and automatic publishing can never drift on
-    // what "checks passed" means. Those scheduling-decision call sites use
-    // the default side-effect-free mode (no persistence); this is the one
-    // call site that is an actual publish attempt, so it opts into
-    // `{ persist: true }` to record the result in task-progress.json and
-    // publish-review.md's managed Completion Checks section.
-    const runChecks = async (): Promise<CompletionLintResult> => {
-      const preflight = (await runTrackedOperation(
-        lockKey,
-        { parent: op, label: "Completion checks", stage: "publish", kind: "completion-checks" },
-        () => checkPublishPreflight(vscode.Uri.file(resolvedTask.taskFolderPath), resolvedTask.progress.implReviewFiles, { persist: true })
-      ))!;
-      if (preflight.lintPayload) {
-        return preflight.lintPayload;
-      }
-      // checkPublishPreflight omits lintPayload when either the read-only
-      // git readiness check failed (already handled above — this is a
-      // narrow same-task race, e.g. the branch changed between the two
-      // checks) or runCompletionLint itself threw (e.g. a tooling
-      // failure). Surface that through the same failing-checks modal
-      // instead of letting the exception abort the whole commit flow.
-      return {
-        runAt: new Date().toISOString(),
-        passed: false,
-        summary: preflight.ok === false ? preflight.reason : "Completion checks failed.",
-        issueCount: 1,
-        failedChecks: [],
-        missingScripts: [],
-      };
+    // checkPublishPreflight omits lintPayload when either the read-only
+    // git readiness check failed (already handled by executeCommitPushV1's
+    // own pre-check — this is a narrow same-task race, e.g. the branch
+    // changed between the two checks) or runCompletionLint itself threw
+    // (e.g. a tooling failure). Surface that through the same failing-checks
+    // modal instead of letting the exception abort the whole commit flow.
+    return {
+      runAt: new Date().toISOString(),
+      passed: false,
+      summary: preflight.ok === false ? preflight.reason : "Completion checks failed.",
+      issueCount: 1,
+      failedChecks: [],
+      missingScripts: [],
     };
-    let lintPayload = await runChecks();
-    // Failing checks surface a three-way decision (C3): Publish Anyway,
-    // Fix with AI, or Cancel (the modal's dismiss affordance). Fix with AI
-    // runs the linting-fixes flow — editor autofixes plus the configured
-    // Publish-stage agent fed the failing lint/test output — nested under
-    // this operation, then checks re-run before publishing can continue, so
-    // a fix pass that didn't resolve everything re-surfaces this decision.
-    while (!lintPayload.passed) {
-      const summary = lintPayload.summary ? ` (${lintPayload.summary})` : "";
-      const choice = await vscode.window.showWarningMessage(
-        `Completion checks failed for "${resolvedTask.folderName}"${summary}.\n\n` +
-          "Publish Anyway records the failing checks in the Publish review. " +
-          "Fix with AI applies automatic and AI fixes using the failing check output, then re-runs the checks.",
-        { modal: true },
-        "Publish Anyway",
-        "Fix with AI"
+  };
+  let lintPayload = await runChecks();
+  // Failing checks surface a three-way decision (C3): Publish Anyway,
+  // Fix with AI, or Cancel (the modal's dismiss affordance). Fix with AI
+  // runs the linting-fixes flow — editor autofixes plus the configured
+  // Publish-stage agent fed the failing lint/test output — nested under
+  // this operation, then checks re-run before publishing can continue, so
+  // a fix pass that didn't resolve everything re-surfaces this decision.
+  while (!lintPayload.passed) {
+    const summary = lintPayload.summary ? ` (${lintPayload.summary})` : "";
+    const choice = await vscode.window.showWarningMessage(
+      `Completion checks failed for "${resolvedTask.folderName}"${summary}.\n\n` +
+        "Publish Anyway records the failing checks in the Publish review. " +
+        "Fix with AI applies automatic and AI fixes using the failing check output, then re-runs the checks.",
+      { modal: true },
+      "Publish Anyway",
+      "Fix with AI"
+    );
+    if (choice === "Publish Anyway") {
+      // The override lives here, in the publish flow (C3): task completion
+      // is ungated and never records overrides — publishing over failing
+      // checks is the decision worth an audit trail in publish-review.md.
+      await upsertCompletionChecksInPublishReview(
+        vscode.Uri.file(resolvedTask.taskFolderPath),
+        lintPayload,
+        { reason: "user chose Publish Anyway despite failing checks" }
       );
-      if (choice === "Publish Anyway") {
-        // The override lives here, in the publish flow (C3): task completion
-        // is ungated and never records overrides — publishing over failing
-        // checks is the decision worth an audit trail in publish-review.md.
-        await upsertCompletionChecksInPublishReview(
-          vscode.Uri.file(resolvedTask.taskFolderPath),
-          lintPayload,
-          { reason: "user chose Publish Anyway despite failing checks" }
-        );
-        break;
-      }
-      if (choice !== "Fix with AI") {
-        NotificationRouter.showInformation("Commit and push cancelled.");
-        coreResult = { kind: "notCompleted", reason: "checksDeclined" };
-        return;
-      }
-      if (!extensionContext) {
-        // Programmatic invocation without an ExtensionContext: the fix flow
-        // needs prompt templates and the AI-consent state, so point at the
-        // standalone command instead of failing partway through.
-        NotificationRouter.showWarning(
-          'Fix with AI is unavailable here — run "Linting Fixes" from the task\'s Publish actions, then retry Commit and Push.'
-        );
-        coreResult = { kind: "notCompleted", reason: "fixWithAiUnavailable" };
-        return;
-      }
-      await runLintingFixes(
-        inventory,
-        extensionContext.extensionUri,
-        { taskFolderPath: resolvedTask.taskFolderPath },
-        extensionContext,
-        op
-      );
-      lintPayload = await runChecks();
+      break;
     }
+    if (choice !== "Fix with AI") {
+      return { ok: false, reason: "checksDeclined" };
+    }
+    if (!extensionContext) {
+      // Programmatic invocation without an ExtensionContext: the fix flow
+      // needs prompt templates and the AI-consent state, so point at the
+      // standalone command instead of failing partway through. Text shown by
+      // `executeCommitPushV1` via `presentCommitPushCoreResultV1`, not here
+      // (plan §3.8: "the coordinator owns ... presentation").
+      return { ok: false, reason: "fixWithAiUnavailable" };
+    }
+    await runLintingFixes(
+      inventory,
+      extensionContext.extensionUri,
+      { taskFolderPath: resolvedTask.taskFolderPath },
+      extensionContext,
+      op
+    );
+    lintPayload = await runChecks();
+  }
+  return { ok: true };
+}
 
-  await vscode.window.withProgress(
+/**
+ * The read-only file lists `resolveCommitPushStagingScopeV1` resolves before
+ * anything is staged, committed, or pushed — threaded through
+ * `confirmCommitPushScopeV1` and the remaining save/PR-description/
+ * commit-message/staging/commit steps below so each coordinator-native step
+ * operates on the SAME resolved scope rather than silently re-deriving its
+ * own (which could drift if git state changes between steps, or
+ * double-prompt the user for "Include Task Folder" / "Include Run
+ * Artifacts" a second time).
+ */
+export interface CommitPushResolvedScopeV1 {
+  readonly scopedFiles: string[];
+  readonly repoFiles: string[];
+  readonly runArtifactPaths: string[];
+  readonly sensitiveFilePaths: string[];
+  readonly excludedControlPaths: string[];
+  readonly includeTaskFolder: boolean;
+}
+
+/**
+ * `resolveCommitPushStagingScopeV1`'s result (plan §3.8/§10.2's "staging-
+ * scope decisions" step, now a distinct coordinator-native step
+ * `commitPushRowV1.ts`'s `executeCommitPushV1` calls directly instead of it
+ * living opaquely inside a single delegated call). `repoRoot` travels
+ * alongside the resolved scope so downstream steps never re-resolve it from
+ * a fresh `checkCommitPushIndexPrivacyV1` call — that repo identity was
+ * already established here, as this step's own revalidation (§7.7).
+ */
+export type CommitPushScopeResultV1 =
+  | { readonly kind: "noChanges" }
+  | {
+      readonly kind: "notCompleted";
+      readonly reason: CommitAndPushNotCompletedReasonV1;
+      // See `checkCommitPushIndexPrivacyV1`'s `detail` field — same contract.
+      readonly detail?: string;
+    }
+  | { readonly kind: "scoped"; readonly repoRoot: string; readonly scope: CommitPushResolvedScopeV1 };
+
+/**
+ * `confirmCommitPushScopeV1`'s result. `gitReadiness` is the successful
+ * branch/push-destination read this step performs as its own revalidation
+ * (§7.7) immediately before building the confirmation preview — threaded
+ * into `pushCommitPushV1` below so the push step never needs to re-derive it
+ * a third time. `scope` carries `scopedFiles` after the
+ * final pre-preview `stripSensitiveTaskFiles` gate (§2.4's invariant "gate A"
+ * — reapplied here regardless of which path built the scope).
+ */
+export type CommitPushConfirmResultV1 =
+  | {
+      readonly kind: "confirmed";
+      readonly gitReadiness: Extract<GitPublishReadiness, { ok: true }>;
+      readonly scope: CommitPushResolvedScopeV1;
+    }
+  | {
+      readonly kind: "notCompleted";
+      readonly reason: CommitAndPushNotCompletedReasonV1;
+      // See `checkCommitPushIndexPrivacyV1`'s `detail` field — same contract.
+      readonly detail?: string;
+    };
+
+/**
+ * §10.2's staging-scope resolution as its own coordinator-native step (plan
+ * §3.8: "the coordinator owns ... sequencing ... and presentation") —
+ * `commitPushRowV1.ts`'s `executeCommitPushV1` calls this directly, before
+ * `confirmCommitPushScopeV1` and the remaining save/PR-description/
+ * commit-message/staging/commit/push steps below, instead of this work
+ * living inside one opaque delegated call. Handles the
+ * pre-existing-staged-changes prompt, the default (outside-task-folder)
+ * scope, and the "Include Task Folder Changes" / "Include Run Artifacts"
+ * fallback prompts when the default scope is empty. Never stages, commits,
+ * or pushes anything — every git call here is read-only.
+ *
+ * Runs its own revalidation of the index/privacy and git-readiness checks
+ * (§7.7 "revalidate immediately before mutation") exactly once — not a NEW
+ * extra revalidation on top of the coordinator's early pre-checks in
+ * `executeCommitPushV1`, just the authoritative recheck at the point where
+ * the real (lock-protected, `op`-scoped) work begins.
+ *
+ * @internal exported for the commitPush.v1 row and for testing
+ */
+export async function resolveCommitPushStagingScopeV1(
+  resolvedTask: ResolvedTaskContext
+): Promise<CommitPushScopeResultV1> {
+  const indexCheck = await checkCommitPushIndexPrivacyV1(resolvedTask);
+  if (!indexCheck.ok) {
+    return { kind: "notCompleted", reason: indexCheck.reason };
+  }
+  const repoRoot = indexCheck.repoRoot;
+
+  const gitReadinessCheck = await checkGitPublishReadiness(resolvedTask.taskFolderPath);
+  if (!gitReadinessCheck.ok) {
+    return {
+      kind: "notCompleted",
+      reason: "gitNotReady",
+      detail: `Commit and push failed: ${gitReadinessCheck.reason}`,
+    };
+  }
+
+  return vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Window,
       title: `Committing and pushing ${resolvedTask.folderName}...`,
       cancellable: false,
     },
-    async (progress) => {
+    async (progress): Promise<CommitPushScopeResultV1> => {
       NotificationRouter.emitProgressSummary(
         `Committing and pushing ${resolvedTask.folderName}...`,
-        taskOperations.rootOperationIdFor(lockKey)
+        taskOperations.rootOperationIdFor(resolvedTask.taskFolderPath)
       );
       try {
-        // Repository already resolved by the §10.2 index/privacy gate above,
-        // before lint and every prompt — reused here unchanged.
-
         // Handle pre-existing staged changes. When EVERYTHING that changed
         // is already staged, commit/push proceeds without raising an error
         // (the staged files are part of the porcelain status and flow into
@@ -1762,11 +1818,11 @@ export async function commitAndPushTaskCore(
               "Commit Everything Together"
             );
             if (choice !== "Commit Everything Together") {
-              NotificationRouter.showInformation(
-                "Commit and push cancelled — handle the existing staged changes manually, then retry."
-              );
-              coreResult = { kind: "notCompleted", reason: "userCancelled" };
-              throw new vscode.CancellationError();
+              return {
+                kind: "notCompleted",
+                reason: "userCancelled",
+                detail: "Commit and push cancelled — handle the existing staged changes manually, then retry.",
+              };
             }
           }
         }
@@ -1785,11 +1841,7 @@ export async function commitAndPushTaskCore(
           // task folder. Offer to include it, or bail out if nothing changed.
           const hasRepoChanges = await hasChangesToCommit(repoRoot);
           if (!hasRepoChanges) {
-            NotificationRouter.showInformation(
-              "No changes to commit — the repository is clean."
-            );
-            coreResult = { kind: "noChanges" };
-            return;
+            return { kind: "noChanges" };
           }
 
           const choice = await vscode.window.showInformationMessage(
@@ -1800,9 +1852,7 @@ export async function commitAndPushTaskCore(
             "Include Task Folder Changes",
           );
           if (choice !== "Include Task Folder Changes") {
-            NotificationRouter.showInformation("Commit and push cancelled.");
-            coreResult = { kind: "notCompleted", reason: "taskFolderChangesDeclined" };
-            return;
+            return { kind: "notCompleted", reason: "taskFolderChangesDeclined" };
           }
           includeTaskFolder = true;
           ({ scopedFiles, repoFiles, runArtifactPaths, sensitiveFilePaths, excludedControlPaths } =
@@ -1841,13 +1891,55 @@ export async function commitAndPushTaskCore(
                 return !sensitivePathSet.has(f);
               }));
             } else {
-              NotificationRouter.showInformation("Commit and push cancelled.");
-              coreResult = { kind: "notCompleted", reason: "runArtifactsDeclined" };
-              return;
+              return { kind: "notCompleted", reason: "runArtifactsDeclined" };
             }
           }
         }
 
+        return {
+          kind: "scoped",
+          repoRoot,
+          scope: { scopedFiles, repoFiles, runArtifactPaths, sensitiveFilePaths, excludedControlPaths, includeTaskFolder },
+        };
+      } catch (error) {
+        if (error instanceof vscode.CancellationError) {
+          throw error;
+        }
+        return {
+          kind: "notCompleted",
+          reason: "unexpectedError",
+          detail: `Commit and push failed: ${getErrorMessage(error)}`,
+        };
+      }
+    }
+  );
+}
+
+/**
+ * §10.2's final preview-and-confirmation step as its own coordinator-native
+ * step, run directly by `commitPushRowV1.ts`'s `executeCommitPushV1` after
+ * `resolveCommitPushStagingScopeV1` and before the remaining save/
+ * PR-description/commit-message/staging/commit/push steps below. This is
+ * the flow's critical safety gate — staging and pushing are NOT reversible
+ * once changes reach a shared remote — so nothing here mutates the working
+ * tree or index; it only re-derives the
+ * branch/push-destination for display and asks the user to confirm.
+ *
+ * @internal exported for the commitPush.v1 row and for testing
+ */
+export async function confirmCommitPushScopeV1(
+  resolvedTask: ResolvedTaskContext,
+  repoRoot: string,
+  scope: CommitPushResolvedScopeV1
+): Promise<CommitPushConfirmResultV1> {
+  return vscode.window.withProgress(
+    {
+      location: vscode.ProgressLocation.Window,
+      title: `Committing and pushing ${resolvedTask.folderName}...`,
+      cancellable: false,
+    },
+    async (): Promise<CommitPushConfirmResultV1> => {
+      try {
         // Get current branch and push destination for the confirm dialog,
         // through the same read-only checkGitPublishReadiness the automatic
         // Publish-entry preflight (publishPreflight.ts) already ran before
@@ -1874,10 +1966,11 @@ export async function commitAndPushTaskCore(
         }
 
         // Final gate (the invariant): re-applied here regardless of which
-        // path above built `scopedFiles` — default fetch, include-task-folder
+        // path built `scope.scopedFiles` — default fetch, include-task-folder
         // re-fetch, or the run-artifact override re-add — so no chat
         // transcript can reach the preview the user is about to confirm.
-        scopedFiles = stripSensitiveTaskFiles(scopedFiles, repoRoot, resolvedTask.taskFolderPath);
+        const scopedFiles = stripSensitiveTaskFiles(scope.scopedFiles, repoRoot, resolvedTask.taskFolderPath);
+        const nextScope: CommitPushResolvedScopeV1 = { ...scope, scopedFiles };
 
         // ----------------------------------------------------------------
         // ⚠️  CONFIRMATION DIALOG with file preview and push destination
@@ -1889,13 +1982,13 @@ export async function commitAndPushTaskCore(
         const previewFiles = scopedFiles.slice(0, MAX_PREVIEW_FILES);
         const remaining = scopedFiles.length - previewFiles.length;
 
-        const scopeLabel = includeTaskFolder
+        const scopeLabel = scope.includeTaskFolder
           ? "all repository changes, including the task folder"
           : "source changes only (task folder excluded by default)";
 
         const fileList = previewFiles
           .map((f) => {
-            const isRunArtifact = runArtifactPaths.includes(f);
+            const isRunArtifact = scope.runArtifactPaths.includes(f);
             const marker = isRunArtifact ? " ⚠ (run artifact — contains AI prompts)" : "";
             return `  • ${renderPath(f)}${marker}`;
           })
@@ -1903,18 +1996,18 @@ export async function commitAndPushTaskCore(
         const moreNote =
           remaining > 0 ? `\n  … and ${remaining} more file(s)` : "";
 
-        const notStagedCount = repoFiles.length - scopedFiles.length;
+        const notStagedCount = scope.repoFiles.length - scopedFiles.length;
         const repoExtra =
-          !includeTaskFolder && notStagedCount > 0
+          !scope.includeTaskFolder && notStagedCount > 0
             ? `\n\n(${notStagedCount} file(s) changed in the task folder — not staged by default)`
             : "";
         const sensitiveExtra =
-          sensitiveFilePaths.length > 0
-            ? `\n\n(${sensitiveFilePaths.length} chat transcript file(s) excluded — plaintext prompt/response content, never staged by this command)`
+          scope.sensitiveFilePaths.length > 0
+            ? `\n\n(${scope.sensitiveFilePaths.length} chat transcript file(s) excluded — plaintext prompt/response content, never staged by this command)`
             : "";
         const controlExtra =
-          excludedControlPaths.length > 0
-            ? `\n\n(${excludedControlPaths.length} workflow-control/private file(s) excluded — Ensemble runtime records, never staged by this command)`
+          scope.excludedControlPaths.length > 0
+            ? `\n\n(${scope.excludedControlPaths.length} workflow-control/private file(s) excluded — Ensemble runtime records, never staged by this command)`
             : "";
 
         const confirmMessage =
@@ -1953,73 +2046,162 @@ export async function commitAndPushTaskCore(
           channel.appendLine("");
           channel.appendLine(`Files to be staged (${scopedFiles.length} total):`);
           for (const f of scopedFiles) {
-            const isRunArtifact = runArtifactPaths.includes(f);
+            const isRunArtifact = scope.runArtifactPaths.includes(f);
             const marker = isRunArtifact
               ? "  [run artifact — contains AI prompts and file contents]"
               : "";
             channel.appendLine(`  ${renderPath(f)}${marker}`);
           }
-          if (!includeTaskFolder && notStagedCount > 0) {
+          if (!scope.includeTaskFolder && notStagedCount > 0) {
             channel.appendLine("");
             channel.appendLine("Not staged (inside task folder, excluded by default):");
             const taskRelative = path
               .relative(repoRoot, resolvedTask.taskFolderPath)
               .replace(/\\/g, "/");
-            for (const f of repoFiles) {
+            for (const f of scope.repoFiles) {
               const inTaskFolder = f === taskRelative || f.startsWith(taskRelative + "/");
               if (inTaskFolder) {
                 channel.appendLine(`  ${renderPath(f)}`);
               }
             }
           }
-          if (sensitiveFilePaths.length > 0) {
+          if (scope.sensitiveFilePaths.length > 0) {
             channel.appendLine("");
             channel.appendLine("Excluded — chat transcripts (plaintext prompt/response content, never staged by this command):");
-            for (const f of sensitiveFilePaths) {
+            for (const f of scope.sensitiveFilePaths) {
               channel.appendLine(`  ${renderPath(f)}`);
             }
           }
-          if (excludedControlPaths.length > 0) {
+          if (scope.excludedControlPaths.length > 0) {
             channel.appendLine("");
             channel.appendLine("Excluded — workflow-control/private files (Ensemble runtime records, never staged by this command):");
-            for (const f of excludedControlPaths) {
+            for (const f of scope.excludedControlPaths) {
               channel.appendLine(`  ${renderPath(f)}`);
             }
           }
           channel.appendLine("");
           channel.appendLine("Run the command again to proceed after reviewing.");
           channel.show(true);
-          NotificationRouter.showInformation(
-            "Full file list shown in 'Ensemble: Commit Preview'. Re-run the command to proceed."
-          );
-          coreResult = { kind: "notCompleted", reason: "viewedFullFileList" };
-          // End the tracked operation as cancelled, not succeeded — nothing
-          // was committed or pushed, so a "completed" terminal entry here
-          // would falsely report success. Swallowed at the outer call.
-          throw new vscode.CancellationError();
+          return { kind: "notCompleted", reason: "viewedFullFileList" };
         }
 
         if (confirmed !== "Commit & Push") {
-          NotificationRouter.showInformation(
-            "Commit and push cancelled."
-          );
-          coreResult = { kind: "notCompleted", reason: "userCancelled" };
-          return;
+          return { kind: "notCompleted", reason: "userCancelled" };
         }
 
-        // Save dirty documents (scoped to source files, or entire repo)
+        return { kind: "confirmed", gitReadiness, scope: nextScope };
+      } catch (error) {
+        if (error instanceof vscode.CancellationError) {
+          throw error;
+        }
+        return {
+          kind: "notCompleted",
+          reason: "unexpectedError",
+          detail: `Commit and push failed: ${getErrorMessage(error)}`,
+        };
+      }
+    }
+  );
+}
+
+/**
+ * §10.2's "save" step (plan §3.8) as its own coordinator-native function —
+ * `commitPushRowV1.ts`'s `executeCommitPushV1` calls this directly,
+ * immediately after `confirmCommitPushScopeV1` accepts, instead of this work
+ * living opaquely inside one delegated "core" call. Saves dirty documents
+ * relevant to the resolved staging scope; never stages, commits, or pushes.
+ *
+ * Emits the flow's progress-summary line once, here, at the start of the
+ * remaining (post-confirmation) sequence — the same point the former single
+ * delegated call used to emit it from, before this step existed on its own.
+ *
+ * @internal exported for the commitPush.v1 row and for testing
+ */
+export type CommitPushSaveResultV1 =
+  | { readonly kind: "saved" }
+  | {
+      readonly kind: "notCompleted";
+      readonly reason: Extract<CommitAndPushNotCompletedReasonV1, "saveFailed" | "unexpectedError">;
+      // See `checkCommitPushIndexPrivacyV1`'s `detail` field — same contract.
+      readonly detail?: string;
+    };
+
+export async function saveCommitPushDocumentsV1(
+  resolvedTask: ResolvedTaskContext,
+  repoRoot: string,
+  includeTaskFolder: boolean
+): Promise<CommitPushSaveResultV1> {
+  return vscode.window.withProgress(
+    {
+      location: vscode.ProgressLocation.Window,
+      title: `Committing and pushing ${resolvedTask.folderName}...`,
+      cancellable: false,
+    },
+    async (progress): Promise<CommitPushSaveResultV1> => {
+      NotificationRouter.emitProgressSummary(
+        `Committing and pushing ${resolvedTask.folderName}...`,
+        taskOperations.rootOperationIdFor(resolvedTask.taskFolderPath)
+      );
+      try {
         progress.report({ message: "Saving open files..." });
         const saved = await saveDirtyDocuments(
           resolvedTask.taskFolderPath,
           repoRoot,
           includeTaskFolder
         );
-        if (!saved) {
-          coreResult = { kind: "notCompleted", reason: "saveFailed" };
-          return;
+        if (!saved.ok) {
+          return { kind: "notCompleted", reason: "saveFailed", detail: saved.detail };
         }
+        return { kind: "saved" };
+      } catch (error) {
+        if (error instanceof vscode.CancellationError) {
+          throw error;
+        }
+        return {
+          kind: "notCompleted",
+          reason: "unexpectedError",
+          detail: `Commit and push failed: ${getErrorMessage(error)}`,
+        };
+      }
+    }
+  );
+}
 
-        // Generate PR description
+/**
+ * §10.2's "PR description" step as its own coordinator-native function,
+ * called directly by `executeCommitPushV1` right after
+ * `saveCommitPushDocumentsV1` succeeds. Generates `pr-description.md` from
+ * task artifacts and writes it atomically (temp file + rename), then
+ * reapplies the §2.4 sensitive/control-path gate to `scopedFiles` — the
+ * true invariant point immediately before the commit-message review's modal
+ * preview (whose acceptance is what actually stages these files). Nothing
+ * rebuilds `scopedFiles` between here and the eventual `git add`, but this
+ * call is what makes that a property of the code rather than an assumption.
+ *
+ * @internal exported for the commitPush.v1 row and for testing
+ */
+export type CommitPushPrDescriptionResultV1 =
+  | { readonly kind: "generated"; readonly scopedFiles: string[] }
+  | {
+      readonly kind: "notCompleted";
+      readonly reason: Extract<CommitAndPushNotCompletedReasonV1, "unexpectedError">;
+      // See `checkCommitPushIndexPrivacyV1`'s `detail` field — same contract.
+      readonly detail?: string;
+    };
+
+export async function generateCommitPushPrDescriptionV1(
+  resolvedTask: ResolvedTaskContext,
+  repoRoot: string,
+  scopedFiles: string[]
+): Promise<CommitPushPrDescriptionResultV1> {
+  return vscode.window.withProgress(
+    {
+      location: vscode.ProgressLocation.Window,
+      title: `Committing and pushing ${resolvedTask.folderName}...`,
+      cancellable: false,
+    },
+    async (progress): Promise<CommitPushPrDescriptionResultV1> => {
+      try {
         progress.report({ message: "Generating PR description..." });
         const prDescription = await generatePRDescription(
           resolvedTask.taskFolderPath,
@@ -2043,19 +2225,77 @@ export async function commitAndPushTaskCore(
           overwrite: true,
         });
 
-        // Final gate, reapplied immediately before the modal confirmation
-        // preview (whose acceptance performs the actual `git add`) — the
-        // true invariant point. Nothing rebuilds scopedFiles between the
-        // confirmation preview and here today, but this call is what makes
-        // that a property of the code rather than an assumption.
-        scopedFiles = stripSensitiveTaskFiles(scopedFiles, repoRoot, resolvedTask.taskFolderPath);
+        // Final gate, reapplied immediately before the commit-message
+        // review's modal confirmation preview (whose acceptance performs
+        // the actual `git add`, in stageAndCommitCommitPushV1).
+        const gatedScopedFiles = stripSensitiveTaskFiles(scopedFiles, repoRoot, resolvedTask.taskFolderPath);
+        return { kind: "generated", scopedFiles: gatedScopedFiles };
+      } catch (error) {
+        if (error instanceof vscode.CancellationError) {
+          throw error;
+        }
+        return {
+          kind: "notCompleted",
+          reason: "unexpectedError",
+          detail: `Commit and push failed: ${getErrorMessage(error)}`,
+        };
+      }
+    }
+  );
+}
 
-        // Commit message — generated from the configured Publish-stage
-        // model when possible, always shown to the user in a modal preview
-        // to review, regenerate, or accept before anything is committed.
-        // Staging, commit, and push all happen AFTER the user confirms the
-        // message (stage-after-confirm) — cancelling or dismissing the
-        // dialog leaves the index untouched.
+/**
+ * §10.2's "commit message review" step as its own coordinator-native
+ * function, called directly by `executeCommitPushV1` right after
+ * `generateCommitPushPrDescriptionV1` succeeds. Generated from the
+ * configured Publish-stage model when possible, always shown to the user in
+ * a modal preview to review, regenerate, or accept before anything is
+ * staged or committed — staging, commit, and push all happen AFTER the user
+ * confirms the message here (stage-after-confirm); cancelling or dismissing
+ * the dialog leaves the index untouched. May instead return structured
+ * questions (routed to Chat With AI by `buildCommitMessage`/
+ * `resumeCommitMessage` themselves) that this attempt must end on rather
+ * than falling back to a placeholder message the caller could commit
+ * without realizing clarification was needed.
+ *
+ * @internal exported for the commitPush.v1 row and for testing
+ */
+export type CommitPushMessageReviewResultV1 =
+  | { readonly kind: "confirmed"; readonly message: string }
+  | { readonly kind: "questionsPosted"; readonly interactionId: InteractionIdV1; readonly correlation: ActionCorrelationV1 }
+  | {
+      readonly kind: "notCompleted";
+      readonly reason: Extract<CommitAndPushNotCompletedReasonV1, "commitMessageCancelled" | "unexpectedError">;
+      // See `checkCommitPushIndexPrivacyV1`'s `detail` field — same contract.
+      readonly detail?: string;
+    };
+
+export async function reviewCommitPushMessageV1(
+  op: TaskOperationHandle,
+  resolvedTask: ResolvedTaskContext,
+  repoRoot: string,
+  scopedFiles: string[],
+  runArtifactPaths: string[],
+  pushDestination: string,
+  explicitArg: CommitAndPushTaskArg | undefined,
+  chatViewProvider: ChatViewProvider | undefined,
+  // The commitPush.v1 ROW's own coordinator operationId (commitPushRowV1.ts).
+  // Threaded down to reviewCommitMessage's nested commitPushMetadata.v1
+  // invocation so it opens a CHILD lease on this same task binding instead
+  // of self-deadlocking against this row's own held lease. Undefined only
+  // for a hypothetical caller outside the commitPush.v1 row (none exists in
+  // production today), in which case the nested call falls back to a plain
+  // top-level acquire — unchanged prior behavior.
+  coordinatorOperationId: OperationIdV1 | undefined
+): Promise<CommitPushMessageReviewResultV1> {
+  return vscode.window.withProgress(
+    {
+      location: vscode.ProgressLocation.Window,
+      title: `Committing and pushing ${resolvedTask.folderName}...`,
+      cancellable: false,
+    },
+    async (progress): Promise<CommitPushMessageReviewResultV1> => {
+      try {
         progress.report({ message: "Generating commit message..." });
         const commitTaskTitle = await resolveTaskTitle(
           vscode.Uri.file(resolvedTask.taskFolderPath),
@@ -2073,7 +2313,7 @@ export async function commitAndPushTaskCore(
           op.token!,
           resolvedTask.progress.status,
           chatViewProvider,
-          resumeInteraction,
+          extractResumeInteraction(explicitArg),
           coordinatorOperationId
         );
         if (reviewResult.kind === "questionsPosted") {
@@ -2083,106 +2323,178 @@ export async function commitAndPushTaskCore(
           // not a decline: carry the metadata attempt's own
           // correlation/interactionId so commitPushRowV1.ts can map it to
           // the standard coordinator `questions` outcome.
-          coreResult = {
+          return {
             kind: "questionsPosted",
             interactionId: reviewResult.interactionId,
             correlation: reviewResult.correlation,
           };
-          return;
         }
         if (reviewResult.kind === "declined") {
-          NotificationRouter.showInformation("Commit and push cancelled.");
-          coreResult = { kind: "notCompleted", reason: "commitMessageCancelled" };
-          return;
+          return { kind: "notCompleted", reason: "commitMessageCancelled" };
         }
-        const confirmedMessage = reviewResult.message;
-
-        progress.report({ message: "Staging changes..." });
-        try {
-          if (scopedFiles.length > 0) {
-            await runGitCommand(repoRoot, "add", ["--", ...scopedFiles]);
-          }
-          // §2.4 rule 7: re-read the INDEX after staging and verify no
-          // private/workflow-control content slipped in — e.g. a path that
-          // changed shape between the proposal build and the add, or
-          // pre-staged records swept in by the "Commit Everything Together"
-          // path. A hit rolls the staging back (the catch below runs
-          // `git reset`) and aborts before any commit exists.
-          const postAddForbidden = findForbiddenStagedRecordsV1(
-            await collectStagedIndexRecordsV1(repoRoot),
-            repoRoot,
-            resolvedTask.taskFolderPath
-          );
-          if (postAddForbidden.length > 0) {
-            throw new Error(
-              `staging was rolled back — ${postAddForbidden.length} private/workflow-control file(s) reached the git index ` +
-                `(first: ${postAddForbidden[0]!.path}). Unstage or remove them and retry.`
-            );
-          }
-          progress.report({ message: "Creating commit..." });
-          await runGitCommand(repoRoot, "commit", ["-m", confirmedMessage]);
-        } catch (error) {
-          // Undo any staging performed above so a retry starts clean.
-          try {
-            await runGitCommand(repoRoot, "reset", []);
-          } catch {
-            // Best effort.
-          }
-          NotificationRouter.showError(
-            `Commit failed: ${getErrorMessage(error)}`
-          );
-          coreResult = { kind: "notCompleted", reason: "gitCommitFailed" };
-          return;
-        }
-
-        progress.report({ message: "Pushing to remote..." });
-        try {
-          if (hasUpstream) {
-            await runGitCommand(repoRoot, "push", []);
-          } else if (singleRemote) {
-            await runGitCommand(repoRoot, "push", [
-              "-u",
-              singleRemote,
-              currentBranch,
-            ]);
-          }
-          NotificationRouter.showInformation(
-            `Successfully committed and pushed ${resolvedTask.folderName} to ${pushDestination}`
-          );
-          coreResult = { kind: "completed" };
-        } catch (error) {
-          // Push failed after commit was created — keep the local commit.
-          // Do NOT automatically roll back: this mutates the user's git
-          // history without their explicit instruction. Tell them how to
-          // undo manually.
-          NotificationRouter.showError(
-            `Push failed. Your local commit was kept — it has NOT been rolled back automatically.\n\n` +
-              `To undo the commit manually: git reset --mixed HEAD~1\n\n` +
-              `Error: ${getErrorMessage(error)}`
-          );
-          coreResult = { kind: "notCompleted", reason: "pushFailed" };
-        }
-      } catch (error: unknown) {
+        return { kind: "confirmed", message: reviewResult.message };
+      } catch (error) {
         if (error instanceof vscode.CancellationError) {
-          // "View Full List" (and genuine cancellations) end the tracked
-          // operation as cancelled instead of falsely reporting success.
+          // A genuine mid-flight cancellation (e.g. the operation's token
+          // fired while awaiting a provider call). Rethrown to the caller
+          // (executeCommitPushV1), which ends the operation as cancelled.
           throw error;
         }
-        NotificationRouter.showError(
-          `Commit and push failed: ${getErrorMessage(error)}`
-        );
-        coreResult = { kind: "notCompleted", reason: "unexpectedError" };
+        return {
+          kind: "notCompleted",
+          reason: "unexpectedError",
+          detail: `Commit and push failed: ${getErrorMessage(error)}`,
+        };
       }
     }
   );
+}
+
+/**
+ * §10.2's "staging and commit" step as its own coordinator-native function,
+ * called directly by `executeCommitPushV1` right after
+ * `reviewCommitPushMessageV1` returns a confirmed message. Stages exactly
+ * `scopedFiles`, re-verifies the index for private/workflow-control content
+ * that may have slipped in since the confirmation preview (§2.4 rule 7,
+ * rolling staging back via `git reset` on a hit), then commits. Never
+ * pushes — `pushCommitPushV1` is a separate step so a commit failure can
+ * never reach the push step at all.
+ *
+ * @internal exported for the commitPush.v1 row and for testing
+ */
+export type CommitPushStageAndCommitResultV1 =
+  | { readonly kind: "committed" }
+  | {
+      readonly kind: "notCompleted";
+      readonly reason: Extract<CommitAndPushNotCompletedReasonV1, "gitCommitFailed">;
+      // See `checkCommitPushIndexPrivacyV1`'s `detail` field — same contract.
+      readonly detail: string;
+    };
+
+export async function stageAndCommitCommitPushV1(
+  resolvedTask: ResolvedTaskContext,
+  repoRoot: string,
+  scopedFiles: string[],
+  confirmedMessage: string
+): Promise<CommitPushStageAndCommitResultV1> {
+  return vscode.window.withProgress(
+    {
+      location: vscode.ProgressLocation.Window,
+      title: `Committing and pushing ${resolvedTask.folderName}...`,
+      cancellable: false,
+    },
+    async (progress): Promise<CommitPushStageAndCommitResultV1> => {
+      progress.report({ message: "Staging changes..." });
+      try {
+        if (scopedFiles.length > 0) {
+          await runGitCommand(repoRoot, "add", ["--", ...scopedFiles]);
+        }
+        // §2.4 rule 7: re-read the INDEX after staging and verify no
+        // private/workflow-control content slipped in — e.g. a path that
+        // changed shape between the proposal build and the add, or
+        // pre-staged records swept in by the "Commit Everything Together"
+        // path. A hit rolls the staging back (the catch below runs
+        // `git reset`) and aborts before any commit exists.
+        const postAddForbidden = findForbiddenStagedRecordsV1(
+          await collectStagedIndexRecordsV1(repoRoot),
+          repoRoot,
+          resolvedTask.taskFolderPath
+        );
+        if (postAddForbidden.length > 0) {
+          throw new Error(
+            `staging was rolled back — ${postAddForbidden.length} private/workflow-control file(s) reached the git index ` +
+              `(first: ${postAddForbidden[0]!.path}). Unstage or remove them and retry.`
+          );
+        }
+        progress.report({ message: "Creating commit..." });
+        await runGitCommand(repoRoot, "commit", ["-m", confirmedMessage]);
+      } catch (error) {
+        // Undo any staging performed above so a retry starts clean.
+        try {
+          await runGitCommand(repoRoot, "reset", []);
+        } catch {
+          // Best effort.
+        }
+        return {
+          kind: "notCompleted",
+          reason: "gitCommitFailed",
+          detail: `Commit failed: ${getErrorMessage(error)}`,
+        };
+      }
+      return { kind: "committed" };
     }
   );
-  } catch (error) {
-    if (!(error instanceof vscode.CancellationError)) {
-      throw error;
+}
+
+/**
+ * §10.2's "push" step as its own coordinator-native function, called
+ * directly by `executeCommitPushV1` right after
+ * `stageAndCommitCommitPushV1` succeeds. Push failure keeps the local
+ * commit — it is never rolled back automatically, since that would mutate
+ * the user's git history without explicit instruction; the user is told how
+ * to undo manually.
+ *
+ * @internal exported for the commitPush.v1 row and for testing
+ */
+export type CommitPushPushResultV1 =
+  | {
+      readonly kind: "completed";
+      // The exact success text (plan §3.8: "the coordinator owns ...
+      // presentation") — `executeCommitPushV1` shows this itself, exactly
+      // once, via `presentCommitPushCoreResultV1`; this function performs no
+      // notification/UI side effect of its own.
+      readonly detail: string;
     }
-  }
-  return coreResult;
+  | {
+      readonly kind: "notCompleted";
+      readonly reason: Extract<CommitAndPushNotCompletedReasonV1, "pushFailed">;
+      readonly detail: string;
+    };
+
+export async function pushCommitPushV1(
+  resolvedTask: ResolvedTaskContext,
+  repoRoot: string,
+  gitReadiness: Extract<GitPublishReadiness, { ok: true }>
+): Promise<CommitPushPushResultV1> {
+  const { pushDestination, hasUpstream, singleRemote, currentBranch } = gitReadiness;
+  return vscode.window.withProgress(
+    {
+      location: vscode.ProgressLocation.Window,
+      title: `Committing and pushing ${resolvedTask.folderName}...`,
+      cancellable: false,
+    },
+    async (progress): Promise<CommitPushPushResultV1> => {
+      progress.report({ message: "Pushing to remote..." });
+      try {
+        if (hasUpstream) {
+          await runGitCommand(repoRoot, "push", []);
+        } else if (singleRemote) {
+          await runGitCommand(repoRoot, "push", [
+            "-u",
+            singleRemote,
+            currentBranch,
+          ]);
+        }
+        return {
+          kind: "completed",
+          detail: `Successfully committed and pushed ${resolvedTask.folderName} to ${pushDestination}`,
+        };
+      } catch (error) {
+        // Push failed after commit was created — keep the local commit.
+        // Do NOT automatically roll back: this mutates the user's git
+        // history without their explicit instruction. Tell them how to
+        // undo manually.
+        return {
+          kind: "notCompleted",
+          reason: "pushFailed",
+          detail:
+            `Push failed. Your local commit was kept — it has NOT been rolled back automatically.\n\n` +
+            `To undo the commit manually: git reset --mixed HEAD~1\n\n` +
+            `Error: ${getErrorMessage(error)}`,
+        };
+      }
+    }
+  );
 }
 
 /**
@@ -2191,13 +2503,16 @@ export async function commitAndPushTaskCore(
  * settlement logging run through the coordinator exactly once per
  * invocation, regardless of which public entry point (or internal composite
  * step) is driving it. The row's `execute` passes THIS exact `resolvedTask`
- * straight into `commitAndPushTaskCore` (never re-resolving one), so the
- * task the coordinator bound its correlation/eligibility check to is
+ * straight through its coordinator-native steps (never re-resolving one),
+ * so the task the coordinator bound its correlation/eligibility check to is
  * guaranteed to be the task actually acted on. Every outcome except a
  * pre-`execute` rejection (ineligible stage/status, or duplicate lease) has
- * already had its specific reason shown to the user via `NotificationRouter`
- * from inside the core itself, so this helper only surfaces a message for
- * the pre-`execute` cases nothing has said anything about yet.
+ * already had its specific reason shown to the user exactly once, by
+ * `presentCommitPushCoreResultV1` from inside `executeCommitPushV1`
+ * (`commitPushRowV1.ts`) — the coordinator's own presentation step, not any
+ * of the coordinator-native step functions above, none of which show a
+ * notification of their own for a reason they set. This helper only surfaces
+ * a message for the pre-`execute` cases nothing has said anything about yet.
  */
 /** @internal exported for testing */
 export async function invokeCommitPushRowV1(
@@ -2223,7 +2538,8 @@ export async function invokeCommitPushRowV1(
     rawInput: { taskFolderPath: resolvedTask.taskFolderPath },
     // The row's `execute` (commitPushRowV1.ts) must act on this EXACT
     // resolved/bound task, never re-resolve one from mutable current-task
-    // state — see commitAndPushTaskCore's header comment.
+    // state — see the coordinator-native step functions' header comments
+    // above (saveCommitPushDocumentsV1 onward).
     services: { ...services, resolvedTask },
   });
   if (outcome.kind === "completed") {
@@ -2240,24 +2556,26 @@ export async function invokeCommitPushRowV1(
     return;
   }
   if (outcome.kind === "cancelled" && outcome.code === "userCancelled") {
-    // commitAndPushTaskCore already showed "Commit and push cancelled." via
-    // NotificationRouter at the exact point that produced this outcome
-    // (commitPushRowV1.ts's `userCancelled` mapping) — nothing more to show.
+    // The coordinator-native step that produced this outcome already showed
+    // "Commit and push cancelled." via NotificationRouter at the exact
+    // point that produced this outcome (commitPushRowV1.ts's `userCancelled`
+    // mapping) — nothing more to show.
     return;
   }
   if (outcome.kind === "failed" && outcome.code.startsWith("commitPush.") && outcome.code !== "commitPush.servicesUnavailable") {
-    // commitAndPushTaskCore already showed the specific reason for every
-    // `commitPush.<CommitAndPushNotCompletedReasonV1>` code (see that type's
-    // header) — this just recognizes the whole family instead of one
-    // now-retired exact string, so a caller doesn't ALSO get the generic
-    // "could not start" message below on top of the real one.
+    // The coordinator-native step that produced this outcome already showed
+    // the specific reason for every `commitPush.<CommitAndPushNotCompletedReasonV1>`
+    // code (see that type's header) — this just recognizes the whole family
+    // instead of one now-retired exact string, so a caller doesn't ALSO get
+    // the generic "could not start" message below on top of the real one.
     return;
   }
   if (outcome.kind === "failed" && outcome.code === "actionNotEligibleForStage") {
     // The row's real, coordinator-owned stage eligibility (commitPushRowV1.ts)
-    // rejected this before commitAndPushTaskCore ever ran — same user-facing
-    // message core used to show internally after its own now-redundant (but
-    // still present, defense-in-depth) stage check.
+    // rejected this before any of the coordinator-native steps ever ran —
+    // same user-facing message those steps used to show internally after
+    // their own now-redundant (but still present, defense-in-depth) stage
+    // check.
     NotificationRouter.showWarning(
       `Task is at stage "${STAGE_DISPLAY_NAMES[resolvedTask.progress.currentStage]}" — must be completed before committing and pushing.`
     );
@@ -2276,8 +2594,9 @@ export async function invokeCommitPushRowV1(
  * Acquires the process-global Commit/Push token before anything else — a
  * duplicate invocation is rejected immediately, before argument
  * normalization, task resolution, lint, prompts, staging, commit, or push
- * setup. See `commitAndPushTaskCore` above for the actual behavior; both
- * public entries reach it through the `commitPush.v1` registry row.
+ * setup. See the coordinator-native step functions above (checked via
+ * `commitPushRowV1.ts`'s `executeCommitPushV1`) for the actual behavior;
+ * both public entries reach them through the `commitPush.v1` registry row.
  */
 export async function commitAndPushTask(
   inventory: TaskInventory,
@@ -2317,7 +2636,7 @@ export async function commitAndPushTask(
  *
  * Acquires the same process-global Commit/Push token as `commitAndPushTask`
  * before anything else, then — holding that token — calls
- * `commitAndPushTaskCore` directly rather than the public `commitAndPushTask`
+ * `invokeCommitPushRowV1` directly rather than the public `commitAndPushTask`
  * command, so it never tries (and fails) to acquire a token it already
  * holds.
  */
@@ -2386,9 +2705,10 @@ export async function completeCommitAndPushTask(
       // through the coordinator's lifecycle rows (§10.2's transfer: the
       // strict progress stack and the exhaustive field policy own these
       // writes, never the permissive patch). Completion itself is ungated
-      // (C3): no checks run here — commitAndPushTaskCore below runs fresh
-      // checks and owns the failing-checks prompt/override flow, so the
-      // completion step can never be blocked by lint/test state.
+      // (C3): no checks run here — the commitPush.v1 row invoked below (via
+      // invokeCommitPushRowV1) runs fresh checks and owns the failing-checks
+      // prompt/override flow, so the completion step can never be blocked
+      // by lint/test state.
       const workspaceCwd =
         resolvedTask.workspaceFolder?.fsPath ?? path.dirname(resolvedTask.taskFolderPath);
       // Plan §3.9: the task-binding identity is the digest derived from this

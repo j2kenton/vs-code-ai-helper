@@ -998,6 +998,47 @@ void describe("runImplementationForModel", () => {
     }
   });
 
+  // Regression coverage for a review finding: resolveRunnerForModel's
+  // stage-less branch (historically called by runSecondOpinionReview in
+  // reviewActions.ts and by the Global Assistant in
+  // openGeneralAssistant.ts — both resolved a runner without ever passing
+  // `stage`; both call sites were later removed entirely during the Cleanup
+  // cohort's disposition of those two routes, see
+  // legacyAiActionSafetyGateV0.ts's file header) used to return
+  // toResolvedRunner's raw runner untouched, so its .run() reached the
+  // concrete CopilotLanguageModelRunner/CliAgentRunner directly with NO call
+  // to assertNoUnauthorizedV1CorrelationV0 at all — not merely being subject
+  // to it, as the stage-bearing branches always were. This test proves the
+  // stage-less branch itself still enforces the boundary directly against
+  // the production switch, independent of whether any production caller
+  // currently exercises that branch, mirroring the equivalent
+  // runImplementationForModel coverage above.
+  void it("resolveRunnerForModel's stage-less branch also rejects an uncorrelated call", async () => {
+    assert.equal(LEGACY_UNCORRELATED_RUNNER_INVOCATION_REJECTED_V0.enabled, false);
+    LEGACY_UNCORRELATED_RUNNER_INVOCATION_REJECTED_V0.enabled = true;
+    try {
+      // A bare/legacy model id resolves to Copilot with no provider-selection
+      // or model-settings stub needed (resolveEffectiveProvider's rule).
+      const { runner } = resolveRunnerForModel("gpt-4o");
+      await assert.rejects(
+        runner.run(
+          {
+            taskFolderUri: vscode.Uri.file(path.join(os.tmpdir(), "ensemble-stageless-backstop")),
+            workspaceUri: vscode.Uri.file(path.join(os.tmpdir(), "ensemble-stageless-backstop")),
+            stage: "desc",
+            prompt: "Second opinion / Global Assistant style call with no V1 correlation.",
+            outputFile: vscode.Uri.file(path.join(os.tmpdir(), "ensemble-stageless-backstop", "out.md")),
+            modelId: "gpt-4o",
+          },
+          new vscode.CancellationTokenSource().token
+        ),
+        LegacyAiActionSafetyGateErrorV0
+      );
+    } finally {
+      LEGACY_UNCORRELATED_RUNNER_INVOCATION_REJECTED_V0.enabled = false;
+    }
+  });
+
   void it("does not keep an authentication-failed backup as the next implementation route", async () => {
     const metaRoot = fs.mkdtempSync(
       path.join(os.tmpdir(), "ensemble-impl-fallback-auth-")

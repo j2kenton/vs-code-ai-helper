@@ -31,6 +31,52 @@
  *     to the deterministic fallback subject without breaking the non-AI
  *     commit flow.
  *
+ *     Three SUPPLEMENTARY provider-invoking routes outside the original §1.2
+ *     baseline table were discovered during the runner-boundary audit that
+ *     fixed check 2's stage-less bypass below: review escalation's plateau
+ *     second opinion (`runSecondOpinionReview` in reviewActions.ts), the
+ *     Global Assistant (`globalAssistantSend`/`openGeneralAssistant` in
+ *     openGeneralAssistant.ts), and Publish AI plan verification
+ *     (`runAiPlanVerification` in completionLint.ts). None had a planned V1
+ *     coordinator `actionKey` at the time, and two of the three's actual
+ *     output shapes still have no member in the plan's closed completed-
+ *     content union (§3.5) — a full-opinion review verdict never published
+ *     as an artifact, and per-plan-item JSON verdicts — so migrating THOSE
+ *     two onto the coordinator would mean inventing coordinator machinery
+ *     the approved plan does not authorize. Per the Cleanup cohort's
+ *     disposition of "proven-unreachable legacy consumers/output paths"
+ *     (plan §8), their dead runner-invocation code (prompt construction,
+ *     `resolveRunnerForModel`/`AgentRunner.run` calls, scratch `outputFile`
+ *     handling) has been REMOVED outright rather than left permanently gated
+ *     in an undecided limbo state. Second opinion now unconditionally
+ *     escalates on the primary review alone, and plan verification
+ *     unconditionally reports the deterministic baseline only — the exact
+ *     behavior each already had in production, since
+ *     `LEGACY_UNCORRELATED_RUNNER_INVOCATION_REJECTED_V0` made their
+ *     runner-invocation code permanently unreachable. Neither route id
+ *     remains in this catalog; there is nothing left to re-enable for
+ *     either, only a real V1 migration (a new coordinator action with a
+ *     genuine completed-content type) could restore actual AI behavior for
+ *     them, and that would need its own scope decision.
+ *
+ *     The Global Assistant's output shape, unlike the other two, IS a
+ *     `chat-message.v1` — it is free-form assistant chat, just outside any
+ *     task's Chat document rather than inside one. It migrated onto the
+ *     coordinator as `globalAssistantSend.v1` (globalAssistantSendRowV1.ts):
+ *     its folder registers as dedicated non-task storage
+ *     (`ensureWorkflowNonTaskStorageRootV1`, not a task-folder root), and its
+ *     `taskBinding.taskBindingId` is chatHistoryStore.ts's own
+ *     `localTaskBindingId(GLOBAL_ASSISTANT_CANONICAL_ID)` — the same local
+ *     digest stand-in that module already used as this conversation's
+ *     default binding, now supplied explicitly instead of only defaulted
+ *     internally. Its command, toolbar entry, default-Chat-target wiring,
+ *     and prompt builder are all restored (openGeneralAssistant.ts); the
+ *     only thing that changed from the pre-audit implementation is HOW it
+ *     reaches a provider — through this route id, `assertLegacyAiRouteAllowedV0`,
+ *     and the coordinator's V1-correlated runner boundary, never the direct
+ *     `resolveRunnerForModel(...).runner.run(...)` call the audit found
+ *     bypassing check 2 below.
+ *
  *  2. `assertNoUnauthorizedV1CorrelationV0` — the shared runner/provider
  *     boundary in `runnerRegistry.ts` (`resolveRunnerForModel` and
  *     `runImplementationForModel`, which together are the only two paths
@@ -42,6 +88,15 @@
  *         true (plan §1.3: "unknown or legacy calls are rejected"). This is
  *         the backstop for any invocation path that reached the provider
  *         boundary without passing a handler-level route gate first.
+ *
+ *     `resolveRunnerForModel`'s `stage`-less branch (used by callers that
+ *     resolve a runner outside the stage-reservation/quota-observation
+ *     machinery — the three supplementary routes above) used to return the
+ *     raw concrete runner untouched, reaching the transport with no
+ *     assertion at all rather than merely being subject to one. It now wraps
+ *     that branch the same way the stage-bearing branches always did, so
+ *     every exit of the function enforces this check identically regardless
+ *     of whether the caller passed a `stage`.
  *
  * TESTS
  * -----
@@ -68,7 +123,8 @@ export type LegacyAiRouteIdV0 =
   | "applyCurrentStage.v1"
   | "lint.v1"
   | "chatSend.v1"
-  | "commitPushMetadata.v1";
+  | "commitPushMetadata.v1"
+  | "globalAssistantSend.v1";
 
 const REGISTERED_LEGACY_AI_ROUTE_IDS_V0: ReadonlySet<string> = new Set<LegacyAiRouteIdV0>([
   "draft.v1",
@@ -83,6 +139,7 @@ const REGISTERED_LEGACY_AI_ROUTE_IDS_V0: ReadonlySet<string> = new Set<LegacyAiR
   "lint.v1",
   "chatSend.v1",
   "commitPushMetadata.v1",
+  "globalAssistantSend.v1",
 ]);
 
 export class LegacyAiActionSafetyGateErrorV0 extends Error {
@@ -99,14 +156,23 @@ export class LegacyAiActionSafetyGateErrorV0 extends Error {
  * lands — the cohort that lands a replacement removes its route id from
  * this set in the same change. Do not remove a route id here without its
  * real V1 migration landing in the same change.
+ *
+ * Two of the three `.v0` supplementary routes discussed in the file header
+ * (review second opinion, Publish plan verification) are no longer
+ * registered here at all: their Cleanup-cohort disposition was removal (see
+ * the file header), not an entry in this set, since there is no dead
+ * runner-invocation code left for an entry to disable. The third,
+ * `globalAssistantSend.v1`, IS registered above (as a real `.v1`, not a
+ * `.v0` route) and stays enabled: it migrated onto the coordinator instead
+ * of being retired.
  */
 export const LEGACY_AI_ROUTE_DISABLED_V0: ReadonlySet<string> = new Set<string>([
-  // EMPTY since the §7.8 Edit-cohort cutover: the final five ids
-  // (implementation.v1, fastForward.v1, applyReviewEdit.v1,
-  // applyCurrentStage.v1, lint.v1) migrated onto the sealed two-phase
-  // preflight/edit pipeline (runEditActionV1.ts → preflight rows →
-  // editExecution.v1) in the same change that emptied this set. The set —
-  // and the fail-closed assert below — stay in place so a future route
+  // Every ".v1" baseline route id is EMPTY since the §7.8 Edit-cohort
+  // cutover: the final five ids (implementation.v1, fastForward.v1,
+  // applyReviewEdit.v1, applyCurrentStage.v1, lint.v1) migrated onto the
+  // sealed two-phase preflight/edit pipeline (runEditActionV1.ts →
+  // preflight rows → editExecution.v1) in the same change that emptied it.
+  // The fail-closed assert below stays in place so a future ".v1" route
   // lands disabled-by-default again by adding its id here.
 ]);
 
@@ -115,8 +181,9 @@ export const LEGACY_AI_ROUTE_DISABLED_V0: ReadonlySet<string> = new Set<string>(
  * not disabled via `LEGACY_AI_ROUTE_DISABLED_V0`. Call this as the first
  * statement of a route's real handler — before any read, consent gate, or
  * provider selection — so an unregistered/misspelled route id, or one whose
- * legacy path is disabled pending its V1 migration (currently: all of
- * them), fails closed instead of running unaccounted-for.
+ * legacy path is disabled pending its V1 migration, fails closed instead of
+ * running unaccounted-for. A future route lands disabled-by-default by
+ * adding its id to `LEGACY_AI_ROUTE_DISABLED_V0`.
  */
 export function assertLegacyAiRouteAllowedV0(routeId: string): void {
   if (!REGISTERED_LEGACY_AI_ROUTE_IDS_V0.has(routeId)) {
@@ -138,12 +205,13 @@ export function assertLegacyAiRouteAllowedV0(routeId: string): void {
 
 /**
  * Non-throwing variant of the route gate for COMPOSITE routes whose handler
- * embeds an AI sub-step inside a larger non-AI flow (today: Commit/Push
- * metadata generation inside the commit flow). An unregistered route id
- * still throws (fail-closed identity check), but a disabled route returns
- * `true` so the caller can degrade to its deterministic non-AI behavior
- * (e.g. the fallback commit subject) instead of failing the whole non-AI
- * flow. Pure AI routes must keep using `assertLegacyAiRouteAllowedV0`.
+ * must degrade gracefully rather than throw when disabled: an AI sub-step
+ * embedded inside a larger non-AI flow (Commit/Push metadata generation
+ * inside the commit flow, degrading to the deterministic fallback subject).
+ * An unregistered route id still throws (fail-closed identity check), but a
+ * disabled route returns `true` so the caller can degrade instead of failing
+ * outright. Pure AI routes with no graceful degradation path must keep using
+ * `assertLegacyAiRouteAllowedV0`.
  */
 export function isLegacyAiRouteDisabledV0(routeId: string): boolean {
   if (!REGISTERED_LEGACY_AI_ROUTE_IDS_V0.has(routeId)) {
@@ -170,6 +238,7 @@ export const MIGRATED_ACTION_KEYS_V0: ReadonlySet<string> = new Set<string>([
   "review.v1",
   "applyReview.v1",
   "chatSend.v1",
+  "globalAssistantSend.v1",
   "commitPushMetadata.v1",
   // Edit cohort (§7.8): the four preflight actions and the composite
   // dispatcher, plus the internal mutation session — all running through

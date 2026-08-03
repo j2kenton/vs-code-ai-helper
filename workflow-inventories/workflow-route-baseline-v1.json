@@ -102,7 +102,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.applyReviewEditWithAI",
       "path": "src/commands/reviewActions.ts",
-      "span": "L5376-L5380",
+      "span": "L4797-L4801",
       "registrationSymbol": "registerReviewActionCommands",
       "contributed": true,
       "keybound": false,
@@ -123,8 +123,8 @@
       ],
       "entrypoint": "Contributed command + tree context menu (impl-review stages only); also the delegate target of the high/low wrapper commands for an impl-high-review/impl-low-review target.",
       "earliestRead": "assertLegacyAiRouteAllowedV0(\"applyReviewEdit.v1\") unconditionally as the literal first statement, before any argument normalization or read — stronger than the shared applyReviewWithAI's own edit-branch check, which must still dynamically discover a {taskFolderPath}/no-arg dispatch's stage first.",
-      "providerEdge": "No independent provider edge of its own — delegates to applyReviewWithAI, whose edit branch remains routed through the legacy runner and stays gated until the edit cohort (plan §1.2/§7/§7.8) lands.",
-      "writerEdge": "None reachable — applyReviewEdit.v1 is disabled, so the delegated call always rejects before any write.",
+      "providerEdge": "No independent provider edge of its own — delegates to applyReviewWithAI, whose edit branch runs the sealed two-phase preflight/edit pipeline (runSealedImplementationV1) since the §7.8 edit-cohort cutover; applyReviewEdit.v1 is enabled (removed from LEGACY_AI_ROUTE_DISABLED_V0).",
+      "writerEdge": "Source files, via the delegate's receipted mutation session (ensemble.writeFile/createDirectory/deletePath) against a sealed, revalidated plan — never a direct write from this wrapper.",
       "targetActionKey": "applyReviewEdit.v1",
       "gateLocation": "src/commands/reviewActions.ts",
       "migrationCohort": "edit"
@@ -133,7 +133,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.applyReviewWithAI",
       "path": "src/commands/reviewActions.ts",
-      "span": "L5371-L5375",
+      "span": "L4792-L4796",
       "registrationSymbol": "registerReviewActionCommands",
       "contributed": true,
       "keybound": false,
@@ -154,8 +154,8 @@
       ],
       "entrypoint": "Contributed command + tree context menu; also the delegate target of the high/low wrapper commands.",
       "earliestRead": "assertLegacyAiRouteAllowedV0(\"applyReview.v1\") in the reviewActions handler before task/review-artifact reads.",
-      "providerEdge": "Yes — review-apply provider run. Text branch (applyReview.v1) is migrated and enabled, running through the V1 action coordinator; the edit-capable branch (applyReviewEdit.v1) remains routed through the legacy runner and stays gated until the edit cohort (plan §1.2/§7/§7.8) lands.",
-      "writerEdge": "Text branch: review-targeted artifact via the V1 action coordinator (applyReviewRowV1) revision-checked promotion. Edit branch: source files via the legacy runner outputFile path — still disabled by the applyReviewEdit.v1 route gate.",
+      "providerEdge": "Yes — review-apply provider run. Text branch (applyReview.v1) is migrated and enabled, running through the V1 action coordinator; the edit-capable branch (applyReviewEdit.v1) is also migrated and enabled since the §7.8 edit-cohort cutover, running the sealed two-phase preflight/edit pipeline (runSealedImplementationV1) instead of the retired legacy runner.",
+      "writerEdge": "Text branch: review-targeted artifact via the V1 action coordinator (applyReviewRowV1) revision-checked promotion. Edit branch: source files via the receipted mutation session (ensemble.writeFile/createDirectory/deletePath) against a sealed, revalidated plan.",
       "targetActionKey": "applyReview.v1",
       "gateLocation": "src/commands/reviewActions.ts",
       "migrationCohort": "text3"
@@ -172,7 +172,7 @@
         "view/item/context"
       ],
       "treeBindings": [
-        "src/utils/globalAssistantActions.ts#L926-L926"
+        "src/utils/globalAssistantActions.ts#L960-L960"
       ],
       "fileGateRouteIds": [],
       "fileEdgesOut": [],
@@ -188,7 +188,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.cancelOperation",
       "path": "src/extension.ts",
-      "span": "L586-L597",
+      "span": "L591-L602",
       "registrationSymbol": "activate",
       "contributed": true,
       "keybound": false,
@@ -280,7 +280,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.chooseReleaseTarget",
       "path": "src/commands/reviewActions.ts",
-      "span": "L5407-L5431",
+      "span": "L4828-L4852",
       "registrationSymbol": "registerReviewActionCommands",
       "contributed": true,
       "keybound": false,
@@ -309,7 +309,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.clearNotifications",
       "path": "src/extension.ts",
-      "span": "L574-L577",
+      "span": "L579-L582",
       "registrationSymbol": "activate",
       "contributed": true,
       "keybound": false,
@@ -333,7 +333,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.collapseAllTasks",
       "path": "src/extension.ts",
-      "span": "L685-L695",
+      "span": "L690-L700",
       "registrationSymbol": "collapseAllCommand",
       "contributed": true,
       "keybound": false,
@@ -357,7 +357,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.commitAndPushTask",
       "path": "src/commands/commitAndPushTask.ts",
-      "span": "L2513-L2517",
+      "span": "L2833-L2837",
       "registrationSymbol": "disposable",
       "contributed": true,
       "keybound": true,
@@ -365,21 +365,21 @@
         "view/item/context"
       ],
       "treeBindings": [
-        "src/commands/reviewActions.ts#L2104-L2104",
-        "src/commands/reviewActions.ts#L2117-L2117",
-        "src/commands/reviewActions.ts#L2276-L2276",
-        "src/commands/reviewActions.ts#L2314-L2314",
-        "src/commands/reviewActions.ts#L2326-L2326",
-        "src/commands/reviewActions.ts#L2353-L2353",
-        "src/commands/reviewActions.ts#L2411-L2411",
-        "src/commands/reviewActions.ts#L3474-L3474",
-        "src/commands/reviewActions.ts#L3499-L3499",
-        "src/commands/reviewActions.ts#L3532-L3532",
-        "src/commands/reviewActions.ts#L3548-L3548",
-        "src/commands/reviewActions.ts#L3586-L3586",
-        "src/commands/reviewActions.ts#L4120-L4120",
-        "src/commands/reviewActions.ts#L4145-L4145",
-        "src/commands/reviewActions.ts#L4160-L4160",
+        "src/commands/reviewActions.ts#L1428-L1428",
+        "src/commands/reviewActions.ts#L1441-L1441",
+        "src/commands/reviewActions.ts#L1600-L1600",
+        "src/commands/reviewActions.ts#L1638-L1638",
+        "src/commands/reviewActions.ts#L1650-L1650",
+        "src/commands/reviewActions.ts#L1677-L1677",
+        "src/commands/reviewActions.ts#L1735-L1735",
+        "src/commands/reviewActions.ts#L2798-L2798",
+        "src/commands/reviewActions.ts#L2823-L2823",
+        "src/commands/reviewActions.ts#L2856-L2856",
+        "src/commands/reviewActions.ts#L2872-L2872",
+        "src/commands/reviewActions.ts#L2910-L2910",
+        "src/commands/reviewActions.ts#L3444-L3444",
+        "src/commands/reviewActions.ts#L3469-L3469",
+        "src/commands/reviewActions.ts#L3484-L3484",
         "src/commands/setTaskStage.ts#L293-L293"
       ],
       "fileGateRouteIds": [
@@ -398,7 +398,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.completeCommitAndPushTask",
       "path": "src/commands/commitAndPushTask.ts",
-      "span": "L2518-L2522",
+      "span": "L2838-L2842",
       "registrationSymbol": "completeDisposable",
       "contributed": true,
       "keybound": false,
@@ -506,7 +506,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.expandAllTasks",
       "path": "src/extension.ts",
-      "span": "L674-L684",
+      "span": "L679-L689",
       "registrationSymbol": "expandAllCommand",
       "contributed": true,
       "keybound": false,
@@ -554,7 +554,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.fastForwardReviewWithAI",
       "path": "src/commands/reviewActions.ts",
-      "span": "L5381-L5385",
+      "span": "L4802-L4806",
       "registrationSymbol": "registerReviewActionCommands",
       "contributed": true,
       "keybound": false,
@@ -562,7 +562,7 @@
         "view/item/context"
       ],
       "treeBindings": [
-        "src/utils/globalAssistantActions.ts#L898-L898"
+        "src/utils/globalAssistantActions.ts#L932-L932"
       ],
       "fileGateRouteIds": [
         "applyReview.v1",
@@ -577,8 +577,8 @@
       ],
       "entrypoint": "Contributed command + tree context menu; also bound as a global-assistant action.",
       "earliestRead": "assertLegacyAiRouteAllowedV0(\"fastForward.v1\") in the reviewActions handler before task/review reads.",
-      "providerEdge": "Yes — edit-capable fast-forward run (disabled by the route gate pending the edit cohort).",
-      "writerEdge": "Source files via the legacy edit runner — disabled by the route gate.",
+      "providerEdge": "Yes — edit-capable fast-forward run. Migrated and enabled since the §7.8 edit-cohort cutover: runs the sealed two-phase preflight/edit pipeline (runSealedImplementationV1) via applyImplementationReviewWithAI, not the retired legacy runner.",
+      "writerEdge": "Source files, via the receipted mutation session (ensemble.writeFile/createDirectory/deletePath) against a sealed, revalidated plan.",
       "targetActionKey": "fastForward.v1",
       "gateLocation": "src/commands/reviewActions.ts",
       "migrationCohort": "edit"
@@ -587,7 +587,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.filterNotifications",
       "path": "src/extension.ts",
-      "span": "L578-L581",
+      "span": "L583-L586",
       "registrationSymbol": "activate",
       "contributed": true,
       "keybound": false,
@@ -611,7 +611,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.filterTasksByStatus",
       "path": "src/extension.ts",
-      "span": "L701-L704",
+      "span": "L706-L709",
       "registrationSymbol": "activate",
       "contributed": true,
       "keybound": false,
@@ -635,7 +635,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.generateImplementationWithAI",
       "path": "src/commands/reviewActions.ts",
-      "span": "L5362-L5366",
+      "span": "L4783-L4787",
       "registrationSymbol": "registerReviewActionCommands",
       "contributed": false,
       "keybound": false,
@@ -672,7 +672,7 @@
         "view/item/context"
       ],
       "treeBindings": [
-        "src/commands/reviewActions.ts#L4077-L4077"
+        "src/commands/reviewActions.ts#L3401-L3401"
       ],
       "fileGateRouteIds": [
         "generatePlan.v1"
@@ -690,29 +690,31 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.globalAssistantSend",
       "path": "src/commands/openGeneralAssistant.ts",
-      "span": "L371-L375",
+      "span": "L307-L310",
       "registrationSymbol": "registerOpenGeneralAssistantCommand",
       "contributed": false,
       "keybound": false,
       "menus": [],
       "treeBindings": [],
-      "fileGateRouteIds": [],
+      "fileGateRouteIds": [
+        "globalAssistantSend.v1"
+      ],
       "fileEdgesOut": [
         "vs-code-ai-helper.openAiModels"
       ],
-      "entrypoint": "Internal command (not contributed); the chat webview's Send routes here when no stage conversation is selected.",
-      "earliestRead": "Global assistant conversation state (workspace-level); reads no task artifacts and never resolves a task context.",
-      "providerEdge": "Yes — global-assistant conversation model. DELIBERATELY outside the legacy AI route gate: it is not a baseline task question/edit-capable route (no task artifact writes, no task binding); this row is the explicit classification of that exemption (plan §1.2). Any provider invocation is still subject to the runner-boundary backstop.",
-      "writerEdge": "Global assistant transcript state only; never task artifacts or source files.",
-      "targetActionKey": "none",
-      "gateLocation": "none",
+      "entrypoint": "Contributed command (no menu entry of its own — invoked internally by the chat webview's composer for the Global Assistant's \"global\" target kind).",
+      "earliestRead": "assertLegacyAiRouteAllowedV0(\"globalAssistantSend.v1\") before argument/message resolution.",
+      "providerEdge": "Yes — Global Assistant cross-task conversation send. Migrated and enabled: runs through the V1 action coordinator (globalAssistantSend.v1 / globalAssistantSendRowV1.ts).",
+      "writerEdge": "The Global Assistant's own dedicated non-task Chat folder (chat-v1.json under the meta-root's global-assistant/ folder, registered via ensureWorkflowNonTaskStorageRootV1 — never a task folder); executing a proposed cross-task operation also appends a best-effort audit-log entry (writeRunLog) via globalAssistantActions.ts's executeProposedAction.",
+      "targetActionKey": "globalAssistantSend.v1",
+      "gateLocation": "src/commands/openGeneralAssistant.ts",
       "migrationCohort": "chat"
     },
     {
       "kind": "command",
       "commandId": "vs-code-ai-helper.helloWorld",
       "path": "src/extension.ts",
-      "span": "L524-L531",
+      "span": "L529-L536",
       "registrationSymbol": "helloWorldDisposable",
       "contributed": true,
       "keybound": false,
@@ -742,7 +744,7 @@
         "view/item/context"
       ],
       "treeBindings": [
-        "src/utils/globalAssistantActions.ts#L867-L867"
+        "src/utils/globalAssistantActions.ts#L901-L901"
       ],
       "fileGateRouteIds": [],
       "fileEdgesOut": [],
@@ -778,7 +780,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.nextStage",
       "path": "src/commands/reviewActions.ts",
-      "span": "L5390-L5394",
+      "span": "L4811-L4815",
       "registrationSymbol": "registerReviewActionCommands",
       "contributed": true,
       "keybound": true,
@@ -786,7 +788,7 @@
         "view/item/context"
       ],
       "treeBindings": [
-        "src/utils/globalAssistantActions.ts#L878-L878"
+        "src/utils/globalAssistantActions.ts#L912-L912"
       ],
       "fileGateRouteIds": [
         "applyReview.v1",
@@ -811,7 +813,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.openAiModels",
       "path": "src/extension.ts",
-      "span": "L496-L499",
+      "span": "L501-L504",
       "registrationSymbol": "activate",
       "contributed": true,
       "keybound": false,
@@ -853,7 +855,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.openChatData",
       "path": "src/extension.ts",
-      "span": "L612-L614",
+      "span": "L617-L619",
       "registrationSymbol": "activate",
       "contributed": true,
       "keybound": false,
@@ -897,7 +899,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.openGeneralAssistant",
       "path": "src/commands/openGeneralAssistant.ts",
-      "span": "L368-L370",
+      "span": "L304-L306",
       "registrationSymbol": "registerOpenGeneralAssistantCommand",
       "contributed": true,
       "keybound": false,
@@ -905,14 +907,16 @@
         "view/title"
       ],
       "treeBindings": [],
-      "fileGateRouteIds": [],
+      "fileGateRouteIds": [
+        "globalAssistantSend.v1"
+      ],
       "fileEdgesOut": [
         "vs-code-ai-helper.openAiModels"
       ],
-      "entrypoint": "Tasks view title button + palette; opens Chat With AI targeting the global assistant.",
-      "earliestRead": "Chat view target state only; no task reads.",
-      "providerEdge": "None (opening the panel never invokes a provider; sends go through globalAssistantSend).",
-      "writerEdge": "None.",
+      "entrypoint": "Contributed command + view/title toolbar icon (\"Open AI Assistant\"); opens/reveals the Chat With AI panel on the Global Assistant's conversation, and is the panel's default target when none is chosen yet.",
+      "earliestRead": "Resolves/creates the Global Assistant's dedicated folder (resolveGlobalAssistantTarget); no AI gate — this command never invokes a provider itself (Send is the separate globalAssistantSend command, above).",
+      "providerEdge": "None (opening the panel invokes no provider).",
+      "writerEdge": "None beyond creating the Global Assistant's dedicated folder if absent (vscode.workspace.fs.createDirectory) — no document content is written.",
       "targetActionKey": "none",
       "gateLocation": "none",
       "migrationCohort": "chat"
@@ -921,7 +925,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.openSettings",
       "path": "src/extension.ts",
-      "span": "L492-L495",
+      "span": "L497-L500",
       "registrationSymbol": "activate",
       "contributed": true,
       "keybound": false,
@@ -932,7 +936,7 @@
         "src/commands/chatWithStage.ts#L478-L478",
         "src/commands/draftTaskWithAI.ts#L427-L427",
         "src/commands/generatePlanWithAI.ts#L502-L502",
-        "src/commands/reviewActions.ts#L1038-L1038"
+        "src/commands/reviewActions.ts#L4472-L4472"
       ],
       "fileGateRouteIds": [],
       "fileEdgesOut": [
@@ -958,7 +962,7 @@
         "view/item/context"
       ],
       "treeBindings": [
-        "src/utils/globalAssistantActions.ts#L906-L906"
+        "src/utils/globalAssistantActions.ts#L940-L940"
       ],
       "fileGateRouteIds": [],
       "fileEdgesOut": [],
@@ -982,7 +986,7 @@
         "view/item/context"
       ],
       "treeBindings": [
-        "src/utils/globalAssistantActions.ts#L946-L946"
+        "src/utils/globalAssistantActions.ts#L980-L980"
       ],
       "fileGateRouteIds": [],
       "fileEdgesOut": [],
@@ -1005,7 +1009,7 @@
       "menus": [],
       "treeBindings": [
         "src/utils/reviewEscalation.ts#L145-L145",
-        "src/views/chatView.ts#L478-L478"
+        "src/views/chatView.ts#L490-L490"
       ],
       "fileGateRouteIds": [
         "chatSend.v1"
@@ -1045,7 +1049,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.refreshTasksView",
       "path": "src/extension.ts",
-      "span": "L670-L673",
+      "span": "L675-L678",
       "registrationSymbol": "refreshCommand",
       "contributed": true,
       "keybound": false,
@@ -1069,7 +1073,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.release",
       "path": "src/commands/reviewActions.ts",
-      "span": "L5403-L5406",
+      "span": "L4824-L4827",
       "registrationSymbol": "registerReviewActionCommands",
       "contributed": true,
       "keybound": false,
@@ -1144,13 +1148,13 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.resetChatHistory",
       "path": "src/extension.ts",
-      "span": "L617-L619",
+      "span": "L622-L624",
       "registrationSymbol": "activate",
       "contributed": true,
       "keybound": false,
       "menus": [],
       "treeBindings": [
-        "src/views/chatView.ts#L890-L890"
+        "src/views/chatView.ts#L902-L902"
       ],
       "fileGateRouteIds": [],
       "fileEdgesOut": [
@@ -1168,7 +1172,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.resetTaskStatusFilter",
       "path": "src/extension.ts",
-      "span": "L705-L708",
+      "span": "L710-L713",
       "registrationSymbol": "activate",
       "contributed": true,
       "keybound": false,
@@ -1203,7 +1207,7 @@
         "src/commands/startNewTask.ts#L506-L506",
         "src/commands/taskCreationRecovery.ts#L297-L297",
         "src/commands/taskCreationRecovery.ts#L558-L558",
-        "src/utils/globalAssistantActions.ts#L916-L916",
+        "src/utils/globalAssistantActions.ts#L950-L950",
         "src/views/taskStatusBar.ts#L133-L133"
       ],
       "fileGateRouteIds": [],
@@ -1288,7 +1292,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.runImplementationWithAI",
       "path": "src/commands/reviewActions.ts",
-      "span": "L5398-L5402",
+      "span": "L4819-L4823",
       "registrationSymbol": "registerReviewActionCommands",
       "contributed": true,
       "keybound": false,
@@ -1296,8 +1300,8 @@
         "view/item/context"
       ],
       "treeBindings": [
-        "src/commands/reviewActions.ts#L237-L237",
-        "src/commands/reviewActions.ts#L4088-L4088"
+        "src/commands/reviewActions.ts#L229-L229",
+        "src/commands/reviewActions.ts#L3412-L3412"
       ],
       "fileGateRouteIds": [
         "applyReview.v1",
@@ -1312,8 +1316,8 @@
       ],
       "entrypoint": "Contributed command + tree context menu; also bound from Implementation-stage follow-up notifications.",
       "earliestRead": "assertLegacyAiRouteAllowedV0(\"implementation.v1\") in the reviewActions handler before task/source reads.",
-      "providerEdge": "Yes — edit-capable implementation run (disabled by the route gate pending the edit cohort; the read-only preflight contract of plan §7 binds here).",
-      "writerEdge": "Source files via the legacy edit runner — disabled by the route gate.",
+      "providerEdge": "Yes — edit-capable implementation run. Migrated and enabled since the §7.8 edit-cohort cutover: runs the sealed two-phase pipeline (runSealedImplementationV1) — a read-only preflight (plan §7) followed by a receipted mutation session — instead of the retired legacy runner.",
+      "writerEdge": "Source files, via the receipted mutation session (ensemble.writeFile/createDirectory/deletePath) against a sealed, revalidated plan.",
       "targetActionKey": "implementation.v1",
       "gateLocation": "src/commands/reviewActions.ts",
       "migrationCohort": "edit"
@@ -1335,9 +1339,9 @@
       ],
       "fileEdgesOut": [],
       "entrypoint": "Contributed command + tree context menu (Publish stage lint).",
-      "earliestRead": "assertLegacyAiRouteAllowedV0(\"lint.v1\") before task/lint-payload reads (composite: deterministic lint + AI fallback both stay gated until both migrate, plan §1.3).",
-      "providerEdge": "AI lint fallback only (after deterministic fixes) — disabled by the route gate.",
-      "writerEdge": "Source files (deterministic lint fixes; AI fallback disabled by the gate).",
+      "earliestRead": "assertLegacyAiRouteAllowedV0(\"lint.v1\") before task/lint-payload reads (composite route; the gate now passes for both the deterministic lint and the AI fallback since both are migrated and enabled).",
+      "providerEdge": "AI lint fallback only (after deterministic fixes). Migrated and enabled since the §7.8 edit-cohort cutover: the fallback runs the sealed two-phase preflight/edit pipeline (runSealedImplementationV1) instead of the retired legacy runner.",
+      "writerEdge": "Source files: deterministic lint fixes write directly; the AI fallback writes via the receipted mutation session (ensemble.writeFile/createDirectory/deletePath) against a sealed, revalidated plan.",
       "targetActionKey": "lint.v1",
       "gateLocation": "src/commands/runLintingFixes.ts",
       "migrationCohort": "edit"
@@ -1346,7 +1350,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.runNotificationAction",
       "path": "src/extension.ts",
-      "span": "L603-L609",
+      "span": "L608-L614",
       "registrationSymbol": "activate",
       "contributed": true,
       "keybound": false,
@@ -1395,7 +1399,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.runReviewWithAI",
       "path": "src/commands/reviewActions.ts",
-      "span": "L5367-L5370",
+      "span": "L4788-L4791",
       "registrationSymbol": "registerReviewActionCommands",
       "contributed": true,
       "keybound": false,
@@ -1404,7 +1408,7 @@
       ],
       "treeBindings": [
         "src/commands/setTaskStage.ts#L325-L325",
-        "src/utils/globalAssistantActions.ts#L890-L890"
+        "src/utils/globalAssistantActions.ts#L924-L924"
       ],
       "fileGateRouteIds": [
         "applyReview.v1",
@@ -1577,7 +1581,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.stageArtifactNotReady",
       "path": "src/extension.ts",
-      "span": "L713-L720",
+      "span": "L718-L725",
       "registrationSymbol": "activate",
       "contributed": false,
       "keybound": false,
@@ -1625,7 +1629,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.statusBarMenu",
       "path": "src/extension.ts",
-      "span": "L721-L724",
+      "span": "L726-L729",
       "registrationSymbol": "statusBarMenuCommand",
       "contributed": false,
       "keybound": false,
@@ -1655,7 +1659,7 @@
         "view/item/context"
       ],
       "treeBindings": [
-        "src/utils/globalAssistantActions.ts#L936-L936"
+        "src/utils/globalAssistantActions.ts#L970-L970"
       ],
       "fileGateRouteIds": [],
       "fileEdgesOut": [],
@@ -1679,7 +1683,7 @@
         "view/item/context"
       ],
       "treeBindings": [
-        "src/utils/globalAssistantActions.ts#L956-L956"
+        "src/utils/globalAssistantActions.ts#L990-L990"
       ],
       "fileGateRouteIds": [],
       "fileEdgesOut": [],
@@ -1695,7 +1699,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.viewDisclaimer",
       "path": "src/extension.ts",
-      "span": "L538-L550",
+      "span": "L543-L555",
       "registrationSymbol": "viewDisclaimerDisposable",
       "contributed": true,
       "keybound": false,
@@ -1737,7 +1741,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.viewReview",
       "path": "src/commands/reviewActions.ts",
-      "span": "L5386-L5389",
+      "span": "L4807-L4810",
       "registrationSymbol": "registerReviewActionCommands",
       "contributed": true,
       "keybound": false,
@@ -1875,11 +1879,11 @@
       "kind": "internalEdge",
       "commandId": "vs-code-ai-helper.openAiModels",
       "path": "src/commands/openGeneralAssistant.ts",
-      "span": "L283-L283",
+      "span": "L195-L195",
       "enclosingSymbol": "globalAssistantSend",
       "occurrence": 1,
       "edgeRole": "uiNavigation",
-      "description": "Opens the model-configuration UI when the assistant has no configured model; no task or provider work.",
+      "description": "Missing-model prompt (the Global Assistant uses the Task Description stage's configured model) opens the model-configuration UI; UI only.",
       "targetActionKey": "none",
       "gateLocation": "none",
       "migrationCohort": "nonPlan"
@@ -1888,7 +1892,7 @@
       "kind": "internalEdge",
       "commandId": "vs-code-ai-helper.runReviewWithAI",
       "path": "src/commands/reviewActions.ts",
-      "span": "L3774-L3777",
+      "span": "L3098-L3101",
       "enclosingSymbol": "viewReview",
       "occurrence": 1,
       "edgeRole": "userPromptAction",
@@ -1918,7 +1922,7 @@
       "enclosingSymbol": "fire",
       "occurrence": 1,
       "edgeRole": "scheduler",
-      "description": "Scheduled-resume timer fires the composite current-stage dispatcher for the scheduled task; the callee's first-statement applyCurrentStage.v1 gate throws before any read while the family is disabled.",
+      "description": "Scheduled-resume timer fires the composite current-stage dispatcher for the scheduled task; the callee's first-statement applyCurrentStage.v1 gate passes (the route is enabled) before any read, then dispatches to the current stage's migrated action.",
       "targetActionKey": "applyCurrentStage.v1",
       "gateLocation": "src/commands/applyCurrentStageAction.ts",
       "migrationCohort": "edit"
@@ -1927,7 +1931,7 @@
       "kind": "internalEdge",
       "commandId": "vs-code-ai-helper.settingsView.focus",
       "path": "src/extension.ts",
-      "span": "L498-L498",
+      "span": "L503-L503",
       "enclosingSymbol": "activate",
       "occurrence": 1,
       "edgeRole": "uiNavigation",
@@ -1953,7 +1957,7 @@
       "kind": "internalEdge",
       "commandId": "vs-code-ai-helper.applyCurrentStageAction",
       "path": "src/utils/globalAssistantActions.ts",
-      "span": "L669-L671",
+      "span": "L703-L705",
       "enclosingSymbol": "execute",
       "occurrence": 1,
       "edgeRole": "wrapperDelegation",
@@ -1966,7 +1970,7 @@
       "kind": "internalEdge",
       "commandId": "vs-code-ai-helper.setTaskStage",
       "path": "src/utils/globalAssistantActions.ts",
-      "span": "L609-L612",
+      "span": "L643-L646",
       "enclosingSymbol": "execute",
       "occurrence": 1,
       "edgeRole": "wrapperDelegation",
@@ -1979,7 +1983,7 @@
       "kind": "internalEdge",
       "commandId": "vs-code-ai-helper.startNewTask",
       "path": "src/utils/globalAssistantActions.ts",
-      "span": "L387-L389",
+      "span": "L421-L423",
       "enclosingSymbol": "folderName",
       "occurrence": 1,
       "edgeRole": "wrapperDelegation",
@@ -1992,7 +1996,7 @@
       "kind": "internalEdge",
       "commandId": "vs-code-ai-helper.unarchiveTask",
       "path": "src/utils/globalAssistantActions.ts",
-      "span": "L442-L444",
+      "span": "L476-L478",
       "enclosingSymbol": "unarchiveOneTaskVerified",
       "occurrence": 1,
       "edgeRole": "wrapperDelegation",
@@ -2044,13 +2048,13 @@
       "kind": "internalEdge",
       "commandId": "vs-code-ai-helper.globalAssistantSend",
       "path": "src/views/chatView.ts",
-      "span": "L325-L327",
+      "span": "L337-L339",
       "enclosingSymbol": "resolveWebviewView",
       "occurrence": 1,
       "edgeRole": "wrapperDelegation",
-      "description": "Chat webview Send forwards global-assistant messages to the deliberately ungated globalAssistantSend command; no handler-level gate — legacy uncorrelated invocations are rejected at the shared runner boundary by the uncorrelated-invocation backstop in legacyAiActionSafetyGateV0.ts.",
-      "targetActionKey": "none",
-      "gateLocation": "none",
+      "description": "Chat webview Send forwards Global Assistant messages to globalAssistantSend for the \"global\" target kind; the composer appends the user's message itself first (globalAssistantSend does not persist it), then dispatches — the callee's own gate (globalAssistantSend.v1) is asserted as its first statement.",
+      "targetActionKey": "globalAssistantSend.v1",
+      "gateLocation": "src/commands/openGeneralAssistant.ts",
       "migrationCohort": "chat"
     },
     {
@@ -2067,92 +2071,21 @@
       "migrationCohort": "nonPlan"
     },
     {
-      "kind": "providerEdge",
-      "callee": "resolveRunnerForModel",
-      "path": "src/commands/openGeneralAssistant.ts",
-      "span": "L306-L306",
-      "enclosingSymbol": "globalAssistantSend",
-      "occurrence": 1,
-      "description": "Global-assistant provider-label resolution for the send path; deliberately ungated at handler level — no handler-level gate — legacy uncorrelated invocations are rejected at the shared runner boundary by the uncorrelated-invocation backstop in legacyAiActionSafetyGateV0.ts.",
-      "targetActionKey": "none",
-      "gateLocation": "none",
-      "migrationCohort": "chat"
-    },
-    {
-      "kind": "providerEdge",
-      "callee": "resolveRunnerForModel",
-      "path": "src/commands/openGeneralAssistant.ts",
-      "span": "L181-L181",
-      "enclosingSymbol": "runGlobalAssistantWithFallback",
-      "occurrence": 1,
-      "description": "Global-assistant candidate-loop resolution (primary plus configured backups); deliberately ungated at handler level — no handler-level gate — legacy uncorrelated invocations are rejected at the shared runner boundary by the uncorrelated-invocation backstop in legacyAiActionSafetyGateV0.ts.",
-      "targetActionKey": "none",
-      "gateLocation": "none",
-      "migrationCohort": "chat"
-    },
-    {
-      "kind": "providerEdge",
-      "callee": "resolveRunnerForModel",
-      "path": "src/commands/reviewActions.ts",
-      "span": "L1047-L1052",
-      "enclosingSymbol": "runAiToFile",
-      "occurrence": 1,
-      "description": "Shared text-run helper's primary resolution. runAiToFile has no registry identity of its own — every caller (review.v1 generation, applyReview.v1 text branch, generateImplementation.v1) carries its own first-statement gate in this file before reaching it, and the runner-boundary backstop rejects any uncorrelated invocation that slipped past a handler gate.",
-      "targetActionKey": "none",
-      "gateLocation": "none",
-      "migrationCohort": "text3"
-    },
-    {
-      "kind": "providerEdge",
-      "callee": "resolveRunnerForModel",
-      "path": "src/commands/reviewActions.ts",
-      "span": "L1292-L1292",
-      "enclosingSymbol": "runAiToFile",
-      "occurrence": 2,
-      "description": "Shared text-run helper's backup-retry resolution (explicit candidate list, no nested automatic fallback); same caller-gate coverage as the primary resolution row.",
-      "targetActionKey": "none",
-      "gateLocation": "none",
-      "migrationCohort": "text3"
-    },
-    {
-      "kind": "providerEdge",
-      "callee": "resolveRunnerForModel",
-      "path": "src/commands/reviewActions.ts",
-      "span": "L1662-L1662",
-      "enclosingSymbol": "runSecondOpinionReview",
-      "occurrence": 1,
-      "description": "Second-opinion review escalation resolution; reached only from gated review flows in this file.",
-      "targetActionKey": "review.v1",
-      "gateLocation": "src/commands/reviewActions.ts",
-      "migrationCohort": "text3"
-    },
-    {
-      "kind": "providerEdge",
-      "callee": "resolveRunnerForModel",
-      "path": "src/utils/completionLint.ts",
-      "span": "L390-L390",
-      "enclosingSymbol": "runAiPlanVerification",
-      "occurrence": 1,
-      "description": "Verified-Checks AI plan verification used by runPublishChecks and reviewActions' publish preview — a read-only verdict pass over a temp spool it deletes; no handler-level gate — legacy uncorrelated invocations are rejected at the shared runner boundary by the uncorrelated-invocation backstop in legacyAiActionSafetyGateV0.ts; migrates with the publish-checks flows.",
-      "targetActionKey": "none",
-      "gateLocation": "none",
-      "migrationCohort": "git"
-    },
-    {
       "kind": "webviewMessage",
       "path": "src/views/chatView.ts",
-      "span": "L257-L329",
+      "span": "L257-L341",
       "handlerSymbol": "resolveWebviewView",
       "fileGateRouteIds": [
-        "chatSend.v1"
+        "chatSend.v1",
+        "globalAssistantSend.v1"
       ],
       "fileEdgesOut": [
         "vs-code-ai-helper.chatWithStage",
         "vs-code-ai-helper.globalAssistantSend"
       ],
       "entrypoint": "Chat With AI webview message handler (Send and panel messages).",
-      "earliestRead": "For stage-conversation sends, the chatSend.v1 gate is consulted BEFORE the user message is appended to the transcript, so a disabled route rejects without mutating chat state (wiring-tested); global-assistant sends route to the deliberately ungated globalAssistantSend command (see that row's classification).",
-      "providerEdge": "None directly; delegates to vs-code-ai-helper.chatWithStage (gated) or vs-code-ai-helper.globalAssistantSend (classified exemption).",
+      "earliestRead": "For stage-conversation sends, the chatSend.v1 gate is consulted BEFORE the user message is appended to the transcript, so a disabled route rejects without mutating chat state (wiring-tested); global-assistant sends route directly to the permanently-unavailable globalAssistantSend stub (no gate — see that row's classification) without appending the user's text first.",
+      "providerEdge": "None directly; delegates to vs-code-ai-helper.chatWithStage (gated) or vs-code-ai-helper.globalAssistantSend (unavailable stub, no provider call).",
       "writerEdge": "Task-local Chat (<task-folder>/chat-v1.json, plan §5.1) via the delegated commands; workspace-state Memento remains only as the legacy migration source, never the live write target. Never task artifacts.",
       "targetActionKey": "chatSend.v1",
       "gateLocation": "src/views/chatView.ts",
@@ -2172,84 +2105,6 @@
       "targetActionKey": "none",
       "gateLocation": "none",
       "migrationCohort": "nonPlan"
-    },
-    {
-      "kind": "writerEdge",
-      "propertyName": "outputFile",
-      "path": "src/commands/openGeneralAssistant.ts",
-      "span": "L214-L214",
-      "enclosingSymbol": "result",
-      "occurrence": 1,
-      "description": "Global-assistant per-candidate response spool runs/chat-<ts>-<model>.md handed to the runner protocol.",
-      "artifactClass": "runsLog",
-      "targetActionKey": "none",
-      "gateLocation": "none",
-      "migrationCohort": "chat"
-    },
-    {
-      "kind": "writerEdge",
-      "propertyName": "outputFile",
-      "path": "src/commands/openGeneralAssistant.ts",
-      "span": "L221-L221",
-      "enclosingSymbol": "runGlobalAssistantWithFallback",
-      "occurrence": 1,
-      "description": "Echoes the chosen spool path back to the caller for transcript read-back; no additional write of its own.",
-      "artifactClass": "resultEcho",
-      "targetActionKey": "none",
-      "gateLocation": "none",
-      "migrationCohort": "chat"
-    },
-    {
-      "kind": "writerEdge",
-      "propertyName": "outputFileUri",
-      "path": "src/commands/reviewActions.ts",
-      "span": "L5094-L5094",
-      "enclosingSymbol": "generated",
-      "occurrence": 1,
-      "description": "Implementation-checklist generation writing plan-final.md (canonical implementation artifact) through runAiToFile; the Generate Implementation family rooted in reviewActions.ts (AC-ROUTE-02).",
-      "artifactClass": "taskArtifact",
-      "targetActionKey": "generateImplementation.v1",
-      "gateLocation": "src/commands/reviewActions.ts",
-      "migrationCohort": "text3"
-    },
-    {
-      "kind": "writerEdge",
-      "propertyName": "outputFile",
-      "path": "src/commands/reviewActions.ts",
-      "span": "L1126-L1126",
-      "enclosingSymbol": "result",
-      "occurrence": 1,
-      "description": "runAiToFile's primary run destination — a same-directory staged temp when output validation is configured (promoted only after validation), otherwise the caller's target; caller gates apply (see the runAiToFile provider rows).",
-      "artifactClass": "stagedTemp",
-      "targetActionKey": "none",
-      "gateLocation": "none",
-      "migrationCohort": "text3"
-    },
-    {
-      "kind": "writerEdge",
-      "propertyName": "outputFile",
-      "path": "src/commands/reviewActions.ts",
-      "span": "L1697-L1697",
-      "enclosingSymbol": "result",
-      "occurrence": 2,
-      "description": "Second-opinion review temp spool (.second-opinion.<uuid>.tmp.md), read for verdicts and deleted; never a task artifact.",
-      "artifactClass": "stagedTemp",
-      "targetActionKey": "review.v1",
-      "gateLocation": "src/commands/reviewActions.ts",
-      "migrationCohort": "text3"
-    },
-    {
-      "kind": "writerEdge",
-      "propertyName": "outputFile",
-      "path": "src/commands/reviewActions.ts",
-      "span": "L1308-L1308",
-      "enclosingSymbol": "runAiToFile",
-      "occurrence": 1,
-      "description": "runAiToFile's backup-retry destination (same staged temp as the primary run); caller gates apply.",
-      "artifactClass": "stagedTemp",
-      "targetActionKey": "none",
-      "gateLocation": "none",
-      "migrationCohort": "text3"
     },
     {
       "kind": "writerEdge",
@@ -2276,19 +2131,6 @@
       "targetActionKey": "none",
       "gateLocation": "none",
       "migrationCohort": "runnerV1"
-    },
-    {
-      "kind": "writerEdge",
-      "propertyName": "outputFile",
-      "path": "src/utils/completionLint.ts",
-      "span": "L418-L418",
-      "enclosingSymbol": "result",
-      "occurrence": 1,
-      "description": "Verified-Checks AI plan-verification temp spool, read for verdicts and deleted; never a task artifact (see the matching provider row).",
-      "artifactClass": "stagedTemp",
-      "targetActionKey": "none",
-      "gateLocation": "none",
-      "migrationCohort": "git"
     }
   ]
 }

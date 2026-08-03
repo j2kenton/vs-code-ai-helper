@@ -4,11 +4,11 @@
  * sequencing past the index/privacy check to the read-only git readiness
  * check too — `checkGitPublishReadiness`, shared with `publishPreflight.ts`):
  * `executeCommitPushV1` now short-circuits on a not-ready repo (detached
- * HEAD, no repo, ambiguous push target) BEFORE ever invoking
- * `commitAndPushTaskCore`, exactly like the pre-existing index/privacy
- * short-circuit — see `commitAndPushIndexGuard.test.ts`'s source-order
- * suite for the static ordering assertions this behavioral test
- * complements.
+ * HEAD, no repo, ambiguous push target) BEFORE ever invoking any of the
+ * remaining coordinator-native steps (staging-scope resolution through
+ * push), exactly like the pre-existing index/privacy short-circuit — see
+ * `commitAndPushIndexGuard.test.ts`'s source-order suite for the static
+ * ordering assertions this behavioral test complements.
  */
 import * as assert from "node:assert/strict";
 import * as cp from "node:child_process";
@@ -29,12 +29,14 @@ import {
 import { fixtureOwnershipFor } from "./taskFolderFixture";
 import { safeRemoveDir } from "./testFsUtils";
 
-// Required (not `import`ed) so commitAndPushTaskCore's exported reference can
-// be monkey-patched for the duration of a test to prove it is never called —
-// same pattern/rationale as commitAndPushPublishGate.test.ts.
+// Required (not `import`ed) so saveCommitPushDocumentsV1's exported
+// reference — the first of the remaining coordinator-native steps that runs
+// after staging-scope resolution/confirmation — can be monkey-patched for
+// the duration of a test to prove it is never called — same pattern/
+// rationale as commitAndPushPublishGate.test.ts.
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const commitAndPushTaskModule = require("../commands/commitAndPushTask") as {
-  commitAndPushTaskCore: (...args: unknown[]) => Promise<unknown>;
+  saveCommitPushDocumentsV1: (...args: unknown[]) => Promise<unknown>;
 };
 
 function git(cwd: string, args: string[]): void {
@@ -102,22 +104,22 @@ function contextFor(taskFolderPath: string): LifecycleExecutionContextV1 {
 }
 
 void describe("executeCommitPushV1 — git readiness short-circuit (§10.2 step 2)", () => {
-  void it("returns commitPush.gitNotReady and never invokes commitAndPushTaskCore for a detached-HEAD repo", async () => {
+  void it("returns commitPush.gitNotReady and never invokes any remaining coordinator-native step for a detached-HEAD repo", async () => {
     const { repoRoot, taskFolderPath } = makeDetachedHeadFixture();
     const surface = new RecordingSurface();
     initNotificationRouter(surface);
 
-    const originalCore = commitAndPushTaskModule.commitAndPushTaskCore;
-    let coreCalled = false;
-    commitAndPushTaskModule.commitAndPushTaskCore = (): Promise<unknown> => {
-      coreCalled = true;
-      return Promise.resolve({ kind: "completed" });
+    const originalSave = commitAndPushTaskModule.saveCommitPushDocumentsV1;
+    let saveCalled = false;
+    commitAndPushTaskModule.saveCommitPushDocumentsV1 = (): Promise<unknown> => {
+      saveCalled = true;
+      return Promise.resolve({ kind: "saved" });
     };
 
     try {
       const outcome = await executeCommitPushV1(contextFor(taskFolderPath));
 
-      assert.equal(coreCalled, false, "a not-ready repo must short-circuit before commitAndPushTaskCore runs");
+      assert.equal(saveCalled, false, "a not-ready repo must short-circuit before any remaining coordinator-native step runs");
       assert.equal(outcome.kind, "failed");
       if (outcome.kind === "failed") {
         assert.equal(outcome.code, "commitPush.gitNotReady");
@@ -128,7 +130,7 @@ void describe("executeCommitPushV1 — git readiness short-circuit (§10.2 step 
         `the detached-HEAD reason must be surfaced to the user; got: ${JSON.stringify(surface.entries)}`
       );
     } finally {
-      commitAndPushTaskModule.commitAndPushTaskCore = originalCore;
+      commitAndPushTaskModule.saveCommitPushDocumentsV1 = originalSave;
       deactivateNotificationRouter();
       safeRemoveDir(repoRoot);
     }

@@ -3,7 +3,7 @@
   "generatedBy": "scripts/resolveProductionSourceUniverse.mjs",
   "description": "Production source universe as of the current working tree, resolved from the exact bundler options that produce dist/extension.js (esbuild.config.js) plus the contribution-asset and runtime-resource-copy rules in scripts/lib/productionSourceScan.mjs. Regenerated every run; diffed against the immutable pre-gate snapshot (workflow-production-source-pregate-v1.json), not authoritative on its own.",
   "packageName": "vs-code-ai-helper",
-  "packageVersion": "0.69.0",
+  "packageVersion": "0.70.0",
   "declaredMain": "./dist/extension.js",
   "entrypoint": "src/extension.ts",
   "outfile": "dist/extension.js",
@@ -12,7 +12,7 @@
   "typescriptVersion": "5.9.3",
   "buildOptionsDigestSha256": "59b9af38338f674e6503e84e1945f3c7b2e65f3aab5e1acec211ca45a20c3d07",
   "lockfileSha256": "8df5712b6f8e20446c74bb0ebf444ca707fb666b5a35214b92ad7d155c4b28f6",
-  "fileCount": 165,
+  "fileCount": 166,
   "files": [
     {
       "path": "src/actions/actionConversationOrchestratorV1.ts",
@@ -20,7 +20,7 @@
     },
     {
       "path": "src/actions/productionTaskActionRuntimeV1.ts",
-      "sha256": "bc9572ca76a5d1b889839a1a4eb21230621289958908c4a376f4b86c0a3c2081"
+      "sha256": "0c6bd20d84058a535f9c250fc637b2adc8d816027950d42e2c83b56145628ab8"
     },
     {
       "path": "src/actions/rows/applyReviewRowV1.ts",
@@ -36,7 +36,7 @@
     },
     {
       "path": "src/actions/rows/commitPushRowV1.ts",
-      "sha256": "0099de2d687860fb553c6f449989b1e4c74703e7d9e60550d51d75b7296924bd"
+      "sha256": "00b5dbdfc0f183f716824c09415708661376752296c7c5ea4e95e520b008352f"
     },
     {
       "path": "src/actions/rows/draftRowV1.ts",
@@ -57,6 +57,10 @@
     {
       "path": "src/actions/rows/generatePlanRowV1.ts",
       "sha256": "8c98661dcfc5ce894d34a1e780ed13468f725de4855658ee1eeed6eaa8755a4b"
+    },
+    {
+      "path": "src/actions/rows/globalAssistantSendRowV1.ts",
+      "sha256": "9f021e5833922c7d4f3a3a4d45e8c9fdb5bb1cef3c910b89333e370310cb5acc"
     },
     {
       "path": "src/actions/rows/lifecyclePolicyRejection.ts",
@@ -112,7 +116,7 @@
     },
     {
       "path": "src/commands/commitAndPushTask.ts",
-      "sha256": "1d1866219a478c54fe721a86d2203a6adf15b40a9a312a6da1a3d521e72add72"
+      "sha256": "577f1e881a65ba4e17953b1b64089bcecd12947bc4a793c56232f74eaf5799ee"
     },
     {
       "path": "src/commands/configureStepModels.ts",
@@ -140,7 +144,7 @@
     },
     {
       "path": "src/commands/openGeneralAssistant.ts",
-      "sha256": "fc2dc920cb454755720a71aad923a5f62750a486ea1274488d167710d5c770bc"
+      "sha256": "e908b463457278f3ef298535562111484ceee9cb77fe337b1442b3bdcfd8a0ba"
     },
     {
       "path": "src/commands/pauseTask.ts",
@@ -160,7 +164,7 @@
     },
     {
       "path": "src/commands/reviewActions.ts",
-      "sha256": "2e8b6d739430c7caff41dd58256b0b2cd1b24e30f96c7df5ed118295d3ce2adf"
+      "sha256": "30fb707afb324564f8e4b0e33ecf86916243565c63ca6bbfde2f11cc3d5e759d"
     },
     {
       "path": "src/commands/reviewCurrentTask.ts",
@@ -212,7 +216,7 @@
     },
     {
       "path": "src/extension.ts",
-      "sha256": "b0bb055cfd32e2d821d9f029846a43caa806cb95bf0d657bdfd924d2434b1c44"
+      "sha256": "480ef4221b7c41a4bed17b0d5821224cb24a88c98004faa5cc6a109ef4c18a22"
     },
     {
       "path": "src/legal/disclaimerVersion.ts",
@@ -248,7 +252,7 @@
     },
     {
       "path": "src/runners/runnerRegistry.ts",
-      "sha256": "8950beb45bba27764529d0b66eac02a9bfb15304eaf58168d63337d8740da617"
+      "sha256": "f641edefa03c1cf1fe0ad5dd7268e4027f97300d338092db2ac351a56d3fa734"
     },
     {
       "path": "src/services/agentExecutionBrokerV1.ts",
@@ -276,7 +280,7 @@
     },
     {
       "path": "src/services/legacyAiActionSafetyGateV0.ts",
-      "sha256": "aae275ca87f01cd8b92f090ca4edcf66d1d7ca6d113317757e91262ce63eb293"
+      "sha256": "476d09e0e99ee3fb2ac6134cf1e4903b8873d7a915f8cd462f83557eef78984c"
     },
     {
       "path": "src/services/providerSelectionPolicyV1.ts",
@@ -484,11 +488,11 @@
     },
     {
       "path": "src/utils/chatHistoryConstants.ts",
-      "sha256": "cc3a165eb3350a43dc15d1fb16084e659122e639356e74fc21626f7865d43dc7"
+      "sha256": "d2b8401dafbdbe6a525951eff056a1d622ac1654fe82b7ad9937d51f8e48c380"
     },
     {
       "path": "src/utils/chatHistoryStore.ts",
-      "sha256": "d0bdedbcb854d7fe505101e7985e6b49305c4b66f2d8c537090569cf6b789439"
+      "sha256": "5f99386fc6b8ca3f9be301e7041858f73f52786a0c46a5f517a44795b6a92bca"
     },
     {
       "path": "src/utils/cliModelDiscovery.ts",
@@ -500,7 +504,7 @@
     },
     {
       "path": "src/utils/completionLint.ts",
-      "sha256": "d13c91607748cf7f572ef5b68a9478fb088585c5961395a5c482dfff8bd745ae"
+      "sha256": "a26df47fd5458d0a62e2941843e77b30748a692452f9ffc661c4971f7a2f4cef"
     },
     {
       "path": "src/utils/contextEligibility.ts",
@@ -532,7 +536,7 @@
     },
     {
       "path": "src/utils/globalAssistantActions.ts",
-      "sha256": "17be5e54c12016acd03985ce0619ecd4e189e0f9f185e04c05566e3414281b31"
+      "sha256": "3e2e6d3fe3b649e6964c7cab52b794c323a22acd4f310eb1e0720dabd36b7fc2"
     },
     {
       "path": "src/utils/implementationArtifactResolver.ts",
@@ -656,7 +660,7 @@
     },
     {
       "path": "src/views/chatView.ts",
-      "sha256": "5d5299dd29fc07e1029b3ee3eda4a415e3e50d9bf2423b8e6610b75a95821114"
+      "sha256": "a328b5fff87c2199a818679f136a031f65a1e30209857f1e23f639ffe6529c69"
     },
     {
       "path": "src/views/settingsView.ts",

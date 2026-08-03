@@ -46,6 +46,40 @@ export interface GlobalAssistantContext {
   pendingOperations?: PendingOperationsStore;
 }
 
+/**
+ * Activation-wired dependencies `globalAssistantSendRowV1.ts` needs to build
+ * a `GlobalAssistantContext` and execute a proposed action. The action-row
+ * registry (`productionTaskActionRuntimeV1.ts`) is a process-lifetime
+ * singleton built with no per-call arguments (rows are "pure declarations,
+ * safe to share"), so a row's `promoteCompletedContent` cannot close over
+ * `inventory`/`currentTaskStore` the way a freshly-constructed-per-call
+ * coordinator does — it reads them from here instead, exactly like
+ * `workflowRuntimeServicesV1.ts`'s `setChatInteractionTransactionStoreV1`
+ * wires a value at activation for later singleton-module consumers.
+ */
+export interface GlobalAssistantRuntimeDepsV1 {
+  readonly inventory: TaskInventory;
+  readonly currentTaskStore: CurrentTaskStore;
+  readonly workspaceState: vscode.Memento;
+}
+
+let runtimeDeps: GlobalAssistantRuntimeDepsV1 | undefined;
+
+/** Activation wiring (extension.ts's `activate`): see `GlobalAssistantRuntimeDepsV1`. */
+export function setGlobalAssistantRuntimeDepsV1(deps: GlobalAssistantRuntimeDepsV1): void {
+  runtimeDeps = deps;
+}
+
+/** The activation-wired dependencies, or `undefined` when not wired yet (tests, pre-activation). */
+export function getGlobalAssistantRuntimeDepsV1(): GlobalAssistantRuntimeDepsV1 | undefined {
+  return runtimeDeps;
+}
+
+/** Test isolation: forget any wired dependencies. Production never calls this. */
+export function resetGlobalAssistantRuntimeDepsForTestV1(): void {
+  runtimeDeps = undefined;
+}
+
 export interface GlobalAssistantOperation {
   readonly id: string;
   /** Shown in the assistant prompt so the AI knows what it may propose. */
@@ -1074,8 +1108,9 @@ async function appendAudit(
         `- At: ${new Date().toISOString()}`,
       ].join("\n")
     );
-    // executeProposedAction (this function's only caller) runs inside the
-    // "Global Assistant" tracked operation (openGeneralAssistant.ts), whose
+    // executeProposedAction (this function's only caller) runs inside its
+    // caller's own tracked operation for ctx.assistantFolderUri's path — sole
+    // production caller is chatWithStage.ts's stage-action executor, whose
     // handle isn't threaded this deep — resolve it by task path instead.
     // No-ops harmlessly if that operation has already ended.
     taskOperations.setResultTargetUriForTask(ctx.assistantFolderUri.fsPath, auditLogUri);
