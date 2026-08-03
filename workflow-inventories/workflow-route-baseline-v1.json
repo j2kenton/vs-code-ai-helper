@@ -2083,10 +2083,10 @@
         "vs-code-ai-helper.chatWithStage",
         "vs-code-ai-helper.globalAssistantSend"
       ],
-      "entrypoint": "Chat With AI webview message handler (Send and panel messages).",
+      "entrypoint": "Chat With AI webview message handler (Send and panel messages). For stage-conversation sends, the chatSend.v1 gate is consulted BEFORE the user message is appended to the transcript, so a disabled route rejects without mutating chat state (wiring-tested). Global-assistant sends are gated the same way: the globalAssistantSend.v1 gate is consulted BEFORE the user message is appended for that branch too (see that command row's own classification for its gate/provider details).",
       "earliestRead": "For stage-conversation sends, the chatSend.v1 gate is consulted BEFORE the user message is appended to the transcript, so a disabled route rejects without mutating chat state (wiring-tested); global-assistant sends route directly to the permanently-unavailable globalAssistantSend stub (no gate — see that row's classification) without appending the user's text first.",
-      "providerEdge": "None directly; delegates to vs-code-ai-helper.chatWithStage (gated) or vs-code-ai-helper.globalAssistantSend (unavailable stub, no provider call).",
-      "writerEdge": "Task-local Chat (<task-folder>/chat-v1.json, plan §5.1) via the delegated commands; workspace-state Memento remains only as the legacy migration source, never the live write target. Never task artifacts.",
+      "providerEdge": "None directly; delegates to vs-code-ai-helper.chatWithStage (gated, chatSend.v1 — see that row) or vs-code-ai-helper.globalAssistantSend (gated, globalAssistantSend.v1 — see that row); both reach a provider through the V1 action coordinator.",
+      "writerEdge": "Task-local Chat (<task-folder>/chat-v1.json, plan §5.1) via the delegated vs-code-ai-helper.chatWithStage; the Global Assistant's own dedicated non-task Chat folder (chat-v1.json under the meta-root's global-assistant/ folder, ensureWorkflowNonTaskStorageRootV1) via the delegated vs-code-ai-helper.globalAssistantSend. workspace-state Memento remains only as the legacy migration source, never the live write target. Never task artifacts.",
       "targetActionKey": "chatSend.v1",
       "gateLocation": "src/views/chatView.ts",
       "migrationCohort": "chat"
