@@ -3,7 +3,7 @@
   "generatedBy": "scripts/resolveProductionSourceUniverse.mjs",
   "description": "Production source universe as of the current working tree, resolved from the exact bundler options that produce dist/extension.js (esbuild.config.js) plus the contribution-asset and runtime-resource-copy rules in scripts/lib/productionSourceScan.mjs. Regenerated every run; diffed against the immutable pre-gate snapshot (workflow-production-source-pregate-v1.json), not authoritative on its own.",
   "packageName": "vs-code-ai-helper",
-  "packageVersion": "0.70.0",
+  "packageVersion": "0.71.0",
   "declaredMain": "./dist/extension.js",
   "entrypoint": "src/extension.ts",
   "outfile": "dist/extension.js",
@@ -20,7 +20,7 @@
     },
     {
       "path": "src/actions/productionTaskActionRuntimeV1.ts",
-      "sha256": "0c6bd20d84058a535f9c250fc637b2adc8d816027950d42e2c83b56145628ab8"
+      "sha256": "aed2622deca172ca46ab21bfd34f92d5797fdeea263713d9a52d94a542e6967d"
     },
     {
       "path": "src/actions/rows/applyReviewRowV1.ts",
@@ -108,7 +108,7 @@
     },
     {
       "path": "src/commands/chatWithStage.ts",
-      "sha256": "fcee6cc70efd78b862f283e7972b74af37753b0b0c76c7af96120a75714e6e4b"
+      "sha256": "92a488bc4da058008c81af90ee41173fbb87016bbbb92d162590122bc3e6bf7d"
     },
     {
       "path": "src/commands/choosePublishScope.ts",
@@ -144,7 +144,7 @@
     },
     {
       "path": "src/commands/openGeneralAssistant.ts",
-      "sha256": "e908b463457278f3ef298535562111484ceee9cb77fe337b1442b3bdcfd8a0ba"
+      "sha256": "f689f39566251b8d0a2c892b5dd913ad598836e185e41fa1eed0672c653d594d"
     },
     {
       "path": "src/commands/pauseTask.ts",

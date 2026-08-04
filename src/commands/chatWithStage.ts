@@ -33,11 +33,11 @@ import {
 import { readChatDocumentIdentityV1, ChatMessage } from "../utils/chatHistoryStore";
 import { allocateHex128IdV1 } from "../types/actionCorrelationV1";
 import {
+  admitAndContinueWithMalformedResultRetryV1,
   createProductionTaskActionCoordinatorV1,
   getProductionActionConversationOrchestratorV1,
 } from "../actions/productionTaskActionRuntimeV1";
 import { CHAT_SEND_ACTION_KEY_V1, ChatSendActionInputV1, validateChatSendInputV1 } from "../actions/rows/chatSendRowV1";
-import { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
 import { ChatInteractionRefV1, ChatInteractionResumeResultV1 } from "../views/chatView";
 
 type ChatWithStageArg =
@@ -536,7 +536,12 @@ export async function chatWithStage(
     // provider does the user's message get persisted — a rejection at any
     // of these stages leaves the transcript untouched, same as a rejection
     // from the prompt-size confirmation or input validation just above.
-    const admission = await coordinator.admitAction({
+    // Retried via admitAndContinueWithMalformedResultRetryV1 on a malformed
+    // provider response (bad result frame / cross-operation correlation) —
+    // safe here because preInvocationHook's own userMessagePersisted guard
+    // makes a second admission's hook a deliberate no-op, so a retry can
+    // never persist the user's message twice.
+    const outcome = await admitAndContinueWithMalformedResultRetryV1(coordinator, {
       actionKey: CHAT_SEND_ACTION_KEY_V1,
       taskBinding: { taskBindingId: verifiedBindingId, chatDocumentId },
       taskStatus: task.progress.status ?? "active",
@@ -553,13 +558,6 @@ export async function chatWithStage(
         }
       },
     });
-
-    let outcome: TaskActionOutcomeV1;
-    if (admission.kind === "settled") {
-      outcome = admission.outcome;
-    } else {
-      outcome = await coordinator.continueAdmittedAction(admission.ticket);
-    }
 
     if (outcome.kind === "completed") {
       // Completed message has already been written to chat-v1.json by promoteChatSendContentV1.

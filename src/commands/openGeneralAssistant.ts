@@ -17,13 +17,15 @@ import {
   readChatDocumentIdentityV1,
 } from "../utils/chatHistoryStore";
 import { allocateHex128IdV1 } from "../types/actionCorrelationV1";
-import { createProductionTaskActionCoordinatorV1 } from "../actions/productionTaskActionRuntimeV1";
+import {
+  admitAndContinueWithMalformedResultRetryV1,
+  createProductionTaskActionCoordinatorV1,
+} from "../actions/productionTaskActionRuntimeV1";
 import {
   GLOBAL_ASSISTANT_SEND_ACTION_KEY_V1,
   GlobalAssistantSendActionInputV1,
   validateGlobalAssistantSendInputV1,
 } from "../actions/rows/globalAssistantSendRowV1";
-import { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
 
 export { GLOBAL_ASSISTANT_CANONICAL_ID };
 const GLOBAL_ASSISTANT_DIRNAME = "global-assistant";
@@ -254,7 +256,10 @@ async function globalAssistantSend(
         // global assistant has no task/stage-existence precondition to
         // validate first, unlike chatWithStage's append-after-validation
         // ordering) — so there is no preInvocationHook to persist it here.
-        const admission = await coordinator.admitAction({
+        // No caller-owned side effect between admission and continuation
+        // means a malformed provider response can be retried via
+        // admitAndContinueWithMalformedResultRetryV1 with nothing to guard.
+        const outcome = await admitAndContinueWithMalformedResultRetryV1(coordinator, {
           actionKey: GLOBAL_ASSISTANT_SEND_ACTION_KEY_V1,
           taskBinding: { taskBindingId, chatDocumentId },
           taskStatus: "active",
@@ -262,13 +267,6 @@ async function globalAssistantSend(
           rawInput: validatedInput,
           cancellationToken: op.token!,
         });
-
-        let outcome: TaskActionOutcomeV1;
-        if (admission.kind === "settled") {
-          outcome = admission.outcome;
-        } else {
-          outcome = await coordinator.continueAdmittedAction(admission.ticket);
-        }
 
         if (outcome.kind === "completed") {
           // Completed content has already been written to chat-v1.json by

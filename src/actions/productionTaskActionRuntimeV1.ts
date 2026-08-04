@@ -24,6 +24,7 @@ import {
   TaskActionCoordinatorV1,
   TaskActionFollowUpSchedulerV1,
   TaskActionPresenterV1,
+  TaskActionRequestV1,
 } from "./taskActionCoordinatorV1";
 import { createTaskActionRegistryV1, TaskActionRegistryV1 } from "./taskActionRegistryV1";
 import { createGeneratePlanRowV1 } from "./rows/generatePlanRowV1";
@@ -45,7 +46,11 @@ import {
   createLintPreflightRowV1,
   EditPreflightActionInputV1,
 } from "./rows/editPreflightRowsV1";
-import { createEditExecutionRowV1, EditExecutionActionInputV1 } from "./rows/editExecutionRowV1";
+import {
+  createEditExecutionRowV1,
+  EDIT_EXECUTION_ACTION_KEY_V1,
+  EditExecutionActionInputV1,
+} from "./rows/editExecutionRowV1";
 import { createV1RunnerSelectionOpener } from "../runners/runnerRegistry";
 import {
   getChatInteractionTransactionStoreV1,
@@ -174,6 +179,145 @@ function lazyProductionActionConversationOrchestratorV1(): ActionConversationOrc
 }
 
 /**
+ * Malformed model output (a broken result frame, or a response echoing a
+ * different operation's correlation) is deliberately TERMINAL within one
+ * provider-selection session — `providerSelectionPolicyV1.ts`'s own module
+ * header, AC-RUNNER-05: only a pre-invocation or pre-response transport
+ * failure may reopen a session for fallback. A session that tried retrying
+ * past a malformed outcome throws `ProviderSelectionPolicyErrorV1` ("Fallback
+ * requires a new coordinator operation, not a reopened session") — which is
+ * the sanctioned fix location: retry belongs HERE, one layer up, as a
+ * genuinely fresh `executeAction` call (new operationId, new session), never
+ * inside the coordinator itself.
+ *
+ * Bounded to `maxAttempts` total tries. Each retry is a plain repeat of the
+ * same request — no corrective prompt hint is injected (that would require
+ * touching the protected coordinator's prompt assembly) — so this recovers a
+ * one-off formatting slip without masking a model that persistently can't
+ * follow the result contract: after `maxAttempts`, the last malformed
+ * outcome is returned unchanged, exactly as an unwrapped coordinator would
+ * have returned it today.
+ */
+/**
+ * `editExecution.v1` is excluded from this retry, checked against the
+ * SETTLED outcome's own `correlation.actionKey` rather than the caller's
+ * request — this row does have an internal route entry
+ * (`"internal:editExecution.v1"`, see editExecutionRowV1.ts), even though
+ * nothing dispatches through it today, so checking the outcome uniformly
+ * protects both `executeAction` and `executeRoute` without this
+ * action-agnostic loop needing to know which routeId maps to which row.
+ *
+ * Unlike every other provider row, `editExecution.v1` drives an
+ * irreversible, cursor-tracked mutation session
+ * (`editBrokerToolSessionHandlerV1.ts`'s `execution.cursor`/`execution.state`,
+ * claimed once via `claimExecutionPermit`). Once that session's first
+ * mutation tool call has landed, a fresh retry conversation can never
+ * legitimately recover: the broker's cursor has already moved past step one,
+ * so a fresh conversation replaying the same fixed script from the start
+ * either trips `mutationOrderViolation` on its very first call (some steps
+ * already applied) or, if every step already applied, can never reconstruct
+ * the matching `receiptIds` `promoteEditExecutionContentV1` requires (a fresh
+ * conversation is never told the already-persisted receipt ids) — in both
+ * cases spending one more costly tool-calling conversation for an outcome no
+ * better than the single attempt's, which `continueSealedEditExecutionV1`
+ * (runEditActionV1.ts) already derives correctly from the broker's own
+ * authoritative state. This is a cost/waste concern, not a correctness one —
+ * the broker's own state guards (`execution.state !== "executing"`, the
+ * per-step order check) already reject a retried conversation's mutation
+ * calls outright, so no file is ever re-applied or corrupted either way.
+ * A malformed result BEFORE any mutation call (cursor still 0) would be
+ * safe and beneficial to retry same as any other row, but distinguishing
+ * that case here would require reaching into the edit broker's internal
+ * state — simpler and safer to exclude the whole action key and leave its
+ * single-attempt behavior exactly as before this retry existed.
+ *
+ * Shared bounded-retry loop behind both `withMalformedResultRetryV1` (fresh
+ * `executeAction`/`executeRoute` calls) and
+ * `admitAndContinueWithMalformedResultRetryV1` (the two-phase admit/continue
+ * split) — one retry policy, not two independently-tuned ones.
+ */
+async function retryOnMalformedResultV1(
+  run: () => Promise<TaskActionOutcomeV1>,
+  maxAttempts: number
+): Promise<TaskActionOutcomeV1> {
+  let outcome = await run();
+  let attempts = 1;
+  while (
+    outcome.kind === "malformedResult" &&
+    outcome.correlation.actionKey !== EDIT_EXECUTION_ACTION_KEY_V1 &&
+    attempts < maxAttempts
+  ) {
+    attempts++;
+    outcome = await run();
+  }
+  return outcome;
+}
+
+/**
+ * Only `executeAction`/`executeRoute` are wrapped — `resumeAction` (and the
+ * admit/continue/abort trio) pass through unwrapped via the `...coordinator`
+ * spread below. A Resume drive reuses its ORIGINAL operationId rather than
+ * starting a fresh one (see taskActionCoordinatorV1.ts's own note on
+ * `claimInvocationOnce`/`isFreshInvocation`), so retrying it the way
+ * `executeAction` retries — a genuinely new operation — isn't available
+ * here; a malformed Resume response is left to fail outright, same as before
+ * this retry existed.
+ *
+ * @internal exported for unit testing — production callers use
+ * `createProductionTaskActionCoordinatorV1`, which already applies this. */
+export function withMalformedResultRetryV1(
+  coordinator: TaskActionCoordinatorV1,
+  maxAttempts = 2
+): TaskActionCoordinatorV1 {
+  return {
+    ...coordinator,
+    executeAction: (request: TaskActionRequestV1) =>
+      retryOnMalformedResultV1(() => coordinator.executeAction(request), maxAttempts),
+    executeRoute: (routeId: string, request: Omit<TaskActionRequestV1, "actionKey">) =>
+      retryOnMalformedResultV1(() => coordinator.executeRoute(routeId, request), maxAttempts),
+  };
+}
+
+/**
+ * The two-phase admit/continue split (plan §5.4/AC-CHAT-TX-02 — Chat Send,
+ * Global Assistant Send) sits outside `withMalformedResultRetryV1`
+ * deliberately: `executeAction`'s retry starts a fresh operation blindly,
+ * but an admitted ticket's `preInvocationHook` runs CALLER-owned side effects
+ * (chatWithStage.ts persists the user's message) between admission and
+ * continuation, and only the caller knows whether repeating those side
+ * effects on a retry is safe.
+ *
+ * This helper is opt-in for exactly that reason: use it only when the
+ * caller's admission is safe to repeat. Both current callers are —
+ * `openGeneralAssistant.ts` has no `preInvocationHook` at all (the message is
+ * already persisted before the command runs), and `chatWithStage.ts`'s hook
+ * guards its persist with a `userMessagePersisted` flag, so a second
+ * admission's hook is a deliberate no-op. A future caller whose hook is NOT
+ * idempotent must not use this helper — call `admitAction`/
+ * `continueAdmittedAction` directly instead, same as before this existed.
+ *
+ * Same bounded policy as `withMalformedResultRetryV1`: a malformed
+ * `continueAdmittedAction` outcome retries via a brand new `admitAction`
+ * (a fresh operation, never a reopened session — see that function's own
+ * AC-RUNNER-05 note) up to `maxAttempts` total tries, returning the last
+ * outcome unchanged if every attempt is malformed. An admission that itself
+ * settles (rejected before ever reaching a provider) can never be
+ * `malformedResult`, so it is returned as-is with no retry.
+ */
+export async function admitAndContinueWithMalformedResultRetryV1(
+  coordinator: TaskActionCoordinatorV1,
+  request: TaskActionRequestV1,
+  maxAttempts = 2
+): Promise<TaskActionOutcomeV1> {
+  return retryOnMalformedResultV1(async () => {
+    const admission = await coordinator.admitAction(request);
+    return admission.kind === "settled"
+      ? admission.outcome
+      : await coordinator.continueAdmittedAction(admission.ticket);
+  }, maxAttempts);
+}
+
+/**
  * Build a coordinator bound to one invocation's already-resolved workspace
  * cwd and stage-model resolution. `resolveStagePrimaryModel` must be
  * synchronous — callers resolve the stage's stored model id asynchronously
@@ -186,7 +330,7 @@ export function createProductionTaskActionCoordinatorV1(options: {
     taskStage: string
   ) => { readonly modelId: string | undefined; readonly stage: TaskStage | undefined };
 }): TaskActionCoordinatorV1 {
-  return createTaskActionCoordinatorV1({
+  return withMalformedResultRetryV1(createTaskActionCoordinatorV1({
     registry: getProductionTaskActionRegistryV1(),
     leaseStore: getWorkflowLeaseStoreV1(),
     openRunnerSelection: createV1RunnerSelectionOpener({
@@ -219,7 +363,7 @@ export function createProductionTaskActionCoordinatorV1(options: {
         return getEditPlanBrokerV1().createEditSessionHandler(input.executionId);
       },
     },
-  });
+  }));
 }
 
 /**
