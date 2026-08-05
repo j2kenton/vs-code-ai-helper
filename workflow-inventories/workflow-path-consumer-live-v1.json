@@ -3,7 +3,7 @@
   "generatedBy": "scripts/generateWorkflowPathConsumers.mjs",
   "description": "Mechanically derived production path-consumer surface of the current working tree (plan §2.3): every module of the §1.1 production source universe importing node fs/child_process or touching the vscode workspace.fs API, with every concrete call site (compiler span + enclosing symbol). Scanned over the exact source-universe file list — never a filesystem walk. Regenerated every run; classification lives in workflow-path-consumer-baseline-v1.json; the immutable pre-gate reference is workflow-path-consumer-pregate-v1.json. Known mechanical bound: modules that only pass path STRINGS to another module (no fs/process API of their own) are covered transitively by the consumer module they call — the classifier enforcement point (plan §2.2) sits at the API-touching module. sourceUniverseSha256 is the CANONICAL (line-ending-independent) digest of the source-universe JSON, so provenance is identical across LF and CRLF checkouts.",
   "sourceUniverse": "workflow-inventories/workflow-production-source-baseline-v1.json",
-  "sourceUniverseSha256": "4be1c5c03a76566457999383514f6eb7e4eee15122509a94ecf3b8e927cf9aac",
+  "sourceUniverseSha256": "13bdb4d82e206c890a4a4c251d53a370acf72d30aaf95c90f4ef66f132559cce",
   "consumerCount": 48,
   "consumers": [
     {
@@ -134,7 +134,7 @@
       "callSites": [
         {
           "signal": "workspace.fs",
-          "span": "L44-L44",
+          "span": "L46-L46",
           "enclosingSymbol": "resolveGlobalAssistantFolder"
         }
       ]

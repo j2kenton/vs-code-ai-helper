@@ -3,7 +3,7 @@
   "generatedBy": "scripts/generateWorkflowRoutes.mjs",
   "description": "Mechanically extracted workflow route surface of the current working tree (plan §1.2): command registrations, contribution/menu references, internal executeCommand edges, dynamic dispatch sites, webview message roots, tree-item command bindings, provider-boundary call sites, legacy output destinations, and per-file legacy-AI-gate calls — every edge a concrete route row. Scanned over the exact §1.1 production source universe (never a filesystem walk). Regenerated every run; classification lives in workflow-route-baseline-v1.json; the immutable pre-gate reference is workflow-route-pregate-v1.json. Known mechanical bound: tree-item/status-row command bindings are collected only when the bound command ID is a string literal — dynamically bound commands are enforced at their executeCommand dispatch sites instead (dynamicDispatches, which fail closed without an annotation). sourceUniverseSha256 is the CANONICAL (line-ending-independent) digest of the source-universe JSON, so provenance is identical across LF and CRLF checkouts.",
   "sourceUniverse": "workflow-inventories/workflow-production-source-baseline-v1.json",
-  "sourceUniverseSha256": "4be1c5c03a76566457999383514f6eb7e4eee15122509a94ecf3b8e927cf9aac",
+  "sourceUniverseSha256": "13bdb4d82e206c890a4a4c251d53a370acf72d30aaf95c90f4ef66f132559cce",
   "routeCount": 98,
   "routes": [
     {
@@ -177,7 +177,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.chatWithStage",
       "path": "src/commands/chatWithStage.ts",
-      "span": "L755-L757",
+      "span": "L753-L755",
       "registrationSymbol": "registerChatWithStageCommand",
       "contributed": true,
       "keybound": false,
@@ -505,7 +505,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.globalAssistantSend",
       "path": "src/commands/openGeneralAssistant.ts",
-      "span": "L307-L310",
+      "span": "L305-L308",
       "registrationSymbol": "registerOpenGeneralAssistantCommand",
       "contributed": false,
       "keybound": false,
@@ -651,7 +651,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.openGeneralAssistant",
       "path": "src/commands/openGeneralAssistant.ts",
-      "span": "L304-L306",
+      "span": "L302-L304",
       "registrationSymbol": "registerOpenGeneralAssistantCommand",
       "contributed": true,
       "keybound": false,
@@ -726,7 +726,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.postStageQuestion",
       "path": "src/commands/chatWithStage.ts",
-      "span": "L758-L764",
+      "span": "L756-L762",
       "registrationSymbol": "registerChatWithStageCommand",
       "contributed": true,
       "keybound": false,
@@ -1340,7 +1340,7 @@
       "kind": "internalEdge",
       "commandId": "vs-code-ai-helper.openAiModels",
       "path": "src/commands/openGeneralAssistant.ts",
-      "span": "L195-L195",
+      "span": "L197-L197",
       "enclosingSymbol": "globalAssistantSend",
       "occurrence": 1
     },
@@ -1592,7 +1592,7 @@
     {
       "commandId": "vs-code-ai-helper.openAiModels",
       "path": "src/commands/openGeneralAssistant.ts",
-      "span": "L195-L195",
+      "span": "L197-L197",
       "enclosingSymbol": "globalAssistantSend"
     },
     {
@@ -1770,7 +1770,7 @@
       "routeId": "globalAssistantSend.v1",
       "gateKind": "throwing",
       "path": "src/commands/openGeneralAssistant.ts",
-      "span": "L153-L153",
+      "span": "L155-L155",
       "enclosingSymbol": "globalAssistantSend"
     },
     {

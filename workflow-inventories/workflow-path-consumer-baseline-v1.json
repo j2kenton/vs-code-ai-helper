@@ -168,7 +168,7 @@
       "callSites": [
         {
           "signal": "workspace.fs",
-          "span": "L44-L44",
+          "span": "L46-L46",
           "enclosingSymbol": "resolveGlobalAssistantFolder"
         }
       ],
