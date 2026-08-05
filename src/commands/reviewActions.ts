@@ -49,6 +49,10 @@ import {
 import { generateContextPack, writeContextPack, writeImplReviewContextPack } from "../utils/contextPack";
 import { renderPromptTemplate } from "../utils/promptTemplates";
 import { writeRunLog } from "../utils/runLog";
+import {
+  describeTaskActionFailureV1,
+  describeTaskActionOutcomeForLogV1,
+} from "../utils/taskActionOutcomeTextV1";
 import { checkImplementationAvailabilityForModel } from "../runners/runnerRegistry";
 import {
   checkEditActionAvailabilityV1,
@@ -1344,6 +1348,54 @@ async function handleReviewOutcomeV1(
   outcome: TaskActionOutcomeV1,
   ctx: ReviewOutcomeContextV1
 ): Promise<void> {
+  // The run log lives in `finally` so it is genuinely unconditional. The
+  // routing body below has several early returns (a stage transition that
+  // throws or fails to persist, a missing Chat record, ...) — an earlier
+  // version of this fix put the log after the branch chain, where every one
+  // of those paths skipped it and silently reproduced the very
+  // no-artifact-to-inspect problem the log exists to end.
+  try {
+    await routeReviewOutcomeV1(outcome, ctx);
+  } finally {
+    await writeReviewRunLogV1(outcome, ctx);
+  }
+}
+
+/**
+ * Best-effort diagnostic artifact for one settled review, written for EVERY
+ * outcome. Reviews on the legacy path wrote a run log per run; the V1
+ * coordinator migration dropped it, which is why a failed review left
+ * nothing on disk to inspect afterwards.
+ *
+ * Sanitized by construction: describeTaskActionOutcomeForLogV1 emits only
+ * the closed outcome contract's kinds/codes/ids, never provider text (plan
+ * §2.2). A logging failure must never fail an otherwise fine review, so
+ * everything here is swallowed.
+ */
+async function writeReviewRunLogV1(
+  outcome: TaskActionOutcomeV1,
+  ctx: ReviewOutcomeContextV1
+): Promise<void> {
+  try {
+    const logUri = await writeRunLog(
+      ctx.folderUri,
+      "review-v1",
+      ctx.targetStage,
+      `# Review Run\n\n${describeTaskActionOutcomeForLogV1(
+        outcome,
+        STAGE_ARTIFACT_FILENAMES[ctx.targetStage]
+      )}\n`
+    );
+    taskOperations.setResultTargetUriForTask(ctx.folderUri.fsPath, logUri);
+  } catch {
+    // Ignore: the review's own outcome has already been surfaced.
+  }
+}
+
+async function routeReviewOutcomeV1(
+  outcome: TaskActionOutcomeV1,
+  ctx: ReviewOutcomeContextV1
+): Promise<void> {
   const {
     folderUri,
     currentStage,
@@ -1736,6 +1788,32 @@ async function handleReviewOutcomeV1(
         title: "Publish Anyway",
         args: [{ taskFolderPath: folderUri.fsPath }],
       }
+    );
+  } else if (outcome.kind === "cancelled") {
+    NotificationRouter.showInformation(
+      `${STAGE_DISPLAY_NAMES[targetStage]} cancelled.`
+    );
+  } else {
+    // Every remaining outcome (failed, malformedResult, unavailable,
+    // recoveryRequired, duplicateRejected, stalePreflight,
+    // partialEditBlocked) is a real failure the user must be told about.
+    //
+    // This branch previously did not exist: only "completed", "questions",
+    // and the Publish-stage special case above were handled, so a failed
+    // review on ANY other review stage fell through the whole chain and
+    // this function returned having shown nothing at all. Combined with the
+    // run log below (also absent before) and the no-op progress terminator
+    // in productionTaskActionRuntimeV1.ts, that is what made a failed review
+    // present as a stuck "Running review…" row with no error, no artifact,
+    // and no explanation anywhere except a console.log the user never sees.
+    // Names the settlement inline rather than pointing at the run log for
+    // "the prompt": the log records the sanitized outcome only. The rendered
+    // prompt is deliberately NOT written here — it embeds the full context
+    // pack, and this handler receives no prompt to log anyway (unlike
+    // generatePlanWithAI, which has ctx.prompt in scope).
+    NotificationRouter.showError(
+      `${STAGE_DISPLAY_NAMES[targetStage]} failed: ${describeTaskActionFailureV1(outcome)}. ` +
+        "The run log under runs/ records this settlement."
     );
   }
 }

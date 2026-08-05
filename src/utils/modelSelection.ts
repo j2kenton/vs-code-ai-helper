@@ -21,7 +21,11 @@ import {
   toQualifiedModelId,
 } from "../runners/providers";
 import { AI_MODEL_STAGES, REVIEW_STAGES, STAGE_DISPLAY_NAMES, TaskStage } from "../types/taskProgress";
-import { parseOpencodeModelsOutput, type DiscoveredCliModel } from "./cliModelDiscovery";
+import {
+  parseKimiModelsOutput,
+  parseOpencodeModelsOutput,
+  type DiscoveredCliModel,
+} from "./cliModelDiscovery";
 
 export const TASK_MODEL_CONFIG_FILENAME = "task-models.json";
 
@@ -1459,21 +1463,23 @@ const SEEDED_CLI_MODELS: Readonly<
   "devpass-cli": createSeededDevpassModels(),
   "cline-cli": createSeededClineModels(),
   // Snapshot of `kimi provider list --json`'s "models" map (kimi-code
-  // 0.29.2, captured 2026-07-27 against the managed `kimi-code` OAuth
-  // provider) — see parseKimiModelsOutput in cliModelDiscovery.ts, which
-  // produces this exact same shape from a live CLI call. K2.7 Coding /
-  // K2.7 Coding Highspeed have no reasoning-effort ladder (always-on
-  // thinking); K3 / K3-256k support low/high/max but that per-invocation
-  // choice isn't wired up here — see the models comment in providers.ts.
-  "kimi-cli": [
-    { model: "kimi-code/kimi-for-coding", name: "K2.7 Coding" },
-    {
-      model: "kimi-code/kimi-for-coding-highspeed",
-      name: "K2.7 Coding Highspeed",
-    },
-    { model: "kimi-code/k3-256k", name: "K3-256k" },
-    { model: "kimi-code/k3", name: "K3" },
-  ],
+  // 0.29.2, re-captured 2026-08-03 against the managed `kimi-code` OAuth
+  // provider), run through the real parseKimiModelsOutput (cliModelDiscovery.ts)
+  // so the seeded catalog and live discovery share one code path and can't
+  // drift in shape. K2.7 Coding / K2.7 Coding Highspeed have no
+  // `supportEfforts` (always-on thinking), so they get one entry each; K3 /
+  // K3-256k each expand into a bare entry plus @low/@high/@max variants —
+  // reasoning effort is applied via KIMI_MODEL_THINKING_EFFORT, an
+  // operational environment-variable override, not a CLI flag — see
+  // parseKimiModelSelection's doc comment in providers.ts.
+  "kimi-cli": parseKimiModelsOutput(`{
+  "models": {
+    "kimi-code/kimi-for-coding": { "displayName": "K2.7 Coding" },
+    "kimi-code/kimi-for-coding-highspeed": { "displayName": "K2.7 Coding Highspeed" },
+    "kimi-code/k3-256k": { "displayName": "K3-256k", "supportEfforts": ["low", "high", "max"], "defaultEffort": "high" },
+    "kimi-code/k3": { "displayName": "K3", "supportEfforts": ["low", "high", "max"], "defaultEffort": "high" }
+  }
+}`),
 };
 
 function createSeededCliModelCache(): Map<

@@ -966,6 +966,10 @@ function extractStructuredCliDiagnostics(
 const CLINE_NO_TEXT_REPLY_PLACEHOLDER =
   "(cline completed the run without returning any text reply.)";
 
+/** Kimi's counterpart to CLINE_NO_TEXT_REPLY_PLACEHOLDER — see extractKimiFinalOutput. */
+const KIMI_NO_TEXT_REPLY_PLACEHOLDER =
+  "(Kimi Code CLI completed the run without returning any text reply.)";
+
 interface ClineEnvelope {
   type?: unknown;
   message?: unknown;
@@ -1014,6 +1018,117 @@ function extractClineFinalOutput(
   // empty or generic (same rationale as extractOpencodeFinalOutput's own
   // final fallback).
   return cleaned;
+}
+
+/**
+ * Kimi Code CLI's `--output-format stream-json` line shape (verified live
+ * against kimi-code 0.29.2): NDJSON where each line is a chat message —
+ * `{"role":"assistant","content":"..."}` for model text,
+ * `{"role":"assistant","tool_calls":[...]}` and `{"role":"tool",...}` for
+ * tool turns, plus a trailing `{"role":"meta","type":"session.resume_hint"}`.
+ */
+interface KimiEnvelope {
+  role?: unknown;
+  content?: unknown;
+}
+
+/**
+ * Kimi's LAST assistant text message is the authoritative final answer.
+ *
+ * This extractor is why kimi-cli uses `--output-format stream-json` at all.
+ * In its plain `text` mode Kimi is an agentic CLI that NARRATES before
+ * answering — real captured output began "• The file is large. Let me page
+ * through it in chunks." and then indented the answer by two spaces. That is
+ * fatal for a V1-migrated action: parseAiResultEnvelopeV1 requires the
+ * captured output to START with `<<<ENSEMBLE_AI_RESULT_V1>>>` and rejects any
+ * leading bytes, so a genuinely COMPLETED review (a real, correct 7/10 with a
+ * valid frame) settled as `malformedResult` purely because of the narration
+ * in front of it.
+ *
+ * In stream-json mode those same narration turns are separate earlier
+ * `assistant` lines, so taking the last one yields the frame exactly — live
+ * verified: the last assistant `content` both starts with the frame marker
+ * and ends with the end marker, with no surrounding text and no indentation.
+ *
+ * "Last wins" matches extractClineFinalOutput/extractOpencodeFinalOutput's
+ * own forward-compatible choice. Intermediate assistant lines carrying
+ * `tool_calls` have no string `content` and are skipped by construction.
+ */
+function extractKimiFinalOutput(
+  stdout: string,
+  parsed: ParsedCliEventLines = parseJsonLineEvents(stdout)
+): string {
+  const cleaned = stripAnsi(stdout).trim();
+  if (cleaned.length === 0) {
+    return cleaned;
+  }
+
+  let sawRecognizedEvent = false;
+  let finalText: string | undefined;
+  for (const rawEvent of parsed.events) {
+    const event = rawEvent as KimiEnvelope;
+    if (typeof event.role === "string") {
+      sawRecognizedEvent = true;
+    }
+    if (event.role === "assistant" && typeof event.content === "string") {
+      finalText = event.content;
+    }
+  }
+
+  // Same rationale as extractClineFinalOutput: an explicit empty string is
+  // treated as "no text reply", so a legitimate exit-0 tool-only turn still
+  // produces a visible placeholder rather than "" (which downstream misreads
+  // as "the CLI produced no output" and routes through a generic failure).
+  if (finalText !== undefined && finalText.trim().length > 0) {
+    return finalText.trim();
+  }
+  if (sawRecognizedEvent) {
+    return KIMI_NO_TEXT_REPLY_PLACEHOLDER;
+  }
+  // Nothing parsed as a recognizable Kimi message line at all — fall back to
+  // the raw stream so a failure stays visible instead of silently empty.
+  return cleaned;
+}
+
+/**
+ * Diagnosable content from Kimi's stream-json stdout — deliberately almost
+ * nothing, because Kimi puts its failures somewhere else.
+ *
+ * Verified live against kimi-code 0.29.2: a failing run reports on STDERR as
+ * plain (non-JSON) text — `error: failed to run prompt: config.invalid:
+ * Model "k3" is not configured in config.toml.` for a bad model alias, and
+ * `error: failed to run prompt: provider.api_error: 400 Invalid request
+ * Error` for a rejected thinking effort. Its stdout NDJSON carries no error
+ * event kind at all; it is purely the conversation (`assistant`/`tool`/
+ * `meta` message lines).
+ *
+ * So this contributes NO markerScanText from stdout. That is the entire
+ * reason it exists: without it, `def.structuredEventStream` being set but
+ * unhandled would fall through to scanning `${stderr}\n${stdout}` RAW — and
+ * Kimi's `{"role":"tool",...}` lines re-emit the full content of every file
+ * it read, exactly the leak class that made an opencode transport drop get
+ * misreported as a billing/auth failure (see extractStructuredCliDiagnostics).
+ * The caller concatenates stderr itself, so Kimi's real errors are still
+ * scanned and still shown; only the file-content-bearing stdout is withheld.
+ *
+ * `unparsedScanSafeText` is still included: parseJsonLineEvents scopes it to
+ * trailing non-JSON output that no message line accounted for, which for
+ * Kimi is where a plain-text failure would land if it ever reached stdout.
+ */
+function extractKimiStructuredDiagnostics(
+  stdout: string,
+  parsed: ParsedCliEventLines = parseJsonLineEvents(stdout)
+): StructuredCliDiagnostics {
+  const { events, unparsedText, unparsedScanSafeText } = parsed;
+  return {
+    markerScanText: unparsedScanSafeText,
+    detail: unparsedText,
+    // Kimi's stream carries no structural retryable signal (same as cline);
+    // transient-transport classification stays with applyTransportTransience
+    // over the scoped diagnosticText.
+    retryable: false,
+    sawAnyEvent: events.length > 0,
+  };
 }
 
 /**
@@ -1224,6 +1339,12 @@ function normalizeCliOutput(
     return extractClineFinalOutput(output, parsed);
   }
 
+  if (def.id === "kimi-cli") {
+    // Same reasoning again: kimi-cli never sets usesLastMessageFile, so
+    // output is always stdout-derived and the shared parse stays valid.
+    return extractKimiFinalOutput(output, parsed);
+  }
+
   return output;
 }
 
@@ -1406,7 +1527,11 @@ export function createCliTextTransportV1(options: {
               cwd,
               shell: useShell,
               windowsHide: true,
-              env: sanitizedCliEnv(),
+              // buildEnv is merged OVER sanitizedCliEnv(), never the other
+              // way — a provider's own env additions (e.g. Kimi's
+              // KIMI_MODEL_THINKING_EFFORT) can only add variables, not
+              // weaken the sanitized base.
+              env: { ...sanitizedCliEnv(), ...def.buildEnv?.(model) },
               detached: process.platform !== "win32",
             });
           } catch {
@@ -1512,6 +1637,8 @@ export const __testOnly = {
   extractStructuredCliDiagnostics,
   extractClineFinalOutput,
   extractClineStructuredDiagnostics,
+  extractKimiFinalOutput,
+  extractKimiStructuredDiagnostics,
   isTextModeGuaranteedReadOnly,
   parseJsonLineEvents,
   unwrapJsonString,
@@ -1610,7 +1737,9 @@ function toFriendlyError(
       ? extractStructuredCliDiagnostics(stdout, parsed)
       : def.structuredEventStream === "cline"
         ? extractClineStructuredDiagnostics(stdout, parsed)
-        : undefined;
+        : def.structuredEventStream === "kimi"
+          ? extractKimiStructuredDiagnostics(stdout, parsed)
+          : undefined;
 
   const scanSource = structured
     ? `${stderr}\n${structured.markerScanText}`
@@ -1846,7 +1975,11 @@ export async function execCliAgent(options: {
         cwd,
         shell: useShell,
         windowsHide: true,
-        env: sanitizedCliEnv(),
+        // buildEnv is merged OVER sanitizedCliEnv(), never the other way —
+        // a provider's own env additions (e.g. Kimi's
+        // KIMI_MODEL_THINKING_EFFORT) can only add variables, not weaken
+        // the sanitized base.
+        env: { ...sanitizedCliEnv(), ...def.buildEnv?.(model) },
         // POSIX only: makes the shell (and everything it execs/forks) its
         // own process group, so killProcessTree can SIGTERM the whole group
         // instead of just the shell's PID — see killProcessTree for why that

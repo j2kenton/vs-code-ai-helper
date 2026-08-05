@@ -3,7 +3,7 @@
   "generatedBy": "scripts/resolveProductionSourceUniverse.mjs",
   "description": "Production source universe as of the current working tree, resolved from the exact bundler options that produce dist/extension.js (esbuild.config.js) plus the contribution-asset and runtime-resource-copy rules in scripts/lib/productionSourceScan.mjs. Regenerated every run; diffed against the immutable pre-gate snapshot (workflow-production-source-pregate-v1.json), not authoritative on its own.",
   "packageName": "vs-code-ai-helper",
-  "packageVersion": "0.72.0",
+  "packageVersion": "0.72.1",
   "declaredMain": "./dist/extension.js",
   "entrypoint": "src/extension.ts",
   "outfile": "dist/extension.js",
@@ -12,7 +12,7 @@
   "typescriptVersion": "5.9.3",
   "buildOptionsDigestSha256": "59b9af38338f674e6503e84e1945f3c7b2e65f3aab5e1acec211ca45a20c3d07",
   "lockfileSha256": "8df5712b6f8e20446c74bb0ebf444ca707fb666b5a35214b92ad7d155c4b28f6",
-  "fileCount": 166,
+  "fileCount": 167,
   "files": [
     {
       "path": "src/actions/actionConversationOrchestratorV1.ts",
@@ -132,7 +132,7 @@
     },
     {
       "path": "src/commands/generatePlanWithAI.ts",
-      "sha256": "59118b9097d2aa68b7f379cbdfeeff2e679ac3caafed0649e3da82c3015ed817"
+      "sha256": "530ad5af1363f14d555b3580a38f6e146420d83bf1a4922103247f825fba0241"
     },
     {
       "path": "src/commands/markTaskDone.ts",
@@ -164,7 +164,7 @@
     },
     {
       "path": "src/commands/reviewActions.ts",
-      "sha256": "30fb707afb324564f8e4b0e33ecf86916243565c63ca6bbfde2f11cc3d5e759d"
+      "sha256": "63e3371fb987dec9945be6407a80cea781f26dca648c1a17475caf179d5854b5"
     },
     {
       "path": "src/commands/reviewCurrentTask.ts",
@@ -232,7 +232,7 @@
     },
     {
       "path": "src/runners/cliAgentRunner.ts",
-      "sha256": "b18f5824dfcc2d7c0c51d5a94f7a1b7116fa6edde543de42a0d7975f4af226ff"
+      "sha256": "f88919a48ee83f1b4a84b5d1f085b4c8303467404cc814140b97d5846f432de0"
     },
     {
       "path": "src/runners/copilotImplementationRunner.ts",
@@ -248,7 +248,7 @@
     },
     {
       "path": "src/runners/providers.ts",
-      "sha256": "8820b50f4e5d9efd76f017462aa49abf0fa5e51738d48e87b1b3d35cee94b273"
+      "sha256": "38968fea82084bc06b9035578d3aa65ce8de6ae2748ba44dff4d36c1fe2e038e"
     },
     {
       "path": "src/runners/runnerRegistry.ts",
@@ -496,7 +496,7 @@
     },
     {
       "path": "src/utils/cliModelDiscovery.ts",
-      "sha256": "1e833483ce2ea8bf17e187e09921b5b3c8a92e9511e0efe54aa67e30e9c847b8"
+      "sha256": "4c9abe871b3fecf621f588879e8a7199f750ed42fdf92e19ebf28dd1cf77bbb7"
     },
     {
       "path": "src/utils/cliProcessUtils.ts",
@@ -560,7 +560,7 @@
     },
     {
       "path": "src/utils/modelSelection.ts",
-      "sha256": "1fbed511d601806305077ecb8cd916bf13cb0d696565d8b29dee65e3e7e25151"
+      "sha256": "63f5cc58ed609ae64630956d50aee9dda0200f4c1bda22ea2e8358106d0b4775"
     },
     {
       "path": "src/utils/notificationContentProvider.ts",
@@ -637,6 +637,10 @@
     {
       "path": "src/utils/stageTransition.ts",
       "sha256": "cf597a93cf1694915d6bdb3df417fe1e7af0ac9ab5c27635673d17e478015fdc"
+    },
+    {
+      "path": "src/utils/taskActionOutcomeTextV1.ts",
+      "sha256": "311991b0a9162136fbc2f8ec1197cec3a00aee6031ec8ce843197b129e7b2689"
     },
     {
       "path": "src/utils/taskDescriptionDocument.ts",

@@ -312,6 +312,75 @@ void describe("CLI output normalization", () => {
     assert.strictEqual(output, "Hello there.");
   });
 
+  // Kimi's stream-json shape, verified live against kimi-code 0.29.2. The
+  // narration lines below are why this extractor exists at all: in plain
+  // `text` mode they are concatenated AHEAD of the real answer, and
+  // parseAiResultEnvelopeV1 rejects any bytes before the frame marker — so a
+  // correct, completed V1 review settled as malformedResult.
+  void it("takes Kimi's LAST assistant message, dropping narration and tool turns", () => {
+    const stream = [
+      JSON.stringify({ role: "assistant", content: "The file is large. Let me page through it." }),
+      JSON.stringify({
+        role: "assistant",
+        tool_calls: [{ type: "function", id: "t1", function: { name: "Read", arguments: "{}" } }],
+      }),
+      JSON.stringify({ role: "tool", tool_call_id: "t1", content: "1\tSECRET_FILE_CONTENT" }),
+      JSON.stringify({ role: "assistant", content: "<<<ENSEMBLE_AI_RESULT_V1>>>\n{}\n<<<END_ENSEMBLE_AI_RESULT_V1>>>" }),
+      JSON.stringify({ role: "meta", type: "session.resume_hint", session_id: "s1" }),
+    ].join("\n");
+
+    assert.strictEqual(
+      __testOnly.extractKimiFinalOutput(stream),
+      "<<<ENSEMBLE_AI_RESULT_V1>>>\n{}\n<<<END_ENSEMBLE_AI_RESULT_V1>>>"
+    );
+  });
+
+  void it("returns Kimi's placeholder for a tool-only turn with no text reply", () => {
+    const stream = [
+      JSON.stringify({ role: "assistant", tool_calls: [{ type: "function", id: "t1" }] }),
+      JSON.stringify({ role: "tool", tool_call_id: "t1", content: "done" }),
+    ].join("\n");
+
+    assert.strictEqual(
+      __testOnly.extractKimiFinalOutput(stream),
+      "(Kimi Code CLI completed the run without returning any text reply.)"
+    );
+  });
+
+  void it("falls back to the raw stream when Kimi output isn't a recognizable message stream", () => {
+    const notJson = "error: failed to run prompt: config.invalid: Model \"k3\" is not configured";
+    assert.strictEqual(__testOnly.extractKimiFinalOutput(notJson), notJson);
+  });
+
+  void it("normalizes Kimi output via provider-specific extraction", () => {
+    const kimi = getCliProvider("kimi-cli");
+    assert.ok(kimi, "expected kimi-cli provider definition");
+
+    const stream = [
+      JSON.stringify({ role: "assistant", content: "narration" }),
+      JSON.stringify({ role: "assistant", content: "Final answer." }),
+    ].join("\n");
+
+    assert.strictEqual(__testOnly.normalizeCliOutput(kimi, stream, undefined), "Final answer.");
+  });
+
+  void it("never feeds Kimi's tool output into the auth-marker scan", () => {
+    // Kimi's {"role":"tool",...} lines re-emit whatever files it read — the
+    // same leak class that made an opencode transport drop get misreported
+    // as a billing/auth failure. Its real errors go to stderr (verified
+    // live), which the caller concatenates separately, so stdout must
+    // contribute nothing scannable here.
+    const stream = [
+      JSON.stringify({ role: "assistant", content: "ok" }),
+      JSON.stringify({ role: "tool", tool_call_id: "t1", content: "please provide your api key to log in" }),
+    ].join("\n");
+
+    const diagnostics = __testOnly.extractKimiStructuredDiagnostics(stream);
+    assert.strictEqual(diagnostics.markerScanText, "");
+    assert.strictEqual(diagnostics.sawAnyEvent, true);
+    assert.strictEqual(diagnostics.retryable, false);
+  });
+
   void it("fails CLI implementation runs that report completion without file changes", () => {
     const codex = getCliProvider("codex-cli");
     assert.ok(codex, "expected codex-cli provider definition");

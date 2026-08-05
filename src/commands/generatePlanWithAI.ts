@@ -8,6 +8,10 @@ import {
 } from "../utils/contextPack";
 import { renderPromptTemplate } from "../utils/promptTemplates";
 import { writeRunLog } from "../utils/runLog";
+import {
+  describeTaskActionFailureV1,
+  describeTaskActionOutcomeForLogV1,
+} from "../utils/taskActionOutcomeTextV1";
 import { pickTaskFolder } from "../utils/pickTaskFolder";
 import { checkRunnerAvailabilityForModel } from "../runners/runnerRegistry";
 import { resolveFreshModelForStage } from "../utils/modelSelection";
@@ -326,55 +330,6 @@ interface GeneratePlanOutcomeResultV1 {
   readonly runLogUri?: vscode.Uri;
 }
 
-/** One short, sanitized status line for the run log — never provider text (plan §2.2/§3.7's closed outcome contract carries none anyway). */
-function describeGeneratePlanOutcomeForLogV1(outcome: TaskActionOutcomeV1): string {
-  switch (outcome.kind) {
-    case "completed":
-      return `Status: completed (${outcome.code})`;
-    case "questions":
-      return `Status: questions (interactionId=${outcome.interactionId}) — the AI asked a clarifying question in Chat With AI instead of writing plan.md.`;
-    case "cancelled":
-      return `Status: cancelled (${outcome.code})`;
-    case "failed":
-      return `Status: failed (code=${outcome.code}, retryable=${outcome.retryable})`;
-    case "malformedResult":
-      return `Status: malformed result (${outcome.code})`;
-    case "unavailable":
-      return `Status: unavailable (${outcome.code})`;
-    case "recoveryRequired":
-      return `Status: recovery required (${outcome.code})`;
-    case "duplicateRejected":
-      return "Status: duplicate rejected (another operation is already running for this task)";
-    case "stalePreflight":
-      return `Status: stale preflight (${outcome.planId})`;
-    case "partialEditBlocked":
-      return `Status: partial edit blocked (${outcome.executionId})`;
-    default:
-      return `Status: ${(outcome as TaskActionOutcomeV1).kind}`;
-  }
-}
-
-/** User-facing failure text for a non-completed, non-cancelled, non-questions outcome. */
-function describeGeneratePlanFailureV1(outcome: TaskActionOutcomeV1): string {
-  switch (outcome.kind) {
-    case "failed":
-      return `${outcome.code}${outcome.retryable ? " (retryable)" : ""}`;
-    case "malformedResult":
-      return `the model's response was malformed (${outcome.code})`;
-    case "unavailable":
-      return outcome.code;
-    case "recoveryRequired":
-      return outcome.code;
-    case "duplicateRejected":
-      return "another operation is already running for this task";
-    case "stalePreflight":
-      return "a stale preflight plan was rejected";
-    case "partialEditBlocked":
-      return "a partial edit was blocked";
-    default:
-      return outcome.kind;
-  }
-}
 
 /**
  * Handle one `generatePlan.v1` coordinator outcome: promote a completed
@@ -448,7 +403,7 @@ async function handleGeneratePlanOutcomeV1(
     NotificationRouter.showInformation("Plan generation cancelled.");
   } else {
     NotificationRouter.showError(
-      `Plan generation failed: ${describeGeneratePlanFailureV1(outcome)}. Use the manual planning workflow instead.`
+      `Plan generation failed: ${describeTaskActionFailureV1(outcome)}. Use the manual planning workflow instead.`
     );
   }
 
@@ -456,7 +411,7 @@ async function handleGeneratePlanOutcomeV1(
     taskFolderUri,
     "generatePlan-v1",
     "plan",
-    `# Prompt\n\n${ctx.prompt}\n\n# Result\n\n${describeGeneratePlanOutcomeForLogV1(outcome)}`
+    `# Prompt\n\n${ctx.prompt}\n\n# Result\n\n${describeTaskActionOutcomeForLogV1(outcome, "plan.md")}`
   );
 
   return { succeeded, triggerAutoReview, runLogUri };
@@ -780,7 +735,7 @@ export async function resumeGeneratePlanInteractionV1(
       : undefined;
 
   if (settlement === undefined) {
-    return { ok: false, reason: describeGeneratePlanFailureV1(outcome) };
+    return { ok: false, reason: describeTaskActionFailureV1(outcome) };
   }
   return { ok: true, settlement };
 }

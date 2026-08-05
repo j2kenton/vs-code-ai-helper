@@ -393,6 +393,19 @@ void describe("createCliTextTransportV1 per shipped CLI definition", () => {
         "",
       ].join("\n");
     }
+    if (def.structuredEventStream === "kimi") {
+      // Kimi's stream-json message stream: narration and tool turns arrive as
+      // earlier lines, and the LAST assistant `content` is the real answer —
+      // which is exactly why this provider cannot use plain `text` mode (the
+      // narration would precede the frame and fail the strict envelope parse).
+      return [
+        JSON.stringify({ role: "assistant", content: "Let me page through the file." }),
+        JSON.stringify({ role: "tool", tool_call_id: "t1", content: "1\tfile contents" }),
+        JSON.stringify({ role: "assistant", content: frame }),
+        JSON.stringify({ role: "meta", type: "session.resume_hint", session_id: "s1" }),
+        "",
+      ].join("\n");
+    }
     if (def.structuredEventStream !== undefined) {
       throw new Error(
         `Unrecognized structuredEventStream ${String(def.structuredEventStream)} for ${def.id} — add a fixture shape for it here.`

@@ -492,6 +492,33 @@ export async function discoverDevpassModelsWithTimeout(
  * and not opencode's repeating-text-block shape, so this is a dedicated
  * parser rather than a reuse of parseModelListOutput/parseOpencodeVerboseModels.
  */
+/**
+ * The recognized Kimi reasoning-effort ladder, and the SINGLE source of it.
+ *
+ * Discovery (below) and `parseKimiModelSelection` (providers.ts, which
+ * imports this) must agree exactly, because they are two halves of one round
+ * trip: discovery attaches an `@<effort>` suffix to a model id, and the
+ * parser splits that suffix back off before `-m` ever sees it. If discovery
+ * publishes an effort the parser does not recognize, the parser treats the
+ * whole `kimi-code/k3@medium` string as the model name and passes it to `-m`
+ * verbatim — which Kimi rejects outright ("Model ... is not configured in
+ * config.toml"), turning a picker entry into an unrunnable model. Keeping
+ * one constant (rather than two "kept in sync" copies) makes that class of
+ * drift impossible.
+ *
+ * Values verified live against kimi-code 0.29.2 (`kimi provider list
+ * --json`): only K3/K3-256k carry `supportEfforts`, each exactly
+ * ["low","high","max"]; K2.7 Coding / K2.7 Coding Highspeed are
+ * `always_thinking` with no ladder at all, so they get no variant entries.
+ * A future CLI version adding an effort must be added HERE — until it is,
+ * discovery deliberately drops it rather than publishing a model that
+ * cannot run.
+ */
+export const KIMI_REASONING_EFFORTS_V1: ReadonlySet<string> = new Set([
+  "low",
+  "high",
+  "max",
+]);
 export function parseKimiModelsOutput(output: string): DiscoveredCliModel[] {
   const trimmed = output.trim();
   if (trimmed.length === 0) {
@@ -518,14 +545,39 @@ export function parseKimiModelsOutput(output: string): DiscoveredCliModel[] {
     if (!id) {
       continue;
     }
+    const record =
+      value && typeof value === "object" ? (value as Record<string, unknown>) : undefined;
     const displayName =
-      value &&
-      typeof value === "object" &&
-      typeof (value as { displayName?: unknown }).displayName === "string" &&
-      (value as { displayName: string }).displayName.trim().length > 0
-        ? (value as { displayName: string }).displayName.trim()
+      record &&
+      typeof record.displayName === "string" &&
+      record.displayName.trim().length > 0
+        ? record.displayName.trim()
         : id;
     result.push({ model: id, name: displayName });
+
+    // A future response shape could carry a non-array supportEfforts (or
+    // non-string entries) without warning — guard both explicitly rather
+    // than let a malformed value silently produce "@[object Object]"-style
+    // variant ids or throw mid-loop. Unrecognized effort NAMES are dropped
+    // for a sharper reason: see KIMI_REASONING_EFFORTS_V1 — publishing one
+    // the parser cannot split back off yields a picker entry whose id is
+    // passed to `-m` whole and rejected by the CLI.
+    const supportEfforts = record?.supportEfforts;
+    if (Array.isArray(supportEfforts)) {
+      for (const effort of supportEfforts) {
+        if (typeof effort !== "string") {
+          continue;
+        }
+        const trimmedEffort = effort.trim();
+        if (!KIMI_REASONING_EFFORTS_V1.has(trimmedEffort)) {
+          continue;
+        }
+        result.push({
+          model: `${id}@${trimmedEffort}`,
+          name: `${displayName} (${trimmedEffort[0]!.toUpperCase()}${trimmedEffort.slice(1)})`,
+        });
+      }
+    }
   }
   return uniqueByModel(result);
 }

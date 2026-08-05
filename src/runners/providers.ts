@@ -47,6 +47,7 @@ import {
   discoverKimiModels,
   discoverKiroModels,
   discoverOpencodeModels,
+  KIMI_REASONING_EFFORTS_V1,
   type DiscoveredCliModel,
 } from "../utils/cliModelDiscovery";
 
@@ -149,6 +150,21 @@ export interface CliProviderDefinition {
    * Ignored for stdin transport.
    */
   maxArgvPromptBytes?: number;
+  /**
+   * Extra environment variables to set on the spawned CLI process for this
+   * invocation's model selection, merged over sanitizedCliEnv() (so this
+   * CANNOT unset the sanitization — only add to it). Exists for a provider
+   * whose per-invocation model options (e.g. reasoning effort) are exposed
+   * as an operational environment-variable override rather than a CLI flag,
+   * with no other way to reach them from buildArgs's plain string[] return.
+   * Absent for every provider whose options are all expressible as argv
+   * flags (the normal case) — kimi-cli is first: its reasoning effort for
+   * K3/K3-256k is set via KIMI_MODEL_THINKING_EFFORT, verified live against
+   * kimi-code 0.29.2 (`kimi provider list --json`'s support_efforts/
+   * default_effort fields, and a live low/high/bogus run: low and high both
+   * succeeded, bogus 400'd from the API) — see parseKimiModelSelection.
+   */
+  buildEnv?: (model: string | undefined) => Record<string, string> | undefined;
   models: readonly CliModelChoice[];
   /**
    * Optional live model discovery: queries the CLI itself for its current
@@ -207,7 +223,7 @@ export interface CliProviderDefinition {
    * lines rather than opencode's `{"type":"error","error":{...}}"` — see
    * extractClineStructuredDiagnostics/extractClineFinalOutput.
    */
-  structuredEventStream?: "opencode" | "cline";
+  structuredEventStream?: "opencode" | "cline" | "kimi";
   /**
    * Retry-evidence capability flag: true ONLY when this provider's CLI
    * protocol verifiably guarantees that tool/edit boundary events are
@@ -486,6 +502,59 @@ export function parseClineModelSelection(
 
   const split = splitModelAtLastAt(model);
   if (split.suffix === undefined || !CLINE_REASONING_EFFORTS.has(split.suffix)) {
+    return { model, reasoningEffort: undefined };
+  }
+
+  return { model: split.model, reasoningEffort: split.suffix };
+}
+
+/**
+ * Kimi's reasoning effort is NOT a CLI flag — `-m`/`--model` only ever
+ * accepts a bare model alias (verified live: `-m "kimi-code/k3:low"` and
+ * `-m "kimi-code/k3@low"` both fail with "Model ... is not configured in
+ * config.toml"). It is instead an operational override read from the
+ * `KIMI_MODEL_THINKING_EFFORT` environment variable at process start
+ * (confirmed in kimi-code 0.29.2's own bundled source and by a live run:
+ * KIMI_MODEL_THINKING_EFFORT=low/high both succeeded against `kimi-code/k3`,
+ * =bogus 400'd from the API). So this returns a base model plus an effort
+ * to be applied via CliProviderDefinition.buildEnv, not via buildArgs.
+ *
+ * Only K3 and K3-256k declare `support_efforts` (`kimi provider list
+ * --json`); K2.7 Coding / K2.7 Coding Highspeed are `always_thinking` with
+ * no effort ladder at all. This function does not special-case that per
+ * model the way opencode's per-model variant sets require — the seeded/
+ * discovered catalog in modelSelection.ts simply never attaches an
+ * `@effort` suffix to a K2.7 model id, so the ambiguity does not arise from
+ * the picker. A hand-typed `kimi-code/kimi-for-coding@low` custom id would
+ * still parse here (the suffix is a fixed low/high/max ladder, not
+ * model-aware) and be sent to the CLI regardless; that is an accepted,
+ * narrow gap matching how legacyModelAliases/custom ids are handled
+ * elsewhere in this file — the environment variable is documented as
+ * ignored by models that don't support it, not rejected.
+ *
+ * The recognized ladder itself is KIMI_REASONING_EFFORTS_V1, imported from
+ * cliModelDiscovery.ts so this parser and the discovery that PRODUCES these
+ * suffixes share one constant rather than two copies that can drift. They
+ * are two halves of one round trip: an effort discovery publishes but this
+ * parser does not recognize would fall through to the `return { model, ... }`
+ * below with the suffix still attached, sending `-m kimi-code/k3@medium` to
+ * a CLI that rejects it.
+ */
+
+export interface ParsedKimiModelSelection {
+  model: string | undefined;
+  reasoningEffort: string | undefined;
+}
+
+export function parseKimiModelSelection(
+  model: string | undefined
+): ParsedKimiModelSelection {
+  if (!model) {
+    return { model: undefined, reasoningEffort: undefined };
+  }
+
+  const split = splitModelAtLastAt(model);
+  if (split.suffix === undefined || !KIMI_REASONING_EFFORTS_V1.has(split.suffix)) {
     return { model, reasoningEffort: undefined };
   }
 
@@ -1351,17 +1420,28 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     // `default_model`, and the extension has no way to discover what that
     // is without an account-specific query — every choice is therefore a
     // concrete model. Reasoning-effort selection (K3/K3-256k support
-    // low/high/max, verified live via the `KIMI_MODEL_THINKING_EFFORT`
-    // environment-variable override) is NOT wired up in this integration:
-    // it requires a per-invocation environment-variable hook this codebase's
-    // CLI transport does not currently expose, so each model runs at its own
-    // configured default_effort ("high" for both K3 variants, verified via
-    // `kimi provider list --json`). K2.7 Coding / K2.7 Coding Highspeed have
-    // no effort ladder at all (`always_thinking` capability, no
-    // `support_efforts` field) — thinking is always on for those two.
+    // low/high/max) is wired via `buildEnv` below, not a CLI flag — see
+    // parseKimiModelSelection's doc comment for why. K2.7 Coding / K2.7
+    // Coding Highspeed have no effort ladder at all (`always_thinking`
+    // capability, no `support_efforts` field) — thinking is always on for
+    // those two, and the seeded/discovered catalog never attaches an
+    // `@effort` suffix to either.
     models: [],
     discoverModels: discoverKimiModels,
     usesLastMessageFile: false,
+    // Kimi's `--output-format stream-json` stdout is an NDJSON message
+    // stream, not the final answer — see extractKimiFinalOutput, and the
+    // buildArgs comment for why plain `text` mode is unusable here. Like
+    // opencode's and cline's streams it also re-emits tool input/output
+    // (Kimi's `{"role":"tool",...}` lines carry whatever files it read), so
+    // failure diagnosis must not scan the raw stream for auth markers.
+    structuredEventStream: "kimi",
+    buildEnv(model): Record<string, string> | undefined {
+      const { reasoningEffort } = parseKimiModelSelection(model);
+      return reasoningEffort
+        ? { KIMI_MODEL_THINKING_EFFORT: reasoningEffort }
+        : undefined;
+    },
     buildArgs(_mode, model, _lastMessageFile, context): string[] {
       // mode is deliberately NOT branched on for a permission flag here —
       // unlike every other provider in this file. Verified live against
@@ -1387,9 +1467,26 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
           "Kimi Code CLI provider misconfiguration: promptTransport is \"file\" but no promptFile was provided to buildArgs."
         );
       }
-      const args = ["--output-format", "text"];
-      if (model) {
-        args.push("-m", model);
+      // stream-json, NOT text — this is load-bearing, see
+      // extractKimiFinalOutput in cliAgentRunner.ts. Kimi narrates before it
+      // answers ("• The file is large. Let me page through it in chunks.")
+      // and indents the answer; in `text` mode that prose is concatenated
+      // ahead of the model's real reply, which makes a V1-migrated action's
+      // strict envelope parse fail (parseAiResultEnvelopeV1 rejects any
+      // bytes before the frame marker) even when the model answered
+      // perfectly. Verified live both ways: `text` mode produced a valid,
+      // correct review that still settled as malformedResult, while
+      // stream-json's last assistant message is the frame exactly — starting
+      // with the start marker and ending with the end marker, no
+      // surrounding text.
+      const args = ["--output-format", "stream-json"];
+      // -m takes only the bare model alias — a trailing "@effort" suffix is
+      // rejected outright (verified live), so it must be split off here.
+      // The effort itself reaches the CLI via buildEnv's
+      // KIMI_MODEL_THINKING_EFFORT, not argv; see parseKimiModelSelection.
+      const parsedModel = parseKimiModelSelection(model);
+      if (parsedModel.model) {
+        args.push("-m", parsedModel.model);
       }
       // The ONLY argv-borne prompt text is this short, fixed instruction —
       // never the user's own prompt — so nothing here scales with context

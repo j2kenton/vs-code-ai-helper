@@ -6,6 +6,7 @@ import {
   discoverKiroModelsWithTimeout,
   discoverOpencodeModelsWithTimeout,
   parseAgyModelsOutput,
+  parseKimiModelsOutput,
   parseKiroModelsOutput,
   parseOpencodeModelsOutput,
 } from "../utils/cliModelDiscovery";
@@ -571,5 +572,104 @@ void describe("parseOpencodeModelsOutput", () => {
       childProcess.spawn = originalSpawn;
       Object.defineProperty(process, "platform", { value: originalPlatform });
     }
+  });
+});
+
+void describe("parseKimiModelsOutput", () => {
+  // Shape captured live from `kimi provider list --json` (kimi-code 0.29.2):
+  // a "models" map keyed by the full "<provider>/<alias>" id, each value
+  // carrying "displayName" and, for K3/K3-256k only, "supportEfforts".
+  void it("expands a model's supportEfforts into @effort-suffixed entries", () => {
+    const output = JSON.stringify({
+      models: {
+        "kimi-code/k3": {
+          displayName: "K3",
+          supportEfforts: ["low", "high", "max"],
+          defaultEffort: "high",
+        },
+      },
+    });
+
+    assert.deepStrictEqual(parseKimiModelsOutput(output), [
+      { model: "kimi-code/k3", name: "K3" },
+      { model: "kimi-code/k3@low", name: "K3 (Low)" },
+      { model: "kimi-code/k3@high", name: "K3 (High)" },
+      { model: "kimi-code/k3@max", name: "K3 (Max)" },
+    ]);
+  });
+
+  void it("emits only the base model for one with no supportEfforts (K2.7's always-on thinking)", () => {
+    const output = JSON.stringify({
+      models: {
+        "kimi-code/kimi-for-coding": { displayName: "K2.7 Coding" },
+      },
+    });
+
+    assert.deepStrictEqual(parseKimiModelsOutput(output), [
+      { model: "kimi-code/kimi-for-coding", name: "K2.7 Coding" },
+    ]);
+  });
+
+  void it("falls back to the model id when displayName is absent or blank", () => {
+    const output = JSON.stringify({
+      models: {
+        "kimi-code/mystery-model": {},
+        "kimi-code/blank-name": { displayName: "   " },
+      },
+    });
+
+    assert.deepStrictEqual(parseKimiModelsOutput(output), [
+      { model: "kimi-code/mystery-model", name: "kimi-code/mystery-model" },
+      { model: "kimi-code/blank-name", name: "kimi-code/blank-name" },
+    ]);
+  });
+
+  void it("drops an effort the selection parser would not recognize, rather than publishing an unrunnable model", () => {
+    // Review finding: discovery accepted any non-blank effort string while
+    // parseKimiModelSelection recognizes only low/high/max. An unexpected
+    // "medium" became "kimi-code/k3@medium", which the parser could not
+    // split back off — so buildArgs passed the whole suffixed id to -m and
+    // Kimi rejected it ("Model ... is not configured in config.toml"),
+    // turning a picker entry into a model that can never run. Both sides now
+    // share KIMI_REASONING_EFFORTS_V1.
+    const output = JSON.stringify({
+      models: {
+        "kimi-code/k3": {
+          displayName: "K3",
+          supportEfforts: ["low", "medium", "high", "max", "ultra"],
+        },
+      },
+    });
+
+    assert.deepStrictEqual(parseKimiModelsOutput(output), [
+      { model: "kimi-code/k3", name: "K3" },
+      { model: "kimi-code/k3@low", name: "K3 (Low)" },
+      { model: "kimi-code/k3@high", name: "K3 (High)" },
+      { model: "kimi-code/k3@max", name: "K3 (Max)" },
+    ]);
+  });
+
+  void it("ignores a malformed supportEfforts value instead of throwing or producing bogus variants", () => {
+    const output = JSON.stringify({
+      models: {
+        "kimi-code/odd-a": { displayName: "Odd A", supportEfforts: "low" },
+        "kimi-code/odd-b": { displayName: "Odd B", supportEfforts: [42, "", "  ", "max"] },
+      },
+    });
+
+    assert.deepStrictEqual(parseKimiModelsOutput(output), [
+      { model: "kimi-code/odd-a", name: "Odd A" },
+      { model: "kimi-code/odd-b", name: "Odd B" },
+      { model: "kimi-code/odd-b@max", name: "Odd B (Max)" },
+    ]);
+  });
+
+  void it("returns an empty array for empty, malformed, or shapeless input", () => {
+    assert.deepStrictEqual(parseKimiModelsOutput(""), []);
+    assert.deepStrictEqual(parseKimiModelsOutput("   "), []);
+    assert.deepStrictEqual(parseKimiModelsOutput("not json"), []);
+    assert.deepStrictEqual(parseKimiModelsOutput("null"), []);
+    assert.deepStrictEqual(parseKimiModelsOutput("[]"), []);
+    assert.deepStrictEqual(parseKimiModelsOutput('{"models": "not an object"}'), []);
   });
 });

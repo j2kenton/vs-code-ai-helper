@@ -12,6 +12,7 @@ import {
   parseClineModelSelection,
   parseCopilotModelSelection,
   parseCodexModelSelection,
+  parseKimiModelSelection,
   parseModelSelection,
   parseOpencodeModelSelection,
   providerAccountIdForModelId,
@@ -367,12 +368,20 @@ void describe("provider CLI contracts", () => {
     const args = kimi.buildArgs("text", "kimi-code/k3", undefined, { promptFile });
     assert.deepStrictEqual(args, [
       "--output-format",
-      "text",
+      "stream-json",
       "-m",
       "kimi-code/k3",
       "-p",
       buildKimiCliPromptFileInstruction(promptFile),
     ]);
+
+    // stream-json is load-bearing, not cosmetic: in plain `text` mode Kimi
+    // narrates before answering ("• The file is large...") and indents the
+    // answer, and parseAiResultEnvelopeV1 rejects ANY bytes before the frame
+    // marker — so a genuinely completed V1 review settled as malformedResult.
+    // Pinning both the flag and the paired stream tag together, since either
+    // alone silently breaks the extraction (see extractKimiFinalOutput).
+    assert.strictEqual(kimi.structuredEventStream, "kimi");
 
     // The instruction must name the file, and must carry both load-bearing
     // clauses: read it ALL (its Read tool paginates on large files) and
@@ -402,6 +411,65 @@ void describe("provider CLI contracts", () => {
       () => kimi.buildArgs("text", undefined, undefined),
       /misconfiguration/
     );
+  });
+
+  void it("Kimi reasoning effort is an environment variable, not a CLI flag", () => {
+    // Verified live against kimi-code 0.29.2: -m rejects any "@effort"
+    // suffix outright ("Model ... is not configured in config.toml"), but
+    // KIMI_MODEL_THINKING_EFFORT=low/high both succeeded for kimi-code/k3
+    // and =bogus 400'd from the API. So buildArgs must pass only the bare
+    // model to -m, and the effort must reach the CLI via buildEnv instead.
+    assert.deepStrictEqual(parseKimiModelSelection(undefined), {
+      model: undefined,
+      reasoningEffort: undefined,
+    });
+    assert.deepStrictEqual(parseKimiModelSelection("kimi-code/k3"), {
+      model: "kimi-code/k3",
+      reasoningEffort: undefined,
+    });
+    assert.deepStrictEqual(parseKimiModelSelection("kimi-code/k3@low"), {
+      model: "kimi-code/k3",
+      reasoningEffort: "low",
+    });
+    assert.deepStrictEqual(parseKimiModelSelection("kimi-code/k3-256k@max"), {
+      model: "kimi-code/k3-256k",
+      reasoningEffort: "max",
+    });
+    // An unrecognized suffix is not a valid effort — the whole string is
+    // kept as the model, same convention as Codex/Claude/Cline's parsers.
+    assert.deepStrictEqual(parseKimiModelSelection("kimi-code/k3@medium"), {
+      model: "kimi-code/k3@medium",
+      reasoningEffort: undefined,
+    });
+
+    const kimi = getCliProvider("kimi-cli");
+    assert.ok(kimi, "expected kimi-cli provider definition");
+    assert.ok(kimi.buildEnv, "expected kimi-cli to declare buildEnv");
+
+    // buildArgs strips the suffix before -m; buildEnv is where the effort
+    // actually reaches the CLI.
+    const args = kimi.buildArgs("text", "kimi-code/k3@high", undefined, {
+      promptFile: "/tmp/prompt.txt",
+    });
+    const modelIndex = args.indexOf("-m");
+    assert.ok(modelIndex >= 0, "expected -m flag in kimi's buildArgs output");
+    assert.strictEqual(args[modelIndex + 1], "kimi-code/k3");
+    assert.ok(
+      !args.some((arg) => arg.includes("@")),
+      "no argv element may carry the raw @effort-suffixed model id"
+    );
+
+    assert.deepStrictEqual(kimi.buildEnv("kimi-code/k3@low"), {
+      KIMI_MODEL_THINKING_EFFORT: "low",
+    });
+    assert.deepStrictEqual(kimi.buildEnv("kimi-code/k3-256k@max"), {
+      KIMI_MODEL_THINKING_EFFORT: "max",
+    });
+    // No suffix, or a model with no effort ladder at all (K2.7) — no env
+    // override is added; the model runs at its own configured default.
+    assert.strictEqual(kimi.buildEnv("kimi-code/k3"), undefined);
+    assert.strictEqual(kimi.buildEnv("kimi-code/kimi-for-coding"), undefined);
+    assert.strictEqual(kimi.buildEnv(undefined), undefined);
   });
 
   void it("Codex model variants map to base model plus reasoning config", () => {

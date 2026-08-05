@@ -147,7 +147,7 @@
       "callSites": [
         {
           "signal": "workspace.fs",
-          "span": "L523-L523",
+          "span": "L478-L478",
           "enclosingSymbol": "content"
         }
       ],
@@ -210,47 +210,47 @@
       "callSites": [
         {
           "signal": "import:child_process",
-          "span": "L74-L74",
+          "span": "L78-L78",
           "enclosingSymbol": "(module)"
         },
         {
           "signal": "import:fs",
-          "span": "L75-L75",
+          "span": "L79-L79",
           "enclosingSymbol": "(module)"
         },
         {
           "signal": "workspace.fs",
-          "span": "L682-L682",
+          "span": "L686-L686",
           "enclosingSymbol": "entries"
         },
         {
           "signal": "workspace.fs",
-          "span": "L695-L695",
+          "span": "L699-L699",
           "enclosingSymbol": "legacyEntries"
         },
         {
           "signal": "workspace.fs",
-          "span": "L1390-L1390",
+          "span": "L1442-L1442",
           "enclosingSymbol": "contentBytes"
         },
         {
           "signal": "workspace.fs",
-          "span": "L1854-L1854",
+          "span": "L1932-L1932",
           "enclosingSymbol": "runReviewForFolder"
         },
         {
           "signal": "workspace.fs",
-          "span": "L1871-L1871",
+          "span": "L1949-L1949",
           "enclosingSymbol": "runReviewForFolder"
         },
         {
           "signal": "workspace.fs",
-          "span": "L2259-L2259",
+          "span": "L2337-L2337",
           "enclosingSymbol": "runApply"
         },
         {
           "signal": "workspace.fs",
-          "span": "L5267-L5267",
+          "span": "L5345-L5345",
           "enclosingSymbol": "buildReviewResumeVariablesV1"
         }
       ],
@@ -1111,17 +1111,17 @@
       "callSites": [
         {
           "signal": "workspace.fs",
-          "span": "L74-L74",
+          "span": "L78-L78",
           "enclosingSymbol": "content"
         },
         {
           "signal": "workspace.fs",
-          "span": "L112-L112",
+          "span": "L116-L116",
           "enclosingSymbol": "setTaskStageModel"
         },
         {
           "signal": "workspace.fs",
-          "span": "L124-L124",
+          "span": "L128-L128",
           "enclosingSymbol": "setTaskStageModel"
         }
       ],
