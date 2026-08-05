@@ -284,6 +284,23 @@
       }
     },
     {
+      "annotationKind": "pregateAddedRoute",
+      "routeKey": "provider:src/commands/runEditActionV1.ts#runImplementationOrSealedV1->runImplementationForModel#1",
+      "path": "src/commands/runEditActionV1.ts",
+      "planSection": "§7.5/§7.8 (restoring CLI implementation)",
+      "rationale": "The §7.8 cutover made every edit-capable action (implementation.v1, fastForward.v1, applyReviewEdit.v1, lint.v1) run exclusively through the sealed two-phase pipeline, which only a Copilot-backed model can join — a CLI agent edits files with its own in-process tools that the extension never sees, so it cannot participate in the pipeline's request-local vscode.lm tool-calling loop at all. This silently required a Copilot subscription for implementation, with no CLI equivalent for the direct edit-mode path (runImplementationForModel/runImplementationWithCli) it replaced, even though that path remained fully implemented and tested — just orphaned (zero production callers; see runnerRegistry.ts's own evidence refresh). The new runImplementationOrSealedV1 is the actual entry point reviewActions.ts's executeImplementationRun and runLintingFixes.ts's AI fix pass now call (see their own evidence refreshes): it resolves the stage model's effective provider and calls runSealedImplementationV1 unchanged for a Copilot-resolved one, or this runImplementationForModel call directly for a CLI-resolved one — restoring the exact git-snapshot-based direct edit-mode invocation runImplementationWithAI used before the §7.8 cutover for all four edit-capable actions. This path has no preflight, receipts, or structured mid-run questions — CLI providers never had that and cannot participate in it — but is not a stub: same backup-model cascade, same quota/auth classification as the sealed path.",
+      "owner": "j2kenton",
+      "cohort": "edit",
+      "expiryCohort": "edit",
+      "evidence": {
+        "symbol": "runImplementationOrSealedV1",
+        "sourceSpan": "L666-L675",
+        "edgeKind": "pregateAddedRoute",
+        "targetActionKey": "implementation.v1/fastForward.v1/applyReviewEdit.v1/lint.v1",
+        "liveStabilitySha256": "d5d18efd264933955d0c796b41858a5f49a931c94eebe38d27f5639823c8231b"
+      }
+    },
+    {
       "annotationKind": "pregateModifiedRoute",
       "routeKey": "command:vs-code-ai-helper.applyReviewWithAI",
       "path": "src/commands/reviewActions.ts",

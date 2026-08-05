@@ -1,11 +1,16 @@
 /**
  * Coverage for the §7.5 edit-action availability gate and the two-phase
- * driver's request digest (runEditActionV1): host floor + runtime tool
- * shapes fail as hostToolApiUnavailable, CLI-only stage models as
- * providerModeUnavailable, and non-workspace paths as
+ * driver's request digest (runEditActionV1): checkEditActionAvailabilityV1
+ * resolves the WINNING candidate (checkImplementationAvailabilityForModel)
+ * before deciding whether a host/tool-calling check applies — skipped for a
+ * CLI-resolved winner (which never touches vscode.lm), required for a
+ * Copilot-resolved one; an unresolvable/unavailable stage model fails as
+ * providerModeUnavailable, and non-workspace paths fail as
  * workspaceRootUnsupported — all BEFORE any task or source read.
  */
 import * as assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
+import { createRequire } from "node:module";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -14,9 +19,40 @@ import * as vscode from "vscode";
 import {
   checkEditActionAvailabilityV1,
   checkEditActionHostGateV1,
+  checkEditActionProviderPathGateV1,
   computeEditRequestDigestV1,
   isEditPreflightActionKeyV1,
+  runImplementationOrSealedV1,
 } from "../commands/runEditActionV1";
+
+const requireModule = createRequire(__filename);
+const childProcess = requireModule("node:child_process") as typeof import("node:child_process");
+// Reassigning properties on this required module object affects call sites
+// inside runEditActionV1.ts too — tsc's CommonJS output for a named import
+// resolves the callee through this exact same namespace object at call time
+// (see commitMessageReview.test.ts / publishOwnershipMatrix.test.ts for the
+// same pattern against this module).
+const runnerRegistryModule = requireModule("../runners/runnerRegistry") as {
+  checkImplementationAvailabilityForModel: (...args: unknown[]) => Promise<unknown>;
+  runImplementationForModel: (...args: unknown[]) => Promise<unknown>;
+};
+
+function installModelSettings(raw: Record<string, unknown>): { restore: () => void } {
+  const original = (vscode.workspace as unknown as Record<string, unknown>).getConfiguration;
+  (vscode.workspace as unknown as Record<string, unknown>).getConfiguration = (): {
+    get: (key: string, defaultValue?: unknown) => unknown;
+    inspect: () => undefined;
+  } => ({
+    get: (key: string, defaultValue?: unknown): unknown =>
+      key === "modelSettings" ? raw : defaultValue,
+    inspect: () => undefined,
+  });
+  return {
+    restore: (): void => {
+      (vscode.workspace as unknown as Record<string, unknown>).getConfiguration = original;
+    },
+  };
+}
 import { resetWorkflowRuntimeServicesForTestV1 } from "../services/workflowRuntimeServicesV1";
 import {
   createApplyReviewEditPreflightRowV1,
@@ -37,15 +73,37 @@ function installWorkspaceFoldersStub(roots: readonly string[]): { restore: () =>
   return { restore: (): void => { target.workspaceFolders = orig; } };
 }
 
+/** Makes every `where.exe`/`which` CLI existence probe report "found". */
+function installCliFoundStub(): { restore: () => void } {
+  const originalSpawn = childProcess.spawn;
+  childProcess.spawn = (() => {
+    const child = new EventEmitter() as import("node:child_process").ChildProcess;
+    process.nextTick(() => child.emit("close", 0));
+    return child;
+  }) as typeof childProcess.spawn;
+  return { restore: (): void => { childProcess.spawn = originalSpawn; } };
+}
+
+/** Makes checkImplementationAvailability's Copilot model-list probe report at least one model. */
+function installCopilotAvailableStub(): { restore: () => void } {
+  const lm = vscode.lm as unknown as { selectChatModels: () => Promise<vscode.LanguageModelChat[]> };
+  const original = lm.selectChatModels;
+  lm.selectChatModels = (): Promise<vscode.LanguageModelChat[]> =>
+    Promise.resolve([{ id: "auto", name: "Auto" } as unknown as vscode.LanguageModelChat]);
+  return { restore: (): void => { lm.selectChatModels = original; } };
+}
+
 void describe("runEditActionV1 — §7.5 availability", () => {
-  void it("accepts a Copilot-backed stage over an open workspace folder and derives the root binding", () => {
+  void it("accepts a Copilot-backed stage over an open workspace folder and derives the root binding", async () => {
     resetWorkflowRuntimeServicesForTestV1();
     const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-edit-avail-"));
     const ws = installWorkspaceFoldersStub([workspaceRoot]);
+    const copilot = installCopilotAvailableStub();
     try {
-      const result = checkEditActionAvailabilityV1({
+      const result = await checkEditActionAvailabilityV1({
         workspaceFsPath: workspaceRoot,
         stageModelId: "copilot:gpt-5",
+        stage: "impl",
       });
       assert.equal(result.ok, true);
       if (result.ok) {
@@ -53,55 +111,99 @@ void describe("runEditActionV1 — §7.5 availability", () => {
         assert.match(result.rootBindingId, /^[0-9a-f]{64}$/);
       }
     } finally {
+      copilot.restore();
       ws.restore();
       fs.rmSync(workspaceRoot, { recursive: true, force: true });
     }
   });
 
-  void it("fails as providerModeUnavailable for a CLI-only stage model (§7.5: no CLI edit path)", () => {
+  void it("accepts a CLI-resolved stage model without requiring the host/LM-tool gate", async () => {
     resetWorkflowRuntimeServicesForTestV1();
     const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-edit-avail-cli-"));
     const ws = installWorkspaceFoldersStub([workspaceRoot]);
+    const cli = installCliFoundStub();
     try {
-      const result = checkEditActionAvailabilityV1({
+      const result = await checkEditActionAvailabilityV1({
         workspaceFsPath: workspaceRoot,
         stageModelId: "claude-cli:sonnet",
+        stage: "impl",
       });
-      assert.equal(result.ok === false && result.code, "providerModeUnavailable");
+      // CLI providers run their own direct edit-mode invocation
+      // (runImplementationOrSealedV1) rather than the Copilot-only sealed
+      // pipeline, so this must succeed even where the host/LM-tool probe
+      // below would fail — that probe is irrelevant to a CLI provider.
+      assert.equal(result.ok, true);
     } finally {
+      cli.restore();
       ws.restore();
       fs.rmSync(workspaceRoot, { recursive: true, force: true });
     }
   });
 
-  void it("fails as workspaceRootUnsupported for a path that is not an open workspace folder", () => {
+  void it("still accepts a CLI-resolved stage model when the host lacks the tool-calling constructors", async () => {
+    resetWorkflowRuntimeServicesForTestV1();
+    const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-edit-avail-cli-nohost-"));
+    const ws = installWorkspaceFoldersStub([workspaceRoot]);
+    const cli = installCliFoundStub();
+    // eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/no-var-requires
+    const raw = require("vscode") as Record<string, unknown>;
+    const original = raw.LanguageModelToolResultPart;
+    delete raw.LanguageModelToolResultPart;
+    try {
+      const result = await checkEditActionAvailabilityV1({
+        workspaceFsPath: workspaceRoot,
+        stageModelId: "claude-cli:sonnet",
+        stage: "impl",
+      });
+      assert.equal(result.ok, true);
+    } finally {
+      raw.LanguageModelToolResultPart = original;
+      cli.restore();
+      ws.restore();
+      fs.rmSync(workspaceRoot, { recursive: true, force: true });
+    }
+  });
+
+  void it("fails as workspaceRootUnsupported for a path that is not an open workspace folder", async () => {
     resetWorkflowRuntimeServicesForTestV1();
     const stray = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-edit-avail-stray-"));
     const ws = installWorkspaceFoldersStub([]);
+    const copilot = installCopilotAvailableStub();
     try {
-      const result = checkEditActionAvailabilityV1({
+      const result = await checkEditActionAvailabilityV1({
         workspaceFsPath: stray,
         stageModelId: "copilot:gpt-5",
+        stage: "impl",
       });
       assert.equal(result.ok === false && result.code, "workspaceRootUnsupported");
     } finally {
+      copilot.restore();
       ws.restore();
       fs.rmSync(stray, { recursive: true, force: true });
     }
   });
 
-  void it("fails as hostToolApiUnavailable when the host lacks the tool-calling constructors, before any root check", () => {
+  void it("fails when the host lacks the tool-calling constructors, before any root check", async () => {
     resetWorkflowRuntimeServicesForTestV1();
     // eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/no-var-requires
     const raw = require("vscode") as Record<string, unknown>;
     const original = raw.LanguageModelToolResultPart;
     delete raw.LanguageModelToolResultPart;
     try {
-      const result = checkEditActionAvailabilityV1({
+      const result = await checkEditActionAvailabilityV1({
         workspaceFsPath: "C:\\not-checked",
         stageModelId: "copilot:gpt-5",
+        stage: "impl",
       });
-      assert.equal(result.ok === false && result.code, "hostToolApiUnavailable");
+      // checkImplementationAvailabilityForModel's own Copilot branch probes
+      // this same tool-calling capability internally and reports the missing
+      // constructor as a plain provider-unavailable result, so it now
+      // surfaces as providerModeUnavailable rather than this function's own
+      // (now largely redundant, but still correct) hostToolApiUnavailable
+      // check further down — which internal layer supplies the rejection
+      // code is not itself the contract; only that it rejects before any
+      // task/source read is (AC-HOST-03).
+      assert.equal(result.ok, false);
     } finally {
       raw.LanguageModelToolResultPart = original;
     }
@@ -130,6 +232,141 @@ void describe("runEditActionV1 — §7.5 availability", () => {
       assert.equal(failed.ok === false && failed.code, "hostToolApiUnavailable");
     } finally {
       raw.LanguageModelToolResultPart = original;
+    }
+  });
+
+  // Codex review finding (this round): checkEditActionProviderPathGateV1
+  // used to decide whether the host floor applied from the PRIMARY's kind
+  // alone. Since runImplementationOrSealedV1 can fall through a CLI primary
+  // to a Copilot backup, that left the actual host requirement unchecked
+  // until deep inside execution (after resolveTask and every artifact read
+  // this gate exists to precede) whenever the primary was CLI but the
+  // winning candidate turned out to be Copilot. This proves the gate now
+  // resolves the WINNING candidate (via checkImplementationAvailabilityForModel,
+  // same as runImplementationOrSealedV1 itself) and host-checks THAT one.
+  void it("host-checks the winning Copilot backup when the configured CLI primary is not installed", async () => {
+    const originalSpawn = childProcess.spawn;
+    childProcess.spawn = (() => {
+      const child = new EventEmitter() as import("node:child_process").ChildProcess;
+      // Every CLI existence probe (where.exe/which) reports "not installed" —
+      // the configured CLI primary must be unavailable so the gate is forced
+      // to fall through to the configured Copilot backup.
+      process.nextTick(() => child.emit("close", 1));
+      return child;
+    }) as typeof childProcess.spawn;
+    const lm = vscode.lm as unknown as { selectChatModels: () => Promise<vscode.LanguageModelChat[]> };
+    const originalSelectChatModels = lm.selectChatModels;
+    lm.selectChatModels = (): Promise<vscode.LanguageModelChat[]> =>
+      Promise.resolve([{ id: "auto", name: "Auto" } as unknown as vscode.LanguageModelChat]);
+    const settings = installModelSettings({
+      impl: { primary: "opencode-cli:default", backup: "auto", strategy: "switch-to-backup" },
+    });
+    try {
+      const ok = await checkEditActionProviderPathGateV1("impl");
+      assert.equal(ok.ok, true, "the Copilot backup is live and the host supports it, so the gate must pass");
+
+      // Removing the tool-calling constructor makes the winning Copilot
+      // backup itself unavailable (checkImplementationAvailabilityForModel's
+      // own Copilot branch probes the same capability) — either way, the
+      // gate must reject BEFORE any task/source read, which is the actual
+      // AC-HOST-03 property this fix protects; which of the two internal
+      // layers supplies the rejection code is not itself the contract.
+      // eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/no-var-requires
+      const raw = require("vscode") as Record<string, unknown>;
+      const original = raw.LanguageModelToolResultPart;
+      delete raw.LanguageModelToolResultPart;
+      try {
+        const failed = await checkEditActionProviderPathGateV1("impl");
+        assert.equal(
+          failed.ok,
+          false,
+          "the CLI primary being down must not mask the winning Copilot backup's own host incapability"
+        );
+      } finally {
+        raw.LanguageModelToolResultPart = original;
+      }
+    } finally {
+      settings.restore();
+      childProcess.spawn = originalSpawn;
+      lm.selectChatModels = originalSelectChatModels;
+    }
+  });
+
+  // Codex review finding (P2, 5th round): runImplementationOrSealedV1 used to
+  // decide its dispatch path from the PRIMARY's provider kind alone, so a
+  // Copilot-resolved primary always ran straight into the sealed pipeline —
+  // even when that primary was unavailable and a "switch-to-backup" CLI
+  // candidate was configured and live. That backup was reachable through
+  // checkEditActionProviderPathGateV1 (which the gate test above already
+  // covers) but never actually DISPATCHED to, since the gate and the
+  // dispatcher resolved the winning candidate independently. This proves the
+  // dispatcher itself now reaches the CLI backup.
+  void it("dispatches to the winning CLI backup when the configured Copilot primary is unavailable", async () => {
+    const originalAvailability = runnerRegistryModule.checkImplementationAvailabilityForModel;
+    const originalRun = runnerRegistryModule.runImplementationForModel;
+    let capturedRunOptions: Record<string, unknown> | undefined;
+    runnerRegistryModule.checkImplementationAvailabilityForModel = (): Promise<unknown> =>
+      Promise.resolve({
+        availability: { available: true },
+        providerLabel: "Claude Code",
+        provider: "claude-cli",
+        modelId: "claude-cli:sonnet",
+        nativeModelId: "sonnet",
+      });
+    runnerRegistryModule.runImplementationForModel = (...args: unknown[]): Promise<unknown> => {
+      capturedRunOptions = args[0] as Record<string, unknown>;
+      return Promise.resolve({
+        status: "completed",
+        filesChanged: ["a.ts"],
+        summary: "stub CLI backup run",
+        runnerId: "claude-cli",
+      });
+    };
+    try {
+      const result = await runImplementationOrSealedV1({
+        editActionKey: "implementation.v1",
+        modelId: "copilot:gpt-5",
+        prompt: "do the thing",
+        workspaceUri: vscode.Uri.file("C:\\not-checked"),
+        token: new vscode.CancellationTokenSource().token,
+        onProgress: () => {},
+        stage: "impl",
+      });
+      assert.equal(result.status, "completed");
+      assert.equal(result.runnerId, "claude-cli");
+      assert.ok(capturedRunOptions, "runImplementationForModel must have been called");
+      assert.equal(capturedRunOptions?.modelId, "claude-cli:sonnet");
+      assert.equal(capturedRunOptions?.allowCrossProviderBackups, false);
+      // Codex review findings (P2, this round): configuredPrimaryModelId
+      // must be the ORIGINAL (Copilot) options.modelId, not the CLI winning
+      // candidate — see runnerRegistry.ts's own header for why that's what
+      // lets a direct success on this backup be recorded as the active
+      // fallback. runCrossProviderBackup must be wired so a RUNTIME failure
+      // on this CLI backup can still reach a further Copilot backup through
+      // the sealed pipeline instead of runImplementationForModel's own
+      // unsealed cascade.
+      assert.equal(capturedRunOptions?.configuredPrimaryModelId, "copilot:gpt-5");
+      const runCrossProviderBackup = capturedRunOptions?.runCrossProviderBackup as
+        | ((modelId: string) => Promise<unknown>)
+        | undefined;
+      assert.equal(typeof runCrossProviderBackup, "function");
+      // Invoking it should reach the REAL runSealedImplementationV1 (this
+      // module's own Copilot pipeline), not loop back into
+      // runImplementationForModel again — proven by the distinct failure
+      // shape only that pipeline's own early gate produces (no LM model
+      // configured in this test's environment, so checkEditActionAvailabilityV1
+      // rejects before any task/source read, exactly as a fresh Copilot
+      // dispatch would).
+      const crossProviderResult = (await runCrossProviderBackup!("copilot:some-backup")) as {
+        status: string;
+        failureKind?: string;
+        runnerId: string;
+      };
+      assert.equal(crossProviderResult.status, "failed");
+      assert.equal(crossProviderResult.runnerId, "copilot-lm");
+    } finally {
+      runnerRegistryModule.checkImplementationAvailabilityForModel = originalAvailability;
+      runnerRegistryModule.runImplementationForModel = originalRun;
     }
   });
 });

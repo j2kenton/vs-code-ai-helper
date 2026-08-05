@@ -893,6 +893,8 @@ void describe("runImplementationForModel", () => {
         onProgress: () => undefined,
         stage: "impl",
         taskFolderUri,
+        correlation: { actionKey: "implementation.v1" },
+        allowCrossProviderBackups: true,
       });
 
       assert.strictEqual(result.runnerId, "copilot-lm");
@@ -983,9 +985,12 @@ void describe("runImplementationForModel", () => {
         onProgress: () => undefined,
         stage: "impl" as const,
         taskFolderUri,
+        // deliberately no `correlation` — this test proves an uncorrelated
+        // call is rejected, so it must violate that required field.
       };
 
       await assert.rejects(
+        // @ts-expect-error — deliberately uncorrelated request under test
         runImplementationForModel(baseRequest),
         LegacyAiActionSafetyGateErrorV0
       );
@@ -1115,6 +1120,8 @@ void describe("runImplementationForModel", () => {
         prompt: "Implement the requested change.",
         workspaceUri: vscode.Uri.file(taskFolder),
         token: new vscode.CancellationTokenSource().token,
+        correlation: { actionKey: "implementation.v1" },
+        allowCrossProviderBackups: true,
         onProgress: () => undefined,
         stage: "impl",
         taskFolderUri,
@@ -1285,6 +1292,8 @@ void describe("runImplementationForModel", () => {
           workspaceUri: taskFolderUri,
           token: new vscode.CancellationTokenSource().token,
           onProgress: () => undefined,
+          correlation: { actionKey: "implementation.v1" },
+          allowCrossProviderBackups: true,
           stage: "impl",
           taskFolderUri,
         });
@@ -1296,6 +1305,142 @@ void describe("runImplementationForModel", () => {
           false,
           "the backup must never be attempted for an auth failure, regardless of what the bare error text says"
         );
+        assert.deepStrictEqual(spawnedCommands, ["opencode"]);
+      } finally {
+        settings.restore();
+      }
+    } finally {
+      childProcess.spawn = originalSpawn;
+      lm.selectChatModels = originalSelectChatModels;
+      workspace.fs.readFile = originalReadFile;
+      workspace.fs.writeFile = originalWriteFile;
+      fs.rmSync(metaRoot, { recursive: true, force: true });
+    }
+  });
+
+  // Codex review finding (P1): runImplementationOrSealedV1's CLI branch
+  // (runEditActionV1.ts) calls this function specifically so a CLI-resolved
+  // model never joins the sealed pipeline — but runImplementationForModel's
+  // OWN backup cascade could still silently hand off to a configured Copilot
+  // backup via runImplementationWithCopilot (the older, unsealed Copilot
+  // runner), bypassing runSealedImplementationV1's host gate/preflight/
+  // receipts entirely for that backup attempt. allowCrossProviderBackups:
+  // false must keep the cascade from ever crossing from a CLI primary to a
+  // Copilot backup, unlike the sibling test above (which asserts the SAME
+  // "must not reach the backup" outcome, but for a wholly different reason —
+  // an authentication failure, which never cascades regardless of kind).
+  void it("does not cross from a CLI primary to a Copilot backup when allowCrossProviderBackups is false", async () => {
+    const originalSpawn = childProcess.spawn;
+    const spawnedCommands: string[] = [];
+
+    childProcess.spawn = ((command: string) => {
+      const child = new EventEmitter() as import("node:child_process").ChildProcess;
+      Object.defineProperty(child, "pid", { value: 4322 });
+      child.stdout = new EventEmitter() as import("node:child_process").ChildProcess["stdout"];
+      child.stderr = new EventEmitter() as import("node:child_process").ChildProcess["stderr"];
+      child.stdin = Object.assign(new EventEmitter(), {
+        write: () => true,
+        end: () => undefined,
+      }) as unknown as import("node:child_process").ChildProcess["stdin"];
+
+      if (/^(which|where\.exe)$/.test(command)) {
+        process.nextTick(() => child.emit("close", 0));
+        return child;
+      }
+
+      spawnedCommands.push(command);
+      process.nextTick(() => {
+        child.stdout?.emit(
+          "data",
+          Buffer.from(
+            `${JSON.stringify({
+              type: "error",
+              error: {
+                name: "APIError",
+                data: { message: "Rate limit exceeded, try again later." },
+              },
+            })}\n`
+          )
+        );
+        child.emit("close", 1);
+      });
+      return child;
+    }) as typeof childProcess.spawn;
+
+    const lm = lmStub();
+    const originalSelectChatModels = lm.selectChatModels;
+    let backupAttempted = false;
+    lm.selectChatModels = (): Promise<vscode.LanguageModelChat[]> =>
+      Promise.resolve([
+        {
+          id: "auto",
+          name: "Auto",
+          sendRequest: () => {
+            backupAttempted = true;
+            return Promise.reject(new Error("must not be reached"));
+          },
+        } as unknown as vscode.LanguageModelChat,
+      ]);
+
+    const workspace = vscode.workspace as unknown as {
+      fs: {
+        readFile: (uri: vscode.Uri) => Promise<Uint8Array>;
+        writeFile: (uri: vscode.Uri, bytes: Uint8Array) => Promise<void>;
+      };
+    };
+    const originalReadFile = workspace.fs.readFile;
+    const originalWriteFile = workspace.fs.writeFile;
+    workspace.fs.readFile = (uri: vscode.Uri): Promise<Uint8Array> =>
+      fs.promises.readFile(uri.fsPath);
+    workspace.fs.writeFile = (uri: vscode.Uri, bytes: Uint8Array): Promise<void> =>
+      fs.promises.writeFile(uri.fsPath, bytes);
+
+    const metaRoot = fs.mkdtempSync(
+      path.join(os.tmpdir(), "ensemble-impl-cross-provider-gate-")
+    );
+    const taskFolder = path.join(metaRoot, "tasks", "task-a");
+    fs.mkdirSync(taskFolder, { recursive: true });
+    const taskFolderUri = vscode.Uri.file(taskFolder);
+    childProcess.execSync("git init", { cwd: taskFolder, stdio: "ignore" });
+    const now = new Date().toISOString();
+    fs.writeFileSync(
+      path.join(taskFolder, "task-progress.json"),
+      JSON.stringify(
+        { taskFolder: "task-a", currentStage: "impl", status: "active", createdAt: now, updatedAt: now },
+        null,
+        2
+      ),
+      "utf8"
+    );
+
+    try {
+      const settings = installModelSettings({
+        impl: {
+          primary: "opencode-cli:default",
+          backup: "auto",
+          strategy: "switch-to-backup",
+        },
+      });
+      try {
+        const result = await runImplementationForModel({
+          modelId: "opencode-cli:default",
+          prompt: "Implement the requested change.",
+          workspaceUri: taskFolderUri,
+          token: new vscode.CancellationTokenSource().token,
+          onProgress: () => undefined,
+          correlation: { actionKey: "implementation.v1" },
+          allowCrossProviderBackups: false,
+          stage: "impl",
+          taskFolderUri,
+        });
+
+        assert.strictEqual(
+          backupAttempted,
+          false,
+          "a CLI primary must never fail over to a Copilot backup when allowCrossProviderBackups is false"
+        );
+        assert.strictEqual(result.status, "failed");
+        assert.strictEqual(result.runnerId, "opencode-cli");
         assert.deepStrictEqual(spawnedCommands, ["opencode"]);
       } finally {
         settings.restore();
@@ -1424,6 +1569,8 @@ void describe("runImplementationForModel", () => {
           workspaceUri: taskFolderUri,
           token: new vscode.CancellationTokenSource().token,
           onProgress: () => undefined,
+          correlation: { actionKey: "implementation.v1" },
+          allowCrossProviderBackups: true,
           stage: "impl",
           taskFolderUri,
         });
@@ -1459,6 +1606,146 @@ void describe("runImplementationForModel", () => {
     }
   });
 
+  // Codex review finding (P1): the sibling test above proves the dirty-tree
+  // gate blocks the FIRST cascade hop (primary -> backup #1) when the
+  // PRIMARY leaves a mutated tree. It does not prove the same gate applies
+  // BETWEEN backups: backup #1 can itself write a file and then fail with
+  // its own cascadable (quota/temporarily-unavailable) error, and nothing
+  // previously stopped the loop from dispatching backup #2 against that now
+  // half-edited tree. Three distinct CLI commands (opencode, cline, codex)
+  // so each stage of the cascade is unambiguously attributable.
+  void it("does not cross from a CLI backup to a further backup once that backup itself mutates the tree", async () => {
+    const originalSpawn = childProcess.spawn;
+    const spawnedCommands: string[] = [];
+
+    const metaRoot = fs.mkdtempSync(
+      path.join(os.tmpdir(), "ensemble-impl-backup-to-backup-dirty-gate-")
+    );
+    const taskFolder = path.join(metaRoot, "tasks", "task-a");
+    fs.mkdirSync(taskFolder, { recursive: true });
+    const taskFolderUri = vscode.Uri.file(taskFolder);
+    childProcess.execSync("git init", { cwd: taskFolder, stdio: "ignore" });
+    const mutatedFile = path.join(taskFolder, "mutated-by-backup-one.txt");
+
+    childProcess.spawn = ((command: string) => {
+      const child = new EventEmitter() as import("node:child_process").ChildProcess;
+      Object.defineProperty(child, "pid", { value: 6001 });
+      child.stdout = new EventEmitter() as import("node:child_process").ChildProcess["stdout"];
+      child.stderr = new EventEmitter() as import("node:child_process").ChildProcess["stderr"];
+      child.stdin = Object.assign(new EventEmitter(), {
+        write: () => true,
+        end: () => undefined,
+      }) as unknown as import("node:child_process").ChildProcess["stdin"];
+
+      if (/^(which|where\.exe)$/.test(command)) {
+        process.nextTick(() => child.emit("close", 0));
+        return child;
+      }
+
+      spawnedCommands.push(command);
+      if (command === "opencode") {
+        // Primary: a clean, cascadable failure (no file write) — the
+        // cascade must legitimately start.
+        process.nextTick(() => {
+          child.stdout?.emit(
+            "data",
+            Buffer.from(
+              `${JSON.stringify({
+                type: "error",
+                error: { name: "APIError", data: { message: "service temporarily unavailable" } },
+              })}\n`
+            )
+          );
+          child.emit("close", 1);
+        });
+        return child;
+      }
+      if (command === "cline") {
+        // Backup #1: writes a real file, THEN reports its own cascadable
+        // failure — the exact shape the dirty-tree gate must now catch
+        // between backups, not only at the primary.
+        process.nextTick(() => {
+          fs.writeFileSync(mutatedFile, "partial edit from backup #1 that then failed");
+          child.stdout?.emit(
+            "data",
+            Buffer.from(`${JSON.stringify({ type: "error", message: "service temporarily unavailable" })}\n`)
+          );
+          child.emit("close", 1);
+        });
+        return child;
+      }
+      // Backup #2 (codex): must never be reached.
+      process.nextTick(() => child.emit("close", 1));
+      return child;
+    }) as typeof childProcess.spawn;
+
+    const workspace = vscode.workspace as unknown as {
+      fs: {
+        readFile: (uri: vscode.Uri) => Promise<Uint8Array>;
+        writeFile: (uri: vscode.Uri, bytes: Uint8Array) => Promise<void>;
+      };
+    };
+    const originalReadFile = workspace.fs.readFile;
+    const originalWriteFile = workspace.fs.writeFile;
+    workspace.fs.readFile = (uri: vscode.Uri): Promise<Uint8Array> =>
+      fs.promises.readFile(uri.fsPath);
+    workspace.fs.writeFile = (uri: vscode.Uri, bytes: Uint8Array): Promise<void> =>
+      fs.promises.writeFile(uri.fsPath, bytes);
+
+    const now = new Date().toISOString();
+    fs.writeFileSync(
+      path.join(taskFolder, "task-progress.json"),
+      JSON.stringify(
+        { taskFolder: "task-a", currentStage: "impl", status: "active", createdAt: now, updatedAt: now },
+        null,
+        2
+      ),
+      "utf8"
+    );
+
+    try {
+      const settings = installModelSettings({
+        impl: {
+          primary: "opencode-cli:default",
+          backups: ["cline-cli:default", "codex-cli:default"],
+          strategy: "switch-to-backup",
+        },
+      });
+      try {
+        const result = await runImplementationForModel({
+          modelId: "opencode-cli:default",
+          prompt: "Implement the requested change.",
+          workspaceUri: taskFolderUri,
+          token: new vscode.CancellationTokenSource().token,
+          onProgress: () => undefined,
+          correlation: { actionKey: "implementation.v1" },
+          allowCrossProviderBackups: true,
+          stage: "impl",
+          taskFolderUri,
+        });
+
+        assert.deepStrictEqual(
+          spawnedCommands,
+          ["opencode", "cline"],
+          "codex (backup #2) must never be dispatched once backup #1 (cline) itself left the tree dirty"
+        );
+        assert.strictEqual(result.status, "failed");
+        assert.strictEqual(result.failureKind, "temporarily-unavailable");
+        assert.ok(
+          result.filesChanged.includes("mutated-by-backup-one.txt"),
+          "expected backup #1's own file write to be detected and reported"
+        );
+      } finally {
+        settings.restore();
+      }
+    } finally {
+      childProcess.spawn = originalSpawn;
+      workspace.fs.readFile = originalReadFile;
+      workspace.fs.writeFile = originalWriteFile;
+      fs.rmSync(metaRoot, { recursive: true, force: true });
+    }
+  });
+
   void it("keeps provider-qualified CLI model IDs on the CLI implementation path", async () => {
     const originalSpawn = childProcess.spawn;
     const spawnCalls: Array<{ command: string; args: readonly string[] }> = [];
@@ -1485,6 +1772,8 @@ void describe("runImplementationForModel", () => {
         workspaceUri: vscode.Uri.file(process.cwd()),
         token: tokenSource.token,
         onProgress: () => undefined,
+        correlation: { actionKey: "implementation.v1" },
+        allowCrossProviderBackups: true,
         stage: "impl",
         taskFolderUri: vscode.Uri.file(process.cwd()),
       });

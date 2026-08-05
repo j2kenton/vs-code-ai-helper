@@ -89,10 +89,11 @@ function isModelProviderDisabled(modelId: string | undefined): boolean {
 }
 
 /**
- * Exported for `runEditActionV1.ts`'s §7.5 availability check ("at least
- * one selected-provider path supporting request-local tools"): the stage's
- * stored model must resolve to a Copilot path before an edit action may
- * begin any task or source read.
+ * Also exported for `runEditActionV1.ts`'s §7.5 availability checks and
+ * `runImplementationOrSealedV1`'s routing decision: an edit-capable action's
+ * stage model must resolve to SOME runnable path before the action may
+ * begin any task or source read — Copilot's sealed pipeline, or a CLI
+ * provider's own direct edit-mode invocation.
  */
 export function resolveEffectiveProvider(
   modelId: string | undefined
@@ -654,6 +655,71 @@ export async function runImplementationForModel(options: {
   requireFileChange?: boolean;
   onBusyDetail?: (detail: string | undefined) => void;
   onWaitingForUser?: (waiting: boolean) => void;
+  /**
+   * V1 correlation for `assertNoUnauthorizedV1CorrelationV0` below — REQUIRED
+   * (no default) so every caller states its intent explicitly, matching the
+   * removed isImplementationV1Bootstrap field's own rationale. `actionKey`
+   * must be one of MIGRATED_ACTION_KEYS_V0's edit-cohort keys
+   * (implementation.v1/fastForward.v1/applyReviewEdit.v1/lint.v1); this
+   * function reads nothing else off it — there is no coordinator lease or
+   * receipt at this call site to attach a full ActionCorrelationV1 to, since
+   * the CLI edit path this feeds has none of that machinery.
+   */
+  correlation: { readonly actionKey: string };
+  /**
+   * REQUIRED (no default). When false, a configured backup whose effective
+   * provider kind differs from the PRIMARY's is treated as unavailable and
+   * skipped by THIS function's own direct dispatch (the `run` closure below)
+   * — it never silently crosses from one runner kind to another itself. This
+   * matters because the two kinds have categorically different safety
+   * properties: a CLI provider's edit mode is a blunt, extension-unmediated
+   * workspace-wide write grant, while Copilot's callers outside this
+   * function route through the sealed two-phase pipeline
+   * (runSealedImplementationV1 in runEditActionV1.ts) with its own
+   * preflight/receipts/host-floor gate. Dispatching a Copilot backup through
+   * `run` below — runImplementationWithCopilot, the older, unsealed Copilot
+   * runner — would silently bypass every one of the sealed pipeline's
+   * guarantees. Pass true only for a caller that has no such distinction to
+   * protect (e.g. a primary that is itself Copilot falling back to another
+   * Copilot model). A caller that DOES need a cross-kind backup reachable
+   * (runImplementationOrSealedV1, whose own top-level dispatch already knows
+   * how to run a Copilot candidate safely) should instead pass
+   * `runCrossProviderBackup` and leave this false — see that option.
+   */
+  allowCrossProviderBackups: boolean;
+  /**
+   * Optional safe cross-provider handoff (Codex review finding: a CLI
+   * primary that passes its pre-run availability probe but then fails at
+   * RUNTIME with a quota/temporarily-unavailable error had no way to reach a
+   * configured Copilot backup — `allowCrossProviderBackups: false` correctly
+   * blocks this cascade's own unsealed `run` dispatch from crossing to it,
+   * but the caller never got a chance to route that backup through the
+   * sealed pipeline instead, so `switch-to-backup` silently did nothing for
+   * a runtime failure even though it already worked for a pre-run
+   * unavailable-primary failure via runImplementationOrSealedV1's own
+   * top-level resolution). When set, a backup whose kind differs from the
+   * primary's is no longer skipped outright: this callback is invoked with
+   * its modelId INSTEAD of the unsafe `run` dispatch, and its result flows
+   * through the exact same quota-observation/sticky-fallback/dirty-tree-gate
+   * bookkeeping as any same-kind backup. An unresolvable backup modelId is
+   * still always skipped, regardless of this callback, exactly as before.
+   */
+  runCrossProviderBackup?: (modelId: string) => Promise<ImplementationRunResult & { runnerId: string }>;
+  /**
+   * The stage's TRUE globally-configured primary, when `modelId` above is
+   * actually a pre-resolved WINNING candidate rather than that primary
+   * itself (Codex review finding: runImplementationOrSealedV1 pre-resolves
+   * the winning candidate — the primary if live, else the first available
+   * configured backup — via checkImplementationAvailabilityForModel, then
+   * dispatches straight to it as this function's `modelId`; a direct,
+   * first-try success on that candidate previously went unrecorded, since
+   * this function's own recordActiveFallbackModel call only fires from
+   * inside its OWN internal backup loop below, never for its own top-level
+   * `modelId` succeeding directly). Omit when `modelId` already IS the true
+   * primary (every other caller) — this only activates the check below when
+   * explicitly given a value that differs from `modelId`.
+   */
+  configuredPrimaryModelId?: string;
 }): Promise<ImplementationRunResult & { runnerId: string }> {
   assertNoUnauthorizedV1CorrelationV0(options);
   const effective = resolveEffectiveProvider(options.modelId);
@@ -689,6 +755,24 @@ export async function runImplementationForModel(options: {
   if (options.stage) {
     recordQuotaObservation(options.stage, options.modelId, result.failureKind, result.errorMessage);
   }
+  // Codex review finding: a pre-resolved winning candidate (passed as
+  // `modelId` above, differing from the stage's true `configuredPrimaryModelId`)
+  // that succeeds on this direct, first-try attempt was never recorded as the
+  // active fallback — only a candidate discovered by THIS function's OWN
+  // internal backup loop below gets that treatment. Without this, a later
+  // Fast Forward iteration passing preserveActiveFallback re-resolves the
+  // stage's raw configured primary instead of sticking with the
+  // known-working backup this run just proved out.
+  if (
+    result.status === "completed" &&
+    options.taskFolderUri &&
+    options.stage &&
+    options.modelId !== undefined &&
+    options.configuredPrimaryModelId !== undefined &&
+    options.configuredPrimaryModelId !== options.modelId
+  ) {
+    await recordActiveFallbackModel(options.taskFolderUri, options.stage, options.modelId);
+  }
   const setting = getModelSettings()[options.stage as keyof ReturnType<typeof getModelSettings>];
   // Prefer the provider's own pre-hint verdict; fall back to the regex over the
   // pre-hint diagnostic text, and only then over errorMessage. The layering is
@@ -707,25 +791,26 @@ export async function runImplementationForModel(options: {
   const authFailure =
     result.authFailure === true ||
     isAuthenticationFailure(result.authDiagnosticText ?? result.errorMessage);
-  // A failed primary run may already have written partial changes before it
-  // failed (a timeout on a provider whose CLI keeps writing right up to the
-  // kill, e.g. Cline/Antigravity's unenforced text/edit modes — or, less
-  // likely but still possible on any provider, a mid-run failure after some
-  // tool calls already landed). filesChanged/filesChangedUnknown are already
-  // computed by runImplementationWithCli's before/after git snapshot for
-  // exactly this purpose (see its own doc comment) but were previously never
-  // consulted here — this cascade dispatched a DIFFERENT model at the
-  // current, possibly half-edited working tree the moment failureKind alone
-  // said quota/temporarily-unavailable, with no dirty-tree gate at all
-  // (unlike the same-model retry path in runImplementationWithCli, which
-  // already refuses to retry without a clean git snapshot). Treat "unknown"
-  // (git unavailable / not a repository) the same as "dirty" — genuinely not
-  // knowing is not evidence of safety. Copilot's runner has its own tool-path
-  // boundary rather than a git snapshot, but still always reports a real
-  // filesChanged array (see ImplementationRunResult), so this check applies
-  // uniformly to every runner kind, not just CLI providers.
-  const primaryLeftTreeClean =
-    result.filesChangedUnknown !== true && result.filesChanged.length === 0;
+  // A failed run may already have written partial changes before it failed
+  // (a timeout on a provider whose CLI keeps writing right up to the kill,
+  // e.g. Cline/Antigravity's unenforced text/edit modes — or, less likely but
+  // still possible on any provider, a mid-run failure after some tool calls
+  // already landed). filesChanged/filesChangedUnknown are already computed by
+  // runImplementationWithCli's before/after git snapshot for exactly this
+  // purpose (see its own doc comment) but were previously never consulted
+  // here — this cascade dispatched a DIFFERENT model at the current, possibly
+  // half-edited working tree the moment failureKind alone said quota/
+  // temporarily-unavailable, with no dirty-tree gate at all (unlike the
+  // same-model retry path in runImplementationWithCli, which already refuses
+  // to retry without a clean git snapshot). Treat "unknown" (git unavailable
+  // / not a repository) the same as "dirty" — genuinely not knowing is not
+  // evidence of safety. Copilot's runner has its own tool-path boundary
+  // rather than a git snapshot, but still always reports a real filesChanged
+  // array (see ImplementationRunResult), so this check applies uniformly to
+  // every runner kind, not just CLI providers.
+  const leftTreeCleanV1 = (r: ImplementationRunResult): boolean =>
+    r.filesChangedUnknown !== true && r.filesChanged.length === 0;
+  const primaryLeftTreeClean = leftTreeCleanV1(result);
   if (
     !authFailure &&
     primaryLeftTreeClean &&
@@ -748,6 +833,31 @@ export async function runImplementationForModel(options: {
       if (backupModel === options.modelId) {
         continue;
       }
+      let useCrossProviderBackup = false;
+      if (!options.allowCrossProviderBackups) {
+        let backupKind: "cli" | "copilot" | undefined;
+        try {
+          backupKind = resolveEffectiveProvider(backupModel).kind;
+        } catch {
+          // Unresolvable — the availability check just below rejects it too;
+          // treat as skip either way rather than crossing provider kinds.
+        }
+        if (backupKind !== effective.kind) {
+          // Codex review finding: previously always skipped here, so a
+          // primary that passed its pre-run probe but then failed at RUNTIME
+          // (quota/temporarily-unavailable) could never reach a
+          // cross-provider-kind backup even with switch-to-backup configured
+          // — runCrossProviderBackup (when the caller supplied one) is the
+          // sanctioned way to still reach it, through that caller's own safe
+          // dispatch instead of this cascade's unsealed `run` below. An
+          // unresolvable backupKind (undefined) still always skips,
+          // regardless, matching the pre-existing comment above.
+          if (!options.runCrossProviderBackup || backupKind === undefined) {
+            continue;
+          }
+          useCrossProviderBackup = true;
+        }
+      }
       const fallbackAvailability =
         await checkImplementationAvailabilityForModel(backupModel);
       if (!fallbackAvailability.availability.available) {
@@ -766,7 +876,9 @@ export async function runImplementationForModel(options: {
         }
         continue;
       }
-      const fallbackResult = await run(resolveEffectiveProvider(backupModel));
+      const fallbackResult = useCrossProviderBackup
+        ? await options.runCrossProviderBackup!(backupModel)
+        : await run(resolveEffectiveProvider(backupModel));
       recordQuotaObservation(options.stage, backupModel, fallbackResult.failureKind, fallbackResult.errorMessage);
       if (fallbackResult.status === "completed") {
         await recordActiveFallbackModel(
@@ -784,6 +896,18 @@ export async function runImplementationForModel(options: {
         (fallbackResult.failureKind !== "quota" &&
           fallbackResult.failureKind !== "temporarily-unavailable")
       ) {
+        await releaseReservation();
+        return fallbackResult;
+      }
+      // Codex review finding (P1): this backup's own failure is cascadable
+      // by failureKind alone, but the SAME dirty-tree gate applied to the
+      // primary above was never re-applied here — a backup that writes
+      // partial changes before hitting its own transient quota error would
+      // let a THIRD candidate run against that now half-edited (or unknown)
+      // tree with no awareness of it. Stop the cascade the moment any
+      // attempt — primary or backup — may have mutated the workspace,
+      // exactly as the primary's own gate does.
+      if (!leftTreeCleanV1(fallbackResult)) {
         await releaseReservation();
         return fallbackResult;
       }

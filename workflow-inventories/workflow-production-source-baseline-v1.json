@@ -3,7 +3,7 @@
   "generatedBy": "scripts/resolveProductionSourceUniverse.mjs",
   "description": "Production source universe as of the current working tree, resolved from the exact bundler options that produce dist/extension.js (esbuild.config.js) plus the contribution-asset and runtime-resource-copy rules in scripts/lib/productionSourceScan.mjs. Regenerated every run; diffed against the immutable pre-gate snapshot (workflow-production-source-pregate-v1.json), not authoritative on its own.",
   "packageName": "vs-code-ai-helper",
-  "packageVersion": "0.72.1",
+  "packageVersion": "0.73.0",
   "declaredMain": "./dist/extension.js",
   "entrypoint": "src/extension.ts",
   "outfile": "dist/extension.js",
@@ -128,7 +128,7 @@
     },
     {
       "path": "src/commands/fastForwardCurrentTaskReview.ts",
-      "sha256": "b750ea6707d57bdc35d2ebe57fcc60c00abdd6e671436698d2d93adb17d87dbe"
+      "sha256": "ed9e4e23b54a2df214aa71431a38ff74cc7aad10f1acd341114027c86b7d3706"
     },
     {
       "path": "src/commands/generatePlanWithAI.ts",
@@ -164,7 +164,7 @@
     },
     {
       "path": "src/commands/reviewActions.ts",
-      "sha256": "63e3371fb987dec9945be6407a80cea781f26dca648c1a17475caf179d5854b5"
+      "sha256": "a1416596d29ee2ce734ca8e8a81e8d563d3f490f9878efbde165576ca819c50c"
     },
     {
       "path": "src/commands/reviewCurrentTask.ts",
@@ -172,11 +172,11 @@
     },
     {
       "path": "src/commands/runEditActionV1.ts",
-      "sha256": "07e252e83fc145cc4c77d0cad29b56d767b8a0f64f135555d548404b8acd268b"
+      "sha256": "4544aa353c5b111b523d02e2f1b7e2e8ae7d538f917945bef60b2d2e792af4ab"
     },
     {
       "path": "src/commands/runLintingFixes.ts",
-      "sha256": "a66420e1fbdf84454598d4d646415d053a5dfb548e655122635e4da5b9e92c04"
+      "sha256": "8f3c872532f0530dc0bb4a798bf45d915e087f09c4d6d956cbbf98174ac9e814"
     },
     {
       "path": "src/commands/runPublishChecks.ts",
@@ -252,7 +252,7 @@
     },
     {
       "path": "src/runners/runnerRegistry.ts",
-      "sha256": "f641edefa03c1cf1fe0ad5dd7268e4027f97300d338092db2ac351a56d3fa734"
+      "sha256": "220485caa21888cc7b96f7206b37d0cc5de09162f9d5be1931815eebacc15de6"
     },
     {
       "path": "src/services/agentExecutionBrokerV1.ts",

@@ -53,12 +53,12 @@ import {
   describeTaskActionFailureV1,
   describeTaskActionOutcomeForLogV1,
 } from "../utils/taskActionOutcomeTextV1";
-import { checkImplementationAvailabilityForModel } from "../runners/runnerRegistry";
+import { checkImplementationAvailabilityForModel, resolveEffectiveProvider } from "../runners/runnerRegistry";
 import {
   checkEditActionAvailabilityV1,
   checkEditActionHostGateV1,
   checkEditActionProviderPathGateV1,
-  runSealedImplementationV1,
+  runImplementationOrSealedV1,
 } from "./runEditActionV1";
 import {
   ResolvedStageModel,
@@ -897,7 +897,7 @@ function artifactUri(
  * Check if the workspace is inside a git repository.
  * Returns true when git is available and the path is inside a repo.
  */
-async function isGitWorkspace(cwd: string): Promise<boolean> {
+export async function isGitWorkspace(cwd: string): Promise<boolean> {
   return new Promise((resolve) => {
     cp.execFile(
       "git",
@@ -913,7 +913,7 @@ async function isGitWorkspace(cwd: string): Promise<boolean> {
  * Task metadata and files recorded by earlier implementation runs are related
  * work, so they must not trigger the pre-run warning.
  */
-async function getUnrelatedWorkspaceChanges(
+export async function getUnrelatedWorkspaceChanges(
   cwd: string,
   taskFolderUri: vscode.Uri
 ): Promise<string[]> {
@@ -2576,14 +2576,17 @@ export async function fastForwardReviewWithAI(
   chatViewProvider?: ChatViewProvider
 ): Promise<void> {
   assertLegacyAiRouteAllowedV0("fastForward.v1");
-  // §7.5 host+provider gate (AC-HOST-03): both checks are pure/zero-I/O —
-  // checkEditActionHostGateV1 reads only `vscode.version` and probes the
-  // host API shape; checkEditActionProviderPathGateV1 reads only global
-  // model settings (see their own headers in runEditActionV1.ts) — neither
-  // touches TaskInventory, current-task state, or any per-task file. Calling
-  // them here, unconditionally, is the first thing this function does after
-  // the legacy-route gate — strictly before ANY task or source read,
-  // including an in-memory TaskInventory lookup.
+  // §7.5 provider-path gate (AC-HOST-03): task/model-INDEPENDENT — it never
+  // touches TaskInventory, current-task state, or any per-task file — but
+  // it is NOT zero-I/O: it resolves the impl stage's WINNING candidate via
+  // checkImplementationAvailabilityForModel (a CLI existence probe, or a
+  // Copilot model-list probe, to correctly fall through a down CLI primary
+  // to a configured backup) and, only when that candidate is Copilot,
+  // additionally probes the host API shape (see checkEditActionProviderPathGateV1's
+  // own header in runEditActionV1.ts). Calling it here, unconditionally, is
+  // the first thing this function does after the legacy-route gate —
+  // strictly before ANY task or source read, including an in-memory
+  // TaskInventory lookup.
   //
   // Fast Forward's apply loop only reaches the edit-capable branch
   // (applyReviewEditWithAI's edit branch) when the target review is an
@@ -2604,14 +2607,23 @@ export async function fastForwardReviewWithAI(
   // ambiguous invocation. Only an invocation zero-I/O already proves is
   // plan-review-only (`fastForwardTargetsImplReviewV1(arg) === false`) skips
   // this gate, since it can never reach the edit-capable branch.
-  const earlyHostGate = checkEditActionHostGateV1();
-  const earlyProviderPathGate = checkEditActionProviderPathGateV1("impl");
+  // Declared outside the block below so the IMPL_REVIEW_STAGES branch further
+  // down can reuse this exact result instead of probing a second time. NOT
+  // guaranteed assigned by the time that branch runs: `resolveTask` below
+  // always re-reads progress from disk, so a stale caller-supplied
+  // `arg.task.progress` that made `knownTargetsImplReview === false` here can
+  // still land on an implementation-review targetStage there — that branch
+  // computes the gate on demand when this stays undefined (see its comment).
+  let earlyProviderPathGate: Awaited<ReturnType<typeof checkEditActionProviderPathGateV1>> | undefined;
   let knownTargetsImplReview = fastForwardTargetsImplReviewV1(arg);
   if (knownTargetsImplReview !== false) {
-    if (!earlyHostGate.ok) {
-      NotificationRouter.showWarning(earlyHostGate.reason);
-      return;
-    }
+    // The gate itself now does real I/O (a CLI existence probe or Copilot
+    // model-list probe, to resolve the winning candidate through a possible
+    // backup — see checkEditActionProviderPathGateV1's header), so it is
+    // called here, inside this branch, rather than unconditionally above —
+    // a plan-review-only invocation (knownTargetsImplReview === false) never
+    // needs it and must not pay for it.
+    earlyProviderPathGate = await checkEditActionProviderPathGateV1("impl");
     if (!earlyProviderPathGate.ok) {
       NotificationRouter.showWarning(earlyProviderPathGate.reason);
       return;
@@ -2706,20 +2718,26 @@ export async function fastForwardReviewWithAI(
   // before the review-content read below and before the initial-review run
   // further down — mirroring runImplementationWithAI's placement.
   if (IMPL_REVIEW_STAGES.includes(targetStage)) {
-    // Enforce the coarse host/provider result computed at the very top of
+    // Enforce the coarse provider-path result computed at the very top of
     // fastForwardReviewWithAI — before resolveTask's read — FIRST, so a
     // bare/path-only/ambiguous invocation whose target only became known to
     // be an implementation review just now (via resolveTask, not via a
     // cache) still rejects without the further resolveOwnerWorkspace /
-    // resolveFreshModelForStage reads below. No new check runs here; this
-    // just applies the already-computed result at the earliest point its
-    // relevance is known.
-    if (!earlyHostGate.ok) {
-      NotificationRouter.showWarning(earlyHostGate.reason);
-      return;
-    }
-    if (!earlyProviderPathGate.ok) {
-      NotificationRouter.showWarning(earlyProviderPathGate.reason);
+    // resolveFreshModelForStage reads below.
+    // Codex review finding (P2): earlyProviderPathGate is NOT always assigned
+    // here. `knownTargetsImplReview` can be `false` from a caller-supplied
+    // `arg.task.progress` that says the target is a plan review (skipping the
+    // gate above entirely, by design — a genuinely plan-review-only
+    // invocation must never pay for it), yet `resolveTask` above always
+    // re-reads progress from disk rather than trusting that cached snapshot.
+    // If the task advanced to an implementation-review stage between when
+    // the caller's cached arg was captured and this fresh read, targetStage
+    // lands here anyway with earlyProviderPathGate still undefined — compute
+    // it now instead of asserting a guarantee that stale cached input can
+    // violate.
+    const providerPathGate = earlyProviderPathGate ?? (await checkEditActionProviderPathGateV1("impl"));
+    if (!providerPathGate.ok) {
+      NotificationRouter.showWarning(providerPathGate.reason);
       return;
     }
     const editWorkspaceRoot = resolveOwnerWorkspace(resolved.progress);
@@ -2730,9 +2748,10 @@ export async function fastForwardReviewWithAI(
       return;
     }
     const gateModel = await resolveFreshModelForStage(resolved.folderUri, "impl");
-    const editAvailability = checkEditActionAvailabilityV1({
+    const editAvailability = await checkEditActionAvailabilityV1({
       workspaceFsPath: editWorkspaceRoot.uri.fsPath,
       stageModelId: gateModel.modelId,
+      stage: "impl",
     });
     if (!editAvailability.ok) {
       NotificationRouter.showWarning(editAvailability.reason);
@@ -3026,20 +3045,32 @@ async function applyImplementationReviewWithAI(
   options: ApplyReviewOptions & ExecuteImplementationRunOptions
 ): Promise<boolean> {
   // Edit-capable sibling of the "applyReview.v1" text route, MIGRATED by
-  // §7.8: it runs the sealed two-phase pipeline (runSealedImplementationV1
-  // with editActionKey "applyReviewEdit.v1"). The assertion is kept under
-  // its own route id so re-gating "applyReview.v1" for plan-review stages
-  // never implicitly toggles implementation-review edit runs.
+  // §7.8: it runs through runImplementationOrSealedV1 with editActionKey
+  // "applyReviewEdit.v1" (the sealed two-phase pipeline for a
+  // Copilot-resolved model, or a direct edit-mode invocation for a
+  // CLI-resolved one). The assertion is kept under its own route id so
+  // re-gating "applyReview.v1" for plan-review stages never implicitly
+  // toggles implementation-review edit runs.
   assertLegacyAiRouteAllowedV0("applyReviewEdit.v1");
   // §7.5 host gate (AC-HOST-03): the full provider/root availability gate
   // already ran in the caller before any read; this cheap host-only check is
   // kept as defense-in-depth for any other caller reaching this function
   // directly, before the plan-final materialization and review-content reads
-  // below.
-  const hostGate = checkEditActionHostGateV1();
-  if (!hostGate.ok) {
-    NotificationRouter.showWarning(hostGate.reason);
-    return false;
+  // below. Only applies to a Copilot-resolved model — the already-resolved
+  // `model` here may be CLI-backed, which never touches the LM tool API this
+  // gate exists to prove usable.
+  let usesCopilotModel: boolean;
+  try {
+    usesCopilotModel = resolveEffectiveProvider(model.modelId).kind === "copilot";
+  } catch {
+    usesCopilotModel = false;
+  }
+  if (usesCopilotModel) {
+    const hostGate = checkEditActionHostGateV1();
+    if (!hostGate.ok) {
+      NotificationRouter.showWarning(hostGate.reason);
+      return false;
+    }
   }
   // Materialize canonical plan-final.md from legacy implementation.md if needed.
   let canonicalUri: vscode.Uri;
@@ -4142,7 +4173,7 @@ async function executeImplementationRun(
     }
   }
 
-  let result: Awaited<ReturnType<typeof runSealedImplementationV1>> | undefined;
+  let result: Awaited<ReturnType<typeof runImplementationOrSealedV1>> | undefined;
 
   await vscode.window.withProgress(
     {
@@ -4162,11 +4193,13 @@ async function executeImplementationRun(
         taskOperations.tokenFor(folderUri.fsPath)
       );
       try {
-      // §7.8 cutover: the sealed two-phase pipeline (read-only preflight →
-      // sealed plan → receipted mutation session) replaces the retired
-      // direct-edit runners. Provider/model fallback lives in the
-      // coordinator's ranked selection now.
-      result = await runSealedImplementationV1({
+      // Copilot-resolved models run the sealed two-phase pipeline
+      // (read-only preflight → sealed plan → receipted mutation session);
+      // CLI-resolved models run their own direct edit-mode invocation
+      // instead, since they cannot join that pipeline (see
+      // runImplementationOrSealedV1's header). Provider/model fallback for
+      // both paths lives in the coordinator's/runner's ranked selection.
+      result = await runImplementationOrSealedV1({
         editActionKey: options.editActionKey ?? "implementation.v1",
         prompt,
         modelId,
@@ -4401,25 +4434,21 @@ export async function runImplementationWithAI(
   arg?: ReviewCommandArg,
   chatViewProvider?: ChatViewProvider
 ): Promise<void> {
-  // Post-§7.8 route gate: "implementation.v1" is MIGRATED (it runs the
-  // sealed two-phase pipeline via runSealedImplementationV1), so this
-  // assertion passes and exists to fail closed if the key is ever re-gated.
+  // Post-§7.8 route gate: "implementation.v1" is MIGRATED (Copilot-resolved
+  // models run the sealed two-phase pipeline via runSealedImplementationV1;
+  // CLI-resolved models run their own direct edit-mode invocation — see
+  // runImplementationOrSealedV1), so this assertion passes and exists to
+  // fail closed if the key is ever re-gated.
   assertLegacyAiRouteAllowedV0("implementation.v1");
-  // ── §7.5 host gate (AC-HOST-03) ──────────────────────────────────────────
-  // First real check, before consent, task resolution, or ANY task/source
-  // read: a pre-1.100 host (or one whose LM tool API probes unavailable)
-  // reports hostToolApiUnavailable here and nothing has been read.
-  const hostGate = checkEditActionHostGateV1();
-  if (!hostGate.ok) {
-    NotificationRouter.showWarning(hostGate.reason);
-    return;
-  }
-  // §7.5's task/model-INDEPENDENT provider-path check: still before any
-  // task/source read (Implementation always resolves against the impl
-  // stage's model — see checkEditActionProviderPathGateV1's header). The
-  // exact per-task/stage capability (workspace root included) is revalidated
-  // by checkEditActionAvailabilityV1 below, once resolveTask makes it known.
-  const providerPathGate = checkEditActionProviderPathGateV1("impl");
+  // §7.5's task/model-INDEPENDENT provider-path check (AC-HOST-03): first
+  // real check, before consent, task resolution, or ANY task/source read —
+  // still before any task/source read (Implementation always resolves
+  // against the impl stage's model — see checkEditActionProviderPathGateV1's
+  // header). It subsumes the host/LM-tool-API floor for a Copilot-resolved
+  // model and skips it entirely for a CLI-resolved one. The exact per-task/
+  // stage capability (workspace root included) is revalidated by
+  // checkEditActionAvailabilityV1 below, once resolveTask makes it known.
+  const providerPathGate = await checkEditActionProviderPathGateV1("impl");
   if (!providerPathGate.ok) {
     NotificationRouter.showWarning(providerPathGate.reason);
     return;
@@ -4481,9 +4510,10 @@ export async function runImplementationWithAI(
     return;
   }
   const model = await resolveFreshModelForStage(resolved.folderUri, "impl");
-  const editAvailability = checkEditActionAvailabilityV1({
+  const editAvailability = await checkEditActionAvailabilityV1({
     workspaceFsPath: workspaceRoot.uri.fsPath,
     stageModelId: model.modelId,
+    stage: "impl",
   });
   if (!editAvailability.ok) {
     NotificationRouter.showWarning(editAvailability.reason);
@@ -4684,7 +4714,9 @@ export async function runImplementationWithAI(
  * e.g. a stale custom keybinding) — sharing behavior is not the architectural
  * problem the plan flags; one dynamic PUBLIC COMMAND identity for both
  * branches is. Post-§7.8, `applyReviewEdit.v1` is MIGRATED: the edit branch
- * runs the sealed two-phase pipeline via runSealedImplementationV1.
+ * runs the sealed two-phase pipeline via runSealedImplementationV1 for a
+ * Copilot-resolved model, or its own direct edit-mode invocation for a
+ * CLI-resolved one — see runImplementationOrSealedV1.
  */
 export async function applyReviewEditWithAI(
   extensionUri: vscode.Uri,
@@ -4693,18 +4725,14 @@ export async function applyReviewEditWithAI(
   options: ApplyReviewOptions = {}
 ): Promise<void> {
   assertLegacyAiRouteAllowedV0("applyReviewEdit.v1");
-  // §7.5 host gate (AC-HOST-03): before any task/source read.
-  const hostGate = checkEditActionHostGateV1();
-  if (!hostGate.ok) {
-    NotificationRouter.showWarning(hostGate.reason);
-    return;
-  }
-  // §7.5's task/model-INDEPENDENT provider-path check: still before any
-  // task/source read (the edit branch always resolves against the impl
-  // stage's model — see checkEditActionProviderPathGateV1's header). The
-  // exact per-task/stage capability (workspace root included) is revalidated
-  // by checkEditActionAvailabilityV1 below, once resolveTask makes it known.
-  const providerPathGate = checkEditActionProviderPathGateV1("impl");
+  // §7.5's task/model-INDEPENDENT provider-path check (AC-HOST-03): before
+  // any task/source read (the edit branch always resolves against the impl
+  // stage's model — see checkEditActionProviderPathGateV1's header). It
+  // subsumes the host/LM-tool-API floor for a Copilot-resolved model and
+  // skips it entirely for a CLI-resolved one. The exact per-task/stage
+  // capability (workspace root included) is revalidated by
+  // checkEditActionAvailabilityV1 below, once resolveTask makes it known.
+  const providerPathGate = await checkEditActionProviderPathGateV1("impl");
   if (!providerPathGate.ok) {
     NotificationRouter.showWarning(providerPathGate.reason);
     return;
@@ -4758,9 +4786,10 @@ export async function applyReviewEditWithAI(
   const model = options.preserveActiveFallback
     ? await resolveModelForStage(resolved.folderUri, "impl")
     : await resolveFreshModelForStage(resolved.folderUri, "impl");
-  const editAvailability = checkEditActionAvailabilityV1({
+  const editAvailability = await checkEditActionAvailabilityV1({
     workspaceFsPath: workspaceRoot.uri.fsPath,
     stageModelId: model.modelId,
+    stage: "impl",
   });
   if (!editAvailability.ok) {
     NotificationRouter.showWarning(editAvailability.reason);

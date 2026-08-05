@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import * as path from "path";
 import { TaskInventory } from "../state/taskInventory";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
@@ -17,8 +18,10 @@ import {
 } from "../utils/modelSelection";
 import {
   checkEditActionAvailabilityV1,
-  runSealedImplementationV1,
+  runImplementationOrSealedV1,
 } from "./runEditActionV1";
+import { getUnrelatedWorkspaceChanges, isGitWorkspace } from "./reviewActions";
+import { allowsDirtyWorktreeChanges } from "../config/settings";
 import { getProductionActionConversationOrchestratorV1 } from "../actions/productionTaskActionRuntimeV1";
 import type { ChatViewProvider } from "../views/chatView";
 import { checkAndConfirmPromptSize } from "../utils/promptSizeGuard";
@@ -256,6 +259,27 @@ export async function runLintingFixes(
 
             const relevantFiles = resolvedTask.progress.implReviewFiles;
 
+            // Codex review finding: the deterministic autofix loop below
+            // writes and saves files BEFORE the later "unrelated uncommitted
+            // changes" safety check runs — so a scoped fix to any file
+            // outside implReviewFiles/the task folder (getUnrelatedWorkspaceChanges's
+            // own exclusions) shows up as an "unrelated" change the user is
+            // warned to commit or stash, seconds after the extension itself
+            // made it. Tracking exactly which paths THIS loop actually saves
+            // (below) and excluding only those is what tells "this run's own
+            // autofixes" apart from "genuinely pre-existing (or concurrently
+            // introduced by someone else) dirty state" — a prior revision
+            // instead snapshotted the whole unrelated-change set before the
+            // loop and intersected the later result against it, which
+            // over-excluded: a file a USER or another process modified
+            // during the autofix/lint window (new since that snapshot, but
+            // not this run's doing) was silently dropped from the warning
+            // too, exactly like the run's own edits were. Recording actual
+            // write targets instead of inferring them from a before/after
+            // diff closes that gap.
+            const workspaceFolderForSnapshot = vscode.workspace.getWorkspaceFolder(taskFolderUri);
+            const autofixedRelativePaths = new Set<string>();
+
             progress.report({ message: "Applying automatic fixes..." });
 
             // Open each file with linting issues and apply fixes
@@ -282,9 +306,18 @@ export async function runLintingFixes(
 
                 // Fix commands can leave edits only in the in-memory document.
                 // Persist them before collecting the post-fix result so the lint
-                // payload describes what is actually on disk.
+                // payload describes what is actually on disk. Only a document
+                // that was actually dirty (a real write happens) is recorded
+                // below — one that the fix commands left unchanged can never
+                // spuriously appear as newly dirty later, so it needs no
+                // exclusion.
                 if (doc.isDirty) {
                   await doc.save();
+                  if (workspaceFolderForSnapshot) {
+                    autofixedRelativePaths.add(
+                      path.relative(workspaceFolderForSnapshot.uri.fsPath, uri.fsPath).replace(/\\/g, "/")
+                    );
+                  }
                 }
               } catch {
                 failedCount++;
@@ -324,9 +357,10 @@ export async function runLintingFixes(
                 // workspace root) runs BEFORE the context pack and prompt
                 // reads below. The deterministic autofixes above are not
                 // edit-action work and run on any host.
-                const editAvailability = checkEditActionAvailabilityV1({
+                const editAvailability = await checkEditActionAvailabilityV1({
                   workspaceFsPath: workspaceFolder.uri.fsPath,
                   stageModelId: model.modelId,
+                  stage: "publish",
                 });
                 if (!editAvailability.ok) {
                   NotificationRouter.showWarning(
@@ -350,13 +384,74 @@ export async function runLintingFixes(
                   if (!context || !(await ensureAiConsent(context))) {
                     return;
                   }
-                  let result: Awaited<ReturnType<typeof runSealedImplementationV1>> | undefined;
+                  // Pre-run safety checks for agentic file-editing runs —
+                  // the same gate executeImplementationRun applies (in the
+                  // same size-gate → consent → safety-check order) before
+                  // Generate Implementation/Apply Review/Fast Forward. This
+                  // branch calls runImplementationOrSealedV1 directly rather
+                  // than going through that shared entry point, so it needs
+                  // its own copy: a CLI-resolved model's edit-mode run has
+                  // full, extension-unmediated workspace write access
+                  // (unlike the sealed pipeline's receipted, revalidated
+                  // mutations), so without this it could silently edit a
+                  // non-git workspace or overwrite unrelated uncommitted
+                  // work.
+                  const cwd = workspaceFolder.uri.fsPath;
+                  const isGit = await isGitWorkspace(cwd);
+                  if (!isGit) {
+                    const proceed = await vscode.window.showWarningMessage(
+                      "⚠️ This workspace is not tracked by git.\n\n" +
+                        "The AI final-fixes run will edit files in your workspace, " +
+                        "but there is no git history to track or revert those changes. " +
+                        "You will not be able to see exactly what was changed or undo it via git.\n\n" +
+                        "Back up your workspace before proceeding.",
+                      { modal: true },
+                      "Proceed Anyway",
+                    );
+                    if (proceed !== "Proceed Anyway") {
+                      NotificationRouter.showInformation("AI final fixes cancelled.");
+                      return;
+                    }
+                  } else {
+                    // Excludes only paths the autofix loop above actually
+                    // wrote (autofixedRelativePaths) — not "anything new
+                    // since a before-loop snapshot", which would also hide a
+                    // genuinely unrelated concurrent edit (the user, or
+                    // another process, touching a different file during the
+                    // autofix/lint window) from this warning.
+                    const currentUnrelatedChanges = await getUnrelatedWorkspaceChanges(cwd, taskFolderUri);
+                    const unrelatedChanges = currentUnrelatedChanges.filter(
+                      (file) => !autofixedRelativePaths.has(file)
+                    );
+                    if (unrelatedChanges.length > 0 && !allowsDirtyWorktreeChanges()) {
+                      const preview = unrelatedChanges.slice(0, 5).map((file) => `• ${file}`).join("\n");
+                      const more = unrelatedChanges.length > 5
+                        ? `\n• … and ${unrelatedChanges.length - 5} more`
+                        : "";
+                      const proceed = await vscode.window.showWarningMessage(
+                        "⚠️ Your workspace has unrelated uncommitted changes.\n\n" +
+                          "The AI final-fixes run may edit workspace files. Commit, stash, " +
+                          "or review these unrelated changes first:\n\n" + preview + more,
+                        { modal: false },
+                        "Proceed",
+                        "Cancel",
+                      );
+                      if (proceed !== "Proceed") {
+                        NotificationRouter.showInformation("AI final fixes cancelled.");
+                        return;
+                      }
+                    }
+                  }
+                  let result: Awaited<ReturnType<typeof runImplementationOrSealedV1>> | undefined;
                   await vscode.window.withProgress({ location: vscode.ProgressLocation.Window, title: "Applying AI final fixes...", cancellable: true }, async (aiProgress, token) => {
-                    // §7.8 cutover: the sealed two-phase pipeline replaces
-                    // the retired direct-edit runner. `model` is resolved
-                    // from the "publish" stage above — fallback bookkeeping
-                    // lives in the coordinator's ranked selection.
-                    result = await runSealedImplementationV1({
+                    // Copilot-resolved models run the sealed two-phase
+                    // pipeline; CLI-resolved models run their own direct
+                    // edit-mode invocation instead (see
+                    // runImplementationOrSealedV1's header). `model` is
+                    // resolved from the "publish" stage above — fallback
+                    // bookkeeping lives in the coordinator's/runner's ranked
+                    // selection.
+                    result = await runImplementationOrSealedV1({
                       editActionKey: "lint.v1",
                       modelId: model.modelId,
                       prompt,

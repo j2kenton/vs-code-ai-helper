@@ -4,10 +4,7 @@ import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { assertLegacyAiRouteAllowedV0 } from "../services/legacyAiActionSafetyGateV0";
-import {
-  checkEditActionHostGateV1,
-  checkEditActionProviderPathGateV1,
-} from "./runEditActionV1";
+import { checkEditActionProviderPathGateV1 } from "./runEditActionV1";
 
 /**
  * Keyboard shortcut router: runs Fast Forward Review against the current
@@ -29,14 +26,11 @@ export async function fastForwardCurrentTaskReview(
   // caller-supplied data. Answering "is the target plan-review-only" here
   // would require reading `currentTaskStore` and/or `TaskInventory` first,
   // and those are task-state reads. So this router enforces the coarse
-  // host/provider gate unconditionally, before touching `currentTaskStore`
-  // or `TaskInventory` at all — no peek, no conditional skip.
-  const earlyHostGate = checkEditActionHostGateV1();
-  if (!earlyHostGate.ok) {
-    NotificationRouter.showWarning(earlyHostGate.reason);
-    return;
-  }
-  const earlyProviderPathGate = checkEditActionProviderPathGateV1("impl");
+  // provider-path gate unconditionally, before touching `currentTaskStore`
+  // or `TaskInventory` at all — no peek, no conditional skip. It subsumes
+  // the host/LM-tool-API floor for a Copilot-resolved model and skips it
+  // entirely for a CLI-resolved one.
+  const earlyProviderPathGate = await checkEditActionProviderPathGateV1("impl");
   if (!earlyProviderPathGate.ok) {
     NotificationRouter.showWarning(earlyProviderPathGate.reason);
     return;

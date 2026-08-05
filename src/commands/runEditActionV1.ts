@@ -1,13 +1,19 @@
 /**
- * Two-phase edit-action driver (plan §7.5/§7.6): the ONE path every
- * edit-capable action (implementation, Fast Forward, edit Apply Review, AI
- * lint fallback) takes after the §7.8 cutover.
+ * Two-phase edit-action driver (plan §7.5/§7.6) for every edit-capable
+ * action (implementation, Fast Forward, edit Apply Review, AI lint
+ * fallback) after the §7.8 cutover. This drives the Copilot-only sealed
+ * pipeline; `runImplementationOrSealedV1` below is the actual entry point
+ * callers use — it routes a CLI-resolved stage model to its own direct
+ * edit-mode invocation instead, since CLI providers cannot join a
+ * request-local `vscode.lm` tool session at all.
  *
  * Phase 0 — §7.5 availability, BEFORE any task or source read:
- *   host floor (1.100.0) + runtime tool shapes → `hostToolApiUnavailable`;
- *   a Copilot-backed model path for this stage → `providerModeUnavailable`;
- *   workspace-root registration → `workspaceRootUnsupported` /
- *   `workspacePathUnsafe`. No standalone probing command exists.
+ *   host floor (1.100.0) + runtime tool shapes → `hostToolApiUnavailable`
+ *   (Copilot-resolved stages only; skipped for CLI — see
+ *   `checkEditActionAvailabilityV1`); an unresolvable model for this stage
+ *   → `providerModeUnavailable`; workspace-root registration →
+ *   `workspaceRootUnsupported` / `workspacePathUnsafe`. No standalone
+ *   probing command exists.
  * Phase 1 — the preflight action (read tools only). Structured questions
  *   ride the ordinary question/Resume plumbing; `completed/noChanges`
  *   settles with no edit session (§7.4).
@@ -46,7 +52,14 @@ import {
   getVerifiedTaskBindingIdV1,
 } from "../services/workflowRuntimeServicesV1";
 import { probeLmToolCallingHostCapabilityV1, VscodeLmModuleV1 } from "../services/vscodeLmCompat";
-import { resolveEffectiveProvider } from "../runners/runnerRegistry";
+import {
+  backupModelsForStage,
+  checkImplementationAvailabilityForModel,
+  recordActiveFallbackModel,
+  resolveEffectiveProvider,
+  runImplementationForModel,
+} from "../runners/runnerRegistry";
+import { isAuthenticationFailure } from "../utils/quota";
 import { resolveFreshModelForStage } from "../utils/modelSelection";
 import { getAiModelDefaults, getModelSettings } from "../config/settings";
 import { writeRunLog } from "../utils/runLog";
@@ -115,45 +128,83 @@ export function checkEditActionHostGateV1():
 }
 
 /**
- * §7.5's task/model-INDEPENDENT half of "at least one selected-provider path
- * supporting request-local tools": true when `stage`'s globally configured
- * primary model — the model the calling edit action actually resolves
- * against (Implementation, Fast Forward, and Apply Review Edit all call
- * `resolveFreshModelForStage(..., "impl")`; the AI lint fallback, the one
- * edit action whose registry row is scoped to `["publish"]`, calls
- * `resolveFreshModelForStage(..., "publish")` — see
- * `modelStageForEditActionKeyV1` in runEditActionV1.ts) — currently resolves
- * to a Copilot-backed path. Reads ONLY global settings (`getModelSettings`/
- * `getAiModelDefaults`, both parameterless) — no `taskFolderUri`, so no
- * per-task read — because `resolveFreshModelForStage` always calls
- * `resolveModelForStage` with `ignoreActiveFallback: true`, whose returned
- * model id is exactly `getModelSettings()[stage]?.primary ??
- * getAiModelDefaults()[stage]` regardless of any task's own state; the
- * per-task read it performs is solely to clear a stale fallback flag, a side
- * effect this coarse pre-check does not need to reproduce.
+ * Task/model-INDEPENDENT half of "this stage has a runnable edit path":
+ * resolves `stage`'s globally configured primary model — the model the
+ * calling edit action actually resolves against (Implementation, Fast
+ * Forward, and Apply Review Edit all call `resolveFreshModelForStage(...,
+ * "impl")`; the AI lint fallback, the one edit action whose registry row is
+ * scoped to `["publish"]`, calls `resolveFreshModelForStage(..., "publish")`
+ * — see `modelStageForEditActionKeyV1` in runEditActionV1.ts) — but the
+ * PRIMARY alone is not what will actually run: `runImplementationOrSealedV1`
+ * falls through to a configured backup when the primary is unavailable, and
+ * that backup can be Copilot even when the primary is CLI. Checking only the
+ * primary's kind here (Codex review finding, this round) let a CLI-primary/
+ * Copilot-backup stage skip the host-floor/LM-tool check entirely — the
+ * mismatch then surfaced only much later, inside runImplementationOrSealedV1
+ * itself, after resolveTask and every artifact/context-pack read this
+ * function exists to precede (§7.5/AC-HOST-03). This function therefore
+ * calls `checkImplementationAvailabilityForModel` — the SAME availability
+ * resolution `runImplementationOrSealedV1` itself uses — to find the WINNING
+ * candidate (the primary if live, else the first available configured
+ * backup, of either kind) before deciding whether a host check applies.
+ * Copilot runs the sealed two-phase pipeline (§7.5-§7.7); CLI providers run
+ * their own direct edit-mode invocation (see `runImplementationOrSealedV1`)
+ * — both are valid, so this only rejects a stage with no available candidate
+ * at all.
  *
- * Command handlers call this immediately after `checkEditActionHostGateV1()`
- * — before `resolveTask` or any other task read — so a globally CLI-only
- * configuration is rejected before any task/source read (§7.5). Callers MUST
+ * Reads ONLY global settings to resolve the STARTING (primary) model id —
+ * no `taskFolderUri`, so no per-task read for that half — because
+ * `resolveFreshModelForStage` always calls `resolveModelForStage` with
+ * `ignoreActiveFallback: true`, whose returned model id is exactly
+ * `getModelSettings()[stage]?.primary ?? getAiModelDefaults()[stage]`
+ * regardless of any task's own state; the per-task read it performs is
+ * solely to clear a stale fallback flag, a side effect this coarse pre-check
+ * does not need to reproduce. The availability resolution itself IS I/O (a
+ * CLI existence probe, or a Copilot model-list probe) — this function is no
+ * longer zero-I/O, but every byte of that I/O is provider-liveness plumbing
+ * that never touches this task's own files.
+ *
+ * Command handlers call this as their first real check — before
+ * `resolveTask` or any other task read — so an unresolvable/unavailable
+ * model, or (for a Copilot-resolved winning candidate) a pre-1.100 host, is
+ * rejected before any task/source read (§7.5). This function alone replaces
+ * the old `checkEditActionHostGateV1()`-then-`checkEditActionProviderPathGateV1()`
+ * pair: calling the host gate unconditionally, before the provider is even
+ * known, incorrectly rejected a CLI-resolved stage on a host missing the
+ * Copilot LM tool API — an API that stage's execution path never touches.
+ * Resolving the provider FIRST and only then conditionally requiring the
+ * host floor is what makes the CLI path actually reachable on such a host.
+ * `checkEditActionHostGateV1()` itself is kept exported for the few
+ * defense-in-depth call sites that already have a specific resolved model in
+ * scope and can make their own copilot-only decision around it. Callers MUST
  * pass the stage the invoked action key actually resolves its model
  * against — passing the wrong stage (e.g. defaulting every caller to
  * `"impl"`) can reject an otherwise-valid action solely because an unrelated
- * stage's model is CLI-backed. This is a coarse pre-check, not a replacement
- * for `checkEditActionAvailabilityV1`: the exact per-task capability (plus
- * the workspace-root check, which genuinely needs the resolved task's
- * ownership) is still revalidated by that function immediately before the
- * first source read (§7.6).
+ * stage's model is unconfigured or (if Copilot-resolved) needs a newer host.
+ * This is a coarse pre-check, not a replacement for
+ * `checkEditActionAvailabilityV1`: the exact per-task capability (plus the
+ * workspace-root check, which genuinely needs the resolved task's ownership)
+ * is still revalidated by that function immediately before the first source
+ * read (§7.6).
  */
-export function checkEditActionProviderPathGateV1(
+export async function checkEditActionProviderPathGateV1(
   stage: TaskStage
-):
+): Promise<
   | { readonly ok: true }
-  | { readonly ok: false; readonly code: "providerModeUnavailable"; readonly reason: string } {
-  const modelId = getModelSettings()[stage]?.primary ?? getAiModelDefaults()[stage];
-  try {
-    if (resolveEffectiveProvider(modelId).kind === "copilot") {
-      return { ok: true };
+  | {
+      readonly ok: false;
+      readonly code: "providerModeUnavailable" | "hostToolApiUnavailable";
+      readonly reason: string;
     }
+> {
+  const modelId = getModelSettings()[stage]?.primary ?? getAiModelDefaults()[stage];
+  // checkImplementationAvailabilityForModel calls resolveEffectiveProvider(modelId)
+  // unguarded internally (runnerRegistry.ts) — an unresolvable/unconfigured
+  // modelId throws OUT of it rather than returning a clean unavailable
+  // result, so it is checked here first, exactly as runImplementationOrSealedV1
+  // already does before its own call to the same function.
+  try {
+    resolveEffectiveProvider(modelId);
   } catch (error) {
     return {
       ok: false,
@@ -161,54 +212,90 @@ export function checkEditActionProviderPathGateV1(
       reason: error instanceof Error ? error.message : String(error),
     };
   }
-  return {
-    ok: false,
-    code: "providerModeUnavailable",
-    reason:
-      "AI-assisted edits run through the request-local Copilot Language Model tool session — " +
-      `configure a Copilot model for the ${stage} stage (CLI providers cannot run sealed edit sessions).`,
-  };
+  const availability = await checkImplementationAvailabilityForModel(modelId, stage);
+  if (!availability.availability.available) {
+    return {
+      ok: false,
+      code: "providerModeUnavailable",
+      reason: availability.availability.reason ?? `${availability.providerLabel} is unavailable.`,
+    };
+  }
+  let usesCopilot: boolean;
+  try {
+    usesCopilot = resolveEffectiveProvider(availability.modelId).kind === "copilot";
+  } catch (error) {
+    return {
+      ok: false,
+      code: "providerModeUnavailable",
+      reason: error instanceof Error ? error.message : String(error),
+    };
+  }
+  if (usesCopilot) {
+    return checkEditActionHostGateV1();
+  }
+  return { ok: true };
 }
 
 /**
  * §7.5: checked by the command wrapper BEFORE any task or source read.
  * `stageModelId` is the stage's stored (provider-qualified) model id — the
- * check requires at least one Copilot-backed path (CLI providers cannot run
- * request-local tool sessions; §7.5 requires the absence of a
- * general-workspace CLI edit path).
+ * STARTING candidate, not necessarily the one that actually runs.
+ *
+ * Codex review finding: this used to decide `usesCopilot` from
+ * `stageModelId` alone, so a Copilot-primary/CLI-backup stage with an
+ * unavailable Copilot primary still required the host floor/LM-tool
+ * capability here — rejecting a run `runImplementationOrSealedV1` would have
+ * happily dispatched to the live CLI backup, never touching Copilot at all.
+ * This now resolves the WINNING candidate first (the same
+ * `checkImplementationAvailabilityForModel` call `checkEditActionProviderPathGateV1`
+ * and `runImplementationOrSealedV1` themselves use — the primary if live,
+ * else the first available configured backup, of either kind) and decides
+ * `usesCopilot` from THAT, mirroring `checkEditActionProviderPathGateV1`'s
+ * already-winner-aware pattern. `stage` must be the same model stage
+ * `stageModelId` was resolved against (e.g. "impl" for every edit action
+ * except the AI lint fallback's "publish"), since backup resolution is
+ * scoped per stage. A CLI provider never touches `vscode.lm` — it edits the
+ * workspace directly via `runImplementationOrSealedV1`'s CLI branch — so the
+ * host-version/LM-tool probe below (which exists solely to prove the sealed
+ * pipeline's request-local tool-calling API is usable) is skipped when the
+ * winning candidate is CLI-resolved; only an unresolvable/unavailable model
+ * (across the primary and every configured backup) fails this gate.
  */
-export function checkEditActionAvailabilityV1(options: {
+export async function checkEditActionAvailabilityV1(options: {
   readonly workspaceFsPath: string;
   readonly stageModelId: string | undefined;
-}): EditActionAvailabilityV1 {
-  if (!hostVersionAtLeast(vscode.version, EDIT_ACTION_HOST_FLOOR_V1)) {
+  readonly stage: TaskStage;
+}): Promise<EditActionAvailabilityV1> {
+  const availability = await checkImplementationAvailabilityForModel(options.stageModelId, options.stage);
+  if (!availability.availability.available) {
     return {
       ok: false,
-      code: "hostToolApiUnavailable",
-      reason: `VS Code ${EDIT_ACTION_HOST_FLOOR_V1}+ is required for AI-assisted edits (running ${vscode.version}).`,
+      code: "providerModeUnavailable",
+      reason: availability.availability.reason ?? `${availability.providerLabel} is unavailable.`,
     };
   }
-  const capability = probeLmToolCallingHostCapabilityV1(vscode as unknown as VscodeLmModuleV1);
-  if (!capability.supported) {
-    return { ok: false, code: "hostToolApiUnavailable", reason: capability.reason };
-  }
+  let usesCopilot: boolean;
   try {
-    const effective = resolveEffectiveProvider(options.stageModelId);
-    if (effective.kind !== "copilot") {
-      return {
-        ok: false,
-        code: "providerModeUnavailable",
-        reason:
-          "AI-assisted edits run through the request-local Copilot Language Model tool session — " +
-          "configure a Copilot model for this stage (CLI providers cannot run sealed edit sessions).",
-      };
-    }
+    usesCopilot = resolveEffectiveProvider(availability.modelId).kind === "copilot";
   } catch (error) {
     return {
       ok: false,
       code: "providerModeUnavailable",
       reason: error instanceof Error ? error.message : String(error),
     };
+  }
+  if (usesCopilot) {
+    if (!hostVersionAtLeast(vscode.version, EDIT_ACTION_HOST_FLOOR_V1)) {
+      return {
+        ok: false,
+        code: "hostToolApiUnavailable",
+        reason: `VS Code ${EDIT_ACTION_HOST_FLOOR_V1}+ is required for AI-assisted edits (running ${vscode.version}).`,
+      };
+    }
+    const capability = probeLmToolCallingHostCapabilityV1(vscode as unknown as VscodeLmModuleV1);
+    if (!capability.supported) {
+      return { ok: false, code: "hostToolApiUnavailable", reason: capability.reason };
+    }
   }
   let rootId: string;
   try {
@@ -268,6 +355,8 @@ export interface RunTwoPhaseEditOptionsV1 {
     taskStage: string
   ) => { readonly modelId: string | undefined; readonly stage: TaskStage | undefined };
   readonly stageModelId: string | undefined;
+  /** The model/quota stage `stageModelId` was resolved against — see checkEditActionAvailabilityV1's `stage` param. */
+  readonly modelStage: TaskStage;
   readonly cancellationToken: vscode.CancellationToken;
 }
 
@@ -283,9 +372,10 @@ export function computeEditRequestDigestV1(prompt: string): string {
 export async function runTwoPhaseEditActionV1(
   options: RunTwoPhaseEditOptionsV1
 ): Promise<TwoPhaseEditResultV1> {
-  const availability = checkEditActionAvailabilityV1({
+  const availability = await checkEditActionAvailabilityV1({
     workspaceFsPath: options.workspaceCwd,
     stageModelId: options.stageModelId,
+    stage: options.modelStage,
   });
   if (!availability.ok) {
     return { kind: "unavailable", code: availability.code, reason: availability.reason };
@@ -465,11 +555,13 @@ export interface RunSealedImplementationOptionsV1 {
 export async function runSealedImplementationV1(
   options: RunSealedImplementationOptionsV1
 ): Promise<ImplementationRunResult & { runnerId: string }> {
+  const stage = options.stage ?? "impl";
   // §7.5: the FULL availability gate runs before this adapter reads anything
   // at all — including the task's Chat identity and ownership binding below.
-  const availability = checkEditActionAvailabilityV1({
+  const availability = await checkEditActionAvailabilityV1({
     workspaceFsPath: options.workspaceUri.fsPath,
     stageModelId: options.modelId,
+    stage,
   });
   if (!availability.ok) {
     return {
@@ -530,7 +622,6 @@ export async function runSealedImplementationV1(
     chatDocumentId = allocateHex128IdV1();
   }
 
-  const stage = options.stage ?? "impl";
   const result = await runTwoPhaseEditActionV1({
     actionKey: options.editActionKey,
     prompt: options.prompt,
@@ -540,6 +631,7 @@ export async function runSealedImplementationV1(
     workspaceCwd: options.workspaceUri.fsPath,
     resolveStagePrimaryModel: () => ({ modelId: options.modelId, stage }),
     stageModelId: options.modelId,
+    modelStage: stage,
     cancellationToken: options.token,
   });
 
@@ -630,6 +722,154 @@ export async function runSealedImplementationV1(
   }
 }
 
+/**
+ * Dispatch an edit-capable action through whichever path the resolved
+ * model's provider actually supports.
+ *
+ * Copilot runs the sealed two-phase pipeline above (§7.5-§7.7: read-only
+ * preflight, structured questions via Chat, receipted mutation session).
+ * CLI providers cannot join that pipeline at all — it works by the
+ * extension brokering `vscode.lm`'s request-local tool calls one at a time,
+ * and a CLI agent edits files with its own in-process tools that the
+ * extension never sees or can revalidate between. So CLI-resolved models
+ * run through their own direct edit-mode invocation instead
+ * (`runImplementationForModel` → `runImplementationWithCli`): the same
+ * git-snapshot-based mechanism `runImplementationWithAI` used before the
+ * §7.8 cutover, permission-gated per provider (`--permission-mode
+ * acceptEdits`, `--sandbox workspace-write`, etc. — see
+ * `docs/design/c4-chat-edit-spike-decision.md`). It has no preflight,
+ * receipts, or structured mid-run questions — CLI providers never had that
+ * and cannot participate in it — but it is a fully supported, tested path,
+ * not a stub: same backup-model cascade, same quota/auth classification.
+ *
+ * Codex review finding (P2, 5th round): the availability-and-backup-
+ * selection check below now runs for BOTH primary kinds, not just a CLI
+ * primary. An earlier revision short-circuited a Copilot-resolved primary
+ * straight into the sealed pipeline before this check, on the reasoning
+ * that the sealed pipeline's own gates were a sufficient contract for it —
+ * but that skipped backup selection entirely for a Copilot primary that's
+ * unavailable with a configured "switch-to-backup" CLI candidate: the CLI
+ * backup was configured but unreachable, since nothing ever looked past the
+ * (unavailable) Copilot primary to find it. Running the check
+ * unconditionally and branching dispatch on the WINNING candidate's
+ * provider kind — never the PRIMARY's — makes both fallback directions
+ * (CLI-primary-to-Copilot-backup, Copilot-primary-to-CLI-backup)
+ * symmetric. For a healthy, backup-free primary of either kind this changes
+ * nothing observable: `availability.modelId === options.modelId`, so
+ * dispatch lands on the exact same call as before.
+ */
+export async function runImplementationOrSealedV1(
+  options: RunSealedImplementationOptionsV1
+): Promise<ImplementationRunResult & { runnerId: string }> {
+  try {
+    resolveEffectiveProvider(options.modelId);
+  } catch (error) {
+    return {
+      status: "failed",
+      filesChanged: [],
+      failureKind: "generic",
+      errorMessage: error instanceof Error ? error.message : String(error),
+      // Codex review nit: resolution failed, so the real provider is
+      // unknown — hardcoding "copilot-lm" here misattributed a CLI-prefixed
+      // modelId's failure to Copilot in run logs. Best-effort label from the
+      // stored id's own "<provider>:" prefix when it has one (still "copilot-lm"
+      // for a bare/undefined selection, which really does default to Copilot).
+      runnerId: options.modelId?.includes(":") ? options.modelId.split(":", 1)[0]! : "copilot-lm",
+    };
+  }
+  const stage = options.stage ?? "impl";
+  // Codex review finding (P2): `options.modelId` is the stage's CONFIGURED
+  // primary, not necessarily an installed/live/available one.
+  // checkImplementationAvailabilityForModel already knows how to fall
+  // through to a configured backup — callers upstream (e.g.
+  // executeImplementationRun's own liveness re-check) use its result only
+  // for the warning/progress LABEL, never to redirect which model actually
+  // runs. Resolving the WINNING candidate here, then branching on *its*
+  // provider kind, is what actually reaches that backup: dispatching
+  // options.modelId as-is and only then discovering (inside
+  // runImplementationForModel, or inside the sealed pipeline) that the
+  // primary isn't installed/available is too late — a configured, available
+  // backup would never be attempted despite passing this exact availability
+  // check moments earlier.
+  const availability = await checkImplementationAvailabilityForModel(options.modelId, stage);
+  if (!availability.availability.available) {
+    return {
+      status: "failed",
+      filesChanged: [],
+      failureKind: isAuthenticationFailure(availability.availability.reason)
+        ? "generic"
+        : "temporarily-unavailable",
+      errorMessage: availability.availability.reason ?? `${availability.providerLabel} is unavailable.`,
+      runnerId: availability.provider,
+    };
+  }
+  if (availability.provider !== "copilot") {
+    return runImplementationForModel({
+      modelId: availability.modelId,
+      prompt: options.prompt,
+      workspaceUri: options.workspaceUri,
+      token: options.token,
+      onProgress: options.onProgress,
+      stage,
+      taskFolderUri: options.taskFolderUri,
+      requireFileChange: options.requireFileChange,
+      correlation: { actionKey: options.editActionKey },
+      // A CLI candidate must never fail over to a Copilot backup INSIDE
+      // runImplementationForModel's own cascade — that backup would run
+      // through the older, unsealed Copilot runner, bypassing
+      // runSealedImplementationV1's preflight/receipts/host-floor gate
+      // entirely. See that option's own header in runnerRegistry.ts. (A
+      // Copilot candidate found by the availability check above is handled
+      // correctly regardless — the branch below runs the sealed pipeline
+      // against it instead of ever reaching this call.)
+      allowCrossProviderBackups: false,
+      // Codex review finding (P2, this round): allowCrossProviderBackups:
+      // false correctly stops this cascade's OWN unsealed dispatch from
+      // crossing to a configured Copilot backup, but that also meant a CLI
+      // candidate that passes ITS pre-run availability probe here and then
+      // fails at RUNTIME (quota/temporarily-unavailable) could never reach
+      // that Copilot backup at all — switch-to-backup silently did nothing
+      // for a runtime failure, even though the pre-run-unavailable case
+      // (this same function's own resolution above) already worked. Routing
+      // a cross-kind backup back through runSealedImplementationV1 here
+      // keeps it on the sealed pipeline while still letting
+      // runImplementationForModel's cascade own the iteration order/quota-
+      // observation/dirty-tree-gate bookkeeping.
+      runCrossProviderBackup: (modelId) => runSealedImplementationV1({ ...options, modelId }),
+      // Codex review finding (P2, this round): availability.modelId can be a
+      // BACKUP relative to the stage's true configured primary
+      // (options.modelId) — passing it as this call's own `modelId` makes it
+      // look like a fresh "primary" from runImplementationForModel's own
+      // perspective, so a direct success on it never got recorded as the
+      // active fallback. configuredPrimaryModelId tells that function the
+      // TRUE primary so it can record correctly (see its own header).
+      configuredPrimaryModelId: options.modelId,
+    });
+  }
+  // The winning candidate resolves to Copilot — either the primary itself
+  // (the common case: availability.modelId === options.modelId, so this is
+  // identical to the old unconditional runSealedImplementationV1(options)),
+  // or a CLI primary that fell through to a configured Copilot backup. Either
+  // way that candidate still requires the sealed pipeline, never
+  // runImplementationForModel's unsealed Copilot branch, so route it through
+  // runSealedImplementationV1 with the winning modelId.
+  const sealedResult = await runSealedImplementationV1({ ...options, modelId: availability.modelId });
+  // Codex review finding (P2, this round): the same "backup succeeded but
+  // was never recorded as the active fallback" gap applies here too —
+  // runSealedImplementationV1 has no cascade of its own to have already
+  // handled it, so a single direct check is sufficient (no nested-cascade
+  // double-write risk, unlike runImplementationForModel's own case above).
+  if (
+    sealedResult.status === "completed" &&
+    options.taskFolderUri &&
+    availability.modelId !== undefined &&
+    availability.modelId !== options.modelId
+  ) {
+    await recordActiveFallbackModel(options.taskFolderUri, stage, availability.modelId);
+  }
+  return sealedResult;
+}
+
 // ---------------------------------------------------------------------------
 // Explicit Chat Resume for edit-preflight structured questions (plan §5.5 /
 // §7.3 / AC-PREFLIGHT-04 / AC-QUESTION-03): the extension.ts interaction
@@ -658,6 +898,94 @@ function modelStageForEditActionKeyV1(actionKey: string): TaskStage {
 }
 
 /**
+ * Resume-specific gate: unlike a fresh edit-capable invocation (which now has
+ * two valid paths — the sealed pipeline for Copilot, or a direct edit-mode
+ * run for CLI, via runImplementationOrSealedV1), a pending edit-preflight
+ * interaction was, by construction, raised by the sealed pipeline — CLI
+ * providers never create one, since ImplementationRunResult has no
+ * "questions" outcome and CLI never touches the coordinator's preflight
+ * machinery at all. So a CLI-resolved model is never valid here, even though
+ * checkEditActionProviderPathGateV1/checkEditActionAvailabilityV1 now accept
+ * it for a fresh run.
+ *
+ * Codex review finding (prior round): checking only the STAGE'S CONFIGURED
+ * PRIMARY's kind is wrong on its own terms now that a fresh invocation can
+ * fall through a CLI primary to a Copilot BACKUP (runImplementationOrSealedV1
+ * / checkEditActionProviderPathGateV1) — an interaction can therefore have
+ * been legitimately raised by that Copilot backup while the primary is still
+ * (and always was) CLI. The old primary-only check rejected every Resume of
+ * such an interaction outright, even with the exact same backup still live,
+ * making it unresumable short of the user manually reconfiguring their
+ * primary model.
+ *
+ * Codex review finding (this round): the prior round's fix still applied
+ * checkImplementationAvailabilityForModel's normal "primary first, then
+ * backups in configured order" winner search — correct for a FRESH run,
+ * where the primary should always be preferred when live, but wrong for
+ * Resume specifically. If the primary was CLI and unavailable when the
+ * interaction was raised (so a Copilot backup won and created it), and that
+ * CLI primary later RECOVERS before the user resumes, normal winner ordering
+ * picks the now-live CLI primary again — incorrectly rejecting a Resume of a
+ * session the still-live Copilot backup could perfectly well continue. The
+ * interaction transaction does not record which candidate actually created
+ * it (same constraint as before), so instead of top-level winner ordering,
+ * this searches the primary and every configured backup, in that same
+ * order, for the first one that is BOTH Copilot-resolved AND live — ignoring
+ * a live CLI candidate entirely rather than letting it win. Re-verified
+ * fresh at Resume time, on the same "re-verify liveness right before use"
+ * precedent already used throughout this file.
+ *
+ * Still guards the two original failure modes: if no candidate for this
+ * stage is both Copilot-resolved and live, `coordinator.resumeAction` is
+ * never reached — its `preflight` mode has no CLI support and would
+ * otherwise settle (consume) the pending interaction as a terminal
+ * `providerModeUnavailable` failure, destroying the user's in-flight
+ * question/answer with no way to retry it. And the host floor is checked
+ * once a live Copilot candidate is actually found, not against a
+ * stage-level model that may not be it.
+ */
+async function requireCopilotForResumeV1(
+  modelId: string | undefined,
+  stage: TaskStage
+): Promise<{ readonly ok: true } | { readonly ok: false; readonly reason: string }> {
+  // modelId is the caller's resolveFreshModelForStage result — identical to
+  // getModelSettings()[stage]?.primary ?? getAiModelDefaults()[stage] (see
+  // checkEditActionProviderPathGateV1's header) — so it doubles here as the
+  // primary candidate to search from, with no extra settings read needed.
+  const candidates = [modelId, ...backupModelsForStage(stage, modelId)];
+  let lastReason: string | undefined;
+  for (const candidate of candidates) {
+    let kind: "cli" | "copilot" | undefined;
+    try {
+      kind = resolveEffectiveProvider(candidate).kind;
+    } catch (error) {
+      lastReason = error instanceof Error ? error.message : String(error);
+      continue;
+    }
+    if (kind !== "copilot") {
+      continue;
+    }
+    const availability = await checkImplementationAvailabilityForModel(candidate, stage);
+    if (availability.availability.available) {
+      const hostGate = checkEditActionHostGateV1();
+      if (!hostGate.ok) {
+        return { ok: false, reason: hostGate.reason };
+      }
+      return { ok: true };
+    }
+    lastReason = availability.availability.reason;
+  }
+  return {
+    ok: false,
+    reason:
+      lastReason ??
+      "This question was raised during a Copilot preflight session, which only a Copilot model can resume — " +
+      "configure a Copilot model for this stage before answering, or start a fresh run instead (CLI providers " +
+      "cannot resume a sealed preflight).",
+  };
+}
+
+/**
  * `actionKey` is the interaction's own recorded correlation key — the
  * dispatcher in extension.ts already loads the interaction transaction (to
  * decide which Resume handler to call at all) and passes its
@@ -680,20 +1008,19 @@ export async function resumeEditPreflightInteractionV1(
   if (!isEditPreflightActionKeyV1(actionKey)) {
     return { ok: false, reason: `unexpected action key ${actionKey} for an edit-preflight Resume` };
   }
-  // §7.5, applied to Resume drives too: the task/model-INDEPENDENT halves of
-  // the gate run first — before the inventory lookup below (a task read) or
-  // any transaction/binding revalidation — so a pre-1.100 host or a globally
-  // CLI-only configuration is rejected before any task/source read, exactly
-  // like a fresh invocation (checkEditActionAvailabilityV1's workspace-root
-  // half genuinely needs the resolved task's workspace and is revalidated
-  // further down once that is known). The stage passed here is the stage
-  // THIS actionKey actually resolves its model against, not a hardcoded one.
+  // §7.5, applied to Resume drives too — but unlike a fresh invocation,
+  // Resume is Copilot-only (see requireCopilotForResumeV1's header): the
+  // task/model-INDEPENDENT gate runs first, before the inventory lookup
+  // below (a task read) or any transaction/binding revalidation, so an
+  // unresolvable or CLI-resolved model, or a pre-1.100 host, is rejected
+  // before any task/source read, exactly like a fresh invocation
+  // (checkEditActionAvailabilityV1's workspace-root half genuinely needs the
+  // resolved task's workspace and is revalidated further down once that is
+  // known). The stage passed here is the stage THIS actionKey actually
+  // resolves its model against, not a hardcoded one.
   const modelStage = modelStageForEditActionKeyV1(actionKey);
-  const hostGate = checkEditActionHostGateV1();
-  if (!hostGate.ok) {
-    return { ok: false, reason: hostGate.reason };
-  }
-  const providerPathGate = checkEditActionProviderPathGateV1(modelStage);
+  const earlyModelId = getModelSettings()[modelStage]?.primary ?? getAiModelDefaults()[modelStage];
+  const providerPathGate = await requireCopilotForResumeV1(earlyModelId, modelStage);
   if (!providerPathGate.ok) {
     return { ok: false, reason: providerPathGate.reason };
   }
@@ -717,12 +1044,23 @@ export async function resumeEditPreflightInteractionV1(
     sourceAttemptId: ref.sourceAttemptId,
   };
   const model = await resolveFreshModelForStage(taskFolderUri, modelStage);
-  const availability = checkEditActionAvailabilityV1({
+  // Registers the workspace root (needed by the coordinator's file-store
+  // access below) and revalidates the coarse checks against the exact
+  // per-task model — CLI-permissive for a fresh invocation, but Resume's own
+  // Copilot-only requirement is enforced separately right after, since a
+  // stage's model can have changed to CLI since this interaction was raised
+  // (see requireCopilotForResumeV1's header).
+  const availability = await checkEditActionAvailabilityV1({
     workspaceFsPath: workspaceFolderUri.fsPath,
     stageModelId: model.modelId,
+    stage: modelStage,
   });
   if (!availability.ok) {
     return { ok: false, reason: availability.reason };
+  }
+  const resumeProviderGate = await requireCopilotForResumeV1(model.modelId, modelStage);
+  if (!resumeProviderGate.ok) {
+    return { ok: false, reason: resumeProviderGate.reason };
   }
 
   const coordinator = createProductionTaskActionCoordinatorV1({
