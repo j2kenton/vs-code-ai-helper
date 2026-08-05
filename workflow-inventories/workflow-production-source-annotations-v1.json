@@ -1576,7 +1576,7 @@
       "disposition": "modified",
       "cohort": "runnerV1",
       "planSection": "3.4",
-      "rationale": "Provider runner adapter Evidence refresh 2026-07-29 (release-gate re-review of commit 04dc497): the Antigravity CLI adapter gained conversation resumption — its buildArgs now emits --print-timeout=55m0s on every print run and --continue (L897-L907) for follow-up runs within a session, so multi-turn stage chats continue the CLI-side conversation instead of re-sending the full history each turn. BREAKING CHANGE to the Antigravity command line. Evidence refresh 2026-07-30 (commit 161c56f, devpass-code provider support): adds the \"devpass-cli\" CliProviderId/CliProviderDefinition entry — a rebrand/fork of OpenCode sharing its structuredEventStream: \"opencode\" tag and stdin prompt transport, so it reuses the existing opencode-shaped extraction/discovery paths rather than adding a new one. Purely an additional provider-catalog entry; no new writer edge or route.",
+      "rationale": "Provider runner adapter Evidence refresh 2026-07-29 (release-gate re-review of commit 04dc497): the Antigravity CLI adapter gained conversation resumption — its buildArgs now emits --print-timeout=55m0s on every print run and --continue (L897-L907) for follow-up runs within a session, so multi-turn stage chats continue the CLI-side conversation instead of re-sending the full history each turn. BREAKING CHANGE to the Antigravity command line. Evidence refresh 2026-07-30 (commit 161c56f, devpass-code provider support): adds the \"devpass-cli\" CliProviderId/CliProviderDefinition entry — a rebrand/fork of OpenCode sharing its structuredEventStream: \"opencode\" tag and stdin prompt transport, so it reuses the existing opencode-shaped extraction/discovery paths rather than adding a new one. Purely an additional provider-catalog entry; no new writer edge or route. Evidence refresh 2026-08-03 (Kimi prompt-transport fix): kimi-cli moves from promptTransport \"argv\" (with a 20,000-byte maxArgvPromptBytes cap) to \"file\", and its buildArgs now emits a short fixed instruction — buildKimiCliPromptFileInstruction(promptFile), the only argv-borne prompt text — telling Kimi to read the runner-written temp prompt file with its own file tools. Kimi's `-p` is its sole prompt input and it has no prompt-file flag, so argv transport hard-capped every run at the OS command-line ceiling and made real context packs fail with cliPromptTooLarge (118 KB pack vs the 20 KB cap); this removes prompt size from argv entirely. Verified live against kimi-code 0.29.2: reads a temp file outside the workspace when explicitly instructed, executes the file's instructions rather than summarizing them, and retrieves content from the end of a 419 KB file (searching when its Read tool paginates). No change to the permission posture, model catalog, writer edges, or routes; useShell stays false (now required by the file transport rather than the argv one).",
       "owner": "ensemble-workflow-migration",
       "expiryCohort": "cleanup",
       "evidence": {
@@ -1584,7 +1584,7 @@
         "sourceSpan": "whole file",
         "edgeKind": "production-source",
         "targetActionKey": "n/a",
-        "liveSha256": "16c3cdec63aeabcbe72bf98fc1079a3b21b481c106e75981620da954895255d5"
+        "liveSha256": "8820b50f4e5d9efd76f017462aa49abf0fa5e51738d48e87b1b3d35cee94b273"
       }
     },
     {

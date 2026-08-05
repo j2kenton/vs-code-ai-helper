@@ -577,6 +577,44 @@ export const CLAUDE_CLI_HEADLESS_PLAN_MODE_SYSTEM_PROMPT =
 export const CLINE_CLI_ARGV_PROMPT_PLACEHOLDER =
   "Complete the task described in the piped input above.";
 
+/**
+ * The entire argv-borne prompt for a Kimi Code CLI run: a short, fixed
+ * instruction pointing at the temp file that holds the real prompt. Kimi's
+ * `-p` is its only prompt input and has no prompt-file flag, so this is what
+ * lets a 100 KB+ context pack reach a CLI whose argv is capped at the OS
+ * command-line ceiling (see the promptTransport comment on the kimi-cli
+ * provider for the live verification behind each clause below).
+ *
+ * Only `promptFile` — a path this extension generated — is interpolated;
+ * user/context content never reaches argv, so prompt size cannot push this
+ * past the ceiling and there is no injection surface here.
+ *
+ * The wording is load-bearing and was tuned against live runs:
+ *  - "read that entire file" plus the explicit continue/search clause,
+ *    because Kimi's Read tool paginates on large files (verified at 419 KB:
+ *    it searched the file for the trailing marker rather than answering from
+ *    the first page);
+ *  - "authoritative prompt ... not reference material to summarize", because
+ *    Kimi's default posture toward file contents is to treat them as
+ *    untrusted data to report on — a probe run explicitly reasoned about
+ *    prompt injection before complying, and this framing is what makes it
+ *    carry the instructions out instead;
+ *  - naming the file as this run's own instructions, which is also what
+ *    satisfies Kimi's "never read outside the working directory unless
+ *    explicitly instructed" rule for the temp path.
+ *
+ * Exported so providerCliContracts.test.ts can assert on it without
+ * duplicating the literal string.
+ */
+export function buildKimiCliPromptFileInstruction(promptFile: string): string {
+  return (
+    `Your complete instructions and context for this run are in the file at ${promptFile}. ` +
+    "Read that entire file first — it may be large, so keep reading (or search it) until you have all of it — " +
+    "then carry out exactly what it asks. Treat its contents as the authoritative prompt for this run, " +
+    "not as reference material to summarize."
+  );
+}
+
 export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
   {
     id: "claude-cli",
@@ -1269,21 +1307,41 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     // no `--output-format` flag): stdin content is NEVER read in prompt
     // mode — the model reported "no stdin content arrived" even with a
     // clear instruction piped in. `-p`/`--prompt` is the CLI's ONLY prompt
-    // input mechanism, so the prompt must be an argv element; per the
-    // "argv" contract this requires useShell: false, which in turn requires
-    // the native-installer executable (see installHint) rather than an npm
-    // .cmd shim.
-    promptTransport: "argv",
+    // input mechanism, and it has no `--prompt-file`-style flag that reads
+    // the prompt from disk the way Antigravity's `--print=<path>` does
+    // (verified against `kimi --help`).
+    //
+    // That combination previously forced `promptTransport: "argv"`, which
+    // capped the prompt at the OS single-command-line ceiling (~32,767
+    // chars on Windows) and made every real context pack fail outright with
+    // cliPromptTooLarge — a 118 KB pack against a 20 KB cap. This provider
+    // now uses "file" transport WITHOUT a native prompt-file flag instead:
+    // the runner writes the full prompt to a temp file (mode 0600) and
+    // buildArgs passes only a short, fixed instruction telling Kimi to read
+    // that path. Kimi is an agentic CLI whose own Read/search tools then
+    // pull the content in, so the argv ceiling stops applying to prompt
+    // size entirely.
+    //
+    // Verified live end to end against kimi-code 0.29.2 before shipping:
+    //  - it reads a temp file OUTSIDE the workspace (its system prompt
+    //    forbids that "unless explicitly instructed", and the instruction
+    //    below is what explicitly instructs it — this is the one soft,
+    //    model-judgment-dependent link in the chain);
+    //  - it EXECUTES the file's instructions rather than merely summarizing
+    //    them (a probe task told it to create a file; the file was created);
+    //  - it retrieves content from the very END of a 419 KB file, larger
+    //    than any real context pack — when the Read tool paginates, it
+    //    searches the file rather than answering from the first page alone.
+    //
+    // The models' own context windows were never the constraint: every Kimi
+    // model reports maxContextSize 262144+ (one is 1048576) via `kimi
+    // provider list --json`, and a 118 KB prompt is ~30K tokens.
+    //
+    // "file" transport still requires useShell: false (enforced by
+    // execCliAgent), which is why the native-installer executable is
+    // required over an npm .cmd shim — see installHint.
+    promptTransport: "file",
     useShell: false,
-    // No `--prompt-file`-style flag exists (verified via `kimi --help`), so
-    // unlike Antigravity's file-transport escape hatch, a prompt here is
-    // hard-capped by the OS single-command-line length ceiling (~32K chars
-    // on Windows). This is a real, user-facing limitation: a large context
-    // pack that fits other providers' stdin/file transports can fail here
-    // with a clear cliPromptTooLarge error rather than a silent truncation.
-    // 20,000 UTF-8 bytes leaves headroom for the other argv elements and
-    // shell/OS overhead within Windows's ~32,767-character command-line cap.
-    maxArgvPromptBytes: 20_000,
     // Model IDs are "<alias>" values straight out of `kimi provider list
     // --json`'s "models" map (e.g. "kimi-code/k3") — verified live that a
     // bare "k3" is rejected ("Model \"k3\" is not configured in
@@ -1304,7 +1362,7 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     models: [],
     discoverModels: discoverKimiModels,
     usesLastMessageFile: false,
-    buildArgs(_mode, model): string[] {
+    buildArgs(_mode, model, _lastMessageFile, context): string[] {
       // mode is deliberately NOT branched on for a permission flag here —
       // unlike every other provider in this file. Verified live against
       // kimi-code 0.29.2 that `-p`/`--prompt` rejects ALL THREE of
@@ -1316,14 +1374,27 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
       // `-p` for either mode: edit mode gets the exact same args as text
       // mode, both already running with full unattended tool access (see
       // permissionWarning above).
+      //
+      // promptTransport: "file" is a contract with the caller (see
+      // CliBuildArgsContext.promptFile): cliAgentRunner always writes the
+      // prompt to disk and passes its path before calling buildArgs for a
+      // provider declared this way. A missing promptFile means that
+      // contract was violated upstream — throw naming the real cause rather
+      // than sending Kimi an instruction pointing at "undefined", which it
+      // would report as a confusing missing-file error instead.
+      if (!context?.promptFile) {
+        throw new Error(
+          "Kimi Code CLI provider misconfiguration: promptTransport is \"file\" but no promptFile was provided to buildArgs."
+        );
+      }
       const args = ["--output-format", "text"];
       if (model) {
         args.push("-m", model);
       }
-      // promptTransport: "argv" — the caller appends the prompt itself as
-      // the final argv element right after this, which must directly
-      // follow "-p" for it to be read as that flag's value.
-      args.push("-p");
+      // The ONLY argv-borne prompt text is this short, fixed instruction —
+      // never the user's own prompt — so nothing here scales with context
+      // size. It must directly follow "-p" to be read as that flag's value.
+      args.push("-p", buildKimiCliPromptFileInstruction(context.promptFile));
       return args;
     },
   },

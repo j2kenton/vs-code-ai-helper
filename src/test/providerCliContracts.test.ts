@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, it } from "node:test";
 import {
+  buildKimiCliPromptFileInstruction,
   CLAUDE_CLI_HEADLESS_PLAN_MODE_SYSTEM_PROMPT,
   CLI_PROVIDERS,
   CLINE_CLI_ARGV_PROMPT_PLACEHOLDER,
@@ -342,6 +343,65 @@ void describe("provider CLI contracts", () => {
     );
     assert.match(kimi.permissionWarning, /--plan/);
     assert.match(kimi.permissionWarning, /-p/);
+  });
+
+  void it("Kimi carries the whole prompt in a temp file, never in argv", () => {
+    // Kimi's `-p` is its only prompt input and it has no prompt-file flag,
+    // so argv transport capped every run at the OS command-line ceiling and
+    // made real context packs fail with cliPromptTooLarge (118 KB pack vs a
+    // 20 KB cap). "file" transport + a short read-this-file instruction
+    // removes prompt size from argv entirely — see the provider's
+    // promptTransport comment for the live verification behind it.
+    const kimi = getCliProvider("kimi-cli");
+    assert.ok(kimi, "expected kimi-cli provider definition");
+
+    assert.strictEqual(kimi.promptTransport, "file");
+    // "file" transport is enforced as shell:false by execCliAgent; this is
+    // also why Kimi must be the native binary, not an npm .cmd shim.
+    assert.strictEqual(kimi.useShell, false);
+    // An argv byte cap would be meaningless now — and leaving one behind
+    // would re-impose a prompt-size limit that no longer applies.
+    assert.strictEqual(kimi.maxArgvPromptBytes, undefined);
+
+    const promptFile = "/tmp/ensemble-kimi-prompt.txt";
+    const args = kimi.buildArgs("text", "kimi-code/k3", undefined, { promptFile });
+    assert.deepStrictEqual(args, [
+      "--output-format",
+      "text",
+      "-m",
+      "kimi-code/k3",
+      "-p",
+      buildKimiCliPromptFileInstruction(promptFile),
+    ]);
+
+    // The instruction must name the file, and must carry both load-bearing
+    // clauses: read it ALL (its Read tool paginates on large files) and
+    // treat it as instructions rather than material to summarize (its
+    // default posture toward file contents is untrusted-data).
+    const instruction = buildKimiCliPromptFileInstruction(promptFile);
+    assert.ok(instruction.includes(promptFile), "instruction must name the prompt file");
+    assert.match(instruction, /entire file/i);
+    assert.match(instruction, /authoritative prompt/i);
+    // Edit mode is byte-identical: Kimi rejects every permission flag
+    // alongside -p, so mode changes nothing (see permissionWarning).
+    assert.deepStrictEqual(
+      kimi.buildArgs("edit", "kimi-code/k3", undefined, { promptFile }),
+      args
+    );
+
+    // promptTransport "file" is a caller contract; a missing promptFile is
+    // an upstream violation and must name itself rather than silently
+    // pointing Kimi at "undefined". Matching /misconfiguration/ (not merely
+    // /promptFile/) so an unguarded property access throwing its own
+    // TypeError cannot satisfy this vacuously — same rule as Antigravity's.
+    assert.throws(
+      () => kimi.buildArgs("text", undefined, undefined, {}),
+      /misconfiguration/
+    );
+    assert.throws(
+      () => kimi.buildArgs("text", undefined, undefined),
+      /misconfiguration/
+    );
   });
 
   void it("Codex model variants map to base model plus reasoning config", () => {

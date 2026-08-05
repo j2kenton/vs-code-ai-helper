@@ -105,7 +105,7 @@ Eligibility rules for open editors included in provider-bound context packs:
 ### Temp files
 
 - Some CLI runs (Codex) write a temporary last-message file to `os.tmpdir()`.
-- Antigravity (`promptTransport: "file"`) writes the full prompt — including the entire context pack — to a temp file in `os.tmpdir()` before every run, since its CLI takes the prompt as a file path rather than via stdin. The file is written with mode `0600` and deleted after the run.
+- Antigravity and Kimi Code CLI (`promptTransport: "file"`) write the full prompt — including the entire context pack — to a temp file in `os.tmpdir()` before every run, because neither CLI accepts a prompt via stdin. Antigravity takes the file path directly (`--print=<path>`); Kimi has no prompt-file flag, so it is instead passed a short instruction to read that path with its own file tools. Either way the file is written with mode `0600` and deleted after the run.
 - Deletion is best-effort only; the file may persist if cleanup fails.
 - On POSIX, the temp directory is created with mode `0700`.
 
