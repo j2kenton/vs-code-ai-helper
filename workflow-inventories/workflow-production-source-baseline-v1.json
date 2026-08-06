@@ -3,7 +3,7 @@
   "generatedBy": "scripts/resolveProductionSourceUniverse.mjs",
   "description": "Production source universe as of the current working tree, resolved from the exact bundler options that produce dist/extension.js (esbuild.config.js) plus the contribution-asset and runtime-resource-copy rules in scripts/lib/productionSourceScan.mjs. Regenerated every run; diffed against the immutable pre-gate snapshot (workflow-production-source-pregate-v1.json), not authoritative on its own.",
   "packageName": "vs-code-ai-helper",
-  "packageVersion": "0.74.0",
+  "packageVersion": "0.74.1",
   "declaredMain": "./dist/extension.js",
   "entrypoint": "src/extension.ts",
   "outfile": "dist/extension.js",
@@ -164,7 +164,7 @@
     },
     {
       "path": "src/commands/reviewActions.ts",
-      "sha256": "293339e4450957659eb84928c890c4da76cdc16df8835531949f89565d203077"
+      "sha256": "41e90a93cf586755b5835566321009863491a8d50f5757c82073b3864c8fcbba"
     },
     {
       "path": "src/commands/reviewCurrentTask.ts",
@@ -620,7 +620,7 @@
     },
     {
       "path": "src/utils/reviewReadiness.ts",
-      "sha256": "77708df375da2586fe6334ac1b8526683cc08347d6d67c856940ca0a401a4792"
+      "sha256": "de33839f46cd40266b151b871bd5178ebe144e3921132978f962c0a3f21f01e4"
     },
     {
       "path": "src/utils/reviewRouting.ts",
@@ -821,7 +821,7 @@
     },
     {
       "path": "resources/prompts/review-scoring-rubric.md",
-      "sha256": "274e716c735fa0914cc4cda7bb2158bf7ecf5affab62e5757d010b9e0657ec7f",
+      "sha256": "d44b667b422566ddc9c32544e9a5a3330f6ff7f2d79974e666e2fd6602348b96",
       "category": "runtimeResourceCopy"
     },
     {

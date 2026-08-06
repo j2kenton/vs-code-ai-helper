@@ -250,7 +250,7 @@
         },
         {
           "signal": "workspace.fs",
-          "span": "L5656-L5656",
+          "span": "L5662-L5662",
           "enclosingSymbol": "buildReviewResumeVariablesV1"
         }
       ],
