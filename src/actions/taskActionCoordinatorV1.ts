@@ -145,7 +145,13 @@ import {
 } from "../types/agentExecutionV1";
 import { RequestLocalToolHandlerV1 } from "../services/requestLocalToolHandlerV1";
 import { ObservationLedgerV1 } from "../types/preflightPlanV1";
-import { AiResultEnvelopeV1, parseAiResultEnvelopeV1 } from "../types/aiResultEnvelope";
+import {
+  AiResultEnvelopeV1,
+  FRAME_START_V1,
+  hasLoneSurrogate,
+  MalformedAiResultV1,
+  parseAiResultEnvelopeV1,
+} from "../types/aiResultEnvelope";
 import { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
 import { unavailableV1 } from "../types/workflowAvailabilityV1";
 import {
@@ -666,6 +672,93 @@ async function unsealPayload(
   return { ok: true, text: claim.utf8Text };
 }
 
+/** Content types whose completed shape is a single flat string a raw, unwrapped response can losslessly become — see `tryFramelessContentFallbackV1`'s own doc comment. */
+const FRAMELESS_FALLBACK_CONTENT_TYPES_V1: ReadonlySet<string> = new Set([
+  "markdown-artifact.v1",
+  "chat-message.v1",
+]);
+
+/**
+ * Best-effort recovery for one specific, repeatedly-observed failure shape:
+ * a text-mode provider does the real work correctly and writes a complete,
+ * well-formed response, but never emits the `<<<ENSEMBLE_AI_RESULT_V1>>>`
+ * frame ANYWHERE in it — not misplaced, not duplicated, simply never
+ * attempted. Confirmed against four live incidents on 2026-08-06/07 (task
+ * "workflow", runs 022/023/025/029, three of them with the recovered raw
+ * text hand-inspected): every one was a substantively complete, correct
+ * markdown review with zero frame markers anywhere, discarded as
+ * `malformedResult`/`invalidFrame` despite the work being fine.
+ *
+ * Deliberately narrow, in four ways:
+ *  - Only `invalidFrame`, and only when `FRAME_START_V1` does not appear
+ *    ANYWHERE in the raw text. A frame that exists but is duplicated,
+ *    mis-delimited, or wrapped in mismatched line endings means the model
+ *    attempted the contract and got some structural detail wrong — a
+ *    different, more suspicious failure this function does not touch;
+ *    trusting raw content there would be a materially different judgment
+ *    call than "the contract was never attempted at all". A leading BOM or
+ *    an embedded lone (unpaired) UTF-16 surrogate are also refused, even
+ *    though both surface as `invalidFrame` too: those are encoding defects
+ *    in the transport, not "the model skipped the frame", and — for the
+ *    surrogate case specifically — could otherwise flow an unrepresentable
+ *    code unit straight into a promoted artifact.
+ *  - Only rows whose `completedContentType` is a single flat string a raw
+ *    response maps to losslessly (`markdown-artifact.v1`'s `markdown`,
+ *    `chat-message.v1`'s `text`) — never `commit-metadata.v1`, whose
+ *    `subject`/`body` split is a real parsing decision raw text cannot
+ *    safely provide, and never a structured (preflight/edit) content type,
+ *    where a plain-text response cannot substitute for actual operations.
+ *  - Only non-trivial content (a short length floor) so a near-empty or
+ *    whitespace-only response still settles as malformed rather than
+ *    fabricating content from nothing.
+ *  - Not a distinction this function makes, but worth stating: a row whose
+ *    `permittedResultKinds` also includes `"questions"` (review.v1 among
+ *    them) could in principle receive frameless prose that was actually
+ *    meant as a clarifying question rather than a final answer. This
+ *    function has no way to tell the two apart from raw text alone, and
+ *    deliberately does not try — every incident that motivated it was
+ *    unambiguously a completed answer, and refusing every question-capable
+ *    row would gut the fix for exactly the rows it exists to help. Accepted
+ *    tradeoff, not an oversight.
+ *
+ * Returns a synthetic `completed` envelope on success, routed through the
+ * normal `settleEnvelope` promotion path exactly like a well-framed
+ * response — this is a parsing-layer recovery, not a special promotion
+ * path. Returns undefined for every other case, leaving the caller's
+ * existing malformed-result handling (including recovery-spool
+ * preservation) unchanged.
+ */
+const FRAMELESS_FALLBACK_MIN_CHARS_V1 = 20;
+
+/** @internal exported for testing */
+export function tryFramelessContentFallbackV1(
+  row: ProviderTaskActionRowV1,
+  correlation: ActionCorrelationV1,
+  malformed: MalformedAiResultV1
+): AiResultEnvelopeV1 | undefined {
+  if (malformed.code !== "invalidFrame" || malformed.raw.includes(FRAME_START_V1)) {
+    return undefined;
+  }
+  if (
+    (malformed.raw.length > 0 && malformed.raw.charCodeAt(0) === 0xfeff) ||
+    hasLoneSurrogate(malformed.raw)
+  ) {
+    return undefined;
+  }
+  if (!FRAMELESS_FALLBACK_CONTENT_TYPES_V1.has(row.completedContentType)) {
+    return undefined;
+  }
+  const trimmed = malformed.raw.trim();
+  if (trimmed.length < FRAMELESS_FALLBACK_MIN_CHARS_V1) {
+    return undefined;
+  }
+  const content =
+    row.completedContentType === "markdown-artifact.v1"
+      ? ({ contentType: "markdown-artifact.v1", schemaVersion: 1, markdown: trimmed } as const)
+      : ({ contentType: "chat-message.v1", schemaVersion: 1, text: trimmed } as const);
+  return { version: 1, correlation, kind: "completed", content };
+}
+
 /**
  * Best-effort recovery copy of a response that is ABOUT to be discarded as
  * `malformedResult` — preserved for the same 24h window a normal spool would
@@ -1081,6 +1174,10 @@ export function createTaskActionCoordinatorV1(
 
       const parsed = parseAiResultEnvelopeV1(unsealed.text, correlation);
       if (parsed.kind === "malformed") {
+        const framelessFallback = tryFramelessContentFallbackV1(row, correlation, parsed);
+        if (framelessFallback) {
+          return settleEnvelope(row, framelessFallback, session, attemptId, context, acquireLeasePhase, promptSha256);
+        }
         session.reportAttemptOutcome(
           attemptId,
           parsed.code === "resultCorrelationMismatch" ? "resultCorrelationMismatch" : "malformedResult"

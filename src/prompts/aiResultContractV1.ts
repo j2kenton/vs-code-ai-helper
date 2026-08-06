@@ -134,6 +134,24 @@ export function buildAiResultContractPromptV1(input: AiResultContractPromptInput
         'and boolean "retryable".'
     );
   }
+  // Closing reminder (2026-08-06/07 live incidents: four separate reviews on
+  // the "workflow" task did substantively correct work but never emitted the
+  // frame at all — each recovered response showed the model narrating its
+  // own verification process, "let me check X", "let me verify Y", right up
+  // to its final answer, with the frame simply never appearing). Restating
+  // the requirement as the last substantive instruction in the whole prompt
+  // bundle — one line above the closing "=== END ..." marker, itself always
+  // appended last — puts it where a model composing its final answer is most
+  // likely to still have it in view, and names the observed failure mode
+  // directly instead of only stating the positive rule once at the top.
+  lines.push(
+    "",
+    "REMINDER: your reply must begin with <<<ENSEMBLE_AI_RESULT_V1>>> and contain " +
+      "nothing else. Investigate, verify, and reason as much as you need to first — " +
+      "but once you are ready to answer, your final output is ONLY the frame above, " +
+      "with no exploratory notes (\"let me check...\", \"let me verify...\") before or " +
+      "after it, even if your process involved a lot of that."
+  );
   lines.push("=== END ENSEMBLE RESULT CONTRACT ===");
   return lines.join("\n");
 }

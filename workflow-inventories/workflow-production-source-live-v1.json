@@ -84,7 +84,7 @@
     },
     {
       "path": "src/actions/taskActionCoordinatorV1.ts",
-      "sha256": "87dd6184a48346b709dd0d0c2a3f5c4dc14d82b18ce3f80d6572f7a4e271d2a1"
+      "sha256": "dc6255609d27cdabed8f038d22ae721735e625e08f61acbf2d4d08e35de6d8cd"
     },
     {
       "path": "src/actions/taskActionRegistryV1.ts",
@@ -228,7 +228,7 @@
     },
     {
       "path": "src/prompts/aiResultContractV1.ts",
-      "sha256": "e942af07428d160e6edbbecf14fc9a51c842650b50e6d3d883285237b0fda012"
+      "sha256": "a3499b53327d087ea3c647a9c954bff2a08990098e69a19b9d04515cf189f306"
     },
     {
       "path": "src/prompts/editExecutionContractV1.ts",
@@ -416,7 +416,7 @@
     },
     {
       "path": "src/types/aiResultEnvelope.ts",
-      "sha256": "5920891df3e3a5866c1f233cc4c563cd05eca90e3937a063aa3cbecf28c49588"
+      "sha256": "b0436ff14da2d611e6e11d409cd84519140d5391f1e0c8aaf3d2e7670c786b87"
     },
     {
       "path": "src/types/chatInteractionTransactionV1.ts",

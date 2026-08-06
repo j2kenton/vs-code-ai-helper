@@ -476,7 +476,8 @@ function parseStrictJsonV1(text: string): StrictJsonParseResult {
   }
 }
 
-function hasLoneSurrogate(text: string): boolean {
+/** Exported so a caller deciding whether raw malformed text is safe to promote elsewhere (e.g. taskActionCoordinatorV1.ts's frameless-content fallback) can reuse the exact same encoding check rather than re-deriving it. */
+export function hasLoneSurrogate(text: string): boolean {
   return LONE_SURROGATE_PATTERN_V1.test(text);
 }
 

@@ -157,7 +157,11 @@ function malformedTransport(): AgentTransportV1 {
   return {
     runnerId: "scripted-transport",
     invoke: (_request, output): Promise<{ kind: "completed" }> => {
-      output.write("not a valid result frame at all");
+      // Short enough (under taskActionCoordinatorV1.ts's
+      // FRAMELESS_FALLBACK_MIN_CHARS_V1) to stay genuinely malformed rather
+      // than being rescued by tryFramelessContentFallbackV1, which this
+      // suite's own tests are not about.
+      output.write("no frame");
       return Promise.resolve({ kind: "completed" as const });
     },
   };

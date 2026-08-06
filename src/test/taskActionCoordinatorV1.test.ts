@@ -71,6 +71,7 @@ import {
   TaskActionCoordinatorV1,
   TaskActionFollowUpRequestV1,
   TaskActionSettlementRecordV1,
+  tryFramelessContentFallbackV1,
 } from "../actions/taskActionCoordinatorV1";
 import { createBoundedResultStoreV1 } from "../services/boundedResultStoreV1";
 import { AgentExecutionBrokerOptionsV1 } from "../services/agentExecutionBrokerV1";
@@ -87,7 +88,7 @@ import {
 } from "../runners/runnerRegistry";
 import { ActionCorrelationV1, allocateHex128IdV1 } from "../types/actionCorrelationV1";
 import { AgentTransportV1 } from "../types/agentExecutionV1";
-import { CompletedContentV1 } from "../types/aiResultEnvelope";
+import { CompletedContentV1, MalformedAiResultV1 } from "../types/aiResultEnvelope";
 import { MIGRATED_ACTION_KEYS_V0 } from "../services/legacyAiActionSafetyGateV0";
 import {
   createWorkflowLeaseStoreV1,
@@ -450,28 +451,7 @@ void describe("taskActionCoordinatorV1", () => {
     assert.equal(harness.promoted.length, 0);
   });
 
-  void it("maps unframed output, wrong content types, and unpermitted kinds to malformedResult", async () => {
-    const bare = makeHarness([
-      {
-        runnerId: "scripted-transport",
-        invoke: (_request, output): Promise<{ kind: "completed" }> => {
-          output.write("just some prose, no frame");
-          return Promise.resolve({ kind: "completed" as const });
-        },
-      },
-    ]);
-    const bareOutcome = await bare.coordinator.executeAction(baseRequest());
-    assert.equal(bareOutcome.kind, "malformedResult");
-    if (bareOutcome.kind !== "malformedResult") {
-      assert.fail("expected malformedResult");
-    }
-    assert.equal(bareOutcome.code, "invalidFrame");
-    // 2026-08-06 live dogfooding fix: a complete, correct response missing
-    // only the required frame used to surface as the bare code
-    // "invalidFrame" with no way to tell that apart from any other frame
-    // defect. detail now carries the parser's own structural reason.
-    assert.match(bareOutcome.detail ?? "", /expected the frame to start with/);
-
+  void it("maps wrong content types and unpermitted kinds to malformedResult", async () => {
     const wrongType = makeHarness([
       envelopeTransport((correlation) =>
         frame({
@@ -523,6 +503,178 @@ void describe("taskActionCoordinatorV1", () => {
   });
 
   /**
+   * 2026-08-06/07 live incident: four separate `impl-high-review` runs on
+   * the "workflow" task settled `malformedResult (invalidFrame)` in one day,
+   * each time with a substantively complete, correct markdown review
+   * recovered from the discarded response — the model simply never attempted
+   * the `<<<ENSEMBLE_AI_RESULT_V1>>>` frame at all, not merely misplaced it.
+   * tryFramelessContentFallbackV1 rescues exactly that shape instead of
+   * discarding real work.
+   */
+  void it("rescues a frameless-but-substantive text-mode response instead of discarding it as malformed", async () => {
+    const harness = makeHarness([
+      {
+        runnerId: "scripted-transport",
+        invoke: (_request, output): Promise<{ kind: "completed" }> => {
+          output.write(
+            "Let me verify the implementation first.\n\nReadiness: 6.3/10\n\n## Summary\n\nEverything checks out."
+          );
+          return Promise.resolve({ kind: "completed" as const });
+        },
+      },
+    ]);
+    const outcome = await harness.coordinator.executeAction(baseRequest());
+    assert.equal(outcome.kind, "completed");
+    assert.equal(harness.promoted.length, 1);
+    assert.deepEqual(harness.promoted[0], {
+      contentType: "markdown-artifact.v1",
+      schemaVersion: 1,
+      markdown:
+        "Let me verify the implementation first.\n\nReadiness: 6.3/10\n\n## Summary\n\nEverything checks out.",
+    });
+  });
+
+  void it("does not rescue a frameless response with a leading byte-order mark", async () => {
+    const harness = makeHarness([
+      {
+        runnerId: "scripted-transport",
+        invoke: (_request, output): Promise<{ kind: "completed" }> => {
+          output.write("﻿Readiness: 6.3/10\n\nA complete, substantive review with no frame at all.");
+          return Promise.resolve({ kind: "completed" as const });
+        },
+      },
+    ]);
+    const outcome = await harness.coordinator.executeAction(baseRequest());
+    assert.equal(outcome.kind, "malformedResult");
+    if (outcome.kind !== "malformedResult") {
+      assert.fail("expected malformedResult");
+    }
+    assert.equal(outcome.code, "invalidFrame");
+    assert.equal(harness.promoted.length, 0);
+  });
+
+  // Unit-tested directly against tryFramelessContentFallbackV1 rather than
+  // through the full coordinator/broker pipeline: createBoundedResultWriterV1
+  // captures text via `Buffer.from(chunk, "utf8")`, which already replaces a
+  // lone surrogate with U+FFFD at write time (verified directly — a real
+  // lone surrogate cannot survive that round-trip), so a transport-level
+  // `output.write(...)` can never actually deliver one to this function in
+  // practice. The guard stays as defense-in-depth for any other caller of
+  // parseAiResultEnvelopeV1 whose raw text did not go through that writer —
+  // exactly why aiResultEnvelope.test.ts's own equivalent test also calls
+  // the parser directly rather than through a transport.
+  void it("does not rescue a frameless response containing a lone (unpaired) UTF-16 surrogate", () => {
+    const correlation: ActionCorrelationV1 = {
+      actionKey: TEST_ACTION_KEY,
+      operationId: allocateHex128IdV1(),
+      attemptId: allocateHex128IdV1(),
+      ...TASK_BINDING,
+    };
+    const malformed: MalformedAiResultV1 = {
+      kind: "malformed",
+      code: "invalidFrame",
+      raw: "Readiness: 6.3/10\n\nA review with a stray surrogate: \uD800 right here.",
+      reason: "input contains a lone (unpaired) UTF-16 surrogate",
+    };
+    const row: ProviderTaskActionRowV1 = {
+      kind: "provider",
+      actionKey: TEST_ACTION_KEY,
+      routes: [TEST_ROUTE],
+      eligibility: { statuses: ["active"], stages: ["plan"] },
+      requiresTaskOperationLease: true,
+      progressLabel: "Testing…",
+      providerMode: "text",
+      maxResponseBytes: 64 * 1024,
+      permittedResultKinds: ["completed", "questions", "cancelled", "failed"],
+      completedContentType: "markdown-artifact.v1",
+      resumeSemantics: "sameOperation",
+      validateInput: (input) => ({ ok: true, input }),
+      buildPrompt: () => "ACTION PROMPT",
+      promoteCompletedContent: () => Promise.resolve("completed"),
+      loggingPolicy: { channel: "action.test", includeResultMetrics: true },
+    };
+    assert.equal(tryFramelessContentFallbackV1(row, correlation, malformed), undefined);
+  });
+
+  void it("does not rescue a frameless response that is too short to trust as real content", async () => {
+    const harness = makeHarness([
+      {
+        runnerId: "scripted-transport",
+        invoke: (_request, output): Promise<{ kind: "completed" }> => {
+          output.write("too short");
+          return Promise.resolve({ kind: "completed" as const });
+        },
+      },
+    ]);
+    const outcome = await harness.coordinator.executeAction(baseRequest());
+    assert.equal(outcome.kind, "malformedResult");
+    if (outcome.kind !== "malformedResult") {
+      assert.fail("expected malformedResult");
+    }
+    assert.equal(outcome.code, "invalidFrame");
+    assert.equal(harness.promoted.length, 0);
+  });
+
+  void it("does not rescue a response whose frame was attempted but is structurally broken", async () => {
+    // Two frames present: the model attempted the contract and got a
+    // structural detail wrong, a materially different — and more
+    // suspicious — failure than never attempting it at all.
+    const harness = makeHarness([
+      {
+        runnerId: "scripted-transport",
+        invoke: (_request, output): Promise<{ kind: "completed" }> => {
+          output.write(
+            `${frame({
+              version: 1,
+              correlation: { actionKey: TEST_ACTION_KEY, operationId: "0".repeat(32), attemptId: "0".repeat(32), ...TASK_BINDING },
+              kind: "completed",
+              content: { contentType: "markdown-artifact.v1", schemaVersion: 1, markdown: "first" },
+            })}${frame({
+              version: 1,
+              correlation: { actionKey: TEST_ACTION_KEY, operationId: "0".repeat(32), attemptId: "0".repeat(32), ...TASK_BINDING },
+              kind: "completed",
+              content: { contentType: "markdown-artifact.v1", schemaVersion: 1, markdown: "second" },
+            })}`
+          );
+          return Promise.resolve({ kind: "completed" as const });
+        },
+      },
+    ]);
+    const outcome = await harness.coordinator.executeAction(baseRequest());
+    assert.equal(outcome.kind, "malformedResult");
+    if (outcome.kind !== "malformedResult") {
+      assert.fail("expected malformedResult");
+    }
+    assert.equal(outcome.code, "invalidFrame");
+    assert.match(outcome.detail ?? "", /more than one result frame/);
+    assert.equal(harness.promoted.length, 0);
+  });
+
+  void it("does not rescue a frameless response for a content type raw text cannot losslessly become", async () => {
+    // commit-metadata.v1 needs a real subject/body split raw prose cannot
+    // safely provide — deliberately excluded from the fallback's allowed set.
+    const harness = makeHarness(
+      [
+        {
+          runnerId: "scripted-transport",
+          invoke: (_request, output): Promise<{ kind: "completed" }> => {
+            output.write("A perfectly reasonable-looking commit message body, just never framed.");
+            return Promise.resolve({ kind: "completed" as const });
+          },
+        },
+      ],
+      { completedContentType: "commit-metadata.v1" }
+    );
+    const outcome = await harness.coordinator.executeAction(baseRequest());
+    assert.equal(outcome.kind, "malformedResult");
+    if (outcome.kind !== "malformedResult") {
+      assert.fail("expected malformedResult");
+    }
+    assert.equal(outcome.code, "invalidFrame");
+    assert.equal(harness.promoted.length, 0);
+  });
+
+  /**
    * Live incident, 2026-08-06: a review settled `malformedResult
    * (invalidFrame)` after the model did the work correctly and only omitted
    * the required output frame. Nothing in the coordinator kept a copy of
@@ -536,12 +688,17 @@ void describe("taskActionCoordinatorV1", () => {
   void it("preserves a malformed result's raw text for recovery when a spool store is configured", async () => {
     const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-recovery-spool-"));
     const spoolStore = createBoundedResultStoreV1({ rootDir });
+    // Well-framed but invalid JSON inside: "invalidJson", never rescued by
+    // tryFramelessContentFallbackV1 (which only ever touches "invalidFrame"),
+    // so this keeps testing genuine malformed-result recovery regardless of
+    // that fallback's own tuning.
+    const rawText = "<<<ENSEMBLE_AI_RESULT_V1>>>\nnot valid json\n<<<END_ENSEMBLE_AI_RESULT_V1>>>\n";
     const harness = makeHarness(
       [
         {
           runnerId: "scripted-transport",
           invoke: (_request, output): Promise<{ kind: "completed" }> => {
-            output.write("just some prose, no frame — this is the model's real, correct answer");
+            output.write(rawText);
             return Promise.resolve({ kind: "completed" as const });
           },
         },
@@ -556,6 +713,7 @@ void describe("taskActionCoordinatorV1", () => {
       if (outcome.kind !== "malformedResult") {
         assert.fail("expected malformedResult");
       }
+      assert.equal(outcome.code, "invalidJson");
       assert.match(outcome.detail ?? "", /response preserved for recovery/);
       assert.match(
         outcome.detail ?? "",
@@ -579,10 +737,7 @@ void describe("taskActionCoordinatorV1", () => {
       };
       walk(rootDir);
       assert.equal(spoolFiles.length, 1, "exactly one recovery spool must be written");
-      assert.equal(
-        fs.readFileSync(spoolFiles[0]!, "utf8"),
-        "just some prose, no frame — this is the model's real, correct answer"
-      );
+      assert.equal(fs.readFileSync(spoolFiles[0]!, "utf8"), rawText);
 
       // The persisted meta must carry purpose: "recovery" — this is what lets
       // a reader walking the SAME store's tree (Recover Last AI Response)
@@ -599,12 +754,14 @@ void describe("taskActionCoordinatorV1", () => {
   void it("never blocks settlement when no spool store is configured — recovery is best-effort", async () => {
     // The default harness (used by every other test in this suite) passes no
     // brokerOptions at all; this pins that the malformedResult path still
-    // settles cleanly with no detail crash and no thrown error.
+    // settles cleanly with no detail crash and no thrown error. Short enough
+    // (under FRAMELESS_FALLBACK_MIN_CHARS_V1) to stay genuinely malformed
+    // rather than being rescued by tryFramelessContentFallbackV1.
     const harness = makeHarness([
       {
         runnerId: "scripted-transport",
         invoke: (_request, output): Promise<{ kind: "completed" }> => {
-          output.write("no frame here either");
+          output.write("no frame at all");
           return Promise.resolve({ kind: "completed" as const });
         },
       },
