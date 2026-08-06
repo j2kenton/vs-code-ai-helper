@@ -513,6 +513,56 @@ void describe("provider CLI contracts", () => {
     assert.strictEqual(kimi.buildEnv(undefined), undefined);
   });
 
+  void it("Kimi can resume its own conversation instead of replaying a long prompt", () => {
+    // Kimi is the slowest provider here (live-timed at ~10-18 minutes for one
+    // plan review against a one-hour process cap), so a timed-out run is
+    // disproportionately expensive to redo from scratch. Declaring
+    // conversationResume makes Ensemble's own RUN_TIMEOUT_MS path
+    // retry-eligible (cliAgentRunner keys that solely off the field being
+    // defined) and makes the retry send only continuationPrompt with
+    // --continue, preserving partial edits.
+    const kimi = getCliProvider("kimi-cli");
+    assert.ok(kimi, "expected kimi-cli provider definition");
+    assert.ok(kimi.conversationResume, "expected kimi-cli to declare conversationResume");
+
+    // Deliberately empty: no Kimi-owned RECOVERABLE diagnostic has been
+    // observed. Every failure captured live is terminal (bad model alias,
+    // rejected effort, missing session), and a marker matching one of those
+    // would trade a clean failure for a pointless second full-length run.
+    // The timeout path needs no marker. See the field's comment before
+    // adding one.
+    assert.deepStrictEqual(kimi.conversationResume.errorMarkers, []);
+    assert.ok(
+      kimi.conversationResume.continuationPrompt.length > 0,
+      "a resumed run still needs a continuation prompt to send"
+    );
+
+    const promptFile = "/tmp/ensemble-kimi-prompt.txt";
+    const fresh = kimi.buildArgs("text", "kimi-code/k3", undefined, { promptFile });
+    assert.ok(
+      !fresh.includes("--continue"),
+      "a first attempt must not continue a previous conversation"
+    );
+
+    const resumed = kimi.buildArgs("text", "kimi-code/k3", undefined, {
+      promptFile,
+      resumePreviousConversation: true,
+    });
+    assert.ok(resumed.includes("--continue"), "a resumed attempt must pass --continue");
+    // Verified live that --continue coexists with -p (unlike --yolo/--auto/
+    // --plan, which the CLI rejects outright alongside it), so the rest of
+    // the vector must stay intact.
+    assert.deepStrictEqual(resumed, [
+      "--output-format",
+      "stream-json",
+      "--continue",
+      "-m",
+      "kimi-code/k3",
+      "-p",
+      resumed[resumed.length - 1],
+    ]);
+  });
+
   void it("Codex model variants map to base model plus reasoning config", () => {
     const codex = getCliProvider("codex-cli");
     assert.ok(codex, "expected codex-cli provider definition");

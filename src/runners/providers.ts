@@ -1497,6 +1497,42 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     // (Kimi's `{"role":"tool",...}` lines carry whatever files it read), so
     // failure diagnosis must not scan the raw stream for auth markers.
     structuredEventStream: "kimi",
+    // Kimi is by far the slowest provider here — live-timed at ~10 minutes
+    // for a plan review in `text` mode and ~18 minutes for the same work in
+    // stream-json, against Ensemble's one-hour process cap. That makes a
+    // timed-out or dropped run disproportionately expensive: without this,
+    // the whole 100 KB+ prompt is replayed from scratch and every minute of
+    // model work (and quota) already spent is discarded.
+    //
+    // Declaring conversationResume changes that in two ways (cliAgentRunner):
+    //  - the RUN_TIMEOUT_MS path keys off `def.conversationResume !== undefined`
+    //    alone, so Ensemble's own timeout becomes retry-eligible instead of a
+    //    dead failure; and
+    //  - the retry then re-invokes with `--continue` and sends only
+    //    continuationPrompt rather than the original prompt, deliberately
+    //    preserving any partial workspace edits (the resume path skips the
+    //    clean-snapshot precondition for exactly this reason).
+    //
+    // errorMarkers is deliberately EMPTY. Antigravity carries one because its
+    // own "error: timeout waiting for response" text was observed live; no
+    // equivalent Kimi-owned recoverable diagnostic has been observed yet.
+    // Every Kimi failure captured so far is terminal and NOT resumable — a
+    // rejected model alias ("Model ... is not configured in config.toml"), a
+    // rejected thinking effort ("provider.api_error: 400"), a missing session
+    // ("Session ... not found") — so inventing a marker would trade a clean
+    // failure for a pointless second full-length run. The timeout path above
+    // needs no marker, which is where the real value is. Add a marker here
+    // only after observing a genuine recoverable one in a real run.
+    conversationResume: {
+      errorMarkers: [],
+      continuationPrompt:
+        "Continue the same task from where the previous response stopped. Your earlier " +
+        "context, including the instructions file you already read, is still in this " +
+        "conversation — do not re-read it from scratch unless you need a specific detail. " +
+        "Inspect the current workspace state and any changes you already made first, then " +
+        "finish the remaining requested work without restarting or reverting completed work. " +
+        "Emit the required final result frame exactly as originally instructed.",
+    },
     buildEnv(model): Record<string, string> | undefined {
       const { reasoningEffort } = parseKimiModelSelection(model);
       return reasoningEffort
@@ -1541,6 +1577,22 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
       // with the start marker and ending with the end marker, no
       // surrounding text.
       const args = ["--output-format", "stream-json"];
+      if (context.resumePreviousConversation) {
+        // Verified live against kimi-code 0.29.2 that `--continue` is
+        // accepted alongside `-p` (unlike `--yolo`/`--auto`/`--plan`, which
+        // it rejects outright) and genuinely restores context: a second run
+        // recalled a codeword from the first without it being restated, and
+        // reported the same session_id.
+        //
+        // Safer than Antigravity's equivalent: Kimi scopes --continue to the
+        // WORKING DIRECTORY ("No sessions to continue under <cwd>; starting
+        // a fresh session."), not to its globally most recent conversation,
+        // and execCliAgent always spawns with the task's workspace as cwd —
+        // so a concurrent Kimi run under a different workspace cannot be
+        // continued by mistake. Its no-session fallback is also graceful
+        // (fresh session, exit 0) rather than an error.
+        args.push("--continue");
+      }
       // -m takes only the bare model alias — a trailing "@effort" suffix is
       // rejected outright (verified live), so it must be split off here.
       // The effort itself reaches the CLI via buildEnv's
