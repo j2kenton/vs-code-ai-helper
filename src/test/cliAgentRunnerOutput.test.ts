@@ -146,6 +146,25 @@ void describe("CLI output normalization", () => {
     );
   });
 
+  // 2026-08-07: the V1 createCliTextTransportV1 path (requiresFramedResult:
+  // true) needs only the model's LAST text part — its reply is parsed by
+  // parseAiResultEnvelopeV1, and concatenating narration ahead of the frame
+  // fed the parser text whose frame (if attempted at all) was buried
+  // mid-response. Legacy free-text callers (the test above, and every
+  // existing caller) are unaffected — requiresFramedResult defaults to false.
+  void it("keeps only the LAST opencode text part when requiresFramedResult is true", () => {
+    const stream = [
+      JSON.stringify({ type: "text", part: { type: "text", text: "I'll create the file." } }),
+      JSON.stringify({ type: "tool_use", part: { type: "tool", tool: "write" } }),
+      JSON.stringify({ type: "text", part: { type: "text", text: "<<<ENSEMBLE_AI_RESULT_V1>>>\nreal frame\n<<<END_ENSEMBLE_AI_RESULT_V1>>>" } }),
+    ].join("\n");
+
+    assert.strictEqual(
+      __testOnly.extractOpencodeFinalOutput(stream, undefined, true),
+      "<<<ENSEMBLE_AI_RESULT_V1>>>\nreal frame\n<<<END_ENSEMBLE_AI_RESULT_V1>>>"
+    );
+  });
+
   void it("returns a non-empty placeholder (not the raw JSON, not empty) for a recognized stream with no text reply", () => {
     // Real, reproduced-live scenario (opencode 1.18.4): a build-mode run
     // instructed to act silently ("create this file, no confirmation text")

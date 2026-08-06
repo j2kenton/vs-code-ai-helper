@@ -1251,7 +1251,24 @@ function extractClineStructuredDiagnostics(
 
 function extractOpencodeFinalOutput(
   stdout: string,
-  parsed: ParsedCliEventLines = parseJsonLineEvents(stdout)
+  parsed: ParsedCliEventLines = parseJsonLineEvents(stdout),
+  /**
+   * When true (the V1 `createCliTextTransportV1` path, whose reply is parsed
+   * by `parseAiResultEnvelopeV1`), keep only the LAST text part instead of
+   * concatenating every one. 2026-08-07 live incidents: concatenating
+   * narration ahead of a final framed answer ("I'll check X" ... tool call
+   * ... the actual frame) fed the parser text whose frame — if the model
+   * attempted one at all — was buried mid-response rather than isolated.
+   * `parseAiResultEnvelopeV1` now also scans for the frame rather than
+   * requiring it at byte zero (belt and braces — this fix and that one are
+   * independently useful), but not concatenating narration in the first
+   * place keeps the captured text itself close to just the model's real
+   * answer. Legacy free-text callers (default false) keep the full
+   * concatenated reply unchanged — nothing there depends on frame position,
+   * and reconstructing the complete multi-part reply is the correct
+   * behavior for them.
+   */
+  requiresFramedResult = false
 ): string {
   const cleaned = stripAnsi(stdout).trim();
   if (cleaned.length === 0) {
@@ -1278,7 +1295,7 @@ function extractOpencodeFinalOutput(
   }
 
   if (textParts.length > 0) {
-    return textParts.join("\n\n").trim();
+    return (requiresFramedResult ? textParts[textParts.length - 1]! : textParts.join("\n\n")).trim();
   }
 
   if (sawRecognizedEvent) {
@@ -1298,7 +1315,9 @@ function normalizeCliOutput(
   def: CliProviderDefinition,
   stdout: string,
   lastMessageFile: string | undefined,
-  parsed?: ParsedCliEventLines
+  parsed?: ParsedCliEventLines,
+  /** Forwarded to extractOpencodeFinalOutput — see its own doc comment. False (the legacy default) for every caller except createCliTextTransportV1's V1 path. */
+  requiresFramedResult = false
 ): string {
   let output = stripAnsi(stdout).trim();
   if (lastMessageFile) {
@@ -1329,7 +1348,7 @@ function normalizeCliOutput(
     // extractOpencodeFinalOutput's own default parameter already parses
     // internally in that case — an explicit undefined argument triggers a
     // default the same as omitting it.
-    return extractOpencodeFinalOutput(output, parsed);
+    return extractOpencodeFinalOutput(output, parsed, requiresFramedResult);
   }
 
   if (def.id === "cline-cli") {
@@ -1612,9 +1631,14 @@ export function createCliTextTransportV1(options: {
                 // the provider's own extractor and write it as the single
                 // captured payload — a framed result the model emitted
                 // arrives at the broker as directly parseable framed bytes.
+                // requiresFramedResult: true (2026-08-07) — this reply is
+                // parsed by parseAiResultEnvelopeV1, so opencode/devpass-cli
+                // keep only the model's LAST text part instead of
+                // concatenating narration ahead of the frame; see
+                // extractOpencodeFinalOutput's own doc comment.
                 const rawStdout = Buffer.concat(rawEventChunks).toString("utf8");
                 rawEventChunks.length = 0;
-                capture.handleStdout(normalizeCliOutput(def, rawStdout, undefined));
+                capture.handleStdout(normalizeCliOutput(def, rawStdout, undefined, undefined, true));
               }
               finish({ kind: "completed" });
               return;

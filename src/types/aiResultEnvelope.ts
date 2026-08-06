@@ -954,13 +954,36 @@ function decodeEnvelopeV1(
  *   <<<ENSEMBLE_AI_RESULT_V1>>>
  *   <single-line strict JSON>
  *   <<<END_ENSEMBLE_AI_RESULT_V1>>>
- * using LF-only or CRLF-only line endings (not mixed), with nothing before
- * the start marker or after the end marker beyond a single, fully optional
- * trailing newline (the near-universal stdout convention). Any other input
- * shape — a bare-text response, multiple frames, a BOM, mixed line endings,
- * multiline JSON, or a JSON payload that violates the envelope schema — is
- * "malformed", carrying the raw text, a machine-readable `code`, and a
- * human-readable `reason`.
+ * using LF-only or CRLF-only line endings (not mixed), with the frame ending
+ * at the very end of the input (beyond a single, fully optional trailing
+ * newline — the near-universal stdout convention) but NOT required to begin
+ * there. Text ahead of the frame is tolerated and discarded rather than
+ * rejected — see "Why scan from the end" below. Any other input shape — no
+ * frame anywhere, a BOM, mixed line endings, multiline JSON, or a JSON
+ * payload that violates the envelope schema — is "malformed", carrying the
+ * raw text, a machine-readable `code`, and a human-readable `reason`.
+ *
+ * Why scan from the end (2026-08-07, live incidents): agentic CLI providers
+ * routinely interleave narration with tool calls ("I'll check X" ... tool
+ * call ... "Done."), and some capture paths concatenate every text part in
+ * stream order (`extractOpencodeFinalOutput`) while others keep only the
+ * model's own last message verbatim, narration and all
+ * (`extractClineFinalOutput`/`extractKimiFinalOutput`) — either way, a model
+ * that narrates at all before its final answer cannot land the frame at byte
+ * zero, which is not a model defect but a structural mismatch between output
+ * shape and a byte-zero requirement. Taking the LAST occurrence of
+ * `FRAME_START_V1` — rather than the first — is also what makes this safe
+ * for a repo whose own reviews discuss this exact frame format in prose: a
+ * quoted/mentioned marker earlier in the text can never be mistaken for the
+ * real one, because the real one (per the result-contract prompt) is always
+ * what the model writes last.
+ *
+ * A consequence worth stating plainly: multiple complete frames no longer
+ * reject as malformed — the last one wins, and every earlier one (whether a
+ * genuine duplicate or an incidental quoted mention) is silently discarded.
+ * This mirrors the same "keep only the final say" philosophy
+ * `extractClineFinalOutput`/`extractKimiFinalOutput` already apply one layer
+ * down, and is a deliberate loosening, not an oversight.
  *
  * Pass `expectedCorrelation` when the caller already knows which operation
  * and attempt it invoked, to reject a cross-task/cross-operation/
@@ -979,26 +1002,28 @@ export function parseAiResultEnvelopeV1(
     return malformed("invalidFrame", raw, "input contains a lone (unpaired) UTF-16 surrogate");
   }
 
-  let body = raw;
-  if (body.endsWith("\r\n")) {
-    body = body.slice(0, -2);
-  } else if (body.endsWith("\n")) {
-    body = body.slice(0, -1);
+  let trimmedForTrailingNewline = raw;
+  if (trimmedForTrailingNewline.endsWith("\r\n")) {
+    trimmedForTrailingNewline = trimmedForTrailingNewline.slice(0, -2);
+  } else if (trimmedForTrailingNewline.endsWith("\n")) {
+    trimmedForTrailingNewline = trimmedForTrailingNewline.slice(0, -1);
   }
 
-  if (!body.startsWith(FRAME_START_V1)) {
-    return malformed("invalidFrame", raw, `expected the frame to start with ${FRAME_START_V1}`);
+  const frameStartIndex = trimmedForTrailingNewline.lastIndexOf(FRAME_START_V1);
+  if (frameStartIndex === -1) {
+    return malformed(
+      "invalidFrame",
+      raw,
+      `the response does not contain the required ${FRAME_START_V1} frame marker anywhere`
+    );
   }
+  const body = trimmedForTrailingNewline.slice(frameStartIndex);
+
   if (!body.endsWith(FRAME_END_V1)) {
     return malformed("invalidFrame", raw, `expected the frame to end with ${FRAME_END_V1}`);
   }
   if (body.length < FRAME_START_V1.length + FRAME_END_V1.length) {
     return malformed("invalidFrame", raw, "start and end markers overlap");
-  }
-
-  const afterStart = body.slice(FRAME_START_V1.length);
-  if (afterStart.includes(FRAME_START_V1)) {
-    return malformed("invalidFrame", raw, "found more than one result frame");
   }
 
   const middle = body.slice(FRAME_START_V1.length, body.length - FRAME_END_V1.length);

@@ -3,7 +3,7 @@
   "generatedBy": "scripts/resolveProductionSourceUniverse.mjs",
   "description": "Production source universe as of the current working tree, resolved from the exact bundler options that produce dist/extension.js (esbuild.config.js) plus the contribution-asset and runtime-resource-copy rules in scripts/lib/productionSourceScan.mjs. Regenerated every run; diffed against the immutable pre-gate snapshot (workflow-production-source-pregate-v1.json), not authoritative on its own.",
   "packageName": "vs-code-ai-helper",
-  "packageVersion": "0.74.4",
+  "packageVersion": "0.74.5",
   "declaredMain": "./dist/extension.js",
   "entrypoint": "src/extension.ts",
   "outfile": "dist/extension.js",
@@ -236,7 +236,7 @@
     },
     {
       "path": "src/runners/cliAgentRunner.ts",
-      "sha256": "a125747d5e8e03b1ef4b88f6c75d78c6489901487e5ebf8e54fe1672c8bc1f00"
+      "sha256": "7f49c9690001870d462113151fa7dd4adfe1347fe6aaac20b5015237b541b419"
     },
     {
       "path": "src/runners/copilotImplementationRunner.ts",
@@ -416,7 +416,7 @@
     },
     {
       "path": "src/types/aiResultEnvelope.ts",
-      "sha256": "b0436ff14da2d611e6e11d409cd84519140d5391f1e0c8aaf3d2e7670c786b87"
+      "sha256": "ee200807bb6e0089d4199b7ecdbaf822ee719475b8ae6498b013505e77756f6b"
     },
     {
       "path": "src/types/chatInteractionTransactionV1.ts",

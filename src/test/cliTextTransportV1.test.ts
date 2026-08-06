@@ -183,6 +183,42 @@ void describe("createCliTextTransportV1 structured-event capture", () => {
     assert.equal(parsed.kind, "completed", "the captured payload must parse as one strict envelope");
   });
 
+  /**
+   * 2026-08-07 live incidents: a real agentic run narrates between tool
+   * calls ("I'll check X" ... "Done."), and opencode's event stream carries
+   * that as separate "text" parts. Before this fix, extractOpencodeFinalOutput
+   * concatenated all of them, so the captured payload had the frame buried
+   * after narration rather than isolated — this end-to-end test proves the
+   * full spawn-to-writer path now isolates the model's last text part
+   * (the frame) instead.
+   */
+  void it("keeps only the model's final text part when narration precedes the frame", async () => {
+    const correlation = makeCorrelation();
+    const frame = frameFor(correlation);
+    const stdout = [
+      JSON.stringify({ type: "text", part: { type: "text", text: "Let me check the implementation first." } }),
+      JSON.stringify({ type: "tool", part: { type: "tool", state: { output: "some file content" } } }),
+      JSON.stringify({ type: "text", part: { type: "text", text: "Verified. Writing the answer now." } }),
+      JSON.stringify({ type: "text", part: { type: "text", text: frame } }),
+      "",
+    ].join("\n");
+
+    const def = scriptedDef({ id: "opencode-cli", structuredEventStream: "opencode", stdout });
+    const transport = createCliTextTransportV1({ def, model: undefined, cwd: process.cwd() });
+    const { writer, text } = collectingWriter();
+    const exit = await transport.invoke(makeRequest(correlation), writer);
+
+    assert.deepEqual(exit, { kind: "completed" });
+    const captured = text();
+    assert.equal(
+      captured,
+      frame,
+      "narration text parts must not be concatenated into the captured payload"
+    );
+    const parsed = parseAiResultEnvelopeV1(captured, correlation);
+    assert.equal(parsed.kind, "completed", "the captured payload must parse as one strict envelope");
+  });
+
   void it("unwraps a cline run_result into one directly parseable framed envelope", async () => {
     const correlation = makeCorrelation();
     const frame = frameFor(correlation);

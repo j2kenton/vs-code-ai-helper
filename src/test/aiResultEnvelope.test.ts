@@ -576,16 +576,26 @@ void describe("parseAiResultEnvelopeV1 — frame parsing", () => {
     }
   });
 
-  void it("rejects outer bytes before the start marker", () => {
-    const raw = "preamble\n" + frame({ version: 1, correlation: correlation(), kind: "cancelled" });
+  /**
+   * 2026-08-07 live incidents: agentic CLI providers routinely narrate
+   * ("I'll check X", "Let me verify Y") before their final answer, and some
+   * capture paths concatenate that narration ahead of the frame. Requiring
+   * the frame at byte zero made every narrating run fail — not a model
+   * defect, a structural mismatch. The parser now tolerates and discards
+   * anything before the LAST frame-start marker instead of rejecting it.
+   */
+  void it("tolerates and discards narration before the frame instead of rejecting it", () => {
+    const raw =
+      "Let me check the implementation first.\n\nOkay, verified.\n\n" +
+      frame({ version: 1, correlation: correlation(), kind: "cancelled" });
     const result = parseAiResultEnvelopeV1(raw);
-    assert.equal(result.kind, "malformed");
-    if (result.kind === "malformed") {
-      assert.equal(result.code, "invalidFrame");
-    }
+    assert.equal(result.kind, "cancelled");
   });
 
-  void it("rejects outer bytes after the end marker", () => {
+  void it("still rejects outer bytes after the end marker", () => {
+    // Preamble is tolerated; a trailer is not — once the model emits the
+    // frame, the result-contract prompt says that is its entire reply, so
+    // trailing content past the end marker stays a genuine violation.
     const raw = frame({ version: 1, correlation: correlation(), kind: "cancelled" }) + "\ntrailer";
     const result = parseAiResultEnvelopeV1(raw);
     assert.equal(result.kind, "malformed");
@@ -594,13 +604,32 @@ void describe("parseAiResultEnvelopeV1 — frame parsing", () => {
     }
   });
 
-  void it("rejects two frames back to back", () => {
-    const one = frame({ version: 1, correlation: correlation(), kind: "cancelled" });
-    const raw = one + one;
+  void it("rejects a response with no frame marker anywhere", () => {
+    const raw = "just some prose, no frame at all, nothing to find here.";
     const result = parseAiResultEnvelopeV1(raw);
     assert.equal(result.kind, "malformed");
     if (result.kind === "malformed") {
-      assert.match(result.reason, /more than one result frame/);
+      assert.equal(result.code, "invalidFrame");
+      assert.match(result.reason, /does not contain the required.*frame marker anywhere/);
+    }
+  });
+
+  /**
+   * Multiple frames no longer reject outright — the LAST one wins, and every
+   * earlier one is silently discarded. Two reasons: (1) it mirrors the same
+   * "keep only the final say" choice extractClineFinalOutput/
+   * extractKimiFinalOutput already make for multi-turn CLI output, and
+   * (2) it is what makes scanning safe for a repo whose own reviews discuss
+   * this exact frame format in prose — a quoted/mentioned marker earlier in
+   * the text can never be mistaken for the real, final one.
+   */
+  void it("keeps the LAST of two frames back to back, discarding the first", () => {
+    const first = frame({ version: 1, correlation: correlation(), kind: "cancelled", reason: "user" });
+    const second = frame({ version: 1, correlation: correlation(), kind: "cancelled", reason: "provider" });
+    const result = parseAiResultEnvelopeV1(first + second);
+    assert.equal(result.kind, "cancelled");
+    if (result.kind === "cancelled") {
+      assert.equal(result.reason, "provider");
     }
   });
 

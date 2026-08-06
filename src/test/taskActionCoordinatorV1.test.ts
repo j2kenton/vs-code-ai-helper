@@ -615,27 +615,23 @@ void describe("taskActionCoordinatorV1", () => {
     assert.equal(harness.promoted.length, 0);
   });
 
+  // 2026-08-07: parseAiResultEnvelopeV1 now scans for the LAST frame-start
+  // marker and keeps only that frame, discarding anything before it — so two
+  // complete, well-formed frames back to back are no longer "structurally
+  // broken" at all; the second one wins outright (see
+  // aiResultEnvelope.test.ts's own "keeps the LAST of two frames" test). A
+  // frame that starts but never closes is still genuinely broken under the
+  // new parser too, and is the case this test now covers instead.
   void it("does not rescue a response whose frame was attempted but is structurally broken", async () => {
-    // Two frames present: the model attempted the contract and got a
-    // structural detail wrong, a materially different — and more
-    // suspicious — failure than never attempting it at all.
     const harness = makeHarness([
       {
         runnerId: "scripted-transport",
         invoke: (_request, output): Promise<{ kind: "completed" }> => {
-          output.write(
-            `${frame({
-              version: 1,
-              correlation: { actionKey: TEST_ACTION_KEY, operationId: "0".repeat(32), attemptId: "0".repeat(32), ...TASK_BINDING },
-              kind: "completed",
-              content: { contentType: "markdown-artifact.v1", schemaVersion: 1, markdown: "first" },
-            })}${frame({
-              version: 1,
-              correlation: { actionKey: TEST_ACTION_KEY, operationId: "0".repeat(32), attemptId: "0".repeat(32), ...TASK_BINDING },
-              kind: "completed",
-              content: { contentType: "markdown-artifact.v1", schemaVersion: 1, markdown: "second" },
-            })}`
-          );
+          // Frame start present, but the response ends before the closing
+          // marker ever appears — the model attempted the contract and got a
+          // structural detail wrong, a materially different — and more
+          // suspicious — failure than never attempting it at all.
+          output.write("<<<ENSEMBLE_AI_RESULT_V1>>>\nsomething went wrong mid-stream, never closed");
           return Promise.resolve({ kind: "completed" as const });
         },
       },
@@ -646,7 +642,7 @@ void describe("taskActionCoordinatorV1", () => {
       assert.fail("expected malformedResult");
     }
     assert.equal(outcome.code, "invalidFrame");
-    assert.match(outcome.detail ?? "", /more than one result frame/);
+    assert.match(outcome.detail ?? "", /expected the frame to end with/);
     assert.equal(harness.promoted.length, 0);
   });
 
