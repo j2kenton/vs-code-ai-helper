@@ -147,12 +147,12 @@ void describe("CLI output normalization", () => {
   });
 
   // 2026-08-07: the V1 createCliTextTransportV1 path (requiresFramedResult:
-  // true) needs only the model's LAST text part — its reply is parsed by
-  // parseAiResultEnvelopeV1, and concatenating narration ahead of the frame
-  // fed the parser text whose frame (if attempted at all) was buried
-  // mid-response. Legacy free-text callers (the test above, and every
+  // true) needs the text part that actually carries the frame — its reply is
+  // parsed by parseAiResultEnvelopeV1, and concatenating narration ahead of
+  // the frame fed the parser text whose frame (if attempted at all) was
+  // buried mid-response. Legacy free-text callers (the test above, and every
   // existing caller) are unaffected — requiresFramedResult defaults to false.
-  void it("keeps only the LAST opencode text part when requiresFramedResult is true", () => {
+  void it("keeps the opencode text part carrying the frame when requiresFramedResult is true", () => {
     const stream = [
       JSON.stringify({ type: "text", part: { type: "text", text: "I'll create the file." } }),
       JSON.stringify({ type: "tool_use", part: { type: "tool", tool: "write" } }),
@@ -162,6 +162,53 @@ void describe("CLI output normalization", () => {
     assert.strictEqual(
       __testOnly.extractOpencodeFinalOutput(stream, undefined, true),
       "<<<ENSEMBLE_AI_RESULT_V1>>>\nreal frame\n<<<END_ENSEMBLE_AI_RESULT_V1>>>"
+    );
+  });
+
+  /**
+   * Code-review finding, 2026-08-07: a model that keeps talking after the
+   * frame ("Done.") — or even emits a stray empty text event — used to make
+   * the true last part win, discarding the frame entirely (an empty last
+   * part made the WHOLE captured payload "", a hard malformedResult with no
+   * chance for the parser's own scan-from-end fix to help, since the frame
+   * text never reached it at all). Scanning from the end for the part that
+   * actually contains the frame closes this instead of trading one failure
+   * shape for another.
+   */
+  void it("does not lose the frame to a trailing text part emitted after it", () => {
+    const stream = [
+      JSON.stringify({ type: "text", part: { type: "text", text: "I'll create the file." } }),
+      JSON.stringify({ type: "text", part: { type: "text", text: "<<<ENSEMBLE_AI_RESULT_V1>>>\nreal frame\n<<<END_ENSEMBLE_AI_RESULT_V1>>>" } }),
+      JSON.stringify({ type: "text", part: { type: "text", text: "Done." } }),
+    ].join("\n");
+
+    assert.strictEqual(
+      __testOnly.extractOpencodeFinalOutput(stream, undefined, true),
+      "<<<ENSEMBLE_AI_RESULT_V1>>>\nreal frame\n<<<END_ENSEMBLE_AI_RESULT_V1>>>"
+    );
+  });
+
+  void it("does not lose the frame to an empty trailing text part", () => {
+    const stream = [
+      JSON.stringify({ type: "text", part: { type: "text", text: "<<<ENSEMBLE_AI_RESULT_V1>>>\nreal frame\n<<<END_ENSEMBLE_AI_RESULT_V1>>>" } }),
+      JSON.stringify({ type: "text", part: { type: "text", text: "" } }),
+    ].join("\n");
+
+    assert.strictEqual(
+      __testOnly.extractOpencodeFinalOutput(stream, undefined, true),
+      "<<<ENSEMBLE_AI_RESULT_V1>>>\nreal frame\n<<<END_ENSEMBLE_AI_RESULT_V1>>>"
+    );
+  });
+
+  void it("falls back to the true last part when no part contains the frame at all", () => {
+    const stream = [
+      JSON.stringify({ type: "text", part: { type: "text", text: "I'll check the implementation." } }),
+      JSON.stringify({ type: "text", part: { type: "text", text: "A complete review with no frame at all." } }),
+    ].join("\n");
+
+    assert.strictEqual(
+      __testOnly.extractOpencodeFinalOutput(stream, undefined, true),
+      "A complete review with no frame at all."
     );
   });
 

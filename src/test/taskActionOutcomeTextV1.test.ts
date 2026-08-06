@@ -88,11 +88,11 @@ void describe("describeTaskActionOutcomeForLogV1", () => {
       kind: "malformedResult",
       correlation: CORRELATION,
       code: "invalidFrame",
-      detail: "expected the frame to start with <<<ENSEMBLE_AI_RESULT_V1>>>",
+      detail: "the response does not contain the required <<<ENSEMBLE_AI_RESULT_V1>>> frame marker anywhere",
     };
     assert.equal(
       describeTaskActionOutcomeForLogV1(withDetail),
-      "Status: malformed result (invalidFrame: expected the frame to start with <<<ENSEMBLE_AI_RESULT_V1>>>)"
+      "Status: malformed result (invalidFrame: the response does not contain the required <<<ENSEMBLE_AI_RESULT_V1>>> frame marker anywhere)"
     );
     // No detail (the majority of malformedResult outcomes, and every one
     // built before this field existed) must render exactly as before.

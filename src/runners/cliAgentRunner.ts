@@ -17,6 +17,7 @@ import {
   AgentTransportV1,
   BoundedResultWriterV1,
 } from "../types/agentExecutionV1";
+import { FRAME_START_V1 } from "../types/aiResultEnvelope";
 import { createCliStdoutResultCaptureV1 } from "../services/cliStdoutResultCaptureV1";
 import { withAttribution, writeTextFile } from "../utils/fileUtils";
 import { ImplementationRunResult } from "./copilotImplementationRunner";
@@ -1254,19 +1255,23 @@ function extractOpencodeFinalOutput(
   parsed: ParsedCliEventLines = parseJsonLineEvents(stdout),
   /**
    * When true (the V1 `createCliTextTransportV1` path, whose reply is parsed
-   * by `parseAiResultEnvelopeV1`), keep only the LAST text part instead of
-   * concatenating every one. 2026-08-07 live incidents: concatenating
-   * narration ahead of a final framed answer ("I'll check X" ... tool call
-   * ... the actual frame) fed the parser text whose frame — if the model
-   * attempted one at all — was buried mid-response rather than isolated.
-   * `parseAiResultEnvelopeV1` now also scans for the frame rather than
-   * requiring it at byte zero (belt and braces — this fix and that one are
-   * independently useful), but not concatenating narration in the first
-   * place keeps the captured text itself close to just the model's real
-   * answer. Legacy free-text callers (default false) keep the full
-   * concatenated reply unchanged — nothing there depends on frame position,
-   * and reconstructing the complete multi-part reply is the correct
-   * behavior for them.
+   * by `parseAiResultEnvelopeV1`), keep only the text part that actually
+   * carries the frame — scanning from the end, so a model that keeps talking
+   * after the frame ("Done.", or even an empty trailing text event) does not
+   * make the LAST part win over the one that matters. Falls back to the
+   * true last part when no part contains the frame at all (the coordinator's
+   * frameless-content fallback already handles that shape from there).
+   * 2026-08-07 live incidents: concatenating narration ahead of a final
+   * framed answer ("I'll check X" ... tool call ... the actual frame) fed the
+   * parser text whose frame — if the model attempted one at all — was buried
+   * mid-response rather than isolated. `parseAiResultEnvelopeV1` also scans
+   * for the frame rather than requiring it at byte zero (belt and braces —
+   * this fix and that one are independently useful), but not concatenating
+   * narration in the first place keeps the captured text itself close to
+   * just the model's real answer. Legacy free-text callers (default false)
+   * keep the full concatenated reply unchanged — nothing there depends on
+   * frame position, and reconstructing the complete multi-part reply is the
+   * correct behavior for them.
    */
   requiresFramedResult = false
 ): string {
@@ -1295,7 +1300,15 @@ function extractOpencodeFinalOutput(
   }
 
   if (textParts.length > 0) {
-    return (requiresFramedResult ? textParts[textParts.length - 1]! : textParts.join("\n\n")).trim();
+    if (requiresFramedResult) {
+      for (let i = textParts.length - 1; i >= 0; i--) {
+        if (textParts[i]!.includes(FRAME_START_V1)) {
+          return textParts[i]!.trim();
+        }
+      }
+      return textParts[textParts.length - 1]!.trim();
+    }
+    return textParts.join("\n\n").trim();
   }
 
   if (sawRecognizedEvent) {

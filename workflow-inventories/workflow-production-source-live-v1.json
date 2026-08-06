@@ -236,7 +236,7 @@
     },
     {
       "path": "src/runners/cliAgentRunner.ts",
-      "sha256": "7f49c9690001870d462113151fa7dd4adfe1347fe6aaac20b5015237b541b419"
+      "sha256": "5fe79a8fe8099a3687ec17fae566fc1477384187be56780d8eb9afe9ee84c2dc"
     },
     {
       "path": "src/runners/copilotImplementationRunner.ts",
