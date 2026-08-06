@@ -86,6 +86,26 @@ void describe("taskProgressDecoderV1", () => {
     }
   });
 
+  void it("decodes a valid reviewRejections trail and fails closed on malformed entries", () => {
+    const valid = {
+      stage: "impl-high-review",
+      attemptId: "attempt-1",
+      at: "2026-07-02T11:00:00.000Z",
+      reason: "no parseable Readiness line",
+    };
+    const result = decodeTaskProgressTextV1(
+      doc({ ensembleProgressVersion: 1, reviewRejections: [valid] })
+    );
+    assert.equal(result.ok, true);
+    if (result.ok) {
+      assert.deepEqual(result.decoded.progress.reviewRejections, [valid]);
+    }
+    expectRecovery(doc({ ensembleProgressVersion: 1, reviewRejections: [{ ...valid, reason: "" }] }), "invalidFieldValue");
+    expectRecovery(doc({ ensembleProgressVersion: 1, reviewRejections: [{ ...valid, stage: "bogus" }] }), "invalidFieldValue");
+    expectRecovery(doc({ ensembleProgressVersion: 1, reviewRejections: [{ ...valid, extra: true }] }), "invalidFieldValue");
+    expectRecovery(doc({ ensembleProgressVersion: 1, reviewRejections: { not: "an array" } }), "invalidFieldValue");
+  });
+
   void it("resolves the closed legacy stage alias table in parity with migrateStage", () => {
     for (const [alias, canonical] of Object.entries(LEGACY_STAGE_ALIAS_TABLE_V1)) {
       assert.equal(

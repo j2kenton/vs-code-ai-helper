@@ -3,7 +3,7 @@
   "generatedBy": "scripts/resolveProductionSourceUniverse.mjs",
   "description": "Production source universe as of the current working tree, resolved from the exact bundler options that produce dist/extension.js (esbuild.config.js) plus the contribution-asset and runtime-resource-copy rules in scripts/lib/productionSourceScan.mjs. Regenerated every run; diffed against the immutable pre-gate snapshot (workflow-production-source-pregate-v1.json), not authoritative on its own.",
   "packageName": "vs-code-ai-helper",
-  "packageVersion": "0.73.0",
+  "packageVersion": "0.73.1",
   "declaredMain": "./dist/extension.js",
   "entrypoint": "src/extension.ts",
   "outfile": "dist/extension.js",
@@ -84,7 +84,7 @@
     },
     {
       "path": "src/actions/taskActionCoordinatorV1.ts",
-      "sha256": "e2f47c6e7c8b3b8ad6f0d86bc0411b4b0ac9951e2f215797c74f0fdb01c189bb"
+      "sha256": "1a63205d452b5071ac9990fb117ef3a7172238c32b16c2766ad95bacfdfd4a63"
     },
     {
       "path": "src/actions/taskActionRegistryV1.ts",
@@ -104,7 +104,7 @@
     },
     {
       "path": "src/commands/archiveTask.ts",
-      "sha256": "9b79de8b3d445798d964f171d29d152325881a9ba1a4bec8e4f1f56d712ee16d"
+      "sha256": "b0d1bec7832c8e48108510ac7695f07123bb7864af39b87a2e9ea7d2edd23be2"
     },
     {
       "path": "src/commands/chatWithStage.ts",
@@ -164,7 +164,7 @@
     },
     {
       "path": "src/commands/reviewActions.ts",
-      "sha256": "a1416596d29ee2ce734ca8e8a81e8d563d3f490f9878efbde165576ca819c50c"
+      "sha256": "293339e4450957659eb84928c890c4da76cdc16df8835531949f89565d203077"
     },
     {
       "path": "src/commands/reviewCurrentTask.ts",
@@ -172,7 +172,7 @@
     },
     {
       "path": "src/commands/runEditActionV1.ts",
-      "sha256": "4544aa353c5b111b523d02e2f1b7e2e8ae7d538f917945bef60b2d2e792af4ab"
+      "sha256": "56c27994ad359098697ff2f57f465c67e84907d7157b684071743a866292d37d"
     },
     {
       "path": "src/commands/runLintingFixes.ts",
@@ -212,7 +212,7 @@
     },
     {
       "path": "src/config/settings.ts",
-      "sha256": "cf28d72e39c32d1ac93b20f13faee380046c23582cdce3a2b4da662e80b0b4f9"
+      "sha256": "8620d4a9e33ec256b16e809e31fbcdb26a1ea3079ed275bd78f4b94c655f6fc3"
     },
     {
       "path": "src/extension.ts",
@@ -232,7 +232,7 @@
     },
     {
       "path": "src/runners/cliAgentRunner.ts",
-      "sha256": "f88919a48ee83f1b4a84b5d1f085b4c8303467404cc814140b97d5846f432de0"
+      "sha256": "8697e222cfc6956aedb681325a9ac5d2373a8eac93a2fc292b1680ec26cc4bab"
     },
     {
       "path": "src/runners/copilotImplementationRunner.ts",
@@ -312,7 +312,7 @@
     },
     {
       "path": "src/services/taskProgressDecoderV1.ts",
-      "sha256": "959d049bbe330b99f0098518122f420581c95ab85f7417a303e128b2a93171da"
+      "sha256": "5e78e5a2d96643644465c6364dfc0f183cde19c5e06ae588339f3e1ef5fc4a00"
     },
     {
       "path": "src/services/taskProgressDiscoveryV1.ts",
@@ -320,7 +320,7 @@
     },
     {
       "path": "src/services/taskProgressFieldPolicyV1.ts",
-      "sha256": "5040a032c016a7d9efae5e275602e8c9d66e20874089552362222ce9c179b8e4"
+      "sha256": "1b792b73cb2436e9ffe46846db5c679b8e3e88acea963b7a4927f1027583f5a7"
     },
     {
       "path": "src/services/taskProgressReaderV1.ts",
@@ -452,7 +452,7 @@
     },
     {
       "path": "src/types/taskProgress.ts",
-      "sha256": "f687de0c731b4b61982355a618320f85a8c4bc68178d9d724b4db2cb9c7a82d2"
+      "sha256": "0c62138d97e4325982ab9011373fd4ce2f403be6dba252559cd4ead8915509ee"
     },
     {
       "path": "src/types/taskRef.ts",
@@ -512,7 +512,7 @@
     },
     {
       "path": "src/utils/contextPack.ts",
-      "sha256": "eb28dd8a724142b7664124f256a099821203021b148eb4efd01b10ec2c53b43b"
+      "sha256": "51650c5ec4456ca838422bdf5fc31912fd1354c18793f31153ce595a9841e192"
     },
     {
       "path": "src/utils/contextTokens.ts",
@@ -544,7 +544,7 @@
     },
     {
       "path": "src/utils/implReviewFileSelection.ts",
-      "sha256": "5713d6546a8e793c8a1a6bfad3de2b678a25f106714b5c8f2e29ec3355770d23"
+      "sha256": "e01b28c4c569c694852ce6beaaf4344d93ca408764006e7017243b75862276d5"
     },
     {
       "path": "src/utils/lowLevelPlanArtifactResolver.ts",
@@ -620,15 +620,15 @@
     },
     {
       "path": "src/utils/reviewReadiness.ts",
-      "sha256": "d8131a392471b62201203a55395eb0d908278a88c7f4d8fd96b647ac900852b3"
+      "sha256": "77708df375da2586fe6334ac1b8526683cc08347d6d67c856940ca0a401a4792"
     },
     {
       "path": "src/utils/reviewRouting.ts",
-      "sha256": "50b3abbee8d2fff1985b9f2e29f7e2e111ad3097eb1e2e5016ceb736c782d49b"
+      "sha256": "8a6ce893cc12f6cb8448f1c5e7bb249fdf4495524a9cf33b4ade889aa9907f59"
     },
     {
       "path": "src/utils/reviewScoreLoop.ts",
-      "sha256": "959accbc503f1f98ea77eb611524c9346ee9516fd76307384443161a5f0e7c92"
+      "sha256": "08e27fd8705744401ca8b38deac206822e9f645b7dcd6b7fa9d5214cfcf152b9"
     },
     {
       "path": "src/utils/runLog.ts",
@@ -652,7 +652,7 @@
     },
     {
       "path": "src/utils/taskProgressTransforms.ts",
-      "sha256": "4b75e93740b20139e9a78aa886199096d96ad094ec2eaa04725c63d51e37d822"
+      "sha256": "48c5031207b39cc37f06cc1c1834afbf14f3e3045eb3314994546ecfe3bf2085"
     },
     {
       "path": "src/utils/taskRoot.ts",

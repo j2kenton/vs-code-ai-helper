@@ -999,6 +999,52 @@
           "scope": "window",
           "description": "Maximum time (milliseconds) a single completion check (lint/type-check/test/explicit verification command) may run before being terminated, both at Publish and during every review round's verified-checks evidence collection."
         },
+        "ensemble.resilience.fastForwardSurvivesEscalation": {
+          "type": "boolean",
+          "default": false,
+          "scope": "window",
+          "description": "A plateau escalation raised inside a Fast Forward run no longer aborts that run: the run finishes its attempt budget and the escalation is reported at the end. Pauses from other sources (manual pause, another window) still abort. Off = legacy behavior (any pause aborts the run after one attempt)."
+        },
+        "ensemble.resilience.rejectDegenerateReviews": {
+          "type": "boolean",
+          "default": false,
+          "scope": "window",
+          "description": "A review round with no parseable \"Readiness: N/10\" line is recorded as a failed attempt (with a reason in the run log) instead of being appended to the review score history — so a failed provider call can never wear a 0/10 score and manufacture a false plateau. Off = legacy behavior."
+        },
+        "ensemble.resilience.zeroFixableTerminatesFastForward": {
+          "type": "boolean",
+          "default": false,
+          "scope": "window",
+          "description": "Two consecutive review rounds that each carry positive evidence of zero task-fixable blockers (a parsed empty blocker block or an explicit no-blockers statement) end Fast Forward as success, regardless of score movement. The score-improvement gate remains an additional way to succeed. Off = legacy behavior (only a score gain can end the loop successfully)."
+        },
+        "ensemble.resilience.blockerSetPlateau": {
+          "type": "boolean",
+          "default": false,
+          "scope": "window",
+          "description": "Stall detection compares the reported blocker set across rounds (matched on category, resolver, and the file/subject named — not exact wording) instead of the review score's high-water mark: a shrinking or changing set counts as progress regardless of score; an unchanged or growing set escalates. Off = legacy score-based plateau detection."
+        },
+        "ensemble.resilience.churnCeilingRounds": {
+          "type": "integer",
+          "default": 0,
+          "minimum": 0,
+          "maximum": 99,
+          "scope": "window",
+          "description": "Escalate unconditionally after this many consecutive review rounds without a decrease in task-fixable blockers, independent of score movement and blocker churn. 0 disables the ceiling (legacy behavior). Set well below ensemble.fastForwardMaxIterations to stop a churning loop before it burns its full budget."
+        },
+        "ensemble.resilience.nothingToFixRoutesToReview": {
+          "type": "boolean",
+          "default": false,
+          "scope": "window",
+          "description": "An implementation round that reports completion without changing any files — when prior rounds already changed the tree — routes onward to review instead of being recorded as a failed run. A correct implementer that finds the plan already satisfied is not forced to fabricate work. Off = legacy behavior (zero changed files is a hard failure)."
+        },
+        "ensemble.resilience.noProgressBreakerRounds": {
+          "type": "integer",
+          "default": 0,
+          "minimum": 0,
+          "maximum": 99,
+          "scope": "window",
+          "description": "Stop and escalate after this many consecutive implementation rounds that change zero files while the same blocker persists, instead of iterating to ensemble.fastForwardMaxIterations. 0 disables the breaker (legacy behavior). Takes effect together with ensemble.resilience.nothingToFixRoutesToReview, which is what lets zero-change rounds continue at all."
+        },
         "vs-code-ai-helper.aiModelDefaults": {
           "deprecationMessage": "Use `ensemble.aiModelDefaults` instead.",
           "type": "object",

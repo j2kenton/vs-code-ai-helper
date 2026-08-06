@@ -6,6 +6,8 @@ import {
   improveReviewScore,
   MAX_REVIEW_ATTEMPTS,
   recordBestReviewScore,
+  ReviewRoundOutcome,
+  ZERO_FIXABLE_TERMINAL_ROUNDS,
 } from "../utils/reviewScoreLoop";
 
 /** Minimal in-memory stand-in for vscode.ExtensionContext.workspaceState. */
@@ -252,6 +254,194 @@ void describe("improveReviewScore", () => {
     assert.strictEqual(result.improved, true);
     assert.strictEqual(result.paused, false);
     assert.strictEqual(result.attempts, 3);
+  });
+
+  // 2a (ensemble.resilience.fastForwardSurvivesEscalation): an escalation
+  // raised by this run's OWN review must not silently reduce an explicitly
+  // requested multi-attempt run to attempts: 1 — the exact failure observed
+  // on jester 2026-07-30_task_1, where every Fast Forward click produced one
+  // apply/review pair and a mandatory manual resume.
+  void it("continues through an in-run escalation pause when continueThroughEscalation is set, reporting escalationDeferred", async () => {
+    const context = fakeContext();
+    let applies = 0;
+
+    const result = await improveReviewScore({
+      context,
+      stage: "impl-high-review",
+      baselineScore: 5,
+      maxAttempts: 3,
+      continueThroughEscalation: true,
+      apply: () => {
+        applies += 1;
+        return Promise.resolve();
+      },
+      // The first attempt's review escalates (pause source "escalation");
+      // later attempts see no pause.
+      isPaused: () => Promise.resolve(applies === 1 ? "escalation" : false),
+      review: () => Promise.resolve(5), // never improves — exhausts the budget
+    });
+
+    assert.strictEqual(result.paused, false);
+    assert.strictEqual(result.escalationDeferred, true);
+    assert.strictEqual(result.attempts, 3, "the run must finish its attempt budget");
+    assert.strictEqual(applies, 3);
+  });
+
+  void it("still aborts on an escalation pause when continueThroughEscalation is off (legacy behavior)", async () => {
+    const context = fakeContext();
+    let applies = 0;
+
+    const result = await improveReviewScore({
+      context,
+      stage: "impl-high-review",
+      baselineScore: 5,
+      maxAttempts: 3,
+      apply: () => {
+        applies += 1;
+        return Promise.resolve();
+      },
+      isPaused: () => Promise.resolve("escalation"),
+      review: () => Promise.resolve(5),
+    });
+
+    assert.strictEqual(result.paused, true);
+    assert.strictEqual(result.attempts, 1);
+    assert.strictEqual(applies, 1);
+  });
+
+  void it("still aborts on an EXTERNAL pause even when continueThroughEscalation is set", async () => {
+    // Riding through pauses is scoped to this run's own escalation; a user
+    // pausing manually (or another window) must keep its original effect.
+    const context = fakeContext();
+
+    const result = await improveReviewScore({
+      context,
+      stage: "impl-high-review",
+      baselineScore: 5,
+      maxAttempts: 3,
+      continueThroughEscalation: true,
+      apply: () => Promise.resolve(),
+      isPaused: () => Promise.resolve("external"),
+      review: () => Promise.resolve(5),
+    });
+
+    assert.strictEqual(result.paused, true);
+    assert.strictEqual(result.attempts, 1);
+  });
+
+  // 2h (ensemble.resilience.zeroFixableTerminatesFastForward): a review
+  // reporting zero task-fixable blockers with positive evidence is terminal
+  // success, regardless of score movement — 37 zero-blocker rounds on
+  // 2026-07-14_task_5 (scores 5.2–7.6) advanced nothing because only a +0.1
+  // score change could ever end the loop.
+  const cleanRound = (score: number): ReviewRoundOutcome => ({
+    score,
+    taskFixableCount: 0,
+    zeroFixableEvidence: true,
+  });
+
+  void it("terminates as success after two consecutive zero-fixable rounds with positive evidence, with no score movement", async () => {
+    const context = fakeContext();
+    let applies = 0;
+
+    const result = await improveReviewScore({
+      context,
+      stage: "impl-high-review",
+      baselineScore: 5.2,
+      maxAttempts: MAX_REVIEW_ATTEMPTS,
+      zeroFixableTerminates: true,
+      apply: () => {
+        applies += 1;
+        return Promise.resolve();
+      },
+      review: () => Promise.resolve(cleanRound(5.2)), // flat score, clean evidence
+    });
+
+    assert.strictEqual(result.zeroFixableSuccess, true);
+    assert.strictEqual(result.improved, false);
+    assert.strictEqual(result.attempts, ZERO_FIXABLE_TERMINAL_ROUNDS);
+    assert.strictEqual(applies, ZERO_FIXABLE_TERMINAL_ROUNDS);
+  });
+
+  void it("does NOT terminate on zero-fixable rounds without positive evidence (absent blocker block)", async () => {
+    const context = fakeContext();
+
+    const result = await improveReviewScore({
+      context,
+      stage: "impl-high-review",
+      baselineScore: 5,
+      maxAttempts: 3,
+      zeroFixableTerminates: true,
+      apply: () => Promise.resolve(),
+      // No blocker block parsed and no explicit statement — mere absence.
+      review: () => Promise.resolve({ score: 5, taskFixableCount: null, zeroFixableEvidence: false }),
+    });
+
+    assert.strictEqual(result.zeroFixableSuccess, false);
+    assert.strictEqual(result.attempts, 3);
+  });
+
+  void it("requires the zero-fixable rounds to be consecutive", async () => {
+    const context = fakeContext();
+    const rounds: ReviewRoundOutcome[] = [
+      cleanRound(5),
+      { score: 5, taskFixableCount: 1, zeroFixableEvidence: false }, // breaks the streak
+      cleanRound(5),
+      cleanRound(5),
+    ];
+    let call = 0;
+
+    const result = await improveReviewScore({
+      context,
+      stage: "impl-high-review",
+      baselineScore: 5,
+      maxAttempts: 4,
+      zeroFixableTerminates: true,
+      apply: () => {
+        call += 1;
+        return Promise.resolve();
+      },
+      review: () => Promise.resolve(rounds[call - 1] ?? null),
+    });
+
+    assert.strictEqual(result.zeroFixableSuccess, true);
+    assert.strictEqual(result.attempts, 4, "the streak must restart after the interrupting round");
+  });
+
+  void it("ignores zero-fixable evidence entirely when the flag is off (legacy behavior)", async () => {
+    const context = fakeContext();
+
+    const result = await improveReviewScore({
+      context,
+      stage: "impl-high-review",
+      baselineScore: 5,
+      maxAttempts: 3,
+      apply: () => Promise.resolve(),
+      review: () => Promise.resolve(cleanRound(5)),
+    });
+
+    assert.strictEqual(result.zeroFixableSuccess, false);
+    assert.strictEqual(result.attempts, 3);
+  });
+
+  void it("keeps the score-improvement gate as an additional success path alongside zero-fixable termination", async () => {
+    const context = fakeContext();
+
+    const result = await improveReviewScore({
+      context,
+      stage: "impl-high-review",
+      baselineScore: 5,
+      maxAttempts: 3,
+      zeroFixableTerminates: true,
+      apply: () => Promise.resolve(),
+      // Improves immediately — the improved path must win on attempt 1,
+      // before any zero-fixable streak accumulates.
+      review: () => Promise.resolve({ score: 7, taskFixableCount: 0, zeroFixableEvidence: true }),
+    });
+
+    assert.strictEqual(result.improved, true);
+    assert.strictEqual(result.zeroFixableSuccess, false);
+    assert.strictEqual(result.attempts, 1);
   });
 
   void it("throws CancellationError when the token is already cancelled", async () => {

@@ -27,7 +27,10 @@
  */
 import {
   LintPayload,
+  MAX_REVIEW_BLOCKER_IDENTITIES,
+  MAX_REVIEW_REJECTIONS,
   MAX_REVIEW_SCORE_HISTORY,
+  ReviewRejectionEntry,
   ReviewScoreHistoryEntry,
   STAGE_ORDER,
   TaskEscalation,
@@ -125,6 +128,7 @@ export const TASK_PROGRESS_PRODUCT_FIELD_NAMES_V1 = [
   "fallbackModelId",
   "reviewAttemptId",
   "reviewScoreHistory",
+  "reviewRejections",
   "escalation",
 ] as const satisfies readonly (keyof TaskProgress)[];
 
@@ -590,6 +594,7 @@ function validateReviewScoreHistory(
       "at",
       "blockerCount",
       "taskFixableCount",
+      "blockers",
     ]);
     for (const key of Object.keys(entry)) {
       if (!allowed.has(key)) {
@@ -618,6 +623,70 @@ function validateReviewScoreHistory(
     }
     if (!isNonNegativeInteger(entry["taskFixableCount"])) {
       return "reviewScoreHistory entry taskFixableCount must be a non-negative integer";
+    }
+    const blockers = entry["blockers"];
+    if (blockers !== undefined) {
+      if (!Array.isArray(blockers) || blockers.length > MAX_REVIEW_BLOCKER_IDENTITIES) {
+        return "reviewScoreHistory entry blockers must be a bounded array";
+      }
+      for (const blocker of blockers as unknown[]) {
+        if (!isPlainObject(blocker)) {
+          return "reviewScoreHistory entry blockers entries must be objects";
+        }
+        const allowedBlockerKeys = new Set(["category", "resolver", "subject"]);
+        for (const key of Object.keys(blocker)) {
+          if (!allowedBlockerKeys.has(key)) {
+            return `reviewScoreHistory entry blocker has an unknown property ${JSON.stringify(key)}`;
+          }
+        }
+        for (const key of ["category", "resolver", "subject"] as const) {
+          const field = blocker[key];
+          if (typeof field !== "string" || field.length === 0 || field.length > 200) {
+            return `reviewScoreHistory entry blocker ${key} must be a bounded non-empty string`;
+          }
+        }
+      }
+    }
+  }
+  return undefined;
+}
+
+function validateReviewRejections(
+  value: unknown,
+  family: TaskProgressFamilyV1
+): string | undefined {
+  if (!Array.isArray(value) || value.length > MAX_REVIEW_REJECTIONS) {
+    return "reviewRejections must be a bounded array";
+  }
+  for (const entry of value as unknown[]) {
+    if (!isPlainObject(entry)) {
+      return "reviewRejections entries must be objects";
+    }
+    const allowed = new Set(["stage", "attemptId", "at", "reason"]);
+    for (const key of Object.keys(entry)) {
+      if (!allowed.has(key)) {
+        return `reviewRejections entry has an unknown property ${JSON.stringify(key)}`;
+      }
+    }
+    if (typeof entry["stage"] !== "string" || resolveStage(entry["stage"], family) === undefined) {
+      return "reviewRejections entry stage must be a recognized stage";
+    }
+    if (
+      typeof entry["attemptId"] !== "string" ||
+      entry["attemptId"].length === 0 ||
+      entry["attemptId"].length > MAX_ID_LENGTH
+    ) {
+      return "reviewRejections entry attemptId must be a bounded non-empty string";
+    }
+    if (!isIsoTimestamp(entry["at"])) {
+      return "reviewRejections entry at must be an ISO timestamp";
+    }
+    if (
+      typeof entry["reason"] !== "string" ||
+      entry["reason"].length === 0 ||
+      entry["reason"].length > MAX_ESCALATION_REASON_LENGTH
+    ) {
+      return "reviewRejections entry reason must be a bounded non-empty string";
     }
   }
   return undefined;
@@ -1056,6 +1125,14 @@ export function decodeTaskProgressTextV1(
           return recovery("invalidFieldValue", error);
         }
         draft.reviewScoreHistory = value as ReviewScoreHistoryEntry[];
+        break;
+      }
+      case "reviewRejections": {
+        const error = validateReviewRejections(value, family);
+        if (error !== undefined) {
+          return recovery("invalidFieldValue", error);
+        }
+        draft.reviewRejections = value as ReviewRejectionEntry[];
         break;
       }
       case "escalation": {

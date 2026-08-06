@@ -1,4 +1,10 @@
-import { ReviewScoreHistoryEntry, TaskStage } from "../types/taskProgress";
+import {
+  MAX_REVIEW_BLOCKER_IDENTITIES,
+  ReviewBlockerIdentity,
+  ReviewScoreHistoryEntry,
+  STAGE_DISPLAY_NAMES,
+  TaskStage,
+} from "../types/taskProgress";
 import { BlockerResolver, ReviewBlocker } from "./reviewReadiness";
 
 /** Default number of consecutive rounds with no new high-water-mark score
@@ -62,6 +68,246 @@ export function detectPlateau(
   const priorBest = Math.max(...prior.map((entry) => entry.score));
   const recentBest = Math.max(...recent.map((entry) => entry.score));
   return recentBest <= priorBest;
+}
+
+/** File-ish token (has a path separator or an extension) named by a blocker
+ * description — the most stable "what is this about" key across rewordings. */
+const BLOCKER_SUBJECT_FILE_RE = /[\w@][\w@./\\-]*[/\\.][\w./\\-]*\w/;
+
+/**
+ * Reduce one reported blocker to the stable identity persisted in
+ * `reviewScoreHistory` and compared by {@link detectBlockerSetStall}.
+ * Deliberately NOT the raw prose: reviewer wording drifts round to round
+ * ("still fails in three test files" → "fails during collection in all three
+ * test files") while the underlying cause never changes, so identity is
+ * category + resolver + the file/subject named. When no file-ish token is
+ * present the normalized leading prose stands in — imperfect, but two rounds
+ * describing the same problem usually share their opening words.
+ */
+export function blockerIdentity(blocker: ReviewBlocker): ReviewBlockerIdentity {
+  const fileMatch = BLOCKER_SUBJECT_FILE_RE.exec(blocker.description);
+  const subject = fileMatch
+    ? fileMatch[0].toLowerCase()
+    : blocker.description.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim().slice(0, 64);
+  return {
+    category: blocker.category,
+    resolver: blocker.resolver,
+    subject: subject || "unspecified",
+  };
+}
+
+/** Truncated to the persisted cap so an over-verbose review can't grow a
+ * history entry unboundedly (and fail the strict decoder's bound). */
+export function blockerIdentities(blockers: readonly ReviewBlocker[]): ReviewBlockerIdentity[] {
+  return blockers.slice(0, MAX_REVIEW_BLOCKER_IDENTITIES).map(blockerIdentity);
+}
+
+function identityKeySet(blockers: readonly ReviewBlockerIdentity[]): Set<string> {
+  return new Set(blockers.map((b) => `${b.category}|${b.resolver}|${b.subject}`));
+}
+
+/**
+ * Blocker-set stall detection — the `ensemble.resilience.blockerSetPlateau`
+ * replacement for {@link detectPlateau}'s score-high-water-mark test. The
+ * blocker set is the progress signal; the score is display only:
+ *
+ *  - Improving: the set shrank, or its CONTENTS changed (one resolved, one
+ *    new — same count, real progress) → not stalled, score ignored.
+ *  - Stuck: the set is substantively unchanged across the window → stalled.
+ *  - Regressing: the set only ever grew across the window → stalled
+ *    (iteration is making things worse, escalate rather than run on).
+ *
+ * "Substantively" means identity comparison (category, resolver, file/subject
+ * — see blockerIdentity), never byte-for-byte prose. Requires `window`
+ * transitions (window + 1 rounds) that all carry identity data — AND a
+ * non-empty blocker set at the start of the window, so a blocker's first
+ * appearance after clean rounds never reads as "stuck for the whole window".
+ * Entries written before the `blockers` field existed fall back to the
+ * legacy score test so older tasks keep a working safety valve rather than
+ * silently losing it.
+ */
+export function detectBlockerSetStall(
+  history: readonly ReviewScoreHistoryEntry[],
+  stage: TaskStage,
+  window: number = DEFAULT_PLATEAU_WINDOW
+): boolean {
+  const safeWindow = Number.isFinite(window) && window > 0 ? Math.floor(window) : DEFAULT_PLATEAU_WINDOW;
+  const scored = history.filter(
+    (entry) => entry.stage === stage && entry.score !== null
+  );
+  if (scored.length < safeWindow + 1) {
+    return false;
+  }
+  const recent = scored.slice(-(safeWindow + 1));
+  if (recent.some((entry) => entry.blockers === undefined)) {
+    return detectPlateau(history, stage, safeWindow);
+  }
+  // A stall means the SAME work stayed unresolved for the whole window, so
+  // the window must START with something to be stuck on. A blocker whose
+  // first appearance falls inside the window is NEW work, not a stall —
+  // escalating on it would reinstate the 2026-07-26 regression the legacy
+  // detector's zero-fixable filter exists for (clean rounds becoming the
+  // baseline a brand-new blocker is measured against, escalating on its
+  // FIRST appearance as "unable to resolve across multiple rounds"). This
+  // also covers the all-empty window: healthy clean rounds are not a stall
+  // (decideReviewRoute already refuses to escalate with zero current
+  // blockers; zero-fixable termination is reviewScoreLoop's job).
+  if ((recent[0]?.blockers ?? []).length === 0) {
+    return false;
+  }
+  for (let i = 1; i < recent.length; i++) {
+    const prev = identityKeySet(recent[i - 1]?.blockers ?? []);
+    const next = identityKeySet(recent[i]?.blockers ?? []);
+    const removed = [...prev].some((key) => !next.has(key));
+    const shrank = next.size < prev.size;
+    // Any transition that resolved at least one prior blocker (or shrank the
+    // set) is real progress — the window is not a stall.
+    if (removed || shrank) {
+      return false;
+    }
+  }
+  // Every transition kept the full prior set (unchanged or grew) — stuck or
+  // regressing for the whole window.
+  return true;
+}
+
+/**
+ * How many consecutive trailing review rounds (for this stage, scored, with
+ * a recorded taskFixableCount) have gone by WITHOUT a strict decrease in
+ * task-fixable blockers — the churn-ceiling input: a loop that keeps
+ * completing rounds while the amount of fixable work never falls is burning
+ * budget regardless of what the score or the blocker identities are doing.
+ * Returns 0 when fewer than two comparable rounds exist.
+ */
+export function roundsWithoutTaskFixableDecrease(
+  history: readonly ReviewScoreHistoryEntry[],
+  stage: TaskStage
+): number {
+  const scored = history.filter(
+    (entry) => entry.stage === stage && entry.score !== null && entry.taskFixableCount !== undefined
+  );
+  let rounds = 0;
+  for (let i = scored.length - 1; i >= 1; i--) {
+    const current = scored[i];
+    const previous = scored[i - 1];
+    if (!current || !previous || current.taskFixableCount < previous.taskFixableCount) {
+      break;
+    }
+    rounds++;
+  }
+  return rounds;
+}
+
+/**
+ * Churn-ceiling escalation decision (extracted from
+ * handleReviewRoutingOutcome so the escalate-or-not choice has a unit-test
+ * seam): escalate when the flag is on (`churnCeilingRounds > 0`), the round
+ * that was just recorded still carries task-fixable work, and the trailing
+ * run of rounds without a decrease in `taskFixableCount` has reached the
+ * ceiling. With the flag off (0) this never escalates — the legacy behavior.
+ */
+export function shouldEscalateChurnCeiling(input: {
+  history: readonly ReviewScoreHistoryEntry[];
+  stage: TaskStage;
+  /** The just-recorded round's task-fixable count — a round with nothing
+   * fixable left is not churning, it is (at worst) waiting on escalation
+   * paths that own that case. */
+  taskFixableCount: number;
+  /** ensemble.resilience.churnCeilingRounds (0 = off). */
+  churnCeilingRounds: number;
+}): boolean {
+  if (input.churnCeilingRounds <= 0 || input.taskFixableCount <= 0) {
+    return false;
+  }
+  return (
+    roundsWithoutTaskFixableDecrease(input.history, input.stage) >=
+    input.churnCeilingRounds
+  );
+}
+
+/**
+ * Whether the last two same-stage review rounds report the same blocker
+ * situation — by identity set when both rounds recorded one, else by equal
+ * non-zero blocker/task-fixable counts. False without two comparable rounds:
+ * the no-progress breaker never escalates on missing evidence.
+ */
+export function sameBlockerPersistsAcrossLastRounds(
+  history: readonly ReviewScoreHistoryEntry[] | undefined
+): boolean {
+  const lastEntry = history?.[history.length - 1];
+  if (!lastEntry) {
+    return false;
+  }
+  const sameStage = (history ?? []).filter((entry) => entry.stage === lastEntry.stage);
+  const prev = sameStage[sameStage.length - 2];
+  const last = sameStage[sameStage.length - 1];
+  if (!prev || !last) {
+    return false;
+  }
+  if (prev.blockers !== undefined && last.blockers !== undefined) {
+    const prevKeys = identityKeySet(prev.blockers);
+    const lastKeys = identityKeySet(last.blockers);
+    return (
+      lastKeys.size > 0 &&
+      prevKeys.size === lastKeys.size &&
+      [...lastKeys].every((k) => prevKeys.has(k))
+    );
+  }
+  return (
+    last.taskFixableCount > 0 &&
+    last.taskFixableCount === prev.taskFixableCount &&
+    last.blockerCount === prev.blockerCount
+  );
+}
+
+/**
+ * No-progress-breaker decision (2c, ensemble.resilience.noProgressBreakerRounds
+ * — extracted from executeImplementationRun so the escalate-or-not choice has
+ * a unit-test seam): trip when the flag is on (`breakerRounds > 0`), the
+ * consecutive zero-file-change implementation-round count has reached it, and
+ * the durable review history shows the same blocker persisting across the
+ * last two rounds. With the flag off (0) this never trips — the legacy
+ * behavior.
+ */
+export function shouldTripNoProgressBreaker(input: {
+  /** Consecutive completed implementation rounds that changed zero files. */
+  zeroChangeRounds: number;
+  /** ensemble.resilience.noProgressBreakerRounds (0 = off). */
+  breakerRounds: number;
+  history: readonly ReviewScoreHistoryEntry[] | undefined;
+}): boolean {
+  if (input.breakerRounds <= 0 || input.zeroChangeRounds < input.breakerRounds) {
+    return false;
+  }
+  return sameBlockerPersistsAcrossLastRounds(input.history);
+}
+
+/**
+ * Degenerate-review rejection decision (2d,
+ * ensemble.resilience.rejectDegenerateReviews — extracted from
+ * handleReviewRoutingOutcome so both flag states have a unit-test seam).
+ * Returns the human-readable rejection reason when the round must be
+ * recorded as a failed attempt and EXCLUDED from reviewScoreHistory (a
+ * phantom scoreless round would otherwise distort plateau detection), or
+ * null when the round proceeds normally: flag off (legacy behavior — the
+ * round is appended to history with a null score), or a parseable score.
+ */
+export function degenerateReviewRejectionReason(input: {
+  /** ensemble.resilience.rejectDegenerateReviews. */
+  rejectDegenerateReviews: boolean;
+  /** Parsed `Readiness: N/10`, or null when no parseable line exists. */
+  score: number | null;
+  stage: TaskStage;
+  attemptId: string;
+}): string | null {
+  if (!input.rejectDegenerateReviews || input.score !== null) {
+    return null;
+  }
+  return (
+    `The ${STAGE_DISPLAY_NAMES[input.stage]} review round (attempt ${input.attemptId}) produced no ` +
+    "parseable `Readiness: N/10` line — recorded as a failed attempt, not a review. " +
+    "The round was excluded from the review score history so it cannot distort plateau detection."
+  );
 }
 
 export type ReviewRoute =

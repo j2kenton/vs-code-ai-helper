@@ -64,6 +64,7 @@ import { createChatInteractionTransactionStoreV1 } from "../services/chatInterac
 import { createWorkflowFileStoreV1 } from "../services/workflowFileStoreV1";
 import { createWorkflowPathRegistryV1 } from "../services/workflowPathRegistryV1";
 import {
+  chatTransactionFailureCodeV1,
   createTaskActionCoordinatorV1,
   RunnerSelectionOpenerV1,
   TaskActionCoordinatorV1,
@@ -2007,5 +2008,51 @@ void describe("taskActionCoordinatorV1", () => {
     const record = await harness.orchestrator.getRecord(ref);
     assert.equal(record?.state, "answersSubmitted");
     assert.equal(harness.selection.reserved, 1);
+  });
+});
+
+/**
+ * A rejected chat transaction is deterministic and content-driven (plan §5.5:
+ * oversized input snapshot, malformed correlation, undecodable record), yet
+ * the outcome reports `retryable: true` — so if the reason is dropped, an
+ * unchanged prompt fails identically forever with nothing to diagnose. That
+ * is not hypothetical: a real review stalled for days with only
+ * "chatTransaction.chatTransactionRejected" in its run log, while the store
+ * had computed the exact cause (its canonical input snapshot sat ~1.5% over
+ * MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1) and the coordinator discarded it.
+ */
+void describe("taskActionCoordinatorV1 — chat transaction failure codes", () => {
+  void it("preserves the store's reason so a deterministic rejection is diagnosable", () => {
+    assert.equal(
+      chatTransactionFailureCodeV1(
+        "chatTransactionRejected",
+        "transaction record would not decode: inputSnapshot exceeds the 262144-byte canonical limit"
+      ),
+      "chatTransaction.chatTransactionRejected: transaction record would not decode: " +
+        "inputSnapshot exceeds the 262144-byte canonical limit"
+    );
+  });
+
+  void it("falls back to the bare namespaced code when the store gave no reason", () => {
+    assert.equal(
+      chatTransactionFailureCodeV1("chatTransactionRejected", "   "),
+      "chatTransaction.chatTransactionRejected"
+    );
+  });
+
+  void it("flattens newlines so the code stays a single readable run-log line", () => {
+    assert.equal(
+      chatTransactionFailureCodeV1("chatTransactionRejected", "line one\n\tline two   line three"),
+      "chatTransaction.chatTransactionRejected: line one line two line three"
+    );
+  });
+
+  void it("bounds an overlong reason instead of pasting unbounded text into the code", () => {
+    const code = chatTransactionFailureCodeV1("chatTransactionRejected", "x".repeat(5000));
+    const prefix = "chatTransaction.chatTransactionRejected: ";
+    assert.ok(code.startsWith(prefix));
+    // The reason is capped at 200 chars regardless of what the store produced.
+    assert.equal(code.length - prefix.length, 200);
+    assert.ok(code.endsWith("…"), "a truncated reason must be visibly elided");
   });
 });

@@ -120,9 +120,49 @@ const BLOCKER_LINE_RE =
  * routing degrades to "no structured blocker signal" instead of failing.
  */
 export function parseReviewBlockers(content: string): ReviewBlocker[] {
+  return parseReviewBlockersDetailed(content).blockers;
+}
+
+/**
+ * Result of {@link parseReviewBlockersDetailed}: the parsed blockers plus
+ * whether the machine-readable block was PRESENT at all. The distinction
+ * matters because an empty array is ambiguous on its own — "the reviewer
+ * affirmatively reported zero blockers" (block present, no entries) and "the
+ * reviewer never emitted the block" (older prompt, non-compliant provider)
+ * must route differently: only the former is positive evidence of a clean
+ * review that termination logic (reviewScoreLoop.ts) may act on.
+ */
+export interface ReviewBlockerEvidence {
+  /** True when the `<!-- blockers:start/end -->` markers were found. */
+  blockPresent: boolean;
+  blockers: ReviewBlocker[];
+}
+
+/** Conservative match for an explicit prose "no blockers" declaration —
+ * secondary evidence when a review omits the machine block but states the
+ * absence outright. Deliberately anchored so "no NEW blockers" or "no
+ * blockers in this file" prose deeper in a sentence doesn't count. */
+const EXPLICIT_NO_BLOCKERS_RE = /^\s*(?:[-*]\s*)?(?:blockers?:\s*none\b|no blockers\b)/im;
+
+/**
+ * Positive evidence this review reported zero task-fixable blockers: either
+ * the machine-readable block is present and contains no task-fixable entry,
+ * or the review explicitly states there are no blockers. Mere ABSENCE of the
+ * block is never evidence — see ReviewBlockerEvidence.
+ */
+export function hasZeroTaskFixableEvidence(content: string): boolean {
+  const evidence = parseReviewBlockersDetailed(content);
+  if (evidence.blockPresent) {
+    return evidence.blockers.every((b) => b.resolver !== "task-fixable");
+  }
+  return EXPLICIT_NO_BLOCKERS_RE.test(content);
+}
+
+/** See {@link parseReviewBlockers}; also reports whether the block existed. */
+export function parseReviewBlockersDetailed(content: string): ReviewBlockerEvidence {
   const match = BLOCKERS_BLOCK_RE.exec(content);
   if (!match?.[1]) {
-    return [];
+    return { blockPresent: false, blockers: [] };
   }
   const blockers: ReviewBlocker[] = [];
   for (const line of match[1].split(/\r?\n/)) {
@@ -140,7 +180,7 @@ export function parseReviewBlockers(content: string): ReviewBlocker[] {
       description,
     });
   }
-  return blockers;
+  return { blockPresent: true, blockers };
 }
 
 /** Strict gate used by automatic stage advancement. */

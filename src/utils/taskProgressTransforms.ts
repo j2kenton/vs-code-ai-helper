@@ -11,7 +11,9 @@
  * are not part of this boundary").
  */
 import {
+  MAX_REVIEW_REJECTIONS,
   MAX_REVIEW_SCORE_HISTORY,
+  ReviewRejectionEntry,
   ReviewScoreHistoryEntry,
   TaskEscalation,
   TaskProgress,
@@ -184,6 +186,28 @@ export function appendReviewScoreHistory(
   return {
     ...progress,
     reviewScoreHistory: trimmed,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * Append one rejected (degenerate) review round to the durable rejection
+ * trail (see `TaskProgress.reviewRejections`: these rounds are failed
+ * attempts recorded WITH a reason, kept out of `reviewScoreHistory` so a
+ * phantom scoreless round can never distort plateau detection). Trims from
+ * the front once the cap is exceeded.
+ */
+export function appendReviewRejection(
+  progress: TaskProgress,
+  entry: ReviewRejectionEntry
+): TaskProgress {
+  const rejections = [...(progress.reviewRejections ?? []), entry];
+  const trimmed = rejections.length > MAX_REVIEW_REJECTIONS
+    ? rejections.slice(rejections.length - MAX_REVIEW_REJECTIONS)
+    : rejections;
+  return {
+    ...progress,
+    reviewRejections: trimmed,
     updatedAt: new Date().toISOString(),
   };
 }

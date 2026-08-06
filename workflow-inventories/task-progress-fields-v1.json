@@ -312,10 +312,24 @@
       }
     },
     {
+      "name": "reviewRejections",
+      "optional": true,
+      "typeText": "ReviewRejectionEntry[]",
+      "sourceSpan": "L199-L199",
+      "historicalFamilyRule": "Introduced by the ensemble-v1 family (workflow-resilience 2d); never emitted by workspace-legacy-v0 writers, so absence is the only legacy shape. If present it is validated like any V1 document.",
+      "v1DecoderRule": "Optional bounded exact-shape array (≤ MAX_REVIEW_REJECTIONS entries: recognized stage, bounded attemptId, ISO at, bounded non-empty reason); unknown entry keys are recovery.",
+      "lifecyclePolicy": {
+        "migration": "Validate bounded exact-shape entry array; preserve (taskProgressFieldPolicyV1).",
+        "nextStage": "Preserve (durable degenerate-round rejection trail) (taskProgressFieldPolicyV1).",
+        "markTaskDone": "Preserve (durable degenerate-round rejection trail) (taskProgressFieldPolicyV1).",
+        "reopen": "Preserve (durable degenerate-round rejection trail) (taskProgressFieldPolicyV1)."
+      }
+    },
+    {
       "name": "escalation",
       "optional": true,
       "typeText": "TaskEscalation",
-      "sourceSpan": "L196-L196",
+      "sourceSpan": "L205-L205",
       "historicalFamilyRule": "Optional record set when automated review iteration needs a human decision; cleared on the next stage transition and explicit resume; omit-compatible.",
       "v1DecoderRule": "Optional exact shape: recognized stage and escalation kind, bounded reason, ISO at, optional boolean secondOpinionAttempted; unknown nested keys are recovery.",
       "lifecyclePolicy": {

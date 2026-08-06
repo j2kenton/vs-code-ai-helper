@@ -1,13 +1,20 @@
 import * as assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
+  blockerIdentity,
   decideReviewRoute,
+  degenerateReviewRejectionReason,
+  detectBlockerSetStall,
   detectPlateau,
   REVIEW_RUBRIC_BLOCKER_SCORE_CAP,
+  roundsWithoutTaskFixableDecrease,
   rubricCapLikelyBlockedAdvance,
+  sameBlockerPersistsAcrossLastRounds,
+  shouldEscalateChurnCeiling,
+  shouldTripNoProgressBreaker,
 } from "../utils/reviewRouting";
 import { ReviewBlocker } from "../utils/reviewReadiness";
-import { ReviewScoreHistoryEntry } from "../types/taskProgress";
+import { ReviewBlockerIdentity, ReviewScoreHistoryEntry } from "../types/taskProgress";
 
 function entry(score: number | null, overrides: Partial<ReviewScoreHistoryEntry> = {}): ReviewScoreHistoryEntry {
   return {
@@ -124,6 +131,402 @@ void describe("detectPlateau", () => {
       entry(5), // last 3 of [5,5,5,5] never exceed the pre-window best of 5
     ];
     assert.strictEqual(detectPlateau(history, "impl-high-review", 3), true);
+  });
+});
+
+function identity(overrides: Partial<ReviewBlockerIdentity> = {}): ReviewBlockerIdentity {
+  return { category: "completion", resolver: "task-fixable", subject: "src/app.ts", ...overrides };
+}
+
+void describe("blockerIdentity", () => {
+  void it("matches drifted wording that names the same file (the jester 2026-07-30_task_1 stall)", () => {
+    // The reviewer refined its prose across rounds while the underlying
+    // input never changed — identity comparison must read that as the SAME
+    // blocker, where a byte-for-byte comparison would read it as progress.
+    const roundA = blocker({ description: "still fails in amplify/functions/shabbatCron/handler.integration.test.ts" });
+    const roundB = blocker({ description: "fails during collection in amplify/functions/shabbatCron/handler.integration.test.ts" });
+    assert.deepStrictEqual(blockerIdentity(roundA), blockerIdentity(roundB));
+  });
+
+  void it("distinguishes blockers about different files", () => {
+    const a = blocker({ description: "type error in src/a.ts" });
+    const b = blocker({ description: "type error in src/b.ts" });
+    assert.notDeepStrictEqual(blockerIdentity(a), blockerIdentity(b));
+  });
+
+  void it("distinguishes the same subject under different resolvers", () => {
+    const a = blocker({ description: "src/a.ts fails", resolver: "task-fixable" });
+    const b = blocker({ description: "src/a.ts fails", resolver: "environmental" });
+    assert.notDeepStrictEqual(blockerIdentity(a), blockerIdentity(b));
+  });
+});
+
+void describe("detectBlockerSetStall", () => {
+  void it("escalates on a substantively unchanged blocker set across the window", () => {
+    const blockers = [identity()];
+    const history = [
+      entry(5, { blockers }),
+      entry(5.1, { blockers }),
+      entry(5, { blockers }),
+      entry(5.2, { blockers }),
+    ];
+    // Score is climbing (5 -> 5.2 would defeat the legacy high-water test),
+    // but the SET never changed — stuck.
+    assert.strictEqual(detectBlockerSetStall(history, "impl-high-review", 3), true);
+  });
+
+  void it("does not escalate when the set contents change round to round (same count, real progress)", () => {
+    const history = [
+      entry(5, { blockers: [identity({ subject: "src/a.ts" })] }),
+      entry(5, { blockers: [identity({ subject: "src/b.ts" })] }),
+      entry(5, { blockers: [identity({ subject: "src/c.ts" })] }),
+      entry(5, { blockers: [identity({ subject: "src/d.ts" })] }),
+    ];
+    // Flat score for four rounds — the legacy test would call this a
+    // plateau; blocker churn shows each round resolved one and found one.
+    assert.strictEqual(detectBlockerSetStall(history, "impl-high-review", 3), false);
+  });
+
+  void it("does not escalate while the set is shrinking, regardless of the score", () => {
+    const history = [
+      entry(7, { blockers: [identity({ subject: "a" }), identity({ subject: "b" }), identity({ subject: "c" })] }),
+      entry(7, { blockers: [identity({ subject: "a" }), identity({ subject: "b" })] }),
+      entry(7, { blockers: [identity({ subject: "a" })] }),
+      entry(7, { blockers: [] }),
+    ];
+    // The jester 2026-07-11_task_2 shape: 7/10 for every round while
+    // blockers fell 3 -> 0 — resolving itself, not stuck.
+    assert.strictEqual(detectBlockerSetStall(history, "impl-high-review", 3), false);
+  });
+
+  void it("escalates when the set only ever grows (regressing)", () => {
+    const history = [
+      entry(6, { blockers: [identity({ subject: "a" })] }),
+      entry(6, { blockers: [identity({ subject: "a" }), identity({ subject: "b" })] }),
+      entry(6, { blockers: [identity({ subject: "a" }), identity({ subject: "b" }), identity({ subject: "c" })] }),
+      entry(6, { blockers: [identity({ subject: "a" }), identity({ subject: "b" }), identity({ subject: "c" }), identity({ subject: "d" })] }),
+    ];
+    assert.strictEqual(detectBlockerSetStall(history, "impl-high-review", 3), true);
+  });
+
+  void it("returns false for all-empty blocker sets (healthy clean rounds are not a stall)", () => {
+    const history = [
+      entry(5, { blockerCount: 0, taskFixableCount: 0, blockers: [] }),
+      entry(5, { blockerCount: 0, taskFixableCount: 0, blockers: [] }),
+      entry(5, { blockerCount: 0, taskFixableCount: 0, blockers: [] }),
+      entry(5, { blockerCount: 0, taskFixableCount: 0, blockers: [] }),
+    ];
+    assert.strictEqual(detectBlockerSetStall(history, "impl-high-review", 3), false);
+  });
+
+  void it("does not escalate on a blocker's FIRST appearance after clean rounds (the 2026-07-26 regression)", () => {
+    // Mirror of detectPlateau's "clean rounds must not become the prior
+    // best" guard: three clean rounds followed by one round surfacing a
+    // brand-new blocker is NEW work, not evidence that iteration failed
+    // "across multiple rounds" — nothing in the window ever had that
+    // blocker to fix. The set never shrank and never changed, so without
+    // the window-start guard this window reads as stuck and escalates on
+    // the blocker's very first appearance.
+    const history = [
+      entry(5.8, { blockerCount: 0, taskFixableCount: 0, blockers: [] }),
+      entry(5.9, { blockerCount: 0, taskFixableCount: 0, blockers: [] }),
+      entry(5.9, { blockerCount: 0, taskFixableCount: 0, blockers: [] }),
+      entry(5.7, { blockers: [identity()] }),
+    ];
+    assert.strictEqual(detectBlockerSetStall(history, "impl-high-review", 3), false);
+  });
+
+  void it("still escalates once the blocker has persisted for the full window", () => {
+    // The window must START with the blocker present: once the same
+    // identity has survived window+1 consecutive rounds, the stall is real
+    // even though the run began with clean rounds further back.
+    const blockers = [identity()];
+    const history = [
+      entry(5.9, { blockerCount: 0, taskFixableCount: 0, blockers: [] }),
+      entry(5.7, { blockers }),
+      entry(5.7, { blockers }),
+      entry(5.8, { blockers }),
+      entry(5.7, { blockers }),
+    ];
+    assert.strictEqual(detectBlockerSetStall(history, "impl-high-review", 3), true);
+  });
+
+  void it("falls back to the legacy score test when the window MIXES identity-carrying and older entries", () => {
+    // A long-lived task fills its window with identity-carrying rounds one
+    // by one; until every entry in the window carries identity data the
+    // legacy detector stays in charge. Pinned so the detector switch point
+    // stays deliberate rather than drifting silently.
+    const mixedFlat = [
+      entry(2),
+      entry(5),
+      entry(5), // no blockers field — legacy entry inside the window
+      entry(5, { blockers: [identity()] }),
+      entry(5, { blockers: [identity()] }),
+    ];
+    assert.strictEqual(detectBlockerSetStall(mixedFlat, "impl-high-review", 3), true);
+    const mixedClimbing = [
+      entry(2),
+      entry(5), // legacy entry inside the window
+      entry(6, { blockers: [identity()] }),
+      entry(7, { blockers: [identity()] }),
+    ];
+    assert.strictEqual(detectBlockerSetStall(mixedClimbing, "impl-high-review", 3), false);
+  });
+
+  void it("falls back to the legacy score test when entries predate blocker identity data", () => {
+    const flat = [entry(2), entry(5), entry(5), entry(5), entry(5)];
+    assert.strictEqual(detectBlockerSetStall(flat, "impl-high-review", 3), true);
+    const climbing = [entry(2), entry(5), entry(6), entry(7)];
+    assert.strictEqual(detectBlockerSetStall(climbing, "impl-high-review", 3), false);
+  });
+
+  void it("returns false with fewer than window + 1 rounds", () => {
+    const blockers = [identity()];
+    const history = [entry(5, { blockers }), entry(5, { blockers }), entry(5, { blockers })];
+    assert.strictEqual(detectBlockerSetStall(history, "impl-high-review", 3), false);
+  });
+});
+
+void describe("roundsWithoutTaskFixableDecrease", () => {
+  void it("counts trailing rounds since the last strict decrease", () => {
+    const history = [
+      entry(4, { taskFixableCount: 3 }),
+      entry(5, { taskFixableCount: 2 }), // decrease — counting starts after this
+      entry(5, { taskFixableCount: 2 }),
+      entry(5, { taskFixableCount: 3 }),
+      entry(5, { taskFixableCount: 3 }),
+    ];
+    assert.strictEqual(roundsWithoutTaskFixableDecrease(history, "impl-high-review"), 3);
+  });
+
+  void it("returns 0 when the most recent transition was a decrease", () => {
+    const history = [entry(5, { taskFixableCount: 3 }), entry(5, { taskFixableCount: 1 })];
+    assert.strictEqual(roundsWithoutTaskFixableDecrease(history, "impl-high-review"), 0);
+  });
+
+  void it("returns 0 without two comparable rounds", () => {
+    assert.strictEqual(roundsWithoutTaskFixableDecrease([entry(5)], "impl-high-review"), 0);
+    assert.strictEqual(roundsWithoutTaskFixableDecrease([], "impl-high-review"), 0);
+  });
+
+  void it("ignores rounds from other stages and unscored rounds", () => {
+    const history = [
+      entry(5, { taskFixableCount: 5, stage: "impl-low-review" }),
+      entry(5, { taskFixableCount: 2 }),
+      entry(null, { taskFixableCount: 9 }),
+      entry(5, { taskFixableCount: 2 }),
+    ];
+    assert.strictEqual(roundsWithoutTaskFixableDecrease(history, "impl-high-review"), 1);
+  });
+});
+
+void describe("shouldEscalateChurnCeiling", () => {
+  // Four rounds at taskFixableCount 2 -> the trailing three transitions all
+  // fail to decrease it (roundsWithoutTaskFixableDecrease = 3).
+  const stagnant = [
+    entry(5, { taskFixableCount: 2 }),
+    entry(5, { taskFixableCount: 2 }),
+    entry(5, { taskFixableCount: 2 }),
+    entry(5, { taskFixableCount: 2 }),
+  ];
+
+  void it("never escalates with the flag off (churnCeilingRounds = 0) — the legacy behavior", () => {
+    assert.strictEqual(
+      shouldEscalateChurnCeiling({
+        history: stagnant,
+        stage: "impl-high-review",
+        taskFixableCount: 2,
+        churnCeilingRounds: 0,
+      }),
+      false
+    );
+  });
+
+  void it("escalates once the stagnant-round run reaches the configured ceiling", () => {
+    assert.strictEqual(
+      shouldEscalateChurnCeiling({
+        history: stagnant,
+        stage: "impl-high-review",
+        taskFixableCount: 2,
+        churnCeilingRounds: 3,
+      }),
+      true
+    );
+  });
+
+  void it("does not escalate before the ceiling is reached, even with the flag on", () => {
+    assert.strictEqual(
+      shouldEscalateChurnCeiling({
+        history: stagnant,
+        stage: "impl-high-review",
+        taskFixableCount: 2,
+        churnCeilingRounds: 4,
+      }),
+      false
+    );
+  });
+
+  void it("catches resolve-one/raise-one churn: identities change every round, but the count never falls", () => {
+    // The exact case the ceiling exists for — blocker CONTENTS change each
+    // round (so the blocker-set stall detector reads it as progress), while
+    // the amount of fixable work never decreases.
+    const churning = [
+      entry(5, { taskFixableCount: 1, blockers: [identity({ subject: "src/a.ts" })] }),
+      entry(5, { taskFixableCount: 1, blockers: [identity({ subject: "src/b.ts" })] }),
+      entry(5, { taskFixableCount: 1, blockers: [identity({ subject: "src/c.ts" })] }),
+      entry(5, { taskFixableCount: 1, blockers: [identity({ subject: "src/d.ts" })] }),
+    ];
+    assert.strictEqual(detectBlockerSetStall(churning, "impl-high-review", 3), false);
+    assert.strictEqual(
+      shouldEscalateChurnCeiling({
+        history: churning,
+        stage: "impl-high-review",
+        taskFixableCount: 1,
+        churnCeilingRounds: 3,
+      }),
+      true
+    );
+  });
+
+  void it("does not escalate when the just-recorded round carries no task-fixable work", () => {
+    assert.strictEqual(
+      shouldEscalateChurnCeiling({
+        history: stagnant,
+        stage: "impl-high-review",
+        taskFixableCount: 0,
+        churnCeilingRounds: 3,
+      }),
+      false
+    );
+  });
+});
+
+void describe("sameBlockerPersistsAcrossLastRounds", () => {
+  void it("is true when the last two same-stage rounds carry the same non-empty identity set", () => {
+    const blockers = [identity()];
+    const history = [entry(5, { blockers }), entry(5, { blockers })];
+    assert.strictEqual(sameBlockerPersistsAcrossLastRounds(history), true);
+  });
+
+  void it("is false when the identity sets differ (real progress, not persistence)", () => {
+    const history = [
+      entry(5, { blockers: [identity({ subject: "src/a.ts" })] }),
+      entry(5, { blockers: [identity({ subject: "src/b.ts" })] }),
+    ];
+    assert.strictEqual(sameBlockerPersistsAcrossLastRounds(history), false);
+  });
+
+  void it("is false for empty identity sets — nothing persists when nothing is blocked", () => {
+    const history = [
+      entry(5, { blockerCount: 0, taskFixableCount: 0, blockers: [] }),
+      entry(5, { blockerCount: 0, taskFixableCount: 0, blockers: [] }),
+    ];
+    assert.strictEqual(sameBlockerPersistsAcrossLastRounds(history), false);
+  });
+
+  void it("falls back to equal non-zero counts when identity data is absent", () => {
+    assert.strictEqual(
+      sameBlockerPersistsAcrossLastRounds([
+        entry(5, { blockerCount: 2, taskFixableCount: 1 }),
+        entry(5, { blockerCount: 2, taskFixableCount: 1 }),
+      ]),
+      true
+    );
+    assert.strictEqual(
+      sameBlockerPersistsAcrossLastRounds([
+        entry(5, { blockerCount: 2, taskFixableCount: 2 }),
+        entry(5, { blockerCount: 2, taskFixableCount: 1 }),
+      ]),
+      false
+    );
+  });
+
+  void it("is false without two comparable same-stage rounds (never escalates on missing evidence)", () => {
+    assert.strictEqual(sameBlockerPersistsAcrossLastRounds(undefined), false);
+    assert.strictEqual(sameBlockerPersistsAcrossLastRounds([]), false);
+    assert.strictEqual(sameBlockerPersistsAcrossLastRounds([entry(5)]), false);
+    assert.strictEqual(
+      sameBlockerPersistsAcrossLastRounds([
+        entry(5, { stage: "impl-low-review" }),
+        entry(5, { stage: "impl-high-review" }),
+      ]),
+      false
+    );
+  });
+});
+
+void describe("shouldTripNoProgressBreaker", () => {
+  const persisting = [entry(5, { blockers: [identity()] }), entry(5, { blockers: [identity()] })];
+
+  void it("never trips with the flag off (breakerRounds = 0) — the legacy behavior", () => {
+    assert.strictEqual(
+      shouldTripNoProgressBreaker({ zeroChangeRounds: 99, breakerRounds: 0, history: persisting }),
+      false
+    );
+  });
+
+  void it("trips at the configured round count while the same blocker persists", () => {
+    assert.strictEqual(
+      shouldTripNoProgressBreaker({ zeroChangeRounds: 3, breakerRounds: 3, history: persisting }),
+      true
+    );
+  });
+
+  void it("does not trip below the configured round count", () => {
+    assert.strictEqual(
+      shouldTripNoProgressBreaker({ zeroChangeRounds: 2, breakerRounds: 3, history: persisting }),
+      false
+    );
+  });
+
+  void it("does not trip when the blocker situation changed across the last rounds", () => {
+    const changing = [
+      entry(5, { blockers: [identity({ subject: "src/a.ts" })] }),
+      entry(5, { blockers: [identity({ subject: "src/b.ts" })] }),
+    ];
+    assert.strictEqual(
+      shouldTripNoProgressBreaker({ zeroChangeRounds: 3, breakerRounds: 3, history: changing }),
+      false
+    );
+  });
+});
+
+void describe("degenerateReviewRejectionReason", () => {
+  void it("returns null with the flag off, even for an unparseable score — the legacy behavior", () => {
+    assert.strictEqual(
+      degenerateReviewRejectionReason({
+        rejectDegenerateReviews: false,
+        score: null,
+        stage: "impl-high-review",
+        attemptId: "attempt-1",
+      }),
+      null
+    );
+  });
+
+  void it("returns null for a parseable score with the flag on (the round proceeds normally)", () => {
+    assert.strictEqual(
+      degenerateReviewRejectionReason({
+        rejectDegenerateReviews: true,
+        score: 7.5,
+        stage: "impl-high-review",
+        attemptId: "attempt-1",
+      }),
+      null
+    );
+  });
+
+  void it("returns a reason naming the stage and attempt for an unparseable score with the flag on", () => {
+    const reason = degenerateReviewRejectionReason({
+      rejectDegenerateReviews: true,
+      score: null,
+      stage: "impl-high-review",
+      attemptId: "attempt-42",
+    });
+    assert.notStrictEqual(reason, null);
+    assert.ok(reason!.includes("High-Level Code Review"));
+    assert.ok(reason!.includes("attempt-42"));
+    assert.ok(reason!.includes("excluded from the review score history"));
   });
 });
 

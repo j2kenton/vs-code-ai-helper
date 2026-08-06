@@ -348,6 +348,66 @@ export function getReviewPlateauRounds(): number {
 }
 
 /**
+ * Workflow-resilience feature flags (Stage A of the workflow-resilience
+ * backlog). Every flag defaults to the PRE-EXISTING behavior — enabling one
+ * is an explicit opt-in per behavior change, so the legacy loop-control
+ * semantics stay bit-identical until a user (or a later release flipping the
+ * defaults) turns a flag on. Read per-round, never cached, so mid-task
+ * changes take effect on the next round.
+ */
+export interface ResilienceSettings {
+  /** 2a: a plateau escalation raised inside a Fast Forward run lets the run
+   * finish its attempt budget (escalation reported at the end) instead of
+   * aborting it; external pauses still abort. */
+  fastForwardSurvivesEscalation: boolean;
+  /** 2d: a review round with no parseable `Readiness: N/10` line is recorded
+   * as a failed attempt and never appended to reviewScoreHistory. */
+  rejectDegenerateReviews: boolean;
+  /** 2h: two consecutive reviews with positive zero-task-fixable-blocker
+   * evidence terminate Fast Forward as success regardless of score movement. */
+  zeroFixableTerminatesFastForward: boolean;
+  /** 2f: plateau/stall detection compares blocker identity sets across
+   * rounds instead of the score high-water mark. */
+  blockerSetPlateau: boolean;
+  /** Churn ceiling: escalate after this many consecutive review rounds
+   * without a decrease in taskFixableCount (0 = off). */
+  churnCeilingRounds: number;
+  /** 2b: an implementation round that reports completion with zero file
+   * changes — after prior rounds already changed the tree — routes to
+   * review/complete instead of failing. */
+  nothingToFixRoutesToReview: boolean;
+  /** 2c: escalate after this many consecutive implementation rounds that
+   * change zero files while the same blocker persists (0 = off). */
+  noProgressBreakerRounds: number;
+}
+
+const RESILIENCE_FF_SURVIVES_ESCALATION_KEY = "resilience.fastForwardSurvivesEscalation";
+const RESILIENCE_REJECT_DEGENERATE_REVIEWS_KEY = "resilience.rejectDegenerateReviews";
+const RESILIENCE_ZERO_FIXABLE_TERMINATES_KEY = "resilience.zeroFixableTerminatesFastForward";
+const RESILIENCE_BLOCKER_SET_PLATEAU_KEY = "resilience.blockerSetPlateau";
+const RESILIENCE_CHURN_CEILING_ROUNDS_KEY = "resilience.churnCeilingRounds";
+const RESILIENCE_NOTHING_TO_FIX_KEY = "resilience.nothingToFixRoutesToReview";
+const RESILIENCE_NO_PROGRESS_BREAKER_ROUNDS_KEY = "resilience.noProgressBreakerRounds";
+
+function readResilienceRounds(key: string): number {
+  const value = readSetting<unknown>(key, 0);
+  const numeric = typeof value === "number" && Number.isFinite(value) ? Math.floor(value) : 0;
+  return Math.max(0, Math.min(99, numeric));
+}
+
+export function getResilienceSettings(): ResilienceSettings {
+  return {
+    fastForwardSurvivesEscalation: readSetting<unknown>(RESILIENCE_FF_SURVIVES_ESCALATION_KEY, false) === true,
+    rejectDegenerateReviews: readSetting<unknown>(RESILIENCE_REJECT_DEGENERATE_REVIEWS_KEY, false) === true,
+    zeroFixableTerminatesFastForward: readSetting<unknown>(RESILIENCE_ZERO_FIXABLE_TERMINATES_KEY, false) === true,
+    blockerSetPlateau: readSetting<unknown>(RESILIENCE_BLOCKER_SET_PLATEAU_KEY, false) === true,
+    churnCeilingRounds: readResilienceRounds(RESILIENCE_CHURN_CEILING_ROUNDS_KEY),
+    nothingToFixRoutesToReview: readSetting<unknown>(RESILIENCE_NOTHING_TO_FIX_KEY, false) === true,
+    noProgressBreakerRounds: readResilienceRounds(RESILIENCE_NO_PROGRESS_BREAKER_ROUNDS_KEY),
+  };
+}
+
+/**
  * Wall-clock cap (milliseconds) on a single completion check (lint/type-
  * check/test command, or an explicit verification command). Applies both at
  * Publish and — since review-impl-high/impl-low/publish reviews now run

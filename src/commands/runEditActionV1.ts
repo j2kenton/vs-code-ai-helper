@@ -61,7 +61,7 @@ import {
 } from "../runners/runnerRegistry";
 import { isAuthenticationFailure } from "../utils/quota";
 import { resolveFreshModelForStage } from "../utils/modelSelection";
-import { getAiModelDefaults, getModelSettings } from "../config/settings";
+import { getAiModelDefaults, getModelSettings, getResilienceSettings } from "../config/settings";
 import { writeRunLog } from "../utils/runLog";
 import { NotificationRouter } from "../utils/notificationRouter";
 import type { TaskInventory } from "../state/taskInventory";
@@ -648,7 +648,15 @@ export async function runSealedImplementationV1(
         runnerId,
       };
     case "noChanges":
-      if (options.requireFileChange === false) {
+      if (
+        options.requireFileChange === false ||
+        // ensemble.resilience.nothingToFixRoutesToReview (2b): an empty plan
+        // from a model that inspected the tree and found nothing to fix is a
+        // legitimate completion, not a failure — the caller
+        // (executeImplementationRun) verifies prior rounds actually changed
+        // the tree before routing it onward to review.
+        getResilienceSettings().nothingToFixRoutesToReview
+      ) {
         return {
           status: "completed",
           filesChanged: [],

@@ -95,6 +95,14 @@ void describe("taskProgressFieldPolicyV1", () => {
           taskFixableCount: 1,
         },
       ],
+      reviewRejections: [
+        {
+          stage: "impl-high-review",
+          attemptId: "attempt-7",
+          at: "2026-07-08T00:00:00.000Z",
+          reason: "no parseable Readiness line",
+        },
+      ],
       pinnedAt: "2026-07-05T00:00:00.000Z",
       publishScopePath: "packages/core",
     });
@@ -124,6 +132,7 @@ void describe("taskProgressFieldPolicyV1", () => {
     assert.deepEqual(next.fallbackModelId, { plan: "model-a" });
     assert.deepEqual(next.implReviewFiles, ["src/a.ts"]);
     assert.deepEqual(next.reviewScoreHistory, input.reviewScoreHistory);
+    assert.deepEqual(next.reviewRejections, input.reviewRejections);
     // Binding, creation, and display metadata preserved exactly.
     assert.deepEqual(next.ownership, OWNERSHIP);
     assert.equal(next.taskFolder, input.taskFolder);

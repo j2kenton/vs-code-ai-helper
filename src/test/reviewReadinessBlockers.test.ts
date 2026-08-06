@@ -1,6 +1,10 @@
 import * as assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { parseReviewBlockers } from "../utils/reviewReadiness";
+import {
+  hasZeroTaskFixableEvidence,
+  parseReviewBlockers,
+  parseReviewBlockersDetailed,
+} from "../utils/reviewReadiness";
 
 void describe("parseReviewBlockers", () => {
   void it("returns an empty array when no blockers block is present", () => {
@@ -83,5 +87,48 @@ void describe("parseReviewBlockers", () => {
       blockers.map((b) => b.resolver),
       ["task-fixable", "environmental", "unverifiable", "spec-defect"]
     );
+  });
+});
+
+void describe("parseReviewBlockersDetailed / hasZeroTaskFixableEvidence", () => {
+  void it("distinguishes an absent block from a present-but-empty block", () => {
+    assert.strictEqual(parseReviewBlockersDetailed("Readiness: 9/10").blockPresent, false);
+    const empty = ["<!-- blockers:start -->", "<!-- blockers:end -->"].join("\n");
+    assert.strictEqual(parseReviewBlockersDetailed(empty).blockPresent, true);
+  });
+
+  void it("treats a parsed empty blocker block as positive zero-fixable evidence", () => {
+    const content = ["Readiness: 6/10", "<!-- blockers:start -->", "<!-- blockers:end -->"].join("\n");
+    assert.strictEqual(hasZeroTaskFixableEvidence(content), true);
+  });
+
+  void it("treats a present block with only non-task-fixable blockers as zero-fixable evidence", () => {
+    // The task_5 rounds 84-85 shape: 1 blocker / 0 task-fixable (the
+    // deferred host matrix) — no amount of iteration could ever clear it.
+    const content = [
+      "<!-- blockers:start -->",
+      "- [completion] [environmental] deferred host matrix",
+      "<!-- blockers:end -->",
+    ].join("\n");
+    assert.strictEqual(hasZeroTaskFixableEvidence(content), true);
+  });
+
+  void it("does NOT treat the mere absence of the block as evidence", () => {
+    assert.strictEqual(hasZeroTaskFixableEvidence("Readiness: 9/10\n\nLooks great."), false);
+  });
+
+  void it("accepts an explicit no-blockers statement as evidence when the block is absent", () => {
+    assert.strictEqual(hasZeroTaskFixableEvidence("Readiness: 9/10\n\nNo blockers remain."), true);
+    assert.strictEqual(hasZeroTaskFixableEvidence("Readiness: 9/10\n\nBlockers: none"), true);
+  });
+
+  void it("a present block with a task-fixable blocker is never zero-fixable evidence", () => {
+    const content = [
+      "No blockers were expected, but:",
+      "<!-- blockers:start -->",
+      "- [completion] [task-fixable] real remaining work",
+      "<!-- blockers:end -->",
+    ].join("\n");
+    assert.strictEqual(hasZeroTaskFixableEvidence(content), false);
   });
 });

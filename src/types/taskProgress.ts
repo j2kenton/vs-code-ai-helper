@@ -189,11 +189,36 @@ export interface TaskProgress {
    */
   reviewScoreHistory?: ReviewScoreHistoryEntry[];
   /**
+   * Durable record of review rounds REJECTED as degenerate (2d,
+   * ensemble.resilience.rejectDegenerateReviews): a round with no parseable
+   * `Readiness: N/10` line is a failed attempt, not a review, so it is
+   * recorded here — with its reason — instead of ever entering
+   * `reviewScoreHistory`, where a phantom scoreless round would distort
+   * plateau detection. Capped at MAX_REVIEW_REJECTIONS (oldest dropped).
+   */
+  reviewRejections?: ReviewRejectionEntry[];
+  /**
    * Set when automated review iteration determined it cannot make further
    * progress on its own and needs a human decision. Cleared on the next
    * stage transition and whenever the user explicitly resumes iteration.
    */
   escalation?: TaskEscalation;
+}
+
+/**
+ * Stable identity of one reported blocker, persisted per review round so
+ * later rounds can compare blocker SETS substantively (category + resolver +
+ * the file/subject named) instead of byte-for-byte prose — reviewer wording
+ * drifts round to round ("still fails" → "fails during collection") while
+ * the underlying cause stays the same. See reviewRouting.ts's
+ * detectBlockerSetStall.
+ */
+export interface ReviewBlockerIdentity {
+  category: string;
+  resolver: string;
+  /** File-ish token named by the blocker when one exists, else a normalized
+   * prose prefix — the "what is this blocker about" key. */
+  subject: string;
 }
 
 /** One row of `TaskProgress.reviewScoreHistory`. */
@@ -209,7 +234,27 @@ export interface ReviewScoreHistoryEntry {
   blockerCount: number;
   /** Of those, how many were classified as fixable by another implementation round. */
   taskFixableCount: number;
+  /** Stable identities of this round's blockers (absent on entries written
+   * before this field existed). */
+  blockers?: ReviewBlockerIdentity[];
 }
+
+/** One row of `TaskProgress.reviewRejections`. */
+export interface ReviewRejectionEntry {
+  stage: TaskStage;
+  /** The reviewAttemptId of the rejected round, for correlation with run logs. */
+  attemptId: string;
+  /** ISO timestamp when the round was rejected. */
+  at: string;
+  /** Why the round was rejected (e.g. no parseable `Readiness: N/10` line). */
+  reason: string;
+}
+
+/** Cap on `TaskProgress.reviewRejections` length (oldest entries dropped first). */
+export const MAX_REVIEW_REJECTIONS = 50;
+
+/** Cap on per-entry `blockers` length (a review with more is truncated). */
+export const MAX_REVIEW_BLOCKER_IDENTITIES = 32;
 
 /** Cap on `TaskProgress.reviewScoreHistory` length (oldest entries dropped first). */
 export const MAX_REVIEW_SCORE_HISTORY = 200;

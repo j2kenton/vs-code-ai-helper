@@ -172,6 +172,12 @@ export const TASK_PROGRESS_FIELD_POLICY_V1: Record<
     markTaskDone: "Preserve (durable cross-invocation review trail).",
     reopen: "Preserve (durable cross-invocation review trail).",
   },
+  reviewRejections: {
+    migration: "Validate bounded exact-shape entry array; preserve.",
+    nextStage: "Preserve (durable degenerate-round rejection trail).",
+    markTaskDone: "Preserve (durable degenerate-round rejection trail).",
+    reopen: "Preserve (durable degenerate-round rejection trail).",
+  },
   escalation: {
     migration: "Validate exact shape; preserve.",
     nextStage:
@@ -324,6 +330,7 @@ export function applyNextStagePolicyV1(
     fallbackModelId: clearMapEntry(progress.fallbackModelId, departing),
     reviewAttemptId: undefined,
     reviewScoreHistory: progress.reviewScoreHistory,
+    reviewRejections: progress.reviewRejections,
     escalation: undefined,
     archivedFrom: progress.archivedFrom,
     pinnedAt: progress.pinnedAt,
@@ -370,6 +377,7 @@ export function applyMarkTaskDonePolicyV1(
     fallbackModelId: clearMapEntry(progress.fallbackModelId, progress.currentStage),
     reviewAttemptId: undefined,
     reviewScoreHistory: progress.reviewScoreHistory,
+    reviewRejections: progress.reviewRejections,
     escalation: undefined,
     archivedFrom: progress.archivedFrom,
     pinnedAt: progress.pinnedAt,
@@ -453,6 +461,7 @@ export function applyReopenPolicyV1(
     fallbackModelId,
     reviewAttemptId: undefined,
     reviewScoreHistory: progress.reviewScoreHistory,
+    reviewRejections: progress.reviewRejections,
     escalation: undefined,
     archivedFrom: progress.archivedFrom,
     pinnedAt: progress.pinnedAt,

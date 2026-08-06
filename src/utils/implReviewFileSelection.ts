@@ -14,9 +14,59 @@
  * omitted file is still listed by name, never silently dropped, but a
  * reviewer working from the pack alone still misses their content). Raised
  * to 150000 chars (~35-40k tokens), comfortably inside modern model context
- * windows, to make that the uncommon case rather than the common one. */
+ * windows, to make that the uncommon case rather than the common one.
+ *
+ * Lowered to 100000 (2026-08-06, live dogfooding failure): the model context
+ * window is NOT the binding constraint — the chat-transaction store is.
+ * Every coordinator-driven action's validated input (which embeds the fully
+ * rendered prompt) must persist inside
+ * MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1 = 262,144 bytes
+ * (types/chatInteractionTransactionV1.ts) or the whole run dies BEFORE any
+ * provider is reached, as an opaque-looking
+ * `chatTransaction.chatTransactionRejected` failure. Measured composition of
+ * a real impl-high re-review prompt that hit this: review template + scoring
+ * rubric ≈ 11K, plan ≈ 29K, plan-final ≈ 20K, previous review ≈ 10K, the
+ * pack's non-content sections (task description etc.) ≈ 45K, JSON-string
+ * escaping overhead ≈ 4.5% — leaving roughly 120-135K for embedded file
+ * contents before the cap. At 150000 this section alone could bust it;
+ * 100000 (~25k tokens) keeps the worst observed composition ≈ 20K+ under
+ * the limit while still embedding a dozen files' capped contents. */
 export const IMPL_REVIEW_MAX_CHARS_PER_FILE = 8000;
-export const IMPL_REVIEW_MAX_TOTAL_CHARS = 150000;
+export const IMPL_REVIEW_MAX_TOTAL_CHARS = 100000;
+
+/**
+ * Machine-maintained artifacts whose CONTENTS are never embedded in a review
+ * context pack (they stay listed by name, explicitly labeled as omitted).
+ *
+ * Two reasons, both from a live dogfooding failure (2026-08-06): (1) budget —
+ * implReviewFiles is written verbatim from an implementation run's changed
+ * files, and a run that regenerates this repo's workflow-safety inventories
+ * adds up to ~10 large generated JSON files, each burning
+ * IMPL_REVIEW_MAX_CHARS_PER_FILE of the total budget on an unreadable 8K
+ * head-slice of a 50-400KB machine-written file, crowding out (or, before
+ * the total cap above was anchored to the transaction limit, overflowing)
+ * the actual source changes; (2) authority — these files are verified by
+ * their own generators/verifiers (`pnpm run package`'s workflow-safety
+ * chain, lockfile integrity checks), not by AI review, so a reviewer filing
+ * blockers against a truncated fragment of one is noise by construction.
+ *
+ * `workflow-inventories/` is this extension's own dogfooding convention
+ * (generated baseline/live/route/consumer JSON); the lockfile and
+ * minified/sourcemap patterns are universal.
+ */
+const MACHINE_MAINTAINED_ARTIFACT_PATTERNS_V1: readonly RegExp[] = [
+  /^workflow-inventories\//,
+  /(^|\/)(package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?|Cargo\.lock|composer\.lock|Gemfile\.lock|poetry\.lock|uv\.lock|go\.sum)$/,
+  /\.(min\.js|min\.css|js\.map|css\.map)$/,
+];
+
+/** Whether a workspace-relative path is a machine-maintained artifact whose
+ * contents should be omitted (not a reviewable source file). Accepts either
+ * slash style. */
+export function isMachineMaintainedArtifactPathV1(relPath: string): boolean {
+  const normalized = relPath.replace(/\\/g, "/");
+  return MACHINE_MAINTAINED_ARTIFACT_PATTERNS_V1.some((pattern) => pattern.test(normalized));
+}
 
 /**
  * Deterministically map a changed source file to its associated test file,

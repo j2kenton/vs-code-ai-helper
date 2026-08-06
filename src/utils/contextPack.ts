@@ -6,6 +6,7 @@ import {
   applyContentCaps,
   IMPL_REVIEW_MAX_CHARS_PER_FILE,
   IMPL_REVIEW_MAX_TOTAL_CHARS,
+  isMachineMaintainedArtifactPathV1,
   mapSourceToTestPath,
 } from "./implReviewFileSelection";
 import { sanitizeRelativePath } from "./pathSafety";
@@ -560,6 +561,12 @@ export async function generateImplReviewContextPack(
 
     const fileInputs: Array<{ relPath: string; content: string | undefined }> = [];
     const rejectedPaths: string[] = [];
+    // Machine-maintained artifacts (generated workflow inventories,
+    // lockfiles, minified bundles): listed by name, contents never embedded —
+    // see isMachineMaintainedArtifactPathV1's header for the budget and
+    // review-authority rationale. Diverted before the content read so they
+    // cost no I/O and no share of the embed budget.
+    const machineMaintainedPaths: string[] = [];
 
     for (const rawPath of implReviewFiles) {
       // Reject paths that contain traversal or other suspicious patterns.
@@ -613,6 +620,11 @@ export async function generateImplReviewContextPack(
         continue;
       }
 
+      if (isMachineMaintainedArtifactPathV1(normalized)) {
+        machineMaintainedPaths.push(normalized);
+        continue;
+      }
+
       const content = await getFileContentForReview(resolved);
       fileInputs.push({ relPath: normalized, content });
     }
@@ -652,6 +664,9 @@ export async function generateImplReviewContextPack(
     for (const { relPath, content } of fileInputs) {
       const note = content === undefined ? " ⚠ (missing on disk)" : "";
       lines.push(`- ${relPath}${note}`);
+    }
+    for (const relPath of machineMaintainedPaths) {
+      lines.push(`- ${relPath} (machine-maintained — contents not embedded)`);
     }
     lines.push("");
 
@@ -693,6 +708,19 @@ export async function generateImplReviewContextPack(
       lines.push("");
       for (const o of omitted) {
         lines.push(`- ${o.relPath}`);
+      }
+      lines.push("");
+    }
+
+    if (machineMaintainedPaths.length > 0) {
+      lines.push(
+        `_${machineMaintainedPaths.length} machine-maintained artifact(s) changed — contents omitted by design ` +
+          "(generated inventories/lockfiles are verified by their own generators and the workflow-safety " +
+          "verification chain, not by this review; do not file blockers about their contents being unavailable):_"
+      );
+      lines.push("");
+      for (const relPath of machineMaintainedPaths) {
+        lines.push(`- ${relPath}`);
       }
       lines.push("");
     }
@@ -754,10 +782,14 @@ export async function generateImplReviewContextPack(
     lines.push("## Open Editor Contents (Fallback)");
     lines.push("");
 
-    const fileInputs = uniqueDocs.map((doc) => ({
-      relPath: vscode.workspace.asRelativePath(doc.uri, false),
-      content: doc.getText() as string | undefined,
-    }));
+    const fileInputs = uniqueDocs
+      .map((doc) => ({
+        relPath: vscode.workspace.asRelativePath(doc.uri, false),
+        content: doc.getText() as string | undefined,
+      }))
+      // Same machine-maintained exclusion as tracked mode: an open lockfile
+      // or generated inventory would burn embed budget on unreviewable text.
+      .filter((f) => !isMachineMaintainedArtifactPathV1(f.relPath));
 
     const results = applyContentCaps(
       fileInputs,

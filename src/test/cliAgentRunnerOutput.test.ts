@@ -400,6 +400,47 @@ void describe("CLI output normalization", () => {
     assert.match(result.errorMessage ?? "", /Provider output:/);
   });
 
+  void it("treats a no-file-change CLI completion as success under ensemble.resilience.nothingToFixRoutesToReview (2b)", () => {
+    // A correct implementer that inspects the tree, finds the plan already
+    // satisfied, and declines to fabricate work must route to review rather
+    // than be recorded as a failed run — observed five times, every time
+    // with the model behaving correctly.
+    const codex = getCliProvider("codex-cli");
+    assert.ok(codex, "expected codex-cli provider definition");
+
+    const result = __testOnly.toCliImplementationRunResult(
+      codex,
+      {
+        status: "completed",
+        output: "Verified all plan items are already implemented; no changes needed.",
+      },
+      [],
+      false,
+      true, // requireFileChange (the Run Implementation shape)
+      true // noChangeCompletionIsSuccess (the resilience flag)
+    );
+
+    assert.strictEqual(result.status, "completed");
+    assert.strictEqual(result.summary, "Verified all plan items are already implemented; no changes needed.");
+  });
+
+  void it("keeps the zero-change hard failure when the resilience flag is off (legacy behavior)", () => {
+    const codex = getCliProvider("codex-cli");
+    assert.ok(codex, "expected codex-cli provider definition");
+
+    const result = __testOnly.toCliImplementationRunResult(
+      codex,
+      { status: "completed", output: "Done." },
+      [],
+      false,
+      true,
+      false
+    );
+
+    assert.strictEqual(result.status, "failed");
+    assert.match(result.errorMessage ?? "", /did not modify any workspace files/);
+  });
+
   void it("treats a no-file-change CLI completion as success when requireFileChange is false", () => {
     const codex = getCliProvider("codex-cli");
     assert.ok(codex, "expected codex-cli provider definition");

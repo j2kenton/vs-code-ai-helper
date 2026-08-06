@@ -220,37 +220,37 @@
         },
         {
           "signal": "workspace.fs",
-          "span": "L686-L686",
+          "span": "L699-L699",
           "enclosingSymbol": "entries"
         },
         {
           "signal": "workspace.fs",
-          "span": "L699-L699",
+          "span": "L712-L712",
           "enclosingSymbol": "legacyEntries"
         },
         {
           "signal": "workspace.fs",
-          "span": "L1442-L1442",
+          "span": "L1529-L1529",
           "enclosingSymbol": "contentBytes"
         },
         {
           "signal": "workspace.fs",
-          "span": "L1932-L1932",
+          "span": "L2019-L2019",
           "enclosingSymbol": "runReviewForFolder"
         },
         {
           "signal": "workspace.fs",
-          "span": "L1949-L1949",
+          "span": "L2036-L2036",
           "enclosingSymbol": "runReviewForFolder"
         },
         {
           "signal": "workspace.fs",
-          "span": "L2337-L2337",
+          "span": "L2424-L2424",
           "enclosingSymbol": "runApply"
         },
         {
           "signal": "workspace.fs",
-          "span": "L5374-L5374",
+          "span": "L5656-L5656",
           "enclosingSymbol": "buildReviewResumeVariablesV1"
         }
       ],
@@ -923,17 +923,17 @@
         },
         {
           "signal": "workspace.fs",
-          "span": "L47-L47",
+          "span": "L48-L48",
           "enclosingSymbol": "content"
         },
         {
           "signal": "workspace.fs",
-          "span": "L408-L408",
+          "span": "L409-L409",
           "enclosingSymbol": "writeContextPackContent"
         },
         {
           "signal": "workspace.fs",
-          "span": "L454-L454",
+          "span": "L455-L455",
           "enclosingSymbol": "bytes"
         }
       ],

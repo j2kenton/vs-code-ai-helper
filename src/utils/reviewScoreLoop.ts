@@ -27,6 +27,48 @@ export async function recordBestReviewScore(context: vscode.ExtensionContext, st
   return best;
 }
 
+/** How many consecutive zero-task-fixable review rounds (with positive
+ * evidence — see ReviewRoundOutcome.zeroFixableEvidence) terminate the loop
+ * as success when `zeroFixableTerminates` is enabled. Two, not one, so a
+ * single over-lenient round can't end a run on its own. */
+export const ZERO_FIXABLE_TERMINAL_ROUNDS = 2;
+
+/**
+ * Where a pause came from, when the caller can tell:
+ *  - "escalation": handleReviewRoutingOutcome (reviewActions.ts) escalated
+ *    and paused the task from INSIDE this run's own review round.
+ *  - "external": any other source — the user pausing manually, another
+ *    window, an escalation for a different stage.
+ * A plain boolean `true` is treated as "external" (the pre-existing
+ * contract): only a caller that affirmatively classifies a pause as this
+ * run's own escalation ever gets the continue-through behavior.
+ */
+export type PauseSource = "external" | "escalation";
+
+/**
+ * Structured per-round review outcome — the single seam consumed by both
+ * degenerate-round handling (score: null) and zero-fixable termination.
+ * review() may still return a bare number (legacy callers/tests): it is
+ * normalized to `{ score, taskFixableCount: null, zeroFixableEvidence:
+ * false }`, which preserves every historical behavior.
+ */
+export interface ReviewRoundOutcome {
+  /** Parsed `Readiness: N/10`, or null when the artifact changed but carried
+   * no parseable score (the round is treated as stalled, exactly as a bare
+   * null score was before). */
+  score: number | null;
+  /** Task-fixable blockers reported this round, or null when no
+   * machine-readable blocker block was parsed. */
+  taskFixableCount: number | null;
+  /**
+   * POSITIVE evidence this round reported zero task-fixable blockers: a
+   * parsed (present) blocker block with no task-fixable entry, or an
+   * explicit "no blockers" statement — never the mere absence of the block
+   * (see reviewReadiness.ts's hasZeroTaskFixableEvidence).
+   */
+  zeroFixableEvidence: boolean;
+}
+
 export interface ImproveReviewScoreResult {
   /** Last known score, or null if no attempt ever produced a parseable one. */
   score: number | null;
@@ -42,7 +84,8 @@ export interface ImproveReviewScoreResult {
    */
   stalled: boolean;
   /**
-   * True when apply() left the task paused (isPaused() returned true).
+   * True when apply() left the task paused (isPaused() returned truthy and
+   * the pause was not ridden through — see continueThroughEscalation).
    * Checked AFTER review() runs (so a score this attempt actually produced
    * is still recorded — see isPaused's own doc comment) but takes priority
    * over `stalled` in the returned outcome, so the two remain mutually
@@ -51,6 +94,20 @@ export interface ImproveReviewScoreResult {
    * we don't know why". Always false when the caller doesn't pass isPaused.
    */
   paused: boolean;
+  /**
+   * True when at least one attempt's own review escalated ("escalation"
+   * pause source) and the loop, under continueThroughEscalation, kept
+   * running instead of aborting — the caller must surface that escalation
+   * to the user at the end of the run rather than letting it disappear.
+   */
+  escalationDeferred: boolean;
+  /**
+   * True when the loop stopped because ZERO_FIXABLE_TERMINAL_ROUNDS
+   * consecutive rounds each carried positive evidence of zero task-fixable
+   * blockers (zeroFixableTerminates) — terminal success regardless of score
+   * movement. Mutually exclusive with `improved`.
+   */
+  zeroFixableSuccess: boolean;
 }
 
 /**
@@ -72,18 +129,41 @@ export async function improveReviewScore(options: {
   stage: string;
   baselineScore: number;
   apply: () => Promise<void>;
-  /** Returns the new score, or null if this attempt produced nothing to compare (stops the loop). */
-  review: () => Promise<number | null>;
+  /** Returns the new round outcome (or a bare score, normalized — see
+   * ReviewRoundOutcome), or null if this attempt produced nothing to compare
+   * (stops the loop). */
+  review: () => Promise<ReviewRoundOutcome | number | null>;
   /**
    * Checked immediately after review(), and takes priority over `stalled` in
-   * the returned outcome. When it returns true, the loop stops and reports
-   * `paused` instead of continuing — but review() still runs first so a
-   * score this same attempt actually produced (e.g. an internal re-review
-   * that itself triggered the pause via escalation) is recorded rather than
-   * discarded. Optional: a caller with no pausable task (e.g. a test, or a
-   * future non-task-scoped use of this loop) simply never sees this outcome.
+   * the returned outcome. When it returns truthy, the loop stops and reports
+   * `paused` — unless the value is "escalation" AND continueThroughEscalation
+   * is set, in which case the loop records `escalationDeferred` and keeps
+   * going. review() still runs first so a score this same attempt actually
+   * produced (e.g. an internal re-review that itself triggered the pause via
+   * escalation) is recorded rather than discarded. Optional: a caller with
+   * no pausable task (e.g. a test, or a future non-task-scoped use of this
+   * loop) simply never sees this outcome.
    */
-  isPaused?: () => Promise<boolean>;
+  isPaused?: () => Promise<boolean | PauseSource>;
+  /**
+   * ensemble.resilience.fastForwardSurvivesEscalation: a plateau escalation
+   * raised INSIDE this run must not silently reduce an explicitly-requested
+   * multi-attempt run to a single round — the user already answered "keep
+   * going" by starting it. Only rides through pauses the caller classifies
+   * as "escalation" (this run's own); external pauses always abort, which is
+   * isPaused's original purpose.
+   */
+  continueThroughEscalation?: boolean;
+  /**
+   * ensemble.resilience.zeroFixableTerminatesFastForward: two consecutive
+   * rounds with positive zero-task-fixable evidence end the loop as terminal
+   * success regardless of score movement. Without this, a review reporting
+   * zero blockers of every category plus "ready to proceed" still burns the
+   * remaining attempts whenever its number failed to move +0.1 (observed:
+   * 37 zero-blocker rounds across one task, none of which stopped anything).
+   * The score gate remains an ADDITIONAL way to succeed, never the only one.
+   */
+  zeroFixableTerminates?: boolean;
   token?: vscode.CancellationToken;
   /** Maximum apply/review cycles for this run. */
   maxAttempts?: number;
@@ -93,6 +173,8 @@ export async function improveReviewScore(options: {
   stopAtScore?: number;
 }): Promise<ImproveReviewScoreResult> {
   let best: number | null = null;
+  let escalationDeferred = false;
+  let consecutiveZeroFixable = 0;
   const maxAttempts = Math.max(1, options.maxAttempts ?? MAX_REVIEW_ATTEMPTS);
   const stopAtScore = Math.max(0, Math.min(10, options.stopAtScore ?? 0));
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -103,16 +185,29 @@ export async function improveReviewScore(options: {
     if (options.token?.isCancellationRequested) {
       throw new vscode.CancellationError();
     }
-    const score = await options.review();
+    const raw = await options.review();
+    const round: ReviewRoundOutcome | null =
+      raw === null
+        ? null
+        : typeof raw === "number"
+          ? { score: raw, taskFixableCount: null, zeroFixableEvidence: false }
+          : raw;
+    const score = round?.score ?? null;
     if (score !== null) {
       best = Math.max(best ?? Number.NEGATIVE_INFINITY, score);
       await recordBestReviewScore(options.context, options.stage, score);
     }
-    if ((await options.isPaused?.()) === true) {
-      return { score: best, attempts: attempt, improved: false, stalled: false, paused: true };
+    const pause = (await options.isPaused?.()) ?? false;
+    if (pause === "escalation" && options.continueThroughEscalation === true) {
+      // This run's own review escalated. The user asked for a multi-attempt
+      // run; keep going and report the escalation at the end instead of
+      // degrading to a one-round button.
+      escalationDeferred = true;
+    } else if (pause === true || pause === "external" || pause === "escalation") {
+      return { score: best, attempts: attempt, improved: false, stalled: false, paused: true, escalationDeferred, zeroFixableSuccess: false };
     }
-    if (score === null) {
-      return { score: best, attempts: attempt, improved: false, stalled: true, paused: false };
+    if (round === null || score === null) {
+      return { score: best, attempts: attempt, improved: false, stalled: true, paused: false, escalationDeferred, zeroFixableSuccess: false };
     }
     // Compare in integer tenths: scores are normalized to one decimal
     // (reviewReadiness.ts), and `baseline + 0.1` is not exactly representable
@@ -124,8 +219,12 @@ export async function improveReviewScore(options: {
     // from the score it started with.  A configured target may require more,
     // but must not let a task at (or above) that target stop without improving.
     if (improved && (stopAtScore === 0 || score >= stopAtScore)) {
-      return { score, attempts: attempt, improved: true, stalled: false, paused: false };
+      return { score, attempts: attempt, improved: true, stalled: false, paused: false, escalationDeferred, zeroFixableSuccess: false };
+    }
+    consecutiveZeroFixable = round.zeroFixableEvidence ? consecutiveZeroFixable + 1 : 0;
+    if (options.zeroFixableTerminates === true && consecutiveZeroFixable >= ZERO_FIXABLE_TERMINAL_ROUNDS) {
+      return { score, attempts: attempt, improved: false, stalled: false, paused: false, escalationDeferred, zeroFixableSuccess: true };
     }
   }
-  return { score: best, attempts: maxAttempts, improved: false, stalled: false, paused: false };
+  return { score: best, attempts: maxAttempts, improved: false, stalled: false, paused: false, escalationDeferred, zeroFixableSuccess: false };
 }

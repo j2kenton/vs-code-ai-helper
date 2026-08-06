@@ -28,7 +28,7 @@ import {
 } from "../types/taskProgress";
 import { TaskProgress } from "../types/taskProgress";
 import { deriveTaskBindingV1 } from "../types/taskBindingV1";
-import { appendReviewScoreHistory } from "../utils/taskProgressTransforms";
+import { appendReviewRejection, appendReviewScoreHistory, updateTaskStatus } from "../utils/taskProgressTransforms";
 import { IncompleteTask } from "../types/incompleteTask";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
@@ -102,16 +102,28 @@ import { NEXT_STAGE_ACTION_KEY_V1 } from "../actions/rows/nextStageRowV1";
 import { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
 import { ChatInteractionRefV1, ChatInteractionResumeResultV1, ChatViewProvider } from "../views/chatView";
 import { TaskInventory } from "../state/taskInventory";
-import { meetsAutoAdvanceThreshold, parseReadiness, parseReviewBlockers } from "../utils/reviewReadiness";
+import {
+  hasZeroTaskFixableEvidence,
+  meetsAutoAdvanceThreshold,
+  parseReadiness,
+  parseReviewBlockers,
+  parseReviewBlockersDetailed,
+} from "../utils/reviewReadiness";
 import { scheduleAutomationChain, releaseAutomationChain } from "../utils/automationChain";
 import { buildVerifiedChecksSection, collectCompletionLintPreview, resolvePublishScopeFolder } from "../utils/completionLint";
 import { checkPublishPreflight } from "../utils/publishPreflight";
 import { improveReviewScore } from "../utils/reviewScoreLoop";
 import {
+  blockerIdentities,
   decideReviewRoute,
+  degenerateReviewRejectionReason,
+  detectBlockerSetStall,
   detectPlateau,
   REVIEW_RUBRIC_BLOCKER_SCORE_CAP,
+  roundsWithoutTaskFixableDecrease,
   rubricCapLikelyBlockedAdvance,
+  shouldEscalateChurnCeiling,
+  shouldTripNoProgressBreaker,
 } from "../utils/reviewRouting";
 import { escalateReviewToHuman } from "../utils/reviewEscalation";
 import {
@@ -122,6 +134,7 @@ import {
   getCompleteAndMoveOnTriggersAIMode,
   getFastForwardMaxIterations,
   getFastForwardStopLevel,
+  getResilienceSettings,
   getReviewPlateauRounds,
   isAutoAdvanceEnabled,
   strongestAutoTriggerMode,
@@ -1196,9 +1209,44 @@ async function handleReviewRoutingOutcome(options: {
 }): Promise<{ escalated: boolean }> {
   const { folderUri, targetStage, reviewAttemptId, content, score, threshold } = options;
   try {
+    const resilience = getResilienceSettings();
     const blockers = parseReviewBlockers(content);
     const progressBefore = await readTaskProgressAdvisoryV1(folderUri);
     if (!progressBefore) {
+      return { escalated: false };
+    }
+    // 2d: a round with no parseable `Readiness: N/10` line is a failure
+    // wearing a review's clothes — a provider error, truncation, or
+    // degenerate output. It must NOT be appended to reviewScoreHistory:
+    // detectPlateau reads exactly that history, so a phantom scoreless
+    // round (or, historically, a 0/10 from a failed call) permanently
+    // depresses the "prior best" and can manufacture a false plateau
+    // rounds later. Record it as a failed attempt — with its reason
+    // durably persisted in task-progress.json's reviewRejections trail,
+    // plus a run log and a notification — instead.
+    const rejectionReason = degenerateReviewRejectionReason({
+      rejectDegenerateReviews: resilience.rejectDegenerateReviews,
+      score,
+      stage: targetStage,
+      attemptId: reviewAttemptId,
+    });
+    if (rejectionReason !== null) {
+      await patchTaskProgressStrictV1(folderUri, (current) =>
+        appendReviewRejection(current, {
+          stage: targetStage,
+          attemptId: reviewAttemptId,
+          at: new Date().toISOString(),
+          reason: rejectionReason,
+        })
+      );
+      await writeRunLog(
+        folderUri,
+        "review-guard",
+        targetStage,
+        `# Rejected Review Round\n\nStatus: rejected (degenerate output)\n\n${rejectionReason}\n\n` +
+          `Output length: ${content.length} characters.`
+      );
+      NotificationRouter.showWarning(rejectionReason);
       return { escalated: false };
     }
     const historyEntry = {
@@ -1208,6 +1256,7 @@ async function handleReviewRoutingOutcome(options: {
       at: new Date().toISOString(),
       blockerCount: blockers.length,
       taskFixableCount: blockers.filter((b) => b.resolver === "task-fixable").length,
+      blockers: blockerIdentities(blockers),
     };
     const updated = await patchTaskProgressStrictV1(folderUri, (current) =>
       appendReviewScoreHistory(current, historyEntry)
@@ -1216,8 +1265,46 @@ async function handleReviewRoutingOutcome(options: {
       return { escalated: false };
     }
 
+    // Churn ceiling: an unconditional stop after N configurable rounds
+    // without a DECREASE in task-fixable blockers — independent of both the
+    // score and the blocker-churn signal below, so a loop that keeps
+    // completing rounds while the amount of fixable work never falls is
+    // stopped well before fastForwardMaxIterations burns out.
+    if (
+      shouldEscalateChurnCeiling({
+        history: updated.reviewScoreHistory ?? [],
+        stage: targetStage,
+        taskFixableCount: historyEntry.taskFixableCount,
+        churnCeilingRounds: resilience.churnCeilingRounds,
+      })
+    ) {
+      const stagnantRounds = roundsWithoutTaskFixableDecrease(
+        updated.reviewScoreHistory ?? [],
+        targetStage
+      );
+      const escalated = await escalateReviewToHuman(
+        folderUri,
+        targetStage,
+        "plateau",
+        `${STAGE_DISPLAY_NAMES[targetStage]} has completed ${stagnantRounds} consecutive rounds without ` +
+          "reducing the number of task-fixable blockers (churn ceiling, " +
+          "ensemble.resilience.churnCeilingRounds). Automated iteration is churning, not converging.",
+        reviewAttemptId,
+        updated,
+        false
+      );
+      return { escalated };
+    }
+
     const plateauWindow = getReviewPlateauRounds();
-    const plateaued = detectPlateau(updated.reviewScoreHistory ?? [], targetStage, plateauWindow);
+    // 2f (flagged): the blocker set is the progress signal — shrinking or
+    // changing contents means real work landed regardless of what the score
+    // did; an unchanged (matched substantively, not byte-for-byte) or
+    // growing set is the stall. The legacy score high-water-mark test
+    // remains the default until the flag is enabled.
+    const plateaued = resilience.blockerSetPlateau
+      ? detectBlockerSetStall(updated.reviewScoreHistory ?? [], targetStage, plateauWindow)
+      : detectPlateau(updated.reviewScoreHistory ?? [], targetStage, plateauWindow);
     // A second opinion has already been "tried this plateau" once any round
     // in the current unbroken run of plateaued rounds recorded one. Latches
     // on `secondOpinionAttempted`, not `kind`: every kind a second-opinion
@@ -2829,6 +2916,31 @@ export async function fastForwardReviewWithAI(
 
   let previousContent = initialContent;
   let attemptNumber = 0;
+  const resilience = getResilienceSettings();
+
+  // Set once isPaused has ridden through this run's own escalation (2a):
+  // that un-pauses the task so the remaining attempts can run, which means
+  // the run must RE-ASSERT the pause on every exit path — normal completion,
+  // cancellation, or a thrown failure. Without that, a run that dies after
+  // riding through leaves the task active with an escalation record and no
+  // pause, and the escalation the user still has to act on loses the very
+  // stop it was raised to cause.
+  let escalationRiddenThrough = false;
+  const reassertDeferredEscalationPause = async (): Promise<void> => {
+    if (!escalationRiddenThrough) {
+      return;
+    }
+    try {
+      await patchTaskProgressStrictV1(resolved.folderUri, (current) =>
+        current.status === "active" && current.escalation?.stage === targetStage
+          ? updateTaskStatus(current, "paused")
+          : current
+      );
+    } catch {
+      // Best-effort: the escalation record itself is already persisted, and
+      // failing to re-pause must not mask the run's own outcome/error.
+    }
+  };
 
   let outcome: Awaited<ReturnType<typeof improveReviewScore>>;
   try {
@@ -2857,7 +2969,23 @@ export async function fastForwardReviewWithAI(
             });
             // Iteration progress on the root operation's Notifications row.
             op.report(`iteration ${attemptNumber}/${maxAttempts}`);
-            await applyReviewWithAI(
+            // Route by the review target's own kind (live dogfooding finding,
+            // 2026-08-06): this callback previously called applyReviewWithAI
+            // unconditionally, but that handler's first gate REFUSES
+            // implementation-review stages outright (warning + return, zero
+            // edits) — so Fast Forward on an impl-review target warned once
+            // per attempt, applied nothing, review() then read unchanged
+            // content, and the loop reported "stalled": structurally unable
+            // to ever progress. Impl-review targets go to the edit-capable
+            // applyReviewEditWithAI (identical signature; its own chained
+            // re-review refreshes the artifact exactly like the plan path's,
+            // which is what review() below reads), matching every other
+            // dispatch surface (tree button, applyHighLevel/
+            // applyLowLevelReviewChanges).
+            const applyForTarget = IMPL_REVIEW_STAGES.includes(targetStage)
+              ? applyReviewEditWithAI
+              : applyReviewWithAI;
+            await applyForTarget(
               extensionUri,
               context,
               concreteArg,
@@ -2870,19 +2998,60 @@ export async function fastForwardReviewWithAI(
           // paused guard, review() then sees unchanged content and returns
           // null, and the loop reports "stalled" — blaming the provider for
           // a deliberate escalation it has no way to see otherwise.
-          isPaused: async () => (await readTaskProgressAdvisoryV1(resolved.folderUri))?.status === "paused",
+          //
+          // 2a (flagged): the pause SOURCE matters. An escalation this run's
+          // own review just raised must not silently reduce an explicitly
+          // requested multi-attempt run to a single round — the user already
+          // answered "keep going" by clicking Fast Forward. With the flag
+          // on, such a pause is classified "escalation", the task is
+          // un-paused so the remaining attempts can actually run (the
+          // escalation record itself is preserved for end-of-run reporting),
+          // and the loop continues. Pauses from any OTHER source (manual,
+          // another window, a different stage's escalation) still abort —
+          // that is isPaused's original purpose.
+          isPaused: async () => {
+            const fresh = await readTaskProgressAdvisoryV1(resolved.folderUri);
+            if (fresh?.status !== "paused") {
+              return false;
+            }
+            if (!resilience.fastForwardSurvivesEscalation || fresh.escalation?.stage !== targetStage) {
+              return "external";
+            }
+            await patchTaskProgressStrictV1(resolved.folderUri, (current) =>
+              current.status === "paused" && current.escalation?.stage === targetStage
+                ? updateTaskStatus(current, "active")
+                : current
+            );
+            escalationRiddenThrough = true;
+            return "escalation";
+          },
+          continueThroughEscalation: resilience.fastForwardSurvivesEscalation,
+          zeroFixableTerminates: resilience.zeroFixableTerminatesFastForward,
           review: async () => {
             const newContent = await readNonEmptyText(reviewUri);
             if (!newContent || newContent === previousContent) {
               return null;
             }
             previousContent = newContent;
-            return parseReadiness(newContent).score;
+            const detailed = parseReviewBlockersDetailed(newContent);
+            return {
+              score: parseReadiness(newContent).score,
+              taskFixableCount: detailed.blockPresent
+                ? detailed.blockers.filter((b) => b.resolver === "task-fixable").length
+                : null,
+              // Positive evidence only: a parsed (present) blocker block
+              // with no task-fixable entry, or an explicit no-blockers
+              // statement — never the mere absence of the block.
+              zeroFixableEvidence: hasZeroTaskFixableEvidence(newContent),
+            };
           },
         }).finally(() => linked.dispose());
       }
     );
   } catch (error) {
+    // The run is over (cancelled or failed) — if it rode through its own
+    // escalation, the pause that escalation asserted must come back now.
+    await reassertDeferredEscalationPause();
     if (error instanceof vscode.CancellationError) {
       if (targetStage === "publish") {
         NotificationRouter.showWarning(
@@ -2926,9 +3095,36 @@ export async function fastForwardReviewWithAI(
     throw error;
   }
 
+  // The run finished — if it rode through its own escalation, re-assert the
+  // pause that escalation originally asserted before reporting the outcome.
+  await reassertDeferredEscalationPause();
+  if (outcome.escalationDeferred) {
+    // 2a: an escalation fired during the run but (per
+    // ensemble.resilience.fastForwardSurvivesEscalation) did not abort it.
+    // The escalation's own notification/chat question already carried the
+    // reason; this re-surfaces it at end of run so finishing the attempt
+    // budget never buries a signal the user must still act on.
+    NotificationRouter.showWarning(
+      "Fast Forward Review: automated review iteration escalated during this run (see the escalation " +
+        "notification/chat question for the reason). The run was allowed to finish its attempt budget " +
+        "instead of stopping, and the task has been returned to paused — review the escalation and " +
+        "resume the task once you've decided how to proceed."
+    );
+  }
   if (outcome.improved) {
     NotificationRouter.showInformation(
       `Fast Forward Review: score improved to ${outcome.score}/10 after ${outcome.attempts} attempt(s).`
+    );
+  } else if (outcome.zeroFixableSuccess) {
+    // 2h: two consecutive reviews each carried positive evidence of zero
+    // task-fixable blockers — terminal success regardless of score movement.
+    // Without this stop, "no blockers found, ready to proceed" rounds whose
+    // number failed to move +0.1 burned the remaining attempts (observed:
+    // 37 zero-blocker rounds across one task, none of which stopped it).
+    NotificationRouter.showInformation(
+      `Fast Forward Review: stopped after ${outcome.attempts} attempt(s) — two consecutive reviews ` +
+        `reported zero task-fixable blockers (last score ${outcome.score}/10). Nothing fixable remains ` +
+        "for further automated iteration."
     );
   } else if (outcome.paused) {
     // The escalation that paused the task already showed its own
@@ -4117,6 +4313,27 @@ export const IMPLEMENTATION_CHECKLIST_MARKER = "<!-- ensemble:implementation-che
  * it IS applied for paths coming directly from runImplementationWithAI
  * (where the prompt is assembled here).
  */
+/**
+ * In-memory consecutive zero-file-change implementation-round counter per
+ * task folder (2c, ensemble.resilience.noProgressBreakerRounds). In-memory
+ * on purpose: the breaker exists to stop a single session's automation loop
+ * (Fast Forward / auto-review chains) from running to
+ * fastForwardMaxIterations while producing no edits — matching Fast
+ * Forward's own in-session loop state, not the durable cross-session trail
+ * reviewScoreHistory provides.
+ */
+const zeroChangeImplRoundsByTask = new Map<string, number>();
+
+/**
+ * Drop the in-memory zero-change round counter for one task. Called when a
+ * task is archived (see archiveTask.ts) so the per-session map does not
+ * accumulate entries for tasks that are no longer iterating; a missing entry
+ * is equivalent to a zero count, so this is always safe.
+ */
+export function clearZeroChangeImplRoundCounter(taskFolderPath: string): void {
+  zeroChangeImplRoundsByTask.delete(normalizePath(taskFolderPath));
+}
+
 async function executeImplementationRun(
   _extensionUri: vscode.Uri,
   folderUri: vscode.Uri,
@@ -4273,14 +4490,62 @@ async function executeImplementationRun(
 
   if (result.status === "completed") {
     const implementationUri = getCanonicalImplementationUri(folderUri);
+    const taskKey = normalizePath(folderUri.fsPath);
 
     if (!result.filesChangedUnknown && result.filesChanged.length === 0) {
-      NotificationRouter.showWarning(
-        "Implementation finished, but no workspace files changed. " +
-          "Review the implementation run log; the provider may have been blocked from writing files."
+      const resilience = getResilienceSettings();
+      const priorProgress = await readTaskProgressAdvisoryV1(folderUri);
+      // "Prior rounds already changed the tree": implReviewFiles is the
+      // durable record of the last implementation round's real edits.
+      const priorRoundsChangedTree = (priorProgress?.implReviewFiles?.length ?? 0) > 0;
+      if (!resilience.nothingToFixRoutesToReview || !priorRoundsChangedTree) {
+        NotificationRouter.showWarning(
+          "Implementation finished, but no workspace files changed. " +
+            "Review the implementation run log; the provider may have been blocked from writing files."
+        );
+        await safeOpenTextDocument(logUri, "implementation run log");
+        return false;
+      }
+      // 2b: the model reported completion, prior rounds already changed the
+      // tree, and it found no defect to fix — a correct implementer that
+      // declines to fabricate work. Route onward to review/complete instead
+      // of recording a spurious failure (observed five times; in every case
+      // the model was behaving correctly).
+      const zeroChangeRounds = (zeroChangeImplRoundsByTask.get(taskKey) ?? 0) + 1;
+      zeroChangeImplRoundsByTask.set(taskKey, zeroChangeRounds);
+      NotificationRouter.showInformation(
+        "Implementation finished with no file changes — the model reported the current state already " +
+          "satisfies the plan. Routing to review instead of recording a failure " +
+          "(ensemble.resilience.nothingToFixRoutesToReview)."
       );
-      await safeOpenTextDocument(logUri, "implementation run log");
-      return false;
+      // 2c: N consecutive zero-change rounds while the same blocker persists
+      // is a loop producing no edits at all — stop and escalate rather than
+      // running to fastForwardMaxIterations.
+      if (
+        shouldTripNoProgressBreaker({
+          zeroChangeRounds,
+          breakerRounds: resilience.noProgressBreakerRounds,
+          history: priorProgress?.reviewScoreHistory,
+        })
+      ) {
+        const escalated = await escalateReviewToHuman(
+          folderUri,
+          priorProgress?.currentStage ?? postRunReviewStage,
+          "plateau",
+          `${zeroChangeRounds} consecutive implementation round(s) changed zero files while the same ` +
+            "blocker persisted (no-progress breaker, ensemble.resilience.noProgressBreakerRounds). " +
+            "Automated iteration is no longer producing edits.",
+          priorProgress?.reviewAttemptId ?? "",
+          priorProgress ?? undefined,
+          false
+        );
+        if (escalated) {
+          zeroChangeImplRoundsByTask.delete(taskKey);
+          return false;
+        }
+      }
+    } else if (!result.filesChangedUnknown) {
+      zeroChangeImplRoundsByTask.delete(taskKey);
     }
 
     const summary = result.summary?.trim();
@@ -4313,8 +4578,12 @@ async function executeImplementationRun(
         : { ...currentProgress, currentStage: "impl" as TaskStage };
 
       // filesChangedUnknown means THIS run's own change detection failed.
-      // Leave implReviewFiles untouched rather than clearing it.
-      if (!result!.filesChangedUnknown) {
+      // Leave implReviewFiles untouched rather than clearing it. A completed
+      // zero-change round (reachable only under
+      // ensemble.resilience.nothingToFixRoutesToReview) likewise preserves
+      // the prior round's list — the review scope must still cover the work
+      // those earlier rounds actually landed.
+      if (!result!.filesChangedUnknown && result!.filesChanged.length > 0) {
         return { ...stageUpdated, implReviewFiles: result!.filesChanged };
       }
       return stageUpdated;
@@ -4867,6 +5136,19 @@ export async function applyReviewEditWithAI(
     }
   };
 
+  if (options.parentOperation) {
+    // A composite caller (Fast Forward) already registered the exclusive
+    // tracked operation on this task; run under its handle so the whole
+    // composite renders exactly one Notifications row and the internal
+    // apply/re-review steps nest as its children. Without this branch the
+    // runTrackedOperation below would try to register a SECOND exclusive
+    // root on the same key while the composite still holds it, be refused
+    // by taskOperations.begin, and silently no-op every Fast Forward
+    // attempt with a "task busy" warning — mirrors applyReviewWithAI's
+    // identical branch, which is what let the plan path compose all along.
+    await runApply(options.parentOperation);
+    return;
+  }
   await runTrackedOperation(
     lockKey,
     {

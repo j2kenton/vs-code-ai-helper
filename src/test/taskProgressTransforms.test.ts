@@ -1,7 +1,7 @@
 import * as assert from "node:assert/strict";
 import { test } from "node:test";
-import { appendReviewScoreHistory, clearEscalation, clearStageFallbackReservation, recordEscalation, updateImplReviewFiles, clearImplReviewFiles, updateTaskProgressStage } from "../utils/taskProgressTransforms";
-import { MAX_REVIEW_SCORE_HISTORY, ReviewScoreHistoryEntry, type TaskProgress } from "../types/taskProgress";
+import { appendReviewRejection, appendReviewScoreHistory, clearEscalation, clearStageFallbackReservation, recordEscalation, updateImplReviewFiles, clearImplReviewFiles, updateTaskProgressStage } from "../utils/taskProgressTransforms";
+import { MAX_REVIEW_REJECTIONS, MAX_REVIEW_SCORE_HISTORY, ReviewRejectionEntry, ReviewScoreHistoryEntry, type TaskProgress } from "../types/taskProgress";
 
 function makeProgress(implReviewFiles?: string[]): TaskProgress {
   return {
@@ -180,6 +180,45 @@ void test("appendReviewScoreHistory caps at MAX_REVIEW_SCORE_HISTORY, dropping t
   assert.equal(updated.reviewScoreHistory?.length, MAX_REVIEW_SCORE_HISTORY);
   assert.equal(updated.reviewScoreHistory?.[0]?.attemptId, "attempt-1", "the single oldest entry must be dropped");
   assert.equal(updated.reviewScoreHistory?.at(-1)?.attemptId, "attempt-new");
+});
+
+// ---------------------------------------------------------------------------
+// appendReviewRejection: durable degenerate-round rejection trail (2d)
+// ---------------------------------------------------------------------------
+
+function rejectionEntry(overrides: Partial<ReviewRejectionEntry> = {}): ReviewRejectionEntry {
+  return {
+    stage: "impl-high-review",
+    attemptId: "attempt-1",
+    at: "2026-07-07T00:00:00.000Z",
+    reason: "no parseable Readiness line",
+    ...overrides,
+  };
+}
+
+void test("appendReviewRejection records the rejected round with its reason, without touching reviewScoreHistory", () => {
+  const progress = { ...makeProgress(), reviewScoreHistory: [historyEntry()] };
+  const updated = appendReviewRejection(progress, rejectionEntry());
+  assert.deepEqual(updated.reviewRejections, [rejectionEntry()]);
+  assert.deepEqual(updated.reviewScoreHistory, [historyEntry()]);
+});
+
+void test("appendReviewRejection preserves prior rejections in order", () => {
+  const progress = { ...makeProgress(), reviewRejections: [rejectionEntry({ attemptId: "attempt-0" })] };
+  const updated = appendReviewRejection(progress, rejectionEntry({ attemptId: "attempt-1" }));
+  assert.deepEqual(
+    updated.reviewRejections?.map((e) => e.attemptId),
+    ["attempt-0", "attempt-1"]
+  );
+});
+
+void test("appendReviewRejection caps at MAX_REVIEW_REJECTIONS, dropping the oldest first", () => {
+  const existing = Array.from({ length: MAX_REVIEW_REJECTIONS }, (_, i) => rejectionEntry({ attemptId: `attempt-${i}` }));
+  const progress = { ...makeProgress(), reviewRejections: existing };
+  const updated = appendReviewRejection(progress, rejectionEntry({ attemptId: "attempt-new" }));
+  assert.equal(updated.reviewRejections?.length, MAX_REVIEW_REJECTIONS);
+  assert.equal(updated.reviewRejections?.[0]?.attemptId, "attempt-1", "the single oldest entry must be dropped");
+  assert.equal(updated.reviewRejections?.at(-1)?.attemptId, "attempt-new");
 });
 
 void test("recordEscalation sets the escalation field", () => {

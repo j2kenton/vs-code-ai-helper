@@ -8,6 +8,7 @@ import { IncompleteTask } from "../types/incompleteTask";
 import { MAX_PINNED_TASKS, TaskProgress, TaskStatus } from "../types/taskProgress";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { cancelRunningOperationsForTask, runTrackedOperation } from "../utils/taskOperations";
+import { clearZeroChangeImplRoundCounter } from "./reviewActions";
 import { PendingOperationsStore } from "../state/pendingOperationsStore";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
 
@@ -126,6 +127,9 @@ export async function archiveTask(
         // either — those would otherwise be recovered/reconciled against an
         // archived task on the next activation.
         await pendingOperations?.removeForTask(resolved.canonicalId);
+        // A parked task is no longer iterating — drop its in-memory
+        // zero-change implementation-round counter too.
+        clearZeroChangeImplRoundCounter(resolved.taskFolderPath);
         if (currentTaskStore.get() === resolved.canonicalId) {
           await currentTaskStore.clear();
         }

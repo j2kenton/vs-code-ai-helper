@@ -1,6 +1,12 @@
 import * as assert from "node:assert/strict";
 import { test } from "node:test";
-import { applyContentCaps, mapSourceToTestPath } from "../utils/implReviewFileSelection";
+import {
+  applyContentCaps,
+  IMPL_REVIEW_MAX_TOTAL_CHARS,
+  isMachineMaintainedArtifactPathV1,
+  mapSourceToTestPath,
+} from "../utils/implReviewFileSelection";
+import { MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1 } from "../types/chatInteractionTransactionV1";
 
 // ---------------------------------------------------------------------------
 // Basic inclusion
@@ -189,4 +195,61 @@ void test("returns undefined for paths already inside src/test/", () => {
 void test("returns undefined for non-TypeScript files", () => {
   assert.equal(mapSourceToTestPath("src/media/icon.svg"), undefined);
   assert.equal(mapSourceToTestPath("src/commands/README.md"), undefined);
+});
+
+// ---------------------------------------------------------------------------
+// Machine-maintained artifact classification (2026-08-06 dogfooding fix: an
+// implementation run that regenerates the workflow-safety inventories writes
+// them all into implReviewFiles verbatim, and embedding their 8K head-slices
+// bloated the review prompt past the chat-transaction store's 262,144-byte
+// canonical input snapshot cap — every review then died pre-provider as
+// chatTransaction.chatTransactionRejected).
+// ---------------------------------------------------------------------------
+
+void test("classifies generated workflow inventories as machine-maintained", () => {
+  assert.equal(
+    isMachineMaintainedArtifactPathV1("workflow-inventories/workflow-route-baseline-v1.json"),
+    true
+  );
+  assert.equal(
+    isMachineMaintainedArtifactPathV1("workflow-inventories\\workflow-production-source-annotations-v1.json"),
+    true,
+    "backslash-separated tracked paths must classify identically"
+  );
+});
+
+void test("classifies lockfiles and minified bundles as machine-maintained anywhere in the tree", () => {
+  assert.equal(isMachineMaintainedArtifactPathV1("pnpm-lock.yaml"), true);
+  assert.equal(isMachineMaintainedArtifactPathV1("nested/dir/package-lock.json"), true);
+  assert.equal(isMachineMaintainedArtifactPathV1("dist/bundle.min.js"), true);
+  assert.equal(isMachineMaintainedArtifactPathV1("dist/extension.js.map"), true);
+});
+
+void test("does not classify ordinary source, config, or manifest files as machine-maintained", () => {
+  assert.equal(isMachineMaintainedArtifactPathV1("src/commands/reviewActions.ts"), false);
+  assert.equal(isMachineMaintainedArtifactPathV1("package.json"), false);
+  assert.equal(
+    isMachineMaintainedArtifactPathV1("src/workflow-inventories-helper.ts"),
+    false,
+    "only the workflow-inventories DIRECTORY is excluded, not names containing the words"
+  );
+  assert.equal(isMachineMaintainedArtifactPathV1("docs/locks.md"), false);
+});
+
+void test("total embed cap stays anchored under the chat-transaction input snapshot limit", () => {
+  // The binding constraint on the automated review prompt is
+  // MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1 (262,144 bytes), not model context:
+  // template+rubric+plan+implementation+previous review+non-content pack
+  // sections measured ≈ 115K on the real task that hit this, plus ~4.5%
+  // JSON-escape overhead. This guard fails if someone raises the cap back
+  // above what that composition can absorb — see the constant's doc comment
+  // before touching either side of the inequality.
+  const WORST_OBSERVED_NON_CONTENT_BYTES = 115_000;
+  const ESCAPE_OVERHEAD = 1.045;
+  assert.ok(
+    (IMPL_REVIEW_MAX_TOTAL_CHARS + WORST_OBSERVED_NON_CONTENT_BYTES) * ESCAPE_OVERHEAD <
+      MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1,
+    `IMPL_REVIEW_MAX_TOTAL_CHARS=${IMPL_REVIEW_MAX_TOTAL_CHARS} no longer fits inside the ` +
+      `${MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1}-byte transaction cap with the observed fixed overhead`
+  );
 });

@@ -22,6 +22,7 @@ import { withAttribution, writeTextFile } from "../utils/fileUtils";
 import { ImplementationRunResult } from "./copilotImplementationRunner";
 import { cliDisplayLabel, CliProviderDefinition, CliRunMode } from "./providers";
 import { classifyCliFailure, isAuthenticationFailure, isTransportError } from "../utils/quota";
+import { getResilienceSettings } from "../config/settings";
 import { writeRunLog } from "../utils/runLog";
 import { taskOperations } from "../utils/taskOperations";
 import {
@@ -2448,7 +2449,8 @@ function toCliImplementationRunResult(
   result: CliExecResult,
   filesChanged: string[],
   filesChangedUnknown: boolean,
-  requireFileChange = true
+  requireFileChange = true,
+  noChangeCompletionIsSuccess = false
 ): ImplementationRunResult {
   if (result.status === "cancelled") {
     return { status: "cancelled", filesChanged, filesChangedUnknown };
@@ -2465,6 +2467,19 @@ function toCliImplementationRunResult(
       // may contain the login hint that Ensemble itself appended.
       authFailure: result.authFailure,
       authDiagnosticText: result.authDiagnosticText,
+    };
+  }
+  if (noChangeCompletionIsSuccess && !filesChangedUnknown && filesChanged.length === 0) {
+    // ensemble.resilience.nothingToFixRoutesToReview: a completed run that
+    // changed nothing is a legitimate outcome — an implementer that
+    // inspected the tree, found the plan already satisfied, and declined to
+    // fabricate work. The caller (executeImplementationRun) decides whether
+    // prior rounds actually changed the tree before routing this onward.
+    return {
+      status: "completed",
+      filesChanged,
+      filesChangedUnknown,
+      summary: result.output || undefined,
     };
   }
   if (requireFileChange && !filesChangedUnknown && filesChanged.length === 0) {
@@ -2660,6 +2675,11 @@ export async function runImplementationWithCli(options: {
     result,
     filesChanged,
     filesChangedUnknown,
-    requireFileChange
+    requireFileChange,
+    // Read per-run, not cached: mid-task settings changes take effect on the
+    // next round. Only softens the zero-change failure for callers that
+    // REQUIRE file changes (Run Implementation); requireFileChange:false
+    // callers already treat no-change completions as success.
+    getResilienceSettings().nothingToFixRoutesToReview
   );
 }
