@@ -2936,9 +2936,15 @@ export async function fastForwardReviewWithAI(
           ? updateTaskStatus(current, "paused")
           : current
       );
-    } catch {
+    } catch (error) {
       // Best-effort: the escalation record itself is already persisted, and
-      // failing to re-pause must not mask the run's own outcome/error.
+      // failing to re-pause must not mask the run's own outcome/error. Still
+      // surface it — silently swallowing this would leave the task active
+      // with an escalation record and no pause, with no trace of why.
+      const message = error instanceof Error ? error.message : String(error);
+      NotificationRouter.showWarning(
+        `Escalation for ${STAGE_DISPLAY_NAMES[targetStage] ?? "review"} could not re-pause the task: ${message}`
+      );
     }
   };
 
