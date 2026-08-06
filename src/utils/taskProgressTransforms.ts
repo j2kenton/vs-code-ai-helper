@@ -20,6 +20,7 @@ import {
   TaskStage,
   TaskStatus,
 } from "../types/taskProgress";
+import { isMachineMaintainedArtifactPathV1 } from "./implReviewFileSelection";
 
 /**
  * Update the task progress stage
@@ -122,7 +123,17 @@ export function updateImplReviewFiles(
   files: string[]
 ): TaskProgress {
   const existing = progress.implReviewFiles ?? [];
-  const union = new Set([...files, ...existing]);
+  // Excludes generated workflow-safety inventories, lockfiles, and minified
+  // bundles from ever entering review scope — the same classifier
+  // contextPack.ts uses to keep their CONTENTS out of the review prompt (see
+  // its own header). `files` here is typically a raw before/after git diff
+  // (e.g. ImplementationRunResult.filesChanged), which has no way to know
+  // these paths are machine-written side effects of a source edit rather
+  // than reviewable work — filtering at the single place every caller
+  // updates this field is what stops a future call site from reintroducing
+  // the 2026-08-06 failure this exists to prevent.
+  const reviewable = files.filter((file) => !isMachineMaintainedArtifactPathV1(file));
+  const union = new Set([...reviewable, ...existing]);
   return {
     ...progress,
     implReviewFiles: [...union],

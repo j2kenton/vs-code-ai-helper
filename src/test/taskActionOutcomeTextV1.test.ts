@@ -82,6 +82,25 @@ void describe("describeTaskActionOutcomeForLogV1", () => {
       /code=providerExploded, retryable=true/
     );
   });
+
+  void it("appends detail when the coordinator supplied one, for OUR OWN parser/schema diagnostics only", () => {
+    const withDetail: TaskActionOutcomeV1 = {
+      kind: "malformedResult",
+      correlation: CORRELATION,
+      code: "invalidFrame",
+      detail: "expected the frame to start with <<<ENSEMBLE_AI_RESULT_V1>>>",
+    };
+    assert.equal(
+      describeTaskActionOutcomeForLogV1(withDetail),
+      "Status: malformed result (invalidFrame: expected the frame to start with <<<ENSEMBLE_AI_RESULT_V1>>>)"
+    );
+    // No detail (the majority of malformedResult outcomes, and every one
+    // built before this field existed) must render exactly as before.
+    assert.equal(
+      describeTaskActionOutcomeForLogV1(ALL_OUTCOMES[4]!),
+      "Status: malformed result (invalidFrame)"
+    );
+  });
 });
 
 void describe("describeTaskActionFailureV1", () => {
@@ -102,6 +121,19 @@ void describe("describeTaskActionFailureV1", () => {
     assert.strictEqual(
       describeTaskActionFailureV1(ALL_OUTCOMES[4]!),
       "the model's response was malformed (invalidFrame)"
+    );
+  });
+
+  void it("includes the coordinator's own diagnostic detail when present", () => {
+    const withDetail: TaskActionOutcomeV1 = {
+      kind: "malformedResult",
+      correlation: CORRELATION,
+      code: "contentSchemaMismatch",
+      detail: 'received content type "chat-message.v1", expected "markdown-artifact.v1"',
+    };
+    assert.strictEqual(
+      describeTaskActionFailureV1(withDetail),
+      "the model's response was malformed (contentSchemaMismatch: received content type \"chat-message.v1\", expected \"markdown-artifact.v1\")"
     );
   });
 });

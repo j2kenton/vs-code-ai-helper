@@ -418,7 +418,11 @@ void describe("draftRowV1", () => {
       const outcome = await coordinator.executeAction(baseRequest(env, input));
       assert.equal(outcome.kind, "failed");
       if (outcome.kind === "failed") {
-        assert.equal(outcome.code, "promotionFailed");
+        // promotionFailureCodeV1 now appends the row's own write-failure
+        // detail (bounded/flattened) instead of the bare code — see that
+        // function's own doc comment for the live diagnosability gap this
+        // closes.
+        assert.match(outcome.code, /^promotionFailed: task\.md changed since this drive's baseline revision was captured/);
       }
       assert.equal(env.readTaskFile(), before);
     });

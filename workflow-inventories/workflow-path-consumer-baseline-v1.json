@@ -210,47 +210,47 @@
       "callSites": [
         {
           "signal": "import:child_process",
-          "span": "L78-L78",
-          "enclosingSymbol": "(module)"
-        },
-        {
-          "signal": "import:fs",
           "span": "L79-L79",
           "enclosingSymbol": "(module)"
         },
         {
+          "signal": "import:fs",
+          "span": "L80-L80",
+          "enclosingSymbol": "(module)"
+        },
+        {
           "signal": "workspace.fs",
-          "span": "L699-L699",
+          "span": "L700-L700",
           "enclosingSymbol": "entries"
         },
         {
           "signal": "workspace.fs",
-          "span": "L712-L712",
+          "span": "L713-L713",
           "enclosingSymbol": "legacyEntries"
         },
         {
           "signal": "workspace.fs",
-          "span": "L1529-L1529",
+          "span": "L1530-L1530",
           "enclosingSymbol": "contentBytes"
         },
         {
           "signal": "workspace.fs",
-          "span": "L2019-L2019",
+          "span": "L2020-L2020",
           "enclosingSymbol": "runReviewForFolder"
         },
         {
           "signal": "workspace.fs",
-          "span": "L2036-L2036",
+          "span": "L2037-L2037",
           "enclosingSymbol": "runReviewForFolder"
         },
         {
           "signal": "workspace.fs",
-          "span": "L2424-L2424",
+          "span": "L2425-L2425",
           "enclosingSymbol": "runApply"
         },
         {
           "signal": "workspace.fs",
-          "span": "L5662-L5662",
+          "span": "L5685-L5685",
           "enclosingSymbol": "buildReviewResumeVariablesV1"
         }
       ],

@@ -372,7 +372,11 @@ void describe("generatePlanRowV1", () => {
       const outcome = await coordinator.executeAction(baseRequest(env, input));
       assert.equal(outcome.kind, "failed");
       if (outcome.kind === "failed") {
-        assert.equal(outcome.code, "promotionFailed");
+        // promotionFailureCodeV1 now appends the row's own write-failure
+        // detail (bounded/flattened) instead of the bare code — see that
+        // function's own doc comment for the live diagnosability gap this
+        // closes.
+        assert.match(outcome.code, /^promotionFailed: could not write plan\.md: .*revisionMismatch/);
       }
       assert.equal(env.readPlanFile(), "# Plan\n\nEdited concurrently.\n");
     });

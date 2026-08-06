@@ -133,12 +133,14 @@ import {
   allocateHex128IdV1,
   isHex128IdV1,
   OperationIdV1,
+  ReservationIdV1,
   TaskBindingRefV1,
 } from "../types/actionCorrelationV1";
 import {
   AgentExecutionModeV1,
   AgentExecutionRequestV1,
   AgentTransportV1,
+  ResultSpoolRefV1,
   SealedResultPayloadV1,
 } from "../types/agentExecutionV1";
 import { RequestLocalToolHandlerV1 } from "../services/requestLocalToolHandlerV1";
@@ -525,6 +527,25 @@ function isCanonicalTaskStageV0(value: string): value is TaskStage {
 }
 
 /**
+ * Flattens whitespace/newlines and caps length so a diagnostic string stays
+ * one readable line regardless of what its source produced. Returns
+ * undefined for an empty/whitespace-only input, so callers can distinguish
+ * "no detail available" from "detail is an empty string".
+ *
+ * Shared by every settled-outcome site that surfaces OUR OWN generated
+ * diagnostic text (parser reasons, validation mismatches, promotion error
+ * messages) — never provider/model output, which plan §2.2/§3.7's
+ * sanitized-outcome contract forbids regardless of length.
+ */
+function boundedDiagnosticDetailV1(text: string, maxChars = 200): string | undefined {
+  const flattened = text.replace(/\s+/g, " ").trim();
+  if (flattened.length === 0) {
+    return undefined;
+  }
+  return flattened.length > maxChars ? `${flattened.slice(0, maxChars - 1)}…` : flattened;
+}
+
+/**
  * Build the `failed.code` for a rejected chat transaction, preserving the
  * store's own explanation instead of discarding it.
  *
@@ -548,16 +569,32 @@ function isCanonicalTaskStageV0(value: string): value is TaskStage {
  */
 /** @internal exported for testing */
 export function chatTransactionFailureCodeV1(code: string, reason: string): string {
-  const flattened = reason.replace(/\s+/g, " ").trim();
-  if (flattened.length === 0) {
-    return `chatTransaction.${code}`;
-  }
-  const MAX_REASON_CHARS = 200;
-  const bounded =
-    flattened.length > MAX_REASON_CHARS
-      ? `${flattened.slice(0, MAX_REASON_CHARS - 1)}…`
-      : flattened;
-  return `chatTransaction.${code}: ${bounded}`;
+  const bounded = boundedDiagnosticDetailV1(reason);
+  return bounded ? `chatTransaction.${code}: ${bounded}` : `chatTransaction.${code}`;
+}
+
+/**
+ * Build the `failed.code` for a promotion failure, preserving the row's own
+ * validation/write error instead of discarding it.
+ *
+ * Every row's `promoteCompletedContent` (actions/rows/*.ts) throws a plain
+ * Error whose message describes its OWN validation or storage-write failure
+ * — a missing required line, a content-type mismatch, a compare-and-set
+ * conflict — never provider/model text, since the row only validates its own
+ * already-schema-checked envelope and its own storage layer's result
+ * (confirmed across all ten current `promoteCompletedContent`
+ * implementations). The catch block this feeds used to discard the error
+ * entirely — not even into a variable — so a promotion failure surfaced only
+ * the bare code "promotionFailed", indistinguishable whether the cause was a
+ * CAS conflict, a validation failure, or a storage error. That cost real
+ * diagnosis time on a live failure: a complete, correct review lost a
+ * compare-and-set race against a concurrent artifact write, and nothing in
+ * the outcome said so.
+ */
+/** @internal exported for testing */
+export function promotionFailureCodeV1(message: string): string {
+  const detail = boundedDiagnosticDetailV1(message);
+  return detail ? `promotionFailed: ${detail}` : "promotionFailed";
 }
 
 function eligibilityFailure(
@@ -617,6 +654,49 @@ async function unsealPayload(
     // Expiry sweeps collect the remainder within 24 hours.
   }
   return { ok: true, text: claim.utf8Text };
+}
+
+/**
+ * Best-effort recovery copy of a response that is ABOUT to be discarded as
+ * `malformedResult` — preserved for the same 24h window a normal spool would
+ * live (plan §3.2's existing `RESULT_SPOOL_EXPIRY_MS_V1`), reusing the
+ * broker's own spool store rather than a new storage mechanism.
+ *
+ * Live motivation (2026-08-06): a response settling as `malformedResult` had
+ * already, by construction, been correctly received and unsealed — the
+ * fixed contract in front of it (frame markers, JSON shape) was the only
+ * thing wrong, not the underlying work. Real incidents cost hours of
+ * diagnosis and one lucky, provider-specific recovery (kimi-code happens to
+ * keep its own session transcripts; a provider that doesn't would have lost
+ * the response outright) precisely because nothing in Ensemble's own control
+ * kept a copy once `unsealPayload` returned. This writes exactly the text
+ * that was about to be handed to the parser to a spool keyed by the SAME
+ * correlation/reservation tuple `unsealPayload` already used — by the time
+ * this runs, that tuple's original spool (if the payload was spooled rather
+ * than inline) has already been removed, so a fresh write for the same key
+ * cannot collide with it.
+ *
+ * Failure to preserve — no spool store configured, a write error, anything —
+ * must never affect the settled outcome; this is best-effort diagnostics,
+ * not a correctness requirement. Returns the ref on success so the caller
+ * can name it (ids only, never content — plan §2.2) in the outcome's
+ * `detail`.
+ */
+async function preserveRejectedResultForRecoveryV1(
+  text: string,
+  correlation: ActionCorrelationV1,
+  reservationId: ReservationIdV1,
+  brokerOptions: AgentExecutionBrokerOptionsV1 | undefined
+): Promise<ResultSpoolRefV1 | undefined> {
+  const store = brokerOptions?.spoolStore;
+  if (!store) {
+    return undefined;
+  }
+  try {
+    return await store.writeSpool(correlation, reservationId, Buffer.from(text, "utf8"));
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -981,7 +1061,34 @@ export function createTaskActionCoordinatorV1(
           attemptId,
           parsed.code === "resultCorrelationMismatch" ? "resultCorrelationMismatch" : "malformedResult"
         );
-        return { kind: "malformedResult", correlation, code: parsed.code };
+        // parsed.reason is our own parser's structural diagnostic (e.g.
+        // "expected the frame to start with <<<...>>>") — never parsed.raw,
+        // which can carry the model's full free-text reply and must never
+        // reach a settled outcome (§2.2). See detail's own doc comment for
+        // the live failure this makes diagnosable.
+        const reasonDetail = boundedDiagnosticDetailV1(parsed.reason);
+        // The received text was correctly unsealed — only the output-format
+        // contract in front of it is what failed — so it is preserved
+        // (best-effort, 24h) before being discarded. See that function's own
+        // doc comment for the live incident this closes.
+        const recoveryRef = await preserveRejectedResultForRecoveryV1(
+          unsealed.text,
+          correlation,
+          reserved.handle.reservationId,
+          deps.brokerOptions
+        );
+        const detailParts = [
+          reasonDetail,
+          recoveryRef
+            ? `response preserved for recovery (operationId=${correlation.operationId}, ~24h)`
+            : undefined,
+        ].filter((part): part is string => part !== undefined);
+        return {
+          kind: "malformedResult",
+          correlation,
+          code: parsed.code,
+          ...(detailParts.length > 0 ? { detail: detailParts.join("; ") } : {}),
+        };
       }
 
       return settleEnvelope(row, parsed, session, attemptId, context, acquireLeasePhase, promptSha256);
@@ -1000,13 +1107,23 @@ export function createTaskActionCoordinatorV1(
     const correlation = context.correlation;
     if (!row.permittedResultKinds.includes(envelope.kind)) {
       session.reportAttemptOutcome(attemptId, "malformedResult");
-      return { kind: "malformedResult", correlation, code: "contentSchemaMismatch" };
+      return {
+        kind: "malformedResult",
+        correlation,
+        code: "contentSchemaMismatch",
+        detail: `received result kind "${envelope.kind}", but ${row.actionKey} only permits: ${row.permittedResultKinds.join(", ")}`,
+      };
     }
     switch (envelope.kind) {
       case "completed": {
         if (envelope.content.contentType !== row.completedContentType) {
           session.reportAttemptOutcome(attemptId, "malformedResult");
-          return { kind: "malformedResult", correlation, code: "contentSchemaMismatch" };
+          return {
+            kind: "malformedResult",
+            correlation,
+            code: "contentSchemaMismatch",
+            detail: `received content type "${envelope.content.contentType}", expected "${row.completedContentType}"`,
+          };
         }
         session.reportAttemptOutcome(attemptId, "completed");
         // SETTLEMENT lease phase: the lease was released before the provider
@@ -1023,8 +1140,13 @@ export function createTaskActionCoordinatorV1(
         try {
           const code = await row.promoteCompletedContent(envelope.content, context);
           return { kind: "completed", correlation, code };
-        } catch {
-          return { kind: "failed", correlation, code: "promotionFailed", retryable: false };
+        } catch (error) {
+          return {
+            kind: "failed",
+            correlation,
+            code: promotionFailureCodeV1(error instanceof Error ? error.message : String(error)),
+            retryable: false,
+          };
         } finally {
           settlement.release();
         }

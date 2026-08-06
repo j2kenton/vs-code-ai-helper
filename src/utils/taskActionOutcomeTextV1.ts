@@ -14,7 +14,17 @@
  * Both functions are exhaustive over the outcome union and carry NO provider
  * text: plan §3.7's outcome contract is a closed set of stable codes, and
  * §2.2 forbids raw provider output in logs — so these only ever emit kinds,
- * codes, and ids that the contract itself defines.
+ * codes, and ids that the contract itself defines. `malformedResult.detail`
+ * (2026-08-06) is the one field that adds free text, and it does not weaken
+ * this: the coordinator populates it only from OUR OWN parser/schema
+ * diagnostics (e.g. "expected the frame to start with <<<...>>>", "received
+ * content type X, expected Y") — never provider/model output — bounded and
+ * flattened to a single line. Before this, a malformed result surfaced only
+ * its closed-union code (e.g. "invalidFrame") with no way to say WHY, which
+ * cost real diagnosis time on a live failure whose actual cause — a complete,
+ * correct model response missing only the required output frame — was
+ * invisible until the raw response was recovered by hand from the CLI
+ * provider's own session store.
  */
 import { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
 
@@ -42,7 +52,7 @@ export function describeTaskActionOutcomeForLogV1(
     case "failed":
       return `Status: failed (code=${outcome.code}, retryable=${outcome.retryable})`;
     case "malformedResult":
-      return `Status: malformed result (${outcome.code})`;
+      return `Status: malformed result (${outcome.code}${outcome.detail ? `: ${outcome.detail}` : ""})`;
     case "unavailable":
       return `Status: unavailable (${outcome.code})`;
     case "recoveryRequired":
@@ -64,7 +74,7 @@ export function describeTaskActionFailureV1(outcome: TaskActionOutcomeV1): strin
     case "failed":
       return `${outcome.code}${outcome.retryable ? " (retryable)" : ""}`;
     case "malformedResult":
-      return `the model's response was malformed (${outcome.code})`;
+      return `the model's response was malformed (${outcome.code}${outcome.detail ? `: ${outcome.detail}` : ""})`;
     case "unavailable":
       return outcome.code;
     case "recoveryRequired":

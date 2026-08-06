@@ -65,12 +65,15 @@ import { createWorkflowFileStoreV1 } from "../services/workflowFileStoreV1";
 import { createWorkflowPathRegistryV1 } from "../services/workflowPathRegistryV1";
 import {
   chatTransactionFailureCodeV1,
+  promotionFailureCodeV1,
   createTaskActionCoordinatorV1,
   RunnerSelectionOpenerV1,
   TaskActionCoordinatorV1,
   TaskActionFollowUpRequestV1,
   TaskActionSettlementRecordV1,
 } from "../actions/taskActionCoordinatorV1";
+import { createBoundedResultStoreV1 } from "../services/boundedResultStoreV1";
+import { AgentExecutionBrokerOptionsV1 } from "../services/agentExecutionBrokerV1";
 import {
   createTaskActionRegistryV1,
   LifecycleTaskActionRowV1,
@@ -227,7 +230,8 @@ interface Harness {
 function makeHarness(
   transports: readonly AgentTransportV1[],
   rowOverrides: Partial<ProviderTaskActionRowV1> = {},
-  extraRows: readonly TaskActionRegistryRowV1[] = []
+  extraRows: readonly TaskActionRegistryRowV1[] = [],
+  brokerOptions?: AgentExecutionBrokerOptionsV1
 ): Harness {
   const promoted: CompletedContentV1[] = [];
   const row: ProviderTaskActionRowV1 = {
@@ -284,6 +288,7 @@ function makeHarness(
         settlementRecords.push(record);
       },
     },
+    ...(brokerOptions !== undefined ? { brokerOptions } : {}),
   });
   return { coordinator, leaseStore, promoted, orchestrator, selection, followUps, leaseHeldAtFollowUp, presentations, presentationEnded, settlementRecords, leaseHeldAtSettlement };
 }
@@ -461,6 +466,11 @@ void describe("taskActionCoordinatorV1", () => {
       assert.fail("expected malformedResult");
     }
     assert.equal(bareOutcome.code, "invalidFrame");
+    // 2026-08-06 live dogfooding fix: a complete, correct response missing
+    // only the required frame used to surface as the bare code
+    // "invalidFrame" with no way to tell that apart from any other frame
+    // defect. detail now carries the parser's own structural reason.
+    assert.match(bareOutcome.detail ?? "", /expected the frame to start with/);
 
     const wrongType = makeHarness([
       envelopeTransport((correlation) =>
@@ -478,6 +488,7 @@ void describe("taskActionCoordinatorV1", () => {
       assert.fail("expected malformedResult");
     }
     assert.equal(wrongTypeOutcome.code, "contentSchemaMismatch");
+    assert.match(wrongTypeOutcome.detail ?? "", /received content type "chat-message\.v1"/);
     assert.equal(wrongType.promoted.length, 0);
 
     const unpermitted = makeHarness(
@@ -508,6 +519,94 @@ void describe("taskActionCoordinatorV1", () => {
       assert.fail("expected malformedResult");
     }
     assert.equal(unpermittedOutcome.code, "contentSchemaMismatch");
+    assert.match(unpermittedOutcome.detail ?? "", /received result kind "questions"/);
+  });
+
+  /**
+   * Live incident, 2026-08-06: a review settled `malformedResult
+   * (invalidFrame)` after the model did the work correctly and only omitted
+   * the required output frame. Nothing in the coordinator kept a copy of
+   * what it actually said — the only reason it was recoverable at all was
+   * that the CLI provider happened to keep its own private session
+   * transcript, which is provider-specific luck, not something Ensemble
+   * controls. This proves the coordinator now keeps its own recovery copy
+   * whenever a spool store is configured, independent of any provider's own
+   * transcript behavior.
+   */
+  void it("preserves a malformed result's raw text for recovery when a spool store is configured", async () => {
+    const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-recovery-spool-"));
+    const spoolStore = createBoundedResultStoreV1({ rootDir });
+    const harness = makeHarness(
+      [
+        {
+          runnerId: "scripted-transport",
+          invoke: (_request, output): Promise<{ kind: "completed" }> => {
+            output.write("just some prose, no frame — this is the model's real, correct answer");
+            return Promise.resolve({ kind: "completed" as const });
+          },
+        },
+      ],
+      {},
+      [],
+      { spoolStore }
+    );
+    try {
+      const outcome = await harness.coordinator.executeAction(baseRequest());
+      assert.equal(outcome.kind, "malformedResult");
+      if (outcome.kind !== "malformedResult") {
+        assert.fail("expected malformedResult");
+      }
+      assert.match(outcome.detail ?? "", /response preserved for recovery/);
+      assert.match(
+        outcome.detail ?? "",
+        new RegExp(`operationId=${outcome.correlation.operationId}`)
+      );
+
+      // Read the recovery copy back directly from disk — the same layout
+      // boundedResultStoreV1.ts documents (<root>/<op>/<attempt>/<reservation>/
+      // result-v1.bin) — proving the ACTUAL text was preserved, not just that
+      // the outcome claims it was.
+      const spoolFiles: string[] = [];
+      const walk = (dir: string): void => {
+        for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+          const full = path.join(dir, entry.name);
+          if (entry.isDirectory()) {
+            walk(full);
+          } else if (entry.name === "result-v1.bin") {
+            spoolFiles.push(full);
+          }
+        }
+      };
+      walk(rootDir);
+      assert.equal(spoolFiles.length, 1, "exactly one recovery spool must be written");
+      assert.equal(
+        fs.readFileSync(spoolFiles[0]!, "utf8"),
+        "just some prose, no frame — this is the model's real, correct answer"
+      );
+    } finally {
+      fs.rmSync(rootDir, { recursive: true, force: true });
+    }
+  });
+
+  void it("never blocks settlement when no spool store is configured — recovery is best-effort", async () => {
+    // The default harness (used by every other test in this suite) passes no
+    // brokerOptions at all; this pins that the malformedResult path still
+    // settles cleanly with no detail crash and no thrown error.
+    const harness = makeHarness([
+      {
+        runnerId: "scripted-transport",
+        invoke: (_request, output): Promise<{ kind: "completed" }> => {
+          output.write("no frame here either");
+          return Promise.resolve({ kind: "completed" as const });
+        },
+      },
+    ]);
+    const outcome = await harness.coordinator.executeAction(baseRequest());
+    assert.equal(outcome.kind, "malformedResult");
+    if (outcome.kind !== "malformedResult") {
+      assert.fail("expected malformedResult");
+    }
+    assert.doesNotMatch(outcome.detail ?? "", /response preserved for recovery/);
   });
 
   void it("falls back after a pre-response transport failure with a fresh attempt", async () => {
@@ -2054,5 +2153,41 @@ void describe("taskActionCoordinatorV1 — chat transaction failure codes", () =
     // The reason is capped at 200 chars regardless of what the store produced.
     assert.equal(code.length - prefix.length, 200);
     assert.ok(code.endsWith("…"), "a truncated reason must be visibly elided");
+  });
+});
+
+/**
+ * A promotion failure's catch block used to discard the thrown error
+ * entirely — not even into a variable — so every promotion failure surfaced
+ * only the bare code "promotionFailed", indistinguishable whether the cause
+ * was a compare-and-set conflict, a validation failure, or a storage error.
+ * Live evidence 2026-08-06: a complete, correct review lost a CAS race
+ * against a concurrent artifact write and the outcome said nothing about it.
+ */
+void describe("taskActionCoordinatorV1 — promotion failure codes", () => {
+  void it("preserves the row's own write-failure message", () => {
+    assert.equal(
+      promotionFailureCodeV1("could not write plan.md: failed.revisionMismatch"),
+      "promotionFailed: could not write plan.md: failed.revisionMismatch"
+    );
+  });
+
+  void it("falls back to the bare code when the error has no message", () => {
+    assert.equal(promotionFailureCodeV1("   "), "promotionFailed");
+  });
+
+  void it("flattens newlines so the code stays a single readable line", () => {
+    assert.equal(
+      promotionFailureCodeV1("line one\n\tline two   line three"),
+      "promotionFailed: line one line two line three"
+    );
+  });
+
+  void it("bounds an overlong message instead of pasting unbounded text into the code", () => {
+    const code = promotionFailureCodeV1("x".repeat(5000));
+    const prefix = "promotionFailed: ";
+    assert.ok(code.startsWith(prefix));
+    assert.equal(code.length - prefix.length, 200);
+    assert.ok(code.endsWith("…"), "a truncated message must be visibly elided");
   });
 });

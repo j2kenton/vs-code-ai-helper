@@ -84,7 +84,7 @@
     },
     {
       "path": "src/actions/taskActionCoordinatorV1.ts",
-      "sha256": "1a63205d452b5071ac9990fb117ef3a7172238c32b16c2766ad95bacfdfd4a63"
+      "sha256": "e174e84a1e8841adf088d5251d4994f4965eab62f1c13e0a3292b5710842a21a"
     },
     {
       "path": "src/actions/taskActionRegistryV1.ts",
@@ -164,7 +164,7 @@
     },
     {
       "path": "src/commands/reviewActions.ts",
-      "sha256": "41e90a93cf586755b5835566321009863491a8d50f5757c82073b3864c8fcbba"
+      "sha256": "eb4357b9b2e42088d30a0db02f3afd80a3f3768326ba25935e40d72c312578ff"
     },
     {
       "path": "src/commands/reviewCurrentTask.ts",
@@ -432,7 +432,7 @@
     },
     {
       "path": "src/types/taskActionOutcomeV1.ts",
-      "sha256": "ab40207ad0ab39384804c58f28a5b47991254289cf26bc32ea21d711cb4d00ba"
+      "sha256": "f423f39fdfe223b0b2003b9305086524b7bea538dcd8b73f136747856b1e26a4"
     },
     {
       "path": "src/types/taskAdoptionIntentV1.ts",
@@ -640,7 +640,7 @@
     },
     {
       "path": "src/utils/taskActionOutcomeTextV1.ts",
-      "sha256": "311991b0a9162136fbc2f8ec1197cec3a00aee6031ec8ce843197b129e7b2689"
+      "sha256": "8a60a7fde1e5d911002aecdf59631171ddf5d64d273a9e7c755cd94ec3f0b44c"
     },
     {
       "path": "src/utils/taskDescriptionDocument.ts",
@@ -652,7 +652,7 @@
     },
     {
       "path": "src/utils/taskProgressTransforms.ts",
-      "sha256": "48c5031207b39cc37f06cc1c1834afbf14f3e3045eb3314994546ecfe3bf2085"
+      "sha256": "fe4ecd92f7054c0b2aacb50267660f364d14653a816cc09f73634e7425eb95c1"
     },
     {
       "path": "src/utils/taskRoot.ts",

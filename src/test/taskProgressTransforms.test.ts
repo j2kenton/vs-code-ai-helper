@@ -61,6 +61,54 @@ void test(
 );
 
 // ---------------------------------------------------------------------------
+// updateImplReviewFiles: machine-maintained artifacts are never tracked
+// (2026-08-06 live dogfooding fix — see isMachineMaintainedArtifactPathV1's
+// own header for the recurring failure this closes: an implementation round
+// that regenerates this repo's own generated workflow-safety inventories had
+// those paths recorded as review scope, inflating or replacing the next
+// review's actual reviewable content with machine-written JSON fragments).
+// ---------------------------------------------------------------------------
+
+void test("generated workflow inventories are excluded from a fresh set", () => {
+  const progress = makeProgress(undefined);
+  const updated = updateImplReviewFiles(progress, [
+    "src/a.ts",
+    "workflow-inventories/workflow-route-baseline-v1.json",
+  ]);
+  assert.deepEqual(updated.implReviewFiles, ["src/a.ts"]);
+});
+
+void test("lockfiles and minified bundles are excluded alongside real source changes", () => {
+  const progress = makeProgress(undefined);
+  const updated = updateImplReviewFiles(progress, [
+    "src/a.ts",
+    "pnpm-lock.yaml",
+    "dist/extension.js.map",
+  ]);
+  assert.deepEqual(updated.implReviewFiles, ["src/a.ts"]);
+});
+
+void test("a round touching ONLY machine-maintained artifacts still preserves the prior tracked set", () => {
+  // Same "don't erase on an empty-after-filtering diff" contract as an
+  // empty raw diff — a round whose only changes are generated inventories
+  // did not touch reviewable work, so the previous round's scope must survive.
+  const progress = makeProgress(["a.ts", "b.ts"]);
+  const updated = updateImplReviewFiles(progress, ["workflow-inventories/workflow-route-live-v1.json"]);
+  assert.deepEqual(updated.implReviewFiles, ["a.ts", "b.ts"]);
+});
+
+void test("machine-maintained paths already in the prior tracked set are not retroactively purged", () => {
+  // The filter only screens NEW files this round is trying to add — it is
+  // not a general-purpose sanitizer of the whole persisted list. (A prior
+  // round predating this fix could still have one on disk; that is a
+  // one-time cleanup concern, not something every future update should
+  // re-litigate.)
+  const progress = makeProgress(["workflow-inventories/workflow-route-live-v1.json"]);
+  const updated = updateImplReviewFiles(progress, ["a.ts"]);
+  assert.deepEqual(updated.implReviewFiles, ["a.ts", "workflow-inventories/workflow-route-live-v1.json"]);
+});
+
+// ---------------------------------------------------------------------------
 // clearImplReviewFiles: the only intended way to discard the tracked set
 // ---------------------------------------------------------------------------
 

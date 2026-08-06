@@ -47,6 +47,7 @@ import {
   writeTextFile,
 } from "../utils/fileUtils";
 import { generateContextPack, writeContextPack, writeImplReviewContextPack } from "../utils/contextPack";
+import { isMachineMaintainedArtifactPathV1 } from "../utils/implReviewFileSelection";
 import { renderPromptTemplate } from "../utils/promptTemplates";
 import { writeRunLog } from "../utils/runLog";
 import {
@@ -4589,8 +4590,30 @@ async function executeImplementationRun(
       // ensemble.resilience.nothingToFixRoutesToReview) likewise preserves
       // the prior round's list — the review scope must still cover the work
       // those earlier rounds actually landed.
+      //
+      // Live dogfooding failure (2026-08-06): this used to persist
+      // result.filesChanged verbatim, so an implementation round that
+      // regenerated this repo's own generated workflow-safety inventories —
+      // a routine side effect of any source edit here, not the model doing
+      // extra work — wrote those generated JSON paths into implReviewFiles.
+      // The NEXT round's review then had its context pack built almost
+      // entirely from an 8K-truncated fragment of a machine-written file
+      // (once inflating the prompt past the chat-transaction size cap; once
+      // leaving the review with nothing reviewable at all, pointed only at
+      // "workflow-production-source-live-v1.json"). isMachineMaintainedArtifactPathV1
+      // is the same generated-inventories/lockfiles/minified-bundle
+      // classifier contextPack.ts already uses to exclude these paths'
+      // CONTENTS from the pack; filtering them here stops them from ever
+      // being recorded as review scope in the first place. If every changed
+      // file was machine-maintained, treat it exactly like a zero-change
+      // round — keep the prior list rather than persisting an empty one.
       if (!result!.filesChangedUnknown && result!.filesChanged.length > 0) {
-        return { ...stageUpdated, implReviewFiles: result!.filesChanged };
+        const reviewableFiles = result!.filesChanged.filter(
+          (file) => !isMachineMaintainedArtifactPathV1(file)
+        );
+        if (reviewableFiles.length > 0) {
+          return { ...stageUpdated, implReviewFiles: reviewableFiles };
+        }
       }
       return stageUpdated;
     });
