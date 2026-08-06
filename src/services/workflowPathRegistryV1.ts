@@ -180,6 +180,13 @@ export interface WorkflowPathRegistryV1 {
     documentId: string,
     resetId: string
   ): WorkflowAllocatedPathV1;
+  /**
+   * `workflow-runtime-v1/provider-results` — the transient-provider-data
+   * family parent (plan §3.2), for provisioning a spool store's stable root
+   * and for a recovery command's own enumeration of what a rejected result
+   * left behind (never a per-operation locator itself).
+   */
+  providerResultsFamilyDir(privateRootId: string): WorkflowAllocatedPathV1;
   /** `workflow-runtime-v1/provider-results/<op>/<attempt>/<reservation>` — transient provider data (plan §3.2). */
   providerResultSpoolDir(
     privateRootId: string,
@@ -409,6 +416,15 @@ class WorkflowPathRegistryImplV1 implements WorkflowPathRegistryV1 {
       privateRootId,
       `${WORKFLOW_RUNTIME_DIRNAME_V1}/${CHAT_RECOVERY_DIRNAME_V1}/${documentId}/${resetId}/${CHAT_RECOVERY_SNAPSHOT_FILENAME}`,
       "chatPrivate"
+    );
+  }
+
+  providerResultsFamilyDir(privateRootId: string): WorkflowAllocatedPathV1 {
+    this.requireRootOfKind(privateRootId, "privateStorage");
+    return this.sealed(
+      privateRootId,
+      `${WORKFLOW_RUNTIME_DIRNAME_V1}/${PROVIDER_RESULTS_DIRNAME_V1}`,
+      "transientProviderData"
     );
   }
 

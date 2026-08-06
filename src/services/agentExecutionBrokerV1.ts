@@ -189,6 +189,16 @@ function validateRequest(
   }
 }
 
+function sealInMemory(utf8Text: string, rawBytes: Buffer): RawAgentExecutionResultV1 {
+  const payload: SealedResultPayloadV1 = {
+    storage: "memory",
+    utf8Text,
+    byteLength: rawBytes.length,
+    sha256: createHash("sha256").update(rawBytes).digest("hex"),
+  };
+  return { kind: "response", payload };
+}
+
 async function sealCompletedResponse(
   request: AgentExecutionRequestV1,
   rawBytes: Buffer,
@@ -210,17 +220,17 @@ async function sealCompletedResponse(
       );
       return { kind: "response", payload: { storage: "spool", spoolRef } };
     } catch {
-      // The sealed bytes never reached durable storage; nothing is retained.
-      return { kind: "transportFailure", code: "resultSpoolWriteFailed", responseStarted: true };
+      // Spooling is a size-management optimization, not a correctness
+      // requirement: rawBytes are already held in memory at this point, so a
+      // disk-write failure falls back to sealing them in memory (exactly the
+      // path below, and exactly what every response took before a spool
+      // store was ever wired into production) instead of discarding a
+      // fully-received, paid-for response as a terminal, non-retryable
+      // failure.
+      return sealInMemory(utf8Text, rawBytes);
     }
   }
-  const payload: SealedResultPayloadV1 = {
-    storage: "memory",
-    utf8Text,
-    byteLength: rawBytes.length,
-    sha256: createHash("sha256").update(rawBytes).digest("hex"),
-  };
-  return { kind: "response", payload };
+  return sealInMemory(utf8Text, rawBytes);
 }
 
 /**

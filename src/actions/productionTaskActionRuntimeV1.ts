@@ -55,6 +55,7 @@ import { createV1RunnerSelectionOpener } from "../runners/runnerRegistry";
 import {
   getChatInteractionTransactionStoreV1,
   getEditPlanBrokerV1,
+  getProviderResultSpoolStoreV1,
   getWorkflowFileStoreV1,
   getWorkflowLeaseStoreV1,
 } from "../services/workflowRuntimeServicesV1";
@@ -341,6 +342,14 @@ export function createProductionTaskActionCoordinatorV1(options: {
     followUpScheduler: noopFollowUpSchedulerV1,
     presenter: notificationPresenterV1(),
     auditLogger: consoleAuditLoggerV1,
+    // 2026-08-06 stability fix: without this, a `malformedResult` settlement's
+    // recovery write (preserveRejectedResultForRecoveryV1) was silently a
+    // no-op in production — no spool store was ever configured, so a
+    // rejected response could never actually be recovered. undefined before
+    // the private-storage root is configured (pre-activation) — the broker
+    // and the recovery write both already treat a missing store as
+    // best-effort/optional.
+    brokerOptions: { spoolStore: getProviderResultSpoolStoreV1() },
     // §7.2/§7.6 request-local tool sessions: a fresh read session (with its
     // own observation ledger) per preflight attempt, and the broker's
     // mutation-session handler per edit attempt. Text rows never touch this.

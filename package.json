@@ -128,6 +128,12 @@
         "icon": "$(settings)"
       },
       {
+        "command": "vs-code-ai-helper.recoverLastAiResponse",
+        "title": "Recover Last AI Response [Ctrl+Shift+Alt+C]",
+        "category": "Ensemble",
+        "icon": "$(history)"
+      },
+      {
         "command": "vs-code-ai-helper.archiveTask",
         "title": "Archive Task",
         "category": "Ensemble",
@@ -432,6 +438,11 @@
         "command": "vs-code-ai-helper.nextStage",
         "key": "ctrl+shift+alt+n",
         "mac": "cmd+shift+alt+n"
+      },
+      {
+        "command": "vs-code-ai-helper.recoverLastAiResponse",
+        "key": "ctrl+shift+alt+c",
+        "mac": "cmd+shift+alt+c"
       },
       {
         "command": "workbench.view.extension.ai-helper",

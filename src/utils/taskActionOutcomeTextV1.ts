@@ -11,20 +11,22 @@
  * them here means a newly migrated action gets the diagnosable behavior by
  * default instead of having to remember to re-derive it.
  *
- * Both functions are exhaustive over the outcome union and carry NO provider
- * text: plan §3.7's outcome contract is a closed set of stable codes, and
- * §2.2 forbids raw provider output in logs — so these only ever emit kinds,
- * codes, and ids that the contract itself defines. `malformedResult.detail`
- * (2026-08-06) is the one field that adds free text, and it does not weaken
- * this: the coordinator populates it only from OUR OWN parser/schema
- * diagnostics (e.g. "expected the frame to start with <<<...>>>", "received
- * content type X, expected Y") — never provider/model output — bounded and
- * flattened to a single line. Before this, a malformed result surfaced only
- * its closed-union code (e.g. "invalidFrame") with no way to say WHY, which
- * cost real diagnosis time on a live failure whose actual cause — a complete,
- * correct model response missing only the required output frame — was
- * invisible until the raw response was recovered by hand from the CLI
- * provider's own session store.
+ * Both functions are exhaustive over the outcome union and carry no raw
+ * provider output: plan §3.7's outcome contract is a closed set of stable
+ * codes, and §2.2 forbids the model's free-text reply appearing in logs — so
+ * these only ever emit kinds, codes, and ids that the contract itself
+ * defines. `malformedResult.detail` (2026-08-06) is the one field that adds
+ * free text, and it does not weaken this: the coordinator populates it only
+ * from OUR OWN parser/schema diagnostics (e.g. "expected the frame to start
+ * with <<<...>>>", "received content type X, expected Y") — the model's raw
+ * reply text itself never reaches it, though a short, bounded (<=200 char),
+ * escaped fragment of a specific field value the provider supplied (e.g. the
+ * literal "X"/"Y" above) may, when that is what explains the mismatch.
+ * Before this, a malformed result surfaced only its closed-union code (e.g.
+ * "invalidFrame") with no way to say WHY, which cost real diagnosis time on
+ * a live failure whose actual cause — a complete, correct model response
+ * missing only the required output frame — was invisible until the raw
+ * response was recovered by hand from the CLI provider's own session store.
  */
 import { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
 

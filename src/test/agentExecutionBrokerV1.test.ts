@@ -33,7 +33,7 @@ import {
   createBoundedResultWriterV1,
   executeAgentRequestV1,
 } from "../services/agentExecutionBrokerV1";
-import { createBoundedResultStoreV1 } from "../services/boundedResultStoreV1";
+import { BoundedResultStoreV1, createBoundedResultStoreV1 } from "../services/boundedResultStoreV1";
 import { MIGRATED_ACTION_KEYS_V0 } from "../services/legacyAiActionSafetyGateV0";
 import {
   ClaimedReservationV1,
@@ -419,6 +419,34 @@ void describe("agentExecutionBrokerV1", () => {
     } finally {
       fs.rmSync(rootDir, { recursive: true, force: true });
     }
+  });
+
+  void it("falls back to sealing in memory when the spool store's write fails, instead of discarding the response", async () => {
+    const { request, claimed } = makeFixture({ maxResponseBytes: 4096 });
+    const text = "x".repeat(1000);
+    const failingStore: BoundedResultStoreV1 = {
+      storeId: "failing-store",
+      writeSpool: () => Promise.reject(new Error("disk full")),
+      claimSpoolOnce: () => Promise.reject(new Error("unused")),
+      removeSpool: () => Promise.reject(new Error("unused")),
+      expireStaleSpools: () => Promise.reject(new Error("unused")),
+    };
+    const result = await executeAgentRequestV1(
+      request,
+      claimed,
+      scriptedTransport((_req, output) => {
+        output.write(text);
+        return { kind: "completed" };
+      }),
+      { spoolStore: failingStore, spoolThresholdBytes: 100 }
+    );
+    assert.equal(result.kind, "response");
+    if (result.kind !== "response" || result.payload.storage !== "memory") {
+      assert.fail("expected an in-memory-sealed payload, not a terminal transportFailure");
+    }
+    assert.equal(result.payload.utf8Text, text);
+    assert.equal(result.payload.byteLength, 1000);
+    assert.equal(result.payload.sha256, createHash("sha256").update(text, "utf8").digest("hex"));
   });
 
   void it("createBoundedResultWriterV1 counts bytes exactly and discards on overflow", () => {

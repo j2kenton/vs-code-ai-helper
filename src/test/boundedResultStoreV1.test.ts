@@ -308,4 +308,57 @@ void describe("boundedResultStoreV1", () => {
       fixture.cleanup();
     }
   });
+
+  void it('marks a spool written with { purpose: "recovery" } on disk, and leaves an ordinary spool unmarked', async () => {
+    const fixture = makeStore();
+    try {
+      const correlation = makeCorrelation();
+      const recoveryRef = await fixture.store.writeSpool(
+        correlation,
+        allocateHex128IdV1(),
+        Buffer.from("rejected response text"),
+        { purpose: "recovery" }
+      );
+      const ordinaryRef = await fixture.store.writeSpool(
+        makeCorrelation(),
+        allocateHex128IdV1(),
+        Buffer.from("ordinary large response")
+      );
+
+      const recoveryMeta = JSON.parse(
+        fs.readFileSync(
+          path.join(
+            fixture.rootDir,
+            recoveryRef.operationId,
+            recoveryRef.attemptId,
+            recoveryRef.reservationId,
+            "spool-meta-v1.json"
+          ),
+          "utf8"
+        )
+      ) as { purpose?: string };
+      const ordinaryMeta = JSON.parse(
+        fs.readFileSync(
+          path.join(
+            fixture.rootDir,
+            ordinaryRef.operationId,
+            ordinaryRef.attemptId,
+            ordinaryRef.reservationId,
+            "spool-meta-v1.json"
+          ),
+          "utf8"
+        )
+      ) as { purpose?: string };
+
+      assert.equal(recoveryMeta.purpose, "recovery");
+      assert.equal(ordinaryMeta.purpose, undefined);
+
+      // The marker never affects claiming — a recovery-marked spool is still
+      // a perfectly ordinary claimable spool from the store's own point of view.
+      const claim = await fixture.store.claimSpoolOnce(recoveryRef, correlation);
+      assert.ok(claim.ok);
+    } finally {
+      fixture.cleanup();
+    }
+  });
 });

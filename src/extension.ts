@@ -35,6 +35,7 @@ import { registerApplyCurrentStageActionCommand } from "./commands/applyCurrentS
 import { registerOpenAndStartNewTaskCommand } from "./commands/openAndStartNewTask";
 import { registerReviewCurrentTaskCommand } from "./commands/reviewCurrentTask";
 import { registerFastForwardCurrentTaskReviewCommand } from "./commands/fastForwardCurrentTaskReview";
+import { registerRecoverLastAiResponseCommand } from "./commands/recoverLastAiResponse";
 import { registerPauseTaskCommand } from "./commands/pauseTask";
 import { registerArchiveTaskCommands } from "./commands/archiveTask";
 import { registerPinTaskCommands } from "./commands/pinTask";
@@ -508,6 +509,7 @@ export function activate(context: vscode.ExtensionContext): void {
   registerOpenAndStartNewTaskCommand(context, inventory, currentTaskStore);
   registerReviewCurrentTaskCommand(context, inventory, currentTaskStore);
   registerFastForwardCurrentTaskReviewCommand(context, inventory, currentTaskStore);
+  registerRecoverLastAiResponseCommand(context);
   registerPauseTaskCommand(context, inventory, currentTaskStore);
   registerArchiveTaskCommands(context, inventory, currentTaskStore);
   registerPinTaskCommands(context, inventory);

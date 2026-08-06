@@ -398,6 +398,38 @@
         "targetActionKey": "n/a (superseded by the strict V1 progress stack)",
         "pregateStabilitySha256": "3adfcff5073836d321dabcdad5492e2afc0f49d52ebb4ae3c3213a8ac7198d82"
       }
+    },
+    {
+      "annotationKind": "pregateAddedConsumer",
+      "path": "src/commands/recoverLastAiResponse.ts",
+      "planSection": "3.2 (core-stability round, 2026-08-06)",
+      "rationale": "New command reading the BoundedResultStoreV1 provider-results spool tree directly via fs.readdirSync/fs.readFileSync (never through the store's own claim-once API — see the command's own doc comment for why a direct read is required for re-runnability). Every path read is confined under workflowRuntimeServicesV1.ts's getProviderResultSpoolStoreRootDirV1(), itself the registry-vended workflow-runtime-v1/provider-results/ family root; read-only, never writes.",
+      "owner": "j2kenton",
+      "cohort": "runnerV1",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "symbol": "findMostRecentSpool, recoverLastAiResponse",
+        "sourceSpan": "L2-L2",
+        "edgeKind": "pregateAddedConsumer",
+        "targetActionKey": "n/a (host-wide recovery command, not tied to a single actionKey)",
+        "liveStabilitySha256": "2a3cdfd6eec573e3dde0d367f91506394d3cb95f117e8530d7fa91ee00066e1f"
+      }
+    },
+    {
+      "annotationKind": "pregateAddedConsumer",
+      "path": "src/services/boundedResultStoreV1.ts",
+      "planSection": "3.2 (core-stability round, 2026-08-06)",
+      "rationale": "Newly bundle-reachable this round (present on disk since the deferred workflow-safety backlog round but never imported by a production caller until workflowRuntimeServicesV1.ts's getProviderResultSpoolStoreV1 constructed the one production singleton): writeSpool/claimSpoolOnce/removeSpool/expireStaleSpools use fs for exclusive (O_EXCL) spool file creation, read, and cleanup, all confined under the caller-supplied rootDir (workflow-runtime-v1/provider-results/, registry-vended, never a raw path).",
+      "owner": "j2kenton",
+      "cohort": "runnerV1",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "symbol": "createBoundedResultStoreV1, BoundedResultStoreV1",
+        "sourceSpan": "L26-L26",
+        "edgeKind": "pregateAddedConsumer",
+        "targetActionKey": "n/a (spool store under the execution broker; not a route)",
+        "liveStabilitySha256": "b87c52d778d5dd29216392ae98536d8c012c3063da7db954c22e2989c4a05589"
+      }
     }
   ]
 }

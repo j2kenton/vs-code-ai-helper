@@ -1255,6 +1255,23 @@
         "pregateStabilitySha256": "540e9b49fcc0816deccd61eb24fef73a350d24eaf1ce43db2c6f4a565d577e24",
         "liveStabilitySha256": "9b33ba368c637faf96801f6292f7fc3df642455f3a15ba175f34a849a1d6b6b7"
       }
+    },
+    {
+      "annotationKind": "pregateAddedRoute",
+      "routeKey": "command:vs-code-ai-helper.recoverLastAiResponse",
+      "path": "src/commands/recoverLastAiResponse.ts",
+      "planSection": "3.2 (core-stability round, 2026-08-06)",
+      "rationale": "New host-wide, task-independent command (Ctrl+Shift+Alt+C, contributed + keybound, no menu entries) surfacing the most recently preserved rejected-provider-response spool written by taskActionCoordinatorV1.ts's preserveRejectedResultForRecoveryV1 into the BoundedResultStoreV1 singleton (boundedResultStoreV1.ts, workflowRuntimeServicesV1.ts). It reads spool-meta-v1.json/result-v1.bin directly off disk (never through claimSpoolOnce) and opens the raw text as a read-only untitled markdown document — no fileEdgesOut, no legacy AI gate, since it never invokes a provider and never writes to a real workspace file (transient provider data, plan §2.2). Registered from extension.ts alongside the other standalone command registrations.",
+      "owner": "j2kenton",
+      "cohort": "runnerV1",
+      "expiryCohort": "cleanup",
+      "evidence": {
+        "symbol": "recoverLastAiResponse, registerRecoverLastAiResponseCommand",
+        "sourceSpan": "L174-L177",
+        "edgeKind": "pregateAddedRoute",
+        "targetActionKey": "n/a (host-wide recovery command, not tied to a single actionKey)",
+        "liveStabilitySha256": "39ede08d79ec9512df89061fdc818ddd8cae013814266894f47482fce509d2d2"
+      }
     }
   ]
 }

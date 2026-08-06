@@ -534,8 +534,12 @@ function isCanonicalTaskStageV0(value: string): value is TaskStage {
  *
  * Shared by every settled-outcome site that surfaces OUR OWN generated
  * diagnostic text (parser reasons, validation mismatches, promotion error
- * messages) — never provider/model output, which plan §2.2/§3.7's
- * sanitized-outcome contract forbids regardless of length.
+ * messages) — never the model's raw free-text reply, which plan §2.2/§3.7's
+ * sanitized-outcome contract forbids regardless of length. A diagnostic MAY
+ * still quote a short, specific field value the provider supplied (a
+ * contentType/version string, a plan stepId, a relative path) when that is
+ * what the message is explaining; the cap here is what keeps any such
+ * fragment bounded.
  */
 function boundedDiagnosticDetailV1(text: string, maxChars = 200): string | undefined {
   const flattened = text.replace(/\s+/g, " ").trim();
@@ -580,10 +584,16 @@ export function chatTransactionFailureCodeV1(code: string, reason: string): stri
  * Every row's `promoteCompletedContent` (actions/rows/*.ts) throws a plain
  * Error whose message describes its OWN validation or storage-write failure
  * — a missing required line, a content-type mismatch, a compare-and-set
- * conflict — never provider/model text, since the row only validates its own
- * already-schema-checked envelope and its own storage layer's result
- * (confirmed across all ten current `promoteCompletedContent`
- * implementations). The catch block this feeds used to discard the error
+ * conflict — never the model's raw free-text reply, since the row only
+ * validates its own already-schema-checked envelope and its own storage
+ * layer's result. That validation message CAN echo a short, specific field
+ * value from the envelope's own schema-checked content when naming it is
+ * what explains the failure (e.g. editPreflightRowsV1.ts's promotion path
+ * folds validatePreflightPlanAgainstLedgerV1's reason — which may quote an
+ * operation's provider-supplied stepId or relativePath — straight into this
+ * message); boundedDiagnosticDetailV1 below is what keeps any such fragment
+ * short and flattened, not an absence of provider-supplied values. The catch
+ * block this feeds used to discard the error
  * entirely — not even into a variable — so a promotion failure surfaced only
  * the bare code "promotionFailed", indistinguishable whether the cause was a
  * CAS conflict, a validation failure, or a storage error. That cost real
@@ -673,8 +683,20 @@ async function unsealPayload(
  * that was about to be handed to the parser to a spool keyed by the SAME
  * correlation/reservation tuple `unsealPayload` already used — by the time
  * this runs, that tuple's original spool (if the payload was spooled rather
- * than inline) has already been removed, so a fresh write for the same key
- * cannot collide with it.
+ * than inline) should already have been removed by `unsealPayload`'s own
+ * best-effort `removeSpool` call, so a fresh write for the same key is not
+ * expected to collide with it. That removal's own errors are swallowed
+ * (plan §3.2's expiry sweep is the backstop), so a fresh write CAN still
+ * collide with a not-yet-removed original — `writeSpool`'s exclusive
+ * creation then throws, which the catch below folds into an ordinary
+ * preservation failure exactly like any other write error.
+ *
+ * Written with `{ purpose: "recovery" }` (boundedResultStoreV1.ts's
+ * `SpoolPurposeV1`) so a reader walking the shared spool tree — the Recover
+ * Last AI Response command — can tell this apart from an ordinary broker
+ * spool for a large in-flight or already-settled response sharing the same
+ * store and directory layout, and never surface one under a "rejected"
+ * banner it doesn't deserve.
  *
  * Failure to preserve — no spool store configured, a write error, anything —
  * must never affect the settled outcome; this is best-effort diagnostics,
@@ -693,7 +715,9 @@ async function preserveRejectedResultForRecoveryV1(
     return undefined;
   }
   try {
-    return await store.writeSpool(correlation, reservationId, Buffer.from(text, "utf8"));
+    return await store.writeSpool(correlation, reservationId, Buffer.from(text, "utf8"), {
+      purpose: "recovery",
+    });
   } catch {
     return undefined;
   }

@@ -33,6 +33,7 @@ import * as fs from "fs";
 import * as path from "path";
 import * as vscode from "vscode";
 import { ChatInteractionTransactionStoreV1 } from "./chatInteractionTransactionStoreV1";
+import { BoundedResultStoreV1, createBoundedResultStoreV1 } from "./boundedResultStoreV1";
 import { createEditPlanBrokerV1, EditPlanBrokerV1 } from "./editBrokerToolSessionHandlerV1";
 import { createWorkflowLeaseStoreV1, WorkflowLeaseStoreV1 } from "./workflowLeaseStoreV1";
 import { decodeTaskProgressTextV1 } from "./taskProgressDecoderV1";
@@ -59,6 +60,7 @@ let fileStore: WorkflowFileStoreV1 = createWorkflowFileStoreV1(registry.register
 let privateRootId: string | undefined;
 let transactionStore: ChatInteractionTransactionStoreV1 | undefined;
 let editPlanBroker: EditPlanBrokerV1 | undefined;
+let providerResultSpoolStore: BoundedResultStoreV1 | undefined;
 /**
  * The one shared task-operation lease store (plan §1.8/§3.9) the action
  * coordinator acquires against for every provider/lifecycle row — a runtime,
@@ -721,6 +723,48 @@ export function getEditPlanBrokerV1(): EditPlanBrokerV1 {
   return editPlanBroker;
 }
 
+/**
+ * The one shared provider-result spool store (plan §3.2): large sealed
+ * responses above the execution broker's spool threshold, and (2026-08-06)
+ * the best-effort recovery copy of a response rejected as `malformedResult`
+ * — see `taskActionCoordinatorV1.ts`'s `preserveRejectedResultForRecoveryV1`
+ * — read back by the "Recover Last AI Response" command.
+ *
+ * Unlike `getEditPlanBrokerV1` above, an unconfigured private-storage root
+ * returns `undefined` here rather than throwing: every consumer of this
+ * store already treats it as optional (the broker seals to memory instead of
+ * spooling; the recovery write is best-effort and silent on failure), so
+ * there is no caller for whom a missing root is a programmer error worth
+ * crashing over.
+ */
+export function getProviderResultSpoolStoreV1(): BoundedResultStoreV1 | undefined {
+  if (providerResultSpoolStore) {
+    return providerResultSpoolStore;
+  }
+  const rootDir = getProviderResultSpoolStoreRootDirV1();
+  if (rootDir === undefined) {
+    return undefined;
+  }
+  providerResultSpoolStore = createBoundedResultStoreV1({ rootDir });
+  return providerResultSpoolStore;
+}
+
+/**
+ * Absolute fs path to the provider-results family directory the store above
+ * uses — for a recovery command's own READ-ONLY enumeration of what a
+ * rejected result left behind. Writes always go through the store's own
+ * `writeSpool` API, never direct fs access against this path; this exists so
+ * a caller that only needs to list/read existing spools (find the most
+ * recent one, walk its tree) does not have to duplicate the registry/root-id
+ * resolution `getProviderResultSpoolStoreV1` already does.
+ */
+export function getProviderResultSpoolStoreRootDirV1(): string | undefined {
+  if (privateRootId === undefined) {
+    return undefined;
+  }
+  return resolveWorkflowAllocatedFsPathV1(registry.providerResultsFamilyDir(privateRootId));
+}
+
 /** Test isolation: restore the pristine, unconfigured state. Production never calls this. */
 export function resetWorkflowRuntimeServicesForTestV1(): void {
   registry = createWorkflowPathRegistryV1();
@@ -728,6 +772,7 @@ export function resetWorkflowRuntimeServicesForTestV1(): void {
   privateRootId = undefined;
   transactionStore = undefined;
   editPlanBroker = undefined;
+  providerResultSpoolStore = undefined;
   leaseStore = createWorkflowLeaseStoreV1();
   verifiedTaskFolderRootIds = new Set<string>();
   verifiedTaskFolderBindingIds = new Map<string, string>();

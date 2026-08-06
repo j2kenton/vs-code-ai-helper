@@ -181,6 +181,26 @@
       "migrationCohort": "chat"
     },
     {
+      "path": "src/commands/recoverLastAiResponse.ts",
+      "signals": [
+        "import:fs"
+      ],
+      "callSites": [
+        {
+          "signal": "import:fs",
+          "span": "L2-L2",
+          "enclosingSymbol": "(module)"
+        }
+      ],
+      "sinkCategories": [
+        "stateStore"
+      ],
+      "pathSource": "The private-storage provider-results spool tree (workflow-runtime-v1/provider-results/, registry-vended via workflowRuntimeServicesV1.ts's getProviderResultSpoolStoreRootDirV1) — never a task-owned or Chat-private path.",
+      "expectedHandling": "Read-only: fs.readdirSync/fs.readFileSync walk the spool tree for the newest spool-meta-v1.json and read its paired result-v1.bin; a missing/unreadable/corrupt entry is skipped, never thrown. No writes beyond the store's own best-effort expireStaleSpools() housekeeping call after a successful open.",
+      "classifierCall": "n/a (transient provider-result recovery data, plan §2.2 — not a task/workflow path the privacy classifier scopes)",
+      "migrationCohort": "runnerV1"
+    },
+    {
       "path": "src/commands/renameTask.ts",
       "signals": [
         "workspace.fs"
@@ -439,7 +459,7 @@
       "callSites": [
         {
           "signal": "workspace.fs",
-          "span": "L205-L205",
+          "span": "L206-L206",
           "enclosingSymbol": "activate"
         }
       ],
@@ -510,6 +530,26 @@
       "expectedHandling": "The edit-capable runner. The edit cohort replaces direct tool file access with the request-local read tools + sealed-manifest broker (plan §7); until then the route gate and boundary backstop keep it unreachable.",
       "classifierCall": "pending:privacy — classifyWorkflowPathV1 inside every tool read/write handler (plan §2.2/§7.2)",
       "migrationCohort": "edit"
+    },
+    {
+      "path": "src/services/boundedResultStoreV1.ts",
+      "signals": [
+        "import:fs"
+      ],
+      "callSites": [
+        {
+          "signal": "import:fs",
+          "span": "L26-L26",
+          "enclosingSymbol": "(module)"
+        }
+      ],
+      "sinkCategories": [
+        "stateStore"
+      ],
+      "pathSource": "The caller-supplied rootDir (always the registry-vended workflow-runtime-v1/provider-results/ family root in production, via workflowRuntimeServicesV1.ts's getProviderResultSpoolStoreV1) — never a raw or caller-invented path.",
+      "expectedHandling": "writeSpool creates result-v1.bin/spool-meta-v1.json via exclusive (O_EXCL) file creation under <rootDir>/<operationId>/<attemptId>/<reservationId>/; claimSpoolOnce/removeSpool/expireStaleSpools read and delete within that same confined tree. All operations are best-effort from the caller's perspective (never block settlement) and never escape the supplied root.",
+      "classifierCall": "n/a (transient provider-result recovery data, plan §2.2 — not a task/workflow path the privacy classifier scopes)",
+      "migrationCohort": "runnerV1"
     },
     {
       "path": "src/services/taskCreationSeedHistoryV1.ts",

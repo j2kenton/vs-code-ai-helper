@@ -36,8 +36,9 @@ import { ResultSpoolRefV1 } from "../types/agentExecutionV1";
 /** Spools expire 24 hours after creation (plan §3.2). */
 export const RESULT_SPOOL_EXPIRY_MS_V1 = 24 * 60 * 60 * 1000;
 
-const SPOOL_BIN_NAME_V1 = "result-v1.bin";
-const SPOOL_META_NAME_V1 = "spool-meta-v1.json";
+/** File names within a spool directory — exported so a read-only, non-claiming consumer (e.g. the Recover Last AI Response command) never hardcodes its own copy. */
+export const SPOOL_BIN_NAME_V1 = "result-v1.bin";
+export const SPOOL_META_NAME_V1 = "spool-meta-v1.json";
 const SPOOL_CLAIM_MARKER_NAME_V1 = "claimed-v1.marker";
 
 export class BoundedResultStoreErrorV1 extends Error {
@@ -58,13 +59,25 @@ export type SpoolClaimResultV1 =
   | { readonly ok: true; readonly utf8Text: string; readonly ref: ResultSpoolRefV1 }
   | { readonly ok: false; readonly code: SpoolClaimFailureCodeV1 };
 
+/**
+ * Marks WHY a spool was written, since the broker (large in-flight/completed
+ * responses) and the coordinator's own rejected-response recovery copy
+ * (`preserveRejectedResultForRecoveryV1`) write to the exact same store and
+ * directory tree. Absent (undefined) on every ordinary broker spool — only a
+ * recovery write sets it — so a reader that only wants genuinely-rejected
+ * responses (the Recover Last AI Response command) can tell the two apart
+ * instead of surfacing whatever spool happens to be newest, broker or not.
+ */
+export type SpoolPurposeV1 = "recovery";
+
 export interface BoundedResultStoreV1 {
   readonly storeId: string;
   /** Seal raw response bytes into a new spool for the given correlation/reservation. */
   writeSpool(
     correlation: ActionCorrelationV1,
     reservationId: ReservationIdV1,
-    rawBytes: Buffer
+    rawBytes: Buffer,
+    options?: { readonly purpose?: SpoolPurposeV1 }
   ): Promise<ResultSpoolRefV1>;
   /**
    * Claim a spool exactly once. Verifies the caller's correlation tuple,
@@ -84,6 +97,7 @@ export interface BoundedResultStoreV1 {
 
 interface SpoolMetaV1 extends ResultSpoolRefV1 {
   readonly schemaVersion: 1;
+  readonly purpose?: SpoolPurposeV1;
 }
 
 function spoolDir(rootDir: string, ref: {
@@ -143,7 +157,8 @@ function decodeSpoolMeta(rawJson: string): SpoolMetaV1 | undefined {
     typeof m.byteLength !== "number" || !Number.isInteger(m.byteLength) || m.byteLength < 0 ||
     typeof m.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(m.sha256) ||
     typeof m.createdAt !== "string" || Number.isNaN(Date.parse(m.createdAt)) ||
-    typeof m.expiresAt !== "string" || Number.isNaN(Date.parse(m.expiresAt))
+    typeof m.expiresAt !== "string" || Number.isNaN(Date.parse(m.expiresAt)) ||
+    (m.purpose !== undefined && m.purpose !== "recovery")
   ) {
     return undefined;
   }
@@ -160,6 +175,7 @@ function decodeSpoolMeta(rawJson: string): SpoolMetaV1 | undefined {
     sha256: m.sha256,
     createdAt: m.createdAt,
     expiresAt: m.expiresAt,
+    ...(m.purpose === "recovery" ? { purpose: "recovery" as const } : {}),
   };
 }
 
@@ -193,7 +209,8 @@ export function createBoundedResultStoreV1(options: {
     async writeSpool(
       correlation: ActionCorrelationV1,
       reservationId: ReservationIdV1,
-      rawBytes: Buffer
+      rawBytes: Buffer,
+      writeOptions?: { readonly purpose?: SpoolPurposeV1 }
     ): Promise<ResultSpoolRefV1> {
       if (
         !isHex128IdV1(correlation.operationId) ||
@@ -223,7 +240,11 @@ export function createBoundedResultStoreV1(options: {
       };
       const dir = spoolDir(rootDir, ref);
       await fs.promises.mkdir(dir, { recursive: true });
-      const meta: SpoolMetaV1 = { schemaVersion: 1, ...ref };
+      const meta: SpoolMetaV1 = {
+        schemaVersion: 1,
+        ...ref,
+        ...(writeOptions?.purpose ? { purpose: writeOptions.purpose } : {}),
+      };
       // Exclusive creation: a reservation is invocation-once, so a second
       // spool write for the same reservation is always a protocol violation.
       // A spool becomes durable only once BOTH files exist; a failure after

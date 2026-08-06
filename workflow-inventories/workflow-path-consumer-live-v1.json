@@ -3,8 +3,8 @@
   "generatedBy": "scripts/generateWorkflowPathConsumers.mjs",
   "description": "Mechanically derived production path-consumer surface of the current working tree (plan §2.3): every module of the §1.1 production source universe importing node fs/child_process or touching the vscode workspace.fs API, with every concrete call site (compiler span + enclosing symbol). Scanned over the exact source-universe file list — never a filesystem walk. Regenerated every run; classification lives in workflow-path-consumer-baseline-v1.json; the immutable pre-gate reference is workflow-path-consumer-pregate-v1.json. Known mechanical bound: modules that only pass path STRINGS to another module (no fs/process API of their own) are covered transitively by the consumer module they call — the classifier enforcement point (plan §2.2) sits at the API-touching module. sourceUniverseSha256 is the CANONICAL (line-ending-independent) digest of the source-universe JSON, so provenance is identical across LF and CRLF checkouts.",
   "sourceUniverse": "workflow-inventories/workflow-production-source-baseline-v1.json",
-  "sourceUniverseSha256": "ca55806235558b023830808c0a4cd482fe36f5bfe878325a61780f87c98513bc",
-  "consumerCount": 48,
+  "sourceUniverseSha256": "0c6fdaba98b83d8bc9134f44686fcbeda91811b7d651587676bc8b8c8c1b0258",
+  "consumerCount": 50,
   "consumers": [
     {
       "path": "src/commands/applyCurrentStageAction.ts",
@@ -136,6 +136,19 @@
           "signal": "workspace.fs",
           "span": "L46-L46",
           "enclosingSymbol": "resolveGlobalAssistantFolder"
+        }
+      ]
+    },
+    {
+      "path": "src/commands/recoverLastAiResponse.ts",
+      "signals": [
+        "import:fs"
+      ],
+      "callSites": [
+        {
+          "signal": "import:fs",
+          "span": "L2-L2",
+          "enclosingSymbol": "(module)"
         }
       ]
     },
@@ -348,7 +361,7 @@
       "callSites": [
         {
           "signal": "workspace.fs",
-          "span": "L205-L205",
+          "span": "L206-L206",
           "enclosingSymbol": "activate"
         }
       ]
@@ -393,6 +406,19 @@
           "signal": "workspace.fs",
           "span": "L291-L291",
           "enclosingSymbol": "entries"
+        }
+      ]
+    },
+    {
+      "path": "src/services/boundedResultStoreV1.ts",
+      "signals": [
+        "import:fs"
+      ],
+      "callSites": [
+        {
+          "signal": "import:fs",
+          "span": "L26-L26",
+          "enclosingSymbol": "(module)"
         }
       ]
     },

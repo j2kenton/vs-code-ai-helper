@@ -20,8 +20,10 @@ import * as path from "node:path";
 import { describe, it } from "node:test";
 import * as vscode from "vscode";
 import {
+  configureWorkflowPrivateStorageRootV1,
   ensureWorkflowNonTaskStorageRootV1,
   ensureWorkflowTaskFolderRootV1,
+  getProviderResultSpoolStoreV1,
   getVerifiedTaskBindingIdV1,
   getWorkflowFileStoreV1,
   getWorkflowPathRegistryV1,
@@ -29,6 +31,7 @@ import {
   resetWorkflowRuntimeServicesForTestV1,
   resolveWorkflowAllocatedFsPathV1,
 } from "../services/workflowRuntimeServicesV1";
+import { allocateHex128IdV1 } from "../types/actionCorrelationV1";
 import { computeTaskBindingIdV1 } from "../types/taskBindingV1";
 import { TASK_PROGRESS_FILENAME } from "../types/taskProgress";
 import { fixtureOwnershipFor, makeOwnedTaskFolder } from "./taskFolderFixture";
@@ -514,5 +517,66 @@ void describe("workflowRuntimeServicesV1 — resolveWorkflowAllocatedFsPathV1", 
         }),
       /not registered/
     );
+  });
+});
+
+/**
+ * Coverage for getProviderResultSpoolStoreV1 (2026-08-06 stability fix): the
+ * production coordinator never actually configured a spool store, so a
+ * `malformedResult` settlement's recovery write (taskActionCoordinatorV1.ts's
+ * preserveRejectedResultForRecoveryV1) was silently a no-op regardless of the
+ * code that called it. This proves the accessor itself resolves to a real,
+ * usable store under the registry's own `provider-results` family directory
+ * once the private-storage root is configured, and stays undefined (rather
+ * than throwing) before that — every consumer already treats a missing store
+ * as optional/best-effort.
+ */
+void describe("workflowRuntimeServicesV1 — getProviderResultSpoolStoreV1", () => {
+  void it("is undefined before the private-storage root is configured", () => {
+    resetWorkflowRuntimeServicesForTestV1();
+    assert.equal(getProviderResultSpoolStoreV1(), undefined);
+  });
+
+  void it("resolves to a real store under workflow-runtime-v1/provider-results once configured", async () => {
+    resetWorkflowRuntimeServicesForTestV1();
+    const privateRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-provider-spool-"));
+    try {
+      configureWorkflowPrivateStorageRootV1(privateRoot);
+      const store = getProviderResultSpoolStoreV1();
+      assert.ok(store, "expected a configured spool store");
+      const correlation = {
+        actionKey: "review.v1",
+        operationId: allocateHex128IdV1(),
+        attemptId: allocateHex128IdV1(),
+        taskBindingId: "tb",
+        chatDocumentId: "cd",
+      };
+      const reservationId = allocateHex128IdV1();
+      const ref = await store.writeSpool(correlation, reservationId, Buffer.from("hello", "utf8"));
+      const expectedPath = path.join(
+        privateRoot,
+        "workflow-runtime-v1",
+        "provider-results",
+        correlation.operationId,
+        correlation.attemptId,
+        reservationId,
+        "result-v1.bin"
+      );
+      assert.equal(fs.readFileSync(expectedPath, "utf8"), "hello");
+      assert.equal(ref.operationId, correlation.operationId);
+    } finally {
+      fs.rmSync(privateRoot, { recursive: true, force: true });
+    }
+  });
+
+  void it("returns the SAME store instance across calls (singleton, not re-created per access)", () => {
+    resetWorkflowRuntimeServicesForTestV1();
+    const privateRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-provider-spool-singleton-"));
+    try {
+      configureWorkflowPrivateStorageRootV1(privateRoot);
+      assert.equal(getProviderResultSpoolStoreV1(), getProviderResultSpoolStoreV1());
+    } finally {
+      fs.rmSync(privateRoot, { recursive: true, force: true });
+    }
   });
 });

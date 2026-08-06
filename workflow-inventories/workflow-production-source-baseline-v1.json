@@ -12,7 +12,7 @@
   "typescriptVersion": "5.9.3",
   "buildOptionsDigestSha256": "59b9af38338f674e6503e84e1945f3c7b2e65f3aab5e1acec211ca45a20c3d07",
   "lockfileSha256": "8df5712b6f8e20446c74bb0ebf444ca707fb666b5a35214b92ad7d155c4b28f6",
-  "fileCount": 167,
+  "fileCount": 169,
   "files": [
     {
       "path": "src/actions/actionConversationOrchestratorV1.ts",
@@ -20,7 +20,7 @@
     },
     {
       "path": "src/actions/productionTaskActionRuntimeV1.ts",
-      "sha256": "aed2622deca172ca46ab21bfd34f92d5797fdeea263713d9a52d94a542e6967d"
+      "sha256": "13bd56daed6b7151d7456a402587e260b1e9e2a58821e9ee558c9fba8cabc4a7"
     },
     {
       "path": "src/actions/rows/applyReviewRowV1.ts",
@@ -84,7 +84,7 @@
     },
     {
       "path": "src/actions/taskActionCoordinatorV1.ts",
-      "sha256": "e174e84a1e8841adf088d5251d4994f4965eab62f1c13e0a3292b5710842a21a"
+      "sha256": "87dd6184a48346b709dd0d0c2a3f5c4dc14d82b18ce3f80d6572f7a4e271d2a1"
     },
     {
       "path": "src/actions/taskActionRegistryV1.ts",
@@ -155,6 +155,10 @@
       "sha256": "070a2abffb1d283a8ee4ccb3b964fa7d2a4f62ee693372604a9a80f64cbf0079"
     },
     {
+      "path": "src/commands/recoverLastAiResponse.ts",
+      "sha256": "84ef93072e45bd3f6d6e5a07205d4c24cf2cc3141e2664958ff0b40610a0bdf6"
+    },
+    {
       "path": "src/commands/renameTask.ts",
       "sha256": "a85f4aa20e197c12c5b03b000ecf61461897fcb06fdfccc1142ce200233c3b8c"
     },
@@ -216,7 +220,7 @@
     },
     {
       "path": "src/extension.ts",
-      "sha256": "480ef4221b7c41a4bed17b0d5821224cb24a88c98004faa5cc6a109ef4c18a22"
+      "sha256": "436d6fcd1fbe8480f400b58e95d57028f54a8c3671720c1ac675e63e62d69be7"
     },
     {
       "path": "src/legal/disclaimerVersion.ts",
@@ -256,7 +260,11 @@
     },
     {
       "path": "src/services/agentExecutionBrokerV1.ts",
-      "sha256": "5f886e2a9e738efdb1ae9d305450b97fd7718d519455df9ed47907aa43a8bc79"
+      "sha256": "c8c950d514c5ffeca1a86bdf61e345922d761990e797c0513dec878027607aa8"
+    },
+    {
+      "path": "src/services/boundedResultStoreV1.ts",
+      "sha256": "ff3d43fdb0552f893eb62f1ce2165dde0eb22d7c34b5762361528db62e92292a"
     },
     {
       "path": "src/services/canonicalJsonV1.ts",
@@ -344,7 +352,7 @@
     },
     {
       "path": "src/services/workflowPathRegistryV1.ts",
-      "sha256": "cb7d0c4516125432d5f8c4afed5b0599453d2e0c12e06b67807ced0e2fddd75c"
+      "sha256": "73aeaada3fe130f34f5f4ad924b4671cfb2053d2b73c10ece9bf4a6c0301feb5"
     },
     {
       "path": "src/services/workflowPathSafetyV1.ts",
@@ -356,7 +364,7 @@
     },
     {
       "path": "src/services/workflowRuntimeServicesV1.ts",
-      "sha256": "c30e11b19c5148f5bfc8b7ee45a50cfec9cc6b04d0cf4c6f317f356d260ba6bc"
+      "sha256": "5ce6c5d757114212470152ead1acf4904b225128b4dad6c9cedfe13fbd74b3dd"
     },
     {
       "path": "src/state/finalizationJournal.ts",
@@ -432,7 +440,7 @@
     },
     {
       "path": "src/types/taskActionOutcomeV1.ts",
-      "sha256": "f423f39fdfe223b0b2003b9305086524b7bea538dcd8b73f136747856b1e26a4"
+      "sha256": "814d36753a0597516cae34177ff9be2593f40c89cf4c589a7e435d63cae4c71f"
     },
     {
       "path": "src/types/taskAdoptionIntentV1.ts",
@@ -640,7 +648,7 @@
     },
     {
       "path": "src/utils/taskActionOutcomeTextV1.ts",
-      "sha256": "8a60a7fde1e5d911002aecdf59631171ddf5d64d273a9e7c755cd94ec3f0b44c"
+      "sha256": "4f2395a432922b7ad683338576274daec6b29e002dcffbeddf1511026c47b1f7"
     },
     {
       "path": "src/utils/taskDescriptionDocument.ts",

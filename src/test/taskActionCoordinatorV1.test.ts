@@ -583,6 +583,14 @@ void describe("taskActionCoordinatorV1", () => {
         fs.readFileSync(spoolFiles[0]!, "utf8"),
         "just some prose, no frame — this is the model's real, correct answer"
       );
+
+      // The persisted meta must carry purpose: "recovery" — this is what lets
+      // a reader walking the SAME store's tree (Recover Last AI Response)
+      // tell this apart from an ordinary broker spool for a large in-flight
+      // or already-settled response, which never sets this field.
+      const metaPath = path.join(path.dirname(spoolFiles[0]!), "spool-meta-v1.json");
+      const meta = JSON.parse(fs.readFileSync(metaPath, "utf8")) as { purpose?: string };
+      assert.equal(meta.purpose, "recovery");
     } finally {
       fs.rmSync(rootDir, { recursive: true, force: true });
     }
