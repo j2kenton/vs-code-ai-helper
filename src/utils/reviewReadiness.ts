@@ -161,11 +161,19 @@ export function hasZeroTaskFixableEvidence(content: string): boolean {
 /** See {@link parseReviewBlockers}; also reports whether the block existed. */
 export function parseReviewBlockersDetailed(content: string): ReviewBlockerEvidence {
   const match = BLOCKERS_BLOCK_RE.exec(content);
-  if (!match?.[1]) {
+  if (!match) {
     return { blockPresent: false, blockers: [] };
   }
+  // Presence is decided by the MARKERS, not by the capture being non-empty.
+  // `<!-- blockers:start --><!-- blockers:end -->` with nothing between them
+  // captures "" (falsy), and testing the capture read that as "no block at
+  // all" — the one shape that means "I looked and found zero blockers" was
+  // therefore indistinguishable from "the model forgot the block", which
+  // hasZeroTaskFixableEvidence deliberately refuses to treat as evidence.
+  // That inverted the intent of an explicitly empty block.
+  const body = match[1] ?? "";
   const blockers: ReviewBlocker[] = [];
-  for (const line of match[1].split(/\r?\n/)) {
+  for (const line of body.split(/\r?\n/)) {
     const lineMatch = BLOCKER_LINE_RE.exec(line);
     if (!lineMatch) {
       continue;

@@ -132,3 +132,47 @@ void describe("parseReviewBlockersDetailed / hasZeroTaskFixableEvidence", () => 
     assert.strictEqual(hasZeroTaskFixableEvidence(content), false);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Empty-but-present block (2026-08-06 live dogfooding fix). The rubric used to
+// say "omit the block entirely when you found zero blockers", while
+// hasZeroTaskFixableEvidence refuses to read ABSENCE as evidence — so in the
+// one case termination needs proof, the prompt deleted the proof.
+// zeroFixableTerminatesFastForward could therefore never fire from the block,
+// and Fast Forward span to its iteration ceiling applying nothing. The rubric
+// now always emits the block; these pin the parser side of that contract.
+// ---------------------------------------------------------------------------
+
+void describe("blockers block: presence vs absence", () => {
+  void it("an explicitly empty blockers block is PRESENT with zero blockers", () => {
+    const content = "Readiness: 8/10\n\n<!-- blockers:start -->\n<!-- blockers:end -->\n";
+    const evidence = parseReviewBlockersDetailed(content);
+    assert.equal(evidence.blockPresent, true, "markers present means the block is present");
+    assert.deepEqual(evidence.blockers, []);
+    assert.equal(hasZeroTaskFixableEvidence(content), true);
+  });
+
+  void it("markers with nothing at all between them still count as present", () => {
+    // The capture is "" here — testing the capture's truthiness (the old bug)
+    // read this as no block at all, inverting the meaning of a deliberate
+    // empty block into "unknown".
+    const content = "Readiness: 8/10\n\n<!-- blockers:start --><!-- blockers:end -->";
+    const evidence = parseReviewBlockersDetailed(content);
+    assert.equal(evidence.blockPresent, true);
+    assert.deepEqual(evidence.blockers, []);
+    assert.equal(hasZeroTaskFixableEvidence(content), true);
+  });
+
+  void it("a missing block is still NOT evidence of zero blockers", () => {
+    // The complement, and the reason the empty block has to exist: a response
+    // that simply forgot the block must stay "unknown", never "none".
+    const content = "Readiness: 8/10\n\nI found zero blockers of any category.";
+    const evidence = parseReviewBlockersDetailed(content);
+    assert.equal(evidence.blockPresent, false);
+    assert.equal(
+      hasZeroTaskFixableEvidence(content),
+      false,
+      "prose that does not match the explicit no-blockers phrasing is not evidence"
+    );
+  });
+});

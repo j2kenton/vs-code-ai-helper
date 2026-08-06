@@ -27,7 +27,7 @@ When a "## Verified Checks (ground truth)" section is present below, it was prod
 
 ## Blocker Classification
 
-In addition to the prose blocker sections below, end your response with a machine-readable block listing every blocker you named above (architectural, completion, defect, shipping, and review-confidence blockers all go in this one block; omit the block entirely only when you found zero blockers of any kind):
+In addition to the prose blocker sections below, end your response with a machine-readable block listing every blocker you named above (architectural, completion, defect, shipping, and review-confidence blockers all go in this one block):
 
 ```
 <!-- blockers:start -->
@@ -35,6 +35,15 @@ In addition to the prose blocker sections below, end your response with a machin
 - [review-confidence] [environmental] one-line description matching a blocker above
 <!-- blockers:end -->
 ```
+
+**Always emit this block — including when you found zero blockers, in which case emit it with the two markers and no entries between them:**
+
+```
+<!-- blockers:start -->
+<!-- blockers:end -->
+```
+
+An empty block is a positive statement ("I looked and found none") and is what lets an automated review loop recognize the work as finished and stop. Omitting the block is NOT read as "zero blockers" — it is indistinguishable from a response that simply forgot it, so it is treated as "unknown" and the loop keeps running further rounds that have nothing to fix.
 
 The first bracket is the blocker's category — use exactly one of: `architectural`, `completion` (also file a `defect` blocker under `completion`), `shipping` (Publish-review shipping blockers — this is the category most Publish reviews will use), or `review-confidence`. The second bracket is who/what can resolve it — pick exactly one:
 - `task-fixable`: another implementation round can address it (a missing feature, a bug, missing tests, a plan deviation).
