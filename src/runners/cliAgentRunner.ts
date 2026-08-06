@@ -1477,7 +1477,17 @@ export function createCliTextTransportV1(options: {
       let args: string[];
       try {
         // No last-message file: V1 results are captured from stdout only.
-        args = def.buildArgs("text", model, undefined, { cwd, promptFile });
+        // requiresFramedResult: this transport's reply is parsed by
+        // parseAiResultEnvelopeV1, so a `promptTransport: "file"` provider
+        // restates the frame contract in argv rather than relying solely on
+        // it being stated deep inside the prompt file (see that context
+        // field's own doc comment for the live run this fixes). The legacy
+        // path deliberately does NOT set it — legacy replies are free text.
+        args = def.buildArgs("text", model, undefined, {
+          cwd,
+          promptFile,
+          requiresFramedResult: true,
+        });
       } catch {
         cleanupPromptFile();
         return Promise.resolve({ kind: "transportFailure", code: "cliArgumentBuildFailed" });

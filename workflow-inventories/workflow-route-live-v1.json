@@ -3,7 +3,7 @@
   "generatedBy": "scripts/generateWorkflowRoutes.mjs",
   "description": "Mechanically extracted workflow route surface of the current working tree (plan §1.2): command registrations, contribution/menu references, internal executeCommand edges, dynamic dispatch sites, webview message roots, tree-item command bindings, provider-boundary call sites, legacy output destinations, and per-file legacy-AI-gate calls — every edge a concrete route row. Scanned over the exact §1.1 production source universe (never a filesystem walk). Regenerated every run; classification lives in workflow-route-baseline-v1.json; the immutable pre-gate reference is workflow-route-pregate-v1.json. Known mechanical bound: tree-item/status-row command bindings are collected only when the bound command ID is a string literal — dynamically bound commands are enforced at their executeCommand dispatch sites instead (dynamicDispatches, which fail closed without an annotation). sourceUniverseSha256 is the CANONICAL (line-ending-independent) digest of the source-universe JSON, so provenance is identical across LF and CRLF checkouts.",
   "sourceUniverse": "workflow-inventories/workflow-production-source-baseline-v1.json",
-  "sourceUniverseSha256": "1b8a2523901c2392fd5f1157295175f4a226bdf6ac3395427b7863dd99b25170",
+  "sourceUniverseSha256": "0f1b413e5c4b824907986b8bbe254e42545c53c7f610d46f51716ed7382b885e",
   "routeCount": 99,
   "routes": [
     {
@@ -1490,7 +1490,7 @@
       "kind": "writerEdge",
       "propertyName": "outputFile",
       "path": "src/runners/cliAgentRunner.ts",
-      "span": "L2302-L2302",
+      "span": "L2312-L2312",
       "enclosingSymbol": "run",
       "occurrence": 1
     },
@@ -1700,7 +1700,7 @@
     {
       "propertyName": "outputFile",
       "path": "src/runners/cliAgentRunner.ts",
-      "span": "L2302-L2302",
+      "span": "L2312-L2312",
       "enclosingSymbol": "run"
     },
     {

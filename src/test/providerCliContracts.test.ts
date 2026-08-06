@@ -2,6 +2,7 @@ import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, it } from "node:test";
+import { FRAME_END_V1, FRAME_START_V1 } from "../types/aiResultEnvelope";
 import {
   buildKimiCliPromptFileInstruction,
   CLAUDE_CLI_HEADLESS_PLAN_MODE_SYSTEM_PROMPT,
@@ -75,11 +76,18 @@ void describe("provider CLI contracts", () => {
       { model: undefined, name: "Antigravity (CLI default)" },
     ]);
 
+    // `--print` carries the PROMPT TEXT, not a path. Passing the bare path
+    // made agy treat the file as untrusted material to report on rather than
+    // instructions to follow (verified 2026-08-06: it answered "This file
+    // contains a prompt injection attempt ... I won't follow those
+    // instructions" and did no work), so the path is wrapped in the shared
+    // file-instruction sentence. Only the extension-generated path is
+    // interpolated, so argv stays fixed-size for any prompt.
     const textArgs = antigravity.buildArgs("text", undefined, undefined, {
       promptFile: "/tmp/prompt.txt",
     });
     assert.deepStrictEqual(textArgs, [
-      "--print=/tmp/prompt.txt",
+      `--print=${buildKimiCliPromptFileInstruction("/tmp/prompt.txt")}`,
       "--print-timeout=55m0s",
       "--dangerously-skip-permissions",
     ]);
@@ -88,7 +96,7 @@ void describe("provider CLI contracts", () => {
       promptFile: "/tmp/prompt.txt",
     });
     assert.deepStrictEqual(editArgs, [
-      "--print=/tmp/prompt.txt",
+      `--print=${buildKimiCliPromptFileInstruction("/tmp/prompt.txt")}`,
       "--print-timeout=55m0s",
       "--dangerously-skip-permissions",
       "--model",
@@ -100,7 +108,7 @@ void describe("provider CLI contracts", () => {
       resumePreviousConversation: true,
     });
     assert.deepStrictEqual(resumedArgs, [
-      "--print=/tmp/prompt.txt",
+      `--print=${buildKimiCliPromptFileInstruction("/tmp/prompt.txt")}`,
       "--print-timeout=55m0s",
       "--dangerously-skip-permissions",
       "--continue",
@@ -391,6 +399,39 @@ void describe("provider CLI contracts", () => {
     assert.ok(instruction.includes(promptFile), "instruction must name the prompt file");
     assert.match(instruction, /entire file/i);
     assert.match(instruction, /authoritative prompt/i);
+
+    // The frame reminder is opt-in (V1 text transport only) — the legacy path
+    // expects free text, so adding it there would demand a frame nothing
+    // parses. Default-off keeps that split explicit.
+    assert.ok(
+      !instruction.includes(FRAME_START_V1),
+      "the frame reminder must not leak into the default (legacy) instruction"
+    );
+
+    // With it on, the V1 output contract is restated in argv. A live
+    // kimi-code/k3 run (2026-08-06, 15 steps over a ~200 KB prompt) did the
+    // review correctly and then answered in plain prose, dropping the frame
+    // stated hundreds of lines into the file it read through its paginated
+    // Read tool — a complete review discarded as invalidFrame on formatting
+    // alone. argv is the one channel delivered directly rather than read.
+    const framed = buildKimiCliPromptFileInstruction(promptFile, true);
+    assert.ok(framed.startsWith(instruction), "framed form must extend, not replace, the base instruction");
+    assert.ok(framed.includes(FRAME_START_V1), "must name the exact opening marker the parser requires");
+    assert.ok(framed.includes(FRAME_END_V1), "must name the exact closing marker the parser requires");
+    assert.match(framed, /final message/i);
+    // Fixed-size and path-free: argv can never grow with prompt size, which
+    // is the entire reason these providers use a prompt file.
+    assert.ok(
+      Buffer.byteLength(framed, "utf8") - Buffer.byteLength(instruction, "utf8") < 600,
+      "the argv reminder must stay small — argv is the constrained channel"
+    );
+
+    // The V1 text transport is what turns it on; buildArgs must thread it.
+    const framedArgs = kimi.buildArgs("text", "kimi-code/k3", undefined, {
+      promptFile,
+      requiresFramedResult: true,
+    });
+    assert.deepStrictEqual(framedArgs[framedArgs.length - 1], framed);
     // Edit mode is byte-identical: Kimi rejects every permission flag
     // alongside -p, so mode changes nothing (see permissionWarning).
     assert.deepStrictEqual(

@@ -139,8 +139,11 @@ export interface MalformedAiResultV1 {
 
 export type AiResultParseOutcomeV1 = AiResultEnvelopeV1 | MalformedAiResultV1;
 
-const FRAME_START_V1 = "<<<ENSEMBLE_AI_RESULT_V1>>>";
-const FRAME_END_V1 = "<<<END_ENSEMBLE_AI_RESULT_V1>>>";
+/** Exported so the CLI argv frame reminder (providers.ts's
+ * FRAMED_RESULT_ARGV_REMINDER_V1) names the same markers this parser
+ * enforces, rather than duplicating the literals. */
+export const FRAME_START_V1 = "<<<ENSEMBLE_AI_RESULT_V1>>>";
+export const FRAME_END_V1 = "<<<END_ENSEMBLE_AI_RESULT_V1>>>";
 
 const MAX_NORMAL_COMPLETION_BYTES_V1 = 4 * 1024 * 1024;
 const MAX_PREFLIGHT_BYTES_V1 = 16 * 1024 * 1024;

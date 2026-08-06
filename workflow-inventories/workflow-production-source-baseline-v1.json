@@ -3,7 +3,7 @@
   "generatedBy": "scripts/resolveProductionSourceUniverse.mjs",
   "description": "Production source universe as of the current working tree, resolved from the exact bundler options that produce dist/extension.js (esbuild.config.js) plus the contribution-asset and runtime-resource-copy rules in scripts/lib/productionSourceScan.mjs. Regenerated every run; diffed against the immutable pre-gate snapshot (workflow-production-source-pregate-v1.json), not authoritative on its own.",
   "packageName": "vs-code-ai-helper",
-  "packageVersion": "0.73.1",
+  "packageVersion": "0.74.0",
   "declaredMain": "./dist/extension.js",
   "entrypoint": "src/extension.ts",
   "outfile": "dist/extension.js",
@@ -232,7 +232,7 @@
     },
     {
       "path": "src/runners/cliAgentRunner.ts",
-      "sha256": "8697e222cfc6956aedb681325a9ac5d2373a8eac93a2fc292b1680ec26cc4bab"
+      "sha256": "a125747d5e8e03b1ef4b88f6c75d78c6489901487e5ebf8e54fe1672c8bc1f00"
     },
     {
       "path": "src/runners/copilotImplementationRunner.ts",
@@ -248,7 +248,7 @@
     },
     {
       "path": "src/runners/providers.ts",
-      "sha256": "38968fea82084bc06b9035578d3aa65ce8de6ae2748ba44dff4d36c1fe2e038e"
+      "sha256": "15bb54db34700154e2374fc33a59961209f0a2eb1a0216c417fa841a78a625f0"
     },
     {
       "path": "src/runners/runnerRegistry.ts",
@@ -408,7 +408,7 @@
     },
     {
       "path": "src/types/aiResultEnvelope.ts",
-      "sha256": "fd1c9f3391462f5dea17c366308e8a4c835edf4c0742bc55ec933278d4d9b673"
+      "sha256": "5920891df3e3a5866c1f233cc4c563cd05eca90e3937a063aa3cbecf28c49588"
     },
     {
       "path": "src/types/chatInteractionTransactionV1.ts",

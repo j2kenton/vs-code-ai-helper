@@ -50,6 +50,7 @@ import {
   KIMI_REASONING_EFFORTS_V1,
   type DiscoveredCliModel,
 } from "../utils/cliModelDiscovery";
+import { FRAME_END_V1, FRAME_START_V1 } from "../types/aiResultEnvelope";
 
 export type CliProviderId =
   | "claude-cli"
@@ -97,6 +98,23 @@ export interface CliBuildArgsContext {
    * declare conversationResume below.
    */
   resumePreviousConversation?: boolean;
+  /**
+   * This run's reply must be exactly one `<<<ENSEMBLE_AI_RESULT_V1>>>` frame
+   * (the V1 text transport parses stdout with `parseAiResultEnvelopeV1`; the
+   * legacy path does not). Set only by `createCliTextTransportV1`.
+   *
+   * It exists for `promptTransport: "file"` providers specifically. The frame
+   * contract is stated inside the prompt file, but for a large prompt that is
+   * hundreds of lines deep in a document the model reads through its own
+   * paginated Read tool — and a live run (kimi-code/k3, 2026-08-06, 15 steps
+   * / 23 tool calls over a ~200 KB prompt) carried out the review task
+   * faithfully and then answered in plain prose, dropping the output-format
+   * contract entirely. A complete, high-quality review was discarded as
+   * `invalidFrame` purely on formatting. Restating the frame requirement in
+   * argv — the one channel the model receives directly rather than by
+   * reading a file — keeps it adjacent to the instruction it must obey last.
+   */
+  requiresFramedResult?: boolean;
 }
 
 export interface CliConversationResumeDefinition {
@@ -675,14 +693,42 @@ export const CLINE_CLI_ARGV_PROMPT_PLACEHOLDER =
  * Exported so providerCliContracts.test.ts can assert on it without
  * duplicating the literal string.
  */
-export function buildKimiCliPromptFileInstruction(promptFile: string): string {
+export function buildKimiCliPromptFileInstruction(
+  promptFile: string,
+  requiresFramedResult = false
+): string {
   return (
     `Your complete instructions and context for this run are in the file at ${promptFile}. ` +
     "Read that entire file first — it may be large, so keep reading (or search it) until you have all of it — " +
     "then carry out exactly what it asks. Treat its contents as the authoritative prompt for this run, " +
-    "not as reference material to summarize."
+    "not as reference material to summarize." +
+    (requiresFramedResult ? ` ${FRAMED_RESULT_ARGV_REMINDER_V1}` : "")
   );
 }
+
+/**
+ * Restates the V1 output-format contract in argv for `promptTransport:
+ * "file"` providers — see `CliBuildArgsContext.requiresFramedResult` for the
+ * live failure that motivated it.
+ *
+ * Deliberately a REMINDER, not a specification: the prompt file remains the
+ * authoritative statement of the frame's schema (kind, content, and the
+ * per-action fields each row requires). Restating the full contract here
+ * would fork it across two places that must agree, and argv is the one place
+ * that cannot grow — this text is a fixed ~340 bytes and interpolates
+ * nothing, so it can never push a command line toward the Windows ~32 KB
+ * ceiling that made these providers use a prompt file to begin with.
+ *
+ * Says "final message" because these are agentic CLIs whose stdout carries a
+ * whole tool-calling transcript; only the last assistant message is unwrapped
+ * (`extractKimiFinalOutput` and friends), so that is the one that must be the
+ * bare frame.
+ */
+export const FRAMED_RESULT_ARGV_REMINDER_V1 =
+  "Critical output requirement, restated here because it is easy to lose track of while working through a long " +
+  `file: your FINAL message must be exactly one ${FRAME_START_V1} ... ${FRAME_END_V1} result frame and nothing ` +
+  "else — no prose, summary, or commentary before or after it. Use the exact frame format that file specifies. " +
+  "If you have done the work but not emitted the frame, the entire run is discarded, so emit it as your last act.";
 
 export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
   {
@@ -999,7 +1045,22 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
         );
       }
       const args: string[] = [
-        `--print=${context.promptFile}`,
+        // `--print` takes the PROMPT TEXT, not a path (agy --help: "Run a
+        // single prompt non-interactively"). Passing the bare path made the
+        // prompt literally be a filename, so agy opened it with its own file
+        // tools and judged the contents as untrusted material: verified
+        // 2026-08-06 against agy + Claude Opus 4.6 (Thinking), which answered
+        // "This file contains a prompt injection attempt ... I won't follow
+        // those instructions" and did no work at all. Wrapping the path in
+        // the same file-instruction sentence kimi-cli uses names the file as
+        // this run's own authoritative prompt, which is what gets it carried
+        // out. Only the extension-generated path is interpolated, so argv
+        // stays a fixed size regardless of prompt length — the reason this
+        // provider uses a prompt file in the first place.
+        `--print=${buildKimiCliPromptFileInstruction(
+          context.promptFile,
+          context.requiresFramedResult === true
+        )}`,
         // agy's own default is only five minutes, which repeatedly cut off
         // healthy implementation runs after they had already edited files.
         // Leave a five-minute cushion inside Ensemble's one-hour process cap.
@@ -1491,7 +1552,10 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
       // The ONLY argv-borne prompt text is this short, fixed instruction —
       // never the user's own prompt — so nothing here scales with context
       // size. It must directly follow "-p" to be read as that flag's value.
-      args.push("-p", buildKimiCliPromptFileInstruction(context.promptFile));
+      args.push(
+        "-p",
+        buildKimiCliPromptFileInstruction(context.promptFile, context.requiresFramedResult === true)
+      );
       return args;
     },
   },

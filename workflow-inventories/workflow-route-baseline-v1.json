@@ -2122,7 +2122,7 @@
       "kind": "writerEdge",
       "propertyName": "outputFile",
       "path": "src/runners/cliAgentRunner.ts",
-      "span": "L2302-L2302",
+      "span": "L2312-L2312",
       "enclosingSymbol": "run",
       "occurrence": 1,
       "description": "CLI runner echoing the request's output destination in its result after writing the signed output there — the legacy outputFile protocol boundary the runnerV1 cohort replaces with bounded stdout capture.",
