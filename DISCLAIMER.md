@@ -5,7 +5,7 @@
 > **Read this before using any AI-powered feature of this extension.**
 > This document is the single canonical source of the extension's disclaimer.
 > It is also packaged inside the extension and accessible via the Command Palette
-> (`AI Helper: View Disclaimer`) so you can review it inside VS Code at any time.
+> (`Ensemble: View Disclaimer`) so you can review it inside VS Code at any time.
 
 ---
 
@@ -230,4 +230,4 @@ Documentation and disclosures are not a substitute for legal review. No guarante
 
 ---
 
-*VS Code AI Helper is an open-source project. Contributions, forks, and feedback are welcome.*
+*Ensemble is an open-source project. Contributions, forks, and feedback are welcome.*

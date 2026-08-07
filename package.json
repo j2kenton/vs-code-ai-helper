@@ -13,7 +13,7 @@
     "vscode": "^1.93.0"
   },
   "categories": [
-    "Other",
+    "AI",
     "Machine Learning"
   ],
   "icon": "images/icon.png",
@@ -502,13 +502,18 @@
       },
       {
         "view": "vs-code-ai-helper.tasksView",
+        "contents": "Configure a model before starting — Ensemble needs at least one AI model to run a task.\n[Configure AI Models](command:vs-code-ai-helper.openAiModels)",
+        "when": "vs-code-ai-helper.tasksInitialized && !vs-code-ai-helper.isLoadingTasks && !vs-code-ai-helper.modelsConfigured"
+      },
+      {
+        "view": "vs-code-ai-helper.tasksView",
         "contents": "Open a workspace folder to start tracking tasks. Ensemble stores task metadata in `.ensemble`.\n[Start New Task](command:vs-code-ai-helper.startNewTask)",
-        "when": "vs-code-ai-helper.tasksInitialized && !vs-code-ai-helper.isLoadingTasks && !vs-code-ai-helper.hasMetaFolder"
+        "when": "vs-code-ai-helper.tasksInitialized && !vs-code-ai-helper.isLoadingTasks && vs-code-ai-helper.modelsConfigured && !vs-code-ai-helper.hasMetaFolder"
       },
       {
         "view": "vs-code-ai-helper.tasksView",
         "contents": "No tasks yet. Start one to see its workflow progress here.\n[Start New Task](command:vs-code-ai-helper.startNewTask)",
-        "when": "vs-code-ai-helper.tasksInitialized && !vs-code-ai-helper.isLoadingTasks && vs-code-ai-helper.hasMetaFolder && !vs-code-ai-helper.hasTasks"
+        "when": "vs-code-ai-helper.tasksInitialized && !vs-code-ai-helper.isLoadingTasks && vs-code-ai-helper.modelsConfigured && vs-code-ai-helper.hasMetaFolder && !vs-code-ai-helper.hasTasks"
       }
     ],
     "menus": {

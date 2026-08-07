@@ -97,7 +97,7 @@ import { PendingOperationsStore } from "./state/pendingOperationsStore";
 import { recoverActivationCheckpoint } from "./state/taskActivationCoordinator";
 import { readTaskProgressStrictV1 } from "./services/taskProgressReaderV1";
 import { IncompleteTask } from "./types/incompleteTask";
-import { installAutoImplementConfirmation, migrateEnabledProvidersForExistingModels, migrateSettingsNamespace, migrateSettingsScope } from "./config/settings";
+import { getModelSettings, installAutoImplementConfirmation, migrateEnabledProvidersForExistingModels, migrateSettingsNamespace, migrateSettingsScope } from "./config/settings";
 
 /**
  * Run an orchestrator call that throws `ActionConversationErrorV1` on
@@ -391,6 +391,26 @@ export function activate(context: vscode.ExtensionContext): void {
   // migrations, startup recovery, and command registration) can now run
   // without risking the "no data provider" window above.
 
+  // Onboarding: the tasksView welcome content links to AI Models until at
+  // least one stage has a configured model. getModelSettings() already
+  // resolves ensemble.*-over-legacy precedence and folds in the older
+  // primary-only setting, so a single read here is enough.
+  const refreshModelsConfiguredContext = (): void => {
+    const anyModelConfigured = Object.values(getModelSettings()).some((entry) => !!entry?.primary);
+    void vscode.commands.executeCommand(
+      "setContext",
+      "vs-code-ai-helper.modelsConfigured",
+      anyModelConfigured
+    );
+  };
+  refreshModelsConfiguredContext();
+  const modelsConfiguredListener = vscode.workspace.onDidChangeConfiguration((event) => {
+    if (event.affectsConfiguration("ensemble") || event.affectsConfiguration("vs-code-ai-helper")) {
+      refreshModelsConfiguredContext();
+    }
+  });
+  context.subscriptions.push(modelsConfiguredListener);
+
   // Scope migration must resolve before the provider migration, which
   // inspects enabledProviders' post-migration state to decide whether it
   // still needs to run.
@@ -398,7 +418,8 @@ export function activate(context: vscode.ExtensionContext): void {
     .then(() => migrateSettingsScope())
     .catch(error => console.error("Settings scope migration failed", error))
     .then(() => migrateEnabledProvidersForExistingModels())
-    .catch(error => console.error("Provider settings migration failed", error));
+    .catch(error => console.error("Provider settings migration failed", error))
+    .then(() => refreshModelsConfiguredContext());
   context.subscriptions.push(installAutoImplementConfirmation(context));
   // Recover interrupted operations before commands become available. They are
   // retained for reconciliation rather than silently discarded.

@@ -10,6 +10,23 @@
       "preLaunchTask": "${defaultBuildTask}"
     },
     {
+      // First-launch testing: --user-data-dir points at a throwaway settings
+      // store, so this host starts with NO configured models and no prior
+      // state — the state a brand-new user sees. Model settings live at user
+      // level, so the plain "Run Extension" config above inherits your real
+      // ones and cannot reproduce first launch. Delete c:/tmp/ensemble-fresh
+      // between runs to get a genuine first launch again.
+      "name": "Run Extension (fresh profile)",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": [
+        "--extensionDevelopmentPath=${workspaceFolder}",
+        "--user-data-dir=c:/tmp/ensemble-fresh"
+      ],
+      "outFiles": ["${workspaceFolder}/dist/**/*.js"],
+      "preLaunchTask": "${defaultBuildTask}"
+    },
+    {
       "name": "Extension Tests",
       "type": "extensionHost",
       "request": "launch",

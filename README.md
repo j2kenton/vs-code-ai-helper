@@ -1,6 +1,6 @@
 # Ensemble
 
-Ensemble is an agentic workflow system for VS Code. It turns an idea into a supervised, reviewable implementation: capture the task, shape a plan, implement it with the AI provider you choose, and review the result before moving on.
+Ensemble is deterministic AI orchestration for VS Code — not an autonomous agent loop. You stay in control of every stage transition; the AI never decides what happens next. It turns an idea into a supervised, reviewable implementation: capture the task, shape a plan, implement it with the AI provider you choose, and review the result before moving on.
 
 ## The workflow
 

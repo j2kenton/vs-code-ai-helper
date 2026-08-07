@@ -2,7 +2,7 @@
 
 ## Overview
 
-VS Code AI Helper is a personal developer tool that orchestrates AI providers (GitHub Copilot, Claude, Codex, Gemini, Antigravity, Kiro, opencode, Cline, Kimi, devpass-code) to assist with task planning and implementation. This document describes what the extension enforces, what it does not enforce, and how to report vulnerabilities.
+Ensemble is a personal developer tool that orchestrates AI providers (GitHub Copilot, Claude, Codex, Gemini, Antigravity, Kiro, opencode, Cline, Kimi, devpass-code) to assist with task planning and implementation. This document describes what the extension enforces, what it does not enforce, and how to report vulnerabilities.
 
 ---
 
