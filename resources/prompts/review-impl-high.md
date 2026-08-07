@@ -16,7 +16,7 @@ Plans built across multiple implementation rounds. A plan larger than one implem
 Plan progress — required whenever the plan has discrete, countable steps. End your response with this marker on its own line: steps fully implemented and verified, over the number of steps THIS TASK is responsible for delivering.
 
 ```
-<!-- progress: 8/25 -->
+<!-- progress: 6/18 -->
 ```
 
 The denominator is this task's own scope, which is normally just the plan's total step count. It differs only when the plan itself explicitly assigns part of its scope to separate or follow-up tasks (e.g. "delivery is five sequenced tasks, one per stage"). In that case count only the portion THIS task owns — a task delivering an 8-step stage of a 25-step plan reports `8/8` when that stage is done, not `8/25` — and say so in your verdict. Never narrow the scope on your own judgement that something would be better done later; only an explicit division written into the plan counts, and everything else in the plan stays this task's responsibility.
