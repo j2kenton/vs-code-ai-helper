@@ -51,7 +51,11 @@ void describe("recoverLastAiResponse — findMostRecentSpool", () => {
   void it("ignores a newer ordinary broker spool and returns the recovery-marked one", async () => {
     const rootDir = makeRootDir();
     try {
-      let current = new Date("2026-08-06T10:00:00.000Z");
+      // Anchored to NOW, not a fixed calendar date. findMostRecentSpool skips
+      // entries past their own 24h expiresAt, so a hardcoded date turns this
+      // into a time bomb that passes when written and fails exactly 24h later
+      // on any machine — which is precisely what happened.
+      let current = new Date();
       const store = createBoundedResultStoreV1({ rootDir, now: () => current });
 
       const recoveryRef = await store.writeSpool(
@@ -63,7 +67,7 @@ void describe("recoverLastAiResponse — findMostRecentSpool", () => {
 
       // Written LATER (newer createdAt) but never marked — must still lose to
       // the recovery spool above, since it is not a rejected response at all.
-      current = new Date("2026-08-06T11:00:00.000Z");
+      current = new Date(current.getTime() + 60 * 60 * 1000);
       await store.writeSpool(makeCorrelation(), allocateHex128IdV1(), Buffer.from("ordinary, newer"));
 
       const found = findMostRecentSpool(rootDir);
@@ -78,14 +82,14 @@ void describe("recoverLastAiResponse — findMostRecentSpool", () => {
   void it("picks the newest among multiple recovery-marked spools", async () => {
     const rootDir = makeRootDir();
     try {
-      let current = new Date("2026-08-06T10:00:00.000Z");
+      let current = new Date();
       const store = createBoundedResultStoreV1({ rootDir, now: () => current });
 
       await store.writeSpool(makeCorrelation(), allocateHex128IdV1(), Buffer.from("older rejected"), {
         purpose: "recovery",
       });
 
-      current = new Date("2026-08-06T12:00:00.000Z");
+      current = new Date(current.getTime() + 2 * 60 * 60 * 1000);
       const newerRef = await store.writeSpool(
         makeCorrelation(),
         allocateHex128IdV1(),

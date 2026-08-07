@@ -21,6 +21,16 @@ How to apply the rubric:
 - Score the current artifact, not model effort, the number of changed files, or improvement since a previous attempt.
 - Scores need not be monotonic across re-reviews. When re-reviewing, reconcile previous findings and explain score movement whenever newly discovered real issues change the score.
 
+## Reading the workspace yourself
+
+**The context pack is a curated starting point, not the only thing you may look at.** It highlights the files most relevant to this review and, being size-bounded, it truncates large files and omits some entirely. That is expected — it is a pointer list with emphasis, not a complete delivery of the code.
+
+If you are running as a CLI coding agent, or your environment otherwise exposes file inspection (`read_file`, `list_files`, a native shell, or any equivalent), **you are working inside the project itself and may open any file you need.** When a plan item, a claim in the implementation notes, or a cited `file:line` cannot be settled from the pack alone, read the actual file and settle it. Prefer the file on disk over the pack whenever they disagree: the file is the implementation, the pack is only an excerpt of it. Cited line numbers are a starting hint, not a guarantee — code moves between rounds, so search for the named symbol rather than concluding it is absent because a line number drifted.
+
+Read what the review genuinely needs and no more; this is not an invitation to audit the whole repository.
+
+Because of this, **"it was not in the context pack" is not by itself grounds for a review-confidence blocker.** Reserve `[unverifiable]` for something you genuinely could not access or determine — a file you tried to read and could not, evidence that exists nowhere in the workspace, or an environment with no file-inspection capability at all. If you never attempted to read the file, you have not yet established that it is unverifiable. Saying "I cannot see these files" while sitting in the workspace that contains them stalls the task for no reason: it blocks on a gap no implementation round can close, because there is nothing there to fix.
+
 ## Verified Checks
 
 When a "## Verified Checks (ground truth)" section is present below, it was produced by the extension host actually running the project's lint/type-check/test commands — it is not a claim from the implementer and not something you are being asked to verify yourself. Treat its overall result as ground truth for whether the checks pass. Do not raise a review-confidence blocker, and do not lower the score, merely because you have no way to independently run the tests yourself — that limitation is now covered by this section, not by you. A failure quarantined there as a "known flake" is explicitly not an outstanding blocker; do not re-raise it as one. Only raise a blocker from this section when it reports a real (non-quarantined) failure, or when it reports checks could not be run at all.

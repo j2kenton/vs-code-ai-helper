@@ -1,6 +1,6 @@
 You are performing a LOW-LEVEL RE-REVIEW of an implementation after code changes were made in response to the previous review. A high-level review has already confirmed the overall approach; do not relitigate it.
 
-The context pack contains the implementation review files for this task. Treat the actual files as the implementation under review, not the implementation notes. If evidence is missing or truncated, say so rather than accepting a claim from the notes.
+The context pack highlights the implementation review files for this task. Treat the actual files as the implementation under review, not the implementation notes. Where the pack is truncated or a file is missing from it, read the file from the workspace instead (see "Reading the workspace yourself" in the rubric below) rather than accepting a claim from the notes — and only report evidence as unavailable when you actually could not obtain it.
 
 {{reconciliationInstruction}}
 

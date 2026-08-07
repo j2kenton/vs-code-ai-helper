@@ -779,22 +779,22 @@
     },
     {
       "path": "resources/prompts/review-impl-high-rereview.md",
-      "sha256": "3d77571aa46c2d877538e0a026376aecf88582e181a422b3f9adb18bf03b4e1f",
+      "sha256": "fba3df034a1e67610d55fbf9d556f6c58a6e551a2700377a0e23b0f5a39b7e13",
       "category": "runtimeResourceCopy"
     },
     {
       "path": "resources/prompts/review-impl-high.md",
-      "sha256": "2f531c5d88d2bbbb7dbe380e4a8cf6b7c011f3ae73c9a31ed35beed81d9f6f65",
+      "sha256": "b4549ce1cc7ca8d719eecb9b3ce23a75d9942aa415e0f1d4f289a396356a1048",
       "category": "runtimeResourceCopy"
     },
     {
       "path": "resources/prompts/review-impl-low-rereview.md",
-      "sha256": "7a5016201f49db9bef97e3781392b83add0d2c285cc81d0c90c6b0a0cb56f3fd",
+      "sha256": "859e8ddadbe90a5bb28931ebca9d278d073af751a5b63386457adc034807dc00",
       "category": "runtimeResourceCopy"
     },
     {
       "path": "resources/prompts/review-impl-low.md",
-      "sha256": "1641043a5b842f4155a5629defaa979c92f8c10e68212c1a38c4ffab8d060a67",
+      "sha256": "de7dcd6d75d86bab689390c4270e0be6efbff79eec712b7c7e3938af5e0c301a",
       "category": "runtimeResourceCopy"
     },
     {
@@ -819,17 +819,17 @@
     },
     {
       "path": "resources/prompts/review-publish-rereview.md",
-      "sha256": "c43b5a9eca61b745774b9ed5c4df8f87ac4d53cb7201bb5fd0a9fa2bd916e5ed",
+      "sha256": "afaa4053785868f0d03d67785fefc08b5f689ed751c7402e7c4e3bce611f33e5",
       "category": "runtimeResourceCopy"
     },
     {
       "path": "resources/prompts/review-publish.md",
-      "sha256": "88eaae9dfeec253376e3989c5766e1a77ee55217f1f6ff4f097011bf2ae370f2",
+      "sha256": "a89d7080901dbf3927f9203f9bc99b722d11453aaffa09dfbfd19897287d8730",
       "category": "runtimeResourceCopy"
     },
     {
       "path": "resources/prompts/review-scoring-rubric.md",
-      "sha256": "fac8ae07712d41a93b93fb1703ce8a82b5ce9c63d64f9e9e63237cc63cbecb18",
+      "sha256": "9db8d54d06fdf51d266a27ea65d4f09e5943709dba150a9eadbb92b6517aca32",
       "category": "runtimeResourceCopy"
     },
     {

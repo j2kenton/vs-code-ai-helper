@@ -2,7 +2,7 @@ You are performing a PUBLISH-READINESS RE-REVIEW after changes were made in resp
 
 Both implementation review levels have already passed. Do not relitigate architecture or conduct a broad new code review. Your job is to determine whether the previous shipping blockers were resolved and whether the current change is safe to publish.
 
-Treat the files in the context pack as the implementation under review. If relevant evidence is missing or truncated, say so rather than accepting implementation-note claims.
+Treat the actual files as the implementation under review. Where the pack is truncated or omits a file, read it from the workspace instead (see "Reading the workspace yourself" in the rubric below) rather than accepting implementation-note claims — and only report evidence as missing when you actually could not obtain it.
 
 {{reconciliationInstruction}}
 
