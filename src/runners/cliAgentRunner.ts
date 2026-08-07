@@ -32,6 +32,7 @@ import {
 } from "../types/taskProgress";
 import { looksLikeGeneratedImplementationSummary } from "../utils/implementationArtifactResolver";
 import { killProcessTree, sanitizedCliEnv } from "../utils/cliProcessUtils";
+import { readPackageScripts } from "../utils/completionLint";
 
 /**
  * Reserved artifact filenames the implementation stage writes inside a task
@@ -1525,11 +1526,7 @@ export function createCliTextTransportV1(options: {
         return Promise.resolve({ kind: "transportFailure", code: "cliArgumentBuildFailed" });
       }
       if (promptTransport === "argv") {
-        const promptBytes = Buffer.byteLength(request.prompt, "utf8");
-        if (
-          typeof def.maxArgvPromptBytes === "number" &&
-          promptBytes > def.maxArgvPromptBytes
-        ) {
+        if (checkArgvPromptSizeLimitV1(def, request.prompt).exceeds) {
           return Promise.resolve({ kind: "transportFailure", code: "cliPromptTooLarge" });
         }
         args.push(request.prompt);
@@ -1844,6 +1841,38 @@ function toFriendlyError(
 }
 
 /**
+ * (2j) Whether `prompt` would be rejected outright by `def`'s own argv-only
+ * transport ceiling — a structural per-provider limit (verified before this
+ * fix cost 5/5 dispatches to Kimi's now-retired argv transport: 118,611
+ * bytes against a 20,000-byte cap, every single time), not a transient
+ * condition retrying could ever clear. Pure and provider-agnostic so it can
+ * gate dispatch BEFORE any CLI process, retry-loop attempt, or audit-log
+ * entry is spent — see the pre-dispatch calls in CliAgentRunner.run and
+ * runImplementationWithCli below, which use this to skip the provider
+ * entirely rather than let execCliAgent's own (still-present, defense in
+ * depth) check burn a doomed attempt first.
+ */
+export function checkArgvPromptSizeLimitV1(
+  def: CliProviderDefinition,
+  prompt: string
+): { exceeds: false } | { exceeds: true; errorMessage: string } {
+  const maxArgvPromptBytes = def.maxArgvPromptBytes;
+  if ((def.promptTransport ?? "stdin") !== "argv" || typeof maxArgvPromptBytes !== "number") {
+    return { exceeds: false };
+  }
+  const promptBytes = Buffer.byteLength(prompt, "utf8");
+  if (promptBytes <= maxArgvPromptBytes) {
+    return { exceeds: false };
+  }
+  return {
+    exceeds: true,
+    errorMessage:
+      `${def.label} prompt is too large for this CLI mode (${promptBytes} bytes; max ${maxArgvPromptBytes} bytes). ` +
+      "Reduce context or choose a provider that accepts stdin prompts.",
+  };
+}
+
+/**
  * Run a provider CLI once: prompt in via stdin, answer out via stdout (or
  * the provider's last-message file). Cancellation kills the process tree.
  */
@@ -1954,18 +1983,12 @@ export async function execCliAgent(options: {
         errorMessage: `${def.label} provider misconfiguration: argv prompt transport requires shell:false for safe argument passing.`,
       });
     }
-    const promptBytes = Buffer.byteLength(prompt, "utf8");
-    const maxArgvPromptBytes = def.maxArgvPromptBytes;
-    if (
-      typeof maxArgvPromptBytes === "number" &&
-      promptBytes > maxArgvPromptBytes
-    ) {
+    const sizeCheck = checkArgvPromptSizeLimitV1(def, prompt);
+    if (sizeCheck.exceeds) {
       return classifyCliFailure({
         status: "failed",
         output: "",
-        errorMessage:
-          `${def.label} prompt is too large for this CLI mode (${promptBytes} bytes; max ${maxArgvPromptBytes} bytes). ` +
-          "Reduce context or choose a provider that accepts stdin prompts.",
+        errorMessage: sizeCheck.errorMessage,
       });
     }
     args.push(prompt);
@@ -2269,6 +2292,30 @@ export class CliAgentRunner implements AgentRunner {
     request: AgentRunRequest,
     token: vscode.CancellationToken
   ): Promise<AgentRunResult> {
+    // (2j) A provider's own argv-transport ceiling is a structural,
+    // guaranteed failure, never a transient one — check it before the retry
+    // loop below even starts. Without this, the loop still "worked" (the
+    // in-dispatch check inside execCliAgent fails fast and shouldRetryReadOnlyRun
+    // refuses to retry a non-transient result), but only after spending one
+    // full dispatch + retry-audit entry on a run that could never succeed.
+    // Skipping here spends zero attempts. Same classification
+    // (temporarily-unavailable) execCliAgent's own check would have produced,
+    // so every downstream backup-cascade decision is unaffected.
+    const sizeCheck = checkArgvPromptSizeLimitV1(this.def, request.prompt);
+    if (sizeCheck.exceeds) {
+      const classified = classifyCliFailure({
+        status: "failed" as const,
+        output: "",
+        errorMessage: sizeCheck.errorMessage,
+      });
+      return {
+        runnerId: this.id,
+        status: "failed",
+        errorMessage: classified.errorMessage,
+        failureKind: classified.failureKind,
+      };
+    }
+
     // Ordinary read-only text runs replay transient failures. Providers with
     // a conversationResume contract instead continue the just-failed
     // conversation, preserving its context and any partial workspace edits.
@@ -2555,6 +2602,114 @@ function toCliImplementationRunResult(
   };
 }
 
+export interface PostImplementationTypeCheckResult {
+  passed: boolean;
+  /** Truncated combined stdout+stderr — only populated when `passed` is false. */
+  output: string;
+}
+
+const TYPE_CHECK_OUTPUT_MAX_CHARS = 4000;
+const TYPE_CHECK_TIMEOUT_MS = 120_000;
+
+function truncateTypeCheckOutputV1(output: string): string {
+  const trimmed = output.trim();
+  return trimmed.length > TYPE_CHECK_OUTPUT_MAX_CHARS
+    ? `${trimmed.slice(0, TYPE_CHECK_OUTPUT_MAX_CHARS)}\n… (truncated)`
+    : trimmed;
+}
+
+/**
+ * Run the project's type-check after an implementation round (plan §2g): a
+ * round that leaves the tree non-compiling must never be handed to a
+ * reviewer as if it were reviewable — a reviewer that instead diagnoses a
+ * build failure has wasted its round (observed directly: a quota kill
+ * mid-write left a truncated file with 24 TS errors, surfaced a full review
+ * round later as a 6.5 → 4.4 "Regressed" score spent diagnosing the break
+ * instead of reviewing the work).
+ *
+ * Prefers the repo's own `check-types` package.json script — the same
+ * command a human (or `npm run verify`) would run — and falls back to a bare
+ * `npx tsc --noEmit` when no such script is declared. Any infrastructure
+ * failure (the tool itself missing, a cancelled round) reports `passed: true`
+ * rather than a false positive: this check exists to catch a broken BUILD,
+ * not to gate on unrelated environment gaps — that distinction is exactly
+ * what 1d's environment-disclosure item is for at the review stage.
+ */
+export async function runProjectTypeCheckV1(
+  cwd: string,
+  token: vscode.CancellationToken
+): Promise<PostImplementationTypeCheckResult> {
+  if (token.isCancellationRequested) {
+    return { passed: true, output: "" };
+  }
+  const scripts = readPackageScripts(cwd);
+  const hasCheckTypesScript = typeof scripts?.["check-types"] === "string";
+  const command = hasCheckTypesScript ? "npm" : "npx";
+  const args = hasCheckTypesScript ? ["run", "check-types"] : ["tsc", "--noEmit"];
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (result: PostImplementationTypeCheckResult): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      resolve(result);
+    };
+
+    let child: cp.ChildProcess;
+    try {
+      child = cp.spawn(command, args, {
+        cwd,
+        // Windows needs a shell to resolve the npm/npx .cmd shim; POSIX
+        // shells resolve the real executable directly (see runCheck in
+        // completionLint.ts for the same platform split).
+        shell: process.platform === "win32",
+        env: sanitizedCliEnv(),
+        windowsHide: true,
+      });
+    } catch {
+      finish({ passed: true, output: "" });
+      return;
+    }
+
+    let output = "";
+    child.stdout?.on("data", (chunk: Buffer) => { output += chunk.toString("utf8"); });
+    child.stderr?.on("data", (chunk: Buffer) => { output += chunk.toString("utf8"); });
+
+    const timer = setTimeout(() => {
+      killProcessTree(child);
+      finish({
+        passed: false,
+        output: truncateTypeCheckOutputV1(
+          `${output}\n[type-check timed out after ${TYPE_CHECK_TIMEOUT_MS}ms]`
+        ),
+      });
+    }, TYPE_CHECK_TIMEOUT_MS);
+
+    const cancellation = token.onCancellationRequested(() => {
+      clearTimeout(timer);
+      killProcessTree(child);
+      finish({ passed: true, output: "" });
+    });
+
+    child.on("error", () => {
+      clearTimeout(timer);
+      cancellation.dispose();
+      finish({ passed: true, output: "" });
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      cancellation.dispose();
+      finish(
+        code === 0
+          ? { passed: true, output: "" }
+          : { passed: false, output: truncateTypeCheckOutputV1(output) }
+      );
+    });
+  });
+}
+
 /**
  * Run an agentic implementation with a vendor CLI: the CLI edits files in
  * the workspace itself (with edit-level permissions only), and the files it
@@ -2582,9 +2737,39 @@ export async function runImplementationWithCli(options: {
   stage?: AgentWorkflowStage;
   /** Test seam; production uses CLI_RETRY_DELAY_MS. */
   retryDelayMs?: number;
+  /**
+   * Test seam (2g); production always uses runProjectTypeCheckV1. Lets a
+   * test substitute a fake type-check outcome instead of spawning a real
+   * compiler.
+   */
+  typeCheckRunner?: (
+    cwd: string,
+    token: vscode.CancellationToken
+  ) => Promise<PostImplementationTypeCheckResult>;
 }): Promise<ImplementationRunResult> {
   const { def, model, prompt, workspaceUri, token, onProgress, requireFileChange } = options;
   const cwd = workspaceUri.fsPath;
+
+  // (2j) Same structural, guaranteed-failure pre-check as CliAgentRunner.run
+  // (text mode) above — see its comment. Checked before the git snapshot and
+  // any dispatch: nothing ran, so filesChanged is definitively empty rather
+  // than unknown, which keeps the caller's dirty-tree cascade gate reading
+  // this as safe to continue past.
+  const sizeCheck = checkArgvPromptSizeLimitV1(def, prompt);
+  if (sizeCheck.exceeds) {
+    const classified = classifyCliFailure({
+      status: "failed" as const,
+      output: "",
+      errorMessage: sizeCheck.errorMessage,
+    });
+    return {
+      status: "failed",
+      filesChanged: [],
+      filesChangedUnknown: false,
+      errorMessage: classified.errorMessage,
+      failureKind: classified.failureKind,
+    };
+  }
 
   onProgress(`Using ${def.label}...`);
   const before = await gitStatusSnapshot(cwd);
@@ -2717,7 +2902,7 @@ export async function runImplementationWithCli(options: {
     );
   }
 
-  return toCliImplementationRunResult(
+  const implResult = toCliImplementationRunResult(
     def,
     result,
     filesChanged,
@@ -2729,4 +2914,23 @@ export async function runImplementationWithCli(options: {
     // callers already treat no-change completions as success.
     getResilienceSettings().nothingToFixRoutesToReview
   );
+
+  // (2g) Only worth checking a round that actually left real, known edits —
+  // a failed/cancelled run or a genuine no-op has nothing new to compile,
+  // and an unknown change set already routes to manual review regardless.
+  if (
+    implResult.status === "completed" &&
+    !filesChangedUnknown &&
+    filesChanged.length > 0 &&
+    !token.isCancellationRequested
+  ) {
+    onProgress("Verifying the project still type-checks...");
+    const typeCheck = await (options.typeCheckRunner ?? runProjectTypeCheckV1)(cwd, token);
+    if (!typeCheck.passed) {
+      onProgress(`${def.label}'s changes left the project failing to type-check.`);
+      return { ...implResult, typeCheckFailed: true, typeCheckOutput: typeCheck.output };
+    }
+  }
+
+  return implResult;
 }

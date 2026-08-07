@@ -1,5 +1,5 @@
 {
   "schemaVersion": 1,
-  "description": "Removed workflow routes (plan §1.2/§1.5): each entry records the removed route's source evidence, rationale, and the cohort that removed it. scripts/verifyWorkflowRoutes.mjs fails if a removed commandId reappears in the live registration scan. Empty until a cohort actually removes a route — no route has been removed since the route baseline was established.",
+  "description": "Removed workflow routes (plan §1.2/§1.5/§2l): each entry records the removed route's source evidence, rationale, the cohort that removed it, and a surfaceKind classification (\"internalRoute\" or \"userFacingContribution\"). scripts/verifyWorkflowRoutes.mjs fails if a removed commandId reappears in the live registration scan, and fails any userFacingContribution entry (a package.json contributes.commands/menu removal) that lacks an approvedScopeDecision recording explicit human approval — removing user-facing surface is a higher class of change than an internal route removal (plan §2l). Empty until a cohort actually removes a route — no route has been removed since the route baseline was established.",
   "removals": []
 }

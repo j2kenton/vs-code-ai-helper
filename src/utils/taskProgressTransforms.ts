@@ -11,6 +11,7 @@
  * are not part of this boundary").
  */
 import {
+  ImplementationTypeCheckFailure,
   MAX_REVIEW_REJECTIONS,
   MAX_REVIEW_SCORE_HISTORY,
   ReviewRejectionEntry,
@@ -250,6 +251,38 @@ export function clearEscalation(progress: TaskProgress): TaskProgress {
     return progress;
   }
   const { escalation: _unused, ...rest } = progress;
+  return {
+    ...rest,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * Record that a post-implementation type-check (2g) failed on a round that
+ * DID change files, so the caller can surface it immediately instead of
+ * handing a non-compiling tree to a reviewer as if it were reviewable.
+ */
+export function recordImplementationTypeCheckFailure(
+  progress: TaskProgress,
+  failure: ImplementationTypeCheckFailure
+): TaskProgress {
+  return {
+    ...progress,
+    implementationTypeCheckFailure: failure,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * Clear a recorded type-check failure once a later implementation round
+ * completes with a passing (or skipped) type-check, so a stale failure from
+ * an earlier round never lingers past the round that fixed it.
+ */
+export function clearImplementationTypeCheckFailure(progress: TaskProgress): TaskProgress {
+  if (!progress.implementationTypeCheckFailure) {
+    return progress;
+  }
+  const { implementationTypeCheckFailure: _unused, ...rest } = progress;
   return {
     ...rest,
     updatedAt: new Date().toISOString(),

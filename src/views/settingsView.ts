@@ -1050,6 +1050,16 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               markDirty();
             }
           });
+          // The strategy <select> is a native element (unlike the JS-driven
+          // model comboboxes, which call updateAccountWarningFor directly on
+          // selection), so a same-account warning that depends on it needs
+          // its own delegated 'change' listener.
+          document.getElementById('stages-tbody').addEventListener('change', event => {
+            const row = event.target.closest('.stage-row');
+            if (row) {
+              updateAccountWarningFor(row.id.replace('row-', ''));
+            }
+          });
 
           // Tell the extension host this document's listener is attached
           // and ready to receive "init".
@@ -1090,6 +1100,32 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               return 'opencode-cli';
             }
             return providers.some(p => p.id === prefix) ? prefix : 'copilot';
+          }
+
+          // A same-account backup shares its primary's session/quota limit
+          // (plan §5b/25): a Claude session limit is account-wide, so a
+          // backup on the same account hits the identical limit the primary
+          // just failed on, and the fallback cascade stalls. Only meaningful
+          // when the stage would actually fall back to a backup.
+          function updateAccountWarningFor(stage) {
+            const row = document.getElementById('row-' + stage);
+            const warningEl = row ? row.querySelector('.account-warning') : null;
+            if (!row || !warningEl) return;
+            const strategySelect = document.getElementById('strategy-' + stage);
+            const usesBackup = strategySelect && strategySelect.value === 'switch-to-backup';
+            const primaryHidden = document.getElementById('primary-' + stage);
+            const primaryId = primaryHidden ? primaryHidden.value : '';
+            const primaryAccount = primaryId ? providerIdOfModelId(primaryId) : '';
+            const backupHiddenInputs = Array.from(
+              row.querySelectorAll('.model-combobox[data-kind^="backup"] input[type="hidden"]')
+            );
+            const sameAccountBackup = usesBackup && primaryAccount && backupHiddenInputs.some(input =>
+              input.value && providerIdOfModelId(input.value) === primaryAccount
+            );
+            warningEl.hidden = !sameAccountBackup;
+            warningEl.textContent = sameAccountBackup
+              ? 'This backup uses the same provider account as the primary model. A session limit or quota outage on the primary will affect this backup too, so the fallback may not help — choose a backup on a different account where possible.'
+              : '';
           }
 
           function isProviderChecked(providerId) {
@@ -1234,6 +1270,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               input.value = id ? label : '';
               closeList();
               markDirty();
+              updateAccountWarningFor(stage);
             }
 
             function reconcileExactValue() {
@@ -1272,6 +1309,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             input.addEventListener('input', () => {
               hidden.value = '';
               renderOptions();
+              updateAccountWarningFor(stage);
             });
 
             input.addEventListener('focus', () => {
@@ -1356,10 +1394,12 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               item.remove();
               syncBackupLimitFor(row);
               markDirty();
+              updateAccountWarningFor(stage);
             });
             container.appendChild(item);
             setupModelCombobox(item, kind, stage);
             syncBackupLimitFor(row);
+            updateAccountWarningFor(stage);
           }
 
           function syncBackupLimitFor(row) {
@@ -1448,6 +1488,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                   <div class="extra-backups"></div>
                   <button type="button" class="secondary add-backup" title="Add another backup model for this stage">+ Add another backup</button>
                   <span class="backup-limit">1/10</span>
+                  <div class="provider-warning account-warning" id="account-warning-\${stage}" hidden></div>
                 </div>
               \`;
 
@@ -1461,6 +1502,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                 addExtraBackupCombobox(row, stage, '');
               });
               syncBackupLimitFor(row);
+              updateAccountWarningFor(stage);
             });
           }
 

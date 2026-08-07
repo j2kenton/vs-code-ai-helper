@@ -61,6 +61,13 @@
  *    route ROW — a mechanical gate call alone never satisfies coverage.
  *  - A removed route (workflow-route-removals-v1.json) fails if it
  *    reappears in the live scan.
+ *  - A removal must classify its surfaceKind ("internalRoute" or
+ *    "userFacingContribution" — a package.json contributes.commands/menu
+ *    entry). A "userFacingContribution" removal additionally requires an
+ *    approvedScopeDecision recording explicit human approval before it can
+ *    ship — removing user-facing product surface is a higher class of
+ *    change than removing internal scaffolding and is never authorized by
+ *    a review score alone (plan §2l).
  *  - Unannotated drift from the immutable pre-gate snapshot fails.
  *
  * USAGE
@@ -535,19 +542,122 @@ function verifyAgainstScan({ scan, roots, baseline, annotations, removals, recor
   if (checkRemovals) {
     const removalEntries = removals?.removals || [];
     for (const removal of removalEntries) {
-      const label = `removal:${removal.commandId ?? removal.path ?? "?"}`;
-      for (const field of ["rationale", "removedInCohort", "sourceEvidence"]) {
-        if (typeof removal[field] !== "string" || removal[field].length === 0) {
-          record(`${label} is missing required field "${field}" (workflow-route-removal-v1.schema.json).`);
-        }
-      }
-      if (typeof removal.commandId === "string") {
-        const returned = scan.commandRegistrations.some((r) => r.commandId === removal.commandId);
-        if (returned) {
-          record(`${label}: removed route ${removal.commandId} has returned to the live scan — a removed route requires a verifier that fails if it returns (plan §1.5).`);
-        }
+      const commandStillRegistered =
+        typeof removal.commandId === "string" &&
+        scan.commandRegistrations.some((r) => r.commandId === removal.commandId);
+      for (const message of validateRemovalEntry(removal, { commandStillRegistered })) {
+        record(message);
       }
     }
+  }
+}
+
+/** Surface classes a removal entry may declare (plan §2l). */
+const REMOVAL_SURFACE_KINDS = new Set(["internalRoute", "userFacingContribution"]);
+
+/**
+ * Pure validator for a single workflow-route-removals-v1.json entry, shared
+ * by verifyAgainstScan's removals pass and runRemovalClassificationSelfTest.
+ * Returns the list of failure messages for this entry (empty when clean).
+ *
+ * Every removal must classify itself as an internal route removal or a
+ * removal of a package.json contributes.commands/menu entry
+ * ("userFacingContribution"). The latter is a distinct, higher class of
+ * change (plan §2l): removing user-facing product surface must carry an
+ * approvedScopeDecision recording that a human explicitly approved the
+ * removal — the mechanical review-score gate can never authorize it alone.
+ */
+function validateRemovalEntry(removal, { commandStillRegistered }) {
+  const messages = [];
+  const label = `removal:${removal.commandId ?? removal.path ?? "?"}`;
+  for (const field of ["rationale", "removedInCohort", "sourceEvidence"]) {
+    if (typeof removal[field] !== "string" || removal[field].length === 0) {
+      messages.push(`${label} is missing required field "${field}" (workflow-route-removal-v1.schema.json).`);
+    }
+  }
+  if (!REMOVAL_SURFACE_KINDS.has(removal.surfaceKind)) {
+    messages.push(
+      `${label} is missing a valid "surfaceKind" (must be "internalRoute" or "userFacingContribution") — every ` +
+        `removal must classify whether it removed a package.json contributes.commands/menu entry (plan §2l).`
+    );
+  } else if (removal.surfaceKind === "userFacingContribution") {
+    if (typeof removal.approvedScopeDecision !== "string" || removal.approvedScopeDecision.length === 0) {
+      messages.push(
+        `${label} removes a user-facing contribution (contributes.commands/menu) but carries no ` +
+          `"approvedScopeDecision" — removing user-facing surface requires explicit recorded human approval before ` +
+          `it can ship (plan §2l).`
+      );
+    }
+  }
+  if (typeof removal.commandId === "string" && commandStillRegistered) {
+    messages.push(
+      `${label}: removed route ${removal.commandId} has returned to the live scan — a removed route requires a ` +
+        `verifier that fails if it returns (plan §1.5).`
+    );
+  }
+  return messages;
+}
+
+/**
+ * Self-test for validateRemovalEntry (mirrors runExtractorSelfTest's
+ * pattern): runs on every invocation against synthetic entries, never the
+ * checked-in (currently empty) removals file, so the classification gate
+ * itself is proven before any real removal is trusted.
+ */
+function runRemovalClassificationSelfTest(record) {
+  const base = {
+    commandId: "vs-code-ai-helper.fixture.selfTestRemoval",
+    rationale: "self-test fixture",
+    removedInCohort: "selfTest",
+    sourceEvidence: "n/a — synthetic self-test entry",
+  };
+  const missingSurfaceKind = validateRemovalEntry({ ...base }, { commandStillRegistered: false });
+  if (!missingSurfaceKind.some((m) => m.includes('"surfaceKind"'))) {
+    record("Removal classification self-test failed: an entry with no surfaceKind must be rejected (plan §2l).");
+  }
+  const userFacingNoApproval = validateRemovalEntry(
+    { ...base, surfaceKind: "userFacingContribution" },
+    { commandStillRegistered: false }
+  );
+  if (!userFacingNoApproval.some((m) => m.includes("approvedScopeDecision"))) {
+    record(
+      "Removal classification self-test failed: a userFacingContribution removal with no approvedScopeDecision " +
+        "must be rejected (plan §2l)."
+    );
+  }
+  const userFacingApproved = validateRemovalEntry(
+    {
+      ...base,
+      surfaceKind: "userFacingContribution",
+      approvedScopeDecision: "self-test fixture: explicit approval recorded",
+    },
+    { commandStillRegistered: false }
+  );
+  if (userFacingApproved.length !== 0) {
+    record(
+      `Removal classification self-test failed: a fully-evidenced userFacingContribution removal must pass, got: ` +
+        userFacingApproved.join("; ")
+    );
+  }
+  const internalRouteNoApproval = validateRemovalEntry(
+    { ...base, surfaceKind: "internalRoute" },
+    { commandStillRegistered: false }
+  );
+  if (internalRouteNoApproval.length !== 0) {
+    record(
+      `Removal classification self-test failed: an internalRoute removal must not require approvedScopeDecision, ` +
+        `got: ${internalRouteNoApproval.join("; ")}`
+    );
+  }
+  const returnedToLiveScan = validateRemovalEntry(
+    { ...base, surfaceKind: "internalRoute" },
+    { commandStillRegistered: true }
+  );
+  if (!returnedToLiveScan.some((m) => m.includes("has returned to the live scan"))) {
+    record(
+      "Removal classification self-test failed: a removed commandId still present in the live scan must be " +
+        "rejected (plan §1.5)."
+    );
   }
 }
 
@@ -611,6 +721,7 @@ function main() {
     fail(message);
   };
   runExtractorSelfTest(record);
+  runRemovalClassificationSelfTest(record);
   // Fixture-provenance gate (plan §3.10's checked-in evidence-base rule,
   // extended to this tree per the implementation review): every extractor
   // self-test fixture must carry a README row recording the extraction rule

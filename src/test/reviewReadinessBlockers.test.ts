@@ -8,6 +8,7 @@ import {
   isPlanIncomplete,
   meetsAutoAdvanceThreshold,
   readyToAdvanceStage,
+  detectSiblingReviewDisagreement,
 } from "../utils/reviewReadiness";
 
 void describe("parseReviewBlockers", () => {
@@ -381,5 +382,117 @@ void describe("isPlanIncomplete", () => {
         `advance decision must equal !isPlanIncomplete for ${JSON.stringify(progress)}`
       );
     }
+  });
+});
+
+/**
+ * Coverage for 2k (reconcile sibling reviews of the same commit): the
+ * task_5 evidence was impl-high reporting "18 of 18 ordered steps complete"
+ * while impl-low, on the same commit, reported required steps missing.
+ * Deliberately conservative — every negative case below is a reason the
+ * function must refuse to claim a contradiction rather than risk a false one.
+ */
+void describe("detectSiblingReviewDisagreement (2k)", () => {
+  const SHA = "abc1234";
+
+  function implHigh(progress: string, sha: string = SHA): string {
+    return `Readiness: 9/10\n\nSummary verdict — on track.\n\n<!-- progress: ${progress} -->\n<!-- reviewed-commit: ${sha} -->\n`;
+  }
+
+  function implLow(blockersBlock: string, sha: string = SHA): string {
+    return `Readiness: 8/10\n\nSummary verdict — needs changes.\n\n<!-- blockers:start -->\n${blockersBlock}\n<!-- blockers:end -->\n<!-- reviewed-commit: ${sha} -->\n`;
+  }
+
+  void it("detects the contradiction: impl-high says complete, impl-low reports a completion blocker, same commit", () => {
+    const result = detectSiblingReviewDisagreement(
+      implHigh("18/18"),
+      implLow("- [completion] [task-fixable] steps 5-18 do not exist yet"),
+      SHA
+    );
+    assert.ok(result);
+    assert.deepStrictEqual(result.implHighProgress, { complete: 18, total: 18 });
+    assert.strictEqual(result.implLowCompletionBlockers.length, 1);
+    assert.strictEqual(
+      result.implLowCompletionBlockers[0]?.description,
+      "steps 5-18 do not exist yet"
+    );
+  });
+
+  void it("returns null when impl-high itself reports the plan incomplete (nothing to contradict)", () => {
+    const result = detectSiblingReviewDisagreement(
+      implHigh("6/18"),
+      implLow("- [completion] [task-fixable] steps 7-18 do not exist yet"),
+      SHA
+    );
+    assert.strictEqual(result, null);
+  });
+
+  void it("returns null when impl-low reports no completion-category blocker", () => {
+    const result = detectSiblingReviewDisagreement(
+      implHigh("18/18"),
+      implLow("- [review-confidence] [environmental] flaky temp-dir cleanup"),
+      SHA
+    );
+    assert.strictEqual(result, null);
+  });
+
+  void it("returns null when impl-low reports zero blockers at all", () => {
+    const result = detectSiblingReviewDisagreement(
+      implHigh("18/18"),
+      "Readiness: 9/10\n\nblockers: none\n\n<!-- reviewed-commit: " + SHA + " -->\n",
+      SHA
+    );
+    assert.strictEqual(result, null);
+  });
+
+  void it("returns null when the two sibling reviews reviewed different commits", () => {
+    const result = detectSiblingReviewDisagreement(
+      implHigh("18/18", "sha-high"),
+      implLow("- [completion] [task-fixable] steps 5-18 do not exist yet", "sha-low"),
+      "sha-high"
+    );
+    assert.strictEqual(result, null);
+  });
+
+  void it("returns null when the siblings agree with each other but not with the commit publish is about to review", () => {
+    // Both impl-high and impl-low reviewed the same (now stale) commit —
+    // that is 2i's problem, not 2k's; comparing against an older commit than
+    // the one currently under review would manufacture a false positive.
+    const result = detectSiblingReviewDisagreement(
+      implHigh("18/18", SHA),
+      implLow("- [completion] [task-fixable] steps 5-18 do not exist yet", SHA),
+      "a-newer-commit-sha"
+    );
+    assert.strictEqual(result, null);
+  });
+
+  void it("returns null when either review is missing its reviewed-commit marker", () => {
+    const noMarkerHigh = "Readiness: 9/10\n\n<!-- progress: 18/18 -->\n";
+    const result = detectSiblingReviewDisagreement(
+      noMarkerHigh,
+      implLow("- [completion] [task-fixable] steps 5-18 do not exist yet"),
+      SHA
+    );
+    assert.strictEqual(result, null);
+  });
+
+  void it("returns null when either review artifact is missing", () => {
+    assert.strictEqual(
+      detectSiblingReviewDisagreement(undefined, implLow("- [completion] [task-fixable] x"), SHA),
+      null
+    );
+    assert.strictEqual(
+      detectSiblingReviewDisagreement(implHigh("18/18"), undefined, SHA),
+      null
+    );
+  });
+
+  void it("returns null when the current reviewed-commit sha is unknown", () => {
+    const result = detectSiblingReviewDisagreement(
+      implHigh("18/18"),
+      implLow("- [completion] [task-fixable] steps 5-18 do not exist yet"),
+      undefined
+    );
+    assert.strictEqual(result, null);
   });
 });

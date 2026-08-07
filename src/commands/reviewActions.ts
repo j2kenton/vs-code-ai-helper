@@ -28,7 +28,13 @@ import {
 } from "../types/taskProgress";
 import { TaskProgress } from "../types/taskProgress";
 import { deriveTaskBindingV1 } from "../types/taskBindingV1";
-import { appendReviewRejection, appendReviewScoreHistory, updateTaskStatus } from "../utils/taskProgressTransforms";
+import {
+  appendReviewRejection,
+  appendReviewScoreHistory,
+  clearImplementationTypeCheckFailure,
+  recordImplementationTypeCheckFailure,
+  updateTaskStatus,
+} from "../utils/taskProgressTransforms";
 import { IncompleteTask } from "../types/incompleteTask";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
@@ -113,6 +119,7 @@ import {
   parseReviewBlockersDetailed,
   parseReviewedCommitSha,
   parseReviewProgress,
+  detectSiblingReviewDisagreement,
 } from "../utils/reviewReadiness";
 import { scheduleAutomationChain, releaseAutomationChain } from "../utils/automationChain";
 import { buildPlanItemVerificationSection, buildVerifiedChecksSection, collectCompletionLintPreview, resolvePublishScopeFolder } from "../utils/completionLint";
@@ -1073,6 +1080,57 @@ export async function selectReconciliationInstruction(
     "state from the context pack and the workspace directly, and treat the previous review only as history: " +
     "useful context on what earlier rounds found, not a baseline whose blockers must each be individually " +
     "addressed as resolved/partially resolved/unresolved."
+  );
+}
+
+/**
+ * Build the `{{siblingReviewDisagreement}}` block for the Publish review
+ * prompt (2k): when the impl-high and impl-low reviews of the exact commit
+ * Publish is about to assess disagree on whether the plan is actually
+ * complete, render that contradiction as an explicit block the reviewer must
+ * address — rather than letting it sit silently in two separate artifacts
+ * that publish would otherwise average into one verdict.
+ *
+ * Reads the two sibling review artifacts directly (they are prior stages,
+ * already written by the time Publish runs) rather than depending on the
+ * caller to have them on hand. Returns "" when either artifact is missing or
+ * {@link detectSiblingReviewDisagreement} finds no mechanical contradiction —
+ * the publish template renders nothing in that case.
+ *
+ * @internal exported for testing
+ */
+export async function buildSiblingReviewDisagreementVariable(
+  folderUri: vscode.Uri,
+  currentReviewedCommitSha: string | undefined
+): Promise<string> {
+  const implHighUri = artifactUri(folderUri, "impl-high-review");
+  const implLowUri = artifactUri(folderUri, "impl-low-review");
+  const [implHighReview, implLowReview] = await Promise.all([
+    implHighUri ? readNonEmptyText(implHighUri) : Promise.resolve(undefined),
+    implLowUri ? readNonEmptyText(implLowUri) : Promise.resolve(undefined),
+  ]);
+  const disagreement = detectSiblingReviewDisagreement(
+    implHighReview,
+    implLowReview,
+    currentReviewedCommitSha
+  );
+  if (!disagreement) {
+    return "";
+  }
+  const { implHighProgress, implLowCompletionBlockers } = disagreement;
+  const blockerLines = implLowCompletionBlockers
+    .map((b) => `- ${b.description}`)
+    .join("\n");
+  return (
+    "## Sibling Review Disagreement (mechanical check)\n\n" +
+    `The high-level implementation review reported the plan fully complete ` +
+    `(${implHighProgress.complete} of ${implHighProgress.total} ordered steps) for this exact commit, ` +
+    "but the low-level implementation review reported the following completion blocker(s) for the SAME commit:\n\n" +
+    `${blockerLines}\n\n` +
+    "These two reviews assessed the identical commit and disagree on a factual, checkable claim — whether the " +
+    "required plan items actually exist. Do not silently average this into your verdict: derive the current " +
+    "state from the context pack and the workspace directly, state explicitly which review's claim is correct, " +
+    "and reflect that in your shipping blockers or verdict."
   );
 }
 
@@ -2153,6 +2211,12 @@ export async function runReviewForFolder(
     variables.verifiedChecks = checks.verifiedChecks;
     if (checks.planItemVerification !== undefined) {
       variables.planItemVerification = checks.planItemVerification;
+    }
+    if (targetStage === "publish") {
+      variables.siblingReviewDisagreement = await buildSiblingReviewDisagreementVariable(
+        folderUri,
+        variables.reviewedCommitSha
+      );
     }
   }
 
@@ -4635,7 +4699,11 @@ async function executeImplementationRun(
     result.filesChanged.length > 0
       ? result.filesChanged.map((f) => `- ${f}`).join("\n")
       : "_none recorded_"
-  }\n\n${result.summary ?? result.errorMessage ?? ""}`;
+  }\n\n${result.summary ?? result.errorMessage ?? ""}${
+    result.typeCheckFailed
+      ? `\n\n## Type-check failure (2g)\n\nThe project no longer type-checks after this round's edits:\n\n\`\`\`\n${result.typeCheckOutput ?? ""}\n\`\`\`\n`
+      : ""
+  }`;
 
   const logUri = await writeRunLog(folderUri, result.runnerId, "impl", logContent);
   // No handle in scope here either — resolve the task's live root operation.
@@ -4726,9 +4794,20 @@ async function executeImplementationRun(
       const alreadyAtOrPastImplementation =
         currentProgress.currentStage === "impl" ||
         isReviewStage(currentProgress.currentStage);
-      const stageUpdated = alreadyAtOrPastImplementation
+      const stageBase = alreadyAtOrPastImplementation
         ? currentProgress
         : { ...currentProgress, currentStage: "impl" as TaskStage };
+      // (2g) Record a failing post-round type-check so it surfaces even if
+      // the user isn't watching this run's notifications; clear a
+      // previously-recorded one once a later round's type-check passes (or
+      // is skipped) again, so a stale failure never lingers past the round
+      // that fixed it.
+      const stageUpdated = result!.typeCheckFailed
+        ? recordImplementationTypeCheckFailure(stageBase, {
+            at: new Date().toISOString(),
+            output: result!.typeCheckOutput ?? "",
+          })
+        : clearImplementationTypeCheckFailure(stageBase);
 
       // filesChangedUnknown means THIS run's own change detection failed.
       // Leave implReviewFiles untouched rather than clearing it. A completed
@@ -4763,6 +4842,22 @@ async function executeImplementationRun(
       }
       return stageUpdated;
     });
+
+    // (2g) A round that leaves the tree non-compiling must never be handed
+    // to a reviewer as if it were reviewable. The edits and the failure are
+    // already durably recorded above (implReviewFiles +
+    // implementationTypeCheckFailure), so a human can inspect and fix the
+    // build, or the next implementation round can retry — but auto-advance
+    // and any review dispatch below must not run against a broken build.
+    if (result.typeCheckFailed) {
+      NotificationRouter.showWarning(
+        "⚠️ Implementation finished, but the project no longer type-checks. " +
+          "The round's edits were kept and recorded for review, but automated review has been " +
+          "paused until the build is fixed — see the implementation run log for the type-check output."
+      );
+      await safeOpenTextDocument(logUri, "implementation run log");
+      return false;
+    }
 
     if (isReviewStage(postRunReviewStage)) {
       const reviewUri = artifactUri(folderUri, postRunReviewStage);

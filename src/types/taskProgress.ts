@@ -203,6 +203,23 @@ export interface TaskProgress {
    * stage transition and whenever the user explicitly resumes iteration.
    */
   escalation?: TaskEscalation;
+  /**
+   * Set when a post-implementation type-check (2g) fails on a round that DID
+   * change files — a truncated tsc/build error left the tree non-compiling.
+   * Surfaced immediately so the round is never handed to a reviewer as if it
+   * were reviewable (a reviewer that instead diagnoses a build failure has
+   * wasted its round). Cleared the next time an implementation round
+   * completes with a passing (or skipped) type-check.
+   */
+  implementationTypeCheckFailure?: ImplementationTypeCheckFailure;
+}
+
+/** `TaskProgress.implementationTypeCheckFailure` — one round's failing type-check. */
+export interface ImplementationTypeCheckFailure {
+  /** ISO timestamp the failing type-check was recorded. */
+  at: string;
+  /** Truncated compiler/build output, for display. */
+  output: string;
 }
 
 /**

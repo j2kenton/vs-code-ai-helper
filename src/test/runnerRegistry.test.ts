@@ -1454,20 +1454,23 @@ void describe("runImplementationForModel", () => {
     }
   });
 
-  // Codex review finding (P1): the backup cascade dispatched a DIFFERENT
-  // model at the current working tree the moment failureKind alone said
-  // quota/temporarily-unavailable, with no check for whether the PRIMARY
-  // run already wrote partial changes before it failed — unlike the
-  // same-model retry path in runImplementationWithCli, which already
-  // refuses to retry without a clean git snapshot. Especially reachable for
-  // Cline/Antigravity, whose edit mode keeps every tool auto-approved right
-  // up to a timeout/kill, but the gate applies to every provider uniformly
-  // (filesChanged is computed the same way for all of them).
-  void it("does not cascade to backup when the primary run already left the working tree dirty", async () => {
+  // (2e) Backup handoff after a quota-interrupted implementation. Prior
+  // behavior (Codex review finding, P1) blocked the backup cascade outright
+  // the moment the PRIMARY run left the tree dirty, stranding whatever it
+  // had already written — see the sibling "unknown file state" test below
+  // for the case that DOES still stop the cascade. When the change set is
+  // known (a real git snapshot, not `filesChangedUnknown`), the fix is to
+  // preserve the tree and hand the SAME configured backup an explicit
+  // handoff prompt describing what changed, rather than give up. Especially
+  // reachable for Cline/Antigravity, whose edit mode keeps every tool
+  // auto-approved right up to a timeout/kill, but the gate applies to every
+  // provider uniformly (filesChanged is computed the same way for all of
+  // them).
+  void it("hands off to a backup with the primary's changed files preserved when the primary run already left the working tree dirty", async () => {
     const originalSpawn = childProcess.spawn;
 
     const metaRoot = fs.mkdtempSync(
-      path.join(os.tmpdir(), "ensemble-impl-dirty-tree-gate-")
+      path.join(os.tmpdir(), "ensemble-impl-dirty-tree-handoff-")
     );
     const taskFolder = path.join(metaRoot, "tasks", "task-a");
     fs.mkdirSync(taskFolder, { recursive: true });
@@ -1496,11 +1499,163 @@ void describe("runImplementationForModel", () => {
         // report a transient, cascade-eligible failure. runImplementationWithCli's
         // real before/after `git status` snapshot (execFile, not spawn, so
         // it runs for real against this actual file) is what must catch
-        // this and block the cascade.
+        // this and route it into the handoff branch.
         fs.writeFileSync(mutatedFile, "partial edit from a run that then failed");
         // Cline's real --json error shape is a FLAT top-level
         // {"type":"error","message":"..."} line (see extractClineStructuredDiagnostics
         // in cliAgentRunner.ts) — not opencode's nested error.data.message.
+        child.stdout?.emit(
+          "data",
+          Buffer.from(
+            `${JSON.stringify({
+              type: "error",
+              message: "service temporarily unavailable",
+            })}\n`
+          )
+        );
+        child.emit("close", 1);
+      });
+      return child;
+    }) as typeof childProcess.spawn;
+
+    const lm = lmStub();
+    const originalSelectChatModels = lm.selectChatModels;
+    let capturedPrompt: string | undefined;
+    const { LanguageModelTextPart } = vscode as unknown as {
+      LanguageModelTextPart: new (value: string) => { value: string };
+    };
+    function* responseStream(): Iterable<unknown> {
+      yield new LanguageModelTextPart("backup finished the interrupted implementation");
+    }
+    lm.selectChatModels = (): Promise<vscode.LanguageModelChat[]> =>
+      Promise.resolve([
+        {
+          id: "auto",
+          name: "Auto",
+          sendRequest: (messages: Array<{ content: unknown }>) => {
+            capturedPrompt = String(messages[0]?.content ?? "");
+            return Promise.resolve({ stream: responseStream() });
+          },
+        } as unknown as vscode.LanguageModelChat,
+      ]);
+
+    const workspace = vscode.workspace as unknown as {
+      fs: {
+        readFile: (uri: vscode.Uri) => Promise<Uint8Array>;
+        writeFile: (uri: vscode.Uri, bytes: Uint8Array) => Promise<void>;
+      };
+    };
+    const originalReadFile = workspace.fs.readFile;
+    const originalWriteFile = workspace.fs.writeFile;
+    workspace.fs.readFile = (uri: vscode.Uri): Promise<Uint8Array> =>
+      fs.promises.readFile(uri.fsPath);
+    workspace.fs.writeFile = (uri: vscode.Uri, bytes: Uint8Array): Promise<void> =>
+      fs.promises.writeFile(uri.fsPath, bytes);
+
+    const progressPath = path.join(taskFolder, "task-progress.json");
+    const now = new Date().toISOString();
+    fs.writeFileSync(
+      progressPath,
+      JSON.stringify(
+        { taskFolder: "task-a", currentStage: "impl", status: "active", createdAt: now, updatedAt: now },
+        null,
+        2
+      ),
+      "utf8"
+    );
+
+    try {
+      const settings = installModelSettings({
+        impl: {
+          primary: "cline-cli:default",
+          backup: "auto",
+          strategy: "switch-to-backup",
+        },
+      });
+      try {
+        const result = await runImplementationForModel({
+          modelId: "cline-cli:default",
+          prompt: "Implement the requested change.",
+          workspaceUri: taskFolderUri,
+          token: new vscode.CancellationTokenSource().token,
+          onProgress: () => undefined,
+          correlation: { actionKey: "implementation.v1" },
+          allowCrossProviderBackups: true,
+          stage: "impl",
+          taskFolderUri,
+        });
+
+        assert.strictEqual(result.status, "completed");
+        assert.strictEqual(result.runnerId, "copilot-lm");
+        assert.ok(
+          result.filesChanged.includes("mutated-by-partial-run.txt"),
+          "expected the primary run's own file write to survive into the merged filesChanged list"
+        );
+        assert.ok(
+          capturedPrompt?.includes("mutated-by-partial-run.txt"),
+          "expected the handoff prompt to name the file the interrupted primary already changed"
+        );
+        assert.ok(
+          capturedPrompt?.toLowerCase().includes("preserve") &&
+            capturedPrompt?.toLowerCase().includes("interrupted"),
+          "expected the handoff prompt to instruct the backup to preserve the interrupted agent's work"
+        );
+        assert.ok(
+          capturedPrompt?.includes("Implement the requested change."),
+          "expected the handoff prompt to still include the original implementation task"
+        );
+        const progress = JSON.parse(fs.readFileSync(progressPath, "utf8")) as {
+          fallbackActive?: Partial<Record<string, boolean>>;
+          fallbackModelId?: Partial<Record<string, string>>;
+        };
+        assert.strictEqual(progress.fallbackActive?.impl, true);
+        assert.strictEqual(progress.fallbackModelId?.impl, "auto");
+      } finally {
+        settings.restore();
+      }
+    } finally {
+      childProcess.spawn = originalSpawn;
+      lm.selectChatModels = originalSelectChatModels;
+      workspace.fs.readFile = originalReadFile;
+      workspace.fs.writeFile = originalWriteFile;
+      fs.rmSync(metaRoot, { recursive: true, force: true });
+    }
+  });
+
+  // (2e) Sibling of the handoff test above: file-change state must be
+  // KNOWN, not merely non-clean, before a handoff is safe. Outside a git
+  // repository (or with git unavailable) `filesChangedUnknown` is true —
+  // genuinely not knowing what changed is not evidence it's safe to build
+  // on, so this must keep the pre-existing stop behavior exactly like an
+  // authentication failure or a cancellation would.
+  void it("does not hand off to a backup when the primary's file-change state is unknown", async () => {
+    const originalSpawn = childProcess.spawn;
+
+    const metaRoot = fs.mkdtempSync(
+      path.join(os.tmpdir(), "ensemble-impl-unknown-tree-gate-")
+    );
+    const taskFolder = path.join(metaRoot, "tasks", "task-a");
+    // Deliberately NOT a git repository — gitStatusSnapshot's `before` probe
+    // must fail, forcing filesChangedUnknown: true.
+    fs.mkdirSync(taskFolder, { recursive: true });
+    const taskFolderUri = vscode.Uri.file(taskFolder);
+
+    childProcess.spawn = ((command: string) => {
+      const child = new EventEmitter() as import("node:child_process").ChildProcess;
+      Object.defineProperty(child, "pid", { value: 5556 });
+      child.stdout = new EventEmitter() as import("node:child_process").ChildProcess["stdout"];
+      child.stderr = new EventEmitter() as import("node:child_process").ChildProcess["stderr"];
+      child.stdin = Object.assign(new EventEmitter(), {
+        write: () => true,
+        end: () => undefined,
+      }) as unknown as import("node:child_process").ChildProcess["stdin"];
+
+      if (/^(which|where\.exe)$/.test(command)) {
+        process.nextTick(() => child.emit("close", 0));
+        return child;
+      }
+
+      process.nextTick(() => {
         child.stdout?.emit(
           "data",
           Buffer.from(
@@ -1575,25 +1730,14 @@ void describe("runImplementationForModel", () => {
           taskFolderUri,
         });
 
-        // Checked FIRST and deliberately independent of `result`'s own
-        // shape: once a backup is attempted, `runImplementationForModel`
-        // returns the BACKUP's failed result (not the primary's) once it
-        // too fails — so asserting on `result.failureKind`/`filesChanged`
-        // below only reflects the primary's own outcome when this holds.
-        // Confirmed by reproducing the pre-fix regression directly: with
-        // the dirty-tree gate removed, this assertion is what actually
-        // fails (the LM stub's sendRequest gets called), not the ones below.
         assert.strictEqual(
           backupAttempted,
           false,
-          "the backup must never be dispatched against a working tree the primary already mutated"
+          "the backup must never be dispatched when the primary's file-change state could not be determined"
         );
         assert.strictEqual(result.status, "failed");
         assert.strictEqual(result.failureKind, "temporarily-unavailable");
-        assert.ok(
-          result.filesChanged.includes("mutated-by-partial-run.txt"),
-          "expected the primary run's file write to be detected by the git snapshot"
-        );
+        assert.strictEqual(result.filesChangedUnknown, true);
       } finally {
         settings.restore();
       }

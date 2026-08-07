@@ -7,7 +7,7 @@ import {
 } from "../config/settings";
 import { getConfiguredTaskRoot } from "./taskRoot";
 import { NotificationRouter } from "./notificationRouter";
-import { canUseBackup, getBackupModels } from "./modelFallback";
+import { canUseBackup, getBackupModels, type FallbackStrategy } from "./modelFallback";
 import { cliCommandExists, resolveCliCommand } from "../runners/cliAgentRunner";
 import { findAllTasksStrictV1 } from "../services/taskProgressDiscoveryV1";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
@@ -128,6 +128,81 @@ export async function setTaskStageModel(
   await vscode.workspace.fs.writeFile(
     modelFileUri,
     new TextEncoder().encode(JSON.stringify(payload, null, 2))
+  );
+}
+
+/**
+ * Filename of the per-task resolved-model-config snapshot written once at
+ * task kickoff (plan §23/5a). Unlike task-models.json (a live per-task
+ * override input, now vestigial), this is a write-once historical record:
+ * model settings are global and mutable, so without a snapshot a completed
+ * task's folder cannot show which models actually ran it days or weeks
+ * later, after workspace settings have moved on.
+ */
+export const RESOLVED_MODEL_SNAPSHOT_FILENAME = "task-models.resolved.json";
+
+/** One stage's resolved model configuration at the moment a task was created. */
+export interface ResolvedModelSnapshotStage {
+  primary?: string;
+  backups: string[];
+  strategy: FallbackStrategy;
+  source: "workspace" | "none";
+}
+
+export interface ResolvedModelSnapshotV1 {
+  schemaVersion: 1;
+  resolvedAt: string;
+  stages: Partial<Record<TaskStage, ResolvedModelSnapshotStage>>;
+}
+
+/**
+ * Snapshot the workspace's current model configuration for every
+ * configurable stage. Reads the same sources resolveModelForStage does
+ * (modelSettings, then the legacy aiModelDefaults), but ignores any
+ * in-progress fallback state — this is kickoff provenance, not a live
+ * resolution, so it always records the configured primary/backups/strategy.
+ */
+export function buildResolvedModelSnapshotV1(): ResolvedModelSnapshotV1 {
+  const modelSettings = getModelSettings();
+  const defaults = getAiModelDefaults();
+  const stages: ResolvedModelSnapshotV1["stages"] = {};
+  for (const stage of AI_MODEL_STAGES) {
+    const setting = modelSettings[stage];
+    if (setting?.primary) {
+      stages[stage] = {
+        primary: setting.primary,
+        backups: getBackupModels(setting),
+        strategy: setting.strategy,
+        source: "workspace",
+      };
+      continue;
+    }
+    const legacyPrimary = defaults[stage];
+    if (legacyPrimary) {
+      stages[stage] = {
+        primary: legacyPrimary,
+        backups: [],
+        strategy: "alert-and-wait",
+        source: "workspace",
+      };
+      continue;
+    }
+    stages[stage] = { backups: [], strategy: "alert-and-wait", source: "none" };
+  }
+  return { schemaVersion: 1, resolvedAt: new Date().toISOString(), stages };
+}
+
+/**
+ * Write the resolved-model snapshot into a task folder. Called once at
+ * kickoff (startNewTask.ts); best-effort by design — a snapshot failure must
+ * never block task creation, which has already succeeded by the time this
+ * runs.
+ */
+export async function writeResolvedModelSnapshotV1(taskFolderUri: vscode.Uri): Promise<void> {
+  const snapshot = buildResolvedModelSnapshotV1();
+  await vscode.workspace.fs.writeFile(
+    vscode.Uri.joinPath(taskFolderUri, RESOLVED_MODEL_SNAPSHOT_FILENAME),
+    new TextEncoder().encode(JSON.stringify(snapshot, null, 2) + "\n")
   );
 }
 

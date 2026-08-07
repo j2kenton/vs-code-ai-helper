@@ -338,6 +338,20 @@
         "markTaskDone": "Clear (taskProgressFieldPolicyV1).",
         "reopen": "Clear (explicit user resume decision) (taskProgressFieldPolicyV1)."
       }
+    },
+    {
+      "name": "implementationTypeCheckFailure",
+      "optional": true,
+      "typeText": "ImplementationTypeCheckFailure",
+      "sourceSpan": "L214-L214",
+      "historicalFamilyRule": "Optional record set (2g) when a post-implementation type-check fails on a round that changed files; cleared on the next passing/skipped round and on stage transitions; omit-compatible.",
+      "v1DecoderRule": "Optional exact shape: ISO at timestamp, bounded output string; unknown nested keys are recovery.",
+      "lifecyclePolicy": {
+        "migration": "Validate exact shape; preserve (taskProgressFieldPolicyV1).",
+        "nextStage": "Clear (a stage transition implies the build issue was resolved or accepted) (taskProgressFieldPolicyV1).",
+        "markTaskDone": "Clear (taskProgressFieldPolicyV1).",
+        "reopen": "Clear (explicit user resume decision) (taskProgressFieldPolicyV1)."
+      }
     }
   ],
   "permissiveReaderConsumers": []

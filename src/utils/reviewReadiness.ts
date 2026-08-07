@@ -342,6 +342,67 @@ export function parseReviewBlockersDetailed(content: string): ReviewBlockerEvide
   return { blockPresent: true, blockers };
 }
 
+/**
+ * Result of {@link detectSiblingReviewDisagreement}: the high-level review's
+ * progress marker (claiming the plan is fully complete) and the low-level
+ * review's own "completion" blockers (claiming required plan items are still
+ * missing) — both parsed from reviews of the SAME commit, so the
+ * contradiction between them is a fact, not an inference.
+ */
+export interface SiblingReviewDisagreement {
+  implHighProgress: ReviewProgress;
+  implLowCompletionBlockers: ReviewBlocker[];
+}
+
+/**
+ * Detect the 2k failure mode: an impl-high review and an impl-low review of
+ * the identical commit disagree on whether the plan is actually complete.
+ * The task_5 evidence (2026-08-03) was exactly this — impl-high reported
+ * "18 of 18 ordered steps complete" while impl-low, ~10 minutes later on the
+ * same commit, reported that steps 5-18 did not exist yet. Nothing
+ * reconciled the two before both fed publish.
+ *
+ * Deliberately conservative: only fires when all three reviewed-commit SHAs
+ * (impl-high's, impl-low's, and the one the CURRENT review being built is
+ * about to assess) are present and identical. Comparing reviews of different
+ * commits would manufacture false disagreements out of ordinary staleness
+ * (already 2i's problem, not this function's) rather than a genuine
+ * same-commit contradiction. Returns null whenever either review is
+ * missing, either SHA is unresolvable, the SHAs disagree, impl-high emitted
+ * no progress marker or reports the plan incomplete, or impl-low reported no
+ * "completion" category blocker — i.e. whenever there is nothing to
+ * mechanically prove is a contradiction.
+ */
+export function detectSiblingReviewDisagreement(
+  implHighReview: string | undefined,
+  implLowReview: string | undefined,
+  currentReviewedCommitSha: string | undefined
+): SiblingReviewDisagreement | null {
+  if (!implHighReview || !implLowReview || !currentReviewedCommitSha) {
+    return null;
+  }
+  const highSha = parseReviewedCommitSha(implHighReview);
+  const lowSha = parseReviewedCommitSha(implLowReview);
+  if (!highSha || !lowSha) {
+    return null;
+  }
+  if (highSha !== lowSha || highSha !== currentReviewedCommitSha) {
+    return null;
+  }
+  const progress = parseReviewProgress(implHighReview);
+  if (!progress || progress.complete !== progress.total) {
+    return null;
+  }
+  const lowBlockers = parseReviewBlockersDetailed(implLowReview);
+  const completionBlockers = lowBlockers.blockers.filter(
+    (b) => b.category === "completion"
+  );
+  if (completionBlockers.length === 0) {
+    return null;
+  }
+  return { implHighProgress: progress, implLowCompletionBlockers: completionBlockers };
+}
+
 /** Strict gate used by automatic stage advancement. */
 export function isStrictPerfectReview(content: string): boolean {
   const lines = content.replace(/^\uFEFF/, "").replace(/\r\n/g, "\n").split("\n");

@@ -26,6 +26,7 @@
  * tables cannot silently drift while the permissive reader still exists.
  */
 import {
+  ImplementationTypeCheckFailure,
   LintPayload,
   MAX_REVIEW_BLOCKER_IDENTITIES,
   MAX_REVIEW_REJECTIONS,
@@ -130,6 +131,7 @@ export const TASK_PROGRESS_PRODUCT_FIELD_NAMES_V1 = [
   "reviewScoreHistory",
   "reviewRejections",
   "escalation",
+  "implementationTypeCheckFailure",
 ] as const satisfies readonly (keyof TaskProgress)[];
 
 type MissingProductFieldV1 = Exclude<
@@ -726,6 +728,25 @@ function validateEscalation(
   return undefined;
 }
 
+function validateImplementationTypeCheckFailure(value: unknown): string | undefined {
+  if (!isPlainObject(value)) {
+    return "implementationTypeCheckFailure must be an object";
+  }
+  const allowed = new Set(["at", "output"]);
+  for (const key of Object.keys(value)) {
+    if (!allowed.has(key)) {
+      return `implementationTypeCheckFailure has an unknown property ${JSON.stringify(key)}`;
+    }
+  }
+  if (!isIsoTimestamp(value["at"])) {
+    return "implementationTypeCheckFailure.at must be an ISO timestamp";
+  }
+  if (!boundedString(value["output"], MAX_ESCALATION_REASON_LENGTH)) {
+    return "implementationTypeCheckFailure.output must be a bounded string";
+  }
+  return undefined;
+}
+
 function validateFallbackModelId(value: unknown): string | undefined {
   if (!isPlainObject(value)) {
     return "fallbackModelId must be a per-stage object map";
@@ -1141,6 +1162,14 @@ export function decodeTaskProgressTextV1(
           return recovery("invalidFieldValue", error);
         }
         draft.escalation = value as TaskEscalation;
+        break;
+      }
+      case "implementationTypeCheckFailure": {
+        const error = validateImplementationTypeCheckFailure(value);
+        if (error !== undefined) {
+          return recovery("invalidFieldValue", error);
+        }
+        draft.implementationTypeCheckFailure = value as ImplementationTypeCheckFailure;
         break;
       }
     }

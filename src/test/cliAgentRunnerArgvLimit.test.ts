@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
 import * as vscode from "vscode";
-import { execCliAgent, runImplementationWithCli } from "../runners/cliAgentRunner";
+import { CliAgentRunner, execCliAgent, runImplementationWithCli } from "../runners/cliAgentRunner";
 import { CliProviderDefinition, getCliProvider } from "../runners/providers";
 
 void describe("execCliAgent argv prompt limits", () => {
@@ -202,5 +202,82 @@ void describe("execCliAgent argv prompt limits", () => {
     } finally {
       fs.rmSync(workspace, { recursive: true, force: true });
     }
+  });
+});
+
+// (2j) A provider's argv-transport ceiling is a structural, guaranteed
+// failure — never transient — so it must be caught BEFORE dispatch, not
+// discovered by trying and failing. These tests assert that outcome
+// directly: buildArgs is never called, proving no CLI dispatch (and no
+// retry-loop attempt) was spent on a run that could never succeed.
+void describe("pre-dispatch prompt-size skip (2j)", () => {
+  function oversizedArgvProvider(buildArgsCalls: { count: number }): CliProviderDefinition {
+    return {
+      id: "kiro-cli",
+      label: "Kiro CLI",
+      command: "kiro-cli",
+      installHint: "install",
+      loginHint: "login",
+      authErrorMarkers: ["login"],
+      signInCommand: "login",
+      signInLabel: "Sign in",
+      promptTransport: "argv",
+      useShell: false,
+      maxArgvPromptBytes: 10,
+      models: [{ model: undefined, name: "default" }],
+      usesLastMessageFile: false,
+      buildArgs(): string[] {
+        buildArgsCalls.count++;
+        return ["chat", "--no-interactive"];
+      },
+    };
+  }
+
+  void it("CliAgentRunner.run (text mode) skips dispatch and returns a cascade-eligible failure with zero attempts spent", async () => {
+    const buildArgsCalls = { count: 0 };
+    const runner = new CliAgentRunner(oversizedArgvProvider(buildArgsCalls));
+    const cts = new vscode.CancellationTokenSource();
+
+    const result = await runner.run(
+      {
+        taskFolderUri: vscode.Uri.file(process.cwd()),
+        workspaceUri: vscode.Uri.file(process.cwd()),
+        stage: "impl",
+        prompt: "this prompt is definitely longer than ten bytes",
+        outputFile: vscode.Uri.file(path.join(os.tmpdir(), "cli-argv-limit-out.md")),
+      },
+      cts.token
+    );
+
+    assert.strictEqual(result.status, "failed");
+    // Same classification the in-dispatch check would have produced — the
+    // backup cascade in runnerRegistry.ts keys on this to try a different
+    // provider, and that behavior must be unaffected by skipping earlier.
+    assert.strictEqual(result.failureKind, "temporarily-unavailable");
+    assert.match(result.errorMessage ?? "", /too large/i);
+    assert.strictEqual(buildArgsCalls.count, 0, "expected the provider CLI to never be dispatched");
+  });
+
+  void it("runImplementationWithCli (edit mode) skips dispatch and reports a definitively clean (not unknown) tree", async () => {
+    const buildArgsCalls = { count: 0 };
+    const cts = new vscode.CancellationTokenSource();
+
+    const result = await runImplementationWithCli({
+      def: oversizedArgvProvider(buildArgsCalls),
+      model: undefined,
+      prompt: "this prompt is definitely longer than ten bytes",
+      workspaceUri: vscode.Uri.file(process.cwd()),
+      token: cts.token,
+      onProgress: () => undefined,
+    });
+
+    assert.strictEqual(result.status, "failed");
+    assert.strictEqual(result.failureKind, "temporarily-unavailable");
+    assert.match(result.errorMessage ?? "", /too large/i);
+    // Nothing ran, so this is KNOWN-clean rather than unknown — the dirty-tree
+    // cascade gate in runnerRegistry.ts must be free to continue past it.
+    assert.deepStrictEqual(result.filesChanged, []);
+    assert.strictEqual(result.filesChangedUnknown, false);
+    assert.strictEqual(buildArgsCalls.count, 0, "expected the provider CLI to never be dispatched");
   });
 });

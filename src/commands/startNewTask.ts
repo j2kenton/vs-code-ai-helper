@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import * as path from "path";
 import { TASK_FILENAME, TASK_PROGRESS_FILENAME, TaskStatus } from "../types/taskProgress";
+import { writeResolvedModelSnapshotV1 } from "../utils/modelSelection";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import { createTaskProgressV1, writeTaskProgressV1 } from "../services/taskProgressWriterV1";
 import { getConfiguredTaskRoot, normalizePath, resolveTaskRootForCreation } from "../utils/taskRoot";
@@ -426,6 +427,17 @@ async function createTask(
       vscode.Uri.joinPath(workFolderUri, TASK_FILENAME),
       new TextEncoder().encode(taskTemplate)
     );
+
+    // Best-effort model-config provenance (plan §23/5a): model settings are
+    // global and mutable, so without a snapshot taken at kickoff, a
+    // completed task's folder cannot show which models actually ran it once
+    // workspace settings have since moved on. Never fatal to task creation,
+    // which has effectively already succeeded by this point.
+    try {
+      await writeResolvedModelSnapshotV1(workFolderUri);
+    } catch {
+      // Non-fatal: the snapshot is provenance, not required for the task to function.
+    }
 
     const [progressEntry, taskMdEntry] = await Promise.all([
       tryReadCreatedFileEntryV1(vscode.Uri.joinPath(workFolderUri, TASK_PROGRESS_FILENAME), TASK_PROGRESS_FILENAME, taskFolderName),

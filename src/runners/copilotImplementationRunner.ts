@@ -493,6 +493,15 @@ export interface ImplementationRunResult {
   authFailure?: boolean;
   /** errorMessage minus any appended login hint — the classification-safe form. */
   authDiagnosticText?: string;
+  /**
+   * Set (2g) when a post-implementation type-check ran because this round
+   * left known, non-empty file changes and the check failed — the tree does
+   * not compile. Only CLI runs (runImplementationWithCli) currently perform
+   * this check; the Copilot runner leaves it undefined.
+   */
+  typeCheckFailed?: boolean;
+  /** Truncated compiler/build output when `typeCheckFailed` is true. */
+  typeCheckOutput?: string;
 }
 
 /**

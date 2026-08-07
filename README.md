@@ -59,6 +59,16 @@ devpass-code is a separate CLI that happens to be a rebrand/fork of OpenCode: it
 
 > **Note on Kimi Code CLI:** its headless CLI has no scoped read-only mode either, and it's worse than Antigravity's/Cline's — `-p` (its one-shot prompt flag) rejects `--plan`, `--yolo`, AND `--auto` outright (verified live: the CLI errors on each combination), so **no mode passes any permission flag at all**; implementation and plan/review runs use identical arguments. Verified directly that a bare invocation with zero flags still wrote a file and ran a shell command with no approval prompt. Also note: its CLI accepts a prompt only as a command-line argument (no stdin, and no prompt-file flag), which caps argv at the OS command-line limit. Ensemble works around that by writing the full prompt to a temp file and passing Kimi a short instruction to read it — Kimi's own file tools then pull the content in, so large context packs work normally (verified against a 419 KB file, including content at its end). One consequence remains: Kimi must be installed via the **official installer**, not npm, because that transport requires launching the real binary rather than the shell-shim wrapper an npm install produces. Commit or back up before using it, or pick another provider.
 
+### Choosing models and effort tiers per stage
+
+A model's **effort tier** (Low/High/Max, etc.) predicts review quality far more than which model you pick — the same model at two effort tiers has produced opposite verdicts on the same code, including a wrong 10/10 at a low tier that missed a blocker an equivalent high-tier run caught. Some general guidance drawn from observed runs:
+
+- **Never run Publish below a high effort tier.** The specific model matters far less than the tier at this stage.
+- **Never assign a free or daily-limited model to Implementation.** A quota exhaustion mid-implementation can leave a broken, half-written tree.
+- **Prefer Claude Code or Codex CLI for Implementation.** Implementation runs are long, stateful, and write files, so a provider that fails safely (leaving the tree consistent on a quota stop) matters more there than anywhere else.
+- **Treat OpenCode as acceptable for reviews** (short, read-only, cheap to redo) but be cautious using it for Implementation, where an interruption is more costly.
+- **Cross provider boundaries in your backup chain.** If a stage's backup is on the same account as its primary (Ensemble warns about this in **Configure AI Models** when Fallback Strategy is set to Switch to Backup), a session limit or quota outage on the primary will hit the backup identically — order backups so at least one crosses to a different provider account.
+
 AI actions consume real quota or money, and implementation runs modify workspace files.
 
 ## Quick start

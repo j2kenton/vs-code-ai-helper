@@ -203,6 +203,13 @@ export const TASK_PROGRESS_FIELD_POLICY_V1: Record<
     markTaskDone: "Preserve (publish verification scope).",
     reopen: "Preserve (publish verification scope).",
   },
+  implementationTypeCheckFailure: {
+    migration: "Validate exact shape; preserve.",
+    nextStage:
+      "Clear (per-round build-health state tied to the departing stage's implementation; a stage transition implies the build issue was resolved or accepted, parity with lintPayload/escalation).",
+    markTaskDone: "Clear.",
+    reopen: "Clear (explicit user resume decision — parity with escalation/lintPayload).",
+  },
 };
 
 const ISO_TIMESTAMP_RE =

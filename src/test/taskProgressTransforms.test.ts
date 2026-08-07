@@ -1,6 +1,6 @@
 import * as assert from "node:assert/strict";
 import { test } from "node:test";
-import { appendReviewRejection, appendReviewScoreHistory, clearEscalation, clearStageFallbackReservation, recordEscalation, updateImplReviewFiles, clearImplReviewFiles, updateTaskProgressStage } from "../utils/taskProgressTransforms";
+import { appendReviewRejection, appendReviewScoreHistory, clearEscalation, clearImplementationTypeCheckFailure, clearStageFallbackReservation, recordEscalation, recordImplementationTypeCheckFailure, updateImplReviewFiles, clearImplReviewFiles, updateTaskProgressStage } from "../utils/taskProgressTransforms";
 import { MAX_REVIEW_REJECTIONS, MAX_REVIEW_SCORE_HISTORY, ReviewRejectionEntry, ReviewScoreHistoryEntry, type TaskProgress } from "../types/taskProgress";
 
 function makeProgress(implReviewFiles?: string[]): TaskProgress {
@@ -288,5 +288,26 @@ void test("clearEscalation removes a recorded escalation", () => {
 void test("clearEscalation is a no-op (same reference) when nothing is recorded", () => {
   const progress = makeProgress();
   assert.strictEqual(clearEscalation(progress), progress);
+});
+
+void test("recordImplementationTypeCheckFailure sets the field (2g)", () => {
+  const progress = makeProgress();
+  const failure = { at: "2026-08-07T00:00:00.000Z", output: "TS2322: fake type error" };
+  const updated = recordImplementationTypeCheckFailure(progress, failure);
+  assert.deepEqual(updated.implementationTypeCheckFailure, failure);
+});
+
+void test("clearImplementationTypeCheckFailure removes a recorded failure (2g)", () => {
+  const progress: TaskProgress = {
+    ...makeProgress(),
+    implementationTypeCheckFailure: { at: "2026-08-07T00:00:00.000Z", output: "TS2322: fake type error" },
+  };
+  const updated = clearImplementationTypeCheckFailure(progress);
+  assert.equal(updated.implementationTypeCheckFailure, undefined);
+});
+
+void test("clearImplementationTypeCheckFailure is a no-op (same reference) when nothing is recorded", () => {
+  const progress = makeProgress();
+  assert.strictEqual(clearImplementationTypeCheckFailure(progress), progress);
 });
 

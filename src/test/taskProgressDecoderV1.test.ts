@@ -106,6 +106,36 @@ void describe("taskProgressDecoderV1", () => {
     expectRecovery(doc({ ensembleProgressVersion: 1, reviewRejections: { not: "an array" } }), "invalidFieldValue");
   });
 
+  void it("decodes a valid implementationTypeCheckFailure and fails closed on malformed shapes (2g)", () => {
+    const valid = {
+      at: "2026-08-07T11:00:00.000Z",
+      output: "src/foo.ts(1,1): error TS2322: Type 'string' is not assignable to type 'number'.",
+    };
+    const result = decodeTaskProgressTextV1(
+      doc({ ensembleProgressVersion: 1, implementationTypeCheckFailure: valid })
+    );
+    assert.equal(result.ok, true);
+    if (result.ok) {
+      assert.deepEqual(result.decoded.progress.implementationTypeCheckFailure, valid);
+    }
+    expectRecovery(
+      doc({ ensembleProgressVersion: 1, implementationTypeCheckFailure: { ...valid, at: "not-a-timestamp" } }),
+      "invalidFieldValue"
+    );
+    expectRecovery(
+      doc({ ensembleProgressVersion: 1, implementationTypeCheckFailure: { ...valid, output: 42 } }),
+      "invalidFieldValue"
+    );
+    expectRecovery(
+      doc({ ensembleProgressVersion: 1, implementationTypeCheckFailure: { ...valid, extra: true } }),
+      "invalidFieldValue"
+    );
+    expectRecovery(
+      doc({ ensembleProgressVersion: 1, implementationTypeCheckFailure: "not an object" }),
+      "invalidFieldValue"
+    );
+  });
+
   void it("resolves the closed legacy stage alias table in parity with migrateStage", () => {
     for (const [alias, canonical] of Object.entries(LEGACY_STAGE_ALIAS_TABLE_V1)) {
       assert.equal(

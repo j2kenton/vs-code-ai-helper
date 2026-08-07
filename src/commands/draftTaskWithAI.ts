@@ -9,7 +9,7 @@ import { resolveTaskContext, ResolvedTaskContext } from "../utils/resolveTaskCon
 import { ensureAiConsent } from "../utils/aiConsent";
 import { checkAndConfirmPromptSize } from "../utils/promptSizeGuard";
 import { NotificationRouter } from "../utils/notificationRouter";
-import { safeOpenTextDocument } from "../utils/fileUtils";
+import { attributionHeader, safeOpenTextDocument } from "../utils/fileUtils";
 import { ChatViewProvider, ChatInteractionRefV1, ChatInteractionResumeResultV1 } from "../views/chatView";
 import { assertLegacyAiRouteAllowedV0 } from "../services/legacyAiActionSafetyGateV0";
 
@@ -105,6 +105,8 @@ export function normalizeDraftTaskArg(
 interface ResolvedDraftCoordinatorV1 {
   readonly coordinator: TaskActionCoordinatorV1;
   readonly providerLabel: string;
+  /** (2m) Native model id for the run-log attribution header; undefined for providers without one. */
+  readonly modelLabel: string | undefined;
 }
 
 type ResolveDraftCoordinatorFailureV1 =
@@ -130,7 +132,7 @@ async function resolveDraftCoordinatorV1(
   if (!model.modelId) {
     return { ok: false, failure: { kind: "noModel" } };
   }
-  const { availability, providerLabel } = await checkRunnerAvailabilityForModel(
+  const { availability, providerLabel, nativeModelId } = await checkRunnerAvailabilityForModel(
     model.modelId,
     "desc"
   );
@@ -145,7 +147,7 @@ async function resolveDraftCoordinatorV1(
     workspaceCwd: workspaceFolderUri.fsPath,
     resolveStagePrimaryModel: () => ({ modelId, stage: "desc" as TaskStage }),
   });
-  return { ok: true, value: { coordinator, providerLabel } };
+  return { ok: true, value: { coordinator, providerLabel, modelLabel: nativeModelId } };
 }
 
 /** Minimal task identity `handleDraftOutcomeV1` needs — never a raw filesystem path beyond the task's own folder. */
@@ -160,8 +162,15 @@ interface DraftOutcomeContextV1 {
   readonly taskRef: DraftOutcomeTaskRefV1;
   readonly chatViewProvider: ChatViewProvider;
   readonly orchestrator: ActionConversationOrchestratorV1;
-  /** The action-specific prompt sent this drive, recorded in the run log only. */
+  /**
+   * The action-specific prompt this drive rendered, recorded in the run log
+   * only. This is the prompt BEFORE the coordinator appends its own AI-result
+   * envelope contract block — see the run-log write below.
+   */
   readonly prompt: string;
+  /** (2m) Resolved provider/model for the run log's attribution header. */
+  readonly providerLabel: string;
+  readonly modelLabel: string | undefined;
 }
 
 interface DraftOutcomeResultV1 {
@@ -324,11 +333,19 @@ async function handleDraftOutcomeV1(
     );
   }
 
+  // (2m) See generatePlanWithAI.ts's identical run-log comment: ctx.prompt is
+  // the pre-contract prompt, and the coordinator-appended AI-result envelope
+  // block (not reconstructable here — §2.2-permitted, correlation-scoped
+  // boilerplate) is called out explicitly rather than silently omitted.
   const runLogUri = await writeRunLog(
     taskFolderUri,
     "draft-v1",
     "desc",
-    `# Prompt\n\n${ctx.prompt}\n\n# Result\n\n${describeDraftOutcomeForLogV1(outcome)}`
+    `${attributionHeader(ctx.providerLabel, ctx.modelLabel)}\n\n` +
+      `# Prompt\n\n${ctx.prompt}\n\n` +
+      "*(The coordinator appends its own AI-result envelope contract block " +
+      "to this prompt before dispatch; that block is not reproduced here.)*\n\n" +
+      `# Result\n\n${describeDraftOutcomeForLogV1(outcome)}`
   );
 
   return { succeeded, runLogUri };
@@ -433,7 +450,7 @@ async function draftTaskWithAIForResolvedTask(
     }
     return { succeeded: false };
   }
-  const { coordinator, providerLabel } = resolved.value;
+  const { coordinator, providerLabel, modelLabel } = resolved.value;
 
   // Build the prompt and check its size BEFORE launching or writing artifacts.
   const prompt = await renderPromptTemplate(
@@ -544,6 +561,8 @@ async function draftTaskWithAIForResolvedTask(
           chatViewProvider,
           orchestrator: getProductionActionConversationOrchestratorV1(),
           prompt,
+          providerLabel,
+          modelLabel,
         });
         succeeded = handled.succeeded;
         if (handled.runLogUri) {
@@ -632,7 +651,7 @@ export async function resumeDraftInteractionV1(
           : `${resolved.failure.providerLabel} is unavailable: ${resolved.failure.reason}`,
     };
   }
-  const { coordinator } = resolved.value;
+  const { coordinator, providerLabel, modelLabel } = resolved.value;
   const orchestrator = getProductionActionConversationOrchestratorV1();
 
   const interactionRef: InteractionRefV1 = {
@@ -678,6 +697,8 @@ export async function resumeDraftInteractionV1(
     chatViewProvider,
     orchestrator,
     prompt,
+    providerLabel,
+    modelLabel,
   });
 
   // Report the ORIGINAL interaction's actual settlement (re-read after

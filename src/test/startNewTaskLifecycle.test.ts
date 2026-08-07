@@ -284,6 +284,42 @@ void describe("startNewTask — active/paused lifecycle", () => {
   });
 });
 
+void describe("startNewTask — resolved model snapshot (plan §23/5a)", () => {
+  void it("writes task-models.resolved.json into a newly created task folder", async () => {
+    const harness = installHarness();
+    try {
+      const folderName = await startNewTask(
+        harness.inventory,
+        vscode.Uri.file(harness.workspaceRoot),
+        harness.currentTaskStore
+      );
+      assert.ok(folderName, "expected the created folder name to be returned");
+
+      const taskFolderPath = path.join(harness.metaFolderPath, folderName);
+      const snapshotPath = path.join(taskFolderPath, "task-models.resolved.json");
+      assert.ok(fs.existsSync(snapshotPath), "expected task-models.resolved.json in the new task folder");
+
+      const snapshot = JSON.parse(fs.readFileSync(snapshotPath, "utf8")) as {
+        schemaVersion: number;
+        resolvedAt: string;
+        stages: Record<string, { source: string; backups: unknown[]; strategy: string }>;
+      };
+      assert.equal(snapshot.schemaVersion, 1);
+      assert.equal(typeof snapshot.resolvedAt, "string");
+      assert.ok(Object.keys(snapshot.stages).length > 0, "expected at least one configurable stage recorded");
+      for (const stage of Object.values(snapshot.stages)) {
+        // No model settings are configured in this harness — every stage
+        // resolves to "none" rather than fabricating a model id.
+        assert.equal(stage.source, "none");
+        assert.deepEqual(stage.backups, []);
+        assert.equal(stage.strategy, "alert-and-wait");
+      }
+    } finally {
+      harness.restore();
+    }
+  });
+});
+
 void describe("startNewTask — legacy `creating` footprints are never auto-promoted", () => {
   void it(
     "leaves a stuck legacy creating folder untouched and warns instead of promoting it to paused",
