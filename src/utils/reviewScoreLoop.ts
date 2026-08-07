@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { isPlanIncomplete } from "./reviewReadiness";
 
 const KEY = "bestReviewScores";
 export const MAX_REVIEW_ATTEMPTS = 5;
@@ -242,7 +243,7 @@ export async function improveReviewScore(options: {
     // reports no marker leaves all of this null/untouched, so every decision
     // below is bit-for-bit the pre-marker behavior for those reviews.
     const progress = round.progress ?? null;
-    const planIncomplete = progress !== null && progress.complete < progress.total;
+    const planIncomplete = isPlanIncomplete(progress);
     if (progress !== null) {
       if (previousComplete !== null) {
         roundsWithoutProgressAdvance =

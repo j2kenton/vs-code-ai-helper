@@ -105,7 +105,9 @@ import { ChatInteractionRefV1, ChatInteractionResumeResultV1, ChatViewProvider }
 import { TaskInventory } from "../state/taskInventory";
 import {
   hasZeroTaskFixableEvidence,
+  isPlanIncomplete,
   meetsAutoAdvanceThreshold,
+  readyToAdvanceStage,
   parseReadiness,
   parseReviewBlockers,
   parseReviewBlockersDetailed,
@@ -1615,7 +1617,19 @@ async function routeReviewOutcomeV1(
         const content = new TextDecoder().decode(contentBytes);
         const score = parseReadiness(content).score;
         const autoAdvanceThreshold = getAutoAdvanceScoreThreshold();
-        const meetsThreshold = meetsAutoAdvanceThreshold(score, autoAdvanceThreshold);
+        // A high score no longer implies the plan is finished. Before the
+        // progress marker existed, the review prompts capped a mid-plan
+        // score below the threshold, so "score >= threshold" doubled as an
+        // accidental completeness gate. Removing that cap (correctly — it
+        // made a clean staged task unable to ever advance) freed the score
+        // to measure QUALITY, which means a flawless partial plan can score
+        // 8.5 at 13 of 25 steps and silently auto-advance out of the
+        // implementation stage with 12 steps unbuilt — observed live.
+        // Completeness now has to be checked explicitly, here as well as in
+        // reviewScoreLoop.ts's two termination paths.
+        const progress = parseReviewProgress(content);
+        const planIncomplete = isPlanIncomplete(progress);
+        const meetsThreshold = readyToAdvanceStage(score, autoAdvanceThreshold, progress);
         // Records this round in the durable score history and decides
         // whether to keep quietly iterating, get a deliberate second
         // opinion, or escalate to the human. `escalated` is true only for
@@ -1668,6 +1682,24 @@ async function routeReviewOutcomeV1(
               }
             );
           }
+        }
+        // Say WHY a high-scoring round is not advancing. Without this the
+        // task looks silently stuck at a good score — indistinguishable from
+        // the failure mode this whole signal exists to remove — when in fact
+        // it is correctly still building the plan.
+        // isAutoAdvanceEnabled(): with auto-advance off, staying on the stage
+        // is simply what always happens, so announcing it as though the plan
+        // held something back would be noise describing normal behavior.
+        if (
+          !escalated &&
+          isAutoAdvanceEnabled() &&
+          planIncomplete &&
+          meetsAutoAdvanceThreshold(score, autoAdvanceThreshold)
+        ) {
+          NotificationRouter.showInformation(
+            `Review scored ${score}/10 with no blocking issues, but ${progress.complete} of ${progress.total} plan steps are implemented. ` +
+              "Staying on this stage to build the rest."
+          );
         }
         if (!escalated && isAutoAdvanceEnabled() && meetsThreshold) {
           NotificationRouter.showInformation(`Review score ${score}/10 reached the auto-advance threshold. Auto-advancing stage...`);

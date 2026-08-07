@@ -5,6 +5,9 @@ import {
   parseReviewBlockers,
   parseReviewBlockersDetailed,
   parseReviewProgress,
+  isPlanIncomplete,
+  meetsAutoAdvanceThreshold,
+  readyToAdvanceStage,
 } from "../utils/reviewReadiness";
 
 void describe("parseReviewBlockers", () => {
@@ -269,5 +272,114 @@ void describe("parseReviewProgress", () => {
       parseReviewProgress("<!-- progress: 4/9 -->\n<!-- progress: 9/4 -->"),
       null
     );
+  });
+});
+
+/**
+ * Stage-advance gate (2026-08-07). This is the rule that actually fired the
+ * live failure: with the progress marker in place the review score was freed
+ * to measure QUALITY, so a flawless partial plan scored 8.5 at 13 of 25 steps
+ * and auto-advanced out of implementation with 12 steps unbuilt.
+ *
+ * The equivalent rule inside improveReviewScore is pinned separately
+ * (reviewScoreLoop.test.ts). These exist so the two sites cannot drift apart:
+ * the same "a high score does not mean finished" mistake has now been made in
+ * two different places.
+ */
+void describe("readyToAdvanceStage", () => {
+  void it("advances when the score clears the threshold and the plan is complete", () => {
+    assert.strictEqual(readyToAdvanceStage(8.5, 8, { complete: 25, total: 25 }), true);
+  });
+
+  void it("does NOT advance mid-plan, however high the score", () => {
+    // The exact live failure: 8.5/10, zero blockers, 13 of 25 steps built.
+    assert.strictEqual(readyToAdvanceStage(8.5, 8, { complete: 13, total: 25 }), false);
+    assert.strictEqual(readyToAdvanceStage(10, 8, { complete: 24, total: 25 }), false);
+  });
+
+  void it("does NOT advance when the score is below the threshold, complete or not", () => {
+    assert.strictEqual(readyToAdvanceStage(6.3, 8, { complete: 25, total: 25 }), false);
+    assert.strictEqual(readyToAdvanceStage(6.3, 8, { complete: 8, total: 25 }), false);
+  });
+
+  void it("falls back to score-only when no progress marker was emitted", () => {
+    // Pre-marker behavior must be preserved exactly: an absent signal is
+    // unknown completeness, not a reason to block.
+    assert.strictEqual(readyToAdvanceStage(8.5, 8, null), true);
+    assert.strictEqual(readyToAdvanceStage(7.9, 8, null), false);
+  });
+
+  void it("treats a null score as never ready", () => {
+    assert.strictEqual(readyToAdvanceStage(null, 8, { complete: 25, total: 25 }), false);
+    assert.strictEqual(readyToAdvanceStage(null, 8, null), false);
+  });
+
+  void it("advances exactly at the threshold boundary", () => {
+    assert.strictEqual(readyToAdvanceStage(8, 8, { complete: 25, total: 25 }), true);
+  });
+
+  void it("stays consistent with meetsAutoAdvanceThreshold when the plan is complete", () => {
+    // The two must never disagree once completeness is satisfied, or the
+    // notification branch (which uses the score-only predicate) would
+    // contradict the advance decision.
+    for (const score of [0, 5, 7.9, 8, 8.1, 10]) {
+      assert.strictEqual(
+        readyToAdvanceStage(score, 8, { complete: 4, total: 4 }),
+        meetsAutoAdvanceThreshold(score, 8),
+        `score ${score} must agree with the score-only predicate on a complete plan`
+      );
+    }
+  });
+});
+
+/**
+ * The single shared completeness predicate. Three sites decide "is this
+ * finished" — readyToAdvanceStage (stage advance) and the two termination
+ * gates in reviewScoreLoop.ts — and all three now route through this. These
+ * tests exist because the same "a high score does not mean finished" bug was
+ * shipped three times in different disguises; three correct copies of a rule
+ * drift, one shared predicate cannot.
+ */
+void describe("isPlanIncomplete", () => {
+  void it("is true while steps remain", () => {
+    assert.strictEqual(isPlanIncomplete({ complete: 13, total: 25 }), true);
+    assert.strictEqual(isPlanIncomplete({ complete: 0, total: 1 }), true);
+  });
+
+  void it("is false once every step is done", () => {
+    assert.strictEqual(isPlanIncomplete({ complete: 25, total: 25 }), false);
+  });
+
+  void it("treats an absent marker as NOT incomplete, preserving pre-marker behavior", () => {
+    // Unknown completeness must never block a caller on a signal that was
+    // never sent — both null and undefined, since ReviewRoundOutcome.progress
+    // is optional while reviewActions parses to null.
+    assert.strictEqual(isPlanIncomplete(null), false);
+    assert.strictEqual(isPlanIncomplete(undefined), false);
+  });
+
+  void it("is defensive about a numerator past the denominator", () => {
+    // parseReviewProgress rejects this shape, but the predicate is called
+    // with hand-built outcomes in tests and by reviewScoreLoop's callers.
+    assert.strictEqual(isPlanIncomplete({ complete: 30, total: 25 }), false);
+  });
+
+  void it("is the definition readyToAdvanceStage actually uses", () => {
+    // Pins the sharing itself: for any progress shape, a score clearing the
+    // threshold advances exactly when the plan is not incomplete. If either
+    // side is ever re-derived inline, this disagrees.
+    const cases = [
+      { complete: 0, total: 5 },
+      { complete: 4, total: 5 },
+      { complete: 5, total: 5 },
+      null,
+    ];
+    for (const progress of cases) {
+      assert.strictEqual(
+        readyToAdvanceStage(9, 8, progress),
+        !isPlanIncomplete(progress),
+        `advance decision must equal !isPlanIncomplete for ${JSON.stringify(progress)}`
+      );
+    }
   });
 });

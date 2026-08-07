@@ -70,6 +70,59 @@ export function meetsAutoAdvanceThreshold(
   return score !== null && score >= threshold;
 }
 
+/**
+ * THE single definition of "this plan still has work left in it".
+ *
+ * Every place that decides whether work is finished must call this rather
+ * than re-deriving `complete < total` inline. Three separate sites now make
+ * that call — `readyToAdvanceStage` below (stage advance), and the two
+ * termination gates in `reviewScoreLoop.ts` — and the same "a high score
+ * does not mean finished" bug has been shipped three times in different
+ * disguises. Three correct copies of a rule are worth less than one shared
+ * predicate: copies drift silently, and this one already did.
+ *
+ * A null/absent `progress` means the review emitted no marker, so
+ * completeness is UNKNOWN — reported as "not incomplete" so callers fall
+ * back to their exact pre-marker behavior instead of blocking on a signal
+ * that was never sent.
+ */
+export function isPlanIncomplete(
+  progress: ReviewProgress | null | undefined
+): progress is ReviewProgress {
+  // A type predicate, not a plain boolean: callers that go on to report the
+  // remaining steps (e.g. reviewActions.ts's "13 of 25 implemented" notice)
+  // then keep the narrowing the old inline `progress !== null && ...` gave
+  // them, so sharing this definition costs them no null assertions.
+  return progress !== null && progress !== undefined && progress.complete < progress.total;
+}
+
+/**
+ * The complete "may this stage advance" decision: a high score alone is NOT
+ * enough — the plan must also be finished.
+ *
+ * Before the progress marker existed, the review prompts capped a mid-plan
+ * score below the threshold, so `score >= threshold` doubled as an
+ * ACCIDENTAL completeness gate. Removing that cap (necessary — it made a
+ * clean staged task unable to ever advance) freed the score to measure
+ * quality, and a flawless partial plan promptly scored 8.5 at 13 of 25 steps
+ * and auto-advanced out of implementation with 12 steps unbuilt.
+ *
+ * Kept as a pure predicate, separate from `meetsAutoAdvanceThreshold`, so
+ * the rule is pinnable in a unit test — and defined in terms of
+ * `isPlanIncomplete` rather than re-deriving the comparison, so the shared
+ * definition is genuinely shared instead of merely claimed to be.
+ */
+export function readyToAdvanceStage(
+  score: number | null,
+  threshold: number,
+  progress: ReviewProgress | null
+): boolean {
+  if (!meetsAutoAdvanceThreshold(score, threshold)) {
+    return false;
+  }
+  return !isPlanIncomplete(progress);
+}
+
 /** A blocker's review category, as used by the existing free-text sections
  * every review prompt already asks for: "Architectural blockers" and
  * "Completion blockers" (plan/impl-high reviews), "Defect blockers" and

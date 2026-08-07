@@ -3,7 +3,7 @@
   "generatedBy": "scripts/resolveProductionSourceUniverse.mjs",
   "description": "Production source universe as of the current working tree, resolved from the exact bundler options that produce dist/extension.js (esbuild.config.js) plus the contribution-asset and runtime-resource-copy rules in scripts/lib/productionSourceScan.mjs. Regenerated every run; diffed against the immutable pre-gate snapshot (workflow-production-source-pregate-v1.json), not authoritative on its own.",
   "packageName": "vs-code-ai-helper",
-  "packageVersion": "0.76.0",
+  "packageVersion": "0.77.0",
   "declaredMain": "./dist/extension.js",
   "entrypoint": "src/extension.ts",
   "outfile": "dist/extension.js",
@@ -168,7 +168,7 @@
     },
     {
       "path": "src/commands/reviewActions.ts",
-      "sha256": "e06dcd63a900ce4d8ab882db3d3264696850f49f46b503ad41aa15415543d7ad"
+      "sha256": "4e1179964a2825f08557d24a770a62743275356e353173d5110dd58b6bd539e5"
     },
     {
       "path": "src/commands/reviewCurrentTask.ts",
@@ -512,7 +512,7 @@
     },
     {
       "path": "src/utils/completionLint.ts",
-      "sha256": "4fa45252f9c9ee2fba848b95cf44bd4581fcb4f9e4803a5beb63717d24b63a27"
+      "sha256": "417e98a032fd3926e9be183fe07674bdda555e4709441fa5cc815b0e92b18683"
     },
     {
       "path": "src/utils/contextEligibility.ts",
@@ -628,7 +628,7 @@
     },
     {
       "path": "src/utils/reviewReadiness.ts",
-      "sha256": "fffb0ccf6be69167af9cc5d0d3b77a9b226096508b1ee6e0a416b9b88a700fa5"
+      "sha256": "f8103d789ae8e65d4cddbc7a44252e414adfbd952312bdf94396127586e0c121"
     },
     {
       "path": "src/utils/reviewRouting.ts",
@@ -636,7 +636,7 @@
     },
     {
       "path": "src/utils/reviewScoreLoop.ts",
-      "sha256": "4ed5ab53856aa5b2271c29c5c213618294b71cd52bade8335761c4e5089afaad"
+      "sha256": "e3b96e67b1c87dd99c10f433776753102ee939914b29a6172500bc789dc69ca0"
     },
     {
       "path": "src/utils/runLog.ts",
@@ -834,7 +834,7 @@
     },
     {
       "path": "resources/prompts/run-implementation.md",
-      "sha256": "0e416dc3bebe2b2f0518cc9c9d0fb6926157a0259b80fe9ab923bab59608f7fc",
+      "sha256": "896ae4b2508e5be27a62b2d9eded46dbf919336f7fc7f85a31011694aa61a210",
       "category": "runtimeResourceCopy"
     },
     {

@@ -183,6 +183,36 @@ export function resolvePublishScopeFolder(
   return { folder: defaultFolder, stale: true };
 }
 
+/**
+ * Text that marks a plan checklist item as not-done-on-purpose. Matching it
+ * makes the item `failed` below: deferring is not completing.
+ *
+ * KNOWN LATENT CONTRADICTION — safe today, read this before changing either
+ * side. `run-implementation.md` and `apply-impl-review-code.md` both require
+ * a `## Plan Item Checklist` in which an unbuilt item is reported as
+ * `deferred — "out of this task's scope" per the plan's own division`. That
+ * is the sanctioned wording for an item a plan explicitly assigned to a
+ * DIFFERENT task — yet it matches this pattern, so it would score `failed`,
+ * and `buildPlanItemVerificationSection` then tells the publish reviewer its
+ * verdict "must never state 'no blockers' while a failed item here goes
+ * unaddressed". A task that correctly scoped itself would be penalised for
+ * doing so.
+ *
+ * Why that is not a live bug: this fires only when BOTH (a) plan-final.md
+ * carries a `- [ ]` checklist (collectAiVerifiedPlanItems returns undefined
+ * otherwise) and (b) something is legitimately outside the task's scope. (b)
+ * cannot happen under the current delivery rule — one plan is one task, which
+ * owns every step in it, so nothing is ever legitimately out of scope and
+ * `failed` is the correct verdict for any deferral. The scope-exception text
+ * in those prompts is defensive, for a plan that explicitly divides itself;
+ * it is inert while plans are not divided.
+ *
+ * So: if a plan ever DOES divide its scope across tasks, this pattern needs
+ * to distinguish scope-deferral (legitimate) from work-avoidance deferral
+ * (a real failure) — they read almost identically in prose, which is exactly
+ * why this is documented rather than pre-emptively "fixed" with a fragile
+ * regex. Deliberate decision, 2026-08-07.
+ */
 const DEFERRED_MARKERS = /\b(deferred|out[ -]of[ -]scope|won'?t (?:do|fix)|skipped)\b/i;
 
 /**
