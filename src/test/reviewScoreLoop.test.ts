@@ -465,3 +465,135 @@ void describe("improveReviewScore", () => {
     );
   });
 });
+
+/**
+ * Plan-progress signal (2026-08-07). The bug it fixes: a review's score was
+ * asked to answer two different questions at once — "is what was built any
+ * good" and "is the whole plan built yet". A clean-but-partial round therefore
+ * looked identical to a failure, so the loop retried the SAME scope instead of
+ * moving on to the next steps. Live evidence: task "workflow" sat at 6.3/10
+ * with zero blockers across six reviews and four providers, structurally unable
+ * to advance, while 17 of its 25 plan steps were never built.
+ *
+ * With the marker, "no blockers" means only "nothing is wrong"; completeness is
+ * reported separately, and the loop keeps building until the plan is done.
+ */
+void describe("improveReviewScore — plan progress", () => {
+  const cleanAt = (score: number, complete: number, total: number): ReviewRoundOutcome => ({
+    score,
+    taskFixableCount: 0,
+    zeroFixableEvidence: true,
+    progress: { complete, total },
+  });
+
+  void it("keeps building instead of declaring success while plan steps remain", async () => {
+    const context = fakeContext();
+    let applies = 0;
+    // Every round is clean, and each one lands one more step: 8/25 ... 12/25.
+    const result = await improveReviewScore({
+      context,
+      stage: "impl-high-review",
+      baselineScore: 6.3,
+      maxAttempts: 5,
+      zeroFixableTerminates: true,
+      apply: () => {
+        applies += 1;
+        return Promise.resolve();
+      },
+      review: () => Promise.resolve(cleanAt(9, 7 + applies, 25)),
+    });
+
+    // Pre-fix this returned zeroFixableSuccess after 2 rounds, stranding 17 steps.
+    assert.strictEqual(result.zeroFixableSuccess, false, "must not call a partial plan finished");
+    assert.strictEqual(applies, 5, "keeps implementing across the full attempt budget");
+  });
+
+  void it("terminates as success once the plan reports fully complete", async () => {
+    const context = fakeContext();
+    // Flat score, so the score-improvement path can't fire and this pins the
+    // zero-fixable path specifically: complete plan + clean rounds = done.
+    const result = await improveReviewScore({
+      context,
+      stage: "impl-high-review",
+      baselineScore: 6.3,
+      maxAttempts: 5,
+      zeroFixableTerminates: true,
+      apply: () => Promise.resolve(),
+      review: () => Promise.resolve(cleanAt(6.3, 25, 25)),
+    });
+
+    assert.strictEqual(result.zeroFixableSuccess, true);
+    assert.strictEqual(result.attempts, ZERO_FIXABLE_TERMINAL_ROUNDS);
+  });
+
+  void it("lets a score improvement finish the run once the plan is complete", async () => {
+    // The complement of the mid-plan guard below: with 25/25 reported, a
+    // genuine score improvement is allowed to end the run as before.
+    const context = fakeContext();
+    const result = await improveReviewScore({
+      context,
+      stage: "impl-high-review",
+      baselineScore: 5,
+      maxAttempts: 3,
+      apply: () => Promise.resolve(),
+      review: () => Promise.resolve(cleanAt(9, 25, 25)),
+    });
+
+    assert.strictEqual(result.improved, true);
+  });
+
+  void it("stops as stalled when a clean but incomplete plan stops advancing", async () => {
+    // The safety valve: "keep going" must not mean "burn every attempt doing
+    // nothing" if implementation stops landing steps.
+    const context = fakeContext();
+    let applies = 0;
+    const result = await improveReviewScore({
+      context,
+      stage: "impl-high-review",
+      baselineScore: 6.3,
+      maxAttempts: 20,
+      zeroFixableTerminates: true,
+      apply: () => {
+        applies += 1;
+        return Promise.resolve();
+      },
+      review: () => Promise.resolve(cleanAt(9, 8, 25)), // frozen at 8/25
+    });
+
+    assert.strictEqual(result.stalled, true);
+    assert.strictEqual(result.zeroFixableSuccess, false);
+    assert.ok(applies < 20, "stopped early rather than burning the whole attempt budget");
+  });
+
+  void it("does not let a high score advance the stage mid-plan", async () => {
+    // Scores now measure quality, so a flawless first batch can score high
+    // while most of the plan is unbuilt. That must not count as success.
+    const context = fakeContext();
+    const result = await improveReviewScore({
+      context,
+      stage: "impl-high-review",
+      baselineScore: 5,
+      maxAttempts: 3,
+      apply: () => Promise.resolve(),
+      review: () => Promise.resolve(cleanAt(10, 8, 25)), // big improvement, still partial
+    });
+
+    assert.strictEqual(result.improved, false, "a partial plan is never 'improved to done'");
+  });
+
+  void it("is unaffected when a review emits no progress marker (pre-marker behavior)", async () => {
+    const context = fakeContext();
+    const result = await improveReviewScore({
+      context,
+      stage: "impl-high-review",
+      baselineScore: 5,
+      maxAttempts: 3,
+      apply: () => Promise.resolve(),
+      // No `progress` field at all — exactly the old ReviewRoundOutcome shape.
+      review: () =>
+        Promise.resolve({ score: 9, taskFixableCount: 0, zeroFixableEvidence: true }),
+    });
+
+    assert.strictEqual(result.improved, true, "score-based success still works without the marker");
+  });
+});

@@ -109,6 +109,7 @@ import {
   parseReadiness,
   parseReviewBlockers,
   parseReviewBlockersDetailed,
+  parseReviewProgress,
 } from "../utils/reviewReadiness";
 import { scheduleAutomationChain, releaseAutomationChain } from "../utils/automationChain";
 import { buildVerifiedChecksSection, collectCompletionLintPreview, resolvePublishScopeFolder } from "../utils/completionLint";
@@ -3050,6 +3051,9 @@ export async function fastForwardReviewWithAI(
               // with no task-fixable entry, or an explicit no-blockers
               // statement — never the mere absence of the block.
               zeroFixableEvidence: hasZeroTaskFixableEvidence(newContent),
+              // "Clean so far" vs "clean and finished" — null when the review
+              // emitted no marker, which preserves the pre-marker behavior.
+              progress: parseReviewProgress(newContent),
             };
           },
         }).finally(() => linked.dispose());

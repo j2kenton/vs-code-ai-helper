@@ -3,7 +3,7 @@
   "generatedBy": "scripts/resolveProductionSourceUniverse.mjs",
   "description": "Production source universe as of the current working tree, resolved from the exact bundler options that produce dist/extension.js (esbuild.config.js) plus the contribution-asset and runtime-resource-copy rules in scripts/lib/productionSourceScan.mjs. Regenerated every run; diffed against the immutable pre-gate snapshot (workflow-production-source-pregate-v1.json), not authoritative on its own.",
   "packageName": "vs-code-ai-helper",
-  "packageVersion": "0.74.7",
+  "packageVersion": "0.75.0",
   "declaredMain": "./dist/extension.js",
   "entrypoint": "src/extension.ts",
   "outfile": "dist/extension.js",
@@ -168,7 +168,7 @@
     },
     {
       "path": "src/commands/reviewActions.ts",
-      "sha256": "eb4357b9b2e42088d30a0db02f3afd80a3f3768326ba25935e40d72c312578ff"
+      "sha256": "9ec5d5689b6c0830327bead7fc797dbb5844dca866049e508084da4b6d2e9248"
     },
     {
       "path": "src/commands/reviewCurrentTask.ts",
@@ -628,7 +628,7 @@
     },
     {
       "path": "src/utils/reviewReadiness.ts",
-      "sha256": "de33839f46cd40266b151b871bd5178ebe144e3921132978f962c0a3f21f01e4"
+      "sha256": "24deacea160a715cef8d33ef01f2999f9f97195095a76c583a3e0b2278042ba2"
     },
     {
       "path": "src/utils/reviewRouting.ts",
@@ -636,7 +636,7 @@
     },
     {
       "path": "src/utils/reviewScoreLoop.ts",
-      "sha256": "08e27fd8705744401ca8b38deac206822e9f645b7dcd6b7fa9d5214cfcf152b9"
+      "sha256": "4ed5ab53856aa5b2271c29c5c213618294b71cd52bade8335761c4e5089afaad"
     },
     {
       "path": "src/utils/runLog.ts",
@@ -734,7 +734,7 @@
     },
     {
       "path": "resources/prompts/apply-impl-review-code.md",
-      "sha256": "4b4d97d2da63d3e3132a8a602dd136c89a96308c55468030880edb80d16ce5db",
+      "sha256": "bd9260af86677bbb674e8e0b4d4b340f1f2ccb0ffbf8bd3a9c7bde5d5b64141a",
       "category": "runtimeResourceCopy"
     },
     {
@@ -779,12 +779,12 @@
     },
     {
       "path": "resources/prompts/review-impl-high-rereview.md",
-      "sha256": "0656b878e2746b9ca80c1481c242f7099349eacbac23f1ca037461a8c3323d88",
+      "sha256": "078f6da1ad1a2730d8fe886831e961280fe8a8ac1ce5066c0a8b5f9e215dbd99",
       "category": "runtimeResourceCopy"
     },
     {
       "path": "resources/prompts/review-impl-high.md",
-      "sha256": "a82acafbb1992094ca0a0e02ea499e946d6b7378a3f4588e8fd01249e292451c",
+      "sha256": "0a1b69b3620b488616273c50ae0bce90a2a4d0001db9f718aa228456af1e5162",
       "category": "runtimeResourceCopy"
     },
     {

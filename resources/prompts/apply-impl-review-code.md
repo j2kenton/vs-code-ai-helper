@@ -14,6 +14,7 @@ Read the approved plan, implementation notes, and review below, then:
 4. Treat review-confidence blockers as an instruction to inspect the workspace directly or improve the missing evidence, not as proof of a code defect
 5. Address non-blocking suggestions where they are clearly correct and in scope
 6. Edit files directly in the workspace, and remove anything obsolete
+7. If the review reports NO blockers but the plan is not finished — look for a `<!-- progress: N/M -->` marker where N is less than M, or a verdict naming steps still to come — then this round's job is to **build the next steps of the plan**, continuing in the plan's own order from where the last round stopped. "No blockers" means nothing is wrong with what exists; it does not mean the work is done. Reporting "no changes needed" while plan steps remain unbuilt stalls the task, because this same review-then-implement cycle is what carries a large plan to completion a batch at a time. Implement as much of the remaining order as you can do well in one round — correctness and verification first, volume second — then state exactly which steps you completed and which are still outstanding.
 
 The approved plan is the binding delivery contract. Implementation notes are
 historical evidence, not approval to reduce, substitute, or defer a plan

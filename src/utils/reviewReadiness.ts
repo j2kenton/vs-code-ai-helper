@@ -158,6 +158,65 @@ export function hasZeroTaskFixableEvidence(content: string): boolean {
   return EXPLICIT_NO_BLOCKERS_RE.test(content);
 }
 
+/**
+ * How far through an ordered plan a review reports the implementation to be.
+ * `complete` counts steps the reviewer verified as landed and in order;
+ * `total` is the plan's own step count.
+ */
+export interface ReviewProgress {
+  complete: number;
+  total: number;
+}
+
+/**
+ * Global (not first-match) on purpose: the prompt that asks for this marker
+ * contains a worked example of it, and models routinely echo format
+ * instructions back before emitting the real thing. Matching the FIRST
+ * occurrence would then parse the example's numbers every single round —
+ * reporting frozen progress for a run that is genuinely advancing. The
+ * reviewer is told to end its response with the marker, so the LAST
+ * occurrence is the authoritative one. (Same failure mode, and same fix, as
+ * parseAiResultEnvelopeV1 scanning for the last frame marker rather than the
+ * first — this repo's own reviews quote both formats in prose.)
+ */
+const PROGRESS_MARKER_RE = /<!--\s*progress\s*:\s*(\d+)\s*\/\s*(\d+)\s*-->/gi;
+
+/**
+ * Parse the machine-readable plan-progress marker a review emits alongside
+ * its blocker block (see resources/prompts/review-impl-high.md):
+ *
+ *   <!-- progress: 8/25 -->
+ *
+ * This is the signal that lets the loop distinguish the two very different
+ * situations a low score used to conflate: "what was built is wrong" (fix it)
+ * versus "what was built is right, there is simply more of the plan left"
+ * (keep building). Without it, a clean-but-partial round reads as failure and
+ * the loop retries the SAME scope forever instead of advancing to the next
+ * steps — the multi-round runaway this marker exists to end.
+ *
+ * Returns null when the marker is absent (older prompt, or a provider that
+ * ignored it) or nonsensical (`total` of zero, `complete` past `total`), so
+ * every caller degrades to exactly the pre-marker behavior rather than acting
+ * on a number it cannot trust.
+ */
+export function parseReviewProgress(content: string): ReviewProgress | null {
+  // matchAll clones the regex internally, so the module-level `g` flag's
+  // lastIndex is never carried between calls.
+  const match = [...content.matchAll(PROGRESS_MARKER_RE)].at(-1);
+  if (!match) {
+    return null;
+  }
+  const complete = Number.parseInt(match[1] ?? "", 10);
+  const total = Number.parseInt(match[2] ?? "", 10);
+  if (!Number.isInteger(complete) || !Number.isInteger(total)) {
+    return null;
+  }
+  if (total <= 0 || complete < 0 || complete > total) {
+    return null;
+  }
+  return { complete, total };
+}
+
 /** See {@link parseReviewBlockers}; also reports whether the block existed. */
 export function parseReviewBlockersDetailed(content: string): ReviewBlockerEvidence {
   const match = BLOCKERS_BLOCK_RE.exec(content);

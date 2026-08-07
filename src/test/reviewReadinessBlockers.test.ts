@@ -4,6 +4,7 @@ import {
   hasZeroTaskFixableEvidence,
   parseReviewBlockers,
   parseReviewBlockersDetailed,
+  parseReviewProgress,
 } from "../utils/reviewReadiness";
 
 void describe("parseReviewBlockers", () => {
@@ -173,6 +174,88 @@ void describe("blockers block: presence vs absence", () => {
       hasZeroTaskFixableEvidence(content),
       false,
       "prose that does not match the explicit no-blockers phrasing is not evidence"
+    );
+  });
+});
+
+/**
+ * The plan-progress marker (2026-08-07). A review's score answers "is what was
+ * built any good"; this marker answers "is there more of the plan to build".
+ * Conflating the two into the score is what made a clean-but-partial round read
+ * as failure, so the loop retried the same scope instead of continuing — see
+ * reviewScoreLoop.ts's own progress handling for the consuming side.
+ */
+void describe("parseReviewProgress", () => {
+  void it("parses a well-formed progress marker", () => {
+    assert.deepStrictEqual(parseReviewProgress("Readiness: 9/10\n\n<!-- progress: 8/25 -->"), {
+      complete: 8,
+      total: 25,
+    });
+  });
+
+  void it("tolerates spacing and case variation", () => {
+    assert.deepStrictEqual(parseReviewProgress("<!--progress:3/7-->"), { complete: 3, total: 7 });
+    assert.deepStrictEqual(parseReviewProgress("<!--   PROGRESS :  12 / 12   -->"), {
+      complete: 12,
+      total: 12,
+    });
+  });
+
+  void it("recognizes a fully complete plan", () => {
+    assert.deepStrictEqual(parseReviewProgress("<!-- progress: 25/25 -->"), {
+      complete: 25,
+      total: 25,
+    });
+  });
+
+  void it("returns null when the marker is absent, so behavior degrades to pre-marker", () => {
+    assert.strictEqual(parseReviewProgress("Readiness: 9/10\n\nNo marker here."), null);
+  });
+
+  void it("returns null for nonsensical values rather than acting on them", () => {
+    assert.strictEqual(parseReviewProgress("<!-- progress: 5/0 -->"), null, "zero total");
+    assert.strictEqual(parseReviewProgress("<!-- progress: 9/5 -->"), null, "complete past total");
+    assert.strictEqual(parseReviewProgress("<!-- progress: x/5 -->"), null, "non-numeric");
+  });
+
+  void it("accepts zero completed steps", () => {
+    assert.deepStrictEqual(parseReviewProgress("<!-- progress: 0/25 -->"), {
+      complete: 0,
+      total: 25,
+    });
+  });
+
+  void it("takes the LAST marker, so an echoed prompt example cannot win", () => {
+    // The prompt asking for this marker contains a worked example of it, and
+    // models routinely restate format instructions before complying. Matching
+    // the first occurrence would parse the example's 8/25 every round and
+    // report frozen progress for a run that is actually advancing.
+    const review = [
+      "Readiness: 9/10",
+      "",
+      "The prompt asked me to end with `<!-- progress: 8/25 -->`.",
+      "",
+      "I completed steps 9 through 13 this round.",
+      "",
+      "<!-- progress: 13/25 -->",
+    ].join("\n");
+    assert.deepStrictEqual(parseReviewProgress(review), { complete: 13, total: 25 });
+  });
+
+  void it("is stable across repeated calls (no lastIndex leakage from the global regex)", () => {
+    const content = "<!-- progress: 4/9 -->";
+    assert.deepStrictEqual(parseReviewProgress(content), { complete: 4, total: 9 });
+    assert.deepStrictEqual(parseReviewProgress(content), { complete: 4, total: 9 });
+    assert.deepStrictEqual(parseReviewProgress(content), { complete: 4, total: 9 });
+  });
+
+  void it("falls back to the last VALID marker shape when a later one is nonsense", () => {
+    // A trailing malformed marker still yields null rather than silently
+    // using an earlier one — the reviewer's final word is authoritative even
+    // when it is unusable, so the loop degrades to pre-marker behavior.
+    assert.strictEqual(
+      parseReviewProgress("<!-- progress: 4/9 -->\n<!-- progress: 9/4 -->"),
+      null
     );
   });
 });

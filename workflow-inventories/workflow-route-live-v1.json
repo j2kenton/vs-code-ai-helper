@@ -3,7 +3,7 @@
   "generatedBy": "scripts/generateWorkflowRoutes.mjs",
   "description": "Mechanically extracted workflow route surface of the current working tree (plan §1.2): command registrations, contribution/menu references, internal executeCommand edges, dynamic dispatch sites, webview message roots, tree-item command bindings, provider-boundary call sites, legacy output destinations, and per-file legacy-AI-gate calls — every edge a concrete route row. Scanned over the exact §1.1 production source universe (never a filesystem walk). Regenerated every run; classification lives in workflow-route-baseline-v1.json; the immutable pre-gate reference is workflow-route-pregate-v1.json. Known mechanical bound: tree-item/status-row command bindings are collected only when the bound command ID is a string literal — dynamically bound commands are enforced at their executeCommand dispatch sites instead (dynamicDispatches, which fail closed without an annotation). sourceUniverseSha256 is the CANONICAL (line-ending-independent) digest of the source-universe JSON, so provenance is identical across LF and CRLF checkouts.",
   "sourceUniverse": "workflow-inventories/workflow-production-source-baseline-v1.json",
-  "sourceUniverseSha256": "e9f5a240efddfc6e2c682f9d66f4f43ff18646eafa7e90662e1d10b246629bd3",
+  "sourceUniverseSha256": "26e38164ffc9da3220f24e6a39de42002684e88a47ce743ef10741857e79702f",
   "routeCount": 100,
   "routes": [
     {
@@ -78,7 +78,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.applyReviewEditWithAI",
       "path": "src/commands/reviewActions.ts",
-      "span": "L5215-L5219",
+      "span": "L5219-L5223",
       "registrationSymbol": "registerReviewActionCommands",
       "contributed": true,
       "keybound": false,
@@ -102,7 +102,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.applyReviewWithAI",
       "path": "src/commands/reviewActions.ts",
-      "span": "L5210-L5214",
+      "span": "L5214-L5218",
       "registrationSymbol": "registerReviewActionCommands",
       "contributed": true,
       "keybound": false,
@@ -207,7 +207,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.chooseReleaseTarget",
       "path": "src/commands/reviewActions.ts",
-      "span": "L5246-L5270",
+      "span": "L5250-L5274",
       "registrationSymbol": "registerReviewActionCommands",
       "contributed": true,
       "keybound": false,
@@ -271,21 +271,21 @@
         "view/item/context"
       ],
       "treeBindings": [
-        "src/commands/reviewActions.ts#L1568-L1568",
-        "src/commands/reviewActions.ts#L1581-L1581",
-        "src/commands/reviewActions.ts#L1740-L1740",
-        "src/commands/reviewActions.ts#L1778-L1778",
-        "src/commands/reviewActions.ts#L1790-L1790",
-        "src/commands/reviewActions.ts#L1817-L1817",
-        "src/commands/reviewActions.ts#L1875-L1875",
-        "src/commands/reviewActions.ts#L3071-L3071",
-        "src/commands/reviewActions.ts#L3096-L3096",
-        "src/commands/reviewActions.ts#L3156-L3156",
-        "src/commands/reviewActions.ts#L3172-L3172",
-        "src/commands/reviewActions.ts#L3210-L3210",
-        "src/commands/reviewActions.ts#L3756-L3756",
-        "src/commands/reviewActions.ts#L3781-L3781",
-        "src/commands/reviewActions.ts#L3796-L3796",
+        "src/commands/reviewActions.ts#L1569-L1569",
+        "src/commands/reviewActions.ts#L1582-L1582",
+        "src/commands/reviewActions.ts#L1741-L1741",
+        "src/commands/reviewActions.ts#L1779-L1779",
+        "src/commands/reviewActions.ts#L1791-L1791",
+        "src/commands/reviewActions.ts#L1818-L1818",
+        "src/commands/reviewActions.ts#L1876-L1876",
+        "src/commands/reviewActions.ts#L3075-L3075",
+        "src/commands/reviewActions.ts#L3100-L3100",
+        "src/commands/reviewActions.ts#L3160-L3160",
+        "src/commands/reviewActions.ts#L3176-L3176",
+        "src/commands/reviewActions.ts#L3214-L3214",
+        "src/commands/reviewActions.ts#L3760-L3760",
+        "src/commands/reviewActions.ts#L3785-L3785",
+        "src/commands/reviewActions.ts#L3800-L3800",
         "src/commands/setTaskStage.ts#L293-L293"
       ],
       "fileGateRouteIds": [
@@ -404,7 +404,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.fastForwardReviewWithAI",
       "path": "src/commands/reviewActions.ts",
-      "span": "L5220-L5224",
+      "span": "L5224-L5228",
       "registrationSymbol": "registerReviewActionCommands",
       "contributed": true,
       "keybound": false,
@@ -464,7 +464,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.generateImplementationWithAI",
       "path": "src/commands/reviewActions.ts",
-      "span": "L5201-L5205",
+      "span": "L5205-L5209",
       "registrationSymbol": "registerReviewActionCommands",
       "contributed": false,
       "keybound": false,
@@ -494,7 +494,7 @@
         "view/item/context"
       ],
       "treeBindings": [
-        "src/commands/reviewActions.ts#L3713-L3713"
+        "src/commands/reviewActions.ts#L3717-L3717"
       ],
       "fileGateRouteIds": [
         "generatePlan.v1"
@@ -567,7 +567,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.nextStage",
       "path": "src/commands/reviewActions.ts",
-      "span": "L5229-L5233",
+      "span": "L5233-L5237",
       "registrationSymbol": "registerReviewActionCommands",
       "contributed": true,
       "keybound": true,
@@ -681,7 +681,7 @@
         "src/commands/chatWithStage.ts#L478-L478",
         "src/commands/draftTaskWithAI.ts#L427-L427",
         "src/commands/generatePlanWithAI.ts#L457-L457",
-        "src/commands/reviewActions.ts#L4878-L4878"
+        "src/commands/reviewActions.ts#L4882-L4882"
       ],
       "fileGateRouteIds": [],
       "fileEdgesOut": [
@@ -789,7 +789,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.release",
       "path": "src/commands/reviewActions.ts",
-      "span": "L5242-L5245",
+      "span": "L5246-L5249",
       "registrationSymbol": "registerReviewActionCommands",
       "contributed": true,
       "keybound": false,
@@ -945,7 +945,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.runImplementationWithAI",
       "path": "src/commands/reviewActions.ts",
-      "span": "L5237-L5241",
+      "span": "L5241-L5245",
       "registrationSymbol": "registerReviewActionCommands",
       "contributed": true,
       "keybound": false,
@@ -953,8 +953,8 @@
         "view/item/context"
       ],
       "treeBindings": [
-        "src/commands/reviewActions.ts#L247-L247",
-        "src/commands/reviewActions.ts#L3724-L3724"
+        "src/commands/reviewActions.ts#L248-L248",
+        "src/commands/reviewActions.ts#L3728-L3728"
       ],
       "fileGateRouteIds": [
         "applyReview.v1",
@@ -1024,7 +1024,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.runReviewWithAI",
       "path": "src/commands/reviewActions.ts",
-      "span": "L5206-L5209",
+      "span": "L5210-L5213",
       "registrationSymbol": "registerReviewActionCommands",
       "contributed": true,
       "keybound": false,
@@ -1261,7 +1261,7 @@
       "kind": "command",
       "commandId": "vs-code-ai-helper.viewReview",
       "path": "src/commands/reviewActions.ts",
-      "span": "L5225-L5228",
+      "span": "L5229-L5232",
       "registrationSymbol": "registerReviewActionCommands",
       "contributed": true,
       "keybound": false,
@@ -1361,7 +1361,7 @@
       "kind": "internalEdge",
       "commandId": "vs-code-ai-helper.runReviewWithAI",
       "path": "src/commands/reviewActions.ts",
-      "span": "L3410-L3413",
+      "span": "L3414-L3417",
       "enclosingSymbol": "viewReview",
       "occurrence": 1
     },
@@ -1619,7 +1619,7 @@
     {
       "commandId": "vs-code-ai-helper.runReviewWithAI",
       "path": "src/commands/reviewActions.ts",
-      "span": "L3410-L3413",
+      "span": "L3414-L3417",
       "enclosingSymbol": "viewReview"
     },
     {
@@ -1805,84 +1805,84 @@
       "routeId": "review.v1",
       "gateKind": "throwing",
       "path": "src/commands/reviewActions.ts",
-      "span": "L2052-L2052",
+      "span": "L2053-L2053",
       "enclosingSymbol": "runReviewForFolder"
     },
     {
       "routeId": "review.v1",
       "gateKind": "throwing",
       "path": "src/commands/reviewActions.ts",
-      "span": "L2208-L2208",
+      "span": "L2209-L2209",
       "enclosingSymbol": "runReviewWithAI"
     },
     {
       "routeId": "applyReview.v1",
       "gateKind": "throwing",
       "path": "src/commands/reviewActions.ts",
-      "span": "L2305-L2305",
+      "span": "L2306-L2306",
       "enclosingSymbol": "applyReviewWithAI"
     },
     {
       "routeId": "applyReviewEdit.v1",
       "gateKind": "throwing",
       "path": "src/commands/reviewActions.ts",
-      "span": "L2313-L2313",
+      "span": "L2314-L2314",
       "enclosingSymbol": "applyReviewWithAI"
     },
     {
       "routeId": "applyReviewEdit.v1",
       "gateKind": "throwing",
       "path": "src/commands/reviewActions.ts",
-      "span": "L2342-L2342",
+      "span": "L2343-L2343",
       "enclosingSymbol": "applyReviewWithAI"
     },
     {
       "routeId": "applyReview.v1",
       "gateKind": "throwing",
       "path": "src/commands/reviewActions.ts",
-      "span": "L2427-L2427",
+      "span": "L2428-L2428",
       "enclosingSymbol": "runApply"
     },
     {
       "routeId": "fastForward.v1",
       "gateKind": "throwing",
       "path": "src/commands/reviewActions.ts",
-      "span": "L2666-L2666",
+      "span": "L2667-L2667",
       "enclosingSymbol": "fastForwardReviewWithAI"
     },
     {
       "routeId": "applyReviewEdit.v1",
       "gateKind": "throwing",
       "path": "src/commands/reviewActions.ts",
-      "span": "L3257-L3257",
+      "span": "L3261-L3261",
       "enclosingSymbol": "applyImplementationReviewWithAI"
     },
     {
       "routeId": "generateImplementation.v1",
       "gateKind": "throwing",
       "path": "src/commands/reviewActions.ts",
-      "span": "L4047-L4047",
+      "span": "L4051-L4051",
       "enclosingSymbol": "generateImplementationWithAI"
     },
     {
       "routeId": "implementation.v1",
       "gateKind": "throwing",
       "path": "src/commands/reviewActions.ts",
-      "span": "L4740-L4740",
+      "span": "L4744-L4744",
       "enclosingSymbol": "runImplementationWithAI"
     },
     {
       "routeId": "applyReviewEdit.v1",
       "gateKind": "throwing",
       "path": "src/commands/reviewActions.ts",
-      "span": "L5025-L5025",
+      "span": "L5029-L5029",
       "enclosingSymbol": "applyReviewEditWithAI"
     },
     {
       "routeId": "applyReviewEdit.v1",
       "gateKind": "throwing",
       "path": "src/commands/reviewActions.ts",
-      "span": "L5121-L5121",
+      "span": "L5125-L5125",
       "enclosingSymbol": "runApply"
     },
     {

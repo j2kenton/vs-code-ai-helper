@@ -34,6 +34,20 @@ export async function recordBestReviewScore(context: vscode.ExtensionContext, st
 export const ZERO_FIXABLE_TERMINAL_ROUNDS = 2;
 
 /**
+ * How many consecutive clean-but-incomplete rounds may pass WITHOUT the
+ * reported plan progress advancing before the loop gives up and reports
+ * `stalled`.
+ *
+ * The safety valve on continuing through an incomplete plan: "zero blockers,
+ * more steps remain" tells the loop to keep building, but if implementation
+ * then lands nothing new round after round, continuing would burn the entire
+ * attempt budget achieving nothing — the exact runaway this whole signal
+ * exists to prevent, just wearing a different hat. Two rounds, matching
+ * ZERO_FIXABLE_TERMINAL_ROUNDS, so one unproductive round is tolerated.
+ */
+export const PROGRESS_STALL_ROUNDS = 2;
+
+/**
  * Where a pause came from, when the caller can tell:
  *  - "escalation": handleReviewRoutingOutcome (reviewActions.ts) escalated
  *    and paused the task from INSIDE this run's own review round.
@@ -67,6 +81,18 @@ export interface ReviewRoundOutcome {
    * (see reviewReadiness.ts's hasZeroTaskFixableEvidence).
    */
   zeroFixableEvidence: boolean;
+  /**
+   * How far through an ordered plan this round reports the implementation to
+   * be (reviewReadiness.ts's parseReviewProgress), or null/absent when the
+   * review emitted no progress marker.
+   *
+   * This is what separates "clean AND finished" from "clean SO FAR": with
+   * zero blockers and `complete < total`, the correct move is to keep
+   * building the next steps, NOT to declare the run successful. Absent
+   * (null/undefined) restores the exact pre-marker behavior, so a review from
+   * an older prompt — or a provider that ignored the marker — is unaffected.
+   */
+  progress?: { complete: number; total: number } | null;
 }
 
 export interface ImproveReviewScoreResult {
@@ -175,6 +201,9 @@ export async function improveReviewScore(options: {
   let best: number | null = null;
   let escalationDeferred = false;
   let consecutiveZeroFixable = 0;
+  /** Last round's reported `progress.complete`, for detecting forward movement. */
+  let previousComplete: number | null = null;
+  let roundsWithoutProgressAdvance = 0;
   const maxAttempts = Math.max(1, options.maxAttempts ?? MAX_REVIEW_ATTEMPTS);
   const stopAtScore = Math.max(0, Math.min(10, options.stopAtScore ?? 0));
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -209,6 +238,19 @@ export async function improveReviewScore(options: {
     if (round === null || score === null) {
       return { score: best, attempts: attempt, improved: false, stalled: true, paused: false, escalationDeferred, zeroFixableSuccess: false };
     }
+    // Plan-progress tracking (see ReviewRoundOutcome.progress). A round that
+    // reports no marker leaves all of this null/untouched, so every decision
+    // below is bit-for-bit the pre-marker behavior for those reviews.
+    const progress = round.progress ?? null;
+    const planIncomplete = progress !== null && progress.complete < progress.total;
+    if (progress !== null) {
+      if (previousComplete !== null) {
+        roundsWithoutProgressAdvance =
+          progress.complete > previousComplete ? 0 : roundsWithoutProgressAdvance + 1;
+      }
+      previousComplete = progress.complete;
+    }
+
     // Compare in integer tenths: scores are normalized to one decimal
     // (reviewReadiness.ts), and `baseline + 0.1` is not exactly representable
     // in IEEE-754, so a direct `>=` misfires exactly at the boundary.
@@ -218,12 +260,33 @@ export async function improveReviewScore(options: {
     // Fast Forward is only successful after it has made measurable progress
     // from the score it started with.  A configured target may require more,
     // but must not let a task at (or above) that target stop without improving.
-    if (improved && (stopAtScore === 0 || score >= stopAtScore)) {
+    //
+    // `!planIncomplete` guards the same trap as the zero-fixable branch
+    // below: now that scores measure the QUALITY of what was built rather
+    // than the fraction of the plan present, a flawless first batch can
+    // legitimately score high while most of the plan is still unbuilt.
+    // Returning success there would advance the stage and strand every
+    // remaining step. A review with no progress marker is unaffected.
+    if (improved && (stopAtScore === 0 || score >= stopAtScore) && !planIncomplete) {
       return { score, attempts: attempt, improved: true, stalled: false, paused: false, escalationDeferred, zeroFixableSuccess: false };
     }
+
     consecutiveZeroFixable = round.zeroFixableEvidence ? consecutiveZeroFixable + 1 : 0;
     if (options.zeroFixableTerminates === true && consecutiveZeroFixable >= ZERO_FIXABLE_TERMINAL_ROUNDS) {
-      return { score, attempts: attempt, improved: false, stalled: false, paused: false, escalationDeferred, zeroFixableSuccess: true };
+      // Zero task-fixable blockers means "nothing is WRONG" — which is only
+      // the same thing as "we are DONE" when the plan has no steps left. With
+      // an ordered plan still mid-flight, terminating here is precisely the
+      // bug this signal fixes: it declares success at (say) 8 of 25 steps and
+      // strands the remaining 17. Keep going instead, so the next round
+      // implements the next steps.
+      if (!planIncomplete) {
+        return { score, attempts: attempt, improved: false, stalled: false, paused: false, escalationDeferred, zeroFixableSuccess: true };
+      }
+      // ...unless implementation has stopped actually landing steps, in which
+      // case "keep going" would just burn the attempt budget (PROGRESS_STALL_ROUNDS).
+      if (roundsWithoutProgressAdvance >= PROGRESS_STALL_ROUNDS) {
+        return { score: best, attempts: attempt, improved: false, stalled: true, paused: false, escalationDeferred, zeroFixableSuccess: false };
+      }
     }
   }
   return { score: best, attempts: maxAttempts, improved: false, stalled: false, paused: false, escalationDeferred, zeroFixableSuccess: false };

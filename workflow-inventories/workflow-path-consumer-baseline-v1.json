@@ -240,37 +240,37 @@
         },
         {
           "signal": "workspace.fs",
-          "span": "L700-L700",
+          "span": "L701-L701",
           "enclosingSymbol": "entries"
         },
         {
           "signal": "workspace.fs",
-          "span": "L713-L713",
+          "span": "L714-L714",
           "enclosingSymbol": "legacyEntries"
         },
         {
           "signal": "workspace.fs",
-          "span": "L1530-L1530",
+          "span": "L1531-L1531",
           "enclosingSymbol": "contentBytes"
         },
         {
           "signal": "workspace.fs",
-          "span": "L2020-L2020",
+          "span": "L2021-L2021",
           "enclosingSymbol": "runReviewForFolder"
         },
         {
           "signal": "workspace.fs",
-          "span": "L2037-L2037",
+          "span": "L2038-L2038",
           "enclosingSymbol": "runReviewForFolder"
         },
         {
           "signal": "workspace.fs",
-          "span": "L2425-L2425",
+          "span": "L2426-L2426",
           "enclosingSymbol": "runApply"
         },
         {
           "signal": "workspace.fs",
-          "span": "L5685-L5685",
+          "span": "L5689-L5689",
           "enclosingSymbol": "buildReviewResumeVariablesV1"
         }
       ],
