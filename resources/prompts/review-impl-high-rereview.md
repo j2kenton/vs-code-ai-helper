@@ -20,13 +20,15 @@ Plans built across multiple implementation rounds. A plan larger than one implem
 - In the summary verdict, describe a plan progressing correctly and in order as on track (naming the step count, e.g. "on track — 6 of 18 ordered steps complete"), not "off track", even while much of the plan remains to be built. Reserve "off track" for genuine trouble: out-of-order or skipped foundational steps, defects, or deviation from the plan's contract.
 - When the plan is still incomplete and you found no blockers, say plainly in the summary verdict which steps come next, so the next implementation round knows exactly what to build.
 
-Plan progress — required whenever the plan has discrete, countable steps. End your response with this marker on its own line, giving the number of plan steps fully implemented and verified, over the plan's total step count:
+Plan progress — required whenever the plan has discrete, countable steps. End your response with this marker on its own line: steps fully implemented and verified, over the number of steps THIS TASK is responsible for delivering.
 
 ```
 <!-- progress: 8/25 -->
 ```
 
-Count a step as complete only when it is actually implemented and verified — not merely started, stubbed, or planned. If the plan has no meaningful step structure to count, omit the marker entirely rather than inventing numbers. Emit `<!-- progress: 25/25 -->` when every step is done; that is what allows the task to advance past implementation.
+The denominator is this task's own scope, which is normally just the plan's total step count. It differs only when the plan itself explicitly assigns part of its scope to separate or follow-up tasks (e.g. "delivery is five sequenced tasks, one per stage"). In that case count only the portion THIS task owns — a task delivering an 8-step stage of a 25-step plan reports `8/8` when that stage is done, not `8/25` — and say so in your verdict. Never narrow the scope on your own judgement that something would be better done later; only an explicit division written into the plan counts, and everything else in the plan stays this task's responsibility.
+
+Count a step as complete only when it is actually implemented and verified — not merely started, stubbed, or planned. If the plan has no meaningful step structure to count, omit the marker entirely rather than inventing numbers. When the numerator equals the denominator, this task's work is done; that is what allows it to advance past implementation.
 
 For every major plan area, compare the actual behavior to the explicit plan
 contract and acceptance criteria. Do not treat an unapproved reduction,
