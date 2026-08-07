@@ -660,7 +660,7 @@
     },
     {
       "path": "src/utils/taskProgressTransforms.ts",
-      "sha256": "38e0c8932bfe15ee46a4fb6f6f3d4ca7b66ec2a7f6ce49acbf8338c71a68999f"
+      "sha256": "79f48b1c181540e1c9d861f863c0e36f74c650aee9982e8402bc0d501cb477bf"
     },
     {
       "path": "src/utils/taskRoot.ts",

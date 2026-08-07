@@ -17,6 +17,7 @@ import {
   ReviewRejectionEntry,
   ReviewScoreHistoryEntry,
   TaskEscalation,
+  STAGE_ORDER,
   TaskProgress,
   TaskStage,
   TaskStatus,
@@ -41,9 +42,41 @@ export function updateTaskProgressStage(
   // stage being left — an escalation recorded there would otherwise linger
   // and be shown against the new stage it has nothing to do with.
   const { escalation: _unused, ...withoutEscalation } = progress;
+
+  // Moving BACKWARDS (Set Stage as Current, or any correction after a stage
+  // advanced too early) must retract the stages being re-entered. Without
+  // this the task claims currentStage: "impl-high-review" while
+  // completedStages still lists "impl-high-review" AND "impl-low-review" —
+  // a state that says a stage is simultaneously in progress and finished.
+  // The tree renders those stages as done (taskTreeProvider's getStageStatus
+  // reads this list), and anything asking "has this stage been through?"
+  // gets the wrong answer for work that is about to be redone.
+  //
+  // taskProgressFieldPolicyV1's reopen path already retracts exactly this
+  // way, but it is gated on `status === "completed"` — it only covers
+  // reopening a FINISHED task, never rolling an active one back. That gap
+  // was hit twice on 2026-08-07 and both times required hand-editing
+  // task-progress.json.
+  const newIndex = STAGE_ORDER.indexOf(newStage);
+  const currentIndex = STAGE_ORDER.indexOf(progress.currentStage);
+  const movingBackwards = newIndex >= 0 && currentIndex >= 0 && newIndex < currentIndex;
+  // `progress.completedStages !== undefined` keeps an absent field absent:
+  // filtering `?? []` would materialize an empty array on a task that never
+  // recorded one, adding a field the decoder then has to carry around.
+  const completedStages =
+    movingBackwards && progress.completedStages !== undefined
+      ? progress.completedStages.filter((stage) => {
+          const index = STAGE_ORDER.indexOf(stage);
+          // An unrecognized stage has no position to compare, so it is left
+          // alone rather than silently dropped.
+          return index < 0 || index < newIndex;
+        })
+      : progress.completedStages;
+
   return {
     ...withoutEscalation,
     currentStage: newStage,
+    ...(completedStages !== undefined ? { completedStages } : {}),
     fallbackActive: Object.keys(fallbackActive).length > 0
       ? fallbackActive
       : undefined,

@@ -1,7 +1,7 @@
 import * as assert from "node:assert/strict";
 import { test } from "node:test";
 import { appendReviewRejection, appendReviewScoreHistory, clearEscalation, clearImplementationTypeCheckFailure, clearStageFallbackReservation, recordEscalation, recordImplementationTypeCheckFailure, updateImplReviewFiles, clearImplReviewFiles, updateTaskProgressStage } from "../utils/taskProgressTransforms";
-import { MAX_REVIEW_REJECTIONS, MAX_REVIEW_SCORE_HISTORY, ReviewRejectionEntry, ReviewScoreHistoryEntry, type TaskProgress } from "../types/taskProgress";
+import { MAX_REVIEW_REJECTIONS, MAX_REVIEW_SCORE_HISTORY, ReviewRejectionEntry, ReviewScoreHistoryEntry, type TaskProgress, type TaskStage } from "../types/taskProgress";
 
 function makeProgress(implReviewFiles?: string[]): TaskProgress {
   return {
@@ -366,4 +366,75 @@ void test("keeps earlier rounds when a later round changes only machine-maintain
     "workflow-inventories/workflow-production-source-live-v1.json",
   ]);
   assert.deepStrictEqual(progress.implReviewFiles, ["real-work.ts"]);
+});
+
+// ---------------------------------------------------------------------------
+// Stage rollback retracts completedStages (2026-08-07). Moving an ACTIVE task
+// backwards — Set Stage as Current, or correcting a stage that advanced too
+// early — used to leave completedStages claiming the re-entered stage and
+// every later one were still finished. taskProgressFieldPolicyV1's reopen path
+// already retracts correctly, but it is gated on status === "completed", so it
+// never covered an active rollback. That gap was hit twice in one day and both
+// times needed task-progress.json edited by hand.
+// ---------------------------------------------------------------------------
+
+void test("rolling back an active task retracts the re-entered stage and everything after it", () => {
+  const progress: TaskProgress = {
+    ...makeProgress(),
+    currentStage: "publish",
+    completedStages: ["desc", "plan", "plan-high-review", "plan-low-review", "impl", "impl-high-review", "impl-low-review"],
+  };
+  const rolled = updateTaskProgressStage(progress, "impl-high-review");
+  assert.strictEqual(rolled.currentStage, "impl-high-review");
+  assert.deepStrictEqual(rolled.completedStages, [
+    "desc",
+    "plan",
+    "plan-high-review",
+    "plan-low-review",
+    "impl",
+  ]);
+});
+
+void test("a stage is never both current and completed after a rollback", () => {
+  const progress: TaskProgress = {
+    ...makeProgress(),
+    currentStage: "impl-low-review",
+    completedStages: ["desc", "plan", "impl", "impl-high-review"],
+  };
+  const rolled = updateTaskProgressStage(progress, "impl-high-review");
+  assert.ok(
+    !(rolled.completedStages ?? []).includes("impl-high-review"),
+    "the stage being re-entered must not still be listed as completed"
+  );
+});
+
+void test("moving FORWARD leaves completedStages untouched", () => {
+  // Only the backwards direction retracts; normal advancement is handled by
+  // the stage-transition path that adds to the list.
+  const completed: TaskStage[] = ["desc", "plan", "impl"];
+  const progress: TaskProgress = {
+    ...makeProgress(),
+    currentStage: "impl",
+    completedStages: completed,
+  };
+  const advanced = updateTaskProgressStage(progress, "impl-high-review");
+  assert.deepStrictEqual(advanced.completedStages, completed);
+});
+
+void test("re-setting the same stage changes nothing about completion", () => {
+  const completed: TaskStage[] = ["desc", "plan"];
+  const progress: TaskProgress = {
+    ...makeProgress(),
+    currentStage: "impl",
+    completedStages: completed,
+  };
+  const same = updateTaskProgressStage(progress, "impl");
+  assert.deepStrictEqual(same.completedStages, completed);
+});
+
+void test("a task with no completedStages survives a rollback", () => {
+  const progress: TaskProgress = { ...makeProgress(), currentStage: "impl-high-review" };
+  const rolled = updateTaskProgressStage(progress, "impl");
+  assert.strictEqual(rolled.currentStage, "impl");
+  assert.strictEqual(rolled.completedStages, undefined);
 });
