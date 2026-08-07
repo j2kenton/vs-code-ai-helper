@@ -109,12 +109,14 @@ import {
   parseReadiness,
   parseReviewBlockers,
   parseReviewBlockersDetailed,
+  parseReviewedCommitSha,
   parseReviewProgress,
 } from "../utils/reviewReadiness";
 import { scheduleAutomationChain, releaseAutomationChain } from "../utils/automationChain";
-import { buildVerifiedChecksSection, collectCompletionLintPreview, resolvePublishScopeFolder } from "../utils/completionLint";
+import { buildPlanItemVerificationSection, buildVerifiedChecksSection, collectCompletionLintPreview, resolvePublishScopeFolder } from "../utils/completionLint";
 import { checkPublishPreflight } from "../utils/publishPreflight";
 import { improveReviewScore } from "../utils/reviewScoreLoop";
+import { countCommitsSinceSha, resolveHeadCommitSha } from "../utils/gitRepoInfo";
 import {
   blockerIdentities,
   decideReviewRoute,
@@ -126,6 +128,7 @@ import {
   rubricCapLikelyBlockedAdvance,
   shouldEscalateChurnCeiling,
   shouldTripNoProgressBreaker,
+  STALE_REVIEW_RECONCILIATION_COMMIT_THRESHOLD,
 } from "../utils/reviewRouting";
 import { escalateReviewToHuman } from "../utils/reviewEscalation";
 import {
@@ -1009,6 +1012,68 @@ const REVIEW_REREVIEW_PROMPTS: Partial<Record<TaskStage, string>> = {
   "publish": "review-publish-rereview.md",
 };
 
+/** Stages that record a `<!-- reviewed-commit: SHA -->` marker (2i) — the
+ * implementation and publish review stages, whose "previous review" a
+ * re-review is told to reconcile against can go stale relative to the
+ * workspace across many rounds (the task_5 evidence: a 62-commit, 8-day gap).
+ * Plan reviews assess plan.md prose, which isn't tied to commit history the
+ * same way, so they stay out of scope. */
+const REVIEWED_COMMIT_STAGES: ReadonlySet<TaskStage> = new Set([
+  "impl-high-review",
+  "impl-low-review",
+  "publish",
+]);
+
+/** The reconciliation-instruction paragraph each re-review prompt used to
+ * hardcode as its opening paragraph — now the DEFAULT `{{reconciliationInstruction}}`
+ * value, used whenever the previous review's recorded commit is unknown or
+ * still close enough to HEAD to reconcile against directly (2i). */
+const DEFAULT_RECONCILIATION_INSTRUCTIONS: Partial<Record<TaskStage, string>> = {
+  "impl-low-review":
+    "Your first responsibility is to reconcile every blocker from the previous low-level implementation review. Do not silently replace the previous blocker set with a fresh code review. If the previous review used inconsistent headings, treat any issue it described as preventing completion or leaving a required plan item unmet as a previous blocker.",
+  "impl-high-review":
+    "Your first responsibility is to reconcile every blocker from the previous high-level implementation review. Do not silently replace the previous blocker set with a fresh architectural review. If the previous review used inconsistent headings, treat any issue it described as preventing readiness, leaving required acceptance criteria unmet, or blocking completion as a previous blocker.",
+  publish:
+    "Reconcile every previous blocker before considering new concerns. If the previous review used inconsistent headings, treat any issue it described as preventing shipping or publish readiness as a previous blocker. Keep newly discovered shipping blockers separate. A blocker must be something that should prevent shipping: a concrete regression, secret or credential, leftover debug/TODO code that affects delivery, incomplete error handling introduced by the change, missing required test evidence, a silently dropped required plan item, or insufficient evidence to establish publish readiness.",
+};
+
+/**
+ * Decide the `{{reconciliationInstruction}}` text for a re-review (2i): the
+ * standard "reconcile against the previous review" instruction, unless the
+ * previous review's recorded commit (parseReviewedCommitSha) is far enough
+ * behind HEAD that reconciling line-by-line no longer makes sense — in which
+ * case swap in an instruction to derive current state from the workspace and
+ * treat the previous review as history only. Falls back to the standard
+ * instruction whenever staleness cannot be determined (no marker in the
+ * previous review, not a git repo, or the recorded commit can't be resolved —
+ * e.g. it was rewritten away by a rebase): the conservative default is to
+ * reconcile, exactly as every re-review did before this existed.
+ *
+ * @internal exported for testing
+ */
+export async function selectReconciliationInstruction(
+  targetStage: TaskStage,
+  previousReview: string,
+  workspaceRootFsPath: string
+): Promise<string> {
+  const fallback = DEFAULT_RECONCILIATION_INSTRUCTIONS[targetStage] ?? "";
+  const previousSha = parseReviewedCommitSha(previousReview);
+  if (!previousSha) {
+    return fallback;
+  }
+  const commitsSince = await countCommitsSinceSha(workspaceRootFsPath, previousSha);
+  if (commitsSince === undefined || commitsSince < STALE_REVIEW_RECONCILIATION_COMMIT_THRESHOLD) {
+    return fallback;
+  }
+  return (
+    `The previous review below was written against a commit ${commitsSince} commits behind the current HEAD. ` +
+    "Do not reconcile against it blocker-by-blocker as if it reflects the current state — derive the current " +
+    "state from the context pack and the workspace directly, and treat the previous review only as history: " +
+    "useful context on what earlier rounds found, not a baseline whose blockers must each be individually " +
+    "addressed as resolved/partially resolved/unresolved."
+  );
+}
+
 export function selectReviewPromptTemplate(
   targetStage: TaskStage,
   currentStage: TaskStage,
@@ -1063,24 +1128,37 @@ async function readPreviousReviewForRereview(
  * instead of leaving it running with no way to recover short of reloading
  * the window. Each check is additionally capped at
  * ensemble.completionCheckTimeoutMs regardless of cancellation.
+ *
+ * `includePlanItemVerification` (1c) additionally computes and returns the
+ * `{{planItemVerification}}` block for the Publish review prompt — the same
+ * Plan Item Verification content upsertCompletionChecksInPublishReview later
+ * writes into publish-review.md's Completion Checks section, but delivered
+ * as an INPUT to the reviewer before it writes a verdict, not appended to
+ * the artifact afterward. Before this, a failed plan item only ever reached
+ * publish-review.md after the AI verdict already existed, so nothing
+ * reconciled a ❌ item against a simultaneous "no blockers" verdict. Reuses
+ * this same collectCompletionLintPreview call (rather than a second one) so
+ * requesting it doesn't double the lint/type/test/build commands run for
+ * every Publish review round.
  */
 async function buildVerifiedChecksVariable(
   folderUri: vscode.Uri,
   relevantFiles: readonly string[] | undefined,
-  token: vscode.CancellationToken | undefined
-): Promise<string> {
+  token: vscode.CancellationToken | undefined,
+  includePlanItemVerification = false
+): Promise<{ verifiedChecks: string; planItemVerification?: string }> {
   try {
-    // includeAiPlanVerification: false — buildVerifiedChecksSection never
-    // renders `planItems`, so running that AI-assisted pass here would be a
-    // full extra model call (against the Publish-stage model, regardless of
-    // which stage is actually under review) discarded on every single
-    // review round for output nothing displays.
     const result = await collectCompletionLintPreview(folderUri, relevantFiles, {
       allowScopePrompt: false,
-      includeAiPlanVerification: false,
+      includeAiPlanVerification: includePlanItemVerification,
       token,
     });
-    return buildVerifiedChecksSection(result);
+    return {
+      verifiedChecks: buildVerifiedChecksSection(result),
+      planItemVerification: includePlanItemVerification
+        ? buildPlanItemVerificationSection(result.planItems)
+        : undefined,
+    };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     // Consistent with review-scoring-rubric.md's "## Verified Checks"
@@ -1090,11 +1168,16 @@ async function buildVerifiedChecksVariable(
     // itself missing evidence — a legitimate review-confidence concern, not
     // the "you personally can't reproduce a test run" case the rubric tells
     // reviewers to ignore. Do not tell reviewers to disregard this.
-    return (
+    const verifiedChecks =
       "## Verified Checks (ground truth)\n\n" +
       `Verified checks could not be run for this review: ${message}\n\n` +
-      "This means no ground-truth evidence is available for this round — treat the absence of verified checks itself as a review-confidence concern, not as neutral."
-    );
+      "This means no ground-truth evidence is available for this round — treat the absence of verified checks itself as a review-confidence concern, not as neutral.";
+    return {
+      verifiedChecks,
+      planItemVerification: includePlanItemVerification
+        ? `## Plan Item Verification\n\nPlan item verification could not be run for this review: ${message}\n\nTreat the absence of this evidence itself as a review-confidence concern, not as neutral.`
+        : undefined,
+    };
   }
 }
 
@@ -1952,6 +2035,24 @@ export async function runReviewForFolder(
     variables.previousReview = previousReview;
   }
 
+  // 2i: stamp the commit this review actually assesses, and — for a
+  // re-review — decide whether the previous review is still close enough to
+  // HEAD to reconcile against directly or has gone stale enough that the
+  // reviewer should derive current state from the workspace instead. Scoped
+  // to implementation/publish review stages (REVIEWED_COMMIT_STAGES); plan
+  // reviews don't use either variable so this is a harmless no-op for them.
+  if (REVIEWED_COMMIT_STAGES.has(targetStage)) {
+    const headSha = await resolveHeadCommitSha(workspaceRoot.uri.fsPath);
+    variables.reviewedCommitSha = headSha ?? "unknown";
+    if (previousReview !== undefined) {
+      variables.reconciliationInstruction = await selectReconciliationInstruction(
+        targetStage,
+        previousReview,
+        workspaceRoot.uri.fsPath
+      );
+    }
+  }
+
   if (isPlanReview) {
     const planUri = await resolveCurrentPlanUri(folderUri);
     const planContent = await readNonEmptyText(planUri);
@@ -2011,7 +2112,16 @@ export async function runReviewForFolder(
 
     variables.plan = planContent;
     variables.implementation = implementationContent;
-    variables.verifiedChecks = await buildVerifiedChecksVariable(folderUri, undefined, options.operation?.token);
+    const checks = await buildVerifiedChecksVariable(
+      folderUri,
+      undefined,
+      options.operation?.token,
+      targetStage === "publish"
+    );
+    variables.verifiedChecks = checks.verifiedChecks;
+    if (checks.planItemVerification !== undefined) {
+      variables.planItemVerification = checks.planItemVerification;
+    }
   }
 
   let contextPackContent: string;
@@ -5674,7 +5784,16 @@ async function buildReviewResumeVariablesV1(
       };
     }
     variables.implementation = implementationContent;
-    variables.verifiedChecks = await buildVerifiedChecksVariable(folderUri, undefined, operationToken);
+    const checks = await buildVerifiedChecksVariable(
+      folderUri,
+      undefined,
+      operationToken,
+      targetStage === "publish"
+    );
+    variables.verifiedChecks = checks.verifiedChecks;
+    if (checks.planItemVerification !== undefined) {
+      variables.planItemVerification = checks.planItemVerification;
+    }
   }
 
   const contextPackUri = isPlanReview

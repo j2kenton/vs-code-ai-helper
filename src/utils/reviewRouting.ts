@@ -13,6 +13,17 @@ import { BlockerResolver, ReviewBlocker } from "./reviewReadiness";
 export const DEFAULT_PLATEAU_WINDOW = 3;
 
 /**
+ * Number of commits past which a re-review's "previous review" (2i) is
+ * considered stale enough that reconciling against it blocker-by-blocker no
+ * longer makes sense — the re-review should instead derive current state
+ * from the workspace/context pack and treat the prior review as history only.
+ * A plain constant, not a setting: this guards against a multi-day-old review
+ * being read as current (the task_5 evidence was a 62-commit gap), not a
+ * tunable behavior a user would reasonably want to adjust per repo.
+ */
+export const STALE_REVIEW_RECONCILIATION_COMMIT_THRESHOLD = 15;
+
+/**
  * A stage is plateaued when the best score seen in the most recent `window`
  * rounds is no better than the best score seen in every round before that
  * window — i.e. the last `window` rounds collectively failed to set a new
@@ -429,19 +440,21 @@ export function decideReviewRoute(input: {
     };
   }
   if (onlyNonFixableRemain) {
-    // Every reported blocker is environmental, unverifiable, or a spec
-    // defect — none is something another automated implementation round
-    // could act on. That is true independent of the score's trend: unlike
-    // "iterate" (below), where waiting to see whether task-fixable work
-    // lands over more rounds is worthwhile, there is nothing here for more
-    // rounds to change. Escalate immediately rather than waiting out a full
-    // plateau window (and, previously, a wasted second-opinion round) on
-    // rounds that could not have altered the outcome either way.
+    // Every reported blocker is environmental, unverifiable, a spec defect,
+    // or needs-toolchain (requires running the project's own build/codegen,
+    // which the implementation stage structurally cannot do) — none is
+    // something another automated implementation round could act on. That is
+    // true independent of the score's trend: unlike "iterate" (below), where
+    // waiting to see whether task-fixable work lands over more rounds is
+    // worthwhile, there is nothing here for more rounds to change. Escalate
+    // immediately rather than waiting out a full plateau window (and,
+    // previously, a wasted second-opinion round) on rounds that could not
+    // have altered the outcome either way.
     return {
       route: "escalate",
       reason: plateaued
-        ? "The score has plateaued and every remaining blocker is outside automation's control (environmental, unverifiable, or a spec defect)."
-        : "Every remaining blocker is outside automation's control (environmental, unverifiable, or a spec defect); no amount of further automated iteration can resolve it.",
+        ? "The score has plateaued and every remaining blocker is outside automation's control (environmental, unverifiable, a spec defect, or requires toolchain execution)."
+        : "Every remaining blocker is outside automation's control (environmental, unverifiable, a spec defect, or requires toolchain execution); no amount of further automated iteration can resolve it.",
     };
   }
   if (plateaued && !secondOpinionTriedThisPlateau) {

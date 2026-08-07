@@ -187,6 +187,50 @@ void describe("review scoring rubric", () => {
       assert.match(rubricText, /approval/);
       assert.match(rubricText, /credential or account entitlement/);
     });
+
+    void it("documents the needs-toolchain resolver (3a)", () => {
+      assert.match(rubricText, /`needs-toolchain`/);
+      assert.match(rubricText, /build, codegen, or other toolchain step/);
+    });
+  });
+
+  void describe("staged-plan scoring exception mirrored into low-level review (4a)", () => {
+    for (const templateFile of ["review-impl-low.md", "review-impl-low-rereview.md"]) {
+      void it(`${templateFile} scores staged plans by executable-order progress, not raw completeness`, () => {
+        const raw = fs.readFileSync(path.join(PROMPTS_DIR, templateFile), "utf8");
+        assert.match(raw, /executable order/);
+        assert.match(raw, /not completion blockers/);
+      });
+    }
+  });
+
+  void describe("off-track verdict must name its cause (4c)", () => {
+    for (const templateFile of ["review-impl-high.md", "review-impl-high-rereview.md"]) {
+      void it(`${templateFile} requires an "off track" verdict to name the cause inline`, () => {
+        const raw = fs.readFileSync(path.join(PROMPTS_DIR, templateFile), "utf8");
+        assert.match(raw, /must name the actual cause inline/);
+      });
+    }
+  });
+
+  void describe("plan reviews can demand restructuring, not just more detail (4d)", () => {
+    for (const templateFile of ["review-plan-low.md", "review-plan-high.md"]) {
+      void it(`${templateFile} offers a blocking "needs restructuring" verdict`, () => {
+        const raw = fs.readFileSync(path.join(PROMPTS_DIR, templateFile), "utf8");
+        assert.match(raw, /needs restructuring/);
+        assert.match(raw, /wrong shape/);
+      });
+    }
+  });
+
+  void describe("implementation claims are structurally checkable (4b)", () => {
+    for (const templateFile of ["run-implementation.md", "apply-impl-review-code.md"]) {
+      void it(`${templateFile} requires a per-plan-item checklist with evidence`, () => {
+        const raw = fs.readFileSync(path.join(PROMPTS_DIR, templateFile), "utf8");
+        assert.match(raw, /## Plan Item Checklist/);
+        assert.match(raw, /done \/ deferred \/ not reached/);
+      });
+    }
   });
 
   void describe("parseReadiness", () => {

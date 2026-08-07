@@ -3,7 +3,7 @@
   "generatedBy": "scripts/resolveProductionSourceUniverse.mjs",
   "description": "Production source universe as of the current working tree, resolved from the exact bundler options that produce dist/extension.js (esbuild.config.js) plus the contribution-asset and runtime-resource-copy rules in scripts/lib/productionSourceScan.mjs. Regenerated every run; diffed against the immutable pre-gate snapshot (workflow-production-source-pregate-v1.json), not authoritative on its own.",
   "packageName": "vs-code-ai-helper",
-  "packageVersion": "0.75.0",
+  "packageVersion": "0.76.0",
   "declaredMain": "./dist/extension.js",
   "entrypoint": "src/extension.ts",
   "outfile": "dist/extension.js",
@@ -168,7 +168,7 @@
     },
     {
       "path": "src/commands/reviewActions.ts",
-      "sha256": "9ec5d5689b6c0830327bead7fc797dbb5844dca866049e508084da4b6d2e9248"
+      "sha256": "e06dcd63a900ce4d8ab882db3d3264696850f49f46b503ad41aa15415543d7ad"
     },
     {
       "path": "src/commands/reviewCurrentTask.ts",
@@ -512,7 +512,7 @@
     },
     {
       "path": "src/utils/completionLint.ts",
-      "sha256": "a26df47fd5458d0a62e2941843e77b30748a692452f9ffc661c4971f7a2f4cef"
+      "sha256": "4fa45252f9c9ee2fba848b95cf44bd4581fcb4f9e4803a5beb63717d24b63a27"
     },
     {
       "path": "src/utils/contextEligibility.ts",
@@ -540,7 +540,7 @@
     },
     {
       "path": "src/utils/gitRepoInfo.ts",
-      "sha256": "3261c6d676423fbc431e3d24c2bbdc5406f0fc3fde023432ff1383d2cdfe15c2"
+      "sha256": "21ed23263a230eb5d6e2e59f02ae4e5c23a74aecfac0ff8f9252485603837f87"
     },
     {
       "path": "src/utils/globalAssistantActions.ts",
@@ -628,11 +628,11 @@
     },
     {
       "path": "src/utils/reviewReadiness.ts",
-      "sha256": "24deacea160a715cef8d33ef01f2999f9f97195095a76c583a3e0b2278042ba2"
+      "sha256": "fffb0ccf6be69167af9cc5d0d3b77a9b226096508b1ee6e0a416b9b88a700fa5"
     },
     {
       "path": "src/utils/reviewRouting.ts",
-      "sha256": "8a6ce893cc12f6cb8448f1c5e7bb249fdf4495524a9cf33b4ade889aa9907f59"
+      "sha256": "0de0441b09cd412cbcae54c0e7f0011c0ffddd8fcaad7a47c318328d2e00f731"
     },
     {
       "path": "src/utils/reviewScoreLoop.ts",
@@ -734,7 +734,7 @@
     },
     {
       "path": "resources/prompts/apply-impl-review-code.md",
-      "sha256": "bd9260af86677bbb674e8e0b4d4b340f1f2ccb0ffbf8bd3a9c7bde5d5b64141a",
+      "sha256": "8a61aa11a2dedf11007354cad80c746b6bbdc64dffcd713b8d2b47345c5225b7",
       "category": "runtimeResourceCopy"
     },
     {
@@ -779,22 +779,22 @@
     },
     {
       "path": "resources/prompts/review-impl-high-rereview.md",
-      "sha256": "078f6da1ad1a2730d8fe886831e961280fe8a8ac1ce5066c0a8b5f9e215dbd99",
+      "sha256": "3d77571aa46c2d877538e0a026376aecf88582e181a422b3f9adb18bf03b4e1f",
       "category": "runtimeResourceCopy"
     },
     {
       "path": "resources/prompts/review-impl-high.md",
-      "sha256": "0a1b69b3620b488616273c50ae0bce90a2a4d0001db9f718aa228456af1e5162",
+      "sha256": "2f531c5d88d2bbbb7dbe380e4a8cf6b7c011f3ae73c9a31ed35beed81d9f6f65",
       "category": "runtimeResourceCopy"
     },
     {
       "path": "resources/prompts/review-impl-low-rereview.md",
-      "sha256": "26ac560a19fb7f2b938cad728a970cedb7c33db6fe70638320903061c54f2878",
+      "sha256": "7a5016201f49db9bef97e3781392b83add0d2c285cc81d0c90c6b0a0cb56f3fd",
       "category": "runtimeResourceCopy"
     },
     {
       "path": "resources/prompts/review-impl-low.md",
-      "sha256": "7e1c489d0c8598fb9e62e94f02a57c0ad03277515643e623bf18298db8901930",
+      "sha256": "1641043a5b842f4155a5629defaa979c92f8c10e68212c1a38c4ffab8d060a67",
       "category": "runtimeResourceCopy"
     },
     {
@@ -804,7 +804,7 @@
     },
     {
       "path": "resources/prompts/review-plan-high.md",
-      "sha256": "38ac55883cb70ca835faa6304948823b605cde5f639f4bf1e8732b989f6ae1e4",
+      "sha256": "e4654fb7ca2fd8840b90ab1b95f30e9bf83b33b05211483fa60da517dc8efc1c",
       "category": "runtimeResourceCopy"
     },
     {
@@ -814,27 +814,27 @@
     },
     {
       "path": "resources/prompts/review-plan-low.md",
-      "sha256": "3c65b9181ea13f6337021a371af457051de66bc4a65f0015f5d9c0307084b2ad",
+      "sha256": "82f0d1d651986cde815c2d75989bf632aeec7b2d1c214920969da6919cba7a0d",
       "category": "runtimeResourceCopy"
     },
     {
       "path": "resources/prompts/review-publish-rereview.md",
-      "sha256": "baeaee50b6713e076be67592bf877ef54d8666901653bbc23db82a744151e6eb",
+      "sha256": "bf456c8a123aea89e891342d4bc7afb8028300fdeadf9742734098041f4ffaeb",
       "category": "runtimeResourceCopy"
     },
     {
       "path": "resources/prompts/review-publish.md",
-      "sha256": "1b54685fb87ced76738f823ddeb80cef7f3c83bcca2040fbbede62db0bb35eca",
+      "sha256": "c73350c0468aa5c27d42a4ff6bf9a19361eedb953e19e2049395a6f46696e617",
       "category": "runtimeResourceCopy"
     },
     {
       "path": "resources/prompts/review-scoring-rubric.md",
-      "sha256": "d44b667b422566ddc9c32544e9a5a3330f6ff7f2d79974e666e2fd6602348b96",
+      "sha256": "fac8ae07712d41a93b93fb1703ce8a82b5ce9c63d64f9e9e63237cc63cbecb18",
       "category": "runtimeResourceCopy"
     },
     {
       "path": "resources/prompts/run-implementation.md",
-      "sha256": "dde148d3ebf3017f626e47f74ef5be4780ebbb1de5b8df3d3ea1d5d2deb90325",
+      "sha256": "0e416dc3bebe2b2f0518cc9c9d0fb6926157a0259b80fe9ab923bab59608f7fc",
       "category": "runtimeResourceCopy"
     },
     {

@@ -41,6 +41,7 @@ function makeWorkspace(name: string, testScript: string): string {
           lint: 'node -e "process.exit(0)"',
           "check-types": 'node -e "process.exit(0)"',
           test: testScript,
+          build: 'node -e "process.exit(0)"',
         },
       },
       null,

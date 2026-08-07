@@ -92,8 +92,22 @@ export type BlockerCategory = "architectural" | "completion" | "review-confidenc
  *  - spec-defect: the acceptance criterion itself cannot be satisfied as
  *    written (e.g. "all tests pass" when one pre-existing test can never
  *    pass in this environment).
+ *  - needs-toolchain: resolving the blocker requires running the project's
+ *    own build/codegen/toolchain step (e.g. `npm run build`, a generator)
+ *    that the implementation stage structurally cannot run (it runs
+ *    edit-only, with Bash denied). Distinct from task-fixable — no amount of
+ *    re-editing source will fix a blocker whose resolution is "run the
+ *    build" — and distinct from environmental/spec-defect, since the fix
+ *    does exist and is well-defined, it just cannot be executed from this
+ *    stage. Routes straight to escalation like every other non-task-fixable
+ *    resolver (see decideReviewRoute in reviewRouting.ts).
  */
-export type BlockerResolver = "task-fixable" | "environmental" | "unverifiable" | "spec-defect";
+export type BlockerResolver =
+  | "task-fixable"
+  | "environmental"
+  | "unverifiable"
+  | "spec-defect"
+  | "needs-toolchain";
 
 export interface ReviewBlocker {
   category: BlockerCategory;
@@ -103,7 +117,7 @@ export interface ReviewBlocker {
 
 const BLOCKERS_BLOCK_RE = /<!--\s*blockers:start\s*-->([\s\S]*?)<!--\s*blockers:end\s*-->/i;
 const BLOCKER_LINE_RE =
-  /^\s*[-*]\s*\[\s*(architectural|completion|review-confidence|shipping)\s*\]\s*\[\s*(task-fixable|environmental|unverifiable|spec-defect)\s*\]\s*(.+?)\s*$/i;
+  /^\s*[-*]\s*\[\s*(architectural|completion|review-confidence|shipping)\s*\]\s*\[\s*(task-fixable|environmental|unverifiable|spec-defect|needs-toolchain)\s*\]\s*(.+?)\s*$/i;
 
 /**
  * Parse the machine-readable blocker block reviewers are asked to emit
@@ -199,6 +213,31 @@ const PROGRESS_MARKER_RE = /<!--\s*progress\s*:\s*(\d+)\s*\/\s*(\d+)\s*-->/gi;
  * every caller degrades to exactly the pre-marker behavior rather than acting
  * on a number it cannot trust.
  */
+/**
+ * Global (not first-match), for the same reason as {@link PROGRESS_MARKER_RE}:
+ * the instruction that asks for this marker shows a worked example of it, and
+ * the LAST occurrence is the authoritative one a reviewer was told to end its
+ * response with.
+ */
+const REVIEWED_COMMIT_RE = /<!--\s*reviewed-commit:\s*([0-9a-f]{7,40})\s*-->/gi;
+
+/**
+ * Parse the machine-readable `<!-- reviewed-commit: SHA -->` marker an
+ * implementation/publish review is asked to emit (2i, see
+ * resources/prompts/review-impl-high.md and siblings): the commit the review
+ * actually assessed. A re-review reads this back from the PREVIOUS review to
+ * decide whether reconciling against it blocker-by-blocker still makes sense,
+ * or whether it predates HEAD by enough commits that it should be treated as
+ * history only (see reviewActions.ts's reconciliation-instruction selection).
+ * Returns undefined when absent (older prompt, or a provider that ignored
+ * it) — callers must treat that the same as "cannot determine staleness",
+ * never as "definitely stale" or "definitely current".
+ */
+export function parseReviewedCommitSha(content: string): string | undefined {
+  const match = [...content.matchAll(REVIEWED_COMMIT_RE)].at(-1);
+  return match?.[1];
+}
+
 export function parseReviewProgress(content: string): ReviewProgress | null {
   // matchAll clones the regex internally, so the module-level `g` flag's
   // lastIndex is never carried between calls.

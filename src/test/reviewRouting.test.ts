@@ -614,6 +614,21 @@ void describe("decideReviewRoute", () => {
     assert.strictEqual(decision.route, "escalate");
   });
 
+  void it("escalates immediately when the only remaining blocker needs toolchain execution (3a)", () => {
+    // needs-toolchain marks a blocker whose fix requires running the
+    // project's own build/codegen — something the implementation stage
+    // structurally cannot do (edit-only, Bash denied). It must route the
+    // same as environmental/spec-defect, not loop forever as task-fixable.
+    const decision = decideReviewRoute({
+      score: 5,
+      threshold: 9,
+      blockers: [blocker({ resolver: "needs-toolchain" })],
+      plateaued: false,
+      secondOpinionTriedThisPlateau: false,
+    });
+    assert.strictEqual(decision.route, "escalate");
+  });
+
   void it("still iterates below threshold when task-fixable work remains, regardless of any environmental blocker also present", () => {
     // onlyNonFixableRemain requires ALL blockers to be non-task-fixable — a
     // mix must still iterate normally so real, fixable work keeps getting

@@ -74,19 +74,20 @@ void describe("parseReviewBlockers", () => {
     ]);
   });
 
-  void it("handles all four resolver kinds", () => {
+  void it("handles all five resolver kinds", () => {
     const content = [
       "<!-- blockers:start -->",
       "- [completion] [task-fixable] a",
       "- [completion] [environmental] b",
       "- [completion] [unverifiable] c",
       "- [completion] [spec-defect] d",
+      "- [completion] [needs-toolchain] e",
       "<!-- blockers:end -->",
     ].join("\n");
     const blockers = parseReviewBlockers(content);
     assert.deepStrictEqual(
       blockers.map((b) => b.resolver),
-      ["task-fixable", "environmental", "unverifiable", "spec-defect"]
+      ["task-fixable", "environmental", "unverifiable", "spec-defect", "needs-toolchain"]
     );
   });
 });
@@ -109,6 +110,17 @@ void describe("parseReviewBlockersDetailed / hasZeroTaskFixableEvidence", () => 
     const content = [
       "<!-- blockers:start -->",
       "- [completion] [environmental] deferred host matrix",
+      "<!-- blockers:end -->",
+    ].join("\n");
+    assert.strictEqual(hasZeroTaskFixableEvidence(content), true);
+  });
+
+  void it("treats a needs-toolchain-only block as zero-fixable evidence (3a)", () => {
+    // A blocker whose fix is "run the build", not "edit more source" — the
+    // implementation stage cannot clear it by iterating further.
+    const content = [
+      "<!-- blockers:start -->",
+      "- [completion] [needs-toolchain] generated bundle is stale relative to source; requires npm run build",
       "<!-- blockers:end -->",
     ].join("\n");
     assert.strictEqual(hasZeroTaskFixableEvidence(content), true);

@@ -8,6 +8,7 @@ import * as path from "path";
 import { STAGE_ARTIFACT_FILENAMES, TaskProgress } from "../types/taskProgress";
 import { getCompletionCheckTimeoutMs, getKnownFlakyChecks, getPublishVerificationCommands, KnownFlakyCheck } from "../config/settings";
 import { promptAndPersistPublishScope } from "../commands/choosePublishScope";
+import { isWorkflowPrivatePathV1 } from "../services/workflowPrivacyClassifierV1";
 
 /**
  * Resolve a package manager executable to an absolute path, preferring a
@@ -45,7 +46,7 @@ export interface CompletionLintResult {
   passed: boolean;
   summary: string;
   issueCount: number;
-  failedChecks: Array<{ command: string; exitCode: number; output: string }>;
+  failedChecks: Array<{ command: string; exitCode: number; output: string; retryCount?: number }>;
   /** Entries of `failedChecks` that also matched a configured known-flaky-
    * check allowlist entry (see settings.ts's `getKnownFlakyChecks`). `passed`
    * above is never adjusted for these — this is a separate, additive signal
@@ -63,9 +64,20 @@ export interface CompletionLintResult {
    * Optional for the same reason as `knownFlakeFailures`; treat absent as
    * equal to `passed`. */
   passedModuloKnownFlakes?: boolean;
-  /** `scripts` entries (from the conventional `lint`/`test` names) not found
-   * in the workspace `package.json`, and therefore skipped rather than run.
-   * Reported as `inconclusive` — an undetected toolchain is never a pass. */
+  /** Checks that failed at least once but passed on a same-round,
+   * cache-bypassed retry (see runWithRetry / CHECK_ATTEMPTS_MAX). Counted as
+   * passing in `passed`/`passedModuloKnownFlakes` — the check's FINAL exit
+   * code was 0 — but never rendered as silently clean: the retry count stays
+   * visible in both the Completion Checks and Verified Checks sections, so a
+   * "passed on retry 2" result is distinguishable from a check that was
+   * clean on the first try. Distinct from `knownFlakeFailures`, which
+   * quarantines a check that never passed against a configured allowlist.
+   * Optional for the same reason as `knownFlakeFailures` above. */
+  retriedPasses?: Array<{ command: string; retryCount: number }>;
+  /** `scripts` entries (from the conventional `lint`/`test`/`build` names)
+   * not found in the workspace `package.json`, and therefore skipped rather
+   * than run. Reported as `inconclusive` — an undetected toolchain is never
+   * a pass. */
   missingScripts: string[];
   /** AI-verified plan-item completion check (report section, not a gate):
    * `passed` only ever comes from AI evidence against the source, never from
@@ -73,6 +85,33 @@ export interface CompletionLintResult {
   planItems?: PlanItemVerification[];
   /** The folder lint/tests actually ran against (the Publish scope). */
   verifiedFolder?: string;
+  /**
+   * The environment these checks actually ran in (1d) — the fix for a real
+   * stall (jester 2026-07-30_task_1) where a check was genuinely red in the
+   * extension host and genuinely green in a plain shell because the two had
+   * different environment variables (DATABASE_URL, in that case), and
+   * nothing in either party's evidence hinted the environments differed.
+   *
+   * Env var VALUES are never disclosed — only NAMES, and only the resolved
+   * cwd / package manager version as narrow, structurally-safe exceptions.
+   * Verified Checks artifacts land in task folders (frequently committed)
+   * and go verbatim into third-party AI prompts, so a credential-bearing
+   * value (a DB connection string, an API token) must never be able to
+   * reach either surface — disclosing names only means there is no pattern
+   * to get wrong: nothing is ever shown that could be a secret, regardless
+   * of what any individual variable happens to be named.
+   */
+  verificationEnvironment?: {
+    /** The resolved cwd checks ran in, or a redacted placeholder if it
+     * classifies as a private workflow path (see safeCwdForDisclosure). */
+    cwd: string;
+    /** e.g. "npm 10.8.2" — falls back to the bare manager name if a
+     * `--version` lookup fails or times out. */
+    packageManager: string;
+    /** Sorted env var NAMES present in the process the checks were spawned
+     * from. Never values — see the field doc above. */
+    envVarNames: string[];
+  };
 }
 
 /** True when the path exists on disk and is a directory. */
@@ -153,9 +192,18 @@ const DEFERRED_MARKERS = /\b(deferred|out[ -]of[ -]scope|won'?t (?:do|fix)|skipp
  * completing); everything else — checked or not — is `inconclusive` until
  * the AI-assisted verification (below) inspects the actual source and
  * upgrades or contradicts it.
+ *
+ * Deduplicated by item text (case/whitespace-insensitive), keeping the LAST
+ * occurrence in the file. The round-progress-tracking convention reproduces
+ * an `<!-- ensemble:implementation-checklist -->` checklist verbatim across
+ * a plan document's own sections (once where the plan states it, again in
+ * later "Implementation Notes" progress updates as boxes get checked off) —
+ * without dedup every one of those items renders twice in the Plan Item
+ * Verification section (observed: 8 entries, 4 unique), and the earlier
+ * copy's checkbox state is the stale one.
  */
 export function verifyPlanItems(planContent: string): PlanItemVerification[] {
-  const items: PlanItemVerification[] = [];
+  const items = new Map<string, PlanItemVerification>();
   for (const line of planContent.split(/\r?\n/)) {
     const match = /^\s*[-*]\s*\[([ xX])\]\s+(.*\S)\s*$/.exec(line);
     if (!match) {
@@ -163,28 +211,29 @@ export function verifyPlanItems(planContent: string): PlanItemVerification[] {
     }
     const checked = match[1]?.toLowerCase() === "x";
     const text = match[2] ?? "";
+    const dedupeKey = text.trim().toLowerCase().replace(/\s+/g, " ");
     const deferred = DEFERRED_MARKERS.test(text);
     if (deferred) {
-      items.push({
+      items.set(dedupeKey, {
         text,
         status: "failed",
         note: "marked deferred/out-of-scope — not counted as complete",
       });
     } else if (checked) {
-      items.push({
+      items.set(dedupeKey, {
         text,
         status: "inconclusive",
         note: "checked in the plan — a checkbox is not evidence; awaiting AI verification against the implementation",
       });
     } else {
-      items.push({
+      items.set(dedupeKey, {
         text,
         status: "inconclusive",
         note: "unchecked — completion could not be verified automatically",
       });
     }
   }
-  return items;
+  return [...items.values()];
 }
 
 // ---------------------------------------------------------------------------
@@ -637,7 +686,8 @@ function attachRunGuards(
 function runCheck(
   cwd: string,
   args: string[],
-  guard?: RunGuardOptions
+  guard?: RunGuardOptions,
+  extraEnv?: NodeJS.ProcessEnv
 ): Promise<{ code: number; output: string }> {
   return new Promise((resolve) => {
     const executable = args[0] ?? "npm";
@@ -659,10 +709,62 @@ function runCheck(
     const child = spawn(
       useShell ? quote(resolved) : resolved,
       useShell ? args.slice(1).map(quote) : args.slice(1),
-      { cwd, shell: useShell }
+      { cwd, shell: useShell, env: extraEnv ? { ...process.env, ...extraEnv } : undefined }
     );
     attachRunGuards(child, guard, resolve);
   });
+}
+
+/** Total check attempts (1 initial + up to this-1 retries) before a failure
+ * is reported red — bounded per the backlog's own guidance (N ≤ 3): retries
+ * exist for genuine intermittent failures, not as a way to brute-force an
+ * environment-determined red into green. */
+const CHECK_ATTEMPTS_MAX = 3;
+
+/** Applied only to a RETRY attempt, never the first — so a cached red from
+ * the first attempt cannot simply replay itself on every retry and "confirm"
+ * a defect that does not exist (Turbo: "cache hit, replaying logs"). Turbo's
+ * own documented cache-bypass is the TURBO_FORCE env var; setting it
+ * unconditionally is safe because it's a no-op for any command that isn't a
+ * Turbo pipeline. */
+const CACHE_BYPASS_RETRY_ENV: NodeJS.ProcessEnv = { TURBO_FORCE: "1" };
+
+/**
+ * Run one check attempt via `attempt`; on failure, retry up to
+ * `CHECK_ATTEMPTS_MAX - 1` more times with the build cache disabled
+ * (CACHE_BYPASS_RETRY_ENV), stopping as soon as an attempt succeeds. Reports
+ * a failure red only when every attempt failed. `retryCount` — the number of
+ * retries actually taken (0 for a check that passed or failed on the first
+ * try) — is always returned so the caller can surface a "passed on retry N"
+ * result rather than rendering it as silently clean; composes with (does not
+ * shadow) the existing known-flake quarantine, which only ever sees a check
+ * that still fails after every retry.
+ *
+ * `token`, when supplied, stops further retries once cancellation has been
+ * requested — a user-cancelled check is not a "failure" needing reproduction,
+ * and retrying it would burn up to two more spawn/kill cycles for no reason.
+ * A check that genuinely times out (not cancelled) still retries: that is
+ * one of the actual motivating flakes this exists to catch.
+ *
+ * @internal exported for testing
+ */
+export async function runWithRetry(
+  attempt: (extraEnv?: NodeJS.ProcessEnv) => Promise<{ code: number; output: string }>,
+  token?: vscode.CancellationToken
+): Promise<{ code: number; output: string; retryCount: number }> {
+  let result = await attempt();
+  if (result.code === 0) {
+    return { ...result, retryCount: 0 };
+  }
+  let retryCount = 0;
+  while (retryCount < CHECK_ATTEMPTS_MAX - 1 && !token?.isCancellationRequested) {
+    retryCount++;
+    result = await attempt(CACHE_BYPASS_RETRY_ENV);
+    if (result.code === 0) {
+      return { ...result, retryCount };
+    }
+  }
+  return { ...result, retryCount };
 }
 
 function packageManager(folder: string): string {
@@ -672,16 +774,77 @@ function packageManager(folder: string): string {
   return "npm";
 }
 
+/** "npm 10.8.2" (or just the bare name if the `--version` lookup fails or
+ * takes too long — this is diagnostic best-effort, never a gate). */
+function describePackageManagerVersion(cwd: string, manager: string): string {
+  try {
+    const resolved = resolveManagerExecutable(cwd, manager);
+    const useShell = process.platform === "win32" && /\.(cmd|bat)$/i.test(resolved);
+    const version = execFileSync(resolved, ["--version"], {
+      cwd,
+      windowsHide: true,
+      shell: useShell,
+      timeout: 5_000,
+    }).toString("utf8").trim();
+    return version ? `${manager} ${version}` : manager;
+  } catch {
+    return manager;
+  }
+}
+
+/**
+ * 1d: route the one allowlisted disclosure value that is actually a
+ * filesystem path (the resolved cwd) through the existing workflow-privacy
+ * classifier rather than assuming it's always safe to show. A Publish
+ * verification scope is essentially never a private workflow path, so this
+ * almost always no-ops — but it costs nothing and closes the gap for the
+ * one value here the classifier can actually reason about (it classifies
+ * path SHAPE, not arbitrary env var values — see the module doc comment for
+ * why it isn't used for the env var names/values below).
+ */
+function safeCwdForDisclosure(cwd: string): string {
+  return isWorkflowPrivatePathV1(cwd) ? "(redacted — resolves to a private workflow path)" : cwd;
+}
+
 /** Run one user-authored verification command line through the shell. */
 function runExplicitCheck(
   cwd: string,
   command: string,
-  guard?: RunGuardOptions
+  guard?: RunGuardOptions,
+  extraEnv?: NodeJS.ProcessEnv
 ): Promise<{ code: number; output: string }> {
   return new Promise((resolve) => {
-    const child = spawn(command, { cwd, shell: true });
+    const child = spawn(command, { cwd, shell: true, env: extraEnv ? { ...process.env, ...extraEnv } : undefined });
     attachRunGuards(child, guard, resolve);
   });
+}
+
+/** Command text that looks like it chains a deploy/publish/release/migration
+ * step rather than a safe, read-only verification step. A `verify` script
+ * matching this must never be treated as the default Publish check — see
+ * selectVerifyScriptCandidate. */
+const DEPLOY_LIKE_SCRIPT_RE = /\b(deploy|publish|release|migrat\w*)\b/i;
+
+/**
+ * Prefer a repo's own aggregate `verify` script (1b) as the sole candidate
+ * check, replacing the conventional lint/check-types/test/build detection —
+ * the same effect linkedin-linker gets today from a per-repo
+ * `ensemble.publishVerificationCommands` override, now as default behavior.
+ * Guarded: a `verify` script whose command text looks like it chains a
+ * deploy/publish/release/migration step is never treated as safe; the
+ * default candidate list (with `build` added) is used instead.
+ *
+ * @internal exported for testing
+ */
+export function selectVerifyScriptCandidate(
+  scripts: Record<string, string> | undefined,
+  manager: string
+): readonly [string, string[]] | undefined {
+  const verifyScript = scripts?.verify;
+  if (!verifyScript || DEPLOY_LIKE_SCRIPT_RE.test(verifyScript)) {
+    return undefined;
+  }
+  return [`${manager} run verify`, [manager, "run", "verify"]] as const;
 }
 
 export interface CollectCompletionLintOptions {
@@ -725,36 +888,53 @@ export async function collectCompletionLint(
     timeoutMs: options?.timeoutMs ?? getCompletionCheckTimeoutMs(),
   };
 
-  let checks: Array<{ command: string; code: number; output: string }>;
+  let checks: Array<{ command: string; code: number; output: string; retryCount: number }>;
   if (explicitCommands.length > 0) {
     // Toolchain resolution order (publish pre-check contract): explicitly
     // configured verification commands win over conventional npm scripts.
     checks = await Promise.all(
-      explicitCommands.map(async (command) => ({ command, ...(await runExplicitCheck(folder, command, guard)) }))
+      explicitCommands.map(async (command) => ({
+        command,
+        ...(await runWithRetry((extraEnv) => runExplicitCheck(folder, command, guard, extraEnv), guard.token)),
+      }))
     );
   } else {
     const scripts = readPackageScripts(folder);
-    const candidateChecks: Array<readonly [string, string[]]> = [
-      [`${manager} run lint`, [manager, "run", "lint"]],
-      [`${manager} run check-types`, [manager, "run", "check-types"]],
-      [`${manager} run test`, [manager, "run", "test"]],
-    ];
+    // 1b: a repo's own aggregate `verify` script, when safe, replaces the
+    // conventional candidate list outright (see selectVerifyScriptCandidate).
+    const verifyCandidate = selectVerifyScriptCandidate(scripts, manager);
+    const candidateChecks: Array<readonly [string, string[]]> = verifyCandidate
+      ? [verifyCandidate]
+      : [
+          [`${manager} run lint`, [manager, "run", "lint"]],
+          [`${manager} run check-types`, [manager, "run", "check-types"]],
+          [`${manager} run test`, [manager, "run", "test"]],
+          [`${manager} run build`, [manager, "run", "build"]],
+        ];
 
-    // The conventional `lint`/`test` scripts (publish pre-check contract) are
-    // skipped rather than run when not present in package.json's `scripts`, so
-    // an unconfigured workspace gets clean setup guidance instead of every
-    // publish check being misreported as a failure. `check-types` predates
-    // that contract and keeps its existing unconditional-run behavior.
-    const runnableChecks = candidateChecks.filter(([, args]) => {
-      const scriptName = args[2];
-      if (scriptName !== "lint" && scriptName !== "test") return true;
-      const configured = !!scripts && Object.prototype.hasOwnProperty.call(scripts, scriptName);
-      if (!configured) missingScripts.push(scriptName);
-      return configured;
-    });
+    // The conventional `lint`/`test`/`build` scripts (publish pre-check
+    // contract, extended by 1b to include `build`) are skipped rather than
+    // run when not present in package.json's `scripts`, so an unconfigured
+    // workspace gets clean setup guidance instead of every publish check
+    // being misreported as a failure. `check-types` predates that contract
+    // and keeps its existing unconditional-run behavior. A selected `verify`
+    // script is always configured (it was only selected because it exists),
+    // so it skips this filter entirely.
+    const runnableChecks = verifyCandidate
+      ? candidateChecks
+      : candidateChecks.filter(([, args]) => {
+          const scriptName = args[2];
+          if (scriptName !== "lint" && scriptName !== "test" && scriptName !== "build") return true;
+          const configured = !!scripts && Object.prototype.hasOwnProperty.call(scripts, scriptName);
+          if (!configured) missingScripts.push(scriptName);
+          return configured;
+        });
 
     checks = await Promise.all(
-      runnableChecks.map(async ([command, args]) => ({ command, ...(await runCheck(folder, [...args], guard)) }))
+      runnableChecks.map(async ([command, args]) => ({
+        command,
+        ...(await runWithRetry((extraEnv) => runCheck(folder, [...args], guard, extraEnv), guard.token)),
+      }))
     );
   }
 
@@ -778,30 +958,51 @@ export async function collectCompletionLint(
   // failed configured check so publish-review.md and the Publish Anyway / Fix
   // / Cancel prompt always reflect the actual command outcome.
   const commandFailures = checks.filter((check) => check.code !== 0);
+  // A check that failed at least once but passed on a cache-bypassed retry
+  // (see runWithRetry) — not a "real" failure (its final exit code was 0),
+  // but never rendered as silently clean either: the retry itself is the
+  // signal that the first attempt could not be trusted.
+  const retriedPasses = checks
+    .filter((check) => check.code === 0 && check.retryCount > 0)
+    .map((check) => ({ command: check.command, retryCount: check.retryCount }));
   const issueCount = issues.length + commandFailures.length;
   const baseSummary = commandFailures.length > 0
     ? `${commandFailures.length} completion check(s) failed${issues.length ? `; ${issues.length} editor diagnostic(s) remain` : "."}`
     : issues.length === 0 ? "No linting issues found." : `${issues.length} lint issue(s) remain.`;
+  const retriedNote = retriedPasses.length > 0
+    ? ` (${retriedPasses.length} check(s) required a retry to pass — see Verified Checks for details)`
+    : "";
   const summary = missingScripts.length > 0
     ? `${baseSummary} (${missingScripts.join("/")} script(s) not configured — add them to package.json's ` +
-      `"scripts" to enable publish checks for them. Checks are inconclusive, not passed.)`
-    : baseSummary;
+      `"scripts" to enable publish checks for them. Checks are inconclusive, not passed.)${retriedNote}`
+    : `${baseSummary}${retriedNote}`;
   const knownFlakes = getKnownFlakyChecks();
   const knownFlakeFailures = classifyKnownFlakeFailures(commandFailures, knownFlakes);
   const unquarantinedFailureCount = commandFailures.length - knownFlakeFailures.length;
   return {
     runAt: new Date().toISOString(),
     // An undetected toolchain is never a pass: with a required check
-    // inconclusive (missing lint/test script), the run cannot report passed
-    // even when everything that could run came back clean.
+    // inconclusive (missing lint/test/build script), the run cannot report
+    // passed even when everything that could run came back clean.
     passed: issueCount === 0 && missingScripts.length === 0,
     passedModuloKnownFlakes:
       issues.length === 0 && unquarantinedFailureCount === 0 && missingScripts.length === 0,
     issueCount,
     summary,
-    failedChecks: commandFailures.map(({ command, code, output }) => ({ command, exitCode: code, output })),
+    failedChecks: commandFailures.map(({ command, code, output, retryCount }) => ({
+      command,
+      exitCode: code,
+      output,
+      ...(retryCount > 0 ? { retryCount } : {}),
+    })),
     knownFlakeFailures,
+    retriedPasses,
     missingScripts,
+    verificationEnvironment: {
+      cwd: safeCwdForDisclosure(folder),
+      packageManager: describePackageManagerVersion(folder, manager),
+      envVarNames: Object.keys(process.env).sort(),
+    },
   };
 }
 
@@ -878,6 +1079,75 @@ export function truncateCheckOutput(output: string, maxChars: number): string {
   return `${output.slice(0, headChars)}${marker}${output.slice(output.length - tailChars)}`;
 }
 
+/**
+ * Render the Plan Item Verification block shared by two surfaces: the
+ * "Completion Checks" section written into publish-review.md
+ * (renderCompletionChecksSection, `heading: "###"`, an artifact appended
+ * AFTER the review is written) and the `{{planItemVerification}}` variable
+ * injected into the publish review PROMPT itself (reviewActions.ts's
+ * buildVerifiedChecksVariable, default `heading: "##"`) — the 1c fix. Before
+ * this, a failed plan item only ever reached publish-review.md after the AI
+ * verdict was already written, so nothing reconciled "❌ failed" against a
+ * simultaneous "no blockers" verdict. Feeding the same block into the prompt
+ * as an input, with an explicit reconciliation instruction when any item
+ * failed, is what closes that gap.
+ *
+ * @internal exported for testing
+ */
+export function buildPlanItemVerificationSection(
+  planItems: readonly PlanItemVerification[] | undefined,
+  options?: { heading?: string }
+): string {
+  const heading = options?.heading ?? "##";
+  if (!planItems || planItems.length === 0) {
+    return `${heading} Plan Item Verification\n\nNo plan checklist items were found in plan-final.md (nothing to verify).`;
+  }
+  const counts = { passed: 0, failed: 0, inconclusive: 0 };
+  for (const item of planItems) {
+    counts[item.status]++;
+  }
+  const lines: string[] = [
+    `${heading} Plan Item Verification`,
+    "",
+    `_Deterministic completion check of the plan checklist against the implementation (not a completion gate; AI-assisted verdicts are unavailable in this build — see the per-item notes below): ${counts.passed} passed, ${counts.failed} failed, ${counts.inconclusive} inconclusive._`,
+    "",
+  ];
+  for (const item of planItems) {
+    const marker = item.status === "passed" ? "✅ passed" : item.status === "failed" ? "❌ failed" : "❓ inconclusive";
+    lines.push(`- ${marker} — ${item.text}${item.note ? ` _(${item.note})_` : ""}`);
+  }
+  if (counts.failed > 0) {
+    lines.push(
+      "",
+      `**${counts.failed} plan item(s) failed verification.** Address every ❌ item explicitly in your verdict — ` +
+        "either as a shipping blocker, or with an explicit recorded reason it is not one. Your verdict must never " +
+        "state \"no blockers\" while a failed item here goes unaddressed — a publish verdict must never contradict " +
+        "a check embedded in its own artifact."
+    );
+  }
+  return lines.join("\n");
+}
+
+/**
+ * Render the environment disclosure shared by both surfaces that show
+ * Verified Checks (the "Completion Checks" artifact section and the
+ * `{{verifiedChecks}}` prompt block) — 1d. Names only, never values, plus the
+ * two narrow allowlisted exceptions (cwd, package manager) already redacted
+ * upstream in collectCompletionLint. Both of these artifacts land in task
+ * folders (frequently committed) and go verbatim into third-party AI
+ * prompts, so this must never be able to leak a credential-bearing value —
+ * see the CompletionLintResult.verificationEnvironment doc comment.
+ */
+function renderVerificationEnvironmentLines(
+  env: NonNullable<CompletionLintResult["verificationEnvironment"]>
+): string[] {
+  return [
+    `- Resolved cwd: ${env.cwd}`,
+    `- Package manager: ${env.packageManager}`,
+    `- Environment variable names present (values redacted — names only, so a variable that differs between environments can be spotted without ever disclosing what it holds): ${env.envVarNames.map((name) => `\`${name}\``).join(", ")}`,
+  ];
+}
+
 function renderCompletionChecksSection(
   result: CompletionLintResult,
   override?: { reason: string }
@@ -894,6 +1164,9 @@ function renderCompletionChecksSection(
     lines.push(`- Verified against: ${result.verifiedFolder}`);
   }
   lines.push(`- Summary: ${result.summary}`);
+  if (result.verificationEnvironment) {
+    lines.push("", "### Environment these checks ran in", ...renderVerificationEnvironmentLines(result.verificationEnvironment));
+  }
   if (result.missingScripts.length > 0) {
     lines.push("", "### Inconclusive checks");
     for (const script of result.missingScripts) {
@@ -907,31 +1180,26 @@ function renderCompletionChecksSection(
     for (const check of result.failedChecks) {
       const flake = (result.knownFlakeFailures ?? []).find((f) => f.command === check.command && f.exitCode === check.exitCode);
       const output = truncateCheckOutput(check.output, PUBLISH_CHECKS_MAX_OUTPUT_CHARS);
+      const retryNote = check.retryCount ? ` — failed consistently across ${check.retryCount + 1} attempts (${check.retryCount} cache-bypassed retries)` : "";
       lines.push(
         "",
-        `**${check.command}** (exit ${check.exitCode})${flake ? ` — _known flake: ${flake.reason}_` : ""}`,
+        `**${check.command}** (exit ${check.exitCode})${retryNote}${flake ? ` — _known flake: ${flake.reason}_` : ""}`,
         "```",
         output,
         "```"
       );
     }
   }
+  if (result.retriedPasses && result.retriedPasses.length > 0) {
+    lines.push("", "### Checks that required a retry to pass");
+    for (const retried of result.retriedPasses) {
+      lines.push(
+        `- \`${retried.command}\`: failed on the first attempt, passed on retry ${retried.retryCount} (cache disabled) — flaky, not clean.`
+      );
+    }
+  }
   if (result.planItems && result.planItems.length > 0) {
-    const counts = { passed: 0, failed: 0, inconclusive: 0 };
-    for (const item of result.planItems) {
-      counts[item.status]++;
-    }
-    lines.push(
-      "",
-      "### Plan Item Verification",
-      "",
-      `_Deterministic completion check of the plan checklist against the implementation (not a completion gate; AI-assisted verdicts are unavailable in this build — see the per-item notes below): ${counts.passed} passed, ${counts.failed} failed, ${counts.inconclusive} inconclusive._`,
-      ""
-    );
-    for (const item of result.planItems) {
-      const marker = item.status === "passed" ? "✅ passed" : item.status === "failed" ? "❌ failed" : "❓ inconclusive";
-      lines.push(`- ${marker} — ${item.text}${item.note ? ` _(${item.note})_` : ""}`);
-    }
+    lines.push("", buildPlanItemVerificationSection(result.planItems, { heading: "###" }));
   }
   if (override) {
     lines.push("", `_Published anyway despite failing checks — ${override.reason}._`);
@@ -984,13 +1252,16 @@ export function buildVerifiedChecksSection(result: CompletionLintResult): string
   const unquarantinedFailures = result.failedChecks.filter(
     (check) => !knownFlakeFailures.some((f) => f.command === check.command && f.exitCode === check.exitCode)
   );
+  const retriedPasses = result.retriedPasses ?? [];
   const overall = unquarantinedFailures.length > 0
     ? "One or more checks failed."
     : result.missingScripts.length > 0
       ? "Required checks could not run (inconclusive)."
       : knownFlakeFailures.length > 0
         ? "All checks passed except quarantined known flakes (see below) — treat as passing for readiness purposes."
-        : "All checks passed.";
+        : retriedPasses.length > 0
+          ? "All checks passed, but only after a retry (see below) — not clean on the first attempt."
+          : "All checks passed.";
   lines.push(`- Overall: ${overall}`);
   lines.push(`- Last run: ${result.runAt}`);
   if (result.verifiedFolder) {
@@ -998,6 +1269,27 @@ export function buildVerifiedChecksSection(result: CompletionLintResult): string
   }
   if (result.missingScripts.length > 0) {
     lines.push(`- Not configured (inconclusive, not passed): ${result.missingScripts.join(", ")}`);
+  }
+  // Rendered unconditionally (not gated behind the "no command failures"
+  // early return below) — the environment disclosure is useful evidence
+  // whether or not anything failed; see the field doc comment on
+  // CompletionLintResult.verificationEnvironment for why this exists.
+  if (result.verificationEnvironment) {
+    lines.push("", "### Environment these checks ran in", ...renderVerificationEnvironmentLines(result.verificationEnvironment));
+  }
+  // Rendered even when failedChecks is empty — a check that failed on its
+  // first attempt and only passed on a cache-bypassed retry has NO entry in
+  // failedChecks (its final exit code was 0), so this must not sit behind
+  // the "no command failures" early return below or it silently disappears
+  // exactly where the backlog says it must stay visible.
+  if (retriedPasses.length > 0) {
+    lines.push("", "### Checks that required a retry to pass");
+    for (const retried of retriedPasses) {
+      lines.push(
+        `- **${retried.command}** — failed on the first attempt, passed on retry ${retried.retryCount} ` +
+          "with the build cache disabled. Flaky, not clean — do not treat as a fully clean run."
+      );
+    }
   }
   if (result.failedChecks.length === 0) {
     lines.push("", "No command failures.");
@@ -1008,16 +1300,19 @@ export function buildVerifiedChecksSection(result: CompletionLintResult): string
     const flake = knownFlakeFailures.find(
       (f) => f.command === check.command && f.exitCode === check.exitCode
     );
+    const retryNote = check.retryCount
+      ? ` (failed consistently across ${check.retryCount + 1} attempts, ${check.retryCount} with the cache disabled)`
+      : "";
     if (flake) {
       lines.push(
         "",
-        `- **${check.command}** — exit ${check.exitCode}, **quarantined known flake**: ${flake.reason}. ` +
+        `- **${check.command}** — exit ${check.exitCode}${retryNote}, **quarantined known flake**: ${flake.reason}. ` +
           "This failure is excluded from the overall verdict above — do not treat it as an outstanding blocker."
       );
       continue;
     }
     const output = truncateCheckOutput(check.output, VERIFIED_CHECKS_PROMPT_MAX_OUTPUT_CHARS);
-    lines.push("", `- **${check.command}** — exit ${check.exitCode} (FAILED)`, "```", output, "```");
+    lines.push("", `- **${check.command}** — exit ${check.exitCode} (FAILED)${retryNote}`, "```", output, "```");
   }
   return lines.join("\n");
 }

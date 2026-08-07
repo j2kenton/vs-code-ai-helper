@@ -56,6 +56,55 @@ export async function resolveGitRepo(folderPath: string): Promise<string | undef
 }
 
 /**
+ * Resolve the current HEAD commit SHA for the repo containing `folderPath`,
+ * or undefined when there is no repo (or git itself is unavailable). Used to
+ * stamp review artifacts with the commit they actually assessed (2i), so a
+ * later re-review can tell how stale the "previous review" it's told to
+ * reconcile against is.
+ */
+export async function resolveHeadCommitSha(folderPath: string): Promise<string | undefined> {
+  const repoRoot = await resolveGitRepo(folderPath);
+  if (!repoRoot) {
+    return undefined;
+  }
+  try {
+    const { stdout } = await runGitCommand(repoRoot, "rev-parse", ["HEAD"]);
+    return stdout.trim() || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Count commits reachable from HEAD but not from `fromSha` — how far HEAD has
+ * moved since a review recorded against `fromSha`. Returns undefined when the
+ * repo cannot be resolved, or `fromSha` itself cannot be resolved (e.g. it
+ * was rewritten away by a rebase) — callers must treat that as "staleness
+ * cannot be determined", never as zero, so an unresolvable SHA falls back to
+ * the conservative default (reconcile as usual) rather than silently
+ * suppressing reconciliation.
+ */
+export async function countCommitsSinceSha(
+  folderPath: string,
+  fromSha: string
+): Promise<number | undefined> {
+  const repoRoot = await resolveGitRepo(folderPath);
+  if (!repoRoot) {
+    return undefined;
+  }
+  try {
+    const { stdout } = await runGitCommand(repoRoot, "rev-list", [
+      "--count",
+      `${fromSha}..HEAD`,
+    ]);
+    const count = Number.parseInt(stdout.trim(), 10);
+    return Number.isFinite(count) ? count : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Determine the push destination string for display in the confirm dialog
  * (and for the preflight readiness check below).
  */

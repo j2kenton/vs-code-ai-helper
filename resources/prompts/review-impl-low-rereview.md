@@ -2,7 +2,7 @@ You are performing a LOW-LEVEL RE-REVIEW of an implementation after code changes
 
 The context pack contains the implementation review files for this task. Treat the actual files as the implementation under review, not the implementation notes. If evidence is missing or truncated, say so rather than accepting a claim from the notes.
 
-Your first responsibility is to reconcile every blocker from the previous low-level implementation review. Do not silently replace the previous blocker set with a fresh code review. If the previous review used inconsistent headings, treat any issue it described as preventing completion or leaving a required plan item unmet as a previous blocker.
+{{reconciliationInstruction}}
 
 Focus on code-level correctness: specific plan items, failure scenarios, edge cases, error handling, consistency with surrounding code, and whether each required item is genuinely complete.
 
@@ -12,6 +12,8 @@ Use these blocker categories consistently:
 - Review-confidence blockers: relevant evidence is unavailable or truncated enough that readiness cannot responsibly be established.
 
 Score the current implementation against the full approved plan. Explain any unchanged or lower score despite resolved findings, and keep newly discovered blockers separate from the previous blocker reconciliation.
+
+Plans built across multiple implementation rounds. When the high-level review has already established that this plan is being delivered in an ordered, multi-round sequence (an "executable order", numbered phases, or a cohort structure), apply the same exception at this level: plan items not yet reached by that order are expected work, not completion blockers, and must not hold the score down. Score what exists — if every landed item is correct and genuinely complete, that is a high score even when most of the plan is still ahead. A landed item that is incomplete, defective, or deviates from the plan's contract is still a blocker regardless of how much of the plan remains; being mid-plan excuses only the ABSENCE of later items, never a defect in what was built.
 
 Do not accept an unapproved substitute merely because it is plausible or
 locally safer. When code materially changes an explicit plan contract or
@@ -35,6 +37,12 @@ Then structure your review as:
 - New completion blockers (if any).
 - New review-confidence blockers (if any).
 - Non-blocking suggestions (if any).
+
+Record which commit you reviewed. End your response with this marker on its own line, using the exact value shown below (copy it — do not compute or guess a SHA yourself):
+
+```
+<!-- reviewed-commit: {{reviewedCommitSha}} -->
+```
 
 ## Context Pack (implementation review files)
 

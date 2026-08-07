@@ -67,6 +67,7 @@ void describe("collectCompletionLint — publish pre-check schema (lint/test scr
       scripts: {
         lint: "node -e \"process.exit(0)\"",
         "check-types": "node -e \"process.exit(0)\"",
+        build: "node -e \"process.exit(0)\"",
       },
     });
 
@@ -86,6 +87,7 @@ void describe("collectCompletionLint — publish pre-check schema (lint/test scr
       name: "x",
       scripts: {
         "check-types": "node -e \"process.exit(0)\"",
+        build: "node -e \"process.exit(0)\"",
       },
     });
 
@@ -137,6 +139,7 @@ void describe("collectCompletionLint — publish pre-check schema (lint/test scr
         lint: "node -e \"process.exit(0)\"",
         "check-types": "node -e \"process.exit(0)\"",
         test: "node -e \"console.log('FAIL src/test/widget.test.ts'); process.exit(1)\"",
+        build: "node -e \"process.exit(0)\"",
       },
     });
 
