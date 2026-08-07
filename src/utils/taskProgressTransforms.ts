@@ -57,6 +57,21 @@ export function updateTaskProgressStage(
   // reopening a FINISHED task, never rolling an active one back. That gap
   // was hit twice on 2026-08-07 and both times required hand-editing
   // task-progress.json.
+  //
+  // `implReviewFiles` is deliberately NOT retracted here, which is a real
+  // divergence from that reopen path (its policy: "Preserve only when its
+  // owner stage (impl) is strictly before selected stage; otherwise []").
+  // The two transitions want different things. Reopen restarts a FINISHED
+  // task, so the previous cycle's changed-file list is history and clearing
+  // it is right. An active rollback is a mid-flight correction — typically
+  // "go back to impl and build more" — and that list is the accumulated
+  // review scope for everything the task has built so far. Clearing it would
+  // leave the next review seeing only whatever the following round happens to
+  // touch, which is exactly the blindness that stalled the workflow task on
+  // 2026-08-07 (a reviewer given 9 of 85 files could not source-verify ~18 of
+  // 25 plan items, and raised a blocker no implementation round could clear).
+  // Accumulating across rounds is the fix that unblocked it; a rollback must
+  // not throw that away.
   const newIndex = STAGE_ORDER.indexOf(newStage);
   const currentIndex = STAGE_ORDER.indexOf(progress.currentStage);
   const movingBackwards = newIndex >= 0 && currentIndex >= 0 && newIndex < currentIndex;

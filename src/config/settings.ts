@@ -389,21 +389,86 @@ const RESILIENCE_CHURN_CEILING_ROUNDS_KEY = "resilience.churnCeilingRounds";
 const RESILIENCE_NOTHING_TO_FIX_KEY = "resilience.nothingToFixRoutesToReview";
 const RESILIENCE_NO_PROGRESS_BREAKER_ROUNDS_KEY = "resilience.noProgressBreakerRounds";
 
-function readResilienceRounds(key: string): number {
-  const value = readSetting<unknown>(key, 0);
-  const numeric = typeof value === "number" && Number.isFinite(value) ? Math.floor(value) : 0;
+/**
+ * Fallbacks for the `ensemble.resilience.*` flags, mirroring the defaults
+ * declared in package.json's configuration contribution.
+ *
+ * In production these are effectively unreachable: readSetting falls through
+ * to `configuration.get(key, fallback)`, and VS Code answers that with the
+ * schema default whenever the key is unset. They matter for the lightweight
+ * configuration adapters used by tests and by non-VS-Code callers, where no
+ * schema exists to supply one.
+ *
+ * They are declared here as named constants, next to the readers, so the two
+ * copies of each default are at least visibly paired. They MUST be kept equal
+ * to package.json — a fallback that disagrees with the schema means a flag
+ * behaves one way in the product and the other way under test, which is the
+ * hardest kind of drift to notice.
+ *
+ * 2026-08-07: flipped from the legacy-off values to on, per the plan's own
+ * rollout rule ("flags... become unconditional once a full task has run green
+ * under them"). Shipping off meant new users got the configuration that
+ * produced the 119-round runaway these flags exist to prevent.
+ */
+/** @internal exported so a test can pin it against package.json's schema. */
+export const RESILIENCE_DEFAULTS = {
+  fastForwardSurvivesEscalation: true,
+  rejectDegenerateReviews: true,
+  zeroFixableTerminatesFastForward: true,
+  blockerSetPlateau: true,
+  // Ordered deliberately against the default fastForwardMaxIterations (5):
+  // the specific breaker fires first (3 zero-change rounds), then the broader
+  // churn ceiling (4), then the hard iteration cap. A breaker set at or above
+  // that cap can never fire — the loop reaches the cap first, which is the
+  // runaway these exist to prevent. resilienceDefaults.test.ts pins the
+  // ordering.
+  churnCeilingRounds: 4,
+  nothingToFixRoutesToReview: true,
+  noProgressBreakerRounds: 3,
+} as const;
+
+function readResilienceRounds(key: string, fallback: number): number {
+  const value = readSetting<unknown>(key, fallback);
+  const numeric =
+    typeof value === "number" && Number.isFinite(value) ? Math.floor(value) : fallback;
   return Math.max(0, Math.min(99, numeric));
 }
 
 export function getResilienceSettings(): ResilienceSettings {
   return {
-    fastForwardSurvivesEscalation: readSetting<unknown>(RESILIENCE_FF_SURVIVES_ESCALATION_KEY, false) === true,
-    rejectDegenerateReviews: readSetting<unknown>(RESILIENCE_REJECT_DEGENERATE_REVIEWS_KEY, false) === true,
-    zeroFixableTerminatesFastForward: readSetting<unknown>(RESILIENCE_ZERO_FIXABLE_TERMINATES_KEY, false) === true,
-    blockerSetPlateau: readSetting<unknown>(RESILIENCE_BLOCKER_SET_PLATEAU_KEY, false) === true,
-    churnCeilingRounds: readResilienceRounds(RESILIENCE_CHURN_CEILING_ROUNDS_KEY),
-    nothingToFixRoutesToReview: readSetting<unknown>(RESILIENCE_NOTHING_TO_FIX_KEY, false) === true,
-    noProgressBreakerRounds: readResilienceRounds(RESILIENCE_NO_PROGRESS_BREAKER_ROUNDS_KEY),
+    fastForwardSurvivesEscalation:
+      readSetting<unknown>(
+        RESILIENCE_FF_SURVIVES_ESCALATION_KEY,
+        RESILIENCE_DEFAULTS.fastForwardSurvivesEscalation
+      ) === true,
+    rejectDegenerateReviews:
+      readSetting<unknown>(
+        RESILIENCE_REJECT_DEGENERATE_REVIEWS_KEY,
+        RESILIENCE_DEFAULTS.rejectDegenerateReviews
+      ) === true,
+    zeroFixableTerminatesFastForward:
+      readSetting<unknown>(
+        RESILIENCE_ZERO_FIXABLE_TERMINATES_KEY,
+        RESILIENCE_DEFAULTS.zeroFixableTerminatesFastForward
+      ) === true,
+    blockerSetPlateau:
+      readSetting<unknown>(
+        RESILIENCE_BLOCKER_SET_PLATEAU_KEY,
+        RESILIENCE_DEFAULTS.blockerSetPlateau
+      ) === true,
+    churnCeilingRounds: readResilienceRounds(
+      RESILIENCE_CHURN_CEILING_ROUNDS_KEY,
+      RESILIENCE_DEFAULTS.churnCeilingRounds
+    ),
+    nothingToFixRoutesToReview:
+      readSetting<unknown>(
+        RESILIENCE_NOTHING_TO_FIX_KEY,
+        RESILIENCE_DEFAULTS.nothingToFixRoutesToReview
+      ) === true,
+    noProgressBreakerRounds: readResilienceRounds(
+      RESILIENCE_NO_PROGRESS_BREAKER_ROUNDS_KEY,
+      RESILIENCE_DEFAULTS.noProgressBreakerRounds
+    ),
   };
 }
 

@@ -216,7 +216,7 @@
     },
     {
       "path": "src/config/settings.ts",
-      "sha256": "8620d4a9e33ec256b16e809e31fbcdb26a1ea3079ed275bd78f4b94c655f6fc3"
+      "sha256": "ec245f1cfc11d2d36ff69164c56129b7fc4c8136cd3300b38e230b1455e9e205"
     },
     {
       "path": "src/extension.ts",
@@ -660,7 +660,7 @@
     },
     {
       "path": "src/utils/taskProgressTransforms.ts",
-      "sha256": "79f48b1c181540e1c9d861f863c0e36f74c650aee9982e8402bc0d501cb477bf"
+      "sha256": "367e22c3b762171ffeaf475dfb1145d6a23806f8d7a8e2bf17ef049b5e506c86"
     },
     {
       "path": "src/utils/taskRoot.ts",

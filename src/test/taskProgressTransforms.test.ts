@@ -438,3 +438,40 @@ void test("a task with no completedStages survives a rollback", () => {
   assert.strictEqual(rolled.currentStage, "impl");
   assert.strictEqual(rolled.completedStages, undefined);
 });
+
+// A rollback deliberately PRESERVES implReviewFiles, diverging from the
+// completed-task reopen path (whose policy is "otherwise []"). Reopen restarts
+// a finished task, so the old changed-file list is history. An active rollback
+// is a mid-flight correction — usually "go back to impl and build more" — and
+// that list is the accumulated review scope for everything built so far.
+// Clearing it would leave the next review seeing only the following round's
+// files, which is the blindness that stalled the workflow task on 2026-08-07.
+
+void test("rolling back to impl preserves accumulated implReviewFiles (unlike reopen)", () => {
+  const accumulated = ["a.ts", "b.ts", "c.ts"];
+  const progress: TaskProgress = {
+    ...makeProgress(accumulated),
+    currentStage: "impl-high-review",
+    completedStages: ["desc", "plan", "impl"],
+  };
+  const rolled = updateTaskProgressStage(progress, "impl");
+  assert.deepStrictEqual(
+    rolled.implReviewFiles,
+    accumulated,
+    "review scope built over earlier rounds must survive a mid-flight rollback"
+  );
+});
+
+void test("rolling back to a stage before impl also preserves review scope", () => {
+  // Even here the task is still active and mid-flight; reopen's "clear it"
+  // rule applies to restarting a COMPLETED task, not to this transition.
+  const accumulated = ["a.ts", "b.ts"];
+  const progress: TaskProgress = {
+    ...makeProgress(accumulated),
+    currentStage: "impl-high-review",
+    completedStages: ["desc", "plan", "impl"],
+  };
+  const rolled = updateTaskProgressStage(progress, "plan");
+  assert.deepStrictEqual(rolled.implReviewFiles, accumulated);
+  assert.deepStrictEqual(rolled.completedStages, ["desc"]);
+});
