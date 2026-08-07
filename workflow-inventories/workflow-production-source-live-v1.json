@@ -3,7 +3,7 @@
   "generatedBy": "scripts/resolveProductionSourceUniverse.mjs",
   "description": "Production source universe as of the current working tree, resolved from the exact bundler options that produce dist/extension.js (esbuild.config.js) plus the contribution-asset and runtime-resource-copy rules in scripts/lib/productionSourceScan.mjs. Regenerated every run; diffed against the immutable pre-gate snapshot (workflow-production-source-pregate-v1.json), not authoritative on its own.",
   "packageName": "vs-code-ai-helper",
-  "packageVersion": "0.80.0",
+  "packageVersion": "0.81.0",
   "declaredMain": "./dist/extension.js",
   "entrypoint": "src/extension.ts",
   "outfile": "dist/extension.js",
@@ -628,7 +628,7 @@
     },
     {
       "path": "src/utils/reviewReadiness.ts",
-      "sha256": "598ed3047127276397f553c08a1a76fb7e2f4bb1d40ec4297f3f6de99e45a2c5"
+      "sha256": "889c8de9c553f7a50816f427bfe6907f388e551bffd6dbf612fab4d5cf637479"
     },
     {
       "path": "src/utils/reviewRouting.ts",

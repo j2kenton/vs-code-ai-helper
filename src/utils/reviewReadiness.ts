@@ -169,8 +169,26 @@ export interface ReviewBlocker {
 }
 
 const BLOCKERS_BLOCK_RE = /<!--\s*blockers:start\s*-->([\s\S]*?)<!--\s*blockers:end\s*-->/i;
+/**
+ * The category bracket is OPTIONAL. Reviewers do sometimes emit only the
+ * resolver — `- [needs-toolchain] baseline drifted…` instead of
+ * `- [completion] [needs-toolchain] baseline drifted…` — and requiring both
+ * brackets made that line unmatchable, so it was skipped and the block parsed
+ * to zero blockers. That is the worst possible reading: a review that found
+ * real problems became indistinguishable from one that found none, and
+ * `hasZeroTaskFixableEvidence` then reported positive evidence of a clean
+ * round. Observed live 2026-08-07 (`.ensemble/2026-07-24_task_1`, impl-high
+ * round 1) where two genuine blockers recorded as `blockerCount: 0`.
+ *
+ * The resolver is the field every routing decision actually keys on, so it
+ * stays required; a missing category defaults to `completion` below. Order
+ * matters in the alternation — the optional group is tried first, and a line
+ * carrying only a CATEGORY (`- [completion] …`, no resolver) still correctly
+ * fails to match, because backtracking then requires a valid resolver in the
+ * first bracket and finds a category name there instead.
+ */
 const BLOCKER_LINE_RE =
-  /^\s*[-*]\s*\[\s*(architectural|completion|review-confidence|shipping)\s*\]\s*\[\s*(task-fixable|environmental|unverifiable|spec-defect|needs-toolchain)\s*\]\s*(.+?)\s*$/i;
+  /^\s*[-*]\s*(?:\[\s*(architectural|completion|review-confidence|shipping)\s*\]\s*)?\[\s*(task-fixable|environmental|unverifiable|spec-defect|needs-toolchain)\s*\]\s*(.+?)\s*$/i;
 
 /**
  * Parse the machine-readable blocker block reviewers are asked to emit
@@ -330,11 +348,17 @@ export function parseReviewBlockersDetailed(content: string): ReviewBlockerEvide
       continue;
     }
     const [, category, resolver, description] = lineMatch;
-    if (!category || !resolver || !description) {
+    // `category` is absent when the reviewer emitted the resolver-only form;
+    // that is accepted, so only resolver and description are required here.
+    // Defaulting to "completion" is the conservative choice: it is the
+    // rubric's general-purpose category, and it makes the sibling-disagreement
+    // check (`implLowCompletionBlockers` below) MORE likely to surface a
+    // conflict rather than less.
+    if (!resolver || !description) {
       continue;
     }
     blockers.push({
-      category: category.toLowerCase() as BlockerCategory,
+      category: (category ?? "completion").toLowerCase() as BlockerCategory,
       resolver: resolver.toLowerCase() as BlockerResolver,
       description,
     });
