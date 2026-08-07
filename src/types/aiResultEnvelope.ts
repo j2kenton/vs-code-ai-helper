@@ -9,10 +9,12 @@
  * cross-task, cross-operation, or stale-attempt result can never be
  * promoted by a consumer that only checks "kind".
  *
- * Nothing in the extension emits or consumes this format yet — no runner,
- * coordinator, or registry exists to produce a correlation tuple or route
- * "questions"/"preflight-plan.v1"/"edit-execution.v1" content anywhere. This
- * module only defines and strictly parses the wire contract itself.
+ * No runner, coordinator, or registry yet produces a correlation tuple or
+ * routes "questions"/"preflight-plan.v1"/"edit-execution.v1" content
+ * anywhere — this module still only defines and strictly parses the wire
+ * contract itself. The one exception is `FRAME_START_V1`, which
+ * `cliAgentRunner.ts` already imports to detect a framed text part when
+ * extracting opencode output.
  */
 import { createHash } from "crypto";
 import {

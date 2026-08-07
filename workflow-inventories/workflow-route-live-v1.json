@@ -3,7 +3,7 @@
   "generatedBy": "scripts/generateWorkflowRoutes.mjs",
   "description": "Mechanically extracted workflow route surface of the current working tree (plan §1.2): command registrations, contribution/menu references, internal executeCommand edges, dynamic dispatch sites, webview message roots, tree-item command bindings, provider-boundary call sites, legacy output destinations, and per-file legacy-AI-gate calls — every edge a concrete route row. Scanned over the exact §1.1 production source universe (never a filesystem walk). Regenerated every run; classification lives in workflow-route-baseline-v1.json; the immutable pre-gate reference is workflow-route-pregate-v1.json. Known mechanical bound: tree-item/status-row command bindings are collected only when the bound command ID is a string literal — dynamically bound commands are enforced at their executeCommand dispatch sites instead (dynamicDispatches, which fail closed without an annotation). sourceUniverseSha256 is the CANONICAL (line-ending-independent) digest of the source-universe JSON, so provenance is identical across LF and CRLF checkouts.",
   "sourceUniverse": "workflow-inventories/workflow-production-source-baseline-v1.json",
-  "sourceUniverseSha256": "b425c86e09339a7a6c6da1bfbccbc36fdd56c72591493d06bb6b93bdd9dc09a9",
+  "sourceUniverseSha256": "e9f5a240efddfc6e2c682f9d66f4f43ff18646eafa7e90662e1d10b246629bd3",
   "routeCount": 100,
   "routes": [
     {

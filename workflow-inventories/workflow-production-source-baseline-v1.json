@@ -3,7 +3,7 @@
   "generatedBy": "scripts/resolveProductionSourceUniverse.mjs",
   "description": "Production source universe as of the current working tree, resolved from the exact bundler options that produce dist/extension.js (esbuild.config.js) plus the contribution-asset and runtime-resource-copy rules in scripts/lib/productionSourceScan.mjs. Regenerated every run; diffed against the immutable pre-gate snapshot (workflow-production-source-pregate-v1.json), not authoritative on its own.",
   "packageName": "vs-code-ai-helper",
-  "packageVersion": "0.74.6",
+  "packageVersion": "0.74.7",
   "declaredMain": "./dist/extension.js",
   "entrypoint": "src/extension.ts",
   "outfile": "dist/extension.js",
@@ -416,7 +416,7 @@
     },
     {
       "path": "src/types/aiResultEnvelope.ts",
-      "sha256": "ee200807bb6e0089d4199b7ecdbaf822ee719475b8ae6498b013505e77756f6b"
+      "sha256": "0ed30bc5d3cf3820d2637d98a242310bd35c4bec2e5fe9b3c76990de4b76e7fb"
     },
     {
       "path": "src/types/chatInteractionTransactionV1.ts",
