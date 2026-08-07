@@ -33,6 +33,7 @@ import {
   appendReviewScoreHistory,
   clearImplementationTypeCheckFailure,
   recordImplementationTypeCheckFailure,
+  updateImplReviewFiles,
   updateTaskStatus,
 } from "../utils/taskProgressTransforms";
 import { IncompleteTask } from "../types/incompleteTask";
@@ -53,7 +54,6 @@ import {
   writeTextFile,
 } from "../utils/fileUtils";
 import { generateContextPack, writeContextPack, writeImplReviewContextPack } from "../utils/contextPack";
-import { isMachineMaintainedArtifactPathV1 } from "../utils/implReviewFileSelection";
 import { renderPromptTemplate } from "../utils/promptTemplates";
 import { writeRunLog } from "../utils/runLog";
 import {
@@ -4832,13 +4832,22 @@ async function executeImplementationRun(
       // being recorded as review scope in the first place. If every changed
       // file was machine-maintained, treat it exactly like a zero-change
       // round — keep the prior list rather than persisting an empty one.
+      //
+      // ACCUMULATES across rounds (updateImplReviewFiles unions with the
+      // existing list) rather than replacing. This write used to overwrite,
+      // which was harmless while a task was one implementation round — but a
+      // plan now legitimately spans many rounds, and replacing left the
+      // final reviewer looking at only the LAST round's slice while being
+      // asked to verify every plan step. Observed live 2026-08-07: after the
+      // 25-step plan finished, impl-low-review could see 9 files, could not
+      // source-verify ~20 of 25 items, and raised a review-confidence
+      // blocker no implementation round could ever clear — three zero-change
+      // rounds later the no-progress breaker escalated. The union helper
+      // also applies the machine-maintained filter and keeps newest-first
+      // ordering, so a context-pack budget trims the oldest (already
+      // reviewed) files rather than the current round's work.
       if (!result!.filesChangedUnknown && result!.filesChanged.length > 0) {
-        const reviewableFiles = result!.filesChanged.filter(
-          (file) => !isMachineMaintainedArtifactPathV1(file)
-        );
-        if (reviewableFiles.length > 0) {
-          return { ...stageUpdated, implReviewFiles: reviewableFiles };
-        }
+        return updateImplReviewFiles(stageUpdated, result!.filesChanged);
       }
       return stageUpdated;
     });

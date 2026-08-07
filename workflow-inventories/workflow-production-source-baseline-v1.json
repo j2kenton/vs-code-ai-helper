@@ -168,7 +168,7 @@
     },
     {
       "path": "src/commands/reviewActions.ts",
-      "sha256": "894c658a768fa1a3bf7a68637b96aaf66c8fcb3a1c8c3f5a4c8a76d007a6d91e"
+      "sha256": "f78ce55ef8852c493de5bae3a2de6d524f6e24441902715f2939190494a23327"
     },
     {
       "path": "src/commands/reviewCurrentTask.ts",

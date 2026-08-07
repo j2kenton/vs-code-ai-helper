@@ -311,3 +311,59 @@ void test("clearImplementationTypeCheckFailure is a no-op (same reference) when 
   assert.strictEqual(clearImplementationTypeCheckFailure(progress), progress);
 });
 
+
+// ---------------------------------------------------------------------------
+// Multi-round accumulation (2026-08-07 live escalation). A plan now
+// legitimately spans many implementation rounds, so review scope must be
+// everything the task built — not the last round's slice.
+//
+// Observed: after a 25-step plan finished, impl-low-review saw only 9 files,
+// could not source-verify ~20 of 25 plan items, and raised a
+// review-confidence blocker no implementation round could clear (nothing was
+// wrong to fix). Three zero-change rounds later the no-progress breaker
+// escalated. reviewActions.ts's write site had been REPLACING this field
+// while the helper it bypassed unions.
+// ---------------------------------------------------------------------------
+
+void test("accumulates across many rounds instead of keeping only the last", () => {
+  let progress = makeProgress();
+  progress = updateImplReviewFiles(progress, ["round1.ts"]);
+  progress = updateImplReviewFiles(progress, ["round2.ts"]);
+  progress = updateImplReviewFiles(progress, ["round3.ts"]);
+  assert.deepStrictEqual(
+    [...(progress.implReviewFiles ?? [])].sort(),
+    ["round1.ts", "round2.ts", "round3.ts"]
+  );
+});
+
+void test("puts the newest round first so a size budget trims already-reviewed files", () => {
+  // Ordering is load-bearing: the context pack truncates from the end, so
+  // the current round's work — the part the reviewer has not seen yet —
+  // must never be the part dropped.
+  let progress = makeProgress();
+  progress = updateImplReviewFiles(progress, ["older.ts"]);
+  progress = updateImplReviewFiles(progress, ["newest.ts"]);
+  assert.strictEqual(progress.implReviewFiles?.[0], "newest.ts");
+});
+
+void test("does not duplicate a file touched in several rounds", () => {
+  let progress = makeProgress();
+  progress = updateImplReviewFiles(progress, ["shared.ts", "a.ts"]);
+  progress = updateImplReviewFiles(progress, ["shared.ts", "b.ts"]);
+  assert.strictEqual(
+    (progress.implReviewFiles ?? []).filter((f) => f === "shared.ts").length,
+    1
+  );
+});
+
+void test("keeps earlier rounds when a later round changes only machine-maintained files", () => {
+  // The regression this guards: an inventory-only round must not shrink
+  // review scope to nothing, which is how a reviewer once ended up pointed
+  // at a single generated JSON file.
+  let progress = makeProgress();
+  progress = updateImplReviewFiles(progress, ["real-work.ts"]);
+  progress = updateImplReviewFiles(progress, [
+    "workflow-inventories/workflow-production-source-live-v1.json",
+  ]);
+  assert.deepStrictEqual(progress.implReviewFiles, ["real-work.ts"]);
+});
