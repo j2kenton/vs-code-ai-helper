@@ -120,9 +120,16 @@ import {
   parseReviewedCommitSha,
   parseReviewProgress,
   detectSiblingReviewDisagreement,
+  ReviewBlocker,
 } from "../utils/reviewReadiness";
 import { scheduleAutomationChain, releaseAutomationChain } from "../utils/automationChain";
-import { buildPlanItemVerificationSection, buildVerifiedChecksSection, collectCompletionLintPreview, resolvePublishScopeFolder } from "../utils/completionLint";
+import {
+  buildPlanItemVerificationSection,
+  buildVerifiedChecksSection,
+  collectCompletionLintPreview,
+  resolvePublishScopeFolder,
+  synthesizeMechanicalBlockers,
+} from "../utils/completionLint";
 import { checkPublishPreflight } from "../utils/publishPreflight";
 import { improveReviewScore } from "../utils/reviewScoreLoop";
 import { countCommitsSinceSha, resolveHeadCommitSha } from "../utils/gitRepoInfo";
@@ -1201,13 +1208,20 @@ async function readPreviousReviewForRereview(
  * this same collectCompletionLintPreview call (rather than a second one) so
  * requesting it doesn't double the lint/type/test/build commands run for
  * every Publish review round.
+ *
+ * Also returns `mechanicalBlockers` (step 4 of the fail-closed-parsing fix):
+ * blockers synthesized directly from `result.failedChecks` via
+ * `synthesizeMechanicalBlockers`, bypassing the reviewer's prose entirely for
+ * a fact the extension host already confirmed firsthand. Empty when checks
+ * could not be run at all — an unrunnable check is missing evidence, not a
+ * known failure, so nothing can be synthesized from it.
  */
 async function buildVerifiedChecksVariable(
   folderUri: vscode.Uri,
   relevantFiles: readonly string[] | undefined,
   token: vscode.CancellationToken | undefined,
   includePlanItemVerification = false
-): Promise<{ verifiedChecks: string; planItemVerification?: string }> {
+): Promise<{ verifiedChecks: string; planItemVerification?: string; mechanicalBlockers: ReviewBlocker[] }> {
   try {
     const result = await collectCompletionLintPreview(folderUri, relevantFiles, {
       allowScopePrompt: false,
@@ -1219,6 +1233,7 @@ async function buildVerifiedChecksVariable(
       planItemVerification: includePlanItemVerification
         ? buildPlanItemVerificationSection(result.planItems)
         : undefined,
+      mechanicalBlockers: synthesizeMechanicalBlockers(result),
     };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -1238,8 +1253,41 @@ async function buildVerifiedChecksVariable(
       planItemVerification: includePlanItemVerification
         ? `## Plan Item Verification\n\nPlan item verification could not be run for this review: ${message}\n\nTreat the absence of this evidence itself as a review-confidence concern, not as neutral.`
         : undefined,
+      mechanicalBlockers: [],
     };
   }
+}
+
+/**
+ * In-memory last-computed mechanical-blocker set per task folder + stage.
+ * `buildVerifiedChecksVariable` runs once per review round (inside
+ * `runReviewForFolder`/Fast Forward's `applyReviewWithAI`/
+ * `applyReviewEditWithAI` chain) and its result feeds the prompt, but Fast
+ * Forward's `review()` callback (`improveReviewScoreForConcreteArg` below)
+ * only ever reads the resulting review ARTIFACT back off disk — it has no
+ * other path to the `CompletionLintResult` that round's prompt was built
+ * from. This cache closes that gap without threading a new parameter through
+ * the whole apply/review call chain. Matches `zeroChangeImplRoundsByTask`'s
+ * existing in-memory, per-session pattern above: scoped to this run of the
+ * extension host, never persisted, safe to be stale-and-overwritten on the
+ * next round.
+ */
+const mechanicalBlockersByTaskStage = new Map<string, ReviewBlocker[]>();
+
+function mechanicalBlockersCacheKey(folderUri: vscode.Uri, targetStage: TaskStage): string {
+  return `${normalizePath(folderUri.fsPath)}::${targetStage}`;
+}
+
+function setMechanicalBlockersForStage(
+  folderUri: vscode.Uri,
+  targetStage: TaskStage,
+  blockers: ReviewBlocker[]
+): void {
+  mechanicalBlockersByTaskStage.set(mechanicalBlockersCacheKey(folderUri, targetStage), blockers);
+}
+
+function getMechanicalBlockersForStage(folderUri: vscode.Uri, targetStage: TaskStage): ReviewBlocker[] {
+  return mechanicalBlockersByTaskStage.get(mechanicalBlockersCacheKey(folderUri, targetStage)) ?? [];
 }
 
 /**
@@ -1344,8 +1392,10 @@ export function reconcileSecondOpinion(
  * here is logged as a warning and swallowed rather than risking the review
  * pipeline that already succeeded in publishing (failure returns
  * escalated: false, since nothing was actually paused).
+ *
+ * @internal exported for testing
  */
-async function handleReviewRoutingOutcome(options: {
+export async function handleReviewRoutingOutcome(options: {
   folderUri: vscode.Uri;
   targetStage: TaskStage;
   reviewAttemptId: string;
@@ -1357,7 +1407,13 @@ async function handleReviewRoutingOutcome(options: {
   try {
     const resilience = getResilienceSettings();
     const blockerEvidence = parseReviewBlockersDetailed(content);
-    const blockers = blockerEvidence.blockers;
+    // Merge in blockers synthesized directly from this round's failed
+    // Verified Checks (step 4 of the fail-closed-parsing fix) — cached by
+    // buildVerifiedChecksVariable moments earlier in this same round, before
+    // this review's content was even generated, so a mechanical failure
+    // feeds history/routing even if the reviewer's own prose description of
+    // it never round-trips through BLOCKER_LINE_RE at all.
+    const blockers = [...blockerEvidence.blockers, ...getMechanicalBlockersForStage(folderUri, targetStage)];
     if (blockerEvidence.malformedLines.length > 0) {
       // A malformed line is UNKNOWN, not clean — never let it look identical
       // to a round that stalled for any other reason. Record what could not
@@ -2235,6 +2291,7 @@ export async function runReviewForFolder(
     if (checks.planItemVerification !== undefined) {
       variables.planItemVerification = checks.planItemVerification;
     }
+    setMechanicalBlockersForStage(folderUri, targetStage, checks.mechanicalBlockers);
     if (targetStage === "publish") {
       variables.siblingReviewDisagreement = await buildSiblingReviewDisagreementVariable(
         folderUri,
@@ -3271,15 +3328,30 @@ export async function fastForwardReviewWithAI(
             }
             previousContent = newContent;
             const detailed = parseReviewBlockersDetailed(newContent);
+            // Mechanical blockers (step 4 of the fail-closed-parsing fix),
+            // cached by buildVerifiedChecksVariable when this round's prompt
+            // was assembled: a failed Verified Check must count toward
+            // taskFixableCount, and must veto zeroFixableEvidence, exactly
+            // like a parsed reviewer blocker — a model-authored blocker line
+            // that happens to fail to parse must never be the ONLY thing
+            // standing between "checks are failing" and "clean round".
+            const mechanicalBlockers = getMechanicalBlockersForStage(resolved.folderUri, targetStage);
+            const hasMechanicalTaskFixable = mechanicalBlockers.some((b) => b.resolver === "task-fixable");
             return {
               score: parseReadiness(newContent).score,
               taskFixableCount: detailed.blockPresent
-                ? detailed.blockers.filter((b) => b.resolver === "task-fixable").length
-                : null,
+                ? detailed.blockers.filter((b) => b.resolver === "task-fixable").length + mechanicalBlockers.length
+                : mechanicalBlockers.length > 0
+                  ? mechanicalBlockers.length
+                  : null,
               // Positive evidence only: a parsed (present) blocker block
               // with no task-fixable entry, or an explicit no-blockers
-              // statement — never the mere absence of the block.
-              zeroFixableEvidence: hasZeroTaskFixableEvidence(newContent),
+              // statement — never the mere absence of the block. A
+              // mechanically-synthesized task-fixable blocker overrides that
+              // to false regardless of what the reviewer's own block says —
+              // a Verified Check that is still failing is never a clean
+              // round, no matter how the reviewer described it.
+              zeroFixableEvidence: hasMechanicalTaskFixable ? false : hasZeroTaskFixableEvidence(newContent),
               // "Clean so far" vs "clean and finished" — null when the review
               // emitted no marker, which preserves the pre-marker behavior.
               progress: parseReviewProgress(newContent),
@@ -5958,6 +6030,7 @@ async function buildReviewResumeVariablesV1(
     if (checks.planItemVerification !== undefined) {
       variables.planItemVerification = checks.planItemVerification;
     }
+    setMechanicalBlockersForStage(folderUri, targetStage, checks.mechanicalBlockers);
   }
 
   const contextPackUri = isPlanReview

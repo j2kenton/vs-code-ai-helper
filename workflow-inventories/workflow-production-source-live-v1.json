@@ -168,7 +168,7 @@
     },
     {
       "path": "src/commands/reviewActions.ts",
-      "sha256": "04ed9a31b94f08b8fc11c15c8320a2873dc7c0f96b40cb754ccf9aa163dd1cf0"
+      "sha256": "21b40c950fe5daa3e5f3325c35e2d5114341d51907500ab1e3797489ab1f7491"
     },
     {
       "path": "src/commands/reviewCurrentTask.ts",
@@ -512,7 +512,7 @@
     },
     {
       "path": "src/utils/completionLint.ts",
-      "sha256": "417e98a032fd3926e9be183fe07674bdda555e4709441fa5cc815b0e92b18683"
+      "sha256": "6f2a5b3aeccd5673f13cf7bcbca7afbde540d6ba3e457b942eda2c9e59e7e901"
     },
     {
       "path": "src/utils/contextEligibility.ts",

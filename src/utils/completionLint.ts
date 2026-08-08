@@ -9,6 +9,7 @@ import { STAGE_ARTIFACT_FILENAMES, TaskProgress } from "../types/taskProgress";
 import { getCompletionCheckTimeoutMs, getKnownFlakyChecks, getPublishVerificationCommands, KnownFlakyCheck } from "../config/settings";
 import { promptAndPersistPublishScope } from "../commands/choosePublishScope";
 import { isWorkflowPrivatePathV1 } from "../services/workflowPrivacyClassifierV1";
+import { ReviewBlocker } from "./reviewReadiness";
 
 /**
  * Resolve a package manager executable to an absolute path, preferring a
@@ -1345,6 +1346,40 @@ export function buildVerifiedChecksSection(result: CompletionLintResult): string
     lines.push("", `- **${check.command}** — exit ${check.exitCode} (FAILED)${retryNote}`, "```", output, "```");
   }
   return lines.join("\n");
+}
+
+/**
+ * Turn failed Verified Checks directly into blockers, bypassing the model
+ * entirely for facts the extension host already holds firsthand. See
+ * reviewReadiness.ts's `BLOCKER_LINE_RE` doc comment for the incident this
+ * exists to make impossible: `verify:workflow-production-sources` had
+ * already failed with a non-zero exit code before any reviewer saw it, and
+ * the round trip through the reviewer's prose (describe the failure, format
+ * it as a blocker line) is exactly where the blocker was lost. A
+ * deterministic check that fails now files its own blocker directly,
+ * independent of whether the reviewer's free-text summary of it happens to
+ * parse.
+ *
+ * Quarantined known-flake failures (`knownFlakeFailures`) are excluded,
+ * mirroring `buildVerifiedChecksSection`'s own "excluded from the overall
+ * verdict" treatment above — a quarantined flake must not synthesize a
+ * blocker any more than it counts toward `passed`.
+ *
+ * category/resolver are fixed at "completion"/"task-fixable": a failing repo
+ * check is, by construction, something an implementation round can address
+ * (fix what the command reports, then it passes), the same bucket a human
+ * reviewer would file it under.
+ */
+export function synthesizeMechanicalBlockers(result: CompletionLintResult): ReviewBlocker[] {
+  const knownFlakeFailures = result.knownFlakeFailures ?? [];
+  const unquarantinedFailures = result.failedChecks.filter(
+    (check) => !knownFlakeFailures.some((f) => f.command === check.command && f.exitCode === check.exitCode)
+  );
+  return unquarantinedFailures.map((check) => ({
+    category: "completion",
+    resolver: "task-fixable",
+    description: `\`${check.command}\` failed (exit ${check.exitCode}) — generated mechanically from Verified Checks`,
+  }));
 }
 
 /**
