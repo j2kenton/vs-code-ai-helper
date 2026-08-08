@@ -101,6 +101,35 @@ void describe("describeTaskActionOutcomeForLogV1", () => {
       "Status: malformed result (invalidFrame)"
     );
   });
+
+  void it("renders the reservation's provider/model identity when a completed outcome carries one", () => {
+    const withProvider: TaskActionOutcomeV1 = {
+      kind: "completed",
+      correlation: CORRELATION,
+      code: "completed",
+      provider: { providerLabel: "Claude Code", storedModelId: "claude-cli:opus@max" },
+    };
+    assert.equal(
+      describeTaskActionOutcomeForLogV1(withProvider),
+      "Status: completed (completed) [Claude Code (opus@max)]"
+    );
+    // Absent provider (every pre-existing outcome, or an outcome kind that
+    // never reaches a provider invocation) renders exactly as before.
+    assert.equal(describeTaskActionOutcomeForLogV1(ALL_OUTCOMES[0]!), "Status: completed (completed)");
+  });
+
+  void it("renders the reservation's provider/model identity on a malformedResult that writes no artifact", () => {
+    const withProvider: TaskActionOutcomeV1 = {
+      kind: "malformedResult",
+      correlation: CORRELATION,
+      code: "invalidFrame",
+      provider: { providerLabel: "OpenAI Codex", storedModelId: "codex-cli:gpt-5.6-sol@high" },
+    };
+    assert.equal(
+      describeTaskActionOutcomeForLogV1(withProvider),
+      "Status: malformed result (invalidFrame) [OpenAI Codex (gpt-5.6-sol@high)]"
+    );
+  });
 });
 
 void describe("describeTaskActionFailureV1", () => {

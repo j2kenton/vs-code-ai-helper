@@ -801,7 +801,8 @@ async function preserveRejectedResultForRecoveryV1(
   text: string,
   correlation: ActionCorrelationV1,
   reservationId: ReservationIdV1,
-  brokerOptions: AgentExecutionBrokerOptionsV1 | undefined
+  brokerOptions: AgentExecutionBrokerOptionsV1 | undefined,
+  provider: { readonly providerLabel: string; readonly storedModelId: string }
 ): Promise<ResultSpoolRefV1 | undefined> {
   const store = brokerOptions?.spoolStore;
   if (!store) {
@@ -810,6 +811,7 @@ async function preserveRejectedResultForRecoveryV1(
   try {
     return await store.writeSpool(correlation, reservationId, Buffer.from(text, "utf8"), {
       purpose: "recovery",
+      provider,
     });
   } catch {
     return undefined;
@@ -1068,6 +1070,7 @@ export function createTaskActionCoordinatorV1(
         ...(preflightSession !== undefined
           ? { preflight: { ledger: preflightSession.ledger, rootId: preflightSession.rootId } }
           : {}),
+        provider: { providerLabel: reserved.providerLabel, storedModelId: reserved.storedModelId },
       };
       const prompt =
         row.buildPrompt(context) +
@@ -1130,7 +1133,10 @@ export function createTaskActionCoordinatorV1(
       const raw =
         prepared.kind === "preInvocationOutcome"
           ? prepared.outcome
-          : await prepared.invoke(deps.brokerOptions ?? {});
+          : await prepared.invoke({
+              ...(deps.brokerOptions ?? {}),
+              provider: { providerLabel: reserved.providerLabel, storedModelId: reserved.storedModelId },
+            });
 
       switch (raw.kind) {
         case "callerCancelled":
@@ -1196,7 +1202,8 @@ export function createTaskActionCoordinatorV1(
           unsealed.text,
           correlation,
           reserved.handle.reservationId,
-          deps.brokerOptions
+          deps.brokerOptions,
+          { providerLabel: reserved.providerLabel, storedModelId: reserved.storedModelId }
         );
         const detailParts = [
           reasonDetail,
@@ -1209,6 +1216,7 @@ export function createTaskActionCoordinatorV1(
           correlation,
           code: parsed.code,
           ...(detailParts.length > 0 ? { detail: detailParts.join("; ") } : {}),
+          ...(context.provider ? { provider: context.provider } : {}),
         };
       }
 
@@ -1233,6 +1241,7 @@ export function createTaskActionCoordinatorV1(
         correlation,
         code: "contentSchemaMismatch",
         detail: `received result kind "${envelope.kind}", but ${row.actionKey} only permits: ${row.permittedResultKinds.join(", ")}`,
+        ...(context.provider ? { provider: context.provider } : {}),
       };
     }
     switch (envelope.kind) {
@@ -1244,6 +1253,7 @@ export function createTaskActionCoordinatorV1(
             correlation,
             code: "contentSchemaMismatch",
             detail: `received content type "${envelope.content.contentType}", expected "${row.completedContentType}"`,
+            ...(context.provider ? { provider: context.provider } : {}),
           };
         }
         session.reportAttemptOutcome(attemptId, "completed");
@@ -1260,7 +1270,7 @@ export function createTaskActionCoordinatorV1(
         }
         try {
           const code = await row.promoteCompletedContent(envelope.content, context);
-          return { kind: "completed", correlation, code };
+          return { kind: "completed", correlation, code, ...(context.provider ? { provider: context.provider } : {}) };
         } catch (error) {
           return {
             kind: "failed",

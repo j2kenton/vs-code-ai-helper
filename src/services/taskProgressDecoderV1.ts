@@ -526,7 +526,13 @@ function validateLintPayload(value: unknown): string | undefined {
       if (!isPlainObject(check)) {
         return "lintPayload.failedChecks entries must be objects";
       }
-      const checkAllowed = new Set(["command", "exitCode", "output"]);
+      // `retryCount` is written by completionLint.ts's runCheckWithRetry (it
+      // records how many attempts a flaky check needed) and is omitted when
+      // zero. It was missing here, so any task whose publish checks retried
+      // wrote a progress file its own strict decoder then refused —
+      // "unknown property \"retryCount\"" — leaving the task stuck needing
+      // recovery. Observed 2026-08-08 on .ensemble/2026-07-24_task_1.
+      const checkAllowed = new Set(["command", "exitCode", "output", "retryCount"]);
       for (const key of Object.keys(check)) {
         if (!checkAllowed.has(key)) {
           return `lintPayload.failedChecks entry has an unknown property ${JSON.stringify(key)}`;
@@ -537,6 +543,9 @@ function validateLintPayload(value: unknown): string | undefined {
       }
       if (typeof check["exitCode"] !== "number" || !Number.isInteger(check["exitCode"])) {
         return "lintPayload.failedChecks entry exitCode must be an integer";
+      }
+      if (check["retryCount"] !== undefined && !isNonNegativeInteger(check["retryCount"])) {
+        return "lintPayload.failedChecks entry retryCount must be a non-negative integer when present";
       }
       if (!boundedString(check["output"], MAX_CHECK_OUTPUT_LENGTH)) {
         return "lintPayload.failedChecks entry output must be a bounded string";

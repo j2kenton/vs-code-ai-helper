@@ -17,6 +17,7 @@ import { maxResponseBytesCeilingForModeV1 } from "../../types/agentExecutionV1";
 import { CompletedContentV1 } from "../../types/aiResultEnvelope";
 import { getWorkflowFileStoreV1 } from "../../services/workflowRuntimeServicesV1";
 import { WorkflowFileRevisionV1 } from "../../services/workflowFileStoreV1";
+import { attributionModelLabel, withAttribution } from "../../utils/fileUtils";
 
 export const GENERATE_IMPLEMENTATION_ACTION_KEY_V1 = "generateImplementation.v1";
 
@@ -107,6 +108,16 @@ async function promoteGenerateImplementationContentV1(
   let markdown = content.markdown;
   if (!markdown.includes(IMPLEMENTATION_CHECKLIST_MARKER)) {
     markdown = `${IMPLEMENTATION_CHECKLIST_MARKER}\n\n${markdown}`;
+  }
+  // Signed with the reservation actually claimed/invoked, same helper and
+  // header format as review artifacts (reviewRowV1.ts) — header goes above
+  // the checklist marker; .includes() still finds the marker either way.
+  if (context.provider) {
+    markdown = withAttribution(
+      markdown,
+      context.provider.providerLabel,
+      attributionModelLabel(context.provider.storedModelId)
+    );
   }
   const bytes = Buffer.from(markdown, "utf8");
   const result =

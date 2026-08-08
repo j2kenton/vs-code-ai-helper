@@ -70,6 +70,12 @@ export type SpoolClaimResultV1 =
  */
 export type SpoolPurposeV1 = "recovery";
 
+/** Identity of the reservation that actually produced the spooled bytes, so a claim (or an unclaimed recovery read) can attribute the content without re-deriving it from configuration. Optional so pre-existing spools without it still decode. */
+export interface SpoolProviderIdentityV1 {
+  readonly providerLabel: string;
+  readonly storedModelId: string;
+}
+
 export interface BoundedResultStoreV1 {
   readonly storeId: string;
   /** Seal raw response bytes into a new spool for the given correlation/reservation. */
@@ -77,7 +83,10 @@ export interface BoundedResultStoreV1 {
     correlation: ActionCorrelationV1,
     reservationId: ReservationIdV1,
     rawBytes: Buffer,
-    options?: { readonly purpose?: SpoolPurposeV1 }
+    options?: {
+      readonly purpose?: SpoolPurposeV1;
+      readonly provider?: SpoolProviderIdentityV1;
+    }
   ): Promise<ResultSpoolRefV1>;
   /**
    * Claim a spool exactly once. Verifies the caller's correlation tuple,
@@ -98,6 +107,8 @@ export interface BoundedResultStoreV1 {
 interface SpoolMetaV1 extends ResultSpoolRefV1 {
   readonly schemaVersion: 1;
   readonly purpose?: SpoolPurposeV1;
+  readonly providerLabel?: string;
+  readonly storedModelId?: string;
 }
 
 function spoolDir(rootDir: string, ref: {
@@ -158,7 +169,11 @@ function decodeSpoolMeta(rawJson: string): SpoolMetaV1 | undefined {
     typeof m.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(m.sha256) ||
     typeof m.createdAt !== "string" || Number.isNaN(Date.parse(m.createdAt)) ||
     typeof m.expiresAt !== "string" || Number.isNaN(Date.parse(m.expiresAt)) ||
-    (m.purpose !== undefined && m.purpose !== "recovery")
+    (m.purpose !== undefined && m.purpose !== "recovery") ||
+    (m.providerLabel !== undefined &&
+      (typeof m.providerLabel !== "string" || m.providerLabel.length === 0)) ||
+    (m.storedModelId !== undefined &&
+      (typeof m.storedModelId !== "string" || m.storedModelId.length === 0))
   ) {
     return undefined;
   }
@@ -176,6 +191,8 @@ function decodeSpoolMeta(rawJson: string): SpoolMetaV1 | undefined {
     createdAt: m.createdAt,
     expiresAt: m.expiresAt,
     ...(m.purpose === "recovery" ? { purpose: "recovery" as const } : {}),
+    ...(typeof m.providerLabel === "string" ? { providerLabel: m.providerLabel } : {}),
+    ...(typeof m.storedModelId === "string" ? { storedModelId: m.storedModelId } : {}),
   };
 }
 
@@ -210,7 +227,10 @@ export function createBoundedResultStoreV1(options: {
       correlation: ActionCorrelationV1,
       reservationId: ReservationIdV1,
       rawBytes: Buffer,
-      writeOptions?: { readonly purpose?: SpoolPurposeV1 }
+      writeOptions?: {
+        readonly purpose?: SpoolPurposeV1;
+        readonly provider?: SpoolProviderIdentityV1;
+      }
     ): Promise<ResultSpoolRefV1> {
       if (
         !isHex128IdV1(correlation.operationId) ||
@@ -244,6 +264,12 @@ export function createBoundedResultStoreV1(options: {
         schemaVersion: 1,
         ...ref,
         ...(writeOptions?.purpose ? { purpose: writeOptions.purpose } : {}),
+        ...(writeOptions?.provider
+          ? {
+              providerLabel: writeOptions.provider.providerLabel,
+              storedModelId: writeOptions.provider.storedModelId,
+            }
+          : {}),
       };
       // Exclusive creation: a reservation is invocation-once, so a second
       // spool write for the same reservation is always a protocol violation.

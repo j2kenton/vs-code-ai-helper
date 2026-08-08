@@ -900,6 +900,14 @@ void describe("runImplementationForModel", () => {
       assert.strictEqual(result.runnerId, "copilot-lm");
       assert.strictEqual(result.status, "completed");
       assert.strictEqual(result.summary, "backup implementation");
+      // Durable provider/model attribution task: the RUNTIME backup that
+      // actually produced this result must be stamped, not the requested
+      // primary "copilot-gpt-5.6-sol" — this is the misattribution the
+      // implementation review flagged (runnerRegistry.ts's own internal
+      // cascade substituting a model with no visible identity at the
+      // caller boundary).
+      assert.strictEqual(result.actualStoredModelId, "auto");
+      assert.strictEqual(result.actualProviderLabel, "Copilot");
       const progress = JSON.parse(fs.readFileSync(progressPath, "utf8")) as {
         fallbackActive?: Partial<Record<string, boolean>>;
         fallbackModelId?: Partial<Record<string, string>>;

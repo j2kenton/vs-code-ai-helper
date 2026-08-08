@@ -361,4 +361,47 @@ void describe("boundedResultStoreV1", () => {
       fixture.cleanup();
     }
   });
+
+  void it("round-trips optional provider identity through spool meta, and still decodes metas without it", async () => {
+    const fixture = makeStore();
+    try {
+      const correlation = makeCorrelation();
+      const withProviderRef = await fixture.store.writeSpool(
+        correlation,
+        allocateHex128IdV1(),
+        Buffer.from("provider-attributed response"),
+        { provider: { providerLabel: "Claude Code", storedModelId: "claude-cli:opus@max" } }
+      );
+      const claimWithProvider = await fixture.store.claimSpoolOnce(withProviderRef, correlation);
+      assert.ok(claimWithProvider.ok);
+      assert.equal((claimWithProvider.ref as { providerLabel?: string }).providerLabel, "Claude Code");
+      assert.equal(
+        (claimWithProvider.ref as { storedModelId?: string }).storedModelId,
+        "claude-cli:opus@max"
+      );
+
+      // A pre-existing spool written before provider fields existed has
+      // neither field in its meta and must still decode/claim successfully.
+      const legacyCorrelation = makeCorrelation();
+      const legacyRef = await fixture.store.writeSpool(
+        legacyCorrelation,
+        allocateHex128IdV1(),
+        Buffer.from("legacy response, no provider fields")
+      );
+      const legacyMetaPath = path.join(
+        fixture.rootDir,
+        legacyRef.operationId,
+        legacyRef.attemptId,
+        legacyRef.reservationId,
+        "spool-meta-v1.json"
+      );
+      const legacyMeta = JSON.parse(fs.readFileSync(legacyMetaPath, "utf8")) as Record<string, unknown>;
+      assert.equal("providerLabel" in legacyMeta, false);
+      assert.equal("storedModelId" in legacyMeta, false);
+      const claimLegacy = await fixture.store.claimSpoolOnce(legacyRef, legacyCorrelation);
+      assert.ok(claimLegacy.ok);
+    } finally {
+      fixture.cleanup();
+    }
+  });
 });

@@ -768,7 +768,23 @@ export async function runSealedImplementationV1(
  */
 export async function runImplementationOrSealedV1(
   options: RunSealedImplementationOptionsV1
-): Promise<ImplementationRunResult & { runnerId: string }> {
+): Promise<
+  ImplementationRunResult & {
+    runnerId: string;
+    /**
+     * Identity of the winning candidate `checkImplementationAvailabilityForModel`
+     * resolved BEFORE dispatch — i.e. the requested primary, or a configured
+     * backup when the primary was unavailable pre-invocation. Absent when
+     * resolution/availability failed before any model was chosen. Does not
+     * capture a RUNTIME quota fallback inside `runImplementationForModel`'s own
+     * internal cascade (AC-RUNNER-04 forbids deepening that legacy cascade
+     * further to expose it) — that case still only surfaces via the sticky
+     * per-stage `recordActiveFallbackModel` state, not here.
+     */
+    providerLabel?: string;
+    storedModelId?: string;
+  }
+> {
   try {
     resolveEffectiveProvider(options.modelId);
   } catch (error) {
@@ -812,7 +828,7 @@ export async function runImplementationOrSealedV1(
     };
   }
   if (availability.provider !== "copilot") {
-    return runImplementationForModel({
+    const cliResult = await runImplementationForModel({
       modelId: availability.modelId,
       prompt: options.prompt,
       workspaceUri: options.workspaceUri,
@@ -853,6 +869,22 @@ export async function runImplementationOrSealedV1(
       // TRUE primary so it can record correctly (see its own header).
       configuredPrimaryModelId: options.modelId,
     });
+    // Review finding (this round): `availability.providerLabel`/`.modelId`
+    // are only the PRE-invocation winning candidate. `cliResult` now always
+    // carries `actualProviderLabel`/`actualStoredModelId`, stamped at
+    // runImplementationForModel's own return point — including inside its
+    // internal RUNTIME quota/temporarily-unavailable cascade, so a caller
+    // whose primary passed this pre-check but failed at runtime and was
+    // rescued by a backup reports that backup's identity, not the failed
+    // primary's (AC 1's quota-fallback clause). This does not deepen or
+    // change the cascade's own control flow (AC-RUNNER-04 concerns the V1
+    // selection opener, not this pre-existing legacy cascade) — it only
+    // surfaces the identity each existing return point already knows.
+    return {
+      ...cliResult,
+      providerLabel: cliResult.actualProviderLabel,
+      storedModelId: cliResult.actualStoredModelId,
+    };
   }
   // The winning candidate resolves to Copilot — either the primary itself
   // (the common case: availability.modelId === options.modelId, so this is
@@ -875,7 +907,9 @@ export async function runImplementationOrSealedV1(
   ) {
     await recordActiveFallbackModel(options.taskFolderUri, stage, availability.modelId);
   }
-  return sealedResult;
+  // runSealedImplementationV1 has no fallback cascade of its own (see the
+  // comment above), so the pre-invocation winning candidate IS what ran.
+  return { ...sealedResult, providerLabel: availability.providerLabel, storedModelId: availability.modelId };
 }
 
 // ---------------------------------------------------------------------------

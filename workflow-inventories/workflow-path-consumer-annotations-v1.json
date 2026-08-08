@@ -12,7 +12,7 @@
       "expiryCohort": "cleanup",
       "evidence": {
         "symbol": "(module)",
-        "sourceSpan": "L85-L85",
+        "sourceSpan": "L87-L87",
         "edgeKind": "dynamicPathConsumption",
         "targetActionKey": "none"
       }

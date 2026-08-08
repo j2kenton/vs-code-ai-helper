@@ -16,6 +16,7 @@ import { CompletedContentV1 } from "../../types/aiResultEnvelope";
 import { getWorkflowFileStoreV1 } from "../../services/workflowRuntimeServicesV1";
 import { WorkflowFileRevisionV1 } from "../../services/workflowFileStoreV1";
 import { parseReadiness } from "../../utils/reviewReadiness";
+import { attributionModelLabel, withAttribution } from "../../utils/fileUtils";
 
 export const REVIEW_ACTION_KEY_V1 = "review.v1";
 
@@ -109,7 +110,19 @@ async function promoteReviewContentV1(
   }
   const input = context.validatedInput as ReviewActionInputV1;
   const fileStore = getWorkflowFileStoreV1();
-  const bytes = Buffer.from(content.markdown, "utf8");
+  // Signed with the reservation actually claimed/invoked (never the row's
+  // requested model), so a backup-cascade substitution is reflected here —
+  // same helper and header format the legacy CliAgentRunner text path uses,
+  // so a review artifact is indistinguishable regardless of which path wrote
+  // it (see fileUtils.ts's withAttribution/attributionModelLabel).
+  const markdown = context.provider
+    ? withAttribution(
+        content.markdown,
+        context.provider.providerLabel,
+        attributionModelLabel(context.provider.storedModelId)
+      )
+    : content.markdown;
+  const bytes = Buffer.from(markdown, "utf8");
   const result =
     input.baselineRevision === undefined
       ? await fileStore.createFileExclusive(input.targetLocator, bytes)

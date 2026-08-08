@@ -750,9 +750,35 @@ export async function runImplementationForModel(options: {
    * explicitly given a value that differs from `modelId`.
    */
   configuredPrimaryModelId?: string;
-}): Promise<ImplementationRunResult & { runnerId: string }> {
+}): Promise<
+  ImplementationRunResult & {
+    runnerId: string;
+    /**
+     * Identity of whichever candidate — the primary, or a same-/cross-kind
+     * backup this cascade (or `runCrossProviderBackup`) actually invoked —
+     * produced THIS returned result. Unlike `runImplementationOrSealedV1`'s
+     * own pre-invocation `providerLabel`/`storedModelId` (resolved BEFORE
+     * dispatch), these are stamped at the exact return point, after any
+     * runtime quota/temporarily-unavailable substitution inside this
+     * cascade — so a caller can always report the model that actually ran,
+     * not just the one that was about to be tried.
+     */
+    actualProviderLabel: string;
+    actualStoredModelId: string | undefined;
+  }
+> {
   assertNoUnauthorizedV1CorrelationV0(options);
   const effective = resolveEffectiveProvider(options.modelId);
+  const primaryProviderLabel = toResolvedRunner(effective).providerLabel;
+  const withActualIdentity = <T extends ImplementationRunResult & { runnerId: string }>(
+    base: T,
+    providerLabel: string,
+    storedModelId: string | undefined
+  ): T & { actualProviderLabel: string; actualStoredModelId: string | undefined } => ({
+    ...base,
+    actualProviderLabel: providerLabel,
+    actualStoredModelId: storedModelId,
+  });
 
   const run = async (
     selected: EffectiveProvider,
@@ -855,11 +881,11 @@ export async function runImplementationForModel(options: {
     getBackupModels(setting).length
   ) {
     if (!options.taskFolderUri) {
-      return result;
+      return withActualIdentity(result, primaryProviderLabel, options.modelId);
     }
     const reserved = await reserveFallback(options.taskFolderUri, options.stage);
     if (!reserved) {
-      return result;
+      return withActualIdentity(result, primaryProviderLabel, options.modelId);
     }
     const releaseReservation = (): Promise<void> =>
       releaseUnresolvedFallbackReservation(options.taskFolderUri!, options.stage!);
@@ -906,7 +932,7 @@ export async function runImplementationForModel(options: {
         recordQuotaObservation(options.stage, backupModel, fallbackFailure.failureKind, fallbackFailure.errorMessage);
         if (isAuthenticationFailure(fallbackAvailability.availability.reason)) {
           await releaseReservation();
-          return fallbackFailure;
+          return withActualIdentity(fallbackFailure, fallbackAvailability.providerLabel, backupModel);
         }
         continue;
       }
@@ -920,7 +946,7 @@ export async function runImplementationForModel(options: {
           options.stage,
           backupModel
         );
-        return fallbackResult;
+        return withActualIdentity(fallbackResult, fallbackAvailability.providerLabel, backupModel);
       }
       // A failed/cancelled backup cannot be the stage's sticky fallback.
       // In particular, this prevents an OpenCode 401 from routing every
@@ -931,7 +957,7 @@ export async function runImplementationForModel(options: {
           fallbackResult.failureKind !== "temporarily-unavailable")
       ) {
         await releaseReservation();
-        return fallbackResult;
+        return withActualIdentity(fallbackResult, fallbackAvailability.providerLabel, backupModel);
       }
       // Codex review finding (P1): this backup's own failure is cascadable
       // by failureKind alone, but the SAME dirty-tree gate applied to the
@@ -943,7 +969,7 @@ export async function runImplementationForModel(options: {
       // exactly as the primary's own gate does.
       if (!leftTreeCleanV1(fallbackResult)) {
         await releaseReservation();
-        return fallbackResult;
+        return withActualIdentity(fallbackResult, fallbackAvailability.providerLabel, backupModel);
       }
     }
     await releaseReservation();
@@ -969,11 +995,11 @@ export async function runImplementationForModel(options: {
     getBackupModels(setting).length
   ) {
     if (!options.taskFolderUri) {
-      return result;
+      return withActualIdentity(result, primaryProviderLabel, options.modelId);
     }
     const reserved = await reserveFallback(options.taskFolderUri, options.stage);
     if (!reserved) {
-      return result;
+      return withActualIdentity(result, primaryProviderLabel, options.modelId);
     }
     const releaseReservation = (): Promise<void> =>
       releaseUnresolvedFallbackReservation(options.taskFolderUri!, options.stage!);
@@ -1020,7 +1046,7 @@ export async function runImplementationForModel(options: {
         recordQuotaObservation(options.stage, backupModel, fallbackFailure.failureKind, fallbackFailure.errorMessage);
         if (isAuthenticationFailure(fallbackAvailability.availability.reason)) {
           await releaseReservation();
-          return fallbackFailure;
+          return withActualIdentity(fallbackFailure, fallbackAvailability.providerLabel, backupModel);
         }
         continue;
       }
@@ -1034,7 +1060,7 @@ export async function runImplementationForModel(options: {
       const merged = { ...fallbackResult, ...mergeFilesChanged(fallbackResult) };
       if (fallbackResult.status === "completed") {
         await recordActiveFallbackModel(options.taskFolderUri, options.stage, backupModel);
-        return merged;
+        return withActualIdentity(merged, fallbackAvailability.providerLabel, backupModel);
       }
       // Whether the backup itself failed, was cancelled, or left the tree in
       // an unknown state, do not cascade to a THIRD agent: the combined tree
@@ -1042,13 +1068,13 @@ export async function runImplementationForModel(options: {
       // to describe both, not just the primary's. Stop and report the
       // merged changed-file set on the backup's own outcome.
       await releaseReservation();
-      return merged;
+      return withActualIdentity(merged, fallbackAvailability.providerLabel, backupModel);
     }
     if (!handedOff) {
       await releaseReservation();
     }
   }
-  return result;
+  return withActualIdentity(result, primaryProviderLabel, options.modelId);
 }
 
 /* ------------------------------------------------------------------------ *

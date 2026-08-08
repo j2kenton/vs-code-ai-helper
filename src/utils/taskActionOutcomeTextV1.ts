@@ -28,7 +28,23 @@
  * missing only the required output frame — was invisible until the raw
  * response was recovered by hand from the CLI provider's own session store.
  */
-import { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
+import { TaskActionOutcomeProviderV1, TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
+import { attributionModelLabel } from "./fileUtils";
+
+/**
+ * Render the same provider/model identity artifact attribution headers use,
+ * as a run-log line suffix — so a reader never has to learn two formats for
+ * "what actually ran". Absent whenever the outcome carries no provider
+ * (e.g. a pre-existing persisted outcome, or an outcome kind that never
+ * reaches a provider invocation).
+ */
+function providerLogSuffix(provider: TaskActionOutcomeProviderV1 | undefined): string {
+  if (!provider) {
+    return "";
+  }
+  const model = attributionModelLabel(provider.storedModelId);
+  return ` [${provider.providerLabel}${model ? ` (${model})` : ""}]`;
+}
 
 /**
  * One short status line for a run log.
@@ -43,7 +59,7 @@ export function describeTaskActionOutcomeForLogV1(
 ): string {
   switch (outcome.kind) {
     case "completed":
-      return `Status: completed (${outcome.code})`;
+      return `Status: completed (${outcome.code})${providerLogSuffix(outcome.provider)}`;
     case "questions":
       return (
         `Status: questions (interactionId=${outcome.interactionId}) — the AI asked a clarifying ` +
@@ -54,7 +70,7 @@ export function describeTaskActionOutcomeForLogV1(
     case "failed":
       return `Status: failed (code=${outcome.code}, retryable=${outcome.retryable})`;
     case "malformedResult":
-      return `Status: malformed result (${outcome.code}${outcome.detail ? `: ${outcome.detail}` : ""})`;
+      return `Status: malformed result (${outcome.code}${outcome.detail ? `: ${outcome.detail}` : ""})${providerLogSuffix(outcome.provider)}`;
     case "unavailable":
       return `Status: unavailable (${outcome.code})`;
     case "recoveryRequired":

@@ -52,7 +52,7 @@
     },
     {
       "path": "src/actions/rows/generateImplementationRowV1.ts",
-      "sha256": "d7de62f797c5374f5065bb12de207dbf5b855cef7899e03e05827fe48032ef68"
+      "sha256": "4ef6b69ff275094b747440ef4337a5978652932448cec17b1a3955e0faf22482"
     },
     {
       "path": "src/actions/rows/generatePlanRowV1.ts",
@@ -80,15 +80,15 @@
     },
     {
       "path": "src/actions/rows/reviewRowV1.ts",
-      "sha256": "fdd868ae6dd74ab40152d745c5a627fd7d16f3fdd1a4a3edaa2372aa9297f9ec"
+      "sha256": "e00348329213b20e522553db08c99a24baf95067856d154ffbbe0a5b38ca26d2"
     },
     {
       "path": "src/actions/taskActionCoordinatorV1.ts",
-      "sha256": "dc6255609d27cdabed8f038d22ae721735e625e08f61acbf2d4d08e35de6d8cd"
+      "sha256": "cbdae3a3bc7172b2701b86797752134cb33276c8ec551d56ce210284eefda605"
     },
     {
       "path": "src/actions/taskActionRegistryV1.ts",
-      "sha256": "24dab6e482a8f66c4f53478eb3a5c758ad828e2c8419b1788c25e0b0022c5071"
+      "sha256": "c20ccff0ea792a5398b614818fd7cceff396a8b808fa68a7a77e72cc9289a5e0"
     },
     {
       "path": "src/commands/applyCurrentStageAction.ts",
@@ -156,7 +156,7 @@
     },
     {
       "path": "src/commands/recoverLastAiResponse.ts",
-      "sha256": "84ef93072e45bd3f6d6e5a07205d4c24cf2cc3141e2664958ff0b40610a0bdf6"
+      "sha256": "3abb87256879b9c29e3b91740903b0e352160152bff058922f9f8a09befc0b6f"
     },
     {
       "path": "src/commands/renameTask.ts",
@@ -168,7 +168,7 @@
     },
     {
       "path": "src/commands/reviewActions.ts",
-      "sha256": "21b40c950fe5daa3e5f3325c35e2d5114341d51907500ab1e3797489ab1f7491"
+      "sha256": "781784f25673b0811092e687b45607011df89d8c9d8f972310e02fe3ddab7fac"
     },
     {
       "path": "src/commands/reviewCurrentTask.ts",
@@ -176,7 +176,7 @@
     },
     {
       "path": "src/commands/runEditActionV1.ts",
-      "sha256": "56c27994ad359098697ff2f57f465c67e84907d7157b684071743a866292d37d"
+      "sha256": "e6af2d03dd4614fc23527f7093f46dca432fd396ec6c2037ee0580f3cd7246ef"
     },
     {
       "path": "src/commands/runLintingFixes.ts",
@@ -256,15 +256,15 @@
     },
     {
       "path": "src/runners/runnerRegistry.ts",
-      "sha256": "8ec703ab13f21e4bc3faa575f0232313a009fedc5e522d28026bc028d4f91c1a"
+      "sha256": "97584172f147b68f28f65780e2463fab614e2b6015366879dbcbe1f9157271b7"
     },
     {
       "path": "src/services/agentExecutionBrokerV1.ts",
-      "sha256": "c8c950d514c5ffeca1a86bdf61e345922d761990e797c0513dec878027607aa8"
+      "sha256": "c2f3aff3b187cfcdb243df49b36429364ba93603d8c3a9ad5dfece1ce1521b28"
     },
     {
       "path": "src/services/boundedResultStoreV1.ts",
-      "sha256": "ff3d43fdb0552f893eb62f1ce2165dde0eb22d7c34b5762361528db62e92292a"
+      "sha256": "1fd9432897716574f591d569436d93a5ec8ba0ca2e344a5a5ab2b60a3ba599fd"
     },
     {
       "path": "src/services/canonicalJsonV1.ts",
@@ -320,7 +320,7 @@
     },
     {
       "path": "src/services/taskProgressDecoderV1.ts",
-      "sha256": "dd73cca4c287e9fecf56765e399cc80c79b062fb2660442acbb2cd08735960b6"
+      "sha256": "21fa9ee0f701fde73051e288463596d2e926a08b11995dbdfee7de8e9ebdcfdb"
     },
     {
       "path": "src/services/taskProgressDiscoveryV1.ts",
@@ -440,7 +440,7 @@
     },
     {
       "path": "src/types/taskActionOutcomeV1.ts",
-      "sha256": "814d36753a0597516cae34177ff9be2593f40c89cf4c589a7e435d63cae4c71f"
+      "sha256": "de230d49eec23cd70c4004730b9a521182de71054525927eafa6ea4a4e5419b5"
     },
     {
       "path": "src/types/taskAdoptionIntentV1.ts",
@@ -512,7 +512,7 @@
     },
     {
       "path": "src/utils/completionLint.ts",
-      "sha256": "6f2a5b3aeccd5673f13cf7bcbca7afbde540d6ba3e457b942eda2c9e59e7e901"
+      "sha256": "9b467d6dddbcc4b82b98a4fc1c2f4fb524754809ed68b628e5f107ec8682c9eb"
     },
     {
       "path": "src/utils/contextEligibility.ts",
@@ -536,7 +536,7 @@
     },
     {
       "path": "src/utils/fileUtils.ts",
-      "sha256": "9b1e55f41f53e4435513352af9a073bce821439b31ba0ceae967cbe60d22a9cf"
+      "sha256": "2dc9178199a0331ca95173956310627c5c1688cf2cfedeb61c0ea3122e2663a7"
     },
     {
       "path": "src/utils/gitRepoInfo.ts",
@@ -648,7 +648,7 @@
     },
     {
       "path": "src/utils/taskActionOutcomeTextV1.ts",
-      "sha256": "4f2395a432922b7ad683338576274daec6b29e002dcffbeddf1511026c47b1f7"
+      "sha256": "6bd6497fb381ec6c88bc09a4eec643675f2a43ff8a2cf74f2d1e8e5e54878226"
     },
     {
       "path": "src/utils/taskDescriptionDocument.ts",

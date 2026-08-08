@@ -24,6 +24,8 @@ interface RecoveredSpoolMetaV1 {
   readonly createdAt?: string;
   readonly expiresAt?: string;
   readonly purpose?: string;
+  readonly providerLabel?: string;
+  readonly storedModelId?: string;
 }
 
 interface RecoveredSpoolV1 {
@@ -152,6 +154,9 @@ export async function recoverLastAiResponse(): Promise<void> {
     `  Expires at:    ${meta.expiresAt ?? "(unknown)"} (24h retention)`,
     meta.actionKey ? `  Action:        ${meta.actionKey}` : undefined,
     meta.operationId ? `  Operation id:  ${meta.operationId}` : undefined,
+    meta.providerLabel
+      ? `  Provider:      ${meta.providerLabel}${meta.storedModelId ? ` (${meta.storedModelId})` : ""}`
+      : undefined,
     meta.byteLength !== undefined ? `  Byte length:   ${meta.byteLength}` : undefined,
     meta.sha256 ? `  SHA-256:       ${meta.sha256}` : undefined,
     "",

@@ -77,6 +77,17 @@ export interface TaskActionExecutionContextV1 {
     readonly ledger: ObservationLedgerV1;
     readonly rootId: string;
   };
+  /**
+   * Identity of the reservation actually claimed and invoked for this
+   * attempt — set by the coordinator from `reserved.providerLabel` /
+   * `reserved.storedModelId`, never from the row's requested model, so
+   * promotion can attribute content to the model that really ran even when
+   * a backup cascade substituted a different one.
+   */
+  readonly provider?: {
+    readonly providerLabel: string;
+    readonly storedModelId: string;
+  };
 }
 
 /** Execution context for non-provider (lifecycle) rows: an operation, but no provider attempt. */

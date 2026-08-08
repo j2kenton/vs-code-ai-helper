@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import { PLAN_FILENAME } from "../types/taskProgress";
 import { backupArtifactBeforeWrite } from "./artifactBackups";
 import { NotificationRouter } from "./notificationRouter";
+import { parseModelSelection } from "../runners/providers";
 
 /**
  * Build a signed attribution line for AI-generated output, so the file
@@ -27,6 +28,18 @@ export function withAttribution(
   modelLabel: string | undefined
 ): string {
   return `${attributionHeader(providerLabel, modelLabel)}\n\n${content}`;
+}
+
+/**
+ * Derive the native model id (plus effort suffix, e.g. "opus@max") from a
+ * provider-qualified stored model id (e.g. "claude-cli:claude-code/opus@max")
+ * for use as `withAttribution`'s modelLabel, so a V1 reservation's
+ * `storedModelId` renders identically to the legacy runner's `request.modelId`
+ * in the same header. Reuses `parseModelSelection`'s own prefix-splitting
+ * logic rather than duplicating it.
+ */
+export function attributionModelLabel(storedModelId: string): string | undefined {
+  return parseModelSelection(storedModelId).model;
 }
 
 /**

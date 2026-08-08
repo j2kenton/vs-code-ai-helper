@@ -116,6 +116,15 @@ export interface AgentExecutionBrokerOptionsV1 {
   readonly spoolStore?: BoundedResultStoreV1;
   /** Byte size above which a sealed response is spooled instead of held in memory. */
   readonly spoolThresholdBytes?: number;
+  /**
+   * Identity of the reservation actually invoked, stamped onto a spooled
+   * response's metadata so a later claim (or an unclaimed recovery read) can
+   * attribute the content without re-deriving it from configuration.
+   */
+  readonly provider?: {
+    readonly providerLabel: string;
+    readonly storedModelId: string;
+  };
 }
 
 function validateRequest(
@@ -216,7 +225,8 @@ async function sealCompletedResponse(
       const spoolRef = await options.spoolStore.writeSpool(
         request.correlation,
         request.reservationId,
-        rawBytes
+        rawBytes,
+        options.provider ? { provider: options.provider } : undefined
       );
       return { kind: "response", payload: { storage: "spool", spoolRef } };
     } catch {

@@ -30,11 +30,25 @@ export interface DuplicateRejectedOutcomeV1 {
   readonly code: "operationAlreadyRunning";
 }
 
+/**
+ * Identity of the reservation actually claimed and invoked for a settled
+ * outcome — carried onto `completed`/`malformedResult` so the run log can
+ * record what really ran (including a backup-cascade substitution) rather
+ * than the row's requested model. Never the model itself: just enough (the
+ * same display label + provider-qualified stored id used for artifact
+ * attribution) to render one log line.
+ */
+export interface TaskActionOutcomeProviderV1 {
+  readonly providerLabel: string;
+  readonly storedModelId: string;
+}
+
 export type TaskActionOutcomeV1 =
   | {
       readonly kind: "completed";
       readonly correlation: ActionCorrelationV1;
       readonly code: "completed" | "noChanges";
+      readonly provider?: TaskActionOutcomeProviderV1;
     }
   | {
       readonly kind: "questions";
@@ -71,6 +85,7 @@ export type TaskActionOutcomeV1 =
        * every persisted record without it) remains valid.
        */
       readonly detail?: string;
+      readonly provider?: TaskActionOutcomeProviderV1;
     }
   | {
       readonly kind: "unavailable";
@@ -217,6 +232,27 @@ function decodeOptionalCorrelation(raw: unknown): ActionCorrelationV1 | undefine
   return decodeCorrelation(raw);
 }
 
+/** Decode an optional `provider` field, rejecting unknown sub-fields; absent (pre-existing persisted outcomes) decodes to `undefined`. */
+function decodeOptionalProviderV1(raw: unknown): TaskActionOutcomeProviderV1 | undefined | string {
+  if (raw === undefined) {
+    return undefined;
+  }
+  if (!isPlainRecordV1(raw)) {
+    return "\"provider\" is not an object";
+  }
+  const unknown = unknownOutcomeField(raw, new Set(["providerLabel", "storedModelId"]), "provider");
+  if (unknown) {
+    return unknown;
+  }
+  if (typeof raw.providerLabel !== "string" || raw.providerLabel.length === 0) {
+    return "\"provider.providerLabel\" must be a non-empty string";
+  }
+  if (typeof raw.storedModelId !== "string" || raw.storedModelId.length === 0) {
+    return "\"provider.storedModelId\" must be a non-empty string";
+  }
+  return { providerLabel: raw.providerLabel, storedModelId: raw.storedModelId };
+}
+
 /**
  * Strictly decode a raw parsed JSON value as a persisted `TaskActionOutcomeV1`.
  * Fail-closed: unknown fields, malformed correlations, and unrecognized codes
@@ -228,7 +264,11 @@ export function decodeTaskActionOutcomeV1(raw: unknown): DecodeTaskActionOutcome
   }
   switch (raw.kind) {
     case "completed": {
-      const unknown = unknownOutcomeField(raw, new Set(["kind", "correlation", "code"]), "completed outcome");
+      const unknown = unknownOutcomeField(
+        raw,
+        new Set(["kind", "correlation", "code", "provider"]),
+        "completed outcome"
+      );
       if (unknown) {
         return fail(unknown);
       }
@@ -239,7 +279,19 @@ export function decodeTaskActionOutcomeV1(raw: unknown): DecodeTaskActionOutcome
       if (raw.code !== "completed" && raw.code !== "noChanges") {
         return fail(`invalid completed outcome "code": ${JSON.stringify(raw.code)}`);
       }
-      return { ok: true, outcome: { kind: "completed", correlation, code: raw.code } };
+      const provider = decodeOptionalProviderV1(raw.provider);
+      if (typeof provider === "string") {
+        return fail(provider);
+      }
+      return {
+        ok: true,
+        outcome: {
+          kind: "completed",
+          correlation,
+          code: raw.code,
+          ...(provider !== undefined ? { provider } : {}),
+        },
+      };
     }
     case "questions": {
       const unknown = unknownOutcomeField(
@@ -311,7 +363,7 @@ export function decodeTaskActionOutcomeV1(raw: unknown): DecodeTaskActionOutcome
     case "malformedResult": {
       const unknown = unknownOutcomeField(
         raw,
-        new Set(["kind", "correlation", "code", "detail"]),
+        new Set(["kind", "correlation", "code", "detail", "provider"]),
         "malformedResult outcome"
       );
       if (unknown) {
@@ -327,6 +379,10 @@ export function decodeTaskActionOutcomeV1(raw: unknown): DecodeTaskActionOutcome
       if (raw.detail !== undefined && typeof raw.detail !== "string") {
         return fail(`invalid malformedResult outcome "detail": ${JSON.stringify(raw.detail)}`);
       }
+      const provider = decodeOptionalProviderV1(raw.provider);
+      if (typeof provider === "string") {
+        return fail(provider);
+      }
       return {
         ok: true,
         outcome: {
@@ -334,6 +390,7 @@ export function decodeTaskActionOutcomeV1(raw: unknown): DecodeTaskActionOutcome
           correlation,
           code: raw.code as MalformedResultCodeV1,
           ...(raw.detail !== undefined ? { detail: raw.detail } : {}),
+          ...(provider !== undefined ? { provider } : {}),
         },
       };
     }

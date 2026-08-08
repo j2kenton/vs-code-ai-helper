@@ -46,11 +46,13 @@ import {
 } from "../utils/stageTransition";
 import { assertLegacyAiRouteAllowedV0 } from "../services/legacyAiActionSafetyGateV0";
 import {
+  attributionModelLabel,
   openOrCreateDocument,
   readNonEmptyText,
   resolveCurrentPlanUri,
   safeOpenTextDocument,
   statIfExists,
+  withAttribution,
   writeTextFile,
 } from "../utils/fileUtils";
 import { generateContextPack, writeContextPack, writeImplReviewContextPack } from "../utils/contextPack";
@@ -4795,7 +4797,14 @@ async function executeImplementationRun(
     return false;
   }
 
-  const logContent = `# Implementation Run\n\nStatus: ${result.status}\n\nFiles changed:\n${
+  const implProviderLine = result.providerLabel
+    ? `Provider: ${result.providerLabel}${
+        result.storedModelId && attributionModelLabel(result.storedModelId)
+          ? ` (${attributionModelLabel(result.storedModelId)})`
+          : ""
+      }\n\n`
+    : "";
+  const logContent = `# Implementation Run\n\nStatus: ${result.status}\n\n${implProviderLine}Files changed:\n${
     result.filesChanged.length > 0
       ? result.filesChanged.map((f) => `- ${f}`).join("\n")
       : "_none recorded_"
@@ -4871,7 +4880,18 @@ async function executeImplementationRun(
 
     const summary = result.summary?.trim();
     if (summary) {
-      await writeTextFile(implementationUri, `${summary}\n`);
+      // Signed with the reservation actually invoked (never the requested
+      // primary) — same helper and header format review artifacts use
+      // (reviewRowV1.ts), so plan-final.md is indistinguishable in format
+      // regardless of which path wrote it.
+      const signedSummary = result.providerLabel
+        ? withAttribution(
+            summary,
+            result.providerLabel,
+            result.storedModelId ? attributionModelLabel(result.storedModelId) : undefined
+          )
+        : summary;
+      await writeTextFile(implementationUri, `${signedSummary}\n`);
     }
 
     // Post-run: show changed files or warn if tracking was unavailable

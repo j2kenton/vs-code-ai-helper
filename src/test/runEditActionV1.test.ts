@@ -320,6 +320,13 @@ void describe("runEditActionV1 — §7.5 availability", () => {
         filesChanged: ["a.ts"],
         summary: "stub CLI backup run",
         runnerId: "claude-cli",
+        // runImplementationForModel always stamps the identity of whichever
+        // candidate actually produced the result at its own return point
+        // (see runnerRegistry.ts's withActualIdentity) — this stub mirrors
+        // that contract so this test still exercises the real consumption
+        // path in runImplementationOrSealedV1.
+        actualProviderLabel: "Claude Code",
+        actualStoredModelId: "claude-cli:sonnet",
       });
     };
     try {
@@ -334,6 +341,13 @@ void describe("runEditActionV1 — §7.5 availability", () => {
       });
       assert.equal(result.status, "completed");
       assert.equal(result.runnerId, "claude-cli");
+      // Durable provider/model attribution task: the result must be stamped
+      // with the BACKUP that actually ran (the winning candidate
+      // checkImplementationAvailabilityForModel resolved), never the
+      // originally requested Copilot primary — the exact mis-stamping this
+      // task exists to avoid.
+      assert.equal(result.providerLabel, "Claude Code");
+      assert.equal(result.storedModelId, "claude-cli:sonnet");
       assert.ok(capturedRunOptions, "runImplementationForModel must have been called");
       assert.equal(capturedRunOptions?.modelId, "claude-cli:sonnet");
       assert.equal(capturedRunOptions?.allowCrossProviderBackups, false);

@@ -1023,7 +1023,17 @@ export async function collectCompletionLint(
     failedChecks: commandFailures.map(({ command, code, output, retryCount }) => ({
       command,
       exitCode: code,
-      output,
+      // Truncated at the PERSIST boundary, not just the display ones. This
+      // payload is written into task-progress.json, which is re-read and
+      // rewritten on every stage transition, so an untruncated failure makes
+      // a hot ~2.5 KB file enormous: one `pnpm run verify` failure carrying
+      // all 422 eslint warnings produced a 384 KB progress file
+      // (.ensemble/2026-07-24_task_1, 2026-08-08). truncateCheckOutput was
+      // already applied where output feeds prompts (PUBLISH_CHECKS_ and
+      // VERIFIED_CHECKS_PROMPT_MAX_OUTPUT_CHARS) but never where it feeds
+      // storage. Head+tail is kept, so the fail-fast opening and the
+      // summarizing end both survive for runLintingFixes.
+      output: truncateCheckOutput(output, PERSISTED_CHECK_OUTPUT_MAX_CHARS),
       ...(retryCount > 0 ? { retryCount } : {}),
     })),
     knownFlakeFailures,
@@ -1068,6 +1078,15 @@ const PUBLISH_CHECKS_SECTION_END = "<!-- completion-checks:end -->";
  * human-facing artifact, not an AI prompt, so it only needs enough of the
  * output to identify the failure, not the full log. */
 const PUBLISH_CHECKS_MAX_OUTPUT_CHARS = 4000;
+
+/** Cap per-failed-check output PERSISTED into task-progress.json. Deliberately
+ * larger than the two display caps — runLintingFixes.ts reads this payload back
+ * to drive fixes, so it wants more context than a human skimming the artifact —
+ * but still bounded, because this file is re-read and rewritten on every stage
+ * transition. The decoder's own MAX_CHECK_OUTPUT_LENGTH (256 KB) is a ceiling
+ * against corruption, not a target: a single failing `verify` run legitimately
+ * emits hundreds of KB. */
+const PERSISTED_CHECK_OUTPUT_MAX_CHARS = 8000;
 
 /** Room reserved for the elision marker itself so the rendered output still
  * respects the caller's cap. */
