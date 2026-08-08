@@ -35,11 +35,10 @@ import {
   ProviderId,
 } from "./providers";
 import {
-  getModelSettings,
   isModelProviderEnabled,
   isProviderSelectionConfigured,
 } from "../config/settings";
-import { chooseFallback, getBackupModels } from "../utils/modelFallback";
+import { resolveEffectiveStageChainV1 } from "../utils/modelSelection";
 import { isAuthenticationFailure, recordQuotaObservation } from "../utils/quota";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { clearStageFallbackReservation } from "../utils/taskProgressTransforms";
@@ -218,13 +217,16 @@ export function backupModelsForStage(
   if (!stage) {
     return [];
   }
-  const setting = getModelSettings()[stage];
-  if (setting?.strategy !== "switch-to-backup") {
+  // The effective chain resolver applies skip flags and lets a blank stage
+  // inherit the general model's backups AND its strategy; the strategy gate
+  // therefore applies to whichever chain is actually in effect.
+  const chain = resolveEffectiveStageChainV1(stage);
+  if (chain.strategy !== "switch-to-backup") {
     return [];
   }
   const primary = normalizeQualifiedModelId(modelId);
   const seen = new Set<string>();
-  return filterEnabledBackupModels(getBackupModels(setting)).filter((candidate) => {
+  return filterEnabledBackupModels(chain.backups).filter((candidate) => {
     const normalized = normalizeQualifiedModelId(candidate);
     if (normalized === primary || seen.has(normalized)) {
       return false;
@@ -257,8 +259,11 @@ export function getConfiguredBackupModelsForStage(
   if (!stage) {
     return [];
   }
+  // Same effective chain as backupModelsForStage (skip flags applied, blank
+  // stage inheriting the general chain) — but deliberately WITHOUT that
+  // helper's strategy gate, per the contrast documented above.
   return filterEnabledBackupModels(
-    getBackupModels(getModelSettings()[stage]).filter(candidate => candidate !== modelId)
+    resolveEffectiveStageChainV1(stage).backups.filter(candidate => candidate !== modelId)
   );
 }
 
@@ -833,7 +838,12 @@ export async function runImplementationForModel(options: {
   ) {
     await recordActiveFallbackModel(options.taskFolderUri, options.stage, options.modelId);
   }
-  const setting = getModelSettings()[options.stage as keyof ReturnType<typeof getModelSettings>];
+  // The effective chain (skip-filtered, general-model fallback applied) is
+  // what governs the quota-fallback cascade below: a blank stage inherits
+  // the general chain's backups and strategy.
+  const chain = options.stage ? resolveEffectiveStageChainV1(options.stage) : undefined;
+  const chainWantsBackup =
+    chain !== undefined && chain.strategy === "switch-to-backup" && chain.backups.length > 0;
   // Prefer the provider's own pre-hint verdict; fall back to the regex over the
   // pre-hint diagnostic text, and only then over errorMessage. The layering is
   // what breaks a self-reinforcing loop: toFriendlyError APPENDS the login hint
@@ -877,8 +887,7 @@ export async function runImplementationForModel(options: {
     (result.failureKind === "quota" ||
       result.failureKind === "temporarily-unavailable") &&
     options.stage &&
-    chooseFallback(setting) === "backup" &&
-    getBackupModels(setting).length
+    chainWantsBackup
   ) {
     if (!options.taskFolderUri) {
       return withActualIdentity(result, primaryProviderLabel, options.modelId);
@@ -889,7 +898,7 @@ export async function runImplementationForModel(options: {
     }
     const releaseReservation = (): Promise<void> =>
       releaseUnresolvedFallbackReservation(options.taskFolderUri!, options.stage!);
-    for (const backupModel of filterEnabledBackupModels(getBackupModels(setting))) {
+    for (const backupModel of filterEnabledBackupModels(chain.backups)) {
       if (backupModel === options.modelId) {
         continue;
       }
@@ -991,8 +1000,7 @@ export async function runImplementationForModel(options: {
     (result.failureKind === "quota" ||
       result.failureKind === "temporarily-unavailable") &&
     options.stage &&
-    chooseFallback(setting) === "backup" &&
-    getBackupModels(setting).length
+    chainWantsBackup
   ) {
     if (!options.taskFolderUri) {
       return withActualIdentity(result, primaryProviderLabel, options.modelId);
@@ -1010,7 +1018,7 @@ export async function runImplementationForModel(options: {
       filesChangedUnknown: backup.filesChangedUnknown === true,
     });
     let handedOff = false;
-    for (const backupModel of filterEnabledBackupModels(getBackupModels(setting))) {
+    for (const backupModel of filterEnabledBackupModels(chain.backups)) {
       if (backupModel === options.modelId) {
         continue;
       }

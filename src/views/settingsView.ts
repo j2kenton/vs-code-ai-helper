@@ -8,6 +8,7 @@ import {
 import {
   getModelSettings,
   getEnabledProviders,
+  isProviderAccountActionsEnabled,
   isUnsavedSettingsWarningEnabled,
   setEnabledProviders,
   setModelSettings,
@@ -16,6 +17,8 @@ import {
 import { ModelSettings } from "../utils/modelFallback";
 import { getQuotaStatusText } from "../utils/quota";
 import {
+  CLI_PROVIDERS,
+  CliProviderDefinition,
   getProviderAccountEntry,
   PROVIDER_ACCOUNT_ENTRIES,
   ProviderAccountEntry,
@@ -37,6 +40,40 @@ type IncomingMessage =
 /** Provider label for terminal titles/messages, without a doubled "CLI". */
 function accountEntryDisplayLabel(entry: ProviderAccountEntry): string {
   return entry.label.replace(/\s+CLI$/i, "");
+}
+
+/**
+ * View-payload title overrides for stage headings (deliberately NOT edits to
+ * STAGE_DISPLAY_NAMES, which other surfaces render): the "desc" chain heads
+ * the AI Models list as the general model (§2).
+ */
+export const STAGE_TITLE_OVERRIDES: Partial<Record<TaskStage, string>> = {
+  desc: "General Model",
+};
+
+/** Role hints rendered under a stage heading in the AI Models view. */
+export const STAGE_ROLE_HINTS: Partial<Record<TaskStage, string>> = {
+  desc:
+    "Used for the Global Assistant, for processing task descriptions, and as the default for any stage with no model of its own.",
+  publish: "Used for running CLI operations — tests, linting, and similar.",
+};
+
+/**
+ * Map a Provider Selection account id to the CLI definition whose
+ * `installHint` applies to it: OpenCode Zen/Go are logical services backed by
+ * the one `opencode-cli` binary; every other CLI account id maps to its
+ * same-id definition; Copilot has no CLI to install and maps to undefined.
+ * providers.ts stays read-only — this is a view-side lookup.
+ */
+export function cliDefinitionForProviderAccountId(
+  accountId: string
+): CliProviderDefinition | undefined {
+  if (accountId === "copilot") {
+    return undefined;
+  }
+  const targetId =
+    accountId === "opencode-zen" || accountId === "opencode-go" ? "opencode-cli" : accountId;
+  return CLI_PROVIDERS.find((def) => def.id === targetId);
 }
 
 /**
@@ -464,9 +501,12 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       models,
       stages: AI_MODEL_STAGES,
       stageNames: STAGE_DISPLAY_NAMES,
+      stageTitleOverrides: STAGE_TITLE_OVERRIDES,
+      stageHints: STAGE_ROLE_HINTS,
       quotaStatus: this._buildQuotaStatus(),
       enabledProviders: getEnabledProviders(),
       providers: this._buildProviderViewModels(),
+      showProviderAccountActions: isProviderAccountActionsEnabled(),
       warnUnsavedSettings: isUnsavedSettingsWarningEnabled(),
     });
   }
@@ -481,6 +521,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       // Shown inline in the provider row, not as a tooltip: the user has
       // to be able to read it before deciding to enable the provider.
       permissionWarning: provider.permissionWarning ?? "",
+      // Launch gate 4b: surfaced by the model combobox's empty state when no
+      // models were discovered at all — before a run has failed, instead of
+      // only inside post-failure error strings.
+      installHint: cliDefinitionForProviderAccountId(provider.id)?.installHint ?? "",
       // UI button state comes from the same capability descriptor the
       // handler dispatches on: enabled for terminal/interactive/
       // vscode-command/manual, and also for unsupported when it carries a
@@ -518,6 +562,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       models,
       enabledProviders: getEnabledProviders(),
       providers: this._buildProviderViewModels(),
+      showProviderAccountActions: isProviderAccountActionsEnabled(),
     });
   }
 
@@ -799,14 +844,32 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             margin-bottom: var(--ensemble-space-half);
             font-size: var(--ensemble-small-font-size);
           }
-          .extra-backup {
+          /* One uniform row shape for the primary and every backup:
+             [checkbox] [combo] [×]. */
+          .model-row {
             display: flex;
             gap: var(--ensemble-space-1);
             margin-top: var(--ensemble-space-1);
             align-items: flex-start;
           }
-          .extra-backup .model-combobox {
+          .model-row .model-combobox {
             flex: 1;
+          }
+          .model-row .row-enabled {
+            margin-top: var(--ensemble-space-1);
+          }
+          /* A skipped row keeps its configured model and position — dimmed,
+             not disabled, so it stays editable. */
+          .model-row.skipped .model-combobox {
+            opacity: 0.55;
+          }
+          .stage-hint {
+            margin: 0 0 var(--ensemble-space-2);
+            font-size: var(--ensemble-small-font-size);
+            color: var(--vscode-descriptionForeground);
+          }
+          .model-option-detail {
+            color: var(--vscode-descriptionForeground);
           }
           .add-backup {
             margin-top: var(--ensemble-space-3);
@@ -858,6 +921,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           let quotaStatus = {};
           let enabledProviders = {};
           let providers = [];
+          let stageTitleOverrides = {};
+          let stageHints = {};
+          let showProviderAccountActions = false;
           let warnUnsavedSettings = true;
           let formDirty = false;
           let initialized = false;
@@ -971,6 +1037,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               quotaStatus = message.quotaStatus || {};
               enabledProviders = message.enabledProviders || {};
               providers = message.providers || [];
+              stageTitleOverrides = message.stageTitleOverrides || {};
+              stageHints = message.stageHints || {};
+              showProviderAccountActions = message.showProviderAccountActions === true;
               warnUnsavedSettings = message.warnUnsavedSettings !== false;
 
               // Restore a draft preserved across a webview disposal.
@@ -1017,6 +1086,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               providers = message.providers || [];
               enabledProviders = message.enabledProviders || {};
               availableModels = message.models || [];
+              if (typeof message.showProviderAccountActions === 'boolean') {
+                showProviderAccountActions = message.showProviderAccountActions;
+              }
               renderProviderSelection();
               if (!formDirty) {
                 renderTable();
@@ -1033,8 +1105,12 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                 row.scrollIntoView({ behavior: 'smooth', block: 'center' });
                 row.classList.add('highlighted');
                 setTimeout(() => row.classList.remove('highlighted'), 3000);
-                const control = message.control === 'backup' ? 'backup' : 'primary';
-                const input = document.getElementById(control + '-input-' + message.stage);
+                // Backup rows are all dynamically-keyed now, so "backup"
+                // focuses the first backup row's combo input.
+                let input = message.control === 'backup'
+                  ? row.querySelector('.extra-backups .model-combo-input')
+                  : null;
+                if (!input) input = document.getElementById('primary-input-' + message.stage);
                 if (input) input.focus();
               }
             }
@@ -1081,6 +1157,80 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
 
           function findModelById(id) {
             return availableModels.find(model => model.id === id);
+          }
+
+          // The bare model identity, with trailing (…)/[…] qualifier groups
+          // split off — "Kimi K3 [may be unstable] (Extra High)" leads with
+          // "Kimi K3" and the qualifiers become secondary text.
+          function splitModelName(name) {
+            let base = String(name || '').trim();
+            const qualifiers = [];
+            for (;;) {
+              const match = base.match(/\\s*([\\(\\[][^()\\[\\]]*[\\)\\]])\\s*$/);
+              if (!match) break;
+              qualifiers.unshift(match[1]);
+              base = base.slice(0, match.index).trim();
+            }
+            return { base: base || String(name || '').trim(), qualifiers: qualifiers.join(' ') };
+          }
+
+          // Typed-text → model resolution, in tiers that each fire only when
+          // exactly ONE model matches: exact label/id (pre-existing), then
+          // exact bare-name match, then token-prefix match against the same
+          // searchable text the dropdown filters on. An ambiguous bare name
+          // selects nothing — the typed text just keeps filtering the list.
+          function matchModelByTypedText(typed) {
+            const lowered = String(typed || '').trim().toLowerCase();
+            if (!lowered) return undefined;
+            const exact = availableModels.find(model =>
+              modelLabel(model).toLowerCase() === lowered ||
+              model.id.toLowerCase() === lowered
+            );
+            if (exact) return exact;
+            const baseMatches = availableModels.filter(model =>
+              splitModelName(model.name).base.toLowerCase() === lowered
+            );
+            if (baseMatches.length === 1) return baseMatches[0];
+            if (baseMatches.length > 1) return undefined;
+            const tokens = lowered.match(/[a-z0-9.]+/g) || [];
+            if (tokens.length === 0) return undefined;
+            const prefixMatches = availableModels.filter(model => {
+              const words = modelSearchableText(model).match(/[a-z0-9.]+/g) || [];
+              return tokens.every(token => words.some(word => word.indexOf(token) === 0));
+            });
+            return prefixMatches.length === 1 ? prefixMatches[0] : undefined;
+          }
+
+          function modelSearchableText(model) {
+            return [splitModelName(model.name).base, model.name, model.providerLabel, model.id]
+              .join(' ').replace(/\\[[^\\]]*\\]/g, '').toLowerCase();
+          }
+
+          // Deduplicated install hints for the currently enabled providers —
+          // rendered by the combobox empty state when no models were
+          // discovered at all (launch gate 4b). Zen and Go both map to the
+          // shared OpenCode hint host-side, so the dedup collapses them.
+          function enabledProviderInstallHints() {
+            const hints = [];
+            providers.forEach(provider => {
+              if (!isProviderChecked(provider.id) || !provider.installHint) return;
+              if (hints.indexOf(provider.installHint) === -1) hints.push(provider.installHint);
+            });
+            return hints;
+          }
+
+          // One uniform row shape for the primary and every backup:
+          // [checkbox] [combo] [×]. Unchecking the checkbox skips the row
+          // during resolution (model and position preserved); the × clears
+          // the row entirely.
+          function modelRowHtml(kind, stage, selectedId, enabled) {
+            return '<div class="model-row' + (enabled === false ? ' skipped' : '') + '">' +
+              '<input type="checkbox" class="row-enabled" aria-label="Use this model" ' +
+              'title="Uncheck to skip this model during resolution; it keeps its configured model and position" ' +
+              (enabled === false ? '' : 'checked') + '>' +
+              modelComboboxHtml(kind, stage, selectedId || '', false) +
+              '<button type="button" class="secondary remove-backup" aria-label="Remove backup" title="Remove this backup model">×</button>' +
+              '</div>';
           }
 
           // Provider Selection account governing a stored model. Most IDs
@@ -1235,13 +1385,19 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
 
             function getChoices(query) {
               const tokens = query.toLowerCase().match(/[a-z0-9.]+/g) || [];
-              const choices = [{ id: '', label: '(None)', searchable: 'none' }].concat(
-                availableModels.map(model => ({
-                  id: model.id,
-                  label: modelLabel(model),
-                  searchable: [model.name, model.providerLabel, model.id]
-                    .join(' ').replace(/\\[[^\\]]*\\]/g, '').toLowerCase()
-                }))
+              const choices = [{ id: '', label: '(None)', base: '(None)', detail: '', searchable: 'none' }].concat(
+                availableModels.map(model => {
+                  const parts = splitModelName(model.name);
+                  return {
+                    id: model.id,
+                    label: modelLabel(model),
+                    // The model name leads and stays matchable; the
+                    // qualifiers and provider become secondary text.
+                    base: parts.base,
+                    detail: [parts.qualifiers, model.providerLabel].filter(Boolean).join(' — '),
+                    searchable: modelSearchableText(model)
+                  };
+                })
               );
               if (tokens.length === 0) {
                 return choices;
@@ -1267,6 +1423,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
 
             function selectValue(id, label) {
               hidden.value = id;
+              delete hidden.dataset.lastValid;
               input.value = id ? label : '';
               closeList();
               markDirty();
@@ -1274,21 +1431,32 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             }
 
             function reconcileExactValue() {
-              const typed = input.value.trim().toLowerCase();
-              const exact = availableModels.find(model =>
-                modelLabel(model).toLowerCase() === typed ||
-                model.id.toLowerCase() === typed
-              );
-              if (exact) {
-                selectValue(exact.id, modelLabel(exact));
+              const match = matchModelByTypedText(input.value);
+              if (match) {
+                selectValue(match.id, modelLabel(match));
               } else {
                 closeList();
               }
             }
 
             function renderOptions() {
+              // Launch gate 4b: no models discovered at all (checked before
+              // the "(None)" sentinel is prepended) — surface the enabled
+              // providers' install hints instead of a bare "No models found".
+              if (availableModels.length === 0 && input.value.trim() === '') {
+                const hints = enabledProviderInstallHints();
+                list.innerHTML = hints.length
+                  ? hints.map(hint => '<div class="model-option empty">' + escapeHtml(hint) + '</div>').join('')
+                  : '<div class="model-option empty">No models found</div>';
+                list.hidden = false;
+                input.setAttribute('aria-expanded', 'true');
+                activeIndex = -1;
+                return;
+              }
               const choices = getChoices(input.value);
               if (choices.length === 0) {
+                // Models exist but the typed filter matches none — plain
+                // no-match message, no install hints.
                 list.innerHTML = '<div class="model-option empty">No models found</div>';
                 list.hidden = false;
                 input.setAttribute('aria-expanded', 'true');
@@ -1298,7 +1466,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               list.innerHTML = choices.map((choice, index) =>
                 '<div class="model-option" role="option" aria-selected="' + (index === 0 ? 'true' : 'false') +
                 '" data-id="' + escapeHtml(choice.id) + '" data-label="' + escapeHtml(choice.label) + '">' +
-                escapeHtml(choice.label) +
+                '<span class="model-option-name">' + escapeHtml(choice.base || choice.label) + '</span>' +
+                (choice.detail ? '<span class="model-option-detail"> — ' + escapeHtml(choice.detail) + '</span>' : '') +
                 '</div>'
               ).join('');
               activeIndex = 0;
@@ -1307,6 +1476,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             }
 
             input.addEventListener('input', () => {
+              // Remember the last confirmed selection so a skipped row with
+              // typed-but-unmatched text can save its stored id unchanged.
+              if (hidden.value) hidden.dataset.lastValid = hidden.value;
               hidden.value = '';
               renderOptions();
               updateAccountWarningFor(stage);
@@ -1367,37 +1539,37 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               return '';
             }
 
-            const typed = input.value.trim().toLowerCase();
-            const exact = availableModels.find(model =>
-              modelLabel(model).toLowerCase() === typed ||
-              model.id.toLowerCase() === typed
-            );
-            if (exact) {
-              hidden.value = exact.id;
-              input.value = modelLabel(exact);
+            const match = matchModelByTypedText(input.value);
+            if (match) {
+              hidden.value = match.id;
+              delete hidden.dataset.lastValid;
+              input.value = modelLabel(match);
             }
             return hidden.value;
           }
 
-          // Additional backup models use the SAME combobox control as the
-          // primary model (no plain <select> anywhere).
-          function addExtraBackupCombobox(row, stage, selectedId) {
+          // Every backup model row uses the SAME uniform [checkbox][combo][×]
+          // template as the primary (see modelRowHtml — no plain <select>
+          // anywhere).
+          function addExtraBackupCombobox(row, stage, selectedId, enabled) {
             const container = row.querySelector('.extra-backups');
-            if (!container || container.children.length >= 9) return;
+            if (!container || container.querySelectorAll('.model-row').length >= 10) return;
             const kind = 'backupx' + (++extraBackupSeq);
-            const item = document.createElement('div');
-            item.className = 'extra-backup';
-            item.innerHTML =
-              modelComboboxHtml(kind, stage, selectedId || '', false) +
-              '<button type="button" class="secondary remove-backup" aria-label="Remove backup" title="Remove this backup model">×</button>';
-            item.querySelector('.remove-backup').addEventListener('click', () => {
-              item.remove();
+            const holder = document.createElement('div');
+            holder.innerHTML = modelRowHtml(kind, stage, selectedId || '', enabled !== false);
+            const modelRow = holder.firstChild;
+            const checkbox = modelRow.querySelector('.row-enabled');
+            checkbox.addEventListener('change', () => {
+              modelRow.classList.toggle('skipped', !checkbox.checked);
+            });
+            modelRow.querySelector('.remove-backup').addEventListener('click', () => {
+              modelRow.remove();
               syncBackupLimitFor(row);
               markDirty();
               updateAccountWarningFor(stage);
             });
-            container.appendChild(item);
-            setupModelCombobox(item, kind, stage);
+            container.appendChild(modelRow);
+            setupModelCombobox(modelRow, kind, stage);
             syncBackupLimitFor(row);
             updateAccountWarningFor(stage);
           }
@@ -1406,10 +1578,16 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             const addBackupButton = row.querySelector('.add-backup');
             const backupLimit = row.querySelector('.backup-limit');
             if (!addBackupButton || !backupLimit) return;
-            const count = 1 + row.querySelectorAll('.extra-backups .model-combobox').length;
+            const count = row.querySelectorAll('.extra-backups .model-row').length;
             addBackupButton.disabled = count >= 10;
-            addBackupButton.title = count >= 10 ? 'A maximum of 10 backup models is allowed' : 'Add another backup model for this stage';
+            addBackupButton.title = count >= 10 ? 'A maximum of 10 backup models is allowed' : 'Add a backup model for this stage';
             backupLimit.textContent = count + '/10';
+            // With zero backups only the add button renders — no caption,
+            // no backup quota line.
+            const caption = row.querySelector('.backup-caption');
+            if (caption) caption.hidden = count === 0;
+            const backupQuota = row.querySelector('.backup-quota');
+            if (backupQuota) backupQuota.hidden = count === 0;
           }
 
           function renderProviderSelection() {
@@ -1419,10 +1597,16 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               providers.map(provider =>
                 '<div class="provider-row">' +
                 '<label><input type="checkbox" data-provider="' + escapeHtml(provider.id) + '" ' + (isProviderChecked(provider.id) ? 'checked' : '') + '> ' + escapeHtml(provider.label) + '</label>' +
-                '<button type="button" class="secondary provider-signin" data-signin-provider="' + escapeHtml(provider.id) + '" title="' + escapeHtml(provider.signInGuidance || 'Runs the provider\\'s login command in a visible terminal') + '">' + escapeHtml(provider.signInLabel || 'Sign in') + '</button>' +
-                (provider.usageEnabled
-                  ? '<button type="button" class="secondary provider-usage" data-usage-provider="' + escapeHtml(provider.id) + '" title="' + escapeHtml(provider.usageTooltip) + '">Check usage</button>'
-                  : '<button type="button" class="secondary provider-usage" disabled title="' + escapeHtml(provider.usageTooltip) + '">Check usage</button>') +
+                // The account-action buttons are hidden unless the
+                // ensemble.showProviderAccountActions setting (VS Code
+                // settings UI, default off) enables them. The enable
+                // checkbox, save button, and permission warning always render.
+                (showProviderAccountActions
+                  ? '<button type="button" class="secondary provider-signin" data-signin-provider="' + escapeHtml(provider.id) + '" title="' + escapeHtml(provider.signInGuidance || 'Runs the provider\\'s login command in a visible terminal') + '">' + escapeHtml(provider.signInLabel || 'Sign in') + '</button>' +
+                    (provider.usageEnabled
+                      ? '<button type="button" class="secondary provider-usage" data-usage-provider="' + escapeHtml(provider.id) + '" title="' + escapeHtml(provider.usageTooltip) + '">Check usage</button>'
+                      : '<button type="button" class="secondary provider-usage" disabled title="' + escapeHtml(provider.usageTooltip) + '">Check usage</button>')
+                  : '') +
                 '</div>' +
                 (provider.permissionWarning
                   ? '<p class="provider-warning">' + escapeHtml(provider.permissionWarning) + '</p>'
@@ -1449,6 +1633,45 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             });
           }
 
+          // The primary row's own controls: the skip checkbox and the ×.
+          // Clearing the primary promotes the first remaining backup into
+          // the primary slot, carrying that row's own enabled flag (a
+          // skipped backup arrives still skipped); clearing the last
+          // remaining row leaves the stage unconfigured, which resolves to
+          // the general model.
+          function setupPrimaryRowControls(row, stage) {
+            const primaryRow = row.querySelector('.primary-container .model-row');
+            if (!primaryRow) return;
+            const checkbox = primaryRow.querySelector('.row-enabled');
+            checkbox.addEventListener('change', () => {
+              primaryRow.classList.toggle('skipped', !checkbox.checked);
+            });
+            primaryRow.querySelector('.remove-backup').addEventListener('click', () => {
+              const hidden = document.getElementById('primary-' + stage);
+              const input = document.getElementById('primary-input-' + stage);
+              const firstBackup = row.querySelector('.extra-backups .model-row');
+              delete hidden.dataset.lastValid;
+              if (firstBackup) {
+                const backupHidden = firstBackup.querySelector('input[type="hidden"]');
+                const backupInput = firstBackup.querySelector('.model-combo-input');
+                const backupEnabled = firstBackup.querySelector('.row-enabled').checked;
+                hidden.value = backupHidden ? backupHidden.value : '';
+                input.value = backupInput ? backupInput.value : '';
+                checkbox.checked = backupEnabled;
+                primaryRow.classList.toggle('skipped', !backupEnabled);
+                firstBackup.remove();
+              } else {
+                hidden.value = '';
+                input.value = '';
+                checkbox.checked = true;
+                primaryRow.classList.remove('skipped');
+              }
+              syncBackupLimitFor(row);
+              markDirty();
+              updateAccountWarningFor(stage);
+            });
+          }
+
           function renderTable() {
             const tbody = document.getElementById('stages-tbody');
             tbody.innerHTML = '';
@@ -1461,45 +1684,49 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
 
               const primaryQuotaStatus = quotaStatus[stage + ':primary'] || 'No usage observed yet this session';
               const backupQuotaStatus = quotaStatus[stage + ':backup'] || 'No usage observed yet this session';
-              const quotaText = \`<span class="quota-text" title="Session-observed usage status">\${primaryQuotaStatus}</span>\`;
-              const backupQuotaText = \`<span class="quota-text" title="Session-observed usage status">\${backupQuotaStatus}</span>\`;
 
               const backupModels = (setting.backups && setting.backups.length ? setting.backups : (setting.backup ? [setting.backup] : []));
+              const backupFlags = Array.isArray(setting.backupsEnabled) ? setting.backupsEnabled : [];
+              const stageTitle = stageTitleOverrides[stage] || stageDisplayNames[stage] || stage;
+              const stageHint = stageHints[stage] || '';
 
-              row.innerHTML = \`
-                <h3 class="stage-heading">\${stageDisplayNames[stage] || stage}</h3>
-                <div class="form-row">
-                  <label for="primary-input-\${stage}" class="field-label">Primary model:</label>
-                  \${modelComboboxHtml('primary', stage, setting.primary || '', false)}
-                  \${quotaText}
-                </div>
-                <div class="form-row">
-                  <label for="strategy-\${stage}" class="field-label">Fallback strategy:</label>
-                  <select id="strategy-\${stage}">
-                    <option value="switch-to-backup" \${setting.strategy === 'switch-to-backup' ? 'selected' : ''}>Switch to Backup</option>
-                    <option value="pause-and-resume" \${setting.strategy === 'pause-and-resume' ? 'selected' : ''}>Pause until available</option>
-                    <option value="alert-and-wait" \${setting.strategy === 'alert-and-wait' ? 'selected' : ''}>Alert and wait</option>
-                  </select>
-                </div>
-                <div class="form-row">
-                  <label for="backup-input-\${stage}" class="field-label">Backup models (tried in order):</label>
-                  \${modelComboboxHtml('backup', stage, backupModels[0] || '', false)}
-                  \${backupQuotaText}
-                  <div class="extra-backups"></div>
-                  <button type="button" class="secondary add-backup" title="Add another backup model for this stage">+ Add another backup</button>
-                  <span class="backup-limit">1/10</span>
-                  <div class="provider-warning account-warning" id="account-warning-\${stage}" hidden></div>
-                </div>
-              \`;
+              // The stage name alone is the header; the first row is
+              // implicitly the primary — no per-row primary label, no
+              // backup field-label.
+              row.innerHTML =
+                '<h3 class="stage-heading">' + escapeHtml(stageTitle) + '</h3>' +
+                (stageHint ? '<p class="stage-hint">' + escapeHtml(stageHint) + '</p>' : '') +
+                '<div class="form-row primary-container">' +
+                  modelRowHtml('primary', stage, setting.primary || '', setting.primaryEnabled !== false) +
+                  '<span class="quota-text" title="Session-observed usage status">' + escapeHtml(primaryQuotaStatus) + '</span>' +
+                '</div>' +
+                '<div class="form-row">' +
+                  '<label for="strategy-' + escapeHtml(stage) + '" class="field-label">Fallback strategy:</label>' +
+                  '<select id="strategy-' + escapeHtml(stage) + '">' +
+                    '<option value="switch-to-backup"' + (setting.strategy === 'switch-to-backup' ? ' selected' : '') + '>Switch to Backup</option>' +
+                    '<option value="pause-and-resume"' + (setting.strategy === 'pause-and-resume' ? ' selected' : '') + '>Pause until available</option>' +
+                    '<option value="alert-and-wait"' + (setting.strategy === 'alert-and-wait' ? ' selected' : '') + '>Alert and wait</option>' +
+                  '</select>' +
+                '</div>' +
+                '<div class="form-row backup-section">' +
+                  '<div class="field-label backup-caption" hidden>Backup models (tried in order)</div>' +
+                  '<div class="extra-backups"></div>' +
+                  '<span class="quota-text backup-quota" title="Session-observed usage status" hidden>' + escapeHtml(backupQuotaStatus) + '</span>' +
+                  '<button type="button" class="secondary add-backup" title="Add a backup model for this stage">+ Add backup model</button>' +
+                  '<span class="backup-limit">0/10</span>' +
+                  '<div class="provider-warning account-warning" id="account-warning-' + escapeHtml(stage) + '" hidden></div>' +
+                '</div>';
 
               tbody.appendChild(row);
               setupModelCombobox(row, 'primary', stage);
-              setupModelCombobox(row, 'backup', stage);
+              setupPrimaryRowControls(row, stage);
 
-              backupModels.slice(1).forEach(model => addExtraBackupCombobox(row, stage, model));
+              backupModels.forEach((model, index) =>
+                addExtraBackupCombobox(row, stage, model, backupFlags[index] !== false)
+              );
 
               row.querySelector('.add-backup').addEventListener('click', () => {
-                addExtraBackupCombobox(row, stage, '');
+                addExtraBackupCombobox(row, stage, '', true);
               });
               syncBackupLimitFor(row);
               updateAccountWarningFor(stage);
@@ -1511,36 +1738,73 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             const errors = [];
 
             stagesList.forEach(stage => {
-              const primary = reconcileModelInput('primary', stage);
-              const primaryText = document.getElementById('primary-input-' + stage).value.trim();
-              const strategy = document.getElementById('strategy-' + stage).value;
-              const usesBackup = strategy === 'switch-to-backup';
-              const backup = reconcileModelInput('backup', stage);
-              const backupText = document.getElementById('backup-input-' + stage).value.trim();
               const row = document.getElementById('row-' + stage);
-              const extraBackups = Array.from(row.querySelectorAll('.extra-backups .model-combobox input[type="hidden"]'))
-                .map(input => input.value.trim()).filter(Boolean);
+              const strategy = document.getElementById('strategy-' + stage).value;
+              const stageName = stageDisplayNames[stage] || stage;
 
+              const primaryRow = row.querySelector('.primary-container .model-row');
+              const primaryEnabled = primaryRow ? primaryRow.querySelector('.row-enabled').checked : true;
+              const primaryHidden = document.getElementById('primary-' + stage);
+              let primary = reconcileModelInput('primary', stage);
+              const primaryText = document.getElementById('primary-input-' + stage).value.trim();
               // A stored id whose provider is disabled resolves to no
               // available model but must be preserved, not flagged invalid.
               const primaryIsPreservedStored = primary && !findModelById(primary);
               if (primaryText && !primary && !primaryIsPreservedStored) {
-                errors.push('Stage ' + (stageDisplayNames[stage] || stage) + ' has an invalid primary model selection. Choose a model from the list.');
-              }
-              const backupIsPreservedStored = backup && !findModelById(backup);
-              if (usesBackup && backupText && !backup && !backupIsPreservedStored) {
-                errors.push('Stage ' + (stageDisplayNames[stage] || stage) + ' has an invalid backup model selection. Choose a model from the list.');
-              }
-              if (usesBackup && !backup) {
-                errors.push('Stage ' + (stageDisplayNames[stage] || stage) + ' requires a valid backup model when Fallback Strategy is set to Switch to Backup.');
+                if (primaryEnabled) {
+                  errors.push('Stage ' + stageName + ' has an invalid primary model selection. Choose a model from the list.');
+                } else {
+                  // A skipped row with typed-but-unmatched text saves without
+                  // error: keep the last valid stored id, discard the text.
+                  primary = (primaryHidden && primaryHidden.dataset.lastValid) || '';
+                }
               }
 
-              updatedSettings[stage] = {
+              // Skipped-but-populated rows keep their id AND their position;
+              // only genuinely empty rows are dropped, with the enabled flag
+              // spliced out in the same operation so the two arrays stay
+              // index-aligned.
+              const backups = [];
+              const backupsEnabled = [];
+              Array.from(row.querySelectorAll('.extra-backups .model-row')).forEach(backupRow => {
+                const combobox = backupRow.querySelector('.model-combobox');
+                const hidden = backupRow.querySelector('input[type="hidden"]');
+                const inputEl = backupRow.querySelector('.model-combo-input');
+                const enabled = backupRow.querySelector('.row-enabled').checked;
+                if (!combobox || !hidden || !inputEl) return;
+                let id = reconcileModelInput(combobox.dataset.kind, stage);
+                const text = inputEl.value.trim();
+                const isPreservedStored = id && !findModelById(id);
+                if (text && !id && !isPreservedStored) {
+                  if (enabled) {
+                    errors.push('Stage ' + stageName + ' has an invalid backup model selection. Choose a model from the list.');
+                    return;
+                  }
+                  id = hidden.dataset.lastValid || '';
+                }
+                if (!id) return;
+                backups.push(id);
+                backupsEnabled.push(enabled);
+              });
+
+              // A stage with no primary (never configured, or cleared with
+              // the ×) is valid state meaning "use the general model" — no
+              // error, and the stage entry is still written explicitly so
+              // the legacy aiModelDefaults import cannot resurrect a
+              // cleared model.
+              const entry = {
                 primary: primary || undefined,
-                backup: backup || undefined,
-                backups: [backup, ...extraBackups].filter(Boolean).slice(0, 10),
+                backup: backups[0] || undefined,
+                backups: backups.slice(0, 10),
                 strategy
               };
+              // Skip flags are persisted only when they say something
+              // (absent = enabled).
+              if (!primaryEnabled && primary) entry.primaryEnabled = false;
+              if (backupsEnabled.slice(0, 10).some(flag => flag === false)) {
+                entry.backupsEnabled = backupsEnabled.slice(0, 10);
+              }
+              updatedSettings[stage] = entry;
             });
 
             return { settings: updatedSettings, errors };

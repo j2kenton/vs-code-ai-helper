@@ -815,7 +815,13 @@
           "type": "object",
           "default": {},
           "scope": "window",
-          "description": "AI model and fallback settings for Ensemble workflow stages."
+          "description": "AI model and fallback settings for Ensemble workflow stages. Each stage entry may set primary, backups (ordered), strategy, and the optional skip flags primaryEnabled and backupsEnabled (the latter index-aligned with backups): a false flag skips that row during resolution while keeping its configured model and position; absent means enabled. A stage with no enabled model of its own falls back to the general (Task Description) model."
+        },
+        "ensemble.showProviderAccountActions": {
+          "type": "boolean",
+          "default": false,
+          "scope": "window",
+          "description": "Show the per-provider account-action buttons (Sign in / Switch account, Check usage) in the AI Models view's Provider Selection section. Hidden by default."
         },
         "ensemble.warnings.unsavedSettings": {
           "type": "boolean",

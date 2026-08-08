@@ -176,7 +176,7 @@
     },
     {
       "path": "src/commands/runEditActionV1.ts",
-      "sha256": "e6af2d03dd4614fc23527f7093f46dca432fd396ec6c2037ee0580f3cd7246ef"
+      "sha256": "775015ee9a1f34e3861ed39aff402c06ec19de7038722c92558473f56dca1be7"
     },
     {
       "path": "src/commands/runLintingFixes.ts",
@@ -216,7 +216,7 @@
     },
     {
       "path": "src/config/settings.ts",
-      "sha256": "ec245f1cfc11d2d36ff69164c56129b7fc4c8136cd3300b38e230b1455e9e205"
+      "sha256": "0ba342f8fdcff7264475abc8c8a71038f8285071471b8e4ce4492e1d429f61ff"
     },
     {
       "path": "src/extension.ts",
@@ -256,7 +256,7 @@
     },
     {
       "path": "src/runners/runnerRegistry.ts",
-      "sha256": "97584172f147b68f28f65780e2463fab614e2b6015366879dbcbe1f9157271b7"
+      "sha256": "0368ad248aa40f4dc4871825a55166ffa7e95c574ca3cc6e1bb16ee3162b7490"
     },
     {
       "path": "src/services/agentExecutionBrokerV1.ts",
@@ -564,11 +564,11 @@
     },
     {
       "path": "src/utils/modelFallback.ts",
-      "sha256": "1f32281725d28ac0d53a43dfa39dfd2ab9889482ffed7bba33de5eb7c4895914"
+      "sha256": "2dcb64ba4eab2fb695d416586ae728ee371e6c37e265a41da6f30f9c6f27ff56"
     },
     {
       "path": "src/utils/modelSelection.ts",
-      "sha256": "10ac00b41e962a2a5050ea47583c24e11985e477e3617edfae72d597e73d33f9"
+      "sha256": "907da95390d57e4e9ee745a28eaf7fe5bfc7eeb2a4084a32cabd517feb93c635"
     },
     {
       "path": "src/utils/notificationContentProvider.ts",
@@ -680,7 +680,7 @@
     },
     {
       "path": "src/views/settingsView.ts",
-      "sha256": "08e827823007ce352893e4d691ad94d6356a190ee41451cda277c575ad6f83a3"
+      "sha256": "9a65464f59fb32caf4dc2f87f44c3b6128a0ce2fc249ca66ea10a760cdf0042a"
     },
     {
       "path": "src/views/statusView.ts",

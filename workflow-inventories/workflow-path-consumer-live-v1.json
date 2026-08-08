@@ -3,7 +3,7 @@
   "generatedBy": "scripts/generateWorkflowPathConsumers.mjs",
   "description": "Mechanically derived production path-consumer surface of the current working tree (plan §2.3): every module of the §1.1 production source universe importing node fs/child_process or touching the vscode workspace.fs API, with every concrete call site (compiler span + enclosing symbol). Scanned over the exact source-universe file list — never a filesystem walk. Regenerated every run; classification lives in workflow-path-consumer-baseline-v1.json; the immutable pre-gate reference is workflow-path-consumer-pregate-v1.json. Known mechanical bound: modules that only pass path STRINGS to another module (no fs/process API of their own) are covered transitively by the consumer module they call — the classifier enforcement point (plan §2.2) sits at the API-touching module. sourceUniverseSha256 is the CANONICAL (line-ending-independent) digest of the source-universe JSON, so provenance is identical across LF and CRLF checkouts.",
   "sourceUniverse": "workflow-inventories/workflow-production-source-baseline-v1.json",
-  "sourceUniverseSha256": "04fbbb3c6a4c838179c17168f1f90e4355148e9cbcb9ed53ba1d3cd61a7f5e8c",
+  "sourceUniverseSha256": "47345a2b106f030faa5d2b51b0b2be8af124049ce1d921ca6b11ce8402432435",
   "consumerCount": 50,
   "consumers": [
     {
@@ -832,22 +832,22 @@
       "callSites": [
         {
           "signal": "workspace.fs",
-          "span": "L78-L78",
+          "span": "L190-L190",
           "enclosingSymbol": "content"
         },
         {
           "signal": "workspace.fs",
-          "span": "L116-L116",
+          "span": "L228-L228",
           "enclosingSymbol": "setTaskStageModel"
         },
         {
           "signal": "workspace.fs",
-          "span": "L128-L128",
+          "span": "L240-L240",
           "enclosingSymbol": "setTaskStageModel"
         },
         {
           "signal": "workspace.fs",
-          "span": "L203-L203",
+          "span": "L315-L315",
           "enclosingSymbol": "writeResolvedModelSnapshotV1"
         }
       ]

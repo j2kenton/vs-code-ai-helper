@@ -3,7 +3,7 @@
   "generatedBy": "scripts/generateWorkflowRoutes.mjs",
   "description": "Mechanically extracted workflow route surface of the current working tree (plan §1.2): command registrations, contribution/menu references, internal executeCommand edges, dynamic dispatch sites, webview message roots, tree-item command bindings, provider-boundary call sites, legacy output destinations, and per-file legacy-AI-gate calls — every edge a concrete route row. Scanned over the exact §1.1 production source universe (never a filesystem walk). Regenerated every run; classification lives in workflow-route-baseline-v1.json; the immutable pre-gate reference is workflow-route-pregate-v1.json. Known mechanical bound: tree-item/status-row command bindings are collected only when the bound command ID is a string literal — dynamically bound commands are enforced at their executeCommand dispatch sites instead (dynamicDispatches, which fail closed without an annotation). sourceUniverseSha256 is the CANONICAL (line-ending-independent) digest of the source-universe JSON, so provenance is identical across LF and CRLF checkouts.",
   "sourceUniverse": "workflow-inventories/workflow-production-source-baseline-v1.json",
-  "sourceUniverseSha256": "04fbbb3c6a4c838179c17168f1f90e4355148e9cbcb9ed53ba1d3cd61a7f5e8c",
+  "sourceUniverseSha256": "47345a2b106f030faa5d2b51b0b2be8af124049ce1d921ca6b11ce8402432435",
   "routeCount": 100,
   "routes": [
     {
@@ -1433,7 +1433,7 @@
       "kind": "internalEdge",
       "commandId": "vs-code-ai-helper.openAiModels",
       "path": "src/utils/modelSelection.ts",
-      "span": "L344-L344",
+      "span": "L451-L451",
       "enclosingSymbol": "ensureStageModelConfigured",
       "occurrence": 1
     },
@@ -1441,7 +1441,7 @@
       "kind": "internalEdge",
       "commandId": "vs-code-ai-helper.openAiModels",
       "path": "src/utils/modelSelection.ts",
-      "span": "L354-L354",
+      "span": "L461-L461",
       "enclosingSymbol": "ensureStageModelConfigured",
       "occurrence": 2
     },
@@ -1473,7 +1473,7 @@
       "kind": "providerEdge",
       "callee": "runImplementationForModel",
       "path": "src/commands/runEditActionV1.ts",
-      "span": "L831-L871",
+      "span": "L832-L872",
       "enclosingSymbol": "cliResult",
       "occurrence": 1
     },
@@ -1494,7 +1494,7 @@
     {
       "kind": "webviewMessage",
       "path": "src/views/settingsView.ts",
-      "span": "L210-L407",
+      "span": "L247-L444",
       "handlerSymbol": "resolveWebviewView",
       "fileGateRouteIds": [],
       "fileEdgesOut": []
@@ -1543,25 +1543,25 @@
     },
     {
       "path": "src/views/settingsView.ts",
-      "span": "L147-L147",
+      "span": "L184-L184",
       "enclosingSymbol": "tryRun",
       "expressionText": "id"
     },
     {
       "path": "src/views/settingsView.ts",
-      "span": "L286-L286",
+      "span": "L323-L323",
       "enclosingSymbol": "resolveWebviewView",
       "expressionText": "command"
     },
     {
       "path": "src/views/settingsView.ts",
-      "span": "L354-L354",
+      "span": "L391-L391",
       "enclosingSymbol": "resolveWebviewView",
       "expressionText": "usage.command"
     },
     {
       "path": "src/views/settingsView.ts",
-      "span": "L358-L358",
+      "span": "L395-L395",
       "enclosingSymbol": "resolveWebviewView",
       "expressionText": "usage.fallbackCommand"
     },
@@ -1673,13 +1673,13 @@
     {
       "commandId": "vs-code-ai-helper.openAiModels",
       "path": "src/utils/modelSelection.ts",
-      "span": "L344-L344",
+      "span": "L451-L451",
       "enclosingSymbol": "ensureStageModelConfigured"
     },
     {
       "commandId": "vs-code-ai-helper.openAiModels",
       "path": "src/utils/modelSelection.ts",
-      "span": "L354-L354",
+      "span": "L461-L461",
       "enclosingSymbol": "ensureStageModelConfigured"
     },
     {
@@ -1705,7 +1705,7 @@
     {
       "callee": "runImplementationForModel",
       "path": "src/commands/runEditActionV1.ts",
-      "span": "L831-L871",
+      "span": "L832-L872",
       "enclosingSymbol": "cliResult"
     }
   ],

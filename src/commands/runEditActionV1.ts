@@ -60,8 +60,8 @@ import {
   runImplementationForModel,
 } from "../runners/runnerRegistry";
 import { isAuthenticationFailure } from "../utils/quota";
-import { resolveFreshModelForStage } from "../utils/modelSelection";
-import { getAiModelDefaults, getModelSettings, getResilienceSettings } from "../config/settings";
+import { resolveEffectiveStageChainV1, resolveFreshModelForStage } from "../utils/modelSelection";
+import { getResilienceSettings } from "../config/settings";
 import { writeRunLog } from "../utils/runLog";
 import { NotificationRouter } from "../utils/notificationRouter";
 import type { TaskInventory } from "../state/taskInventory";
@@ -155,8 +155,9 @@ export function checkEditActionHostGateV1():
  * Reads ONLY global settings to resolve the STARTING (primary) model id —
  * no `taskFolderUri`, so no per-task read for that half — because
  * `resolveFreshModelForStage` always calls `resolveModelForStage` with
- * `ignoreActiveFallback: true`, whose returned model id is exactly
- * `getModelSettings()[stage]?.primary ?? getAiModelDefaults()[stage]`
+ * `ignoreActiveFallback: true`, whose returned model id is exactly the
+ * effective primary of `resolveEffectiveStageChainV1(stage)` (the stage's
+ * own skip-filtered chain, else the general model's chain)
  * regardless of any task's own state; the per-task read it performs is
  * solely to clear a stale fallback flag, a side effect this coarse pre-check
  * does not need to reproduce. The availability resolution itself IS I/O (a
@@ -197,7 +198,7 @@ export async function checkEditActionProviderPathGateV1(
       readonly reason: string;
     }
 > {
-  const modelId = getModelSettings()[stage]?.primary ?? getAiModelDefaults()[stage];
+  const modelId = resolveEffectiveStageChainV1(stage).primary;
   // checkImplementationAvailabilityForModel calls resolveEffectiveProvider(modelId)
   // unguarded internally (runnerRegistry.ts) — an unresolvable/unconfigured
   // modelId throws OUT of it rather than returning a clean unavailable
@@ -991,7 +992,7 @@ async function requireCopilotForResumeV1(
   stage: TaskStage
 ): Promise<{ readonly ok: true } | { readonly ok: false; readonly reason: string }> {
   // modelId is the caller's resolveFreshModelForStage result — identical to
-  // getModelSettings()[stage]?.primary ?? getAiModelDefaults()[stage] (see
+  // resolveEffectiveStageChainV1(stage).primary (see
   // checkEditActionProviderPathGateV1's header) — so it doubles here as the
   // primary candidate to search from, with no extra settings read needed.
   const candidates = [modelId, ...backupModelsForStage(stage, modelId)];
@@ -1061,7 +1062,7 @@ export async function resumeEditPreflightInteractionV1(
   // known). The stage passed here is the stage THIS actionKey actually
   // resolves its model against, not a hardcoded one.
   const modelStage = modelStageForEditActionKeyV1(actionKey);
-  const earlyModelId = getModelSettings()[modelStage]?.primary ?? getAiModelDefaults()[modelStage];
+  const earlyModelId = resolveEffectiveStageChainV1(modelStage).primary;
   const providerPathGate = await requireCopilotForResumeV1(earlyModelId, modelStage);
   if (!providerPathGate.ok) {
     return { ok: false, reason: providerPathGate.reason };

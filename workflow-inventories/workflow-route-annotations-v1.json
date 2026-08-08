@@ -77,7 +77,7 @@
       "expiryCohort": "cleanup",
       "evidence": {
         "symbol": "tryRun",
-        "sourceSpan": "L147-L147",
+        "sourceSpan": "L184-L184",
         "edgeKind": "dynamicCommandDispatch",
         "targetActionKey": "none"
       }
@@ -93,7 +93,7 @@
       "expiryCohort": "cleanup",
       "evidence": {
         "symbol": "resolveWebviewView",
-        "sourceSpan": "L286-L286",
+        "sourceSpan": "L323-L323",
         "edgeKind": "dynamicCommandDispatch",
         "targetActionKey": "none"
       }
@@ -109,7 +109,7 @@
       "expiryCohort": "cleanup",
       "evidence": {
         "symbol": "resolveWebviewView",
-        "sourceSpan": "L354-L354",
+        "sourceSpan": "L391-L391",
         "edgeKind": "dynamicCommandDispatch",
         "targetActionKey": "none"
       }
@@ -125,7 +125,7 @@
       "expiryCohort": "cleanup",
       "evidence": {
         "symbol": "resolveWebviewView",
-        "sourceSpan": "L358-L358",
+        "sourceSpan": "L395-L395",
         "edgeKind": "dynamicCommandDispatch",
         "targetActionKey": "none"
       }

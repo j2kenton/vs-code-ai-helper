@@ -1189,6 +1189,7 @@ void describe("Model Selection Display States", () => {
   void it("describeModelSource returns correct strings", () => {
     assert.strictEqual(describeModelSource("task"), "task override");
     assert.strictEqual(describeModelSource("workspace"), "workspace default");
+    assert.strictEqual(describeModelSource("general"), "general model fallback");
     assert.strictEqual(describeModelSource("none"), "automatic selection");
   });
 

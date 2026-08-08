@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import { AI_MODEL_STAGES, TaskStage } from "../types/taskProgress";
-import { FallbackStrategy, ModelSettings } from "../utils/modelFallback";
+import { FallbackStrategy, ModelSettings, StageModelSetting, normalizeBackupChain } from "../utils/modelFallback";
 import {
   normalizeQualifiedModelId,
   providerAccountIdForModelId,
@@ -810,6 +810,19 @@ export function isDesktopNotificationsEnabled(): boolean {
   return readSetting(DESKTOP_NOTIFICATIONS_KEY, false);
 }
 
+const SHOW_PROVIDER_ACCOUNT_ACTIONS_KEY = "showProviderAccountActions";
+
+/**
+ * Whether the Provider Selection section of the AI Models view shows the
+ * per-provider account-action buttons (Sign in / Switch account, Check
+ * usage). Hidden by default; toggled only from the VS Code settings UI —
+ * there is deliberately no in-view control, and no `vs-code-ai-helper.*`
+ * twin for this key.
+ */
+export function isProviderAccountActionsEnabled(): boolean {
+  return readSetting<unknown>(SHOW_PROVIDER_ACCOUNT_ACTIONS_KEY, false) === true;
+}
+
 /**
  * Get workspace-level default model IDs keyed by AI workflow stage.
  */
@@ -880,16 +893,17 @@ export function getModelSettings(): ModelSettings {
     // would otherwise still see the old, no-longer-listed ID.
     const primary = typeof entry.primary === "string" && entry.primary.trim() ? normalizeQualifiedModelId(entry.primary) : undefined;
     const backup = typeof entry.backup === "string" && entry.backup.trim() ? normalizeQualifiedModelId(entry.backup) : undefined;
-    const backups = Array.isArray(entry.backups)
-      ? [
-          ...new Set(
-            entry.backups
-              .filter((v): v is string => typeof v === "string" && v.trim().length > 0)
-              .map((v) => normalizeQualifiedModelId(v.trim()))
-              .filter((v): v is string => v !== undefined)
-          ),
-        ]
+    // normalizeBackupChain keeps the per-row skip flags index-aligned with
+    // the backups through the trim/dedup pass, so a dropped entry drops its
+    // flag in the same operation.
+    const chain = Array.isArray(entry.backups)
+      ? normalizeBackupChain(
+          entry.backups,
+          Array.isArray(entry.backupsEnabled) ? entry.backupsEnabled : undefined,
+          (v) => normalizeQualifiedModelId(v)
+        )
       : undefined;
+    const backups = chain?.backups;
     let strategy: FallbackStrategy = entry.strategy === "switch-to-backup" || entry.strategy === "pause-and-resume" || entry.strategy === "alert-and-wait"
       ? entry.strategy : "alert-and-wait";
     // Back-compat: the old UI could save strategy: "switch-to-backup" with
@@ -900,10 +914,21 @@ export function getModelSettings(): ModelSettings {
     if (strategy === "switch-to-backup" && entry.fallbackEnabled === false) {
       strategy = "alert-and-wait";
     }
-    result[stage] = { primary, backup, backups, strategy };
+    result[stage] = {
+      primary,
+      backup,
+      backups,
+      strategy,
+      ...(entry.primaryEnabled === false ? { primaryEnabled: false } : {}),
+      ...(chain?.backupsEnabled ? { backupsEnabled: chain.backupsEnabled } : {}),
+    };
   }
   // Migrate the older primary-only setting so existing workspaces do not
   // silently lose their configured models when the settings panel is opened.
+  // This import applies ONLY to stages with no explicit modelSettings entry:
+  // an explicitly saved empty entry (a stage the user cleared in the AI
+  // Models view) is an object above and therefore suppresses the legacy
+  // value — the read boundary the clear-vs-legacy behavior depends on.
   for (const stage of AI_MODEL_STAGES) {
     if (!result[stage]) {
       const legacy = getAiModelDefault(stage);
@@ -920,11 +945,25 @@ export async function setModelSettings(settings: ModelSettings): Promise<void> {
     const setting = settings[stage];
     if (setting) {
       const primary = typeof setting.primary === "string" && setting.primary.trim() ? setting.primary.trim() : undefined;
-      const backup = typeof setting.backup === "string" && setting.backup.trim() ? setting.backup.trim() : undefined;
-      const backups = Array.isArray(setting.backups) ? [...new Set(setting.backups.filter((v): v is string => typeof v === "string" && v.trim().length > 0).map(v => v.trim()))].slice(0, 10) : undefined;
+      // Skip flags travel through the same trim/dedup/cap pass as the
+      // backups themselves so the two arrays stay index-aligned.
+      const chain = Array.isArray(setting.backups)
+        ? normalizeBackupChain(setting.backups, setting.backupsEnabled)
+        : undefined;
+      const backups = chain?.backups;
+      // The legacy `backup` mirror stays equal to backups[0] when the
+      // extended shape is present; older callers still read it.
+      const backup = backups
+        ? backups[0]
+        : typeof setting.backup === "string" && setting.backup.trim() ? setting.backup.trim() : undefined;
       // Preserve a configured backup even if strategy isn't switch-to-backup —
       // switching strategy back later shouldn't lose the user's backup choice.
-      clean[stage] = { ...setting, primary, backup, backups };
+      const entry: StageModelSetting = { ...setting, primary, backup, backups };
+      delete entry.backupsEnabled;
+      if (chain?.backupsEnabled) entry.backupsEnabled = chain.backupsEnabled;
+      // Skip flags are stored only when they say something (absent = enabled).
+      if (entry.primaryEnabled !== false) delete entry.primaryEnabled;
+      clean[stage] = entry;
     }
   }
   await config.update(

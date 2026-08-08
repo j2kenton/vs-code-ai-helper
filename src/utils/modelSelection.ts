@@ -1,13 +1,12 @@
 import * as vscode from "vscode";
 import {
-  getAiModelDefaults,
   getModelSettings,
   isModelProviderEnabled,
   isProviderEnabled,
 } from "../config/settings";
 import { getConfiguredTaskRoot } from "./taskRoot";
 import { NotificationRouter } from "./notificationRouter";
-import { canUseBackup, getBackupModels, type FallbackStrategy } from "./modelFallback";
+import { type FallbackStrategy, type StageModelSetting } from "./modelFallback";
 import { cliCommandExists, resolveCliCommand } from "../runners/cliAgentRunner";
 import { findAllTasksStrictV1 } from "../services/taskProgressDiscoveryV1";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
@@ -36,7 +35,120 @@ interface TaskModelSelectionFile {
 
 export interface ResolvedStageModel {
   modelId?: string;
-  source: "task" | "workspace" | "none";
+  /** "general" = resolved through the general model's chain because the
+   * stage itself has no (enabled) model of its own. */
+  source: "task" | "workspace" | "general" | "none";
+}
+
+/**
+ * The stage whose configured chain doubles as the general model (§2 of the
+ * AI Models rework): "desc" heads the AI Models list, is used for the Global
+ * Assistant and task-description processing, and is the default for any
+ * stage with no model of its own.
+ */
+export const GENERAL_MODEL_STAGE: TaskStage = "desc";
+
+export type EffectiveChainSourceV1 = "stage" | "general" | "none";
+
+/** The effective, skip-filtered model chain a stage resolves to. */
+export interface EffectiveStageChainV1 {
+  /** Stage whose configured chain actually supplies the models
+   * (=== the requested stage unless source is "general"). */
+  originStage: TaskStage;
+  source: EffectiveChainSourceV1;
+  primary?: string;
+  backups: string[];
+  strategy?: FallbackStrategy;
+}
+
+/**
+ * Skip-filtered view of one stage's OWN configured chain: backups whose
+ * `backupsEnabled` flag is false are dropped, and a skipped (or absent)
+ * primary promotes the first enabled backup into the effective primary slot
+ * with the rest kept in order.
+ */
+function skipFilteredChainOf(
+  setting: StageModelSetting | undefined
+): { primary?: string; backups: string[] } {
+  if (!setting) {
+    return { backups: [] };
+  }
+  const configured =
+    Array.isArray(setting.backups) && setting.backups.length > 0
+      ? setting.backups
+      : setting.backup
+        ? [setting.backup]
+        : [];
+  const flags = setting.backupsEnabled;
+  const seen = new Set<string>();
+  let backups: string[] = [];
+  configured.forEach((model, index) => {
+    if (typeof model !== "string" || model.trim().length === 0) {
+      return;
+    }
+    if (flags && flags[index] === false) {
+      return;
+    }
+    const trimmed = model.trim();
+    if (seen.has(trimmed)) {
+      return;
+    }
+    seen.add(trimmed);
+    backups.push(trimmed);
+  });
+  let primary = setting.primaryEnabled === false ? undefined : setting.primary;
+  if (!primary && backups.length > 0) {
+    primary = backups[0];
+    backups = backups.slice(1);
+  }
+  return { primary, backups: backups.filter((model) => model !== primary) };
+}
+
+/**
+ * The single, central resolver for "which model chain does this stage
+ * actually run with". Synchronous and settings-only: it reads exclusively
+ * from getModelSettings() output (which already folds in the legacy
+ * `aiModelDefaults` import for stages with no explicit entry) and never
+ * consults per-task state.
+ *
+ * Tier order:
+ *  1. the stage's own skip-filtered chain (`source: "stage"`);
+ *  2. the general model's chain, itself skip-filtered, with the general
+ *     chain's backups and strategy (`source: "general"`, `originStage`
+ *     = GENERAL_MODEL_STAGE) — so a blank, cleared, or fully-skipped stage
+ *     is never silently unresolvable;
+ *  3. nothing configured anywhere (`source: "none"`).
+ *
+ * Skip filtering lives ONLY here (and in the identical per-stage helper
+ * above): `getBackupModels` in modelFallback.ts stays raw, and
+ * provider-disabled filtering (`filterEnabledBackupModels`) stays layered on
+ * top by callers.
+ */
+export function resolveEffectiveStageChainV1(stage: TaskStage): EffectiveStageChainV1 {
+  const settings = getModelSettings();
+  const own = skipFilteredChainOf(settings[stage]);
+  if (own.primary) {
+    return {
+      originStage: stage,
+      source: "stage",
+      primary: own.primary,
+      backups: own.backups,
+      strategy: settings[stage]?.strategy,
+    };
+  }
+  if (stage !== GENERAL_MODEL_STAGE) {
+    const general = skipFilteredChainOf(settings[GENERAL_MODEL_STAGE]);
+    if (general.primary) {
+      return {
+        originStage: GENERAL_MODEL_STAGE,
+        source: "general",
+        primary: general.primary,
+        backups: general.backups,
+        strategy: settings[GENERAL_MODEL_STAGE]?.strategy,
+      };
+    }
+  }
+  return { originStage: stage, source: "none", backups: [] };
 }
 
 interface ResolveStageModelOptions {
@@ -146,7 +258,12 @@ export interface ResolvedModelSnapshotStage {
   primary?: string;
   backups: string[];
   strategy: FallbackStrategy;
-  source: "workspace" | "none";
+  /** "workspace" = the stage's own configured chain; "general" = inherited
+   * from the general model's chain; "none" = nothing configured anywhere. */
+  source: "workspace" | "general" | "none";
+  /** Stage whose configured chain supplied the models (differs from the
+   * stage key only when source is "general"). */
+  originStage?: TaskStage;
 }
 
 export interface ResolvedModelSnapshotV1 {
@@ -157,37 +274,32 @@ export interface ResolvedModelSnapshotV1 {
 
 /**
  * Snapshot the workspace's current model configuration for every
- * configurable stage. Reads the same sources resolveModelForStage does
- * (modelSettings, then the legacy aiModelDefaults), but ignores any
+ * configurable stage. Records the EFFECTIVE chain from
+ * resolveEffectiveStageChainV1 (skip-filtered, general-model fallback
+ * applied) plus its provenance (`source`/`originStage`), ignoring any
  * in-progress fallback state — this is kickoff provenance, not a live
- * resolution, so it always records the configured primary/backups/strategy.
+ * resolution.
+ *
+ * schemaVersion stays 1: the new fields are purely additive and nothing in
+ * the codebase reads snapshot contents back (only the filename is referenced,
+ * by the workflow privacy classifier), so old snapshots remain valid and new
+ * ones cannot break a reader.
  */
 export function buildResolvedModelSnapshotV1(): ResolvedModelSnapshotV1 {
-  const modelSettings = getModelSettings();
-  const defaults = getAiModelDefaults();
   const stages: ResolvedModelSnapshotV1["stages"] = {};
   for (const stage of AI_MODEL_STAGES) {
-    const setting = modelSettings[stage];
-    if (setting?.primary) {
-      stages[stage] = {
-        primary: setting.primary,
-        backups: getBackupModels(setting),
-        strategy: setting.strategy,
-        source: "workspace",
-      };
+    const chain = resolveEffectiveStageChainV1(stage);
+    if (chain.source === "none") {
+      stages[stage] = { backups: [], strategy: "alert-and-wait", source: "none" };
       continue;
     }
-    const legacyPrimary = defaults[stage];
-    if (legacyPrimary) {
-      stages[stage] = {
-        primary: legacyPrimary,
-        backups: [],
-        strategy: "alert-and-wait",
-        source: "workspace",
-      };
-      continue;
-    }
-    stages[stage] = { backups: [], strategy: "alert-and-wait", source: "none" };
+    stages[stage] = {
+      primary: chain.primary,
+      backups: chain.backups,
+      strategy: chain.strategy ?? "alert-and-wait",
+      source: chain.source === "general" ? "general" : "workspace",
+      originStage: chain.originStage,
+    };
   }
   return { schemaVersion: 1, resolvedAt: new Date().toISOString(), stages };
 }
@@ -270,46 +382,40 @@ export async function resolveModelForStage(
     return { source: "none" };
   }
 
-  // Check new modelSettings first
-  const modelSettings = getModelSettings();
-  const stageSetting = modelSettings[stage];
-  if (stageSetting?.primary) {
-    if (!options.ignoreActiveFallback) {
-      // If fallback is enabled, check if task progress has fallback active
-      // for this stage.
-      try {
-        const readResult = await readTaskProgressStrictV1(taskFolderUri);
-        const progress = readResult.ok ? readResult.decoded.progress : undefined;
-        if (
-          progress &&
-          progress.fallbackActive &&
-          progress.fallbackActive[stage] &&
-          canUseBackup(stageSetting)
-        ) {
-          const backupModels = getBackupModels(stageSetting);
-          const activeFallbackModel = progress.fallbackModelId?.[stage];
-          return {
-            modelId:
-              activeFallbackModel && backupModels.includes(activeFallbackModel)
-                ? activeFallbackModel
-                : backupModels[0],
-            source: "workspace",
-          };
-        }
-      } catch {
-        // No persisted progress (or unreadable) — fall through to the primary model.
+  // The effective chain (the stage's own skip-filtered chain, else the
+  // general model's) is the single source of the primary and the backup list;
+  // the task-progress fallbackActive layer only chooses AMONG that chain's
+  // backups.
+  const chain = resolveEffectiveStageChainV1(stage);
+  if (!chain.primary) {
+    return { source: "none" };
+  }
+  const source = chain.source === "general" ? "general" : "workspace";
+  if (
+    !options.ignoreActiveFallback &&
+    chain.strategy === "switch-to-backup" &&
+    chain.backups.length > 0
+  ) {
+    // If fallback is enabled, check if task progress has fallback active
+    // for this stage.
+    try {
+      const readResult = await readTaskProgressStrictV1(taskFolderUri);
+      const progress = readResult.ok ? readResult.decoded.progress : undefined;
+      if (progress && progress.fallbackActive && progress.fallbackActive[stage]) {
+        const activeFallbackModel = progress.fallbackModelId?.[stage];
+        return {
+          modelId:
+            activeFallbackModel && chain.backups.includes(activeFallbackModel)
+              ? activeFallbackModel
+              : chain.backups[0],
+          source,
+        };
       }
+    } catch {
+      // No persisted progress (or unreadable) — fall through to the primary model.
     }
-    return { modelId: stageSetting.primary, source: "workspace" };
   }
-
-  const defaults = getAiModelDefaults();
-  const workspaceModel = defaults[stage];
-  if (workspaceModel) {
-    return { modelId: workspaceModel, source: "workspace" };
-  }
-
-  return { source: "none" };
+  return { modelId: chain.primary, source };
 }
 
 /**
@@ -334,9 +440,10 @@ export async function ensureStageModelConfigured(
   });
   const stageName = STAGE_DISPLAY_NAMES[stage];
   if (!resolved.modelId) {
-    // Copilot resolution can still pick a model automatically; only warn
-    // when there is genuinely nothing configured AND no Copilot fallback.
-    // resolveModelForStage returning source "none" means nothing configured.
+    // A stage with no model of its own resolves through the general model
+    // (source "general"), so this warns/blocks ONLY when the resolver
+    // reports source "none" — nothing configured for the stage OR the
+    // general model.
     if (resolved.source === "none") {
       NotificationRouter.showWarning(
         `No AI model is configured for the ${stageName} stage. Configure one in AI Models.`
@@ -400,17 +507,23 @@ const OPTIONAL_REVIEW_STAGES: readonly TaskStage[] = [
   "impl-low-review",
 ];
 
-export async function resolveConfiguredReviewStages(
-  taskFolderUri: vscode.Uri
+export function resolveConfiguredReviewStages(
+  _taskFolderUri: vscode.Uri
 ): Promise<ReadonlySet<TaskStage>> {
   const configured = new Set<TaskStage>(REVIEW_STAGES);
   for (const stage of OPTIONAL_REVIEW_STAGES) {
-    const resolved = await resolveModelForStage(taskFolderUri, stage);
-    if (!resolved.modelId) {
+    // Deliberate exception to the general-model fallback: leaving an
+    // OPTIONAL deep-dive review blank is the opt-out signal auto-advance
+    // relies on. Only the stage's OWN chain counts here — otherwise
+    // configuring a general model would make these stages impossible to
+    // skip. Required stages still fall through to the general model.
+    if (resolveEffectiveStageChainV1(stage).source !== "stage") {
       configured.delete(stage);
     }
   }
-  return configured;
+  // Still Promise-shaped for its awaiting callers, though the resolver made
+  // it synchronous (settings-only, no per-task read).
+  return Promise.resolve(configured);
 }
 
 function isAutoModel(model: vscode.LanguageModelChat): boolean {
@@ -1854,13 +1967,15 @@ export function getModelDisplayName(
 }
 
 export function describeModelSource(
-  source: "task" | "workspace" | "none"
+  source: "task" | "workspace" | "general" | "none"
 ): string {
   switch (source) {
     case "task":
       return "task override";
     case "workspace":
       return "workspace default";
+    case "general":
+      return "general model fallback";
     case "none":
       return "automatic selection";
   }

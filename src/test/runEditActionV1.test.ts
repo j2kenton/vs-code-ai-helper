@@ -235,6 +235,54 @@ void describe("runEditActionV1 — §7.5 availability", () => {
     }
   });
 
+  // AI Models rework (§2): a stage with no model of its own resolves through
+  // the general (desc) chain via resolveEffectiveStageChainV1 — the §7.5
+  // provider-path gate must therefore probe the GENERAL model's provider for
+  // a blank stage, not treat the stage as unconfigured.
+  void it("resolves a blank stage through the general (desc) chain", async () => {
+    const settings = installModelSettings({
+      desc: { primary: "claude-cli:sonnet", strategy: "alert-and-wait" },
+    });
+    const cliFound = installCliFoundStub();
+    try {
+      const ok = await checkEditActionProviderPathGateV1("impl");
+      assert.equal(
+        ok.ok,
+        true,
+        "with the general chain's CLI installed, the blank stage must pass the gate through it"
+      );
+    } finally {
+      cliFound.restore();
+      settings.restore();
+    }
+    // With the general model's CLI NOT installed, the gate's failure must
+    // name that provider — proving the blank stage consulted the general
+    // chain rather than falling into the unconfigured/Copilot path. Uses a
+    // DIFFERENT provider than the leg above: cliAgentRunner caches PATH
+    // lookups for 60s, so re-probing "claude" here would answer from the
+    // found-cache regardless of the spawn stub.
+    const missingCliSettings = installModelSettings({
+      desc: { primary: "gemini-cli:default", strategy: "alert-and-wait" },
+    });
+    const originalSpawn = childProcess.spawn;
+    childProcess.spawn = (() => {
+      const child = new EventEmitter() as import("node:child_process").ChildProcess;
+      process.nextTick(() => child.emit("close", 1));
+      return child;
+    }) as typeof childProcess.spawn;
+    try {
+      const failed = await checkEditActionProviderPathGateV1("impl");
+      assert.equal(failed.ok, false);
+      if (!failed.ok) {
+        assert.equal(failed.code, "providerModeUnavailable");
+        assert.match(failed.reason, /[Gg]emini/);
+      }
+    } finally {
+      childProcess.spawn = originalSpawn;
+      missingCliSettings.restore();
+    }
+  });
+
   // Codex review finding (this round): checkEditActionProviderPathGateV1
   // used to decide whether the host floor applied from the PRIMARY's kind
   // alone. Since runImplementationOrSealedV1 can fall through a CLI primary

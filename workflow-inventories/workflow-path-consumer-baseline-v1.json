@@ -1151,22 +1151,22 @@
       "callSites": [
         {
           "signal": "workspace.fs",
-          "span": "L78-L78",
+          "span": "L190-L190",
           "enclosingSymbol": "content"
         },
         {
           "signal": "workspace.fs",
-          "span": "L116-L116",
+          "span": "L228-L228",
           "enclosingSymbol": "setTaskStageModel"
         },
         {
           "signal": "workspace.fs",
-          "span": "L128-L128",
+          "span": "L240-L240",
           "enclosingSymbol": "setTaskStageModel"
         },
         {
           "signal": "workspace.fs",
-          "span": "L203-L203",
+          "span": "L315-L315",
           "enclosingSymbol": "writeResolvedModelSnapshotV1"
         }
       ],
