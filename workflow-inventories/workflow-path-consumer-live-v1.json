@@ -3,7 +3,7 @@
   "generatedBy": "scripts/generateWorkflowPathConsumers.mjs",
   "description": "Mechanically derived production path-consumer surface of the current working tree (plan §2.3): every module of the §1.1 production source universe importing node fs/child_process or touching the vscode workspace.fs API, with every concrete call site (compiler span + enclosing symbol). Scanned over the exact source-universe file list — never a filesystem walk. Regenerated every run; classification lives in workflow-path-consumer-baseline-v1.json; the immutable pre-gate reference is workflow-path-consumer-pregate-v1.json. Known mechanical bound: modules that only pass path STRINGS to another module (no fs/process API of their own) are covered transitively by the consumer module they call — the classifier enforcement point (plan §2.2) sits at the API-touching module. sourceUniverseSha256 is the CANONICAL (line-ending-independent) digest of the source-universe JSON, so provenance is identical across LF and CRLF checkouts.",
   "sourceUniverse": "workflow-inventories/workflow-production-source-baseline-v1.json",
-  "sourceUniverseSha256": "4e61cf198d84c11faba1b18968fdf2dfc1d576efcc59735686ed520cb467feb8",
+  "sourceUniverseSha256": "49630ea1303b573d3b3bb194cbd306988148e307801724774ecca911983c10fd",
   "consumerCount": 50,
   "consumers": [
     {
@@ -195,27 +195,27 @@
         },
         {
           "signal": "workspace.fs",
-          "span": "L1674-L1674",
+          "span": "L1697-L1697",
           "enclosingSymbol": "contentBytes"
         },
         {
           "signal": "workspace.fs",
-          "span": "L2227-L2227",
+          "span": "L2250-L2250",
           "enclosingSymbol": "runReviewForFolder"
         },
         {
           "signal": "workspace.fs",
-          "span": "L2244-L2244",
+          "span": "L2267-L2267",
           "enclosingSymbol": "runReviewForFolder"
         },
         {
           "signal": "workspace.fs",
-          "span": "L2632-L2632",
+          "span": "L2655-L2655",
           "enclosingSymbol": "runApply"
         },
         {
           "signal": "workspace.fs",
-          "span": "L5944-L5944",
+          "span": "L5972-L5972",
           "enclosingSymbol": "buildReviewResumeVariablesV1"
         }
       ]
@@ -950,7 +950,7 @@
       "callSites": [
         {
           "signal": "workspace.fs",
-          "span": "L438-L438",
+          "span": "L439-L439",
           "enclosingSymbol": "loadPersistedTarget"
         }
       ]

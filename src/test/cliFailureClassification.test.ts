@@ -887,8 +887,9 @@ void describe("stream-transport failures are cascade-eligible", () => {
   });
 
   void it("does NOT promote an edit-mode transport drop at all, even for a structured provider (F4 gap)", () => {
-    // Unlike the same-model retry (evaluateEditRetryEligibility, gated on a
-    // clean git snapshot), the backup CASCADE has no dirty-tree gate at all —
+    // Unlike the same-model retry (which never retries an edit-mode run
+    // except via same-conversation resume), the backup CASCADE has no
+    // dirty-tree gate at all —
     // it dispatches a different model the moment failureKind is cascade-eligible.
     // Promoting here would spend that ungated cascade on a possibly
     // half-edited tree, a strictly worse hazard than the retry withheld for

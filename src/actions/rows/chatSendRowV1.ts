@@ -105,7 +105,7 @@ export function createChatSendRowV1(): ProviderTaskActionRowV1 {
     kind: "provider",
     actionKey: CHAT_SEND_ACTION_KEY_V1,
     routes: ["vs-code-ai-helper.chatWithStage"],
-    eligibility: { statuses: ["active"], stages: "anyStage" },
+    eligibility: { statuses: ["active", "paused"], stages: "anyStage" },
     requiresTaskOperationLease: true,
     progressLabel: "Responding to AI…",
     validateInput: validateChatSendInputV1,

@@ -212,58 +212,6 @@ export interface EditRetryDecision {
   reason: string;
 }
 
-/**
- * The edit-run auto-retry rule (exported for direct unit testing): retry a
- * timed-out edit run ONLY when the provider guarantees tool/edit boundary
- * events are flushed before side effects, the parsed event stream was
- * actually available AND clean of tool/edit activity, and the working-tree
- * snapshot is unchanged. Every other combination refuses the retry — an
- * absent or unverifiable stream from a timed-out process proves nothing.
- */
-export function evaluateEditRetryEligibility(options: {
-  providerLabel: string;
-  guaranteesEditEventFlushBeforeSideEffects: boolean;
-  evidence: CliEditEventEvidence | undefined;
-  snapshotClean: boolean;
-}): EditRetryDecision {
-  if (!options.guaranteesEditEventFlushBeforeSideEffects) {
-    return {
-      retry: false,
-      reason:
-        `Automatic retry is disabled for ${options.providerLabel} edit runs: its CLI protocol ` +
-        "does not guarantee edit events are flushed before side effects.",
-    };
-  }
-  if (!options.evidence?.streamAvailable) {
-    return {
-      retry: false,
-      reason:
-        "No parseable event stream was available for the timed-out run, so it cannot be " +
-        "proven side-effect free.",
-    };
-  }
-  if (options.evidence.sawToolOrEditEvent) {
-    return {
-      retry: false,
-      reason:
-        "The run's event stream shows tool/edit activity before the timeout, so it may " +
-        "already have made changes.",
-    };
-  }
-  if (!options.snapshotClean) {
-    return {
-      retry: false,
-      reason: "The working tree changed (or could not be verified) during the timed-out run.",
-    };
-  }
-  return {
-    retry: true,
-    reason:
-      "provider flush guarantee + clean event stream (no tool/edit events) + unchanged " +
-      "working-tree snapshot",
-  };
-}
-
 /** One audited (attempted or refused) retry, persisted via runLog. */
 export interface RetryAuditEntry {
   attempt: number;
@@ -340,18 +288,20 @@ export interface CliExecResult {
    * True when the failure is a transient transport-level condition — a run
    * timeout, or a mid-stream transport drop — that is in principle retryable.
    * Auth errors, non-zero tool exits, and content errors are never marked
-   * transient. A run timeout sets this for BOTH modes (evaluateEditRetryEligibility
-   * is what actually gates whether an edit run may retry on it). A mid-stream
-   * transport drop, by contrast, is promoted to transient for read-only (text)
-   * runs ONLY: unlike a killed-after-buffering-everything timeout, a dropped
-   * stream is TRUNCATED, so the absence of tool/edit events in it proves
-   * nothing about whether files were already changed — see applyTransportTransience.
+   * transient. A run timeout sets this for BOTH modes, but an edit-mode run
+   * only actually retries via same-conversation resume (when the provider
+   * supports it); every other timed-out edit run refuses regardless of this
+   * flag. A mid-stream transport drop, by contrast, is promoted to transient
+   * for read-only (text) runs ONLY: unlike a killed-after-buffering-everything
+   * timeout, a dropped stream is TRUNCATED, so the absence of tool/edit events
+   * in it proves nothing about whether files were already changed — see
+   * applyTransportTransience.
    */
   transient?: boolean;
   /**
    * Event-stream evidence captured for timed-out runs. Deliberately NOT
    * populated for transport drops: a truncated stream would look like a clean
-   * one to evaluateEditRetryEligibility.
+   * one.
    */
   editEvidence?: CliEditEventEvidence;
   /**
@@ -490,9 +440,9 @@ function applyTransportTransience(
     };
   }
   // Edit-mode runs may have already written partial changes. The same-model
-  // retry path (evaluateEditRetryEligibility) refuses to retry without a
-  // clean git snapshot — but the backup CASCADE (runnerRegistry.ts) has no
-  // equivalent gate at all: it dispatches a different model at the current
+  // retry path refuses to retry at all — except via same-conversation resume
+  // — but the backup CASCADE (runnerRegistry.ts) has no equivalent gate at
+  // all: it dispatches a different model at the current
   // (possibly half-edited) working tree the moment failureKind is
   // quota/temporarily-unavailable, with nothing checking whether the primary
   // left it dirty. Promoting an edit-mode transport drop here would spend
@@ -2095,11 +2045,10 @@ export async function execCliAgent(options: {
     const timeoutHandle = setTimeout(() => {
       killProcessTree(child);
       // Edit-mode timeouts are always promoted: edit mode has its OWN
-      // separate, stricter retry gate downstream (evaluateEditRetryEligibility
-      // / guaranteesEditEventFlushBeforeSideEffects) that refuses to act on
-      // this promotion for any provider without a verified flush guarantee —
-      // Cline/Antigravity included, since neither sets that flag. Text-mode
-      // timeouts are only promoted for a provider whose text mode is
+      // separate, stricter retry gate downstream that refuses to act on this
+      // promotion for any provider — Cline/Antigravity included — except via
+      // same-conversation resume. Text-mode timeouts are only promoted for a
+      // provider whose text mode is
       // actually enforced read-only: shouldRetryReadOnlyRun's free-retry
       // rule (and the backup cascade, gated on failureKind alone) both trust
       // this promotion as proof the run could not have mutated the
@@ -2799,33 +2748,24 @@ export async function runImplementationWithCli(options: {
   ) {
     const resumeConversation =
       result.resumeConversation === true && def.conversationResume !== undefined;
-    const capabilityFlag = def.guaranteesEditEventFlushBeforeSideEffects === true;
-    const snapshotNow =
-      !resumeConversation && capabilityFlag && before
-        ? await gitStatusSnapshot(cwd)
-        : undefined;
-    const snapshotClean =
-      before !== undefined &&
-      snapshotNow !== undefined &&
-      changedPathsSince(before, snapshotNow).length === 0;
     const decision: EditRetryDecision = resumeConversation
       ? {
           retry: true,
           reason:
             "same-conversation continuation — preserves prior provider context and workspace state",
         }
-      : evaluateEditRetryEligibility({
-          providerLabel: def.label,
-          guaranteesEditEventFlushBeforeSideEffects: capabilityFlag,
-          evidence: result.editEvidence,
-          snapshotClean,
-        });
+      : {
+          retry: false,
+          reason:
+            `Automatic retry is disabled for ${def.label} edit runs: its CLI protocol ` +
+            "does not guarantee edit events are flushed before side effects.",
+        };
     retryAudit.push({
       attempt,
       classification: resumeConversation
         ? "transient (provider response timeout)"
         : "transient (run timeout)",
-      capabilityFlag,
+      capabilityFlag: false,
       evidence: decision.reason,
       delayMs: retryDelayMs,
       retried: decision.retry,

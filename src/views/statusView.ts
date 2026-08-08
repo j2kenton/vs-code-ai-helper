@@ -4,6 +4,7 @@ import { taskOperations } from "../utils/taskOperations";
 import { TaskOperationSnapshot } from "../utils/taskOperations";
 import { terminalEntryFor } from "../utils/operationNotificationBridge";
 import { notificationFallbackUri } from "../utils/notificationContentProvider";
+import { formatTimeHHmm } from "../utils/timeFormat";
 
 export const STATUS_VIEW_ID = "vs-code-ai-helper.statusView";
 
@@ -247,13 +248,7 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
 
     // Displayed timestamp is HH:mm (seconds are noisy for the user); the
     // underlying Date retains full precision and still drives ordering.
-    const timeStr = element.timestamp.toLocaleTimeString(undefined, {
-      hour12: false,
-      hour: "2-digit",
-      minute: "2-digit",
-    });
-
-    item.description = timeStr;
+    item.description = formatTimeHHmm(element.timestamp);
 
     // Click still always navigates to the notification's full text/target
     // (D11) — `actionCommand`, when present, is exposed as a separate inline

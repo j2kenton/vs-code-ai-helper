@@ -191,7 +191,7 @@ void describe("Stage 3 action matrix contracts", () => {
     ]);
     const publishActions = contextMenus.filter((entry) =>
       publishActionCommands.has(entry.command) &&
-      (entry.when ?? "").includes("&& viewItem =~ /^stage-publish-current/ &&")
+      (entry.when ?? "").includes("&& viewItem =~ /^stage-publish-current/")
     );
     const groups = publishActions.map(entry => entry.group);
 

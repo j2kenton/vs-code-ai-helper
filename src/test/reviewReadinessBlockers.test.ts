@@ -45,7 +45,7 @@ void describe("parseReviewBlockers", () => {
     ]);
   });
 
-  void it("skips malformed lines instead of throwing", () => {
+  void it("excludes malformed lines from .blockers instead of throwing", () => {
     const content = [
       "<!-- blockers:start -->",
       "- [completion] missing the resolver bracket entirely",
@@ -147,6 +147,95 @@ void describe("parseReviewBlockersDetailed / hasZeroTaskFixableEvidence", () => 
       "<!-- blockers:end -->",
     ].join("\n");
     assert.strictEqual(hasZeroTaskFixableEvidence(content), false);
+  });
+});
+
+/**
+ * Fail-closed on unreadable lines (2026-08-07, step 2). The live incident:
+ * two genuine blockers written in a shape the parser could not read parsed
+ * to zero blockers, and hasZeroTaskFixableEvidence then reported that as
+ * POSITIVE evidence of a clean round. An unreadable line must report itself
+ * (`malformedLines`) rather than vanish, and must veto the zero-fixable
+ * reading rather than be silently indistinguishable from "nothing to report".
+ */
+void describe("parseReviewBlockersDetailed.malformedLines (fail-closed)", () => {
+  void it("reports one good blocker and one garbage line, and fails closed on zero-fixable evidence", () => {
+    const content = [
+      "<!-- blockers:start -->",
+      "- [completion] [task-fixable] the one valid line",
+      "- this is not a blocker line at all",
+      "<!-- blockers:end -->",
+    ].join("\n");
+    const evidence = parseReviewBlockersDetailed(content);
+    assert.deepStrictEqual(evidence.blockers, [
+      { category: "completion", resolver: "task-fixable", description: "the one valid line" },
+    ]);
+    assert.deepStrictEqual(evidence.malformedLines, ["- this is not a blocker line at all"]);
+    assert.strictEqual(hasZeroTaskFixableEvidence(content), false);
+  });
+
+  void it("a garbage-only block yields zero blockers but still fails closed", () => {
+    const content = [
+      "<!-- blockers:start -->",
+      "- totally unstructured prose about a problem",
+      "<!-- blockers:end -->",
+    ].join("\n");
+    const evidence = parseReviewBlockersDetailed(content);
+    assert.deepStrictEqual(evidence.blockers, []);
+    assert.strictEqual(evidence.malformedLines.length, 1);
+    assert.strictEqual(hasZeroTaskFixableEvidence(content), false);
+  });
+
+  void it("a category-only line (no resolver) lands in malformedLines, not .blockers", () => {
+    const content = [
+      "<!-- blockers:start -->",
+      "- [completion] category but no resolver bracket",
+      "<!-- blockers:end -->",
+    ].join("\n");
+    const evidence = parseReviewBlockersDetailed(content);
+    assert.deepStrictEqual(evidence.blockers, []);
+    assert.deepStrictEqual(evidence.malformedLines, ["- [completion] category but no resolver bracket"]);
+  });
+
+  void it("an explicitly empty block still yields zero-fixable evidence, with malformedLines empty", () => {
+    const content = ["<!-- blockers:start -->", "<!-- blockers:end -->"].join("\n");
+    const evidence = parseReviewBlockersDetailed(content);
+    assert.deepStrictEqual(evidence.blockers, []);
+    assert.deepStrictEqual(evidence.malformedLines, []);
+    assert.strictEqual(hasZeroTaskFixableEvidence(content), true);
+  });
+
+  void it("blank/whitespace-only lines inside the block are never reported as malformed", () => {
+    const content = [
+      "<!-- blockers:start -->",
+      "",
+      "   ",
+      "- [completion] [task-fixable] the only real line",
+      "",
+      "<!-- blockers:end -->",
+    ].join("\n");
+    const evidence = parseReviewBlockersDetailed(content);
+    assert.strictEqual(evidence.blockers.length, 1);
+    assert.deepStrictEqual(evidence.malformedLines, []);
+  });
+
+  void it("regression: the incident's resolver-only lines still parse cleanly, not as malformed", () => {
+    // .ensemble/2026-07-24_task_1, impl-high round 1 — the exact two lines
+    // that motivated step 1 (optional category bracket).
+    const content = [
+      "<!-- blockers:start -->",
+      "- [needs-toolchain] Production-source baseline drifted (verify:workflow-production-sources)",
+      "- [environmental] Manual Extension Development Host verification not performed",
+      "<!-- blockers:end -->",
+    ].join("\n");
+    const evidence = parseReviewBlockersDetailed(content);
+    assert.deepStrictEqual(evidence.malformedLines, []);
+    assert.strictEqual(evidence.blockers.length, 2);
+    assert.deepStrictEqual(
+      evidence.blockers.map((b) => b.resolver),
+      ["needs-toolchain", "environmental"]
+    );
+    assert.strictEqual(hasZeroTaskFixableEvidence(content), true);
   });
 });
 

@@ -21,6 +21,7 @@ import {
   writeChatHistory,
 } from "../utils/chatHistoryStore";
 import { stripAttributionHeaders } from "../utils/fileUtils";
+import { formatTimeHHmm } from "../utils/timeFormat";
 import {
   decodeStructuredAnswersArrayV1,
   StructuredAnswerV1,
@@ -919,8 +920,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     // reads as "the computer is working, leave it alone" and is exactly
     // backwards when it's actually this chat that's waiting on the user.
     const targetOps = target ? taskOperations.getTaskOperations(target.canonicalId) : [];
-    const busy = targetOps.some((op) => !op.waitingForUser);
-    const waitingForUser = !busy && targetOps.some((op) => op.waitingForUser);
+    // A trailing pending question (no reply after it yet) is the one case
+    // that genuinely needs the user's attention rather than just being more
+    // conversation — computed here (ahead of busy/waitingForUser) so it can
+    // win over an operation that is still technically running: a question
+    // posted mid-operation means the operation is now blocked on the user,
+    // not "busy", no matter what targetOps still reports.
+    const lastEntry = entries[entries.length - 1];
+    const hasPendingQuestion = lastEntry?.role === "question" && lastEntry.pending;
+    const waitingForUser =
+      interaction !== undefined || hasPendingQuestion || targetOps.some((op) => op.waitingForUser);
+    const busy = !waitingForUser && targetOps.some((op) => !op.waitingForUser);
     // Always show the associated task: the task name when available,
     // otherwise the folder's date/task-ID code — with no bracketed raw
     // stage id. The global assistant is labeled as a global assistant.
@@ -933,18 +943,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     }
     // Attribution comments belong in generated artifact files, not in a
     // conversation — strip them from every displayed message (including
-    // messages persisted before this stripping existed).
-    const displayEntries = entries.map((entry) => ({
-      ...entry,
-      text: stripAttributionHeaders(entry.text),
-    }));
-    // A trailing pending question (no reply after it yet) is the one case
-    // that genuinely needs the user's attention rather than just being more
-    // conversation — a small badge on the view itself draws the eye even
-    // when this panel is present but not the currently focused element,
-    // mirroring how other views badge unread/actionable counts.
-    const lastEntry = entries[entries.length - 1];
-    const hasPendingQuestion = lastEntry?.role === "question" && lastEntry.pending;
+    // messages persisted before this stripping existed). The webview script
+    // cannot import host-side code, so the HH:mm label and its full-date
+    // tooltip are pre-formatted here from `entry.at` (an ISO string) using
+    // the same helper the Notifications view uses.
+    const displayEntries = entries.map((entry) => {
+      const date = new Date(entry.at);
+      return {
+        ...entry,
+        text: stripAttributionHeaders(entry.text),
+        atLabel: formatTimeHHmm(date),
+        atTitle: date.toLocaleString(),
+      };
+    });
+    // A small badge on the view itself draws the eye even when this panel is
+    // present but not the currently focused element, mirroring how other
+    // views badge unread/actionable counts.
     if (this.view) {
       this.view.badge = hasPendingQuestion || interaction !== undefined
         ? { value: 1, tooltip: "Waiting for your answer" }
@@ -993,8 +1007,31 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         #messages {
           margin: 0 0 var(--ensemble-space-2);
         }
-        #messages p {
+        .msg-row {
           margin: 0 0 var(--ensemble-space-2);
+        }
+        .msg-meta {
+          display: flex;
+          align-items: center;
+          gap: var(--ensemble-space-1);
+          font-size: 0.85em;
+          color: var(--vscode-descriptionForeground);
+          margin-bottom: 2px;
+        }
+        .msg-copy {
+          background: none;
+          border: none;
+          cursor: pointer;
+          color: var(--vscode-descriptionForeground);
+          padding: 0 var(--ensemble-space-1);
+          font-size: 1em;
+          line-height: 1;
+        }
+        .msg-copy:hover {
+          color: var(--vscode-foreground);
+        }
+        #messages p {
+          margin: 0;
           line-height: 1.4;
           white-space: pre-wrap;
           overflow-wrap: anywhere;
@@ -1250,7 +1287,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         const switchedChat=nextKey!==currentKey;
         const stick=!switchedChat&&isNearBottom();
         c.textContent=s.label??'No chat available yet.';
-        m.replaceChildren(...s.entries.map(x=>{const d=document.createElement('p');d.className=x.role==='user'?'msg-user':'msg-agent';d.textContent='['+x.role+(x.pending?' — awaiting your answer':'')+'] '+x.text;return d;}));
+        m.replaceChildren(...s.entries.map(x=>{
+          const row=document.createElement('div');row.className='msg-row';
+          const meta=document.createElement('div');meta.className='msg-meta';
+          const time=document.createElement('span');time.className='msg-time';time.textContent=x.atLabel??'';time.title=x.atTitle??'';
+          const copyBtn=document.createElement('button');copyBtn.type='button';copyBtn.className='msg-copy';copyBtn.title='Copy message';copyBtn.setAttribute('aria-label','Copy message');copyBtn.textContent='⧉';
+          copyBtn.addEventListener('click',()=>{navigator.clipboard.writeText(x.text);});
+          meta.appendChild(time);meta.appendChild(copyBtn);
+          const d=document.createElement('p');d.className=x.role==='user'?'msg-user':'msg-agent';d.textContent='['+x.role+(x.pending?' — awaiting your answer':'')+'] '+x.text;
+          row.appendChild(meta);row.appendChild(d);
+          return row;
+        }));
         renderInteraction(s.interaction);
         e.textContent=s.errorMessage??'';e.style.display=s.errorMessage?'block':'none';
         if(s.busy){bs.style.display='inline-block';bt.textContent='Waiting for the AI…';b.style.display='block';}

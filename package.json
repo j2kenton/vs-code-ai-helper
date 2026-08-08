@@ -732,7 +732,7 @@
         },
         {
           "command": "vs-code-ai-helper.chatWithStage",
-          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage-publish-current/ && !(viewItem =~ /-paused/)",
+          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage-publish-current/",
           "group": "inline@40"
         },
         {
@@ -757,7 +757,7 @@
         },
         {
           "command": "vs-code-ai-helper.chatWithStage",
-          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /-modelable$/ && !(viewItem =~ /^stage-publish-current/) && !(viewItem =~ /-paused/)",
+          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /-modelable$/ && !(viewItem =~ /^stage-publish-current/)",
           "group": "inline@7"
         },
         {

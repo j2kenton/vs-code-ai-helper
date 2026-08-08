@@ -243,20 +243,6 @@ export interface CliProviderDefinition {
    */
   structuredEventStream?: "opencode" | "cline" | "kimi";
   /**
-   * Retry-evidence capability flag: true ONLY when this provider's CLI
-   * protocol verifiably guarantees that tool/edit boundary events are
-   * emitted and flushed before any side effect occurs. Edit-capable runs
-   * are auto-retried after a transient timeout only on providers with this
-   * guarantee (and even then only with an unchanged working-tree snapshot
-   * as a secondary guard). Defaults to absent (= not guaranteed): an absent
-   * or clean event stream from a process that timed out proves nothing —
-   * events can be buffered, truncated, or lost — so edit runs on such
-   * providers are never auto-retried. Set this to true for a provider only
-   * after verifying the guarantee against its protocol documentation and
-   * observed behavior for the currently supported CLI version.
-   */
-  guaranteesEditEventFlushBeforeSideEffects?: boolean;
-  /**
    * Optional same-conversation recovery for a provider whose headless CLI
    * persists a failed turn and exposes a continuation flag. Unlike replaying
    * the original prompt, this deliberately preserves the provider's prior

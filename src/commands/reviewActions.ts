@@ -811,6 +811,7 @@ async function resolveTask(
     picked = selected?.task;
   }
   if (!picked) {
+    NotificationRouter.showInformation("Task selection cancelled.");
     return undefined;
   }
 
@@ -1355,7 +1356,29 @@ async function handleReviewRoutingOutcome(options: {
   const { folderUri, targetStage, reviewAttemptId, content, score, threshold } = options;
   try {
     const resilience = getResilienceSettings();
-    const blockers = parseReviewBlockers(content);
+    const blockerEvidence = parseReviewBlockersDetailed(content);
+    const blockers = blockerEvidence.blockers;
+    if (blockerEvidence.malformedLines.length > 0) {
+      // A malformed line is UNKNOWN, not clean — never let it look identical
+      // to a round that stalled for any other reason. Record what could not
+      // be parsed in the run log (the durable record) and tell the user, in
+      // the same spirit as the "scored N/10 but M of T steps implemented"
+      // notice below. Parsed blockers still feed history/routing as usual —
+      // this only blocks the CLEAN-round reading, not the round itself.
+      await writeRunLog(
+        folderUri,
+        "review-guard",
+        targetStage,
+        `# Unparseable Blocker Lines\n\nStatus: ${blockers.length} blocker(s) parsed; ` +
+          `${blockerEvidence.malformedLines.length} line(s) could not be parsed.\n\n` +
+          `## Malformed lines\n\n${blockerEvidence.malformedLines.map((l) => `- ${l}`).join("\n")}`
+      );
+      NotificationRouter.showWarning(
+        `${STAGE_DISPLAY_NAMES[targetStage]} review parsed ${blockers.length} blocker(s), but ` +
+          `${blockerEvidence.malformedLines.length} blocker line(s) could not be read and were not counted. ` +
+          "Check the review-guard run log."
+      );
+    }
     const progressBefore = await readTaskProgressAdvisoryV1(folderUri);
     if (!progressBefore) {
       return { escalated: false };
@@ -3790,6 +3813,11 @@ export async function nextStage(
   const configuredStages = await resolveConfiguredReviewStages(resolved.folderUri);
   const next = computeNextStage(resolved.progress.currentStage, configuredStages);
   if (!next) {
+    NotificationRouter.showInformation(
+      resolved.progress.currentStage === "publish"
+        ? `${resolved.progress.taskFolder} is already at the last stage (Publish). Use "Mark Task Done" to finish it.`
+        : `${resolved.progress.taskFolder} has no next stage to advance to — only unconfigured review stages remain.`
+    );
     return;
   }
 

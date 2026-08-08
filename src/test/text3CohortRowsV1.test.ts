@@ -129,6 +129,11 @@ void describe("Text 3 cohort action rows", () => {
       assert.equal(row.providerMode, "text");
       assert.equal(row.resumeSemantics, "sameOperation");
     });
+
+    void it("is eligible on both active and paused tasks", () => {
+      const row = createChatSendRowV1();
+      assert.deepEqual(row.eligibility, { statuses: ["active", "paused"], stages: "anyStage" });
+    });
   });
 
   void describe("commitPushMetadataRowV1", () => {

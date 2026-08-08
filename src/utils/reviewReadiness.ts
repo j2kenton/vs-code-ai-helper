@@ -199,10 +199,15 @@ const BLOCKER_LINE_RE =
  *   - [completion] [task-fixable] short description
  *   <!-- blockers:end -->
  *
- * Absent, malformed, or unparseable lines are simply skipped — a review
- * that omits the block (older prompt version, or a provider that didn't
- * follow instructions) yields an empty array rather than throwing, so
- * routing degrades to "no structured blocker signal" instead of failing.
+ * An absent block (older prompt version, or a provider that didn't follow
+ * instructions) yields an empty array rather than throwing, so routing
+ * degrades to "no structured blocker signal" instead of failing. A PRESENT
+ * block that contains a line the parser cannot read is a different case: the
+ * line is reported via {@link parseReviewBlockersDetailed}'s `malformedLines`
+ * rather than silently dropped, and `hasZeroTaskFixableEvidence` fails closed
+ * on it — an unreadable line must never be indistinguishable from "no
+ * blockers found". Use `parseReviewBlockersDetailed` directly when the
+ * caller needs to detect and surface that condition.
  */
 export function parseReviewBlockers(content: string): ReviewBlocker[] {
   return parseReviewBlockersDetailed(content).blockers;
@@ -221,6 +226,14 @@ export interface ReviewBlockerEvidence {
   /** True when the `<!-- blockers:start/end -->` markers were found. */
   blockPresent: boolean;
   blockers: ReviewBlocker[];
+  /**
+   * Non-blank lines inside the block that failed to match
+   * {@link BLOCKER_LINE_RE} (no valid resolver bracket, or no description).
+   * Non-empty means "unknown", never "clean" — see
+   * {@link hasZeroTaskFixableEvidence}, which fails closed on this field
+   * rather than silently dropping the line the way earlier versions did.
+   */
+  malformedLines: string[];
 }
 
 /** Conservative match for an explicit prose "no blockers" declaration —
@@ -231,13 +244,24 @@ const EXPLICIT_NO_BLOCKERS_RE = /^\s*(?:[-*]\s*)?(?:blockers?:\s*none\b|no block
 
 /**
  * Positive evidence this review reported zero task-fixable blockers: either
- * the machine-readable block is present and contains no task-fixable entry,
- * or the review explicitly states there are no blockers. Mere ABSENCE of the
- * block is never evidence — see ReviewBlockerEvidence.
+ * the machine-readable block is present, contains no task-fixable entry, AND
+ * contains no unparseable line, or the review explicitly states there are no
+ * blockers. Mere ABSENCE of the block is never evidence — see
+ * ReviewBlockerEvidence. A present block with even one malformed line fails
+ * CLOSED (returns false): that line might be the exact blocker the reviewer
+ * meant to file, just in a shape the parser could not read, and "unknown"
+ * must never be reported as "clean".
  */
 export function hasZeroTaskFixableEvidence(content: string): boolean {
   const evidence = parseReviewBlockersDetailed(content);
   if (evidence.blockPresent) {
+    if (evidence.malformedLines.length > 0) {
+      // An unreadable line means UNKNOWN, not clean. A round that logged a
+      // real blocker in a shape the parser couldn't read must never be
+      // indistinguishable from a round with nothing to report — that
+      // conflation is the exact incident this field exists to prevent.
+      return false;
+    }
     return evidence.blockers.every((b) => b.resolver !== "task-fixable");
   }
   return EXPLICIT_NO_BLOCKERS_RE.test(content);
@@ -331,7 +355,7 @@ export function parseReviewProgress(content: string): ReviewProgress | null {
 export function parseReviewBlockersDetailed(content: string): ReviewBlockerEvidence {
   const match = BLOCKERS_BLOCK_RE.exec(content);
   if (!match) {
-    return { blockPresent: false, blockers: [] };
+    return { blockPresent: false, blockers: [], malformedLines: [] };
   }
   // Presence is decided by the MARKERS, not by the capture being non-empty.
   // `<!-- blockers:start --><!-- blockers:end -->` with nothing between them
@@ -342,9 +366,17 @@ export function parseReviewBlockersDetailed(content: string): ReviewBlockerEvide
   // That inverted the intent of an explicitly empty block.
   const body = match[1] ?? "";
   const blockers: ReviewBlocker[] = [];
+  const malformedLines: string[] = [];
   for (const line of body.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      // Blank/whitespace-only lines are formatting, not content — never
+      // reported as malformed.
+      continue;
+    }
     const lineMatch = BLOCKER_LINE_RE.exec(line);
     if (!lineMatch) {
+      malformedLines.push(trimmed);
       continue;
     }
     const [, category, resolver, description] = lineMatch;
@@ -355,6 +387,7 @@ export function parseReviewBlockersDetailed(content: string): ReviewBlockerEvide
     // check (`implLowCompletionBlockers` below) MORE likely to surface a
     // conflict rather than less.
     if (!resolver || !description) {
+      malformedLines.push(trimmed);
       continue;
     }
     blockers.push({
@@ -363,7 +396,7 @@ export function parseReviewBlockersDetailed(content: string): ReviewBlockerEvide
       description,
     });
   }
-  return { blockPresent: true, blockers };
+  return { blockPresent: true, blockers, malformedLines };
 }
 
 /**
