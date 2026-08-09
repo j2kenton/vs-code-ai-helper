@@ -1,5 +1,0 @@
-{
-  "schemaVersion": 1,
-  "description": "Provenance manifest for GENERATED production sources (plan §1.1 point 7). A generated file may participate in the production bundle graph or shipped-asset set ONLY if it is declared here with its generator command, output path, source inputs, and content digest — resolveProductionSourceUniverse.mjs fails closed on any bundle input or shipped asset matching a generated-output naming convention that has no entry here, and on any declared entry whose file is missing, whose digest no longer matches, or which is not actually part of the resolved production universe. The current build has NO generated production inputs: every bundled source is a hand-authored .ts file and every shipped asset is a checked-in image or prompt template.",
-  "generatedSources": []
-}
