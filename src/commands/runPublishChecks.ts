@@ -5,6 +5,7 @@ import { IncompleteTask } from "../types/incompleteTask";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
 import { runCompletionLint } from "../utils/completionLint";
+import { runPublishScopeCheck } from "../utils/publishScopeCheck";
 import { ensureStageModelConfigured } from "../utils/modelSelection";
 import { safeOpenTextDocument } from "../utils/fileUtils";
 import { STAGE_ARTIFACT_FILENAMES } from "../types/taskProgress";
@@ -120,6 +121,7 @@ export async function runPublishChecks(
               taskFolderUri,
               resolvedTask.progress.implReviewFiles
             );
+            await runPublishScopeCheck(taskFolderUri, resolvedTask.progress);
 
             // Keep the tree aligned with the persisted lint payload.
             await inventory.refresh();

@@ -11,12 +11,11 @@
  * The seed corpus mirrors `test-fixtures/creation-seeds/` (see that
  * directory's README for provenance), but production code cannot read
  * `test-fixtures/**` — that directory is excluded from the packaged
- * extension (.vscodeignore) and from the production source universe. The
- * three legacy seeds therefore ship as their own bundled copies under
- * `resources/prompts/creation-seed-legacy-*.md` (byte-identical copies,
- * loaded at runtime exactly like `resources/prompts/task-template.md` via
- * `promptTemplates.ts` — see `resolveProductionSourceUniverse.mjs`'s
- * `resources/prompts/*.md` runtime-copy rule). The current (v1) seed is not
+ * extension (.vscodeignore). The three legacy seeds therefore ship as their
+ * own bundled copies under `resources/prompts/creation-seed-legacy-*.md`
+ * (byte-identical copies, loaded at runtime exactly like
+ * `resources/prompts/task-template.md` via `promptTemplates.ts`). The
+ * current (v1) seed is not
  * duplicated: it is `resources/prompts/task-template.md` itself, already
  * loaded elsewhere, so this module reads that same file rather than keeping
  * a second copy that could drift.

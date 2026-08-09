@@ -3,8 +3,7 @@
  *
  * `TASK_PROGRESS_FIELD_POLICY_V1` mirrors the plan's per-field lifecycle
  * table; its `Record` type over every persisted field (plus the version
- * marker) makes omitting a field a COMPILE error, which — together with the
- * generated inventory check in verify:task-progress-fields — is the plan's
+ * marker) makes omitting a field a COMPILE error — this is the plan's
  * completeness proof ("no current persisted field is omitted from this
  * table"). The transition functions below are the only implementation of
  * the nextStage / markTaskDone / reopen columns; the migration column is

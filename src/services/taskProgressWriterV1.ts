@@ -9,7 +9,7 @@
  * unambiguously V1 input on the next read.
  *
  * Like the decoder, this module is fenced from the permissive legacy
- * reader/writer (scripts/verifyProgressReaderFence.mjs).
+ * reader/writer: it never imports from `utils/taskProgressUtils`.
  */
 import * as vscode from "vscode";
 import * as path from "path";

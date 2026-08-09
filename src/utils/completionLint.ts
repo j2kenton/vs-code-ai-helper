@@ -1371,8 +1371,8 @@ export function buildVerifiedChecksSection(result: CompletionLintResult): string
  * Turn failed Verified Checks directly into blockers, bypassing the model
  * entirely for facts the extension host already holds firsthand. See
  * reviewReadiness.ts's `BLOCKER_LINE_RE` doc comment for the incident this
- * exists to make impossible: `verify:workflow-production-sources` had
- * already failed with a non-zero exit code before any reviewer saw it, and
+ * exists to make impossible: a since-retired `verify:workflow-production-sources`
+ * check had already failed with a non-zero exit code before any reviewer saw it, and
  * the round trip through the reviewer's prose (describe the failure, format
  * it as a blocker line) is exactly where the blocker was lost. A
  * deterministic check that fails now files its own blocker directly,

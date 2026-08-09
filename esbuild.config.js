@@ -1,12 +1,9 @@
 "use strict";
 
-// Shared production build option factory. Both `esbuild.js` (the shipping
-// build) and `scripts/resolveProductionSourceUniverse.mjs` (the production
-// source-universe resolver, plan §1.1) must build from these exact options —
-// entrypoints, platform, conditions, externals, defines, loaders, and
-// plugins — so the resolver's view of "what ships" cannot drift from what
-// actually ships. Do not inline build options anywhere else; add new build
-// options here and let both consumers pick them up.
+// Shared production build option factory, consumed by `esbuild.js` (the
+// shipping build) — entrypoints, platform, conditions, externals, defines,
+// loaders, and plugins. Do not inline build options anywhere else; add new
+// build options here instead.
 
 /**
  * @param {{ production?: boolean }} [opts]

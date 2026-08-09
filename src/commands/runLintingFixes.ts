@@ -10,6 +10,7 @@ import {
   runCompletionLint,
   resolvePublishScopeFolder,
 } from "../utils/completionLint";
+import { runPublishScopeCheck } from "../utils/publishScopeCheck";
 import { renderPromptTemplate } from "../utils/promptTemplates";
 import { generateContextPack } from "../utils/contextPack";
 import {
@@ -339,6 +340,7 @@ export async function runLintingFixes(
               }).length;
 
             const postFixLint = await runCompletionLint(taskFolderUri, relevantFiles);
+            await runPublishScopeCheck(taskFolderUri, resolvedTask.progress);
 
             if (!postFixLint.passed) {
 
@@ -498,10 +500,12 @@ export async function runLintingFixes(
                   });
                   if (result?.status === "completed") {
                     await runCompletionLint(taskFolderUri, relevantFiles);
+                    await runPublishScopeCheck(taskFolderUri, resolvedTask.progress);
                     await inventory.refresh();
                     NotificationRouter.showInformation("AI final fixes applied; completion lint was rerun.");
                   } else {
                     await runCompletionLint(taskFolderUri, relevantFiles);
+                    await runPublishScopeCheck(taskFolderUri, resolvedTask.progress);
                     if (result?.errorMessage) {
                       NotificationRouter.showWarning(`AI final fixes failed: ${result.errorMessage}`);
                     } else {
@@ -529,6 +533,7 @@ export async function runLintingFixes(
           } catch (error) {
             try {
               await runCompletionLint(taskFolderUri, resolvedTask.progress.implReviewFiles);
+              await runPublishScopeCheck(taskFolderUri, resolvedTask.progress);
             } catch {
               await persistLintState(
                 false,

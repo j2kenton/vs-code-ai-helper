@@ -8,7 +8,7 @@
  * invalid/unknown-version document now surfaces as an explicit recovery
  * entry instead of a silently omitted task (§3.12 step 4). Lives under
  * `services/taskProgress*` so the permissive-reader import fence covers it
- * from birth (scripts/verifyProgressReaderFence.mjs).
+ * from birth: this module never imports from `utils/taskProgressUtils`.
  */
 import * as vscode from "vscode";
 import { IncompleteTask } from "../types/incompleteTask";

@@ -6,8 +6,8 @@
  * is reported distinctly (`code: "missing"`) from an unsupported/invalid
  * document (a decoder recovery result): both are failures a caller must
  * handle explicitly, unlike the permissive reader's single collapsed
- * `undefined`. Fenced from the permissive legacy reader/writer exactly like
- * the rest of the strict stack (scripts/verifyProgressReaderFence.mjs).
+ * `undefined`. Fenced from the permissive legacy reader/writer, like the rest
+ * of the strict stack: never imports from `utils/taskProgressUtils`.
  */
 import * as vscode from "vscode";
 import { TASK_PROGRESS_FILENAME } from "../types/taskProgress";

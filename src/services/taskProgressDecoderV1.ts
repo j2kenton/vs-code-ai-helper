@@ -2,13 +2,12 @@
  * Strict task-progress decoder and version selector (plan §3.10).
  *
  * This is the fail-closed replacement for the permissive legacy reader in
- * `utils/taskProgressUtils` (which this module is fenced from importing —
- * see scripts/verifyProgressReaderFence.mjs). Version selection follows
- * `ensembleProgressVersion` exactly:
+ * `utils/taskProgressUtils` (which this module must never import from, to
+ * keep the strict stack independent of the permissive one). Version selection
+ * follows `ensembleProgressVersion` exactly:
  *
  *  - property ABSENT + the workspace-legacy-v0 family rules all satisfied
- *    → supported legacy input (workflow-inventories/task-progress-history-v1.json
- *    is the checked-in evidence base for those rules);
+ *    → supported legacy input;
  *  - exact integer 1 → the ensemble-v1 family;
  *  - any other present value → recovery.
  *

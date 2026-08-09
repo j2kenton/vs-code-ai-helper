@@ -6,8 +6,7 @@
  * classifies `status: "creating"` task folders into the four conservative
  * classes from §4.3 (`reconstructible`, `pristine`, `preservable`,
  * `inspectionOnly`), using the strict progress decoder rather than the
- * permissive reader (this file is fenced — see
- * scripts/verifyProgressReaderFence.mjs's FENCED_PATTERNS — from importing
+ * permissive reader (this file is fenced from importing
  * `utils/taskProgressUtils`/`utils/legacyTaskProgressV0`).
  *
  * This module now IS the activation-order barrier: `extension.ts`,
