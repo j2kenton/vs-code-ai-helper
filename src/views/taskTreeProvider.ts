@@ -54,20 +54,34 @@ export function orderTasksForDisplay(visible: readonly IncompleteTask[]): Incomp
 type StageStatus = "done" | "current" | "outstanding";
 
 /**
- * Determine the status of a stage relative to a task's current stage
+ * Determine the status of a stage relative to a task's current stage.
+ *
+ * The current-stage comparison wins over `completedStages`: stages at or
+ * after the current index NEVER render as done, no matter what
+ * `completedStages` claims. A rollback out of Publish retracts the
+ * re-entered stages on write (updateTaskProgressStage / applyReopenPolicyV1),
+ * but files written before that retraction existed — and kept whole by the
+ * decoder's canonicalize-to-a-prefix backfill — can still list the
+ * destination stage (or every later stage) as completed. Consulting that
+ * list first rendered every stage as done after a Publish rollback: no
+ * current marker anywhere, as if the stage change never landed.
+ *
+ * `completedStages` stays in the signature (callers still pass it, and the
+ * regression tests exercise stale shapes through it), but it is deliberately
+ * not consulted: a stage strictly before the current one is already done by
+ * position, and one at/after it must never be.
+ *
+ * Exported for direct unit testing.
  */
-function getStageStatus(stage: TaskStage, currentStage: TaskStage, completedStages?: readonly TaskStage[]): StageStatus {
-  if (completedStages?.includes(stage)) {
-    return "done";
-  }
+export function getStageStatus(stage: TaskStage, currentStage: TaskStage, _completedStages?: readonly TaskStage[]): StageStatus {
   const stageIndex = STAGE_ORDER.indexOf(stage);
   const currentIndex = STAGE_ORDER.indexOf(currentStage);
 
-  if (stageIndex < currentIndex) {
-    return "done";
-  }
   if (stageIndex === currentIndex) {
     return "current";
+  }
+  if (stageIndex < currentIndex) {
+    return "done";
   }
   return "outstanding";
 }
@@ -813,8 +827,14 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
     const active = ordered.filter(
       (t) => t.progress.status !== "completed" && t.progress.status !== "archived"
     );
+    // The first ACTIVE task in display order — not ordered[0], which can be a
+    // completed or archived row (e.g. a pinned finished task) that would
+    // otherwise swallow the auto-expansion while the actual working task
+    // stays collapsed.
+    const firstActive = active[0];
+    const firstActiveId = firstActive !== undefined ? taskIdentityKey(firstActive) : undefined;
 
-    const shouldExpand = (task: IncompleteTask, index: number): boolean => {
+    const shouldExpand = (task: IncompleteTask): boolean => {
       const id = taskIdentityKey(task);
 
       // Explicit user state takes precedence over mode
@@ -832,8 +852,8 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
       if (this.mode === 'allCollapsed') {
         return false;
       }
-      // autoFirstActive mode: expand only the first active task
-      return index === 0 && active.length > 0;
+      // autoFirstActive mode: expand only the first active task in display order
+      return firstActiveId !== undefined && id === firstActiveId;
     };
 
     // Get current task ID from the store (canonical normalized path).
@@ -842,7 +862,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
     const currentTaskCanonicalId = this.currentTaskStore?.get();
 
     const nodes: TaskTreeNode[] = ordered.map(
-      (task, index) => {
+      (task) => {
         const taskId = taskIdentityKey(task);
         const isCurrent =
           currentTaskCanonicalId !== undefined &&
@@ -859,7 +879,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
             : undefined;
         return new TaskNode(
           task,
-          shouldExpand(task, index),
+          shouldExpand(task),
           isCurrent,
           isScheduled,
           this.isMetaManaged,

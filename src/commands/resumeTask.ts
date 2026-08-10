@@ -151,9 +151,11 @@ export async function resumePausedTask(
         // escalation left behind here would otherwise linger in the task
         // tree and (once the task plateaus again) skew
         // secondOpinionTriedThisPlateau against a fresh attempt.
+        // preserveFreshness: resuming is selection, not progress — it must
+        // not hoist the task in the recency-ordered task list.
         await patchTaskProgressStrictV1(
           vscode.Uri.file(resolvedTask.taskFolderPath),
-          (current) => clearEscalation(current)
+          (current) => clearEscalation(current, { preserveFreshness: true })
         );
       }
     );

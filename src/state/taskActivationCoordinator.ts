@@ -146,7 +146,10 @@ async function activateTaskLocked(
         (task.progress.status === "active" || task.progress.status === "creating")) {
       const paused = await patchTaskProgressStrictV1(
         vscode.Uri.file(task.taskFolderPath),
-        (current) => updateTaskStatus(current, "paused"),
+        // preserveFreshness: pausing the others is a side effect of focusing
+        // the target, not progress on those tasks — bumping their updatedAt
+        // would reshuffle the recency-ordered task list on every activation.
+        (current) => updateTaskStatus(current, "paused", { preserveFreshness: true }),
         { skipLock: true }
       );
       if (!paused) {
@@ -174,7 +177,12 @@ async function activateTaskLocked(
       ? await options.writeTarget()
       : await patchTaskProgressStrictV1(
           vscode.Uri.file(taskFolderPath),
-          (current) => updateTaskStatus(options?.mutateTarget ? options.mutateTarget(current) : current, "active"),
+          // preserveFreshness: activating a task is selection, not progress —
+          // bumping updatedAt here hoisted whichever task was made current to
+          // the top of the recency-ordered task list, as if it were pinned.
+          // (The writeTarget reopen path is a real lifecycle write and keeps
+          // its own coordinator-clock updatedAt.)
+          (current) => updateTaskStatus(options?.mutateTarget ? options.mutateTarget(current) : current, "active", { preserveFreshness: true }),
           { skipLock: true }
         );
   } catch (error) {
@@ -242,7 +250,9 @@ function warnBestEffort(message: string): void {
 async function rollback(previous: Array<{ taskFolderPath: string; status: string }>, changed: string[]): Promise<void> {
   for (const folder of changed) {
     const old = previous.find(item => item.taskFolderPath === folder);
-    if (old) await patchTaskProgressStrictV1(vscode.Uri.file(folder), current => updateTaskStatus(current, old.status as TaskStatus), { skipLock: true });
+    // preserveFreshness: undoing this activation's own bookkeeping writes —
+    // recency must end up exactly where it started.
+    if (old) await patchTaskProgressStrictV1(vscode.Uri.file(folder), current => updateTaskStatus(current, old.status as TaskStatus, { preserveFreshness: true }), { skipLock: true });
   }
 }
 
@@ -348,7 +358,7 @@ async function ensureNoPendingActivation(
   for (const folder of checkpoint.pausedFolders) {
     const old = checkpoint.previousStatuses.find(item => item.taskFolderPath === folder);
     if (old) {
-      await patchTaskProgressStrictV1(vscode.Uri.file(folder), current => updateTaskStatus(current, old.status as TaskStatus), { skipLock: true });
+      await patchTaskProgressStrictV1(vscode.Uri.file(folder), current => updateTaskStatus(current, old.status as TaskStatus, { preserveFreshness: true }), { skipLock: true });
     }
   }
   await clearActivationCheckpoint(root);
@@ -417,7 +427,7 @@ async function recoverActivationCheckpointLocked(
   for (const folder of checkpoint.pausedFolders) {
     const old = checkpoint.previousStatuses.find(item => item.taskFolderPath === folder);
     if (old) {
-      await patchTaskProgressStrictV1(vscode.Uri.file(folder), current => updateTaskStatus(current, old.status as TaskStatus));
+      await patchTaskProgressStrictV1(vscode.Uri.file(folder), current => updateTaskStatus(current, old.status as TaskStatus, { preserveFreshness: true }));
     }
   }
   await clearActivationCheckpoint(root);

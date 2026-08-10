@@ -48,9 +48,10 @@ export function updateTaskProgressStage(
   // this the task claims currentStage: "impl-high-review" while
   // completedStages still lists "impl-high-review" AND "impl-low-review" —
   // a state that says a stage is simultaneously in progress and finished.
-  // The tree renders those stages as done (taskTreeProvider's getStageStatus
-  // reads this list), and anything asking "has this stage been through?"
-  // gets the wrong answer for work that is about to be redone.
+  // taskTreeProvider's getStageStatus now renders from the current stage's
+  // position alone (so a stale list can no longer hide the current marker),
+  // but anything else asking "has this stage been through?" would still get
+  // the wrong answer for work that is about to be redone.
   //
   // taskProgressFieldPolicyV1's reopen path already retracts exactly this
   // way, but it is gated on `status === "completed"` — it only covers
@@ -103,16 +104,27 @@ export function updateTaskProgressStage(
 }
 
 /**
- * Update task status (active/paused)
+ * Update task status (active/paused).
+ *
+ * `preserveFreshness` keeps `updatedAt` untouched for status flips that are
+ * pure focus/selection bookkeeping rather than task progress — activating a
+ * task (and pausing the others as a side effect of that activation) must not
+ * bump its recency, because the task list orders unpinned tasks by
+ * `updatedAt` and a bump would hoist whichever task was merely selected to
+ * the top as if it were pinned. Real lifecycle writes (explicit pause,
+ * escalation pause, reopen) keep the default bump.
  */
 export function updateTaskStatus(
   progress: TaskProgress,
-  status: TaskStatus
+  status: TaskStatus,
+  options?: { preserveFreshness?: boolean }
 ): TaskProgress {
   return {
     ...progress,
     status,
-    updatedAt: new Date().toISOString(),
+    updatedAt: options?.preserveFreshness
+      ? progress.updatedAt
+      : new Date().toISOString(),
   };
 }
 
@@ -293,15 +305,24 @@ export function recordEscalation(
  * Clear a recorded escalation — e.g. once the user resumes the task or the
  * stage moves on. Stage transitions call this so a stale escalation reason
  * from a previous stage never lingers into the next one.
+ *
+ * `preserveFreshness` skips the `updatedAt` bump for callers where the clear
+ * is a side effect of selecting/resuming a task rather than task progress
+ * (see `updateTaskStatus` — same recency-ordering rationale).
  */
-export function clearEscalation(progress: TaskProgress): TaskProgress {
+export function clearEscalation(
+  progress: TaskProgress,
+  options?: { preserveFreshness?: boolean }
+): TaskProgress {
   if (!progress.escalation) {
     return progress;
   }
   const { escalation: _unused, ...rest } = progress;
   return {
     ...rest,
-    updatedAt: new Date().toISOString(),
+    updatedAt: options?.preserveFreshness
+      ? progress.updatedAt
+      : new Date().toISOString(),
   };
 }
 
