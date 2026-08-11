@@ -71,7 +71,7 @@ const MIGRATED_ROUTE_IDS = [
  * Migrated action keys with NO registered legacy route id: internal-only
  * actions launched by the two-phase driver, never by a user-facing route.
  */
-const INTERNAL_MIGRATED_ACTION_KEYS = ["editExecution.v1"];
+const INTERNAL_MIGRATED_ACTION_KEYS = ["editExecution.v1", "renameTask.v1"];
 
 const GATE_SOURCE_PATH = path.resolve(
   __dirname,

@@ -1,7 +1,7 @@
 import * as assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import * as vscode from "vscode";
-import { getStageNodeContextValue, orderTasksForDisplay, StageNode } from "../views/taskTreeProvider";
+import { firstActiveInDisplayOrder, getStageNodeContextValue, orderTasksForDisplay, StageNode } from "../views/taskTreeProvider";
 import type { IncompleteTask } from "../types/incompleteTask";
 import { buildTaskContextValue, buildStageContextValue, CREATION_RECOVERY_CONTEXT_V1 } from "../utils/contextTokens";
 import {
@@ -109,6 +109,48 @@ void describe("orderTasksForDisplay", () => {
       ordered.map((t) => t.progress.displayName),
       ["aa rename", "zz rename"]
     );
+  });
+});
+
+void describe("firstActiveInDisplayOrder", () => {
+  function statusEntry(name: string, status?: string): IncompleteTask {
+    return {
+      folderUri: vscode.Uri.file(`/workspace/tasks/${name}`),
+      folderName: name,
+      progress: {
+        currentStage: "impl",
+        completedStages: [],
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        status,
+      },
+    } as unknown as IncompleteTask;
+  }
+
+  void it("skips leading completed/archived rows and picks the first active task", () => {
+    const first = firstActiveInDisplayOrder([
+      statusEntry("pinned-done", "completed"),
+      statusEntry("archived-old", "archived"),
+      statusEntry("working", "active"),
+      statusEntry("working-later", "active"),
+    ]);
+    assert.strictEqual(first?.folderName, "working");
+  });
+
+  void it("treats a task without a status as active", () => {
+    const first = firstActiveInDisplayOrder([
+      statusEntry("done", "completed"),
+      statusEntry("legacy-no-status", undefined),
+    ]);
+    assert.strictEqual(first?.folderName, "legacy-no-status");
+  });
+
+  void it("returns undefined when every task is completed or archived", () => {
+    const first = firstActiveInDisplayOrder([
+      statusEntry("done", "completed"),
+      statusEntry("gone", "archived"),
+    ]);
+    assert.strictEqual(first, undefined);
   });
 });
 

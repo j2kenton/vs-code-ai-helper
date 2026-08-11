@@ -191,7 +191,6 @@ function initMessage(overrides: InitOverrides = {}): Record<string, unknown> {
     },
     stageTitleOverrides: STAGE_TITLE_OVERRIDES,
     stageHints: STAGE_ROLE_HINTS,
-    quotaStatus: {},
     enabledProviders: overrides.enabledProviders ?? {},
     providers: overrides.providers ?? [],
     showProviderAccountActions: overrides.showProviderAccountActions ?? false,
@@ -222,8 +221,11 @@ void describe("AI Models view — static row template and captions", () => {
       "the backups caption is kept (shown only when backups exist)"
     );
     // Flagged-for-later strings stay byte-identical.
-    assert.ok(html.includes("No usage observed yet this session"));
     assert.ok(html.includes("Remove this backup model"));
+    // Quota status text no longer renders anywhere — the data keeps
+    // accruing underneath (utils/quota.ts), but the UI consumer is gone.
+    assert.ok(!html.includes("No usage observed yet this session"));
+    assert.ok(!html.includes("quota-text"));
     // Every row shares the uniform template: checkbox + combo + ×.
     assert.ok(html.includes('class="row-enabled"'));
     assert.ok(html.includes("modelRowHtml('primary'"));

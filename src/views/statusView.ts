@@ -4,7 +4,7 @@ import { taskOperations } from "../utils/taskOperations";
 import { TaskOperationSnapshot } from "../utils/taskOperations";
 import { terminalEntryFor } from "../utils/operationNotificationBridge";
 import { notificationFallbackUri } from "../utils/notificationContentProvider";
-import { formatTimeHHmm } from "../utils/timeFormat";
+import { formatTimestampForDisplay } from "../utils/timeFormat";
 
 export const STATUS_VIEW_ID = "vs-code-ai-helper.statusView";
 
@@ -246,9 +246,10 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
     const label = isTruncated ? `${element.message.slice(0, LABEL_TRUNCATE_LENGTH)}…` : element.message;
     const item = new vscode.TreeItem(label, vscode.TreeItemCollapsibleState.None);
 
-    // Displayed timestamp is HH:mm (seconds are noisy for the user); the
+    // Displayed timestamp is HH:mm for today and YYYY-MM-DD for any earlier
+    // day (a bare time is meaningless once the day has changed); the
     // underlying Date retains full precision and still drives ordering.
-    item.description = formatTimeHHmm(element.timestamp);
+    item.description = formatTimestampForDisplay(element.timestamp);
 
     // Click still always navigates to the notification's full text/target
     // (D11) — `actionCommand`, when present, is exposed as a separate inline

@@ -51,6 +51,19 @@ export function orderTasksForDisplay(visible: readonly IncompleteTask[]): Incomp
   return [...pinned, ...unpinned];
 }
 
+/**
+ * The first ACTIVE task in an already-display-ordered list — not `ordered[0]`,
+ * which can be a completed or archived row (e.g. a pinned finished task) that
+ * would otherwise swallow the auto-expansion while the actual working task
+ * stays collapsed. Returns undefined when every task is completed/archived.
+ * Exported for direct unit testing.
+ */
+export function firstActiveInDisplayOrder(ordered: readonly IncompleteTask[]): IncompleteTask | undefined {
+  return ordered.find(
+    (t) => t.progress.status !== "completed" && t.progress.status !== "archived"
+  );
+}
+
 type StageStatus = "done" | "current" | "outstanding";
 
 /**
@@ -836,14 +849,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
     const visible = tasks.filter(task => this.selectedStatuses.has(task.progress.status ?? "active"));
 
     const ordered = orderTasksForDisplay(visible);
-    const active = ordered.filter(
-      (t) => t.progress.status !== "completed" && t.progress.status !== "archived"
-    );
-    // The first ACTIVE task in display order — not ordered[0], which can be a
-    // completed or archived row (e.g. a pinned finished task) that would
-    // otherwise swallow the auto-expansion while the actual working task
-    // stays collapsed.
-    const firstActive = active[0];
+    const firstActive = firstActiveInDisplayOrder(ordered);
     const firstActiveId = firstActive !== undefined ? taskIdentityKey(firstActive) : undefined;
 
     const shouldExpand = (task: IncompleteTask): boolean => {

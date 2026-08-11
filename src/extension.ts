@@ -231,6 +231,10 @@ export function activate(context: vscode.ExtensionContext): void {
       return submitted.ok ? { ok: true } : { ok: false, reason: submitted.reason };
     },
     cancel: async (ref) => runChatConversationAction(() => chatConversationOrchestrator.cancel(ref)),
+    // Chat With AI hides (never deletes) the conversation of a task whose
+    // lifecycle status is completed/archived — resolved live from the shared
+    // inventory so resume/reopen surfaces the history again immediately.
+    getTaskStatus: (canonicalId) => inventory.getTaskById(canonicalId)?.progress.status,
     validateSend: async (target, _text) => {
       if (target.kind === "global") {
         return { ok: true };

@@ -13,7 +13,6 @@ import { attributionHeader, safeOpenTextDocument } from "../utils/fileUtils";
 import { ChatViewProvider, ChatInteractionRefV1, ChatInteractionResumeResultV1 } from "../views/chatView";
 import { assertLegacyAiRouteAllowedV0 } from "../services/legacyAiActionSafetyGateV0";
 
-import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { IncompleteTask } from "../types/incompleteTask";
 import {
   linkCancellationTokens,
@@ -89,14 +88,19 @@ export function normalizeDraftTaskArg(
   if (!arg) {
     return undefined;
   }
-  if ("task" in arg && arg.task) {
+  // Prefer the explicit resolver shape: the keyboard-shortcut router
+  // (applyCurrentStageAction) dispatches { canonicalId, taskFolderPath,
+  // task: { progress } } — a partial `task` with no folderUri — so the
+  // explicit fields must win before the tree-node branch touches folderUri.
+  const explicit = arg as { canonicalId?: string; taskFolderPath?: string };
+  if (explicit.canonicalId || explicit.taskFolderPath) {
+    return { canonicalId: explicit.canonicalId, taskFolderPath: explicit.taskFolderPath };
+  }
+  if ("task" in arg && arg.task && arg.task.folderUri?.fsPath) {
     return {
       canonicalId: arg.task.canonicalId,
       taskFolderPath: arg.task.folderUri.fsPath,
     };
-  }
-  if ("canonicalId" in arg && (arg.canonicalId || arg.taskFolderPath)) {
-    return { canonicalId: arg.canonicalId, taskFolderPath: arg.taskFolderPath };
   }
   return undefined;
 }
@@ -155,7 +159,6 @@ interface DraftOutcomeTaskRefV1 {
   readonly taskFolderPath: string;
   readonly canonicalId: string;
   readonly taskName?: string;
-  readonly nameIsDefault?: boolean;
 }
 
 interface DraftOutcomeContextV1 {
@@ -267,29 +270,8 @@ async function handleDraftOutcomeV1(
     }
     succeeded = true;
 
-    // Keep folder IDs stable, but replace the generated label when it has
-    // not been manually renamed. The draft's opening goal line is the best
-    // concise summary already produced without an extra model request, so
-    // it (not a nonexistent H1) is the task name. Skip `#`/`>` lines too: an
-    // unstructured-fallback draft opens with the "### Draft (unstructured)"
-    // heading followed by a "> The AI response was missing..." blockquote —
-    // neither is real draft content.
-    if (ctx.taskRef.nameIsDefault !== false) {
-      const title = draftWithAI
-        .split(/\r?\n/)
-        .map((line) => line.trim())
-        .find((line) => line.length > 0 && !line.startsWith("#") && !line.startsWith(">"));
-      if (title) {
-        await patchTaskProgressStrictV1(taskFolderUri, (current) => ({
-          ...current,
-          displayName: title.slice(0, 120),
-          // An AI-derived summary replaces the generated folder-name label.
-          // Treat it as established so later drafts cannot silently
-          // overwrite a title the user has accepted.
-          nameIsDefault: false,
-        }));
-      }
-    }
+    // Drafting never renames the task: naming is owned exclusively by the
+    // explicit Rename Task with AI action (renameTask.ts).
 
     await safeOpenTextDocument(taskFileUri, "task.md");
     NotificationRouter.showInformation("task.md updated with Draft with AI.");
@@ -556,7 +538,6 @@ async function draftTaskWithAIForResolvedTask(
             taskFolderPath: taskFolderUri.fsPath,
             canonicalId: resolvedTask.canonicalId ?? taskFolderUri.fsPath,
             taskName: resolvedTask.progress.displayName,
-            nameIsDefault: resolvedTask.progress.nameIsDefault,
           },
           chatViewProvider,
           orchestrator: getProductionActionConversationOrchestratorV1(),
@@ -692,7 +673,6 @@ export async function resumeDraftInteractionV1(
       taskFolderPath: ownedTask.taskFolderPath,
       canonicalId: ownedTask.canonicalId ?? ownedTask.taskFolderPath,
       taskName: ownedTask.progress.displayName,
-      nameIsDefault: ownedTask.progress.nameIsDefault,
     },
     chatViewProvider,
     orchestrator,

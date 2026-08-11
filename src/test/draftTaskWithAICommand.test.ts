@@ -361,13 +361,12 @@ void describe("draftTaskWithAI command (G18: Description-model routing regressio
         "the user's actual description must reach the model"
       );
 
-      // 4. The derived task name comes from the AI's draft response (the
-      //    opening goal line), driven by the SAME "desc"-stage model call —
-      //    not the placeholder text and not the raw folder slug.
+      // 4. Drafting never renames the task: naming is owned exclusively by
+      //    the explicit Rename Task with AI action (renameTask.ts), so the
+      //    default label and nameIsDefault flag must survive a draft.
       const persisted = await readTaskProgress(vscode.Uri.file(folderPath));
-      assert.equal(persisted?.nameIsDefault, false, "a drafted name must replace the default label");
-      assert.match(persisted?.displayName ?? "", /background export queue/i);
-      assert.doesNotMatch(persisted?.displayName ?? "", /Describe the work you want to do here/);
+      assert.equal(persisted?.nameIsDefault, true, "drafting must not claim the task name");
+      assert.equal(persisted?.displayName, undefined, "drafting must not set displayName");
 
       // 5. task.md's Task Description section is preserved untouched, and no
       //    fresh Open Questions section is emitted (plan §6.3).

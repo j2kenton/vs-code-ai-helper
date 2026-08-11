@@ -21,7 +21,7 @@ import {
   writeChatHistory,
 } from "../utils/chatHistoryStore";
 import { stripAttributionHeaders } from "../utils/fileUtils";
-import { formatTimeHHmm } from "../utils/timeFormat";
+import { formatTimestampForDisplay } from "../utils/timeFormat";
 import {
   decodeStructuredAnswersArrayV1,
   StructuredAnswerV1,
@@ -100,6 +100,16 @@ export interface ChatInteractionServicesV1 {
    * task to validate).
    */
   validateSend?(target: ChatTarget, text: string): Promise<ChatInteractionServiceResultV1>;
+  /**
+   * Resolve a task's current lifecycle status from the shared inventory.
+   * Used by render() to hide (never delete) the stored conversation of a
+   * completed/archived task; resume/reopen flips the status back to active
+   * and the history reappears automatically. Optional: when unset (tests,
+   * pre-wiring), every conversation renders as before. Returning undefined
+   * (unknown task) also renders normally rather than hiding history on a
+   * lookup miss.
+   */
+  getTaskStatus?(canonicalId: string): string | undefined;
 }
 
 export interface ChatTarget {
@@ -855,7 +865,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     let entries: ChatMessage[] = [];
     let interaction: ChatDocumentInteractionV1 | undefined;
     let errorMessage: string | undefined;
-    if (target) {
+    let emptyNotice: string | undefined;
+    // A completed/archived task's conversation is hidden, not deleted: skip
+    // the transcript read entirely and show an explanatory empty state. The
+    // history file stays on disk, and resume/reopen (which flips the status
+    // back to active) surfaces it again with no further work here.
+    const taskStatus =
+      target && target.kind !== "global"
+        ? this.interactionServices?.getTaskStatus?.(target.canonicalId)
+        : undefined;
+    const historyHidden = taskStatus === "completed" || taskStatus === "archived";
+    if (historyHidden) {
+      emptyNotice = `This task is ${taskStatus}, so its chat is hidden. Resume or reopen the task to see the conversation again.`;
+    } else if (target) {
       try {
         // Stage chats are fully isolated: a stage's view never shows another
         // stage's conversation. The global assistant's history lives in its
@@ -952,7 +974,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       return {
         ...entry,
         text: stripAttributionHeaders(entry.text),
-        atLabel: formatTimeHHmm(date),
+        atLabel: formatTimestampForDisplay(date),
         atTitle: date.toLocaleString(),
       };
     });
@@ -973,6 +995,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       busy,
       waitingForUser,
       errorMessage,
+      emptyNotice,
     });
   }
 
@@ -1016,7 +1039,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           gap: var(--ensemble-space-1);
           font-size: 0.85em;
           color: var(--vscode-descriptionForeground);
-          margin-bottom: 2px;
+          margin-top: 2px;
         }
         .msg-copy {
           background: none;
@@ -1075,6 +1098,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           }
         }
         #busy-indicator {
+          display: none;
+          margin: var(--ensemble-space-2) 0;
+          font-style: italic;
+          color: var(--vscode-descriptionForeground);
+        }
+        #empty-notice {
           display: none;
           margin: var(--ensemble-space-2) 0;
           font-style: italic;
@@ -1162,10 +1191,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       </head><body>
       <div id="context" role="status">Loading chat…</div><div id="messages" role="log" aria-live="polite" aria-label="Conversation"></div>
       <div id="interaction" role="form" aria-label="Question from the AI"></div>
+      <div id="empty-notice" role="status"></div>
       <div id="error" role="alert"></div>
       <div id="busy-indicator" role="status" aria-live="polite"><span id="busy-spinner" class="spinner"></span><span id="busy-text">Waiting for the AI…</span></div>
       <form id="form"><textarea id="message" rows="3" aria-label="Message the AI" placeholder="Message the AI… (Enter to send, Shift+Enter for a new line)"></textarea><button type="submit" title="Send message (Enter)">Send</button></form>
-      <script nonce="${nonce}">const v=acquireVsCodeApi(), c=document.getElementById('context'), m=document.getElementById('messages'), ic=document.getElementById('interaction'), e=document.getElementById('error'), b=document.getElementById('busy-indicator'), bs=document.getElementById('busy-spinner'), bt=document.getElementById('busy-text'), f=document.getElementById('form'), i=document.getElementById('message');
+      <script nonce="${nonce}">const v=acquireVsCodeApi(), c=document.getElementById('context'), m=document.getElementById('messages'), ic=document.getElementById('interaction'), en=document.getElementById('empty-notice'), e=document.getElementById('error'), b=document.getElementById('busy-indicator'), bs=document.getElementById('busy-spinner'), bt=document.getElementById('busy-text'), f=document.getElementById('form'), i=document.getElementById('message');
       const savedState = v.getState() || {};
       const scrollPositions = savedState.scrollPositions || {};
       let currentKey;
@@ -1292,13 +1322,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           const meta=document.createElement('div');meta.className='msg-meta';
           const time=document.createElement('span');time.className='msg-time';time.textContent=x.atLabel??'';time.title=x.atTitle??'';
           const copyBtn=document.createElement('button');copyBtn.type='button';copyBtn.className='msg-copy';copyBtn.title='Copy message';copyBtn.setAttribute('aria-label','Copy message');copyBtn.textContent='⧉';
-          copyBtn.addEventListener('click',()=>{navigator.clipboard.writeText(x.text);});
-          meta.appendChild(time);meta.appendChild(copyBtn);
+          let copyTimer;
+          copyBtn.addEventListener('click',()=>{
+            navigator.clipboard.writeText(x.text);
+            // Re-clicking restarts the ~1 s "copied" confirmation instead of
+            // letting a stale timer revert the fresh checkmark early.
+            if(copyTimer!==undefined)clearTimeout(copyTimer);
+            copyBtn.textContent='✓';copyBtn.setAttribute('aria-label','Copied');copyBtn.title='Copied';
+            copyTimer=setTimeout(()=>{copyTimer=undefined;copyBtn.textContent='⧉';copyBtn.setAttribute('aria-label','Copy message');copyBtn.title='Copy message';},1000);
+          });
+          meta.appendChild(copyBtn);meta.appendChild(time);
           const d=document.createElement('p');d.className=x.role==='user'?'msg-user':'msg-agent';d.textContent='['+x.role+(x.pending?' — awaiting your answer':'')+'] '+x.text;
-          row.appendChild(meta);row.appendChild(d);
+          row.appendChild(d);row.appendChild(meta);
           return row;
         }));
         renderInteraction(s.interaction);
+        en.textContent=s.emptyNotice??'';en.style.display=s.emptyNotice?'block':'none';
         e.textContent=s.errorMessage??'';e.style.display=s.errorMessage?'block':'none';
         if(s.busy){bs.style.display='inline-block';bt.textContent='Waiting for the AI…';b.style.display='block';}
         else if(s.waitingForUser){bs.style.display='none';bt.textContent='Waiting for your answer';b.style.display='block';}

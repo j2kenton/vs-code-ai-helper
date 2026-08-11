@@ -35,6 +35,7 @@ import { createApplyReviewRowV1 } from "./rows/applyReviewRowV1";
 import { createChatSendRowV1 } from "./rows/chatSendRowV1";
 import { createGlobalAssistantSendRowV1 } from "./rows/globalAssistantSendRowV1";
 import { createCommitPushMetadataRowV1 } from "./rows/commitPushMetadataRowV1";
+import { createRenameTaskRowV1 } from "./rows/renameTaskRowV1";
 import { createCommitPushRowV1 } from "./rows/commitPushRowV1";
 import { createNextStageRowV1 } from "./rows/nextStageRowV1";
 import { createMarkTaskDoneRowV1 } from "./rows/markTaskDoneRowV1";
@@ -82,6 +83,7 @@ export function getProductionTaskActionRegistryV1(): TaskActionRegistryV1 {
       createChatSendRowV1(),
       createGlobalAssistantSendRowV1(),
       createCommitPushMetadataRowV1(),
+      createRenameTaskRowV1(),
       createCommitPushRowV1(),
       createNextStageRowV1(),
       createMarkTaskDoneRowV1(),

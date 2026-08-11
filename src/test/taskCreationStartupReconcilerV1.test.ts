@@ -504,6 +504,7 @@ void describe("TaskCreationStartupReconcilerV1", () => {
       ["creation-seed-legacy-instructions-user-description.md", "legacy-instructions-user-description-seed.md"],
       ["creation-seed-legacy-single-body-task.md", "legacy-single-body-task-seed.md"],
       ["creation-seed-legacy-early-inline-fallback.md", "legacy-early-inline-fallback-seed.md"],
+      ["creation-seed-legacy-v1-bare.md", "legacy-v1-bare-seed.md"],
     ];
 
     for (const [resourceFileName, fixtureFileName] of SHIPPED_TO_FIXTURE_PAIRS) {

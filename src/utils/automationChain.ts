@@ -36,6 +36,19 @@ export interface AutomationDispatch {
    * an explicit chainId such as "auto-review".
    */
   chainId?: string;
+  /**
+   * Fire-time re-check for automatic chains: evaluated immediately before
+   * the command is executed (both the immediate and the deferred dispatch
+   * paths). When it returns false the chain is dropped — the guard slot is
+   * released and the schedule promise resolves false without dispatching.
+   *
+   * Automatic schedulers attach a closure over their settings gate (e.g.
+   * `() => resolveAutoRunMode(kind) !== "off"`), so a chain queued while an
+   * automation option was on is dropped at fire time if the user has since
+   * turned the option off. Manual invocations never route through this
+   * module and are unaffected.
+   */
+  stillEnabled?: () => boolean;
 }
 
 /** Snapshot shape scheduleAutomationChain needs from an ended operation. */
@@ -164,6 +177,10 @@ export function scheduleAutomationChain(
   }
   const rootOperationId = rootOperation?.id;
   if (!rootOperationId) {
+    if (dispatch.stillEnabled && !dispatch.stillEnabled()) {
+      release();
+      return Promise.resolve(false); // Automation disabled since scheduling — dropped.
+    }
     return Promise.resolve(deps.execute(dispatch.command, dispatch.arg)).then(
       () => {
         release();
@@ -182,6 +199,13 @@ export function scheduleAutomationChain(
       }
       endSub.dispose();
       if (snapshot.state === "succeeded") {
+        if (dispatch.stillEnabled && !dispatch.stillEnabled()) {
+          // Automation disabled between scheduling and the root operation
+          // ending — drop the chain at fire time.
+          release();
+          resolve(false);
+          return;
+        }
         // Fire-and-forget: the root operation has already ended, so nothing
         // is awaiting this chain — surface failures through the command's
         // own error handling. The guard slot is held until the command

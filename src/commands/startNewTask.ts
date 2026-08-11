@@ -259,8 +259,10 @@ export async function loadTaskTemplate(extensionUri: vscode.Uri): Promise<string
     const bytes = await vscode.workspace.fs.readFile(templateUri);
     return new TextDecoder().decode(bytes);
   } catch (error) {
-    // Fallback to inline template if file read fails
-    return "# Task\n\n## Task Description\n\n## Draft with AI\n";
+    // Fallback to inline template if file read fails — must stay
+    // byte-identical to resources/prompts/task-template.md (see
+    // test-fixtures/creation-seeds/README.md).
+    return "# Task\n\n## Task Description\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n## Draft with AI\n\n[Click the Draft with AI button, or press Ctrl+Shift+Alt+I]\n";
   }
 }
 

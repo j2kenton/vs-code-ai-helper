@@ -285,6 +285,9 @@ export function scheduleAutomaticImplementationAfterReview(
       command: "vs-code-ai-helper.runImplementationWithAI",
       arg: { taskFolderPath },
       taskKey: taskFolderPath,
+      // Re-checked at fire time: the review that scheduled this can run for
+      // minutes, and the user may disable auto-implement in the meantime.
+      stillEnabled: () => isAutoImplementAfterReviewEnabled(),
     },
     parentOperation
   );
@@ -397,6 +400,11 @@ type ReviewCommandArg =
  * Extract the chained follow-up-review request from a ReviewCommandArg, if
  * present. Only the exact "auto-fast-forward" marker is honored — anything
  * else (including args from UI surfaces) yields undefined.
+ *
+ * The marker is re-validated against the setting that minted it: it was
+ * only ever attached while "Complete & Move On triggers AI" was
+ * "auto-fast-forward", so if that setting has since been turned off or
+ * downgraded, a queued/stale arg must not resurrect the disabled loop.
  */
 function chainedFollowUpReviewMode(
   arg: ReviewCommandArg
@@ -404,7 +412,8 @@ function chainedFollowUpReviewMode(
   return arg &&
     typeof arg === "object" &&
     "followUpReviewMode" in arg &&
-    arg.followUpReviewMode === "auto-fast-forward"
+    arg.followUpReviewMode === "auto-fast-forward" &&
+    getCompleteAndMoveOnTriggersAIMode() === "auto-fast-forward"
     ? arg.followUpReviewMode
     : undefined;
 }
@@ -620,7 +629,12 @@ export function normalizeReviewArg(arg: ReviewCommandArg): TaskNodeArg {
   if (!arg || typeof arg !== "object") {
     return {};
   }
-  if ("task" in arg && arg.task) {
+  // The task branch requires a real folderUri: the keyboard-shortcut router
+  // (applyCurrentStageAction) dispatches { canonicalId, taskFolderPath,
+  // task: { progress } } — a partial task with no folderUri — which must fall
+  // through to the { taskFolderPath } branch below instead of reaching
+  // resolveTask, where `node.task.folderUri.fsPath` would throw.
+  if ("task" in arg && arg.task && arg.task.folderUri?.fsPath) {
     return arg;
   }
   // Caller passed { taskFolderPath }
@@ -672,7 +686,7 @@ async function resolveTask(
   title: string,
   context: vscode.ExtensionContext
 ): Promise<ResolvedTask | undefined> {
-  if (node?.task) {
+  if (node?.task?.folderUri?.fsPath) {
     const folderUri = node.task.folderUri;
     // Strict decode (plan §3.10/§3.12 Text-3 cutover): this is the single
     // most common resolution path shared by every review-family command, so
@@ -2006,6 +2020,9 @@ async function routeReviewOutcomeV1(
                     },
                     taskKey: folderUri.fsPath,
                     chainId: "auto-review",
+                    // Dropped at fire time if auto-advance was turned off
+                    // while this chain waited for the root operation to end.
+                    stillEnabled: () => isAutoAdvanceEnabled(),
                   },
                   operation
                 );
@@ -4102,6 +4119,7 @@ export async function nextStage(
         command: "vs-code-ai-helper.generatePlanWithAI",
         arg: target,
         taskKey,
+        stillEnabled: () => completeAndMoveOnTriggersAI(),
       });
       return;
     }
@@ -4113,6 +4131,7 @@ export async function nextStage(
         command: "vs-code-ai-helper.runImplementationWithAI",
         arg: target,
         taskKey,
+        stillEnabled: () => completeAndMoveOnTriggersAI(),
       });
       return;
     }
@@ -4126,7 +4145,13 @@ export async function nextStage(
       const publishCommand = getCompleteAndMoveOnTriggersAIMode() === "auto-fast-forward"
         ? "vs-code-ai-helper.fastForwardReviewWithAI"
         : "vs-code-ai-helper.runReviewWithAI";
-      const reviewScheduled = await scheduleAutomationChain({ command: publishCommand, arg: target, taskKey, chainId: "auto-review" });
+      const reviewScheduled = await scheduleAutomationChain({
+        command: publishCommand,
+        arg: target,
+        taskKey,
+        chainId: "auto-review",
+        stillEnabled: () => completeAndMoveOnTriggersAI(),
+      });
       if (!reviewScheduled) {
         // Dropped by the shared "auto-review" duplicate-chain guard — some
         // other review chain for this task is already pending or running.
@@ -4232,6 +4257,7 @@ export async function nextStage(
       },
       taskKey: resolved.folderUri.fsPath,
       chainId: "auto-review",
+      stillEnabled: () => completeAndMoveOnTriggersAI(),
     });
   }
 }
@@ -5263,17 +5289,31 @@ async function executeImplementationRun(
     // operation still holds that lock the chain scheduler defers the dispatch
     // until the root operation ends successfully. Both share the
     // "auto-review" chainId so they can never duplicate each other.
-    const dispatchReviewChainAfterLockRelease = (command: string): void => {
+    const dispatchReviewChainAfterLockRelease = (
+      command: string,
+      stillEnabled: () => boolean
+    ): void => {
       void scheduleAutomationChain(
         {
           command,
           arg: { taskFolderPath: folderUri.fsPath },
           taskKey: folderUri.fsPath,
           chainId: "auto-review",
+          // Re-checked immediately before dispatch: the root operation can
+          // hold the lock for minutes, and the user may turn the automation
+          // off in the meantime — the queued chain must then drop.
+          stillEnabled,
         },
         options.parentOperation
       );
     };
+    // Chained "auto-fast-forward" marker re-validated at fire time against
+    // the setting that minted it (see chainedFollowUpReviewMode).
+    const fireTimeFollowUpMode = (): "auto-fast-forward" | undefined =>
+      options.followUpReviewMode === "auto-fast-forward" &&
+      getCompleteAndMoveOnTriggersAIMode() === "auto-fast-forward"
+        ? options.followUpReviewMode
+        : undefined;
     if (isAutoAdvanceEnabled()) {
       try {
         const freshProgress = await readTaskProgressAdvisoryV1(folderUri);
@@ -5299,7 +5339,9 @@ async function executeImplementationRun(
                   options.followUpReviewMode
                 ) === "auto-fast-forward"
                   ? "vs-code-ai-helper.fastForwardReviewWithAI"
-                  : "vs-code-ai-helper.runReviewWithAI"
+                  : "vs-code-ai-helper.runReviewWithAI",
+                () =>
+                  strongestAutoTriggerMode(getAutoAdvanceMode(), fireTimeFollowUpMode()) !== "off"
               );
             }
           }
@@ -5326,7 +5368,12 @@ async function executeImplementationRun(
         dispatchReviewChainAfterLockRelease(
           reviewMode === "auto-fast-forward"
             ? "vs-code-ai-helper.fastForwardReviewWithAI"
-            : "vs-code-ai-helper.runReviewWithAI"
+            : "vs-code-ai-helper.runReviewWithAI",
+          () =>
+            strongestAutoTriggerMode(
+              getAutoReviewAfterImplementationMode(),
+              fireTimeFollowUpMode()
+            ) !== "off"
         );
       }
     }

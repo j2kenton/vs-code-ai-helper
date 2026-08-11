@@ -319,39 +319,34 @@ void describe("provider CLI contracts", () => {
       );
     }
 
-    // Guard against the loop above passing vacuously: Antigravity is the
-    // known exception and must actually be flagged, naming the real flag so
-    // the warning means something to someone reading it.
-    const antigravity = getCliProvider("antigravity-cli");
-    assert.ok(
-      antigravity?.permissionWarning,
-      "expected Antigravity to carry a permission warning"
-    );
-    assert.match(
-      antigravity.permissionWarning,
-      /--dangerously-skip-permissions/
-    );
-
-    // Same guard for Cline: its warning must actually name the mechanism
-    // (--plan being non-enforcing, run_commands staying auto-approved), not
-    // just exist.
-    const cline = getCliProvider("cline-cli");
-    assert.ok(
-      cline?.permissionWarning,
-      "expected Cline to carry a permission warning"
-    );
-    assert.match(cline.permissionWarning, /--plan/);
-    assert.match(cline.permissionWarning, /run_commands/);
-
-    // Same guard for Kimi: its warning must name the mechanism (that
-    // --plan cannot even be combined with -p), not just exist.
-    const kimi = getCliProvider("kimi-cli");
-    assert.ok(
-      kimi?.permissionWarning,
-      "expected Kimi Code CLI to carry a permission warning"
-    );
-    assert.match(kimi.permissionWarning, /--plan/);
-    assert.match(kimi.permissionWarning, /-p/);
+    // Guard against the loop above passing vacuously: each known exception
+    // must actually be flagged, and its user-facing warning must lead with
+    // the concrete risk in plain language (the CLI-flag mechanics live in
+    // the provider definitions' code comments, not in the warning the user
+    // reads) and stay a warning-sized message, not an essay.
+    for (const id of ["antigravity-cli", "cline-cli", "kimi-cli"] as const) {
+      const provider = getCliProvider(id);
+      assert.ok(provider?.permissionWarning, `expected ${id} to carry a permission warning`);
+      assert.match(
+        provider.permissionWarning,
+        /create, change, or delete any file and run shell commands without asking/,
+        `${id}'s warning must lead with the concrete risk in plain language`
+      );
+      assert.match(
+        provider.permissionWarning,
+        /every stage including plan and review/,
+        `${id}'s warning must say the risk applies to every stage`
+      );
+      assert.doesNotMatch(
+        provider.permissionWarning,
+        /unlike|other providers|applies to .* only/i,
+        `${id}'s warning must not compare against other providers`
+      );
+      assert.ok(
+        provider.permissionWarning.length <= 220,
+        `${id}'s warning must stay short (${provider.permissionWarning.length} chars)`
+      );
+    }
   });
 
   void it("Kimi carries the whole prompt in a temp file, never in argv", () => {
@@ -964,6 +959,19 @@ void describe("provider CLI contracts", () => {
         }
       }
     }
+  });
+
+  void it("orders Provider Selection with devpass-code first and Antigravity last", () => {
+    assert.strictEqual(
+      PROVIDER_ACCOUNT_ENTRIES[0]?.id,
+      "devpass-cli",
+      "devpass-code leads Provider Selection"
+    );
+    assert.strictEqual(
+      PROVIDER_ACCOUNT_ENTRIES[PROVIDER_ACCOUNT_ENTRIES.length - 1]?.id,
+      "antigravity-cli",
+      "Antigravity stays last"
+    );
   });
 
   void it("provider account entries carry the usage capability matrix", () => {

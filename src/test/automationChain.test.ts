@@ -187,6 +187,60 @@ void test("chains dispatching different commands share an explicit chainId guard
   assert.equal(chain.executed.length, 2);
 });
 
+void test("stillEnabled=false at immediate dispatch drops the chain and releases the guard", async () => {
+  resetAutomationChainGuards();
+  const chain = makeFakeChain();
+  const result = await scheduleAutomationChain(
+    { command: "x.review", taskKey: "/task-a", stillEnabled: () => false },
+    undefined,
+    chain.deps
+  );
+  assert.equal(result, false, "a disabled automation must not dispatch");
+  assert.equal(chain.executed.length, 0);
+  assert.equal(
+    isAutomationChainActive("/task-a", "x.review"),
+    false,
+    "the guard slot must be released so a later chain is not blocked"
+  );
+});
+
+void test("stillEnabled flipping to false between schedule and the deferred fire drops the chain at fire time", async () => {
+  resetAutomationChainGuards();
+  const chain = makeFakeChain();
+  let enabled = true;
+  const pending = scheduleAutomationChain(
+    { command: "x.fastForward", taskKey: "/task-a", stillEnabled: () => enabled },
+    { id: "root-1" },
+    chain.deps
+  );
+  // The user turns the automation option off while the root operation runs.
+  enabled = false;
+  chain.end({ id: "root-1", state: "succeeded" });
+  assert.equal(await pending, false, "the queued chain must be dropped at fire time");
+  assert.equal(chain.executed.length, 0);
+  assert.equal(isAutomationChainActive("/task-a", "x.fastForward"), false);
+  assert.equal(chain.listenerCount(), 0, "listener must be disposed after the drop");
+});
+
+void test("stillEnabled=true dispatches normally on both the immediate and deferred paths", async () => {
+  resetAutomationChainGuards();
+  const chain = makeFakeChain();
+  const immediate = await scheduleAutomationChain(
+    { command: "x.review", taskKey: "/task-a", stillEnabled: () => true },
+    undefined,
+    chain.deps
+  );
+  assert.equal(immediate, true);
+  const deferred = scheduleAutomationChain(
+    { command: "x.review", taskKey: "/task-b", stillEnabled: () => true },
+    { id: "root-1" },
+    chain.deps
+  );
+  chain.end({ id: "root-1", state: "succeeded" });
+  assert.equal(await deferred, true);
+  assert.equal(chain.executed.length, 2);
+});
+
 void test("a review handing off to the next review stage under the same chainId, from inside its own still-pending dispatch, is not silently dropped", async () => {
   // Regression: a review that auto-advances directly into the next review
   // stage (e.g. plan-high-review scoring above threshold -> plan-low-review)

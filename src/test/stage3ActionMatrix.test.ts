@@ -118,14 +118,15 @@ void describe("Stage 3 action matrix contracts", () => {
   });
 
   void it("uses the same canonical task document template in packaged and fallback templates", () => {
-    const expected = "# Task\n\n## Task Description\n\n## Draft with AI\n";
+    const expected =
+      "# Task\n\n## Task Description\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n## Draft with AI\n\n[Click the Draft with AI button, or press Ctrl+Shift+Alt+I]\n";
     const packagedTemplate = readWorkspaceFile(
       path.join("resources", "prompts", "task-template.md")
     ).replace(/\r\n/g, "\n");
     assert.equal(packagedTemplate, expected);
     assert.match(
       readWorkspaceFile(path.join("src", "commands", "startNewTask.ts")),
-      /return "# Task\\n\\n## Task Description\\n\\n## Draft with AI\\n"/
+      /return "# Task\\n\\n## Task Description(?:\\n){16}## Draft with AI\\n\\n\[Click the Draft with AI button, or press Ctrl\+Shift\+Alt\+I\]\\n"/
     );
   });
 

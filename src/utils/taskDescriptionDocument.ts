@@ -6,6 +6,21 @@ export const INTRO_TEXT = `Describe the work you want to do here in as much deta
 export const LEGACY_INTRO_TEXT = `Briefly describe what changes you want to be made, and then use AI to help you clarify the plan.`;
 export const SHORTCUT_NOTE = `Shortcut: Apply Current Stage Action (Ctrl+Shift+Alt+I).`;
 
+/**
+ * Bracketed hint rendered under `## Draft with AI` while the draft body is
+ * empty, pointing at the button and the same shortcut SHORTCUT_NOTE names.
+ * Stripped on parse exactly like INTRO_TEXT/SHORTCUT_NOTE so it never leaks
+ * into taskDescription or the draft body.
+ */
+export const DRAFT_WITH_AI_HINT = `[Click the Draft with AI button, or press Ctrl+Shift+Alt+I]`;
+
+/**
+ * Blank lines emitted between `## Task Description` and `## Draft with AI`
+ * while the description is empty: an obvious typing area in the raw editor
+ * (Markdown collapses them on render — that is accepted).
+ */
+export const EMPTY_DESCRIPTION_GAP_LINES = 15;
+
 export interface ParsedTaskDocument {
   introText: string;
   shortcutNote?: string;
@@ -87,7 +102,10 @@ export function parseTaskDocument(content: string): ParsedTaskDocument {
     } else if (section.header === "## Task Description") {
       taskDescBodies.push(bodyText);
     } else if (section.header === "## Draft with AI") {
-      draftBodies.push(bodyText);
+      const withoutHint = bodyText.replace(DRAFT_WITH_AI_HINT, "").trim();
+      if (withoutHint.length > 0) {
+        draftBodies.push(withoutHint);
+      }
     } else if (section.header === "## Open Questions") {
       questionsBodies.push(bodyText);
     } else {
@@ -126,13 +144,22 @@ export function buildTaskDocument(parsed: ParsedTaskDocument): string {
   if (taskDesc) {
     parts.push("");
     parts.push(taskDesc);
+    parts.push("");
+  } else {
+    // An empty description gets a tall blank typing area so the user can see
+    // where their text goes (EMPTY_DESCRIPTION_GAP_LINES blank lines).
+    for (let i = 0; i < EMPTY_DESCRIPTION_GAP_LINES; i++) {
+      parts.push("");
+    }
   }
-  parts.push("");
   parts.push("## Draft with AI");
   const draftBody = parsed.draftWithAI ? parsed.draftWithAI.replace(/\r\n/g, "\n").trim() : "";
   if (draftBody) {
     parts.push("");
     parts.push(draftBody);
+  } else {
+    parts.push("");
+    parts.push(DRAFT_WITH_AI_HINT);
   }
 
   return parts.join("\n") + "\n";

@@ -490,6 +490,9 @@ void describe("Complete & Move On auto-fast-forward chaining", () => {
       dispatchSeam,
       // The standalone setting is OFF — only the chained request may fire.
       patch(settingsModule, "getAutoReviewAfterPlanMode", () => "off"),
+      // The chained marker is only honored while the setting that minted it
+      // still says auto-fast-forward — the receiver re-validates it.
+      patch(settingsModule, "getCompleteAndMoveOnTriggersAIMode", () => "auto-fast-forward"),
       patch(modelSelectionModule, "resolveFreshModelForStage", () =>
         Promise.resolve({ source: "settings", modelId: "stub:model" })),
       patch(runnerRegistryModule, "checkRunnerAvailabilityForModel", () =>
@@ -592,6 +595,74 @@ void describe("Complete & Move On auto-fast-forward chaining", () => {
       const persisted = await readTaskProgress(vscode.Uri.file(folderPath));
       assert.equal(persisted?.currentStage, "plan", "no chained request → no review-stage advance");
       assert.equal(dispatches.length, 0, "no follow-up review dispatched");
+    } finally {
+      for (const p of patches.reverse()) { p.restore(); }
+      runtime.tearDown();
+      wsStub.restore();
+      fsBridge.restore();
+      provider.dispose();
+      deactivateNotificationRouter();
+    }
+  });
+
+  void it("a stale chained marker is dropped when Complete & Move On triggers AI is no longer auto-fast-forward", async () => {
+    const { folderPath } = makeTaskFolder(`plan_stale_${Math.floor(Math.random() * 1e9)}`, "desc");
+
+    const provider = new StatusTreeProvider();
+    initNotificationRouter(provider);
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const { dispatches, patched: dispatchSeam } = recordDispatches();
+
+    const inventory = {
+      getTaskById: (): undefined => undefined,
+      getTaskByPath: (
+        fsPath: string
+      ): { taskFolderPath: string; workspaceFolder: vscode.Uri; canonicalId: string; progress: { status: string; currentStage: string } } => ({
+        taskFolderPath: fsPath,
+        workspaceFolder: vscode.Uri.file(REAL_ROOT),
+        canonicalId: fsPath,
+        progress: { status: "active", currentStage: "desc" },
+      }),
+      refresh: (): Promise<void> => Promise.resolve(),
+    } as unknown as TaskInventory;
+
+    const runtime = setUpTaskActionRuntimeForTestV1();
+    const patches: Patched[] = [
+      dispatchSeam,
+      patch(settingsModule, "getAutoReviewAfterPlanMode", () => "off"),
+      // The user downgraded the originating setting after the chain carrying
+      // the marker was queued — the receiver must not honor the stale arg.
+      patch(settingsModule, "getCompleteAndMoveOnTriggersAIMode", () => "auto"),
+      patch(modelSelectionModule, "resolveFreshModelForStage", () =>
+        Promise.resolve({ source: "settings", modelId: "stub:model" })),
+      patch(runnerRegistryModule, "checkRunnerAvailabilityForModel", () =>
+        Promise.resolve({ availability: { available: true }, providerLabel: "Stub Provider" })),
+      patch(
+        copilotLmTransportModule,
+        "createCopilotLmTextTransportV1",
+        fakeCompletedCopilotTransportFactory("# Plan\n\n1. Generated.\n")
+      ),
+      patch(contextPackModule, "generateContextPack", () => Promise.resolve("# Context Pack (stub)\n")),
+      patch(contextPackModule, "writeContextPackContent", () => Promise.resolve(undefined)),
+      patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.resolve("stub prompt")),
+      patch(promptSizeGuardModule, "checkAndConfirmPromptSize", () => Promise.resolve("ok")),
+      patch(runLogModule, "writeRunLog", () => Promise.resolve(undefined)),
+      patch(fileUtilsModule, "safeOpenTextDocument", () => Promise.resolve(undefined)),
+    ];
+
+    const context = makeExtensionContext();
+
+    try {
+      const succeeded = await generatePlanWithAI(context, inventory, fakeChatViewProviderV1, {
+        taskFolderPath: folderPath,
+        followUpReviewMode: "auto-fast-forward",
+      });
+      assert.equal(succeeded, true, "plan generation completed");
+
+      const persisted = await readTaskProgress(vscode.Uri.file(folderPath));
+      assert.equal(persisted?.currentStage, "plan", "revoked chained request → no review-stage advance");
+      assert.equal(dispatches.length, 0, "revoked chained request → no follow-up review dispatched");
     } finally {
       for (const p of patches.reverse()) { p.restore(); }
       runtime.tearDown();

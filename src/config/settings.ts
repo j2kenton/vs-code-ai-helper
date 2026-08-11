@@ -42,19 +42,44 @@ const ALL_SETTING_KEYS = [
   COMPLETION_CHECK_TIMEOUT_MS_KEY,
 ] as const;
 
+/** Legacy keys already reported this session — one console notice per key. */
+const reportedLegacySettingKeys = new Set<string>();
+
+const SETTING_SCOPE_FIELDS = ["workspaceFolderValue", "workspaceValue", "globalValue"] as const;
+
 /**
- * Read a setting without allowing the active schema default to mask an
- * explicitly configured legacy value during the compatibility window.
- * Values are resolved at each scope before proceeding to the next one.
+ * Read a setting from the `ensemble.*` namespace, consulting the deprecated
+ * `vs-code-ai-helper.*` twin ONLY when no `ensemble.*` value is explicitly
+ * configured at any scope.
+ *
+ * The namespaces are deliberately not interleaved per scope: a leftover
+ * legacy workspace value must never shadow an `ensemble.*` value the user
+ * just wrote from the Settings UI (which writes global scope) — that
+ * shadowing is exactly the "I turned it off and it still runs" failure mode.
+ * Leftover legacy values are surfaced with a one-time console notice per
+ * key; user settings are never silently deleted.
  */
 function readSetting<T>(key: string, fallback: T, resource?: vscode.Uri): T {
   const activeConfiguration = vscode.workspace.getConfiguration(CONFIG_SECTION, resource);
-  const legacyConfiguration = vscode.workspace.getConfiguration(LEGACY_CONFIG_SECTION, resource);
   const active = activeConfiguration.inspect<T>(key);
-  const legacy = legacyConfiguration.inspect<T>(key);
-  for (const field of ["workspaceFolderValue", "workspaceValue", "globalValue"] as const) {
-    if (active?.[field] !== undefined) return active[field] as T;
-    if (legacy?.[field] !== undefined) return legacy[field] as T;
+  if (SETTING_SCOPE_FIELDS.some((field) => active?.[field] !== undefined)) {
+    for (const field of SETTING_SCOPE_FIELDS) {
+      if (active?.[field] !== undefined) return active[field] as T;
+    }
+  } else {
+    const legacy = vscode.workspace.getConfiguration(LEGACY_CONFIG_SECTION, resource).inspect<T>(key);
+    for (const field of SETTING_SCOPE_FIELDS) {
+      if (legacy?.[field] !== undefined) {
+        if (!reportedLegacySettingKeys.has(key)) {
+          reportedLegacySettingKeys.add(key);
+          console.warn(
+            `Ensemble: using deprecated setting "${LEGACY_CONFIG_SECTION}.${key}". ` +
+              `Move the value to "${CONFIG_SECTION}.${key}" — the legacy key is ignored whenever any "${CONFIG_SECTION}.${key}" value is set.`
+          );
+        }
+        return legacy[field] as T;
+      }
+    }
   }
   // inspect() is authoritative for explicit-value precedence.  get() is only
   // the final schema-default fallback (and keeps lightweight configuration
@@ -130,9 +155,51 @@ function readAutoTriggerMode(key: string, defaultMode: AutoTriggerMode): AutoTri
   return defaultMode;
 }
 
+/**
+ * The kinds of automatic AI follow-up a completed operation can start. Each
+ * maps to one three-state setting; resolveAutoRunMode below is the single
+ * dispatch-time gate every automatic entry point consults (directly, or via
+ * the thin mode getters that delegate to it).
+ */
+export type AutoRunKind =
+  | "autoAdvance"
+  | "autoReviewAfterPlan"
+  | "autoReviewAfterImplementation"
+  | "completeAndMoveOn";
+
+/**
+ * Single dispatch-time gate for automatic runs (auto-advance, auto-review
+ * after plan/implementation, complete-and-move-on triggers). Reads the
+ * setting fresh on every call — never cached — so turning an option off in
+ * Settings stops the next automatic dispatch at the source.
+ *
+ * `callerMode` is a chained "auto-fast-forward" request carried on a
+ * dispatched command's arg (minted by "Complete & Move On triggers AI:
+ * auto-fast-forward"). It is re-validated here rather than trusted: the
+ * marker only counts while that originating setting still says
+ * "auto-fast-forward", so an arg queued before the user turned the option
+ * off cannot resurrect a disabled automation.
+ */
+export function resolveAutoRunMode(kind: AutoRunKind, callerMode?: AutoTriggerMode): AutoTriggerMode {
+  const base =
+    kind === "autoAdvance"
+      ? readAutoTriggerMode(AUTO_ADVANCE_ENABLED_KEY, "off")
+      : kind === "autoReviewAfterPlan"
+        ? readAutoTriggerMode(AUTO_REVIEW_AFTER_PLAN_KEY, "off")
+        : kind === "autoReviewAfterImplementation"
+          ? readAutoTriggerMode(AUTO_REVIEW_AFTER_IMPLEMENTATION_KEY, "off")
+          : readAutoTriggerMode(COMPLETE_AND_MOVE_ON_TRIGGERS_AI_KEY, "auto");
+  const revalidatedCallerMode =
+    callerMode === "auto-fast-forward" &&
+    readAutoTriggerMode(COMPLETE_AND_MOVE_ON_TRIGGERS_AI_KEY, "auto") === "auto-fast-forward"
+      ? callerMode
+      : undefined;
+  return strongestAutoTriggerMode(base, revalidatedCallerMode);
+}
+
 /** Mode for starting the destination stage's AI action after completing a stage. */
 export function getCompleteAndMoveOnTriggersAIMode(): AutoTriggerMode {
-  return readAutoTriggerMode(COMPLETE_AND_MOVE_ON_TRIGGERS_AI_KEY, "auto");
+  return resolveAutoRunMode("completeAndMoveOn");
 }
 
 /** Whether completing a stage automatically starts the destination stage's AI action. */
@@ -598,7 +665,7 @@ export function getFastForwardMaxIterations(): number {
 
 /** Mode for score-threshold auto-advance. */
 export function getAutoAdvanceMode(): AutoTriggerMode {
-  return readAutoTriggerMode(AUTO_ADVANCE_ENABLED_KEY, "off");
+  return resolveAutoRunMode("autoAdvance");
 }
 
 export function isAutoAdvanceEnabled(): boolean {
@@ -792,12 +859,12 @@ export function usesAcceptanceThresholdForFastForward(): boolean {
 
 /** Mode for auto-review after AI drafts a plan. */
 export function getAutoReviewAfterPlanMode(): AutoTriggerMode {
-  return readAutoTriggerMode(AUTO_REVIEW_AFTER_PLAN_KEY, "off");
+  return resolveAutoRunMode("autoReviewAfterPlan");
 }
 
 /** Mode for auto-review after AI completes initial implementation. */
 export function getAutoReviewAfterImplementationMode(): AutoTriggerMode {
-  return readAutoTriggerMode(AUTO_REVIEW_AFTER_IMPLEMENTATION_KEY, "off");
+  return resolveAutoRunMode("autoReviewAfterImplementation");
 }
 
 /** Whether implementation/Fast Forward runs may proceed without prompting when the workspace has unrelated uncommitted changes. */

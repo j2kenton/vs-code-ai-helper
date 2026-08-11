@@ -26,6 +26,7 @@ import { assertLegacyAiRouteAllowedV0 } from "../services/legacyAiActionSafetyGa
 import {
   AutoTriggerMode,
   getAutoReviewAfterPlanMode,
+  getCompleteAndMoveOnTriggersAIMode,
   strongestAutoTriggerMode,
 } from "../config/settings";
 import { scheduleAutomationChain } from "../utils/automationChain";
@@ -123,8 +124,13 @@ export function normalizeGeneratePlanArg(
     return arg;
   }
 
-  // Tree stage-row shape: StageNode has `.task: IncompleteTask`
-  if ("task" in arg && arg.task) {
+  // Tree stage-row shape: StageNode has `.task: IncompleteTask`. Guarded on
+  // folderUri: the keyboard-shortcut router (applyCurrentStageAction)
+  // dispatches { canonicalId, taskFolderPath, task: { progress } } — a
+  // partial task with no folderUri — which must resolve via the explicit
+  // fields below rather than returning undefined here (which would silently
+  // open the folder picker and could retarget a different task).
+  if ("task" in arg && arg.task && arg.task.folderUri?.fsPath) {
     return arg.task.folderUri;
   }
 
@@ -207,11 +213,18 @@ export async function generatePlanWithAI(
   // whichever is stronger wins, so the chained request fires even when the
   // standalone setting is off, and a standalone "auto-fast-forward" is never
   // downgraded by a plain chained dispatch.
-  const chainedReviewMode =
+  //
+  // The chained marker is re-validated against the setting that minted it:
+  // it was only ever attached while "Complete & Move On triggers AI" was
+  // "auto-fast-forward", so a queued/stale arg must not resurrect the loop
+  // after the user turned that setting off or downgraded it.
+  const currentChainedReviewMode = (): "auto-fast-forward" | undefined =>
     arg && !(arg instanceof vscode.Uri) && "followUpReviewMode" in arg &&
-    arg.followUpReviewMode === "auto-fast-forward"
+    arg.followUpReviewMode === "auto-fast-forward" &&
+    getCompleteAndMoveOnTriggersAIMode() === "auto-fast-forward"
       ? arg.followUpReviewMode
       : undefined;
+  const chainedReviewMode = currentChainedReviewMode();
   const effectiveReviewMode = strongestAutoTriggerMode(
     getAutoReviewAfterPlanMode(),
     chainedReviewMode
@@ -247,6 +260,13 @@ export async function generatePlanWithAI(
       arg: { taskFolderPath: result.taskFolderPath },
       taskKey: result.taskFolderPath,
       chainId: "auto-review",
+      // Dropped at fire time if every route to this review (the stage's own
+      // auto-review setting and the chained request) is off by then.
+      stillEnabled: () =>
+        strongestAutoTriggerMode(
+          getAutoReviewAfterPlanMode(),
+          currentChainedReviewMode()
+        ) !== "off",
     });
   }
 
@@ -747,6 +767,7 @@ export async function resumeGeneratePlanInteractionV1(
       arg: { taskFolderPath: ownedTask.taskFolderPath },
       taskKey: ownedTask.taskFolderPath,
       chainId: "auto-review",
+      stillEnabled: () => getAutoReviewAfterPlanMode() !== "off",
     });
   }
 

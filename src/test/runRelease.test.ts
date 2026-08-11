@@ -339,11 +339,19 @@ void describe("automatic implementation dispatch gate", () => {
         true
       );
       assert.equal(dispatches.length, 1);
-      assert.deepEqual(dispatches[0], {
+      const dispatched = dispatches[0];
+      assert.ok(dispatched);
+      const { stillEnabled, ...dispatchShape } = dispatched as AutomationDispatch;
+      assert.deepEqual(dispatchShape, {
         command: "vs-code-ai-helper.runImplementationWithAI",
         arg: { taskFolderPath: "/workspace/.ensemble/task" },
         taskKey: "/workspace/.ensemble/task",
       });
+      assert.equal(
+        typeof stillEnabled,
+        "function",
+        "automatic implementation must carry the fire-time settings re-check"
+      );
 
       assert.equal(
         scheduleAutomaticImplementationAfterReview("publish", true, "/workspace/.ensemble/task", undefined),

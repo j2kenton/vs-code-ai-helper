@@ -23,11 +23,18 @@
       "provenance": "pinned: resources/prompts/task-template.md@486aab4 (oldest committed revision), sha256:83a43f9a… — also matches the startNewTask.ts inline fallback string at the same revision; see README.md"
     },
     {
+      "id": "legacy-v1-bare",
+      "fixture": "legacy-v1-bare-seed.md",
+      "version": "v1",
+      "hasOpenQuestionsHeading": false,
+      "provenance": "pinned: resources/prompts/task-template.md@3e467f7 (the bare V1 seed emitted from the draft.v1 cutover until the typing-gap/hint template revision), sha256:2175edf8…"
+    },
+    {
       "id": "v1-canonical",
       "fixture": "v1-canonical-seed.md",
       "version": "v1",
       "hasOpenQuestionsHeading": false,
-      "provenance": "pinned: resources/prompts/task-template.md@3e467f7 (current), sha256:2175edf8…"
+      "provenance": "pinned: resources/prompts/task-template.md (current — the typing-gap/hint revision), sha256:73a6b3b5…"
     }
   ]
 }

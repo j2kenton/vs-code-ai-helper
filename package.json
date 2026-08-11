@@ -858,7 +858,7 @@
           "minimum": 1,
           "maximum": 99,
           "scope": "window",
-          "description": "Maximum Fast Forward iterations."
+          "description": "Maximum rounds for one Fast Forward run (1–99, default 5). Applies only after a fast-forward is explicitly started — this cap never starts one by itself."
         },
         "ensemble.autoAdvanceEnabled": {
           "type": [
@@ -874,7 +874,7 @@
           ],
           "default": "off",
           "scope": "window",
-          "description": "Automatically advance stages after reviews meet the configured score."
+          "description": "Automatically advance the stage when a review meets the configured score. Off by default: a review runs exactly one round and stops. \"auto-fast-forward\" additionally runs Fast Forward Fixes when the destination is a review stage. Checked again immediately before each automatic dispatch, so turning it off also drops already-queued follow-ups."
         },
         "ensemble.completeAndMoveOnTriggersAI": {
           "type": [
@@ -890,7 +890,7 @@
           ],
           "default": "auto",
           "scope": "window",
-          "description": "Start the destination stage's AI action after completing a stage."
+          "description": "Start the destination stage's AI action after you click Complete Stage & Move On. Default \"auto\": exactly one AI action per click, never escalating to Fast Forward. \"auto-fast-forward\" opts in to continuing with the unattended review-and-fix loop. \"off\" starts nothing automatically."
         },
         "ensemble.autoAdvanceScoreThreshold": {
           "type": "integer",
@@ -928,7 +928,7 @@
           ],
           "default": "off",
           "scope": "window",
-          "description": "Review a generated plan automatically."
+          "description": "Start a high-level review automatically after AI drafts a plan. Off by default — unattended iteration is opt-in. \"auto-fast-forward\" continues with Fast Forward Fixes until the configured stop level."
         },
         "ensemble.autoReviewAfterImplementation": {
           "type": [
@@ -944,7 +944,7 @@
           ],
           "default": "off",
           "scope": "window",
-          "description": "Review completed implementation automatically."
+          "description": "Start a high-level review automatically after AI completes an implementation run. Off by default — unattended iteration is opt-in. \"auto-fast-forward\" continues with Fast Forward Fixes until the configured stop level."
         },
         "ensemble.autoImplementAfterReview": {
           "type": "string",
@@ -1123,7 +1123,7 @@
           "minimum": 1,
           "maximum": 99,
           "scope": "window",
-          "description": "Maximum fast-forward iterations (1–99)."
+          "description": "Maximum rounds for one Fast Forward run (1–99, default 5). Applies only after a fast-forward is explicitly started — this cap never starts one by itself. Ignored whenever any ensemble.fastForwardMaxIterations value is set."
         },
         "vs-code-ai-helper.autoAdvanceEnabled": {
           "deprecationMessage": "Use `ensemble.autoAdvanceEnabled` instead.",
@@ -1147,7 +1147,7 @@
           ],
           "default": "off",
           "scope": "window",
-          "description": "Auto-advance when the configured review score threshold is reached. Legacy true/false values are still honored (true = auto)."
+          "description": "Auto-advance when the configured review score threshold is reached. Off by default: a review runs exactly one round and stops. Legacy true/false values are still honored (true = auto). Ignored whenever any ensemble.autoAdvanceEnabled value is set."
         },
         "vs-code-ai-helper.completeAndMoveOnTriggersAI": {
           "deprecationMessage": "Use `ensemble.completeAndMoveOnTriggersAI` instead.",
@@ -1171,7 +1171,7 @@
           ],
           "default": "auto",
           "scope": "window",
-          "description": "When completing a stage and moving on, automatically start the AI action for the destination stage. Legacy true/false values are still honored (true = auto)."
+          "description": "When completing a stage and moving on, automatically start the AI action for the destination stage. Default \"auto\": exactly one AI action per click, never escalating to Fast Forward. Legacy true/false values are still honored (true = auto). Ignored whenever any ensemble.completeAndMoveOnTriggersAI value is set."
         },
         "vs-code-ai-helper.autoAdvanceScoreThreshold": {
           "deprecationMessage": "Use `ensemble.autoAdvanceScoreThreshold` instead.",
@@ -1220,7 +1220,7 @@
           ],
           "default": "off",
           "scope": "window",
-          "description": "Start high-level review after AI drafts a plan. Legacy true/false values are still honored (true = auto)."
+          "description": "Start high-level review after AI drafts a plan. Off by default — unattended iteration is opt-in. Legacy true/false values are still honored (true = auto). Ignored whenever any ensemble.autoReviewAfterPlan value is set."
         },
         "vs-code-ai-helper.autoReviewAfterImplementation": {
           "deprecationMessage": "Use `ensemble.autoReviewAfterImplementation` instead.",
@@ -1244,7 +1244,7 @@
           ],
           "default": "off",
           "scope": "window",
-          "description": "Start high-level review after AI completes initial implementation. Legacy true/false values are still honored (true = auto)."
+          "description": "Start high-level review after AI completes initial implementation. Off by default — unattended iteration is opt-in. Legacy true/false values are still honored (true = auto). Ignored whenever any ensemble.autoReviewAfterImplementation value is set."
         },
         "vs-code-ai-helper.maxImplementationIterations": {
           "deprecationMessage": "Use `ensemble.maxImplementationIterations` instead.",

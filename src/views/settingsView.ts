@@ -15,7 +15,6 @@ import {
   setUnsavedSettingsWarningEnabled,
 } from "../config/settings";
 import { ModelSettings } from "../utils/modelFallback";
-import { getQuotaStatusText } from "../utils/quota";
 import {
   CLI_PROVIDERS,
   CliProviderDefinition,
@@ -32,7 +31,6 @@ type IncomingMessage =
   | { type: "saveSettings"; settings: ModelSettings }
   | { type: "saveProviders"; enabledProviders: Record<string, boolean> }
   | { type: "validationError"; message: string }
-  | { type: "refreshQuotaStatus" }
   | { type: "providerSignIn"; providerId: string }
   | { type: "providerUsage"; providerId: string }
   | { type: "suppressUnsavedWarning" };
@@ -300,10 +298,6 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           await this._postProvidersRefresh(webviewView.webview);
           break;
         }
-        case "refreshQuotaStatus": {
-          void webviewView.webview.postMessage({ type: "quotaStatus", quotaStatus: this._buildQuotaStatus() });
-          break;
-        }
         case "providerSignIn": {
           const provider = getProviderAccountEntry(data.providerId);
           if (!provider) {
@@ -443,15 +437,6 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       }
     });
 
-    // Refresh quota status (session-observed, not persisted) whenever the
-    // panel becomes visible again, so re-opening it after a run reflects
-    // what actually happened rather than a stale snapshot from first load.
-    webviewView.onDidChangeVisibility(() => {
-      if (webviewView.visible) {
-        void webviewView.webview.postMessage({ type: "quotaStatus", quotaStatus: this._buildQuotaStatus() });
-      }
-    });
-
     // Model settings and provider selection can be edited directly in
     // settings.json, or from a different workspace via the Global scope —
     // re-sync the panel so it doesn't show a stale snapshot. The webview
@@ -503,7 +488,6 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       stageNames: STAGE_DISPLAY_NAMES,
       stageTitleOverrides: STAGE_TITLE_OVERRIDES,
       stageHints: STAGE_ROLE_HINTS,
-      quotaStatus: this._buildQuotaStatus(),
       enabledProviders: getEnabledProviders(),
       providers: this._buildProviderViewModels(),
       showProviderAccountActions: isProviderAccountActionsEnabled(),
@@ -596,26 +580,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  /**
-   * Session-observed quota status for every stage's configured primary and
-   * backup model. Keyed as `${stage}:primary` / `${stage}:backup` to match
-   * how the webview looks it up. See utils/quota.ts — this is never a
-   * fabricated percentage, only what this session has actually observed.
-   */
-  private _buildQuotaStatus(): Record<string, string> {
-    const settings = getModelSettings();
-    const quotaStatus: Record<string, string> = {};
-    for (const stage of AI_MODEL_STAGES) {
-      const setting = settings[stage];
-      if (setting?.primary) {
-        quotaStatus[`${stage}:primary`] = getQuotaStatusText(stage, setting.primary);
-      }
-      if (setting?.backup) {
-        quotaStatus[`${stage}:backup`] = getQuotaStatusText(stage, setting.backup);
-      }
-    }
-    return quotaStatus;
-  }
+  // Session-observed quota status is still recorded underneath (see
+  // utils/quota.ts / runnerRegistry.ts) but is no longer rendered anywhere
+  // in this panel — the per-stage "usage observed" text was noise the user
+  // ignored. The data keeps accruing for future surfaces.
 
   public focusStage(stage: TaskStage, control: "primary" | "backup" = "primary"): void {
     if (!this._view) {
@@ -730,11 +698,6 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             color: var(--vscode-descriptionForeground);
             cursor: default;
           }
-          .quota-text {
-            font-size: var(--ensemble-small-font-size);
-            color: var(--vscode-descriptionForeground);
-            margin-top: var(--ensemble-space-half);
-          }
           .provider-disabled-note {
             font-size: var(--ensemble-small-font-size);
             color: var(--vscode-errorForeground);
@@ -827,7 +790,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             color: var(--vscode-descriptionForeground);
           }
           /* Sits directly under its provider row, indented to read as
-             belonging to that provider rather than to the whole list. */
+             belonging to that provider rather than to the whole list. A
+             native disclosure, collapsed by default: only the "Warning"
+             summary shows until the user expands it (keyboard- and
+             screen-reader-accessible with no extra script). */
           .provider-warning {
             margin: 0 0 var(--ensemble-space-2) var(--ensemble-space-3);
             padding: var(--ensemble-space-1) var(--ensemble-space-2);
@@ -835,6 +801,13 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             background: var(--vscode-inputValidation-warningBackground);
             color: var(--vscode-inputValidation-warningForeground, var(--vscode-foreground));
             font-size: var(--ensemble-small-font-size);
+          }
+          .provider-warning summary {
+            cursor: pointer;
+            font-weight: bold;
+          }
+          .provider-warning p {
+            margin: var(--ensemble-space-1) 0 0;
           }
           .form-row {
             margin-bottom: var(--ensemble-space-2);
@@ -898,7 +871,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
              "settings-table"/"stages-tbody" ids so the show/hide and
              delegated-listener wiring below is unchanged. -->
         <div id="settings-table" hidden>
-          <p class="provider-help">Models labeled "free" are offered at no cost by their provider today, but that isn't guaranteed to stay true — check with the provider directly and keep an eye on your own usage. Free models may also be less reliable than paid ones (slower, more likely to be rate-limited or unavailable).</p>
+          <p class="provider-help">Models labeled "free" were offered at no cost by their provider at the time of writing — pricing can change without notice, so check with the provider directly and keep an eye on your own usage. Free models may also be less reliable than paid ones (slower, more likely to be rate-limited or unavailable).</p>
           <div id="stages-tbody">
             <!-- Will be populated dynamically -->
           </div>
@@ -918,7 +891,6 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           let availableModels = [];
           let stagesList = [];
           let stageDisplayNames = {};
-          let quotaStatus = {};
           let enabledProviders = {};
           let providers = [];
           let stageTitleOverrides = {};
@@ -1034,7 +1006,6 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               availableModels = message.models || [];
               stagesList = message.stages || [];
               stageDisplayNames = message.stageNames || {};
-              quotaStatus = message.quotaStatus || {};
               enabledProviders = message.enabledProviders || {};
               providers = message.providers || [];
               stageTitleOverrides = message.stageTitleOverrides || {};
@@ -1072,17 +1043,12 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               // exists by this point. Tell the extension host it's now safe
               // to deliver a focusStage request.
               vscode.postMessage({ type: 'rendered' });
-            } else if (message.type === 'quotaStatus') {
-              quotaStatus = message.quotaStatus || {};
-              if (!formDirty) {
-                renderTable();
-              }
             } else if (message.type === 'providersRefreshed') {
               // A provider-selection save, refreshed independently of the
               // model-selection form: currentSettings (and formDirty) are
               // deliberately left untouched here, so unsaved model edits
-              // survive a provider save intact. Re-rendering the table only
-              // when it isn't mid-edit mirrors the quotaStatus refresh above.
+              // survive a provider save intact. The table is only rebuilt
+              // when it isn't mid-edit.
               providers = message.providers || [];
               enabledProviders = message.enabledProviders || {};
               availableModels = message.models || [];
@@ -1126,17 +1092,6 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               markDirty();
             }
           });
-          // The strategy <select> is a native element (unlike the JS-driven
-          // model comboboxes, which call updateAccountWarningFor directly on
-          // selection), so a same-account warning that depends on it needs
-          // its own delegated 'change' listener.
-          document.getElementById('stages-tbody').addEventListener('change', event => {
-            const row = event.target.closest('.stage-row');
-            if (row) {
-              updateAccountWarningFor(row.id.replace('row-', ''));
-            }
-          });
-
           // Tell the extension host this document's listener is attached
           // and ready to receive "init".
           vscode.postMessage({ type: 'ready' });
@@ -1228,7 +1183,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               '<input type="checkbox" class="row-enabled" aria-label="Use this model" ' +
               'title="Uncheck to skip this model during resolution; it keeps its configured model and position" ' +
               (enabled === false ? '' : 'checked') + '>' +
-              modelComboboxHtml(kind, stage, selectedId || '', false) +
+              modelComboboxHtml(kind, stage, selectedId || '', enabled === false) +
               '<button type="button" class="secondary remove-backup" aria-label="Remove backup" title="Remove this backup model">×</button>' +
               '</div>';
           }
@@ -1252,30 +1207,21 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             return providers.some(p => p.id === prefix) ? prefix : 'copilot';
           }
 
-          // A same-account backup shares its primary's session/quota limit
-          // (plan §5b/25): a Claude session limit is account-wide, so a
-          // backup on the same account hits the identical limit the primary
-          // just failed on, and the fallback cascade stalls. Only meaningful
-          // when the stage would actually fall back to a backup.
-          function updateAccountWarningFor(stage) {
-            const row = document.getElementById('row-' + stage);
-            const warningEl = row ? row.querySelector('.account-warning') : null;
-            if (!row || !warningEl) return;
-            const strategySelect = document.getElementById('strategy-' + stage);
-            const usesBackup = strategySelect && strategySelect.value === 'switch-to-backup';
-            const primaryHidden = document.getElementById('primary-' + stage);
-            const primaryId = primaryHidden ? primaryHidden.value : '';
-            const primaryAccount = primaryId ? providerIdOfModelId(primaryId) : '';
-            const backupHiddenInputs = Array.from(
-              row.querySelectorAll('.model-combobox[data-kind^="backup"] input[type="hidden"]')
-            );
-            const sameAccountBackup = usesBackup && primaryAccount && backupHiddenInputs.some(input =>
-              input.value && providerIdOfModelId(input.value) === primaryAccount
-            );
-            warningEl.hidden = !sameAccountBackup;
-            warningEl.textContent = sameAccountBackup
-              ? 'This backup uses the same provider account as the primary model. A session limit or quota outage on the primary will affect this backup too, so the fallback may not help — choose a backup on a different account where possible.'
-              : '';
+          // Disabling a row (checkbox unchecked) makes its combobox
+          // non-editable: no typing, no dropdown. The hidden input keeps
+          // the stored model id, so re-enabling restores the selection.
+          function setRowComboDisabled(modelRow, disabled) {
+            const input = modelRow.querySelector('.model-combo-input');
+            const list = modelRow.querySelector('.model-options');
+            if (!input) return;
+            input.disabled = disabled;
+            if (disabled) {
+              input.setAttribute('aria-disabled', 'true');
+              if (list) list.hidden = true;
+              input.setAttribute('aria-expanded', 'false');
+            } else {
+              input.removeAttribute('aria-disabled');
+            }
           }
 
           function isProviderChecked(providerId) {
@@ -1306,7 +1252,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                 ? (providerDisabled ? selectedId + ' (provider disabled)' : 'Unknown model: ' + selectedId)
                 : '';
             const hiddenValue = selectedId || '';
-            const disabledAttr = disabled ? 'disabled' : '';
+            const disabledAttr = disabled ? 'disabled aria-disabled="true"' : '';
             const disabledNote = providerDisabled
               ? '<div class="provider-disabled-note">This model\\'s provider is disabled in Provider Selection above; the stage is treated as unconfigured until the provider is re-enabled or another model is chosen.</div>'
               : '';
@@ -1427,7 +1373,6 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               input.value = id ? label : '';
               closeList();
               markDirty();
-              updateAccountWarningFor(stage);
             }
 
             function reconcileExactValue() {
@@ -1481,7 +1426,6 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               if (hidden.value) hidden.dataset.lastValid = hidden.value;
               hidden.value = '';
               renderOptions();
-              updateAccountWarningFor(stage);
             });
 
             input.addEventListener('focus', () => {
@@ -1561,17 +1505,16 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             const checkbox = modelRow.querySelector('.row-enabled');
             checkbox.addEventListener('change', () => {
               modelRow.classList.toggle('skipped', !checkbox.checked);
+              setRowComboDisabled(modelRow, !checkbox.checked);
             });
             modelRow.querySelector('.remove-backup').addEventListener('click', () => {
               modelRow.remove();
               syncBackupLimitFor(row);
               markDirty();
-              updateAccountWarningFor(stage);
             });
             container.appendChild(modelRow);
             setupModelCombobox(modelRow, kind, stage);
             syncBackupLimitFor(row);
-            updateAccountWarningFor(stage);
           }
 
           function syncBackupLimitFor(row) {
@@ -1582,12 +1525,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             addBackupButton.disabled = count >= 10;
             addBackupButton.title = count >= 10 ? 'A maximum of 10 backup models is allowed' : 'Add a backup model for this stage';
             backupLimit.textContent = count + '/10';
-            // With zero backups only the add button renders — no caption,
-            // no backup quota line.
+            // With zero backups only the add button renders — no caption.
             const caption = row.querySelector('.backup-caption');
             if (caption) caption.hidden = count === 0;
-            const backupQuota = row.querySelector('.backup-quota');
-            if (backupQuota) backupQuota.hidden = count === 0;
           }
 
           function renderProviderSelection() {
@@ -1609,7 +1549,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                   : '') +
                 '</div>' +
                 (provider.permissionWarning
-                  ? '<p class="provider-warning">' + escapeHtml(provider.permissionWarning) + '</p>'
+                  ? '<details class="provider-warning"><summary>Warning</summary><p>' + escapeHtml(provider.permissionWarning) + '</p></details>'
                   : '')
               ).join('') +
               '<div class="btn-container"><button id="save-providers-btn" title="Save the enabled provider selection">Save Provider Selection</button></div>' +
@@ -1645,6 +1585,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             const checkbox = primaryRow.querySelector('.row-enabled');
             checkbox.addEventListener('change', () => {
               primaryRow.classList.toggle('skipped', !checkbox.checked);
+              setRowComboDisabled(primaryRow, !checkbox.checked);
             });
             primaryRow.querySelector('.remove-backup').addEventListener('click', () => {
               const hidden = document.getElementById('primary-' + stage);
@@ -1666,9 +1607,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                 checkbox.checked = true;
                 primaryRow.classList.remove('skipped');
               }
+              setRowComboDisabled(primaryRow, !checkbox.checked);
               syncBackupLimitFor(row);
               markDirty();
-              updateAccountWarningFor(stage);
             });
           }
 
@@ -1681,9 +1622,6 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               const row = document.createElement('div');
               row.id = 'row-' + stage;
               row.className = 'stage-row';
-
-              const primaryQuotaStatus = quotaStatus[stage + ':primary'] || 'No usage observed yet this session';
-              const backupQuotaStatus = quotaStatus[stage + ':backup'] || 'No usage observed yet this session';
 
               const backupModels = (setting.backups && setting.backups.length ? setting.backups : (setting.backup ? [setting.backup] : []));
               const backupFlags = Array.isArray(setting.backupsEnabled) ? setting.backupsEnabled : [];
@@ -1698,7 +1636,6 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                 (stageHint ? '<p class="stage-hint">' + escapeHtml(stageHint) + '</p>' : '') +
                 '<div class="form-row primary-container">' +
                   modelRowHtml('primary', stage, setting.primary || '', setting.primaryEnabled !== false) +
-                  '<span class="quota-text" title="Session-observed usage status">' + escapeHtml(primaryQuotaStatus) + '</span>' +
                 '</div>' +
                 '<div class="form-row">' +
                   '<label for="strategy-' + escapeHtml(stage) + '" class="field-label">Fallback strategy:</label>' +
@@ -1711,10 +1648,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                 '<div class="form-row backup-section">' +
                   '<div class="field-label backup-caption" hidden>Backup models (tried in order)</div>' +
                   '<div class="extra-backups"></div>' +
-                  '<span class="quota-text backup-quota" title="Session-observed usage status" hidden>' + escapeHtml(backupQuotaStatus) + '</span>' +
                   '<button type="button" class="secondary add-backup" title="Add a backup model for this stage">+ Add backup model</button>' +
                   '<span class="backup-limit">0/10</span>' +
-                  '<div class="provider-warning account-warning" id="account-warning-' + escapeHtml(stage) + '" hidden></div>' +
                 '</div>';
 
               tbody.appendChild(row);
@@ -1729,7 +1664,6 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                 addExtraBackupCombobox(row, stage, '', true);
               });
               syncBackupLimitFor(row);
-              updateAccountWarningFor(stage);
             });
           }
 

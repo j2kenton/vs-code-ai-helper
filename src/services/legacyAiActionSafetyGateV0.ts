@@ -251,6 +251,10 @@ export const MIGRATED_ACTION_KEYS_V0: ReadonlySet<string> = new Set<string>([
   "lint.v1",
   "applyCurrentStage.v1",
   "editExecution.v1",
+  // Internal-only like editExecution.v1: no registered legacy route id —
+  // renameTask.v1 is invoked directly through the coordinator by the Rename
+  // Task with AI command (renameTask.ts).
+  "renameTask.v1",
 ]);
 
 /**

@@ -640,12 +640,12 @@ void describe("draftRowV1", () => {
         seeds: Array<{ id: string; fixture: string; version: string; hasOpenQuestionsHeading: boolean }>;
       };
 
-      assert.equal(manifest.seeds.length, 4, "seed history must inventory all 4 historical and V1 creation seeds");
+      assert.equal(manifest.seeds.length, 5, "seed history must inventory all 5 historical and V1 creation seeds");
 
       const templatePath = path.join(process.cwd(), "resources", "prompts", "task-template.md");
       assert.equal(fs.existsSync(templatePath), true, "task-template.md must exist");
       const templateContent = fs.readFileSync(templatePath, "utf8");
-      const inlineFallback = "# Task\n\n## Task Description\n\n## Draft with AI\n";
+      const inlineFallback = "# Task\n\n## Task Description\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n## Draft with AI\n\n[Click the Draft with AI button, or press Ctrl+Shift+Alt+I]\n";
 
       for (const entry of manifest.seeds) {
         const fixturePath = path.join(fixturesDir, entry.fixture);

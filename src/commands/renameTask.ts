@@ -2,11 +2,27 @@ import * as vscode from "vscode";
 import { TaskInventory } from "../state/taskInventory";
 import { TASK_DESCRIPTION_FILENAME, TASK_FILENAME } from "../types/taskProgress";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
-import { resolveTaskContext } from "../utils/resolveTaskContext";
+import { resolveTaskContext, ResolvedTaskContext } from "../utils/resolveTaskContext";
 import { runTrackedOperation } from "../utils/taskOperations";
 import { parseTaskDocument } from "../utils/taskDescriptionDocument";
 import { TaskNode } from "../views/taskTreeProvider";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
+import { NotificationRouter } from "../utils/notificationRouter";
+import { ensureAiConsent } from "../utils/aiConsent";
+import { renderPromptTemplate } from "../utils/promptTemplates";
+import { resolveFreshModelForStage } from "../utils/modelSelection";
+import { readChatDocumentIdentityV1 } from "../utils/chatHistoryStore";
+import { allocateHex128IdV1 } from "../types/actionCorrelationV1";
+import { createProductionTaskActionCoordinatorV1 } from "../actions/productionTaskActionRuntimeV1";
+import {
+  RENAME_TASK_ACTION_KEY_V1,
+  RenameTaskActionInputV1,
+} from "../actions/rows/renameTaskRowV1";
+import {
+  ensureWorkflowTaskFolderRootV1,
+  getVerifiedTaskBindingIdV1,
+  getWorkflowFileStoreV1,
+} from "../services/workflowRuntimeServicesV1";
 
 type TaskArg = TaskNode | { canonicalId?: string; taskFolderPath?: string };
 
@@ -112,14 +128,118 @@ export function deriveNameFromDescription(text: string): string | undefined {
   return firstFallback;
 }
 
+/** Split into whitespace-delimited words (markdown-stripped input assumed). */
+function wordsOf(text: string): string[] {
+  return text.split(/\s+/).filter((w) => w.length > 0);
+}
+
 /**
- * A concise title derived from the task description without renaming
- * folders/IDs. Prefers the user's own free-text description
- * (task-description.md), then the structured "Task Description" section of
- * task.md, then the AI draft — instead of whatever heading happened to come
- * first in the document.
+ * Normalize a model reply into a single-line candidate name: first non-empty
+ * line, stripped of surrounding quotes, markdown emphasis, and a trailing
+ * period.
+ */
+export function normalizeAiNameReply(reply: string): string {
+  const firstLine =
+    reply
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .find((line) => line.length > 0) ?? "";
+  return firstLine
+    .replace(/^["'`*_\s]+/, "")
+    .replace(/["'`*_\s]+$/, "")
+    .replace(/\.$/, "")
+    .trim();
+}
+
+/** Clamp a too-long name at a word boundary — never mid-word. */
+export function clampNameAtWordBoundary(name: string, maxWords: number): string {
+  return wordsOf(name).slice(0, maxWords).join(" ");
+}
+
+const RENAME_MAX_WORDS = 7;
+
+/**
+ * Ask the configured Description-stage model for a 5–7 word name via the
+ * `renameTask.v1` coordinator row. Returns the normalized reply, or
+ * undefined when no provider path is available or the run fails/cancels.
+ */
+async function requestAiNameV1(
+  context: vscode.ExtensionContext,
+  task: ResolvedTaskContext,
+  taskDescription: string,
+  strictnessNote: string,
+  token: vscode.CancellationToken
+): Promise<string | undefined> {
+  const taskFolderUri = vscode.Uri.file(task.taskFolderPath);
+  const workspaceFolder = task.workspaceFolder
+    ? vscode.workspace.getWorkspaceFolder(task.workspaceFolder)
+    : undefined;
+  if (!workspaceFolder) {
+    return undefined;
+  }
+
+  const { modelId } = await resolveFreshModelForStage(taskFolderUri, "desc");
+  if (!modelId) {
+    return undefined;
+  }
+
+  try {
+    const rootId = ensureWorkflowTaskFolderRootV1(taskFolderUri.fsPath);
+    const taskBindingId = getVerifiedTaskBindingIdV1(rootId);
+    if (!taskBindingId) {
+      return undefined;
+    }
+    const chatIdentity = await readChatDocumentIdentityV1(
+      taskFolderUri.fsPath,
+      task.canonicalId ?? taskFolderUri.fsPath
+    );
+    const chatDocumentId = chatIdentity?.documentId ?? allocateHex128IdV1();
+
+    const prompt = await renderPromptTemplate(context.extensionUri, "rename-task.md", {
+      taskDescription,
+      strictnessNote,
+    });
+
+    const coordinator = createProductionTaskActionCoordinatorV1({
+      workspaceCwd: workspaceFolder.uri.fsPath,
+      resolveStagePrimaryModel: () => ({ modelId, stage: "desc" }),
+    });
+
+    const targetLocator = { rootId, relativePath: `runs/rename-suggestion-${Date.now()}.txt` };
+    const validatedInput: RenameTaskActionInputV1 = { prompt, targetLocator };
+
+    const outcome = await coordinator.executeAction({
+      actionKey: RENAME_TASK_ACTION_KEY_V1,
+      taskBinding: { taskBindingId, chatDocumentId },
+      taskStatus: task.progress.status ?? "active",
+      taskStage: task.progress.currentStage,
+      rawInput: validatedInput,
+      cancellationToken: token,
+    });
+
+    if (outcome.kind !== "completed") {
+      return undefined;
+    }
+    const readResult = await getWorkflowFileStoreV1().readFileBounded(targetLocator, 16 * 1024);
+    if (readResult.kind !== "ok") {
+      return undefined;
+    }
+    const name = normalizeAiNameReply(readResult.value.bytes.toString("utf8"));
+    return name.length > 0 ? name : undefined;
+  } catch {
+    // Any provider/coordinator failure falls back to the offline derivation.
+    return undefined;
+  }
+}
+
+/**
+ * Rename Task with AI: read the task description and produce a short 5–7
+ * word high-level summary, applied directly (the explicit click is the
+ * confirmation, so it renames even after a prior manual rename). Falls back
+ * to `deriveNameFromDescription` when no provider is available.
  */
 export async function renameTaskWithAI(
+  context: vscode.ExtensionContext,
   inventory: TaskInventory,
   arg?: TaskArg
 ): Promise<void> {
@@ -143,9 +263,64 @@ export async function renameTaskWithAI(
     const parsed = parseTaskDocument(await readText(TASK_FILENAME));
     sourceText = parsed.taskDescription || parsed.draftWithAI;
   }
+  if (!sourceText.trim()) {
+    NotificationRouter.showWarning(
+      "This task has no description yet. Write a task description before renaming with AI."
+    );
+    return;
+  }
 
-  const suggestion = deriveNameFromDescription(sourceText) ?? task.folderName;
-  await renameTask(inventory, arg, suggestion.slice(0, 120));
+  const consented = await ensureAiConsent(context);
+  if (!consented) return;
+
+  await runTrackedOperation(
+    task.taskFolderPath,
+    { label: "Rename Task with AI", taskName: task.folderName, kind: "rename-task" },
+    async (op) => {
+      const fallbackCts = new vscode.CancellationTokenSource();
+      const token = op.token ?? fallbackCts.token;
+      try {
+        let name = await requestAiNameV1(context, task, sourceText, "", token);
+        if (name !== undefined && wordsOf(name).length > RENAME_MAX_WORDS) {
+          // Too long: one stricter retry, then clamp at a word boundary.
+          const retried = await requestAiNameV1(
+            context,
+            task,
+            sourceText,
+            "IMPORTANT: your previous answer was too long. Respond with 5 to 7 words — nothing more.",
+            token
+          );
+          name = retried ?? name;
+          if (wordsOf(name).length > RENAME_MAX_WORDS) {
+            name = clampNameAtWordBoundary(name, RENAME_MAX_WORDS);
+          }
+        }
+
+        if (name === undefined) {
+          // Offline fallback: derive a concise name without a provider.
+          name = deriveNameFromDescription(sourceText);
+        }
+        if (!name) {
+          NotificationRouter.showWarning(
+            "Could not produce a task name. Configure a Description-stage model in AI Models, or rename manually."
+          );
+          return;
+        }
+
+        const finalName = name;
+        await patchTaskProgressStrictV1(vscode.Uri.file(task.taskFolderPath), (current) => ({
+          ...current,
+          displayName: finalName,
+          // The explicit Rename Task with AI click confirms the name.
+          nameIsDefault: false,
+        }));
+        await inventory.refresh();
+        op.report(`renamed to "${finalName}"`);
+      } finally {
+        fallbackCts.dispose();
+      }
+    }
+  );
 }
 
 export function registerRenameTaskCommands(
@@ -160,7 +335,7 @@ export function registerRenameTaskCommands(
   context.subscriptions.push(
     vscode.commands.registerCommand(
       "vs-code-ai-helper.renameTaskWithAI",
-      (arg?: TaskArg) => renameTaskWithAI(inventory, arg)
+      (arg?: TaskArg) => renameTaskWithAI(context, inventory, arg)
     )
   );
 }

@@ -1009,10 +1009,8 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     // than ship a provider whose plan and review stages always fail.
     // Re-test if a future CLI version adds a scope flag or a class grant.
     permissionWarning:
-      "Antigravity runs with --dangerously-skip-permissions in every mode, including " +
-      "plan and review. It can create, change, or delete any file in your workspace " +
-      "without asking. Its headless CLI offers no scoped alternative — this warning " +
-      "applies to Antigravity only, not to the other providers above.",
+      "Antigravity can create, change, or delete any file and run shell commands without asking, " +
+      "in every stage including plan and review. Its CLI has no read-only or restricted mode.",
     buildArgs(_mode, model, _lastMessageFile, context): string[] {
       // promptTransport: "file" is a contract with the caller (see
       // CliBuildArgsContext.promptFile): cliAgentRunner always writes the
@@ -1295,13 +1293,8 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     // grant that approval — so, like Antigravity, there is no scoped
     // read-only mode to fall back to in either direction.
     permissionWarning:
-      "Runs with all tools auto-approved in every mode, including plan and review. " +
-      "--plan only changes the model's own system-prompt instructions, not what the CLI " +
-      "will execute without asking: its run_commands tool stays available and auto-approved " +
-      "throughout, so a prompt that causes the model to run a shell command can still create, " +
-      "change, or delete files even during a nominally read-only stage. Its headless CLI offers " +
-      "no scoped alternative — disabling auto-approval blocks every tool, including reads, since " +
-      "there is no way to grant interactive approval in a non-interactive run.",
+      "Cline can create, change, or delete any file and run shell commands without asking, " +
+      "in every stage including plan and review. Its CLI has no read-only or restricted mode.",
     promptTransport: "stdin",
     // Keep the provider-level fallback to the account's own default model
     // only (mirroring Claude/Codex/Gemini). The full ClinePass catalog,
@@ -1414,11 +1407,8 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     // invocation runs identically regardless of the extension's own
     // text/edit mode distinction (see buildArgs below).
     permissionWarning:
-      "Every one-shot `kimi -p` run — implementation, plan, and review stages alike — executes file edits and " +
-      "shell commands with no approval gate at all, verified live with zero permission flags passed. Worse " +
-      "still, none of `--plan`, `--yolo`, or `--auto` can even be passed alongside `-p` (the CLI rejects each " +
-      "combination outright), so there is no permission flag of any kind to fall back to in either direction, " +
-      "unlike Antigravity's/Cline's unenforced-but-present `--dangerously-skip-permissions`/`--auto-approve` flags.",
+      "Kimi Code can create, change, or delete any file and run shell commands without asking, " +
+      "in every stage including plan and review. Its CLI has no read-only or restricted mode.",
     // Verified live (kimi-code 0.29.2, `kimi -p "..."` with piped stdin and
     // no `--output-format` flag): stdin content is NEVER read in prompt
     // mode — the model reported "no stdin content arrived" even with a
@@ -1791,7 +1781,22 @@ function reorderAntigravityLast<T extends { id: string }>(entries: readonly T[])
   return [...entries.slice(0, index), ...entries.slice(index + 1), antigravity];
 }
 
-export const PROVIDER_ACCOUNT_ENTRIES: readonly ProviderAccountEntry[] = [
+/**
+ * Move the "devpass-cli" entry (if present) to the front of the list,
+ * preserving the relative order of everything else — devpass-code leads
+ * Provider Selection. Applied after reorderAntigravityLast, so Antigravity
+ * still ends up last.
+ */
+function reorderDevpassFirst<T extends { id: string }>(entries: readonly T[]): T[] {
+  const index = entries.findIndex((entry) => entry.id === "devpass-cli");
+  if (index === -1) {
+    return [...entries];
+  }
+  const devpass = entries[index]!;
+  return [devpass, ...entries.slice(0, index), ...entries.slice(index + 1)];
+}
+
+export const PROVIDER_ACCOUNT_ENTRIES: readonly ProviderAccountEntry[] = reorderDevpassFirst([
   {
     id: "copilot",
     label: "GitHub Copilot",
@@ -1939,7 +1944,7 @@ export const PROVIDER_ACCOUNT_ENTRIES: readonly ProviderAccountEntry[] = [
       : {}),
     }))
   ),
-];
+]);
 
 export function getProviderAccountEntry(
   id: string

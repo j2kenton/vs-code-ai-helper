@@ -26,8 +26,15 @@ type RunPublishChecksArg =
 
 /**
  * Normalize a command argument into the shape resolveTaskContext expects.
+ *
+ * The explicit { canonicalId / taskFolderPath } shape wins over the tree-node
+ * { task } shape: the keyboard-shortcut router (applyCurrentStageAction)
+ * dispatches both fields plus a partial `task` carrying only `progress`, so
+ * reading `task.folderUri.fsPath` first would throw on that arg.
+ *
+ * @internal exported for testing
  */
-function normalizeArg(node: RunPublishChecksArg | undefined): {
+export function normalizeRunPublishChecksArg(node: RunPublishChecksArg | undefined): {
   canonicalId?: string;
   taskFolderPath?: string;
 } | undefined {
@@ -35,15 +42,16 @@ function normalizeArg(node: RunPublishChecksArg | undefined): {
     return undefined;
   }
 
-  if ("task" in node && node.task) {
+  const n = node as { canonicalId?: string; taskFolderPath?: string };
+  if (n.canonicalId || n.taskFolderPath) {
+    return { canonicalId: n.canonicalId, taskFolderPath: n.taskFolderPath };
+  }
+
+  if ("task" in node && node.task && node.task.folderUri?.fsPath) {
     return { taskFolderPath: node.task.folderUri.fsPath };
   }
 
-  const n = node as { canonicalId?: string; taskFolderPath?: string };
-  const hasExplicit = !!(n.canonicalId || n.taskFolderPath);
-  return hasExplicit
-    ? { canonicalId: n.canonicalId, taskFolderPath: n.taskFolderPath }
-    : undefined;
+  return undefined;
 }
 
 /**
@@ -61,7 +69,7 @@ export async function runPublishChecks(
   // Activation-order barrier (plan §1.4): never read task state while the
   // startup creating-folder classification pass is still running.
   await TaskCreationStartupReconcilerV1.waitUntilReady();
-  const resolverArg = normalizeArg(explicitArg);
+  const resolverArg = normalizeRunPublishChecksArg(explicitArg);
 
   const resolvedTask = await resolveTaskContext(inventory, resolverArg, {
     allowPaused: true,

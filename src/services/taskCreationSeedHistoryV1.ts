@@ -80,6 +80,15 @@ const LEGACY_SEED_DESCRIPTORS: readonly CreationSeedDescriptorV1[] = [
     resourceFileName: "creation-seed-legacy-early-inline-fallback.md",
     version: "v0",
   },
+  {
+    // The bare V1 canonical seed (# Task / ## Task Description / ## Draft
+    // with AI, no gap or hint) emitted from the draft.v1 cutover until the
+    // template gained the empty-description typing gap and the Draft with AI
+    // hint. `creating` folders seeded from it may still sit on disk.
+    seedId: "legacy-v1-bare",
+    resourceFileName: "creation-seed-legacy-v1-bare.md",
+    version: "v1",
+  },
 ];
 
 const V1_CANONICAL_SEED_ID = "v1-canonical";
