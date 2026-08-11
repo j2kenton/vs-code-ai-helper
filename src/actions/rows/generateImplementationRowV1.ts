@@ -18,6 +18,10 @@ import { CompletedContentV1 } from "../../types/aiResultEnvelope";
 import { getWorkflowFileStoreV1 } from "../../services/workflowRuntimeServicesV1";
 import { WorkflowFileRevisionV1 } from "../../services/workflowFileStoreV1";
 import { attributionModelLabel, withAttribution } from "../../utils/fileUtils";
+import {
+  hasImplementationChecklistV1,
+  IMPLEMENTATION_CHECKLIST_MARKER,
+} from "../../utils/implementationChecklist";
 
 export const GENERATE_IMPLEMENTATION_ACTION_KEY_V1 = "generateImplementation.v1";
 
@@ -92,8 +96,6 @@ class GenerateImplementationPromotionErrorV1 extends Error {
   }
 }
 
-const IMPLEMENTATION_CHECKLIST_MARKER = "<!-- ensemble:implementation-checklist -->";
-
 async function promoteGenerateImplementationContentV1(
   content: CompletedContentV1,
   context: TaskActionExecutionContextV1
@@ -106,7 +108,12 @@ async function promoteGenerateImplementationContentV1(
   const input = context.validatedInput as GenerateImplementationActionInputV1;
   const fileStore = getWorkflowFileStoreV1();
   let markdown = content.markdown;
-  if (!markdown.includes(IMPLEMENTATION_CHECKLIST_MARKER)) {
+  // Shared definition, not a substring test: a generated checklist that merely
+  // QUOTES the marker (this repo's own plans do, when the work is about this
+  // mechanism) would otherwise be left without a real standalone marker line —
+  // and everything downstream would then read the task as having no checklist
+  // at all, silently disabling plan-completeness tracking for it.
+  if (!hasImplementationChecklistV1(markdown)) {
     markdown = `${IMPLEMENTATION_CHECKLIST_MARKER}\n\n${markdown}`;
   }
   // Signed with the reservation actually claimed/invoked, same helper and

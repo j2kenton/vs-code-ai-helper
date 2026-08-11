@@ -646,6 +646,9 @@ export async function runSealedImplementationV1(
         summary:
           `Applied ${result.appliedReceiptIds.length} sealed edit step(s) with ordered receipts ` +
           `(${result.changedPaths.length} file(s) changed).`,
+        // Runner-authored, not model-authored against the summary prompt —
+        // see ImplementationRunResult.summaryIsSynthetic.
+        summaryIsSynthetic: true,
         runnerId,
       };
     case "noChanges":
@@ -662,6 +665,10 @@ export async function runSealedImplementationV1(
           status: "completed",
           filesChanged: [],
           summary: "The preflight produced an empty plan — no changes were needed.",
+          // Runner-authored too. Without this the summary shape gate rejected
+          // this sentence for lacking the prompt's headings and paused a
+          // legitimate no-change completion instead of routing it to review.
+          summaryIsSynthetic: true,
           runnerId,
         };
       }

@@ -13,13 +13,19 @@ Plans built across multiple implementation rounds. A plan larger than one implem
 - In the summary verdict, describe a plan progressing correctly and in order as on track (naming the step count, e.g. "on track — 6 of 18 ordered steps complete"), not "off track", even while much of the plan remains to be built. Reserve "off track" for genuine trouble: out-of-order or skipped foundational steps, defects, or deviation from the plan's contract. An "off track" verdict must name the actual cause inline, in the same sentence, not merely report the step count — e.g. "Off track — trust-boundary defect in workflowRuntimeServicesV1; 7 of 18 ordered steps complete in order." Steps completing in order is the healthy fact about a staged plan; naming only the step count in an "off track" verdict reads as self-contradictory and buries the real reason further down the response.
 - When the plan is still incomplete and you found no blockers, say plainly in the summary verdict which steps come next, so the next implementation round knows exactly what to build.
 
-Plan progress — required whenever the plan has discrete, countable steps. End your response with this marker on its own line: steps fully implemented and verified, over the number of steps THIS TASK is responsible for delivering.
+Plan progress — required whenever the plan has discrete, countable steps. End your response with this marker on its own line: steps fully implemented and verified, over the plan's TOTAL step count.
 
 ```
 <!-- progress: 6/18 -->
 ```
 
-The denominator is this task's own scope, which is normally just the plan's total step count. It differs only when the plan itself explicitly assigns part of its scope to separate or follow-up tasks (e.g. "delivery is five sequenced tasks, one per stage"). In that case count only the portion THIS task owns — a task delivering an 8-step stage of a 25-step plan reports `8/8` when that stage is done, not `8/25` — and say so in your verdict. Never narrow the scope on your own judgement that something would be better done later; only an explicit division written into the plan counts, and everything else in the plan stays this task's responsibility.
+The denominator is always the whole plan. One plan is one task, so there is no smaller scope to count against — a round that finishes an 8-step part of a 25-step plan reports `8/25`, never `8/8`. This holds even when the plan divides itself into named parts, phases, or lettered sections: a plan may be implemented one part per round, but every part belongs to this task, and the marker measures the task's progress through the plan as a whole. Never narrow the denominator on your own judgement that something belongs to a later task, and never adopt a division the plan claims to make across tasks — report the plan-wide count and note the discrepancy in your verdict.
+
+Review both things every round, and keep them separate in your verdict:
+- **Quality** — how well the part implemented this round was done, judged against the plan's contract and acceptance criteria for that part.
+- **Coverage** — how much of the whole plan remains, named concretely so the next round knows what to build.
+
+A part implemented flawlessly is still `8/25`. Never let a high quality judgement on this round's slice read as completion of the plan.
 
 Count a step as complete only when it is actually implemented and verified — not merely started, stubbed, or planned. If the plan has no meaningful step structure to count, omit the marker entirely rather than inventing numbers. When the numerator equals the denominator, this task's work is done; that is what allows it to advance past implementation.
 

@@ -10,6 +10,7 @@ import { getCompletionCheckTimeoutMs, getKnownFlakyChecks, getPublishVerificatio
 import { promptAndPersistPublishScope } from "../commands/choosePublishScope";
 import { isWorkflowPrivatePathV1 } from "../services/workflowPrivacyClassifierV1";
 import { ReviewBlocker } from "./reviewReadiness";
+import { scopeToLatestChecklistV1 } from "./implementationChecklist";
 
 /**
  * Resolve a package manager executable to an absolute path, preferring a
@@ -188,31 +189,30 @@ export function resolvePublishScopeFolder(
  * Text that marks a plan checklist item as not-done-on-purpose. Matching it
  * makes the item `failed` below: deferring is not completing.
  *
- * KNOWN LATENT CONTRADICTION — safe today, read this before changing either
- * side. `run-implementation.md` and `apply-impl-review-code.md` both require
- * a `## Plan Item Checklist` in which an unbuilt item is reported as
- * `deferred — "out of this task's scope" per the plan's own division`. That
- * is the sanctioned wording for an item a plan explicitly assigned to a
- * DIFFERENT task — yet it matches this pattern, so it would score `failed`,
- * and `buildPlanItemVerificationSection` then tells the publish reviewer its
- * verdict "must never state 'no blockers' while a failed item here goes
- * unaddressed". A task that correctly scoped itself would be penalised for
- * doing so.
+ * This pattern used to carry a latent contradiction: `run-implementation.md`
+ * and `apply-impl-review-code.md` sanctioned reporting an unbuilt item as
+ * `deferred — "out of this task's scope" per the plan's own division`, which
+ * matches here and scores `failed`, so a task that "correctly" scoped itself
+ * was penalised for it. The note reasoned that this stayed inert as long as
+ * plans were not divided across tasks.
  *
- * Why that is not a live bug: this fires only when BOTH (a) plan-final.md
- * carries a `- [ ]` checklist (collectAiVerifiedPlanItems returns undefined
- * otherwise) and (b) something is legitimately outside the task's scope. (b)
- * cannot happen under the current delivery rule — one plan is one task, which
- * owns every step in it, so nothing is ever legitimately out of scope and
- * `failed` is the correct verdict for any deferral. The scope-exception text
- * in those prompts is defensive, for a plan that explicitly divides itself;
- * it is inert while plans are not divided.
+ * They were divided the next day. A plan-high-review blocker told a plan to
+ * "split the nine unrelated workstreams into independently implementable
+ * tasks"; the implementation built one of five, and the impl reviewer — told
+ * to count only the portion "this task" owned — emitted `<!-- progress: 5/5 -->`
+ * instead of `5/47`. `N == M` reads as done, so the review-then-implement
+ * cycle that carries a large plan to completion never fired again and the
+ * task walked to Publish with four fifths unbuilt (task "1.8", 2026-08-10).
  *
- * So: if a plan ever DOES divide its scope across tasks, this pattern needs
- * to distinguish scope-deferral (legitimate) from work-avoidance deferral
- * (a real failure) — they read almost identically in prose, which is exactly
- * why this is documented rather than pre-emptively "fixed" with a fragile
- * regex. Deliberate decision, 2026-08-07.
+ * Resolved by removing the exception rather than by loosening this regex: one
+ * plan is one task, a plan is delivered in ordered PARTS across rounds within
+ * that task, and the denominator is always the plan's full step count. A plan
+ * that cannot be delivered that way escalates to a human scope decision — it
+ * is never divided across tasks by the workflow itself. So nothing is ever
+ * legitimately out of scope, and `failed` is the correct verdict for any
+ * deferral. An item simply not built yet is reported as "not yet reached in
+ * the executable order", which deliberately does NOT match here: remaining
+ * work in a staged plan scores `inconclusive`, not `failed`.
  */
 const DEFERRED_MARKERS = /\b(deferred|out[ -]of[ -]scope|won'?t (?:do|fix)|skipped)\b/i;
 
@@ -234,37 +234,42 @@ const DEFERRED_MARKERS = /\b(deferred|out[ -]of[ -]scope|won'?t (?:do|fix)|skipp
  * copy's checkbox state is the stale one.
  */
 export function verifyPlanItems(planContent: string): PlanItemVerification[] {
-  const items = new Map<string, PlanItemVerification>();
-  for (const line of planContent.split(/\r?\n/)) {
+  const items: PlanItemVerification[] = [];
+  // Scoped to the latest rendering, which is what removes the duplication
+  // described above — every rendering opens with its own standalone marker
+  // line, so the last one is the freshest copy. Within that single rendering
+  // one line is one item, with no collapsing by text: two genuinely distinct
+  // steps that happen to share wording stay two steps here, exactly as they do
+  // in countChecklistProgressV1's denominator.
+  for (const line of scopeToLatestChecklistV1(planContent).region.split(/\r?\n/)) {
     const match = /^\s*[-*]\s*\[([ xX])\]\s+(.*\S)\s*$/.exec(line);
     if (!match) {
       continue;
     }
     const checked = match[1]?.toLowerCase() === "x";
     const text = match[2] ?? "";
-    const dedupeKey = text.trim().toLowerCase().replace(/\s+/g, " ");
     const deferred = DEFERRED_MARKERS.test(text);
     if (deferred) {
-      items.set(dedupeKey, {
+      items.push({
         text,
         status: "failed",
         note: "marked deferred/out-of-scope — not counted as complete",
       });
     } else if (checked) {
-      items.set(dedupeKey, {
+      items.push({
         text,
         status: "inconclusive",
         note: "checked in the plan — a checkbox is not evidence; awaiting AI verification against the implementation",
       });
     } else {
-      items.set(dedupeKey, {
+      items.push({
         text,
         status: "inconclusive",
         note: "unchecked — completion could not be verified automatically",
       });
     }
   }
-  return [...items.values()];
+  return items;
 }
 
 // ---------------------------------------------------------------------------

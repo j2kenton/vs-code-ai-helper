@@ -112,6 +112,42 @@ export function isPlanIncomplete(
  * `isPlanIncomplete` rather than re-deriving the comparison, so the shared
  * definition is genuinely shared instead of merely claimed to be.
  */
+/**
+ * Reconcile a review's self-reported `<!-- progress: N/M -->` against the plan
+ * of record's own checklist, which is the authority on how much of the plan
+ * remains.
+ *
+ * A reviewer chooses its own denominator, and a reviewer that narrows it can
+ * declare the task finished while most of the plan is unbuilt: `N == M` is
+ * what every completeness gate reads as done. That is not hypothetical — an
+ * implementation review reported `<!-- progress: 5/5 -->` for a plan whose
+ * checklist held 47 items, the task auto-advanced out of implementation with
+ * 41 items untouched, and only Publish noticed (task "1.8", 2026-08-10).
+ *
+ * So when the plan still lists unchecked items, THOSE numbers win, and no
+ * reported marker can advance the stage. Deliberately asymmetric: a checklist
+ * with nothing left unchecked does NOT override a review still reporting
+ * itself mid-plan — either source may say "not finished", neither may
+ * unilaterally say "finished".
+ *
+ * A plan with no checklist at all reconciles to the review's own marker
+ * unchanged, so tasks that never generated one behave exactly as before.
+ *
+ * This does not itself escalate. It removes the false "done" so the loop keeps
+ * building the remaining items, and a task that genuinely cannot progress hits
+ * the existing no-progress breaker and escalates to the human there — which is
+ * the intended route for a plan that cannot be implemented as written.
+ */
+export function reconcileProgressWithChecklistV1(
+  progress: ReviewProgress | null,
+  checklist: { total: number; checked: number; remaining: number } | undefined
+): ReviewProgress | null {
+  if (!checklist || checklist.remaining <= 0) {
+    return progress;
+  }
+  return { complete: checklist.checked, total: checklist.total };
+}
+
 export function readyToAdvanceStage(
   score: number | null,
   threshold: number,

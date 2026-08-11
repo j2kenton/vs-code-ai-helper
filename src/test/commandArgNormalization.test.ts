@@ -825,6 +825,7 @@ import { resumePausedTask } from "../commands/resumeTask";
 import { patchTaskProgressStrictV1 as patchTaskProgress } from "../services/taskProgressWriterV1";
 import { updateTaskStatus, updateTaskProgressStage, updateImplReviewFiles } from "../utils/taskProgressTransforms";
 import type { TaskProgress } from "../types/taskProgress";
+import { IMPLEMENTATION_SUMMARY_FILENAME } from "../types/taskProgress";
 
 void describe("pauseTask integration (full command path)", () => {
   void it("TaskNode-shaped arg pauses the exact named task", async () => {
@@ -1811,10 +1812,12 @@ void describe("runReviewForFolder impl-review variable sourcing (production code
   });
 
   void it("missing plan-final.md triggers the impl-missing warning, not the plan-missing warning", async () => {
-    // Seed plan.md (plan) but NOT plan-final.md.
-    // Production runReviewForFolder reads plan-final.md via
-    // getCanonicalImplementationUri for {{implementation}}.
-    // A missing plan-final.md must trigger the impl-missing warning.
+    // Seed plan.md (plan) but NO implementation artifact at all.
+    // Production runReviewForFolder fills {{implementation}} via
+    // readImplementationReviewContent, which reads impl-summary.md (a run's
+    // summary), then plan-final.md (the plan of record), then legacy
+    // implementation.md. With none of the three present the impl-missing
+    // warning must fire.
     // If plan.md were read for {{implementation}} instead (the old bug),
     // this test would NOT trigger the impl-missing warning — it would
     // proceed to the AI runner.
@@ -1855,11 +1858,13 @@ void describe("runReviewForFolder impl-review variable sourcing (production code
         true
       );
 
-      // MUST show the impl-missing warning
+      // MUST show the impl-missing warning, naming every artifact it looked for
       const implMissingWarning = msgs.captured.find(
         (m) =>
           m.method === "warning" &&
-          m.message.includes("plan-final.md is missing or empty")
+          m.message.includes("No implementation notes found") &&
+          m.message.includes(IMPLEMENTATION_SUMMARY_FILENAME) &&
+          m.message.includes("plan-final.md")
       );
       assert.ok(
         implMissingWarning !== undefined,

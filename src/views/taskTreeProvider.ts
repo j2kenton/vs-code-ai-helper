@@ -102,6 +102,18 @@ function buildTaskTooltip(task: IncompleteTask): vscode.MarkdownString {
   if (task.progress.pinnedAt) {
     lines.push("$(pinned) **Pinned**", "");
   }
+  // The completeness gate stands down for this task (see
+  // checklistProgressUnreliable). Surfaced because the alternative is degrading
+  // in silence: a round landed work the plan's checklist could not record, so
+  // its counts understate what is done and no longer gate advancement. Without
+  // this the only trace is a comment in one round's summary, long scrolled past
+  // by the time the missing safety net matters.
+  if (task.progress.checklistProgressUnreliable) {
+    lines.push(
+      "$(warning) **Plan checklist is not a complete record** — a round landed changes it could not check off, so its counts understate what is done and no longer gate advancement. Tick the missed items in `plan-final.md`, then run **Ensemble: Mark Plan Checklist Reconciled** on this task to restore them.",
+      ""
+    );
+  }
 
   for (const stage of STAGE_ORDER) {
     const status = getStageStatus(stage, task.progress.currentStage, task.progress.completedStages);

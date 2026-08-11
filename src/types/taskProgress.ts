@@ -63,6 +63,23 @@ export const IMPLEMENTATION_FILENAME = "plan-final.md";
 export const LEGACY_IMPLEMENTATION_FILENAME = "implementation.md";
 
 /**
+ * The filename for an implementation RUN's summary.
+ *
+ * Deliberately separate from {@link IMPLEMENTATION_FILENAME}. plan-final.md is
+ * the implementation plan of record — promoted from plan.md on entering the
+ * stage, then refined into an `<!-- ensemble:implementation-checklist -->`
+ * checklist — and it is read as durable state by completionLint's plan-item
+ * verification and publishScopeCheck's path extraction. Writing a run's
+ * free-text summary over it destroyed all of that (observed live 2026-08-10:
+ * a 47-item checklist replaced by a three-line "tests still running" status
+ * message, which silently emptied the Plan Item Verification section and left
+ * both implementation reviewers reading that message as the implementation).
+ * The two roles now own separate files: the plan of record is never
+ * overwritten by a run, and the run summary has a home of its own.
+ */
+export const IMPLEMENTATION_SUMMARY_FILENAME = "impl-summary.md";
+
+/**
  * The filename for the generated context pack artifact
  */
 export const CONTEXT_PACK_FILENAME = "context-pack.md";
@@ -212,6 +229,25 @@ export interface TaskProgress {
    * completes with a passing (or skipped) type-check.
    */
   implementationTypeCheckFailure?: ImplementationTypeCheckFailure;
+
+  /**
+   * True once a round completed work that could not be recorded in the plan's
+   * `- [ ]` checklist, making its counts permanently understate what is done.
+   *
+   * Set when a runner-authored round lands (the sealed edit pipeline returns
+   * verified receipts and no written summary, so it cannot echo the checklist
+   * back). Durable rather than derived from the latest summary, because the
+   * damage outlives the round: a later model-authored round ticks only the
+   * items IT completed, so the earlier round's work stays unticked forever
+   * while the fresh summary makes the checklist look trustworthy again. The
+   * count would then hold a finished plan short of its total indefinitely.
+   *
+   * Consulted by the completeness gate, which stands down rather than treat an
+   * under-counting checklist as the authority on remaining work. Cleared only
+   * by an explicit reconciliation of the checklist against the tree — never by
+   * a later round, which has no way to know what the unrecorded round did.
+   */
+  checklistProgressUnreliable?: boolean;
 }
 
 /** `TaskProgress.implementationTypeCheckFailure` — one round's failing type-check. */

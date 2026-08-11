@@ -146,6 +146,12 @@
         "icon": "$(debug-continue)"
       },
       {
+        "command": "vs-code-ai-helper.reconcilePlanChecklist",
+        "title": "Mark Plan Checklist Reconciled",
+        "category": "Ensemble",
+        "icon": "$(checklist)"
+      },
+      {
         "command": "vs-code-ai-helper.pinTask",
         "title": "Pin Task",
         "category": "Ensemble",
@@ -799,6 +805,11 @@
           "command": "vs-code-ai-helper.cancelScheduledTaskAction",
           "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^task/ && viewItem =~ /-scheduled/",
           "group": "task@4"
+        },
+        {
+          "command": "vs-code-ai-helper.reconcilePlanChecklist",
+          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^task/",
+          "group": "9_troubleshoot"
         }
       ]
     },

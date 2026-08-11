@@ -45,6 +45,14 @@ import { readPackageScripts } from "../utils/completionLint";
  * matches the generated-summary shape (see looksLikeGeneratedImplementationSummary);
  * a workspace's own unrelated file of the same name is left alone.
  */
+// Deliberately NOT including IMPLEMENTATION_SUMMARY_FILENAME. These two names
+// are reserved because the implementation prompt mentions them by name, so a
+// model can misread the mention as an instruction to write the file. Nothing
+// ever tells a provider to write impl-summary.md — the summary is returned as
+// text — so reserving it would guard against a misdirection that cannot
+// happen, while a repository that legitimately owns a root impl-summary.md
+// with the natural "## Files Changed"/"## Verification" sections would have
+// real edits to it silently dropped from filesChanged.
 const RESERVED_ROOT_ARTIFACT_NAMES: ReadonlySet<string> = new Set([
   IMPLEMENTATION_FILENAME,
   LEGACY_IMPLEMENTATION_FILENAME,

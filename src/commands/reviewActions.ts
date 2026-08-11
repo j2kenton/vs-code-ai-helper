@@ -16,6 +16,7 @@ import {
 import {
   EscalationKind,
   IMPL_REVIEW_STAGES,
+  IMPLEMENTATION_SUMMARY_FILENAME,
   isPlanReviewStage,
   isReviewStage,
   PLAN_FILENAME,
@@ -49,12 +50,19 @@ import {
   attributionModelLabel,
   openOrCreateDocument,
   readNonEmptyText,
+  readTextIfExists,
   resolveCurrentPlanUri,
   safeOpenTextDocument,
   statIfExists,
   withAttribution,
   writeTextFile,
 } from "../utils/fileUtils";
+import {
+  ChecklistProgressV1,
+  hasImplementationChecklistV1,
+  IMPLEMENTATION_CHECKLIST_MARKER,
+  mergeChecklistProgressV1,
+} from "../utils/implementationChecklist";
 import { generateContextPack, writeContextPack, writeImplReviewContextPack } from "../utils/contextPack";
 import { renderPromptTemplate } from "../utils/promptTemplates";
 import { writeRunLog } from "../utils/runLog";
@@ -76,8 +84,15 @@ import {
   resolveModelForStage,
 } from "../utils/modelSelection";
 import {
+  buildSyntheticImplementationSummaryV1,
+  buildUnusableImplementationSummaryV1,
+  describeImplementationSummaryShapeIssue,
   getCanonicalImplementationUri,
+  getImplementationSummaryUri,
   getLegacyImplementationUri,
+  isUnusableImplementationSummaryV1,
+  readImplementationReviewContent,
+  readPlanOfRecordV1,
   resolveImplementationArtifact,
   materializeCanonicalIfNeeded,
   preparePlanPromotion,
@@ -121,6 +136,7 @@ import {
   parseReviewBlockersDetailed,
   parseReviewedCommitSha,
   parseReviewProgress,
+  reconcileProgressWithChecklistV1,
   detectSiblingReviewDisagreement,
   ReviewBlocker,
 } from "../utils/reviewReadiness";
@@ -1766,7 +1782,23 @@ async function routeReviewOutcomeV1(
         // implementation stage with 12 steps unbuilt — observed live.
         // Completeness now has to be checked explicitly, here as well as in
         // reviewScoreLoop.ts's two termination paths.
-        const progress = parseReviewProgress(content);
+        // The reviewer picks its own denominator, so its marker alone cannot
+        // be trusted to mean "the plan is finished" — the plan of record's
+        // checklist is the authority on what remains.
+        //
+        // Implementation-side stages only. A task rolled back from
+        // implementation to a plan review keeps its half-finished
+        // plan-final.md, and a plan review emits no progress marker of its
+        // own — so reconciling here would substitute the implementation's
+        // outstanding count into the plan stage, block its auto-advance, and
+        // let Fast Forward grind into no-progress escalation, when returning
+        // to implementation is precisely what would tick those items off.
+        const progress = isPlanReviewStage(targetStage)
+          ? parseReviewProgress(content)
+          : reconcileProgressWithChecklistV1(
+              parseReviewProgress(content),
+              await readPlanChecklistProgressV1(folderUri)
+            );
         const planIncomplete = isPlanIncomplete(progress);
         const meetsThreshold = readyToAdvanceStage(score, autoAdvanceThreshold, progress);
         // Records this round in the durable score history and decides
@@ -2244,14 +2276,16 @@ export async function runReviewForFolder(
     //     itself.
     //
     //   {{implementation}} — the run summary / implementation notes.
-    //     Source: plan-final.md (getCanonicalImplementationUri).
-    //     executeImplementationRun writes the summary here on completion.
+    //     Source: impl-summary.md, then plan-final.md, then implementation.md
+    //     (readImplementationReviewContent). executeImplementationRun writes
+    //     each completed run's summary to impl-summary.md; it no longer writes
+    //     over plan-final.md, which is the plan of record.
     //
-    //   Legacy tasks (implementation.md present, plan-final.md absent):
-    //     materializeCanonicalIfNeeded copies implementation.md → plan-final.md
-    //     so the canonical path always exists after this point. This mirrors
-    //     the same migration used by generateImplementationWithAI and
-    //     runImplementationWithAI.
+    //     The plan-final.md step is not only a legacy path: a task whose
+    //     implementation ran before the summary split had its run summary
+    //     written there, and a task that has only been promoted (no run yet)
+    //     has its checklist there. Both are better {{implementation}} content
+    //     than nothing, and both still differ from {{plan}}.
 
     const planUri = await resolveCurrentPlanUri(folderUri);
     const planContent = await readNonEmptyText(planUri);
@@ -2262,21 +2296,30 @@ export async function runReviewForFolder(
       return;
     }
 
-    // Read-only: never materialize plan-final.md from legacy implementation.md
-    // here. This function only reads content to build a review prompt — a
-    // review that is later cancelled, fails, or returns questions must leave
-    // the implementation artifact byte-identical. Eagerly writing plan-final.md
-    // as a side effect of preparing a prompt was the same defect already fixed
-    // in generateImplementationWithAI; the canonical-vs-legacy fallback read
-    // mirrors that fix instead of reusing the writing materializeCanonicalIfNeeded.
-    let implementationContent = await readNonEmptyText(getCanonicalImplementationUri(folderUri));
-    if (!implementationContent) {
-      implementationContent = await readNonEmptyText(getLegacyImplementationUri(folderUri));
-    }
+    // Read-only: never materialize any implementation artifact here. This
+    // function only reads content to build a review prompt — a review that is
+    // later cancelled, fails, or returns questions must leave every
+    // implementation artifact byte-identical. Eagerly writing plan-final.md as
+    // a side effect of preparing a prompt was the same defect already fixed in
+    // generateImplementationWithAI; this ordered fallback read mirrors that fix
+    // instead of reusing the writing materializeCanonicalIfNeeded.
+    const implementationContent = await readImplementationReviewContent(folderUri);
     if (!implementationContent) {
       NotificationRouter.showWarning(
-        "No implementation notes found (plan-final.md is missing or empty). " +
-          "Run the implementation step first."
+        `No implementation notes found (${IMPLEMENTATION_SUMMARY_FILENAME} and plan-final.md are ` +
+          "missing or empty). Run the implementation step first."
+      );
+      return;
+    }
+    // The last round changed files but returned nothing reviewable. Every
+    // review entry point refuses here — not just the automated follow-up the
+    // run itself declined to dispatch — because the alternative is reviewing
+    // an earlier round's notes against a tree they no longer describe.
+    if (isUnusableImplementationSummaryV1(implementationContent)) {
+      NotificationRouter.showWarning(
+        "The last implementation round did not produce usable implementation notes, so there is " +
+          `nothing to review it against (see ${IMPLEMENTATION_SUMMARY_FILENAME} and the run log). ` +
+          "Run the implementation step again to produce them."
       );
       return;
     }
@@ -3356,7 +3399,18 @@ export async function fastForwardReviewWithAI(
               zeroFixableEvidence: hasMechanicalTaskFixable ? false : hasZeroTaskFixableEvidence(newContent),
               // "Clean so far" vs "clean and finished" — null when the review
               // emitted no marker, which preserves the pre-marker behavior.
-              progress: parseReviewProgress(newContent),
+              // Reconciled against the plan of record's checklist for the same
+              // reason as the advancement gate: a narrowed denominator would
+              // otherwise terminate this loop early, reporting success with
+              // most of the plan unbuilt. Skipped for plan reviews for the
+              // same reason as there — a rolled-back task's leftover
+              // implementation checklist is not that stage's progress.
+              progress: isPlanReviewStage(targetStage)
+                ? parseReviewProgress(newContent)
+                : reconcileProgressWithChecklistV1(
+                    parseReviewProgress(newContent),
+                    await readPlanChecklistProgressV1(resolved.folderUri)
+                  ),
             };
           },
         }).finally(() => linked.dispose());
@@ -3593,13 +3647,36 @@ async function applyImplementationReviewWithAI(
     return false;
   }
 
-  const implementationNotes = await readNonEmptyText(canonicalUri);
-  if (!implementationNotes) {
+  const planOfRecordNotes = await readNonEmptyText(canonicalUri);
+  if (!planOfRecordNotes) {
     NotificationRouter.showWarning(
       "No plan-final.md found. Nothing to apply the review to."
     );
     return false;
   }
+
+  // {{implementation}} here carries BOTH artifacts, because this prompt needs
+  // both and they now live in different files. apply-impl-review-code.md tells
+  // the round to echo the plan's checklist back (so plan progress keeps
+  // accumulating), which requires the plan of record — but before the split,
+  // plan-final.md also held the last round's summary, so the round could see
+  // its Files Changed / Verification / remaining blockers. Swapping wholesale
+  // to impl-summary.md would restore that evidence and lose the checklist;
+  // appending keeps both, checklist first so the echo instruction reads
+  // naturally. A summary stamped unusable is omitted rather than presented as
+  // notes — there is nothing reviewable in a rejection stamp.
+  //
+  // The separator deliberately does NOT name impl-summary.md. Both runners
+  // reserve only the artifact filenames a prompt actually mentions, on the
+  // reasoning that a model can misread a mention as an instruction to write
+  // the file; naming this one here would have put it in front of an
+  // edit-capable agent while it sits outside those reserved sets, so a
+  // misdirected repo-root write would be recorded as a real source change.
+  const latestSummary = await readNonEmptyText(getImplementationSummaryUri(folderUri));
+  const implementationNotes =
+    latestSummary && !isUnusableImplementationSummaryV1(latestSummary)
+      ? `${planOfRecordNotes}\n\n---\n\n## Latest implementation round summary\n\n${latestSummary}`
+      : planOfRecordNotes;
 
   // Do not make the implementation model infer the approved contract from a
   // review or from its own prior summary. Review generation already uses the
@@ -4612,7 +4689,41 @@ const IMPLEMENTATION_ELIGIBLE_STAGES: readonly TaskStage[] = [
  * so the marker check is additionally limited to first runs (no
  * implReviewFiles yet) to avoid regenerating over an existing run's output.
  */
-export const IMPLEMENTATION_CHECKLIST_MARKER = "<!-- ensemble:implementation-checklist -->";
+export { IMPLEMENTATION_CHECKLIST_MARKER };
+
+/**
+ * The plan of record's checklist state, for reconciling against a review's
+ * self-reported progress marker (see reconcileProgressWithChecklistV1).
+ * `undefined` whenever there is nothing authoritative to reconcile against:
+ * no plan-final.md, or one that never had a checklist generated.
+ */
+async function readPlanChecklistProgressV1(
+  folderUri: vscode.Uri
+): Promise<ChecklistProgressV1 | undefined> {
+  const plan = await readPlanOfRecordV1(folderUri);
+  const counted = plan.counts;
+  if (!plan.hasChecklist || !counted) {
+    return undefined;
+  }
+  // The checklist is only authoritative while something is maintaining it.
+  // When the last round could not report checkbox state — any runner whose
+  // result is runner-authored rather than model-authored — its counts are a
+  // snapshot from some earlier round, not a live record of remaining work.
+  // Presenting a frozen number as live is worse than presenting none: it would
+  // block advancement forever on evidence that stopped updating.
+  //
+  // Durable, not derived from the latest summary. A round whose work never
+  // reached the checklist leaves it permanently short: the NEXT round ticks
+  // only what it did itself, so the missing items stay missing while the fresh
+  // model-authored summary makes the checklist look current again. Reading the
+  // latest summary alone therefore re-enabled the gate on a count that can
+  // never reach its total, holding a finished plan at N/M forever.
+  const progress = await readTaskProgressAdvisoryV1(folderUri);
+  if (progress?.checklistProgressUnreliable) {
+    return undefined;
+  }
+  return counted;
+}
 
 /**
  * Shared core of an implementation run.
@@ -4819,7 +4930,7 @@ async function executeImplementationRun(
   taskOperations.setResultTargetUriForTask(folderUri.fsPath, logUri);
 
   if (result.status === "completed") {
-    const implementationUri = getCanonicalImplementationUri(folderUri);
+    const summaryUri = getImplementationSummaryUri(folderUri);
     const taskKey = normalizePath(folderUri.fsPath);
 
     if (!result.filesChangedUnknown && result.filesChanged.length === 0) {
@@ -4878,20 +4989,97 @@ async function executeImplementationRun(
       zeroChangeImplRoundsByTask.delete(taskKey);
     }
 
-    const summary = result.summary?.trim();
-    if (summary) {
+    // The run summary is written to impl-summary.md and NEVER over
+    // plan-final.md. plan-final.md is the implementation plan of record — the
+    // promoted plan, then the `<!-- ensemble:implementation-checklist -->`
+    // checklist — and three separate consumers read it as durable state:
+    // completionLint's collectAiVerifiedPlanItems (which returns undefined,
+    // rendering NO Plan Item Verification section at all, once the `- [ ]`
+    // lines are gone), publishScopeCheck's path extraction, and
+    // {{implementation}} itself. Overwriting it with a run's free-text summary
+    // destroyed all three at once (observed live 2026-08-10).
+    //
+    // Validated before it is written, and validated even when it will not be:
+    // a completed run whose final text does not follow the summary contract
+    // both implementation prompts mandate is not a reviewable round. The
+    // failure that motivated this shipped a "tests are still running in the
+    // background, I'll report back" message as the implementation notes; the
+    // only guard was non-empty, so both reviewers scored a status message.
+    const summary = result.summary?.trim() ?? "";
+    // A plan carrying a checklist must get it back with updated boxes: that
+    // echo is the only thing that advances plan progress, so a round that
+    // drops it would leave the plan reading as untouched forever. Read once
+    // and reused by the merge below, so the gate and the merge can never
+    // disagree about which document they are checking against.
+    const planOfRecordUri = getCanonicalImplementationUri(folderUri);
+    const plan = await readPlanOfRecordV1(folderUri);
+    const planChecklist = plan.hasChecklist ? plan.text : undefined;
+    // The gate enforces the contract run-implementation.md imposes on a model.
+    // A runner-synthesized summary never went through that prompt (the sealed
+    // edit pipeline reports "Applied N sealed edit step(s)…"), so holding it to
+    // that shape stamped every successful Copilot run unusable and refused to
+    // advance — disabling that execution path entirely, on success.
+    const summaryIssue = result.summaryIsSynthetic
+      ? undefined
+      : describeImplementationSummaryShapeIssue(summary, {
+          planChecklist,
+          roundChangedFiles: !result.filesChangedUnknown && result.filesChanged.length > 0,
+        });
+    if (!summaryIssue) {
       // Signed with the reservation actually invoked (never the requested
       // primary) — same helper and header format review artifacts use
-      // (reviewRowV1.ts), so plan-final.md is indistinguishable in format
+      // (reviewRowV1.ts), so impl-summary.md is indistinguishable in format
       // regardless of which path wrote it.
+      // A runner-authored summary is recorded AS runner-authored, so later
+      // stages can tell that this round could not report checklist progress
+      // instead of reading the plan's frozen counts as current.
+      const summaryText = result.summaryIsSynthetic
+        ? buildSyntheticImplementationSummaryV1(summary, result.filesChanged)
+        : summary;
       const signedSummary = result.providerLabel
         ? withAttribution(
-            summary,
+            summaryText,
             result.providerLabel,
             result.storedModelId ? attributionModelLabel(result.storedModelId) : undefined
           )
-        : summary;
-      await writeTextFile(implementationUri, `${signedSummary}\n`);
+        : summaryText;
+      await writeTextFile(summaryUri, `${signedSummary}\n`);
+
+      // Carry this round's checkbox progress back into the plan of record.
+      // The reproduced checklist in the summary is the only persistent record
+      // of how much of the plan remains (run-implementation.md), and the next
+      // round reads plan-final.md — not the summary — as its Final Plan. It
+      // used to arrive there because the summary REPLACED plan-final.md, which
+      // is the same coupling that destroyed the checklist when a provider
+      // returned a status message. Merging ticks instead keeps the progress
+      // record without ever letting a run overwrite the plan.
+      if (planChecklist !== undefined) {
+        const merged = mergeChecklistProgressV1(planChecklist, summary);
+        if (merged !== undefined) {
+          await writeTextFile(planOfRecordUri, merged);
+        }
+      }
+    } else {
+      // Stamped HERE, next to the write it replaces, rather than beside the
+      // warning further down: a round can fail its type-check AND return a
+      // malformed summary, and the type-check gate returns first. Stamping at
+      // the warning meant that combination left no marker at all, so a later
+      // manual Review or Fast Forward would evaluate an older summary — or the
+      // plan, via the fallback — against a tree this round has since broken.
+      //
+      // Skipped when a stamp is already there. The warning tells the user to
+      // rerun, so consecutive rejected rounds are the normal recovery path —
+      // and re-stamping would back the FIRST stamp over impl-summary_prev.md,
+      // destroying the last usable summary the stamp itself promises is
+      // preserved. Nothing is lost by not rewriting: the marker is identical
+      // in effect, and each round's full response is in its own run log.
+      const existingSummary = await readTextIfExists(summaryUri);
+      if (!existingSummary || !isUnusableImplementationSummaryV1(existingSummary)) {
+        await writeTextFile(
+          summaryUri,
+          `${buildUnusableImplementationSummaryV1(summaryIssue, path.basename(logUri.fsPath))}\n`
+        );
+      }
     }
 
     // Post-run: show changed files or warn if tracking was unavailable
@@ -4966,11 +5154,63 @@ async function executeImplementationRun(
       // also applies the machine-maintained filter and keeps newest-first
       // ordering, so a context-pack budget trims the oldest (already
       // reviewed) files rather than the current round's work.
+      // Any round that changed the tree without its checklist state being
+      // recorded leaves the plan's counts permanently short — no later round
+      // can tick items on its behalf. Two ways that happens, and both must
+      // latch, not just the first:
+      //   - runner-authored (the sealed pipeline returns receipts, not prose,
+      //     so there is no echo to merge);
+      //   - a rejected summary, where the merge is skipped entirely because
+      //     the response never passed validation.
+      // A merge that ran and ticked nothing is NOT this case: an echo that
+      // reports no completions is an accurate record of a round that finished
+      // no items, and flagging it would disable the gate on healthy tasks.
+      // "Might have changed the tree", not "provably did": when change
+      // tracking is unavailable (no git repo) filesChangedUnknown is true and
+      // the paths cannot be enumerated, but a CLI round may well have edited
+      // files. Requiring an enumerated change set left the latch unset purely
+      // because we could not list what moved, so a later valid round made the
+      // permanently under-counting checklist authoritative again — with no
+      // warning and no reconciliation action offered. Only a round KNOWN to
+      // have changed nothing is exempt.
+      const roundMayHaveChangedFiles =
+        result!.filesChangedUnknown === true || result!.filesChanged.length > 0;
+      const checklistStateUnrecorded =
+        planChecklist !== undefined &&
+        roundMayHaveChangedFiles &&
+        (result!.summaryIsSynthetic === true || summaryIssue !== undefined);
+      // updatedAt is bumped with the latch. patchTaskProgressStrictV1 does not
+      // set it (only creation does), and the updateImplReviewFiles branch below
+      // — which would have — is skipped when the change set is unknown. Without
+      // the bump, reconcilePlanChecklist's race check cannot see the very round
+      // that warranted the latch, and would clear it.
+      const stageRecorded = checklistStateUnrecorded
+        ? {
+            ...stageUpdated,
+            checklistProgressUnreliable: true,
+            updatedAt: new Date().toISOString(),
+          }
+        : stageUpdated;
+
       if (!result!.filesChangedUnknown && result!.filesChanged.length > 0) {
-        return updateImplReviewFiles(stageUpdated, result!.filesChanged);
+        return updateImplReviewFiles(stageRecorded, result!.filesChanged);
       }
-      return stageUpdated;
+      return stageRecorded;
     });
+
+    // Any existing review artifact describes the tree as it was BEFORE this
+    // round's edits, so it is stale the moment those edits land — regardless
+    // of whether this run goes on to dispatch a review. Both gates below
+    // return early, and leaving a pre-edit review looking current is exactly
+    // how a later manual Review or stage advance ends up scoring evidence
+    // that no longer matches the workspace. Staling first makes the early
+    // returns safe; isUnusableAsExistingReview then refuses the placeholder.
+    if (isReviewStage(postRunReviewStage)) {
+      const reviewUri = artifactUri(folderUri, postRunReviewStage);
+      if (reviewUri) {
+        await markReviewArtifactStale(reviewUri, "workspace files");
+      }
+    }
 
     // (2g) A round that leaves the tree non-compiling must never be handed
     // to a reviewer as if it were reviewable. The edits and the failure are
@@ -4988,14 +5228,29 @@ async function executeImplementationRun(
       return false;
     }
 
-    if (isReviewStage(postRunReviewStage)) {
-      const reviewUri = artifactUri(folderUri, postRunReviewStage);
-      if (reviewUri) {
-        await markReviewArtifactStale(reviewUri, "workspace files");
-      }
+    // Same contract as the type-check gate directly above, and placed after
+    // the same durable recording for the same reason: a round whose final
+    // response does not follow the mandated summary shape has still edited the
+    // tree, so its files must be recorded — but it must not be handed onward
+    // as a reviewable round. {{implementation}} would otherwise carry whatever
+    // the provider happened to say last, and a reviewer cannot tell a status
+    // message from implementation notes. The full response is already durably
+    // captured in the run log, so nothing is lost by declining to promote it.
+    if (summaryIssue) {
+      // The rejection stamp was already written above, before the type-check
+      // gate, so every review entry point refuses this round regardless of
+      // which gate returns first.
+      NotificationRouter.showWarning(
+        "⚠️ Implementation finished, but the provider did not return a usable summary " +
+          `(${summaryIssue}). The round's edits were kept and recorded for review, but ` +
+          "review has been paused — a reviewer would otherwise be handed this text " +
+          "as the implementation notes. See the implementation run log for the full response."
+      );
+      await safeOpenTextDocument(logUri, "implementation run log");
+      return false;
     }
 
-    await safeOpenTextDocument(implementationUri, "plan-final.md");
+    await safeOpenTextDocument(summaryUri, IMPLEMENTATION_SUMMARY_FILENAME);
 
     // Auto-advance: a completed implementation proceeds to High-Level Code
     // Review when auto-advance is enabled, and (via AUTO_REVIEW_TRANSITIONS)
@@ -5218,7 +5473,7 @@ export async function runImplementationWithAI(
     // have implReviewFiles from an earlier run, and whose plan-final.md may
     // hold a post-run summary) never regenerate.
     const needsChecklist =
-      !planFinalContent.includes(IMPLEMENTATION_CHECKLIST_MARKER) &&
+      !hasImplementationChecklistV1(planFinalContent) &&
       resolved.progress.currentStage === "impl" &&
       (resolved.progress.implReviewFiles?.length ?? 0) === 0;
     if (needsChecklist) {
@@ -6026,17 +6281,26 @@ async function buildReviewResumeVariablesV1(
   variables.plan = planContent;
 
   if (!isPlanReview) {
-    // Read-only fallback (see the identical rationale in runReviewForFolder):
-    // never materialize plan-final.md here as a side effect of rebuilding
-    // second-opinion prompt variables.
-    let implementationContent = await readNonEmptyText(getCanonicalImplementationUri(folderUri));
-    if (!implementationContent) {
-      implementationContent = await readNonEmptyText(getLegacyImplementationUri(folderUri));
-    }
+    // Same resolver and same order as runReviewForFolder — a resumed review
+    // (and any second opinion routed off it) must see the SAME
+    // {{implementation}} the original review saw. Reading plan-final.md
+    // directly here handed the second prompt the checklist plan while the
+    // first got impl-summary.md, so the two could reconcile against different
+    // documents. Read-only by the same rationale: never materialize an
+    // artifact as a side effect of rebuilding prompt variables.
+    const implementationContent = await readImplementationReviewContent(folderUri);
     if (!implementationContent) {
       return {
         ok: false,
-        warning: "No implementation notes found (plan-final.md is missing or empty). Run the implementation step first.",
+        warning: `No implementation notes found (${IMPLEMENTATION_SUMMARY_FILENAME} and plan-final.md are missing or empty). Run the implementation step first.`,
+      };
+    }
+    if (isUnusableImplementationSummaryV1(implementationContent)) {
+      return {
+        ok: false,
+        warning:
+          "The last implementation round did not produce usable implementation notes, so there is " +
+          "nothing to review it against. Run the implementation step again to produce them.",
       };
     }
     variables.implementation = implementationContent;
@@ -6125,6 +6389,23 @@ export async function resumeReviewInteractionV1(
     return { ok: false, reason: "could not claim the review attempt (the task may have been paused)" };
   }
 
+  // Preflight BEFORE resuming, and fail closed. An interaction can sit waiting
+  // on questions while a later implementation round changes the tree and
+  // stamps its summary unusable; resuming first meant the provider answered
+  // against its original, now-stale prompt and the outcome still went through
+  // handleReviewOutcomeV1 — which can advance the stage. A warning after the
+  // fact does not undo that. Checking first turns it into a refusal.
+  const variablesResult = await buildReviewResumeVariablesV1(
+    taskFolderUri,
+    workspaceFolderUri,
+    targetStage,
+    cancellationToken
+  );
+  if (!variablesResult.ok) {
+    NotificationRouter.showWarning(variablesResult.warning);
+    return { ok: false, reason: variablesResult.warning };
+  }
+
   const outcome = await coordinator.resumeAction({
     interaction: interactionRef,
     taskBinding: { taskBindingId: ref.taskBindingId, chatDocumentId: ref.chatDocumentId },
@@ -6134,16 +6415,6 @@ export async function resumeReviewInteractionV1(
     cancellationToken,
   });
 
-  const variablesResult = await buildReviewResumeVariablesV1(
-    taskFolderUri,
-    workspaceFolderUri,
-    targetStage,
-    cancellationToken
-  );
-  if (!variablesResult.ok) {
-    NotificationRouter.showWarning(variablesResult.warning);
-  }
-
   await handleReviewOutcomeV1(outcome, {
     extensionUri,
     folderUri: taskFolderUri,
@@ -6151,7 +6422,7 @@ export async function resumeReviewInteractionV1(
     currentStage,
     targetStage,
     reviewUri,
-    variables: variablesResult.ok ? variablesResult.variables : {},
+    variables: variablesResult.variables,
     reviewAttemptId,
     chatViewProvider,
   });

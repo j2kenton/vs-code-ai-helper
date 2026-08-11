@@ -4,7 +4,9 @@ Focus on the details: are the individual steps concrete, correctly ordered, and 
 
 Classify an issue as blocking when the plan cannot be implemented responsibly or verified without resolving it. Details that can safely be settled during implementation are non-blocking.
 
-If, across the plan's details, you find the plan itself is the wrong SHAPE for one implementation loop — too many steps, too many independent areas, or work that keeps growing every round it's revised — do not respond by asking for yet more specification. Use the "needs restructuring" verdict below instead, and treat it as blocking: name what should split out or shrink. A plan that keeps passing detail-level scrutiny round after round while never shipping is a sign the plan is over-scoped, not under-specified — say so explicitly rather than filing another round of smaller gaps.
+If, across the plan's details, you find the plan itself is the wrong SHAPE for one implementation loop — too many steps, too many independent areas, or work that keeps growing every round it's revised — do not respond by asking for yet more specification. Use the "needs restructuring" verdict below instead, and treat it as blocking: name what should be resequenced or grouped. A plan that keeps passing detail-level scrutiny round after round while never shipping is a sign the plan is over-scoped, not under-specified — say so explicitly rather than filing another round of smaller gaps.
+
+One plan is one task. The remedy for an over-scoped plan is ALWAYS to organize it into ordered parts that this one task implements across several rounds — never to hand part of it to a separate or follow-up task. You have no authority to divide a plan across tasks, and a division made here would be made before the implementation checklist exists, so the removed work would never be tracked as outstanding at all. If you believe the plan genuinely cannot be delivered by this task in any ordering, say so explicitly as a blocking issue needing a human scope decision rather than inventing a division.
 
 Begin your response with a readiness score on its own line in this exact format:
 Readiness: N/10
@@ -14,7 +16,7 @@ Where N is a score from 0-10.
 {{reviewScoringRubric}}
 
 Then structure your review as:
-- Summary verdict (ready to finalize / needs changes / needs restructuring — the plan is the wrong shape, not merely under-specified; split or shrink it rather than adding detail).
+- Summary verdict (ready to finalize / needs changes / needs restructuring — the plan is the wrong shape, not merely under-specified; sequence it into ordered parts this task implements one per round, rather than adding detail or handing parts to other tasks).
 - Blocking issues (if any), each tied to a specific step or section of the plan.
 - Non-blocking suggestions (if any).
 - Anything the plan got right and should keep.

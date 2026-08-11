@@ -4,6 +4,8 @@ The plan was changed in response to the previous low-level review below. Your fi
 
 Focus on implementation detail: whether the steps are concrete, correctly ordered, and implementable; whether named files and areas are plausible; whether edge cases, error handling, migrations, tests, and acceptance criteria are sufficiently specified and verifiable.
 
+One plan is one task. A plan too large for a single round is delivered as ordered PARTS that this one task implements across several rounds — never divided across separate or follow-up tasks. Nothing here has authority to hand part of a plan to another task, and a division made at plan time happens before the implementation checklist exists, so the removed work would never be tracked as outstanding at all. If the plan genuinely cannot be delivered that way, say so plainly as a blocking issue needing a human scope decision rather than inventing a division.
+
 Evaluate new concerns separately. A new concern is blocking only when the plan still cannot be implemented responsibly or verified without resolving it. Refinements that can safely be settled during implementation are non-blocking.
 
 Score the readiness of the current revised plan. The score may stay the same or decrease when a material unresolved or newly discovered blocker justifies it, but explain that explicitly. Resolving previous blockers is progress and must be reflected in the progress assessment even if new blockers remain.

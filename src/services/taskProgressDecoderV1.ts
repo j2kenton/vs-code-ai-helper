@@ -131,6 +131,7 @@ export const TASK_PROGRESS_PRODUCT_FIELD_NAMES_V1 = [
   "reviewRejections",
   "escalation",
   "implementationTypeCheckFailure",
+  "checklistProgressUnreliable",
 ] as const satisfies readonly (keyof TaskProgress)[];
 
 type MissingProductFieldV1 = Exclude<
@@ -950,6 +951,16 @@ export function decodeTaskProgressTextV1(
           return recovery("invalidFieldValue", "displayName must be a bounded string");
         }
         draft.displayName = value;
+        break;
+      }
+      case "checklistProgressUnreliable": {
+        if (typeof value !== "boolean") {
+          return recovery(
+            "invalidFieldValue",
+            "checklistProgressUnreliable must be an exact boolean"
+          );
+        }
+        draft.checklistProgressUnreliable = value;
         break;
       }
       case "nameIsDefault": {

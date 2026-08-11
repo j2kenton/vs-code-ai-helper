@@ -39,6 +39,7 @@ import { registerRecoverLastAiResponseCommand } from "./commands/recoverLastAiRe
 import { registerPauseTaskCommand } from "./commands/pauseTask";
 import { registerArchiveTaskCommands } from "./commands/archiveTask";
 import { registerPinTaskCommands } from "./commands/pinTask";
+import { registerReconcilePlanChecklistCommands } from "./commands/reconcilePlanChecklist";
 import { registerTaskCreationRecoveryCommands, resumeStrandedTaskDeletionsV1 } from "./commands/taskCreationRecovery";
 import { registerApplyHighLevelReviewChangesCommand } from "./commands/applyHighLevelReviewChanges";
 import { registerApplyLowLevelReviewChangesCommand } from "./commands/applyLowLevelReviewChanges";
@@ -534,6 +535,7 @@ export function activate(context: vscode.ExtensionContext): void {
   registerPauseTaskCommand(context, inventory, currentTaskStore);
   registerArchiveTaskCommands(context, inventory, currentTaskStore);
   registerPinTaskCommands(context, inventory);
+  registerReconcilePlanChecklistCommands(context, inventory, currentTaskStore);
   registerTaskCreationRecoveryCommands(context, inventory, currentTaskStore);
   registerApplyHighLevelReviewChangesCommand(context, inventory);
   registerApplyLowLevelReviewChangesCommand(context, inventory);

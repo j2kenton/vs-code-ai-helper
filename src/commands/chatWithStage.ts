@@ -3,6 +3,7 @@ import * as path from "path";
 import { TaskInventory } from "../state/taskInventory";
 import { resolveTaskContext, ResolvedTaskContext } from "../utils/resolveTaskContext";
 import {
+  IMPLEMENTATION_SUMMARY_FILENAME,
   PLAN_FILENAME,
   STAGE_ARTIFACT_FILENAMES,
   STAGE_DISPLAY_NAMES,
@@ -301,6 +302,19 @@ async function readStageArtifactsForChat(
     if (stageContent?.trim()) {
       sections.push(`### ${stageFilename} (current stage artifact)\n\n${stageContent}`);
     }
+  }
+
+  // The latest run's notes live in impl-summary.md since the artifact split;
+  // before it they arrived here inside plan-final.md, which is now only the
+  // plan of record. Without this, Chat With Stage silently lost the ability to
+  // answer anything about what the last implementation round actually did.
+  const summaryContent = await readTextIfExists(
+    vscode.Uri.joinPath(taskFolderUri, IMPLEMENTATION_SUMMARY_FILENAME)
+  );
+  if (summaryContent?.trim()) {
+    sections.push(
+      `### ${IMPLEMENTATION_SUMMARY_FILENAME} (latest implementation run summary)\n\n${summaryContent}`
+    );
   }
 
   return sections.join("\n\n");

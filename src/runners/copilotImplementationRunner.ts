@@ -44,6 +44,10 @@ import { NotificationRouter } from "../utils/notificationRouter";
  * filename and location alone can't tell that apart from a workspace's own
  * unrelated file of the same name.
  */
+// Deliberately NOT including IMPLEMENTATION_SUMMARY_FILENAME — see the same
+// note in cliAgentRunner.ts. Nothing names impl-summary.md to a provider, so
+// reserving it guards nothing and would reject a legitimate write to a
+// project's own root impl-summary.md.
 const RESERVED_ROOT_ARTIFACT_NAMES: ReadonlySet<string> = new Set([
   IMPLEMENTATION_FILENAME,
   LEGACY_IMPLEMENTATION_FILENAME,
@@ -481,6 +485,19 @@ export interface ImplementationRunResult {
   filesChangedUnknown?: boolean;
   /** Markdown summary text returned for logs/user feedback after a completed run */
   summary?: string;
+  /**
+   * True when `summary` was synthesized by the runner rather than authored by
+   * a model answering the implementation prompt.
+   *
+   * The sealed edit pipeline applies a structured, receipt-checked edit plan
+   * and reports `"Applied N sealed edit step(s)…"`; it never sees
+   * run-implementation.md, so it cannot produce that prompt's
+   * `## Files Changed`/`## Verification` shape or echo the plan checklist.
+   * The summary shape gate enforces a PROMPT contract and must therefore skip
+   * these — without this flag it stamped every successful sealed run unusable
+   * and refused to advance, disabling the whole Copilot execution path.
+   */
+  summaryIsSynthetic?: boolean;
   errorMessage?: string;
   /** Stable provider-neutral failure classification; set on failed results only. */
   failureKind?: "quota" | "temporarily-unavailable" | "generic";
