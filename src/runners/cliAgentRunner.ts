@@ -469,7 +469,8 @@ function applyTransportTransience(
   // reported isRetryable) and safe for any provider. Text-based matching via
   // isTransportError is safe ONLY for structured-stream providers, whose
   // diagnosticText is scoped to parsed error events and never raw stdout
-  // (see toFriendlyError) — for opaque-text providers (kiro-cli, codex-cli),
+  // (see toFriendlyError) — for opaque-text providers (kiro-cli; codex-cli
+  // left this bucket when it adopted --json),
   // diagnosticText IS raw stdout/model prose, and a transport phrase
   // appearing in ordinary output would falsely promote (and retry) a
   // deterministic failure. Opaque providers simply never set retryableHint,

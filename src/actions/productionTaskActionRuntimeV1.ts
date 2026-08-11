@@ -345,13 +345,18 @@ export function createProductionTaskActionCoordinatorV1(options: {
     // session: the user saw a completed stage answered by a backup, with
     // nothing anywhere naming the model that never ran. codex-cli sat in
     // exactly that state on every V1 action — resolved, "available", listed
-    // in the picker, never spawned. Warn (not error): the cascade is working
-    // as designed and a backup did answer, so this is degraded-but-succeeded,
-    // and the stage's own result notification still follows.
+    // in the picker, never spawned.
+    //
+    // Warn, not error: this fires per skipped candidate, at the moment of the
+    // skip, and states ONLY what is known to be true then. It deliberately
+    // does not promise a backup answered — the skipped candidate may be the
+    // last ranked one (the next reserveNext returns noneRemaining), or
+    // admission may abort before a reserved backup ever runs. The action's
+    // own outcome notification reports what actually happened.
     onCandidateSkipped: (skip): void => {
       NotificationRouter.showWarning(
         `${skip.providerLabel} (${skip.storedModelId}) was skipped for ${skip.taskStage} and did not run: ` +
-          "the provider cannot satisfy this action's mode. A backup model is being used instead. " +
+          "the provider cannot satisfy this action's mode. The next configured model is tried if one remains. " +
           "Check the model's provider settings if you expected it to answer."
       );
     },
