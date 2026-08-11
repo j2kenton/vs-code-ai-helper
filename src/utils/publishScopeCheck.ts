@@ -4,6 +4,7 @@ import * as nodePath from "node:path";
 import {
   IMPLEMENTATION_FILENAME,
   PLAN_FILENAME,
+  PUBLISH_CHECKS_FILENAME,
   STAGE_ARTIFACT_FILENAMES,
   TaskProgress,
 } from "../types/taskProgress";
@@ -31,6 +32,14 @@ export interface PublishScopeCheckResult {
    * its own plan/review files, so these are expected noise and are kept out
    * of `unplannedFiles`. */
   ensembleArtifacts: string[];
+  /** ISO timestamp of the run that produced this result.
+   *
+   * Rendered into the section so the report can never present two runs as one.
+   * The Completion Checks section has always stamped its own `Last run`; this
+   * one did not, and the two are refreshed by different call paths — Commit and
+   * Push re-runs the lint alone — so the undated half was the half that went
+   * stale, with nothing on the page to say so. */
+  runAt: string;
   /** True when there is no basis to compute a diff at all — git is
    * unavailable, or this task has no tracked implementation-run changed-file
    * set (`implReviewFiles` is `undefined`, not merely empty). When true, the
@@ -219,6 +228,7 @@ export async function computePublishScopeCheck(
   taskFolderUri: vscode.Uri,
   progress: Pick<TaskProgress, "implReviewFiles">
 ): Promise<PublishScopeCheckResult> {
+  const runAt = new Date().toISOString();
   const workspaceUri = vscode.workspace.getWorkspaceFolder(taskFolderUri)?.uri ?? taskFolderUri;
   const scope = await resolveStageResponseScope(workspaceUri, taskFolderUri, "publish");
   const gitSnapshot = await snapshotStageResponseState(scope);
@@ -227,12 +237,12 @@ export async function computePublishScopeCheck(
   const filesUnknown = changedFiles === undefined;
 
   if (gitUnavailable || filesUnknown) {
-    return { unplannedFiles: [], ensembleArtifacts: [], basisUnavailable: true };
+    return { runAt, unplannedFiles: [], ensembleArtifacts: [], basisUnavailable: true };
   }
 
   const planMarkdown = readPlanMarkdown(taskFolderUri);
   const planMentionedPaths = extractPlanMentionedPaths(planMarkdown ?? "");
-  return { ...computeScopeCheckDiff(changedFiles, planMentionedPaths), basisUnavailable: false };
+  return { runAt, ...computeScopeCheckDiff(changedFiles, planMentionedPaths), basisUnavailable: false };
 }
 
 // ---------------------------------------------------------------------------
@@ -250,6 +260,7 @@ const SCOPE_CHECK_SECTION_END = "<!-- scope-check:end -->";
  */
 export function renderScopeCheckSection(result: PublishScopeCheckResult): string {
   const lines: string[] = [SCOPE_CHECK_SECTION_START, "## Scope Check", ""];
+  lines.push(`- Last run: ${result.runAt}`, "");
   lines.push(
     "_Report-only — this never blocks Publish, the same as a failing check elsewhere on this " +
       "page: it is reported, and you decide. Compares the files this task actually changed " +
@@ -308,21 +319,53 @@ export function mergeScopeCheckSection(existing: string, section: string): strin
 }
 
 /**
- * Upsert a "Scope Check" section into publish-review.md, alongside (and
+ * Remove this module's managed section from `publish-review.md`, where it used
+ * to live before the split. Mirrors
+ * `stripCompletionChecksFromReviewArtifactV1` exactly — subtractive only, and
+ * only over the markers this module owns. See PUBLISH_CHECKS_FILENAME for why
+ * the reviewer's verdict and these checks must not share a document.
+ */
+async function stripScopeCheckFromReviewArtifactV1(
+  taskFolderUri: vscode.Uri
+): Promise<void> {
+  const legacyName = STAGE_ARTIFACT_FILENAMES.publish;
+  if (!legacyName) {
+    return;
+  }
+  const legacyPath = nodePath.join(taskFolderUri.fsPath, legacyName);
+
+  let existing: string;
+  try {
+    existing = await nodeFs.promises.readFile(legacyPath, "utf8");
+  } catch {
+    return;
+  }
+
+  const startIdx = existing.indexOf(SCOPE_CHECK_SECTION_START);
+  const endIdx = existing.indexOf(SCOPE_CHECK_SECTION_END);
+  if (startIdx === -1 || endIdx === -1 || endIdx < startIdx) {
+    return;
+  }
+
+  const stripped =
+    existing.slice(0, startIdx).trimEnd() +
+    "\n" +
+    existing.slice(endIdx + SCOPE_CHECK_SECTION_END.length).trimStart();
+  await nodeFs.promises.writeFile(legacyPath, `${stripped.trimEnd()}\n`, "utf8");
+}
+
+/**
+ * Upsert a "Scope Check" section into publish-checks.md, alongside (and
  * independent of) the "Completion Checks" section `completionLint.ts`
  * manages. Uses plain `node:fs` for the same reason
- * `upsertCompletionChecksInPublishReview` does — always a plain file inside
+ * `upsertCompletionChecksReportV1` does — always a plain file inside
  * the task folder, never a virtual FS scheme.
  */
-export async function upsertScopeCheckInPublishReview(
+export async function upsertScopeCheckReportV1(
   taskFolderUri: vscode.Uri,
   result: PublishScopeCheckResult
 ): Promise<void> {
-  const filename = STAGE_ARTIFACT_FILENAMES.publish;
-  if (!filename) {
-    return;
-  }
-  const targetPath = nodePath.join(taskFolderUri.fsPath, filename);
+  const targetPath = nodePath.join(taskFolderUri.fsPath, PUBLISH_CHECKS_FILENAME);
 
   let existing = "";
   try {
@@ -333,6 +376,7 @@ export async function upsertScopeCheckInPublishReview(
 
   const section = renderScopeCheckSection(result);
   await nodeFs.promises.writeFile(targetPath, mergeScopeCheckSection(existing, section), "utf8");
+  await stripScopeCheckFromReviewArtifactV1(taskFolderUri);
 }
 
 /**
@@ -347,6 +391,6 @@ export async function runPublishScopeCheck(
   progress: Pick<TaskProgress, "implReviewFiles">
 ): Promise<PublishScopeCheckResult> {
   const result = await computePublishScopeCheck(taskFolderUri, progress);
-  await upsertScopeCheckInPublishReview(taskFolderUri, result);
+  await upsertScopeCheckReportV1(taskFolderUri, result);
   return result;
 }

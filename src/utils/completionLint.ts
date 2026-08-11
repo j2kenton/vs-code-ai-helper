@@ -5,7 +5,11 @@ import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { updateLintPayload } from "./taskProgressTransforms";
 import * as fs from "fs";
 import * as path from "path";
-import { STAGE_ARTIFACT_FILENAMES, TaskProgress } from "../types/taskProgress";
+import {
+  PUBLISH_CHECKS_FILENAME,
+  STAGE_ARTIFACT_FILENAMES,
+  TaskProgress,
+} from "../types/taskProgress";
 import { getCompletionCheckTimeoutMs, getKnownFlakyChecks, getPublishVerificationCommands, KnownFlakyCheck } from "../config/settings";
 import { promptAndPersistPublishScope } from "../commands/choosePublishScope";
 import { isWorkflowPrivatePathV1 } from "../services/workflowPrivacyClassifierV1";
@@ -1425,23 +1429,63 @@ export function mergeCompletionChecksSection(existing: string, section: string):
 }
 
 /**
- * Upsert a "Completion Checks" section into publish-review.md. Every
+ * Remove this module's managed section from `publish-review.md`, where it used
+ * to live before the split (see PUBLISH_CHECKS_FILENAME).
+ *
+ * Leaving it there is not cosmetic. The reviewer's verdict and these checks
+ * advance on different schedules, so a task carrying both ends up asserting two
+ * readiness answers from two different commits in one document — the exact
+ * failure the split exists to remove. Re-running the checks would refresh the
+ * lower half and leave the stale headline in place, which is how a passing run
+ * came to be read as a 2/10.
+ *
+ * Strictly subtractive, and only over markers this module owns: it never adds
+ * content to the reviewer's artifact, so the two writers cannot start
+ * disagreeing again through this path.
+ */
+async function stripCompletionChecksFromReviewArtifactV1(
+  taskFolderUri: vscode.Uri
+): Promise<void> {
+  const legacyName = STAGE_ARTIFACT_FILENAMES.publish;
+  if (!legacyName) {
+    return;
+  }
+  const legacyPath = path.join(taskFolderUri.fsPath, legacyName);
+
+  let existing: string;
+  try {
+    existing = await fs.promises.readFile(legacyPath, "utf8");
+  } catch {
+    return;
+  }
+
+  const startIdx = existing.indexOf(PUBLISH_CHECKS_SECTION_START);
+  const endIdx = existing.indexOf(PUBLISH_CHECKS_SECTION_END);
+  if (startIdx === -1 || endIdx === -1 || endIdx < startIdx) {
+    return;
+  }
+
+  const stripped =
+    existing.slice(0, startIdx).trimEnd() +
+    "\n" +
+    existing.slice(endIdx + PUBLISH_CHECKS_SECTION_END.length).trimStart();
+  await fs.promises.writeFile(legacyPath, `${stripped.trimEnd()}\n`, "utf8");
+}
+
+/**
+ * Upsert a "Completion Checks" section into publish-checks.md. Every
  * completion lint run at the Publish stage calls this, so both the "check"
  * and "fix" paths keep this artifact current. Uses plain `node:fs` (like
  * `readPackageScripts` above) rather than `vscode.workspace.fs` — this is
  * always a plain file on disk inside the task folder, never a virtual FS
  * scheme, so there's nothing the VS Code FS abstraction adds here.
  */
-export async function upsertCompletionChecksInPublishReview(
+export async function upsertCompletionChecksReportV1(
   taskFolderUri: vscode.Uri,
   result: CompletionLintResult,
   override?: { reason: string }
 ): Promise<void> {
-  const filename = STAGE_ARTIFACT_FILENAMES.publish;
-  if (!filename) {
-    return;
-  }
-  const targetPath = path.join(taskFolderUri.fsPath, filename);
+  const targetPath = path.join(taskFolderUri.fsPath, PUBLISH_CHECKS_FILENAME);
 
   let existing = "";
   try {
@@ -1452,6 +1496,7 @@ export async function upsertCompletionChecksInPublishReview(
 
   const section = renderCompletionChecksSection(result, override);
   await fs.promises.writeFile(targetPath, mergeCompletionChecksSection(existing, section), "utf8");
+  await stripCompletionChecksFromReviewArtifactV1(taskFolderUri);
 }
 
 /**
@@ -1581,6 +1626,6 @@ export async function runCompletionLint(folderUri: vscode.Uri, relevantFiles?: r
   // advancing into) the Publish stage, so it's always safe to keep
   // publish-review.md's checks section current here rather than at each of
   // the eight call sites individually.
-  await upsertCompletionChecksInPublishReview(folderUri, result);
+  await upsertCompletionChecksReportV1(folderUri, result);
   return result;
 }

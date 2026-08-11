@@ -8,7 +8,7 @@ import { runCompletionLint } from "../utils/completionLint";
 import { runPublishScopeCheck } from "../utils/publishScopeCheck";
 import { ensureStageModelConfigured } from "../utils/modelSelection";
 import { safeOpenTextDocument } from "../utils/fileUtils";
-import { STAGE_ARTIFACT_FILENAMES } from "../types/taskProgress";
+import { PUBLISH_CHECKS_FILENAME } from "../types/taskProgress";
 import {
   runTrackedOperation,
   taskOperations,
@@ -58,7 +58,7 @@ export function normalizeRunPublishChecksArg(node: RunPublishChecksArg | undefin
  * First Publish action: run the completion checks (lint/type/test against the
  * task's Publish verification scope, plus the AI-assisted plan-item
  * verification) and record the result as the Publish-stage report in
- * publish-review.md. This command only checks and reports — fixing what the
+ * publish-checks.md. This command only checks and reports — fixing what the
  * report found is the separate second action (runLintingFixes).
  */
 export async function runPublishChecks(
@@ -134,17 +134,22 @@ export async function runPublishChecks(
             // Keep the tree aligned with the persisted lint payload.
             await inventory.refresh();
 
-            const reportName = STAGE_ARTIFACT_FILENAMES.publish;
-            if (reportName) {
-              await safeOpenTextDocument(
-                vscode.Uri.joinPath(taskFolderUri, reportName),
-                "Publish report"
-              );
-            }
+            // Opens the report these checks just wrote, not the reviewer's
+            // artifact. This used to open publish-review.md and announce
+            // "Report saved" — but the checks only ever upserted a section
+            // partway down that file, so what surfaced was the AI verdict at
+            // the top, from whichever commit the last review ran against.
+            // Observed live 2026-08-11: a fully passing run opened a
+            // "Readiness: 2/10" document listing three blockers that had all
+            // been fixed, and re-running the checks could not change it.
+            await safeOpenTextDocument(
+              vscode.Uri.joinPath(taskFolderUri, PUBLISH_CHECKS_FILENAME),
+              "Publish checks report"
+            );
 
             if (result.passed) {
               NotificationRouter.showInformation(
-                `Publish checks passed. Report saved to ${reportName ?? "the Publish review"}.`
+                `Publish checks passed. Report saved to ${PUBLISH_CHECKS_FILENAME}.`
               );
             } else {
               NotificationRouter.showWarning(

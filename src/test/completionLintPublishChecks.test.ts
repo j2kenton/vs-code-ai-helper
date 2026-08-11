@@ -24,7 +24,7 @@ import {
   readPackageScripts,
   mergeCompletionChecksSection,
   truncateCheckOutput,
-  upsertCompletionChecksInPublishReview,
+  upsertCompletionChecksReportV1,
   CompletionLintResult,
 } from "../utils/completionLint";
 
@@ -178,7 +178,7 @@ void describe("collectCompletionLint — publish pre-check schema (lint/test scr
 });
 
 // ---------------------------------------------------------------------------
-// C3: writing completion-check results into publish-review.md
+// C3: writing completion-check results into publish-checks.md
 // ---------------------------------------------------------------------------
 
 function fakeResult(overrides: Partial<CompletionLintResult> = {}): CompletionLintResult {
@@ -227,12 +227,12 @@ void describe("mergeCompletionChecksSection", () => {
   });
 });
 
-void describe("upsertCompletionChecksInPublishReview", () => {
-  void it("creates publish-review.md with a Completion Checks section when it doesn't exist", async () => {
+void describe("upsertCompletionChecksReportV1", () => {
+  void it("creates publish-checks.md with a Completion Checks section when it doesn't exist", async () => {
     const dir = makeWorkspace("publish-review-create", { name: "x" });
-    await upsertCompletionChecksInPublishReview(vscode.Uri.file(dir), fakeResult());
+    await upsertCompletionChecksReportV1(vscode.Uri.file(dir), fakeResult());
 
-    const content = nodeFs.readFileSync(nodePath.join(dir, "publish-review.md"), "utf8");
+    const content = nodeFs.readFileSync(nodePath.join(dir, "publish-checks.md"), "utf8");
     assert.match(content, /## Completion Checks/);
     assert.match(content, /Status: Failed/);
     assert.match(content, /npm run lint/);
@@ -241,18 +241,18 @@ void describe("upsertCompletionChecksInPublishReview", () => {
   void it("preserves pre-existing AI review content and updates only the managed section on rerun", async () => {
     const dir = makeWorkspace("publish-review-preserve", { name: "x" });
     nodeFs.writeFileSync(
-      nodePath.join(dir, "publish-review.md"),
+      nodePath.join(dir, "publish-checks.md"),
       "Readiness: 8/10\n\nSummary verdict: ready to publish.\n",
       "utf8"
     );
 
-    await upsertCompletionChecksInPublishReview(vscode.Uri.file(dir), fakeResult());
-    await upsertCompletionChecksInPublishReview(
+    await upsertCompletionChecksReportV1(vscode.Uri.file(dir), fakeResult());
+    await upsertCompletionChecksReportV1(
       vscode.Uri.file(dir),
       fakeResult({ passed: true, summary: "No linting issues found.", failedChecks: [] })
     );
 
-    const content = nodeFs.readFileSync(nodePath.join(dir, "publish-review.md"), "utf8");
+    const content = nodeFs.readFileSync(nodePath.join(dir, "publish-checks.md"), "utf8");
     assert.match(content, /Readiness: 8\/10/);
     assert.match(content, /Status: Passed/);
     assert.doesNotMatch(content, /Status: Failed/);
@@ -260,11 +260,11 @@ void describe("upsertCompletionChecksInPublishReview", () => {
 
   void it("records the override reason when a user publishes anyway", async () => {
     const dir = makeWorkspace("publish-review-override", { name: "x" });
-    await upsertCompletionChecksInPublishReview(vscode.Uri.file(dir), fakeResult(), {
+    await upsertCompletionChecksReportV1(vscode.Uri.file(dir), fakeResult(), {
       reason: "user chose Publish Anyway",
     });
 
-    const content = nodeFs.readFileSync(nodePath.join(dir, "publish-review.md"), "utf8");
+    const content = nodeFs.readFileSync(nodePath.join(dir, "publish-checks.md"), "utf8");
     assert.match(content, /Published anyway despite failing checks — user chose Publish Anyway\./);
   });
 });

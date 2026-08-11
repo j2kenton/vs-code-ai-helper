@@ -2,13 +2,13 @@
  * Coverage for the publish failing-checks gate (C3, plan step 28): when the
  * fresh pre-commit completion checks fail, Commit and Push must surface a
  * three-way decision — Publish Anyway (recorded as an override in
- * publish-review.md), Fix with AI (the linting-fixes flow run in-flow, nested
+ * publish-checks.md), Fix with AI (the linting-fixes flow run in-flow, nested
  * under the commit-push operation, followed by a fresh check run), or Cancel
  * (the modal's dismiss affordance). A user with a failing test must be able
  * to pick the fix option without cancelling and restarting publishing.
  *
  * Every check run — passing, failing, and post-fix rerun — must also be
- * recorded in publish-review.md's managed Completion Checks section,
+ * recorded in publish-checks.md's managed Completion Checks section,
  * regardless of which gate outcome follows. In production that write happens
  * inside runCompletionLint (completionLint.ts) on every run; the stub
  * installed below delegates to the real upsert so these tests exercise and
@@ -39,7 +39,7 @@ import { fixtureOwnershipFor } from "./taskFolderFixture";
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const completionLintModule = require("../utils/completionLint") as {
   runCompletionLint: (...args: unknown[]) => Promise<unknown>;
-  upsertCompletionChecksInPublishReview: (
+  upsertCompletionChecksReportV1: (
     taskFolderUri: vscode.Uri,
     result: unknown,
     override?: { reason: string }
@@ -162,10 +162,10 @@ function installGateHarness(
   completionLintModule.runCompletionLint = async (...args: unknown[]): Promise<unknown> => {
     const result = lintResults();
     // Mirror the production contract: runCompletionLint upserts the managed
-    // Completion Checks section into publish-review.md on EVERY run — pass or
+    // Completion Checks section into publish-checks.md on EVERY run — pass or
     // fail — before the gate ever sees the result. Delegating to the real
     // upsert keeps the artifact behavior under test instead of stubbed away.
-    await completionLintModule.upsertCompletionChecksInPublishReview(
+    await completionLintModule.upsertCompletionChecksReportV1(
       args[0] as vscode.Uri,
       result
     );
@@ -203,7 +203,7 @@ function installGateHarness(
 }
 
 void describe("commitAndPushTask failing-checks gate (Publish Anyway / Fix with AI / Cancel)", () => {
-  void it("offers both Publish Anyway and Fix with AI, and records the override in publish-review.md when the user publishes anyway", async () => {
+  void it("offers both Publish Anyway and Fix with AI, and records the override in publish-checks.md when the user publishes anyway", async () => {
     const harness = installGateHarness(failingLintResult, () => "Publish Anyway");
     try {
       await commitAndPushTask(harness.inventory, { canonicalId: harness.taskFolderPath });
@@ -216,8 +216,8 @@ void describe("commitAndPushTask failing-checks gate (Publish Anyway / Fix with 
         "the modal must offer Publish Anyway and Fix with AI (Cancel is the modal's dismiss affordance)"
       );
 
-      const reviewPath = path.join(harness.taskFolderPath, "publish-review.md");
-      assert.ok(fs.existsSync(reviewPath), "publishing anyway must record the failing checks in publish-review.md");
+      const reviewPath = path.join(harness.taskFolderPath, "publish-checks.md");
+      assert.ok(fs.existsSync(reviewPath), "publishing anyway must record the failing checks in publish-checks.md");
       const content = fs.readFileSync(reviewPath, "utf8");
       assert.match(content, /Published anyway despite failing checks — user chose Publish Anyway despite failing checks\./);
       assert.match(content, /npm run test/, "the failing check itself must be part of the recorded override");
@@ -272,10 +272,10 @@ void describe("commitAndPushTask failing-checks gate (Publish Anyway / Fix with 
 
       assert.equal(lintCallCount, 2, "checks must re-run after the fix pass, before publishing continues");
       const reviewContent = fs.readFileSync(
-        path.join(harness.taskFolderPath, "publish-review.md"),
+        path.join(harness.taskFolderPath, "publish-checks.md"),
         "utf8"
       );
-      assert.match(reviewContent, /Status: Passed/, "the passing rerun must be recorded in publish-review.md");
+      assert.match(reviewContent, /Status: Passed/, "the passing rerun must be recorded in publish-checks.md");
       assert.doesNotMatch(
         reviewContent,
         /Status: Failed/,
@@ -325,9 +325,9 @@ void describe("commitAndPushTask failing-checks gate (Publish Anyway / Fix with 
         `dismissing the modal must cancel; got: ${JSON.stringify(harness.surface.entries)}`
       );
       // Cancelling forgoes the override, but the failing check runs themselves
-      // must still be on record in publish-review.md — publish check results
+      // must still be on record in publish-checks.md — publish check results
       // always update the artifact, whatever the user decides at the gate.
-      const reviewPath = path.join(harness.taskFolderPath, "publish-review.md");
+      const reviewPath = path.join(harness.taskFolderPath, "publish-checks.md");
       assert.ok(fs.existsSync(reviewPath), "the failing check runs must be recorded even when the user cancels");
       const reviewContent = fs.readFileSync(reviewPath, "utf8");
       assert.match(reviewContent, /Status: Failed/);
@@ -343,7 +343,7 @@ void describe("commitAndPushTask failing-checks gate (Publish Anyway / Fix with 
     }
   });
 
-  void it("records a clean passing run in publish-review.md and proceeds without ever showing the gate", async () => {
+  void it("records a clean passing run in publish-checks.md and proceeds without ever showing the gate", async () => {
     const harness = installGateHarness(passingLintResult, () => undefined);
     try {
       await commitAndPushTask(harness.inventory, { canonicalId: harness.taskFolderPath });
@@ -353,10 +353,10 @@ void describe("commitAndPushTask failing-checks gate (Publish Anyway / Fix with 
         0,
         "passing checks must not surface the failing-checks modal"
       );
-      const reviewPath = path.join(harness.taskFolderPath, "publish-review.md");
+      const reviewPath = path.join(harness.taskFolderPath, "publish-checks.md");
       assert.ok(
         fs.existsSync(reviewPath),
-        "a successful pre-commit check run must still be recorded in publish-review.md"
+        "a successful pre-commit check run must still be recorded in publish-checks.md"
       );
       const reviewContent = fs.readFileSync(reviewPath, "utf8");
       assert.match(reviewContent, /## Completion Checks/);

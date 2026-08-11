@@ -18,7 +18,7 @@ import {
   extractPlanMentionedPaths,
   mergeScopeCheckSection,
   PublishScopeCheckResult,
-  upsertScopeCheckInPublishReview,
+  upsertScopeCheckReportV1,
 } from "../utils/publishScopeCheck";
 
 const TEST_ROOT = nodeFs.mkdtempSync(
@@ -230,19 +230,20 @@ void describe("mergeScopeCheckSection", () => {
 });
 
 // ---------------------------------------------------------------------------
-// upsertScopeCheckInPublishReview
+// upsertScopeCheckReportV1
 // ---------------------------------------------------------------------------
 
-void describe("upsertScopeCheckInPublishReview", () => {
-  void it("creates publish-review.md with a Scope Check section when it doesn't exist", async () => {
+void describe("upsertScopeCheckReportV1", () => {
+  void it("creates publish-checks.md with a Scope Check section when it doesn't exist", async () => {
     const dir = makeDir("upsert-create");
-    await upsertScopeCheckInPublishReview(vscode.Uri.file(dir), {
+    await upsertScopeCheckReportV1(vscode.Uri.file(dir), {
+      runAt: "2026-01-01T00:00:00.000Z",
       unplannedFiles: ["src/unexpected.ts"],
       ensembleArtifacts: [],
       basisUnavailable: false,
     });
 
-    const content = nodeFs.readFileSync(nodePath.join(dir, "publish-review.md"), "utf8");
+    const content = nodeFs.readFileSync(nodePath.join(dir, "publish-checks.md"), "utf8");
     assert.match(content, /## Scope Check/);
     assert.match(content, /Files the plan doesn't mention/);
     assert.match(content, /src\/unexpected\.ts/);
@@ -250,13 +251,14 @@ void describe("upsertScopeCheckInPublishReview", () => {
 
   void it("renders the no-basis statement instead of an empty ok-looking result", async () => {
     const dir = makeDir("upsert-no-basis");
-    await upsertScopeCheckInPublishReview(vscode.Uri.file(dir), {
+    await upsertScopeCheckReportV1(vscode.Uri.file(dir), {
+      runAt: "2026-01-01T00:00:00.000Z",
       unplannedFiles: [],
       ensembleArtifacts: [],
       basisUnavailable: true,
     });
 
-    const content = nodeFs.readFileSync(nodePath.join(dir, "publish-review.md"), "utf8");
+    const content = nodeFs.readFileSync(nodePath.join(dir, "publish-checks.md"), "utf8");
     assert.match(content, /No basis for this check/);
     assert.doesNotMatch(content, /No files the plan doesn't mention/);
   });
@@ -264,23 +266,25 @@ void describe("upsertScopeCheckInPublishReview", () => {
   void it("preserves pre-existing AI review content and updates only the managed section on rerun", async () => {
     const dir = makeDir("upsert-preserve");
     nodeFs.writeFileSync(
-      nodePath.join(dir, "publish-review.md"),
+      nodePath.join(dir, "publish-checks.md"),
       "Readiness: 8/10\n\nSummary verdict: ready to publish.\n",
       "utf8"
     );
 
-    await upsertScopeCheckInPublishReview(vscode.Uri.file(dir), {
+    await upsertScopeCheckReportV1(vscode.Uri.file(dir), {
+      runAt: "2026-01-01T00:00:00.000Z",
       unplannedFiles: ["src/first.ts"],
       ensembleArtifacts: [],
       basisUnavailable: false,
     });
-    await upsertScopeCheckInPublishReview(vscode.Uri.file(dir), {
+    await upsertScopeCheckReportV1(vscode.Uri.file(dir), {
+      runAt: "2026-01-01T00:00:00.000Z",
       unplannedFiles: [],
       ensembleArtifacts: [],
       basisUnavailable: false,
     });
 
-    const content = nodeFs.readFileSync(nodePath.join(dir, "publish-review.md"), "utf8");
+    const content = nodeFs.readFileSync(nodePath.join(dir, "publish-checks.md"), "utf8");
     assert.match(content, /Readiness: 8\/10/);
     assert.doesNotMatch(content, /src\/first\.ts/);
     assert.match(content, /No files the plan doesn't mention\./);
@@ -289,22 +293,59 @@ void describe("upsertScopeCheckInPublishReview", () => {
   void it("keeps a separate Completion Checks section intact", async () => {
     const dir = makeDir("upsert-alongside-completion-checks");
     nodeFs.writeFileSync(
-      nodePath.join(dir, "publish-review.md"),
+      nodePath.join(dir, "publish-checks.md"),
       "<!-- completion-checks:start -->\n## Completion Checks\n\n- Status: Passed\n<!-- completion-checks:end -->\n",
       "utf8"
     );
 
-    await upsertScopeCheckInPublishReview(vscode.Uri.file(dir), {
+    await upsertScopeCheckReportV1(vscode.Uri.file(dir), {
+      runAt: "2026-01-01T00:00:00.000Z",
       unplannedFiles: ["src/unexpected.ts"],
       ensembleArtifacts: [".ensemble/2026-08-09_task_1/plan.md"],
       basisUnavailable: false,
     });
 
-    const content = nodeFs.readFileSync(nodePath.join(dir, "publish-review.md"), "utf8");
+    const content = nodeFs.readFileSync(nodePath.join(dir, "publish-checks.md"), "utf8");
     assert.match(content, /## Completion Checks/);
     assert.match(content, /Status: Passed/);
     assert.match(content, /## Scope Check/);
     assert.match(content, /src\/unexpected\.ts/);
     assert.match(content, /1 `\.ensemble\/` task-artifact file\(s\)/);
+  });
+});
+
+void describe("the Scope Check section dates itself", () => {
+  // Both halves of publish-checks.md are refreshed by different call paths —
+  // Commit and Push re-runs the completion lint alone — so the document can
+  // legitimately hold sections computed moments apart. Completion Checks has
+  // always stamped its own "Last run"; this one did not, which made the
+  // undated half the one that silently went stale. A reader could not tell.
+  void it("renders its own run timestamp so two runs can never read as one", async () => {
+    const dir = makeDir("scope-timestamp");
+    await upsertScopeCheckReportV1(vscode.Uri.file(dir), {
+      runAt: "2026-08-11T09:30:00.000Z",
+      unplannedFiles: [],
+      ensembleArtifacts: [],
+      basisUnavailable: false,
+    });
+
+    const content = nodeFs.readFileSync(nodePath.join(dir, "publish-checks.md"), "utf8");
+    assert.match(content, /Last run: 2026-08-11T09:30:00\.000Z/);
+  });
+
+  void it("dates the no-basis rendering too", async () => {
+    // The no-basis branch returns early, so it is the one most likely to lose
+    // a field added to the main path.
+    const dir = makeDir("scope-timestamp-nobasis");
+    await upsertScopeCheckReportV1(vscode.Uri.file(dir), {
+      runAt: "2026-08-11T10:45:00.000Z",
+      unplannedFiles: [],
+      ensembleArtifacts: [],
+      basisUnavailable: true,
+    });
+
+    const content = nodeFs.readFileSync(nodePath.join(dir, "publish-checks.md"), "utf8");
+    assert.match(content, /Last run: 2026-08-11T10:45:00\.000Z/);
+    assert.match(content, /No basis for this check/);
   });
 });

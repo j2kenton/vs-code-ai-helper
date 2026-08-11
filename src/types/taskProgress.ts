@@ -80,6 +80,28 @@ export const LEGACY_IMPLEMENTATION_FILENAME = "implementation.md";
 export const IMPLEMENTATION_SUMMARY_FILENAME = "impl-summary.md";
 
 /**
+ * The machine-written Publish report: Completion Checks (lint/type/test plus
+ * plan-item verification) and the Scope Check.
+ *
+ * Split out of `publish-review.md` for the same reason `impl-summary.md` was
+ * split out of `plan-final.md`, and after the same failure. Both sections were
+ * upserted into the AI reviewer's artifact, so a file could hold one cycle's
+ * verdict above another cycle's checks with nothing marking the seam. Observed
+ * live 2026-08-11: publish-review.md opened with a stale `Readiness: 2/10` and
+ * three blockers from the previous commit, while the Completion Checks section
+ * a hundred lines below reported everything passing from the current one.
+ * Re-running the checks could not fix it — they only ever rewrote the lower
+ * half — and the command announced "Report saved" while opening the file whose
+ * visible verdict was the old one.
+ *
+ * Nothing reads these sections back: the Publish reviewer receives
+ * `{{verifiedChecks}}` and `{{planItemVerification}}` computed fresh as prompt
+ * inputs, never by parsing this file. They are a report for the user, so they
+ * belong in a document whose every line comes from the same run.
+ */
+export const PUBLISH_CHECKS_FILENAME = "publish-checks.md";
+
+/**
  * The filename for the generated context pack artifact
  */
 export const CONTEXT_PACK_FILENAME = "context-pack.md";

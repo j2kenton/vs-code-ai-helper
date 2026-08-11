@@ -50,7 +50,7 @@ import {
   setChatInteractionTransactionStoreV1,
 } from "../services/workflowRuntimeServicesV1";
 import { initNotificationRouter, deactivateNotificationRouter } from "../utils/notificationRouter";
-import { upsertCompletionChecksInPublishReview, CompletionLintResult } from "../utils/completionLint";
+import { upsertCompletionChecksReportV1, CompletionLintResult } from "../utils/completionLint";
 import { TaskInventory } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { normalizePath } from "../utils/taskRoot";
@@ -934,15 +934,14 @@ void describe("Publish review — genuine provider failure and cancellation outc
   });
 });
 
-void describe("Fast Forward Review — the Publish preflight's Completion Checks section is not mistaken for an existing review", () => {
-  // Reproduces the defect: publish-review.md can hold ONLY a Completion
-  // Checks section — written by upsertCompletionChecksInPublishReview via a
-  // prior runCompletionLint persist (e.g. an earlier manual publish attempt
-  // or "Fix with AI"; checkPublishPreflight's own scheduling-decision calls
-  // are side-effect-free and never write this) — with no review body yet.
-  // Before the fix, fastForwardReviewWithAI read that checks-only content as
-  // "an existing review with no Readiness line" and refused outright instead
-  // of running the initial review it was dispatched to run.
+void describe("Fast Forward Review — a checks-only publish-review.md is not mistaken for an existing review", () => {
+  // Historical shape, kept covered because tasks created before the artifact
+  // split still have it on disk: publish-review.md holding ONLY a Completion
+  // Checks section, with no AI review body. Before the guard,
+  // fastForwardReviewWithAI read that as "an existing review with no Readiness
+  // line" and refused outright instead of running the initial review it was
+  // dispatched to run. The split stops NEW files taking this shape; the guard
+  // stays for the ones that already have it.
   const samplePassingLint: CompletionLintResult = {
     runAt: "2026-01-01T00:00:00.000Z",
     passed: true,
@@ -952,27 +951,25 @@ void describe("Fast Forward Review — the Publish preflight's Completion Checks
     missingScripts: [],
   };
 
-  void it("isUnusableAsExistingReview treats checks-only publish-review.md content as no review yet", async () => {
-    const folderPath = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-checks-only-"));
-    const fsBridge = installFsBridge();
-    try {
-      await upsertCompletionChecksInPublishReview(vscode.Uri.file(folderPath), samplePassingLint);
-      const written = fs.readFileSync(path.join(folderPath, "publish-review.md"), "utf8");
-      assert.ok(written.includes("Completion Checks"), "sanity: the checks section was written");
-      assert.equal(
-        written.includes("Readiness:"),
-        false,
-        "sanity: a checks-only file has no Readiness line"
-      );
-      assert.equal(
-        isUnusableAsExistingReview(written),
-        true,
-        "checks-only content must not be treated as a usable existing review"
-      );
-    } finally {
-      fsBridge.restore();
-      fs.rmSync(folderPath, { recursive: true, force: true });
-    }
+  void it("isUnusableAsExistingReview treats checks-only content as no review yet", () => {
+    const checksOnly = [
+      "<!-- completion-checks:start -->",
+      "## Completion Checks",
+      "",
+      "All checks passed.",
+      "<!-- completion-checks:end -->",
+      "",
+    ].join("\n");
+    assert.equal(
+      checksOnly.includes("Readiness:"),
+      false,
+      "sanity: a checks-only file has no Readiness line"
+    );
+    assert.equal(
+      isUnusableAsExistingReview(checksOnly),
+      true,
+      "checks-only content must not be treated as a usable existing review"
+    );
   });
 
   void it("isUnusableAsExistingReview treats an actual AI review (with a Readiness line) as usable", () => {
@@ -980,8 +977,11 @@ void describe("Fast Forward Review — the Publish preflight's Completion Checks
     assert.equal(isUnusableAsExistingReview(realReview), false);
   });
 
-  void it("isUnusableAsExistingReview treats a real review merged with a Completion Checks section as usable", async () => {
-    const folderPath = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-checks-plus-review-"));
+  void it("the checks report is written to publish-checks.md and never into the reviewer's artifact", async () => {
+    // The split itself. Two authors on one document is what let a stale
+    // `Readiness: 2/10` from one commit sit above passing checks from another,
+    // with re-running the checks unable to correct the headline.
+    const folderPath = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-checks-split-"));
     const fsBridge = installFsBridge();
     try {
       fs.writeFileSync(
@@ -989,14 +989,62 @@ void describe("Fast Forward Review — the Publish preflight's Completion Checks
         "Readiness: 9/10\n\n- Looks good.\n",
         "utf8"
       );
-      await upsertCompletionChecksInPublishReview(vscode.Uri.file(folderPath), samplePassingLint);
-      const written = fs.readFileSync(path.join(folderPath, "publish-review.md"), "utf8");
-      assert.ok(written.includes("Readiness: 9/10"), "the AI review body must survive the merge");
+      await upsertCompletionChecksReportV1(vscode.Uri.file(folderPath), samplePassingLint);
+
+      const checks = fs.readFileSync(path.join(folderPath, "publish-checks.md"), "utf8");
+      assert.ok(checks.includes("Completion Checks"), "the report owns its own file");
+
+      const review = fs.readFileSync(path.join(folderPath, "publish-review.md"), "utf8");
+      assert.ok(review.includes("Readiness: 9/10"), "the AI review body is untouched");
       assert.equal(
-        isUnusableAsExistingReview(written),
+        review.includes("Completion Checks"),
         false,
-        "an actual review merged with the checks section must remain usable"
+        "the reviewer's artifact must never gain a checks section"
       );
+    } finally {
+      fsBridge.restore();
+      fs.rmSync(folderPath, { recursive: true, force: true });
+    }
+  });
+
+  void it("strips a pre-split checks section out of publish-review.md on the next run", async () => {
+    // Migration: leaving the old section behind would keep the two-verdict
+    // document alive forever on exactly the tasks that hit the bug.
+    const folderPath = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-checks-migrate-"));
+    const fsBridge = installFsBridge();
+    try {
+      fs.writeFileSync(
+        path.join(folderPath, "publish-review.md"),
+        [
+          "Readiness: 2/10",
+          "",
+          "## Shipping blockers",
+          "",
+          "- Something from an older commit.",
+          "",
+          "<!-- completion-checks:start -->",
+          "## Completion Checks",
+          "",
+          "Stale checks from a previous cycle.",
+          "<!-- completion-checks:end -->",
+          "",
+        ].join("\n"),
+        "utf8"
+      );
+      await upsertCompletionChecksReportV1(vscode.Uri.file(folderPath), samplePassingLint);
+
+      const review = fs.readFileSync(path.join(folderPath, "publish-review.md"), "utf8");
+      assert.equal(
+        review.includes("completion-checks:start"),
+        false,
+        "the pre-split section must be removed"
+      );
+      assert.ok(
+        review.includes("Readiness: 2/10") && review.includes("Shipping blockers"),
+        "the reviewer's own verdict must survive the strip untouched"
+      );
+      const checks = fs.readFileSync(path.join(folderPath, "publish-checks.md"), "utf8");
+      assert.ok(checks.includes("All checks passed."), "the current run lands in the new file");
     } finally {
       fsBridge.restore();
       fs.rmSync(folderPath, { recursive: true, force: true });

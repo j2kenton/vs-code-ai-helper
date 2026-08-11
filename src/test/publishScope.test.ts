@@ -31,7 +31,7 @@
  *  5. runCompletionLint direct regression: the full check entry point records
  *     `verifiedFolder` and actually EXECUTES its verification commands in the
  *     folder resolved through ownership.projectRoot — not just the resolver
- *     in isolation — and writes that folder into publish-review.md.
+ *     in isolation — and writes that folder into publish-checks.md.
  */
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
@@ -692,8 +692,8 @@ void describe("choosePublishScope command", () => {
         "checks must never execute in the external metadata folder"
       );
 
-      // The publish-review.md artifact names the same verified folder.
-      const review = fs.readFileSync(path.join(taskFolder, "publish-review.md"), "utf8");
+      // The publish-checks.md artifact names the same verified folder.
+      const review = fs.readFileSync(path.join(taskFolder, "publish-checks.md"), "utf8");
       assert.match(review, /- Verified against: /);
       const reviewLine = review.split(/\r?\n/).find((line) => line.startsWith("- Verified against: "));
       assert.equal(normalize(reviewLine!.slice("- Verified against: ".length)), normalize(app));
@@ -755,7 +755,7 @@ void describe("choosePublishScope command", () => {
       // Nothing was persisted or reported for a run that never happened.
       const stored = await readTaskProgress(vscode.Uri.file(taskFolder));
       assert.equal(stored?.lintPayload, undefined);
-      assert.equal(fs.existsSync(path.join(taskFolder, "publish-review.md")), false);
+      assert.equal(fs.existsSync(path.join(taskFolder, "publish-checks.md")), false);
     } finally {
       wsTarget.getConfiguration = origGetConfiguration;
       msgs.restore();
@@ -830,7 +830,7 @@ void describe("choosePublishScope command", () => {
       // Nothing was persisted or reported for a run that never happened.
       const stored = await readTaskProgress(vscode.Uri.file(taskFolder));
       assert.equal(stored?.lintPayload, undefined);
-      assert.equal(fs.existsSync(path.join(taskFolder, "publish-review.md")), false);
+      assert.equal(fs.existsSync(path.join(taskFolder, "publish-checks.md")), false);
     } finally {
       qp.restore();
       wsTarget.getConfiguration = origGetConfiguration;

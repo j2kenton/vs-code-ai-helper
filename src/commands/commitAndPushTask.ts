@@ -16,8 +16,9 @@ import { selectNextTask } from "./markTaskDone";
 import { NotificationRouter } from "../utils/notificationRouter";
 import {
   CompletionLintResult,
-  upsertCompletionChecksInPublishReview,
+  upsertCompletionChecksReportV1,
 } from "../utils/completionLint";
+import { runPublishScopeCheck } from "../utils/publishScopeCheck";
 import { checkPublishPreflight } from "../utils/publishPreflight";
 import { runGitCommand, resolveGitRepo, checkGitPublishReadiness, GitPublishReadiness } from "../utils/gitRepoInfo";
 import { runLintingFixes } from "./runLintingFixes";
@@ -1666,6 +1667,22 @@ export async function runCommitPushCompletionChecksV1(
       () => checkPublishPreflight(vscode.Uri.file(resolvedTask.taskFolderPath), resolvedTask.progress.implReviewFiles, { persist: true })
     ))!;
     if (preflight.lintPayload) {
+      // Both halves of publish-checks.md must come from the same run. The
+      // preflight refreshes Completion Checks (through runCompletionLint) but
+      // nothing here recomputed the Scope Check, so a pre-commit report paired
+      // fresh check results with a scope answer from whenever Run Publish
+      // Checks last ran — before the files being committed were edited. That is
+      // the two-runs-one-document failure the publish split exists to remove,
+      // reappearing inside the new artifact.
+      //
+      // Deliberately inside this branch: an absent lintPayload means the checks
+      // did not run (git-readiness race, or runCompletionLint threw), so
+      // Completion Checks was not refreshed either. Refreshing only the scope
+      // half there would create the same mismatch in the other direction.
+      await runPublishScopeCheck(
+        vscode.Uri.file(resolvedTask.taskFolderPath),
+        resolvedTask.progress
+      );
       return preflight.lintPayload;
     }
     // checkPublishPreflight omits lintPayload when either the read-only
@@ -1704,7 +1721,7 @@ export async function runCommitPushCompletionChecksV1(
       // The override lives here, in the publish flow (C3): task completion
       // is ungated and never records overrides — publishing over failing
       // checks is the decision worth an audit trail in publish-review.md.
-      await upsertCompletionChecksInPublishReview(
+      await upsertCompletionChecksReportV1(
         vscode.Uri.file(resolvedTask.taskFolderPath),
         lintPayload,
         { reason: "user chose Publish Anyway despite failing checks" }

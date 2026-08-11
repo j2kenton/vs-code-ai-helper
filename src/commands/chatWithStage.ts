@@ -5,6 +5,7 @@ import { resolveTaskContext, ResolvedTaskContext } from "../utils/resolveTaskCon
 import {
   IMPLEMENTATION_SUMMARY_FILENAME,
   PLAN_FILENAME,
+  PUBLISH_CHECKS_FILENAME,
   STAGE_ARTIFACT_FILENAMES,
   STAGE_DISPLAY_NAMES,
   TaskStage,
@@ -280,8 +281,13 @@ export function buildStageResponsePrompt(
  * file open. Skips a file that doesn't exist yet (e.g. plan.md before the
  * Plan stage), and never reads the same file twice (targetStage === "plan"
  * means the stage artifact IS plan.md).
+ *
+ * @internal exported for testing — chatArtifactCoverage.test.ts asserts that
+ * every task artifact carrying answerable content actually reaches chat, so a
+ * future artifact split cannot silently drop one the way the plan-final.md and
+ * publish-review.md splits both did.
  */
-async function readStageArtifactsForChat(
+export async function readStageArtifactsForChat(
   taskFolderUri: vscode.Uri,
   targetStage: TaskStage
 ): Promise<string> {
@@ -314,6 +320,25 @@ async function readStageArtifactsForChat(
   if (summaryContent?.trim()) {
     sections.push(
       `### ${IMPLEMENTATION_SUMMARY_FILENAME} (latest implementation run summary)\n\n${summaryContent}`
+    );
+  }
+
+  // The Publish checks report, and it regressed exactly the way the paragraph
+  // above describes: before the publish split these sections arrived here
+  // inside publish-review.md, so "why did the checks fail?" was answerable at
+  // the Publish stage. Afterwards chat could only see the review's verdict —
+  // which may be several commits old — and would answer a question about the
+  // current run from a stale one.
+  //
+  // Read unconditionally rather than gated on `targetStage === "publish"`:
+  // readTextIfExists already yields undefined when the file is absent, and a
+  // stage conditional is one more place for the next artifact to be forgotten.
+  const publishChecksContent = await readTextIfExists(
+    vscode.Uri.joinPath(taskFolderUri, PUBLISH_CHECKS_FILENAME)
+  );
+  if (publishChecksContent?.trim()) {
+    sections.push(
+      `### ${PUBLISH_CHECKS_FILENAME} (latest Publish checks report)\n\n${publishChecksContent}`
     );
   }
 
