@@ -366,6 +366,52 @@ export interface TaskActionResumeRequestV1 {
   readonly parentOperationId?: OperationIdV1;
 }
 
+/**
+ * One ranked candidate the registry refused to reserve, reported to
+ * `TaskActionCoordinatorDepsV1.onCandidateSkipped`. Mirrors the registry's
+ * own `candidateUnavailable` payload plus the stage it happened on.
+ */
+export interface CandidateSkippedV1 {
+  readonly code: "providerModeUnavailable";
+  /** The model id exactly as configured in settings, e.g. "codex-cli:gpt-5.6-sol@high". */
+  readonly storedModelId: string;
+  readonly providerLabel: string;
+  readonly runnerId: string;
+  readonly taskStage: string;
+}
+
+/**
+ * Report one skipped candidate to the optional observer, swallowing anything
+ * it throws. Selection correctness must never depend on a reporting side
+ * channel: a notification failing (or a test stub throwing) has to leave the
+ * cascade behaving exactly as it did before this seam existed.
+ */
+function reportCandidateSkipped(
+  deps: TaskActionCoordinatorDepsV1,
+  skip: {
+    readonly code: "providerModeUnavailable";
+    readonly storedModelId: string;
+    readonly providerLabel: string;
+    readonly runnerId: string;
+  },
+  taskStage: string
+): void {
+  if (!deps.onCandidateSkipped) {
+    return;
+  }
+  try {
+    deps.onCandidateSkipped({
+      code: skip.code,
+      storedModelId: skip.storedModelId,
+      providerLabel: skip.providerLabel,
+      runnerId: skip.runnerId,
+      taskStage,
+    });
+  } catch {
+    // Advisory only — see onCandidateSkipped's doc comment.
+  }
+}
+
 export interface TaskActionCoordinatorDepsV1 {
   readonly registry: TaskActionRegistryV1;
   readonly leaseStore: WorkflowLeaseStoreV1;
@@ -376,6 +422,26 @@ export interface TaskActionCoordinatorDepsV1 {
    * rejects mode-incapable ones, and issues every reservation.
    */
   readonly openRunnerSelection: RunnerSelectionOpenerV1;
+  /**
+   * Observer for a ranked candidate the registry refused to reserve
+   * (`candidateUnavailable`). Optional and purely advisory: it never affects
+   * selection, and throwing from it must not fail the operation.
+   *
+   * It exists because "auditable skip" was only ever true INSIDE the session.
+   * A skipped candidate settles its attempt and the loop moves to the next
+   * one, so nothing the user can see records that their configured model was
+   * passed over — no notification, no run log, no artifact. That is precisely
+   * how codex-cli stayed invisible for weeks: it resolved, reported
+   * available, sat in the picker, and was refused here on every single
+   * action while a backup answered in its place. The provider bug is fixed;
+   * this is the missing signal that would have made it a ten-minute
+   * diagnosis instead of an overnight one, for the NEXT provider too.
+   *
+   * The coordinator cannot surface this itself — it imports vscode as
+   * `import type` only and holds no filesystem path — so the composition
+   * root supplies the user-facing behaviour.
+   */
+  readonly onCandidateSkipped?: (skip: CandidateSkippedV1) => void;
   /**
    * The durable interaction ledger (plan §5.5): a `questions` result persists
    * its Chat interaction transaction through this before the outcome surfaces.
@@ -982,7 +1048,9 @@ export function createTaskActionCoordinatorV1(
           // The registry settled this attempt (providerUnavailablePreInvocation)
           // for a ranked candidate that cannot satisfy the mode — an explicit,
           // auditable skip, never a silent bypass. A FRESH attempt reaches the
-          // next ranked candidate (plan §3.4).
+          // next ranked candidate (plan §3.4). The audit trail only existed
+          // inside the session until onCandidateSkipped; see its doc comment.
+          reportCandidateSkipped(deps, next, stage);
           continue;
         }
 
@@ -1531,6 +1599,7 @@ export function createTaskActionCoordinatorV1(
         return { kind: "settled", outcome: finalizeOutcome(row, request, operationId, unavailableV1("providerModeUnavailable"), metrics) };
       }
       if (next.kind === "candidateUnavailable") {
+        reportCandidateSkipped(deps, next, request.taskStage);
         continue;
       }
       initialCandidate = { attemptId, reserved: next.reserved };

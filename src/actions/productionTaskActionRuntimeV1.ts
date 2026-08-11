@@ -340,6 +340,21 @@ export function createProductionTaskActionCoordinatorV1(options: {
       workspaceCwd: options.workspaceCwd,
       resolveStagePrimaryModel: options.resolveStagePrimaryModel,
     }),
+    // Make a passed-over model visible. Until this existed, a candidate the
+    // registry refused was recorded only inside the in-memory selection
+    // session: the user saw a completed stage answered by a backup, with
+    // nothing anywhere naming the model that never ran. codex-cli sat in
+    // exactly that state on every V1 action — resolved, "available", listed
+    // in the picker, never spawned. Warn (not error): the cascade is working
+    // as designed and a backup did answer, so this is degraded-but-succeeded,
+    // and the stage's own result notification still follows.
+    onCandidateSkipped: (skip): void => {
+      NotificationRouter.showWarning(
+        `${skip.providerLabel} (${skip.storedModelId}) was skipped for ${skip.taskStage} and did not run: ` +
+          "the provider cannot satisfy this action's mode. A backup model is being used instead. " +
+          "Check the model's provider settings if you expected it to answer."
+      );
+    },
     orchestrator: lazyProductionActionConversationOrchestratorV1(),
     followUpScheduler: noopFollowUpSchedulerV1,
     presenter: notificationPresenterV1(),

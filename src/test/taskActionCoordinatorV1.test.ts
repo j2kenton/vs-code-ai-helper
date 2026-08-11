@@ -66,6 +66,7 @@ import { createWorkflowPathRegistryV1 } from "../services/workflowPathRegistryV1
 import {
   chatTransactionFailureCodeV1,
   promotionFailureCodeV1,
+  CandidateSkippedV1,
   createTaskActionCoordinatorV1,
   RunnerSelectionOpenerV1,
   TaskActionCoordinatorV1,
@@ -1279,19 +1280,146 @@ void describe("taskActionCoordinatorV1", () => {
     assert.equal(questions.followUps.length, 0);
   });
 
-  void it("integrates with runnerRegistry's real openV1RunnerSelection: unsupported primary, ranked fallback, exhaustion", async () => {
-    // Ranking policy under test is the registry's own: the stored primary
-    // (codex-cli, a last-message-file CLI that cannot satisfy AC-RUNNER-02's
-    // stdout-only capture) is settled as an explicit unavailable attempt —
-    // never silently bypassed — then the strategy-gated Copilot backup is
-    // reserved on a FRESH attempt and invoked through the broker. Under the
-    // test stub there is no usable vscode.lm host, so the Copilot transport
+  // A skipped candidate used to be recorded ONLY inside the selection session:
+  // the loop settled the attempt, moved to the next candidate, and nothing the
+  // user could ever see said their configured model had been passed over. That
+  // is how codex-cli stayed invisible — resolving, reporting available, listed
+  // in the picker, refused on every V1 action while a backup answered for it.
+  // A hand-rolled selection is used deliberately here rather than the real
+  // registry: this asserts the coordinator's own reporting, and it must not
+  // reach a transport that could spawn a provider CLI.
+  function skippingSelectionOpener(skips: readonly {
+    storedModelId: string;
+    providerLabel: string;
+    runnerId: string;
+  }[]): RunnerSelectionOpenerV1 {
+    return (request) => {
+      let index = 0;
+      return {
+        reserveNext: (attemptId): V1ReserveNextResultV1 => {
+          const skip = skips[index++];
+          if (!skip) {
+            return { kind: "noneRemaining", code: "providerModeUnavailable" };
+          }
+          // Mirror the real registry: it settles the attempt itself before
+          // returning candidateUnavailable, so the session's
+          // one-outcome-per-attempt accounting stays complete.
+          request.session.reportAttemptOutcome(attemptId, "providerUnavailablePreInvocation");
+          return {
+            kind: "candidateUnavailable",
+            code: "providerModeUnavailable",
+            storedModelId: skip.storedModelId,
+            providerLabel: skip.providerLabel,
+            runnerId: skip.runnerId,
+          };
+        },
+      };
+    };
+  }
+
+  function skipTestRow(): ProviderTaskActionRowV1 {
+    return {
+      kind: "provider",
+      actionKey: TEST_ACTION_KEY,
+      routes: [TEST_ROUTE],
+      eligibility: { statuses: ["active"], stages: ["plan"] },
+      requiresTaskOperationLease: true,
+      progressLabel: "Testing…",
+      providerMode: "text",
+      maxResponseBytes: 64 * 1024,
+      permittedResultKinds: ["completed", "cancelled", "failed"],
+      completedContentType: "markdown-artifact.v1",
+      resumeSemantics: "sameOperation",
+      validateInput: (input) => ({ ok: true, input }),
+      buildPrompt: () => "ACTION PROMPT",
+      promoteCompletedContent: () => Promise.resolve("completed"),
+      loggingPolicy: { channel: "action.test", includeResultMetrics: false },
+    };
+  }
+
+  void it("reports every skipped candidate to onCandidateSkipped instead of dropping it silently", async () => {
+    const skipped: CandidateSkippedV1[] = [];
+    const coordinator = createTaskActionCoordinatorV1({
+      registry: createTaskActionRegistryV1([skipTestRow()]),
+      leaseStore: createWorkflowLeaseStoreV1(),
+      openRunnerSelection: skippingSelectionOpener([
+        { storedModelId: "codex-cli:gpt-5.6-sol@high", providerLabel: "OpenAI Codex", runnerId: "codex-cli" },
+        { storedModelId: "kimi-cli:kimi-code/k3", providerLabel: "Kimi Code CLI", runnerId: "kimi-cli" },
+      ]),
+      orchestrator: makeOrchestrator(),
+      followUpScheduler: { schedule: (): void => undefined },
+      presenter: { beginProgress: () => ({ end: (): void => undefined }) },
+      auditLogger: { log: (): void => undefined },
+      onCandidateSkipped: (skip): void => {
+        skipped.push(skip);
+      },
+    });
+
+    const outcome = await coordinator.executeAction(baseRequest());
+
+    assert.deepEqual(outcome, { kind: "unavailable", code: "providerModeUnavailable" });
+    assert.equal(skipped.length, 2, "every passed-over candidate must be reported, not just the first");
+    assert.deepEqual(skipped.map((s) => s.storedModelId), [
+      "codex-cli:gpt-5.6-sol@high",
+      "kimi-cli:kimi-code/k3",
+    ]);
+    // The stored id is what the user actually configured, so it is the only
+    // string that lets them find the setting that caused the skip.
+    assert.equal(skipped[0]?.providerLabel, "OpenAI Codex");
+    assert.equal(skipped[0]?.runnerId, "codex-cli");
+    assert.equal(skipped[0]?.code, "providerModeUnavailable");
+    assert.equal(skipped[0]?.taskStage, "plan");
+  });
+
+  void it("never lets a throwing onCandidateSkipped observer change the outcome", async () => {
+    // Reporting is advisory. A notification surface that throws (or is torn
+    // down mid-operation) must not turn a working cascade into a failure.
+    const coordinator = createTaskActionCoordinatorV1({
+      registry: createTaskActionRegistryV1([skipTestRow()]),
+      leaseStore: createWorkflowLeaseStoreV1(),
+      openRunnerSelection: skippingSelectionOpener([
+        { storedModelId: "codex-cli:gpt-5", providerLabel: "OpenAI Codex", runnerId: "codex-cli" },
+      ]),
+      orchestrator: makeOrchestrator(),
+      followUpScheduler: { schedule: (): void => undefined },
+      presenter: { beginProgress: () => ({ end: (): void => undefined }) },
+      auditLogger: { log: (): void => undefined },
+      onCandidateSkipped: (): void => {
+        throw new Error("notification surface exploded");
+      },
+    });
+
+    const outcome = await coordinator.executeAction(baseRequest());
+    assert.deepEqual(outcome, { kind: "unavailable", code: "providerModeUnavailable" });
+  });
+
+  void it("integrates with runnerRegistry's real openV1RunnerSelection: ranked fallback and exhaustion", async () => {
+    // Ranking policy under test is the registry's own: the stored primary is
+    // reserved, invoked through the broker, and on a pre-response failure the
+    // strategy-gated backup is reserved on a FRESH attempt. Under the test
+    // stub there is no usable vscode.lm host, so each Copilot transport
     // reports a deterministic pre-response transport failure, the ranking
     // exhausts, and the coordinator maps the whole operation onto the stable
     // providerModeUnavailable outcome.
+    //
+    // BOTH candidates are Copilot on purpose. This test uses the REAL opener,
+    // which builds REAL transports — a CLI candidate here does not stub
+    // anything, it spawns the actual provider binary against the developer's
+    // own account. This test previously ranked `codex-cli:gpt-5` first,
+    // relying on codex being refused pre-spawn for writing its answer to a
+    // last-message file; when codex moved to stdout capture (2026-08-11) that
+    // refusal disappeared and every run of this file silently started two
+    // real `codex exec` processes, burning live quota to reach the same
+    // assertion. Keep CLI provider ids out of this test.
+    //
+    // The "unsupported primary is skipped rather than silently bypassed"
+    // behaviour it used to cover lives in runnerRegistryV1Selection.test.ts,
+    // which exercises the mode arm and a synthetic last-message-file
+    // definition without constructing a transport at all; the coordinator's
+    // own handling of a skip is covered by the onCandidateSkipped tests above.
     const settings = installModelSettings({
       "impl-high-review": {
-        primary: "codex-cli:gpt-5",
+        primary: "copilot:gpt-5-mini",
         backups: ["copilot:gpt-5"],
         strategy: "switch-to-backup",
       },
@@ -1301,7 +1429,7 @@ void describe("taskActionCoordinatorV1", () => {
         workspaceCwd: "/workspace",
         resolveStagePrimaryModel: (taskStage) => {
           assert.equal(taskStage, "plan");
-          return { modelId: "codex-cli:gpt-5", stage: "impl-high-review" };
+          return { modelId: "copilot:gpt-5-mini", stage: "impl-high-review" };
         },
       });
       const leaseStore = createWorkflowLeaseStoreV1();
