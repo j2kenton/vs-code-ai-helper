@@ -230,83 +230,30 @@ void describe("openV1RunnerSelection", () => {
     }
   });
 
-  void it("rejects a last-message-file CLI at selection time instead of reserving it", () => {
-    // codex-cli writes its final message to a temp file, so it cannot satisfy
-    // AC-RUNNER-02's stdout-only capture: as sole candidate the selection
-    // reports providerModeUnavailable rather than silently reserving it.
-    const noBackups = installModelSettings({
+  void it("reserves codex-cli in text mode instead of silently skipping it", () => {
+    // Regression guard. codex-cli used to declare usesLastMessageFile: true,
+    // so cliProviderSupportsV1StdoutCapture rejected it here and the selection
+    // returned providerModeUnavailable for a perfectly healthy, logged-in CLI.
+    // Because that happens at SELECTION time, the symptom was silence: Codex
+    // resolved, reported available, and stayed listed in the picker while
+    // never being spawned once — zero tokens, no session file, no error, and
+    // a backup model quietly answering in its place. Codex now reads its
+    // result from its --json event stream (extractCodexFinalOutput), so it
+    // satisfies AC-RUNNER-02 from stdout and must genuinely reserve.
+    const stub = installModelSettings({
       "impl-high-review": { primary: "codex-cli:gpt-5", strategy: "switch-to-backup" },
     });
     try {
       const session = openSession();
       const selection = openSelection({ session, mode: "text", modelId: "codex-cli:gpt-5" });
-      assert.deepEqual(selection.reserveNext(session.allocateAttempt()), {
-        kind: "noneRemaining",
-        code: "providerModeUnavailable",
-      });
-    } finally {
-      noBackups.restore();
-    }
-
-    // With a capturable backup configured, the unqualified primary is NOT
-    // silently bypassed: it becomes an explicit settled attempt
-    // (providerUnavailablePreInvocation) before any backup attempt is
-    // allocated, and only a FRESH attempt may then reserve the backup.
-    const withBackup = installModelSettings({
-      "impl-high-review": {
-        primary: "codex-cli:gpt-5",
-        backups: ["claude-cli:sonnet"],
-        strategy: "switch-to-backup",
-      },
-    });
-    try {
-      const session = openSession();
-      const selection = openSelection({ session, mode: "text", modelId: "codex-cli:gpt-5" });
-
-      const primaryAttempt = session.allocateAttempt();
-      const first = selection.reserveNext(primaryAttempt);
-      assert.deepEqual(first, {
-        kind: "candidateUnavailable",
-        code: "providerModeUnavailable",
-        storedModelId: "codex-cli:gpt-5",
-        providerLabel: "OpenAI Codex",
-        runnerId: "codex-cli",
-      });
-      // The skip is a real settled attempt in the session, not bookkeeping
-      // outside it: the settled attempt can never receive a reservation…
-      assert.throws(
-        () =>
-          session.reserve({
-            attemptId: primaryAttempt,
-            mode: "text",
-            runnerId: "codex-cli",
-            providerId: "codex-cli",
-            modelId: "codex-cli:gpt-5",
-          }),
-        /already settled/
-      );
-      // …and its outcome is reported exactly once.
-      assert.throws(
-        () => session.reportAttemptOutcome(primaryAttempt, "providerUnavailablePreInvocation"),
-        /exactly once/
-      );
-
-      const second = selection.reserveNext(session.allocateAttempt());
-      assert.equal(second.kind, "reserved");
-      if (second.kind === "reserved") {
-        assert.equal(second.reserved.handle.runnerId, "claude-cli");
-        assert.equal(second.reserved.storedModelId, "claude-cli:sonnet");
-        session.reportAttemptOutcome(
-          second.reserved.handle.correlation.attemptId,
-          "transportFailurePreResponse"
-        );
+      const first = selection.reserveNext(session.allocateAttempt());
+      assert.equal(first.kind, "reserved");
+      if (first.kind === "reserved") {
+        assert.equal(first.reserved.handle.runnerId, "codex-cli");
+        assert.equal(first.reserved.storedModelId, "codex-cli:gpt-5");
       }
-      assert.deepEqual(selection.reserveNext(session.allocateAttempt()), {
-        kind: "noneRemaining",
-        code: "candidatesExhausted",
-      });
     } finally {
-      withBackup.restore();
+      stub.restore();
     }
   });
 

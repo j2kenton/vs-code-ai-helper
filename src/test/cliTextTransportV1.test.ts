@@ -442,6 +442,21 @@ void describe("createCliTextTransportV1 per shipped CLI definition", () => {
         "",
       ].join("\n");
     }
+    if (def.structuredEventStream === "codex") {
+      // Codex's --json JSONL: reasoning and command items interleave, and the
+      // LAST agent_message item is the real answer. Plain `text` mode cannot
+      // be used here at all — Codex's human-readable stdout leads with a
+      // banner and echoes the entire prompt back under a `user` heading, so
+      // the frame would never be the first bytes of the capture.
+      return [
+        JSON.stringify({ type: "thread.started", thread_id: "t1" }),
+        JSON.stringify({ type: "turn.started" }),
+        JSON.stringify({ type: "item.completed", item: { id: "i0", type: "reasoning", text: "considering" } }),
+        JSON.stringify({ type: "item.completed", item: { id: "i1", type: "agent_message", text: frame } }),
+        JSON.stringify({ type: "turn.completed", usage: { input_tokens: 1, output_tokens: 1 } }),
+        "",
+      ].join("\n");
+    }
     if (def.structuredEventStream !== undefined) {
       throw new Error(
         `Unrecognized structuredEventStream ${String(def.structuredEventStream)} for ${def.id} — add a fixture shape for it here.`

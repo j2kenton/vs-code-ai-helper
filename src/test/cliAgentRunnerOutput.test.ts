@@ -6,7 +6,12 @@ import { execSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import { describe, it } from "node:test";
 import * as vscode from "vscode";
-import { __testOnly, CliAgentRunner, runImplementationWithCli } from "../runners/cliAgentRunner";
+import {
+  __testOnly,
+  CliAgentRunner,
+  cliProviderSupportsV1StdoutCapture,
+  runImplementationWithCli,
+} from "../runners/cliAgentRunner";
 import { CliProviderDefinition, getCliProvider } from "../runners/providers";
 import { attributionHeader, withAttribution } from "../utils/fileUtils";
 import { AgentRunRequest } from "../types/agentRunner";
@@ -447,6 +452,113 @@ void describe("CLI output normalization", () => {
     assert.strictEqual(diagnostics.markerScanText, "");
     assert.strictEqual(diagnostics.sawAnyEvent, true);
     assert.strictEqual(diagnostics.retryable, false);
+  });
+
+  // Codex's plain stdout is a human-readable transcript (banner, workdir/model
+  // header, a `user` section echoing the whole prompt, then `codex`, then a
+  // "tokens used" footer), so parseAiResultEnvelopeV1 — which requires the
+  // capture to START with the frame marker — could never accept it. `--json`
+  // is what makes codex-cli V1-eligible at all; these lock the event shape
+  // verified live against codex 0.147.0.
+  void it("takes Codex's LAST agent_message item, dropping reasoning and tool items", () => {
+    const stream = [
+      JSON.stringify({ type: "thread.started", thread_id: "019ff1c3" }),
+      JSON.stringify({ type: "turn.started" }),
+      JSON.stringify({ type: "item.completed", item: { id: "item_0", type: "reasoning", text: "thinking" } }),
+      JSON.stringify({ type: "item.completed", item: { id: "item_1", type: "agent_message", text: "Let me check the file." } }),
+      JSON.stringify({ type: "item.completed", item: { id: "item_2", type: "command_execution", text: "SECRET_FILE_CONTENT" } }),
+      JSON.stringify({
+        type: "item.completed",
+        item: { id: "item_3", type: "agent_message", text: "<<<ENSEMBLE_AI_RESULT_V1>>>\n{}\n<<<END_ENSEMBLE_AI_RESULT_V1>>>" },
+      }),
+      JSON.stringify({ type: "turn.completed", usage: { input_tokens: 14592, output_tokens: 11 } }),
+    ].join("\n");
+
+    assert.strictEqual(
+      __testOnly.extractCodexFinalOutput(stream),
+      "<<<ENSEMBLE_AI_RESULT_V1>>>\n{}\n<<<END_ENSEMBLE_AI_RESULT_V1>>>"
+    );
+  });
+
+  void it("returns Codex's placeholder for a turn that emits no agent_message", () => {
+    const stream = [
+      JSON.stringify({ type: "thread.started", thread_id: "t" }),
+      JSON.stringify({ type: "turn.completed", usage: { output_tokens: 0 } }),
+    ].join("\n");
+
+    assert.strictEqual(
+      __testOnly.extractCodexFinalOutput(stream),
+      "(Codex completed the run without returning any text reply.)"
+    );
+  });
+
+  void it("falls back to the raw stream when Codex output isn't a recognizable event stream", () => {
+    const notJson = "Not inside a trusted directory and --skip-git-repo-check was not specified.";
+    assert.strictEqual(__testOnly.extractCodexFinalOutput(notJson), notJson);
+  });
+
+  void it("normalizes Codex output via provider-specific extraction", () => {
+    const codex = getCliProvider("codex-cli");
+    assert.ok(codex, "expected codex-cli provider definition");
+
+    const stream = [
+      JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "narration" } }),
+      JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "Final answer." } }),
+    ].join("\n");
+
+    assert.strictEqual(__testOnly.normalizeCliOutput(codex, stream, undefined), "Final answer.");
+  });
+
+  void it("surfaces Codex's stdout-only failure text while withholding its agent prose", () => {
+    // Codex reports failures EXCLUSIVELY on stdout with an empty stderr
+    // (verified live), so withholding stdout the way the opaque-text bucket
+    // does would reduce every Codex failure to a bare "exit code 1". Its
+    // agent_message prose still must not reach the auth-marker scan: it can
+    // quote file contents back verbatim.
+    const stream = [
+      JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "the config wants an api key to authenticate" } }),
+      JSON.stringify({ type: "item.completed", item: { id: "item_0", type: "error", message: "Model metadata not found. Defaulting to fallback metadata." } }),
+      JSON.stringify({ type: "error", message: "The 'no-such-model' model is not supported when using Codex with a ChatGPT account." }),
+      JSON.stringify({ type: "turn.failed", error: { message: "400 invalid_request_error" } }),
+    ].join("\n");
+
+    const diagnostics = __testOnly.extractCodexStructuredDiagnostics(stream);
+    assert.ok(diagnostics.markerScanText.includes("not supported when using Codex"));
+    assert.ok(diagnostics.markerScanText.includes("400 invalid_request_error"));
+    assert.ok(diagnostics.markerScanText.includes("Defaulting to fallback metadata"));
+    assert.ok(
+      !diagnostics.markerScanText.includes("api key to authenticate"),
+      "agent prose must never reach the auth-marker scan"
+    );
+    assert.strictEqual(diagnostics.sawAnyEvent, true);
+    assert.strictEqual(diagnostics.retryable, false);
+  });
+
+  void it("keeps codex-cli eligible for V1 stdout capture", () => {
+    // The regression this whole change exists for: usesLastMessageFile: true
+    // made cliProviderSupportsV1StdoutCapture reject codex-cli at V1 selection
+    // time, so it resolved, reported available, and appeared in the picker
+    // while never being spawned — zero tokens, no session file, no error.
+    const codex = getCliProvider("codex-cli");
+    assert.ok(codex, "expected codex-cli provider definition");
+    assert.strictEqual(codex.usesLastMessageFile ?? false, false);
+    assert.strictEqual(cliProviderSupportsV1StdoutCapture(codex), true);
+    assert.ok(
+      codex.buildArgs("text", undefined, undefined, undefined).includes("--json"),
+      "codex must request its JSONL event stream"
+    );
+  });
+
+  void it("still refuses V1 stdout capture for any last-message-file CLI", () => {
+    // No shipped provider sets usesLastMessageFile any more (codex-cli was the
+    // last one), so this synthetic definition keeps the gate itself covered:
+    // a future provider that answers only via a temp file must not be reserved
+    // for V1, because AC-RUNNER-02 captures results from bounded stdout alone.
+    const lastMessageFileProvider = {
+      ...(getCliProvider("codex-cli") as CliProviderDefinition),
+      usesLastMessageFile: true,
+    };
+    assert.strictEqual(cliProviderSupportsV1StdoutCapture(lastMessageFileProvider), false);
   });
 
   void it("fails CLI implementation runs that report completion without file changes", () => {

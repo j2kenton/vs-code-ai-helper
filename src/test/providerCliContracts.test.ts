@@ -576,6 +576,7 @@ void describe("provider CLI contracts", () => {
     );
     assert.deepStrictEqual(textArgs, [
       "exec",
+      "--json",
       "--skip-git-repo-check",
       "--color",
       "never",
@@ -600,6 +601,7 @@ void describe("provider CLI contracts", () => {
     );
     assert.deepStrictEqual(editArgs, [
       "exec",
+      "--json",
       "--skip-git-repo-check",
       "--color",
       "never",

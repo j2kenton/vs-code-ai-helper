@@ -240,8 +240,15 @@ export interface CliProviderDefinition {
    * `{"type":"run_result",...,"text":...}` and `{"type":"error","message"}`
    * lines rather than opencode's `{"type":"error","error":{...}}"` — see
    * extractClineStructuredDiagnostics/extractClineFinalOutput.
+   *
+   * "codex" names Codex's `--json` JSONL stream: `{"type":"item.completed",
+   * "item":{"type":"agent_message","text":...}}` for the final answer, with
+   * failures arriving as `{"type":"error","message":...}` /
+   * `{"type":"turn.failed","error":{"message":...}}` on STDOUT while stderr
+   * stays empty (verified live against codex 0.147.0) — see
+   * extractCodexFinalOutput/extractCodexStructuredDiagnostics.
    */
-  structuredEventStream?: "opencode" | "cline" | "kimi";
+  structuredEventStream?: "opencode" | "cline" | "kimi" | "codex";
   /**
    * Optional same-conversation recovery for a provider whose headless CLI
    * persists a failed turn and exposes a continuation flag. Unlike replaying
@@ -843,10 +850,29 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     // semantics here, and any unsupported custom ID can still be set
     // directly via "codex-cli:<model>" in settings.
     models: [{ model: undefined, name: "Codex (CLI default)" }],
-    usesLastMessageFile: true,
+    // Codex's final answer is read from its `--json` event stream, NOT from
+    // `--output-last-message`. This flag is what gates V1 eligibility
+    // (cliProviderSupportsV1StdoutCapture → openV1RunnerSelection), and
+    // leaving it true is what silently excluded Codex from every V1 action:
+    // the registry returned `providerModeUnavailable` at selection time and
+    // fell through to a backup model, so Codex resolved, reported available,
+    // and was enumerated in the picker while never actually being spawned —
+    // zero tokens, no session file, no error. Codex satisfies AC-RUNNER-02
+    // from stdout like every other structured-stream provider, so it must
+    // stay false; see extractCodexFinalOutput.
+    usesLastMessageFile: false,
+    structuredEventStream: "codex",
     buildArgs(mode, model, lastMessageFile, context): string[] {
       const parsedModel = parseCodexModelSelection(model);
-      const args = ["exec", "--skip-git-repo-check", "--color", "never"];
+      // `--json` for the same reason kimi-cli uses `--output-format
+      // stream-json`: Codex's human-readable stdout wraps the answer in a
+      // banner ("OpenAI Codex v…", workdir/model header, a `user` echo of the
+      // whole prompt, then `codex`, then a "tokens used" footer). V1 requires
+      // the captured output to START with the frame marker, so that plain
+      // mode cannot satisfy parseAiResultEnvelopeV1 no matter how well the
+      // model complies. In `--json` mode the answer is its own
+      // `agent_message` item and extracts cleanly.
+      const args = ["exec", "--json", "--skip-git-repo-check", "--color", "never"];
       if (context?.cwd) {
         args.push("--cd", context.cwd);
       }

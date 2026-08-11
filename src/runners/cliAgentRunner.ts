@@ -1092,6 +1092,166 @@ function extractKimiStructuredDiagnostics(
   };
 }
 
+/** Codex's counterpart to CLINE_NO_TEXT_REPLY_PLACEHOLDER — see extractCodexFinalOutput. */
+const CODEX_NO_TEXT_REPLY_PLACEHOLDER =
+  "(Codex completed the run without returning any text reply.)";
+
+/**
+ * Codex's `--json` JSONL line shape (verified live against codex 0.147.0):
+ * `{"type":"thread.started","thread_id":...}`, `{"type":"turn.started"}`,
+ * `{"type":"item.completed","item":{"id":...,"type":"agent_message","text":...}}`
+ * for the model's answer, and `{"type":"turn.completed","usage":{...}}`.
+ * Failures instead emit `{"type":"error","message":...}` and
+ * `{"type":"turn.failed","error":{"message":...}}`, and non-fatal notices
+ * arrive as an `item.completed` whose item `type` is "error".
+ */
+interface CodexEnvelope {
+  type?: unknown;
+  message?: unknown;
+  error?: { message?: unknown };
+  item?: { type?: unknown; text?: unknown; message?: unknown };
+}
+
+/**
+ * Codex's LAST `agent_message` item is the authoritative final answer.
+ *
+ * This extractor is why codex-cli passes `--json` at all. Codex's plain
+ * stdout is a human-readable transcript: an "OpenAI Codex v0.147.0" banner, a
+ * workdir/model header, a `user` section echoing the ENTIRE prompt back, then
+ * `codex` and the answer, then a "tokens used" footer. parseAiResultEnvelopeV1
+ * requires the captured output to START with `<<<ENSEMBLE_AI_RESULT_V1>>>`, so
+ * that shape can never satisfy V1 — the banner alone guarantees
+ * `invalidFrame` regardless of how perfectly the model complies. This is the
+ * identical failure mode that moved kimi-cli to stream-json (see
+ * extractKimiFinalOutput); Codex's version is worse only in that it echoes the
+ * prompt, so the frame the model emitted appears TWICE in the raw stream.
+ *
+ * "Last wins" matches extractKimiFinalOutput/extractClineFinalOutput's
+ * forward-compatible choice: a turn that narrates before answering emits each
+ * narration as its own earlier `agent_message`, so the last one is the answer.
+ * Reasoning and tool items carry a different item `type` and are skipped by
+ * construction.
+ */
+function extractCodexFinalOutput(
+  stdout: string,
+  parsed: ParsedCliEventLines = parseJsonLineEvents(stdout)
+): string {
+  const cleaned = stripAnsi(stdout).trim();
+  if (cleaned.length === 0) {
+    return cleaned;
+  }
+
+  let sawRecognizedEvent = false;
+  let finalText: string | undefined;
+  for (const rawEvent of parsed.events) {
+    const event = rawEvent as CodexEnvelope;
+    if (typeof event.type === "string") {
+      sawRecognizedEvent = true;
+    }
+    if (
+      event.type === "item.completed" &&
+      event.item?.type === "agent_message" &&
+      typeof event.item.text === "string"
+    ) {
+      finalText = event.item.text;
+    }
+  }
+
+  // Same rationale as extractKimiFinalOutput: an explicit empty string is
+  // treated as "no text reply" so a legitimate exit-0 tool-only turn still
+  // produces a visible placeholder rather than "" (which downstream misreads
+  // as "the CLI produced no output" and routes through a generic failure).
+  if (finalText !== undefined && finalText.trim().length > 0) {
+    return finalText.trim();
+  }
+  if (sawRecognizedEvent) {
+    return CODEX_NO_TEXT_REPLY_PLACEHOLDER;
+  }
+  // Nothing parsed as a recognizable Codex event at all — fall back to the raw
+  // stream so a failure stays visible instead of silently empty.
+  return cleaned;
+}
+
+/**
+ * Pull just the diagnosable content out of Codex's `--json` stream: its own
+ * `{"type":"error"}` lines, the `turn.failed` error message, and
+ * `item.completed` items whose item `type` is "error" — and nothing else.
+ *
+ * Codex is the case that makes this mandatory rather than merely tidy. Its
+ * failures arrive EXCLUSIVELY on stdout as events, with stderr completely
+ * empty and exit 1 (verified live: a rejected model produced
+ * `{"type":"error","message":"{…\\"message\\":\\"The 'x' model is not
+ * supported when using Codex with a ChatGPT account.\\"}"}` plus a matching
+ * `turn.failed`, and nothing at all on stderr). That is precisely the opencode
+ * 401 situation called out in toFriendlyError: scoping diagnosis to stderr
+ * alone would reduce every Codex failure — including auth failures that must
+ * gate the backup cascade — to a bare "exit code 1".
+ *
+ * `agent_message` items are excluded for the standard reason (see
+ * extractClineStructuredDiagnostics): they are the model's own free-form prose
+ * and can quote file contents back verbatim, so feeding them to the
+ * authErrorMarkers scan would diagnose an auth failure on any run that merely
+ * read a file mentioning credentials. Before this provider became
+ * structured, codex-cli was in toFriendlyError's "opaque-text" bucket where
+ * stdout was withheld from the scan entirely for exactly that reason; routing
+ * it through this curated extractor is what makes scanning safe AND restores
+ * the real error text.
+ *
+ * A non-flat error payload is re-serialized via JSON.stringify rather than
+ * dropped, the same fallback (and justification) as the cline/opencode
+ * siblings: an error event never carries file contents, and losing a real
+ * failure silently is worse than a noisier message.
+ *
+ * As with cline, a bare error line is not on its own proof the run failed —
+ * the observed "Model metadata … not found. Defaulting to fallback metadata"
+ * notice is a warning-shaped `item.completed`. This function is only reached
+ * via toFriendlyError, which the caller gates on a non-zero exit or empty
+ * output, so that ambiguity is resolved by the caller.
+ */
+function extractCodexStructuredDiagnostics(
+  stdout: string,
+  parsed: ParsedCliEventLines = parseJsonLineEvents(stdout)
+): StructuredCliDiagnostics {
+  const { events, unparsedText, unparsedScanSafeText } = parsed;
+  const collected: string[] = [];
+
+  for (const rawEvent of events) {
+    const event = rawEvent as CodexEnvelope;
+    if (event.type === "error") {
+      collected.push(
+        typeof event.message === "string" ? event.message : JSON.stringify(rawEvent)
+      );
+      continue;
+    }
+    if (event.type === "turn.failed") {
+      collected.push(
+        typeof event.error?.message === "string"
+          ? event.error.message
+          : JSON.stringify(rawEvent)
+      );
+      continue;
+    }
+    if (event.type === "item.completed" && event.item?.type === "error") {
+      collected.push(
+        typeof event.item.message === "string"
+          ? event.item.message
+          : JSON.stringify(rawEvent)
+      );
+    }
+  }
+
+  const joined = collected.join("\n");
+  return {
+    markerScanText: [joined, unparsedScanSafeText].filter((part) => part.length > 0).join("\n"),
+    detail: [joined, unparsedText].filter((part) => part.length > 0).join("\n"),
+    // Codex's stream carries no structural retryable signal (same as cline and
+    // kimi); transient-transport classification stays with
+    // applyTransportTransience over the scoped diagnosticText.
+    retryable: false,
+    sawAnyEvent: events.length > 0,
+  };
+}
+
 /**
  * finishReason values verified LIVE to carry CLI/provider-generated failure
  * text in `run_result.text` rather than the model's own free-form prose —
@@ -1335,6 +1495,15 @@ function normalizeCliOutput(
     // Same reasoning again: kimi-cli never sets usesLastMessageFile, so
     // output is always stdout-derived and the shared parse stays valid.
     return extractKimiFinalOutput(output, parsed);
+  }
+
+  if (def.structuredEventStream === "codex") {
+    // Keyed off the tag rather than the id purely for symmetry with the
+    // opencode branch; codex-cli is currently its only carrier. codex-cli sets
+    // usesLastMessageFile: false (deliberately — see its provider definition),
+    // so `output` is always stdout-derived here and the caller's shared parse
+    // stays valid to reuse.
+    return extractCodexFinalOutput(output, parsed);
   }
 
   return output;
@@ -1642,6 +1811,8 @@ export const __testOnly = {
   extractClineStructuredDiagnostics,
   extractKimiFinalOutput,
   extractKimiStructuredDiagnostics,
+  extractCodexFinalOutput,
+  extractCodexStructuredDiagnostics,
   isTextModeGuaranteedReadOnly,
   parseJsonLineEvents,
   unwrapJsonString,
@@ -1742,7 +1913,9 @@ function toFriendlyError(
         ? extractClineStructuredDiagnostics(stdout, parsed)
         : def.structuredEventStream === "kimi"
           ? extractKimiStructuredDiagnostics(stdout, parsed)
-          : undefined;
+          : def.structuredEventStream === "codex"
+            ? extractCodexStructuredDiagnostics(stdout, parsed)
+            : undefined;
 
   const scanSource = structured
     ? `${stderr}\n${structured.markerScanText}`
@@ -1751,12 +1924,14 @@ function toFriendlyError(
   // The provider's own marker list is necessarily narrow (opencode has no
   // "403"/"forbidden" entry, for instance). isAuthenticationFailure's broader
   // regex is ALSO checked, but the text it scans depends on the provider
-  // shape: for structured providers, the full scanSource — markerScanText is
+  // shape: for structured providers (which now includes codex-cli — it moved
+  // out of the opaque-text bucket below when it adopted `--json`, precisely
+  // because its failures live only on stdout), the full scanSource — markerScanText is
   // curated by extractStructuredCliDiagnostics to exclude tool/text-event
   // content (safely including fields like responseBody that are deliberately
   // excluded from `detail` below), so an auth signal living only in a field
   // the provider's own markers don't cover is still caught. For opaque-text
-  // providers (kiro-cli, codex-cli), stdout is the model's own generated
+  // providers (kiro-cli), stdout is the model's own generated
   // output — arbitrary prose or echoed file content that happens to mention
   // "403"/"credentials"/"authenticate" would false-positive the whole run as
   // an auth failure if scanned, which hard-blocks the backup cascade
