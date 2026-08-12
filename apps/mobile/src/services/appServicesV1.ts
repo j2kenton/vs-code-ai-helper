@@ -151,6 +151,41 @@ let testOverrides: Partial<CreateAppServicesOptionsV1> | undefined;
 export const DEFAULT_CONTROL_PLANE_URL_V1 = 'https://control-plane.invalid';
 
 /**
+ * OAuth client IDs from the build environment.
+ *
+ * Until this existed, `oauthClientIds` could only be supplied through
+ * `setAppServiceTestOverridesV1`, which only the e2e hook calls — so a real
+ * build had no client id for any provider and `startSignIn` failed at its own
+ * "no client id configured" guard. Sign-in was reachable from a test and
+ * unreachable from the app.
+ *
+ * Client IDs are public by design — they travel in the authorize URL the
+ * browser sees — so `EXPO_PUBLIC_*` is the right channel. The client SECRETS
+ * deliberately have no counterpart here: they belong only to the control
+ * plane, which performs the code exchange (Part 6 trust boundary).
+ *
+ * Each variable is read as a literal `process.env.EXPO_PUBLIC_…` expression
+ * because Metro inlines these at build time by textual substitution; a
+ * computed lookup would silently evaluate to undefined in a production bundle.
+ */
+function oauthClientIdsFromEnvV1(): Partial<Record<IdentityProviderV1, string>> | undefined {
+  const github = process.env.EXPO_PUBLIC_GITHUB_CLIENT_ID;
+  const google = process.env.EXPO_PUBLIC_GOOGLE_CLIENT_ID;
+  const apple = process.env.EXPO_PUBLIC_APPLE_CLIENT_ID;
+  const ids: Partial<Record<IdentityProviderV1, string>> = {};
+  if (github !== undefined && github.length > 0) {
+    ids.github = github;
+  }
+  if (google !== undefined && google.length > 0) {
+    ids.google = google;
+  }
+  if (apple !== undefined && apple.length > 0) {
+    ids.apple = apple;
+  }
+  return Object.keys(ids).length > 0 ? ids : undefined;
+}
+
+/**
  * Lazily created singleton used by the screens; recreated only when the
  * configured control-plane URL actually changes (which drops the in-memory
  * session — pointing at a different control plane is a new sign-in).
@@ -159,7 +194,12 @@ export function getAppServicesV1(baseUrl?: string): AppServicesV1 {
   const resolved = baseUrl ?? sharedBaseUrl ?? DEFAULT_CONTROL_PLANE_URL_V1;
   if (sharedServices === undefined || resolved !== sharedBaseUrl) {
     sharedBaseUrl = resolved;
-    sharedServices = createAppServicesV1({ baseUrl: resolved, ...testOverrides });
+    // Test overrides spread last so a test still wins over the environment.
+    sharedServices = createAppServicesV1({
+      baseUrl: resolved,
+      oauthClientIds: oauthClientIdsFromEnvV1(),
+      ...testOverrides,
+    });
   }
   return sharedServices;
 }
