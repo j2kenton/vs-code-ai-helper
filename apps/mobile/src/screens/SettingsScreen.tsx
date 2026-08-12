@@ -34,6 +34,10 @@ export function SettingsScreen(): React.JSX.Element {
   const setGateApprovalRequired = useAppStore((s) => s.setGateApprovalRequired);
 
   const [notice, setNotice] = React.useState<string | null>(null);
+  // Separate from `notice`, which renders in the Account card at the top of
+  // the screen — too far from the key fields to be read as a response to
+  // pressing Save.
+  const [keyNotice, setKeyNotice] = React.useState<string | null>(null);
   const [sandboxKeyDraft, setSandboxKeyDraft] = React.useState('');
   const [modelKeyDraft, setModelKeyDraft] = React.useState('');
 
@@ -87,12 +91,29 @@ export function SettingsScreen(): React.JSX.Element {
       return;
     }
     const result = await services.client.putKey(keyKind, draft);
-    if (result.ok) {
-      clear();
-      setNotice(null);
-      await refreshKeyRecords();
+    if (!result.ok) {
+      setKeyNotice(`Could not save ${keyKind}: ${result.message}`);
+      return;
+    }
+    // Clearing the field was previously the ONLY evidence a save happened, and
+    // an emptied box reads at least as much like "your input was discarded" as
+    // like "stored". Say what happened, and say it next to the list it changed.
+    clear();
+    const listed = await services.client.listKeys();
+    if (listed.ok) {
+      setKeyRecords(listed.body);
+      setKeyNotice(
+        `Saved ${keyKind}. The control plane now holds ${listed.body.length} key${
+          listed.body.length === 1 ? '' : 's'
+        } for you, listed below as masked hints.`
+      );
     } else {
-      setNotice(`Key submission failed: ${result.message}`);
+      // The write succeeded; only the read-back failed. Distinguishing the two
+      // matters — the key IS stored, and re-submitting it would be pointless.
+      setKeyNotice(
+        `Saved ${keyKind}, but the key list could not be re-read (${listed.message}). ` +
+          'The key is stored; reload to see it.'
+      );
     }
   }
 
@@ -212,6 +233,7 @@ export function SettingsScreen(): React.JSX.Element {
       <Card>
         <Stack>
           <Heading>Stored keys</Heading>
+          {keyNotice !== null ? <Body>{keyNotice}</Body> : null}
           {keyRecords.length === 0 ? (
             <Body muted>
               No stored keys{signedIn ? '' : ' (sign in to view)'}. Keys are held server-side,
