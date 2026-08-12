@@ -15,6 +15,17 @@ jobs:
     defaults:
       run:
         working-directory: apps/mobile
+    env:
+      # First run on a hosted runner died as
+      # `AndroidDriverTimeoutException: Maestro Android driver did not start up
+      # in time on emulator [emulator-5554] (driver port 37173)` after ~130s.
+      # The app never launched and no flow ran: this is Maestro's own
+      # instrumentation driver losing a race with a cold, software-rendered
+      # emulator, not a product failure. Hosted runners are far slower at this
+      # than any developer machine, so the timeout is raised well past the
+      # observed failure rather than nudged just above it.
+      MAESTRO_DRIVER_STARTUP_TIMEOUT: '300000'
+      MAESTRO_CLI_NO_ANALYTICS: '1'
     steps:
       - uses: actions/checkout@v4
 
@@ -51,9 +62,21 @@ jobs:
           api-level: 34
           arch: x86_64
           working-directory: apps/mobile
+          # Headless, no boot animation, no audio/camera, and no snapshot
+          # save/restore — every one of these is time the driver spends waiting
+          # on a device that is still doing something else.
+          emulator-options: -no-window -no-snapshot -no-boot-anim -noaudio -no-camera -gpu swiftshader_indirect
+          disable-animations: true
           script: |
             adb install android/app/build/outputs/apk/debug/app-debug.apk
-            maestro test .maestro/
+            # `adb install` returning is not the same as the device being ready
+            # to host an instrumentation driver; wait for boot to actually
+            # complete before handing over to Maestro.
+            adb wait-for-device shell 'while [ "$(getprop sys.boot_completed)" != "1" ]; do sleep 1; done'
+            # One retry: driver startup is a race, and a race that fails is
+            # worth re-running before it is called a red build. A second
+            # failure still fails the job.
+            maestro test .maestro/ || maestro test .maestro/
 
   ios:
     name: iOS simulator + Maestro
@@ -61,6 +84,14 @@ jobs:
     defaults:
       run:
         working-directory: apps/mobile
+    env:
+      # Same failure as the Android lane, and Maestro named the remedy itself:
+      # `IOSDriverTimeoutException: iOS driver not ready in time, consider
+      # increasing timeout by configuring MAESTRO_DRIVER_STARTUP_TIMEOUT`.
+      # The XCTest driver is installed and launched on the simulator at session
+      # start, which a cold CI simulator does not finish quickly.
+      MAESTRO_DRIVER_STARTUP_TIMEOUT: '300000'
+      MAESTRO_CLI_NO_ANALYTICS: '1'
     steps:
       - uses: actions/checkout@v4
 
@@ -99,6 +130,11 @@ jobs:
         run: |
           UDID=$(xcrun simctl create maestro-ci "iPhone 15" || xcrun simctl list devices available | grep -m1 'iPhone' | grep -oE '[0-9A-F-]{36}')
           xcrun simctl boot "$UDID"
+          # `simctl boot` returns as soon as boot STARTS. Installing and driving
+          # a simulator that is still coming up is the same race the Android
+          # lane lost; bootstatus blocks until it is genuinely ready.
+          xcrun simctl bootstatus "$UDID" -b
           APP_PATH=$(find ios/build/Build/Products/Debug-iphonesimulator -maxdepth 1 -name '*.app' | head -n1)
           xcrun simctl install "$UDID" "$APP_PATH"
-          maestro test .maestro/
+          # One retry, same rationale as the Android lane.
+          maestro test .maestro/ || maestro test .maestro/

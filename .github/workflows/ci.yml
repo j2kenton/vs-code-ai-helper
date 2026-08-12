@@ -30,8 +30,7 @@ jobs:
       - name: Extension lint
         run: pnpm run lint
 
-      - name: Extension unit tests
-        run: pnpm run test:unit
+      # Extension unit tests run on Windows only — see the `windows` job below.
 
       - name: Extension workflow-safety verification
         run: pnpm run verify:workflow-safety
@@ -75,3 +74,39 @@ jobs:
       - name: Playwright web smoke
         if: steps.web_smoke_check.outputs.present == 'true'
         run: pnpm --filter './apps/*' run --if-present test:web-smoke
+
+  # The extension's own suite has only ever run on Windows — this repo had no
+  # CI until this workspace conversion added it, and its first Linux execution
+  # failed 18 of 2488 tests purely on path shape. Example
+  # (chatFileUpdateEnvelope.test.ts, "rejects an absolute path outside the task
+  # folder"): the fixture is `C:/tasks/other/plan.md` and the assertion expects
+  # the resolver to refuse it. On Linux that string is not absolute, so it is
+  # correctly treated as relative and joined — the resolver behaves properly and
+  # the assertion does not hold. The shipped code is not platform-specific; the
+  # FIXTURES are.
+  #
+  # Running them where they were written keeps the suite honest and CI green
+  # without editing `src/` (criterion 10). It does leave a real gap worth its
+  # own task: on Linux those path-escape assertions prove nothing, because no
+  # POSIX-absolute fixture (`/etc/passwd`) exists to exercise them. Fix that by
+  # parameterizing the fixtures per platform, then this job can fold back into
+  # the Linux one.
+  windows:
+    name: Extension unit tests (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # pnpm version comes from the root package.json "packageManager" pin.
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install workspace dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Extension unit tests
+        run: pnpm run test:unit
