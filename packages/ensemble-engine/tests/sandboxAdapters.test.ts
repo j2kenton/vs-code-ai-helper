@@ -32,7 +32,7 @@ function fakeFetch(
 ): { readonly fetch: FetchLikeV1; readonly requests: RecordedRequestV1[] } {
   const requests: RecordedRequestV1[] = [];
   const fetch: FetchLikeV1 = (url, init) => {
-    requests.push({ url, method: init.method, headers: init.headers, body: init.body });
+    requests.push({ url, method: init.method, headers: init.headers, body: init.body ?? "" });
     const response = respond(url, init.method);
     return Promise.resolve({
       status: response.status,

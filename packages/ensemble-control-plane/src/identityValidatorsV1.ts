@@ -120,7 +120,6 @@ export function createGitHubIdentityValidatorV1(
           accept: "application/vnd.github+json",
           "user-agent": "ensemble-control-plane",
         },
-        body: "",
       });
       const userBody = await userResponse.text();
       const userParsed = parseJson(userBody);
@@ -210,7 +209,6 @@ export function createOidcIdentityValidatorV1(
       const jwksResponse = await options.fetch(options.jwksUri, {
         method: "GET",
         headers: { accept: "application/json" },
-        body: "",
       });
       const jwksParsed = parseJson(await jwksResponse.text());
       const keys =

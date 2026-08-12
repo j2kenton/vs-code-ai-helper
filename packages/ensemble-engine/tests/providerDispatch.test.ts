@@ -560,7 +560,7 @@ function fakeFetch(
   calls: { url: string; headers: Record<string, string>; body: string }[]
 ): FetchLikeV1 {
   return (url, init) => {
-    calls.push({ url, headers: { ...init.headers }, body: init.body });
+    calls.push({ url, headers: { ...init.headers }, body: init.body ?? "" });
     const next = responses.shift();
     if (!next) {
       return Promise.reject(new Error("fetch failed"));

@@ -34,7 +34,16 @@ export type FetchLikeV1 = (
   init: {
     readonly method: string;
     readonly headers: Readonly<Record<string, string>>;
-    readonly body: string;
+    /**
+     * Optional, because GET and HEAD cannot carry one. When `body` was
+     * mandatory here, every GET call site had to invent a value, and the two
+     * that did — the GitHub user lookup and the OIDC JWKS fetch — passed `""`.
+     * A hand-written test fake accepts that happily; the real `fetch` answers
+     * `TypeError: Request with GET/HEAD method cannot have body`, which was
+     * then swallowed into a generic "identity validation failed" and made
+     * sign-in impossible with either provider while every test stayed green.
+     */
+    readonly body?: string;
     readonly signal?: AbortSignal;
   }
 ) => Promise<FetchResponseLikeV1>;
