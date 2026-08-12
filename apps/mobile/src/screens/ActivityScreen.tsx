@@ -2,7 +2,7 @@ import { useNavigation, type NavigationProp } from '@react-navigation/native';
 import React from 'react';
 import { StyleSheet } from 'react-native';
 
-import { Body, Card, Heading, Row, Screen, Stack, Title, TouchButton } from '../components/primitives';
+import { Body, Card, Heading, Row, Screen, SegmentedControl, Stack, Title, TouchButton } from '../components/primitives';
 import { filterFeedByTaskV1, type FeedEntryV1 } from '../events/notificationFeedV1';
 import type { RootTabParamList } from '../navigation/RootTabs';
 import { useAppStore } from '../state/appStore';
@@ -87,19 +87,15 @@ export function ActivityScreen(): React.JSX.Element {
         <TouchButton label="Clear" variant="secondary" onPress={clearFeed} disabled={feedEntries.length === 0} />
       </Row>
       <Body muted>{`Stream: ${connectionStatus}`}</Body>
-      <Row>
-        <TouchButton
-          label="All tasks"
-          variant={filterTaskId === null ? 'primary' : 'secondary'}
-          onPress={() => setOnlyActiveTask(false)}
-        />
-        <TouchButton
-          label="Active task"
-          variant={filterTaskId !== null ? 'primary' : 'secondary'}
-          disabled={activeTaskId === null}
-          onPress={() => setOnlyActiveTask(true)}
-        />
-      </Row>
+      <SegmentedControl
+        accessibilityLabel="Feed filter"
+        value={filterTaskId === null ? 'all' : 'active'}
+        onChange={(next) => setOnlyActiveTask(next === 'active')}
+        options={[
+          { value: 'all', label: 'All tasks' },
+          { value: 'active', label: 'Active task', disabled: activeTaskId === null },
+        ]}
+      />
       {visible.length === 0 ? (
         <Card>
           <Stack gap={1}>

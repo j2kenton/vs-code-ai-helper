@@ -62,7 +62,7 @@ test.describe('Activity (Part 8)', () => {
     await expect(page.getByText('Task one event')).toBeVisible();
     await expect(page.getByText('Task two event')).toBeVisible();
 
-    await page.getByRole('button', { name: 'Active task' }).click();
+    await page.getByRole('radio', { name: 'Active task' }).click();
     await expect(page.getByText('Task one event')).toBeVisible();
     await expect(page.getByText('Task two event')).not.toBeVisible();
   });

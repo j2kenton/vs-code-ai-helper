@@ -327,18 +327,15 @@ function TaskCreateForm(props: TaskCreateFormProps): React.JSX.Element {
               placeholder="Existing sandbox / workspace id"
             />
           )}
-          <Row>
-            <TouchButton
-              label="Clone git repo"
-              variant={sourceKind === 'gitClone' ? 'primary' : 'secondary'}
-              onPress={() => setSourceKind('gitClone')}
-            />
-            <TouchButton
-              label="Attach existing"
-              variant={sourceKind === 'attachExisting' ? 'primary' : 'secondary'}
-              onPress={() => setSourceKind('attachExisting')}
-            />
-          </Row>
+          <SegmentedControl
+            accessibilityLabel="Where the code comes from"
+            value={sourceKind}
+            onChange={setSourceKind}
+            options={[
+              { value: 'gitClone', label: 'Clone git repo' },
+              { value: 'attachExisting', label: 'Attach existing' },
+            ]}
+          />
           {sourceKind === 'gitClone' ? (
             <Stack gap={2}>
               <TextField value={gitUrl} onChangeText={setGitUrl} placeholder="Repository URL" />

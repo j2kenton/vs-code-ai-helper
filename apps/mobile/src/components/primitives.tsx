@@ -137,6 +137,8 @@ export function TouchButton({ label, onPress, variant = 'primary', disabled = fa
 interface SegmentedOptionV1<T extends string> {
   readonly value: T;
   readonly label: string;
+  /** Selectable but not yet available — e.g. a filter with nothing to filter to. */
+  readonly disabled?: boolean;
 }
 
 interface SegmentedControlProps<T extends string> {
@@ -185,12 +187,13 @@ export function SegmentedControl<T extends string>({
           <Pressable
             key={option.value}
             accessibilityRole="radio"
+            disabled={option.disabled === true}
             // Both spellings on purpose: `accessibilityState` is what native
             // reads, while react-native-web does not map it to `aria-checked`
             // for role="radio" — it rendered a bare <div role="radio"> with no
             // checked state, so the selection stayed invisible to assistive
             // tech on web (and to any test asserting it).
-            accessibilityState={{ checked: selected }}
+            accessibilityState={{ checked: selected, disabled: option.disabled === true }}
             aria-checked={selected}
             onPress={() => onChange(option.value)}
             style={({ pressed }) => [
@@ -202,7 +205,7 @@ export function SegmentedControl<T extends string>({
                 backgroundColor: selected ? theme.colors.surfaceRaised : 'transparent',
                 borderColor: selected ? theme.colors.accent : 'transparent',
                 borderWidth: selected ? StyleSheet.hairlineWidth : 0,
-                opacity: pressed ? 0.8 : 1,
+                opacity: option.disabled === true ? 0.4 : pressed ? 0.8 : 1,
               },
             ]}
           >
