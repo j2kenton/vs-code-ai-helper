@@ -1,0 +1,7 @@
+# Part 11: Tasks tab signed-out empty state. Mirrors
+# tests/web-smoke/tabs.smoke.spec.ts "Tasks tab shows the signed-out empty state".
+appId: dev.ensemble.commandcenter
+---
+- launchApp
+- assertVisible: 'Tasks'
+- assertVisible: 'Sign in to manage tasks'

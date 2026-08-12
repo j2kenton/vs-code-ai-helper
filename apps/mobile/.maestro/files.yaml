@@ -1,0 +1,7 @@
+# Part 11: Files tab signed-out empty state. Mirrors
+# tests/web-smoke/tabs.smoke.spec.ts "Files tab shows the signed-out empty state".
+appId: dev.ensemble.commandcenter
+---
+- launchApp
+- tapOn: 'Files'
+- assertVisible: 'Sign in to browse files'

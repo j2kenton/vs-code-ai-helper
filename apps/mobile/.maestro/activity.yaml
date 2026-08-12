@@ -1,0 +1,7 @@
+# Part 11: Activity tab signed-out empty state. Mirrors
+# tests/web-smoke/tabs.smoke.spec.ts "Activity tab shows the signed-out empty state".
+appId: dev.ensemble.commandcenter
+---
+- launchApp
+- tapOn: 'Activity'
+- assertVisible: 'Sign in to follow activity'

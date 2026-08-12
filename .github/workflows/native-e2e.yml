@@ -1,0 +1,104 @@
+name: Native E2E (Maestro)
+
+# Native lanes are expensive, so they are gated to pushes on main and release
+# tags rather than every PR. The Linux CI lane (ci.yml) runs on every PR.
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  android:
+    name: Android emulator + Maestro
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/mobile
+    steps:
+      - uses: actions/checkout@v4
+
+      # pnpm version comes from the root package.json "packageManager" pin.
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Install workspace dependencies
+        run: pnpm install --frozen-lockfile
+        working-directory: .
+
+      - name: Expo prebuild (android)
+        run: pnpm exec expo prebuild --platform android --no-install
+
+      - name: Build debug APK
+        run: ./gradlew assembleDebug
+        working-directory: apps/mobile/android
+
+      - name: Install Maestro
+        run: curl -fsSL https://get.maestro.mobile.dev | bash && echo "$HOME/.maestro/bin" >> "$GITHUB_PATH"
+
+      - name: Run Maestro flows on emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          arch: x86_64
+          working-directory: apps/mobile
+          script: |
+            adb install android/app/build/outputs/apk/debug/app-debug.apk
+            maestro test .maestro/
+
+  ios:
+    name: iOS simulator + Maestro
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: apps/mobile
+    steps:
+      - uses: actions/checkout@v4
+
+      # pnpm version comes from the root package.json "packageManager" pin.
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install workspace dependencies
+        run: pnpm install --frozen-lockfile
+        working-directory: .
+
+      - name: Expo prebuild (ios)
+        run: pnpm exec expo prebuild --platform ios --no-install
+
+      - name: Install CocoaPods dependencies
+        run: pod install
+        working-directory: apps/mobile/ios
+
+      - name: Build for simulator
+        run: |
+          xcodebuild -workspace ios/EnsembleCommandCenter.xcworkspace \
+            -scheme EnsembleCommandCenter \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            -derivedDataPath ios/build \
+            CODE_SIGNING_ALLOWED=NO build
+
+      - name: Install Maestro
+        run: curl -fsSL https://get.maestro.mobile.dev | bash && echo "$HOME/.maestro/bin" >> "$GITHUB_PATH"
+
+      - name: Boot simulator and run Maestro flows
+        run: |
+          UDID=$(xcrun simctl create maestro-ci "iPhone 15" || xcrun simctl list devices available | grep -m1 'iPhone' | grep -oE '[0-9A-F-]{36}')
+          xcrun simctl boot "$UDID"
+          APP_PATH=$(find ios/build/Build/Products/Debug-iphonesimulator -maxdepth 1 -name '*.app' | head -n1)
+          xcrun simctl install "$UDID" "$APP_PATH"
+          maestro test .maestro/

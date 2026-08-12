@@ -1,0 +1,23 @@
+# Part 11: Settings tab signed-out controls that need no network backend.
+# Mirrors the non-network cases in tests/web-smoke/tabs.smoke.spec.ts:
+# sign-in options, sandbox provider toggle, gate policy toggle, theme selector.
+appId: dev.ensemble.commandcenter
+---
+- launchApp
+- tapOn: 'Settings'
+- assertVisible: 'Appearance'
+- assertVisible: 'GitHub'
+- assertVisible: 'Google'
+- assertVisible: 'E2B'
+- assertVisible: 'Daytona'
+- tapOn: 'Daytona'
+- assertVisible: 'Daytona'
+- tapOn: 'E2B'
+- assertVisible: 'Approval required'
+- tapOn: 'Approval required'
+- assertVisible: 'Approval optional'
+- tapOn: 'Approval optional'
+- assertVisible: 'Approval required'
+- tapOn: 'dark'
+- tapOn: 'light'
+- tapOn: 'system'

@@ -4,6 +4,7 @@ node_modules/
 # Build output
 dist/
 out/
+out-test/
 *.vsix
 
 # Logs
@@ -35,6 +36,10 @@ Thumbs.db
 
 # Test coverage
 coverage/
+
+# Playwright test artifacts
+test-results/
+playwright-report/
 
 # Downloaded VS Code builds + user data for extension-host tests (test:host)
 .vscode-test/

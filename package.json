@@ -5,6 +5,7 @@
   "version": "0.85.0",
   "publisher": "j2kenton",
   "license": "MIT",
+  "packageManager": "pnpm@10.34.5",
   "repository": {
     "type": "git",
     "url": "https://github.com/j2kenton/vs-code-ai-helper.git"
@@ -1299,6 +1300,7 @@
     "test": "npm run test:unit",
     "verify": "npm-run-all -s check-types lint test verify:workflow-safety",
     "verify:vscode-lm-boundary": "node scripts/verifyVscodeLmApiBoundary.mjs",
+    "verify:execution-boundary": "node scripts/verifyExecutionBoundary.mjs",
     "check-types:vscode-1.93-compat": "tsc --noEmit -p tsconfig.vscode-1.93-compat.json",
     "verify:task-progress-selection": "tsc --project tsconfig.test.json && node --require ./test-stubs/register.js --test-timeout=20000 --test out/test/taskProgressDecoderV1.test.js",
     "verify:task-progress-migration": "tsc --project tsconfig.test.json && node --require ./test-stubs/register.js --test-timeout=20000 --test out/test/taskProgressWriterV1.test.js",

@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  linux:
+    name: Typecheck, lint, tests, web smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # pnpm version comes from the root package.json "packageManager" pin.
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install workspace dependencies
+        run: pnpm install --frozen-lockfile
+
+      # --- Existing VS Code extension checks (must stay green; src/ untouched) ---
+      - name: Extension typecheck
+        run: pnpm run check-types
+
+      - name: Extension lint
+        run: pnpm run lint
+
+      - name: Extension unit tests
+        run: pnpm run test:unit
+
+      - name: Extension workflow-safety verification
+        run: pnpm run verify:workflow-safety
+
+      - name: Extension esbuild bundle
+        run: node esbuild.js
+
+      # --- New workspace packages (mobile app, ensemble-core, engine, control plane) ---
+      # Criterion 6: no execution primitive (child_process/exec/spawn/eval/
+      # Function constructor/vm) outside allowlisted sandbox adapter files.
+      - name: Execution-boundary scan
+        run: pnpm run verify:execution-boundary
+
+      - name: Workspace package typecheck
+        run: pnpm --filter './apps/*' --filter './packages/*' run --if-present check-types
+
+      - name: Workspace package lint
+        run: pnpm --filter './apps/*' --filter './packages/*' run --if-present lint
+
+      - name: Unit / conformance / contract tests
+        run: pnpm --filter './apps/*' --filter './packages/*' run --if-present test
+
+      # --- Playwright web smoke (flows added per UI part) ---
+      # Gated on apps/mobile actually declaring a test:web-smoke script, so
+      # this doesn't spend every PR run installing a browser for a suite
+      # that doesn't exist yet (and doesn't need continue-on-error to mask
+      # that non-existence as a "pass").
+      - name: Check for a mobile web-smoke script
+        id: web_smoke_check
+        run: |
+          if node -e "process.exit(require('./apps/mobile/package.json').scripts?.['test:web-smoke'] ? 0 : 1)"; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Playwright browsers
+        if: steps.web_smoke_check.outputs.present == 'true'
+        run: pnpm --filter @ensemble/mobile exec playwright install --with-deps chromium
+
+      - name: Playwright web smoke
+        if: steps.web_smoke_check.outputs.present == 'true'
+        run: pnpm --filter './apps/*' run --if-present test:web-smoke

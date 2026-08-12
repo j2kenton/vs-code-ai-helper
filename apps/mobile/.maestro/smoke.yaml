@@ -1,0 +1,18 @@
+# Part 1 stub, extended in Part 11: full-tab-shell smoke flow. Mirrors the
+# Playwright `tabs.smoke.spec.ts` "all five tabs reachable in one pass" case,
+# just for the native shell instead of react-native-web.
+appId: dev.ensemble.commandcenter
+---
+- launchApp
+- assertVisible: 'Tasks'
+- assertVisible: 'Sign in to manage tasks'
+- tapOn: 'Activity'
+- assertVisible: 'Sign in to follow activity'
+- tapOn: 'Chat'
+- assertVisible: 'Sign in to chat'
+- tapOn: 'Files'
+- assertVisible: 'Sign in to browse files'
+- tapOn: 'Settings'
+- assertVisible: 'Appearance'
+- tapOn: 'Tasks'
+- assertVisible: 'Sign in to manage tasks'

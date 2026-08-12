@@ -1,0 +1,31 @@
+{
+  "expo": {
+    "name": "Ensemble Command Center",
+    "slug": "ensemble-command-center",
+    "scheme": "ensemble",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "automatic",
+    "newArchEnabled": true,
+    "platforms": [
+      "ios",
+      "android",
+      "web"
+    ],
+    "ios": {
+      "bundleIdentifier": "dev.ensemble.commandcenter",
+      "supportsTablet": true
+    },
+    "android": {
+      "package": "dev.ensemble.commandcenter"
+    },
+    "web": {
+      "bundler": "metro",
+      "output": "single"
+    },
+    "plugins": [
+      "expo-secure-store",
+      "expo-notifications"
+    ]
+  }
+}

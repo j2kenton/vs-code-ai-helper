@@ -1,0 +1,7 @@
+# Part 11: Chat tab signed-out empty state. Mirrors
+# tests/web-smoke/tabs.smoke.spec.ts "Chat tab shows the signed-out empty state".
+appId: dev.ensemble.commandcenter
+---
+- launchApp
+- tapOn: 'Chat'
+- assertVisible: 'Sign in to chat'

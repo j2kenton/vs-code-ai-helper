@@ -1,0 +1,13 @@
+{
+  "name": "@ensemble/contract",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Control-plane API contract (plan Part 3): OpenAPI spec, WebSocket event schemas, and the SandboxBinding resource, built on @ensemble/core types. Contract only — no server.",
+  "main": "out-test/packages/ensemble-contract/src/index.js",
+  "types": "src/index.ts",
+  "scripts": {
+    "check-types": "tsc --noEmit -p tsconfig.json",
+    "lint": "eslint src tests",
+    "test": "tsc -p tsconfig.json && node --test \"out-test/packages/ensemble-contract/tests/*.test.js\""
+  }
+}

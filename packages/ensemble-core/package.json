@@ -1,0 +1,13 @@
+{
+  "name": "@ensemble/core",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Transport-agnostic Ensemble domain contracts: task-progress, structured-question, chat-transaction, result-frame, gate, and settings shapes shared by the mobile client, engine, and control plane. Pure types + codecs; no VS Code imports.",
+  "main": "out-test/packages/ensemble-core/src/index.js",
+  "types": "src/index.ts",
+  "scripts": {
+    "check-types": "tsc --noEmit -p tsconfig.json",
+    "lint": "eslint src tests",
+    "test": "tsc -p tsconfig.json && node --test \"out-test/packages/ensemble-core/tests/*.test.js\""
+  }
+}

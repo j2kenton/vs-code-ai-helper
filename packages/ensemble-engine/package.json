@@ -1,0 +1,13 @@
+{
+  "name": "@ensemble/engine",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Portable Ensemble orchestration/execution engine (plan Part 4): the round/part task loop, structured-question lifecycle, resume semantics, and progress/notification/chat event emission per the Part 3 contract, reimplementing the VS Code extension's actions-layer semantics for a plain Node service context. Depends only on Node plus the Part 2/3 workspace packages.",
+  "main": "out-test/packages/ensemble-engine/src/index.js",
+  "types": "src/index.ts",
+  "scripts": {
+    "check-types": "tsc --noEmit -p tsconfig.json",
+    "lint": "eslint src tests",
+    "test": "tsc -p tsconfig.json && node --test \"out-test/packages/ensemble-engine/tests/*.test.js\""
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "compilerOptions": {
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "target": "es2022",
+    "lib": ["es2022", "dom"],
+    "types": ["node"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "sourceMap": true,
+    "rootDir": ".",
+    "outDir": "out-test"
+  },
+  "include": [
+    "src/api/**/*.ts",
+    "src/auth/**/*.ts",
+    "src/chat/**/*.ts",
+    "src/events/**/*.ts",
+    "src/files/**/*.ts",
+    "src/log/**/*.ts",
+    "src/tasks/**/*.ts",
+    "tests/**/*.ts"
+  ]
+}
