@@ -46,11 +46,15 @@ test.describe('Tasks (Part 7)', () => {
 
     await page.getByTestId('tab-tasks').click();
     await page.getByRole('button', { name: 'New task' }).click();
-    await page.getByPlaceholder('What should the ensemble do?').fill('Refactor the auth module');
+    await page.getByPlaceholder('What should Ensemble do?').fill('Refactor the auth module');
+    // The sandbox id only exists when attaching a workspace you already own —
+    // a task-owned sandbox is created by the control plane, so there is no id
+    // to type and nothing to get wrong. Switch modes to reach the field.
+    await page.getByRole('radio', { name: 'Attach mine' }).click();
     // Sentinel sandboxId the mock's server-side handler rejects (see
     // mockControlPlane.ts) — the form's own client-side check only blocks
     // an EMPTY sandboxId, so this reaches the contract's typed error path.
-    await page.getByPlaceholder('Sandbox / workspace id').fill('reject-me');
+    await page.getByPlaceholder('Existing sandbox / workspace id').fill('reject-me');
     await page.getByRole('button', { name: 'Create task' }).click();
 
     await expect(page.getByText(/sandboxBindingInvalid/)).toBeVisible();

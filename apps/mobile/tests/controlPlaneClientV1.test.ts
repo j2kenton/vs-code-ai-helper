@@ -143,7 +143,8 @@ test('typed error bodies surface their code and message', async () => {
     request: 'do the thing',
     sandboxBinding: {
       provider: 'e2b',
-      sandboxId: 'sb-1',
+      // No sandboxId: a task-owned sandbox is created by the control plane,
+      // which assigns the id.
       source: { kind: 'gitClone', repoUrl: 'https://example.com/r.git', ref: 'main' },
       workingDirectoryRoot: '/workspace',
       lifecycle: 'task-owned-ephemeral',

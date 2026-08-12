@@ -134,6 +134,93 @@ export function TouchButton({ label, onPress, variant = 'primary', disabled = fa
   );
 }
 
+interface SegmentedOptionV1<T extends string> {
+  readonly value: T;
+  readonly label: string;
+}
+
+interface SegmentedControlProps<T extends string> {
+  readonly options: readonly SegmentedOptionV1<T>[];
+  readonly value: T;
+  readonly onChange: (value: T) => void;
+  readonly accessibilityLabel: string;
+}
+
+/**
+ * A single choice among a few — provider, theme, mode.
+ *
+ * Distinct from TouchButton on purpose. Rendered as buttons, a choice group and
+ * an action are indistinguishable: pressing "Daytona" and pressing "Save key"
+ * looked identical while doing entirely different things, and nothing told you
+ * which provider was currently selected except a colour you had to interpret.
+ * Here the options share one recessed track, the selected option is the only
+ * raised surface in it, and each carries `radio` semantics so the selection is
+ * announced rather than inferred from styling.
+ */
+export function SegmentedControl<T extends string>({
+  options,
+  value,
+  onChange,
+  accessibilityLabel,
+}: SegmentedControlProps<T>): React.JSX.Element {
+  const theme = useTheme();
+  return (
+    <View
+      accessibilityRole="radiogroup"
+      accessibilityLabel={accessibilityLabel}
+      style={[
+        styles.segmentTrack,
+        {
+          backgroundColor: theme.colors.surface,
+          borderColor: theme.colors.border,
+          borderRadius: theme.radius.sm,
+          padding: theme.spacing(1),
+          gap: theme.spacing(1),
+        },
+      ]}
+    >
+      {options.map((option) => {
+        const selected = option.value === value;
+        return (
+          <Pressable
+            key={option.value}
+            accessibilityRole="radio"
+            // Both spellings on purpose: `accessibilityState` is what native
+            // reads, while react-native-web does not map it to `aria-checked`
+            // for role="radio" — it rendered a bare <div role="radio"> with no
+            // checked state, so the selection stayed invisible to assistive
+            // tech on web (and to any test asserting it).
+            accessibilityState={{ checked: selected }}
+            aria-checked={selected}
+            onPress={() => onChange(option.value)}
+            style={({ pressed }) => [
+              styles.segmentOption,
+              {
+                minHeight: theme.touchTarget,
+                borderRadius: theme.radius.sm,
+                paddingHorizontal: theme.spacing(3),
+                backgroundColor: selected ? theme.colors.surfaceRaised : 'transparent',
+                borderColor: selected ? theme.colors.accent : 'transparent',
+                borderWidth: selected ? StyleSheet.hairlineWidth : 0,
+                opacity: pressed ? 0.8 : 1,
+              },
+            ]}
+          >
+            <Text
+              style={[
+                selected ? theme.typography.heading : theme.typography.body,
+                { color: selected ? theme.colors.textPrimary : theme.colors.textMuted },
+              ]}
+            >
+              {option.label}
+            </Text>
+          </Pressable>
+        );
+      })}
+    </View>
+  );
+}
+
 interface TextFieldProps {
   value: string;
   onChangeText: (value: string) => void;
@@ -188,6 +275,8 @@ export function TextField({
 }
 
 const styles = StyleSheet.create({
+  segmentTrack: { flexDirection: 'row', borderWidth: StyleSheet.hairlineWidth },
+  segmentOption: { flex: 1, alignItems: 'center', justifyContent: 'center' },
   flex: { flex: 1 },
   row: { flexDirection: 'row', alignItems: 'center' },
   button: { alignItems: 'center', justifyContent: 'center' },

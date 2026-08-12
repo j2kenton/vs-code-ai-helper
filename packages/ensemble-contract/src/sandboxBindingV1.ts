@@ -60,8 +60,27 @@ export interface SandboxBindingV1 {
   readonly cleanup: SandboxCleanupPolicyV1;
 }
 
-/** The client-submitted portion of a binding (task creation request). */
-export type SandboxBindingRequestV1 = Omit<SandboxBindingV1, "bindingId" | "ownerUserId">;
+/**
+ * The client-submitted portion of a binding (task creation request).
+ *
+ * `sandboxId` is conditional on lifecycle, and the union encodes why. A
+ * `task-owned-ephemeral` binding names a sandbox the control plane has not
+ * created yet — its id is a RESULT of creation, not an input to it — so
+ * requiring one made the default mode impossible to submit: the client had
+ * nothing truthful to put there, and providers like E2B have no dashboard
+ * where a user could go and make one first (sandboxes are created on demand
+ * by the SDK and destroyed after use). Only `user-managed-persistent`, which
+ * attaches to a workspace the user already owns and keeps, has an id to give.
+ */
+export type SandboxBindingRequestV1 =
+  | (Omit<SandboxBindingV1, "bindingId" | "ownerUserId" | "sandboxId" | "lifecycle"> & {
+      readonly lifecycle: "task-owned-ephemeral";
+      /** Never submitted: the control plane creates the sandbox and assigns this. */
+      readonly sandboxId?: undefined;
+    })
+  | (Omit<SandboxBindingV1, "bindingId" | "ownerUserId" | "lifecycle"> & {
+      readonly lifecycle: "user-managed-persistent";
+    });
 
 /**
  * Typed error codes for binding validation and path confinement (plan
@@ -152,11 +171,27 @@ export function validateSandboxBindingRequestV1(raw: unknown): SandboxBindingVal
   if (typeof raw.provider !== "string" || !PROVIDERS_V1.has(raw.provider)) {
     return { ok: false, code: "sandboxBindingInvalid", reason: 'provider must be "e2b" or "daytona"' };
   }
-  if (!isBoundedNonEmptyString(raw.sandboxId)) {
-    return { ok: false, code: "sandboxBindingInvalid", reason: "sandboxId must be a bounded non-empty string" };
-  }
   if (typeof raw.lifecycle !== "string" || !LIFECYCLES_V1.has(raw.lifecycle)) {
     return { ok: false, code: "sandboxBindingInvalid", reason: "lifecycle must be a recognized ownership mode" };
+  }
+  // Checked against lifecycle rather than unconditionally: an ephemeral
+  // sandbox does not exist when the binding is submitted, so accepting an id
+  // there would be accepting a claim about something the client cannot know.
+  if (raw.lifecycle === "user-managed-persistent") {
+    if (!isBoundedNonEmptyString(raw.sandboxId)) {
+      return {
+        ok: false,
+        code: "sandboxBindingInvalid",
+        reason: "a user-managed persistent workspace requires the sandboxId it attaches to",
+      };
+    }
+  } else if (raw.sandboxId !== undefined) {
+    return {
+      ok: false,
+      code: "sandboxBindingInvalid",
+      reason:
+        "sandboxId must be omitted for a task-owned ephemeral sandbox — the control plane creates it and assigns the id",
+    };
   }
   if (typeof raw.cleanup !== "string" || !CLEANUPS_V1.has(raw.cleanup)) {
     return { ok: false, code: "sandboxBindingInvalid", reason: "cleanup must be a recognized cleanup policy" };
@@ -203,16 +238,21 @@ export function validateSandboxBindingRequestV1(raw: unknown): SandboxBindingVal
   } else {
     return { ok: false, code: "sandboxBindingInvalid", reason: `source has an unrecognized kind: ${JSON.stringify(source.kind)}` };
   }
+  // Built per branch so the returned value matches the union member its
+  // lifecycle selects, rather than carrying a `string | undefined` sandboxId
+  // that neither member accepts.
+  const common = {
+    provider: raw.provider as SandboxProviderV1,
+    source: decodedSource,
+    workingDirectoryRoot: raw.workingDirectoryRoot as string,
+    cleanup: raw.cleanup as SandboxCleanupPolicyV1,
+  };
   return {
     ok: true,
-    binding: {
-      provider: raw.provider as SandboxProviderV1,
-      sandboxId: raw.sandboxId,
-      source: decodedSource,
-      workingDirectoryRoot: raw.workingDirectoryRoot as string,
-      lifecycle: raw.lifecycle as SandboxLifecycleOwnershipV1,
-      cleanup: raw.cleanup as SandboxCleanupPolicyV1,
-    },
+    binding:
+      raw.lifecycle === "user-managed-persistent"
+        ? { ...common, lifecycle: "user-managed-persistent", sandboxId: raw.sandboxId as string }
+        : { ...common, lifecycle: "task-owned-ephemeral" },
   };
 }
 

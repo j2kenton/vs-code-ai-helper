@@ -144,7 +144,18 @@ test("task creation requires a validated SandboxBinding", () => {
   const binding = spec.components.schemas.SandboxBinding;
   assert.deepEqual(
     [...binding.required].sort(),
-    ["cleanup", "lifecycle", "provider", "sandboxId", "source", "workingDirectoryRoot"]
+    ["cleanup", "lifecycle", "provider", "source", "workingDirectoryRoot"]
+  );
+  // sandboxId is conditionally required rather than unconditionally: an
+  // ephemeral sandbox has no id until the control plane creates it.
+  assert.ok(
+    binding.allOf?.some(
+      (rule: any) =>
+        rule.if?.properties?.lifecycle?.const === "user-managed-persistent" &&
+        rule.then?.required?.includes("sandboxId") &&
+        rule.else?.not?.required?.includes("sandboxId")
+    ),
+    "SandboxBinding must require sandboxId only for user-managed-persistent"
   );
   assert.deepEqual(binding.properties.provider.enum, ["e2b", "daytona"]);
   const createOp = spec.paths["/v1/tasks"].post;
@@ -237,17 +248,38 @@ test("key records are write/rotate/delete only with masked metadata reads", () =
 // SandboxBinding validators
 // ---------------------------------------------------------------------------
 
+// The common case: nothing to attach to, so no sandboxId — the control plane
+// creates the sandbox and assigns the id.
 const validBinding = {
   provider: "e2b",
-  sandboxId: "sbx_123",
   source: { kind: "gitClone", repoUrl: "https://github.com/example/repo.git", ref: "main" },
   workingDirectoryRoot: "/workspace/repo",
   lifecycle: "task-owned-ephemeral",
   cleanup: "destroy-on-completion",
 };
 
+/** Attaching to a workspace the user already owns — the only mode with an id. */
+const validPersistentBinding = {
+  ...validBinding,
+  sandboxId: "sbx_123",
+  lifecycle: "user-managed-persistent",
+  cleanup: "retain",
+};
+
 test("sandbox binding validation: typed errors, no unbound path", () => {
   assert.equal(validateSandboxBindingRequestV1(validBinding).ok, true);
+  assert.equal(validateSandboxBindingRequestV1(validPersistentBinding).ok, true);
+
+  // An ephemeral binding cannot name a sandbox that does not exist yet.
+  const ephemeralWithId = validateSandboxBindingRequestV1({ ...validBinding, sandboxId: "sbx_123" });
+  assert.ok(!ephemeralWithId.ok && ephemeralWithId.code === "sandboxBindingInvalid");
+
+  // Attaching to an existing workspace without saying which one is not a binding.
+  const persistentWithoutId = validateSandboxBindingRequestV1({
+    ...validPersistentBinding,
+    sandboxId: undefined,
+  });
+  assert.ok(!persistentWithoutId.ok && persistentWithoutId.code === "sandboxBindingInvalid");
 
   const missing = validateSandboxBindingRequestV1(undefined);
   assert.ok(!missing.ok && missing.code === "sandboxBindingMissing");
@@ -269,9 +301,7 @@ test("sandbox binding validation: typed errors, no unbound path", () => {
   assert.ok(!badCleanup.ok && badCleanup.code === "sandboxBindingInvalid");
 
   const attach = validateSandboxBindingRequestV1({
-    ...validBinding,
-    lifecycle: "user-managed-persistent",
-    cleanup: "retain",
+    ...validPersistentBinding,
     source: { kind: "attachExisting", path: "/home/user/project" },
   });
   assert.equal(attach.ok, true);

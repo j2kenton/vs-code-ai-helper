@@ -1,7 +1,18 @@
 import React from 'react';
 
 import type { SandboxProviderV1 } from '../api/controlPlaneClientV1';
-import { Body, Card, Heading, Row, Screen, Stack, TextField, Title, TouchButton } from '../components/primitives';
+import {
+  Body,
+  Card,
+  Heading,
+  Row,
+  Screen,
+  SegmentedControl,
+  Stack,
+  TextField,
+  Title,
+  TouchButton,
+} from '../components/primitives';
 import { getAppServicesV1 } from '../services/appServicesV1';
 import { useAppStore, type ThemePreference } from '../state/appStore';
 
@@ -123,16 +134,48 @@ export function SettingsScreen(): React.JSX.Element {
    * is signed in, Control plane shows its URL — and the cards that take a
    * secret said nothing at all, leaving an emptied input as the only evidence.
    */
-  function keyStatusFor(kind: string): React.JSX.Element {
-    const stored = keyRecords.find((record) => record.keyKind === kind);
+  async function removeKey(keyKind: string): Promise<void> {
+    const result = await services.client.deleteKey(keyKind);
+    setKeyNotice({
+      kind: keyKind,
+      message: result.ok ? 'Removed.' : `Could not remove: ${result.message}`,
+    });
+    await refreshKeyRecords();
+  }
+
+  /**
+   * Every key this card owns, with its masked hint and a way to remove it.
+   *
+   * Listed by PREFIX rather than by the currently-selected kind, because a
+   * stored key outlives the selection that created it: store an E2B key, switch
+   * the picker to Daytona, and a selected-kind-only view would hide it with no
+   * way to remove it. The same applies to a model key after the model string
+   * changes. This card is the only place those keys appear now that the
+   * separate summary list is gone, so it has to show all of them.
+   */
+  function keyStatusFor(prefix: string): React.JSX.Element {
+    const stored = keyRecords.filter((record) => record.keyKind.startsWith(`${prefix}:`));
     return (
       <Stack gap={1}>
-        {stored !== undefined ? (
-          <Body>{`Key stored: ${stored.maskedHint}`}</Body>
-        ) : (
+        {stored.length === 0 ? (
           <Body muted>No key stored yet.</Body>
+        ) : (
+          stored.map((record) => (
+            <Row key={record.keyKind} style={{ justifyContent: 'space-between' }}>
+              <Body>{`${record.keyKind.slice(prefix.length + 1)} — ${record.maskedHint}`}</Body>
+              <TouchButton
+                label="Remove"
+                variant="secondary"
+                onPress={() => void removeKey(record.keyKind)}
+              />
+            </Row>
+          ))
         )}
-        {keyNotice?.kind === kind ? <Body>{keyNotice.message}</Body> : null}
+        {keyNotice?.kind.startsWith(`${prefix}:`) ? <Body>{keyNotice.message}</Body> : null}
+        <Body muted>
+          Keys are held server-side, encrypted at rest, and are never readable back — only these
+          masked hints.
+        </Body>
       </Stack>
     );
   }
@@ -191,16 +234,15 @@ export function SettingsScreen(): React.JSX.Element {
       <Card>
         <Stack>
           <Heading>Sandbox provider</Heading>
-          <Row>
-            {SANDBOX_PROVIDERS.map((provider) => (
-              <TouchButton
-                key={provider}
-                label={provider === 'e2b' ? 'E2B' : 'Daytona'}
-                variant={sandboxProvider === provider ? 'primary' : 'secondary'}
-                onPress={() => setSandboxProvider(provider)}
-              />
-            ))}
-          </Row>
+          <SegmentedControl
+            accessibilityLabel="Sandbox provider"
+            value={sandboxProvider}
+            onChange={setSandboxProvider}
+            options={SANDBOX_PROVIDERS.map((provider) => ({
+              value: provider,
+              label: provider === 'e2b' ? 'E2B' : 'Daytona',
+            }))}
+          />
           <TextField
             value={sandboxKeyDraft}
             onChangeText={setSandboxKeyDraft}
@@ -219,7 +261,7 @@ export function SettingsScreen(): React.JSX.Element {
               }
             />
           </Row>
-          {signedIn ? keyStatusFor(`sandbox:${sandboxProvider}`) : (
+          {signedIn ? keyStatusFor('sandbox') : (
             <Body muted>Sign in to submit keys.</Body>
           )}
         </Stack>
@@ -249,45 +291,23 @@ export function SettingsScreen(): React.JSX.Element {
               }
             />
           </Row>
-          {signedIn ? keyStatusFor(`model:${modelProviderId}`) : null}
+          {signedIn ? keyStatusFor('model') : null}
         </Stack>
       </Card>
 
-      <Card>
-        <Stack>
-          <Heading>Stored keys</Heading>
-          {keyRecords.length === 0 ? (
-            <Body muted>
-              No stored keys{signedIn ? '' : ' (sign in to view)'}. Keys are held server-side,
-              encrypted at rest, and are never readable back — only these masked hints.
-            </Body>
-          ) : (
-            keyRecords.map((record) => (
-              <Row key={record.keyKind} style={{ justifyContent: 'space-between' }}>
-                <Body>{`${record.keyKind} — ${record.maskedHint}`}</Body>
-                <TouchButton
-                  label="Remove"
-                  variant="secondary"
-                  onPress={() =>
-                    void services.client.deleteKey(record.keyKind).then(refreshKeyRecords)
-                  }
-                />
-              </Row>
-            ))
-          )}
-        </Stack>
-      </Card>
 
       <Card>
         <Stack>
           <Heading>Gate policy</Heading>
-          <Row>
-            <TouchButton
-              label={gateApprovalRequired ? 'Approval required' : 'Approval optional'}
-              variant={gateApprovalRequired ? 'primary' : 'secondary'}
-              onPress={() => setGateApprovalRequired(!gateApprovalRequired)}
-            />
-          </Row>
+          <SegmentedControl
+            accessibilityLabel="Gate policy"
+            value={gateApprovalRequired ? 'required' : 'optional'}
+            onChange={(next) => setGateApprovalRequired(next === 'required')}
+            options={[
+              { value: 'required', label: 'Required' },
+              { value: 'optional', label: 'Optional' },
+            ]}
+          />
           <Body muted>
             When required, every gate pauses execution until you approve or reject it in-app.
           </Body>
@@ -297,16 +317,12 @@ export function SettingsScreen(): React.JSX.Element {
       <Card>
         <Stack>
           <Heading>Appearance</Heading>
-          <Row>
-            {THEME_OPTIONS.map((option) => (
-              <TouchButton
-                key={option}
-                label={option}
-                variant={themePreference === option ? 'primary' : 'secondary'}
-                onPress={() => setThemePreference(option)}
-              />
-            ))}
-          </Row>
+          <SegmentedControl
+            accessibilityLabel="Appearance"
+            value={themePreference}
+            onChange={setThemePreference}
+            options={THEME_OPTIONS.map((option) => ({ value: option, label: option }))}
+          />
         </Stack>
       </Card>
     </Screen>

@@ -5,8 +5,16 @@
     "version": "1.0.0",
     "description": "Control-plane contract for the Ensemble mobile command center (plan Part 3). Normative rules: (1) The ONLY security scheme is the control-plane session credential (short-lived access token, Part 6) — no endpoint accepts provider OAuth tokens or any client-asserted identity data. (2) Every resource (task, sandbox binding, gate, event stream, file/diff request, key record) carries an owner, and every request is authorized against resource ownership — access by identifier guessing is denied with 404. (3) The API is a read-only remote control over sandbox content: no write or exec endpoints exist; file and diff retrieval is confined to the task's SandboxBinding root, paths canonicalized, `..` and absolute paths rejected, and symlinks resolved to real targets via the sandbox provider's filesystem APIs BEFORE authorization (resolved targets outside the root are rejected). (4) Gate decisions are idempotent: the client-generated idempotency key is scoped to (authenticated owner, target gate); same-key/same-payload replay returns the original outcome, same-key/different-payload returns a typed mismatch, and a conflicting decision on a decided gate returns a typed conflict — never a second execution."
   },
-  "servers": [{ "url": "https://control-plane.invalid/api" }],
-  "security": [{ "sessionToken": [] }],
+  "servers": [
+    {
+      "url": "https://control-plane.invalid/api"
+    }
+  ],
+  "security": [
+    {
+      "sessionToken": []
+    }
+  ],
   "paths": {
     "/v1/auth/exchange": {
       "post": {
@@ -15,19 +23,35 @@
         "description": "The client sends ONLY the authorization code and PKCE verifier; the control plane performs the code exchange with the provider server-side and validates the result per provider (OIDC: ID-token signature against published JWKS plus issuer/audience/expiry/nonce; GitHub: server-side user-API call). Identity is mapped by stable (provider, provider-subject-id) — never email. Provider tokens are used once and not retained. On the web target (x-ensemble-platform: web) refreshToken is omitted from the response body and delivered solely as an HttpOnly Set-Cookie.",
         "security": [],
         "x-ownership": "none — this endpoint ESTABLISHES identity; it trusts no client-asserted identity data",
-        "parameters": [{ "$ref": "#/components/parameters/platformHeader" }],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/platformHeader"
+          }
+        ],
         "requestBody": {
           "required": true,
           "content": {
-            "application/json": { "schema": { "$ref": "#/components/schemas/AuthExchangeRequest" } }
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AuthExchangeRequest"
+              }
+            }
           }
         },
         "responses": {
           "200": {
             "description": "Session issued",
-            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SessionTokens" } } }
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionTokens"
+                }
+              }
+            }
           },
-          "401": { "$ref": "#/components/responses/TypedError" }
+          "401": {
+            "$ref": "#/components/responses/TypedError"
+          }
         }
       }
     },
@@ -38,19 +62,35 @@
         "description": "Refresh-token rotation with reuse detection: presenting an already-rotated refresh token revokes the whole token family (Part 6). Native clients present refreshToken in the body; the web target (x-ensemble-platform: web) omits it and the server reads the token from the HttpOnly cookie set by authExchange/authRefresh instead, rotating that cookie in the response.",
         "security": [],
         "x-ownership": "the presented refresh token (body, or the HttpOnly cookie on web) identifies the session family; reuse revokes the family",
-        "parameters": [{ "$ref": "#/components/parameters/platformHeader" }],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/platformHeader"
+          }
+        ],
         "requestBody": {
           "required": true,
           "content": {
-            "application/json": { "schema": { "$ref": "#/components/schemas/RefreshRequest" } }
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RefreshRequest"
+              }
+            }
           }
         },
         "responses": {
           "200": {
             "description": "Rotated session",
-            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SessionTokens" } } }
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionTokens"
+                }
+              }
+            }
           },
-          "401": { "$ref": "#/components/responses/TypedError" }
+          "401": {
+            "$ref": "#/components/responses/TypedError"
+          }
         }
       }
     },
@@ -60,8 +100,16 @@
         "summary": "Sign out: revoke the session and its refresh-token family",
         "description": "On the web target (x-ensemble-platform: web) the response also clears the HttpOnly refresh cookie.",
         "x-ownership": "revokes only the authenticated caller's own session",
-        "parameters": [{ "$ref": "#/components/parameters/platformHeader" }],
-        "responses": { "204": { "description": "Session revoked" } }
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/platformHeader"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Session revoked"
+          }
+        }
       }
     },
     "/v1/tasks": {
@@ -74,7 +122,12 @@
             "description": "Owned tasks",
             "content": {
               "application/json": {
-                "schema": { "type": "array", "items": { "$ref": "#/components/schemas/Task" } }
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Task"
+                  }
+                }
               }
             }
           }
@@ -88,16 +141,30 @@
         "requestBody": {
           "required": true,
           "content": {
-            "application/json": { "schema": { "$ref": "#/components/schemas/TaskCreateRequest" } }
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TaskCreateRequest"
+              }
+            }
           }
         },
         "responses": {
           "201": {
             "description": "Task created",
-            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Task" } } }
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Task"
+                }
+              }
+            }
           },
-          "400": { "$ref": "#/components/responses/BindingError" },
-          "422": { "$ref": "#/components/responses/BindingError" }
+          "400": {
+            "$ref": "#/components/responses/BindingError"
+          },
+          "422": {
+            "$ref": "#/components/responses/BindingError"
+          }
         }
       }
     },
@@ -106,13 +173,25 @@
         "operationId": "getTask",
         "summary": "Monitor one task (live progress snapshot)",
         "x-ownership": "404 unless the task is owned by the authenticated user",
-        "parameters": [{ "$ref": "#/components/parameters/taskId" }],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/taskId"
+          }
+        ],
         "responses": {
           "200": {
             "description": "Task with current progress",
-            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Task" } } }
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Task"
+                }
+              }
+            }
           },
-          "404": { "$ref": "#/components/responses/TypedError" }
+          "404": {
+            "$ref": "#/components/responses/TypedError"
+          }
         }
       }
     },
@@ -121,17 +200,28 @@
         "operationId": "getTaskHistory",
         "summary": "Per-round task history (Part 7 task detail)",
         "x-ownership": "404 unless the task is owned by the authenticated user",
-        "parameters": [{ "$ref": "#/components/parameters/taskId" }],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/taskId"
+          }
+        ],
         "responses": {
           "200": {
             "description": "Ordered per-round history entries",
             "content": {
               "application/json": {
-                "schema": { "type": "array", "items": { "$ref": "#/components/schemas/TaskRound" } }
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/TaskRound"
+                  }
+                }
               }
             }
           },
-          "404": { "$ref": "#/components/responses/TypedError" }
+          "404": {
+            "$ref": "#/components/responses/TypedError"
+          }
         }
       }
     },
@@ -140,17 +230,28 @@
         "operationId": "listChatTurns",
         "summary": "List the task's chat thread (including structured questions)",
         "x-ownership": "404 unless the task is owned by the authenticated user",
-        "parameters": [{ "$ref": "#/components/parameters/taskId" }],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/taskId"
+          }
+        ],
         "responses": {
           "200": {
             "description": "Chat turns",
             "content": {
               "application/json": {
-                "schema": { "type": "array", "items": { "$ref": "#/components/schemas/ChatTurn" } }
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ChatTurn"
+                  }
+                }
               }
             }
           },
-          "404": { "$ref": "#/components/responses/TypedError" }
+          "404": {
+            "$ref": "#/components/responses/TypedError"
+          }
         }
       },
       "post": {
@@ -158,17 +259,31 @@
         "summary": "Post a chat turn or a structured-answer submission",
         "description": "Structured answers carry the answer-submission idempotency id from the Part 2 chat-transaction contract; replaying an identical submission is a no-op returning the original acknowledgement.",
         "x-ownership": "404 unless the task is owned by the authenticated user",
-        "parameters": [{ "$ref": "#/components/parameters/taskId" }],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/taskId"
+          }
+        ],
         "requestBody": {
           "required": true,
           "content": {
-            "application/json": { "schema": { "$ref": "#/components/schemas/ChatTurnRequest" } }
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChatTurnRequest"
+              }
+            }
           }
         },
         "responses": {
-          "202": { "description": "Turn accepted" },
-          "404": { "$ref": "#/components/responses/TypedError" },
-          "422": { "$ref": "#/components/responses/TypedError" }
+          "202": {
+            "description": "Turn accepted"
+          },
+          "404": {
+            "$ref": "#/components/responses/TypedError"
+          },
+          "422": {
+            "$ref": "#/components/responses/TypedError"
+          }
         }
       }
     },
@@ -177,17 +292,28 @@
         "operationId": "listGates",
         "summary": "List the task's gates",
         "x-ownership": "404 unless the task is owned by the authenticated user",
-        "parameters": [{ "$ref": "#/components/parameters/taskId" }],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/taskId"
+          }
+        ],
         "responses": {
           "200": {
             "description": "Gates",
             "content": {
               "application/json": {
-                "schema": { "type": "array", "items": { "$ref": "#/components/schemas/Gate" } }
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Gate"
+                  }
+                }
               }
             }
           },
-          "404": { "$ref": "#/components/responses/TypedError" }
+          "404": {
+            "$ref": "#/components/responses/TypedError"
+          }
         }
       }
     },
@@ -196,13 +322,25 @@
         "operationId": "getGate",
         "summary": "Gate detail (push-notification deep-link target, Part 8)",
         "x-ownership": "404 unless the gate's task is owned by the authenticated user",
-        "parameters": [{ "$ref": "#/components/parameters/gateId" }],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/gateId"
+          }
+        ],
         "responses": {
           "200": {
             "description": "Gate",
-            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Gate" } } }
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Gate"
+                }
+              }
+            }
           },
-          "404": { "$ref": "#/components/responses/TypedError" }
+          "404": {
+            "$ref": "#/components/responses/TypedError"
+          }
         }
       }
     },
@@ -212,21 +350,41 @@
         "summary": "Idempotent gate approve/reject",
         "description": "The idempotency key's uniqueness is scoped to (authenticated owner, target gate). The server stores a fingerprint (hash of the decision payload) alongside the key: replaying the same key with the same payload returns the original outcome (200); the same key with a DIFFERENT payload returns the typed mismatch gateDecisionPayloadMismatch (422); a conflicting decision for an already-decided gate returns the typed conflict gateAlreadyDecided (409) — never a second execution.",
         "x-ownership": "404 unless the gate's task is owned by the authenticated user; the idempotency key is scoped to (owner, gate)",
-        "parameters": [{ "$ref": "#/components/parameters/gateId" }],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/gateId"
+          }
+        ],
         "requestBody": {
           "required": true,
           "content": {
-            "application/json": { "schema": { "$ref": "#/components/schemas/GateDecisionRequest" } }
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GateDecisionRequest"
+              }
+            }
           }
         },
         "responses": {
           "200": {
             "description": "Decision accepted, or the stored original outcome for a same-key/same-payload replay",
-            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GateDecisionOutcome" } } }
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GateDecisionOutcome"
+                }
+              }
+            }
           },
-          "404": { "$ref": "#/components/responses/TypedError" },
-          "409": { "$ref": "#/components/responses/TypedError" },
-          "422": { "$ref": "#/components/responses/TypedError" }
+          "404": {
+            "$ref": "#/components/responses/TypedError"
+          },
+          "409": {
+            "$ref": "#/components/responses/TypedError"
+          },
+          "422": {
+            "$ref": "#/components/responses/TypedError"
+          }
         }
       }
     },
@@ -237,20 +395,33 @@
         "description": "The path is resolved strictly relative to the binding's allowed root with canonicalization; `..` and absolute paths are rejected with pathOutsideBindingRoot; symlinks are resolved to real targets via the provider's filesystem APIs BEFORE authorization and rejected with symlinkEscapesBindingRoot when the target escapes the root.",
         "x-ownership": "404 unless the task is owned by the authenticated user; retrieval confined to the task's binding root",
         "parameters": [
-          { "$ref": "#/components/parameters/taskId" },
-          { "$ref": "#/components/parameters/relativePath" }
+          {
+            "$ref": "#/components/parameters/taskId"
+          },
+          {
+            "$ref": "#/components/parameters/relativePath"
+          }
         ],
         "responses": {
           "200": {
             "description": "Directory entries",
             "content": {
               "application/json": {
-                "schema": { "type": "array", "items": { "$ref": "#/components/schemas/FileEntry" } }
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/FileEntry"
+                  }
+                }
               }
             }
           },
-          "400": { "$ref": "#/components/responses/TypedError" },
-          "404": { "$ref": "#/components/responses/TypedError" }
+          "400": {
+            "$ref": "#/components/responses/TypedError"
+          },
+          "404": {
+            "$ref": "#/components/responses/TypedError"
+          }
         }
       }
     },
@@ -261,16 +432,30 @@
         "description": "Same path-confinement rules as listFiles. Content is read-only; there is no corresponding write endpoint anywhere in this contract.",
         "x-ownership": "404 unless the task is owned by the authenticated user; retrieval confined to the task's binding root",
         "parameters": [
-          { "$ref": "#/components/parameters/taskId" },
-          { "$ref": "#/components/parameters/relativePath" }
+          {
+            "$ref": "#/components/parameters/taskId"
+          },
+          {
+            "$ref": "#/components/parameters/relativePath"
+          }
         ],
         "responses": {
           "200": {
             "description": "File content with optional pre-tokenized highlight spans",
-            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/FileContent" } } }
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FileContent"
+                }
+              }
+            }
           },
-          "400": { "$ref": "#/components/responses/TypedError" },
-          "404": { "$ref": "#/components/responses/TypedError" }
+          "400": {
+            "$ref": "#/components/responses/TypedError"
+          },
+          "404": {
+            "$ref": "#/components/responses/TypedError"
+          }
         }
       }
     },
@@ -281,21 +466,33 @@
         "description": "Same path-confinement rules as listFiles, applied to every path named in the diff.",
         "x-ownership": "404 unless the task is owned by the authenticated user; retrieval confined to the task's binding root",
         "parameters": [
-          { "$ref": "#/components/parameters/taskId" },
+          {
+            "$ref": "#/components/parameters/taskId"
+          },
           {
             "name": "gateId",
             "in": "query",
             "required": false,
             "description": "Scope the diff to the changes a specific pending gate would apply.",
-            "schema": { "type": "string" }
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
           "200": {
             "description": "Unified diff",
-            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DiffDocument" } } }
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DiffDocument"
+                }
+              }
+            }
           },
-          "404": { "$ref": "#/components/responses/TypedError" }
+          "404": {
+            "$ref": "#/components/responses/TypedError"
+          }
         }
       }
     },
@@ -310,7 +507,12 @@
             "description": "Masked metadata",
             "content": {
               "application/json": {
-                "schema": { "type": "array", "items": { "$ref": "#/components/schemas/KeyRecordMetadata" } }
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/KeyRecordMetadata"
+                  }
+                }
               }
             }
           }
@@ -323,26 +525,46 @@
         "summary": "Write or rotate a sandbox/model-provider API key",
         "description": "Submitted over TLS, stored server-side under envelope encryption (Part 5 custody). Never persisted on-device, never logged, never readable back.",
         "x-ownership": "writes only to the authenticated user's own key record",
-        "parameters": [{ "$ref": "#/components/parameters/keyKind" }],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/keyKind"
+          }
+        ],
         "requestBody": {
           "required": true,
           "content": {
-            "application/json": { "schema": { "$ref": "#/components/schemas/KeyWriteRequest" } }
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/KeyWriteRequest"
+              }
+            }
           }
         },
         "responses": {
-          "204": { "description": "Key stored (no material echoed back)" },
-          "422": { "$ref": "#/components/responses/TypedError" }
+          "204": {
+            "description": "Key stored (no material echoed back)"
+          },
+          "422": {
+            "$ref": "#/components/responses/TypedError"
+          }
         }
       },
       "delete": {
         "operationId": "deleteKey",
         "summary": "Delete a stored key",
         "x-ownership": "deletes only the authenticated user's own key record",
-        "parameters": [{ "$ref": "#/components/parameters/keyKind" }],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/keyKind"
+          }
+        ],
         "responses": {
-          "204": { "description": "Key deleted" },
-          "404": { "$ref": "#/components/responses/TypedError" }
+          "204": {
+            "description": "Key deleted"
+          },
+          "404": {
+            "$ref": "#/components/responses/TypedError"
+          }
         }
       }
     },
@@ -353,8 +575,12 @@
         "description": "Upgrades to a WebSocket carrying the schemas in src/wsEventsV1.ts. The first client message MUST be `subscribe` with a current access token; the subscription is authorized at subscribe time, revalidated on reconnect and on token refresh/expiry via `refreshAuth`, and closed on an expired or revoked token.",
         "x-ownership": "events fan out only for resources owned by the authenticated subscriber",
         "responses": {
-          "101": { "description": "Switching protocols to WebSocket" },
-          "401": { "$ref": "#/components/responses/TypedError" }
+          "101": {
+            "description": "Switching protocols to WebSocket"
+          },
+          "401": {
+            "$ref": "#/components/responses/TypedError"
+          }
         }
       }
     }
@@ -372,66 +598,125 @@
         "name": "x-ensemble-platform",
         "in": "header",
         "required": false,
-        "schema": { "type": "string", "enum": ["web", "native"] },
+        "schema": {
+          "type": "string",
+          "enum": [
+            "web",
+            "native"
+          ]
+        },
         "description": "Transport hint only (never an identity assertion) for the Part 6 web refresh-cookie policy. When `web`, authExchange and authRefresh omit refreshToken from the response body and deliver it solely as an HttpOnly, Secure, SameSite=Strict cookie scoped to /v1/auth, and authRefresh reads the refresh token back from that cookie instead of the request body. Absent (the default, native behavior) leaves refreshToken travelling in the body only, with no cookie set."
       },
       "taskId": {
         "name": "taskId",
         "in": "path",
         "required": true,
-        "schema": { "type": "string" }
+        "schema": {
+          "type": "string"
+        }
       },
       "gateId": {
         "name": "gateId",
         "in": "path",
         "required": true,
-        "schema": { "type": "string" }
+        "schema": {
+          "type": "string"
+        }
       },
       "keyKind": {
         "name": "keyKind",
         "in": "path",
         "required": true,
         "description": "Which key record: a sandbox provider or a model provider.",
-        "schema": { "type": "string", "pattern": "^(sandbox|model):[A-Za-z0-9._-]{1,64}$" }
+        "schema": {
+          "type": "string",
+          "pattern": "^(sandbox|model):[A-Za-z0-9._-]{1,64}$"
+        }
       },
       "relativePath": {
         "name": "path",
         "in": "query",
         "required": true,
         "description": "Binding-root-relative POSIX path; `.` names the binding root itself (the browser's starting directory listing). Absolute paths and `..` segments are rejected (pathOutsideBindingRoot); provider-resolved symlink targets outside the root are rejected (symlinkEscapesBindingRoot).",
-        "schema": { "type": "string", "minLength": 1, "maxLength": 2048 }
+        "schema": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048
+        }
       }
     },
     "responses": {
       "TypedError": {
         "description": "Typed error",
-        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TypedError" } } }
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/TypedError"
+            }
+          }
+        }
       },
       "BindingError": {
         "description": "Typed SandboxBinding validation error (sandboxBindingMissing, sandboxBindingInvalid, sandboxProviderKeyMissing, sandboxUnreachable, workingDirectoryRootInvalid)",
-        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TypedError" } } }
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/TypedError"
+            }
+          }
+        }
       }
     },
     "schemas": {
       "TypedError": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["code", "message"],
+        "required": [
+          "code",
+          "message"
+        ],
         "properties": {
-          "code": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" },
-          "message": { "type": "string" }
+          "code": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+          },
+          "message": {
+            "type": "string"
+          }
         }
       },
       "AuthExchangeRequest": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["provider", "authorizationCode", "codeVerifier", "redirectUri"],
+        "required": [
+          "provider",
+          "authorizationCode",
+          "codeVerifier",
+          "redirectUri"
+        ],
         "properties": {
-          "provider": { "type": "string", "enum": ["github", "google", "apple"] },
-          "authorizationCode": { "type": "string" },
-          "codeVerifier": { "type": "string", "description": "PKCE verifier; the exchange itself happens server-side." },
-          "redirectUri": { "type": "string" },
-          "nonce": { "type": "string", "description": "OIDC nonce echoed for ID-token validation (Google/Apple)." }
+          "provider": {
+            "type": "string",
+            "enum": [
+              "github",
+              "google",
+              "apple"
+            ]
+          },
+          "authorizationCode": {
+            "type": "string"
+          },
+          "codeVerifier": {
+            "type": "string",
+            "description": "PKCE verifier; the exchange itself happens server-side."
+          },
+          "redirectUri": {
+            "type": "string"
+          },
+          "nonce": {
+            "type": "string",
+            "description": "OIDC nonce echoed for ID-token validation (Google/Apple)."
+          }
         }
       },
       "RefreshRequest": {
@@ -448,56 +733,152 @@
       "SessionTokens": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["accessToken", "accessTokenExpiresAt"],
+        "required": [
+          "accessToken",
+          "accessTokenExpiresAt"
+        ],
         "properties": {
-          "accessToken": { "type": "string" },
-          "accessTokenExpiresAt": { "type": "string", "format": "date-time" },
-          "refreshToken": { "type": "string", "description": "Rotates on every refresh; reuse revokes the family. Present for native clients; absent on the web target (x-ensemble-platform: web), where it is delivered ONLY as an HttpOnly cookie instead of this body field." }
+          "accessToken": {
+            "type": "string"
+          },
+          "accessTokenExpiresAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "refreshToken": {
+            "type": "string",
+            "description": "Rotates on every refresh; reuse revokes the family. Present for native clients; absent on the web target (x-ensemble-platform: web), where it is delivered ONLY as an HttpOnly cookie instead of this body field."
+          }
         }
       },
       "SandboxBinding": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["provider", "sandboxId", "source", "workingDirectoryRoot", "lifecycle", "cleanup"],
+        "required": [
+          "provider",
+          "source",
+          "workingDirectoryRoot",
+          "lifecycle",
+          "cleanup"
+        ],
         "properties": {
-          "provider": { "type": "string", "enum": ["e2b", "daytona"] },
-          "sandboxId": { "type": "string", "minLength": 1, "maxLength": 2048 },
+          "provider": {
+            "type": "string",
+            "enum": [
+              "e2b",
+              "daytona"
+            ]
+          },
+          "sandboxId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2048,
+            "description": "Required only when lifecycle is user-managed-persistent (the workspace being attached). Omitted for task-owned-ephemeral: the control plane creates the sandbox and assigns its id, so the client has no id to submit."
+          },
           "source": {
             "oneOf": [
               {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["kind", "repoUrl", "ref"],
+                "required": [
+                  "kind",
+                  "repoUrl",
+                  "ref"
+                ],
                 "properties": {
-                  "kind": { "const": "gitClone" },
-                  "repoUrl": { "type": "string" },
-                  "ref": { "type": "string" }
+                  "kind": {
+                    "const": "gitClone"
+                  },
+                  "repoUrl": {
+                    "type": "string"
+                  },
+                  "ref": {
+                    "type": "string"
+                  }
                 }
               },
               {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["kind", "path"],
+                "required": [
+                  "kind",
+                  "path"
+                ],
                 "properties": {
-                  "kind": { "const": "attachExisting" },
-                  "path": { "type": "string" }
+                  "kind": {
+                    "const": "attachExisting"
+                  },
+                  "path": {
+                    "type": "string"
+                  }
                 }
               }
             ]
           },
-          "workingDirectoryRoot": { "type": "string", "description": "Canonical absolute path; every file/diff path resolves strictly relative to it." },
-          "lifecycle": { "type": "string", "enum": ["task-owned-ephemeral", "user-managed-persistent"] },
-          "cleanup": { "type": "string", "enum": ["destroy-on-completion", "retain"] }
-        }
+          "workingDirectoryRoot": {
+            "type": "string",
+            "description": "Canonical absolute path; every file/diff path resolves strictly relative to it."
+          },
+          "lifecycle": {
+            "type": "string",
+            "enum": [
+              "task-owned-ephemeral",
+              "user-managed-persistent"
+            ]
+          },
+          "cleanup": {
+            "type": "string",
+            "enum": [
+              "destroy-on-completion",
+              "retain"
+            ]
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "lifecycle": {
+                  "const": "user-managed-persistent"
+                }
+              },
+              "required": [
+                "lifecycle"
+              ]
+            },
+            "then": {
+              "required": [
+                "sandboxId"
+              ]
+            },
+            "else": {
+              "not": {
+                "required": [
+                  "sandboxId"
+                ]
+              }
+            }
+          }
+        ]
       },
       "TaskCreateRequest": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["request", "sandboxBinding"],
+        "required": [
+          "request",
+          "sandboxBinding"
+        ],
         "properties": {
-          "displayName": { "type": "string" },
-          "request": { "type": "string", "description": "The task description / context-pack request text." },
-          "sandboxBinding": { "$ref": "#/components/schemas/SandboxBinding" },
+          "displayName": {
+            "type": "string"
+          },
+          "request": {
+            "type": "string",
+            "description": "The task description / context-pack request text."
+          },
+          "sandboxBinding": {
+            "$ref": "#/components/schemas/SandboxBinding"
+          },
           "model": {
             "type": "string",
             "description": "Optional provider-qualified model id (\"<provider>:<model>\", or \"<provider>:default\" for the provider's default) the engine's rounds for this task run with — the client surfaces it from the user's model settings (Part 9). Validated at creation against the engine provider catalog; an invalid selection fails with the typed error modelSelectionInvalid. Absent means the control plane's configured default chain."
@@ -507,17 +888,32 @@
       "Task": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["taskId", "ownerUserId", "bindingId", "progress"],
+        "required": [
+          "taskId",
+          "ownerUserId",
+          "bindingId",
+          "progress"
+        ],
         "properties": {
-          "taskId": { "type": "string" },
-          "ownerUserId": { "type": "string" },
-          "bindingId": { "type": "string" },
+          "taskId": {
+            "type": "string"
+          },
+          "ownerUserId": {
+            "type": "string"
+          },
+          "bindingId": {
+            "type": "string"
+          },
           "progress": {
             "type": "object",
             "description": "PersistedTaskProgressV1 per the Part 2 strict schema (ensembleProgressVersion: 1)."
           },
           "latestRound": {
-            "allOf": [{ "$ref": "#/components/schemas/TaskRound" }],
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/TaskRound"
+              }
+            ],
             "description": "The task's most recent round, when one exists. Lets GET /v1/tasks derive N/M progress for every task in one call instead of a per-task GET /v1/tasks/{taskId}/history fetch; the history endpoint remains the source for the full per-round list."
           }
         }
@@ -525,25 +921,62 @@
       "TaskRound": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["roundId", "stage", "startedAt"],
+        "required": [
+          "roundId",
+          "stage",
+          "startedAt"
+        ],
         "properties": {
-          "roundId": { "type": "string" },
-          "stage": { "type": "string" },
-          "startedAt": { "type": "string", "format": "date-time" },
-          "completedAt": { "type": "string", "format": "date-time" },
-          "summary": { "type": "string" }
+          "roundId": {
+            "type": "string"
+          },
+          "stage": {
+            "type": "string"
+          },
+          "startedAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "completedAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "summary": {
+            "type": "string"
+          }
         }
       },
       "ChatTurn": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["turnId", "role", "at"],
+        "required": [
+          "turnId",
+          "role",
+          "at"
+        ],
         "properties": {
-          "turnId": { "type": "string" },
-          "role": { "type": "string", "enum": ["user", "assistant", "system"] },
-          "at": { "type": "string", "format": "date-time" },
-          "text": { "type": "string" },
-          "interactionId": { "type": "string", "description": "Present when this turn is a structured-question interaction (kind: questions frame)." }
+          "turnId": {
+            "type": "string"
+          },
+          "role": {
+            "type": "string",
+            "enum": [
+              "user",
+              "assistant",
+              "system"
+            ]
+          },
+          "at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "text": {
+            "type": "string"
+          },
+          "interactionId": {
+            "type": "string",
+            "description": "Present when this turn is a structured-question interaction (kind: questions frame)."
+          }
         }
       },
       "ChatTurnRequest": {
@@ -551,21 +984,44 @@
           {
             "type": "object",
             "additionalProperties": false,
-            "required": ["kind", "text"],
+            "required": [
+              "kind",
+              "text"
+            ],
             "properties": {
-              "kind": { "const": "message" },
-              "text": { "type": "string", "minLength": 1 }
+              "kind": {
+                "const": "message"
+              },
+              "text": {
+                "type": "string",
+                "minLength": 1
+              }
             }
           },
           {
             "type": "object",
             "additionalProperties": false,
-            "required": ["kind", "interactionId", "answers", "answerIdempotencyId"],
+            "required": [
+              "kind",
+              "interactionId",
+              "answers",
+              "answerIdempotencyId"
+            ],
             "properties": {
-              "kind": { "const": "structuredAnswers" },
-              "interactionId": { "type": "string" },
-              "answers": { "type": "array", "description": "StructuredAnswerV1[] per the Part 2 contract." },
-              "answerIdempotencyId": { "type": "string", "pattern": "^[0-9a-f]{32}$" }
+              "kind": {
+                "const": "structuredAnswers"
+              },
+              "interactionId": {
+                "type": "string"
+              },
+              "answers": {
+                "type": "array",
+                "description": "StructuredAnswerV1[] per the Part 2 contract."
+              },
+              "answerIdempotencyId": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{32}$"
+              }
             }
           }
         ]
@@ -573,76 +1029,176 @@
       "Gate": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["gateId", "taskId", "state", "summary", "requestedAt"],
+        "required": [
+          "gateId",
+          "taskId",
+          "state",
+          "summary",
+          "requestedAt"
+        ],
         "properties": {
-          "gateId": { "type": "string" },
-          "taskId": { "type": "string" },
-          "state": { "type": "string", "enum": ["pending", "approved", "rejected"] },
-          "summary": { "type": "string" },
-          "requestedAt": { "type": "string", "format": "date-time" },
-          "decidedAt": { "type": "string", "format": "date-time" }
+          "gateId": {
+            "type": "string"
+          },
+          "taskId": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "approved",
+              "rejected"
+            ]
+          },
+          "summary": {
+            "type": "string"
+          },
+          "requestedAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "decidedAt": {
+            "type": "string",
+            "format": "date-time"
+          }
         }
       },
       "GateDecisionRequest": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["decision", "idempotencyKey"],
+        "required": [
+          "decision",
+          "idempotencyKey"
+        ],
         "properties": {
-          "decision": { "type": "string", "enum": ["approve", "reject"] },
+          "decision": {
+            "type": "string",
+            "enum": [
+              "approve",
+              "reject"
+            ]
+          },
           "idempotencyKey": {
             "type": "string",
             "pattern": "^[0-9a-f]{32}$",
             "description": "Client-generated; unique per (authenticated owner, target gate). Retries MUST reuse the same key with an identical payload."
           },
-          "comment": { "type": "string" }
+          "comment": {
+            "type": "string"
+          }
         }
       },
       "GateDecisionOutcome": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["gateId", "state", "decidedAt", "replayed"],
+        "required": [
+          "gateId",
+          "state",
+          "decidedAt",
+          "replayed"
+        ],
         "properties": {
-          "gateId": { "type": "string" },
-          "state": { "type": "string", "enum": ["approved", "rejected"] },
-          "decidedAt": { "type": "string", "format": "date-time" },
-          "replayed": { "type": "boolean", "description": "True when this response is the stored original outcome for a same-key/same-payload replay." }
+          "gateId": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "approved",
+              "rejected"
+            ]
+          },
+          "decidedAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "replayed": {
+            "type": "boolean",
+            "description": "True when this response is the stored original outcome for a same-key/same-payload replay."
+          }
         }
       },
       "FileEntry": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["name", "kind"],
+        "required": [
+          "name",
+          "kind"
+        ],
         "properties": {
-          "name": { "type": "string" },
-          "kind": { "type": "string", "enum": ["file", "directory"] },
-          "sizeBytes": { "type": "integer", "minimum": 0 }
+          "name": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "file",
+              "directory"
+            ]
+          },
+          "sizeBytes": {
+            "type": "integer",
+            "minimum": 0
+          }
         }
       },
       "FileContent": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["path", "text"],
+        "required": [
+          "path",
+          "text"
+        ],
         "properties": {
-          "path": { "type": "string", "description": "The confined binding-root-relative path served." },
-          "text": { "type": "string" },
-          "language": { "type": "string" },
+          "path": {
+            "type": "string",
+            "description": "The confined binding-root-relative path served."
+          },
+          "text": {
+            "type": "string"
+          },
+          "language": {
+            "type": "string"
+          },
           "tokenSpans": {
             "type": "array",
             "description": "Server-side highlight spans (shared token-span schema; native clients render these, web may Shiki-render locally — Part 10).",
-            "items": { "$ref": "#/components/schemas/TokenSpan" }
+            "items": {
+              "$ref": "#/components/schemas/TokenSpan"
+            }
           }
         }
       },
       "TokenSpan": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["start", "end", "scope"],
+        "required": [
+          "start",
+          "end",
+          "scope"
+        ],
         "properties": {
-          "start": { "type": "integer", "minimum": 0 },
-          "end": { "type": "integer", "minimum": 0 },
+          "start": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "end": {
+            "type": "integer",
+            "minimum": 0
+          },
           "scope": {
             "type": "string",
-            "enum": ["comment", "keyword", "string", "number", "literal", "property", "tag", "heading"],
+            "enum": [
+              "comment",
+              "keyword",
+              "string",
+              "number",
+              "literal",
+              "property",
+              "tag",
+              "heading"
+            ],
             "description": "Highlight scope shared between the server tokenizer and clients — the CLOSED vocabulary in src/tokenSpanV1.ts. Clients render an unrecognized scope as unstyled text."
           }
         }
@@ -650,28 +1206,55 @@
       "DiffDocument": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["unifiedDiff"],
+        "required": [
+          "unifiedDiff"
+        ],
         "properties": {
-          "unifiedDiff": { "type": "string" },
-          "files": { "type": "array", "items": { "type": "string" } }
+          "unifiedDiff": {
+            "type": "string"
+          },
+          "files": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
         }
       },
       "KeyWriteRequest": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["key"],
+        "required": [
+          "key"
+        ],
         "properties": {
-          "key": { "type": "string", "minLength": 1, "description": "The API key material. Write-only: no response or later read ever echoes it." }
+          "key": {
+            "type": "string",
+            "minLength": 1,
+            "description": "The API key material. Write-only: no response or later read ever echoes it."
+          }
         }
       },
       "KeyRecordMetadata": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["keyKind", "maskedHint", "updatedAt"],
+        "required": [
+          "keyKind",
+          "maskedHint",
+          "updatedAt"
+        ],
         "properties": {
-          "keyKind": { "type": "string" },
-          "maskedHint": { "type": "string", "description": "Last-4-style mask for display; never the key material." },
-          "updatedAt": { "type": "string", "format": "date-time" }
+          "keyKind": {
+            "type": "string"
+          },
+          "maskedHint": {
+            "type": "string",
+            "description": "Last-4-style mask for display; never the key material."
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "date-time"
+          }
         }
       }
     }

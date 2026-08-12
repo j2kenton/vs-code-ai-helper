@@ -8,17 +8,7 @@ import type {
   TaskDtoV1,
   TaskRoundDtoV1,
 } from '../api/controlPlaneClientV1';
-import {
-  Body,
-  Card,
-  Heading,
-  Row,
-  Screen,
-  Stack,
-  TextField,
-  Title,
-  TouchButton,
-} from '../components/primitives';
+import { Body, Card, Heading, Row, Screen, SegmentedControl, Stack, TextField, Title, TouchButton } from '../components/primitives';
 import { getAppServicesV1 } from '../services/appServicesV1';
 import { useAppStore } from '../state/appStore';
 import {
@@ -239,17 +229,24 @@ function TaskCreateForm(props: TaskCreateFormProps): React.JSX.Element {
   const [error, setError] = React.useState<string | null>(null);
 
   async function submit(): Promise<void> {
-    const sandboxBinding: SandboxBindingRequestV1 = {
-      provider,
-      sandboxId,
-      source:
-        sourceKind === 'gitClone'
-          ? { kind: 'gitClone', repoUrl: gitUrl, ref: gitRef }
-          : { kind: 'attachExisting', path: attachPath },
-      workingDirectoryRoot,
-      lifecycle,
-      cleanup,
-    };
+    const source: SandboxBindingRequestV1['source'] =
+      sourceKind === 'gitClone'
+        ? { kind: 'gitClone', repoUrl: gitUrl, ref: gitRef }
+        : { kind: 'attachExisting', path: attachPath };
+    // sandboxId is submitted only when attaching to a workspace that already
+    // exists. For a task-owned sandbox the control plane creates one and
+    // assigns the id, and sending a value here is rejected by the contract.
+    const sandboxBinding: SandboxBindingRequestV1 =
+      lifecycle === 'user-managed-persistent'
+        ? {
+            provider,
+            sandboxId,
+            source,
+            workingDirectoryRoot,
+            lifecycle: 'user-managed-persistent',
+            cleanup,
+          }
+        : { provider, source, workingDirectoryRoot, lifecycle: 'task-owned-ephemeral', cleanup };
     const trimmedName = displayName.trim();
     const trimmedModel = model.trim();
     setSubmitting(true);
@@ -281,7 +278,7 @@ function TaskCreateForm(props: TaskCreateFormProps): React.JSX.Element {
         <Stack>
           <Heading>Task</Heading>
           <TextField value={displayName} onChangeText={setDisplayName} placeholder="Display name (optional)" autoCapitalize="sentences" />
-          <TextField value={request} onChangeText={setRequest} placeholder="What should the ensemble do?" autoCapitalize="sentences" multiline />
+          <TextField value={request} onChangeText={setRequest} placeholder="What should Ensemble do?" autoCapitalize="sentences" multiline />
         </Stack>
       </Card>
       <Card>
@@ -300,17 +297,36 @@ function TaskCreateForm(props: TaskCreateFormProps): React.JSX.Element {
       <Card>
         <Stack>
           <Heading>Sandbox binding</Heading>
-          <Row>
-            {SANDBOX_PROVIDERS.map((option) => (
-              <TouchButton
-                key={option}
-                label={option === 'e2b' ? 'E2B' : 'Daytona'}
-                variant={provider === option ? 'primary' : 'secondary'}
-                onPress={() => setProvider(option)}
-              />
-            ))}
-          </Row>
-          <TextField value={sandboxId} onChangeText={setSandboxId} placeholder="Sandbox / workspace id" />
+          <SegmentedControl
+            accessibilityLabel="Sandbox provider"
+            value={provider}
+            onChange={setProvider}
+            options={SANDBOX_PROVIDERS.map((option) => ({
+              value: option,
+              label: option === 'e2b' ? 'E2B' : 'Daytona',
+            }))}
+          />
+          <SegmentedControl
+            accessibilityLabel="Sandbox lifecycle"
+            value={lifecycle}
+            onChange={setLifecycle}
+            options={[
+              { value: 'task-owned-ephemeral', label: 'Create for me' },
+              { value: 'user-managed-persistent', label: 'Attach mine' },
+            ]}
+          />
+          {lifecycle === 'task-owned-ephemeral' ? (
+            <Body muted>
+              A sandbox is created for this task and torn down afterwards. Nothing to set up — you
+              never create one yourself.
+            </Body>
+          ) : (
+            <TextField
+              value={sandboxId}
+              onChangeText={setSandboxId}
+              placeholder="Existing sandbox / workspace id"
+            />
+          )}
           <Row>
             <TouchButton
               label="Clone git repo"
@@ -336,22 +352,15 @@ function TaskCreateForm(props: TaskCreateFormProps): React.JSX.Element {
             onChangeText={setWorkingDirectoryRoot}
             placeholder="Allowed working-directory root"
           />
-          <Row>
-            <TouchButton
-              label={lifecycle === 'task-owned-ephemeral' ? 'Task-owned sandbox' : 'User-managed workspace'}
-              variant="secondary"
-              onPress={() =>
-                setLifecycle(
-                  lifecycle === 'task-owned-ephemeral' ? 'user-managed-persistent' : 'task-owned-ephemeral'
-                )
-              }
-            />
-            <TouchButton
-              label={cleanup === 'destroy-on-completion' ? 'Destroy on completion' : 'Retain sandbox'}
-              variant="secondary"
-              onPress={() => setCleanup(cleanup === 'destroy-on-completion' ? 'retain' : 'destroy-on-completion')}
-            />
-          </Row>
+          <SegmentedControl
+            accessibilityLabel="When the task finishes"
+            value={cleanup}
+            onChange={setCleanup}
+            options={[
+              { value: 'destroy-on-completion', label: 'Destroy after' },
+              { value: 'retain', label: 'Keep' },
+            ]}
+          />
         </Stack>
       </Card>
       {error !== null ? (
@@ -362,7 +371,11 @@ function TaskCreateForm(props: TaskCreateFormProps): React.JSX.Element {
       <Row>
         <TouchButton
           label={submitting ? 'Creating…' : 'Create task'}
-          disabled={submitting || request.trim().length === 0 || sandboxId.trim().length === 0}
+          disabled={
+            submitting ||
+            request.trim().length === 0 ||
+            (lifecycle === 'user-managed-persistent' && sandboxId.trim().length === 0)
+          }
           onPress={() => void submit()}
         />
       </Row>

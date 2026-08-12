@@ -390,7 +390,7 @@ export function ChatScreen(): React.JSX.Element {
         <Stack gap={2}>
           <Heading>Thread</Heading>
           {turns.length === 0 ? (
-            <Body muted>No messages yet. Say something to the ensemble below.</Body>
+            <Body muted>No messages yet. Say something to Ensemble below.</Body>
           ) : (
             turns.map((turn) => (
               <Stack key={turn.turnId} gap={1}>
@@ -411,7 +411,7 @@ export function ChatScreen(): React.JSX.Element {
           <TextField
             value={message}
             onChangeText={setMessage}
-            placeholder="Message the ensemble"
+            placeholder="Message Ensemble"
             autoCapitalize="sentences"
             multiline
           />

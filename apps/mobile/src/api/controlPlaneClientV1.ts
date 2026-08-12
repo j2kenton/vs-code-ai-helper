@@ -42,17 +42,40 @@ export interface AuthExchangeRequestV1 {
 
 export type SandboxProviderV1 = 'e2b' | 'daytona';
 
-/** The SandboxBinding request shape (Part 3): validated server-side. */
-export interface SandboxBindingRequestV1 {
-  readonly provider: SandboxProviderV1;
-  readonly sandboxId: string;
-  readonly source:
-    | { readonly kind: 'gitClone'; readonly repoUrl: string; readonly ref: string }
-    | { readonly kind: 'attachExisting'; readonly path: string };
-  readonly workingDirectoryRoot: string;
-  readonly lifecycle: 'task-owned-ephemeral' | 'user-managed-persistent';
-  readonly cleanup: 'destroy-on-completion' | 'retain';
-}
+export type SandboxSourceAcquisitionV1 =
+  | { readonly kind: 'gitClone'; readonly repoUrl: string; readonly ref: string }
+  | { readonly kind: 'attachExisting'; readonly path: string };
+
+/**
+ * The SandboxBinding request shape (Part 3): validated server-side.
+ *
+ * `sandboxId` is conditional on lifecycle, mirroring the contract. A
+ * task-owned sandbox does not exist when the binding is submitted — the
+ * control plane creates it and assigns the id — so sending one is rejected;
+ * only an attached, user-managed workspace has an id to name.
+ *
+ * NOTE: this duplicates `@ensemble/contract`'s type rather than importing it.
+ * The app declares no dependency on the contract package, so the two shapes
+ * are kept in step by hand — a divergence here surfaces as a server-side
+ * `sandboxBindingInvalid` rather than a compile error.
+ */
+export type SandboxBindingRequestV1 =
+  | {
+      readonly provider: SandboxProviderV1;
+      readonly source: SandboxSourceAcquisitionV1;
+      readonly workingDirectoryRoot: string;
+      readonly lifecycle: 'task-owned-ephemeral';
+      readonly cleanup: 'destroy-on-completion' | 'retain';
+      readonly sandboxId?: undefined;
+    }
+  | {
+      readonly provider: SandboxProviderV1;
+      readonly sandboxId: string;
+      readonly source: SandboxSourceAcquisitionV1;
+      readonly workingDirectoryRoot: string;
+      readonly lifecycle: 'user-managed-persistent';
+      readonly cleanup: 'destroy-on-completion' | 'retain';
+    };
 
 export interface TaskDtoV1 {
   readonly taskId: string;

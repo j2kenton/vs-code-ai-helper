@@ -47,39 +47,52 @@ test('Settings tab renders sign-in options and the BYOS controls', async ({ page
   await expect(page.getByText('Sign in with your identity provider.', { exact: false })).toBeVisible();
   await expect(page.getByRole('button', { name: 'GitHub' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Google' })).toBeVisible();
-  await expect(page.getByRole('button', { name: 'E2B' })).toBeVisible();
-  await expect(page.getByRole('button', { name: 'Daytona' })).toBeVisible();
+  await expect(page.getByRole('radio', { name: 'E2B' })).toBeVisible();
+  await expect(page.getByRole('radio', { name: 'Daytona' })).toBeVisible();
   await expect(page.getByPlaceholder('https://control-plane.example.com')).toBeVisible();
 });
 
 test('Settings sandbox provider selection toggles between E2B and Daytona', async ({ page }) => {
   await page.getByTestId('tab-settings').click();
-  const e2b = page.getByRole('button', { name: 'E2B' });
-  const daytona = page.getByRole('button', { name: 'Daytona' });
+  const e2b = page.getByRole('radio', { name: 'E2B' });
+  const daytona = page.getByRole('radio', { name: 'Daytona' });
+
+  // The selection is now an ARIA state rather than a colour, so this asserts
+  // WHICH provider is selected — previously it could only check that both
+  // options were still visible and clickable after a change.
+  await expect(e2b).toBeChecked();
+  await expect(daytona).not.toBeChecked();
+
   await daytona.click();
-  // The provider buttons swap variant (primary/secondary) on selection but
-  // don't expose that as an ARIA attribute; visibility + re-clickability
-  // after the state change is the smoke-level assertion here.
-  await expect(e2b).toBeVisible();
-  await expect(daytona).toBeVisible();
+  await expect(daytona).toBeChecked();
+  await expect(e2b).not.toBeChecked();
+
   await e2b.click();
+  await expect(e2b).toBeChecked();
 });
 
-test('Settings gate policy toggle flips its label without a network dependency', async ({ page }) => {
+test('Settings gate policy toggle flips its state without a network dependency', async ({ page }) => {
   await page.getByTestId('tab-settings').click();
-  const toggle = page.getByRole('button', { name: /Approval (required|optional)/ });
-  await expect(toggle).toHaveText('Approval required');
-  await toggle.click();
-  await expect(toggle).toHaveText('Approval optional');
-  await toggle.click();
-  await expect(toggle).toHaveText('Approval required');
+  // Same segmented control as the provider and theme pickers: the choice is
+  // visible as a selected option rather than a caption that mutates.
+  const required = page.getByRole('radio', { name: 'Required' });
+  const optional = page.getByRole('radio', { name: 'Optional' });
+  await expect(required).toBeChecked();
+  await optional.click();
+  await expect(optional).toBeChecked();
+  await expect(required).not.toBeChecked();
+  await required.click();
+  await expect(required).toBeChecked();
 });
 
 test('Settings appearance theme selector switches themes', async ({ page }) => {
   await page.getByTestId('tab-settings').click();
-  await page.getByRole('button', { name: 'dark' }).click();
-  await page.getByRole('button', { name: 'light' }).click();
-  await page.getByRole('button', { name: 'system' }).click();
+  await page.getByRole('radio', { name: 'dark' }).click();
+  await expect(page.getByRole('radio', { name: 'dark' })).toBeChecked();
+  await page.getByRole('radio', { name: 'light' }).click();
+  await expect(page.getByRole('radio', { name: 'light' })).toBeChecked();
+  await page.getByRole('radio', { name: 'system' }).click();
+  await expect(page.getByRole('radio', { name: 'system' })).toBeChecked();
 });
 
 test('all five tabs are reachable in one pass', async ({ page }) => {

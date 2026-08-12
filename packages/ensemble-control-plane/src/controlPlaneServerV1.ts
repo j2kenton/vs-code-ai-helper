@@ -337,8 +337,28 @@ export function createControlPlaneHandlerV1(
         throw error;
       }
       const client = sandboxFactory.clientFor(validated.binding.provider, apiKey);
+      // A task-owned ephemeral binding names no sandbox because none exists
+      // yet — creating it here is what makes the default mode usable at all.
+      // Providers like E2B have no dashboard where a user could pre-create
+      // one; sandboxes are created on demand by the SDK and torn down after,
+      // so the id is only knowable after this call.
+      let sandboxId: string;
+      if (validated.binding.lifecycle === "user-managed-persistent") {
+        sandboxId = validated.binding.sandboxId;
+      } else {
+        try {
+          sandboxId = (await client.createSandbox()).sandboxId;
+        } catch {
+          return typed(
+            422,
+            "sandboxUnreachable",
+            "the sandbox provider could not create a sandbox for this task"
+          );
+        }
+      }
       const binding: SandboxBindingV1 = {
         ...validated.binding,
+        sandboxId,
         bindingId: allocateHex128IdV1(),
         ownerUserId: userId,
       };
