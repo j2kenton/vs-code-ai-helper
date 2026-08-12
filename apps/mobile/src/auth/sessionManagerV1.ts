@@ -151,6 +151,24 @@ export function createSessionManagerV1(options: CreateSessionManagerOptionsV1): 
           await options.tokenStore.remove(STORAGE_KEY_V1);
         }
       }
+      if (tokens === undefined) {
+        // Web has nothing to read: by the Part 6 storage policy its refresh
+        // token is never in the app's hands, it lives in an HttpOnly cookie
+        // the browser replays for us. So "no stored tokens" does not mean
+        // "signed out" there — it means the only way to find out is to ask.
+        // `refreshNow` cannot do this: it returns early precisely when
+        // `tokens` is undefined, which is the state every reload starts in.
+        //
+        // On native this costs one rejected request on a genuinely
+        // signed-out start, which is cheaper than the alternative of
+        // branching on platform here.
+        const result = await options.client.refresh(undefined);
+        if (result.ok) {
+          tokens = result.body;
+          await persist();
+          notify();
+        }
+      }
       return snapshot();
     },
 

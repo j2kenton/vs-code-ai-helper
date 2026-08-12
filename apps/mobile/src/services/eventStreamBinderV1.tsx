@@ -41,6 +41,19 @@ export function EventStreamBinder(): null {
 
   React.useEffect(() => services.session.onChange(setSession), [services, setSession]);
 
+  // Adopt an existing session at start-up. `restore` was fully implemented and
+  // never called by anything, so every launch began signed out: on native the
+  // token was written to secure storage and never read back, and on web the
+  // refresh cookie was never presented. The visible symptom was that reloading
+  // the page appeared to reset the app entirely.
+  //
+  // Runs once per services instance — that is, again when the control-plane
+  // URL changes, which is correct: a different control plane is a different
+  // session, and asking the new one whether it knows us is exactly right.
+  React.useEffect(() => {
+    void services.session.restore();
+  }, [services]);
+
   // Tapping a gate push opens the same in-app gate detail the Activity
   // feed's "Open gate" button does — approve/deny only ever happens there.
   React.useEffect(

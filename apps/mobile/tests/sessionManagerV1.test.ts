@@ -128,15 +128,64 @@ test('restore round-trips a persisted session and rejects corrupted state', asyn
   assert.equal(restored.status, 'signedIn');
   assert.equal(await manager.getAccessToken(), 'access-persisted');
 
+  // Corrupt local state must not yield a session — but restore now also asks
+  // the control plane whether a refresh cookie identifies one, so this half
+  // needs a client that says no. Otherwise it asserts against the cookie path
+  // rather than against corruption handling.
   const corruptStore = createInMemoryTokenStoreV1();
   await corruptStore.set('ensemble.session.v1', '{not json');
+  const noCookieClient = fakeAuthClient();
+  noCookieClient.nextRefresh = () =>
+    Promise.resolve({
+      ok: false,
+      status: 401,
+      code: 'refreshTokenInvalid',
+      message: 'missing refresh cookie',
+    });
   const corruptManager = createSessionManagerV1({
-    client,
+    client: noCookieClient,
     tokenStore: corruptStore,
     now: () => new Date(BASE_MS),
   });
   assert.equal((await corruptManager.restore()).status, 'signedOut');
   assert.equal(await corruptStore.get('ensemble.session.v1'), null);
+});
+
+/**
+ * The web reload path. Nothing is in the token store — by policy the refresh
+ * token never reaches the app there — so the only evidence of a live session
+ * is the HttpOnly cookie the browser replays on the refresh call.
+ */
+test('restore adopts a cookie-backed session when nothing is stored locally', async () => {
+  const client = fakeAuthClient();
+  const store = createInMemoryTokenStoreV1();
+  const manager = createSessionManagerV1({
+    client,
+    tokenStore: store,
+    now: () => new Date(BASE_MS),
+  });
+
+  assert.equal((await manager.restore()).status, 'signedIn');
+  assert.equal(await manager.getAccessToken(), 'access-rotated');
+});
+
+test('restore stays signed out when no local tokens and no valid cookie exist', async () => {
+  const client = fakeAuthClient();
+  client.nextRefresh = () =>
+    Promise.resolve({
+      ok: false,
+      status: 401,
+      code: 'refreshTokenInvalid',
+      message: 'missing refresh cookie',
+    });
+  const manager = createSessionManagerV1({
+    client,
+    tokenStore: createInMemoryTokenStoreV1(),
+    now: () => new Date(BASE_MS),
+  });
+
+  assert.equal((await manager.restore()).status, 'signedOut');
+  assert.equal(await manager.getAccessToken(), null);
 });
 
 test('signOut revokes server-side and clears local state', async () => {
