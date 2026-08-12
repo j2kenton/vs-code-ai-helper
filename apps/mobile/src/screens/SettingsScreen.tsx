@@ -34,10 +34,14 @@ export function SettingsScreen(): React.JSX.Element {
   const setGateApprovalRequired = useAppStore((s) => s.setGateApprovalRequired);
 
   const [notice, setNotice] = React.useState<string | null>(null);
-  // Separate from `notice`, which renders in the Account card at the top of
-  // the screen — too far from the key fields to be read as a response to
-  // pressing Save.
-  const [keyNotice, setKeyNotice] = React.useState<string | null>(null);
+  // Tagged with the key kind it concerns, so the message appears under the
+  // card whose button was pressed. A shared, untagged notice rendered in one
+  // fixed place is what produced the original complaint: feedback for an
+  // action you took HERE showing up somewhere you had to go looking for.
+  const [keyNotice, setKeyNotice] = React.useState<{
+    readonly kind: string;
+    readonly message: string;
+  } | null>(null);
   const [sandboxKeyDraft, setSandboxKeyDraft] = React.useState('');
   const [modelKeyDraft, setModelKeyDraft] = React.useState('');
 
@@ -92,7 +96,7 @@ export function SettingsScreen(): React.JSX.Element {
     }
     const result = await services.client.putKey(keyKind, draft);
     if (!result.ok) {
-      setKeyNotice(`Could not save ${keyKind}: ${result.message}`);
+      setKeyNotice({ kind: keyKind, message: `Could not save: ${result.message}` });
       return;
     }
     // Clearing the field was previously the ONLY evidence a save happened, and
@@ -102,19 +106,35 @@ export function SettingsScreen(): React.JSX.Element {
     const listed = await services.client.listKeys();
     if (listed.ok) {
       setKeyRecords(listed.body);
-      setKeyNotice(
-        `Saved ${keyKind}. The control plane now holds ${listed.body.length} key${
-          listed.body.length === 1 ? '' : 's'
-        } for you, listed below as masked hints.`
-      );
+      setKeyNotice({ kind: keyKind, message: 'Saved. Stored server-side, encrypted.' });
     } else {
       // The write succeeded; only the read-back failed. Distinguishing the two
       // matters — the key IS stored, and re-submitting it would be pointless.
-      setKeyNotice(
-        `Saved ${keyKind}, but the key list could not be re-read (${listed.message}). ` +
-          'The key is stored; reload to see it.'
-      );
+      setKeyNotice({
+        kind: keyKind,
+        message: `Saved, but the stored-key list could not be re-read (${listed.message}).`,
+      });
     }
+  }
+
+  /**
+   * The state of one key kind, rendered inside the card that submits it.
+   * Every other card on this screen reports its own state — Account says who
+   * is signed in, Control plane shows its URL — and the cards that take a
+   * secret said nothing at all, leaving an emptied input as the only evidence.
+   */
+  function keyStatusFor(kind: string): React.JSX.Element {
+    const stored = keyRecords.find((record) => record.keyKind === kind);
+    return (
+      <Stack gap={1}>
+        {stored !== undefined ? (
+          <Body>{`Key stored: ${stored.maskedHint}`}</Body>
+        ) : (
+          <Body muted>No key stored yet.</Body>
+        )}
+        {keyNotice?.kind === kind ? <Body>{keyNotice.message}</Body> : null}
+      </Stack>
+    );
   }
 
   const modelProviderId = modelPrimary.includes(':')
@@ -199,7 +219,9 @@ export function SettingsScreen(): React.JSX.Element {
               }
             />
           </Row>
-          {!signedIn ? <Body muted>Sign in to submit keys.</Body> : null}
+          {signedIn ? keyStatusFor(`sandbox:${sandboxProvider}`) : (
+            <Body muted>Sign in to submit keys.</Body>
+          )}
         </Stack>
       </Card>
 
@@ -227,13 +249,13 @@ export function SettingsScreen(): React.JSX.Element {
               }
             />
           </Row>
+          {signedIn ? keyStatusFor(`model:${modelProviderId}`) : null}
         </Stack>
       </Card>
 
       <Card>
         <Stack>
           <Heading>Stored keys</Heading>
-          {keyNotice !== null ? <Body>{keyNotice}</Body> : null}
           {keyRecords.length === 0 ? (
             <Body muted>
               No stored keys{signedIn ? '' : ' (sign in to view)'}. Keys are held server-side,
