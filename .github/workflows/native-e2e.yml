@@ -62,10 +62,15 @@ jobs:
           api-level: 34
           arch: x86_64
           working-directory: apps/mobile
-          # Headless, no boot animation, no audio/camera, and no snapshot
-          # save/restore — every one of these is time the driver spends waiting
-          # on a device that is still doing something else.
-          emulator-options: -no-window -no-snapshot -no-boot-anim -noaudio -no-camera -gpu swiftshader_indirect
+          # Headless, no boot animation, no audio, no camera — time the driver
+          # would otherwise spend waiting on a device still doing something
+          # else. Keep to flags the emulator actually accepts: an earlier
+          # attempt passed `-no-camera`, which does not exist, and the emulator
+          # answered `unknown option: -no-camera` and never started at all
+          # ("Timeout waiting for emulator to boot", then `could not connect to
+          # TCP port 5554`). Cameras are disabled via `-camera-*`, not a
+          # `-no-camera` switch.
+          emulator-options: -no-window -no-boot-anim -noaudio -camera-back none -camera-front none -gpu swiftshader_indirect
           disable-animations: true
           script: |
             adb install android/app/build/outputs/apk/debug/app-debug.apk
@@ -77,6 +82,23 @@ jobs:
             # worth re-running before it is called a red build. A second
             # failure still fails the job.
             maestro test .maestro/ || maestro test .maestro/
+
+      # Maestro writes a screenshot and view hierarchy per failed step under
+      # ~/.maestro/tests. Without these, an app-level failure ("Element not
+      # found: Text matching regex: Settings") is undiagnosable from CI — you
+      # cannot tell a crashed launch from a rendered screen whose labels differ.
+      - name: Collect Maestro artifacts
+        if: failure()
+        run: cp -r "$HOME/.maestro/tests" maestro-artifacts || true
+        working-directory: apps/mobile
+
+      - name: Upload Maestro artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: maestro-android
+          path: apps/mobile/maestro-artifacts
+          if-no-files-found: ignore
 
   ios:
     name: iOS simulator + Maestro
@@ -138,3 +160,15 @@ jobs:
           xcrun simctl install "$UDID" "$APP_PATH"
           # One retry, same rationale as the Android lane.
           maestro test .maestro/ || maestro test .maestro/
+
+      - name: Collect Maestro artifacts
+        if: failure()
+        run: cp -r "$HOME/.maestro/tests" maestro-artifacts || true
+
+      - name: Upload Maestro artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: maestro-ios
+          path: apps/mobile/maestro-artifacts
+          if-no-files-found: ignore
