@@ -1,0 +1,13 @@
+# Files that are compared BYTE-FOR-BYTE by the test suite must not be
+# reshaped on checkout. With core.autocrlf enabled (the default on Windows,
+# including hosted CI runners) git rewrites LF to CRLF when it materialises a
+# fresh clone, while the strings these fixtures are compared against are
+# written with \n in source — so the comparison fails on any machine that has
+# actually re-checked-out the file, and passes on the authoring machine whose
+# working copy still holds the original bytes.
+#
+# Observed as: "canonical V1 fixture v1-canonical-seed.md must match
+# startNewTask inline fallback byte-for-byte", actual '# Task\r\n', on a
+# windows-latest runner while the same test passed locally.
+test-fixtures/** text eol=lf
+resources/prompts/** text eol=lf
