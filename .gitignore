@@ -71,3 +71,8 @@ playwright-report/
 
 # Expo's local dev cache.
 .expo/
+
+# Local secrets for the control plane and app. The committed .env.local.example
+# files document what belongs in each; the real values never leave the machine.
+.env.local
+.env*.local

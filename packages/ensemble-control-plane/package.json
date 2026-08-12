@@ -9,7 +9,7 @@
     "check-types": "tsc --noEmit -p tsconfig.json",
     "lint": "eslint src tests",
     "test": "tsc -p tsconfig.json && node --test \"out-test/packages/ensemble-control-plane/tests/*.test.js\"",
-    "serve": "tsc -p tsconfig.json && node out-test/packages/ensemble-control-plane/src/serveV1.js"
+    "serve": "tsc -p tsconfig.json && node --env-file-if-exists=.env.local out-test/packages/ensemble-control-plane/src/serveV1.js"
   },
   "dependencies": {
     "@daytona/sdk": "^0.204.0",
