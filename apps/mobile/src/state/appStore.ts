@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { createJSONStorage, persist } from 'zustand/middleware';
 
 import type { KeyRecordDtoV1, SandboxProviderV1 } from '../api/controlPlaneClientV1';
 import type { SessionSnapshotV1 } from '../auth/sessionManagerV1';
@@ -66,36 +67,73 @@ export interface AppState {
   setGateApprovalRequired: (required: boolean) => void;
 }
 
-export const useAppStore = create<AppState>((set) => ({
-  themePreference: 'system',
-  connectionStatus: 'disconnected',
-  activeTaskId: null,
-  activeGateId: null,
-  feedEntries: [],
-  pendingQuestionsByTask: {},
-  chatStreamRevisionByTask: {},
-  session: { status: 'signedOut' },
-  controlPlaneUrl: DEFAULT_CONTROL_PLANE_URL_V1,
-  sandboxProvider: 'e2b',
-  keyRecords: [],
-  modelPrimary: 'anthropic:claude-sonnet-5',
-  gateApprovalRequired: true,
-  setThemePreference: (themePreference) => set({ themePreference }),
-  setConnectionStatus: (connectionStatus) => set({ connectionStatus }),
-  setActiveTaskId: (activeTaskId) => set({ activeTaskId }),
-  setActiveGateId: (activeGateId) => set({ activeGateId }),
-  appendFeedEntry: (entry) => set((s) => ({ feedEntries: appendFeedEntryV1(s.feedEntries, entry) })),
-  clearFeed: () => set({ feedEntries: [] }),
-  setPendingQuestions: (taskId, pending) =>
-    set((s) => ({ pendingQuestionsByTask: { ...s.pendingQuestionsByTask, [taskId]: pending } })),
-  clearPendingQuestions: (taskId) =>
-    set((s) => {
+/**
+ * Settings survive a reload; nothing else does.
+ *
+ * `partialize` is the whole point here. Session snapshots, key records, the
+ * feed and connection status are all either secret-adjacent or derived from a
+ * live connection, and writing them to disk would either leak or go stale —
+ * the session in particular is owned by sessionManagerV1, whose web half
+ * deliberately keeps no local copy. Only the four values the user typed or
+ * chose are kept.
+ *
+ * The control-plane URL is the one that made this necessary: without it, every
+ * reload pointed the app back at the placeholder host, so restoring the session
+ * asked the wrong server and always failed.
+ *
+ * Storage falls back to an in-memory shim when `localStorage` is absent (React
+ * Native), where this simply behaves as it did before — nothing persists —
+ * rather than throwing at import time.
+ */
+type PersistedSettingsV1 = Pick<
+  AppState,
+  'controlPlaneUrl' | 'sandboxProvider' | 'modelPrimary' | 'gateApprovalRequired' | 'themePreference'
+>;
+
+const memoryFallbackV1 = new Map<string, string>();
+
+const settingsStorageV1 = createJSONStorage<PersistedSettingsV1>(() =>
+  typeof globalThis.localStorage !== 'undefined'
+    ? globalThis.localStorage
+    : {
+        getItem: (name: string): string | null => memoryFallbackV1.get(name) ?? null,
+        setItem: (name: string, value: string): void => void memoryFallbackV1.set(name, value),
+        removeItem: (name: string): void => void memoryFallbackV1.delete(name),
+      }
+);
+
+export const useAppStore = create<AppState>()(
+  persist<AppState, [], [], PersistedSettingsV1>(
+    (set) => ({
+      themePreference: 'system',
+      connectionStatus: 'disconnected',
+      activeTaskId: null,
+      activeGateId: null,
+      feedEntries: [],
+      pendingQuestionsByTask: {},
+      chatStreamRevisionByTask: {},
+      session: { status: 'signedOut' },
+      controlPlaneUrl: DEFAULT_CONTROL_PLANE_URL_V1,
+      sandboxProvider: 'e2b',
+      keyRecords: [],
+      modelPrimary: 'anthropic:claude-sonnet-5',
+      gateApprovalRequired: true,
+      setThemePreference: (themePreference) => set({ themePreference }),
+      setConnectionStatus: (connectionStatus) => set({ connectionStatus }),
+      setActiveTaskId: (activeTaskId) => set({ activeTaskId }),
+      setActiveGateId: (activeGateId) => set({ activeGateId }),
+      appendFeedEntry: (entry) => set((s) => ({ feedEntries: appendFeedEntryV1(s.feedEntries, entry) })),
+      clearFeed: () => set({ feedEntries: [] }),
+      setPendingQuestions: (taskId, pending) =>
+        set((s) => ({ pendingQuestionsByTask: { ...s.pendingQuestionsByTask, [taskId]: pending } })),
+      clearPendingQuestions: (taskId) =>
+        set((s) => {
       const next = { ...s.pendingQuestionsByTask };
       delete next[taskId];
       return { pendingQuestionsByTask: next };
-    }),
-  bumpChatStreamRevision: (taskId) =>
-    set((s) => {
+        }),
+      bumpChatStreamRevision: (taskId) =>
+        set((s) => {
       // Housekeeping (same class as the feed cap): re-insert the bumped task
       // last and keep only the most recently bumped entries, so the map
       // cannot grow one key per task ever streamed. A pruned task's revision
@@ -104,11 +142,24 @@ export const useAppStore = create<AppState>((set) => ({
       const others = Object.entries(s.chatStreamRevisionByTask).filter(([id]) => id !== taskId);
       const kept = others.slice(Math.max(0, others.length - (CHAT_REVISION_TASK_CAP_V1 - 1)));
       return { chatStreamRevisionByTask: { ...Object.fromEntries(kept), [taskId]: bumped } };
+        }),
+      setSession: (session) => set({ session }),
+      setControlPlaneUrl: (controlPlaneUrl) => set({ controlPlaneUrl }),
+      setSandboxProvider: (sandboxProvider) => set({ sandboxProvider }),
+      setKeyRecords: (keyRecords) => set({ keyRecords }),
+      setModelPrimary: (modelPrimary) => set({ modelPrimary }),
+      setGateApprovalRequired: (gateApprovalRequired) => set({ gateApprovalRequired }),
     }),
-  setSession: (session) => set({ session }),
-  setControlPlaneUrl: (controlPlaneUrl) => set({ controlPlaneUrl }),
-  setSandboxProvider: (sandboxProvider) => set({ sandboxProvider }),
-  setKeyRecords: (keyRecords) => set({ keyRecords }),
-  setModelPrimary: (modelPrimary) => set({ modelPrimary }),
-  setGateApprovalRequired: (gateApprovalRequired) => set({ gateApprovalRequired }),
-}));
+    {
+      name: 'ensemble.settings.v1',
+      storage: settingsStorageV1,
+      partialize: (state) => ({
+        controlPlaneUrl: state.controlPlaneUrl,
+        sandboxProvider: state.sandboxProvider,
+        modelPrimary: state.modelPrimary,
+        gateApprovalRequired: state.gateApprovalRequired,
+        themePreference: state.themePreference,
+      }),
+    }
+  )
+);
