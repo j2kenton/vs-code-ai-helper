@@ -49,6 +49,21 @@ export function SettingsScreen(): React.JSX.Element {
     }
   }, [services, setKeyRecords]);
 
+  // Stored keys follow the SESSION, not one particular way of starting one.
+  // Previously the list was fetched only after handleSignIn returned
+  // 'signedIn' or after a save, so a session restored at start-up — now the
+  // normal case on web, where a cookie re-establishes it without anyone
+  // pressing a button — never triggered a fetch at all. The keys were on the
+  // server the whole time and the screen simply never asked, which read as
+  // "saving doesn't work".
+  React.useEffect(() => {
+    if (!signedIn) {
+      setKeyRecords([]);
+      return;
+    }
+    void refreshKeyRecords();
+  }, [signedIn, refreshKeyRecords, setKeyRecords]);
+
   async function handleSignIn(provider: (typeof SIGN_IN_PROVIDERS)[number]): Promise<void> {
     const outcome = await services.signIn(provider);
     if (outcome.kind === 'signedIn') {
