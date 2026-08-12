@@ -49,8 +49,15 @@ jobs:
       - name: Expo prebuild (android)
         run: pnpm exec expo prebuild --platform android --no-install
 
-      - name: Build debug APK
-        run: ./gradlew assembleDebug
+      # Release, not debug. A debug build contains no JavaScript — it fetches
+      # the bundle from a Metro dev server at runtime, and no such server runs
+      # here. The first native run proved it: every flow failed against React
+      # Native's red error screen, "No script URL provided. Make sure the
+      # packager is running or you have embedded a JS bundle in your
+      # application bundle. unsanitizedScriptURLString = (null)". Release
+      # embeds the bundle, and is what a user would install anyway.
+      - name: Build release APK
+        run: ./gradlew assembleRelease
         working-directory: apps/mobile/android
 
       - name: Install Maestro
@@ -73,7 +80,7 @@ jobs:
           emulator-options: -no-window -no-boot-anim -noaudio -camera-back none -camera-front none -gpu swiftshader_indirect
           disable-animations: true
           script: |
-            adb install android/app/build/outputs/apk/debug/app-debug.apk
+            adb install android/app/build/outputs/apk/release/app-release.apk
             # `adb install` returning is not the same as the device being ready
             # to host an instrumentation driver; wait for boot to actually
             # complete before handing over to Maestro.
@@ -136,11 +143,16 @@ jobs:
         run: pod install
         working-directory: apps/mobile/ios
 
+      # Release for the same reason as the Android lane: only a Release build
+      # runs Xcode's "Bundle React Native code and images" phase, so a Debug
+      # build ships with no JavaScript and shows RN's "No script URL provided"
+      # error screen instead of the app. Simulator builds still need no
+      # signing identity.
       - name: Build for simulator
         run: |
           xcodebuild -workspace ios/EnsembleCommandCenter.xcworkspace \
             -scheme EnsembleCommandCenter \
-            -configuration Debug \
+            -configuration Release \
             -sdk iphonesimulator \
             -derivedDataPath ios/build \
             CODE_SIGNING_ALLOWED=NO build
@@ -156,7 +168,7 @@ jobs:
           # a simulator that is still coming up is the same race the Android
           # lane lost; bootstatus blocks until it is genuinely ready.
           xcrun simctl bootstatus "$UDID" -b
-          APP_PATH=$(find ios/build/Build/Products/Debug-iphonesimulator -maxdepth 1 -name '*.app' | head -n1)
+          APP_PATH=$(find ios/build/Build/Products/Release-iphonesimulator -maxdepth 1 -name '*.app' | head -n1)
           xcrun simctl install "$UDID" "$APP_PATH"
           # One retry, same rationale as the Android lane.
           maestro test .maestro/ || maestro test .maestro/
