@@ -60,3 +60,14 @@ playwright-report/
 # Ensemble session lock files (transient, machine/pid-specific)
 /.ensemble-session.lock
 /.helper/
+
+# Local control-plane state. Holds session token hashes and key material
+# sealed under the KEK boot secret — never commit it, and note that it is
+# only readable by whoever holds that same secret.
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+
+# Expo's local dev cache.
+.expo/
