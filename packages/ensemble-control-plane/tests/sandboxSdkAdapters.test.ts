@@ -117,7 +117,24 @@ function makeFakeE2bFactoryV1(): {
     },
   };
 
-  return { factory, files, killed, runResult: state.runResult, runCalls, processes: state.processes };
+  // `runResult` must write THROUGH to `state`, which is what the fake command
+  // handler reads. Returning `state.runResult` handed back a snapshot of the
+  // default instead, so every `fake.runResult = ...` assignment landed on a
+  // dead property and the fake kept replying with its success default —
+  // silently disabling the exit-code and transport-error tests below.
+  return {
+    factory,
+    files,
+    killed,
+    runCalls,
+    processes: state.processes,
+    get runResult() {
+      return state.runResult;
+    },
+    set runResult(next) {
+      state.runResult = next;
+    },
+  };
 }
 
 test("E2B SDK adapter: runCommand marks the command line and envs, and tails output", async () => {
@@ -272,7 +289,20 @@ function makeFakeDaytonaFactoryV1(): {
     },
   };
 
-  return { factory, files, destroyed, execResult: state.execResult, execCalls, sessions: state.sessions };
+  // Same write-through requirement as the E2B fake above.
+  return {
+    factory,
+    files,
+    destroyed,
+    execCalls,
+    sessions: state.sessions,
+    get execResult() {
+      return state.execResult;
+    },
+    set execResult(next) {
+      state.execResult = next;
+    },
+  };
 }
 
 test("Daytona SDK adapter: runCommand marks the command line and env, and reports the exit code", async () => {

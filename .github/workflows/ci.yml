@@ -108,5 +108,16 @@ jobs:
       - name: Install workspace dependencies
         run: pnpm install --frozen-lockfile
 
+      # Parts of the suite drive real `git commit` against scratch repos
+      # (commit-message review, the Resume delegate). A hosted runner has no
+      # committer identity, so those commits fail and the assertions see the
+      # fixture's seed commit instead of the one under test — e.g. "fallback
+      # subject must use the task.md H1" reporting actual: 'initial'. Developer
+      # machines pass because they have a global identity configured.
+      - name: Configure a committer identity for tests that create commits
+        run: |
+          git config --global user.name "ensemble-ci"
+          git config --global user.email "ensemble-ci@users.noreply.github.com"
+
       - name: Extension unit tests
         run: pnpm run test:unit
