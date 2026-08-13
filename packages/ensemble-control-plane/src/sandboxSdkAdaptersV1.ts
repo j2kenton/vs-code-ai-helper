@@ -131,6 +131,30 @@ export interface E2bSandboxFactoryV1 {
   kill(sandboxId: string, apiKey: string): Promise<boolean>;
 }
 
+/**
+ * E2B's `commands.run` THROWS `CommandExitError` on a non-zero exit; that error
+ * carries a real exit code, so it is a valid RESULT, not a transport failure.
+ * Any other error propagates, leaving the attempt record open for 4c recovery.
+ *
+ * Extracted and exported because this translation is the whole outcome
+ * discipline for E2B, and it lives BELOW the `E2bSandboxFactoryV1` DI seam —
+ * a test that injects a fake factory returns an already-translated handle and
+ * so cannot reach this code at all. Testing it as a function is the only way
+ * to test the code production actually runs.
+ */
+export async function runE2bCommandCatchingExitV1(
+  run: () => Promise<{ readonly exitCode: number; readonly stdout: string; readonly stderr: string }>
+): Promise<{ readonly exitCode: number; readonly stdout: string; readonly stderr: string }> {
+  try {
+    return await run();
+  } catch (error) {
+    if (error instanceof CommandExitError) {
+      return { exitCode: error.exitCode, stdout: error.stdout, stderr: error.stderr };
+    }
+    throw error;
+  }
+}
+
 function wrapE2bSandbox(sandbox: E2bSandbox): E2bSandboxHandleV1 {
   return {
     sandboxId: sandbox.sandboxId,
@@ -155,19 +179,14 @@ function wrapE2bSandbox(sandbox: E2bSandbox): E2bSandboxHandleV1 {
     },
     commands: {
       async run(cmd, opts) {
-        try {
+        return runE2bCommandCatchingExitV1(async () => {
           const result = await sandbox.commands.run(cmd, {
             cwd: opts.cwd,
             envs: opts.envs,
             background: false,
           });
           return { exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr };
-        } catch (error) {
-          if (error instanceof CommandExitError) {
-            return { exitCode: error.exitCode, stdout: error.stdout, stderr: error.stderr };
-          }
-          throw error;
-        }
+        });
       },
       async list() {
         const processes = await sandbox.commands.list();

@@ -86,8 +86,10 @@ export function SettingsScreen(): React.JSX.Element {
   async function handleSignIn(provider: (typeof SIGN_IN_PROVIDERS)[number]): Promise<void> {
     const outcome = await services.signIn(provider);
     if (outcome.kind === 'signedIn') {
+      // No explicit refresh here: the effect above already fetches whenever
+      // `signedIn` becomes true, which covers this path and the restored-session
+      // path both. Doing it here as well just fetched the list twice.
       setNotice(null);
-      await refreshKeyRecords();
     } else if (outcome.kind === 'unavailable') {
       setNotice(outcome.reason);
     } else if (outcome.kind === 'failed') {

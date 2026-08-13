@@ -41,7 +41,59 @@ export function createInMemoryTokenStoreV1(): SecureTokenStoreV1 {
   };
 }
 
-const STORAGE_KEY_V1 = 'ensemble.session.v1';
+const STORAGE_KEY_PREFIX_V1 = 'ensemble.session.v1';
+
+/** Every character `expo-secure-store` rejects in a key. */
+const UNSAFE_KEY_CHARS_V1 = /[^A-Za-z0-9._-]/g;
+
+/**
+ * FNV-1a (32-bit). Not a security primitive — it only has to make two distinct
+ * origins produce distinct keys. It is here because the key is built
+ * SYNCHRONOUSLY at manager construction, and the platform's real hashes are
+ * async (`expo-crypto`) or absent (Hermes has no WebCrypto).
+ */
+function fnv1a32V1(text: string): string {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < text.length; index++) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash.toString(16).padStart(8, '0');
+}
+
+/**
+ * The secure-store key for one control-plane ORIGIN.
+ *
+ * A single global key is a credential-leak vector on native, where the store
+ * genuinely persists: changing the control-plane URL builds a new client, whose
+ * `restore()` would read the PREVIOUS server's tokens and send them as a bearer
+ * to the new origin. An attacker-controlled URL — or an honest typo — would
+ * hand out a token that is still valid against the original server. Keying by
+ * origin means a new control plane simply finds nothing and starts signed out,
+ * while switching back recovers the right session.
+ *
+ * The origin CANNOT be used literally. `expo-secure-store` accepts only
+ * alphanumerics, `.`, `-` and `_`, and every real origin carries `:` and `/`
+ * (`https://host:8787`), so a literal key makes SecureStore reject on every
+ * read and write — which on native breaks sign-in and restore outright, the
+ * exact opposite of the fix. So the origin is sanitized for legibility while
+ * debugging, bounded in length, and disambiguated by a hash of the ORIGINAL
+ * string, so two origins that sanitize or truncate alike still differ.
+ *
+ * Only the origin is used, so a trailing slash or path does not fork the key.
+ * A URL that will not parse falls back to the raw string: still per-URL, and
+ * such a value cannot reach a real server anyway.
+ */
+function sessionStorageKeyV1(baseUrl: string): string {
+  let scope: string;
+  try {
+    scope = new URL(baseUrl).origin;
+  } catch {
+    scope = baseUrl;
+  }
+  const readable = scope.replace(UNSAFE_KEY_CHARS_V1, '_').slice(0, 64);
+  return `${STORAGE_KEY_PREFIX_V1}.${readable}.${fnv1a32V1(scope)}`;
+}
 
 export type SessionStatusV1 = 'signedOut' | 'signedIn';
 
@@ -68,6 +120,13 @@ export interface CreateSessionManagerOptionsV1 {
   /** The auth endpoints used for refresh/revoke; injected to avoid a cycle. */
   readonly client: Pick<ControlPlaneClientV1, 'refresh' | 'revoke'>;
   readonly tokenStore: SecureTokenStoreV1;
+  /**
+   * Control-plane origin these tokens belong to; scopes the storage key so a
+   * session is never restored against a different server. Defaults to the
+   * unscoped legacy key only when absent (tests that construct a manager
+   * directly), never in app composition.
+   */
+  readonly baseUrl?: string;
   readonly now?: () => Date;
   /** Refresh when within this window of expiry (default 60s). */
   readonly refreshSkewMs?: number;
@@ -76,6 +135,8 @@ export interface CreateSessionManagerOptionsV1 {
 export function createSessionManagerV1(options: CreateSessionManagerOptionsV1): SessionManagerV1 {
   const now = options.now ?? ((): Date => new Date());
   const refreshSkewMs = options.refreshSkewMs ?? 60_000;
+  const storageKey =
+    options.baseUrl === undefined ? STORAGE_KEY_PREFIX_V1 : sessionStorageKeyV1(options.baseUrl);
   const listeners = new Set<(snapshot: SessionSnapshotV1) => void>();
 
   let tokens: SessionTokensV1 | undefined;
@@ -96,9 +157,9 @@ export function createSessionManagerV1(options: CreateSessionManagerOptionsV1): 
 
   async function persist(): Promise<void> {
     if (tokens === undefined) {
-      await options.tokenStore.remove(STORAGE_KEY_V1);
+      await options.tokenStore.remove(storageKey);
     } else {
-      await options.tokenStore.set(STORAGE_KEY_V1, JSON.stringify(tokens));
+      await options.tokenStore.set(storageKey, JSON.stringify(tokens));
     }
   }
 
@@ -133,7 +194,7 @@ export function createSessionManagerV1(options: CreateSessionManagerOptionsV1): 
 
   return {
     async restore(): Promise<SessionSnapshotV1> {
-      const stored = await options.tokenStore.get(STORAGE_KEY_V1);
+      const stored = await options.tokenStore.get(storageKey);
       if (stored !== null) {
         try {
           const parsed = JSON.parse(stored) as SessionTokensV1;
@@ -148,7 +209,7 @@ export function createSessionManagerV1(options: CreateSessionManagerOptionsV1): 
             notify();
           }
         } catch {
-          await options.tokenStore.remove(STORAGE_KEY_V1);
+          await options.tokenStore.remove(storageKey);
         }
       }
       if (tokens === undefined) {
@@ -169,6 +230,14 @@ export function createSessionManagerV1(options: CreateSessionManagerOptionsV1): 
           notify();
         }
       }
+      // Publish the OUTCOME, including "still signed out". Notifying only on
+      // success let a stale signed-in state survive a failed restore: the app
+      // store is global while managers are per-origin, so pointing at a new
+      // control plane built a manager with no token while the store still
+      // carried the old server's `signedIn`. Screens then hid sign-in and
+      // issued unauthorized requests, recoverable only by signing out by hand.
+      // Notifying unconditionally is idempotent — listeners assign a snapshot.
+      notify();
       return snapshot();
     },
 

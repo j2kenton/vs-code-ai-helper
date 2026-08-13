@@ -5,6 +5,50 @@ Deliberate, recorded gaps in the §11 verification surface for
 Everything else in the plan's Verification Plan sequence is wired as a real
 package script (see `scripts/workflowSuites.mjs` + `scripts/runWorkflowSuite.mjs`).
 
+## Open: the control-plane server has no engine run host (leaks paid sandboxes)
+
+`packages/ensemble-control-plane/src/serveV1.ts` composes the handler WITHOUT
+`runs`, because an engine run host needs a `providerRunnerFor` and that is a
+separate composition problem. The omission was cheap when task creation only
+wrote a record. It no longer is.
+
+`POST /v1/tasks` with the default `task-owned-ephemeral` lifecycle calls
+`createSandbox()` against the user's provider, because that binding names no
+sandbox and E2B offers no dashboard where one could be pre-created. With no run
+host that sandbox can never be used or reclaimed: the task stays
+`status: "creating"` forever, source acquisition never runs, and
+`teardownTaskSandboxV1` — the only thing that honours `destroy-on-completion` —
+has no production caller.
+
+### How this is contained
+
+- **Task-owned bindings are refused** when the handler has no `runs`
+  (`422 sandboxBindingInvalid`, naming the reason). Allocating a paid resource
+  that provably cannot be used is not a defensible default, so the store-only
+  composition declines rather than billing the user for nothing.
+- **`user-managed-persistent` is unaffected** and is the working path against
+  `serveV1.ts`: it allocates nothing, and the user already owns the workspace.
+- **`ENSEMBLE_ALLOW_UNMANAGED_SANDBOXES=1`** opts back in for integration
+  smokes that exercise binding custody and reachability. The server logs a
+  warning at boot, and every task created that way leaves a sandbox to destroy
+  by hand.
+- **A failure after allocation releases the sandbox** (`releaseCreatedSandbox`
+  in `controlPlaneServerV1.ts`), covering both an unreachable binding and a
+  failed `store.createTask` — the window where the id exists nowhere but the
+  request's stack frame.
+
+### What is NOT proven while this gap is open
+
+That a task-owned sandbox is ever torn down on completion: no production caller
+of `teardownTaskSandboxV1` exists, so `destroy-on-completion` is currently a
+recorded intention rather than an enforced policy.
+
+### Closing trigger
+
+Close this gap when the run host is wired into `serveV1.ts`. At that point
+`teardownTaskSandboxV1` gains its production caller, the refusal above can be
+lifted, and the cleanup policy becomes real.
+
 ## Deferred: multi-version VS Code host-download matrix
 
 The following scripts from the plan's Verification Plan are **intentionally not

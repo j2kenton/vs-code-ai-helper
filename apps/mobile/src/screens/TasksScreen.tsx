@@ -225,6 +225,12 @@ function TaskCreateForm(props: TaskCreateFormProps): React.JSX.Element {
   const [cleanup, setCleanup] = React.useState<'destroy-on-completion' | 'retain'>(
     'destroy-on-completion'
   );
+  // A workspace you brought is never ours to destroy, and the server enforces
+  // that: `user-managed-persistent` + `destroy-on-completion` is rejected as
+  // sandboxBindingInvalid. Deriving the submitted value from the lifecycle —
+  // rather than leaving the picker's initial 'destroy-on-completion' in place —
+  // is what stops "Attach mine" from failing on every first submission.
+  const effectiveCleanup = lifecycle === 'user-managed-persistent' ? 'retain' : cleanup;
   const [submitting, setSubmitting] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
 
@@ -244,9 +250,15 @@ function TaskCreateForm(props: TaskCreateFormProps): React.JSX.Element {
             source,
             workingDirectoryRoot,
             lifecycle: 'user-managed-persistent',
-            cleanup,
+            cleanup: effectiveCleanup,
           }
-        : { provider, source, workingDirectoryRoot, lifecycle: 'task-owned-ephemeral', cleanup };
+        : {
+            provider,
+            source,
+            workingDirectoryRoot,
+            lifecycle: 'task-owned-ephemeral',
+            cleanup: effectiveCleanup,
+          };
     const trimmedName = displayName.trim();
     const trimmedModel = model.trim();
     setSubmitting(true);
@@ -351,13 +363,23 @@ function TaskCreateForm(props: TaskCreateFormProps): React.JSX.Element {
           />
           <SegmentedControl
             accessibilityLabel="When the task finishes"
-            value={cleanup}
+            value={effectiveCleanup}
             onChange={setCleanup}
             options={[
-              { value: 'destroy-on-completion', label: 'Destroy after' },
+              {
+                value: 'destroy-on-completion',
+                label: 'Destroy after',
+                // Not offered for a sandbox you own: the control shows what
+                // will actually be submitted rather than a choice the server
+                // would reject.
+                disabled: lifecycle === 'user-managed-persistent',
+              },
               { value: 'retain', label: 'Keep' },
             ]}
           />
+          {lifecycle === 'user-managed-persistent' ? (
+            <Body muted>Your own sandbox is always kept — Ensemble never destroys it.</Body>
+          ) : null}
         </Stack>
       </Card>
       {error !== null ? (

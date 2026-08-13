@@ -9,7 +9,11 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import type { ApiResultV1, SessionTokensV1 } from '../src/api/controlPlaneClientV1';
-import { createInMemoryTokenStoreV1, createSessionManagerV1 } from '../src/auth/sessionManagerV1';
+import {
+  createInMemoryTokenStoreV1,
+  createSessionManagerV1,
+  type SecureTokenStoreV1,
+} from '../src/auth/sessionManagerV1';
 
 const BASE_MS = Date.parse('2026-08-12T00:00:00.000Z');
 
@@ -238,4 +242,97 @@ test('web sessions (no refreshToken field) still refresh and restore: the cookie
   });
   const restored = await restoreManager.restore();
   assert.equal(restored.status, 'signedIn');
+});
+
+// ─── Origin-scoped storage keys ─────────────────────────────────────────
+
+/** Records every key the manager touches, so the key itself can be asserted. */
+function keyRecordingStore(): { store: SecureTokenStoreV1; keys: string[] } {
+  const values = new Map<string, string>();
+  const keys: string[] = [];
+  return {
+    keys,
+    store: {
+      get(key) {
+        keys.push(key);
+        return Promise.resolve(values.get(key) ?? null);
+      },
+      set(key, value) {
+        keys.push(key);
+        values.set(key, value);
+        return Promise.resolve();
+      },
+      remove(key) {
+        keys.push(key);
+        values.delete(key);
+        return Promise.resolve();
+      },
+    },
+  };
+}
+
+test('every storage key is legal for expo-secure-store', async () => {
+  // SecureStore accepts ONLY alphanumerics, '.', '-' and '_', and rejects the
+  // key outright otherwise. Every real origin contains ':' and '/', so a key
+  // built from a raw origin would throw on every native read and write —
+  // breaking sign-in and restore completely.
+  const client = fakeAuthClient();
+  for (const baseUrl of [
+    'https://control-plane.example.com',
+    'http://localhost:8787',
+    'http://127.0.0.1:8787/',
+    'https://user:pass@host.example.com:9443/deep/path?q=1#frag',
+    'not a url at all',
+  ]) {
+    const recorder = keyRecordingStore();
+    const manager = createSessionManagerV1({
+      client,
+      tokenStore: recorder.store,
+      baseUrl,
+      now: () => new Date(BASE_MS),
+    });
+    await manager.completeSignIn(tokens('initial', 3_600_000));
+    await manager.restore();
+    assert.ok(recorder.keys.length > 0, `no key was used for ${baseUrl}`);
+    for (const key of recorder.keys) {
+      assert.match(key, /^[A-Za-z0-9._-]+$/, `illegal SecureStore key for ${baseUrl}: ${key}`);
+    }
+  }
+});
+
+test('tokens stored for one control plane are never restored against another', async () => {
+  // The leak this prevents: switching the control-plane URL builds a new
+  // manager, and a shared key would hand the PREVIOUS server's still-valid
+  // token to the new origin as a bearer.
+  const client = fakeAuthClient();
+  client.nextRefresh = () =>
+    Promise.resolve({ ok: false, status: 401, code: 'unauthorized', message: 'no session' });
+  const recorder = keyRecordingStore();
+
+  const first = createSessionManagerV1({
+    client,
+    tokenStore: recorder.store,
+    baseUrl: 'https://alpha.example.com',
+    now: () => new Date(BASE_MS),
+  });
+  await first.completeSignIn(tokens('alpha', 3_600_000));
+
+  const second = createSessionManagerV1({
+    client,
+    tokenStore: recorder.store,
+    baseUrl: 'https://beta.example.com',
+    now: () => new Date(BASE_MS),
+  });
+  assert.equal((await second.restore()).status, 'signedOut');
+  assert.equal(await second.getAccessToken(), null);
+
+  // The same origin still recovers its own session (a port is part of it).
+  const again = createSessionManagerV1({
+    client,
+    tokenStore: recorder.store,
+    baseUrl: 'https://alpha.example.com/some/path',
+    now: () => new Date(BASE_MS),
+  });
+  assert.equal((await again.restore()).status, 'signedIn');
+  assert.equal(await again.getAccessToken(), 'access-alpha');
 });

@@ -91,7 +91,14 @@ export function createAppServicesV1(options: CreateAppServicesOptionsV1): AppSer
     platform: Platform.OS === 'web' ? 'web' : 'native',
     ...(options.fetchImpl !== undefined ? { fetchImpl: options.fetchImpl } : {}),
   });
-  const boundSession: SessionManagerV1 = createSessionManagerV1({ client, tokenStore });
+  // `baseUrl` scopes the secure-store key to this control-plane origin. Without
+  // it a URL change restores the previous server's tokens into a client that
+  // points somewhere else, handing a still-valid credential to a new host.
+  const boundSession: SessionManagerV1 = createSessionManagerV1({
+    client,
+    tokenStore,
+    baseUrl: options.baseUrl,
+  });
 
   async function signIn(provider: IdentityProviderV1): Promise<SignInOutcomeV1> {
     const clientId = options.oauthClientIds?.[provider];
@@ -171,6 +178,10 @@ export const DEFAULT_CONTROL_PLANE_URL_V1 = 'https://control-plane.invalid';
 function oauthClientIdsFromEnvV1(): Partial<Record<IdentityProviderV1, string>> | undefined {
   const github = process.env.EXPO_PUBLIC_GITHUB_CLIENT_ID;
   const google = process.env.EXPO_PUBLIC_GOOGLE_CLIENT_ID;
+  // Apple is read for symmetry but is not wired end-to-end: the control plane
+  // builds GitHub/Google validators only, so a configured Apple client id
+  // would fail at the exchange. Add the server-side validator before offering
+  // it in the UI (SIGN_IN_PROVIDERS in SettingsScreen lists the usable two).
   const apple = process.env.EXPO_PUBLIC_APPLE_CLIENT_ID;
   const ids: Partial<Record<IdentityProviderV1, string>> = {};
   if (github !== undefined && github.length > 0) {

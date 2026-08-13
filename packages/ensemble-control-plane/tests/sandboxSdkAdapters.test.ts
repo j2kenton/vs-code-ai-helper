@@ -24,6 +24,7 @@ import {
   DaytonaSandboxHandleV1,
   E2bSandboxFactoryV1,
   E2bSandboxHandleV1,
+  runE2bCommandCatchingExitV1,
 } from "../src/sandboxSdkAdaptersV1";
 
 const API_KEY = "sk-sandbox-secret-0001";
@@ -157,19 +158,27 @@ test("E2B SDK adapter: runCommand marks the command line and envs, and tails out
   assert.equal(call.envs[SANDBOX_ATTEMPT_KEY_MARKER_V1], ATTEMPT_KEY);
 });
 
+// Exercised as a function rather than through the client, because the
+// translation sits BELOW the `factory` seam: a fake factory hands back an
+// already-translated handle, so a client-level assertion would test the fake's
+// imitation of E2B rather than the adapter. Asserting through the client here
+// is what made this test fail unconditionally — `runCommand` does not catch,
+// and never needed to, since `wrapE2bSandbox` already had.
 test("E2B SDK adapter: a CommandExitError is a valid result, not a thrown transport failure", async () => {
   const { CommandExitError } = await import("e2b");
-  const fake = makeFakeE2bFactoryV1();
-  fake.runResult = new CommandExitError({ exitCode: 7, stdout: "partial", stderr: "boom", error: "boom" });
-  const client = createE2bSdkSandboxClientV1({ apiKey: API_KEY, factory: fake.factory });
-
-  const result = await client.runCommand({
-    sandboxId: SANDBOX_ID,
-    argv: ["false"],
-    cwd: "/workspace",
-    attemptKey: ATTEMPT_KEY,
+  const result = await runE2bCommandCatchingExitV1(() => {
+    throw new CommandExitError({ exitCode: 7, stdout: "partial", stderr: "boom", error: "boom" });
   });
-  assert.deepEqual(result, { exitCode: 7, stdoutTail: "partial", stderrTail: "boom" });
+  assert.deepEqual(result, { exitCode: 7, stdout: "partial", stderr: "boom" });
+});
+
+test("E2B SDK adapter: a non-exit error is NOT translated into a result", async () => {
+  await assert.rejects(
+    runE2bCommandCatchingExitV1(() => {
+      throw new Error("socket hang up");
+    }),
+    /socket hang up/
+  );
 });
 
 test("E2B SDK adapter: a non-exit transport error propagates (leaves the attempt open)", async () => {

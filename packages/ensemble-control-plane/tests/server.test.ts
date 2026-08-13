@@ -59,6 +59,7 @@ interface World {
 async function makeWorld(options?: {
   readonly kekDown?: boolean;
   readonly log?: (line: string) => void;
+  readonly allowEphemeralSandboxWithoutRunHost?: boolean;
 }): Promise<World> {
   const clock = makeClock();
   const store = createControlPlaneStoreV1({ now: clock.now });
@@ -83,6 +84,9 @@ async function makeWorld(options?: {
     kekProvider,
     sandboxFactory: { clientFor: (): SandboxClientV1 => sandbox },
     now: clock.now,
+    ...(options?.allowEphemeralSandboxWithoutRunHost === true
+      ? { allowEphemeralSandboxWithoutRunHost: true }
+      : {}),
     ...(options?.log !== undefined ? { log: options.log } : {}),
   });
   const a = await sessions.exchange({ provider: "github", authorizationCode: "code-a", ...BASE });
@@ -124,6 +128,124 @@ async function storeKeyAndCreateTask(world: World): Promise<string> {
   assert.equal(body.ownerUserId, world.userA);
   return body.taskId;
 }
+
+/** A task-owned binding: names no sandbox, so the server must allocate one. */
+const EPHEMERAL_BINDING = {
+  provider: "e2b",
+  source: { kind: "attachExisting", path: "/workspace" },
+  workingDirectoryRoot: "/workspace",
+  lifecycle: "task-owned-ephemeral",
+  cleanup: "destroy-on-completion",
+};
+
+async function storeSandboxKey(world: World): Promise<void> {
+  const put = await world.call(world.tokenA, "PUT", "/v1/keys/sandbox:e2b", {
+    body: { key: "e2b_live_key_A_9876" },
+  });
+  assert.equal(put.status, 204);
+}
+
+test("a task-owned sandbox is refused outright when the deployment has no engine run host", async () => {
+  // Creating one would allocate a BILLABLE sandbox that nothing can drive:
+  // no run host means source is never acquired, the task never leaves
+  // `creating`, and teardown — which honours destroy-on-completion — is never
+  // called. Refusing costs the user nothing; allocating costs them money.
+  const world = await makeWorld();
+  await storeSandboxKey(world);
+
+  const created = await world.call(world.tokenA, "POST", "/v1/tasks", {
+    body: { request: "do the thing", sandboxBinding: EPHEMERAL_BINDING },
+  });
+
+  assert.equal(created.status, 422);
+  assert.equal(code(created), "sandboxBindingInvalid");
+  assert.match(String((created.body as { message?: string }).message), /run host/);
+  // Refused BEFORE contacting the provider: nothing allocated, nothing to reclaim.
+  assert.deepEqual(world.sandbox.destroyedSandboxIds, []);
+  const listed = await world.call(world.tokenA, "GET", "/v1/tasks");
+  assert.deepEqual(listed.body, []);
+});
+
+test("a user-managed sandbox is unaffected by the run-host refusal (it allocates nothing)", async () => {
+  const world = await makeWorld();
+  const taskId = await storeKeyAndCreateTask(world);
+  assert.ok(taskId.length > 0);
+});
+
+test("with the opt-in, a task-owned binding allocates a sandbox and adopts its id", async () => {
+  // The binding names no sandbox — the id can only come from the provider,
+  // which is what makes the default mode usable at all.
+  const world = await makeWorld({ allowEphemeralSandboxWithoutRunHost: true });
+  await storeSandboxKey(world);
+
+  const created = await world.call(world.tokenA, "POST", "/v1/tasks", {
+    body: { request: "do the thing", sandboxBinding: EPHEMERAL_BINDING },
+  });
+
+  assert.equal(created.status, 201);
+  const taskId = (created.body as { taskId: string }).taskId;
+  const stored = world.store.readTask(taskId);
+  assert.ok(stored !== undefined);
+  assert.ok(
+    stored.binding.sandboxId.length > 0 && stored.binding.sandboxId !== "sbx-1",
+    "the persisted binding must carry the provider-allocated id"
+  );
+  assert.deepEqual(world.sandbox.destroyedSandboxIds, [], "a successful creation destroys nothing");
+});
+
+test("a failure after allocation releases the sandbox it created", async () => {
+  // The window this covers: the sandbox exists at the provider, but its id
+  // lives ONLY in the request's stack frame — no task, no binding, nothing
+  // persisted. Without compensating teardown it bills until someone finds it
+  // in a provider dashboard.
+  const store = createControlPlaneStoreV1({ now: makeClock().now });
+  const clock = makeClock();
+  const sessions = createSessionServiceV1({
+    store,
+    validators: [makeFakeValidator("github", { "code-a": "subject-a" })],
+    now: clock.now,
+  });
+  const sandbox = createInMemorySandboxClientV1();
+  const unreachableClient: SandboxClientV1 = {
+    ...sandbox,
+    resolveRealPath: () => Promise.reject(new Error("provider down")),
+  };
+  const handler = createControlPlaneHandlerV1({
+    store,
+    sessions,
+    hub: createWsHubV1({ sessions, store }),
+    kekProvider: createBootSecretKekProviderV1({ kekId: "kek-1", bootSecret: "boot" }),
+    sandboxFactory: { clientFor: (): SandboxClientV1 => unreachableClient },
+    allowEphemeralSandboxWithoutRunHost: true,
+    now: clock.now,
+  });
+  const a = await sessions.exchange({ provider: "github", authorizationCode: "code-a", ...BASE });
+  assert.ok(a.ok);
+  const auth = { authorization: `Bearer ${a.tokens.accessToken}` };
+  await handler.handle({
+    method: "PUT",
+    path: "/v1/keys/sandbox:e2b",
+    query: {},
+    headers: auth,
+    body: { key: "e2b_live_key_A_9876" },
+  });
+
+  const created = await handler.handle({
+    method: "POST",
+    path: "/v1/tasks",
+    query: {},
+    headers: auth,
+    body: { request: "x", sandboxBinding: EPHEMERAL_BINDING },
+  });
+
+  assert.equal(created.status, 422);
+  assert.equal(code(created), "sandboxUnreachable");
+  assert.equal(
+    sandbox.destroyedSandboxIds.length,
+    1,
+    "the sandbox allocated by this request must be destroyed before the error returns"
+  );
+});
 
 function code(response: { body?: unknown }): string {
   return (response.body as { code?: string })?.code ?? "";

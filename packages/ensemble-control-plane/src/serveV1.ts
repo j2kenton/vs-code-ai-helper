@@ -26,6 +26,23 @@
  * start a run. That is the correct first milestone, and the gap is explicit
  * rather than hidden behind a half-wired runner.
  *
+ * THIS NOW COSTS REAL MONEY, which it did not when the omission was written.
+ * A `task-owned-ephemeral` binding makes task creation ALLOCATE a sandbox at
+ * the user's provider. With no run host, nothing subsequently drives that task:
+ * the git source is never acquired, the task stays `creating` forever, and
+ * `teardownTaskSandboxV1` — which is what honours `destroy-on-completion` — has
+ * no production caller, so the sandbox is never destroyed. Each task created
+ * against this composition therefore leaves one billable sandbox running until
+ * the user kills it in their provider's dashboard.
+ *
+ * So this composition REFUSES a `task-owned-ephemeral` binding outright
+ * (422 sandboxBindingInvalid, explaining why) rather than allocating something
+ * it cannot drive or reclaim. `user-managed-persistent` is unaffected and is
+ * the working path here: it allocates nothing, and the sandbox is already
+ * yours. Set `ENSEMBLE_ALLOW_UNMANAGED_SANDBOXES=1` to allocate anyway, and
+ * accept that every created task leaves a billable sandbox to destroy by hand.
+ * Tracked in docs/verification/known-gaps.md.
+ *
  * Usage:
  *   ENSEMBLE_KEK_SECRET=... ENSEMBLE_GITHUB_CLIENT_ID=... \
  *   ENSEMBLE_GITHUB_CLIENT_SECRET=... pnpm --filter @ensemble/control-plane serve
@@ -146,12 +163,19 @@ export function startControlPlaneV1(): { readonly port: number; readonly close: 
     process.stdout.write(`${line}\n`);
   });
 
+  // Opt-in to creating sandboxes this composition cannot drive or tear down.
+  // Off by default: see the handler option's own note, and the "no engine run
+  // host" gap in docs/verification/known-gaps.md.
+  const allowEphemeralSandboxWithoutRunHost =
+    process.env["ENSEMBLE_ALLOW_UNMANAGED_SANDBOXES"] === "1";
+
   const handler = createControlPlaneHandlerV1({
     store,
     sessions,
     hub,
     kekProvider,
     sandboxFactory: createSdkSandboxClientFactoryV1(),
+    allowEphemeralSandboxWithoutRunHost,
     log,
   });
 
@@ -160,6 +184,12 @@ export function startControlPlaneV1(): { readonly port: number; readonly close: 
   log(`control plane listening on http://127.0.0.1:${port}`);
   log(`  database: ${databasePath}`);
   log(`  cors origins: ${corsOrigins.join(", ")}`);
+  log(
+    allowEphemeralSandboxWithoutRunHost
+      ? "  WARNING: task-owned sandboxes are permitted with no run host — each " +
+          "created task leaves a billable sandbox you must destroy by hand"
+      : "  task-owned sandboxes: refused (no engine run host); attach your own sandbox"
+  );
   return { port, close: (): void => void server.close() };
 }
 

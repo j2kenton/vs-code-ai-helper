@@ -31,6 +31,18 @@ interface OpenApiOperation {
 
 type OpenApiPathItem = Record<string, OpenApiOperation>;
 
+/**
+ * One `allOf` entry expressing a conditional requirement — the shape the
+ * SandboxBinding schema uses to require `sandboxId` for user-managed sandboxes
+ * only. Declared rather than reached for with `any` so the assertion below
+ * fails to compile if the shape it probes stops existing.
+ */
+interface OpenApiConditionalRuleV1 {
+  if?: { properties?: { lifecycle?: { const?: string } } };
+  then?: { required?: readonly string[] };
+  else?: { not?: { required?: readonly string[] } };
+}
+
 const specPath = path.join(__dirname, "..", "..", "..", "..", "packages", "ensemble-contract", "openapi", "control-plane.v1.json");
 // __dirname is the compiled mirror (out-test/packages/ensemble-contract/tests);
 // walk up to the package root that holds openapi/.
@@ -150,7 +162,7 @@ test("task creation requires a validated SandboxBinding", () => {
   // ephemeral sandbox has no id until the control plane creates it.
   assert.ok(
     binding.allOf?.some(
-      (rule: any) =>
+      (rule: OpenApiConditionalRuleV1) =>
         rule.if?.properties?.lifecycle?.const === "user-managed-persistent" &&
         rule.then?.required?.includes("sandboxId") &&
         rule.else?.not?.required?.includes("sandboxId")

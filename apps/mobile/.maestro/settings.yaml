@@ -13,11 +13,15 @@ appId: dev.ensemble.commandcenter
 - tapOn: 'Daytona'
 - assertVisible: 'Daytona'
 - tapOn: 'E2B'
-- assertVisible: 'Approval required'
-- tapOn: 'Approval required'
-- assertVisible: 'Approval optional'
-- tapOn: 'Approval optional'
-- assertVisible: 'Approval required'
+# Gate policy is a segmented control, not a toggling button: both options are
+# always on screen and tapping selects one. The old 'Approval required' /
+# 'Approval optional' labels belonged to a button that relabelled itself, and
+# no longer exist anywhere in the UI.
+- assertVisible: 'Gate policy'
+- assertVisible: 'Required'
+- assertVisible: 'Optional'
+- tapOn: 'Optional'
+- tapOn: 'Required'
 - tapOn: 'dark'
 - tapOn: 'light'
 - tapOn: 'system'

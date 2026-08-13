@@ -96,6 +96,24 @@ export interface CreateControlPlaneHandlerOptionsV1 {
    * engine worker).
    */
   readonly runs?: EngineRunHostV1;
+  /**
+   * Permit `task-owned-ephemeral` bindings even with no `runs` host.
+   *
+   * Default false, and deliberately so: a task-owned binding ALLOCATES a
+   * sandbox at the user's provider, and with no run host nothing ever drives
+   * that task — source is never acquired, the task never leaves `creating`,
+   * and `teardownTaskSandboxV1` (which honours `destroy-on-completion`) has no
+   * caller. The sandbox simply runs, and bills, until the user finds it in a
+   * provider dashboard. Allocating a paid resource that provably cannot be
+   * used is not a defensible default, so a store-only handler refuses it.
+   *
+   * `user-managed-persistent` is unaffected: it allocates nothing, and the
+   * user already owns the workspace.
+   *
+   * Set true only for a deployment that knowingly accepts manual sandbox
+   * cleanup (integration smokes exercising binding custody and reachability).
+   */
+  readonly allowEphemeralSandboxWithoutRunHost?: boolean;
   readonly now?: () => Date;
   /**
    * Diagnostic log sink (plan Part 11). Every line is passed through
@@ -185,6 +203,7 @@ export function createControlPlaneHandlerV1(
   options: CreateControlPlaneHandlerOptionsV1
 ): ControlPlaneHandlerV1 {
   const { store, sessions, hub, kekProvider, sandboxFactory, runs } = options;
+  const allowEphemeralSandboxWithoutRunHost = options.allowEphemeralSandboxWithoutRunHost === true;
   const now = options.now ?? ((): Date => new Date());
   const log = options.log === undefined ? undefined : createRedactingLogSinkV1(options.log);
 
@@ -323,6 +342,23 @@ export function createControlPlaneHandlerV1(
           parsedModel.selection.model
         );
       }
+      // Refuse to allocate a sandbox nothing can ever drive. Checked BEFORE
+      // key custody and provider contact so the failure costs nothing: with no
+      // run host this request would create a billable sandbox, leave the task
+      // at `creating` forever, and never reach teardown.
+      if (
+        validated.binding.lifecycle === "task-owned-ephemeral" &&
+        runs === undefined &&
+        !allowEphemeralSandboxWithoutRunHost
+      ) {
+        return typed(
+          422,
+          "sandboxBindingInvalid",
+          "this deployment has no engine run host, so a task-owned sandbox would be " +
+            "created, billed, and never used or torn down. Attach a sandbox you " +
+            "manage, or run a control plane with a run host configured."
+        );
+      }
       const keyRecord = store.readKeyRecord(userId, `sandbox:${validated.binding.provider}`);
       if (keyRecord === undefined) {
         return typed(422, "sandboxProviderKeyMissing", "no stored key for the binding's provider");
@@ -343,11 +379,16 @@ export function createControlPlaneHandlerV1(
       // one; sandboxes are created on demand by the SDK and torn down after,
       // so the id is only knowable after this call.
       let sandboxId: string;
+      // Set only when THIS request created the sandbox, so a later failure can
+      // destroy it. A user-managed sandbox is never destroyed here — it is not
+      // ours to reclaim.
+      let createdSandboxId: string | undefined;
       if (validated.binding.lifecycle === "user-managed-persistent") {
         sandboxId = validated.binding.sandboxId;
       } else {
         try {
           sandboxId = (await client.createSandbox()).sandboxId;
+          createdSandboxId = sandboxId;
         } catch {
           return typed(
             422,
@@ -356,6 +397,24 @@ export function createControlPlaneHandlerV1(
           );
         }
       }
+      /**
+       * Give up the sandbox this request created before returning a failure.
+       * Creation happens BEFORE the task record exists, so a sandbox left
+       * running after an early return is unreachable from every later code
+       * path — no task, no binding, no id persisted anywhere — and the user
+       * is billed for it until they find it in a provider dashboard. Teardown
+       * is best-effort: a failure to destroy must not mask the real error.
+       */
+      const releaseCreatedSandbox = async (): Promise<void> => {
+        if (createdSandboxId === undefined) {
+          return;
+        }
+        try {
+          await client.destroySandbox(createdSandboxId);
+        } catch {
+          // Nothing better is available here; the typed failure below stands.
+        }
+      };
       const binding: SandboxBindingV1 = {
         ...validated.binding,
         sandboxId,
@@ -364,6 +423,7 @@ export function createControlPlaneHandlerV1(
       };
       const reachable = await validateBindingReachabilityV1(client, binding);
       if (!reachable.ok) {
+        await releaseCreatedSandbox();
         return typed(422, reachable.code, reachable.reason);
       }
       const at = now().toISOString();
@@ -389,7 +449,17 @@ export function createControlPlaneHandlerV1(
         rounds: [],
         createdAt: at,
       };
-      store.createTask(record);
+      try {
+        store.createTask(record);
+      } catch (error) {
+        // Until the record is durable, the sandbox id exists ONLY in this
+        // closure: a failed insert means no task, no binding, and no way for
+        // any later code path to find what was allocated. Release it before
+        // the error escapes, then rethrow untouched — a persistence fault is
+        // not a binding fault and must not be reported as one.
+        await releaseCreatedSandbox();
+        throw error;
+      }
       if (runs !== undefined) {
         // The hosted engine run drives in the background; its settlement is
         // observable through the store (progress, rounds, job checkpoints)
