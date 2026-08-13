@@ -342,7 +342,22 @@ function stubV1RunnerSelection(transports: readonly AgentTransportV1[]): Patched
       };
     },
   });
-  return patch(runnerRegistryModule, "createV1RunnerSelectionOpener", () => fakeOpener);
+  // The review dispatch site pre-flights the stage's REAL provider chain
+  // before opening a selection; no CLI exists in this harness, so an
+  // unstubbed pre-flight would pause the task before the stubbed selection
+  // above is ever reached. A stubbed selection is dispatchable by definition.
+  const openerPatch = patch(runnerRegistryModule, "createV1RunnerSelectionOpener", () => fakeOpener);
+  const preflightPatch = patch(
+    runnerRegistryModule,
+    "preflightStageChainAvailabilityV1",
+    () => Promise.resolve({ kind: "dispatchable" })
+  );
+  return {
+    restore: (): void => {
+      preflightPatch.restore();
+      openerPatch.restore();
+    },
+  };
 }
 
 function makeExtensionContext(): vscode.ExtensionContext {

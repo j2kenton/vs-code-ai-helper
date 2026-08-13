@@ -134,6 +134,10 @@ export const TASK_PROGRESS_PRODUCT_FIELD_NAMES_V1 = [
   "implementationTypeCheckFailure",
   "checklistProgressUnreliable",
   "zeroChangeImplRounds",
+  "pendingImplReviewFiles",
+  "reviewInvalidatedByRound",
+  "incompleteRoundContinuations",
+  "pausedReason",
 ] as const satisfies readonly (keyof TaskProgress)[];
 
 type MissingProductFieldV1 = Exclude<
@@ -1112,6 +1116,81 @@ export function decodeTaskProgressTextV1(
           files.push(entry);
         }
         draft.implReviewFiles = files;
+        break;
+      }
+      case "pendingImplReviewFiles": {
+        // Same bounds as implReviewFiles: the quarantined set is the same
+        // kind of value (workspace-relative changed paths), just not yet
+        // promoted into review scope.
+        if (!Array.isArray(value) || value.length > MAX_IMPL_REVIEW_FILES) {
+          return recovery("invalidFieldValue", "pendingImplReviewFiles must be a bounded array");
+        }
+        const files: string[] = [];
+        for (const entry of value as unknown[]) {
+          if (
+            typeof entry !== "string" ||
+            entry.length === 0 ||
+            entry.length > MAX_PATH_LENGTH
+          ) {
+            return recovery(
+              "invalidFieldValue",
+              "pendingImplReviewFiles entries must be bounded non-empty strings"
+            );
+          }
+          files.push(entry);
+        }
+        draft.pendingImplReviewFiles = files;
+        break;
+      }
+      case "reviewInvalidatedByRound": {
+        if (typeof value !== "object" || value === null || Array.isArray(value)) {
+          return recovery("invalidFieldValue", "reviewInvalidatedByRound must be an object");
+        }
+        const record = value as Record<string, unknown>;
+        for (const key of Object.keys(record)) {
+          if (key !== "stage" && key !== "at") {
+            return recovery(
+              "invalidFieldValue",
+              `reviewInvalidatedByRound has an unknown field: ${key}`
+            );
+          }
+        }
+        if (typeof record["stage"] !== "string") {
+          return recovery("invalidFieldValue", "reviewInvalidatedByRound.stage must be a string");
+        }
+        const stage = resolveStage(record["stage"], family);
+        if (stage === undefined) {
+          return recovery(
+            "invalidFieldValue",
+            "reviewInvalidatedByRound.stage must be a recognized stage"
+          );
+        }
+        if (!isIsoTimestamp(record["at"])) {
+          return recovery("invalidFieldValue", "reviewInvalidatedByRound.at must be an ISO timestamp");
+        }
+        draft.reviewInvalidatedByRound = { stage, at: record["at"] };
+        break;
+      }
+      case "incompleteRoundContinuations": {
+        if (!isNonNegativeInteger(value)) {
+          return recovery(
+            "invalidFieldValue",
+            "incompleteRoundContinuations must be a non-negative integer"
+          );
+        }
+        draft.incompleteRoundContinuations = value;
+        break;
+      }
+      case "pausedReason": {
+        // A workflow-imposed pause reason is one bounded diagnostic sentence
+        // (e.g. an exhausted provider chain) — never provider free text.
+        if (typeof value !== "string" || value.length === 0 || value.length > 2000) {
+          return recovery(
+            "invalidFieldValue",
+            "pausedReason must be a bounded non-empty string"
+          );
+        }
+        draft.pausedReason = value;
         break;
       }
       case "lintPayload": {

@@ -45,6 +45,10 @@ import { clearStageFallbackReservation } from "../utils/taskProgressTransforms";
 import { createCopilotLmToolSessionTransportV1 } from "../services/languageModelToolSessionV1";
 import { RequestLocalToolHandlerV1 } from "../services/requestLocalToolHandlerV1";
 import { TaskStage } from "../types/taskProgress";
+import {
+  ProviderChainCandidateStatusV1,
+  ProviderChainExhaustionV1,
+} from "../types/taskActionOutcomeV1";
 import { assertNoUnauthorizedV1CorrelationV0 } from "../services/legacyAiActionSafetyGateV0";
 
 type EffectiveProvider =
@@ -1060,6 +1064,16 @@ export type V1ReserveNextResultV1 =
        * explicit unavailable attempt).
        */
       readonly code: "providerModeUnavailable" | "candidatesExhausted";
+      /**
+       * Structured evidence of WHICH resolved chain was exhausted and why
+       * each ranked candidate could not serve (2026-08-13 finding 4: a bare
+       * `Status: unavailable (providerModeUnavailable)` run record named no
+       * provider at all). Built from this selection's own ranked list — the
+       * live settings resolution — so it can never disagree with what
+       * selection actually tried. The coordinator passes it through to the
+       * stage owner verbatim, performing no task-state mutation of its own.
+       */
+      readonly chainExhaustion?: ProviderChainExhaustionV1;
     };
 
 export interface V1RunnerSelectionV1 {
@@ -1081,6 +1095,31 @@ interface V1CandidateV1 {
   readonly providerId: ProviderId;
   readonly nativeModelId: string | undefined;
   readonly createTransport: (toolHandler?: RequestLocalToolHandlerV1) => AgentTransportV1;
+}
+
+/**
+ * The exact ranked stored-model-id chain `openV1RunnerSelection` walks: the
+ * stage's stored primary first, then the strategy-gated backups from live
+ * settings resolution. Shared with `preflightStageChainAvailabilityV1` so a
+ * pre-flight can never disagree with what selection would actually try
+ * (finding 4's second fix: "the chain is known ahead of time").
+ * `resolveEffectiveProvider(undefined)` is called for its fail-closed throw
+ * when no primary is configured — the same legacy misconfiguration error
+ * selection surfaces.
+ */
+function rankedStageChainStoredIdsV1(
+  stage: TaskStage | undefined,
+  modelId: string | undefined
+): string[] {
+  const rankedStoredIds: string[] = [];
+  if (modelId !== undefined) {
+    rankedStoredIds.push(modelId);
+  } else {
+    // Surface the exact legacy misconfiguration error at selection time.
+    resolveEffectiveProvider(undefined);
+  }
+  rankedStoredIds.push(...backupModelsForStage(stage, modelId));
+  return rankedStoredIds;
 }
 
 /**
@@ -1213,18 +1252,40 @@ export function openV1RunnerSelection(options: {
   // `resolveEffectiveProvider` throws for a disabled or unconfigured primary
   // (the same fail-closed behavior as the legacy entry points), and
   // `backupModelsForStage` already excludes disabled providers.
-  const rankedStoredIds: string[] = [];
-  if (options.modelId !== undefined) {
-    rankedStoredIds.push(options.modelId);
-  } else {
-    // Surface the exact legacy misconfiguration error at selection time.
-    resolveEffectiveProvider(undefined);
-  }
-  rankedStoredIds.push(...backupModelsForStage(options.stage, options.modelId));
+  const rankedStoredIds = rankedStageChainStoredIdsV1(options.stage, options.modelId);
 
   const ranked = rankedStoredIds.map(toRankedEntry);
   const anySupported = ranked.some((entry) => entry.supported);
   let cursor = 0;
+
+  // Per-candidate exhaustion diary, in ranked order. Updated as selection
+  // walks the chain so the noneRemaining evidence names what actually
+  // happened to every candidate — never reconstructed after the fact from a
+  // stale resolved-models snapshot (finding 4's bare 60-byte run record).
+  const candidateStatuses: {
+    storedModelId: string;
+    providerLabel: string;
+    runnerId: string;
+    reason: string;
+  }[] = ranked.map((entry) =>
+    entry.supported
+      ? {
+          storedModelId: entry.candidate.storedModelId,
+          providerLabel: entry.candidate.providerLabel,
+          runnerId: entry.candidate.runnerId,
+          reason: "not attempted",
+        }
+      : {
+          storedModelId: entry.storedModelId,
+          providerLabel: entry.providerLabel,
+          runnerId: entry.runnerId,
+          reason: `cannot satisfy the requested "${mode}" mode (skipped at selection time)`,
+        }
+  );
+  const exhaustionEvidence = (): ProviderChainExhaustionV1 => ({
+    ...(options.stage !== undefined ? { stage: options.stage } : {}),
+    candidates: candidateStatuses.map((status) => ({ ...status })),
+  });
 
   return {
     reserveNext(attemptId: AttemptIdV1): V1ReserveNextResultV1 {
@@ -1232,10 +1293,18 @@ export function openV1RunnerSelection(options: {
         // No ranked candidate can satisfy this mode at all — the whole
         // selection is mode-unavailable (there is nothing to fall back TO,
         // so no per-candidate attempt accounting is warranted).
-        return { kind: "noneRemaining", code: "providerModeUnavailable" };
+        return {
+          kind: "noneRemaining",
+          code: "providerModeUnavailable",
+          chainExhaustion: exhaustionEvidence(),
+        };
       }
       if (cursor >= ranked.length) {
-        return { kind: "noneRemaining", code: "candidatesExhausted" };
+        return {
+          kind: "noneRemaining",
+          code: "candidatesExhausted",
+          chainExhaustion: exhaustionEvidence(),
+        };
       }
       const entry = ranked[cursor]!;
       cursor++;
@@ -1262,6 +1331,16 @@ export function openV1RunnerSelection(options: {
         providerId: candidate.providerId,
         modelId: candidate.storedModelId,
       });
+      // Selection never sees the invocation's own failure (AC-RUNNER-04),
+      // so the diary can only record that the reservation was handed out —
+      // if this candidate had succeeded, reserveNext would never be asked
+      // for another, so reaching noneRemaining later proves it failed.
+      const status = candidateStatuses[cursor - 1];
+      if (status) {
+        status.reason =
+          "reserved and invoked, but the invocation did not produce a usable result " +
+          "(the per-attempt outcome is recorded in the selection session)";
+      }
       return {
         kind: "reserved",
         reserved: {
@@ -1315,5 +1394,160 @@ export function createV1RunnerSelectionOpener(options: {
       stage: resolved.stage,
       workspaceCwd: options.workspaceCwd,
     });
+  };
+}
+
+/* ------------------------------------------------------------------------ *
+ * Stage-chain availability pre-flight (2026-08-13 finding 4, second fix)   *
+ * ------------------------------------------------------------------------ */
+
+/** Result of {@link preflightStageChainAvailabilityV1}. */
+export type StageChainPreflightResultV1 =
+  | {
+      /**
+       * At least one candidate probed available — or could not be safely
+       * probed within the timeout ("unknown" NEVER short-circuits dispatch;
+       * the runtime exhaustion path remains the backstop for
+       * probe-available/invoke-fail candidates).
+       */
+      readonly kind: "dispatchable";
+    }
+  | {
+      /** Every enumerable candidate failed a safely probeable availability check. */
+      readonly kind: "exhausted";
+      readonly exhaustion: ProviderChainExhaustionV1;
+    };
+
+/** Per-candidate probe budget — an availability check, not an invocation. */
+const STAGE_CHAIN_PREFLIGHT_PROBE_TIMEOUT_MS_V1 = 5000;
+
+/** Race a probe against the timeout; `undefined` means "unknown — fail open". */
+async function probeWithTimeoutV1(
+  probe: Promise<AgentAvailability>,
+  timeoutMs: number
+): Promise<AgentAvailability | undefined> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      probe,
+      new Promise<undefined>((resolve) => {
+        timer = setTimeout(() => resolve(undefined), timeoutMs);
+      }),
+    ]);
+  } catch (error) {
+    // A probe that throws is a real (safely probeable) failure, not unknown.
+    return {
+      available: false,
+      reason: error instanceof Error ? error.message : String(error),
+    };
+  } finally {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
+  }
+}
+
+/**
+ * Pre-flight the availability of a stage's ENTIRE resolved provider chain
+ * before dispatching a round (finding 4: an unavailable-provider stall is
+ * predictable, so it should be reported as "no configured provider for
+ * <stage> is available" BEFORE a round burns, not discovered as a 60-byte
+ * run file afterwards).
+ *
+ * Enumerates candidates through the exact same chain-building path
+ * `openV1RunnerSelection` walks (`rankedStageChainStoredIdsV1` — the stored
+ * primary plus live strategy-gated backups) with NO reservation commit, and
+ * probes each with the existing side-effect-free availability machinery:
+ * `isAvailable()` for text-capable stages (the same primitive
+ * `checkRunnerAvailabilityForModel` uses, with `isAuthenticationFailure`
+ * classification), or the implementation-availability check for edit-capable
+ * stages. Each probe is bounded by a short timeout treated as "unknown — do
+ * not short-circuit": ONLY a chain whose every candidate fails a safely
+ * probeable check reports exhaustion; anything else fails open to dispatch,
+ * leaving the runtime exhaustion evidence as the backstop.
+ */
+export async function preflightStageChainAvailabilityV1(
+  stage: TaskStage,
+  options: {
+    /** The stage's stored primary model id (the caller's fresh resolution). */
+    modelId: string | undefined;
+    /** Probe the edit-capable availability path instead of the text path. */
+    editCapable?: boolean;
+    probeTimeoutMs?: number;
+    /** Test seam: probe one candidate. Defaults to the production probes. */
+    probeCandidate?: (storedModelId: string) => Promise<AgentAvailability>;
+  }
+): Promise<StageChainPreflightResultV1> {
+  const timeoutMs = options.probeTimeoutMs ?? STAGE_CHAIN_PREFLIGHT_PROBE_TIMEOUT_MS_V1;
+
+  let rankedStoredIds: string[];
+  try {
+    rankedStoredIds = rankedStageChainStoredIdsV1(stage, options.modelId);
+  } catch {
+    // The same misconfiguration selection would throw on. Not this
+    // function's failure to report — fail open and let the dispatch path
+    // surface its own configured error.
+    return { kind: "dispatchable" };
+  }
+
+  const defaultProbe = async (storedModelId: string): Promise<AgentAvailability> => {
+    const effective = resolveEffectiveProvider(storedModelId);
+    if (options.editCapable) {
+      if (effective.kind === "copilot") {
+        return checkImplementationAvailability();
+      }
+      const exists = await cliCommandExists(effective.def.command, effective.def.commandAliases);
+      return exists
+        ? { available: true }
+        : {
+            available: false,
+            reason: `The ${cliDisplayLabel(effective.def)} CLI (${effective.def.command}) is not installed. ${effective.def.installHint}`,
+          };
+    }
+    return toResolvedRunner(effective).runner.isAvailable();
+  };
+  const probeCandidate = options.probeCandidate ?? defaultProbe;
+
+  const candidates: ProviderChainCandidateStatusV1[] = [];
+  for (const storedModelId of rankedStoredIds) {
+    let providerLabel = storedModelId;
+    let runnerId = "unknown";
+    try {
+      const effective = resolveEffectiveProvider(storedModelId);
+      providerLabel = effective.kind === "copilot" ? "Copilot" : effective.def.label;
+      runnerId = effective.kind === "copilot" ? "copilot-lm" : effective.def.id;
+    } catch (error) {
+      candidates.push({
+        storedModelId,
+        providerLabel,
+        runnerId,
+        reason: error instanceof Error ? error.message : String(error),
+      });
+      continue;
+    }
+
+    const availability = await probeWithTimeoutV1(
+      Promise.resolve().then(() => probeCandidate(storedModelId)),
+      timeoutMs
+    );
+    if (availability === undefined || availability.available) {
+      // Available, or unknown within the probe budget — either way the
+      // chain is dispatchable and the pre-flight must not short-circuit.
+      return { kind: "dispatchable" };
+    }
+    const reason = availability.reason ?? "the provider reported itself unavailable";
+    candidates.push({
+      storedModelId,
+      providerLabel,
+      runnerId,
+      reason: isAuthenticationFailure(availability.reason)
+        ? `authentication failure: ${reason}`
+        : reason,
+    });
+  }
+
+  return {
+    kind: "exhausted",
+    exhaustion: { stage, candidates },
   };
 }

@@ -1,6 +1,6 @@
 import * as assert from "node:assert/strict";
 import { test } from "node:test";
-import { appendReviewRejection, appendReviewScoreHistory, clearEscalation, clearImplementationTypeCheckFailure, clearStageFallbackReservation, recordEscalation, recordImplementationTypeCheckFailure, setZeroChangeImplRounds, updateImplReviewFiles, clearImplReviewFiles, updateTaskProgressStage } from "../utils/taskProgressTransforms";
+import { appendReviewRejection, appendReviewScoreHistory, clearEscalation, clearImplementationTypeCheckFailure, clearReviewInvalidatedByRound, clearStageFallbackReservation, promotePendingImplReviewFiles, quarantinePendingImplReviewFiles, recordEscalation, recordImplementationTypeCheckFailure, recordReviewInvalidatedByRound, setIncompleteRoundContinuations, setZeroChangeImplRounds, updateImplReviewFiles, clearImplReviewFiles, updateTaskProgressStage } from "../utils/taskProgressTransforms";
 import { MAX_REVIEW_REJECTIONS, MAX_REVIEW_SCORE_HISTORY, ReviewRejectionEntry, ReviewScoreHistoryEntry, type TaskProgress, type TaskStage } from "../types/taskProgress";
 
 function makeProgress(implReviewFiles?: string[]): TaskProgress {
@@ -503,4 +503,90 @@ void test("setZeroChangeImplRounds does not disturb unrelated fields", () => {
   const updated = setZeroChangeImplRounds(progress, 2);
   assert.deepEqual(updated.implReviewFiles, ["a.ts"]);
   assert.equal(updated.currentStage, "impl-high-review");
+});
+
+// ---------------------------------------------------------------------------
+// Incomplete-round quarantine / promotion (deferred-round detection, 2026-08-13
+// report item 1): a detected round's delta lands in pendingImplReviewFiles —
+// never implReviewFiles — and a later successful round promotes it.
+// ---------------------------------------------------------------------------
+
+void test("quarantinePendingImplReviewFiles records the delta without touching implReviewFiles", () => {
+  const progress = makeProgress(["reviewed.ts"]);
+  const updated = quarantinePendingImplReviewFiles(progress, ["a.ts", "b.ts"]);
+  assert.deepEqual(updated.pendingImplReviewFiles, ["a.ts", "b.ts"]);
+  assert.deepEqual(updated.implReviewFiles, ["reviewed.ts"]);
+});
+
+void test("consecutive incomplete rounds accumulate into the quarantine (union, newest first)", () => {
+  const progress = { ...makeProgress(), pendingImplReviewFiles: ["a.ts", "b.ts"] };
+  const updated = quarantinePendingImplReviewFiles(progress, ["b.ts", "c.ts"]);
+  assert.deepEqual(updated.pendingImplReviewFiles, ["b.ts", "c.ts", "a.ts"]);
+});
+
+void test("quarantine applies the machine-maintained-path filter like updateImplReviewFiles", () => {
+  const progress = makeProgress();
+  const updated = quarantinePendingImplReviewFiles(progress, [
+    "src/a.ts",
+    "workflow-inventories/workflow-route-baseline-v1.json",
+  ]);
+  assert.deepEqual(updated.pendingImplReviewFiles, ["src/a.ts"]);
+});
+
+void test("quarantining an empty (or all-filtered) delta leaves progress untouched", () => {
+  const progress = makeProgress();
+  assert.equal(quarantinePendingImplReviewFiles(progress, []), progress);
+});
+
+void test("promotePendingImplReviewFiles unions the pending set into implReviewFiles and clears it", () => {
+  const progress = {
+    ...makeProgress(["reviewed.ts"]),
+    pendingImplReviewFiles: ["a.ts", "b.ts"],
+    incompleteRoundContinuations: 2,
+  };
+  const promoted = promotePendingImplReviewFiles(progress);
+  assert.deepEqual(promoted.implReviewFiles, ["a.ts", "b.ts", "reviewed.ts"]);
+  assert.equal(promoted.pendingImplReviewFiles, undefined);
+  assert.equal(promoted.incompleteRoundContinuations, undefined);
+});
+
+void test("promotePendingImplReviewFiles with nothing pending is a no-op returning the same object", () => {
+  const progress = makeProgress(["reviewed.ts"]);
+  assert.equal(promotePendingImplReviewFiles(progress), progress);
+});
+
+void test("promotePendingImplReviewFiles clears a continuation counter even with no pending files", () => {
+  const progress = { ...makeProgress(), incompleteRoundContinuations: 1 };
+  const promoted = promotePendingImplReviewFiles(progress);
+  assert.equal(promoted.incompleteRoundContinuations, undefined);
+  assert.equal(promoted.pendingImplReviewFiles, undefined);
+});
+
+// ---------------------------------------------------------------------------
+// reviewInvalidatedByRound marker: durable "this review no longer describes
+// the workspace" record, set by a detected round and cleared only after
+// replacement review-tracking state persists.
+// ---------------------------------------------------------------------------
+
+void test("recordReviewInvalidatedByRound stamps the stage and a timestamp", () => {
+  const progress = makeProgress();
+  const updated = recordReviewInvalidatedByRound(progress, "impl-high-review");
+  assert.equal(updated.reviewInvalidatedByRound?.stage, "impl-high-review");
+  assert.ok(updated.reviewInvalidatedByRound?.at);
+});
+
+void test("clearReviewInvalidatedByRound removes the marker; no-op when absent", () => {
+  const progress = makeProgress();
+  const marked = recordReviewInvalidatedByRound(progress, "impl-low-review");
+  const cleared = clearReviewInvalidatedByRound(marked);
+  assert.equal(cleared.reviewInvalidatedByRound, undefined);
+  assert.equal(clearReviewInvalidatedByRound(progress), progress);
+});
+
+void test("setIncompleteRoundContinuations sets and clears the persisted counter", () => {
+  const progress = makeProgress();
+  const set = setIncompleteRoundContinuations(progress, 2);
+  assert.equal(set.incompleteRoundContinuations, 2);
+  const cleared = setIncompleteRoundContinuations(set, undefined);
+  assert.equal(cleared.incompleteRoundContinuations, undefined);
 });

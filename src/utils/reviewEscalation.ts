@@ -52,7 +52,7 @@ export async function escalateReviewToHuman(
   stage: TaskStage,
   kind: EscalationKind,
   reason: string,
-  reviewAttemptId: string,
+  reviewAttemptId: string | undefined,
   progressHint?: Pick<TaskProgress, "displayName">,
   secondOpinionAttempted = false
 ): Promise<boolean> {
@@ -88,9 +88,16 @@ export async function escalateReviewToHuman(
       // `reviewAttemptId` has already moved on even though `currentStage`
       // hasn't. Applying window A's stale escalation in that case would
       // pause the task out from under window B's independent, still-live
-      // attempt. Older tasks written before this field existed have no
-      // `reviewAttemptId` at all — decline in that ambiguous case too
-      // rather than assume it's safe.
+      // attempt. The expected value is whatever the caller just read from
+      // persisted state — including `undefined` for an implementation-stage
+      // task, where the field is legitimately absent (the impl transition
+      // clears it; see taskProgressFieldPolicyV1). An escalation computed
+      // against an absent id therefore applies only while the id is STILL
+      // absent: if a review round has claimed the stage since, the write
+      // declines exactly as it does for a mismatched string. Callers that
+      // read no persisted state at all should keep passing "" (which can
+      // never match), not `undefined` — an unread expectation is not an
+      // expectation of absence.
       if (current.reviewAttemptId !== reviewAttemptId) {
         return current;
       }

@@ -135,6 +135,32 @@ export const TASK_PROGRESS_FIELD_POLICY_V1: Record<
     reopen:
       "Preserve only when its owner stage (impl) is strictly before selected stage; otherwise [].",
   },
+  pendingImplReviewFiles: {
+    migration: "Validate bounded task-local paths (same bounds as implReviewFiles); absent on new tasks.",
+    nextStage: "Preserve — quarantined edits from an incomplete round must survive until a successful round promotes them.",
+    markTaskDone: "Preserve.",
+    reopen:
+      "Preserve only when its owner stage (impl) is strictly before selected stage; otherwise clear — a reopened earlier stage restarts the cycle the quarantine belonged to.",
+  },
+  reviewInvalidatedByRound: {
+    migration: "Validate exact { stage, at } shape; absent on new tasks.",
+    nextStage:
+      "Preserve — a stage change is not replacement review-tracking state; the marker clears only after a stale stamp or a fresh review round persists.",
+    markTaskDone: "Clear — terminal completion is an explicit human acceptance of the current state.",
+    reopen: "Clear — reopening restarts review tracking for the selected stage.",
+  },
+  incompleteRoundContinuations: {
+    migration: "Validate non-negative integer/current optionality; absent on new tasks.",
+    nextStage: "Clear — the continuation streak belongs to the stage being left.",
+    markTaskDone: "Clear.",
+    reopen: "Clear — reopening starts the streak over.",
+  },
+  pausedReason: {
+    migration: "Validate bounded non-empty string/current optionality; absent on new tasks.",
+    nextStage: "Clear — a stage transition requires an active task, and the reason only describes a paused state.",
+    markTaskDone: "Clear.",
+    reopen: "Clear — reopening reactivates the task; the workflow-imposed pause it described is over.",
+  },
   lintPayload: {
     migration: "Validate/preserve without granting runtime ownership.",
     nextStage: "Consume before transition, then clear.",
@@ -343,6 +369,10 @@ export function applyNextStagePolicyV1(
     completedAt: undefined,
     completedStages: addCompletedStage(progress.completedStages, departing),
     implReviewFiles: progress.implReviewFiles,
+    pendingImplReviewFiles: progress.pendingImplReviewFiles,
+    reviewInvalidatedByRound: progress.reviewInvalidatedByRound,
+    incompleteRoundContinuations: undefined,
+    pausedReason: undefined,
     lintPayload: undefined,
     scheduledRun: undefined,
     scheduledResumeTime: undefined,
@@ -392,6 +422,10 @@ export function applyMarkTaskDonePolicyV1(
     completedAt: input.now,
     completedStages: addCompletedStage(progress.completedStages, progress.currentStage),
     implReviewFiles: progress.implReviewFiles,
+    pendingImplReviewFiles: progress.pendingImplReviewFiles,
+    reviewInvalidatedByRound: undefined,
+    incompleteRoundContinuations: undefined,
+    pausedReason: undefined,
     lintPayload: undefined,
     scheduledRun: undefined,
     scheduledResumeTime: undefined,
@@ -441,6 +475,8 @@ export function applyReopenPolicyV1(
   const implOwnerIndex = stageIndex("impl");
   const implReviewFiles =
     implOwnerIndex < selectedIndex ? progress.implReviewFiles : [];
+  const pendingImplReviewFiles =
+    implOwnerIndex < selectedIndex ? progress.pendingImplReviewFiles : undefined;
 
   // Set selected/later-stage entries to false only where an entry exists —
   // materializing false for every absent stage would grow the persisted map
@@ -478,6 +514,10 @@ export function applyReopenPolicyV1(
     completedAt: undefined,
     completedStages: retainedStages,
     implReviewFiles,
+    pendingImplReviewFiles,
+    reviewInvalidatedByRound: undefined,
+    incompleteRoundContinuations: undefined,
+    pausedReason: undefined,
     lintPayload: undefined,
     scheduledRun: undefined,
     scheduledResumeTime: undefined,

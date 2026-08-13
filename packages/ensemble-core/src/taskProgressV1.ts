@@ -178,7 +178,37 @@ export interface TaskProgress {
    * zero files — durable no-progress-breaker counter; persists across
    * reloads/rounds, reset on a file-changing round or stage transition. */
   zeroChangeImplRounds?: number;
+  /** Workspace-relative paths changed by an implementation round detected as
+   * INCOMPLETE (deferred/cut short), quarantined instead of banked into
+   * `implReviewFiles`; promoted by the next successful round. */
+  pendingImplReviewFiles?: string[];
+  /** Set when an incomplete round changed the tree after a review stage's
+   * artifact was written; the artifact's content is preserved but no longer
+   * describes the workspace. */
+  reviewInvalidatedByRound?: ReviewInvalidatedByRound;
+  /** Count of incomplete (deferred/cut-short) implementation rounds since the
+   * last successful round; bounds the automatic continuation loop. */
+  incompleteRoundContinuations?: number;
+  /** WHY the task is paused, for a workflow-imposed pause (e.g. an exhausted
+   * provider chain). Meaningful only while `status === "paused"`; cleared by
+   * any status change away from paused. */
+  pausedReason?: string;
 }
+
+/** `TaskProgress.reviewInvalidatedByRound` — which stage's review an incomplete round invalidated, and when. */
+export interface ReviewInvalidatedByRound {
+  /** The review stage whose artifact no longer describes the workspace. */
+  stage: TaskStage;
+  /** ISO timestamp the invalidating round was detected. */
+  at: string;
+}
+
+/**
+ * Cap on automatic continuations of incomplete (deferred/cut-short)
+ * implementation rounds before escalating to the human (mirror of
+ * `src/types/taskProgress.ts`).
+ */
+export const MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1 = 3;
 
 /** `TaskProgress.implementationTypeCheckFailure` — one round's failing type-check. */
 export interface ImplementationTypeCheckFailure {

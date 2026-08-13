@@ -65,11 +65,44 @@ export interface TaskActionOutcomeProviderV1 {
   readonly storedModelId: string;
 }
 
+/**
+ * One candidate of an exhausted provider chain: which ranked entry it was and
+ * why it could not serve the round. `reason` is our own bounded diagnostic —
+ * never provider free text (port of `src/types/taskActionOutcomeV1.ts`).
+ */
+export interface ProviderChainCandidateStatusV1 {
+  readonly storedModelId: string;
+  readonly providerLabel: string;
+  readonly runnerId: string;
+  readonly reason: string;
+}
+
+/**
+ * Structured evidence that a stage's ENTIRE resolved provider chain was
+ * exhausted without acquiring a provider — see the extension source for the
+ * full rationale (2026-08-13 finding 4). Carried optionally on
+ * `providerModeUnavailable` outcomes; the stage owner surfaces it.
+ */
+export interface ProviderChainExhaustionV1 {
+  /** The stage whose chain was exhausted (absent when the request carried no stage). */
+  readonly stage?: string;
+  /** The resolved candidate chain, in ranked order, each with its skip/failure reason. */
+  readonly candidates: readonly ProviderChainCandidateStatusV1[];
+}
+
 export type TaskActionOutcomeV1 =
   | {
       readonly kind: "completed";
       readonly correlation: ActionCorrelationV1;
-      readonly code: "completed" | "noChanges";
+      /**
+       * `roundDeferredIncomplete`/`roundIncomplete` record a provider
+       * invocation that settled successfully but whose round the STAGE OWNER
+       * detected as not actually finished (deferred to an undeliverable
+       * follow-up turn, or cut short). Informational only: the coordinator
+       * never emits or retries them (they are not malformed results), and
+       * recovery is the task-loop's continuation scheduling.
+       */
+      readonly code: "completed" | "noChanges" | "roundDeferredIncomplete" | "roundIncomplete";
       readonly provider?: TaskActionOutcomeProviderV1;
     }
   | {
@@ -112,6 +145,12 @@ export type TaskActionOutcomeV1 =
   | {
       readonly kind: "unavailable";
       readonly code: WorkflowUnavailableCodeV1;
+      /**
+       * Present only on `providerModeUnavailable` outcomes produced by a
+       * selection whose whole ranked chain was exhausted. Optional and
+       * additive: every existing unavailable outcome remains valid.
+       */
+      readonly chainExhaustion?: ProviderChainExhaustionV1;
     }
   | {
       readonly kind: "recoveryRequired";
@@ -275,6 +314,70 @@ function decodeOptionalProviderV1(raw: unknown): TaskActionOutcomeProviderV1 | u
   return { providerLabel: raw.providerLabel, storedModelId: raw.storedModelId };
 }
 
+/** Bound on one candidate's `reason` — a diagnostic sentence, never a transcript. */
+const MAX_CHAIN_CANDIDATE_REASON_CHARS_V1 = 500;
+/** Bound on the candidate list — a ranked chain is a handful of models. */
+const MAX_CHAIN_CANDIDATES_V1 = 32;
+
+/** Decode an optional `chainExhaustion` field, rejecting unknown sub-fields. */
+function decodeOptionalChainExhaustionV1(
+  raw: unknown
+): ProviderChainExhaustionV1 | undefined | string {
+  if (raw === undefined) {
+    return undefined;
+  }
+  if (!isPlainRecordV1(raw)) {
+    return "\"chainExhaustion\" is not an object";
+  }
+  const unknown = unknownOutcomeField(raw, new Set(["stage", "candidates"]), "chainExhaustion");
+  if (unknown) {
+    return unknown;
+  }
+  if (raw.stage !== undefined && (typeof raw.stage !== "string" || raw.stage.length === 0)) {
+    return "\"chainExhaustion.stage\" must be a non-empty string when present";
+  }
+  if (!Array.isArray(raw.candidates) || raw.candidates.length > MAX_CHAIN_CANDIDATES_V1) {
+    return "\"chainExhaustion.candidates\" must be a bounded array";
+  }
+  const candidates: ProviderChainCandidateStatusV1[] = [];
+  for (const entry of raw.candidates as unknown[]) {
+    if (!isPlainRecordV1(entry)) {
+      return "\"chainExhaustion.candidates\" entries must be objects";
+    }
+    const unknownEntry = unknownOutcomeField(
+      entry,
+      new Set(["storedModelId", "providerLabel", "runnerId", "reason"]),
+      "chainExhaustion candidate"
+    );
+    if (unknownEntry) {
+      return unknownEntry;
+    }
+    if (
+      typeof entry.storedModelId !== "string" ||
+      entry.storedModelId.length === 0 ||
+      typeof entry.providerLabel !== "string" ||
+      entry.providerLabel.length === 0 ||
+      typeof entry.runnerId !== "string" ||
+      entry.runnerId.length === 0 ||
+      typeof entry.reason !== "string" ||
+      entry.reason.length === 0 ||
+      entry.reason.length > MAX_CHAIN_CANDIDATE_REASON_CHARS_V1
+    ) {
+      return "\"chainExhaustion.candidates\" entries must carry bounded non-empty identity and reason strings";
+    }
+    candidates.push({
+      storedModelId: entry.storedModelId,
+      providerLabel: entry.providerLabel,
+      runnerId: entry.runnerId,
+      reason: entry.reason,
+    });
+  }
+  return {
+    ...(raw.stage !== undefined ? { stage: raw.stage } : {}),
+    candidates,
+  };
+}
+
 /**
  * Strictly decode a raw parsed JSON value as a persisted `TaskActionOutcomeV1`.
  * Fail-closed: unknown fields, malformed correlations, and unrecognized codes
@@ -298,7 +401,12 @@ export function decodeTaskActionOutcomeV1(raw: unknown): DecodeTaskActionOutcome
       if (typeof correlation === "string") {
         return fail(correlation);
       }
-      if (raw.code !== "completed" && raw.code !== "noChanges") {
+      if (
+        raw.code !== "completed" &&
+        raw.code !== "noChanges" &&
+        raw.code !== "roundDeferredIncomplete" &&
+        raw.code !== "roundIncomplete"
+      ) {
         return fail(`invalid completed outcome "code": ${JSON.stringify(raw.code)}`);
       }
       const provider = decodeOptionalProviderV1(raw.provider);
@@ -417,14 +525,29 @@ export function decodeTaskActionOutcomeV1(raw: unknown): DecodeTaskActionOutcome
       };
     }
     case "unavailable": {
-      const unknown = unknownOutcomeField(raw, new Set(["kind", "code"]), "unavailable outcome");
+      const unknown = unknownOutcomeField(
+        raw,
+        new Set(["kind", "code", "chainExhaustion"]),
+        "unavailable outcome"
+      );
       if (unknown) {
         return fail(unknown);
       }
       if (typeof raw.code !== "string" || !WORKFLOW_UNAVAILABLE_CODES_V1.has(raw.code)) {
         return fail(`invalid unavailable outcome "code": ${JSON.stringify(raw.code)}`);
       }
-      return { ok: true, outcome: { kind: "unavailable", code: raw.code as WorkflowUnavailableCodeV1 } };
+      const chainExhaustion = decodeOptionalChainExhaustionV1(raw.chainExhaustion);
+      if (typeof chainExhaustion === "string") {
+        return fail(chainExhaustion);
+      }
+      return {
+        ok: true,
+        outcome: {
+          kind: "unavailable",
+          code: raw.code as WorkflowUnavailableCodeV1,
+          ...(chainExhaustion !== undefined ? { chainExhaustion } : {}),
+        },
+      };
     }
     case "recoveryRequired": {
       const unknown = unknownOutcomeField(raw, new Set(["kind", "code"]), "recoveryRequired outcome");

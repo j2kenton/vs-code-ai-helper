@@ -207,6 +207,41 @@ export interface TaskProgress {
    */
   implReviewFiles?: string[];
   /**
+   * Workspace-relative paths changed by an implementation round that was
+   * detected as INCOMPLETE (deferred or cut short — see
+   * `describeIncompleteImplementationRoundV1`), quarantined here instead of
+   * banked into `implReviewFiles`. A deferred round is not a completed round:
+   * its edits are real and must not be discarded, but they have no usable
+   * report to review against, so they wait here until a subsequent
+   * implementation round completes successfully and promotes them (unioned
+   * into `implReviewFiles` alongside that round's own delta) — see
+   * `promotePendingImplReviewFiles`.
+   */
+  pendingImplReviewFiles?: string[];
+  /**
+   * Set when an incomplete implementation round changed the tree AFTER the
+   * stage's review artifact was written, WITHOUT staling that artifact's
+   * content: the previous review is preserved on disk (a detected round must
+   * not destroy artifacts the way a rejected round's placeholder writes do),
+   * and this marker is the durable record that it no longer describes the
+   * workspace. Consumers that treat an existing review as current must check
+   * it. Cleared only AFTER replacement review-tracking state has persisted —
+   * a stale stamp on the artifact, or a fresh review round publishing with no
+   * pending quarantined files — so every persisted state either carries the
+   * marker or already shows a fresh review is required.
+   */
+  reviewInvalidatedByRound?: ReviewInvalidatedByRound;
+  /**
+   * Count of implementation rounds detected as incomplete (deferred/cut
+   * short) since the last successful round. Bounds the automatic
+   * continuation loop: each detected round schedules a continuation
+   * implementation round, and once this reaches
+   * `MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1` the task escalates to the human
+   * instead of dispatching another provider. Cleared when a round completes
+   * with a usable summary (the pending set is promoted at the same time).
+   */
+  incompleteRoundContinuations?: number;
+  /**
    * Persisted lint state for this task. Present only after a lint run has
    * been executed for a completed task. When absent, the lint state is
    * "unknown" and completion-only actions (commit/push) are gated pending
@@ -299,7 +334,38 @@ export interface TaskProgress {
    * not wiped merely because the field was read once.
    */
   zeroChangeImplRounds?: number;
+
+  /**
+   * WHY the task is paused, for a pause the workflow imposed rather than the
+   * user requesting one — e.g. "no configured provider for impl-high-review
+   * is available" when a stage's entire provider chain is exhausted
+   * (2026-08-13 finding 4: the task previously just went quiet, its only
+   * record a 60-byte run file nobody was watching). Surfaced in the task
+   * tree so a paused-with-reason task is distinguishable from a round still
+   * thinking. Meaningful only while `status === "paused"`; cleared by any
+   * status change away from paused (`updateTaskStatus`).
+   */
+  pausedReason?: string;
 }
+
+/** `TaskProgress.reviewInvalidatedByRound` — which stage's review an incomplete round invalidated, and when. */
+export interface ReviewInvalidatedByRound {
+  /** The review stage whose artifact no longer describes the workspace. */
+  stage: TaskStage;
+  /** ISO timestamp the invalidating round was detected. */
+  at: string;
+}
+
+/**
+ * Cap on automatic continuations of incomplete (deferred/cut-short)
+ * implementation rounds before escalating to the human. Deliberately the
+ * same VALUE as the coordinator's `MAX_MALFORMED_RESULT_INVOCATIONS_V1`
+ * (taskActionCoordinatorV1.ts) but applied at the task-loop layer against
+ * the persisted `incompleteRoundContinuations` counter — the coordinator's
+ * malformed-result budget never sees these rounds, because a detected round
+ * settles as a completed provider invocation.
+ */
+export const MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1 = 3;
 
 /** `TaskProgress.implementationTypeCheckFailure` — one round's failing type-check. */
 export interface ImplementationTypeCheckFailure {

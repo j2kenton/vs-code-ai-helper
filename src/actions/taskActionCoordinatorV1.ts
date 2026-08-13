@@ -1123,8 +1123,22 @@ export function createTaskActionCoordinatorV1(
           // providerModeUnavailable there would mask the real failure behind
           // a misleading "no provider available" — the last malformed
           // outcome is the honest report of what actually happened.
+          //
+          // The registry's structured chain-exhaustion evidence is passed
+          // through VERBATIM (2026-08-13 finding 4): the coordinator mutates
+          // no task state and edits no reasons — surfacing (enriched run
+          // record, paused task) belongs to the stage owner that dispatched
+          // the round.
           session.reportAttemptOutcome(attemptId, "providerUnavailablePreInvocation");
-          return lastMalformedOutcomeV1 ?? unavailableV1("providerModeUnavailable");
+          return (
+            lastMalformedOutcomeV1 ?? {
+              kind: "unavailable",
+              code: "providerModeUnavailable",
+              ...(next.chainExhaustion !== undefined
+                ? { chainExhaustion: next.chainExhaustion }
+                : {}),
+            }
+          );
         }
         if (next.kind === "candidateUnavailable") {
           // The registry settled this attempt (providerUnavailablePreInvocation)
@@ -1744,7 +1758,25 @@ export function createTaskActionCoordinatorV1(
       if (next.kind === "noneRemaining") {
         session.reportAttemptOutcome(attemptId, "providerUnavailablePreInvocation");
         progress.end();
-        return { kind: "settled", outcome: finalizeOutcome(row, request, operationId, unavailableV1("providerModeUnavailable"), metrics) };
+        // Same verbatim evidence pass-through as the invocation loop's
+        // noneRemaining branch (finding 4): no task-state mutation here —
+        // the stage owner surfaces the exhausted chain.
+        return {
+          kind: "settled",
+          outcome: finalizeOutcome(
+            row,
+            request,
+            operationId,
+            {
+              kind: "unavailable",
+              code: "providerModeUnavailable",
+              ...(next.chainExhaustion !== undefined
+                ? { chainExhaustion: next.chainExhaustion }
+                : {}),
+            },
+            metrics
+          ),
+        };
       }
       if (next.kind === "candidateUnavailable") {
         reportCandidateSkipped(deps, next, request.taskStage);

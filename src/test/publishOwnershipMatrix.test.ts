@@ -335,7 +335,23 @@ function stubV1RunnerSelection(transports: readonly AgentTransportV1[]): Patched
       };
     },
   });
-  return patch(runnerRegistryModule, "createV1RunnerSelectionOpener", () => fakeOpener);
+  // The dispatch-site chain pre-flight (finding 4) probes REAL provider
+  // availability before the coordinator ever opens a selection; in this
+  // harness no CLI is installed, so an unstubbed pre-flight would report the
+  // chain exhausted and pause the task before the stubbed selection above is
+  // ever reached. A stubbed selection is dispatchable by definition.
+  const openerPatch = patch(runnerRegistryModule, "createV1RunnerSelectionOpener", () => fakeOpener);
+  const preflightPatch = patch(
+    runnerRegistryModule,
+    "preflightStageChainAvailabilityV1",
+    () => Promise.resolve({ kind: "dispatchable" })
+  );
+  return {
+    restore: (): void => {
+      preflightPatch.restore();
+      openerPatch.restore();
+    },
+  };
 }
 
 /** Minimal TaskInventory stub — enough for setTaskStage's resolveTaskContext + refresh(). */
@@ -819,12 +835,20 @@ async function runReviewWithOutcome(
   reviewOptions: Parameters<typeof runReviewForFolder>[5] = {}
 ): Promise<void> {
   const workspaceRoot = { uri: vscode.Uri.file(REAL_ROOT), name: "root", index: 0 } as vscode.WorkspaceFolder;
-  const fakeRunner = {
-    id: "stub-runner",
-    label: "Stub Provider",
-    capabilities: { planning: true, review: true, assistant: false },
-    isAvailable: (): Promise<{ available: boolean }> => Promise.resolve({ available: true }),
-    run: (): Promise<AgentRunResult> => Promise.resolve(runnerResult),
+  // Reviews run through the V1 coordinator, so the failure is injected as a
+  // transport exit, not a legacy AgentRunResult: a "cancelled" result becomes
+  // a providerCancelled exit (a cancelled outcome), and a "failed" result
+  // becomes a transportFailure exit (the coordinator advances past it; the
+  // stub chain has nothing further, so selection reports exhausted without
+  // the registry's structured evidence — the generic-failure shape).
+  const failureTransport: AgentTransportV1 = {
+    runnerId: runnerResult.runnerId,
+    invoke: (): Promise<{ kind: "providerCancelled" } | { kind: "transportFailure"; code: string }> =>
+      Promise.resolve(
+        runnerResult.status === "cancelled"
+          ? { kind: "providerCancelled" as const }
+          : { kind: "transportFailure" as const, code: "stubProviderError" }
+      ),
   };
   const contextPack = path.join(folderPath, "context-pack.md");
   fs.writeFileSync(contextPack, "# Context\n", "utf8");
@@ -836,9 +860,7 @@ async function runReviewWithOutcome(
       Promise.resolve({ source: "settings", modelId: "stub:model" })),
     patch(modelSelectionModule, "resolveConfiguredReviewStages", () =>
       Promise.resolve(new Set(REVIEW_STAGES))),
-    patch(runnerRegistryModule, "resolveRunnerForModel", () => ({
-      runner: fakeRunner, provider: "copilot", providerLabel: "Stub Provider", nativeModelId: undefined,
-    })),
+    stubV1RunnerSelection([failureTransport]),
     patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.resolve("stub prompt")),
     patch(runLogModule, "writeRunLog", () => Promise.resolve(undefined)),
     patch(contextPackModule, "writeContextPack", () => Promise.resolve(vscode.Uri.file(contextPack))),
@@ -1903,6 +1925,160 @@ void describe("resumeReviewInteractionV1 — production Resume delegate", () => 
       provider.dispose();
       deactivateNotificationRouter();
     }
+  });
+});
+
+/**
+ * Plan Part 3, step 12(c): a candidate that probes AVAILABLE at pre-flight but
+ * fails at invocation must still reach the runtime exhaustion backstop — the
+ * pre-flight's probeable checks cannot see quota, capacity, or outage classes,
+ * so the registry's invoke-time exhaustion evidence (chain + per-candidate
+ * reasons) is a permanent backstop, not a transitional one. The stage owner
+ * applies it: task paused with `pausedReason`, `updatedAt` bumped, and the
+ * enriched run record naming the chain — never the bare 60-byte status line.
+ *
+ * The second test pins the Publish-stage regression: the generic "Publish
+ * review did not complete" branch used to capture every non-completed outcome
+ * first, so a Publish-chain exhaustion produced only the Publish Anyway nudge
+ * while the task stayed active.
+ */
+void describe("provider-chain exhaustion — probe-available/invoke-fail reaches the runtime backstop", () => {
+  const invokeTimeExhaustion = (stage: string): Record<string, unknown> => ({
+    stage,
+    candidates: [
+      {
+        storedModelId: "cline-cli:kimi-k3",
+        providerLabel: "Cline CLI",
+        runnerId: "cline-cli",
+        reason: "quota exhausted at invocation",
+      },
+      {
+        storedModelId: "kimi-cli:k3",
+        providerLabel: "Kimi CLI",
+        runnerId: "kimi-cli",
+        reason: "remote service outage at invocation",
+      },
+    ],
+  });
+
+  /**
+   * Pre-flight explicitly reports the chain dispatchable (the probes saw an
+   * available candidate), while the selection opener exhausts at invocation
+   * time WITH the registry's structured evidence attached — the
+   * probe-available/invoke-fail shape.
+   */
+  function stubProbeAvailableInvokeFail(stage: string): Patched {
+    const openerPatch = patch(runnerRegistryModule, "createV1RunnerSelectionOpener", () => () => ({
+      reserveNext(): unknown {
+        return {
+          kind: "noneRemaining",
+          code: "providerModeUnavailable",
+          chainExhaustion: invokeTimeExhaustion(stage),
+        };
+      },
+    }));
+    const preflightPatch = patch(
+      runnerRegistryModule,
+      "preflightStageChainAvailabilityV1",
+      () => Promise.resolve({ kind: "dispatchable" })
+    );
+    return {
+      restore: (): void => {
+        preflightPatch.restore();
+        openerPatch.restore();
+      },
+    };
+  }
+
+  function readPersistedProgress(folderPath: string): TaskProgress {
+    return JSON.parse(
+      fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")
+    ) as TaskProgress;
+  }
+
+  async function runExhaustedReview(stage: TaskStage, name: string): Promise<string> {
+    const { folderPath } = makeTaskFolder(name, stage);
+    const provider = new StatusTreeProvider();
+    initNotificationRouter(provider);
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const contextPack = path.join(folderPath, "context-pack.md");
+    fs.writeFileSync(contextPack, "# Context\n", "utf8");
+    const patches: Patched[] = [
+      patch(settingsModule, "isAutoAdvanceEnabled", () => false),
+      patch(modelSelectionModule, "resolveModelForStage", () =>
+        Promise.resolve({ source: "settings", modelId: "cline-cli:kimi-k3" })),
+      patch(modelSelectionModule, "resolveFreshModelForStage", () =>
+        Promise.resolve({ source: "settings", modelId: "cline-cli:kimi-k3" })),
+      patch(modelSelectionModule, "resolveConfiguredReviewStages", () =>
+        Promise.resolve(new Set(REVIEW_STAGES))),
+      stubProbeAvailableInvokeFail(stage),
+      patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.resolve("stub prompt")),
+      // writeRunLog is deliberately NOT patched: the enriched exhaustion run
+      // record is part of what these tests assert.
+      patch(contextPackModule, "writeContextPack", () => Promise.resolve(vscode.Uri.file(contextPack))),
+    ];
+    try {
+      const workspaceRoot = { uri: vscode.Uri.file(REAL_ROOT), name: "root", index: 0 } as vscode.WorkspaceFolder;
+      await runReviewForFolder(
+        vscode.Uri.file(REAL_ROOT),
+        vscode.Uri.file(folderPath),
+        workspaceRoot,
+        stage,
+        true,
+        {}
+      );
+    } finally {
+      for (const p of patches.reverse()) { p.restore(); }
+      wsStub.restore();
+      fsBridge.restore();
+      provider.dispose();
+      deactivateNotificationRouter();
+    }
+    return folderPath;
+  }
+
+  void it("an invoke-time exhaustion pauses the task with a reason and writes the enriched run record, even though pre-flight probed available", async () => {
+    const folderPath = await runExhaustedReview(
+      "impl-low-review",
+      `invoke-fail-backstop-${Math.floor(Math.random() * 1e9)}`
+    );
+
+    const persisted = readPersistedProgress(folderPath);
+    assert.equal(persisted.status, "paused", "the runtime backstop must pause the task");
+    assert.match(
+      persisted.pausedReason ?? "",
+      /No configured provider for impl-low-review is available/
+    );
+    assert.match(persisted.pausedReason ?? "", /Cline CLI → Kimi CLI/);
+    assert.notEqual(persisted.updatedAt, "2026-01-01T00:00:00.000Z", "updatedAt must be bumped");
+
+    const runsDir = path.join(folderPath, "runs");
+    const logs = fs.readdirSync(runsDir).map((entry) =>
+      fs.readFileSync(path.join(runsDir, entry), "utf8")
+    );
+    assert.equal(logs.length, 1);
+    assert.match(logs[0]!, /## Provider chain exhausted/);
+    assert.match(logs[0]!, /Cline CLI .*— quota exhausted at invocation/);
+    assert.match(logs[0]!, /Kimi CLI .*— remote service outage at invocation/);
+  });
+
+  void it("a Publish-stage exhaustion pauses the task too — the generic Publish failure nudge must not swallow it", async () => {
+    const folderPath = await runExhaustedReview(
+      "publish",
+      `publish-exhaustion-${Math.floor(Math.random() * 1e9)}`
+    );
+
+    const persisted = readPersistedProgress(folderPath);
+    assert.equal(
+      persisted.status,
+      "paused",
+      "an exhausted Publish chain must pause the task, not only surface Publish Anyway"
+    );
+    assert.match(
+      persisted.pausedReason ?? "",
+      /No configured provider for publish is available/
+    );
   });
 });
 

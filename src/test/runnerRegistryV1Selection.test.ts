@@ -20,7 +20,10 @@
 import * as assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import * as vscode from "vscode";
-import { openV1RunnerSelection } from "../runners/runnerRegistry";
+import {
+  openV1RunnerSelection,
+  preflightStageChainAvailabilityV1,
+} from "../runners/runnerRegistry";
 import {
   openProviderSelectionSessionV1,
   ProviderSelectionSessionV1,
@@ -110,7 +113,20 @@ void describe("openV1RunnerSelection", () => {
       );
 
       const third = selection.reserveNext(session.allocateAttempt());
-      assert.deepEqual(third, { kind: "noneRemaining", code: "candidatesExhausted" });
+      assert.equal(third.kind, "noneRemaining");
+      if (third.kind === "noneRemaining") {
+        assert.equal(third.code, "candidatesExhausted");
+        // Structured exhaustion evidence (finding 4): the diary names every
+        // ranked candidate, in order, with why each could not serve.
+        assert.equal(third.chainExhaustion?.stage, "impl-high-review");
+        assert.deepEqual(
+          third.chainExhaustion?.candidates.map((candidate) => candidate.storedModelId),
+          ["copilot:gpt-5", "claude-cli:sonnet"]
+        );
+        for (const candidate of third.chainExhaustion?.candidates ?? []) {
+          assert.match(candidate.reason, /reserved and invoked/);
+        }
+      }
     } finally {
       stub.restore();
     }
@@ -219,11 +235,27 @@ void describe("openV1RunnerSelection", () => {
       for (const mode of ["preflight", "edit"] as const) {
         const session = openSession();
         const selection = openSelection({ session, mode, modelId: "claude-cli:sonnet" });
-        assert.deepEqual(
-          selection.reserveNext(session.allocateAttempt()),
-          { kind: "noneRemaining", code: "providerModeUnavailable" },
+        const result = selection.reserveNext(session.allocateAttempt());
+        assert.equal(
+          result.kind,
+          "noneRemaining",
           `a CLI-only configuration must stay unavailable for "${mode}" (§7.5)`
         );
+        if (result.kind === "noneRemaining") {
+          assert.equal(result.code, "providerModeUnavailable");
+          // The evidence names the mode-incapable candidate and why it was
+          // skipped, so the stage owner can write an enriched run record.
+          assert.equal(result.chainExhaustion?.stage, "impl-high-review");
+          assert.equal(result.chainExhaustion?.candidates.length, 1);
+          assert.equal(
+            result.chainExhaustion?.candidates[0]?.storedModelId,
+            "claude-cli:sonnet"
+          );
+          assert.match(
+            result.chainExhaustion?.candidates[0]?.reason ?? "",
+            new RegExp(`cannot satisfy the requested "${mode}" mode`)
+          );
+        }
       }
     } finally {
       stub.restore();
@@ -278,10 +310,121 @@ void describe("openV1RunnerSelection", () => {
       }
       // "pause-and-resume" opts out of automatic switch-over, so the backup
       // list is empty — mode-capable candidates existed but are used up.
-      assert.deepEqual(selection.reserveNext(session.allocateAttempt()), {
-        kind: "noneRemaining",
-        code: "candidatesExhausted",
+      const exhausted = selection.reserveNext(session.allocateAttempt());
+      assert.equal(exhausted.kind, "noneRemaining");
+      if (exhausted.kind === "noneRemaining") {
+        assert.equal(exhausted.code, "candidatesExhausted");
+        assert.deepEqual(
+          exhausted.chainExhaustion?.candidates.map((candidate) => candidate.storedModelId),
+          ["copilot:gpt-5"]
+        );
+      }
+    } finally {
+      stub.restore();
+    }
+  });
+});
+
+/**
+ * Stage-chain availability pre-flight (finding 4, second fix): the chain is
+ * known ahead of time, so an unavailable-provider stall must be reported
+ * BEFORE a round burns — but only when every candidate fails a safely
+ * probeable check. Unknown (timeout) never short-circuits dispatch.
+ */
+void describe("preflightStageChainAvailabilityV1", () => {
+  const PREFLIGHT_SETTINGS = {
+    "impl-high-review": {
+      primary: "claude-cli:sonnet",
+      backups: ["gemini-cli:default", "codex-cli:gpt-5"],
+      strategy: "switch-to-backup",
+    },
+  };
+
+  void it("all candidates failing a probeable check reports exhaustion naming each candidate's reason", async () => {
+    const stub = installModelSettings(PREFLIGHT_SETTINGS);
+    try {
+      const probed: string[] = [];
+      const result = await preflightStageChainAvailabilityV1("impl-high-review", {
+        modelId: "claude-cli:sonnet",
+        probeCandidate: (storedModelId) => {
+          probed.push(storedModelId);
+          return Promise.resolve({
+            available: false,
+            reason: `${storedModelId} is not installed`,
+          });
+        },
       });
+      assert.equal(result.kind, "exhausted");
+      if (result.kind === "exhausted") {
+        assert.equal(result.exhaustion.stage, "impl-high-review");
+        assert.deepEqual(
+          result.exhaustion.candidates.map((candidate) => candidate.storedModelId),
+          ["claude-cli:sonnet", "gemini-cli:default", "codex-cli:gpt-5"],
+          "the probed chain must be the same ranked chain selection would walk"
+        );
+        for (const candidate of result.exhaustion.candidates) {
+          assert.match(candidate.reason, /is not installed/);
+        }
+      }
+      assert.deepEqual(probed, [
+        "claude-cli:sonnet",
+        "gemini-cli:default",
+        "codex-cli:gpt-5",
+      ]);
+    } finally {
+      stub.restore();
+    }
+  });
+
+  void it("one available candidate means dispatchable — no short-circuit", async () => {
+    const stub = installModelSettings(PREFLIGHT_SETTINGS);
+    try {
+      const result = await preflightStageChainAvailabilityV1("impl-high-review", {
+        modelId: "claude-cli:sonnet",
+        probeCandidate: (storedModelId) =>
+          Promise.resolve(
+            storedModelId === "gemini-cli:default"
+              ? { available: true }
+              : { available: false, reason: "unavailable" }
+          ),
+      });
+      assert.deepEqual(result, { kind: "dispatchable" });
+    } finally {
+      stub.restore();
+    }
+  });
+
+  void it("a probe timeout is unknown — fails open to dispatch instead of short-circuiting", async () => {
+    const stub = installModelSettings(PREFLIGHT_SETTINGS);
+    try {
+      const result = await preflightStageChainAvailabilityV1("impl-high-review", {
+        modelId: "claude-cli:sonnet",
+        probeTimeoutMs: 25,
+        // Never resolves: the probe budget elapses and the candidate must be
+        // treated as "unknown — do not short-circuit" (fail open).
+        probeCandidate: () => new Promise(() => undefined),
+      });
+      assert.deepEqual(result, { kind: "dispatchable" });
+    } finally {
+      stub.restore();
+    }
+  });
+
+  void it("a probe that throws is a real failure, not unknown — counted toward exhaustion", async () => {
+    const stub = installModelSettings(PREFLIGHT_SETTINGS);
+    try {
+      const result = await preflightStageChainAvailabilityV1("impl-high-review", {
+        modelId: "claude-cli:sonnet",
+        probeCandidate: (storedModelId) =>
+          Promise.reject(new Error(`${storedModelId} probe exploded`)),
+      });
+      assert.equal(result.kind, "exhausted");
+      if (result.kind === "exhausted") {
+        assert.match(
+          result.exhaustion.candidates[0]?.reason ?? "",
+          /probe exploded/
+        );
+      }
     } finally {
       stub.restore();
     }

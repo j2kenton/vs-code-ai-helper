@@ -24,6 +24,7 @@ import {
   findLastHeadingV1,
   headingsV1,
   sectionHasContentV1,
+  walkLinesV1,
 } from "./markdownStructure";
 
 export interface ResolvedImplementationArtifact {
@@ -128,6 +129,90 @@ function echoesPlanChecklist(response: string, planChecklist: string): boolean {
   return false;
 }
 
+/**
+ * Section presence over one completed response, computed once and shared by
+ * both consumers of the summary contract: the shape gate
+ * (`describeImplementationSummaryShapeIssue`) and the incomplete-round
+ * detector (`describeIncompleteImplementationRoundV1`). Factored so the two
+ * can never disagree about what counts as "has a `## Files Changed`" — the
+ * scoping and fenced-block rules below have each been fixed several times,
+ * and a second re-derivation would inherit none of those fixes.
+ */
+export interface ImplementationSummarySectionPresenceV1 {
+  /** The run-owned region every section lookup was performed over. */
+  readonly scope: string;
+  readonly filesChangedPresent: boolean;
+  readonly filesChangedHasContent: boolean;
+  readonly verificationPresent: boolean;
+  readonly verificationHasContent: boolean;
+  /**
+   * True when the response echoes the expected plan checklist (or declares
+   * `NO_CHECKLIST_CHANGE_MARKER_V1`). Vacuously true when no checklist echo
+   * was expected — callers that care about the distinction must also check
+   * `expectations.planChecklist`.
+   */
+  readonly checklistEchoPresent: boolean;
+}
+
+/**
+ * Assess `trimmed` (a completed response, already trimmed and non-empty)
+ * against the summary contract's section requirements.
+ *
+ * headingsV1 ignores anything inside a fenced block, so quoted examples are
+ * not this response's own sections — and comparing parsed TITLES rejects
+ * prose that merely names them ("I could not produce ## Files Changed yet"),
+ * which is exactly the shape of the status message the gate exists to catch.
+ * When an echo is expected, the response's OWN sections are what must be
+ * present — and a checklist may itself contain a phase named `## Files
+ * Changed`. Judging the whole response let a reply consisting of nothing but
+ * the echoed plan satisfy every heading lookup, promoting exactly the
+ * no-summary case the gate exists to reject. Sections are therefore looked
+ * up in the run-owned region, which by construction starts at the response's
+ * own Files Changed.
+ * No fallback to the whole response when an echo is expected. `own` is empty
+ * precisely when the response has no summary of its own — either no
+ * `## Files Changed` at all, or one that is a plan phase rather than a file
+ * list — and falling back put the echoed plan's sections back in view, so an
+ * echo-only response satisfied every heading lookup. Empty scope yields no
+ * headings, which reports the missing sections: the correct answer.
+ */
+export function assessImplementationSummarySectionsV1(
+  trimmed: string,
+  expectations: ImplementationSummaryExpectationsV1 = {}
+): ImplementationSummarySectionPresenceV1 {
+  const scope =
+    expectations.planChecklist !== undefined
+      ? splitSummaryAtEchoV1(trimmed).own
+      : trimmed;
+
+  const all = headingsV1(scope);
+  const filesChanged = findLastHeadingV1(all, "Files Changed");
+  const verification = findLastHeadingV1(all, "Verification");
+
+  const checklistEchoPresent =
+    expectations.planChecklist === undefined ||
+    // Only the echo region counts. Searching the whole response let a
+    // `## Verification` box whose text happened to match a plan item satisfy
+    // the echo requirement with no echo present at all.
+    echoesPlanChecklist(splitSummaryAtEchoV1(trimmed).echo, expectations.planChecklist) ||
+    // A round that fixed a review blocker without ticking any checkbox has
+    // nothing to echo — the marker is its explicit, reasoned statement of
+    // that, and is accepted in place of the echo rather than rejected as a
+    // missing one. See NO_CHECKLIST_CHANGE_MARKER_V1's doc comment.
+    declaresNoChecklistChangeV1(trimmed);
+
+  return {
+    scope,
+    filesChangedPresent: filesChanged !== -1,
+    filesChangedHasContent:
+      filesChanged !== -1 && sectionHasContentV1(scope, all, filesChanged),
+    verificationPresent: verification !== -1,
+    verificationHasContent:
+      verification !== -1 && sectionHasContentV1(scope, all, verification),
+    checklistEchoPresent,
+  };
+}
+
 export function describeImplementationSummaryShapeIssue(
   content: string,
   expectations: ImplementationSummaryExpectationsV1 = {}
@@ -137,27 +222,7 @@ export function describeImplementationSummaryShapeIssue(
     return "the provider returned no final summary text";
   }
 
-  // headingsV1 ignores anything inside a fenced block, so quoted examples are
-  // not this response's own sections — and comparing parsed TITLES rejects
-  // prose that merely names them ("I could not produce ## Files Changed yet"),
-  // which is exactly the shape of the status message this gate exists to catch.
-  // When an echo is expected, the response's OWN sections are what must be
-  // present — and a checklist may itself contain a phase named `## Files
-  // Changed`. Judging the whole response let a reply consisting of nothing but
-  // the echoed plan satisfy every heading lookup, promoting exactly the
-  // no-summary case this gate exists to reject. Sections are therefore looked
-  // up in the run-owned region, which by construction starts at the response's
-  // own Files Changed.
-  // No fallback to the whole response when an echo is expected. `own` is empty
-  // precisely when the response has no summary of its own — either no
-  // `## Files Changed` at all, or one that is a plan phase rather than a file
-  // list — and falling back put the echoed plan's sections back in view, so an
-  // echo-only response satisfied every heading lookup. Empty scope yields no
-  // headings, which reports the missing sections: the correct answer.
-  const scope =
-    expectations.planChecklist !== undefined
-      ? splitSummaryAtEchoV1(trimmed).own
-      : trimmed;
+  const sections = assessImplementationSummarySectionsV1(trimmed, expectations);
 
   // Naming the real cause when the region is empty but the heading is plainly
   // there. `filesChangedIsSummaryBoundary` rejects a `## Files Changed` whose
@@ -168,7 +233,7 @@ export function describeImplementationSummaryShapeIssue(
   // format run-implementation.md asks for, but an easy habit — gets told its
   // `## Files Changed` is missing while it is right there on screen. That
   // reads as a broken gate rather than a fixable response.
-  if (expectations.planChecklist !== undefined && scope.trim().length === 0) {
+  if (expectations.planChecklist !== undefined && sections.scope.trim().length === 0) {
     if (findLastHeadingV1(headingsV1(trimmed), "Files Changed") !== -1) {
       return (
         "the final response has a `## Files Changed` section, but its entries are " +
@@ -178,28 +243,18 @@ export function describeImplementationSummaryShapeIssue(
     }
   }
 
-  const all = headingsV1(scope);
-
   const missing: string[] = [];
-  const filesChanged = findLastHeadingV1(all, "Files Changed");
-  const verification = findLastHeadingV1(all, "Verification");
-  if (filesChanged === -1) {
+  if (!sections.filesChangedPresent) {
     missing.push("`## Files Changed`");
-  } else if (
-    expectations.roundChangedFiles &&
-    !sectionHasContentV1(scope, all, filesChanged)
-  ) {
+  } else if (expectations.roundChangedFiles && !sections.filesChangedHasContent) {
     // The round edited the tree, so an empty Files Changed is not a summary of
     // it — this is the "reports on work instead of reporting work" shape,
     // caught structurally rather than by reading the prose.
     missing.push("any files under `## Files Changed`, though this round changed files");
   }
-  if (verification === -1) {
+  if (!sections.verificationPresent) {
     missing.push("`## Verification`");
-  } else if (
-    expectations.roundChangedFiles &&
-    !sectionHasContentV1(scope, all, verification)
-  ) {
+  } else if (expectations.roundChangedFiles && !sections.verificationHasContent) {
     // Same rule as Files Changed, and needed for the same reason: a response
     // truncated immediately after its own `## Verification` heading otherwise
     // satisfied every presence check and was promoted for review.
@@ -210,24 +265,257 @@ export function describeImplementationSummaryShapeIssue(
   // follow `## Files Changed`. Scoping to the run-owned region subsumes it —
   // the echo is no longer in view at all — so keeping it would be a guard for
   // a condition that can no longer arise.
-  if (
-    expectations.planChecklist !== undefined &&
-    // Only the echo region counts. Searching the whole response let a
-    // `## Verification` box whose text happened to match a plan item satisfy
-    // the echo requirement with no echo present at all.
-    !echoesPlanChecklist(splitSummaryAtEchoV1(trimmed).echo, expectations.planChecklist) &&
-    // A round that fixed a review blocker without ticking any checkbox has
-    // nothing to echo — the marker is its explicit, reasoned statement of
-    // that, and is accepted in place of the echo rather than rejected as a
-    // missing one. See NO_CHECKLIST_CHANGE_MARKER_V1's doc comment.
-    !declaresNoChecklistChangeV1(trimmed)
-  ) {
+  if (!sections.checklistEchoPresent) {
     missing.push("the plan's implementation checklist, echoed with updated checkbox state");
   }
   if (missing.length === 0) {
     return undefined;
   }
   return `the final response is missing ${missing.join(" and ")}`;
+}
+
+/** How a completed-status round was detected as not actually complete. */
+export type IncompleteImplementationRoundKindV1 = "roundDeferred" | "roundIncomplete";
+
+/** One detected incomplete round: its classification and a displayable reason. */
+export interface IncompleteImplementationRoundV1 {
+  readonly kind: IncompleteImplementationRoundKindV1;
+  readonly reason: string;
+}
+
+/**
+ * Phrases a provider uses when it ends its turn intending to resume later —
+ * "Waiting for the background test run to finish (scheduled wakeup in ~5
+ * min). I'll pick back up automatically when it completes" was the observed
+ * case. Nothing in the workflow can deliver that follow-up turn, so a
+ * response carrying one of these is a deferral, not a completion.
+ */
+const DEFERRAL_PHRASES_V1: readonly RegExp[] = [
+  /\bwake[- ]?ups?\b/i,
+  /\bpick (?:back )?up\b/i,
+  /\breport (?:back|the final summary)\b/i,
+  /\bcheck back\b/i,
+  /\bI['’]ll (?:resume|continue|follow up|report)\b/i,
+  /\bwhen (?:it|they|the .{0,60}?) (?:completes?|finish(?:es)?)\b/i,
+  /\bonce (?:it|they|the .{0,60}?) (?:completes?|finish(?:es)?)\b/i,
+  /\bstill running in the background\b/i,
+  /\bwaiting (?:for|on) the background\b/i,
+];
+
+/**
+ * Detect a completed-status implementation round that did not actually finish
+ * its turn: the response's own-scope summary omits ALL of `## Files Changed`,
+ * `## Verification`, and (when a checklist echo is expected) the echo.
+ *
+ * This is the DETECTION half of the deferred-round failure (2026-08-13,
+ * round 014 of "more workflow bugs"): a provider ended its turn promising to
+ * "pick back up when the wakeup fires", the workflow recorded the round
+ * `Status: completed`, banked its ten changed files into `implReviewFiles`,
+ * replaced the previous good summary with the unusable placeholder, and
+ * staled the review — all while the only true statement about the round was
+ * that it never finished. A prompt cannot guarantee a model never defers, so
+ * the workflow has to notice when one does: a detected round is recorded
+ * incomplete, its delta is quarantined (`pendingImplReviewFiles`), and a
+ * continuation round is scheduled — never banked and then blamed on a
+ * malformed summary.
+ *
+ * Deliberately NARROWER than the shape gate: a response that carries any one
+ * of the required sections made a (possibly deficient) report and stays on
+ * the existing rejected-summary path. Only a response with none of them is
+ * treated as a round that never reported at all. `roundDeferred` (future-work
+ * phrasing present) and `roundIncomplete` (cut short for any other reason)
+ * follow the identical recovery path — the split exists so run logs and
+ * outcome codes name what actually happened.
+ *
+ * An EMPTY response is the limiting case of this contract, not an exception
+ * to it: it omits every required section, so it is classified
+ * `roundIncomplete` here rather than left to the shape gate's
+ * "no final summary text" rejection. Routing it to the gate instead let a
+ * completed round whose final text was cut short entirely fall back onto the
+ * rejected-summary path — which banks its changed files and replaces
+ * impl-summary.md with the unusable placeholder — exactly the poisoning this
+ * detector exists to prevent.
+ */
+export function describeIncompleteImplementationRoundV1(
+  content: string,
+  expectations: ImplementationSummaryExpectationsV1 = {}
+): IncompleteImplementationRoundV1 | undefined {
+  const trimmed = content.trim();
+  if (!trimmed) {
+    return {
+      kind: "roundIncomplete",
+      reason:
+        "the provider returned no final response text at all — no `## Files Changed`, " +
+        "no `## Verification`, and no checklist echo",
+    };
+  }
+  const sections = assessImplementationSummarySectionsV1(trimmed, expectations);
+  if (sections.filesChangedPresent || sections.verificationPresent) {
+    return undefined;
+  }
+  // When an echo is expected and present, the round DID report durable state
+  // (the merge can tick boxes from it) — that is a deficient summary, not an
+  // unreported round. When no echo is expected, `checklistEchoPresent` is
+  // vacuously true and must not veto detection.
+  if (expectations.planChecklist !== undefined && sections.checklistEchoPresent) {
+    return undefined;
+  }
+  const deferral = DEFERRAL_PHRASES_V1.find((phrase) => phrase.test(trimmed));
+  if (deferral) {
+    const match = deferral.exec(trimmed)?.[0] ?? "";
+    return {
+      kind: "roundDeferred",
+      reason:
+        "the provider ended its turn deferring to a follow-up turn the workflow cannot deliver " +
+        `("${match}"), with no \`## Files Changed\`, no \`## Verification\`, and no checklist echo`,
+    };
+  }
+  return {
+    kind: "roundIncomplete",
+    reason:
+      "the provider's final response was cut short — no `## Files Changed`, no `## Verification`, " +
+      "and no checklist echo",
+  };
+}
+
+/**
+ * Comparison key for a workspace-relative path reported by a model against
+ * one detected by the git snapshot: separators normalized to `/`, a leading
+ * `./` dropped, case folded (the snapshot and the report name the same file
+ * on the case-insensitive filesystems this extension predominantly runs on,
+ * and a false MISMATCH here silently drops a genuinely-changed file from
+ * review scope — the worse error).
+ */
+function reportedPathKeyV1(path: string): string {
+  return path.replace(/\\/g, "/").replace(/^\.\//, "").toLowerCase();
+}
+
+/**
+ * The file paths a completed response reports under its own `## Files
+ * Changed` section, or `undefined` when the response carries no such section
+ * to parse (including an empty/whitespace-only response).
+ *
+ * Scoped exactly the way the shape gate scopes its section lookups
+ * (`assessImplementationSummarySectionsV1`): when a checklist echo is
+ * expected, only the run-owned region after the echo is searched, so a plan
+ * phase named "Files Changed" inside the echo is never read as the round's
+ * file list. Entries are bullets in the mandated `- path — what changed`
+ * shape; the path is the leading backticked token when present, otherwise
+ * the first whitespace-delimited token. Checkbox bullets are skipped — those
+ * are plan items, not file entries.
+ *
+ * This is the round's SELF-REPORT, parsed so banking can attribute the git
+ * snapshot's delta to the round (finding 2): the snapshot spans wall-clock
+ * time, not authorship, so edits made by hand in the same workspace while a
+ * round runs land in the diff. Round 015 of "more workflow bugs"
+ * (2026-08-13) reported exactly 2 changed files while the workflow banked 8
+ * — the other 6 were the user's own concurrent Claude Code session.
+ */
+export function parseReportedFilesChangedV1(
+  content: string,
+  expectations: ImplementationSummaryExpectationsV1 = {}
+): string[] | undefined {
+  const trimmed = content.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  const scope =
+    expectations.planChecklist !== undefined
+      ? splitSummaryAtEchoV1(trimmed).own
+      : trimmed;
+  const all = headingsV1(scope);
+  const index = findLastHeadingV1(all, "Files Changed");
+  if (index === -1) {
+    return undefined;
+  }
+  const heading = all[index]!;
+  const lines = walkLinesV1(scope);
+  // Same boundary rule as sectionHasContentV1: the section runs to the next
+  // heading of the same or higher level, so grouping subheadings inside
+  // `## Files Changed` keep their bullets in scope.
+  let next = lines.length;
+  for (let h = index + 1; h < all.length; h++) {
+    const candidate = all[h];
+    if (candidate && candidate.level <= heading.level) {
+      next = candidate.line;
+      break;
+    }
+  }
+  const files: string[] = [];
+  for (let i = heading.line + 1; i < next; i++) {
+    const line = lines[i];
+    if (!line || line.fenced) {
+      continue;
+    }
+    const bullet = /^[ \t]*[-*+][ \t]+(.*)$/.exec(line.text);
+    if (!bullet) {
+      continue;
+    }
+    const entry = (bullet[1] ?? "").trim();
+    // Checkbox bullets are checklist items, never file entries; a
+    // parenthesized entry is prose ("(none)", "(no changes)"), not a path.
+    if (/^\[[ xX]\]/.test(entry) || entry.startsWith("(")) {
+      continue;
+    }
+    const backticked = /^`([^`]+)`/.exec(entry);
+    const raw = backticked
+      ? backticked[1]!
+      : (/^\S+/.exec(entry)?.[0] ?? "").replace(/[,:;]+$/, "");
+    const candidatePath = raw.trim();
+    if (candidatePath.length > 0) {
+      files.push(candidatePath.replace(/\\/g, "/").replace(/^\.\//, ""));
+    }
+  }
+  return files;
+}
+
+/** Result of {@link attributeImplementationRoundFilesV1}. */
+export interface AttributedRoundFilesV1 {
+  /** Snapshot-detected paths the round's own report also names — banked. */
+  readonly attributed: string[];
+  /**
+   * Snapshot-detected paths the round's report does NOT name — excluded from
+   * banking and surfaced in the run log as unattributed workspace changes.
+   */
+  readonly unattributed: string[];
+}
+
+/**
+ * Split a round's git-snapshot delta into the files attributable to the round
+ * (also present in its self-reported `## Files Changed` list) and the files
+ * that changed in the workspace during the round without the round claiming
+ * them (finding 2: concurrent hand edits in the same workspace).
+ *
+ * `reportedFiles === undefined` means the model-authored response carried no
+ * parseable `## Files Changed` section — and NOTHING is attributed: the
+ * snapshot delta spans wall-clock time, not authorship, so with no
+ * self-report to intersect against there is no evidence tying any snapshot
+ * path to the round, and banking the whole delta would re-open the very leak
+ * this function exists to close (a malformed-but-not-incomplete response
+ * would adopt concurrent hand edits into review scope). Fail closed: every
+ * snapshot path is surfaced as unattributed in the run log instead. A
+ * runner-synthesized summary (whose `filesChanged` is already authoritative
+ * tool-call receipts, copilotImplementationRunner) must NOT be routed
+ * through this function — its snapshot is banked as-is at the call site.
+ * Reported-only files are dropped silently: a path the model names but the
+ * snapshot never saw change was not actually changed. A file edited by hand
+ * during a pause AND by the round is legitimately in both sets, so the
+ * intersection keeps it.
+ */
+export function attributeImplementationRoundFilesV1(
+  snapshotFiles: readonly string[],
+  reportedFiles: readonly string[] | undefined
+): AttributedRoundFilesV1 {
+  if (reportedFiles === undefined) {
+    return { attributed: [], unattributed: [...snapshotFiles] };
+  }
+  const reported = new Set(reportedFiles.map(reportedPathKeyV1));
+  const attributed: string[] = [];
+  const unattributed: string[] = [];
+  for (const file of snapshotFiles) {
+    (reported.has(reportedPathKeyV1(file)) ? attributed : unattributed).push(file);
+  }
+  return { attributed, unattributed };
 }
 
 /**

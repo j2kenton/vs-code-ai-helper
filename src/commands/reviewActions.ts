@@ -19,6 +19,7 @@ import {
   IMPLEMENTATION_SUMMARY_FILENAME,
   isPlanReviewStage,
   isReviewStage,
+  MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1,
   PLAN_FILENAME,
   PLAN_REVIEW_STAGES,
   REVIEW_STAGES,
@@ -33,8 +34,14 @@ import {
   appendReviewRejection,
   appendReviewScoreHistory,
   clearImplementationTypeCheckFailure,
+  clearReviewInvalidatedByRound,
+  promotePendingImplReviewFiles,
+  quarantinePendingImplReviewFiles,
   recordImplementationTypeCheckFailure,
+  recordReviewInvalidatedByRound,
+  setIncompleteRoundContinuations,
   setZeroChangeImplRounds,
+  pauseTaskWithReason,
   updateImplReviewFiles,
   updateLintPayload,
   updateTaskStatus,
@@ -72,7 +79,11 @@ import {
   describeTaskActionFailureV1,
   describeTaskActionOutcomeForLogV1,
 } from "../utils/taskActionOutcomeTextV1";
-import { checkImplementationAvailabilityForModel, resolveEffectiveProvider } from "../runners/runnerRegistry";
+import {
+  checkImplementationAvailabilityForModel,
+  preflightStageChainAvailabilityV1,
+  resolveEffectiveProvider,
+} from "../runners/runnerRegistry";
 import {
   checkEditActionAvailabilityV1,
   checkEditActionHostGateV1,
@@ -86,9 +97,13 @@ import {
   resolveModelForStage,
 } from "../utils/modelSelection";
 import {
+  attributeImplementationRoundFilesV1,
   buildSyntheticImplementationSummaryV1,
   buildUnusableImplementationSummaryV1,
   describeImplementationSummaryShapeIssue,
+  parseReportedFilesChangedV1,
+  describeIncompleteImplementationRoundV1,
+  IncompleteImplementationRoundV1,
   getCanonicalImplementationUri,
   getImplementationSummaryUri,
   getLegacyImplementationUri,
@@ -125,7 +140,7 @@ import { GENERATE_IMPLEMENTATION_ACTION_KEY_V1 } from "../actions/rows/generateI
 import { REVIEW_ACTION_KEY_V1, ReviewActionInputV1 } from "../actions/rows/reviewRowV1";
 import { APPLY_REVIEW_ACTION_KEY_V1, ApplyReviewActionInputV1 } from "../actions/rows/applyReviewRowV1";
 import { NEXT_STAGE_ACTION_KEY_V1 } from "../actions/rows/nextStageRowV1";
-import { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
+import { ProviderChainExhaustionV1, TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
 import { ChatInteractionRefV1, ChatInteractionResumeResultV1, ChatViewProvider } from "../views/chatView";
 import { TaskInventory } from "../state/taskInventory";
 import {
@@ -1127,6 +1142,43 @@ export async function selectReconciliationInstruction(
 }
 
 /**
+ * Qualifier appended to every "N of M plan steps" count surfaced to the user
+ * or a reviewer while the task's `checklistProgressUnreliable` latch is set
+ * (finding 3): a round landed changes the plan's checklist could not record,
+ * so any step count derived from — or reported alongside — that checklist
+ * understates what is done. Presenting the number unqualified is what let
+ * rounds keep routing on a count the workflow had already marked as
+ * untrustworthy. Wording aligned with the task tree tooltip
+ * (taskTreeProvider.ts); only `reconcilePlanChecklist` clears the latch.
+ *
+ * @internal exported for testing
+ */
+export const UNVERIFIED_CHECKLIST_COUNT_QUALIFIER_V1 =
+  " — count unverified: the plan checklist is not a complete record and needs reconciliation " +
+  "(run Ensemble: Mark Plan Checklist Reconciled once the missed items are ticked)";
+
+/**
+ * The "high score but plan incomplete" notification, factored out so the
+ * unverified-count qualifier's presence is testable without driving the whole
+ * review flow.
+ *
+ * @internal exported for testing
+ */
+export function buildStayingOnStageNoticeV1(
+  score: number | null,
+  progress: { complete: number; total: number },
+  excludedSuffix: string,
+  countUnverified: boolean
+): string {
+  return (
+    `Review scored ${score}/10 with no blocking issues, but ${progress.complete} of ${progress.total} ` +
+    `plan steps are implemented${excludedSuffix}` +
+    (countUnverified ? UNVERIFIED_CHECKLIST_COUNT_QUALIFIER_V1 : "") +
+    ". Staying on this stage to build the rest."
+  );
+}
+
+/**
  * Build the `{{siblingReviewDisagreement}}` block for the Publish review
  * prompt (2k): when the impl-high and impl-low reviews of the exact commit
  * Publish is about to assess disagree on whether the plan is actually
@@ -1161,13 +1213,21 @@ export async function buildSiblingReviewDisagreementVariable(
     return "";
   }
   const { implHighProgress, implLowCompletionBlockers } = disagreement;
+  // Read only once a disagreement is actually going to render: while the
+  // checklist latch is set, the high review's own "N of M ordered steps"
+  // claim is derived from a record known to be incomplete, and must not be
+  // handed to the Publish reviewer as an authoritative count.
+  const advisory = await readTaskProgressAdvisoryV1(folderUri);
+  const countQualifier = advisory?.checklistProgressUnreliable
+    ? UNVERIFIED_CHECKLIST_COUNT_QUALIFIER_V1
+    : "";
   const blockerLines = implLowCompletionBlockers
     .map((b) => `- ${b.description}`)
     .join("\n");
   return (
     "## Sibling Review Disagreement (mechanical check)\n\n" +
     `The high-level implementation review reported the plan fully complete ` +
-    `(${implHighProgress.complete} of ${implHighProgress.total} ordered steps) for this exact commit, ` +
+    `(${implHighProgress.complete} of ${implHighProgress.total} ordered steps${countQualifier}) for this exact commit, ` +
     "but the low-level implementation review reported the following completion blocker(s) for the SAME commit:\n\n" +
     `${blockerLines}\n\n` +
     "These two reviews assessed the identical commit and disagree on a factual, checkable claim — whether the " +
@@ -1581,9 +1641,19 @@ export async function handleReviewRoutingOutcome(options: {
       taskFixableCount: blockers.filter((b) => b.resolver === "task-fixable").length,
       blockers: blockerIdentities(blockers),
     };
-    const updated = await patchTaskProgressStrictV1(folderUri, (current) =>
-      appendReviewScoreHistory(current, historyEntry)
-    );
+    const updated = await patchTaskProgressStrictV1(folderUri, (current) => {
+      const withHistory = appendReviewScoreHistory(current, historyEntry);
+      // A real (non-degenerate) review round just published for this stage —
+      // that is replacement review-tracking state, so an incomplete-round
+      // invalidation marker for the same stage is now redundant and may be
+      // cleared. Only while nothing is still quarantined: a review that ran
+      // while `pendingImplReviewFiles` exist has not seen the unreported
+      // round's edits, so the marker must survive it.
+      return withHistory.reviewInvalidatedByRound?.stage === targetStage &&
+        (withHistory.pendingImplReviewFiles?.length ?? 0) === 0
+        ? clearReviewInvalidatedByRound(withHistory)
+        : withHistory;
+    });
     if (!updated) {
       return { escalated: false };
     }
@@ -1729,7 +1799,7 @@ export async function handleReviewRoutingOutcome(options: {
 /** Context {@link handleReviewOutcomeV1} needs to route a `review.v1` outcome
  * (from either the initial run or an explicit Chat Resume) through stage
  * advancement, score-based auto-advance/escalation, and follow-up dispatch. */
-interface ReviewOutcomeContextV1 {
+export interface ReviewOutcomeContextV1 {
   extensionUri: vscode.Uri;
   folderUri: vscode.Uri;
   workspaceUri: vscode.Uri;
@@ -1782,11 +1852,38 @@ async function handleReviewOutcomeV1(
  * §2.2). A logging failure must never fail an otherwise fine review, so
  * everything here is swallowed.
  */
-async function writeReviewRunLogV1(
+/** @internal exported for testing (the chain-exhaustion enrichment) */
+export async function writeReviewRunLogV1(
   outcome: TaskActionOutcomeV1,
   ctx: ReviewOutcomeContextV1
 ): Promise<void> {
   try {
+    // A stage whose whole provider chain was exhausted gets an ENRICHED run
+    // record naming the chain and per-candidate reasons — never the bare
+    // 60-byte `Status: unavailable (providerModeUnavailable)` that made
+    // round 018 of "more workflow bugs" (2026-08-13) indistinguishable from
+    // a round still thinking. The evidence is the registry's own closed
+    // diagnostic strings (stage, ranked stored ids, skip/failure reasons),
+    // so the §2.2 no-provider-text rule still holds; the per-candidate lines
+    // use the same provider-attribution format successful rounds record.
+    const exhaustion =
+      outcome.kind === "unavailable" ? outcome.chainExhaustion : undefined;
+    const exhaustionSection = exhaustion
+      ? `\n## Provider chain exhausted\n\n` +
+        `No provider could be acquired for ${exhaustion.stage ?? ctx.targetStage}. ` +
+        `The resolved chain, in ranked order:\n\n` +
+        (exhaustion.candidates.length > 0
+          ? exhaustion.candidates
+              .map(
+                (candidate) =>
+                  `- ${candidate.providerLabel} (${
+                    attributionModelLabel(candidate.storedModelId) ?? candidate.storedModelId
+                  }) — ${candidate.reason}`
+              )
+              .join("\n")
+          : "_no candidates are configured for this stage_") +
+        "\n\nThe task has been paused with this reason; fix provider availability or the stage's model configuration, then resume.\n"
+      : "";
     const logUri = await writeRunLog(
       ctx.folderUri,
       "review-v1",
@@ -1794,7 +1891,7 @@ async function writeReviewRunLogV1(
       `# Review Run\n\n${describeTaskActionOutcomeForLogV1(
         outcome,
         STAGE_ARTIFACT_FILENAMES[ctx.targetStage]
-      )}\n`
+      )}\n${exhaustionSection}`
     );
     taskOperations.setResultTargetUriForTask(ctx.folderUri.fsPath, logUri);
   } catch {
@@ -1955,9 +2052,16 @@ async function routeReviewOutcomeV1(
             planChecklistProgress && planChecklistProgress.excluded > 0
               ? ` (${planChecklistProgress.excluded} additional step(s) marked excluded from this count)`
               : "";
+          // While the checklist latch is set, readPlanChecklistProgressV1
+          // above returned undefined (the completeness gate is stood down),
+          // so the count below is the review's own self-reported marker —
+          // qualified as unverified rather than presented as a live measure
+          // of remaining work (finding 3).
+          const checklistCountUnverified =
+            !isPlanReviewStage(targetStage) &&
+            (await readTaskProgressAdvisoryV1(folderUri))?.checklistProgressUnreliable === true;
           NotificationRouter.showInformation(
-            `Review scored ${score}/10 with no blocking issues, but ${progress.complete} of ${progress.total} plan steps are implemented${excludedSuffix}. ` +
-              "Staying on this stage to build the rest."
+            buildStayingOnStageNoticeV1(score, progress, excludedSuffix, checklistCountUnverified)
           );
         }
         if (!escalated && isAutoAdvanceEnabled() && meetsThreshold) {
@@ -2239,6 +2343,21 @@ async function routeReviewOutcomeV1(
         });
       }
     }
+  } else if (outcome.kind === "unavailable" && outcome.chainExhaustion !== undefined) {
+    // The stage's ENTIRE provider chain was exhausted (finding 4): a hard
+    // failure, never silence. The stage owner — this handler, which
+    // dispatched the round — marks the task paused with a reason naming the
+    // exhausted chain and bumps updatedAt, so the task stops presenting as
+    // "active and busy" while nothing can possibly run. The enriched run
+    // record (per-candidate reasons) is written by writeReviewRunLogV1 in
+    // the caller's finally block.
+    //
+    // Checked BEFORE the Publish special case below: every review stage —
+    // Publish included — pauses on an exhausted chain. The generic Publish
+    // branch used to capture every non-completed outcome first, so a
+    // Publish-stage exhaustion produced only the Publish Anyway nudge while
+    // the task stayed "active" with nothing able to run.
+    await pauseTaskForExhaustedChainV1(folderUri, targetStage, outcome.chainExhaustion);
   } else if (targetStage === "publish") {
     // The Publish review failed, was cancelled, or was stalled. Give the
     // user a one-click path to publish anyway instead of only a dead-end
@@ -2282,6 +2401,40 @@ async function routeReviewOutcomeV1(
         "The run log under runs/ records this settlement."
     );
   }
+}
+
+/**
+ * Pause a task whose stage cannot acquire ANY provider (finding 4): the
+ * durable state must say WHY nothing is running — `status: "paused"` plus a
+ * `pausedReason` naming the stage and the exhausted chain, with `updatedAt`
+ * bumped — instead of the task sitting "active" while its only record is a
+ * run file nobody is watching. Shared by the runtime exhaustion path
+ * (routeReviewOutcomeV1) and the dispatch-site pre-flight, so both produce
+ * identical durable state.
+ *
+ * @internal exported for testing
+ */
+export async function pauseTaskForExhaustedChainV1(
+  folderUri: vscode.Uri,
+  stage: TaskStage,
+  exhaustion: ProviderChainExhaustionV1
+): Promise<void> {
+  const stageName = exhaustion.stage ?? stage;
+  const chain =
+    exhaustion.candidates.length > 0
+      ? exhaustion.candidates.map((candidate) => candidate.providerLabel).join(" → ")
+      : "no candidates configured";
+  const reason =
+    `No configured provider for ${stageName} is available — ` +
+    `the resolved chain was exhausted (${chain}). ` +
+    "See the run log for per-candidate reasons.";
+  await patchTaskProgressStrictV1(folderUri, (current) =>
+    pauseTaskWithReason(current, reason)
+  );
+  NotificationRouter.showWarning(
+    `⚠️ ${reason} The task has been paused; fix provider availability or the stage's ` +
+      "model configuration, then resume."
+  );
 }
 
 export async function runReviewForFolder(
@@ -2488,6 +2641,41 @@ export async function runReviewForFolder(
   const { modelId } = await resolveFreshModelForStage(folderUri, targetStage);
   if (!modelId) {
     NotificationRouter.showWarning("No model is configured for this stage.");
+    return;
+  }
+
+  // Pre-flight the stage's resolved provider chain BEFORE burning a round
+  // (finding 4's second fix): an unavailable-provider stall is predictable —
+  // the chain is known ahead of time — so a chain whose every candidate
+  // fails a safely probeable availability check reports "no configured
+  // provider for <stage> is available" here, producing the same paused
+  // outcome and enriched run record the runtime exhaustion path writes,
+  // without dispatching anything. Probe timeouts fail open to dispatch; a
+  // probe-available/invoke-fail candidate still reaches the runtime
+  // exhaustion path as the backstop.
+  const chainPreflight = await preflightStageChainAvailabilityV1(targetStage, {
+    modelId,
+  });
+  if (chainPreflight.kind === "exhausted") {
+    await handleReviewOutcomeV1(
+      {
+        kind: "unavailable",
+        code: "providerModeUnavailable",
+        chainExhaustion: chainPreflight.exhaustion,
+      },
+      {
+        extensionUri,
+        folderUri,
+        workspaceUri: workspaceRoot.uri,
+        currentStage,
+        targetStage,
+        reviewUri,
+        variables,
+        reviewAttemptId,
+        operation: options.operation,
+        chatViewProvider: options.chatViewProvider,
+      }
+    );
     return;
   }
 
@@ -3381,7 +3569,16 @@ export async function fastForwardReviewWithAI(
   }
 
   let initialContent = await readNonEmptyText(reviewUri);
-  if (initialContent !== undefined && isUnusableAsExistingReview(initialContent)) {
+  if (
+    initialContent !== undefined &&
+    (isUnusableAsExistingReview(initialContent) ||
+      // An incomplete implementation round invalidated this review via the
+      // durable marker WITHOUT staling the artifact's content (the content is
+      // deliberately preserved) — it must not be treated as a current
+      // baseline. Refusing it here routes into the same fresh-review path a
+      // stale placeholder takes.
+      resolved.progress.reviewInvalidatedByRound?.stage === targetStage)
+  ) {
     initialContent = undefined;
   }
   if (!initialContent) {
@@ -4937,8 +5134,10 @@ export { IMPLEMENTATION_CHECKLIST_MARKER };
  * self-reported progress marker (see reconcileProgressWithChecklistV1).
  * `undefined` whenever there is nothing authoritative to reconcile against:
  * no plan-final.md, or one that never had a checklist generated.
+ *
+ * @internal exported for testing (the checklistProgressUnreliable stand-down)
  */
-async function readPlanChecklistProgressV1(
+export async function readPlanChecklistProgressV1(
   folderUri: vscode.Uri
 ): Promise<ChecklistProgressV1 | undefined> {
   const plan = await readPlanOfRecordV1(folderUri);
@@ -5153,11 +5352,66 @@ async function executeImplementationRun(
           : ""
       }\n\n`
     : "";
-  const logContent = `# Implementation Run\n\nStatus: ${result.status}\n\n${implProviderLine}Files changed:\n${
+
+  // Deferred/cut-short detection runs BEFORE the run log is written, so the
+  // durable record of a detected round says `Status: incomplete (...)` —
+  // never `Status: completed`. A round that ends its turn promising a
+  // follow-up the workflow cannot deliver is not a completed round, and
+  // recording it as one is what left a task sitting "active" for 3.5 hours
+  // with its previous good summary destroyed (2026-08-13, round 014). The
+  // plan of record is read here for the same reason the summary gate reads
+  // it: the checklist-echo expectation is part of the contract.
+  let incompleteRound: IncompleteImplementationRoundV1 | undefined;
+  if (result.status === "completed" && !result.summaryIsSynthetic) {
+    const planForDetection = await readPlanOfRecordV1(folderUri);
+    incompleteRound = describeIncompleteImplementationRoundV1(
+      result.summary?.trim() ?? "",
+      { planChecklist: planForDetection.hasChecklist ? planForDetection.text : undefined }
+    );
+  }
+  const quarantinedPaths =
+    incompleteRound && !result.filesChangedUnknown ? result.filesChanged : [];
+
+  // Durable quarantine FIRST — before the run log or any other write. The
+  // run log is the visible record that the round was detected incomplete; if
+  // it were written first and the process died before this patch landed, the
+  // durable state would say "incomplete round handled" while the round's
+  // edits sat in no set at all. Persisting the quarantine (plus the
+  // continuation counter and, at a review stage, the review-invalid marker)
+  // ahead of every other write means a crash at any later point can only
+  // lose REPORTING, never the round's edits.
+  let incompleteContinuations = 0;
+  let incompletePersisted: Awaited<ReturnType<typeof patchTaskProgressStrictV1>>;
+  if (incompleteRound) {
+    incompletePersisted = await patchTaskProgressStrictV1(folderUri, (current) => {
+      incompleteContinuations = (current.incompleteRoundContinuations ?? 0) + 1;
+      let next = setIncompleteRoundContinuations(current, incompleteContinuations);
+      if (quarantinedPaths.length > 0) {
+        next = quarantinePendingImplReviewFiles(next, [...quarantinedPaths]);
+      }
+      if (isReviewStage(postRunReviewStage)) {
+        next = recordReviewInvalidatedByRound(next, postRunReviewStage);
+      }
+      return next;
+    });
+  }
+
+  const logContent = `# Implementation Run\n\nStatus: ${
+    incompleteRound ? `incomplete (${incompleteRound.kind})` : result.status
+  }\n\n${implProviderLine}Files changed:\n${
     result.filesChanged.length > 0
       ? result.filesChanged.map((f) => `- ${f}`).join("\n")
       : "_none recorded_"
   }\n\n${result.summary ?? result.errorMessage ?? ""}${
+    incompleteRound
+      ? `\n\n## Incomplete round\n\nThis round was recorded incomplete: ${incompleteRound.reason}.\n\n` +
+        `Its workspace delta was quarantined into \`pendingImplReviewFiles\` (not banked as review scope):\n${
+          quarantinedPaths.length > 0
+            ? quarantinedPaths.map((f) => `- ${f}`).join("\n")
+            : "_none recorded_"
+        }\n`
+      : ""
+  }${
     result.typeCheckFailed
       ? `\n\n## Type-check failure (2g)\n\nThe project no longer type-checks after this round's edits:\n\n\`\`\`\n${result.typeCheckOutput ?? ""}\n\`\`\`\n`
       : ""
@@ -5177,6 +5431,84 @@ async function executeImplementationRun(
     // real state is not provably clean.
     const roundMayHaveChangedFiles =
       result.filesChangedUnknown === true || result.filesChanged.length > 0;
+
+    if (incompleteRound) {
+      // A detected deferred/cut-short round is recorded INCOMPLETE and
+      // recovered through an explicit continuation — never banked as a
+      // completed round and then blamed on a malformed summary. The durable
+      // quarantine write already happened ABOVE, before the run log was
+      // written, so the round's edits can never be discarded even if
+      // everything from the log write onward fails.
+      //
+      // Deliberately preserved, in contrast to the rejected-summary path:
+      //  - impl-summary.md / impl-summary_prev.md keep the previous good
+      //    summary (no `implementation-summary-unusable` replacement) — the
+      //    detected round produced no report to replace them with;
+      //  - the stage's review artifact keeps its content (no
+      //    markReviewArtifactStale placeholder); the durable
+      //    `reviewInvalidatedByRound` marker records instead that it no
+      //    longer describes the workspace.
+      const continuations = incompleteContinuations;
+      const persisted = incompletePersisted;
+
+      NotificationRouter.showWarning(
+        `⚠️ The implementation round did not finish its turn: ${incompleteRound.reason}. ` +
+          (quarantinedPaths.length > 0
+            ? `Its ${quarantinedPaths.length} changed file(s) were quarantined for the next round. `
+            : "") +
+          (continuations >= MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1
+            ? "The continuation budget is exhausted, so the task needs a human decision."
+            : "A continuation implementation round has been scheduled to complete and report the work.")
+      );
+
+      if (continuations >= MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1) {
+        // The attempt CAS expects the value read from the state persisted
+        // moments ago — for an implementation-stage task that value is
+        // legitimately ABSENT (the impl transition clears reviewAttemptId,
+        // taskProgressFieldPolicyV1), so `undefined` is passed through as the
+        // expected value rather than coerced to "". Coercing made the CAS
+        // unsatisfiable on exactly the stage this cap most needs to escalate.
+        const escalated = await escalateReviewToHuman(
+          folderUri,
+          persisted?.currentStage ?? postRunReviewStage,
+          "plateau",
+          `${continuations} consecutive implementation round(s) ended without a usable report ` +
+            `(${incompleteRound.kind}). Automated continuation is no longer making the round finish; ` +
+            "the unreported edits are preserved in pendingImplReviewFiles.",
+          persisted?.reviewAttemptId,
+          persisted ?? undefined,
+          false
+        );
+        if (!escalated) {
+          // The escalation write can be declined by its CAS guards (e.g. no
+          // reviewAttemptId on an implementation-only task). The failure must
+          // not be silent — without a continuation OR an escalation the task
+          // would go quiet exactly the way this detector exists to prevent.
+          NotificationRouter.showWarning(
+            "⚠️ Automated continuation stopped after repeated incomplete implementation rounds, " +
+              "and the task could not be paused automatically. Rerun the implementation manually — " +
+              "the unreported edits are preserved and listed in the run log."
+          );
+        }
+      } else {
+        // The continuation is the task's NEXT action: no review dispatch, no
+        // auto-advance, no second provider fired inside this round. It runs
+        // as a fresh Run Implementation once this run's root operation
+        // releases the task lock; runImplementationWithAI sees the pending
+        // quarantined set and prepends the continuation notice to its prompt.
+        void scheduleAutomationChain(
+          {
+            command: "vs-code-ai-helper.runImplementationWithAI",
+            arg: { taskFolderPath: folderUri.fsPath },
+            taskKey: folderUri.fsPath,
+            chainId: "impl-continuation",
+          },
+          options.parentOperation
+        );
+      }
+      await safeOpenTextDocument(logUri, "implementation run log");
+      return false;
+    }
 
     if (!result.filesChangedUnknown && result.filesChanged.length === 0) {
       const resilience = getResilienceSettings();
@@ -5277,6 +5609,34 @@ async function executeImplementationRun(
           planChecklist,
           roundChangedFiles: !result.filesChangedUnknown && result.filesChanged.length > 0,
         });
+
+    // Attribution (finding 2): the git snapshot diff spans the round's
+    // wall-clock window, not its authorship — edits made BY HAND in the same
+    // workspace while a round runs land in the diff and used to be banked
+    // verbatim into implReviewFiles (round 015 of "more workflow bugs"
+    // self-reported 2 files; the workflow banked 8, adopting the user's own
+    // concurrent Claude Code session as review scope). Review scope comes
+    // from the intersection of the snapshot with the round's own
+    // `## Files Changed` report; snapshot-only paths are excluded from
+    // banking and recorded in the run log as unattributed workspace changes.
+    // Only a runner-synthesized summary banks the snapshot delta as-is: its
+    // `filesChanged` is already authoritative tool-call receipts (the sealed
+    // pipeline), not a wall-clock diff. A MODEL-AUTHORED response with no
+    // parseable `## Files Changed` section attributes NOTHING — with no
+    // self-report to intersect against there is no evidence tying the
+    // snapshot's paths to the round, and banking them anyway would let a
+    // malformed-but-not-incomplete response adopt concurrent hand edits into
+    // review scope (the exact leak this attribution exists to close). Those
+    // paths are surfaced in the run log as unattributed instead, and the
+    // round's real edits re-enter scope when a later round reports properly.
+    const { attributed: attributedFilesChanged, unattributed: unattributedFilesChanged } =
+      result.summaryIsSynthetic || result.filesChangedUnknown
+        ? { attributed: [...result.filesChanged], unattributed: [] as string[] }
+        : attributeImplementationRoundFilesV1(
+            result.filesChanged,
+            parseReportedFilesChangedV1(summary, { planChecklist })
+          );
+
     if (!summaryIssue) {
       // Signed with the reservation actually invoked (never the requested
       // primary) — same helper and header format review artifacts use
@@ -5381,7 +5741,7 @@ async function executeImplementationRun(
     }
 
     // Use patchTaskProgressStrictV1 to avoid overwriting unrelated fields.
-    await patchTaskProgressStrictV1(folderUri, (currentProgress) => {
+    const persistedAfterRun = await patchTaskProgressStrictV1(folderUri, (currentProgress) => {
       const alreadyAtOrPastImplementation =
         currentProgress.currentStage === "impl" ||
         isReviewStage(currentProgress.currentStage);
@@ -5475,11 +5835,86 @@ async function executeImplementationRun(
           }
         : stageUpdated;
 
-      if (!result!.filesChangedUnknown && result!.filesChanged.length > 0) {
-        return updateImplReviewFiles(stageRecorded, result!.filesChanged);
+      // A successful round (usable summary, or the sealed runner's synthetic
+      // one) promotes any quarantined incomplete-round delta into review
+      // scope — unioned with this round's own changed files below — and
+      // clears the pending set plus the continuation counter. A REJECTED
+      // round (summaryIssue) does not: promotion requires a round that
+      // actually reported, so the quarantine survives until one does.
+      const promotedBase =
+        summaryIssue === undefined
+          ? promotePendingImplReviewFiles(stageRecorded)
+          : stageRecorded;
+
+      // Only the round's ATTRIBUTED delta is banked (finding 2) — never the
+      // raw snapshot diff, which absorbs concurrent hand edits. When change
+      // tracking was unavailable (filesChangedUnknown) nothing is banked at
+      // all: a full dirty scan of the workspace is scope, not attribution.
+      if (!result!.filesChangedUnknown && attributedFilesChanged.length > 0) {
+        return updateImplReviewFiles(promotedBase, attributedFilesChanged);
       }
-      return stageRecorded;
+      return promotedBase;
     });
+
+    // Visibility for the excluded remainder (finding 2's acceptance
+    // criterion): paths that changed in the workspace during the round
+    // without the round claiming them are recorded in the run file rather
+    // than silently adopted — or silently dropped.
+    if (unattributedFilesChanged.length > 0) {
+      const existingLog = await readTextIfExists(logUri);
+      if (existingLog !== undefined) {
+        const unattributedSection =
+          "\n\n## Unattributed workspace changes\n\n" +
+          "These paths changed in the workspace during this round but are not in the " +
+          "round's own `## Files Changed` report, so they were EXCLUDED from review scope " +
+          "(they are most likely edits made by hand in the same workspace while the round ran):\n\n" +
+          unattributedFilesChanged.map((file) => `- ${file}`).join("\n");
+        // skipBackup: this append preserves every byte of the just-written
+        // log, and a `_prev` sibling in runs/ would read as a second run.
+        await writeTextFile(logUri, `${existingLog}${unattributedSection}\n`, {
+          skipBackup: true,
+        });
+      }
+    }
+
+    // Finding 3: while `checklistProgressUnreliable` is set the loop keeps
+    // running (the completeness gate is already stood down via
+    // readPlanChecklistProgressV1), but never silently — every round that
+    // completes under the latch records the condition in its own run file and
+    // re-surfaces the ONE action that can clear it. Nothing reconciles
+    // automatically: no round knows what the unrecorded round did, so the
+    // repair is deliberately a human confirmation (reconcilePlanChecklist).
+    // Without this, the only standing trace was the task tooltip — invisible
+    // while rounds appear to be progressing normally.
+    if (persistedAfterRun?.checklistProgressUnreliable) {
+      const existingLog = await readTextIfExists(logUri);
+      if (existingLog !== undefined) {
+        const reconcileNote =
+          "\n\n## Checklist reconciliation needed\n\n" +
+          "This task's plan checklist is not a complete record (checklistProgressUnreliable): a round " +
+          "landed changes its checklist state could not record, so the plan's step counts are unverified " +
+          "and completeness is not gating advancement. Tick the missed items in plan-final.md, then run " +
+          "**Ensemble: Mark Plan Checklist Reconciled** to restore the gate.";
+        // skipBackup: appends to the just-written log; a `_prev` sibling in
+        // runs/ would read as a second run.
+        await writeTextFile(logUri, `${existingLog}${reconcileNote}\n`, {
+          skipBackup: true,
+        });
+      }
+      NotificationRouter.showWarning(
+        "⚠️ The plan checklist is not a complete record for this task — its step counts are unverified " +
+          "until reconciled, and completeness is not gating advancement. Tick the missed items in " +
+          "plan-final.md, then mark the checklist reconciled.",
+        undefined,
+        undefined,
+        undefined,
+        {
+          command: "vs-code-ai-helper.reconcilePlanChecklist",
+          title: "Mark Reconciled",
+          args: [{ taskFolderPath: folderUri.fsPath }],
+        }
+      );
+    }
 
     // Any existing review artifact describes the tree as it was BEFORE this
     // round's edits, so it is stale the moment those edits land — regardless
@@ -5492,6 +5927,17 @@ async function executeImplementationRun(
       const reviewUri = artifactUri(folderUri, postRunReviewStage);
       if (reviewUri) {
         await markReviewArtifactStale(reviewUri, "workspace files");
+        // Ordering invariant for the incomplete-round marker: the stale stamp
+        // just written IS the replacement review-tracking state ("a fresh
+        // review is required" is now durable on the artifact itself), so the
+        // `reviewInvalidatedByRound` marker may be cleared only NOW — never
+        // before. Every persisted state therefore has either the marker set
+        // or review-tracking state already showing a fresh review is needed.
+        await patchTaskProgressStrictV1(folderUri, (current) =>
+          current.reviewInvalidatedByRound?.stage === postRunReviewStage
+            ? clearReviewInvalidatedByRound(current)
+            : current
+        );
       }
     }
 
@@ -5898,11 +6344,43 @@ export async function runImplementationWithAI(
       workspaceRoot.uri
     );
 
-    const prompt = await renderPromptTemplate(
+    const basePrompt = await renderPromptTemplate(
       extensionUri,
       "run-implementation.md",
       { contextPack: contextPackContent, plan: planFinalContent }
     );
+
+    // Continuation of a detected incomplete round: a prior round changed the
+    // quarantined files below but ended without a usable report (deferred to
+    // a follow-up turn the workflow cannot deliver, or cut short). The
+    // freshest progress read wins — the quarantine may have been written
+    // after `resolved.progress` was snapshotted at command entry.
+    const freshForContinuation = await readTaskProgressAdvisoryV1(resolved.folderUri);
+    const pendingFiles =
+      freshForContinuation?.pendingImplReviewFiles ??
+      resolved.progress.pendingImplReviewFiles ??
+      [];
+    const prompt =
+      pendingFiles.length > 0
+        ? basePrompt +
+          [
+            "",
+            "",
+            "## Continuation Notice",
+            "",
+            "A previous implementation round for this task ended WITHOUT a usable report:",
+            "it changed the files listed below but returned no `## Files Changed`, no",
+            "`## Verification`, and no checklist echo (it may have deferred to a follow-up",
+            "turn that never ran). Treat that round's edits as unverified work in progress.",
+            "Complete whatever plan work those edits belong to, verify it, and report ALL of",
+            "it in THIS round's summary — include the files below under `## Files Changed`",
+            "and echo the plan checklist with every box that work completes. Do not defer",
+            "any part of the report to a later turn: this round gets no follow-up turn.",
+            "",
+            "Files changed by the unreported round:",
+            ...pendingFiles.map((file) => `- ${file}`),
+          ].join("\n")
+        : basePrompt;
 
     // ── Prompt-size gate (applied before executeImplementationRun) ────────────
     const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel);
@@ -6049,6 +6527,24 @@ export async function applyReviewEditWithAI(
     if (isStaleReviewArtifact(reviewContent)) {
       NotificationRouter.showWarning(
         "The review is stale. Run the review again before applying it."
+      );
+      return;
+    }
+    // An incomplete implementation round can invalidate this stage's review
+    // via the durable `reviewInvalidatedByRound` marker WITHOUT staling the
+    // artifact's content (the content is deliberately preserved for
+    // reference). The marker, not the artifact, is the source of truth for
+    // currency — applying the preserved review would drive an edit round
+    // from findings about a tree that no longer exists, while the unreported
+    // round's edits sit unreviewed in `pendingImplReviewFiles`. Read fresh
+    // rather than trusting `resolved.progress`: the marker may have been
+    // persisted after that snapshot was taken at command entry.
+    const progressForApply = await readTaskProgressAdvisoryV1(resolved.folderUri);
+    if (progressForApply?.reviewInvalidatedByRound?.stage === stage) {
+      NotificationRouter.showWarning(
+        "An implementation round changed the workspace after this review was written " +
+          "(the round ended without a usable report), so the review no longer describes " +
+          "the tree. Run the review again before applying it."
       );
       return;
     }

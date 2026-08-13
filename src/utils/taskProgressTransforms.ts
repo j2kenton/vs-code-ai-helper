@@ -122,9 +122,33 @@ export function updateTaskStatus(
   return {
     ...progress,
     status,
+    // A workflow-imposed pause reason describes the CURRENT paused state
+    // only — any transition away from paused (resume, completion, archive)
+    // retires it, or a long-resolved "no provider available" banner would
+    // reappear on the next unrelated pause.
+    ...(status !== "paused" && progress.pausedReason !== undefined
+      ? { pausedReason: undefined }
+      : {}),
     updatedAt: options?.preserveFreshness
       ? progress.updatedAt
       : new Date().toISOString(),
+  };
+}
+
+/**
+ * Pause a task because the WORKFLOW cannot proceed (not a user request),
+ * recording why — e.g. an exhausted provider chain (2026-08-13 finding 4).
+ * `updatedAt` is bumped by `updateTaskStatus`'s default lifecycle behavior,
+ * so the task stops looking "active as of the last successful round" while
+ * it is actually stalled.
+ */
+export function pauseTaskWithReason(
+  progress: TaskProgress,
+  reason: string
+): TaskProgress {
+  return {
+    ...updateTaskStatus(progress, "paused"),
+    pausedReason: reason,
   };
 }
 
@@ -198,6 +222,113 @@ export function updateImplReviewFiles(
   return {
     ...progress,
     implReviewFiles: [...union],
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * Quarantine the changed paths of an implementation round detected as
+ * INCOMPLETE (deferred or cut short — see
+ * `describeIncompleteImplementationRoundV1`): the delta goes durably into
+ * `pendingImplReviewFiles`, never into `implReviewFiles` and never discarded.
+ * A deferred round is not a completed round, so its edits must not be banked
+ * as review scope — a reviewer would be handed files with no report to judge
+ * them against — but they are real work that a later successful round must
+ * carry into review (see `promotePendingImplReviewFiles`).
+ *
+ * Unions with any already-quarantined set (consecutive incomplete rounds
+ * accumulate) and applies the same machine-maintained-path filter as
+ * `updateImplReviewFiles`, for the same reason.
+ */
+export function quarantinePendingImplReviewFiles(
+  progress: TaskProgress,
+  files: string[]
+): TaskProgress {
+  const reviewable = files.filter((file) => !isMachineMaintainedArtifactPathV1(file));
+  const union = new Set([...reviewable, ...(progress.pendingImplReviewFiles ?? [])]);
+  if (union.size === 0) {
+    return progress;
+  }
+  return {
+    ...progress,
+    pendingImplReviewFiles: [...union],
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * Promote the quarantined incomplete-round delta into review scope once a
+ * subsequent implementation round completes successfully: the pending paths
+ * are unioned into `implReviewFiles` (callers union the successful round's
+ * own attributed delta separately, on top), and the pending set plus the
+ * continuation counter are cleared. Returns `progress` unchanged when there
+ * is nothing to promote or clear.
+ */
+export function promotePendingImplReviewFiles(progress: TaskProgress): TaskProgress {
+  const pending = progress.pendingImplReviewFiles ?? [];
+  if (
+    progress.pendingImplReviewFiles === undefined &&
+    progress.incompleteRoundContinuations === undefined
+  ) {
+    return progress;
+  }
+  const {
+    pendingImplReviewFiles: _pending,
+    incompleteRoundContinuations: _continuations,
+    ...rest
+  } = progress;
+  if (pending.length === 0) {
+    return { ...rest, updatedAt: new Date().toISOString() };
+  }
+  return updateImplReviewFiles(rest, pending);
+}
+
+/**
+ * Record that an incomplete implementation round changed the tree after
+ * `stage`'s review artifact was written, WITHOUT staling that artifact's
+ * content — the marker is the durable "this review no longer describes the
+ * workspace" record consumers must check (see
+ * `TaskProgress.reviewInvalidatedByRound`).
+ */
+export function recordReviewInvalidatedByRound(
+  progress: TaskProgress,
+  stage: TaskStage
+): TaskProgress {
+  return {
+    ...progress,
+    reviewInvalidatedByRound: { stage, at: new Date().toISOString() },
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * Clear the review-invalidation marker. Callers must persist replacement
+ * review-tracking state FIRST (a stale stamp on the artifact, or a fresh
+ * review round's publish record) — every persisted state must either carry
+ * the marker or already show a fresh review is required.
+ */
+export function clearReviewInvalidatedByRound(progress: TaskProgress): TaskProgress {
+  if (!progress.reviewInvalidatedByRound) {
+    return progress;
+  }
+  const { reviewInvalidatedByRound: _unused, ...rest } = progress;
+  return {
+    ...rest,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * Set (or clear, with `undefined`) the persisted incomplete-round
+ * continuation counter (see `TaskProgress.incompleteRoundContinuations`).
+ */
+export function setIncompleteRoundContinuations(
+  progress: TaskProgress,
+  rounds: number | undefined
+): TaskProgress {
+  return {
+    ...progress,
+    incompleteRoundContinuations: rounds,
     updatedAt: new Date().toISOString(),
   };
 }

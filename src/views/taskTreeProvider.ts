@@ -107,7 +107,16 @@ function buildTaskTooltip(task: IncompleteTask): vscode.MarkdownString {
 
   const isPaused = task.progress.status === "paused";
   if (isPaused) {
-    lines.push("⏸ **Paused**", "");
+    // A workflow-imposed pause carries its reason (e.g. an exhausted
+    // provider chain, finding 4) — surfaced here so a paused-with-reason
+    // task is distinguishable from one the user paused, and from a round
+    // still thinking.
+    lines.push(
+      task.progress.pausedReason
+        ? `⏸ **Paused** — ${task.progress.pausedReason}`
+        : "⏸ **Paused**",
+      ""
+    );
   }
   if (task.progress.status === "archived") {
     lines.push("$(archive) **Archived**", "");

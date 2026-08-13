@@ -32,6 +32,12 @@ import { after, describe, it } from "node:test";
 import * as vscode from "vscode";
 
 import { reconcilePlanChecklist } from "../commands/reconcilePlanChecklist";
+import {
+  UNVERIFIED_CHECKLIST_COUNT_QUALIFIER_V1,
+  buildSiblingReviewDisagreementVariable,
+  buildStayingOnStageNoticeV1,
+  readPlanChecklistProgressV1,
+} from "../commands/reviewActions";
 import { TaskInventory } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { TaskProgress } from "../types/taskProgress";
@@ -480,5 +486,116 @@ void describe("reconcilePlanChecklist — races around the confirmation", () => 
       "an aborted reconciliation must leave the latch set"
     );
     assert.equal(result.refreshes, 0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 6. Finding 3 — while the latch is set, count-dependent gating stays stood
+//    down and every "N of M" reporting surface carries the unverified
+//    qualifier. The latch's ONE exit stays reconcilePlanChecklist (above).
+// ---------------------------------------------------------------------------
+
+void describe("checklistProgressUnreliable — gating and reporting surfaces", () => {
+  void it("readPlanChecklistProgressV1 stands down while latched, and returns counts once cleared", async () => {
+    const { folder } = makeTask("gating-stood-down", { latched: true });
+    const workspace = installWorkspaceFolders();
+    const fs = installRealFs();
+    const win = installWindowStub({});
+    try {
+      const folderUri = vscode.Uri.file(folder);
+      assert.equal(
+        await readPlanChecklistProgressV1(folderUri),
+        undefined,
+        "a latched task's checklist counts must not feed count-dependent gating"
+      );
+
+      writeProgress(folder, {
+        ...readProgress(folder),
+        checklistProgressUnreliable: undefined,
+      });
+      const counts = await readPlanChecklistProgressV1(folderUri);
+      assert.ok(counts, "clearing the latch restores the checklist as authoritative");
+      assert.equal(counts.total, 2);
+      assert.equal(counts.checked, 1);
+    } finally {
+      win.restore();
+      fs.restore();
+      workspace.restore();
+    }
+  });
+
+  void it("the staying-on-stage notice carries the unverified qualifier only while latched", () => {
+    const qualified = buildStayingOnStageNoticeV1(8, { complete: 3, total: 5 }, "", true);
+    assert.ok(qualified.includes("3 of 5"), "the count itself still renders");
+    assert.ok(
+      qualified.includes(UNVERIFIED_CHECKLIST_COUNT_QUALIFIER_V1),
+      "a latched task's count must say it is unverified"
+    );
+    assert.match(qualified, /needs reconciliation/);
+
+    const plain = buildStayingOnStageNoticeV1(8, { complete: 3, total: 5 }, "", false);
+    assert.equal(
+      plain.includes(UNVERIFIED_CHECKLIST_COUNT_QUALIFIER_V1),
+      false,
+      "an unlatched task's count renders unqualified"
+    );
+  });
+
+  void it("the sibling-disagreement block qualifies the ordered-steps count only while latched", async () => {
+    const { folder } = makeTask("sibling-qualifier", { latched: true });
+    const sha = "abcdef1";
+    nodeFs.writeFileSync(
+      nodePath.join(folder, "impl-high-review.md"),
+      [
+        "# Implementation Review",
+        "",
+        `<!-- reviewed-commit: ${sha} -->`,
+        "<!-- progress: 4/4 -->",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+    nodeFs.writeFileSync(
+      nodePath.join(folder, "impl-low-review.md"),
+      [
+        "# Implementation Review",
+        "",
+        `<!-- reviewed-commit: ${sha} -->`,
+        "<!-- blockers:start -->",
+        "- [completion] [task-fixable] the resolver from plan step 2 does not exist",
+        "<!-- blockers:end -->",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const workspace = installWorkspaceFolders();
+    const fs = installRealFs();
+    const win = installWindowStub({});
+    try {
+      const folderUri = vscode.Uri.file(folder);
+      const latched = await buildSiblingReviewDisagreementVariable(folderUri, sha);
+      assert.match(latched, /4 of 4 ordered steps/);
+      assert.ok(
+        latched.includes(UNVERIFIED_CHECKLIST_COUNT_QUALIFIER_V1),
+        "the Publish reviewer must not be handed the count as authoritative while latched"
+      );
+
+      writeProgress(folder, {
+        ...readProgress(folder),
+        checklistProgressUnreliable: undefined,
+      });
+      const cleared = await buildSiblingReviewDisagreementVariable(folderUri, sha);
+      assert.match(cleared, /4 of 4 ordered steps/);
+      assert.equal(
+        cleared.includes(UNVERIFIED_CHECKLIST_COUNT_QUALIFIER_V1),
+        false,
+        "once reconciled the count renders unqualified again"
+      );
+    } finally {
+      win.restore();
+      fs.restore();
+      workspace.restore();
+    }
   });
 });

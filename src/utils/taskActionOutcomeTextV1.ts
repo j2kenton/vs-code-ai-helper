@@ -59,7 +59,13 @@ export function describeTaskActionOutcomeForLogV1(
 ): string {
   switch (outcome.kind) {
     case "completed":
-      return `Status: completed (${outcome.code})${providerLogSuffix(outcome.provider)}`;
+      // A detected deferred/cut-short round settled as a successful provider
+      // invocation but is NOT a completed round — the log line must say so,
+      // or the durable record claims a finish that never happened (the
+      // 2026-08-13 round-014 failure).
+      return outcome.code === "roundDeferredIncomplete" || outcome.code === "roundIncomplete"
+        ? `Status: incomplete (${outcome.code})${providerLogSuffix(outcome.provider)}`
+        : `Status: completed (${outcome.code})${providerLogSuffix(outcome.provider)}`;
     case "questions":
       return (
         `Status: questions (interactionId=${outcome.interactionId}) — the AI asked a clarifying ` +

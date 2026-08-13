@@ -28,12 +28,16 @@ import { afterEach, describe, it } from "node:test";
 import * as vscode from "vscode";
 
 import {
+  assessImplementationSummarySectionsV1,
+  attributeImplementationRoundFilesV1,
   buildSyntheticImplementationSummaryV1,
   buildUnusableImplementationSummaryV1,
   describeImplementationSummaryShapeIssue,
+  describeIncompleteImplementationRoundV1,
   getCanonicalImplementationUri,
   getImplementationSummaryUri,
   isUnusableImplementationSummaryV1,
+  parseReportedFilesChangedV1,
   readImplementationReviewContent,
 } from "../utils/implementationArtifactResolver";
 import { verifyPlanItems } from "../utils/completionLint";
@@ -1813,5 +1817,276 @@ void describe("a round can record work completed in an earlier round", () => {
     const merged = mergedContent(mergeChecklistProgressV1(PLAN, both));
     assert.ok(merged.includes("- [x] Add the `databaseWaking` state to the dashboard API"));
     assert.ok(merged.includes("- [x] Wire the SPA to retry on that state"));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// describeIncompleteImplementationRoundV1 — the DETECTION half of the
+// deferred-round failure (2026-08-13 report item 1): a completed-status round
+// whose response promises future work while omitting every required section
+// is recorded incomplete and recovered via continuation, never banked.
+// ---------------------------------------------------------------------------
+
+void describe("describeIncompleteImplementationRoundV1", () => {
+  /** The observed round-014 shape: a deferral to a wakeup that never fires. */
+  const DEFERRED_RESPONSE =
+    "All edits are staged. Waiting for the background test run to finish " +
+    "(scheduled wakeup in ~5 min). I'll pick back up automatically when it " +
+    "completes or the wakeup fires.";
+
+  void it("classifies a deferral with no sections and no echo as roundDeferred", () => {
+    const detected = describeIncompleteImplementationRoundV1(DEFERRED_RESPONSE, {
+      planChecklist: CHECKLIST_PLAN_OF_RECORD,
+    });
+    assert.equal(detected?.kind, "roundDeferred");
+    assert.ok(detected?.reason.includes("follow-up turn"));
+  });
+
+  void it("classifies the 2026-08-10 live status message as roundDeferred", () => {
+    const detected = describeIncompleteImplementationRoundV1(
+      STATUS_MESSAGE_NOT_A_SUMMARY,
+      { planChecklist: CHECKLIST_PLAN_OF_RECORD }
+    );
+    assert.equal(detected?.kind, "roundDeferred");
+  });
+
+  void it("classifies a cut-short response without future-work phrasing as roundIncomplete", () => {
+    const detected = describeIncompleteImplementationRoundV1(
+      "Refactored the resolver and updated the decoder switch.",
+      { planChecklist: CHECKLIST_PLAN_OF_RECORD }
+    );
+    assert.equal(detected?.kind, "roundIncomplete");
+  });
+
+  void it("does not fire on a well-formed summary", () => {
+    const wellFormed = [CHECKLIST_PLAN_OF_RECORD, "", WELL_FORMED_SUMMARY].join("\n");
+    assert.equal(
+      describeIncompleteImplementationRoundV1(wellFormed, {
+        planChecklist: CHECKLIST_PLAN_OF_RECORD,
+      }),
+      undefined
+    );
+  });
+
+  void it("does not fire when the own-scope summary carries a required section (stays a rejected summary)", () => {
+    // `## Files Changed` with plain bullets starts the run-owned region, so
+    // the response reported real (if deficient — no `## Verification`) work:
+    // that is the shape gate's case, not an unreported round, even though it
+    // also promises future work.
+    const partial =
+      "## Files Changed\n\n- `src/a.ts` — resolver update\n\n" +
+      "I'll report back when the build completes.";
+    assert.equal(
+      describeIncompleteImplementationRoundV1(partial, {
+        planChecklist: CHECKLIST_PLAN_OF_RECORD,
+      }),
+      undefined
+    );
+  });
+
+  void it("fires on a Verification-only response whose own-scope region is empty", () => {
+    // With an echo expected, the run-owned region starts at the response's
+    // own `## Files Changed`; a response without one has an EMPTY own scope,
+    // so a floating `## Verification` does not count as a report — the plan's
+    // own-scope rule, shared with the shape gate.
+    const partial =
+      "## Verification\n\n- ran the tests\n\nI'll report back when the build completes.";
+    assert.equal(
+      describeIncompleteImplementationRoundV1(partial, {
+        planChecklist: CHECKLIST_PLAN_OF_RECORD,
+      })?.kind,
+      "roundDeferred"
+    );
+  });
+
+  void it("does not fire when the response echoes the plan checklist (round reported durable state)", () => {
+    const echoOnly = [
+      "<!-- ensemble:implementation-checklist -->",
+      "",
+      "- [x] Reproduce the Publish rollback bug before fixing",
+      "- [ ] Fix `getStageStatus` so the current-stage comparison wins",
+    ].join("\n");
+    assert.equal(
+      describeIncompleteImplementationRoundV1(echoOnly, {
+        planChecklist: CHECKLIST_PLAN_OF_RECORD,
+      }),
+      undefined
+    );
+  });
+
+  void it("classifies an empty response as roundIncomplete (the limiting no-sections case)", () => {
+    // Plan contract: EVERY completed response omitting all required sections
+    // becomes an incomplete round. Routing the empty case to the shape gate
+    // instead let a cut-short round fall onto the rejected-summary path,
+    // which banks its changed files and replaces impl-summary.md — the exact
+    // poisoning the detector exists to prevent (review blocker, 2026-08-13).
+    assert.equal(describeIncompleteImplementationRoundV1("", {})?.kind, "roundIncomplete");
+    assert.equal(
+      describeIncompleteImplementationRoundV1("   \n ", {})?.kind,
+      "roundIncomplete"
+    );
+    assert.equal(
+      describeIncompleteImplementationRoundV1("", {
+        planChecklist: CHECKLIST_PLAN_OF_RECORD,
+      })?.kind,
+      "roundIncomplete"
+    );
+  });
+
+  void it("detects a section-less deferral even when no checklist echo is expected", () => {
+    const detected = describeIncompleteImplementationRoundV1(DEFERRED_RESPONSE, {});
+    assert.equal(detected?.kind, "roundDeferred");
+  });
+
+  void it("agrees with the shared section assessment used by the shape gate", () => {
+    // The detector and the gate read the same factored helper — a response
+    // the detector calls section-less must also fail the shape gate, so a
+    // detected round can never have been promotable.
+    const issue = describeImplementationSummaryShapeIssue(DEFERRED_RESPONSE, {
+      planChecklist: CHECKLIST_PLAN_OF_RECORD,
+    });
+    assert.ok(issue !== undefined);
+    const sections = assessImplementationSummarySectionsV1(DEFERRED_RESPONSE, {
+      planChecklist: CHECKLIST_PLAN_OF_RECORD,
+    });
+    assert.equal(sections.filesChangedPresent, false);
+    assert.equal(sections.verificationPresent, false);
+    assert.equal(sections.checklistEchoPresent, false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Part 2 (finding 2): the round's self-reported `## Files Changed` list and
+// the snapshot/report attribution split that keeps concurrent hand edits out
+// of implReviewFiles.
+// ---------------------------------------------------------------------------
+
+void describe("parseReportedFilesChangedV1", () => {
+  void it("parses backticked and plain bullet paths from the response's own Files Changed", () => {
+    const summary = [
+      "## Files Changed",
+      "",
+      "- `src/a.ts` — added the resolver",
+      "- src/b.ts — wired the decoder",
+      "* `src/c.ts`",
+      "",
+      "## Verification",
+      "",
+      "- ran tests",
+    ].join("\n");
+    assert.deepEqual(parseReportedFilesChangedV1(summary), [
+      "src/a.ts",
+      "src/b.ts",
+      "src/c.ts",
+    ]);
+  });
+
+  void it("returns undefined when there is no Files Changed section (or no text at all)", () => {
+    assert.equal(parseReportedFilesChangedV1("Just prose, no sections."), undefined);
+    assert.equal(parseReportedFilesChangedV1(""), undefined);
+    assert.equal(parseReportedFilesChangedV1("   \n\n  "), undefined);
+  });
+
+  void it("returns an empty list for a present-but-empty section, distinct from undefined", () => {
+    const summary = ["## Files Changed", "", "## Verification", "", "- checked"].join("\n");
+    assert.deepEqual(parseReportedFilesChangedV1(summary), []);
+  });
+
+  void it("skips checkbox bullets and parenthesized prose entries", () => {
+    const summary = [
+      "## Files Changed",
+      "",
+      "- [x] Reproduce the Publish rollback bug before fixing",
+      "- (the runner reported no changed paths)",
+      "- `src/real.ts` — the only actual file entry",
+    ].join("\n");
+    assert.deepEqual(parseReportedFilesChangedV1(summary), ["src/real.ts"]);
+  });
+
+  void it("normalizes backslashes and a leading ./ in reported paths", () => {
+    const summary = [
+      "## Files Changed",
+      "",
+      "- `src\\utils\\thing.ts` — windows separators",
+      "- ./src/other.ts — leading dot-slash",
+    ].join("\n");
+    assert.deepEqual(parseReportedFilesChangedV1(summary), [
+      "src/utils/thing.ts",
+      "src/other.ts",
+    ]);
+  });
+
+  void it("scopes to the run-owned region when a checklist echo is expected, so a plan phase named Files Changed is not read as the file list", () => {
+    const echoOnly = [
+      "<!-- ensemble:implementation-checklist -->",
+      "",
+      "- [ ] Reproduce the Publish rollback bug before fixing",
+      "",
+      "## Files Changed",
+      "",
+      "- [ ] Fix `getStageStatus` so the current-stage comparison wins",
+    ].join("\n");
+    assert.equal(
+      parseReportedFilesChangedV1(echoOnly, { planChecklist: CHECKLIST_PLAN_OF_RECORD }),
+      undefined
+    );
+  });
+
+  void it("ignores a Files Changed heading quoted inside a fenced block", () => {
+    const summary = [
+      "```",
+      "## Files Changed",
+      "- `src/fenced.ts`",
+      "```",
+      "",
+      "Some prose only.",
+    ].join("\n");
+    assert.equal(parseReportedFilesChangedV1(summary), undefined);
+  });
+});
+
+void describe("attributeImplementationRoundFilesV1", () => {
+  void it("banks the intersection and surfaces snapshot-only paths as unattributed", () => {
+    const split = attributeImplementationRoundFilesV1(
+      ["src/real.ts", "apps/mobile/hand-edit.ts"],
+      ["src/real.ts"]
+    );
+    assert.deepEqual(split.attributed, ["src/real.ts"]);
+    assert.deepEqual(split.unattributed, ["apps/mobile/hand-edit.ts"]);
+  });
+
+  void it("keeps a file that is in both sets (hand-edited during a pause AND modified by the round)", () => {
+    const split = attributeImplementationRoundFilesV1(
+      ["src/both.ts", "src/mine.ts"],
+      ["src/both.ts", "src/mine.ts", "src/reported-only.ts"]
+    );
+    assert.deepEqual(split.attributed, ["src/both.ts", "src/mine.ts"]);
+    // Reported-only paths simply never appear: the snapshot says they did not change.
+    assert.deepEqual(split.unattributed, []);
+  });
+
+  void it("matches case-insensitively and across separator styles, so a report never falsely drops a real edit", () => {
+    const split = attributeImplementationRoundFilesV1(
+      ["src/Utils/Thing.ts"],
+      ["src\\utils\\thing.ts"]
+    );
+    assert.deepEqual(split.attributed, ["src/Utils/Thing.ts"]);
+  });
+
+  void it("with no self-report (undefined) attributes NOTHING — the snapshot alone is not evidence of authorship", () => {
+    // A model-authored response whose `## Files Changed` section is absent or
+    // unparseable must fail CLOSED: banking the raw snapshot here would let a
+    // malformed-but-not-incomplete response adopt concurrent hand edits into
+    // implReviewFiles. (The synthetic/receipt-backed path banks its snapshot
+    // at the call site and never reaches this function.)
+    const split = attributeImplementationRoundFilesV1(["src/a.ts", "src/b.ts"], undefined);
+    assert.deepEqual(split.attributed, []);
+    assert.deepEqual(split.unattributed, ["src/a.ts", "src/b.ts"]);
+  });
+
+  void it("with an empty self-report attributes nothing and surfaces everything", () => {
+    const split = attributeImplementationRoundFilesV1(["src/a.ts"], []);
+    assert.deepEqual(split.attributed, []);
+    assert.deepEqual(split.unattributed, ["src/a.ts"]);
   });
 });

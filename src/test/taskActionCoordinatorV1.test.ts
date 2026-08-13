@@ -165,7 +165,10 @@ interface StubSelectionSource {
  * one-reservation-per-attempt are session-enforced), and exhaustion reports
  * `noneRemaining` with the registry's codes.
  */
-function stubSelectionOpener(transports: readonly AgentTransportV1[]): StubSelectionSource {
+function stubSelectionOpener(
+  transports: readonly AgentTransportV1[],
+  exhaustion?: import("../types/taskActionOutcomeV1").ProviderChainExhaustionV1
+): StubSelectionSource {
   let opened = 0;
   let reservedCount = 0;
   let cursor = 0;
@@ -176,8 +179,16 @@ function stubSelectionOpener(transports: readonly AgentTransportV1[]): StubSelec
         const transport = transports[cursor];
         if (!transport) {
           return cursor === 0
-            ? { kind: "noneRemaining", code: "providerModeUnavailable" }
-            : { kind: "noneRemaining", code: "candidatesExhausted" };
+            ? {
+                kind: "noneRemaining",
+                code: "providerModeUnavailable",
+                ...(exhaustion !== undefined ? { chainExhaustion: exhaustion } : {}),
+              }
+            : {
+                kind: "noneRemaining",
+                code: "candidatesExhausted",
+                ...(exhaustion !== undefined ? { chainExhaustion: exhaustion } : {}),
+              };
         }
         cursor += 1;
         reservedCount += 1;
@@ -234,7 +245,8 @@ function makeHarness(
   transports: readonly AgentTransportV1[],
   rowOverrides: Partial<ProviderTaskActionRowV1> = {},
   extraRows: readonly TaskActionRegistryRowV1[] = [],
-  brokerOptions?: AgentExecutionBrokerOptionsV1
+  brokerOptions?: AgentExecutionBrokerOptionsV1,
+  selectionExhaustion?: import("../types/taskActionOutcomeV1").ProviderChainExhaustionV1
 ): Harness {
   const promoted: CompletedContentV1[] = [];
   const row: ProviderTaskActionRowV1 = {
@@ -261,7 +273,7 @@ function makeHarness(
   };
   const leaseStore = createWorkflowLeaseStoreV1();
   const orchestrator = makeOrchestrator();
-  const selection = stubSelectionOpener(transports);
+  const selection = stubSelectionOpener(transports, selectionExhaustion);
   const followUps: TaskActionFollowUpRequestV1[] = [];
   const leaseHeldAtFollowUp: (string | undefined)[] = [];
   const presentations: { actionKey: string; operationId: string; progressLabel: string }[] = [];
@@ -1099,6 +1111,44 @@ void describe("taskActionCoordinatorV1", () => {
     assert.equal(harness.selection.reserved, 0);
   });
 
+  void it("passes the registry's chain-exhaustion evidence through verbatim, mutating no task state", async () => {
+    // Finding 4: the coordinator is a pure pass-through for the structured
+    // exhaustion evidence — the stage owner (not the coordinator) pauses the
+    // task and writes the enriched run record. Asserted here: the evidence
+    // arrives on the outcome byte-identical, the lease is released, and no
+    // task-progress mutation surface was ever touched (this harness wires
+    // none, so any attempted mutation would throw).
+    const exhaustion = {
+      stage: "impl-high-review",
+      candidates: [
+        {
+          storedModelId: "cline-cli:kimi-k3",
+          providerLabel: "Cline CLI",
+          runnerId: "cline-cli",
+          reason: "the CLI is not installed",
+        },
+        {
+          storedModelId: "kimi-cli:k3",
+          providerLabel: "Kimi CLI",
+          runnerId: "kimi-cli",
+          reason: "authentication failure: not logged in",
+        },
+      ],
+    };
+    const harness = makeHarness([], {}, [], undefined, exhaustion);
+    const outcome = await harness.coordinator.executeAction(baseRequest());
+    assert.deepEqual(outcome, {
+      kind: "unavailable",
+      code: "providerModeUnavailable",
+      chainExhaustion: exhaustion,
+    });
+    assert.equal(
+      harness.leaseStore.heldLease(TASK_BINDING.taskBindingId),
+      undefined,
+      "the lease must be released like any other unavailable settlement"
+    );
+  });
+
   void it("maps provider-declared failure and cancellation envelopes onto stable outcomes", async () => {
     const failed = makeHarness([
       envelopeTransport((correlation) =>
@@ -1732,7 +1782,18 @@ void describe("taskActionCoordinatorV1", () => {
       });
 
       const outcome = await coordinator.executeAction(baseRequest());
-      assert.deepEqual(outcome, { kind: "unavailable", code: "providerModeUnavailable" });
+      assert.equal(outcome.kind, "unavailable");
+      if (outcome.kind === "unavailable") {
+        assert.equal(outcome.code, "providerModeUnavailable");
+        // The real registry now carries structured exhaustion evidence for
+        // the stage owner (finding 4) — both ranked candidates named, both
+        // recorded as reserved-and-failed.
+        assert.equal(outcome.chainExhaustion?.stage, "impl-high-review");
+        assert.deepEqual(
+          outcome.chainExhaustion?.candidates.map((candidate) => candidate.storedModelId),
+          ["copilot:gpt-5-mini", "copilot:gpt-5"]
+        );
+      }
       assert.equal(promoted.length, 0);
       assert.equal(leaseStore.heldLease(TASK_BINDING.taskBindingId), undefined);
 
@@ -1744,7 +1805,10 @@ void describe("taskActionCoordinatorV1", () => {
       });
       try {
         const sole = await coordinator.executeAction(baseRequest());
-        assert.deepEqual(sole, { kind: "unavailable", code: "providerModeUnavailable" });
+        assert.equal(sole.kind, "unavailable");
+        if (sole.kind === "unavailable") {
+          assert.equal(sole.code, "providerModeUnavailable");
+        }
       } finally {
         soleUnsupported.restore();
       }
