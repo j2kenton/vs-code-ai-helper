@@ -75,7 +75,26 @@ export function isAuthenticationFailure(message: string | undefined): boolean {
   return /sign[\s-]*in|log(?:ged|ging)?[\s-]*(?:in|out)|session(?:\s+\w+){0,3}\s+(?:expired|invalid|missing|timed?\s*out)|authenticat\w*|authoris\w*|authoriz\w*|credential|re[-\s]?auth\w*|token(?:\s+\w+){0,3}\s+(?:expired|invalid|missing|revoked)|api\s*key|access\s*denied|permission\s*denied|forbidden|unauthori[sz]ed|\b(?:401|403)\b/i.test(value);
 }
 
-export function isQuotaError(message: string | undefined): boolean {
+/**
+ * `structuredSignal` is an OR'd-in, provider-scoped structural verdict (e.g.
+ * claude-cli's stream-json `result` event carrying `error: "rate_limit"` —
+ * see extractClaudeCliStructuredDiagnostics in cliAgentRunner.ts) that a
+ * caller has already determined, independent of any text. It exists because
+ * a structured error CODE (underscored, like "rate_limit") does not
+ * necessarily contain any of QUOTA_MARKERS' phrase spellings ("rate limit"
+ * with a space, "ratelimit" with none) as a literal substring, so relying on
+ * the phrase scan alone would miss it. The phrase-based scan below still
+ * runs unconditionally — this is an ADDITIONAL signal, never a replacement,
+ * so free-text quota phrasing from providers with no structural signal at
+ * all keeps working exactly as before.
+ */
+export function isQuotaError(
+  message: string | undefined,
+  structuredSignal?: boolean
+): boolean {
+  if (structuredSignal === true) {
+    return true;
+  }
   const value = (message ?? "").toLowerCase();
   return QUOTA_MARKERS.some((marker) => value.includes(marker));
 }
@@ -90,7 +109,7 @@ export function isTransportError(message: string | undefined): boolean {
   return TRANSPORT_MARKERS.some((marker) => value.includes(marker));
 }
 
-export function classifyFailure<T extends { errorMessage?: string; authDiagnosticText?: string }>(result: T): T & { failureKind: "quota" | "temporarily-unavailable" | "generic" } {
+export function classifyFailure<T extends { errorMessage?: string; authDiagnosticText?: string; structuredQuotaSignal?: boolean }>(result: T): T & { failureKind: "quota" | "temporarily-unavailable" | "generic" } {
   const message = (result.errorMessage ?? "").toLowerCase();
   // Quota first: a rate-limited request whose stream also dropped is a quota
   // event, and reporting it as a transport blip would retry straight back into
@@ -126,7 +145,7 @@ export function classifyFailure<T extends { errorMessage?: string; authDiagnosti
   // authDiagnosticText is absent for non-CLI callers (e.g. Copilot), which
   // fall back to errorMessage exactly as before.
   const isAuth = isAuthenticationFailure(result.authDiagnosticText ?? result.errorMessage);
-  const failureKind = isQuotaError(result.errorMessage)
+  const failureKind = isQuotaError(result.errorMessage, result.structuredQuotaSignal)
     ? "quota" as const
     : !isAuth && (
         TEMPORARY_MARKERS.some(m => message.includes(m)) ||

@@ -285,6 +285,22 @@ export function appendReviewRejection(
 }
 
 /**
+ * Set (or clear, with `undefined`) the durable consecutive zero-file-change
+ * implementation-round counter (see `TaskProgress.zeroChangeImplRounds`'s
+ * doc comment) — the persisted form of the no-progress breaker's input (2c).
+ */
+export function setZeroChangeImplRounds(
+  progress: TaskProgress,
+  rounds: number | undefined
+): TaskProgress {
+  return {
+    ...progress,
+    zeroChangeImplRounds: rounds,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+/**
  * Record that automated review iteration has given up and needs a human
  * decision. Does not itself change `status` — callers that want the
  * automation chain to actually stop must also set `status: "paused"` (see

@@ -123,9 +123,105 @@ const STANDALONE_MARKER_LINE = new RegExp(
   `^[ \\t]*${IMPLEMENTATION_CHECKLIST_MARKER_V1.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}[ \\t]*\\r?$`
 );
 
-/** Item-identity text: must match the extension's key exactly (parity-tested). */
+/**
+ * Item-identity text: must match the extension's key exactly (parity-tested).
+ *
+ * Unescapes backslash-escaped quotes/apostrophes/backslashes BEFORE the trim/
+ * lowercase/whitespace collapse — port of the extension's
+ * `normalizeChecklistItemTextV1`, which exists because a round-trip through a
+ * JSON-encoded field can leave over-escaped quotes on disk as literal
+ * backslash-quote sequences.
+ */
 export function normalizeChecklistItemTextV1(text: string): string {
-  return text.trim().toLowerCase().replace(/\s+/g, " ");
+  const unescaped = text
+    .replace(/\\"/g, "\"")
+    .replace(/\\'/g, "'")
+    .replace(/\\\\/g, "\\");
+  return unescaped.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+/**
+ * A round's `## Plan Item Checklist` section may report an item as `done`
+ * with this marker to claim it was completed in an EARLIER round and only
+ * verified (not built) this round — port of the extension's
+ * `RETROACTIVE_TICK_MARKER_V1`; must match its marker text exactly
+ * (parity-tested). Only honored alongside non-empty evidence following it.
+ */
+export const RETROACTIVE_TICK_MARKER_V1 = "<!-- ensemble:retroactive -->";
+
+/** One retroactive-tick claim parsed from a round's `## Plan Item Checklist` section. */
+export interface RetroactiveTickClaimV1 {
+  readonly itemText: string;
+  readonly evidence: string;
+}
+
+const CHECKLIST_ENTRY_LINE = /^[ \t]*[-*][ \t]+(.*\S)[ \t]*\r?$/;
+
+function parsePlanItemChecklistLine(
+  raw: string
+): { itemText: string; status: string; evidence: string } | undefined {
+  const outer = CHECKLIST_ENTRY_LINE.exec(raw);
+  if (!outer) {
+    return undefined;
+  }
+  const parts = (outer[1] ?? "").split(/\s+—\s+/);
+  if (parts.length < 2) {
+    return undefined;
+  }
+  return {
+    itemText: (parts[0] ?? "").trim(),
+    status: (parts[1] ?? "").trim(),
+    evidence: parts.slice(2).join(" — ").trim(),
+  };
+}
+
+/**
+ * Retroactive-tick claims declared in `ownSummary` — the part of a response
+ * AFTER the `## Files Changed` boundary (`splitSummaryAtEchoV1`'s `own`),
+ * never the echoed plan checklist itself. Port of the extension's
+ * `collectRetroactiveTickClaimsV1`. A claim with empty `evidence` is still
+ * returned so the caller can treat it as unfulfilled rather than dropping it.
+ */
+export function collectRetroactiveTickClaimsV1(
+  ownSummary: string
+): RetroactiveTickClaimV1[] {
+  const claims: RetroactiveTickClaimV1[] = [];
+  const all = headingsV1(ownSummary);
+  const at = findLastHeadingV1(all, "Plan Item Checklist");
+  if (at === -1) {
+    return claims;
+  }
+  const heading = all[at];
+  if (!heading) {
+    return claims;
+  }
+  const lines = walkLinesV1(ownSummary);
+  let end = lines.length;
+  for (let h = at + 1; h < all.length; h++) {
+    const candidate = all[h];
+    if (candidate && candidate.level <= heading.level) {
+      end = candidate.line;
+      break;
+    }
+  }
+  for (let i = heading.line + 1; i < end; i++) {
+    const line = lines[i];
+    if (!line || line.fenced) {
+      continue;
+    }
+    const parsed = parsePlanItemChecklistLine(line.text);
+    if (!parsed) {
+      continue;
+    }
+    if (
+      !parsed.status.toLowerCase().startsWith("done") ||
+      !parsed.status.includes(RETROACTIVE_TICK_MARKER_V1)
+    ) {
+      continue;
+    }
+    claims.push({ itemText: parsed.itemText, evidence: parsed.evidence });
+  }
+  return claims;
 }
 
 /**
@@ -231,20 +327,34 @@ export function hasImplementationChecklistV1(content: string): boolean {
   );
 }
 
+/**
+ * Marks one checklist line as an operator-action/optional/descoped step —
+ * port of the extension's `EXCLUDED_CHECKLIST_ITEM_MARKER_V1`. See
+ * `src/utils/implementationChecklist.ts` for the full rationale; must match
+ * the extension's marker text exactly (parity-tested).
+ */
+export const EXCLUDED_CHECKLIST_ITEM_MARKER_V1 = "<!-- ensemble:excluded -->";
+
+function isExcludedChecklistItemText(itemText: string): boolean {
+  return itemText.trimEnd().endsWith(EXCLUDED_CHECKLIST_ITEM_MARKER_V1);
+}
+
 /** Countable state of a plan-of-record checklist. */
 export interface ChecklistProgressV1 {
-  /** Checklist items in the latest rendering. */
+  /** Checklist items in the latest rendering, excluding marked-excluded items. */
   readonly total: number;
-  /** Items whose box is ticked. */
+  /** Items whose box is ticked, excluding marked-excluded items. */
   readonly checked: number;
   /** `total - checked` — the work the plan still says is outstanding. */
   readonly remaining: number;
+  /** Items carrying `EXCLUDED_CHECKLIST_ITEM_MARKER_V1`, counted separately. */
+  readonly excluded: number;
 }
 
 function itemsInLatestRendering(
   content: string
-): { text: string; checked: boolean }[] {
-  const items: { text: string; checked: boolean }[] = [];
+): { text: string; checked: boolean; excluded: boolean }[] {
+  const items: { text: string; checked: boolean; excluded: boolean }[] = [];
   const scoped = scopeToLatestChecklistV1(content).region;
   const region = filesChangedIsSummaryBoundary(scoped)
     ? splitSummaryAtEchoV1(scoped).echo
@@ -255,16 +365,23 @@ function itemsInLatestRendering(
     }
     const match = ANY_ITEM_LINE.exec(line.text);
     if (match) {
+      const text = match[2] ?? "";
       items.push({
-        text: match[2] ?? "",
+        text,
         checked: match[1]?.toLowerCase() === "x",
+        excluded: isExcludedChecklistItemText(text),
       });
     }
   }
   return items;
 }
 
-/** Count the plan of record's checklist, or `undefined` when it carries none. */
+/**
+ * Count the plan of record's checklist, or `undefined` when it carries none.
+ * Marked-excluded items are excluded from `total`/`checked` but still count
+ * toward "is there a checklist at all" (a plan whose only items are all
+ * excluded is a real, if fully out-of-scope, checklist).
+ */
 export function countChecklistProgressV1(
   planOfRecord: string
 ): ChecklistProgressV1 | undefined {
@@ -272,8 +389,14 @@ export function countChecklistProgressV1(
   if (items.length === 0) {
     return undefined;
   }
-  const checked = items.filter((item) => item.checked).length;
-  return { total: items.length, checked, remaining: items.length - checked };
+  const counted = items.filter((item) => !item.excluded);
+  const checked = counted.filter((item) => item.checked).length;
+  return {
+    total: counted.length,
+    checked,
+    remaining: counted.length - checked,
+    excluded: items.length - counted.length,
+  };
 }
 
 /** How many times each item is reported CHECKED in `content`. */
@@ -291,19 +414,71 @@ export function collectCheckedChecklistCountsV1(
 }
 
 /**
+ * Outcome of {@link mergeChecklistProgressV1} — port of the extension's
+ * `MergeChecklistProgressResultV1`. Distinguishes a legitimate no-op
+ * ("unchanged"/"no-report") from a round that reported ticks matching
+ * nothing in the plan of record ("no-match"), which must be surfaced rather
+ * than silently swallowed.
+ */
+export type MergeChecklistProgressResultV1 =
+  | { readonly kind: "unchanged" }
+  | { readonly kind: "no-report" }
+  | { readonly kind: "no-match"; readonly unmatchedSample: readonly string[] }
+  | {
+      readonly kind: "merged";
+      readonly content: string;
+      readonly retroactiveTicks?: readonly { readonly itemText: string; readonly evidence: string }[];
+    };
+
+/**
  * Apply the checkbox state a round reported in `summary` to `planOfRecord`
  * (port of `mergeChecklistProgressV1`): ticks only (never untick), matched
  * by text and COUNT rather than position, byte-preserving and confined to
- * the latest rendering. Returns the updated document, or `undefined` when
- * nothing changed.
+ * the latest rendering. Also folds in retroactive-tick claims from the
+ * round's own `## Plan Item Checklist` section. See
+ * {@link MergeChecklistProgressResultV1}.
  */
 export function mergeChecklistProgressV1(
   planOfRecord: string,
   summary: string
-): string | undefined {
-  const reported = collectCheckedChecklistCountsV1(splitSummaryAtEchoV1(summary).echo);
+): MergeChecklistProgressResultV1 {
+  const { echo, own } = splitSummaryAtEchoV1(summary);
+  const reported = new Map<string, number>(collectCheckedChecklistCountsV1(echo));
+
+  const reportedRawText = new Map<string, string>();
+  for (const item of itemsInLatestRendering(echo)) {
+    if (item.checked) {
+      const key = normalizeChecklistItemTextV1(item.text);
+      if (!reportedRawText.has(key)) {
+        reportedRawText.set(key, item.text);
+      }
+    }
+  }
+
+  const retroactiveKeys = new Set<string>();
+  const retroactiveEvidenceByKey = new Map<string, string>();
+  const missingEvidenceSamples: string[] = [];
+  for (const claim of collectRetroactiveTickClaimsV1(own)) {
+    const key = normalizeChecklistItemTextV1(claim.itemText);
+    if (claim.evidence.length === 0) {
+      missingEvidenceSamples.push(claim.itemText);
+      continue;
+    }
+    reported.set(key, (reported.get(key) ?? 0) + 1);
+    retroactiveKeys.add(key);
+    if (!retroactiveEvidenceByKey.has(key)) {
+      retroactiveEvidenceByKey.set(key, claim.evidence);
+    }
+    if (!reportedRawText.has(key)) {
+      reportedRawText.set(key, claim.itemText);
+    }
+  }
+
   if (reported.size === 0) {
-    return undefined;
+    if (missingEvidenceSamples.length > 0) {
+      return { kind: "no-match", unmatchedSample: missingEvidenceSamples.slice(0, 2) };
+    }
+    return { kind: "no-report" };
   }
 
   const { prefix, region } = scopeToLatestChecklistV1(planOfRecord);
@@ -320,6 +495,7 @@ export function mergeChecklistProgressV1(
   }
 
   let changed = false;
+  const retroactiveTicks: { itemText: string; evidence: string }[] = [];
   const mergedRegion = walkLinesV1(region)
     .map((line) => {
       if (line.fenced) {
@@ -338,13 +514,42 @@ export function mergeChecklistProgressV1(
           }
           owed.set(key, remaining - 1);
           changed = true;
+          if (retroactiveKeys.has(key)) {
+            retroactiveTicks.push({
+              itemText: text,
+              evidence: retroactiveEvidenceByKey.get(key) ?? "",
+            });
+          }
           return `${open}x${close}${text}${trailing}`;
         }
       );
     })
     .join("");
 
-  return changed ? `${prefix}${mergedRegion}` : undefined;
+  if (changed) {
+    return {
+      kind: "merged",
+      content: `${prefix}${mergedRegion}`,
+      ...(retroactiveTicks.length > 0 ? { retroactiveTicks } : {}),
+    };
+  }
+
+  const planKeys = new Set(
+    itemsInLatestRendering(planOfRecord).map((item) => normalizeChecklistItemTextV1(item.text))
+  );
+  const unmatchedSample: string[] = [...missingEvidenceSamples];
+  for (const key of reported.keys()) {
+    if (!planKeys.has(key) && !unmatchedSample.includes(reportedRawText.get(key) ?? key)) {
+      unmatchedSample.push(reportedRawText.get(key) ?? key);
+    }
+    if (unmatchedSample.length >= 2) {
+      break;
+    }
+  }
+  if (unmatchedSample.length > 0) {
+    return { kind: "no-match", unmatchedSample: unmatchedSample.slice(0, 2) };
+  }
+  return { kind: "unchanged" };
 }
 
 /** A round's self-reported `N/M` plan progress. */

@@ -457,6 +457,26 @@ void describe("createCliTextTransportV1 per shipped CLI definition", () => {
         "",
       ].join("\n");
     }
+    if (def.structuredEventStream === "claude") {
+      // Claude Code CLI's --output-format stream-json: an init event, then
+      // one `assistant` message per turn of output, and the LAST one is the
+      // real answer — same "last message wins" shape as Codex/Kimi above,
+      // and exactly why claude-cli's text mode moved off plain `text` (see
+      // providers.ts's buildArgs comment).
+      return [
+        JSON.stringify({ type: "system", subtype: "init" }),
+        JSON.stringify({
+          type: "assistant",
+          message: { role: "assistant", content: [{ type: "text", text: "Let me check that." }] },
+        }),
+        JSON.stringify({
+          type: "assistant",
+          message: { role: "assistant", content: [{ type: "text", text: frame }] },
+        }),
+        JSON.stringify({ type: "result", subtype: "success", is_error: false, result: frame }),
+        "",
+      ].join("\n");
+    }
     if (def.structuredEventStream !== undefined) {
       throw new Error(
         `Unrecognized structuredEventStream ${String(def.structuredEventStream)} for ${def.id} — add a fixture shape for it here.`

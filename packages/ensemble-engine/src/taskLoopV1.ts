@@ -291,10 +291,22 @@ export function createEngineTaskV1(options: CreateEngineTaskOptionsV1): EngineTa
     RunEngineRoundResultV1,
     { kind: "completed" }
   > {
-    const merged = mergeChecklistProgressV1(planOfRecord, summaryMarkdown);
-    if (merged !== undefined) {
-      planOfRecord = merged;
+    const mergeResult = mergeChecklistProgressV1(planOfRecord, summaryMarkdown);
+    if (mergeResult.kind === "merged") {
+      planOfRecord = mergeResult.content;
+    } else if (mergeResult.kind === "no-match") {
+      // The round reported ticked items, but none matched any item in the
+      // plan of record — never a legitimate no-op (a corrupted or reworded
+      // echo, or a stale/foreign checklist). Surfaced rather than silently
+      // treated the same as "nothing changed", mirroring the extension's
+      // handling in reviewActions.ts.
+      emitError(
+        "checklistProgressNoMatch",
+        "round reported checklist progress that matched no item in the plan of record " +
+          `(unmatched: ${mergeResult.unmatchedSample.map((text) => `"${text}"`).join(", ")})`
+      );
     }
+    // "unchanged" / "no-report" behave as the old undefined case did.
     const checklist = countChecklistProgressV1(planOfRecord);
     const reported = parseReviewProgressV1(summaryMarkdown);
     const progress = reconcileProgressWithChecklistV1(reported, checklist);

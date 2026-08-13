@@ -71,6 +71,37 @@ void describe("taskProgressFieldPolicyV1", () => {
     }
   });
 
+  void it("zeroChangeImplRounds is cleared on nextStage, markTaskDone, and reopen (step 8)", () => {
+    const next = applyNextStagePolicyV1(baseProgress({ zeroChangeImplRounds: 4 }), { now: NOW });
+    assert.equal(next.ok, true);
+    if (next.ok) {
+      assert.equal(next.progress.zeroChangeImplRounds, undefined);
+    }
+
+    const done = applyMarkTaskDonePolicyV1(
+      baseProgress({ currentStage: "publish", zeroChangeImplRounds: 2 }),
+      { now: NOW }
+    );
+    assert.equal(done.ok, true);
+    if (done.ok) {
+      assert.equal(done.progress.zeroChangeImplRounds, undefined);
+    }
+
+    const reopened = applyReopenPolicyV1(
+      baseProgress({
+        status: "completed",
+        currentStage: "publish",
+        completedAt: "2026-07-09T00:00:00.000Z",
+        zeroChangeImplRounds: 7,
+      }),
+      { now: NOW, selectedStage: "impl" }
+    );
+    assert.equal(reopened.ok, true);
+    if (reopened.ok) {
+      assert.equal(reopened.progress.zeroChangeImplRounds, undefined);
+    }
+  });
+
   void it("nextStage applies every column rule", () => {
     const input = baseProgress({
       lintPayload: { runAt: NOW, passed: true },

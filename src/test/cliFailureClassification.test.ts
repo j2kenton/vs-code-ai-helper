@@ -39,6 +39,8 @@ const {
   toFriendlyError,
   extractStructuredCliDiagnostics,
   extractClineStructuredDiagnostics,
+  extractClaudeCliFinalOutput,
+  extractClaudeCliStructuredDiagnostics,
   unwrapJsonString,
   applyTransportTransience,
   truncateCliDetail,
@@ -107,6 +109,30 @@ const CLINE_LIKE: CliProviderDefinition = {
   structuredEventStream: "cline",
   buildArgs(): string[] {
     return ["--json"];
+  },
+};
+
+/**
+ * A claude-cli-shaped provider using the new stream-json structured stream
+ * (Step 16: claude-cli moved off `--output-format text`) — real marker list
+ * from the shipped definition. Distinct from OPAQUE_TEXT_LIKE below, which
+ * intentionally keeps claude-cli's OLD opaque-text shape so the many
+ * opaque-provider tests in this file (auth/transport classification for a
+ * provider with no structured stream at all) stay meaningful.
+ */
+const CLAUDE_STRUCTURED_LIKE: CliProviderDefinition = {
+  id: "claude-cli",
+  label: "Claude Code",
+  command: "claude",
+  installHint: "Install claude.",
+  loginHint: "Run `claude` and sign in.",
+  authErrorMarkers: ["log in", "login", "authenticate", "api key", "oauth"],
+  signInLabel: "Sign in",
+  models: [],
+  usesLastMessageFile: false,
+  structuredEventStream: "claude",
+  buildArgs(): string[] {
+    return ["-p", "--output-format", "stream-json", "--verbose"];
   },
 };
 
@@ -364,6 +390,43 @@ void describe("toFriendlyError — structured-stream providers", () => {
     const classified = classifyFailed(friendly.message);
 
     assert.notEqual(classified.failureKind, "quota");
+  });
+});
+
+void describe("toFriendlyError — hook-lifecycle text ranked below other diagnostic content", () => {
+  // Production shape: a Claude Code SessionEnd hook installed by a Claude Code
+  // plugin gets cancelled during an abrupt process teardown (the real cause —
+  // here, a synthetic rate-limit assistant message reading "Run /usage-credits
+  // to continue" — died on stderr alongside it). Before this fix, whichever
+  // line truncateCliDetail happened to keep decided the whole diagnosis.
+  const HOOK_LINE =
+    'SessionEnd hook [node "${CLAUDE_PLUGIN_ROOT}/scripts/session-lifecycle-hook.mjs" SessionEnd] failed: Hook cancelled';
+
+  void it("classifies as quota when a rate-limit line coexists with hook-lifecycle noise", () => {
+    const stderr = [
+      'You\'ve reached your Fable 5 limit. Run /usage-credits to continue or switch models with /model.',
+      HOOK_LINE,
+    ].join("\n");
+    const friendly = toFriendlyError(OPAQUE_TEXT_LIKE, undefined, 1, stderr, "");
+    const classified = classifyFailed(friendly.message);
+
+    assert.doesNotMatch(friendly.message, /Hook cancelled/);
+    assert.match(friendly.message, /usage-credits/);
+    assert.equal(classified.failureKind, "quota");
+  });
+
+  void it("still reports hook-lifecycle text when it is the only content present", () => {
+    const friendly = toFriendlyError(OPAQUE_TEXT_LIKE, undefined, 1, HOOK_LINE, "");
+
+    assert.match(friendly.message, /Hook cancelled/);
+  });
+
+  void it("strips hook noise from stdout too, for a provider with nothing on stderr", () => {
+    const stdout = ["Some real failure detail the model reported.", HOOK_LINE].join("\n");
+    const friendly = toFriendlyError(OPAQUE_TEXT_LIKE, undefined, 1, "", stdout);
+
+    assert.doesNotMatch(friendly.message, /Hook cancelled/);
+    assert.match(friendly.message, /real failure detail/);
   });
 });
 
@@ -694,6 +757,206 @@ void describe("extractClineStructuredDiagnostics", () => {
 
     assert.doesNotMatch(diagnostics.markerScanText, /api key|authenticate|login/);
     assert.equal(diagnostics.sawAnyEvent, true);
+  });
+});
+
+/**
+ * Claude Code CLI stream-json fixtures (Step 16). NEEDS-TOOLCHAIN: this shape
+ * is built from Claude Code CLI's documented event model, not yet confirmed
+ * against a live `claude` CLI invocation — see the doc comment on
+ * ClaudeCliEnvelope in cliAgentRunner.ts.
+ */
+function claudeAssistantEvent(text: string): string {
+  return JSON.stringify({
+    type: "assistant",
+    message: { role: "assistant", content: [{ type: "text", text }] },
+  });
+}
+
+void describe("extractClaudeCliFinalOutput", () => {
+  void it("returns the LAST assistant message when the model narrates before answering", () => {
+    const stdout = [
+      JSON.stringify({ type: "system", subtype: "init" }),
+      claudeAssistantEvent("Let me check that file first."),
+      claudeAssistantEvent("The answer is 42."),
+    ].join("\n");
+
+    assert.equal(extractClaudeCliFinalOutput(stdout), "The answer is 42.");
+  });
+
+  void it("concatenates multiple text parts within a single assistant message", () => {
+    const stdout = JSON.stringify({
+      type: "assistant",
+      message: {
+        role: "assistant",
+        content: [
+          { type: "text", text: "Part one. " },
+          { type: "tool_use", id: "call_1", name: "Read", input: {} },
+          { type: "text", text: "Part two." },
+        ],
+      },
+    });
+
+    assert.equal(extractClaudeCliFinalOutput(stdout), "Part one. Part two.");
+  });
+
+  void it("falls back to a placeholder when a recognized stream carries no assistant text", () => {
+    const stdout = JSON.stringify({ type: "system", subtype: "init" });
+
+    assert.match(extractClaudeCliFinalOutput(stdout), /did not return any text|without returning any text reply/);
+  });
+
+  void it("falls back to the raw stream when stdout is not a recognizable event stream at all", () => {
+    assert.equal(extractClaudeCliFinalOutput("some unrelated plain text"), "some unrelated plain text");
+  });
+});
+
+void describe("extractClaudeCliStructuredDiagnostics", () => {
+  void it("sets quotaSignal when a terminal result event reports a structural rate_limit error", () => {
+    const stdout = [
+      claudeAssistantEvent("Working on it..."),
+      JSON.stringify({
+        type: "result",
+        subtype: "error_max_turns",
+        is_error: true,
+        error: "rate_limit",
+        result: "Rate limit reached for this account.",
+      }),
+    ].join("\n");
+    const diagnostics = extractClaudeCliStructuredDiagnostics(stdout);
+
+    assert.equal(diagnostics.quotaSignal, true);
+    assert.match(diagnostics.detail, /rate_limit/);
+  });
+
+  void it("does not set quotaSignal for an unrelated structured error", () => {
+    const stdout = JSON.stringify({
+      type: "result",
+      is_error: true,
+      error: "invalid_model",
+      result: "The requested model is not available.",
+    });
+    const diagnostics = extractClaudeCliStructuredDiagnostics(stdout);
+
+    assert.equal(diagnostics.quotaSignal, false);
+    assert.match(diagnostics.detail, /invalid_model/);
+  });
+
+  void it("never scans the model's own assistant text for diagnosis, only is_error result/system events", () => {
+    // Same exclusion every sibling structured extractor applies: assistant
+    // text can quote file contents (e.g. one mentioning "login"/"api key")
+    // back to the user, so it must never reach the auth/quota scan.
+    const stdout = [
+      claudeAssistantEvent("The file you read says: please login with your api key."),
+      JSON.stringify({ type: "result", subtype: "success", is_error: false, result: "done" }),
+    ].join("\n");
+    const diagnostics = extractClaudeCliStructuredDiagnostics(stdout);
+
+    assert.doesNotMatch(diagnostics.markerScanText, /login|api key/);
+  });
+
+  void it("does not flag a successful (is_error: false) result as a quota signal", () => {
+    const stdout = JSON.stringify({ type: "result", subtype: "success", is_error: false, result: "done" });
+    const diagnostics = extractClaudeCliStructuredDiagnostics(stdout);
+
+    assert.equal(diagnostics.quotaSignal, false);
+  });
+});
+
+void describe("toFriendlyError — claude-cli stream-json", () => {
+  void it("feeds a structural rate_limit signal into isQuotaError even though the code has no space-separated 'rate limit' phrase", () => {
+    const stdout = JSON.stringify({
+      type: "result",
+      is_error: true,
+      error: "rate_limit",
+      result: "You have hit the rate_limit for this account.",
+    });
+    const friendly = toFriendlyError(CLAUDE_STRUCTURED_LIKE, "sonnet", 1, "", stdout);
+
+    assert.equal(friendly.quotaSignal, true);
+    const classified = classifyCliFailure({
+      status: "failed" as const,
+      output: "",
+      errorMessage: friendly.message,
+      structuredQuotaSignal: friendly.quotaSignal,
+    });
+    assert.equal(classified.failureKind, "quota");
+  });
+
+  void it("does not diagnose auth from the model's own assistant prose", () => {
+    const stdout = [
+      claudeAssistantEvent("This project's README says: run `claude` and login with your api key."),
+      JSON.stringify({ type: "result", subtype: "success", is_error: false, result: "done" }),
+    ].join("\n");
+    const friendly = toFriendlyError(CLAUDE_STRUCTURED_LIKE, "sonnet", 1, "", stdout);
+
+    assert.equal(friendly.authFailure, false);
+  });
+});
+
+// Step 16's edit-mode contract: claude-cli's stream-json move is TEXT-MODE
+// ONLY (its buildArgs keeps edit mode on `--output-format text`), but the
+// `structuredEventStream: "claude"` provider tag is mode-blind. Review
+// blocker: routed through the structured extractors, an edit-mode failure's
+// plain-prose stdout lands in markerScanText wholesale (every non-JSON line
+// is "scan-safe" by parseJsonLineEvents' rules) and gets scanned by
+// isAuthenticationFailure — a change to edit-mode failure classification the
+// plan requires untouched. effectiveStructuredStreamDefV1 is the mode-scoped
+// seam execCliAgent applies before normalizeCliOutput/toFriendlyError.
+void describe("effectiveStructuredStreamDefV1 — claude edit mode keeps the opaque-text contract", () => {
+  const { effectiveStructuredStreamDefV1, normalizeCliOutput } = __testOnly;
+
+  void it("strips the claude structured tag for edit mode and leaves text mode untouched", () => {
+    const editDef = effectiveStructuredStreamDefV1(CLAUDE_STRUCTURED_LIKE, "edit");
+    assert.equal(editDef.structuredEventStream, undefined);
+    // Text mode is exactly the shipped definition, by identity — no cloning.
+    assert.equal(effectiveStructuredStreamDefV1(CLAUDE_STRUCTURED_LIKE, "text"), CLAUDE_STRUCTURED_LIKE);
+    // Providers whose structured stream applies in every mode pass through
+    // untouched in edit mode too.
+    assert.equal(effectiveStructuredStreamDefV1(CLINE_LIKE, "edit"), CLINE_LIKE);
+    assert.equal(effectiveStructuredStreamDefV1(OPENCODE_LIKE, "edit"), OPENCODE_LIKE);
+  });
+
+  void it("retains the prior opaque classification for a plain-text edit-mode failure mentioning auth terms", () => {
+    // Plain `--output-format text` stdout: the model narrates about a 403 it
+    // saw while working. "403"/"Forbidden" match isAuthenticationFailure's
+    // broad regex but none of claude-cli's own authErrorMarkers — so the
+    // OLD opaque-text contract (broad regex scans stderr ONLY; stdout gets
+    // just the narrow marker list) classifies this as NOT an auth failure.
+    const editModeStdout =
+      "I tried fetching the dashboard fixture and the server returned 403 Forbidden, " +
+      "so I stubbed the response instead and continued editing.";
+    const editDef = effectiveStructuredStreamDefV1(CLAUDE_STRUCTURED_LIKE, "edit");
+    const friendly = toFriendlyError(editDef, "sonnet", 1, "", editModeStdout);
+
+    assert.equal(
+      friendly.authFailure,
+      false,
+      "edit-mode prose must not be fed to the broad auth regex — that is the pre-Step-16 opaque contract"
+    );
+    // No structured extractor ran, so no structural quota signal can exist.
+    assert.equal(friendly.quotaSignal, false);
+    // Sanity check on why this test has teeth: the SAME stdout through the
+    // unstripped structured def IS scanned wholesale (every prose line is
+    // "scan-safe") and false-positives as auth — the exact regression the
+    // mode scoping prevents.
+    const unscoped = toFriendlyError(CLAUDE_STRUCTURED_LIKE, "sonnet", 1, "", editModeStdout);
+    assert.equal(unscoped.authFailure, true);
+  });
+
+  void it("normalizes edit-mode stdout as opaque text, not through the claude extractor", () => {
+    // A stray JSON line among prose: the claude extractor would treat it as a
+    // recognized event and reduce the output to the no-text-reply
+    // placeholder; the opaque path must return the stdout verbatim.
+    const editModeStdout = [
+      JSON.stringify({ type: "system", subtype: "init" }),
+      "Edited 3 files to address the review.",
+    ].join("\n");
+    const editDef = effectiveStructuredStreamDefV1(CLAUDE_STRUCTURED_LIKE, "edit");
+    assert.equal(
+      normalizeCliOutput(editDef, editModeStdout, undefined),
+      editModeStdout.trim()
+    );
   });
 });
 

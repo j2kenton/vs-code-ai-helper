@@ -126,6 +126,17 @@ export interface LintPayload {
   issueCount?: number;
   /** Commands that failed, including their exit codes and output. */
   failedChecks?: Array<{ command: string; exitCode: number; output: string }>;
+  /**
+   * Where this payload came from. `"publish"` (the default when absent, for
+   * backward compatibility) means a real Publish attempt ran the checks via
+   * `runCompletionLint`. `"review"` means a Publish-stage review computed
+   * this via `collectCompletionLintPreview` (allowScopePrompt: false) while
+   * building its `{{verifiedChecks}}`/`{{planItemVerification}}` prompt
+   * variables — real, ground-truth check results, but possibly against a
+   * stale Publish scope compared to what an actual publish attempt would
+   * resolve.
+   */
+  source?: "publish" | "review";
 }
 
 /**
@@ -270,6 +281,24 @@ export interface TaskProgress {
    * a later round, which has no way to know what the unrecorded round did.
    */
   checklistProgressUnreliable?: boolean;
+
+  /**
+   * Consecutive completed implementation rounds (for the task's current
+   * stage) that changed zero files — the durable form of the no-progress
+   * breaker's counter (2c, `ensemble.resilience.noProgressBreakerRounds`).
+   *
+   * Deliberately persisted, reversing the counter's original in-memory-only
+   * design: a per-session `Map` reset on every window reload, which let a
+   * task that could have tripped the breaker keep silently accumulating
+   * fresh zero-change rounds after a reload instead (report 11). The counter
+   * now survives reloads and survives across rounds within a stage.
+   *
+   * Reset to zero (or cleared) on any round that changes files, and on a
+   * stage transition — NOT consume-before-transition: a stage's own loop
+   * must be able to read a count written several rounds earlier, so this is
+   * not wiped merely because the field was read once.
+   */
+  zeroChangeImplRounds?: number;
 }
 
 /** `TaskProgress.implementationTypeCheckFailure` — one round's failing type-check. */

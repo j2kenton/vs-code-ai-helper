@@ -5,7 +5,9 @@ import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { updateLintPayload } from "../utils/taskProgressTransforms";
 import { IncompleteTask } from "../types/incompleteTask";
+import { PUBLISH_CHECKS_FILENAME } from "../types/taskProgress";
 import { NotificationRouter } from "../utils/notificationRouter";
+import { readNonEmptyText } from "../utils/fileUtils";
 import {
   runCompletionLint,
   resolvePublishScopeFolder,
@@ -136,22 +138,46 @@ export async function runLintingFixes(
     resolvedTask.progress.currentStage !== "publish"
   ) {
     NotificationRouter.showWarning(
-      "Linting fixes are only available for completed tasks."
+      "Linting fixes are only available at the Publish stage. Advance this task to Publish first."
     );
     return;
   }
 
-  // Fix what the LAST Publish-checks report found — this action never runs
-  // the initial checks itself. The first Publish action (runPublishChecks)
-  // produces the report; checks re-run here only AFTER fixes, to verify them
-  // and refresh the report. Gated before the tracked operation so the
-  // "Run Publish Checks" fallback never contends with this action's own
-  // exclusive task lock.
+  // Fix what the LAST Publish-checks report (task-progress.json's
+  // lintPayload) found — this action never runs the initial checks itself.
+  // The first Publish action (runPublishChecks) produces the report; checks
+  // re-run here only AFTER fixes, to verify them and refresh the report.
+  // Gated before the tracked operation so the "Run Publish Checks" fallback
+  // never contends with this action's own exclusive task lock.
+  //
+  // A Publish-stage review also populates this same lintPayload as a
+  // side effect of computing its {{verifiedChecks}}/{{planItemVerification}}
+  // prompt variables (reviewActions.ts's buildVerifiedChecksVariable /
+  // persistPublishReviewLintPayload) — so it may already be populated here
+  // even if no explicit "Run Publish Checks" ever ran. That review-sourced
+  // lintPayload is marked `source: "review"`; nothing here needs to branch
+  // on it, but it explains why a report can exist without runCompletionLint
+  // ever having run for this task.
   const lastReport = resolvedTask.progress.lintPayload;
   if (!lastReport) {
+    // publish-checks.md (the Publish report artifact, distinct from the
+    // AI reviewer's publish-review.md verdict) is only ever written by an
+    // actual Publish checks run — never by this preview/review path — so
+    // its presence here means checks ran and were reported at some point,
+    // but no lintPayload survived to this task's current progress (an old
+    // task from before lintPayload persistence existed, or a state file
+    // that was reset/edited by hand). Word this so it doesn't flatly claim
+    // "no report found" when there is visibly a Publish report on disk.
+    const publishChecksUri = vscode.Uri.file(
+      path.join(resolvedTask.taskFolderPath, PUBLISH_CHECKS_FILENAME)
+    );
+    const publishChecksContent = await readNonEmptyText(publishChecksUri);
     NotificationRouter.showWarning(
-      "No Publish report found. Run the Publish checks first to generate " +
-        "the report this action fixes.",
+      publishChecksContent
+        ? `A ${PUBLISH_CHECKS_FILENAME} report exists on disk, but no usable Publish check result is ` +
+          "currently recorded for this task. Run the Publish checks again to refresh the report this action fixes."
+        : "The Publish checks have not been run for this task yet. Run the Publish checks first to generate " +
+          "the report this action fixes.",
       undefined,
       undefined,
       undefined,

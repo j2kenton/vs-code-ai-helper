@@ -198,15 +198,62 @@ export async function improveReviewScore(options: {
    * goal, but never replaces the mandatory baseline improvement (of at least
    * MIN_SCORE_IMPROVEMENT). */
   stopAtScore?: number;
+  /**
+   * Evidence from the review that already existed BEFORE this call started
+   * (the same review `baselineScore` was read from) — lets a baseline that
+   * is already at or above `stopAtScore` with nothing fixable succeed
+   * without burning even one apply()/review() cycle. Without this, a
+   * finished 10/10 task still runs a full round: `improved` demands
+   * `baselineScore + 0.1`, which cannot exist at a baseline of 10 on a
+   * 0-10 scale, so the loop always falls through to the zero-fixable path
+   * — but that path itself needs ZERO_FIXABLE_TERMINAL_ROUNDS consecutive
+   * evidence, and the counter starts at 0 every call. Passing the pre-loop
+   * review's own evidence here both seeds that counter (so one in-loop
+   * round after a zero-fixable baseline can still terminate) and — when the
+   * evidence already clears the bar — skips apply() on attempt 1 entirely.
+   */
+  preLoopEvidence?: {
+    /** Same positive-evidence contract as ReviewRoundOutcome.zeroFixableEvidence. */
+    zeroFixableEvidence: boolean;
+    /** Same contract as ReviewRoundOutcome.progress → isPlanIncomplete. */
+    planIncomplete: boolean;
+  };
 }): Promise<ImproveReviewScoreResult> {
   let best: number | null = null;
   let escalationDeferred = false;
-  let consecutiveZeroFixable = 0;
+  // Seeded from the pre-loop review's own evidence (see preLoopEvidence) so
+  // the counter reflects what is already known rather than only what this
+  // run generates — without this, a zero-fixable baseline is invisible to
+  // the ZERO_FIXABLE_TERMINAL_ROUNDS check and costs one extra round.
+  let consecutiveZeroFixable = options.preLoopEvidence?.zeroFixableEvidence ? 1 : 0;
   /** Last round's reported `progress.complete`, for detecting forward movement. */
   let previousComplete: number | null = null;
   let roundsWithoutProgressAdvance = 0;
   const maxAttempts = Math.max(1, options.maxAttempts ?? MAX_REVIEW_ATTEMPTS);
   const stopAtScore = Math.max(0, Math.min(10, options.stopAtScore ?? 0));
+
+  // Pre-loop short-circuit: the evidence already in hand (from the review
+  // that produced baselineScore) shows the task is already finished. Succeed
+  // without running apply() even once — the round that would otherwise run
+  // here is exactly the one that failed in report 7 (a model asked to
+  // "improve" work a reviewer already called perfect).
+  if (
+    stopAtScore > 0 &&
+    options.baselineScore >= stopAtScore &&
+    options.preLoopEvidence?.zeroFixableEvidence === true &&
+    options.preLoopEvidence.planIncomplete === false
+  ) {
+    return {
+      score: options.baselineScore,
+      attempts: 0,
+      improved: false,
+      stalled: false,
+      paused: false,
+      escalationDeferred: false,
+      zeroFixableSuccess: true,
+    };
+  }
+
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     if (options.token?.isCancellationRequested) {
       throw new vscode.CancellationError();
@@ -270,6 +317,25 @@ export async function improveReviewScore(options: {
     // remaining step. A review with no progress marker is unaffected.
     if (improved && (stopAtScore === 0 || score >= stopAtScore) && !planIncomplete) {
       return { score, attempts: attempt, improved: true, stalled: false, paused: false, escalationDeferred, zeroFixableSuccess: false };
+    }
+
+    // Terminal success on the FIRST round whose own evidence shows the task
+    // is already at (or above) the configured stop level with nothing
+    // task-fixable left, regardless of whether the score moved from the
+    // baseline. This is what makes a 10/10 baseline reachable at all: the
+    // `improved` branch above demands `baselineScore + 0.1`, which has no
+    // representable value above a baseline of 10 on a 0-10 scale, so without
+    // this branch a perfect baseline could only ever succeed through the
+    // separate ZERO_FIXABLE_TERMINAL_ROUNDS path below — which still
+    // requires two consecutive rounds even when the very first one already
+    // proves there is nothing left to fix.
+    if (
+      stopAtScore > 0 &&
+      score >= stopAtScore &&
+      round.zeroFixableEvidence &&
+      !planIncomplete
+    ) {
+      return { score, attempts: attempt, improved: false, stalled: false, paused: false, escalationDeferred, zeroFixableSuccess: true };
     }
 
     consecutiveZeroFixable = round.zeroFixableEvidence ? consecutiveZeroFixable + 1 : 0;

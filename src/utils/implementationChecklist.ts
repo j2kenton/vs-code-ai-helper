@@ -56,11 +56,186 @@ const STANDALONE_MARKER_LINE = new RegExp(
 );
 
 /**
+ * A round that legitimately fixed a review blocker without ticking any plan
+ * checkbox (the work was a defect fix, not an unbuilt step) may state so
+ * explicitly with this marker instead of reproducing the checklist echo. Used
+ * by `describeImplementationSummaryShapeIssue` to accept the response without
+ * requiring `echoesPlanChecklist` to find an overlapping item, since a round
+ * that changed no checkbox state has nothing to echo.
+ */
+export const NO_CHECKLIST_CHANGE_MARKER_V1 = "<!-- ensemble:no-checklist-change -->";
+
+/** True when `response` declares, via the marker above, that no checkbox state changed this round. */
+export function declaresNoChecklistChangeV1(response: string): boolean {
+  return response.includes(NO_CHECKLIST_CHANGE_MARKER_V1);
+}
+
+/**
+ * Marks one checklist line as an operator-action/optional/descoped step the
+ * implementation stage cannot itself perform (e.g. "Deploy the classifier
+ * change to production", "Optional: add telemetry once the dashboard
+ * exists"). Written as a trailing HTML comment, on the same line, after the
+ * item's text:
+ *
+ *   - [ ] Deploy the classifier change to the production cluster <!-- ensemble:excluded -->
+ *
+ * An HTML comment (not a bracketed `[operator-action]` tag before the text)
+ * was chosen to match `NO_CHECKLIST_CHANGE_MARKER_V1`'s existing convention
+ * in this same file, and because it sits at the END of the line: `ITEM_LINE`
+ * and `ANY_ITEM_LINE` already capture "everything after the checkbox" as the
+ * item's text via `(.*\S)`, so a trailing marker needs no change to either
+ * regex — only to how the captured text is interpreted afterward.
+ *
+ * A marked item is still a real checklist item for every purpose except the
+ * completeness denominator: `itemsInLatestRendering` still returns it (so it
+ * is still matched/ticked by `mergeChecklistProgressV1` and still counted by
+ * `hasImplementationChecklistV1`/`collectChecklistItemKeysV1`), but
+ * `countChecklistProgressV1` excludes it from `total` and `checked` — which
+ * is what `reconcileProgressWithChecklistV1` (reviewReadiness.ts) reads as
+ * the denominator the completeness gate cannot be satisfied without.
+ *
+ * Additive only: a plan-final.md with no markers at all has zero lines
+ * matching this, so existing in-flight plans are completely unaffected.
+ */
+export const EXCLUDED_CHECKLIST_ITEM_MARKER_V1 = "<!-- ensemble:excluded -->";
+
+/** True when `itemText` (the checklist line's captured text) carries the exclusion marker. */
+function isExcludedChecklistItemText(itemText: string): boolean {
+  return itemText.trimEnd().endsWith(EXCLUDED_CHECKLIST_ITEM_MARKER_V1);
+}
+
+/**
+ * Reverses the over-escaping a checklist line can pick up from a round-trip
+ * through a JSON-encoded field (the checklist echo travels inside the
+ * `<<<ENSEMBLE_AI_RESULT_V1>>>` frame's `"markdown"` string, and the plan of
+ * record was itself generated the same way): backslash-escaped quotes
+ * (`\"` -> `"`), apostrophes (`\'` -> `'`) and doubled backslashes
+ * (`\\` -> `\`). Shared by `normalizeChecklistItemTextV1` (for the merge key)
+ * and `verifyPlanItems` (for the text it displays/hands to AI verification),
+ * so a corrupted plan item is unescaped identically wherever it is read —
+ * neither copy duplicates this logic.
+ */
+export function unescapeChecklistItemTextV1(text: string): string {
+  return text
+    .replace(/\\"/g, "\"")
+    .replace(/\\'/g, "'")
+    .replace(/\\\\/g, "\\");
+}
+
+/**
  * Item-identity text. Must match `verifyPlanItems`' key exactly, or an item
  * could merge here and count differently in Plan Item Verification.
+ *
+ * Unescapes via `unescapeChecklistItemTextV1` BEFORE the trim/lowercase/
+ * whitespace collapse below. Without unescaping here, a plan item written
+ * `Fix the \"foo\" bug` and an echo of the same item written clean as
+ * `Fix the "foo" bug` normalize to two different keys and never match, so the
+ * tick is silently dropped. Order matters: unescape first, so the corrupted
+ * and clean spellings of the same item collapse to one key before
+ * whitespace/case folding.
  */
 export function normalizeChecklistItemTextV1(text: string): string {
-  return text.trim().toLowerCase().replace(/\s+/g, " ");
+  const unescaped = unescapeChecklistItemTextV1(text);
+  return unescaped.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+/**
+ * A round's `## Plan Item Checklist` section may report an item as `done`
+ * with this marker to claim it was completed in an EARLIER round and only
+ * verified (not built) this round — see `apply-impl-review-code.md` and
+ * `run-implementation.md`. `FULLY COMPLETED this round` otherwise governs
+ * which boxes a round may tick, so this is the one sanctioned exception, and
+ * it is only honored when the same entry also carries non-empty evidence
+ * (file:line, symbol, or test name) after the marker.
+ */
+export const RETROACTIVE_TICK_MARKER_V1 = "<!-- ensemble:retroactive -->";
+
+/** One retroactive-tick claim parsed from a round's `## Plan Item Checklist` section. */
+export interface RetroactiveTickClaimV1 {
+  /** The plan item's identity text, matched the same way an echoed tick is. */
+  readonly itemText: string;
+  /** Verification evidence following the marker; empty when the round omitted it. */
+  readonly evidence: string;
+}
+
+const CHECKLIST_ENTRY_LINE = /^[ \t]*[-*][ \t]+(.*\S)[ \t]*\r?$/;
+
+/**
+ * Splits one `## Plan Item Checklist` bullet into its em-dash-separated
+ * fields: `<item> — <status> — <evidence...>`. `apply-impl-review-code.md`
+ * and `run-implementation.md` both mandate exactly this shape for every
+ * entry in that section.
+ */
+function parsePlanItemChecklistLine(
+  raw: string
+): { itemText: string; status: string; evidence: string } | undefined {
+  const outer = CHECKLIST_ENTRY_LINE.exec(raw);
+  if (!outer) {
+    return undefined;
+  }
+  const parts = (outer[1] ?? "").split(/\s+—\s+/);
+  if (parts.length < 2) {
+    return undefined;
+  }
+  return {
+    itemText: (parts[0] ?? "").trim(),
+    status: (parts[1] ?? "").trim(),
+    evidence: parts.slice(2).join(" — ").trim(),
+  };
+}
+
+/**
+ * Retroactive-tick claims declared in `ownSummary` — the part of a response
+ * AFTER the `## Files Changed` boundary (`splitSummaryAtEchoV1`'s `own`),
+ * never the echoed plan checklist itself, so a plan quoting this marker in
+ * its own text cannot be mistaken for a round claiming it.
+ *
+ * A claim with empty `evidence` is still returned (not dropped): the caller
+ * must treat it as an unfulfilled claim rather than silently ticking
+ * unverified work, and surface it the same way an unmatched echoed tick is
+ * surfaced — the hard evidence requirement is what keeps this from becoming
+ * a licence to mark unbuilt work done.
+ */
+export function collectRetroactiveTickClaimsV1(
+  ownSummary: string
+): RetroactiveTickClaimV1[] {
+  const claims: RetroactiveTickClaimV1[] = [];
+  const all = headingsV1(ownSummary);
+  const at = findLastHeadingV1(all, "Plan Item Checklist");
+  if (at === -1) {
+    return claims;
+  }
+  const heading = all[at];
+  if (!heading) {
+    return claims;
+  }
+  const lines = walkLinesV1(ownSummary);
+  let end = lines.length;
+  for (let h = at + 1; h < all.length; h++) {
+    const candidate = all[h];
+    if (candidate && candidate.level <= heading.level) {
+      end = candidate.line;
+      break;
+    }
+  }
+  for (let i = heading.line + 1; i < end; i++) {
+    const line = lines[i];
+    if (!line || line.fenced) {
+      continue;
+    }
+    const parsed = parsePlanItemChecklistLine(line.text);
+    if (!parsed) {
+      continue;
+    }
+    if (
+      !parsed.status.toLowerCase().startsWith("done") ||
+      !parsed.status.includes(RETROACTIVE_TICK_MARKER_V1)
+    ) {
+      continue;
+    }
+    claims.push({ itemText: parsed.itemText, evidence: parsed.evidence });
+  }
+  return claims;
 }
 
 /**
@@ -229,12 +404,18 @@ export function hasImplementationChecklistV1(content: string): boolean {
 
 /** Countable state of a plan-of-record checklist. */
 export interface ChecklistProgressV1 {
-  /** Checklist items in the latest rendering. */
+  /** Checklist items in the latest rendering, excluding marked-excluded items. */
   readonly total: number;
-  /** Items whose box is ticked. */
+  /** Items whose box is ticked, excluding marked-excluded items. */
   readonly checked: number;
   /** `total - checked` — the work the plan still says is outstanding. */
   readonly remaining: number;
+  /**
+   * Items carrying `EXCLUDED_CHECKLIST_ITEM_MARKER_V1` — counted separately
+   * so a caller can say WHY the denominator is smaller than the checklist's
+   * visible line count, without those items affecting `total`/`checked`.
+   */
+  readonly excluded: number;
 }
 
 /**
@@ -244,8 +425,8 @@ export interface ChecklistProgressV1 {
  */
 function itemsInLatestRendering(
   content: string
-): { text: string; checked: boolean }[] {
-  const items: { text: string; checked: boolean }[] = [];
+): { text: string; checked: boolean; excluded: boolean }[] {
+  const items: { text: string; checked: boolean; excluded: boolean }[] = [];
   // Scoped to the latest rendering, then cut at a run summary's `## Files
   // Changed` — but only when that heading really is a summary boundary.
   //
@@ -272,9 +453,11 @@ function itemsInLatestRendering(
     }
     const match = ANY_ITEM_LINE.exec(line.text);
     if (match) {
+      const text = match[2] ?? "";
       items.push({
-        text: match[2] ?? "",
+        text,
         checked: match[1]?.toLowerCase() === "x",
+        excluded: isExcludedChecklistItemText(text),
       });
     }
   }
@@ -288,6 +471,14 @@ function itemsInLatestRendering(
  * cross-copy duplication, so nothing here collapses by text — two genuinely
  * distinct steps that happen to share wording stay two steps, and neither
  * disappears from the denominator.
+ *
+ * Items carrying `EXCLUDED_CHECKLIST_ITEM_MARKER_V1` are excluded from both
+ * `total` and `checked` — an operator-action/optional/descoped step the
+ * implementation stage cannot itself perform must not hold the completeness
+ * gate (`reconcileProgressWithChecklistV1`) open forever. The presence check
+ * below still counts them: a plan whose only items are all marked excluded is
+ * a real (if fully out-of-scope) checklist, not "no checklist", so it must
+ * not fall through to `undefined` and silently disable the gate.
  */
 export function countChecklistProgressV1(
   planOfRecord: string
@@ -296,8 +487,14 @@ export function countChecklistProgressV1(
   if (items.length === 0) {
     return undefined;
   }
-  const checked = items.filter((item) => item.checked).length;
-  return { total: items.length, checked, remaining: items.length - checked };
+  const counted = items.filter((item) => !item.excluded);
+  const checked = counted.filter((item) => item.checked).length;
+  return {
+    total: counted.length,
+    checked,
+    remaining: counted.length - checked,
+    excluded: items.length - counted.length,
+  };
 }
 
 /** Normalized text of every checklist item in `content`'s latest rendering. */
@@ -324,8 +521,44 @@ export function collectCheckedChecklistCountsV1(
 }
 
 /**
- * Apply the checkbox state a round reported in `summary` to `planOfRecord`,
- * returning the updated document, or `undefined` when nothing changed.
+ * Outcome of {@link mergeChecklistProgressV1}, distinguishing the two
+ * situations that both used to collapse into a plain `undefined`:
+ *
+ *  - `"no-report"` / `"unchanged"` — nothing to do. Either the round reported
+ *    no ticked items at all (no echo, or an echo with every box unchecked),
+ *    or it reported ticks that exactly match what the plan already records.
+ *    Both are legitimate, silent no-ops — the caller's old `undefined`
+ *    behavior.
+ *  - `"no-match"` — the round DID report ticked items, but not one of them
+ *    matched any item text in the plan of record's latest rendering. This is
+ *    never a legitimate no-op: it means either the round echoed a corrupted
+ *    or reworded copy of the checklist (a live cause: escaped-quote
+ *    corruption surviving normalization, or the model paraphrasing an item),
+ *    or it echoed a stale/foreign checklist entirely. Silently treating this
+ *    like `"unchanged"` hid real progress from ever reaching the plan of
+ *    record, indistinguishable from a round that genuinely did nothing.
+ *    Carries a sample of the reported-but-unmatched item text so a caller can
+ *    name what did not match.
+ *  - `"merged"` — at least one box was ticked; `content` is the updated
+ *    document, byte-preserving except for the flipped checkbox glyphs.
+ *    `retroactiveTicks`, when present, lists the subset ticked via a
+ *    {@link RETROACTIVE_TICK_MARKER_V1} claim rather than the echo, each with
+ *    its verification evidence, so the caller can record them in the run log
+ *    for audit rather than treating every tick as identical.
+ */
+export type MergeChecklistProgressResultV1 =
+  | { readonly kind: "unchanged" }
+  | { readonly kind: "no-report" }
+  | { readonly kind: "no-match"; readonly unmatchedSample: readonly string[] }
+  | {
+      readonly kind: "merged";
+      readonly content: string;
+      readonly retroactiveTicks?: readonly { readonly itemText: string; readonly evidence: string }[];
+    };
+
+/**
+ * Apply the checkbox state a round reported in `summary` to `planOfRecord`.
+ * See {@link MergeChecklistProgressResultV1} for the returned outcome kinds.
  *
  * Deliberately narrow, because the plan of record is durable state and the
  * summary is model-authored text:
@@ -353,14 +586,57 @@ export function collectCheckedChecklistCountsV1(
 export function mergeChecklistProgressV1(
   planOfRecord: string,
   summary: string
-): string | undefined {
+): MergeChecklistProgressResultV1 {
   // Only the echoed checklist counts as reported progress. The summary's own
   // `## Verification` is itself "a short checklist" per the prompt, so reading
   // the whole response let verification ticks add to the echo's — checking
   // more copies of a duplicated item than the round actually reported done.
-  const reported = collectCheckedChecklistCountsV1(splitSummaryAtEchoV1(summary).echo);
+  const { echo, own } = splitSummaryAtEchoV1(summary);
+  const reported = new Map<string, number>(collectCheckedChecklistCountsV1(echo));
+
+  // Original (pre-normalization) text for each reported key, so a "no-match"
+  // result can name what the round actually echoed rather than just its
+  // normalized form.
+  const reportedRawText = new Map<string, string>();
+  for (const item of itemsInLatestRendering(echo)) {
+    if (item.checked) {
+      const key = normalizeChecklistItemTextV1(item.text);
+      if (!reportedRawText.has(key)) {
+        reportedRawText.set(key, item.text);
+      }
+    }
+  }
+
+  // Retroactive claims from the round's OWN `## Plan Item Checklist` section
+  // (never the echo) fold into the same reported-count map, so a valid claim
+  // is ticked by the identical owed-count logic below. A claim missing its
+  // required evidence is never added to `reported` — it cannot tick anything
+  // — but its text is kept so the no-match path can surface it exactly like
+  // an unmatched echoed tick, rather than silently discarding it.
+  const retroactiveKeys = new Set<string>();
+  const retroactiveEvidenceByKey = new Map<string, string>();
+  const missingEvidenceSamples: string[] = [];
+  for (const claim of collectRetroactiveTickClaimsV1(own)) {
+    const key = normalizeChecklistItemTextV1(claim.itemText);
+    if (claim.evidence.length === 0) {
+      missingEvidenceSamples.push(claim.itemText);
+      continue;
+    }
+    reported.set(key, (reported.get(key) ?? 0) + 1);
+    retroactiveKeys.add(key);
+    if (!retroactiveEvidenceByKey.has(key)) {
+      retroactiveEvidenceByKey.set(key, claim.evidence);
+    }
+    if (!reportedRawText.has(key)) {
+      reportedRawText.set(key, claim.itemText);
+    }
+  }
+
   if (reported.size === 0) {
-    return undefined;
+    if (missingEvidenceSamples.length > 0) {
+      return { kind: "no-match", unmatchedSample: missingEvidenceSamples.slice(0, 2) };
+    }
+    return { kind: "no-report" };
   }
 
   const { prefix, region } = scopeToLatestChecklistV1(planOfRecord);
@@ -380,6 +656,7 @@ export function mergeChecklistProgressV1(
   }
 
   let changed = false;
+  const retroactiveTicks: { itemText: string; evidence: string }[] = [];
   const mergedRegion = walkLinesV1(region)
     .map((line) => {
       if (line.fenced) {
@@ -398,11 +675,44 @@ export function mergeChecklistProgressV1(
           }
           owed.set(key, remaining - 1);
           changed = true;
+          if (retroactiveKeys.has(key)) {
+            retroactiveTicks.push({
+              itemText: text,
+              evidence: retroactiveEvidenceByKey.get(key) ?? "",
+            });
+          }
           return `${open}x${close}${text}${trailing}`;
         }
       );
     })
     .join("");
 
-  return changed ? `${prefix}${mergedRegion}` : undefined;
+  if (changed) {
+    return {
+      kind: "merged",
+      content: `${prefix}${mergedRegion}`,
+      ...(retroactiveTicks.length > 0 ? { retroactiveTicks } : {}),
+    };
+  }
+
+  // The round reported ticks, but the merge loop above never matched one to a
+  // plan line — either every reported key was already checked in the plan
+  // (owed <= 0 throughout: a legitimate no-op, "unchanged"), or at least one
+  // reported key never appears among the plan's item keys at all (a genuine
+  // mismatch worth surfacing). Distinguish by re-checking membership rather
+  // than threading a second flag through the loop above.
+  const planKeys = collectChecklistItemKeysV1(planOfRecord);
+  const unmatchedSample: string[] = [...missingEvidenceSamples];
+  for (const key of reported.keys()) {
+    if (!planKeys.has(key) && !unmatchedSample.includes(reportedRawText.get(key) ?? key)) {
+      unmatchedSample.push(reportedRawText.get(key) ?? key);
+    }
+    if (unmatchedSample.length >= 2) {
+      break;
+    }
+  }
+  if (unmatchedSample.length > 0) {
+    return { kind: "no-match", unmatchedSample: unmatchedSample.slice(0, 2) };
+  }
+  return { kind: "unchanged" };
 }

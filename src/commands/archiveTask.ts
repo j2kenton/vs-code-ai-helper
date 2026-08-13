@@ -127,9 +127,9 @@ export async function archiveTask(
         // either — those would otherwise be recovered/reconciled against an
         // archived task on the next activation.
         await pendingOperations?.removeForTask(resolved.canonicalId);
-        // A parked task is no longer iterating — drop its in-memory
+        // A parked task is no longer iterating — drop its persisted
         // zero-change implementation-round counter too.
-        clearZeroChangeImplRoundCounter(resolved.taskFolderPath);
+        await clearZeroChangeImplRoundCounter(resolved.taskFolderPath);
         if (currentTaskStore.get() === resolved.canonicalId) {
           await currentTaskStore.clear();
         }

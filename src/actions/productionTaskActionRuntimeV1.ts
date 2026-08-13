@@ -239,19 +239,58 @@ function lazyProductionActionConversationOrchestratorV1(): ActionConversationOrc
  * `admitAndContinueWithMalformedResultRetryV1` (the two-phase admit/continue
  * split) — one retry policy, not two independently-tuned ones.
  */
+/**
+ * Shared invocation budget for rows the coordinator's own malformed-result
+ * candidate-advancement loop can retry (2026-08-12 field report item 2's
+ * `MAX_MALFORMED_RESULT_INVOCATIONS_V1` in `taskActionCoordinatorV1.ts`).
+ * Kept as a duplicated literal, not an import, because the two constants
+ * are independently meaningful — this one bounds the OUTER wrapper's
+ * decision to stop retrying, the coordinator's bounds what IT does inside
+ * one operation — and importing across the module boundary here would
+ * couple runtime wiring to coordinator internals for a single number.
+ */
+const SHARED_MALFORMED_RESULT_INVOCATION_BUDGET_V1 = 3;
+
 async function retryOnMalformedResultV1(
-  run: () => Promise<TaskActionOutcomeV1>,
+  /**
+   * Called with the malformed-invocation budget already spent by an EARLIER
+   * iteration of this same loop (0 on the first call). Threaded into the
+   * coordinator via `TaskActionRequestV1.malformedInvocationsAlreadyUsedV1`
+   * so a genuinely fresh operation seeds its own counter from the running
+   * total instead of starting at zero — without this, each fresh operation
+   * could spend up to its own full 3-invocation budget, reaching 5-6 total
+   * invocations per user press instead of the approved shared cap of 3.
+   */
+  run: (malformedInvocationsAlreadyUsedV1: number) => Promise<TaskActionOutcomeV1>,
   maxAttempts: number
 ): Promise<TaskActionOutcomeV1> {
-  let outcome = await run();
+  let outcome = await run(0);
   let attempts = 1;
+  // `malformedInvocationsUsedV1` is present only on outcomes from a row the
+  // coordinator's own loop could have advanced (text-mode, non-edit-execution
+  // — see that field's doc comment). For those rows the coordinator already
+  // spent its own budget of provider invocations before returning this
+  // terminal outcome — and, because each retry below re-seeds the next
+  // operation with the running total, that value is already the CUMULATIVE
+  // count across every operation so far, not just this one — so this wrapper
+  // stops at the SAME shared budget instead of adding a fixed number of
+  // further fresh operations on top. Rows without the field (edit execution,
+  // non-text mode) keep the original fixed-attempt behavior, since the
+  // coordinator never advances candidates for them either.
+  let sharedInvocationsUsedV1 =
+    outcome.kind === "malformedResult" ? outcome.malformedInvocationsUsedV1 : undefined;
   while (
     outcome.kind === "malformedResult" &&
     outcome.correlation.actionKey !== EDIT_EXECUTION_ACTION_KEY_V1 &&
-    attempts < maxAttempts
+    (sharedInvocationsUsedV1 === undefined
+      ? attempts < maxAttempts
+      : sharedInvocationsUsedV1 < SHARED_MALFORMED_RESULT_INVOCATION_BUDGET_V1)
   ) {
     attempts++;
-    outcome = await run();
+    outcome = await run(sharedInvocationsUsedV1 ?? 0);
+    if (outcome.kind === "malformedResult" && sharedInvocationsUsedV1 !== undefined) {
+      sharedInvocationsUsedV1 = outcome.malformedInvocationsUsedV1 ?? sharedInvocationsUsedV1;
+    }
   }
   return outcome;
 }
@@ -275,9 +314,26 @@ export function withMalformedResultRetryV1(
   return {
     ...coordinator,
     executeAction: (request: TaskActionRequestV1) =>
-      retryOnMalformedResultV1(() => coordinator.executeAction(request), maxAttempts),
+      retryOnMalformedResultV1(
+        (malformedInvocationsAlreadyUsedV1) =>
+          coordinator.executeAction(
+            malformedInvocationsAlreadyUsedV1 > 0
+              ? { ...request, malformedInvocationsAlreadyUsedV1 }
+              : request
+          ),
+        maxAttempts
+      ),
     executeRoute: (routeId: string, request: Omit<TaskActionRequestV1, "actionKey">) =>
-      retryOnMalformedResultV1(() => coordinator.executeRoute(routeId, request), maxAttempts),
+      retryOnMalformedResultV1(
+        (malformedInvocationsAlreadyUsedV1) =>
+          coordinator.executeRoute(
+            routeId,
+            malformedInvocationsAlreadyUsedV1 > 0
+              ? { ...request, malformedInvocationsAlreadyUsedV1 }
+              : request
+          ),
+        maxAttempts
+      ),
   };
 }
 
@@ -312,8 +368,10 @@ export async function admitAndContinueWithMalformedResultRetryV1(
   request: TaskActionRequestV1,
   maxAttempts = 2
 ): Promise<TaskActionOutcomeV1> {
-  return retryOnMalformedResultV1(async () => {
-    const admission = await coordinator.admitAction(request);
+  return retryOnMalformedResultV1(async (malformedInvocationsAlreadyUsedV1) => {
+    const admission = await coordinator.admitAction(
+      malformedInvocationsAlreadyUsedV1 > 0 ? { ...request, malformedInvocationsAlreadyUsedV1 } : request
+    );
     return admission.kind === "settled"
       ? admission.outcome
       : await coordinator.continueAdmittedAction(admission.ticket);

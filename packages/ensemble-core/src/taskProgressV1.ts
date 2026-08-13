@@ -93,6 +93,16 @@ export interface LintPayload {
   issueCount?: number;
   /** Commands that failed, including their exit codes and output. */
   failedChecks?: Array<{ command: string; exitCode: number; output: string; retryCount?: number }>;
+  /**
+   * Where this payload came from. `"publish"` (the default when absent, for
+   * backward compatibility) means a real Publish attempt ran the checks.
+   * `"review"` means a Publish-stage review computed this while building its
+   * prompt variables — real, ground-truth check results, but possibly
+   * against a stale Publish scope compared to what an actual publish attempt
+   * would resolve. See the extension's `src/types/taskProgress.ts` for full
+   * commentary.
+   */
+  source?: "publish" | "review";
 }
 
 /**
@@ -164,6 +174,10 @@ export interface TaskProgress {
   implementationTypeCheckFailure?: ImplementationTypeCheckFailure;
   /** True once a round completed work the plan checklist could not record. */
   checklistProgressUnreliable?: boolean;
+  /** Consecutive completed implementation rounds (current stage) that changed
+   * zero files — durable no-progress-breaker counter; persists across
+   * reloads/rounds, reset on a file-changing round or stage transition. */
+  zeroChangeImplRounds?: number;
 }
 
 /** `TaskProgress.implementationTypeCheckFailure` — one round's failing type-check. */

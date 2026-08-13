@@ -184,6 +184,7 @@ import {
   TaskActionRegistryV1,
 } from "./taskActionRegistryV1";
 import type { StructuredAnswerV1 } from "../types/structuredQuestionV1";
+import { EDIT_EXECUTION_ACTION_KEY_V1 } from "./rows/editExecutionRowV1";
 import type { V1RunnerSelectionV1 } from "../runners/runnerRegistry";
 import { STAGE_ORDER, TaskProgress, TaskStage } from "../types/taskProgress";
 
@@ -333,6 +334,22 @@ export interface TaskActionRequestV1 {
    * self-deadlocking against its own already-held lease.
    */
   readonly parentOperationId?: OperationIdV1;
+  /**
+   * Carries the malformed-result invocation budget already spent by an
+   * EARLIER, now-terminal `executeAction`/`executeRoute` call for this same
+   * user press, forward into a genuinely fresh operation
+   * (`withMalformedResultRetryV1`, `productionTaskActionRuntimeV1.ts`).
+   * Without this, each fresh operation's own `runProviderRow` loop
+   * (`MAX_MALFORMED_RESULT_INVOCATIONS_V1`, this module) starts counting
+   * from zero, so two fresh operations could each spend the full budget —
+   * the 3+3=6 (or, after candidate exhaustion mid-budget, up to 5) worst
+   * case the 2026-08-12 field report's item 2 called out. Seeding this
+   * operation's own counter from the value here makes the running total
+   * shared across operations, not per-operation. Absent (or `0`) for a
+   * fresh, first-attempt operation; never set by anything other than the
+   * outer retry wrapper.
+   */
+  readonly malformedInvocationsAlreadyUsedV1?: number;
 }
 
 /**
@@ -1009,7 +1026,13 @@ export function createTaskActionCoordinatorV1(
      * leaves an unanswerable orphan message in the transcript.
      */
     preInvocationHook?: () => Promise<void>,
-    initialCandidate?: AdmittedProviderActionTicketV1["initialCandidate"]
+    initialCandidate?: AdmittedProviderActionTicketV1["initialCandidate"],
+    /**
+     * See `TaskActionRequestV1.malformedInvocationsAlreadyUsedV1` — seeds
+     * this operation's own malformed-invocation counter so the shared
+     * budget is enforced across, not just within, one operation.
+     */
+    malformedInvocationsAlreadyUsedV1?: number
   ): Promise<TaskActionOutcomeV1> {
     // No task-operation lease is held anywhere in this function except the
     // settlement phase inside `settleEnvelope` (plan §6.1 rule 6: leases are
@@ -1024,6 +1047,61 @@ export function createTaskActionCoordinatorV1(
     // their pre-existing behavior entirely.
     const isFreshInvocation = claimInvocationOnce === undefined;
     let pendingCandidate = initialCandidate;
+
+    // Malformed-result candidate advancement (2026-08-12 field report, item
+    // 2): a `malformedResult` used to exhaust its two attempts
+    // (`withMalformedResultRetryV1`, productionTaskActionRuntimeV1.ts)
+    // against the SAME resolved primary candidate — backups configured via
+    // switch-to-backup never ran. This loop now advances to the next
+    // ranked candidate on a malformed result exactly like the pre-response
+    // `transportFailure` case below does (`continue` back to the top, which
+    // reserves the next candidate via `selection`'s ranked cursor) —
+    // restricted to text-mode rows, never `editExecution.v1` (same
+    // exclusion, same reasoning, as `retryOnMalformedResultV1`: a
+    // partially-executed edit session cannot safely restart from a fresh
+    // conversation).
+    //
+    // Budget: `MAX_MALFORMED_RESULT_INVOCATIONS_V1` (3) bounds the TOTAL
+    // number of provider invocations this operation makes on account of
+    // malformed results — the initial attempt plus at most two advances.
+    // This is a PER-OPERATION cap, but it IS shared with
+    // `withMalformedResultRetryV1`'s separate outer retry
+    // (productionTaskActionRuntimeV1.ts): a terminal `malformedResult`
+    // outcome this loop produces for an advancement-eligible row carries
+    // `malformedInvocationsUsedV1` (see that field's own doc comment), and
+    // the outer wrapper sums it across its own fresh-operation retries,
+    // stopping once the running total reaches this same 3-invocation cap
+    // instead of adding a fixed number of fresh operations on top. That
+    // keeps one user press to 3 provider invocations total, not 3x2=6 —
+    // closing the gap the plan's "do not multiply them" instruction called
+    // out. Rows this loop never advances (editExecution.v1, non-text mode)
+    // do not carry the field, so the outer wrapper falls back to its
+    // original fixed-attempt behavior for them, unchanged.
+    //
+    // Each malformed attempt writes its own recovery spool
+    // (`preserveRejectedResultForRecoveryV1`, below) keyed by that attempt's
+    // own reservation, so `recoverLastAiResponse` (most-recent-wins) surfaces
+    // the LAST candidate's rejected text after an exhausted advance chain,
+    // not necessarily the best one among the candidates tried.
+    const MAX_MALFORMED_RESULT_INVOCATIONS_V1 = 3;
+    const malformedRetryEligibleV1 =
+      row.providerMode === "text" && row.actionKey !== EDIT_EXECUTION_ACTION_KEY_V1;
+    let malformedInvocationCountV1 = malformedInvocationsAlreadyUsedV1 ?? 0;
+    let lastMalformedOutcomeV1: TaskActionOutcomeV1 | undefined;
+    // Armed once a malformed result has been seen for this row — either in
+    // this operation or a prior fresh operation whose count was seeded in
+    // via `malformedInvocationsAlreadyUsedV1` (only ever stamped for
+    // malformed-retry-eligible rows, so a defined seed already implies this
+    // row's history includes a malformed result). Once armed, the shared
+    // 3-invocation budget must bound EVERY subsequent invocation this loop
+    // makes for the row — including one triggered by a pre-response
+    // transport failure, not just one triggered by another malformed
+    // result. Unarmed, transport-failure candidate advancement is
+    // intentionally unbounded by this cap (it predates and is unrelated to
+    // the malformed-result budget).
+    let malformedBudgetArmedV1 =
+      malformedRetryEligibleV1 && malformedInvocationsAlreadyUsedV1 !== undefined;
+
     for (;;) {
       let attemptId: string;
       let reserved: NonNullable<AdmittedProviderActionTicketV1["initialCandidate"]>["reserved"];
@@ -1040,9 +1118,13 @@ export function createTaskActionCoordinatorV1(
           // Nothing was reserved for this attempt — settle it explicitly so
           // the session's one-outcome-per-attempt accounting stays complete,
           // then map both exhaustion codes onto the stable mode-unavailable
-          // outcome (plan §3.7).
+          // outcome (plan §3.7). EXCEPT when candidates were exhausted while
+          // advancing past malformed results: returning
+          // providerModeUnavailable there would mask the real failure behind
+          // a misleading "no provider available" — the last malformed
+          // outcome is the honest report of what actually happened.
           session.reportAttemptOutcome(attemptId, "providerUnavailablePreInvocation");
-          return unavailableV1("providerModeUnavailable");
+          return lastMalformedOutcomeV1 ?? unavailableV1("providerModeUnavailable");
         }
         if (next.kind === "candidateUnavailable") {
           // The registry settled this attempt (providerUnavailablePreInvocation)
@@ -1198,6 +1280,27 @@ export function createTaskActionCoordinatorV1(
         }
       }
 
+      if (prepared.kind === "prepared") {
+        malformedInvocationCountV1++;
+        // Keep the previously-stamped malformed outcome's count current as
+        // later invocations (including transport-failure advances) consume
+        // more of the shared budget. Without this, a return of
+        // `lastMalformedOutcomeV1` below (or at the `noneRemaining` branch
+        // above) would carry the STALE count from when the malformed result
+        // first occurred, understating how much of the 3-invocation budget
+        // this operation actually used — letting the outer wrapper in
+        // `productionTaskActionRuntimeV1.ts` open further invocations past
+        // the shared cap.
+        if (
+          lastMalformedOutcomeV1?.kind === "malformedResult" &&
+          lastMalformedOutcomeV1.malformedInvocationsUsedV1 !== undefined
+        ) {
+          lastMalformedOutcomeV1 = {
+            ...lastMalformedOutcomeV1,
+            malformedInvocationsUsedV1: malformedInvocationCountV1,
+          };
+        }
+      }
       const raw =
         prepared.kind === "preInvocationOutcome"
           ? prepared.outcome
@@ -1224,7 +1327,15 @@ export function createTaskActionCoordinatorV1(
           session.reportAttemptOutcome(attemptId, "transportFailurePreResponse");
           // Pre-response failure is the fallback-eligible case: loop for the
           // next registry-ranked candidate with a fresh attempt and an
-          // explicit next reservation.
+          // explicit next reservation — UNLESS the malformed-result budget
+          // is armed and already exhausted, in which case advancing again
+          // would push this operation's total invocations past the shared
+          // 3-invocation cap. In that case report the honest diagnosis
+          // (the last malformed outcome, if this row produced one) instead
+          // of masking it behind an unbounded transport-failure walk.
+          if (malformedBudgetArmedV1 && malformedInvocationCountV1 >= MAX_MALFORMED_RESULT_INVOCATIONS_V1) {
+            return lastMalformedOutcomeV1 ?? { kind: "failed", correlation, code: raw.code, retryable: true };
+          }
           continue;
         case "response":
           break;
@@ -1248,13 +1359,35 @@ export function createTaskActionCoordinatorV1(
 
       const parsed = parseAiResultEnvelopeV1(unsealed.text, correlation);
       if (parsed.kind === "malformed") {
+        if (malformedRetryEligibleV1) {
+          malformedBudgetArmedV1 = true;
+        }
         const framelessFallback = tryFramelessContentFallbackV1(row, correlation, parsed);
         if (framelessFallback) {
           return settleEnvelope(row, framelessFallback, session, attemptId, context, acquireLeasePhase, promptSha256);
         }
+        // Decide advance eligibility BEFORE reporting the attempt outcome.
+        // `resultCorrelationMismatch` is excluded: it signals a correlation
+        // bug, not a bad provider response, and a different candidate cannot
+        // fix it. A malformed result the coordinator will NOT retry reports
+        // the ordinary terminal `"malformedResult"` outcome, exactly as
+        // before this step. One that WILL be retried reports the dedicated
+        // `"malformedResultPreFallback"` outcome instead — `"malformedResult"`
+        // itself is terminal by design (AC-RUNNER-05), so reporting it here
+        // and then looping to `session.allocateAttempt()` would throw
+        // `ProviderSelectionPolicyErrorV1` on a closed session. See that
+        // outcome kind's own doc comment in `providerSelectionPolicyV1.ts`.
+        const willAdvanceV1 =
+          parsed.code !== "resultCorrelationMismatch" &&
+          malformedRetryEligibleV1 &&
+          malformedInvocationCountV1 < MAX_MALFORMED_RESULT_INVOCATIONS_V1;
         session.reportAttemptOutcome(
           attemptId,
-          parsed.code === "resultCorrelationMismatch" ? "resultCorrelationMismatch" : "malformedResult"
+          parsed.code === "resultCorrelationMismatch"
+            ? "resultCorrelationMismatch"
+            : willAdvanceV1
+              ? "malformedResultPreFallback"
+              : "malformedResult"
         );
         // parsed.reason is our own parser's structural diagnostic (e.g.
         // "expected the frame to start with <<<...>>>") — never parsed.raw,
@@ -1279,13 +1412,28 @@ export function createTaskActionCoordinatorV1(
             ? `response preserved for recovery (operationId=${correlation.operationId}, ~24h)`
             : undefined,
         ].filter((part): part is string => part !== undefined);
-        return {
+        const malformedOutcomeV1: TaskActionOutcomeV1 = {
           kind: "malformedResult",
           correlation,
           code: parsed.code,
           ...(detailParts.length > 0 ? { detail: detailParts.join("; ") } : {}),
           ...(context.provider ? { provider: context.provider } : {}),
+          // Only stamped for rows this loop could have advanced (see
+          // `malformedRetryEligibleV1` above) — carries the shared budget
+          // forward to `withMalformedResultRetryV1` so the outer wrapper
+          // stops at the same 3-invocation total instead of adding its own
+          // fixed retries on top. See this field's own doc comment in
+          // `taskActionOutcomeV1.ts`.
+          ...(malformedRetryEligibleV1 ? { malformedInvocationsUsedV1: malformedInvocationCountV1 } : {}),
         };
+        // Advance to the next ranked candidate instead of surfacing this
+        // outcome immediately — see the budget/eligibility doc comment
+        // above the `for (;;)` loop.
+        if (willAdvanceV1) {
+          lastMalformedOutcomeV1 = malformedOutcomeV1;
+          continue;
+        }
+        return malformedOutcomeV1;
       }
 
       return settleEnvelope(row, parsed, session, attemptId, context, acquireLeasePhase, promptSha256);
@@ -1699,7 +1847,8 @@ export function createTaskActionCoordinatorV1(
           undefined,
           undefined,
           ticket.preInvocationHook,
-          ticket.initialCandidate
+          ticket.initialCandidate,
+          ticket.request.malformedInvocationsAlreadyUsedV1
         );
       } catch (err) {
         console.error("continueAdmittedAction error:", err);

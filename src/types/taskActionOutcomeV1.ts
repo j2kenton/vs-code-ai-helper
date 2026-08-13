@@ -86,6 +86,22 @@ export type TaskActionOutcomeV1 =
        */
       readonly detail?: string;
       readonly provider?: TaskActionOutcomeProviderV1;
+      /**
+       * Present only for outcomes produced by the malformed-result
+       * candidate-advancement loop (`taskActionCoordinatorV1.ts`'s
+       * `MAX_MALFORMED_RESULT_INVOCATIONS_V1` budget, 2026-08-12 field report
+       * item 2): the number of provider invocations this OPERATION already
+       * spent (same-candidate attempt plus any candidate advances) before
+       * returning this terminal outcome. `withMalformedResultRetryV1`
+       * (`productionTaskActionRuntimeV1.ts`) reads this to cap the combined
+       * same-candidate-retry + advance + outer-fresh-retry total at the same
+       * shared budget, instead of adding its own fixed retry count on top —
+       * which is what used to let one user press reach 3x2=6 invocations.
+       * Absent on outcomes the advancement loop never touches (e.g.
+       * `resultLimitExceeded`, `contentSchemaMismatch`), which keep the
+       * outer wrapper's pre-existing fixed-attempt behavior unchanged.
+       */
+      readonly malformedInvocationsUsedV1?: number;
     }
   | {
       readonly kind: "unavailable";
@@ -363,7 +379,7 @@ export function decodeTaskActionOutcomeV1(raw: unknown): DecodeTaskActionOutcome
     case "malformedResult": {
       const unknown = unknownOutcomeField(
         raw,
-        new Set(["kind", "correlation", "code", "detail", "provider"]),
+        new Set(["kind", "correlation", "code", "detail", "provider", "malformedInvocationsUsedV1"]),
         "malformedResult outcome"
       );
       if (unknown) {
@@ -383,6 +399,16 @@ export function decodeTaskActionOutcomeV1(raw: unknown): DecodeTaskActionOutcome
       if (typeof provider === "string") {
         return fail(provider);
       }
+      if (
+        raw.malformedInvocationsUsedV1 !== undefined &&
+        (typeof raw.malformedInvocationsUsedV1 !== "number" ||
+          !Number.isInteger(raw.malformedInvocationsUsedV1) ||
+          raw.malformedInvocationsUsedV1 < 0)
+      ) {
+        return fail(
+          `invalid malformedResult outcome "malformedInvocationsUsedV1": ${JSON.stringify(raw.malformedInvocationsUsedV1)}`
+        );
+      }
       return {
         ok: true,
         outcome: {
@@ -391,6 +417,9 @@ export function decodeTaskActionOutcomeV1(raw: unknown): DecodeTaskActionOutcome
           code: raw.code as MalformedResultCodeV1,
           ...(raw.detail !== undefined ? { detail: raw.detail } : {}),
           ...(provider !== undefined ? { provider } : {}),
+          ...(raw.malformedInvocationsUsedV1 !== undefined
+            ? { malformedInvocationsUsedV1: raw.malformedInvocationsUsedV1 }
+            : {}),
         },
       };
     }

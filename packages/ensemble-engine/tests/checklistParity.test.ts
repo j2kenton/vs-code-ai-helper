@@ -100,6 +100,87 @@ const NO_CHECKLIST_DOC = [
   "",
 ].join("\n");
 
+// Escaped-quote corpus rows (step 2 parity): a round-trip through a
+// JSON-encoded field can leave a provider's over-escaped quotes on disk as
+// literal backslash-quote sequences instead of plain quotes, both on the
+// plan side and the echo side.
+const PLAN_ESCAPED_QUOTES = [
+  "<!-- ensemble:implementation-checklist -->",
+  "",
+  `- [ ] Fix the \\"getStageStatus\\" comparison`,
+  "- [ ] wire the gate",
+  "",
+].join("\n");
+
+const SUMMARY_ECHO_CLEAN_QUOTES = [
+  "<!-- ensemble:implementation-checklist -->",
+  `- [x] Fix the "getStageStatus" comparison`,
+  "",
+  "## Files Changed",
+  "- src/a.ts — created",
+  "",
+].join("\n");
+
+const SUMMARY_ECHO_ESCAPED_QUOTES = [
+  "<!-- ensemble:implementation-checklist -->",
+  `- [x] Fix the \\"getStageStatus\\" comparison`,
+  "",
+  "## Files Changed",
+  "- src/a.ts — created",
+  "",
+].join("\n");
+
+const PLAN_CLEAN_QUOTES = [
+  "<!-- ensemble:implementation-checklist -->",
+  "",
+  `- [ ] Fix the "getStageStatus" comparison`,
+  "- [ ] wire the gate",
+  "",
+].join("\n");
+
+// Exclusion-marker corpus row (step 5 parity): an operator-action/optional
+// step that must not count toward the completion denominator.
+const PLAN_WITH_EXCLUDED_ITEM = [
+  "<!-- ensemble:implementation-checklist -->",
+  "",
+  "- [ ] wire the gate",
+  "- [ ] deploy the classifier change to production <!-- ensemble:excluded -->",
+  "- [x] add a regression test",
+  "",
+].join("\n");
+
+// Retroactive-tick corpus (step 4 parity): a round's own `## Plan Item
+// Checklist` section may claim an item complete from an earlier round via
+// RETROACTIVE_TICK_MARKER_V1 plus evidence, distinct from the echo above.
+const PLAN_FOR_RETROACTIVE = [
+  "<!-- ensemble:implementation-checklist -->",
+  "",
+  "- [ ] add the databaseWaking state",
+  "- [ ] wire the SPA retry",
+  "",
+].join("\n");
+
+const SUMMARY_WITH_RETROACTIVE_CLAIM = [
+  "## Files Changed",
+  "- (none)",
+  "",
+  "## Plan Item Checklist",
+  "",
+  "- add the databaseWaking state — done <!-- ensemble:retroactive --> — app.ts:194",
+  "- wire the SPA retry — not reached — deferred",
+  "",
+].join("\n");
+
+const SUMMARY_WITH_RETROACTIVE_CLAIM_NO_EVIDENCE = [
+  "## Files Changed",
+  "- (none)",
+  "",
+  "## Plan Item Checklist",
+  "",
+  "- add the databaseWaking state — done <!-- ensemble:retroactive -->",
+  "",
+].join("\n");
+
 const CORPUS: Record<string, string> = {
   PLAN_BASIC,
   PLAN_WITH_FENCED_EXAMPLE,
@@ -109,6 +190,14 @@ const CORPUS: Record<string, string> = {
   SUMMARY_ECHO,
   SUMMARY_DUPLICATES,
   NO_CHECKLIST_DOC,
+  PLAN_ESCAPED_QUOTES,
+  SUMMARY_ECHO_CLEAN_QUOTES,
+  SUMMARY_ECHO_ESCAPED_QUOTES,
+  PLAN_CLEAN_QUOTES,
+  PLAN_WITH_EXCLUDED_ITEM,
+  PLAN_FOR_RETROACTIVE,
+  SUMMARY_WITH_RETROACTIVE_CLAIM,
+  SUMMARY_WITH_RETROACTIVE_CLAIM_NO_EVIDENCE,
 };
 
 test("countChecklistProgressV1 agrees with the extension for every corpus document", () => {
@@ -137,6 +226,34 @@ test("mergeChecklistProgressV1 produces byte-identical merges", () => {
     { plan: PLAN_DUPLICATE_ITEMS, summary: SUMMARY_DUPLICATES, label: "duplicate-item count merge" },
     { plan: PLAN_BASIC, summary: NO_CHECKLIST_DOC, label: "no-op merge (no echo)" },
     { plan: PLAN_TWO_RENDERINGS, summary: SUMMARY_ECHO, label: "latest-rendering confinement" },
+    // Escaped-quote corpus, both directions (step 2 parity).
+    { plan: PLAN_ESCAPED_QUOTES, summary: SUMMARY_ECHO_CLEAN_QUOTES, label: "corrupted plan, clean echo" },
+    { plan: PLAN_CLEAN_QUOTES, summary: SUMMARY_ECHO_ESCAPED_QUOTES, label: "clean plan, corrupted echo" },
+    // A round echoing something the plan does not contain at all (step 3 parity).
+    {
+      plan: PLAN_BASIC,
+      summary: [
+        "<!-- ensemble:implementation-checklist -->",
+        "- [x] a totally unrelated item not in the plan",
+        "",
+        "## Files Changed",
+        "- src/a.ts — created",
+        "",
+      ].join("\n"),
+      label: "no-match merge",
+    },
+    // Retroactive-tick claims, both the valid (evidenced) and invalid
+    // (missing-evidence) shapes (step 4 parity).
+    {
+      plan: PLAN_FOR_RETROACTIVE,
+      summary: SUMMARY_WITH_RETROACTIVE_CLAIM,
+      label: "retroactive claim with evidence merges",
+    },
+    {
+      plan: PLAN_FOR_RETROACTIVE,
+      summary: SUMMARY_WITH_RETROACTIVE_CLAIM_NO_EVIDENCE,
+      label: "retroactive claim without evidence does not merge",
+    },
   ];
   for (const { plan, summary, label } of pairs) {
     assert.deepEqual(
@@ -148,7 +265,7 @@ test("mergeChecklistProgressV1 produces byte-identical merges", () => {
   // Ticks-only invariant: the merge never unticks second step even though the
   // summary could regress it.
   const merged = engine.mergeChecklistProgressV1(PLAN_BASIC, SUMMARY_ECHO);
-  assert.ok(merged !== undefined && merged.includes("- [x] second step"));
+  assert.ok(merged.kind === "merged" && merged.content.includes("- [x] second step"));
 });
 
 test("progress marker parse agrees with the extension", () => {
@@ -172,15 +289,17 @@ test("progress marker parse agrees with the extension", () => {
 test("checklist reconciliation agrees with the extension (checklist authority)", () => {
   const cases: Array<{
     progress: { complete: number; total: number } | null;
-    checklist: { total: number; checked: number; remaining: number } | undefined;
+    checklist: { total: number; checked: number; remaining: number; excluded: number } | undefined;
   }> = [
     // The 47-item plan vs a narrowed 5/5 marker (the historical failure).
-    { progress: { complete: 5, total: 5 }, checklist: { total: 47, checked: 6, remaining: 41 } },
+    { progress: { complete: 5, total: 5 }, checklist: { total: 47, checked: 6, remaining: 41, excluded: 0 } },
     // Fully ticked checklist does NOT override a marker reporting work left.
-    { progress: { complete: 3, total: 5 }, checklist: { total: 4, checked: 4, remaining: 0 } },
-    { progress: null, checklist: { total: 4, checked: 1, remaining: 3 } },
+    { progress: { complete: 3, total: 5 }, checklist: { total: 4, checked: 4, remaining: 0, excluded: 0 } },
+    { progress: null, checklist: { total: 4, checked: 1, remaining: 3, excluded: 0 } },
     { progress: null, checklist: undefined },
     { progress: { complete: 2, total: 4 }, checklist: undefined },
+    // An excluded-item denominator is exactly like any other narrower total.
+    { progress: { complete: 4, total: 4 }, checklist: { total: 5, checked: 4, remaining: 1, excluded: 2 } },
   ];
   for (const { progress, checklist } of cases) {
     assert.deepEqual(
@@ -192,6 +311,21 @@ test("checklist reconciliation agrees with the extension (checklist authority)",
       engine.isPlanIncompleteV1(engine.reconcileProgressWithChecklistV1(progress, checklist)),
       srcReadiness.isPlanIncomplete(srcReadiness.reconcileProgressWithChecklistV1(progress, checklist)),
       `incompleteness divergence for ${JSON.stringify({ progress, checklist })}`
+    );
+  }
+});
+
+test("collectRetroactiveTickClaimsV1 agrees with the extension", () => {
+  const docs = [
+    srcChecklist.splitSummaryAtEchoV1(SUMMARY_WITH_RETROACTIVE_CLAIM).own,
+    srcChecklist.splitSummaryAtEchoV1(SUMMARY_WITH_RETROACTIVE_CLAIM_NO_EVIDENCE).own,
+    "",
+  ];
+  for (const doc of docs) {
+    assert.deepEqual(
+      engine.collectRetroactiveTickClaimsV1(doc),
+      srcChecklist.collectRetroactiveTickClaimsV1(doc),
+      `retroactive-claim divergence for ${JSON.stringify(doc)}`
     );
   }
 });

@@ -133,6 +133,7 @@ export const TASK_PROGRESS_PRODUCT_FIELD_NAMES_V1 = [
   "escalation",
   "implementationTypeCheckFailure",
   "checklistProgressUnreliable",
+  "zeroChangeImplRounds",
 ] as const satisfies readonly (keyof TaskProgress)[];
 
 type MissingProductFieldV1 = Exclude<
@@ -500,11 +501,18 @@ function validateLintPayload(value: unknown): string | undefined {
   if (!isPlainObject(value)) {
     return "lintPayload must be an object";
   }
-  const allowed = new Set(["runAt", "passed", "summary", "issueCount", "failedChecks"]);
+  const allowed = new Set(["runAt", "passed", "summary", "issueCount", "failedChecks", "source"]);
   for (const key of Object.keys(value)) {
     if (!allowed.has(key)) {
       return `lintPayload has an unknown property ${JSON.stringify(key)}`;
     }
+  }
+  if (
+    value["source"] !== undefined &&
+    value["source"] !== "publish" &&
+    value["source"] !== "review"
+  ) {
+    return 'lintPayload.source must be "publish" or "review" when present';
   }
   if (!isIsoTimestamp(value["runAt"])) {
     return "lintPayload.runAt must be an ISO timestamp";
@@ -962,6 +970,16 @@ export function decodeTaskProgressTextV1(
           );
         }
         draft.checklistProgressUnreliable = value;
+        break;
+      }
+      case "zeroChangeImplRounds": {
+        if (!isNonNegativeInteger(value)) {
+          return recovery(
+            "invalidFieldValue",
+            "zeroChangeImplRounds must be a non-negative integer"
+          );
+        }
+        draft.zeroChangeImplRounds = value;
         break;
       }
       case "nameIsDefault": {

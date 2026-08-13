@@ -399,6 +399,27 @@ void describe("shouldEscalateChurnCeiling", () => {
       false
     );
   });
+
+  void it("does not count zero-fixable rounds as churn — the round after a long stall does not immediately trip", () => {
+    // 18 zero-blocker rounds (report 12's stall), then one round that finally
+    // finds a real blocker. The transition INTO that blocker is not churn —
+    // there is nothing to compare it against — so the ceiling must not fire
+    // on this round alone.
+    const zeroFixableStretch = Array.from({ length: 18 }, () =>
+      entry(9, { taskFixableCount: 0, blockerCount: 0, blockers: [] })
+    );
+    const history = [...zeroFixableStretch, entry(6, { taskFixableCount: 1 })];
+    assert.strictEqual(roundsWithoutTaskFixableDecrease(history, "impl-high-review"), 0);
+    assert.strictEqual(
+      shouldEscalateChurnCeiling({
+        history,
+        stage: "impl-high-review",
+        taskFixableCount: 1,
+        churnCeilingRounds: 3,
+      }),
+      false
+    );
+  });
 });
 
 void describe("sameBlockerPersistsAcrossLastRounds", () => {
@@ -479,14 +500,39 @@ void describe("shouldTripNoProgressBreaker", () => {
     );
   });
 
-  void it("does not trip when the blocker situation changed across the last rounds", () => {
+  void it("trips on the zero-change count alone, even when blockers report zero every round (report 11)", () => {
+    // The original gate required a persisting non-empty blocker set, which
+    // can never be true while the reviewer reports zero blockers — exactly
+    // the shape that stalled for 18 rounds/9 hours before this fix.
+    const zeroBlockers = [
+      entry(9, { blockers: [], blockerCount: 0, taskFixableCount: 0 }),
+      entry(9, { blockers: [], blockerCount: 0, taskFixableCount: 0 }),
+    ];
+    assert.strictEqual(
+      shouldTripNoProgressBreaker({ zeroChangeRounds: 3, breakerRounds: 3, history: zeroBlockers }),
+      true
+    );
+  });
+
+  void it("trips on the zero-change count alone even when the blocker situation changed across rounds", () => {
     const changing = [
       entry(5, { blockers: [identity({ subject: "src/a.ts" })] }),
       entry(5, { blockers: [identity({ subject: "src/b.ts" })] }),
     ];
     assert.strictEqual(
       shouldTripNoProgressBreaker({ zeroChangeRounds: 3, breakerRounds: 3, history: changing }),
-      false
+      true
+    );
+  });
+
+  void it("does not trip without a durable history (still requires no crash on undefined/empty)", () => {
+    assert.strictEqual(
+      shouldTripNoProgressBreaker({ zeroChangeRounds: 3, breakerRounds: 3, history: undefined }),
+      true
+    );
+    assert.strictEqual(
+      shouldTripNoProgressBreaker({ zeroChangeRounds: 3, breakerRounds: 3, history: [] }),
+      true
     );
   });
 });

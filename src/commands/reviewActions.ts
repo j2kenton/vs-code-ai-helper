@@ -34,7 +34,9 @@ import {
   appendReviewScoreHistory,
   clearImplementationTypeCheckFailure,
   recordImplementationTypeCheckFailure,
+  setZeroChangeImplRounds,
   updateImplReviewFiles,
+  updateLintPayload,
   updateTaskStatus,
 } from "../utils/taskProgressTransforms";
 import { IncompleteTask } from "../types/incompleteTask";
@@ -145,6 +147,7 @@ import {
   buildPlanItemVerificationSection,
   buildVerifiedChecksSection,
   collectCompletionLintPreview,
+  CompletionLintResult,
   resolvePublishScopeFolder,
   synthesizeMechanicalBlockers,
 } from "../utils/completionLint";
@@ -1216,11 +1219,16 @@ async function readPreviousReviewForRereview(
  * exists: a reviewer with no way to confirm "tests pass" otherwise has to
  * either trust the implementer's prose or try to run the suite itself, and
  * if its own sandbox can't run anything it has no way to ever mark that
- * criterion satisfied. Side-effect-free (does not persist to
- * task-progress.json or publish-review.md — that only happens at an actual
- * Publish attempt via runCompletionLint) and never throws: a stale/
- * unresolvable Publish scope or any other failure degrades to an explicit
- * "could not run" note rather than blocking the review that requested it.
+ * criterion satisfied. Side-effect-free with ONE narrow, explicit exception:
+ * when `targetStage` is literally `"publish"`, the computed result is also
+ * persisted into task-progress.json's `lintPayload` (marked
+ * `source: "review"`) via `persistPublishReviewLintPayload` below — see that
+ * function's doc comment for why. It never touches publish-review.md (that
+ * artifact is still only written at an actual Publish attempt via
+ * runCompletionLint, or by the review's own AI-response handling) and never
+ * throws: a stale/unresolvable Publish scope or any other failure degrades
+ * to an explicit "could not run" note rather than blocking the review that
+ * requested it.
  *
  * `token`, when supplied, is the enclosing tracked operation's cancellation
  * token — linked through to every spawned check process so cancelling the
@@ -1252,7 +1260,8 @@ async function buildVerifiedChecksVariable(
   folderUri: vscode.Uri,
   relevantFiles: readonly string[] | undefined,
   token: vscode.CancellationToken | undefined,
-  includePlanItemVerification = false
+  includePlanItemVerification = false,
+  targetStage?: TaskStage
 ): Promise<{ verifiedChecks: string; planItemVerification?: string; mechanicalBlockers: ReviewBlocker[] }> {
   try {
     const result = await collectCompletionLintPreview(folderUri, relevantFiles, {
@@ -1260,6 +1269,19 @@ async function buildVerifiedChecksVariable(
       includeAiPlanVerification: includePlanItemVerification,
       token,
     });
+    if (targetStage === "publish") {
+      // Narrow, explicit carve-out from this function's normal
+      // side-effect-free contract (see the file-header doc comment above) —
+      // ONLY for a Publish-stage review, never for implementation reviews or
+      // any scheduling-only caller (e.g. checkPublishPreflight, which never
+      // reaches this branch). A Publish-stage review already runs the exact
+      // checks a real Publish attempt would; today that result was computed
+      // and then discarded, leaving "Apply lint/test fixes"
+      // (runLintingFixes.ts) unable to find a report even right after a
+      // Publish review just ran and passed those same checks. Best-effort:
+      // persistence failing here must never fail or block the review itself.
+      await persistPublishReviewLintPayload(folderUri, result);
+    }
     return {
       verifiedChecks: buildVerifiedChecksSection(result),
       planItemVerification: includePlanItemVerification
@@ -1291,6 +1313,50 @@ async function buildVerifiedChecksVariable(
 }
 
 /**
+ * Persist a Publish-stage review's already-computed
+ * `collectCompletionLintPreview` result into task-progress.json's
+ * `lintPayload`, the same shape/field-set `runCompletionLint`
+ * (completionLint.ts) writes for a real Publish attempt — reusing that
+ * write path is what lets `runLintingFixes.ts` find the report. Marked
+ * `source: "review"` (never overwrites a good-faith reader's assumptions
+ * about `source: "publish"` results) because this ran with
+ * `allowScopePrompt: false`, so it may reflect a stale Publish scope
+ * compared to what an actual publish attempt would resolve — see
+ * `LintPayload.source` in `types/taskProgress.ts`.
+ *
+ * Deliberately does NOT touch publish-review.md (unlike `runCompletionLint`,
+ * which also calls `upsertCompletionChecksReportV1`): that artifact is
+ * written by the review's own AI-response handling, and this function only
+ * ever runs as a side effect of building that review's PROMPT, before any
+ * response exists.
+ *
+ * Best-effort and never throws — called from inside
+ * `buildVerifiedChecksVariable`, which must keep building the review prompt
+ * even if this persistence fails (e.g. a concurrent CAS loss).
+ *
+ * @internal exported for testing
+ */
+export async function persistPublishReviewLintPayload(
+  folderUri: vscode.Uri,
+  result: CompletionLintResult
+): Promise<void> {
+  try {
+    await patchTaskProgressStrictV1(folderUri, (current) =>
+      updateLintPayload(current, {
+        runAt: result.runAt,
+        passed: result.passed,
+        summary: result.summary,
+        issueCount: result.issueCount,
+        failedChecks: result.failedChecks,
+        source: "review",
+      })
+    );
+  } catch {
+    // Best-effort — see doc comment above.
+  }
+}
+
+/**
  * In-memory last-computed mechanical-blocker set per task folder + stage.
  * `buildVerifiedChecksVariable` runs once per review round (inside
  * `runReviewForFolder`/Fast Forward's `applyReviewWithAI`/
@@ -1299,10 +1365,11 @@ async function buildVerifiedChecksVariable(
  * only ever reads the resulting review ARTIFACT back off disk — it has no
  * other path to the `CompletionLintResult` that round's prompt was built
  * from. This cache closes that gap without threading a new parameter through
- * the whole apply/review call chain. Matches `zeroChangeImplRoundsByTask`'s
- * existing in-memory, per-session pattern above: scoped to this run of the
- * extension host, never persisted, safe to be stale-and-overwritten on the
- * next round.
+ * the whole apply/review call chain. In-memory, per-session, scoped to this
+ * run of the extension host, never persisted, safe to be
+ * stale-and-overwritten on the next round — unlike the durable
+ * `zeroChangeImplRounds` counter (see `clearZeroChangeImplRoundCounter`),
+ * which must survive a reload for the no-progress breaker to work.
  */
 const mechanicalBlockersByTaskStage = new Map<string, ReviewBlocker[]>();
 
@@ -1807,12 +1874,12 @@ async function routeReviewOutcomeV1(
         // outstanding count into the plan stage, block its auto-advance, and
         // let Fast Forward grind into no-progress escalation, when returning
         // to implementation is precisely what would tick those items off.
+        const planChecklistProgress = isPlanReviewStage(targetStage)
+          ? undefined
+          : await readPlanChecklistProgressV1(folderUri);
         const progress = isPlanReviewStage(targetStage)
           ? parseReviewProgress(content)
-          : reconcileProgressWithChecklistV1(
-              parseReviewProgress(content),
-              await readPlanChecklistProgressV1(folderUri)
-            );
+          : reconcileProgressWithChecklistV1(parseReviewProgress(content), planChecklistProgress);
         const planIncomplete = isPlanIncomplete(progress);
         const meetsThreshold = readyToAdvanceStage(score, autoAdvanceThreshold, progress);
         // Records this round in the durable score history and decides
@@ -1881,8 +1948,15 @@ async function routeReviewOutcomeV1(
           planIncomplete &&
           meetsAutoAdvanceThreshold(score, autoAdvanceThreshold)
         ) {
+          // Names the operator-action/optional steps the denominator above
+          // already excludes, so "X of Y implemented" doesn't read as though
+          // the plan holds MORE outstanding work than it actually does.
+          const excludedSuffix =
+            planChecklistProgress && planChecklistProgress.excluded > 0
+              ? ` (${planChecklistProgress.excluded} additional step(s) marked excluded from this count)`
+              : "";
           NotificationRouter.showInformation(
-            `Review scored ${score}/10 with no blocking issues, but ${progress.complete} of ${progress.total} plan steps are implemented. ` +
+            `Review scored ${score}/10 with no blocking issues, but ${progress.complete} of ${progress.total} plan steps are implemented${excludedSuffix}. ` +
               "Staying on this stage to build the rest."
           );
         }
@@ -2347,7 +2421,8 @@ export async function runReviewForFolder(
       folderUri,
       undefined,
       options.operation?.token,
-      targetStage === "publish"
+      targetStage === "publish",
+      targetStage
     );
     variables.verifiedChecks = checks.verifiedChecks;
     if (checks.planItemVerification !== undefined) {
@@ -2504,6 +2579,39 @@ export function isUnusableAsExistingReview(content: string): boolean {
 }
 
 /**
+ * Fast Forward Review's "no usable review to start from" message, tailored
+ * to name the actual cause when it is the common one: a prior implementation
+ * round was rejected by the summary shape gate (impl-summary.md still holds
+ * IMPLEMENTATION_SUMMARY_UNUSABLE_MARKER_V1), so runReviewForFolder's own
+ * dispatch is refused — there are no real implementation notes to review
+ * against — and the review artifact is left as the stale placeholder
+ * markReviewArtifactStale wrote. "Run the review again" is not a workable
+ * next step in that state, so the generic wording is replaced with the real
+ * cause and the real recovery: rerun the implementation, or (once a usable
+ * summary exists) use "Apply Review Changes".
+ *
+ * Falls back to the generic message for every other way a review can fail to
+ * produce usable output (provider error, empty response, etc.), where
+ * "try running Review manually" remains the right next step.
+ *
+ * @internal exported for testing
+ */
+export async function describeUnusableReviewBlockV1(folderUri: vscode.Uri): Promise<string> {
+  const summary = await readTextIfExists(getImplementationSummaryUri(folderUri));
+  if (summary !== undefined && isUnusableImplementationSummaryV1(summary)) {
+    return (
+      "Fast Forward Review: a prior implementation round was rejected and left no usable " +
+      "implementation summary, so review could not run and there is nothing to fast-forward from. " +
+      'Rerun the implementation, or use "Apply Review Changes" once a usable summary exists, before ' +
+      "fast-forwarding."
+    );
+  }
+  return (
+    "Fast Forward Review: the initial review did not produce usable output. Try running Review manually."
+  );
+}
+
+/**
  * Backs up a review artifact unless its current content is already a
  * "# Review Stale" placeholder. A placeholder is never worth preserving as
  * the "previous version" for View Changes — without this guard, staling the
@@ -2540,6 +2648,82 @@ async function markReviewArtifactStale(
     "",
   ].join("\n");
   await writeTextFile(reviewUri, staleNotice, { skipBackup: true });
+}
+
+/**
+ * Undoes a rejected implementation round: restores impl-summary.md and the
+ * round's review artifact from their `_prev` backups
+ * (`previousVersionUri` — see artifactBackups.ts), returning the task to
+ * exactly its pre-rejection state. The two durable writes a rejection makes
+ * (executeImplementationRun's summary-shape gate, above) each already
+ * preserve the good prior version as `<name>_prev.md` before stamping/staling
+ * the current one — impl-summary.md via `writeTextFile`'s own backup, and the
+ * review via `markReviewArtifactStale`'s explicit `backupReviewUnlessStale` —
+ * so recovery is exactly "copy each `_prev` file back over its current one".
+ *
+ * Reads each `_prev` file's bytes and writes them with the raw
+ * `vscode.workspace.fs` API rather than `writeTextFile`: `writeTextFile`
+ * would back up the CURRENT (still-stamped) content into `_prev` before
+ * writing, clobbering the very backup this function is restoring from.
+ *
+ * Guarded on the current summary actually being the rejection stamp — a
+ * stale action button (the user already reran the implementation, or is
+ * looking at a different round's notification) must not silently overwrite a
+ * newer, usable summary with an older one.
+ *
+ * `stage` is the review stage the rejected round belonged to
+ * (executeImplementationRun's `postRunReviewStage`), used to locate that
+ * stage's review artifact; a plan-only task (no review stage yet) restores
+ * just the summary.
+ */
+export async function restoreRejectedImplementationRoundV1(
+  taskFolderPath: string,
+  stage: TaskStage
+): Promise<void> {
+  const folderUri = vscode.Uri.file(taskFolderPath);
+  const summaryUri = getImplementationSummaryUri(folderUri);
+
+  const currentSummary = await readTextIfExists(summaryUri);
+  if (currentSummary === undefined || !isUnusableImplementationSummaryV1(currentSummary)) {
+    NotificationRouter.showInformation(
+      "Nothing to restore — the current implementation summary is not a rejected-round stamp " +
+        "(it may already have been restored, or a later round already replaced it)."
+    );
+    return;
+  }
+
+  const restoreTargets: Array<{ current: vscode.Uri; label: string }> = [
+    { current: summaryUri, label: "implementation summary" },
+  ];
+  const reviewUri = isReviewStage(stage) ? artifactUri(folderUri, stage) : undefined;
+  if (reviewUri) {
+    restoreTargets.push({ current: reviewUri, label: "review" });
+  }
+
+  const restored: string[] = [];
+  const missing: string[] = [];
+  for (const { current, label } of restoreTargets) {
+    try {
+      const backupContents = await vscode.workspace.fs.readFile(previousVersionUri(current));
+      await vscode.workspace.fs.writeFile(current, backupContents);
+      restored.push(label);
+    } catch {
+      missing.push(label);
+    }
+  }
+
+  if (restored.length === 0) {
+    NotificationRouter.showWarning(
+      "Could not restore the prior round: no backup (_prev) file was found for the implementation " +
+        "summary" + (reviewUri ? " or review" : "") + "."
+    );
+    return;
+  }
+
+  NotificationRouter.showInformation(
+    `Restored the prior ${restored.join(" and ")} — the task is back to its pre-rejection state.` +
+      (missing.length > 0 ? ` (No backup was found for the ${missing.join(" and ")}.)` : "")
+  );
 }
 
 /**
@@ -3220,23 +3404,53 @@ export async function fastForwardReviewWithAI(
       () => runReviewForFolder(extensionUri, resolved.folderUri, workspaceRoot, stage, true, { operation: op, chatViewProvider })
     );
     initialContent = await readNonEmptyText(reviewUri);
+    // Same unusable check as the pre-dispatch read above (line ~3209) — the
+    // review just dispatched by runReviewForFolder can be refused outright
+    // (e.g. impl-summary.md is still the rejected-round stamp, so there are
+    // no real implementation notes to review against), in which case
+    // reviewUri is untouched and this re-read picks the SAME stale
+    // placeholder back up. Without this check that placeholder read as "a
+    // review exists" and fell through to the parseReadiness check below,
+    // which produced a "no Readiness line, run the review again" message —
+    // wrong, because running the review again is exactly what cannot work in
+    // this state. Applying the same recognition here closes that gap.
+    if (initialContent !== undefined && isUnusableAsExistingReview(initialContent)) {
+      initialContent = undefined;
+    }
     if (!initialContent) {
-      NotificationRouter.showWarning(
-        "Fast Forward Review: the initial review did not produce usable output. Try running Review manually."
-      );
+      NotificationRouter.showWarning(await describeUnusableReviewBlockV1(resolved.folderUri));
       return;
     }
   }
 
   const initialScore = parseReadiness(initialContent).score;
   if (initialScore === null) {
-    NotificationRouter.showWarning(
-      "Fast Forward Review: the current review has no \"Readiness: N/10\" line to use as a " +
-        "starting score. Run the review again (or edit it to include one) before fast-forwarding."
-    );
+    NotificationRouter.showWarning(await describeUnusableReviewBlockV1(resolved.folderUri));
     return;
   }
   const baselineScore = initialScore;
+  // Evidence from the review that already produced baselineScore — lets
+  // improveReviewScore recognize a finished task before running a single
+  // apply()/review() cycle (10: Fast Forward must be able to succeed from a
+  // 10/10 baseline). Computed the same way review()'s callback below
+  // computes it for each in-loop round, so the pre-loop and in-loop
+  // evidence share one definition of "zero-fixable" and "plan incomplete".
+  const initialMechanicalBlockers = getMechanicalBlockersForStage(resolved.folderUri, targetStage);
+  const initialHasMechanicalTaskFixable = initialMechanicalBlockers.some(
+    (b) => b.resolver === "task-fixable"
+  );
+  const initialProgress = isPlanReviewStage(targetStage)
+    ? parseReviewProgress(initialContent)
+    : reconcileProgressWithChecklistV1(
+        parseReviewProgress(initialContent),
+        await readPlanChecklistProgressV1(resolved.folderUri)
+      );
+  const preLoopEvidence = {
+    zeroFixableEvidence: initialHasMechanicalTaskFixable
+      ? false
+      : hasZeroTaskFixableEvidence(initialContent),
+    planIncomplete: isPlanIncomplete(initialProgress),
+  };
   const maxAttempts = getFastForwardMaxIterations();
   // The acceptance-threshold option uses the user's configured acceptance
   // threshold; it is not synonymous with a perfect 10/10 score.
@@ -3383,6 +3597,7 @@ export async function fastForwardReviewWithAI(
           },
           continueThroughEscalation: resilience.fastForwardSurvivesEscalation,
           zeroFixableTerminates: resilience.zeroFixableTerminatesFastForward,
+          preLoopEvidence,
           review: async () => {
             const newContent = await readNonEmptyText(reviewUri);
             if (!newContent || newContent === previousContent) {
@@ -4770,24 +4985,21 @@ async function readPlanChecklistProgressV1(
  * (where the prompt is assembled here).
  */
 /**
- * In-memory consecutive zero-file-change implementation-round counter per
- * task folder (2c, ensemble.resilience.noProgressBreakerRounds). In-memory
- * on purpose: the breaker exists to stop a single session's automation loop
- * (Fast Forward / auto-review chains) from running to
- * fastForwardMaxIterations while producing no edits — matching Fast
- * Forward's own in-session loop state, not the durable cross-session trail
- * reviewScoreHistory provides.
+ * Durable consecutive zero-file-change implementation-round counter, backed
+ * by `TaskProgress.zeroChangeImplRounds` (2c,
+ * ensemble.resilience.noProgressBreakerRounds). Previously an in-memory-only
+ * `Map`, which reset on every window reload — the counter could accumulate
+ * fresh zero-change rounds after a reload without ever tripping the breaker,
+ * even past the configured threshold (report 11). Persisting it means the
+ * count survives reloads and survives across rounds within a stage; it is
+ * cleared on any file-changing round, on a stage transition (see
+ * taskProgressFieldPolicyV1's `zeroChangeImplRounds` row), and on archive.
  */
-const zeroChangeImplRoundsByTask = new Map<string, number>();
-
-/**
- * Drop the in-memory zero-change round counter for one task. Called when a
- * task is archived (see archiveTask.ts) so the per-session map does not
- * accumulate entries for tasks that are no longer iterating; a missing entry
- * is equivalent to a zero count, so this is always safe.
- */
-export function clearZeroChangeImplRoundCounter(taskFolderPath: string): void {
-  zeroChangeImplRoundsByTask.delete(normalizePath(taskFolderPath));
+export async function clearZeroChangeImplRoundCounter(taskFolderPath: string): Promise<void> {
+  const folderUri = vscode.Uri.file(taskFolderPath);
+  await patchTaskProgressStrictV1(folderUri, (current) =>
+    setZeroChangeImplRounds(current, undefined)
+  );
 }
 
 async function executeImplementationRun(
@@ -4957,7 +5169,14 @@ async function executeImplementationRun(
 
   if (result.status === "completed") {
     const summaryUri = getImplementationSummaryUri(folderUri);
-    const taskKey = normalizePath(folderUri.fsPath);
+    // Hoisted so every "the round's edits were kept" message below (Step 19)
+    // shares one answer instead of re-deriving it — and so a genuinely
+    // zero-change round (reachable via the 2b nothingToFixRoutesToReview
+    // path just below, which does not return early) never gets told its
+    // edits were "kept". Unknown counts as "may have changed": the tree's
+    // real state is not provably clean.
+    const roundMayHaveChangedFiles =
+      result.filesChangedUnknown === true || result.filesChanged.length > 0;
 
     if (!result.filesChangedUnknown && result.filesChanged.length === 0) {
       const resilience = getResilienceSettings();
@@ -4978,16 +5197,19 @@ async function executeImplementationRun(
       // declines to fabricate work. Route onward to review/complete instead
       // of recording a spurious failure (observed five times; in every case
       // the model was behaving correctly).
-      const zeroChangeRounds = (zeroChangeImplRoundsByTask.get(taskKey) ?? 0) + 1;
-      zeroChangeImplRoundsByTask.set(taskKey, zeroChangeRounds);
+      const zeroChangeRounds = (priorProgress?.zeroChangeImplRounds ?? 0) + 1;
+      const persistedRounds = await patchTaskProgressStrictV1(folderUri, (current) =>
+        setZeroChangeImplRounds(current, zeroChangeRounds)
+      );
       NotificationRouter.showInformation(
         "Implementation finished with no file changes — the model reported the current state already " +
           "satisfies the plan. Routing to review instead of recording a failure " +
           "(ensemble.resilience.nothingToFixRoutesToReview)."
       );
-      // 2c: N consecutive zero-change rounds while the same blocker persists
-      // is a loop producing no edits at all — stop and escalate rather than
-      // running to fastForwardMaxIterations.
+      // 2c: N consecutive zero-change rounds is a loop producing no edits at
+      // all — stop and escalate rather than running to
+      // fastForwardMaxIterations. The counter itself (not the blocker
+      // situation) is now the trigger — see shouldTripNoProgressBreaker.
       if (
         shouldTripNoProgressBreaker({
           zeroChangeRounds,
@@ -4999,20 +5221,24 @@ async function executeImplementationRun(
           folderUri,
           priorProgress?.currentStage ?? postRunReviewStage,
           "plateau",
-          `${zeroChangeRounds} consecutive implementation round(s) changed zero files while the same ` +
-            "blocker persisted (no-progress breaker, ensemble.resilience.noProgressBreakerRounds). " +
-            "Automated iteration is no longer producing edits.",
+          `${zeroChangeRounds} consecutive implementation round(s) changed zero files (no-progress ` +
+            "breaker, ensemble.resilience.noProgressBreakerRounds). Automated iteration is no longer " +
+            "producing edits.",
           priorProgress?.reviewAttemptId ?? "",
-          priorProgress ?? undefined,
+          persistedRounds ?? priorProgress ?? undefined,
           false
         );
         if (escalated) {
-          zeroChangeImplRoundsByTask.delete(taskKey);
+          await patchTaskProgressStrictV1(folderUri, (current) =>
+            setZeroChangeImplRounds(current, undefined)
+          );
           return false;
         }
       }
     } else if (!result.filesChangedUnknown) {
-      zeroChangeImplRoundsByTask.delete(taskKey);
+      await patchTaskProgressStrictV1(folderUri, (current) =>
+        setZeroChangeImplRounds(current, undefined)
+      );
     }
 
     // The run summary is written to impl-summary.md and NEVER over
@@ -5080,10 +5306,41 @@ async function executeImplementationRun(
       // returned a status message. Merging ticks instead keeps the progress
       // record without ever letting a run overwrite the plan.
       if (planChecklist !== undefined) {
-        const merged = mergeChecklistProgressV1(planChecklist, summary);
-        if (merged !== undefined) {
-          await writeTextFile(planOfRecordUri, merged);
+        const mergeResult = mergeChecklistProgressV1(planChecklist, summary);
+        if (mergeResult.kind === "merged") {
+          await writeTextFile(planOfRecordUri, mergeResult.content);
+          // Retroactive ticks (RETROACTIVE_TICK_MARKER_V1) mark items this
+          // round verified as already complete rather than built itself —
+          // recorded in the run log, next to the rest of the round's
+          // evidence, so the claim is auditable rather than indistinguishable
+          // from an ordinary this-round tick.
+          if (mergeResult.retroactiveTicks && mergeResult.retroactiveTicks.length > 0) {
+            const existingLog = await readTextIfExists(logUri);
+            if (existingLog !== undefined) {
+              const retroSection =
+                "\n\n## Retroactive plan ticks\n\n" +
+                "Items ticked this round via a retroactive claim (verified complete from an " +
+                "earlier round, not built this round):\n\n" +
+                mergeResult.retroactiveTicks
+                  .map((tick) => `- ${tick.itemText} — ${tick.evidence}`)
+                  .join("\n");
+              await writeTextFile(logUri, `${existingLog}${retroSection}\n`);
+            }
+          }
+        } else if (mergeResult.kind === "no-match") {
+          // The round reported ticked items, but none matched any item in the
+          // plan of record — a silent no-op here would be indistinguishable
+          // from a round that genuinely made no progress. Surfaced rather than
+          // swallowed so a corrupted or reworded echo is visible instead of
+          // quietly stalling the plan.
+          NotificationRouter.showWarning(
+            "⚠️ The implementation round reported checklist progress that did not match any " +
+              "item in the plan of record, so no boxes were ticked. Unmatched: " +
+              mergeResult.unmatchedSample.map((text) => `"${text}"`).join(", ")
+          );
         }
+        // "unchanged" / "no-report" behave as the old undefined case did: no
+        // write, no warning.
       }
     } else {
       // Stamped HERE, next to the write it replaces, rather than beside the
@@ -5103,7 +5360,7 @@ async function executeImplementationRun(
       if (!existingSummary || !isUnusableImplementationSummaryV1(existingSummary)) {
         await writeTextFile(
           summaryUri,
-          `${buildUnusableImplementationSummaryV1(summaryIssue, path.basename(logUri.fsPath))}\n`
+          `${buildUnusableImplementationSummaryV1(summaryIssue, path.basename(logUri.fsPath), roundMayHaveChangedFiles)}\n`
         );
       }
     }
@@ -5247,7 +5504,9 @@ async function executeImplementationRun(
     if (result.typeCheckFailed) {
       NotificationRouter.showWarning(
         "⚠️ Implementation finished, but the project no longer type-checks. " +
-          "The round's edits were kept and recorded for review, but automated review has been " +
+          (roundMayHaveChangedFiles
+            ? "The round's edits were kept and recorded for review, but automated review has been "
+            : "This round changed no files, so there is nothing new recorded for review, but automated review has been ") +
           "paused until the build is fixed — see the implementation run log for the type-check output."
       );
       await safeOpenTextDocument(logUri, "implementation run log");
@@ -5268,9 +5527,20 @@ async function executeImplementationRun(
       // which gate returns first.
       NotificationRouter.showWarning(
         "⚠️ Implementation finished, but the provider did not return a usable summary " +
-          `(${summaryIssue}). The round's edits were kept and recorded for review, but ` +
+          `(${summaryIssue}). ` +
+          (roundMayHaveChangedFiles
+            ? "The round's edits were kept and recorded for review, but "
+            : "This round changed no files, so there is nothing new recorded for review, but ") +
           "review has been paused — a reviewer would otherwise be handed this text " +
-          "as the implementation notes. See the implementation run log for the full response."
+          "as the implementation notes. See the implementation run log for the full response.",
+        undefined,
+        undefined,
+        undefined,
+        {
+          command: "vs-code-ai-helper.restoreRejectedImplementationRound",
+          title: "Restore Prior Round",
+          args: [folderUri.fsPath, postRunReviewStage],
+        }
       );
       await safeOpenTextDocument(logUri, "implementation run log");
       return false;
@@ -5899,6 +6169,11 @@ export function registerReviewActionCommands(
       (arg?: ReviewCommandArg) => viewReview(context, arg)
     ),
     vscode.commands.registerCommand(
+      "vs-code-ai-helper.restoreRejectedImplementationRound",
+      (taskFolderPath: string, stage: TaskStage) =>
+        restoreRejectedImplementationRoundV1(taskFolderPath, stage)
+    ),
+    vscode.commands.registerCommand(
       "vs-code-ai-helper.nextStage",
       (node?: TaskNodeArg) =>
         nextStage(context.extensionUri, context, node)
@@ -6355,7 +6630,8 @@ async function buildReviewResumeVariablesV1(
       folderUri,
       undefined,
       operationToken,
-      targetStage === "publish"
+      targetStage === "publish",
+      targetStage
     );
     variables.verifiedChecks = checks.verifiedChecks;
     if (checks.planItemVerification !== undefined) {

@@ -596,4 +596,132 @@ void describe("improveReviewScore — plan progress", () => {
 
     assert.strictEqual(result.improved, true, "score-based success still works without the marker");
   });
+
+  // Step 10: Fast Forward must be able to succeed from a 10/10 baseline.
+  // `improved` demands `baselineScore + 0.1`, which has no representable
+  // value above a baseline of 10 on a 0-10 scale, so a perfect baseline must
+  // succeed through a different path that does not require score movement.
+  void describe("terminal success at/above the configured stop level without score movement", () => {
+    void it("succeeds on the FIRST in-loop round at a 10/10 baseline, without requiring +0.1", async () => {
+      const context = fakeContext();
+      let applies = 0;
+      const result = await improveReviewScore({
+        context,
+        stage: "impl-high-review",
+        baselineScore: 10,
+        maxAttempts: MAX_REVIEW_ATTEMPTS,
+        stopAtScore: 10,
+        apply: () => {
+          applies += 1;
+          return Promise.resolve();
+        },
+        review: () => Promise.resolve({ score: 10, taskFixableCount: 0, zeroFixableEvidence: true }),
+      });
+
+      assert.strictEqual(result.zeroFixableSuccess, true);
+      assert.strictEqual(result.improved, false);
+      assert.strictEqual(result.attempts, 1, "must not wait for ZERO_FIXABLE_TERMINAL_ROUNDS");
+      assert.strictEqual(applies, 1);
+    });
+
+    void it("does not fire below the configured stop level, even with zero-fixable evidence", async () => {
+      const context = fakeContext();
+      const result = await improveReviewScore({
+        context,
+        stage: "impl-high-review",
+        baselineScore: 8,
+        maxAttempts: 2,
+        stopAtScore: 10,
+        apply: () => Promise.resolve(),
+        review: () => Promise.resolve({ score: 8, taskFixableCount: 0, zeroFixableEvidence: true }),
+      });
+
+      assert.strictEqual(result.zeroFixableSuccess, false, "8 is below the configured stop level of 10");
+    });
+
+    void it("does not fire without zero-fixable evidence, even at/above the stop level", async () => {
+      const context = fakeContext();
+      const result = await improveReviewScore({
+        context,
+        stage: "impl-high-review",
+        baselineScore: 10,
+        maxAttempts: 1,
+        stopAtScore: 10,
+        apply: () => Promise.resolve(),
+        review: () => Promise.resolve({ score: 10, taskFixableCount: 1, zeroFixableEvidence: false }),
+      });
+
+      assert.strictEqual(result.zeroFixableSuccess, false);
+    });
+
+    void it("pre-loop short-circuit: succeeds without running apply() even once when the seeded evidence already clears the bar", async () => {
+      const context = fakeContext();
+      let applies = 0;
+      const result = await improveReviewScore({
+        context,
+        stage: "impl-high-review",
+        baselineScore: 10,
+        maxAttempts: MAX_REVIEW_ATTEMPTS,
+        stopAtScore: 10,
+        preLoopEvidence: { zeroFixableEvidence: true, planIncomplete: false },
+        apply: () => {
+          applies += 1;
+          return Promise.resolve();
+        },
+        review: () => Promise.resolve({ score: 3, taskFixableCount: 5, zeroFixableEvidence: false }),
+      });
+
+      assert.strictEqual(result.zeroFixableSuccess, true);
+      assert.strictEqual(result.attempts, 0, "must not burn the round that failed in report 7");
+      assert.strictEqual(applies, 0, "apply() must never run when the pre-loop evidence already succeeds");
+      assert.strictEqual(result.score, 10);
+    });
+
+    void it("pre-loop short-circuit does not fire when the plan is still incomplete", async () => {
+      const context = fakeContext();
+      let applies = 0;
+      const result = await improveReviewScore({
+        context,
+        stage: "impl-high-review",
+        baselineScore: 10,
+        maxAttempts: 1,
+        stopAtScore: 10,
+        preLoopEvidence: { zeroFixableEvidence: true, planIncomplete: true },
+        apply: () => {
+          applies += 1;
+          return Promise.resolve();
+        },
+        review: () => Promise.resolve({ score: 10, taskFixableCount: 0, zeroFixableEvidence: true }),
+      });
+
+      assert.strictEqual(applies, 1, "an incomplete plan must still run at least one round");
+      assert.strictEqual(result.zeroFixableSuccess, true);
+    });
+
+    void it("seeds consecutiveZeroFixable from the pre-loop review, so one in-loop clean round can still terminate via the 2-round path", async () => {
+      // The pre-loop review was itself zero-fixable but did NOT meet
+      // stopAtScore (so the short-circuit above does not fire) — a single
+      // further clean round should be enough to reach
+      // ZERO_FIXABLE_TERMINAL_ROUNDS (2), not require two more rounds.
+      const context = fakeContext();
+      let applies = 0;
+      const result = await improveReviewScore({
+        context,
+        stage: "impl-high-review",
+        baselineScore: 8,
+        maxAttempts: MAX_REVIEW_ATTEMPTS,
+        zeroFixableTerminates: true,
+        preLoopEvidence: { zeroFixableEvidence: true, planIncomplete: false },
+        apply: () => {
+          applies += 1;
+          return Promise.resolve();
+        },
+        review: () => Promise.resolve({ score: 8, taskFixableCount: 0, zeroFixableEvidence: true }),
+      });
+
+      assert.strictEqual(result.zeroFixableSuccess, true);
+      assert.strictEqual(result.attempts, 1, "the pre-loop round already counted toward the 2-round streak");
+      assert.strictEqual(applies, 1);
+    });
+  });
 });

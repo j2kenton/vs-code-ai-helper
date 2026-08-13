@@ -91,6 +91,7 @@ import { ActionCorrelationV1, allocateHex128IdV1 } from "../types/actionCorrelat
 import { AgentTransportV1 } from "../types/agentExecutionV1";
 import { CompletedContentV1, MalformedAiResultV1 } from "../types/aiResultEnvelope";
 import { MIGRATED_ACTION_KEYS_V0 } from "../services/legacyAiActionSafetyGateV0";
+import { EDIT_EXECUTION_ACTION_KEY_V1 } from "../actions/rows/editExecutionRowV1";
 import {
   createWorkflowLeaseStoreV1,
   WorkflowLeaseStoreV1,
@@ -800,6 +801,272 @@ void describe("taskActionCoordinatorV1", () => {
     assert.notEqual(seen[0]!.attemptId, seen[1]!.attemptId);
     assert.equal(harness.selection.opened, 1);
     assert.equal(harness.selection.reserved, 2);
+  });
+
+  /**
+   * 2026-08-12 field report, item 2: a malformed result used to be retried
+   * only against the SAME resolved primary candidate
+   * (`withMalformedResultRetryV1`) — a stage with four configured backups
+   * under `switch-to-backup` never reached any of them. The coordinator loop
+   * now advances to the next ranked candidate on a malformed result, exactly
+   * like the existing pre-response `transportFailure` fallback above.
+   */
+  void describe("malformed-result candidate advancement", () => {
+    function malformedTransport(): AgentTransportV1 {
+      return {
+        runnerId: "scripted-transport",
+        invoke: (_request, output): Promise<{ kind: "completed" }> => {
+          output.write("<<<ENSEMBLE_AI_RESULT_V1>>>\nnot valid json\n<<<END_ENSEMBLE_AI_RESULT_V1>>>\n");
+          return Promise.resolve({ kind: "completed" as const });
+        },
+      };
+    }
+
+    void it("advances to the next candidate on a malformed result and recovers on the second", async () => {
+      const harness = makeHarness([
+        malformedTransport(),
+        envelopeTransport((correlation) =>
+          frame({
+            version: 1,
+            correlation,
+            kind: "completed",
+            content: { contentType: "markdown-artifact.v1", schemaVersion: 1, markdown: "# ok" },
+          })
+        ),
+      ]);
+      const outcome = await harness.coordinator.executeAction(baseRequest());
+      assert.equal(outcome.kind, "completed");
+      assert.equal(harness.promoted.length, 1);
+      assert.equal(harness.selection.reserved, 2, "the second candidate must have been reserved");
+    });
+
+    /**
+     * The budget is pinned at MAX_MALFORMED_RESULT_INVOCATIONS_V1 = 3 (the
+     * initial attempt plus at most two advances) so a five-candidate stage
+     * cannot burn five CLI invocations on one press.
+     */
+    void it("stops advancing after 3 total invocations, even with more candidates configured", async () => {
+      const harness = makeHarness([
+        malformedTransport(),
+        malformedTransport(),
+        malformedTransport(),
+        malformedTransport(),
+        malformedTransport(),
+      ]);
+      const outcome = await harness.coordinator.executeAction(baseRequest());
+      assert.equal(outcome.kind, "malformedResult");
+      assert.equal(
+        harness.selection.reserved,
+        3,
+        "only the initial attempt plus two advances may be reserved"
+      );
+    });
+
+    void it("returns the last malformed outcome, not providerModeUnavailable, when candidates run out", async () => {
+      // Exactly two candidates configured, both malformed: the loop advances
+      // once, the second candidate also comes back malformed, and reserving
+      // a third finds nothing left. The exhaustion must not mask the real
+      // failure behind a misleading "no provider available".
+      const harness = makeHarness([malformedTransport(), malformedTransport()]);
+      const outcome = await harness.coordinator.executeAction(baseRequest());
+      assert.equal(outcome.kind, "malformedResult");
+      if (outcome.kind !== "malformedResult") {
+        assert.fail("expected malformedResult, not providerModeUnavailable");
+      }
+      assert.equal(outcome.code, "invalidJson");
+      assert.equal(harness.selection.reserved, 2);
+    });
+
+    void it("does not advance candidates for a resultCorrelationMismatch", async () => {
+      // A foreign-operation echo is a correlation bug, not a bad provider
+      // response — a different candidate cannot fix it, so this must settle
+      // on the first candidate exactly as before this step.
+      const harness = makeHarness([
+        envelopeTransport((correlation) =>
+          frame({
+            version: 1,
+            correlation: { ...correlation, operationId: allocateHex128IdV1() },
+            kind: "completed",
+            content: { contentType: "markdown-artifact.v1", schemaVersion: 1, markdown: "# x" },
+          })
+        ),
+        envelopeTransport(() => {
+          throw new Error("must not advance past a resultCorrelationMismatch");
+        }),
+      ]);
+      const outcome = await harness.coordinator.executeAction(baseRequest());
+      assert.equal(outcome.kind, "malformedResult");
+      if (outcome.kind !== "malformedResult") {
+        assert.fail("expected malformedResult");
+      }
+      assert.equal(outcome.code, "resultCorrelationMismatch");
+      assert.equal(harness.selection.reserved, 1);
+    });
+
+    // Excluded action key, matching `retryOnMalformedResultV1`'s existing
+    // exclusion and its reasoning (productionTaskActionRuntimeV1.ts): a
+    // partially-executed edit-broker session cannot safely restart from a
+    // fresh conversation, so `editExecution.v1` never advances candidates on
+    // a malformed result even when (as synthesized here) it happens to be
+    // wired as a text-mode row. Production `editExecution.v1` rows are
+    // always non-text anyway, so the providerMode check above already
+    // covers that shape in practice; this test isolates the action-key
+    // check specifically.
+    void it("does not advance candidates for the editExecution.v1 action key", async () => {
+      const editRow: ProviderTaskActionRowV1 = {
+        kind: "provider",
+        actionKey: EDIT_EXECUTION_ACTION_KEY_V1,
+        routes: ["vs-code-ai-helper.testEditExecutionRoute"],
+        eligibility: { statuses: ["active"], stages: ["plan"] },
+        requiresTaskOperationLease: true,
+        progressLabel: "Testing…",
+        providerMode: "text",
+        maxResponseBytes: 64 * 1024,
+        permittedResultKinds: ["completed", "cancelled", "failed"],
+        completedContentType: "markdown-artifact.v1",
+        resumeSemantics: "sameOperation",
+        validateInput: (input) => ({ ok: true, input }),
+        buildPrompt: () => "ACTION PROMPT",
+        promoteCompletedContent: () => Promise.resolve("completed"),
+        loggingPolicy: { channel: "action.test", includeResultMetrics: false },
+      };
+      const selection = stubSelectionOpener([malformedTransport(), malformedTransport()]);
+      const coordinator = createTaskActionCoordinatorV1({
+        registry: createTaskActionRegistryV1([editRow]),
+        leaseStore: createWorkflowLeaseStoreV1(),
+        openRunnerSelection: selection.opener,
+        orchestrator: makeOrchestrator(),
+        followUpScheduler: { schedule: (): void => undefined },
+        presenter: { beginProgress: () => ({ end: (): void => undefined }) },
+        auditLogger: { log: (): void => undefined },
+      });
+      const outcome = await coordinator.executeAction({
+        ...baseRequest(),
+        actionKey: EDIT_EXECUTION_ACTION_KEY_V1,
+      });
+      assert.equal(outcome.kind, "malformedResult");
+      assert.equal(
+        selection.reserved,
+        1,
+        "editExecution.v1 must not advance past a malformed result"
+      );
+    });
+
+    /**
+     * `TaskActionRequestV1.malformedInvocationsAlreadyUsedV1` seeds this
+     * operation's own counter (2026-08-13 review fix): without it, a
+     * genuinely fresh operation started by `withMalformedResultRetryV1`
+     * after a first operation already spent part of the shared 3-invocation
+     * budget would start counting from zero again, letting one user press
+     * reach up to 5-6 total provider invocations instead of the approved 3.
+     */
+    void it("seeds the invocation counter from malformedInvocationsAlreadyUsedV1, capping the combined total at 3", async () => {
+      const harness = makeHarness([malformedTransport(), malformedTransport(), malformedTransport()]);
+      const outcome = await harness.coordinator.executeAction({
+        ...baseRequest(),
+        malformedInvocationsAlreadyUsedV1: 2,
+      });
+      assert.equal(outcome.kind, "malformedResult");
+      // Seeded at 2 already-used: only ONE more invocation is permitted
+      // before hitting the shared cap of 3, so only a single candidate may
+      // be reserved by this operation.
+      assert.equal(
+        harness.selection.reserved,
+        1,
+        "only one more invocation may run once 2 of the shared 3-budget is already spent"
+      );
+      if (outcome.kind === "malformedResult") {
+        assert.equal(
+          outcome.malformedInvocationsUsedV1,
+          3,
+          "the reported count must be the cumulative total (2 already used + 1 more), not this operation's own delta"
+        );
+      }
+    });
+
+    function preResponseFailingTransport(): AgentTransportV1 {
+      return {
+        runnerId: "scripted-transport",
+        invoke: () => Promise.resolve({ kind: "transportFailure" as const, code: "connectFailed" }),
+      };
+    }
+
+    /**
+     * 2026-08-13 review fix: `malformedInvocationCountV1` counts EVERY
+     * invocation once a malformed result has armed the shared budget — not
+     * just ones caused by another malformed result. Before this fix, a
+     * pre-response `transportFailure` always advanced unconditionally
+     * (mirroring the ordinary transport-failure fallback), so a malformed
+     * result followed by transport failures could push this operation's
+     * total invocations past the 3-invocation cap. With a malformed result
+     * on attempt 1 and transport failures on attempts 2 and 3, attempt 3's
+     * increment reaches the cap (count=3) and must stop the loop rather
+     * than reserving a 4th candidate.
+     */
+    void it("caps total invocations at 3 when a malformed result is followed by transport failures", async () => {
+      const harness = makeHarness([
+        malformedTransport(),
+        preResponseFailingTransport(),
+        preResponseFailingTransport(),
+        envelopeTransport(() => {
+          throw new Error("must not reserve a 4th candidate once the shared budget is exhausted");
+        }),
+      ]);
+      const outcome = await harness.coordinator.executeAction(baseRequest());
+      assert.equal(outcome.kind, "malformedResult");
+      if (outcome.kind === "malformedResult") {
+        assert.equal(
+          outcome.code,
+          "invalidJson",
+          "the honest diagnosis (the malformed result from attempt 1) must be reported, not masked by the later transport failures"
+        );
+        assert.equal(
+          outcome.malformedInvocationsUsedV1,
+          3,
+          // 2026-08-13 review fix: the stamped count must track the
+          // operation's TOTAL invocations (1 malformed + 2 transport
+          // failures = 3), not the count at the moment the malformed result
+          // occurred (1). A stale count here would let the outer wrapper in
+          // productionTaskActionRuntimeV1.ts believe only 1 of 3 invocations
+          // had been spent and open further operations past the shared cap.
+        );
+      }
+      assert.equal(
+        harness.selection.reserved,
+        3,
+        "only 3 total invocations may be reserved once the malformed budget is armed"
+      );
+    });
+
+    /**
+     * Same guard, but the budget arrives already-armed via
+     * `malformedInvocationsAlreadyUsedV1` from a prior fresh operation
+     * (rather than a malformed result within this operation itself). A
+     * pre-response transport failure on the one invocation this operation
+     * is permitted must not advance to a 2nd candidate.
+     */
+    void it("caps a transport failure at the seeded budget when armed via malformedInvocationsAlreadyUsedV1", async () => {
+      const harness = makeHarness([
+        preResponseFailingTransport(),
+        envelopeTransport(() => {
+          throw new Error("must not reserve a 2nd candidate once the seeded budget is exhausted");
+        }),
+      ]);
+      const outcome = await harness.coordinator.executeAction({
+        ...baseRequest(),
+        malformedInvocationsAlreadyUsedV1: 2,
+      });
+      assert.equal(outcome.kind, "failed");
+      if (outcome.kind === "failed") {
+        assert.equal(outcome.code, "connectFailed");
+        assert.equal(outcome.retryable, true);
+      }
+      assert.equal(
+        harness.selection.reserved,
+        1,
+        "only the one remaining invocation of the seeded 3-budget may be reserved"
+      );
+    });
   });
 
   void it("treats a response-started transport failure as terminal (no fallback)", async () => {

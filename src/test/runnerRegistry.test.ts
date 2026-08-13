@@ -1462,23 +1462,25 @@ void describe("runImplementationForModel", () => {
     }
   });
 
-  // (2e) Backup handoff after a quota-interrupted implementation. Prior
-  // behavior (Codex review finding, P1) blocked the backup cascade outright
-  // the moment the PRIMARY run left the tree dirty, stranding whatever it
-  // had already written — see the sibling "unknown file state" test below
-  // for the case that DOES still stop the cascade. When the change set is
-  // known (a real git snapshot, not `filesChangedUnknown`), the fix is to
-  // preserve the tree and hand the SAME configured backup an explicit
-  // handoff prompt describing what changed, rather than give up. Especially
-  // reachable for Cline/Antigravity, whose edit mode keeps every tool
-  // auto-approved right up to a timeout/kill, but the gate applies to every
-  // provider uniformly (filesChanged is computed the same way for all of
-  // them).
-  void it("hands off to a backup with the primary's changed files preserved when the primary run already left the working tree dirty", async () => {
+  // (2e / plan step 17) A quota-or-outage failure that left the working tree
+  // DIRTY must never invoke a backup — the zero-changed-files requirement is
+  // the cascade's explicit safety boundary (a second model dispatched at a
+  // half-edited tree risks mixing two models' edits in one round). An earlier
+  // round replaced this with a "handoff" that deliberately ran the backup
+  // against the dirty tree; the implementation review rejected that as a
+  // reversal of the plan's contract, so this test pins the required shape:
+  // the configured, AVAILABLE backup stays uninvoked, and the primary's own
+  // failure comes back enriched with an explanation naming the withheld
+  // switch and the two real choices (rerun the stage / switch the stage's
+  // model). Especially reachable for Cline/Antigravity, whose edit mode
+  // keeps every tool auto-approved right up to a timeout/kill, but the gate
+  // applies to every provider uniformly (filesChanged is computed the same
+  // way for all of them).
+  void it("withholds the backup switch and explains why when the primary run already left the working tree dirty", async () => {
     const originalSpawn = childProcess.spawn;
 
     const metaRoot = fs.mkdtempSync(
-      path.join(os.tmpdir(), "ensemble-impl-dirty-tree-handoff-")
+      path.join(os.tmpdir(), "ensemble-impl-dirty-tree-withheld-")
     );
     const taskFolder = path.join(metaRoot, "tasks", "task-a");
     fs.mkdirSync(taskFolder, { recursive: true });
@@ -1507,7 +1509,7 @@ void describe("runImplementationForModel", () => {
         // report a transient, cascade-eligible failure. runImplementationWithCli's
         // real before/after `git status` snapshot (execFile, not spawn, so
         // it runs for real against this actual file) is what must catch
-        // this and route it into the handoff branch.
+        // this and route it into the withheld branch.
         fs.writeFileSync(mutatedFile, "partial edit from a run that then failed");
         // Cline's real --json error shape is a FLAT top-level
         // {"type":"error","message":"..."} line (see extractClineStructuredDiagnostics
@@ -1528,21 +1530,15 @@ void describe("runImplementationForModel", () => {
 
     const lm = lmStub();
     const originalSelectChatModels = lm.selectChatModels;
-    let capturedPrompt: string | undefined;
-    const { LanguageModelTextPart } = vscode as unknown as {
-      LanguageModelTextPart: new (value: string) => { value: string };
-    };
-    function* responseStream(): Iterable<unknown> {
-      yield new LanguageModelTextPart("backup finished the interrupted implementation");
-    }
+    let backupAttempted = false;
     lm.selectChatModels = (): Promise<vscode.LanguageModelChat[]> =>
       Promise.resolve([
         {
           id: "auto",
           name: "Auto",
-          sendRequest: (messages: Array<{ content: unknown }>) => {
-            capturedPrompt = String(messages[0]?.content ?? "");
-            return Promise.resolve({ stream: responseStream() });
+          sendRequest: () => {
+            backupAttempted = true;
+            return Promise.reject(new Error("the backup must never run on a dirty tree"));
           },
         } as unknown as vscode.LanguageModelChat,
       ]);
@@ -1572,6 +1568,7 @@ void describe("runImplementationForModel", () => {
       "utf8"
     );
 
+    const progressMessages: string[] = [];
     try {
       const settings = installModelSettings({
         impl: {
@@ -1586,38 +1583,55 @@ void describe("runImplementationForModel", () => {
           prompt: "Implement the requested change.",
           workspaceUri: taskFolderUri,
           token: new vscode.CancellationTokenSource().token,
-          onProgress: () => undefined,
+          onProgress: (message: string) => {
+            progressMessages.push(message);
+          },
           correlation: { actionKey: "implementation.v1" },
           allowCrossProviderBackups: true,
           stage: "impl",
           taskFolderUri,
         });
 
-        assert.strictEqual(result.status, "completed");
-        assert.strictEqual(result.runnerId, "copilot-lm");
+        assert.strictEqual(
+          backupAttempted,
+          false,
+          "an available backup must never be dispatched at a tree the failed primary already edited"
+        );
+        assert.strictEqual(result.status, "failed");
+        assert.strictEqual(result.failureKind, "temporarily-unavailable");
         assert.ok(
           result.filesChanged.includes("mutated-by-partial-run.txt"),
-          "expected the primary run's own file write to survive into the merged filesChanged list"
+          "expected the primary run's own file write to survive in the reported filesChanged list"
+        );
+        assert.match(
+          result.errorMessage ?? "",
+          /withheld the automatic switch/,
+          "expected the failure message to say the backup switch was deliberately withheld"
+        );
+        assert.match(
+          result.errorMessage ?? "",
+          /changed 1 file\(s\)/,
+          "expected the failure message to name how many files the interrupted round left behind"
+        );
+        assert.match(
+          result.errorMessage ?? "",
+          /Rerun this stage.*switch the stage's model/,
+          "expected the failure message to offer the two real choices: rerun or switch the model"
         );
         assert.ok(
-          capturedPrompt?.includes("mutated-by-partial-run.txt"),
-          "expected the handoff prompt to name the file the interrupted primary already changed"
-        );
-        assert.ok(
-          capturedPrompt?.toLowerCase().includes("preserve") &&
-            capturedPrompt?.toLowerCase().includes("interrupted"),
-          "expected the handoff prompt to instruct the backup to preserve the interrupted agent's work"
-        );
-        assert.ok(
-          capturedPrompt?.includes("Implement the requested change."),
-          "expected the handoff prompt to still include the original implementation task"
+          progressMessages.some((message) => message.includes("withheld the automatic switch")),
+          "expected an explicit progress notification about the withheld backup, not just the returned error"
         );
         const progress = JSON.parse(fs.readFileSync(progressPath, "utf8")) as {
           fallbackActive?: Partial<Record<string, boolean>>;
           fallbackModelId?: Partial<Record<string, string>>;
         };
-        assert.strictEqual(progress.fallbackActive?.impl, true);
-        assert.strictEqual(progress.fallbackModelId?.impl, "auto");
+        assert.notStrictEqual(
+          progress.fallbackActive?.impl,
+          true,
+          "a withheld switch must not record an active fallback for the stage"
+        );
+        assert.strictEqual(progress.fallbackModelId?.impl, undefined);
       } finally {
         settings.restore();
       }
@@ -1630,13 +1644,15 @@ void describe("runImplementationForModel", () => {
     }
   });
 
-  // (2e) Sibling of the handoff test above: file-change state must be
-  // KNOWN, not merely non-clean, before a handoff is safe. Outside a git
-  // repository (or with git unavailable) `filesChangedUnknown` is true —
-  // genuinely not knowing what changed is not evidence it's safe to build
-  // on, so this must keep the pre-existing stop behavior exactly like an
-  // authentication failure or a cancellation would.
-  void it("does not hand off to a backup when the primary's file-change state is unknown", async () => {
+  // (2e) Sibling of the withheld-switch test above: an UNKNOWN file-change
+  // state (outside a git repository, or with git unavailable) is treated the
+  // same as dirty by the cascade — genuinely not knowing what changed is not
+  // evidence the tree is clean — but it takes the plain fall-through rather
+  // than the withheld-message branch (a message claiming "N file(s) changed"
+  // cannot be written about a tree whose state could not be determined). The
+  // backup must stay uninvoked here exactly as it does for a known-dirty
+  // tree.
+  void it("does not run a backup when the primary's file-change state is unknown", async () => {
     const originalSpawn = childProcess.spawn;
 
     const metaRoot = fs.mkdtempSync(

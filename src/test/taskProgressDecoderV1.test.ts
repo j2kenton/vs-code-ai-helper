@@ -136,6 +136,26 @@ void describe("taskProgressDecoderV1", () => {
     );
   });
 
+  void it("decodes a valid zeroChangeImplRounds and fails closed on non-negative-integer violations (step 8)", () => {
+    const result = decodeTaskProgressTextV1(
+      doc({ ensembleProgressVersion: 1, zeroChangeImplRounds: 3 })
+    );
+    assert.equal(result.ok, true);
+    if (result.ok) {
+      assert.equal(result.decoded.progress.zeroChangeImplRounds, 3);
+    }
+    const zero = decodeTaskProgressTextV1(
+      doc({ ensembleProgressVersion: 1, zeroChangeImplRounds: 0 })
+    );
+    assert.equal(zero.ok, true);
+    if (zero.ok) {
+      assert.equal(zero.decoded.progress.zeroChangeImplRounds, 0);
+    }
+    expectRecovery(doc({ ensembleProgressVersion: 1, zeroChangeImplRounds: -1 }), "invalidFieldValue");
+    expectRecovery(doc({ ensembleProgressVersion: 1, zeroChangeImplRounds: 1.5 }), "invalidFieldValue");
+    expectRecovery(doc({ ensembleProgressVersion: 1, zeroChangeImplRounds: "3" }), "invalidFieldValue");
+  });
+
   void it("resolves the closed legacy stage alias table in parity with migrateStage", () => {
     for (const [alias, canonical] of Object.entries(LEGACY_STAGE_ALIAS_TABLE_V1)) {
       assert.equal(

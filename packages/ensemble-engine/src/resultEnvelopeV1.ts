@@ -1017,6 +1017,50 @@ function decodeEnvelopeV1(
  * it invoked: a cross-task/cross-operation/stale-attempt result rejects
  * (resultCorrelationMismatch) BEFORE any content is decoded.
  */
+/**
+ * Accept a frame whose payload is complete but whose `FRAME_END_V1`
+ * terminator never arrived (2026-08-12 field report, item 1) — ported
+ * verbatim from `src/types/aiResultEnvelope.ts`'s own copy; see that file's
+ * doc comment for the full rationale. `body` is known NOT to end with
+ * `FRAME_END_V1`.
+ */
+function parseUnterminatedFrameV1(
+  raw: string,
+  body: string,
+  expectedCorrelation?: ActionCorrelationV1
+): AiResultParseOutcomeV1 {
+  const missingTerminatorReason = `expected the frame to end with ${FRAME_END_V1}`;
+  const afterStart = body.slice(FRAME_START_V1.length);
+
+  let eol: "\n" | "\r\n";
+  if (afterStart.startsWith("\r\n")) {
+    eol = "\r\n";
+  } else if (afterStart.startsWith("\n")) {
+    eol = "\n";
+  } else {
+    return malformed("invalidFrame", raw, missingTerminatorReason);
+  }
+
+  const candidateLine = afterStart.slice(eol.length);
+  if (candidateLine.length === 0 || candidateLine.includes("\n") || candidateLine.includes("\r")) {
+    return malformed("invalidFrame", raw, missingTerminatorReason);
+  }
+  if (utf8ByteLength(candidateLine) > MAX_PREFLIGHT_BYTES_V1) {
+    return malformed(
+      "resultLimitExceeded",
+      raw,
+      `payload exceeds the absolute ${MAX_PREFLIGHT_BYTES_V1}-byte ceiling`
+    );
+  }
+
+  const parsed = parseStrictJsonV1(candidateLine);
+  if (!parsed.ok) {
+    return malformed("invalidFrame", raw, missingTerminatorReason);
+  }
+
+  return decodeEnvelopeV1(parsed.value, raw, expectedCorrelation);
+}
+
 export function parseAiResultEnvelopeV1(
   raw: string,
   expectedCorrelation?: ActionCorrelationV1
@@ -1046,7 +1090,7 @@ export function parseAiResultEnvelopeV1(
   const body = trimmedForTrailingNewline.slice(frameStartIndex);
 
   if (!body.endsWith(FRAME_END_V1)) {
-    return malformed("invalidFrame", raw, `expected the frame to end with ${FRAME_END_V1}`);
+    return parseUnterminatedFrameV1(raw, body, expectedCorrelation);
   }
   if (body.length < FRAME_START_V1.length + FRAME_END_V1.length) {
     return malformed("invalidFrame", raw, "start and end markers overlap");

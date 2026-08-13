@@ -247,8 +247,20 @@ export interface CliProviderDefinition {
    * `{"type":"turn.failed","error":{"message":...}}` on STDOUT while stderr
    * stays empty (verified live against codex 0.147.0) — see
    * extractCodexFinalOutput/extractCodexStructuredDiagnostics.
+   *
+   * "claude" names Claude Code CLI's `--output-format stream-json` JSONL
+   * stream: `{"type":"assistant","message":{"content":[{"type":"text",
+   * "text":...}]}}` events for each turn of assistant output (last one wins
+   * as the final answer), and a terminal `{"type":"result",...,"is_error":
+   * boolean,"error":...}` event whose `is_error`/`error` fields carry
+   * structured failure info (e.g. a rate-limit refusal) instead of only being
+   * inferable from prose the way `--output-format text` left it — see
+   * extractClaudeCliFinalOutput/extractClaudeCliStructuredDiagnostics.
+   * NEEDS-TOOLCHAIN: this shape is built from Claude Code CLI's documented
+   * event model, not yet confirmed live — see the doc comment on
+   * ClaudeCliEnvelope in cliAgentRunner.ts.
    */
-  structuredEventStream?: "opencode" | "cline" | "kimi" | "codex";
+  structuredEventStream?: "opencode" | "cline" | "kimi" | "codex" | "claude";
   /**
    * Optional same-conversation recovery for a provider whose headless CLI
    * persists a failed turn and exposes a continuation flag. Unlike replaying
@@ -770,14 +782,39 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
       },
     ],
     usesLastMessageFile: false,
+    structuredEventStream: "claude",
     buildArgs(mode, model): string[] {
       const parsedModel = parseClaudeCliModelSelection(model);
-      const args = ["-p", "--output-format", "text"];
+      // Edit mode keeps the original plain "text" output-format, unchanged —
+      // only text (read-only, summary-extraction) mode moves to stream-json
+      // below. Edit-mode runs are captured for their WORKSPACE FILE changes,
+      // not for a parsed summary string, so there is nothing for a
+      // structured event stream to buy there, and touching it would be an
+      // unrelated behavior change outside this fix's scope.
+      const args = ["-p", "--output-format", mode === "edit" ? "text" : "stream-json"];
       if (mode === "edit") {
         // Allow file edits in the workspace without per-edit prompts;
         // anything beyond edits (e.g. arbitrary shell) stays denied.
         args.push("--permission-mode", "acceptEdits");
       } else {
+        // stream-json, NOT text — same motivation as kimi-cli's identical
+        // move (see its own buildArgs comment): `text` mode's only failure
+        // signal is prose, so a 429/rate-limit refusal is inferable only by
+        // scanning the model's own free-form output for phrases, unlike
+        // every other structuredEventStream provider here
+        // (codex/cline/kimi/opencode), which all report failures via a
+        // dedicated structured field. In stream-json mode, the terminal
+        // `result` event's `is_error`/`error` fields are read structurally
+        // by extractClaudeCliStructuredDiagnostics, and the last `assistant`
+        // event's text is unwrapped by extractClaudeCliFinalOutput —
+        // mirroring extractKimiFinalOutput/extractCodexFinalOutput's "last
+        // message wins" shape. `--verbose` is required alongside `-p
+        // --output-format stream-json` per Claude Code CLI's documented
+        // print-mode contract.
+        // NEEDS-TOOLCHAIN: neither flag combination nor the resulting event
+        // shape has been confirmed against a live `claude` CLI invocation —
+        // see the doc comment on ClaudeCliEnvelope in cliAgentRunner.ts.
+        args.push("--verbose");
         // Text mode must stay read-only no matter what the invoking
         // workspace's own .claude/settings.json permits: omitting this flag
         // falls back to "default" permission mode, which still honors any

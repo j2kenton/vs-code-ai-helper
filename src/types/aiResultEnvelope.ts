@@ -993,6 +993,56 @@ function decodeEnvelopeV1(
  * decoded — matching plan §3.1's "correlation is checked before envelope-
  * kind or content processing."
  */
+/**
+ * Accept a frame whose payload is complete but whose `FRAME_END_V1`
+ * terminator never arrived — the shape a truncated agentic response leaves
+ * behind (2026-08-12 field report, item 1): the model's JSON is byte-perfect
+ * but the CLI stopped writing before the closing marker. `body` is
+ * everything from `FRAME_START_V1` to the end of the (trailing-newline-
+ * trimmed) response, and is known NOT to end with `FRAME_END_V1`.
+ *
+ * The bar for acceptance is deliberately as strict as the terminated path
+ * minus the terminator itself: exactly one line ending immediately after the
+ * start marker, then a single line with no embedded line breaks, then
+ * nothing else, and that line must parse as strict JSON. Anything looser
+ * (multiple lines, trailing bytes, a non-parsing payload) still reports
+ * `invalidFrame` naming the missing terminator — never `invalidJson` — so a
+ * genuinely malformed unterminated response is not misdiagnosed as "JSON
+ * broke" when the real defect is "the frame never closed."
+ */
+function parseUnterminatedFrameV1(
+  raw: string,
+  body: string,
+  expectedCorrelation?: ActionCorrelationV1
+): AiResultParseOutcomeV1 {
+  const missingTerminatorReason = `expected the frame to end with ${FRAME_END_V1}`;
+  const afterStart = body.slice(FRAME_START_V1.length);
+
+  let eol: "\n" | "\r\n";
+  if (afterStart.startsWith("\r\n")) {
+    eol = "\r\n";
+  } else if (afterStart.startsWith("\n")) {
+    eol = "\n";
+  } else {
+    return malformed("invalidFrame", raw, missingTerminatorReason);
+  }
+
+  const candidateLine = afterStart.slice(eol.length);
+  if (candidateLine.length === 0 || candidateLine.includes("\n") || candidateLine.includes("\r")) {
+    return malformed("invalidFrame", raw, missingTerminatorReason);
+  }
+  if (utf8ByteLength(candidateLine) > MAX_PREFLIGHT_BYTES_V1) {
+    return malformed("resultLimitExceeded", raw, `payload exceeds the absolute ${MAX_PREFLIGHT_BYTES_V1}-byte ceiling`);
+  }
+
+  const parsed = parseStrictJsonV1(candidateLine);
+  if (!parsed.ok) {
+    return malformed("invalidFrame", raw, missingTerminatorReason);
+  }
+
+  return decodeEnvelopeV1(parsed.value, raw, expectedCorrelation);
+}
+
 export function parseAiResultEnvelopeV1(
   raw: string,
   expectedCorrelation?: ActionCorrelationV1
@@ -1022,7 +1072,7 @@ export function parseAiResultEnvelopeV1(
   const body = trimmedForTrailingNewline.slice(frameStartIndex);
 
   if (!body.endsWith(FRAME_END_V1)) {
-    return malformed("invalidFrame", raw, `expected the frame to end with ${FRAME_END_V1}`);
+    return parseUnterminatedFrameV1(raw, body, expectedCorrelation);
   }
   if (body.length < FRAME_START_V1.length + FRAME_END_V1.length) {
     return malformed("invalidFrame", raw, "start and end markers overlap");

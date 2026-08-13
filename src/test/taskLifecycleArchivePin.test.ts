@@ -159,6 +159,16 @@ void describe("verifyPlanItems", () => {
     assert.strictEqual(items[1]?.status, "inconclusive");
     assert.strictEqual(items[2]?.status, "failed");
   });
+
+  void it("unescapes backslash-escaped quotes via the same shared helper normalizeChecklistItemTextV1 uses", () => {
+    const items = verifyPlanItems('- [ ] Fix the \\"getStageStatus\\" comparison');
+    assert.strictEqual(items.length, 1);
+    assert.strictEqual(
+      items[0]?.text,
+      'Fix the "getStageStatus" comparison',
+      "a plan item corrupted with literal backslash-escaped quotes on disk must display clean, not show the escapes to the reviewer/AI verifier"
+    );
+  });
 });
 
 void describe("AI plan verification verdicts", () => {
@@ -385,6 +395,53 @@ void describe("archive → resume → re-complete round trip", () => {
       assert.ok(
         msgs.captured.some((m) => m.includes("complete")),
         "the completion must be reported"
+      );
+    } finally {
+      msgs.restore();
+      rf.restore();
+      ws.restore();
+    }
+  });
+});
+
+void describe("archive clears the persisted zero-change implementation-round counter (step 8)", () => {
+  void it("archiving a task with a durable zeroChangeImplRounds streak clears it", async () => {
+    const folderPath = makeTaskFolder("zero-change-archive");
+    const canonicalId = folderPath;
+    const progress: TaskProgress = {
+      taskFolder: path.basename(folderPath),
+      currentStage: "impl-high-review",
+      status: "active",
+      completedStages: ["desc", "plan", "impl"],
+      zeroChangeImplRounds: 5,
+      createdAt: "2026-08-01T00:00:00.000Z",
+      updatedAt: "2026-08-01T00:00:00.000Z",
+      ownership: fixtureOwnershipFor(folderPath),
+    };
+    await fs.promises.writeFile(
+      path.join(folderPath, "task-progress.json"),
+      JSON.stringify(progress, null, 2),
+      "utf8"
+    );
+
+    const inv = makeInventory([{ canonicalId, taskFolderPath: folderPath, progress }]);
+    const store = makeCurrentTaskStoreStub();
+    const ws = installWorkspaceFoldersStub();
+    const rf = installReadFileBridge();
+    const msgs = installMessageCapture();
+
+    try {
+      const before = await readTaskProgress(vscode.Uri.file(folderPath));
+      assert.equal(before?.zeroChangeImplRounds, 5, "fixture precondition");
+
+      await archiveTask(inv, store, { canonicalId });
+
+      const after = await readTaskProgress(vscode.Uri.file(folderPath));
+      assert.equal(after?.status, "archived");
+      assert.equal(
+        after?.zeroChangeImplRounds,
+        undefined,
+        "archiving a task must drop its no-progress-breaker streak, since a parked task is no longer iterating"
       );
     } finally {
       msgs.restore();

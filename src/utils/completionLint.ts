@@ -14,7 +14,7 @@ import { getCompletionCheckTimeoutMs, getKnownFlakyChecks, getPublishVerificatio
 import { promptAndPersistPublishScope } from "../commands/choosePublishScope";
 import { isWorkflowPrivatePathV1 } from "../services/workflowPrivacyClassifierV1";
 import { ReviewBlocker } from "./reviewReadiness";
-import { scopeToLatestChecklistV1 } from "./implementationChecklist";
+import { scopeToLatestChecklistV1, unescapeChecklistItemTextV1 } from "./implementationChecklist";
 
 /**
  * Resolve a package manager executable to an absolute path, preferring a
@@ -118,6 +118,47 @@ export interface CompletionLintResult {
      * from. Never values — see the field doc above. */
     envVarNames: string[];
   };
+  /**
+   * Every command line actually executed for this run, root conventional/
+   * verify/explicit commands AND (when the workspace is a monorepo) every
+   * per-package command from the recursive pass below — in the order they
+   * were spawned. Exists so a "green" Verified Checks result is never read
+   * as broader than what actually ran: a monorepo whose `packages/*`
+   * suites were never invoked must never be indistinguishable from one
+   * where they were and passed. Optional for the same reason as
+   * `knownFlakeFailures`/`retriedPasses` above — callers that construct a
+   * result without running the real check (error fallbacks, test fixtures)
+   * aren't forced to populate it.
+   */
+  commandsRun?: string[];
+  /**
+   * True when the verified workspace root was detected as a monorepo (a
+   * `workspaces` field in the root package.json, or a pnpm-workspace.yaml
+   * file present) — regardless of whether any member package actually had
+   * a matching script to run. Lets a reviewer distinguish "not a monorepo"
+   * from "a monorepo where the recursive pass found nothing to run".
+   */
+  monorepoDetected?: boolean;
+  /**
+   * One entry per member-package command from the recursive monorepo pass
+   * (step 21 of the workflow-resilience backlog) — additive to, never a
+   * replacement for, the root commands above (including any explicitly
+   * configured ones, which always still run and win as before). Each
+   * member package's pass/fail is reported HERE separately rather than
+   * folded into a single aggregate verdict, so a reviewer can see exactly
+   * which package failed. A failing entry also has a matching row in
+   * `failedChecks` (with full output) via the same `command` string — this
+   * array is the compact per-package roll-up, not a duplicate of the full
+   * failure output.
+   */
+  monorepoChecks?: Array<{
+    /** Workspace-root-relative path of the member package, e.g. "packages/ensemble-core". */
+    packageDir: string;
+    command: string;
+    exitCode: number;
+    passed: boolean;
+    retryCount?: number;
+  }>;
 }
 
 /** True when the path exists on disk and is a directory. */
@@ -251,7 +292,11 @@ export function verifyPlanItems(planContent: string): PlanItemVerification[] {
       continue;
     }
     const checked = match[1]?.toLowerCase() === "x";
-    const text = match[2] ?? "";
+    // Unescaped via the same shared helper `normalizeChecklistItemTextV1` uses
+    // for its merge key, so a plan item corrupted with literal `\"` on disk
+    // (see implementationChecklist.ts) reads clean here too, instead of
+    // showing backslashes to the reviewer/AI verifier.
+    const text = unescapeChecklistItemTextV1(match[2] ?? "");
     const deferred = DEFERRED_MARKERS.test(text);
     if (deferred) {
       items.push({
@@ -493,6 +538,171 @@ export function readPackageScripts(folder: string): Record<string, string> | und
   } catch {
     return undefined;
   }
+}
+
+/** Shape of the root `package.json` fields this file cares about for
+ * monorepo detection (npm/yarn's `workspaces`, either the bare-array form
+ * or the `{ packages: [...] }` object form). */
+interface RootPackageJsonWorkspaces {
+  workspaces?: string[] | { packages?: string[] };
+}
+
+/** Read the root `package.json`'s `workspaces` field only, or `undefined`
+ * if the file is missing/unreadable/malformed. Separate from
+ * `readPackageScripts` because callers here only ever need this one field. */
+function readRootWorkspacesField(folder: string): RootPackageJsonWorkspaces["workspaces"] | undefined {
+  try {
+    const raw = fs.readFileSync(path.join(folder, "package.json"), "utf8");
+    const parsed = JSON.parse(raw) as RootPackageJsonWorkspaces;
+    return parsed.workspaces;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Parse the `packages:` list out of a pnpm-workspace.yaml file with a
+ * deliberately narrow, hand-rolled reader rather than pulling in a full
+ * YAML dependency for one list of quoted globs — this repo has no `yaml`/
+ * `js-yaml` dependency today, and pnpm-workspace.yaml's `packages:` block
+ * is always a flat list of `- 'glob'` entries in practice. Returns an empty
+ * array (not an error) for anything that doesn't parse cleanly — a
+ * malformed/unsupported layout degrades to "no member packages discovered"
+ * rather than throwing and losing the root checks entirely.
+ *
+ * @internal exported for testing
+ */
+export function parsePnpmWorkspacePackages(folder: string): string[] {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(path.join(folder, "pnpm-workspace.yaml"), "utf8");
+  } catch {
+    return [];
+  }
+  const patterns: string[] = [];
+  let inPackagesList = false;
+  for (const line of raw.split(/\r?\n/)) {
+    if (/^packages\s*:\s*$/.test(line)) {
+      inPackagesList = true;
+      continue;
+    }
+    if (inPackagesList) {
+      const item = line.match(/^\s*-\s*['"]?([^'"#]+?)['"]?\s*(#.*)?$/);
+      const pattern = item?.[1];
+      if (pattern !== undefined) {
+        patterns.push(pattern.trim());
+        continue;
+      }
+      // Any other non-blank, non-comment line ends the `packages:` block —
+      // either a new top-level key or a nested mapping we don't parse.
+      if (/\S/.test(line) && !/^\s*#/.test(line)) {
+        inPackagesList = false;
+      }
+    }
+  }
+  return patterns;
+}
+
+/**
+ * True when the workspace root is a monorepo: the root `package.json` has a
+ * non-empty `workspaces` field (npm/yarn convention), OR a
+ * pnpm-workspace.yaml file is present at the root. Detection is deliberately
+ * OR'd across both conventions — a workspace can use either (this repo uses
+ * pnpm-workspace.yaml with no `workspaces` field in package.json).
+ *
+ * @internal exported for testing
+ */
+export function isMonorepoWorkspace(folder: string): boolean {
+  const workspacesField = readRootWorkspacesField(folder);
+  const hasWorkspacesField = Array.isArray(workspacesField)
+    ? workspacesField.length > 0
+    : Array.isArray(workspacesField?.packages) && workspacesField.packages.length > 0;
+  return hasWorkspacesField || fs.existsSync(path.join(folder, "pnpm-workspace.yaml"));
+}
+
+/** The workspace member glob patterns for the root folder: the
+ * package.json `workspaces` field when present (either array or
+ * `{ packages }` form), otherwise pnpm-workspace.yaml's `packages:` list.
+ * Empty when neither is configured. */
+function getWorkspacePackagePatterns(folder: string): string[] {
+  const workspacesField = readRootWorkspacesField(folder);
+  if (Array.isArray(workspacesField)) {
+    return workspacesField;
+  }
+  if (Array.isArray(workspacesField?.packages)) {
+    return workspacesField.packages;
+  }
+  return parsePnpmWorkspacePackages(folder);
+}
+
+/** Convert one workspace glob pattern segment-by-segment into a RegExp
+ * matched against a POSIX-style relative path. Supports `*` (any run of
+ * non-slash characters) and `**` (any run of characters, including `/`) —
+ * the two wildcard forms actually used in workspace `packages:`/`workspaces`
+ * lists in practice. */
+function globPatternToRegExp(pattern: string): RegExp {
+  // Constructed via String.fromCharCode, never written as a literal byte: a
+  // raw NUL embedded in the source made Git and search tools classify this
+  // file as binary, obscuring diffs. The runtime value is unchanged — a NUL
+  // can never appear in a real workspaces/pnpm-workspace glob pattern, which
+  // is what makes it a safe placeholder.
+  const DOUBLE_STAR_PLACEHOLDER = String.fromCharCode(0);
+  const withPlaceholders = pattern
+    .replace(/\\/g, "/")
+    .replace(/\*\*/g, DOUBLE_STAR_PLACEHOLDER)
+    .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+    .replace(/\*/g, "[^/]*")
+    .replace(new RegExp(DOUBLE_STAR_PLACEHOLDER, "g"), ".*");
+  return new RegExp(`^${withPlaceholders}$`);
+}
+
+/** Depth-bounded walk collecting every directory under `root` that contains
+ * its own package.json, skipping `node_modules` and dotfolders. Bounded to
+ * a shallow depth because real workspace layouts (`packages/*`, `apps/*`)
+ * are one or two levels deep — this is a candidate list for glob matching
+ * below, not a general-purpose recursive search. */
+function collectPackageJsonDirectories(root: string, maxDepth = 4): string[] {
+  const results: string[] = [];
+  const walk = (dir: string, depth: number): void => {
+    if (depth > maxDepth) { return; }
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory() || entry.name === "node_modules" || entry.name.startsWith(".")) { continue; }
+      const full = path.join(dir, entry.name);
+      if (fs.existsSync(path.join(full, "package.json"))) {
+        results.push(full);
+      }
+      walk(full, depth + 1);
+    }
+  };
+  walk(root, 0);
+  return results;
+}
+
+/**
+ * Resolve the workspace member package glob patterns to actual on-disk
+ * package folders (each containing its own package.json), relative to
+ * `folder`. Patterns starting with `!` exclude rather than include —
+ * pnpm-workspace.yaml commonly negates a sub-pattern (e.g.
+ * `!packages/*\/test-fixtures`).
+ *
+ * @internal exported for testing
+ */
+export function discoverWorkspaceMemberFolders(folder: string): string[] {
+  const patterns = getWorkspacePackagePatterns(folder);
+  if (patterns.length === 0) { return []; }
+  const includePatterns = patterns.filter((p) => !p.startsWith("!")).map(globPatternToRegExp);
+  const excludePatterns = patterns.filter((p) => p.startsWith("!")).map((p) => globPatternToRegExp(p.slice(1)));
+  if (includePatterns.length === 0) { return []; }
+  return collectPackageJsonDirectories(folder).filter((dir) => {
+    const relative = path.relative(folder, dir).replace(/\\/g, "/");
+    return includePatterns.some((re) => re.test(relative)) && !excludePatterns.some((re) => re.test(relative));
+  });
 }
 
 function isInFolder(uri: vscode.Uri, folder: string): boolean {
@@ -929,6 +1139,8 @@ export async function collectCompletionLint(
   };
 
   let checks: Array<{ command: string; code: number; output: string; retryCount: number }>;
+  let monorepoDetected = false;
+  let monorepoChecks: NonNullable<CompletionLintResult["monorepoChecks"]> = [];
   if (explicitCommands.length > 0) {
     // Toolchain resolution order (publish pre-check contract): explicitly
     // configured verification commands win over conventional npm scripts.
@@ -976,6 +1188,63 @@ export async function collectCompletionLint(
         ...(await runWithRetry((extraEnv) => runCheck(folder, [...args], guard, extraEnv), guard.token)),
       }))
     );
+  }
+
+  // Monorepo recursive pass (step 21, workflow-resilience backlog): additive
+  // to the conventional fallback path above, never a replacement for it —
+  // the root commands (including any selected `verify` script) still run
+  // and win exactly as before. Detection itself (`monorepoDetected`) is
+  // reported regardless of whether the pass actually runs, so a reviewer
+  // can tell "not a monorepo" apart from "a monorepo whose recursive pass
+  // didn't run this time". The pass only actually executes in the
+  // conventional-fallback branch: explicitly configured verification
+  // commands (explicitCommands above) already say precisely what should
+  // run, and stay authoritative with nothing added underneath them. A
+  // root-level `lint`/`test`/`build` (or `verify`) command frequently never
+  // touches `packages/*`/`apps/*` at all, so without this pass a member
+  // package's real, currently-failing suite is invisible to a reviewer who
+  // is told the Verified Checks result is ground truth.
+  monorepoDetected = isMonorepoWorkspace(folder);
+  if (monorepoDetected && explicitCommands.length === 0) {
+    const memberFolders = discoverWorkspaceMemberFolders(folder);
+    const scriptNames = ["lint", "check-types", "test", "build"] as const;
+    const memberCommands: Array<{ packageDir: string; command: string; memberFolder: string; args: string[] }> = [];
+    for (const memberFolder of memberFolders) {
+      const memberScripts = readPackageScripts(memberFolder);
+      if (!memberScripts) { continue; }
+      const packageDir = path.relative(folder, memberFolder).replace(/\\/g, "/");
+      for (const scriptName of scriptNames) {
+        // `--if-present` equivalent: only invoke a script that is actually
+        // configured for this member package, so one package missing e.g.
+        // `build` never fails (or is even attempted for) the whole pass.
+        if (!Object.prototype.hasOwnProperty.call(memberScripts, scriptName)) { continue; }
+        memberCommands.push({
+          packageDir,
+          command: `[${packageDir}] ${manager} run ${scriptName}`,
+          memberFolder,
+          args: [manager, "run", scriptName],
+        });
+      }
+    }
+    const memberResults = await Promise.all(
+      memberCommands.map(async ({ packageDir, command, memberFolder, args }) => ({
+        packageDir,
+        command,
+        ...(await runWithRetry((extraEnv) => runCheck(memberFolder, args, guard, extraEnv), guard.token)),
+      }))
+    );
+    monorepoChecks = memberResults.map(({ packageDir, command, code, retryCount }) => ({
+      packageDir,
+      command,
+      exitCode: code,
+      passed: code === 0,
+      ...(retryCount > 0 ? { retryCount } : {}),
+    }));
+    // Merged into the same `checks` array the root commands use, so every
+    // existing downstream mechanism (commandFailures, retriedPasses, known-
+    // flake quarantine, failedChecks output rendering) already applies to
+    // member-package failures with no separate code path to keep in sync.
+    checks = [...checks, ...memberResults.map(({ packageDir: _packageDir, ...rest }) => rest)];
   }
 
   let filesToCheck = relevantFiles ? [...relevantFiles] : [];
@@ -1053,6 +1322,9 @@ export async function collectCompletionLint(
       packageManager: describePackageManagerVersion(folder, manager),
       envVarNames: Object.keys(process.env).sort(),
     },
+    commandsRun: checks.map((check) => check.command),
+    monorepoDetected,
+    ...(monorepoDetected ? { monorepoChecks } : {}),
   };
 }
 
@@ -1207,6 +1479,41 @@ function renderVerificationEnvironmentLines(
   ];
 }
 
+/**
+ * Render the "which commands actually ran" disclosure (step 21) shared by
+ * both Verified Checks surfaces — root commands (conventional/verify/
+ * explicit) AND, when the workspace is a monorepo, every per-package
+ * command from the recursive pass. Exists so a green/clean result is never
+ * read as broader than what was executed: without this, "All checks
+ * passed." on a monorepo whose `packages/*` suites were never invoked reads
+ * identically to one where they were invoked and passed.
+ */
+function renderCommandsRunLines(result: CompletionLintResult): string[] {
+  const lines: string[] = [];
+  if (result.commandsRun && result.commandsRun.length > 0) {
+    lines.push("", "### Commands that ran", ...result.commandsRun.map((command) => `- \`${command}\``));
+  }
+  if (result.monorepoDetected) {
+    lines.push("", "### Monorepo packages checked");
+    if (!result.monorepoChecks || result.monorepoChecks.length === 0) {
+      lines.push(
+        "- Monorepo workspace detected (workspaces field or pnpm-workspace.yaml present), " +
+          "but the recursive per-package pass ran no commands this time — either explicit " +
+          "verification commands were configured (which always win, per the toolchain " +
+          "resolution order above) or no member package had a matching lint/check-types/" +
+          "test/build script."
+      );
+    } else {
+      for (const check of result.monorepoChecks) {
+        const status = check.passed ? "passed" : "**FAILED**";
+        const retryNote = check.retryCount ? ` (passed on retry ${check.retryCount})` : "";
+        lines.push(`- **${check.packageDir}** — \`${check.command}\`: ${status}${retryNote}`);
+      }
+    }
+  }
+  return lines;
+}
+
 function renderCompletionChecksSection(
   result: CompletionLintResult,
   override?: { reason: string }
@@ -1226,6 +1533,7 @@ function renderCompletionChecksSection(
   if (result.verificationEnvironment) {
     lines.push("", "### Environment these checks ran in", ...renderVerificationEnvironmentLines(result.verificationEnvironment));
   }
+  lines.push(...renderCommandsRunLines(result));
   if (result.missingScripts.length > 0) {
     lines.push("", "### Inconclusive checks");
     for (const script of result.missingScripts) {
@@ -1336,6 +1644,11 @@ export function buildVerifiedChecksSection(result: CompletionLintResult): string
   if (result.verificationEnvironment) {
     lines.push("", "### Environment these checks ran in", ...renderVerificationEnvironmentLines(result.verificationEnvironment));
   }
+  // Rendered unconditionally for the same reason as the environment block
+  // above — which commands ran is evidence a reviewer needs whether or not
+  // anything failed, so "All checks passed." can never be misread as
+  // broader coverage than what actually executed (step 21).
+  lines.push(...renderCommandsRunLines(result));
   // Rendered even when failedChecks is empty — a check that failed on its
   // first attempt and only passed on a cache-bypassed retry has NO entry in
   // failedChecks (its final exit code was 0), so this must not sit behind
@@ -1618,6 +1931,7 @@ export async function runCompletionLint(folderUri: vscode.Uri, relevantFiles?: r
     summary: result.summary,
     issueCount: result.issueCount,
     failedChecks: result.failedChecks,
+    source: "publish",
   }));
   if (!persisted) {
     throw new Error("Could not persist completion lint result.");

@@ -631,11 +631,16 @@ void describe("provider CLI contracts", () => {
     const claude = getCliProvider("claude-cli");
     assert.ok(claude, "expected claude-cli provider definition");
 
+    // Text mode moved to stream-json (Step 16 — see providers.ts's buildArgs
+    // comment): claude-cli's plain `text` mode carries no structural failure
+    // signal, so a rate-limit refusal was only inferable from prose, unlike
+    // every other structuredEventStream provider here.
     const textArgs = claude.buildArgs("text", "sonnet@high", undefined);
     assert.deepStrictEqual(textArgs, [
       "-p",
       "--output-format",
-      "text",
+      "stream-json",
+      "--verbose",
       "--permission-mode",
       "plan",
       "--append-system-prompt",
@@ -645,6 +650,24 @@ void describe("provider CLI contracts", () => {
       "--max-thinking-tokens",
       "8192",
     ]);
+
+    // Edit mode is untouched: it keeps the original plain "text" format,
+    // since edit-mode runs are captured for their workspace file changes,
+    // not a parsed summary string.
+    const editArgs = claude.buildArgs("edit", "sonnet@high", undefined);
+    assert.deepStrictEqual(editArgs, [
+      "-p",
+      "--output-format",
+      "text",
+      "--permission-mode",
+      "acceptEdits",
+      "--model",
+      "sonnet",
+      "--max-thinking-tokens",
+      "8192",
+    ]);
+
+    assert.strictEqual(claude.structuredEventStream, "claude");
   });
 
   void it("Cline model variants map to base model plus thinking effort; prompt is stdin-only", () => {

@@ -152,6 +152,100 @@ void describe("withMalformedResultRetryV1", () => {
     // header in productionTaskActionRuntimeV1.ts).
     assert.equal(calls.count, 1);
   });
+
+  void it("caps at the shared 3-invocation budget when the coordinator already spent it advancing candidates, even with maxAttempts > 1", async () => {
+    // Field report deviation, 2026-08-12: an eligible row's coordinator
+    // operation can itself burn up to 3 invocations advancing through
+    // ranked candidates before giving up. Without sharing that count, this
+    // wrapper's own maxAttempts=2 would add two more fresh operations on
+    // top, reaching 3x2=6 provider invocations for a single user press.
+    // `malformedInvocationsUsedV1` is how the coordinator reports "I already
+    // used N of the shared budget" so this wrapper stops at the same total.
+    const { coordinator, calls } = scriptedCoordinator([
+      { kind: "malformedResult", correlation: {} as never, code: "invalidFrame", malformedInvocationsUsedV1: 3 },
+      { kind: "completed", correlation: {} as never, code: "completed" },
+    ]);
+    const wrapped = withMalformedResultRetryV1(coordinator, 2);
+    const outcome = await wrapped.executeAction(request);
+    assert.equal(outcome.kind, "malformedResult");
+    // Budget already exhausted by the coordinator's own advances — no fresh
+    // outer retry, even though maxAttempts=2 would otherwise allow one.
+    assert.equal(calls.count, 1);
+  });
+
+  void it("retries once more when the coordinator reports budget remaining, then stops at the shared total", async () => {
+    // `malformedInvocationsUsedV1` on a real (seeded) coordinator call is
+    // already the CUMULATIVE total across every operation so far — the
+    // wrapper passes the running total into the next call via
+    // `malformedInvocationsAlreadyUsedV1`, and a correctly-seeded coordinator
+    // reports back the new cumulative total, not just its own delta. This
+    // wrapper must therefore REPLACE its running total with what the
+    // coordinator reports, never re-sum it (summing a cumulative value on
+    // top of itself would double count and stop too early).
+    const { coordinator, calls } = scriptedCoordinator([
+      { kind: "malformedResult", correlation: {} as never, code: "invalidFrame", malformedInvocationsUsedV1: 1 },
+      { kind: "malformedResult", correlation: {} as never, code: "invalidFrame", malformedInvocationsUsedV1: 3 },
+      { kind: "completed", correlation: {} as never, code: "completed" },
+    ]);
+    const wrapped = withMalformedResultRetryV1(coordinator, 2);
+    const outcome = await wrapped.executeAction(request);
+    assert.equal(outcome.kind, "malformedResult");
+    if (outcome.kind !== "malformedResult") {
+      assert.fail("expected malformedResult");
+    }
+    // Cumulative total reaches 3 (the shared budget) after the second call;
+    // the third scripted (recovering) outcome is never reached.
+    assert.equal(calls.count, 2);
+  });
+
+  void it("passes the running budget total into the next operation's request so the coordinator can seed its own counter", async () => {
+    const seenRequests: TaskActionRequestV1[] = [];
+    const coordinator: TaskActionCoordinatorV1 = {
+      executeAction: (req: TaskActionRequestV1) => {
+        seenRequests.push(req);
+        return Promise.resolve(
+          seenRequests.length === 1
+            ? {
+                kind: "malformedResult",
+                correlation: {} as never,
+                code: "invalidFrame",
+                malformedInvocationsUsedV1: 1,
+              }
+            : { kind: "completed", correlation: {} as never, code: "completed" }
+        );
+      },
+      executeRoute: notUsedInThisTest,
+      admitAction: notUsedInThisTest,
+      continueAdmittedAction: notUsedInThisTest,
+      abortAdmittedAction: notUsedInThisTest,
+      resumeAction: notUsedInThisTest,
+    };
+    const wrapped = withMalformedResultRetryV1(coordinator, 2);
+    const outcome = await wrapped.executeAction(request);
+    assert.equal(outcome.kind, "completed");
+    assert.equal(seenRequests.length, 2);
+    // First (fresh) operation carries no already-used budget.
+    assert.equal(seenRequests[0]!.malformedInvocationsAlreadyUsedV1, undefined);
+    // Second operation is seeded with the first operation's reported total,
+    // so its own coordinator loop starts counting from 1, not 0.
+    assert.equal(seenRequests[1]!.malformedInvocationsAlreadyUsedV1, 1);
+  });
+
+  void it("falls back to the fixed maxAttempts policy when the outcome carries no shared-budget count", async () => {
+    // Ineligible rows (editExecution.v1, non-text mode) and pre-advancement
+    // malformedResult outcomes (contentSchemaMismatch, resultLimitExceeded)
+    // never carry `malformedInvocationsUsedV1` — those keep this wrapper's
+    // original fixed-attempt behavior, unaffected by the shared budget.
+    const { coordinator, calls } = scriptedCoordinator([
+      { kind: "malformedResult", correlation: {} as never, code: "contentSchemaMismatch" },
+      { kind: "malformedResult", correlation: {} as never, code: "contentSchemaMismatch" },
+      { kind: "completed", correlation: {} as never, code: "completed" },
+    ]);
+    const wrapped = withMalformedResultRetryV1(coordinator, 2);
+    const outcome = await wrapped.executeAction(request);
+    assert.equal(outcome.kind, "malformedResult");
+    assert.equal(calls.count, 2);
+  });
 });
 
 const fakeTicket = {} as AdmittedProviderActionTicketV1;

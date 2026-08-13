@@ -107,6 +107,28 @@ async function promoteGenerateImplementationContentV1(
   }
   const input = context.validatedInput as GenerateImplementationActionInputV1;
   const fileStore = getWorkflowFileStoreV1();
+  // 2026-08-12 field report item 1 (checklist tick corruption) traced: this
+  // path writes `content.markdown` to disk with no transformation of its own
+  // (see the plain `Buffer.from(markdown, "utf8")` below) — identical in
+  // shape to `generatePlanRowV1.ts`'s `promoteGeneratePlanContentV1`, whose
+  // output is not corrupted. `content.markdown` itself is `raw.markdown`
+  // from `parseAiResultEnvelopeV1`'s `markdown-artifact.v1` decode
+  // (`aiResultEnvelope.ts`), which is a plain field read off the already
+  // `JSON.parse`d envelope body — `JSON.parse` unescapes `\"` to `"` as part
+  // of ordinary string decoding, so a `\"` surviving as literal backslash+
+  // quote characters in `content.markdown` at this point cannot originate
+  // from our own frame parsing OR this write path. It has to already be
+  // present, as literal text, inside the JSON string value the provider put
+  // in its response body — i.e. the model over-escaped quotes in the
+  // markdown it authored, as if that markdown would itself be re-embedded in
+  // JSON, which the transport frame does not require. No corresponding
+  // corruption exists in `plan.md` from the same provider/task, which is
+  // additional evidence this is a content-generation quality issue on
+  // specific rounds, not a defect in our parse-then-write pipeline. See
+  // `generateImplementationRowV1.test.ts`'s "does not escape or otherwise
+  // transform quoted markdown" for the regression proving this write path's
+  // own innocence; survival of the corruption once written is handled
+  // downstream by `normalizeChecklistItemTextV1`'s unescaping (step 2).
   let markdown = content.markdown;
   // Shared definition, not a substring test: a generated checklist that merely
   // QUOTES the marker (this repo's own plans do, when the work is about this

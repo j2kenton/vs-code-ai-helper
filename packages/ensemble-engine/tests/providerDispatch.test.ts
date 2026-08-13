@@ -191,6 +191,24 @@ test("result-envelope corpus: engine port and src parser agree on every accept a
         String.fromCharCode(0xfeff) +
         frame({ version: 1, correlation: CORRELATION, kind: "cancelled" }),
     },
+    {
+      // 2026-08-12 field report, item 1: a complete unterminated frame (no
+      // closing marker) must be accepted, not rejected.
+      name: "unterminated frame with a complete single-line JSON payload accepts",
+      raw: `<<<ENSEMBLE_AI_RESULT_V1>>>\n${JSON.stringify({
+        version: 1,
+        correlation: CORRELATION,
+        kind: "cancelled",
+      })}`,
+    },
+    {
+      name: "unterminated frame with a multiline payload rejects (invalidFrame)",
+      raw: `<<<ENSEMBLE_AI_RESULT_V1>>>\n{\n"version":1\n}`,
+    },
+    {
+      name: "unterminated frame with invalid JSON rejects as invalidFrame, not invalidJson",
+      raw: `<<<ENSEMBLE_AI_RESULT_V1>>>\n{not json}`,
+    },
   ];
 
   for (const entry of corpus) {

@@ -29,6 +29,24 @@ void describe("isQuotaError", () => {
     assert.strictEqual(isQuotaError(undefined), false);
     assert.strictEqual(isQuotaError("command not found"), false);
   });
+
+  void it("treats an explicit structured signal as an additional (not replacement) quota verdict", () => {
+    // A structured error CODE like "rate_limit" (underscored) is not a
+    // substring of any QUOTA_MARKERS phrase ("rate limit" with a space,
+    // "ratelimit" with none), so the phrase scan alone would miss it — this
+    // is exactly the gap claude-cli's structured stream closes (see
+    // extractClaudeCliStructuredDiagnostics in cliAgentRunner.ts).
+    assert.strictEqual(isQuotaError("You have hit the rate_limit for this account.", true), true);
+    // The phrase-based scan is still the fallback: no structural signal, but
+    // ordinary quota phrasing must keep working exactly as before.
+    assert.strictEqual(isQuotaError("Rate limit exceeded, please retry later", false), true);
+    assert.strictEqual(isQuotaError("Rate limit exceeded, please retry later"), true);
+    // A structural signal alone (with unrelated or absent text) is trusted.
+    assert.strictEqual(isQuotaError(undefined, true), true);
+    assert.strictEqual(isQuotaError("unrelated failure text", true), true);
+    // No structural signal and no matching phrase stays false.
+    assert.strictEqual(isQuotaError("unrelated failure text", false), false);
+  });
 });
 
 void describe("isTransportError", () => {

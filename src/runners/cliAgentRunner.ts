@@ -347,6 +347,16 @@ interface CliFriendlyError {
   diagnosticText: string;
   /** True when the provider's own error channel said the failure is retryable. */
   retryableHint: boolean;
+  /**
+   * True when a structured event explicitly identified the failure as a
+   * quota/rate-limit condition (see StructuredCliDiagnostics.quotaSignal).
+   * Threaded into classifyCliFailure's structuredQuotaSignal alongside the
+   * phrase-based scan quota.ts's isQuotaError always still runs. Optional
+   * (rather than required like retryableHint) purely so existing
+   * hand-constructed CliFriendlyError test fixtures that predate this field
+   * don't all need updating — toFriendlyError itself always sets it.
+   */
+  quotaSignal?: boolean;
 }
 
 /** Bounded retry policy for transient CLI failures (timeouts). */
@@ -751,6 +761,15 @@ interface StructuredCliDiagnostics {
   retryable: boolean;
   /** Whether stdout parsed as a JSON-lines event stream at all. */
   sawAnyEvent: boolean;
+  /**
+   * A structured event explicitly identified the failure as a quota/rate-limit
+   * condition (e.g. claude-cli's stream-json `result` event carrying
+   * `error: "rate_limit"`), independent of any phrase match. Optional and
+   * omitted (falsy) for providers with no such structural field — see
+   * quota.ts's isQuotaError, which OR's this in as an ADDITIONAL signal
+   * alongside its existing phrase-based scan, never a replacement for it.
+   */
+  quotaSignal?: boolean;
 }
 
 /**
@@ -1253,6 +1272,234 @@ function extractCodexStructuredDiagnostics(
   };
 }
 
+/** Claude Code CLI's counterpart to CODEX_NO_TEXT_REPLY_PLACEHOLDER — see extractClaudeCliFinalOutput. */
+const CLAUDE_CLI_NO_TEXT_REPLY_PLACEHOLDER =
+  "(Claude Code completed the run without returning any text reply.)";
+
+/**
+ * Claude Code CLI's `--output-format stream-json` JSONL line shape, per its
+ * documented event model: an initial `{"type":"system","subtype":"init",...}`,
+ * one `{"type":"assistant","message":{"role":"assistant","content":[{"type":
+ * "text","text":...}, ...]}}` per turn of assistant output, and a terminal
+ * `{"type":"result","subtype":"success"|"error_...","is_error":boolean,
+ * "result":"...","error":"..."}` line. A rate-limited turn is expected to
+ * surface as a terminal `result`/`system` event with `is_error: true` and
+ * either an `error` field (e.g. `"rate_limit"`) or `result` text describing
+ * the limit, structurally mirroring how Codex's `turn.failed`/`error` events
+ * carry Codex's own failure text (see extractCodexFinalOutput /
+ * extractCodexStructuredDiagnostics just above, whose "last event wins" /
+ * "collect only error-shaped events" structure this adapts).
+ *
+ * NEEDS-TOOLCHAIN: this shape has not been confirmed against a live
+ * `claude` CLI invocation (out of scope for this change — see the plan step
+ * that introduced it); it is built from the documented event model and from
+ * this file's existing structured-stream extractors, the same way
+ * extractCodexFinalOutput's shape was derived before its own live
+ * verification. Re-verify the exact field names (particularly `error`'s
+ * shape/value on a real rate-limited run) the first time a live Claude Code
+ * CLI is available, the same way codex's shape above was confirmed against
+ * codex 0.147.0.
+ */
+interface ClaudeCliEnvelope {
+  type?: unknown;
+  is_error?: unknown;
+  subtype?: unknown;
+  error?: unknown;
+  result?: unknown;
+  message?: { role?: unknown; content?: unknown };
+}
+
+/**
+ * Pull the text out of a single stream-json `assistant` event's
+ * `message.content` array: only `{"type":"text","text":...}` parts count
+ * (tool_use/tool_result parts are skipped by construction, same as Codex's
+ * item.type gate above).
+ */
+function claudeCliAssistantMessageText(event: ClaudeCliEnvelope): string | undefined {
+  const content = event.message?.content;
+  if (!Array.isArray(content)) {
+    return undefined;
+  }
+  const parts: string[] = [];
+  for (const part of content) {
+    if (
+      part &&
+      typeof part === "object" &&
+      (part as { type?: unknown }).type === "text" &&
+      typeof (part as { text?: unknown }).text === "string"
+    ) {
+      parts.push((part as { text: string }).text);
+    }
+  }
+  return parts.length > 0 ? parts.join("") : undefined;
+}
+
+/**
+ * Claude Code CLI's LAST `assistant` message wins — same "last wins" choice
+ * as extractCodexFinalOutput/extractKimiFinalOutput/extractClineFinalOutput:
+ * a turn that narrates before answering emits each narration as its own
+ * earlier `assistant` event, so the last one is the real answer.
+ *
+ * This is why claude-cli's text mode moves off `--output-format text`: plain
+ * text mode has no structural way to tell a rate-limit refusal from an
+ * ordinary reply short of scanning prose, unlike every other
+ * structuredEventStream provider here — see providers.ts's buildArgs comment
+ * for claude-cli.
+ */
+function extractClaudeCliFinalOutput(
+  stdout: string,
+  parsed: ParsedCliEventLines = parseJsonLineEvents(stdout)
+): string {
+  const cleaned = stripAnsi(stdout).trim();
+  if (cleaned.length === 0) {
+    return cleaned;
+  }
+
+  let sawRecognizedEvent = false;
+  let finalText: string | undefined;
+  for (const rawEvent of parsed.events) {
+    const event = rawEvent as ClaudeCliEnvelope;
+    if (typeof event.type === "string") {
+      sawRecognizedEvent = true;
+    }
+    if (event.type !== "assistant") {
+      continue;
+    }
+    const text = claudeCliAssistantMessageText(event);
+    if (text !== undefined) {
+      finalText = text;
+    }
+  }
+
+  // Same rationale as extractCodexFinalOutput/extractKimiFinalOutput: an
+  // explicit empty string is treated as "no text reply" so a legitimate
+  // exit-0 tool-only turn still produces a visible placeholder instead of ""
+  // (which downstream misreads as "the CLI produced no output").
+  if (finalText !== undefined && finalText.trim().length > 0) {
+    return finalText.trim();
+  }
+  if (sawRecognizedEvent) {
+    return CLAUDE_CLI_NO_TEXT_REPLY_PLACEHOLDER;
+  }
+  // Nothing parsed as a recognizable Claude Code event at all — fall back to
+  // the raw stream so a failure stays visible instead of silently empty.
+  return cleaned;
+}
+
+/**
+ * Structural rate-limit vocabulary recognized in a `result`/`system` event's
+ * `error` field or `is_error: true` `result` text. Deliberately narrow (an
+ * underscored CLI error CODE, not free prose) — this is the structural
+ * counterpart to quota.ts's QUOTA_MARKERS phrase list, not a replacement for
+ * it; see isQuotaError's structuredSignal parameter.
+ */
+const CLAUDE_CLI_STRUCTURAL_RATE_LIMIT_MARKERS = ["rate_limit", "usage_limit", "quota_exceeded"];
+
+/**
+ * Pull just the diagnosable content out of Claude Code CLI's stream-json
+ * stream: an `is_error: true` `result`/`system` event's own `error` field
+ * and/or `result` text — and nothing else.
+ *
+ * Same exclusion every sibling extractor in this file applies: `assistant`
+ * message text is the model's own free-form prose (and, mid-conversation,
+ * can quote file contents back verbatim), so it is never fed to the
+ * authErrorMarkers/quota scan — only consulted for output via
+ * extractClaudeCliFinalOutput, never for this diagnostic scan. Before this
+ * provider moved to stream-json it was in toFriendlyError's
+ * opaque-text/full-stdout-scan bucket; routing it through this curated
+ * extractor is what makes scanning safe (see providers.ts's buildArgs
+ * comment for the false-positive this closes) while still surfacing the real
+ * failure text.
+ *
+ * quotaSignal is set when the error event's own field matches
+ * CLAUDE_CLI_STRUCTURAL_RATE_LIMIT_MARKERS — a structural signal distinct
+ * from (and in addition to) the phrase-based scan quota.ts's isQuotaError
+ * still runs over `detail`/markerScanText as a fallback.
+ *
+ * See the NEEDS-TOOLCHAIN note on ClaudeCliEnvelope above: this shape has not
+ * been confirmed against a live `claude` CLI run.
+ */
+function extractClaudeCliStructuredDiagnostics(
+  stdout: string,
+  parsed: ParsedCliEventLines = parseJsonLineEvents(stdout)
+): StructuredCliDiagnostics {
+  const { events, unparsedText, unparsedScanSafeText } = parsed;
+  const collected: string[] = [];
+  let quotaSignal = false;
+
+  for (const rawEvent of events) {
+    const event = rawEvent as ClaudeCliEnvelope;
+    if (event.type !== "result" && event.type !== "system") {
+      continue;
+    }
+    if (event.is_error !== true) {
+      continue;
+    }
+    const errorField = typeof event.error === "string" ? event.error : undefined;
+    const resultText = typeof event.result === "string" ? event.result : undefined;
+    const subtype = typeof event.subtype === "string" ? event.subtype : undefined;
+    const scanCandidates = [errorField, subtype, resultText].filter(
+      (part): part is string => Boolean(part)
+    );
+    if (
+      scanCandidates.some((part) =>
+        CLAUDE_CLI_STRUCTURAL_RATE_LIMIT_MARKERS.some((marker) =>
+          part.toLowerCase().includes(marker)
+        )
+      )
+    ) {
+      quotaSignal = true;
+    }
+    if (scanCandidates.length > 0) {
+      collected.push(scanCandidates.join(": "));
+    } else {
+      collected.push(JSON.stringify(rawEvent));
+    }
+  }
+
+  const joined = collected.join("\n");
+  return {
+    markerScanText: [joined, unparsedScanSafeText].filter((part) => part.length > 0).join("\n"),
+    detail: [joined, unparsedText].filter((part) => part.length > 0).join("\n"),
+    // No general structural retryable signal is documented for Claude Code
+    // CLI's stream-json events (same as cline/kimi/codex above);
+    // transient-transport classification stays with applyTransportTransience
+    // over the scoped diagnosticText. quotaSignal (below) is a narrower,
+    // separate structural signal specifically for rate-limit classification.
+    retryable: false,
+    sawAnyEvent: events.length > 0,
+    quotaSignal,
+  };
+}
+
+/**
+ * claude-cli's structured stream is TEXT-MODE ONLY: its buildArgs emits
+ * `--output-format stream-json` for text mode but keeps edit mode on plain
+ * `--output-format text` (see providers.ts — edit-mode runs are captured for
+ * their workspace file changes, not a parsed summary string). The
+ * `structuredEventStream: "claude"` tag on the provider definition, however,
+ * is mode-blind, and every other carrier of that field emits structured
+ * output in ALL modes. Left unscoped, an edit-mode claude failure would be
+ * routed through the structured extractors, whose markerScanText includes
+ * every non-JSON stdout line — i.e. the model's own free-form prose — and
+ * would be scanned by isAuthenticationFailure wholesale, the exact
+ * false-positive hazard the opaque-text bucket in toFriendlyError exists to
+ * avoid (and a change to edit-mode failure classification, which the plan
+ * requires untouched). Strip the tag for claude edit-mode invocations so
+ * normalizeCliOutput and toFriendlyError see the same opaque-text provider
+ * shape they saw before claude's text mode moved to stream-json. Every other
+ * provider (and claude text mode) passes through unchanged.
+ */
+function effectiveStructuredStreamDefV1(
+  def: CliProviderDefinition,
+  mode: CliRunMode
+): CliProviderDefinition {
+  if (def.structuredEventStream === "claude" && mode === "edit") {
+    return { ...def, structuredEventStream: undefined };
+  }
+  return def;
+}
+
 /**
  * finishReason values verified LIVE to carry CLI/provider-generated failure
  * text in `run_result.text` rather than the model's own free-form prose —
@@ -1505,6 +1752,12 @@ function normalizeCliOutput(
     // so `output` is always stdout-derived here and the caller's shared parse
     // stays valid to reuse.
     return extractCodexFinalOutput(output, parsed);
+  }
+
+  if (def.structuredEventStream === "claude") {
+    // claude-cli never sets usesLastMessageFile either, so output is always
+    // stdout-derived here and the caller's shared parse stays valid to reuse.
+    return extractClaudeCliFinalOutput(output, parsed);
   }
 
   return output;
@@ -1814,6 +2067,9 @@ export const __testOnly = {
   extractKimiStructuredDiagnostics,
   extractCodexFinalOutput,
   extractCodexStructuredDiagnostics,
+  extractClaudeCliFinalOutput,
+  extractClaudeCliStructuredDiagnostics,
+  effectiveStructuredStreamDefV1,
   isTextModeGuaranteedReadOnly,
   parseJsonLineEvents,
   unwrapJsonString,
@@ -1823,6 +2079,7 @@ export const __testOnly = {
   sanitizedCliEnv,
   toFriendlyError,
   truncateCliDetail,
+  stripHookLifecycleNoiseV1,
 };
 
 /**
@@ -1882,12 +2139,43 @@ function truncateCliDetail(text: string, maxLines = 8, maxChars = 4000): string 
  *  2. Structured-stream providers can report retryability directly, and that
  *     signal has no string representation worth matching.
  */
+/**
+ * Matches a line reporting a Claude Code (or similar) lifecycle hook's own
+ * outcome — e.g. `SessionEnd hook [...] failed: Hook cancelled` — rather than
+ * the underlying failure that triggered the abrupt teardown. A user-installed
+ * hook (this codebase's own Codex plugin included) can be cancelled mid-run
+ * when the CLI process dies for an unrelated reason (a 429, an OOM, a crash),
+ * and its complaint reaching stderr/stdout is collateral damage, not the
+ * cause. See src/utils/quota.ts's isQuotaError comment for the incident this
+ * guards: a rate-limit synthetic message ("Run /usage-credits to continue")
+ * was displaced by a "Hook cancelled" line that matched none of the quota
+ * markers, so the real cause was never classified.
+ */
+const HOOK_LIFECYCLE_LINE_PATTERN_V1 =
+  /\b(?:SessionStart|SessionEnd|Stop|SubagentStop|PreCompact|UserPromptSubmit|PreToolUse|PostToolUse|Notification)\s+hook\b|\bhook\s+cancelled\b/i;
+
+/**
+ * Drops hook-lifecycle lines from `text` so they never crowd out other
+ * diagnostic content in a truncated (head+tail) excerpt. Only strips when
+ * something else survives — if hook noise is the ENTIRE text, it is returned
+ * unchanged so it still surfaces rather than being reported as "no output".
+ */
+function stripHookLifecycleNoiseV1(text: string): string {
+  if (!text) {
+    return text;
+  }
+  const lines = text.split(/\r?\n/);
+  const filtered = lines.filter((line) => !HOOK_LIFECYCLE_LINE_PATTERN_V1.test(line));
+  const remainder = filtered.join("\n").trim();
+  return remainder.length > 0 ? filtered.join("\n") : text;
+}
+
 function toFriendlyError(
   def: CliProviderDefinition,
   model: string | undefined,
   exitCode: number | null,
-  stderr: string,
-  stdout: string,
+  rawStderr: string,
+  rawStdout: string,
   parsed?: ParsedCliEventLines,
   /**
    * Replaces the computed "CLI failed: <detail>" text wholesale (e.g. the
@@ -1898,6 +2186,12 @@ function toFriendlyError(
    */
   diagnosticTextOverride?: string
 ): CliFriendlyError {
+  // Rank hook-lifecycle text below any other diagnostic content present, so a
+  // cancelled SessionEnd/Stop hook is never adopted as the sole errorMessage
+  // while genuine failure content (a rate-limit line, a traceback, ...) also
+  // exists. Falls back to the raw text when hook noise is all there is.
+  const stderr = stripHookLifecycleNoiseV1(rawStderr);
+  const stdout = stripHookLifecycleNoiseV1(rawStdout);
   // Structured-stream providers are diagnosed from stderr plus the stream's own
   // "error" events (plus any trailing unparsed text — see
   // extractStructuredCliDiagnostics) only. stderr is still concatenated even
@@ -1916,7 +2210,9 @@ function toFriendlyError(
           ? extractKimiStructuredDiagnostics(stdout, parsed)
           : def.structuredEventStream === "codex"
             ? extractCodexStructuredDiagnostics(stdout, parsed)
-            : undefined;
+            : def.structuredEventStream === "claude"
+              ? extractClaudeCliStructuredDiagnostics(stdout, parsed)
+              : undefined;
 
   const scanSource = structured
     ? `${stderr}\n${structured.markerScanText}`
@@ -1971,6 +2267,7 @@ function toFriendlyError(
     authFailure,
     diagnosticText,
     retryableHint: structured?.retryable === true,
+    quotaSignal: structured?.quotaSignal === true,
   };
 }
 
@@ -2314,19 +2611,24 @@ export async function execCliAgent(options: {
         return;
       }
 
+      // claude-cli's structured stream applies to text mode only — its edit
+      // mode still runs plain `--output-format text`, so its stdout must be
+      // handled through the opaque-text path, exactly as before Step 16. See
+      // effectiveStructuredStreamDefV1's doc comment.
+      const effectiveDef = effectiveStructuredStreamDefV1(def, mode);
       // Parsed once and shared with toFriendlyError below (both call sites):
       // a failing opencode run's stdout can be multi-megabyte (it re-emits
       // every file the agent read), and parsing that same buffer twice for
       // two different purposes is pure waste. Only structured providers pay
       // for this parse at all — undefined here is a no-op for every other
       // provider's normalizeCliOutput/toFriendlyError call.
-      const sharedParsedEvents = def.structuredEventStream
+      const sharedParsedEvents = effectiveDef.structuredEventStream
         ? parseJsonLineEvents(stdout)
         : undefined;
-      const output = normalizeCliOutput(def, stdout, lastMessageFile, sharedParsedEvents);
+      const output = normalizeCliOutput(effectiveDef, stdout, lastMessageFile, sharedParsedEvents);
 
       if (code !== 0) {
-        const friendly = toFriendlyError(def, model, code, stderr, stdout, sharedParsedEvents);
+        const friendly = toFriendlyError(effectiveDef, model, code, stderr, stdout, sharedParsedEvents);
         finish(applyTransportTransience(
           classifyCliFailure({
             status: "failed",
@@ -2336,10 +2638,11 @@ export async function execCliAgent(options: {
             // own login hint as evidence of the auth failure that produced it.
             authFailure: friendly.authFailure,
             authDiagnosticText: friendly.diagnosticText,
+            structuredQuotaSignal: friendly.quotaSignal,
           }),
           friendly,
           mode,
-          def
+          effectiveDef
         ));
         return;
       }
@@ -2357,7 +2660,7 @@ export async function execCliAgent(options: {
         const emptyDetail = `${cliDisplayLabel(def)} CLI produced no output. ${
           truncateCliDetail(stderr, 4)
         }`.trim();
-        const friendly = toFriendlyError(def, model, code, stderr, stdout, sharedParsedEvents, emptyDetail);
+        const friendly = toFriendlyError(effectiveDef, model, code, stderr, stdout, sharedParsedEvents, emptyDetail);
         finish(applyTransportTransience(
           classifyCliFailure({
             status: "failed",
@@ -2365,10 +2668,11 @@ export async function execCliAgent(options: {
             errorMessage: friendly.message,
             authFailure: friendly.authFailure,
             authDiagnosticText: friendly.diagnosticText,
+            structuredQuotaSignal: friendly.quotaSignal,
           }),
           friendly,
           mode,
-          def
+          effectiveDef
         ));
         return;
       }

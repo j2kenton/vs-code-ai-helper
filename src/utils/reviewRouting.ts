@@ -189,6 +189,17 @@ export function detectBlockerSetStall(
  * completing rounds while the amount of fixable work never falls is burning
  * budget regardless of what the score or the blocker identities are doing.
  * Returns 0 when fewer than two comparable rounds exist.
+ *
+ * Only counts a transition where the PREVIOUS round already carried
+ * task-fixable work (`taskFixableCount > 0`). A transition out of a
+ * zero-fixable round is not churn: report 12 observed a task stall cleanly
+ * for 18 zero-blocker rounds (nothing to churn on), then have the churn
+ * ceiling fire on the very next round — the first one to find a real
+ * blocker — because `0 >= 0` had been silently accruing to this counter the
+ * whole time. Counting only genuine "keeps finding the same amount of work"
+ * runs means the counter no longer charges up during a healthy or
+ * differently-stalled stretch and then detonates on the round that proves
+ * iteration is converging.
  */
 export function roundsWithoutTaskFixableDecrease(
   history: readonly ReviewScoreHistoryEntry[],
@@ -201,7 +212,7 @@ export function roundsWithoutTaskFixableDecrease(
   for (let i = scored.length - 1; i >= 1; i--) {
     const current = scored[i];
     const previous = scored[i - 1];
-    if (!current || !previous || current.taskFixableCount < previous.taskFixableCount) {
+    if (!current || !previous || previous.taskFixableCount <= 0 || current.taskFixableCount < previous.taskFixableCount) {
       break;
     }
     rounds++;
@@ -274,11 +285,24 @@ export function sameBlockerPersistsAcrossLastRounds(
 /**
  * No-progress-breaker decision (2c, ensemble.resilience.noProgressBreakerRounds
  * — extracted from executeImplementationRun so the escalate-or-not choice has
- * a unit-test seam): trip when the flag is on (`breakerRounds > 0`), the
- * consecutive zero-file-change implementation-round count has reached it, and
- * the durable review history shows the same blocker persisting across the
- * last two rounds. With the flag off (0) this never trips — the legacy
- * behavior.
+ * a unit-test seam): trip when the flag is on (`breakerRounds > 0`) and the
+ * consecutive zero-file-change implementation-round count has reached it.
+ * With the flag off (0) this never trips — the legacy behavior.
+ *
+ * The zero-change count is sufficient on its own — a round that changed no
+ * files trips at N whether or not it carried blockers. Requiring the durable
+ * review history to also show the same blocker persisting (the original
+ * gate) disabled the breaker exactly when the evidence of no progress was
+ * strongest: a reviewer reporting zero blockers round after round while
+ * nothing gets edited (report 11, an 18-round/9-hour stall) never made
+ * `sameBlockerPersistsAcrossLastRounds` true, since that helper requires a
+ * non-empty blocker identity set. `history` is accepted for API stability
+ * with callers/tests but no longer consulted here.
+ *
+ * `sameBlockerPersistsAcrossLastRounds` remains available as an independent
+ * signal for rounds that DO change files but keep reproducing the same
+ * blocker — a different stall shape from the one this function now measures
+ * directly.
  */
 export function shouldTripNoProgressBreaker(input: {
   /** Consecutive completed implementation rounds that changed zero files. */
@@ -287,10 +311,10 @@ export function shouldTripNoProgressBreaker(input: {
   breakerRounds: number;
   history: readonly ReviewScoreHistoryEntry[] | undefined;
 }): boolean {
-  if (input.breakerRounds <= 0 || input.zeroChangeRounds < input.breakerRounds) {
+  if (input.breakerRounds <= 0) {
     return false;
   }
-  return sameBlockerPersistsAcrossLastRounds(input.history);
+  return input.zeroChangeRounds >= input.breakerRounds;
 }
 
 /**

@@ -604,6 +604,75 @@ void describe("parseAiResultEnvelopeV1 — frame parsing", () => {
     }
   });
 
+  /**
+   * 2026-08-12 field report, item 1: a response whose JSON payload is
+   * byte-perfect but whose closing `<<<END_ENSEMBLE_AI_RESULT_V1>>>` never
+   * arrived (the CLI stopped writing early) was previously LESS recoverable
+   * than a response with no frame at all, because the frameless fallback
+   * bails whenever the start marker appears anywhere. A single complete JSON
+   * line with no terminator is now accepted.
+   */
+  void it("accepts a complete unterminated frame: start marker, one JSON line, nothing else", () => {
+    const payload = JSON.stringify({ version: 1, correlation: correlation(), kind: "cancelled" });
+    const raw = `<<<ENSEMBLE_AI_RESULT_V1>>>\n${payload}`;
+    const result = parseAiResultEnvelopeV1(raw);
+    assert.equal(result.kind, "cancelled");
+  });
+
+  void it("accepts a complete unterminated frame with CRLF line ending", () => {
+    const payload = JSON.stringify({ version: 1, correlation: correlation(), kind: "cancelled" });
+    const raw = `<<<ENSEMBLE_AI_RESULT_V1>>>\r\n${payload}`;
+    const result = parseAiResultEnvelopeV1(raw);
+    assert.equal(result.kind, "cancelled");
+  });
+
+  void it("accepts an unterminated frame preceded by tolerated narration", () => {
+    const payload = JSON.stringify({ version: 1, correlation: correlation(), kind: "cancelled" });
+    const raw = `Let me finish up.\n\n<<<ENSEMBLE_AI_RESULT_V1>>>\n${payload}`;
+    const result = parseAiResultEnvelopeV1(raw);
+    assert.equal(result.kind, "cancelled");
+  });
+
+  void it("rejects an unterminated frame whose payload spans multiple lines", () => {
+    const raw = `<<<ENSEMBLE_AI_RESULT_V1>>>\n{\n"version": 1\n}`;
+    const result = parseAiResultEnvelopeV1(raw);
+    assert.equal(result.kind, "malformed");
+    if (result.kind === "malformed") {
+      assert.equal(result.code, "invalidFrame");
+      assert.match(result.reason, /expected the frame to end with/);
+    }
+  });
+
+  void it("rejects an unterminated frame whose single line is not valid JSON, naming the missing terminator (not invalidJson)", () => {
+    const raw = `<<<ENSEMBLE_AI_RESULT_V1>>>\n{not json}`;
+    const result = parseAiResultEnvelopeV1(raw);
+    assert.equal(result.kind, "malformed");
+    if (result.kind === "malformed") {
+      assert.equal(result.code, "invalidFrame");
+      assert.match(result.reason, /expected the frame to end with/);
+    }
+  });
+
+  void it("rejects an unterminated frame with no line ending after the start marker", () => {
+    const raw = `<<<ENSEMBLE_AI_RESULT_V1>>>not-even-a-newline`;
+    const result = parseAiResultEnvelopeV1(raw);
+    assert.equal(result.kind, "malformed");
+    if (result.kind === "malformed") {
+      assert.equal(result.code, "invalidFrame");
+    }
+  });
+
+  void it("still rejects the extra-outer-brace shape (both markers present, invalid JSON) as invalidJson, not invalidFrame", () => {
+    // The observed attempt-1 shape from the field report: terminator IS
+    // present, so this is still the terminated path — only the JSON is bad.
+    const raw = `<<<ENSEMBLE_AI_RESULT_V1>>>\n{"version": 1, "correlation": ${JSON.stringify(correlation())}, "kind": "cancelled"}}\n<<<END_ENSEMBLE_AI_RESULT_V1>>>`;
+    const result = parseAiResultEnvelopeV1(raw);
+    assert.equal(result.kind, "malformed");
+    if (result.kind === "malformed") {
+      assert.equal(result.code, "invalidJson");
+    }
+  });
+
   void it("rejects a response with no frame marker anywhere", () => {
     const raw = "just some prose, no frame at all, nothing to find here.";
     const result = parseAiResultEnvelopeV1(raw);

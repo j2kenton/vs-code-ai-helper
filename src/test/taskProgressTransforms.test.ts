@@ -1,6 +1,6 @@
 import * as assert from "node:assert/strict";
 import { test } from "node:test";
-import { appendReviewRejection, appendReviewScoreHistory, clearEscalation, clearImplementationTypeCheckFailure, clearStageFallbackReservation, recordEscalation, recordImplementationTypeCheckFailure, updateImplReviewFiles, clearImplReviewFiles, updateTaskProgressStage } from "../utils/taskProgressTransforms";
+import { appendReviewRejection, appendReviewScoreHistory, clearEscalation, clearImplementationTypeCheckFailure, clearStageFallbackReservation, recordEscalation, recordImplementationTypeCheckFailure, setZeroChangeImplRounds, updateImplReviewFiles, clearImplReviewFiles, updateTaskProgressStage } from "../utils/taskProgressTransforms";
 import { MAX_REVIEW_REJECTIONS, MAX_REVIEW_SCORE_HISTORY, ReviewRejectionEntry, ReviewScoreHistoryEntry, type TaskProgress, type TaskStage } from "../types/taskProgress";
 
 function makeProgress(implReviewFiles?: string[]): TaskProgress {
@@ -474,4 +474,33 @@ void test("rolling back to a stage before impl also preserves review scope", () 
   const rolled = updateTaskProgressStage(progress, "plan");
   assert.deepStrictEqual(rolled.implReviewFiles, accumulated);
   assert.deepStrictEqual(rolled.completedStages, ["desc"]);
+});
+
+// ---------------------------------------------------------------------------
+// setZeroChangeImplRounds: durable no-progress-breaker counter (step 8)
+// ---------------------------------------------------------------------------
+
+void test("setZeroChangeImplRounds sets the counter to the given value", () => {
+  const progress = makeProgress();
+  const updated = setZeroChangeImplRounds(progress, 3);
+  assert.equal(updated.zeroChangeImplRounds, 3);
+});
+
+void test("setZeroChangeImplRounds(undefined) clears a previously set counter", () => {
+  const progress = { ...makeProgress(), zeroChangeImplRounds: 5 };
+  const updated = setZeroChangeImplRounds(progress, undefined);
+  assert.equal(updated.zeroChangeImplRounds, undefined);
+});
+
+void test("setZeroChangeImplRounds bumps updatedAt", () => {
+  const progress = makeProgress();
+  const updated = setZeroChangeImplRounds(progress, 1);
+  assert.notEqual(updated.updatedAt, progress.updatedAt);
+});
+
+void test("setZeroChangeImplRounds does not disturb unrelated fields", () => {
+  const progress = { ...makeProgress(["a.ts"]), currentStage: "impl-high-review" as const };
+  const updated = setZeroChangeImplRounds(progress, 2);
+  assert.deepEqual(updated.implReviewFiles, ["a.ts"]);
+  assert.equal(updated.currentStage, "impl-high-review");
 });

@@ -168,36 +168,6 @@ function filterEnabledBackupModels(models: readonly string[]): string[] {
 }
 
 /**
- * Build the prompt sent to a backup model that is taking over from a primary
- * interrupted by a quota/temporarily-unavailable failure with a known,
- * non-empty changed-file set (plan §2e). Preserving the tree instead of
- * suppressing the cascade only helps if the backup is explicitly told what
- * already changed and instructed to build on it rather than restart —
- * otherwise it may silently overwrite or ignore the stranded edits.
- */
-export function buildBackupHandoffPromptV1(
-  originalPrompt: string,
-  changedFiles: readonly string[]
-): string {
-  const fileList = changedFiles.map((file) => `- ${file}`).join("\n");
-  return [
-    "IMPORTANT: Another AI agent was implementing this task and was interrupted " +
-      "mid-run by a temporary provider outage or quota limit — NOT a defect in its work.",
-    "",
-    "Before it stopped, that agent already changed the following files in this workspace:",
-    fileList,
-    "",
-    "Inspect those changes first. Preserve them — do not discard, revert, or restart the " +
-      "implementation from scratch. Continue from where the interrupted agent left off and " +
-      "finish the task described below.",
-    "",
-    "--- Original implementation task ---",
-    "",
-    originalPrompt,
-  ].join("\n");
-}
-
-/**
  * Configured backup models for a stage, excluding `modelId` itself and any
  * provider currently disabled — but ONLY when the stage's fallback strategy
  * is "switch-to-backup" (the quota-triggered automatic switch-over opt-in).
@@ -786,10 +756,9 @@ export async function runImplementationForModel(options: {
   });
 
   const run = async (
-    selected: EffectiveProvider,
-    promptOverride?: string
+    selected: EffectiveProvider
   ): Promise<ImplementationRunResult & { runnerId: string }> => {
-    const prompt = promptOverride ?? options.prompt;
+    const prompt = options.prompt;
     if (selected.kind === "cli") {
       const result = await runImplementationWithCli({
         def: selected.def,
@@ -983,17 +952,22 @@ export async function runImplementationForModel(options: {
     }
     await releaseReservation();
   } else if (
-    // (2e) Backup handoff after a quota-interrupted implementation: the
-    // clean-tree cascade above intentionally never fires here because
-    // `primaryLeftTreeClean` is false, and the old behavior was to fall
-    // straight through to `return result` — stranding whatever the primary
-    // had already written with no attempt to finish it. When the change set
-    // is actually KNOWN (not `filesChangedUnknown`) and non-empty, preserve
-    // the tree and hand the SAME backup chain an explicit handoff prompt
-    // instead of silently giving up. Unknown file state is still treated as
-    // unsafe to hand off (genuinely not knowing what changed is not
-    // evidence it's safe to build on), matching leftTreeCleanV1's own
-    // "unknown == dirty" rule.
+    // (2e / plan step 17) Quota-or-outage failure that left the working tree
+    // DIRTY: the clean-tree cascade above intentionally never fires here
+    // because `primaryLeftTreeClean` is false, and no backup is EVER invoked
+    // in this state. The zero-changed-files requirement is the cascade's
+    // explicit safety boundary — dispatching a second model at a tree the
+    // failed primary already half-edited risks mixing two models' edits in
+    // one round, which is strictly worse than failing. What the bare
+    // fall-through used to omit is any explanation: the user saw only the
+    // primary's raw quota/outage error, with no way to tell that a
+    // configured backup exists but was deliberately withheld (versus not
+    // being configured at all). Enrich the primary's own outcome with that
+    // explanation and the two real choices — rerun the stage, or switch the
+    // stage's model — and return it. Only a KNOWN, non-empty change set
+    // takes this branch: `filesChangedUnknown` keeps the plain fall-through
+    // below, since a message claiming "N file(s) changed" cannot be written
+    // about a tree whose state could not be determined.
     !authFailure &&
     result.filesChangedUnknown !== true &&
     result.filesChanged.length > 0 &&
@@ -1002,85 +976,23 @@ export async function runImplementationForModel(options: {
     options.stage &&
     chainWantsBackup
   ) {
-    if (!options.taskFolderUri) {
-      return withActualIdentity(result, primaryProviderLabel, options.modelId);
-    }
-    const reserved = await reserveFallback(options.taskFolderUri, options.stage);
-    if (!reserved) {
-      return withActualIdentity(result, primaryProviderLabel, options.modelId);
-    }
-    const releaseReservation = (): Promise<void> =>
-      releaseUnresolvedFallbackReservation(options.taskFolderUri!, options.stage!);
-    const mergeFilesChanged = (
-      backup: ImplementationRunResult
-    ): Pick<ImplementationRunResult, "filesChanged" | "filesChangedUnknown"> => ({
-      filesChanged: Array.from(new Set([...result.filesChanged, ...backup.filesChanged])),
-      filesChangedUnknown: backup.filesChangedUnknown === true,
-    });
-    let handedOff = false;
-    for (const backupModel of filterEnabledBackupModels(chain.backups)) {
-      if (backupModel === options.modelId) {
-        continue;
-      }
-      // Mirrors the clean-tree cascade's own kind gate above, minus its
-      // `runCrossProviderBackup` escape hatch: that callback takes only a
-      // modelId, not a prompt override, so it has no way to carry the
-      // handoff instructions. When `allowCrossProviderBackups` is false, a
-      // cross-kind backup is therefore always skipped for a handoff (a
-      // same-kind backup further down the configured list may still be
-      // eligible) rather than silently dropping the handoff context.
-      if (!options.allowCrossProviderBackups) {
-        let backupKind: "cli" | "copilot" | undefined;
-        try {
-          backupKind = resolveEffectiveProvider(backupModel).kind;
-        } catch {
-          // Unresolvable — the availability check just below rejects it too.
-        }
-        if (backupKind !== effective.kind) {
-          continue;
-        }
-      }
-      const fallbackAvailability =
-        await checkImplementationAvailabilityForModel(backupModel);
-      if (!fallbackAvailability.availability.available) {
-        const fallbackFailure = {
-          ...result,
-          status: "failed" as const,
-          failureKind: isAuthenticationFailure(fallbackAvailability.availability.reason)
-            ? "generic" as const
-            : "temporarily-unavailable" as const,
-          errorMessage: fallbackAvailability.availability.reason ?? "Backup model is unavailable.",
-        };
-        recordQuotaObservation(options.stage, backupModel, fallbackFailure.failureKind, fallbackFailure.errorMessage);
-        if (isAuthenticationFailure(fallbackAvailability.availability.reason)) {
-          await releaseReservation();
-          return withActualIdentity(fallbackFailure, fallbackAvailability.providerLabel, backupModel);
-        }
-        continue;
-      }
-      handedOff = true;
-      options.onProgress(
-        `Handing off to backup after the primary was interrupted with ${result.filesChanged.length} file(s) already changed.`
-      );
-      const handoffPrompt = buildBackupHandoffPromptV1(options.prompt, result.filesChanged);
-      const fallbackResult = await run(resolveEffectiveProvider(backupModel), handoffPrompt);
-      recordQuotaObservation(options.stage, backupModel, fallbackResult.failureKind, fallbackResult.errorMessage);
-      const merged = { ...fallbackResult, ...mergeFilesChanged(fallbackResult) };
-      if (fallbackResult.status === "completed") {
-        await recordActiveFallbackModel(options.taskFolderUri, options.stage, backupModel);
-        return withActualIdentity(merged, fallbackAvailability.providerLabel, backupModel);
-      }
-      // Whether the backup itself failed, was cancelled, or left the tree in
-      // an unknown state, do not cascade to a THIRD agent: the combined tree
-      // is now the product of two attempts and a further handoff would need
-      // to describe both, not just the primary's. Stop and report the
-      // merged changed-file set on the backup's own outcome.
-      await releaseReservation();
-      return withActualIdentity(merged, fallbackAvailability.providerLabel, backupModel);
-    }
-    if (!handedOff) {
-      await releaseReservation();
-    }
+    const limitLabel =
+      result.failureKind === "quota"
+        ? "a quota/rate limit"
+        : "the provider being temporarily unavailable";
+    const withheldMessage =
+      `Hit ${limitLabel} on ${primaryProviderLabel}` +
+      (result.errorMessage ? ` (${result.errorMessage})` : "") +
+      `. This round already changed ${result.filesChanged.length} file(s), so Ensemble withheld the ` +
+      "automatic switch to this stage's backup model — switching mid-round on a dirty working tree " +
+      "risks mixing two models' edits in one round. Rerun this stage to retry with the same model, " +
+      "or switch the stage's model before rerunning.";
+    options.onProgress(withheldMessage);
+    return withActualIdentity(
+      { ...result, errorMessage: withheldMessage },
+      primaryProviderLabel,
+      options.modelId
+    );
   }
   return withActualIdentity(result, primaryProviderLabel, options.modelId);
 }

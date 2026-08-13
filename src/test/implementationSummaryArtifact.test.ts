@@ -38,9 +38,14 @@ import {
 } from "../utils/implementationArtifactResolver";
 import { verifyPlanItems } from "../utils/completionLint";
 import {
+  collectRetroactiveTickClaimsV1,
   countChecklistProgressV1,
+  EXCLUDED_CHECKLIST_ITEM_MARKER_V1,
   hasImplementationChecklistV1,
   mergeChecklistProgressV1,
+  MergeChecklistProgressResultV1,
+  normalizeChecklistItemTextV1,
+  RETROACTIVE_TICK_MARKER_V1,
   scopeToLatestChecklistV1,
   splitSummaryAtEchoV1,
 } from "../utils/implementationChecklist";
@@ -141,6 +146,12 @@ function installMemStore(seed: Record<string, string>): {
       fsApi.stat = orig.stat;
     },
   };
+}
+
+/** Asserts the merge actually ticked something and returns the updated document. */
+function mergedContent(result: MergeChecklistProgressResultV1): string {
+  assert.equal(result.kind, "merged", `expected a merge, got "${result.kind}"`);
+  return (result as { kind: "merged"; content: string }).content;
 }
 
 const FOLDER = vscode.Uri.file("/tasks/2026-08-07_task_1");
@@ -291,8 +302,7 @@ void describe("checklist progress carries forward into the plan of record", () =
   ].join("\n");
 
   void it("ticks exactly the items the round reported done", () => {
-    const merged = mergeChecklistProgressV1(CHECKLIST_PLAN_OF_RECORD, SUMMARY_WITH_PROGRESS);
-    assert.ok(merged, "a round reporting progress must update the plan of record");
+    const merged = mergedContent(mergeChecklistProgressV1(CHECKLIST_PLAN_OF_RECORD, SUMMARY_WITH_PROGRESS));
 
     const items = verifyPlanItems(merged);
     assert.equal(items.length, 5);
@@ -310,8 +320,7 @@ void describe("checklist progress carries forward into the plan of record", () =
       "- [x] Fix the `autoFirstActive` expansion"
     );
     // This round's reproduction sloppily resets that box back to unchecked.
-    const merged = mergeChecklistProgressV1(alreadyDone, SUMMARY_WITH_PROGRESS);
-    assert.ok(merged);
+    const merged = mergedContent(mergeChecklistProgressV1(alreadyDone, SUMMARY_WITH_PROGRESS));
     assert.ok(
       merged.includes("- [x] Fix the `autoFirstActive` expansion"),
       "a sloppy reproduction must not erase progress an earlier round earned"
@@ -324,8 +333,7 @@ void describe("checklist progress carries forward into the plan of record", () =
       "- [x] Delete the auto-rename block in `handleDraftOutcomeV1`",
       "- [x] Reproduce the Publish rollback bug before fixing",
     ].join("\n");
-    const merged = mergeChecklistProgressV1(CHECKLIST_PLAN_OF_RECORD, reordered);
-    assert.ok(merged);
+    const merged = mergedContent(mergeChecklistProgressV1(CHECKLIST_PLAN_OF_RECORD, reordered));
     assert.ok(merged.includes("- [x] Delete the auto-rename block in `handleDraftOutcomeV1`"));
     assert.ok(merged.includes("- [x] Reproduce the Publish rollback bug before fixing"));
     assert.ok(merged.includes("- [ ] Fix the `autoFirstActive` expansion"));
@@ -333,16 +341,15 @@ void describe("checklist progress carries forward into the plan of record", () =
 
   void it("leaves the document untouched when the round reported no completions", () => {
     assert.equal(
-      mergeChecklistProgressV1(CHECKLIST_PLAN_OF_RECORD, WELL_FORMED_SUMMARY),
-      undefined,
+      mergeChecklistProgressV1(CHECKLIST_PLAN_OF_RECORD, WELL_FORMED_SUMMARY).kind,
+      "no-report",
       "a summary with no reproduced checklist must not rewrite the plan of record"
     );
   });
 
   void it("preserves CRLF line endings and surrounding prose byte-for-byte", () => {
     const crlf = CHECKLIST_PLAN_OF_RECORD.split("\n").join("\r\n");
-    const merged = mergeChecklistProgressV1(crlf, SUMMARY_WITH_PROGRESS);
-    assert.ok(merged);
+    const merged = mergedContent(mergeChecklistProgressV1(crlf, SUMMARY_WITH_PROGRESS));
     assert.ok(merged.includes("\r\n"), "line endings must survive the merge");
     assert.doesNotMatch(merged, /[^\r]\n/, "no CRLF may be downgraded to LF");
     assert.ok(merged.includes("## Task B — Stage-action dispatch and AI authoring"));
@@ -354,8 +361,7 @@ void describe("checklist progress carries forward into the plan of record", () =
   });
 
   void it("tells the next round what remains — the record the clobber destroyed", () => {
-    const merged = mergeChecklistProgressV1(CHECKLIST_PLAN_OF_RECORD, SUMMARY_WITH_PROGRESS);
-    assert.ok(merged);
+    const merged = mergedContent(mergeChecklistProgressV1(CHECKLIST_PLAN_OF_RECORD, SUMMARY_WITH_PROGRESS));
     const remaining = merged
       .split(/\r?\n/)
       .filter((line) => /^\s*[-*]\s*\[ \]/.test(line));
@@ -366,7 +372,7 @@ void describe("checklist progress carries forward into the plan of record", () =
 void describe("a narrowed denominator cannot declare the plan finished", () => {
   void it("counts the plan of record's checklist, deduped", () => {
     const counted = countChecklistProgressV1(CHECKLIST_PLAN_OF_RECORD);
-    assert.deepEqual(counted, { total: 5, checked: 0, remaining: 5 });
+    assert.deepEqual(counted, { total: 5, checked: 0, remaining: 5, excluded: 0 });
   });
 
   void it("reports no checklist for a document that has none", () => {
@@ -671,7 +677,26 @@ void describe("a plan with a checklist requires the round to echo it", () => {
     assert.ok(issue, "verification checkboxes are not the plan's checklist");
     assert.match(issue, /checklist/);
     // Proves the gate and the merge now agree: neither finds anything.
-    assert.equal(mergeChecklistProgressV1(CHECKLIST_PLAN_OF_RECORD, verificationOnly), undefined);
+    assert.equal(mergeChecklistProgressV1(CHECKLIST_PLAN_OF_RECORD, verificationOnly).kind, "no-report");
+  });
+
+  void it("accepts a `no-checklist-change` marker in place of the echo", () => {
+    // A round that fixed a review blocker without ticking any plan step (a
+    // defect fix, not an unbuilt step) legitimately has nothing to echo.
+    const noChange = [
+      "<!-- ensemble:no-checklist-change -->",
+      "No checkbox state changed this round: the fix addressed a defect the review raised, not an unbuilt plan step.",
+      "",
+      WELL_FORMED_SUMMARY,
+    ].join("\n");
+    assert.equal(
+      describeImplementationSummaryShapeIssue(noChange, {
+        planChecklist: CHECKLIST_PLAN_OF_RECORD,
+      }),
+      undefined
+    );
+    // And the merge correctly ticks nothing — there is no echo to match.
+    assert.equal(mergeChecklistProgressV1(CHECKLIST_PLAN_OF_RECORD, noChange).kind, "no-report");
   });
 
   void it("rejects a response truncated after Files Changed, echo notwithstanding", () => {
@@ -778,7 +803,7 @@ void describe("a plan with a checklist requires the round to echo it", () => {
       describeImplementationSummaryShapeIssue(echoed, { planChecklist: CHECKLIST_PLAN_OF_RECORD }),
       undefined
     );
-    assert.ok(mergeChecklistProgressV1(CHECKLIST_PLAN_OF_RECORD, echoed));
+    assert.equal(mergeChecklistProgressV1(CHECKLIST_PLAN_OF_RECORD, echoed).kind, "merged");
   });
 
   void it("rejects a response that is only the echoed plan", () => {
@@ -811,7 +836,7 @@ void describe("a plan with a checklist requires the round to echo it", () => {
     const attributed = `<!-- Generated by Claude Code (fable@high) -->\n\n${CHECKLIST_PLAN_OF_RECORD}`;
     assert.ok(attributed.includes("<!-- ensemble:implementation-checklist -->"));
     assert.equal(attributed.startsWith("<!-- ensemble:implementation-checklist -->"), false);
-    assert.deepEqual(countChecklistProgressV1(attributed), { total: 5, checked: 0, remaining: 5 });
+    assert.deepEqual(countChecklistProgressV1(attributed), { total: 5, checked: 0, remaining: 5, excluded: 0 });
   });
 });
 
@@ -824,6 +849,22 @@ void describe("a rejected round is refused by every review entry point", () => {
     assert.equal(isUnusableImplementationSummaryV1(stamp), true);
     assert.match(stamp, /007-claude-cli-impl\.md/);
     assert.match(stamp, /missing `## Verification`/);
+    assert.match(stamp, /Its edits were kept and recorded for review/);
+  });
+
+  void it("does not claim edits were kept when the round changed no files", () => {
+    // ensemble.resilience.nothingToFixRoutesToReview can route a genuinely
+    // zero-change round onward even when its summary is rejected — the
+    // stamp must not then falsely claim files were changed and kept.
+    const stamp = buildUnusableImplementationSummaryV1(
+      "the final response is missing `## Verification`",
+      "007-claude-cli-impl.md",
+      false
+    );
+    assert.equal(isUnusableImplementationSummaryV1(stamp), true);
+    assert.match(stamp, /completed without changing any files/);
+    assert.match(stamp, /This round changed no files, so there is nothing new recorded for review/);
+    assert.doesNotMatch(stamp, /Its edits were kept/);
   });
 
   void it("does not mistake a real summary or a plan for a rejected round", () => {
@@ -893,6 +934,7 @@ void describe("checklist item identity", () => {
       total: 3,
       checked: 0,
       remaining: 3,
+      excluded: 0,
     });
   });
 
@@ -903,12 +945,11 @@ void describe("checklist item identity", () => {
       "- [ ] Wire the gate",
       "- [ ] Add a regression test",
     ].join("\n");
-    const merged = mergeChecklistProgressV1(DUPLICATE_WORDING, echo);
-    assert.ok(merged);
+    const merged = mergedContent(mergeChecklistProgressV1(DUPLICATE_WORDING, echo));
     const lines = merged.split("\n").filter((l) => l.includes("Add a regression test"));
     assert.deepEqual(lines, ["- [x] Add a regression test", "- [ ] Add a regression test"]);
     // The unfinished second copy still holds the denominator open.
-    assert.deepEqual(countChecklistProgressV1(merged), { total: 3, checked: 1, remaining: 2 });
+    assert.deepEqual(countChecklistProgressV1(merged), { total: 3, checked: 1, remaining: 2, excluded: 0 });
   });
 
   void it("still collapses a whole checklist reproduced a second time", () => {
@@ -920,6 +961,7 @@ void describe("checklist item identity", () => {
       total: 5,
       checked: 0,
       remaining: 5,
+      excluded: 0,
     });
     assert.equal(verifyPlanItems(reproduced).length, 5, "one rendering, not two");
   });
@@ -931,6 +973,7 @@ void describe("checklist item identity", () => {
       total: 5,
       checked: 5,
       remaining: 0,
+      excluded: 0,
     });
   });
 
@@ -949,6 +992,7 @@ void describe("checklist item identity", () => {
       total: 3,
       checked: 0,
       remaining: 3,
+      excluded: 0,
     });
     assert.equal(verifyPlanItems(quoting).length, 3);
   });
@@ -964,7 +1008,7 @@ void describe("checklist item identity", () => {
     ].join("\n");
     const counted = countChecklistProgressV1(quoting);
     assert.ok(counted, "a quoted marker must not make the checklist vanish");
-    assert.deepEqual(counted, { total: 2, checked: 0, remaining: 2 });
+    assert.deepEqual(counted, { total: 2, checked: 0, remaining: 2, excluded: 0 });
   });
 
   void it("ignores a marker shown inside a fenced example", () => {
@@ -988,6 +1032,7 @@ void describe("checklist item identity", () => {
       total: 2,
       checked: 0,
       remaining: 2,
+      excluded: 0,
     });
   });
 
@@ -1005,6 +1050,7 @@ void describe("checklist item identity", () => {
       total: 1,
       checked: 0,
       remaining: 1,
+      excluded: 0,
     });
   });
 
@@ -1024,12 +1070,12 @@ void describe("checklist item identity", () => {
       "- [x] Wire the gate",
       "- [x] Update foo.ts",
     ].join("\n");
-    const merged = mergeChecklistProgressV1(plan, reorderedEcho);
-    assert.ok(merged);
+    const merged = mergedContent(mergeChecklistProgressV1(plan, reorderedEcho));
     assert.deepEqual(countChecklistProgressV1(merged), {
       total: 3,
       checked: 2,
       remaining: 1,
+      excluded: 0,
     });
     assert.equal(
       merged.split("\n").filter((l) => l === "- [ ] Update foo.ts").length,
@@ -1046,8 +1092,8 @@ void describe("checklist item identity", () => {
     ].join("\n");
     const echo = ["<!-- ensemble:implementation-checklist -->", "- [x] Update foo.ts"].join("\n");
     assert.equal(
-      mergeChecklistProgressV1(plan, echo),
-      undefined,
+      mergeChecklistProgressV1(plan, echo).kind,
+      "unchanged",
       "one reported tick against one already recorded is no new progress"
     );
   });
@@ -1074,7 +1120,7 @@ void describe("checklist item identity", () => {
     ].join("\n");
     assert.deepEqual(
       countChecklistProgressV1(legacy),
-      { total: 2, checked: 2, remaining: 0 },
+      { total: 2, checked: 2, remaining: 0, excluded: 0 },
       "every real plan item is done, so the plan is complete"
     );
   });
@@ -1098,6 +1144,7 @@ void describe("checklist item identity", () => {
       total: 3,
       checked: 1,
       remaining: 2,
+      excluded: 0,
     });
   });
 
@@ -1138,8 +1185,7 @@ void describe("checklist item identity", () => {
       "<!-- ensemble:implementation-checklist -->",
       "- [x] Fix the `autoFirstActive` expansion",
     ].join("\n");
-    const merged = mergeChecklistProgressV1(doc, echo);
-    assert.ok(merged);
+    const merged = mergedContent(mergeChecklistProgressV1(doc, echo));
     const ticked = merged.split("\n").filter((l) => l === "- [x] Fix the `autoFirstActive` expansion");
     assert.equal(ticked.length, 1, "only the latest rendering is updated");
   });
@@ -1171,11 +1217,10 @@ void describe("the echoed checklist is separated from the summary's own sections
       "",
       "- [x] Run the full test suite",
     ].join("\n");
-    const merged = mergeChecklistProgressV1(PLAN_WITH_DUPES, response);
-    assert.ok(merged);
+    const merged = mergedContent(mergeChecklistProgressV1(PLAN_WITH_DUPES, response));
     assert.deepEqual(
       countChecklistProgressV1(merged),
-      { total: 3, checked: 1, remaining: 2 },
+      { total: 3, checked: 1, remaining: 2, excluded: 0 },
       "one reported tick means one tick, whatever the verification list says"
     );
   });
@@ -1469,5 +1514,304 @@ void describe("the rejection message names the real cause", () => {
     assert.ok(issue);
     assert.match(issue, /is missing/);
     assert.doesNotMatch(issue, /checkboxes/);
+  });
+});
+
+void describe("checklist item identity survives escaped-quote corruption", () => {
+  // A round-trip through a JSON-encoded field (the checklist echo travels
+  // inside the strict-JSON result frame, and plan-final.md was itself
+  // generated the same way) can leave a provider's over-escaped quotes on
+  // disk as literal backslash-quote sequences rather than plain quotes.
+  void it("unescapes backslash-escaped quotes before folding case/whitespace", () => {
+    assert.equal(
+      normalizeChecklistItemTextV1(`Fix the \\"foo\\" bug`),
+      normalizeChecklistItemTextV1(`Fix the "foo" bug`)
+    );
+  });
+
+  void it("unescapes backslash-escaped apostrophes", () => {
+    assert.equal(
+      normalizeChecklistItemTextV1(`Guard against a partial task object\\'s state`),
+      normalizeChecklistItemTextV1(`Guard against a partial task object's state`)
+    );
+  });
+
+  void it("collapses doubled backslashes to a single backslash", () => {
+    assert.equal(
+      normalizeChecklistItemTextV1(`Update C:\\\\Users\\\\task`),
+      normalizeChecklistItemTextV1(`Update C:\\Users\\task`)
+    );
+  });
+
+  void it("an echo with clean quotes still ticks a plan line carrying escaped quotes", () => {
+    const plan = [
+      "<!-- ensemble:implementation-checklist -->",
+      "",
+      `- [ ] Fix the \\"getStageStatus\\" comparison`,
+      "- [ ] Wire the gate",
+    ].join("\n");
+    const echo = [
+      "<!-- ensemble:implementation-checklist -->",
+      `- [x] Fix the "getStageStatus" comparison`,
+    ].join("\n");
+    const merged = mergedContent(mergeChecklistProgressV1(plan, echo));
+    assert.ok(
+      merged.includes(`- [x] Fix the \\"getStageStatus\\" comparison`),
+      "the plan's original (corrupted) spelling is ticked, byte-preserving except the box"
+    );
+    assert.deepEqual(countChecklistProgressV1(merged), { total: 2, checked: 1, remaining: 1, excluded: 0 });
+  });
+
+  void it("a plan with clean quotes still ticks against an echo carrying escaped quotes", () => {
+    const plan = [
+      "<!-- ensemble:implementation-checklist -->",
+      "",
+      `- [ ] Fix the "getStageStatus" comparison`,
+      "- [ ] Wire the gate",
+    ].join("\n");
+    const echo = [
+      "<!-- ensemble:implementation-checklist -->",
+      `- [x] Fix the \\"getStageStatus\\" comparison`,
+    ].join("\n");
+    const merged = mergedContent(mergeChecklistProgressV1(plan, echo));
+    assert.ok(merged.includes(`- [x] Fix the "getStageStatus" comparison`));
+  });
+});
+
+void describe("mergeChecklistProgressV1 distinguishes no-op from no-match", () => {
+  const PLAN = [
+    "<!-- ensemble:implementation-checklist -->",
+    "",
+    "- [ ] Reproduce the Publish rollback bug before fixing",
+    "- [ ] Wire the gate",
+  ].join("\n");
+
+  void it("reports \"no-report\" when the round echoed no ticked items at all", () => {
+    const result = mergeChecklistProgressV1(PLAN, WELL_FORMED_SUMMARY);
+    assert.deepEqual(result, { kind: "no-report" });
+  });
+
+  void it("reports \"unchanged\" when every reported tick is already recorded", () => {
+    const alreadyDone = PLAN.replace(
+      "- [ ] Reproduce the Publish rollback bug before fixing",
+      "- [x] Reproduce the Publish rollback bug before fixing"
+    );
+    const echo = [
+      "<!-- ensemble:implementation-checklist -->",
+      "- [x] Reproduce the Publish rollback bug before fixing",
+    ].join("\n");
+    const result = mergeChecklistProgressV1(alreadyDone, echo);
+    assert.deepEqual(result, { kind: "unchanged" });
+  });
+
+  void it("reports \"no-match\" — distinct from a no-op — when a reported tick names nothing in the plan", () => {
+    const echo = [
+      "<!-- ensemble:implementation-checklist -->",
+      "- [x] Refactor the completely unrelated billing module",
+    ].join("\n");
+    const result = mergeChecklistProgressV1(PLAN, echo);
+    assert.equal(result.kind, "no-match");
+    if (result.kind === "no-match") {
+      assert.deepEqual(result.unmatchedSample, ["Refactor the completely unrelated billing module"]);
+    }
+  });
+
+  void it("samples up to two unmatched items when several reported ticks miss", () => {
+    const echo = [
+      "<!-- ensemble:implementation-checklist -->",
+      "- [x] Totally foreign item one",
+      "- [x] Totally foreign item two",
+      "- [x] Totally foreign item three",
+    ].join("\n");
+    const result = mergeChecklistProgressV1(PLAN, echo);
+    assert.equal(result.kind, "no-match");
+    if (result.kind === "no-match") {
+      assert.equal(result.unmatchedSample.length, 2);
+    }
+  });
+});
+
+void describe("the completeness gate exempts steps the stage cannot perform", () => {
+  const PLAN_WITH_EXCLUDED_STEP = [
+    "<!-- ensemble:implementation-checklist -->",
+    "",
+    "- [ ] Fix `getStageStatus` so the current-stage comparison wins",
+    `- [ ] Deploy the classifier change to the production cluster ${EXCLUDED_CHECKLIST_ITEM_MARKER_V1}`,
+    "- [ ] Add a regression test",
+  ].join("\n");
+
+  void it("excludes a marked item from both total and checked", () => {
+    assert.deepEqual(countChecklistProgressV1(PLAN_WITH_EXCLUDED_STEP), {
+      total: 2,
+      checked: 0,
+      remaining: 2,
+      excluded: 1,
+    });
+  });
+
+  void it("still ticks a checked excluded item without adding it to the denominator", () => {
+    const ticked = PLAN_WITH_EXCLUDED_STEP.replace(
+      `- [ ] Deploy the classifier change to the production cluster ${EXCLUDED_CHECKLIST_ITEM_MARKER_V1}`,
+      `- [x] Deploy the classifier change to the production cluster ${EXCLUDED_CHECKLIST_ITEM_MARKER_V1}`
+    );
+    assert.deepEqual(countChecklistProgressV1(ticked), {
+      total: 2,
+      checked: 0,
+      remaining: 2,
+      excluded: 1,
+    });
+  });
+
+  void it("a plan whose only items are all excluded is still a real checklist, not \"no checklist\"", () => {
+    const allExcluded = [
+      "<!-- ensemble:implementation-checklist -->",
+      "",
+      `- [ ] Rotate the API key ${EXCLUDED_CHECKLIST_ITEM_MARKER_V1}`,
+    ].join("\n");
+    assert.equal(hasImplementationChecklistV1(allExcluded), true);
+    assert.deepEqual(countChecklistProgressV1(allExcluded), {
+      total: 0,
+      checked: 0,
+      remaining: 0,
+      excluded: 1,
+    });
+  });
+
+  void it("an excluded item is still a real checklist item for merge/echo purposes", () => {
+    const echo = [
+      "<!-- ensemble:implementation-checklist -->",
+      `- [x] Deploy the classifier change to the production cluster ${EXCLUDED_CHECKLIST_ITEM_MARKER_V1}`,
+    ].join("\n");
+    const merged = mergedContent(mergeChecklistProgressV1(PLAN_WITH_EXCLUDED_STEP, echo));
+    assert.ok(
+      merged.includes(
+        `- [x] Deploy the classifier change to the production cluster ${EXCLUDED_CHECKLIST_ITEM_MARKER_V1}`
+      ),
+      "an excluded item must still be tickable — it is out of the DENOMINATOR, not out of the plan"
+    );
+    // Ticking it must not have moved it into the denominator.
+    assert.deepEqual(countChecklistProgressV1(merged), {
+      total: 2,
+      checked: 0,
+      remaining: 2,
+      excluded: 1,
+    });
+  });
+
+  void it("an unmarked plan is completely unaffected — additive only", () => {
+    assert.deepEqual(countChecklistProgressV1(CHECKLIST_PLAN_OF_RECORD), {
+      total: 5,
+      checked: 0,
+      remaining: 5,
+      excluded: 0,
+    });
+  });
+});
+
+void describe("a round can record work completed in an earlier round", () => {
+  const PLAN = [
+    "<!-- ensemble:implementation-checklist -->",
+    "",
+    "- [ ] Add the `databaseWaking` state to the dashboard API",
+    "- [ ] Wire the SPA to retry on that state",
+  ].join("\n");
+
+  const RESPONSE_WITH_VALID_CLAIM = [
+    "## Files Changed",
+    "",
+    "- `src/api.ts` — no change this round; investigated only",
+    "",
+    "## Plan Item Checklist",
+    "",
+    `- Add the \`databaseWaking\` state to the dashboard API — done ${RETROACTIVE_TICK_MARKER_V1} — app.ts:194 returns databaseWaking: true, covered by app.test.ts:616`,
+    "- Wire the SPA to retry on that state — not reached — deferred to a later round",
+  ].join("\n");
+
+  void it("parses a retroactive claim from the summary's own Plan Item Checklist section", () => {
+    const own = splitSummaryAtEchoV1(RESPONSE_WITH_VALID_CLAIM).own;
+    const claims = collectRetroactiveTickClaimsV1(own);
+    assert.deepEqual(claims, [
+      {
+        itemText: "Add the `databaseWaking` state to the dashboard API",
+        evidence: "app.ts:194 returns databaseWaking: true, covered by app.test.ts:616",
+      },
+    ]);
+  });
+
+  void it("merges a plan line that is unticked on disk but claimed retroactively with evidence", () => {
+    const result = mergeChecklistProgressV1(PLAN, RESPONSE_WITH_VALID_CLAIM);
+    assert.equal(result.kind, "merged");
+    if (result.kind === "merged") {
+      assert.ok(
+        result.content.includes("- [x] Add the `databaseWaking` state to the dashboard API"),
+        "the retroactively-claimed item must be ticked"
+      );
+      assert.ok(
+        result.content.includes("- [ ] Wire the SPA to retry on that state"),
+        "an item not claimed must stay unticked"
+      );
+      assert.deepEqual(result.retroactiveTicks, [
+        {
+          itemText: "Add the `databaseWaking` state to the dashboard API",
+          evidence: "app.ts:194 returns databaseWaking: true, covered by app.test.ts:616",
+        },
+      ]);
+    }
+  });
+
+  void it("does not merge a retroactive claim with no evidence, and surfaces it like an unmatched tick", () => {
+    const noEvidence = [
+      "## Files Changed",
+      "",
+      "- (none)",
+      "",
+      "## Plan Item Checklist",
+      "",
+      `- Add the \`databaseWaking\` state to the dashboard API — done ${RETROACTIVE_TICK_MARKER_V1}`,
+    ].join("\n");
+    const result = mergeChecklistProgressV1(PLAN, noEvidence);
+    assert.equal(result.kind, "no-match");
+    if (result.kind === "no-match") {
+      assert.deepEqual(result.unmatchedSample, [
+        "Add the `databaseWaking` state to the dashboard API",
+      ]);
+    }
+  });
+
+  void it("a done entry without the retroactive marker is ordinary Plan Item Checklist prose, not a claim", () => {
+    const ordinaryDone = [
+      "## Files Changed",
+      "",
+      "- (none)",
+      "",
+      "## Plan Item Checklist",
+      "",
+      "- Add the `databaseWaking` state to the dashboard API — done — built and tested this round",
+    ].join("\n");
+    const own = splitSummaryAtEchoV1(ordinaryDone).own;
+    assert.deepEqual(collectRetroactiveTickClaimsV1(own), []);
+    // With no echo and no valid retroactive claim, this is a plain no-report.
+    assert.deepEqual(mergeChecklistProgressV1(PLAN, ordinaryDone), { kind: "no-report" });
+  });
+
+  void it("an echo tick and a retroactive claim in the same response both apply", () => {
+    const both = [
+      "<!-- ensemble:implementation-checklist -->",
+      "",
+      "- [x] Add the `databaseWaking` state to the dashboard API",
+      "- [ ] Wire the SPA to retry on that state",
+      "",
+      "## Files Changed",
+      "",
+      "- `src/api.ts` — retry wiring",
+      "",
+      "## Plan Item Checklist",
+      "",
+      "- Add the `databaseWaking` state to the dashboard API — done — built this round",
+      `- Wire the SPA to retry on that state — done ${RETROACTIVE_TICK_MARKER_V1} — components.tsx:115 already wired`,
+    ].join("\n");
+    const merged = mergedContent(mergeChecklistProgressV1(PLAN, both));
+    assert.ok(merged.includes("- [x] Add the `databaseWaking` state to the dashboard API"));
+    assert.ok(merged.includes("- [x] Wire the SPA to retry on that state"));
   });
 });

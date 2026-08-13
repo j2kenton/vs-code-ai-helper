@@ -15,7 +15,11 @@
  *     attempt settled with a pre-response outcome — completed output,
  *     questions, provider-declared failure, malformed output, correlation
  *     mismatch, overflow, cancellation, and response-started transport
- *     failure are terminal (AC-RUNNER-05);
+ *     failure are terminal (AC-RUNNER-05). The one caller-driven exception is
+ *     `malformedResultPreFallback`, reported only when the coordinator has
+ *     already committed to advancing to the next ranked candidate for a
+ *     malformed result (2026-08-12 field report, item 2) — see its own doc
+ *     comment on `AttemptOutcomeKindV1`;
  *  5. no attempt or reservation is ever revisited.
  *
  * The session only accounts identities — it never invokes a provider
@@ -50,15 +54,29 @@ export class ProviderSelectionPolicyErrorV1 extends Error {
 
 /**
  * How an attempt settled, as reported by the coordinator after decoding the
- * broker result (and, for completed frames, the envelope). Exactly two
+ * broker result (and, for completed frames, the envelope). Exactly three
  * outcomes leave the session open for an explicit fallback reservation; the
  * rest are terminal (plan §3.3).
+ *
+ * `malformedResultPreFallback` (2026-08-12 field report, item 2) is a
+ * DISTINCT bookkeeping outcome from `malformedResult`, not a reclassification
+ * of it: `malformedResult` itself stays terminal (AC-RUNNER-05 is unchanged —
+ * a malformed response the coordinator has decided NOT to retry still closes
+ * the session exactly as before). This new kind is reported only when the
+ * coordinator has already decided, before calling `reportAttemptOutcome`,
+ * that it will immediately reserve and invoke the next ranked candidate for
+ * the SAME operation — the malformed-result analogue of the pre-response
+ * `transportFailurePreResponse` path, which established the same shape for a
+ * different terminal-outcome family. The `TaskActionOutcomeV1` returned to
+ * the caller if candidates run out is still `{ kind: "malformedResult", ... }`;
+ * this session-level kind never leaks past `taskActionCoordinatorV1.ts`.
  */
 export type AttemptOutcomeKindV1 =
   | "completed"
   | "questions"
   | "providerDeclaredFailure"
   | "malformedResult"
+  | "malformedResultPreFallback"
   | "resultCorrelationMismatch"
   | "overflow"
   | "providerCancelled"
@@ -72,6 +90,7 @@ export const FALLBACK_ELIGIBLE_ATTEMPT_OUTCOMES_V1: ReadonlySet<AttemptOutcomeKi
   new Set<AttemptOutcomeKindV1>([
     "transportFailurePreResponse",
     "providerUnavailablePreInvocation",
+    "malformedResultPreFallback",
   ]);
 
 export interface SelectionSessionBindingV1 {

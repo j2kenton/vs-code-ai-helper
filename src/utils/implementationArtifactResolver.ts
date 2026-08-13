@@ -15,6 +15,7 @@ import {
   ChecklistProgressV1,
   collectChecklistItemKeysV1,
   countChecklistProgressV1,
+  declaresNoChecklistChangeV1,
   hasImplementationChecklistV1,
   splitSummaryAtEchoV1,
 } from "./implementationChecklist";
@@ -214,7 +215,12 @@ export function describeImplementationSummaryShapeIssue(
     // Only the echo region counts. Searching the whole response let a
     // `## Verification` box whose text happened to match a plan item satisfy
     // the echo requirement with no echo present at all.
-    !echoesPlanChecklist(splitSummaryAtEchoV1(trimmed).echo, expectations.planChecklist)
+    !echoesPlanChecklist(splitSummaryAtEchoV1(trimmed).echo, expectations.planChecklist) &&
+    // A round that fixed a review blocker without ticking any checkbox has
+    // nothing to echo — the marker is its explicit, reasoned statement of
+    // that, and is accepted in place of the echo rather than rejected as a
+    // missing one. See NO_CHECKLIST_CHANGE_MARKER_V1's doc comment.
+    !declaresNoChecklistChangeV1(trimmed)
   ) {
     missing.push("the plan's implementation checklist, echoed with updated checkbox state");
   }
@@ -345,19 +351,34 @@ export function buildSyntheticImplementationSummaryV1(
   ].join("\n");
 }
 
-/** The stamp written in place of a round's unusable summary. */
+/**
+ * The stamp written in place of a round's unusable summary.
+ *
+ * `roundChangedFiles` defaults to `true` (the common case: the round DID
+ * write files, just not a usable summary of them) but must be passed as
+ * `false` for the "nothingToFixRoutesToReview" zero-change round that still
+ * rejects on summary shape — otherwise this stamp falsely claims edits were
+ * kept when the round changed nothing at all.
+ */
 export function buildUnusableImplementationSummaryV1(
   reason: string,
-  runLogName: string
+  runLogName: string,
+  roundChangedFiles = true
 ): string {
+  const roundOutcomeClause = roundChangedFiles
+    ? "completed and changed files"
+    : "completed without changing any files";
+  const editsClause = roundChangedFiles
+    ? "Its edits were kept and recorded for review, but there are no usable"
+    : "This round changed no files, so there is nothing new recorded for review, and there are no usable";
   return [
     IMPLEMENTATION_SUMMARY_UNUSABLE_MARKER_V1,
     "",
     "# Implementation Summary Unusable",
     "",
-    `The last implementation round completed and changed files, but ${reason}.`,
+    `The last implementation round ${roundOutcomeClause}, but ${reason}.`,
     "",
-    "Its edits were kept and recorded for review, but there are no usable",
+    editsClause,
     "implementation notes to review against, so review is paused until another",
     `round produces them. The provider's full response is in \`${runLogName}\`.`,
     "",
