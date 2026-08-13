@@ -12,6 +12,28 @@ out/**
 coverage/**
 node_modules/**
 
+# The workspace packages and the mobile/web app. NONE of this belongs in the
+# extension: esbuild bundles src/extension.ts with `vscode` as the only
+# external, and nothing under src/ imports these packages, so the shipped
+# dist/extension.js does not reference a byte of it.
+#
+# Without these lines 671 files shipped, including
+# packages/ensemble-control-plane/.env.local (the KEK boot secret plus BOTH
+# OAuth client secrets) and control-plane.sqlite (session records and
+# encrypted key envelopes). .gitignore does NOT protect against this — vsce
+# ignores .gitignore entirely whenever a .vscodeignore exists, which is the
+# same trap documented for .ensemble/ below.
+apps/**
+packages/**
+
+# Defence in depth for the two file classes above, so a new package or a
+# relocated app cannot reintroduce the leak by sitting outside those globs.
+**/.env
+**/.env.*
+**/*.sqlite
+**/*.sqlite-journal
+**/*.db
+
 # Task meta folders. These hold run logs, which contain full AI prompts and
 # context packs (verbatim source excerpts, absolute local paths) — the same
 # content commitAndPushTask deliberately excludes from commits and DISCLAIMER.md
@@ -54,3 +76,8 @@ yarn.lock
 *.vsix
 dist/**/*.map
 dist/meta.json
+
+# Local run output. Untracked, so .gitignore never had to cover it — but vsce
+# does not read .gitignore, so these shipped: three stray suite logs totalling
+# ~850KB of local absolute paths and test names.
+*.log
