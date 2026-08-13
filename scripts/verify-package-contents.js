@@ -113,6 +113,38 @@ function buildRules(taskRoots) {
     {
       label: "stray root implementation artifact",
       test: (file) => file === "plan-final.md",
+    },
+    {
+      // The 2026-08-13 near-miss: the pnpm workspace added apps/ and
+      // packages/, .vscodeignore was not updated, and 671 files were staged
+      // for the marketplace — including a control-plane .env.local holding the
+      // KEK boot secret and BOTH OAuth client secrets, plus a sqlite database
+      // of session records and encrypted key envelopes.
+      //
+      // Only the MAX_FILES ceiling caught it, and only because the workspace
+      // happened to be large. A single package containing one .env.local would
+      // have passed silently, and the ceiling message invites raising the
+      // limit — which would have shipped the secrets. Credential material
+      // needs a rule that names it, not an incidental size check.
+      label: "credential material (env files, databases, keys)",
+      test: (file) => {
+        const name = file.split("/").pop() ?? file;
+        return (
+          /^\.env(\..*)?$/.test(name) ||
+          /\.(sqlite|sqlite-journal|sqlite-wal|db)$/.test(name) ||
+          /\.(pem|p12|pfx|keystore|jks)$/.test(name) ||
+          name === "id_rsa" ||
+          name === ".npmrc"
+        );
+      },
+    },
+    {
+      label: 'workspace packages and apps ("packages/", "apps/")',
+      test: (file) => file.startsWith("packages/") || file.startsWith("apps/"),
+    },
+    {
+      label: "local run output (*.log)",
+      test: (file) => /\.log$/.test(file),
     }
   );
 
