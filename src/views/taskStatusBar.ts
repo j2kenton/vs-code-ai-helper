@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import { STAGE_DISPLAY_NAMES, STAGE_ORDER } from "../types/taskProgress";
+import { STAGE_DISPLAY_NAMES } from "../types/taskProgress";
 import { IncompleteTask } from "../types/incompleteTask";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { taskOperations } from "../utils/taskOperations";
@@ -84,19 +84,17 @@ export class TaskStatusBar implements vscode.Disposable {
     }
 
     const stage = taskToShow.progress.currentStage;
-    const stepNumber = STAGE_ORDER.indexOf(stage) + 1;
-    const totalSteps = STAGE_ORDER.length;
     const isPaused = taskToShow.progress.status === "paused";
     const statusLabel = isPaused ? "paused" : "active";
 
-    // Text: Checklist, folderName, stage display name, step progress, status
-    this.item.text = `${icon} ${taskToShow.folderName}: ${STAGE_DISPLAY_NAMES[stage]} (${stepNumber}/${totalSteps})${isPaused ? " [paused]" : ""}`;
+    // Text: Checklist, folderName, stage display name, status
+    this.item.text = `${icon} ${taskToShow.folderName}: ${STAGE_DISPLAY_NAMES[stage]}${isPaused ? " [paused]" : ""}`;
     this.item.tooltip = new vscode.MarkdownString(
       [
         `**Ensemble — ${statusLabel} task**`,
         "",
         `Task: \`${taskToShow.folderName}\``,
-        `Stage: **${STAGE_DISPLAY_NAMES[stage]}** (step ${stepNumber} of ${totalSteps})`,
+        `Stage: **${STAGE_DISPLAY_NAMES[stage]}**`,
         `Last updated: ${new Date(
           taskToShow.progress.updatedAt
         ).toLocaleString()}`,

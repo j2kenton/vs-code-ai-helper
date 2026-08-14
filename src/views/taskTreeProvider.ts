@@ -231,8 +231,6 @@ export class TaskNode extends vscode.TreeItem {
       : taskIdentityKey(task);
 
     const currentStage = task.progress.currentStage;
-    const stepNumber = STAGE_ORDER.indexOf(currentStage) + 1;
-    const totalSteps = STAGE_ORDER.length;
     const isPaused = task.progress.status === "paused";
 
     // Only task-level operations (commit/push, Complete and Move On, Release)
@@ -262,15 +260,15 @@ export class TaskNode extends vscode.TreeItem {
         "comment-unresolved",
         new vscode.ThemeColor("charts.yellow")
       );
-      this.description = `${taskLevelOp.label} · waiting for you · ${STAGE_DISPLAY_NAMES[currentStage]} · step ${stepNumber} of ${totalSteps}`;
+      this.description = `${taskLevelOp.label} · waiting for you · ${STAGE_DISPLAY_NAMES[currentStage]}`;
     } else if (taskLevelOp) {
       this.iconPath = new vscode.ThemeIcon(
         "loading~spin",
         new vscode.ThemeColor("charts.blue")
       );
-      this.description = `${taskLevelOp.label}… · ${STAGE_DISPLAY_NAMES[currentStage]} · step ${stepNumber} of ${totalSteps}`;
+      this.description = `${taskLevelOp.label}… · ${STAGE_DISPLAY_NAMES[currentStage]}`;
     } else if (isPaused) {
-      this.description = `Paused · ${STAGE_DISPLAY_NAMES[currentStage]} · step ${stepNumber} of ${totalSteps}`;
+      this.description = `Paused · ${STAGE_DISPLAY_NAMES[currentStage]}`;
       this.iconPath = new vscode.ThemeIcon(
         "debug-pause",
         new vscode.ThemeColor("charts.orange")
@@ -288,7 +286,7 @@ export class TaskNode extends vscode.TreeItem {
         new vscode.ThemeColor("charts.green")
       );
     } else {
-      this.description = `${STAGE_DISPLAY_NAMES[currentStage]} · step ${stepNumber} of ${totalSteps}`;
+      this.description = STAGE_DISPLAY_NAMES[currentStage];
       this.iconPath = new vscode.ThemeIcon(
         "play-circle",
         new vscode.ThemeColor("charts.blue")

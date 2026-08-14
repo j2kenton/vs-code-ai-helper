@@ -844,6 +844,21 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           .model-row.skipped .model-combobox {
             opacity: 0.55;
           }
+          /* The fallback-strategy dropdown sits in the same [checkbox]
+             [combo] [×] row shape as the model rows: invisible spacers in
+             the checkbox and × columns keep its left/right edges flush
+             with the combo boxes above and below, and the compact font/
+             padding match the combo inputs' height. */
+          .model-row .strategy-select {
+            flex: 1;
+            width: auto;
+            min-width: 0;
+            font-size: var(--ensemble-small-font-size);
+            padding: var(--ensemble-space-half) var(--ensemble-space-1);
+          }
+          .model-row .strategy-spacer {
+            visibility: hidden;
+          }
           .stage-hint {
             margin: 0 0 var(--ensemble-space-2);
             font-size: var(--ensemble-small-font-size);
@@ -1707,11 +1722,15 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                 '</div>' +
                 '<div class="form-row">' +
                   '<label for="strategy-' + escapeHtml(stage) + '" class="field-label">Fallback strategy:</label>' +
-                  '<select id="strategy-' + escapeHtml(stage) + '">' +
-                    '<option value="switch-to-backup"' + (setting.strategy === 'switch-to-backup' ? ' selected' : '') + '>Switch to Backup</option>' +
-                    '<option value="pause-and-resume"' + (setting.strategy === 'pause-and-resume' ? ' selected' : '') + '>Pause until available</option>' +
-                    '<option value="alert-and-wait"' + (setting.strategy === 'alert-and-wait' ? ' selected' : '') + '>Alert and wait</option>' +
-                  '</select>' +
+                  '<div class="model-row">' +
+                    '<input type="checkbox" class="strategy-spacer" disabled aria-hidden="true" tabindex="-1">' +
+                    '<select id="strategy-' + escapeHtml(stage) + '" class="strategy-select">' +
+                      '<option value="switch-to-backup"' + (setting.strategy === 'switch-to-backup' ? ' selected' : '') + '>Switch to Backup</option>' +
+                      '<option value="pause-and-resume"' + (setting.strategy === 'pause-and-resume' ? ' selected' : '') + '>Pause until available</option>' +
+                      '<option value="alert-and-wait"' + (setting.strategy === 'alert-and-wait' ? ' selected' : '') + '>Alert and wait</option>' +
+                    '</select>' +
+                    '<button type="button" class="secondary remove-backup strategy-spacer" disabled aria-hidden="true" tabindex="-1">×</button>' +
+                  '</div>' +
                 '</div>' +
                 '<div class="form-row backup-section">' +
                   '<div class="field-label backup-caption" hidden>Backup models (tried in order)</div>' +
