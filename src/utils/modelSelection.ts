@@ -933,10 +933,7 @@ function createSeededClineModels(): readonly DiscoveredCliModel[] {
     ),
     ...createModelWithVariants("cline-pass/glm-5.2", "GLM-5.2"),
     ...createModelWithVariants("cline-free/glm-5.2", "GLM-5.2 (Free)"),
-    ...createModelWithVariants(
-      "cline-pass/kimi-k3",
-      "Kimi K3 [may be unstable, higher usage]"
-    ),
+    ...createModelWithVariants("cline-pass/kimi-k3", "Kimi K3"),
     ...createModelWithVariants(
       "cline-pass/kimi-k2.7-code",
       "Kimi K2.7 Code"

@@ -3,7 +3,7 @@ import * as crypto from "crypto";
 import * as path from "path";
 import { STAGE_DISPLAY_NAMES, TaskStage } from "../types/taskProgress";
 import { notifyDesktop } from "../utils/desktopNotifier";
-import { taskOperations } from "../utils/taskOperations";
+import { formatTaskNameForDisplay, taskOperations } from "../utils/taskOperations";
 import { NotificationRouter, getNotificationRouterStatus } from "../utils/notificationRouter";
 import { assertLegacyAiRouteAllowedV0 } from "../services/legacyAiActionSafetyGateV0";
 import {
@@ -961,7 +961,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       label = "Global Assistant — cross-task actions (Uses the model currently set for Task Description)";
     } else if (target) {
       const taskLabel = target.taskName ?? target.taskFolderPath.replace(/\\/g, "/").split("/").pop() ?? "task";
-      label = `${taskLabel} — ${STAGE_DISPLAY_NAMES[target.stage]} stage chat`;
+      label = `${formatTaskNameForDisplay(taskLabel)} — ${STAGE_DISPLAY_NAMES[target.stage]} stage chat`;
     }
     // Attribution comments belong in generated artifact files, not in a
     // conversation — strip them from every displayed message (including

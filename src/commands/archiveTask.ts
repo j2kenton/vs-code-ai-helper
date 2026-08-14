@@ -108,7 +108,7 @@ export async function archiveTask(
   try {
     await runTrackedOperation(
       resolved.taskFolderPath,
-      { label: "Archive Task", taskName: resolved.folderName, kind: "pause-task" },
+      { label: "Archive Task", taskName: resolved.progress.displayName ?? resolved.folderName, kind: "pause-task" },
       async () => {
         const patched = await patchTaskProgressStrictV1(taskUri, (current) => ({
           ...current,
@@ -194,7 +194,7 @@ export async function resumeArchivedTask(
   try {
     await runTrackedOperation(
       resolved.taskFolderPath,
-      { label: "Resume Task", taskName: resolved.folderName, kind: "resume-task" },
+      { label: "Resume Task", taskName: resolved.progress.displayName ?? resolved.folderName, kind: "resume-task" },
       async () => {
         const activated = await activateTask(
           inventory,

@@ -79,5 +79,8 @@ dist/meta.json
 
 # Local run output. Untracked, so .gitignore never had to cover it — but vsce
 # does not read .gitignore, so these shipped: three stray suite logs totalling
-# ~850KB of local absolute paths and test names.
+# ~850KB of local absolute paths and test names. `.tmp-*` and `*.done` cover
+# throwaway root-level test-runner scripts and their exit-code marker files.
 *.log
+.tmp-*
+*.done

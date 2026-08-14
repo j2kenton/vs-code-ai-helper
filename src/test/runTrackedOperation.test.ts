@@ -6,6 +6,8 @@
  * Notifications rows), and leaf-stage spinner derivation (getActiveStages).
  */
 import * as assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { describe, it } from "node:test";
 import * as vscode from "vscode";
 import {
@@ -264,5 +266,48 @@ void describe("runTrackedOperation", () => {
     } finally {
       deactivateNotificationRouter();
     }
+  });
+
+  void it("stores the spec's taskName verbatim — unquoted; quoting is a render-time concern", async () => {
+    const taskPath = `/tmp/rto-name-${Math.random()}`;
+    let seen: TaskOperationSnapshot | undefined;
+
+    await runTrackedOperation(
+      taskPath,
+      { label: "Rename Task", taskName: "ff for 1 pt 2" },
+      () => {
+        seen = taskOperations.getTaskOperations(taskPath)[0];
+        return Promise.resolve();
+      }
+    );
+
+    assert.ok(seen);
+    assert.equal(seen.taskName, "ff for 1 pt 2");
+    assert.equal(seen.taskName.includes('"'), false, "the stored taskName must carry no quote characters");
+  });
+
+  void it("source wiring: registers via begin() synchronously, with no progress-file read on the admission path", () => {
+    // Same indexOf-over-source convention as stage3ActionMatrix.test.ts:
+    // the optimistic-UI/admission contract is that runTrackedOperation's
+    // body reaches taskOperations.begin() before any await or task-progress
+    // read, so the Notifications row appears (or the busy refusal fires)
+    // without any I/O.
+    const source = fs.readFileSync(
+      path.join(process.cwd(), "src", "utils", "taskOperations.ts"),
+      "utf8"
+    );
+    const fnStart = source.indexOf("export async function runTrackedOperation");
+    assert.ok(fnStart >= 0, "runTrackedOperation must exist in taskOperations.ts");
+    const beginCall = source.indexOf("taskOperations.begin(taskPath, spec)", fnStart);
+    assert.ok(beginCall >= 0, "runTrackedOperation must register through taskOperations.begin");
+    const admissionPath = source.slice(fnStart, beginCall);
+    assert.ok(
+      !admissionPath.includes("await"),
+      "no await may precede begin() — registration must stay synchronous at entry"
+    );
+    assert.ok(
+      !/readTaskProgress|task-progress\.json/.test(admissionPath),
+      "no task-progress read may precede begin() on the admission path"
+    );
   });
 });

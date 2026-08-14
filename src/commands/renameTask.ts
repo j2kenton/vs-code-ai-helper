@@ -3,7 +3,11 @@ import { TaskInventory } from "../state/taskInventory";
 import { TASK_DESCRIPTION_FILENAME, TASK_FILENAME } from "../types/taskProgress";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { resolveTaskContext, ResolvedTaskContext } from "../utils/resolveTaskContext";
-import { runTrackedOperation } from "../utils/taskOperations";
+import {
+  runTrackedOperation,
+  taskOperations,
+  TASK_NAME_WRITE_CONFLICT_KEY,
+} from "../utils/taskOperations";
 import { parseTaskDocument } from "../utils/taskDescriptionDocument";
 import { TaskNode } from "../views/taskTreeProvider";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
@@ -40,6 +44,43 @@ async function resolve(inventory: TaskInventory, arg?: TaskArg) {
   return resolveTaskContext(inventory, arg, { allowPaused: true });
 }
 
+/**
+ * Rename never contends for the task's exclusive operation lock (both rename
+ * operations register with `exclusive: false`): the displayName patch goes
+ * through patchTaskProgressStrictV1, which merges onto freshly-read state
+ * under its own journaled lock, so it is safe beside a running
+ * implementation, review, or publish operation. The one stage it must NOT
+ * run beside is Task Description generation — the requested product
+ * boundary. That run never writes the name (naming is owned exclusively by
+ * the rename actions, per handleDraftOutcomeV1 in draftTaskWithAI.ts), but
+ * it works from the name captured when it was admitted — its Notifications
+ * row, chat interaction labels, and run log — so a mid-run rename would
+ * desync those surfaces.
+ *
+ * This guard exists for the quality of the message only — the exclusion
+ * itself is enforced atomically by the operation registry: both rename
+ * operations and the Task Description operation register with
+ * TASK_NAME_WRITE_CONFLICT_KEY, so `begin` refuses either while the other is
+ * active, with no window between check and registration.
+ *
+ * @returns true (after showing the explanatory warning) when rename must
+ * wait; false when it may proceed.
+ *
+ * @internal exported for testing
+ */
+export function refuseRenameWhileDescStageRuns(taskFolderPath: string): boolean {
+  const descRunning = taskOperations
+    .getTaskOperations(taskFolderPath)
+    .some((op) => op.state === "running" && op.stage === "desc");
+  if (!descRunning) {
+    return false;
+  }
+  NotificationRouter.showWarning(
+    "Renaming is unavailable while the Task Description is being generated, because that run works from the task's current name. Wait for it to finish, then rename."
+  );
+  return true;
+}
+
 export async function renameTask(
   inventory: TaskInventory,
   arg?: TaskArg,
@@ -51,6 +92,7 @@ export async function renameTask(
 
   const task = await resolve(inventory, arg);
   if (!task) return;
+  if (refuseRenameWhileDescStageRuns(task.taskFolderPath)) return;
 
   const name = await vscode.window.showInputBox({
     prompt: "Task name",
@@ -60,13 +102,21 @@ export async function renameTask(
   });
   if (name === undefined) return;
 
+  // The input box can sit open for as long as the user likes, so a Task
+  // Description run may have started meanwhile — re-check for the
+  // explanatory message. Even if one starts between this check and begin(),
+  // the shared conflict key makes begin() refuse the rename atomically.
+  if (refuseRenameWhileDescStageRuns(task.taskFolderPath)) return;
+
   // Tracked instant mutation (taxonomy: rename-task / terminal-always). The
   // input box stays outside the operation; the terminal Notifications entry
   // (including the new name, via report()) is recorded centrally by the
-  // operation-notification bridge.
+  // operation-notification bridge. Non-exclusive: see
+  // refuseRenameWhileDescStageRuns — rename is safe beside every running
+  // stage except Task Description generation, which the conflict key blocks.
   await runTrackedOperation(
     task.taskFolderPath,
-    { label: "Rename Task", taskName: task.folderName, kind: "rename-task" },
+    { label: "Rename Task", taskName: task.progress.displayName ?? task.folderName, kind: "rename-task", exclusive: false, conflictKeys: [TASK_NAME_WRITE_CONFLICT_KEY] },
     async (op) => {
       await patchTaskProgressStrictV1(vscode.Uri.file(task.taskFolderPath), (current) => ({
         ...current,
@@ -248,6 +298,7 @@ export async function renameTaskWithAI(
 
   const task = await resolve(inventory, arg);
   if (!task) return;
+  if (refuseRenameWhileDescStageRuns(task.taskFolderPath)) return;
 
   const readText = async (fileName: string): Promise<string> => {
     try {
@@ -273,9 +324,14 @@ export async function renameTaskWithAI(
   const consented = await ensureAiConsent(context);
   if (!consented) return;
 
+  // The consent prompt can pause the flow indefinitely — re-check for the
+  // explanatory message; begin()'s conflict key enforces the exclusion
+  // atomically regardless (see refuseRenameWhileDescStageRuns).
+  if (refuseRenameWhileDescStageRuns(task.taskFolderPath)) return;
+
   await runTrackedOperation(
     task.taskFolderPath,
-    { label: "Rename Task with AI", taskName: task.folderName, kind: "rename-task" },
+    { label: "Rename Task with AI", taskName: task.progress.displayName ?? task.folderName, kind: "rename-task", exclusive: false, conflictKeys: [TASK_NAME_WRITE_CONFLICT_KEY] },
     async (op) => {
       const fallbackCts = new vscode.CancellationTokenSource();
       const token = op.token ?? fallbackCts.token;

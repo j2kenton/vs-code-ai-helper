@@ -135,6 +135,19 @@ void describe("ChatViewProvider.ask() task-switch behavior", () => {
     assert.match(html, /className\s*=\s*x\.role\s*===\s*'user'\s*\?\s*'msg-user'\s*:\s*'msg-agent'/);
   });
 
+  void it("renders the stage-chat header with the task name in quotes", () => {
+    // The header label is composed host-side in render(); the source-wiring
+    // assertion pins that it goes through the shared quoted-name formatter
+    // (taskOperations.formatTaskNameForDisplay), the same one Notifications
+    // rows use, so a task always reads as `"name" — <Stage> stage chat`.
+    const source = fs.readFileSync("src/views/chatView.ts", "utf8");
+    assert.match(
+      source,
+      /label = `\$\{formatTaskNameForDisplay\(taskLabel\)\} — \$\{STAGE_DISPLAY_NAMES\[target\.stage\]\} stage chat`/,
+      "the stage-chat header must quote the task name via formatTaskNameForDisplay"
+    );
+  });
+
   void it("writes the question to its own task but does not refocus/retarget the view when a different task is current", async () => {
     const rf = installReadFileBridge();
     const cmds = installExecuteCommandCapture();

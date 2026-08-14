@@ -25,9 +25,26 @@ export interface TaskOperationSpec {
   label: string;              // "Run Implementation" — reused by showTaskBusyWarning
   stage?: TaskStage;          // omit for task-level ops (commit/push, mark-done, Release)
   taskName?: string;          // for the Notifications row; defaults to basename(key)
-  exclusive?: boolean;        // default true. false = advisory (chat): never refuses/refused,
+  /**
+   * Default true. false = advisory (chat, rename): holds no claim on the
+   * task's exclusive lock — it is never refused by, and never refuses, an
+   * exclusive operation on lock grounds. Advisory operations can still be
+   * excluded selectively (in both directions) via `conflictKeys` below.
+   */
+  exclusive?: boolean;
   /** Taxonomy classification (operationTaxonomy.ts). */
   kind?: OperationKind;
+  /**
+   * Selective mutual exclusion, orthogonal to `exclusive`: `begin` refuses a
+   * root operation when any active operation on the same task shares one of
+   * its conflict keys — even when neither side holds the exclusive lock.
+   * This is how two non-exclusive-vs-exclusive operations that mutate the
+   * same task field (e.g. the display name) are kept from overlapping
+   * ATOMICALLY at admission, instead of via a caller-side check that a later
+   * `begin` could race past. Children never declare conflicts (the parent's
+   * admission already covered them).
+   */
+  conflictKeys?: readonly string[];
   /**
    * Creates a CancellationTokenSource for this operation. The token is
    * exposed on the handle (and via `tokenFor` for code deep in the stack that
@@ -94,6 +111,8 @@ export interface TaskOperationSnapshot {
   readonly finishedAt?: number;
   /** See TaskOperationHandle.setWaitingForUser. */
   readonly waitingForUser: boolean;
+  /** See TaskOperationSpec.conflictKeys. */
+  readonly conflictKeys?: readonly string[];
   /**
    * Stringified vscode.Uri of the artifact/run-log this operation produced,
    * when known (set via setResultTargetUri/setResultTargetUriForTask). Always
@@ -126,7 +145,21 @@ interface MutableOperation {
   finishedAt?: number;
   resultTargetUri?: string;
   waitingForUser: boolean;
+  conflictKeys?: readonly string[];
 }
+
+/**
+ * Conflict key shared by the operations that must never overlap around the
+ * task's display name: Rename Task and Rename Task with AI (which write it)
+ * and Task Description generation (which never writes it — naming is owned
+ * exclusively by the rename actions, per handleDraftOutcomeV1 in
+ * draftTaskWithAI.ts — but runs under the name captured at admission, so a
+ * mid-run rename would desync its Notifications row, chat labels, and run
+ * log). Declaring it on both sides makes rename-vs-description exclusion
+ * atomic at `begin`, closing the window where a description run could start
+ * while the rename dialog (or AI naming) is still in flight.
+ */
+export const TASK_NAME_WRITE_CONFLICT_KEY = "task-name-write";
 
 /**
  * The one canonical task identity key. Delegates to taskRoot's normalizePath so
@@ -166,6 +199,17 @@ export function linkCancellationTokens(
   };
 }
 
+/**
+ * Render a task name for user-facing display, wrapped in straight double
+ * quotes: Notifications rows and terminal entries read `Rename Task —
+ * "ff for 1 pt 2": completed`. The semantic `taskName` stored on operation
+ * snapshots (and in persisted entries) stays unquoted — quoting happens only
+ * at the render boundary, so historical data never carries quote characters.
+ */
+export function formatTaskNameForDisplay(taskName: string): string {
+  return `"${taskName}"`;
+}
+
 export class TaskOperationRegistry implements vscode.Disposable {
   private readonly _onDidChange = new vscode.EventEmitter<void>();
   readonly onDidChange: vscode.Event<void> = this._onDidChange.event;
@@ -203,12 +247,23 @@ export class TaskOperationRegistry implements vscode.Disposable {
     // holds it. Registering them exclusive would deadlock every composite.
     const exclusive = !isChild && spec.exclusive !== false;
 
-    if (exclusive) {
-      // Check if there is already an exclusive operation on this key
+    // Admission is a single synchronous check, so both refusal rules below
+    // are atomic with registration — nothing can slip in between.
+    const conflictKeys = isChild ? undefined : spec.conflictKeys;
+    if (!isChild) {
       const active = this.operations.get(key);
       if (active) {
         for (const snap of active.values()) {
-          if (snap.exclusive) {
+          // Rule 1: at most one exclusive operation per task.
+          if (exclusive && snap.exclusive) {
+            return null; // Refused
+          }
+          // Rule 2: no two operations sharing a conflict key, regardless of
+          // exclusivity (see TaskOperationSpec.conflictKeys).
+          if (
+            conflictKeys &&
+            snap.conflictKeys?.some((k) => conflictKeys.includes(k))
+          ) {
             return null; // Refused
           }
         }
@@ -234,6 +289,7 @@ export class TaskOperationRegistry implements vscode.Disposable {
       cancellable,
       state: "running",
       waitingForUser: false,
+      conflictKeys,
     };
 
     let keyMap = this.operations.get(key);
@@ -562,7 +618,10 @@ export class TaskOperationRegistry implements vscode.Disposable {
 
   busyLabel(taskPath: string): string | undefined {
     const ops = this.getTaskOperations(taskPath);
-    const exclusiveOp = ops.find(o => o.exclusive);
+    // A refusal is usually the exclusive lock, but a conflict-key refusal can
+    // name a non-exclusive root (e.g. "Draft Task with AI" refused while a
+    // rename runs) — fall back to any root so the warning stays specific.
+    const exclusiveOp = ops.find(o => o.exclusive) ?? ops.find(o => o.parentId === undefined);
     return exclusiveOp?.label;
   }
 

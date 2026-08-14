@@ -15,6 +15,7 @@ import { resolveCurrentPlanUri, statIfExists } from "../utils/fileUtils";
 import { hasPreviousVersion } from "../utils/artifactBackups";
 import { readRedoSidecar, isRedoAvailableFromRecord } from "../utils/redoSidecar";
 import { resolveImplementationArtifact } from "../utils/implementationArtifactResolver";
+import { effectiveReviewProgressV1 } from "../utils/effectiveReviewProgress";
 import { parseReadiness } from "../utils/reviewReadiness";
 import { TaskInventory, TaskWithProgress } from "../state/taskInventory";
 import { TaskProgressRecoveryEntryV1 } from "../services/taskProgressDiscoveryV1";
@@ -323,8 +324,10 @@ export class StageNode extends vscode.TreeItem {
     public readonly stage: TaskStage,
     status: StageStatus,
     artifactUri: vscode.Uri | undefined,
-    /** Optional readiness info for review stages */
-    readiness?: { label: string },
+    /** Optional readiness info for review stages: the score label plus, when
+     * the review carries a usable progress marker, the checklist-reconciled
+     * step counts (see effectiveReviewProgressV1). */
+    readiness?: { label: string; progress?: { complete: number; total: number } },
     isScheduled: boolean = false,
     isMetaManaged: boolean = false,
     hasBackup: boolean = false,
@@ -380,7 +383,17 @@ export class StageNode extends vscode.TreeItem {
             escalated ? "warning" : "arrow-right",
             new vscode.ThemeColor(escalated ? "charts.orange" : "charts.blue")
           );
-          const base = readiness ? `current · ${readiness.label}` : "current";
+          // Score AND step progress at a glance: the score alone read as
+          // "finished" when the workflow had only completed some of the
+          // plan's steps (a loop back into implementation looked like a
+          // bug). A missing/malformed marker renders exactly the pre-existing
+          // score-only output.
+          const readinessLabel = readiness
+            ? readiness.progress
+              ? `${readiness.label} · ${readiness.progress.complete} of ${readiness.progress.total} steps`
+              : readiness.label
+            : undefined;
+          const base = readinessLabel ? `current · ${readinessLabel}` : "current";
           this.description = escalated ? `${base} · escalated` : base;
           break;
         }
@@ -422,6 +435,13 @@ export class StageNode extends vscode.TreeItem {
       ? (artifactUri ? `Open ${artifactName}` : `${artifactName} has not been created yet`)
       : STAGE_DISPLAY_NAMES[stage];
 
+    if (readiness?.progress) {
+      // The score on one line, a divider, then the step progress on the next
+      // — the two read as separate facts instead of one conflated number.
+      tooltipStr +=
+        `\n\nReview score: ${readiness.label}\n\n---\n\n` +
+        `${readiness.progress.complete} of ${readiness.progress.total} steps completed`;
+    }
     if (isScheduled) {
       this.description = this.description
         ? `${this.description} · scheduled`
@@ -519,11 +539,19 @@ export class ProgressRecoveryNode extends vscode.TreeItem {
 type TaskTreeNode = TaskNode | StageNode | EmptyTasksNode | ProgressRecoveryNode;
 
 /**
- * Try to read review readiness from an artifact file.
+ * Try to read review readiness (score) and the effective plan progress from
+ * a review artifact file. The progress is the same checklist-reconciled
+ * value the advance gates use (effectiveReviewProgressV1), read under the
+ * lenient policy so a tree render can never throw or notify — anything
+ * unreadable simply yields no progress, and the row renders score-only.
+ *
+ * @internal exported for testing
  */
-async function tryReadReadiness(
-  artifactUri: vscode.Uri | undefined
-): Promise<{ label: string } | undefined> {
+export async function tryReadReadiness(
+  artifactUri: vscode.Uri | undefined,
+  stage: TaskStage,
+  folderUri: vscode.Uri
+): Promise<{ label: string; progress?: { complete: number; total: number } } | undefined> {
   if (!artifactUri) {
     return undefined;
   }
@@ -531,7 +559,8 @@ async function tryReadReadiness(
     const content = await vscode.workspace.fs.readFile(artifactUri);
     const text = new TextDecoder().decode(content);
     const result = parseReadiness(text);
-    return { label: result.label };
+    const progress = await effectiveReviewProgressV1(folderUri, stage, text, "lenient");
+    return progress ? { label: result.label, progress } : { label: result.label };
   } catch {
     return undefined;
   }
@@ -963,9 +992,9 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
       // For review stages, only try to parse readiness when the stage is
       // current — done stages always render with the tick icon regardless of
       // readiness data present in the artifact.
-      let readiness: { label: string } | undefined;
+      let readiness: { label: string; progress?: { complete: number; total: number } } | undefined;
       if (isReviewStage(stage) && status === "current") {
-        readiness = await tryReadReadiness(artifactUri);
+        readiness = await tryReadReadiness(artifactUri, stage, task.folderUri);
       }
 
       const isStageScheduled = status === "current" && task.progress.scheduledRun !== undefined;

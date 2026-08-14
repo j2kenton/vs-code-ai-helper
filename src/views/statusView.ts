@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import { StatusSurface } from "../utils/notificationRouter";
-import { taskOperations } from "../utils/taskOperations";
+import { formatTaskNameForDisplay, taskOperations } from "../utils/taskOperations";
 import { TaskOperationSnapshot } from "../utils/taskOperations";
 import { terminalEntryFor } from "../utils/operationNotificationBridge";
 import { notificationFallbackUri } from "../utils/notificationContentProvider";
@@ -227,7 +227,7 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
 
   getTreeItem(element: StatusTreeNode): vscode.TreeItem {
     if (isOperationNode(element)) {
-      const label = `${element.label} — ${element.taskName}`;
+      const label = `${element.label} — ${formatTaskNameForDisplay(element.taskName)}`;
       const item = new vscode.TreeItem(label, vscode.TreeItemCollapsibleState.None);
       item.id = `running:${element.id}`;
       item.description = element.detail ?? (element.waitingForUser ? "waiting for you" : "running");

@@ -115,6 +115,29 @@ void describe("operationIndicators", () => {
       }
     });
 
+    void it("renders the live operation row with the task name in quotes (display name or folder-name fallback)", () => {
+      const withDisplayName = taskOperations.begin("/dev/task_1", {
+        label: "Rename Task",
+        taskName: "ff for 1 pt 2",
+      });
+      const withFolderFallback = taskOperations.begin("/dev/task_2", {
+        label: "Review",
+        taskName: "2026-08-14_task_2",
+      });
+      assert.ok(withDisplayName && withFolderFallback);
+
+      try {
+        const children = provider.getChildren() as StatusTreeNode[];
+        const opNodes = children.filter((n) => "kind" in n && n.kind === "operation");
+        const labels = opNodes.map((n) => String(provider.getTreeItem(n).label));
+        assert.ok(labels.includes('Rename Task — "ff for 1 pt 2"'), `got: ${JSON.stringify(labels)}`);
+        assert.ok(labels.includes('Review — "2026-08-14_task_2"'), `got: ${JSON.stringify(labels)}`);
+      } finally {
+        taskOperations.end(withDisplayName);
+        taskOperations.end(withFolderFallback);
+      }
+    });
+
     void it("shows the inline cancel action on a history entry only while its sourceOperationId is still a live cancellable root operation (D10)", () => {
       const op = taskOperations.begin("/dev/task_1", {
         label: "Fast Forward",

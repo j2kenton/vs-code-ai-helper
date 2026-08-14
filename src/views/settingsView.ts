@@ -666,6 +666,13 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           .model-combobox {
             position: relative;
           }
+          /* Compact combo: the input text matches the surrounding small
+             labels, and the reduced vertical padding shrinks the box height
+             accordingly. */
+          .model-combo-input {
+            font-size: var(--ensemble-small-font-size);
+            padding: var(--ensemble-space-half) var(--ensemble-space-1);
+          }
           .model-combo-input[disabled] {
             opacity: 0.55;
             cursor: not-allowed;
@@ -684,10 +691,11 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             box-shadow: 0 var(--ensemble-space-half) var(--ensemble-space-2) var(--vscode-widget-shadow);
           }
           .model-option {
-            padding: var(--ensemble-space-1) var(--ensemble-space-2);
+            padding: var(--ensemble-space-half) var(--ensemble-space-2);
             cursor: pointer;
             white-space: normal;
             overflow-wrap: anywhere;
+            font-size: var(--ensemble-small-font-size);
           }
           .model-option[aria-selected="true"],
           .model-option:hover {
@@ -847,6 +855,22 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           .add-backup {
             margin-top: var(--ensemble-space-3);
           }
+          /* Compact × remove control: smaller than a regular button but
+             still a comfortable click target, with the shared focus outline
+             (button:focus-visible above) unchanged. */
+          .remove-backup {
+            padding: 0 var(--ensemble-space-1);
+            font-size: var(--ensemble-small-font-size);
+            line-height: 1.6;
+          }
+          /* The three selection action buttons share one reduced text size,
+             with their leading icon laid out left of the label. */
+          #save-btn, #discard-btn, #save-providers-btn {
+            display: inline-flex;
+            align-items: center;
+            gap: var(--ensemble-space-1);
+            font-size: var(--ensemble-small-font-size);
+          }
           .backup-limit {
             margin-left: var(--ensemble-space-1);
             font-size: var(--ensemble-small-font-size);
@@ -878,8 +902,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         </div>
 
         <div class="btn-container" id="model-settings-buttons" hidden>
-          <button id="discard-btn" class="secondary" disabled title="Revert unsaved model selection changes back to the last saved settings">Discard Unsaved Changes</button>
-          <button id="save-btn" disabled title="Save the current model selection">Save Model Selection</button>
+          <button id="discard-btn" class="secondary" disabled title="Revert unsaved model selection changes back to the last saved settings"><svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" focusable="false"><path d="M6.78 1.72a.75.75 0 0 1 0 1.06L4.06 5.5H9a5.75 5.75 0 0 1 0 11.5H4.25a.75.75 0 0 1 0-1.5H9a4.25 4.25 0 0 0 0-8.5H4.06l2.72 2.72a.75.75 0 1 1-1.06 1.06l-4-4a.75.75 0 0 1 0-1.06l4-4a.75.75 0 0 1 1.06 0z"/></svg>Discard Unsaved Changes</button>
+          <button id="save-btn" disabled title="Save the current model selection"><svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" focusable="false"><path d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.75.75 0 0 1 1.06-1.06L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0z"/></svg>Save Model Selection</button>
         </div>
 
         <script nonce="${nonce}">
@@ -900,10 +924,36 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           let formDirty = false;
           let initialized = false;
           let extraBackupSeq = 0;
+          // The same save glyph the static Save Model Selection button
+          // renders — kept as a constant so Save Provider Selection shows
+          // the identical icon left of its label (a CSP-safe inline SVG,
+          // aria-hidden so screen readers announce the text label only).
+          const SAVE_ICON_SVG = '<svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" focusable="false"><path d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.75.75 0 0 1 1.06-1.06L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0z"/></svg>';
+          // Provider Selection dirty-tracking, independent of the model
+          // form's formDirty: pending checkbox states keyed by provider id,
+          // fed by the delegated change listener on #provider-selection.
+          // Emptied whenever the provider rows re-render from the last-saved
+          // enabledProviders map (init / providersRefreshed), at which point
+          // every checkbox matches that map by construction.
+          let pendingProviderChecks = {};
+          let providersDirty = false;
 
           function updateSaveButtonState() {
             document.getElementById('save-btn').disabled = !formDirty;
             document.getElementById('discard-btn').disabled = !formDirty;
+          }
+
+          // Enable Save Provider Selection only while a checkbox differs
+          // from the last-saved enabledProviders map (isProviderChecked
+          // reads that map, honouring each provider's enabledByDefault).
+          function updateProviderSaveButtonState() {
+            providersDirty = Object.keys(pendingProviderChecks).some(
+              id => pendingProviderChecks[id] !== isProviderChecked(id)
+            );
+            const button = document.getElementById('save-providers-btn');
+            if (button) {
+              button.disabled = !providersDirty;
+            }
           }
 
           function markDirty() {
@@ -1092,6 +1142,18 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               markDirty();
             }
           });
+          // Provider Selection dirty-tracking: the container itself is
+          // static (renderProviderSelection rebuilds only its innerHTML), so
+          // one delegated listener catches every current and future
+          // provider checkbox. The save button's gating is kept entirely
+          // separate from the model form's formDirty flag above.
+          document.getElementById('provider-selection').addEventListener('change', event => {
+            const target = event.target;
+            if (target && target.dataset && target.dataset.provider) {
+              pendingProviderChecks[target.dataset.provider] = target.checked === true;
+              updateProviderSaveButtonState();
+            }
+          });
           // Tell the extension host this document's listener is attached
           // and ready to receive "init".
           vscode.postMessage({ type: 'ready' });
@@ -1115,8 +1177,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           }
 
           // The bare model identity, with trailing (…)/[…] qualifier groups
-          // split off — "Kimi K3 [may be unstable] (Extra High)" leads with
-          // "Kimi K3" and the qualifiers become secondary text.
+          // split off — "Kimi K3 (Extra High)" leads with "Kimi K3" and the
+          // qualifiers become secondary text.
           function splitModelName(name) {
             let base = String(name || '').trim();
             const qualifiers = [];
@@ -1184,7 +1246,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               'title="Uncheck to skip this model during resolution; it keeps its configured model and position" ' +
               (enabled === false ? '' : 'checked') + '>' +
               modelComboboxHtml(kind, stage, selectedId || '', enabled === false) +
-              '<button type="button" class="secondary remove-backup" aria-label="Remove backup" title="Remove this backup model">×</button>' +
+              '<button type="button" class="secondary remove-backup" aria-label="Remove model" title="Remove this model">×</button>' +
               '</div>';
           }
 
@@ -1552,7 +1614,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                   ? '<details class="provider-warning"><summary>Warning</summary><p>' + escapeHtml(provider.permissionWarning) + '</p></details>'
                   : '')
               ).join('') +
-              '<div class="btn-container"><button id="save-providers-btn" title="Save the enabled provider selection">Save Provider Selection</button></div>' +
+              '<div class="btn-container"><button id="save-providers-btn" disabled title="Save the enabled provider selection">' + SAVE_ICON_SVG + 'Save Provider Selection</button></div>' +
               '</fieldset>';
             container.querySelectorAll('[data-signin-provider]').forEach(button => {
               button.addEventListener('click', () => {
@@ -1571,6 +1633,12 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               });
               vscode.postMessage({ type: 'saveProviders', enabledProviders: next });
             });
+            // Fresh render: every checkbox matches the last-saved map by
+            // construction, so any pending toggles are gone and the save
+            // button starts disabled again (a saveProviders round-trip ends
+            // in a providersRefreshed re-render, re-disabling after save).
+            pendingProviderChecks = {};
+            updateProviderSaveButtonState();
           }
 
           // The primary row's own controls: the skip checkbox and the ×.

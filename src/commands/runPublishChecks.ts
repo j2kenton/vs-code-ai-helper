@@ -107,7 +107,7 @@ export async function runPublishChecks(
     {
       label: "Publish Checks",
       stage: "publish",
-      taskName: resolvedTask.folderName,
+      taskName: resolvedTask.progress.displayName ?? resolvedTask.folderName,
       kind: "completion-checks",
       parent: parentOperation,
     },

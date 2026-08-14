@@ -36,7 +36,7 @@ void describe("operation reload recovery", () => {
       const entries = provider.getEntries();
       assert.equal(entries.length, 1);
       assert.equal(entries[0]?.level, "warning");
-      assert.equal(entries[0]?.message, "Run Review — 2026-07-17_task_1: interrupted");
+      assert.equal(entries[0]?.message, 'Run Review — "2026-07-17_task_1": interrupted');
       await Promise.resolve();
       assert.deepEqual(state.get("ensemble.runningOperations", []), []);
     } finally {

@@ -29,12 +29,13 @@ function snap(overrides: {
   parentId?: string;
   detail?: string;
   label?: string;
+  taskName?: string;
 }): TaskOperationSnapshot {
   return {
     id: "op-1",
     key: "/dev/task_1",
     label: overrides.label ?? "Review",
-    taskName: "task_1",
+    taskName: overrides.taskName ?? "task_1",
     startedAt: 1,
     finishedAt: 2,
     exclusive: true,
@@ -50,37 +51,51 @@ function snap(overrides: {
 void describe("terminalEntryFor (taxonomy policy)", () => {
   void it("records succeeded roots as info 'completed' entries", () => {
     const entry = terminalEntryFor(snap({ state: "succeeded", kind: "review" }));
-    assert.deepEqual(entry, { message: "Review — task_1: completed", level: "info", sourceOperationId: "op-1" });
+    assert.deepEqual(entry, { message: "Review — \"task_1\": completed", level: "info", sourceOperationId: "op-1" });
+  });
+
+  void it("quotes the human display name in the rendered message, unquoted in the snapshot", () => {
+    const source = snap({ state: "succeeded", kind: "review", taskName: "ff for 1 pt 2" });
+    const entry = terminalEntryFor(source);
+    assert.equal(entry?.message, 'Review — "ff for 1 pt 2": completed');
+    // Quoting is a render-time decision only — the semantic taskName that
+    // snapshots (and persisted entries) carry stays quote-free.
+    assert.equal(source.taskName.includes('"'), false);
+  });
+
+  void it("quotes the folder-name fallback the same way when no display name exists", () => {
+    const entry = terminalEntryFor(snap({ state: "succeeded", kind: "review", taskName: "2026-08-14_task_3" }));
+    assert.equal(entry?.message, 'Review — "2026-08-14_task_3": completed');
   });
 
   void it("appends the settled live detail (e.g. iteration x/y, a created folder name)", () => {
     const entry = terminalEntryFor(
       snap({ state: "succeeded", kind: "fast-forward", label: "Fast Forward Review", detail: "iteration 3/5" })
     );
-    assert.equal(entry?.message, "Fast Forward Review — task_1: completed (iteration 3/5)");
+    assert.equal(entry?.message, "Fast Forward Review — \"task_1\": completed (iteration 3/5)");
   });
 
   void it("records failed roots as error entries", () => {
     const entry = terminalEntryFor(snap({ state: "failed", kind: "generate-plan", label: "Generate Plan" }));
-    assert.deepEqual(entry, { message: "Generate Plan — task_1: failed", level: "error", sourceOperationId: "op-1" });
+    assert.deepEqual(entry, { message: "Generate Plan — \"task_1\": failed", level: "error", sourceOperationId: "op-1" });
   });
 
   void it("records cancelled roots as warnings and drops the transient 'cancelling…' detail", () => {
     const entry = terminalEntryFor(snap({ state: "cancelled", kind: "review", detail: "cancelling…" }));
-    assert.deepEqual(entry, { message: "Review — task_1: cancelled", level: "warning", sourceOperationId: "op-1" });
+    assert.deepEqual(entry, { message: "Review — \"task_1\": cancelled", level: "warning", sourceOperationId: "op-1" });
   });
 
   void it("records instant mutations (terminal-always) on success", () => {
     const entry = terminalEntryFor(
       snap({ state: "succeeded", kind: "pause-task", label: "Pause Task" })
     );
-    assert.deepEqual(entry, { message: "Pause Task — task_1: completed", level: "info", sourceOperationId: "op-1" });
+    assert.deepEqual(entry, { message: "Pause Task — \"task_1\": completed", level: "info", sourceOperationId: "op-1" });
   });
 
   void it("skips chat-response successes (terminal-on-failure-only) but records their failures", () => {
     assert.equal(terminalEntryFor(snap({ state: "succeeded", kind: "chat-send", label: "Chat" })), undefined);
     const failed = terminalEntryFor(snap({ state: "failed", kind: "chat-send", label: "Chat" }));
-    assert.deepEqual(failed, { message: "Chat — task_1: failed", level: "error", sourceOperationId: "op-1" });
+    assert.deepEqual(failed, { message: "Chat — \"task_1\": failed", level: "error", sourceOperationId: "op-1" });
   });
 
   void it("never records child operations — the root's entry covers the composite", () => {
@@ -137,8 +152,8 @@ void describe("installOperationNotificationBridge (activation subscription)", ()
       ).catch(() => undefined);
 
       assert.deepEqual(captured, [
-        { message: "Pause Task — bridge_task: completed", level: "info" },
-        { message: "Generate Plan — bridge_task: failed", level: "error" },
+        { message: "Pause Task — \"bridge_task\": completed", level: "info" },
+        { message: "Generate Plan — \"bridge_task\": failed", level: "error" },
       ]);
     } finally {
       bridge.dispose();

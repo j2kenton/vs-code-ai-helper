@@ -140,7 +140,7 @@ export async function pauseTask(
   try {
     await runTrackedOperation(
       resolvedTask.taskFolderPath,
-      { label: "Pause Task", taskName: resolvedTask.folderName, kind: "pause-task" },
+      { label: "Pause Task", taskName: resolvedTask.progress.displayName ?? resolvedTask.folderName, kind: "pause-task" },
       async () => {
         const patched = await patchTaskProgressStrictV1(taskUri, (current) =>
           updateTaskStatus(current, "paused")

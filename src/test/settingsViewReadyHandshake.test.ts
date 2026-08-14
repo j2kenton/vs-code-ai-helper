@@ -887,13 +887,35 @@ void describe("SettingsViewProvider webview — AI Models tab labels and Discard
   void it("labels and styles the save/discard/provider/backup buttons per the AI Models tab conventions", () => {
     const html = extractWebviewHtml();
 
-    assert.match(html, /<button id="save-btn" disabled title="[^"]+">Save Model Selection<\/button>/);
+    // Each action button leads with a CSP-safe inline SVG icon (aria-hidden,
+    // left of the label via the shared inline-flex rule); the two save
+    // buttons render at the primary styling, discard keeps secondary.
     assert.match(
       html,
-      /<button id="discard-btn" class="secondary" disabled title="[^"]+">Discard Unsaved Changes<\/button>/
+      /<button id="save-btn" disabled title="[^"]+"><svg[^>]*aria-hidden="true"[^>]*><path[^>]*\/><\/svg>Save Model Selection<\/button>/
+    );
+    assert.match(
+      html,
+      /<button id="discard-btn" class="secondary" disabled title="[^"]+"><svg[^>]*aria-hidden="true"[^>]*><path[^>]*\/><\/svg>Discard Unsaved Changes<\/button>/
     );
     assert.doesNotMatch(html, /Reset to Defaults/);
-    assert.match(html, /<button id="save-providers-btn" title="[^"]+">Save Provider Selection<\/button>/);
+    // Save Provider Selection starts disabled (enabled only once a checkbox
+    // differs from the saved map) and shows the same save icon, injected via
+    // the SAVE_ICON_SVG script constant.
+    assert.match(
+      html,
+      /<button id="save-providers-btn" disabled title="[^"]+">' \+ SAVE_ICON_SVG \+ 'Save Provider Selection<\/button>/
+    );
+    // The two save buttons render the identical icon glyph.
+    const saveBtnIcon = /<button id="save-btn"[^>]*><svg[^>]*><path d="([^"]+)"/.exec(html);
+    const providerBtnIcon = /const SAVE_ICON_SVG = '<svg[^>]*><path d="([^"]+)"/.exec(html);
+    assert.ok(saveBtnIcon, "Save Model Selection must render an inline icon");
+    assert.ok(providerBtnIcon, "Save Provider Selection must render an inline icon");
+    assert.equal(
+      providerBtnIcon[1],
+      saveBtnIcon[1],
+      "Save Provider Selection must reuse the exact Save Model Selection icon"
+    );
     assert.match(html, /class="secondary add-backup"/);
     assert.match(html, /class="secondary remove-backup"/);
   });
@@ -967,5 +989,115 @@ void describe("SettingsViewProvider webview — AI Models tab labels and Discard
 
     assert.equal(session.byId("save-btn").disabled, false, "cancelling discard must keep the form dirty");
     assert.equal(session.byId("discard-btn").disabled, false, "cancelling discard must keep discard enabled");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Save Provider Selection gating
+//
+// The provider save button mirrors the model form's gating: it starts
+// disabled, enables only while a provider checkbox differs from the
+// last-saved enabledProviders map, and re-disables after the saveProviders
+// round-trip (which ends in a providersRefreshed re-render) or when the
+// boxes return to the saved state — all without touching the model form's
+// own dirty flag.
+// ---------------------------------------------------------------------------
+
+void describe("SettingsViewProvider webview — Save Provider Selection gating", () => {
+  const CLAUDE_PROVIDER = {
+    id: "claude-cli",
+    label: "Claude Code",
+    signInLabel: "Sign in / Switch account",
+    signInGuidance: "",
+    permissionWarning: "",
+    installHint: "",
+    usageEnabled: true,
+    usageTooltip: "usage",
+    enabledByDefault: true,
+  };
+
+  function providerInitMessage(): Record<string, unknown> {
+    const init = initMessage();
+    init.providers = [CLAUDE_PROVIDER];
+    init.enabledProviders = {};
+    return init;
+  }
+
+  void it("starts disabled, enables on a checkbox toggle, and re-disables after the save round-trip", async () => {
+    const script = extractWebviewScript();
+    const stateStore: { value: unknown } = { value: undefined };
+    const session = runWebviewSession(script, stateStore);
+
+    await session.deliver(providerInitMessage());
+    assert.equal(
+      session.byId("save-providers-btn").disabled,
+      true,
+      "nothing unsaved right after init — the checkboxes match the saved map"
+    );
+
+    // Toggle the claude-cli checkbox off (its saved state is on by default).
+    await session.byId("provider-selection").dispatch("change", {
+      target: { dataset: { provider: "claude-cli" }, checked: false },
+    });
+    assert.equal(
+      session.byId("save-providers-btn").disabled,
+      false,
+      "a checkbox differing from the saved map must enable the save button"
+    );
+    assert.equal(
+      session.byId("save-btn").disabled,
+      true,
+      "provider toggles must not mark the independent model form dirty"
+    );
+
+    // Saving posts the new provider map…
+    await session.byId("provider-selection").querySelector("#save-providers-btn").dispatch("click");
+    assert.ok(
+      session.posted.some((message) => message.type === "saveProviders"),
+      "clicking the enabled save button must post saveProviders"
+    );
+
+    // …and the host's providersRefreshed round-trip re-renders from the
+    // saved map, re-disabling the button.
+    await session.deliver({
+      type: "providersRefreshed",
+      models: [{ id: "claude-cli:sonnet", name: "Sonnet", providerLabel: "Claude CLI" }],
+      enabledProviders: { "claude-cli": false },
+      providers: [CLAUDE_PROVIDER],
+    });
+    assert.equal(
+      session.byId("save-providers-btn").disabled,
+      true,
+      "a successful save must re-disable the button"
+    );
+  });
+
+  void it("re-disables when the checkboxes return to the saved state", async () => {
+    const script = extractWebviewScript();
+    const stateStore: { value: unknown } = { value: undefined };
+    const session = runWebviewSession(script, stateStore);
+
+    await session.deliver(providerInitMessage());
+    assert.equal(session.byId("save-providers-btn").disabled, true);
+
+    // Off → enabled…
+    await session.byId("provider-selection").dispatch("change", {
+      target: { dataset: { provider: "claude-cli" }, checked: false },
+    });
+    assert.equal(session.byId("save-providers-btn").disabled, false);
+
+    // …back on (the saved state) → disabled again, with no save in between.
+    await session.byId("provider-selection").dispatch("change", {
+      target: { dataset: { provider: "claude-cli" }, checked: true },
+    });
+    assert.equal(
+      session.byId("save-providers-btn").disabled,
+      true,
+      "returning every checkbox to its saved state must re-disable the button"
+    );
+    assert.ok(
+      !session.posted.some((message) => message.type === "saveProviders"),
+      "no save may be posted while the button was never meaningfully enabled"
+    );
   });
 });

@@ -136,7 +136,7 @@ export async function resumePausedTask(
   try {
     await runTrackedOperation(
       resolvedTask.taskFolderPath,
-      { label: "Resume Task", taskName: resolvedTask.folderName, kind: "resume-task" },
+      { label: "Resume Task", taskName: resolvedTask.progress.displayName ?? resolvedTask.folderName, kind: "resume-task" },
       async () => {
         const activated = await activateTask(
           inventory, currentTaskStore, resolvedTask.taskFolderPath, resolvedTask.canonicalId
@@ -192,7 +192,7 @@ async function resumeCompletedTask(
   try {
     await runTrackedOperation(
       resolvedTask.taskFolderPath,
-      { label: "Resume Task", taskName: resolvedTask.folderName, kind: "resume-task" },
+      { label: "Resume Task", taskName: resolvedTask.progress.displayName ?? resolvedTask.folderName, kind: "resume-task" },
       async (op) => {
         result = await reopenCompletedTask(
           inventory,

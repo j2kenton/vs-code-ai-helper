@@ -181,7 +181,7 @@ export async function markTaskDone(
   const lockKey = taskFolderUri.fsPath;
   await runTrackedOperation(
     lockKey,
-    { label: "Complete Task", taskName: resolvedTask.folderName, kind: "complete-task" },
+    { label: "Complete Task", taskName: resolvedTask.progress.displayName ?? resolvedTask.folderName, kind: "complete-task" },
     async () => {
     // Completion is an explicit user action. Reaching Publish alone never
     // changes lifecycle status, but this command is the durable terminal

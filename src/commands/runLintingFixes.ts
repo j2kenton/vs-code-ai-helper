@@ -250,7 +250,7 @@ export async function runLintingFixes(
 
   await runTrackedOperation(
     lockKey,
-    { label: "Linting Fixes", stage: "publish", taskName: resolvedTask.folderName, kind: "lint-fixes", parent: parentOperation },
+    { label: "Linting Fixes", stage: "publish", taskName: resolvedTask.progress.displayName ?? resolvedTask.folderName, kind: "lint-fixes", parent: parentOperation },
     async () => {
       await vscode.window.withProgress(
         {

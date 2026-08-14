@@ -157,6 +157,10 @@ import {
   detectSiblingReviewDisagreement,
   ReviewBlocker,
 } from "../utils/reviewReadiness";
+import {
+  effectiveReviewProgressV1,
+  readEffectivePlanChecklistProgressV1,
+} from "../utils/effectiveReviewProgress";
 import { scheduleAutomationChain, releaseAutomationChain } from "../utils/automationChain";
 import {
   buildPlanItemVerificationSection,
@@ -1971,12 +1975,12 @@ async function routeReviewOutcomeV1(
         // outstanding count into the plan stage, block its auto-advance, and
         // let Fast Forward grind into no-progress escalation, when returning
         // to implementation is precisely what would tick those items off.
-        const planChecklistProgress = isPlanReviewStage(targetStage)
-          ? undefined
-          : await readPlanChecklistProgressV1(folderUri);
-        const progress = isPlanReviewStage(targetStage)
-          ? parseReviewProgress(content)
-          : reconcileProgressWithChecklistV1(parseReviewProgress(content), planChecklistProgress);
+        // The same effective-progress computation the Tasks tree renders
+        // (effectiveReviewProgress.ts): raw marker for plan-review stages,
+        // checklist-reconciled otherwise — strict here, so a corrupt
+        // progress file still throws and notifies instead of advancing on
+        // state that could not be read.
+        const progress = await effectiveReviewProgressV1(folderUri, targetStage, content, "strict");
         const planIncomplete = isPlanIncomplete(progress);
         const meetsThreshold = readyToAdvanceStage(score, autoAdvanceThreshold, progress);
         // Records this round in the durable score history and decides
@@ -2047,7 +2051,12 @@ async function routeReviewOutcomeV1(
         ) {
           // Names the operator-action/optional steps the denominator above
           // already excludes, so "X of Y implemented" doesn't read as though
-          // the plan holds MORE outstanding work than it actually does.
+          // the plan holds MORE outstanding work than it actually does. Read
+          // lazily here — this notice is the only consumer of the exclusion
+          // count, so the advance path above no longer pays for it.
+          const planChecklistProgress = isPlanReviewStage(targetStage)
+            ? undefined
+            : await readPlanChecklistProgressV1(folderUri);
           const excludedSuffix =
             planChecklistProgress && planChecklistProgress.excluded > 0
               ? ` (${planChecklistProgress.excluded} additional step(s) marked excluded from this count)`
@@ -2988,6 +2997,7 @@ export async function runReviewWithAI(
     {
       label: "Review",
       stage: resolved.progress.currentStage,
+      taskName: resolved.progress.displayName,
       kind: "review",
       cancellable: true,
     },
@@ -3257,7 +3267,7 @@ export async function applyReviewWithAI(
   } else {
     await runTrackedOperation(
       lockKey,
-      { label: "Apply Review", stage, kind: "apply-review", cancellable: true },
+      { label: "Apply Review", stage, taskName: resolved.progress.displayName, kind: "apply-review", cancellable: true },
       runApply
     );
   }
@@ -3497,6 +3507,7 @@ export async function fastForwardReviewWithAI(
     {
       label: "Fast Forward Review",
       stage: resolved.progress.currentStage,
+      taskName: resolved.progress.displayName,
       kind: "fast-forward",
       cancellable: true,
     },
@@ -4926,7 +4937,7 @@ export async function generateImplementationWithAI(
   const lockKey = resolved.folderUri.fsPath;
   const opResult = await runTrackedOperation(
     lockKey,
-    { label: "Generate Implementation", stage: "impl", kind: "generate-implementation", cancellable: true },
+    { label: "Generate Implementation", stage: "impl", taskName: resolved.progress.displayName, kind: "generate-implementation", cancellable: true },
     async (op) => {
       const implementationUri = getCanonicalImplementationUri(resolved.folderUri);
       let planFinalContent = await readNonEmptyText(implementationUri);
@@ -5140,29 +5151,10 @@ export { IMPLEMENTATION_CHECKLIST_MARKER };
 export async function readPlanChecklistProgressV1(
   folderUri: vscode.Uri
 ): Promise<ChecklistProgressV1 | undefined> {
-  const plan = await readPlanOfRecordV1(folderUri);
-  const counted = plan.counts;
-  if (!plan.hasChecklist || !counted) {
-    return undefined;
-  }
-  // The checklist is only authoritative while something is maintaining it.
-  // When the last round could not report checkbox state — any runner whose
-  // result is runner-authored rather than model-authored — its counts are a
-  // snapshot from some earlier round, not a live record of remaining work.
-  // Presenting a frozen number as live is worse than presenting none: it would
-  // block advancement forever on evidence that stopped updating.
-  //
-  // Durable, not derived from the latest summary. A round whose work never
-  // reached the checklist leaves it permanently short: the NEXT round ticks
-  // only what it did itself, so the missing items stay missing while the fresh
-  // model-authored summary makes the checklist look current again. Reading the
-  // latest summary alone therefore re-enabled the gate on a count that can
-  // never reach its total, holding a finished plan at N/M forever.
-  const progress = await readTaskProgressAdvisoryV1(folderUri);
-  if (progress?.checklistProgressUnreliable) {
-    return undefined;
-  }
-  return counted;
+  // The read itself now lives in effectiveReviewProgress.ts, shared with the
+  // Tasks tree's stage rows; the strict policy preserves this gate's
+  // throw-and-notify behavior on a corrupt progress file.
+  return readEffectivePlanChecklistProgressV1(folderUri, "strict");
 }
 
 /**
@@ -6209,7 +6201,7 @@ export async function runImplementationWithAI(
   const lockKey = resolved.folderUri.fsPath;
   await runTrackedOperation(
     lockKey,
-    { label: "Run Implementation", stage: "impl", kind: "run-implementation", cancellable: true },
+    { label: "Run Implementation", stage: "impl", taskName: resolved.progress.displayName, kind: "run-implementation", cancellable: true },
     async (op) => {
     // Materialize canonical plan-final.md from legacy implementation.md if needed
     let canonicalUri: vscode.Uri;
@@ -6621,6 +6613,7 @@ export async function applyReviewEditWithAI(
     {
       label: "Apply Review",
       stage,
+      taskName: resolved.progress.displayName,
       kind: "apply-review",
       cancellable: true,
     },
@@ -6966,7 +6959,7 @@ async function runRelease(context: vscode.ExtensionContext, arg?: TaskNodeArg): 
 
   await runTrackedOperation(
     candidate,
-    { label: "Release", taskName: arg?.task?.folderName ?? path.basename(candidate), kind: "release" },
+    { label: "Release", taskName: arg?.task?.progress?.displayName ?? arg?.task?.folderName ?? path.basename(candidate), kind: "release" },
     async () => {
     // The release target is the explicit, per-workspace-folder persisted
     // package.json path (see resolveReleaseTargetPackageJson) — it may be a
@@ -7325,7 +7318,7 @@ export async function resumeApplyReviewInteractionV1(
     if (workspaceFolder) {
       await runTrackedOperation(
         taskFolderUri.fsPath,
-        { label: "Re-running review", stage, kind: "review" },
+        { label: "Re-running review", stage, taskName: ownedTask.progress.displayName, kind: "review" },
         (op) =>
           runReviewForFolder(
             extensionUri,

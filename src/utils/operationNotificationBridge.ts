@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import { taskOperations, TaskOperationSnapshot } from "./taskOperations";
+import { formatTaskNameForDisplay, taskOperations, TaskOperationSnapshot } from "./taskOperations";
 import { NotificationRouter } from "./notificationRouter";
 import { policyForKind } from "./operationTaxonomy";
 
@@ -60,7 +60,9 @@ export function terminalEntryFor(
   const detail = snap.state === "cancelled" ? undefined : snap.detail;
   const suffix = detail ? ` (${detail})` : "";
   return {
-    message: `${snap.label} — ${snap.taskName}: ${stateText}${suffix}`,
+    // The quoted name is a render-time decision: the snapshot's semantic
+    // `taskName` (including persisted snapshots) stays unquoted.
+    message: `${snap.label} — ${formatTaskNameForDisplay(snap.taskName)}: ${stateText}${suffix}`,
     level,
     sourceOperationId: snap.id,
     // Only present when set — keeps `terminalEntryFor` output free of

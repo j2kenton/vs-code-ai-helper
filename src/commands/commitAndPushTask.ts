@@ -2776,7 +2776,7 @@ export async function completeCommitAndPushTask(
     const lockKey = resolvedTask.taskFolderPath;
     await runTrackedOperation(
       lockKey,
-      { label: "Complete, Commit and Push", taskName: resolvedTask.folderName, kind: "complete-commit-push" },
+      { label: "Complete, Commit and Push", taskName: resolvedTask.progress.displayName ?? resolvedTask.folderName, kind: "complete-commit-push" },
       async (op) => {
       // 1. Transition stage to "publish", then persist completion — both
       // through the coordinator's lifecycle rows (§10.2's transfer: the

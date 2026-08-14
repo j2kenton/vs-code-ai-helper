@@ -220,8 +220,10 @@ void describe("AI Models view — static row template and captions", () => {
       html.includes("Backup models (tried in order)"),
       "the backups caption is kept (shown only when backups exist)"
     );
-    // Flagged-for-later strings stay byte-identical.
-    assert.ok(html.includes("Remove this backup model"));
+    // The × tooltip/aria-label is role-neutral (the same row shape serves
+    // primary and backup rows alike).
+    assert.ok(html.includes("Remove this model"));
+    assert.ok(!html.includes("Remove this backup model"));
     // Quota status text no longer renders anywhere — the data keeps
     // accruing underneath (utils/quota.ts), but the UI consumer is gone.
     assert.ok(!html.includes("No usage observed yet this session"));
@@ -374,7 +376,7 @@ void describe("AI Models view — combo labelling and type-to-select", () => {
   const QUALIFIED_MODELS = [
     {
       id: "cline-cli:kimi-code/k3",
-      name: "Kimi K3 [may be unstable, higher usage] (Extra High)",
+      name: "Kimi K3 [beta] (Extra High)",
       providerLabel: "Cline CLI (subscription CLI)",
     },
     { id: "claude-cli:sonnet", name: "Sonnet", providerLabel: "Claude Code" },

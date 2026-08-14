@@ -161,6 +161,8 @@ export async function retryTaskCreation(
   try {
     const result = await runTrackedOperation(
       taskFolderPath,
+      // Incomplete-creation footprints have no persisted displayName yet, so
+      // the folder name IS the task's display name here.
       { label: "Retry Task Creation", taskName: taskFolderName, kind: "create-task" },
       async (op) => {
         const metaFolderPaths = allMetaRootPaths(metaFolderPath);

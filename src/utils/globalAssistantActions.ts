@@ -576,7 +576,7 @@ const renameTaskOperation: GlobalAssistantOperation = {
       // takes the name from the typed payload instead of an input box.
       await runTrackedOperation(
         task.taskFolderPath,
-        { label: "Rename Task", taskName: task.folderName, kind: "rename-task" },
+        { label: "Rename Task", taskName: task.progress.displayName ?? task.folderName, kind: "rename-task" },
         async (op) => {
           await patchTaskProgressStrictV1(vscode.Uri.file(task.taskFolderPath), (current) => ({
             ...current,

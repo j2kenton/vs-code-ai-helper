@@ -124,7 +124,16 @@ export function createRenameTaskRowV1(): ProviderTaskActionRowV1 {
     // route entry is internal-only like editExecution.v1's.
     routes: ["internal:renameTask.v1"],
     eligibility: { statuses: ["active", "paused"], stages: "anyStage" },
-    requiresTaskOperationLease: true,
+    // No lease: the coordinator lease is pure mutual exclusion, and this row
+    // needs none of it. Promotion only exclusive-creates a caller-unique
+    // runs/rename-suggestion-*.txt artifact (createFileExclusive can never
+    // clobber another writer), and the displayName patch happens in the
+    // caller through patchTaskProgressStrictV1, which merges onto
+    // freshly-read state under its own journaled lock. Requiring the lease
+    // only made Rename Task with AI refuse while any other stage's provider
+    // action was running — the caller-side guard in renameTask.ts still
+    // blocks it during Task Description generation, the one true conflict.
+    requiresTaskOperationLease: false,
     progressLabel: "Naming task…",
     validateInput: validateRenameTaskInputV1,
     loggingPolicy: { channel: "action.renameTask", includeResultMetrics: true },

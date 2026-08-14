@@ -102,7 +102,7 @@ async function performStageSwap(node: StageNode | undefined, kind: StageSwapKind
     {
       label: kind === "revert" ? "Revert Stage Changes" : "Redo Stage Changes",
       stage: node.stage,
-      taskName: node.task.folderName,
+      taskName: node.task.progress?.displayName ?? node.task.folderName,
     },
     async () => {
       const artifactName = artifact.path.split("/").pop() ?? artifact.fsPath;
@@ -327,7 +327,7 @@ export function registerViewStageChangesCommands(context: vscode.ExtensionContex
     // the row's has-backup context token).
     await runTrackedOperation(
       node.task.folderUri.fsPath,
-      { label: "Delete Previous Version", stage: node.stage, taskName: node.task.folderName },
+      { label: "Delete Previous Version", stage: node.stage, taskName: node.task.progress?.displayName ?? node.task.folderName },
       async () => {
         await vscode.workspace.fs.delete(previousVersionUri(artifact), { useTrash: true });
         await deleteRedoSidecar(artifact);

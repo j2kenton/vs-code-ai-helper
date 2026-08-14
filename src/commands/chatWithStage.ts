@@ -499,7 +499,7 @@ export async function chatWithStage(
     await runTrackedOperation(lockKey, {
       label: "Chat",
       stage: targetStage,
-      taskName: task.folderName,
+      taskName: task.progress.displayName ?? task.folderName,
       exclusive: false,
       kind: "chat-send",
       cancellable: true,

@@ -1,7 +1,7 @@
 import * as assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import * as vscode from "vscode";
-import { firstActiveInDisplayOrder, getStageNodeContextValue, orderTasksForDisplay, StageNode } from "../views/taskTreeProvider";
+import { firstActiveInDisplayOrder, getStageNodeContextValue, orderTasksForDisplay, StageNode, tryReadReadiness } from "../views/taskTreeProvider";
 import type { IncompleteTask } from "../types/incompleteTask";
 import { buildTaskContextValue, buildStageContextValue, CREATION_RECOVERY_CONTEXT_V1 } from "../utils/contextTokens";
 import {
@@ -772,3 +772,179 @@ void describe("Icon selection in StageNode", () => {
     assert.strictEqual((node.iconPath as vscode.ThemeIcon).id, "circle-large-outline");
   });
 });
+
+// ---------------------------------------------------------------------------
+// Review score + step progress visibility (tryReadReadiness / StageNode)
+//
+// The at-a-glance score (9/10) now sits next to the checklist-reconciled step
+// progress (1 of 5 steps) so a loop back into implementation no longer reads
+// as a bug. The counts come from effectiveReviewProgressV1 under the lenient
+// policy — the same value the advance gates act on.
+// ---------------------------------------------------------------------------
+
+void describe("StageNode — review score and step progress", () => {
+  const folderUri = vscode.Uri.file("/workspace/tasks/progress-task");
+  const reviewUri = vscode.Uri.joinPath(folderUri, "review-impl-high.md");
+  const planUri = vscode.Uri.joinPath(folderUri, "plan-final.md");
+  const progressUri = vscode.Uri.joinPath(folderUri, "task-progress.json");
+
+  const PLAN_TWO_OF_FIVE = [
+    "# Final Plan",
+    "",
+    "<!-- ensemble:implementation-checklist -->",
+    "",
+    "- [x] One",
+    "- [x] Two",
+    "- [ ] Three",
+    "- [ ] Four",
+    "- [ ] Five",
+    "",
+  ].join("\n");
+
+  const PROGRESS_JSON = JSON.stringify({
+    taskFolder: "progress-task",
+    currentStage: "impl-high-review",
+    status: "active",
+    createdAt: "2026-08-11T00:00:00.000Z",
+    updatedAt: "2026-08-11T00:00:00.000Z",
+  });
+
+  function reviewContent(score: string, marker?: string): string {
+    return [
+      "# Implementation Review",
+      "",
+      `Readiness: ${score}/10`,
+      "",
+      ...(marker ? [`<!-- progress: ${marker} -->`, ""] : []),
+    ].join("\n");
+  }
+
+  /** In-memory workspace.fs.readFile, keyed by fsPath (the stub is notImplemented). */
+  function installReadFileStub(files: Map<string, string>): () => void {
+    const fsRecord = vscode.workspace.fs as unknown as Record<string, unknown>;
+    const original = fsRecord.readFile;
+    fsRecord.readFile = (uri: vscode.Uri): Promise<Uint8Array> => {
+      const text = files.get(uri.fsPath);
+      if (text === undefined) {
+        return Promise.reject(new Error(`ENOENT: no such file: ${uri.fsPath}`));
+      }
+      return Promise.resolve(new TextEncoder().encode(text));
+    };
+    return (): void => {
+      fsRecord.readFile = original;
+    };
+  }
+
+  void it("renders the score and the step progress in the description, with a divided tooltip", async () => {
+    const restore = installReadFileStub(new Map([[reviewUri.fsPath, reviewContent("9", "1/5")]]));
+    try {
+      const readiness = await tryReadReadiness(reviewUri, "impl-high-review", folderUri);
+      assert.ok(readiness, "a readable review artifact must yield readiness");
+      assert.equal(readiness.label, "9/10");
+      assert.deepEqual(readiness.progress, { complete: 1, total: 5 });
+
+      const node = new StageNode(makeTask("impl-high-review"), "impl-high-review", "current", reviewUri, readiness);
+      assert.strictEqual(node.description, "current · 9/10 · 1 of 5 steps");
+      const tooltip = (node.tooltip as vscode.MarkdownString).value;
+      assert.ok(tooltip.includes("Review score: 9/10"), "score line leads the tooltip block");
+      assert.ok(tooltip.includes("\n\n---\n\n"), "a divider sits between score and progress");
+      assert.ok(tooltip.includes("1 of 5 steps completed"));
+    } finally {
+      restore();
+    }
+  });
+
+  void it("renders score-only when the review carries no marker", async () => {
+    const restore = installReadFileStub(new Map([[reviewUri.fsPath, reviewContent("9")]]));
+    try {
+      const readiness = await tryReadReadiness(reviewUri, "impl-high-review", folderUri);
+      assert.ok(readiness);
+      assert.equal(readiness.progress, undefined);
+
+      const node = new StageNode(makeTask("impl-high-review"), "impl-high-review", "current", reviewUri, readiness);
+      assert.strictEqual(node.description, "current · 9/10");
+      const tooltip = (node.tooltip as vscode.MarkdownString).value;
+      assert.ok(!tooltip.includes("steps completed"), "no progress block without a marker");
+    } finally {
+      restore();
+    }
+  });
+
+  void it("renders score-only when the marker is malformed (progress: 7/5)", async () => {
+    const restore = installReadFileStub(new Map([[reviewUri.fsPath, reviewContent("9", "7/5")]]));
+    try {
+      const readiness = await tryReadReadiness(reviewUri, "impl-high-review", folderUri);
+      assert.ok(readiness);
+      assert.equal(readiness.progress, undefined, "a nonsensical marker parses to no progress");
+
+      const node = new StageNode(makeTask("impl-high-review"), "impl-high-review", "current", reviewUri, readiness);
+      assert.strictEqual(node.description, "current · 9/10");
+    } finally {
+      restore();
+    }
+  });
+
+  void it("displays the checklist-reconciled counts, never the marker's false completion", async () => {
+    // The review claims 5/5 done, but the plan of record's checklist still
+    // lists three unchecked items — the tree must show the checklist's 2 of
+    // 5, exactly what the advance gate reconciles to.
+    const restore = installReadFileStub(
+      new Map([
+        [reviewUri.fsPath, reviewContent("9", "5/5")],
+        [planUri.fsPath, PLAN_TWO_OF_FIVE],
+        [progressUri.fsPath, PROGRESS_JSON],
+      ])
+    );
+    try {
+      const readiness = await tryReadReadiness(reviewUri, "impl-high-review", folderUri);
+      assert.ok(readiness);
+      assert.deepEqual(
+        readiness.progress,
+        { complete: 2, total: 5 },
+        "the reconciled checklist counts win over the false 5/5 completion"
+      );
+
+      const node = new StageNode(makeTask("impl-high-review"), "impl-high-review", "current", reviewUri, readiness);
+      assert.strictEqual(node.description, "current · 9/10 · 2 of 5 steps");
+      assert.ok(!String(node.description).includes("5 of 5"));
+      assert.ok((node.tooltip as vscode.MarkdownString).value.includes("2 of 5 steps completed"));
+    } finally {
+      restore();
+    }
+  });
+
+  void it("renders a plan-review stage's raw marker unreconciled", async () => {
+    // The checklist (2 of 5) belongs to the implementation; a plan review's
+    // own marker (3/5) passes through untouched.
+    const planReviewUri = vscode.Uri.joinPath(folderUri, "review-plan-high.md");
+    const restore = installReadFileStub(
+      new Map([
+        [planReviewUri.fsPath, reviewContent("8", "3/5")],
+        [planUri.fsPath, PLAN_TWO_OF_FIVE],
+        [progressUri.fsPath, PROGRESS_JSON],
+      ])
+    );
+    try {
+      const readiness = await tryReadReadiness(planReviewUri, "plan-high-review", folderUri);
+      assert.ok(readiness);
+      assert.deepEqual(readiness.progress, { complete: 3, total: 5 });
+
+      const node = new StageNode(makeTask("plan-high-review"), "plan-high-review", "current", planReviewUri, readiness);
+      assert.strictEqual(node.description, "current · 8/10 · 3 of 5 steps");
+    } finally {
+      restore();
+    }
+  });
+
+  void it("returns undefined readiness when the artifact cannot be read", async () => {
+    const restore = installReadFileStub(new Map());
+    try {
+      const readiness = await tryReadReadiness(reviewUri, "impl-high-review", folderUri);
+      assert.equal(readiness, undefined);
+    } finally {
+      restore();
+    }
+  });
+});
+
+
