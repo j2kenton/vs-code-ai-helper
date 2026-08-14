@@ -315,7 +315,7 @@ void describe("createCliTextTransportV1 structured-event capture", () => {
  * shipped definition's real `buildArgs` with the transport's exact arguments
  * and records the call, then substitutes the scripted-node argv for the
  * actual spawn. That seam proves, per definition, that the V1 call site
- * (`buildArgs("text", model, undefined, { cwd, promptFile })`) satisfies the
+ * (`buildArgs("text", model, { cwd, promptFile })`) satisfies the
  * provider's own precondition contract (Antigravity throws without a
  * promptFile; codex-cli never reaches buildArgs because stdout capture is
  * rejected pre-spawn) and that the real argument construction succeeds under
@@ -351,7 +351,6 @@ void describe("createCliTextTransportV1 per shipped CLI definition", () => {
   interface RecordedBuildArgsCallV1 {
     mode: CliRunMode;
     model: string | undefined;
-    lastMessageFile: string | undefined;
     context: CliBuildArgsContext | undefined;
     /** What the REAL buildArgs produced for that invocation. */
     realArgs: string[];
@@ -391,15 +390,14 @@ void describe("createCliTextTransportV1 per shipped CLI definition", () => {
       buildArgs(
         mode: CliRunMode,
         model: string | undefined,
-        lastMessageFile: string | undefined,
         context?: CliBuildArgsContext
       ): string[] {
         // Exercise the real construction under the transport's actual call
         // contract before substituting the scripted argv. If the provider's
         // preconditions reject the transport's arguments (e.g. Antigravity's
         // promptFile contract), this throws exactly as production would.
-        const realArgs = def.buildArgs(mode, model, lastMessageFile, context);
-        buildArgsCalls.push({ mode, model, lastMessageFile, context, realArgs });
+        const realArgs = def.buildArgs(mode, model, context);
+        buildArgsCalls.push({ mode, model, context, realArgs });
         if (fileTransport) {
           if (!context?.promptFile) {
             throw new Error(
@@ -528,19 +526,15 @@ void describe("createCliTextTransportV1 per shipped CLI definition", () => {
       assert.deepEqual(exit, { kind: "completed" });
 
       // The real buildArgs ran exactly once, under the V1 transport's exact
-      // call contract: text mode, no last-message file (results are captured
-      // only from stdout, AC-RUNNER-02), the transport's cwd, and a
-      // promptFile only for "file"-transport definitions.
+      // call contract: text mode, the transport's cwd, and a promptFile only
+      // for "file"-transport definitions. (Results are captured only from
+      // stdout, AC-RUNNER-02 — the last-message-file parameter no longer
+      // exists on the signature at all.)
       assert.equal(buildArgsCalls.length, 1, "buildArgs must be invoked exactly once");
       const call = buildArgsCalls[0];
       assert.ok(call);
       assert.equal(call.mode, "text");
       assert.equal(call.model, undefined);
-      assert.equal(
-        call.lastMessageFile,
-        undefined,
-        "V1 stdout capture must never supply a last-message file"
-      );
       assert.equal(call.context?.cwd, cwd);
       if ((shippedDef.promptTransport ?? "stdin") === "file") {
         const promptFile = call.context?.promptFile;

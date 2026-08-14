@@ -21,6 +21,7 @@ import {
 import { runPublishScopeCheck } from "../utils/publishScopeCheck";
 import { checkPublishPreflight } from "../utils/publishPreflight";
 import { runGitCommand, resolveGitRepo, checkGitPublishReadiness, GitPublishReadiness } from "../utils/gitRepoInfo";
+import { refreshStaleReviewBannersForTaskV1 } from "../utils/reviewFreshness";
 import { runLintingFixes } from "./runLintingFixes";
 import { resolveFreshModelForStage } from "../utils/modelSelection";
 import {
@@ -1108,9 +1109,22 @@ function extractSectionBody(
 }
 
 /**
- * Generate PR description from task artifacts
+ * Label prepended to the PR "Testing" section when its text came from the
+ * low-level plan's own `## Testing` section rather than from anything the run
+ * reported about itself. Kept as a named constant so the label's exact
+ * wording is pinnable in a test and greppable at the decision site.
+ *
+ * @internal exported for testing
  */
-async function generatePRDescription(
+export const PR_TESTING_PLANNED_FALLBACK_LABEL_V1 =
+  "Planned testing (from the plan — not verified by this run):";
+
+/**
+ * Generate PR description from task artifacts
+ *
+ * @internal exported for testing
+ */
+export async function generatePRDescription(
   taskFolderPath: string,
   folderName: string,
   changedFiles: string[]
@@ -1236,8 +1250,17 @@ async function generatePRDescription(
         "## Testing"
       );
       if (testingSection) {
+        // This fallback reads the low-level PLAN's own `## Testing` section —
+        // planned testing, written before any run existed. Emitting it
+        // unlabeled presented the plan's intentions under the PR's "Testing"
+        // heading as if the run had executed them, the same misrepresentation
+        // that retired the overview extraction above. The fallback itself is
+        // kept (a PR with no run-owned testing section is still better
+        // pointing at the plan than saying nothing), but the label travels
+        // with the text so the reader can tell planned from delivered.
         testingSummary =
-          extractFirstParagraph(testingSection) ?? testingSection;
+          `${PR_TESTING_PLANNED_FALLBACK_LABEL_V1}\n` +
+          (extractFirstParagraph(testingSection) ?? testingSection);
       }
     } catch {
       // ignore
@@ -2498,6 +2521,12 @@ export async function stageAndCommitCommitPushV1(
           detail: `Commit failed: ${getErrorMessage(error)}`,
         };
       }
+      // The commit just advanced HEAD: any review artifact whose recorded
+      // reviewed-commit predates it is now stale, and must say so at the top
+      // rather than only in a trailing HTML comment (review freshness
+      // follow-up — see utils/reviewFreshness.ts). Best-effort: the commit
+      // already landed, so a courtesy marker must never fail it.
+      await refreshStaleReviewBannersForTaskV1(resolvedTask.taskFolderPath);
       return { kind: "committed" };
     }
   );

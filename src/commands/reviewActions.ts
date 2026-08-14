@@ -155,8 +155,12 @@ import {
   parseReviewProgress,
   reconcileProgressWithChecklistV1,
   detectSiblingReviewDisagreement,
+  REVIEWED_COMMIT_STAGES,
   ReviewBlocker,
 } from "../utils/reviewReadiness";
+import {
+  refreshStaleReviewBannerForArtifactV1,
+} from "../utils/reviewFreshness";
 import {
   effectiveReviewProgressV1,
   readEffectivePlanChecklistProgressV1,
@@ -1083,17 +1087,8 @@ const REVIEW_REREVIEW_PROMPTS: Partial<Record<TaskStage, string>> = {
   "publish": "review-publish-rereview.md",
 };
 
-/** Stages that record a `<!-- reviewed-commit: SHA -->` marker (2i) — the
- * implementation and publish review stages, whose "previous review" a
- * re-review is told to reconcile against can go stale relative to the
- * workspace across many rounds (the task_5 evidence: a 62-commit, 8-day gap).
- * Plan reviews assess plan.md prose, which isn't tied to commit history the
- * same way, so they stay out of scope. */
-const REVIEWED_COMMIT_STAGES: ReadonlySet<TaskStage> = new Set([
-  "impl-high-review",
-  "impl-low-review",
-  "publish",
-]);
+// REVIEWED_COMMIT_STAGES (2i) now lives in utils/reviewReadiness.ts beside
+// the freshness primitives it scopes, and is imported above.
 
 /** The reconciliation-instruction paragraph each re-review prompt used to
  * hardcode as its opening paragraph — now the DEFAULT `{{reconciliationInstruction}}`
@@ -2501,6 +2496,18 @@ export async function runReviewForFolder(
     const headSha = await resolveHeadCommitSha(workspaceRoot.uri.fsPath);
     variables.reviewedCommitSha = headSha ?? "unknown";
     if (previousReview !== undefined) {
+      // The previous review is about to be reconciled against — or superseded.
+      // If its recorded commit has fallen behind HEAD, its on-disk copy must
+      // carry the stale banner (review freshness follow-up): when the re-review
+      // succeeds the fresh artifact replaces it banner-free, and when it fails
+      // the old review remains, now correctly marked. Reuses the HEAD resolved
+      // above — no extra git call. Best-effort: a courtesy marker must never
+      // block the re-review itself.
+      try {
+        await refreshStaleReviewBannerForArtifactV1(reviewUri, headSha);
+      } catch {
+        // Marker only — proceed with the review regardless.
+      }
       variables.reconciliationInstruction = await selectReconciliationInstruction(
         targetStage,
         previousReview,
@@ -4239,6 +4246,17 @@ export async function viewReview(
       await openOrCreateDocument(reviewUri);
     }
     return;
+  }
+  // Review freshness: if the recorded reviewed-commit is no longer HEAD, the
+  // artifact must say so under its Readiness line, not only in a trailing
+  // HTML comment an operator never scrolls to. The upsert is a no-op for
+  // plan reviews (no marker), placeholders, and current reviews. Best-effort:
+  // opening the review must never fail over a courtesy marker.
+  try {
+    const headSha = await resolveHeadCommitSha(resolved.folderUri.fsPath);
+    await refreshStaleReviewBannerForArtifactV1(reviewUri, headSha);
+  } catch {
+    // Marker only — open the artifact regardless.
   }
   await safeOpenTextDocument(
     reviewUri,

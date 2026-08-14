@@ -24,6 +24,12 @@ import { runTrackedOperation } from "../utils/taskOperations";
 import {
   readTextIfExists,
 } from "../utils/fileUtils";
+import { resolveHeadCommitSha } from "../utils/gitRepoInfo";
+import {
+  computeReviewFreshness,
+  parseReviewedCommitSha,
+  REVIEWED_COMMIT_STAGES,
+} from "../utils/reviewReadiness";
 import { executeProposedAction } from "../utils/globalAssistantActions";
 import { PendingOperationsStore } from "../state/pendingOperationsStore";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
@@ -306,7 +312,24 @@ export async function readStageArtifactsForChat(
       vscode.Uri.joinPath(taskFolderUri, stageFilename)
     );
     if (stageContent?.trim()) {
-      sections.push(`### ${stageFilename} (current stage artifact)\n\n${stageContent}`);
+      let section = `### ${stageFilename} (current stage artifact)\n\n${stageContent}`;
+      // Review freshness, display-side only (chat never mutates the
+      // artifact): a stage review whose recorded commit is behind HEAD gets a
+      // note appended to its packed section, so the model answering the user
+      // does not present a superseded verdict as the current state.
+      if (
+        REVIEWED_COMMIT_STAGES.has(targetStage) &&
+        parseReviewedCommitSha(stageContent) !== undefined
+      ) {
+        const headSha = await resolveHeadCommitSha(taskFolderUri.fsPath);
+        const freshness = computeReviewFreshness(stageContent, headSha);
+        if (freshness.behindHead) {
+          section +=
+            `\n\n> ⚠ This review examined commit ${freshness.reviewedSha}, which is no longer HEAD — ` +
+            "its verdicts describe that commit, not the current workspace.";
+        }
+      }
+      sections.push(section);
     }
   }
 

@@ -17,6 +17,8 @@
  * regardless of readiness, so a low score can never render as a down arrow).
  */
 
+import { TaskStage } from "../types/taskProgress";
+
 export interface ReadinessResult {
   score: number | null;
   /** Formatted label e.g. "9/10" or "—/10" */
@@ -367,6 +369,203 @@ const REVIEWED_COMMIT_RE = /<!--\s*reviewed-commit:\s*([0-9a-f]{7,40})\s*-->/gi;
 export function parseReviewedCommitSha(content: string): string | undefined {
   const match = [...content.matchAll(REVIEWED_COMMIT_RE)].at(-1);
   return match?.[1];
+}
+
+/**
+ * Stages that record a `<!-- reviewed-commit: SHA -->` marker (2i) — the
+ * implementation and publish review stages, whose "previous review" a
+ * re-review is told to reconcile against can go stale relative to the
+ * workspace across many rounds (the task_5 evidence: a 62-commit, 8-day gap).
+ * Plan reviews assess plan.md prose, which isn't tied to commit history the
+ * same way, so they stay out of scope.
+ *
+ * Lives here (not in reviewActions.ts, where it was born) so the freshness
+ * primitives below and every trigger-point caller — review flows, the commit
+ * lifecycle, chat packing, the task tree — share one definition without a
+ * utils → commands dependency.
+ */
+export const REVIEWED_COMMIT_STAGES: ReadonlySet<TaskStage> = new Set([
+  "impl-high-review",
+  "impl-low-review",
+  "publish",
+]);
+
+/** The placeholder a workspace-change staling writes (reviewActions.ts's
+ * markReviewArtifactStale). Freshness marking must never touch one: it has
+ * no Readiness line and its staleness is already its whole content. */
+const STALE_REVIEW_PLACEHOLDER_PREFIX_V1 = "# Review Stale";
+
+/**
+ * The one banner line {@link upsertStaleReviewBanner} manages. Kept exact so
+ * the upsert can find — and refresh or remove — a banner it (or an earlier
+ * run) previously wrote, which is what makes the transform idempotent.
+ */
+const STALE_REVIEW_BANNER_RE_V1 =
+  /^> ⚠ Stale: this review examined ([0-9a-f]{7,40}), which is no longer HEAD\.[ \t]*\r?$/i;
+
+/**
+ * The visible counterpart of the trailing `<!-- reviewed-commit: SHA -->`
+ * HTML comment, written at save time by {@link withVisibleReviewedCommitLineV1}.
+ * REVIEWED_COMMIT_RE matches only the comment form, so this line can never
+ * confuse {@link parseReviewedCommitSha} or any other existing parser.
+ */
+const VISIBLE_REVIEWED_COMMIT_LINE_RE_V1 =
+  /^> Reviewed commit: ([0-9a-f]{7,40})[ \t]*\r?$/i;
+
+/** Per-line form of EXACT_READINESS_RE (trailing `\r` tolerated via `\s*`). */
+const READINESS_ANCHOR_LINE_RE_V1 =
+  /^Readiness:\s*(10(?:\.0+)?|[0-9](?:\.[0-9]+)?)\/10\s*$/;
+
+/**
+ * Prefix-tolerant SHA comparison: the recorded marker is usually the full
+ * 40-char HEAD at prompt time, but tests and hand-written artifacts use the
+ * 7-char short form. Two SHAs name the same commit when the shorter (at
+ * least 7 chars, the marker regex's own minimum) prefixes the longer.
+ */
+function shasReferToSameCommitV1(a: string, b: string): boolean {
+  const left = a.toLowerCase();
+  const right = b.toLowerCase();
+  if (left === right) {
+    return true;
+  }
+  const [shorter, longer] = left.length <= right.length ? [left, right] : [right, left];
+  return shorter.length >= 7 && longer.startsWith(shorter);
+}
+
+/** Where the review stands relative to HEAD. */
+export interface ReviewFreshnessV1 {
+  /** The commit the review assessed, or undefined when it recorded none. */
+  readonly reviewedSha: string | undefined;
+  /**
+   * True only when BOTH SHAs are known and name different commits. An
+   * unreadable marker or an unresolvable HEAD reports false — "cannot
+   * determine" must never read as "stale" (same rule parseReviewedCommitSha
+   * documents for its own callers).
+   */
+  readonly behindHead: boolean;
+}
+
+/**
+ * Compute whether a review artifact's recorded commit is behind HEAD.
+ * Pure: no git, no fs — the caller resolves HEAD once and reuses it.
+ */
+export function computeReviewFreshness(
+  content: string,
+  headSha: string | undefined
+): ReviewFreshnessV1 {
+  const reviewedSha = parseReviewedCommitSha(content);
+  return {
+    reviewedSha,
+    behindHead:
+      reviewedSha !== undefined &&
+      headSha !== undefined &&
+      !shasReferToSameCommitV1(reviewedSha, headSha),
+  };
+}
+
+/**
+ * Insert, refresh, or remove the single stale banner line that marks a review
+ * whose recorded commit is no longer HEAD:
+ *
+ *   > ⚠ Stale: this review examined abc1234, which is no longer HEAD.
+ *
+ * Why this exists: `reviewed-commit` travels as a trailing HTML comment, so a
+ * superseded review reads as current — confident prose, a readiness score,
+ * nothing marking it stale. That misled the operator three times in one
+ * session on 2026-08-07_task_1. The workspace-change placeholder
+ * (markReviewArtifactStale) covers only the "artifact changed" case; a review
+ * whose commit merely fell behind HEAD had no marker at all.
+ *
+ * Pure, idempotent, byte-preserving: the only permitted mutation is the one
+ * banner line — inserted immediately after the leading `Readiness: N/10` line
+ * (so the review contract's Readiness line stays the first content line, and
+ * isStrictPerfectReview never reads the banner instead), or at the very top
+ * when no Readiness line exists. Returns the input unchanged (same string)
+ * when there is nothing to do:
+ *
+ *  - a `# Review Stale` placeholder (already a staleness marker);
+ *  - no reviewed-commit marker, or no HEAD to compare against — "cannot
+ *    determine" never reads as "stale";
+ *  - the recorded commit still matches HEAD — except that THIS case removes a
+ *    leftover banner, so a review that is current again heals itself.
+ */
+export function upsertStaleReviewBanner(
+  content: string,
+  headSha: string | undefined
+): string {
+  if (content.trimStart().startsWith(STALE_REVIEW_PLACEHOLDER_PREFIX_V1)) {
+    return content;
+  }
+  const reviewedSha = parseReviewedCommitSha(content);
+  if (!reviewedSha || !headSha) {
+    return content;
+  }
+  const lines = content.split("\n");
+  const bannerIndex = lines.findIndex((line) => STALE_REVIEW_BANNER_RE_V1.test(line));
+  if (shasReferToSameCommitV1(reviewedSha, headSha)) {
+    if (bannerIndex === -1) {
+      return content;
+    }
+    lines.splice(bannerIndex, 1);
+    return lines.join("\n");
+  }
+  const desired = `> ⚠ Stale: this review examined ${reviewedSha}, which is no longer HEAD.`;
+  if (bannerIndex !== -1) {
+    const existing = lines[bannerIndex]!;
+    const eol = existing.endsWith("\r") ? "\r" : "";
+    if (existing === desired + eol) {
+      return content;
+    }
+    lines[bannerIndex] = desired + eol;
+    return lines.join("\n");
+  }
+  const anchorIndex = lines.findIndex((line) => READINESS_ANCHOR_LINE_RE_V1.test(line));
+  const insertAt = anchorIndex === -1 ? 0 : anchorIndex + 1;
+  const anchorEol =
+    anchorIndex !== -1 && lines[anchorIndex]!.endsWith("\r") ? "\r" : "";
+  lines.splice(insertAt, 0, desired + anchorEol);
+  return lines.join("\n");
+}
+
+/**
+ * Write-time half of review freshness: give a freshly saved review a VISIBLE
+ * `> Reviewed commit: <sha>` line immediately after its leading Readiness
+ * line, mirroring the trailing `<!-- reviewed-commit: <sha> -->` HTML comment
+ * the model was asked to emit (which is kept — every existing parser reads
+ * only the comment form). An operator skimming the artifact no longer has to
+ * reach the last line to learn which commit the verdict describes.
+ *
+ * Also strips any stale-banner line from the content: a review being written
+ * NOW assesses the current workspace by construction, so a banner could only
+ * be the model echoing the previous review it was shown back into its own
+ * output. Idempotent: an existing visible line is refreshed to the marker's
+ * SHA in place, and content with no reviewed-commit marker is returned
+ * unchanged (same string).
+ */
+export function withVisibleReviewedCommitLineV1(content: string): string {
+  const reviewedSha = parseReviewedCommitSha(content);
+  if (!reviewedSha) {
+    return content;
+  }
+  const lines = content.split("\n");
+  const kept = lines.filter((line) => !STALE_REVIEW_BANNER_RE_V1.test(line));
+  const desired = `> Reviewed commit: ${reviewedSha}`;
+  const visibleIndex = kept.findIndex((line) => VISIBLE_REVIEWED_COMMIT_LINE_RE_V1.test(line));
+  if (visibleIndex !== -1) {
+    const existing = kept[visibleIndex]!;
+    const eol = existing.endsWith("\r") ? "\r" : "";
+    if (kept.length === lines.length && existing === desired + eol) {
+      return content;
+    }
+    kept[visibleIndex] = desired + eol;
+    return kept.join("\n");
+  }
+  const anchorIndex = kept.findIndex((line) => READINESS_ANCHOR_LINE_RE_V1.test(line));
+  const insertAt = anchorIndex === -1 ? 0 : anchorIndex + 1;
+  const anchorEol =
+    anchorIndex !== -1 && kept[anchorIndex]!.endsWith("\r") ? "\r" : "";
+  kept.splice(insertAt, 0, desired + anchorEol);
+  return kept.join("\n");
 }
 
 export function parseReviewProgress(content: string): ReviewProgress | null {

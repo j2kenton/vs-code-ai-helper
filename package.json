@@ -809,7 +809,7 @@
         },
         {
           "command": "vs-code-ai-helper.reconcilePlanChecklist",
-          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^task/",
+          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^task/ && viewItem =~ /-checklistUnreliable/",
           "group": "9_troubleshoot"
         }
       ]

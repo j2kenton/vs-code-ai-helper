@@ -1694,22 +1694,15 @@ function extractOpencodeFinalOutput(
 function normalizeCliOutput(
   def: CliProviderDefinition,
   stdout: string,
-  lastMessageFile: string | undefined,
   parsed?: ParsedCliEventLines,
   /** Forwarded to extractOpencodeFinalOutput — see its own doc comment. False (the legacy default) for every caller except createCliTextTransportV1's V1 path. */
   requiresFramedResult = false
 ): string {
-  let output = stripAnsi(stdout).trim();
-  if (lastMessageFile) {
-    try {
-      const fromFile = nodeFs.readFileSync(lastMessageFile, "utf8").trim();
-      if (fromFile.length > 0) {
-        output = stripAnsi(fromFile).trim();
-      }
-    } catch {
-      // Fall back to stdout when the CLI never wrote the file.
-    }
-  }
+  // The answer is always derived from stdout: the last-message-file read
+  // branch was removed on 2026-08-14 with the rest of the temp-file plumbing
+  // (see the usesLastMessageFile declaration comment in providers.ts), so a
+  // caller's already-produced `parsed` stream is always valid to reuse here.
+  const output = stripAnsi(stdout).trim();
 
   if (def.id === "kiro-cli") {
     return extractKiroFinalOutput(output);
@@ -1719,44 +1712,28 @@ function normalizeCliOutput(
     // Keyed off the tag, not the literal provider ID: devpass-cli is a
     // rebrand/fork of OpenCode emitting the byte-for-byte same --format
     // json event-stream shape (verified live), so it shares this same
-    // extractor rather than needing its own. parsed (when the caller
-    // already parsed stdout for another purpose) is only valid to reuse
-    // here when lastMessageFile didn't override output — neither
-    // opencode-cli nor devpass-cli ever sets usesLastMessageFile, so output
-    // is always derived from stdout for both and the shared parse stays
-    // correct. Passing `parsed` even when undefined is fine:
-    // extractOpencodeFinalOutput's own default parameter already parses
-    // internally in that case — an explicit undefined argument triggers a
-    // default the same as omitting it.
+    // extractor rather than needing its own. Passing `parsed` even when
+    // undefined is fine: extractOpencodeFinalOutput's own default parameter
+    // already parses internally in that case — an explicit undefined
+    // argument triggers a default the same as omitting it.
     return extractOpencodeFinalOutput(output, parsed, requiresFramedResult);
   }
 
   if (def.id === "cline-cli") {
-    // Same reasoning as opencode-cli above: cline never sets
-    // usesLastMessageFile either, so output is always derived from stdout
-    // and the shared parse (when the caller already produced one) stays
-    // valid to reuse.
     return extractClineFinalOutput(output, parsed);
   }
 
   if (def.id === "kimi-cli") {
-    // Same reasoning again: kimi-cli never sets usesLastMessageFile, so
-    // output is always stdout-derived and the shared parse stays valid.
     return extractKimiFinalOutput(output, parsed);
   }
 
   if (def.structuredEventStream === "codex") {
     // Keyed off the tag rather than the id purely for symmetry with the
-    // opencode branch; codex-cli is currently its only carrier. codex-cli sets
-    // usesLastMessageFile: false (deliberately — see its provider definition),
-    // so `output` is always stdout-derived here and the caller's shared parse
-    // stays valid to reuse.
+    // opencode branch; codex-cli is currently its only carrier.
     return extractCodexFinalOutput(output, parsed);
   }
 
   if (def.structuredEventStream === "claude") {
-    // claude-cli never sets usesLastMessageFile either, so output is always
-    // stdout-derived here and the caller's shared parse stays valid to reuse.
     return extractClaudeCliFinalOutput(output, parsed);
   }
 
@@ -1890,14 +1867,15 @@ export function createCliTextTransportV1(options: {
 
       let args: string[];
       try {
-        // No last-message file: V1 results are captured from stdout only.
+        // V1 results are captured from stdout only (AC-RUNNER-02) — the
+        // last-message-file parameter no longer exists.
         // requiresFramedResult: this transport's reply is parsed by
         // parseAiResultEnvelopeV1, so a `promptTransport: "file"` provider
         // restates the frame contract in argv rather than relying solely on
         // it being stated deep inside the prompt file (see that context
         // field's own doc comment for the live run this fixes). The legacy
         // path deliberately does NOT set it — legacy replies are free text.
-        args = def.buildArgs("text", model, undefined, {
+        args = def.buildArgs("text", model, {
           cwd,
           promptFile,
           requiresFramedResult: true,
@@ -2029,7 +2007,7 @@ export function createCliTextTransportV1(options: {
                 // extractOpencodeFinalOutput's own doc comment.
                 const rawStdout = Buffer.concat(rawEventChunks).toString("utf8");
                 rawEventChunks.length = 0;
-                capture.handleStdout(normalizeCliOutput(def, rawStdout, undefined, undefined, true));
+                capture.handleStdout(normalizeCliOutput(def, rawStdout, undefined, true));
               }
               finish({ kind: "completed" });
               return;
@@ -2304,8 +2282,8 @@ export function checkArgvPromptSizeLimitV1(
 }
 
 /**
- * Run a provider CLI once: prompt in via stdin, answer out via stdout (or
- * the provider's last-message file). Cancellation kills the process tree.
+ * Run a provider CLI once: prompt in via stdin, answer out via stdout.
+ * Cancellation kills the process tree.
  */
 export async function execCliAgent(options: {
   def: CliProviderDefinition;
@@ -2328,14 +2306,6 @@ export async function execCliAgent(options: {
     onProgress,
     resumePreviousConversation,
   } = options;
-
-  let lastMessageFile: string | undefined;
-  if (def.usesLastMessageFile) {
-    lastMessageFile = nodePath.join(
-      os.tmpdir(),
-      `vs-code-ai-helper-${def.id}-${Date.now()}-${Math.random().toString(36).slice(2)}.md`
-    );
-  }
 
   const promptTransport = def.promptTransport ?? "stdin";
   const useShell = def.useShell ?? true;
@@ -2391,7 +2361,7 @@ export async function execCliAgent(options: {
   // this function does, via classifyCliFailure.
   let args: string[];
   try {
-    args = def.buildArgs(mode, model, lastMessageFile, {
+    args = def.buildArgs(mode, model, {
       cwd,
       promptFile,
       resumePreviousConversation,
@@ -2512,13 +2482,6 @@ export async function execCliAgent(options: {
       settled = true;
       clearTimeout(timeoutHandle);
       cancellationListener.dispose();
-      if (lastMessageFile) {
-        try {
-          nodeFs.unlinkSync(lastMessageFile);
-        } catch {
-          // Best-effort cleanup.
-        }
-      }
       cleanupPromptFile();
       resolve(result);
     };
@@ -2625,7 +2588,7 @@ export async function execCliAgent(options: {
       const sharedParsedEvents = effectiveDef.structuredEventStream
         ? parseJsonLineEvents(stdout)
         : undefined;
-      const output = normalizeCliOutput(effectiveDef, stdout, lastMessageFile, sharedParsedEvents);
+      const output = normalizeCliOutput(effectiveDef, stdout, sharedParsedEvents);
 
       if (code !== 0) {
         const friendly = toFriendlyError(effectiveDef, model, code, stderr, stdout, sharedParsedEvents);

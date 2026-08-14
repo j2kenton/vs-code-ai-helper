@@ -544,7 +544,7 @@ void describe("CLI output normalization", () => {
     assert.strictEqual(codex.usesLastMessageFile ?? false, false);
     assert.strictEqual(cliProviderSupportsV1StdoutCapture(codex), true);
     assert.ok(
-      codex.buildArgs("text", undefined, undefined, undefined).includes("--json"),
+      codex.buildArgs("text", undefined, undefined).includes("--json"),
       "codex must request its JSONL event stream"
     );
   });

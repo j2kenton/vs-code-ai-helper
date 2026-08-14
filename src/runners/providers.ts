@@ -202,20 +202,30 @@ export interface CliProviderDefinition {
    * Build the CLI arguments. "text" mode must keep the
    * CLI read-only; "edit" mode may let it modify files in the working
    * directory (but not run arbitrary commands unapproved).
-   *
-   * lastMessageFile is only set for providers with usesLastMessageFile,
-   * and receives the path of a temp file the CLI should write its final
-   * message to.
    */
   buildArgs(
     mode: CliRunMode,
     model: string | undefined,
-    lastMessageFile: string | undefined,
     context?: CliBuildArgsContext
   ): string[];
   /**
    * True when the CLI's stdout is an event stream rather than the final
-   * answer, and the answer must instead be read from lastMessageFile.
+   * answer, and the answer must instead be read from a last-message temp
+   * file. No shipped provider sets this — codex-cli was the last one and
+   * moved to stdout capture via its `--json` event stream on 2026-08-11.
+   *
+   * The boolean and the fail-closed V1 gate it feeds
+   * (cliProviderSupportsV1StdoutCapture → providerModeUnavailable) are
+   * deliberately permanent: without the gate, a provider that answers via a
+   * temp file would be reserved for V1 and feed banner text into
+   * parseAiResultEnvelopeV1. The PLUMBING behind it (a `lastMessageFile`
+   * buildArgs parameter, the file-read branch in normalizeCliOutput, the
+   * temp-file creation in the legacy runner) was removed on 2026-08-14:
+   * after codex-cli's move it was exercised only by synthetic tests, so the
+   * first real temp-file provider would have run production code that had
+   * never executed. A future provider that sets this flag must therefore
+   * reintroduce that plumbing deliberately, with real coverage, rather than
+   * inherit never-executed code — see docs/verification/known-gaps.md.
    */
   usesLastMessageFile: boolean;
   /**
@@ -899,7 +909,7 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     // stay false; see extractCodexFinalOutput.
     usesLastMessageFile: false,
     structuredEventStream: "codex",
-    buildArgs(mode, model, lastMessageFile, context): string[] {
+    buildArgs(mode, model, context): string[] {
       const parsedModel = parseCodexModelSelection(model);
       // `--json` for the same reason kimi-cli uses `--output-format
       // stream-json`: Codex's human-readable stdout wraps the answer in a
@@ -927,9 +937,6 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
       }
       if (parsedModel.serviceTier) {
         args.push("-c", `service_tier="${parsedModel.serviceTier}"`);
-      }
-      if (lastMessageFile) {
-        args.push("--output-last-message", lastMessageFile);
       }
       // Read the prompt from stdin.
       args.push("-");
@@ -1074,7 +1081,7 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     permissionWarning:
       "Antigravity can create, change, or delete any file and run shell commands without asking, " +
       "in every stage including plan and review. Its CLI has no read-only or restricted mode.",
-    buildArgs(_mode, model, _lastMessageFile, context): string[] {
+    buildArgs(_mode, model, context): string[] {
       // promptTransport: "file" is a contract with the caller (see
       // CliBuildArgsContext.promptFile): cliAgentRunner always writes the
       // prompt to disk and passes its path before calling buildArgs for a
@@ -1578,7 +1585,7 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
         ? { KIMI_MODEL_THINKING_EFFORT: reasoningEffort }
         : undefined;
     },
-    buildArgs(_mode, model, _lastMessageFile, context): string[] {
+    buildArgs(_mode, model, context): string[] {
       // mode is deliberately NOT branched on for a permission flag here —
       // unlike every other provider in this file. Verified live against
       // kimi-code 0.29.2 that `-p`/`--prompt` rejects ALL THREE of

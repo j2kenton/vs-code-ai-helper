@@ -16,13 +16,19 @@ import { hasPreviousVersion } from "../utils/artifactBackups";
 import { readRedoSidecar, isRedoAvailableFromRecord } from "../utils/redoSidecar";
 import { resolveImplementationArtifact } from "../utils/implementationArtifactResolver";
 import { effectiveReviewProgressV1 } from "../utils/effectiveReviewProgress";
-import { parseReadiness } from "../utils/reviewReadiness";
+import {
+  computeReviewFreshness,
+  parseReadiness,
+  parseReviewedCommitSha,
+  REVIEWED_COMMIT_STAGES,
+} from "../utils/reviewReadiness";
+import { resolveHeadCommitSha } from "../utils/gitRepoInfo";
 import { TaskInventory, TaskWithProgress } from "../state/taskInventory";
 import { TaskProgressRecoveryEntryV1 } from "../services/taskProgressDiscoveryV1";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { buildTaskContextValue, buildStageContextValue, TaskCreationContextInput } from "../utils/contextTokens";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
-import { getConfiguredTaskRoot } from "../utils/taskRoot";
+import { getConfiguredTaskRoot, normalizePath } from "../utils/taskRoot";
 
 /**
  * The view ID for the tasks tree view (must match package.json)
@@ -309,6 +315,10 @@ export class TaskNode extends vscode.TreeItem {
       lintPassed: task.progress.lintPayload?.passed,
       isScheduled,
       isMetaManaged,
+      // The same flag the tooltip branch above reads: carrying it into the
+      // context value is what scopes the reconcilePlanChecklist menu entry to
+      // latched tasks only (package.json matches /-checklistUnreliable/).
+      checklistProgressUnreliable: task.progress.checklistProgressUnreliable === true,
       isPinned: task.progress.pinnedAt !== undefined,
       creationFootprint
     });
@@ -326,8 +336,10 @@ export class StageNode extends vscode.TreeItem {
     artifactUri: vscode.Uri | undefined,
     /** Optional readiness info for review stages: the score label plus, when
      * the review carries a usable progress marker, the checklist-reconciled
-     * step counts (see effectiveReviewProgressV1). */
-    readiness?: { label: string; progress?: { complete: number; total: number } },
+     * step counts (see effectiveReviewProgressV1). `staleReviewedSha` is set
+     * when the review's recorded commit is no longer HEAD (review freshness —
+     * display-side only, the artifact itself is never mutated here). */
+    readiness?: { label: string; progress?: { complete: number; total: number }; staleReviewedSha?: string },
     isScheduled: boolean = false,
     isMetaManaged: boolean = false,
     hasBackup: boolean = false,
@@ -387,11 +399,14 @@ export class StageNode extends vscode.TreeItem {
           // "finished" when the workflow had only completed some of the
           // plan's steps (a loop back into implementation looked like a
           // bug). A missing/malformed marker renders exactly the pre-existing
-          // score-only output.
+          // score-only output. A review whose recorded commit is no longer
+          // HEAD carries a "stale" qualifier so its score stops reading as a
+          // verdict on the current workspace.
+          const staleSuffix = readiness?.staleReviewedSha ? " · stale" : "";
           const readinessLabel = readiness
-            ? readiness.progress
-              ? `${readiness.label} · ${readiness.progress.complete} of ${readiness.progress.total} steps`
-              : readiness.label
+            ? (readiness.progress
+                ? `${readiness.label} · ${readiness.progress.complete} of ${readiness.progress.total} steps`
+                : readiness.label) + staleSuffix
             : undefined;
           const base = readinessLabel ? `current · ${readinessLabel}` : "current";
           this.description = escalated ? `${base} · escalated` : base;
@@ -441,6 +456,11 @@ export class StageNode extends vscode.TreeItem {
       tooltipStr +=
         `\n\nReview score: ${readiness.label}\n\n---\n\n` +
         `${readiness.progress.complete} of ${readiness.progress.total} steps completed`;
+    }
+    if (readiness?.staleReviewedSha) {
+      tooltipStr +=
+        `\n\n⚠ This review examined commit ${readiness.staleReviewedSha}, which is no longer HEAD — ` +
+        "re-run Review with AI to assess the current state.";
     }
     if (isScheduled) {
       this.description = this.description
@@ -550,8 +570,17 @@ type TaskTreeNode = TaskNode | StageNode | EmptyTasksNode | ProgressRecoveryNode
 export async function tryReadReadiness(
   artifactUri: vscode.Uri | undefined,
   stage: TaskStage,
-  folderUri: vscode.Uri
-): Promise<{ label: string; progress?: { complete: number; total: number } } | undefined> {
+  folderUri: vscode.Uri,
+  /**
+   * HEAD to judge the review's recorded commit against — either the SHA
+   * itself (tests inject it) or a lazy resolver (the provider passes its
+   * refresh-scoped cache, so one tree render costs at most one git
+   * resolution no matter how many review tasks are expanded). Either form
+   * is consulted only when the artifact actually carries a reviewed-commit
+   * marker; omitted entirely, HEAD is resolved directly.
+   */
+  headSha?: string | (() => Promise<string | undefined>)
+): Promise<{ label: string; progress?: { complete: number; total: number }; staleReviewedSha?: string } | undefined> {
   if (!artifactUri) {
     return undefined;
   }
@@ -560,7 +589,25 @@ export async function tryReadReadiness(
     const text = new TextDecoder().decode(content);
     const result = parseReadiness(text);
     const progress = await effectiveReviewProgressV1(folderUri, stage, text, "lenient");
-    return progress ? { label: result.label, progress } : { label: result.label };
+    // Review freshness (display-side only — the tree never mutates the
+    // artifact): a review whose recorded commit is behind HEAD is flagged so
+    // its score no longer reads as a verdict on the current workspace.
+    let staleReviewedSha: string | undefined;
+    if (
+      REVIEWED_COMMIT_STAGES.has(stage) &&
+      parseReviewedCommitSha(text) !== undefined
+    ) {
+      const resolvedHead =
+        typeof headSha === "function"
+          ? await headSha()
+          : headSha ?? (await resolveHeadCommitSha(folderUri.fsPath));
+      const freshness = computeReviewFreshness(text, resolvedHead);
+      if (freshness.behindHead) {
+        staleReviewedSha = freshness.reviewedSha;
+      }
+    }
+    const base = progress ? { label: result.label, progress } : { label: result.label };
+    return staleReviewedSha ? { ...base, staleReviewedSha } : base;
   } catch {
     return undefined;
   }
@@ -578,6 +625,19 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
   private readonly _onDidChangeTreeData = new vscode.EventEmitter<void>();
   readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
   private readonly taskNodesByFolder = new Map<string, TaskNode>();
+
+  // HEAD resolutions shared for the duration of one tree refresh, keyed by
+  // the containing workspace folder — falling back, for tasks outside every
+  // workspace folder (an absolute configured task root, taskRoot.ts), to the
+  // task folder's parent directory. Task folders are direct children of
+  // their task root (discoverTasksInRoot), so sibling tasks under one such
+  // root share a key while tasks in unrelated locations still get their
+  // own. Storing the in-flight promise means N expanded review tasks
+  // rendered concurrently still cost one git call, not N. Cleared at every
+  // root render — the funnel every _onDidChangeTreeData.fire() passes
+  // through — so an external HEAD move (pull/rebase in a terminal) is
+  // picked up on the next refresh.
+  private readonly headShaByRepo = new Map<string, Promise<string | undefined>>();
 
   private readonly _onDidLoadTasks = new vscode.EventEmitter<
     IncompleteTask[]
@@ -836,6 +896,11 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
 
   async getChildren(element?: TaskTreeNode): Promise<TaskTreeNode[]> {
     if (!element) {
+      // A root render is the start of a refresh cycle: every
+      // _onDidChangeTreeData.fire() re-queries the root before any task's
+      // stage nodes, so clearing here re-resolves HEAD exactly once per
+      // refresh while still observing external HEAD moves.
+      this.headShaByRepo.clear();
       await this.updateMetaManagedStatus();
     }
     if (element instanceof TaskNode) {
@@ -966,6 +1031,24 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
     return [...nodes, ...recoveryNodes];
   }
 
+  /**
+   * Resolve HEAD once per refresh cycle (see headShaByRepo). Lazy: only
+   * called when a current review stage's artifact actually carries a
+   * reviewed-commit marker, so a tree with no such artifact costs no git
+   * call at all.
+   */
+  private resolveHeadShaShared(folderUri: vscode.Uri): Promise<string | undefined> {
+    const key =
+      vscode.workspace.getWorkspaceFolder(folderUri)?.uri.toString() ??
+      normalizePath(path.dirname(folderUri.fsPath));
+    let pending = this.headShaByRepo.get(key);
+    if (pending === undefined) {
+      pending = resolveHeadCommitSha(folderUri.fsPath);
+      this.headShaByRepo.set(key, pending);
+    }
+    return pending;
+  }
+
   private async getStageNodes(task: IncompleteTask): Promise<StageNode[]> {
     const nodes: StageNode[] = [];
 
@@ -992,9 +1075,11 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
       // For review stages, only try to parse readiness when the stage is
       // current — done stages always render with the tick icon regardless of
       // readiness data present in the artifact.
-      let readiness: { label: string; progress?: { complete: number; total: number } } | undefined;
+      let readiness: { label: string; progress?: { complete: number; total: number }; staleReviewedSha?: string } | undefined;
       if (isReviewStage(stage) && status === "current") {
-        readiness = await tryReadReadiness(artifactUri, stage, task.folderUri);
+        readiness = await tryReadReadiness(artifactUri, stage, task.folderUri, () =>
+          this.resolveHeadShaShared(task.folderUri)
+        );
       }
 
       const isStageScheduled = status === "current" && task.progress.scheduledRun !== undefined;

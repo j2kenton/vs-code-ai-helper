@@ -95,6 +95,77 @@ sequence) when **either**:
    floor (1.93 base / 1.100 tool API) — at that point single-version host
    coverage is no longer honest evidence for the compat contract.
 
+## Deferred: sealed runs cannot maintain plan progress (checklist echo cannot travel with receipts)
+
+Recorded 2026-08-14, from the 2026-08-10/11 workflow-repair follow-up batch
+(item 6). **Decision: DEFER — do not paper over it.**
+
+A sealed implementation run (`TwoPhaseEditResultV1`) returns verified edit
+receipts, not prose, so the implementer's checklist echo has no channel to
+travel with the receipts: the round's checklist state is never recorded, and
+the `checklistProgressUnreliable` latch is the operating mitigation. Closing
+the gap properly needs a text channel added to `TwoPhaseEditResultV1` so the
+echo can travel with the receipts — a deliberate change to the digest-bound
+`SealedPlanRecordV1` protocol, and its own piece of work (digest versioning,
+receipt shape migration, and the merge path's treatment of a second
+checklist source).
+
+### What is NOT done while this gap is open
+
+Inferring ticks from diffs. Ticks are monotonic and completion-only; having a
+model guess which boxes a diff completed reintroduces the false-"done"
+failure the 2026-08-10/11 repair removed. Until the protocol change lands,
+a sealed round latches `checklistProgressUnreliable`, the completeness gate
+stands down, and the human reconciles by ticking the missed items and running
+**Ensemble: Mark Plan Checklist Reconciled**.
+
+### Closing trigger
+
+Close this gap when `TwoPhaseEditResultV1` gains a first-class text channel
+for the checklist echo, versioned as part of the `SealedPlanRecordV1` digest
+contract — not bolted on as an inferred field.
+
+## Deferred: lastMessageFile plumbing removed; the boolean gate stays
+
+Recorded 2026-08-14 (same batch, item 7). **Decision: DELETE the plumbing,
+keep the fail-closed gate.** `codex-cli` was the only provider that ever set
+`usesLastMessageFile`, and it moved to stdout capture via its `--json` event
+stream on 2026-08-11. The plumbing behind the flag — the `lastMessageFile`
+parameter of `buildArgs`, the file-read branch in `normalizeCliOutput`, and
+the temp-file creation/cleanup in the legacy runner — was exercised only by a
+synthetic test definition, so the first real temp-file provider would have
+run production code that had never executed. It has been removed. What stays,
+untouched, is the contract surface: the `usesLastMessageFile` boolean on
+`CliProviderDefinition` and `cliProviderSupportsV1StdoutCapture`, which fails
+closed (`providerModeUnavailable`) for any future provider that sets the
+flag. Such a provider must reintroduce the plumbing deliberately, with real
+coverage, rather than inherit never-executed code. The reasoning also lives
+at the flag's declaration in `src/runners/providers.ts`.
+
+## Open: retroactive ticks cannot carry plan items whose text contains " — "
+
+Recorded 2026-08-14, diagnosed while closing the workflow-repair follow-up
+batch. `parsePlanItemChecklistLine` (`src/utils/implementationChecklist.ts`)
+splits a `## Plan Item Checklist` entry into `<item> — <status> — <evidence>`
+on the FIRST ` — ` boundaries, so a plan item whose own text contains an
+internal ` — ` is truncated at that em-dash: the next fragment fails the
+`done` status check and the retroactive claim is silently dropped. On
+`.ensemble/2026-08-11_task_1` this left exactly the 8 em-dash-bearing items
+unticked across two rounds of verbatim retroactive entries while every
+em-dash-free item ticked — the previous round misattributed the loss to
+paraphrased text. Fallback that works today: manual reconciliation (tick the
+items in `plan-final.md` directly; ticks are monotonic and completion-only).
+
+Not fixed here because the checklist merge is explicitly out of scope for
+that task's plan, and per the recorded design decision this is a live-use
+signal for the "tasks blocked by how a document was read" trigger — record
+it, don't bolt on another parsing heuristic. A fix would make the status
+field, not the first em-dash, the split anchor (e.g. split on the LAST
+` — done/deferred/not reached` occurrence or on the retroactive marker), or —
+per the design note's preference — record the fact upstream instead of
+parsing it out of prose. This fails in the safe direction only: items stay
+unticked, the completeness gate holds the task open, nothing is advanced.
+
 ## Full-sequence run record
 
 The most recent full verification-sequence run is recorded in

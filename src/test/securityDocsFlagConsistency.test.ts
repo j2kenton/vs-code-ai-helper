@@ -104,7 +104,7 @@ function permissionFlagText(
     flagName,
     `${def.id} has no ${mode}-mode entry in the flag-name map — add one so this guard keeps covering every provider (or document why it's deliberately absent, as gemini-cli's text mode is).`
   );
-  const args = def.buildArgs(mode, undefined, undefined, {
+  const args = def.buildArgs(mode, undefined, {
     promptFile: "/tmp/prompt.txt",
   });
   const index = args.indexOf(flagName);

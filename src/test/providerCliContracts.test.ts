@@ -31,7 +31,7 @@ void describe("provider CLI contracts", () => {
     provider: CliProviderDefinition,
     model: string | undefined
   ): string[] {
-    return provider.buildArgs("text", model, "/tmp/last-message.md", {
+    return provider.buildArgs("text", model, {
       cwd: "/workspace/project",
       promptFile: "/tmp/prompt.txt",
     });
@@ -45,7 +45,7 @@ void describe("provider CLI contracts", () => {
     assert.strictEqual(kiro.useShell, false);
     assert.strictEqual(kiro.maxArgvPromptBytes, undefined);
 
-    const textArgs = kiro.buildArgs("text", undefined, undefined);
+    const textArgs = kiro.buildArgs("text", undefined);
     assert.deepStrictEqual(textArgs, [
       "chat",
       "--no-interactive",
@@ -53,7 +53,7 @@ void describe("provider CLI contracts", () => {
       "fs_read,grep,glob",
     ]);
 
-    const editArgs = kiro.buildArgs("edit", "claude-opus-4.6", undefined);
+    const editArgs = kiro.buildArgs("edit", "claude-opus-4.6");
     assert.deepStrictEqual(editArgs, [
       "chat",
       "--no-interactive",
@@ -83,7 +83,7 @@ void describe("provider CLI contracts", () => {
     // instructions" and did no work), so the path is wrapped in the shared
     // file-instruction sentence. Only the extension-generated path is
     // interpolated, so argv stays fixed-size for any prompt.
-    const textArgs = antigravity.buildArgs("text", undefined, undefined, {
+    const textArgs = antigravity.buildArgs("text", undefined, {
       promptFile: "/tmp/prompt.txt",
     });
     assert.deepStrictEqual(textArgs, [
@@ -92,7 +92,7 @@ void describe("provider CLI contracts", () => {
       "--dangerously-skip-permissions",
     ]);
 
-    const editArgs = antigravity.buildArgs("edit", "gemini-3-pro", undefined, {
+    const editArgs = antigravity.buildArgs("edit", "gemini-3-pro", {
       promptFile: "/tmp/prompt.txt",
     });
     assert.deepStrictEqual(editArgs, [
@@ -103,7 +103,7 @@ void describe("provider CLI contracts", () => {
       "gemini-3-pro",
     ]);
 
-    const resumedArgs = antigravity.buildArgs("edit", undefined, undefined, {
+    const resumedArgs = antigravity.buildArgs("edit", undefined, {
       promptFile: "/tmp/prompt.txt",
       resumePreviousConversation: true,
     });
@@ -127,11 +127,11 @@ void describe("provider CLI contracts", () => {
     // throw its own TypeError containing the word "promptFile" even if the
     // explicit guard were deleted, making a looser regex pass vacuously.
     assert.throws(
-      () => antigravity.buildArgs("text", undefined, undefined, {}),
+      () => antigravity.buildArgs("text", undefined, {}),
       /misconfiguration/
     );
     assert.throws(
-      () => antigravity.buildArgs("text", undefined, undefined),
+      () => antigravity.buildArgs("text", undefined),
       /misconfiguration/
     );
   });
@@ -152,7 +152,7 @@ void describe("provider CLI contracts", () => {
       "a JSON statusCode 401 must show opencode's sign-in recovery hint"
     );
 
-    const textArgs = opencode.buildArgs("text", undefined, undefined);
+    const textArgs = opencode.buildArgs("text", undefined);
     assert.deepStrictEqual(textArgs, [
       "run",
       "--format",
@@ -161,7 +161,7 @@ void describe("provider CLI contracts", () => {
       "plan",
     ]);
 
-    const editArgs = opencode.buildArgs("edit", "openai/gpt-5", undefined);
+    const editArgs = opencode.buildArgs("edit", "openai/gpt-5");
     assert.deepStrictEqual(editArgs, [
       "run",
       "--format",
@@ -199,7 +199,7 @@ void describe("provider CLI contracts", () => {
 
     const opencode = getCliProvider("opencode-cli");
     assert.ok(opencode);
-    const editArgs = opencode.buildArgs("edit", "opencode/deepseek-v4-flash@high", undefined);
+    const editArgs = opencode.buildArgs("edit", "opencode/deepseek-v4-flash@high");
     assert.deepStrictEqual(editArgs, [
       "run",
       "--format",
@@ -278,7 +278,7 @@ void describe("provider CLI contracts", () => {
     ];
 
     for (const provider of CLI_PROVIDERS) {
-      const textArgs = provider.buildArgs("text", undefined, undefined, {
+      const textArgs = provider.buildArgs("text", undefined, {
         promptFile: "/tmp/prompt.txt",
       });
       const bypassed = textArgs.filter((arg) =>
@@ -368,7 +368,7 @@ void describe("provider CLI contracts", () => {
     assert.strictEqual(kimi.maxArgvPromptBytes, undefined);
 
     const promptFile = "/tmp/ensemble-kimi-prompt.txt";
-    const args = kimi.buildArgs("text", "kimi-code/k3", undefined, { promptFile });
+    const args = kimi.buildArgs("text", "kimi-code/k3", { promptFile });
     assert.deepStrictEqual(args, [
       "--output-format",
       "stream-json",
@@ -422,7 +422,7 @@ void describe("provider CLI contracts", () => {
     );
 
     // The V1 text transport is what turns it on; buildArgs must thread it.
-    const framedArgs = kimi.buildArgs("text", "kimi-code/k3", undefined, {
+    const framedArgs = kimi.buildArgs("text", "kimi-code/k3", {
       promptFile,
       requiresFramedResult: true,
     });
@@ -430,7 +430,7 @@ void describe("provider CLI contracts", () => {
     // Edit mode is byte-identical: Kimi rejects every permission flag
     // alongside -p, so mode changes nothing (see permissionWarning).
     assert.deepStrictEqual(
-      kimi.buildArgs("edit", "kimi-code/k3", undefined, { promptFile }),
+      kimi.buildArgs("edit", "kimi-code/k3", { promptFile }),
       args
     );
 
@@ -440,11 +440,11 @@ void describe("provider CLI contracts", () => {
     // /promptFile/) so an unguarded property access throwing its own
     // TypeError cannot satisfy this vacuously — same rule as Antigravity's.
     assert.throws(
-      () => kimi.buildArgs("text", undefined, undefined, {}),
+      () => kimi.buildArgs("text", undefined, {}),
       /misconfiguration/
     );
     assert.throws(
-      () => kimi.buildArgs("text", undefined, undefined),
+      () => kimi.buildArgs("text", undefined),
       /misconfiguration/
     );
   });
@@ -484,7 +484,7 @@ void describe("provider CLI contracts", () => {
 
     // buildArgs strips the suffix before -m; buildEnv is where the effort
     // actually reaches the CLI.
-    const args = kimi.buildArgs("text", "kimi-code/k3@high", undefined, {
+    const args = kimi.buildArgs("text", "kimi-code/k3@high", {
       promptFile: "/tmp/prompt.txt",
     });
     const modelIndex = args.indexOf("-m");
@@ -533,13 +533,13 @@ void describe("provider CLI contracts", () => {
     );
 
     const promptFile = "/tmp/ensemble-kimi-prompt.txt";
-    const fresh = kimi.buildArgs("text", "kimi-code/k3", undefined, { promptFile });
+    const fresh = kimi.buildArgs("text", "kimi-code/k3", { promptFile });
     assert.ok(
       !fresh.includes("--continue"),
       "a first attempt must not continue a previous conversation"
     );
 
-    const resumed = kimi.buildArgs("text", "kimi-code/k3", undefined, {
+    const resumed = kimi.buildArgs("text", "kimi-code/k3", {
       promptFile,
       resumePreviousConversation: true,
     });
@@ -569,11 +569,7 @@ void describe("provider CLI contracts", () => {
       serviceTier: "priority",
     });
 
-    const textArgs = codex.buildArgs(
-      "text",
-      "gpt-5.6-terra@ultra+fast",
-      "/tmp/codex-last-message.md"
-    );
+    const textArgs = codex.buildArgs("text", "gpt-5.6-terra@ultra+fast");
     assert.deepStrictEqual(textArgs, [
       "exec",
       "--json",
@@ -588,17 +584,10 @@ void describe("provider CLI contracts", () => {
       'model_reasoning_effort="ultra"',
       "-c",
       'service_tier="priority"',
-      "--output-last-message",
-      "/tmp/codex-last-message.md",
       "-",
     ]);
 
-    const editArgs = codex.buildArgs(
-      "edit",
-      undefined,
-      undefined,
-      { cwd: "/workspace/project" }
-    );
+    const editArgs = codex.buildArgs("edit", undefined, { cwd: "/workspace/project" });
     assert.deepStrictEqual(editArgs, [
       "exec",
       "--json",
@@ -635,7 +624,7 @@ void describe("provider CLI contracts", () => {
     // comment): claude-cli's plain `text` mode carries no structural failure
     // signal, so a rate-limit refusal was only inferable from prose, unlike
     // every other structuredEventStream provider here.
-    const textArgs = claude.buildArgs("text", "sonnet@high", undefined);
+    const textArgs = claude.buildArgs("text", "sonnet@high");
     assert.deepStrictEqual(textArgs, [
       "-p",
       "--output-format",
@@ -654,7 +643,7 @@ void describe("provider CLI contracts", () => {
     // Edit mode is untouched: it keeps the original plain "text" format,
     // since edit-mode runs are captured for their workspace file changes,
     // not a parsed summary string.
-    const editArgs = claude.buildArgs("edit", "sonnet@high", undefined);
+    const editArgs = claude.buildArgs("edit", "sonnet@high");
     assert.deepStrictEqual(editArgs, [
       "-p",
       "--output-format",
@@ -713,7 +702,6 @@ void describe("provider CLI contracts", () => {
     const textArgs = cline.buildArgs(
       "text",
       "cline-pass/deepseek-v4-pro@high",
-      undefined,
       { cwd: "/workspace/project", promptFile: "/tmp/prompt.txt" }
     );
     assert.deepStrictEqual(textArgs, [
@@ -732,7 +720,7 @@ void describe("provider CLI contracts", () => {
       "cline's buildArgs must never pass cwd through argv"
     );
 
-    const editArgs = cline.buildArgs("edit", undefined, undefined, {
+    const editArgs = cline.buildArgs("edit", undefined, {
       promptFile: "/tmp/prompt.txt",
     });
     assert.deepStrictEqual(editArgs, [
@@ -778,7 +766,7 @@ void describe("provider CLI contracts", () => {
       reasoningEffort: "high",
     });
 
-    const args = cline.buildArgs("text", withEffort.model, undefined, {
+    const args = cline.buildArgs("text", withEffort.model, {
       promptFile: "/tmp/prompt.txt",
     });
     const modelIndex = args.indexOf("-m");

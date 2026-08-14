@@ -19,6 +19,15 @@ export interface TaskContextInput {
   lintPassed?: boolean;
   isScheduled?: boolean;
   isMetaManaged?: boolean;
+  /**
+   * The task's `checklistProgressUnreliable` latch (see taskProgress.ts): a
+   * round landed changes the plan checklist could not record, so the
+   * completeness gate has stood down. Carried as a context token so the
+   * reconcile command's menu entry — the only way to clear the latch — shows
+   * only on tasks that actually carry it. Ignored for `creating` rows, which
+   * return their single recovery context before any suffix is applied.
+   */
+  checklistProgressUnreliable?: boolean;
   isPinned?: boolean;
   /** Present only when `status === "creating"` and a classification has published. */
   creationFootprint?: TaskCreationContextInput;
@@ -139,6 +148,14 @@ export function buildTaskContextValue(input: TaskContextInput): string {
 
   if (input.isMetaManaged) {
     tokens.push("meta-managed");
+  }
+
+  // Checklist-unreliable latch: gates the reconcilePlanChecklist menu entry
+  // (menus match /-checklistUnreliable/). Kept before the trailing pinned
+  // token so /-pinned$/ clauses keep matching; every existing /^task/ clause
+  // is a prefix match and is unaffected by the added suffix.
+  if (input.checklistProgressUnreliable) {
+    tokens.push("checklistUnreliable");
   }
 
   // Pinned marker last so menu `when` clauses can match /-pinned$/ without

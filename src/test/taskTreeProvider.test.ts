@@ -1,11 +1,14 @@
 import * as assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { describe, it } from "node:test";
 import * as vscode from "vscode";
-import { firstActiveInDisplayOrder, getStageNodeContextValue, orderTasksForDisplay, StageNode, tryReadReadiness } from "../views/taskTreeProvider";
+import { firstActiveInDisplayOrder, getStageNodeContextValue, orderTasksForDisplay, StageNode, TaskNode, TaskTreeProvider, tryReadReadiness } from "../views/taskTreeProvider";
 import type { IncompleteTask } from "../types/incompleteTask";
 import { buildTaskContextValue, buildStageContextValue, CREATION_RECOVERY_CONTEXT_V1 } from "../utils/contextTokens";
 import {
   AI_MODEL_STAGES,
+  STAGE_ARTIFACT_FILENAMES,
   STAGE_ORDER,
   migrateStage,
   type TaskStage,
@@ -710,6 +713,83 @@ void describe("Context Tokens Emission", () => {
     );
   });
 
+  void it("buildTaskContextValue emits the checklistUnreliable token only for latched tasks, keeping pinned trailing", () => {
+    // The token gates the reconcilePlanChecklist menu entry (package.json
+    // matches /-checklistUnreliable/): it must appear exactly when the task's
+    // checklistProgressUnreliable latch is set, and never move the pinned
+    // token off the end (menus match /-pinned$/).
+    assert.strictEqual(
+      buildTaskContextValue({ status: "active", currentStage: "impl", checklistProgressUnreliable: true }),
+      "task-active-checklistUnreliable"
+    );
+    assert.strictEqual(
+      buildTaskContextValue({ status: "active", currentStage: "impl" }),
+      "task-active",
+      "a healthy task must not carry the token — its menu entry stays hidden"
+    );
+    assert.strictEqual(
+      buildTaskContextValue({ status: "active", currentStage: "impl", checklistProgressUnreliable: false }),
+      "task-active",
+      "an explicitly-cleared latch must not carry the token either"
+    );
+    assert.strictEqual(
+      buildTaskContextValue({ status: "active", currentStage: "impl", checklistProgressUnreliable: true, isPinned: true }),
+      "task-active-checklistUnreliable-pinned",
+      "pinned stays in the trailing position so /-pinned$/ menu clauses keep matching"
+    );
+    assert.strictEqual(
+      buildTaskContextValue({
+        status: "paused",
+        currentStage: "publish",
+        isScheduled: true,
+        isMetaManaged: true,
+        checklistProgressUnreliable: true,
+        isPinned: true,
+      }),
+      "task-paused-scheduled-meta-managed-checklistUnreliable-pinned"
+    );
+    // A creating row returns its single recovery context before any suffix is
+    // applied — the latch token must never blend into it.
+    assert.strictEqual(
+      buildTaskContextValue({
+        status: "creating",
+        currentStage: "desc",
+        checklistProgressUnreliable: true,
+        creationFootprint: { footprintClass: "inspectionOnly", retryWithoutAdoptionEligible: false, deletionPending: false },
+      }),
+      CREATION_RECOVERY_CONTEXT_V1.inspectionOnly
+    );
+  });
+
+  void it("gates the reconcilePlanChecklist menu entry on the checklistUnreliable token", () => {
+    // Same package.json-reading contract pattern as stage3ActionMatrix /
+    // stageRevertContract: the menu contribution is the whole point of the
+    // token, so the entry's when-clause is pinned here against accidental
+    // broadening back to every /^task/ row.
+    const packageJson = JSON.parse(
+      fs.readFileSync(path.join(__dirname, "..", "..", "package.json"), "utf8")
+    ) as {
+      contributes?: {
+        menus?: Record<string, Array<{ command: string; when?: string }>>;
+      };
+    };
+    const contextMenus = packageJson.contributes?.menus?.["view/item/context"] ?? [];
+    const entries = contextMenus.filter(
+      (entry) => entry.command === "vs-code-ai-helper.reconcilePlanChecklist"
+    );
+    assert.ok(entries.length > 0, "Expected menu entries for reconcilePlanChecklist");
+    for (const entry of entries) {
+      assert.ok(
+        (entry.when ?? "").includes("viewItem =~ /-checklistUnreliable/"),
+        `reconcilePlanChecklist menu entry must be gated on the checklistUnreliable token: ${entry.when}`
+      );
+      assert.ok(
+        (entry.when ?? "").includes("viewItem =~ /^task/"),
+        `reconcilePlanChecklist menu entry must remain scoped to task rows: ${entry.when}`
+      );
+    }
+  });
+
   void it("buildStageContextValue returns expected lifecycle and feature flags", () => {
     assert.strictEqual(
       buildStageContextValue({ stage: "plan", status: "current", isPaused: false }),
@@ -941,6 +1021,262 @@ void describe("StageNode — review score and step progress", () => {
     try {
       const readiness = await tryReadReadiness(reviewUri, "impl-high-review", folderUri);
       assert.equal(readiness, undefined);
+    } finally {
+      restore();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// TaskTreeProvider — refresh-scoped HEAD cache (review freshness)
+//
+// The plan's task-tree freshness contract is one resolveHeadCommitSha call
+// per refresh cycle, no matter how many expanded tasks sit on a current
+// review stage. The provider keys an in-flight-promise cache by workspace
+// folder — falling back to the task folder's parent directory for tasks
+// outside every workspace folder (an absolute configured task root), so
+// sibling tasks under one such root still share a resolution — and clears
+// it at every root render, so a refresh shares one git call across tasks
+// while the next refresh still observes external HEAD moves (pull/rebase
+// in a terminal).
+// ---------------------------------------------------------------------------
+
+/* eslint-disable @typescript-eslint/no-var-requires */
+const gitRepoInfoModule = require("../utils/gitRepoInfo") as Record<string, unknown>;
+/* eslint-enable @typescript-eslint/no-var-requires */
+
+void describe("TaskTreeProvider — refresh-scoped HEAD cache", () => {
+  const REVIEWED_SHA = "a".repeat(40);
+  const HEAD_SHA = "b".repeat(40);
+
+  const STALE_REVIEW = [
+    "# Implementation Review",
+    "",
+    "Readiness: 6/10",
+    "",
+    "Body prose.",
+    "",
+    `<!-- reviewed-commit: ${REVIEWED_SHA} -->`,
+    "",
+  ].join("\n");
+
+  /** readFile + stat backed by an in-memory map, keyed by fsPath. */
+  function installFsStubs(files: Map<string, string>): () => void {
+    const fsRecord = vscode.workspace.fs as unknown as Record<string, unknown>;
+    const originalRead = fsRecord.readFile;
+    const originalStat = fsRecord.stat;
+    fsRecord.readFile = (uri: vscode.Uri): Promise<Uint8Array> => {
+      const text = files.get(uri.fsPath);
+      if (text === undefined) {
+        return Promise.reject(new Error(`ENOENT: no such file: ${uri.fsPath}`));
+      }
+      return Promise.resolve(new TextEncoder().encode(text));
+    };
+    fsRecord.stat = (uri: vscode.Uri): Promise<vscode.FileStat> =>
+      files.has(uri.fsPath)
+        ? Promise.resolve({ type: vscode.FileType.File, ctime: 0, mtime: 0, size: 1 })
+        : Promise.reject(new Error(`ENOENT: no such file: ${uri.fsPath}`));
+    return (): void => {
+      fsRecord.readFile = originalRead;
+      fsRecord.stat = originalStat;
+    };
+  }
+
+  /** getChildren() fires setContext via executeCommand; the stub throws on unregistered commands. */
+  async function withStubbedCommands<T>(callback: () => Promise<T>): Promise<T> {
+    const commandsStub = vscode.commands as typeof vscode.commands & {
+      _executeCommandOverride?: (id: string, ...args: unknown[]) => Promise<unknown>;
+    };
+    const previous = commandsStub._executeCommandOverride;
+    commandsStub._executeCommandOverride = (): Promise<unknown> => Promise.resolve(undefined);
+    try {
+      return await callback();
+    } finally {
+      commandsStub._executeCommandOverride = previous;
+    }
+  }
+
+  function makeInventoryWithReviewTasks(
+    fsPaths: string[]
+  ): import("../state/taskInventory").TaskInventory {
+    return {
+      getTasks: () =>
+        fsPaths.map((fsPath) => ({
+          taskFolderPath: fsPath,
+          folderName: path.basename(fsPath),
+          progress: {
+            currentStage: "impl-high-review" as TaskStage,
+            status: "active",
+            taskFolder: path.basename(fsPath),
+            createdAt: "2026-08-14T00:00:00.000Z",
+            updatedAt: "2026-08-14T00:00:00.000Z",
+          },
+          canonicalId: fsPath,
+        })),
+      refresh: async (): Promise<void> => {},
+      onDidChange: (_handler: () => void): { dispose: () => void } => ({ dispose(): void {} }),
+    } as unknown as import("../state/taskInventory").TaskInventory;
+  }
+
+  void it("resolves HEAD once per refresh across multiple expanded review tasks, and again on the next refresh", async () => {
+    const folderA = vscode.Uri.file("/workspace/tasks/head-cache-a");
+    const folderB = vscode.Uri.file("/workspace/tasks/head-cache-b");
+    const reviewName = STAGE_ARTIFACT_FILENAMES["impl-high-review"]!;
+    const restoreFs = installFsStubs(
+      new Map([
+        [vscode.Uri.joinPath(folderA, reviewName).fsPath, STALE_REVIEW],
+        [vscode.Uri.joinPath(folderB, reviewName).fsPath, STALE_REVIEW],
+      ])
+    );
+
+    const workspaceRecord = vscode.workspace as unknown as Record<string, unknown>;
+    const originalFolders = workspaceRecord.workspaceFolders;
+    workspaceRecord.workspaceFolders = [
+      { uri: vscode.Uri.file("/workspace"), name: "workspace", index: 0 },
+    ];
+
+    const originalResolve = gitRepoInfoModule.resolveHeadCommitSha;
+    let resolutions = 0;
+    gitRepoInfoModule.resolveHeadCommitSha = (): Promise<string | undefined> => {
+      resolutions += 1;
+      return Promise.resolve(HEAD_SHA);
+    };
+
+    const provider = new TaskTreeProvider(
+      makeInventoryWithReviewTasks([folderA.fsPath, folderB.fsPath])
+    );
+    try {
+      const roots = await withStubbedCommands(() => provider.getChildren());
+      const taskNodes = roots.filter((n): n is TaskNode => n instanceof TaskNode);
+      assert.equal(taskNodes.length, 2);
+
+      const stagesA = await provider.getChildren(taskNodes[0]);
+      await provider.getChildren(taskNodes[1]);
+      assert.equal(
+        resolutions,
+        1,
+        "both expanded review tasks must share one HEAD resolution within a refresh"
+      );
+
+      const reviewNode = stagesA.find(
+        (n): n is StageNode => n instanceof StageNode && n.stage === "impl-high-review"
+      );
+      assert.ok(reviewNode, "the current review stage renders a StageNode");
+      assert.ok(
+        String(reviewNode.description).includes("stale"),
+        "the cached path still flags a behind-HEAD review"
+      );
+
+      await withStubbedCommands(() => provider.getChildren());
+      await provider.getChildren(taskNodes[0]);
+      assert.equal(
+        resolutions,
+        2,
+        "a root render starts a new refresh cycle, so HEAD is re-resolved and external moves stay visible"
+      );
+    } finally {
+      provider.dispose();
+      gitRepoInfoModule.resolveHeadCommitSha = originalResolve;
+      workspaceRecord.workspaceFolders = originalFolders;
+      restoreFs();
+    }
+  });
+
+  void it("shares one HEAD resolution across sibling tasks under an out-of-workspace absolute task root", async () => {
+    // Absolute configured task roots outside every workspace folder are a
+    // supported configuration (taskRoot.ts resolveTaskRootCandidates). The
+    // cache must not fall back to per-task keys there: siblings under one
+    // root share the root as their parent directory, while a task under an
+    // unrelated root still resolves on its own.
+    const siblingA = vscode.Uri.file("/external-root/head-cache-a");
+    const siblingB = vscode.Uri.file("/external-root/head-cache-b");
+    const unrelated = vscode.Uri.file("/other-root/head-cache-c");
+    const reviewName = STAGE_ARTIFACT_FILENAMES["impl-high-review"]!;
+    const restoreFs = installFsStubs(
+      new Map([
+        [vscode.Uri.joinPath(siblingA, reviewName).fsPath, STALE_REVIEW],
+        [vscode.Uri.joinPath(siblingB, reviewName).fsPath, STALE_REVIEW],
+        [vscode.Uri.joinPath(unrelated, reviewName).fsPath, STALE_REVIEW],
+      ])
+    );
+
+    const workspaceRecord = vscode.workspace as unknown as Record<string, unknown>;
+    const originalFolders = workspaceRecord.workspaceFolders;
+    workspaceRecord.workspaceFolders = [
+      { uri: vscode.Uri.file("/workspace"), name: "workspace", index: 0 },
+    ];
+
+    const originalResolve = gitRepoInfoModule.resolveHeadCommitSha;
+    let resolutions = 0;
+    gitRepoInfoModule.resolveHeadCommitSha = (): Promise<string | undefined> => {
+      resolutions += 1;
+      return Promise.resolve(HEAD_SHA);
+    };
+
+    const provider = new TaskTreeProvider(
+      makeInventoryWithReviewTasks([siblingA.fsPath, siblingB.fsPath, unrelated.fsPath])
+    );
+    try {
+      const roots = await withStubbedCommands(() => provider.getChildren());
+      const taskNodes = roots.filter((n): n is TaskNode => n instanceof TaskNode);
+      assert.equal(taskNodes.length, 3);
+
+      const stageLists = [];
+      for (const node of taskNodes) {
+        stageLists.push(await provider.getChildren(node));
+      }
+      assert.equal(
+        resolutions,
+        2,
+        "sibling tasks under one out-of-workspace root share a resolution; the unrelated root gets its own"
+      );
+
+      for (const stages of stageLists) {
+        const reviewNode = stages.find(
+          (n): n is StageNode => n instanceof StageNode && n.stage === "impl-high-review"
+        );
+        assert.ok(reviewNode, "each task's current review stage renders a StageNode");
+        assert.ok(
+          String(reviewNode.description).includes("stale"),
+          "the shared-cache path still flags every behind-HEAD review"
+        );
+      }
+    } finally {
+      provider.dispose();
+      gitRepoInfoModule.resolveHeadCommitSha = originalResolve;
+      workspaceRecord.workspaceFolders = originalFolders;
+      restoreFs();
+    }
+  });
+
+  void it("consults the injected resolver lazily — only when the artifact carries a reviewed-commit marker", async () => {
+    const folderUri = vscode.Uri.file("/workspace/tasks/lazy-head");
+    const reviewUri = vscode.Uri.joinPath(folderUri, "impl-high-review.md");
+
+    let restore = installFsStubs(new Map([[reviewUri.fsPath, STALE_REVIEW]]));
+    try {
+      let calls = 0;
+      const readiness = await tryReadReadiness(reviewUri, "impl-high-review", folderUri, () => {
+        calls += 1;
+        return Promise.resolve(HEAD_SHA);
+      });
+      assert.equal(calls, 1, "a marker-bearing artifact resolves HEAD through the resolver");
+      assert.equal(readiness?.staleReviewedSha, REVIEWED_SHA);
+    } finally {
+      restore();
+    }
+
+    const noMarker = ["# Implementation Review", "", "Readiness: 9/10", ""].join("\n");
+    restore = installFsStubs(new Map([[reviewUri.fsPath, noMarker]]));
+    try {
+      let calls = 0;
+      const readiness = await tryReadReadiness(reviewUri, "impl-high-review", folderUri, () => {
+        calls += 1;
+        return Promise.resolve(HEAD_SHA);
+      });
+      assert.equal(calls, 0, "no reviewed-commit marker means no git resolution at all");
+      assert.ok(readiness, "the artifact still yields readiness");
+      assert.equal(readiness.staleReviewedSha, undefined);
     } finally {
       restore();
     }

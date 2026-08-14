@@ -69,7 +69,7 @@ void describe("execCliAgent argv prompt limits", () => {
       useShell: false,
       models: [{ model: undefined, name: "default" }],
       usesLastMessageFile: false,
-      buildArgs(_mode, _model, _lastMessageFile, context): string[] {
+      buildArgs(_mode, _model, context): string[] {
         capturedPromptFile = context?.promptFile;
         // Node script that reads the prompt file passed as its own argv and
         // prints its contents, standing in for `agy --print=<file>`.
@@ -120,7 +120,7 @@ void describe("execCliAgent argv prompt limits", () => {
       useShell: false,
       models: [{ model: undefined, name: "default" }],
       usesLastMessageFile: false,
-      buildArgs(_mode, _model, _lastMessageFile, context): string[] {
+      buildArgs(_mode, _model, context): string[] {
         capturedPromptFile = context?.promptFile;
         return [`--print=${context?.promptFile ?? ""}`];
       },
@@ -167,7 +167,7 @@ void describe("execCliAgent argv prompt limits", () => {
         errorMarkers: ["error: timeout waiting for response"],
         continuationPrompt,
       },
-      buildArgs(_mode, _model, _lastMessageFile, context): string[] {
+      buildArgs(_mode, _model, context): string[] {
         resumeFlags.push(context?.resumePreviousConversation);
         prompts.push(fs.readFileSync(context?.promptFile ?? "", "utf8"));
         return context?.resumePreviousConversation
