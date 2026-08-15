@@ -4734,7 +4734,12 @@ function describeGenerateImplementationFailureV1(outcome: TaskActionOutcomeV1): 
     case "failed":
       return `${outcome.code}${outcome.retryable ? " (retryable)" : ""}`;
     case "malformedResult":
-      return `the model's response was malformed (${outcome.code})`;
+      // Same dropped-`detail` bug as draftTaskWithAI's copy — see the note
+      // there. Third copy of this formatter; the shared one in
+      // taskActionOutcomeTextV1.ts is the correct version.
+      return `the model's response was malformed (${outcome.code}${
+        outcome.detail ? `: ${outcome.detail}` : ""
+      })`;
     case "unavailable":
       return outcome.code;
     case "recoveryRequired":

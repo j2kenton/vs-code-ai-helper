@@ -727,11 +727,38 @@ export async function runSealedImplementationV1(
         result.outcome.kind === "failed" || result.outcome.kind === "unavailable"
           ? result.outcome.code
           : result.outcome.kind;
+      // Surface WHY, not just the code. `ProviderChainExhaustionV1`'s own
+      // contract says the stage owner surfaces it — this path did not, so an
+      // exhausted chain reported a bare `providerModeUnavailable` and the
+      // per-candidate reasons (already computed, already carried here) were
+      // discarded. That cost hours of guessing on 2026-08-15 for a Copilot
+      // stage whose real reason was sitting in this object. Sibling cases
+      // above already pass `result.reason` through; this one now matches.
+      const exhaustion =
+        result.outcome.kind === "unavailable" ? result.outcome.chainExhaustion : undefined;
+      const parts: string[] = [];
+      if (exhaustion !== undefined && exhaustion.candidates.length > 0) {
+        parts.push(
+          `Every configured model was unavailable: ${exhaustion.candidates
+            .map((c) => `${c.storedModelId} (${c.providerLabel}) — ${c.reason}`)
+            .join("; ")}`
+        );
+      }
+      // The outcome VARIANT, not just its code. `unavailable` carries
+      // per-candidate chain evidence; `failed` carries none, and the two are
+      // indistinguishable from the code alone — which is exactly why the
+      // 2026-08-15 Copilot investigation could not tell whether the evidence
+      // was missing or simply not extracted. Naming the variant makes the
+      // next occurrence self-diagnosing instead of another guessing round.
+      if (exhaustion === undefined) {
+        parts.push(`outcome=${result.outcome.kind}, no chain evidence attached`);
+      }
+      const detail = parts.length > 0 ? ` ${parts.join(". ")}.` : "";
       return {
         status: "failed",
         filesChanged: [],
         failureKind: "generic",
-        errorMessage: `The edit action did not complete (${code}).`,
+        errorMessage: `The edit action did not complete (${code}).${detail}`,
         runnerId,
       };
     }
