@@ -1255,6 +1255,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           // [checkbox] [combo] [×]. Unchecking the checkbox skips the row
           // during resolution (model and position preserved); the × clears
           // the row entirely.
+          // NOTE: renderTable's fallback-strategy row mirrors this
+          // [checkbox][combo][×] shape with hidden spacers so the select
+          // stays flush with the combo column — if this template gains or
+          // loses a column, update that row to match.
           function modelRowHtml(kind, stage, selectedId, enabled) {
             return '<div class="model-row' + (enabled === false ? ' skipped' : '') + '">' +
               '<input type="checkbox" class="row-enabled" aria-label="Use this model" ' +
