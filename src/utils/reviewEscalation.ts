@@ -46,6 +46,15 @@ export function initReviewEscalationChat(provider: EscalationChatTarget): void {
  * anyway would suppress its own auto-advance/auto-publish dispatch for a
  * round that produced no visible outcome at all — a review that publishes,
  * records nothing, says nothing, and advances nothing.
+ *
+ * `extraMutation`, when supplied, is folded into the SAME
+ * `patchTaskProgressStrictV1` transaction as the pause/escalation write —
+ * applied only once the three CAS guards above have already decided to
+ * apply (never on a declined write, and never as a separate patch a crash
+ * could land between). Use this for state that must be durably true the
+ * instant the task is paused for this reason (e.g. a remedy latch the
+ * escalation reason names) rather than issuing a second
+ * `patchTaskProgressStrictV1` call after this one returns.
  */
 export async function escalateReviewToHuman(
   folderUri: vscode.Uri,
@@ -54,7 +63,8 @@ export async function escalateReviewToHuman(
   reason: string,
   reviewAttemptId: string | undefined,
   progressHint?: Pick<TaskProgress, "displayName">,
-  secondOpinionAttempted = false
+  secondOpinionAttempted = false,
+  extraMutation?: (current: TaskProgress) => TaskProgress
 ): Promise<boolean> {
   try {
     let applied = false;
@@ -102,10 +112,11 @@ export async function escalateReviewToHuman(
         return current;
       }
       applied = true;
-      return updateTaskStatus(
+      const paused = updateTaskStatus(
         recordEscalation(current, { stage, kind, reason, at: new Date().toISOString(), secondOpinionAttempted }),
         "paused"
       );
+      return extraMutation ? extraMutation(paused) : paused;
     });
     if (!applied) {
       return false;

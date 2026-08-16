@@ -62,6 +62,7 @@ function openSelection(options: {
   session: ProviderSelectionSessionV1;
   mode: AgentExecutionModeV1;
   modelId: string | undefined;
+  requireGuaranteedReadOnlyText?: boolean;
 }): ReturnType<typeof openV1RunnerSelection> {
   return openV1RunnerSelection({
     session: options.session,
@@ -69,6 +70,7 @@ function openSelection(options: {
     modelId: options.modelId,
     stage: "impl-high-review",
     workspaceCwd: "/workspace",
+    requireGuaranteedReadOnlyText: options.requireGuaranteedReadOnlyText,
   });
 }
 
@@ -318,6 +320,124 @@ void describe("openV1RunnerSelection", () => {
           exhausted.chainExhaustion?.candidates.map((candidate) => candidate.storedModelId),
           ["copilot:gpt-5"]
         );
+      }
+    } finally {
+      stub.restore();
+    }
+  });
+
+  /**
+   * Review blocker, 2026-08-14: a caller whose no-edit mandate must actually
+   * be enforced (`summary-only` recovery continuations,
+   * `implContinuationTextDispatchV1.ts`) cannot let the generic ranked
+   * selection substitute a write-capable backup — cline-cli/antigravity-cli/
+   * kimi-cli's text mode auto-approves every tool, so reserving one of them
+   * in place of a read-only primary would defeat the whole guarantee the
+   * caller opted into `requireGuaranteedReadOnlyText` for.
+   */
+  void it("requireGuaranteedReadOnlyText skips a write-capable backup and reserves the next read-only candidate", () => {
+    const stub = installModelSettings({
+      "impl-high-review": {
+        primary: "claude-cli:sonnet",
+        backups: ["cline-cli:pass", "codex-cli:gpt-5"],
+        strategy: "switch-to-backup",
+      },
+    });
+    try {
+      const session = openSession();
+      const selection = openSelection({
+        session,
+        mode: "text",
+        modelId: "claude-cli:sonnet",
+        requireGuaranteedReadOnlyText: true,
+      });
+
+      const first = selection.reserveNext(session.allocateAttempt());
+      assert.equal(first.kind, "reserved");
+      if (first.kind === "reserved") {
+        assert.equal(first.reserved.handle.runnerId, "claude-cli");
+        session.reportAttemptOutcome(
+          first.reserved.handle.correlation.attemptId,
+          "providerUnavailablePreInvocation"
+        );
+      }
+
+      // cline-cli is ranked next but is not guaranteed read-only — it must be
+      // surfaced as an explicit skipped candidate, never silently reserved.
+      const second = selection.reserveNext(session.allocateAttempt());
+      assert.equal(second.kind, "candidateUnavailable");
+      if (second.kind === "candidateUnavailable") {
+        assert.equal(second.code, "providerModeUnavailable");
+        assert.equal(second.runnerId, "cline-cli");
+      }
+
+      // codex-cli IS guaranteed read-only text mode, so selection reserves it.
+      const third = selection.reserveNext(session.allocateAttempt());
+      assert.equal(third.kind, "reserved");
+      if (third.kind === "reserved") {
+        assert.equal(third.reserved.handle.runnerId, "codex-cli");
+      }
+    } finally {
+      stub.restore();
+    }
+  });
+
+  void it("requireGuaranteedReadOnlyText exhausts to providerModeUnavailable when every candidate is write-capable", () => {
+    const stub = installModelSettings({
+      "impl-high-review": {
+        primary: "cline-cli:pass",
+        backups: ["kimi-cli:default"],
+        strategy: "switch-to-backup",
+      },
+    });
+    try {
+      const session = openSession();
+      const selection = openSelection({
+        session,
+        mode: "text",
+        modelId: "cline-cli:pass",
+        requireGuaranteedReadOnlyText: true,
+      });
+      const result = selection.reserveNext(session.allocateAttempt());
+      assert.equal(result.kind, "noneRemaining");
+      if (result.kind === "noneRemaining") {
+        assert.equal(result.code, "providerModeUnavailable");
+        assert.deepEqual(
+          result.chainExhaustion?.candidates.map((candidate) => candidate.storedModelId),
+          ["cline-cli:pass", "kimi-cli:default"]
+        );
+      }
+    } finally {
+      stub.restore();
+    }
+  });
+
+  void it("requireGuaranteedReadOnlyText leaves ordinary text-mode selection unaffected when omitted (default false)", () => {
+    // Same chain as the skip test above, but WITHOUT the flag: cline-cli must
+    // reserve normally, exactly as every other text-mode caller (chat,
+    // review) has always been able to use it.
+    const stub = installModelSettings({
+      "impl-high-review": {
+        primary: "claude-cli:sonnet",
+        backups: ["cline-cli:pass"],
+        strategy: "switch-to-backup",
+      },
+    });
+    try {
+      const session = openSession();
+      const selection = openSelection({ session, mode: "text", modelId: "claude-cli:sonnet" });
+      const first = selection.reserveNext(session.allocateAttempt());
+      assert.equal(first.kind, "reserved");
+      if (first.kind === "reserved") {
+        session.reportAttemptOutcome(
+          first.reserved.handle.correlation.attemptId,
+          "providerUnavailablePreInvocation"
+        );
+      }
+      const second = selection.reserveNext(session.allocateAttempt());
+      assert.equal(second.kind, "reserved");
+      if (second.kind === "reserved") {
+        assert.equal(second.reserved.handle.runnerId, "cline-cli");
       }
     } finally {
       stub.restore();

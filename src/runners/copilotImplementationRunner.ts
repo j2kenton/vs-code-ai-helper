@@ -500,7 +500,7 @@ export interface ImplementationRunResult {
   summaryIsSynthetic?: boolean;
   errorMessage?: string;
   /** Stable provider-neutral failure classification; set on failed results only. */
-  failureKind?: "quota" | "temporarily-unavailable" | "generic";
+  failureKind?: "quota" | "temporarily-unavailable" | "model-entitlement" | "generic";
   /**
    * The provider's own authentication verdict, when the runner can produce
    * one, captured before any login hint was appended to errorMessage. CLI
@@ -519,6 +519,18 @@ export interface ImplementationRunResult {
   typeCheckFailed?: boolean;
   /** Truncated compiler/build output when `typeCheckFailed` is true. */
   typeCheckOutput?: string;
+  /**
+   * Part 7: set on a failed CLI edit round whose process was externally
+   * killed (wall-clock or inactivity watchdog) rather than a normal
+   * provider-reported failure. Recovery routing uses this together with
+   * filesChangedUnknown to pick the recovery mode: a known non-empty
+   * filesChanged routes to "inspect-and-complete" (edits may be mid-flight,
+   * never treat the process's own summary as trustworthy); an unknown
+   * change set routes to "unconstrained".
+   */
+  timedOut?: boolean;
+  /** Which watchdog produced `timedOut`, mirroring CliExecResult.timeoutReason. */
+  timeoutReason?: "wall-clock" | "inactivity";
 }
 
 /**

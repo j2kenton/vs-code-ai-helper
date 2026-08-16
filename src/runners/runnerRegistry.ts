@@ -22,6 +22,7 @@ import {
   cliCommandExists,
   cliProviderSupportsV1StdoutCapture,
   createCliTextTransportV1,
+  isCliTextModeGuaranteedReadOnlyV1,
   runImplementationWithCli,
 } from "./cliAgentRunner";
 import {
@@ -37,14 +38,34 @@ import {
 import {
   isModelProviderEnabled,
   isProviderSelectionConfigured,
+  resolveQuotaAccountKeyV1,
 } from "../config/settings";
-import { resolveEffectiveStageChainV1 } from "../utils/modelSelection";
-import { isAuthenticationFailure, recordQuotaObservation } from "../utils/quota";
+import {
+  findStagesSharingBlockedPrimaryV1,
+  resolveEffectiveStageChainV1,
+} from "../utils/modelSelection";
+import {
+  buildQuotaRemedyTextV1,
+  getQuotaLedgerEntry,
+  getQuotaObservation,
+  isAuthenticationFailure,
+  isCascadeEligibleFailureKind,
+  isQuotaResetBeyondThresholdV1,
+  parseQuotaResetV1,
+  recordQuotaObservation,
+} from "../utils/quota";
+import { getExtensionContextV1 } from "../utils/extensionContextV1";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
-import { clearStageFallbackReservation } from "../utils/taskProgressTransforms";
+import {
+  clearQuotaParkV1,
+  clearStageFallbackReservation,
+  QuotaParkClearingIdentityV1,
+  recordQuotaParkV1,
+} from "../utils/taskProgressTransforms";
 import { createCopilotLmToolSessionTransportV1 } from "../services/languageModelToolSessionV1";
 import { RequestLocalToolHandlerV1 } from "../services/requestLocalToolHandlerV1";
-import { TaskStage } from "../types/taskProgress";
+import { STAGE_DISPLAY_NAMES, TaskStage } from "../types/taskProgress";
+import { NotificationRouter } from "../utils/notificationRouter";
 import {
   ProviderChainCandidateStatusV1,
   ProviderChainExhaustionV1,
@@ -344,10 +365,98 @@ export async function recordActiveFallbackModel(
   return recorded;
 }
 
+/**
+ * Whether a run result is fresh evidence that a prior task-level
+ * `quotaParkRecord` block has resolved: either the run succeeded outright,
+ * or it failed with a classified, contradicting kind. A cancelled run (or a
+ * failed run with no `failureKind` classification) proves nothing about
+ * whether the block resolved, so it must not clear the record.
+ */
+function isQuotaParkClearingEvidence(result: {
+  status: "completed" | "failed" | "cancelled";
+  failureKind?: "quota" | "temporarily-unavailable" | "model-entitlement" | "generic";
+}): boolean {
+  return (
+    result.status === "completed" ||
+    (result.status === "failed" &&
+      result.failureKind !== undefined &&
+      result.failureKind !== "quota" &&
+      result.failureKind !== "model-entitlement")
+  );
+}
+
+/**
+ * Identity of the given model/provider for `quotaParkRecord` clearing
+ * comparisons, mirroring exactly how a park record's own `providerId`/
+ * `accountKey` are stamped at creation time (see the withheld-backup branch
+ * further below). Returns `undefined` if the model can no longer be resolved
+ * (e.g. its provider was disabled between resolution and this run) — callers
+ * treat that as "cannot prove a match" and skip clearing rather than clear
+ * unconditionally.
+ */
+function computeQuotaParkIdentityV1(
+  modelId: string | undefined,
+  // Pre-dispatch-resolved account key, when the caller already has one (see
+  // `recordQuotaObservation`'s `accountKeyOverride` doc comment for why this
+  // matters) — avoids re-resolving `ensemble.providerAccountLabels` from
+  // live settings after the run this identity describes has already
+  // completed.
+  accountKeyOverride?: string
+): QuotaParkClearingIdentityV1 | undefined {
+  try {
+    const effective = resolveEffectiveProvider(modelId);
+    return {
+      providerId: String(effective.kind === "cli" ? effective.def.id : "copilot"),
+      modelId: modelId ?? "(default)",
+      accountKey: accountKeyOverride ?? resolveQuotaAccountKeyV1(modelId),
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Records a run's quota/entitlement observation and — when the result is
+ * fresh evidence the block resolved (`isQuotaParkClearingEvidence`) — clears
+ * a matching task-level `quotaParkRecord` for that exact model/provider/
+ * account identity. `withQuotaObservation` already does this for the
+ * no-backup and stage-less paths; this is the same logic factored out so the
+ * backup-configured branch of `resolveRunnerForModel` (which dispatches the
+ * primary and each backup directly, not through `withQuotaObservation`) gets
+ * identical park-clearing behavior instead of only updating the session/
+ * global ledger. Review completion blocker: previously only the ledger was
+ * updated here, so a successful or contradicting retry through this branch
+ * never cleared a stale park banner even though the no-backup branch did.
+ */
+async function recordQuotaObservationAndClearParkV1(
+  stage: TaskStage,
+  modelId: string | undefined,
+  result: Pick<AgentRunResult, "status" | "failureKind" | "errorMessage">,
+  taskFolderUri: vscode.Uri | undefined,
+  accountKey: string | undefined
+): Promise<void> {
+  await recordQuotaObservation(
+    stage,
+    modelId,
+    result.failureKind,
+    result.errorMessage,
+    getExtensionContextV1(),
+    undefined,
+    accountKey
+  );
+  const identity = computeQuotaParkIdentityV1(modelId, accountKey);
+  if (taskFolderUri && identity && isQuotaParkClearingEvidence(result)) {
+    await patchTaskProgressStrictV1(taskFolderUri, (current) =>
+      clearQuotaParkV1(current, identity)
+    );
+  }
+}
+
 function withQuotaObservation(
   runner: AgentRunner,
   stage: TaskStage,
-  modelId: string | undefined
+  modelId: string | undefined,
+  taskFolderUri?: vscode.Uri
 ): AgentRunner {
   return {
     id: runner.id,
@@ -356,8 +465,12 @@ function withQuotaObservation(
     isAvailable: () => runner.isAvailable(),
     async run(request, token): Promise<AgentRunResult> {
       assertNoUnauthorizedV1CorrelationV0(request);
+      // Captured BEFORE dispatch so a label edit made while this run is in
+      // flight cannot make the ledger write below and the park-clearing
+      // identity disagree about which account this one attempt belongs to.
+      const accountKey = resolveQuotaAccountKeyV1(modelId);
       const result = await runner.run(request, token);
-      recordQuotaObservation(stage, modelId, result.failureKind, result.errorMessage);
+      await recordQuotaObservationAndClearParkV1(stage, modelId, result, taskFolderUri, accountKey);
       return result;
     },
   };
@@ -485,7 +598,7 @@ export function resolveRunnerForModel(
   // (session-observed only — see utils/quota.ts for why a numeric percentage
   // isn't offered) so the settings webview can show real, non-fabricated
   // telemetry instead of a permanent placeholder.
-  const instrumented = withQuotaObservation(primary, stage, modelId);
+  const instrumented = withQuotaObservation(primary, stage, modelId, taskFolderUri);
   const backupModels = backupModelsForStage(stage, modelId);
   if (backupModels.length === 0) {
     return { ...resolved, runner: instrumented };
@@ -509,6 +622,11 @@ export function resolveRunnerForModel(
             );
           let last: AgentRunResult | undefined;
           for (const backupModel of backupModels) {
+            // Captured before this backup's own availability check/dispatch —
+            // same rationale as the primary's `accountKey` above: keeps this
+            // one attempt's ledger identity fixed even if the label setting
+            // changes while the backup is in flight.
+            const backupAccountKey = resolveQuotaAccountKeyV1(backupModel);
             const fallback = toResolvedRunner(resolveEffectiveProvider(backupModel));
             const fallbackAvailability = await fallback.runner.isAvailable();
             if (!fallbackAvailability.available) {
@@ -520,7 +638,13 @@ export function resolveRunnerForModel(
                   : "temporarily-unavailable",
                 errorMessage: fallbackAvailability.reason ?? "Backup model is unavailable.",
               };
-              recordQuotaObservation(stage, backupModel, last.failureKind, last.errorMessage);
+              await recordQuotaObservationAndClearParkV1(
+                stage,
+                backupModel,
+                last,
+                taskFolderUri ?? request.taskFolderUri,
+                backupAccountKey
+              );
               if (isAuthenticationFailure(fallbackAvailability.reason)) {
                 await releaseReservation();
                 return last;
@@ -528,7 +652,13 @@ export function resolveRunnerForModel(
               continue;
             }
             const fallbackResult = await fallback.runner.run({ ...request, modelId: fallback.nativeModelId }, token);
-            recordQuotaObservation(stage, backupModel, fallbackResult.failureKind, fallbackResult.errorMessage);
+            await recordQuotaObservationAndClearParkV1(
+              stage,
+              backupModel,
+              fallbackResult,
+              taskFolderUri ?? request.taskFolderUri,
+              backupAccountKey
+            );
             last = fallbackResult;
             if (fallbackResult.status === "completed") {
               await recordActiveFallbackModel(
@@ -544,8 +674,7 @@ export function resolveRunnerForModel(
             // backup a known-good route for later runs.
             if (
               fallbackResult.status === "cancelled" ||
-              (fallbackResult.failureKind !== "quota" &&
-                fallbackResult.failureKind !== "temporarily-unavailable")
+              !isCascadeEligibleFailureKind(fallbackResult.failureKind)
             ) {
               await releaseReservation();
               return fallbackResult;
@@ -565,9 +694,19 @@ export function resolveRunnerForModel(
           }
           return { runnerId: primary.id, status: "failed", failureKind: "temporarily-unavailable", errorMessage: availability.reason ?? "Model is temporarily unavailable." };
         }
+        // Captured before this attempt's own dispatch — same rationale as
+        // `primaryAccountKey` in withQuotaObservation above: keeps this run's
+        // ledger identity fixed even if the label setting changes mid-run.
+        const primaryRunAccountKey = resolveQuotaAccountKeyV1(modelId);
         const result = await primary.run(request, token);
-        recordQuotaObservation(stage, modelId, result.failureKind, result.errorMessage);
-        if (result.failureKind !== "quota" && result.failureKind !== "temporarily-unavailable") {
+        await recordQuotaObservationAndClearParkV1(
+          stage,
+          modelId,
+          result,
+          taskFolderUri ?? request.taskFolderUri,
+          primaryRunAccountKey
+        );
+        if (!isCascadeEligibleFailureKind(result.failureKind)) {
           return result;
         }
 
@@ -749,6 +888,16 @@ export async function runImplementationForModel(options: {
   assertNoUnauthorizedV1CorrelationV0(options);
   const effective = resolveEffectiveProvider(options.modelId);
   const primaryProviderLabel = toResolvedRunner(effective).providerLabel;
+  // Shared identity for this attempt's model/provider/account — used both to
+  // gate quotaParkRecord clearing (below) and to stamp a new park record
+  // (further below), so the two always agree on what "this run" means.
+  const primaryProviderId = String(effective.kind === "cli" ? effective.def.id : "copilot");
+  const primaryAccountKey = resolveQuotaAccountKeyV1(options.modelId);
+  const primaryParkIdentity: QuotaParkClearingIdentityV1 = {
+    providerId: primaryProviderId,
+    modelId: options.modelId ?? "(default)",
+    accountKey: primaryAccountKey,
+  };
   const withActualIdentity = <T extends ImplementationRunResult & { runnerId: string }>(
     base: T,
     providerLabel: string,
@@ -791,7 +940,34 @@ export async function runImplementationForModel(options: {
   };
   const result = await run(effective);
   if (options.stage) {
-    recordQuotaObservation(options.stage, options.modelId, result.failureKind, result.errorMessage);
+    await recordQuotaObservation(options.stage, options.modelId, result.failureKind, result.errorMessage, getExtensionContextV1(), undefined, primaryAccountKey);
+  }
+  // Review completion blocker: a successful same-stage retry (the withheld
+  // branch below's own suggested remedy — "rerun this stage") previously
+  // left a prior `quotaParkRecord` in place, so the task tree tooltip could
+  // keep reporting a resolved block as still active. Clear it the moment
+  // this stage's run succeeds.
+  //
+  // The same review also flagged that a FAILED retry contradicting the
+  // parked kind (e.g. now "temporarily-unavailable" or "generic" instead of
+  // "quota"/"model-entitlement") left the task-level record stale too —
+  // mirroring updateQuotaLedger's own clearing rule (quota.ts), which
+  // already treats "ok" or a contradicting non-quota/entitlement kind as
+  // proof the provider is no longer known-blocked.
+  //
+  // Both clearing branches require FRESH evidence, not merely "not a quota
+  // failure": a cancelled run (`status === "cancelled"`, `failureKind`
+  // typically undefined) proves nothing about whether the block resolved,
+  // so it must not clear the record. A second review finding: evidence from
+  // a DIFFERENT model/provider than the one the persisted record actually
+  // blocked proves nothing about that specific block either — `identity` is
+  // matched inside `clearQuotaParkV1` against the record's own
+  // providerId/modelId/accountKey, so a mismatched result now leaves the
+  // record in place instead of erasing it.
+  if (options.taskFolderUri && isQuotaParkClearingEvidence(result)) {
+    await patchTaskProgressStrictV1(options.taskFolderUri, (current) =>
+      clearQuotaParkV1(current, primaryParkIdentity)
+    );
   }
   // Codex review finding: a pre-resolved winning candidate (passed as
   // `modelId` above, differing from the stage's true `configuredPrimaryModelId`)
@@ -857,8 +1033,7 @@ export async function runImplementationForModel(options: {
   if (
     !authFailure &&
     primaryLeftTreeClean &&
-    (result.failureKind === "quota" ||
-      result.failureKind === "temporarily-unavailable") &&
+    isCascadeEligibleFailureKind(result.failureKind) &&
     options.stage &&
     chainWantsBackup
   ) {
@@ -875,6 +1050,9 @@ export async function runImplementationForModel(options: {
       if (backupModel === options.modelId) {
         continue;
       }
+      // Captured before this backup's availability check/dispatch — same
+      // rationale as `primaryAccountKey` above.
+      const backupAccountKey = resolveQuotaAccountKeyV1(backupModel);
       let useCrossProviderBackup = false;
       if (!options.allowCrossProviderBackups) {
         let backupKind: "cli" | "copilot" | undefined;
@@ -911,7 +1089,7 @@ export async function runImplementationForModel(options: {
             : "temporarily-unavailable" as const,
           errorMessage: fallbackAvailability.availability.reason ?? "Backup model is unavailable.",
         };
-        recordQuotaObservation(options.stage, backupModel, fallbackFailure.failureKind, fallbackFailure.errorMessage);
+        await recordQuotaObservation(options.stage, backupModel, fallbackFailure.failureKind, fallbackFailure.errorMessage, getExtensionContextV1(), undefined, backupAccountKey);
         if (isAuthenticationFailure(fallbackAvailability.availability.reason)) {
           await releaseReservation();
           return withActualIdentity(fallbackFailure, fallbackAvailability.providerLabel, backupModel);
@@ -921,7 +1099,7 @@ export async function runImplementationForModel(options: {
       const fallbackResult = useCrossProviderBackup
         ? await options.runCrossProviderBackup!(backupModel)
         : await run(resolveEffectiveProvider(backupModel));
-      recordQuotaObservation(options.stage, backupModel, fallbackResult.failureKind, fallbackResult.errorMessage);
+      await recordQuotaObservation(options.stage, backupModel, fallbackResult.failureKind, fallbackResult.errorMessage, getExtensionContextV1(), undefined, backupAccountKey);
       if (fallbackResult.status === "completed") {
         await recordActiveFallbackModel(
           options.taskFolderUri,
@@ -935,8 +1113,7 @@ export async function runImplementationForModel(options: {
       // later implementation attempt to the same unauthenticated model.
       if (
         fallbackResult.status === "cancelled" ||
-        (fallbackResult.failureKind !== "quota" &&
-          fallbackResult.failureKind !== "temporarily-unavailable")
+        !isCascadeEligibleFailureKind(fallbackResult.failureKind)
       ) {
         await releaseReservation();
         return withActualIdentity(fallbackResult, fallbackAvailability.providerLabel, backupModel);
@@ -975,28 +1152,148 @@ export async function runImplementationForModel(options: {
     !authFailure &&
     result.filesChangedUnknown !== true &&
     result.filesChanged.length > 0 &&
-    (result.failureKind === "quota" ||
-      result.failureKind === "temporarily-unavailable") &&
+    isCascadeEligibleFailureKind(result.failureKind) &&
     options.stage &&
     chainWantsBackup
   ) {
     const limitLabel =
       result.failureKind === "quota"
         ? "a quota/rate limit"
-        : "the provider being temporarily unavailable";
+        : result.failureKind === "model-entitlement"
+          ? "a model-entitlement block"
+          : "the provider being temporarily unavailable";
+    const parkProviderId = primaryProviderId;
+    const parkAccountKey = primaryAccountKey;
+    const extensionContext = getExtensionContextV1();
+    // Known reset time, when this failure kind carries one at all ("resets
+    // at" language only applies to quota/model-entitlement — see
+    // QuotaParkRecordV1's doc comment). Prefers a fresh parse of THIS
+    // failure's own message, then the (restart-losing) session-observed
+    // value, then the durable cross-restart ledger — so a host restart
+    // between the original block and a later retry attempt still recovers
+    // the previously known reset time instead of silently falling back to
+    // "no known reset" wording.
+    const knownResetAt =
+      result.failureKind === "quota" || result.failureKind === "model-entitlement"
+        ? parseQuotaResetV1(result.errorMessage, new Date()) ??
+          getQuotaObservation(options.stage, options.modelId)?.resetAt ??
+          (extensionContext
+            ? getQuotaLedgerEntry(
+                extensionContext,
+                parkProviderId,
+                parkAccountKey,
+                options.modelId ?? "(default)"
+              )?.resetAt
+            : undefined)
+        : undefined;
+    const remedyText = buildQuotaRemedyTextV1(knownResetAt);
+    // Part 5 step 3b: a "far" outage (beyond the near-reset threshold) is
+    // never just this one stage's problem — every OTHER configurable stage
+    // whose effective primary chain resolves to this SAME blocked model id is
+    // either equally blocked or has already silently fallen through to a
+    // different backup. Name them so the operator learns this from one
+    // notification instead of one stage failure at a time.
+    const affectedStages =
+      knownResetAt !== undefined && isQuotaResetBeyondThresholdV1(knownResetAt)
+        ? findStagesSharingBlockedPrimaryV1(options.modelId ?? "(default)").filter(
+            (stage) => stage !== options.stage
+          )
+        : [];
+    const affectedStagesClause =
+      affectedStages.length > 0
+        ? ` This also affects: ${affectedStages.map((stage) => STAGE_DISPLAY_NAMES[stage]).join(", ")} — ` +
+          "each configured with the same primary model, so they are equally blocked (or already " +
+          "running on a different fallback)."
+        : "";
     const withheldMessage =
       `Hit ${limitLabel} on ${primaryProviderLabel}` +
       (result.errorMessage ? ` (${result.errorMessage})` : "") +
       `. This round already changed ${result.filesChanged.length} file(s), so Ensemble withheld the ` +
       "automatic switch to this stage's backup model — switching mid-round on a dirty working tree " +
-      "risks mixing two models' edits in one round. Rerun this stage to retry with the same model, " +
-      "or switch the stage's model before rerunning.";
+      `risks mixing two models' edits in one round. ${remedyText}${affectedStagesClause}`;
     options.onProgress(withheldMessage);
+    // Part 5 step 1: surface a "Rerun after reset" action alongside the
+    // withheld-cascade notice whenever a concrete, NEAR reset time is known
+    // — this is the one place a caller (not just a live progress stream
+    // reader) can learn there is a specific time worth arming a scheduled
+    // rerun for. Routed through NotificationRouter directly (rather than
+    // relying on whatever the caller does with the returned/`onProgress`-
+    // streamed message) so the action is attached exactly once, here,
+    // regardless of which caller invoked this cascade.
+    // Review completion blocker: this previously fired for EVERY known
+    // reset, including a "far" one (already past the near-reset threshold,
+    // same `affectedStagesClause` branch above) — offering a scheduled
+    // rerun there contradicts remedyText's own switch-model-only advice for
+    // a multi-day outage. Gated on the same threshold check that drives
+    // affectedStagesClause so the action and the remedy text never disagree.
+    if (
+      options.taskFolderUri &&
+      knownResetAt !== undefined &&
+      !isQuotaResetBeyondThresholdV1(knownResetAt)
+    ) {
+      NotificationRouter.showWarning(withheldMessage, undefined, undefined, undefined, {
+        command: "vs-code-ai-helper.scheduleQuotaResumeV1",
+        title: "Rerun after reset",
+        args: [{ taskFolderPath: options.taskFolderUri.fsPath, resetAtIso: knownResetAt }],
+      });
+    }
+    // Persist a durable record of the block — the same transaction that
+    // withholds the backup switch — so a host restart or a later
+    // notification can still know WHEN (if known) this provider is expected
+    // to recover, rather than relying solely on the restart-losing
+    // in-memory QuotaObservation map (quota.ts). Scoped to the two failure
+    // kinds "resets at" language applies to; a temporarily-unavailable
+    // outage has no predictable reset time and is deliberately left
+    // unrecorded here.
+    if (
+      options.taskFolderUri &&
+      (result.failureKind === "quota" || result.failureKind === "model-entitlement")
+    ) {
+      const record = {
+        modelId: options.modelId ?? "(default)",
+        providerId: parkProviderId,
+        accountKey: parkAccountKey,
+        failureKind: result.failureKind,
+        resetAt: knownResetAt,
+        observedAt: new Date().toISOString(),
+      };
+      await patchTaskProgressStrictV1(options.taskFolderUri, (current) =>
+        recordQuotaParkV1(current, record)
+      );
+    }
     return withActualIdentity(
       { ...result, errorMessage: withheldMessage },
       primaryProviderLabel,
       options.modelId
     );
+  }
+  // Part 7 diagnostic: neither cascade branch above fired, so this cascade-
+  // eligible failure falls straight through with no explanation of WHY no
+  // backup was attempted. Two distinct reasons land here and were previously
+  // indistinguishable in the run record: no backup is even CONFIGURED for
+  // this stage/chain (`chainWantsBackup` false), versus a backup IS
+  // configured but the working tree's state is UNKNOWN
+  // (`filesChangedUnknown` — git unavailable or not a repository — which the
+  // withheld-cascade branch above only explains for the KNOWN-dirty case).
+  if (
+    !authFailure &&
+    result.status === "failed" &&
+    isCascadeEligibleFailureKind(result.failureKind) &&
+    options.stage
+  ) {
+    if (!chainWantsBackup) {
+      options.onProgress(
+        `${primaryProviderLabel} hit ${result.failureKind ?? "a"} failure; no backup model is ` +
+          "configured for this stage/chain, so no automatic fallback was attempted."
+      );
+    } else if (result.filesChangedUnknown === true) {
+      options.onProgress(
+        `${primaryProviderLabel} hit ${result.failureKind ?? "a"} failure with the working ` +
+          "tree state unknown (git unavailable or not a repository); Ensemble withheld the " +
+          "automatic switch to this stage's backup model because a dirty-vs-clean tree could " +
+          "not be confirmed."
+      );
+    }
   }
   return withActualIdentity(result, primaryProviderLabel, options.modelId);
 }
@@ -1164,8 +1461,25 @@ export function openV1RunnerSelection(options: {
    * selection time by the caller — never carried inside a V1 request.
    */
   workspaceCwd: string;
+  /**
+   * `text` mode only: reject every candidate — primary AND every ranked
+   * backup — whose text mode is not vendor-enforced read-only (review
+   * blocker, 2026-08-14: the generic ranked selection otherwise accepts any
+   * CLI provider that can capture bounded stdout, with no regard for whether
+   * its text mode actually withholds edit tools — so a read-only primary
+   * could cascade to a write-capable backup like Cline/Antigravity under a
+   * `summary-only` recovery continuation, defeating the no-edit guarantee
+   * that dispatch mode exists to enforce). Copilot's broker text mode always
+   * satisfies this (no edit tools are ever granted); a CLI candidate must
+   * pass `isCliTextModeGuaranteedReadOnlyV1`. A rejected candidate is
+   * recorded exactly like any other unsupported one — an explicit settled
+   * attempt, never a silent skip — so when no candidate qualifies the whole
+   * selection settles `providerModeUnavailable` instead of ever reserving an
+   * edit-capable provider under a no-edit mandate.
+   */
+  requireGuaranteedReadOnlyText?: boolean;
 }): V1RunnerSelectionV1 {
-  const { session, mode, workspaceCwd } = options;
+  const { session, mode, workspaceCwd, requireGuaranteedReadOnlyText = false } = options;
 
   type RankedEntryV1 =
     | { readonly supported: true; readonly candidate: V1CandidateV1 }
@@ -1219,12 +1533,19 @@ export function openV1RunnerSelection(options: {
         },
       };
     }
-    if (mode !== "text" || !cliProviderSupportsV1StdoutCapture(effective.def)) {
+    if (
+      mode !== "text" ||
+      !cliProviderSupportsV1StdoutCapture(effective.def) ||
+      (requireGuaranteedReadOnlyText && !isCliTextModeGuaranteedReadOnlyV1(effective.def))
+    ) {
       // CLI providers are unsupported for preflight/edit (plan product
       // decisions), and a last-message-file CLI cannot satisfy AC-RUNNER-02
-      // ("CLI results are captured only from bounded stdout") yet. The
-      // candidate stays in the ranked list so `reserveNext` can surface it
-      // as an explicit settled attempt instead of silently bypassing it.
+      // ("CLI results are captured only from bounded stdout") yet; a caller
+      // that requires a guaranteed-read-only text mode (see the option's own
+      // doc comment) additionally rejects a CLI whose text mode auto-approves
+      // every tool. The candidate stays in the ranked list so `reserveNext`
+      // can surface it as an explicit settled attempt instead of silently
+      // bypassing it.
       return {
         supported: false,
         storedModelId,
@@ -1380,6 +1701,8 @@ export function createV1RunnerSelectionOpener(options: {
     readonly modelId: string | undefined;
     readonly stage: TaskStage | undefined;
   };
+  /** Forwarded verbatim to every `openV1RunnerSelection` call — see its doc comment. */
+  requireGuaranteedReadOnlyText?: boolean;
 }): (request: {
   readonly session: ProviderSelectionSessionV1;
   readonly mode: AgentExecutionModeV1;
@@ -1393,6 +1716,7 @@ export function createV1RunnerSelectionOpener(options: {
       modelId: resolved.modelId,
       stage: resolved.stage,
       workspaceCwd: options.workspaceCwd,
+      requireGuaranteedReadOnlyText: options.requireGuaranteedReadOnlyText,
     });
   };
 }

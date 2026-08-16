@@ -26,7 +26,10 @@ import {
 } from "../src/resultEnvelopeV1";
 import {
   classifyEngineProviderFailureV1,
+  createQuotaObservationLedgerV1,
   isAuthenticationFailureV1,
+  isCascadeEligibleFailureKindV1,
+  isModelEntitlementFailureV1,
 } from "../src/failureClassificationV1";
 import {
   backupModelsForStageV1,
@@ -345,6 +348,7 @@ type ScriptedBehavior =
   | { readonly kind: "authFailure" }
   | { readonly kind: "quota" }
   | { readonly kind: "unavailable" }
+  | { readonly kind: "entitlement" }
   | { readonly kind: "malformed" };
 
 function scriptedAdapter(
@@ -390,6 +394,12 @@ function scriptedAdapter(
           return { status: "failed", errorMessage: "rate limit or quota exhausted (HTTP 429)" };
         case "unavailable":
           return { status: "failed", errorMessage: "temporarily unavailable (HTTP 503)" };
+        case "entitlement":
+          return {
+            status: "failed",
+            errorMessage:
+              "Anthropic does not have access to this model for the configured API key (HTTP 403). anthropic.claude-sonnet-5 is not available for this account.",
+          };
         case "malformed":
           return { status: "completed", text: "no frame here at all" };
       }
@@ -513,6 +523,29 @@ test("dispatch: quota cascades once, records the sticky fallback, and later roun
   assert.equal(openai.invocations.length, 2);
 });
 
+test("dispatch: a model-entitlement failure (Bedrock-style 403) cascades to a backup and is never treated as auth", async () => {
+  const anthropic = scriptedAdapter("anthropic", () => ({ kind: "entitlement" }));
+  const openai = scriptedAdapter("openai", () => ({ kind: "completed", markdown: "# ok\n" }));
+  const fallbackState = createInMemoryFallbackStateStoreV1();
+  const result = await runner({ anthropic, openai, fallbackState }).invoke(invocation());
+  assert.deepEqual(result, { kind: "completed", summaryMarkdown: "# ok\n" });
+  assert.equal(openai.invocations.length, 1, "the backup was never tried on an entitlement block");
+  assert.deepEqual(await fallbackState.read("impl"), { active: true, modelId: "openai:gpt-5.4" });
+});
+
+test("dispatch: a model-entitlement failure with no configured backup reports modelEntitlementBlocked as retryable, never authenticationFailed", async () => {
+  const settings: ModelSettings = {
+    impl: {
+      primary: "anthropic:claude-sonnet-5",
+      backups: [],
+      strategy: "switch-to-backup",
+    },
+  };
+  const anthropic = scriptedAdapter("anthropic", () => ({ kind: "entitlement" }));
+  const result = await runner({ anthropic, settings }).invoke(invocation());
+  assert.deepEqual(result, { kind: "failed", code: "modelEntitlementBlocked", retryable: true });
+});
+
 test("dispatch: a non-switch-to-backup strategy never cascades on quota", async () => {
   const settings: ModelSettings = {
     impl: {
@@ -587,6 +620,44 @@ function fakeFetch(
   };
 }
 
+test("adapter HTTP mapping: a Bedrock-style 403 whose body reads as a model-entitlement refusal is never authFailure and classifies model-entitlement, not auth", async () => {
+  const calls: { url: string; headers: Record<string, string>; body: string }[] = [];
+  const key = "sk-ant-secret";
+  const adapter = createAnthropicAdapterV1({
+    fetch: fakeFetch(
+      [
+        {
+          status: 403,
+          body: JSON.stringify({
+            message:
+              "anthropic.claude-sonnet-5 is not available for this account. You can explore other available models on Amazon Bedrock.",
+          }),
+        },
+        { status: 403, body: `{"error":"invalid api key sk-ant-secret"}` },
+      ],
+      calls
+    ),
+  });
+
+  const entitlement = await adapter.invokeText({ prompt: "p", model: undefined, apiKey: key });
+  assert.ok(entitlement.status === "failed");
+  assert.equal(entitlement.authFailure, undefined, "an entitlement 403 must not set authFailure");
+  assert.ok(
+    entitlement.errorMessage.includes("explore other available models"),
+    "the provider's own remediation text must be preserved verbatim"
+  );
+  assert.equal(
+    classifyEngineProviderFailureV1({ errorMessage: entitlement.errorMessage }).failureKind,
+    "model-entitlement"
+  );
+  assert.equal(isAuthenticationFailureV1(entitlement.errorMessage), false);
+
+  // A genuine credential 403 with no entitlement phrasing still classifies as auth.
+  const credential = await adapter.invokeText({ prompt: "p", model: undefined, apiKey: key });
+  assert.ok(credential.status === "failed" && credential.authFailure === true);
+  assert.ok(!credential.errorMessage.includes(key), "the API key leaked into the error message");
+});
+
 test("anthropic adapter: 200 extracts text; the key travels only in headers", async () => {
   const calls: { url: string; headers: Record<string, string>; body: string }[] = [];
   const adapter = createAnthropicAdapterV1({
@@ -660,4 +731,71 @@ test("google adapter: 200 extracts candidate part text with the key in the heade
   assert.deepEqual(result, { status: "completed", text: "hi there" });
   assert.equal(calls[0]!.headers["x-goog-api-key"], "g-x");
   assert.ok(calls[0]!.url.includes("gemini-3.1-pro"));
+});
+
+// ─── 5. Model-entitlement classification (plan Part 4 engine parity) ───────────
+
+test("isModelEntitlementFailureV1 matches the known provider phrasings and nothing else", () => {
+  assert.equal(
+    isModelEntitlementFailureV1(
+      "403 Forbidden anthropic.claude-sonnet-5 is not available for this account."
+    ),
+    true
+  );
+  assert.equal(isModelEntitlementFailureV1("does not have access to model gpt-5.4"), true);
+  assert.equal(isModelEntitlementFailureV1("session expired, please sign in again"), false);
+  assert.equal(isModelEntitlementFailureV1(undefined), false);
+});
+
+test("isAuthenticationFailureV1 excludes model-entitlement phrasing even when 403/forbidden co-occurs", () => {
+  assert.equal(
+    isAuthenticationFailureV1(
+      "403 Forbidden: anthropic.claude-sonnet-5 is not available for this account."
+    ),
+    false
+  );
+  // A genuine credential 403 with no entitlement phrasing keeps classifying as auth.
+  assert.equal(isAuthenticationFailureV1("request failed: 403 Forbidden"), true);
+  assert.equal(isAuthenticationFailureV1("please sign in again"), true);
+});
+
+test("classifyEngineProviderFailureV1 classifies a Bedrock-style entitlement message as model-entitlement, not generic or auth", () => {
+  const classified = classifyEngineProviderFailureV1({
+    errorMessage:
+      '403 Forbidden {"message":"anthropic.claude-sonnet-5 is not available for this account. You can explore other available models on Amazon Bedrock."}',
+  });
+  assert.equal(classified.failureKind, "model-entitlement");
+});
+
+test("classifyEngineProviderFailureV1 never lets an explicit authFailure flag be overridden by entitlement text alone", () => {
+  // authFailure is the adapter's own pre-hint verdict; a message that ALSO
+  // happens to carry non-entitlement auth wording alongside authFailure:
+  // true must still classify auth over quota/temporary/generic ambiguity.
+  const classified = classifyEngineProviderFailureV1({
+    authFailure: true,
+    errorMessage: "credential invalid (HTTP 401)",
+  });
+  assert.equal(classified.failureKind, "generic");
+});
+
+test("isCascadeEligibleFailureKindV1 accepts quota, temporarily-unavailable, and model-entitlement; rejects generic and undefined", () => {
+  assert.equal(isCascadeEligibleFailureKindV1("quota"), true);
+  assert.equal(isCascadeEligibleFailureKindV1("temporarily-unavailable"), true);
+  assert.equal(isCascadeEligibleFailureKindV1("model-entitlement"), true);
+  assert.equal(isCascadeEligibleFailureKindV1("generic"), false);
+  assert.equal(isCascadeEligibleFailureKindV1(undefined), false);
+});
+
+test("the quota observation ledger records a model-entitlement failure as entitlement-blocked, never ok", () => {
+  const ledger = createQuotaObservationLedgerV1(() => new Date("2026-08-14T12:00:00.000Z"));
+  ledger.record(
+    "impl",
+    "anthropic:claude-sonnet-5",
+    "model-entitlement",
+    "anthropic.claude-sonnet-5 is not available for this account."
+  );
+  assert.deepEqual(ledger.get("impl", "anthropic:claude-sonnet-5"), {
+    state: "entitlement-blocked",
+    observedAt: "2026-08-14T12:00:00.000Z",
+  });
 });

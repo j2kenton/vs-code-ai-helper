@@ -45,9 +45,11 @@ import {
   collectRetroactiveTickClaimsV1,
   countChecklistProgressV1,
   EXCLUDED_CHECKLIST_ITEM_MARKER_V1,
+  hasContradictoryNoChecklistChangeClaimV1,
   hasImplementationChecklistV1,
   mergeChecklistProgressV1,
   MergeChecklistProgressResultV1,
+  NO_CHECKLIST_CHANGE_MARKER_V1,
   normalizeChecklistItemTextV1,
   RETROACTIVE_TICK_MARKER_V1,
   scopeToLatestChecklistV1,
@@ -1821,6 +1823,139 @@ void describe("a round can record work completed in an earlier round", () => {
 });
 
 // ---------------------------------------------------------------------------
+// hasContradictoryNoChecklistChangeClaimV1 / describeImplementationSummaryShapeIssue
+// — round 013 of task "1.9" (2026-08-14): a response that declares
+// `<!-- ensemble:no-checklist-change -->` ("nothing to tick") while also
+// reporting retroactive completions in `## Plan Item Checklist` wants
+// checklist state to change while explicitly declaring it does not. The
+// marker alone satisfied the echo requirement, so the round completed with
+// its claimed progress recorded nowhere — the retroactive-claim mechanism
+// itself worked correctly (the claims used PARAPHRASED item text, so the
+// merge legitimately returned "no-match"); the missing guard is the
+// contradiction, caught here before the merge ever runs.
+// ---------------------------------------------------------------------------
+void describe("hasContradictoryNoChecklistChangeClaimV1", () => {
+  const PLAN_ITEM =
+    "In the webview <style>, set .model-combo-input to font-size: var(--ensemble-small-font-size) " +
+    "and reduce its vertical padding so the combo-box input height shrinks with the text.";
+
+  /** The actual shape observed in runs/013-claude-cli-impl.md of task "1.9". */
+  const ROUND_013_SHAPED_RESPONSE = [
+    "Status: completed",
+    "",
+    "Files changed:",
+    "_none recorded_",
+    "",
+    NO_CHECKLIST_CHANGE_MARKER_V1,
+    "This round independently re-verified every plan anchor in the working tree.",
+    "",
+    "## Files Changed",
+    "",
+    "None — no source, test, or configuration file was created, modified, or deleted this round.",
+    "",
+    "## Plan Item Checklist",
+    "",
+    `- \`.model-combo-input\` small font + reduced padding — done ${RETROACTIVE_TICK_MARKER_V1} — src/views/settingsView.ts:672-675`,
+    "",
+    "## Verification",
+    "",
+    "- pnpm run test:unit — 2688/2688 pass",
+  ].join("\n");
+
+  void it("is false for a plain no-checklist-change declaration with no retroactive claims", () => {
+    const response = [
+      NO_CHECKLIST_CHANGE_MARKER_V1,
+      "This round fixed the review's blocker; no checkbox state changes.",
+      "",
+      "## Files Changed",
+      "",
+      "- `src/foo.ts` — fixed the null check",
+      "",
+      "## Verification",
+      "",
+      "- ran the unit tests",
+    ].join("\n");
+    assert.equal(hasContradictoryNoChecklistChangeClaimV1(response), false);
+  });
+
+  void it("is false for retroactive claims with no no-checklist-change declaration", () => {
+    const response = [
+      "## Files Changed",
+      "",
+      "- (none)",
+      "",
+      "## Plan Item Checklist",
+      "",
+      `- ${PLAN_ITEM} — done ${RETROACTIVE_TICK_MARKER_V1} — src/views/settingsView.ts:672-675`,
+    ].join("\n");
+    assert.equal(hasContradictoryNoChecklistChangeClaimV1(response), false);
+  });
+
+  void it("is true for the round-013 shape: the marker plus a retroactive claim in the same response", () => {
+    assert.equal(hasContradictoryNoChecklistChangeClaimV1(ROUND_013_SHAPED_RESPONSE), true);
+  });
+
+  void it("is false when the echoed checklist merely QUOTES the marker inside an item's own text", () => {
+    // Reproduces this repo's own plan echo (this very task's plan-final.md
+    // has a Part 3 item describing this mechanism by quoting the marker) —
+    // a bare substring match over the whole response read that quotation as
+    // the round's own declaration and rejected an otherwise-valid response
+    // (review finding, 2026-08-14). The marker never appears on a line of its
+    // own here, so it must not be treated as a declaration.
+    const response = [
+      "<!-- ensemble:implementation-checklist -->",
+      "",
+      "# Implementation Checklist",
+      "",
+      `- [x] Treat a summary that both declares ${NO_CHECKLIST_CHANGE_MARKER_V1} and supplies ` +
+        "retroactive/done claims as self-contradictory",
+      "",
+      "## Files Changed",
+      "",
+      "- `src/foo.ts` — fixed the null check",
+      "",
+      "## Plan Item Checklist",
+      "",
+      `- ${PLAN_ITEM} — done ${RETROACTIVE_TICK_MARKER_V1} — src/views/settingsView.ts:672-675`,
+      "",
+      "## Verification",
+      "",
+      "- ran the unit tests",
+    ].join("\n");
+    assert.equal(hasContradictoryNoChecklistChangeClaimV1(response), false);
+  });
+
+  void it("the round-013 fixture: the retroactive-claim mechanism itself is not the defect — the merge legitimately returns no-match on the paraphrase", () => {
+    // Isolates the merge from the shape gate: this is what
+    // `mergeChecklistProgressV1` actually does with round 013's real claim
+    // text, proving the root cause is the paraphrase (never matches PLAN_ITEM's
+    // exact wording), not a bug in `collectRetroactiveTickClaimsV1` or the
+    // merge's matching logic.
+    const plan = ["<!-- ensemble:implementation-checklist -->", "", `- [ ] ${PLAN_ITEM}`].join("\n");
+    const result = mergeChecklistProgressV1(plan, ROUND_013_SHAPED_RESPONSE);
+    assert.equal(result.kind, "no-match");
+    if (result.kind === "no-match") {
+      assert.deepEqual(result.unmatchedSample, [
+        "`.model-combo-input` small font + reduced padding",
+      ]);
+    }
+  });
+
+  void it("describeImplementationSummaryShapeIssue rejects the round-013 shape with an actionable message", () => {
+    const issue = describeImplementationSummaryShapeIssue(ROUND_013_SHAPED_RESPONSE, {
+      planChecklist: CHECKLIST_PLAN_OF_RECORD,
+    });
+    assert.ok(issue, "a contradictory response must be rejected");
+    assert.match(issue, /no-checklist-change/);
+    assert.match(issue, /retroactive plan-item completions/);
+  });
+
+  void it("does not flag a response with neither marker nor claims", () => {
+    assert.equal(describeImplementationSummaryShapeIssue(WELL_FORMED_SUMMARY), undefined);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // describeIncompleteImplementationRoundV1 — the DETECTION half of the
 // deferred-round failure (2026-08-13 report item 1): a completed-status round
 // whose response promises future work while omitting every required section
@@ -1868,18 +2003,50 @@ void describe("describeIncompleteImplementationRoundV1", () => {
     );
   });
 
-  void it("does not fire when the own-scope summary carries a required section (stays a rejected summary)", () => {
-    // `## Files Changed` with plain bullets starts the run-owned region, so
-    // the response reported real (if deficient — no `## Verification`) work:
-    // that is the shape gate's case, not an unreported round, even though it
-    // also promises future work.
+  void it("classifies a deferral with exactly one section present as roundDeferred (Part 1 tightening)", () => {
+    // Pre-tightening this stayed on the rejected-summary path because one
+    // section was present. But the section a deferring response DID produce
+    // is a partial narration of work it declares unfinished — a one-section
+    // variant of round 010 ("workflow 2") would have been stamped unusable
+    // with nothing persisted, stranding the task the same way. Deferral
+    // phrasing plus ANY missing required section is now a deferred round.
     const partial =
       "## Files Changed\n\n- `src/a.ts` — resolver update\n\n" +
       "I'll report back when the build completes.";
     assert.equal(
       describeIncompleteImplementationRoundV1(partial, {
         planChecklist: CHECKLIST_PLAN_OF_RECORD,
-      }),
+      })?.kind,
+      "roundDeferred"
+    );
+  });
+
+  void it("classifies a deferral whose sections are empty as roundDeferred when the round changed files", () => {
+    const hollow =
+      "## Files Changed\n\n## Verification\n\n" +
+      "I'll report back when the build completes.";
+    assert.equal(
+      describeIncompleteImplementationRoundV1(hollow, {
+        roundChangedFiles: true,
+      })?.kind,
+      "roundDeferred"
+    );
+  });
+
+  void it("accepts a complete, well-shaped summary with an incidental phrase match", () => {
+    // "check it completes" trips a deferral phrase, but nothing is missing
+    // from the report — an incidental match must not reject a compliant round.
+    const complete = [
+      "## Files Changed",
+      "",
+      "- `src/a.ts` — resolver update",
+      "",
+      "## Verification",
+      "",
+      "- run `pnpm test` and check it completes cleanly",
+    ].join("\n");
+    assert.equal(
+      describeIncompleteImplementationRoundV1(complete, { roundChangedFiles: true }),
       undefined
     );
   });
@@ -1952,6 +2119,52 @@ void describe("describeIncompleteImplementationRoundV1", () => {
     assert.equal(sections.filesChangedPresent, false);
     assert.equal(sections.verificationPresent, false);
     assert.equal(sections.checklistEchoPresent, false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The round-010 fixture (".ensemble/2026-08-13_task_1" — "workflow 2"): the
+// stale-waiter-cutoff reproduction. The round was finalized `completed` with
+// its 5-file delta kept, while its entire final response was the narration
+// below; impl-summary.md was stamped unusable and NOTHING was persisted or
+// scheduled, so the task sat at impl-high-review/active indefinitely. These
+// tests pin which gate now catches that exact body.
+// ---------------------------------------------------------------------------
+
+void describe("round-010 stale-waiter fixture (workflow 2)", () => {
+  /** Verbatim response body from runs/010-claude-cli-impl.md. */
+  const ROUND_010_RESPONSE =
+    "Stale waiter stopped. The full unit suite (with the fix compiled in) is " +
+    "running in the background — I'll write the final summary when its " +
+    "completion notification arrives with the final pass/fail counts.";
+
+  void it("the incomplete-round detector catches it as roundDeferred, with a checklist expected", () => {
+    const detected = describeIncompleteImplementationRoundV1(ROUND_010_RESPONSE, {
+      planChecklist: CHECKLIST_PLAN_OF_RECORD,
+      roundChangedFiles: true,
+    });
+    assert.equal(detected?.kind, "roundDeferred");
+    assert.ok(detected?.reason.includes("follow-up turn"));
+  });
+
+  void it("the detector catches it with no checklist expectation too", () => {
+    assert.equal(
+      describeIncompleteImplementationRoundV1(ROUND_010_RESPONSE, {})?.kind,
+      "roundDeferred"
+    );
+  });
+
+  void it("the shape gate also rejects it, so neither gate can promote the narration", () => {
+    // The historical failure: this gate DID fire (the summary was stamped
+    // unusable) but its branch persisted no recovery state. The detector now
+    // classifies the round first, and the recovery transition backs both
+    // gates — this pins that the body can never satisfy either.
+    assert.ok(
+      describeImplementationSummaryShapeIssue(ROUND_010_RESPONSE, {
+        planChecklist: CHECKLIST_PLAN_OF_RECORD,
+        roundChangedFiles: true,
+      }) !== undefined
+    );
   });
 });
 

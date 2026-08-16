@@ -94,6 +94,20 @@ export interface ReviewRoundOutcome {
    * an older prompt — or a provider that ignored the marker — is unaffected.
    */
   progress?: { complete: number; total: number } | null;
+  /**
+   * Identity of the provider/model that actually produced THIS round's
+   * review (including any backup-cascade substitution) — mirrors
+   * `ReviewScoreHistoryEntry.reviewer`. Absent when the caller has no
+   * attribution to offer, which keeps every pre-existing caller's behavior
+   * unchanged (see `baselineReviewer` below).
+   */
+  reviewer?: { providerLabel: string; storedModelId: string };
+}
+
+/** `${providerLabel}|${storedModelId}`, or undefined for an unidentified
+ * reviewer — mirrors reviewRouting.ts's own reviewerKey. */
+function reviewerKey(reviewer?: { providerLabel: string; storedModelId: string }): string | undefined {
+  return reviewer ? `${reviewer.providerLabel}|${reviewer.storedModelId}` : undefined;
 }
 
 export interface ImproveReviewScoreResult {
@@ -218,6 +232,19 @@ export async function improveReviewScore(options: {
     /** Same contract as ReviewRoundOutcome.progress → isPlanIncomplete. */
     planIncomplete: boolean;
   };
+  /**
+   * Identity of the reviewer that produced `baselineScore` (read by the
+   * caller before this call started), and its task-fixable count if known.
+   * Lets the loop tell a genuine score improvement from an artifact of a
+   * reviewer substitution (backup-cascade fallback, manual model switch): a
+   * different reviewer is a different instrument, and the between-reviewer
+   * offset can be the same order of magnitude as MIN_SCORE_IMPROVEMENT
+   * (2026-08-14 finding: workflow-2 item 7). Absent — as for every
+   * pre-existing caller — restores the exact prior behavior of comparing
+   * every round's score straight against `baselineScore`.
+   */
+  baselineReviewer?: { providerLabel: string; storedModelId: string };
+  baselineTaskFixableCount?: number;
 }): Promise<ImproveReviewScoreResult> {
   let best: number | null = null;
   let escalationDeferred = false;
@@ -231,6 +258,14 @@ export async function improveReviewScore(options: {
   let roundsWithoutProgressAdvance = 0;
   const maxAttempts = Math.max(1, options.maxAttempts ?? MAX_REVIEW_ATTEMPTS);
   const stopAtScore = Math.max(0, Math.min(10, options.stopAtScore ?? 0));
+  // The reviewer identity + score/blocker-count a round's `improved` test is
+  // actually compared against. Starts at the caller-supplied baseline and
+  // re-anchors to a new reviewer's own first round when one is detected (see
+  // the reviewer-change branch below), so a substitution never gets treated
+  // as a same-instrument delta in either direction.
+  let referenceReviewerKey = reviewerKey(options.baselineReviewer);
+  let referenceScore = options.baselineScore;
+  let referenceTaskFixableCount: number | null = options.baselineTaskFixableCount ?? null;
 
   // Pre-loop short-circuit: the evidence already in hand (from the review
   // that produced baselineScore) shows the task is already finished. Succeed
@@ -299,12 +334,44 @@ export async function improveReviewScore(options: {
       previousComplete = progress.complete;
     }
 
+    // Reviewer-substitution scale break (workflow-2 item 7): once BOTH the
+    // reference and this round carry a recorded identity and they differ,
+    // this round's score is not comparable to the reference score at all —
+    // treat it as a different instrument's reading, never as the same scale
+    // moving. Prefer blocker-count movement (a count, not a judgement scale)
+    // when both counts are known; otherwise there is no comparable evidence
+    // yet, so this round can't itself prove improvement — it becomes the new
+    // reference for whatever round comes next.
+    const currentReviewerKey = reviewerKey(round.reviewer);
+    const reviewerChanged =
+      currentReviewerKey !== undefined &&
+      referenceReviewerKey !== undefined &&
+      currentReviewerKey !== referenceReviewerKey;
     // Compare in integer tenths: scores are normalized to one decimal
-    // (reviewReadiness.ts), and `baseline + 0.1` is not exactly representable
+    // (reviewReadiness.ts), and `reference + 0.1` is not exactly representable
     // in IEEE-754, so a direct `>=` misfires exactly at the boundary.
-    const improved =
-      Math.round(score * 10) >=
-      Math.round(options.baselineScore * 10) + Math.round(MIN_SCORE_IMPROVEMENT * 10);
+    const improved = reviewerChanged
+      ? round.taskFixableCount !== null &&
+        referenceTaskFixableCount !== null &&
+        round.taskFixableCount < referenceTaskFixableCount
+      : Math.round(score * 10) >=
+        Math.round(referenceScore * 10) + Math.round(MIN_SCORE_IMPROVEMENT * 10);
+    // Re-anchor the reference to this round ONLY on a genuine detected
+    // change from a KNOWN reference reviewer — never merely because this is
+    // the first round to carry an identity at all (that would silently
+    // narrow every later round's comparison from the original baseline down
+    // to "beat the immediately preceding round", which is a different and
+    // unintended loosening for the ordinary single-reviewer case). With no
+    // `baselineReviewer` supplied, referenceReviewerKey stays undefined for
+    // the whole run and this block never fires — the pre-existing behavior
+    // of always comparing against options.baselineScore is preserved
+    // exactly, matching every caller that has not opted into identity
+    // tracking yet.
+    if (reviewerChanged) {
+      referenceReviewerKey = currentReviewerKey;
+      referenceScore = score;
+      referenceTaskFixableCount = round.taskFixableCount;
+    }
     // Fast Forward is only successful after it has made measurable progress
     // from the score it started with.  A configured target may require more,
     // but must not let a task at (or above) that target stop without improving.

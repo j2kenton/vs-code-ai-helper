@@ -5,7 +5,7 @@ import {
   STAGE_DISPLAY_NAMES,
   TaskStage,
 } from "../types/taskProgress";
-import { BlockerResolver, ReviewBlocker } from "./reviewReadiness";
+import { BlockerResolver, meetsAutoAdvanceThreshold, ReviewBlocker } from "./reviewReadiness";
 
 /** Default number of consecutive rounds with no new high-water-mark score
  * before a stage is considered plateaued. Configurable via
@@ -51,6 +51,54 @@ export const STALE_REVIEW_RECONCILIATION_COMMIT_THRESHOLD = 15;
  * rounds". Rounds that did carry fixable work still count in full, so a real
  * stall is still caught.
  */
+/** `${providerLabel}|${storedModelId}` for the reviewer that produced
+ * `entry`, or `undefined` when the entry predates identity tracking. */
+function reviewerKey(entry: ReviewScoreHistoryEntry): string | undefined {
+  return entry.reviewer ? `${entry.reviewer.providerLabel}|${entry.reviewer.storedModelId}` : undefined;
+}
+
+/**
+ * Restrict a scored-entry list to the trailing run produced by the SAME
+ * reviewer as the most recent entry, so plateau/blocker-set-stall windows
+ * never compare scores or blocker sets across a provider/model substitution
+ * (backup-cascade fallback, manual model switch) — a different reviewer is a
+ * different instrument, and the between-reviewer offset can be the same
+ * order of magnitude as the signal being measured (2026-08-14 finding:
+ * workflow-2 item 7).
+ *
+ * An entry with no recorded identity (legacy, or the caller passed none)
+ * neither confirms nor denies a reviewer change, so it is kept rather than
+ * treated as a break — this keeps every pre-existing task's behavior exactly
+ * as it was before identity tracking existed. Only an entry whose recorded
+ * identity strictly DIFFERS from the most recent entry's cuts the run short,
+ * which also means the round immediately after a reviewer change sees a
+ * trailing run of length 1 (or 0) — too short to satisfy `window + 1`, so
+ * the caller's existing "not enough rounds yet" guard reports not-plateaued
+ * for that round rather than comparing across the break.
+ */
+function restrictToTrailingSameReviewerRun<T extends ReviewScoreHistoryEntry>(
+  scored: readonly T[]
+): readonly T[] {
+  const lastEntry = scored[scored.length - 1];
+  if (lastEntry === undefined) {
+    return scored;
+  }
+  const lastKey = reviewerKey(lastEntry);
+  if (lastKey === undefined) {
+    return scored;
+  }
+  let startIndex = scored.length - 1;
+  for (let i = scored.length - 2; i >= 0; i--) {
+    const current = scored[i];
+    const key = current === undefined ? undefined : reviewerKey(current);
+    if (key !== undefined && key !== lastKey) {
+      break;
+    }
+    startIndex = i;
+  }
+  return scored.slice(startIndex);
+}
+
 export function detectPlateau(
   history: readonly ReviewScoreHistoryEntry[],
   stage: TaskStage,
@@ -63,7 +111,7 @@ export function detectPlateau(
   // passes a bad window gets a working default instead of a silently
   // disabled safety valve.
   const safeWindow = Number.isFinite(window) && window > 0 ? Math.floor(window) : DEFAULT_PLATEAU_WINDOW;
-  const scored = history.filter(
+  const scoredAcrossReviewers = history.filter(
     (entry): entry is ReviewScoreHistoryEntry & { score: number } =>
       entry.stage === stage &&
       entry.score !== null &&
@@ -71,6 +119,7 @@ export function detectPlateau(
       // than silently disabling plateau detection for older tasks.
       (entry.taskFixableCount === undefined || entry.taskFixableCount > 0)
   );
+  const scored = restrictToTrailingSameReviewerRun(scoredAcrossReviewers);
   if (scored.length < safeWindow + 1) {
     return false;
   }
@@ -143,9 +192,10 @@ export function detectBlockerSetStall(
   window: number = DEFAULT_PLATEAU_WINDOW
 ): boolean {
   const safeWindow = Number.isFinite(window) && window > 0 ? Math.floor(window) : DEFAULT_PLATEAU_WINDOW;
-  const scored = history.filter(
+  const scoredAcrossReviewers = history.filter(
     (entry) => entry.stage === stage && entry.score !== null
   );
+  const scored = restrictToTrailingSameReviewerRun(scoredAcrossReviewers);
   if (scored.length < safeWindow + 1) {
     return false;
   }
@@ -296,13 +346,29 @@ export function sameBlockerPersistsAcrossLastRounds(
  * strongest: a reviewer reporting zero blockers round after round while
  * nothing gets edited (report 11, an 18-round/9-hour stall) never made
  * `sameBlockerPersistsAcrossLastRounds` true, since that helper requires a
- * non-empty blocker identity set. `history` is accepted for API stability
- * with callers/tests but no longer consulted here.
+ * non-empty blocker identity set.
  *
  * `sameBlockerPersistsAcrossLastRounds` remains available as an independent
  * signal for rounds that DO change files but keep reproducing the same
  * blocker — a different stall shape from the one this function now measures
  * directly.
+ *
+ * The item-8 shape this breaker exists for is specifically a PASSING review
+ * sending a finished-looking round back to `impl` forever — a review at or
+ * above the auto-advance threshold, not a task with real unresolved work.
+ * Trip therefore also requires the most recent same-stage history entry to
+ * meet `qualifyingThreshold` (2026-08-14 review finding: without this gate,
+ * three manual/no-op implementation reruns with no qualifying passing review
+ * on record could pause a task too — a different, unrelated stall shape this
+ * breaker was never meant to police). `qualifyingStage`/`qualifyingThreshold`
+ * are optional so existing callers/tests that predate this gate keep their
+ * exact prior behavior (trip on the zero-change count alone) when they omit
+ * both; every real call site supplies them together. When they ARE supplied,
+ * a `history` with no qualifying entry for `qualifyingStage` — including
+ * `undefined`/empty history, or an implementation round that has never yet
+ * reached a review stage — does NOT trip: that is exactly the "no qualifying
+ * passing-review loop" shape the review finding named, so absence of
+ * evidence here is disqualifying, not unknown.
  */
 export function shouldTripNoProgressBreaker(input: {
   /** Consecutive completed implementation rounds that changed zero files. */
@@ -310,11 +376,30 @@ export function shouldTripNoProgressBreaker(input: {
   /** ensemble.resilience.noProgressBreakerRounds (0 = off). */
   breakerRounds: number;
   history: readonly ReviewScoreHistoryEntry[] | undefined;
+  /** The review stage this implementation round answers to — the streak only
+   * qualifies against that stage's own history, never a different stage's. */
+  qualifyingStage?: TaskStage;
+  /** The auto-advance score threshold a qualifying review must meet or
+   * exceed. Omit together with `qualifyingStage` to skip the gate entirely. */
+  qualifyingThreshold?: number;
 }): boolean {
   if (input.breakerRounds <= 0) {
     return false;
   }
-  return input.zeroChangeRounds >= input.breakerRounds;
+  if (input.zeroChangeRounds < input.breakerRounds) {
+    return false;
+  }
+  if (input.qualifyingThreshold === undefined || input.qualifyingStage === undefined) {
+    return true;
+  }
+  const sameStage = (input.history ?? []).filter(
+    (entry) => entry.stage === input.qualifyingStage
+  );
+  const latest = sameStage[sameStage.length - 1];
+  if (!latest) {
+    return false;
+  }
+  return meetsAutoAdvanceThreshold(latest.score, input.qualifyingThreshold);
 }
 
 /**

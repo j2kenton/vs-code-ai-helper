@@ -11,8 +11,8 @@
  *    runs, no matter which path resolved it; the guard is active only once a
  *    provider selection actually exists.
  *  - **Quota-triggered fallback cascade.** A primary failure classified
- *    quota/temporarily-unavailable — and ONLY such a failure — may spend the
- *    stage's backup allocation, gated on the effective chain's
+ *    quota/temporarily-unavailable/model-entitlement — and ONLY such a
+ *    failure — may spend the stage's backup allocation, gated on the effective chain's
  *    "switch-to-backup" strategy. The reservation is an atomic once-per-
  *    stage-epoch claim on the fallback state store; an unresolved
  *    reservation (no backup completed) is always released, and a completed
@@ -45,6 +45,7 @@ import {
   createQuotaObservationLedgerV1,
   EngineFailureKindV1,
   EngineQuotaObservationLedgerV1,
+  isCascadeEligibleFailureKindV1,
 } from "./failureClassificationV1";
 import {
   backupModelsForStageV1,
@@ -284,9 +285,11 @@ export function createEngineProviderRunnerV1(
             ? "quotaExhausted"
             : classified.failureKind === "temporarily-unavailable"
               ? "temporarilyUnavailable"
-              : invoked.authFailure === true
-                ? "authenticationFailed"
-                : "providerRequestFailed",
+              : classified.failureKind === "model-entitlement"
+                ? "modelEntitlementBlocked"
+                : invoked.authFailure === true
+                  ? "authenticationFailed"
+                  : "providerRequestFailed",
         errorMessage: invoked.errorMessage,
       };
     }
@@ -384,8 +387,7 @@ export function createEngineProviderRunnerV1(
       );
 
       const cascadeEligible =
-        !primary.authFailure &&
-        (primary.failureKind === "quota" || primary.failureKind === "temporarily-unavailable");
+        !primary.authFailure && isCascadeEligibleFailureKindV1(primary.failureKind);
       const backups = backupModelsForStageV1(
         settings,
         enabledProviders,

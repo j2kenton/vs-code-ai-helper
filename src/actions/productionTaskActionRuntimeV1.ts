@@ -31,6 +31,7 @@ import { createGeneratePlanRowV1 } from "./rows/generatePlanRowV1";
 import { createDraftRowV1 } from "./rows/draftRowV1";
 import { createGenerateImplementationRowV1 } from "./rows/generateImplementationRowV1";
 import { createReviewRowV1 } from "./rows/reviewRowV1";
+import { createImplContinuationReportRowV1 } from "./rows/implContinuationReportRowV1";
 import { createApplyReviewRowV1 } from "./rows/applyReviewRowV1";
 import { createChatSendRowV1 } from "./rows/chatSendRowV1";
 import { createGlobalAssistantSendRowV1 } from "./rows/globalAssistantSendRowV1";
@@ -79,6 +80,7 @@ export function getProductionTaskActionRegistryV1(): TaskActionRegistryV1 {
       createDraftRowV1(),
       createGenerateImplementationRowV1(),
       createReviewRowV1(),
+      createImplContinuationReportRowV1(),
       createApplyReviewRowV1(),
       createChatSendRowV1(),
       createGlobalAssistantSendRowV1(),
@@ -390,6 +392,18 @@ export function createProductionTaskActionCoordinatorV1(options: {
   readonly resolveStagePrimaryModel: (
     taskStage: string
   ) => { readonly modelId: string | undefined; readonly stage: TaskStage | undefined };
+  /**
+   * Forwarded to `createV1RunnerSelectionOpener` — when true, `text`-mode
+   * candidate selection (primary AND every ranked backup) rejects any CLI
+   * provider whose text mode is not vendor-enforced read-only, so a caller
+   * whose no-edit mandate must actually be enforced (the `summary-only`
+   * recovery continuation, `implContinuationTextDispatchV1.ts`) can never
+   * have the coordinator reserve a write-capable backup in its place. Omit
+   * (default false) for every ordinary text-mode row — chat/review/etc. never
+   * required this guarantee before and must not narrow their provider chain
+   * by it now.
+   */
+  readonly requireGuaranteedReadOnlyText?: boolean;
 }): TaskActionCoordinatorV1 {
   return withMalformedResultRetryV1(createTaskActionCoordinatorV1({
     registry: getProductionTaskActionRegistryV1(),
@@ -397,6 +411,7 @@ export function createProductionTaskActionCoordinatorV1(options: {
     openRunnerSelection: createV1RunnerSelectionOpener({
       workspaceCwd: options.workspaceCwd,
       resolveStagePrimaryModel: options.resolveStagePrimaryModel,
+      requireGuaranteedReadOnlyText: options.requireGuaranteedReadOnlyText,
     }),
     // Make a passed-over model visible. Until this existed, a candidate the
     // registry refused was recorded only inside the in-memory selection

@@ -466,6 +466,143 @@ void describe("improveReviewScore", () => {
   });
 });
 
+void describe("improveReviewScore — reviewer-identity scale break (workflow-2 item 7)", () => {
+  const REVIEWER_A = { providerLabel: "OpenAI Codex", storedModelId: "gpt-5.6-sol@high" };
+  const REVIEWER_B = { providerLabel: "Cline", storedModelId: "cline-pass/kimi-k3@xhigh" };
+
+  void it("legacy behavior: no baselineReviewer supplied — every round compares straight against baselineScore", async () => {
+    // Without baselineReviewer the scale-break check never activates, so
+    // this is byte-for-byte the pre-existing multi-round semantic: round 2
+    // must still beat the ORIGINAL baseline, not round 1's score.
+    const context = fakeContext();
+    const scores: ReviewRoundOutcome[] = [
+      { score: 6, taskFixableCount: 1, zeroFixableEvidence: false, reviewer: REVIEWER_A },
+      { score: 6.2, taskFixableCount: 1, zeroFixableEvidence: false, reviewer: REVIEWER_A },
+    ];
+    let call = 0;
+
+    const result = await improveReviewScore({
+      context,
+      stage: "impl-high-review",
+      baselineScore: 6,
+      apply: () => {
+        call += 1;
+        return Promise.resolve();
+      },
+      review: () => Promise.resolve(scores[call - 1] ?? null),
+    });
+
+    // 6.2 is only +0.2 over the true original baseline of 6 but the loop
+    // runs out of scripted rounds (score 6.2 also fails "beat 6 by 1 whole
+    // point"? no — MIN_SCORE_IMPROVEMENT is 0.1, so 6.2 DOES clear 6.1).
+    assert.strictEqual(result.improved, true);
+    assert.strictEqual(result.attempts, 2);
+    assert.strictEqual(result.score, 6.2);
+  });
+
+  void it("a reviewer substitution does not let a same-or-lower score across the break read as improvement", async () => {
+    // Baseline was reviewed by A at 7.4. The in-loop round is reviewed by B
+    // (backup-cascade substitution) at 7.1 — a genuine regression under one
+    // instrument, but +... nothing meaningful to compare across a break. It
+    // must not be misread as "improved" via a same-reviewer delta test, and
+    // with no known blocker-count movement it must not terminate as improved
+    // either.
+    const context = fakeContext();
+    const result = await improveReviewScore({
+      context,
+      stage: "impl-high-review",
+      baselineScore: 7.4,
+      baselineReviewer: REVIEWER_A,
+      maxAttempts: 1,
+      apply: () => Promise.resolve(),
+      review: () =>
+        Promise.resolve({
+          score: 7.1,
+          taskFixableCount: null,
+          zeroFixableEvidence: false,
+          reviewer: REVIEWER_B,
+        }),
+    });
+
+    assert.strictEqual(result.improved, false);
+    assert.strictEqual(result.score, 7.1);
+  });
+
+  void it("a reviewer substitution with a lower task-fixable count IS treated as improvement (count, not score, movement)", async () => {
+    const context = fakeContext();
+    const result = await improveReviewScore({
+      context,
+      stage: "impl-high-review",
+      baselineScore: 7.4,
+      baselineReviewer: REVIEWER_A,
+      baselineTaskFixableCount: 3,
+      apply: () => Promise.resolve(),
+      review: () =>
+        Promise.resolve({
+          // Score itself moved DOWN across the break (different instrument),
+          // but the blocker count — a count, not a judgement scale — improved.
+          score: 6.9,
+          taskFixableCount: 1,
+          zeroFixableEvidence: false,
+          reviewer: REVIEWER_B,
+        }),
+    });
+
+    assert.strictEqual(result.improved, true);
+    assert.strictEqual(result.attempts, 1);
+    assert.strictEqual(result.score, 6.9);
+  });
+
+  void it("a reviewer substitution with unknown blocker counts re-baselines to the new reviewer's own first score, without terminating that round", async () => {
+    const context = fakeContext();
+    const rounds: ReviewRoundOutcome[] = [
+      // Round 1: reviewer changed, no taskFixableCount evidence either side —
+      // no comparable signal yet, so this round can't itself prove
+      // improvement; it becomes the new reference.
+      { score: 6.5, taskFixableCount: null, zeroFixableEvidence: false, reviewer: REVIEWER_B },
+      // Round 2: SAME reviewer as round 1 (B), and clears +0.1 over round 1's
+      // own score (6.5 -> 6.6) — proves the re-baseline actually took, since
+      // 6.6 does NOT clear the ORIGINAL baseline (7.4) by any margin.
+      { score: 6.6, taskFixableCount: null, zeroFixableEvidence: false, reviewer: REVIEWER_B },
+    ];
+    let call = 0;
+
+    const result = await improveReviewScore({
+      context,
+      stage: "impl-high-review",
+      baselineScore: 7.4,
+      baselineReviewer: REVIEWER_A,
+      apply: () => {
+        call += 1;
+        return Promise.resolve();
+      },
+      review: () => Promise.resolve(rounds[call - 1] ?? null),
+    });
+
+    assert.strictEqual(result.improved, true);
+    assert.strictEqual(result.attempts, 2);
+    assert.strictEqual(result.score, 6.6);
+  });
+
+  void it("entries without a recorded identity on either side keep today's behavior", async () => {
+    const context = fakeContext();
+    const result = await improveReviewScore({
+      context,
+      stage: "impl-high-review",
+      baselineScore: 6,
+      // No baselineReviewer, and this round's outcome carries no reviewer
+      // either — the scale-break check has nothing to compare and must stay
+      // fully inert, exactly like every pre-existing (legacy) caller.
+      apply: () => Promise.resolve(),
+      review: () =>
+        Promise.resolve({ score: 6.1, taskFixableCount: null, zeroFixableEvidence: false }),
+    });
+
+    assert.strictEqual(result.improved, true);
+    assert.strictEqual(result.score, 6.1);
+  });
+});
+
 /**
  * Plan-progress signal (2026-08-07). The bug it fixes: a review's score was
  * asked to answer two different questions at once — "is what was built any

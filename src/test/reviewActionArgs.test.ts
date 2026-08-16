@@ -28,6 +28,7 @@ import {
   buildFastForwardApplyReviewOptions,
   fastForwardReviewWithAI,
   peekFastForwardTargetsImplReviewFromPathV1,
+  resolveBaselineReviewHistoryEntryV1,
   selectReviewPromptTemplate,
 } from "../commands/reviewActions";
 import { fastForwardCurrentTaskReview } from "../commands/fastForwardCurrentTaskReview";
@@ -635,6 +636,99 @@ void describe("fastForwardReviewWithAI — read-before-gate ordering (§7.5/AC-H
       reads.restore();
       gate.restore();
       fs.rmSync(path.dirname(fixture.folder), { recursive: true, force: true });
+    }
+  });
+});
+
+void describe("resolveBaselineReviewHistoryEntryV1 — Fast Forward baseline reviewer lookup", () => {
+  void it(
+    "reads fresh from disk, picking up a reviewScoreHistory entry the in-memory snapshot predates",
+    async () => {
+      // Reproduces the workflow-2 item-7 review finding: fastForwardReviewWithAI
+      // runs the initial review (when none exists yet) using a task-progress
+      // snapshot captured BEFORE that run, then originally computed the
+      // baseline reviewer from that stale snapshot — missing the very
+      // reviewScoreHistory entry the initial review just appended to disk.
+      // `fallbackProgress` here stands in for that stale snapshot: it has no
+      // reviewScoreHistory at all, exactly like a task that has never been
+      // reviewed at this stage yet, while the on-disk file (written
+      // "concurrently" by the simulated initial review) already carries the
+      // entry with its reviewer identity.
+      const fixture = makeOwnedTaskFolder("ff-baseline-reviewer-");
+      const reads = installReadFileCounter();
+      try {
+        const progressPath = path.join(fixture.folder, "task-progress.json");
+        const onDisk = JSON.parse(fs.readFileSync(progressPath, "utf8")) as Record<string, unknown>;
+        onDisk.currentStage = "impl-high-review";
+        onDisk.reviewScoreHistory = [
+          {
+            stage: "impl-high-review",
+            score: 9,
+            attemptId: "attempt-1",
+            at: "2026-08-13T10:00:00.000Z",
+            blockerCount: 0,
+            taskFixableCount: 0,
+            reviewer: { providerLabel: "OpenAI Codex", storedModelId: "gpt-5.6-sol@high" },
+          },
+        ];
+        fs.writeFileSync(progressPath, JSON.stringify(onDisk, null, 2));
+
+        const staleFallbackProgress = {
+          taskFolder: path.basename(fixture.folder),
+          currentStage: "impl-high-review",
+          createdAt: "2026-07-01T10:00:00.000Z",
+          updatedAt: "2026-07-02T11:30:00.000Z",
+          ownership: fixture.ownership,
+          // No reviewScoreHistory — the pre-review-run snapshot's shape.
+        } as unknown as import("../types/taskProgress").TaskProgress;
+
+        const entry = await resolveBaselineReviewHistoryEntryV1(
+          vscode.Uri.file(fixture.folder),
+          "impl-high-review" as import("../types/taskProgress").TaskStage,
+          staleFallbackProgress
+        );
+
+        assert.ok(entry, "must find the on-disk history entry despite a stale fallback snapshot");
+        assert.equal(entry?.reviewer?.storedModelId, "gpt-5.6-sol@high");
+        assert.equal(entry?.score, 9);
+      } finally {
+        reads.restore();
+        fs.rmSync(path.dirname(fixture.folder), { recursive: true, force: true });
+      }
+    }
+  );
+
+  void it("falls back to the supplied progress when disk read fails (e.g. missing file)", async () => {
+    const reads = installReadFileCounter();
+    const fallbackProgress = {
+      taskFolder: "ghost-task",
+      currentStage: "impl-high-review",
+      createdAt: "2026-07-01T10:00:00.000Z",
+      updatedAt: "2026-07-02T11:30:00.000Z",
+      reviewScoreHistory: [
+        {
+          stage: "impl-high-review",
+          score: 7,
+          attemptId: "attempt-fallback",
+          at: "2026-08-13T10:00:00.000Z",
+          blockerCount: 1,
+          taskFixableCount: 1,
+          reviewer: { providerLabel: "Cline", storedModelId: "cline-pass/kimi-k3@xhigh" },
+        },
+      ],
+    } as unknown as import("../types/taskProgress").TaskProgress;
+
+    try {
+      const entry = await resolveBaselineReviewHistoryEntryV1(
+        vscode.Uri.file(path.join(os.tmpdir(), "does-not-exist-" + Date.now())),
+        "impl-high-review" as import("../types/taskProgress").TaskStage,
+        fallbackProgress
+      );
+
+      assert.equal(entry?.reviewer?.storedModelId, "cline-pass/kimi-k3@xhigh");
+      assert.equal(entry?.score, 7);
+    } finally {
+      reads.restore();
     }
   });
 });

@@ -193,6 +193,69 @@ export interface TaskProgress {
    * provider chain). Meaningful only while `status === "paused"`; cleared by
    * any status change away from paused. */
   pausedReason?: string;
+  /** Durable record that an implementation round finished without a usable
+   * report and a recovery continuation is owed. See the extension's
+   * `src/types/taskProgress.ts` for the full state-machine commentary. */
+  implRecovery?: ImplRecoveryV1;
+  /** Durable record that a stage was blocked by a quota/model-entitlement
+   * failure (mirror of `src/types/taskProgress.ts`). See the extension's
+   * copy for the full state-machine commentary. */
+  quotaParkRecord?: QuotaParkRecordV1;
+}
+
+/** `TaskProgress.quotaParkRecord` — mirror of `src/types/taskProgress.ts`. */
+export interface QuotaParkRecordV1 {
+  /** The model id that hit the failure. */
+  modelId: string;
+  /** The resolved provider id that reported the failure. */
+  providerId: string;
+  /** Account/credential context the failure was observed under, when known. */
+  accountKey?: string;
+  /** Narrowed to the two failure kinds "resets at" language applies to. */
+  failureKind: "quota" | "model-entitlement";
+  /** ISO instant the provider reported the limit will lift. */
+  resetAt?: string;
+  /** ISO instant the failure was observed. */
+  observedAt: string;
+}
+
+/** How the round that triggered an `implRecovery` failed to report. */
+export type ImplRecoveryTriggerV1 =
+  | "roundDeferred"
+  | "roundIncomplete"
+  | "summaryRejected";
+
+/** The continuation constraint recovery was begun under (mirror of
+ * `src/types/taskProgress.ts`). */
+export type ImplRecoveryModeV1 =
+  | "summary-only"
+  | "inspect-and-complete"
+  | "unconstrained";
+
+/** Dispatch state of the owed recovery continuation. */
+export type ImplRecoveryDispatchStateV1 = "pending" | "dispatched";
+
+/** `TaskProgress.implRecovery` — one owed recovery continuation. */
+export interface ImplRecoveryV1 {
+  /** Stable token identifying the triggering round, quoted in its run log. */
+  sourceAttemptId: string;
+  /** Displayable reason the triggering round's report was unusable. */
+  reason: string;
+  /** Failure class of the triggering round. */
+  trigger: ImplRecoveryTriggerV1;
+  /** Continuation constraint selected at transition time. */
+  mode: ImplRecoveryModeV1;
+  /** "pending" until an implementation round claims the continuation. */
+  dispatch: ImplRecoveryDispatchStateV1;
+  /** ISO timestamp recovery was recorded. */
+  at: string;
+  /** True when the triggering round's change set could not be enumerated. */
+  filesChangedUnknown?: boolean;
+  /** Continuation attempt token, set when `dispatch` flips to "dispatched". */
+  attemptId?: string;
+  /** Same lease semantics as `scheduledRun`: one window arms the dispatch. */
+  leaseOwner?: string;
+  leaseUntil?: string;
 }
 
 /** `TaskProgress.reviewInvalidatedByRound` — which stage's review an incomplete round invalidated, and when. */
@@ -241,6 +304,16 @@ export interface ReviewScoreHistoryEntry {
   taskFixableCount: number;
   /** Stable identities of this round's blockers (absent on older entries). */
   blockers?: ReviewBlockerIdentity[];
+  /** Identity of the provider/model that actually produced this round's
+   * review (absent on older entries). See the mirrored doc in
+   * src/types/taskProgress.ts. */
+  reviewer?: ReviewerIdentityV1;
+}
+
+/** See `ReviewScoreHistoryEntry.reviewer`. */
+export interface ReviewerIdentityV1 {
+  readonly providerLabel: string;
+  readonly storedModelId: string;
 }
 
 /** One row of `TaskProgress.reviewRejections`. */

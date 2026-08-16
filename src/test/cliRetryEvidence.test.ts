@@ -7,11 +7,24 @@
  * auto-retries except via same-conversation resume.
  */
 import * as assert from "node:assert/strict";
+// `import cp = require(...)` (not `import * as cp from`) deliberately: the
+// latter compiles (via __importStar/__createBinding) to a fresh object with
+// non-configurable getter properties, which node:test's `t.mock.method`
+// cannot install a mock onto ("methodName must be a method. Received
+// undefined") because it reads the *own* descriptor's `value`, not the
+// getter's return. `require` gives the real, mutable child_process module
+// object, and cliAgentRunner.ts's own `cp.spawn` getter dereferences that
+// same live object on every call, so mutating it here still takes effect.
+import cp = require("child_process");
+import { EventEmitter } from "node:events";
 import { describe, it } from "node:test";
+import * as vscode from "vscode";
 
 import {
   analyzeCliEventStream,
   CLI_RETRY_MAX_ATTEMPTS,
+  composeCliTimeoutOutcomeV1,
+  execCliAgent,
   formatRetryAuditLog,
   shouldRetryReadOnlyRun,
   __testOnly,
@@ -238,5 +251,223 @@ void describe("formatRetryAuditLog", () => {
       },
     ]);
     assert.match(log, /n\/a \(read-only run\)/);
+  });
+});
+
+/**
+ * Part 7: the honest timeout-outcome message, composed once
+ * filesChanged/filesChangedUnknown are known (AFTER the retry loop and the
+ * post-run git snapshot — the defect this replaces composed the hedge text
+ * BEFORE the snapshot existed, so it was always the vague hedge even for a
+ * run that provably changed nothing, or provably changed N known files).
+ */
+void describe("composeCliTimeoutOutcomeV1 (Part 7 honest timeout message)", () => {
+  void it("known non-empty change set: names the files instead of hedging", () => {
+    const message = composeCliTimeoutOutcomeV1(
+      "Claude Code CLI timed out after 60 minutes.",
+      ["src/a.ts", "src/b.ts"],
+      false,
+      "Automatic retry is disabled for Claude Code edit runs"
+    );
+    assert.match(message, /timed out after changing 2 file\(s\): src\/a\.ts, src\/b\.ts/);
+    assert.match(message, /review these before retrying/);
+    assert.doesNotMatch(message, /may already have made changes/);
+  });
+
+  void it("known empty change set: states plainly the tree is clean, no hedge", () => {
+    const message = composeCliTimeoutOutcomeV1(
+      "Claude Code CLI timed out after 60 minutes.",
+      [],
+      false,
+      "Automatic retry is disabled for Claude Code edit runs"
+    );
+    assert.match(message, /left the working tree clean — no files were changed/);
+    assert.doesNotMatch(message, /may already have made changes/);
+    assert.doesNotMatch(message, /changing \d+ file/);
+  });
+
+  void it("filesChangedUnknown: keeps the pre-existing hedge — git couldn't be consulted", () => {
+    const message = composeCliTimeoutOutcomeV1(
+      "Claude Code CLI timed out after 60 minutes.",
+      [],
+      true,
+      "Automatic retry is disabled for Claude Code edit runs"
+    );
+    assert.match(message, /may already have made changes; review your working tree before retrying/);
+  });
+
+  void it("falls back to a generic base clause when no prior errorMessage exists", () => {
+    const message = composeCliTimeoutOutcomeV1(undefined, [], false, "reason");
+    assert.match(message, /^The run did not complete\./);
+  });
+});
+
+/**
+ * Part 7: the inactivity watchdog. Drives execCliAgent's actual spawn/timer
+ * machinery with a mocked child_process.spawn and node:test's fake timers —
+ * covers (a) the watchdog firing on genuine silence, (b) NOT firing while the
+ * stream stays active well past the inactivity threshold, and (c) the
+ * inactivity classification/message being distinct from the wall-clock one.
+ *
+ * Not covered here (documented rather than fabricated): the
+ * `ensemble.resilience.inactivityTimeoutMinutes` setting itself is exercised
+ * at its DEFAULT (15 minutes) only — the test-stub vscode `getConfiguration`
+ * always returns the schema default for this key, so a non-default
+ * configured value is not exercised by this suite. `readInactivityTimeout-
+ * Minutes`'s own clamping (0-180, 0 disables) is plain arithmetic covered
+ * implicitly by the analogous `readResilienceRounds`/`readQuotaResetThreshold-
+ * Hours` coercion, not re-tested per-setting here.
+ */
+void describe("execCliAgent inactivity watchdog (Part 7)", () => {
+  /** A fake CliProviderDefinition with a unique command per test so the
+   * module-level PATH-lookup cache (commandExistsCache, TTL-based) never
+   * serves a stale result across tests or test files. */
+  const fakeDef = (): CliProviderDefinition => ({
+    id: "opencode-cli",
+    label: "Watchdog Test CLI",
+    command: `watchdog-test-cli-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    installHint: "n/a",
+    loginHint: "n/a",
+    authErrorMarkers: [],
+    signInLabel: "Sign in",
+    models: [],
+    usesLastMessageFile: false,
+    buildArgs(): string[] {
+      return ["run"];
+    },
+  });
+
+  const fakeToken = (): vscode.CancellationToken => ({
+    isCancellationRequested: false,
+    onCancellationRequested: () => ({ dispose(): void {} }),
+  });
+
+  /** Installs a fake cp.spawn: the PATH-lookup (`where.exe`/`which`) spawn
+   * always reports found; the real provider spawn returns a fake
+   * EventEmitter-based child with pid left undefined so killProcessTree is a
+   * no-op (no real process to signal). Returns the main child for the test
+   * to drive stdout/close events on. */
+  function installFakeSpawn(t: import("node:test").TestContext): { child: EventEmitter } {
+    const handle: { child: EventEmitter } = { child: undefined as unknown as EventEmitter };
+    t.mock.method(
+      cp,
+      "spawn",
+      (command: string) => {
+        const child = new EventEmitter() as EventEmitter & {
+          stdout: EventEmitter;
+          stderr: EventEmitter;
+          pid?: number;
+          kill: () => void;
+        };
+        child.stdout = new EventEmitter();
+        child.stderr = new EventEmitter();
+        child.pid = undefined;
+        child.kill = () => {};
+        if (command === "where.exe" || command === "which") {
+          process.nextTick(() => child.emit("close", 0));
+        } else {
+          handle.child = child;
+        }
+        return child;
+      }
+    );
+    return handle;
+  }
+
+  void it("fires on genuine silence, well before the 60-minute wall clock, with a distinct 'inactivity' classification", async (t) => {
+    const handle = installFakeSpawn(t);
+    t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+
+    const resultPromise = execCliAgent({
+      def: fakeDef(),
+      mode: "text",
+      model: undefined,
+      prompt: "prompt",
+      cwd: process.cwd(),
+      token: fakeToken(),
+    });
+    // Real setImmediate (not faked) lets the PATH-lookup microtask/close
+    // event and the subsequent real spawn call land before fake time moves.
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.ok(handle.child, "the main provider spawn must have been invoked");
+
+    // Default ensemble.resilience.inactivityTimeoutMinutes is 15 (the
+    // test-stub vscode config always answers the schema default). No
+    // activity is ever emitted, so the watchdog's 15-second poll must catch
+    // it at the 15-minute mark — long before the 60-minute wall clock.
+    t.mock.timers.tick(15 * 60_000);
+
+    const result = await resultPromise;
+    assert.equal(result.status, "failed");
+    assert.equal(result.timeoutReason, "inactivity");
+    assert.match(result.errorMessage ?? "", /produced no output for 15 minute\(s\)/);
+  });
+
+  void it("does NOT fire while the stream stays active past the inactivity threshold", async (t) => {
+    const handle = installFakeSpawn(t);
+    t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+
+    const resultPromise = execCliAgent({
+      def: fakeDef(),
+      mode: "text",
+      model: undefined,
+      prompt: "prompt",
+      cwd: process.cwd(),
+      token: fakeToken(),
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.ok(handle.child, "the main provider spawn must have been invoked");
+
+    // 5 x 5 minutes = 25 minutes total, well past the 15-minute inactivity
+    // threshold — but a chunk lands every 5 minutes (under the threshold),
+    // so lastActivityAt never goes stale enough to trip the watchdog.
+    for (let i = 0; i < 5; i++) {
+      t.mock.timers.tick(5 * 60_000);
+      (handle.child as unknown as { stdout: EventEmitter }).stdout.emit(
+        "data",
+        Buffer.from("still working...\n")
+      );
+    }
+    handle.child.emit("close", 0);
+
+    const result = await resultPromise;
+    // Reached a normal close — the watchdog never killed the process, which
+    // would have produced status "failed" with timeoutReason "inactivity".
+    assert.equal(result.status, "completed");
+    assert.equal(result.timeoutReason, undefined);
+  });
+
+  void it("the wall-clock timeout is classified/worded distinctly from an inactivity kill", async (t) => {
+    const handle = installFakeSpawn(t);
+    t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+
+    const resultPromise = execCliAgent({
+      def: fakeDef(),
+      mode: "text",
+      model: undefined,
+      prompt: "prompt",
+      cwd: process.cwd(),
+      token: fakeToken(),
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.ok(handle.child, "the main provider spawn must have been invoked");
+
+    // Keep activity flowing every 10 minutes (under the 15-minute inactivity
+    // threshold) all the way to the 60-minute wall clock, so ONLY the flat
+    // wall-clock cap — never the inactivity watchdog — can fire.
+    for (let i = 0; i < 6; i++) {
+      t.mock.timers.tick(10 * 60_000);
+      (handle.child as unknown as { stdout: EventEmitter }).stdout.emit(
+        "data",
+        Buffer.from("still working...\n")
+      );
+    }
+
+    const result = await resultPromise;
+    assert.equal(result.status, "failed");
+    assert.equal(result.timeoutReason, "wall-clock");
+    assert.match(result.errorMessage ?? "", /timed out after 60 minutes/);
+    // Distinct from the inactivity wording pinned above.
+    assert.doesNotMatch(result.errorMessage ?? "", /produced no output/);
   });
 });

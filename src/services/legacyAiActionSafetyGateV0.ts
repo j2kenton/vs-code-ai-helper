@@ -255,6 +255,11 @@ export const MIGRATED_ACTION_KEYS_V0: ReadonlySet<string> = new Set<string>([
   // renameTask.v1 is invoked directly through the coordinator by the Rename
   // Task with AI command (renameTask.ts).
   "renameTask.v1",
+  // Internal-only text-mode dispatch for a summary-only recovery
+  // continuation (workflow-robustness Part 2 item 4) — invoked by the
+  // implementation stage owner via the coordinator, inside the already-gated
+  // "implementation.v1" route.
+  "implContinuationReport.v1",
 ]);
 
 /**

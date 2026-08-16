@@ -25,11 +25,13 @@
  * tables cannot silently drift while the permissive reader still exists.
  */
 import {
+  ImplRecoveryV1,
   ImplementationTypeCheckFailure,
   LintPayload,
   MAX_REVIEW_BLOCKER_IDENTITIES,
   MAX_REVIEW_REJECTIONS,
   MAX_REVIEW_SCORE_HISTORY,
+  QuotaParkRecordV1,
   ReviewRejectionEntry,
   ReviewScoreHistoryEntry,
   STAGE_ORDER,
@@ -137,6 +139,8 @@ export const TASK_PROGRESS_PRODUCT_FIELD_NAMES_V1 = [
   "reviewInvalidatedByRound",
   "incompleteRoundContinuations",
   "pausedReason",
+  "implRecovery",
+  "quotaParkRecord",
 ] as const satisfies readonly (keyof TaskProgress)[];
 
 type MissingProductFieldV1 = Exclude<
@@ -618,6 +622,7 @@ function validateReviewScoreHistory(
       "blockerCount",
       "taskFixableCount",
       "blockers",
+      "reviewer",
     ]);
     for (const key of Object.keys(entry)) {
       if (!allowed.has(key)) {
@@ -667,6 +672,24 @@ function validateReviewScoreHistory(
           if (typeof field !== "string" || field.length === 0 || field.length > 200) {
             return `reviewScoreHistory entry blocker ${key} must be a bounded non-empty string`;
           }
+        }
+      }
+    }
+    const reviewer = entry["reviewer"];
+    if (reviewer !== undefined) {
+      if (!isPlainObject(reviewer)) {
+        return "reviewScoreHistory entry reviewer must be an object";
+      }
+      const allowedReviewerKeys = new Set(["providerLabel", "storedModelId"]);
+      for (const key of Object.keys(reviewer)) {
+        if (!allowedReviewerKeys.has(key)) {
+          return `reviewScoreHistory entry reviewer has an unknown property ${JSON.stringify(key)}`;
+        }
+      }
+      for (const key of ["providerLabel", "storedModelId"] as const) {
+        const field = reviewer[key];
+        if (typeof field !== "string" || field.length === 0 || field.length > MAX_ID_LENGTH) {
+          return `reviewScoreHistory entry reviewer ${key} must be a bounded non-empty string`;
         }
       }
     }
@@ -745,6 +768,159 @@ function validateEscalation(
     typeof value["secondOpinionAttempted"] !== "boolean"
   ) {
     return "escalation.secondOpinionAttempted must be a boolean when present";
+  }
+  return undefined;
+}
+
+const IMPL_RECOVERY_TRIGGERS: ReadonlySet<string> = new Set([
+  "roundDeferred",
+  "roundIncomplete",
+  "summaryRejected",
+  "externallyTerminated",
+]);
+const IMPL_RECOVERY_MODES: ReadonlySet<string> = new Set([
+  "summary-only",
+  "inspect-and-complete",
+  "unconstrained",
+]);
+const IMPL_RECOVERY_DISPATCH_STATES: ReadonlySet<string> = new Set([
+  "pending",
+  "dispatched",
+]);
+
+function validateImplRecovery(value: unknown): string | undefined {
+  if (!isPlainObject(value)) {
+    return "implRecovery must be an object";
+  }
+  const allowed = new Set([
+    "sourceAttemptId",
+    "reason",
+    "trigger",
+    "mode",
+    "dispatch",
+    "at",
+    "filesChangedUnknown",
+    "attemptId",
+    "leaseOwner",
+    "leaseUntil",
+  ]);
+  for (const key of Object.keys(value)) {
+    if (!allowed.has(key)) {
+      return `implRecovery has an unknown property ${JSON.stringify(key)}`;
+    }
+  }
+  if (
+    typeof value["sourceAttemptId"] !== "string" ||
+    value["sourceAttemptId"].length === 0 ||
+    value["sourceAttemptId"].length > MAX_ID_LENGTH
+  ) {
+    return "implRecovery.sourceAttemptId must be a bounded non-empty string";
+  }
+  if (
+    typeof value["reason"] !== "string" ||
+    value["reason"].length === 0 ||
+    value["reason"].length > MAX_ESCALATION_REASON_LENGTH
+  ) {
+    return "implRecovery.reason must be a bounded non-empty string";
+  }
+  if (typeof value["trigger"] !== "string" || !IMPL_RECOVERY_TRIGGERS.has(value["trigger"])) {
+    return "implRecovery.trigger must be a recognized trigger";
+  }
+  if (typeof value["mode"] !== "string" || !IMPL_RECOVERY_MODES.has(value["mode"])) {
+    return "implRecovery.mode must be a recognized recovery mode";
+  }
+  if (
+    typeof value["dispatch"] !== "string" ||
+    !IMPL_RECOVERY_DISPATCH_STATES.has(value["dispatch"])
+  ) {
+    return 'implRecovery.dispatch must be "pending" or "dispatched"';
+  }
+  if (!isIsoTimestamp(value["at"])) {
+    return "implRecovery.at must be an ISO timestamp";
+  }
+  if (
+    value["filesChangedUnknown"] !== undefined &&
+    typeof value["filesChangedUnknown"] !== "boolean"
+  ) {
+    return "implRecovery.filesChangedUnknown must be a boolean when present";
+  }
+  if (
+    value["attemptId"] !== undefined &&
+    (typeof value["attemptId"] !== "string" ||
+      value["attemptId"].length === 0 ||
+      value["attemptId"].length > MAX_ID_LENGTH)
+  ) {
+    return "implRecovery.attemptId must be a bounded non-empty string when present";
+  }
+  if (
+    value["leaseOwner"] !== undefined &&
+    (typeof value["leaseOwner"] !== "string" ||
+      value["leaseOwner"].length === 0 ||
+      value["leaseOwner"].length > MAX_ID_LENGTH)
+  ) {
+    return "implRecovery.leaseOwner must be a bounded non-empty string when present";
+  }
+  if (value["leaseUntil"] !== undefined && !isIsoTimestamp(value["leaseUntil"])) {
+    return "implRecovery.leaseUntil must be an ISO timestamp when present";
+  }
+  return undefined;
+}
+
+const QUOTA_PARK_RECORD_FAILURE_KINDS: ReadonlySet<string> = new Set([
+  "quota",
+  "model-entitlement",
+]);
+
+function validateQuotaParkRecord(value: unknown): string | undefined {
+  if (!isPlainObject(value)) {
+    return "quotaParkRecord must be an object";
+  }
+  const allowed = new Set([
+    "modelId",
+    "providerId",
+    "accountKey",
+    "failureKind",
+    "resetAt",
+    "observedAt",
+  ]);
+  for (const key of Object.keys(value)) {
+    if (!allowed.has(key)) {
+      return `quotaParkRecord has an unknown property ${JSON.stringify(key)}`;
+    }
+  }
+  if (
+    typeof value["modelId"] !== "string" ||
+    value["modelId"].length === 0 ||
+    value["modelId"].length > MAX_ID_LENGTH
+  ) {
+    return "quotaParkRecord.modelId must be a bounded non-empty string";
+  }
+  if (
+    typeof value["providerId"] !== "string" ||
+    value["providerId"].length === 0 ||
+    value["providerId"].length > MAX_ID_LENGTH
+  ) {
+    return "quotaParkRecord.providerId must be a bounded non-empty string";
+  }
+  if (
+    value["accountKey"] !== undefined &&
+    (typeof value["accountKey"] !== "string" ||
+      value["accountKey"].length === 0 ||
+      value["accountKey"].length > MAX_ID_LENGTH)
+  ) {
+    return "quotaParkRecord.accountKey must be a bounded non-empty string when present";
+  }
+  if (
+    typeof value["failureKind"] !== "string" ||
+    !QUOTA_PARK_RECORD_FAILURE_KINDS.has(value["failureKind"])
+  ) {
+    return 'quotaParkRecord.failureKind must be "quota" or "model-entitlement"';
+  }
+  if (value["resetAt"] !== undefined && !isIsoTimestamp(value["resetAt"])) {
+    return "quotaParkRecord.resetAt must be an ISO timestamp when present";
+  }
+  if (!isIsoTimestamp(value["observedAt"])) {
+    return "quotaParkRecord.observedAt must be an ISO timestamp";
   }
   return undefined;
 }
@@ -1286,6 +1462,22 @@ export function decodeTaskProgressTextV1(
           return recovery("invalidFieldValue", error);
         }
         draft.implementationTypeCheckFailure = value as ImplementationTypeCheckFailure;
+        break;
+      }
+      case "implRecovery": {
+        const error = validateImplRecovery(value);
+        if (error !== undefined) {
+          return recovery("invalidFieldValue", error);
+        }
+        draft.implRecovery = value as ImplRecoveryV1;
+        break;
+      }
+      case "quotaParkRecord": {
+        const error = validateQuotaParkRecord(value);
+        if (error !== undefined) {
+          return recovery("invalidFieldValue", error);
+        }
+        draft.quotaParkRecord = value as QuotaParkRecordV1;
         break;
       }
     }

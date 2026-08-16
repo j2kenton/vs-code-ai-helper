@@ -166,6 +166,113 @@ per the design note's preference — record the fact upstream instead of
 parsing it out of prose. This fails in the safe direction only: items stay
 unticked, the completeness gate holds the task open, nothing is advanced.
 
+## Accepted (revised contract): quota/entitlement ledger keys on a user-declared account label, not auto-detected credential context
+
+Recorded 2026-08-16, from the workflow-robustness batch (`.ensemble/2026-08-13_task_1`
++ jester-run items 3–4), Part 5 ("Parse quota reset times; branch the remedy on
+magnitude; persist it").
+
+**DECISION — 2026-08-16, Jonathan Kenton (plan owner): OPTION 1 ACCEPTED.**
+The shipped user-declared-label fallback is hereby the revised contract for
+acceptance criterion 5. Two credentials behind one provider id share
+quota/entitlement state unless the operator declares which is active via
+`ensemble.providerAccountLabels`. This is an explicit product decision, not an
+inferred one, and it supersedes criterion 5's literal "actual
+account/credential context" wording.
+
+**Why accepted:** the investigation (re-confirmed twice, detailed below) shows
+automatic credential detection is not reachable from inside this task — no
+integrated provider CLI exposes which login answered an invocation, and every
+CLI is spawned from one extension-host process under one environment, so no
+environment or config-path signal can separate two credentials without the
+operator reconfiguring between runs. That is not meaningfully different from
+declaring a label. Holding 51 of 52 completed steps open against work that
+depends on a third-party CLI change was judged the worse outcome.
+
+**The obligation this creates — it is real, not a formality.** Anyone running
+two credentials behind one provider MUST set `ensemble.providerAccountLabels`,
+or one credential's quota/entitlement observation will be attributed to both.
+This is not hypothetical: on 2026-08-15 this workspace ran `claude-cli` on a
+personal subscription alongside `devpass-cli` serving `claude-sonnet-5` — two
+credentials, one of which hit a session limit. That is exactly the
+cross-contamination case. Treat the label as required configuration whenever a
+provider has more than one account, not as an optional refinement.
+
+**Scope of this decision:** it approves the reduction for acceptance criterion
+5 only. It does not close the underlying gap — see "Closing trigger" below,
+which remains open should a provider ever expose an automatic signal.
+
+An earlier version of this entry stated "Decision: DEFER" — that was the
+implementation unilaterally recording its own preferred outcome, which a review
+of this batch correctly rejected: an implementation round cannot approve a
+reduction of its own plan's acceptance criterion. The finding and the two
+options it presented are retained below as the record behind this decision.
+
+The plan's acceptance criterion 5 calls for the persistent quota/entitlement
+outage record to be keyed on "provider + actual account/credential context +
+model" so that two credentials sharing one CLI provider (e.g. two `claude-cli`
+logins in separate OS profiles, or a personal vs. work subscription) never
+cross-contaminate each other's quota or entitlement state. Re-confirmed during
+this round's investigation: no CLI provider integrated today
+(`src/runners/providers.ts`) exposes *which* logged-in credential answered a
+given invocation (no `whoami`-style structured field, no account id in normal
+output), and because Ensemble always spawns provider CLIs from one VS Code
+extension host process under one OS environment (`sanitizedCliEnv()` /
+`def.buildEnv?.(model)` in `src/runners/cliAgentRunner.ts`), even an
+environment-variable or config-directory-path signal (e.g. a per-profile
+`CLAUDE_CONFIG_DIR`) cannot distinguish two credentials unless the user
+manually reconfigures the environment between runs — which is not
+meaningfully different from declaring a label directly. Building "actual
+credential context" detection is therefore not a bug fix reachable inside this
+task; it would be new per-provider integration work with no existing hook to
+build it against, contingent on a provider CLI someday exposing this.
+
+### The two options that were presented — for the record
+
+1. **Accept the shipped fallback as the revised contract for acceptance
+   criterion 5.** Two credentials behind the same provider id share
+   quota/entitlement state unless the user declares which is active via
+   `ensemble.providerAccountLabels` (see below) — an explicit, recorded
+   product decision, not an inferred one. ← **CHOSEN, 2026-08-16 (see the
+   decision at the top of this section).**
+2. **Reject the fallback and keep acceptance criterion 5 open** until a
+   provider CLI exposes an automatic signal (see "Closing trigger" below),
+   accepting that Part 5 stays incomplete against the plan as written.
+   *Not chosen.*
+
+With option 1 accepted, Part 5 is complete against the revised criterion. The
+gap entry stays open as documentation of the residual limitation and its
+closing trigger, not as a blocker.
+
+### What ships instead
+
+`resolveQuotaAccountKeyV1` (`src/config/settings.ts:725-729`) keys on the
+resolved `ProviderAccountId` (`providerAccountIdForModelId`), refined by an
+optional user-declared label from the `ensemble.providerAccountLabels`
+setting (`src/config/settings.ts:674-712`, exposed at `package.json:856-860`).
+Unset — the default — reproduces exactly the bare-`ProviderAccountId` keying
+that predates this batch. A user who runs two credentials behind the same
+provider id declares which one is active; the quota ledger, task-park
+identity, and entitlement classification (`src/utils/quota.ts`,
+`src/runners/runnerRegistry.ts`) then key on `providerId + accountLabel +
+modelId` instead of silently sharing state.
+
+### What is NOT proven while this gap is open
+
+That two credentials behind the same provider id are ever distinguished
+*automatically*. Without a user-declared label, a quota/entitlement
+observation for one credential is attributed to both. This degrades to
+today's pre-batch behavior (shared state per provider id) rather than
+introducing a new failure mode.
+
+### Closing trigger
+
+Close this gap if a provider integration later exposes a way to identify the
+answering credential (a CLI flag, an account field in structured output, a
+config file read) — wire that into `providerAccountIdForModelId` or a
+provider-specific probe feeding `resolveQuotaAccountKeyV1`, rather than adding
+a second parallel identity mechanism.
+
 ## Full-sequence run record
 
 The most recent full verification-sequence run is recorded in

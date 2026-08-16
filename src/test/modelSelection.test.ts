@@ -1,13 +1,33 @@
 import * as assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import * as vscode from "vscode";
 import {
   __testOnly,
+  findStagesSharingBlockedPrimaryV1,
   getAvailableModels,
   type SelectableModel,
   describeModel,
   getModelDisplayName,
   describeModelSource,
 } from "../utils/modelSelection";
+
+/** Mirrors runnerRegistry.test.ts's own `installModelSettings` helper. */
+function installModelSettings(raw: Record<string, unknown>): { restore: () => void } {
+  const original = (vscode.workspace as unknown as Record<string, unknown>).getConfiguration;
+  (vscode.workspace as unknown as Record<string, unknown>).getConfiguration = (): {
+    get: (key: string, defaultValue?: unknown) => unknown;
+    inspect: () => undefined;
+  } => ({
+    get: (key: string, defaultValue?: unknown): unknown =>
+      key === "modelSettings" ? raw : defaultValue,
+    inspect: () => undefined,
+  });
+  return {
+    restore: (): void => {
+      (vscode.workspace as unknown as Record<string, unknown>).getConfiguration = original;
+    },
+  };
+}
 
 function providerModels(
   models: readonly SelectableModel[],
@@ -1193,4 +1213,65 @@ void describe("Model Selection Display States", () => {
     assert.strictEqual(describeModelSource("none"), "automatic selection");
   });
 
+});
+
+void describe("findStagesSharingBlockedPrimaryV1 (Part 5 step 3b — long-outage stage-impact notice)", () => {
+  void it("lists every configurable stage whose effective primary resolves to the given model id", () => {
+    const settings = installModelSettings({
+      plan: { primary: "copilot-gpt-5.6-sol", strategy: "alert-and-wait" },
+      "plan-high-review": { primary: "copilot-gpt-5.6-sol", strategy: "alert-and-wait" },
+      impl: { primary: "kiro-cli:default", strategy: "alert-and-wait" },
+    });
+    try {
+      const affected = findStagesSharingBlockedPrimaryV1("copilot-gpt-5.6-sol");
+      assert.deepEqual(affected.sort(), ["plan", "plan-high-review"].sort());
+    } finally {
+      settings.restore();
+    }
+  });
+
+  void it("omits stages whose primary resolves to a different model, including via the general-model fallback", () => {
+    const settings = installModelSettings({
+      desc: { primary: "copilot-gpt-5.6-sol", strategy: "alert-and-wait" }, // general model
+      plan: { primary: "kiro-cli:default", strategy: "alert-and-wait" }, // own primary, different model
+      // "impl" has no own chain — inherits the general (desc) chain's primary.
+    });
+    try {
+      const affected = findStagesSharingBlockedPrimaryV1("copilot-gpt-5.6-sol");
+      assert.ok(affected.includes("desc"));
+      assert.ok(affected.includes("impl"));
+      assert.ok(!affected.includes("plan"));
+    } finally {
+      settings.restore();
+    }
+  });
+
+  void it("returns an empty list when no stage's primary matches", () => {
+    const settings = installModelSettings({
+      plan: { primary: "kiro-cli:default", strategy: "alert-and-wait" },
+    });
+    try {
+      assert.deepEqual(findStagesSharingBlockedPrimaryV1("copilot-gpt-5.6-sol"), []);
+    } finally {
+      settings.restore();
+    }
+  });
+
+  void it("compares by provider account, not exact model id — a provider-wide block affects every stage primary'd to ANY model on that provider (review completion blocker)", () => {
+    const settings = installModelSettings({
+      plan: { primary: "claude-cli:opus", strategy: "alert-and-wait" },
+      "plan-high-review": { primary: "claude-cli:sonnet", strategy: "alert-and-wait" },
+      impl: { primary: "kiro-cli:default", strategy: "alert-and-wait" },
+    });
+    try {
+      // The block was observed on claude-cli:opus, but claude-cli:sonnet is
+      // a DIFFERENT model id on the SAME provider account — a provider-wide
+      // quota/entitlement block affects it too. A prior version compared
+      // exact model id and missed this.
+      const affected = findStagesSharingBlockedPrimaryV1("claude-cli:opus");
+      assert.deepEqual(affected.sort(), ["plan", "plan-high-review"].sort());
+    } finally {
+      settings.restore();
+    }
+  });
 });

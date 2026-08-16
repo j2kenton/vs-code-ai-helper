@@ -106,6 +106,49 @@ void describe("taskProgressDecoderV1", () => {
     expectRecovery(doc({ ensembleProgressVersion: 1, reviewRejections: { not: "an array" } }), "invalidFieldValue");
   });
 
+  void it("decodes reviewScoreHistory entries with a reviewer identity and fails closed on malformed shapes (workflow-2 item 7)", () => {
+    const valid = {
+      stage: "impl-high-review",
+      score: 9,
+      attemptId: "attempt-1",
+      at: "2026-08-14T11:00:00.000Z",
+      blockerCount: 0,
+      taskFixableCount: 0,
+      reviewer: { providerLabel: "Codex", storedModelId: "gpt-5.6-sol@high" },
+    };
+    const result = decodeTaskProgressTextV1(
+      doc({ ensembleProgressVersion: 1, reviewScoreHistory: [valid] })
+    );
+    assert.equal(result.ok, true);
+    if (result.ok) {
+      assert.deepEqual(result.decoded.progress.reviewScoreHistory, [valid]);
+    }
+    // Legacy entries with no reviewer field still decode cleanly.
+    const { reviewer: _omit, ...legacy } = valid;
+    const legacyResult = decodeTaskProgressTextV1(
+      doc({ ensembleProgressVersion: 1, reviewScoreHistory: [legacy] })
+    );
+    assert.equal(legacyResult.ok, true);
+    expectRecovery(
+      doc({
+        ensembleProgressVersion: 1,
+        reviewScoreHistory: [{ ...valid, reviewer: { ...valid.reviewer, extra: true } }],
+      }),
+      "invalidFieldValue"
+    );
+    expectRecovery(
+      doc({
+        ensembleProgressVersion: 1,
+        reviewScoreHistory: [{ ...valid, reviewer: { providerLabel: "" } }],
+      }),
+      "invalidFieldValue"
+    );
+    expectRecovery(
+      doc({ ensembleProgressVersion: 1, reviewScoreHistory: [{ ...valid, reviewer: "not-an-object" }] }),
+      "invalidFieldValue"
+    );
+  });
+
   void it("decodes a valid implementationTypeCheckFailure and fails closed on malformed shapes (2g)", () => {
     const valid = {
       at: "2026-08-07T11:00:00.000Z",

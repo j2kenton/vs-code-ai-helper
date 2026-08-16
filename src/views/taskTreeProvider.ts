@@ -28,6 +28,7 @@ import { TaskProgressRecoveryEntryV1 } from "../services/taskProgressDiscoveryV1
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { buildTaskContextValue, buildStageContextValue, TaskCreationContextInput } from "../utils/contextTokens";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
+import { buildQuotaRemedyTextV1 } from "../utils/quota";
 import { getConfiguredTaskRoot, normalizePath } from "../utils/taskRoot";
 
 /**
@@ -130,6 +131,21 @@ function buildTaskTooltip(task: IncompleteTask): vscode.MarkdownString {
   }
   if (task.progress.pinnedAt) {
     lines.push("$(pinned) **Pinned**", "");
+  }
+  // The durable record of a quota/model-entitlement block — written whether
+  // or not it also paused the whole task (a withheld-backup-switch block on
+  // a dirty tree keeps the task "active" with no other visible trace; see
+  // recordQuotaParkV1 vs. pauseTaskWithReason in taskProgressTransforms.ts).
+  // Without this the operator had no way to see WHEN (if known) a blocked
+  // model was expected to recover short of reading run logs by hand.
+  if (task.progress.quotaParkRecord) {
+    const park = task.progress.quotaParkRecord;
+    const label =
+      park.failureKind === "model-entitlement" ? "model-entitlement block" : "quota/rate limit";
+    lines.push(
+      `$(clock) **Blocked by a ${label}** on \`${park.modelId}\` as of ${new Date(park.observedAt).toLocaleString()}. ${buildQuotaRemedyTextV1(park.resetAt)}`,
+      ""
+    );
   }
   // The completeness gate stands down for this task (see
   // checklistProgressUnreliable). Surfaced because the alternative is degrading

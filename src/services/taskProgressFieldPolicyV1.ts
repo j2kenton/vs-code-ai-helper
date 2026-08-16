@@ -155,6 +155,22 @@ export const TASK_PROGRESS_FIELD_POLICY_V1: Record<
     markTaskDone: "Clear.",
     reopen: "Clear — reopening starts the streak over.",
   },
+  implRecovery: {
+    migration:
+      "Validate exact record shape (source attempt, reason, trigger, mode, dispatch state, optional lease/attempt fields); absent on new tasks.",
+    nextStage:
+      "Clear — the owed recovery continuation belongs to the implementation loop of the stage being left (parity with incompleteRoundContinuations).",
+    markTaskDone: "Clear.",
+    reopen: "Clear — reopening restarts the cycle the recovery belonged to.",
+  },
+  quotaParkRecord: {
+    migration:
+      "Validate exact record shape (modelId, providerId, optional accountKey, failureKind restricted to quota/model-entitlement, optional resetAt, observedAt); absent on new tasks.",
+    nextStage:
+      "Clear — the park record belongs to the specific stage attempt that hit the failure, not to future stages (parity with implRecovery).",
+    markTaskDone: "Clear.",
+    reopen: "Clear — reopening restarts the cycle the park record belonged to.",
+  },
   pausedReason: {
     migration: "Validate bounded non-empty string/current optionality; absent on new tasks.",
     nextStage: "Clear — a stage transition requires an active task, and the reason only describes a paused state.",
@@ -372,6 +388,8 @@ export function applyNextStagePolicyV1(
     pendingImplReviewFiles: progress.pendingImplReviewFiles,
     reviewInvalidatedByRound: progress.reviewInvalidatedByRound,
     incompleteRoundContinuations: undefined,
+    implRecovery: undefined,
+    quotaParkRecord: undefined,
     pausedReason: undefined,
     lintPayload: undefined,
     scheduledRun: undefined,
@@ -425,6 +443,8 @@ export function applyMarkTaskDonePolicyV1(
     pendingImplReviewFiles: progress.pendingImplReviewFiles,
     reviewInvalidatedByRound: undefined,
     incompleteRoundContinuations: undefined,
+    implRecovery: undefined,
+    quotaParkRecord: undefined,
     pausedReason: undefined,
     lintPayload: undefined,
     scheduledRun: undefined,
@@ -517,6 +537,8 @@ export function applyReopenPolicyV1(
     pendingImplReviewFiles,
     reviewInvalidatedByRound: undefined,
     incompleteRoundContinuations: undefined,
+    implRecovery: undefined,
+    quotaParkRecord: undefined,
     pausedReason: undefined,
     lintPayload: undefined,
     scheduledRun: undefined,

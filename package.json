@@ -853,6 +853,12 @@
           "scope": "window",
           "description": "Enabled AI providers."
         },
+        "ensemble.providerAccountLabels": {
+          "type": "object",
+          "default": {},
+          "scope": "window",
+          "description": "Optional account/credential label per provider (e.g. \"claude-cli\": \"work\"), for users authenticated to the same CLI provider with more than one credential. No CLI provider reports which credential answered a run, so this is a manual declaration: it keys quota/entitlement tracking and paused-task state so two credentials sharing one provider stop being treated as the same account. Leave unset if you only use one credential per provider."
+        },
         "ensemble.fastForwardMaxIterations": {
           "type": "integer",
           "default": 5,
@@ -1078,6 +1084,22 @@
           "maximum": 99,
           "scope": "window",
           "description": "Stop and escalate after this many consecutive implementation rounds that change zero files while the same blocker persists, instead of iterating to ensemble.fastForwardMaxIterations. 0 disables the breaker (legacy behavior). Works together with ensemble.resilience.nothingToFixRoutesToReview, which is what lets zero-change rounds continue at all."
+        },
+        "ensemble.resilience.quotaResetNearThresholdHours": {
+          "type": "integer",
+          "default": 24,
+          "minimum": 0,
+          "maximum": 720,
+          "scope": "window",
+          "description": "When a quota/rate-limit or model-entitlement failure carries a provider-reported reset time within this many hours, remedy messages say to rerun after that local time; beyond it, messages advise switching the stage's model instead of waiting. When no reset time is known at all, messages keep offering both options (rerun or switch), unchanged from before this setting existed."
+        },
+        "ensemble.resilience.inactivityTimeoutMinutes": {
+          "type": "integer",
+          "default": 15,
+          "minimum": 0,
+          "maximum": 180,
+          "scope": "window",
+          "description": "Kill a CLI run's process tree when it has produced no stdout/stderr/raw-transport output for this many consecutive minutes, distinct from the flat 60-minute wall-clock cap on a run. Catches a wedged process much sooner than the wall clock while leaving a slow-but-actively-generating run alone. 0 disables the inactivity watchdog."
         },
         "vs-code-ai-helper.aiModelDefaults": {
           "deprecationMessage": "Use `ensemble.aiModelDefaults` instead.",

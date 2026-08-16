@@ -24,6 +24,8 @@ import {
   ProviderSignInAction,
 } from "../runners/providers";
 import { NotificationRouter } from "../utils/notificationRouter";
+import { getExtensionContextV1 } from "../utils/extensionContextV1";
+import { buildQuotaRemedyTextV1, listParkedQuotaLedgerEntriesV1 } from "../utils/quota";
 
 type IncomingMessage =
   | { type: "ready" }
@@ -492,6 +494,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       providers: this._buildProviderViewModels(),
       showProviderAccountActions: isProviderAccountActionsEnabled(),
       warnUnsavedSettings: isUnsavedSettingsWarningEnabled(),
+      quotaWarnings: this._buildQuotaWarnings(),
     });
   }
 
@@ -528,6 +531,36 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               : "Runs the provider's usage command in a visible terminal",
       enabledByDefault: provider.enabledByDefault,
     }));
+  }
+
+  /**
+   * Review completion blocker: the durable quota/model-entitlement ledger
+   * (utils/quota.ts's globalState-backed ledger) accrued entries with no
+   * consumer anywhere in this panel — a model the account cannot currently
+   * use (quota-exhausted or entitlement-blocked) read no differently from
+   * any other model in the AI Models list. Surfaces every currently-parked
+   * ledger entry as a short warning line so the operator sees the block
+   * without reading run logs or the task tree tooltip. Returns `[]` (not
+   * omitted) when the extension context isn't available yet (e.g. very
+   * early activation) or nothing is parked, so the webview can render an
+   * empty state deterministically rather than branching on `undefined`.
+   */
+  private _buildQuotaWarnings(): Array<{ providerId: string; providerLabel: string; modelId: string; text: string }> {
+    const context = getExtensionContextV1();
+    if (!context) {
+      return [];
+    }
+    return listParkedQuotaLedgerEntriesV1(context).map((entry) => {
+      const provider = getProviderAccountEntry(entry.providerId);
+      const providerLabel = provider ? accountEntryDisplayLabel(provider) : entry.providerId;
+      const kindLabel = entry.failureKind === "model-entitlement" ? "not entitled to this model" : "quota exhausted";
+      return {
+        providerId: entry.providerId,
+        providerLabel,
+        modelId: entry.modelId,
+        text: `${providerLabel} — ${entry.modelId}: ${kindLabel}. ${buildQuotaRemedyTextV1(entry.resetAt)}`,
+      };
+    });
   }
 
   /**
@@ -817,6 +850,14 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           .provider-warning p {
             margin: var(--ensemble-space-1) 0 0;
           }
+          .quota-warning {
+            margin: 0 0 var(--ensemble-space-2);
+            padding: var(--ensemble-space-1) var(--ensemble-space-2);
+            border-left: var(--ensemble-border-width) solid var(--vscode-inputValidation-warningBorder);
+            background: var(--vscode-inputValidation-warningBackground);
+            color: var(--vscode-inputValidation-warningForeground, var(--vscode-foreground));
+            font-size: var(--ensemble-small-font-size);
+          }
           .form-row {
             margin-bottom: var(--ensemble-space-2);
           }
@@ -904,6 +945,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
 
         <div id="restored-note-container"></div>
 
+        <!-- Currently-parked quota/model-entitlement blocks (utils/quota.ts's
+             durable ledger) — empty and hidden when nothing is parked. -->
+        <div id="quota-warnings"></div>
+
         <!-- Single-column layout: one titled section per stage (stage name
              as a heading, then primary model / fallback strategy / backup
              models stacked vertically). The container keeps the historical
@@ -932,6 +977,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           let stageDisplayNames = {};
           let enabledProviders = {};
           let providers = [];
+          let quotaWarnings = [];
           let stageTitleOverrides = {};
           let stageHints = {};
           let showProviderAccountActions = false;
@@ -1077,6 +1123,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               stageHints = message.stageHints || {};
               showProviderAccountActions = message.showProviderAccountActions === true;
               warnUnsavedSettings = message.warnUnsavedSettings !== false;
+              quotaWarnings = message.quotaWarnings || [];
 
               // Restore a draft preserved across a webview disposal.
               const draft = takeSavedDraft();
@@ -1087,6 +1134,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               }
 
               renderProviderSelection();
+              renderQuotaWarnings();
               renderTable();
               document.getElementById('loading-indicator').hidden = true;
               document.getElementById('settings-table').hidden = false;
@@ -1609,6 +1657,17 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             // With zero backups only the add button renders — no caption.
             const caption = row.querySelector('.backup-caption');
             if (caption) caption.hidden = count === 0;
+          }
+
+          function renderQuotaWarnings() {
+            const container = document.getElementById('quota-warnings');
+            if (!quotaWarnings.length) {
+              container.innerHTML = '';
+              return;
+            }
+            container.innerHTML = quotaWarnings.map(warning =>
+              '<div class="quota-warning">' + escapeHtml(warning.text) + '</div>'
+            ).join('');
           }
 
           function renderProviderSelection() {

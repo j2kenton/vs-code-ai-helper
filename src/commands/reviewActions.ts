@@ -28,7 +28,7 @@ import {
   STAGE_ORDER,
   TaskStage,
 } from "../types/taskProgress";
-import { TaskProgress } from "../types/taskProgress";
+import { ReviewScoreHistoryEntry, TaskProgress } from "../types/taskProgress";
 import { deriveTaskBindingV1 } from "../types/taskBindingV1";
 import {
   appendReviewRejection,
@@ -36,16 +36,28 @@ import {
   clearImplementationTypeCheckFailure,
   clearReviewInvalidatedByRound,
   promotePendingImplReviewFiles,
-  quarantinePendingImplReviewFiles,
   recordImplementationTypeCheckFailure,
-  recordReviewInvalidatedByRound,
-  setIncompleteRoundContinuations,
   setZeroChangeImplRounds,
   pauseTaskWithReason,
   updateImplReviewFiles,
   updateLintPayload,
   updateTaskStatus,
 } from "../utils/taskProgressTransforms";
+import { classifyFailure, parseQuotaResetV1, isQuotaResetBeyondThresholdV1 } from "../utils/quota";
+import { QuotaParkRecordV1 } from "../types/taskProgress";
+import {
+  BegunImplementationRecoveryV1,
+  beginImplementationRecoveryV1,
+  buildImplementationContinuationPromptV1,
+  claimImplRecoveryDispatchV1,
+  ClaimedImplRecoveryV1,
+  escalateClaimedSummaryOnlyIfUnavailableV1,
+  stripImplementationContinuationNoticeV1,
+} from "./implementationRecoveryV1";
+import {
+  isSummaryOnlyDispatchAvailableV1,
+  runSummaryOnlyContinuationV1,
+} from "./implContinuationTextDispatchV1";
 import { IncompleteTask } from "../types/incompleteTask";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
@@ -108,6 +120,7 @@ import {
   getImplementationSummaryUri,
   getLegacyImplementationUri,
   isUnusableImplementationSummaryV1,
+  PlanOfRecordV1,
   readImplementationReviewContent,
   readPlanOfRecordV1,
   resolveImplementationArtifact,
@@ -202,6 +215,7 @@ import {
   getResilienceSettings,
   getReviewPlateauRounds,
   isAutoAdvanceEnabled,
+  resolveQuotaAccountKeyV1,
   strongestAutoTriggerMode,
   usesAcceptanceThresholdForFastForward,
   completeAndMoveOnTriggersAI,
@@ -944,6 +958,32 @@ async function readTaskProgressAdvisoryV1(
   return undefined;
 }
 
+/**
+ * The most recent reviewScoreHistory entry for `targetStage`, read fresh
+ * from disk rather than trusting a possibly-stale in-memory `TaskProgress`
+ * snapshot. Fast Forward's baseline reviewer lookup needs this: when no
+ * review existed yet at the target stage, the caller just ran the initial
+ * review, which appends that stage's very first history entry (including
+ * the reviewer identity that produced the baseline score) via its own
+ * `handleReviewRoutingOutcome` call. A snapshot captured before that run
+ * never has the entry, which silently leaves the scale-break check inert
+ * against a reviewer substitution on the very first loop iteration.
+ * `fallbackProgress` covers the read-failure case (`readTaskProgressAdvisoryV1`
+ * returns `undefined` on a missing file) with whatever the caller already
+ * has in hand.
+ */
+export async function resolveBaselineReviewHistoryEntryV1(
+  folderUri: vscode.Uri,
+  targetStage: TaskStage,
+  fallbackProgress: TaskProgress
+): Promise<ReviewScoreHistoryEntry | undefined> {
+  const history =
+    (await readTaskProgressAdvisoryV1(folderUri))?.reviewScoreHistory ??
+    fallbackProgress.reviewScoreHistory ??
+    [];
+  return history.filter((entry) => entry.stage === targetStage).at(-1);
+}
+
 function getWorkspaceRoot(): vscode.WorkspaceFolder | undefined {
   const active = vscode.window.activeTextEditor;
   return active
@@ -1560,8 +1600,13 @@ export async function handleReviewRoutingOutcome(options: {
   content: string;
   score: number | null;
   threshold: number;
+  /** Identity of the provider/model that actually produced this review
+   * (including any backup-cascade substitution) — recorded on the history
+   * entry so cross-reviewer comparisons can be detected. Absent when the
+   * caller has no provider attribution to offer. */
+  reviewer?: { providerLabel: string; storedModelId: string };
 }): Promise<{ escalated: boolean }> {
-  const { folderUri, targetStage, reviewAttemptId, content, score, threshold } = options;
+  const { folderUri, targetStage, reviewAttemptId, content, score, threshold, reviewer } = options;
   try {
     const resilience = getResilienceSettings();
     const blockerEvidence = parseReviewBlockersDetailed(content);
@@ -1639,6 +1684,7 @@ export async function handleReviewRoutingOutcome(options: {
       blockerCount: blockers.length,
       taskFixableCount: blockers.filter((b) => b.resolver === "task-fixable").length,
       blockers: blockerIdentities(blockers),
+      ...(reviewer ? { reviewer } : {}),
     };
     const updated = await patchTaskProgressStrictV1(folderUri, (current) => {
       const withHistory = appendReviewScoreHistory(current, historyEntry);
@@ -1996,6 +2042,7 @@ async function routeReviewOutcomeV1(
           content,
           score,
           threshold: autoAdvanceThreshold,
+          reviewer: outcome.provider,
         });
         // Publish has no further stage to auto-advance into (see the `next`
         // block below), so this is the only notification a Publish review
@@ -2432,12 +2479,59 @@ export async function pauseTaskForExhaustedChainV1(
     `No configured provider for ${stageName} is available — ` +
     `the resolved chain was exhausted (${chain}). ` +
     "See the run log for per-candidate reasons.";
+  // Review completion blocker: a chain exhausted because every ranked
+  // candidate hit a quota or model-entitlement block previously paused the
+  // task with only the human-readable `reason` text — no `quotaParkRecord`,
+  // so the settings quota view and a later notification had no durable
+  // "when might this resume" state to read, unlike the withheld-backup path
+  // in runnerRegistry.ts which already records one. Scan the ranked
+  // candidates (same order they were attempted) for the first one whose
+  // recorded skip/failure reason classifies as quota/entitlement, and park
+  // the same shape of record for it.
+  const quotaCandidate = exhaustion.candidates
+    .map((candidate) => ({ candidate, classified: classifyFailure({ errorMessage: candidate.reason }) }))
+    .find(
+      ({ classified }) =>
+        classified.failureKind === "quota" || classified.failureKind === "model-entitlement"
+    );
+  const quotaParkRecord: QuotaParkRecordV1 | undefined = quotaCandidate
+    ? {
+        modelId: quotaCandidate.candidate.storedModelId,
+        providerId: quotaCandidate.candidate.runnerId,
+        accountKey: resolveQuotaAccountKeyV1(quotaCandidate.candidate.storedModelId),
+        failureKind: quotaCandidate.classified.failureKind as "quota" | "model-entitlement",
+        resetAt: parseQuotaResetV1(quotaCandidate.candidate.reason, new Date()),
+        observedAt: new Date().toISOString(),
+      }
+    : undefined;
   await patchTaskProgressStrictV1(folderUri, (current) =>
-    pauseTaskWithReason(current, reason)
+    pauseTaskWithReason(current, reason, quotaParkRecord)
   );
+  // Review completion blocker: this path parked the task with a durable
+  // quotaParkRecord (including resetAt when known) but never offered the
+  // same "Rerun after reset" action the withheld-backup cascade offers in
+  // runnerRegistry.ts — so a chain-exhaustion park was NOT actually a timed,
+  // actionable recovery, only the generic "fix it yourself" text below.
+  // Gated to a near reset the same way the cascade path is: a far reset
+  // (beyond ensemble.resilience.quotaResetNearThresholdHours) should advise
+  // switching the stage's model instead of implying a scheduled rerun is
+  // useful before the window actually reopens.
+  const resumeAction =
+    quotaParkRecord?.resetAt !== undefined &&
+    !isQuotaResetBeyondThresholdV1(quotaParkRecord.resetAt)
+      ? {
+          command: "vs-code-ai-helper.scheduleQuotaResumeV1",
+          title: "Rerun after reset",
+          args: [{ taskFolderPath: folderUri.fsPath, resetAtIso: quotaParkRecord.resetAt }],
+        }
+      : undefined;
   NotificationRouter.showWarning(
     `⚠️ ${reason} The task has been paused; fix provider availability or the stage's ` +
-      "model configuration, then resume."
+      "model configuration, then resume.",
+    undefined,
+    undefined,
+    undefined,
+    resumeAction
   );
 }
 
@@ -3666,6 +3760,21 @@ export async function fastForwardReviewWithAI(
       : hasZeroTaskFixableEvidence(initialContent),
     planIncomplete: isPlanIncomplete(initialProgress),
   };
+  // Reviewer identity + task-fixable count already on record for this stage's
+  // most recent review round (the one that produced baselineScore), so the
+  // in-loop scale-break check has something to compare a reviewer change
+  // against. Absent for a task with no prior history entry (e.g. this
+  // stage's very first review), which leaves the check inert for the whole
+  // run — identical to today's behavior. Reads fresh from disk (see
+  // resolveBaselineReviewHistoryEntryV1's doc comment): `resolved.progress`
+  // is a snapshot from BEFORE the block above possibly ran the initial
+  // review, so trusting it here would miss the very entry that review just
+  // appended.
+  const baselineHistoryEntry = await resolveBaselineReviewHistoryEntryV1(
+    resolved.folderUri,
+    targetStage,
+    resolved.progress
+  );
   const maxAttempts = getFastForwardMaxIterations();
   // The acceptance-threshold option uses the user's configured acceptance
   // threshold; it is not synonymous with a perfect 10/10 score.
@@ -3813,6 +3922,8 @@ export async function fastForwardReviewWithAI(
           continueThroughEscalation: resilience.fastForwardSurvivesEscalation,
           zeroFixableTerminates: resilience.zeroFixableTerminatesFastForward,
           preLoopEvidence,
+          baselineReviewer: baselineHistoryEntry?.reviewer,
+          baselineTaskFixableCount: baselineHistoryEntry?.taskFixableCount,
           review: async () => {
             const newContent = await readNonEmptyText(reviewUri);
             if (!newContent || newContent === previousContent) {
@@ -3858,6 +3969,16 @@ export async function fastForwardReviewWithAI(
                     parseReviewProgress(newContent),
                     await readPlanChecklistProgressV1(resolved.folderUri)
                   ),
+              // apply() already ran handleReviewRoutingOutcome for this same
+              // round (via applyReviewWithAI/applyReviewEditWithAI), which
+              // appended this round's own reviewScoreHistory entry — including
+              // its resolved reviewer identity — before review() runs. Read it
+              // back rather than re-deriving it, so the scale-break check
+              // below compares against the SAME identity the durable history
+              // records for this round.
+              reviewer: (await readTaskProgressAdvisoryV1(resolved.folderUri))?.reviewScoreHistory?.filter(
+                (entry) => entry.stage === targetStage
+              ).at(-1)?.reviewer,
             };
           },
         }).finally(() => linked.dispose());
@@ -5272,6 +5393,46 @@ async function executeImplementationRun(
     }
   }
 
+  // A pending recovery continuation (implRecovery, Part 1) is claimed by the
+  // round that actually starts: `pending` → `dispatched` with a fresh
+  // continuation attemptId, in one patch. After this point a lingering
+  // `dispatched` record always means a round started and died — which the
+  // scheduler surfaces but never re-fires — while a `pending` one means the
+  // continuation never started and is safe to re-arm exactly once.
+  //
+  // The claim also captures WHAT this round is running as (the record's
+  // persisted recovery mode) and the pre-round boundary — the inputs to the
+  // post-run delta gate (Part 2): `summary-only` permits no edits at all,
+  // `inspect-and-complete` bounds them to the quarantined plus
+  // previously-reviewed scope.
+  const claimedAtStart = await claimImplRecoveryDispatchV1(folderUri);
+  // A claimed `summary-only` record's no-edit guarantee is enforceable only
+  // when THIS round's actually-resolved model can dispatch in text mode with
+  // edit permissions genuinely withheld. The transition-time probe
+  // (`beginImplementationRecoveryV1`) checked the stage chain's PRIMARY; a
+  // sticky fallback, or a live settings change between transition and claim,
+  // can resolve this round against a different model that no longer
+  // qualifies. Escalating HERE — before any dispatch decision — and
+  // rebuilding the prompt to match closes the fallthrough where an
+  // unenforceable `summary-only` claim would otherwise reach the ordinary
+  // edit path still carrying its no-edits mandate (review blocker,
+  // 2026-08-14).
+  const escalatedRecord = await escalateClaimedSummaryOnlyIfUnavailableV1(
+    folderUri,
+    claimedAtStart.record,
+    modelId
+  );
+  const claimedRecovery: ClaimedImplRecoveryV1 = { ...claimedAtStart, record: escalatedRecord };
+  const wasEscalatedFromSummaryOnly =
+    claimedAtStart.record?.mode === "summary-only" && escalatedRecord?.mode !== "summary-only";
+  const dispatchPrompt = wasEscalatedFromSummaryOnly
+    ? buildImplementationContinuationPromptV1(stripImplementationContinuationNoticeV1(prompt), {
+        mode: escalatedRecord?.mode,
+        pendingFiles: claimedRecovery.priorPendingFiles,
+        reviewedFiles: claimedRecovery.priorImplReviewFiles,
+      })
+    : prompt;
+
   let result: Awaited<ReturnType<typeof runImplementationOrSealedV1>> | undefined;
 
   await vscode.window.withProgress(
@@ -5292,15 +5453,43 @@ async function executeImplementationRun(
         taskOperations.tokenFor(folderUri.fsPath)
       );
       try {
+      // A claimed summary-only continuation dispatches in TEXT mode — edit
+      // permissions actually withheld (Part 2 item 4), never an edit run
+      // carrying only a no-edits instruction. The re-probe against the model
+      // THIS run resolved already happened above (escalateClaimedSummaryOnly-
+      // IfUnavailableV1): by the time this branch runs, `claimedRecovery.record`
+      // reads `summary-only` only when that probe passed, so this check is a
+      // belt-and-braces re-assertion, not the escalation point itself. If the
+      // record was escalated, this branch is skipped and the edit dispatch
+      // below runs with `dispatchPrompt`'s rebuilt inspect-and-complete
+      // mandate and the delta-boundary gate (Part 2 step 3) still armed.
+      if (
+        claimedRecovery.record?.mode === "summary-only" &&
+        isSummaryOnlyDispatchAvailableV1(modelId)
+      ) {
+        result = await runSummaryOnlyContinuationV1({
+          taskFolderUri: folderUri,
+          workspaceUri: workspaceRoot.uri,
+          prompt: dispatchPrompt,
+          modelId,
+          taskStage: postRunReviewStage,
+          token: linked.token,
+          onProgress: (message) => progress.report({ message }),
+        });
+        return;
+      }
       // Copilot-resolved models run the sealed two-phase pipeline
       // (read-only preflight → sealed plan → receipted mutation session);
       // CLI-resolved models run their own direct edit-mode invocation
       // instead, since they cannot join that pipeline (see
       // runImplementationOrSealedV1's header). Provider/model fallback for
       // both paths lives in the coordinator's/runner's ranked selection.
+      // `dispatchPrompt` carries the rebuilt inspect-and-complete mandate
+      // when this round was escalated off an unenforceable summary-only
+      // claim; otherwise it is `prompt` unchanged.
       result = await runImplementationOrSealedV1({
         editActionKey: options.editActionKey ?? "implementation.v1",
-        prompt,
+        prompt: dispatchPrompt,
         modelId,
         workspaceUri: workspaceRoot.uri,
         token: linked.token,
@@ -5368,48 +5557,165 @@ async function executeImplementationRun(
       }\n\n`
     : "";
 
-  // Deferred/cut-short detection runs BEFORE the run log is written, so the
-  // durable record of a detected round says `Status: incomplete (...)` —
-  // never `Status: completed`. A round that ends its turn promising a
-  // follow-up the workflow cannot deliver is not a completed round, and
-  // recording it as one is what left a task sitting "active" for 3.5 hours
-  // with its previous good summary destroyed (2026-08-13, round 014). The
-  // plan of record is read here for the same reason the summary gate reads
-  // it: the checklist-echo expectation is part of the contract.
+  // Deferred/cut-short detection AND summary-shape validation run BEFORE the
+  // run log is written, so the durable record of a detected round says
+  // `Status: incomplete (...)` — never `Status: completed` — and so BOTH
+  // failure classes can persist their recovery transition ahead of every
+  // other write. A round that ends its turn promising a follow-up the
+  // workflow cannot deliver is not a completed round, and recording it as
+  // one is what left a task sitting "active" for 3.5 hours with its previous
+  // good summary destroyed (2026-08-13, round 014). The plan of record is
+  // read once here and reused by the summary write/merge below, so the gate
+  // and the merge can never disagree about which document they check against.
+  const summary = result.summary?.trim() ?? "";
+  // "May have changed": unknown counts, because the tree's real state is not
+  // provably clean. "Known files" is the stricter form the shape gate's
+  // empty-section rule keys on.
+  const roundMayHaveChangedFiles =
+    result.filesChangedUnknown === true || result.filesChanged.length > 0;
+  const roundChangedKnownFiles =
+    !result.filesChangedUnknown && result.filesChanged.length > 0;
+  let plan: PlanOfRecordV1 | undefined;
+  let planChecklist: string | undefined;
   let incompleteRound: IncompleteImplementationRoundV1 | undefined;
-  if (result.status === "completed" && !result.summaryIsSynthetic) {
-    const planForDetection = await readPlanOfRecordV1(folderUri);
-    incompleteRound = describeIncompleteImplementationRoundV1(
-      result.summary?.trim() ?? "",
-      { planChecklist: planForDetection.hasChecklist ? planForDetection.text : undefined }
-    );
+  let summaryIssue: string | undefined;
+  // Post-run delta gate, first half (Part 2 step 3): a `summary-only`
+  // continuation's premise is "no edits". Any delta — or an unenumerable one,
+  // which cannot prove the tree clean — violates the mode: the round's report
+  // is NOT accepted as a summary-only report regardless of its shape, its
+  // delta is quarantined (never banked), and the recovery transition below
+  // escalates the mode to `inspect-and-complete` under the same continuation
+  // cap. Checked before the shape gates so a well-formed summary cannot
+  // narrate over edits it was forbidden to make.
+  const summaryOnlyViolation =
+    result.status === "completed" &&
+    claimedRecovery.record?.mode === "summary-only" &&
+    roundMayHaveChangedFiles;
+  if (result.status === "completed") {
+    plan = await readPlanOfRecordV1(folderUri);
+    planChecklist = plan.hasChecklist ? plan.text : undefined;
+    if (summaryOnlyViolation) {
+      summaryIssue =
+        "this summary-only continuation was not permitted to edit files, but it " +
+        (result.filesChangedUnknown
+          ? "left the tree state unenumerable"
+          : `changed ${result.filesChanged.length} file(s)`) +
+        " — its report was rejected and the delta quarantined";
+    } else if (!result.summaryIsSynthetic) {
+      // The gate enforces the contract run-implementation.md imposes on a
+      // model. A runner-synthesized summary never went through that prompt
+      // (the sealed edit pipeline reports "Applied N sealed edit step(s)…"),
+      // so holding it to that shape stamped every successful Copilot run
+      // unusable and refused to advance — disabling that execution path
+      // entirely, on success.
+      const expectations = {
+        planChecklist,
+        roundChangedFiles: roundChangedKnownFiles,
+      };
+      incompleteRound = describeIncompleteImplementationRoundV1(summary, expectations);
+      if (!incompleteRound) {
+        summaryIssue = describeImplementationSummaryShapeIssue(summary, expectations);
+      }
+    }
   }
-  const quarantinedPaths =
-    incompleteRound && !result.filesChangedUnknown ? result.filesChanged : [];
 
-  // Durable quarantine FIRST — before the run log or any other write. The
-  // run log is the visible record that the round was detected incomplete; if
-  // it were written first and the process died before this patch landed, the
-  // durable state would say "incomplete round handled" while the round's
-  // edits sat in no set at all. Persisting the quarantine (plus the
-  // continuation counter and, at a review stage, the review-invalid marker)
-  // ahead of every other write means a crash at any later point can only
-  // lose REPORTING, never the round's edits.
-  let incompleteContinuations = 0;
-  let incompletePersisted: Awaited<ReturnType<typeof patchTaskProgressStrictV1>>;
-  if (incompleteRound) {
-    incompletePersisted = await patchTaskProgressStrictV1(folderUri, (current) => {
-      incompleteContinuations = (current.incompleteRoundContinuations ?? 0) + 1;
-      let next = setIncompleteRoundContinuations(current, incompleteContinuations);
-      if (quarantinedPaths.length > 0) {
-        next = quarantinePendingImplReviewFiles(next, [...quarantinedPaths]);
-      }
-      if (isReviewStage(postRunReviewStage)) {
-        next = recordReviewInvalidatedByRound(next, postRunReviewStage);
-      }
-      return next;
+  // Checklist-merge outcome, computed ONCE here (pure/read-only — nothing is
+  // written yet) so both the zero-change routing decision below and the
+  // merge-write block further down read the identical result and can never
+  // disagree about what this round actually reported. A round that changed
+  // no files but DID land new ticks (`kind === "merged"`) made real progress
+  // and must not count toward the no-progress streak; a round that changed
+  // no files and reported checklist claims that never merged (`"no-match"`,
+  // e.g. paraphrased retroactive-tick text — see
+  // `hasContradictoryNoChecklistChangeClaimV1`) is exactly as sterile as one
+  // that reported nothing at all, and must still count.
+  const checklistMergeResult =
+    planChecklist !== undefined && summaryIssue === undefined
+      ? mergeChecklistProgressV1(planChecklist, summary)
+      : undefined;
+  const checklistAdvanced = checklistMergeResult?.kind === "merged";
+  const checklistClaimedButUnmerged = checklistMergeResult?.kind === "no-match";
+
+  // The ONE durable recovery transition (Part 1): a detected incomplete
+  // round, and equally a completed round whose summary will be stamped
+  // unusable, both persist — in a single strict patch, before the run log or
+  // any other write — the quarantined delta, the bounded continuation
+  // counter, the review-invalid marker, and the `implRecovery` dispatch
+  // record. If the log were written first and the process died before the
+  // patch landed, the durable state would say "handled" while the round's
+  // edits sat in no set at all; persisting first means a crash at any later
+  // point can only lose REPORTING, never the round's edits or the owed
+  // continuation. A zero-change rejected summary lands the SAME transition:
+  // it has no delta to quarantine, but the round still owes a usable report,
+  // and exempting it left the task parked at "active" with an unusable stamp
+  // and nothing scheduled — the exact stall the transition exists to end
+  // (review blocker, 2026-08-14).
+  // Part 7: a failed round whose process was externally killed (wall-clock
+  // or inactivity watchdog — see CliExecResult.timeoutReason /
+  // ImplementationRunResult.timedOut) is neither a completed round with an
+  // unusable summary nor a plain provider error: the process may have been
+  // killed mid-edit, so it owes the same recovery transition as a detected
+  // incomplete round, routed with terminatedExternally: true and its own
+  // `externallyTerminated` trigger so the mode selector (Part 2) never
+  // picks summary-only for it, and the run log records the true cause
+  // distinctly from a provider-reported deferred/cut-short round.
+  const timedOutRound = result.status === "failed" && result.timedOut === true;
+  let recovery: BegunImplementationRecoveryV1 | undefined;
+  if (incompleteRound || summaryIssue !== undefined || timedOutRound) {
+    recovery = await beginImplementationRecoveryV1(folderUri, {
+      trigger: incompleteRound
+        ? incompleteRound.kind
+        : timedOutRound
+          ? "externallyTerminated"
+          : "summaryRejected",
+      reason:
+        incompleteRound?.reason ??
+        summaryIssue ??
+        result.errorMessage ??
+        `${result.timeoutReason === "inactivity" ? "produced no output and was" : "timed out and was"} stopped before returning a final response`,
+      // Every summary-gate path is a NORMAL termination — the provider
+      // returned a final response, however unusable. Externally-killed
+      // rounds (timeout, inactivity kill) enter the transition here with
+      // this flag true; the mode itself is selected from evidence inside
+      // the transition (Part 2) — known non-empty delta routes to
+      // inspect-and-complete, filesChangedUnknown routes to unconstrained.
+      terminatedExternally: timedOutRound,
+      ...(summaryOnlyViolation ? { escalatedFromSummaryOnly: true } : {}),
+      filesChanged: result.filesChanged,
+      filesChangedUnknown: result.filesChangedUnknown === true,
+      postRunReviewStage,
+      parentOperation: options.parentOperation,
+      ...(incompleteRound === undefined
+        ? {
+            notificationAction: {
+              command: "vs-code-ai-helper.restoreRejectedImplementationRound",
+              title: "Restore Prior Round",
+              args: [folderUri.fsPath, postRunReviewStage],
+            },
+          }
+        : {}),
     });
   }
+  const quarantinedPaths = recovery?.quarantinedPaths ?? [];
+
+  // Post-run delta gate, second half (Part 2 step 3): an
+  // `inspect-and-complete` continuation is bounded to the quarantined plus
+  // previously-reviewed scope. Files it changed OUTSIDE that boundary are
+  // kept — the gate is a backstop, not a sandbox — but named in the run log
+  // as unreviewed scope, so the prior review's score is never read as
+  // covering them. (They still enter the NEXT review's scope through the
+  // ordinary attribution/banking below, which is exactly what "unreviewed
+  // scope requiring a fresh review" means.)
+  const inspectBoundaryViolations =
+    result.status === "completed" &&
+    claimedRecovery.record?.mode === "inspect-and-complete" &&
+    !result.filesChangedUnknown
+      ? result.filesChanged.filter(
+          (file) =>
+            !claimedRecovery.priorImplReviewFiles.includes(file) &&
+            !claimedRecovery.priorPendingFiles.includes(file)
+        )
+      : [];
 
   const logContent = `# Implementation Run\n\nStatus: ${
     incompleteRound ? `incomplete (${incompleteRound.kind})` : result.status
@@ -5418,13 +5724,56 @@ async function executeImplementationRun(
       ? result.filesChanged.map((f) => `- ${f}`).join("\n")
       : "_none recorded_"
   }\n\n${result.summary ?? result.errorMessage ?? ""}${
-    incompleteRound
+    incompleteRound && recovery
       ? `\n\n## Incomplete round\n\nThis round was recorded incomplete: ${incompleteRound.reason}.\n\n` +
+        `Recovery record: \`${recovery.sourceAttemptId}\` (${
+          recovery.capReached
+            ? "continuation budget exhausted — human decision needed"
+            : `continuation ${recovery.continuations} of ${MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1}, ${recovery.mode}`
+        }).\n\n` +
         `Its workspace delta was quarantined into \`pendingImplReviewFiles\` (not banked as review scope):\n${
           quarantinedPaths.length > 0
             ? quarantinedPaths.map((f) => `- ${f}`).join("\n")
             : "_none recorded_"
         }\n`
+      : ""
+  }${
+    timedOutRound && recovery
+      ? `\n\n## Externally terminated — recovery scheduled\n\nThis round did not return a final response (${
+          result.timeoutReason === "inactivity" ? "inactivity watchdog" : "wall-clock timeout"
+        }): ${recovery.sourceAttemptId ? recovery.sourceAttemptId : ""}.\n\n` +
+        `Recovery record: \`${recovery.sourceAttemptId}\` (${
+          recovery.capReached
+            ? "continuation budget exhausted — human decision needed"
+            : `continuation ${recovery.continuations} of ${MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1}, ${recovery.mode}`
+        }).\n\n` +
+        `Its workspace delta was quarantined into \`pendingImplReviewFiles\` (not banked as review scope):\n${
+          quarantinedPaths.length > 0
+            ? quarantinedPaths.map((f) => `- ${f}`).join("\n")
+            : result.filesChangedUnknown
+              ? "_unknown — the change set could not be enumerated_"
+              : "_none recorded_"
+        }\n`
+      : ""
+  }${
+    !incompleteRound && !timedOutRound && recovery
+      ? `\n\n## Unusable summary — recovery scheduled\n\nThis round completed, but ${summaryIssue}.\n\n` +
+        `Recovery record: \`${recovery.sourceAttemptId}\` (${
+          recovery.capReached
+            ? "continuation budget exhausted — human decision needed"
+            : `continuation ${recovery.continuations} of ${MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1}, ${recovery.mode}`
+        }).\n\n` +
+        `Its workspace delta was quarantined into \`pendingImplReviewFiles\` until a round reports properly:\n${
+          quarantinedPaths.length > 0
+            ? quarantinedPaths.map((f) => `- ${f}`).join("\n")
+            : result.filesChangedUnknown
+              ? "_unknown — the change set could not be enumerated_"
+              : "_none recorded_"
+        }\n`
+      : ""
+  }${
+    inspectBoundaryViolations.length > 0
+      ? `\n\n## Out-of-boundary changes (inspect-and-complete)\n\nThis continuation ran under the inspect-and-complete mandate — bounded to the quarantined plus previously-reviewed files — but changed these paths outside that boundary. They are kept, and recorded as unreviewed scope for the next review; the prior review's score does not cover them:\n${inspectBoundaryViolations.map((file) => `- ${file}`).join("\n")}\n`
       : ""
   }${
     result.typeCheckFailed
@@ -5438,22 +5787,15 @@ async function executeImplementationRun(
 
   if (result.status === "completed") {
     const summaryUri = getImplementationSummaryUri(folderUri);
-    // Hoisted so every "the round's edits were kept" message below (Step 19)
-    // shares one answer instead of re-deriving it — and so a genuinely
-    // zero-change round (reachable via the 2b nothingToFixRoutesToReview
-    // path just below, which does not return early) never gets told its
-    // edits were "kept". Unknown counts as "may have changed": the tree's
-    // real state is not provably clean.
-    const roundMayHaveChangedFiles =
-      result.filesChangedUnknown === true || result.filesChanged.length > 0;
 
-    if (incompleteRound) {
+    if (incompleteRound && recovery) {
       // A detected deferred/cut-short round is recorded INCOMPLETE and
       // recovered through an explicit continuation — never banked as a
       // completed round and then blamed on a malformed summary. The durable
-      // quarantine write already happened ABOVE, before the run log was
-      // written, so the round's edits can never be discarded even if
-      // everything from the log write onward fails.
+      // recovery transition (quarantine, counter, `implRecovery` record)
+      // already persisted ABOVE, before the run log was written, so the
+      // round's edits can never be discarded even if everything from the log
+      // write onward fails.
       //
       // Deliberately preserved, in contrast to the rejected-summary path:
       //  - impl-summary.md / impl-summary_prev.md keep the previous good
@@ -5463,69 +5805,33 @@ async function executeImplementationRun(
       //    markReviewArtifactStale placeholder); the durable
       //    `reviewInvalidatedByRound` marker records instead that it no
       //    longer describes the workspace.
-      const continuations = incompleteContinuations;
-      const persisted = incompletePersisted;
-
-      NotificationRouter.showWarning(
-        `⚠️ The implementation round did not finish its turn: ${incompleteRound.reason}. ` +
-          (quarantinedPaths.length > 0
-            ? `Its ${quarantinedPaths.length} changed file(s) were quarantined for the next round. `
-            : "") +
-          (continuations >= MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1
-            ? "The continuation budget is exhausted, so the task needs a human decision."
-            : "A continuation implementation round has been scheduled to complete and report the work.")
-      );
-
-      if (continuations >= MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1) {
-        // The attempt CAS expects the value read from the state persisted
-        // moments ago — for an implementation-stage task that value is
-        // legitimately ABSENT (the impl transition clears reviewAttemptId,
-        // taskProgressFieldPolicyV1), so `undefined` is passed through as the
-        // expected value rather than coerced to "". Coercing made the CAS
-        // unsatisfiable on exactly the stage this cap most needs to escalate.
-        const escalated = await escalateReviewToHuman(
-          folderUri,
-          persisted?.currentStage ?? postRunReviewStage,
-          "plateau",
-          `${continuations} consecutive implementation round(s) ended without a usable report ` +
-            `(${incompleteRound.kind}). Automated continuation is no longer making the round finish; ` +
-            "the unreported edits are preserved in pendingImplReviewFiles.",
-          persisted?.reviewAttemptId,
-          persisted ?? undefined,
-          false
-        );
-        if (!escalated) {
-          // The escalation write can be declined by its CAS guards (e.g. no
-          // reviewAttemptId on an implementation-only task). The failure must
-          // not be silent — without a continuation OR an escalation the task
-          // would go quiet exactly the way this detector exists to prevent.
-          NotificationRouter.showWarning(
-            "⚠️ Automated continuation stopped after repeated incomplete implementation rounds, " +
-              "and the task could not be paused automatically. Rerun the implementation manually — " +
-              "the unreported edits are preserved and listed in the run log."
-          );
-        }
-      } else {
-        // The continuation is the task's NEXT action: no review dispatch, no
-        // auto-advance, no second provider fired inside this round. It runs
-        // as a fresh Run Implementation once this run's root operation
-        // releases the task lock; runImplementationWithAI sees the pending
-        // quarantined set and prepends the continuation notice to its prompt.
-        void scheduleAutomationChain(
-          {
-            command: "vs-code-ai-helper.runImplementationWithAI",
-            arg: { taskFolderPath: folderUri.fsPath },
-            taskKey: folderUri.fsPath,
-            chainId: "impl-continuation",
-          },
-          options.parentOperation
-        );
-      }
+      await recovery.finishDispatch();
       await safeOpenTextDocument(logUri, "implementation run log");
       return false;
     }
 
-    if (!result.filesChangedUnknown && result.filesChanged.length === 0) {
+    // The zero-change routing below is premised on a round that REPORTED
+    // properly ("the model reported completion... and found no defect to
+    // fix"). A rejected summary is not that round: it owes a continuation via
+    // the recovery transition above, and letting it return early here left
+    // the pending dispatch unscheduled (and its stamp unwritten) for exactly
+    // the zero-change case (review blocker, 2026-08-14).
+    //
+    // An ACCEPTED summary-only continuation is not that round either, from
+    // the other direction: changing zero files is its MANDATE, not a "model
+    // found nothing to fix" observation — its progress is the report itself
+    // (summary write, checklist ticks, quarantine promotion below). Counting
+    // it as a zero-change round would advance the no-progress breaker on a
+    // round that did exactly its job, and the early return here would skip
+    // the promotion that clears the recovery record.
+    const acceptedSummaryOnlyReport =
+      !summaryIssue && claimedRecovery.record?.mode === "summary-only";
+    if (
+      !summaryIssue &&
+      !acceptedSummaryOnlyReport &&
+      !result.filesChangedUnknown &&
+      result.filesChanged.length === 0
+    ) {
       const resilience = getResilienceSettings();
       const priorProgress = await readTaskProgressAdvisoryV1(folderUri);
       // "Prior rounds already changed the tree": implReviewFiles is the
@@ -5544,9 +5850,19 @@ async function executeImplementationRun(
       // declines to fabricate work. Route onward to review/complete instead
       // of recording a spurious failure (observed five times; in every case
       // the model was behaving correctly).
-      const zeroChangeRounds = (priorProgress?.zeroChangeImplRounds ?? 0) + 1;
+      //
+      // The streak is about STERILE rounds — no file delta AND no checklist
+      // delta — not file delta alone (Part 3 generalization). A round that
+      // changed no files but DID land new checklist ticks (`checklistAdvanced`)
+      // made real, durable progress and resets the streak exactly like a round
+      // that changed files; one that changed no files and merged none — which
+      // includes claimed-but-unmerged retroactive claims, "no-match" — is
+      // exactly as sterile as one that reported nothing, and still counts.
+      const zeroChangeRounds = checklistAdvanced
+        ? 0
+        : (priorProgress?.zeroChangeImplRounds ?? 0) + 1;
       const persistedRounds = await patchTaskProgressStrictV1(folderUri, (current) =>
-        setZeroChangeImplRounds(current, zeroChangeRounds)
+        setZeroChangeImplRounds(current, zeroChangeRounds > 0 ? zeroChangeRounds : undefined)
       );
       NotificationRouter.showInformation(
         "Implementation finished with no file changes — the model reported the current state already " +
@@ -5562,27 +5878,66 @@ async function executeImplementationRun(
           zeroChangeRounds,
           breakerRounds: resilience.noProgressBreakerRounds,
           history: priorProgress?.reviewScoreHistory,
+          // Review finding (2026-08-14): the breaker exists for a PASSING
+          // review looping back to impl forever, not sterile rounds against
+          // real unresolved work — gate the trip on the most recent review
+          // for this same stage meeting the auto-advance threshold.
+          qualifyingStage: priorProgress?.currentStage ?? postRunReviewStage,
+          qualifyingThreshold: getAutoAdvanceScoreThreshold(),
         })
       ) {
         const escalated = await escalateReviewToHuman(
           folderUri,
           priorProgress?.currentStage ?? postRunReviewStage,
           "plateau",
-          `${zeroChangeRounds} consecutive implementation round(s) changed zero files (no-progress ` +
-            "breaker, ensemble.resilience.noProgressBreakerRounds). Automated iteration is no longer " +
-            "producing edits.",
-          priorProgress?.reviewAttemptId ?? "",
+          `${zeroChangeRounds} consecutive implementation round(s) changed zero files and made no ` +
+            "checklist progress (no-progress breaker, ensemble.resilience.noProgressBreakerRounds). " +
+            "Automated iteration is no longer producing edits." +
+            (checklistClaimedButUnmerged
+              ? " The latest round reported plan-item completions that did not match any item in the " +
+                "plan of record — if that work is genuinely done, run Reconcile Plan Checklist to " +
+                "confirm it by hand."
+              : ""),
+          // NOT coerced to "": the attempt CAS expects the value read from
+          // the state persisted moments ago, and for an implementation-stage
+          // task that value is legitimately ABSENT (the impl transition
+          // clears reviewAttemptId, taskProgressFieldPolicyV1) — the same
+          // reasoning implementationRecoveryV1.ts's cap-exhaustion escalation
+          // already applies. Coercing to "" made this CAS unsatisfiable
+          // (current.reviewAttemptId reads undefined, never "") on exactly
+          // the implementation-stage task the no-progress breaker exists for,
+          // so the escalation could never actually apply (found while adding
+          // end-to-end coverage for the qualifying-review gate, 2026-08-14).
+          priorProgress?.reviewAttemptId,
           persistedRounds ?? priorProgress ?? undefined,
-          false
+          false,
+          // Review finding (2026-08-14): when the diagnosed cause is claimed
+          // -but-unmerged checklist progress, the latch and its
+          // reconcilePlanChecklist remedy must land in the SAME transaction
+          // that pauses the task and records the escalation — a crash or
+          // write failure between two separate patches could otherwise leave
+          // the task paused with the reconciliation remedy still inert (the
+          // exact prior-blocker state). `extraMutation` folds both the
+          // streak clear and the latch into escalateReviewToHuman's own
+          // patchTaskProgressStrictV1 call, applied only once its CAS guards
+          // have already decided to apply.
+          (current) => {
+            const cleared = setZeroChangeImplRounds(current, undefined);
+            return checklistClaimedButUnmerged
+              ? { ...cleared, checklistProgressUnreliable: true }
+              : cleared;
+          }
         );
         if (escalated) {
-          await patchTaskProgressStrictV1(folderUri, (current) =>
-            setZeroChangeImplRounds(current, undefined)
-          );
           return false;
         }
       }
-    } else if (!result.filesChangedUnknown) {
+    } else if (!result.filesChangedUnknown && result.filesChanged.length > 0) {
+      // A round that landed real edits breaks any zero-change streak,
+      // rejected summary or not. A REJECTED zero-change round touches the
+      // counter in neither direction: it skipped the increment branch above
+      // (its report is unusable, so "nothing to fix" was never established),
+      // and it produced no edits that would justify clearing the streak.
       await patchTaskProgressStrictV1(folderUri, (current) =>
         setZeroChangeImplRounds(current, undefined)
       );
@@ -5604,26 +5959,15 @@ async function executeImplementationRun(
     // failure that motivated this shipped a "tests are still running in the
     // background, I'll report back" message as the implementation notes; the
     // only guard was non-empty, so both reviewers scored a status message.
-    const summary = result.summary?.trim() ?? "";
-    // A plan carrying a checklist must get it back with updated boxes: that
-    // echo is the only thing that advances plan progress, so a round that
-    // drops it would leave the plan reading as untouched forever. Read once
-    // and reused by the merge below, so the gate and the merge can never
-    // disagree about which document they are checking against.
+    //
+    // `summary`, the plan of record, and `summaryIssue` were all computed
+    // ONCE above, before the run log was written — the recovery transition
+    // for a rejected summary must persist ahead of every other write, and a
+    // second read here could disagree with the one the gate used. A plan
+    // carrying a checklist must get its checklist back with updated boxes:
+    // that echo is the only thing that advances plan progress, so the merge
+    // below reuses the same read the gate validated against.
     const planOfRecordUri = getCanonicalImplementationUri(folderUri);
-    const plan = await readPlanOfRecordV1(folderUri);
-    const planChecklist = plan.hasChecklist ? plan.text : undefined;
-    // The gate enforces the contract run-implementation.md imposes on a model.
-    // A runner-synthesized summary never went through that prompt (the sealed
-    // edit pipeline reports "Applied N sealed edit step(s)…"), so holding it to
-    // that shape stamped every successful Copilot run unusable and refused to
-    // advance — disabling that execution path entirely, on success.
-    const summaryIssue = result.summaryIsSynthetic
-      ? undefined
-      : describeImplementationSummaryShapeIssue(summary, {
-          planChecklist,
-          roundChangedFiles: !result.filesChangedUnknown && result.filesChanged.length > 0,
-        });
 
     // Attribution (finding 2): the git snapshot diff spans the round's
     // wall-clock window, not its authorship — edits made BY HAND in the same
@@ -5681,7 +6025,11 @@ async function executeImplementationRun(
       // returned a status message. Merging ticks instead keeps the progress
       // record without ever letting a run overwrite the plan.
       if (planChecklist !== undefined) {
-        const mergeResult = mergeChecklistProgressV1(planChecklist, summary);
+        // Reuses the SAME result the zero-change routing decision above
+        // already computed (checklistAdvanced/checklistClaimedButUnmerged) —
+        // never recomputed, so the two can never disagree about what this
+        // round reported.
+        const mergeResult = checklistMergeResult ?? mergeChecklistProgressV1(planChecklist, summary);
         if (mergeResult.kind === "merged") {
           await writeTextFile(planOfRecordUri, mergeResult.content);
           // Retroactive ticks (RETROACTIVE_TICK_MARKER_V1) mark items this
@@ -5733,9 +6081,17 @@ async function executeImplementationRun(
       // in effect, and each round's full response is in its own run log.
       const existingSummary = await readTextIfExists(summaryUri);
       if (!existingSummary || !isUnusableImplementationSummaryV1(existingSummary)) {
+        // The stamp states what happens next (continuation scheduled, or the
+        // budget exhausted) so it is distinguishable from a plain "review
+        // paused, waiting on user" state — see beginImplementationRecoveryV1.
+        const recoveryLine = recovery
+          ? recovery.capReached
+            ? "Automated recovery has stopped: the continuation budget is exhausted, so the task needs a human decision."
+            : `A continuation implementation round (${recovery.continuations} of ${MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1}, ${recovery.mode}) has been scheduled to produce them.`
+          : undefined;
         await writeTextFile(
           summaryUri,
-          `${buildUnusableImplementationSummaryV1(summaryIssue, path.basename(logUri.fsPath), roundMayHaveChangedFiles)}\n`
+          `${buildUnusableImplementationSummaryV1(summaryIssue, path.basename(logUri.fsPath), roundMayHaveChangedFiles, recoveryLine)}\n`
         );
       }
     }
@@ -5833,10 +6189,23 @@ async function executeImplementationRun(
       // have changed nothing is exempt.
       const roundMayHaveChangedFiles =
         result!.filesChangedUnknown === true || result!.filesChanged.length > 0;
+      // Third way the plan's counts fall permanently short (Part 3,
+      // 2026-08-14): a round that DID claim checklist progress — a
+      // retroactive-tick claim, or an echoed tick — but whose claim matched
+      // no item in the plan of record (`checklistClaimedButUnmerged`, merge
+      // kind "no-match"). Unlike "unchanged"/"no-report" above, this is not
+      // an accurate record of a round that finished nothing: the round
+      // BELIEVES it recorded progress, so a later round has no reason to
+      // revisit the same claim, and the plan's counts stay short exactly the
+      // same way an unrecorded runner-authored round's would. Independent of
+      // `roundMayHaveChangedFiles` — a verification-only round that changed
+      // no files is precisely the shape this was observed in (round 013,
+      // task "1.9").
       const checklistStateUnrecorded =
         planChecklist !== undefined &&
-        roundMayHaveChangedFiles &&
-        (result!.summaryIsSynthetic === true || summaryIssue !== undefined);
+        ((roundMayHaveChangedFiles &&
+          (result!.summaryIsSynthetic === true || summaryIssue !== undefined)) ||
+          checklistClaimedButUnmerged);
       // updatedAt is bumped with the latch. patchTaskProgressStrictV1 does not
       // set it (only creation does), and the updateImplReviewFiles branch below
       // — which would have — is skipped when the change set is unknown. Without
@@ -5854,8 +6223,13 @@ async function executeImplementationRun(
       // one) promotes any quarantined incomplete-round delta into review
       // scope — unioned with this round's own changed files below — and
       // clears the pending set plus the continuation counter. A REJECTED
-      // round (summaryIssue) does not: promotion requires a round that
-      // actually reported, so the quarantine survives until one does.
+      // round (summaryIssue) does neither: promotion requires a round that
+      // actually reported, so the quarantine survives until one does — and
+      // its OWN delta stays quarantined too. The recovery transition put the
+      // round's snapshot delta into pendingImplReviewFiles before the run log
+      // was written; banking the attributed subset here as well would mark
+      // unreported edits as reviewed scope while the same paths sit in
+      // quarantine awaiting a usable report (review blocker, 2026-08-14).
       const promotedBase =
         summaryIssue === undefined
           ? promotePendingImplReviewFiles(stageRecorded)
@@ -5865,7 +6239,11 @@ async function executeImplementationRun(
       // raw snapshot diff, which absorbs concurrent hand edits. When change
       // tracking was unavailable (filesChangedUnknown) nothing is banked at
       // all: a full dirty scan of the workspace is scope, not attribution.
-      if (!result!.filesChangedUnknown && attributedFilesChanged.length > 0) {
+      if (
+        summaryIssue === undefined &&
+        !result!.filesChangedUnknown &&
+        attributedFilesChanged.length > 0
+      ) {
         return updateImplReviewFiles(promotedBase, attributedFilesChanged);
       }
       return promotedBase;
@@ -5887,6 +6265,36 @@ async function executeImplementationRun(
         // skipBackup: this append preserves every byte of the just-written
         // log, and a `_prev` sibling in runs/ would read as a second run.
         await writeTextFile(logUri, `${existingLog}${unattributedSection}\n`, {
+          skipBackup: true,
+        });
+      }
+    }
+
+    // Review finding (2026-08-16): three production rounds (074, 077, 079)
+    // presented inputs that deterministically return `mergeChecklistProgressV1`
+    // kind "no-match" under a replay of the current build, yet the durable
+    // record shows no `checklistProgressUnreliable` latch and no
+    // reconciliation note for any of them — while the code path itself is
+    // pinned correct by tests and by direct trace. The leading unverified
+    // hypothesis is a stale extension-host bundle (rounds ran against a build
+    // predating this latch). Rather than re-assert "not a live defect" from
+    // inference, this line is written UNCONDITIONALLY for every round that has
+    // a plan checklist, so the merge kind actually computed and the latch
+    // decision actually persisted are both in the run record — the next
+    // occurrence (if there is one) is self-diagnosing from the run log alone
+    // instead of requiring a hand replay of durable inputs against the source.
+    if (planChecklist !== undefined) {
+      const existingLog = await readTextIfExists(logUri);
+      if (existingLog !== undefined) {
+        const mergeKind = checklistMergeResult?.kind ?? "no-report";
+        const latchSet = persistedAfterRun?.checklistProgressUnreliable === true;
+        const diagnosticsNote =
+          "\n\n## Checklist merge diagnostics\n\n" +
+          `Merge kind: \`${mergeKind}\`. Latch (\`checklistProgressUnreliable\`) after this round: ` +
+          `${latchSet ? "set" : "not set"}.`;
+        // skipBackup: appends to the just-written log; a `_prev` sibling in
+        // runs/ would read as a second run.
+        await writeTextFile(logUri, `${existingLog}${diagnosticsNote}\n`, {
           skipBackup: true,
         });
       }
@@ -5970,6 +6378,18 @@ async function executeImplementationRun(
             : "This round changed no files, so there is nothing new recorded for review, but automated review has been ") +
           "paused until the build is fixed — see the implementation run log for the type-check output."
       );
+      // A round can fail its type-check AND return a rejected summary, and
+      // this gate returns first. The rejected summary's recovery transition
+      // still owes its dispatch — without it the stamp written above claims a
+      // continuation "has been scheduled" while the durable record sits
+      // `pending` under a live lease, unscheduled until the lease expires
+      // (review blocker, 2026-08-14). The continuation is an IMPLEMENTATION
+      // round, so scheduling it is compatible with this gate's contract:
+      // review stays paused; the next round inherits (and can fix) the
+      // broken build.
+      if (recovery) {
+        await recovery.finishDispatch();
+      }
       await safeOpenTextDocument(logUri, "implementation run log");
       return false;
     }
@@ -5985,24 +6405,15 @@ async function executeImplementationRun(
     if (summaryIssue) {
       // The rejection stamp was already written above, before the type-check
       // gate, so every review entry point refuses this round regardless of
-      // which gate returns first.
-      NotificationRouter.showWarning(
-        "⚠️ Implementation finished, but the provider did not return a usable summary " +
-          `(${summaryIssue}). ` +
-          (roundMayHaveChangedFiles
-            ? "The round's edits were kept and recorded for review, but "
-            : "This round changed no files, so there is nothing new recorded for review, but ") +
-          "review has been paused — a reviewer would otherwise be handed this text " +
-          "as the implementation notes. See the implementation run log for the full response.",
-        undefined,
-        undefined,
-        undefined,
-        {
-          command: "vs-code-ai-helper.restoreRejectedImplementationRound",
-          title: "Restore Prior Round",
-          args: [folderUri.fsPath, postRunReviewStage],
-        }
-      );
+      // which gate returns first. EVERY rejected summary — zero-change
+      // included — began the recovery transition before the run log was
+      // written, so `recovery` is always set here; finishDispatch schedules
+      // the continuation (or escalates at the cap) instead of parking the
+      // task at "active" with nothing scheduled, which is exactly how round
+      // 010 of "workflow 2" stranded its task.
+      if (recovery) {
+        await recovery.finishDispatch();
+      }
       await safeOpenTextDocument(logUri, "implementation run log");
       return false;
     }
@@ -6113,9 +6524,19 @@ async function executeImplementationRun(
     NotificationRouter.showInformation("Implementation cancelled.");
     return false;
   } else {
-    NotificationRouter.showError(
-      `Implementation failed: ${result.errorMessage ?? "unknown error"}`
-    );
+    // Part 7: an externally-terminated round (wall-clock/inactivity
+    // watchdog) owes the SAME recovery continuation as a detected
+    // incomplete round — `recovery` was begun above, before the run log
+    // write, so its quarantine/counter/`implRecovery` record are already
+    // durable. finishDispatch() (notify + schedule-or-escalate) runs AFTER
+    // the run log write, same ordering as every other recovery call site.
+    if (result.timedOut === true && recovery) {
+      await recovery.finishDispatch();
+    } else {
+      NotificationRouter.showError(
+        `Implementation failed: ${result.errorMessage ?? "unknown error"}`
+      );
+    }
     return false;
   }
 }
@@ -6365,37 +6786,30 @@ export async function runImplementationWithAI(
       { contextPack: contextPackContent, plan: planFinalContent }
     );
 
-    // Continuation of a detected incomplete round: a prior round changed the
-    // quarantined files below but ended without a usable report (deferred to
-    // a follow-up turn the workflow cannot deliver, or cut short). The
-    // freshest progress read wins — the quarantine may have been written
-    // after `resolved.progress` was snapshotted at command entry.
+    // Continuation of a failed/unreported round: a prior round changed the
+    // quarantined files but ended without a usable report (deferred, cut
+    // short, rejected, or — via Part 7 — killed externally). The freshest
+    // progress read wins — the quarantine and the `implRecovery` record may
+    // have been written after `resolved.progress` was snapshotted at command
+    // entry. The record's persisted MODE (Part 2) selects the mandate:
+    // `summary-only` (report the combined diff, no edits),
+    // `inspect-and-complete` (verify/finish the quarantined files inside the
+    // reviewed boundary), or the unconstrained notice.
     const freshForContinuation = await readTaskProgressAdvisoryV1(resolved.folderUri);
     const pendingFiles =
       freshForContinuation?.pendingImplReviewFiles ??
       resolved.progress.pendingImplReviewFiles ??
       [];
-    const prompt =
-      pendingFiles.length > 0
-        ? basePrompt +
-          [
-            "",
-            "",
-            "## Continuation Notice",
-            "",
-            "A previous implementation round for this task ended WITHOUT a usable report:",
-            "it changed the files listed below but returned no `## Files Changed`, no",
-            "`## Verification`, and no checklist echo (it may have deferred to a follow-up",
-            "turn that never ran). Treat that round's edits as unverified work in progress.",
-            "Complete whatever plan work those edits belong to, verify it, and report ALL of",
-            "it in THIS round's summary — include the files below under `## Files Changed`",
-            "and echo the plan checklist with every box that work completes. Do not defer",
-            "any part of the report to a later turn: this round gets no follow-up turn.",
-            "",
-            "Files changed by the unreported round:",
-            ...pendingFiles.map((file) => `- ${file}`),
-          ].join("\n")
-        : basePrompt;
+    const recoveryRecord =
+      freshForContinuation?.implRecovery ?? resolved.progress.implRecovery;
+    const prompt = buildImplementationContinuationPromptV1(basePrompt, {
+      mode: recoveryRecord?.mode,
+      pendingFiles,
+      reviewedFiles:
+        freshForContinuation?.implReviewFiles ??
+        resolved.progress.implReviewFiles ??
+        [],
+    });
 
     // ── Prompt-size gate (applied before executeImplementationRun) ────────────
     const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel);

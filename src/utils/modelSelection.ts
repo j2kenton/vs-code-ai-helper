@@ -151,6 +151,35 @@ export function resolveEffectiveStageChainV1(stage: TaskStage): EffectiveStageCh
   return { originStage: stage, source: "none", backups: [] };
 }
 
+/**
+ * Every configurable stage (`AI_MODEL_STAGES`) whose effective PRIMARY chain
+ * currently resolves to a model on the SAME blocked provider account as
+ * `modelId` — Part 5 step 3b: when a quota/entitlement block is expected to
+ * persist a long time (beyond `ensemble.resilience.quotaResetNearThresholdHours`),
+ * the operator needs to know every OTHER stage silently affected too — each
+ * either fell through to a different backup model already, or is equally
+ * blocked and hasn't run yet — rather than discovering them one at a time as
+ * each stage's own run fails.
+ *
+ * Review completion blocker: a prior version compared by exact stored model
+ * id, which missed the plan's own contract ("stages whose effective primary
+ * chain uses the blocked PROVIDER") — a provider-wide quota/entitlement
+ * block on, say, `claude-cli` affects every stage primary'd to a
+ * `claude-cli:*` model, not only the one exact model id that happened to
+ * fail first. Compared by `providerAccountIdForModelId` (provider, refined
+ * by OpenCode's Zen/Go account split) rather than provider name alone, so
+ * two stages on genuinely distinct billed accounts of the same CLI adapter
+ * are not conflated — that finer account-context binding is the same
+ * granularity `resolveQuotaAccountKeyV1` already uses elsewhere.
+ */
+export function findStagesSharingBlockedPrimaryV1(modelId: string): TaskStage[] {
+  const blockedAccount = providerAccountIdForModelId(modelId);
+  return AI_MODEL_STAGES.filter((stage) => {
+    const primary = resolveEffectiveStageChainV1(stage).primary;
+    return primary !== undefined && providerAccountIdForModelId(primary) === blockedAccount;
+  });
+}
+
 interface ResolveStageModelOptions {
   ignoreActiveFallback?: boolean;
 }

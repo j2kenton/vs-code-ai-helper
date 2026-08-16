@@ -51,6 +51,8 @@ import type { AutomationDispatch } from "../utils/automationChain";
 
 /* eslint-disable @typescript-eslint/no-var-requires */
 const runEditActionModule = require("../commands/runEditActionV1") as Record<string, unknown>;
+const implContinuationTextDispatchModule =
+  require("../commands/implContinuationTextDispatchV1") as Record<string, unknown>;
 const modelSelectionModule = require("../utils/modelSelection") as Record<string, unknown>;
 const runnerRegistryModule = require("../runners/runnerRegistry") as Record<string, unknown>;
 const contextPackModule = require("../utils/contextPack") as Record<string, unknown>;
@@ -104,6 +106,32 @@ const GOOD_SUMMARY = [
   "- ran the unit tests",
 ].join("\n");
 
+/**
+ * Verbatim round-077 plan of record and response ("workflow 3" task, review
+ * finding 2026-08-15) — real production text, not a hand-authored toy, kept
+ * as fixture files rather than inline strings because both are long enough
+ * that hand-transcribing them into a template literal risked silently
+ * altering the exact byte content the reproduction depends on.
+ */
+const ROUND_077_PLAN_FINAL = fs.readFileSync(
+  path.join(__dirname, "..", "..", "src", "test", "fixtures", "round077", "plan-final.md"),
+  "utf8"
+);
+const ROUND_077_SUMMARY = fs.readFileSync(
+  path.join(__dirname, "..", "..", "src", "test", "fixtures", "round077", "response.md"),
+  "utf8"
+).trimEnd();
+const ROUND_077_FILES_CHANGED = [
+  "packages/ensemble-core/src/taskProgressDecoderV1.ts",
+  "packages/ensemble-core/src/taskProgressV1.ts",
+  "src/commands/reviewActions.ts",
+  "src/services/taskProgressDecoderV1.ts",
+  "src/test/reviewRouting.test.ts",
+  "src/test/taskProgressDecoderV1.test.ts",
+  "src/types/taskProgress.ts",
+  "src/utils/reviewRouting.ts",
+];
+
 const PRIOR_SUMMARY = "# Prior Round Summary\n\nGood notes from the last usable round.\n";
 const PRIOR_SUMMARY_PREV = "# Even Older Summary\n";
 const PRIOR_REVIEW =
@@ -118,6 +146,8 @@ interface FakeRunResult {
   runnerId: string;
   providerLabel?: string;
   storedModelId?: string;
+  typeCheckFailed?: boolean;
+  typeCheckOutput?: string;
 }
 
 function makeTaskFolder(
@@ -253,16 +283,36 @@ interface HarnessRun {
   /** Prompts the fake provider boundary was invoked with. */
   prompts: string[];
   /**
+   * Prompts the fake TEXT-MODE continuation dispatch
+   * (`runSummaryOnlyContinuationV1`) was invoked with — a summary-only
+   * continuation must land here, never in `prompts` (the edit path).
+   */
+  textPrompts: string[];
+  /**
    * Persisted pendingImplReviewFiles as read from DISK at the moment the run
    * log was written — the crash-order probe for "quarantine is durable first".
    */
   pendingAtRunLogWrite: string[][];
   /**
+   * Persisted implRecovery record as read from DISK at the moment the run
+   * log was written — the crash-order probe for "the recovery transition is
+   * durable before anything else" (Part 1).
+   */
+  recoveryAtRunLogWrite: (TaskProgress["implRecovery"] | undefined)[];
+  /**
    * After every patchTaskProgressStrictV1 persist: the marker's presence and
    * whether the review artifact was stale-stamped at that instant, for the
-   * marker-clear ordering invariant.
+   * marker-clear ordering invariant. Also carries `status` and
+   * `checklistProgressUnreliable` so tests can assert no persisted state ever
+   * shows the task paused without a remedy latch that the pause reason names
+   * already being true (the no-progress-breaker atomicity invariant).
    */
-  persistedStates: { markerSet: boolean; reviewStale: boolean }[];
+  persistedStates: {
+    markerSet: boolean;
+    reviewStale: boolean;
+    status: TaskProgress["status"];
+    checklistProgressUnreliable: boolean;
+  }[];
   /**
    * Every status-surface notification the run emitted, with its action
    * command when one was attached — the reconciliation-affordance probe
@@ -271,10 +321,26 @@ interface HarnessRun {
   notifications: { message: string; actionCommand?: { command: string; title: string } }[];
 }
 
+interface HarnessOptions {
+  /**
+   * Result the fake text-mode dispatch returns when a summary-only
+   * continuation routes there. When absent, a text dispatch is unexpected
+   * and throws — pinning that only summary-only continuations use it.
+   */
+  textResult?: FakeRunResult;
+  /**
+   * What the patched `isSummaryOnlyDispatchAvailableV1` probe reports.
+   * Defaults to false (the enforceable fallback), keeping every test
+   * deterministic against the real probe's settings-dependent answer.
+   */
+  summaryOnlyDispatchAvailable?: boolean;
+}
+
 async function runHarnessed(
   folderPath: string,
   progress: TaskProgress,
-  result: FakeRunResult
+  result: FakeRunResult,
+  harnessOptions: HarnessOptions = {}
 ): Promise<HarnessRun> {
   const provider = new StatusTreeProvider();
   initNotificationRouter(provider);
@@ -288,7 +354,9 @@ async function runHarnessed(
   const run: HarnessRun = {
     dispatches: [],
     prompts: [],
+    textPrompts: [],
     pendingAtRunLogWrite: [],
+    recoveryAtRunLogWrite: [],
     persistedStates: [],
     notifications: [],
   };
@@ -325,6 +393,24 @@ async function runHarnessed(
       run.prompts.push(options.prompt);
       return Promise.resolve(result);
     }),
+    patch(
+      implContinuationTextDispatchModule,
+      "isSummaryOnlyDispatchAvailableV1",
+      () => harnessOptions.summaryOnlyDispatchAvailable ?? false
+    ),
+    patch(
+      implContinuationTextDispatchModule,
+      "runSummaryOnlyContinuationV1",
+      (options: { prompt: string }): Promise<FakeRunResult> => {
+        run.textPrompts.push(options.prompt);
+        if (!harnessOptions.textResult) {
+          throw new Error(
+            "unexpected text-mode continuation dispatch: this test provided no textResult"
+          );
+        }
+        return Promise.resolve(harnessOptions.textResult);
+      }
+    ),
     patch(modelSelectionModule, "resolveFreshModelForStage", () =>
       Promise.resolve({ modelId: "cli:test-model", source: "task" })),
     patch(runnerRegistryModule, "checkImplementationAvailabilityForModel", () =>
@@ -341,6 +427,7 @@ async function runHarnessed(
       // Crash-order probe: what is DURABLE at the instant the run log lands?
       const persisted = JSON.parse(fs.readFileSync(progressFile, "utf8")) as TaskProgress;
       run.pendingAtRunLogWrite.push([...(persisted.pendingImplReviewFiles ?? [])]);
+      run.recoveryAtRunLogWrite.push(persisted.implRecovery);
       return origWriteRunLog(...args);
     }),
     patch(
@@ -353,6 +440,8 @@ async function runHarnessed(
         run.persistedStates.push({
           markerSet: persisted.reviewInvalidatedByRound !== undefined,
           reviewStale: review.trimStart().startsWith("# Review Stale"),
+          status: persisted.status,
+          checklistProgressUnreliable: persisted.checklistProgressUnreliable === true,
         });
         return patched;
       }
@@ -740,6 +829,1302 @@ void describe("checklist reconciliation prompt while the latch is set", () => {
         (n) => n.actionCommand?.command === "vs-code-ai-helper.reconcilePlanChecklist"
       ),
       false
+    );
+  });
+});
+
+/**
+ * Part 3 (2026-08-14, round 013 of task "1.9"): a round that declares
+ * `<!-- ensemble:no-checklist-change -->` while also reporting retroactive
+ * plan-item completions is self-contradictory — the marker satisfies the
+ * echo requirement on its own, so the round used to complete with its
+ * claimed progress recorded nowhere. Rejected as a shape issue instead, so it
+ * enters the same recovery transition every other unusable summary does.
+ */
+void describe("contradictory no-checklist-change + retroactive claims (Part 3, end to end)", () => {
+  /** Verbatim shape from runs/013-claude-cli-impl.md of task "1.9" — the
+   * marker is declared, then a retroactive claim uses PARAPHRASED item text
+   * ("small font + reduced padding") that matches nothing in the plan. */
+  const ROUND_013_SHAPED_SUMMARY = [
+    "<!-- ensemble:no-checklist-change -->",
+    "This round independently re-verified every plan anchor in the working tree.",
+    "",
+    "## Files Changed",
+    "",
+    "None — no source, test, or configuration file was created, modified, or deleted this round.",
+    "",
+    "## Plan Item Checklist",
+    "",
+    "- Resolver wiring, condensed — done <!-- ensemble:retroactive --> — src/resolver.ts:1-5",
+    "",
+    "## Verification",
+    "",
+    "- pnpm run test:unit — all green",
+  ].join("\n");
+
+  void it("is rejected as a shape issue and schedules a recovery continuation instead of completing silently", async () => {
+    const { folderPath, progress } = makeTaskFolder("round013_contradiction");
+    const run = await runHarnessed(folderPath, progress, {
+      status: "completed",
+      filesChanged: [],
+      filesChangedUnknown: false,
+      summary: ROUND_013_SHAPED_SUMMARY,
+      runnerId: "test-cli",
+      providerLabel: "Test CLI",
+      storedModelId: "cli:test-model",
+    });
+
+    const persisted = readProgress(folderPath);
+    const record = persisted?.implRecovery;
+    assert.ok(record, "the contradictory round must be rejected and land a recovery record");
+    assert.equal(record.trigger, "summaryRejected");
+    assert.equal(record.dispatch, "pending");
+
+    // The plan of record must NOT have been merged against — a rejected
+    // round never reaches the merge/write step.
+    const planFinal = fs.readFileSync(path.join(folderPath, "plan-final.md"), "utf8");
+    assert.equal(planFinal, PLAN_FINAL, "a rejected round's checklist must not be merged");
+
+    const summary = fs.readFileSync(path.join(folderPath, "impl-summary.md"), "utf8");
+    assert.ok(summary.includes("<!-- ensemble:implementation-summary-unusable -->"));
+
+    const logs = readRunLogs(folderPath);
+    assert.match(logs[0]!, /no-checklist-change/);
+    assert.match(logs[0]!, /retroactive plan-item completions/);
+
+    assert.equal(
+      run.dispatches.some((d) => d.chainId === "impl-continuation"),
+      true,
+      "a continuation round must be scheduled rather than leaving the task parked silently"
+    );
+  });
+});
+
+/**
+ * Part 3 (2026-08-14): the `checklistProgressUnreliable` latch used to fire
+ * only for a runner-authored summary or a rejected one — never for an
+ * ACCEPTED round whose retroactive claim simply matched nothing in the plan
+ * (merge kind "no-match"). That round believes it recorded progress, so
+ * nothing else would ever revisit the claim; the latch must catch it too.
+ */
+void describe("checklistProgressUnreliable latch fires on claimed-but-unmerged progress (Part 3)", () => {
+  /** Echoes the plan verbatim (unchecked — satisfies the echo requirement)
+   * but claims a DIFFERENT, unmatched item retroactively, so the merge
+   * returns "no-match" even though the round is otherwise well-formed and
+   * accepted. */
+  const ACCEPTED_BUT_UNMATCHED_CLAIM_SUMMARY = [
+    "<!-- ensemble:implementation-checklist -->",
+    "",
+    "- [ ] Add the resolver",
+    "- [ ] Wire the decoder",
+    "",
+    "## Files Changed",
+    "",
+    "- (none) — verification only",
+    "",
+    "## Plan Item Checklist",
+    "",
+    "- Resolver addition — done <!-- ensemble:retroactive --> — src/resolver.ts:1 already implemented",
+    "",
+    "## Verification",
+    "",
+    "- ran the unit tests",
+  ].join("\n");
+
+  void it("latches even though the round changed no files and was otherwise accepted", async () => {
+    const { folderPath, progress } = makeTaskFolder("claimed_unmerged_latch");
+    const run = await runHarnessed(folderPath, progress, {
+      status: "completed",
+      filesChanged: [],
+      filesChangedUnknown: false,
+      summary: ACCEPTED_BUT_UNMATCHED_CLAIM_SUMMARY,
+      runnerId: "test-cli",
+      providerLabel: "Test CLI",
+      storedModelId: "cli:test-model",
+    });
+
+    // The round is accepted (no recovery record) — this is not a rejected
+    // summary, just one whose claimed progress didn't merge.
+    const persisted = readProgress(folderPath);
+    assert.equal(persisted?.implRecovery, undefined);
+    assert.equal(persisted?.checklistProgressUnreliable, true);
+
+    assert.equal(
+      run.notifications.some(
+        (n) => n.actionCommand?.command === "vs-code-ai-helper.reconcilePlanChecklist"
+      ),
+      true,
+      "the reconcile affordance must surface even though no files changed"
+    );
+  });
+
+  /**
+   * Review finding (2026-08-15, "workflow 3" round 074): the latch was
+   * verified above against a minimal task (one prior reviewed file, no
+   * review history). Round 074's REAL task carried 46 prior `implReviewFiles`
+   * and a long `reviewScoreHistory` including a qualifying 0-blocker
+   * `impl-high-review` pass — and the latch did not persist. This reproduces
+   * that larger prior state with the same claimed-but-unmerged shape (four
+   * paraphrased retroactive claims that never match the plan's exact
+   * wording) to prove the latch still fires once realistic history is
+   * present, not just in the minimal-state case above.
+   */
+  void it("latches with a large prior implReviewFiles set and a qualifying review in history (round 074 shape)", async () => {
+    const manyPriorFiles = Array.from({ length: 46 }, (_, i) => `src/prior${i}.ts`);
+    const { folderPath, progress } = makeTaskFolder("claimed_unmerged_latch_realistic_history", {
+      implReviewFiles: manyPriorFiles,
+      reviewScoreHistory: [
+        {
+          stage: "impl-high-review",
+          score: 9,
+          attemptId: "11111111-1111-1111-1111-111111111111",
+          at: "2026-01-01T00:00:00.000Z",
+          blockerCount: 0,
+          taskFixableCount: 0,
+          blockers: [],
+        },
+      ],
+      reviewAttemptId: "11111111-1111-1111-1111-111111111111",
+    });
+
+    await runHarnessed(folderPath, progress, {
+      status: "completed",
+      filesChanged: [],
+      filesChangedUnknown: false,
+      summary: ACCEPTED_BUT_UNMATCHED_CLAIM_SUMMARY,
+      runnerId: "test-cli",
+      providerLabel: "Test CLI",
+      storedModelId: "cli:test-model",
+    });
+
+    const persisted = readProgress(folderPath);
+    assert.equal(persisted?.implRecovery, undefined);
+    assert.equal(
+      persisted?.checklistProgressUnreliable,
+      true,
+      "the latch must fire regardless of how large the prior implReviewFiles/review history is"
+    );
+  });
+
+  /**
+   * Review finding (2026-08-15, "workflow 3" round 077): the two cases above
+   * cover a small two-item toy plan. Round 077's REAL plan of record was an
+   * 8-part, 52-item checklist, and its response echoed most parts BYTE-EXACT
+   * (they were already ticked, so re-echoing them verbatim is a no-op) while
+   * paraphrasing the wording of the handful of items it was newly claiming —
+   * dropping file/line parentheticals — so those specific ticks legitimately
+   * fail to match (`mergeChecklistProgressV1` returns "no-match", confirmed
+   * by direct replay). The reviewer could not determine from static evidence
+   * alone whether `checklistProgressUnreliable` was set and then cleared, or
+   * never set at all. This reproduces the exact multi-part plan structure,
+   * the exact response text, and the exact non-empty file list round 077
+   * reported, to pin down current-code behavior definitively.
+   */
+  void it("latches on a realistic multi-part plan with mostly-verbatim echo and a few paraphrased new ticks (round 077 shape)", async () => {
+    const { folderPath, progress } = makeTaskFolder("claimed_unmerged_latch_round077_shape", {
+      implReviewFiles: ["src/prior.ts"],
+      reviewScoreHistory: [
+        {
+          stage: "impl-high-review",
+          score: 9,
+          attemptId: "22222222-2222-2222-2222-222222222222",
+          at: "2026-01-01T00:00:00.000Z",
+          blockerCount: 0,
+          taskFixableCount: 0,
+          blockers: [],
+        },
+      ],
+      reviewAttemptId: "22222222-2222-2222-2222-222222222222",
+    });
+    fs.writeFileSync(path.join(folderPath, "plan-final.md"), ROUND_077_PLAN_FINAL, "utf8");
+
+    await runHarnessed(folderPath, progress, {
+      status: "completed",
+      filesChanged: ROUND_077_FILES_CHANGED,
+      filesChangedUnknown: false,
+      summary: ROUND_077_SUMMARY,
+      runnerId: "test-cli",
+      providerLabel: "Test CLI",
+      storedModelId: "cli:test-model",
+    });
+
+    const persisted = readProgress(folderPath);
+    const planFinalAfter = fs.readFileSync(path.join(folderPath, "plan-final.md"), "utf8");
+    assert.equal(
+      planFinalAfter,
+      ROUND_077_PLAN_FINAL,
+      "a no-match merge must never write plan-final.md"
+    );
+    assert.equal(
+      persisted?.checklistProgressUnreliable,
+      true,
+      "the latch must fire for a non-zero-file round whose claimed new ticks paraphrase the plan text, " +
+        "exactly as it must for the zero-file cases above"
+    );
+
+    // Review finding (2026-08-16): three production rounds reproduced this
+    // exact merge/latch shape (074, 077, 079) with no standing trace of the
+    // computed merge kind, so a stale-bundle hypothesis could not be
+    // distinguished from a live defect from the run record alone. The merge
+    // kind and latch decision are now written to every impl round's run log
+    // unconditionally — pin that they actually land, not just the durable
+    // task-progress field.
+    const logs = readRunLogs(folderPath);
+    const diagnosticsLog = logs.find((log) => log.includes("## Checklist merge diagnostics"));
+    assert.ok(diagnosticsLog, "run log must record the checklist merge diagnostics section");
+    assert.ok(
+      diagnosticsLog?.includes("Merge kind: `no-match`"),
+      "diagnostics must record the actual computed merge kind"
+    );
+    assert.ok(
+      diagnosticsLog?.includes("Latch (`checklistProgressUnreliable`) after this round: set"),
+      "diagnostics must record the actual persisted latch decision"
+    );
+  });
+});
+
+/**
+ * Part 3 (2026-08-14): the zero-change no-progress streak is about STERILE
+ * rounds — no file delta AND no checklist delta — not file delta alone. A
+ * zero-file round that DID land new checklist ticks made real progress and
+ * must reset the streak like any round that changed files; one that changed
+ * no files and merged nothing (including a claimed-but-unmerged retroactive
+ * claim) is exactly as sterile as one that reported nothing, and must still
+ * count.
+ */
+void describe("zero-change streak counts checklist progress, not just file changes (Part 3)", () => {
+  const ECHO_TICKS_RESOLVER_SUMMARY = [
+    "<!-- ensemble:implementation-checklist -->",
+    "",
+    "- [x] Add the resolver",
+    "- [ ] Wire the decoder",
+    "",
+    "## Files Changed",
+    "",
+    "- (none) — the resolver already existed; only the plan needed updating",
+    "",
+    "## Verification",
+    "",
+    "- ran the unit tests",
+  ].join("\n");
+
+  const UNMATCHED_CLAIM_SUMMARY = [
+    "<!-- ensemble:implementation-checklist -->",
+    "",
+    "- [ ] Add the resolver",
+    "- [ ] Wire the decoder",
+    "",
+    "## Files Changed",
+    "",
+    "- (none) — verification only",
+    "",
+    "## Plan Item Checklist",
+    "",
+    "- Resolver addition — done <!-- ensemble:retroactive --> — src/resolver.ts:1 already implemented",
+    "",
+    "## Verification",
+    "",
+    "- ran the unit tests",
+  ].join("\n");
+
+  void it("a zero-file round that lands new ticks resets the streak instead of extending it", async () => {
+    const { folderPath, progress } = makeTaskFolder("streak_reset_on_ticks", {
+      zeroChangeImplRounds: 2,
+    });
+    await runHarnessed(folderPath, progress, {
+      status: "completed",
+      filesChanged: [],
+      filesChangedUnknown: false,
+      summary: ECHO_TICKS_RESOLVER_SUMMARY,
+      runnerId: "test-cli",
+      providerLabel: "Test CLI",
+      storedModelId: "cli:test-model",
+    });
+
+    const persisted = readProgress(folderPath);
+    assert.equal(
+      persisted?.zeroChangeImplRounds,
+      undefined,
+      "landing a real tick must clear the no-progress streak, not extend it"
+    );
+  });
+
+  void it("a zero-file round whose claim never merges still extends the streak", async () => {
+    const { folderPath, progress } = makeTaskFolder("streak_extends_on_unmatched_claim", {
+      zeroChangeImplRounds: 1,
+    });
+    await runHarnessed(folderPath, progress, {
+      status: "completed",
+      filesChanged: [],
+      filesChangedUnknown: false,
+      summary: UNMATCHED_CLAIM_SUMMARY,
+      runnerId: "test-cli",
+      providerLabel: "Test CLI",
+      storedModelId: "cli:test-model",
+    });
+
+    const persisted = readProgress(folderPath);
+    assert.equal(
+      persisted?.zeroChangeImplRounds,
+      2,
+      "a claimed-but-unmerged round is exactly as sterile as one that reported nothing"
+    );
+  });
+});
+
+/**
+ * Part 3 (2026-08-14 review finding): the no-progress breaker exists for a
+ * PASSING review sending a finished-looking round back to `impl` forever —
+ * tripping it must require a qualifying same-stage review at or above the
+ * auto-advance threshold, not just N sterile rounds in isolation. This also
+ * drives the companion fix: when the diagnosed cause is claimed-but-unmerged
+ * checklist progress, `checklistProgressUnreliable` and its
+ * reconcilePlanChecklist remedy must land in the SAME patch as the
+ * escalation, since the function returns immediately after and the later
+ * merge-write block that would otherwise set the latch never runs.
+ */
+void describe("no-progress breaker requires a qualifying passing review (Part 3, end to end)", () => {
+  const UNMATCHED_CLAIM_SUMMARY = [
+    "<!-- ensemble:implementation-checklist -->",
+    "",
+    "- [ ] Add the resolver",
+    "- [ ] Wire the decoder",
+    "",
+    "## Files Changed",
+    "",
+    "- (none) — verification only",
+    "",
+    "## Plan Item Checklist",
+    "",
+    "- Resolver addition — done <!-- ensemble:retroactive --> — src/resolver.ts:1 already implemented",
+    "",
+    "## Verification",
+    "",
+    "- ran the unit tests",
+  ].join("\n");
+
+  const qualifyingHistory = [
+    {
+      stage: "impl-high-review" as const,
+      score: 10,
+      attemptId: "attempt-passing",
+      at: "2026-01-02T00:00:00.000Z",
+      blockerCount: 0,
+      taskFixableCount: 0,
+    },
+  ];
+
+  void it("eligible: escalates at the threshold behind a qualifying 0-blocker review, and latches checklistProgressUnreliable in the same round", async () => {
+    const { folderPath, progress } = makeTaskFolder("breaker_eligible", {
+      zeroChangeImplRounds: 2,
+      reviewScoreHistory: qualifyingHistory,
+    });
+    const run = await runHarnessed(folderPath, progress, {
+      status: "completed",
+      filesChanged: [],
+      filesChangedUnknown: false,
+      summary: UNMATCHED_CLAIM_SUMMARY,
+      runnerId: "test-cli",
+      providerLabel: "Test CLI",
+      storedModelId: "cli:test-model",
+    });
+
+    const persisted = readProgress(folderPath);
+    assert.equal(persisted?.status, "paused", "the qualifying sequence must escalate and pause the task");
+    assert.equal(persisted?.escalation?.kind, "plateau");
+    assert.equal(
+      persisted?.zeroChangeImplRounds,
+      undefined,
+      "the streak is cleared once the escalation lands"
+    );
+    // The companion fix: the latch must be true THIS round — not only after
+    // a later round reaches the merge-write block, which never runs here
+    // because the function returns immediately after escalating.
+    assert.equal(
+      persisted?.checklistProgressUnreliable,
+      true,
+      "reconcilePlanChecklist must be actionable immediately, not after another round"
+    );
+    // Atomicity invariant (review finding, 2026-08-14): the pause and the
+    // latch must land in the SAME patchTaskProgressStrictV1 transaction, not
+    // two sequential ones a crash could land between. Prove it across EVERY
+    // persisted state the run produced, not just the final one: no snapshot
+    // may ever show the task already paused while the latch it names as the
+    // remedy still reads false — that gap is exactly the prior-blocker state
+    // (paused, with the reconciliation remedy inert).
+    for (const state of run.persistedStates) {
+      assert.ok(
+        state.status !== "paused" || state.checklistProgressUnreliable,
+        "a persisted state showed the task paused before the checklist latch was durable"
+      );
+    }
+    assert.equal(
+      run.notifications.some((n) => /Reconcile Plan Checklist/.test(n.message)),
+      true,
+      "the escalation notice must name the reconciliation remedy for the diagnosed cause"
+    );
+  });
+
+  void it("ineligible: does not escalate without any qualifying review on record — the streak keeps counting instead", async () => {
+    const { folderPath, progress } = makeTaskFolder("breaker_ineligible_no_history", {
+      zeroChangeImplRounds: 2,
+      // No reviewScoreHistory at all: three sterile reruns with prior edits
+      // already in the tree, but no qualifying passing-review loop — exactly
+      // the shape the review finding named.
+    });
+    await runHarnessed(folderPath, progress, {
+      status: "completed",
+      filesChanged: [],
+      filesChangedUnknown: false,
+      summary: UNMATCHED_CLAIM_SUMMARY,
+      runnerId: "test-cli",
+      providerLabel: "Test CLI",
+      storedModelId: "cli:test-model",
+    });
+
+    const persisted = readProgress(folderPath);
+    assert.equal(persisted?.status, "active", "an ineligible sequence must not pause the task");
+    assert.equal(persisted?.escalation, undefined);
+    assert.equal(
+      persisted?.zeroChangeImplRounds,
+      3,
+      "the streak keeps counting rather than resetting — only the escalation is withheld"
+    );
+  });
+
+  void it("ineligible: does not escalate when the latest same-stage review scored below the auto-advance threshold", async () => {
+    const { folderPath, progress } = makeTaskFolder("breaker_ineligible_low_score", {
+      zeroChangeImplRounds: 2,
+      reviewScoreHistory: [{ ...qualifyingHistory[0]!, score: 6, blockerCount: 1, taskFixableCount: 1 }],
+    });
+    await runHarnessed(folderPath, progress, {
+      status: "completed",
+      filesChanged: [],
+      filesChangedUnknown: false,
+      summary: UNMATCHED_CLAIM_SUMMARY,
+      runnerId: "test-cli",
+      providerLabel: "Test CLI",
+      storedModelId: "cli:test-model",
+    });
+
+    const persisted = readProgress(folderPath);
+    assert.equal(persisted?.status, "active", "a below-threshold review must not qualify as a passing loop");
+    assert.equal(persisted?.escalation, undefined);
+  });
+});
+
+/**
+ * Part 1 (2026-08-14): the ONE durable recovery transition. Round 010 of
+ * ".ensemble/2026-08-13_task_1" ("workflow 2") was finalized `completed` with
+ * its edits kept while its whole response was a stale-waiter narration; the
+ * summary was stamped unusable and NOTHING was persisted or scheduled, so the
+ * task sat at impl-high-review/active with no round 011 until a human
+ * noticed. Both failure classes — a detected incomplete round AND a
+ * stamped-unusable summary — now land the identical `implRecovery` record
+ * (quarantined delta, continuation count, mode, dispatch: "pending") in one
+ * strict patch BEFORE anything else is written or scheduled.
+ */
+void describe("durable recovery transition (implRecovery, end to end)", () => {
+  /** Verbatim response body from runs/010-claude-cli-impl.md. */
+  const ROUND_010_RESPONSE =
+    "Stale waiter stopped. The full unit suite (with the fix compiled in) is " +
+    "running in the background — I'll write the final summary when its " +
+    "completion notification arrives with the final pass/fail counts.";
+
+  /** Rejected shape WITHOUT deferral phrasing: reports files, no Verification, no echo. */
+  const REJECTED_NO_DEFERRAL_SUMMARY =
+    "## Files Changed\n\n- `src/rejected.ts` — reworked the resolver\n\nDone.";
+
+  void it("the round-010 fixture lands the recovery record durably before the run log, artifacts preserved", async () => {
+    const { folderPath, progress } = makeTaskFolder("recovery_round010");
+    const run = await runHarnessed(folderPath, progress, {
+      status: "completed",
+      filesChanged: ["src/commands/reviewActions.ts", "src/utils/implementationArtifactResolver.ts"],
+      filesChangedUnknown: false,
+      summary: ROUND_010_RESPONSE,
+      runnerId: "test-cli",
+      providerLabel: "Test CLI",
+      storedModelId: "cli:test-model",
+    });
+
+    const persisted = readProgress(folderPath);
+    const record = persisted?.implRecovery;
+    assert.ok(record, "the recovery record must persist");
+    assert.equal(record.trigger, "roundDeferred");
+    assert.equal(record.mode, "unconstrained");
+    assert.equal(record.dispatch, "pending");
+    assert.ok(record.sourceAttemptId.startsWith("impl-recovery-"));
+    assert.match(record.reason, /follow-up turn/);
+    assert.deepEqual(
+      [...(persisted?.pendingImplReviewFiles ?? [])].sort(),
+      ["src/commands/reviewActions.ts", "src/utils/implementationArtifactResolver.ts"]
+    );
+    assert.equal(persisted?.incompleteRoundContinuations, 1);
+
+    // Crash-order invariant: the identical record was already durable at the
+    // instant the run log was written — before any dispatch.
+    assert.equal(run.recoveryAtRunLogWrite.length, 1);
+    assert.equal(run.recoveryAtRunLogWrite[0]?.dispatch, "pending");
+    assert.equal(run.recoveryAtRunLogWrite[0]?.sourceAttemptId, record.sourceAttemptId);
+
+    // A detected round preserves artifacts (no unusable stamp).
+    assert.equal(fs.readFileSync(path.join(folderPath, "impl-summary.md"), "utf8"), PRIOR_SUMMARY);
+
+    const logs = readRunLogs(folderPath);
+    assert.match(logs[0]!, /Status: incomplete \(roundDeferred\)/);
+    assert.match(logs[0]!, /Recovery record: `impl-recovery-/);
+    assert.match(logs[0]!, /continuation 1 of 3, unconstrained/);
+
+    assert.equal(run.dispatches.length, 1);
+    assert.equal(run.dispatches[0]?.chainId, "impl-continuation");
+    // The warning names the continuation count and mode — wording distinct
+    // from a plain "review paused, waiting on user" state.
+    assert.ok(
+      run.notifications.some((n) => /continuation implementation round \(1 of 3, unconstrained\)/.test(n.message))
+    );
+  });
+
+  void it("a stamped-unusable summary WITHOUT deferral phrasing lands the same recovery record and schedules the continuation", async () => {
+    const { folderPath, progress } = makeTaskFolder("recovery_rejected");
+    const run = await runHarnessed(folderPath, progress, {
+      status: "completed",
+      filesChanged: ["src/rejected.ts"],
+      filesChangedUnknown: false,
+      summary: REJECTED_NO_DEFERRAL_SUMMARY,
+      runnerId: "test-cli",
+      providerLabel: "Test CLI",
+      storedModelId: "cli:test-model",
+    });
+
+    const persisted = readProgress(folderPath);
+    const record = persisted?.implRecovery;
+    assert.ok(record, "the rejected-summary path must persist recovery state, not nothing");
+    assert.equal(record.trigger, "summaryRejected");
+    assert.equal(record.dispatch, "pending");
+    assert.deepEqual(persisted?.pendingImplReviewFiles, ["src/rejected.ts"]);
+    assert.equal(persisted?.incompleteRoundContinuations, 1);
+    // Quarantine and review scope are mutually exclusive for a rejected
+    // round: even though the summary's own `## Files Changed` attributes
+    // src/rejected.ts to the round, nothing may be banked until a later
+    // usable summary promotes the pending set (review blocker, 2026-08-14).
+    assert.deepEqual(
+      persisted?.implReviewFiles,
+      ["src/prior.ts"],
+      "a rejected round's delta must stay quarantined, never banked into implReviewFiles"
+    );
+
+    // Durable before the run log, exactly like the detected-round class.
+    assert.equal(run.recoveryAtRunLogWrite.length, 1);
+    assert.equal(run.recoveryAtRunLogWrite[0]?.trigger, "summaryRejected");
+
+    // The stamp is still written — and now states what happens next.
+    const summary = fs.readFileSync(path.join(folderPath, "impl-summary.md"), "utf8");
+    assert.ok(summary.includes("<!-- ensemble:implementation-summary-unusable -->"));
+    assert.match(summary, /continuation implementation round \(1 of 3, unconstrained\)/);
+
+    const logs = readRunLogs(folderPath);
+    assert.match(logs[0]!, /Status: completed/);
+    assert.match(logs[0]!, /## Unusable summary — recovery scheduled/);
+    assert.match(logs[0]!, /- src\/rejected\.ts/);
+
+    // Continuation scheduled; the warning keeps the Restore Prior Round action.
+    assert.equal(
+      run.dispatches.some((d) => d.chainId === "impl-continuation"),
+      true
+    );
+    const warning = run.notifications.find(
+      (n) => n.actionCommand?.command === "vs-code-ai-helper.restoreRejectedImplementationRound"
+    );
+    assert.ok(warning, "the rejected-summary warning keeps its restore action");
+    assert.match(warning.message, /continuation implementation round \(1 of 3, unconstrained\)/);
+  });
+
+  void it("cap exhaustion on the rejected-summary path escalates to human instead of looping", async () => {
+    const { folderPath, progress } = makeTaskFolder("recovery_rejected_cap", {
+      incompleteRoundContinuations: MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1 - 1,
+    });
+    const run = await runHarnessed(folderPath, progress, {
+      status: "completed",
+      filesChanged: ["src/rejected.ts"],
+      filesChangedUnknown: false,
+      summary: REJECTED_NO_DEFERRAL_SUMMARY,
+      runnerId: "test-cli",
+      providerLabel: "Test CLI",
+      storedModelId: "cli:test-model",
+    });
+
+    const persisted = readProgress(folderPath);
+    assert.equal(persisted?.incompleteRoundContinuations, MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1);
+    assert.equal(persisted?.status, "paused");
+    assert.equal(persisted?.escalation?.kind, "plateau");
+    assert.equal(persisted?.implRecovery?.trigger, "summaryRejected");
+    assert.equal(
+      run.dispatches.some((d) => d.chainId === "impl-continuation"),
+      false
+    );
+    const summary = fs.readFileSync(path.join(folderPath, "impl-summary.md"), "utf8");
+    assert.match(summary, /continuation budget is exhausted/);
+  });
+
+  void it("filesChangedUnknown is recorded honestly on the record instead of an empty quarantine list", async () => {
+    const { folderPath, progress } = makeTaskFolder("recovery_unknown");
+    await runHarnessed(folderPath, progress, {
+      status: "completed",
+      filesChanged: [],
+      filesChangedUnknown: true,
+      summary: REJECTED_NO_DEFERRAL_SUMMARY,
+      runnerId: "test-cli",
+      providerLabel: "Test CLI",
+      storedModelId: "cli:test-model",
+    });
+
+    const persisted = readProgress(folderPath);
+    assert.equal(persisted?.implRecovery?.filesChangedUnknown, true);
+    assert.equal(persisted?.pendingImplReviewFiles, undefined);
+    assert.equal(persisted?.incompleteRoundContinuations, 1);
+  });
+
+  void it("a known-zero-change rejected summary lands the recovery record and schedules the continuation instead of parking the task", async () => {
+    const { folderPath, progress } = makeTaskFolder("recovery_zero_change");
+    const run = await runHarnessed(folderPath, progress, {
+      status: "completed",
+      filesChanged: [],
+      filesChangedUnknown: false,
+      summary: REJECTED_NO_DEFERRAL_SUMMARY,
+      runnerId: "test-cli",
+      providerLabel: "Test CLI",
+      storedModelId: "cli:test-model",
+    });
+
+    // The exemption this pins against: "provably no edits" used to skip
+    // recovery entirely, leaving an unusable stamp on an active task with
+    // nothing scheduled (review blocker, 2026-08-14).
+    const persisted = readProgress(folderPath);
+    const record = persisted?.implRecovery;
+    assert.ok(record, "a zero-change rejected summary must land the recovery record");
+    assert.equal(record.trigger, "summaryRejected");
+    assert.equal(record.dispatch, "pending");
+    assert.equal(record.filesChangedUnknown, undefined);
+    assert.equal(persisted?.incompleteRoundContinuations, 1);
+    // Nothing to quarantine, nothing banked — and honestly recorded as such.
+    assert.equal(persisted?.pendingImplReviewFiles, undefined);
+    assert.deepEqual(persisted?.implReviewFiles, ["src/prior.ts"]);
+    assert.equal(persisted?.status, "active");
+
+    // Durable before the run log, like every other trigger of the transition.
+    assert.equal(run.recoveryAtRunLogWrite.length, 1);
+    assert.equal(run.recoveryAtRunLogWrite[0]?.trigger, "summaryRejected");
+
+    // The stamp is written and states what happens next.
+    const summary = fs.readFileSync(path.join(folderPath, "impl-summary.md"), "utf8");
+    assert.ok(summary.includes("<!-- ensemble:implementation-summary-unusable -->"));
+    assert.match(summary, /continuation implementation round \(1 of 3, unconstrained\)/);
+
+    const logs = readRunLogs(folderPath);
+    assert.match(logs[0]!, /## Unusable summary — recovery scheduled/);
+    assert.match(logs[0]!, /_none recorded_/);
+
+    assert.equal(
+      run.dispatches.some((d) => d.chainId === "impl-continuation"),
+      true,
+      "the continuation must be scheduled even with a provably empty change set"
+    );
+    assert.ok(
+      run.notifications.some((n) =>
+        /continuation implementation round \(1 of 3, unconstrained\)/.test(n.message)
+      )
+    );
+  });
+
+  void it("a rejected summary whose round also broke the type-check still dispatches the continuation before returning", async () => {
+    const { folderPath, progress } = makeTaskFolder("recovery_typecheck");
+    const run = await runHarnessed(folderPath, progress, {
+      status: "completed",
+      filesChanged: ["src/rejected.ts"],
+      filesChangedUnknown: false,
+      summary: REJECTED_NO_DEFERRAL_SUMMARY,
+      runnerId: "test-cli",
+      providerLabel: "Test CLI",
+      storedModelId: "cli:test-model",
+      typeCheckFailed: true,
+      typeCheckOutput: "src/rejected.ts(1,1): error TS2304: Cannot find name 'x'.",
+    });
+
+    // The type-check gate returns first; it used to do so WITHOUT finishing
+    // the recovery dispatch, so the stamp claimed a continuation "has been
+    // scheduled" while the record sat pending under a live lease (review
+    // blocker, 2026-08-14).
+    const persisted = readProgress(folderPath);
+    assert.equal(persisted?.implRecovery?.trigger, "summaryRejected");
+    assert.deepEqual(persisted?.pendingImplReviewFiles, ["src/rejected.ts"]);
+    assert.deepEqual(persisted?.implReviewFiles, ["src/prior.ts"]);
+    assert.equal(persisted?.implementationTypeCheckFailure !== undefined, true);
+
+    const summary = fs.readFileSync(path.join(folderPath, "impl-summary.md"), "utf8");
+    assert.ok(summary.includes("<!-- ensemble:implementation-summary-unusable -->"));
+    assert.match(summary, /continuation implementation round \(1 of 3, unconstrained\)/);
+
+    assert.equal(
+      run.dispatches.some((d) => d.chainId === "impl-continuation"),
+      true,
+      "the stamp's promise must be true: the continuation is dispatched even when the type-check gate returns first"
+    );
+    const logs = readRunLogs(folderPath);
+    assert.match(logs[0]!, /## Type-check failure/);
+    assert.match(logs[0]!, /## Unusable summary — recovery scheduled/);
+  });
+
+  void it("a later usable round claims the pending dispatch and clears the record in the finalizing transaction", async () => {
+    const { folderPath, progress } = makeTaskFolder("recovery_cleared", {
+      pendingImplReviewFiles: ["src/newfile.ts"],
+      incompleteRoundContinuations: 1,
+      reviewInvalidatedByRound: { stage: "impl-high-review", at: "2026-01-02T00:00:00.000Z" },
+      implRecovery: {
+        sourceAttemptId: "impl-recovery-seeded",
+        reason: "seeded for the clear test",
+        trigger: "roundDeferred",
+        mode: "unconstrained",
+        dispatch: "pending",
+        at: "2026-01-02T00:00:00.000Z",
+      },
+    });
+    const run = await runHarnessed(folderPath, progress, {
+      status: "completed",
+      filesChanged: ["src/resolver.ts"],
+      filesChangedUnknown: false,
+      summary: GOOD_SUMMARY,
+      runnerId: "test-cli",
+      providerLabel: "Test CLI",
+      storedModelId: "cli:test-model",
+    });
+
+    // The run START claimed the record (pending → dispatched, one patch), so
+    // at the moment the run log was written the record read "dispatched" —
+    // proof a restart at that instant would never re-fire it.
+    assert.equal(run.recoveryAtRunLogWrite.length, 1);
+    assert.equal(run.recoveryAtRunLogWrite[0]?.dispatch, "dispatched");
+    assert.ok(run.recoveryAtRunLogWrite[0]?.attemptId?.startsWith("impl-continuation-"));
+
+    // The usable summary's finalizing transaction cleared the whole record
+    // alongside the promotion of the pending set — and only NOW does the
+    // quarantined delta enter review scope, unioned with the usable round's
+    // own reported files.
+    const persisted = readProgress(folderPath);
+    assert.equal(persisted?.implRecovery, undefined);
+    assert.equal(persisted?.pendingImplReviewFiles, undefined);
+    assert.equal(persisted?.incompleteRoundContinuations, undefined);
+    assert.deepEqual(
+      [...(persisted?.implReviewFiles ?? [])].sort(),
+      ["src/newfile.ts", "src/prior.ts", "src/resolver.ts"],
+      "promotion by a usable round is the only path into implReviewFiles for a quarantined delta"
+    );
+  });
+});
+
+/**
+ * Part 2 (2026-08-14): evidence-based recovery modes, selected at transition
+ * time and enforced by the post-run delta gate — a full stage redo
+ * (`unconstrained`) is reserved for rounds whose EDITS are suspect, and a
+ * prior clean review's score never covers edits made by a later round.
+ *
+ * `summary-only` requires an enforceable text-mode dispatch (Part 2 item 4,
+ * `runSummaryOnlyContinuationV1`): the harness patches the capability probe
+ * (false by default — the plan's `inspect-and-complete` fallback, never an
+ * edit run carrying only a no-edits instruction) and the text dispatch
+ * itself, so both the fallback and the real summary-only path are pinned.
+ * Eligibility is additionally bound to the exact reviewed boundary: the
+ * 0-blocker score must still DESCRIBE the pre-round tree (fresh
+ * impl-high-review artifact at the reviewed stage), or selection refuses the
+ * narrowed modes (review blocker 2, 2026-08-14).
+ */
+void describe("recovery mode selection and enforcement (Part 2, end to end)", () => {
+  const REJECTED_NO_DEFERRAL_SUMMARY =
+    "## Files Changed\n\n- `src/rejected.ts` — reworked the resolver\n\nDone.";
+
+  const zeroBlockerHistory = [
+    {
+      stage: "impl-high-review" as const,
+      score: 9,
+      attemptId: "attempt-passing",
+      at: "2026-01-02T00:00:00.000Z",
+      blockerCount: 0,
+      taskFixableCount: 0,
+    },
+  ];
+
+  void it("a rejected summary after a 0-blocker high review over a clean boundary selects inspect-and-complete when text mode is not honorable (fallback)", async () => {
+    const { folderPath, progress } = makeTaskFolder("mode_fallback", {
+      reviewScoreHistory: zeroBlockerHistory,
+    });
+    // The harness probe defaults to false: the resolved provider cannot
+    // enforce a read-only text run, so the plan's fallback rule applies.
+    const run = await runHarnessed(folderPath, progress, {
+      status: "completed",
+      filesChanged: ["src/rejected.ts"],
+      filesChangedUnknown: false,
+      summary: REJECTED_NO_DEFERRAL_SUMMARY,
+      runnerId: "test-cli",
+      providerLabel: "Test CLI",
+      storedModelId: "cli:test-model",
+    });
+
+    const persisted = readProgress(folderPath);
+    assert.equal(persisted?.implRecovery?.mode, "inspect-and-complete");
+    assert.equal(persisted?.implRecovery?.trigger, "summaryRejected");
+    const summary = fs.readFileSync(path.join(folderPath, "impl-summary.md"), "utf8");
+    assert.match(summary, /continuation implementation round \(1 of 3, inspect-and-complete\)/);
+    assert.ok(
+      run.notifications.some((n) => /1 of 3, inspect-and-complete/.test(n.message)),
+      "the warning must name the narrowed mode, not a full redo"
+    );
+  });
+
+  void it("the same failure with an enforceable text-mode dispatch selects summary-only", async () => {
+    const { folderPath, progress } = makeTaskFolder("mode_summary_only_selected", {
+      reviewScoreHistory: zeroBlockerHistory,
+    });
+    await runHarnessed(
+      folderPath,
+      progress,
+      {
+        status: "completed",
+        filesChanged: ["src/rejected.ts"],
+        filesChangedUnknown: false,
+        summary: REJECTED_NO_DEFERRAL_SUMMARY,
+        runnerId: "test-cli",
+        providerLabel: "Test CLI",
+        storedModelId: "cli:test-model",
+      },
+      { summaryOnlyDispatchAvailable: true }
+    );
+    const persisted = readProgress(folderPath);
+    assert.equal(persisted?.implRecovery?.mode, "summary-only");
+    assert.equal(persisted?.implRecovery?.dispatch, "pending");
+  });
+
+  void it("the same failure with open blockers on the latest high review stays unconstrained — the edits are suspect", async () => {
+    const { folderPath, progress } = makeTaskFolder("mode_open_blockers", {
+      reviewScoreHistory: [
+        { ...zeroBlockerHistory[0]!, score: 6, blockerCount: 2, taskFixableCount: 2 },
+      ],
+    });
+    await runHarnessed(folderPath, progress, {
+      status: "completed",
+      filesChanged: ["src/rejected.ts"],
+      filesChangedUnknown: false,
+      summary: REJECTED_NO_DEFERRAL_SUMMARY,
+      runnerId: "test-cli",
+      providerLabel: "Test CLI",
+      storedModelId: "cli:test-model",
+    });
+    assert.equal(readProgress(folderPath)?.implRecovery?.mode, "unconstrained");
+  });
+
+  void it("an unknown delta stays unconstrained even after a 0-blocker review — no trustworthy delta to inspect", async () => {
+    const { folderPath, progress } = makeTaskFolder("mode_unknown_delta", {
+      reviewScoreHistory: zeroBlockerHistory,
+    });
+    await runHarnessed(folderPath, progress, {
+      status: "completed",
+      filesChanged: [],
+      filesChangedUnknown: true,
+      summary: REJECTED_NO_DEFERRAL_SUMMARY,
+      runnerId: "test-cli",
+      providerLabel: "Test CLI",
+      storedModelId: "cli:test-model",
+    });
+    const persisted = readProgress(folderPath);
+    assert.equal(persisted?.implRecovery?.mode, "unconstrained");
+    assert.equal(persisted?.implRecovery?.filesChangedUnknown, true);
+  });
+
+  void it("an outstanding quarantine before the round forbids the narrowed modes — the prior score does not cover unreported edits", async () => {
+    const { folderPath, progress } = makeTaskFolder("mode_dirty_boundary", {
+      reviewScoreHistory: zeroBlockerHistory,
+      pendingImplReviewFiles: ["src/unreported.ts"],
+      incompleteRoundContinuations: 1,
+      reviewInvalidatedByRound: { stage: "impl-high-review", at: "2026-01-02T00:00:00.000Z" },
+    });
+    await runHarnessed(folderPath, progress, {
+      status: "completed",
+      filesChanged: ["src/rejected.ts"],
+      filesChangedUnknown: false,
+      summary: REJECTED_NO_DEFERRAL_SUMMARY,
+      runnerId: "test-cli",
+      providerLabel: "Test CLI",
+      storedModelId: "cli:test-model",
+    });
+    assert.equal(readProgress(folderPath)?.implRecovery?.mode, "unconstrained");
+  });
+
+  void it("a claimed summary-only continuation that can no longer dispatch in text mode escalates to inspect-and-complete BEFORE the edit run, never reaching an edit-capable path with the no-edits mandate", async () => {
+    // Review blocker, 2026-08-14: the transition-time probe checked the
+    // stage chain's PRIMARY, but THIS round resolves against a different
+    // model whose text mode is not guaranteed read-only (the harness's probe
+    // defaults to false, i.e. unavailable). The escalation must happen
+    // before any dispatch decision — never let the claimed record and its
+    // prompt still say `summary-only` while an edit-capable run executes.
+    const { folderPath, progress } = makeTaskFolder("mode_summary_only_unenforceable", {
+      reviewScoreHistory: zeroBlockerHistory,
+      pendingImplReviewFiles: ["src/newfile.ts"],
+      incompleteRoundContinuations: 1,
+      reviewInvalidatedByRound: { stage: "impl-high-review", at: "2026-01-02T00:00:00.000Z" },
+      implRecovery: {
+        sourceAttemptId: "impl-recovery-seeded",
+        reason: "seeded summary-only continuation",
+        trigger: "summaryRejected",
+        mode: "summary-only",
+        dispatch: "pending",
+        at: "2026-01-02T00:00:00.000Z",
+      },
+    });
+    const run = await runHarnessed(folderPath, progress, {
+      status: "completed",
+      filesChanged: ["src/resolver.ts"],
+      filesChangedUnknown: false,
+      summary: GOOD_SUMMARY,
+      runnerId: "test-cli",
+      providerLabel: "Test CLI",
+      storedModelId: "cli:test-model",
+    });
+
+    // Never routed through text mode; the edit dispatch ran under the
+    // REBUILT inspect-and-complete mandate, not the stale summary-only one.
+    assert.equal(run.textPrompts.length, 0, "an unenforceable claim must never attempt text dispatch");
+    assert.equal(run.prompts.length, 1);
+    assert.match(run.prompts[0]!, /## Continuation Notice — inspect and complete/);
+    assert.doesNotMatch(run.prompts[0]!, /report only \(summary-only\)/);
+    assert.match(run.prompts[0]!, /Quarantined files \(unverified work in progress\):\n- src\/newfile\.ts/);
+    assert.match(run.prompts[0]!, /Previously-reviewed boundary:\n- src\/prior\.ts/);
+
+    // Persisted mid-run, before the claimed round's own patch — the CAS is
+    // keyed on the claim's fresh attemptId.
+    const claimedAttemptId = run.recoveryAtRunLogWrite[0]?.attemptId;
+    assert.ok(claimedAttemptId, "the claim must have assigned a fresh continuation attemptId");
+
+    // The round reported properly under its (rebuilt) mandate, so it is
+    // ACCEPTED, not rejected: the report matches its own attributed delta,
+    // the quarantine promotes, and the recovery record clears — this is the
+    // key behavioral difference from the old "reject and re-quarantine"
+    // path, which wasted a whole continuation re-litigating a claim the
+    // round was never able to honor in the first place.
+    const summary = fs.readFileSync(path.join(folderPath, "impl-summary.md"), "utf8");
+    assert.ok(!summary.includes("<!-- ensemble:implementation-summary-unusable -->"));
+    const persisted = readProgress(folderPath);
+    assert.equal(persisted?.implRecovery, undefined);
+    assert.equal(persisted?.pendingImplReviewFiles, undefined);
+    assert.equal(persisted?.incompleteRoundContinuations, undefined);
+    assert.deepEqual(
+      [...(persisted?.implReviewFiles ?? [])].sort(),
+      ["src/newfile.ts", "src/prior.ts", "src/resolver.ts"],
+      "the quarantined delta promotes and the round's own attributed delta banks alongside it"
+    );
+
+    // `src/resolver.ts` sits outside the quarantined+reviewed boundary — kept
+    // (the gate is a backstop, not a sandbox), but recorded as unreviewed
+    // scope rather than silently covered by the escalated mandate.
+    const logs = readRunLogs(folderPath);
+    assert.match(logs[0]!, /## Out-of-boundary changes \(inspect-and-complete\)/);
+    assert.match(logs[0]!, /src\/resolver\.ts/);
+  });
+
+  void it("the post-run delta gate still rejects a genuine summary-only violation when text mode itself reports edits", async () => {
+    // The enforceable path (probe available, dispatched in text mode) is the
+    // one place a violation can still slip through: a provider whose text
+    // mode is supposed to be read-only but shells out anyway. This is the
+    // gate `runSummaryOnlyContinuationV1`'s before/after git snapshot exists
+    // to catch — distinct from the pre-dispatch escalation covered above.
+    const { folderPath, progress } = makeTaskFolder("mode_summary_only_text_violation", {
+      reviewScoreHistory: zeroBlockerHistory,
+      pendingImplReviewFiles: ["src/newfile.ts"],
+      incompleteRoundContinuations: 1,
+      reviewInvalidatedByRound: { stage: "impl-high-review", at: "2026-01-02T00:00:00.000Z" },
+      implRecovery: {
+        sourceAttemptId: "impl-recovery-seeded",
+        reason: "seeded summary-only continuation",
+        trigger: "summaryRejected",
+        mode: "summary-only",
+        dispatch: "pending",
+        at: "2026-01-02T00:00:00.000Z",
+      },
+    });
+    const run = await runHarnessed(
+      folderPath,
+      progress,
+      {
+        // The edit-path result is a tripwire: routing there at all fails the
+        // test via the prompts/textPrompts assertions below.
+        status: "failed",
+        filesChanged: [],
+        runnerId: "test-cli",
+      },
+      {
+        summaryOnlyDispatchAvailable: true,
+        textResult: {
+          status: "completed",
+          filesChanged: ["src/resolver.ts"],
+          filesChangedUnknown: false,
+          // A WELL-FORMED summary on purpose: the delta gate must reject the
+          // round for editing, not for its shape — a good report cannot
+          // narrate over edits the mode forbade.
+          summary: GOOD_SUMMARY,
+          runnerId: "impl-continuation-text",
+          providerLabel: "Test CLI",
+          storedModelId: "cli:test-model",
+        },
+      }
+    );
+
+    // Dispatched in text mode, under the summary-only mandate — the probe
+    // passed, so this IS the enforceable path.
+    assert.equal(run.textPrompts.length, 1);
+    assert.equal(run.prompts.length, 0, "the edit path must never be invoked for summary-only");
+    assert.match(run.textPrompts[0]!, /## Continuation Notice — report only \(summary-only\)/);
+
+    // Not accepted as a summary-only report: stamped unusable despite the
+    // valid shape, nothing banked, both deltas quarantined.
+    const summary = fs.readFileSync(path.join(folderPath, "impl-summary.md"), "utf8");
+    assert.ok(summary.includes("<!-- ensemble:implementation-summary-unusable -->"));
+    const persisted = readProgress(folderPath);
+    assert.deepEqual(persisted?.implReviewFiles, ["src/prior.ts"]);
+    assert.deepEqual(
+      [...(persisted?.pendingImplReviewFiles ?? [])].sort(),
+      ["src/newfile.ts", "src/resolver.ts"],
+      "the violating round's delta joins the quarantine — never discarded, never banked as reviewed"
+    );
+
+    // The mode escalated under the same continuation cap.
+    assert.equal(persisted?.implRecovery?.mode, "inspect-and-complete");
+    assert.equal(persisted?.implRecovery?.dispatch, "pending");
+    assert.equal(persisted?.incompleteRoundContinuations, 2);
+    assert.equal(
+      run.dispatches.some((d) => d.chainId === "impl-continuation"),
+      true
+    );
+
+    // The warning and run log say plainly what happened.
+    assert.ok(
+      run.notifications.some((n) =>
+        /summary-only continuation edited files it was not permitted to edit/.test(n.message)
+      )
+    );
+    const logs = readRunLogs(folderPath);
+    assert.match(logs[0]!, /was not permitted to edit files/);
+  });
+
+  void it("an inspect-and-complete continuation records out-of-boundary paths as unreviewed scope and still requires a fresh review", async () => {
+    const { folderPath, progress } = makeTaskFolder("mode_inspect_boundary", {
+      pendingImplReviewFiles: ["src/newfile.ts"],
+      incompleteRoundContinuations: 1,
+      reviewInvalidatedByRound: { stage: "impl-high-review", at: "2026-01-02T00:00:00.000Z" },
+      implRecovery: {
+        sourceAttemptId: "impl-recovery-seeded",
+        reason: "seeded inspect-and-complete continuation",
+        trigger: "summaryRejected",
+        mode: "inspect-and-complete",
+        dispatch: "pending",
+        at: "2026-01-02T00:00:00.000Z",
+      },
+    });
+    const inspectSummary = GOOD_SUMMARY.replace(
+      "- `src/resolver.ts` — added the resolver",
+      "- `src/resolver.ts` — added the resolver\n- `src/newfile.ts` — finished the deferred work"
+    );
+    const run = await runHarnessed(folderPath, progress, {
+      status: "completed",
+      // src/newfile.ts is inside the boundary (quarantined); src/resolver.ts
+      // is outside it (neither quarantined nor previously reviewed).
+      filesChanged: ["src/newfile.ts", "src/resolver.ts"],
+      filesChangedUnknown: false,
+      summary: inspectSummary,
+      runnerId: "test-cli",
+      providerLabel: "Test CLI",
+      storedModelId: "cli:test-model",
+    });
+
+    // The continuation ran under the inspect-and-complete mandate, with both
+    // boundary lists in the prompt.
+    assert.match(run.prompts[0]!, /## Continuation Notice — inspect and complete/);
+    assert.match(run.prompts[0]!, /- src\/newfile\.ts/);
+    assert.match(run.prompts[0]!, /Previously-reviewed boundary:\n- src\/prior\.ts/);
+
+    // The out-of-boundary path is named in the run log — kept, but recorded
+    // as scope the prior review's score does not cover.
+    const logs = readRunLogs(folderPath);
+    const boundarySection = logs[0]!.split("## Out-of-boundary changes (inspect-and-complete)")[1];
+    assert.ok(boundarySection, "the run log must carry the out-of-boundary section");
+    const sectionBody = boundarySection.split("\n## ")[0]!;
+    assert.match(sectionBody, /- src\/resolver\.ts/);
+    assert.doesNotMatch(sectionBody, /- src\/newfile\.ts/);
+
+    // A usable report: the record clears, the quarantine promotes, and BOTH
+    // paths enter review scope for the next review.
+    const persisted = readProgress(folderPath);
+    assert.equal(persisted?.implRecovery, undefined);
+    assert.equal(persisted?.pendingImplReviewFiles, undefined);
+    assert.deepEqual(
+      [...(persisted?.implReviewFiles ?? [])].sort(),
+      ["src/newfile.ts", "src/prior.ts", "src/resolver.ts"]
+    );
+
+    // Part 2 step 4's pin: the combined scope still requires a fresh review —
+    // the stage's artifact is stale-stamped, so the prior score can never be
+    // read as covering the continuation's edits.
+    const review = fs.readFileSync(path.join(folderPath, "impl-high-review.md"), "utf8");
+    assert.ok(review.trimStart().startsWith("# Review Stale"));
+  });
+
+  void it("a summary-only continuation dispatches in TEXT mode, scoped to the reviewed files plus the quarantined delta, and its accepted report promotes and clears the record", async () => {
+    const { folderPath, progress } = makeTaskFolder("mode_summary_only_dispatch", {
+      reviewScoreHistory: zeroBlockerHistory,
+      pendingImplReviewFiles: ["src/newfile.ts"],
+      incompleteRoundContinuations: 1,
+      reviewInvalidatedByRound: { stage: "impl-high-review", at: "2026-01-02T00:00:00.000Z" },
+      implRecovery: {
+        sourceAttemptId: "impl-recovery-seeded",
+        reason: "seeded summary-only continuation",
+        trigger: "summaryRejected",
+        mode: "summary-only",
+        dispatch: "pending",
+        at: "2026-01-02T00:00:00.000Z",
+      },
+    });
+    // The report covers the EXISTING combined diff (reviewed + quarantined)
+    // and, per the mode's mandate, the round itself changes nothing.
+    const combinedReport = [
+      "<!-- ensemble:implementation-checklist -->",
+      "",
+      "- [x] Add the resolver",
+      "- [ ] Wire the decoder",
+      "",
+      "## Files Changed",
+      "",
+      "- `src/newfile.ts` — the quarantined delta, reported",
+      "- `src/prior.ts` — previously-reviewed work, reported",
+      "",
+      "## Verification",
+      "",
+      "- re-verified the existing diff; made no edits",
+    ].join("\n");
+    const run = await runHarnessed(
+      folderPath,
+      progress,
+      {
+        // The edit-path result is a tripwire: routing there at all fails the
+        // test via the textPrompts/prompts assertions below.
+        status: "failed",
+        filesChanged: [],
+        runnerId: "test-cli",
+      },
+      {
+        summaryOnlyDispatchAvailable: true,
+        textResult: {
+          status: "completed",
+          filesChanged: [],
+          filesChangedUnknown: false,
+          summary: combinedReport,
+          runnerId: "impl-continuation-text",
+          providerLabel: "Test CLI",
+          storedModelId: "cli:test-model",
+        },
+      }
+    );
+
+    // Dispatched through the text path — edit permissions withheld — and
+    // never through the edit path.
+    assert.equal(run.textPrompts.length, 1, "the continuation must dispatch in text mode");
+    assert.equal(run.prompts.length, 0, "the edit path must not be invoked for summary-only");
+    assert.match(run.textPrompts[0]!, /## Continuation Notice — report only \(summary-only\)/);
+    assert.match(run.textPrompts[0]!, /Quarantined delta awaiting a report:\n- src\/newfile\.ts/);
+    assert.match(run.textPrompts[0]!, /Previously-reviewed files:\n- src\/prior\.ts/);
+
+    // The accepted report is the round's summary; the quarantine promotes,
+    // the recovery record clears, and the continuation counter resets.
+    const summary = fs.readFileSync(path.join(folderPath, "impl-summary.md"), "utf8");
+    assert.ok(summary.includes("## Files Changed"));
+    assert.ok(!summary.includes("<!-- ensemble:implementation-summary-unusable -->"));
+    const persisted = readProgress(folderPath);
+    assert.equal(persisted?.implRecovery, undefined);
+    assert.equal(persisted?.pendingImplReviewFiles, undefined);
+    assert.deepEqual(
+      [...(persisted?.implReviewFiles ?? [])].sort(),
+      ["src/newfile.ts", "src/prior.ts"]
+    );
+
+    // The combined scope still requires a fresh review: the prior 0-blocker
+    // score never covered the quarantined delta.
+    const review = fs.readFileSync(path.join(folderPath, "impl-high-review.md"), "utf8");
+    assert.ok(review.trimStart().startsWith("# Review Stale"));
+  });
+
+  void it("a successful post-review edit round makes the old 0-blocker score stale: the next unreported round is never summary-only (review blocker 2)", async () => {
+    const { folderPath, progress } = makeTaskFolder("mode_stale_score", {
+      reviewScoreHistory: zeroBlockerHistory,
+    });
+
+    // Round 1: an ordinary successful edit round AFTER the 0-blocker review.
+    // Its report is usable, so nothing quarantines — but its edits were never
+    // reviewed, and the stage's review artifact goes stale.
+    const roundOneSummary = [
+      "<!-- ensemble:implementation-checklist -->",
+      "",
+      "- [x] Add the resolver",
+      "- [ ] Wire the decoder",
+      "",
+      "## Files Changed",
+      "",
+      "- `src/roundb.ts` — new post-review work",
+      "",
+      "## Verification",
+      "",
+      "- ran the unit tests",
+    ].join("\n");
+    await runHarnessed(
+      folderPath,
+      progress,
+      {
+        status: "completed",
+        filesChanged: ["src/roundb.ts"],
+        filesChangedUnknown: false,
+        summary: roundOneSummary,
+        runnerId: "test-cli",
+        providerLabel: "Test CLI",
+        storedModelId: "cli:test-model",
+      },
+      { summaryOnlyDispatchAvailable: true }
+    );
+    const reviewAfterRoundOne = fs.readFileSync(
+      path.join(folderPath, "impl-high-review.md"),
+      "utf8"
+    );
+    assert.ok(
+      reviewAfterRoundOne.trimStart().startsWith("# Review Stale"),
+      "round 1's edits must stale-stamp the review artifact"
+    );
+
+    // Round 2: an unreported round. The 0-blocker history entry still exists
+    // and the boundary reads clean (round 1 reported properly), but that
+    // score reviewed a tree that no longer exists — summary-only must NOT be
+    // selected, even with text mode fully available.
+    await runHarnessed(
+      folderPath,
+      readProgress(folderPath),
+      {
+        status: "completed",
+        filesChanged: ["src/rejected.ts"],
+        filesChangedUnknown: false,
+        summary: REJECTED_NO_DEFERRAL_SUMMARY,
+        runnerId: "test-cli",
+        providerLabel: "Test CLI",
+        storedModelId: "cli:test-model",
+      },
+      { summaryOnlyDispatchAvailable: true }
+    );
+    const persisted = readProgress(folderPath);
+    assert.equal(
+      persisted?.implRecovery?.mode,
+      "unconstrained",
+      "a stale 0-blocker score must never select summary-only for later, unreviewed edits"
     );
   });
 });

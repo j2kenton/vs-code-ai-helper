@@ -124,6 +124,45 @@ const STANDALONE_MARKER_LINE = new RegExp(
 );
 
 /**
+ * A round that legitimately fixed a review blocker without ticking any plan
+ * checkbox may state so explicitly with this marker instead of reproducing
+ * the checklist echo — port of the extension's `NO_CHECKLIST_CHANGE_MARKER_V1`;
+ * must match its marker text exactly (parity-tested).
+ */
+export const NO_CHECKLIST_CHANGE_MARKER_V1 = "<!-- ensemble:no-checklist-change -->";
+
+const NO_CHECKLIST_CHANGE_STANDALONE_LINE = new RegExp(
+  `^[ \\t]*${NO_CHECKLIST_CHANGE_MARKER_V1.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}[ \\t]*\\r?$`
+);
+
+/** True when `response` declares, via the marker above, that no checkbox state changed this round. */
+export function declaresNoChecklistChangeV1(response: string): boolean {
+  return walkLinesV1(response).some(
+    (line) => !line.fenced && NO_CHECKLIST_CHANGE_STANDALONE_LINE.test(line.text)
+  );
+}
+
+/**
+ * True when `content` both declares `NO_CHECKLIST_CHANGE_MARKER_V1` ("nothing
+ * to tick") and ALSO reports at least one retroactive-tick claim in its own
+ * `## Plan Item Checklist` section — a round that wants checklist state to
+ * change while explicitly declaring it does not. Port of the extension's
+ * `hasContradictoryNoChecklistChangeClaimV1` (round 013, task "1.9",
+ * 2026-08-14): the declaration check requires the marker on its OWN line, and
+ * the claims check is scoped to `own` (`splitSummaryAtEchoV1`'s post-echo
+ * region), so a plan that merely quotes either marker inside a checklist
+ * item's descriptive text can never trigger this on its own.
+ */
+export function hasContradictoryNoChecklistChangeClaimV1(content: string): boolean {
+  const trimmed = content.trim();
+  if (!declaresNoChecklistChangeV1(trimmed)) {
+    return false;
+  }
+  const { own } = splitSummaryAtEchoV1(trimmed);
+  return collectRetroactiveTickClaimsV1(own).length > 0;
+}
+
+/**
  * Item-identity text: must match the extension's key exactly (parity-tested).
  *
  * Unescapes backslash-escaped quotes/apostrophes/backslashes BEFORE the trim/

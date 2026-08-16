@@ -132,6 +132,40 @@ void describe("detectPlateau", () => {
     ];
     assert.strictEqual(detectPlateau(history, "impl-high-review", 3), true);
   });
+
+  void it("does not compare across a reviewer identity change (workflow-2 item 7)", () => {
+    const reviewerA = { providerLabel: "Cline", storedModelId: "cline-pass/kimi-k3@xhigh" };
+    const reviewerB = { providerLabel: "Codex", storedModelId: "gpt-5.6-sol@high" };
+    // A flat run under reviewer A would plateau on its own, but reviewer B
+    // only produced ONE round so far — not enough same-reviewer history to
+    // judge, so this must NOT read as a plateau across the substitution.
+    const history = [
+      entry(7, { reviewer: reviewerA }),
+      entry(7, { reviewer: reviewerA }),
+      entry(7, { reviewer: reviewerA }),
+      entry(7, { reviewer: reviewerA }),
+      entry(6, { reviewer: reviewerB }),
+    ];
+    assert.strictEqual(detectPlateau(history, "impl-high-review", 3), false);
+  });
+
+  void it("resumes comparing once enough rounds accumulate under the new reviewer", () => {
+    const reviewerA = { providerLabel: "Cline", storedModelId: "cline-pass/kimi-k3@xhigh" };
+    const reviewerB = { providerLabel: "Codex", storedModelId: "gpt-5.6-sol@high" };
+    const history = [
+      entry(9, { reviewer: reviewerA }),
+      entry(6, { reviewer: reviewerB }),
+      entry(6, { reviewer: reviewerB }),
+      entry(6, { reviewer: reviewerB }),
+      entry(6, { reviewer: reviewerB }),
+    ];
+    assert.strictEqual(detectPlateau(history, "impl-high-review", 3), true);
+  });
+
+  void it("legacy entries without any recorded reviewer identity behave exactly as before", () => {
+    const history = [entry(2), entry(5), entry(5), entry(5), entry(5)];
+    assert.strictEqual(detectPlateau(history, "impl-high-review", 3), true);
+  });
 });
 
 function identity(overrides: Partial<ReviewBlockerIdentity> = {}): ReviewBlockerIdentity {
@@ -249,6 +283,22 @@ void describe("detectBlockerSetStall", () => {
       entry(5.7, { blockers }),
     ];
     assert.strictEqual(detectBlockerSetStall(history, "impl-high-review", 3), true);
+  });
+
+  void it("does not compare blocker sets across a reviewer identity change", () => {
+    const reviewerA = { providerLabel: "Cline", storedModelId: "cline-pass/kimi-k3@xhigh" };
+    const reviewerB = { providerLabel: "Codex", storedModelId: "gpt-5.6-sol@high" };
+    const blockers = [identity()];
+    // Same unchanged blocker set would stall under one reviewer, but the
+    // window's baseline round is under reviewer A and the rest under B —
+    // only one same-reviewer (B) round exists, too few to judge.
+    const history = [
+      entry(5, { blockers, reviewer: reviewerA }),
+      entry(5, { blockers, reviewer: reviewerB }),
+      entry(5, { blockers, reviewer: reviewerB }),
+      entry(5, { blockers, reviewer: reviewerB }),
+    ];
+    assert.strictEqual(detectBlockerSetStall(history, "impl-high-review", 3), false);
   });
 
   void it("falls back to the legacy score test when the window MIXES identity-carrying and older entries", () => {
@@ -534,6 +584,91 @@ void describe("shouldTripNoProgressBreaker", () => {
       shouldTripNoProgressBreaker({ zeroChangeRounds: 3, breakerRounds: 3, history: [] }),
       true
     );
+  });
+
+  // 2026-08-14 review finding: the breaker exists for a PASSING review
+  // sending a finished-looking round back to impl forever, not for sterile
+  // rounds against real unresolved work — trip must also require a
+  // qualifying same-stage review at or above the auto-advance threshold.
+  void describe("qualifying-review gate (qualifyingStage/qualifyingThreshold)", () => {
+    void it("still trips on the zero-change count alone when the gate is omitted (legacy/back-compat)", () => {
+      assert.strictEqual(
+        shouldTripNoProgressBreaker({ zeroChangeRounds: 3, breakerRounds: 3, history: [] }),
+        true
+      );
+    });
+
+    void it("eligible: trips when the latest same-stage review meets the threshold", () => {
+      const qualifying = [entry(10, { stage: "impl-high-review", blockerCount: 0, taskFixableCount: 0 })];
+      assert.strictEqual(
+        shouldTripNoProgressBreaker({
+          zeroChangeRounds: 3,
+          breakerRounds: 3,
+          history: qualifying,
+          qualifyingStage: "impl-high-review",
+          qualifyingThreshold: 10,
+        }),
+        true
+      );
+    });
+
+    void it("ineligible: does not trip when the latest same-stage review scores below the threshold", () => {
+      const belowThreshold = [entry(6, { stage: "impl-high-review", blockerCount: 1, taskFixableCount: 1 })];
+      assert.strictEqual(
+        shouldTripNoProgressBreaker({
+          zeroChangeRounds: 3,
+          breakerRounds: 3,
+          history: belowThreshold,
+          qualifyingStage: "impl-high-review",
+          qualifyingThreshold: 10,
+        }),
+        false
+      );
+    });
+
+    void it("ineligible: does not trip with no history at all — no qualifying passing-review loop on record", () => {
+      assert.strictEqual(
+        shouldTripNoProgressBreaker({
+          zeroChangeRounds: 3,
+          breakerRounds: 3,
+          history: undefined,
+          qualifyingStage: "impl-high-review",
+          qualifyingThreshold: 10,
+        }),
+        false
+      );
+    });
+
+    void it("ineligible: does not trip when history only has entries for a different stage", () => {
+      const otherStage = [entry(10, { stage: "impl-low-review", blockerCount: 0, taskFixableCount: 0 })];
+      assert.strictEqual(
+        shouldTripNoProgressBreaker({
+          zeroChangeRounds: 3,
+          breakerRounds: 3,
+          history: otherStage,
+          qualifyingStage: "impl-high-review",
+          qualifyingThreshold: 10,
+        }),
+        false
+      );
+    });
+
+    void it("qualifies on the MOST RECENT same-stage entry, not an earlier passing one", () => {
+      const regressed = [
+        entry(10, { stage: "impl-high-review", blockerCount: 0, taskFixableCount: 0, at: "2026-01-01T00:00:00.000Z" }),
+        entry(4, { stage: "impl-high-review", blockerCount: 3, taskFixableCount: 3, at: "2026-01-02T00:00:00.000Z" }),
+      ];
+      assert.strictEqual(
+        shouldTripNoProgressBreaker({
+          zeroChangeRounds: 3,
+          breakerRounds: 3,
+          history: regressed,
+          qualifyingStage: "impl-high-review",
+          qualifyingThreshold: 10,
+        }),
+        false
+      );
+    });
   });
 });
 

@@ -14,6 +14,7 @@ import {
   ImplementationTypeCheckFailure,
   MAX_REVIEW_REJECTIONS,
   MAX_REVIEW_SCORE_HISTORY,
+  QuotaParkRecordV1,
   ReviewRejectionEntry,
   ReviewScoreHistoryEntry,
   TaskEscalation,
@@ -129,6 +130,14 @@ export function updateTaskStatus(
     ...(status !== "paused" && progress.pausedReason !== undefined
       ? { pausedReason: undefined }
       : {}),
+    // Unlike pausedReason, quotaParkRecord is a durable PREDICTION about
+    // when a model/provider becomes usable again, not a description of the
+    // current paused state — resuming the task (paused -> active) is not by
+    // itself fresh evidence the block resolved, so it must survive the
+    // transition. It is only retired by explicit fresh evidence: a
+    // contradicting/successful run (clearQuotaParkV1, called from
+    // runnerRegistry.ts after a same-stage retry) or a later, unrelated
+    // pause overwriting/clearing it (pauseTaskWithReason).
     updatedAt: options?.preserveFreshness
       ? progress.updatedAt
       : new Date().toISOString(),
@@ -144,12 +153,89 @@ export function updateTaskStatus(
  */
 export function pauseTaskWithReason(
   progress: TaskProgress,
-  reason: string
+  reason: string,
+  quotaParkRecord?: QuotaParkRecordV1
 ): TaskProgress {
   return {
     ...updateTaskStatus(progress, "paused"),
     pausedReason: reason,
+    // This pause's own record replaces any prior one; a pause with no
+    // record of its own (this exhaustion wasn't quota/entitlement-shaped)
+    // must not leave a stale record from an earlier, unrelated pause behind.
+    ...(quotaParkRecord !== undefined ? { quotaParkRecord } : { quotaParkRecord: undefined }),
   };
+}
+
+/**
+ * Record that a stage was blocked by a quota/model-entitlement failure,
+ * without changing task status — the withheld-backup branch
+ * (runnerRegistry.ts) blocks a single stage attempt but does not pause the
+ * whole task, unlike `pauseTaskForExhaustedChainV1`'s fully-exhausted-chain
+ * case (which threads the record through `pauseTaskWithReason` instead).
+ */
+export function recordQuotaParkV1(
+  progress: TaskProgress,
+  quotaParkRecord: QuotaParkRecordV1
+): TaskProgress {
+  return {
+    ...progress,
+    quotaParkRecord,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * Identity of the run whose result is being offered as fresh evidence that a
+ * `quotaParkRecord` block has resolved. Matched against the persisted
+ * record's own `providerId`/`modelId`/`accountKey` before clearing.
+ */
+export interface QuotaParkClearingIdentityV1 {
+  providerId: string;
+  modelId: string;
+  accountKey?: string;
+}
+
+/**
+ * Clear a `quotaParkRecord` once a same-stage run has since completed
+ * successfully — a resolved-park record left in place after the task moved
+ * forward is a stale "blocked" reading (surfaced in the task tree tooltip)
+ * for a block that no longer applies. `updatedAt` is deliberately NOT bumped:
+ * this is bookkeeping cleanup riding on a successful run's own progress
+ * write, not user-visible task progress in its own right.
+ *
+ * Review completion blocker: earlier this cleared on ANY fresh evidence
+ * associated with the task folder, regardless of which model/provider
+ * produced it — a contradicting result from a DIFFERENT model than the one
+ * the record actually blocked proved nothing about whether that block
+ * resolved. `identity`, when supplied, is matched against the persisted
+ * record's own `providerId` and `modelId` (and `accountKey`, when both sides
+ * have one) before clearing; a mismatch leaves the record untouched. Callers
+ * that clear as a side effect of a stage/task transition (field-policy
+ * builders) intentionally do not go through this function at all — the
+ * record belongs to a specific stage attempt, and leaving that stage retires
+ * it unconditionally regardless of model identity.
+ */
+export function clearQuotaParkV1(
+  progress: TaskProgress,
+  identity?: QuotaParkClearingIdentityV1
+): TaskProgress {
+  const record = progress.quotaParkRecord;
+  if (record === undefined) {
+    return progress;
+  }
+  if (identity !== undefined) {
+    const matches =
+      record.providerId === identity.providerId &&
+      record.modelId === identity.modelId &&
+      (record.accountKey === undefined ||
+        identity.accountKey === undefined ||
+        record.accountKey === identity.accountKey);
+    if (!matches) {
+      return progress;
+    }
+  }
+  const { quotaParkRecord: _unused, ...rest } = progress;
+  return rest;
 }
 
 /**
@@ -260,21 +346,25 @@ export function quarantinePendingImplReviewFiles(
  * Promote the quarantined incomplete-round delta into review scope once a
  * subsequent implementation round completes successfully: the pending paths
  * are unioned into `implReviewFiles` (callers union the successful round's
- * own attributed delta separately, on top), and the pending set plus the
- * continuation counter are cleared. Returns `progress` unchanged when there
- * is nothing to promote or clear.
+ * own attributed delta separately, on top), and the pending set, the
+ * continuation counter, and the owed `implRecovery` record are cleared —
+ * all in the same transform, so the record can only ever clear in the same
+ * transaction that finalizes the usable summary. Returns `progress`
+ * unchanged when there is nothing to promote or clear.
  */
 export function promotePendingImplReviewFiles(progress: TaskProgress): TaskProgress {
   const pending = progress.pendingImplReviewFiles ?? [];
   if (
     progress.pendingImplReviewFiles === undefined &&
-    progress.incompleteRoundContinuations === undefined
+    progress.incompleteRoundContinuations === undefined &&
+    progress.implRecovery === undefined
   ) {
     return progress;
   }
   const {
     pendingImplReviewFiles: _pending,
     incompleteRoundContinuations: _continuations,
+    implRecovery: _recovery,
     ...rest
   } = progress;
   if (pending.length === 0) {

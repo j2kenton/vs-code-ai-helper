@@ -332,6 +332,15 @@ export interface TaskProgress {
    * stage transition — NOT consume-before-transition: a stage's own loop
    * must be able to read a count written several rounds earlier, so this is
    * not wiped merely because the field was read once.
+   *
+   * Widened (Part 3, 2026-08-14) to track STERILE rounds rather than
+   * file-change alone: a round that changed no files but landed new plan
+   * checklist ticks made real, durable progress and clears the streak like
+   * any file-changing round; one that changed no files and merged no ticks —
+   * including a retroactive-tick claim that matched nothing in the plan of
+   * record — is exactly as sterile as one that reported nothing at all, and
+   * still counts (round 013, task "1.9": a verification-only, zero-file round
+   * whose retroactive claims used paraphrased item text and merged nothing).
    */
   zeroChangeImplRounds?: number;
 
@@ -346,6 +355,130 @@ export interface TaskProgress {
    * status change away from paused (`updateTaskStatus`).
    */
   pausedReason?: string;
+
+  /**
+   * Durable record that an implementation round finished without a usable
+   * report and a recovery continuation is owed — the ONE transition every
+   * unreported round lands on (deferred, cut short, or a stamped-unusable
+   * summary). Written in the same strict patch that quarantines the round's
+   * delta and increments `incompleteRoundContinuations`, BEFORE any run-log
+   * or artifact write, so a crash at any later point can only lose
+   * reporting, never the fact that recovery is owed. Its `dispatch` state
+   * machine (`pending` → `dispatched`) is what lets a host restart tell "a
+   * continuation was never started" (re-arm it) from "one started and died"
+   * (surface it, never double-fire). Cleared in the same transaction that
+   * finalizes a subsequent usable summary (`promotePendingImplReviewFiles`),
+   * and by stage transitions (see taskProgressFieldPolicyV1). Without this
+   * record, a stamped-unusable round persisted nothing and the task sat
+   * "active" indefinitely with no forward motion (2026-08-13_task_1, round
+   * 010: a "stale waiter" narration was finalized as completed and nothing
+   * ever produced a real summary).
+   */
+  implRecovery?: ImplRecoveryV1;
+
+  /**
+   * Durable record that a stage was blocked by a quota or model-entitlement
+   * failure — written in the same transaction that withholds/parks the
+   * stage (see runnerRegistry.ts's dirty-tree withheld-backup branch and
+   * reviewActions.ts's pauseTaskForExhaustedChainV1), so a host restart or a
+   * later notification can still tell the operator WHEN (if known) the
+   * provider is expected to recover, without re-deriving it from a
+   * module-level, restart-losing in-memory map (see quota.ts's
+   * QuotaObservation doc comment). Belongs to the specific stage attempt
+   * that hit the failure, not to future stages. Unlike `pausedReason`,
+   * resuming the task (`"paused"` -> `"active"`) does NOT clear it by
+   * itself — it is a durable prediction, not a description of the current
+   * paused state, so it survives until fresh evidence retires it: a
+   * matching-identity successful or contradicting run via `clearQuotaParkV1`
+   * (see runnerRegistry.ts), a later unrelated pause overwriting it
+   * (`pauseTaskWithReason`), or explicit clearing by all three
+   * `taskProgressFieldPolicyV1` transition builders (nextStage/
+   * markTaskDone/reopen), matching `implRecovery`'s policy.
+   */
+  quotaParkRecord?: QuotaParkRecordV1;
+}
+
+/**
+ * `TaskProgress.quotaParkRecord` — durable record of a quota/entitlement
+ * failure that blocked a stage. `failureKind` is deliberately narrowed to
+ * the two kinds "resets at" language actually applies to: `"quota"` and
+ * `"model-entitlement"` (a provider explicitly refusing this model id to
+ * this account until the account's entitlement changes). `"temporarily-
+ * unavailable"` is excluded on purpose — it is a transient outage with no
+ * provider-reported reset time, so persisting a park record for it would
+ * imply a predictable resume time that does not exist.
+ */
+export interface QuotaParkRecordV1 {
+  /** The model id that hit the failure. */
+  modelId: string;
+  /** The resolved provider id that reported the failure. */
+  providerId: string;
+  /** Account/credential context the failure was observed under, when known. */
+  accountKey?: string;
+  /** Narrowed to the two failure kinds "resets at" language applies to. */
+  failureKind: "quota" | "model-entitlement";
+  /** ISO instant the provider reported the limit will lift, from parseQuotaResetV1. */
+  resetAt?: string;
+  /** ISO instant the failure was observed. */
+  observedAt: string;
+}
+
+/** How the round that triggered an `implRecovery` failed to report. */
+export type ImplRecoveryTriggerV1 =
+  | "roundDeferred"
+  | "roundIncomplete"
+  | "summaryRejected"
+  // Part 7: a wall-clock or inactivity-watchdog kill — the process was
+  // stopped from outside rather than returning any final response at all,
+  // unlike the other three triggers which all have SOME provider reply
+  // (however unusable) to classify.
+  | "externallyTerminated";
+
+/**
+ * The continuation constraint recovery was begun under. Part 1 records
+ * `"unconstrained"` (a full implementation continuation); evidence-based
+ * selection of the narrower modes is Part 2's job:
+ *  - `"summary-only"` — re-emit a proper report for an already-reviewed diff;
+ *  - `"inspect-and-complete"` — verify/finish a known change set from an
+ *    externally-terminated round;
+ *  - `"unconstrained"` — the edits themselves are suspect.
+ */
+export type ImplRecoveryModeV1 =
+  | "summary-only"
+  | "inspect-and-complete"
+  | "unconstrained";
+
+/** Dispatch state of the owed recovery continuation. */
+export type ImplRecoveryDispatchStateV1 = "pending" | "dispatched";
+
+/** `TaskProgress.implRecovery` — one owed recovery continuation. */
+export interface ImplRecoveryV1 {
+  /** Stable token identifying the triggering round, quoted in its run log. */
+  sourceAttemptId: string;
+  /** Displayable reason the triggering round's report was unusable. */
+  reason: string;
+  /** Failure class of the triggering round. */
+  trigger: ImplRecoveryTriggerV1;
+  /** Continuation constraint selected at transition time. */
+  mode: ImplRecoveryModeV1;
+  /**
+   * `"pending"` until an implementation round actually starts and claims the
+   * continuation (flipping to `"dispatched"` with a fresh `attemptId` in one
+   * patch). Only a `pending` record with no live lease may be re-armed.
+   */
+  dispatch: ImplRecoveryDispatchStateV1;
+  /** ISO timestamp recovery was recorded. */
+  at: string;
+  /**
+   * True when the triggering round's change set could not be enumerated —
+   * recorded explicitly rather than passed off as an empty quarantine list.
+   */
+  filesChangedUnknown?: boolean;
+  /** Continuation attempt token, set when `dispatch` flips to "dispatched". */
+  attemptId?: string;
+  /** Same lease semantics as `scheduledRun`: one window arms the dispatch. */
+  leaseOwner?: string;
+  leaseUntil?: string;
 }
 
 /** `TaskProgress.reviewInvalidatedByRound` — which stage's review an incomplete round invalidated, and when. */
@@ -407,6 +540,22 @@ export interface ReviewScoreHistoryEntry {
   /** Stable identities of this round's blockers (absent on entries written
    * before this field existed). */
   blockers?: ReviewBlockerIdentity[];
+  /**
+   * Identity of the provider/model that actually produced this round's
+   * review, including any backup-cascade substitution — never the stage's
+   * configured/requested model. Absent on entries written before this field
+   * existed. Score-delta and plateau comparisons must never compare across a
+   * change in this identity: a different reviewer is a different instrument,
+   * and the +0.1 advance threshold is the same order of magnitude as a
+   * plausible between-reviewer offset (2026-08-14 finding: workflow-2 item 7).
+   */
+  reviewer?: ReviewerIdentityV1;
+}
+
+/** See `ReviewScoreHistoryEntry.reviewer`. */
+export interface ReviewerIdentityV1 {
+  readonly providerLabel: string;
+  readonly storedModelId: string;
 }
 
 /** One row of `TaskProgress.reviewRejections`. */

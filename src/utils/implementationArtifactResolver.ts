@@ -16,6 +16,7 @@ import {
   collectChecklistItemKeysV1,
   countChecklistProgressV1,
   declaresNoChecklistChangeV1,
+  hasContradictoryNoChecklistChangeClaimV1,
   hasImplementationChecklistV1,
   splitSummaryAtEchoV1,
 } from "./implementationChecklist";
@@ -222,6 +223,25 @@ export function describeImplementationSummaryShapeIssue(
     return "the provider returned no final summary text";
   }
 
+  // Checked before the section presence gates below: a response that
+  // declares `NO_CHECKLIST_CHANGE_MARKER_V1` ("nothing to tick") while also
+  // reporting retroactive completions in `## Plan Item Checklist` wants
+  // checklist state to change while explicitly declaring it does not. Both
+  // halves individually satisfy the shape gate (the marker alone stands in
+  // for the echo), so this round would otherwise complete with its claimed
+  // progress recorded nowhere durable — see
+  // `hasContradictoryNoChecklistChangeClaimV1`'s doc comment for the
+  // round-013 reproduction that made this visible.
+  if (expectations.planChecklist !== undefined && hasContradictoryNoChecklistChangeClaimV1(trimmed)) {
+    return (
+      "the final response declares `<!-- ensemble:no-checklist-change -->` (nothing to tick) but " +
+      "also reports retroactive plan-item completions in `## Plan Item Checklist` — use exactly one: " +
+      "either omit the marker and echo the plan's checklist with the completed items ticked (quoting " +
+      "each item's exact text from the plan, not a paraphrase), or drop the marker declaration and the " +
+      "retroactive claims both if truly nothing changed this round"
+    );
+  }
+
   const sections = assessImplementationSummarySectionsV1(trimmed, expectations);
 
   // Naming the real cause when the region is empty but the heading is plainly
@@ -295,10 +315,16 @@ const DEFERRAL_PHRASES_V1: readonly RegExp[] = [
   /\bpick (?:back )?up\b/i,
   /\breport (?:back|the final summary)\b/i,
   /\bcheck back\b/i,
-  /\bI['’]ll (?:resume|continue|follow up|report)\b/i,
+  // "write" joined the verb list for the round-010 shape ("workflow 2",
+  // 2026-08-13): "I'll write the final summary when its completion
+  // notification arrives" promised the summary itself as future work, and no
+  // prior phrase matched it.
+  /\bI['’]ll (?:resume|continue|follow up|report|write)\b/i,
   /\bwhen (?:it|they|the .{0,60}?) (?:completes?|finish(?:es)?)\b/i,
   /\bonce (?:it|they|the .{0,60}?) (?:completes?|finish(?:es)?)\b/i,
-  /\bstill running in the background\b/i,
+  // No leading "still": round 010's "is running in the background" carried
+  // the identical meaning and slipped past the stricter form.
+  /\brunning in the background\b/i,
   /\bwaiting (?:for|on) the background\b/i,
 ];
 
@@ -319,13 +345,22 @@ const DEFERRAL_PHRASES_V1: readonly RegExp[] = [
  * continuation round is scheduled — never banked and then blamed on a
  * malformed summary.
  *
- * Deliberately NARROWER than the shape gate: a response that carries any one
- * of the required sections made a (possibly deficient) report and stays on
- * the existing rejected-summary path. Only a response with none of them is
- * treated as a round that never reported at all. `roundDeferred` (future-work
- * phrasing present) and `roundIncomplete` (cut short for any other reason)
- * follow the identical recovery path — the split exists so run logs and
- * outcome codes name what actually happened.
+ * For a response WITHOUT deferral phrasing this stays deliberately NARROWER
+ * than the shape gate: one that carries any required section made a
+ * (possibly deficient) report and stays on the rejected-summary path; only a
+ * response with none of them is treated as a round that never reported at
+ * all. Deferral phrasing tightens the rule (Part 1, 2026-08-14): a response
+ * that promises future work AND is missing any required section — or whose
+ * sections are empty when the round changed files — is a deferred round even
+ * when one section is present, because the section it did produce is a
+ * partial narration of work it explicitly declares unfinished (round 010 of
+ * "workflow 2" narrated a background test wait; a variant with one section
+ * present would have slipped onto the rejected-summary path and stranded the
+ * task the same way). A complete, well-shaped response with an incidental
+ * phrase match ("run the suite and check it completes") has nothing missing
+ * and stays accepted. `roundDeferred` and `roundIncomplete` follow the
+ * identical recovery path — the split exists so run logs and outcome codes
+ * name what actually happened.
  *
  * An EMPTY response is the limiting case of this contract, not an exception
  * to it: it omits every required section, so it is classified
@@ -350,6 +385,38 @@ export function describeIncompleteImplementationRoundV1(
     };
   }
   const sections = assessImplementationSummarySectionsV1(trimmed, expectations);
+  const deferral = DEFERRAL_PHRASES_V1.find((phrase) => phrase.test(trimmed));
+  if (deferral) {
+    // The tightened deferral rule (see the doc comment): any missing section
+    // — or an empty one when the round changed files — makes a future-work
+    // response a deferred round, even with one section present.
+    const missing: string[] = [];
+    if (!sections.filesChangedPresent) {
+      missing.push("`## Files Changed`");
+    } else if (expectations.roundChangedFiles && !sections.filesChangedHasContent) {
+      missing.push("any files under `## Files Changed`, though this round changed files");
+    }
+    if (!sections.verificationPresent) {
+      missing.push("`## Verification`");
+    } else if (expectations.roundChangedFiles && !sections.verificationHasContent) {
+      missing.push("any content under `## Verification`");
+    }
+    if (!sections.checklistEchoPresent) {
+      missing.push("the checklist echo");
+    }
+    if (missing.length > 0) {
+      const match = deferral.exec(trimmed)?.[0] ?? "";
+      return {
+        kind: "roundDeferred",
+        reason:
+          "the provider ended its turn deferring to a follow-up turn the workflow cannot deliver " +
+          `("${match}"), and its response is missing ${missing.join(" and ")}`,
+      };
+    }
+    // A complete, well-shaped response with an incidental phrase match:
+    // nothing is missing, so it is accepted.
+    return undefined;
+  }
   if (sections.filesChangedPresent || sections.verificationPresent) {
     return undefined;
   }
@@ -359,16 +426,6 @@ export function describeIncompleteImplementationRoundV1(
   // vacuously true and must not veto detection.
   if (expectations.planChecklist !== undefined && sections.checklistEchoPresent) {
     return undefined;
-  }
-  const deferral = DEFERRAL_PHRASES_V1.find((phrase) => phrase.test(trimmed));
-  if (deferral) {
-    const match = deferral.exec(trimmed)?.[0] ?? "";
-    return {
-      kind: "roundDeferred",
-      reason:
-        "the provider ended its turn deferring to a follow-up turn the workflow cannot deliver " +
-        `("${match}"), with no \`## Files Changed\`, no \`## Verification\`, and no checklist echo`,
-    };
   }
   return {
     kind: "roundIncomplete",
@@ -647,11 +704,19 @@ export function buildSyntheticImplementationSummaryV1(
  * `false` for the "nothingToFixRoutesToReview" zero-change round that still
  * rejects on summary shape — otherwise this stamp falsely claims edits were
  * kept when the round changed nothing at all.
+ *
+ * `recoveryLine`, when given, states what will actually happen next (a
+ * scheduled continuation, or the exhausted continuation budget) so the stamp
+ * is distinguishable from a plain "review paused, waiting on user" state —
+ * the round-010 failure ("workflow 2", 2026-08-13) stamped this file and
+ * then nothing moved the task forward, and the stamp itself gave no sign
+ * anything was supposed to.
  */
 export function buildUnusableImplementationSummaryV1(
   reason: string,
   runLogName: string,
-  roundChangedFiles = true
+  roundChangedFiles = true,
+  recoveryLine?: string
 ): string {
   const roundOutcomeClause = roundChangedFiles
     ? "completed and changed files"
@@ -669,6 +734,7 @@ export function buildUnusableImplementationSummaryV1(
     editsClause,
     "implementation notes to review against, so review is paused until another",
     `round produces them. The provider's full response is in \`${runLogName}\`.`,
+    ...(recoveryLine !== undefined ? ["", recoveryLine] : []),
     "",
     "The previous summary, if any, is preserved alongside this file as",
     "`impl-summary_prev.md`.",

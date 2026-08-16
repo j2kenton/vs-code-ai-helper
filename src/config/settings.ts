@@ -446,6 +446,15 @@ export interface ResilienceSettings {
   /** 2c: escalate after this many consecutive implementation rounds that
    * change zero files while the same blocker persists (0 = off). */
   noProgressBreakerRounds: number;
+  /** Part 5 step 3: a quota/entitlement failure's provider-reported reset
+   * time within this many hours is "near" (remedy text says to rerun after
+   * it); beyond it, or unknown, remedy text advises switching models
+   * instead. */
+  quotaResetNearThresholdHours: number;
+  /** Part 7: kill a CLI run's process tree when it has produced no
+   * stdout/stderr/raw-transport bytes for this many minutes, distinct from
+   * the flat RUN_TIMEOUT_MS wall clock (0 disables the watchdog). */
+  inactivityTimeoutMinutes: number;
 }
 
 const RESILIENCE_FF_SURVIVES_ESCALATION_KEY = "resilience.fastForwardSurvivesEscalation";
@@ -455,6 +464,8 @@ const RESILIENCE_BLOCKER_SET_PLATEAU_KEY = "resilience.blockerSetPlateau";
 const RESILIENCE_CHURN_CEILING_ROUNDS_KEY = "resilience.churnCeilingRounds";
 const RESILIENCE_NOTHING_TO_FIX_KEY = "resilience.nothingToFixRoutesToReview";
 const RESILIENCE_NO_PROGRESS_BREAKER_ROUNDS_KEY = "resilience.noProgressBreakerRounds";
+const RESILIENCE_QUOTA_RESET_NEAR_THRESHOLD_HOURS_KEY = "resilience.quotaResetNearThresholdHours";
+const RESILIENCE_INACTIVITY_TIMEOUT_MINUTES_KEY = "resilience.inactivityTimeoutMinutes";
 
 /**
  * Fallbacks for the `ensemble.resilience.*` flags, mirroring the defaults
@@ -492,6 +503,8 @@ export const RESILIENCE_DEFAULTS = {
   churnCeilingRounds: 4,
   nothingToFixRoutesToReview: true,
   noProgressBreakerRounds: 3,
+  quotaResetNearThresholdHours: 24,
+  inactivityTimeoutMinutes: 15,
 } as const;
 
 function readResilienceRounds(key: string, fallback: number): number {
@@ -499,6 +512,25 @@ function readResilienceRounds(key: string, fallback: number): number {
   const numeric =
     typeof value === "number" && Number.isFinite(value) ? Math.floor(value) : fallback;
   return Math.max(0, Math.min(99, numeric));
+}
+
+/** Same coercion as readResilienceRounds, but bounded 0-720 to match this
+ * setting's own package.json schema (a small-hours-range breaker-rounds cap
+ * of 99 would silently clamp a legitimate multi-day threshold). */
+function readQuotaResetThresholdHours(key: string, fallback: number): number {
+  const value = readSetting<unknown>(key, fallback);
+  const numeric =
+    typeof value === "number" && Number.isFinite(value) ? Math.floor(value) : fallback;
+  return Math.max(0, Math.min(720, numeric));
+}
+
+/** Same coercion pattern as readResilienceRounds, but bounded 0-180 to match
+ * this setting's package.json schema. 0 disables the watchdog entirely. */
+function readInactivityTimeoutMinutes(key: string, fallback: number): number {
+  const value = readSetting<unknown>(key, fallback);
+  const numeric =
+    typeof value === "number" && Number.isFinite(value) ? Math.floor(value) : fallback;
+  return Math.max(0, Math.min(180, numeric));
 }
 
 export function getResilienceSettings(): ResilienceSettings {
@@ -535,6 +567,14 @@ export function getResilienceSettings(): ResilienceSettings {
     noProgressBreakerRounds: readResilienceRounds(
       RESILIENCE_NO_PROGRESS_BREAKER_ROUNDS_KEY,
       RESILIENCE_DEFAULTS.noProgressBreakerRounds
+    ),
+    quotaResetNearThresholdHours: readQuotaResetThresholdHours(
+      RESILIENCE_QUOTA_RESET_NEAR_THRESHOLD_HOURS_KEY,
+      RESILIENCE_DEFAULTS.quotaResetNearThresholdHours
+    ),
+    inactivityTimeoutMinutes: readInactivityTimeoutMinutes(
+      RESILIENCE_INACTIVITY_TIMEOUT_MINUTES_KEY,
+      RESILIENCE_DEFAULTS.inactivityTimeoutMinutes
     ),
   };
 }
@@ -629,6 +669,63 @@ export function getEnabledProviders(): Record<string, boolean> {
 export async function setEnabledProviders(enabled: Record<string, boolean>): Promise<void> {
   await vscode.workspace.getConfiguration(CONFIG_SECTION)
     .update(ENABLED_PROVIDERS_KEY, enabled, targetFor(ENABLED_PROVIDERS_KEY));
+}
+
+const PROVIDER_ACCOUNT_LABELS_KEY = "providerAccountLabels";
+
+/**
+ * User-declared account/credential labels, keyed by `ProviderAccountId`
+ * (the same identity `providerAccountIdForModelId` returns).
+ *
+ * No CLI provider today exposes which logged-in credential answered a given
+ * invocation, so real automatic account detection is not buildable without
+ * new per-provider probing infrastructure. This setting is the deliberately
+ * minimal alternative: a user running two credentials for the same CLI
+ * provider (e.g. two separate `claude-cli` logins in different OS profiles,
+ * or a personal vs. work subscription) declares which one is active so the
+ * quota ledger and task-park identity (`src/utils/quota.ts`,
+ * `src/runners/runnerRegistry.ts`) can key on `providerId + accountLabel +
+ * modelId` instead of silently sharing state across two credentials that
+ * happen to resolve to the same provider id.
+ *
+ * Unset (the default) reproduces exactly today's behavior: the resolved
+ * account key is the bare `ProviderAccountId`, identical to
+ * `providerAccountIdForModelId`'s own return value.
+ */
+export function getProviderAccountLabels(): Record<string, string> {
+  return readSetting<Record<string, string>>(PROVIDER_ACCOUNT_LABELS_KEY, {});
+}
+
+export async function setProviderAccountLabel(
+  providerAccountId: string,
+  label: string | undefined
+): Promise<void> {
+  const current = getProviderAccountLabels();
+  const next = { ...current };
+  if (label && label.trim().length > 0) {
+    next[providerAccountId] = label.trim();
+  } else {
+    delete next[providerAccountId];
+  }
+  await vscode.workspace.getConfiguration(CONFIG_SECTION)
+    .update(PROVIDER_ACCOUNT_LABELS_KEY, next, targetFor(PROVIDER_ACCOUNT_LABELS_KEY));
+}
+
+/**
+ * The account/credential context to key quota ledger and task-park identity
+ * on for a given model: `providerAccountIdForModelId`'s result, refined by
+ * any user-declared label for that account (see `getProviderAccountLabels`).
+ *
+ * This is the function quota/park identity call sites should use in place of
+ * a bare `providerAccountIdForModelId(modelId)` — it is backward compatible
+ * (identical output when no label is configured) but lets two credentials
+ * sharing one `ProviderAccountId` stop cross-contaminating each other's
+ * quota/entitlement state once the user tells them apart.
+ */
+export function resolveQuotaAccountKeyV1(modelId: string | undefined): string {
+  const accountId = providerAccountIdForModelId(modelId);
+  const label = getProviderAccountLabels()[accountId];
+  return label ? `${accountId}#${label}` : accountId;
 }
 
 /**

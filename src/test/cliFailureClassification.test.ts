@@ -33,7 +33,7 @@ import { describe, it } from "node:test";
 
 import { __testOnly } from "../runners/cliAgentRunner";
 import { CliProviderDefinition, getCliProvider } from "../runners/providers";
-import { classifyCliFailure, isAuthenticationFailure, isTransportError } from "../utils/quota";
+import { classifyCliFailure, isAuthenticationFailure, isModelEntitlementFailure, isTransportError } from "../utils/quota";
 
 const {
   toFriendlyError,
@@ -760,6 +760,46 @@ void describe("extractClineStructuredDiagnostics", () => {
   });
 });
 
+void describe("Part 6: known-benign CLI noise is never presented as the failure diagnosis", () => {
+  void it("a failed run whose only error content is the hook-dispatch line (structured) presents the honest unknown-cause message with the doctor hint", () => {
+    const stdout = JSON.stringify({
+      type: "error",
+      message: "hook dispatch failed: session.hook requires a valid hook event payload",
+    });
+    const friendly = toFriendlyError(CLINE_LIKE, "cline-pass/kimi-k3", 1, "", stdout);
+
+    assert.doesNotMatch(friendly.message, /hook dispatch failed/);
+    assert.match(friendly.message, /exit code 1/);
+    assert.match(friendly.message, /cline doctor fix/);
+  });
+
+  void it("a failed run whose only error content is the hook-dispatch line via the raw unparsed/JSON-leak path also gets the honest message", () => {
+    // Not valid JSON-lines shape (missing a trailing newline / malformed),
+    // so it falls to the unparsedText fallback rather than the structured
+    // event path — the confirmed second leak route from the plan.
+    const stdout = '{"ts":"2026-08-13T21:05:32.788Z","type":"error","message":"hook dispatch failed: session.hook requires a valid hook event payload"';
+    const friendly = toFriendlyError(CLINE_LIKE, "cline-pass/kimi-k3", 1, "", stdout);
+
+    assert.doesNotMatch(friendly.message, /hook dispatch failed/);
+    assert.match(friendly.message, /exit code 1/);
+    assert.match(friendly.message, /cline doctor fix/);
+  });
+
+  void it("a failed run with a real error plus the hook-dispatch noise surfaces the real error, not the noise", () => {
+    const stdout = [
+      JSON.stringify({ type: "error", message: "not logged in" }),
+      JSON.stringify({
+        type: "error",
+        message: "hook dispatch failed: session.hook requires a valid hook event payload",
+      }),
+    ].join("\n");
+    const friendly = toFriendlyError(CLINE_LIKE, "cline-pass/kimi-k3", 1, "", stdout);
+
+    assert.match(friendly.message, /not logged in/);
+    assert.doesNotMatch(friendly.message, /hook dispatch failed/);
+  });
+});
+
 /**
  * Claude Code CLI stream-json fixtures (Step 16). NEEDS-TOOLCHAIN: this shape
  * is built from Claude Code CLI's documented event model, not yet confirmed
@@ -1075,6 +1115,64 @@ void describe("auth classification is structural, not textual", () => {
     );
 
     assert.equal(friendly.authFailure, false);
+  });
+});
+
+void describe("toFriendlyError — model-entitlement failures (not auth)", () => {
+  // The real production shape: devpass-code (an opencode-fronted provider,
+  // opaque-stderr auth scan here since this is verified via the stderr
+  // channel, matching "still treats a 403 as auth..." above) reports a
+  // Bedrock 403 whose body says the account simply lacks access to this
+  // specific model id. The credential is valid; only a different model id
+  // (a backup) fixes it — never a re-login.
+  const BEDROCK_STDERR =
+    'Error from provider aws-bedrock: 403 Forbidden {"message":"anthropic.claude-sonnet-5 ' +
+    'is not available for this account. You can explore other available models on Amazon Bedrock."}';
+
+  void it("does not classify a Bedrock-style entitlement 403 as an authentication failure", () => {
+    const friendly = toFriendlyError(OPAQUE_TEXT_LIKE, undefined, 1, BEDROCK_STDERR, "");
+
+    assert.equal(friendly.authFailure, false);
+    assert.equal(isAuthenticationFailure(friendly.diagnosticText), false);
+  });
+
+  void it("does not append the provider's re-login hint for an entitlement failure", () => {
+    const friendly = toFriendlyError(OPAQUE_TEXT_LIKE, undefined, 1, BEDROCK_STDERR, "");
+
+    assert.doesNotMatch(friendly.message, /Run `claude` and sign in/);
+  });
+
+  void it("advises switching the stage's model instead of logging in", () => {
+    const friendly = toFriendlyError(OPAQUE_TEXT_LIKE, undefined, 1, BEDROCK_STDERR, "");
+
+    assert.match(friendly.message, /switch this stage's model/i);
+    // The provider's own "explore other available models" text stays intact
+    // in the message body — it is genuinely useful and not replaced.
+    assert.match(friendly.message, /explore other available models/i);
+  });
+
+  void it("still keeps a genuine credential 403 (no entitlement phrasing) classified as auth", () => {
+    const friendly = toFriendlyError(OPAQUE_TEXT_LIKE, undefined, 1, "HTTP 403 Forbidden", "");
+
+    assert.equal(friendly.authFailure, true);
+    assert.match(friendly.message, /Run `claude` and sign in/);
+  });
+
+  void it("classifyCliFailure reads the resulting message as model-entitlement", () => {
+    const friendly = toFriendlyError(OPAQUE_TEXT_LIKE, undefined, 1, BEDROCK_STDERR, "");
+    const classified = classifyCliFailure({
+      status: "failed" as const,
+      output: "",
+      errorMessage: friendly.message,
+      authFailure: friendly.authFailure,
+      authDiagnosticText: friendly.diagnosticText,
+    });
+
+    assert.equal(classified.failureKind, "model-entitlement");
+  });
+
+  void it("isModelEntitlementFailure recognizes the phrasing directly", () => {
+    assert.equal(isModelEntitlementFailure(BEDROCK_STDERR), true);
   });
 });
 

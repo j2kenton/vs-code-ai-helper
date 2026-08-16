@@ -4,6 +4,8 @@ import type { TaskStage } from "../types/taskProgress";
 import { notifyDesktop } from "./desktopNotifier";
 import { taskOperations } from "./taskOperations";
 import { NotificationRouter } from "./notificationRouter";
+import { parseModelSelection } from "../runners/providers";
+import { getResilienceSettings, resolveQuotaAccountKeyV1 } from "../config/settings";
 
 export interface PendingResumeOperation {
   request: Omit<AgentRunRequest, "taskFolderUri" | "workspaceUri" | "outputFile"> & {
@@ -58,6 +60,29 @@ const TRANSPORT_MARKERS = [
 // no) prompt-size ceiling, so trying it is safe and often succeeds outright.
 const PROVIDER_PROMPT_TOO_LARGE_MARKER = "prompt is too large for this cli mode";
 
+// Model-entitlement failures (e.g. Bedrock's "anthropic.claude-sonnet-5 is
+// not available for this account") are NOT authentication failures: the
+// credential is valid and the request reached the provider, which simply
+// refuses to serve THIS model id to THIS account. The only remedies are
+// switching models or changing the account's entitlement — a re-login hint
+// can never fix it, and (unlike a real credential 401/403) a different
+// model id, which is exactly what a backup model is, is a legitimate fix.
+// The discriminator is deliberately this phrasing, never the 403 status
+// code alone, since genuine credential 403s must keep classifying as auth.
+// Extensible: expect more provider-specific equivalents over time.
+const MODEL_ENTITLEMENT_MARKERS = [
+  "is not available for this account",
+  "not enabled for this account",
+  "does not have access to model",
+  "does not have access to the model",
+  "not entitled to model",
+];
+
+export function isModelEntitlementFailure(message: string | undefined): boolean {
+  const value = (message ?? "").toLowerCase();
+  return MODEL_ENTITLEMENT_MARKERS.some((marker) => value.includes(marker));
+}
+
 // Authentication failures are terminal for the selected provider. Keep this
 // deliberately broad: providers often label expired credentials as generic
 // unavailability (or even "try again later"-style transient wording) rather
@@ -67,6 +92,13 @@ const PROVIDER_PROMPT_TOO_LARGE_MARKER = "prompt is too large for this cli mode"
 export function isAuthenticationFailure(message: string | undefined): boolean {
   const value = message ?? "";
   if (/not\s+installed|command\s+not\s+found|could\s+not\s+start\b/i.test(value)) {
+    return false;
+  }
+  // A model-entitlement refusal (see isModelEntitlementFailure) often also
+  // carries "403"/"forbidden" wording that the broad regex below would
+  // otherwise match — checked first so entitlement failures never
+  // misclassify as auth regardless of which status text accompanies them.
+  if (isModelEntitlementFailure(value)) {
     return false;
   }
   // "session"/"token" tolerate a short word gap (e.g. "session has timed
@@ -109,7 +141,261 @@ export function isTransportError(message: string | undefined): boolean {
   return TRANSPORT_MARKERS.some((marker) => value.includes(marker));
 }
 
-export function classifyFailure<T extends { errorMessage?: string; authDiagnosticText?: string; structuredQuotaSignal?: boolean }>(result: T): T & { failureKind: "quota" | "temporarily-unavailable" | "generic" } {
+// ─── Quota reset-time parsing ───────────────────────────────────────────────
+//
+// Providers report a reset time in two observed shapes:
+//   - a wall-clock time plus an IANA zone: "resets 12:10am (Asia/Jerusalem)"
+//   - a relative duration: "resets in 8d 19h", "resets in 45 minutes",
+//     "resets in 2h 30m"
+// parseQuotaResetV1 resolves either into an absolute ISO instant. Any
+// ambiguity — an unrecognized zone, an unparsable unit, no match at all —
+// returns `undefined` rather than guess, so callers degrade to today's
+// manual-retry behavior instead of acting on a fabricated time.
+
+const DURATION_UNIT_MS: Record<string, number> = {
+  d: 86_400_000, day: 86_400_000, days: 86_400_000,
+  h: 3_600_000, hr: 3_600_000, hrs: 3_600_000, hour: 3_600_000, hours: 3_600_000,
+  m: 60_000, min: 60_000, mins: 60_000, minute: 60_000, minutes: 60_000,
+  s: 1_000, sec: 1_000, secs: 1_000, second: 1_000, seconds: 1_000,
+};
+
+/**
+ * "resets 12:10am (Asia/Jerusalem)" — resolves the next occurrence of that
+ * wall-clock time in the named zone, rolling to tomorrow when today's
+ * occurrence has already passed. Offsets are recomputed per candidate day
+ * (via Intl's `longOffset`) so a DST transition on the target day is
+ * reflected rather than assumed constant. Each candidate instant is
+ * validated by formatting it back through the zone and checking it reproduces
+ * the requested hour/minute — a mismatch means the requested wall-clock time
+ * does not exist that day (a DST spring-forward gap), and that candidate is
+ * rejected rather than returned as a shifted guess. The next-day candidate is
+ * derived from plain calendar arithmetic on (year, month, day), not by
+ * re-converting a shifted UTC instant through the zone: for a negative-offset
+ * (west-of-UTC) zone, reformatting `naiveUtcMs + 24h` back through the zone
+ * can land on the *same* calendar day it started from, which would silently
+ * fail to roll the date forward.
+ */
+function parseClockTimeReset(message: string, now: Date): string | undefined {
+  const match = /resets?\s+(\d{1,2}):(\d{2})\s*([ap]\.?m\.?)?\s*\(([^)]+)\)/i.exec(message);
+  if (!match) {
+    return undefined;
+  }
+  const hourRaw = Number(match[1]);
+  const minute = Number(match[2]);
+  const ampm = match[3];
+  const timeZone = match[4]!.trim();
+  if (!Number.isFinite(hourRaw) || !Number.isFinite(minute) || minute > 59) {
+    return undefined;
+  }
+  let hour24 = hourRaw;
+  if (ampm) {
+    if (hourRaw < 1 || hourRaw > 12) {
+      return undefined;
+    }
+    const isPm = /p/i.test(ampm);
+    hour24 = (hourRaw % 12) + (isPm ? 12 : 0);
+  } else if (hourRaw > 23) {
+    return undefined;
+  }
+
+  try {
+    const dateParts = (date: Date): { year: number; month: number; day: number } => {
+      const parts = new Intl.DateTimeFormat("en-US", {
+        timeZone, year: "numeric", month: "2-digit", day: "2-digit",
+      }).formatToParts(date);
+      const get = (type: string): number => Number(parts.find((p) => p.type === type)?.value);
+      return { year: get("year"), month: get("month"), day: get("day") };
+    };
+    const offsetMinutesAt = (utcGuessMs: number): number | undefined => {
+      const parts = new Intl.DateTimeFormat("en-US", {
+        timeZone, timeZoneName: "longOffset", hour: "2-digit",
+      }).formatToParts(new Date(utcGuessMs));
+      const raw = parts.find((p) => p.type === "timeZoneName")?.value;
+      if (raw === "GMT") {
+        return 0;
+      }
+      const offsetMatch = raw ? /^GMT([+-])(\d{1,2}):(\d{2})$/.exec(raw) : null;
+      if (!offsetMatch) {
+        return undefined;
+      }
+      const sign = offsetMatch[1] === "-" ? -1 : 1;
+      return sign * (Number(offsetMatch[2]) * 60 + Number(offsetMatch[3]));
+    };
+    // Resolves (year, month, day, hour24, minute) in `timeZone` to a UTC
+    // instant, then verifies the round trip: if formatting that instant back
+    // through the zone does not reproduce the requested wall-clock time, the
+    // time was skipped by a DST transition on that calendar day.
+    const reproducesWallTime = (utcMs: number): boolean => {
+      const check = new Intl.DateTimeFormat("en-US", {
+        timeZone, hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+      }).formatToParts(new Date(utcMs));
+      const gotHour = Number(check.find((p) => p.type === "hour")?.value);
+      const gotMinute = Number(check.find((p) => p.type === "minute")?.value);
+      return gotHour === hour24 && gotMinute === minute;
+    };
+    const resolveCandidate = (year: number, month: number, day: number): number | undefined | "ambiguous" => {
+      const naiveUtcMs = Date.UTC(year, month - 1, day, hour24, minute, 0);
+      const offsetMinutes = offsetMinutesAt(naiveUtcMs);
+      if (offsetMinutes === undefined) {
+        return undefined;
+      }
+      const targetUtcMs = naiveUtcMs - offsetMinutes * 60_000;
+      if (!reproducesWallTime(targetUtcMs)) {
+        return undefined;
+      }
+      // A DST fall-back fold repeats one local hour on the transition day:
+      // two distinct UTC instants (the pre- and post-transition offsets)
+      // both reproduce the requested wall-clock time. Probe the offsets well
+      // outside the transition window (+/-12h) and, if they differ, check
+      // whether the other offset also yields a valid, distinct candidate.
+      const offsetBefore = offsetMinutesAt(targetUtcMs - 12 * 3_600_000);
+      const offsetAfter = offsetMinutesAt(targetUtcMs + 12 * 3_600_000);
+      if (offsetBefore !== undefined && offsetAfter !== undefined && offsetBefore !== offsetAfter) {
+        for (const altOffset of [offsetBefore, offsetAfter]) {
+          if (altOffset === offsetMinutes) {
+            continue;
+          }
+          const altUtcMs = naiveUtcMs - altOffset * 60_000;
+          if (altUtcMs !== targetUtcMs && reproducesWallTime(altUtcMs)) {
+            return "ambiguous";
+          }
+        }
+      }
+      return targetUtcMs;
+    };
+
+    let { year, month, day } = dateParts(now);
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const candidate = resolveCandidate(year, month, day);
+      if (candidate === "ambiguous") {
+        return undefined;
+      }
+      if (candidate !== undefined && candidate > now.getTime()) {
+        return new Date(candidate).toISOString();
+      }
+      const next = new Date(Date.UTC(year, month - 1, day + 1));
+      year = next.getUTCFullYear();
+      month = next.getUTCMonth() + 1;
+      day = next.getUTCDate();
+    }
+    return undefined;
+  } catch {
+    // Unknown/invalid IANA zone name — Intl throws RangeError.
+    return undefined;
+  }
+}
+
+/** "resets in 8d 19h", "resets in 45 minutes", "in 2h 30m". */
+function parseRelativeDurationReset(message: string, now: Date): string | undefined {
+  const outer = /\bin\s+((?:\d+\s*[a-z]+\s*)+)/i.exec(message);
+  if (!outer) {
+    return undefined;
+  }
+  const tokenPattern = /(\d+)\s*([a-z]+)/gi;
+  let totalMs = 0;
+  let matchedAny = false;
+  let tokenMatch: RegExpExecArray | null;
+  while ((tokenMatch = tokenPattern.exec(outer[1]!)) !== null) {
+    const unitMs = DURATION_UNIT_MS[tokenMatch[2]!.toLowerCase()];
+    if (unitMs === undefined) {
+      // An unrecognized unit means this "in ..." phrase probably isn't a
+      // duration at all — do not guess at a partial total.
+      return undefined;
+    }
+    totalMs += Number(tokenMatch[1]) * unitMs;
+    matchedAny = true;
+  }
+  if (!matchedAny || totalMs <= 0) {
+    return undefined;
+  }
+  return new Date(now.getTime() + totalMs).toISOString();
+}
+
+/**
+ * Parses a provider-reported quota/rate-limit reset time out of a failure
+ * message. Returns an ISO timestamp for when the limit is expected to lift,
+ * or `undefined` on any ambiguity — see parseClockTimeReset/
+ * parseRelativeDurationReset for the two recognized shapes. Clock-time
+ * phrasing is tried first since a message could in principle contain an
+ * unrelated "in N ..." phrase elsewhere.
+ */
+export function parseQuotaResetV1(message: string | undefined, now: Date): string | undefined {
+  const value = message ?? "";
+  return parseClockTimeReset(value, now) ?? parseRelativeDurationReset(value, now);
+}
+
+/** Byte-for-byte the tail every quota-parked remedy message used before a
+ * reset time was ever known — preserved verbatim as the "no known reset at
+ * all" fallback so that common case stays non-breaking. */
+const QUOTA_REMEDY_UNKNOWN_RESET_TEXT_V1 =
+  "Rerun this stage to retry with the same model, or switch the stage's model before rerunning.";
+
+/**
+ * Part 5 step 3: branch a quota/entitlement-parked stage's remedy text by
+ * how soon (if at all) the provider's own reported reset time falls.
+ *  - no known `resetAt` → today's wording, unchanged;
+ *  - `resetAt` within `ensemble.resilience.quotaResetNearThresholdHours`
+ *    (default 24) → name the local rerun time and note manual retry is the
+ *    only option today (no auto-resume scheduling is wired up yet);
+ *  - `resetAt` beyond the threshold → name the concrete date/time the
+ *    provider stays blocked and advise switching the stage's model instead,
+ *    without offering an immediate rerun.
+ */
+/**
+ * Whether a known quota/entitlement reset time falls BEYOND the "near"
+ * threshold `buildQuotaRemedyTextV1` branches on — the same threshold, read
+ * the same way (explicit override else `ensemble.resilience.
+ * quotaResetNearThresholdHours`), exposed separately so a caller that needs
+ * to know WHICH branch applies (e.g. to decide whether to enumerate other
+ * affected stages) doesn't have to re-parse `resetAt` or duplicate the
+ * threshold lookup. An unknown/unparsable `resetAt` is never "far" — with no
+ * known reset time there is nothing to compare against the threshold.
+ */
+export function isQuotaResetBeyondThresholdV1(
+  resetAt: string | undefined,
+  now: Date = new Date(),
+  thresholdHoursOverride?: number
+): boolean {
+  if (!resetAt) {
+    return false;
+  }
+  const resetDate = new Date(resetAt);
+  if (Number.isNaN(resetDate.getTime())) {
+    return false;
+  }
+  const hoursUntilReset = (resetDate.getTime() - now.getTime()) / 3_600_000;
+  const thresholdHours =
+    thresholdHoursOverride ?? getResilienceSettings().quotaResetNearThresholdHours;
+  return hoursUntilReset > thresholdHours;
+}
+
+export function buildQuotaRemedyTextV1(
+  resetAt: string | undefined,
+  now: Date = new Date(),
+  thresholdHoursOverride?: number
+): string {
+  if (!resetAt) {
+    return QUOTA_REMEDY_UNKNOWN_RESET_TEXT_V1;
+  }
+  const resetDate = new Date(resetAt);
+  if (Number.isNaN(resetDate.getTime())) {
+    return QUOTA_REMEDY_UNKNOWN_RESET_TEXT_V1;
+  }
+  const localResetTime = resetDate.toLocaleString();
+  if (!isQuotaResetBeyondThresholdV1(resetAt, now, thresholdHoursOverride)) {
+    return (
+      `Rerun this stage after ${localResetTime}, once the limit lifts — Ensemble does not ` +
+      "auto-resume this stage yet, so retry manually once available. You can also switch the " +
+      "stage's model before rerunning."
+    );
+  }
+  return (
+    `This provider is expected to stay blocked until ${localResetTime} — switch the stage's ` +
+    "model before rerunning rather than waiting."
+  );
+}
+
+export function classifyFailure<T extends { errorMessage?: string; authDiagnosticText?: string; structuredQuotaSignal?: boolean }>(result: T): T & { failureKind: "quota" | "temporarily-unavailable" | "model-entitlement" | "generic" } {
   const message = (result.errorMessage ?? "").toLowerCase();
   // Quota first: a rate-limited request whose stream also dropped is a quota
   // event, and reporting it as a transport blip would retry straight back into
@@ -145,19 +431,46 @@ export function classifyFailure<T extends { errorMessage?: string; authDiagnosti
   // authDiagnosticText is absent for non-CLI callers (e.g. Copilot), which
   // fall back to errorMessage exactly as before.
   const isAuth = isAuthenticationFailure(result.authDiagnosticText ?? result.errorMessage);
+  // Checked before the auth gate (isAuth above already excludes entitlement
+  // phrasing itself — see isAuthenticationFailure) so a Bedrock/Vertex-style
+  // "not available for this account" message classifies as its own kind
+  // rather than falling through to "generic", which would suppress the
+  // backup cascade (runnerRegistry.ts) exactly when a different model id is
+  // the correct remedy.
+  const isEntitlement = isModelEntitlementFailure(result.authDiagnosticText ?? result.errorMessage);
   const failureKind = isQuotaError(result.errorMessage, result.structuredQuotaSignal)
     ? "quota" as const
-    : !isAuth && (
-        TEMPORARY_MARKERS.some(m => message.includes(m)) ||
-        message.includes(PROVIDER_PROMPT_TOO_LARGE_MARKER)
-      )
-      ? "temporarily-unavailable" as const
-      : "generic" as const;
+    : isEntitlement
+      ? "model-entitlement" as const
+      : !isAuth && (
+          TEMPORARY_MARKERS.some(m => message.includes(m)) ||
+          message.includes(PROVIDER_PROMPT_TOO_LARGE_MARKER)
+        )
+        ? "temporarily-unavailable" as const
+        : "generic" as const;
   return { ...result, failureKind };
 }
 
-export function classifyCliFailure<T extends { status: "completed" | "failed" | "cancelled"; errorMessage?: string; authDiagnosticText?: string }>(result: T): T & { failureKind: "quota" | "temporarily-unavailable" | "generic" } {
+export function classifyCliFailure<T extends { status: "completed" | "failed" | "cancelled"; errorMessage?: string; authDiagnosticText?: string }>(result: T): T & { failureKind: "quota" | "temporarily-unavailable" | "model-entitlement" | "generic" } {
   return classifyFailure(result);
+}
+
+/**
+ * The failure kinds a backup-model cascade may fire on: the primary is
+ * reachable and simply cannot serve this request right now (quota,
+ * temporary outage) or cannot serve THIS model id to this account
+ * (model-entitlement) — in every case a different model id is a legitimate
+ * remedy. "generic" (including auth) is deliberately excluded: nothing about
+ * switching models fixes a credentials problem or an unexplained failure.
+ */
+export function isCascadeEligibleFailureKind(
+  failureKind: "quota" | "temporarily-unavailable" | "model-entitlement" | "generic" | undefined
+): boolean {
+  return (
+    failureKind === "quota" ||
+    failureKind === "temporarily-unavailable" ||
+    failureKind === "model-entitlement"
+  );
 }
 
 export async function savePendingResume(context: vscode.ExtensionContext, request: AgentRunRequest): Promise<void> {
@@ -211,13 +524,22 @@ export async function handleQuotaFailure(context: vscode.ExtensionContext, reque
 // each time the extension host restarts — it is a live signal, not a
 // persisted ledger.
 
-export type QuotaState = "ok" | "exhausted" | "unavailable";
+export type QuotaState = "ok" | "exhausted" | "unavailable" | "entitlement-blocked";
 
 export interface QuotaObservation {
   state: QuotaState;
   observedAt: string;
   /** Only present when the provider explicitly reported a percentage. */
   remainingPercent?: number;
+  /**
+   * ISO instant the provider reported the limit will lift, parsed via
+   * parseQuotaResetV1. Only present when the failure message carried a
+   * recognizable reset time. This observation itself does not survive an
+   * extension-host restart (see the module doc comment above) — a durable,
+   * cross-restart record keyed by provider/account/model is tracked as
+   * remaining Part 5 work, not built here.
+   */
+  resetAt?: string;
 }
 
 const quotaObservations = new Map<string, QuotaObservation>();
@@ -226,25 +548,251 @@ function quotaKey(stage: TaskStage, modelId: string | undefined): string {
   return `${stage}::${modelId ?? "(default)"}`;
 }
 
+// ─── Cross-restart quota ledger (Part 5 step 2) ────────────────────────────
+//
+// `quotaObservations` above is a session-only signal, reset on every
+// extension-host restart (see its doc comment). This ledger is the durable
+// counterpart: a workspace-independent record in `ExtensionContext.
+// globalState`, keyed by provider + account/credential context + model id
+// (deliberately NOT model id alone — two accounts sharing a model id, e.g.
+// two Bedrock profiles both able to select the same Claude model id, must
+// never contaminate each other's recorded quota state).
+//
+// `context` is threaded as an explicit parameter, mirroring the existing
+// pattern already used by `savePendingResume`/`getPendingResume`/
+// `handleQuotaFailure` in this same file. It is optional: a caller with no
+// natural access to an `ExtensionContext` in scope may omit it, in which case
+// only the in-memory `quotaObservations` map is updated. In practice every
+// production call site inside runnerRegistry.ts supplies one via
+// `getExtensionContextV1()` (`src/utils/extensionContextV1.ts`) — a
+// process-wide accessor set once by `activate()`, used here specifically
+// because those call sites sit many layers deep in the V1 action-
+// coordinator/execution-broker call graph, where threading an explicit
+// parameter through every intervening signature would be a large, unrelated
+// refactor. The optional-parameter shape is kept (rather than reading the
+// singleton directly inside this file) so unit tests can still exercise the
+// explicit-context path without touching the singleton at all.
+
+const QUOTA_LEDGER_GLOBAL_STATE_KEY = "ensembleQuotaLedgerV1";
+
+/** One durable ledger entry, keyed by provider+account+model (see quotaLedgerKey). */
+export interface QuotaLedgerEntryV1 {
+  failureKind: "quota" | "temporarily-unavailable" | "model-entitlement";
+  /** ISO instant the provider reported the limit will lift, when known. */
+  resetAt?: string;
+  /** ISO instant this entry was last written. */
+  observedAt: string;
+}
+
+type QuotaLedgerV1 = Record<string, QuotaLedgerEntryV1>;
+
+/**
+ * Keys the ledger by provider + account/credential context + model id.
+ * `accountKey` is whatever real account/credential identifier the caller has
+ * on hand (e.g. `providerAccountIdForModelId`'s result) — when none is
+ * available, callers pass `undefined` and this falls back to a documented
+ * `"(default)"` placeholder rather than inventing fake plumbing.
+ */
+export function quotaLedgerKey(
+  providerId: string,
+  accountKey: string | undefined,
+  modelId: string
+): string {
+  return `${providerId}::${accountKey ?? "(default)"}::${modelId}`;
+}
+
+function readQuotaLedger(context: vscode.ExtensionContext): QuotaLedgerV1 {
+  return context.globalState.get<QuotaLedgerV1>(QUOTA_LEDGER_GLOBAL_STATE_KEY, {});
+}
+
+async function writeQuotaLedger(
+  context: vscode.ExtensionContext,
+  ledger: QuotaLedgerV1
+): Promise<void> {
+  await context.globalState.update(QUOTA_LEDGER_GLOBAL_STATE_KEY, ledger);
+}
+
+/**
+ * Per-context write queue: `Memento.update`'s returned promise tracks disk
+ * persistence, not ordering, so two overlapping `await context.globalState
+ * .update(...)` calls for the SAME context race — whichever disk write lands
+ * last wins, even if it started from a now-stale read. This queue makes every
+ * `updateQuotaLedger` mutation for a given context a strict FIFO: `mutate` is
+ * not invoked until every earlier-enqueued write for that context has fully
+ * landed, so it always sees the result of the previous mutation rather than a
+ * read taken before it. A `WeakMap` keyed on the context itself needs no
+ * explicit teardown — entries drop out with the context.
+ */
+const quotaLedgerWriteQueues = new WeakMap<vscode.ExtensionContext, Promise<void>>();
+
+function enqueueQuotaLedgerWrite(
+  context: vscode.ExtensionContext,
+  mutate: (ledger: QuotaLedgerV1) => QuotaLedgerV1 | undefined
+): Promise<void> {
+  const previous = quotaLedgerWriteQueues.get(context) ?? Promise.resolve();
+  const next = previous.catch(() => {}).then(async () => {
+    const ledger = readQuotaLedger(context);
+    const mutated = mutate(ledger);
+    if (mutated === undefined) {
+      return;
+    }
+    await writeQuotaLedger(context, mutated);
+  });
+  quotaLedgerWriteQueues.set(context, next);
+  return next;
+}
+
+/** Read a single ledger entry, or `undefined` if none is recorded for this key. */
+export function getQuotaLedgerEntry(
+  context: vscode.ExtensionContext,
+  providerId: string,
+  accountKey: string | undefined,
+  modelId: string
+): QuotaLedgerEntryV1 | undefined {
+  return readQuotaLedger(context)[quotaLedgerKey(providerId, accountKey, modelId)];
+}
+
+/**
+ * Enumerate every currently-parked ledger entry (quota/model-entitlement
+ * blocks the ledger's own clearing rules haven't retired) — the read side
+ * for a settings-panel surface, since `getQuotaLedgerEntry` requires already
+ * knowing which provider+account+model to ask about. `quotaLedgerKey`'s
+ * `::`-joined format is parsed back apart here rather than storing the parts
+ * redundantly in each entry.
+ */
+export function listParkedQuotaLedgerEntriesV1(
+  context: vscode.ExtensionContext
+): Array<QuotaLedgerEntryV1 & { providerId: string; accountKey: string; modelId: string }> {
+  const ledger = readQuotaLedger(context);
+  return Object.entries(ledger).map(([key, entry]) => {
+    const [providerId = "", accountKey = "", modelId = ""] = key.split("::");
+    return { ...entry, providerId, accountKey, modelId };
+  });
+}
+
+/**
+ * Update (or clear) the durable ledger entry for one provider+account+model.
+ *
+ * Clearing rules (deliberately NOT time-based — a reset time merely passing
+ * is a prediction, not a confirmation):
+ *  - a later successful/generic-failure observation ("ok", i.e. `failureKind`
+ *    is `undefined` or `"generic"`) clears the entry — the provider is
+ *    reachable again;
+ *  - a contradicting fresh observation of a DIFFERENT non-quota/entitlement
+ *    kind (`"temporarily-unavailable"`) also clears it, since it is no
+ *    longer known to be quota/entitlement-blocked;
+ *  - a quota/model-entitlement observation writes/overwrites the entry.
+ */
+async function updateQuotaLedger(
+  context: vscode.ExtensionContext,
+  providerId: string,
+  accountKey: string | undefined,
+  modelId: string,
+  failureKind: "quota" | "temporarily-unavailable" | "model-entitlement" | "generic" | undefined,
+  resetAt: string | undefined,
+  observedAt: string
+): Promise<void> {
+  // Routed through the per-context write queue (see enqueueQuotaLedgerWrite)
+  // rather than reading/mutating/writing directly: two `updateQuotaLedger`
+  // calls for the same context — e.g. a primary and a backup observation
+  // recorded moments apart in the same cascade — must apply in call order
+  // against each other's result, not race a read taken before either
+  // committed.
+  const key = quotaLedgerKey(providerId, accountKey, modelId);
+  await enqueueQuotaLedgerWrite(context, (ledger) => {
+    if (failureKind === "quota" || failureKind === "model-entitlement") {
+      return { ...ledger, [key]: { failureKind, resetAt, observedAt } };
+    }
+    if (key in ledger) {
+      // "ok" (undefined/generic) or a contradicting "temporarily-unavailable"
+      // observation both clear a previously-parked entry.
+      const { [key]: _removed, ...rest } = ledger;
+      return rest;
+    }
+    return undefined;
+  });
+}
+
 /**
  * Record what a completed run revealed about a stage+model's quota state.
  * Called after every run that has a `failureKind` classification (quota or
  * generic) or completed successfully — anything other than "quota" means the
  * provider was reachable and not currently blocked by quota exhaustion.
+ *
+ * `context`, when supplied, additionally updates the cross-restart
+ * globalState ledger (see the "Cross-restart quota ledger" section above) —
+ * omit it to preserve exactly today's session-only behavior. `resetAtOverride`
+ * lets a caller that already has a more authoritative parsed reset time
+ * supply it directly; when absent, the reset time is parsed internally from
+ * `errorMessage` exactly as before (today's only caller shape).
+ *
+ * Returns the ledger write's promise (resolved immediately with no `context`,
+ * or no ledger-affecting change). The in-memory `quotaObservations` map is
+ * always updated synchronously before this function returns, so callers that
+ * only need the session-observed signal may safely ignore the return value
+ * exactly as before; a caller that specifically needs the durable write to
+ * have landed (e.g. a test asserting restart survival, or a future caller
+ * that must not proceed until the park is durable) can await it.
  */
 export function recordQuotaObservation(
   stage: TaskStage,
   modelId: string | undefined,
-  failureKind: "quota" | "temporarily-unavailable" | "generic" | undefined,
-  errorMessage?: string
-): void {
+  failureKind: "quota" | "temporarily-unavailable" | "model-entitlement" | "generic" | undefined,
+  errorMessage?: string,
+  context?: vscode.ExtensionContext,
+  resetAtOverride?: string,
+  // Review completion blocker: the account/credential key previously wasn't
+  // resolved until AFTER the run it describes had already completed — so if
+  // the user edited `ensemble.providerAccountLabels` while the run was in
+  // flight, this call's ledger write and the caller's own pre-dispatch
+  // identity (e.g. a `quotaParkRecord` stamped before the run started) could
+  // disagree about which account the SAME attempt belongs to. Callers that
+  // already resolved the account key before dispatching pass it here so the
+  // ledger write always uses the identity that was true when the attempt was
+  // actually made; omitted only by call sites with no pre-dispatch identity
+  // of their own, which keep today's resolve-at-write-time behavior.
+  accountKeyOverride?: string
+): Promise<void> {
   const percentMatch = /(?:remaining|left|available)[^\d]{0,12}(\d{1,3})\s*%/i.exec(errorMessage ?? "");
   const parsedPercent = percentMatch ? Number(percentMatch[1]) : undefined;
+  // A reset time only means anything for a quota exhaustion; parsing it out
+  // of an unrelated generic/entitlement message risks a coincidental "in N
+  // ..." match being presented as a meaningful resume time.
+  const resetAt =
+    resetAtOverride ??
+    (failureKind === "quota" ? parseQuotaResetV1(errorMessage, new Date()) : undefined);
+  const observedAt = new Date().toISOString();
   quotaObservations.set(quotaKey(stage, modelId), {
-    state: failureKind === "quota" ? "exhausted" : failureKind === "temporarily-unavailable" ? "unavailable" : "ok",
-    observedAt: new Date().toISOString(),
+    state:
+      failureKind === "quota"
+        ? "exhausted"
+        : failureKind === "temporarily-unavailable"
+          ? "unavailable"
+          // A model this account cannot use at all must never read as "OK" —
+          // that reading is what previously sent an operator back to the
+          // provider's own re-login flow for a problem no re-login can fix.
+          : failureKind === "model-entitlement"
+            ? "entitlement-blocked"
+            : "ok",
+    observedAt,
     ...(parsedPercent !== undefined && parsedPercent <= 100 ? { remainingPercent: parsedPercent } : {}),
+    ...(resetAt !== undefined ? { resetAt } : {}),
   });
+  if (context && modelId) {
+    const providerId = parseModelSelection(modelId).provider;
+    const accountKey = accountKeyOverride ?? resolveQuotaAccountKeyV1(modelId);
+    // Most call sites throughout runnerRegistry.ts still don't await this —
+    // the in-memory map above is always updated synchronously first, so the
+    // session-observed signal is never blocked on the durable write. But the
+    // write itself is no longer fire-and-forget in the sense of "may be
+    // lost or reordered": `updateQuotaLedger` queues onto a per-context
+    // promise chain (see enqueueQuotaLedgerWrite) so concurrent observations
+    // for the same context apply in call order rather than racing a
+    // read-modify-write, and the promise is returned here so a caller that
+    // needs the write to have landed before proceeding can await it.
+    return updateQuotaLedger(context, providerId, accountKey, modelId, failureKind, resetAt, observedAt);
+  }
+  return Promise.resolve();
 }
 
 export function getQuotaObservation(
@@ -261,10 +809,14 @@ export function formatQuotaStatus(observation: QuotaObservation | undefined): st
   }
   const time = new Date(observation.observedAt).toLocaleTimeString();
   const percent = observation.remainingPercent === undefined ? "" : ` (${observation.remainingPercent}% remaining)`;
+  const resetSuffix =
+    observation.resetAt === undefined ? "" : ` — resets ${new Date(observation.resetAt).toLocaleString()}`;
   return observation.state === "exhausted"
-    ? `Quota exhausted as of ${time}${percent}`
+    ? `Quota exhausted as of ${time}${percent}${resetSuffix}`
     : observation.state === "unavailable"
       ? `Unavailable as of ${time}`
+      : observation.state === "entitlement-blocked"
+        ? `Not available for this account as of ${time}`
     : `OK as of ${time}${percent}`;
 }
 

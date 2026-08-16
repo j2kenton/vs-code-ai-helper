@@ -65,9 +65,67 @@ const STANDALONE_MARKER_LINE = new RegExp(
  */
 export const NO_CHECKLIST_CHANGE_MARKER_V1 = "<!-- ensemble:no-checklist-change -->";
 
+/**
+ * The marker on a line of its own — the only form that counts as an actual
+ * declaration, mirroring `STANDALONE_MARKER_LINE`'s identical fix for
+ * `IMPLEMENTATION_CHECKLIST_MARKER`.
+ *
+ * A response's echoed checklist can legitimately QUOTE this marker inside an
+ * item's own descriptive text — this repo's own plan does, in the very item
+ * describing this mechanism ("Treat a summary that both declares
+ * `<!-- ensemble:no-checklist-change -->` and supplies retroactive/done
+ * claims as self-contradictory"). A bare substring match over the whole
+ * response read that quoted mention as the round's own declaration and
+ * rejected an otherwise-valid response that echoed the checklist correctly
+ * and reported genuine retroactive completions elsewhere (review finding,
+ * 2026-08-14). Requiring the marker on its own line is the same fix
+ * `STANDALONE_MARKER_LINE` already applies for the checklist-rendering marker.
+ */
+const NO_CHECKLIST_CHANGE_STANDALONE_LINE = new RegExp(
+  `^[ \\t]*${NO_CHECKLIST_CHANGE_MARKER_V1.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}[ \\t]*\\r?$`
+);
+
 /** True when `response` declares, via the marker above, that no checkbox state changed this round. */
 export function declaresNoChecklistChangeV1(response: string): boolean {
-  return response.includes(NO_CHECKLIST_CHANGE_MARKER_V1);
+  return walkLinesV1(response).some(
+    (line) => !line.fenced && NO_CHECKLIST_CHANGE_STANDALONE_LINE.test(line.text)
+  );
+}
+
+/**
+ * True when `content` both declares `NO_CHECKLIST_CHANGE_MARKER_V1` ("nothing
+ * to tick") and ALSO reports at least one {@link RETROACTIVE_TICK_MARKER_V1}
+ * claim in its own `## Plan Item Checklist` section — a round that wants
+ * checklist state to change while explicitly declaring it does not.
+ *
+ * Confirmed live (round 013, task "1.9", 2026-08-14): the round declared the
+ * marker, then listed dozens of retroactive completions for Parts 1-3 with
+ * PARAPHRASED item text ("`.model-combo-input` small font + reduced padding"
+ * against the plan's actual "In the webview `<style>`, set `.model-combo-input`
+ * to `font-size: ...` and reduce its vertical padding..."). The retroactive-
+ * claim mechanism itself worked exactly as designed — exact-text matching
+ * correctly refused to guess that a paraphrase meant the same item — so the
+ * merge legitimately returned "no-match", but the marker already satisfied
+ * `checklistEchoPresent`, so the round was silently accepted as complete with
+ * only a warning notification. No merge/scoping bug was found; the missing
+ * guard is this contradiction itself, caught BEFORE the merge runs so the
+ * round is rejected and retried with either a real echo or a genuinely empty
+ * claim, rather than completing while its claimed progress silently evaporates.
+ *
+ * The declaration check requires the marker on its OWN line
+ * (`declaresNoChecklistChangeV1`), and the claims check is scoped to `own`
+ * (`splitSummaryAtEchoV1`'s post-echo region) — the same scope
+ * `collectRetroactiveTickClaimsV1` already reads. Together they mean a plan
+ * that merely quotes either marker inside a checklist item's descriptive text
+ * can never trigger this on its own.
+ */
+export function hasContradictoryNoChecklistChangeClaimV1(content: string): boolean {
+  const trimmed = content.trim();
+  if (!declaresNoChecklistChangeV1(trimmed)) {
+    return false;
+  }
+  const { own } = splitSummaryAtEchoV1(trimmed);
+  return collectRetroactiveTickClaimsV1(own).length > 0;
 }
 
 /**

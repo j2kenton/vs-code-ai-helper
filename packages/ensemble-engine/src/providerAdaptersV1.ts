@@ -10,7 +10,11 @@
  * Failure text is written so `classifyEngineProviderFailureV1` reaches the
  * same verdicts the extension's cascade gates rely on:
  *  - HTTP 401/403 → `authFailure: true` plus explicit auth wording (terminal
- *    for the provider; never spends a backup allocation);
+ *    for the provider; never spends a backup allocation) — UNLESS the body
+ *    carries model-entitlement phrasing (e.g. Bedrock's "is not available
+ *    for this account"), in which case `authFailure` is left unset and the
+ *    provider's own remediation text is preserved instead (cascade-eligible;
+ *    a backup model, by definition a different model id, is a legitimate fix);
  *  - HTTP 429 → "rate limit" wording (quota; cascade-eligible);
  *  - HTTP 5xx/529 → "temporarily unavailable" wording (cascade-eligible);
  *  - a thrown fetch → the raw transport error text ("fetch failed",
@@ -23,6 +27,7 @@
  * so a logged failure can never leak a credential.
  */
 import { EngineProviderIdV1, getEngineProviderV1 } from "./providerCatalogV1";
+import { isModelEntitlementFailureV1 } from "./failureClassificationV1";
 
 /** Minimal fetch shape so tests and hosts can inject their own transport. */
 export interface FetchResponseLikeV1 {
@@ -100,6 +105,20 @@ function httpFailure(
   const snippet = bodySnippet(body, apiKey);
   const detail = snippet.length > 0 ? ` ${snippet}` : "";
   if (status === 401 || status === 403) {
+    // A 401/403 whose body reads as a model-entitlement refusal (e.g.
+    // Bedrock's "anthropic.claude-sonnet-5 is not available for this
+    // account") is NOT an authentication failure: the credential is valid
+    // and the request reached the provider, which simply refuses to serve
+    // THIS model id to THIS account. authFailure must stay unset so the
+    // dispatch cascade can try a backup model id — the provider's own
+    // remediation text (already captured in `detail`) is preserved verbatim
+    // rather than replaced with a login hint that can never fix this.
+    if (isModelEntitlementFailureV1(snippet)) {
+      return {
+        status: "failed",
+        errorMessage: `${label} does not have access to this model for the configured API key (HTTP ${status}).${detail}`,
+      };
+    }
     return {
       status: "failed",
       authFailure: true,

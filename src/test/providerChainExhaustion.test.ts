@@ -26,9 +26,11 @@ import {
   writeReviewRunLogV1,
 } from "../commands/reviewActions";
 import {
+  clearQuotaParkV1,
   pauseTaskWithReason,
   updateTaskStatus,
 } from "../utils/taskProgressTransforms";
+import { QuotaParkRecordV1 } from "../types/taskProgress";
 import {
   initNotificationRouter,
   deactivateNotificationRouter,
@@ -161,6 +163,25 @@ async function withHarness(run: () => Promise<void>): Promise<void> {
   }
 }
 
+/** A chain exhausted because the primary candidate hit a quota block. */
+const QUOTA_EXHAUSTION: ProviderChainExhaustionV1 = {
+  stage: "impl-high-review",
+  candidates: [
+    {
+      storedModelId: "claude-cli:sonnet",
+      providerLabel: "Claude Code",
+      runnerId: "claude-cli",
+      reason: "You've hit your session limit · resets 12:10am (Asia/Jerusalem)",
+    },
+    {
+      storedModelId: "kimi-cli:k3",
+      providerLabel: "Kimi CLI",
+      runnerId: "kimi-cli",
+      reason: "authentication failure: not logged in",
+    },
+  ],
+};
+
 void describe("provider chain exhaustion (stage owner)", () => {
   void it("pauses the task with a reason naming the stage and exhausted chain, bumping updatedAt", async () => {
     const { folderPath, folderUri } = makeTaskFolder("exhausted_pause");
@@ -180,6 +201,35 @@ void describe("provider chain exhaustion (stage owner)", () => {
       "2026-01-01T00:00:00.000Z",
       "updatedAt must be bumped so the task stops presenting as freshly active"
     );
+  });
+
+  void it("records a durable quotaParkRecord when a candidate's reason was a quota block", async () => {
+    const { folderPath, folderUri } = makeTaskFolder("exhausted_quota_park");
+    await withHarness(async () => {
+      await pauseTaskForExhaustedChainV1(folderUri, "impl-high-review", QUOTA_EXHAUSTION);
+    });
+
+    const persisted = readProgress(folderPath);
+    assert.equal(persisted.status, "paused");
+    assert.ok(persisted.quotaParkRecord, "expected a quotaParkRecord to be persisted");
+    assert.equal(persisted.quotaParkRecord?.modelId, "claude-cli:sonnet");
+    assert.equal(persisted.quotaParkRecord?.providerId, "claude-cli");
+    assert.equal(persisted.quotaParkRecord?.failureKind, "quota");
+    assert.ok(
+      persisted.quotaParkRecord?.resetAt,
+      "the 12:10am reset phrase should have parsed to a resetAt"
+    );
+  });
+
+  void it("leaves quotaParkRecord unset when no candidate's reason was quota/entitlement-shaped", async () => {
+    const { folderPath, folderUri } = makeTaskFolder("exhausted_no_quota_park");
+    await withHarness(async () => {
+      await pauseTaskForExhaustedChainV1(folderUri, "impl-high-review", EXHAUSTION);
+    });
+
+    const persisted = readProgress(folderPath);
+    assert.equal(persisted.status, "paused");
+    assert.equal(persisted.quotaParkRecord, undefined);
   });
 
   void it("writes an enriched run record naming the exhausted chain and per-candidate reasons", async () => {
@@ -275,4 +325,77 @@ void describe("pausedReason lifecycle (transforms)", () => {
     const paused = updateTaskStatus(BASE, "paused");
     assert.equal(paused.pausedReason, undefined);
   });
+
+  const PARK_RECORD: QuotaParkRecordV1 = {
+    modelId: "claude-cli:sonnet",
+    providerId: "claude-cli",
+    failureKind: "quota",
+    observedAt: "2026-01-01T00:00:00.000Z",
+  };
+
+  void it(
+    "review completion blocker: resuming a quota-parked task (paused -> active) does NOT clear quotaParkRecord — resume is not fresh evidence the block resolved",
+    () => {
+      const paused = pauseTaskWithReason(BASE, "quota exhausted", PARK_RECORD);
+      const resumed = updateTaskStatus(paused, "active");
+      assert.equal(resumed.status, "active");
+      assert.deepEqual(resumed.quotaParkRecord, PARK_RECORD);
+    }
+  );
+
+  void it(
+    "a later, unrelated pause with no record of its own clears a stale quotaParkRecord from an earlier pause",
+    () => {
+      const paused = pauseTaskWithReason(BASE, "quota exhausted", PARK_RECORD);
+      const resumed = updateTaskStatus(paused, "active");
+      const repaused = pauseTaskWithReason(resumed, "unrelated: no provider available");
+      assert.equal(repaused.quotaParkRecord, undefined);
+    }
+  );
+
+  void it("clearQuotaParkV1 is the only mechanism that retires a record while the task stays active", () => {
+    const paused = pauseTaskWithReason(BASE, "quota exhausted", PARK_RECORD);
+    const resumed = updateTaskStatus(paused, "active");
+    assert.deepEqual(resumed.quotaParkRecord, PARK_RECORD);
+    const cleared = clearQuotaParkV1(resumed);
+    assert.equal(cleared.quotaParkRecord, undefined);
+  });
+
+  void it(
+    "review completion blocker: clearQuotaParkV1 leaves a record in place when the given identity's model/provider does not match it",
+    () => {
+      const paused = pauseTaskWithReason(BASE, "quota exhausted", PARK_RECORD);
+      const resumed = updateTaskStatus(paused, "active");
+      const untouched = clearQuotaParkV1(resumed, {
+        providerId: "codex-cli",
+        modelId: "codex-cli:gpt-5.6-sol",
+      });
+      assert.deepEqual(untouched.quotaParkRecord, PARK_RECORD);
+    }
+  );
+
+  void it("clearQuotaParkV1 clears when the given identity's provider and model match the record", () => {
+    const paused = pauseTaskWithReason(BASE, "quota exhausted", PARK_RECORD);
+    const resumed = updateTaskStatus(paused, "active");
+    const cleared = clearQuotaParkV1(resumed, {
+      providerId: PARK_RECORD.providerId,
+      modelId: PARK_RECORD.modelId,
+    });
+    assert.equal(cleared.quotaParkRecord, undefined);
+  });
+
+  void it(
+    "clearQuotaParkV1 leaves a record in place when accountKey is known on both sides and differs",
+    () => {
+      const recordWithAccount: QuotaParkRecordV1 = { ...PARK_RECORD, accountKey: "account-a" };
+      const paused = pauseTaskWithReason(BASE, "quota exhausted", recordWithAccount);
+      const resumed = updateTaskStatus(paused, "active");
+      const untouched = clearQuotaParkV1(resumed, {
+        providerId: recordWithAccount.providerId,
+        modelId: recordWithAccount.modelId,
+        accountKey: "account-b",
+      });
+      assert.deepEqual(untouched.quotaParkRecord, recordWithAccount);
+    }
+  );
 });

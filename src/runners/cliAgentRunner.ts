@@ -22,7 +22,7 @@ import { createCliStdoutResultCaptureV1 } from "../services/cliStdoutResultCaptu
 import { withAttribution, writeTextFile } from "../utils/fileUtils";
 import { ImplementationRunResult } from "./copilotImplementationRunner";
 import { cliDisplayLabel, CliProviderDefinition, CliRunMode } from "./providers";
-import { classifyCliFailure, isAuthenticationFailure, isTransportError } from "../utils/quota";
+import { classifyCliFailure, isAuthenticationFailure, isModelEntitlementFailure, isTransportError } from "../utils/quota";
 import { getResilienceSettings } from "../config/settings";
 import { writeRunLog } from "../utils/runLog";
 import { taskOperations } from "../utils/taskOperations";
@@ -291,7 +291,7 @@ export interface CliExecResult {
   output: string;
   errorMessage?: string;
   /** Set on failed results; absent for completed/cancelled. */
-  failureKind?: "quota" | "temporarily-unavailable" | "generic";
+  failureKind?: "quota" | "temporarily-unavailable" | "model-entitlement" | "generic";
   /**
    * True when the failure is a transient transport-level condition — a run
    * timeout, or a mid-stream transport drop — that is in principle retryable.
@@ -329,6 +329,15 @@ export interface CliExecResult {
    * continuation intentionally keeps prior context and partial workspace edits.
    */
   resumeConversation?: boolean;
+  /**
+   * Part 7: which watchdog produced a timed-out result, when applicable.
+   * "wall-clock" is the flat RUN_TIMEOUT_MS cap; "inactivity" fired earlier
+   * because the process produced no stdout/stderr/raw-transport bytes for
+   * ensemble.resilience.inactivityTimeoutMinutes. Absent for non-timeout
+   * failures. Downstream recovery routing and run records use this to tell a
+   * wedged process apart from a genuinely long-running one.
+   */
+  timeoutReason?: "wall-clock" | "inactivity";
 }
 
 /**
@@ -406,6 +415,18 @@ function isTextModeGuaranteedReadOnly(def: CliProviderDefinition): boolean {
 }
 
 /**
+ * Exported capability probe for the summary-only recovery continuation
+ * (workflow-robustness Part 2 item 4): whether this provider's text mode is
+ * vendor-enforced read-only, i.e. dispatching a continuation through it
+ * actually WITHHOLDS edit permissions rather than merely instructing the
+ * model not to edit. Same rule `shouldRetryReadOnlyRun`'s free-retry gate
+ * relies on — see `isTextModeGuaranteedReadOnly` directly above.
+ */
+export function isCliTextModeGuaranteedReadOnlyV1(def: CliProviderDefinition): boolean {
+  return isTextModeGuaranteedReadOnly(def);
+}
+
+/**
  * Promote a mid-stream transport drop from "generic" (terminal at both backup
  * cascade gates) to "temporarily-unavailable" (cascade-eligible) — but only
  * where doing so is actually safe. See the guards below for what "safe"
@@ -415,7 +436,7 @@ function isTextModeGuaranteedReadOnly(def: CliProviderDefinition): boolean {
  * one with the provider and mode context needed to gate it correctly.
  */
 function applyTransportTransience(
-  result: CliExecResult & { failureKind: "quota" | "temporarily-unavailable" | "generic" },
+  result: CliExecResult & { failureKind: "quota" | "temporarily-unavailable" | "model-entitlement" | "generic" },
   friendly: CliFriendlyError,
   mode: CliRunMode,
   def: CliProviderDefinition
@@ -1907,6 +1928,12 @@ export function createCliTextTransportV1(options: {
           const structuredStream = def.structuredEventStream !== undefined;
           const rawEventChunks: Buffer[] = [];
           let rawEventBytes = 0;
+          // Part 7: last time ANY raw byte arrived on stdout or stderr. Keyed
+          // off raw chunk arrival rather than onProgress/capture callbacks,
+          // since structured providers buffer everything until close and
+          // never call onProgress mid-run — this transport has no other
+          // activity signal.
+          let lastActivityAt = Date.now();
 
           // Same shell-quoting rule as execCliAgent: with shell:true Node
           // joins argv with plain spaces, so multi-word values must be
@@ -1945,6 +1972,9 @@ export function createCliTextTransportV1(options: {
             }
             settled = true;
             clearTimeout(timeoutHandle);
+            if (inactivityCheckHandle) {
+              clearInterval(inactivityCheckHandle);
+            }
             cancellationListener.dispose();
             cleanupPromptFile();
             resolve(exit);
@@ -1954,6 +1984,26 @@ export function createCliTextTransportV1(options: {
             killProcessTree(child);
             finish({ kind: "transportFailure", code: "cliRunTimeout" });
           }, RUN_TIMEOUT_MS);
+
+          // Part 7 inactivity watchdog: mirrors execCliAgent's — kills a
+          // process producing zero bytes long before the flat wall-clock cap,
+          // with a distinct transportFailure code ("cliRunInactivityTimeout")
+          // so the caller (and the run record) can tell a wedged process
+          // apart from a genuinely long-running one. 0 disables it.
+          const inactivityLimitMinutes = getResilienceSettings().inactivityTimeoutMinutes;
+          const inactivityLimitMs = inactivityLimitMinutes * 60_000;
+          const inactivityCheckHandle =
+            inactivityLimitMinutes > 0
+              ? setInterval(() => {
+                  if (settled) {
+                    return;
+                  }
+                  if (Date.now() - lastActivityAt >= inactivityLimitMs) {
+                    killProcessTree(child);
+                    finish({ kind: "transportFailure", code: "cliRunInactivityTimeout" });
+                  }
+                }, 15_000)
+              : undefined;
 
           const cancellationListener = request.cancellationToken.onCancellationRequested(() => {
             cancelled = true;
@@ -1966,6 +2016,7 @@ export function createCliTextTransportV1(options: {
           });
 
           child.stdout?.on("data", (chunk: Buffer) => {
+            lastActivityAt = Date.now();
             if (!structuredStream) {
               capture.handleStdout(chunk);
               return;
@@ -1986,6 +2037,7 @@ export function createCliTextTransportV1(options: {
             rawEventChunks.push(Buffer.from(chunk));
           });
           child.stderr?.on("data", (chunk: Buffer) => {
+            lastActivityAt = Date.now();
             capture.handleStderr(chunk);
           });
 
@@ -2058,6 +2110,7 @@ export const __testOnly = {
   toFriendlyError,
   truncateCliDetail,
   stripHookLifecycleNoiseV1,
+  stripKnownBenignCliNoiseV1,
 };
 
 /**
@@ -2148,6 +2201,58 @@ function stripHookLifecycleNoiseV1(text: string): string {
   return remainder.length > 0 ? filtered.join("\n") : text;
 }
 
+/**
+ * Part 6: CLI error lines that are known to be benign noise, never proof of
+ * an actual failure — observed appearing on fully-successful (exit 0) runs
+ * as well as failed ones. When one of these is the ONLY diagnosable content
+ * on a failed run, presenting it verbatim as "the" failure cause is a red
+ * herring: it sends the user chasing a known non-problem while the real
+ * cause (hang, crash, timeout) leaves no trace. Matched by regex against a
+ * single line (or a whole re-serialized JSON line, which still contains the
+ * phrase as a substring) so both the structured-event path and the raw
+ * unparsed/JSON-leak fallback path are covered by the same list.
+ */
+const KNOWN_BENIGN_CLI_ERROR_SIGNATURES_V1: ReadonlyArray<{
+  readonly pattern: RegExp;
+  readonly hint: string;
+}> = [
+  {
+    pattern: /hook dispatch failed: session\.hook requires a valid hook event payload/i,
+    hint:
+      "a known Cline shutdown-race artifact (cline/cline#11821), often cleared by " +
+      "`cline doctor fix` or restarting the local hub daemon",
+  },
+];
+
+/**
+ * Strips lines matching a known-benign signature out of `text`. Returns the
+ * remaining (real) content, plus the first matched signature's hint IFF
+ * every line was noise — i.e. nothing real survived the filter. When real
+ * content coexists with noise, the hint is omitted and only the real
+ * content is returned, per the "surface the real content" rule.
+ */
+function stripKnownBenignCliNoiseV1(text: string): { filtered: string; hint?: string } {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return { filtered: text };
+  }
+  const lines = trimmed.split(/\r?\n/);
+  const realLines: string[] = [];
+  let matchedHint: string | undefined;
+  for (const line of lines) {
+    const signature = KNOWN_BENIGN_CLI_ERROR_SIGNATURES_V1.find(({ pattern }) => pattern.test(line));
+    if (signature) {
+      matchedHint = matchedHint ?? signature.hint;
+      continue;
+    }
+    realLines.push(line);
+  }
+  if (realLines.length === 0 && matchedHint) {
+    return { filtered: "", hint: matchedHint };
+  }
+  return { filtered: realLines.join("\n") };
+}
+
 function toFriendlyError(
   def: CliProviderDefinition,
   model: string | undefined,
@@ -2216,9 +2321,18 @@ function toFriendlyError(
   // itself), not a place the model narrates or echoes file content — so it
   // is safe to scan even for opaque providers, and is what still catches a
   // marker-list gap like a bare "403 Forbidden" in stderr.
+  // Checked first: a model-entitlement refusal (the credential is valid, the
+  // account simply lacks access to THIS model id — e.g. Bedrock's "...is not
+  // available for this account") often also carries "403"/"forbidden"
+  // wording that def.authErrorMarkers or the broad regex below would
+  // otherwise read as auth. A re-login hint can never fix an entitlement
+  // block, so it must never classify as authFailure regardless of which
+  // provider-specific marker matches.
+  const entitlementFailure = isModelEntitlementFailure(structured ? scanSource : stderr);
   const authFailure =
-    def.authErrorMarkers.some((marker) => combined.includes(marker)) ||
-    isAuthenticationFailure(structured ? scanSource : stderr);
+    !entitlementFailure &&
+    (def.authErrorMarkers.some((marker) => combined.includes(marker)) ||
+      isAuthenticationFailure(structured ? scanSource : stderr));
 
   // Fallback order for structured providers: parsed error-event text (which
   // already folds in trailing unparsed content — see
@@ -2226,20 +2340,39 @@ function toFriendlyError(
   // stream that DID fully parse as recognized events is never dumped raw;
   // dumping it is what leaked file contents and thousands of characters of
   // tool-call JSON into user-facing errors in the first place.
+  // Part 6: filter known-benign noise (e.g. Cline's session.hook dispatch
+  // line) out of every candidate diagnostic source before it can become the
+  // presented cause. When filtering leaves nothing real anywhere, fall back
+  // to an honest "exit code N / no diagnostic output" plus whichever
+  // signature's remediation hint matched, instead of the raw noise line.
+  const filteredStructuredDetail = structured
+    ? stripKnownBenignCliNoiseV1(structured.detail)
+    : undefined;
+  const filteredStderr = stripKnownBenignCliNoiseV1(stderr);
+  const filteredStdout = stripKnownBenignCliNoiseV1(stdout);
+  const realDiagnosticContent = structured
+    ? truncateCliDetail(filteredStructuredDetail!.filtered) ||
+      truncateCliDetail(filteredStderr.filtered)
+    : truncateCliDetail(filteredStderr.filtered) || truncateCliDetail(filteredStdout.filtered);
+  const benignNoiseHint =
+    filteredStructuredDetail?.hint ?? filteredStderr.hint ?? filteredStdout.hint;
   const diagnosticText =
     diagnosticTextOverride ??
     `${cliDisplayLabel(def)} CLI failed: ${
-      structured
-        ? truncateCliDetail(structured.detail) ||
-          truncateCliDetail(stderr) ||
-          `exit code ${exitCode ?? "unknown"}`
-        : truncateCliDetail(stderr) ||
-          truncateCliDetail(stdout) ||
-          `exit code ${exitCode ?? "unknown"}`
+      realDiagnosticContent ||
+      (benignNoiseHint
+        ? `exit code ${exitCode ?? "unknown"} / no diagnostic output (${benignNoiseHint})`
+        : `exit code ${exitCode ?? "unknown"}`)
     }`;
+  // No re-login hint for an entitlement block — the credential already
+  // works. Advise switching the stage's model instead; the provider's own
+  // "explore other available models" text (when present) already lives in
+  // diagnosticText above and is kept, not replaced.
   const authSuffix = authFailure
     ? ` ${def.loginHintForModel?.(model) ?? def.loginHint}`
-    : "";
+    : entitlementFailure
+      ? " Switch this stage's model to one your account has access to, then try again."
+      : "";
   return {
     message: `${diagnosticText}${authSuffix}`,
     authFailure,
@@ -2414,6 +2547,10 @@ export async function execCliAgent(options: {
     let cancelled = false;
     let stdout = "";
     let stderr = "";
+    // Part 7: last time ANY stdout/stderr byte arrived, used by the
+    // inactivity watchdog below. Seeded to spawn time so a process that
+    // never produces a single byte still gets caught.
+    let lastActivityAt = Date.now();
 
     // shell:true is the default so Windows resolves .cmd/.ps1 shims from
     // npm/pnpm global installs. With shell:true, Node's own spawn joins
@@ -2481,12 +2618,21 @@ export async function execCliAgent(options: {
       }
       settled = true;
       clearTimeout(timeoutHandle);
+      if (inactivityCheckHandle) {
+        clearInterval(inactivityCheckHandle);
+      }
       cancellationListener.dispose();
       cleanupPromptFile();
       resolve(result);
     };
 
-    const timeoutHandle = setTimeout(() => {
+    // Shared by both watchdogs below (Part 7): the flat wall-clock cap and
+    // the inactivity check kill the process the same way and shape the
+    // result the same way, differing only in the message and the
+    // timeoutReason marker (wall-clock vs inactivity) that recovery routing
+    // and run records use to tell a wedged process apart from a genuinely
+    // long-running one.
+    const emitTimeout = (message: string, timeoutReason: "wall-clock" | "inactivity"): void => {
       killProcessTree(child);
       // Edit-mode timeouts are always promoted: edit mode has its OWN
       // separate, stricter retry gate downstream that refuses to act on this
@@ -2505,9 +2651,7 @@ export async function execCliAgent(options: {
         ...classifyCliFailure({
           status: "failed",
           output: stdout,
-          errorMessage: `${cliDisplayLabel(def)} CLI timed out after ${
-            RUN_TIMEOUT_MS / 60000
-          } minutes.`,
+          errorMessage: message,
         }),
         // Override classifyCliFailure's marker-matched result: the fixed
         // timeout message never contains "quota"/"rate limit"/etc, so it
@@ -2539,8 +2683,40 @@ export async function execCliAgent(options: {
         // What the event stream showed up to the kill — the primary
         // retry-evidence input for edit-capable runs.
         editEvidence: analyzeCliEventStream(stdout),
+        timeoutReason,
       });
+    };
+
+    const timeoutHandle = setTimeout(() => {
+      emitTimeout(
+        `${cliDisplayLabel(def)} CLI timed out after ${RUN_TIMEOUT_MS / 60000} minutes.`,
+        "wall-clock"
+      );
     }, RUN_TIMEOUT_MS);
+
+    // Part 7 inactivity watchdog: unlike the flat wall-clock cap above, this
+    // kills a process that has produced no stdout/stderr bytes at all for
+    // ensemble.resilience.inactivityTimeoutMinutes, so a wedged process is
+    // caught long before the 60-minute wall clock. 0 disables it. Checked on
+    // a short fixed interval (well under the minimum nonzero limit of one
+    // minute) rather than a single setTimeout re-armed per byte, so the
+    // check logic stays simple and independent of how chatty the stream is.
+    const inactivityLimitMinutes = getResilienceSettings().inactivityTimeoutMinutes;
+    const inactivityLimitMs = inactivityLimitMinutes * 60_000;
+    const inactivityCheckHandle =
+      inactivityLimitMinutes > 0
+        ? setInterval(() => {
+            if (settled) {
+              return;
+            }
+            if (Date.now() - lastActivityAt >= inactivityLimitMs) {
+              emitTimeout(
+                `${cliDisplayLabel(def)} CLI produced no output for ${inactivityLimitMinutes} minute(s) and was stopped as inactive.`,
+                "inactivity"
+              );
+            }
+          }, 15_000)
+        : undefined;
 
     const cancellationListener = token.onCancellationRequested(() => {
       cancelled = true;
@@ -2557,6 +2733,7 @@ export async function execCliAgent(options: {
     });
 
     child.stdout?.on("data", (chunk: Buffer) => {
+      lastActivityAt = Date.now();
       stdout += chunk.toString("utf8");
       const lastLine = stdout.trimEnd().split(/\r?\n/).pop();
       if (lastLine && onProgress) {
@@ -2565,6 +2742,7 @@ export async function execCliAgent(options: {
     });
 
     child.stderr?.on("data", (chunk: Buffer) => {
+      lastActivityAt = Date.now();
       stderr += chunk.toString("utf8");
     });
 
@@ -2620,8 +2798,21 @@ export async function execCliAgent(options: {
         // (the specific "produced no output" wording is more informative
         // than toFriendlyError's own generic fallback for an empty result)
         // rather than hand-rebuilding a CliFriendlyError from its pieces.
-        const emptyDetail = `${cliDisplayLabel(def)} CLI produced no output. ${
-          truncateCliDetail(stderr, 4)
+        // Part 6 fix: this override bypassed the benign-noise filter
+        // entirely — diagnosticTextOverride short-circuits toFriendlyError's
+        // own filtering — so a stderr line consisting only of a known-benign
+        // signature (e.g. Cline's hook-dispatch noise) still leaked through
+        // this "clean exit, no output" branch. Filter stderr the same way
+        // toFriendlyError filters its own candidate sources before folding
+        // it into the override.
+        const filteredEmptyStderr = stripKnownBenignCliNoiseV1(stderr);
+        const emptyDetailBody = truncateCliDetail(filteredEmptyStderr.filtered, 4).trim();
+        const emptyDetail = `${cliDisplayLabel(def)} CLI produced no output.${
+          emptyDetailBody
+            ? ` ${emptyDetailBody}`
+            : filteredEmptyStderr.hint
+              ? ` (${filteredEmptyStderr.hint})`
+              : ""
         }`.trim();
         const friendly = toFriendlyError(effectiveDef, model, code, stderr, stdout, sharedParsedEvents, emptyDetail);
         finish(applyTransportTransience(
@@ -2938,6 +3129,33 @@ function changedPathsSince(
   return [...paths].sort();
 }
 
+/**
+ * Part 7: the three honest timeout-outcome variants, composed once
+ * filesChanged/filesChangedUnknown are known (i.e. AFTER the retry loop and
+ * the post-run git snapshot, never before). Pulled out to a pure function so
+ * each variant is directly unit-testable without spawning a CLI process:
+ *  - `filesChangedUnknown`: keep the pre-existing hedge — git couldn't be
+ *    consulted (not a repo / unavailable), so nothing more specific can
+ *    honestly be said.
+ *  - known non-empty change set: name the files, so the message is
+ *    actionable rather than a blanket "may have changed something".
+ *  - known empty change set: state plainly the tree is clean — no hedge
+ *    needed, nothing to review.
+ */
+export function composeCliTimeoutOutcomeV1(
+  baseErrorMessage: string | undefined,
+  filesChanged: readonly string[],
+  filesChangedUnknown: boolean,
+  breakReason: string
+): string {
+  const outcomeText = filesChangedUnknown
+    ? "This run may already have made changes; review your working tree before retrying."
+    : filesChanged.length > 0
+      ? `This run timed out after changing ${filesChanged.length} file(s): ${filesChanged.join(", ")} — review these before retrying.`
+      : "This run timed out but left the working tree clean — no files were changed.";
+  return `${baseErrorMessage ?? "The run did not complete."} ${outcomeText} (${breakReason})`;
+}
+
 function toCliImplementationRunResult(
   def: CliProviderDefinition,
   result: CliExecResult,
@@ -2961,6 +3179,11 @@ function toCliImplementationRunResult(
       // may contain the login hint that Ensemble itself appended.
       authFailure: result.authFailure,
       authDiagnosticText: result.authDiagnosticText,
+      // Part 7: surfaced so recovery routing (beginImplementationRecoveryV1
+      // call site) can tell an externally-killed round apart from an
+      // ordinary provider failure without re-parsing errorMessage.
+      timedOut: result.timeoutReason !== undefined,
+      timeoutReason: result.timeoutReason,
     };
   }
   if (noChangeCompletionIsSuccess && !filesChangedUnknown && filesChanged.length === 0) {
@@ -3191,6 +3414,12 @@ export async function runImplementationWithCli(options: {
   const retryAudit: RetryAuditEntry[] = [];
   const retryDelayMs = options.retryDelayMs ?? CLI_RETRY_DELAY_MS;
   let attempt = 1;
+  // Part 7: when a timed-out run refuses to retry, the reason is recorded
+  // here rather than folded into result.errorMessage immediately — the
+  // honest final message (which of the three variants below applies)
+  // depends on filesChanged/filesChangedUnknown, computed from the git
+  // snapshot AFTER this loop exits.
+  let terminalTimeoutReason: string | undefined;
   while (
     result.status === "failed" &&
     result.transient === true &&
@@ -3225,11 +3454,8 @@ export async function runImplementationWithCli(options: {
       result = {
         ...result,
         transient: false,
-        errorMessage:
-          `${result.errorMessage ?? "The run did not complete."} ` +
-          "This run may already have made changes; review your working tree before retrying. " +
-          `(${decision.reason})`,
       };
+      terminalTimeoutReason = decision.reason;
       break;
     }
     onProgress(resumeConversation
@@ -3291,6 +3517,22 @@ export async function runImplementationWithCli(options: {
         `${strayReservedNames.join("/")} instead of returning it as its final answer; ` +
         "ignoring that stray file."
     );
+  }
+
+  // Part 7: compose the honest timeout message now that filesChanged is
+  // known, rather than the generic hedge composed inside the retry loop
+  // above (before the snapshot existed). See composeCliTimeoutOutcomeV1 for
+  // the three variants.
+  if (terminalTimeoutReason !== undefined) {
+    result = {
+      ...result,
+      errorMessage: composeCliTimeoutOutcomeV1(
+        result.errorMessage,
+        filesChanged,
+        filesChangedUnknown,
+        terminalTimeoutReason
+      ),
+    };
   }
 
   const implResult = toCliImplementationRunResult(

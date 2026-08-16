@@ -99,6 +99,7 @@ import { recoverActivationCheckpoint } from "./state/taskActivationCoordinator";
 import { readTaskProgressStrictV1 } from "./services/taskProgressReaderV1";
 import { IncompleteTask } from "./types/incompleteTask";
 import { getModelSettings, installAutoImplementConfirmation, migrateEnabledProvidersForExistingModels, migrateSettingsNamespace, migrateSettingsScope } from "./config/settings";
+import { setExtensionContextV1 } from "./utils/extensionContextV1";
 
 /**
  * Run an orchestrator call that throws `ActionConversationErrorV1` on
@@ -157,6 +158,7 @@ class CurrentTaskDecorationProvider implements vscode.FileDecorationProvider {
  */
 export function activate(context: vscode.ExtensionContext): void {
   console.log("Ensemble is now active!");
+  setExtensionContextV1(context);
 
   // --- View provider registrations come first, before any other activation
   // work below (migrations, recovery scans, the command-registration flood,

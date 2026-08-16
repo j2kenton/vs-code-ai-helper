@@ -181,6 +181,75 @@ const SUMMARY_WITH_RETROACTIVE_CLAIM_NO_EVIDENCE = [
   "",
 ].join("\n");
 
+// Contradictory no-checklist-change corpus (round 013, task "1.9",
+// 2026-08-14 — Part 3 parity): a response declaring "nothing to tick" while
+// also reporting a retroactive completion in its own Plan Item Checklist.
+const NO_CHECKLIST_CHANGE_PLAIN = [
+  "<!-- ensemble:no-checklist-change -->",
+  "This round fixed the review's blocker; no checkbox state changes.",
+  "",
+  "## Files Changed",
+  "",
+  "- `src/foo.ts` — fixed the null check",
+  "",
+  "## Verification",
+  "",
+  "- ran the unit tests",
+].join("\n");
+
+const RETROACTIVE_CLAIM_NO_DECLARATION = [
+  "## Files Changed",
+  "",
+  "- (none)",
+  "",
+  "## Plan Item Checklist",
+  "",
+  "- some plan item — done <!-- ensemble:retroactive --> — src/views/settingsView.ts:672-675",
+].join("\n");
+
+const ROUND_013_SHAPED_RESPONSE = [
+  "Status: completed",
+  "",
+  "Files changed:",
+  "_none recorded_",
+  "",
+  "<!-- ensemble:no-checklist-change -->",
+  "This round independently re-verified every plan anchor in the working tree.",
+  "",
+  "## Files Changed",
+  "",
+  "None — no source, test, or configuration file was created, modified, or deleted this round.",
+  "",
+  "## Plan Item Checklist",
+  "",
+  "- `.model-combo-input` small font + reduced padding — done <!-- ensemble:retroactive --> — src/views/settingsView.ts:672-675",
+  "",
+  "## Verification",
+  "",
+  "- pnpm run test:unit — 2688/2688 pass",
+].join("\n");
+
+const QUOTED_MARKER_IN_ECHOED_ITEM = [
+  "<!-- ensemble:implementation-checklist -->",
+  "",
+  "# Implementation Checklist",
+  "",
+  "- [x] Treat a summary that both declares <!-- ensemble:no-checklist-change --> and supplies " +
+    "retroactive/done claims as self-contradictory",
+  "",
+  "## Files Changed",
+  "",
+  "- `src/foo.ts` — fixed the null check",
+  "",
+  "## Plan Item Checklist",
+  "",
+  "- some plan item — done <!-- ensemble:retroactive --> — src/views/settingsView.ts:672-675",
+  "",
+  "## Verification",
+  "",
+  "- ran the unit tests",
+].join("\n");
+
 const CORPUS: Record<string, string> = {
   PLAN_BASIC,
   PLAN_WITH_FENCED_EXAMPLE,
@@ -338,4 +407,45 @@ test("splitSummaryAtEchoV1 boundary detection agrees with the extension", () => 
       `${name}: echo split divergence`
     );
   }
+});
+
+test("declaresNoChecklistChangeV1 agrees with the extension", () => {
+  const docs = [
+    NO_CHECKLIST_CHANGE_PLAIN,
+    RETROACTIVE_CLAIM_NO_DECLARATION,
+    ROUND_013_SHAPED_RESPONSE,
+    QUOTED_MARKER_IN_ECHOED_ITEM,
+    "no marker at all",
+  ];
+  for (const doc of docs) {
+    assert.equal(
+      engine.declaresNoChecklistChangeV1(doc),
+      srcChecklist.declaresNoChecklistChangeV1(doc),
+      `declaration-detection divergence for ${JSON.stringify(doc)}`
+    );
+  }
+});
+
+test("hasContradictoryNoChecklistChangeClaimV1 agrees with the extension (round 013 parity)", () => {
+  const docs = [
+    NO_CHECKLIST_CHANGE_PLAIN,
+    RETROACTIVE_CLAIM_NO_DECLARATION,
+    ROUND_013_SHAPED_RESPONSE,
+    QUOTED_MARKER_IN_ECHOED_ITEM,
+    "no marker at all",
+  ];
+  for (const doc of docs) {
+    assert.equal(
+      engine.hasContradictoryNoChecklistChangeClaimV1(doc),
+      srcChecklist.hasContradictoryNoChecklistChangeClaimV1(doc),
+      `contradiction-detection divergence for ${JSON.stringify(doc)}`
+    );
+  }
+  // Pin the actual expected values too, not just cross-implementation
+  // agreement, so a future change that breaks BOTH ports identically is
+  // still caught.
+  assert.equal(engine.hasContradictoryNoChecklistChangeClaimV1(NO_CHECKLIST_CHANGE_PLAIN), false);
+  assert.equal(engine.hasContradictoryNoChecklistChangeClaimV1(RETROACTIVE_CLAIM_NO_DECLARATION), false);
+  assert.equal(engine.hasContradictoryNoChecklistChangeClaimV1(ROUND_013_SHAPED_RESPONSE), true);
+  assert.equal(engine.hasContradictoryNoChecklistChangeClaimV1(QUOTED_MARKER_IN_ECHOED_ITEM), false);
 });

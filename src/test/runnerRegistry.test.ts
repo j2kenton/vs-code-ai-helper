@@ -24,6 +24,34 @@ import {
   LEGACY_UNCORRELATED_RUNNER_INVOCATION_REJECTED_V0,
   LegacyAiActionSafetyGateErrorV0,
 } from "../services/legacyAiActionSafetyGateV0";
+import { resolveQuotaAccountKeyV1 } from "../config/settings";
+import { parseModelSelection, providerAccountIdForModelId } from "../runners/providers";
+import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
+
+/** Minimal in-memory Memento-backed ExtensionContext stub — mirrors the
+ * pattern in quota.test.ts's `createFakeExtensionContext`. */
+function createFakeExtensionContextV1(
+  store: Map<string, unknown> = new Map()
+): { context: vscode.ExtensionContext; store: Map<string, unknown> } {
+  const context = {
+    globalState: {
+      get<T>(key: string, fallback?: T): T {
+        return store.has(key) ? (store.get(key) as T) : (fallback as T);
+      },
+      update(key: string, value: unknown): Promise<void> {
+        if (value === undefined) {
+          store.delete(key);
+        } else {
+          store.set(key, value);
+        }
+        return Promise.resolve();
+      },
+      keys: (): readonly string[] => Array.from(store.keys()),
+      setKeysForSync: (): void => undefined,
+    },
+  } as unknown as vscode.ExtensionContext;
+  return { context, store };
+}
 
 const requireModule = createRequire(__filename);
 const childProcess = requireModule("node:child_process") as typeof import("node:child_process");
@@ -551,6 +579,317 @@ void describe("resolveRunnerForModel", () => {
     }
   });
 
+  // Review completion blocker: plan/review text runs only updated the
+  // session/global quota ledger via withQuotaObservation — a successful or
+  // contradicting-classified retry never cleared a stale task-level
+  // quotaParkRecord, unlike the implementation-run path. These three pin
+  // withQuotaObservation's new taskFolderUri-threaded clearing behavior:
+  // success clears, a genuinely contradicting failure clears, and a
+  // cancelled run (no fresh evidence) leaves the record untouched.
+  void describe("withQuotaObservation clears a stale task-level quotaParkRecord on fresh evidence", () => {
+    function seedProgressWithParkRecord(taskFolder: string, stage: string): string {
+      const progressPath = path.join(taskFolder, "task-progress.json");
+      const now = new Date().toISOString();
+      fs.writeFileSync(
+        progressPath,
+        JSON.stringify(
+          {
+            taskFolder: path.basename(taskFolder),
+            currentStage: stage,
+            status: "active",
+            createdAt: now,
+            updatedAt: now,
+            quotaParkRecord: {
+              modelId: "copilot-gpt-5.6-sol",
+              providerId: "copilot",
+              failureKind: "quota",
+              observedAt: now,
+            },
+          },
+          null,
+          2
+        ),
+        "utf8"
+      );
+      return progressPath;
+    }
+
+    void it("a successful run clears the record", async () => {
+      const metaRoot = fs.mkdtempSync(
+        path.join(os.tmpdir(), "ensemble-quota-park-clear-success-")
+      );
+      const taskFolder = path.join(metaRoot, "tasks", "task-a");
+      fs.mkdirSync(taskFolder, { recursive: true });
+      const taskFolderUri = vscode.Uri.file(taskFolder);
+      const outputFile = vscode.Uri.file(path.join(taskFolder, "plan.md"));
+      const progressPath = seedProgressWithParkRecord(taskFolder, "plan");
+
+      const lm = lmStub();
+      const originalSelectChatModels = lm.selectChatModels;
+      const workspace = vscode.workspace as unknown as {
+        fs: {
+          readFile: (uri: vscode.Uri) => Promise<Uint8Array>;
+          writeFile: (uri: vscode.Uri, bytes: Uint8Array) => Promise<void>;
+        };
+      };
+      const originalReadFile = workspace.fs.readFile;
+      const originalWriteFile = workspace.fs.writeFile;
+      workspace.fs.readFile = (uri: vscode.Uri): Promise<Uint8Array> =>
+        fs.promises.readFile(uri.fsPath);
+      workspace.fs.writeFile = (uri: vscode.Uri, bytes: Uint8Array): Promise<void> =>
+        fs.promises.writeFile(uri.fsPath, bytes);
+      lm.selectChatModels = (): Promise<vscode.LanguageModelChat[]> =>
+        Promise.resolve([
+          {
+            id: "copilot-gpt-5.6-sol",
+            name: "GPT-5.6",
+            sendRequest: () =>
+              Promise.resolve({
+                text: ["done"] as unknown as AsyncIterable<string>,
+              }),
+          } as unknown as vscode.LanguageModelChat,
+        ]);
+
+      try {
+        const { runner } = resolveRunnerForModel(
+          "copilot-gpt-5.6-sol",
+          "plan",
+          taskFolderUri
+        );
+        const result = await runner.run(
+          {
+            taskFolderUri,
+            workspaceUri: taskFolderUri,
+            stage: "plan",
+            prompt: "Create a plan.",
+            outputFile,
+            modelId: "copilot-gpt-5.6-sol",
+          },
+          new vscode.CancellationTokenSource().token
+        );
+        assert.strictEqual(result.status, "completed");
+        const progress = JSON.parse(fs.readFileSync(progressPath, "utf8")) as {
+          quotaParkRecord?: unknown;
+        };
+        assert.strictEqual(progress.quotaParkRecord, undefined);
+      } finally {
+        lm.selectChatModels = originalSelectChatModels;
+        workspace.fs.readFile = originalReadFile;
+        workspace.fs.writeFile = originalWriteFile;
+        fs.rmSync(metaRoot, { recursive: true, force: true });
+      }
+    });
+
+    void it("a failed run with a contradicting, non-quota/entitlement classification clears the record", async () => {
+      const metaRoot = fs.mkdtempSync(
+        path.join(os.tmpdir(), "ensemble-quota-park-clear-contradict-")
+      );
+      const taskFolder = path.join(metaRoot, "tasks", "task-a");
+      fs.mkdirSync(taskFolder, { recursive: true });
+      const taskFolderUri = vscode.Uri.file(taskFolder);
+      const outputFile = vscode.Uri.file(path.join(taskFolder, "plan.md"));
+      const progressPath = seedProgressWithParkRecord(taskFolder, "plan");
+
+      const lm = lmStub();
+      const originalSelectChatModels = lm.selectChatModels;
+      const workspace = vscode.workspace as unknown as {
+        fs: {
+          readFile: (uri: vscode.Uri) => Promise<Uint8Array>;
+          writeFile: (uri: vscode.Uri, bytes: Uint8Array) => Promise<void>;
+        };
+      };
+      const originalReadFile = workspace.fs.readFile;
+      const originalWriteFile = workspace.fs.writeFile;
+      workspace.fs.readFile = (uri: vscode.Uri): Promise<Uint8Array> =>
+        fs.promises.readFile(uri.fsPath);
+      workspace.fs.writeFile = (uri: vscode.Uri, bytes: Uint8Array): Promise<void> =>
+        fs.promises.writeFile(uri.fsPath, bytes);
+      lm.selectChatModels = (): Promise<vscode.LanguageModelChat[]> =>
+        Promise.resolve([
+          {
+            id: "copilot-gpt-5.6-sol",
+            name: "GPT-5.6",
+            sendRequest: () => Promise.reject(new Error("service temporarily unavailable")),
+          } as unknown as vscode.LanguageModelChat,
+        ]);
+
+      try {
+        const { runner } = resolveRunnerForModel(
+          "copilot-gpt-5.6-sol",
+          "plan",
+          taskFolderUri
+        );
+        const result = await runner.run(
+          {
+            taskFolderUri,
+            workspaceUri: taskFolderUri,
+            stage: "plan",
+            prompt: "Create a plan.",
+            outputFile,
+            modelId: "copilot-gpt-5.6-sol",
+          },
+          new vscode.CancellationTokenSource().token
+        );
+        assert.strictEqual(result.status, "failed");
+        assert.notEqual(result.failureKind, "quota");
+        assert.notEqual(result.failureKind, "model-entitlement");
+        const progress = JSON.parse(fs.readFileSync(progressPath, "utf8")) as {
+          quotaParkRecord?: unknown;
+        };
+        assert.strictEqual(progress.quotaParkRecord, undefined);
+      } finally {
+        lm.selectChatModels = originalSelectChatModels;
+        workspace.fs.readFile = originalReadFile;
+        workspace.fs.writeFile = originalWriteFile;
+        fs.rmSync(metaRoot, { recursive: true, force: true });
+      }
+    });
+
+    void it("a cancelled run is not fresh evidence and leaves the record in place", async () => {
+      const metaRoot = fs.mkdtempSync(
+        path.join(os.tmpdir(), "ensemble-quota-park-no-clear-cancel-")
+      );
+      const taskFolder = path.join(metaRoot, "tasks", "task-a");
+      fs.mkdirSync(taskFolder, { recursive: true });
+      const taskFolderUri = vscode.Uri.file(taskFolder);
+      const outputFile = vscode.Uri.file(path.join(taskFolder, "plan.md"));
+      const progressPath = seedProgressWithParkRecord(taskFolder, "plan");
+
+      const lm = lmStub();
+      const originalSelectChatModels = lm.selectChatModels;
+      const workspace = vscode.workspace as unknown as {
+        fs: {
+          readFile: (uri: vscode.Uri) => Promise<Uint8Array>;
+          writeFile: (uri: vscode.Uri, bytes: Uint8Array) => Promise<void>;
+        };
+      };
+      const originalReadFile = workspace.fs.readFile;
+      const originalWriteFile = workspace.fs.writeFile;
+      workspace.fs.readFile = (uri: vscode.Uri): Promise<Uint8Array> =>
+        fs.promises.readFile(uri.fsPath);
+      workspace.fs.writeFile = (uri: vscode.Uri, bytes: Uint8Array): Promise<void> =>
+        fs.promises.writeFile(uri.fsPath, bytes);
+      lm.selectChatModels = (): Promise<vscode.LanguageModelChat[]> =>
+        Promise.resolve([
+          {
+            id: "copilot-gpt-5.6-sol",
+            name: "GPT-5.6",
+            sendRequest: () =>
+              Promise.resolve({
+                text: ["partial"] as unknown as AsyncIterable<string>,
+              }),
+          } as unknown as vscode.LanguageModelChat,
+        ]);
+
+      const tokenSource = new vscode.CancellationTokenSource();
+      tokenSource.cancel();
+      try {
+        const { runner } = resolveRunnerForModel(
+          "copilot-gpt-5.6-sol",
+          "plan",
+          taskFolderUri
+        );
+        const result = await runner.run(
+          {
+            taskFolderUri,
+            workspaceUri: taskFolderUri,
+            stage: "plan",
+            prompt: "Create a plan.",
+            outputFile,
+            modelId: "copilot-gpt-5.6-sol",
+          },
+          tokenSource.token
+        );
+        assert.strictEqual(result.status, "cancelled");
+        const progress = JSON.parse(fs.readFileSync(progressPath, "utf8")) as {
+          quotaParkRecord?: unknown;
+        };
+        assert.ok(progress.quotaParkRecord, "expected the pre-existing quotaParkRecord to survive a cancelled run");
+      } finally {
+        lm.selectChatModels = originalSelectChatModels;
+        workspace.fs.readFile = originalReadFile;
+        workspace.fs.writeFile = originalWriteFile;
+        fs.rmSync(metaRoot, { recursive: true, force: true });
+      }
+    });
+
+    // Review completion blocker: clearing previously required only that SOME
+    // fresh evidence be associated with the task folder, with no check that
+    // it came from the model/provider the persisted record actually blocked.
+    // A successful run on a DIFFERENT model must not erase a record about a
+    // model that was never retried.
+    void it("a successful run on a DIFFERENT model than the parked record leaves it in place", async () => {
+      const metaRoot = fs.mkdtempSync(
+        path.join(os.tmpdir(), "ensemble-quota-park-no-clear-mismatch-")
+      );
+      const taskFolder = path.join(metaRoot, "tasks", "task-a");
+      fs.mkdirSync(taskFolder, { recursive: true });
+      const taskFolderUri = vscode.Uri.file(taskFolder);
+      const outputFile = vscode.Uri.file(path.join(taskFolder, "plan.md"));
+      const progressPath = seedProgressWithParkRecord(taskFolder, "plan");
+
+      const lm = lmStub();
+      const originalSelectChatModels = lm.selectChatModels;
+      const workspace = vscode.workspace as unknown as {
+        fs: {
+          readFile: (uri: vscode.Uri) => Promise<Uint8Array>;
+          writeFile: (uri: vscode.Uri, bytes: Uint8Array) => Promise<void>;
+        };
+      };
+      const originalReadFile = workspace.fs.readFile;
+      const originalWriteFile = workspace.fs.writeFile;
+      workspace.fs.readFile = (uri: vscode.Uri): Promise<Uint8Array> =>
+        fs.promises.readFile(uri.fsPath);
+      workspace.fs.writeFile = (uri: vscode.Uri, bytes: Uint8Array): Promise<void> =>
+        fs.promises.writeFile(uri.fsPath, bytes);
+      lm.selectChatModels = (): Promise<vscode.LanguageModelChat[]> =>
+        Promise.resolve([
+          {
+            id: "copilot-gpt-5.6-mini",
+            name: "GPT-5.6 mini",
+            sendRequest: () =>
+              Promise.resolve({
+                text: ["done"] as unknown as AsyncIterable<string>,
+              }),
+          } as unknown as vscode.LanguageModelChat,
+        ]);
+
+      try {
+        // The seeded record blocks "copilot-gpt-5.6-sol"; this run uses a
+        // different model id ("copilot-gpt-5.6-mini") entirely.
+        const { runner } = resolveRunnerForModel(
+          "copilot-gpt-5.6-mini",
+          "plan",
+          taskFolderUri
+        );
+        const result = await runner.run(
+          {
+            taskFolderUri,
+            workspaceUri: taskFolderUri,
+            stage: "plan",
+            prompt: "Create a plan.",
+            outputFile,
+            modelId: "copilot-gpt-5.6-mini",
+          },
+          new vscode.CancellationTokenSource().token
+        );
+        assert.strictEqual(result.status, "completed");
+        const progress = JSON.parse(fs.readFileSync(progressPath, "utf8")) as {
+          quotaParkRecord?: unknown;
+        };
+        assert.ok(
+          progress.quotaParkRecord,
+          "expected the parked record for a DIFFERENT model to survive an unrelated model's successful run"
+        );
+      } finally {
+        lm.selectChatModels = originalSelectChatModels;
+        workspace.fs.readFile = originalReadFile;
+        workspace.fs.writeFile = originalWriteFile;
+        fs.rmSync(metaRoot, { recursive: true, force: true });
+      }
+    });
+  });
+
   void it("does not keep an authentication-failed backup as the next text-run route", async () => {
     const metaRoot = fs.mkdtempSync(
       path.join(os.tmpdir(), "ensemble-text-fallback-auth-")
@@ -771,6 +1110,290 @@ void describe("resolveRunnerForModel", () => {
       childProcess.spawn = originalSpawn;
       workspace.fs.readFile = originalReadFile;
       workspace.fs.writeFile = originalWriteFile;
+    }
+  });
+
+  // New review completion blocker: unlike the no-backups `withQuotaObservation`
+  // path and the implementation cascade (both of which capture the account
+  // key before dispatch), this primary-with-backups-configured branch called
+  // `recordQuotaObservation` with no override, so it re-resolved the account
+  // key from live settings AFTER `primary.run` had already completed. A label
+  // edit mid-run split one attempt's ledger write across two identities.
+  void it("captures the account key before the primary dispatches when backups are configured, so a mid-run label edit does not split the ledger write", async () => {
+    const metaRoot = fs.mkdtempSync(
+      path.join(os.tmpdir(), "ensemble-quota-primary-with-backups-")
+    );
+    const taskFolder = path.join(metaRoot, "tasks", "task-a");
+    fs.mkdirSync(taskFolder, { recursive: true });
+    const taskFolderUri = vscode.Uri.file(taskFolder);
+    const outputFile = vscode.Uri.file(path.join(taskFolder, "plan.md"));
+    const progressPath = path.join(taskFolder, "task-progress.json");
+    const now = new Date().toISOString();
+    fs.writeFileSync(
+      progressPath,
+      JSON.stringify(
+        {
+          taskFolder: path.basename(taskFolder),
+          currentStage: "plan",
+          status: "active",
+          createdAt: now,
+          updatedAt: now,
+        },
+        null,
+        2
+      ),
+      "utf8"
+    );
+
+    let labels: Record<string, string> = {};
+    const originalGetConfiguration = vscode.workspace.getConfiguration;
+    (vscode.workspace as unknown as Record<string, unknown>).getConfiguration = ((
+      section?: string
+    ) => {
+      if (section !== "ensemble") {
+        return originalGetConfiguration(section);
+      }
+      return {
+        get: (key: string, defaultValue?: unknown): unknown => {
+          if (key === "modelSettings") {
+            return {
+              plan: {
+                primary: "copilot-gpt-5.6-sol",
+                backup: "kiro-cli:default",
+                strategy: "switch-to-backup",
+              },
+            };
+          }
+          if (key === "providerAccountLabels") {
+            return labels;
+          }
+          return defaultValue;
+        },
+        inspect: () => undefined,
+        update: () => Promise.resolve(),
+      } as unknown as ReturnType<typeof originalGetConfiguration>;
+    }) as typeof originalGetConfiguration;
+
+    const { context, store } = createFakeExtensionContextV1();
+    __extensionContextV1TestOnly.set(context);
+
+    const modelId = "copilot-gpt-5.6-sol";
+    const preRunAccountKey = resolveQuotaAccountKeyV1(modelId);
+
+    const lm = lmStub();
+    const originalSelectChatModels = lm.selectChatModels;
+    const originalSpawn = childProcess.spawn;
+    const workspace = vscode.workspace as unknown as {
+      fs: {
+        readFile: (uri: vscode.Uri) => Promise<Uint8Array>;
+        writeFile: (uri: vscode.Uri, bytes: Uint8Array) => Promise<void>;
+      };
+    };
+    const originalReadFile = workspace.fs.readFile;
+    const originalWriteFile = workspace.fs.writeFile;
+    workspace.fs.readFile = (uri: vscode.Uri): Promise<Uint8Array> =>
+      fs.promises.readFile(uri.fsPath);
+    workspace.fs.writeFile = (uri: vscode.Uri, bytes: Uint8Array): Promise<void> =>
+      fs.promises.writeFile(uri.fsPath, bytes);
+    // The backup ("kiro-cli:default") never actually needs to run for this
+    // test — the primary's own quota failure and ledger write happen before
+    // the cascade reaches it — but its availability check spawns a real
+    // process unless stubbed, so keep it a fast, deterministic "unavailable".
+    childProcess.spawn = ((
+      _command: string,
+      _args: readonly string[] = []
+    ) => {
+      const child = new EventEmitter() as import("node:child_process").ChildProcess;
+      process.nextTick(() => child.emit("close", 1));
+      return child;
+    }) as typeof childProcess.spawn;
+    lm.selectChatModels = (): Promise<vscode.LanguageModelChat[]> =>
+      Promise.resolve([
+        {
+          id: "copilot-gpt-5.6-sol",
+          name: "GPT-5.6",
+          sendRequest: () => {
+            // Simulate the user editing the account label WHILE this
+            // attempt is in flight — the same race the review flagged.
+            labels = { ...labels, [providerAccountIdForModelId(modelId)]: "work" };
+            return Promise.reject(
+              new Error("You've hit your usage limit · resets in 8h")
+            );
+          },
+        } as unknown as vscode.LanguageModelChat,
+      ]);
+
+    try {
+      const { runner } = resolveRunnerForModel(modelId, "plan", taskFolderUri);
+      const result = await runner.run(
+        {
+          taskFolderUri,
+          workspaceUri: taskFolderUri,
+          stage: "plan",
+          prompt: "Create a plan.",
+          outputFile,
+          modelId,
+        },
+        new vscode.CancellationTokenSource().token
+      );
+      assert.strictEqual(result.status, "failed");
+
+      const postRunAccountKey = resolveQuotaAccountKeyV1(modelId);
+      assert.notStrictEqual(
+        postRunAccountKey,
+        preRunAccountKey,
+        "the label mutation inside sendRequest must actually change what a fresh resolve would return"
+      );
+
+      const ledger = store.get("ensembleQuotaLedgerV1") as
+        | Record<string, unknown>
+        | undefined;
+      const providerId = parseModelSelection(modelId).provider;
+      assert.ok(
+        ledger?.[`${providerId}::${preRunAccountKey}::${modelId}`],
+        "expected the ledger write to use the account key captured before dispatch"
+      );
+      assert.strictEqual(
+        ledger?.[`${providerId}::${postRunAccountKey}::${modelId}`],
+        undefined,
+        "the mid-run label edit must not split this attempt's ledger write onto a second identity"
+      );
+    } finally {
+      vscode.workspace.getConfiguration = originalGetConfiguration;
+      lm.selectChatModels = originalSelectChatModels;
+      childProcess.spawn = originalSpawn;
+      workspace.fs.readFile = originalReadFile;
+      workspace.fs.writeFile = originalWriteFile;
+      __extensionContextV1TestOnly.set(undefined);
+      fs.rmSync(metaRoot, { recursive: true, force: true });
+    }
+  });
+
+  // Code-review non-blocking suggestion (Part 5): the test above
+  // ("captures the account key before the primary dispatches...") only
+  // proves the ledger write uses the pre-dispatch identity — it never seeds a
+  // `quotaParkRecord` at all, so it says nothing about whether a matching
+  // pre-existing park record actually gets CLEARED when the primary succeeds
+  // through this same backup-configured branch of `resolveRunnerForModel`
+  // (the branch that dispatches the primary and each backup directly, not
+  // through `withQuotaObservation` — see `recordQuotaObservationAndClearParkV1`'s
+  // own doc comment for why that branch needed its own park-clearing wiring).
+  // This is the direct regression test for that: seed a `quotaParkRecord`
+  // whose providerId/modelId/accountKey match exactly what THIS run's primary
+  // will use, run a backup-configured stage where the primary succeeds
+  // outright, and assert the record is gone afterward.
+  void it("clears a matching pre-seeded quotaParkRecord when the primary succeeds through the backup-configured branch", async () => {
+    const metaRoot = fs.mkdtempSync(
+      path.join(os.tmpdir(), "ensemble-quota-park-clear-")
+    );
+    const taskFolder = path.join(metaRoot, "tasks", "task-a");
+    fs.mkdirSync(taskFolder, { recursive: true });
+    const taskFolderUri = vscode.Uri.file(taskFolder);
+    const outputFile = vscode.Uri.file(path.join(taskFolder, "plan.md"));
+    const progressPath = path.join(taskFolder, "task-progress.json");
+    const now = new Date().toISOString();
+    const modelId = "copilot-gpt-5.6-sol";
+    const providerId = parseModelSelection(modelId).provider;
+    const accountKey = resolveQuotaAccountKeyV1(modelId);
+    fs.writeFileSync(
+      progressPath,
+      JSON.stringify(
+        {
+          taskFolder: path.basename(taskFolder),
+          currentStage: "plan",
+          status: "active",
+          createdAt: now,
+          updatedAt: now,
+          quotaParkRecord: {
+            modelId,
+            providerId,
+            accountKey,
+            failureKind: "quota",
+            resetAt: new Date(Date.now() + 3_600_000).toISOString(),
+            observedAt: now,
+          },
+        },
+        null,
+        2
+      ),
+      "utf8"
+    );
+
+    const settings = installModelSettings({
+      plan: {
+        primary: modelId,
+        backup: "kiro-cli:default",
+        strategy: "switch-to-backup",
+      },
+    });
+
+    const lm = lmStub();
+    const originalSelectChatModels = lm.selectChatModels;
+    const originalSpawn = childProcess.spawn;
+    const workspace = vscode.workspace as unknown as {
+      fs: {
+        readFile: (uri: vscode.Uri) => Promise<Uint8Array>;
+        writeFile: (uri: vscode.Uri, bytes: Uint8Array) => Promise<void>;
+      };
+    };
+    const originalReadFile = workspace.fs.readFile;
+    const originalWriteFile = workspace.fs.writeFile;
+    workspace.fs.readFile = (uri: vscode.Uri): Promise<Uint8Array> =>
+      fs.promises.readFile(uri.fsPath);
+    workspace.fs.writeFile = (uri: vscode.Uri, bytes: Uint8Array): Promise<void> =>
+      fs.promises.writeFile(uri.fsPath, bytes);
+    // The backup never needs to actually run — the primary succeeds
+    // outright — but stub it fast/deterministic regardless.
+    childProcess.spawn = ((
+      _command: string,
+      _args: readonly string[] = []
+    ) => {
+      const child = new EventEmitter() as import("node:child_process").ChildProcess;
+      process.nextTick(() => child.emit("close", 1));
+      return child;
+    }) as typeof childProcess.spawn;
+    lm.selectChatModels = (): Promise<vscode.LanguageModelChat[]> =>
+      Promise.resolve([
+        {
+          id: modelId,
+          name: "GPT-5.6",
+          sendRequest: () =>
+            Promise.resolve({
+              text: ["a fresh, successful plan"] as unknown as AsyncIterable<string>,
+            }),
+        } as unknown as vscode.LanguageModelChat,
+      ]);
+
+    try {
+      const { runner } = resolveRunnerForModel(modelId, "plan", taskFolderUri);
+      const result = await runner.run(
+        {
+          taskFolderUri,
+          workspaceUri: taskFolderUri,
+          stage: "plan",
+          prompt: "Create a plan.",
+          outputFile,
+          modelId,
+        },
+        new vscode.CancellationTokenSource().token
+      );
+      assert.strictEqual(result.status, "completed");
+
+      const persisted = JSON.parse(fs.readFileSync(progressPath, "utf8")) as {
+        quotaParkRecord?: unknown;
+      };
+      assert.strictEqual(
+        persisted.quotaParkRecord,
+        undefined,
+        "a matching pre-seeded quotaParkRecord must be cleared once the primary succeeds"
+      );
+    } finally {
+      settings.restore();
+      lm.selectChatModels = originalSelectChatModels;
+      childProcess.spawn = originalSpawn;
+      workspace.fs.readFile = originalReadFile;
+      workspace.fs.writeFile = originalWriteFile;
+      fs.rmSync(metaRoot, { recursive: true, force: true });
     }
   });
 });
@@ -1632,6 +2255,275 @@ void describe("runImplementationForModel", () => {
           "a withheld switch must not record an active fallback for the stage"
         );
         assert.strictEqual(progress.fallbackModelId?.impl, undefined);
+      } finally {
+        settings.restore();
+      }
+    } finally {
+      childProcess.spawn = originalSpawn;
+      lm.selectChatModels = originalSelectChatModels;
+      workspace.fs.readFile = originalReadFile;
+      workspace.fs.writeFile = originalWriteFile;
+      fs.rmSync(metaRoot, { recursive: true, force: true });
+    }
+  });
+
+  // Model-entitlement failures (item 3): a Bedrock/Vertex-style "not
+  // available for this account" refusal is a valid credential blocked from
+  // only THIS model id — a different model id (a backup) is a legitimate
+  // fix, unlike a genuine auth failure. On a CLEAN tree the cascade must
+  // fire exactly as it does for quota/temporarily-unavailable.
+  void it("cascades to the backup on a model-entitlement failure with a clean working tree", async () => {
+    const originalSpawn = childProcess.spawn;
+    const metaRoot = fs.mkdtempSync(
+      path.join(os.tmpdir(), "ensemble-impl-entitlement-cascade-")
+    );
+    const taskFolder = path.join(metaRoot, "tasks", "task-a");
+    fs.mkdirSync(taskFolder, { recursive: true });
+    const taskFolderUri = vscode.Uri.file(taskFolder);
+    childProcess.execSync("git init", { cwd: taskFolder, stdio: "ignore" });
+
+    childProcess.spawn = ((command: string) => {
+      const child = new EventEmitter() as import("node:child_process").ChildProcess;
+      Object.defineProperty(child, "pid", { value: 5556 });
+      child.stdout = new EventEmitter() as import("node:child_process").ChildProcess["stdout"];
+      child.stderr = new EventEmitter() as import("node:child_process").ChildProcess["stderr"];
+      child.stdin = Object.assign(new EventEmitter(), {
+        write: () => true,
+        end: () => undefined,
+      }) as unknown as import("node:child_process").ChildProcess["stdin"];
+
+      if (/^(which|where\.exe)$/.test(command)) {
+        process.nextTick(() => child.emit("close", 0));
+        return child;
+      }
+
+      process.nextTick(() => {
+        // No file written — the working tree stays clean.
+        child.stdout?.emit(
+          "data",
+          Buffer.from(
+            `${JSON.stringify({
+              type: "error",
+              message:
+                'Error from provider aws-bedrock: 403 Forbidden {"message":"anthropic.claude-sonnet-5 is not available for this account."}',
+            })}\n`
+          )
+        );
+        child.emit("close", 1);
+      });
+      return child;
+    }) as typeof childProcess.spawn;
+
+    const lm = lmStub();
+    const originalSelectChatModels = lm.selectChatModels;
+    const { LanguageModelTextPart } = vscode as unknown as {
+      LanguageModelTextPart: new (value: string) => { value: string };
+    };
+    function* responseStream(): Iterable<unknown> {
+      yield new LanguageModelTextPart("backup implementation");
+    }
+    lm.selectChatModels = (): Promise<vscode.LanguageModelChat[]> =>
+      Promise.resolve([
+        {
+          id: "auto",
+          name: "Auto",
+          sendRequest: () => Promise.resolve({ stream: responseStream() }),
+        } as unknown as vscode.LanguageModelChat,
+      ]);
+
+    const workspace = vscode.workspace as unknown as {
+      fs: {
+        readFile: (uri: vscode.Uri) => Promise<Uint8Array>;
+        writeFile: (uri: vscode.Uri, bytes: Uint8Array) => Promise<void>;
+      };
+    };
+    const originalReadFile = workspace.fs.readFile;
+    const originalWriteFile = workspace.fs.writeFile;
+    workspace.fs.readFile = (uri: vscode.Uri): Promise<Uint8Array> =>
+      fs.promises.readFile(uri.fsPath);
+    workspace.fs.writeFile = (uri: vscode.Uri, bytes: Uint8Array): Promise<void> =>
+      fs.promises.writeFile(uri.fsPath, bytes);
+
+    const progressPath = path.join(taskFolder, "task-progress.json");
+    const now = new Date().toISOString();
+    fs.writeFileSync(
+      progressPath,
+      JSON.stringify(
+        { taskFolder: "task-a", currentStage: "impl", status: "active", createdAt: now, updatedAt: now },
+        null,
+        2
+      ),
+      "utf8"
+    );
+
+    try {
+      const settings = installModelSettings({
+        impl: {
+          primary: "cline-cli:default",
+          backup: "auto",
+          strategy: "switch-to-backup",
+        },
+      });
+      try {
+        const result = await runImplementationForModel({
+          modelId: "cline-cli:default",
+          prompt: "Implement the requested change.",
+          workspaceUri: taskFolderUri,
+          token: new vscode.CancellationTokenSource().token,
+          onProgress: () => undefined,
+          correlation: { actionKey: "implementation.v1" },
+          allowCrossProviderBackups: true,
+          stage: "impl",
+          taskFolderUri,
+        });
+
+        assert.strictEqual(result.status, "completed");
+        assert.strictEqual(result.summary, "backup implementation");
+        assert.strictEqual(result.actualStoredModelId, "auto");
+      } finally {
+        settings.restore();
+      }
+    } finally {
+      childProcess.spawn = originalSpawn;
+      lm.selectChatModels = originalSelectChatModels;
+      workspace.fs.readFile = originalReadFile;
+      workspace.fs.writeFile = originalWriteFile;
+      fs.rmSync(metaRoot, { recursive: true, force: true });
+    }
+  });
+
+  // Sibling of the dirty-tree-withheld test above, for model-entitlement: the
+  // same dirty-tree safety boundary applies — a second model must never be
+  // dispatched at a tree the failed primary already edited, regardless of
+  // WHY the primary failed.
+  void it("withholds the backup switch on a model-entitlement failure that left the working tree dirty", async () => {
+    const originalSpawn = childProcess.spawn;
+    const metaRoot = fs.mkdtempSync(
+      path.join(os.tmpdir(), "ensemble-impl-entitlement-dirty-tree-")
+    );
+    const taskFolder = path.join(metaRoot, "tasks", "task-a");
+    fs.mkdirSync(taskFolder, { recursive: true });
+    const taskFolderUri = vscode.Uri.file(taskFolder);
+    childProcess.execSync("git init", { cwd: taskFolder, stdio: "ignore" });
+    const mutatedFile = path.join(taskFolder, "mutated-by-partial-run.txt");
+
+    childProcess.spawn = ((command: string) => {
+      const child = new EventEmitter() as import("node:child_process").ChildProcess;
+      Object.defineProperty(child, "pid", { value: 5557 });
+      child.stdout = new EventEmitter() as import("node:child_process").ChildProcess["stdout"];
+      child.stderr = new EventEmitter() as import("node:child_process").ChildProcess["stderr"];
+      child.stdin = Object.assign(new EventEmitter(), {
+        write: () => true,
+        end: () => undefined,
+      }) as unknown as import("node:child_process").ChildProcess["stdin"];
+
+      if (/^(which|where\.exe)$/.test(command)) {
+        process.nextTick(() => child.emit("close", 0));
+        return child;
+      }
+
+      process.nextTick(() => {
+        fs.writeFileSync(mutatedFile, "partial edit from a run that then failed");
+        child.stdout?.emit(
+          "data",
+          Buffer.from(
+            `${JSON.stringify({
+              type: "error",
+              message:
+                'Error from provider aws-bedrock: 403 Forbidden {"message":"anthropic.claude-sonnet-5 is not available for this account."}',
+            })}\n`
+          )
+        );
+        child.emit("close", 1);
+      });
+      return child;
+    }) as typeof childProcess.spawn;
+
+    const lm = lmStub();
+    const originalSelectChatModels = lm.selectChatModels;
+    let backupAttempted = false;
+    lm.selectChatModels = (): Promise<vscode.LanguageModelChat[]> =>
+      Promise.resolve([
+        {
+          id: "auto",
+          name: "Auto",
+          sendRequest: () => {
+            backupAttempted = true;
+            return Promise.reject(new Error("the backup must never run on a dirty tree"));
+          },
+        } as unknown as vscode.LanguageModelChat,
+      ]);
+
+    const workspace = vscode.workspace as unknown as {
+      fs: {
+        readFile: (uri: vscode.Uri) => Promise<Uint8Array>;
+        writeFile: (uri: vscode.Uri, bytes: Uint8Array) => Promise<void>;
+      };
+    };
+    const originalReadFile = workspace.fs.readFile;
+    const originalWriteFile = workspace.fs.writeFile;
+    workspace.fs.readFile = (uri: vscode.Uri): Promise<Uint8Array> =>
+      fs.promises.readFile(uri.fsPath);
+    workspace.fs.writeFile = (uri: vscode.Uri, bytes: Uint8Array): Promise<void> =>
+      fs.promises.writeFile(uri.fsPath, bytes);
+
+    const progressPath = path.join(taskFolder, "task-progress.json");
+    const now = new Date().toISOString();
+    fs.writeFileSync(
+      progressPath,
+      JSON.stringify(
+        { taskFolder: "task-a", currentStage: "impl", status: "active", createdAt: now, updatedAt: now },
+        null,
+        2
+      ),
+      "utf8"
+    );
+
+    const progressMessages: string[] = [];
+    try {
+      const settings = installModelSettings({
+        impl: {
+          primary: "cline-cli:default",
+          backup: "auto",
+          strategy: "switch-to-backup",
+        },
+      });
+      try {
+        const result = await runImplementationForModel({
+          modelId: "cline-cli:default",
+          prompt: "Implement the requested change.",
+          workspaceUri: taskFolderUri,
+          token: new vscode.CancellationTokenSource().token,
+          onProgress: (message: string) => {
+            progressMessages.push(message);
+          },
+          correlation: { actionKey: "implementation.v1" },
+          allowCrossProviderBackups: true,
+          stage: "impl",
+          taskFolderUri,
+        });
+
+        assert.strictEqual(
+          backupAttempted,
+          false,
+          "an available backup must never be dispatched at a tree the failed primary already edited"
+        );
+        assert.strictEqual(result.status, "failed");
+        assert.strictEqual(result.failureKind, "model-entitlement");
+        assert.match(
+          result.errorMessage ?? "",
+          /withheld the automatic switch/,
+          "expected the failure message to say the backup switch was deliberately withheld"
+        );
+        assert.match(
+          result.errorMessage ?? "",
+          /a model-entitlement block/,
+          "expected the withheld message to name a model-entitlement block, not a generic quota/outage label"
+        );
+        assert.ok(
+          progressMessages.some((message) => message.includes("withheld the automatic switch")),
+          "expected an explicit progress notification about the withheld backup"
+        );
       } finally {
         settings.restore();
       }
