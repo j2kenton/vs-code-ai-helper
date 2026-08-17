@@ -184,7 +184,7 @@ const LONE_SURROGATE_PATTERN_V1 =
  */
 const INERT_TRAILING_PATTERN_V1 = /^[\s\]}]{1,8}$/;
 
-/** Notified when a payload parsed only because inert trailing bytes were ignored. */
+/** Notified when JSON parsed only because inert trailing bytes were ignored. */
 export type InertTrailingObserverV1 = (inertTrailing: string) => void;
 
 let inertTrailingObserverV1: InertTrailingObserverV1 | undefined;

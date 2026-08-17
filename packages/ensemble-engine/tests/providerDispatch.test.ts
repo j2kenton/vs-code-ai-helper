@@ -212,6 +212,37 @@ test("result-envelope corpus: engine port and src parser agree on every accept a
       name: "unterminated frame with invalid JSON rejects as invalidFrame, not invalidJson",
       raw: `<<<ENSEMBLE_AI_RESULT_V1>>>\n{not json}`,
     },
+    {
+      // 2026-08-16 spool corpus: a complete, correct envelope plus one surplus
+      // `}` (brace-miscount at the end of a long escaped Markdown string) must
+      // be RECOVERED by both parsers — this is the case that drifted when the
+      // extension gained the tolerance and this port had not yet been updated.
+      name: "complete payload with one surplus trailing closer recovers",
+      raw:
+        `<<<ENSEMBLE_AI_RESULT_V1>>>\n${JSON.stringify({
+          version: 1,
+          correlation: CORRELATION,
+          kind: "cancelled",
+        })}}\n<<<END_ENSEMBLE_AI_RESULT_V1>>>`,
+    },
+    {
+      name: "surplus closer run beyond the bound still rejects",
+      raw:
+        `<<<ENSEMBLE_AI_RESULT_V1>>>\n${JSON.stringify({
+          version: 1,
+          correlation: CORRELATION,
+          kind: "cancelled",
+        })}${"}".repeat(20)}\n<<<END_ENSEMBLE_AI_RESULT_V1>>>`,
+    },
+    {
+      name: "trailing content that could begin a second value still rejects",
+      raw:
+        `<<<ENSEMBLE_AI_RESULT_V1>>>\n${JSON.stringify({
+          version: 1,
+          correlation: CORRELATION,
+          kind: "cancelled",
+        })}{"a":1}\n<<<END_ENSEMBLE_AI_RESULT_V1>>>`,
+    },
   ];
 
   for (const entry of corpus) {

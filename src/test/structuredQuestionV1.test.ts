@@ -4,11 +4,91 @@ import {
   canonicalJsonByteLengthV1,
   CanonicalJsonErrorV1,
   decodeStructuredAnswersArrayV1,
+  decodeStructuredQuestionsV1,
+  DEFAULT_TEXT_ANSWER_MAX_LENGTH_V1,
   MAX_ANSWER_SUBMISSION_CANONICAL_BYTES_V1,
   MAX_OPTIONS_V1,
   MAX_QUESTION_SET_CANONICAL_BYTES_V1,
   MAX_QUESTIONS_V1,
 } from "../types/structuredQuestionV1";
+
+void describe("decodeStructuredQuestionsV1 — app-owned text answer-box fields", () => {
+  // `allowBlank`/`maxLength` are not asked of the model (owner decision,
+  // 2026-08-16): absent → app-owned defaults; present (a persisted question
+  // set replayed from a chat transaction) → preserved verbatim.
+  void it("derives allowBlank=false for a required question when the fields are absent", () => {
+    const result = decodeStructuredQuestionsV1([
+      { questionId: "q1", kind: "text", prompt: "Which module?", required: true },
+    ]);
+    assert.equal(result.ok, true);
+    if (result.ok) {
+      const q = result.questions?.[0];
+      if (q?.kind === "text") {
+        assert.equal(q.allowBlank, false, "a mandatory answer is not blank");
+        assert.equal(q.maxLength, DEFAULT_TEXT_ANSWER_MAX_LENGTH_V1);
+      } else {
+        assert.fail("expected a text question");
+      }
+    }
+  });
+
+  void it("derives allowBlank=true for an optional question when the fields are absent", () => {
+    const result = decodeStructuredQuestionsV1([
+      { questionId: "q1", kind: "text", prompt: "Anything else?", required: false },
+    ]);
+    assert.equal(result.ok, true);
+    if (result.ok) {
+      const q = result.questions?.[0];
+      if (q?.kind === "text") {
+        assert.equal(q.allowBlank, true, "an optional answer may be blank");
+        assert.equal(q.maxLength, DEFAULT_TEXT_ANSWER_MAX_LENGTH_V1);
+      } else {
+        assert.fail("expected a text question");
+      }
+    }
+  });
+
+  void it("preserves present values verbatim, even ones the derivation would never produce", () => {
+    // The replay path: a persisted set may legitimately hold
+    // required-but-blank-accepted from an older version; the decode must not
+    // rewrite it or the stored questionSetSha256 stops matching.
+    const result = decodeStructuredQuestionsV1([
+      { questionId: "q1", kind: "text", prompt: "Which module?", required: true, allowBlank: true, maxLength: 200 },
+    ]);
+    assert.equal(result.ok, true);
+    if (result.ok) {
+      const q = result.questions?.[0];
+      if (q?.kind === "text") {
+        assert.equal(q.allowBlank, true);
+        assert.equal(q.maxLength, 200);
+      } else {
+        assert.fail("expected a text question");
+      }
+    }
+  });
+
+  void it("rejects a present but non-boolean allowBlank", () => {
+    const result = decodeStructuredQuestionsV1([
+      { questionId: "q1", kind: "text", prompt: "Which module?", required: true, allowBlank: "yes" },
+    ]);
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.match(result.reason ?? "", /non-boolean "allowBlank"/);
+    }
+  });
+
+  void it("rejects a present but invalid maxLength", () => {
+    for (const maxLength of [1.5, -1, "4000"]) {
+      const result = decodeStructuredQuestionsV1([
+        { questionId: "q1", kind: "text", prompt: "Which module?", required: true, maxLength },
+      ]);
+      assert.equal(result.ok, false, `maxLength ${JSON.stringify(maxLength)} must reject`);
+      if (!result.ok) {
+        assert.match(result.reason ?? "", /invalid "maxLength"/);
+      }
+    }
+  });
+});
 
 void describe("decodeStructuredAnswersArrayV1", () => {
   void it("decodes a valid text answer from unknown", () => {

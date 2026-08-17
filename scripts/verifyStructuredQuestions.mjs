@@ -71,6 +71,12 @@ const COMPILED_RUNTIME_RELATIVE = "out/types/structuredQuestionV1.js";
  */
 const FIXTURE_ROSTER = {
   "valid-text.json": { contract: "questions", expect: "valid" },
+  // Text question with ONLY the four fields the result contract documents:
+  // `allowBlank`/`maxLength` are app-owned (decoder defaults), so the schema
+  // must not demand them either. Locks the 2026-08-16 owner decision into the
+  // parity check — without this polarity both validators could re-tighten
+  // together and the gap would be invisible again.
+  "valid-text-app-owned-answer-box.json": { contract: "questions", expect: "valid" },
   "valid-single-choice.json": { contract: "questions", expect: "valid" },
   "valid-multiple-choice.json": { contract: "questions", expect: "valid" },
   "valid-mixed.json": { contract: "questions", expect: "valid" },

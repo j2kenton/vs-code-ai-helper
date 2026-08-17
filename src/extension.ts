@@ -173,7 +173,9 @@ export function activate(context: vscode.ExtensionContext): void {
   setInertTrailingObserverV1((inertTrailing) => {
     console.warn(
       "[ensemble:aiResult] recovered a payload with surplus trailing closers",
-      JSON.stringify({ inertTrailing, byteLength: inertTrailing.length })
+      // Real bytes, not .length: the inert set's `\s` matches Unicode
+      // whitespace, whose code-unit and UTF-8 lengths differ.
+      JSON.stringify({ inertTrailing, byteLength: Buffer.byteLength(inertTrailing, "utf8") })
     );
   });
 

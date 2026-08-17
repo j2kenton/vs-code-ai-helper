@@ -132,15 +132,17 @@ export function buildAiResultContractPromptV1(input: AiResultContractPromptInput
       // which also trips `maxSelections > options.length`. A model copying
       // the shape faithfully would have been rejected — recreating, one level
       // down, the exact "obeyed the contract it was given" failure this block
-      // exists to remove. Keep both option arrays at two entries.
+      // exists to remove. Keep both option arrays at two entries, with
+      // DISTINCT optionId placeholders: two identical `<stable-id>` entries
+      // trip the duplicate-optionId rejection, the same trap one level down.
       '- For "kind": "questions", "questions" must be an array of 1-16 objects, each exactly one of:',
       '    {"questionId":"<stable-id>","kind":"text","prompt":"<the question>","required":true}',
       '    {"questionId":"<stable-id>","kind":"singleChoice","prompt":"<the question>","required":true,' +
-        '"options":[{"optionId":"<stable-id>","label":"<shown to the user>"},' +
-        '{"optionId":"<stable-id>","label":"<shown to the user>"}]}',
+        '"options":[{"optionId":"<stable-id-1>","label":"<shown to the user>"},' +
+        '{"optionId":"<stable-id-2>","label":"<shown to the user>"}]}',
       '    {"questionId":"<stable-id>","kind":"multipleChoice","prompt":"<the question>","required":true,' +
-        '"options":[{"optionId":"<stable-id>","label":"<shown to the user>"},' +
-        '{"optionId":"<stable-id>","label":"<shown to the user>"}],"minSelections":1,"maxSelections":2}',
+        '"options":[{"optionId":"<stable-id-1>","label":"<shown to the user>"},' +
+        '{"optionId":"<stable-id-2>","label":"<shown to the user>"}],"minSelections":1,"maxSelections":2}',
       '  "options" must have 2-32 entries; "maxSelections" must not exceed the number of options.',
       '  "helpText" is the only optional field. Send NO other fields — answer-box behaviour is not yours to set.',
       "  Ask questions ONLY when you cannot complete the action without an answer; never write " +

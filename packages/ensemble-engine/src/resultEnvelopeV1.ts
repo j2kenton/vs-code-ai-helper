@@ -176,6 +176,31 @@ const LONE_SURROGATE_PATTERN_V1 =
  */
 const INERT_TRAILING_PATTERN_V1 = /^[\s\]}]{1,8}$/;
 
+/** Notified when JSON parsed only because inert trailing bytes were ignored. */
+export type InertTrailingObserverV1 = (inertTrailing: string) => void;
+
+let inertTrailingObserverV1: InertTrailingObserverV1 | undefined;
+
+/**
+ * Wire a sink for the recovery above, so the tolerance is visible in logs
+ * rather than silent. Optional by design: this module stays dependency-light,
+ * so it reports through a seam instead of importing a logger. The embedding
+ * application wires it once; tests assert on it. Ported from the extension's
+ * `src/types/aiResultEnvelope.ts`, which wires it in `activate()`.
+ */
+export function setInertTrailingObserverV1(observer: InertTrailingObserverV1 | undefined): void {
+  inertTrailingObserverV1 = observer;
+}
+
+/** Report, never affect. A throwing observer must not change parse behaviour. */
+function recordInertTrailingV1(inertTrailing: string): void {
+  try {
+    inertTrailingObserverV1?.(inertTrailing);
+  } catch {
+    // Observation is a side channel; parsing correctness cannot depend on it.
+  }
+}
+
 function utf8ByteLength(text: string): number {
   return Buffer.byteLength(text, "utf8");
 }
@@ -1077,6 +1102,9 @@ function parseUnterminatedFrameV1(
   if (!parsed.ok) {
     return malformed("invalidFrame", raw, missingTerminatorReason);
   }
+  if (parsed.inertTrailing.length > 0) {
+    recordInertTrailingV1(parsed.inertTrailing);
+  }
 
   return decodeEnvelopeV1(parsed.value, raw, expectedCorrelation);
 }
@@ -1152,6 +1180,12 @@ export function parseAiResultEnvelopeV1(
   const parsed = parseStrictJsonV1(jsonLine);
   if (!parsed.ok) {
     return malformed("invalidJson", raw, parsed.reason);
+  }
+  if (parsed.inertTrailing.length > 0) {
+    // Accepted, but never silently: a model that miscounts its closers is
+    // worth knowing about even when the payload is recoverable, and a silent
+    // tolerance would hide a genuinely new malformation behind this one.
+    recordInertTrailingV1(parsed.inertTrailing);
   }
 
   return decodeEnvelopeV1(parsed.value, raw, expectedCorrelation);
