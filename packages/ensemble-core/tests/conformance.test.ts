@@ -94,6 +94,10 @@ test("sha256V1 matches the FIPS 180-4 test vectors", () => {
 test("structured-question constants match the extension's", () => {
   assert.equal(coreQuestions.MIN_QUESTIONS_V1, srcQuestions.MIN_QUESTIONS_V1);
   assert.equal(coreQuestions.MAX_QUESTIONS_V1, srcQuestions.MAX_QUESTIONS_V1);
+  assert.equal(
+    coreQuestions.DEFAULT_TEXT_ANSWER_MAX_LENGTH_V1,
+    srcQuestions.DEFAULT_TEXT_ANSWER_MAX_LENGTH_V1
+  );
   assert.equal(coreQuestions.MIN_OPTIONS_V1, srcQuestions.MIN_OPTIONS_V1);
   assert.equal(coreQuestions.MAX_OPTIONS_V1, srcQuestions.MAX_OPTIONS_V1);
   assert.equal(
@@ -128,6 +132,7 @@ test("structured-question constants match the extension's", () => {
  */
 const QUESTION_FIXTURE_CONTRACTS: Record<string, "questions" | "answers"> = {
   "valid-text.json": "questions",
+  "valid-text-app-owned-answer-box.json": "questions",
   "valid-single-choice.json": "questions",
   "valid-multiple-choice.json": "questions",
   "valid-mixed.json": "questions",

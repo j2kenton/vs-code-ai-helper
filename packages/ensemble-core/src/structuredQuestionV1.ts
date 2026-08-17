@@ -74,6 +74,7 @@ export type StructuredAnswerV1 =
 
 export const MIN_QUESTIONS_V1 = 1;
 export const MAX_QUESTIONS_V1 = 16;
+export const DEFAULT_TEXT_ANSWER_MAX_LENGTH_V1 = 4000;
 export const MAX_QUESTION_SET_CANONICAL_BYTES_V1 = 256 * 1024;
 export const MIN_OPTIONS_V1 = 2;
 export const MAX_OPTIONS_V1 = 32;
@@ -176,10 +177,13 @@ function decodeQuestion(raw: unknown): StructuredQuestionV1 | string {
 
   switch (raw.kind) {
     case "text": {
-      if (typeof raw.allowBlank !== "boolean") {
-        return `text question "${raw.questionId}" is missing a boolean "allowBlank"`;
+      if (raw.allowBlank !== undefined && typeof raw.allowBlank !== "boolean") {
+        return `text question "${raw.questionId}" has a non-boolean "allowBlank"`;
       }
-      if (typeof raw.maxLength !== "number" || !Number.isInteger(raw.maxLength) || raw.maxLength < 0) {
+      if (
+        raw.maxLength !== undefined &&
+        (typeof raw.maxLength !== "number" || !Number.isInteger(raw.maxLength) || raw.maxLength < 0)
+      ) {
         return `text question "${raw.questionId}" has an invalid "maxLength"`;
       }
       const unknownField = rejectUnknownFields(
@@ -190,7 +194,12 @@ function decodeQuestion(raw: unknown): StructuredQuestionV1 | string {
       if (unknownField) {
         return unknownField;
       }
-      return { ...base, kind: "text", allowBlank: raw.allowBlank, maxLength: raw.maxLength };
+      return {
+        ...base,
+        kind: "text",
+        allowBlank: raw.allowBlank ?? !base.required,
+        maxLength: raw.maxLength ?? DEFAULT_TEXT_ANSWER_MAX_LENGTH_V1,
+      };
     }
     case "singleChoice": {
       const options = decodeOptions(raw.options);
