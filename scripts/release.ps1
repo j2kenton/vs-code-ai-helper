@@ -14,6 +14,43 @@ function Get-RepoRoot {
     return $root.Trim()
 }
 
+function Get-LatestPublishedVersion {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ExtensionId
+    )
+
+    try {
+        $json = & pnpm exec vsce show $ExtensionId --json 2>$null
+        if (-not $json) {
+            return $null
+        }
+        $data = $json | ConvertFrom-Json
+        $latest = $data.versions | Select-Object -First 1
+        if (-not $latest -or -not $latest.version) {
+            return $null
+        }
+        return [string]$latest.version
+    }
+    catch {
+        return $null
+    }
+}
+
+function TryParse-SemVer {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$VersionText
+    )
+
+    try {
+        return [Version]$VersionText
+    }
+    catch {
+        return $null
+    }
+}
+
 $repoRoot = Get-RepoRoot
 Set-Location $repoRoot
 
@@ -29,7 +66,7 @@ foreach ($name in @("package", "publish:patch", "publish:minor", "publish:major"
     # chains.  The package script uses &&, so validate each command rather than
     # rejecting the shell operator outright.
     $safe = ($command -match '^(?:[a-zA-Z0-9_:\-.]+\s+run\s+[a-zA-Z0-9_:\-.]+)(?:\s+&&\s+(?:[a-zA-Z0-9_:\-.]+\s+run\s+[a-zA-Z0-9_:\-.]+|node\s+[a-zA-Z0-9_./:\-]+(?:\s+--production)?))*$') -or
-      ($command -match '^vsce\s+publish\s+(patch|minor|major)$')
+    ($command -match '^vsce\s+publish\s+(patch|minor|major)$')
     if ($allowedRunners -notcontains $runner -or -not $safe) {
         throw "Unsafe package script '$name': $command"
     }
@@ -91,9 +128,54 @@ if ($LASTEXITCODE -ne 0) {
 # --- vsce publish <bump> bumps package.json, commits "<version>", tags v<version>, and publishes ---
 Write-Host ""
 Write-Host "Publishing ($bump)..." -ForegroundColor Cyan
-& pnpm run "publish:$bump"
-if ($LASTEXITCODE -ne 0) {
-    throw "vsce publish failed. package.json version may or may not have been bumped locally - check 'git status' and 'git log'."
+$publishLines = @(& pnpm run "publish:$bump" 2>&1)
+$publishExitCode = $LASTEXITCODE
+$publishLines | ForEach-Object { Write-Host $_ }
+if ($publishExitCode -ne 0) {
+    $publishText = ($publishLines | ForEach-Object { $_.ToString() }) -join "`n"
+    $isMarketplaceTransient =
+    ($publishText -match "TF10216") -or
+    ($publishText -match "Azure DevOps services are currently unavailable")
+
+    $localVersionAfterFailure = (Get-Content (Join-Path $repoRoot "package.json") -Raw | ConvertFrom-Json).version
+    $extensionId = "$($package.publisher).$($package.name)"
+    $publishedVersion = Get-LatestPublishedVersion -ExtensionId $extensionId
+
+    $localVersionParsed = TryParse-SemVer -VersionText $localVersionAfterFailure
+    $publishedVersionParsed = if ($publishedVersion) { TryParse-SemVer -VersionText $publishedVersion } else { $null }
+
+    $tagsAtHead = @(& git tag --points-at HEAD)
+    $hasCurrentVersionTagAtHead = $tagsAtHead -contains "v$localVersionAfterFailure"
+
+    Write-Host "" -ForegroundColor Yellow
+    Write-Host "Publish failed." -ForegroundColor Yellow
+    if ($publishedVersion) {
+        Write-Host "Marketplace latest version: $publishedVersion" -ForegroundColor Yellow
+    }
+    else {
+        Write-Host "Marketplace latest version: (unavailable)" -ForegroundColor Yellow
+    }
+    Write-Host "Local package.json version: $localVersionAfterFailure" -ForegroundColor Yellow
+
+    if ($isMarketplaceTransient) {
+        Write-Host "" -ForegroundColor Yellow
+        Write-Host "Detected transient Marketplace outage (TF10216)." -ForegroundColor Yellow
+    }
+
+    if ($localVersionParsed -and $publishedVersionParsed -and $localVersionParsed -gt $publishedVersionParsed -and $hasCurrentVersionTagAtHead) {
+        Write-Host "" -ForegroundColor Yellow
+        Write-Host "A local release commit/tag appears to exist but is not published yet." -ForegroundColor Yellow
+        Write-Host "Retry publishing THIS exact version (no extra bump):" -ForegroundColor Yellow
+        Write-Host "  pnpm exec vsce publish $localVersionAfterFailure --no-git-tag-version --no-update-package-json --skip-duplicate" -ForegroundColor Yellow
+    }
+    else {
+        Write-Host "" -ForegroundColor Yellow
+        Write-Host "Check local release state before retrying:" -ForegroundColor Yellow
+        Write-Host "  git status --short" -ForegroundColor Yellow
+        Write-Host "  git log --oneline -n 5" -ForegroundColor Yellow
+    }
+
+    throw "vsce publish failed. See diagnostics above."
 }
 
 $newVersion = (Get-Content (Join-Path $repoRoot "package.json") -Raw | ConvertFrom-Json).version
