@@ -2,7 +2,7 @@
   "name": "vs-code-ai-helper",
   "displayName": "Ensemble",
   "description": "AI-assisted task planning and implementation workflow for VS Code. Uses your existing AI subscriptions (Copilot, Claude, Codex, Gemini, Antigravity, Kiro) — real usage costs apply. AI runs can modify workspace files. Provided as-is with no warranty. See README and DISCLAIMER.md.",
-  "version": "0.90.5",
+  "version": "0.90.6",
   "publisher": "j2kenton",
   "license": "MIT",
   "packageManager": "pnpm@10.34.5",
