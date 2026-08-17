@@ -1,7 +1,7 @@
 import * as assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { describe, it } from "node:test";
-import { parseAiResultEnvelopeV1 } from "../types/aiResultEnvelope";
+import { parseAiResultEnvelopeV1, setInertTrailingObserverV1 } from "../types/aiResultEnvelope";
 import { ActionCorrelationV1 } from "../types/actionCorrelationV1";
 
 const HEX_A = "a".repeat(32);
@@ -733,10 +733,43 @@ void describe("parseAiResultEnvelopeV1 — frame parsing", () => {
     }
   });
 
-  void it("still rejects the extra-outer-brace shape (both markers present, invalid JSON) as invalidJson, not invalidFrame", () => {
-    // The observed attempt-1 shape from the field report: terminator IS
-    // present, so this is still the terminated path — only the JSON is bad.
-    const raw = `<<<ENSEMBLE_AI_RESULT_V1>>>\n{"version": 1, "correlation": ${JSON.stringify(correlation())}, "kind": "cancelled"}}\n<<<END_ENSEMBLE_AI_RESULT_V1>>>`;
+  /**
+   * REVERSED 2026-08-17, deliberately. This test previously asserted that the
+   * extra-outer-brace shape stays malformed ("still rejects … as invalidJson,
+   * not invalidFrame"), written from a single field sighting where the
+   * surplus brace read as simply bad JSON.
+   *
+   * The evidence changed. The provider-result spool held EIGHT payloads of
+   * exactly this shape — a complete, correct envelope plus one surplus closer
+   * — across THREE providers (Copilot `applyReview.v1` ×3, OpenAI Codex
+   * `draft.v1` ×2 and `review.v1`, Cline `generateImplementation.v1` ×2).
+   * Every one was 9-13KB of finished work discarded over one character,
+   * because brace-counting fails at the end of a long escaped Markdown
+   * string. That is not a model producing nonsense; it is a finished result
+   * with a miscounted tail.
+   *
+   * The original test's OTHER purpose — pinning the classification as
+   * invalidJson rather than invalidFrame when both markers are present — is
+   * still valuable and is kept in the sibling test below, using a payload
+   * that is genuinely unparseable.
+   */
+  void it("recovers the extra-outer-brace shape (complete value, one surplus closer) and reports the recovery", () => {
+    const seen: string[] = [];
+    setInertTrailingObserverV1((t) => seen.push(t));
+    try {
+      const raw = `<<<ENSEMBLE_AI_RESULT_V1>>>\n{"version": 1, "correlation": ${JSON.stringify(correlation())}, "kind": "cancelled"}}\n<<<END_ENSEMBLE_AI_RESULT_V1>>>`;
+      const result = parseAiResultEnvelopeV1(raw);
+      assert.equal(result.kind, "cancelled", "the envelope is complete before the surplus brace");
+      assert.deepEqual(seen, ["}"], "recovery must be observable, not silent");
+    } finally {
+      setInertTrailingObserverV1(undefined);
+    }
+  });
+
+  void it("classifies genuinely unparseable JSON with both markers present as invalidJson, not invalidFrame", () => {
+    // The surviving half of the reversed test above: when the terminator IS
+    // present, a bad payload is the JSON's fault, not the frame's.
+    const raw = `<<<ENSEMBLE_AI_RESULT_V1>>>\n{"version": 1, "correlation": ${JSON.stringify(correlation())}, "kind":}\n<<<END_ENSEMBLE_AI_RESULT_V1>>>`;
     const result = parseAiResultEnvelopeV1(raw);
     assert.equal(result.kind, "malformed");
     if (result.kind === "malformed") {
@@ -842,5 +875,89 @@ void describe("parseAiResultEnvelopeV1 — frame parsing", () => {
     if (result.kind === "malformed") {
       assert.equal(result.code, "resultLimitExceeded");
     }
+  });
+});
+
+void describe("parseAiResultEnvelopeV1 — a complete value followed by surplus closers", () => {
+  /**
+   * Field shape, not a hypothetical. On 2026-08-16 the provider-result spool
+   * held eight rejected payloads that were a COMPLETE, correct envelope
+   * followed by one extra `}` — Copilot `applyReview.v1` ×3, OpenAI Codex
+   * `draft.v1` ×2 and `review.v1`, Cline `generateImplementation.v1` ×2. Each
+   * was 9-13KB of finished work (a plan, an applied review, an
+   * implementation) discarded over a single character, because brace-counting
+   * fails at the end of a long escaped Markdown string. It is not
+   * provider-specific: three of the four providers in the corpus do it.
+   */
+  const payload = {
+    version: 1,
+    correlation: correlation(),
+    kind: "completed" as const,
+    content: {
+      contentType: "markdown-artifact.v1" as const,
+      schemaVersion: 1 as const,
+      markdown: "# Security hardening plan\n\n## Goal\nAudit the surface.",
+    },
+  };
+
+  void it("recovers the payload when the surplus is a closer, and reports the recovery", () => {
+    const seen: string[] = [];
+    setInertTrailingObserverV1((t) => seen.push(t));
+    try {
+      const raw = frame(payload).replace(
+        `${JSON.stringify(payload)}\n`,
+        `${JSON.stringify(payload)}}\n`
+      );
+      const result = parseAiResultEnvelopeV1(raw);
+      assert.equal(result.kind, "completed", "a complete value must survive one surplus closer");
+      if (result.kind === "completed") {
+        assert.equal(result.content.contentType, "markdown-artifact.v1");
+      }
+      assert.deepEqual(seen, ["}"], "the tolerance must be observable, never silent");
+    } finally {
+      setInertTrailingObserverV1(undefined);
+    }
+  });
+
+  void it("does NOT report anything for a clean payload", () => {
+    const seen: string[] = [];
+    setInertTrailingObserverV1((t) => seen.push(t));
+    try {
+      assert.equal(parseAiResultEnvelopeV1(frame(payload)).kind, "completed");
+      assert.deepEqual(seen, []);
+    } finally {
+      setInertTrailingObserverV1(undefined);
+    }
+  });
+
+  void it("still rejects trailing content that could begin another value", () => {
+    // The tolerance must not become "ignore anything after the JSON": a
+    // second object, prose, or a truncated fragment all still fail. Only
+    // structurally inert surplus is recoverable.
+    for (const tail of ['{"a":1}', "oops", '"x"', "1", "[]"]) {
+      const raw = frame(payload).replace(
+        `${JSON.stringify(payload)}\n`,
+        `${JSON.stringify(payload)}${tail}\n`
+      );
+      assert.equal(
+        parseAiResultEnvelopeV1(raw).kind,
+        "malformed",
+        `trailing ${JSON.stringify(tail)} must still reject`
+      );
+    }
+  });
+
+  void it("rejects a surplus run longer than the bound", () => {
+    const raw = frame(payload).replace(
+      `${JSON.stringify(payload)}\n`,
+      `${JSON.stringify(payload)}${"}".repeat(20)}\n`
+    );
+    assert.equal(parseAiResultEnvelopeV1(raw).kind, "malformed");
+  });
+
+  void it("a truncated payload still fails — the value must be complete first", () => {
+    const truncated = JSON.stringify(payload).slice(0, -12);
+    const raw = frame(payload).replace(`${JSON.stringify(payload)}\n`, `${truncated}\n`);
+    assert.equal(parseAiResultEnvelopeV1(raw).kind, "malformed");
   });
 });

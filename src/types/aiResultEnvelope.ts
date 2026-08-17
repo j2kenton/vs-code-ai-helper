@@ -173,6 +173,41 @@ const STABLE_ID_PATTERN_V1 = /^[\x21-\x7E]{1,128}$/;
 const LONE_SURROGATE_PATTERN_V1 =
   /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?:^|[^\uD800-\uDBFF])[\uDC00-\uDFFF]/;
 
+/**
+ * Trailing characters that cannot change the meaning of an already-complete
+ * JSON value: surplus closing brackets and whitespace, nothing else.
+ *
+ * Deliberately NOT "any trailing text". A `{`, `[`, digit, quote or letter
+ * could begin a second value or a truncated one, so those keep failing. The
+ * bound stops a runaway tail from being waved through — the observed real
+ * cases are a single `}`.
+ */
+const INERT_TRAILING_PATTERN_V1 = /^[\s\]}]{1,8}$/;
+
+/** Notified when a payload parsed only because inert trailing bytes were ignored. */
+export type InertTrailingObserverV1 = (inertTrailing: string) => void;
+
+let inertTrailingObserverV1: InertTrailingObserverV1 | undefined;
+
+/**
+ * Wire a sink for the recovery above, so the tolerance is visible in logs
+ * rather than silent. Optional by design: this module stays dependency-light
+ * (crypto plus two local type modules), so it reports through a seam instead
+ * of importing a logger. Production wires it once; tests assert on it.
+ */
+export function setInertTrailingObserverV1(observer: InertTrailingObserverV1 | undefined): void {
+  inertTrailingObserverV1 = observer;
+}
+
+/** Report, never affect. A throwing observer must not change parse behaviour. */
+function recordInertTrailingV1(inertTrailing: string): void {
+  try {
+    inertTrailingObserverV1?.(inertTrailing);
+  } catch {
+    // Observation is a side channel; parsing correctness cannot depend on it.
+  }
+}
+
 function utf8ByteLength(text: string): number {
   return Buffer.byteLength(text, "utf8");
 }
@@ -204,6 +239,13 @@ function malformed(
 interface StrictJsonParseOk {
   readonly ok: true;
   readonly value: unknown;
+  /**
+   * Characters left over after a COMPLETE value was parsed, when they are
+   * structurally inert (see {@link INERT_TRAILING_PATTERN_V1}). Empty for a
+   * clean parse. Never a second value: anything that could begin one makes
+   * the parse fail instead, so this is only ever surplus closers/whitespace.
+   */
+  readonly inertTrailing: string;
 }
 interface StrictJsonParseErr {
   readonly ok: false;
@@ -467,9 +509,24 @@ function parseStrictJsonV1(text: string): StrictJsonParseResult {
     const value = parseValue(0);
     skipWs();
     if (i !== len) {
-      return { ok: false, reason: `unexpected trailing content at position ${i}` };
+      // A COMPLETE value followed only by surplus closers/whitespace is
+      // recoverable; anything else is not. Four providers (Copilot, Codex,
+      // Cline) were observed emitting one extra `}` after an otherwise
+      // perfect envelope — brace-miscounting at the end of a long escaped
+      // Markdown string — and ~9-13KB of correct work was discarded over one
+      // character. See the caller, which decides whether to accept this.
+      //
+      // Safe because the value is already whole: this cannot admit a
+      // truncated payload (that fails inside parseValue), a second value, or
+      // prose — `{`, `[`, a digit, a quote or a letter all fall outside the
+      // inert set and still reject.
+      const rest = text.slice(i);
+      if (!INERT_TRAILING_PATTERN_V1.test(rest)) {
+        return { ok: false, reason: `unexpected trailing content at position ${i}` };
+      }
+      return { ok: true, value, inertTrailing: rest };
     }
-    return { ok: true, value };
+    return { ok: true, value, inertTrailing: "" };
   } catch (error) {
     return {
       ok: false,
@@ -1039,6 +1096,9 @@ function parseUnterminatedFrameV1(
   if (!parsed.ok) {
     return malformed("invalidFrame", raw, missingTerminatorReason);
   }
+  if (parsed.inertTrailing.length > 0) {
+    recordInertTrailingV1(parsed.inertTrailing);
+  }
 
   return decodeEnvelopeV1(parsed.value, raw, expectedCorrelation);
 }
@@ -1106,6 +1166,12 @@ export function parseAiResultEnvelopeV1(
   const parsed = parseStrictJsonV1(jsonLine);
   if (!parsed.ok) {
     return malformed("invalidJson", raw, parsed.reason);
+  }
+  if (parsed.inertTrailing.length > 0) {
+    // Accepted, but never silently: a model that miscounts its closers is
+    // worth knowing about even when the payload is recoverable, and a silent
+    // tolerance would hide a genuinely new malformation behind this one.
+    recordInertTrailingV1(parsed.inertTrailing);
   }
 
   return decodeEnvelopeV1(parsed.value, raw, expectedCorrelation);
