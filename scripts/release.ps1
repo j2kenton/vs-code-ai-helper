@@ -128,8 +128,27 @@ if ($LASTEXITCODE -ne 0) {
 # --- vsce publish <bump> bumps package.json, commits "<version>", tags v<version>, and publishes ---
 Write-Host ""
 Write-Host "Publishing ($bump)..." -ForegroundColor Cyan
-$publishLines = @(& pnpm run "publish:$bump" 2>&1)
-$publishExitCode = $LASTEXITCODE
+$previousErrorActionPreference = $ErrorActionPreference
+$hadNativeStderrPreference = Test-Path Variable:PSNativeCommandUseErrorActionPreference
+if ($hadNativeStderrPreference) {
+    $previousNativeStderrPreference = $PSNativeCommandUseErrorActionPreference
+    $PSNativeCommandUseErrorActionPreference = $false
+}
+
+try {
+    # Capture stdout+stderr so transient Marketplace errors can be classified
+    # without letting warning-only stderr lines short-circuit the script.
+    $ErrorActionPreference = "Continue"
+    $publishLines = @(& pnpm run "publish:$bump" 2>&1)
+    $publishExitCode = $LASTEXITCODE
+}
+finally {
+    $ErrorActionPreference = $previousErrorActionPreference
+    if ($hadNativeStderrPreference) {
+        $PSNativeCommandUseErrorActionPreference = $previousNativeStderrPreference
+    }
+}
+
 $publishLines | ForEach-Object { Write-Host $_ }
 if ($publishExitCode -ne 0) {
     $publishText = ($publishLines | ForEach-Object { $_.ToString() }) -join "`n"
