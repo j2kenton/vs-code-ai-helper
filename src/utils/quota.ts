@@ -331,15 +331,20 @@ const QUOTA_REMEDY_UNKNOWN_RESET_TEXT_V1 =
   "Rerun this stage to retry with the same model, or switch the stage's model before rerunning.";
 
 /**
- * Part 5 step 3: branch a quota/entitlement-parked stage's remedy text by
- * how soon (if at all) the provider's own reported reset time falls.
+ * Workflow 3 continuation, first item: branch a quota/entitlement-parked
+ * stage's remedy text by how soon (if at all) the provider's own reported
+ * reset time falls.
  *  - no known `resetAt` → today's wording, unchanged;
  *  - `resetAt` within `ensemble.resilience.quotaResetNearThresholdHours`
- *    (default 24) → name the local rerun time and note manual retry is the
- *    only option today (no auto-resume scheduling is wired up yet);
+ *    (default 24) → name the local rerun time and the "Rerun after reset"
+ *    action a near reset actually attaches (runnerRegistry.ts's withheld-
+ *    cascade notice and pauseTaskForExhaustedChainV1 in reviewActions.ts
+ *    both gate that action on this exact same near/far branch), or
+ *    switching the stage's model instead;
  *  - `resetAt` beyond the threshold → name the concrete date/time the
  *    provider stays blocked and advise switching the stage's model instead,
- *    without offering an immediate rerun.
+ *    without offering or implying an immediate rerun — a scheduled resume
+ *    days out is not a recovery, it is an abandonment with extra steps.
  */
 /**
  * Whether a known quota/entitlement reset time falls BEYOND the "near"
@@ -384,9 +389,9 @@ export function buildQuotaRemedyTextV1(
   const localResetTime = resetDate.toLocaleString();
   if (!isQuotaResetBeyondThresholdV1(resetAt, now, thresholdHoursOverride)) {
     return (
-      `Rerun this stage after ${localResetTime}, once the limit lifts — Ensemble does not ` +
-      "auto-resume this stage yet, so retry manually once available. You can also switch the " +
-      "stage's model before rerunning."
+      `Rerun this stage after ${localResetTime}, once the limit lifts — use the "Rerun after ` +
+      'reset" action to schedule the retry automatically, or switch the stage\'s model before ' +
+      "rerunning."
     );
   }
   return (

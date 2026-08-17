@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import { AI_MODEL_STAGES, STAGE_DISPLAY_NAMES, TaskStage } from "../types/taskProgress";
 import {
   clearTaskStageModels,
+  describeStageSubstitutesV1,
   findTaskModelConflicts,
   getAvailableModels,
 } from "../utils/modelSelection";
@@ -25,7 +26,11 @@ import {
 } from "../runners/providers";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { getExtensionContextV1 } from "../utils/extensionContextV1";
-import { buildQuotaRemedyTextV1, listParkedQuotaLedgerEntriesV1 } from "../utils/quota";
+import {
+  buildQuotaRemedyTextV1,
+  isQuotaResetBeyondThresholdV1,
+  listParkedQuotaLedgerEntriesV1,
+} from "../utils/quota";
 
 type IncomingMessage =
   | { type: "ready" }
@@ -544,6 +549,13 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
    * omitted) when the extension context isn't available yet (e.g. very
    * early activation) or nothing is parked, so the webview can render an
    * empty state deterministically rather than branching on `undefined`.
+   *
+   * Workflow 3 continuation, first item (Part 6 step 5): a parked entry is
+   * persistent state, not a one-off progress message — so unlike the
+   * transient withheld-cascade notice in runnerRegistry.ts, this is the
+   * place an operator who missed that notice (or opened the panel later,
+   * after a host restart) can still learn which OTHER stages a long outage
+   * silently affected. Mirrors the same far-reset-only enumeration.
    */
   private _buildQuotaWarnings(): Array<{ providerId: string; providerLabel: string; modelId: string; text: string }> {
     const context = getExtensionContextV1();
@@ -554,11 +566,19 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       const provider = getProviderAccountEntry(entry.providerId);
       const providerLabel = provider ? accountEntryDisplayLabel(provider) : entry.providerId;
       const kindLabel = entry.failureKind === "model-entitlement" ? "not entitled to this model" : "quota exhausted";
+      const affectedStageDescriptions =
+        entry.resetAt !== undefined && isQuotaResetBeyondThresholdV1(entry.resetAt)
+          ? describeStageSubstitutesV1(entry.modelId)
+          : [];
+      const affectedStagesClause =
+        affectedStageDescriptions.length > 0
+          ? ` This also affects: ${affectedStageDescriptions.join("; ")}.`
+          : "";
       return {
         providerId: entry.providerId,
         providerLabel,
         modelId: entry.modelId,
-        text: `${providerLabel} — ${entry.modelId}: ${kindLabel}. ${buildQuotaRemedyTextV1(entry.resetAt)}`,
+        text: `${providerLabel} — ${entry.modelId}: ${kindLabel}. ${buildQuotaRemedyTextV1(entry.resetAt)}${affectedStagesClause}`,
       };
     });
   }

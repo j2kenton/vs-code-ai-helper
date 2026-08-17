@@ -80,8 +80,11 @@ import {
 } from "../utils/fileUtils";
 import {
   ChecklistProgressV1,
+  countChecklistProgressV1,
+  filterUncheckedPlanItemsV1,
   hasImplementationChecklistV1,
   IMPLEMENTATION_CHECKLIST_MARKER,
+  listUncheckedChecklistItemTextsV1,
   mergeChecklistProgressV1,
 } from "../utils/implementationChecklist";
 import { generateContextPack, writeContextPack, writeImplReviewContextPack } from "../utils/contextPack";
@@ -103,6 +106,7 @@ import {
   runImplementationOrSealedV1,
 } from "./runEditActionV1";
 import {
+  describeStageSubstitutesV1,
   ResolvedStageModel,
   resolveConfiguredReviewStages,
   resolveFreshModelForStage,
@@ -154,6 +158,7 @@ import { REVIEW_ACTION_KEY_V1, ReviewActionInputV1 } from "../actions/rows/revie
 import { APPLY_REVIEW_ACTION_KEY_V1, ApplyReviewActionInputV1 } from "../actions/rows/applyReviewRowV1";
 import { NEXT_STAGE_ACTION_KEY_V1 } from "../actions/rows/nextStageRowV1";
 import { ProviderChainExhaustionV1, TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
+import { WorkflowUnavailableCodeV1 } from "../types/workflowAvailabilityV1";
 import { ChatInteractionRefV1, ChatInteractionResumeResultV1, ChatViewProvider } from "../views/chatView";
 import { TaskInventory } from "../state/taskInventory";
 import {
@@ -166,6 +171,7 @@ import {
   parseReviewBlockersDetailed,
   parseReviewedCommitSha,
   parseReviewProgress,
+  parseReviewVerifiedCompleteV1,
   reconcileProgressWithChecklistV1,
   detectSiblingReviewDisagreement,
   REVIEWED_COMMIT_STAGES,
@@ -196,6 +202,7 @@ import {
   degenerateReviewRejectionReason,
   detectBlockerSetStall,
   detectPlateau,
+  latestQualifyingReviewMeetsThresholdV1,
   REVIEW_RUBRIC_BLOCKER_SCORE_CAP,
   roundsWithoutTaskFixableDecrease,
   rubricCapLikelyBlockedAdvance,
@@ -1218,6 +1225,37 @@ export function buildStayingOnStageNoticeV1(
 }
 
 /**
+ * Bounded, human-readable bullet list of a checklist's outstanding items —
+ * shared by every surface that used to just say "tick the missed items in
+ * plan-final.md" with nothing named (the latch-trip note, the
+ * reconciliation-needed note, and the no-progress breaker escalation).
+ * Naming the items is what turns that instruction into something an operator
+ * can act on without opening a plan they may not have on screen (workflow 3
+ * continuation plan, Part 5). Returns "" when there is nothing outstanding to
+ * name (no checklist, or nothing unchecked).
+ *
+ * @internal exported for testing
+ */
+export function describeOutstandingChecklistItemsV1(
+  planOfRecord: string | undefined,
+  limit: number = 10
+): string {
+  if (planOfRecord === undefined) {
+    return "";
+  }
+  const unchecked = listUncheckedChecklistItemTextsV1(planOfRecord, limit);
+  if (unchecked.total === 0) {
+    return "";
+  }
+  const bullets = unchecked.items.map((item) => `- ${item}`).join("\n");
+  const more =
+    unchecked.total > unchecked.items.length
+      ? `\n…and ${unchecked.total - unchecked.items.length} more.`
+      : "";
+  return `\n${bullets}${more}`;
+}
+
+/**
  * Build the `{{siblingReviewDisagreement}}` block for the Publish review
  * prompt (2k): when the impl-high and impl-low reviews of the exact commit
  * Publish is about to assess disagree on whether the plan is actually
@@ -1913,9 +1951,17 @@ export async function writeReviewRunLogV1(
     // use the same provider-attribution format successful rounds record.
     const exhaustion =
       outcome.kind === "unavailable" ? outcome.chainExhaustion : undefined;
+    // workflow 3 continuation, third item: `candidatesExhausted` (every
+    // candidate was reserved, invoked, and failed) is the opposite condition
+    // from `providerModeUnavailable` (nothing was ever reserved) — "no
+    // provider could be acquired" is only true of the second.
+    const exhaustionHeadline =
+      outcome.kind === "unavailable" && outcome.code === "candidatesExhausted"
+        ? `Every configured model was tried and failed for ${exhaustion?.stage ?? ctx.targetStage}.`
+        : `No provider could be acquired for ${exhaustion?.stage ?? ctx.targetStage}.`;
     const exhaustionSection = exhaustion
       ? `\n## Provider chain exhausted\n\n` +
-        `No provider could be acquired for ${exhaustion.stage ?? ctx.targetStage}. ` +
+        `${exhaustionHeadline} ` +
         `The resolved chain, in ranked order:\n\n` +
         (exhaustion.candidates.length > 0
           ? exhaustion.candidates
@@ -1942,6 +1988,53 @@ export async function writeReviewRunLogV1(
   } catch {
     // Ignore: the review's own outcome has already been surfaced.
   }
+}
+
+/**
+ * After a review completes, tell the operator when it named plan items as
+ * verified-complete that plan-final.md still shows unticked — the "Apply N
+ * reviewer-verified ticks" one-click path (workflow 3 continuation plan,
+ * Part 5). Plan review stages carry no implementation checklist at all, so
+ * this is a no-op for them. Best-effort: a read failure here must never break
+ * the review-completion flow it's attached to, so it only ever logs to the
+ * status surface via the caller's existing error handling — there is nothing
+ * destructive here to guard with a try/catch of its own beyond the reads
+ * `readPlanOfRecordV1` already makes safe.
+ */
+async function notifyReviewerVerifiedTicksV1(
+  folderUri: vscode.Uri,
+  targetStage: TaskStage,
+  reviewContent: string
+): Promise<void> {
+  if (isPlanReviewStage(targetStage)) {
+    return;
+  }
+  const verified = parseReviewVerifiedCompleteV1(reviewContent);
+  if (verified.items.length === 0) {
+    return;
+  }
+  const plan = await readPlanOfRecordV1(folderUri);
+  if (!plan.hasChecklist || !plan.text) {
+    return;
+  }
+  const applicable = filterUncheckedPlanItemsV1(plan.text, verified.items);
+  if (applicable.length === 0) {
+    return;
+  }
+  const preview = applicable.slice(0, 5).map((t) => `- ${t}`).join("\n");
+  const more = applicable.length > 5 ? `\n…and ${applicable.length - 5} more.` : "";
+  NotificationRouter.showWarning(
+    `This review named ${applicable.length} plan item(s) as verified complete that are still unticked ` +
+      `in plan-final.md:\n${preview}${more}\n\nApply the reviewer's ticks?`,
+    undefined,
+    undefined,
+    undefined,
+    {
+      command: "vs-code-ai-helper.applyReviewerVerifiedTicks",
+      title: `Apply ${applicable.length} Reviewer-Verified Tick${applicable.length === 1 ? "" : "s"}`,
+      args: [{ taskFolderPath: folderUri.fsPath, reviewStage: targetStage }],
+    }
+  );
 }
 
 async function routeReviewOutcomeV1(
@@ -1994,6 +2087,7 @@ async function routeReviewOutcomeV1(
         const contentBytes = await vscode.workspace.fs.readFile(reviewUri);
         const content = new TextDecoder().decode(contentBytes);
         const score = parseReadiness(content).score;
+        await notifyReviewerVerifiedTicksV1(folderUri, targetStage, content);
         const autoAdvanceThreshold = getAutoAdvanceScoreThreshold();
         // A high score no longer implies the plan is finished. Before the
         // progress marker existed, the review prompts capped a mid-plan
@@ -2408,7 +2502,7 @@ async function routeReviewOutcomeV1(
     // branch used to capture every non-completed outcome first, so a
     // Publish-stage exhaustion produced only the Publish Anyway nudge while
     // the task stayed "active" with nothing able to run.
-    await pauseTaskForExhaustedChainV1(folderUri, targetStage, outcome.chainExhaustion);
+    await pauseTaskForExhaustedChainV1(folderUri, targetStage, outcome.chainExhaustion, outcome.code);
   } else if (targetStage === "publish") {
     // The Publish review failed, was cancelled, or was stalled. Give the
     // user a one-click path to publish anyway instead of only a dead-end
@@ -2468,7 +2562,15 @@ async function routeReviewOutcomeV1(
 export async function pauseTaskForExhaustedChainV1(
   folderUri: vscode.Uri,
   stage: TaskStage,
-  exhaustion: ProviderChainExhaustionV1
+  exhaustion: ProviderChainExhaustionV1,
+  /**
+   * `candidatesExhausted` (every candidate was reserved, invoked, and
+   * failed) vs. `providerModeUnavailable` (nothing was ever reserved) —
+   * workflow 3 continuation, third item. Optional and defaults to the
+   * "no provider available" wording for callers (and existing tests) that
+   * have not been threaded through with the distinguishing code yet.
+   */
+  code?: WorkflowUnavailableCodeV1
 ): Promise<void> {
   const stageName = exhaustion.stage ?? stage;
   const chain =
@@ -2476,9 +2578,13 @@ export async function pauseTaskForExhaustedChainV1(
       ? exhaustion.candidates.map((candidate) => candidate.providerLabel).join(" → ")
       : "no candidates configured";
   const reason =
-    `No configured provider for ${stageName} is available — ` +
-    `the resolved chain was exhausted (${chain}). ` +
-    "See the run log for per-candidate reasons.";
+    code === "candidatesExhausted"
+      ? `Every configured model for ${stageName} was tried and failed — ` +
+        `the resolved chain was exhausted (${chain}). ` +
+        "See the run log for per-candidate reasons."
+      : `No configured provider for ${stageName} is available — ` +
+        `the resolved chain was exhausted (${chain}). ` +
+        "See the run log for per-candidate reasons.";
   // Review completion blocker: a chain exhausted because every ranked
   // candidate hit a quota or model-entitlement block previously paused the
   // task with only the human-readable `reason` text — no `quotaParkRecord`,
@@ -2516,18 +2622,33 @@ export async function pauseTaskForExhaustedChainV1(
   // (beyond ensemble.resilience.quotaResetNearThresholdHours) should advise
   // switching the stage's model instead of implying a scheduled rerun is
   // useful before the window actually reopens.
+  const resetIsFar =
+    quotaParkRecord?.resetAt !== undefined && isQuotaResetBeyondThresholdV1(quotaParkRecord.resetAt);
   const resumeAction =
-    quotaParkRecord?.resetAt !== undefined &&
-    !isQuotaResetBeyondThresholdV1(quotaParkRecord.resetAt)
+    quotaParkRecord?.resetAt !== undefined && !resetIsFar
       ? {
           command: "vs-code-ai-helper.scheduleQuotaResumeV1",
           title: "Rerun after reset",
           args: [{ taskFolderPath: folderUri.fsPath, resetAtIso: quotaParkRecord.resetAt }],
         }
       : undefined;
+  // Workflow 3 continuation, first item (Part 6 step 4): mirrors the same
+  // stage-impact enumeration the withheld-backup cascade in runnerRegistry.ts
+  // already carries — a chain exhaustion caused by a long quota/entitlement
+  // outage is just as likely to silently affect every OTHER stage primary'd
+  // to the same blocked provider account, and this path previously never
+  // said so.
+  const affectedStageDescriptions =
+    resetIsFar && quotaParkRecord
+      ? describeStageSubstitutesV1(quotaParkRecord.modelId, stage)
+      : [];
+  const affectedStagesClause =
+    affectedStageDescriptions.length > 0
+      ? ` This also affects: ${affectedStageDescriptions.join("; ")}.`
+      : "";
   NotificationRouter.showWarning(
     `⚠️ ${reason} The task has been paused; fix provider availability or the stage's ` +
-      "model configuration, then resume.",
+      `model configuration, then resume.${affectedStagesClause}`,
     undefined,
     undefined,
     undefined,
@@ -4824,58 +4945,6 @@ export async function nextStage(
   }
 }
 
-/**
- * Generate the implementation notes in `plan-final.md` (the canonical
- * implementation-stage artifact) using AI.
- *
- * This is the "Generate Implementation" action for the merged Implementation
- * stage. It reads the current contents of `plan-final.md` as context (the
- * promoted plan snapshot written when advancing to the implementation stage,
- * or materialized from legacy `implementation.md` when upgrading an older
- * task folder) and overwrites `plan-final.md` with the AI-generated
- * implementation notes, which are then used as the prompt for the AI
- * implementation run.
- *
- * Eligible stages: only `"implementation"` (see `GENERATE_IMPL_ELIGIBLE_STAGES`).
- * Tasks at `"plan-low-review"` are NOT eligible — the user must first advance
- * to the implementation stage (which promotes plan.md → plan-final.md) before
- * generating implementation notes. Allowing plan-low-review here would let the
- * command advertise the task as eligible in the QuickPick but then hard-fail
- * immediately because plan-final.md doesn't exist yet.
- *
- * Legacy task folders that still have only `implementation.md` are handled
- * transparently: `materializeCanonicalIfNeeded` copies `implementation.md`
- * to `plan-final.md` before the generation starts, matching the same
- * migration path used by `runImplementationWithAI`.
- *
- * Requires first-use consent before any AI action runs.
- */
-function describeGenerateImplementationFailureV1(outcome: TaskActionOutcomeV1): string {
-  switch (outcome.kind) {
-    case "failed":
-      return `${outcome.code}${outcome.retryable ? " (retryable)" : ""}`;
-    case "malformedResult":
-      // Same dropped-`detail` bug as draftTaskWithAI's copy — see the note
-      // there. Third copy of this formatter; the shared one in
-      // taskActionOutcomeTextV1.ts is the correct version.
-      return `the model's response was malformed (${outcome.code}${
-        outcome.detail ? `: ${outcome.detail}` : ""
-      })`;
-    case "unavailable":
-      return outcome.code;
-    case "recoveryRequired":
-      return outcome.code;
-    case "duplicateRejected":
-      return "another operation is already running for this task";
-    case "stalePreflight":
-      return "a stale preflight plan was rejected";
-    case "partialEditBlocked":
-      return "a partial edit was blocked";
-    default:
-      return outcome.kind;
-  }
-}
-
 interface GenerateImplementationOutcomeContextV1 {
   readonly folderUri: vscode.Uri;
   readonly implementationUri: vscode.Uri;
@@ -4944,8 +5013,8 @@ async function handleGenerateImplementationOutcomeV1(
   } else {
     NotificationRouter.showError(
       ctx.suppressCompletionUiV1
-        ? `Generating implementation checklist failed: ${describeGenerateImplementationFailureV1(outcome)}. Implement the plan manually instead.`
-        : `Generate Implementation failed: ${describeGenerateImplementationFailureV1(outcome)}. Use the manual workflow instead.`
+        ? `Generating implementation checklist failed: ${describeTaskActionFailureV1(outcome)}. Implement the plan manually instead.`
+        : `Generate Implementation failed: ${describeTaskActionFailureV1(outcome)}. Use the manual workflow instead.`
     );
   }
 
@@ -5020,6 +5089,32 @@ async function invokeGenerateImplementationActionV1(
   return { outcome, orchestrator };
 }
 
+/**
+ * Generate the implementation notes in `plan-final.md` (the canonical
+ * implementation-stage artifact) using AI.
+ *
+ * This is the "Generate Implementation" action for the merged Implementation
+ * stage. It reads the current contents of `plan-final.md` as context (the
+ * promoted plan snapshot written when advancing to the implementation stage,
+ * or materialized from legacy `implementation.md` when upgrading an older
+ * task folder) and overwrites `plan-final.md` with the AI-generated
+ * implementation notes, which are then used as the prompt for the AI
+ * implementation run.
+ *
+ * Eligible stages: only `"implementation"` (see `GENERATE_IMPL_ELIGIBLE_STAGES`).
+ * Tasks at `"plan-low-review"` are NOT eligible — the user must first advance
+ * to the implementation stage (which promotes plan.md → plan-final.md) before
+ * generating implementation notes. Allowing plan-low-review here would let the
+ * command advertise the task as eligible in the QuickPick but then hard-fail
+ * immediately because plan-final.md doesn't exist yet.
+ *
+ * Legacy task folders that still have only `implementation.md` are handled
+ * transparently: `materializeCanonicalIfNeeded` copies `implementation.md`
+ * to `plan-final.md` before the generation starts, matching the same
+ * migration path used by `runImplementationWithAI`.
+ *
+ * Requires first-use consent before any AI action runs.
+ */
 export async function generateImplementationWithAI(
   extensionUri: vscode.Uri,
   context: vscode.ExtensionContext,
@@ -5260,7 +5355,7 @@ export async function resumeGenerateImplementationInteractionV1(
       : undefined;
 
   if (settlement === undefined) {
-    return { ok: false, reason: describeGenerateImplementationFailureV1(outcome) };
+    return { ok: false, reason: describeTaskActionFailureV1(outcome) };
   }
   return { ok: true, settlement };
 }
@@ -5577,6 +5672,15 @@ async function executeImplementationRun(
     !result.filesChangedUnknown && result.filesChanged.length > 0;
   let plan: PlanOfRecordV1 | undefined;
   let planChecklist: string | undefined;
+  // Tracks the checklist text actually on disk as the function proceeds —
+  // starts equal to `planChecklist` (this round's pre-merge read) and is
+  // updated to the merge's written content the moment a merge lands (below),
+  // so any message built AFTER that point that enumerates outstanding items
+  // (the reconciliation-needed note) names what is really still unticked
+  // rather than a round-stale snapshot. Messages built BEFORE the merge-write
+  // runs (the zero-file-change branch) can keep using `planChecklist`
+  // directly — the two are still identical at that point in the function.
+  let effectivePlanChecklist: string | undefined;
   let incompleteRound: IncompleteImplementationRoundV1 | undefined;
   let summaryIssue: string | undefined;
   // Post-run delta gate, first half (Part 2 step 3): a `summary-only`
@@ -5594,6 +5698,7 @@ async function executeImplementationRun(
   if (result.status === "completed") {
     plan = await readPlanOfRecordV1(folderUri);
     planChecklist = plan.hasChecklist ? plan.text : undefined;
+    effectivePlanChecklist = planChecklist;
     if (summaryOnlyViolation) {
       summaryIssue =
         "this summary-only continuation was not permitted to edit files, but it " +
@@ -5861,9 +5966,74 @@ async function executeImplementationRun(
       const zeroChangeRounds = checklistAdvanced
         ? 0
         : (priorProgress?.zeroChangeImplRounds ?? 0) + 1;
-      const persistedRounds = await patchTaskProgressStrictV1(folderUri, (current) =>
-        setZeroChangeImplRounds(current, zeroChangeRounds > 0 ? zeroChangeRounds : undefined)
-      );
+      // Part 3 (workflow 3 continuation, second item): a sterile round can
+      // loop forever when the checklist's own counts are wrong rather than
+      // the plan being unfinished — this round changed nothing and landed no
+      // ticks, but the most recent review for this stage already scored the
+      // work at or above the auto-advance threshold with zero blockers. That
+      // combination proves the plan's remaining count is under-recording
+      // (the exact condition `checklistProgressUnreliable` exists to stand
+      // the completeness gate down for), so this latches on the FIRST
+      // sterile round it holds for — well before the no-progress breaker
+      // below would otherwise grind to a pause waiting on a human.
+      // `requireZeroBlockers: true` is deliberately stricter than the
+      // breaker's own qualifying check just below it: a review WITH
+      // blockers still names real, unresolved work and must not stand the
+      // gate down.
+      const remainingChecklistProgress =
+        planChecklist !== undefined ? countChecklistProgressV1(planChecklist) : undefined;
+      const checklistUnderrecordingConfirmedByReview =
+        !checklistAdvanced &&
+        remainingChecklistProgress !== undefined &&
+        remainingChecklistProgress.remaining > 0 &&
+        latestQualifyingReviewMeetsThresholdV1({
+          history: priorProgress?.reviewScoreHistory,
+          stage: priorProgress?.currentStage ?? postRunReviewStage,
+          threshold: getAutoAdvanceScoreThreshold(),
+          requireZeroBlockers: true,
+        });
+      const newlyLatchingChecklistUnreliable =
+        checklistUnderrecordingConfirmedByReview && !priorProgress?.checklistProgressUnreliable;
+      const persistedRounds = await patchTaskProgressStrictV1(folderUri, (current) => {
+        const withStreak = setZeroChangeImplRounds(
+          current,
+          zeroChangeRounds > 0 ? zeroChangeRounds : undefined
+        );
+        return checklistUnderrecordingConfirmedByReview && !current.checklistProgressUnreliable
+          ? { ...withStreak, checklistProgressUnreliable: true, updatedAt: new Date().toISOString() }
+          : withStreak;
+      });
+      if (newlyLatchingChecklistUnreliable) {
+        const outstandingList = describeOutstandingChecklistItemsV1(planChecklist);
+        const reconcileNote =
+          "\n\n## Checklist counts stood down (under-recording)\n\n" +
+          "This round changed no files and landed no checklist ticks, but the most recent " +
+          `${priorProgress?.currentStage ?? postRunReviewStage} review already scored the work at or ` +
+          "above the auto-advance threshold with zero blockers — the plan's remaining count " +
+          `(${remainingChecklistProgress?.remaining} of ${remainingChecklistProgress?.total}) is therefore ` +
+          "treated as under-recording rather than real unfinished work. `checklistProgressUnreliable` is now " +
+          "set: completeness is not gating advancement until the checklist is reconciled. Tick the missed " +
+          `items in plan-final.md, then run **Ensemble: Mark Plan Checklist Reconciled** to confirm and ` +
+          `restore the gate.${outstandingList}`;
+        const existingLog = await readTextIfExists(logUri);
+        if (existingLog !== undefined) {
+          await writeTextFile(logUri, `${existingLog}${reconcileNote}\n`, { skipBackup: true });
+        }
+        NotificationRouter.showWarning(
+          "⚠️ The plan checklist still shows unfinished items, but the most recent review already scored " +
+            "this stage at full marks with zero blockers — the checklist's counts are treated as " +
+            "under-recording, not real unfinished work, and completeness is no longer gating advancement. " +
+            `Tick the missed items in plan-final.md, then mark the checklist reconciled.${outstandingList}`,
+          undefined,
+          undefined,
+          undefined,
+          {
+            command: "vs-code-ai-helper.reconcilePlanChecklist",
+            title: "Mark Reconciled",
+            args: [{ taskFolderPath: folderUri.fsPath }],
+          }
+        );
+      }
       NotificationRouter.showInformation(
         "Implementation finished with no file changes — the model reported the current state already " +
           "satisfies the plan. Routing to review instead of recording a failure " +
@@ -5897,6 +6067,13 @@ async function executeImplementationRun(
               ? " The latest round reported plan-item completions that did not match any item in the " +
                 "plan of record — if that work is genuinely done, run Reconcile Plan Checklist to " +
                 "confirm it by hand."
+              : "") +
+            // Names what remains instead of leaving the human to search the
+            // plan for it — the same enumeration every other "tick the missed
+            // items" surface now carries (workflow 3 continuation, Part 5).
+            (remainingChecklistProgress && remainingChecklistProgress.remaining > 0
+              ? ` The plan checklist still lists ${remainingChecklistProgress.remaining} unfinished ` +
+                `item(s):${describeOutstandingChecklistItemsV1(planChecklist)}`
               : ""),
           // NOT coerced to "": the attempt CAS expects the value read from
           // the state persisted moments ago, and for an implementation-stage
@@ -6032,6 +6209,7 @@ async function executeImplementationRun(
         const mergeResult = checklistMergeResult ?? mergeChecklistProgressV1(planChecklist, summary);
         if (mergeResult.kind === "merged") {
           await writeTextFile(planOfRecordUri, mergeResult.content);
+          effectivePlanChecklist = mergeResult.content;
           // Retroactive ticks (RETROACTIVE_TICK_MARKER_V1) mark items this
           // round verified as already complete rather than built itself —
           // recorded in the run log, next to the rest of the round's
@@ -6310,6 +6488,11 @@ async function executeImplementationRun(
     // Without this, the only standing trace was the task tooltip — invisible
     // while rounds appear to be progressing normally.
     if (persistedAfterRun?.checklistProgressUnreliable) {
+      // Reads the checklist text AS IT STANDS after this round's own
+      // merge-write (if any) — never the round-stale `planChecklist` — so a
+      // round that both landed a merge AND still completes under an
+      // already-set latch names what is truly outstanding right now.
+      const outstandingList = describeOutstandingChecklistItemsV1(effectivePlanChecklist);
       const existingLog = await readTextIfExists(logUri);
       if (existingLog !== undefined) {
         const reconcileNote =
@@ -6317,7 +6500,7 @@ async function executeImplementationRun(
           "This task's plan checklist is not a complete record (checklistProgressUnreliable): a round " +
           "landed changes its checklist state could not record, so the plan's step counts are unverified " +
           "and completeness is not gating advancement. Tick the missed items in plan-final.md, then run " +
-          "**Ensemble: Mark Plan Checklist Reconciled** to restore the gate.";
+          `**Ensemble: Mark Plan Checklist Reconciled** to restore the gate.${outstandingList}`;
         // skipBackup: appends to the just-written log; a `_prev` sibling in
         // runs/ would read as a second run.
         await writeTextFile(logUri, `${existingLog}${reconcileNote}\n`, {
@@ -6327,7 +6510,7 @@ async function executeImplementationRun(
       NotificationRouter.showWarning(
         "⚠️ The plan checklist is not a complete record for this task — its step counts are unverified " +
           "until reconciled, and completeness is not gating advancement. Tick the missed items in " +
-          "plan-final.md, then mark the checklist reconciled.",
+          `plan-final.md, then mark the checklist reconciled.${outstandingList}`,
         undefined,
         undefined,
         undefined,

@@ -250,6 +250,64 @@ const QUOTED_MARKER_IN_ECHOED_ITEM = [
   "- ran the unit tests",
 ].join("\n");
 
+// Part 4 corpus (workflow 3 continuation, second item's extra requirement):
+// a plan item whose own text contains " — ", bare "done" prose with no
+// retroactive marker, and a PART-level claim ("Part 7 — done this round
+// (6/6), evidence: ...", the exact shape observed live on round 073 of
+// "workflow 3").
+const PLAN_WITH_DASH_ITEM = [
+  "<!-- ensemble:implementation-checklist -->",
+  "",
+  "- [ ] In the webview <style>, set .model-combo-input to font-size: var(--x) — and reduce its vertical padding",
+  "- [ ] a second, unrelated item",
+  "",
+].join("\n");
+
+const SUMMARY_CLAIMING_DASH_ITEM = [
+  "## Files Changed",
+  "- (none)",
+  "",
+  "## Plan Item Checklist",
+  "",
+  "- In the webview <style>, set .model-combo-input to font-size: var(--x) — and reduce its vertical padding — done <!-- ensemble:retroactive --> — src/views/settingsView.ts:672-675",
+  "",
+].join("\n");
+
+const SUMMARY_WITH_PROSE_CLAIM_NO_MARKER = [
+  "## Files Changed",
+  "- (none)",
+  "",
+  "## Plan Item Checklist",
+  "",
+  "- add the databaseWaking state — done — built and tested this round",
+  "",
+].join("\n");
+
+const PLAN_WITH_PART_7 = [
+  "<!-- ensemble:implementation-checklist -->",
+  "",
+  "## Part 6 — Some earlier part",
+  "",
+  "- [ ] an item in Part 6",
+  "",
+  "## Part 7 — Copilot desc/impl and the auto default",
+  "",
+  "- [ ] item one",
+  "- [ ] item two",
+  "- [ ] item three",
+  "",
+].join("\n");
+
+const SUMMARY_WITH_PART_LEVEL_CLAIM = [
+  "## Files Changed",
+  "- (none) — this round only verified prior work",
+  "",
+  "## Plan Item Checklist",
+  "",
+  "- Part 7 — done this round (3/3), evidence: src/a.ts:1-2, src/b.ts:3-4",
+  "",
+].join("\n");
+
 const CORPUS: Record<string, string> = {
   PLAN_BASIC,
   PLAN_WITH_FENCED_EXAMPLE,
@@ -267,6 +325,11 @@ const CORPUS: Record<string, string> = {
   PLAN_FOR_RETROACTIVE,
   SUMMARY_WITH_RETROACTIVE_CLAIM,
   SUMMARY_WITH_RETROACTIVE_CLAIM_NO_EVIDENCE,
+  PLAN_WITH_DASH_ITEM,
+  SUMMARY_CLAIMING_DASH_ITEM,
+  SUMMARY_WITH_PROSE_CLAIM_NO_MARKER,
+  PLAN_WITH_PART_7,
+  SUMMARY_WITH_PART_LEVEL_CLAIM,
 };
 
 test("countChecklistProgressV1 agrees with the extension for every corpus document", () => {
@@ -323,6 +386,23 @@ test("mergeChecklistProgressV1 produces byte-identical merges", () => {
       summary: SUMMARY_WITH_RETROACTIVE_CLAIM_NO_EVIDENCE,
       label: "retroactive claim without evidence does not merge",
     },
+    // Part 4 parity: an item whose own text contains " — ", bare "done"
+    // prose with no marker, and a PART-level claim.
+    {
+      plan: PLAN_WITH_DASH_ITEM,
+      summary: SUMMARY_CLAIMING_DASH_ITEM,
+      label: "claim against an item whose own text contains ' — '",
+    },
+    {
+      plan: PLAN_FOR_RETROACTIVE,
+      summary: SUMMARY_WITH_PROSE_CLAIM_NO_MARKER,
+      label: "bare prose 'done' claim with no retroactive marker",
+    },
+    {
+      plan: PLAN_WITH_PART_7,
+      summary: SUMMARY_WITH_PART_LEVEL_CLAIM,
+      label: "PART-level claim expands to every item under the matching heading",
+    },
   ];
   for (const { plan, summary, label } of pairs) {
     assert.deepEqual(
@@ -330,6 +410,14 @@ test("mergeChecklistProgressV1 produces byte-identical merges", () => {
       srcChecklist.mergeChecklistProgressV1(plan, summary),
       `${label}: merge divergence`
     );
+  }
+  // Pin the actual Part 4 expectations too, not just cross-implementation
+  // agreement (mirrors the round-013 pinning below).
+  const partMerged = engine.mergeChecklistProgressV1(PLAN_WITH_PART_7, SUMMARY_WITH_PART_LEVEL_CLAIM);
+  assert.equal(partMerged.kind, "merged");
+  if (partMerged.kind === "merged") {
+    assert.equal((partMerged.content.match(/- \[x\]/g) ?? []).length, 3);
+    assert.ok(partMerged.content.includes("- [ ] an item in Part 6"));
   }
   // Ticks-only invariant: the merge never unticks second step even though the
   // summary could regress it.
@@ -388,6 +476,7 @@ test("collectRetroactiveTickClaimsV1 agrees with the extension", () => {
   const docs = [
     srcChecklist.splitSummaryAtEchoV1(SUMMARY_WITH_RETROACTIVE_CLAIM).own,
     srcChecklist.splitSummaryAtEchoV1(SUMMARY_WITH_RETROACTIVE_CLAIM_NO_EVIDENCE).own,
+    srcChecklist.splitSummaryAtEchoV1(SUMMARY_WITH_PROSE_CLAIM_NO_MARKER).own,
     "",
   ];
   for (const doc of docs) {
@@ -397,6 +486,23 @@ test("collectRetroactiveTickClaimsV1 agrees with the extension", () => {
       `retroactive-claim divergence for ${JSON.stringify(doc)}`
     );
   }
+  // Part 4: an item text containing " — " requires planItemKeys to resolve.
+  const dashDoc = srcChecklist.splitSummaryAtEchoV1(SUMMARY_CLAIMING_DASH_ITEM).own;
+  const dashKeys = srcChecklist.collectChecklistItemKeysV1(PLAN_WITH_DASH_ITEM);
+  assert.deepEqual(
+    engine.collectRetroactiveTickClaimsV1(dashDoc, dashKeys),
+    srcChecklist.collectRetroactiveTickClaimsV1(dashDoc, dashKeys),
+    "embedded-dash item claim divergence"
+  );
+});
+
+test("collectPartLevelTickClaimsV1 agrees with the extension", () => {
+  const doc = srcChecklist.splitSummaryAtEchoV1(SUMMARY_WITH_PART_LEVEL_CLAIM).own;
+  assert.deepEqual(
+    engine.collectPartLevelTickClaimsV1(doc),
+    srcChecklist.collectPartLevelTickClaimsV1(doc),
+    "part-level claim divergence"
+  );
 });
 
 test("splitSummaryAtEchoV1 boundary detection agrees with the extension", () => {
@@ -448,4 +554,60 @@ test("hasContradictoryNoChecklistChangeClaimV1 agrees with the extension (round 
   assert.equal(engine.hasContradictoryNoChecklistChangeClaimV1(RETROACTIVE_CLAIM_NO_DECLARATION), false);
   assert.equal(engine.hasContradictoryNoChecklistChangeClaimV1(ROUND_013_SHAPED_RESPONSE), true);
   assert.equal(engine.hasContradictoryNoChecklistChangeClaimV1(QUOTED_MARKER_IN_ECHOED_ITEM), false);
+});
+
+// ---------------------------------------------------------------------------
+// Part 5 (workflow 3 continuation) — listUncheckedChecklistItemTextsV1 /
+// filterUncheckedPlanItemsV1, the mechanism every "tick the missed items"
+// surface and the reviewer-verified-ticks apply path now depend on.
+// ---------------------------------------------------------------------------
+test("listUncheckedChecklistItemTextsV1 agrees with the extension for every corpus document", () => {
+  for (const [name, doc] of Object.entries(CORPUS)) {
+    assert.deepEqual(
+      engine.listUncheckedChecklistItemTextsV1(doc),
+      srcChecklist.listUncheckedChecklistItemTextsV1(doc),
+      `${name}: unchecked-items divergence`
+    );
+    assert.deepEqual(
+      engine.listUncheckedChecklistItemTextsV1(doc, 1),
+      srcChecklist.listUncheckedChecklistItemTextsV1(doc, 1),
+      `${name}: bounded unchecked-items divergence`
+    );
+  }
+});
+
+test("listUncheckedChecklistItemTextsV1 unescapes and bounds, pinned against a literal expectation", () => {
+  const plan = [
+    "<!-- ensemble:implementation-checklist -->",
+    "",
+    "- [x] done item",
+    '- [ ] Fix the \\"quoted\\" bug',
+    "- [ ] a second unchecked item",
+  ].join("\n");
+  assert.deepEqual(engine.listUncheckedChecklistItemTextsV1(plan), {
+    items: ['Fix the "quoted" bug', "a second unchecked item"],
+    total: 2,
+  });
+  assert.deepEqual(engine.listUncheckedChecklistItemTextsV1(plan, 1), {
+    items: ['Fix the "quoted" bug'],
+    total: 2,
+  });
+});
+
+test("filterUncheckedPlanItemsV1 agrees with the extension across candidate/plan pairs", () => {
+  const cases: Array<{ plan: string; candidates: string[] }> = [
+    { plan: PLAN_BASIC, candidates: ["first step", "second step", "third step", "unknown item"] },
+    {
+      plan: PLAN_DUPLICATE_ITEMS,
+      candidates: ["add the web smoke check", "  ADD THE WEB SMOKE CHECK  ", "wire the ci lane"],
+    },
+    { plan: PLAN_WITH_FENCED_EXAMPLE, candidates: ["real item one", "fenced example item"] },
+  ];
+  for (const { plan, candidates } of cases) {
+    assert.deepEqual(
+      engine.filterUncheckedPlanItemsV1(plan, candidates),
+      srcChecklist.filterUncheckedPlanItemsV1(plan, candidates),
+      `candidate resolution divergence for ${JSON.stringify(candidates)}`
+    );
+  }
 });

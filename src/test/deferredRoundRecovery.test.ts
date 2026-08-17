@@ -34,7 +34,10 @@ import * as path from "node:path";
 import { describe, it } from "node:test";
 import * as vscode from "vscode";
 
-import { runImplementationWithAI } from "../commands/reviewActions";
+import { runImplementationWithAI, runReviewForFolder } from "../commands/reviewActions";
+import { applyReviewerVerifiedTicks } from "../commands/applyReviewerVerifiedTicks";
+import { TaskInventory } from "../state/taskInventory";
+import { CurrentTaskStore } from "../utils/currentTaskStore";
 import {
   initNotificationRouter,
   deactivateNotificationRouter,
@@ -43,11 +46,24 @@ import { StatusTreeProvider } from "../views/statusView";
 import { decodeTaskProgressTextV1 } from "../services/taskProgressDecoderV1";
 import {
   MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1,
+  REVIEW_STAGES,
   TaskProgress,
+  TaskStage,
 } from "../types/taskProgress";
 import { IncompleteTask } from "../types/incompleteTask";
 import { DISCLAIMER_VERSION } from "../legal/disclaimerVersion";
+import { effectiveReviewProgressV1 } from "../utils/effectiveReviewProgress";
+import { readyToAdvanceStage } from "../utils/reviewReadiness";
+import { getAutoAdvanceScoreThreshold } from "../config/settings";
 import type { AutomationDispatch } from "../utils/automationChain";
+import type { AgentTransportV1 } from "../types/agentExecutionV1";
+import {
+  configureWorkflowPrivateStorageRootV1,
+  getWorkflowFileStoreV1,
+  getWorkflowPathRegistryV1,
+  setChatInteractionTransactionStoreV1,
+} from "../services/workflowRuntimeServicesV1";
+import { createChatInteractionTransactionStoreV1 } from "../services/chatInteractionTransactionStoreV1";
 
 /* eslint-disable @typescript-eslint/no-var-requires */
 const runEditActionModule = require("../commands/runEditActionV1") as Record<string, unknown>;
@@ -62,6 +78,7 @@ const automationChainModule = require("../utils/automationChain") as Record<stri
 const settingsModule = require("../config/settings") as Record<string, unknown>;
 const runLogModule = require("../utils/runLog") as Record<string, unknown>;
 const progressWriterModule = require("../services/taskProgressWriterV1") as Record<string, unknown>;
+const publishPreflightModule = require("../utils/publishPreflight") as Record<string, unknown>;
 /* eslint-enable @typescript-eslint/no-var-requires */
 
 const REAL_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-deferred-round-"));
@@ -71,6 +88,29 @@ const REAL_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-deferred-round
 // 75s on a real machine, timing out every test here. A repo at the harness
 // root pins rev-parse/status to this tiny directory instead.
 cp.execFileSync("git", ["init", "-q"], { cwd: REAL_ROOT, windowsHide: true });
+
+// Part 8 step 1's review-round hops (below) drive runReviewForFolder, whose
+// AI metadata path runs through the real production coordinator
+// (createProductionTaskActionCoordinatorV1) — that requires the Chat
+// interaction transaction store to be wired exactly as extension.ts does at
+// activation, or getProductionActionConversationOrchestratorV1 throws "not
+// wired yet". runImplementationWithAI's existing harness above never needed
+// this (it replaces runImplementationOrSealedV1 wholesale, below the
+// coordinator), so this file had no such wiring until this addition.
+// Mirrors publishOwnershipMatrix.test.ts's identical setup.
+const REVIEW_PRIVATE_STORAGE_ROOT = fs.mkdtempSync(
+  path.join(os.tmpdir(), "ensemble-deferred-round-review-private-")
+);
+const REVIEW_PRIVATE_STORAGE_ROOT_ID = configureWorkflowPrivateStorageRootV1(
+  REVIEW_PRIVATE_STORAGE_ROOT
+);
+setChatInteractionTransactionStoreV1(
+  createChatInteractionTransactionStoreV1({
+    registry: getWorkflowPathRegistryV1(),
+    fileStore: getWorkflowFileStoreV1(),
+    privateRootId: REVIEW_PRIVATE_STORAGE_ROOT_ID,
+  })
+);
 
 /** The observed round-014 shape: a deferral to a wakeup that never fires. */
 const DEFERRED_RESPONSE =
@@ -251,6 +291,141 @@ function patch(module: Record<string, unknown>, name: string, replacement: unkno
   const orig = module[name];
   module[name] = replacement;
   return { restore: (): void => { module[name] = orig; } };
+}
+
+/**
+ * Part 8 step 1's review-round harness, borrowed from
+ * publishOwnershipMatrix.test.ts's identical machinery: a V1 transport that
+ * frames a completed markdown-artifact.v1 envelope echoing the request's
+ * correlation, so a scripted review round can drive the REAL
+ * runReviewForFolder -> handleReviewOutcomeV1 -> advanceStageViaNextStageRowV1
+ * chain instead of only the effectiveReviewProgressV1/readyToAdvanceStage
+ * predicate pair the "Part 3, end to end" block above calls directly.
+ */
+function frameV1ReviewResult(json: unknown): string {
+  return `<<<ENSEMBLE_AI_RESULT_V1>>>\n${JSON.stringify(json)}\n<<<END_ENSEMBLE_AI_RESULT_V1>>>\n`;
+}
+
+function markdownReviewTransportV1(markdown: string, runnerId = "stub-review-runner"): AgentTransportV1 {
+  return {
+    runnerId,
+    invoke: (request, output): Promise<{ kind: "completed" }> => {
+      output.write(
+        frameV1ReviewResult({
+          version: 1,
+          correlation: request.correlation,
+          kind: "completed",
+          content: { contentType: "markdown-artifact.v1", schemaVersion: 1, markdown },
+        })
+      );
+      return Promise.resolve({ kind: "completed" as const });
+    },
+  };
+}
+
+/** Stubs runnerRegistry's V1 selection opener so a review round never reaches a real CLI/Copilot provider. */
+function stubV1ReviewRunnerSelection(transports: readonly AgentTransportV1[]): Patched {
+  let cursor = 0;
+  const fakeOpener = (request: {
+    session: { reserve: (input: Record<string, unknown>) => unknown };
+    mode: unknown;
+  }): { reserveNext: (attemptId: string) => unknown } => ({
+    reserveNext(attemptId: string): unknown {
+      const transport = transports[cursor];
+      if (!transport) {
+        return cursor === 0
+          ? { kind: "noneRemaining", code: "providerModeUnavailable" }
+          : { kind: "noneRemaining", code: "candidatesExhausted" };
+      }
+      cursor += 1;
+      const handle = request.session.reserve({
+        attemptId,
+        mode: request.mode,
+        runnerId: transport.runnerId,
+        providerId: "copilot",
+        modelId: "copilot:test",
+      });
+      return {
+        kind: "reserved",
+        reserved: {
+          handle,
+          providerLabel: "Test Provider",
+          storedModelId: "copilot:test",
+          createTransport: () => transport,
+        },
+      };
+    },
+  });
+  const openerPatch = patch(runnerRegistryModule, "createV1RunnerSelectionOpener", () => fakeOpener);
+  const preflightPatch = patch(
+    runnerRegistryModule,
+    "preflightStageChainAvailabilityV1",
+    () => Promise.resolve({ kind: "dispatchable" })
+  );
+  return {
+    restore: (): void => {
+      preflightPatch.restore();
+      openerPatch.restore();
+    },
+  };
+}
+
+/**
+ * Drives ONE real review round for `currentStage` (a same-stage self-review,
+ * exactly what "run the review for the task's current stage" means in
+ * production) through the actual advance chain, self-contained like
+ * `runHarnessed` above: installs and tears down its own fs bridge,
+ * workspace-folders stub, and notification router.
+ */
+async function runPassingReviewHarnessed(
+  folderPath: string,
+  currentStage: TaskStage,
+  reviewText: string
+): Promise<void> {
+  const provider = new StatusTreeProvider();
+  initNotificationRouter(provider);
+  const fsBridge = installFsBridge();
+  const wsStub = installWorkspaceFoldersStub();
+  const workspaceRoot = { uri: vscode.Uri.file(REAL_ROOT), name: "root", index: 0 } as vscode.WorkspaceFolder;
+  const contextPack = path.join(folderPath, "review-context-pack.md");
+  fs.writeFileSync(contextPack, "# Context\n", "utf8");
+
+  const patches: Patched[] = [
+    patch(settingsModule, "isAutoAdvanceEnabled", () => true),
+    patch(settingsModule, "getAutoAdvanceMode", () => "auto"),
+    patch(settingsModule, "getAutoAdvanceScoreThreshold", () => 8),
+    patch(modelSelectionModule, "resolveModelForStage", () =>
+      Promise.resolve({ source: "settings", modelId: "stub:model" })),
+    patch(modelSelectionModule, "resolveFreshModelForStage", () =>
+      Promise.resolve({ source: "settings", modelId: "stub:model" })),
+    patch(modelSelectionModule, "resolveConfiguredReviewStages", () =>
+      Promise.resolve(new Set(REVIEW_STAGES))),
+    stubV1ReviewRunnerSelection([markdownReviewTransportV1(reviewText)]),
+    patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.resolve("stub review prompt")),
+    patch(contextPackModule, "writeContextPack", () => Promise.resolve(vscode.Uri.file(contextPack))),
+    patch(automationChainModule, "scheduleAutomationChain", (): Promise<boolean> => Promise.resolve(true)),
+    patch(publishPreflightModule, "checkPublishPreflight", () =>
+      Promise.resolve({
+        ok: true,
+        lintPayload: { runAt: "now", passed: true, summary: "", issueCount: 0, failedChecks: [], missingScripts: [] },
+      })),
+  ];
+  try {
+    await runReviewForFolder(
+      vscode.Uri.file(REAL_ROOT),
+      vscode.Uri.file(folderPath),
+      workspaceRoot,
+      currentStage,
+      true,
+      {}
+    );
+  } finally {
+    for (const p of patches.reverse()) { p.restore(); }
+    wsStub.restore();
+    fsBridge.restore();
+    provider.dispose();
+    deactivateNotificationRouter();
+  }
 }
 
 function makeExtensionContext(): vscode.ExtensionContext {
@@ -1263,6 +1438,17 @@ void describe("no-progress breaker requires a qualifying passing review (Part 3,
       true,
       "the escalation notice must name the reconciliation remedy for the diagnosed cause"
     );
+    // Part 5 (workflow 3 continuation): the escalation reason must name the
+    // exact outstanding items — "tick the missed items" with nothing named
+    // left the human to search the plan for them. PLAN_FINAL's two items are
+    // still unchecked on disk (this round's claim matched neither, so no
+    // merge ran), so both must be enumerated verbatim.
+    assert.match(
+      persisted?.escalation?.reason ?? "",
+      /plan checklist still lists 2 unfinished item\(s\)/
+    );
+    assert.match(persisted?.escalation?.reason ?? "", /- Add the resolver/);
+    assert.match(persisted?.escalation?.reason ?? "", /- Wire the decoder/);
   });
 
   void it("ineligible: does not escalate without any qualifying review on record — the streak keeps counting instead", async () => {
@@ -1310,6 +1496,719 @@ void describe("no-progress breaker requires a qualifying passing review (Part 3,
     const persisted = readProgress(folderPath);
     assert.equal(persisted?.status, "active", "a below-threshold review must not qualify as a passing loop");
     assert.equal(persisted?.escalation, undefined);
+  });
+});
+
+/**
+ * Workflow 3 continuation (second item) / plan Part 3: the
+ * `checklistProgressUnreliable` latch previously fired only when a round
+ * changed FILES without recording checklist state. It never fired for a
+ * round that changed nothing and landed no ticks at all — which is exactly
+ * the jester-shaped deadlock (2026-08-14_task_1): a finished implementation,
+ * a review at full marks with zero blockers three times running, and a
+ * checklist still showing unticked items because nothing ever asserted their
+ * completion. This widens the trigger so the latch fires on the FIRST such
+ * sterile round — well before the no-progress breaker's 3-round threshold
+ * would otherwise grind the task to a pause waiting on a human.
+ */
+void describe("checklistProgressUnreliable latches on a review-confirmed sterile round (Part 3, widened trigger)", () => {
+  // Deliberately NOT the "claimed-but-unmerged" shape (a `## Plan Item
+  // Checklist` claim that matches no plan item): that shape independently
+  // latches `checklistProgressUnreliable` via the PRE-EXISTING
+  // `checklistStateUnrecorded`/checklistClaimedButUnmerged trigger a few
+  // hundred lines below, regardless of review score or blockers — using it
+  // here would make every assertion below pass or fail for the wrong reason.
+  // This echoes the plan's checklist verbatim with NOTHING newly ticked and
+  // makes no retroactive claim at all, so `mergeChecklistProgressV1` returns
+  // `{ kind: "no-report" }` (`reported.size === 0`): a round that reported
+  // properly and genuinely found nothing left to do, isolating the widened
+  // trigger under test (a sterile round behind a qualifying review) from the
+  // older one (a claim that failed to match).
+  const STERILE_ECHO_NO_CLAIM_SUMMARY = [
+    "<!-- ensemble:implementation-checklist -->",
+    "",
+    "- [ ] Add the resolver",
+    "- [ ] Wire the decoder",
+    "",
+    "## Files Changed",
+    "",
+    "- (none) — the review already confirmed this satisfies the plan; nothing left to change",
+    "",
+    "## Verification",
+    "",
+    "- ran the unit tests",
+  ].join("\n");
+
+  const zeroBlockerFullMarks = [
+    {
+      stage: "impl-high-review" as const,
+      score: 10,
+      attemptId: "attempt-passing",
+      at: "2026-01-02T00:00:00.000Z",
+      blockerCount: 0,
+      taskFixableCount: 0,
+    },
+  ];
+
+  void it("latches on the FIRST sterile round behind a qualifying zero-blocker review, well before the no-progress breaker's threshold", async () => {
+    const { folderPath, progress } = makeTaskFolder("latch_first_sterile_round", {
+      // No zeroChangeImplRounds recorded at all: this is the very first
+      // sterile round, nowhere near the breaker's 3-round threshold.
+      reviewScoreHistory: zeroBlockerFullMarks,
+    });
+    const run = await runHarnessed(folderPath, progress, {
+      status: "completed",
+      filesChanged: [],
+      filesChangedUnknown: false,
+      summary: STERILE_ECHO_NO_CLAIM_SUMMARY,
+      runnerId: "test-cli",
+      providerLabel: "Test CLI",
+      storedModelId: "cli:test-model",
+    });
+
+    const persisted = readProgress(folderPath);
+    assert.equal(
+      persisted.status,
+      "active",
+      "one sterile round must not itself trip the no-progress breaker"
+    );
+    assert.equal(
+      persisted.checklistProgressUnreliable,
+      true,
+      "a qualifying zero-blocker full-marks review proves the checklist counts are under-recording"
+    );
+    assert.equal(
+      run.notifications.some((n) => /under-recording/.test(n.message)),
+      true,
+      "the operator must be told the counts are being stood down, not just that nothing happened"
+    );
+    const logs = readRunLogs(folderPath);
+    assert.ok(
+      logs.some((log) => /## Checklist counts stood down \(under-recording\)/.test(log)),
+      "the run log must record why the gate stood itself down"
+    );
+  });
+
+  void it("does not latch when the qualifying review still names blockers, even at full marks", async () => {
+    const { folderPath, progress } = makeTaskFolder("latch_ignores_review_with_blockers", {
+      reviewScoreHistory: [{ ...zeroBlockerFullMarks[0]!, blockerCount: 1, taskFixableCount: 1 }],
+    });
+    await runHarnessed(folderPath, progress, {
+      status: "completed",
+      filesChanged: [],
+      filesChangedUnknown: false,
+      summary: STERILE_ECHO_NO_CLAIM_SUMMARY,
+      runnerId: "test-cli",
+      providerLabel: "Test CLI",
+      storedModelId: "cli:test-model",
+    });
+
+    const persisted = readProgress(folderPath);
+    assert.equal(
+      persisted.checklistProgressUnreliable,
+      undefined,
+      "a review that still names blockers describes real unfinished work, not an under-recording checklist"
+    );
+  });
+
+  void it("does not latch when the qualifying review scored below the auto-advance threshold, even with zero blockers", async () => {
+    const { folderPath, progress } = makeTaskFolder("latch_ignores_below_threshold_review", {
+      // Zero blockers, but the score itself (7) is below the default
+      // auto-advance threshold (10) — `latestQualifyingReviewMeetsThresholdV1`
+      // must reject on the score check before it ever reaches the
+      // zero-blockers check, so this exercises that first gate specifically,
+      // distinct from the blockers-present case just above.
+      reviewScoreHistory: [{ ...zeroBlockerFullMarks[0]!, score: 7 }],
+    });
+    await runHarnessed(folderPath, progress, {
+      status: "completed",
+      filesChanged: [],
+      filesChangedUnknown: false,
+      summary: STERILE_ECHO_NO_CLAIM_SUMMARY,
+      runnerId: "test-cli",
+      providerLabel: "Test CLI",
+      storedModelId: "cli:test-model",
+    });
+
+    const persisted = readProgress(folderPath);
+    assert.equal(
+      persisted.checklistProgressUnreliable,
+      undefined,
+      "a below-threshold review has not yet said the work is done, so the checklist's remaining count is not " +
+        "provably under-recording"
+    );
+  });
+
+  void it("does not latch a healthy task with zero remaining checklist items", async () => {
+    const { folderPath, progress } = makeTaskFolder("latch_ignores_fully_ticked_plan", {
+      reviewScoreHistory: zeroBlockerFullMarks,
+    });
+    fs.writeFileSync(
+      path.join(folderPath, "plan-final.md"),
+      [
+        "<!-- Generated by Test -->",
+        "",
+        "<!-- ensemble:implementation-checklist -->",
+        "",
+        "# Implementation Checklist",
+        "",
+        "- [x] Add the resolver",
+        "- [x] Wire the decoder",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+    await runHarnessed(folderPath, progress, {
+      status: "completed",
+      filesChanged: [],
+      filesChangedUnknown: false,
+      summary: STERILE_ECHO_NO_CLAIM_SUMMARY,
+      runnerId: "test-cli",
+      providerLabel: "Test CLI",
+      storedModelId: "cli:test-model",
+    });
+
+    const persisted = readProgress(folderPath);
+    assert.equal(
+      persisted.checklistProgressUnreliable,
+      undefined,
+      "there is nothing to under-report when the plan's own checklist already shows zero remaining"
+    );
+  });
+});
+
+/**
+ * Part 3 step 3, the other half of the widened-trigger contract: once the
+ * latch is set, "the gate stands down via the existing
+ * `readEffectivePlanChecklistProgressV1` path ... so the next passing review
+ * advances the stage" (plan step 3). The jester task's own next round never
+ * happened — a human hand-ticked its checklist instead — so there is no real
+ * transcript to replay here the way the other Part 3 tests replay one. This
+ * drives the exact two functions the real advance gate calls at the exact
+ * call site (`reviewActions.ts`, generateReviewWithAI): `effectiveReviewProgressV1`
+ * then `readyToAdvanceStage`. That is the entirety of "does the next review
+ * advance" — everything downstream (`handleReviewRoutingOutcome`, the stage
+ * transition) is unconditional once this predicate is true.
+ *
+ * (An earlier version of this comment claimed no review-round harness exists
+ * anywhere in the suite, as the reason this test reaches for the predicate
+ * pair instead of a real review round. That was too broad —
+ * `publishOwnershipMatrix.test.ts` already has one (`runReviewForFolder`
+ * against a stubbed V1 runner selection). Part 8 step 1's own describe block
+ * below reuses that harness — `runPassingReviewHarnessed` — to drive two real
+ * review rounds through the actual advance chain, closing the gap this
+ * comment used to justify leaving open.)
+ */
+void describe("checklistProgressUnreliable stand-down lets the next review advance (Part 3, end to end)", () => {
+  const zeroBlockerFullMarks = [
+    {
+      stage: "impl-high-review" as const,
+      score: 10,
+      attemptId: "attempt-passing",
+      at: "2026-01-02T00:00:00.000Z",
+      blockerCount: 0,
+      taskFixableCount: 0,
+    },
+  ];
+  // No `<!-- progress: N/M -->` marker: the review itself only ever reports
+  // its score. Whether the stage may advance turns entirely on how the
+  // checklist reconciles against that (checklist.ts's `PLAN_FINAL` fixture:
+  // 2 unticked items, 0 checked).
+  const NO_MARKER_REVIEW = "# Implementation Review\n\nReadiness: 10/10\n\nEverything checks out.\n";
+
+  void it("a latched task's next full-marks review is no longer blocked by the plan's unticked items", async () => {
+    const { folderUri } = makeTaskFolder("latch_stands_down_advance", {
+      reviewScoreHistory: zeroBlockerFullMarks,
+      // The state a task is in the round AFTER the sterile-round latch
+      // fired (the previous describe block proves that transition).
+      checklistProgressUnreliable: true,
+    });
+    const fsBridge = installFsBridge();
+    try {
+      const progress = await effectiveReviewProgressV1(
+        folderUri,
+        "impl-high-review",
+        NO_MARKER_REVIEW,
+        "strict"
+      );
+      assert.equal(
+        progress,
+        null,
+        "readEffectivePlanChecklistProgressV1 must stand down under the latch, so reconciliation returns " +
+          "the review's own (absent) marker unchanged rather than the plan's 2 unticked items"
+      );
+      assert.equal(
+        readyToAdvanceStage(10, getAutoAdvanceScoreThreshold(), progress),
+        true,
+        "with the checklist stood down, a full-marks review is no longer judged incomplete and the stage " +
+          "advance gate — the same predicate reviewActions.ts calls at the real advance site — now passes"
+      );
+    } finally {
+      fsBridge.restore();
+    }
+  });
+
+  void it("the SAME plan and review, without the latch, still blocks advance on its 2 unticked items", async () => {
+    const { folderUri } = makeTaskFolder("latch_absent_still_blocks_advance", {
+      reviewScoreHistory: zeroBlockerFullMarks,
+      // No `checklistProgressUnreliable` — this is the contrast case proving
+      // the previous test's pass is really the latch's doing, not some
+      // unrelated effect of a full-marks review.
+    });
+    const fsBridge = installFsBridge();
+    try {
+      const progress = await effectiveReviewProgressV1(
+        folderUri,
+        "impl-high-review",
+        NO_MARKER_REVIEW,
+        "strict"
+      );
+      assert.deepEqual(
+        progress,
+        { complete: 0, total: 2 },
+        "without the latch, the checklist's real 0-of-2 count overrides the review's absent marker"
+      );
+      assert.equal(
+        readyToAdvanceStage(10, getAutoAdvanceScoreThreshold(), progress),
+        false,
+        "a full-marks score alone must not advance a stage the plan's own checklist still reports incomplete"
+      );
+    } finally {
+      fsBridge.restore();
+    }
+  });
+});
+
+/**
+ * Part 8 (workflow 3 continuation, seventh item's verification): the
+ * complementary exit this describe block exercises is Part 4's — a round
+ * that changes NO files and echoes NO checkbox list at all, only bare prose
+ * claims in `## Plan Item Checklist` (the round-073 shape) — reaching
+ * advance-eligibility with no human editing `plan-final.md`. This is
+ * DISTINCT from the "Part 3, end to end" block above, which exercises the
+ * `checklistProgressUnreliable` LATCH exit (a review-confirmed sterile round
+ * whose counts are stood down). Here the merge itself succeeds — every
+ * remaining item resolves and ticks for real — so the latch must NEVER fire;
+ * standing the gate down would be the wrong mechanism when the checklist's
+ * own counts are already accurate.
+ *
+ * Also pins down the shape-gate defect this same round found and fixed:
+ * `describeImplementationSummaryShapeIssue` used to require a `- [x]`
+ * checkbox echo (or the `<!-- ensemble:no-checklist-change -->` marker) to
+ * accept a response at all — a PURE prose claim with no checkbox echo (the
+ * verbatim round-073 production shape) was rejected by the shape gate BEFORE
+ * `mergeChecklistProgressV1` ever ran, so Part 4's fix could tick a plan in
+ * a direct unit call but could never actually fire in the real
+ * round-completion pipeline (`reviewActions.ts`). `hasPlanItemChecklistClaimV1`
+ * closes that gap; this test drives the real pipeline end to end (not just
+ * the merge function directly) so a regression here is caught as a pipeline
+ * failure, not just a unit-level one.
+ */
+void describe("a prose-only Plan Item Checklist claim reaches advance-eligibility with zero file changes (Part 4/8, end to end)", () => {
+  const PROSE_CLAIM_TICKS_BOTH_ITEMS = [
+    "## Files Changed",
+    "",
+    "- (none) — this round only verified prior work",
+    "",
+    "## Plan Item Checklist",
+    "",
+    "- Add the resolver — done — verified present in src/resolver.ts:12-30, tested by src/test/resolver.test.ts",
+    "- Wire the decoder — done — verified present in src/decoder.ts:5-20, tested by src/test/decoder.test.ts",
+    "",
+    "## Verification",
+    "",
+    "- ran the unit tests",
+  ].join("\n");
+
+  void it("ticks every remaining item for real, never latches, and the next full-marks review is advance-eligible — no manual plan-final.md edit anywhere in the chain", async () => {
+    const { folderPath, folderUri, progress } = makeTaskFolder("prose_claim_reaches_advance_eligible");
+
+    const run = await runHarnessed(folderPath, progress, {
+      status: "completed",
+      filesChanged: [],
+      filesChangedUnknown: false,
+      summary: PROSE_CLAIM_TICKS_BOTH_ITEMS,
+      runnerId: "test-cli",
+      providerLabel: "Test CLI",
+      storedModelId: "cli:test-model",
+    });
+
+    // 1. The merge actually ran and wrote real ticks — not the latch.
+    const planFinalAfter = fs.readFileSync(path.join(folderPath, "plan-final.md"), "utf8");
+    assert.ok(
+      planFinalAfter.includes("- [x] Add the resolver"),
+      "the prose claim must land as a real checkbox tick on disk, with no file changes and no manual edit"
+    );
+    assert.ok(planFinalAfter.includes("- [x] Wire the decoder"));
+
+    const persisted = readProgress(folderPath);
+    assert.equal(
+      persisted.checklistProgressUnreliable,
+      undefined,
+      "a claim that actually resolves and ticks for real must never trip the under-recording latch — " +
+        "that exit is reserved for when the counts themselves cannot be trusted"
+    );
+
+    const logs = readRunLogs(folderPath);
+    const diagnosticsLog = logs.find((log) => log.includes("## Checklist merge diagnostics"));
+    assert.ok(
+      diagnosticsLog?.includes("Merge kind: `merged`"),
+      "the run log must record that this round's prose claim actually merged, not that it was rejected " +
+        "or left unmatched"
+    );
+
+    // 2. No notification tells the operator to hand-edit anything — this
+    // round needed no human intervention.
+    assert.equal(
+      run.notifications.some((n) => /tick the missed items|hand-edit|Reconciled/i.test(n.message)),
+      false,
+      "a round whose claim actually merged must not surface any reconciliation/manual-edit affordance"
+    );
+
+    // 3. The stage is now advance-eligible on the next full-marks review —
+    // the same predicate the real advance gate calls at its call site.
+    const fsBridge = installFsBridge();
+    try {
+      const NO_MARKER_REVIEW = "# Implementation Review\n\nReadiness: 10/10\n\nEverything checks out.\n";
+      const reconciled = await effectiveReviewProgressV1(
+        folderUri,
+        "impl-high-review",
+        NO_MARKER_REVIEW,
+        "strict"
+      );
+      assert.equal(
+        readyToAdvanceStage(10, getAutoAdvanceScoreThreshold(), reconciled),
+        true,
+        "with both plan items genuinely ticked, a full-marks review must now advance the stage with no " +
+          "manual file editing anywhere in the chain"
+      );
+    } finally {
+      fsBridge.restore();
+    }
+  });
+});
+
+/**
+ * Part 8 step 1, closing the gap the review of this plan's previous round
+ * flagged: every earlier "end to end" block in this file drives the real
+ * round-completion pipeline up to the exact predicate the advance gate calls
+ * (effectiveReviewProgressV1 + readyToAdvanceStage) and stops there — none of
+ * them drives the REVIEW rounds themselves, so none proves the task actually
+ * reaches Publish. `publishOwnershipMatrix.test.ts` already contains a full
+ * review-round harness (runReviewForFolder against a stubbed V1 runner
+ * selection, driving the real advanceStageViaNextStageRowV1 transition) — the
+ * "no review-round harness exists anywhere in the suite" reasoning documented
+ * on the "Part 3, end to end" block above was therefore too broad; that
+ * harness is reused here (runPassingReviewHarnessed) to chain two real
+ * review rounds after the zero-file prose-claim implementation round, so this
+ * test drives the literal chain the seventh item asked for: a round whose
+ * checklist state does not merge as checkboxes (prose only, no file changes)
+ * reaching `publish`, with no manual `plan-final.md` edit anywhere.
+ */
+void describe("the prose-claim exit reaches literal Publish with no manual editing anywhere (Part 8 step 1, end to end)", () => {
+  const PROSE_CLAIM_TICKS_BOTH_ITEMS = [
+    "## Files Changed",
+    "",
+    "- (none) — this round only verified prior work",
+    "",
+    "## Plan Item Checklist",
+    "",
+    "- Add the resolver — done — verified present in src/resolver.ts:12-30, tested by src/test/resolver.test.ts",
+    "- Wire the decoder — done — verified present in src/decoder.ts:5-20, tested by src/test/decoder.test.ts",
+    "",
+    "## Verification",
+    "",
+    "- ran the unit tests",
+  ].join("\n");
+
+  const FULL_MARKS_REVIEW = "# Implementation Review\n\nReadiness: 10/10\n\nEverything checks out. No blockers.\n";
+
+  void it("a zero-file prose-only round ticks the checklist, then two real review rounds advance impl-high-review -> impl-low-review -> publish", async () => {
+    const { folderPath, progress } = makeTaskFolder("prose_claim_reaches_literal_publish");
+    // runReviewForFolder requires a non-empty plan.md (resolveCurrentPlanUri)
+    // in addition to makeTaskFolder's plan-final.md — the implementation
+    // round harness above never needed it since it never runs a review.
+    fs.writeFileSync(path.join(folderPath, "plan.md"), "# Plan\n\n1. Add the resolver.\n2. Wire the decoder.\n", "utf8");
+
+    // Round 1: the zero-file, checkbox-free prose claim — the exact shape
+    // that used to be rejected by the shape gate before this same plan's
+    // Part 8 discovery fixed it (known-gaps.md, "a prose-only Plan Item
+    // Checklist claim ... was rejected before the merge could ever run").
+    await runHarnessed(folderPath, progress, {
+      status: "completed",
+      filesChanged: [],
+      filesChangedUnknown: false,
+      summary: PROSE_CLAIM_TICKS_BOTH_ITEMS,
+      runnerId: "test-cli",
+      providerLabel: "Test CLI",
+      storedModelId: "cli:test-model",
+    });
+    const planFinalAfterRound = fs.readFileSync(path.join(folderPath, "plan-final.md"), "utf8");
+    assert.ok(
+      planFinalAfterRound.includes("- [x] Add the resolver") && planFinalAfterRound.includes("- [x] Wire the decoder"),
+      "precondition: the prose claim must have ticked both items for real before any review runs"
+    );
+    assert.equal(
+      readProgress(folderPath).checklistProgressUnreliable,
+      undefined,
+      "precondition: the round above must not have latched — this test exercises the merge exit, not the latch exit"
+    );
+
+    // Round 2: a real, full-marks review AT the task's current stage
+    // (impl-high-review) — same-stage self-review, exactly what "review the
+    // current stage" means in production (REVIEW_TARGETS["impl-high-review"]
+    // === "impl-high-review"). With the checklist now showing 0 remaining,
+    // readyToAdvanceStage passes and the REAL advance chain fires.
+    await runPassingReviewHarnessed(folderPath, "impl-high-review", FULL_MARKS_REVIEW);
+    const afterFirstReview = readProgress(folderPath);
+    assert.equal(
+      afterFirstReview.currentStage,
+      "impl-low-review",
+      "a full-marks review with a genuinely complete checklist must advance the stage for real, via the same " +
+        "advanceStageViaNextStageRowV1 transition production uses — not just report advance-eligible"
+    );
+
+    // Round 3: the same real review, now at impl-low-review — the last hop
+    // to Publish.
+    await runPassingReviewHarnessed(folderPath, "impl-low-review", FULL_MARKS_REVIEW);
+    const afterSecondReview = readProgress(folderPath);
+    assert.equal(
+      afterSecondReview.currentStage,
+      "publish",
+      "the task must reach Publish through two real review rounds with no human ever hand-editing " +
+        "plan-final.md — the exact chain the seventh item's verification requirement describes"
+    );
+  });
+});
+
+/**
+ * Part 8 step 1, second complementary exit (2026-08-16 review finding): the
+ * block above proves the Part 4 prose-claim exit reaches literal `publish`.
+ * This block proves the Part 3 LATCH exit reaches it too — a sterile round
+ * behind a qualifying zero-blocker review stands the checklist gate down
+ * (`checklistProgressUnreliable`), and the task then advances through two
+ * real review rounds to Publish with the plan's own items STILL genuinely
+ * unticked on disk. That is the defining difference from the prose-claim
+ * exit: here nothing ever merges as checkboxes — the gate itself stands
+ * down — so this is a distinct proof, not a duplicate of the block above.
+ * The "checklistProgressUnreliable stand-down lets the next review advance
+ * (Part 3, end to end)" block already proves the underlying predicate pair
+ * (`effectiveReviewProgressV1` + `readyToAdvanceStage`); this drives the
+ * real round-completion and review pipelines end to end instead.
+ */
+void describe("the checklistProgressUnreliable latch exit reaches literal Publish with no manual editing anywhere (Part 3+8, end to end)", () => {
+  const zeroBlockerFullMarks = [
+    {
+      stage: "impl-high-review" as const,
+      score: 10,
+      attemptId: "attempt-passing",
+      at: "2026-01-02T00:00:00.000Z",
+      blockerCount: 0,
+      taskFixableCount: 0,
+    },
+  ];
+
+  // Same sterile-echo shape the "Part 3, widened trigger" block above
+  // proves latches the gate: no files changed, the checklist echoed
+  // verbatim with nothing newly ticked, no retroactive claim at all.
+  const STERILE_ECHO_NO_CLAIM_SUMMARY = [
+    "<!-- ensemble:implementation-checklist -->",
+    "",
+    "- [ ] Add the resolver",
+    "- [ ] Wire the decoder",
+    "",
+    "## Files Changed",
+    "",
+    "- (none) — the review already confirmed this satisfies the plan; nothing left to change",
+    "",
+    "## Verification",
+    "",
+    "- ran the unit tests",
+  ].join("\n");
+
+  const FULL_MARKS_REVIEW = "# Implementation Review\n\nReadiness: 10/10\n\nEverything checks out. No blockers.\n";
+
+  void it("a sterile round behind a qualifying review latches the gate, then two real review rounds advance impl-high-review -> impl-low-review -> publish", async () => {
+    const { folderPath, progress } = makeTaskFolder("latch_reaches_literal_publish", {
+      reviewScoreHistory: zeroBlockerFullMarks,
+    });
+    // runReviewForFolder requires a non-empty plan.md, same precondition as
+    // the prose-claim block above.
+    fs.writeFileSync(
+      path.join(folderPath, "plan.md"),
+      "# Plan\n\n1. Add the resolver.\n2. Wire the decoder.\n",
+      "utf8"
+    );
+
+    // Round 1: the sterile round behind the qualifying zero-blocker
+    // full-marks review already on record — must latch the gate.
+    await runHarnessed(folderPath, progress, {
+      status: "completed",
+      filesChanged: [],
+      filesChangedUnknown: false,
+      summary: STERILE_ECHO_NO_CLAIM_SUMMARY,
+      runnerId: "test-cli",
+      providerLabel: "Test CLI",
+      storedModelId: "cli:test-model",
+    });
+    const latched = readProgress(folderPath);
+    assert.equal(
+      latched.checklistProgressUnreliable,
+      true,
+      "precondition: the sterile round behind a qualifying review must latch the gate before the review " +
+        "rounds below can prove it stands the advance down"
+    );
+    assert.equal(
+      latched.currentStage,
+      "impl-high-review",
+      "precondition: latching the checklist gate must not itself advance the stage — only a passing review does"
+    );
+
+    // Round 2: a real, full-marks review at impl-high-review. The plan's
+    // own 2 items are STILL unticked on disk — the latch stands the count
+    // down, it never ticks anything.
+    await runPassingReviewHarnessed(folderPath, "impl-high-review", FULL_MARKS_REVIEW);
+    const afterFirstReview = readProgress(folderPath);
+    assert.equal(
+      afterFirstReview.currentStage,
+      "impl-low-review",
+      "a full-marks review must advance the stage for real under the stood-down latch, via the same " +
+        "advanceStageViaNextStageRowV1 transition production uses — with the plan's 2 items still genuinely unticked"
+    );
+    const planStillUnticked = fs.readFileSync(path.join(folderPath, "plan-final.md"), "utf8");
+    assert.ok(
+      planStillUnticked.includes("- [ ] Add the resolver") && planStillUnticked.includes("- [ ] Wire the decoder"),
+      "the latch exit advances WITHOUT ticking the plan — proving this is the stand-down path, not the merge path"
+    );
+
+    // Round 3: the same real review, now at impl-low-review — the last hop
+    // to Publish, under the same still-latched gate.
+    await runPassingReviewHarnessed(folderPath, "impl-low-review", FULL_MARKS_REVIEW);
+    const afterSecondReview = readProgress(folderPath);
+    assert.equal(
+      afterSecondReview.currentStage,
+      "publish",
+      "the task must reach Publish through two real review rounds with no human ever hand-editing " +
+        "plan-final.md — the latch exit's own literal-publish proof, distinct from the prose-claim exit above"
+    );
+  });
+});
+
+/**
+ * Part 8 step 1, third complementary exit (2026-08-16 review finding): the
+ * two blocks above prove the Part 4 (prose-claim merge) and Part 3 (latch
+ * stand-down) exits reach literal `publish`. This proves the Part 5 exit —
+ * `applyReviewerVerifiedTicks` ("Apply N reviewer-verified ticks"), the
+ * one-click command an OPERATOR invokes (not a round) to apply a reviewer's
+ * `## Verified Complete` list — writes real checkbox ticks with zero file
+ * changes and zero implementation rounds, and the task then advances through
+ * two real review rounds to Publish with no human ever hand-editing
+ * plan-final.md. `applyReviewerVerifiedTicksCommand.test.ts` already proves
+ * the command's own ticking behavior in isolation; this drives it as one
+ * step of the real end-to-end chain the seventh item's verification
+ * requirement describes.
+ */
+void describe("the reviewer-verified-ticks exit reaches literal Publish with no manual editing anywhere (Part 5+8, end to end)", () => {
+  const FULL_MARKS_REVIEW = "# Implementation Review\n\nReadiness: 10/10\n\nEverything checks out. No blockers.\n";
+
+  const REVIEW_WITH_VERIFIED_ITEMS = [
+    "# Implementation Review",
+    "",
+    "Readiness: 9/10",
+    "",
+    "<!-- verified-complete:start -->",
+    "- Add the resolver",
+    "- Wire the decoder",
+    "<!-- verified-complete:end -->",
+    "",
+    "<!-- blockers:start -->",
+    "<!-- blockers:end -->",
+  ].join("\n");
+
+  void it("Apply N reviewer-verified ticks writes real checkbox ticks with zero file changes, then two real review rounds advance impl-high-review -> impl-low-review -> publish", async () => {
+    const { folderPath, progress } = makeTaskFolder("apply_ticks_reaches_literal_publish");
+    fs.writeFileSync(
+      path.join(folderPath, "plan.md"),
+      "# Plan\n\n1. Add the resolver.\n2. Wire the decoder.\n",
+      "utf8"
+    );
+    // Overwrite the default placeholder review with one naming both plan
+    // items as reviewer-verified complete.
+    fs.writeFileSync(path.join(folderPath, "impl-high-review.md"), REVIEW_WITH_VERIFIED_ITEMS, "utf8");
+
+    const canonicalId = "canonical-apply-ticks-reaches-publish";
+    const task = {
+      canonicalId,
+      taskFolderPath: folderPath,
+      folderName: path.basename(folderPath),
+      sourceScopeKey: canonicalId,
+      progress,
+    };
+    const inventory = Object.create(TaskInventory.prototype) as TaskInventory;
+    // @ts-expect-error — direct field init on stub, mirrors applyReviewerVerifiedTicksCommand.test.ts's makeInventory
+    inventory.visibleTasks = [task];
+    // @ts-expect-error — direct field init on stub
+    inventory.taskByCanonicalId = new Map([[canonicalId, task]]);
+    // @ts-expect-error — direct field init on stub
+    inventory.suppressionAliasMap = new Map();
+    inventory.refresh = (): Promise<void> => Promise.resolve();
+    inventory.getTasks = (): Array<typeof task> => [task];
+    inventory.getTaskById = (id: string): typeof task | undefined => (id === canonicalId ? task : undefined);
+    inventory.getTaskByPath = (p: string): typeof task | undefined => (p === folderPath ? task : undefined);
+    inventory.getVisibleTaskForSuppressedId = (): undefined => undefined;
+    inventory.getVisibleTaskForSuppressedPath = (): undefined => undefined;
+
+    const store = Object.create(CurrentTaskStore.prototype) as CurrentTaskStore;
+    store.get = (): string | undefined => canonicalId;
+    store.set = (): Promise<void> => Promise.resolve();
+    store.clear = (): Promise<void> => Promise.resolve();
+
+    const provider = new StatusTreeProvider();
+    initNotificationRouter(provider);
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const windowTarget = vscode.window as unknown as Record<string, unknown>;
+    const origShowWarning = windowTarget.showWarningMessage;
+    windowTarget.showWarningMessage = (): Promise<string> => Promise.resolve("Apply Ticks");
+    try {
+      await applyReviewerVerifiedTicks(inventory, store, { taskFolderPath: folderPath });
+    } finally {
+      windowTarget.showWarningMessage = origShowWarning;
+      wsStub.restore();
+      fsBridge.restore();
+      provider.dispose();
+      deactivateNotificationRouter();
+    }
+
+    const planAfterApply = fs.readFileSync(path.join(folderPath, "plan-final.md"), "utf8");
+    assert.ok(
+      planAfterApply.includes("- [x] Add the resolver") && planAfterApply.includes("- [x] Wire the decoder"),
+      "precondition: Apply N reviewer-verified ticks must land real checkbox ticks with zero file changes " +
+        "and zero implementation rounds before any review runs"
+    );
+
+    // Round 2: a real, full-marks review at impl-high-review. With the
+    // checklist now showing 0 remaining (ticked by the command, not a
+    // round), the real advance chain fires.
+    await runPassingReviewHarnessed(folderPath, "impl-high-review", FULL_MARKS_REVIEW);
+    const afterFirstReview = readProgress(folderPath);
+    assert.equal(
+      afterFirstReview.currentStage,
+      "impl-low-review",
+      "a full-marks review with a genuinely complete checklist must advance the stage for real — the " +
+        "operator's one-click apply is what completed it, not an implementation round"
+    );
+
+    // Round 3: the same real review, now at impl-low-review — the last hop
+    // to Publish.
+    await runPassingReviewHarnessed(folderPath, "impl-low-review", FULL_MARKS_REVIEW);
+    const afterSecondReview = readProgress(folderPath);
+    assert.equal(
+      afterSecondReview.currentStage,
+      "publish",
+      "the task must reach Publish through the operator's one-click reviewer-verified-ticks apply plus two " +
+        "real review rounds, with no human ever hand-editing plan-final.md"
+    );
   });
 });
 

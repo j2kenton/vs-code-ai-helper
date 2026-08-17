@@ -153,13 +153,29 @@ export function declaresNoChecklistChangeV1(response: string): boolean {
  * region), so a plan that merely quotes either marker inside a checklist
  * item's descriptive text can never trigger this on its own.
  */
-export function hasContradictoryNoChecklistChangeClaimV1(content: string): boolean {
+export function hasContradictoryNoChecklistChangeClaimV1(
+  content: string,
+  planItemKeys: ReadonlySet<string> = new Set()
+): boolean {
   const trimmed = content.trim();
   if (!declaresNoChecklistChangeV1(trimmed)) {
     return false;
   }
   const { own } = splitSummaryAtEchoV1(trimmed);
-  return collectRetroactiveTickClaimsV1(own).length > 0;
+  return (
+    collectRetroactiveTickClaimsV1(own, planItemKeys).length > 0 ||
+    collectPartLevelTickClaimsV1(own).length > 0
+  );
+}
+
+/**
+ * Reverses backslash-over-escaping a checklist line can pick up from a
+ * round-trip through a JSON-encoded field — port of the extension's exported
+ * `unescapeChecklistItemTextV1` (kept unexported here; the extension exposes
+ * it separately because `verifyPlanItems` there also needs it directly).
+ */
+function unescapeChecklistItemTextV1(text: string): string {
+  return text.replace(/\\"/g, "\"").replace(/\\'/g, "'").replace(/\\\\/g, "\\");
 }
 
 /**
@@ -172,10 +188,7 @@ export function hasContradictoryNoChecklistChangeClaimV1(content: string): boole
  * backslash-quote sequences.
  */
 export function normalizeChecklistItemTextV1(text: string): string {
-  const unescaped = text
-    .replace(/\\"/g, "\"")
-    .replace(/\\'/g, "'")
-    .replace(/\\\\/g, "\\");
+  const unescaped = unescapeChecklistItemTextV1(text);
   return unescaped.trim().toLowerCase().replace(/\s+/g, " ");
 }
 
@@ -196,35 +209,134 @@ export interface RetroactiveTickClaimV1 {
 
 const CHECKLIST_ENTRY_LINE = /^[ \t]*[-*][ \t]+(.*\S)[ \t]*\r?$/;
 
+/**
+ * Port of the extension's `parsePlanItemChecklistLine`. When `planItemKeys`
+ * is supplied, tries the LONGEST prefix of the line — split on ` — `, most
+ * segments first — that normalizes to a real plan item, so a plan item
+ * whose own text contains ` — ` is not mistaken for the item/status
+ * boundary. Falls back to the naive first-segment split when nothing
+ * matches (or no keys were supplied), preserving `no-match` for a
+ * genuinely unmatched/foreign/paraphrased claim.
+ */
 function parsePlanItemChecklistLine(
-  raw: string
+  raw: string,
+  planItemKeys: ReadonlySet<string> = new Set()
 ): { itemText: string; status: string; evidence: string } | undefined {
   const outer = CHECKLIST_ENTRY_LINE.exec(raw);
   if (!outer) {
     return undefined;
   }
-  const parts = (outer[1] ?? "").split(/\s+—\s+/);
-  if (parts.length < 2) {
+  const segments = (outer[1] ?? "").split(/\s+—\s+/);
+  if (segments.length < 2) {
     return undefined;
   }
+  for (let k = segments.length - 1; k >= 1; k--) {
+    const candidateItemText = segments.slice(0, k).join(" — ").trim();
+    if (planItemKeys.has(normalizeChecklistItemTextV1(candidateItemText))) {
+      return {
+        itemText: candidateItemText,
+        status: (segments[k] ?? "").trim(),
+        evidence: segments.slice(k + 1).join(" — ").trim(),
+      };
+    }
+  }
   return {
-    itemText: (parts[0] ?? "").trim(),
-    status: (parts[1] ?? "").trim(),
-    evidence: parts.slice(2).join(" — ").trim(),
+    itemText: (segments[0] ?? "").trim(),
+    status: (segments[1] ?? "").trim(),
+    evidence: segments.slice(2).join(" — ").trim(),
   };
 }
+
+/**
+ * Matches a PART-level claim line ("Part 7 — done this round (6/6),
+ * evidence: ...") — port of the extension's `PART_CLAIM_LINE`.
+ */
+const PART_CLAIM_LINE = /^[ \t]*[-*][ \t]+Part[ \t]+(\d+[A-Za-z]?)[ \t]*—[ \t]*(.+?)[ \t]*\r?$/i;
 
 /**
  * Retroactive-tick claims declared in `ownSummary` — the part of a response
  * AFTER the `## Files Changed` boundary (`splitSummaryAtEchoV1`'s `own`),
  * never the echoed plan checklist itself. Port of the extension's
- * `collectRetroactiveTickClaimsV1`. A claim with empty `evidence` is still
- * returned so the caller can treat it as unfulfilled rather than dropping it.
+ * `collectRetroactiveTickClaimsV1`. Accepts either the explicit
+ * `RETROACTIVE_TICK_MARKER_V1` or bare prose whose status begins with
+ * "done" — both require the status to start with "done"; PART-level lines
+ * are skipped here (handled by `collectPartLevelTickClaimsV1` instead). A
+ * claim with empty `evidence` is still returned so the caller can treat it
+ * as unfulfilled rather than dropping it.
  */
 export function collectRetroactiveTickClaimsV1(
-  ownSummary: string
+  ownSummary: string,
+  planItemKeys: ReadonlySet<string> = new Set()
 ): RetroactiveTickClaimV1[] {
   const claims: RetroactiveTickClaimV1[] = [];
+  const all = headingsV1(ownSummary);
+  const at = findLastHeadingV1(all, "Plan Item Checklist");
+  if (at === -1) {
+    return claims;
+  }
+  const heading = all[at];
+  if (!heading) {
+    return claims;
+  }
+  const lines = walkLinesV1(ownSummary);
+  let end = lines.length;
+  for (let h = at + 1; h < all.length; h++) {
+    const candidate = all[h];
+    if (candidate && candidate.level <= heading.level) {
+      end = candidate.line;
+      break;
+    }
+  }
+  for (let i = heading.line + 1; i < end; i++) {
+    const line = lines[i];
+    if (!line || line.fenced || PART_CLAIM_LINE.test(line.text)) {
+      continue;
+    }
+    const parsed = parsePlanItemChecklistLine(line.text, planItemKeys);
+    if (!parsed) {
+      continue;
+    }
+    if (!parsed.status.toLowerCase().startsWith("done")) {
+      continue;
+    }
+    claims.push({ itemText: parsed.itemText, evidence: parsed.evidence });
+  }
+  return claims;
+}
+
+/** One PART-level retroactive-tick claim — port of the extension's `PartLevelTickClaimV1`. */
+export interface PartLevelTickClaimV1 {
+  readonly partNumber: string;
+  readonly evidence: string;
+}
+
+function parsePartLevelClaimLine(raw: string): PartLevelTickClaimV1 | undefined {
+  const match = PART_CLAIM_LINE.exec(raw);
+  if (!match) {
+    return undefined;
+  }
+  const partNumber = match[1] ?? "";
+  const segments = (match[2] ?? "").trim().split(/\s+—\s+/);
+  const status = segments[0] ?? "";
+  if (!status.toLowerCase().startsWith("done")) {
+    return undefined;
+  }
+  let evidence = segments.slice(1).join(" — ").trim();
+  if (!evidence) {
+    const inline = /evidence:\s*(.+)$/i.exec(status);
+    evidence = inline ? (inline[1] ?? "").trim() : "";
+  }
+  return { partNumber, evidence };
+}
+
+/**
+ * PART-level claims from `ownSummary`'s `## Plan Item Checklist` section —
+ * port of the extension's `collectPartLevelTickClaimsV1`. Resolution to
+ * individual items happens in `mergeChecklistProgressV1`, mirroring the
+ * extension's split between claim collection and plan-of-record expansion.
+ */
+export function collectPartLevelTickClaimsV1(ownSummary: string): PartLevelTickClaimV1[] {
+  const claims: PartLevelTickClaimV1[] = [];
   const all = headingsV1(ownSummary);
   const at = findLastHeadingV1(all, "Plan Item Checklist");
   if (at === -1) {
@@ -248,19 +360,52 @@ export function collectRetroactiveTickClaimsV1(
     if (!line || line.fenced) {
       continue;
     }
-    const parsed = parsePlanItemChecklistLine(line.text);
-    if (!parsed) {
-      continue;
+    const parsed = parsePartLevelClaimLine(line.text);
+    if (parsed) {
+      claims.push(parsed);
     }
-    if (
-      !parsed.status.toLowerCase().startsWith("done") ||
-      !parsed.status.includes(RETROACTIVE_TICK_MARKER_V1)
-    ) {
-      continue;
-    }
-    claims.push({ itemText: parsed.itemText, evidence: parsed.evidence });
   }
   return claims;
+}
+
+/**
+ * Every checklist item's raw text under the `## Part {partNumber}` heading
+ * of `planOfRecord`'s latest checklist rendering — port of the extension's
+ * `collectPlanItemsUnderPartHeadingV1`.
+ */
+function collectPlanItemsUnderPartHeadingV1(
+  planOfRecord: string,
+  partNumber: string
+): string[] {
+  const scoped = scopeToLatestChecklistV1(planOfRecord).region;
+  const all = headingsV1(scoped);
+  const partPattern = new RegExp(`^Part\\s+${partNumber}\\b`, "i");
+  const at = all.findIndex((entry) => partPattern.test(entry.title.trim()));
+  if (at === -1) {
+    return [];
+  }
+  const heading = all[at]!;
+  const lines = walkLinesV1(scoped);
+  let end = lines.length;
+  for (let h = at + 1; h < all.length; h++) {
+    const candidate = all[h];
+    if (candidate && candidate.level <= heading.level) {
+      end = candidate.line;
+      break;
+    }
+  }
+  const items: string[] = [];
+  for (let i = heading.line + 1; i < end; i++) {
+    const line = lines[i];
+    if (!line || line.fenced) {
+      continue;
+    }
+    const match = ANY_ITEM_LINE.exec(line.text);
+    if (match) {
+      items.push(match[2] ?? "");
+    }
+  }
+  return items;
 }
 
 /**
@@ -452,6 +597,63 @@ export function collectCheckedChecklistCountsV1(
   return counts;
 }
 
+/** Result of {@link listUncheckedChecklistItemTextsV1} — port of the extension's identically-named type. */
+export interface UncheckedChecklistItemsV1 {
+  readonly items: readonly string[];
+  readonly total: number;
+}
+
+/**
+ * Plan-item texts whose box is currently UNCHECKED in `planOfRecord`'s latest
+ * rendering, in document order, unescaped for display and bounded to `limit`.
+ * Excludes items carrying `EXCLUDED_CHECKLIST_ITEM_MARKER_V1` — port of the
+ * extension's identically-named function.
+ */
+export function listUncheckedChecklistItemTextsV1(
+  planOfRecord: string,
+  limit: number = 10
+): UncheckedChecklistItemsV1 {
+  const outstanding = itemsInLatestRendering(planOfRecord).filter(
+    (item) => !item.excluded && !item.checked
+  );
+  return {
+    items: outstanding.slice(0, limit).map((item) => unescapeChecklistItemTextV1(item.text)),
+    total: outstanding.length,
+  };
+}
+
+/**
+ * Of `candidateTexts`, return the plan of record's OWN item text for each
+ * candidate that currently resolves to an unchecked, non-excluded item —
+ * port of the extension's identically-named function.
+ */
+export function filterUncheckedPlanItemsV1(
+  planOfRecord: string,
+  candidateTexts: readonly string[]
+): string[] {
+  const uncheckedByKey = new Map<string, string>();
+  for (const item of itemsInLatestRendering(planOfRecord)) {
+    if (item.excluded || item.checked) {
+      continue;
+    }
+    const key = normalizeChecklistItemTextV1(item.text);
+    if (!uncheckedByKey.has(key)) {
+      uncheckedByKey.set(key, item.text);
+    }
+  }
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const candidate of candidateTexts) {
+    const key = normalizeChecklistItemTextV1(candidate);
+    const planText = uncheckedByKey.get(key);
+    if (planText !== undefined && !seen.has(key)) {
+      seen.add(key);
+      result.push(planText);
+    }
+  }
+  return result;
+}
+
 /**
  * Outcome of {@link mergeChecklistProgressV1} — port of the extension's
  * `MergeChecklistProgressResultV1`. Distinguishes a legitimate no-op
@@ -494,10 +696,13 @@ export function mergeChecklistProgressV1(
     }
   }
 
+  const planItemKeys = new Set(
+    itemsInLatestRendering(planOfRecord).map((item) => normalizeChecklistItemTextV1(item.text))
+  );
   const retroactiveKeys = new Set<string>();
   const retroactiveEvidenceByKey = new Map<string, string>();
   const missingEvidenceSamples: string[] = [];
-  for (const claim of collectRetroactiveTickClaimsV1(own)) {
+  for (const claim of collectRetroactiveTickClaimsV1(own, planItemKeys)) {
     const key = normalizeChecklistItemTextV1(claim.itemText);
     if (claim.evidence.length === 0) {
       missingEvidenceSamples.push(claim.itemText);
@@ -510,6 +715,30 @@ export function mergeChecklistProgressV1(
     }
     if (!reportedRawText.has(key)) {
       reportedRawText.set(key, claim.itemText);
+    }
+  }
+
+  for (const partClaim of collectPartLevelTickClaimsV1(own)) {
+    const label = `Part ${partClaim.partNumber}`;
+    if (partClaim.evidence.length === 0) {
+      missingEvidenceSamples.push(label);
+      continue;
+    }
+    const itemTexts = collectPlanItemsUnderPartHeadingV1(planOfRecord, partClaim.partNumber);
+    if (itemTexts.length === 0) {
+      missingEvidenceSamples.push(`${label} (no matching "## Part ${partClaim.partNumber}" heading in the plan)`);
+      continue;
+    }
+    for (const itemText of itemTexts) {
+      const key = normalizeChecklistItemTextV1(itemText);
+      reported.set(key, (reported.get(key) ?? 0) + 1);
+      retroactiveKeys.add(key);
+      if (!retroactiveEvidenceByKey.has(key)) {
+        retroactiveEvidenceByKey.set(key, partClaim.evidence);
+      }
+      if (!reportedRawText.has(key)) {
+        reportedRawText.set(key, itemText);
+      }
     }
   }
 
@@ -573,12 +802,9 @@ export function mergeChecklistProgressV1(
     };
   }
 
-  const planKeys = new Set(
-    itemsInLatestRendering(planOfRecord).map((item) => normalizeChecklistItemTextV1(item.text))
-  );
   const unmatchedSample: string[] = [...missingEvidenceSamples];
   for (const key of reported.keys()) {
-    if (!planKeys.has(key) && !unmatchedSample.includes(reportedRawText.get(key) ?? key)) {
+    if (!planItemKeys.has(key) && !unmatchedSample.includes(reportedRawText.get(key) ?? key)) {
       unmatchedSample.push(reportedRawText.get(key) ?? key);
     }
     if (unmatchedSample.length >= 2) {

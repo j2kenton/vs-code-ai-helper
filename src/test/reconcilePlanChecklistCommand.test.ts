@@ -36,6 +36,7 @@ import {
   UNVERIFIED_CHECKLIST_COUNT_QUALIFIER_V1,
   buildSiblingReviewDisagreementVariable,
   buildStayingOnStageNoticeV1,
+  describeOutstandingChecklistItemsV1,
   readPlanChecklistProgressV1,
 } from "../commands/reviewActions";
 import { TaskInventory } from "../state/taskInventory";
@@ -597,5 +598,53 @@ void describe("checklistProgressUnreliable — gating and reporting surfaces", (
       fs.restore();
       workspace.restore();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Part 5 (workflow 3 continuation) — describeOutstandingChecklistItemsV1, the
+// formatter shared by the latch-trip note, the reconciliation-needed note,
+// and the no-progress breaker escalation, so every "tick the missed items"
+// surface names the exact items instead of leaving the reader to search the
+// plan for them.
+// ---------------------------------------------------------------------------
+void describe("describeOutstandingChecklistItemsV1", () => {
+  void it("returns '' for an undefined plan (no checklist to name items from)", () => {
+    assert.equal(describeOutstandingChecklistItemsV1(undefined), "");
+  });
+
+  void it("returns '' when the plan has a checklist but nothing is outstanding", () => {
+    const allDone = CHECKLIST_PLAN.replace(
+      "- [ ] Wire the completeness gate",
+      "- [x] Wire the completeness gate"
+    );
+    assert.equal(describeOutstandingChecklistItemsV1(allDone), "");
+  });
+
+  void it("names each outstanding item as its own bullet", () => {
+    const plan = [
+      "<!-- ensemble:implementation-checklist -->",
+      "",
+      "- [ ] Wire the completeness gate",
+      "- [ ] Add the retry button",
+    ].join("\n");
+    assert.equal(
+      describeOutstandingChecklistItemsV1(plan),
+      "\n- Wire the completeness gate\n- Add the retry button"
+    );
+  });
+
+  void it("bounds the list and reports how many more exist", () => {
+    const plan = [
+      "<!-- ensemble:implementation-checklist -->",
+      "",
+      "- [ ] item one",
+      "- [ ] item two",
+      "- [ ] item three",
+    ].join("\n");
+    assert.equal(
+      describeOutstandingChecklistItemsV1(plan, 2),
+      "\n- item one\n- item two\n…and 1 more."
+    );
   });
 });

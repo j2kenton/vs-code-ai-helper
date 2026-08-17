@@ -167,6 +167,52 @@ void describe("describeTaskActionFailureV1", () => {
   });
 });
 
+void describe("draft run log (draftTaskWithAI) — decoder reason and provider suffix", () => {
+  void it("records the decoder's rejection reason AND the provider suffix on a malformed draft", () => {
+    // The 2026-08-15 desc failure's durable run record read only
+    // "Status: malformed result (contentSchemaMismatch)" because the draft
+    // command's hand-copied formatter dropped `detail`. The shared formatter
+    // must carry both the decoder's own reason and which provider produced
+    // the response, or the record is undiagnosable after the fact.
+    const outcome: TaskActionOutcomeV1 = {
+      kind: "malformedResult",
+      correlation: CORRELATION,
+      code: "contentSchemaMismatch",
+      detail: 'received content type "chat-message.v1", expected "markdown-artifact.v1"',
+      provider: { providerLabel: "GitHub Copilot", storedModelId: "copilot:auto" },
+    };
+    const line = describeTaskActionOutcomeForLogV1(outcome, "task.md");
+    assert.match(line, /contentSchemaMismatch: received content type "chat-message\.v1", expected "markdown-artifact\.v1"/);
+    assert.match(line, /\[GitHub Copilot \(auto\)\]$/);
+  });
+
+  void it("draftTaskWithAI writes its run log through the shared formatter, with no surviving hand copy", () => {
+    // Structural pin for the Part 1 dedupe: three character-identical
+    // formatters existed and two drifted (dropping `detail`). The draft
+    // command must call the shared helpers, and the deleted local copies
+    // must not quietly come back.
+    const source = fs.readFileSync(
+      path.resolve(__dirname, "..", "..", "src", "commands", "draftTaskWithAI.ts"),
+      "utf8"
+    );
+    assert.match(
+      source,
+      /describeTaskActionOutcomeForLogV1\(outcome, "task\.md"\)/,
+      "the draft run log must record the shared, detail-carrying status line"
+    );
+    assert.match(
+      source,
+      /describeTaskActionFailureV1\(outcome\)/,
+      "the draft failure notification must use the shared failure text"
+    );
+    assert.doesNotMatch(
+      source,
+      /function describeDraftOutcomeForLogV1|function describeDraftFailureV1/,
+      "the hand-copied draft formatters were deleted and must not be reintroduced"
+    );
+  });
+});
+
 void describe("handleReviewOutcomeV1 silent-failure regression", () => {
   const source = fs.readFileSync(
     path.resolve(__dirname, "..", "..", "src", "commands", "reviewActions.ts"),

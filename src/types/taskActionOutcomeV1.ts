@@ -148,11 +148,14 @@ export type TaskActionOutcomeV1 =
       readonly kind: "unavailable";
       readonly code: WorkflowUnavailableCodeV1;
       /**
-       * Present only on `providerModeUnavailable` outcomes produced by a
-       * selection whose whole ranked chain was exhausted — see
-       * `ProviderChainExhaustionV1`. Optional and additive: every existing
-       * unavailable outcome (and every persisted record without it) remains
-       * valid.
+       * Present only on `providerModeUnavailable` / `candidatesExhausted`
+       * outcomes produced by a selection whose whole ranked chain was
+       * exhausted — see `ProviderChainExhaustionV1`. On
+       * `candidatesExhausted` each invoked candidate's reason carries its
+       * actual recorded per-attempt outcome (enriched by the coordinator
+       * from the selection session it owns). Optional and additive: every
+       * existing unavailable outcome (and every persisted record without
+       * it) remains valid.
        */
       readonly chainExhaustion?: ProviderChainExhaustionV1;
     }
@@ -257,6 +260,7 @@ const MALFORMED_RESULT_CODES_V1: ReadonlySet<string> = new Set<MalformedResultCo
 const WORKFLOW_UNAVAILABLE_CODES_V1: ReadonlySet<string> = new Set<WorkflowUnavailableCodeV1>([
   "hostToolApiUnavailable",
   "providerModeUnavailable",
+  "candidatesExhausted",
   "workspaceRootUnsupported",
   "workspacePathUnsafe",
   "workflowStorageUnavailable",

@@ -521,15 +521,26 @@ void describe("workflowRuntimeServicesV1 — resolveWorkflowAllocatedFsPathV1", 
 });
 
 /**
- * Coverage for getProviderResultSpoolStoreV1 (2026-08-06 stability fix): the
- * production coordinator never actually configured a spool store, so a
- * `malformedResult` settlement's recovery write (taskActionCoordinatorV1.ts's
- * preserveRejectedResultForRecoveryV1) was silently a no-op regardless of the
- * code that called it. This proves the accessor itself resolves to a real,
- * usable store under the registry's own `provider-results` family directory
- * once the private-storage root is configured, and stays undefined (rather
- * than throwing) before that — every consumer already treats a missing store
- * as optional/best-effort.
+ * REGRESSION GUARD for the 2026-08-06 stability fix — not incident evidence.
+ *
+ * The 2026-08-06 bug: the production coordinator never actually configured a
+ * spool store, so a `malformedResult` settlement's recovery write
+ * (taskActionCoordinatorV1.ts's preserveRejectedResultForRecoveryV1) was
+ * silently a no-op regardless of the code that called it. This suite proves
+ * the accessor resolves to a real, usable store under the registry's own
+ * `provider-results` family directory once the private-storage root is
+ * configured, stays undefined (rather than throwing) before that — every
+ * consumer already treats a missing store as optional/best-effort — and that
+ * the production coordinator wiring still passes it through `brokerOptions`.
+ *
+ * Scope limit, stated deliberately: these tests passed BEFORE the 2026-08-15
+ * Copilot desc incident and would have kept passing throughout it. That
+ * incident's missing spool was a settlement-time gap — `settleEnvelope`'s two
+ * `contentSchemaMismatch` returns preserved nothing even with a correctly
+ * wired store — so a green run here only guards the 2026-08-06 wiring fix
+ * against regression. The evidence that the 2026-08-15 incident class is
+ * fixed is taskActionCoordinatorV1.test.ts's settlement-origin preservation
+ * tests ("preserves the rejected response when settlement rejects...").
  */
 void describe("workflowRuntimeServicesV1 — getProviderResultSpoolStoreV1", () => {
   void it("is undefined before the private-storage root is configured", () => {
@@ -578,5 +589,20 @@ void describe("workflowRuntimeServicesV1 — getProviderResultSpoolStoreV1", () 
     } finally {
       fs.rmSync(privateRoot, { recursive: true, force: true });
     }
+  });
+
+  void it("is passed to the production coordinator's brokerOptions (the 2026-08-06 wiring)", () => {
+    // Structural pin on the one line the 2026-08-06 fix added: an accessor
+    // that resolves correctly but is never handed to the coordinator would
+    // reintroduce the silent no-op this suite exists to prevent.
+    const source = fs.readFileSync(
+      path.resolve(__dirname, "..", "..", "src", "actions", "productionTaskActionRuntimeV1.ts"),
+      "utf8"
+    );
+    assert.match(
+      source,
+      /brokerOptions:\s*\{\s*spoolStore:\s*getProviderResultSpoolStoreV1\(\)\s*\}/,
+      "productionTaskActionRuntimeV1 must wire the provider-result spool store into brokerOptions"
+    );
   });
 });

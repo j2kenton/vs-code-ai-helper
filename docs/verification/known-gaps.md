@@ -142,29 +142,81 @@ flag. Such a provider must reintroduce the plumbing deliberately, with real
 coverage, rather than inherit never-executed code. The reasoning also lives
 at the flag's declaration in `src/runners/providers.ts`.
 
-## Open: retroactive ticks cannot carry plan items whose text contains " — "
+## Closed: retroactive ticks cannot carry plan items whose text contains " — "
 
 Recorded 2026-08-14, diagnosed while closing the workflow-repair follow-up
-batch. `parsePlanItemChecklistLine` (`src/utils/implementationChecklist.ts`)
-splits a `## Plan Item Checklist` entry into `<item> — <status> — <evidence>`
-on the FIRST ` — ` boundaries, so a plan item whose own text contains an
-internal ` — ` is truncated at that em-dash: the next fragment fails the
-`done` status check and the retroactive claim is silently dropped. On
+batch; fixed 2026-08-16 as part of the "workflow 3 continuation" plan's Part 4.
+`parsePlanItemChecklistLine` (`src/utils/implementationChecklist.ts`) used to
+split a `## Plan Item Checklist` entry into `<item> — <status> — <evidence>`
+on the FIRST ` — ` boundary, so a plan item whose own text contained an
+internal ` — ` was truncated at that em-dash: the next fragment failed the
+`done` status check and the retroactive claim was silently dropped. On
 `.ensemble/2026-08-11_task_1` this left exactly the 8 em-dash-bearing items
 unticked across two rounds of verbatim retroactive entries while every
-em-dash-free item ticked — the previous round misattributed the loss to
-paraphrased text. Fallback that works today: manual reconciliation (tick the
-items in `plan-final.md` directly; ticks are monotonic and completion-only).
+em-dash-free item ticked — a prior round misattributed the loss to paraphrased
+text.
 
-Not fixed here because the checklist merge is explicitly out of scope for
-that task's plan, and per the recorded design decision this is a live-use
-signal for the "tasks blocked by how a document was read" trigger — record
-it, don't bolt on another parsing heuristic. A fix would make the status
-field, not the first em-dash, the split anchor (e.g. split on the LAST
-` — done/deferred/not reached` occurrence or on the retroactive marker), or —
-per the design note's preference — record the fact upstream instead of
-parsing it out of prose. This fails in the safe direction only: items stay
-unticked, the completeness gate holds the task open, nothing is advanced.
+**Fix.** `parsePlanItemChecklistLine` now takes the plan of record's item keys
+and tries the LONGEST prefix of the line — split on ` — `, most segments
+first — that normalizes to a real plan item, shrinking one segment at a time
+until one matches; the item's own embedded dash is absorbed into its text
+instead of bleeding into the status field. A line whose item matches nothing
+falls back to the original naive split, preserving `no-match` for a genuinely
+unmatched/foreign/paraphrased claim (so the em-dash fix does not mask that
+separate failure mode). Covered by
+`src/test/implementationSummaryArtifact.test.ts` ("Part 4: asserted
+completions land without a file diff") and mirrored in
+`packages/ensemble-engine/src/checklistProgressV1.ts`
+(`checklistParity.test.ts`).
+
+Same batch also closed two related gaps in the same mechanism: a claim's
+`done` status no longer requires the `<!-- ensemble:retroactive -->` marker
+(bare prose is accepted, since models emit it unprompted in practice), and a
+round may claim an entire plan Part in one line (`Part N — done this round
+(X/Y), evidence: ...`) rather than enumerating every item.
+
+## Closed: a prose-only Plan Item Checklist claim (no checkbox echo) was rejected before the merge could ever run
+
+Discovered and fixed 2026-08-16, same "workflow 3 continuation" plan, Part 8
+(the end-to-end self-recovery proof). Every item above closed the MERGE
+engine's handling of prose claims and verified it with direct calls to
+`mergeChecklistProgressV1` — but nothing had verified those claims could
+reach the merge engine in the first place through the real
+round-completion pipeline (`reviewActions.ts`).
+
+`describeImplementationSummaryShapeIssue`'s `checklistEchoPresent` check
+only recognized a `- [x]`/`- [ ]` checkbox echo
+(`echoesPlanChecklist`/`collectChecklistItemKeysV1`) or the
+`<!-- ensemble:no-checklist-change -->` marker as satisfying the response
+shape contract. Round 073 of "workflow 3" itself — the fixture this same
+plan's Part 4 uses as its canonical example — reported ONLY a prose
+`## Plan Item Checklist` claim with no checkbox echo at all. Replaying that
+exact shape through `describeImplementationSummaryShapeIssue` (not just
+`mergeChecklistProgressV1` directly) showed it was rejected as "missing …
+the plan's implementation checklist, echoed with updated checkbox state" —
+so in production this round's report would have been refused before
+`mergeChecklistProgressV1` ever ran, and its real, verified completions
+would never have landed. Every existing Part 4 test called the merge
+function directly, which bypasses the shape gate entirely, so this gap had
+no test coverage pointing at it.
+
+**Fix.** `hasPlanItemChecklistClaimV1` (`src/utils/implementationChecklist.ts`)
+recognizes a syntactically well-formed claim — item-level or PART-level,
+under the response's own `## Plan Item Checklist` section — as satisfying
+the echo requirement on its own, REGARDLESS of whether the claim goes on to
+resolve against a real plan item; resolution is deliberately left to
+`mergeChecklistProgressV1`, so a claim that fails to match still reaches the
+merge and is reported/latched as `checklistClaimedButUnmerged` rather than
+causing the whole round to be refused as a malformed summary. Wired into
+`describeImplementationSummaryShapeIssue` via
+`src/utils/implementationArtifactResolver.ts`. Covered end-to-end (through
+the real `runHarnessed` round-completion pipeline, not a direct merge call)
+by `src/test/deferredRoundRecovery.test.ts` ("a prose-only Plan Item
+Checklist claim reaches advance-eligibility with zero file changes (Part
+4/8, end to end)") and by a shape-gate-only probe in
+`src/test/implementationSummaryArtifact.test.ts` ("a prose-only Plan Item
+Checklist claim (no checkbox echo at all) satisfies the shape gate's echo
+requirement on its own").
 
 ## Accepted (revised contract): quota/entitlement ledger keys on a user-declared account label, not auto-detected credential context
 
@@ -272,6 +324,171 @@ answering credential (a CLI flag, an account field in structured output, a
 config file read) — wire that into `providerAccountIdForModelId` or a
 provider-specific probe feeding `resolveQuotaAccountKeyV1`, rather than adding
 a second parallel identity mechanism.
+
+## Deferred: Copilot `desc` (Draft with AI) live-reproduction pending
+
+Recorded 2026-08-16, workflow 3 continuation, fifth item. On
+`revamp-1/.ensemble/2026-08-15_task_1`, Draft with AI failed with
+`contentSchemaMismatch` on GitHub Copilot for BOTH the "auto" model and the
+concrete "gpt-5.6-terra" model. The envelope itself parsed cleanly
+(`version`, `correlation`, `kind: "completed"` all valid); only
+`decodeCompletedContentV1(value.content)` rejected the content — a genuine
+provider-response decode failure, distinct from the malformed-response
+preservation gap this same batch closed in Part 1.
+
+**Decision: DEFER the live reproduction; discharged instead by code
+comparison, a hardened prompt, and a reconstructed decode fixture** (the
+plan's explicitly sanctioned fallback route, Part 7 step 2). No Copilot LM
+API entitlement is reachable from the environment that implemented this fix
+(a CLI coding agent, not a running VS Code extension host), and the raw
+rejected payload from the 2026-08-15 incident lives in a different
+repository's task history (`revamp-1`), not this one — there is no local
+spool or run record to reconstruct it from.
+
+**What was verified instead, by reading code, not by guessing:**
+`draft.v1` (`src/actions/rows/draftRowV1.ts`) and `generatePlan.v1`
+(`src/actions/rows/generatePlanRowV1.ts`) build a byte-identical AI result
+contract for the same `completedContentType` (`buildAiResultContractPromptV1`
+— same `permittedResultKinds`, same content-shape hint), and
+`generatePlan.v1` succeeds on the same provider/model where `draft.v1` fails.
+The one substantive difference in what the model is told is
+`draft-task-with-ai.md`'s closing instruction, which (prior to this fix) read
+"ask them instead of guessing" with no pointer to the structured `"questions"`
+result kind the contract fragment defines — inviting a model to try to
+surface a clarifying question inside its `"completed"` answer instead of
+switching envelope kind, which is exactly the shape that trips
+`decodeCompletedContentV1`'s unknown-field / missing-field checks.
+
+**Fix applied (prompt-induced route).** `resources/prompts/draft-task-with-ai.md`
+now explicitly names the `"questions"` result kind and states that the
+completed content must contain only the goal line and the three required
+subsections — closing the ambiguity between the action-specific prompt's
+informal "ask them" wording and the contract fragment's mechanical
+definition of how to do so.
+
+**Discharge evidence.** `src/test/aiResultEnvelope.test.ts`
+("reconstructed fixture for the 2026-08-15 Copilot draft.v1 desc failure")
+exercises the two most likely failure shapes given the finding above — an
+extra field riding alongside `markdown`, and a missing `markdown` field — and
+names the exact failing check for each (`markdown-artifact.v1 has unknown
+field: ...` / `markdown-artifact.v1 is missing a string "markdown" field`).
+This is a reconstructed fixture, not a proof that either shape is the
+literal payload Copilot returned.
+
+### What is NOT proven while this gap is open
+
+That the reconstructed fixture matches the actual bytes Copilot returned on
+2026-08-15, or that the prompt hardening above is sufficient by itself to
+prevent a recurrence. The `impl` failure on the same task
+(`providerModeUnavailable` reported for an invoked-and-failed chain) is a
+separate, already-diagnosed defect, fixed in this batch's Part 2
+(`candidatesExhausted` vs. `providerModeUnavailable`), not part of this gap.
+
+### Closing trigger
+
+Close this gap when Draft with AI is reproduced against a live Copilot
+entitlement (either model) and the preserved raw response (now durably
+spooled — see Part 1's `settleEnvelope` preservation fix) is compared against
+the reconstructed fixtures above.
+
+## Accepted: GitHub Copilot's "auto" model no longer leads the model list
+
+Recorded 2026-08-16, workflow 3 continuation, sixth item (Part 7 step 4's
+flagged decision). **DECISION: reorder only; do not add an auto→concrete
+malformed-retry.**
+
+`getAvailableCopilotModels` (`src/utils/modelSelection.ts`) used to move an
+"auto" model to the FRONT of the list ("so it reads as the default choice").
+Because "auto" delegates to whichever concrete model VS Code's Copilot
+extension picks for the request, it is the choice least likely to honour
+Ensemble's output contract — and it was the model in play on the
+`contentSchemaMismatch` above. `getAvailableCopilotModels` now moves "auto"
+to the END of the list instead (concrete, exercised models lead), and
+`normalizeCopilotModelName` labels it `"Auto (provider-chosen)"` in the
+settings picker rather than removing it — a user who wants provider-chosen
+routing can still select it deliberately.
+
+**The other half of the sixth item — advancing once from "auto" to a
+concrete Copilot model on a `contentSchemaMismatch`, using the
+`malformedResultPreFallback` mechanism — was NOT built.** The plan flagged
+both halves as an explicit, droppable product decision ("either half can be
+dropped without affecting other parts"). Two reasons this half was dropped:
+
+1. **Field evidence undercuts it.** The 2026-08-15 incident this fix
+   responds to failed identically on "auto" AND on the concrete
+   "gpt-5.6-terra" model. A model-switch retry would not have prevented that
+   specific incident — the cause is prompt-induced (see the gap above), not
+   auto-model-specific.
+2. **Real architectural cost for unproven benefit.** The existing
+   malformed-advance mechanism (`taskActionCoordinatorV1.ts`, `willAdvanceV1`)
+   already advances to the next RANKED candidate from
+   `rankedStageChainStoredIdsV1` (`runnerRegistry.ts`) — the stage's
+   configured backups, resolved synchronously. Injecting a synthetic
+   "first concrete Copilot model" candidate when none is configured would
+   require threading Copilot's async `vscode.lm.selectChatModels()`
+   discovery into that synchronous ranked-chain build, a genuine (not
+   cosmetic) change to selection's candidate-resolution contract, for a
+   remedy the evidence above suggests would not have helped the one
+   incident motivating it.
+
+### What is NOT proven while this gap is open
+
+That a `contentSchemaMismatch` on Copilot "auto" with no backup configured
+ever gets a same-provider retry before the operation reports failure. Today
+it behaves exactly as any other unconfigured-backup stage does: the
+malformed result is reported once the malformed-retry budget or ranked
+chain is exhausted.
+
+### Closing trigger
+
+Revisit if a future incident shows a `contentSchemaMismatch` that is
+genuinely `"auto"`-specific (a concrete Copilot model succeeding where
+`"auto"` fails under the same prompt) — that would be the evidence this
+decision currently lacks.
+
+## Accepted (out of this plan's scope, recorded per review request): `ensemble.resilience.inactivityTimeoutMinutes` default changed 15 → 0
+
+Flagged as a non-blocking, unrecorded deviation by the last several reviews
+of this task ("workflow 3 continuation"): `package.json` and
+`src/config/settings.ts`'s `RESILIENCE_DEFAULTS.inactivityTimeoutMinutes`
+changed the CLI-run inactivity watchdog's default from `15` to `0` (off) in
+the working tree, and no part of this plan's eight parts names that setting.
+Recording it here — rather than reverting it blind or leaving it
+undocumented — is the review's own suggested resolution route ("record or
+split... before publish").
+
+**The change is not accidental scope creep; it is evidence-driven and
+already fully justified where it lives in code** (`src/config/settings.ts`,
+the `RESILIENCE_DEFAULTS` comment and the `readInactivityTimeoutMinutes`
+docstring, plus the `package.json` setting description, all three updated
+together): the watchdog measures output silence and infers a wedged
+process, but an agentic CLI reading or editing a large file legitimately
+produces no output for long stretches while working correctly. Shipped
+enabled at 15 minutes on 2026-08-16, it fired 6 times in one afternoon —
+every firing killed a healthy round that had simply gone quiet while
+editing a 7,865-line file, and it caught zero genuinely wedged processes.
+For scale, the flat 60-minute wall-clock cap (which this watchdog is
+distinct from, and which remains unconditionally active regardless of this
+setting) fired only 9 times across 3,320 runs in the same window. A false
+positive here destroys a round's edits (quarantined, never banked) and
+burns recovery budget; a false negative costs at most the gap between this
+value and the wall clock. That asymmetry is why the default is now biased
+hard against firing, rather than a value tuned to fire often.
+
+### What is NOT proven while this gap is open
+
+That this task's own review/publish gate has explicitly signed off on
+shipping a changed default for an existing, already-released setting,
+distinct from evaluating whether the change itself is well-reasoned (it
+is, per the evidence above). No part of the eight-part plan lists this
+setting, so nothing in this task's own acceptance criteria covers it.
+
+### Closing trigger
+
+Close (or replace with a decision note) once a human reviewing this task
+for publish either explicitly accepts shipping the new default of `0` as
+part of this task, or splits this specific change into its own separately
+reviewed commit rather than folding it into this task's diff.
 
 ## Full-sequence run record
 

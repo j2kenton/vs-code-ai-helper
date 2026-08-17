@@ -2267,6 +2267,155 @@ void describe("runImplementationForModel", () => {
     }
   });
 
+  // Workflow 3 continuation, first item: replays the real "monthly ...
+  // limit ... resets in 8d 19h, please try again later" Cline message —
+  // which classifies as "temporarily-unavailable" (its "try again later"
+  // wording, not any quota marker), the exact case that used to bypass the
+  // reset-aware remedy entirely and fall back to the generic "rerun or
+  // switch" text no matter how far out the reset actually was. Also proves
+  // the far branch enumerates every OTHER stage sharing the blocked
+  // provider account with its actual substitute (or its absence).
+  void it("replays the Cline 'resets in 8d 19h' monthly-limit message: takes the far branch, never offers a rerun, and names each affected stage's substitute", async () => {
+    const originalSpawn = childProcess.spawn;
+
+    const metaRoot = fs.mkdtempSync(
+      path.join(os.tmpdir(), "ensemble-impl-far-reset-stage-impact-")
+    );
+    const taskFolder = path.join(metaRoot, "tasks", "task-a");
+    fs.mkdirSync(taskFolder, { recursive: true });
+    const taskFolderUri = vscode.Uri.file(taskFolder);
+    childProcess.execSync("git init", { cwd: taskFolder, stdio: "ignore" });
+    const mutatedFile = path.join(taskFolder, "mutated-by-partial-run.txt");
+
+    childProcess.spawn = ((command: string) => {
+      const child = new EventEmitter() as import("node:child_process").ChildProcess;
+      Object.defineProperty(child, "pid", { value: 6001 });
+      child.stdout = new EventEmitter() as import("node:child_process").ChildProcess["stdout"];
+      child.stderr = new EventEmitter() as import("node:child_process").ChildProcess["stderr"];
+      child.stdin = Object.assign(new EventEmitter(), {
+        write: () => true,
+        end: () => undefined,
+      }) as unknown as import("node:child_process").ChildProcess["stdin"];
+
+      if (/^(which|where\.exe)$/.test(command)) {
+        process.nextTick(() => child.emit("close", 0));
+        return child;
+      }
+
+      process.nextTick(() => {
+        // The round already made real edits before hitting the limit — same
+        // shape as the live 18-file incident (kept to one file here).
+        fs.writeFileSync(mutatedFile, "partial edit from a run that then hit the monthly limit");
+        child.stdout?.emit(
+          "data",
+          Buffer.from(
+            `${JSON.stringify({
+              type: "error",
+              message:
+                "You have reached your monthly Clinepass limit. The limit resets in 8d 19h, please try again later.",
+            })}\n`
+          )
+        );
+        child.emit("close", 1);
+      });
+      return child;
+    }) as typeof childProcess.spawn;
+
+    const workspace = vscode.workspace as unknown as {
+      fs: {
+        readFile: (uri: vscode.Uri) => Promise<Uint8Array>;
+        writeFile: (uri: vscode.Uri, bytes: Uint8Array) => Promise<void>;
+      };
+    };
+    const originalReadFile = workspace.fs.readFile;
+    const originalWriteFile = workspace.fs.writeFile;
+    workspace.fs.readFile = (uri: vscode.Uri): Promise<Uint8Array> =>
+      fs.promises.readFile(uri.fsPath);
+    workspace.fs.writeFile = (uri: vscode.Uri, bytes: Uint8Array): Promise<void> =>
+      fs.promises.writeFile(uri.fsPath, bytes);
+
+    const progressPath = path.join(taskFolder, "task-progress.json");
+    const now = new Date().toISOString();
+    fs.writeFileSync(
+      progressPath,
+      JSON.stringify(
+        { taskFolder: "task-a", currentStage: "impl", status: "active", createdAt: now, updatedAt: now },
+        null,
+        2
+      ),
+      "utf8"
+    );
+
+    const progressMessages: string[] = [];
+    try {
+      const settings = installModelSettings({
+        impl: {
+          primary: "cline-cli:default",
+          backup: "kiro-cli:default",
+          strategy: "switch-to-backup",
+        },
+        // Shares impl's blocked provider account (cline-cli) and has an
+        // enabled backup on a DIFFERENT account — must name that substitute.
+        "plan-high-review": {
+          primary: "cline-cli:default",
+          backups: ["kiro-cli:default"],
+          strategy: "switch-to-backup",
+        },
+        // Also shares the blocked account, but configures no backup at all
+        // — must be reported as having none, not silently omitted.
+        "plan-low-review": {
+          primary: "cline-cli:default",
+          strategy: "alert-and-wait",
+        },
+      });
+      try {
+        const result = await runImplementationForModel({
+          modelId: "cline-cli:default",
+          prompt: "Implement the requested change.",
+          workspaceUri: taskFolderUri,
+          token: new vscode.CancellationTokenSource().token,
+          onProgress: (message: string) => {
+            progressMessages.push(message);
+          },
+          correlation: { actionKey: "implementation.v1" },
+          allowCrossProviderBackups: true,
+          stage: "impl",
+          taskFolderUri,
+        });
+
+        assert.strictEqual(result.status, "failed");
+        assert.strictEqual(result.failureKind, "temporarily-unavailable");
+        const message = result.errorMessage ?? "";
+        assert.match(
+          message,
+          /expected to stay blocked until/,
+          "an 8d19h-out reset must take the far branch even though this failure classified as temporarily-unavailable, not quota"
+        );
+        assert.doesNotMatch(
+          message,
+          /Rerun this stage after/,
+          "the far branch must never offer or imply an immediate rerun"
+        );
+        assert.match(
+          message,
+          /This also affects: High-Level Review \(Plan\) → kiro-cli:default; Low-Level Review \(Plan\): no backup configured — this stage will pause\./,
+          "expected every other stage sharing the blocked provider account to be named with its actual substitute (or its absence)"
+        );
+        assert.ok(
+          progressMessages.some((progressMessage) => progressMessage.includes("This also affects:")),
+          "expected the live progress notification to carry the same stage-impact enumeration"
+        );
+      } finally {
+        settings.restore();
+      }
+    } finally {
+      childProcess.spawn = originalSpawn;
+      workspace.fs.readFile = originalReadFile;
+      workspace.fs.writeFile = originalWriteFile;
+      fs.rmSync(metaRoot, { recursive: true, force: true });
+    }
+  });
+
   // Model-entitlement failures (item 3): a Bedrock/Vertex-style "not
   // available for this account" refusal is a valid credential blocked from
   // only THIS model id — a different model id (a backup) is a legitimate

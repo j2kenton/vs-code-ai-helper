@@ -207,6 +207,21 @@ export interface ReviewBlocker {
 }
 
 const BLOCKERS_BLOCK_RE = /<!--\s*blockers:start\s*-->([\s\S]*?)<!--\s*blockers:end\s*-->/i;
+
+/**
+ * The machine-readable block a reviewer names verified-complete plan items in
+ * (see resources/prompts/review-scoring-rubric.md's "Verified Complete"
+ * instruction, workflow 3 continuation plan Part 5):
+ *
+ *   <!-- verified-complete:start -->
+ *   - <exact plan item text, copied verbatim>
+ *   <!-- verified-complete:end -->
+ *
+ * Mirrors `BLOCKERS_BLOCK_RE`'s shape so the two parse identically.
+ */
+const VERIFIED_COMPLETE_BLOCK_RE =
+  /<!--\s*verified-complete:start\s*-->([\s\S]*?)<!--\s*verified-complete:end\s*-->/i;
+const VERIFIED_COMPLETE_LINE_RE = /^\s*[-*]\s+(.+?)\s*$/;
 /**
  * The category bracket is OPTIONAL. Reviewers do sometimes emit only the
  * resolver — `- [needs-toolchain] baseline drifted…` instead of
@@ -632,6 +647,56 @@ export function parseReviewBlockersDetailed(content: string): ReviewBlockerEvide
     });
   }
   return { blockPresent: true, blockers, malformedLines };
+}
+
+/** Result of {@link parseReviewVerifiedCompleteV1}. */
+export interface ReviewVerifiedCompleteEvidence {
+  /** True when the `<!-- verified-complete:start/end -->` markers were found. */
+  readonly blockPresent: boolean;
+  /** Plan-item texts the reviewer asserted it personally verified against the tree, in the order listed. */
+  readonly items: readonly string[];
+}
+
+/**
+ * Parse the machine-readable `## Verified Complete` block a reviewer may emit
+ * (see resources/prompts/review-scoring-rubric.md) naming plan-item lines it
+ * personally checked against the tree and confirmed complete:
+ *
+ *   <!-- verified-complete:start -->
+ *   - <exact plan item text, copied verbatim>
+ *   <!-- verified-complete:end -->
+ *
+ * This is the reviewer's own assertion, the same class of evidence a round's
+ * own retroactive claim already is (`collectRetroactiveTickClaimsV1`) — never
+ * inferred from a diff. `applyReviewerVerifiedTicks` resolves each returned
+ * item against the plan of record's currently-unchecked items before ticking
+ * anything, so a paraphrased or stale item here simply fails to match rather
+ * than ticking the wrong box.
+ *
+ * An absent block yields `blockPresent: false` with an empty `items` list —
+ * older prompt versions and providers that ignore the instruction degrade to
+ * "no verified-complete signal" rather than an error. A present-but-empty
+ * block (`<!-- verified-complete:start --><!-- verified-complete:end -->`,
+ * nothing between) is a normal "reviewer verified nothing new" result, not a
+ * malformed one — mirrors `parseReviewBlockersDetailed`'s empty-block handling.
+ */
+export function parseReviewVerifiedCompleteV1(content: string): ReviewVerifiedCompleteEvidence {
+  const match = VERIFIED_COMPLETE_BLOCK_RE.exec(content);
+  if (!match) {
+    return { blockPresent: false, items: [] };
+  }
+  const body = match[1] ?? "";
+  const items: string[] = [];
+  for (const line of body.split(/\r?\n/)) {
+    if (!line.trim()) {
+      continue;
+    }
+    const lineMatch = VERIFIED_COMPLETE_LINE_RE.exec(line);
+    if (lineMatch?.[1]) {
+      items.push(lineMatch[1]);
+    }
+  }
+  return { blockPresent: true, items };
 }
 
 /**

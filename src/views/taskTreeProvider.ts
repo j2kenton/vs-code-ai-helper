@@ -1,7 +1,9 @@
 import * as vscode from "vscode";
 import * as path from "path";
+import * as fs from "fs";
 import {
   DEFAULT_HIDDEN_STATUSES,
+  IMPLEMENTATION_FILENAME,
   isReviewStage,
   STAGE_ARTIFACT_FILENAMES,
   STAGE_DISPLAY_NAMES,
@@ -30,6 +32,7 @@ import { buildTaskContextValue, buildStageContextValue, TaskCreationContextInput
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
 import { buildQuotaRemedyTextV1 } from "../utils/quota";
 import { getConfiguredTaskRoot, normalizePath } from "../utils/taskRoot";
+import { listUncheckedChecklistItemTextsV1 } from "../utils/implementationChecklist";
 
 /**
  * The view ID for the tasks tree view (must match package.json)
@@ -108,6 +111,33 @@ export function getStageStatus(stage: TaskStage, currentStage: TaskStage, _compl
 }
 
 /**
+ * Best-effort, synchronous read of plan-final.md's currently-unticked items,
+ * for the `checklistProgressUnreliable` tooltip line below. A plain
+ * `fs.readFileSync` rather than the async `readPlanOfRecordV1` resolver
+ * (which also saves an open editor's unsaved buffer first) because
+ * `TreeItem.tooltip` has no async form — `buildTaskTooltip` runs inside
+ * `TaskNode`'s synchronous constructor. Display-only, so a stale read against
+ * an unsaved buffer is an acceptable trade against the alternative of making
+ * every tree row construction async. Swallows any read error (file missing,
+ * permission issue): the tooltip degrades to the unqualified message rather
+ * than throwing out of a tree render.
+ */
+function readOutstandingChecklistItemsForTooltipV1(
+  task: IncompleteTask,
+  limit: number = 5
+): { items: readonly string[]; total: number } {
+  try {
+    const content = fs.readFileSync(
+      path.join(task.folderUri.fsPath, IMPLEMENTATION_FILENAME),
+      "utf8"
+    );
+    return listUncheckedChecklistItemTextsV1(content, limit);
+  } catch {
+    return { items: [], total: 0 };
+  }
+}
+
+/**
  * Build a markdown tooltip summarizing a task's full stage checklist
  */
 function buildTaskTooltip(task: IncompleteTask): vscode.MarkdownString {
@@ -154,8 +184,17 @@ function buildTaskTooltip(task: IncompleteTask): vscode.MarkdownString {
   // this the only trace is a comment in one round's summary, long scrolled past
   // by the time the missing safety net matters.
   if (task.progress.checklistProgressUnreliable) {
+    const outstanding = readOutstandingChecklistItemsForTooltipV1(task);
+    const outstandingSuffix =
+      outstanding.total > 0
+        ? ` Outstanding: ${outstanding.items.join("; ")}` +
+          (outstanding.total > outstanding.items.length
+            ? ` (+${outstanding.total - outstanding.items.length} more)`
+            : "") +
+          "."
+        : "";
     lines.push(
-      "$(warning) **Plan checklist is not a complete record** — a round landed changes it could not check off, so its counts understate what is done and no longer gate advancement. Tick the missed items in `plan-final.md`, then run **Ensemble: Mark Plan Checklist Reconciled** on this task to restore them.",
+      `$(warning) **Plan checklist is not a complete record** — a round landed changes it could not check off, so its counts understate what is done and no longer gate advancement. Tick the missed items in \`plan-final.md\`, then run **Ensemble: Mark Plan Checklist Reconciled** on this task to restore them.${outstandingSuffix}`,
       ""
     );
   }

@@ -370,6 +370,43 @@ export function sameBlockerPersistsAcrossLastRounds(
  * passing-review loop" shape the review finding named, so absence of
  * evidence here is disqualifying, not unknown.
  */
+/** The most recent `history` entry for `stage`, or undefined when none exists. */
+function latestReviewForStageV1(
+  history: readonly ReviewScoreHistoryEntry[] | undefined,
+  stage: TaskStage
+): ReviewScoreHistoryEntry | undefined {
+  const sameStage = (history ?? []).filter((entry) => entry.stage === stage);
+  return sameStage[sameStage.length - 1];
+}
+
+/**
+ * Whether the most recent same-stage review history entry qualifies as "this
+ * review already said the work is done" — shared by `shouldTripNoProgressBreaker`
+ * below and the `checklistProgressUnreliable` latch's sterile-round trigger
+ * (workflow 3 continuation, second item / Part 3), both of which gate a
+ * stall-recovery action on the last review for this stage. `requireZeroBlockers`
+ * additionally requires `blockerCount === 0`: the no-progress breaker trips on
+ * score alone (a high-scoring review WITH blockers still names real,
+ * unresolved work worth iterating on), but the latch's "the checklist counts
+ * are under-recording by definition" reasoning only holds when the review
+ * found nothing left to fix at all — a full-marks, zero-blocker review.
+ */
+export function latestQualifyingReviewMeetsThresholdV1(input: {
+  history: readonly ReviewScoreHistoryEntry[] | undefined;
+  stage: TaskStage;
+  threshold: number;
+  requireZeroBlockers?: boolean;
+}): boolean {
+  const latest = latestReviewForStageV1(input.history, input.stage);
+  if (!latest) {
+    return false;
+  }
+  if (!meetsAutoAdvanceThreshold(latest.score, input.threshold)) {
+    return false;
+  }
+  return !input.requireZeroBlockers || latest.blockerCount === 0;
+}
+
 export function shouldTripNoProgressBreaker(input: {
   /** Consecutive completed implementation rounds that changed zero files. */
   zeroChangeRounds: number;
@@ -392,14 +429,11 @@ export function shouldTripNoProgressBreaker(input: {
   if (input.qualifyingThreshold === undefined || input.qualifyingStage === undefined) {
     return true;
   }
-  const sameStage = (input.history ?? []).filter(
-    (entry) => entry.stage === input.qualifyingStage
-  );
-  const latest = sameStage[sameStage.length - 1];
-  if (!latest) {
-    return false;
-  }
-  return meetsAutoAdvanceThreshold(latest.score, input.qualifyingThreshold);
+  return latestQualifyingReviewMeetsThresholdV1({
+    history: input.history,
+    stage: input.qualifyingStage,
+    threshold: input.qualifyingThreshold,
+  });
 }
 
 /**

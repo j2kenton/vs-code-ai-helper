@@ -126,7 +126,15 @@ void describe("openV1RunnerSelection", () => {
           ["copilot:gpt-5", "claude-cli:sonnet"]
         );
         for (const candidate of third.chainExhaustion?.candidates ?? []) {
-          assert.match(candidate.reason, /reserved and invoked/);
+          // The registry writes only a neutral reservation-time placeholder
+          // (workflow 3 continuation, third item) — asserting an invocation
+          // outcome here would be the registry inferring what the invocation
+          // did before it happened. The coordinator, which owns the session
+          // and actually records per-attempt outcomes, replaces this with
+          // the real outcome before it reaches any user-facing surface (see
+          // taskActionCoordinatorV1.test.ts's "reports candidatesExhausted
+          // with real per-attempt outcomes..." test).
+          assert.match(candidate.reason, /reserved for invocation/);
         }
       }
     } finally {

@@ -26,8 +26,12 @@ abstract planning language ("independently shippable slices", "workstreams",
 differently, not how the work is organized.
 
 If you need the user to clarify something before you can produce a useful
-draft, ask them instead of guessing — do not fabricate an assumption and
-write it into the draft as if it were given.
+draft, respond using the "questions" result kind described in the result
+contract below — do not fabricate an assumption and write it into the draft
+as if it were given, and do not ask your question inside the draft markdown
+itself or as any extra field alongside it. Your completed content must
+contain ONLY the goal line and the three required `###` subsections above;
+nothing else belongs in it.
 
 ---
 

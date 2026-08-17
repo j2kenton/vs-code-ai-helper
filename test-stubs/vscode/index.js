@@ -384,10 +384,20 @@ const workspace = {
       if (key === "enabledProviders") {
         return new Proxy({}, { get: () => true });
       }
+      // Per-key overrides so a test can pin a setting instead of inheriting
+      // whatever the shipped default happens to be. Added when
+      // `resilience.inactivityTimeoutMinutes` changed its default to 0 (off)
+      // and silently disabled the watchdog test that depended on it — a test
+      // asserting a FEATURE should not break because a DEFAULT was retuned.
+      if (workspace._configOverrides.has(key)) {
+        return workspace._configOverrides.get(key);
+      }
       return defaultValue;
     },
     inspect: () => undefined,
   }),
+  /** @see getConfiguration — test-only; clear in a finally/afterEach. */
+  _configOverrides: new Map(),
   onDidChangeConfiguration: (listener) => workspace._configurationChanges.event(listener),
   _configurationChanges: new EventEmitter(),
   onDidChangeWorkspaceFolders: (listener) => workspace._workspaceFolderChanges.event(listener),

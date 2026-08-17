@@ -3,6 +3,7 @@ import {
   getModelSettings,
   isModelProviderEnabled,
   isProviderEnabled,
+  isProviderSelectionConfigured,
 } from "../config/settings";
 import { getConfiguredTaskRoot } from "./taskRoot";
 import { NotificationRouter } from "./notificationRouter";
@@ -178,6 +179,47 @@ export function findStagesSharingBlockedPrimaryV1(modelId: string): TaskStage[] 
     const primary = resolveEffectiveStageChainV1(stage).primary;
     return primary !== undefined && providerAccountIdForModelId(primary) === blockedAccount;
   });
+}
+
+/**
+ * Workflow 3 continuation, first item ("Consequence worth surfacing
+ * separately"): one line per stage returned by
+ * findStagesSharingBlockedPrimaryV1, naming what that stage will ACTUALLY
+ * run now that its primary is blocked — the first enabled backup model not
+ * on the same blocked provider account, or an explicit statement that no
+ * such backup exists and the stage will pause. Losing a provider for a
+ * billing period silently changes which model serves every stage primary'd
+ * to it; without this, the operator only learns each substitution one stage
+ * failure at a time instead of all at once from the outage notice.
+ *
+ * `excludeStage` omits the stage that is itself reporting the outage (its
+ * own remedy text already covers its own fate) — shared by both callers
+ * that enumerate this (the withheld-cascade notice in runnerRegistry.ts and
+ * pauseTaskForExhaustedChainV1 in reviewActions.ts) so the two never phrase
+ * this differently.
+ */
+export function describeStageSubstitutesV1(
+  modelId: string,
+  excludeStage?: TaskStage
+): string[] {
+  const blockedAccount = providerAccountIdForModelId(modelId);
+  // Mirrors runnerRegistry.ts's isModelProviderDisabled: the disabled-
+  // provider guard is only active once a provider selection actually
+  // exists, matching migrateEnabledProvidersForExistingModels's semantics —
+  // a fresh pre-migration state must not report every backup as unusable.
+  const isBackupUsable = (candidate: string): boolean =>
+    !isProviderSelectionConfigured() || isModelProviderEnabled(candidate);
+  return findStagesSharingBlockedPrimaryV1(modelId)
+    .filter((stage) => stage !== excludeStage)
+    .map((stage) => {
+      const backups = resolveEffectiveStageChainV1(stage).backups.filter(isBackupUsable);
+      const substitute = backups.find(
+        (candidate) => providerAccountIdForModelId(candidate) !== blockedAccount
+      );
+      return substitute
+        ? `${STAGE_DISPLAY_NAMES[stage]} → ${substitute}`
+        : `${STAGE_DISPLAY_NAMES[stage]}: no backup configured — this stage will pause`;
+    });
 }
 
 interface ResolveStageModelOptions {
@@ -594,7 +636,11 @@ function pushSelectableModel(
 }
 
 function normalizeCopilotModelName(model: vscode.LanguageModelChat): string {
-  return model.name;
+  // "auto" delegates to whichever model VS Code picks for the request, so it
+  // is the choice least likely to honour an output contract (workflow 3
+  // continuation, sixth item) — label it explicitly rather than let it read
+  // as just another named model.
+  return isAutoModel(model) ? `${model.name} (provider-chosen)` : model.name;
 }
 
 const COPILOT_REASONING_LEVELS = {
@@ -1835,16 +1881,22 @@ export async function getAvailableCopilotModels(): Promise<
 > {
   const models = await vscode.lm.selectChatModels({ vendor: "copilot" });
   const autoIndex = models.findIndex(isAutoModel);
-  if (autoIndex <= 0) {
+  if (autoIndex < 0) {
     return models;
   }
 
-  // Surface an "auto" model first so it reads as the default choice.
+  // "auto" delegates to whichever concrete model VS Code picks for the
+  // request, so it is the choice least likely to honour Ensemble's output
+  // contract (workflow 3 continuation, sixth item — a Copilot draft on
+  // "auto" produced a contentSchemaMismatch on the FIRST attempt). List
+  // concrete models first so a new user's default pick is one Ensemble has
+  // actually exercised; "auto" stays available (labeled, see
+  // normalizeCopilotModelName) rather than being removed or hidden.
   const reordered = [...models];
-  // autoIndex > 0 guarantees splice returns the removed element.
+  // autoIndex >= 0 guarantees splice returns the removed element.
   // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
   const [autoModel] = reordered.splice(autoIndex, 1) as [vscode.LanguageModelChat];
-  reordered.unshift(autoModel);
+  reordered.push(autoModel);
   return reordered;
 }
 

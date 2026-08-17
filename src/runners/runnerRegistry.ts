@@ -41,7 +41,7 @@ import {
   resolveQuotaAccountKeyV1,
 } from "../config/settings";
 import {
-  findStagesSharingBlockedPrimaryV1,
+  describeStageSubstitutesV1,
   resolveEffectiveStageChainV1,
 } from "../utils/modelSelection";
 import {
@@ -64,7 +64,7 @@ import {
 } from "../utils/taskProgressTransforms";
 import { createCopilotLmToolSessionTransportV1 } from "../services/languageModelToolSessionV1";
 import { RequestLocalToolHandlerV1 } from "../services/requestLocalToolHandlerV1";
-import { STAGE_DISPLAY_NAMES, TaskStage } from "../types/taskProgress";
+import { TaskStage } from "../types/taskProgress";
 import { NotificationRouter } from "../utils/notificationRouter";
 import {
   ProviderChainCandidateStatusV1,
@@ -1165,16 +1165,33 @@ export async function runImplementationForModel(options: {
     const parkProviderId = primaryProviderId;
     const parkAccountKey = primaryAccountKey;
     const extensionContext = getExtensionContextV1();
-    // Known reset time, when this failure kind carries one at all ("resets
-    // at" language only applies to quota/model-entitlement — see
-    // QuotaParkRecordV1's doc comment). Prefers a fresh parse of THIS
-    // failure's own message, then the (restart-losing) session-observed
-    // value, then the durable cross-restart ledger — so a host restart
-    // between the original block and a later retry attempt still recovers
-    // the previously known reset time instead of silently falling back to
-    // "no known reset" wording.
+    // Known reset time, when this failure kind carries one at all. Workflow
+    // 3 continuation, first item: a real Cline "monthly ... limit ... resets
+    // in 8d 19h, please try again later" message classifies as
+    // "temporarily-unavailable" (its "try again later" wording matches
+    // TEMPORARY_MARKERS, not any QUOTA_MARKERS phrase), NOT "quota" — so a
+    // check narrowed to quota/model-entitlement never even attempted to
+    // parse its perfectly legible reset time, and the remedy silently fell
+    // back to the generic "rerun or switch models" text regardless of how
+    // far out the reset actually was. Every cascade-eligible failure kind
+    // (isCascadeEligibleFailureKind — the same three kinds this whole
+    // withheld-cascade branch already requires to be reached at all) may
+    // carry provider-reported reset wording, so all three attempt the parse
+    // here; parseQuotaResetV1 itself is what stays conservative, returning
+    // undefined on anything but its two recognized phrase shapes rather than
+    // guessing at an unrelated "in N ..." phrase.
+    //
+    // Prefers a fresh parse of THIS failure's own message, then the
+    // (restart-losing) session-observed value, then the durable cross-restart
+    // ledger — so a host restart between the original block and a later
+    // retry attempt still recovers the previously known reset time instead
+    // of silently falling back to "no known reset" wording. The session/
+    // ledger fallbacks stay scoped to quota/model-entitlement observations
+    // (recordQuotaObservation only ever caches a resetAt for "quota"), so
+    // only the direct parse of this attempt's own message benefits from the
+    // widened kind check.
     const knownResetAt =
-      result.failureKind === "quota" || result.failureKind === "model-entitlement"
+      isCascadeEligibleFailureKind(result.failureKind)
         ? parseQuotaResetV1(result.errorMessage, new Date()) ??
           getQuotaObservation(options.stage, options.modelId)?.resetAt ??
           (extensionContext
@@ -1187,23 +1204,21 @@ export async function runImplementationForModel(options: {
             : undefined)
         : undefined;
     const remedyText = buildQuotaRemedyTextV1(knownResetAt);
-    // Part 5 step 3b: a "far" outage (beyond the near-reset threshold) is
-    // never just this one stage's problem — every OTHER configurable stage
-    // whose effective primary chain resolves to this SAME blocked model id is
-    // either equally blocked or has already silently fallen through to a
-    // different backup. Name them so the operator learns this from one
-    // notification instead of one stage failure at a time.
-    const affectedStages =
+    // Part 5 step 3b / workflow 3 continuation first item: a "far" outage
+    // (beyond the near-reset threshold) is never just this one stage's
+    // problem — every OTHER configurable stage whose effective primary
+    // chain resolves to this SAME blocked provider account is either
+    // equally blocked or has already silently fallen through to a
+    // different backup. Name each affected stage's actual substitute (or
+    // its absence) so the operator learns this from one notification
+    // instead of one stage failure at a time.
+    const affectedStageDescriptions =
       knownResetAt !== undefined && isQuotaResetBeyondThresholdV1(knownResetAt)
-        ? findStagesSharingBlockedPrimaryV1(options.modelId ?? "(default)").filter(
-            (stage) => stage !== options.stage
-          )
+        ? describeStageSubstitutesV1(options.modelId ?? "(default)", options.stage)
         : [];
     const affectedStagesClause =
-      affectedStages.length > 0
-        ? ` This also affects: ${affectedStages.map((stage) => STAGE_DISPLAY_NAMES[stage]).join(", ")} — ` +
-          "each configured with the same primary model, so they are equally blocked (or already " +
-          "running on a different fallback)."
+      affectedStageDescriptions.length > 0
+        ? ` This also affects: ${affectedStageDescriptions.join("; ")}.`
         : "";
     const withheldMessage =
       `Hit ${limitLabel} on ${primaryProviderLabel}` +
@@ -1653,14 +1668,17 @@ export function openV1RunnerSelection(options: {
         modelId: candidate.storedModelId,
       });
       // Selection never sees the invocation's own failure (AC-RUNNER-04),
-      // so the diary can only record that the reservation was handed out —
-      // if this candidate had succeeded, reserveNext would never be asked
-      // for another, so reaching noneRemaining later proves it failed.
+      // so the diary records only the OBSERVATION selection can make: the
+      // reservation was handed out. It deliberately does NOT infer what the
+      // invocation then did — the earlier "reserved and invoked, but did
+      // not produce a usable result" wording was written BEFORE any
+      // invocation happened, an inference that read as fact (workflow 3
+      // continuation, third item). The session owner (the coordinator)
+      // replaces this placeholder with the per-attempt outcome it actually
+      // recorded before the evidence reaches any user-facing surface.
       const status = candidateStatuses[cursor - 1];
       if (status) {
-        status.reason =
-          "reserved and invoked, but the invocation did not produce a usable result " +
-          "(the per-attempt outcome is recorded in the selection session)";
+        status.reason = "reserved for invocation (see the recorded per-attempt outcome)";
       }
       return {
         kind: "reserved",

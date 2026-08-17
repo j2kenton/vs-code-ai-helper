@@ -40,6 +40,7 @@ import {
   DraftActionInputV1,
 } from "../actions/rows/draftRowV1";
 import { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
+import { describeTaskActionFailureV1, describeTaskActionOutcomeForLogV1 } from "../utils/taskActionOutcomeTextV1";
 
 import {
   buildTaskDocument,
@@ -182,64 +183,6 @@ interface DraftOutcomeResultV1 {
   readonly runLogUri?: vscode.Uri;
 }
 
-/** One short, sanitized status line for the run log — never provider text. */
-function describeDraftOutcomeForLogV1(outcome: TaskActionOutcomeV1): string {
-  switch (outcome.kind) {
-    case "completed":
-      return `Status: completed (${outcome.code})`;
-    case "questions":
-      return `Status: questions (interactionId=${outcome.interactionId}) — the AI asked a clarifying question in Chat With AI instead of writing task.md.`;
-    case "cancelled":
-      return `Status: cancelled (${outcome.code})`;
-    case "failed":
-      return `Status: failed (code=${outcome.code}, retryable=${outcome.retryable})`;
-    case "malformedResult":
-      return `Status: malformed result (${outcome.code})`;
-    case "unavailable":
-      return `Status: unavailable (${outcome.code})`;
-    case "recoveryRequired":
-      return `Status: recovery required (${outcome.code})`;
-    case "duplicateRejected":
-      return "Status: duplicate rejected (another operation is already running for this task)";
-    case "stalePreflight":
-      return `Status: stale preflight (${outcome.planId})`;
-    case "partialEditBlocked":
-      return `Status: partial edit blocked (${outcome.executionId})`;
-    default:
-      return `Status: ${(outcome as TaskActionOutcomeV1).kind}`;
-  }
-}
-
-/** User-facing failure text for a non-completed, non-cancelled, non-questions outcome. */
-function describeDraftFailureV1(outcome: TaskActionOutcomeV1): string {
-  switch (outcome.kind) {
-    case "failed":
-      return `${outcome.code}${outcome.retryable ? " (retryable)" : ""}`;
-    case "malformedResult":
-      // `detail` carries the decoder's own reason — e.g. `unrecognized
-      // "contentType": ...` from decodeCompletedContentV1 — which is the only
-      // thing that says WHY the response was rejected. The shared formatter in
-      // taskActionOutcomeTextV1.ts already includes it; this hand-copied
-      // variant dropped it, so a Copilot draft failure on 2026-08-15 reported a
-      // bare `contentSchemaMismatch` and could not be diagnosed at all.
-      return `the model's response was malformed (${outcome.code}${
-        outcome.detail ? `: ${outcome.detail}` : ""
-      })`;
-    case "unavailable":
-      return outcome.code;
-    case "recoveryRequired":
-      return outcome.code;
-    case "duplicateRejected":
-      return "another operation is already running for this task";
-    case "stalePreflight":
-      return "a stale preflight plan was rejected";
-    case "partialEditBlocked":
-      return "a partial edit was blocked";
-    default:
-      return outcome.kind;
-  }
-}
-
 /**
  * Handle one `draft.v1` coordinator outcome: promote a completed result's
  * already-written task.md into the task's lifecycle (derive the task name,
@@ -320,7 +263,7 @@ async function handleDraftOutcomeV1(
     NotificationRouter.showInformation("Draft with AI cancelled.");
   } else {
     NotificationRouter.showError(
-      `Draft with AI failed: ${describeDraftFailureV1(outcome)}. task.md was not changed.`
+      `Draft with AI failed: ${describeTaskActionFailureV1(outcome)}. task.md was not changed.`
     );
   }
 
@@ -336,7 +279,7 @@ async function handleDraftOutcomeV1(
       `# Prompt\n\n${ctx.prompt}\n\n` +
       "*(The coordinator appends its own AI-result envelope contract block " +
       "to this prompt before dispatch; that block is not reproduced here.)*\n\n" +
-      `# Result\n\n${describeDraftOutcomeForLogV1(outcome)}`
+      `# Result\n\n${describeTaskActionOutcomeForLogV1(outcome, "task.md")}`
   );
 
   return { succeeded, runLogUri };
@@ -710,7 +653,7 @@ export async function resumeDraftInteractionV1(
       : undefined;
 
   if (settlement === undefined) {
-    return { ok: false, reason: describeDraftFailureV1(outcome) };
+    return { ok: false, reason: describeTaskActionFailureV1(outcome) };
   }
   return { ok: true, settlement };
 }

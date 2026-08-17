@@ -38,6 +38,7 @@ export type MalformedResultCodeV1 =
 export type WorkflowUnavailableCodeV1 =
   | "hostToolApiUnavailable"
   | "providerModeUnavailable"
+  | "candidatesExhausted"
   | "workspaceRootUnsupported"
   | "workspacePathUnsafe"
   | "workflowStorageUnavailable";
@@ -81,7 +82,8 @@ export interface ProviderChainCandidateStatusV1 {
  * Structured evidence that a stage's ENTIRE resolved provider chain was
  * exhausted without acquiring a provider — see the extension source for the
  * full rationale (2026-08-13 finding 4). Carried optionally on
- * `providerModeUnavailable` outcomes; the stage owner surfaces it.
+ * `providerModeUnavailable` / `candidatesExhausted` outcomes; the stage
+ * owner surfaces it.
  */
 export interface ProviderChainExhaustionV1 {
   /** The stage whose chain was exhausted (absent when the request carried no stage). */
@@ -146,9 +148,10 @@ export type TaskActionOutcomeV1 =
       readonly kind: "unavailable";
       readonly code: WorkflowUnavailableCodeV1;
       /**
-       * Present only on `providerModeUnavailable` outcomes produced by a
-       * selection whose whole ranked chain was exhausted. Optional and
-       * additive: every existing unavailable outcome remains valid.
+       * Present only on `providerModeUnavailable` / `candidatesExhausted`
+       * outcomes produced by a selection whose whole ranked chain was
+       * exhausted. Optional and additive: every existing unavailable
+       * outcome remains valid.
        */
       readonly chainExhaustion?: ProviderChainExhaustionV1;
     }
@@ -253,6 +256,7 @@ const MALFORMED_RESULT_CODES_V1: ReadonlySet<string> = new Set<MalformedResultCo
 const WORKFLOW_UNAVAILABLE_CODES_V1: ReadonlySet<string> = new Set<WorkflowUnavailableCodeV1>([
   "hostToolApiUnavailable",
   "providerModeUnavailable",
+  "candidatesExhausted",
   "workspaceRootUnsupported",
   "workspacePathUnsafe",
   "workflowStorageUnavailable",

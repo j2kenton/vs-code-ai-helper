@@ -152,7 +152,7 @@ import {
   MalformedAiResultV1,
   parseAiResultEnvelopeV1,
 } from "../types/aiResultEnvelope";
-import { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
+import { ProviderChainExhaustionV1, TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
 import { unavailableV1 } from "../types/workflowAvailabilityV1";
 import {
   AgentExecutionBrokerOptionsV1,
@@ -878,27 +878,138 @@ export function tryFramelessContentFallbackV1(
  * must never affect the settled outcome; this is best-effort diagnostics,
  * not a correctness requirement. Returns the ref on success so the caller
  * can name it (ids only, never content — plan §2.2) in the outcome's
- * `detail`.
+ * `detail`; on failure, returns WHICH of the two known reasons applied
+ * (`noSpoolStoreConfigured` vs. `writeError`) so the outcome's `detail` can
+ * say explicitly why no recovery copy exists, instead of the response's
+ * absence being silently indistinguishable from success.
  */
+type PreserveRejectedResultOutcomeV1 =
+  | { readonly ok: true; readonly ref: ResultSpoolRefV1 }
+  | { readonly ok: false; readonly reason: "noSpoolStoreConfigured" | "writeError" };
+
 async function preserveRejectedResultForRecoveryV1(
   text: string,
   correlation: ActionCorrelationV1,
   reservationId: ReservationIdV1,
   brokerOptions: AgentExecutionBrokerOptionsV1 | undefined,
   provider: { readonly providerLabel: string; readonly storedModelId: string }
-): Promise<ResultSpoolRefV1 | undefined> {
+): Promise<PreserveRejectedResultOutcomeV1> {
   const store = brokerOptions?.spoolStore;
   if (!store) {
-    return undefined;
+    return { ok: false, reason: "noSpoolStoreConfigured" };
   }
   try {
-    return await store.writeSpool(correlation, reservationId, Buffer.from(text, "utf8"), {
+    const ref = await store.writeSpool(correlation, reservationId, Buffer.from(text, "utf8"), {
       purpose: "recovery",
       provider,
     });
+    return { ok: true, ref };
   } catch {
-    return undefined;
+    return { ok: false, reason: "writeError" };
   }
+}
+
+/**
+ * Render `preserveRejectedResultForRecoveryV1`'s outcome as one clause for a
+ * `malformedResult` outcome's `detail`, naming the actual recovery route
+ * (private extension storage, not the task's `runs/` directory) and the
+ * command that reads it back, or stating plainly why no copy exists.
+ */
+function preservationDetailFragmentV1(outcome: PreserveRejectedResultOutcomeV1, operationId: string): string {
+  if (outcome.ok) {
+    return (
+      `response preserved for recovery in extension private storage ` +
+      `(operationId=${operationId}, ~24h) — run "Recover Last AI Response" ` +
+      `(vs-code-ai-helper.recoverLastAiResponse, Ctrl+Shift+Alt+C) to read it back`
+    );
+  }
+  return outcome.reason === "noSpoolStoreConfigured"
+    ? "response NOT preserved (no recovery spool store is configured for this workspace)"
+    : "response NOT preserved (writing the recovery copy failed)";
+}
+
+/**
+ * The unsealed provider response text plus the reservation identity it was
+ * received under — `settleEnvelope` is a sibling of `runProviderRow`, not
+ * nested inside it, so it has no closure access to that function's local
+ * `reserved`/`unsealed` bindings and needs them passed explicitly to call
+ * `preserveRejectedResultForRecoveryV1` from its own two content-mismatch
+ * branches.
+ */
+interface UnsealedResponseRefV1 {
+  readonly text: string;
+  readonly reservationId: ReservationIdV1;
+  readonly providerLabel: string;
+  readonly storedModelId: string;
+}
+
+/**
+ * Human phrase for one recorded per-attempt outcome, rendered into a chain
+ * -exhaustion candidate's `reason`. Closed over `AttemptOutcomeKindV1`'s own
+ * union — kinds only, never provider text — so §2.2's sanitized-outcome rule
+ * holds by construction.
+ */
+function attemptOutcomeReasonTextV1(outcome: AttemptOutcomeKindV1): string {
+  switch (outcome) {
+    case "completed":
+      return "invoked and completed";
+    case "questions":
+      return "invoked and returned structured questions";
+    case "providerDeclaredFailure":
+      return "invoked, but the provider declared a failure";
+    case "malformedResult":
+      return "invoked, but the response violated the output contract (malformed result)";
+    case "malformedResultPreFallback":
+      return "invoked, but the response violated the output contract (malformed result; advanced to the next candidate)";
+    case "resultCorrelationMismatch":
+      return "invoked, but the response echoed a foreign correlation";
+    case "overflow":
+      return "invoked, but the response exceeded the size limit";
+    case "providerCancelled":
+      return "invoked, but the provider cancelled";
+    case "callerCancelled":
+      return "invocation cancelled by the caller";
+    case "transportFailureResponseStarted":
+      return "invoked, but the transport failed after the response started";
+    case "transportFailurePreResponse":
+      return "invoked, but the transport failed before any response arrived";
+    case "providerUnavailablePreInvocation":
+      return "could not be invoked (unavailable before invocation)";
+  }
+}
+
+/**
+ * Replace the registry's reservation-time placeholder reasons with what the
+ * selection session actually recorded for each invoked candidate (workflow 3
+ * continuation, third item): the registry writes a candidate's reason at
+ * RESERVATION time — before any invocation happens — because selection never
+ * sees invocation results (AC-RUNNER-04). The coordinator OWNS the session
+ * and reported every per-attempt outcome itself, so this is the layer that
+ * can honestly say what each invocation did. Candidates the session has no
+ * reservation for (selection-time skips, the never-reserved tail) keep the
+ * registry's own reason untouched. Recorded reservations appear in the same
+ * ranked order selection walked the chain, so they are consumed in order,
+ * matched by stored model id.
+ */
+function enrichChainExhaustionWithAttemptOutcomesV1(
+  exhaustion: ProviderChainExhaustionV1,
+  session: ProviderSelectionSessionV1
+): ProviderChainExhaustionV1 {
+  const reservedAttempts = session
+    .recordedAttemptOutcomes()
+    .filter((attempt) => attempt.modelId !== undefined);
+  let cursor = 0;
+  const candidates = exhaustion.candidates.map((candidate) => {
+    const attempt = reservedAttempts[cursor];
+    if (attempt?.modelId === candidate.storedModelId) {
+      cursor++;
+      if (attempt.outcome !== undefined) {
+        return { ...candidate, reason: attemptOutcomeReasonTextV1(attempt.outcome) };
+      }
+    }
+    return candidate;
+  });
+  return { ...exhaustion, candidates };
 }
 
 /**
@@ -1117,25 +1228,37 @@ export function createTaskActionCoordinatorV1(
         if (next.kind === "noneRemaining") {
           // Nothing was reserved for this attempt — settle it explicitly so
           // the session's one-outcome-per-attempt accounting stays complete,
-          // then map both exhaustion codes onto the stable mode-unavailable
-          // outcome (plan §3.7). EXCEPT when candidates were exhausted while
-          // advancing past malformed results: returning
-          // providerModeUnavailable there would mask the real failure behind
-          // a misleading "no provider available" — the last malformed
-          // outcome is the honest report of what actually happened.
+          // then carry the registry's exhaustion code THROUGH (workflow 3
+          // continuation, third item): `providerModeUnavailable` (nothing
+          // could serve the mode — nothing was invoked) and
+          // `candidatesExhausted` (every candidate was reserved, invoked,
+          // and failed) are opposite conditions with opposite remedies, and
+          // collapsing both onto "unavailable-mode" cost a multi-hour
+          // misdiagnosis on 2026-08-15. EXCEPT when candidates were
+          // exhausted while advancing past malformed results: the last
+          // malformed outcome is the honest report of what actually
+          // happened, and it takes precedence over either exhaustion code.
           //
           // The registry's structured chain-exhaustion evidence is passed
-          // through VERBATIM (2026-08-13 finding 4): the coordinator mutates
-          // no task state and edits no reasons — surfacing (enriched run
-          // record, paused task) belongs to the stage owner that dispatched
-          // the round.
+          // through with ONE addition (still no task-state mutation): each
+          // invoked candidate's reservation-time placeholder reason is
+          // replaced with the per-attempt outcome this coordinator itself
+          // recorded in the session it owns — see
+          // `enrichChainExhaustionWithAttemptOutcomesV1`. Surfacing
+          // (enriched run record, paused task) still belongs to the stage
+          // owner that dispatched the round.
           session.reportAttemptOutcome(attemptId, "providerUnavailablePreInvocation");
           return (
             lastMalformedOutcomeV1 ?? {
               kind: "unavailable",
-              code: "providerModeUnavailable",
+              code: next.code,
               ...(next.chainExhaustion !== undefined
-                ? { chainExhaustion: next.chainExhaustion }
+                ? {
+                    chainExhaustion: enrichChainExhaustionWithAttemptOutcomesV1(
+                      next.chainExhaustion,
+                      session
+                    ),
+                  }
                 : {}),
             }
           );
@@ -1378,7 +1501,21 @@ export function createTaskActionCoordinatorV1(
         }
         const framelessFallback = tryFramelessContentFallbackV1(row, correlation, parsed);
         if (framelessFallback) {
-          return settleEnvelope(row, framelessFallback, session, attemptId, context, acquireLeasePhase, promptSha256);
+          return settleEnvelope(
+            row,
+            framelessFallback,
+            session,
+            attemptId,
+            context,
+            acquireLeasePhase,
+            promptSha256,
+            {
+              text: unsealed.text,
+              reservationId: reserved.handle.reservationId,
+              providerLabel: reserved.providerLabel,
+              storedModelId: reserved.storedModelId,
+            }
+          );
         }
         // Decide advance eligibility BEFORE reporting the attempt outcome.
         // `resultCorrelationMismatch` is excluded: it signals a correlation
@@ -1413,7 +1550,7 @@ export function createTaskActionCoordinatorV1(
         // contract in front of it is what failed — so it is preserved
         // (best-effort, 24h) before being discarded. See that function's own
         // doc comment for the live incident this closes.
-        const recoveryRef = await preserveRejectedResultForRecoveryV1(
+        const preservationResult = await preserveRejectedResultForRecoveryV1(
           unsealed.text,
           correlation,
           reserved.handle.reservationId,
@@ -1422,9 +1559,7 @@ export function createTaskActionCoordinatorV1(
         );
         const detailParts = [
           reasonDetail,
-          recoveryRef
-            ? `response preserved for recovery (operationId=${correlation.operationId}, ~24h)`
-            : undefined,
+          preservationDetailFragmentV1(preservationResult, correlation.operationId),
         ].filter((part): part is string => part !== undefined);
         const malformedOutcomeV1: TaskActionOutcomeV1 = {
           kind: "malformedResult",
@@ -1450,7 +1585,12 @@ export function createTaskActionCoordinatorV1(
         return malformedOutcomeV1;
       }
 
-      return settleEnvelope(row, parsed, session, attemptId, context, acquireLeasePhase, promptSha256);
+      return settleEnvelope(row, parsed, session, attemptId, context, acquireLeasePhase, promptSha256, {
+        text: unsealed.text,
+        reservationId: reserved.handle.reservationId,
+        providerLabel: reserved.providerLabel,
+        storedModelId: reserved.storedModelId,
+      });
     }
   }
 
@@ -1461,16 +1601,26 @@ export function createTaskActionCoordinatorV1(
     attemptId: string,
     context: TaskActionExecutionContextV1,
     acquireLeasePhase: AcquireTaskLeasePhaseV1,
-    promptSha256: string
+    promptSha256: string,
+    unsealedResponse: UnsealedResponseRefV1
   ): Promise<TaskActionOutcomeV1> {
     const correlation = context.correlation;
     if (!row.permittedResultKinds.includes(envelope.kind)) {
       session.reportAttemptOutcome(attemptId, "malformedResult");
+      const preservationResult = await preserveRejectedResultForRecoveryV1(
+        unsealedResponse.text,
+        correlation,
+        unsealedResponse.reservationId,
+        deps.brokerOptions,
+        { providerLabel: unsealedResponse.providerLabel, storedModelId: unsealedResponse.storedModelId }
+      );
       return {
         kind: "malformedResult",
         correlation,
         code: "contentSchemaMismatch",
-        detail: `received result kind "${envelope.kind}", but ${row.actionKey} only permits: ${row.permittedResultKinds.join(", ")}`,
+        detail:
+          `received result kind "${envelope.kind}", but ${row.actionKey} only permits: ${row.permittedResultKinds.join(", ")}; ` +
+          preservationDetailFragmentV1(preservationResult, correlation.operationId),
         ...(context.provider ? { provider: context.provider } : {}),
       };
     }
@@ -1478,11 +1628,20 @@ export function createTaskActionCoordinatorV1(
       case "completed": {
         if (envelope.content.contentType !== row.completedContentType) {
           session.reportAttemptOutcome(attemptId, "malformedResult");
+          const preservationResult = await preserveRejectedResultForRecoveryV1(
+            unsealedResponse.text,
+            correlation,
+            unsealedResponse.reservationId,
+            deps.brokerOptions,
+            { providerLabel: unsealedResponse.providerLabel, storedModelId: unsealedResponse.storedModelId }
+          );
           return {
             kind: "malformedResult",
             correlation,
             code: "contentSchemaMismatch",
-            detail: `received content type "${envelope.content.contentType}", expected "${row.completedContentType}"`,
+            detail:
+              `received content type "${envelope.content.contentType}", expected "${row.completedContentType}"; ` +
+              preservationDetailFragmentV1(preservationResult, correlation.operationId),
             ...(context.provider ? { provider: context.provider } : {}),
           };
         }
@@ -1758,9 +1917,13 @@ export function createTaskActionCoordinatorV1(
       if (next.kind === "noneRemaining") {
         session.reportAttemptOutcome(attemptId, "providerUnavailablePreInvocation");
         progress.end();
-        // Same verbatim evidence pass-through as the invocation loop's
-        // noneRemaining branch (finding 4): no task-state mutation here —
-        // the stage owner surfaces the exhausted chain.
+        // Same code pass-through and evidence enrichment as the invocation
+        // loop's noneRemaining branch (finding 4 + workflow 3 continuation
+        // third item): no task-state mutation here — the stage owner
+        // surfaces the exhausted chain. At admission time no candidate has
+        // been invoked yet, so this is providerModeUnavailable in practice;
+        // the registry's code is still carried verbatim rather than
+        // re-asserted here.
         return {
           kind: "settled",
           outcome: finalizeOutcome(
@@ -1769,9 +1932,14 @@ export function createTaskActionCoordinatorV1(
             operationId,
             {
               kind: "unavailable",
-              code: "providerModeUnavailable",
+              code: next.code,
               ...(next.chainExhaustion !== undefined
-                ? { chainExhaustion: next.chainExhaustion }
+                ? {
+                    chainExhaustion: enrichChainExhaustionWithAttemptOutcomesV1(
+                      next.chainExhaustion,
+                      session
+                    ),
+                  }
                 : {}),
             },
             metrics

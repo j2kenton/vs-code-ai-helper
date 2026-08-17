@@ -138,6 +138,26 @@ export interface ClaimedReservationV1 {
   beginInvocation(): void;
 }
 
+/**
+ * One attempt's recorded settlement, serialized for diagnostics (workflow 3
+ * continuation, third item): the session already records exactly one outcome
+ * per attempt via `reportAttemptOutcome`, but nothing could read them back —
+ * so when a chain exhausted, the per-attempt outcomes were discarded with
+ * the session and the user-facing evidence could only guess what happened.
+ * The reservation identity is present only for attempts that actually
+ * received one (an explicit selection-time skip settles an attempt with no
+ * reservation). Read-only accounting: AC-RUNNER-04 is untouched — these
+ * outcomes were reported BY the session owner (the coordinator) in the first
+ * place, and selection (the registry) still never reads invocation results.
+ */
+export interface RecordedAttemptOutcomeV1 {
+  readonly attemptId: AttemptIdV1;
+  /** The reserved candidate's registry-ranked (provider-qualified) stored model id. */
+  readonly modelId?: string;
+  readonly runnerId?: string;
+  readonly outcome?: AttemptOutcomeKindV1;
+}
+
 export interface ProviderSelectionSessionV1 {
   readonly selectionSessionId: string;
   readonly binding: SelectionSessionBindingV1;
@@ -156,6 +176,12 @@ export interface ProviderSelectionSessionV1 {
   reportAttemptOutcome(attemptId: AttemptIdV1, outcome: AttemptOutcomeKindV1): void;
   /** True once a terminal outcome has been reported — no further attempts or reservations. */
   isTerminated(): boolean;
+  /**
+   * The session's per-attempt accounting, in allocation order — see
+   * `RecordedAttemptOutcomeV1`. Safe to call at any point (including on a
+   * terminated session); returns a snapshot, never live state.
+   */
+  recordedAttemptOutcomes(): readonly RecordedAttemptOutcomeV1[];
 }
 
 interface AttemptStateV1 {
@@ -360,6 +386,19 @@ export function openProviderSelectionSessionV1(
 
     isTerminated(): boolean {
       return terminated;
+    },
+
+    recordedAttemptOutcomes(): readonly RecordedAttemptOutcomeV1[] {
+      return attempts.map((attempt) => ({
+        attemptId: attempt.attemptId,
+        ...(attempt.reservation !== undefined
+          ? {
+              modelId: attempt.reservation.handle.modelId,
+              runnerId: attempt.reservation.handle.runnerId,
+            }
+          : {}),
+        ...(attempt.outcome !== undefined ? { outcome: attempt.outcome } : {}),
+      }));
     },
   };
 }

@@ -719,50 +719,66 @@ export async function runSealedImplementationV1(
         errorMessage: result.reason,
         runnerId,
       };
-    case "failed": {
-      if (result.outcome.kind === "cancelled") {
-        return { status: "cancelled", filesChanged: [], runnerId };
-      }
-      const code =
-        result.outcome.kind === "failed" || result.outcome.kind === "unavailable"
-          ? result.outcome.code
-          : result.outcome.kind;
-      // Surface WHY, not just the code. `ProviderChainExhaustionV1`'s own
-      // contract says the stage owner surfaces it — this path did not, so an
-      // exhausted chain reported a bare `providerModeUnavailable` and the
-      // per-candidate reasons (already computed, already carried here) were
-      // discarded. That cost hours of guessing on 2026-08-15 for a Copilot
-      // stage whose real reason was sitting in this object. Sibling cases
-      // above already pass `result.reason` through; this one now matches.
-      const exhaustion =
-        result.outcome.kind === "unavailable" ? result.outcome.chainExhaustion : undefined;
-      const parts: string[] = [];
-      if (exhaustion !== undefined && exhaustion.candidates.length > 0) {
-        parts.push(
-          `Every configured model was unavailable: ${exhaustion.candidates
-            .map((c) => `${c.storedModelId} (${c.providerLabel}) — ${c.reason}`)
-            .join("; ")}`
-        );
-      }
-      // The outcome VARIANT, not just its code. `unavailable` carries
-      // per-candidate chain evidence; `failed` carries none, and the two are
-      // indistinguishable from the code alone — which is exactly why the
-      // 2026-08-15 Copilot investigation could not tell whether the evidence
-      // was missing or simply not extracted. Naming the variant makes the
-      // next occurrence self-diagnosing instead of another guessing round.
-      if (exhaustion === undefined) {
-        parts.push(`outcome=${result.outcome.kind}, no chain evidence attached`);
-      }
-      const detail = parts.length > 0 ? ` ${parts.join(". ")}.` : "";
-      return {
-        status: "failed",
-        filesChanged: [],
-        failureKind: "generic",
-        errorMessage: `The edit action did not complete (${code}).${detail}`,
-        runnerId,
-      };
-    }
+    case "failed":
+      return describeEditActionOutcomeFailureV1(result.outcome, runnerId);
   }
+}
+
+/**
+ * Renders a failed `runTwoPhaseEditActionV1` outcome into the
+ * `ImplementationRunResult` shape callers expect. Exported (rather than left
+ * inline in the switch above) so the `candidatesExhausted` vs.
+ * `providerModeUnavailable` wording below can be unit-tested directly,
+ * without driving the whole sealed pipeline.
+ */
+export function describeEditActionOutcomeFailureV1(
+  outcome: TaskActionOutcomeV1,
+  runnerId: string
+): ImplementationRunResult & { runnerId: string } {
+  if (outcome.kind === "cancelled") {
+    return { status: "cancelled", filesChanged: [], runnerId };
+  }
+  const code = outcome.kind === "failed" || outcome.kind === "unavailable" ? outcome.code : outcome.kind;
+  // Surface WHY, not just the code. `ProviderChainExhaustionV1`'s own
+  // contract says the stage owner surfaces it — this path did not, so an
+  // exhausted chain reported a bare `providerModeUnavailable` and the
+  // per-candidate reasons (already computed, already carried here) were
+  // discarded. That cost hours of guessing on 2026-08-15 for a Copilot
+  // stage whose real reason was sitting in this object. Sibling cases
+  // above already pass `result.reason` through; this one now matches.
+  const exhaustion = outcome.kind === "unavailable" ? outcome.chainExhaustion : undefined;
+  const parts: string[] = [];
+  if (exhaustion !== undefined && exhaustion.candidates.length > 0) {
+    const candidateList = exhaustion.candidates
+      .map((c) => `${c.storedModelId} (${c.providerLabel}) — ${c.reason}`)
+      .join("; ");
+    // workflow 3 continuation, third item: `candidatesExhausted` (every
+    // candidate was reserved, invoked, and failed) and `providerModeUnavailable`
+    // (nothing was ever reserved) are opposite conditions with opposite
+    // remedies — "was unavailable" is only true of the second.
+    parts.push(
+      code === "candidatesExhausted"
+        ? `Every configured model was tried and failed: ${candidateList}`
+        : `No configured model was available: ${candidateList}`
+    );
+  }
+  // The outcome VARIANT, not just its code. `unavailable` carries
+  // per-candidate chain evidence; `failed` carries none, and the two are
+  // indistinguishable from the code alone — which is exactly why the
+  // 2026-08-15 Copilot investigation could not tell whether the evidence
+  // was missing or simply not extracted. Naming the variant makes the
+  // next occurrence self-diagnosing instead of another guessing round.
+  if (exhaustion === undefined) {
+    parts.push(`outcome=${outcome.kind}, no chain evidence attached`);
+  }
+  const detail = parts.length > 0 ? ` ${parts.join(". ")}.` : "";
+  return {
+    status: "failed",
+    filesChanged: [],
+    failureKind: "generic",
+    errorMessage: `The edit action did not complete (${code}).${detail}`,
+    runnerId,
+  };
 }
 
 /**

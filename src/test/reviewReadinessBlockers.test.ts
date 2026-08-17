@@ -5,6 +5,7 @@ import {
   parseReviewBlockers,
   parseReviewBlockersDetailed,
   parseReviewProgress,
+  parseReviewVerifiedCompleteV1,
   isPlanIncomplete,
   meetsAutoAdvanceThreshold,
   readyToAdvanceStage,
@@ -93,6 +94,65 @@ void describe("parseReviewBlockers", () => {
       blockers.map((b) => b.resolver),
       ["task-fixable", "environmental", "unverifiable", "spec-defect", "needs-toolchain"]
     );
+  });
+});
+
+void describe("parseReviewVerifiedCompleteV1", () => {
+  void it("returns blockPresent false and no items when the block is absent", () => {
+    const result = parseReviewVerifiedCompleteV1("Readiness: 9/10\n\nLooks good.");
+    assert.equal(result.blockPresent, false);
+    assert.deepStrictEqual(result.items, []);
+  });
+
+  void it("parses item texts from a well-formed block, verbatim and in order", () => {
+    const content = [
+      "Readiness: 9/10",
+      "",
+      "<!-- verified-complete:start -->",
+      "- Wire the completeness gate",
+      "- Split the artifacts into impl-summary.md",
+      "<!-- verified-complete:end -->",
+    ].join("\n");
+    const result = parseReviewVerifiedCompleteV1(content);
+    assert.equal(result.blockPresent, true);
+    assert.deepStrictEqual(result.items, [
+      "Wire the completeness gate",
+      "Split the artifacts into impl-summary.md",
+    ]);
+  });
+
+  void it("returns blockPresent true with no items for an explicitly empty block", () => {
+    const content = ["<!-- verified-complete:start -->", "<!-- verified-complete:end -->"].join("\n");
+    const result = parseReviewVerifiedCompleteV1(content);
+    assert.equal(result.blockPresent, true);
+    assert.deepStrictEqual(result.items, []);
+  });
+
+  void it("preserves an item's own embedded ' — ' rather than truncating it", () => {
+    // The same class of item text Part 4 (asserted completions) had to fix
+    // for round claims — a reviewer's Verified Complete list must survive it
+    // too, since it is just a bullet list, not an em-dash-delimited claim.
+    const content = [
+      "<!-- verified-complete:start -->",
+      "- Reword the near-reset branch — name the offered Rerun action",
+      "<!-- verified-complete:end -->",
+    ].join("\n");
+    assert.deepStrictEqual(parseReviewVerifiedCompleteV1(content).items, [
+      "Reword the near-reset branch — name the offered Rerun action",
+    ]);
+  });
+
+  void it("ignores blank lines and tolerates '*' bullets", () => {
+    const content = [
+      "<!-- verified-complete:start -->",
+      "",
+      "* Item using a star bullet",
+      "",
+      "<!-- verified-complete:end -->",
+    ].join("\n");
+    assert.deepStrictEqual(parseReviewVerifiedCompleteV1(content).items, [
+      "Item using a star bullet",
+    ]);
   });
 });
 

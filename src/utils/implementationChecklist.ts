@@ -118,14 +118,26 @@ export function declaresNoChecklistChangeV1(response: string): boolean {
  * `collectRetroactiveTickClaimsV1` already reads. Together they mean a plan
  * that merely quotes either marker inside a checklist item's descriptive text
  * can never trigger this on its own.
+ *
+ * `planItemKeys` (optional) is forwarded to `collectRetroactiveTickClaimsV1`
+ * so an item whose own text contains ` — ` is still recognized as a claim;
+ * omitting it falls back to the naive split, which is still sufficient here
+ * since only the PRESENCE of at least one claim matters, not which item it
+ * names.
  */
-export function hasContradictoryNoChecklistChangeClaimV1(content: string): boolean {
+export function hasContradictoryNoChecklistChangeClaimV1(
+  content: string,
+  planItemKeys: ReadonlySet<string> = new Set()
+): boolean {
   const trimmed = content.trim();
   if (!declaresNoChecklistChangeV1(trimmed)) {
     return false;
   }
   const { own } = splitSummaryAtEchoV1(trimmed);
-  return collectRetroactiveTickClaimsV1(own).length > 0;
+  return (
+    collectRetroactiveTickClaimsV1(own, planItemKeys).length > 0 ||
+    collectPartLevelTickClaimsV1(own).length > 0
+  );
 }
 
 /**
@@ -223,24 +235,59 @@ const CHECKLIST_ENTRY_LINE = /^[ \t]*[-*][ \t]+(.*\S)[ \t]*\r?$/;
  * fields: `<item> — <status> — <evidence...>`. `apply-impl-review-code.md`
  * and `run-implementation.md` both mandate exactly this shape for every
  * entry in that section.
+ *
+ * A naive "first ` — ` wins" split truncates a plan item whose OWN text
+ * contains ` — ` (previously a documented open gap,
+ * `docs/verification/known-gaps.md`): the item's own dash gets read as the
+ * item/status boundary, and everything after it — including the real status
+ * and evidence — is mangled. When `planItemKeys` is supplied (the plan of
+ * record's own item keys), this instead tries the LONGEST prefix of the
+ * line — split on ` — `, most segments first — that normalizes to a REAL
+ * plan item, shrinking one segment at a time until one matches. That
+ * absorbs an item's embedded dash into its own text instead of letting it
+ * bleed into the status field. A line whose item text matches nothing in
+ * `planItemKeys` (a genuinely unknown/foreign/paraphrased claim, or a caller
+ * with no plan text to check against) falls back to the original naive
+ * split — which is exactly what lets a genuinely unmatched claim still
+ * surface as `no-match` rather than being silently absorbed into the wrong
+ * field.
  */
 function parsePlanItemChecklistLine(
-  raw: string
+  raw: string,
+  planItemKeys: ReadonlySet<string> = new Set()
 ): { itemText: string; status: string; evidence: string } | undefined {
   const outer = CHECKLIST_ENTRY_LINE.exec(raw);
   if (!outer) {
     return undefined;
   }
-  const parts = (outer[1] ?? "").split(/\s+—\s+/);
-  if (parts.length < 2) {
+  const segments = (outer[1] ?? "").split(/\s+—\s+/);
+  if (segments.length < 2) {
     return undefined;
   }
+  for (let k = segments.length - 1; k >= 1; k--) {
+    const candidateItemText = segments.slice(0, k).join(" — ").trim();
+    if (planItemKeys.has(normalizeChecklistItemTextV1(candidateItemText))) {
+      return {
+        itemText: candidateItemText,
+        status: (segments[k] ?? "").trim(),
+        evidence: segments.slice(k + 1).join(" — ").trim(),
+      };
+    }
+  }
   return {
-    itemText: (parts[0] ?? "").trim(),
-    status: (parts[1] ?? "").trim(),
-    evidence: parts.slice(2).join(" — ").trim(),
+    itemText: (segments[0] ?? "").trim(),
+    status: (segments[1] ?? "").trim(),
+    evidence: segments.slice(2).join(" — ").trim(),
   };
 }
+
+/**
+ * Matches a PART-level claim line ("Part 7 — done this round (6/6),
+ * evidence: ...") so `collectRetroactiveTickClaimsV1` can skip it rather
+ * than misreading it as a single item literally named "Part 7" — see
+ * {@link collectPartLevelTickClaimsV1}.
+ */
+const PART_CLAIM_LINE = /^[ \t]*[-*][ \t]+Part[ \t]+(\d+[A-Za-z]?)[ \t]*—[ \t]*(.+?)[ \t]*\r?$/i;
 
 /**
  * Retroactive-tick claims declared in `ownSummary` — the part of a response
@@ -248,16 +295,107 @@ function parsePlanItemChecklistLine(
  * never the echoed plan checklist itself, so a plan quoting this marker in
  * its own text cannot be mistaken for a round claiming it.
  *
+ * Two forms are accepted, both requiring a `status` beginning with "done":
+ * the explicit {@link RETROACTIVE_TICK_MARKER_V1} (still the recommended,
+ * unambiguous way to claim earlier-round work), or bare prose with no
+ * marker at all — the form models actually emit in practice (observed live,
+ * unprompted, on two separate tasks: a round summarizing "Part 7 — done
+ * this round (6/6), evidence: ..." and rounds reporting "— done —
+ * <evidence>" with no special markup). A status of "not reached"/"not done"
+ * never starts with "done" and is silently skipped either way — it is the
+ * round's honest report of remaining work, not an error worth flagging.
+ *
  * A claim with empty `evidence` is still returned (not dropped): the caller
  * must treat it as an unfulfilled claim rather than silently ticking
  * unverified work, and surface it the same way an unmatched echoed tick is
  * surfaced — the hard evidence requirement is what keeps this from becoming
  * a licence to mark unbuilt work done.
+ *
+ * `planItemKeys` (optional) is forwarded to `parsePlanItemChecklistLine` so
+ * a plan item whose own text contains ` — ` can still be claimed; omitting
+ * it (or passing an empty set) falls back to the original naive split.
  */
 export function collectRetroactiveTickClaimsV1(
-  ownSummary: string
+  ownSummary: string,
+  planItemKeys: ReadonlySet<string> = new Set()
 ): RetroactiveTickClaimV1[] {
   const claims: RetroactiveTickClaimV1[] = [];
+  const all = headingsV1(ownSummary);
+  const at = findLastHeadingV1(all, "Plan Item Checklist");
+  if (at === -1) {
+    return claims;
+  }
+  const heading = all[at];
+  if (!heading) {
+    return claims;
+  }
+  const lines = walkLinesV1(ownSummary);
+  let end = lines.length;
+  for (let h = at + 1; h < all.length; h++) {
+    const candidate = all[h];
+    if (candidate && candidate.level <= heading.level) {
+      end = candidate.line;
+      break;
+    }
+  }
+  for (let i = heading.line + 1; i < end; i++) {
+    const line = lines[i];
+    if (!line || line.fenced || PART_CLAIM_LINE.test(line.text)) {
+      continue;
+    }
+    const parsed = parsePlanItemChecklistLine(line.text, planItemKeys);
+    if (!parsed) {
+      continue;
+    }
+    if (!parsed.status.toLowerCase().startsWith("done")) {
+      continue;
+    }
+    claims.push({ itemText: parsed.itemText, evidence: parsed.evidence });
+  }
+  return claims;
+}
+
+/** One PART-level retroactive-tick claim — see {@link collectPartLevelTickClaimsV1}. */
+export interface PartLevelTickClaimV1 {
+  /** The part number as written, e.g. "7" or "3A" — matched against `## Part N` headings. */
+  readonly partNumber: string;
+  /** Verification evidence for the whole part; empty when the round omitted it. */
+  readonly evidence: string;
+}
+
+function parsePartLevelClaimLine(raw: string): PartLevelTickClaimV1 | undefined {
+  const match = PART_CLAIM_LINE.exec(raw);
+  if (!match) {
+    return undefined;
+  }
+  const partNumber = match[1] ?? "";
+  const segments = (match[2] ?? "").trim().split(/\s+—\s+/);
+  const status = segments[0] ?? "";
+  if (!status.toLowerCase().startsWith("done")) {
+    return undefined;
+  }
+  let evidence = segments.slice(1).join(" — ").trim();
+  if (!evidence) {
+    // The observed compact shape ("done this round (6/6), evidence: ...")
+    // never separates evidence with its own ` — `; it names it inline
+    // instead.
+    const inline = /evidence:\s*(.+)$/i.exec(status);
+    evidence = inline ? (inline[1] ?? "").trim() : "";
+  }
+  return { partNumber, evidence };
+}
+
+/**
+ * PART-level claims from `ownSummary`'s `## Plan Item Checklist` section —
+ * a round may report an entire plan Part complete in one line ("Part 7 —
+ * done this round (6/6), evidence: ...") rather than enumerating every item,
+ * observed live (round 073, "workflow 3"). Resolution to individual plan
+ * items happens in {@link mergeChecklistProgressV1} via
+ * `collectPlanItemsUnderPartHeadingV1`, which needs the plan of record this
+ * function does not have.
+ */
+export function collectPartLevelTickClaimsV1(ownSummary: string): PartLevelTickClaimV1[] {
+  const claims: PartLevelTickClaimV1[] = [];
   const all = headingsV1(ownSummary);
   const at = findLastHeadingV1(all, "Plan Item Checklist");
   if (at === -1) {
@@ -281,19 +419,80 @@ export function collectRetroactiveTickClaimsV1(
     if (!line || line.fenced) {
       continue;
     }
-    const parsed = parsePlanItemChecklistLine(line.text);
-    if (!parsed) {
-      continue;
+    const parsed = parsePartLevelClaimLine(line.text);
+    if (parsed) {
+      claims.push(parsed);
     }
-    if (
-      !parsed.status.toLowerCase().startsWith("done") ||
-      !parsed.status.includes(RETROACTIVE_TICK_MARKER_V1)
-    ) {
-      continue;
-    }
-    claims.push({ itemText: parsed.itemText, evidence: parsed.evidence });
   }
   return claims;
+}
+
+/**
+ * True when `ownSummary`'s `## Plan Item Checklist` section contains at
+ * least one syntactically well-formed completion claim — item-level or
+ * PART-level — REGARDLESS of whether it will go on to resolve against a
+ * real plan item.
+ *
+ * Used by the shape gate (`describeImplementationSummaryShapeIssue`) so a
+ * prose-only claim (no `- [x]` checkbox echo at all — the shape round 073 of
+ * "workflow 3" actually used) satisfies the checklist-echo requirement on
+ * its own, instead of being rejected before `mergeChecklistProgressV1` ever
+ * runs. Whether the claim actually MATCHES a plan item is deliberately not
+ * this function's concern: a claim that fails to resolve must still reach
+ * the merge step so it is reported as `checklistClaimedButUnmerged` and
+ * counted toward the sterile-round/latch accounting
+ * (`hasContradictoryNoChecklistChangeClaimV1`'s sibling concern) — rejecting
+ * it outright here would hide that signal behind a generic "malformed
+ * summary" refusal instead.
+ */
+export function hasPlanItemChecklistClaimV1(ownSummary: string): boolean {
+  return (
+    collectRetroactiveTickClaimsV1(ownSummary).length > 0 ||
+    collectPartLevelTickClaimsV1(ownSummary).length > 0
+  );
+}
+
+/**
+ * Every checklist item's raw text under the `## Part {partNumber}` heading
+ * of `planOfRecord`'s latest checklist rendering, in document order — the
+ * expansion target for a {@link PartLevelTickClaimV1}. Returns an empty
+ * array when no heading matches (e.g. a claim naming a part the plan does
+ * not have), which the caller surfaces exactly like any other unmatched
+ * claim rather than expanding to nothing silently.
+ */
+function collectPlanItemsUnderPartHeadingV1(
+  planOfRecord: string,
+  partNumber: string
+): string[] {
+  const scoped = scopeToLatestChecklistV1(planOfRecord).region;
+  const all = headingsV1(scoped);
+  const partPattern = new RegExp(`^Part\\s+${partNumber}\\b`, "i");
+  const at = all.findIndex((entry) => partPattern.test(entry.title.trim()));
+  if (at === -1) {
+    return [];
+  }
+  const heading = all[at]!;
+  const lines = walkLinesV1(scoped);
+  let end = lines.length;
+  for (let h = at + 1; h < all.length; h++) {
+    const candidate = all[h];
+    if (candidate && candidate.level <= heading.level) {
+      end = candidate.line;
+      break;
+    }
+  }
+  const items: string[] = [];
+  for (let i = heading.line + 1; i < end; i++) {
+    const line = lines[i];
+    if (!line || line.fenced) {
+      continue;
+    }
+    const match = ANY_ITEM_LINE.exec(line.text);
+    if (match) {
+      items.push(match[2] ?? "");
+    }
+  }
+  return items;
 }
 
 /**
@@ -578,6 +777,82 @@ export function collectCheckedChecklistCountsV1(
   return counts;
 }
 
+/** Result of {@link listUncheckedChecklistItemTextsV1}: a bounded preview plus the true total, so a caller can say "and N more" honestly. */
+export interface UncheckedChecklistItemsV1 {
+  /** Outstanding item texts, in document order, truncated to the requested limit. */
+  readonly items: readonly string[];
+  /** The true count of outstanding items — may exceed `items.length`. */
+  readonly total: number;
+}
+
+/**
+ * Plan-item texts whose box is currently UNCHECKED in `planOfRecord`'s latest
+ * rendering, in document order, unescaped for display and bounded to `limit`.
+ *
+ * Items carrying `EXCLUDED_CHECKLIST_ITEM_MARKER_V1` are never included —
+ * they never hold the completeness gate open, so naming them as "outstanding"
+ * to an operator would misdescribe what is actually blocking advancement.
+ *
+ * Used everywhere a human is told to "tick the missed items in plan-final.md"
+ * — the breaker escalation, the reconciliation run-log/notification, and the
+ * task-tree tooltip — so that instruction names the items instead of leaving
+ * the reader to search a plan they may not have open (workflow 3 continuation
+ * plan, Part 5).
+ */
+export function listUncheckedChecklistItemTextsV1(
+  planOfRecord: string,
+  limit: number = 10
+): UncheckedChecklistItemsV1 {
+  const outstanding = itemsInLatestRendering(planOfRecord).filter(
+    (item) => !item.excluded && !item.checked
+  );
+  return {
+    items: outstanding.slice(0, limit).map((item) => unescapeChecklistItemTextV1(item.text)),
+    total: outstanding.length,
+  };
+}
+
+/**
+ * Of `candidateTexts` (e.g. a reviewer's `## Verified Complete` list), return
+ * the plan of record's OWN item text for each candidate that currently
+ * resolves to an unchecked, non-excluded item — matched the same way a
+ * round's echo is matched (`normalizeChecklistItemTextV1`). A candidate
+ * matching nothing, or matching an item that is already checked or excluded,
+ * is silently dropped: this answers "what would a tick actually change",
+ * not "validate every candidate the caller supplied".
+ *
+ * Returning the PLAN's own text (rather than the candidate's) matters because
+ * the two can differ in escaping or incidental whitespace even when they
+ * normalize to the same identity — feeding the plan's own text back into
+ * {@link mergeChecklistProgressV1} keeps the claim resolution exact.
+ */
+export function filterUncheckedPlanItemsV1(
+  planOfRecord: string,
+  candidateTexts: readonly string[]
+): string[] {
+  const uncheckedByKey = new Map<string, string>();
+  for (const item of itemsInLatestRendering(planOfRecord)) {
+    if (item.excluded || item.checked) {
+      continue;
+    }
+    const key = normalizeChecklistItemTextV1(item.text);
+    if (!uncheckedByKey.has(key)) {
+      uncheckedByKey.set(key, item.text);
+    }
+  }
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const candidate of candidateTexts) {
+    const key = normalizeChecklistItemTextV1(candidate);
+    const planText = uncheckedByKey.get(key);
+    if (planText !== undefined && !seen.has(key)) {
+      seen.add(key);
+      result.push(planText);
+    }
+  }
+  return result;
+}
+
 /**
  * Outcome of {@link mergeChecklistProgressV1}, distinguishing the two
  * situations that both used to collapse into a plain `undefined`:
@@ -671,10 +946,14 @@ export function mergeChecklistProgressV1(
   // required evidence is never added to `reported` — it cannot tick anything
   // — but its text is kept so the no-match path can surface it exactly like
   // an unmatched echoed tick, rather than silently discarding it.
+  //
+  // `planItemKeys` lets a claim line whose item text itself contains ` — `
+  // still resolve to the right item (see `parsePlanItemChecklistLine`).
+  const planItemKeys = collectChecklistItemKeysV1(planOfRecord);
   const retroactiveKeys = new Set<string>();
   const retroactiveEvidenceByKey = new Map<string, string>();
   const missingEvidenceSamples: string[] = [];
-  for (const claim of collectRetroactiveTickClaimsV1(own)) {
+  for (const claim of collectRetroactiveTickClaimsV1(own, planItemKeys)) {
     const key = normalizeChecklistItemTextV1(claim.itemText);
     if (claim.evidence.length === 0) {
       missingEvidenceSamples.push(claim.itemText);
@@ -687,6 +966,36 @@ export function mergeChecklistProgressV1(
     }
     if (!reportedRawText.has(key)) {
       reportedRawText.set(key, claim.itemText);
+    }
+  }
+
+  // PART-level claims ("Part 7 — done this round (6/6), evidence: ...")
+  // expand to every item under the matching `## Part N` heading, each
+  // folded into the same maps as an individual retroactive tick sharing the
+  // part's one evidence string. A part naming no matching heading, or
+  // carrying no evidence, contributes nothing to `reported` but is still
+  // named in `missingEvidenceSamples` so it surfaces rather than vanishing.
+  for (const partClaim of collectPartLevelTickClaimsV1(own)) {
+    const label = `Part ${partClaim.partNumber}`;
+    if (partClaim.evidence.length === 0) {
+      missingEvidenceSamples.push(label);
+      continue;
+    }
+    const itemTexts = collectPlanItemsUnderPartHeadingV1(planOfRecord, partClaim.partNumber);
+    if (itemTexts.length === 0) {
+      missingEvidenceSamples.push(`${label} (no matching "## Part ${partClaim.partNumber}" heading in the plan)`);
+      continue;
+    }
+    for (const itemText of itemTexts) {
+      const key = normalizeChecklistItemTextV1(itemText);
+      reported.set(key, (reported.get(key) ?? 0) + 1);
+      retroactiveKeys.add(key);
+      if (!retroactiveEvidenceByKey.has(key)) {
+        retroactiveEvidenceByKey.set(key, partClaim.evidence);
+      }
+      if (!reportedRawText.has(key)) {
+        reportedRawText.set(key, itemText);
+      }
     }
   }
 
@@ -759,10 +1068,9 @@ export function mergeChecklistProgressV1(
   // reported key never appears among the plan's item keys at all (a genuine
   // mismatch worth surfacing). Distinguish by re-checking membership rather
   // than threading a second flag through the loop above.
-  const planKeys = collectChecklistItemKeysV1(planOfRecord);
   const unmatchedSample: string[] = [...missingEvidenceSamples];
   for (const key of reported.keys()) {
-    if (!planKeys.has(key) && !unmatchedSample.includes(reportedRawText.get(key) ?? key)) {
+    if (!planItemKeys.has(key) && !unmatchedSample.includes(reportedRawText.get(key) ?? key)) {
       unmatchedSample.push(reportedRawText.get(key) ?? key);
     }
     if (unmatchedSample.length >= 2) {

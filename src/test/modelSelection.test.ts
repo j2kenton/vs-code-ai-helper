@@ -3,7 +3,9 @@ import { describe, it } from "node:test";
 import * as vscode from "vscode";
 import {
   __testOnly,
+  describeStageSubstitutesV1,
   findStagesSharingBlockedPrimaryV1,
+  getAvailableCopilotModels,
   getAvailableModels,
   type SelectableModel,
   describeModel,
@@ -282,7 +284,7 @@ void describe("getAvailableModels", () => {
     try {
       const models = await getAvailableModels();
       const expected: SelectableModel[] = [
-        copilotModel("auto", "Auto"),
+        copilotModel("auto", "Auto (provider-chosen)"),
         copilotModel("copilot-gpt-5.6-sol", "GPT-5.6 Sol"),
         ...copilotReasoningAndContextVariants(
           "copilot-gpt-5.6-sol",
@@ -1272,6 +1274,176 @@ void describe("findStagesSharingBlockedPrimaryV1 (Part 5 step 3b — long-outage
       assert.deepEqual(affected.sort(), ["plan", "plan-high-review"].sort());
     } finally {
       settings.restore();
+    }
+  });
+});
+
+void describe("describeStageSubstitutesV1 (workflow 3 continuation, first item — named substitute per affected stage)", () => {
+  void it("names the first enabled backup on a DIFFERENT provider account as the affected stage's substitute", () => {
+    const settings = installModelSettings({
+      plan: {
+        primary: "claude-cli:opus",
+        backups: ["kiro-cli:default"],
+        strategy: "switch-to-backup",
+      },
+    });
+    try {
+      const descriptions = describeStageSubstitutesV1("claude-cli:opus");
+      assert.deepEqual(descriptions, ["Plan → kiro-cli:default"]);
+    } finally {
+      settings.restore();
+    }
+  });
+
+  void it("reports no backup configured when the affected stage has none", () => {
+    const settings = installModelSettings({
+      plan: { primary: "claude-cli:opus", strategy: "alert-and-wait" },
+    });
+    try {
+      const descriptions = describeStageSubstitutesV1("claude-cli:opus");
+      assert.deepEqual(descriptions, ["Plan: no backup configured — this stage will pause"]);
+    } finally {
+      settings.restore();
+    }
+  });
+
+  void it("skips a backup on the SAME blocked provider account — it is equally blocked, not a real substitute", () => {
+    const settings = installModelSettings({
+      plan: {
+        primary: "claude-cli:opus",
+        // Same account as the blocked primary (claude-cli) — not usable.
+        backups: ["claude-cli:sonnet"],
+        strategy: "switch-to-backup",
+      },
+    });
+    try {
+      const descriptions = describeStageSubstitutesV1("claude-cli:opus");
+      assert.deepEqual(descriptions, ["Plan: no backup configured — this stage will pause"]);
+    } finally {
+      settings.restore();
+    }
+  });
+
+  void it("falls through to the first DIFFERENT-account backup when an earlier one is on the same blocked account", () => {
+    const settings = installModelSettings({
+      plan: {
+        primary: "claude-cli:opus",
+        backups: ["claude-cli:sonnet", "kiro-cli:default"],
+        strategy: "switch-to-backup",
+      },
+    });
+    try {
+      const descriptions = describeStageSubstitutesV1("claude-cli:opus");
+      assert.deepEqual(descriptions, ["Plan → kiro-cli:default"]);
+    } finally {
+      settings.restore();
+    }
+  });
+
+  void it("excludes the stage that is itself reporting the outage", () => {
+    const settings = installModelSettings({
+      plan: { primary: "claude-cli:opus", strategy: "alert-and-wait" },
+      "plan-high-review": { primary: "claude-cli:opus", strategy: "alert-and-wait" },
+    });
+    try {
+      const descriptions = describeStageSubstitutesV1("claude-cli:opus", "plan");
+      assert.deepEqual(descriptions, [
+        "High-Level Review (Plan): no backup configured — this stage will pause",
+      ]);
+    } finally {
+      settings.restore();
+    }
+  });
+
+  void it("returns an empty list when no other stage shares the blocked primary", () => {
+    const settings = installModelSettings({
+      plan: { primary: "kiro-cli:default", strategy: "alert-and-wait" },
+    });
+    try {
+      assert.deepEqual(describeStageSubstitutesV1("claude-cli:opus"), []);
+    } finally {
+      settings.restore();
+    }
+  });
+});
+
+void describe("getAvailableCopilotModels (workflow 3 continuation, sixth item — 'auto' no longer leads)", () => {
+  function installCopilotModels(
+    models: readonly { id: string; name: string }[]
+  ): { restore: () => void } {
+    const lm = (vscode as unknown as {
+      lm: { selectChatModels: () => Promise<vscode.LanguageModelChat[]> };
+    }).lm;
+    const original = lm.selectChatModels;
+    lm.selectChatModels = (): Promise<vscode.LanguageModelChat[]> =>
+      Promise.resolve(models as vscode.LanguageModelChat[]);
+    return {
+      restore: (): void => {
+        lm.selectChatModels = original;
+      },
+    };
+  }
+
+  void it("moves 'auto' to the END of the list instead of floating it to the front", async () => {
+    const stub = installCopilotModels([
+      { id: "gpt-5.6-sol", name: "GPT-5.6 Sol" },
+      { id: "auto", name: "Auto" },
+      { id: "claude-sonnet-4.6", name: "Claude Sonnet 4.6" },
+    ]);
+    try {
+      const models = await getAvailableCopilotModels();
+      assert.deepEqual(
+        models.map((m) => m.id),
+        ["gpt-5.6-sol", "claude-sonnet-4.6", "auto"]
+      );
+    } finally {
+      stub.restore();
+    }
+  });
+
+  void it("leaves the list untouched when no 'auto' model is present", async () => {
+    const stub = installCopilotModels([
+      { id: "gpt-5.6-sol", name: "GPT-5.6 Sol" },
+      { id: "claude-sonnet-4.6", name: "Claude Sonnet 4.6" },
+    ]);
+    try {
+      const models = await getAvailableCopilotModels();
+      assert.deepEqual(
+        models.map((m) => m.id),
+        ["gpt-5.6-sol", "claude-sonnet-4.6"]
+      );
+    } finally {
+      stub.restore();
+    }
+  });
+
+  void it("leaves a lone 'auto' model as the only entry", async () => {
+    const stub = installCopilotModels([{ id: "auto", name: "Auto" }]);
+    try {
+      const models = await getAvailableCopilotModels();
+      assert.deepEqual(
+        models.map((m) => m.id),
+        ["auto"]
+      );
+    } finally {
+      stub.restore();
+    }
+  });
+
+  void it("labels 'auto' as provider-chosen in the selectable-model list surfaced to the settings UI, and leaves concrete Copilot model names untouched", async () => {
+    const stub = installCopilotModels([
+      { id: "gpt-5.6-sol", name: "GPT-5.6 Sol" },
+      { id: "auto", name: "Auto" },
+    ]);
+    try {
+      const models = await getAvailableModels();
+      const copilotModels = providerModels(models, "GitHub Copilot");
+      const auto = copilotModels.find((m) => m.id === "auto");
+      const concrete = copilotModels.find((m) => m.id === "gpt-5.6-sol");
+      assert.equal(auto?.name, "Auto (provider-chosen)");
+      assert.equal(concrete?.name, "GPT-5.6 Sol");
+    } finally {
+      stub.restore();
     }
   });
 });

@@ -377,6 +377,11 @@ void describe("execCliAgent inactivity watchdog (Part 7)", () => {
   void it("fires on genuine silence, well before the 60-minute wall clock, with a distinct 'inactivity' classification", async (t) => {
     const handle = installFakeSpawn(t);
     t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+    // Enable the watchdog explicitly — it ships OFF (0). See the tick below.
+    const overrides = (vscode.workspace as unknown as { _configOverrides: Map<string, unknown> })
+      ._configOverrides;
+    overrides.set("resilience.inactivityTimeoutMinutes", 15);
+    t.after(() => overrides.delete("resilience.inactivityTimeoutMinutes"));
 
     const resultPromise = execCliAgent({
       def: fakeDef(),
@@ -391,10 +396,11 @@ void describe("execCliAgent inactivity watchdog (Part 7)", () => {
     await new Promise((resolve) => setImmediate(resolve));
     assert.ok(handle.child, "the main provider spawn must have been invoked");
 
-    // Default ensemble.resilience.inactivityTimeoutMinutes is 15 (the
-    // test-stub vscode config always answers the schema default). No
-    // activity is ever emitted, so the watchdog's 15-second poll must catch
-    // it at the 15-minute mark — long before the 60-minute wall clock.
+    // The watchdog is OFF by default (0) as shipped, so this test pins its
+    // own value rather than inheriting one: it asserts the feature works when
+    // enabled, which must stay true independently of what the default is.
+    // No activity is ever emitted, so the 15-second poll must catch it at the
+    // 15-minute mark — long before the 60-minute wall clock.
     t.mock.timers.tick(15 * 60_000);
 
     const result = await resultPromise;

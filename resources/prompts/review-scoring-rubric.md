@@ -35,6 +35,18 @@ Because of this, **"it was not in the context pack" is not by itself grounds for
 
 When a "## Verified Checks (ground truth)" section is present below, it was produced by the extension host actually running the project's lint/type-check/test commands — it is not a claim from the implementer and not something you are being asked to verify yourself. Treat its overall result as ground truth for whether the checks pass. Do not raise a review-confidence blocker, and do not lower the score, merely because you have no way to independently run the tests yourself — that limitation is now covered by this section, not by you. A failure quarantined there as a "known flake" is explicitly not an outstanding blocker; do not re-raise it as one. Only raise a blocker from this section when it reports a real (non-quarantined) failure, or when it reports checks could not be run at all.
 
+## Verified Complete
+
+When the implementation notes below include a plan checklist (`<!-- ensemble:implementation-checklist -->`), and you personally opened the relevant file(s) and confirmed a specific unchecked plan item is actually complete in the workspace — not merely plausible, actually verified — name it in this machine-readable block, copying the item's text VERBATIM from the plan's own checklist (exact wording, so it can be matched by text):
+
+```
+<!-- verified-complete:start -->
+- <exact plan item text, copied verbatim from the plan checklist>
+<!-- verified-complete:end -->
+```
+
+This drives a one-click action that ticks exactly these items in plan-final.md on the strength of your verification alone — so only list an item here when you actually checked it against the tree yourself, never because it merely seems likely to be done. Omit an item you did not personally verify. Skip this block entirely when there is no checklist to check items against (e.g. a plan review), or emit it with the two markers and no entries when a checklist exists but you verified nothing beyond what is already ticked.
+
 ## Blocker Classification
 
 In addition to the prose blocker sections below, end your response with a machine-readable block listing every blocker you named above (architectural, completion, defect, shipping, and review-confidence blockers all go in this one block):

@@ -293,6 +293,73 @@ void describe("provider chain exhaustion (stage owner)", () => {
     assert.equal(logs.length, 1);
     assert.doesNotMatch(logs[0]!, /## Provider chain exhausted/);
   });
+
+  // workflow 3 continuation (third item): `candidatesExhausted` (every
+  // candidate was reserved, invoked, and failed) is the opposite condition
+  // from `providerModeUnavailable` (nothing was ever reserved) — the pause
+  // reason and the run-record headline must say which actually happened.
+  void it("pauses with 'tried and failed' wording for a candidatesExhausted code, never 'no provider available'", async () => {
+    const { folderPath, folderUri } = makeTaskFolder("exhausted_pause_tried");
+    await withHarness(async () => {
+      await pauseTaskForExhaustedChainV1(folderUri, "impl-high-review", EXHAUSTION, "candidatesExhausted");
+    });
+
+    const persisted = readProgress(folderPath);
+    assert.equal(persisted.status, "paused");
+    assert.match(
+      persisted.pausedReason ?? "",
+      /Every configured model for impl-high-review was tried and failed/
+    );
+    assert.doesNotMatch(persisted.pausedReason ?? "", /No configured provider/);
+  });
+
+  void it("pauses with the legacy 'no provider available' wording when no code is passed (back-compat)", async () => {
+    const { folderPath, folderUri } = makeTaskFolder("exhausted_pause_default");
+    await withHarness(async () => {
+      await pauseTaskForExhaustedChainV1(folderUri, "impl-high-review", EXHAUSTION);
+    });
+
+    const persisted = readProgress(folderPath);
+    assert.equal(persisted.status, "paused");
+    assert.match(
+      persisted.pausedReason ?? "",
+      /No configured provider for impl-high-review is available/
+    );
+  });
+
+  void it("writes an enriched run record with 'tried and failed' wording for candidatesExhausted", async () => {
+    const { folderPath, folderUri } = makeTaskFolder("exhausted_runlog_tried");
+    await withHarness(async () => {
+      await writeReviewRunLogV1(
+        {
+          kind: "unavailable",
+          code: "candidatesExhausted",
+          chainExhaustion: EXHAUSTION,
+        },
+        {
+          extensionUri: vscode.Uri.file(REAL_ROOT),
+          folderUri,
+          workspaceUri: vscode.Uri.file(REAL_ROOT),
+          currentStage: "impl",
+          targetStage: "impl-high-review",
+          reviewUri: vscode.Uri.file(path.join(folderPath, "impl-high-review.md")),
+          variables: {},
+          reviewAttemptId: "attempt-1",
+        }
+      );
+    });
+
+    const runsDir = path.join(folderPath, "runs");
+    const logs = fs
+      .readdirSync(runsDir)
+      .sort()
+      .map((name) => fs.readFileSync(path.join(runsDir, name), "utf8"));
+    assert.equal(logs.length, 1);
+    assert.match(logs[0]!, /Status: unavailable \(candidatesExhausted\)/);
+    assert.match(logs[0]!, /## Provider chain exhausted/);
+    assert.match(logs[0]!, /Every configured model was tried and failed for impl-high-review/);
+    assert.doesNotMatch(logs[0]!, /No provider could be acquired/);
+  });
 });
 
 void describe("pausedReason lifecycle (transforms)", () => {

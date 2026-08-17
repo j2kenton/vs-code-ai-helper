@@ -18,6 +18,7 @@ import {
   declaresNoChecklistChangeV1,
   hasContradictoryNoChecklistChangeClaimV1,
   hasImplementationChecklistV1,
+  hasPlanItemChecklistClaimV1,
   splitSummaryAtEchoV1,
 } from "./implementationChecklist";
 import { readTextIfExists } from "./fileUtils";
@@ -200,7 +201,15 @@ export function assessImplementationSummarySectionsV1(
     // nothing to echo — the marker is its explicit, reasoned statement of
     // that, and is accepted in place of the echo rather than rejected as a
     // missing one. See NO_CHECKLIST_CHANGE_MARKER_V1's doc comment.
-    declaresNoChecklistChangeV1(trimmed);
+    declaresNoChecklistChangeV1(trimmed) ||
+    // A prose-only completion claim (no `- [x]` checkbox echo at all) in the
+    // response's own `## Plan Item Checklist` section — the shape round 073
+    // of "workflow 3" actually used, and the form `run-implementation.md`
+    // now documents as accepted. Checked against `scope` (the `own` region),
+    // matching exactly where `mergeChecklistProgressV1` itself reads claims
+    // from (workflow 3 continuation, second/seventh items: the gate must not
+    // reject a response before the merge can even report it as unmatched).
+    hasPlanItemChecklistClaimV1(scope);
 
   return {
     scope,

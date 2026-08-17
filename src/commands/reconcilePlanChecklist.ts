@@ -39,14 +39,22 @@ function normalizeArg(
  * Clear a task's `checklistProgressUnreliable` latch after the user has brought
  * `plan-final.md`'s checkboxes back in line with the tree.
  *
- * The latch is set when a round changes files without its checklist state
- * being recorded — a runner-authored summary (the sealed edit pipeline returns
- * verified receipts, not prose) or a rejected one. Those completions can never
- * be recovered automatically: no later round knows what an unrecorded round
- * did, and inferring it would tick items nobody verified. So the counts stay
- * understated until a human fixes them, and while they are understated the
- * completeness gate stands down rather than hold a finished plan short of its
- * total.
+ * The latch is set under two conditions (workflow 3 continuation, second
+ * item — the widened trigger): (1) a round changes files without its
+ * checklist state being recorded — a runner-authored summary (the sealed
+ * edit pipeline returns verified receipts, not prose) or a rejected one; or
+ * (2) a completed round changes NO files and lands no new checklist ticks
+ * (a sterile round) immediately after the most recent qualifying-stage
+ * review scored at or above the auto-advance threshold with zero blockers —
+ * proof the checklist's own counts are under-reporting finished work, even
+ * though nothing here can point at which lines are wrong. Those completions
+ * can never be recovered automatically: no later round knows what an
+ * unrecorded round did, and inferring it would tick items nobody verified.
+ * So the counts stay understated until a human fixes them (or a later
+ * round's own prose claim resolves them — see `hasPlanItemChecklistClaimV1`
+ * / `mergeChecklistProgressV1`, the other, automatic exit from this same
+ * state), and while they are understated the completeness gate stands down
+ * rather than hold a finished plan short of its total.
  *
  * That made the latch one-way, which turned the task tooltip's advice ("tick
  * the missed items in plan-final.md to restore them") into a false promise —

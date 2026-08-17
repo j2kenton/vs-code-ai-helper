@@ -21,9 +21,11 @@ import {
   checkEditActionHostGateV1,
   checkEditActionProviderPathGateV1,
   computeEditRequestDigestV1,
+  describeEditActionOutcomeFailureV1,
   isEditPreflightActionKeyV1,
   runImplementationOrSealedV1,
 } from "../commands/runEditActionV1";
+import { ProviderChainExhaustionV1, TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
 
 const requireModule = createRequire(__filename);
 const childProcess = requireModule("node:child_process") as typeof import("node:child_process");
@@ -510,5 +512,70 @@ void describe("runEditActionV1 — identity, gate order, and Resume wiring", () 
     const lint = rows.find((row) => row.actionKey === "lint.v1");
     assert.ok(lint, "lint.v1 row missing");
     assert.deepEqual(lint.eligibility.stages, ["publish"], "lint.v1 is Publish-stage only");
+  });
+});
+
+// workflow 3 continuation (third item): `candidatesExhausted` (every
+// candidate was reserved, invoked, and failed) and `providerModeUnavailable`
+// (nothing was ever reserved) are opposite conditions — the user-facing text
+// built from a "failed" TwoPhaseEditResultV1 must say which actually
+// happened instead of "was unavailable" for both.
+void describe("describeEditActionOutcomeFailureV1 (candidatesExhausted vs providerModeUnavailable text)", () => {
+  const EXHAUSTION: ProviderChainExhaustionV1 = {
+    stage: "impl",
+    candidates: [
+      {
+        storedModelId: "claude-sonnet-4.6",
+        providerLabel: "Copilot",
+        runnerId: "copilot",
+        reason: "invoked, but the invocation did not produce a usable result",
+      },
+    ],
+  };
+
+  void it("reports 'tried and failed' with per-candidate reasons for candidatesExhausted", () => {
+    const outcome: TaskActionOutcomeV1 = {
+      kind: "unavailable",
+      code: "candidatesExhausted",
+      chainExhaustion: EXHAUSTION,
+    };
+    const result = describeEditActionOutcomeFailureV1(outcome, "copilot-lm");
+    assert.equal(result.status, "failed");
+    const message = result.errorMessage;
+    assert.ok(message);
+    assert.match(message, /candidatesExhausted/);
+    assert.match(message, /Every configured model was tried and failed/);
+    assert.match(message, /claude-sonnet-4\.6 \(Copilot\)/);
+    assert.doesNotMatch(message, /was unavailable/);
+  });
+
+  void it("reports 'no model was available' for providerModeUnavailable, never implying an invocation happened", () => {
+    const outcome: TaskActionOutcomeV1 = {
+      kind: "unavailable",
+      code: "providerModeUnavailable",
+      chainExhaustion: EXHAUSTION,
+    };
+    const result = describeEditActionOutcomeFailureV1(outcome, "copilot-lm");
+    assert.equal(result.status, "failed");
+    const message = result.errorMessage;
+    assert.ok(message);
+    assert.match(message, /providerModeUnavailable/);
+    assert.match(message, /No configured model was available/);
+    assert.doesNotMatch(message, /tried and failed/);
+  });
+
+  void it("names the outcome variant when no chain evidence is attached", () => {
+    const outcome: TaskActionOutcomeV1 = { kind: "unavailable", code: "providerModeUnavailable" };
+    const result = describeEditActionOutcomeFailureV1(outcome, "copilot-lm");
+    assert.equal(result.status, "failed");
+    const message = result.errorMessage;
+    assert.ok(message);
+    assert.match(message, /outcome=unavailable, no chain evidence attached/);
+  });
+
+  void it("maps a cancelled outcome straight through to a cancelled result", () => {
+    const outcome: TaskActionOutcomeV1 = { kind: "cancelled", code: "userCancelled" };
+    const result = describeEditActionOutcomeFailureV1(outcome, "copilot-lm");
+    assert.equal(result.status, "cancelled");
   });
 });

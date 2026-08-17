@@ -504,7 +504,14 @@ export const RESILIENCE_DEFAULTS = {
   nothingToFixRoutesToReview: true,
   noProgressBreakerRounds: 3,
   quotaResetNearThresholdHours: 24,
-  inactivityTimeoutMinutes: 15,
+  // 0 = off. Shipped enabled at 15 on 2026-08-16 and disabled the same day:
+  // it fired 6 times in one afternoon, every one killing a healthy round that
+  // had simply gone quiet while editing a 7,865-line file, and caught zero
+  // wedged processes. For scale, the 60-minute wall clock has fired 9 times in
+  // 3,320 runs. Losing a round's work is worse than losing 45 minutes, so the
+  // default is biased against firing. See the setting's description in
+  // package.json, and the note at readInactivityTimeoutMinutes.
+  inactivityTimeoutMinutes: 0,
 } as const;
 
 function readResilienceRounds(key: string, fallback: number): number {
@@ -526,6 +533,22 @@ function readQuotaResetThresholdHours(key: string, fallback: number): number {
 
 /** Same coercion pattern as readResilienceRounds, but bounded 0-180 to match
  * this setting's package.json schema. 0 disables the watchdog entirely. */
+/**
+ * Minutes of output silence before a CLI run's process tree is killed; 0 = off,
+ * which is the shipped default.
+ *
+ * The watchdog measures the wrong thing, which is why it defaults off. It kills
+ * on *output* silence and infers *wedged*, but an agentic CLI reading and
+ * editing a large file produces no output for long stretches while working
+ * perfectly — silence is what working looks like on a big codebase. A false
+ * positive destroys the round's edits (they are quarantined, not banked) and
+ * consumes recovery budget; a false negative costs at most the difference
+ * between this value and the 60-minute wall clock. The asymmetry says bias
+ * hard against firing.
+ *
+ * The right signal, if this is ever made default-on: no output AND no file
+ * writes AND no CPU. Any one alone is noise; together they mean something.
+ */
 function readInactivityTimeoutMinutes(key: string, fallback: number): number {
   const value = readSetting<unknown>(key, fallback);
   const numeric =

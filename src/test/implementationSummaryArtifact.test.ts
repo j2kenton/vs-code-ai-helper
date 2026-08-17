@@ -42,11 +42,14 @@ import {
 } from "../utils/implementationArtifactResolver";
 import { verifyPlanItems } from "../utils/completionLint";
 import {
+  collectChecklistItemKeysV1,
   collectRetroactiveTickClaimsV1,
   countChecklistProgressV1,
   EXCLUDED_CHECKLIST_ITEM_MARKER_V1,
+  filterUncheckedPlanItemsV1,
   hasContradictoryNoChecklistChangeClaimV1,
   hasImplementationChecklistV1,
+  listUncheckedChecklistItemTextsV1,
   mergeChecklistProgressV1,
   MergeChecklistProgressResultV1,
   NO_CHECKLIST_CHANGE_MARKER_V1,
@@ -1784,7 +1787,13 @@ void describe("a round can record work completed in an earlier round", () => {
     }
   });
 
-  void it("a done entry without the retroactive marker is ordinary Plan Item Checklist prose, not a claim", () => {
+  void it("a done entry WITHOUT the retroactive marker is now accepted as a claim (Part 4: models emit this form unprompted)", () => {
+    // The explicit marker is still the RECOMMENDED form, but two separate
+    // live tasks (round 073's part-level claim, and the jester task's
+    // rounds) produced this exact bare-prose shape with no marker at all —
+    // and it carries real evidence, so refusing it is what created the
+    // "finished work, unticked checklist" deadlock this plan part exists to
+    // close.
     const ordinaryDone = [
       "## Files Changed",
       "",
@@ -1795,9 +1804,18 @@ void describe("a round can record work completed in an earlier round", () => {
       "- Add the `databaseWaking` state to the dashboard API — done — built and tested this round",
     ].join("\n");
     const own = splitSummaryAtEchoV1(ordinaryDone).own;
-    assert.deepEqual(collectRetroactiveTickClaimsV1(own), []);
-    // With no echo and no valid retroactive claim, this is a plain no-report.
-    assert.deepEqual(mergeChecklistProgressV1(PLAN, ordinaryDone), { kind: "no-report" });
+    assert.deepEqual(collectRetroactiveTickClaimsV1(own), [
+      {
+        itemText: "Add the `databaseWaking` state to the dashboard API",
+        evidence: "built and tested this round",
+      },
+    ]);
+    const result = mergeChecklistProgressV1(PLAN, ordinaryDone);
+    assert.equal(result.kind, "merged");
+    if (result.kind === "merged") {
+      assert.ok(result.content.includes("- [x] Add the `databaseWaking` state to the dashboard API"));
+      assert.ok(result.content.includes("- [ ] Wire the SPA to retry on that state"));
+    }
   });
 
   void it("an echo tick and a retroactive claim in the same response both apply", () => {
@@ -1819,6 +1837,297 @@ void describe("a round can record work completed in an earlier round", () => {
     const merged = mergedContent(mergeChecklistProgressV1(PLAN, both));
     assert.ok(merged.includes("- [x] Add the `databaseWaking` state to the dashboard API"));
     assert.ok(merged.includes("- [x] Wire the SPA to retry on that state"));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Part 4 (workflow 3 continuation, second item's extra requirement /
+// seventh item req 1): a round must be able to assert checklist completion
+// without a matching file diff, in the forms models actually emit — plan
+// items whose own text contains " — ", bare prose with no retroactive
+// marker, and PART-level claims ("Part 7 — done this round (6/6),
+// evidence: ...", the exact shape observed live on round 073 of "workflow
+// 3"). Claim collection stays scoped to the round summary's own
+// `## Plan Item Checklist` section throughout — widening the accepted
+// grammar must not widen WHERE it is read from.
+// ---------------------------------------------------------------------------
+void describe("Part 4: asserted completions land without a file diff", () => {
+  const PLAN_WITH_DASH_ITEM = [
+    "<!-- ensemble:implementation-checklist -->",
+    "",
+    "- [ ] In the webview <style>, set .model-combo-input to font-size: var(--ensemble-small-font-size) — and reduce its vertical padding so the combo-box input height shrinks with the text.",
+    "- [ ] a second, unrelated item",
+  ].join("\n");
+
+  void it("a plan item whose own text contains ' — ' can still be claimed retroactively (the previously documented known-gap)", () => {
+    const claimWithDashItem = [
+      "## Files Changed",
+      "",
+      "- (none)",
+      "",
+      "## Plan Item Checklist",
+      "",
+      `- In the webview <style>, set .model-combo-input to font-size: var(--ensemble-small-font-size) — and reduce its vertical padding so the combo-box input height shrinks with the text. — done ${RETROACTIVE_TICK_MARKER_V1} — src/views/settingsView.ts:672-675`,
+    ].join("\n");
+    const own = splitSummaryAtEchoV1(claimWithDashItem).own;
+    const planItemKeys = collectChecklistItemKeysV1(PLAN_WITH_DASH_ITEM);
+    assert.deepEqual(collectRetroactiveTickClaimsV1(own, planItemKeys), [
+      {
+        itemText:
+          "In the webview <style>, set .model-combo-input to font-size: var(--ensemble-small-font-size) — and reduce its vertical padding so the combo-box input height shrinks with the text.",
+        evidence: "src/views/settingsView.ts:672-675",
+      },
+    ]);
+    const result = mergeChecklistProgressV1(PLAN_WITH_DASH_ITEM, claimWithDashItem);
+    assert.equal(result.kind, "merged");
+    if (result.kind === "merged") {
+      assert.ok(
+        result.content.includes(
+          "- [x] In the webview <style>, set .model-combo-input to font-size: var(--ensemble-small-font-size) — and reduce its vertical padding so the combo-box input height shrinks with the text."
+        )
+      );
+      assert.ok(result.content.includes("- [ ] a second, unrelated item"));
+    }
+  });
+
+  const PLAN_WITH_PART_7 = [
+    "<!-- ensemble:implementation-checklist -->",
+    "",
+    "## Part 6 — Some earlier part",
+    "",
+    "- [ ] an item that belongs to Part 6, not Part 7",
+    "",
+    "## Part 7 — Copilot desc/impl and the auto default",
+    "",
+    "- [ ] Reproduce Draft with AI on Copilot",
+    "- [ ] Commit the captured or reconstructed response shape as a test fixture",
+    "- [ ] Compare draft.v1 vs generatePlan.v1 request construction",
+    "- [ ] Harden the draft prompt or record the cause as provider-side",
+    "- [ ] Reorder getAvailableCopilotModels to list concrete models first",
+    "- [ ] Add a decode unit test for the desc fixture",
+    "",
+    "## Part 8 — End-to-end self-recovery proof",
+    "",
+    "- [ ] an item that belongs to Part 8, not Part 7",
+  ].join("\n");
+
+  /** Verbatim shape from round 073 of "workflow 3" (`.ensemble/2026-08-13_task_4`). */
+  const ROUND_073_RESPONSE = [
+    "## Files Changed",
+    "",
+    "- (none) — this round only verified prior work",
+    "",
+    "## Plan Item Checklist",
+    "",
+    "- Part 7 — done this round (6/6), evidence: `src/runners/cliAgentRunner.ts` (watchdog + " +
+      "`composeCliTimeoutOutcomeV1`), `src/commands/reviewActions.ts:5599-5651`, " +
+      "`src/test/cliRetryEvidence.test.ts:297-420`",
+  ].join("\n");
+
+  void it("a PART-level prose claim ticks every item under that Part heading and none outside it (round-073 shape, 6 ticks)", () => {
+    const result = mergeChecklistProgressV1(PLAN_WITH_PART_7, ROUND_073_RESPONSE);
+    assert.equal(result.kind, "merged");
+    if (result.kind === "merged") {
+      const tickedCount = (result.content.match(/- \[x\]/g) ?? []).length;
+      assert.equal(tickedCount, 6, "exactly the 6 items under Part 7 must be ticked");
+      assert.ok(result.content.includes("- [ ] an item that belongs to Part 6, not Part 7"));
+      assert.ok(result.content.includes("- [ ] an item that belongs to Part 8, not Part 7"));
+      assert.equal(result.retroactiveTicks?.length, 6);
+      for (const tick of result.retroactiveTicks ?? []) {
+        assert.match(tick.evidence, /composeCliTimeoutOutcomeV1/);
+      }
+    }
+  });
+
+  /**
+   * Same shape as ROUND_073_RESPONSE plus a `## Verification` section, so this
+   * isolates ONE question: does a prose-only Plan Item Checklist claim (no
+   * checkbox echo at all) satisfy `describeImplementationSummaryShapeIssue`'s
+   * checklist-echo requirement on its own? `mergeChecklistProgressV1` is
+   * called directly by the test above and succeeds — but in production
+   * (`reviewActions.ts`) that call only happens AFTER
+   * `describeImplementationSummaryShapeIssue` returns undefined first
+   * (`summaryIssue === undefined` gates `checklistMergeResult`). Before this
+   * fix, `echoesPlanChecklist` only recognized checkbox lines
+   * (`collectChecklistItemKeysV1`), so a pure prose claim's `echo` region was
+   * empty and the round was rejected before the merge ever ran — the exact
+   * shape round 073 itself used.
+   */
+  const ROUND_073_SHAPE_WITH_VERIFICATION = [
+    "## Files Changed",
+    "",
+    "- (none) — this round only verified prior work",
+    "",
+    "## Plan Item Checklist",
+    "",
+    "- Part 7 — done this round (6/6), evidence: `src/runners/cliAgentRunner.ts` (watchdog + " +
+      "`composeCliTimeoutOutcomeV1`), `src/commands/reviewActions.ts:5599-5651`, " +
+      "`src/test/cliRetryEvidence.test.ts:297-420`",
+    "",
+    "## Verification",
+    "",
+    "- ran the full unit suite",
+  ].join("\n");
+
+  void it("a prose-only Plan Item Checklist claim (no checkbox echo at all) satisfies the shape gate's echo requirement on its own", () => {
+    const issue = describeImplementationSummaryShapeIssue(ROUND_073_SHAPE_WITH_VERIFICATION, {
+      planChecklist: PLAN_WITH_PART_7,
+    });
+    assert.equal(
+      issue,
+      undefined,
+      "a prose Plan Item Checklist claim with real evidence must satisfy the echo requirement on its own; " +
+        "otherwise Part 4's merge fix never runs in the real round-completion pipeline, only in direct unit calls"
+    );
+  });
+
+  void it("prose completion claims OUTSIDE the '## Plan Item Checklist' section tick nothing", () => {
+    const proseOutsideSection = [
+      "## Files Changed",
+      "",
+      "- (none)",
+      "",
+      "## Verification",
+      "",
+      "- Add the `databaseWaking` state to the dashboard API — done — verified by hand",
+    ].join("\n");
+    const plan = [
+      "<!-- ensemble:implementation-checklist -->",
+      "",
+      "- [ ] Add the `databaseWaking` state to the dashboard API",
+    ].join("\n");
+    const own = splitSummaryAtEchoV1(proseOutsideSection).own;
+    assert.deepEqual(collectRetroactiveTickClaimsV1(own), []);
+    assert.deepEqual(mergeChecklistProgressV1(plan, proseOutsideSection), { kind: "no-report" });
+  });
+
+  void it("a claim naming an item the plan does not have still returns no-match (garbage claims are not silently absorbed)", () => {
+    const plan = [
+      "<!-- ensemble:implementation-checklist -->",
+      "",
+      "- [ ] Add the `databaseWaking` state to the dashboard API",
+    ].join("\n");
+    const garbage = [
+      "## Files Changed",
+      "",
+      "- (none)",
+      "",
+      "## Plan Item Checklist",
+      "",
+      "- Some entirely unrelated item the plan never mentioned — done — built and verified",
+    ].join("\n");
+    const result = mergeChecklistProgressV1(plan, garbage);
+    assert.equal(result.kind, "no-match");
+    if (result.kind === "no-match") {
+      assert.deepEqual(result.unmatchedSample, ["Some entirely unrelated item the plan never mentioned"]);
+    }
+  });
+
+  void it("a PART-level claim naming a part the plan does not have also returns no-match", () => {
+    const plan = [
+      "<!-- ensemble:implementation-checklist -->",
+      "",
+      "## Part 1 — Only part",
+      "",
+      "- [ ] the only item",
+    ].join("\n");
+    const claim = [
+      "## Files Changed",
+      "",
+      "- (none)",
+      "",
+      "## Plan Item Checklist",
+      "",
+      "- Part 99 — done this round (3/3), evidence: nothing real",
+    ].join("\n");
+    const result = mergeChecklistProgressV1(plan, claim);
+    assert.equal(result.kind, "no-match");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Part 5 — listUncheckedChecklistItemTextsV1 / filterUncheckedPlanItemsV1
+// Naming the exact outstanding items, and resolving a reviewer's Verified
+// Complete list against them, is what turns "tick the missed items" into
+// something an operator (or the one-click apply command) can act on.
+// ---------------------------------------------------------------------------
+void describe("Part 5: naming and resolving outstanding checklist items", () => {
+  const PLAN = [
+    "<!-- ensemble:implementation-checklist -->",
+    "",
+    "- [x] Split the artifacts",
+    "- [ ] Wire the completeness gate",
+    "- [ ] Add the retry button",
+    `- [ ] An operator-only step ${EXCLUDED_CHECKLIST_ITEM_MARKER_V1}`,
+    "- [ ] Fix the \\\"quoted\\\" escaping bug",
+  ].join("\n");
+
+  void describe("listUncheckedChecklistItemTextsV1", () => {
+    void it("lists unchecked, non-excluded items in document order, unescaped", () => {
+      const result = listUncheckedChecklistItemTextsV1(PLAN);
+      assert.deepEqual(result.items, [
+        "Wire the completeness gate",
+        "Add the retry button",
+        'Fix the "quoted" escaping bug',
+      ]);
+      assert.equal(result.total, 3, "excluded and already-checked items must not count");
+    });
+
+    void it("bounds the preview to `limit` while `total` still reports the true count", () => {
+      const result = listUncheckedChecklistItemTextsV1(PLAN, 1);
+      assert.deepEqual(result.items, ["Wire the completeness gate"]);
+      assert.equal(result.total, 3);
+    });
+
+    void it("returns an empty result for a plan with no checklist", () => {
+      const result = listUncheckedChecklistItemTextsV1("# Just prose, no checklist.");
+      assert.deepEqual(result.items, []);
+      assert.equal(result.total, 0);
+    });
+
+    void it("returns an empty result once every item is checked", () => {
+      const done = PLAN.replace("- [ ] Wire the completeness gate", "- [x] Wire the completeness gate")
+        .replace("- [ ] Add the retry button", "- [x] Add the retry button")
+        .replace('- [ ] Fix the \\"quoted\\" escaping bug', '- [x] Fix the \\"quoted\\" escaping bug');
+      const result = listUncheckedChecklistItemTextsV1(done);
+      assert.deepEqual(result.items, []);
+      assert.equal(result.total, 0);
+    });
+  });
+
+  void describe("filterUncheckedPlanItemsV1", () => {
+    void it("resolves candidates to the plan's own unchecked item text, matched case/whitespace-insensitively", () => {
+      const resolved = filterUncheckedPlanItemsV1(PLAN, [
+        "  WIRE the completeness   gate  ",
+        "Add the retry button",
+      ]);
+      assert.deepEqual(resolved, ["Wire the completeness gate", "Add the retry button"]);
+    });
+
+    void it("drops a candidate that is already checked", () => {
+      const resolved = filterUncheckedPlanItemsV1(PLAN, ["Split the artifacts", "Add the retry button"]);
+      assert.deepEqual(resolved, ["Add the retry button"]);
+    });
+
+    void it("drops a candidate matching nothing in the plan (paraphrase or foreign text)", () => {
+      const resolved = filterUncheckedPlanItemsV1(PLAN, ["Something the plan never said"]);
+      assert.deepEqual(resolved, []);
+    });
+
+    void it("drops an excluded item even when named as a candidate", () => {
+      const resolved = filterUncheckedPlanItemsV1(PLAN, [
+        `An operator-only step ${EXCLUDED_CHECKLIST_ITEM_MARKER_V1}`,
+      ]);
+      assert.deepEqual(resolved, []);
+    });
+
+    void it("deduplicates repeated candidates resolving to the same item", () => {
+      const resolved = filterUncheckedPlanItemsV1(PLAN, [
+        "Wire the completeness gate",
+        "wire the completeness gate",
+      ]);
+      assert.deepEqual(resolved, ["Wire the completeness gate"]);
+    });
   });
 });
 

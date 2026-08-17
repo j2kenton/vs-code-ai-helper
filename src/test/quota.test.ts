@@ -803,11 +803,12 @@ void describe("buildQuotaRemedyTextV1 — threshold branching (Part 5 step 3)", 
     );
   });
 
-  void it("a near reset (within threshold) mentions the rerun time and manual retry", () => {
+  void it("a near reset (within threshold) mentions the rerun time and the offered Rerun after reset action", () => {
     const now = new Date("2026-01-01T00:00:00.000Z");
     const resetAt = new Date(now.getTime() + 2 * 3_600_000).toISOString(); // 2h away
     const text = buildQuotaRemedyTextV1(resetAt, now, 24);
     assert.match(text, /Rerun this stage after/);
+    assert.match(text, /"Rerun after reset"/);
     assert.doesNotMatch(text, /expected to stay blocked until/);
   });
 

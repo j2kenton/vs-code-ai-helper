@@ -74,8 +74,9 @@ import {
   TaskActionSettlementRecordV1,
   tryFramelessContentFallbackV1,
 } from "../actions/taskActionCoordinatorV1";
-import { createBoundedResultStoreV1 } from "../services/boundedResultStoreV1";
+import { BoundedResultStoreV1, createBoundedResultStoreV1 } from "../services/boundedResultStoreV1";
 import { AgentExecutionBrokerOptionsV1 } from "../services/agentExecutionBrokerV1";
+import { findMostRecentSpool } from "../commands/recoverLastAiResponse";
 import {
   createTaskActionRegistryV1,
   LifecycleTaskActionRowV1,
@@ -784,6 +785,175 @@ void describe("taskActionCoordinatorV1", () => {
     assert.doesNotMatch(outcome.detail ?? "", /response preserved for recovery/);
   });
 
+  /**
+   * Live incident, 2026-08-15 (Copilot desc): the envelope PARSED — version,
+   * correlation, kind all valid — and settlement then rejected the content,
+   * which used to preserve nothing. These four tests are the evidence that
+   * both settlement-time `contentSchemaMismatch` origins now keep a
+   * recovery copy the Recover Last AI Response command can actually find,
+   * and that when no copy could be kept the outcome says so explicitly
+   * instead of leaving success and failure indistinguishable.
+   */
+  void it("preserves the rejected response when settlement rejects a result kind the row does not permit", async () => {
+    const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-settle-kind-spool-"));
+    const spoolStore = createBoundedResultStoreV1({ rootDir });
+    const questionsEnvelope = (correlation: ActionCorrelationV1): unknown => ({
+      version: 1,
+      correlation,
+      kind: "questions",
+      questions: [
+        {
+          questionId: "q1",
+          kind: "text",
+          prompt: "Which stage?",
+          required: true,
+          allowBlank: false,
+          maxLength: 100,
+        },
+      ],
+    });
+    const harness = makeHarness(
+      [envelopeTransport((correlation) => frame(questionsEnvelope(correlation)))],
+      // Exclude "questions" so the well-formed questions envelope lands on
+      // settleEnvelope's kind-not-permitted origin, not the questions flow.
+      { permittedResultKinds: ["completed", "cancelled", "failed"] },
+      [],
+      { spoolStore }
+    );
+    try {
+      const outcome = await harness.coordinator.executeAction(baseRequest());
+      assert.equal(outcome.kind, "malformedResult");
+      if (outcome.kind !== "malformedResult") {
+        assert.fail("expected malformedResult");
+      }
+      assert.equal(outcome.code, "contentSchemaMismatch");
+      assert.match(outcome.detail ?? "", /received result kind "questions"/);
+      assert.match(outcome.detail ?? "", /response preserved for recovery in extension private storage/);
+      assert.match(outcome.detail ?? "", /Recover Last AI Response/);
+      assert.match(outcome.detail ?? "", /vs-code-ai-helper\.recoverLastAiResponse/);
+
+      // The spool must be discoverable the way the user reaches it — through
+      // the Recover Last AI Response command's own scan, not just on disk.
+      const found = findMostRecentSpool(rootDir);
+      assert.ok(found, "findMostRecentSpool must surface the recovery spool");
+      assert.equal(found.meta.purpose, "recovery");
+      assert.equal(found.meta.operationId, outcome.correlation.operationId);
+      assert.equal(found.meta.providerLabel, "Test Provider");
+      assert.equal(
+        fs.readFileSync(found.binPath, "utf8"),
+        frame(questionsEnvelope(outcome.correlation)),
+        "the preserved bytes must be the exact unsealed response text"
+      );
+    } finally {
+      fs.rmSync(rootDir, { recursive: true, force: true });
+    }
+  });
+
+  void it("preserves the rejected response when settlement rejects a completed result's content type", async () => {
+    const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-settle-ctype-spool-"));
+    const spoolStore = createBoundedResultStoreV1({ rootDir });
+    const mismatchedEnvelope = (correlation: ActionCorrelationV1): unknown => ({
+      version: 1,
+      correlation,
+      kind: "completed",
+      // Valid, decodable content — of the WRONG type for the row (which
+      // expects markdown-artifact.v1), the exact 2026-08-15 desc shape.
+      content: { contentType: "chat-message.v1", schemaVersion: 1, text: "a perfectly valid chat reply" },
+    });
+    const harness = makeHarness(
+      [envelopeTransport((correlation) => frame(mismatchedEnvelope(correlation)))],
+      {},
+      [],
+      { spoolStore }
+    );
+    try {
+      const outcome = await harness.coordinator.executeAction(baseRequest());
+      assert.equal(outcome.kind, "malformedResult");
+      if (outcome.kind !== "malformedResult") {
+        assert.fail("expected malformedResult");
+      }
+      assert.equal(outcome.code, "contentSchemaMismatch");
+      assert.match(
+        outcome.detail ?? "",
+        /received content type "chat-message\.v1", expected "markdown-artifact\.v1"/
+      );
+      assert.match(outcome.detail ?? "", /response preserved for recovery in extension private storage/);
+      assert.match(outcome.detail ?? "", /Recover Last AI Response/);
+
+      const found = findMostRecentSpool(rootDir);
+      assert.ok(found, "findMostRecentSpool must surface the recovery spool");
+      assert.equal(found.meta.purpose, "recovery");
+      assert.equal(found.meta.operationId, outcome.correlation.operationId);
+      assert.equal(
+        fs.readFileSync(found.binPath, "utf8"),
+        frame(mismatchedEnvelope(outcome.correlation)),
+        "the preserved bytes must be the exact unsealed response text"
+      );
+      assert.equal(harness.promoted.length, 0);
+    } finally {
+      fs.rmSync(rootDir, { recursive: true, force: true });
+    }
+  });
+
+  void it("states explicitly that nothing was preserved when settlement rejects with no spool store configured", async () => {
+    // Default harness: no brokerOptions at all. The settled outcome must say
+    // the response was NOT kept and why — silence here is what made the
+    // 2026-08-15 failure look identical whether a copy existed or not.
+    const harness = makeHarness(
+      [
+        envelopeTransport((correlation) =>
+          frame({
+            version: 1,
+            correlation,
+            kind: "completed",
+            content: { contentType: "chat-message.v1", schemaVersion: 1, text: "valid but wrong type" },
+          })
+        ),
+      ]
+    );
+    const outcome = await harness.coordinator.executeAction(baseRequest());
+    assert.equal(outcome.kind, "malformedResult");
+    if (outcome.kind !== "malformedResult") {
+      assert.fail("expected malformedResult");
+    }
+    assert.equal(outcome.code, "contentSchemaMismatch");
+    assert.match(
+      outcome.detail ?? "",
+      /response NOT preserved \(no recovery spool store is configured for this workspace\)/
+    );
+    assert.doesNotMatch(outcome.detail ?? "", /response preserved for recovery/);
+  });
+
+  void it("states explicitly that nothing was preserved when the recovery write fails, without altering the settled outcome", async () => {
+    const failingStore = {
+      writeSpool: (): Promise<never> => Promise.reject(new Error("disk full")),
+    } as unknown as BoundedResultStoreV1;
+    const harness = makeHarness(
+      [
+        envelopeTransport((correlation) =>
+          frame({
+            version: 1,
+            correlation,
+            kind: "completed",
+            content: { contentType: "chat-message.v1", schemaVersion: 1, text: "valid but wrong type" },
+          })
+        ),
+      ],
+      {},
+      [],
+      { spoolStore: failingStore }
+    );
+    const outcome = await harness.coordinator.executeAction(baseRequest());
+    // Best-effort contract: the write failure changes only the detail clause,
+    // never the settled kind/code.
+    assert.equal(outcome.kind, "malformedResult");
+    if (outcome.kind !== "malformedResult") {
+      assert.fail("expected malformedResult");
+    }
+    assert.equal(outcome.code, "contentSchemaMismatch");
+    assert.match(outcome.detail ?? "", /response NOT preserved \(writing the recovery copy failed\)/);
+  });
+
   void it("falls back after a pre-response transport failure with a fresh attempt", async () => {
     const seen: ActionCorrelationV1[] = [];
     const failing: AgentTransportV1 = {
@@ -1148,6 +1318,61 @@ void describe("taskActionCoordinatorV1", () => {
       "the lease must be released like any other unavailable settlement"
     );
   });
+
+  void it(
+    "reports candidatesExhausted with real per-attempt outcomes when every candidate was invoked and failed",
+    async () => {
+      // The opposite condition from the previous test: here every candidate
+      // WAS reserved and invoked (both via a pre-response transport failure,
+      // fallback-eligible) before the chain ran out. Collapsing this onto
+      // `providerModeUnavailable` — as the coordinator used to do — is what
+      // cost a multi-hour Copilot misdiagnosis on 2026-08-15 (workflow 3
+      // continuation, third item): the code must say "tried and failed", not
+      // "nothing was available", and each candidate's placeholder reason must
+      // be replaced with what the session actually recorded for it.
+      const failingOnce: AgentTransportV1 = {
+        runnerId: "scripted-transport",
+        invoke: () => Promise.resolve({ kind: "transportFailure" as const, code: "connectFailed" }),
+      };
+      const exhaustion = {
+        stage: "impl-high-review",
+        candidates: [
+          {
+            storedModelId: "copilot:test",
+            providerLabel: "Test Provider",
+            runnerId: "scripted-transport",
+            reason: "not attempted",
+          },
+          {
+            storedModelId: "copilot:test",
+            providerLabel: "Test Provider",
+            runnerId: "scripted-transport",
+            reason: "not attempted",
+          },
+        ],
+      };
+      const harness = makeHarness([failingOnce, failingOnce], {}, [], undefined, exhaustion);
+      const outcome = await harness.coordinator.executeAction(baseRequest());
+      assert.equal(outcome.kind, "unavailable");
+      if (outcome.kind !== "unavailable") {
+        assert.fail("expected unavailable");
+      }
+      assert.equal(
+        outcome.code,
+        "candidatesExhausted",
+        "every candidate was reserved and invoked, so this is the opposite of providerModeUnavailable"
+      );
+      assert.equal(harness.selection.reserved, 2);
+      assert.deepEqual(
+        outcome.chainExhaustion?.candidates.map((candidate) => candidate.reason),
+        [
+          "invoked, but the transport failed before any response arrived",
+          "invoked, but the transport failed before any response arrived",
+        ],
+        "each candidate's placeholder reason must be replaced with its actual recorded per-attempt outcome"
+      );
+    }
+  );
 
   void it("maps provider-declared failure and cancellation envelopes onto stable outcomes", async () => {
     const failed = makeHarness([
@@ -1716,8 +1941,10 @@ void describe("taskActionCoordinatorV1", () => {
     // strategy-gated backup is reserved on a FRESH attempt. Under the test
     // stub there is no usable vscode.lm host, so each Copilot transport
     // reports a deterministic pre-response transport failure, the ranking
-    // exhausts, and the coordinator maps the whole operation onto the stable
-    // providerModeUnavailable outcome.
+    // exhausts, and the coordinator maps the whole operation onto
+    // candidatesExhausted (workflow 3 continuation, third item) — BOTH
+    // candidates were actually reserved and invoked before the chain ran
+    // out, the opposite condition from providerModeUnavailable.
     //
     // BOTH candidates are Copilot on purpose. This test uses the REAL opener,
     // which builds REAL transports — a CLI candidate here does not stub
@@ -1784,7 +2011,11 @@ void describe("taskActionCoordinatorV1", () => {
       const outcome = await coordinator.executeAction(baseRequest());
       assert.equal(outcome.kind, "unavailable");
       if (outcome.kind === "unavailable") {
-        assert.equal(outcome.code, "providerModeUnavailable");
+        assert.equal(
+          outcome.code,
+          "candidatesExhausted",
+          "both candidates were reserved and invoked, so this is the opposite of providerModeUnavailable"
+        );
         // The real registry now carries structured exhaustion evidence for
         // the stage owner (finding 4) — both ranked candidates named, both
         // recorded as reserved-and-failed.
@@ -1797,21 +2028,24 @@ void describe("taskActionCoordinatorV1", () => {
       assert.equal(promoted.length, 0);
       assert.equal(leaseStore.heldLease(TASK_BINDING.taskBindingId), undefined);
 
-      // With NO mode-capable candidate at all (sole last-message-file CLI
-      // primary, no backups), the registry reports mode unavailability on
-      // the first reserveNext and no transport is ever constructed.
-      const soleUnsupported = installModelSettings({
-        "impl-high-review": { primary: "codex-cli:gpt-5", strategy: "switch-to-backup" },
-      });
-      try {
-        const sole = await coordinator.executeAction(baseRequest());
-        assert.equal(sole.kind, "unavailable");
-        if (sole.kind === "unavailable") {
-          assert.equal(sole.code, "providerModeUnavailable");
-        }
-      } finally {
-        soleUnsupported.restore();
-      }
+      // A genuinely NO-mode-capable-candidate-at-all chain (anySupported
+      // false) is deliberately NOT re-proven here: every CLI provider now
+      // supports stdout capture for "text" mode (2026-08-11), so there is no
+      // longer a non-CLI-spawning way to construct that condition through
+      // this row's fixed "text" mode — attempting it by changing settings
+      // alone is a no-op because `resolveStagePrimaryModel` above is a fixed
+      // stub, not a live settings read, so it silently exercised the SAME
+      // chain twice rather than the unsupported-mode path its comment
+      // claimed (masked before this round because the coordinator collapsed
+      // both `providerModeUnavailable` and `candidatesExhausted` onto one
+      // code; workflow 3 continuation, third item, made the mismatch
+      // observable). That condition is already covered at both layers this
+      // test would otherwise duplicate: the real registry in
+      // runnerRegistryV1Selection.test.ts ("returns providerModeUnavailable
+      // for preflight/edit when only CLI providers are configured"), and the
+      // coordinator's own pass-through in this file ("returns
+      // providerModeUnavailable when the ranked selection has no
+      // candidate").
     } finally {
       settings.restore();
     }

@@ -111,6 +111,77 @@ void describe("parseAiResultEnvelopeV1 — completed content", () => {
   });
 });
 
+/**
+ * Workflow 3 continuation, fifth item: `draft.v1` (Draft with AI) failed with
+ * `contentSchemaMismatch` on GitHub Copilot (both "auto" and the concrete
+ * "gpt-5.6-terra" model) on 2026-08-15 — the envelope itself parsed cleanly
+ * (`version`, `correlation`, `kind: "completed"` all valid); only
+ * `decodeCompletedContentV1(value.content)` rejected the content. No live
+ * Copilot entitlement was available in the environment that implemented this
+ * fix, and the raw rejected payload from that incident lives in a different
+ * repository's task history, not this one — so per the plan's fixture route
+ * (Part 7 step 2) this is a RECONSTRUCTED fixture, not a literal capture of
+ * that response.
+ *
+ * The reconstruction is grounded in a concrete code-level finding, not a
+ * guess: `draft.v1` and `generatePlan.v1` build byte-identical result
+ * contracts (`buildAiResultContractPromptV1` — same `permittedResultKinds`,
+ * same `completedContentType`), and `generatePlan.v1` succeeds under the
+ * same conditions where `draft.v1` fails. The only differing instruction is
+ * `draft-task-with-ai.md`'s closing nudge, prior to this fix, to "ask them
+ * instead of guessing" without pointing at the structured "questions" result
+ * kind — which invites a model to try to surface a clarifying question
+ * inside its "completed" answer instead of switching envelope kind. Doing so
+ * as an extra field alongside "markdown" is the shape this test exercises;
+ * `resources/prompts/draft-task-with-ai.md` was hardened in this same round
+ * to close that ambiguity (see the file for the reworded instruction).
+ */
+void describe("parseAiResultEnvelopeV1 — reconstructed fixture for the 2026-08-15 Copilot draft.v1 desc failure", () => {
+  void it("names the failing check as an unknown field on markdown-artifact.v1 when a clarifying question rides alongside the draft markdown", () => {
+    const raw = frame({
+      version: 1,
+      correlation: correlation({ actionKey: "draft.v1" }),
+      kind: "completed",
+      content: {
+        contentType: "markdown-artifact.v1",
+        schemaVersion: 1,
+        markdown: "Add a login button.\n\n### Behavior change\n\n...",
+        // The hypothesized failure shape: the model tries to ask a
+        // clarifying question INSIDE the completed content instead of
+        // using "kind": "questions" — an extra field the decoder rejects.
+        clarifyingQuestion: "Should the login button use OAuth or email/password?",
+      },
+    });
+    const result = parseAiResultEnvelopeV1(raw);
+    assert.equal(result.kind, "malformed");
+    if (result.kind === "malformed") {
+      assert.equal(result.code, "contentSchemaMismatch");
+      assert.match(result.reason, /markdown-artifact\.v1 has unknown field: clarifyingQuestion/);
+    }
+  });
+
+  void it("names the failing check as a missing markdown field when only a conversational reply is returned", () => {
+    const raw = frame({
+      version: 1,
+      correlation: correlation({ actionKey: "draft.v1" }),
+      kind: "completed",
+      content: {
+        contentType: "markdown-artifact.v1",
+        schemaVersion: 1,
+        // No "markdown" field at all — a plausible shape if the model
+        // answers conversationally instead of emitting the artifact.
+        answer: "I'd like to know more about the login flow before drafting this.",
+      },
+    });
+    const result = parseAiResultEnvelopeV1(raw);
+    assert.equal(result.kind, "malformed");
+    if (result.kind === "malformed") {
+      assert.equal(result.code, "contentSchemaMismatch");
+      assert.match(result.reason, /markdown-artifact\.v1 is missing a string "markdown" field/);
+    }
+  });
+});
+
 void describe("parseAiResultEnvelopeV1 — preflight-plan.v1 and edit-execution.v1", () => {
   function writeOp(
     stepId: string,
