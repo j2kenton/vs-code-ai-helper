@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { describe, it } from "node:test";
 import { parseAiResultEnvelopeV1, setInertTrailingObserverV1 } from "../types/aiResultEnvelope";
 import { ActionCorrelationV1 } from "../types/actionCorrelationV1";
+import { DEFAULT_TEXT_ANSWER_MAX_LENGTH_V1 } from "../types/structuredQuestionV1";
 
 const HEX_A = "a".repeat(32);
 const HEX_B = "b".repeat(32);
@@ -959,5 +960,82 @@ void describe("parseAiResultEnvelopeV1 — a complete value followed by surplus 
     const truncated = JSON.stringify(payload).slice(0, -12);
     const raw = frame(payload).replace(`${JSON.stringify(payload)}\n`, `${truncated}\n`);
     assert.equal(parseAiResultEnvelopeV1(raw).kind, "malformed");
+  });
+});
+
+void describe("parseAiResultEnvelopeV1 — a real model-authored clarifying question", () => {
+  /**
+   * The exact payload GitHub Copilot (`auto`) returned for a `draft.v1`
+   * action on 2026-08-15, recovered from the provider-result spool. It was
+   * rejected as `contentSchemaMismatch`, which read as "Copilot is broken at
+   * the desc stage" and cost two sessions to diagnose.
+   *
+   * Nothing was wrong with it. The task said "make sure there are no security
+   * vulnerabilities in this web app", and the draft prompt tells a model to
+   * ask rather than guess when it needs clarification — so it asked which app.
+   * The contract documented `{"questionId","kind","prompt","required",...}`;
+   * the decoder additionally demanded `allowBlank` and `maxLength`, hidden
+   * behind that ellipsis. The model obeyed the contract it was given.
+   *
+   * Not provider-specific: any model that asks a question sent this shape.
+   * This is the corpus's only genuinely model-authored question — every other
+   * fixture is hand-written to whatever the decoder wanted, which is exactly
+   * how the gap survived.
+   */
+  void it("accepts the four documented fields, with answer-box behaviour supplied by the app", () => {
+    const raw = frame({
+      version: 1,
+      correlation: correlation({ actionKey: "draft.v1" }),
+      kind: "questions",
+      questions: [
+        {
+          questionId: "security-scope",
+          kind: "text",
+          prompt:
+            "What web app, repository, or specific feature should be secured, and are there known vulnerabilities or security requirements to address?",
+          required: true,
+        },
+      ],
+    });
+
+    const result = parseAiResultEnvelopeV1(raw, correlation({ actionKey: "draft.v1" }));
+    assert.equal(result.kind, "questions", "a model asking for clarification must not be rejected");
+    if (result.kind === "questions") {
+      const q = result.questions[0];
+      assert.equal(q?.questionId, "security-scope");
+      if (q?.kind === "text") {
+        assert.equal(q.allowBlank, false, "required question => blank is not an answer");
+        assert.equal(q.maxLength, DEFAULT_TEXT_ANSWER_MAX_LENGTH_V1, "the app owns the box size");
+      }
+    }
+  });
+
+  void it("preserves both fields when they ARE present, so a persisted question set round-trips", () => {
+    // The replay path: a stored transaction's questionSetSha256 is computed
+    // over the canonical questions, so decoding must not substitute values.
+    const raw = frame({
+      version: 1,
+      correlation: correlation(),
+      kind: "questions",
+      questions: [
+        {
+          questionId: "q1",
+          kind: "text",
+          prompt: "Which module?",
+          required: true,
+          allowBlank: true,
+          maxLength: 200,
+        },
+      ],
+    });
+    const result = parseAiResultEnvelopeV1(raw, correlation());
+    assert.equal(result.kind, "questions");
+    if (result.kind === "questions") {
+      const q = result.questions[0];
+      if (q?.kind === "text") {
+        assert.equal(q.allowBlank, true, "a stored value must survive the round-trip");
+        assert.equal(q.maxLength, 200);
+      }
+    }
   });
 });
