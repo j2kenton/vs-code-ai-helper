@@ -510,11 +510,12 @@ function parseStrictJsonV1(text: string): StrictJsonParseResult {
     skipWs();
     if (i !== len) {
       // A COMPLETE value followed only by surplus closers/whitespace is
-      // recoverable; anything else is not. Four providers (Copilot, Codex,
-      // Cline) were observed emitting one extra `}` after an otherwise
-      // perfect envelope — brace-miscounting at the end of a long escaped
-      // Markdown string — and ~9-13KB of correct work was discarded over one
-      // character. See the caller, which decides whether to accept this.
+      // recoverable; anything else is not. THREE of the four providers in the
+      // spool corpus (Copilot, Codex, Cline) were observed emitting one extra
+      // `}` after an otherwise perfect envelope — brace-miscounting at the end
+      // of a long escaped Markdown string — and ~9-13KB of correct work was
+      // discarded over one character. See the caller, which decides whether to
+      // accept this.
       //
       // Safe because the value is already whole: this cannot admit a
       // truncated payload (that fails inside parseValue), a second value, or

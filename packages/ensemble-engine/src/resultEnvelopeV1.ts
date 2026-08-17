@@ -169,6 +169,13 @@ const STABLE_ID_PATTERN_V1 = /^[\x21-\x7E]{1,128}$/;
 const LONE_SURROGATE_PATTERN_V1 =
   /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?:^|[^\uD800-\uDBFF])[\uDC00-\uDFFF]/;
 
+/**
+ * Trailing characters that cannot change the meaning of an already-complete
+ * JSON value: surplus closing brackets and whitespace, nothing else. Kept
+ * byte-identical to the extension's copy in `src/types/aiResultEnvelope.ts`.
+ */
+const INERT_TRAILING_PATTERN_V1 = /^[\s\]}]{1,8}$/;
+
 function utf8ByteLength(text: string): number {
   return Buffer.byteLength(text, "utf8");
 }
@@ -199,6 +206,8 @@ function malformed(
 interface StrictJsonParseOk {
   readonly ok: true;
   readonly value: unknown;
+  /** Inert surplus ignored after a COMPLETE value — see INERT_TRAILING_PATTERN_V1. */
+  readonly inertTrailing: string;
 }
 interface StrictJsonParseErr {
   readonly ok: false;
@@ -461,9 +470,20 @@ function parseStrictJsonV1(text: string): StrictJsonParseResult {
     const value = parseValue(0);
     skipWs();
     if (i !== len) {
-      return { ok: false, reason: `unexpected trailing content at position ${i}` };
+      // Ported from `src/types/aiResultEnvelope.ts` (2026-08-17): a COMPLETE
+      // value followed only by surplus closers/whitespace is recoverable.
+      // Three of the four providers in the spool corpus emit one extra `}`
+      // after an otherwise perfect envelope, discarding 9-13KB of finished
+      // work over one character. Safe because the value is already whole:
+      // truncation fails inside parseValue, and `{`, `[`, a digit, a quote or
+      // a letter all fall outside the inert set and still reject.
+      const rest = text.slice(i);
+      if (!INERT_TRAILING_PATTERN_V1.test(rest)) {
+        return { ok: false, reason: `unexpected trailing content at position ${i}` };
+      }
+      return { ok: true, value, inertTrailing: rest };
     }
-    return { ok: true, value };
+    return { ok: true, value, inertTrailing: "" };
   } catch (error) {
     return {
       ok: false,

@@ -597,7 +597,7 @@ function assertExactNameSet(actualNames, expectedNames, message, failures) {
 const QUESTION_VARIANT_SHAPES = {
   text: {
     properties: ["questionId", "kind", "prompt", "helpText", "required", "allowBlank", "maxLength"],
-    required: ["questionId", "kind", "prompt", "required", "allowBlank", "maxLength"],
+    required: ["questionId", "kind", "prompt", "required"],
   },
   singleChoice: {
     properties: ["questionId", "kind", "prompt", "helpText", "required", "options"],

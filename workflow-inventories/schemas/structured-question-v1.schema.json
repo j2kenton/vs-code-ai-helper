@@ -20,7 +20,7 @@
           "allowBlank": { "type": "boolean" },
           "maxLength": { "type": "integer", "minimum": 0 }
         },
-        "required": ["questionId", "kind", "prompt", "required", "allowBlank", "maxLength"],
+        "required": ["questionId", "kind", "prompt", "required"],
         "additionalProperties": false
       },
       {

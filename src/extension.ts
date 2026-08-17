@@ -101,6 +101,7 @@ import { readTaskProgressStrictV1 } from "./services/taskProgressReaderV1";
 import { IncompleteTask } from "./types/incompleteTask";
 import { getModelSettings, installAutoImplementConfirmation, migrateEnabledProvidersForExistingModels, migrateSettingsNamespace, migrateSettingsScope } from "./config/settings";
 import { setExtensionContextV1 } from "./utils/extensionContextV1";
+import { setInertTrailingObserverV1 } from "./types/aiResultEnvelope";
 
 /**
  * Run an orchestrator call that throws `ActionConversationErrorV1` on
@@ -160,6 +161,21 @@ class CurrentTaskDecorationProvider implements vscode.FileDecorationProvider {
 export function activate(context: vscode.ExtensionContext): void {
   console.log("Ensemble is now active!");
   setExtensionContextV1(context);
+
+  // The envelope parser recovers a complete payload followed by surplus
+  // closing braces (three of four observed providers miscount them at the end
+  // of a long escaped Markdown string, discarding 9-13KB of finished work over
+  // one character). That tolerance must never be silent: an unreported
+  // leniency would hide a genuinely new malformation behind a known one. This
+  // is the production sink the parser's seam exists for — sanitized by
+  // construction, since the reported value can only be whitespace and closing
+  // brackets, never payload content.
+  setInertTrailingObserverV1((inertTrailing) => {
+    console.warn(
+      "[ensemble:aiResult] recovered a payload with surplus trailing closers",
+      JSON.stringify({ inertTrailing, byteLength: inertTrailing.length })
+    );
+  });
 
   // --- View provider registrations come first, before any other activation
   // work below (migrations, recovery scans, the command-registration flood,
