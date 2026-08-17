@@ -122,7 +122,7 @@ export function createReadToolSessionHandlerV1(
     }
     const relativePath = decoded.input.relativePath;
 
-    if (tool === "ensemble.readFile") {
+    if (tool === "ensemble_readFile") {
       const read = await view.readFileBounded(locator(relativePath), MAX_READ_FILE_BYTES_V1);
       if (read.kind === "unavailable") {
         return errorResult(callId, tool, "pathUnsafe", read.code);
@@ -163,7 +163,7 @@ export function createReadToolSessionHandlerV1(
       };
     }
 
-    if (tool === "ensemble.stat") {
+    if (tool === "ensemble_stat") {
       const stat = await view.stat(locator(relativePath));
       if (stat.kind === "unavailable") {
         return errorResult(callId, tool, "pathUnsafe", stat.code);
@@ -192,7 +192,7 @@ export function createReadToolSessionHandlerV1(
       return { ok: true, tool, ...refOf(record) };
     }
 
-    // ensemble.readDirectory
+    // ensemble_readDirectory
     const listing = await view.listDirectoryBounded(locator(relativePath), MAX_DIRECTORY_ENTRIES_V1);
     if (listing.kind === "unavailable") {
       return errorResult(callId, tool, "pathUnsafe", listing.code);
@@ -267,11 +267,11 @@ export function createReadToolSessionHandlerV1(
     const decoded = decodeFindFilesToolInputV1(rawInput);
     if (!decoded.ok) {
       violations.record();
-      return errorResult(callId, "ensemble.findFiles", "invalidInput", decoded.reason);
+      return errorResult(callId, "ensemble_findFiles", "invalidInput", decoded.reason);
     }
     if (decoded.input.rootId !== rootId) {
       violations.record();
-      return errorResult(callId, "ensemble.findFiles", "unknownRoot", "this session exposes a single registered root");
+      return errorResult(callId, "ensemble_findFiles", "unknownRoot", "this session exposes a single registered root");
     }
     const needle = decoded.input.pathContains.toLowerCase();
     const cap = Math.min(decoded.input.maxResults ?? MAX_FIND_RESULTS_V1, MAX_FIND_RESULTS_V1);
@@ -305,7 +305,7 @@ export function createReadToolSessionHandlerV1(
     });
     return {
       ok: true,
-      tool: "ensemble.findFiles",
+      tool: "ensemble_findFiles",
       ...refOf(record),
       matches,
       ...(complete ? {} : { truncated: true }),
@@ -316,11 +316,11 @@ export function createReadToolSessionHandlerV1(
     const decoded = decodeTextSearchToolInputV1(rawInput);
     if (!decoded.ok) {
       violations.record();
-      return errorResult(callId, "ensemble.textSearch", "invalidInput", decoded.reason);
+      return errorResult(callId, "ensemble_textSearch", "invalidInput", decoded.reason);
     }
     if (decoded.input.rootId !== rootId) {
       violations.record();
-      return errorResult(callId, "ensemble.textSearch", "unknownRoot", "this session exposes a single registered root");
+      return errorResult(callId, "ensemble_textSearch", "unknownRoot", "this session exposes a single registered root");
     }
     const query = decoded.input.query;
     const cap = Math.min(decoded.input.maxResults ?? MAX_TEXT_SEARCH_RESULTS_V1, MAX_TEXT_SEARCH_RESULTS_V1);
@@ -373,7 +373,7 @@ export function createReadToolSessionHandlerV1(
     });
     return {
       ok: true,
-      tool: "ensemble.textSearch",
+      tool: "ensemble_textSearch",
       ...refOf(record),
       matches,
       ...(complete ? {} : { truncated: true }),
@@ -387,9 +387,9 @@ export function createReadToolSessionHandlerV1(
       if (!(READ_TOOL_NAMES_V1 as readonly string[]).includes(call.name)) {
         violations.record();
         result = errorResult(call.callId, call.name, "unknownTool", "not a preflight read tool");
-      } else if (call.name === "ensemble.findFiles") {
+      } else if (call.name === "ensemble_findFiles") {
         result = await handleFindFiles(call.callId, call.input);
-      } else if (call.name === "ensemble.textSearch") {
+      } else if (call.name === "ensemble_textSearch") {
         result = await handleTextSearch(call.callId, call.input);
       } else {
         result = await handleExactPath(call.name as ReadToolNameV1, call.callId, call.input);

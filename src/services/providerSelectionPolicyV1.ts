@@ -156,6 +156,17 @@ export interface RecordedAttemptOutcomeV1 {
   readonly modelId?: string;
   readonly runnerId?: string;
   readonly outcome?: AttemptOutcomeKindV1;
+  /**
+   * Sanitized cause for outcomes whose closed kind cannot express WHY.
+   *
+   * `AttemptOutcomeKindV1` is deliberately a closed set, so a chain-exhaustion
+   * report could only ever say "the transport failed before any response
+   * arrived" - true, but not actionable, and it was the entire user-facing
+   * evidence for a Copilot edit session that could never succeed. The detail
+   * originates in the transport that caught the throw and is carried here
+   * verbatim so the per-candidate reason can name the real fault.
+   */
+  readonly detail?: string;
 }
 
 export interface ProviderSelectionSessionV1 {
@@ -173,7 +184,11 @@ export interface ProviderSelectionSessionV1 {
   /** Claim a reservation exactly once for invocation. */
   claim(reservationId: ReservationIdV1): ClaimedReservationV1;
   /** Record an attempt's settlement exactly once; a terminal outcome closes the session. */
-  reportAttemptOutcome(attemptId: AttemptIdV1, outcome: AttemptOutcomeKindV1): void;
+  reportAttemptOutcome(
+    attemptId: AttemptIdV1,
+    outcome: AttemptOutcomeKindV1,
+    detail?: string
+  ): void;
   /** True once a terminal outcome has been reported — no further attempts or reservations. */
   isTerminated(): boolean;
   /**
@@ -188,6 +203,7 @@ interface AttemptStateV1 {
   readonly attemptId: AttemptIdV1;
   reservation: ReservationStateV1 | undefined;
   outcome: AttemptOutcomeKindV1 | undefined;
+  detail: string | undefined;
 }
 
 interface ReservationStateV1 {
@@ -285,7 +301,12 @@ export function openProviderSelectionSessionV1(
       }
       const attemptId = pendingFirstAttemptId ?? allocateHex128IdV1();
       pendingFirstAttemptId = undefined;
-      const state: AttemptStateV1 = { attemptId, reservation: undefined, outcome: undefined };
+      const state: AttemptStateV1 = {
+        attemptId,
+        reservation: undefined,
+        outcome: undefined,
+        detail: undefined,
+      };
       attempts.push(state);
       attemptsById.set(attemptId, state);
       return attemptId;
@@ -370,7 +391,11 @@ export function openProviderSelectionSessionV1(
       };
     },
 
-    reportAttemptOutcome(attemptId: AttemptIdV1, outcome: AttemptOutcomeKindV1): void {
+    reportAttemptOutcome(
+      attemptId: AttemptIdV1,
+      outcome: AttemptOutcomeKindV1,
+      detail?: string
+    ): void {
       const attempt = requireAttempt(attemptId);
       if (attempt.outcome !== undefined) {
         throw new ProviderSelectionPolicyErrorV1(
@@ -379,6 +404,7 @@ export function openProviderSelectionSessionV1(
         );
       }
       attempt.outcome = outcome;
+      attempt.detail = detail;
       if (!FALLBACK_ELIGIBLE_ATTEMPT_OUTCOMES_V1.has(outcome)) {
         terminated = true;
       }
@@ -398,6 +424,7 @@ export function openProviderSelectionSessionV1(
             }
           : {}),
         ...(attempt.outcome !== undefined ? { outcome: attempt.outcome } : {}),
+        ...(attempt.detail !== undefined ? { detail: attempt.detail } : {}),
       }));
     },
   };

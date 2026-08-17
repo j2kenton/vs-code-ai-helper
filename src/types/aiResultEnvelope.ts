@@ -720,15 +720,30 @@ function decodePreflightOperation(
   if (decodedBytes.toString("base64") !== raw.contentBase64) {
     return `write operation ${stepId} has non-canonical "contentBase64"`;
   }
-  if (typeof raw.decodedByteLength !== "number" || raw.decodedByteLength !== decodedBytes.length) {
-    return `write operation ${stepId} has a "decodedByteLength" that does not match its content`;
-  }
-  if (typeof raw.contentSha256 !== "string" || !/^[0-9a-f]{64}$/.test(raw.contentSha256)) {
-    return `write operation ${stepId} is missing a valid "contentSha256"`;
+  // `decodedByteLength`/`contentSha256` are DERIVED from `contentBase64`, not
+  // required from the author. Both were mandatory, and a model cannot compute
+  // a SHA-256 of bytes it is itself authoring — on 2026-08-17 Copilot returned
+  // an otherwise perfect plan (correct digests, root, observation, parent
+  // chain, and the complete file) with `"contentSha256":"placeholder"`, and
+  // the whole run was rejected as malformed. The demanded value was redundant
+  // anyway: the host recomputes it from the decoded bytes and compares, so
+  // `contentBase64` was always the authority.
+  //
+  // Still verified WHEN SUPPLIED, so a client that can compute them keeps the
+  // integrity check against a truncated or altered payload.
+  if (raw.decodedByteLength !== undefined) {
+    if (typeof raw.decodedByteLength !== "number" || raw.decodedByteLength !== decodedBytes.length) {
+      return `write operation ${stepId} has a "decodedByteLength" that does not match its content`;
+    }
   }
   const actualSha256 = createHash("sha256").update(decodedBytes).digest("hex");
-  if (actualSha256 !== raw.contentSha256) {
-    return `write operation ${stepId} has a "contentSha256" that does not match its content`;
+  if (raw.contentSha256 !== undefined) {
+    if (typeof raw.contentSha256 !== "string" || !/^[0-9a-f]{64}$/.test(raw.contentSha256)) {
+      return `write operation ${stepId} has a malformed "contentSha256"`;
+    }
+    if (actualSha256 !== raw.contentSha256) {
+      return `write operation ${stepId} has a "contentSha256" that does not match its content`;
+    }
   }
   const unknownField = rejectUnknownFields(
     raw,
@@ -744,7 +759,12 @@ function decodePreflightOperation(
   return {
     stepId, kind, rootId: raw.rootId, relativePath: raw.relativePath,
     targetObservationId: raw.targetObservationId, parentChain,
-    contentBase64: raw.contentBase64, decodedByteLength: raw.decodedByteLength, contentSha256: raw.contentSha256,
+    // Always the host-derived values, so every downstream consumer (sealing,
+    // receipts, the execution script) sees bytes that provably match
+    // `contentBase64` rather than whatever the author claimed.
+    contentBase64: raw.contentBase64,
+    decodedByteLength: decodedBytes.length,
+    contentSha256: actualSha256,
   };
 }
 

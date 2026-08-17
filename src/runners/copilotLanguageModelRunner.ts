@@ -14,6 +14,7 @@ import {
   AgentExecutionRequestV1,
   AgentTransportExitV1,
   AgentTransportV1,
+  boundedTransportDetailV1,
   BoundedResultWriterV1,
 } from "../types/agentExecutionV1";
 import { withAttribution, writeTextFile } from "../utils/fileUtils";
@@ -70,11 +71,19 @@ export function createCopilotLmTextTransportV1(options: {
             break;
           }
         }
-      } catch {
+      } catch (error) {
         if (request.cancellationToken.isCancellationRequested) {
           return { kind: "callerCancelled" };
         }
-        return { kind: "transportFailure", code: "copilotRequestFailed" };
+        // See the identical site in languageModelToolSessionV1.ts: this was a
+        // bare `catch {}`, so whatever `sendRequest` threw was unrecoverable
+        // and the run record settled at 74 bytes with nothing but a code.
+        const detail = boundedTransportDetailV1(error);
+        return {
+          kind: "transportFailure",
+          code: "copilotRequestFailed",
+          ...(detail !== undefined ? { detail } : {}),
+        };
       }
       if (request.cancellationToken.isCancellationRequested) {
         return { kind: "callerCancelled" };

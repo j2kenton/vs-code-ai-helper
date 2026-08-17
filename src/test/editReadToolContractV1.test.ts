@@ -63,7 +63,7 @@ void describe("editReadToolContractV1 — read session", () => {
   void it("readFile returns content plus a file observation; a missing path mints a missing observation", async () => {
     const h = installHarness();
     try {
-      const read = await h.call("ensemble.readFile", { rootId: ROOT_ID, relativePath: "src/app.ts" });
+      const read = await h.call("ensemble_readFile", { rootId: ROOT_ID, relativePath: "src/app.ts" });
       assert.equal(read.ok, true);
       if (read.ok) {
         assert.equal(read.kind, "file");
@@ -74,7 +74,7 @@ void describe("editReadToolContractV1 — read session", () => {
         assert.equal(record?.relativePath, "src/app.ts");
       }
 
-      const missing = await h.call("ensemble.readFile", { rootId: ROOT_ID, relativePath: "src/none.ts" });
+      const missing = await h.call("ensemble_readFile", { rootId: ROOT_ID, relativePath: "src/none.ts" });
       assert.equal(missing.ok, true);
       if (missing.ok) {
         assert.equal(missing.kind, "missing");
@@ -89,7 +89,7 @@ void describe("editReadToolContractV1 — read session", () => {
   void it("stat marks directories as existence facts; readDirectory mints the complete-listing proof", async () => {
     const h = installHarness();
     try {
-      const statDir = await h.call("ensemble.stat", { rootId: ROOT_ID, relativePath: "empty" });
+      const statDir = await h.call("ensemble_stat", { rootId: ROOT_ID, relativePath: "empty" });
       assert.equal(statDir.ok, true);
       if (statDir.ok) {
         assert.equal(statDir.kind, "directory");
@@ -97,7 +97,7 @@ void describe("editReadToolContractV1 — read session", () => {
         assert.equal(h.ledger.get(statDir.observationId)?.source, "stat");
       }
 
-      const listing = await h.call("ensemble.readDirectory", { rootId: ROOT_ID, relativePath: "empty" });
+      const listing = await h.call("ensemble_readDirectory", { rootId: ROOT_ID, relativePath: "empty" });
       assert.equal(listing.ok, true);
       if (listing.ok) {
         assert.equal(listing.kind, "directory");
@@ -107,7 +107,7 @@ void describe("editReadToolContractV1 — read session", () => {
         assert.deepEqual(h.ledger.get(listing.observationId)?.entryNames, []);
       }
 
-      const rootListing = await h.call("ensemble.readDirectory", { rootId: ROOT_ID, relativePath: "." });
+      const rootListing = await h.call("ensemble_readDirectory", { rootId: ROOT_ID, relativePath: "." });
       assert.equal(rootListing.ok, true);
       if (rootListing.ok) {
         const names = (rootListing.entries ?? []).map((entry) => entry.name).sort();
@@ -121,7 +121,7 @@ void describe("editReadToolContractV1 — read session", () => {
   void it("findFiles discovers by path substring, skips node_modules, and marks its observation as discovery", async () => {
     const h = installHarness();
     try {
-      const found = await h.call("ensemble.findFiles", { rootId: ROOT_ID, pathContains: "app" });
+      const found = await h.call("ensemble_findFiles", { rootId: ROOT_ID, pathContains: "app" });
       assert.equal(found.ok, true);
       if (found.ok) {
         assert.deepEqual(found.matches?.map((m) => m.relativePath), ["src/app.ts"]);
@@ -136,7 +136,7 @@ void describe("editReadToolContractV1 — read session", () => {
   void it("textSearch returns line matches with previews and never scans node_modules", async () => {
     const h = installHarness();
     try {
-      const found = await h.call("ensemble.textSearch", { rootId: ROOT_ID, query: "const marker" });
+      const found = await h.call("ensemble_textSearch", { rootId: ROOT_ID, query: "const marker" });
       assert.equal(found.ok, true);
       if (found.ok) {
         assert.deepEqual(
@@ -154,14 +154,14 @@ void describe("editReadToolContractV1 — read session", () => {
   void it("counts violations for unknown tools, foreign roots, and undecodable input", async () => {
     const h = installHarness();
     try {
-      const unknownTool = await h.call("ensemble.writeFile", { rootId: ROOT_ID, relativePath: "x" });
+      const unknownTool = await h.call("ensemble_writeFile", { rootId: ROOT_ID, relativePath: "x" });
       assert.equal(unknownTool.ok, false);
       if (!unknownTool.ok) {
         assert.equal(unknownTool.code, "unknownTool");
       }
-      const foreignRoot = await h.call("ensemble.stat", { rootId: "other", relativePath: "x" });
+      const foreignRoot = await h.call("ensemble_stat", { rootId: "other", relativePath: "x" });
       assert.equal(foreignRoot.ok === false && foreignRoot.code, "unknownRoot");
-      const badInput = await h.call("ensemble.stat", { rootId: ROOT_ID });
+      const badInput = await h.call("ensemble_stat", { rootId: ROOT_ID });
       assert.equal(badInput.ok === false && badInput.code, "invalidInput");
       assert.equal(h.handler.violationCount(), 3);
     } finally {
@@ -172,7 +172,7 @@ void describe("editReadToolContractV1 — read session", () => {
   void it("refuses escaping paths through the safety layer", async () => {
     const h = installHarness();
     try {
-      const escape = await h.call("ensemble.readFile", { rootId: ROOT_ID, relativePath: "../secret.txt" });
+      const escape = await h.call("ensemble_readFile", { rootId: ROOT_ID, relativePath: "../secret.txt" });
       assert.equal(escape.ok, false);
       if (!escape.ok) {
         assert.equal(escape.code, "pathUnsafe");

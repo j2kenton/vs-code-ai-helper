@@ -25,6 +25,7 @@ import {
   AgentExecutionRequestV1,
   AgentTransportExitV1,
   AgentTransportV1,
+  boundedTransportDetailV1,
   BoundedResultWriterV1,
 } from "../types/agentExecutionV1";
 import {
@@ -120,11 +121,21 @@ export function createCopilotLmToolSessionTransportV1(
               return { kind: "transportFailure", code: "toolProtocolViolation" };
             }
           }
-        } catch {
+        } catch (error) {
           if (request.cancellationToken.isCancellationRequested) {
             return { kind: "callerCancelled" };
           }
-          return { kind: "transportFailure", code: "copilotRequestFailed" };
+          // Bind and carry the cause. This was a bare `catch {}`: the error
+          // object was discarded without even reaching a variable, so
+          // `copilotRequestFailed` surfaced with nothing behind it and a
+          // prompt-too-large, a quota refusal and a transient API fault were
+          // indistinguishable — each needing a different remedy.
+          const detail = boundedTransportDetailV1(error);
+          return {
+            kind: "transportFailure",
+            code: "copilotRequestFailed",
+            ...(detail !== undefined ? { detail } : {}),
+          };
         }
 
         if (!sawToolCall) {

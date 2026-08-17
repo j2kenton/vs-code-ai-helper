@@ -86,6 +86,8 @@ export type RawAgentExecutionResultV1 =
        * outcomes").
        */
       readonly responseStarted: boolean;
+      /** Sanitized cause carried through from the transport — see `AgentTransportExitV1`. */
+      readonly detail?: string;
     }
   | { readonly kind: "overflow" };
 
@@ -106,7 +108,53 @@ export type AgentTransportExitV1 =
   | { readonly kind: "completed" }
   | { readonly kind: "providerCancelled" }
   | { readonly kind: "callerCancelled" }
-  | { readonly kind: "transportFailure"; readonly code: string };
+  | {
+      readonly kind: "transportFailure";
+      readonly code: string;
+      /**
+       * Sanitized, bounded description of what actually went wrong, when the
+       * transport knows it.
+       *
+       * Optional because not every exit has more to say than its code — but a
+       * transport that catches a thrown error MUST populate it. Two sites
+       * previously used a bare `catch {}`, discarding the error object
+       * entirely, so `copilotRequestFailed` reached the user with no
+       * recoverable cause: prompt too large, quota, and a transient API fault
+       * were indistinguishable, each with a different remedy. Diagnosing one
+       * such failure on 2026-08-16 required reading four source files and
+       * still ended in a guess.
+       *
+       * Sanitized per §2.2: a short message, never headers, payload, or key
+       * material — see `boundedTransportDetailV1`.
+       */
+      readonly detail?: string;
+    };
+
+/**
+ * Flatten a caught error into a short, single-line cause for
+ * `transportFailure.detail`.
+ *
+ * Mirrors `boundedDiagnosticDetailV1` in taskActionCoordinatorV1.ts — same
+ * flatten-and-cap discipline, kept here because this is where the field it
+ * fills is declared and because a transport should not have to import from
+ * the action coordinator to report its own failure. Takes `unknown` since
+ * every call site is a `catch` binding.
+ */
+export function boundedTransportDetailV1(error: unknown, maxChars = 200): string | undefined {
+  const raw =
+    error instanceof Error
+      ? error.message
+      : typeof error === "string"
+        ? error
+        : error === undefined || error === null
+          ? ""
+          : String(error);
+  const flattened = raw.replace(/\s+/g, " ").trim();
+  if (flattened.length === 0) {
+    return undefined;
+  }
+  return flattened.length > maxChars ? `${flattened.slice(0, maxChars - 1)}…` : flattened;
+}
 
 /**
  * The V1 runner surface: stream the provider's framed result into the

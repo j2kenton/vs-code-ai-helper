@@ -949,7 +949,18 @@ interface UnsealedResponseRefV1 {
  * union — kinds only, never provider text — so §2.2's sanitized-outcome rule
  * holds by construction.
  */
-function attemptOutcomeReasonTextV1(outcome: AttemptOutcomeKindV1): string {
+function attemptOutcomeReasonTextV1(
+  outcome: AttemptOutcomeKindV1,
+  detail?: string
+): string {
+  // The closed kind says WHAT happened; `detail` is the only place the actual
+  // fault can appear (see RecordedAttemptOutcomeV1.detail). Appended rather
+  // than substituted so the stable phrase stays greppable in older records.
+  const suffix = detail !== undefined && detail.length > 0 ? ` - ${detail}` : "";
+  return attemptOutcomeReasonPhraseV1(outcome) + suffix;
+}
+
+function attemptOutcomeReasonPhraseV1(outcome: AttemptOutcomeKindV1): string {
   switch (outcome) {
     case "completed":
       return "invoked and completed";
@@ -1004,7 +1015,10 @@ function enrichChainExhaustionWithAttemptOutcomesV1(
     if (attempt?.modelId === candidate.storedModelId) {
       cursor++;
       if (attempt.outcome !== undefined) {
-        return { ...candidate, reason: attemptOutcomeReasonTextV1(attempt.outcome) };
+        return {
+          ...candidate,
+          reason: attemptOutcomeReasonTextV1(attempt.outcome, attempt.detail),
+        };
       }
     }
     return candidate;
@@ -1458,10 +1472,20 @@ export function createTaskActionCoordinatorV1(
           return { kind: "malformedResult", correlation, code: "resultLimitExceeded" };
         case "transportFailure":
           if (raw.responseStarted) {
-            session.reportAttemptOutcome(attemptId, "transportFailureResponseStarted");
-            return { kind: "failed", correlation, code: raw.code, retryable: false };
+            session.reportAttemptOutcome(
+              attemptId,
+              "transportFailureResponseStarted",
+              raw.detail
+            );
+            return {
+              kind: "failed",
+              correlation,
+              code: raw.code,
+              retryable: false,
+              ...(raw.detail !== undefined ? { detail: raw.detail } : {}),
+            };
           }
-          session.reportAttemptOutcome(attemptId, "transportFailurePreResponse");
+          session.reportAttemptOutcome(attemptId, "transportFailurePreResponse", raw.detail);
           // Pre-response failure is the fallback-eligible case: loop for the
           // next registry-ranked candidate with a fresh attempt and an
           // explicit next reservation — UNLESS the malformed-result budget
@@ -1471,7 +1495,15 @@ export function createTaskActionCoordinatorV1(
           // (the last malformed outcome, if this row produced one) instead
           // of masking it behind an unbounded transport-failure walk.
           if (malformedBudgetArmedV1 && malformedInvocationCountV1 >= MAX_MALFORMED_RESULT_INVOCATIONS_V1) {
-            return lastMalformedOutcomeV1 ?? { kind: "failed", correlation, code: raw.code, retryable: true };
+            return (
+              lastMalformedOutcomeV1 ?? {
+                kind: "failed",
+                correlation,
+                code: raw.code,
+                retryable: true,
+                ...(raw.detail !== undefined ? { detail: raw.detail } : {}),
+              }
+            );
           }
           continue;
         case "response":

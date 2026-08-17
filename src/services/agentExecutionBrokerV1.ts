@@ -336,6 +336,10 @@ async function finishInvocation(
         kind: "transportFailure",
         code: exit.code,
         responseStarted: writer.bytesWritten > 0,
+        // Pass the transport's sanitized cause through verbatim. Dropping it
+        // here would defeat the point of capturing it: the code alone is what
+        // made `copilotRequestFailed` undiagnosable.
+        ...(exit.detail !== undefined ? { detail: exit.detail } : {}),
       };
   }
 }

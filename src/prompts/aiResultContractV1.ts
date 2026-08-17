@@ -59,8 +59,20 @@ const CONTENT_TYPE_SHAPE_HINTS_V1: Readonly<Record<CompletedContentTypeNameV1, s
     '{"contentType":"chat-message.v1","schemaVersion":1,"text":"<the assistant chat message>"}',
   "commit-metadata.v1":
     '{"contentType":"commit-metadata.v1","schemaVersion":1,"subject":"<Conventional-Commits subject, at most 72 characters>","body":"<optional body>"}',
+  // Literal rather than elliptical: `"operations":[...]` told the model
+  // nothing about the operation shape, and the same ellipsis style on the
+  // questions contract is what produced a live contentSchemaMismatch. The
+  // identifiers below come from the session preamble; the example is a
+  // structurally valid plan if the placeholders are substituted.
   "preflight-plan.v1":
-    '{"contentType":"preflight-plan.v1","schemaVersion":1,"requestDigest":"...","rootBindingId":"...","operations":[...]}',
+    '{"contentType":"preflight-plan.v1","schemaVersion":1,' +
+    '"requestDigest":"<requestDigest from the preamble>",' +
+    '"rootBindingId":"<rootBindingId from the preamble>",' +
+    '"operations":[{"stepId":"step-1","kind":"replaceFile",' +
+    '"rootId":"<rootId from the preamble>","relativePath":"src/example.ts",' +
+    '"targetObservationId":"<observationId returned when you read that path>",' +
+    '"parentChain":[{"kind":"observed","observationId":"<observationId for src>"}],' +
+    '"contentBase64":"<base64 of the complete new file>"}]}',
   "edit-execution.v1":
     '{"contentType":"edit-execution.v1","schemaVersion":1,"executionId":"...","planId":"...","planDigest":"...","receiptIds":[...]}',
 };

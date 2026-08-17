@@ -80,12 +80,12 @@ export function toolForOperationKindV1(kind: PreflightOperationKindV1): EditTool
   switch (kind) {
     case "createFile":
     case "replaceFile":
-      return "ensemble.writeFile";
+      return "ensemble_writeFile";
     case "createDirectory":
-      return "ensemble.createDirectory";
+      return "ensemble_createDirectory";
     case "deleteFile":
     case "deleteEmptyDirectory":
-      return "ensemble.deletePath";
+      return "ensemble_deletePath";
   }
 }
 

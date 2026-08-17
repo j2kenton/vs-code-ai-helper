@@ -34,11 +34,11 @@ function operationOf(
 
 void describe("editExecutionScriptV1", () => {
   void it("maps every operation kind to its fixed §7.4 tool", () => {
-    assert.equal(toolForOperationKindV1("createFile"), "ensemble.writeFile");
-    assert.equal(toolForOperationKindV1("replaceFile"), "ensemble.writeFile");
-    assert.equal(toolForOperationKindV1("createDirectory"), "ensemble.createDirectory");
-    assert.equal(toolForOperationKindV1("deleteFile"), "ensemble.deletePath");
-    assert.equal(toolForOperationKindV1("deleteEmptyDirectory"), "ensemble.deletePath");
+    assert.equal(toolForOperationKindV1("createFile"), "ensemble_writeFile");
+    assert.equal(toolForOperationKindV1("replaceFile"), "ensemble_writeFile");
+    assert.equal(toolForOperationKindV1("createDirectory"), "ensemble_createDirectory");
+    assert.equal(toolForOperationKindV1("deleteFile"), "ensemble_deletePath");
+    assert.equal(toolForOperationKindV1("deleteEmptyDirectory"), "ensemble_deletePath");
   });
 
   void it("authors steps in plan order and carries NO paths, bytes, preconditions, or observations", () => {
@@ -48,9 +48,9 @@ void describe("editExecutionScriptV1", () => {
       operationOf("s3", "deleteFile", "src/old.ts"),
     ]);
     assert.deepEqual(script.steps, [
-      { stepId: "s1", tool: "ensemble.createDirectory" },
-      { stepId: "s2", tool: "ensemble.writeFile" },
-      { stepId: "s3", tool: "ensemble.deletePath" },
+      { stepId: "s1", tool: "ensemble_createDirectory" },
+      { stepId: "s2", tool: "ensemble_writeFile" },
+      { stepId: "s3", tool: "ensemble_deletePath" },
     ]);
     const serialized = JSON.stringify(script);
     assert.ok(!serialized.includes("src/"), "the script must never contain a path");

@@ -16,18 +16,18 @@
 import { ObservationRefV1 } from "./preflightPlanV1";
 
 export const READ_TOOL_NAMES_V1 = [
-  "ensemble.readFile",
-  "ensemble.stat",
-  "ensemble.readDirectory",
-  "ensemble.findFiles",
-  "ensemble.textSearch",
+  "ensemble_readFile",
+  "ensemble_stat",
+  "ensemble_readDirectory",
+  "ensemble_findFiles",
+  "ensemble_textSearch",
 ] as const;
 export type ReadToolNameV1 = (typeof READ_TOOL_NAMES_V1)[number];
 
 export const EDIT_TOOL_NAMES_V1 = [
-  "ensemble.writeFile",
-  "ensemble.createDirectory",
-  "ensemble.deletePath",
+  "ensemble_writeFile",
+  "ensemble_createDirectory",
+  "ensemble_deletePath",
 ] as const;
 export type EditToolNameV1 = (typeof EDIT_TOOL_NAMES_V1)[number];
 
@@ -216,6 +216,45 @@ interface LmToolDescriptorV1 {
   readonly inputSchema: Record<string, unknown>;
 }
 
+/**
+ * The only characters a tool name may contain.
+ *
+ * This is not our rule — it is the host's. GitHub Copilot Chat rewrites every
+ * declared tool name with `name.replace(/[^a-zA-Z0-9_-]/gu, "_")` before the
+ * request leaves VS Code, and validates ids against `/^[a-zA-Z0-9_-]+$/u`.
+ * These tools were originally named `ensemble.readFile` and friends, so the
+ * model was offered `ensemble_readFile` and called it back by that name,
+ * while `handleToolCall` matched the inbound name against the DOTTED list —
+ * meaning every single tool call landed on the `unknownTool` branch and no
+ * Copilot tool session could ever read a file. The dot was invisible in our
+ * own logs because the name we recorded was always the one we declared, not
+ * the one that crossed the boundary.
+ *
+ * Naming the tools in the host's own charset makes the rewrite a no-op, so
+ * the declared name and the returned name are identical by construction.
+ */
+const LM_TOOL_NAME_CHARSET_V1 = /^[a-zA-Z0-9_-]+$/u;
+
+/**
+ * Fail loudly at construction if a descriptor would be renamed in flight.
+ * A silent rewrite costs a whole provider's tool support, so this is checked
+ * where the descriptors are built rather than left to a reviewer's eye.
+ */
+function assertHostSafeToolNamesV1(
+  descriptors: readonly LmToolDescriptorV1[]
+): readonly LmToolDescriptorV1[] {
+  for (const descriptor of descriptors) {
+    if (!LM_TOOL_NAME_CHARSET_V1.test(descriptor.name)) {
+      throw new Error(
+        `Tool name "${descriptor.name}" contains characters the host rewrites ` +
+          `(allowed: A-Z a-z 0-9 _ -). The model would call it back under a ` +
+          `different name than the one declared here.`
+      );
+    }
+  }
+  return descriptors;
+}
+
 const EXACT_PATH_SCHEMA_V1: Record<string, unknown> = {
   type: "object",
   properties: {
@@ -228,27 +267,27 @@ const EXACT_PATH_SCHEMA_V1: Record<string, unknown> = {
 
 /** Request-local descriptors for a PREFLIGHT session — exactly the five read tools (§7.2). */
 export function readToolDescriptorsV1(): readonly LmToolDescriptorV1[] {
-  return [
+  return assertHostSafeToolNamesV1([
     {
-      name: "ensemble.readFile",
+      name: "ensemble_readFile",
       description:
         "Read one file's UTF-8 content by exact root-relative path. Returns the content plus a server-issued observation (id, revision, sha256) usable as a mutation precondition.",
       inputSchema: EXACT_PATH_SCHEMA_V1,
     },
     {
-      name: "ensemble.stat",
+      name: "ensemble_stat",
       description:
         "Stat one exact root-relative path. Returns kind (missing | file | directory), revision, and a server-issued observation usable as a mutation precondition.",
       inputSchema: EXACT_PATH_SCHEMA_V1,
     },
     {
-      name: "ensemble.readDirectory",
+      name: "ensemble_readDirectory",
       description:
         "List one directory's immediate entries (complete, never truncated). The returned observation is the only valid parent-chain / emptiness proof.",
       inputSchema: EXACT_PATH_SCHEMA_V1,
     },
     {
-      name: "ensemble.findFiles",
+      name: "ensemble_findFiles",
       description:
         "Discover files whose root-relative path contains a substring (case-insensitive). Discovery only — its observations can never authorize mutations; follow up with stat/readFile/readDirectory on exact paths.",
       inputSchema: {
@@ -263,7 +302,7 @@ export function readToolDescriptorsV1(): readonly LmToolDescriptorV1[] {
       },
     },
     {
-      name: "ensemble.textSearch",
+      name: "ensemble_textSearch",
       description:
         "Search file contents for a literal string. Discovery only — its observations can never authorize mutations; follow up with exact-path reads.",
       inputSchema: {
@@ -277,7 +316,7 @@ export function readToolDescriptorsV1(): readonly LmToolDescriptorV1[] {
         additionalProperties: false,
       },
     },
-  ];
+  ]);
 }
 
 const MUTATION_CALL_SCHEMA_V1: Record<string, unknown> = {
@@ -298,11 +337,13 @@ const MUTATION_CALL_SCHEMA_V1: Record<string, unknown> = {
  * the broker resolves the sealed operation by stepId.
  */
 export function editToolDescriptorsV1(): readonly LmToolDescriptorV1[] {
-  return EDIT_TOOL_NAMES_V1.map((name) => ({
-    name,
-    description:
-      `Execute the next sealed plan step assigned to ${name}. Arguments are reference-only ` +
-      "(executionId/planId/planDigest/stepId from the execution script); the broker holds the sealed operation.",
-    inputSchema: MUTATION_CALL_SCHEMA_V1,
-  }));
+  return assertHostSafeToolNamesV1(
+    EDIT_TOOL_NAMES_V1.map((name) => ({
+      name,
+      description:
+        `Execute the next sealed plan step assigned to ${name}. Arguments are reference-only ` +
+        "(executionId/planId/planDigest/stepId from the execution script); the broker holds the sealed operation.",
+      inputSchema: MUTATION_CALL_SCHEMA_V1,
+    }))
+  );
 }

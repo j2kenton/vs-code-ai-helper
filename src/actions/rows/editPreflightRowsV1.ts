@@ -27,6 +27,7 @@ import { maxResponseBytesCeilingForModeV1 } from "../../types/agentExecutionV1";
 import { CompletedContentV1 } from "../../types/aiResultEnvelope";
 import { validatePreflightPlanAgainstLedgerV1 } from "../../types/preflightPlanV1";
 import { getEditPlanBrokerV1 } from "../../services/workflowRuntimeServicesV1";
+import { buildPreflightToolSessionPreambleV1 } from "../../prompts/toolSessionPreambleV1";
 
 export const IMPLEMENTATION_ACTION_KEY_V1 = "implementation.v1";
 export const FAST_FORWARD_ACTION_KEY_V1 = "fastForward.v1";
@@ -164,7 +165,22 @@ function createEditPreflightRowV1(config: EditPreflightRowConfigV1): ProviderTas
     permittedResultKinds: ["completed", "questions", "cancelled", "failed"],
     completedContentType: "preflight-plan.v1",
     resumeSemantics: "sameOperation",
-    buildPrompt: (context) => (context.validatedInput as EditPreflightActionInputV1).prompt,
+    // The caller's prompt alone left the model unable to act: it names no
+    // rootId for the tools, no rootBindingId/requestDigest for the plan to
+    // echo, and never says that this phase is read-only by design. See
+    // buildPreflightToolSessionPreambleV1.
+    buildPrompt: (context): string => {
+      const input = context.validatedInput as EditPreflightActionInputV1;
+      return (
+        buildPreflightToolSessionPreambleV1({
+          rootId: input.rootId,
+          rootBindingId: input.rootBindingId,
+          requestDigest: input.requestDigest,
+        }) +
+        "\n\n" +
+        input.prompt
+      );
+    },
     promoteCompletedContent: promoteEditPreflightContentV1,
   };
 }

@@ -74,7 +74,9 @@ export function describeTaskActionOutcomeForLogV1(
     case "cancelled":
       return `Status: cancelled (${outcome.code})`;
     case "failed":
-      return `Status: failed (code=${outcome.code}, retryable=${outcome.retryable})`;
+      return `Status: failed (code=${outcome.code}${
+        outcome.detail ? `: ${outcome.detail}` : ""
+      }, retryable=${outcome.retryable})`;
     case "malformedResult":
       return `Status: malformed result (${outcome.code}${outcome.detail ? `: ${outcome.detail}` : ""})${providerLogSuffix(outcome.provider)}`;
     case "unavailable":
@@ -96,7 +98,9 @@ export function describeTaskActionOutcomeForLogV1(
 export function describeTaskActionFailureV1(outcome: TaskActionOutcomeV1): string {
   switch (outcome.kind) {
     case "failed":
-      return `${outcome.code}${outcome.retryable ? " (retryable)" : ""}`;
+      return `${outcome.code}${outcome.detail ? `: ${outcome.detail}` : ""}${
+        outcome.retryable ? " (retryable)" : ""
+      }`;
     case "malformedResult":
       return `the model's response was malformed (${outcome.code}${outcome.detail ? `: ${outcome.detail}` : ""})`;
     case "unavailable":

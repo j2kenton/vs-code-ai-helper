@@ -712,15 +712,22 @@ function decodePreflightOperation(
   if (decodedBytes.toString("base64") !== raw.contentBase64) {
     return `write operation ${stepId} has non-canonical "contentBase64"`;
   }
-  if (typeof raw.decodedByteLength !== "number" || raw.decodedByteLength !== decodedBytes.length) {
-    return `write operation ${stepId} has a "decodedByteLength" that does not match its content`;
-  }
-  if (typeof raw.contentSha256 !== "string" || !/^[0-9a-f]{64}$/.test(raw.contentSha256)) {
-    return `write operation ${stepId} is missing a valid "contentSha256"`;
+  // Derived from `contentBase64`, not required from the author — see the
+  // extension copy in src/types/aiResultEnvelope.ts for the live failure
+  // (a model cannot SHA-256 bytes it is authoring). Verified when supplied.
+  if (raw.decodedByteLength !== undefined) {
+    if (typeof raw.decodedByteLength !== "number" || raw.decodedByteLength !== decodedBytes.length) {
+      return `write operation ${stepId} has a "decodedByteLength" that does not match its content`;
+    }
   }
   const actualSha256 = createHash("sha256").update(decodedBytes).digest("hex");
-  if (actualSha256 !== raw.contentSha256) {
-    return `write operation ${stepId} has a "contentSha256" that does not match its content`;
+  if (raw.contentSha256 !== undefined) {
+    if (typeof raw.contentSha256 !== "string" || !/^[0-9a-f]{64}$/.test(raw.contentSha256)) {
+      return `write operation ${stepId} has a malformed "contentSha256"`;
+    }
+    if (actualSha256 !== raw.contentSha256) {
+      return `write operation ${stepId} has a "contentSha256" that does not match its content`;
+    }
   }
   const unknownField = rejectUnknownFields(
     raw,
@@ -748,8 +755,9 @@ function decodePreflightOperation(
     targetObservationId: raw.targetObservationId,
     parentChain,
     contentBase64: raw.contentBase64,
-    decodedByteLength: raw.decodedByteLength,
-    contentSha256: raw.contentSha256,
+    // Host-derived, so downstream consumers see bytes that provably match.
+    decodedByteLength: decodedBytes.length,
+    contentSha256: actualSha256,
   };
 }
 

@@ -106,6 +106,17 @@ export type TaskActionOutcomeV1 =
       readonly correlation?: ActionCorrelationV1;
       readonly code: string;
       readonly retryable: boolean;
+      /**
+       * Sanitized cause, when the failure knows more than its code.
+       *
+       * Mirrors `malformedResult.detail`. Added because a transport failure
+       * arrived as a bare `copilotRequestFailed` — the thrown error had been
+       * dropped by a `catch {}` with no binding — leaving prompt-too-large,
+       * quota exhaustion and a transient API fault indistinguishable, each
+       * with a different remedy. Kept as a separate field rather than
+       * appended to `code` so the code stays a stable identifier.
+       */
+      readonly detail?: string;
     }
   | {
       readonly kind: "malformedResult";

@@ -61,7 +61,7 @@ function recordingHandler(
   const calls: LmToolCallPartV1[] = [];
   return {
     calls,
-    descriptors: [{ name: "ensemble.stat", description: "stat" }],
+    descriptors: [{ name: "ensemble_stat", description: "stat" }],
     handleToolCall(call) {
       calls.push(call);
       return Promise.resolve(respond(call));
@@ -110,7 +110,7 @@ void describe("languageModelToolSessionV1", () => {
     const model = installModel([
       [
         new stubClasses.LanguageModelTextPart("thinking out loud…"),
-        new stubClasses.LanguageModelToolCallPart("call-1", "ensemble.stat", {
+        new stubClasses.LanguageModelToolCallPart("call-1", "ensemble_stat", {
           rootId: "r",
           relativePath: "a.ts",
         }),
@@ -125,7 +125,7 @@ void describe("languageModelToolSessionV1", () => {
       assert.deepEqual(exit, { kind: "completed" });
       assert.equal(writer.text(), "final answer", "interim narration must be discarded");
       assert.equal(handler.calls.length, 1);
-      assert.equal(handler.calls[0]!.name, "ensemble.stat");
+      assert.equal(handler.calls[0]!.name, "ensemble_stat");
       assert.equal(handler.calls[0]!.callId, "call-1");
       // Round 2's message list grew by the assistant parts + tool results.
       assert.deepEqual(model.requests, [1, 3]);
@@ -136,7 +136,7 @@ void describe("languageModelToolSessionV1", () => {
 
   void it("aborts with toolRoundLimitExceeded when every round keeps calling tools", async () => {
     const model = installModel([
-      [new stubClasses.LanguageModelToolCallPart("call-x", "ensemble.stat", { rootId: "r", relativePath: "a" })],
+      [new stubClasses.LanguageModelToolCallPart("call-x", "ensemble_stat", { rootId: "r", relativePath: "a" })],
     ]);
     const handler = recordingHandler(() => "{}");
     try {
