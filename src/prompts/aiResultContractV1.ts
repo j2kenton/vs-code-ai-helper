@@ -76,8 +76,8 @@ const CONTENT_TYPE_SHAPE_HINTS_V1: Readonly<Record<CompletedContentTypeNameV1, s
     '"rootId":"<rootId from the preamble>","relativePath":"src/example.ts",' +
     '"targetObservationId":"<observationId returned when you read that path>",' +
     '"parentChain":[{"kind":"observed","observationId":"<observationId for src>"}],' +
-    '"findBase64":"<base64 of the exact existing text to replace>",' +
-    '"replacementBase64":"<base64 of the new text>"}]}',
+    '"findText":"<the exact existing text to replace, copied verbatim>",' +
+    '"replacementText":"<the new text>"}]}',
   "edit-execution.v1":
     '{"contentType":"edit-execution.v1","schemaVersion":1,"executionId":"...","planId":"...","planDigest":"...","receiptIds":[...]}',
 };

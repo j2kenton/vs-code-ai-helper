@@ -239,6 +239,86 @@ void describe("parseAiResultEnvelopeV1 — preflight-plan.v1 and edit-execution.
     }
   });
 
+  void it("accepts a patchFile whose payloads are plain text and normalizes them to base64", () => {
+    // A model cannot reliably base64-encode a snippet by hand. Copilot refused
+    // an entire round rather than guess (its own `unreliable-manual-encoding`,
+    // 2026-08-18) — the right call, since a mis-encoded patch corrupts a file.
+    // Plain text in, base64 out, so the seal and the executor see exactly one
+    // representation regardless of which form the author sent.
+    const findText = "const a = 1;\n";
+    const replacementText = "const a = 2;\n";
+    const raw = frame({
+      version: 1,
+      correlation: correlation(),
+      kind: "completed",
+      content: {
+        contentType: "preflight-plan.v1",
+        schemaVersion: 1,
+        requestDigest: "digest-1",
+        rootBindingId: "root-binding-1",
+        operations: [
+          {
+            stepId: "step-1",
+            kind: "patchFile",
+            rootId: "root-1",
+            relativePath: "src/a.ts",
+            targetObservationId: "obs-file",
+            parentChain: [{ kind: "observed", observationId: "obs-src" }],
+            findText,
+            replacementText,
+          },
+        ],
+      },
+    });
+    const result = parseAiResultEnvelopeV1(raw);
+    assert.equal(result.kind, "completed");
+    if (result.kind === "completed" && result.content.contentType === "preflight-plan.v1") {
+      const op = result.content.operations[0];
+      assert.ok(op, "expected one decoded operation");
+      assert.equal(op?.findBase64, Buffer.from(findText, "utf8").toString("base64"));
+      assert.equal(op?.replacementBase64, Buffer.from(replacementText, "utf8").toString("base64"));
+      // Consumed, not carried through: one representation reaches the digest,
+      // so the same edit always seals identically however it was expressed.
+      const opFields = op as unknown as Record<string, unknown>;
+      assert.equal(opFields.findText, undefined);
+      assert.equal(opFields.replacementText, undefined);
+    } else {
+      assert.fail(`expected completed preflight-plan.v1, got: ${JSON.stringify(result)}`);
+    }
+  });
+
+  void it("rejects a patchFile that sends both the text and base64 form", () => {
+    const raw = frame({
+      version: 1,
+      correlation: correlation(),
+      kind: "completed",
+      content: {
+        contentType: "preflight-plan.v1",
+        schemaVersion: 1,
+        requestDigest: "digest-1",
+        rootBindingId: "root-binding-1",
+        operations: [
+          {
+            stepId: "step-1",
+            kind: "patchFile",
+            rootId: "root-1",
+            relativePath: "src/a.ts",
+            targetObservationId: "obs-file",
+            parentChain: [],
+            findText: "a",
+            findBase64: "YQ==",
+            replacementText: "b",
+          },
+        ],
+      },
+    });
+    const result = parseAiResultEnvelopeV1(raw);
+    assert.equal(result.kind, "malformed");
+    if (result.kind === "malformed") {
+      assert.match(result.reason, /must not set both "findBase64" and "findText"/);
+    }
+  });
+
   void it("rejects a createdByStep link that references a later step", () => {
     const raw = frame({
       version: 1,

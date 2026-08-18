@@ -1852,11 +1852,24 @@ export function createTaskActionCoordinatorV1(
       }
       case "failed": {
         session.reportAttemptOutcome(attemptId, "providerDeclaredFailure");
+        // The model's own explanation was previously DISCARDED — only its
+        // invented code survived. On 2026-08-18 a Copilot round failed with
+        // `unreliable-manual-encoding` and nothing else, when the envelope
+        // also carried a message saying precisely what it could not do. A
+        // provider-declared failure is the one case where the model is
+        // telling us the diagnosis directly, so throwing it away is the
+        // worst possible place to lose text.
+        //
+        // Bounded and sanitized like every other detail: §2.2 bars the
+        // model's free-form REPLY from a settled outcome, and this is a
+        // short self-diagnosis in a closed envelope field, not the reply.
+        const declaredDetail = boundedDiagnosticDetailV1(envelope.message);
         return {
           kind: "failed",
           correlation,
           code: envelope.code,
           retryable: envelope.retryable,
+          ...(declaredDetail !== undefined ? { detail: declaredDetail } : {}),
           ...(context.provider ? { provider: context.provider } : {}),
         };
       }

@@ -95,6 +95,29 @@ export interface PreflightOperationV1 {
   readonly findBase64?: string;
   /** `patchFile` only: the replacement bytes for `findBase64`, base64-encoded. */
   readonly replacementBase64?: string;
+  /**
+   * `patchFile` only: the same two payloads as PLAIN TEXT, which is what a
+   * model should actually send.
+   *
+   * Base64 was the original and only form, mirroring `contentBase64`. That was
+   * a mistake for author-generated payloads: encoding a code snippet to base64
+   * by hand is a mechanical transformation a language model cannot perform
+   * reliably, and on 2026-08-18 Copilot declined the whole round rather than
+   * guess — failing with its own `unreliable-manual-encoding`. It was right to
+   * refuse; a silently mis-encoded patch would have corrupted a file.
+   *
+   * JSON string escaping already carries newlines, quotes and Unicode without
+   * ambiguity, and the strict parser already enforces it, so plain text costs
+   * nothing in safety and removes an error class entirely.
+   *
+   * Supply EITHER the text form or the base64 form for each payload, never
+   * both. The decoder normalizes text into the base64 fields, so everything
+   * downstream — plan digest, sealing, execution — sees exactly one
+   * representation and needs no knowledge of this choice.
+   */
+  readonly findText?: string;
+  /** `patchFile` only: plain-text replacement; see {@link findText}. */
+  readonly replacementText?: string;
 }
 
 export interface PreflightPlanCompletedV1 {
@@ -753,26 +776,48 @@ function decodePreflightOperation(
     if (raw.contentBase64 !== undefined || raw.decodedByteLength !== undefined || raw.contentSha256 !== undefined) {
       return `patch operation ${stepId} must not include whole-file content bytes`;
     }
-    if (typeof raw.findBase64 !== "string") {
-      return `patch operation ${stepId} is missing "findBase64"`;
+    // Normalize the text form into base64 in LOCALS — never by reassigning
+    // `raw`, which would discard the isPlainRecord narrowing.
+    if (raw.findBase64 !== undefined && raw.findText !== undefined) {
+      return `patch operation ${stepId} must not set both "findBase64" and "findText"`;
     }
-    if (typeof raw.replacementBase64 !== "string") {
-      return `patch operation ${stepId} is missing "replacementBase64"`;
+    if (raw.replacementBase64 !== undefined && raw.replacementText !== undefined) {
+      return `patch operation ${stepId} must not set both "replacementBase64" and "replacementText"`;
+    }
+    let findEncoded: unknown = raw.findBase64;
+    let replacementEncoded: unknown = raw.replacementBase64;
+    if (raw.findText !== undefined) {
+      if (typeof raw.findText !== "string") {
+        return `patch operation ${stepId} has a non-string "findText"`;
+      }
+      findEncoded = Buffer.from(raw.findText, "utf8").toString("base64");
+    }
+    if (raw.replacementText !== undefined) {
+      if (typeof raw.replacementText !== "string") {
+        return `patch operation ${stepId} has a non-string "replacementText"`;
+      }
+      replacementEncoded = Buffer.from(raw.replacementText, "utf8").toString("base64");
+    }
+    if (typeof findEncoded !== "string") {
+      return `patch operation ${stepId} is missing "findText" (or "findBase64")`;
+    }
+    if (typeof replacementEncoded !== "string") {
+      return `patch operation ${stepId} is missing "replacementText" (or "replacementBase64")`;
     }
     let findBytes: Buffer;
     let replacementBytes: Buffer;
     try {
-      findBytes = Buffer.from(raw.findBase64, "base64");
-      replacementBytes = Buffer.from(raw.replacementBase64, "base64");
+      findBytes = Buffer.from(findEncoded, "base64");
+      replacementBytes = Buffer.from(replacementEncoded, "base64");
     } catch {
       return `patch operation ${stepId} has invalid base64`;
     }
     // Canonicality, same rule the whole-file path enforces: a non-canonical
     // encoding round-trips to different bytes than it claims to carry.
-    if (findBytes.toString("base64") !== raw.findBase64) {
+    if (findBytes.toString("base64") !== findEncoded) {
       return `patch operation ${stepId} has non-canonical "findBase64"`;
     }
-    if (replacementBytes.toString("base64") !== raw.replacementBase64) {
+    if (replacementBytes.toString("base64") !== replacementEncoded) {
       return `patch operation ${stepId} has non-canonical "replacementBase64"`;
     }
     // An empty needle would match everywhere (or nowhere, depending on the
@@ -787,7 +832,7 @@ function decodePreflightOperation(
       raw,
       new Set([
         "stepId", "kind", "rootId", "relativePath", "targetObservationId",
-        "parentChain", "findBase64", "replacementBase64",
+        "parentChain", "findBase64", "replacementBase64", "findText", "replacementText",
       ]),
       `operation ${stepId}`
     );
@@ -797,7 +842,7 @@ function decodePreflightOperation(
     return {
       stepId, kind, rootId: raw.rootId, relativePath: raw.relativePath,
       targetObservationId: raw.targetObservationId, parentChain,
-      findBase64: raw.findBase64, replacementBase64: raw.replacementBase64,
+      findBase64: findEncoded, replacementBase64: replacementEncoded,
     };
   }
   if (!isWrite) {
@@ -806,7 +851,9 @@ function decodePreflightOperation(
       raw.decodedByteLength !== undefined ||
       raw.contentSha256 !== undefined ||
       raw.findBase64 !== undefined ||
-      raw.replacementBase64 !== undefined
+      raw.replacementBase64 !== undefined ||
+      raw.findText !== undefined ||
+      raw.replacementText !== undefined
     ) {
       return `non-write operation ${stepId} must not include content bytes`;
     }

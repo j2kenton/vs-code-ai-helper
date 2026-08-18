@@ -748,6 +748,18 @@ export function describeEditActionOutcomeFailureV1(
   // above already pass `result.reason` through; this one now matches.
   const exhaustion = outcome.kind === "unavailable" ? outcome.chainExhaustion : undefined;
   const parts: string[] = [];
+  // The outcome's own `detail` — the single most informative field it carries,
+  // and this notification is what the operator actually reads. Omitting it
+  // meant a provider-declared failure surfaced as nothing but the model's
+  // invented code: `unreliable-manual-encoding` (2026-08-18) with no trace of
+  // the sentence the model sent alongside it, which was the diagnosis.
+  const declaredDetail =
+    outcome.kind === "failed" || outcome.kind === "malformedResult"
+      ? outcome.detail
+      : undefined;
+  if (declaredDetail !== undefined && declaredDetail.length > 0) {
+    parts.push(declaredDetail);
+  }
   if (exhaustion !== undefined && exhaustion.candidates.length > 0) {
     const candidateList = exhaustion.candidates
       .map((c) => `${c.storedModelId} (${c.providerLabel}) — ${c.reason}`)

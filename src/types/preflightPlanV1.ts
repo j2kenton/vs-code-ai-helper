@@ -233,16 +233,36 @@ export function validatePreflightPlanAgainstLedgerV1(
         if (!observed) {
           return failure("parentChainMismatch", `${where}'s parent link ${i} references an unknown observation`);
         }
+        // A parent link's job is to prove ONE thing: this ancestor exists and
+        // is a directory. `stat` proves exactly that, and it is already in
+        // AUTHORIZING_SOURCES_V1 — trusted to authorize a mutation on the
+        // operation's own TARGET, a far stronger claim. Requiring a COMPLETE
+        // `readDirectory` here as well was therefore inconsistent, and
+        // expensive in a way that mattered: `apps/server/lib/competition/x.ts`
+        // has four ancestors, so a plan touching six such files demanded ~24
+        // full directory listings (up to MAX_DIRECTORY_ENTRIES_V1 = 2048
+        // entries each), every one re-sent on every later tool round, to prove
+        // nothing a stat had not already proven. Copilot failed a whole round
+        // on it (2026-08-18, `parentChainMismatch` on `apps`).
+        //
+        // What is still enforced, and is the actual safety property: the
+        // observation must come from this attempt's ledger, name the EXACT
+        // ancestor path under the same root, be a directory, and come from an
+        // authorizing source — so a `findFiles`/`textSearch` discovery result
+        // still cannot stand in for a parent proof (§7.2). Completeness
+        // remains required where it carries real meaning:
+        // `deleteEmptyDirectory` above, which needs a full listing to prove
+        // emptiness.
         if (
           observed.rootId !== operation.rootId ||
           observed.relativePath !== ancestorPath ||
           observed.kind !== "directory" ||
-          observed.source !== "readDirectory" ||
-          !observed.complete
+          !AUTHORIZING_SOURCES_V1.has(observed.source)
         ) {
           return failure(
             "parentChainMismatch",
-            `${where}'s parent link ${i} must be a complete exact-path directory observation of ${ancestorPath}`
+            `${where}'s parent link ${i} must be an exact-path directory observation of ${ancestorPath} ` +
+              `(from stat or readDirectory, not a discovery result)`
           );
         }
       } else {

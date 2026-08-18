@@ -93,6 +93,104 @@ function plan(operations: readonly PreflightOperationV1[]): PreflightPlanComplet
   };
 }
 
+void describe("editPreflightContractV1 — parent-chain proofs", () => {
+  void it("accepts a stat observation as a parent link", () => {
+    // A parent link proves one thing: this ancestor exists and is a directory.
+    // `stat` proves exactly that, and already authorizes mutations on the
+    // operation's own target — a stronger claim. Demanding a COMPLETE
+    // readDirectory here cost Copilot a whole round (parentChainMismatch on
+    // `apps`, 2026-08-18) and would have required a full listing of every
+    // ancestor of every touched file.
+    const ledger = createObservationLedgerV1();
+    const file = mintFile(ledger, "apps/server/x.ts");
+    const apps = mintDirectory(ledger, "apps", [], "stat");
+    const appsServer = mintDirectory(ledger, "apps/server", [], "stat");
+
+    const result = validatePreflightPlanAgainstLedgerV1(
+      plan([
+        op({
+          stepId: "s1",
+          kind: "patchFile",
+          relativePath: "apps/server/x.ts",
+          targetObservationId: file,
+          parentChain: [
+            { kind: "observed", observationId: apps },
+            { kind: "observed", observationId: appsServer },
+          ],
+          findText: "a",
+          replacementText: "b",
+        }),
+      ]),
+      ledger,
+      ROOT
+    );
+    assert.deepEqual(result, { ok: true });
+  });
+
+  void it("still refuses a discovery observation as a parent link", () => {
+    // The safety property that must survive the relaxation above: §7.2 says a
+    // findFiles/textSearch result can never authorize anything, and that
+    // includes standing in as a parent proof.
+    const ledger = createObservationLedgerV1();
+    const file = mintFile(ledger, "apps/x.ts");
+    const discovered = ledger.mint({
+      callId: "call-discovery",
+      rootId: ROOT,
+      relativePath: "apps",
+      kind: "directory",
+      revision: "dir",
+      complete: true,
+      source: "findFiles",
+    }).observationId;
+
+    const result = validatePreflightPlanAgainstLedgerV1(
+      plan([
+        op({
+          stepId: "s1",
+          kind: "patchFile",
+          relativePath: "apps/x.ts",
+          targetObservationId: file,
+          parentChain: [{ kind: "observed", observationId: discovered }],
+          findText: "a",
+          replacementText: "b",
+        }),
+      ]),
+      ledger,
+      ROOT
+    );
+    assert.equal(result.ok, false);
+    assert.equal(result.ok === false && result.code, "parentChainMismatch");
+  });
+
+  void it("still refuses a parent link naming the wrong ancestor path", () => {
+    const ledger = createObservationLedgerV1();
+    const file = mintFile(ledger, "apps/server/x.ts");
+    const apps = mintDirectory(ledger, "apps", [], "stat");
+
+    const result = validatePreflightPlanAgainstLedgerV1(
+      plan([
+        op({
+          stepId: "s1",
+          kind: "patchFile",
+          relativePath: "apps/server/x.ts",
+          targetObservationId: file,
+          // Two ancestors required; `apps` supplied for BOTH positions.
+          parentChain: [
+            { kind: "observed", observationId: apps },
+            { kind: "observed", observationId: apps },
+          ],
+          findText: "a",
+          replacementText: "b",
+        }),
+      ]),
+      ledger,
+      ROOT
+    );
+    assert.equal(result.ok, false);
+    assert.equal(result.ok === false && result.code, "parentChainMismatch");
+  });
+});
+
 void describe("editPreflightContractV1 — patchFile", () => {
   void it("accepts a patch whose target is an observed file", () => {
     const ledger = createObservationLedgerV1();
