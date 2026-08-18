@@ -77,6 +77,19 @@ const FIXTURE_ROSTER = {
   // parity check — without this polarity both validators could re-tighten
   // together and the gap would be invisible again.
   "valid-text-app-owned-answer-box.json": { contract: "questions", expect: "valid" },
+  // The real Copilot `draft.v1` response spooled 2026-08-15T20:42:08.558Z
+  // (revamp-1/.ensemble/2026-08-15_task_1) that motivated the 2026-08-16
+  // owner decision: a model asking a genuine clarifying question, sending
+  // only the four fields the contract now documents. Doubles as the
+  // regression fixture for that incident.
+  "valid-text-copilot-security-scope.json": { contract: "questions", expect: "valid" },
+  // Isolated PERSISTED-only-field cases: each carries exactly ONE of the two
+  // app-owned fields (never both together, unlike valid-text.json/
+  // unknown-field-on-question.json), so the wire-decoder rejection proven
+  // below by the generic hasAppOwnedField check cannot be an artifact of the
+  // fields always appearing paired.
+  "allow-blank-only-on-text-question.json": { contract: "questions", expect: "valid" },
+  "max-length-only-on-text-question.json": { contract: "questions", expect: "valid" },
   "valid-single-choice.json": { contract: "questions", expect: "valid" },
   "valid-multiple-choice.json": { contract: "questions", expect: "valid" },
   "valid-mixed.json": { contract: "questions", expect: "valid" },
@@ -507,6 +520,7 @@ function runValidatorSelfTest(failures) {
 
 const REQUIRED_RUNTIME_EXPORTS = [
   "decodeStructuredQuestionsV1",
+  "decodeStructuredQuestionsFromProviderV1",
   "decodeStructuredAnswersArrayV1",
   "validateStructuredAnswersV1",
   "canonicalJsonByteLengthV1",
@@ -884,6 +898,42 @@ function verifyFixtures(questionSchema, answerSchema, runtime, failures) {
         `${FIXTURES_RELATIVE}/${name}: classified ${spec.expect} but the runtime decoder says ` +
           `${runtimeValid ? "valid" : `invalid (${runtimeResult.reason})`}.`
       );
+    }
+    if (spec.contract === "questions") {
+      // Cross-check the strict FRESH-envelope decoder against the same
+      // corpus, deriving the expectation from the fixture data itself rather
+      // than a second roster: any fixture whose text question carries
+      // allowBlank/maxLength is PERSISTED-shaped and must be rejected by the
+      // wire decoder (owner decision, 2026-08-16 — those fields are
+      // app-owned, not model-authored); every other fixture must agree with
+      // the persisted decoder's verdict, since nothing in it is
+      // wire-forbidden.
+      const hasAppOwnedField =
+        Array.isArray(data) &&
+        data.some(
+          (q) =>
+            isPlainObject(q) &&
+            q.kind === "text" &&
+            (Object.prototype.hasOwnProperty.call(q, "allowBlank") ||
+              Object.prototype.hasOwnProperty.call(q, "maxLength"))
+        );
+      const strictResult = runtime.decodeStructuredQuestionsFromProviderV1(data);
+      const strictValid = strictResult.ok === true;
+      if (hasAppOwnedField) {
+        if (strictValid) {
+          failures.push(
+            `${FIXTURES_RELATIVE}/${name}: contains a PERSISTED-only allowBlank/maxLength field on a text ` +
+              "question, but decodeStructuredQuestionsFromProviderV1 (the fresh-envelope decoder) accepted " +
+              "it. Fresh model output must never carry those app-owned fields."
+          );
+        }
+      } else if (strictValid !== runtimeValid) {
+        failures.push(
+          `${FIXTURES_RELATIVE}/${name}: decodeStructuredQuestionsFromProviderV1 diverges from the persisted ` +
+            `decoder for a fixture with no allowBlank/maxLength field (persisted=${runtimeValid}, ` +
+            `strict=${strictValid}${strictValid ? "" : ` (${strictResult.reason})`}).`
+        );
+      }
     }
     if (spec.expect === "valid") {
       const limit =

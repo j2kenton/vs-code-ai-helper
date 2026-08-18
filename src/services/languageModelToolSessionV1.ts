@@ -73,8 +73,15 @@ export function createCopilotLmToolSessionTransportV1(
       let models: vscode.LanguageModelChat[];
       try {
         models = await vscode.lm.selectChatModels({ vendor: "copilot" });
-      } catch {
-        return { kind: "transportFailure", code: "copilotModelSelectionFailed" };
+      } catch (error) {
+        // Was a bare `catch {}` — see the identical fix below for
+        // `sendRequest`'s failure path and its reasoning.
+        const detail = boundedTransportDetailV1(error);
+        return {
+          kind: "transportFailure",
+          code: "copilotModelSelectionFailed",
+          ...(detail !== undefined ? { detail } : {}),
+        };
       }
       if (models.length === 0) {
         return { kind: "transportFailure", code: "copilotNoModelsAvailable" };

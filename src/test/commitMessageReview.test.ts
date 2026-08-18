@@ -144,8 +144,6 @@ function questionsTransportV1(runnerId = "stub-runner"): FakeAgentTransportV1 {
               kind: "text",
               prompt: "What's the primary intent of this change?",
               required: true,
-              allowBlank: false,
-              maxLength: 200,
             },
           ],
         })

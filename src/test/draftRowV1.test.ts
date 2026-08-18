@@ -166,8 +166,6 @@ function questionsTransport(): AgentTransportV1 {
           kind: "text",
           prompt: "What export formats matter?",
           required: true,
-          allowBlank: false,
-          maxLength: 500,
         },
       ],
     })

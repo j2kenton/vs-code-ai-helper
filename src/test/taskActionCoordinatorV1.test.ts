@@ -406,8 +406,6 @@ void describe("taskActionCoordinatorV1", () => {
               kind: "text",
               prompt: "Which stage?",
               required: true,
-              allowBlank: false,
-              maxLength: 100,
             },
           ],
         })
@@ -499,8 +497,6 @@ void describe("taskActionCoordinatorV1", () => {
                 kind: "text",
                 prompt: "?",
                 required: true,
-                allowBlank: false,
-                maxLength: 10,
               },
             ],
           })
@@ -807,8 +803,6 @@ void describe("taskActionCoordinatorV1", () => {
           kind: "text",
           prompt: "Which stage?",
           required: true,
-          allowBlank: false,
-          maxLength: 100,
         },
       ],
     });
@@ -1249,6 +1243,110 @@ void describe("taskActionCoordinatorV1", () => {
         "only the one remaining invocation of the seeded 3-budget may be reserved"
       );
     });
+  });
+
+  /**
+   * Coordinator-policy seam tests for the candidate-scoped content-contract
+   * fallback (2026-08-16 field report, fourth item;
+   * `classifyProviderCandidateDispositionV1` in providerSelectionPolicyV1.ts).
+   * A row-owned `validateCompletedContent` failure (e.g. review.v1's missing
+   * "Readiness: N/10" line) must behave exactly like a malformed envelope for
+   * fallback purposes: advance to the next ranked candidate without acquiring
+   * a lease or writing an artifact for the rejected candidate, terminate as a
+   * non-retryable `contentContractFailed` failure (never `malformedResult`)
+   * when no candidate remains, and never cascade past a promotion failure
+   * that happens AFTER a candidate's content already passed validation.
+   */
+  void describe("content-contract candidate advancement", () => {
+    const REQUIRED_MARKER = "MAGIC";
+    function requireMagicMarker(
+      content: CompletedContentV1
+    ): { readonly ok: true } | { readonly ok: false; readonly reason: string } {
+      if (content.contentType !== "markdown-artifact.v1") {
+        return { ok: false, reason: "expected markdown-artifact.v1" };
+      }
+      return content.markdown.includes(REQUIRED_MARKER)
+        ? { ok: true }
+        : { ok: false, reason: `missing required "${REQUIRED_MARKER}" marker` };
+    }
+
+    function markdownEnvelopeTransport(markdown: string): AgentTransportV1 {
+      return envelopeTransport((correlation) =>
+        frame({
+          version: 1,
+          correlation,
+          kind: "completed",
+          content: { contentType: "markdown-artifact.v1", schemaVersion: 1, markdown },
+        })
+      );
+    }
+
+    void it(
+      "advances to the next candidate on a content-contract failure and completes on the second, " +
+        "with no lease acquisition or artifact write for the rejected first candidate",
+      async () => {
+        const harness = makeHarness(
+          [markdownEnvelopeTransport("no marker here"), markdownEnvelopeTransport("has the MAGIC marker")],
+          { validateCompletedContent: requireMagicMarker }
+        );
+        const outcome = await harness.coordinator.executeAction(baseRequest());
+        assert.equal(outcome.kind, "completed");
+        assert.equal(harness.selection.reserved, 2, "the second candidate must have been reserved");
+        assert.equal(
+          harness.promoted.length,
+          1,
+          "promoteCompletedContent (and thus lease acquisition/artifact write) must run once, for the second candidate only"
+        );
+        assert.equal(harness.promoted[0]?.contentType, "markdown-artifact.v1");
+      }
+    );
+
+    void it(
+      "terminates with a non-retryable contentContractFailed outcome (not malformedResult) when no backup candidate remains",
+      async () => {
+        const harness = makeHarness([markdownEnvelopeTransport("no marker here")], {
+          validateCompletedContent: requireMagicMarker,
+        });
+        const outcome = await harness.coordinator.executeAction(baseRequest());
+        assert.equal(outcome.kind, "failed");
+        if (outcome.kind === "failed") {
+          assert.equal(outcome.code, "contentContractFailed");
+          assert.equal(outcome.retryable, false);
+        }
+        assert.equal(harness.selection.reserved, 1);
+        assert.equal(harness.promoted.length, 0, "no candidate's content ever passed validation");
+      }
+    );
+
+    void it(
+      "does not cascade to a further candidate when promotion fails after content-contract validation passed",
+      async () => {
+        const harness = makeHarness(
+          [
+            markdownEnvelopeTransport("has the MAGIC marker"),
+            envelopeTransport(() => {
+              throw new Error("must not reserve a 2nd candidate once promotion has already failed terminally");
+            }),
+          ],
+          {
+            validateCompletedContent: requireMagicMarker,
+            promoteCompletedContent: () => {
+              throw new Error("simulated CAS/storage conflict");
+            },
+          }
+        );
+        const outcome = await harness.coordinator.executeAction(baseRequest());
+        assert.equal(outcome.kind, "failed");
+        if (outcome.kind === "failed") {
+          assert.equal(outcome.retryable, false);
+        }
+        assert.equal(
+          harness.selection.reserved,
+          1,
+          "a promotion/storage failure after content validation passed must not cascade to another candidate"
+        );
+      }
+    );
   });
 
   void it("treats a response-started transport failure as terminal (no fallback)", async () => {
@@ -1807,8 +1905,6 @@ void describe("taskActionCoordinatorV1", () => {
                 kind: "text",
                 prompt: "?",
                 required: true,
-                allowBlank: false,
-                maxLength: 10,
               },
             ],
           })
@@ -2251,8 +2347,6 @@ void describe("taskActionCoordinatorV1", () => {
             kind: "text",
             prompt: "Which stage?",
             required: true,
-            allowBlank: false,
-            maxLength: 100,
           },
         ],
       })

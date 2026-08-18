@@ -411,6 +411,8 @@ function computeQuotaParkIdentityV1(
       accountKey: accountKeyOverride ?? resolveQuotaAccountKeyV1(modelId),
     };
   } catch {
+    // Best-effort quota-park bookkeeping only — an unresolvable provider
+    // just means there is no park identity to clear, not a run failure.
     return undefined;
   }
 }

@@ -25,9 +25,45 @@ export interface ReadinessResult {
   label: string;
 }
 
-/** Primary regex: exact `Readiness: N/10` line (N whole or one-plus decimals) */
+/**
+ * The accepted `Readiness: N/10` grammar, deliberately, in two tiers.
+ *
+ * Canonical (what every review prompt asks models to emit, and what
+ * {@link isStrictPerfectReview} requires verbatim): a line that is exactly
+ * `Readiness: N/10`, N a whole number or a decimal, with nothing else on the
+ * line.
+ *
+ * Tolerated (accepted by `parseReadiness` so real observed model output still
+ * scores, but never required and never checked by the strict gate):
+ *  - Preamble before the line: `EXACT_READINESS_RE`'s `m` flag matches at any
+ *    line start, so text preceding the Readiness line is already fine — no
+ *    separate handling needed.
+ *  - Markdown bold: `**Readiness: 4/10**` (observed from deepseek-v4-flash@xhigh,
+ *    ~7 of 12 sampled reviews, 2026-08-14).
+ *  - A Markdown heading prefix: `### Readiness: 4/10`.
+ *  - The legacy phrasing `Overall readiness N/10` (case-insensitive, no colon
+ *    required) — the form review artifacts predating the `Readiness:` prompt
+ *    wording still use. Kept ONLY for reading old artifacts; no current
+ *    prompt asks for it and no new tolerance should be added to this branch.
+ *
+ * All four tolerated forms are matched by the single fallback regex below,
+ * because each one differs from canonical only by ignorable characters
+ * (asterisks, a heading `#` run, or the word order/colon of the legacy
+ * phrase) around the same `readiness ... N/10` core — a model that emits any
+ * of them still unambiguously means the same score.
+ *
+ * What is NOT tolerated, deliberately: a missing line entirely (the seventh/
+ * seventeenth 2026-08-16 field-report item — a review that omits Readiness
+ * must fall through to the candidate-scoped content-contract fallback in
+ * `taskActionCoordinatorV1.ts`, never silently read as "no score", since
+ * treating an omission as a quality signal is the exact bug this module
+ * exists to prevent), and an out-of-range or non-numeric value (rejected by
+ * both regexes' `[0-9]`/`10` alternation, so `parseReadiness` returns
+ * `score: null` rather than clamping a bogus scan).
+ */
 const EXACT_READINESS_RE = /^Readiness:\s*(10(?:\.0+)?|[0-9](?:\.[0-9]+)?)\/10\s*$/m;
-/** Legacy fallback: case-insensitive `readiness` keyword + N/10 anywhere */
+/** Tolerant fallback: bold/heading-wrapped canonical line, or the legacy
+ * `Overall readiness N/10` phrasing — see the grammar doc comment above. */
 const LEGACY_READINESS_RE = /readiness[^0-9]*(10(?:\.0+)?|[0-9](?:\.[0-9]+)?)\/10/i;
 
 /** Clamp to [0, 10] and normalize to one decimal so a whole number stays a

@@ -259,6 +259,57 @@ void describe("review scoring rubric", () => {
     void it("still returns null when no readiness line is present", () => {
       assert.strictEqual(parseReadiness("No score here").score, null);
     });
+
+    void describe("tolerated grammar forms", () => {
+      void it("accepts arbitrary preamble before the canonical line", () => {
+        const result = parseReadiness("Some intro text.\nMore prose.\nReadiness: 6/10\nBody");
+        assert.strictEqual(result.score, 6);
+        assert.strictEqual(result.label, "6/10");
+      });
+
+      void it("accepts Markdown-bold-wrapped readiness (deepseek-v4-flash@xhigh, 2026-08-14)", () => {
+        const result = parseReadiness("**Readiness: 4/10**\nBody");
+        assert.strictEqual(result.score, 4);
+        assert.strictEqual(result.label, "4/10");
+      });
+
+      void it("accepts a Markdown heading prefix", () => {
+        const result = parseReadiness("### Readiness: 7/10\nBody");
+        assert.strictEqual(result.score, 7);
+        assert.strictEqual(result.label, "7/10");
+      });
+
+      void it("accepts the legacy 'Overall readiness N/10' phrasing", () => {
+        const result = parseReadiness("Overall readiness 5/10 based on analysis");
+        assert.strictEqual(result.score, 5);
+        assert.strictEqual(result.label, "5/10");
+      });
+
+      void it("accepts the legacy phrasing case-insensitively", () => {
+        const result = parseReadiness("OVERALL READINESS 8/10");
+        assert.strictEqual(result.score, 8);
+      });
+    });
+
+    void describe("rejected/ambiguous forms", () => {
+      void it("rejects a bare 'Readiness' with no score at all", () => {
+        assert.strictEqual(parseReadiness("Readiness: unknown\nBody").score, null);
+      });
+
+      void it("rejects an out-of-range score (11/10 is not a valid N)", () => {
+        assert.strictEqual(parseReadiness("Readiness: 11/10\nBody").score, null);
+      });
+
+      void it("rejects a score out of /10 (e.g. N/5)", () => {
+        assert.strictEqual(parseReadiness("Readiness: 4/5\nBody").score, null);
+      });
+
+      void it("a missing Readiness line is null, never a silently-assumed score", () => {
+        const withoutReadiness = "## Summary\nEverything looks fine, ship it.";
+        assert.strictEqual(parseReadiness(withoutReadiness).score, null);
+        assert.strictEqual(parseReadiness(withoutReadiness).label, "—/10");
+      });
+    });
   });
 
   void describe("meetsAutoAdvanceThreshold", () => {

@@ -20,6 +20,12 @@ import {
   PublishScopeCheckResult,
   upsertScopeCheckReportV1,
 } from "../utils/publishScopeCheck";
+import { upsertCompletionChecksReportV1, CompletionLintResult } from "../utils/completionLint";
+import {
+  readPublishChecksFreshnessStampV1,
+  writePublishChecksFreshnessStampV1,
+} from "../utils/publishChecksFreshness";
+import { PUBLISH_CHECKS_FILENAME } from "../types/taskProgress";
 
 const TEST_ROOT = nodeFs.mkdtempSync(
   nodePath.join(nodeOs.tmpdir(), "ensemble-publish-scope-check-test-")
@@ -311,6 +317,76 @@ void describe("upsertScopeCheckReportV1", () => {
     assert.match(content, /## Scope Check/);
     assert.match(content, /src\/unexpected\.ts/);
     assert.match(content, /1 `\.ensemble\/` task-artifact file\(s\)/);
+  });
+
+  void it("invalidates a previous freshness stamp on a refresh of this section alone", async () => {
+    const dir = makeDir("upsert-invalidate-stamp");
+    const targetUri = vscode.Uri.file(dir);
+    await upsertScopeCheckReportV1(targetUri, {
+      runAt: "2026-01-01T00:00:00.000Z",
+      unplannedFiles: [],
+      ensembleArtifacts: [],
+      basisUnavailable: false,
+    });
+    await writePublishChecksFreshnessStampV1(targetUri, {
+      formatVersion: 1,
+      runId: "11111111-1111-4111-8111-111111111111",
+      verifiedCommitSha: "a".repeat(40),
+      completedAt: new Date().toISOString(),
+      scopeId: "0123456789abcdef",
+    });
+    assert.notEqual(await readPublishChecksFreshnessStampV1(targetUri), undefined);
+
+    // A follow-up refresh of the Scope Check section alone (without also
+    // re-running the Completion Checks lint) must not leave that stamp
+    // looking current.
+    await upsertScopeCheckReportV1(targetUri, {
+      runAt: "2026-01-01T00:01:00.000Z",
+      unplannedFiles: [],
+      ensembleArtifacts: [],
+      basisUnavailable: false,
+    });
+    assert.equal(await readPublishChecksFreshnessStampV1(targetUri), undefined);
+  });
+
+  void it("serializes against a concurrent Completion Checks refresh without a torn or corrupted write", async () => {
+    const dir = makeDir("upsert-concurrent-with-completion-checks");
+    const targetUri = vscode.Uri.file(dir);
+
+    const completionResult: CompletionLintResult = {
+      runAt: "2026-01-01T00:00:00.000Z",
+      passed: true,
+      summary: "No linting issues found.",
+      issueCount: 0,
+      failedChecks: [],
+      missingScripts: [],
+    } as unknown as CompletionLintResult;
+
+    // The two managed sections are independently refreshed by different
+    // commands (Publish Checks runs both; Linting Fixes refreshes only
+    // Completion Checks) but share one file — a close race between them
+    // must not produce a document with a duplicated/torn section.
+    await Promise.all([
+      upsertScopeCheckReportV1(targetUri, {
+        runAt: "2026-01-01T00:00:00.000Z",
+        unplannedFiles: ["src/race.ts"],
+        ensembleArtifacts: [],
+        basisUnavailable: false,
+      }),
+      upsertCompletionChecksReportV1(targetUri, completionResult),
+    ]);
+
+    const content = nodeFs.readFileSync(nodePath.join(dir, PUBLISH_CHECKS_FILENAME), "utf8");
+    for (const marker of [
+      "<!-- scope-check:start -->",
+      "<!-- scope-check:end -->",
+      "<!-- completion-checks:start -->",
+      "<!-- completion-checks:end -->",
+    ]) {
+      assert.equal(content.split(marker).length - 1, 1, `exactly one ${marker}`);
+    }
+    assert.match(content, /## Scope Check/);
+    assert.match(content, /## Completion Checks/);
   });
 });
 

@@ -1,0 +1,8 @@
+[
+  {
+    "questionId": "security-scope",
+    "kind": "text",
+    "prompt": "What web app, repository, or specific feature should be secured, and are there known vulnerabilities or security requirements to address?",
+    "required": true
+  }
+]

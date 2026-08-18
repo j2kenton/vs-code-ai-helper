@@ -24,6 +24,7 @@ import { stripAttributionHeaders } from "../utils/fileUtils";
 import { formatTimestampForDisplay } from "../utils/timeFormat";
 import {
   decodeStructuredAnswersArrayV1,
+  DEFAULT_TEXT_ANSWER_MAX_LENGTH_V1,
   StructuredAnswerV1,
   StructuredQuestionV1,
 } from "../types/structuredQuestionV1";
@@ -1237,7 +1238,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           if(q.helpText){ const help=document.createElement('div'); help.className='interaction-help'; help.textContent=q.helpText; wrap.appendChild(help); }
           const prior=priorAnswers[q.questionId];
           if(q.kind==='text'){
-            const ta=document.createElement('textarea'); ta.rows=2; ta.maxLength=q.maxLength; ta.setAttribute('aria-label',q.prompt);
+            const ta=document.createElement('textarea'); ta.rows=2; ta.maxLength=${DEFAULT_TEXT_ANSWER_MAX_LENGTH_V1}; ta.setAttribute('aria-label',q.prompt);
             if(prior && prior.state==='answered') ta.value=prior.value;
             wrap.appendChild(ta);
             getters[q.questionId]=()=>{
@@ -1245,11 +1246,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
               if(!val){
                 if(!q.required) return {questionId:q.questionId,kind:'text',state:'skipped'};
                 // A required question can never be submitted as "skipped" —
-                // that state is reserved for optional questions. A required,
-                // blank-allowed question left blank is an ANSWERED empty
-                // string; a required, blank-DISALLOWED question left blank
-                // is invalid and blocks submission.
-                return q.allowBlank ? {questionId:q.questionId,kind:'text',state:'answered',value:''} : null;
+                // that state is reserved for optional questions. Blank
+                // acceptance is derived from "required" only (exactly what
+                // textAnswerPolicyV1 derives server-side), never read off
+                // q.allowBlank: a historical persisted record's stored value
+                // is migration-only data and must not drive runtime UI
+                // behaviour. required===true here always means blank is
+                // disallowed, so a required question left blank is invalid.
+                return null;
               }
               return {questionId:q.questionId,kind:'text',state:'answered',value:val};
             };

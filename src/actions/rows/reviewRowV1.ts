@@ -5,8 +5,10 @@
  * Completed-content type: `markdown-artifact.v1`.
  * Provider mode: `text`.
  */
+import * as vscode from "vscode";
 import {
   ProviderTaskActionRowV1,
+  TaskActionCompletedContentValidationResultV1,
   TaskActionExecutionContextV1,
   TaskActionInputValidationResultV1,
   TaskActionPromotionCodeV1,
@@ -17,13 +19,35 @@ import { getWorkflowFileStoreV1 } from "../../services/workflowRuntimeServicesV1
 import { WorkflowFileRevisionV1 } from "../../services/workflowFileStoreV1";
 import { parseReadiness, withVisibleReviewedCommitLineV1 } from "../../utils/reviewReadiness";
 import { attributionModelLabel, withAttribution } from "../../utils/fileUtils";
+import { checkPublishChecksFreshnessV1 } from "../../utils/publishChecksFreshness";
+import { resolveHeadCommitSha } from "../../utils/gitRepoInfo";
 
 export const REVIEW_ACTION_KEY_V1 = "review.v1";
+
+/**
+ * Publish-only promotion-time freshness guard (plan PART 2, step 7's
+ * "immediately before promotion, re-read the stamp and current HEAD"
+ * requirement). Captured once by the caller at the SAME moment the
+ * entry-point freshness gate accepted a stamp — before the provider call
+ * that can run for minutes — and re-checked in `promoteReviewContentV1`
+ * right before the CAS write, so a Publish Checks re-run or a new commit
+ * landing while the model was executing cannot let a review promote against
+ * evidence that has since been superseded. `runId` (not just the commit SHA)
+ * is compared so a NEW Publish Checks run against the SAME commit still
+ * invalidates the guard.
+ */
+export interface PublishReviewFreshnessGuardV1 {
+  readonly taskFolderPath: string;
+  readonly scopeFolderPath: string;
+  readonly runId: string;
+  readonly verifiedCommitSha: string;
+}
 
 export interface ReviewActionInputV1 {
   readonly prompt: string;
   readonly targetLocator: { readonly rootId: string; readonly relativePath: string };
   readonly baselineRevision?: WorkflowFileRevisionV1;
+  readonly publishFreshnessGuard?: PublishReviewFreshnessGuardV1;
 }
 
 const MAX_PROMPT_LENGTH_V1 = 8 * 1024 * 1024;
@@ -61,7 +85,24 @@ export function validateReviewInputV1(
   if (raw.baselineRevision !== undefined && !isNonEmptyString(raw.baselineRevision)) {
     return { ok: false, reason: "input \"baselineRevision\" must be a non-empty string when present" };
   }
-  const allowedKeys = new Set(["prompt", "targetLocator", "baselineRevision"]);
+  if (raw.publishFreshnessGuard !== undefined) {
+    const guard = raw.publishFreshnessGuard;
+    if (
+      typeof guard !== "object" ||
+      guard === null ||
+      !isNonEmptyString((guard as Record<string, unknown>).taskFolderPath) ||
+      !isNonEmptyString((guard as Record<string, unknown>).scopeFolderPath) ||
+      !isNonEmptyString((guard as Record<string, unknown>).runId) ||
+      !isNonEmptyString((guard as Record<string, unknown>).verifiedCommitSha)
+    ) {
+      return {
+        ok: false,
+        reason:
+          'input "publishFreshnessGuard" must be { taskFolderPath, scopeFolderPath, runId, verifiedCommitSha: non-empty strings }',
+      };
+    }
+  }
+  const allowedKeys = new Set(["prompt", "targetLocator", "baselineRevision", "publishFreshnessGuard"]);
   for (const key of Object.keys(raw)) {
     if (!allowedKeys.has(key)) {
       return { ok: false, reason: `input has an unknown field: ${key}` };
@@ -74,6 +115,9 @@ export function validateReviewInputV1(
       relativePath: (locator as { relativePath: string }).relativePath,
     },
     ...(raw.baselineRevision !== undefined ? { baselineRevision: raw.baselineRevision } : {}),
+    ...(raw.publishFreshnessGuard !== undefined
+      ? { publishFreshnessGuard: raw.publishFreshnessGuard as PublishReviewFreshnessGuardV1 }
+      : {}),
   };
   return { ok: true, input: validated };
 }
@@ -91,6 +135,61 @@ class ReviewPromotionErrorV1 extends Error {
   }
 }
 
+/**
+ * Every review prompt requires a leading `Readiness: N/10` line (see
+ * reviewActions.ts's validateReviewOutput, the same rule this mirrors). A
+ * response missing it is a strong signal the provider didn't actually
+ * perform the review (e.g. it asked a clarifying question instead) — and
+ * this is a fault of THIS candidate's response, not of the target artifact,
+ * so it is checked as `validateCompletedContent` (before the coordinator
+ * commits to the "completed" attempt outcome) rather than inside
+ * `promoteCompletedContent`, letting the coordinator advance to the next
+ * ranked candidate instead of settling a terminal `promotionFailed`
+ * (2026-08-16 field report, fourth item: three identical `grok-4.6` failures
+ * exhausted the whole chain while a working `sonnet@high` backup sat idle).
+ */
+function validateReviewCompletedContentV1(
+  content: CompletedContentV1
+): TaskActionCompletedContentValidationResultV1 {
+  if (!isMarkdownArtifactV1(content)) {
+    return { ok: false, reason: "review.v1 received a non-markdown-artifact completed content" };
+  }
+  if (parseReadiness(content.markdown).score === null) {
+    return { ok: false, reason: 'review.v1 response has no "Readiness: N/10" line' };
+  }
+  return { ok: true };
+}
+
+/**
+ * Re-check Publish Checks freshness immediately before the artifact write
+ * (plan PART 2, step 7). Requires not merely the same commit but the same
+ * `runId` the entry-point gate accepted, so a Publish Checks run that
+ * started and finished against the SAME commit while this review's provider
+ * call was in flight — evidence the reviewer never actually consumed — still
+ * blocks promotion rather than silently passing a coincidental SHA match.
+ */
+async function revalidatePublishFreshnessOrThrowV1(
+  guard: PublishReviewFreshnessGuardV1
+): Promise<void> {
+  const taskFolderUri = vscode.Uri.file(guard.taskFolderPath);
+  const currentCommitSha = await resolveHeadCommitSha(guard.scopeFolderPath);
+  const check = await checkPublishChecksFreshnessV1(
+    taskFolderUri,
+    guard.scopeFolderPath,
+    currentCommitSha
+  );
+  const stillValid =
+    check.status === "valid" &&
+    check.stamp.runId === guard.runId &&
+    check.stamp.verifiedCommitSha === guard.verifiedCommitSha;
+  if (!stillValid) {
+    throw new ReviewPromotionErrorV1(
+      "Publish Checks changed (a new run or a new commit) while this review was being generated, so " +
+        "the review was not saved. Run Publish Checks again and retry the review."
+    );
+  }
+}
+
 async function promoteReviewContentV1(
   content: CompletedContentV1,
   context: TaskActionExecutionContextV1
@@ -98,17 +197,15 @@ async function promoteReviewContentV1(
   if (!isMarkdownArtifactV1(content)) {
     throw new ReviewPromotionErrorV1("review.v1 received a non-markdown-artifact completed content");
   }
-  // Every review prompt requires a leading `Readiness: N/10` line (see
-  // reviewActions.ts's validateReviewOutput, the same rule this mirrors). A
-  // response missing it is a strong signal the provider didn't actually
-  // perform the review (e.g. it asked a clarifying question instead) and
-  // must never be promoted to a review artifact — rejecting it here, before
-  // any write, keeps this a terminal `promotionFailed` outcome rather than a
-  // fallback-eligible one (AC-RUNNER-05: malformed results are terminal).
-  if (parseReadiness(content.markdown).score === null) {
-    throw new ReviewPromotionErrorV1('review.v1 response has no "Readiness: N/10" line');
-  }
   const input = context.validatedInput as ReviewActionInputV1;
+  if (context.stage === "publish") {
+    if (!input.publishFreshnessGuard) {
+      throw new ReviewPromotionErrorV1(
+        "publish review promotion is missing its freshness guard"
+      );
+    }
+    await revalidatePublishFreshnessOrThrowV1(input.publishFreshnessGuard);
+  }
   const fileStore = getWorkflowFileStoreV1();
   // Review freshness, write time: a review carrying a reviewed-commit marker
   // gets a VISIBLE `> Reviewed commit: <sha>` line under its Readiness line
@@ -172,6 +269,7 @@ export function createReviewRowV1(): ProviderTaskActionRowV1 {
     resumeSemantics: "sameOperation",
     buildPrompt: (context: TaskActionExecutionContextV1): string =>
       (context.validatedInput as ReviewActionInputV1).prompt,
+    validateCompletedContent: validateReviewCompletedContentV1,
     promoteCompletedContent: promoteReviewContentV1,
   };
 }

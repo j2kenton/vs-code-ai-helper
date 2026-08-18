@@ -13,6 +13,11 @@ import {
   resolveStageResponseScope,
   snapshotStageResponseState,
 } from "./stageResponseScope";
+import {
+  invalidatePublishChecksFreshnessStamp,
+  withPublishChecksReportLockV1,
+  writeFileAtomicV1,
+} from "./publishChecksFreshness";
 
 /**
  * Report-only Publish-stage check: which files this task actually changed
@@ -367,15 +372,23 @@ export async function upsertScopeCheckReportV1(
 ): Promise<void> {
   const targetPath = nodePath.join(taskFolderUri.fsPath, PUBLISH_CHECKS_FILENAME);
 
-  let existing = "";
-  try {
-    existing = await nodeFs.promises.readFile(targetPath, "utf8");
-  } catch {
-    existing = "";
-  }
+  // See the matching comment in completionLint.ts's upsertCompletionChecksReportV1:
+  // one locked read-modify-write, merging the section and invalidating any
+  // freshness stamp against the same snapshot, landing in a single atomic
+  // write. runPublishChecks.ts writes a fresh valid stamp itself once both
+  // sections have completed against one unchanged commit.
+  await withPublishChecksReportLockV1(taskFolderUri, async () => {
+    let existing = "";
+    try {
+      existing = await nodeFs.promises.readFile(targetPath, "utf8");
+    } catch {
+      existing = "";
+    }
 
-  const section = renderScopeCheckSection(result);
-  await nodeFs.promises.writeFile(targetPath, mergeScopeCheckSection(existing, section), "utf8");
+    const section = renderScopeCheckSection(result);
+    const merged = mergeScopeCheckSection(existing, section);
+    await writeFileAtomicV1(targetPath, invalidatePublishChecksFreshnessStamp(merged));
+  });
   await stripScopeCheckFromReviewArtifactV1(taskFolderUri);
 }
 

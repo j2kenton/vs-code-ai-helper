@@ -100,6 +100,21 @@ const QUESTIONS: readonly StructuredQuestionV1[] = [
   },
 ];
 
+/**
+ * Wire form of QUESTIONS: what a real model actually sends on a fresh
+ * envelope. `allowBlank`/`maxLength` are app-owned and rejected as unknown
+ * fields by the strict fresh-envelope decoder (owner decision, 2026-08-16),
+ * so a scripted "model" response embedding QUESTIONS' full internal shape
+ * would be wrongly rejected — this is what frameFor's raw JSON must send.
+ */
+const QUESTIONS_WIRE: readonly Record<string, unknown>[] = QUESTIONS.map((q) => {
+  if (q.kind !== "text") {
+    return q as unknown as Record<string, unknown>;
+  }
+  const { allowBlank: _allowBlank, maxLength: _maxLength, ...rest } = q;
+  return rest as unknown as Record<string, unknown>;
+});
+
 /** Decode every emitted frame with the EXTENSION's own decoders. */
 function assertFramesDecodeUnderSrc(
   events: readonly EngineEventV1[],
@@ -539,7 +554,7 @@ test("Part 4b dispatch integration: the real provider runner drives a round/ques
       if (adapterInvocations.length === 1) {
         return {
           status: "completed",
-          text: frameFor(input.prompt, { kind: "questions", questions: QUESTIONS }),
+          text: frameFor(input.prompt, { kind: "questions", questions: QUESTIONS_WIRE }),
         };
       }
       return {

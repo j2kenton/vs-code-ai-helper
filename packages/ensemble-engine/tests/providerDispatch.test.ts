@@ -74,6 +74,63 @@ function frame(payload: unknown): string {
   return `<<<ENSEMBLE_AI_RESULT_V1>>>\n${JSON.stringify(payload)}\n<<<END_ENSEMBLE_AI_RESULT_V1>>>\n`;
 }
 
+/**
+ * Mirrors src/test/aiResultEnvelope.test.ts's "corpus-realistic sizes"
+ * fixtures: the 2026-08-16 spool corpus was 9-13KB `markdown-artifact.v1`
+ * payloads across four action kinds (draft, implementation, review,
+ * apply-review), not a trivial small payload — this port must recover the
+ * same shape and scale, not just the mechanism, or a future change could
+ * pass the small-payload corpus above while still drifting from the
+ * extension at realistic size. Kept in one function so both files can stay
+ * in parity by construction: any edit to the shape must be made in both.
+ */
+function corpusRealisticSizeMarkdownBody(title: string, paragraphs: number): string {
+  const sections: string[] = [`# ${title}`, ""];
+  for (let i = 0; i < paragraphs; i++) {
+    sections.push(`## Section ${i + 1}`);
+    sections.push(
+      `This step touches \`src/module_${i}.ts\` and updates the \`{ "key": "value_${i}" }\` shape used ` +
+        `by callers such as \`doThing({ id: "${i}", nested: { ok: true } })\`. See the "quoted" note below.`
+    );
+    sections.push("```ts");
+    sections.push(`function handle_${i}(input: { a: number; b: string }): { ok: boolean } {`);
+    sections.push(`  if (input.a > ${i}) { return { ok: true }; }`);
+    sections.push(`  return { ok: false };`);
+    sections.push("}");
+    sections.push("```");
+    sections.push("");
+  }
+  return sections.join("\n");
+}
+
+function corpusRealisticSizeSurplusCloserEntries(): readonly { readonly name: string; readonly raw: string }[] {
+  const cases: ReadonlyArray<{ readonly label: string; readonly markdown: string }> = [
+    { label: "draft.v1", markdown: corpusRealisticSizeMarkdownBody("Draft plan", 28) },
+    { label: "generateImplementation.v1", markdown: corpusRealisticSizeMarkdownBody("Implementation summary", 28) },
+    {
+      label: "review.v1",
+      markdown: `Readiness: 8/10\n\n${corpusRealisticSizeMarkdownBody("Review findings", 28)}`,
+    },
+    {
+      label: "applyReview.v1",
+      markdown: `${corpusRealisticSizeMarkdownBody("Applied review", 28)}\nAll findings above were verified during inventory.`,
+    },
+  ];
+  return cases.map(({ label, markdown }) => {
+    const payload = {
+      version: 1,
+      correlation: CORRELATION,
+      kind: "completed" as const,
+      content: { contentType: "markdown-artifact.v1" as const, schemaVersion: 1 as const, markdown },
+    };
+    const serialized = JSON.stringify(payload);
+    return {
+      name: `corpus-scale ${label} payload with one surplus trailing closer recovers`,
+      raw: `<<<ENSEMBLE_AI_RESULT_V1>>>\n${serialized}}\n<<<END_ENSEMBLE_AI_RESULT_V1>>>`,
+    };
+  });
+}
+
 // ─── 1. Envelope dual-decode parity ─────────────────────────────────────────
 
 test("result-envelope corpus: engine port and src parser agree on every accept and reject", () => {
@@ -243,6 +300,28 @@ test("result-envelope corpus: engine port and src parser agree on every accept a
           kind: "cancelled",
         })}{"a":1}\n<<<END_ENSEMBLE_AI_RESULT_V1>>>`,
     },
+    ...corpusRealisticSizeSurplusCloserEntries(),
+    {
+      // 2026-08-16 workflow-fixes review, item seven: a Copilot `draft.v1`
+      // response closed with `<<<END_ENSEMBLE_RESULT_V1>>>` (missing "AI_")
+      // and was accepted anyway. Pinned deliberately as a single enumerated
+      // legacy alias in both parsers — this is the case that would drift if
+      // only one side gained the tolerance.
+      name: "legacy END_ENSEMBLE_RESULT_V1 terminator accepts",
+      raw: `<<<ENSEMBLE_AI_RESULT_V1>>>\n${JSON.stringify({
+        version: 1,
+        correlation: CORRELATION,
+        kind: "cancelled",
+      })}\n<<<END_ENSEMBLE_RESULT_V1>>>`,
+    },
+    {
+      name: "arbitrary near-miss terminator still rejects",
+      raw: `<<<ENSEMBLE_AI_RESULT_V1>>>\n${JSON.stringify({
+        version: 1,
+        correlation: CORRELATION,
+        kind: "cancelled",
+      })}\n<<<END_ENSEMBLE_RESULT>>>`,
+    },
   ];
 
   for (const entry of corpus) {
@@ -409,8 +488,6 @@ function scriptedAdapter(
                   kind: "text",
                   prompt: "Which module first?",
                   required: true,
-                  allowBlank: false,
-                  maxLength: 100,
                 },
               ],
             }),

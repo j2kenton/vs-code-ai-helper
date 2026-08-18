@@ -69,14 +69,15 @@ export function describeTaskActionOutcomeForLogV1(
     case "questions":
       return (
         `Status: questions (interactionId=${outcome.interactionId}) — the AI asked a clarifying ` +
-        `question in Chat With AI${questionsArtifactNote ? ` instead of writing ${questionsArtifactNote}` : ""}.`
+        `question in Chat With AI${questionsArtifactNote ? ` instead of writing ${questionsArtifactNote}` : ""}.` +
+        providerLogSuffix(outcome.provider)
       );
     case "cancelled":
-      return `Status: cancelled (${outcome.code})`;
+      return `Status: cancelled (${outcome.code})${providerLogSuffix(outcome.provider)}`;
     case "failed":
       return `Status: failed (code=${outcome.code}${
         outcome.detail ? `: ${outcome.detail}` : ""
-      }, retryable=${outcome.retryable})`;
+      }, retryable=${outcome.retryable})${providerLogSuffix(outcome.provider)}`;
     case "malformedResult":
       return `Status: malformed result (${outcome.code}${outcome.detail ? `: ${outcome.detail}` : ""})${providerLogSuffix(outcome.provider)}`;
     case "unavailable":
@@ -100,9 +101,9 @@ export function describeTaskActionFailureV1(outcome: TaskActionOutcomeV1): strin
     case "failed":
       return `${outcome.code}${outcome.detail ? `: ${outcome.detail}` : ""}${
         outcome.retryable ? " (retryable)" : ""
-      }`;
+      }${providerLogSuffix(outcome.provider)}`;
     case "malformedResult":
-      return `the model's response was malformed (${outcome.code}${outcome.detail ? `: ${outcome.detail}` : ""})`;
+      return `the model's response was malformed (${outcome.code}${outcome.detail ? `: ${outcome.detail}` : ""})${providerLogSuffix(outcome.provider)}`;
     case "unavailable":
       return outcome.code;
     case "recoveryRequired":

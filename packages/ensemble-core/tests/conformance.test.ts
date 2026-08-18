@@ -23,11 +23,15 @@ import * as coreQuestions from "../src/structuredQuestionV1";
 import * as coreChat from "../src/chatInteractionTransactionV1";
 import * as coreProgress from "../src/taskProgressDecoderV1";
 import { sha256HexUtf8V1 } from "../src/sha256V1";
+import { buildAiResultContractPromptV1 as coreBuildContractPrompt } from "../src/aiResultContractV1";
+import { allocateHex128IdV1 as coreAllocateHex128IdV1 } from "../src/actionCorrelationV1";
 
 // --- the extension's own decoders (parity oracles) --------------------------
 import * as srcQuestions from "../../../src/types/structuredQuestionV1";
 import * as srcChat from "../../../src/types/chatInteractionTransactionV1";
 import * as srcProgress from "../../../src/services/taskProgressDecoderV1";
+import { buildAiResultContractPromptV1 as srcBuildContractPrompt } from "../../../src/prompts/aiResultContractV1";
+import { allocateHex128IdV1 as srcAllocateHex128IdV1 } from "../../../src/types/actionCorrelationV1";
 
 function findRepoRoot(): string {
   let dir = __dirname;
@@ -145,6 +149,9 @@ const QUESTION_FIXTURE_CONTRACTS: Record<string, "questions" | "answers"> = {
   "selection-bounds-exceed-options.json": "questions",
   "invalid-question-id-pattern.json": "questions",
   "too-few-options.json": "questions",
+  "valid-text-copilot-security-scope.json": "questions",
+  "allow-blank-only-on-text-question.json": "questions",
+  "max-length-only-on-text-question.json": "questions",
   "end-to-end-answers.json": "answers",
   "end-to-end-answers-skip-required.json": "answers",
   "unknown-field-on-skipped-answer.json": "answers",
@@ -184,6 +191,23 @@ test("structured-questions corpus: dual decode agrees for every fixture", () => 
           srcQuestions.canonicalJsonTextV1(fromSrc.questions),
           `${name}: canonical JSON text differs`
         );
+      }
+
+      // Cross-check the strict FRESH-envelope ("wire") decoder too — until
+      // this assertion, `decodeStructuredQuestionsFromProviderV1` had no
+      // dual-decode parity test at all, so `packages/ensemble-core` and
+      // `src` could silently diverge on which fields a model may send
+      // without either verifier noticing.
+      const fromSrcWire = srcQuestions.decodeStructuredQuestionsFromProviderV1(data);
+      const fromCoreWire = coreQuestions.decodeStructuredQuestionsFromProviderV1(data);
+      assert.equal(
+        fromCoreWire.ok,
+        fromSrcWire.ok,
+        `${name}: wire-decoder verdict divergence (src ${fromSrcWire.ok ? "valid" : `invalid: ${fromSrcWire.reason}`}, ` +
+          `core ${fromCoreWire.ok ? "valid" : `invalid: ${fromCoreWire.reason}`})`
+      );
+      if (fromSrcWire.ok && fromCoreWire.ok) {
+        assert.deepEqual(fromCoreWire.questions, fromSrcWire.questions, `${name}: wire-decoded questions differ`);
       }
     } else {
       const fromSrc = srcQuestions.decodeStructuredAnswersArrayV1(data);
@@ -226,6 +250,82 @@ test("structured-questions corpus: paired answer validation agrees", () => {
       `${pair.answers}: paired validation diverges (src ${srcVerdict.ok}, core ${coreVerdict.ok})`
     );
   }
+});
+
+test("textAnswerPolicyV1: core and src agree, and both ignore a historical stored maxLength", () => {
+  // max-length-only-on-text-question.json carries a PERSISTED-shaped
+  // maxLength (500) that is deliberately non-default, exactly the shape the
+  // 2026-08-16 owner decision says must NOT drive runtime behaviour: only
+  // DEFAULT_TEXT_ANSWER_MAX_LENGTH_V1 (app-owned) may.
+  const dir = path.join(fixturesRoot, "structured-questions");
+  const data = readJson(path.join(dir, "max-length-only-on-text-question.json"));
+  const fromSrc = srcQuestions.decodeStructuredQuestionsV1(data);
+  const fromCore = coreQuestions.decodeStructuredQuestionsV1(data);
+  assert.ok(fromSrc.ok && fromSrc.questions && fromSrc.questions.length === 1, "src must decode the persisted fixture");
+  assert.ok(fromCore.ok && fromCore.questions && fromCore.questions.length === 1, "core must decode the persisted fixture");
+  if (!fromSrc.ok || !fromSrc.questions || !fromCore.ok || !fromCore.questions) return;
+  const srcQuestion = fromSrc.questions[0];
+  const coreQuestion = fromCore.questions[0];
+  assert.ok(srcQuestion && coreQuestion, "both sides must decode exactly one question");
+  if (!srcQuestion || !coreQuestion) return;
+  assert.equal(srcQuestion.kind, "text");
+  assert.equal(coreQuestion.kind, "text");
+  if (srcQuestion.kind !== "text" || coreQuestion.kind !== "text") return;
+
+  // The decoded question still round-trips the historical 500 (needed for
+  // questionSetSha256), but the policy function must ignore it.
+  assert.equal(srcQuestion.maxLength, 500);
+  assert.equal(coreQuestion.maxLength, 500);
+
+  const srcPolicy = srcQuestions.textAnswerPolicyV1(srcQuestion);
+  const corePolicy = coreQuestions.textAnswerPolicyV1(coreQuestion);
+  assert.deepEqual(corePolicy, srcPolicy, "core and src policy must agree");
+  assert.equal(srcPolicy.maxLength, srcQuestions.DEFAULT_TEXT_ANSWER_MAX_LENGTH_V1);
+  assert.equal(srcPolicy.allowBlank, !srcQuestion.required);
+
+  // An answer longer than the historical 500 but within the app default of
+  // 4000 must be ACCEPTED — proving validateStructuredAnswersV1 itself (not
+  // just the standalone policy function) no longer honours the stored value.
+  const longAnswer = "x".repeat(600);
+  const srcVerdict = srcQuestions.validateStructuredAnswersV1(fromSrc.questions, [
+    { questionId: "q1", kind: "text", state: "answered", value: longAnswer },
+  ]);
+  const coreVerdict = coreQuestions.validateStructuredAnswersV1(fromCore.questions, [
+    { questionId: "q1", kind: "text", state: "answered", value: longAnswer },
+  ]);
+  assert.equal(srcVerdict.ok, true, `src: ${srcVerdict.reason ?? ""}`);
+  assert.equal(coreVerdict.ok, true, `core: ${coreVerdict.reason ?? ""}`);
+});
+
+test("aiResultContractV1: core and src emit byte-identical \"questions\" contract text", () => {
+  // The literal per-kind examples (added 2026-08-16 to replace the "..."
+  // ellipsis that caused a live contentSchemaMismatch) must stay identical
+  // between the extension's prompt builder and this package's port, or the
+  // two codebases could silently start telling models different contracts
+  // again.
+  const correlation = {
+    actionKey: "contractParityTestAction.v1",
+    operationId: srcAllocateHex128IdV1(),
+    attemptId: srcAllocateHex128IdV1(),
+    taskBindingId: "task-binding-digest",
+    chatDocumentId: "chat-document-id",
+  };
+  assert.equal(typeof coreAllocateHex128IdV1(), "string", "core allocator must be callable");
+
+  const srcText = srcBuildContractPrompt({
+    correlation,
+    permittedResultKinds: ["completed", "questions"],
+    completedContentType: "markdown-artifact.v1",
+    maxResponseBytes: 4096,
+  });
+  const coreText = coreBuildContractPrompt({
+    correlation,
+    permittedResultKinds: ["completed", "questions"],
+    completedContentType: "markdown-artifact.v1",
+    maxResponseBytes: 4096,
+  });
+  assert.equal(coreText, srcText, "core and src must emit byte-identical contract prompts");
+  assert.doesNotMatch(srcText, /"prompt","required",\.\.\.\}/, "the questions contract must not regress to an ellipsis");
 });
 
 // ---------------------------------------------------------------------------

@@ -115,10 +115,28 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-export interface StructuredQuestionValidationResult {
+interface StructuredQuestionValidationResultBase {
   readonly ok: boolean;
   readonly reason?: string;
   readonly questions?: readonly StructuredQuestionV1[];
+}
+
+/**
+ * Branded result of {@link decodeStructuredQuestionsV1}, the PERSISTED-path
+ * decoder. Distinct from {@link WireStructuredQuestionValidationResult} by
+ * its `provenance` literal, not just by name: a caller that declares a
+ * variable typed as one cannot assign the other's result to it, so a fresh
+ * envelope accidentally routed through the persisted decoder (or vice versa)
+ * is a type error, not a runtime surprise (plan §3.8, "distinct types or
+ * branded return values").
+ */
+export interface PersistedStructuredQuestionValidationResult extends StructuredQuestionValidationResultBase {
+  readonly provenance: "persisted";
+}
+
+/** Branded result of {@link decodeStructuredQuestionsFromProviderV1}, the FRESH model-wire decoder. */
+export interface WireStructuredQuestionValidationResult extends StructuredQuestionValidationResultBase {
+  readonly provenance: "wire";
 }
 
 function rejectUnknownFields(
@@ -303,11 +321,23 @@ function decodeQuestion(raw: unknown): StructuredQuestionV1 | string {
 }
 
 /**
- * Validate a raw `questions` array against every §3.6 rule: 1-16 questions,
- * unique bounded IDs, and per-kind option/cardinality bounds. Canonical byte
- * size is checked by the caller (it has the original serialized block).
+ * Shared body for both decoders below: 1-16 questions, unique bounded IDs,
+ * and per-kind option/cardinality bounds. Canonical byte size is checked by
+ * the caller (it has the original serialized block).
+ *
+ * `rejectModelOwnedTextFields` is the ONLY behavioral difference between the
+ * persisted and wire paths: when true, a text question carrying `allowBlank`
+ * or `maxLength` at all is rejected as an unknown field rather than
+ * accepted-and-preserved, because those are app-owned interface details a
+ * model has no basis to choose (owner decision, 2026-08-16), and the result
+ * contract no longer documents them. The exported wrappers apply the
+ * provenance brand; this function returns the unbranded base shape so it can
+ * never itself be mistaken for either public decoder's result.
  */
-export function decodeStructuredQuestionsV1(raw: unknown): StructuredQuestionValidationResult {
+function decodeQuestionsCommonV1(
+  raw: unknown,
+  rejectModelOwnedTextFields: boolean
+): StructuredQuestionValidationResultBase {
   if (!Array.isArray(raw)) {
     return { ok: false, reason: "\"questions\" is not an array" };
   }
@@ -320,6 +350,20 @@ export function decodeStructuredQuestionsV1(raw: unknown): StructuredQuestionVal
   const questions: StructuredQuestionV1[] = [];
   const seenIds = new Set<string>();
   for (const entry of raw) {
+    if (rejectModelOwnedTextFields && isPlainRecord(entry) && entry.kind === "text") {
+      if (Object.prototype.hasOwnProperty.call(entry, "allowBlank")) {
+        return {
+          ok: false,
+          reason: `text question "${String(entry.questionId)}" has an unknown field: allowBlank (app-owned, not sent by a model)`,
+        };
+      }
+      if (Object.prototype.hasOwnProperty.call(entry, "maxLength")) {
+        return {
+          ok: false,
+          reason: `text question "${String(entry.questionId)}" has an unknown field: maxLength (app-owned, not sent by a model)`,
+        };
+      }
+    }
     const decoded = decodeQuestion(entry);
     if (typeof decoded === "string") {
       return { ok: false, reason: decoded };
@@ -331,6 +375,64 @@ export function decodeStructuredQuestionsV1(raw: unknown): StructuredQuestionVal
     questions.push(decoded);
   }
   return { ok: true, questions };
+}
+
+/**
+ * Validate a raw `questions` array against every §3.6 rule.
+ *
+ * PERSISTED-PATH DECODER. This tolerates a present `allowBlank`/`maxLength`
+ * on a text question (preserving them verbatim) because it is also used to
+ * replay a question set already stored in a chat transaction, whose
+ * `questionSetSha256` is computed over those decoded values — rewriting or
+ * rejecting them here would make stored interactions fail to resume. Fresh
+ * provider/model envelopes must NOT be decoded with this function; use
+ * {@link decodeStructuredQuestionsFromProviderV1} instead, which rejects
+ * `allowBlank`/`maxLength` as the model's fields to send. The two decoders
+ * return distinctly branded types precisely so a caller cannot mix them up
+ * without a type error.
+ */
+export function decodeStructuredQuestionsV1(raw: unknown): PersistedStructuredQuestionValidationResult {
+  return { ...decodeQuestionsCommonV1(raw, false), provenance: "persisted" };
+}
+
+/**
+ * Strict FRESH-envelope decoder for a raw `questions` array straight from a
+ * provider/model result. Identical to {@link decodeStructuredQuestionsV1}
+ * except a text question carrying `allowBlank` or `maxLength` at all is
+ * rejected as an unknown field, not silently accepted-and-preserved: those
+ * are app-owned interface details a model has no basis to choose (owner
+ * decision, 2026-08-16), and the result contract no longer documents them.
+ * Use the other decoder for persisted/resumed question sets, where a
+ * present value must round-trip verbatim to keep `questionSetSha256` valid.
+ */
+export function decodeStructuredQuestionsFromProviderV1(raw: unknown): WireStructuredQuestionValidationResult {
+  return { ...decodeQuestionsCommonV1(raw, true), provenance: "wire" };
+}
+
+/**
+ * Central app policy for a text question's answer box (owner decision,
+ * 2026-08-16): required text cannot be blank, optional text may be blank,
+ * and {@link DEFAULT_TEXT_ANSWER_MAX_LENGTH_V1} is the length limit —
+ * regardless of any `allowBlank`/`maxLength` value a decoded question
+ * carries. Those two fields are preserved on a PERSISTED question only so
+ * its `questionSetSha256` still round-trips (see
+ * {@link decodeStructuredQuestionsV1}); they must never drive runtime
+ * behaviour, or a historical record with a non-default stored value (or the
+ * `required: true` + `allowBlank: true` shape this decision explicitly
+ * closed) would silently override the app's own policy.
+ *
+ * `overrideMaxLength` exists solely for a CODE-OWNED caller to pick a
+ * different bound; provider/model input can never reach this parameter,
+ * since the wire decoder rejects `maxLength` outright.
+ */
+export function textAnswerPolicyV1(
+  question: Extract<StructuredQuestionV1, { kind: "text" }>,
+  overrideMaxLength?: number
+): { readonly allowBlank: boolean; readonly maxLength: number } {
+  return {
+    allowBlank: !question.required,
+    maxLength: overrideMaxLength ?? DEFAULT_TEXT_ANSWER_MAX_LENGTH_V1,
+  };
 }
 
 /**
@@ -367,10 +469,16 @@ export function validateStructuredAnswersV1(
       continue;
     }
     if (question.kind === "text" && answer.kind === "text") {
-      if (answer.value.length === 0 && !question.allowBlank) {
+      // Both bounds come from the central app policy, not the decoded
+      // question's own `allowBlank`/`maxLength`: a historical persisted
+      // record's values are migration-only data (preserved so its
+      // `questionSetSha256` still round-trips) and must not override runtime
+      // behaviour (owner decision, 2026-08-16).
+      const policy = textAnswerPolicyV1(question);
+      if (answer.value.length === 0 && !policy.allowBlank) {
         return { ok: false, reason: `question ${question.questionId} does not allow a blank answer` };
       }
-      if (answer.value.length > question.maxLength) {
+      if (answer.value.length > policy.maxLength) {
         return { ok: false, reason: `answer for ${question.questionId} exceeds maxLength` };
       }
     } else if (question.kind === "singleChoice" && answer.kind === "singleChoice") {

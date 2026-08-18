@@ -161,6 +161,7 @@ import {
 } from "../services/agentExecutionBrokerV1";
 import {
   AttemptOutcomeKindV1,
+  classifyProviderCandidateDispositionV1,
   openProviderSelectionSessionV1,
   ProviderSelectionSessionV1,
 } from "../services/providerSelectionPolicyV1";
@@ -915,12 +916,12 @@ async function preserveRejectedResultForRecoveryV1(
  * (private extension storage, not the task's `runs/` directory) and the
  * command that reads it back, or stating plainly why no copy exists.
  */
-function preservationDetailFragmentV1(outcome: PreserveRejectedResultOutcomeV1, operationId: string): string {
+function preservationDetailFragmentV1(outcome: PreserveRejectedResultOutcomeV1): string {
   if (outcome.ok) {
     return (
       `response preserved for recovery in extension private storage ` +
-      `(operationId=${operationId}, ~24h) — run "Recover Last AI Response" ` +
-      `(vs-code-ai-helper.recoverLastAiResponse, Ctrl+Shift+Alt+C) to read it back`
+      `(operationId=${outcome.ref.operationId}, reservationId=${outcome.ref.reservationId}, ~24h) — ` +
+      `run "Recover Last AI Response" (vs-code-ai-helper.recoverLastAiResponse, Ctrl+Shift+Alt+C) to read it back`
     );
   }
   return outcome.reason === "noSpoolStoreConfigured"
@@ -972,6 +973,10 @@ function attemptOutcomeReasonPhraseV1(outcome: AttemptOutcomeKindV1): string {
       return "invoked, but the response violated the output contract (malformed result)";
     case "malformedResultPreFallback":
       return "invoked, but the response violated the output contract (malformed result; advanced to the next candidate)";
+    case "contentContractFailure":
+      return "invoked, but the response failed the action's own content contract";
+    case "contentContractFailurePreFallback":
+      return "invoked, but the response failed the action's own content contract (advanced to the next candidate)";
     case "resultCorrelationMismatch":
       return "invoked, but the response echoed a foreign correlation";
     case "overflow":
@@ -1463,13 +1468,28 @@ export function createTaskActionCoordinatorV1(
       switch (raw.kind) {
         case "callerCancelled":
           session.reportAttemptOutcome(attemptId, "callerCancelled");
-          return { kind: "cancelled", correlation, code: "userCancelled" };
+          return {
+            kind: "cancelled",
+            correlation,
+            code: "userCancelled",
+            provider: { providerLabel: reserved.providerLabel, storedModelId: reserved.storedModelId },
+          };
         case "providerCancelled":
           session.reportAttemptOutcome(attemptId, "providerCancelled");
-          return { kind: "cancelled", correlation, code: "providerCancelled" };
+          return {
+            kind: "cancelled",
+            correlation,
+            code: "providerCancelled",
+            provider: { providerLabel: reserved.providerLabel, storedModelId: reserved.storedModelId },
+          };
         case "overflow":
           session.reportAttemptOutcome(attemptId, "overflow");
-          return { kind: "malformedResult", correlation, code: "resultLimitExceeded" };
+          return {
+            kind: "malformedResult",
+            correlation,
+            code: "resultLimitExceeded",
+            ...(context.provider ? { provider: context.provider } : {}),
+          };
         case "transportFailure":
           if (raw.responseStarted) {
             session.reportAttemptOutcome(
@@ -1483,6 +1503,7 @@ export function createTaskActionCoordinatorV1(
               code: raw.code,
               retryable: false,
               ...(raw.detail !== undefined ? { detail: raw.detail } : {}),
+              ...(context.provider ? { provider: context.provider } : {}),
             };
           }
           session.reportAttemptOutcome(attemptId, "transportFailurePreResponse", raw.detail);
@@ -1502,6 +1523,7 @@ export function createTaskActionCoordinatorV1(
                 code: raw.code,
                 retryable: true,
                 ...(raw.detail !== undefined ? { detail: raw.detail } : {}),
+                ...(context.provider ? { provider: context.provider } : {}),
               }
             );
           }
@@ -1591,7 +1613,7 @@ export function createTaskActionCoordinatorV1(
         );
         const detailParts = [
           reasonDetail,
-          preservationDetailFragmentV1(preservationResult, correlation.operationId),
+          preservationDetailFragmentV1(preservationResult),
         ].filter((part): part is string => part !== undefined);
         const malformedOutcomeV1: TaskActionOutcomeV1 = {
           kind: "malformedResult",
@@ -1615,6 +1637,64 @@ export function createTaskActionCoordinatorV1(
           continue;
         }
         return malformedOutcomeV1;
+      }
+
+      // Candidate-scoped content-contract check (2026-08-16 field report,
+      // fourth item): a schema-valid envelope can still fail a row's OWN
+      // content rule (review.v1's required `Readiness: N/10` line). That is
+      // a fault of THIS candidate's response, not of the target artifact, so
+      // it is decided — exactly like the malformed-envelope branch above —
+      // BEFORE `session.reportAttemptOutcome(attemptId, "completed")` closes
+      // the session, so a working next-ranked candidate can still run
+      // instead of the whole stage settling on a terminal `promotionFailed`
+      // that a different model would not have produced.
+      if (
+        parsed.kind === "completed" &&
+        parsed.content.contentType === row.completedContentType &&
+        row.validateCompletedContent
+      ) {
+        const contentValidation = row.validateCompletedContent(parsed.content, context);
+        if (!contentValidation.ok) {
+          if (malformedRetryEligibleV1) {
+            malformedBudgetArmedV1 = true;
+          }
+          const disposition = classifyProviderCandidateDispositionV1({
+            retryEligible: malformedRetryEligibleV1,
+            invocationsUsed: malformedInvocationCountV1,
+            maxInvocations: MAX_MALFORMED_RESULT_INVOCATIONS_V1,
+          });
+          const willAdvanceContractV1 = disposition === "advanceCandidate";
+          session.reportAttemptOutcome(
+            attemptId,
+            willAdvanceContractV1 ? "contentContractFailurePreFallback" : "contentContractFailure"
+          );
+          const preservationResult = await preserveRejectedResultForRecoveryV1(
+            unsealed.text,
+            correlation,
+            reserved.handle.reservationId,
+            deps.brokerOptions,
+            { providerLabel: reserved.providerLabel, storedModelId: reserved.storedModelId }
+          );
+          const contractOutcomeV1: TaskActionOutcomeV1 = {
+            kind: "failed",
+            correlation,
+            code: "contentContractFailed",
+            retryable: false,
+            detail: [
+              boundedDiagnosticDetailV1(contentValidation.reason),
+              preservationDetailFragmentV1(preservationResult),
+            ]
+              .filter((part): part is string => part !== undefined)
+              .join("; "),
+            ...(context.provider ? { provider: context.provider } : {}),
+          };
+          if (willAdvanceContractV1) {
+            malformedInvocationCountV1++;
+            lastMalformedOutcomeV1 = contractOutcomeV1;
+            continue;
+          }
+          return contractOutcomeV1;
+        }
       }
 
       return settleEnvelope(row, parsed, session, attemptId, context, acquireLeasePhase, promptSha256, {
@@ -1652,7 +1732,7 @@ export function createTaskActionCoordinatorV1(
         code: "contentSchemaMismatch",
         detail:
           `received result kind "${envelope.kind}", but ${row.actionKey} only permits: ${row.permittedResultKinds.join(", ")}; ` +
-          preservationDetailFragmentV1(preservationResult, correlation.operationId),
+          preservationDetailFragmentV1(preservationResult),
         ...(context.provider ? { provider: context.provider } : {}),
       };
     }
@@ -1673,7 +1753,7 @@ export function createTaskActionCoordinatorV1(
             code: "contentSchemaMismatch",
             detail:
               `received content type "${envelope.content.contentType}", expected "${row.completedContentType}"; ` +
-              preservationDetailFragmentV1(preservationResult, correlation.operationId),
+              preservationDetailFragmentV1(preservationResult),
             ...(context.provider ? { provider: context.provider } : {}),
           };
         }
@@ -1698,6 +1778,7 @@ export function createTaskActionCoordinatorV1(
             correlation,
             code: promotionFailureCodeV1(error instanceof Error ? error.message : String(error)),
             retryable: false,
+            ...(context.provider ? { provider: context.provider } : {}),
           };
         } finally {
           settlement.release();
@@ -1726,17 +1807,38 @@ export function createTaskActionCoordinatorV1(
           if (posted.code === "workflowStorageUnavailable") {
             return unavailableV1("workflowStorageUnavailable");
           }
-          return { kind: "failed", correlation, code: "chatTransactionNotRecorded", retryable: true };
+          return {
+            kind: "failed",
+            correlation,
+            code: "chatTransactionNotRecorded",
+            retryable: true,
+            ...(context.provider ? { provider: context.provider } : {}),
+          };
         }
-        return { kind: "questions", correlation, interactionId: posted.record.interactionId };
+        return {
+          kind: "questions",
+          correlation,
+          interactionId: posted.record.interactionId,
+          ...(context.provider ? { provider: context.provider } : {}),
+        };
       }
       case "cancelled": {
         if (envelope.reason === "user") {
           session.reportAttemptOutcome(attemptId, "callerCancelled");
-          return { kind: "cancelled", correlation, code: "userCancelled" };
+          return {
+            kind: "cancelled",
+            correlation,
+            code: "userCancelled",
+            ...(context.provider ? { provider: context.provider } : {}),
+          };
         }
         session.reportAttemptOutcome(attemptId, "providerCancelled");
-        return { kind: "cancelled", correlation, code: "providerCancelled" };
+        return {
+          kind: "cancelled",
+          correlation,
+          code: "providerCancelled",
+          ...(context.provider ? { provider: context.provider } : {}),
+        };
       }
       case "failed": {
         session.reportAttemptOutcome(attemptId, "providerDeclaredFailure");
@@ -1745,6 +1847,7 @@ export function createTaskActionCoordinatorV1(
           correlation,
           code: envelope.code,
           retryable: envelope.retryable,
+          ...(context.provider ? { provider: context.provider } : {}),
         };
       }
     }

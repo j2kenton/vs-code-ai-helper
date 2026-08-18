@@ -52,6 +52,7 @@ import {
 } from "../types/actionCorrelationV1";
 import {
   canonicalJsonByteLengthV1,
+  DEFAULT_TEXT_ANSWER_MAX_LENGTH_V1,
   MAX_ANSWER_SUBMISSION_CANONICAL_BYTES_V1,
   StructuredAnswerV1,
   StructuredQuestionV1,
@@ -510,7 +511,19 @@ void describe("actionConversationOrchestratorV1", () => {
     assert.match(failureReason(result), /unknown field/i);
   });
 
-  void it("accepts an exact-limit answer submission", async () => {
+  void it("accepts an answer at the app-owned maxLength boundary, ignoring a question's own larger maxLength", async () => {
+    // This question claims a maxLength far above the 128 KiB byte cap — the
+    // exact shape the 2026-08-16 owner decision closes: maxLength is
+    // app-owned and IGNORED at runtime even when a decoded question carries
+    // a different value (textAnswerPolicyV1 in structuredQuestionV1.ts). So
+    // the real accepted boundary end-to-end through submitAnswers is
+    // DEFAULT_TEXT_ANSWER_MAX_LENGTH_V1, not whatever the question claims —
+    // which sits far below MAX_ANSWER_SUBMISSION_CANONICAL_BYTES_V1 (pinned
+    // independently by "enforces the 128 KiB..." above). Before the app
+    // policy landed, this test constructed an answer at the raw byte cap by
+    // exploiting a huge question-supplied maxLength; that construction can no
+    // longer succeed, because the app policy now caps it long before the raw
+    // byte check is reached.
     const correlation = fakeCorrelation();
     const largeTextQuestion: readonly StructuredQuestionV1[] = [
       {
@@ -533,17 +546,42 @@ void describe("actionConversationOrchestratorV1", () => {
       chatDocumentId: correlation.chatDocumentId,
       sourceAttemptId: correlation.attemptId,
     };
-    const emptyTemplate: readonly StructuredAnswerV1[] = [
-      { questionId: "q1", kind: "text", state: "answered", value: "" },
+    const atAppOwnedLimit = [
+      { questionId: "q1", kind: "text", state: "answered", value: "x".repeat(DEFAULT_TEXT_ANSWER_MAX_LENGTH_V1) },
     ];
-    const emptyLen = canonicalJsonByteLengthV1(emptyTemplate);
-    const neededChars = MAX_ANSWER_SUBMISSION_CANONICAL_BYTES_V1 - emptyLen;
-    const exactLimit = [
-      { questionId: "q1", kind: "text", state: "answered", value: "x".repeat(neededChars) },
-    ];
-    assert.equal(canonicalJsonByteLengthV1(exactLimit), MAX_ANSWER_SUBMISSION_CANONICAL_BYTES_V1);
-    const result = await orchestrator.submitAnswers(ref, exactLimit, allocateHex128IdV1());
+    const result = await orchestrator.submitAnswers(ref, atAppOwnedLimit, allocateHex128IdV1());
     assert.equal(result.ok, true, failureReason(result));
+  });
+
+  void it("rejects an answer one character past the app-owned maxLength, regardless of the question's own maxLength", async () => {
+    const correlation = fakeCorrelation();
+    const largeTextQuestion: readonly StructuredQuestionV1[] = [
+      {
+        questionId: "q1",
+        kind: "text",
+        prompt: "Write a very long answer?",
+        required: true,
+        allowBlank: false,
+        maxLength: MAX_ANSWER_SUBMISSION_CANONICAL_BYTES_V1,
+      },
+    ];
+    const posted = await orchestrator.postQuestions(
+      postInput(correlation, "sameOperation", largeTextQuestion)
+    );
+    expectPosted(posted);
+    const ref: InteractionRefV1 = {
+      operationId: correlation.operationId,
+      interactionId: posted.record.interactionId,
+      taskBindingId: correlation.taskBindingId,
+      chatDocumentId: correlation.chatDocumentId,
+      sourceAttemptId: correlation.attemptId,
+    };
+    const overAppOwnedLimit = [
+      { questionId: "q1", kind: "text", state: "answered", value: "x".repeat(DEFAULT_TEXT_ANSWER_MAX_LENGTH_V1 + 1) },
+    ];
+    const result = await orchestrator.submitAnswers(ref, overAppOwnedLimit, allocateHex128IdV1());
+    assert.equal(result.ok, false);
+    assert.match(failureReason(result), /exceeds maxLength/);
   });
 
   void it("rejects a limit-plus-one answer submission", async () => {

@@ -154,7 +154,11 @@ import {
 } from "../actions/productionTaskActionRuntimeV1";
 import { ActionConversationOrchestratorV1, InteractionRefV1 } from "../actions/actionConversationOrchestratorV1";
 import { GENERATE_IMPLEMENTATION_ACTION_KEY_V1 } from "../actions/rows/generateImplementationRowV1";
-import { REVIEW_ACTION_KEY_V1, ReviewActionInputV1 } from "../actions/rows/reviewRowV1";
+import {
+  REVIEW_ACTION_KEY_V1,
+  ReviewActionInputV1,
+  PublishReviewFreshnessGuardV1,
+} from "../actions/rows/reviewRowV1";
 import { APPLY_REVIEW_ACTION_KEY_V1, ApplyReviewActionInputV1 } from "../actions/rows/applyReviewRowV1";
 import { NEXT_STAGE_ACTION_KEY_V1 } from "../actions/rows/nextStageRowV1";
 import { ProviderChainExhaustionV1, TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
@@ -194,6 +198,10 @@ import {
   synthesizeMechanicalBlockers,
 } from "../utils/completionLint";
 import { checkPublishPreflight } from "../utils/publishPreflight";
+import {
+  checkPublishChecksFreshnessV1,
+  describePublishChecksFreshnessFailureV1,
+} from "../utils/publishChecksFreshness";
 import { improveReviewScore } from "../utils/reviewScoreLoop";
 import { countCommitsSinceSha, resolveHeadCommitSha } from "../utils/gitRepoInfo";
 import {
@@ -1393,6 +1401,62 @@ async function readPreviousReviewForRereview(
  * could not be run at all — an unrunnable check is missing evidence, not a
  * known failure, so nothing can be synthesized from it.
  */
+/**
+ * Publish review freshness gate (plan PART 2, step 7): refuse to build a
+ * Publish review prompt unless `publish-checks.md` carries a valid stamp for
+ * the CURRENT verification scope and commit. Every entry point that can
+ * start a Publish review — direct review, Fast Forward, automatic review,
+ * and resumed review — must call this before it reads/derives any other
+ * review content, so a stale or absent Publish Checks run can never be
+ * consumed as though it were current. A refusal here is an explicit warning
+ * naming the remedy (run Publish Checks), never a silent downgrade to a
+ * model-visible note — the review is not started at all.
+ *
+ * Always passes (`ok: true`, no `guard`) for any stage other than
+ * `"publish"`. On a `"publish"` acceptance, also returns a
+ * {@link PublishReviewFreshnessGuardV1} captured from THIS SAME accepted
+ * stamp, for the caller to carry through the attempt and re-check
+ * immediately before promotion (`reviewRowV1.ts`'s
+ * `revalidatePublishFreshnessOrThrowV1`) — the entry gate alone only proves
+ * freshness at dispatch time, not at the write that follows the (possibly
+ * minutes-long) provider call.
+ */
+async function requirePublishChecksFreshnessOrWarnV1(
+  folderUri: vscode.Uri,
+  targetStage: TaskStage
+): Promise<{ ok: true; guard?: PublishReviewFreshnessGuardV1 } | { ok: false }> {
+  if (targetStage !== "publish") {
+    return { ok: true };
+  }
+  const progress = await readTaskProgressAdvisoryV1(folderUri);
+  const { folder: scopeFolder } = resolvePublishScopeFolder(folderUri, progress);
+  const currentCommitSha = await resolveHeadCommitSha(scopeFolder);
+  const check = await checkPublishChecksFreshnessV1(folderUri, scopeFolder, currentCommitSha);
+  if (check.status === "valid") {
+    return {
+      ok: true,
+      guard: {
+        taskFolderPath: folderUri.fsPath,
+        scopeFolderPath: scopeFolder,
+        runId: check.stamp.runId,
+        verifiedCommitSha: check.stamp.verifiedCommitSha,
+      },
+    };
+  }
+  NotificationRouter.showWarning(
+    describePublishChecksFreshnessFailureV1(check),
+    undefined,
+    undefined,
+    undefined,
+    {
+      command: "vs-code-ai-helper.runPublishChecks",
+      title: "Run Publish Checks",
+      args: [{ taskFolderPath: folderUri.fsPath }],
+    }
+  );
+  return { ok: false };
+}
+
 async function buildVerifiedChecksVariable(
   folderUri: vscode.Uri,
   relevantFiles: readonly string[] | undefined,
@@ -2685,6 +2749,10 @@ export async function runReviewForFolder(
 
   const variables: Record<string, string> = {};
   const isPlanReview = isPlanReviewStage(targetStage);
+  // Captured (publish stage only) when the entry-point freshness gate below
+  // accepts a stamp, and carried all the way to the CAS write so
+  // `promoteReviewContentV1` can re-check it immediately before promotion.
+  let publishFreshnessGuard: PublishReviewFreshnessGuardV1 | undefined;
   const previousReview =
     currentStage === targetStage
       ? await readPreviousReviewForRereview(reviewUri)
@@ -2742,6 +2810,11 @@ export async function runReviewForFolder(
     }
     variables.plan = planContent;
   } else {
+    const freshnessGate = await requirePublishChecksFreshnessOrWarnV1(folderUri, targetStage);
+    if (!freshnessGate.ok) {
+      return;
+    }
+    publishFreshnessGuard = freshnessGate.guard;
     // Implementation reviews need two distinct artifacts:
     //
     //   {{plan}} — the plan the implementation was supposed to follow.
@@ -2927,6 +3000,7 @@ export async function runReviewForFolder(
     prompt,
     targetLocator,
     ...(reviewBaselineRevision !== undefined ? { baselineRevision: reviewBaselineRevision } : {}),
+    ...(publishFreshnessGuard !== undefined ? { publishFreshnessGuard } : {}),
   };
 
   const outcome = await coordinator.executeAction({
@@ -7712,6 +7786,19 @@ async function buildReviewResumeVariablesV1(
   variables.plan = planContent;
 
   if (!isPlanReview) {
+    // Publish freshness gate (plan PART 2, step 7): a resumed review must be
+    // refused exactly like a fresh one when Publish Checks are absent or
+    // stale — resuming is still "building a Publish review prompt", just via
+    // a different entry point. No-op for non-publish targetStage.
+    if (targetStage === "publish") {
+      const progress = await readTaskProgressAdvisoryV1(folderUri);
+      const { folder: scopeFolder } = resolvePublishScopeFolder(folderUri, progress);
+      const currentCommitSha = await resolveHeadCommitSha(scopeFolder);
+      const freshnessCheck = await checkPublishChecksFreshnessV1(folderUri, scopeFolder, currentCommitSha);
+      if (freshnessCheck.status !== "valid") {
+        return { ok: false, warning: describePublishChecksFreshnessFailureV1(freshnessCheck) };
+      }
+    }
     // Same resolver and same order as runReviewForFolder — a resumed review
     // (and any second opinion routed off it) must see the SAME
     // {{implementation}} the original review saw. Reading plan-final.md

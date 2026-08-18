@@ -15,6 +15,7 @@ import {
   AgentExecutionRequestV1,
   AgentTransportExitV1,
   AgentTransportV1,
+  boundedTransportDetailV1,
   BoundedResultWriterV1,
 } from "../types/agentExecutionV1";
 import { FRAME_START_V1 } from "../types/aiResultEnvelope";
@@ -672,6 +673,8 @@ function unwrapJsonString(value: string): string {
     const parsed: unknown = JSON.parse(trimmed);
     return typeof parsed === "string" ? parsed : value;
   } catch {
+    // Not valid JSON after all — keep the original text as-is rather than
+    // treating a parse failure as a transport error.
     return value;
   }
 }
@@ -1872,8 +1875,13 @@ export function createCliTextTransportV1(options: {
           // mode 0o600 for the same reason as the legacy path: prompts can
           // embed full context packs on a world-readable shared tmpdir.
           nodeFs.writeFileSync(promptFile, request.prompt, { encoding: "utf8", mode: 0o600 });
-        } catch {
-          return Promise.resolve({ kind: "transportFailure", code: "cliPromptFileWriteFailed" });
+        } catch (error) {
+          const detail = boundedTransportDetailV1(error);
+          return Promise.resolve({
+            kind: "transportFailure",
+            code: "cliPromptFileWriteFailed",
+            ...(detail !== undefined ? { detail } : {}),
+          });
         }
       }
       const cleanupPromptFile = (): void => {
@@ -1901,9 +1909,14 @@ export function createCliTextTransportV1(options: {
           promptFile,
           requiresFramedResult: true,
         });
-      } catch {
+      } catch (error) {
         cleanupPromptFile();
-        return Promise.resolve({ kind: "transportFailure", code: "cliArgumentBuildFailed" });
+        const detail = boundedTransportDetailV1(error);
+        return Promise.resolve({
+          kind: "transportFailure",
+          code: "cliArgumentBuildFailed",
+          ...(detail !== undefined ? { detail } : {}),
+        });
       }
       if (promptTransport === "argv") {
         if (checkArgvPromptSizeLimitV1(def, request.prompt).exceeds) {
@@ -1960,9 +1973,14 @@ export function createCliTextTransportV1(options: {
               env: { ...sanitizedCliEnv(), ...def.buildEnv?.(model) },
               detached: process.platform !== "win32",
             });
-          } catch {
+          } catch (error) {
             cleanupPromptFile();
-            resolve({ kind: "transportFailure", code: "cliSpawnFailed" });
+            const detail = boundedTransportDetailV1(error);
+            resolve({
+              kind: "transportFailure",
+              code: "cliSpawnFailed",
+              ...(detail !== undefined ? { detail } : {}),
+            });
             return;
           }
 

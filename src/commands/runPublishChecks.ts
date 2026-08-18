@@ -1,10 +1,11 @@
 import * as vscode from "vscode";
+import * as crypto from "node:crypto";
 import { TaskInventory } from "../state/taskInventory";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { IncompleteTask } from "../types/incompleteTask";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
-import { runCompletionLint } from "../utils/completionLint";
+import { runCompletionLint, resolvePublishScopeFolder } from "../utils/completionLint";
 import { runPublishScopeCheck } from "../utils/publishScopeCheck";
 import { ensureStageModelConfigured } from "../utils/modelSelection";
 import { safeOpenTextDocument } from "../utils/fileUtils";
@@ -14,6 +15,42 @@ import {
   taskOperations,
   TaskOperationHandle,
 } from "../utils/taskOperations";
+import { resolveHeadCommitSha } from "../utils/gitRepoInfo";
+import { normalizePath } from "../utils/taskRoot";
+import {
+  computePublishScopeId,
+  invalidatePublishChecksFreshnessStampOnDiskV1,
+  writePublishChecksFreshnessStampV1,
+} from "../utils/publishChecksFreshness";
+
+/**
+ * Per-task queue for `runPublishChecks` invocations (plan PART 2, step 6): a
+ * second trigger arriving while one is already running for the same task
+ * must queue behind it and resolve its OWN starting `HEAD` once it actually
+ * acquires its turn, rather than either interleaving with the active run or
+ * being refused outright. `runTrackedOperation`'s per-task exclusive lock is
+ * what makes two overlapping runs impossible; this queue is what turns that
+ * refusal into a wait, specifically for two `runPublishChecks` calls
+ * stacking on each other. Other exclusive operations (Implementation,
+ * Review, ...) are unaffected — they keep the ordinary busy refusal.
+ *
+ * @internal exported for testing
+ */
+const publishChecksRunQueues = new Map<string, Promise<unknown>>();
+
+/**
+ * @internal exported for testing
+ */
+export function queuePublishChecksRunV1<T>(
+  taskFolderPath: string,
+  fn: () => Promise<T>
+): Promise<T> {
+  const key = normalizePath(taskFolderPath);
+  const previous = publishChecksRunQueues.get(key) ?? Promise.resolve();
+  const run = previous.then(fn, fn);
+  publishChecksRunQueues.set(key, run.catch(() => undefined));
+  return run;
+}
 
 /**
  * Accepted argument shapes for runPublishChecks.
@@ -102,71 +139,114 @@ export async function runPublishChecks(
 
   const lockKey = taskFolderUri.fsPath;
 
-  await runTrackedOperation(
-    lockKey,
-    {
-      label: "Publish Checks",
-      stage: "publish",
-      taskName: resolvedTask.progress.displayName ?? resolvedTask.folderName,
-      kind: "completion-checks",
-      parent: parentOperation,
-    },
-    async () => {
-      await vscode.window.withProgress(
-        {
-          location: vscode.ProgressLocation.Window,
-          title: "Running Publish checks (lint, tests, plan verification)...",
-          cancellable: false,
-        },
-        async (progress) => {
-          NotificationRouter.emitProgressSummary(
-            "Running Publish checks...",
-            taskOperations.rootOperationIdFor(lockKey)
-          );
-          try {
-            progress.report({ message: "Running lint, type and test checks..." });
-            const result = await runCompletionLint(
-              taskFolderUri,
-              resolvedTask.progress.implReviewFiles
+  // Queue behind any other runPublishChecks call already in flight for this
+  // task (see queuePublishChecksRunV1) so a second closely-triggered run
+  // waits its turn instead of being refused. Everything that must observe
+  // this run's OWN starting HEAD — the scope guess and beforeSha below —
+  // lives inside this queued closure, so it is resolved only once this
+  // run actually acquires the lock, never at the moment it was triggered.
+  await queuePublishChecksRunV1(lockKey, () =>
+    runTrackedOperation(
+      lockKey,
+      {
+        label: "Publish Checks",
+        stage: "publish",
+        taskName: resolvedTask.progress.displayName ?? resolvedTask.folderName,
+        kind: "completion-checks",
+        parent: parentOperation,
+      },
+      async () => {
+        await vscode.window.withProgress(
+          {
+            location: vscode.ProgressLocation.Window,
+            title: "Running Publish checks (lint, tests, plan verification)...",
+            cancellable: false,
+          },
+          async (progress) => {
+            NotificationRouter.emitProgressSummary(
+              "Running Publish checks...",
+              taskOperations.rootOperationIdFor(lockKey)
             );
-            await runPublishScopeCheck(taskFolderUri, resolvedTask.progress);
+            try {
+              progress.report({ message: "Running lint, type and test checks..." });
 
-            // Keep the tree aligned with the persisted lint payload.
-            await inventory.refresh();
+              // Freshness stamp (plan PART 2, step 6): resolve HEAD before
+              // either check runs, invalidate any previous stamp so nothing
+              // can read a stamp whose commit predates this run's output, run
+              // both checks, then resolve HEAD again. Only write a new stamp
+              // when both resolve and match — proving the checks below ran
+              // back-to-back against one unchanged commit. A best-effort
+              // pre-run scope guess is used for the "before" SHA; the actual
+              // verified folder (known only once checks complete) is used for
+              // the "after" SHA and the stamped scope id, so a scope re-pick
+              // mid-run correctly fails the match rather than false-passing.
+              const scopeGuess = resolvePublishScopeFolder(
+                taskFolderUri,
+                resolvedTask.progress
+              ).folder;
+              const beforeSha = await resolveHeadCommitSha(scopeGuess);
+              await invalidatePublishChecksFreshnessStampOnDiskV1(taskFolderUri);
 
-            // Opens the report these checks just wrote, not the reviewer's
-            // artifact. This used to open publish-review.md and announce
-            // "Report saved" — but the checks only ever upserted a section
-            // partway down that file, so what surfaced was the AI verdict at
-            // the top, from whichever commit the last review ran against.
-            // Observed live 2026-08-11: a fully passing run opened a
-            // "Readiness: 2/10" document listing three blockers that had all
-            // been fixed, and re-running the checks could not change it.
-            await safeOpenTextDocument(
-              vscode.Uri.joinPath(taskFolderUri, PUBLISH_CHECKS_FILENAME),
-              "Publish checks report"
-            );
-
-            if (result.passed) {
-              NotificationRouter.showInformation(
-                `Publish checks passed. Report saved to ${PUBLISH_CHECKS_FILENAME}.`
+              const result = await runCompletionLint(
+                taskFolderUri,
+                resolvedTask.progress.implReviewFiles
               );
-            } else {
-              NotificationRouter.showWarning(
-                `Publish checks found issues: ${result.summary} ` +
-                  'Use "Fix Linting & Code Errors" to address the report.'
+              await runPublishScopeCheck(taskFolderUri, resolvedTask.progress);
+
+              const verifiedFolder = result.verifiedFolder ?? scopeGuess;
+              const afterSha = await resolveHeadCommitSha(verifiedFolder);
+              if (beforeSha && afterSha && beforeSha === afterSha) {
+                await writePublishChecksFreshnessStampV1(taskFolderUri, {
+                  formatVersion: 1,
+                  runId: crypto.randomUUID(),
+                  verifiedCommitSha: afterSha,
+                  completedAt: new Date().toISOString(),
+                  scopeId: computePublishScopeId(verifiedFolder),
+                });
+              }
+              // A mismatch (working tree advanced mid-run, or HEAD could not be
+              // resolved) leaves no stamp — the previous one was already
+              // invalidated above, so the report correctly reads as stale
+              // rather than carrying a commit that no longer matches its own
+              // check output.
+
+              // Keep the tree aligned with the persisted lint payload.
+              await inventory.refresh();
+
+              // Opens the report these checks just wrote, not the reviewer's
+              // artifact. This used to open publish-review.md and announce
+              // "Report saved" — but the checks only ever upserted a section
+              // partway down that file, so what surfaced was the AI verdict at
+              // the top, from whichever commit the last review ran against.
+              // Observed live 2026-08-11: a fully passing run opened a
+              // "Readiness: 2/10" document listing three blockers that had all
+              // been fixed, and re-running the checks could not change it.
+              await safeOpenTextDocument(
+                vscode.Uri.joinPath(taskFolderUri, PUBLISH_CHECKS_FILENAME),
+                "Publish checks report"
+              );
+
+              if (result.passed) {
+                NotificationRouter.showInformation(
+                  `Publish checks passed. Report saved to ${PUBLISH_CHECKS_FILENAME}.`
+                );
+              } else {
+                NotificationRouter.showWarning(
+                  `Publish checks found issues: ${result.summary} ` +
+                    'Use "Fix Linting & Code Errors" to address the report.'
+                );
+              }
+            } catch (error) {
+              NotificationRouter.showError(
+                `Publish checks failed to run: ${
+                  error instanceof Error ? error.message : String(error)
+                }`
               );
             }
-          } catch (error) {
-            NotificationRouter.showError(
-              `Publish checks failed to run: ${
-                error instanceof Error ? error.message : String(error)
-              }`
-            );
           }
-        }
-      );
-    }
+        );
+      }
+    )
   );
 }
 

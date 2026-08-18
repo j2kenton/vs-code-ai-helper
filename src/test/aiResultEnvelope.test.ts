@@ -1,7 +1,11 @@
 import * as assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { describe, it } from "node:test";
-import { parseAiResultEnvelopeV1, setInertTrailingObserverV1 } from "../types/aiResultEnvelope";
+import {
+  parseAiResultEnvelopeV1,
+  setInertTrailingObserverV1,
+  setLegacyFrameEndObserverV1,
+} from "../types/aiResultEnvelope";
 import { ActionCorrelationV1 } from "../types/actionCorrelationV1";
 import { DEFAULT_TEXT_ANSWER_MAX_LENGTH_V1 } from "../types/structuredQuestionV1";
 
@@ -387,8 +391,6 @@ void describe("parseAiResultEnvelopeV1 — questions", () => {
       kind: "text",
       prompt: "Anything else?",
       required: false,
-      allowBlank: true,
-      maxLength: 100,
     }));
     const raw = frame({ version: 1, correlation: correlation(), kind: "questions", questions });
     const result = parseAiResultEnvelopeV1(raw);
@@ -422,8 +424,8 @@ void describe("parseAiResultEnvelopeV1 — questions", () => {
       correlation: correlation(),
       kind: "questions",
       questions: [
-        { questionId: "q1", kind: "text", prompt: "A?", required: false, allowBlank: true, maxLength: 10 },
-        { questionId: "q1", kind: "text", prompt: "B?", required: false, allowBlank: true, maxLength: 10 },
+        { questionId: "q1", kind: "text", prompt: "A?", required: false },
+        { questionId: "q1", kind: "text", prompt: "B?", required: false },
       ],
     });
     const result = parseAiResultEnvelopeV1(raw);
@@ -444,8 +446,6 @@ void describe("parseAiResultEnvelopeV1 — questions", () => {
           kind: "text",
           prompt: "A?",
           required: false,
-          allowBlank: true,
-          maxLength: 10,
           bogusField: "should be rejected",
         },
       ],
@@ -454,6 +454,30 @@ void describe("parseAiResultEnvelopeV1 — questions", () => {
     assert.equal(result.kind, "malformed");
     if (result.kind === "malformed") {
       assert.match(result.reason, /unknown field/);
+    }
+  });
+
+  void it("rejects fresh allowBlank and maxLength as unknown fields, specifically", () => {
+    for (const field of ["allowBlank", "maxLength"] as const) {
+      const raw = frame({
+        version: 1,
+        correlation: correlation(),
+        kind: "questions",
+        questions: [
+          {
+            questionId: "q1",
+            kind: "text",
+            prompt: "A?",
+            required: false,
+            ...(field === "allowBlank" ? { allowBlank: true } : { maxLength: 10 }),
+          },
+        ],
+      });
+      const result = parseAiResultEnvelopeV1(raw);
+      assert.equal(result.kind, "malformed", `fresh "${field}" must be rejected`);
+      if (result.kind === "malformed") {
+        assert.match(result.reason, new RegExp(field));
+      }
     }
   });
 
@@ -963,6 +987,162 @@ void describe("parseAiResultEnvelopeV1 — a complete value followed by surplus 
   });
 });
 
+/**
+ * The 2026-08-16 spool corpus was not a handful of tiny payloads — every
+ * instance was 9-13KB of `markdown-artifact.v1` content (a plan, an
+ * implementation, an applied review), because the miscount happens at the
+ * end of a long escaped Markdown string, not at small scale. The tests above
+ * pin the mechanism with a trivial payload; these pin the actual shape and
+ * size across the four action kinds the corpus named, so a future change
+ * that only holds at small scale (e.g. swapping the hand-rolled parser for a
+ * brace-counting heuristic) cannot pass by accident.
+ */
+void describe("parseAiResultEnvelopeV1 — corpus-realistic sizes across action kinds", () => {
+  // Deliberately mixes headers, lists, fenced code (with braces/quotes/
+  // backticks inside), and a long prose tail so the escaped JSON string this
+  // becomes is representative of real model output, not a repeated filler
+  // character.
+  function markdownBody(title: string, paragraphs: number): string {
+    const sections: string[] = [`# ${title}`, ""];
+    for (let i = 0; i < paragraphs; i++) {
+      sections.push(`## Section ${i + 1}`);
+      sections.push(
+        `This step touches \`src/module_${i}.ts\` and updates the \`{ "key": "value_${i}" }\` shape used ` +
+          `by callers such as \`doThing({ id: "${i}", nested: { ok: true } })\`. See the "quoted" note below.`
+      );
+      sections.push("```ts");
+      sections.push(`function handle_${i}(input: { a: number; b: string }): { ok: boolean } {`);
+      sections.push(`  if (input.a > ${i}) { return { ok: true }; }`);
+      sections.push(`  return { ok: false };`);
+      sections.push("}");
+      sections.push("```");
+      sections.push("");
+    }
+    return sections.join("\n");
+  }
+
+  const corpusCases: ReadonlyArray<{
+    readonly label: string;
+    readonly markdown: string;
+  }> = [
+    { label: "draft.v1 (a multi-section draft plan)", markdown: markdownBody("Draft plan", 28) },
+    {
+      label: "generateImplementation.v1 (an implementation summary)",
+      markdown: markdownBody("Implementation summary", 28),
+    },
+    {
+      label: "review.v1 (a scored review with a Readiness line)",
+      markdown: `Readiness: 8/10\n\n${markdownBody("Review findings", 28)}`,
+    },
+    {
+      label: "applyReview.v1 (an applied-review summary)",
+      markdown: `${markdownBody("Applied review", 28)}\nAll findings above were verified during inventory.`,
+    },
+  ];
+
+  for (const { label, markdown } of corpusCases) {
+    void it(`recovers a ${label} payload in the 9-13KB range with one surplus trailing closer`, () => {
+      const payload = {
+        version: 1,
+        correlation: correlation(),
+        kind: "completed" as const,
+        content: { contentType: "markdown-artifact.v1" as const, schemaVersion: 1 as const, markdown },
+      };
+      const serialized = JSON.stringify(payload);
+      // Confirms the fixture is actually corpus-scale, not accidentally
+      // shrunk by a future edit to markdownBody's section count.
+      assert.ok(
+        serialized.length >= 9_000 && serialized.length <= 15_000,
+        `fixture for ${label} is ${serialized.length} bytes, expected roughly 9-13KB`
+      );
+
+      const seen: string[] = [];
+      setInertTrailingObserverV1((t) => seen.push(t));
+      try {
+        const raw = frame(payload).replace(`${serialized}\n`, `${serialized}}\n`);
+        const result = parseAiResultEnvelopeV1(raw);
+        assert.equal(result.kind, "completed", `a complete ${label} payload must survive one surplus closer`);
+        if (result.kind === "completed" && result.content.contentType === "markdown-artifact.v1") {
+          assert.equal(result.content.markdown, markdown, "recovered content must be byte-identical to the source");
+        }
+        assert.deepEqual(seen, ["}"], "recovery must be observable, not silent");
+      } finally {
+        setInertTrailingObserverV1(undefined);
+      }
+    });
+
+    void it(`still rejects a truncated ${label} payload even at corpus scale`, () => {
+      const payload = {
+        version: 1,
+        correlation: correlation(),
+        kind: "completed" as const,
+        content: { contentType: "markdown-artifact.v1" as const, schemaVersion: 1 as const, markdown },
+      };
+      const serialized = JSON.stringify(payload);
+      const truncated = serialized.slice(0, -40);
+      const raw = frame(payload).replace(`${serialized}\n`, `${truncated}\n`);
+      assert.equal(parseAiResultEnvelopeV1(raw).kind, "malformed");
+    });
+  }
+});
+
+void describe("parseAiResultEnvelopeV1 — legacy frame-end marker tolerance", () => {
+  /**
+   * Field shape, not a hypothetical (2026-08-15, a Copilot `draft.v1`
+   * response, item seven of the 2026-08-16 workflow-fixes review): the model
+   * closed with `<<<END_ENSEMBLE_RESULT_V1>>>` — missing the "AI_" segment —
+   * and the parser accepted it anyway (decoding reached the content stage).
+   * That tolerance existed by accident; this pins it deliberately as a single
+   * enumerated alias, not a pattern.
+   */
+  void it("accepts the observed legacy terminator and reports the recovery", () => {
+    const seen: number[] = [];
+    setLegacyFrameEndObserverV1(() => seen.push(1));
+    try {
+      const payload = { version: 1, correlation: correlation(), kind: "cancelled" as const };
+      const raw = `<<<ENSEMBLE_AI_RESULT_V1>>>\n${JSON.stringify(payload)}\n<<<END_ENSEMBLE_RESULT_V1>>>`;
+      const result = parseAiResultEnvelopeV1(raw);
+      assert.equal(result.kind, "cancelled", "the legacy terminator must still close the frame");
+      assert.deepEqual(seen, [1], "the tolerance must be observable, never silent");
+    } finally {
+      setLegacyFrameEndObserverV1(undefined);
+    }
+  });
+
+  void it("does NOT report anything for the canonical terminator", () => {
+    const seen: number[] = [];
+    setLegacyFrameEndObserverV1(() => seen.push(1));
+    try {
+      const payload = { version: 1, correlation: correlation(), kind: "cancelled" as const };
+      assert.equal(
+        parseAiResultEnvelopeV1(frame(payload)).kind,
+        "cancelled"
+      );
+      assert.deepEqual(seen, []);
+    } finally {
+      setLegacyFrameEndObserverV1(undefined);
+    }
+  });
+
+  void it("still rejects arbitrary near-miss markers, not just any END_* variant", () => {
+    const payload = { version: 1, correlation: correlation(), kind: "cancelled" as const };
+    for (const badEnd of [
+      "<<<END_ENSEMBLE_AI_RESULT_V2>>>",
+      "<<<END-ENSEMBLE_AI_RESULT_V1>>>",
+      "<<<ENSEMBLE_AI_RESULT_V1_END>>>",
+      "<<<END_ENSEMBLE_RESULT>>>",
+    ]) {
+      const raw = `<<<ENSEMBLE_AI_RESULT_V1>>>\n${JSON.stringify(payload)}\n${badEnd}`;
+      const result = parseAiResultEnvelopeV1(raw);
+      assert.notEqual(
+        result.kind,
+        "cancelled",
+        `${badEnd} must not be treated as a valid terminator`
+      );
+    }
+  });
+});
+
 void describe("parseAiResultEnvelopeV1 — a real model-authored clarifying question", () => {
   /**
    * The exact payload GitHub Copilot (`auto`) returned for a `draft.v1`
@@ -1010,32 +1190,32 @@ void describe("parseAiResultEnvelopeV1 — a real model-authored clarifying ques
     }
   });
 
-  void it("preserves both fields when they ARE present, so a persisted question set round-trips", () => {
-    // The replay path: a stored transaction's questionSetSha256 is computed
-    // over the canonical questions, so decoding must not substitute values.
-    const raw = frame({
-      version: 1,
-      correlation: correlation(),
-      kind: "questions",
-      questions: [
-        {
-          questionId: "q1",
-          kind: "text",
-          prompt: "Which module?",
-          required: true,
-          allowBlank: true,
-          maxLength: 200,
-        },
-      ],
-    });
-    const result = parseAiResultEnvelopeV1(raw, correlation());
-    assert.equal(result.kind, "questions");
-    if (result.kind === "questions") {
-      const q = result.questions[0];
-      if (q?.kind === "text") {
-        assert.equal(q.allowBlank, true, "a stored value must survive the round-trip");
-        assert.equal(q.maxLength, 200);
-      }
+  void it("rejects allowBlank/maxLength from a fresh envelope, even matching what the app would derive", () => {
+    // This is the fresh-envelope path (parseAiResultEnvelopeV1 -> the strict
+    // decodeStructuredQuestionsFromProviderV1), NOT the persisted-replay path
+    // — a stored transaction's questions are decoded directly from the
+    // transaction record by chatInteractionTransactionV1.ts, which still
+    // calls the tolerant decodeStructuredQuestionsV1 so questionSetSha256
+    // keeps round-tripping. A model has no basis to send either field
+    // (owner decision, 2026-08-16), so fresh output supplying them — even
+    // values the app would have derived on its own — is rejected outright.
+    for (const field of ["allowBlank", "maxLength"] as const) {
+      const raw = frame({
+        version: 1,
+        correlation: correlation(),
+        kind: "questions",
+        questions: [
+          {
+            questionId: "q1",
+            kind: "text",
+            prompt: "Which module?",
+            required: true,
+            ...(field === "allowBlank" ? { allowBlank: true } : { maxLength: 200 }),
+          },
+        ],
+      });
+      const result = parseAiResultEnvelopeV1(raw, correlation());
+      assert.equal(result.kind, "malformed", `fresh "${field}" must be rejected`);
     }
   });
 });

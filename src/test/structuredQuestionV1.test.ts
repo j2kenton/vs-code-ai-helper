@@ -4,12 +4,16 @@ import {
   canonicalJsonByteLengthV1,
   CanonicalJsonErrorV1,
   decodeStructuredAnswersArrayV1,
+  decodeStructuredQuestionsFromProviderV1,
   decodeStructuredQuestionsV1,
   DEFAULT_TEXT_ANSWER_MAX_LENGTH_V1,
   MAX_ANSWER_SUBMISSION_CANONICAL_BYTES_V1,
   MAX_OPTIONS_V1,
   MAX_QUESTION_SET_CANONICAL_BYTES_V1,
   MAX_QUESTIONS_V1,
+  StructuredQuestionV1,
+  textAnswerPolicyV1,
+  validateStructuredAnswersV1,
 } from "../types/structuredQuestionV1";
 
 void describe("decodeStructuredQuestionsV1 — app-owned text answer-box fields", () => {
@@ -87,6 +91,154 @@ void describe("decodeStructuredQuestionsV1 — app-owned text answer-box fields"
         assert.match(result.reason ?? "", /invalid "maxLength"/);
       }
     }
+  });
+});
+
+void describe("decodeStructuredQuestionsFromProviderV1 — strict fresh-envelope decoder", () => {
+  // No fixture/roster-level test previously called this decoder directly by
+  // name in this file — coverage existed only via the generic
+  // hasAppOwnedField derivation in verifyStructuredQuestions.mjs. These pin
+  // the same contract at the unit level so a regression fails fast here too.
+  void it("accepts a text question sent with only the model-owned fields", () => {
+    const result = decodeStructuredQuestionsFromProviderV1([
+      { questionId: "q1", kind: "text", prompt: "Which module?", required: true },
+    ]);
+    assert.equal(result.ok, true);
+    if (result.ok) {
+      const q = result.questions?.[0];
+      if (q?.kind === "text") {
+        assert.equal(q.allowBlank, false);
+        assert.equal(q.maxLength, DEFAULT_TEXT_ANSWER_MAX_LENGTH_V1);
+      } else {
+        assert.fail("expected a text question");
+      }
+    }
+  });
+
+  void it("rejects a text question that sends allowBlank, even alone", () => {
+    const result = decodeStructuredQuestionsFromProviderV1([
+      { questionId: "q1", kind: "text", prompt: "Anything else?", required: false, allowBlank: true },
+    ]);
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.match(result.reason ?? "", /unknown field: allowBlank/);
+    }
+  });
+
+  void it("rejects a text question that sends maxLength, even alone", () => {
+    const result = decodeStructuredQuestionsFromProviderV1([
+      { questionId: "q1", kind: "text", prompt: "Describe the architecture", required: true, maxLength: 500 },
+    ]);
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.match(result.reason ?? "", /unknown field: maxLength/);
+    }
+  });
+
+  void it("rejects a text question that sends both allowBlank and maxLength", () => {
+    const result = decodeStructuredQuestionsFromProviderV1([
+      { questionId: "q1", kind: "text", prompt: "Describe the architecture", required: true, allowBlank: false, maxLength: 500 },
+    ]);
+    assert.equal(result.ok, false);
+  });
+
+  void it("rejects an unrelated unknown field on a singleChoice question's option", () => {
+    const result = decodeStructuredQuestionsFromProviderV1([
+      {
+        questionId: "q1",
+        kind: "singleChoice",
+        prompt: "Which module?",
+        required: true,
+        options: [
+          { optionId: "a", label: "Module A", unknownProperty: "bad" },
+          { optionId: "b", label: "Module B" },
+        ],
+      },
+    ]);
+    assert.equal(result.ok, false);
+  });
+
+  void it("accepts a valid singleChoice question with only model-owned fields", () => {
+    const result = decodeStructuredQuestionsFromProviderV1([
+      {
+        questionId: "q1",
+        kind: "singleChoice",
+        prompt: "Which module?",
+        required: true,
+        options: [
+          { optionId: "a", label: "Module A" },
+          { optionId: "b", label: "Module B" },
+        ],
+      },
+    ]);
+    assert.equal(result.ok, true);
+  });
+});
+
+void describe("textAnswerPolicyV1", () => {
+  // Central app policy (owner decision, 2026-08-16): required text cannot be
+  // blank, optional text may be blank, and DEFAULT_TEXT_ANSWER_MAX_LENGTH_V1
+  // is the length limit — regardless of any allowBlank/maxLength the decoded
+  // question carries. Those two fields are preserved on a PERSISTED question
+  // only so its questionSetSha256 round-trips; they must not drive runtime
+  // behaviour.
+  function textQuestion(overrides: {
+    required: boolean;
+    allowBlank: boolean;
+    maxLength: number;
+  }): Extract<StructuredQuestionV1, { kind: "text" }> {
+    return {
+      questionId: "q1",
+      kind: "text",
+      prompt: "Describe the architecture",
+      ...overrides,
+    };
+  }
+
+  void it("derives allowBlank=false and the app default maxLength for a required question, ignoring a historical allowBlank:true/maxLength:500", () => {
+    const q = textQuestion({ required: true, allowBlank: true, maxLength: 500 });
+    const policy = textAnswerPolicyV1(q);
+    assert.equal(policy.allowBlank, false, "required must win over a stale allowBlank:true");
+    assert.equal(policy.maxLength, DEFAULT_TEXT_ANSWER_MAX_LENGTH_V1);
+  });
+
+  void it("derives allowBlank=true and the app default maxLength for an optional question, ignoring a historical allowBlank:false/maxLength:10", () => {
+    const q = textQuestion({ required: false, allowBlank: false, maxLength: 10 });
+    const policy = textAnswerPolicyV1(q);
+    assert.equal(policy.allowBlank, true);
+    assert.equal(policy.maxLength, DEFAULT_TEXT_ANSWER_MAX_LENGTH_V1);
+  });
+
+  void it("lets a CODE-OWNED caller override maxLength via the second parameter", () => {
+    const q = textQuestion({ required: true, allowBlank: false, maxLength: 500 });
+    const policy = textAnswerPolicyV1(q, 10);
+    assert.equal(policy.maxLength, 10);
+  });
+
+  void it("validateStructuredAnswersV1 accepts an answer past a historical stored maxLength but within the app default", () => {
+    const q = textQuestion({ required: true, allowBlank: false, maxLength: 10 });
+    const result = validateStructuredAnswersV1([q], [
+      { questionId: "q1", kind: "text", state: "answered", value: "x".repeat(600) },
+    ]);
+    assert.equal(result.ok, true, result.reason);
+  });
+
+  void it("validateStructuredAnswersV1 rejects an answer past the app default even when the stored maxLength is larger", () => {
+    const q = textQuestion({ required: true, allowBlank: false, maxLength: 999999 });
+    const result = validateStructuredAnswersV1([q], [
+      { questionId: "q1", kind: "text", state: "answered", value: "x".repeat(DEFAULT_TEXT_ANSWER_MAX_LENGTH_V1 + 1) },
+    ]);
+    assert.equal(result.ok, false);
+    assert.match(result.reason ?? "", /exceeds maxLength/);
+  });
+
+  void it("validateStructuredAnswersV1 rejects a blank answer to a required question with a historical allowBlank:true", () => {
+    const q = textQuestion({ required: true, allowBlank: true, maxLength: DEFAULT_TEXT_ANSWER_MAX_LENGTH_V1 });
+    const result = validateStructuredAnswersV1([q], [
+      { questionId: "q1", kind: "text", state: "answered", value: "" },
+    ]);
+    assert.equal(result.ok, false, "required must win over a stale allowBlank:true");
+    assert.match(result.reason ?? "", /does not allow a blank answer/);
   });
 });
 

@@ -132,11 +132,34 @@ export function buildAiResultContractPromptV1(input: AiResultContractPromptInput
     );
   }
   if (input.permittedResultKinds.includes("questions")) {
+    // A literal shape per kind, matching how CONTENT_TYPE_SHAPE_HINTS_V1
+    // specifies completed content — ported verbatim from
+    // `src/prompts/aiResultContractV1.ts`. This used to read
+    // `{"questionId","kind",...,"prompt","required",...}` — four named fields
+    // and an ellipsis — while the decoder ALSO required `allowBlank` and
+    // `maxLength` on text questions. A model that asked a clarifying question
+    // sent exactly the four documented fields and had its whole envelope
+    // rejected. Those two are now supplied by the app and must not appear
+    // here (owner decision, 2026-08-16): a model decides what to ask, not how
+    // the answer box behaves.
     lines.push(
-      '- For "kind": "questions", "questions" must be an array of 1-16 structured questions, each ' +
-        '{"questionId","kind"("text"|"singleChoice"|"multipleChoice"),"prompt","required",...} per the ' +
-        "Ensemble structured-question schema. Ask questions ONLY when you cannot complete the action " +
-        "without an answer; never write questions into artifact content."
+      // Every example is a VALID payload if copied verbatim. Keep both
+      // option arrays at two entries (the decoder requires
+      // MIN_OPTIONS_V1 = 2), with DISTINCT optionId placeholders: two
+      // identical `<stable-id>` entries trip the duplicate-optionId
+      // rejection, and `maxSelections` must not exceed the option count.
+      '- For "kind": "questions", "questions" must be an array of 1-16 objects, each exactly one of:',
+      '    {"questionId":"<stable-id>","kind":"text","prompt":"<the question>","required":true}',
+      '    {"questionId":"<stable-id>","kind":"singleChoice","prompt":"<the question>","required":true,' +
+        '"options":[{"optionId":"<stable-id-1>","label":"<shown to the user>"},' +
+        '{"optionId":"<stable-id-2>","label":"<shown to the user>"}]}',
+      '    {"questionId":"<stable-id>","kind":"multipleChoice","prompt":"<the question>","required":true,' +
+        '"options":[{"optionId":"<stable-id-1>","label":"<shown to the user>"},' +
+        '{"optionId":"<stable-id-2>","label":"<shown to the user>"}],"minSelections":1,"maxSelections":2}',
+      '  "options" must have 2-32 entries; "maxSelections" must not exceed the number of options.',
+      '  "helpText" is the only optional field. Send NO other fields — answer-box behaviour is not yours to set.',
+      "  Ask questions ONLY when you cannot complete the action without an answer; never write " +
+        "questions into artifact content."
     );
   }
   if (input.permittedResultKinds.includes("cancelled")) {

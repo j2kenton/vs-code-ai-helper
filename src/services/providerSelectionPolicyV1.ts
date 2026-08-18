@@ -77,6 +77,8 @@ export type AttemptOutcomeKindV1 =
   | "providerDeclaredFailure"
   | "malformedResult"
   | "malformedResultPreFallback"
+  | "contentContractFailure"
+  | "contentContractFailurePreFallback"
   | "resultCorrelationMismatch"
   | "overflow"
   | "providerCancelled"
@@ -91,7 +93,34 @@ export const FALLBACK_ELIGIBLE_ATTEMPT_OUTCOMES_V1: ReadonlySet<AttemptOutcomeKi
     "transportFailurePreResponse",
     "providerUnavailablePreInvocation",
     "malformedResultPreFallback",
+    "contentContractFailurePreFallback",
   ]);
+
+/** How a candidate-scoped disposition (below) resolves an attempt whose response was schema-valid but failed a row's own content contract. */
+export type ProviderCandidateDispositionV1 = "retryCurrent" | "advanceCandidate" | "terminateStage";
+
+/**
+ * Classify a completed-content-contract failure (row `validateCompletedContent`
+ * rejection — e.g. review.v1's missing `Readiness: N/10` line) into a
+ * disposition, mirroring the malformed-envelope advance/terminate policy
+ * already applied above. `retryCurrent` is reserved for future callers (a
+ * content-contract failure is deterministic per model, so this policy never
+ * returns it today — see the caller's own reasoning for why retrying the
+ * SAME candidate cannot fix it); the two live outcomes are advancing to the
+ * next ranked candidate while the shared malformed/content-contract budget
+ * has room, and terminating the stage once it does not (2026-08-16 field
+ * report, fourth item).
+ */
+export function classifyProviderCandidateDispositionV1(input: {
+  readonly retryEligible: boolean;
+  readonly invocationsUsed: number;
+  readonly maxInvocations: number;
+}): ProviderCandidateDispositionV1 {
+  if (!input.retryEligible) {
+    return "terminateStage";
+  }
+  return input.invocationsUsed < input.maxInvocations ? "advanceCandidate" : "terminateStage";
+}
 
 export interface SelectionSessionBindingV1 {
   readonly actionKey: ActionKeyV1;

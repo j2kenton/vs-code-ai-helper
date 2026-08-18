@@ -131,25 +131,100 @@ export type AgentTransportExitV1 =
     };
 
 /**
- * Flatten a caught error into a short, single-line cause for
- * `transportFailure.detail`.
+ * Redaction patterns for `boundedTransportDetailV1`. Unlike
+ * `boundedDiagnosticDetailV1` in taskActionCoordinatorV1.ts — which only ever
+ * flattens OUR OWN generated diagnostic text — this function's input is
+ * whatever a caught `Error` from a provider SDK or CLI actually says, which
+ * can echo request headers, an Authorization value, an API key embedded in a
+ * URL, or an absolute path into this machine's private extension storage.
+ * Each pattern below replaces the secret/private span with a fixed
+ * placeholder so the shape of the message (still useful for diagnosing
+ * quota/payload-limit causes) survives while the value does not.
+ */
+const REDACTION_PATTERNS_V1: ReadonlyArray<{ readonly pattern: RegExp; readonly replacement: string }> = [
+  // A provider SDK/CLI error can echo the raw request or response body it
+  // choked on, including a full envelope between our own frame markers.
+  // Strip it (terminated or not — an unterminated opening marker means the
+  // rest of the message IS the raw payload) before anything else runs, so
+  // truncation below is a backstop, not the only guard against a raw
+  // provider/prompt payload reaching a sanitized outcome.
+  {
+    pattern: /<<<ENSEMBLE_AI_RESULT_V1>>>[\s\S]*?(?:<<<END_ENSEMBLE(?:_AI)?_RESULT_V1>>>|$)/g,
+    replacement: "[redacted-content]",
+  },
+  // Fenced Markdown code blocks (terminated or not) can likewise carry a
+  // full echoed prompt or response body.
+  { pattern: /```[\s\S]*?(?:```|$)/g, replacement: "[redacted-content]" },
+  // Authorization/Bearer header values.
+  { pattern: /\b(bearer|authorization)\s*:?\s*[A-Za-z0-9._~+/=-]{8,}/gi, replacement: "$1: [redacted]" },
+  // Common API-key-shaped tokens (sk-…, ghp_…, xox…, long hex/base64 runs after a known prefix).
+  { pattern: /\b(sk|pk|ghp|gho|ghu|ghs|ghr|xox[abpsu])-[A-Za-z0-9_-]{8,}\b/g, replacement: "[redacted-token]" },
+  { pattern: /\b(api[_-]?key|token|secret|password|passwd)\s*[:=]\s*\S{4,}/gi, replacement: "$1=[redacted]" },
+  // Credential-bearing URIs: scheme://user:pass@host
+  { pattern: /([a-z][a-z0-9+.-]*:\/\/)[^\s/@]+:[^\s/@]+@/gi, replacement: "$1[redacted]@" },
+  // Windows private user/app-storage paths.
+  {
+    pattern: /[A-Za-z]:\\Users\\[^\\\s]+\\(?:AppData|\.vscode|\.claude)[^\s"']*/g,
+    replacement: "[redacted-path]",
+  },
+  // POSIX private home/app-storage paths.
+  { pattern: /\/(?:home|Users)\/[^/\s]+\/(?:\.[^/\s]+|Library)[^\s"']*/g, replacement: "[redacted-path]" },
+];
+
+function redactSensitiveContentV1(text: string): string {
+  return REDACTION_PATTERNS_V1.reduce(
+    (acc, { pattern, replacement }) => acc.replace(pattern, replacement),
+    text
+  );
+}
+
+/**
+ * Replace C0/C1 control characters (other than tab/newline/carriage-return,
+ * which the caller's whitespace collapse already normalizes to a space) and
+ * DEL with a space. Written as an explicit code-point scan rather than a
+ * regex control-character class so the source contains no raw control bytes
+ * or hex/unicode escape sequences to keep in sync.
+ */
+function stripOtherControlCharsV1(text: string): string {
+  let result = "";
+  for (const ch of text) {
+    const code = ch.codePointAt(0) ?? 0;
+    const isTabOrNewline = code === 9 || code === 10 || code === 13;
+    const isControl = (code <= 31 && !isTabOrNewline) || code === 127;
+    result += isControl ? " " : ch;
+  }
+  return result;
+}
+
+/**
+ * Flatten a caught error into a short, single-line, secret-redacted cause
+ * for `transportFailure.detail`.
  *
- * Mirrors `boundedDiagnosticDetailV1` in taskActionCoordinatorV1.ts — same
- * flatten-and-cap discipline, kept here because this is where the field it
- * fills is declared and because a transport should not have to import from
- * the action coordinator to report its own failure. Takes `unknown` since
- * every call site is a `catch` binding.
+ * Takes `unknown` since every call site is a `catch` binding. Strips control
+ * characters and collapses whitespace so the result is always one readable
+ * line, redacts credential/token/URI/private-path shapes per
+ * `REDACTION_PATTERNS_V1` before bounding, and enforces `maxChars` in UTF-16
+ * code units (bounded well under any storage/render limit, so a surrogate
+ * pair split at the cap is not a correctness concern here).
  */
 export function boundedTransportDetailV1(error: unknown, maxChars = 200): string | undefined {
   const raw =
     error instanceof Error
-      ? error.message
+      ? // A distinctive `name` (TypeError, AbortError, a provider SDK's own
+        // error class, …) is useful classification the plain message loses —
+        // keep it, but only when it adds information: the generic "Error"
+        // name is what every plain `new Error(...)` already carries and
+        // would just be noise prepended to every existing detail.
+        error.name && error.name !== "Error"
+        ? `${error.name}: ${error.message}`
+        : error.message
       : typeof error === "string"
         ? error
         : error === undefined || error === null
           ? ""
           : String(error);
-  const flattened = raw.replace(/\s+/g, " ").trim();
+  const withoutControlChars = stripOtherControlCharsV1(raw);
+  const flattened = redactSensitiveContentV1(withoutControlChars.replace(/\s+/g, " ").trim());
   if (flattened.length === 0) {
     return undefined;
   }

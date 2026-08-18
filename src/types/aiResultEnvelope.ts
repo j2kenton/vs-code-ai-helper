@@ -24,7 +24,7 @@ import {
 } from "./actionCorrelationV1";
 import {
   StructuredQuestionV1,
-  decodeStructuredQuestionsV1,
+  decodeStructuredQuestionsFromProviderV1,
 } from "./structuredQuestionV1";
 
 export interface MarkdownArtifactCompletedV1 {
@@ -147,6 +147,16 @@ export type AiResultParseOutcomeV1 = AiResultEnvelopeV1 | MalformedAiResultV1;
 export const FRAME_START_V1 = "<<<ENSEMBLE_AI_RESULT_V1>>>";
 export const FRAME_END_V1 = "<<<END_ENSEMBLE_AI_RESULT_V1>>>";
 
+/**
+ * Narrowly observed legacy terminator (2026-08-16 field report, a Copilot
+ * `draft.v1` response): the model dropped "AI_" and closed with this instead
+ * of {@link FRAME_END_V1}. Accepted as a single enumerated compatibility
+ * alias — not a pattern — because everything else about the frame must still
+ * be byte-identical to the canonical shape; arbitrary near-miss markers
+ * still reject as `invalidFrame`. Only emit {@link FRAME_END_V1}.
+ */
+export const LEGACY_FRAME_END_V1 = "<<<END_ENSEMBLE_RESULT_V1>>>";
+
 const MAX_NORMAL_COMPLETION_BYTES_V1 = 4 * 1024 * 1024;
 const MAX_PREFLIGHT_BYTES_V1 = 16 * 1024 * 1024;
 const MAX_FAILURE_MESSAGE_BYTES_V1 = 8 * 1024;
@@ -203,6 +213,25 @@ export function setInertTrailingObserverV1(observer: InertTrailingObserverV1 | u
 function recordInertTrailingV1(inertTrailing: string): void {
   try {
     inertTrailingObserverV1?.(inertTrailing);
+  } catch {
+    // Observation is a side channel; parsing correctness cannot depend on it.
+  }
+}
+
+/** Notified when a frame was only accepted because it used {@link LEGACY_FRAME_END_V1}. */
+export type LegacyFrameEndObserverV1 = () => void;
+
+let legacyFrameEndObserverV1: LegacyFrameEndObserverV1 | undefined;
+
+/** Same seam as {@link setInertTrailingObserverV1}, for the legacy-marker tolerance. */
+export function setLegacyFrameEndObserverV1(observer: LegacyFrameEndObserverV1 | undefined): void {
+  legacyFrameEndObserverV1 = observer;
+}
+
+/** Report, never affect. A throwing observer must not change parse behaviour. */
+function recordLegacyFrameEndV1(): void {
+  try {
+    legacyFrameEndObserverV1?.();
   } catch {
     // Observation is a side channel; parsing correctness cannot depend on it.
   }
@@ -993,7 +1022,7 @@ function decodeEnvelopeV1(
       return { version: 1, correlation, kind: "completed", content: contentResult.content };
     }
     case "questions": {
-      const decoded = decodeStructuredQuestionsV1(value.questions);
+      const decoded = decodeStructuredQuestionsFromProviderV1(value.questions);
       if (!decoded.ok || !decoded.questions) {
         return malformed("contentSchemaMismatch", raw, decoded.reason ?? "invalid \"questions\"");
       }
@@ -1152,14 +1181,20 @@ export function parseAiResultEnvelopeV1(
   }
   const body = trimmedForTrailingNewline.slice(frameStartIndex);
 
+  let frameEnd: string = FRAME_END_V1;
   if (!body.endsWith(FRAME_END_V1)) {
-    return parseUnterminatedFrameV1(raw, body, expectedCorrelation);
+    if (body.endsWith(LEGACY_FRAME_END_V1)) {
+      frameEnd = LEGACY_FRAME_END_V1;
+      recordLegacyFrameEndV1();
+    } else {
+      return parseUnterminatedFrameV1(raw, body, expectedCorrelation);
+    }
   }
-  if (body.length < FRAME_START_V1.length + FRAME_END_V1.length) {
+  if (body.length < FRAME_START_V1.length + frameEnd.length) {
     return malformed("invalidFrame", raw, "start and end markers overlap");
   }
 
-  const middle = body.slice(FRAME_START_V1.length, body.length - FRAME_END_V1.length);
+  const middle = body.slice(FRAME_START_V1.length, body.length - frameEnd.length);
 
   let eol: "\n" | "\r\n";
   if (middle.startsWith("\r\n")) {

@@ -207,8 +207,6 @@ function questionsTransportV1(runnerId = "stub-runner"): AgentTransportV1 {
               kind: "text",
               prompt: "Which revision should the plan favor?",
               required: true,
-              allowBlank: false,
-              maxLength: 200,
             },
           ],
         })

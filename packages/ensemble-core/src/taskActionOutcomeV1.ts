@@ -111,17 +111,25 @@ export type TaskActionOutcomeV1 =
       readonly kind: "questions";
       readonly correlation: ActionCorrelationV1;
       readonly interactionId: InteractionIdV1;
+      /** Identity of the reservation that asked the questions; optional and additive. */
+      readonly provider?: TaskActionOutcomeProviderV1;
     }
   | {
       readonly kind: "cancelled";
       readonly correlation?: ActionCorrelationV1;
       readonly code: "userCancelled" | "providerCancelled";
+      /** Identity of the reservation that was cancelled; optional and additive. */
+      readonly provider?: TaskActionOutcomeProviderV1;
     }
   | {
       readonly kind: "failed";
       readonly correlation?: ActionCorrelationV1;
       readonly code: string;
       readonly retryable: boolean;
+      /** Sanitized cause, when the failure knows more than its code; optional and additive. */
+      readonly detail?: string;
+      /** Identity of the reservation actually claimed and invoked, when provider-originated; optional and additive. */
+      readonly provider?: TaskActionOutcomeProviderV1;
     }
   | {
       readonly kind: "malformedResult";
@@ -143,6 +151,12 @@ export type TaskActionOutcomeV1 =
        */
       readonly detail?: string;
       readonly provider?: TaskActionOutcomeProviderV1;
+      /**
+       * Number of provider invocations this operation already spent before
+       * this terminal outcome (port of `src/types/taskActionOutcomeV1.ts`'s
+       * `malformedInvocationsUsedV1`). Optional and additive.
+       */
+      readonly malformedInvocationsUsedV1?: number;
     }
   | {
       readonly kind: "unavailable";
@@ -430,7 +444,7 @@ export function decodeTaskActionOutcomeV1(raw: unknown): DecodeTaskActionOutcome
     case "questions": {
       const unknown = unknownOutcomeField(
         raw,
-        new Set(["kind", "correlation", "interactionId"]),
+        new Set(["kind", "correlation", "interactionId", "provider"]),
         "questions outcome"
       );
       if (unknown) {
@@ -443,13 +457,26 @@ export function decodeTaskActionOutcomeV1(raw: unknown): DecodeTaskActionOutcome
       if (typeof raw.interactionId !== "string" || raw.interactionId.length === 0) {
         return fail("questions outcome is missing a valid \"interactionId\"");
       }
+      const provider = decodeOptionalProviderV1(raw.provider);
+      if (typeof provider === "string") {
+        return fail(provider);
+      }
       return {
         ok: true,
-        outcome: { kind: "questions", correlation, interactionId: raw.interactionId },
+        outcome: {
+          kind: "questions",
+          correlation,
+          interactionId: raw.interactionId,
+          ...(provider !== undefined ? { provider } : {}),
+        },
       };
     }
     case "cancelled": {
-      const unknown = unknownOutcomeField(raw, new Set(["kind", "correlation", "code"]), "cancelled outcome");
+      const unknown = unknownOutcomeField(
+        raw,
+        new Set(["kind", "correlation", "code", "provider"]),
+        "cancelled outcome"
+      );
       if (unknown) {
         return fail(unknown);
       }
@@ -460,15 +487,24 @@ export function decodeTaskActionOutcomeV1(raw: unknown): DecodeTaskActionOutcome
       if (raw.code !== "userCancelled" && raw.code !== "providerCancelled") {
         return fail(`invalid cancelled outcome "code": ${JSON.stringify(raw.code)}`);
       }
+      const provider = decodeOptionalProviderV1(raw.provider);
+      if (typeof provider === "string") {
+        return fail(provider);
+      }
       return {
         ok: true,
-        outcome: { kind: "cancelled", ...(correlation !== undefined ? { correlation } : {}), code: raw.code },
+        outcome: {
+          kind: "cancelled",
+          ...(correlation !== undefined ? { correlation } : {}),
+          code: raw.code,
+          ...(provider !== undefined ? { provider } : {}),
+        },
       };
     }
     case "failed": {
       const unknown = unknownOutcomeField(
         raw,
-        new Set(["kind", "correlation", "code", "retryable"]),
+        new Set(["kind", "correlation", "code", "retryable", "detail", "provider"]),
         "failed outcome"
       );
       if (unknown) {
@@ -484,6 +520,13 @@ export function decodeTaskActionOutcomeV1(raw: unknown): DecodeTaskActionOutcome
       if (typeof raw.retryable !== "boolean") {
         return fail("failed outcome is missing a boolean \"retryable\"");
       }
+      if (raw.detail !== undefined && typeof raw.detail !== "string") {
+        return fail(`invalid failed outcome "detail": ${JSON.stringify(raw.detail)}`);
+      }
+      const provider = decodeOptionalProviderV1(raw.provider);
+      if (typeof provider === "string") {
+        return fail(provider);
+      }
       return {
         ok: true,
         outcome: {
@@ -491,13 +534,15 @@ export function decodeTaskActionOutcomeV1(raw: unknown): DecodeTaskActionOutcome
           ...(correlation !== undefined ? { correlation } : {}),
           code: raw.code,
           retryable: raw.retryable,
+          ...(raw.detail !== undefined ? { detail: raw.detail } : {}),
+          ...(provider !== undefined ? { provider } : {}),
         },
       };
     }
     case "malformedResult": {
       const unknown = unknownOutcomeField(
         raw,
-        new Set(["kind", "correlation", "code", "detail", "provider"]),
+        new Set(["kind", "correlation", "code", "detail", "provider", "malformedInvocationsUsedV1"]),
         "malformedResult outcome"
       );
       if (unknown) {
@@ -517,6 +562,16 @@ export function decodeTaskActionOutcomeV1(raw: unknown): DecodeTaskActionOutcome
       if (typeof provider === "string") {
         return fail(provider);
       }
+      if (
+        raw.malformedInvocationsUsedV1 !== undefined &&
+        (typeof raw.malformedInvocationsUsedV1 !== "number" ||
+          !Number.isInteger(raw.malformedInvocationsUsedV1) ||
+          raw.malformedInvocationsUsedV1 < 0)
+      ) {
+        return fail(
+          `invalid malformedResult outcome "malformedInvocationsUsedV1": ${JSON.stringify(raw.malformedInvocationsUsedV1)}`
+        );
+      }
       return {
         ok: true,
         outcome: {
@@ -525,6 +580,9 @@ export function decodeTaskActionOutcomeV1(raw: unknown): DecodeTaskActionOutcome
           code: raw.code as MalformedResultCodeV1,
           ...(raw.detail !== undefined ? { detail: raw.detail } : {}),
           ...(provider !== undefined ? { provider } : {}),
+          ...(raw.malformedInvocationsUsedV1 !== undefined
+            ? { malformedInvocationsUsedV1: raw.malformedInvocationsUsedV1 }
+            : {}),
         },
       };
     }

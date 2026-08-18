@@ -27,6 +27,11 @@ import {
   upsertCompletionChecksReportV1,
   CompletionLintResult,
 } from "../utils/completionLint";
+import {
+  readPublishChecksFreshnessStampV1,
+  writePublishChecksFreshnessStampV1,
+} from "../utils/publishChecksFreshness";
+import { PUBLISH_CHECKS_FILENAME } from "../types/taskProgress";
 
 const TEST_ROOT = nodeFs.mkdtempSync(
   nodePath.join(nodeOs.tmpdir(), "ensemble-completion-lint-test-")
@@ -266,6 +271,47 @@ void describe("upsertCompletionChecksReportV1", () => {
 
     const content = nodeFs.readFileSync(nodePath.join(dir, "publish-checks.md"), "utf8");
     assert.match(content, /Published anyway despite failing checks — user chose Publish Anyway\./);
+  });
+
+  void it("invalidates a previous freshness stamp on a refresh of this section alone", async () => {
+    const dir = makeWorkspace("publish-review-invalidate-stamp", { name: "x" });
+    const targetUri = vscode.Uri.file(dir);
+    await upsertCompletionChecksReportV1(targetUri, fakeResult());
+    await writePublishChecksFreshnessStampV1(targetUri, {
+      formatVersion: 1,
+      runId: "11111111-1111-4111-8111-111111111111",
+      verifiedCommitSha: "a".repeat(40),
+      completedAt: new Date().toISOString(),
+      scopeId: "0123456789abcdef",
+    });
+    assert.notEqual(await readPublishChecksFreshnessStampV1(targetUri), undefined);
+
+    // A follow-up refresh of the Completion Checks section alone (e.g. the
+    // linting-fix loop re-running the lint, without also re-running the
+    // Scope Check) must not leave that stamp looking current.
+    await upsertCompletionChecksReportV1(targetUri, fakeResult());
+    assert.equal(await readPublishChecksFreshnessStampV1(targetUri), undefined);
+  });
+
+  void it("serializes concurrent refreshes of the same report without a torn or corrupted write", async () => {
+    const dir = makeWorkspace("publish-review-concurrent", { name: "x" });
+    const targetUri = vscode.Uri.file(dir);
+
+    // Two closely triggered refreshes racing on the same publish-checks.md
+    // (plan PART 2, step 6's concurrency requirement) must each land a
+    // complete, well-formed Completion Checks section — never an
+    // interleaved half-write from one call clobbering the other's.
+    await Promise.all([
+      upsertCompletionChecksReportV1(targetUri, fakeResult({ summary: "run A" })),
+      upsertCompletionChecksReportV1(targetUri, fakeResult({ summary: "run B" })),
+    ]);
+
+    const content = nodeFs.readFileSync(nodePath.join(dir, PUBLISH_CHECKS_FILENAME), "utf8");
+    const starts = content.split("<!-- completion-checks:start -->").length - 1;
+    const ends = content.split("<!-- completion-checks:end -->").length - 1;
+    assert.equal(starts, 1, "exactly one Completion Checks section, no duplicated/torn section markers");
+    assert.equal(ends, 1);
+    assert.match(content, /run [AB]/);
   });
 });
 

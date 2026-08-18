@@ -51,6 +51,11 @@ export type TaskActionInputValidationResultV1 =
   | { readonly ok: true; readonly input: unknown }
   | { readonly ok: false; readonly reason: string };
 
+/** Result of a provider row's optional `validateCompletedContent` check. */
+export type TaskActionCompletedContentValidationResultV1 =
+  | { readonly ok: true }
+  | { readonly ok: false; readonly reason: string };
+
 export interface TaskActionEligibilityV1 {
   /** Persisted task statuses this action may run against (non-empty). */
   readonly statuses: readonly string[];
@@ -206,9 +211,31 @@ export interface ProviderTaskActionRowV1 extends TaskActionRowBaseV1 {
   /** Action-specific prompt content; the coordinator appends the result contract. */
   readonly buildPrompt: (context: TaskActionExecutionContextV1) => string;
   /**
+   * Optional pure check of a candidate's already schema-decoded completed
+   * content against a rule the strict envelope decoder cannot express (e.g.
+   * review.v1's required `Readiness: N/10` line). Runs in the coordinator
+   * AFTER envelope/content-type decoding but BEFORE the "completed" attempt
+   * outcome is reported, any lease is acquired, or `promoteCompletedContent`
+   * is called — so a rejection here is candidate-scoped (this model failed
+   * the content contract) rather than storage-scoped, and the coordinator can
+   * advance to the next ranked candidate exactly as it does for a malformed
+   * envelope, instead of settling a terminal `promotionFailed` outcome for a
+   * fault no retry of the same model can fix (2026-08-16 field report,
+   * fourth item: three identical `grok-4.6` failures burned the whole
+   * candidate chain while a working backup sat unreserved one position down).
+   * Must not mutate anything or perform I/O — it runs before the lease is
+   * re-acquired and may be called for a candidate whose result is ultimately
+   * discarded in favor of a later one.
+   */
+  readonly validateCompletedContent?: (
+    content: CompletedContentV1,
+    context: TaskActionExecutionContextV1
+  ) => TaskActionCompletedContentValidationResultV1;
+  /**
    * Promote strictly decoded completed content. Only the coordinator calls
    * this, and only with content whose `contentType` equals the row's
-   * declared `completedContentType`.
+   * declared `completedContentType` and which already passed
+   * `validateCompletedContent`, when declared.
    */
   readonly promoteCompletedContent: (
     content: CompletedContentV1,

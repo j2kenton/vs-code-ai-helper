@@ -15,6 +15,11 @@ import { promptAndPersistPublishScope } from "../commands/choosePublishScope";
 import { isWorkflowPrivatePathV1 } from "../services/workflowPrivacyClassifierV1";
 import { ReviewBlocker } from "./reviewReadiness";
 import { scopeToLatestChecklistV1, unescapeChecklistItemTextV1 } from "./implementationChecklist";
+import {
+  invalidatePublishChecksFreshnessStamp,
+  withPublishChecksReportLockV1,
+  writeFileAtomicV1,
+} from "./publishChecksFreshness";
 
 /**
  * Resolve a package manager executable to an absolute path, preferring a
@@ -1800,15 +1805,32 @@ export async function upsertCompletionChecksReportV1(
 ): Promise<void> {
   const targetPath = path.join(taskFolderUri.fsPath, PUBLISH_CHECKS_FILENAME);
 
-  let existing = "";
-  try {
-    existing = await fs.promises.readFile(targetPath, "utf8");
-  } catch {
-    existing = "";
-  }
+  // Single locked read-modify-write: merging the section and invalidating
+  // any freshness stamp happen against the same in-memory snapshot and land
+  // in one atomic write, so a concurrent reader of publish-checks.md can
+  // never observe this section updated with a stamp that still looks
+  // current (or a half-written file). See withPublishChecksReportLockV1's
+  // doc comment for why this is a per-report lock rather than nesting calls
+  // that would each try to acquire it.
+  await withPublishChecksReportLockV1(taskFolderUri, async () => {
+    let existing = "";
+    try {
+      existing = await fs.promises.readFile(targetPath, "utf8");
+    } catch {
+      existing = "";
+    }
 
-  const section = renderCompletionChecksSection(result, override);
-  await fs.promises.writeFile(targetPath, mergeCompletionChecksSection(existing, section), "utf8");
+    const section = renderCompletionChecksSection(result, override);
+    const merged = mergeCompletionChecksSection(existing, section);
+    // A refresh of only this section (e.g. runLintingFixes re-running the
+    // lint alone) must not leave a previous freshness stamp looking current
+    // — the stamp asserts both this section AND the Scope Check ran together
+    // against one commit. runPublishChecks.ts (the only path that runs both)
+    // writes a fresh valid stamp itself after both complete; every other
+    // path invalidates here and leaves the report correctly stale until
+    // Publish Checks runs again.
+    await writeFileAtomicV1(targetPath, invalidatePublishChecksFreshnessStamp(merged));
+  });
   await stripCompletionChecksFromReviewArtifactV1(taskFolderUri);
 }
 

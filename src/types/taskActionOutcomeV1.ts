@@ -95,11 +95,26 @@ export type TaskActionOutcomeV1 =
       readonly kind: "questions";
       readonly correlation: ActionCorrelationV1;
       readonly interactionId: InteractionIdV1;
+      /**
+       * Identity of the reservation that asked the questions. Absent only for
+       * outcomes produced before a reservation existed (there are none today,
+       * since questions always come from a provider response), kept optional
+       * so persisted records without it (recorded before this field existed)
+       * remain valid.
+       */
+      readonly provider?: TaskActionOutcomeProviderV1;
     }
   | {
       readonly kind: "cancelled";
       readonly correlation?: ActionCorrelationV1;
       readonly code: "userCancelled" | "providerCancelled";
+      /**
+       * Identity of the reservation that was cancelled, when the cancellation
+       * happened after a reservation existed. `userCancelled` before any
+       * reservation (e.g. a caller cancellation token observed pre-invocation)
+       * legitimately carries none.
+       */
+      readonly provider?: TaskActionOutcomeProviderV1;
     }
   | {
       readonly kind: "failed";
@@ -117,6 +132,18 @@ export type TaskActionOutcomeV1 =
        * appended to `code` so the code stays a stable identifier.
        */
       readonly detail?: string;
+      /**
+       * Identity of the reservation actually claimed and invoked, when the
+       * failure was provider-originated (e.g. `contentContractExhausted`, a
+       * content-contract candidate-advance chain that ran out of ranked
+       * candidates). Absent for failures with no reservation to name (a
+       * pre-invocation admission or storage failure). 2026-08-16 field
+       * report, sixth item: a failed run naming no model forced attribution
+       * to be reconstructed from `ensemble.modelSettings`, and it was
+       * reconstructed wrong once — the disabled configured primary was
+       * blamed for a backup candidate's failure.
+       */
+      readonly provider?: TaskActionOutcomeProviderV1;
     }
   | {
       readonly kind: "malformedResult";
@@ -445,7 +472,7 @@ export function decodeTaskActionOutcomeV1(raw: unknown): DecodeTaskActionOutcome
     case "questions": {
       const unknown = unknownOutcomeField(
         raw,
-        new Set(["kind", "correlation", "interactionId"]),
+        new Set(["kind", "correlation", "interactionId", "provider"]),
         "questions outcome"
       );
       if (unknown) {
@@ -458,13 +485,26 @@ export function decodeTaskActionOutcomeV1(raw: unknown): DecodeTaskActionOutcome
       if (typeof raw.interactionId !== "string" || raw.interactionId.length === 0) {
         return fail("questions outcome is missing a valid \"interactionId\"");
       }
+      const provider = decodeOptionalProviderV1(raw.provider);
+      if (typeof provider === "string") {
+        return fail(provider);
+      }
       return {
         ok: true,
-        outcome: { kind: "questions", correlation, interactionId: raw.interactionId },
+        outcome: {
+          kind: "questions",
+          correlation,
+          interactionId: raw.interactionId,
+          ...(provider !== undefined ? { provider } : {}),
+        },
       };
     }
     case "cancelled": {
-      const unknown = unknownOutcomeField(raw, new Set(["kind", "correlation", "code"]), "cancelled outcome");
+      const unknown = unknownOutcomeField(
+        raw,
+        new Set(["kind", "correlation", "code", "provider"]),
+        "cancelled outcome"
+      );
       if (unknown) {
         return fail(unknown);
       }
@@ -475,15 +515,24 @@ export function decodeTaskActionOutcomeV1(raw: unknown): DecodeTaskActionOutcome
       if (raw.code !== "userCancelled" && raw.code !== "providerCancelled") {
         return fail(`invalid cancelled outcome "code": ${JSON.stringify(raw.code)}`);
       }
+      const provider = decodeOptionalProviderV1(raw.provider);
+      if (typeof provider === "string") {
+        return fail(provider);
+      }
       return {
         ok: true,
-        outcome: { kind: "cancelled", ...(correlation !== undefined ? { correlation } : {}), code: raw.code },
+        outcome: {
+          kind: "cancelled",
+          ...(correlation !== undefined ? { correlation } : {}),
+          code: raw.code,
+          ...(provider !== undefined ? { provider } : {}),
+        },
       };
     }
     case "failed": {
       const unknown = unknownOutcomeField(
         raw,
-        new Set(["kind", "correlation", "code", "retryable"]),
+        new Set(["kind", "correlation", "code", "retryable", "detail", "provider"]),
         "failed outcome"
       );
       if (unknown) {
@@ -499,6 +548,13 @@ export function decodeTaskActionOutcomeV1(raw: unknown): DecodeTaskActionOutcome
       if (typeof raw.retryable !== "boolean") {
         return fail("failed outcome is missing a boolean \"retryable\"");
       }
+      if (raw.detail !== undefined && typeof raw.detail !== "string") {
+        return fail(`invalid failed outcome "detail": ${JSON.stringify(raw.detail)}`);
+      }
+      const provider = decodeOptionalProviderV1(raw.provider);
+      if (typeof provider === "string") {
+        return fail(provider);
+      }
       return {
         ok: true,
         outcome: {
@@ -506,6 +562,8 @@ export function decodeTaskActionOutcomeV1(raw: unknown): DecodeTaskActionOutcome
           ...(correlation !== undefined ? { correlation } : {}),
           code: raw.code,
           retryable: raw.retryable,
+          ...(raw.detail !== undefined ? { detail: raw.detail } : {}),
+          ...(provider !== undefined ? { provider } : {}),
         },
       };
     }

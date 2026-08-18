@@ -135,8 +135,6 @@ function questionsTransport(): AgentTransportV1 {
           kind: "text",
           prompt: "What should the plan focus on?",
           required: true,
-          allowBlank: false,
-          maxLength: 500,
         },
       ],
     })

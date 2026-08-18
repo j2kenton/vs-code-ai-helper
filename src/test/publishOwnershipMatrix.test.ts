@@ -23,6 +23,7 @@
  * clicking it.
  */
 import * as assert from "node:assert/strict";
+import * as cp from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -55,6 +56,11 @@ import { TaskInventory } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { normalizePath } from "../utils/taskRoot";
 import { __quotaTestOnly } from "../utils/quota";
+import {
+  computePublishScopeId,
+  renderPublishChecksFreshnessStamp,
+} from "../utils/publishChecksFreshness";
+import { PUBLISH_CHECKS_FILENAME } from "../types/taskProgress";
 
 /* eslint-disable @typescript-eslint/no-var-requires */
 const settingsModule = require("../config/settings") as Record<string, unknown>;
@@ -69,6 +75,21 @@ const gitRepoInfoModule = require("../utils/gitRepoInfo") as Record<string, unkn
 /* eslint-enable @typescript-eslint/no-var-requires */
 
 const REAL_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-publish-owner-"));
+
+// Publish review now refuses to build a prompt unless publish-checks.md
+// carries a freshness stamp naming the current commit and verification scope
+// (plan PART 2, step 7 — requirePublishChecksFreshnessOrWarnV1 in
+// reviewActions.ts) — see makeTaskFolder's `stampPublishChecksFreshnessV1`
+// call below for how this file satisfies that gate for its Publish-stage
+// fixtures. That requires REAL_ROOT to actually be a git repo with a
+// resolvable HEAD; `git init` alone leaves HEAD unborn, so one empty commit
+// is made too.
+cp.execSync("git init", { cwd: REAL_ROOT, stdio: "ignore" });
+cp.execSync(
+  'git -c user.email=test@example.invalid -c user.name=test commit --allow-empty -m "init"',
+  { cwd: REAL_ROOT, stdio: "ignore" }
+);
+const REAL_ROOT_HEAD_SHA = cp.execSync("git rev-parse HEAD", { cwd: REAL_ROOT }).toString().trim();
 
 // runReviewForFolder/commitAndPushTask's AI metadata path run through the
 // real production coordinator (createProductionTaskActionCoordinatorV1),
@@ -108,6 +129,27 @@ after(() => {
   fs.rmSync(REAL_ROOT, { recursive: true, force: true });
 });
 
+/**
+ * Satisfy the Publish review freshness gate (plan PART 2, step 7) for a
+ * Publish-stage fixture: writes a stamp naming REAL_ROOT_HEAD_SHA (this
+ * file's single, never-advancing commit) and the scope this task's
+ * `ownership.projectRoot` binding resolves to — `path.dirname(folderPath)`,
+ * matching makeTaskFolder's own binding below and the resolver
+ * requirePublishChecksFreshnessOrWarnV1 actually calls
+ * (resolvePublishScopeFolder → ownership.projectRoot first).
+ */
+function stampPublishChecksFreshnessV1(folderPath: string): void {
+  const scopeFolder = path.dirname(folderPath);
+  const section = renderPublishChecksFreshnessStamp({
+    formatVersion: 1,
+    runId: "00000000-0000-4000-8000-000000000000",
+    verifiedCommitSha: REAL_ROOT_HEAD_SHA,
+    completedAt: "2026-01-01T00:00:00.000Z",
+    scopeId: computePublishScopeId(scopeFolder),
+  });
+  fs.writeFileSync(path.join(folderPath, PUBLISH_CHECKS_FILENAME), `${section}\n`, "utf8");
+}
+
 function makeTaskFolder(
   name: string,
   currentStage: TaskProgress["currentStage"] = "impl-low-review"
@@ -132,6 +174,9 @@ function makeTaskFolder(
   fs.writeFileSync(path.join(folderPath, "task.md"), "# Task\n\nDo the thing.\n", "utf8");
   fs.writeFileSync(path.join(folderPath, "plan.md"), "# Plan\n\n1. Do the thing.\n", "utf8");
   fs.writeFileSync(path.join(folderPath, "plan-final.md"), "# Implementation\n\nDone.\n", "utf8");
+  if (currentStage === "publish") {
+    stampPublishChecksFreshnessV1(folderPath);
+  }
   return { folderPath };
 }
 
@@ -280,8 +325,6 @@ function questionsTransportV1(runnerId = "stub-runner"): AgentTransportV1 {
               kind: "text",
               prompt: "Which approach should the review favor?",
               required: true,
-              allowBlank: false,
-              maxLength: 200,
             },
           ],
         })
@@ -1690,15 +1733,7 @@ void describe("Publish auto-run ownership matrix — implReviewFiles scope consi
  * changes this behavior deliberately, not by omission:
  *
  *  - Provider selection and fallback move to providerSelectionPolicyV1.ts /
- *    runnerRegistry.ts's openV1RunnerSelection. Per plan §3.3/AC-RUNNER-05,
- *    fallback to another provider is allowed ONLY after a pre-response
- *    outcome (a candidate that can't satisfy the requested mode, or a
- *    pre-response transport failure) — NOT after a malformed/invalid
- *    completed result. A response with no Readiness line now decodes fine as
- *    a well-formed `markdown-artifact.v1` completed envelope, so by the time
- *    reviewRowV1.ts's promoteReviewContentV1 rejects it for missing
- *    readiness, the provider selection session has already reported that
- *    attempt "completed" and closed — there is no backup retry to trigger.
+ *    runnerRegistry.ts's openV1RunnerSelection.
  *  - The old dedup-against-already-tried-model logic
  *    (qualifiedRanModelId/normalizeQualifiedModelId) lived entirely inside
  *    runAiToFile's own cascade and has no V1 equivalent to test here: ranking
@@ -1707,23 +1742,27 @@ void describe("Publish auto-run ownership matrix — implReviewFiles scope consi
  *    runnerRegistry.test.ts and taskActionCoordinatorV1.test.ts), not
  *    something reviewActions.ts's callers orchestrate per-attempt.
  *  - fallbackActive/fallbackModelId persistence tied to a content-validation
- *    retry no longer applies for the same reason: there is no retry to
- *    persist the outcome of.
+ *    retry no longer applies for the same reason: there is no legacy retry
+ *    loop left to persist the outcome of.
  *
- * What replaces this coverage: reviewRowV1.ts's own promotion-time readiness
- * check (a malformed/no-Readiness response is a terminal `promotionFailed`
- * outcome, never retried) and the provider-unavailable-cascades-to-next-
- * candidate contract already covered directly against
- * openV1RunnerSelection/providerSelectionPolicyV1 in runnerRegistry.test.ts
- * and taskActionCoordinatorV1.test.ts. The test below pins the
+ * What replaces this coverage: reviewRowV1.ts's `validateCompletedContent`
+ * readiness check plus the coordinator's candidate-scoped content-contract
+ * advance (taskActionCoordinatorV1.ts, `classifyProviderCandidateDispositionV1`
+ * in providerSelectionPolicyV1.ts). A response with no Readiness line decodes
+ * fine as a well-formed `markdown-artifact.v1` envelope, but fails that
+ * row-owned content contract — and per the 2026-08-16 field report (fourth
+ * item), that is now candidate-scoped, not stage-terminal: the coordinator
+ * advances to the next ranked candidate exactly as it does for a malformed
+ * envelope, rather than settling on a terminal outcome while a working
+ * backup sits unreserved one position down. The test below pins the
  * reviewActions.ts-level, end-to-end half of that contract: a real
- * runReviewForFolder call whose provider produces well-formed but invalid
- * (no Readiness line) content must reject it as terminal, never falling back
- * to a second configured candidate and never publishing the artifact.
+ * runReviewForFolder call whose FIRST candidate produces well-formed but
+ * invalid (no Readiness line) content must fall through to the second
+ * configured candidate and publish ITS review.
  */
-void describe("Review generation — a malformed (no Readiness line) response is a terminal failure, never retried", () => {
-  void it("a review response with no Readiness line is rejected as a terminal failure — no fallback candidate is ever reached, and nothing is published", async () => {
-    const { folderPath } = makeTaskFolder(`content-invalid-terminal-${Math.floor(Math.random() * 1e9)}`, "impl-low-review");
+void describe("Review generation — a response with no Readiness line advances to the next candidate", () => {
+  void it("a review response with no Readiness line from the first candidate falls through to a working second candidate, which is published", async () => {
+    const { folderPath } = makeTaskFolder(`content-invalid-advance-${Math.floor(Math.random() * 1e9)}`, "impl-low-review");
     const provider = new StatusTreeProvider();
     initNotificationRouter(provider);
     const fsBridge = installFsBridge();
@@ -1743,9 +1782,8 @@ void describe("Review generation — a malformed (no Readiness line) response is
       patch(modelSelectionModule, "resolveConfiguredReviewStages", () =>
         Promise.resolve(new Set(REVIEW_STAGES))),
       // Two candidates offered: the first returns well-formed but invalid
-      // (no Readiness line) content; the second would produce a valid
-      // review. Only the first may ever be invoked — a malformed completed
-      // result is terminal (AC-RUNNER-05), not fallback-eligible.
+      // (no Readiness line) content; the coordinator must advance to the
+      // second, which produces a valid, publishable review.
       stubV1RunnerSelection([
         markdownTransportV1("I have a clarifying question instead of a review."),
         scriptedMarkdownTransportV1(() => {
@@ -1772,9 +1810,8 @@ void describe("Review generation — a malformed (no Readiness line) response is
         {}
       );
 
-      assert.equal(secondCandidateInvoked, false, "a malformed completed result must never trigger a fallback candidate");
-      assert.equal(fs.existsSync(path.join(folderPath, "impl-low-review.md")), false, "no review artifact should be published for a rejected (no Readiness line) response");
-      assert.equal(dispatches.length, 0, "nothing was ever produced, so no automation chain should fire");
+      assert.equal(secondCandidateInvoked, true, "a content-contract failure (no Readiness line) must advance to the next ranked candidate");
+      assert.equal(fs.existsSync(path.join(folderPath, "impl-low-review.md")), true, "the second candidate's valid review should be published");
     } finally {
       for (const p of patches.reverse()) { p.restore(); }
       wsStub.restore();
