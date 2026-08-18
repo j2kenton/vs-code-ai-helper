@@ -68,11 +68,16 @@ const CONTENT_TYPE_SHAPE_HINTS_V1: Readonly<Record<CompletedContentTypeNameV1, s
     '{"contentType":"preflight-plan.v1","schemaVersion":1,' +
     '"requestDigest":"<requestDigest from the preamble>",' +
     '"rootBindingId":"<rootBindingId from the preamble>",' +
-    '"operations":[{"stepId":"step-1","kind":"replaceFile",' +
+    // The example shows patchFile deliberately: it is the operation that
+    // should be reached for by default. replaceFile requires emitting the
+    // COMPLETE new file, which is impossible above roughly 40 KB of content
+    // for most models once base64 inflation is counted.
+    '"operations":[{"stepId":"step-1","kind":"patchFile",' +
     '"rootId":"<rootId from the preamble>","relativePath":"src/example.ts",' +
     '"targetObservationId":"<observationId returned when you read that path>",' +
     '"parentChain":[{"kind":"observed","observationId":"<observationId for src>"}],' +
-    '"contentBase64":"<base64 of the complete new file>"}]}',
+    '"findBase64":"<base64 of the exact existing text to replace>",' +
+    '"replacementBase64":"<base64 of the new text>"}]}',
   "edit-execution.v1":
     '{"contentType":"edit-execution.v1","schemaVersion":1,"executionId":"...","planId":"...","planDigest":"...","receiptIds":[...]}',
 };

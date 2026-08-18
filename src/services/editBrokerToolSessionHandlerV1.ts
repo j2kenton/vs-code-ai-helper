@@ -53,6 +53,18 @@ import { RequestLocalToolHandlerV1, createViolationCounterV1 } from "./requestLo
 import { LmToolCallPartV1 } from "../types/vscodeLmCompatV1";
 import { EDIT_RUNS_DIRNAME_V1, WORKFLOW_RUNTIME_DIRNAME_V1 } from "./workflowPrivacyClassifierV1";
 
+/**
+ * Read ceiling when loading a patch target.
+ *
+ * Deliberately larger than the tool-session read cap
+ * (`MAX_READ_FILE_BYTES_V1`, 512 KB): patching exists precisely to edit files
+ * too large to round-trip through a model, so the executor must be able to
+ * load files the model itself could never have been shown in full. Bounded all
+ * the same — an unbounded read would reintroduce host-side the memory profile
+ * the whole-file path is capped to avoid.
+ */
+const MAX_PATCH_TARGET_BYTES_V1 = 16 * 1024 * 1024;
+
 export type SealPlanResultV1 =
   | {
       readonly ok: true;
@@ -379,6 +391,71 @@ export function createEditPlanBrokerV1(deps: EditPlanBrokerDepsV1): EditPlanBrok
                 sha256: replaced.value.sha256,
               });
             }
+            break;
+          }
+          case "patchFile": {
+            // §7.7 (3)/(6) equivalent for a spliced write. The sealed payload
+            // is a find/replacement pair rather than whole-file bytes, so the
+            // re-verification that matters is that the region we are about to
+            // replace still exists EXACTLY ONCE in the current file.
+            //
+            // Uniqueness is the whole safety property. Byte offsets were
+            // deliberately not used: a model cannot compute them reliably, and
+            // a wrong offset silently corrupts a file, whereas a non-unique or
+            // absent match is detectable and refused here.
+            const findBytes = Buffer.from(operation.findBase64 ?? "", "base64");
+            const replacementBytes = Buffer.from(operation.replacementBase64 ?? "", "base64");
+            if (findBytes.length === 0) {
+              blockExecution(execution);
+              return errorJson("stalePreflight", "patch has an empty find payload");
+            }
+            const current = await deps.getFileStore().readFileBounded(
+              targetLocator,
+              MAX_PATCH_TARGET_BYTES_V1
+            );
+            if (current.kind !== "ok") {
+              blockExecution(execution);
+              return errorJson("stalePreflight", "patch target could not be read");
+            }
+            // Raw bytes, never a UTF-8 round-trip: a file that is not valid
+            // UTF-8 would be corrupted by re-encoding, and an exact-match
+            // splice must operate on exactly what is on disk.
+            const currentBytes = current.value.bytes;
+            const firstAt = currentBytes.indexOf(findBytes);
+            if (firstAt < 0) {
+              blockExecution(execution);
+              return errorJson(
+                "stalePreflight",
+                "patch anchor no longer present in the target file"
+              );
+            }
+            if (currentBytes.indexOf(findBytes, firstAt + 1) >= 0) {
+              blockExecution(execution);
+              return errorJson(
+                "stalePreflight",
+                "patch anchor is not unique in the target file"
+              );
+            }
+            const patched = Buffer.concat([
+              currentBytes.subarray(0, firstAt),
+              replacementBytes,
+              currentBytes.subarray(firstAt + findBytes.length),
+            ]);
+            // Same revision-guarded primitive a whole-file replace uses, so a
+            // concurrent edit between observation and execution still loses.
+            const replacedByPatch = await deps.getFileStore().replaceFileExact(
+              targetLocator,
+              patched,
+              targetObservation.revision
+            );
+            if (replacedByPatch.kind !== "ok") {
+              blockExecution(execution);
+              return errorJson("stalePreflight", "exact replace failed (revision mismatch or IO)");
+            }
+            postconditionDigest = sha256OfCanonicalJsonV1({
+              revision: replacedByPatch.value.revision,
+              sha256: replacedByPatch.value.sha256,
+            });
             break;
           }
           case "createDirectory": {

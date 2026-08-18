@@ -55,6 +55,7 @@ export type ParentChainLinkV1 =
 export type PreflightOperationKindV1 =
   | "createFile"
   | "replaceFile"
+  | "patchFile"
   | "createDirectory"
   | "deleteFile"
   | "deleteEmptyDirectory";
@@ -70,6 +71,16 @@ export interface PreflightOperationV1 {
   readonly contentBase64?: string;
   readonly decodedByteLength?: number;
   readonly contentSha256?: string;
+  /**
+   * `patchFile` only: exact existing bytes to replace, base64-encoded. Kept
+   * byte-identical in intent to the extension's copy in
+   * `src/types/aiResultEnvelope.ts` — see that file for why a patch exists at
+   * all (whole-file replace caps the editable file size at the model's output
+   * budget) and why uniqueness, not byte offsets, is the safety property.
+   */
+  readonly findBase64?: string;
+  /** `patchFile` only: replacement bytes for `findBase64`, base64-encoded. */
+  readonly replacementBase64?: string;
 }
 
 export interface PreflightPlanCompletedV1 {
@@ -169,6 +180,7 @@ const MAX_PREFLIGHT_AGGREGATE_WRITE_BYTES_V1 = 8 * 1024 * 1024;
 const PREFLIGHT_OP_KINDS_V1 = new Set<string>([
   "createFile",
   "replaceFile",
+  "patchFile",
   "createDirectory",
   "deleteFile",
   "deleteEmptyDirectory",
@@ -704,11 +716,78 @@ function decodePreflightOperation(
   }
 
   const isWrite = kind === "createFile" || kind === "replaceFile";
-  if (!isWrite) {
+  if (kind === "patchFile") {
     if (
       raw.contentBase64 !== undefined ||
       raw.decodedByteLength !== undefined ||
       raw.contentSha256 !== undefined
+    ) {
+      return `patch operation ${stepId} must not include whole-file content bytes`;
+    }
+    if (typeof raw.findBase64 !== "string") {
+      return `patch operation ${stepId} is missing "findBase64"`;
+    }
+    if (typeof raw.replacementBase64 !== "string") {
+      return `patch operation ${stepId} is missing "replacementBase64"`;
+    }
+    let findBytes: Buffer;
+    let replacementBytes: Buffer;
+    try {
+      findBytes = Buffer.from(raw.findBase64, "base64");
+      replacementBytes = Buffer.from(raw.replacementBase64, "base64");
+    } catch {
+      return `patch operation ${stepId} has invalid base64`;
+    }
+    if (findBytes.toString("base64") !== raw.findBase64) {
+      return `patch operation ${stepId} has non-canonical "findBase64"`;
+    }
+    if (replacementBytes.toString("base64") !== raw.replacementBase64) {
+      return `patch operation ${stepId} has non-canonical "replacementBase64"`;
+    }
+    if (findBytes.length === 0) {
+      return `patch operation ${stepId} has an empty "findBase64"`;
+    }
+    if (
+      findBytes.length > MAX_PREFLIGHT_FILE_BYTES_V1 ||
+      replacementBytes.length > MAX_PREFLIGHT_FILE_BYTES_V1
+    ) {
+      return `patch operation ${stepId} exceeds the per-file byte ceiling`;
+    }
+    const unknownField = rejectUnknownFields(
+      raw,
+      new Set([
+        "stepId",
+        "kind",
+        "rootId",
+        "relativePath",
+        "targetObservationId",
+        "parentChain",
+        "findBase64",
+        "replacementBase64",
+      ]),
+      `operation ${stepId}`
+    );
+    if (unknownField) {
+      return unknownField;
+    }
+    return {
+      stepId,
+      kind,
+      rootId: raw.rootId,
+      relativePath: raw.relativePath,
+      targetObservationId: raw.targetObservationId,
+      parentChain,
+      findBase64: raw.findBase64,
+      replacementBase64: raw.replacementBase64,
+    };
+  }
+  if (!isWrite) {
+    if (
+      raw.contentBase64 !== undefined ||
+      raw.decodedByteLength !== undefined ||
+      raw.contentSha256 !== undefined ||
+      raw.findBase64 !== undefined ||
+      raw.replacementBase64 !== undefined
     ) {
       return `non-write operation ${stepId} must not include content bytes`;
     }

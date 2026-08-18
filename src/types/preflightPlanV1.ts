@@ -195,6 +195,7 @@ export function validatePreflightPlanAgainstLedgerV1(
         }
         break;
       case "replaceFile":
+      case "patchFile":
       case "deleteFile":
         if (target.kind !== "file") {
           return failure("targetStateMismatch", `${where} requires an observed file, found ${target.kind}`);
@@ -290,6 +291,13 @@ export function computePreflightPlanDigestV1(plan: PreflightPlanCompletedV1): st
         ? { decodedByteLength: operation.decodedByteLength }
         : {}),
       ...(operation.contentSha256 !== undefined ? { contentSha256: operation.contentSha256 } : {}),
+      // Patch payloads are covered by the plan digest exactly like whole-file
+      // content. This list is a WHITELIST: a field omitted here is sealed by
+      // nothing, so a tampered find/replacement would verify clean.
+      ...(operation.findBase64 !== undefined ? { findBase64: operation.findBase64 } : {}),
+      ...(operation.replacementBase64 !== undefined
+        ? { replacementBase64: operation.replacementBase64 }
+        : {}),
     })),
   });
 }

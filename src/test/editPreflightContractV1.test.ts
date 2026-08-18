@@ -93,6 +93,92 @@ function plan(operations: readonly PreflightOperationV1[]): PreflightPlanComplet
   };
 }
 
+void describe("editPreflightContractV1 — patchFile", () => {
+  void it("accepts a patch whose target is an observed file", () => {
+    const ledger = createObservationLedgerV1();
+    const file = mintFile(ledger, "src/old.ts");
+    mintDirectory(ledger, "src", ["old.ts"]);
+    const srcDir = ledger.records().find((r) => r.relativePath === "src" && r.kind === "directory")!;
+
+    const result = validatePreflightPlanAgainstLedgerV1(
+      plan([
+        op({
+          stepId: "s1",
+          kind: "patchFile",
+          relativePath: "src/old.ts",
+          targetObservationId: file,
+          parentChain: [{ kind: "observed", observationId: srcDir.observationId }],
+          findBase64: "aGk=",
+          replacementBase64: "Ynll",
+        }),
+      ]),
+      ledger,
+      ROOT
+    );
+    assert.deepEqual(result, { ok: true });
+  });
+
+  void it("refuses a patch aimed at a missing target", () => {
+    // A patch edits bytes that must already exist. Sharing replaceFile's
+    // observed-file precondition is what stops a patch being used to
+    // conjure a file whose prior contents were never observed.
+    const ledger = createObservationLedgerV1();
+    const missing = mintMissing(ledger, "src/new.ts");
+    mintDirectory(ledger, "src", []);
+    const srcDir = ledger.records().find((r) => r.relativePath === "src" && r.kind === "directory")!;
+
+    const result = validatePreflightPlanAgainstLedgerV1(
+      plan([
+        op({
+          stepId: "s1",
+          kind: "patchFile",
+          relativePath: "src/new.ts",
+          targetObservationId: missing,
+          parentChain: [{ kind: "observed", observationId: srcDir.observationId }],
+          findBase64: "aGk=",
+          replacementBase64: "Ynll",
+        }),
+      ]),
+      ledger,
+      ROOT
+    );
+    assert.equal(result.ok, false);
+    assert.equal(result.ok === false && result.code, "targetStateMismatch");
+  });
+
+  void it("seals the patch payloads into the plan digest", () => {
+    // computePreflightPlanDigestV1 whitelists the fields it hashes. A payload
+    // omitted from that list would sit OUTSIDE the seal entirely, so a
+    // tampered find/replacement would verify clean — the digest must move
+    // when either payload moves.
+    const ledger = createObservationLedgerV1();
+    const file = mintFile(ledger, "src/old.ts");
+    const base = op({
+      stepId: "s1",
+      kind: "patchFile",
+      relativePath: "src/old.ts",
+      targetObservationId: file,
+      findBase64: "aGk=",
+      replacementBase64: "Ynll",
+    });
+    const original = computePreflightPlanDigestV1(plan([base]));
+
+    const tamperedFind = computePreflightPlanDigestV1(
+      plan([{ ...base, findBase64: "aGo=" }])
+    );
+    assert.notEqual(original, tamperedFind, "findBase64 must be covered by the plan digest");
+
+    const tamperedReplacement = computePreflightPlanDigestV1(
+      plan([{ ...base, replacementBase64: "Ynlm" }])
+    );
+    assert.notEqual(
+      original,
+      tamperedReplacement,
+      "replacementBase64 must be covered by the plan digest"
+    );
+  });
+});
+
 void describe("editPreflightContractV1 — plan-vs-ledger validation", () => {
   void it("accepts a well-formed create+replace plan whose preconditions come from exact-path reads", () => {
     const ledger = createObservationLedgerV1();

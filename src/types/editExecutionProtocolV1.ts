@@ -78,8 +78,13 @@ export interface SealedPlanRecordV1 {
 /** §7.4's fixed operation-kind → mutation-tool mapping. */
 export function toolForOperationKindV1(kind: PreflightOperationKindV1): EditToolNameV1 {
   switch (kind) {
+    // `patchFile` maps here too: it still writes the file through the same
+    // mutation tool and the same sealed-step dispatch. Only the payload shape
+    // differs (a spliced region rather than whole-file bytes), which the
+    // executor resolves.
     case "createFile":
     case "replaceFile":
+    case "patchFile":
       return "ensemble_writeFile";
     case "createDirectory":
       return "ensemble_createDirectory";

@@ -56,6 +56,7 @@ export type ParentChainLinkV1 =
 export type PreflightOperationKindV1 =
   | "createFile"
   | "replaceFile"
+  | "patchFile"
   | "createDirectory"
   | "deleteFile"
   | "deleteEmptyDirectory";
@@ -71,6 +72,29 @@ export interface PreflightOperationV1 {
   readonly contentBase64?: string;
   readonly decodedByteLength?: number;
   readonly contentSha256?: string;
+  /**
+   * `patchFile` only: the exact existing bytes to replace, base64-encoded.
+   *
+   * Whole-file `replaceFile` requires the author to emit the COMPLETE new file
+   * in one response, which caps the usable file size at whatever the model's
+   * output budget allows (~40 KB for Copilot once base64's 4/3 inflation is
+   * counted). A one-line change to a 373 KB file was therefore impossible,
+   * and the model correctly reported its own `planTooLargeForSingleRound`
+   * (2026-08-17). A patch carries only the changed region, so cost scales
+   * with the EDIT, not the file.
+   *
+   * Base64 for the same reason as `contentBase64`: the payload is arbitrary
+   * source text and must survive JSON without escaping ambiguity.
+   *
+   * Safety rests on exact-match uniqueness rather than byte offsets, which a
+   * model cannot compute reliably: the decoded bytes must occur EXACTLY ONCE
+   * in the target file at execution time, or the operation is refused. That,
+   * plus the existing `targetObservationId` revision check, is what makes a
+   * blind splice safe.
+   */
+  readonly findBase64?: string;
+  /** `patchFile` only: the replacement bytes for `findBase64`, base64-encoded. */
+  readonly replacementBase64?: string;
 }
 
 export interface PreflightPlanCompletedV1 {
@@ -172,6 +196,7 @@ const MAX_PREFLIGHT_AGGREGATE_WRITE_BYTES_V1 = 8 * 1024 * 1024;
 const PREFLIGHT_OP_KINDS_V1 = new Set<string>([
   "createFile",
   "replaceFile",
+  "patchFile",
   "createDirectory",
   "deleteFile",
   "deleteEmptyDirectory",
@@ -722,8 +747,67 @@ function decodePreflightOperation(
   }
 
   const isWrite = kind === "createFile" || kind === "replaceFile";
-  if (!isWrite) {
+  const isPatch = kind === "patchFile";
+  if (isPatch) {
+    // A patch carries its own two payloads and never the whole-file trio.
     if (raw.contentBase64 !== undefined || raw.decodedByteLength !== undefined || raw.contentSha256 !== undefined) {
+      return `patch operation ${stepId} must not include whole-file content bytes`;
+    }
+    if (typeof raw.findBase64 !== "string") {
+      return `patch operation ${stepId} is missing "findBase64"`;
+    }
+    if (typeof raw.replacementBase64 !== "string") {
+      return `patch operation ${stepId} is missing "replacementBase64"`;
+    }
+    let findBytes: Buffer;
+    let replacementBytes: Buffer;
+    try {
+      findBytes = Buffer.from(raw.findBase64, "base64");
+      replacementBytes = Buffer.from(raw.replacementBase64, "base64");
+    } catch {
+      return `patch operation ${stepId} has invalid base64`;
+    }
+    // Canonicality, same rule the whole-file path enforces: a non-canonical
+    // encoding round-trips to different bytes than it claims to carry.
+    if (findBytes.toString("base64") !== raw.findBase64) {
+      return `patch operation ${stepId} has non-canonical "findBase64"`;
+    }
+    if (replacementBytes.toString("base64") !== raw.replacementBase64) {
+      return `patch operation ${stepId} has non-canonical "replacementBase64"`;
+    }
+    // An empty needle would match everywhere (or nowhere, depending on the
+    // search); uniqueness is the entire safety property, so refuse it.
+    if (findBytes.length === 0) {
+      return `patch operation ${stepId} has an empty "findBase64"`;
+    }
+    if (findBytes.length > MAX_PREFLIGHT_FILE_BYTES_V1 || replacementBytes.length > MAX_PREFLIGHT_FILE_BYTES_V1) {
+      return `patch operation ${stepId} exceeds the per-file byte ceiling`;
+    }
+    const unknownField = rejectUnknownFields(
+      raw,
+      new Set([
+        "stepId", "kind", "rootId", "relativePath", "targetObservationId",
+        "parentChain", "findBase64", "replacementBase64",
+      ]),
+      `operation ${stepId}`
+    );
+    if (unknownField) {
+      return unknownField;
+    }
+    return {
+      stepId, kind, rootId: raw.rootId, relativePath: raw.relativePath,
+      targetObservationId: raw.targetObservationId, parentChain,
+      findBase64: raw.findBase64, replacementBase64: raw.replacementBase64,
+    };
+  }
+  if (!isWrite) {
+    if (
+      raw.contentBase64 !== undefined ||
+      raw.decodedByteLength !== undefined ||
+      raw.contentSha256 !== undefined ||
+      raw.findBase64 !== undefined ||
+      raw.replacementBase64 !== undefined
+    ) {
       return `non-write operation ${stepId} must not include content bytes`;
     }
     const unknownField = rejectUnknownFields(
