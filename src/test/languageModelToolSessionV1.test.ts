@@ -106,6 +106,51 @@ function installModel(rounds: ReadonlyArray<readonly object[]>): { restore: () =
 }
 
 void describe("languageModelToolSessionV1", () => {
+  /** A minimal response that carries the required result frame. */
+  const FRAMED_FINAL_ANSWER = "<<<ENSEMBLE_AI_RESULT_V1>>>\n{}\n<<<END_ENSEMBLE_AI_RESULT_V1>>>";
+
+  void it("sends a frameless tool-free reply back for the real answer instead of accepting it", async () => {
+    // 2026-08-18, jester review: after reading the files the model wrote a
+    // paragraph of findings ending "Now I'll write the re-review frame." — and
+    // the session closed, recording that narration as the review. It was then
+    // rejected for having no `Readiness: N/10` line, discarding a round that
+    // had correctly verified the work.
+    const model = installModel([
+      [new stubClasses.LanguageModelTextPart("I verified both tests. Now I'll write the frame.")],
+      [new stubClasses.LanguageModelTextPart(FRAMED_FINAL_ANSWER)],
+    ]);
+    const handler = recordingHandler(() => "{}");
+    const writer = makeWriter();
+    try {
+      const transport = createCopilotLmToolSessionTransportV1({ model: "gpt-test", toolHandler: handler });
+      const exit = await transport.invoke(makeRequest(), writer);
+      assert.deepEqual(exit, { kind: "completed" });
+      assert.equal(writer.text(), FRAMED_FINAL_ANSWER, "the narration must not be recorded as the answer");
+      // Two model turns: the narration, then the nudged reply.
+      assert.equal(model.requests.length, 2);
+    } finally {
+      model.restore();
+    }
+  });
+
+  void it("accepts a frameless reply once the nudge budget is spent rather than looping", async () => {
+    // The nudge must be bounded: a model that cannot produce the frame at all
+    // should not burn the whole round budget being asked repeatedly.
+    const model = installModel([[new stubClasses.LanguageModelTextPart("no frame, ever")]]);
+    const handler = recordingHandler(() => "{}");
+    const writer = makeWriter();
+    try {
+      const transport = createCopilotLmToolSessionTransportV1({ model: "gpt-test", toolHandler: handler });
+      const exit = await transport.invoke(makeRequest(), writer);
+      assert.deepEqual(exit, { kind: "completed" });
+      assert.equal(writer.text(), "no frame, ever");
+      // One narration + the bounded nudges, not the full round cap.
+      assert.ok(model.requests.length <= 3, `expected a bounded nudge, got ${model.requests.length} turns`);
+    } finally {
+      model.restore();
+    }
+  });
+
   void it("dispatches tool rounds to the handler and writes only the final round's text", async () => {
     const model = installModel([
       [
@@ -115,7 +160,7 @@ void describe("languageModelToolSessionV1", () => {
           relativePath: "a.ts",
         }),
       ],
-      [new stubClasses.LanguageModelTextPart("final answer")],
+      [new stubClasses.LanguageModelTextPart(FRAMED_FINAL_ANSWER)],
     ]);
     const handler = recordingHandler(() => "{\"ok\":true}");
     const writer = makeWriter();
@@ -123,7 +168,7 @@ void describe("languageModelToolSessionV1", () => {
       const transport = createCopilotLmToolSessionTransportV1({ model: "gpt-test", toolHandler: handler });
       const exit = await transport.invoke(makeRequest(), writer);
       assert.deepEqual(exit, { kind: "completed" });
-      assert.equal(writer.text(), "final answer", "interim narration must be discarded");
+      assert.equal(writer.text(), FRAMED_FINAL_ANSWER, "interim narration must be discarded");
       assert.equal(handler.calls.length, 1);
       assert.equal(handler.calls[0]!.name, "ensemble_stat");
       assert.equal(handler.calls[0]!.callId, "call-1");

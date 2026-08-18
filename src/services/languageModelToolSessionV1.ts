@@ -32,6 +32,7 @@ import {
   MAX_TOOL_PROTOCOL_VIOLATIONS_V1,
   MAX_TOOL_ROUNDS_V1,
 } from "../types/workflowToolProtocolV1";
+import { FRAME_START_V1 } from "../types/aiResultEnvelope";
 import { RequestLocalToolHandlerV1 } from "./requestLocalToolHandlerV1";
 import {
   VscodeLmModuleV1,
@@ -74,6 +75,14 @@ export interface CopilotLmToolSessionOptionsV1 {
  * the runaway case.
  */
 export const MAX_TOOL_SESSION_RESULT_BYTES_V1 = 8 * 1024 * 1024;
+
+/**
+ * How many times a tool-free round with no result frame may be sent back for
+ * the real answer. Two is enough for a model that narrated once and then
+ * complied; more would just spend rounds arguing with a model that cannot
+ * produce the frame at all.
+ */
+const MAX_NARRATION_NUDGES_V1 = 2;
 
 /** One round's activity, reported for observability. Never affects behaviour. */
 export interface LmToolSessionRoundV1 {
@@ -161,6 +170,7 @@ export function createCopilotLmToolSessionTransportV1(
       ];
 
       let totalResultBytes = 0;
+      let narrationNudges = 0;
 
       for (let round = 0; round < maxRounds; round++) {
         if (request.cancellationToken.isCancellationRequested) {
@@ -239,6 +249,33 @@ export function createCopilotLmToolSessionTransportV1(
         });
 
         if (!sawToolCall) {
+          // A round with no tool calls ENDS the session, so a model that uses
+          // one to think out loud loses its real answer. Observed 2026-08-18
+          // (jester review): after reading the files it wrote a paragraph of
+          // findings ending "Now I'll write the re-review frame." — and the
+          // session closed, recording that narration as the review. The round
+          // was rejected for having no `Readiness: N/10` line, and the work it
+          // had just correctly verified was thrown away.
+          //
+          // A response that carries no result frame is not an answer. Nudge
+          // once per remaining round, bounded, before accepting it: cheap
+          // compared to discarding a completed round, and it cannot loop
+          // forever because `maxRounds` still governs.
+          if (!roundText.includes(FRAME_START_V1) && narrationNudges < MAX_NARRATION_NUDGES_V1) {
+            narrationNudges += 1;
+            messages.push(createLmAssistantMessageWithPartsV1(vscodeModule, assistantRawParts));
+            messages.push(
+              vscode.LanguageModelChatMessage.User(
+                "That response contained no result frame, so it cannot be accepted. " +
+                  "Reply now with ONLY the complete final result frame described in the " +
+                  "result contract — starting with " +
+                  FRAME_START_V1 +
+                  " — and nothing else. Do not restate your findings or announce what you " +
+                  "are about to do; this reply is your final answer."
+              )
+            );
+            continue;
+          }
           // Final round: only THIS round's text is the provider result —
           // interim narration between tool rounds is deliberately discarded.
           if (!output.write(roundText)) {

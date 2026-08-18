@@ -179,5 +179,17 @@ export function buildWorkspaceReadSessionPreambleV1(input: { readonly rootId: st
     "is truncated or a file is absent from the prompt, read it before judging. If",
     "you still cannot verify something, say so explicitly as a confidence",
     "limitation rather than concluding the work was not done.",
+    "",
+    "### When you stop calling tools, you are finished",
+    "",
+    "Keep calling tools for as long as you need. But the FIRST reply you send",
+    "without a tool call ends this session and is taken as your complete answer —",
+    "there is no later turn. So that reply must be the full result frame required",
+    "by the result contract below, and nothing else.",
+    "",
+    "Do not use a tool-free reply to summarise findings, think aloud, or announce",
+    "what you are about to write. A reply that says you will produce the answer",
+    "next is recorded AS the answer, and is then rejected for not matching the",
+    "contract — losing all the work you just did.",
   ].join("\n");
 }
