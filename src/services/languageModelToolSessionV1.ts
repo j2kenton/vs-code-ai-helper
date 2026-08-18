@@ -49,6 +49,66 @@ export interface CopilotLmToolSessionOptionsV1 {
   readonly toolHandler: RequestLocalToolHandlerV1;
   /** Round cap override for tests; production uses MAX_TOOL_ROUNDS_V1. */
   readonly maxRounds?: number;
+  /**
+   * Cumulative tool-result byte budget override for tests; production uses
+   * MAX_TOOL_SESSION_RESULT_BYTES_V1.
+   */
+  readonly maxResultBytes?: number;
+}
+
+/**
+ * Cumulative cap on tool-result bytes fed back into one session.
+ *
+ * The round loop re-sends the ENTIRE message history every round, so every
+ * tool result is paid for again on each subsequent round: cost grows roughly
+ * quadratically in rounds, not linearly. With `MAX_TOOL_ROUNDS_V1` at 64 and
+ * `MAX_READ_FILE_BYTES_V1` at 512 KB per read, an unlucky session can bill for
+ * hundreds of MB of resent context while producing nothing.
+ *
+ * Observed 2026-08-17: a Copilot session ran long enough that the operator
+ * cancelled it on suspicion of being wedged, having no way to tell spend from
+ * a hang. It was working. There was no budget and no signal.
+ *
+ * 8 MB of accumulated tool results is far above any legitimate edit-planning
+ * session (the largest observed real plan read well under 1 MB) and far below
+ * the runaway case.
+ */
+export const MAX_TOOL_SESSION_RESULT_BYTES_V1 = 8 * 1024 * 1024;
+
+/** One round's activity, reported for observability. Never affects behaviour. */
+export interface LmToolSessionRoundV1 {
+  /** 1-based round number. */
+  readonly round: number;
+  readonly maxRounds: number;
+  /** Tool names called this round, in call order. */
+  readonly toolNames: readonly string[];
+  /** Bytes of tool results produced this round. */
+  readonly roundResultBytes: number;
+  /** Cumulative tool-result bytes across the session so far. */
+  readonly totalResultBytes: number;
+}
+
+export type LmToolSessionObserverV1 = (round: LmToolSessionRoundV1) => void;
+
+let lmToolSessionObserverV1: LmToolSessionObserverV1 | undefined;
+
+/**
+ * Wire a sink for per-round session activity. Optional seam rather than a
+ * direct logger import, matching `setInertTrailingObserverV1`'s pattern: a
+ * tool session previously emitted NOTHING for up to 64 rounds, so a working
+ * run and a wedged one were indistinguishable from outside.
+ */
+export function setLmToolSessionObserverV1(observer: LmToolSessionObserverV1 | undefined): void {
+  lmToolSessionObserverV1 = observer;
+}
+
+/** Report, never affect. A throwing observer must not change session behaviour. */
+function recordLmToolSessionRoundV1(round: LmToolSessionRoundV1): void {
+  try {
+    lmToolSessionObserverV1?.(round);
+  } catch {
+    // Observation is a side channel; session correctness cannot depend on it.
+  }
 }
 
 export function createCopilotLmToolSessionTransportV1(
@@ -56,6 +116,7 @@ export function createCopilotLmToolSessionTransportV1(
 ): AgentTransportV1 {
   const vscodeModule = vscode as unknown as VscodeLmModuleV1;
   const maxRounds = options.maxRounds ?? MAX_TOOL_ROUNDS_V1;
+  const maxResultBytes = options.maxResultBytes ?? MAX_TOOL_SESSION_RESULT_BYTES_V1;
 
   return {
     runnerId: COPILOT_LM_RUNNER_ID,
@@ -99,6 +160,8 @@ export function createCopilotLmToolSessionTransportV1(
         vscode.LanguageModelChatMessage.User(request.prompt),
       ];
 
+      let totalResultBytes = 0;
+
       for (let round = 0; round < maxRounds; round++) {
         if (request.cancellationToken.isCancellationRequested) {
           return { kind: "callerCancelled" };
@@ -107,6 +170,8 @@ export function createCopilotLmToolSessionTransportV1(
         let roundText = "";
         const assistantRawParts: unknown[] = [];
         const toolResultParts: unknown[] = [];
+        const roundToolNames: string[] = [];
+        let roundResultBytes = 0;
         let sawToolCall = false;
 
         try {
@@ -123,9 +188,26 @@ export function createCopilotLmToolSessionTransportV1(
             }
             sawToolCall = true;
             const resultText = await options.toolHandler.handleToolCall(part);
+            roundToolNames.push(part.name);
+            const resultBytes = Buffer.byteLength(resultText, "utf8");
+            roundResultBytes += resultBytes;
+            totalResultBytes += resultBytes;
             toolResultParts.push(createLmToolResultPartV1(vscodeModule, part.callId, resultText));
             if (options.toolHandler.violationCount() > MAX_TOOL_PROTOCOL_VIOLATIONS_V1) {
               return { kind: "transportFailure", code: "toolProtocolViolation" };
+            }
+            // Stop before the NEXT round resends everything accumulated so
+            // far. Checked inside the part loop rather than at the round
+            // boundary so a single round that reads far too much cannot blow
+            // straight past the cap.
+            if (totalResultBytes > maxResultBytes) {
+              return {
+                kind: "transportFailure",
+                code: "toolSessionResultBudgetExceeded",
+                detail:
+                  `tool results reached ${totalResultBytes} bytes across ${round + 1} round(s), ` +
+                  `over the ${maxResultBytes}-byte session budget`,
+              };
             }
           }
         } catch (error) {
@@ -144,6 +226,17 @@ export function createCopilotLmToolSessionTransportV1(
             ...(detail !== undefined ? { detail } : {}),
           };
         }
+
+        // Report AFTER the round settles so the record is complete, and
+        // unconditionally — a round with zero tool calls is the final one and
+        // is exactly as interesting as a busy one for "what is it doing?".
+        recordLmToolSessionRoundV1({
+          round: round + 1,
+          maxRounds,
+          toolNames: roundToolNames,
+          roundResultBytes,
+          totalResultBytes,
+        });
 
         if (!sawToolCall) {
           // Final round: only THIS round's text is the provider result —

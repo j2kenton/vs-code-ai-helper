@@ -102,6 +102,7 @@ import { IncompleteTask } from "./types/incompleteTask";
 import { getModelSettings, installAutoImplementConfirmation, migrateEnabledProvidersForExistingModels, migrateSettingsNamespace, migrateSettingsScope } from "./config/settings";
 import { setExtensionContextV1 } from "./utils/extensionContextV1";
 import { setInertTrailingObserverV1 } from "./types/aiResultEnvelope";
+import { setLmToolSessionObserverV1 } from "./services/languageModelToolSessionV1";
 
 /**
  * Run an orchestrator call that throws `ActionConversationErrorV1` on
@@ -176,6 +177,23 @@ export function activate(context: vscode.ExtensionContext): void {
       // Real bytes, not .length: the inert set's `\s` matches Unicode
       // whitespace, whose code-unit and UTF-8 lengths differ.
       JSON.stringify({ inertTrailing, byteLength: Buffer.byteLength(inertTrailing, "utf8") })
+    );
+  });
+
+  // A Copilot tool session can run up to MAX_TOOL_ROUNDS_V1 rounds emitting
+  // nothing observable, which on 2026-08-17 made a working run
+  // indistinguishable from a wedged one and got it cancelled. Tool NAMES and
+  // byte counts only — never tool arguments or result content, which carry
+  // workspace file data (§2.2).
+  setLmToolSessionObserverV1((round) => {
+    console.info(
+      "[ensemble:toolSession] round",
+      JSON.stringify({
+        round: `${round.round}/${round.maxRounds}`,
+        tools: round.toolNames,
+        roundResultBytes: round.roundResultBytes,
+        totalResultBytes: round.totalResultBytes,
+      })
     );
   });
 

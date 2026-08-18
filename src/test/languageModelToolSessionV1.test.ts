@@ -153,6 +153,43 @@ void describe("languageModelToolSessionV1", () => {
     }
   });
 
+  void it("stops the session once cumulative tool-result bytes exceed the budget", async () => {
+    // Each round re-sends the whole history, so accumulated tool results are
+    // paid for again every round — the cost curve is quadratic, not linear.
+    // Without a budget a session can bill for a very large amount of resent
+    // context and still produce nothing (2026-08-17).
+    const model = installModel([
+      [new stubClasses.LanguageModelToolCallPart("call-x", "ensemble_readFile", { rootId: "r", relativePath: "a" })],
+    ]);
+    const handler = recordingHandler(() => "x".repeat(400));
+    try {
+      const transport = createCopilotLmToolSessionTransportV1({
+        model: "gpt-test",
+        toolHandler: handler,
+        // Well above the round cap, so the BUDGET is what stops this and the
+        // round limit cannot be mistaken for the cause.
+        maxRounds: 50,
+        maxResultBytes: 1000,
+      });
+      const exit = await transport.invoke(makeRequest(), makeWriter());
+      assert.equal(exit.kind, "transportFailure");
+      assert.equal(
+        exit.kind === "transportFailure" && exit.code,
+        "toolSessionResultBudgetExceeded"
+      );
+      // The detail must name the measured total and the budget: a bare code
+      // cannot tell an operator whether to raise the cap or fix the prompt.
+      assert.match(
+        (exit.kind === "transportFailure" && exit.detail) || "",
+        /tool results reached \d+ bytes across \d+ round\(s\), over the 1000-byte session budget/
+      );
+      // Stopped promptly rather than running out the 50-round cap.
+      assert.ok(handler.calls.length <= 3, `expected an early stop, got ${handler.calls.length} calls`);
+    } finally {
+      model.restore();
+    }
+  });
+
   void it("aborts with toolProtocolViolation once the handler's violation cap is exceeded", async () => {
     const model = installModel([
       [new stubClasses.LanguageModelToolCallPart("call-x", "not.a.tool", {})],
