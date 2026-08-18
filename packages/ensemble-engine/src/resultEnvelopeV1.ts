@@ -945,6 +945,13 @@ function decodePreflightPlan(raw: Record<string, unknown>): ContentDecodeResult 
       return { ok: false, reason: decoded };
     }
     seenStepIds.add(decoded.stepId);
+    // A patch carries no `decodedByteLength`, so without this its replacement
+    // bytes would escape the aggregate write budget entirely — a plan could
+    // smuggle unbounded total content through many patch operations while
+    // every individual one stayed under the per-file ceiling.
+    if (decoded.replacementBase64 !== undefined) {
+      aggregateWriteBytes += Buffer.from(decoded.replacementBase64, "base64").length;
+    }
     if (decoded.decodedByteLength !== undefined) {
       if (decoded.decodedByteLength > MAX_PREFLIGHT_FILE_BYTES_V1) {
         return {

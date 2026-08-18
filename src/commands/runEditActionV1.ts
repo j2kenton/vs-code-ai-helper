@@ -463,8 +463,17 @@ export async function continueSealedEditExecutionV1(
     if (!operation) {
       return undefined;
     }
+    // `patchFile` belongs here for the same reason replaceFile does — it
+    // changes a file's bytes. Omitting it made a SUCCESSFUL patch report
+    // "0 file(s) changed" / "Files changed: _none recorded_" while the edit
+    // was plainly on disk (2026-08-18, jester run 014: a 28-line insertion
+    // into split.test.ts recorded as nothing). That is worse than cosmetic:
+    // `implReviewFiles` is derived from this list, so the reviewer would get
+    // no changed-file context, and the zero-change gate
+    // (`priorRoundsChangedTree`) would treat a real edit as a sterile round.
     return operation.kind === "createFile" ||
       operation.kind === "replaceFile" ||
+      operation.kind === "patchFile" ||
       operation.kind === "deleteFile"
       ? operation.relativePath
       : undefined;
