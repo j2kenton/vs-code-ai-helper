@@ -370,6 +370,50 @@ void describe("runner-entry disabled-provider guard", () => {
     }
   });
 
+  // The case above is about an ABSENT copilot key (Copilot predates provider
+  // selection, so no key means enabled). An EXPLICIT false is different, and
+  // was silently ignored: resolveEffectiveProvider's Copilot branch returned
+  // without ever consulting the guard, so a stage with Copilot disabled still
+  // resolved to Copilot and invoked it (workflow 5 runs 060/061, 2026-08-18 —
+  // every impl-chain entry disabled, reload ruled out stale config, and the
+  // round still ran `Provider: Copilot (auto)`).
+  void it("blocks a bare/legacy Copilot model id when Copilot is explicitly disabled", () => {
+    const stub = installProviderSelection({ "claude-cli": true, copilot: false });
+    try {
+      assert.throws(
+        () => resolveRunnerForModel("gpt-4o", "impl-low-review"),
+        /disabled in Provider Selection/
+      );
+    } finally {
+      stub.restore();
+    }
+  });
+
+  void it("blocks the Copilot \"auto\" selection when Copilot is explicitly disabled", () => {
+    // `auto` is the id the observed failure actually resolved with.
+    const stub = installProviderSelection({ "claude-cli": true, copilot: false });
+    try {
+      assert.throws(
+        () => resolveRunnerForModel("auto", "impl"),
+        /disabled in Provider Selection/
+      );
+    } finally {
+      stub.restore();
+    }
+  });
+
+  void it("blocks an explicitly qualified copilot: model id when Copilot is disabled", () => {
+    const stub = installProviderSelection({ "claude-cli": true, copilot: false });
+    try {
+      assert.throws(
+        () => resolveRunnerForModel("copilot:claude-sonnet-5", "impl"),
+        /disabled in Provider Selection/
+      );
+    } finally {
+      stub.restore();
+    }
+  });
+
   void it("stays inactive when no provider selection was ever recorded", () => {
     const settings = installModelSettings({});
     try {

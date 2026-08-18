@@ -1847,12 +1847,17 @@ export function createCliTextTransportV1(options: {
         // General-workspace CLI processes are unsupported for preflight and
         // edit execution (plan product decisions); the registry never
         // reserves them for those modes, so this is a defensive backstop.
-        return Promise.resolve({ kind: "transportFailure", code: "cliModeUnsupported" });
+        return Promise.resolve({
+          kind: "transportFailure",
+          code: "cliModeUnsupported",
+          detail: `${def.label} has no general-workspace CLI path for mode "${request.mode}" (text only)`,
+        });
       }
       if (!cliProviderSupportsV1StdoutCapture(def)) {
         return Promise.resolve({
           kind: "transportFailure",
           code: "cliStdoutCaptureUnsupported",
+          detail: `${def.label} reports its final answer through a last-message file, not bounded stdout`,
         });
       }
 
@@ -1862,6 +1867,7 @@ export function createCliTextTransportV1(options: {
         return Promise.resolve({
           kind: "transportFailure",
           code: "cliPromptTransportMisconfigured",
+          detail: `${def.label} declares promptTransport "${promptTransport}" with useShell=true; that combination cannot pass a prompt safely`,
         });
       }
 
@@ -1919,8 +1925,16 @@ export function createCliTextTransportV1(options: {
         });
       }
       if (promptTransport === "argv") {
-        if (checkArgvPromptSizeLimitV1(def, request.prompt).exceeds) {
-          return Promise.resolve({ kind: "transportFailure", code: "cliPromptTooLarge" });
+        const argvLimit = checkArgvPromptSizeLimitV1(def, request.prompt);
+        if (argvLimit.exceeds) {
+          // The checker already produced the measured-vs-limit sentence;
+          // discarding it here was what made this code unactionable.
+          const detail = boundedTransportDetailV1(argvLimit.errorMessage);
+          return Promise.resolve({
+            kind: "transportFailure",
+            code: "cliPromptTooLarge",
+            ...(detail !== undefined ? { detail } : {}),
+          });
         }
         args.push(request.prompt);
       }
@@ -1929,7 +1943,12 @@ export function createCliTextTransportV1(options: {
         const resolvedCommand = await resolveCliCommand(def.command, def.commandAliases);
         if (!resolvedCommand) {
           cleanupPromptFile();
-          return { kind: "transportFailure", code: "cliNotInstalled" };
+          const tried = [def.command, ...(def.commandAliases ?? [])].join(", ");
+          return {
+            kind: "transportFailure",
+            code: "cliNotInstalled",
+            detail: `not found on PATH (tried: ${tried})`,
+          };
         }
 
         return new Promise<AgentTransportExitV1>((resolve) => {
@@ -2000,7 +2019,19 @@ export function createCliTextTransportV1(options: {
 
           const timeoutHandle = setTimeout(() => {
             killProcessTree(child);
-            finish({ kind: "transportFailure", code: "cliRunTimeout" });
+            // stderr CONTENT is deliberately never retained (§2.2 — see
+            // cliStdoutResultCaptureV1); the byte counts are the sanitized
+            // summary its own doc marks safe to log, and they answer the
+            // first question about any timeout: was the process saying
+            // anything, or silently wedged?
+            const stderr = capture.stderrSummary();
+            finish({
+              kind: "transportFailure",
+              code: "cliRunTimeout",
+              detail:
+                `no exit after ${Math.round(RUN_TIMEOUT_MS / 60_000)}m wall clock; ` +
+                `stderr ${stderr.totalByteLength} byte(s)`,
+            });
           }, RUN_TIMEOUT_MS);
 
           // Part 7 inactivity watchdog: mirrors execCliAgent's — kills a
@@ -2018,7 +2049,15 @@ export function createCliTextTransportV1(options: {
                   }
                   if (Date.now() - lastActivityAt >= inactivityLimitMs) {
                     killProcessTree(child);
-                    finish({ kind: "transportFailure", code: "cliRunInactivityTimeout" });
+                    const stderr = capture.stderrSummary();
+                    finish({
+                      kind: "transportFailure",
+                      code: "cliRunInactivityTimeout",
+                      detail:
+                        `no output for ${inactivityLimitMinutes}m ` +
+                        `(ensemble.resilience.inactivityTimeoutMinutes); ` +
+                        `stderr ${stderr.totalByteLength} byte(s)`,
+                    });
                   }
                 }, 15_000)
               : undefined;
@@ -2029,8 +2068,16 @@ export function createCliTextTransportV1(options: {
             finish({ kind: "callerCancelled" });
           });
 
-          child.on("error", () => {
-            finish({ kind: "transportFailure", code: "cliSpawnFailed" });
+          child.on("error", (error) => {
+            // Was a bare arrow discarding the error: a spawn/runtime fault
+            // (ENOENT, EACCES, EPIPE) reached the user as a bare code with
+            // no way to tell which.
+            const detail = boundedTransportDetailV1(error);
+            finish({
+              kind: "transportFailure",
+              code: "cliSpawnFailed",
+              ...(detail !== undefined ? { detail } : {}),
+            });
           });
 
           child.stdout?.on("data", (chunk: Buffer) => {
@@ -2049,7 +2096,11 @@ export function createCliTextTransportV1(options: {
               // result writer, so this stays a pre-response failure.
               rawEventChunks.length = 0;
               killProcessTree(child);
-              finish({ kind: "transportFailure", code: "cliEventStreamTooLarge" });
+              finish({
+                kind: "transportFailure",
+                code: "cliEventStreamTooLarge",
+                detail: `structured event stream exceeded ${maxEventStreamBytes} bytes (read ${rawEventBytes})`,
+              });
               return;
             }
             rawEventChunks.push(Buffer.from(chunk));
@@ -2086,7 +2137,17 @@ export function createCliTextTransportV1(options: {
             // writer (its final text only materializes on exit 0), so the
             // broker correctly reports this as a pre-response failure.
             rawEventChunks.length = 0;
-            finish({ kind: "transportFailure", code: `cliExit.${String(code)}` });
+            // Sanitized stderr accounting only (never its text): "exited 1,
+            // stderr 0 bytes" and "exited 1, stderr 4KB" are completely
+            // different failures and were previously indistinguishable.
+            const stderr = capture.stderrSummary();
+            finish({
+              kind: "transportFailure",
+              code: `cliExit.${String(code)}`,
+              detail:
+                `${def.label} exited ${String(code)}; stderr ${stderr.totalByteLength} byte(s)` +
+                `${stderr.truncated ? " (truncated)" : ""}`,
+            });
           });
 
           if (promptTransport === "stdin") {

@@ -63,6 +63,56 @@ void describe("provider CLI contracts", () => {
     ]);
   });
 
+  void it("devpass-code resumes the same session on an edit retry", () => {
+    const devpass = getCliProvider("devpass-cli");
+    assert.ok(devpass, "expected devpass-cli provider definition");
+
+    // Without conversationResume, cliAgentRunner's edit-retry gate refuses
+    // every devpass edit retry outright ("its CLI protocol does not guarantee
+    // edit events are flushed before side effects"), which is what left run
+    // 045 a dead timeout. The declaration is what makes a timed-out edit run
+    // recoverable, so assert it exists rather than only its shape.
+    assert.ok(
+      devpass.conversationResume,
+      "devpass-cli must declare conversationResume or a timed-out edit run cannot be retried"
+    );
+    assert.deepStrictEqual(devpass.conversationResume?.errorMarkers, []);
+
+    // Verified live 2026-08-18 against devpass-code 1.18.11: `-c/--continue`
+    // continues the last session, restores context, and is scoped to the
+    // working directory (the same flag from another cwd found no session).
+    const editArgs = devpass.buildArgs("edit", "llmgateway-devpass/deepseek-v4-pro", {});
+    assert.deepStrictEqual(editArgs, [
+      "run",
+      "--format",
+      "json",
+      "--agent",
+      "build",
+      "--model",
+      "llmgateway-devpass/deepseek-v4-pro",
+    ]);
+
+    const resumedArgs = devpass.buildArgs("edit", "llmgateway-devpass/deepseek-v4-pro", {
+      resumePreviousConversation: true,
+    });
+    assert.deepStrictEqual(resumedArgs, [
+      "run",
+      "--format",
+      "json",
+      "--continue",
+      "--agent",
+      "build",
+      "--model",
+      "llmgateway-devpass/deepseek-v4-pro",
+    ]);
+
+    // A non-resumed text run must never carry --continue: text mode is the
+    // read-only path and has no partial edits to preserve.
+    const textArgs = devpass.buildArgs("text", "llmgateway-devpass/deepseek-v4-pro", {});
+    assert.ok(!textArgs.includes("--continue"));
+    assert.ok(textArgs.includes("plan"), "text mode must use the edit-denying plan agent");
+  });
+
   void it("Antigravity supports both agy and antigravity executable names", () => {
     const antigravity = getCliProvider("antigravity-cli");
     assert.ok(antigravity, "expected antigravity-cli provider definition");

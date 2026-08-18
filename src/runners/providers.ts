@@ -1719,15 +1719,61 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     // cliAgentRunner.ts, which keys off that tag value, not the provider ID.
     usesLastMessageFile: false,
     structuredEventStream: "opencode",
-    buildArgs(mode, model): string[] {
+    // Without this, an `edit`-mode run that hits Ensemble's own timeout is a
+    // DEAD failure: cliAgentRunner's edit-retry gate keys off
+    // `def.conversationResume !== undefined`, so devpass rounds recorded
+    // "Automatic retry is disabled for devpass-code edit runs: its CLI
+    // protocol does not guarantee edit events are flushed before side
+    // effects" and stopped there (workflow 5 run 045, 2026-08-17). That was
+    // the correct default while resume was unverified — replaying an edit run
+    // from scratch can duplicate side effects — but it left devpass with zero
+    // completed implementation rounds and no way to recover a timeout.
+    //
+    // Verified live 2026-08-18 against devpass-code 1.18.11 (three checks,
+    // all in `run` + `--agent plan`, no interactive mode):
+    //  1. `-c, --continue` is accepted by `run` and documented as "continue
+    //     the last session";
+    //  2. it genuinely restores context — a second run recalled a codeword
+    //     from the first without it being restated;
+    //  3. it is scoped to the WORKING DIRECTORY — the same `--continue` from
+    //     a different cwd found no session and answered "NO CODEWORD".
+    //
+    // (3) is the safety property that makes this sound: a retry can only ever
+    // resume the conversation belonging to the task's own workspace, never
+    // some unrelated session that happened to run last. Same guarantee Kimi
+    // relies on above.
+    //
+    // errorMarkers is deliberately EMPTY, for the same reason as Kimi's: no
+    // devpass-owned recoverable diagnostic has been observed in a real run
+    // yet, and the value here is the timeout path, which needs no marker.
+    // Add one only after seeing a genuine recoverable error live.
+    conversationResume: {
+      errorMarkers: [],
+      continuationPrompt:
+        "Continue the same task from where the previous response stopped. Your earlier " +
+        "context, including any files you already read, is still in this conversation — " +
+        "do not re-read everything from scratch unless you need a specific detail. " +
+        "Inspect the current workspace state and any changes you already made first, then " +
+        "finish the remaining requested work without restarting or reverting completed work. " +
+        "Emit the required final result frame exactly as originally instructed.",
+    },
+    buildArgs(mode, model, context): string[] {
       const args = ["run", "--format", "json"];
+      if (context?.resumePreviousConversation) {
+        // See conversationResume above for the live verification. Continues
+        // the last session for THIS cwd; the retry sends only
+        // continuationPrompt, so prior partial edits are preserved rather
+        // than replayed.
+        args.push("--continue");
+      }
       // Verified live against devpass-code 1.17.13 via `devpass-code agent
-      // list`: "plan" carries the same wildcard edit-deny plus a narrow
-      // .opencode/plans- and ~/.local/share/devpass-code/plans-scoped allow
-      // exception as OpenCode's plan agent; "build" (the CLI's own default
-      // agent) allows `edit: *` outright. Directly tested: a `plan` run
-      // asked to write a file refused and wrote nothing; a `build` run
-      // asked to write the same file wrote it immediately with no prompt.
+      // list` (re-confirmed present on 1.18.11): "plan" carries the same
+      // wildcard edit-deny plus a narrow .opencode/plans- and
+      // ~/.local/share/devpass-code/plans-scoped allow exception as
+      // OpenCode's plan agent; "build" (the CLI's own default agent) allows
+      // `edit: *` outright. Directly tested: a `plan` run asked to write a
+      // file refused and wrote nothing; a `build` run asked to write the same
+      // file wrote it immediately with no prompt.
       args.push("--agent", mode === "edit" ? "build" : "plan");
       const parsedModel = parseOpencodeModelSelection(model);
       if (parsedModel.model) {

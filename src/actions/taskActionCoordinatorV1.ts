@@ -1490,12 +1490,21 @@ export function createTaskActionCoordinatorV1(
             code: "resultLimitExceeded",
             ...(context.provider ? { provider: context.provider } : {}),
           };
-        case "transportFailure":
+        case "transportFailure": {
+          // A transport failure's CODE is the fault class (cliRunTimeout vs
+          // cliNotInstalled vs cliExit.1 — completely different remedies) and
+          // was previously dropped: `attemptOutcomeReasonTextV1` renders only
+          // the closed kind, so every pre-response failure read as the same
+          // generic sentence in a chain-exhaustion report (workflow 5 run 039,
+          // three providers, three identical lines). Carry code plus detail.
+          const transportEvidence = raw.detail !== undefined
+            ? `${raw.code}: ${raw.detail}`
+            : raw.code;
           if (raw.responseStarted) {
             session.reportAttemptOutcome(
               attemptId,
               "transportFailureResponseStarted",
-              raw.detail
+              transportEvidence
             );
             return {
               kind: "failed",
@@ -1506,7 +1515,7 @@ export function createTaskActionCoordinatorV1(
               ...(context.provider ? { provider: context.provider } : {}),
             };
           }
-          session.reportAttemptOutcome(attemptId, "transportFailurePreResponse", raw.detail);
+          session.reportAttemptOutcome(attemptId, "transportFailurePreResponse", transportEvidence);
           // Pre-response failure is the fallback-eligible case: loop for the
           // next registry-ranked candidate with a fresh attempt and an
           // explicit next reservation — UNLESS the malformed-result budget
@@ -1528,6 +1537,7 @@ export function createTaskActionCoordinatorV1(
             );
           }
           continue;
+        }
         case "response":
           break;
       }

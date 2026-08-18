@@ -138,6 +138,25 @@ export function resolveEffectiveProvider(
   }
 
   if (modelId !== undefined) {
+    // The SAME provider-selection guard the CLI branch above applies. It was
+    // missing here, which made `isModelProviderDisabled`'s own "Copilot is not
+    // exempt" comment false in practice: the function was simply never called
+    // on this branch, so a stage with Copilot disabled still resolved to
+    // Copilot and invoked it. Observed 2026-08-18 (workflow 5 runs 060/061):
+    // every entry in the impl chain was disabled, a window reload ruled out
+    // stale config, and the round still ran `Provider: Copilot (auto)`.
+    //
+    // `parseModelSelection` funnels every unrecognized id here as
+    // `provider: "copilot"`, so this check always resolves the "copilot"
+    // account — which `isProviderEnabled` treats as enabled unless explicitly
+    // disabled. No other account can be affected by this branch.
+    if (isModelProviderDisabled(modelId)) {
+      const account = getProviderAccountEntry(providerAccountIdForModelId(modelId));
+      throw new Error(
+        `The selected model ("${modelId}") belongs to ${account?.label ?? "Copilot"}, which is disabled in Provider Selection. ` +
+          "Enable the provider or choose another model in AI Models."
+      );
+    }
     // Explicit (legacy/bare) selection — always Copilot, never silently
     // redirected to a different provider.
     return { kind: "copilot", model: parsed.model };

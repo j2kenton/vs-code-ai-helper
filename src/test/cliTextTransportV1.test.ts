@@ -269,7 +269,17 @@ void describe("createCliTextTransportV1 structured-event capture", () => {
     const { writer } = collectingWriter();
     const exit = await transport.invoke(makeRequest(correlation), writer);
 
-    assert.deepEqual(exit, { kind: "transportFailure", code: "cliExit.3" });
+    // The code is the stable contract; the detail is diagnostic text that may
+    // be reworded, so it is matched by shape rather than compared exactly.
+    // What matters is that a non-zero exit now reports whether the process
+    // said anything at all — "exited 3, stderr 0 bytes" and "exited 3, stderr
+    // 4KB" are different failures and were previously indistinguishable.
+    assert.equal(exit.kind, "transportFailure");
+    assert.equal(exit.kind === "transportFailure" && exit.code, "cliExit.3");
+    assert.match(
+      (exit.kind === "transportFailure" && exit.detail) || "",
+      /exited 3; stderr \d+ byte\(s\)/
+    );
     assert.equal(
       writer.bytesWritten,
       0,
@@ -300,7 +310,12 @@ void describe("createCliTextTransportV1 structured-event capture", () => {
     const { writer } = collectingWriter();
     const exit = await transport.invoke(makeRequest(correlation), writer);
 
-    assert.deepEqual(exit, { kind: "transportFailure", code: "cliEventStreamTooLarge" });
+    assert.equal(exit.kind, "transportFailure");
+    assert.equal(exit.kind === "transportFailure" && exit.code, "cliEventStreamTooLarge");
+    assert.match(
+      (exit.kind === "transportFailure" && exit.detail) || "",
+      /exceeded \d+ bytes \(read \d+\)/
+    );
     assert.equal(writer.bytesWritten, 0, "an overflowed event stream must never reach the writer");
   });
 });

@@ -1464,11 +1464,20 @@ void describe("taskActionCoordinatorV1", () => {
       assert.deepEqual(
         outcome.chainExhaustion?.candidates.map((candidate) => candidate.reason),
         [
-          "invoked, but the transport failed before any response arrived",
-          "invoked, but the transport failed before any response arrived",
+          "invoked, but the transport failed before any response arrived - connectFailed",
+          "invoked, but the transport failed before any response arrived - connectFailed",
         ],
         "each candidate's placeholder reason must be replaced with its actual recorded per-attempt outcome"
       );
+      // The stable phrase is retained verbatim and the fault CLASS appended.
+      // Without the code every pre-response failure rendered identically, so a
+      // three-candidate chain produced three indistinguishable lines and named
+      // no remedy (workflow 5 run 039). cliRunTimeout, cliNotInstalled and
+      // cliExit.1 must not read the same.
+      for (const candidate of outcome.chainExhaustion?.candidates ?? []) {
+        assert.match(candidate.reason, /^invoked, but the transport failed before any response arrived/);
+        assert.match(candidate.reason, /connectFailed/);
+      }
     }
   );
 
