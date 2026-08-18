@@ -72,6 +72,7 @@ import {
   TaskActionCoordinatorV1,
   TaskActionFollowUpRequestV1,
   TaskActionSettlementRecordV1,
+  TaskActionToolSessionsV1,
   tryFramelessContentFallbackV1,
 } from "../actions/taskActionCoordinatorV1";
 import { BoundedResultStoreV1, createBoundedResultStoreV1 } from "../services/boundedResultStoreV1";
@@ -93,6 +94,7 @@ import { AgentTransportV1 } from "../types/agentExecutionV1";
 import { CompletedContentV1, MalformedAiResultV1 } from "../types/aiResultEnvelope";
 import { MIGRATED_ACTION_KEYS_V0 } from "../services/legacyAiActionSafetyGateV0";
 import { EDIT_EXECUTION_ACTION_KEY_V1 } from "../actions/rows/editExecutionRowV1";
+import { createObservationLedgerV1 } from "../types/preflightPlanV1";
 import {
   createWorkflowLeaseStoreV1,
   WorkflowLeaseStoreV1,
@@ -168,7 +170,9 @@ interface StubSelectionSource {
  */
 function stubSelectionOpener(
   transports: readonly AgentTransportV1[],
-  exhaustion?: import("../types/taskActionOutcomeV1").ProviderChainExhaustionV1
+  exhaustion?: import("../types/taskActionOutcomeV1").ProviderChainExhaustionV1,
+  /** false models a Copilot-shaped provider with no file access of its own. */
+  providerReadsWorkspaceNatively = true
 ): StubSelectionSource {
   let opened = 0;
   let reservedCount = 0;
@@ -206,6 +210,7 @@ function stubSelectionOpener(
             handle,
             providerLabel: "Test Provider",
             storedModelId: "copilot:test",
+            providerReadsWorkspaceNatively,
             createTransport: () => transport,
           },
         };
@@ -247,7 +252,12 @@ function makeHarness(
   rowOverrides: Partial<ProviderTaskActionRowV1> = {},
   extraRows: readonly TaskActionRegistryRowV1[] = [],
   brokerOptions?: AgentExecutionBrokerOptionsV1,
-  selectionExhaustion?: import("../types/taskActionOutcomeV1").ProviderChainExhaustionV1
+  selectionExhaustion?: import("../types/taskActionOutcomeV1").ProviderChainExhaustionV1,
+  /** Read-tools wiring: a tool-session source plus whether the stub provider reads files itself. */
+  readTools?: {
+    readonly toolSessions: TaskActionToolSessionsV1;
+    readonly providerReadsWorkspaceNatively: boolean;
+  }
 ): Harness {
   const promoted: CompletedContentV1[] = [];
   const row: ProviderTaskActionRowV1 = {
@@ -274,7 +284,11 @@ function makeHarness(
   };
   const leaseStore = createWorkflowLeaseStoreV1();
   const orchestrator = makeOrchestrator();
-  const selection = stubSelectionOpener(transports, selectionExhaustion);
+  const selection = stubSelectionOpener(
+    transports,
+    selectionExhaustion,
+    readTools?.providerReadsWorkspaceNatively ?? true
+  );
   const followUps: TaskActionFollowUpRequestV1[] = [];
   const leaseHeldAtFollowUp: (string | undefined)[] = [];
   const presentations: { actionKey: string; operationId: string; progressLabel: string }[] = [];
@@ -305,6 +319,7 @@ function makeHarness(
       },
     },
     ...(brokerOptions !== undefined ? { brokerOptions } : {}),
+    ...(readTools !== undefined ? { toolSessions: readTools.toolSessions } : {}),
   });
   return { coordinator, leaseStore, promoted, orchestrator, selection, followUps, leaseHeldAtFollowUp, presentations, presentationEnded, settlementRecords, leaseHeldAtSettlement };
 }
@@ -354,6 +369,119 @@ void describe("taskActionCoordinatorV1", () => {
   after(() => {
     (MIGRATED_ACTION_KEYS_V0 as unknown as Set<string>).delete(TEST_ACTION_KEY);
     fs.rmSync(orchestratorTmpRoot, { recursive: true, force: true });
+  });
+
+  /**
+   * Whether a reviewer CAN read the workspace is a property of the PROVIDER,
+   * not the row. A CLI provider opens files itself; Copilot's text transport
+   * has no tools, so without a read session it judges from a possibly
+   * truncated context pack — and reports work it could not see as missing
+   * (jester 2026-08-18: ten rounds against committed, present tests).
+   */
+  function readSessionProbe(): {
+    readonly toolSessions: TaskActionToolSessionsV1;
+    readonly created: { value: number };
+  } {
+    const created = { value: 0 };
+    return {
+      created,
+      toolSessions: {
+        createPreflightSession: () => {
+          throw new Error("a text row must never open a preflight session");
+        },
+        createEditSession: () => {
+          throw new Error("a text row must never open an edit session");
+        },
+        createWorkspaceReadSession: () => {
+          created.value += 1;
+          return {
+            handler: {
+              descriptors: [],
+              handleToolCall: (): Promise<string> => Promise.resolve("{}"),
+              violationCount: (): number => 0,
+            },
+            ledger: createObservationLedgerV1(),
+            rootId: "workspace:test-root",
+          };
+        },
+      },
+    };
+  }
+
+  function promptCapturingTransport(seen: { prompt: string }): AgentTransportV1 {
+    return {
+      runnerId: "scripted-transport",
+      invoke: (request, output) => {
+        seen.prompt = request.prompt;
+        output.write(
+          frame({
+            version: 1,
+            correlation: request.correlation,
+            kind: "completed",
+            content: {
+              contentType: "markdown-artifact.v1",
+              schemaVersion: 1,
+              markdown: "ok",
+            },
+          })
+        );
+        return Promise.resolve({ kind: "completed" });
+      },
+    };
+  }
+
+  void it("gives a readsWorkspaceFiles row read tools when the provider cannot read files", async () => {
+    const seen = { prompt: "" };
+    const probe = readSessionProbe();
+    const harness = makeHarness(
+      [promptCapturingTransport(seen)],
+      { readsWorkspaceFiles: true },
+      [],
+      undefined,
+      undefined,
+      { toolSessions: probe.toolSessions, providerReadsWorkspaceNatively: false }
+    );
+    const outcome = await harness.coordinator.executeAction(baseRequest());
+    assert.equal(outcome.kind, "completed");
+    assert.equal(probe.created.value, 1, "a tool-less provider must be given the read session");
+    // Attaching tools silently is the same failure as not attaching them: the
+    // model has to be told, and told which root id to pass.
+    assert.match(seen.prompt, /Workspace access/);
+    assert.match(seen.prompt, /workspace:test-root/);
+  });
+
+  void it("gives no read session to a provider that reads the workspace natively", async () => {
+    const seen = { prompt: "" };
+    const probe = readSessionProbe();
+    const harness = makeHarness(
+      [promptCapturingTransport(seen)],
+      { readsWorkspaceFiles: true },
+      [],
+      undefined,
+      undefined,
+      { toolSessions: probe.toolSessions, providerReadsWorkspaceNatively: true }
+    );
+    const outcome = await harness.coordinator.executeAction(baseRequest());
+    assert.equal(outcome.kind, "completed");
+    assert.equal(probe.created.value, 0, "a CLI provider already reads files and needs no session");
+    assert.doesNotMatch(seen.prompt, /Workspace access/);
+  });
+
+  void it("leaves a row that does not read workspace files unchanged", async () => {
+    const seen = { prompt: "" };
+    const probe = readSessionProbe();
+    const harness = makeHarness(
+      [promptCapturingTransport(seen)],
+      {},
+      [],
+      undefined,
+      undefined,
+      { toolSessions: probe.toolSessions, providerReadsWorkspaceNatively: false }
+    );
+    const outcome = await harness.coordinator.executeAction(baseRequest());
+    assert.equal(outcome.kind, "completed");
+    assert.equal(probe.created.value, 0);
+    assert.doesNotMatch(seen.prompt, /Workspace access/);
   });
 
   void it("runs the completed happy path and releases the lease", async () => {

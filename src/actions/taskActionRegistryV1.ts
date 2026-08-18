@@ -192,6 +192,24 @@ interface TaskActionRowBaseV1 {
 export interface ProviderTaskActionRowV1 extends TaskActionRowBaseV1 {
   readonly kind: "provider";
   readonly providerMode: AgentExecutionModeV1;
+  /**
+   * `text` rows only: attach the five READ-ONLY workspace tools when the
+   * selected provider cannot read files by itself.
+   *
+   * `providerMode` describes what the ROW needs to produce, but "can this
+   * provider see the workspace?" is a property of the PROVIDER, and the two
+   * were conflated. A CLI provider runs in the workspace and opens files
+   * natively, so `text` is fully evidenced for it. Copilot's text transport
+   * has no tools at all, so the same row leaves it judging from whatever
+   * survived the context pack — and a pack that truncates the file under
+   * review turns "I cannot see it" into "it is not there".
+   *
+   * Rows that must REASON ABOUT FILE CONTENT (review, publish checks) set
+   * this. Rows whose input is fully self-contained (chat, commit metadata) do
+   * not, and are unaffected. Read tools cannot mutate anything, so this
+   * cannot turn a text row into an editing one.
+   */
+  readonly readsWorkspaceFiles?: boolean;
   readonly maxResponseBytes: number;
   readonly permittedResultKinds: readonly PermittedEnvelopeKindV1[];
   /**

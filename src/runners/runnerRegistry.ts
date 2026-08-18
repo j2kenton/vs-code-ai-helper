@@ -1365,6 +1365,18 @@ export interface V1ReservedProviderV1 {
    * broker handler) so the registry stays a pure selection authority.
    */
   createTransport(toolHandler?: RequestLocalToolHandlerV1): AgentTransportV1;
+  /**
+   * Whether this provider can open workspace files on its own.
+   *
+   * True for every CLI provider: the process runs in the workspace and reads
+   * files natively, so a `text` row is fully evidenced. False for Copilot,
+   * whose text transport has no tools — it sees only what the caller put in
+   * the prompt. A row that must reason about file content
+   * (`readsWorkspaceFiles`) uses this to decide whether to attach the
+   * read-only tool session; without it, review quality silently depended on
+   * which provider the user happened to configure.
+   */
+  readonly providerReadsWorkspaceNatively: boolean;
 }
 
 export type V1ReserveNextResultV1 =
@@ -1428,6 +1440,8 @@ interface V1CandidateV1 {
   readonly providerId: ProviderId;
   readonly nativeModelId: string | undefined;
   readonly createTransport: (toolHandler?: RequestLocalToolHandlerV1) => AgentTransportV1;
+  /** See `V1ReservedProviderV1.providerReadsWorkspaceNatively`. */
+  readonly providerReadsWorkspaceNatively: boolean;
 }
 
 /**
@@ -1543,6 +1557,7 @@ export function openV1RunnerSelection(options: {
             runnerId: "copilot-lm",
             providerId: "copilot",
             nativeModelId,
+            providerReadsWorkspaceNatively: false,
             createTransport: (toolHandler) => {
               if (!toolHandler) {
                 throw new Error(
@@ -1565,7 +1580,19 @@ export function openV1RunnerSelection(options: {
           runnerId: "copilot-lm",
           providerId: "copilot",
           nativeModelId,
-          createTransport: () => createCopilotLmTextTransportV1({ model: nativeModelId }),
+          // Copilot cannot read the workspace by itself.
+          providerReadsWorkspaceNatively: false,
+          createTransport: (toolHandler) =>
+            toolHandler
+              ? // A `readsWorkspaceFiles` row supplied the read-only session:
+                // run the same tool-calling loop the preflight path uses, so
+                // the model can open the files it is reasoning about. Its final
+                // tool-free round is the text this row wanted all along.
+                createCopilotLmToolSessionTransportV1({
+                  model: nativeModelId,
+                  toolHandler,
+                })
+              : createCopilotLmTextTransportV1({ model: nativeModelId }),
         },
       };
     }
@@ -1599,6 +1626,9 @@ export function openV1RunnerSelection(options: {
         runnerId: def.id,
         providerId: def.id,
         nativeModelId,
+        // A CLI provider runs inside the workspace and opens files itself, so
+        // it needs no tool session and ignores any handler passed to it.
+        providerReadsWorkspaceNatively: true,
         createTransport: () =>
           createCliTextTransportV1({ def, model: nativeModelId, cwd: workspaceCwd }),
       },
@@ -1708,6 +1738,7 @@ export function openV1RunnerSelection(options: {
           providerLabel: candidate.providerLabel,
           storedModelId: candidate.storedModelId,
           createTransport: candidate.createTransport,
+          providerReadsWorkspaceNatively: candidate.providerReadsWorkspaceNatively,
         },
       };
     },

@@ -125,6 +125,7 @@ function stubSelectionOpener(transports: readonly AgentTransportV1[]): RunnerSel
           handle,
           providerLabel: "Test Provider",
           storedModelId: "copilot:test",
+          providerReadsWorkspaceNatively: true,
           createTransport: () => transport,
         },
       };

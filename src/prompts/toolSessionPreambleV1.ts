@@ -140,3 +140,44 @@ export function buildPreflightToolSessionPreambleV1(
     "the content itself.",
   ].join("\n");
 }
+
+/**
+ * Preamble for a READ-ONLY workspace session attached to a text-producing row
+ * (currently review). Much shorter than the preflight preamble: there is no
+ * plan to author, no digests to echo, no operations to construct — the model
+ * just needs to know it can open files, and which identifier to pass.
+ *
+ * Without this the tools are attached but never mentioned, and a model that
+ * is not told it can read will reason from the prompt alone — exactly the
+ * failure this whole change exists to remove.
+ */
+export function buildWorkspaceReadSessionPreambleV1(input: { readonly rootId: string }): string {
+  return [
+    "## Workspace access",
+    "",
+    "You can read this workspace directly. Do NOT rely only on excerpts quoted in",
+    "the prompt below — they may be truncated. If a file matters to your",
+    "conclusion, open it and check.",
+    "",
+    "Tools available to you (read-only — nothing here can modify anything):",
+    "",
+    "  - `ensemble_readFile` — read one file by exact root-relative path",
+    "  - `ensemble_stat` — check whether a path exists and what kind it is",
+    "  - `ensemble_readDirectory` — list one directory's entries",
+    "  - `ensemble_findFiles` — find files whose path contains a substring",
+    "  - `ensemble_textSearch` — search file contents for a literal string",
+    "",
+    "Every call takes `rootId`. Exactly one root is registered:",
+    "",
+    `    rootId: ${input.rootId}`,
+    "",
+    "Pass that value verbatim. Paths are root-relative, forward-slash, with no",
+    "leading `/`, no `.` and no `..`. Use `ensemble_readDirectory` with an empty",
+    "`relativePath` to list the root.",
+    "",
+    "**Never report work as missing because you could not see it.** If an excerpt",
+    "is truncated or a file is absent from the prompt, read it before judging. If",
+    "you still cannot verify something, say so explicitly as a confidence",
+    "limitation rather than concluding the work was not done.",
+  ].join("\n");
+}

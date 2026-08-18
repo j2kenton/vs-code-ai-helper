@@ -56,6 +56,7 @@ import {
 import { createV1RunnerSelectionOpener } from "../runners/runnerRegistry";
 import {
   getChatInteractionTransactionStoreV1,
+  ensureWorkflowWorkspaceRootV1,
   getEditPlanBrokerV1,
   getProviderResultSpoolStoreV1,
   getWorkflowFileStoreV1,
@@ -465,6 +466,27 @@ export function createProductionTaskActionCoordinatorV1(options: {
       createEditSession(validatedInput) {
         const input = validatedInput as EditExecutionActionInputV1;
         return getEditPlanBrokerV1().createEditSessionHandler(input.executionId);
+      },
+      createWorkspaceReadSession() {
+        // Read-only workspace access for a `text` row whose provider cannot
+        // open files (see TaskActionToolSessionsV1). Same five read tools and
+        // same per-attempt ledger as a preflight session — the only
+        // difference is where the root comes from: a review carries no
+        // rootId in its input, so it is rooted at the workspace folder
+        // itself. `ensureWorkflowWorkspaceRootV1` throws for a path that is
+        // not an open workspace folder, and the coordinator treats that as
+        // "no tools this round" rather than failing the review.
+        const ledger = createObservationLedgerV1();
+        const rootId = ensureWorkflowWorkspaceRootV1(options.workspaceCwd);
+        return {
+          handler: createReadToolSessionHandlerV1({
+            view: getWorkflowFileStoreV1(),
+            rootId,
+            ledger,
+          }),
+          ledger,
+          rootId,
+        };
       },
     },
   }));

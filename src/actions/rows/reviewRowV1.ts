@@ -263,6 +263,14 @@ export function createReviewRowV1(): ProviderTaskActionRowV1 {
     validateInput: validateReviewInputV1,
     loggingPolicy: { channel: "action.review", includeResultMetrics: true },
     providerMode: "text",
+    // A review must judge FILE CONTENT. On a CLI provider that is free — it
+    // opens files itself. On Copilot the text transport has no tools at all,
+    // so the reviewer sees only what survived the context pack, and a pack
+    // that truncates the file under review turns "I cannot see it" into "it is
+    // not there" (jester 2026-08-18: ten rounds reporting committed, present
+    // tests as missing). Read-only tools are attached only for providers that
+    // need them; CLI reviewers are unaffected.
+    readsWorkspaceFiles: true,
     maxResponseBytes: maxResponseBytesCeilingForModeV1("text"),
     permittedResultKinds: ["completed", "questions", "cancelled", "failed"],
     completedContentType: "markdown-artifact.v1",

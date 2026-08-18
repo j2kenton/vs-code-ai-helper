@@ -171,6 +171,7 @@ import {
   AI_RESULT_CONTRACT_VERSION_V1,
   buildAiResultContractPromptV1,
 } from "../prompts/aiResultContractV1";
+import { buildWorkspaceReadSessionPreambleV1 } from "../prompts/toolSessionPreambleV1";
 import {
   ActionConversationErrorV1,
   ActionConversationOrchestratorV1,
@@ -497,6 +498,25 @@ export interface TaskActionToolSessionsV1 {
   createPreflightSession(validatedInput: unknown): TaskActionPreflightSessionV1;
   /** Create one attempt's mutation session for an already-claimed execution (§7.6). */
   createEditSession(validatedInput: unknown): RequestLocalToolHandlerV1;
+  /**
+   * Create a READ-ONLY workspace session for a text-producing row whose
+   * selected provider cannot read files on its own.
+   *
+   * A CLI provider runs inside the workspace and opens files natively, so a
+   * `text` row is fully evidenced for it. Copilot cannot: its text transport
+   * has no tools, so a reviewer sees only what survived the context pack.
+   * When the pack truncates the very file a review must judge, that reviewer
+   * is structurally unable to verify the work — and, worse, will reason from
+   * whatever weaker signals remain. On 2026-08-18 that cost ten rounds on
+   * jester `2026-08-18_task_1`: the reviewer said outright "the pack truncates
+   * split.test.ts", fell back on a zero-changed-paths receipt, and reported
+   * work as missing that was present and committed.
+   *
+   * Unlike `createPreflightSession` this takes no validated input: a review
+   * row carries no rootId, so the session is rooted at the task's own
+   * workspace folder. Read tools only — nothing here can mutate.
+   */
+  createWorkspaceReadSession(): TaskActionPreflightSessionV1;
 }
 
 /**
@@ -521,6 +541,8 @@ export interface AdmittedProviderActionTicketV1 {
       readonly providerLabel: string;
       readonly storedModelId: string;
       readonly createTransport: (toolHandler?: RequestLocalToolHandlerV1) => AgentTransportV1;
+      /** See `V1ReservedProviderV1.providerReadsWorkspaceNatively`. */
+      readonly providerReadsWorkspaceNatively?: boolean;
     };
   };
   readonly acquireLeasePhase: AcquireTaskLeasePhaseV1;
@@ -1366,6 +1388,27 @@ export function createTaskActionCoordinatorV1(
           session.reportAttemptOutcome(attemptId, "providerUnavailablePreInvocation");
           return { kind: "failed", correlation, code: "toolSessionUnavailable", retryable: false };
         }
+      } else if (row.readsWorkspaceFiles && reserved.providerReadsWorkspaceNatively === false) {
+        // A `text` row that must reason about file content, on a provider
+        // that cannot open files. Attach the read-only tools so it can, rather
+        // than leaving it to infer from a possibly-truncated context pack.
+        //
+        // Deliberately keyed on the RESERVED candidate, not the row: the same
+        // review row runs on a CLI provider (reads the workspace natively —
+        // no tools needed, no behaviour change) and on Copilot (no file access
+        // at all without this). Conflating the two is what made review quality
+        // depend on which subscription the user happened to have.
+        //
+        // Best-effort: a workspace whose root cannot be registered still runs
+        // the review exactly as before rather than failing the round. A
+        // reviewer with a truncated pack is poor; no reviewer at all is worse.
+        try {
+          preflightSession = deps.toolSessions?.createWorkspaceReadSession();
+          toolHandler = preflightSession?.handler;
+        } catch {
+          preflightSession = undefined;
+          toolHandler = undefined;
+        }
       }
 
       const context: TaskActionExecutionContextV1 = {
@@ -1378,7 +1421,18 @@ export function createTaskActionCoordinatorV1(
           : {}),
         provider: { providerLabel: reserved.providerLabel, storedModelId: reserved.storedModelId },
       };
+      // A row that opted into read tools AND actually got a session must be
+      // TOLD it can read — attaching tools silently leaves the model reasoning
+      // from the prompt alone, which is the failure this exists to remove.
+      // Assembled here rather than in the row so every future
+      // `readsWorkspaceFiles` row inherits it, and so it appears only when a
+      // session was really created (a CLI provider gets neither).
+      const readSessionPreamble =
+        row.providerMode === "text" && preflightSession !== undefined
+          ? buildWorkspaceReadSessionPreambleV1({ rootId: preflightSession.rootId }) + "\n\n"
+          : "";
       const prompt =
+        readSessionPreamble +
         row.buildPrompt(context) +
         "\n\n" +
         buildAiResultContractPromptV1({
