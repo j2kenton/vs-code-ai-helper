@@ -258,7 +258,14 @@ export function validatePreflightPlanAgainstLedgerV1(
     if (requiresParentChain && operation.parentChain.length !== ancestors.length) {
       return failure(
         "parentChainMismatch",
-        `${where}'s parent chain has ${operation.parentChain.length} link(s); ${ancestors.length} ancestor(s) required`
+        // Names the ancestors, not just the count. The host derives them from
+        // the path anyway (`ancestors`, just above), so withholding them left
+        // a human reading the run log to re-derive by hand what the validator
+        // already knew — on a failure whose entire content is "you counted
+        // wrong". Third occurrence on 2026-08-19.
+        `${where}'s parent chain has ${operation.parentChain.length} link(s); ` +
+          `${ancestors.length} ancestor(s) required` +
+          (ancestors.length > 0 ? ` (${ancestors.join(", ")})` : "")
       );
     }
     for (let i = 0; i < ancestors.length; i++) {

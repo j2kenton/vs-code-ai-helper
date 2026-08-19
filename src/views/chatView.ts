@@ -147,10 +147,27 @@ function isReadyMessage(value: unknown): boolean {
 }
 
 interface InteractionActionMessage {
-  type: "submitInteractionAnswers" | "cancelInteraction" | "resumeInteraction";
+  /**
+   * `confirmInteraction` is the single commit path behind the Confirm button:
+   * submit the answers, then resume the action, in ONE handler invocation.
+   *
+   * It replaces a webview that posted `submitInteractionAnswers` and
+   * `resumeInteraction` as two separate messages from one click, while a
+   * second button (`Save Answers`) posted the submit on its own. Two buttons
+   * that both submit meant the natural reading of the labels — save, then
+   * resume — submitted the same answers twice and failed the second with
+   * `interactionAlreadySettled` (observed 2026-08-19, jester
+   * `2026-08-19_task_1` runs 002/003). One message, one commit path, no way
+   * to submit twice from the UI.
+   */
+  type:
+    | "submitInteractionAnswers"
+    | "cancelInteraction"
+    | "resumeInteraction"
+    | "confirmInteraction";
   operationId: string;
   interactionId: string;
-  /** Present only for "submitInteractionAnswers". */
+  /** Present only for "submitInteractionAnswers" and "confirmInteraction". */
   answers?: unknown;
 }
 
@@ -158,7 +175,10 @@ function isInteractionActionMessage(value: unknown): value is InteractionActionM
   if (!value || typeof value !== "object") return false;
   const v = value as Record<string, unknown>;
   return (
-    (v.type === "submitInteractionAnswers" || v.type === "cancelInteraction" || v.type === "resumeInteraction") &&
+    (v.type === "submitInteractionAnswers" ||
+      v.type === "cancelInteraction" ||
+      v.type === "resumeInteraction" ||
+      v.type === "confirmInteraction") &&
     typeof v.operationId === "string" &&
     v.operationId.length > 0 &&
     typeof v.interactionId === "string" &&
@@ -285,6 +305,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           await this.submitInteractionAnswers(clientRef, message.answers);
         } else if (message.type === "cancelInteraction") {
           await this.cancelInteraction(clientRef);
+        } else if (message.type === "confirmInteraction") {
+          // Resume ONLY on a confirmed submit: resuming an action whose
+          // answer never landed would run it against a question it has no
+          // answer for. `submitInteractionAnswers` has already reported the
+          // reason to the user on every false path.
+          if (await this.submitInteractionAnswers(clientRef, message.answers)) {
+            await this.resumeInteraction(clientRef);
+          }
         } else {
           await this.resumeInteraction(clientRef);
         }
@@ -658,32 +686,39 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
    * mirror get updated. A caller must not invoke a provider from answering
    * alone (plan product decisions); that only happens on explicit Resume.
    */
-  private async submitInteractionAnswers(clientRef: ChatInteractionClientRefV1, rawAnswers: unknown): Promise<void> {
-    if (!this.target) return;
+  /** Returns whether the answers were accepted, so a combined Confirm can
+   * decide whether resuming is safe — resuming an action whose answer never
+   * landed would run it against a question it has no answer for. */
+  private async submitInteractionAnswers(
+    clientRef: ChatInteractionClientRefV1,
+    rawAnswers: unknown
+  ): Promise<boolean> {
+    if (!this.target) return false;
     const identity = this.target;
     const decoded = decodeStructuredAnswersArrayV1(rawAnswers);
     if (!decoded.ok) {
       NotificationRouter.showWarning(`Could not submit your answers: ${decoded.reason}`);
-      return;
+      return false;
     }
-    await this.runQueued(identity.taskFolderPath, () =>
+    const submitted = await this.runQueued(identity.taskFolderPath, () =>
       this.doSubmitInteractionAnswers(identity, clientRef, decoded.answers)
     );
     if (sameIdentity(this.target, identity)) {
       await this.render();
     }
+    return submitted;
   }
 
   private async doSubmitInteractionAnswers(
     identity: ChatIdentity,
     clientRef: ChatInteractionClientRefV1,
     answers: readonly StructuredAnswerV1[]
-  ): Promise<void> {
+  ): Promise<boolean> {
     if (this.interactionServices) {
       const ref = await this.resolveInteractionRef(identity, clientRef);
       if (!ref) {
         NotificationRouter.showWarning("Could not submit answers: no matching question exists in this task's chat.");
-        return;
+        return false;
       }
       let result: ChatInteractionServiceResultV1;
       try {
@@ -696,11 +731,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         NotificationRouter.showWarning(
           `Could not submit answers. (${error instanceof Error ? error.message : String(error)})`
         );
-        return;
+        return false;
       }
       if (!result.ok) {
         NotificationRouter.showWarning(`Could not submit answers: ${result.reason}`);
-        return;
+        return false;
       }
     }
     try {
@@ -714,7 +749,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       NotificationRouter.showWarning(
         `Could not save your answers. (${error instanceof Error ? error.message : String(error)})`
       );
+      // The transcript record failed, but the answer WAS accepted by the
+      // interaction service above — so this is not a submission failure and
+      // must not stop a combined Confirm from resuming. Reporting false here
+      // would strand an action whose answer is already settled.
     }
+    return true;
   }
 
   /** Cancel the current target's unresolved interaction (plan §6.1's Cancel control). Never invokes a provider. */
@@ -1305,14 +1345,39 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           err.style.display='none';
           return answers;
         }
+        // ONE commit path. The previous three buttons were 'Save Answers'
+        // (submit, do not continue), 'Resume' (submit AND continue) and
+        // 'Cancel'. Two of them submitted, so reading the labels literally —
+        // save, then resume — submitted twice and failed the second with
+        // interactionAlreadySettled. 'Save Answers' also had no user-facing
+        // purpose: nothing later consumes a recorded-but-unresumed answer.
+        // 'Resume' named the system's concept (an action resuming) rather
+        // than the user's (going ahead with a choice).
         const actions=document.createElement('div'); actions.className='interaction-actions';
-        const saveBtn=document.createElement('button'); saveBtn.type='button'; saveBtn.textContent='Save Answers';
-        saveBtn.addEventListener('click',()=>{ const answers=collect(); if(answers) v.postMessage({type:'submitInteractionAnswers',operationId:interaction.operationId,interactionId:interaction.interactionId,answers}); });
-        const resumeBtn=document.createElement('button'); resumeBtn.type='button'; resumeBtn.textContent='Resume';
-        resumeBtn.addEventListener('click',()=>{ const answers=collect(); if(answers){ v.postMessage({type:'submitInteractionAnswers',operationId:interaction.operationId,interactionId:interaction.interactionId,answers}); v.postMessage({type:'resumeInteraction',operationId:interaction.operationId,interactionId:interaction.interactionId}); } });
+        const confirmBtn=document.createElement('button'); confirmBtn.type='button'; confirmBtn.textContent='Confirm';
+        confirmBtn.addEventListener('click',()=>{
+          const answers=collect(); if(!answers) return;
+          // Acknowledge the press immediately and make a second one
+          // impossible. The absence of any visible change is what caused a
+          // user to press again and collect a second failure for answers
+          // that had already been recorded correctly.
+          confirmBtn.disabled=true; cancelBtn.disabled=true; confirmBtn.textContent='Confirmed';
+          v.postMessage({type:'confirmInteraction',operationId:interaction.operationId,interactionId:interaction.interactionId,answers});
+        });
+        // Escape hatch for "none of these options fit". Deliberately does NOT
+        // settle the interaction — it just puts the cursor in the composer so
+        // the user can say what they actually want. Settling here would
+        // discard a question they are about to answer in prose.
+        const chatBtn=document.createElement('button'); chatBtn.type='button'; chatBtn.className='secondary';
+        chatBtn.textContent='Answer in chat instead';
+        chatBtn.title='Leaves the question open and puts the cursor in the message box, so you can reply in your own words.';
+        chatBtn.addEventListener('click',()=>{ const box=document.getElementById('message'); if(box){ box.focus(); } });
         const cancelBtn=document.createElement('button'); cancelBtn.type='button'; cancelBtn.className='secondary'; cancelBtn.textContent='Cancel';
+        // The label alone never said what it discards; the handler settles the
+        // interaction as cancelled, so the action that asked does not proceed.
+        cancelBtn.title='Dismisses this question without answering. The action that asked it will not continue.';
         cancelBtn.addEventListener('click',()=>{ v.postMessage({type:'cancelInteraction',operationId:interaction.operationId,interactionId:interaction.interactionId}); });
-        actions.appendChild(saveBtn); actions.appendChild(resumeBtn); actions.appendChild(cancelBtn);
+        actions.appendChild(confirmBtn); actions.appendChild(chatBtn); actions.appendChild(cancelBtn);
         ic.appendChild(actions);
       }
       window.addEventListener('message', event=>{
