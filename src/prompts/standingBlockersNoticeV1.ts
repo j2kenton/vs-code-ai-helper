@@ -25,7 +25,6 @@
 
 import { ReviewBlocker } from "../utils/reviewReadiness";
 
-
 /**
  * Cap on how many blockers are listed. A review that reports a very long
  * blocker list is usually restating one systemic problem many times, and the
