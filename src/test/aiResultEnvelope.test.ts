@@ -59,6 +59,23 @@ void describe("containsResultFrameV1 — parity with the parser", () => {
     // Valid JSON but not an envelope: still a FRAME, so no nudge — the parser
     // rejects it downstream with an accurate reason rather than silently.
     { name: "unterminated, JSON that is not an envelope", raw: `${FRAME_START_V1}\n{"a":1}` },
+    // --- terminated framing: all of these are `invalidFrame` to the parser ---
+    // (2026-08-19 review: the precheck accepted any body ending in a
+    // terminator, so malformed framing skipped the corrective nudge.)
+    { name: "terminated, no newline after start marker", raw: `${FRAME_START_V1}${envelope}\n${FRAME_END_V1}` },
+    { name: "terminated, no newline before end marker", raw: `${FRAME_START_V1}\n${envelope}${FRAME_END_V1}` },
+    { name: "terminated, mixed line endings", raw: `${FRAME_START_V1}\r\n${envelope}\n${FRAME_END_V1}` },
+    { name: "terminated, multi-line payload", raw: `${FRAME_START_V1}\n{\n"a":1\n}\n${FRAME_END_V1}` },
+    { name: "markers adjacent, no payload at all", raw: `${FRAME_START_V1}${FRAME_END_V1}` },
+    // CRLF framing is legitimate and must NOT be nudged.
+    { name: "terminated with CRLF throughout", raw: `${FRAME_START_V1}\r\n${envelope}\r\n${FRAME_END_V1}` },
+    // Correct framing, bad payload: `invalidJson`, not `invalidFrame` — a
+    // frame WAS seen, so this must not be nudged either.
+    { name: "terminated framing, payload not JSON", raw: `${FRAME_START_V1}\n{not json}\n${FRAME_END_V1}` },
+    { name: "terminated framing, empty payload line", raw: `${FRAME_START_V1}\n\n${FRAME_END_V1}` },
+    // --- parser entry guards ---
+    { name: "leading byte-order mark", raw: `\uFEFF${FRAME_START_V1}\n${envelope}\n${FRAME_END_V1}` },
+    { name: "lone high surrogate in the payload", raw: `${FRAME_START_V1}\n${envelope}\n${FRAME_END_V1}\uD800` },
     { name: "narration quoting both markers", raw: `I will emit ${FRAME_START_V1} then ${FRAME_END_V1} shortly.` },
     { name: "no markers at all", raw: "I verified both tests. Now I will write the frame." },
     { name: "start marker only, no payload", raw: FRAME_START_V1 },

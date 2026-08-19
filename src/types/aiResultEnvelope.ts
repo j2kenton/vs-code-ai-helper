@@ -1275,6 +1275,17 @@ function decodeEnvelopeV1(
  * `invalidFrame`.
  */
 export function containsResultFrameV1(response: string): boolean {
+  // Entry guards, before anything else — the parser rejects both of these as
+  // `invalidFrame` regardless of what follows, so a precheck that skipped them
+  // would call a BOM-prefixed or surrogate-corrupted response a frame and
+  // forward it instead of asking again.
+  if (response.length > 0 && response.charCodeAt(0) === 0xfeff) {
+    return false;
+  }
+  if (hasLoneSurrogate(response)) {
+    return false;
+  }
+
   // Same trailing-newline trim the parser applies before locating the frame.
   let trimmed = response;
   if (trimmed.endsWith("\r\n")) {
@@ -1292,8 +1303,30 @@ export function containsResultFrameV1(response: string): boolean {
   // Terminated: the body must END with a terminator, exactly as the parser
   // requires — a terminator merely present somewhere is narration around a
   // frame, not a frame.
-  if (body.endsWith(FRAME_END_V1) || body.endsWith(LEGACY_FRAME_END_V1)) {
-    return true;
+  const frameEnd = body.endsWith(FRAME_END_V1)
+    ? FRAME_END_V1
+    : body.endsWith(LEGACY_FRAME_END_V1)
+      ? LEGACY_FRAME_END_V1
+      : undefined;
+  if (frameEnd !== undefined) {
+    // The framing checks the parser then applies, all of which are
+    // `invalidFrame`. Payload CONTENT is deliberately not checked here: an
+    // empty or unparseable payload inside correct framing is `invalidJson` to
+    // the parser — a frame was seen — and must not be nudged, or a real answer
+    // with bad JSON would be retried instead of reported.
+    if (body.length < FRAME_START_V1.length + frameEnd.length) {
+      return false;
+    }
+    const middle = body.slice(FRAME_START_V1.length, body.length - frameEnd.length);
+    const eol = middle.startsWith("\r\n") ? "\r\n" : middle.startsWith("\n") ? "\n" : undefined;
+    if (eol === undefined) {
+      return false;
+    }
+    if (!middle.endsWith(eol) || middle.length < eol.length * 2) {
+      return false;
+    }
+    const jsonLine = middle.slice(eol.length, middle.length - eol.length);
+    return !jsonLine.includes("\n") && !jsonLine.includes("\r");
   }
 
   // Unterminated: the parser accepts a complete payload whose closing marker
