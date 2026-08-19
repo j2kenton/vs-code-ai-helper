@@ -129,55 +129,6 @@ export async function renameTask(
   );
 }
 
-/**
- * Lines of abstract process/planning language ("independently shippable
- * slices", "decision gate", …) describe how the work is organized, not what
- * it does — they make meaningless task names, so name derivation skips them
- * in favor of the first line that states concrete work.
- */
-const ABSTRACT_PLANNING_LINE =
-  /\b(shippable|workstream|decision gate|vertical slice|slices?\b.*\bcarved|carved out of|integration checkpoint|implementation checklist|checklist below|scope and requirements|open questions)\b/i;
-
-/**
- * Derive a concise task name from the task description text: the first
- * meaningful (non-heading, non-boilerplate, non-abstract) line, stripped of
- * markdown markup and truncated at a sentence boundary. Exported for testing.
- */
-export function deriveNameFromDescription(text: string): string | undefined {
-  const withoutCode = text.replace(/```[\s\S]*?```/g, " ");
-  let firstFallback: string | undefined;
-  for (const rawLine of withoutCode.split(/\r?\n/)) {
-    let line = rawLine.trim();
-    if (!line || /^#{1,6}\s/.test(line) || /^<!--/.test(line)) {
-      continue;
-    }
-    // Strip list markers, emphasis, and inline code markup.
-    line = line
-      .replace(/^[-*>\d.)\s]+/, "")
-      .replace(/[*_`]/g, "")
-      .trim();
-    // Meta labels like "Goal:" / "Scope:" prefix real content — drop the label.
-    line = line.replace(/^(Goal|Scope|Objective|Summary|Task|Description)\s*:\s*/i, "").trim();
-    if (line.length < 8) {
-      continue;
-    }
-    // Cut at the first sentence end when the line is long.
-    const sentenceEnd = line.search(/[.!?](\s|$)/);
-    if (sentenceEnd > 12) {
-      line = line.slice(0, sentenceEnd);
-    }
-    const candidate = line.slice(0, 100).trim();
-    if (ABSTRACT_PLANNING_LINE.test(candidate)) {
-      // Remember it in case nothing concrete follows, but keep looking for a
-      // line that says what the work actually changes.
-      firstFallback = firstFallback ?? candidate;
-      continue;
-    }
-    return candidate;
-  }
-  return firstFallback;
-}
-
 /** Split into whitespace-delimited words (markdown-stripped input assumed). */
 function wordsOf(text: string): string[] {
   return text.split(/\s+/).filter((w) => w.length > 0);
@@ -201,17 +152,85 @@ export function normalizeAiNameReply(reply: string): string {
     .trim();
 }
 
-/** Clamp a too-long name at a word boundary — never mid-word. */
-export function clampNameAtWordBoundary(name: string, maxWords: number): string {
-  return wordsOf(name).slice(0, maxWords).join(" ");
+/** Collapse markdown markup and whitespace so a candidate name can be
+ * compared against raw task-description text on words alone. */
+function normalizeForComparison(text: string): string {
+  return text
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/[#>*_`-]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
 }
 
-const RENAME_MAX_WORDS = 7;
+/**
+ * True when `candidate` is (up to markdown/whitespace normalization) the
+ * literal leading N words of `description`, where N is the candidate's own
+ * word count — i.e. the model (or a bug) just copied the task's opening
+ * words instead of summarizing. Exported for testing.
+ */
+export function isLeadingSubstringOfDescription(candidate: string, description: string): boolean {
+  const candidateWords = wordsOf(normalizeForComparison(candidate));
+  if (candidateWords.length === 0) {
+    return false;
+  }
+  const descriptionWords = wordsOf(normalizeForComparison(description));
+  if (descriptionWords.length < candidateWords.length) {
+    return false;
+  }
+  return descriptionWords.slice(0, candidateWords.length).join(" ") === candidateWords.join(" ");
+}
+
+const RENAME_MIN_WORDS = 6;
+const RENAME_MAX_WORDS = 8;
+
+export type NameValidationFailureReason = "too-short" | "too-long" | "leading-substring";
+
+export type NameValidationResult =
+  | { ok: true; name: string }
+  | { ok: false; reason: NameValidationFailureReason };
 
 /**
- * Ask the configured Description-stage model for a 5–7 word name via the
- * `renameTask.v1` coordinator row. Returns the normalized reply, or
- * undefined when no provider path is available or the run fails/cancels.
+ * Enforce the full 6–8 word contract for an AI-produced task name, and
+ * reject a reply that is just the task description's opening words restated
+ * (the regression this guards against — see the module doc on
+ * `renameTaskWithAI`). Exported for testing.
+ */
+export function validateAiNameReply(name: string, taskDescription: string): NameValidationResult {
+  const wordCount = wordsOf(name).length;
+  if (wordCount < RENAME_MIN_WORDS) {
+    return { ok: false, reason: "too-short" };
+  }
+  if (wordCount > RENAME_MAX_WORDS) {
+    return { ok: false, reason: "too-long" };
+  }
+  if (isLeadingSubstringOfDescription(name, taskDescription)) {
+    return { ok: false, reason: "leading-substring" };
+  }
+  return { ok: true, name };
+}
+
+function strictnessNoteFor(reason: NameValidationFailureReason | undefined): string {
+  switch (reason) {
+    case "too-long":
+      return "IMPORTANT: your previous answer was too long. Respond with 6 to 8 words — nothing more.";
+    case "too-short":
+      return "IMPORTANT: your previous answer was too short. Respond with 6 to 8 words — no fewer.";
+    case "leading-substring":
+      return "IMPORTANT: your previous answer just repeated the task description's opening words. Write an actual summary of what the task accomplishes, in your own words.";
+    default:
+      return "";
+  }
+}
+
+type AiNameRequestResult =
+  | { kind: "no-model" }
+  | { kind: "failed" }
+  | { kind: "ok"; name: string };
+
+/**
+ * Ask the configured Description-stage model for a 6–8 word name via the
+ * `renameTask.v1` coordinator row.
  */
 async function requestAiNameV1(
   context: vscode.ExtensionContext,
@@ -219,25 +238,25 @@ async function requestAiNameV1(
   taskDescription: string,
   strictnessNote: string,
   token: vscode.CancellationToken
-): Promise<string | undefined> {
+): Promise<AiNameRequestResult> {
   const taskFolderUri = vscode.Uri.file(task.taskFolderPath);
   const workspaceFolder = task.workspaceFolder
     ? vscode.workspace.getWorkspaceFolder(task.workspaceFolder)
     : undefined;
   if (!workspaceFolder) {
-    return undefined;
+    return { kind: "no-model" };
   }
 
   const { modelId } = await resolveFreshModelForStage(taskFolderUri, "desc");
   if (!modelId) {
-    return undefined;
+    return { kind: "no-model" };
   }
 
   try {
     const rootId = ensureWorkflowTaskFolderRootV1(taskFolderUri.fsPath);
     const taskBindingId = getVerifiedTaskBindingIdV1(rootId);
     if (!taskBindingId) {
-      return undefined;
+      return { kind: "failed" };
     }
     const chatIdentity = await readChatDocumentIdentityV1(
       taskFolderUri.fsPath,
@@ -268,25 +287,28 @@ async function requestAiNameV1(
     });
 
     if (outcome.kind !== "completed") {
-      return undefined;
+      return { kind: "failed" };
     }
     const readResult = await getWorkflowFileStoreV1().readFileBounded(targetLocator, 16 * 1024);
     if (readResult.kind !== "ok") {
-      return undefined;
+      return { kind: "failed" };
     }
     const name = normalizeAiNameReply(readResult.value.bytes.toString("utf8"));
-    return name.length > 0 ? name : undefined;
-  } catch {
-    // Any provider/coordinator failure falls back to the offline derivation.
-    return undefined;
+    return name.length > 0 ? { kind: "ok", name } : { kind: "failed" };
+  } catch (error) {
+    console.error("renameTaskWithAI: provider/coordinator call threw", error);
+    return { kind: "failed" };
   }
 }
 
 /**
- * Rename Task with AI: read the task description and produce a short 5–7
- * word high-level summary, applied directly (the explicit click is the
- * confirmation, so it renames even after a prior manual rename). Falls back
- * to `deriveNameFromDescription` when no provider is available.
+ * Rename Task with AI: read the task description and produce a genuine 6–8
+ * word high-level summary from the configured model, applied directly (the
+ * explicit click is the confirmation, so it renames even after a prior
+ * manual rename). There is no deterministic fallback — a reply that fails
+ * validation (wrong length, or just the description's opening words restated)
+ * gets one bounded re-prompt, and if that still fails the task keeps its
+ * current name and the user is notified.
  */
 export async function renameTaskWithAI(
   context: vscode.ExtensionContext,
@@ -336,34 +358,53 @@ export async function renameTaskWithAI(
       const fallbackCts = new vscode.CancellationTokenSource();
       const token = op.token ?? fallbackCts.token;
       try {
-        let name = await requestAiNameV1(context, task, sourceText, "", token);
-        if (name !== undefined && wordsOf(name).length > RENAME_MAX_WORDS) {
-          // Too long: one stricter retry, then clamp at a word boundary.
-          const retried = await requestAiNameV1(
-            context,
-            task,
-            sourceText,
-            "IMPORTANT: your previous answer was too long. Respond with 5 to 7 words — nothing more.",
-            token
-          );
-          name = retried ?? name;
-          if (wordsOf(name).length > RENAME_MAX_WORDS) {
-            name = clampNameAtWordBoundary(name, RENAME_MAX_WORDS);
-          }
-        }
-
-        if (name === undefined) {
-          // Offline fallback: derive a concise name without a provider.
-          name = deriveNameFromDescription(sourceText);
-        }
-        if (!name) {
+        const first = await requestAiNameV1(context, task, sourceText, "", token);
+        if (first.kind === "no-model") {
           NotificationRouter.showWarning(
-            "Could not produce a task name. Configure a Description-stage model in AI Models, or rename manually."
+            "No Description-stage model is configured, so Rename Task with AI could not run. Configure a model in AI Models, or rename manually."
           );
           return;
         }
 
-        const finalName = name;
+        const rejectedReplies: string[] = [];
+        let validated: NameValidationResult | undefined;
+        if (first.kind === "ok") {
+          validated = validateAiNameReply(first.name, sourceText);
+          if (!validated.ok) {
+            rejectedReplies.push(first.name);
+          }
+        }
+
+        // At most one bounded re-prompt covers every failure combination
+        // (too-long, too-short, leading-substring, or an outright failure).
+        if (!validated || !validated.ok) {
+          const retry = await requestAiNameV1(
+            context,
+            task,
+            sourceText,
+            strictnessNoteFor(validated?.reason),
+            token
+          );
+          if (retry.kind === "ok") {
+            validated = validateAiNameReply(retry.name, sourceText);
+            if (!validated.ok) {
+              rejectedReplies.push(retry.name);
+            }
+          }
+        }
+
+        if (!validated || !validated.ok) {
+          console.error(
+            `renameTaskWithAI: no valid 6-8 word summary produced for "${task.taskFolderPath}"`,
+            { rejectedReplies }
+          );
+          NotificationRouter.showWarning(
+            "The AI did not produce a valid task summary, so the name was not changed. Configure a Description-stage model in AI Models, or rename manually."
+          );
+          return;
+        }
+
+        const finalName = validated.name;
         await patchTaskProgressStrictV1(vscode.Uri.file(task.taskFolderPath), (current) => ({
           ...current,
           displayName: finalName,

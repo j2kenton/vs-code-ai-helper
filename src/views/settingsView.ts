@@ -941,7 +941,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           }
           /* The three selection action buttons share one reduced text size,
              with their leading icon laid out left of the label. */
-          #save-btn, #discard-btn, #save-providers-btn {
+          #save-btn, #discard-btn, #save-providers-btn, #discard-providers-btn {
             display: inline-flex;
             align-items: center;
             gap: var(--ensemble-space-1);
@@ -1010,6 +1010,11 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           // the identical icon left of its label (a CSP-safe inline SVG,
           // aria-hidden so screen readers announce the text label only).
           const SAVE_ICON_SVG = '<svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" focusable="false"><path d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.75.75 0 0 1 1.06-1.06L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0z"/></svg>';
+          // The same discard glyph the static Discard Unsaved Changes
+          // (model-selection) button renders — kept as a constant so the
+          // provider section's own discard button shows the identical icon,
+          // for the same reason SAVE_ICON_SVG exists above.
+          const DISCARD_ICON_SVG = '<svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" focusable="false"><path d="M6.78 1.72a.75.75 0 0 1 0 1.06L4.06 5.5H9a5.75 5.75 0 0 1 0 11.5H4.25a.75.75 0 0 1 0-1.5H9a4.25 4.25 0 0 0 0-8.5H4.06l2.72 2.72a.75.75 0 1 1-1.06 1.06l-4-4a.75.75 0 0 1 0-1.06l4-4a.75.75 0 0 1 1.06 0z"/></svg>';
           // Provider Selection dirty-tracking, independent of the model
           // form's formDirty: pending checkbox states keyed by provider id,
           // fed by the delegated change listener on #provider-selection.
@@ -1034,6 +1039,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             const button = document.getElementById('save-providers-btn');
             if (button) {
               button.disabled = !providersDirty;
+            }
+            const discardButton = document.getElementById('discard-providers-btn');
+            if (discardButton) {
+              discardButton.disabled = !providersDirty;
             }
           }
 
@@ -1075,15 +1084,20 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           // modals). Uninterceptable discards are covered by persistDraft().
           function confirmDiscardUnsaved(actionLabel) {
             return new Promise(resolve => {
-              if (!formDirty || !warnUnsavedSettings) {
+              if ((!formDirty && !providersDirty) || !warnUnsavedSettings) {
                 resolve(true);
                 return;
               }
+              const subject = formDirty && providersDirty
+                ? 'unsaved model and provider settings'
+                : providersDirty
+                  ? 'unsaved provider settings'
+                  : 'unsaved model settings';
               const overlay = document.createElement('div');
               overlay.id = 'unsaved-warning-overlay';
               overlay.innerHTML =
                 '<div id="unsaved-warning-dialog" role="alertdialog" aria-modal="true">' +
-                '<p><strong>You have unsaved model settings.</strong></p>' +
+                '<p><strong>You have ' + subject + '.</strong></p>' +
                 '<p>' + escapeHtml(actionLabel) + ' will discard them.</p>' +
                 '<label class="dialog-checkbox"><input type="checkbox" id="unsaved-dont-show"> Don\\'t show again</label>' +
                 '<div class="btn-container">' +
@@ -1117,14 +1131,15 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           window.addEventListener('message', async event => {
             const message = event.data;
             if (message.type === 'init') {
-              // An init while the form is dirty is a discard: the
-              // extension re-sends state after external settings changes or
-              // its own refresh. Warn (with opt-out) before applying.
-              if (initialized && formDirty) {
+              // An init while the model form or the provider checkboxes are
+              // dirty is a discard: the extension re-sends state after
+              // external settings changes or its own refresh. Warn (with
+              // opt-out) before applying.
+              if (initialized && (formDirty || providersDirty)) {
                 const proceed = await confirmDiscardUnsaved('Reloading the settings from disk');
                 if (!proceed) {
-                  // Keep the dirty form; the user can Save and the next
-                  // config-change event will re-sync.
+                  // Keep the dirty form/checkboxes; the user can Save and
+                  // the next config-change event will re-sync.
                   warnUnsavedSettings = message.warnUnsavedSettings !== false;
                   return;
                 }
@@ -1712,7 +1727,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                   ? '<details class="provider-warning"><summary>Warning</summary><p>' + escapeHtml(provider.permissionWarning) + '</p></details>'
                   : '')
               ).join('') +
-              '<div class="btn-container"><button id="save-providers-btn" disabled title="Save the enabled provider selection">' + SAVE_ICON_SVG + 'Save Provider Selection</button></div>' +
+              '<div class="btn-container"><button id="discard-providers-btn" class="secondary" disabled title="Revert unsaved provider selection changes back to the last saved settings">' + DISCARD_ICON_SVG + 'Discard Unsaved Changes</button>' +
+              '<button id="save-providers-btn" disabled title="Save the enabled provider selection">' + SAVE_ICON_SVG + 'Save Provider Selection</button></div>' +
               '</fieldset>';
             container.querySelectorAll('[data-signin-provider]').forEach(button => {
               button.addEventListener('click', () => {
@@ -1730,6 +1746,25 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                 next[input.dataset.provider] = input.checked;
               });
               vscode.postMessage({ type: 'saveProviders', enabledProviders: next });
+            });
+            // Reverts the checkboxes to the last-saved enabledProviders map
+            // (not to empty), identical in spirit to the model form's own
+            // discard-btn handler below. Always asks for confirmation, since
+            // it discards whatever is currently unsaved. This flips the
+            // checkboxes directly rather than calling renderProviderSelection()
+            // again — that would rebuild this very button's own listener
+            // while its click is still being handled.
+            container.querySelector('#discard-providers-btn').addEventListener('click', async () => {
+              const proceed = await confirmDestructiveAction(
+                'Discard your unsaved provider-selection changes? They will be reverted to the last saved settings.',
+                'Discard Unsaved Changes'
+              );
+              if (!proceed) return;
+              pendingProviderChecks = {};
+              container.querySelectorAll('[data-provider]').forEach(input => {
+                input.checked = isProviderChecked(input.dataset.provider);
+              });
+              updateProviderSaveButtonState();
             });
             // Fresh render: every checkbox matches the last-saved map by
             // construction, so any pending toggles are gone and the save

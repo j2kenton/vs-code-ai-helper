@@ -12,6 +12,7 @@ import {
   linkCancellationTokens,
   TaskOperationHandle,
   cancelRunningOperationsForTask,
+  hasActiveOperationTargetingStage,
 } from "../utils/taskOperations";
 import {
   EscalationKind,
@@ -179,6 +180,9 @@ import {
   reconcileProgressWithChecklistV1,
   detectSiblingReviewDisagreement,
   REVIEWED_COMMIT_STAGES,
+  REVIEW_TARGETS,
+  IN_PROGRESS_REVIEW_PLACEHOLDER_PREFIX_V1,
+  markReviewInProgressBannerV1,
   ReviewBlocker,
 } from "../utils/reviewReadiness";
 import {
@@ -1115,16 +1119,46 @@ async function setStage(
   });
 }
 
-/** Stages from which a review can be run, mapped to the review it produces */
-const REVIEW_TARGETS: Partial<Record<TaskStage, TaskStage>> = {
-  plan: "plan-high-review",
-  "plan-high-review": "plan-high-review",
-  "plan-low-review": "plan-low-review",
-  impl: "impl-high-review",
-  "impl-high-review": "impl-high-review",
-  "impl-low-review": "impl-low-review",
-  publish: "publish",
-};
+// REVIEW_TARGETS now lives in utils/reviewReadiness.ts (imported above)
+// beside the freshness primitives it scopes, so taskTreeProvider.ts can
+// translate a taskOperations stage the same way without a views -> commands
+// import.
+
+/**
+ * THE active-run signal for review status display (Part 2, provider/review/
+ * rename/refresh plan): true when a "review"-kind `taskOperations` entry is
+ * genuinely live for `targetReviewStage` right now.
+ *
+ * Deliberately excludes the "fast-forward"-kind root registration
+ * (runFastForwardReviewWithAI's own runTrackedOperation call) — that entry's
+ * `stage` is whatever pre-review/review stage the task sat at when Fast
+ * Forward was invoked, and by itself proves nothing about whether an actual
+ * review dispatch is in flight. Fast Forward's iterative apply/re-review
+ * cycles each register their OWN nested "review"-kind child operation
+ * (applyReviewWithAI/applyReviewEditWithAI's `runApply`), which this DOES
+ * see. The one narrow gap is Fast Forward's very first review dispatch when
+ * no usable review exists yet at all (it runs directly under the
+ * "fast-forward" root, uninstrumented) — accepted per plan (Changes from
+ * previous plan, "reviewActions.ts:3805-3807 registration is kind
+ * fast-forward, not review, and is not the review signal").
+ *
+ * The stale-vs-active precedence this backs: a review marked stale (the
+ * `# Review Stale` placeholder, or a persisted commit-drift banner) with an
+ * active translated run here shows "Review in progress"; with no active run
+ * it still shows stale. The translated active-run signal always takes
+ * precedence over the stale marker for display purposes.
+ */
+export function isReviewActivelyRerunningV1(
+  taskFolderPath: string,
+  targetReviewStage: TaskStage
+): boolean {
+  return hasActiveOperationTargetingStage(
+    taskFolderPath,
+    "review",
+    targetReviewStage,
+    (stage) => REVIEW_TARGETS[stage]
+  );
+}
 
 const REVIEW_PROMPTS: Partial<Record<TaskStage, string>> = {
   "plan-high-review": "review-plan-high.md",
@@ -2786,10 +2820,20 @@ export async function runReviewForFolder(
       // the old review remains, now correctly marked. Reuses the HEAD resolved
       // above — no extra git call. Best-effort: a courtesy marker must never
       // block the re-review itself.
-      try {
-        await refreshStaleReviewBannerForArtifactV1(reviewUri, headSha);
-      } catch {
-        // Marker only — proceed with the review regardless.
+      //
+      // Gated on the translated active-run signal: this run's own
+      // taskOperations entry is already registered by the caller at this
+      // point, so this heals nothing while a rerun of this same review stage
+      // is genuinely in flight — the post-claim marking below will shortly
+      // overwrite the banner to its in-progress form anyway, and healing it
+      // to stale here first would let a mid-run `viewReview` open see the
+      // very "stale" wording this whole feature exists to replace.
+      if (!isReviewActivelyRerunningV1(folderUri.fsPath, targetStage)) {
+        try {
+          await refreshStaleReviewBannerForArtifactV1(reviewUri, headSha);
+        } catch {
+          // Marker only — proceed with the review regardless.
+        }
       }
       variables.reconciliationInstruction = await selectReconciliationInstruction(
         targetStage,
@@ -2930,100 +2974,121 @@ export async function runReviewForFolder(
   const claimed = await claimReviewAttempt(folderUri, reviewAttemptId);
   if (!claimed) return;
 
-  assertLegacyAiRouteAllowedV0("review.v1");
+  // Part 2 (review status messaging): mark the artifact "in progress" now
+  // that this attempt has genuinely won the claim, and before the provider
+  // call — see beginInProgressReviewMarkingV1's doc comment. Reverted in the
+  // `finally` below on every non-success exit (refusal, failure, thrown
+  // error, cancellation), gated on this attempt still being current so a
+  // late failure from a superseded attempt can never clobber a newer one's
+  // marking or its completed review.
+  const inProgressMarking = await beginInProgressReviewMarkingV1(reviewUri);
+  let reviewSucceeded = false;
+  try {
+    assertLegacyAiRouteAllowedV0("review.v1");
 
-  const prompt = await renderPromptTemplate(extensionUri, templateFile, variables);
+    const prompt = await renderPromptTemplate(extensionUri, templateFile, variables);
 
-  const rootId = ensureWorkflowTaskFolderRootV1(folderUri.fsPath);
-  const verifiedBindingId = getVerifiedTaskBindingIdV1(rootId);
-  if (!verifiedBindingId) {
-    throw new Error("Task ownership binding could not be verified.");
+    const rootId = ensureWorkflowTaskFolderRootV1(folderUri.fsPath);
+    const verifiedBindingId = getVerifiedTaskBindingIdV1(rootId);
+    if (!verifiedBindingId) {
+      throw new Error("Task ownership binding could not be verified.");
+    }
+    const chatIdentity = await readChatDocumentIdentityV1(folderUri.fsPath, folderUri.fsPath);
+    const chatDocumentId = chatIdentity?.documentId ?? allocateHex128IdV1();
+
+    const { modelId } = await resolveFreshModelForStage(folderUri, targetStage);
+    if (!modelId) {
+      NotificationRouter.showWarning("No model is configured for this stage.");
+      return;
+    }
+
+    // Pre-flight the stage's resolved provider chain BEFORE burning a round
+    // (finding 4's second fix): an unavailable-provider stall is predictable —
+    // the chain is known ahead of time — so a chain whose every candidate
+    // fails a safely probeable availability check reports "no configured
+    // provider for <stage> is available" here, producing the same paused
+    // outcome and enriched run record the runtime exhaustion path writes,
+    // without dispatching anything. Probe timeouts fail open to dispatch; a
+    // probe-available/invoke-fail candidate still reaches the runtime
+    // exhaustion path as the backstop.
+    const chainPreflight = await preflightStageChainAvailabilityV1(targetStage, {
+      modelId,
+    });
+    if (chainPreflight.kind === "exhausted") {
+      await handleReviewOutcomeV1(
+        {
+          kind: "unavailable",
+          code: "providerModeUnavailable",
+          chainExhaustion: chainPreflight.exhaustion,
+        },
+        {
+          extensionUri,
+          folderUri,
+          workspaceUri: workspaceRoot.uri,
+          currentStage,
+          targetStage,
+          reviewUri,
+          variables,
+          reviewAttemptId,
+          operation: options.operation,
+          chatViewProvider: options.chatViewProvider,
+        }
+      );
+      return;
+    }
+
+    const coordinator = createProductionTaskActionCoordinatorV1({
+      workspaceCwd: workspaceRoot.uri.fsPath,
+      resolveStagePrimaryModel: () => ({ modelId, stage: targetStage }),
+    });
+
+    const relativePath = path.relative(folderUri.fsPath, reviewUri.fsPath) || STAGE_ARTIFACT_FILENAMES[targetStage] || "review.md";
+    const targetLocator = { rootId, relativePath };
+    const reviewFileStore = getWorkflowFileStoreV1();
+    const reviewStatResult = await reviewFileStore.stat(targetLocator);
+    const reviewBaselineRevision =
+      reviewStatResult.kind === "ok" && reviewStatResult.value.kind === "file"
+        ? reviewStatResult.value.revision
+        : undefined;
+    const validatedInput: ReviewActionInputV1 = {
+      prompt,
+      targetLocator,
+      ...(reviewBaselineRevision !== undefined ? { baselineRevision: reviewBaselineRevision } : {}),
+      ...(publishFreshnessGuard !== undefined ? { publishFreshnessGuard } : {}),
+    };
+
+    const outcome = await coordinator.executeAction({
+      actionKey: REVIEW_ACTION_KEY_V1,
+      taskBinding: { taskBindingId: verifiedBindingId, chatDocumentId },
+      taskStatus: "active",
+      taskStage: currentStage,
+      rawInput: validatedInput,
+      cancellationToken: options.operation?.token ?? new vscode.CancellationTokenSource().token,
+    });
+    // "completed" is the only outcome that overwrites reviewUri with fresh
+    // content (via the coordinator's own write) — every other kind
+    // (questions, cancelled, failed, unavailable, ...) leaves the in-progress
+    // marking on disk with nothing further coming, so the `finally` below
+    // must revert it.
+    reviewSucceeded = outcome.kind === "completed";
+
+    await handleReviewOutcomeV1(outcome, {
+      extensionUri,
+      folderUri,
+      workspaceUri: workspaceRoot.uri,
+      currentStage,
+      targetStage,
+      reviewUri,
+      variables,
+      reviewAttemptId,
+      operation: options.operation,
+      chatViewProvider: options.chatViewProvider,
+    });
+  } finally {
+    if (!reviewSucceeded) {
+      await revertInProgressReviewMarkingV1(folderUri, reviewUri, reviewAttemptId, inProgressMarking);
+    }
   }
-  const chatIdentity = await readChatDocumentIdentityV1(folderUri.fsPath, folderUri.fsPath);
-  const chatDocumentId = chatIdentity?.documentId ?? allocateHex128IdV1();
-
-  const { modelId } = await resolveFreshModelForStage(folderUri, targetStage);
-  if (!modelId) {
-    NotificationRouter.showWarning("No model is configured for this stage.");
-    return;
-  }
-
-  // Pre-flight the stage's resolved provider chain BEFORE burning a round
-  // (finding 4's second fix): an unavailable-provider stall is predictable —
-  // the chain is known ahead of time — so a chain whose every candidate
-  // fails a safely probeable availability check reports "no configured
-  // provider for <stage> is available" here, producing the same paused
-  // outcome and enriched run record the runtime exhaustion path writes,
-  // without dispatching anything. Probe timeouts fail open to dispatch; a
-  // probe-available/invoke-fail candidate still reaches the runtime
-  // exhaustion path as the backstop.
-  const chainPreflight = await preflightStageChainAvailabilityV1(targetStage, {
-    modelId,
-  });
-  if (chainPreflight.kind === "exhausted") {
-    await handleReviewOutcomeV1(
-      {
-        kind: "unavailable",
-        code: "providerModeUnavailable",
-        chainExhaustion: chainPreflight.exhaustion,
-      },
-      {
-        extensionUri,
-        folderUri,
-        workspaceUri: workspaceRoot.uri,
-        currentStage,
-        targetStage,
-        reviewUri,
-        variables,
-        reviewAttemptId,
-        operation: options.operation,
-        chatViewProvider: options.chatViewProvider,
-      }
-    );
-    return;
-  }
-
-  const coordinator = createProductionTaskActionCoordinatorV1({
-    workspaceCwd: workspaceRoot.uri.fsPath,
-    resolveStagePrimaryModel: () => ({ modelId, stage: targetStage }),
-  });
-
-  const relativePath = path.relative(folderUri.fsPath, reviewUri.fsPath) || STAGE_ARTIFACT_FILENAMES[targetStage] || "review.md";
-  const targetLocator = { rootId, relativePath };
-  const reviewFileStore = getWorkflowFileStoreV1();
-  const reviewStatResult = await reviewFileStore.stat(targetLocator);
-  const reviewBaselineRevision =
-    reviewStatResult.kind === "ok" && reviewStatResult.value.kind === "file"
-      ? reviewStatResult.value.revision
-      : undefined;
-  const validatedInput: ReviewActionInputV1 = {
-    prompt,
-    targetLocator,
-    ...(reviewBaselineRevision !== undefined ? { baselineRevision: reviewBaselineRevision } : {}),
-    ...(publishFreshnessGuard !== undefined ? { publishFreshnessGuard } : {}),
-  };
-
-  const outcome = await coordinator.executeAction({
-    actionKey: REVIEW_ACTION_KEY_V1,
-    taskBinding: { taskBindingId: verifiedBindingId, chatDocumentId },
-    taskStatus: "active",
-    taskStage: currentStage,
-    rawInput: validatedInput,
-    cancellationToken: options.operation?.token ?? new vscode.CancellationTokenSource().token,
-  });
-
-  await handleReviewOutcomeV1(outcome, {
-    extensionUri,
-    folderUri,
-    workspaceUri: workspaceRoot.uri,
-    currentStage,
-    targetStage,
-    reviewUri,
-    variables,
-    reviewAttemptId,
-    operation: options.operation,
-    chatViewProvider: options.chatViewProvider,
-  });
 }
 
 /**
@@ -3044,6 +3109,14 @@ function validateReviewOutput(content: string): { valid: boolean; reason: string
 
 function isStaleReviewArtifact(content: string): boolean {
   return content.trimStart().startsWith("# Review Stale");
+}
+
+/** The transient placeholder `beginInProgressReviewMarkingV1` writes over a
+ * `# Review Stale` placeholder while a rerun of that same review stage is
+ * genuinely in flight (see `isReviewActivelyRerunningV1`).
+ * @internal exported for testing */
+export function isInProgressReviewArtifact(content: string): boolean {
+  return content.trimStart().startsWith(IN_PROGRESS_REVIEW_PLACEHOLDER_PREFIX_V1);
 }
 
 /**
@@ -3111,10 +3184,21 @@ export async function describeUnusableReviewBlockV1(folderUri: vscode.Uri): Prom
  * same artifact twice in a row (e.g. two implementation reruns with
  * auto-review off) or publishing a new review over a staled one would
  * overwrite the last real review's backup with the placeholder itself.
+ *
+ * @internal exported for testing
  */
-async function backupReviewUnlessStale(reviewUri: vscode.Uri): Promise<void> {
+export async function backupReviewUnlessStale(reviewUri: vscode.Uri): Promise<void> {
   const existing = await readNonEmptyText(reviewUri);
-  if (existing !== undefined && !isStaleReviewArtifact(existing)) {
+  // The in-progress placeholder is excluded for the same reason as the stale
+  // one: it can never be worth preserving as the "previous version" — if a
+  // workspace change stales this same artifact WHILE a rerun is writing the
+  // in-progress placeholder, backing it up would clobber the last REAL
+  // review's backup with a transient marker that describes nothing.
+  if (
+    existing !== undefined &&
+    !isStaleReviewArtifact(existing) &&
+    !isInProgressReviewArtifact(existing)
+  ) {
     await backupArtifactBeforeWrite(reviewUri);
   }
 }
@@ -3141,6 +3225,100 @@ async function markReviewArtifactStale(
     "",
   ].join("\n");
   await writeTextFile(reviewUri, staleNotice, { skipBackup: true });
+}
+
+/** Result of {@link beginInProgressReviewMarkingV1}.
+ * @internal exported for testing */
+export interface InProgressReviewMarkingV1 {
+  /** True when the artifact was rewritten and must be reverted on any
+   * non-success exit (see the run-token-guarded revert below). */
+  readonly rewrote: boolean;
+  /** The exact prior bytes, captured before the rewrite — restored verbatim
+   * on revert rather than reconstructed, so revert can never drift from
+   * whatever was actually on disk (a real stale placeholder, a review body
+   * with a stale banner, or anything else). Only meaningful when
+   * `rewrote` is true. */
+  readonly priorContent?: string;
+}
+
+/**
+ * Part 2 (review status messaging): mark a review artifact "in progress"
+ * immediately after this attempt has claimed the review (post-claim, so this
+ * never runs for an attempt that lost the claim race) and before the
+ * provider call — the two surfaces a rerun can leave stale-looking:
+ *
+ *  - A `# Review Stale` content placeholder is replaced wholesale with the
+ *    `# Review in progress` placeholder (no rerun instruction — one is
+ *    already running).
+ *  - A real review body carrying the commit-drift stale banner
+ *    (`upsertStaleReviewBanner`) has ONLY that banner line swapped for its
+ *    in-progress form (`markReviewInProgressBannerV1`); the body is never
+ *    touched.
+ *  - Anything else (a current review with no stale marker at all, being
+ *    re-reviewed by choice) is left untouched — there is nothing to mark.
+ *
+ * Callers MUST revert on every non-success exit (refusal, failure, thrown
+ * error, cancellation) using the returned `priorContent`, gated on this
+ * attempt still being the task's current `reviewAttemptId` — see
+ * runReviewForFolder's use, immediately after `claimReviewAttempt`.
+ *
+ * @internal exported for testing
+ */
+export async function beginInProgressReviewMarkingV1(
+  reviewUri: vscode.Uri
+): Promise<InProgressReviewMarkingV1> {
+  const current = await readTextIfExists(reviewUri);
+  if (current === undefined) {
+    return { rewrote: false };
+  }
+  if (isStaleReviewArtifact(current)) {
+    const inProgressNotice = [
+      IN_PROGRESS_REVIEW_PLACEHOLDER_PREFIX_V1,
+      "",
+      "This review is being re-evaluated against the current artifact.",
+      "",
+    ].join("\n");
+    await writeTextFile(reviewUri, inProgressNotice, { skipBackup: true });
+    return { rewrote: true, priorContent: current };
+  }
+  const withInProgressBanner = markReviewInProgressBannerV1(current);
+  if (withInProgressBanner === current) {
+    return { rewrote: false };
+  }
+  await writeTextFile(reviewUri, withInProgressBanner, { skipBackup: true });
+  return { rewrote: true, priorContent: current };
+}
+
+/**
+ * Undoes {@link beginInProgressReviewMarkingV1}'s rewrite, restoring the
+ * exact prior bytes — but ONLY when `reviewAttemptId` is still the task's
+ * current one (the run-token guard). A late failure/cancellation from an
+ * older, already-superseded attempt must never clobber whatever a NEWER
+ * attempt has since written (its own in-progress marking, or a completed
+ * review). A no-op when `marking.rewrote` is false (nothing to undo) or the
+ * revert write itself fails (best-effort — the caller's real outcome must
+ * never be masked by a courtesy marker's own I/O failure).
+ *
+ * @internal exported for testing
+ */
+export async function revertInProgressReviewMarkingV1(
+  folderUri: vscode.Uri,
+  reviewUri: vscode.Uri,
+  reviewAttemptId: string,
+  marking: InProgressReviewMarkingV1
+): Promise<void> {
+  if (!marking.rewrote || marking.priorContent === undefined) {
+    return;
+  }
+  try {
+    const latest = await readTaskProgressAdvisoryV1(folderUri);
+    if (latest?.reviewAttemptId !== reviewAttemptId) {
+      return;
+    }
+    await writeTextFile(reviewUri, marking.priorContent, { skipBackup: true });
+  } catch {
+    // Best-effort marker only — see doc comment above.
+  }
 }
 
 /**
@@ -4568,9 +4746,16 @@ export async function viewReview(
   // HTML comment an operator never scrolls to. The upsert is a no-op for
   // plan reviews (no marker), placeholders, and current reviews. Best-effort:
   // opening the review must never fail over a courtesy marker.
+  //
+  // Gated on the translated active-run signal so opening the artifact WHILE
+  // a rerun of this same review stage is genuinely in flight can never heal
+  // its in-progress banner back to stale — the exact "recreate the
+  // complaint on the banner surface" bug this gate exists to prevent.
   try {
-    const headSha = await resolveHeadCommitSha(resolved.folderUri.fsPath);
-    await refreshStaleReviewBannerForArtifactV1(reviewUri, headSha);
+    if (!isReviewActivelyRerunningV1(resolved.folderUri.fsPath, stage)) {
+      const headSha = await resolveHeadCommitSha(resolved.folderUri.fsPath);
+      await refreshStaleReviewBannerForArtifactV1(reviewUri, headSha);
+    }
   } catch {
     // Marker only — open the artifact regardless.
   }

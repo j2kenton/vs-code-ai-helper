@@ -9,9 +9,11 @@
  * Like `commitPushMetadata.v1`, promotion writes the provider's reply to a
  * caller-supplied workflow-file-store artifact instead of applying it
  * directly: the caller (renameTaskWithAI in renameTask.ts) reads the
- * artifact back, enforces the 5–7-word contract (retrying once with a
- * stricter instruction when the reply is too long), and only then patches
- * the task's displayName.
+ * artifact back and validates it against the full 6–8-word contract
+ * (rejecting too-short, too-long, and leading-substring-of-description
+ * replies alike, with one stricter re-prompt on failure), and only then
+ * patches the task's displayName. There is no deterministic fallback: a
+ * reply that never validates leaves the task's name unchanged.
  */
 import {
   ProviderTaskActionRowV1,

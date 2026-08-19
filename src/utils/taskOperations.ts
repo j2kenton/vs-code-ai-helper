@@ -725,6 +725,46 @@ export async function cancelRunningOperationsForTask(
   };
 }
 
+/**
+ * True when the task has at least one live operation of `kind` whose stage —
+ * translated through `translateStage` — targets `targetStage`. Shared by
+ * review status display (reviewActions.ts's `isReviewActivelyRerunningV1` and
+ * taskTreeProvider.ts's StageNode) to tell "a rerun of THIS stage is
+ * genuinely in flight right now" apart from a merely-stale artifact with
+ * nothing running.
+ *
+ * `translateStage` exists because an operation's own recorded `stage` can
+ * still be a PRE-review stage (`plan`, `impl`, `publish`) when a rerun was
+ * launched before the task advanced onto its review stage — a raw
+ * `stage === targetStage` comparison would miss that case.
+ *
+ * `matchWaiting` optionally narrows by `op.waitingForUser`: omitted (the
+ * `isReviewActivelyRerunningV1` placeholder/banner-lifecycle use) matches
+ * either state, because a review paused on a question or round-limit is
+ * still genuinely in flight and must keep showing "Review in progress" —
+ * not reverted stale — until it actually finishes. `false` or `true` (the
+ * StageNode tree-row use) narrows to spinning-only or waiting-only so the
+ * row can tell the two apart, matching the disjoint running/waiting split
+ * `getActiveStages`/`getWaitingStages` already use for non-review stages.
+ */
+export function hasActiveOperationTargetingStage(
+  taskPath: string,
+  kind: OperationKind,
+  targetStage: TaskStage,
+  translateStage: (stage: TaskStage) => TaskStage | undefined,
+  matchWaiting?: boolean
+): boolean {
+  return taskOperations
+    .getTaskOperations(taskPath)
+    .some(
+      (op) =>
+        op.kind === kind &&
+        op.stage !== undefined &&
+        translateStage(op.stage) === targetStage &&
+        (matchWaiting === undefined || op.waitingForUser === matchWaiting)
+    );
+}
+
 export function showTaskBusyWarning(taskPath: string): void {
   const label = taskOperations.busyLabel(taskPath) ?? "An operation";
   NotificationRouter.showInformation(

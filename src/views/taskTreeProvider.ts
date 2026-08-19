@@ -12,7 +12,7 @@ import {
   TaskStage,
 } from "../types/taskProgress";
 import { IncompleteTask } from "../types/incompleteTask";
-import { taskOperations, taskKey } from "../utils/taskOperations";
+import { taskOperations, taskKey, hasActiveOperationTargetingStage } from "../utils/taskOperations";
 import { resolveCurrentPlanUri, statIfExists } from "../utils/fileUtils";
 import { hasPreviousVersion } from "../utils/artifactBackups";
 import { readRedoSidecar, isRedoAvailableFromRecord } from "../utils/redoSidecar";
@@ -23,6 +23,7 @@ import {
   parseReadiness,
   parseReviewedCommitSha,
   REVIEWED_COMMIT_STAGES,
+  REVIEW_TARGETS,
 } from "../utils/reviewReadiness";
 import { resolveHeadCommitSha } from "../utils/gitRepoInfo";
 import { TaskInventory, TaskWithProgress } from "../state/taskInventory";
@@ -408,12 +409,35 @@ export class StageNode extends vscode.TreeItem {
     // spinner follows the actively running sub-stage — the implementation
     // row while a fix is being implemented, the review row while
     // re-reviewing — rather than parking on the composite root's stage.
-    const isRunning = taskOperations.getActiveStages(tKey).includes(stage);
+    //
+    // For a review stage specifically, a raw stage match is not enough: a
+    // rerun launched while the task still sat on a PRE-review stage (`plan`,
+    // `impl`, `publish`) registers its "review"-kind taskOperations entry
+    // under THAT stage, not the review stage it targets — getActiveStages
+    // would miss it. hasActiveOperationTargetingStage translates through
+    // REVIEW_TARGETS (the same mapping reviewActions.ts's
+    // isReviewActivelyRerunningV1 uses) so this row still takes the running
+    // branch, which is what suppresses the "· stale" qualifier below in
+    // favor of "Review in progress" (Part 2, review status messaging).
+    //
+    // The translated check must itself split on waitingForUser (matchWaiting
+    // false/true below) the same way getActiveStages/getWaitingStages split
+    // raw-stage ops: a rerun that is paused on a question or round-limit
+    // (still a live "review"-kind op, just not spinning) must take the
+    // waiting branch, not the running one, even after translation.
+    const isRunning =
+      taskOperations.getActiveStages(tKey).includes(stage) ||
+      (isReviewStage(stage) &&
+        hasActiveOperationTargetingStage(tKey, "review", stage, (s) => REVIEW_TARGETS[s], false));
     // Waiting on the user (a question, a round-limit pause) is NOT "in
     // progress" from the user's point of view — a spinner over it reads as
     // "the computer is working, leave it alone", exactly backwards. Show a
     // distinct, non-spinning icon instead.
-    const isWaitingForUser = !isRunning && taskOperations.getWaitingStages(tKey).includes(stage);
+    const isWaitingForUser =
+      !isRunning &&
+      (taskOperations.getWaitingStages(tKey).includes(stage) ||
+        (isReviewStage(stage) &&
+          hasActiveOperationTargetingStage(tKey, "review", stage, (s) => REVIEW_TARGETS[s], true)));
 
     if (isRunning) {
       this.iconPath = new vscode.ThemeIcon("loading~spin", new vscode.ThemeColor("charts.blue"));
@@ -511,9 +535,22 @@ export class StageNode extends vscode.TreeItem {
         `${readiness.progress.complete} of ${readiness.progress.total} steps completed`;
     }
     if (readiness?.staleReviewedSha) {
-      tooltipStr +=
-        `\n\n⚠ This review examined commit ${readiness.staleReviewedSha}, which is no longer HEAD — ` +
-        "re-run Review with AI to assess the current state.";
+      // Display-time computation (Part 2, review status messaging): a stale
+      // review with an active translated rerun shows "Review in progress"
+      // instead of the categorical rerun instruction — re-derived from live
+      // taskOperations state on every render, so a cancelled or failed rerun
+      // can never leave this tooltip stuck on stale wording it should have
+      // reverted from, and a genuinely still-stale review (no active rerun)
+      // keeps the instruction. Uses isRunning || isWaitingForUser, not
+      // isRunning alone: a rerun paused on a question or round-limit is
+      // still genuinely in flight (the placeholder file and banner keep
+      // saying "in progress" for the same reason — see
+      // isReviewActivelyRerunningV1), so the tooltip must not fall back to
+      // the stale/re-run instruction just because the spinner isn't showing.
+      tooltipStr += (isRunning || isWaitingForUser)
+        ? "\n\n⏳ Review in progress: re-evaluating this artifact against the current HEAD."
+        : `\n\n⚠ This review examined commit ${readiness.staleReviewedSha}, which is no longer HEAD — ` +
+          "re-run Review with AI to assess the current state.";
     }
     if (isScheduled) {
       this.description = this.description

@@ -743,7 +743,14 @@ export function activate(context: vscode.ExtensionContext): void {
 
   const refreshCommand = vscode.commands.registerCommand(
     "vs-code-ai-helper.refreshTasksView",
-    () => taskTreeProvider.refresh()
+    // A full filesystem rescan (added/removed/modified task folders and
+    // files), not just a tree repaint: inventory.refresh() re-runs
+    // discoverAllTasks() and fires onDidChange, which the tree already
+    // subscribes to (taskTreeProvider.ts's constructor), so no separate
+    // taskTreeProvider.refresh() call is needed here. Never touches
+    // taskOperations, so a running implementation/review/publish is
+    // untouched.
+    () => inventory.refresh()
   );
   const expandAllCommand = vscode.commands.registerCommand(
     "vs-code-ai-helper.expandAllTasks",

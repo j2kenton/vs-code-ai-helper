@@ -1101,3 +1101,177 @@ void describe("SettingsViewProvider webview — Save Provider Selection gating",
     );
   });
 });
+
+// ---------------------------------------------------------------------------
+// Provider selection: Discard Unsaved Changes
+//
+// The provider section gets its own discard control, identical in shape to
+// the model-selection "Discard Unsaved Changes" button covered above: same
+// icon constant, same confirmDestructiveAction() confirmation flow, gated by
+// providersDirty (not the model form's formDirty) and reverting checkboxes to
+// the last-saved enabledProviders map on confirm via a fresh
+// renderProviderSelection() (which also empties pendingProviderChecks).
+// ---------------------------------------------------------------------------
+
+void describe("SettingsViewProvider webview — provider selection Discard Unsaved Changes", () => {
+  const CLAUDE_PROVIDER = {
+    id: "claude-cli",
+    label: "Claude Code",
+    signInLabel: "Sign in / Switch account",
+    signInGuidance: "",
+    permissionWarning: "",
+    installHint: "",
+    usageEnabled: true,
+    usageTooltip: "usage",
+    enabledByDefault: true,
+  };
+
+  function providerInitMessage(): Record<string, unknown> {
+    const init = initMessage();
+    init.providers = [CLAUDE_PROVIDER];
+    init.enabledProviders = {};
+    return init;
+  }
+
+  void it("renders the discard button with the shared discard icon, secondary styling, and starts disabled", () => {
+    const html = extractWebviewHtml();
+    assert.match(
+      html,
+      /<button id="discard-providers-btn" class="secondary" disabled title="[^"]+">' \+ DISCARD_ICON_SVG \+ 'Discard Unsaved Changes<\/button>/
+    );
+    const discardBtnIcon = /<button id="discard-btn"[^>]*><svg[^>]*><path d="([^"]+)"/.exec(html);
+    const providerDiscardIcon = /const DISCARD_ICON_SVG = '<svg[^>]*><path d="([^"]+)"/.exec(html);
+    assert.ok(discardBtnIcon, "Discard Unsaved Changes (models) must render an inline icon");
+    assert.ok(providerDiscardIcon, "DISCARD_ICON_SVG must be defined");
+    assert.equal(
+      providerDiscardIcon[1],
+      discardBtnIcon[1],
+      "the provider discard button must reuse the exact model discard-btn icon"
+    );
+  });
+
+  void it("enables alongside Save on a checkbox toggle, and confirming reverts the checkbox and re-disables both", async () => {
+    const script = extractWebviewScript();
+    const stateStore: { value: unknown } = { value: undefined };
+    const session = runWebviewSession(script, stateStore);
+
+    await session.deliver(providerInitMessage());
+    // The disabled flag is written via document.getElementById(id) inside
+    // updateProviderSaveButtonState(), so state must be read the same way —
+    // not via container.querySelector(selector), a distinct FakeNode in this
+    // harness (see the "Save Provider Selection gating" tests above for the
+    // same split: state via byId, click dispatch via container.querySelector,
+    // since the click listener is attached to the querySelector node).
+    assert.equal(session.byId("discard-providers-btn").disabled, true);
+    assert.equal(session.byId("save-providers-btn").disabled, true);
+
+    await session.byId("provider-selection").dispatch("change", {
+      target: { dataset: { provider: "claude-cli" }, checked: false },
+    });
+    assert.equal(
+      session.byId("discard-providers-btn").disabled,
+      false,
+      "toggling a checkbox away from the saved state must enable discard alongside save"
+    );
+
+    const discardClick = session
+      .byId("provider-selection")
+      .querySelector("#discard-providers-btn")
+      .dispatch("click");
+    const overlay = session.body.children[session.body.children.length - 1];
+    assert.ok(overlay, "expected a confirmation overlay to have been appended");
+    await overlay.querySelector("#destructive-confirm").dispatch("click");
+    await discardClick;
+
+    assert.equal(
+      session.byId("discard-providers-btn").disabled,
+      true,
+      "confirming discard must re-disable itself after the re-render"
+    );
+    assert.equal(
+      session.byId("save-providers-btn").disabled,
+      true,
+      "confirming discard must revert the checkbox to the saved state, re-disabling save too"
+    );
+    assert.ok(
+      !session.posted.some((message) => message.type === "saveProviders"),
+      "discarding must never post a save"
+    );
+  });
+
+  void it("dismissing the confirmation leaves the pending checkbox toggle untouched", async () => {
+    const script = extractWebviewScript();
+    const stateStore: { value: unknown } = { value: undefined };
+    const session = runWebviewSession(script, stateStore);
+
+    await session.deliver(providerInitMessage());
+    await session.byId("provider-selection").dispatch("change", {
+      target: { dataset: { provider: "claude-cli" }, checked: false },
+    });
+    assert.equal(session.byId("discard-providers-btn").disabled, false);
+
+    const discardClick = session
+      .byId("provider-selection")
+      .querySelector("#discard-providers-btn")
+      .dispatch("click");
+    const overlay = session.body.children[session.body.children.length - 1];
+    assert.ok(overlay);
+    await overlay.querySelector("#destructive-cancel").dispatch("click");
+    await discardClick;
+
+    assert.equal(
+      session.byId("discard-providers-btn").disabled,
+      false,
+      "cancelling discard must keep the pending toggle (and discard's enabled state) intact"
+    );
+    assert.equal(
+      session.byId("save-providers-btn").disabled,
+      false,
+      "cancelling discard must keep save enabled too"
+    );
+  });
+
+  void it("protects a dirty provider checkbox (with a clean model form) against a silent external reload", async () => {
+    const script = extractWebviewScript();
+    const stateStore: { value: unknown } = { value: undefined };
+    const session = runWebviewSession(script, stateStore);
+
+    await session.deliver(providerInitMessage());
+    assert.equal(session.byId("save-btn").disabled, true, "model form starts clean");
+
+    await session.byId("provider-selection").dispatch("change", {
+      target: { dataset: { provider: "claude-cli" }, checked: false },
+    });
+    assert.equal(
+      session.byId("save-providers-btn").disabled,
+      false,
+      "the provider checkbox is now dirty"
+    );
+
+    // An external reload (e.g. a settings.json edit in another window) posts
+    // a fresh "init" — previously this bypassed confirmDiscardUnsaved
+    // entirely because it only checked formDirty, silently discarding the
+    // pending provider toggle.
+    const reinit = providerInitMessage();
+    (reinit as { enabledProviders: Record<string, boolean> }).enabledProviders = { "claude-cli": true };
+    const deliverPromise = session.deliver(reinit);
+    const overlay = session.body.children[session.body.children.length - 1];
+    assert.ok(
+      overlay,
+      "a dirty provider checkbox must trigger the unsaved-changes confirmation on external reload"
+    );
+    assert.match(
+      overlay.children[0]?.innerHTML ?? overlay.innerHTML,
+      /unsaved provider settings/,
+      "the warning must name the provider settings specifically, not just 'model settings'"
+    );
+    await overlay.querySelector("#unsaved-keep").dispatch("click");
+    await deliverPromise;
+
+    assert.equal(
+      session.byId("save-providers-btn").disabled,
+      false,
+      "declining the reload must preserve the pending provider toggle"
+    );
+  });
+});

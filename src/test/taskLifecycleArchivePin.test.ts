@@ -6,7 +6,6 @@
  *    appears via explicit filtering.
  *  - Context tokens expose archived/pinned states for menu `when` clauses,
  *    with the pinned marker as the final suffix.
- *  - Rename-with-AI derives a concise name from description text.
  *  - Plan-item verification never converts an unverifiable or deferred item
  *    into a pass.
  *  - The full archive → resume → re-complete round trip through the real
@@ -29,7 +28,6 @@ import {
   TaskProgress,
 } from "../types/taskProgress";
 import { buildTaskContextValue } from "../utils/contextTokens";
-import { deriveNameFromDescription } from "../commands/renameTask";
 import {
   mergeAiPlanVerdicts,
   parseAiPlanVerdicts,
@@ -124,19 +122,17 @@ void describe("selectNextTask", () => {
   });
 });
 
-void describe("deriveNameFromDescription", () => {
-  void it("uses the first meaningful line, not a heading", () => {
-    const name = deriveNameFromDescription(
-      "# Task Description\n\n- Fix the settings panel so provider selection persists across reloads. More detail follows here.\n"
+void describe("renameTask.ts — no deterministic name-derivation fallback", () => {
+  void it("never derives a name from the raw description text — Rename Task with AI must fail loudly instead of silently returning a leading-substring name", () => {
+    const source = fs.readFileSync(
+      path.join(process.cwd(), "src", "commands", "renameTask.ts"),
+      "utf8"
     );
-    assert.strictEqual(
-      name,
-      "Fix the settings panel so provider selection persists across reloads"
+    assert.doesNotMatch(
+      source,
+      /deriveNameFromDescription|clampNameAtWordBoundary/,
+      "the deterministic derive/clamp fallbacks were removed on purpose: they were the regression that made Rename Task with AI silently return the description's opening words"
     );
-  });
-
-  void it("returns undefined for empty or heading-only text", () => {
-    assert.strictEqual(deriveNameFromDescription("# Only a heading\n\n## Another\n"), undefined);
   });
 });
 

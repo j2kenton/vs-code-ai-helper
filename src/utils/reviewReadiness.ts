@@ -19,6 +19,26 @@
 
 import { TaskStage } from "../types/taskProgress";
 
+/**
+ * Stages from which a review can be run, mapped to the review stage it
+ * produces. Moved here (from reviewActions.ts, its original home) so both
+ * the command layer (reviewActions.ts) and the tree view (taskTreeProvider.ts)
+ * can translate a `taskOperations` entry's stage — which may still be a
+ * pre-review stage (`plan`, `impl`, `publish`) when a rerun was launched
+ * before the task advanced onto its review stage — into the review stage it
+ * targets, without introducing a views -> commands dependency. See
+ * `isReviewActivelyRerunningV1` (reviewActions.ts) and its tree-side use.
+ */
+export const REVIEW_TARGETS: Partial<Record<TaskStage, TaskStage>> = {
+  plan: "plan-high-review",
+  "plan-high-review": "plan-high-review",
+  "plan-low-review": "plan-low-review",
+  impl: "impl-high-review",
+  "impl-high-review": "impl-high-review",
+  "impl-low-review": "impl-low-review",
+  publish: "publish",
+};
+
 export interface ReadinessResult {
   score: number | null;
   /** Formatted label e.g. "9/10" or "—/10" */
@@ -447,12 +467,70 @@ export const REVIEWED_COMMIT_STAGES: ReadonlySet<TaskStage> = new Set([
 const STALE_REVIEW_PLACEHOLDER_PREFIX_V1 = "# Review Stale";
 
 /**
- * The one banner line {@link upsertStaleReviewBanner} manages. Kept exact so
- * the upsert can find — and refresh or remove — a banner it (or an earlier
- * run) previously wrote, which is what makes the transform idempotent.
+ * The placeholder heading reviewActions.ts's rewrite/revert lifecycle writes
+ * over a `# Review Stale` placeholder while a rerun of that same review stage
+ * is genuinely in flight (`isReviewActivelyRerunningV1`). A recognized
+ * placeholder VARIANT, not a fresh review: it carries no Readiness line
+ * either, so `isUnusableAsExistingReview`/`parseReadiness` already treat it
+ * the same way they treat the stale placeholder, with no extra handling
+ * needed. Exported so reviewActions.ts's rewrite/revert helper and its
+ * `backupReviewUnlessStale` guard share this one literal instead of each
+ * re-declaring it.
  */
-const STALE_REVIEW_BANNER_RE_V1 =
+export const IN_PROGRESS_REVIEW_PLACEHOLDER_PREFIX_V1 = "# Review in progress";
+
+/**
+ * The one banner line {@link upsertStaleReviewBanner} manages, PLUS its
+ * transient in-progress counterpart (`markReviewInProgressBannerV1` below)
+ * that reviewActions.ts's rewrite/revert lifecycle swaps in — line-only,
+ * preserving the rest of the review body — while a rerun of the SAME review
+ * stage is genuinely in flight. Matching both forms in one regex is what
+ * lets `upsertStaleReviewBanner` find and heal (or remove) a leftover
+ * in-progress banner from an interrupted run using its existing bannerIndex
+ * lookup, with no separate code path.
+ */
+const STALE_REVIEW_BANNER_TEXT_RE_V1 =
   /^> ⚠ Stale: this review examined ([0-9a-f]{7,40}), which is no longer HEAD\.[ \t]*\r?$/i;
+const IN_PROGRESS_REVIEW_BANNER_TEXT_V1 =
+  "> ⏳ Review in progress: re-evaluating this artifact against the current HEAD.";
+const IN_PROGRESS_REVIEW_BANNER_RE_V1 =
+  /^> ⏳ Review in progress: re-evaluating this artifact against the current HEAD\.[ \t]*\r?$/i;
+const STALE_REVIEW_BANNER_RE_V1 = new RegExp(
+  `(?:${STALE_REVIEW_BANNER_TEXT_RE_V1.source})|(?:${IN_PROGRESS_REVIEW_BANNER_RE_V1.source})`,
+  "i"
+);
+
+/**
+ * Line-only transform: if `content` (a real review artifact, NOT the
+ * `# Review Stale` placeholder — callers gate that separately) carries the
+ * persisted commit-drift stale banner, replace just that line with the
+ * in-progress form; otherwise return `content` unchanged (byte-identical
+ * string, so callers can cheaply detect a no-op the same way
+ * {@link upsertStaleReviewBanner} does). Never touches the review body, so
+ * the artifact survives for reconciliation and backup while a rerun is live.
+ *
+ * Deliberately does NOT add an in-progress banner to a review that has no
+ * stale banner at all — only a review already flagged commit-stale gets the
+ * transient marker; a current review being re-reviewed by choice (not
+ * staleness) needs no banner at all.
+ */
+export function markReviewInProgressBannerV1(content: string): string {
+  if (content.trimStart().startsWith(STALE_REVIEW_PLACEHOLDER_PREFIX_V1)) {
+    return content;
+  }
+  const lines = content.split("\n");
+  const bannerIndex = lines.findIndex((line) => STALE_REVIEW_BANNER_TEXT_RE_V1.test(line));
+  if (bannerIndex === -1) {
+    return content;
+  }
+  const existing = lines[bannerIndex]!;
+  const eol = existing.endsWith("\r") ? "\r" : "";
+  if (existing === IN_PROGRESS_REVIEW_BANNER_TEXT_V1 + eol) {
+    return content;
+  }
+  lines[bannerIndex] = IN_PROGRESS_REVIEW_BANNER_TEXT_V1 + eol;
+  return lines.join("\n");
+}
 
 /**
  * The visible counterpart of the trailing `<!-- reviewed-commit: SHA -->`
