@@ -291,8 +291,14 @@ export class TaskNode extends vscode.TreeItem {
 
     // Only task-level operations (commit/push, Complete and Move On, Release)
     // spin the task row. Stage-scoped operations already spin their own stage
-    // row, so spinning here as well would be redundant and would hide the
-    // task's stage/step description behind the operation label.
+    // row, so spinning here as well would be redundant.
+    //
+    // Plain task rows carry no description: the status is already conveyed by
+    // the icon (play = active, pause = paused, archive = archived, tick =
+    // completed) and the current stage is visible by expanding the task, so
+    // the "Status · Stage" subtext was dropped. The operation branches keep
+    // their label — that is transient in-flight information the icon alone
+    // (spinner vs. waiting) cannot fully explain.
     const tKey = taskKey(task.canonicalId ?? task.folderUri.fsPath);
     const taskLevelOp = taskOperations
       .getTaskOperations(tKey)
@@ -316,33 +322,29 @@ export class TaskNode extends vscode.TreeItem {
         "comment-unresolved",
         new vscode.ThemeColor("charts.yellow")
       );
-      this.description = `${taskLevelOp.label} · waiting for you · ${STAGE_DISPLAY_NAMES[currentStage]}`;
+      this.description = `${taskLevelOp.label} · waiting for you`;
     } else if (taskLevelOp) {
       this.iconPath = new vscode.ThemeIcon(
         "loading~spin",
         new vscode.ThemeColor("charts.blue")
       );
-      this.description = `${taskLevelOp.label}… · ${STAGE_DISPLAY_NAMES[currentStage]}`;
+      this.description = `${taskLevelOp.label}…`;
     } else if (isPaused) {
-      this.description = `Paused · ${STAGE_DISPLAY_NAMES[currentStage]}`;
       this.iconPath = new vscode.ThemeIcon(
         "debug-pause",
         new vscode.ThemeColor("charts.orange")
       );
     } else if (task.progress.status === "archived") {
-      this.description = "Archived";
       this.iconPath = new vscode.ThemeIcon(
         "archive",
         new vscode.ThemeColor("disabledForeground")
       );
     } else if (task.progress.status === "completed") {
-      this.description = "Completed";
       this.iconPath = new vscode.ThemeIcon(
         "pass-filled",
         new vscode.ThemeColor("charts.green")
       );
     } else {
-      this.description = STAGE_DISPLAY_NAMES[currentStage];
       this.iconPath = new vscode.ThemeIcon(
         "play-circle",
         new vscode.ThemeColor("charts.blue")
