@@ -620,3 +620,126 @@ export function decideReviewRoute(input: {
   };
 }
 
+/**
+ * Which edit action can actually act on what the newest review left behind.
+ *
+ * `decideReviewRoute` above answers "keep iterating, or stop?". It does NOT
+ * answer "iterate with WHAT", and that gap is a real stall shape: the two edit
+ * actions read different inputs, and only one of them can see a blocker.
+ *
+ *  - Implementation (`run-implementation.md`) is rendered with
+ *    `{ contextPack, plan }` — the plan checklist and nothing else. The review
+ *    is not among its template variables, so a blocker is invisible to it.
+ *  - Apply Review (`apply-impl-review-code.md`) is rendered with the review
+ *    itself and is told to "fix every unresolved or partially resolved blocker
+ *    the review identifies".
+ *
+ * So an `iterate` route answered by another Implementation round can loop
+ * forever whenever the standing blockers are defects in code that was already
+ * built rather than unbuilt checklist steps: the reviewer keeps reporting
+ * them, Implementation keeps never being shown them, and the checklist it CAN
+ * see has nothing actionable left — which is also how those rounds end up
+ * returning an empty plan and settling `completed`.
+ *
+ * Observed 2026-08-19: an impl-low review held the same three blockers across
+ * ~10 rounds and ~15 hours at a flat 5/10. Two of the three (a mutation
+ * atomicity defect and a counter contradicting its own regression test) had no
+ * corresponding checklist item, because neither was an unbuilt plan step. No
+ * amount of further Implementation rounds could have closed them.
+ *
+ * Blockers therefore take precedence over unticked checklist items: standing
+ * fixable work that iteration is structurally blind to is strictly more urgent
+ * than plan steps it can see, and the plan's remaining items are still there
+ * on the round after the blockers clear.
+ */
+export type PostReviewActionV1 = "apply-review" | "implementation" | "none";
+
+export interface PostReviewActionDecisionV1 {
+  readonly action: PostReviewActionV1;
+  readonly reason: string;
+  /**
+   * The stage of the review round this decision was made from, so a caller
+   * dispatching "apply-review" applies the round that actually carries the
+   * blockers rather than guessing between the two impl review artifacts.
+   * Absent when no review has run yet.
+   */
+  readonly reviewStage?: TaskStage;
+}
+
+/**
+ * The review stages an implementation round answers to. Both are consulted
+ * together — see `decidePostReviewActionV1`'s `stages`.
+ */
+export const IMPL_REVIEW_STAGES_V1: readonly TaskStage[] = [
+  "impl-low-review",
+  "impl-high-review",
+];
+
+export function decidePostReviewActionV1(input: {
+  history: readonly ReviewScoreHistoryEntry[] | undefined;
+  /**
+   * The review stages the next edit round answers to. The implementation
+   * stage answers to BOTH `impl-low-review` and `impl-high-review`, and the
+   * newest round of either is the only one describing the current tree — so
+   * the decision is made from the latest entry across all of them, never from
+   * whichever stage happens to be listed first. Reading one stage's entry
+   * while the other holds the fresher round is its own observed bug: a Fast
+   * Forward run stopped on a stale `impl-high-review` 9/10 while the current
+   * `impl-low-review` round stood at 5/10 with three blockers.
+   */
+  stages: readonly TaskStage[];
+  /** Whether the plan of record still has unticked checklist items. */
+  hasUntickedChecklistItems: boolean;
+}): PostReviewActionDecisionV1 {
+  const candidates = input.stages
+    .map((stage) => latestReviewForStageV1(input.history, stage))
+    .filter((entry): entry is ReviewScoreHistoryEntry => entry !== undefined);
+  // `at` is an ISO-8601 UTC timestamp, so lexicographic order is chronological.
+  // Ties (same millisecond) keep the later-listed stage, which is harmless:
+  // both entries describe the same tree.
+  const latest = candidates.reduce<ReviewScoreHistoryEntry | undefined>(
+    (best, entry) => (best === undefined || entry.at >= best.at ? entry : best),
+    undefined
+  );
+  const stageName = latest ? STAGE_DISPLAY_NAMES[latest.stage] : "implementation";
+  // No review for these stages yet — the checklist is the only signal there
+  // is, and Implementation is the action that reads it.
+  if (!latest) {
+    return input.hasUntickedChecklistItems
+      ? {
+          action: "implementation",
+          reason: `No ${stageName} review has run yet; the plan checklist still has unticked items.`,
+        }
+      : {
+          action: "none",
+          reason: `No ${stageName} review has run yet and the plan checklist is complete.`,
+        };
+  }
+  if (latest.taskFixableCount > 0) {
+    return {
+      action: "apply-review",
+      reviewStage: latest.stage,
+      // Plain language on purpose: this string is shown to the user in a
+      // dialog they have to act on, and "task-fixable blockers are not
+      // rendered into the implementation prompt" is a sentence that describes
+      // the mechanism perfectly and tells nobody what to click.
+      reason:
+        `The ${stageName} review found ${latest.taskFixableCount} problem(s) in the code that ` +
+        "still need fixing. Implementation works only from the plan checklist, so it cannot fix " +
+        "them — Apply Review can.",
+    };
+  }
+  if (input.hasUntickedChecklistItems) {
+    return {
+      action: "implementation",
+      reviewStage: latest.stage,
+      reason: `The newest ${stageName} review reports no task-fixable blockers; unticked checklist items remain.`,
+    };
+  }
+  return {
+    action: "none",
+    reviewStage: latest.stage,
+    reason: `The newest ${stageName} review reports no task-fixable blockers and the plan checklist is complete.`,
+  };
+}
+

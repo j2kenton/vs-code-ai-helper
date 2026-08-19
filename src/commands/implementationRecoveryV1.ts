@@ -444,7 +444,8 @@ export async function beginImplementationRecoveryV1(
     void scheduleAutomationChain(
       {
         command: "vs-code-ai-helper.runImplementationWithAI",
-        arg: { taskFolderPath: folderUri.fsPath },
+        // No human on this path — see ReviewCommandArg.automationDispatch.
+        arg: { taskFolderPath: folderUri.fsPath, automationDispatch: true },
         taskKey: folderUri.fsPath,
         chainId: IMPL_CONTINUATION_CHAIN_ID_V1,
       },

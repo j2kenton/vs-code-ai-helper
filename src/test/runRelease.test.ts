@@ -342,11 +342,24 @@ void describe("automatic implementation dispatch gate", () => {
       const dispatched = dispatches[0];
       assert.ok(dispatched);
       const { stillEnabled, ...dispatchShape } = dispatched as AutomationDispatch;
-      assert.deepEqual(dispatchShape, {
-        command: "vs-code-ai-helper.runImplementationWithAI",
-        arg: { taskFolderPath: "/workspace/.ensemble/task" },
-        taskKey: "/workspace/.ensemble/task",
-      });
+      assert.deepEqual(
+        dispatchShape,
+        {
+          command: "vs-code-ai-helper.runImplementationWithAI",
+          // `automationDispatch` marks an invocation with no human attached.
+          // runImplementationWithAI's pre-run routing check awaits a
+          // showWarningMessage, and a VS Code notification carrying buttons
+          // never auto-dismisses — unanswered, that promise never settles,
+          // and it is awaited inside a tracked operation holding the task's
+          // chain guard. Without this marker an auto-implement chain hangs
+          // forever instead of running the round. The unit harness stubs
+          // showWarningMessage to resolve immediately, so this assertion is
+          // the only thing standing between that bug and a live host.
+          arg: { taskFolderPath: "/workspace/.ensemble/task", automationDispatch: true },
+          taskKey: "/workspace/.ensemble/task",
+        },
+        "automatic implementation must be marked as an automation dispatch"
+      );
       assert.equal(
         typeof stillEnabled,
         "function",

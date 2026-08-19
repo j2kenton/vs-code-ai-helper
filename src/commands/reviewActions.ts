@@ -210,8 +210,10 @@ import { improveReviewScore } from "../utils/reviewScoreLoop";
 import { countCommitsSinceSha, resolveHeadCommitSha } from "../utils/gitRepoInfo";
 import {
   blockerIdentities,
+  decidePostReviewActionV1,
   decideReviewRoute,
   degenerateReviewRejectionReason,
+  IMPL_REVIEW_STAGES_V1,
   detectBlockerSetStall,
   detectPlateau,
   latestQualifyingReviewMeetsThresholdV1,
@@ -222,6 +224,8 @@ import {
   shouldTripNoProgressBreaker,
   STALE_REVIEW_RECONCILIATION_COMMIT_THRESHOLD,
 } from "../utils/reviewRouting";
+import { buildStandingBlockersNoticeV1 } from "../prompts/standingBlockersNoticeV1";
+import { goToReviewAndApplyV1 } from "./goToReviewAndApplyV1";
 import { escalateReviewToHuman } from "../utils/reviewEscalation";
 import {
   getAutoAdvanceMode,
@@ -342,7 +346,8 @@ export function scheduleAutomaticImplementationAfterReview(
   void scheduleAutomationChain(
     {
       command: "vs-code-ai-helper.runImplementationWithAI",
-      arg: { taskFolderPath },
+      // No human on this path — see ReviewCommandArg.automationDispatch.
+      arg: { taskFolderPath, automationDispatch: true },
       taskKey: taskFolderPath,
       // Re-checked at fire time: the review that scheduled this can run for
       // minutes, and the user may disable auto-implement in the meantime.
@@ -452,8 +457,35 @@ type ReviewCommandArg =
        * set by UI surfaces.
        */
       followUpReviewMode?: "auto-fast-forward";
+      /**
+       * Set ONLY by automation-chain dispatches (`scheduleAutomationChain`),
+       * never by a UI surface — same contract as `followUpReviewMode` above.
+       *
+       * Marks an invocation with no human attached to answer a question.
+       * `runImplementationWithAI`'s pre-run routing check awaits a
+       * `showWarningMessage`, and a VS Code notification carrying buttons does
+       * not auto-dismiss: unanswered, that promise never settles, and it is
+       * awaited inside a tracked operation holding the task's chain guard. An
+       * automation chain that hit it would hang forever rather than run the
+       * round. The unit suite cannot catch this — the harness stubs
+       * `showWarningMessage` to resolve immediately — so the marker is the
+       * guard.
+       */
+      automationDispatch?: true;
     }
   | undefined;
+
+/**
+ * Whether this invocation came from an automation chain rather than a person.
+ * Only the exact literal marker counts; any UI-supplied arg yields false.
+ */
+function isAutomationDispatchV1(arg: ReviewCommandArg): boolean {
+  return (
+    arg !== undefined &&
+    "automationDispatch" in arg &&
+    (arg as { automationDispatch?: unknown }).automationDispatch === true
+  );
+}
 
 /**
  * Extract the chained follow-up-review request from a ReviewCommandArg, if
@@ -1043,6 +1075,53 @@ function artifactUri(
 ): vscode.Uri | undefined {
   const name = STAGE_ARTIFACT_FILENAMES[stage];
   return name ? vscode.Uri.joinPath(taskFolderUri, name) : undefined;
+}
+
+/**
+ * The blockers reported by the newest implementation review of EITHER kind,
+ * for the standing-blockers notice appended to an Implementation prompt (see
+ * `buildStandingBlockersNoticeV1`).
+ *
+ * The stage is chosen from `reviewScoreHistory` rather than from file mtimes,
+ * so this and `decidePostReviewActionV1` always agree about which review is
+ * current — a notice naming one stage's blockers while the routing acted on
+ * the other's would be worse than no notice at all.
+ *
+ * Returns undefined when there is no impl review on record, when its artifact
+ * is missing, or when it carries no machine-readable `blockers:` block —
+ * every one of which means "nothing reliable to tell the round", not "there
+ * are no blockers". Advisory throughout: a failure here must never block an
+ * Implementation round from running.
+ */
+async function readStandingImplBlockersV1(
+  taskFolderUri: vscode.Uri
+): Promise<{ stage: TaskStage; blockers: readonly ReviewBlocker[] } | undefined> {
+  try {
+    const history =
+      (await readTaskProgressAdvisoryV1(taskFolderUri))?.reviewScoreHistory ?? [];
+    const latest = IMPL_REVIEW_STAGES_V1.map((stage) =>
+      history.filter((entry) => entry.stage === stage).at(-1)
+    )
+      .filter((entry): entry is ReviewScoreHistoryEntry => entry !== undefined)
+      .reduce<ReviewScoreHistoryEntry | undefined>(
+        (best, entry) => (best === undefined || entry.at >= best.at ? entry : best),
+        undefined
+      );
+    if (!latest) {
+      return undefined;
+    }
+    const uri = artifactUri(taskFolderUri, latest.stage);
+    const content = uri ? await readTextIfExists(uri) : undefined;
+    if (content === undefined) {
+      return undefined;
+    }
+    const evidence = parseReviewBlockersDetailed(content);
+    return evidence.blockers.length > 0
+      ? { stage: latest.stage, blockers: evidence.blockers }
+      : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -4430,11 +4509,63 @@ export async function fastForwardReviewWithAI(
     // Without this stop, "no blockers found, ready to proceed" rounds whose
     // number failed to move +0.1 burned the remaining attempts (observed:
     // 37 zero-blocker rounds across one task, none of which stopped it).
-    NotificationRouter.showInformation(
-      `Fast Forward Review: stopped after ${outcome.attempts} attempt(s) — two consecutive reviews ` +
-        `reported zero task-fixable blockers (last score ${outcome.score}/10). Nothing fixable remains ` +
-        "for further automated iteration."
-    );
+    // The observation is stage-scoped, so the conclusion must be too. An
+    // implementation task has TWO review stages, and a clean run on one says
+    // nothing about the other: observed 2026-08-19, this stopped announcing
+    // "nothing fixable remains" from an `impl-high-review` 9/10 while the
+    // task's own `impl-low-review` stood at 5/10 with three task-fixable
+    // blockers — which read to the user as the task being finished, when the
+    // sibling stage had unresolved work and a matching Apply Review action
+    // waiting for it.
+    const siblingImplStage: TaskStage | undefined =
+      targetStage === "impl-low-review"
+        ? "impl-high-review"
+        : targetStage === "impl-high-review"
+          ? "impl-low-review"
+          : undefined;
+    // Read fresh rather than trusting `resolved.progress`: that snapshot
+    // predates every round this Fast Forward run just completed.
+    const siblingRead = siblingImplStage
+      ? await readTaskProgressStrictV1(resolved.folderUri, {
+          expectedTaskFolder: path.basename(resolved.folderUri.fsPath),
+        })
+      : undefined;
+    const siblingBlockers =
+      siblingRead?.ok === true
+        ? (siblingRead.decoded.progress.reviewScoreHistory ?? [])
+            .filter((entry) => entry.stage === siblingImplStage)
+            .at(-1)?.taskFixableCount ?? 0
+        : 0;
+    const stageName = STAGE_DISPLAY_NAMES[targetStage];
+    if (siblingImplStage && siblingBlockers > 0) {
+      NotificationRouter.showWarning(
+        `Fast Forward Review: stopped after ${outcome.attempts} attempt(s) — two consecutive ` +
+          `${stageName} reviews found nothing left to fix (last score ${outcome.score}/10). ` +
+          `The task is NOT finished, though: the ${STAGE_DISPLAY_NAMES[siblingImplStage]} review ` +
+          `still lists ${siblingBlockers} problem(s). Use Apply Review to fix those.`,
+        undefined,
+        undefined,
+        undefined,
+        {
+          // The task is at the stage Fast Forward targeted, so the SIBLING
+          // stage's apply command is out of stage — move first.
+          command: "vs-code-ai-helper.goToReviewAndApply",
+          title: "Go to Review & Apply",
+          args: [
+            {
+              taskFolderPath: resolved.folderUri.fsPath,
+              reviewStage: siblingImplStage,
+            },
+          ],
+        }
+      );
+    } else {
+      NotificationRouter.showInformation(
+        `Fast Forward Review: stopped after ${outcome.attempts} attempt(s) — two consecutive ` +
+          `${stageName} reviews reported zero task-fixable blockers (last score ${outcome.score}/10). ` +
+          `Nothing fixable remains in ${stageName} for further automated iteration.`
+      );
+    }
   } else if (outcome.paused) {
     // The escalation that paused the task already showed its own
     // notification (and chat question) with the actual reason — this just
@@ -5071,7 +5202,8 @@ export async function nextStage(
       // separate checklist command anymore.
       await scheduleAutomationChain({
         command: "vs-code-ai-helper.runImplementationWithAI",
-        arg: target,
+        // No human on this path — see ReviewCommandArg.automationDispatch.
+        arg: { ...target, automationDispatch: true },
         taskKey,
         stillEnabled: () => completeAndMoveOnTriggersAI(),
       });
@@ -6293,11 +6425,57 @@ async function executeImplementationRun(
           }
         );
       }
-      NotificationRouter.showInformation(
-        "Implementation finished with no file changes — the model reported the current state already " +
-          "satisfies the plan. Routing to review instead of recording a failure " +
-          "(ensemble.resilience.nothingToFixRoutesToReview)."
-      );
+      // A sterile round is only evidence that "the current state satisfies the
+      // plan" when there is no standing blocker. When the newest impl review
+      // DOES still report task-fixable work, this round changed nothing
+      // because Implementation is rendered with the plan checklist and not
+      // with the review — it never saw the blockers, and its checklist had
+      // nothing actionable left. Announcing that as a clean "already
+      // satisfies the plan" is what let this loop silently: the round settles
+      // completed, routes to review, the review reports the same blockers,
+      // and the next round is answered by the same blind action.
+      //
+      // Neither existing safety valve catches this shape. The
+      // `checklistProgressUnreliable` latch and the no-progress breaker both
+      // require the latest review to MEET the auto-advance threshold — a
+      // 5/10 review carrying blockers qualifies for neither — so the stall
+      // runs until the churn ceiling fires on the review side, rounds later.
+      const sterileRoundDecision = decidePostReviewActionV1({
+        history: priorProgress?.reviewScoreHistory,
+        stages: IMPL_REVIEW_STAGES_V1,
+        hasUntickedChecklistItems: (remainingChecklistProgress?.remaining ?? 0) > 0,
+      });
+      if (sterileRoundDecision.action === "apply-review") {
+        NotificationRouter.showWarning(
+          `Implementation changed no files. ${sterileRoundDecision.reason} ` +
+            "Running Implementation again will give the same result.",
+          undefined,
+          undefined,
+          undefined,
+          {
+            // Moves to the review stage first — this round just ran at
+            // `impl`, where every apply command refuses. See
+            // goToReviewAndApplyV1.
+            command: "vs-code-ai-helper.goToReviewAndApply",
+            title: "Go to Review & Apply",
+            args: [
+              {
+                taskFolderPath: folderUri.fsPath,
+                reviewStage:
+                  sterileRoundDecision.reviewStage === "impl-high-review"
+                    ? "impl-high-review"
+                    : "impl-low-review",
+              },
+            ],
+          }
+        );
+      } else {
+        NotificationRouter.showInformation(
+          "Implementation finished with no file changes — the model reported the current state already " +
+            "satisfies the plan. Routing to review instead of recording a failure " +
+            "(ensemble.resilience.nothingToFixRoutesToReview)."
+        );
+      }
       // 2c: N consecutive zero-change rounds is a loop producing no edits at
       // all — stop and escalate rather than running to
       // fastForwardMaxIterations. The counter itself (not the blocker
@@ -7217,16 +7395,86 @@ export async function runImplementationWithAI(
       return;
     }
 
+    // The routing check on the path users actually take. The tree view's
+    // Implementation button invokes THIS command directly — only the
+    // Ctrl+Shift+Alt+I shortcut goes through applyCurrentStageAction — so a
+    // check that lived only there would never fire for most runs.
+    //
+    // Asked, not auto-substituted: the user explicitly chose Implementation
+    // here, unlike the generic stage action, and silently running a different
+    // command on an explicit request is its own kind of opaque. Non-modal so
+    // it cannot block an unattended chain; defaulting to proceeding keeps
+    // every existing automated caller behaving exactly as before.
+    const preRunDecision = decidePostReviewActionV1({
+      history: resolved.progress.reviewScoreHistory,
+      stages: IMPL_REVIEW_STAGES_V1,
+      hasUntickedChecklistItems:
+        ((await readPlanOfRecordV1(resolved.folderUri)).counts?.remaining ?? 0) > 0,
+    });
+    // Never ask a question nobody is there to answer. An automation chain
+    // proceeds straight to the round: the standing-blockers notice appended
+    // to its prompt below still puts the blockers in front of the model, and
+    // the zero-file-change warning after the round still offers the user the
+    // Apply Review button — so the chain loses the prompt, not the routing.
+    if (preRunDecision.action === "apply-review" && !isAutomationDispatchV1(arg)) {
+      // One sentence of what is wrong, one of what to do. Explaining the
+      // mechanism accurately while leaving the user with no idea which button
+      // to press is the same "big red button" problem this routing exists to
+      // remove, just moved into the message.
+      //
+      // The button moves the stage FIRST. Apply Review is a review-stage
+      // action: `applyLowLevelReviewChanges` refuses unless the task is at a
+      // *-low-review stage, and `applyReviewEditWithAI` resolves against
+      // IMPL_REVIEW_STAGES, which excludes `impl`. Dispatching it straight
+      // from here therefore did nothing but warn "Task is not at a Low-Level
+      // Review stage" — offering an action that could not run, from the one
+      // stage it could not run at. `kind: "jump"` matches a manual stage
+      // change and deliberately does not auto-trigger a fresh review.
+      const targetReviewStage: TaskStage =
+        preRunDecision.reviewStage === "impl-high-review"
+          ? "impl-high-review"
+          : "impl-low-review";
+      const choice = await vscode.window.showWarningMessage(
+        `${preRunDecision.reason} Running Implementation now will most likely change nothing.`,
+        { modal: false },
+        "Go to Review & Apply",
+        "Run Implementation Anyway"
+      );
+      if (choice === "Go to Review & Apply") {
+        await goToReviewAndApplyV1({
+          taskFolderPath: resolved.folderUri.fsPath,
+          reviewStage: targetReviewStage,
+        });
+        return;
+      }
+    }
+
     const contextPackContent = await generateContextPack(
       resolved.folderUri,
       workspaceRoot.uri
     );
 
-    const basePrompt = await renderPromptTemplate(
+    const templatePrompt = await renderPromptTemplate(
       extensionUri,
       "run-implementation.md",
       { contextPack: contextPackContent, plan: planFinalContent }
     );
+
+    // The hedge behind decidePostReviewActionV1's routing (see
+    // standingBlockersNoticeV1). `run-implementation.md` is rendered with the
+    // plan and NOT the review, so a round that reaches here with blockers
+    // outstanding — a directly-invoked command, a chain predating the routing,
+    // a recovery continuation — would otherwise spend itself on a checklist
+    // with nothing actionable left and report "nothing to do", while the
+    // reviewer keeps reporting the same defects. Reads the newest impl review
+    // artifact of either kind, matching the routing's own stage selection.
+    const standingBlockers = await readStandingImplBlockersV1(resolved.folderUri);
+    const basePrompt = standingBlockers
+      ? buildStandingBlockersNoticeV1(templatePrompt, {
+          blockers: standingBlockers.blockers,
+          reviewStageName: STAGE_DISPLAY_NAMES[standingBlockers.stage],
+        })
+      : templatePrompt;
 
     // Continuation of a failed/unreported round: a prior round changed the
     // quarantined files but ended without a usable report (deferred, cut

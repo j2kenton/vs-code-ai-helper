@@ -228,7 +228,8 @@ export class TaskActionScheduler implements vscode.Disposable {
       // sweep and any in-flight in-process chain from double-firing.
       void scheduleAutomationChain({
         command: "vs-code-ai-helper.runImplementationWithAI",
-        arg: { taskFolderPath: task.taskFolderPath },
+        // No human on this path — see ReviewCommandArg.automationDispatch.
+        arg: { taskFolderPath: task.taskFolderPath, automationDispatch: true },
         taskKey: task.taskFolderPath,
         chainId: IMPL_CONTINUATION_CHAIN_ID_V1,
       });

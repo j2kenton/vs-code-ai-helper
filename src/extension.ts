@@ -32,6 +32,7 @@ import {
   resumeEditPreflightInteractionV1,
 } from "./commands/runEditActionV1";
 import { registerApplyCurrentStageActionCommand } from "./commands/applyCurrentStageAction";
+import { registerGoToReviewAndApplyCommandV1 } from "./commands/goToReviewAndApplyV1";
 import { registerOpenAndStartNewTaskCommand } from "./commands/openAndStartNewTask";
 import { registerReviewCurrentTaskCommand } from "./commands/reviewCurrentTask";
 import { registerFastForwardCurrentTaskReviewCommand } from "./commands/fastForwardCurrentTaskReview";
@@ -571,6 +572,7 @@ export function activate(context: vscode.ExtensionContext): void {
   registerViewArtifactCommands(context);
   registerDraftTaskWithAICommand(context, inventory, chatViewProvider);
   registerApplyCurrentStageActionCommand(context, inventory, currentTaskStore);
+  registerGoToReviewAndApplyCommandV1(context);
   registerOpenAndStartNewTaskCommand(context, inventory, currentTaskStore);
   registerReviewCurrentTaskCommand(context, inventory, currentTaskStore);
   registerFastForwardCurrentTaskReviewCommand(context, inventory, currentTaskStore);

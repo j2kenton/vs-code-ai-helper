@@ -32,7 +32,30 @@ export interface PreflightToolSessionPreambleInputV1 {
   readonly rootBindingId: string;
   /** SHA-256 over the exact prompt bytes; echoed verbatim by the plan (§7.3). */
   readonly requestDigest: string;
+  /**
+   * What this round is FOR. Every preflight row shared one preamble, and that
+   * preamble described the job as "work the plan checklist until it is
+   * complete" — correct for an implementation round, actively wrong for a
+   * review-fix round, whose work is the blockers the review lists and which
+   * commonly has no checklist item at all (a defect in already-built code is
+   * not an unbuilt plan step).
+   *
+   * Observed 2026-08-19 in the jester task: Apply Review rounds read the
+   * workspace at length and then returned `operations: []`, round after round,
+   * while the low-level review held the same three task-fixable blockers. The
+   * framing at the top of the prompt told the model its job was a checklist
+   * that was 69/73 done with nothing actionable left, and explicitly offered
+   * an empty plan as a valid answer — so an empty plan is what it produced,
+   * with the blockers sitting unread further down the same prompt.
+   *
+   * Defaults to "checklist" so any caller not yet passing one keeps the exact
+   * prior text.
+   */
+  readonly purpose?: PreflightRoundPurposeV1;
 }
+
+/** See `PreflightToolSessionPreambleInputV1.purpose`. */
+export type PreflightRoundPurposeV1 = "checklist" | "review-fixes" | "lint-fixes";
 
 /**
  * Build the preamble prepended to the preflight row's prompt.
@@ -42,20 +65,47 @@ export interface PreflightToolSessionPreambleInputV1 {
  * validated input as opaque. A preamble missing any one of them leaves the
  * model unable to produce a valid plan at all.
  */
-export function buildPreflightToolSessionPreambleV1(
-  input: PreflightToolSessionPreambleInputV1
-): string {
+/**
+ * The "what is this round for" section. Shared shape, different work:
+ * partial progress is normal in all three, but what counts as progress — and
+ * what makes an empty plan honest rather than a wasted round — differs.
+ */
+function purposeSectionV1(purpose: PreflightRoundPurposeV1): string[] {
+  if (purpose === "review-fixes") {
+    return [
+      "### Your job this round: fix what the review found",
+      "",
+      "A review of this code is included below. The blockers it lists ARE this",
+      "round's work. Fix as many as you can.",
+      "",
+      "Most of them are defects in code that already exists, so do NOT expect to",
+      "find them as unticked items on the plan checklist — a checklist that looks",
+      "complete is not evidence that there is nothing to do. The review is the",
+      "authority on what is wrong here, not the checklist.",
+      "",
+      "**Do not return an empty plan while blockers remain.** An empty",
+      "`operations` array is only honest if you have OPENED the code each blocker",
+      "names and confirmed it is already fixed. If you believe a blocker is wrong",
+      "or already resolved, say so in the plan's reasoning — but do not answer",
+      "\"nothing to change\" without having read the relevant file. A round that",
+      "plans nothing while the review still reports problems is a wasted round:",
+      "the next review reports exactly the same blockers, and nothing moves.",
+      "",
+      "You do not have to fix every blocker in one plan. Fixing some and leaving",
+      "the rest for the next round is normal and expected. Fixing none is not.",
+    ];
+  }
+  if (purpose === "lint-fixes") {
+    return [
+      "### Your job this round: fix the reported lint failures",
+      "",
+      "The failures reported below are this round's work. An empty `operations`",
+      "array is only correct if you have read the files they name and confirmed",
+      "they are already clean.",
+    ];
+  }
   return [
-    "## How this request works (read-only planning phase)",
-    "",
-    "This is phase one of two. You CANNOT modify anything in this phase, and no",
-    "tool offered to you writes. Do not treat that as a failure or report a missing",
-    "capability: producing the plan IS the deliverable. You describe the changes,",
-    "and the host validates and applies them in a sealed second phase.",
-    "",
-    "Answer with a `preflight-plan.v1` result listing the operations you want",
-    "performed. An empty `operations` array is a valid answer when nothing needs to",
-    "change.",
+    "An empty `operations` array is a valid answer when nothing needs to change.",
     "",
     "### You do not have to finish the whole task in one plan",
     "",
@@ -74,6 +124,24 @@ export function buildPreflightToolSessionPreambleV1(
     "the whole job will not fit wastes the round entirely: nothing is implemented,",
     "the review sees no progress, and the next round faces exactly the same task. A",
     "small slice that lands beats a perfect plan that does not.",
+  ];
+}
+
+export function buildPreflightToolSessionPreambleV1(
+  input: PreflightToolSessionPreambleInputV1
+): string {
+  return [
+    "## How this request works (read-only planning phase)",
+    "",
+    "This is phase one of two. You CANNOT modify anything in this phase, and no",
+    "tool offered to you writes. Do not treat that as a failure or report a missing",
+    "capability: producing the plan IS the deliverable. You describe the changes,",
+    "and the host validates and applies them in a sealed second phase.",
+    "",
+    "Answer with a `preflight-plan.v1` result listing the operations you want",
+    "performed.",
+    "",
+    ...purposeSectionV1(input.purpose ?? "checklist"),
     "",
     "### Session identifiers",
     "",

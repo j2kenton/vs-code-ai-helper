@@ -7,6 +7,12 @@ import { ensureStageModelConfigured } from "../utils/modelSelection";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { assertLegacyAiRouteAllowedV0 } from "../services/legacyAiActionSafetyGateV0";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
+import {
+  decidePostReviewActionV1,
+  IMPL_REVIEW_STAGES_V1,
+} from "../utils/reviewRouting";
+import { readPlanOfRecordV1 } from "../utils/implementationArtifactResolver";
+import { goToReviewAndApplyV1 } from "./goToReviewAndApplyV1";
 
 type ApplyArg = { canonicalId?: string; taskFolderPath?: string };
 
@@ -88,6 +94,40 @@ export async function applyCurrentStageAction(
   }
 
   if (stage === "impl") {
+    // Implementation is rendered with the plan checklist and NOT with the
+    // review, so it is structurally blind to a standing blocker. Running it
+    // while the newest impl review still reports task-fixable work is the
+    // stall this routing exists to prevent: the reviewer keeps reporting the
+    // same defects, every round is answered by the one action that cannot see
+    // them, and the checklist it CAN see has nothing actionable left. See
+    // decidePostReviewActionV1 for the observed case.
+    const decision = decidePostReviewActionV1({
+      history: resolvedTask.progress.reviewScoreHistory,
+      stages: IMPL_REVIEW_STAGES_V1,
+      hasUntickedChecklistItems:
+        ((
+          await readPlanOfRecordV1(vscode.Uri.file(resolvedTask.taskFolderPath))
+        ).counts?.remaining ?? 0) > 0,
+    });
+    if (decision.action === "apply-review") {
+      // Say WHY the button did something other than the stage's usual action.
+      // A silent substitution is the same opaque "big red button" problem in
+      // the other direction.
+      NotificationRouter.showInformation(
+        `Running Apply Review instead of Implementation. ${decision.reason}`
+      );
+      // Moves to the review stage first: the task is at `impl` here, which is
+      // precisely why this branch was reached, and every apply command
+      // refuses out of stage. See goToReviewAndApplyV1.
+      await goToReviewAndApplyV1({
+        taskFolderPath: resolvedTask.taskFolderPath,
+        reviewStage:
+          decision.reviewStage === "impl-high-review"
+            ? "impl-high-review"
+            : "impl-low-review",
+      });
+      return;
+    }
     await execute("vs-code-ai-helper.runImplementationWithAI");
     return;
   }

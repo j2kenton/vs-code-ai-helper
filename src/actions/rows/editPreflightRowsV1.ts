@@ -27,7 +27,10 @@ import { maxResponseBytesCeilingForModeV1 } from "../../types/agentExecutionV1";
 import { CompletedContentV1 } from "../../types/aiResultEnvelope";
 import { validatePreflightPlanAgainstLedgerV1 } from "../../types/preflightPlanV1";
 import { getEditPlanBrokerV1 } from "../../services/workflowRuntimeServicesV1";
-import { buildPreflightToolSessionPreambleV1 } from "../../prompts/toolSessionPreambleV1";
+import {
+  buildPreflightToolSessionPreambleV1,
+  PreflightRoundPurposeV1,
+} from "../../prompts/toolSessionPreambleV1";
 
 export const IMPLEMENTATION_ACTION_KEY_V1 = "implementation.v1";
 export const FAST_FORWARD_ACTION_KEY_V1 = "fastForward.v1";
@@ -142,6 +145,12 @@ interface EditPreflightRowConfigV1 {
   readonly loggingChannel: string;
   /** The registry-declared stages this edit action may run at (§3.2). */
   readonly stages: readonly string[];
+  /**
+   * What the round is for, so the preamble states the right job. Sharing one
+   * checklist-framed preamble across every row told Apply Review rounds their
+   * work was the plan checklist — see PreflightToolSessionPreambleInputV1.purpose.
+   */
+  readonly purpose: PreflightRoundPurposeV1;
 }
 
 function createEditPreflightRowV1(config: EditPreflightRowConfigV1): ProviderTaskActionRowV1 {
@@ -176,6 +185,7 @@ function createEditPreflightRowV1(config: EditPreflightRowConfigV1): ProviderTas
           rootId: input.rootId,
           rootBindingId: input.rootBindingId,
           requestDigest: input.requestDigest,
+          purpose: config.purpose,
         }) +
         "\n\n" +
         input.prompt
@@ -188,6 +198,7 @@ function createEditPreflightRowV1(config: EditPreflightRowConfigV1): ProviderTas
 export function createImplementationPreflightRowV1(): ProviderTaskActionRowV1 {
   return createEditPreflightRowV1({
     actionKey: IMPLEMENTATION_ACTION_KEY_V1,
+    purpose: "checklist",
     routes: ["vs-code-ai-helper.runImplementationWithAI"],
     progressLabel: "Planning implementation edits…",
     loggingChannel: "action.implementation",
@@ -200,6 +211,7 @@ export function createImplementationPreflightRowV1(): ProviderTaskActionRowV1 {
 export function createFastForwardPreflightRowV1(): ProviderTaskActionRowV1 {
   return createEditPreflightRowV1({
     actionKey: FAST_FORWARD_ACTION_KEY_V1,
+    purpose: "review-fixes",
     routes: [
       "vs-code-ai-helper.fastForwardReviewWithAI",
       "vs-code-ai-helper.fastForwardCurrentTaskReview",
@@ -216,6 +228,7 @@ export function createFastForwardPreflightRowV1(): ProviderTaskActionRowV1 {
 export function createApplyReviewEditPreflightRowV1(): ProviderTaskActionRowV1 {
   return createEditPreflightRowV1({
     actionKey: APPLY_REVIEW_EDIT_ACTION_KEY_V1,
+    purpose: "review-fixes",
     // The user-facing apply-review command routes belong to the TEXT
     // applyReview.v1 row (route ids are globally unique); the edit-capable
     // branch is dispatched internally by reviewActions.ts.
@@ -229,6 +242,7 @@ export function createApplyReviewEditPreflightRowV1(): ProviderTaskActionRowV1 {
 export function createLintPreflightRowV1(): ProviderTaskActionRowV1 {
   return createEditPreflightRowV1({
     actionKey: LINT_ACTION_KEY_V1,
+    purpose: "lint-fixes",
     routes: ["vs-code-ai-helper.runLintingFixes"],
     progressLabel: "Planning lint fixes…",
     loggingChannel: "action.lint",

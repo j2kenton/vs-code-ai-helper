@@ -2,7 +2,9 @@ import * as assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
   blockerIdentity,
+  decidePostReviewActionV1,
   decideReviewRoute,
+  IMPL_REVIEW_STAGES_V1,
   degenerateReviewRejectionReason,
   detectBlockerSetStall,
   detectPlateau,
@@ -897,5 +899,130 @@ void describe("rubricCapLikelyBlockedAdvance", () => {
 
   void it("does not flag an unparseable score", () => {
     assert.strictEqual(rubricCapLikelyBlockedAdvance(null, 9), false);
+  });
+});
+
+/**
+ * The routing that keeps an Implementation round from answering a blocker it
+ * is structurally unable to see. Implementation is rendered with the plan
+ * checklist only; Apply Review is rendered with the review. Choosing the
+ * former while blockers stand is the stall these cases pin.
+ */
+void describe("decidePostReviewActionV1", () => {
+  void it("routes to apply-review while task-fixable blockers stand, even with a complete checklist", () => {
+    const decision = decidePostReviewActionV1({
+      history: [entry(5, { stage: "impl-low-review", taskFixableCount: 3, blockerCount: 3 })],
+      stages: IMPL_REVIEW_STAGES_V1,
+      hasUntickedChecklistItems: false,
+    });
+    assert.strictEqual(decision.action, "apply-review");
+    assert.strictEqual(decision.reviewStage, "impl-low-review");
+  });
+
+  void it("routes to apply-review even when the checklist ALSO has unticked items", () => {
+    // Blockers take precedence: they are work iteration cannot see, and the
+    // checklist items are still there on the round after they clear.
+    const decision = decidePostReviewActionV1({
+      history: [entry(5, { stage: "impl-low-review", taskFixableCount: 1, blockerCount: 1 })],
+      stages: IMPL_REVIEW_STAGES_V1,
+      hasUntickedChecklistItems: true,
+    });
+    assert.strictEqual(decision.action, "apply-review");
+  });
+
+  void it("routes to implementation when nothing is task-fixable but the checklist is unfinished", () => {
+    const decision = decidePostReviewActionV1({
+      history: [entry(9, { stage: "impl-low-review", taskFixableCount: 0, blockerCount: 0 })],
+      stages: IMPL_REVIEW_STAGES_V1,
+      hasUntickedChecklistItems: true,
+    });
+    assert.strictEqual(decision.action, "implementation");
+  });
+
+  void it("routes to none when nothing is task-fixable and the checklist is complete", () => {
+    const decision = decidePostReviewActionV1({
+      history: [entry(10, { stage: "impl-low-review", taskFixableCount: 0, blockerCount: 0 })],
+      stages: IMPL_REVIEW_STAGES_V1,
+      hasUntickedChecklistItems: false,
+    });
+    assert.strictEqual(decision.action, "none");
+  });
+
+  void it("decides from the NEWEST impl review, not whichever stage is listed first", () => {
+    // The observed stale-stage bug: a clean impl-high-review round sat in
+    // history while the fresher impl-low-review carried three blockers, and
+    // reading the wrong one announced the task as finished.
+    const decision = decidePostReviewActionV1({
+      history: [
+        entry(9, {
+          stage: "impl-high-review",
+          taskFixableCount: 0,
+          blockerCount: 0,
+          at: "2026-08-19T02:21:00.000Z",
+        }),
+        entry(5, {
+          stage: "impl-low-review",
+          taskFixableCount: 3,
+          blockerCount: 3,
+          at: "2026-08-19T09:47:00.000Z",
+        }),
+      ],
+      stages: IMPL_REVIEW_STAGES_V1,
+      hasUntickedChecklistItems: false,
+    });
+    assert.strictEqual(decision.action, "apply-review");
+    assert.strictEqual(decision.reviewStage, "impl-low-review");
+  });
+
+  void it("prefers the newest round regardless of which stage carries the blockers", () => {
+    const decision = decidePostReviewActionV1({
+      history: [
+        entry(5, {
+          stage: "impl-low-review",
+          taskFixableCount: 3,
+          blockerCount: 3,
+          at: "2026-08-19T02:21:00.000Z",
+        }),
+        entry(9, {
+          stage: "impl-high-review",
+          taskFixableCount: 0,
+          blockerCount: 0,
+          at: "2026-08-19T09:47:00.000Z",
+        }),
+      ],
+      stages: IMPL_REVIEW_STAGES_V1,
+      hasUntickedChecklistItems: true,
+    });
+    assert.strictEqual(decision.action, "implementation");
+    assert.strictEqual(decision.reviewStage, "impl-high-review");
+  });
+
+  void it("falls back to the checklist when no review has run yet", () => {
+    assert.strictEqual(
+      decidePostReviewActionV1({
+        history: [],
+        stages: IMPL_REVIEW_STAGES_V1,
+        hasUntickedChecklistItems: true,
+      }).action,
+      "implementation"
+    );
+    assert.strictEqual(
+      decidePostReviewActionV1({
+        history: undefined,
+        stages: IMPL_REVIEW_STAGES_V1,
+        hasUntickedChecklistItems: false,
+      }).action,
+      "none"
+    );
+  });
+
+  void it("ignores review rounds from stages it was not asked about", () => {
+    const decision = decidePostReviewActionV1({
+      history: [entry(4, { stage: "plan-low-review", taskFixableCount: 5, blockerCount: 5 })],
+      stages: IMPL_REVIEW_STAGES_V1,
+      hasUntickedChecklistItems: true,
+    });
+    assert.strictEqual(decision.action, "implementation");
+    assert.strictEqual(decision.reviewStage, undefined);
   });
 });
