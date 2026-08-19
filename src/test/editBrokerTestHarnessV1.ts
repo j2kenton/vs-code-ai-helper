@@ -195,7 +195,7 @@ export async function installEditBrokerHarnessV1(): Promise<EditBrokerHarnessV1>
       rootId: WORKSPACE_ROOT_ID,
       relativePath: "src/existing.ts",
       targetObservationId: existingFile.observationId,
-      parentChain: [{ kind: "observed", observationId: srcListing.observationId }],
+      parentChain: [],
       contentBase64: replacementBytes.toString("base64"),
       decodedByteLength: replacementBytes.length,
       contentSha256: sha256Hex(replacementBytes),
@@ -206,7 +206,7 @@ export async function installEditBrokerHarnessV1(): Promise<EditBrokerHarnessV1>
       rootId: WORKSPACE_ROOT_ID,
       relativePath: "src/old.ts",
       targetObservationId: oldFile.observationId,
-      parentChain: [{ kind: "observed", observationId: srcListing.observationId }],
+      parentChain: [],
     },
     {
       stepId: "s6",

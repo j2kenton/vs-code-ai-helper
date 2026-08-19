@@ -216,7 +216,6 @@ void describe("editPreflightContractV1 — patchFile", () => {
     const ledger = createObservationLedgerV1();
     const file = mintFile(ledger, "src/old.ts");
     mintDirectory(ledger, "src", ["old.ts"]);
-    const srcDir = ledger.records().find((r) => r.relativePath === "src" && r.kind === "directory")!;
 
     const result = validatePreflightPlanAgainstLedgerV1(
       plan([
@@ -225,7 +224,7 @@ void describe("editPreflightContractV1 — patchFile", () => {
           kind: "patchFile",
           relativePath: "src/old.ts",
           targetObservationId: file,
-          parentChain: [{ kind: "observed", observationId: srcDir.observationId }],
+          parentChain: [],
           findBase64: "aGk=",
           replacementBase64: "Ynll",
         }),
@@ -243,7 +242,6 @@ void describe("editPreflightContractV1 — patchFile", () => {
     const ledger = createObservationLedgerV1();
     const missing = mintMissing(ledger, "src/new.ts");
     mintDirectory(ledger, "src", []);
-    const srcDir = ledger.records().find((r) => r.relativePath === "src" && r.kind === "directory")!;
 
     const result = validatePreflightPlanAgainstLedgerV1(
       plan([
@@ -252,7 +250,7 @@ void describe("editPreflightContractV1 — patchFile", () => {
           kind: "patchFile",
           relativePath: "src/new.ts",
           targetObservationId: missing,
-          parentChain: [{ kind: "observed", observationId: srcDir.observationId }],
+          parentChain: [],
           findBase64: "aGk=",
           replacementBase64: "Ynll",
         }),
@@ -322,7 +320,7 @@ void describe("editPreflightContractV1 — plan-vs-ledger validation", () => {
           kind: "replaceFile",
           relativePath: "src/old.ts",
           targetObservationId: file,
-          parentChain: [{ kind: "observed", observationId: srcDir.observationId }],
+          parentChain: [],
           contentBase64: "aGk=",
           decodedByteLength: 2,
           contentSha256: "34".repeat(32),

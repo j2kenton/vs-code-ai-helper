@@ -733,10 +733,20 @@ function decodePreflightOperation(
   if (typeof raw.targetObservationId !== "string" || raw.targetObservationId.length === 0) {
     return `operation ${stepId} is missing "targetObservationId"`;
   }
-  const parentChain = decodeParentChain(raw.parentChain, stepId);
-  if (typeof parentChain === "string") {
-    return parentChain;
+  const decodedParentChain = decodeParentChain(raw.parentChain, stepId);
+  if (typeof decodedParentChain === "string") {
+    return decodedParentChain;
   }
+  // A parent chain only means anything for a CREATE, where the parent may be
+  // missing or produced by an earlier step. For every other kind the target
+  // observation already proves the ancestors exist, so a supplied chain is
+  // redundant — and NOT harmless: the broker re-verifies every link it is
+  // given at execution time, so a stale or unknown one would sink an
+  // already-sealed plan. Normalized away here so the plan that is validated,
+  // sealed and executed all agree, and so a model that habitually includes a
+  // chain does not lose a whole round to it.
+  const parentChain =
+    kind === "createFile" || kind === "createDirectory" ? decodedParentChain : [];
 
   const isWrite = kind === "createFile" || kind === "replaceFile";
   if (kind === "patchFile") {

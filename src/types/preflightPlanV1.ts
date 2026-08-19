@@ -236,6 +236,21 @@ export function validatePreflightPlanAgainstLedgerV1(
     // Deliberately NOT relaxed for creates: there the chain is load-bearing.
     const requiresParentChain =
       operation.kind === "createFile" || operation.kind === "createDirectory";
+    // Not merely "ignored": an ignored link still reaches the broker, which
+    // re-verifies EVERY link at execution time regardless of kind
+    // (editBrokerToolSessionHandlerV1, §7.7 (4)). A link this layer skipped
+    // would therefore pass preflight, get sealed, and then block execution as
+    // `stalePreflight` — a validated plan failing after the point of no
+    // return, which is strictly worse than rejecting it here. The decoder
+    // normalizes wire input to an empty chain for these kinds, so reaching
+    // this branch means an operation was constructed by some other path.
+    if (!requiresParentChain && operation.parentChain.length > 0) {
+      return failure(
+        "parentChainMismatch",
+        `${where} is a ${operation.kind} and must carry an empty parentChain — ` +
+          "its target observation already proves every ancestor exists"
+      );
+    }
     const ancestors = requiresParentChain ? ancestorPathsOf(operation.relativePath) : [];
     if (requiresParentChain && operation.parentChain.length !== ancestors.length) {
       return failure(

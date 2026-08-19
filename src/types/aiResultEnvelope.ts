@@ -764,10 +764,20 @@ function decodePreflightOperation(
   if (typeof raw.targetObservationId !== "string" || raw.targetObservationId.length === 0) {
     return `operation ${stepId} is missing "targetObservationId"`;
   }
-  const parentChain = decodeParentChain(raw.parentChain, stepId);
-  if (typeof parentChain === "string") {
-    return parentChain;
+  const decodedParentChain = decodeParentChain(raw.parentChain, stepId);
+  if (typeof decodedParentChain === "string") {
+    return decodedParentChain;
   }
+  // A parent chain only means anything for a CREATE, where the parent may be
+  // missing or produced by an earlier step. For every other kind the target
+  // observation already proves the ancestors exist, so a supplied chain is
+  // redundant — and NOT harmless: the broker re-verifies every link it is
+  // given at execution time, so a stale or unknown one would sink an
+  // already-sealed plan. Normalized away here so the plan that is validated,
+  // sealed and executed all agree, and so a model that habitually includes a
+  // chain does not lose a whole round to it.
+  const parentChain =
+    kind === "createFile" || kind === "createDirectory" ? decodedParentChain : [];
 
   const isWrite = kind === "createFile" || kind === "replaceFile";
   const isPatch = kind === "patchFile";
@@ -1287,15 +1297,28 @@ export function containsResultFrameV1(response: string): boolean {
   }
 
   // Unterminated: the parser accepts a complete payload whose closing marker
-  // never arrived, but only in the strict shape it defines — one line break
-  // after the start marker, then a single line, then nothing.
+  // never arrived, but only in the strict shape it defines. The checks below
+  // mirror `parseUnterminatedFrameV1` step for step, INCLUDING their order —
+  // an oversize payload is reported there as `resultLimitExceeded` (a frame
+  // was seen) while a payload that fails strict JSON is `invalidFrame` (none
+  // was), so checking size after JSON would disagree on a payload that is both.
   const afterStart = body.slice(FRAME_START_V1.length);
   const eol = afterStart.startsWith("\r\n") ? "\r\n" : afterStart.startsWith("\n") ? "\n" : undefined;
   if (eol === undefined) {
     return false;
   }
   const payload = afterStart.slice(eol.length);
-  return payload.length > 0 && !payload.includes("\n") && !payload.includes("\r");
+  if (payload.length === 0 || payload.includes("\n") || payload.includes("\r")) {
+    return false;
+  }
+  if (utf8ByteLength(payload) > MAX_PREFLIGHT_BYTES_V1) {
+    return true;
+  }
+  // The same strict parser the unterminated path itself uses. Omitting it let
+  // `FRAME_START_V1 + "\n{not json}"` read as a frame here while the parser
+  // called it `invalidFrame` — so the tool session skipped its nudge and
+  // forwarded a response that could only fail (2026-08-19 review).
+  return parseStrictJsonV1(payload).ok;
 }
 
 /**

@@ -10,6 +10,9 @@ import {
   setLegacyFrameEndObserverV1,
 } from "../types/aiResultEnvelope";
 
+import { ActionCorrelationV1 } from "../types/actionCorrelationV1";
+import { DEFAULT_TEXT_ANSWER_MAX_LENGTH_V1 } from "../types/structuredQuestionV1";
+
 void describe("containsResultFrameV1 — parity with the parser", () => {
   // The tool session decides whether to nudge a reply BEFORE the authoritative
   // decode. If that precheck uses different rules than the parser, it either
@@ -46,6 +49,16 @@ void describe("containsResultFrameV1 — parity with the parser", () => {
     // The parser rejects this: the body must END with the terminator, so
     // narration after it is not a frame.
     { name: "terminated then narration", raw: `${FRAME_START_V1}\n${envelope}\n${FRAME_END_V1}\n\nNow I will explain.` },
+    // Unterminated AND not valid JSON: the parser reports `invalidFrame`
+    // (never `invalidJson` — see parseUnterminatedFrameV1), so this is NOT a
+    // frame and must still be nudged. Missing this case is what let a
+    // JSON-blind precheck forward a doomed response (2026-08-19 review).
+    { name: "unterminated, payload is not JSON", raw: `${FRAME_START_V1}\n{not json}` },
+    { name: "unterminated, payload is a bare word", raw: `${FRAME_START_V1}\nthinking...` },
+    { name: "unterminated, empty payload line", raw: `${FRAME_START_V1}\n` },
+    // Valid JSON but not an envelope: still a FRAME, so no nudge — the parser
+    // rejects it downstream with an accurate reason rather than silently.
+    { name: "unterminated, JSON that is not an envelope", raw: `${FRAME_START_V1}\n{"a":1}` },
     { name: "narration quoting both markers", raw: `I will emit ${FRAME_START_V1} then ${FRAME_END_V1} shortly.` },
     { name: "no markers at all", raw: "I verified both tests. Now I will write the frame." },
     { name: "start marker only, no payload", raw: FRAME_START_V1 },
@@ -64,8 +77,6 @@ void describe("containsResultFrameV1 — parity with the parser", () => {
     });
   }
 });
-import { ActionCorrelationV1 } from "../types/actionCorrelationV1";
-import { DEFAULT_TEXT_ANSWER_MAX_LENGTH_V1 } from "../types/structuredQuestionV1";
 
 const HEX_A = "a".repeat(32);
 const HEX_B = "b".repeat(32);
@@ -321,7 +332,7 @@ void describe("parseAiResultEnvelopeV1 — preflight-plan.v1 and edit-execution.
             rootId: "root-1",
             relativePath: "src/a.ts",
             targetObservationId: "obs-file",
-            parentChain: [{ kind: "observed", observationId: "obs-src" }],
+            parentChain: [],
             findText,
             replacementText,
           },

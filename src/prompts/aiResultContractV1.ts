@@ -75,7 +75,12 @@ const CONTENT_TYPE_SHAPE_HINTS_V1: Readonly<Record<CompletedContentTypeNameV1, s
     '"operations":[{"stepId":"step-1","kind":"patchFile",' +
     '"rootId":"<rootId from the preamble>","relativePath":"src/example.ts",' +
     '"targetObservationId":"<observationId returned when you read that path>",' +
-    '"parentChain":[{"kind":"observed","observationId":"<observationId for src>"}],' +
+    // Empty, and that is the point: `patchFile` targets a file that already
+    // exists, whose observation proves every ancestor exists too. A chain is
+    // required only for createFile/createDirectory. An earlier revision showed
+    // an observed parent here, which contradicted the preamble and would have
+    // kept models making exactly the redundant stat calls this removed.
+    '"parentChain":[],' +
     '"findText":"<the exact existing text to replace, copied verbatim>",' +
     '"replacementText":"<the new text>"}]}',
   "edit-execution.v1":
