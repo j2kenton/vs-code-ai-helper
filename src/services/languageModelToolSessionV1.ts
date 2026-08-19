@@ -55,7 +55,34 @@ export interface CopilotLmToolSessionOptionsV1 {
    * MAX_TOOL_SESSION_RESULT_BYTES_V1.
    */
   readonly maxResultBytes?: number;
+  /**
+   * Per-round wall-clock deadline override for tests; production uses
+   * MAX_TOOL_ROUND_WALL_CLOCK_MS_V1.
+   */
+  readonly roundTimeoutMs?: number;
 }
+
+/**
+ * Wall-clock deadline for a single tool-session round (workflow-6 Item 18).
+ *
+ * The LM API offers no timeout of its own: a `sendRequest` that is accepted
+ * and never answered leaves the round awaiting forever. There is no error, no
+ * log line, and no state transition — the Chat transaction simply stays at
+ * `invocationPending` holding the task's chain guard, indistinguishable in the
+ * UI from a round that is working. Observed twice on 2026-08-19 (22 and 30+
+ * minutes, both `applyReviewEdit.v1`), roughly one round in three, each ending
+ * only because the user gave up and cancelled.
+ *
+ * Six minutes is deliberately loose: the slowest healthy round observed on a
+ * large workload (a 107 KB context pack over a 20-file tree) completed in about
+ * four. The point is not to police slow rounds — it is to convert an unbounded
+ * silent wait into a reported, retryable failure so an unattended Fast Forward
+ * loop keeps going instead of parking for hours.
+ *
+ * This does NOT diagnose the underlying cause; see Item 18's fix 2 for the
+ * pre-request boundary marker that would.
+ */
+export const MAX_TOOL_ROUND_WALL_CLOCK_MS_V1 = 6 * 60_000;
 
 /**
  * Cumulative cap on tool-result bytes fed back into one session.
@@ -127,6 +154,7 @@ export function createCopilotLmToolSessionTransportV1(
   const vscodeModule = vscode as unknown as VscodeLmModuleV1;
   const maxRounds = options.maxRounds ?? MAX_TOOL_ROUNDS_V1;
   const maxResultBytes = options.maxResultBytes ?? MAX_TOOL_SESSION_RESULT_BYTES_V1;
+  const roundTimeoutMs = options.roundTimeoutMs ?? MAX_TOOL_ROUND_WALL_CLOCK_MS_V1;
 
   return {
     runnerId: COPILOT_LM_RUNNER_ID,
@@ -185,11 +213,52 @@ export function createCopilotLmToolSessionTransportV1(
         let roundResultBytes = 0;
         let sawToolCall = false;
 
+        // Wall-clock deadline for THIS round (workflow-6 Item 18). Without
+        // it a round that never answers waits forever: the Chat transaction
+        // sits at `invocationPending` with one transition and no log, the
+        // task's chain guard is held, and the only exit is a human noticing
+        // and cancelling. Observed twice on 2026-08-19 (22 and 30+ minutes,
+        // both `applyReviewEdit.v1`) — roughly one round in three.
+        //
+        // Per-round rather than per-session on purpose: the failure is a
+        // single request that never returns, and a session cap generous
+        // enough for many legitimate tool rounds would be far too loose to
+        // catch it. A healthy round on this workload completes in ~4 minutes.
+        //
+        // Cancelling a token the request is already listening to (rather than
+        // racing promises) means the in-flight request and its stream are
+        // actually abandoned — a `Promise.race` would leave the `for await`
+        // below running against a response nobody reads.
+        const roundCts = new vscode.CancellationTokenSource();
+        const callerCancelSub = request.cancellationToken.onCancellationRequested(() =>
+          roundCts.cancel()
+        );
+        let roundTimedOut = false;
+        const roundTimer = setTimeout(() => {
+          roundTimedOut = true;
+          roundCts.cancel();
+        }, roundTimeoutMs);
+        const timedOutExit = (): AgentTransportExitV1 => {
+          recordLmToolSessionRoundV1({
+            round: round + 1,
+            maxRounds,
+            toolNames: roundToolNames,
+            roundResultBytes,
+            totalResultBytes,
+          });
+          return {
+            kind: "transportFailure",
+            code: "copilotRequestTimedOut",
+            detail:
+              `round ${round + 1} produced no response within ${Math.round(roundTimeoutMs / 1000)}s ` +
+              "and was abandoned",
+          };
+        };
         try {
           const response = await resolved.model.sendRequest(
             messages,
             requestOptions,
-            request.cancellationToken
+            roundCts.token
           );
           for await (const { part, raw } of iterateLmResponsePartsV1(vscodeModule, response)) {
             assistantRawParts.push(raw);
@@ -241,6 +310,13 @@ export function createCopilotLmToolSessionTransportV1(
             }
           }
         } catch (error) {
+          // Order matters: the deadline cancels `roundCts`, so the throw here
+          // looks exactly like a cancellation. Check the timeout FIRST, or a
+          // timed-out round is misreported as the user cancelling — the same
+          // silent-misdiagnosis this item exists to remove.
+          if (roundTimedOut) {
+            return timedOutExit();
+          }
           if (request.cancellationToken.isCancellationRequested) {
             return { kind: "callerCancelled" };
           }
@@ -255,6 +331,16 @@ export function createCopilotLmToolSessionTransportV1(
             code: "copilotRequestFailed",
             ...(detail !== undefined ? { detail } : {}),
           };
+        } finally {
+          clearTimeout(roundTimer);
+          callerCancelSub.dispose();
+          roundCts.dispose();
+        }
+        // A stream that ENDS on cancellation rather than throwing would fall
+        // through the try with a truncated round and no error, so the
+        // deadline has to be re-checked outside the catch as well.
+        if (roundTimedOut) {
+          return timedOutExit();
         }
 
         // Report AFTER the round settles so the record is complete, and

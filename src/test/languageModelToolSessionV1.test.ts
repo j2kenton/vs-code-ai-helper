@@ -249,6 +249,70 @@ void describe("languageModelToolSessionV1", () => {
     }
   });
 
+  void it("abandons a round whose request never answers, instead of waiting forever", async () => {
+    // Workflow-6 Item 18. The LM API has no timeout of its own: a request that
+    // is accepted and never answered left the round awaiting indefinitely, the
+    // Chat transaction pinned at `invocationPending`, and the task's chain
+    // guard held — with no error, no log and no state transition. Observed
+    // twice on 2026-08-19 (22 and 30+ minutes), each ending only because a
+    // human gave up and cancelled.
+    //
+    // The stub never resolves and never yields, which is exactly that shape.
+    // Without the deadline this test hangs the suite rather than failing —
+    // which is itself the point.
+    const lm = (vscode as unknown as { lm: { selectChatModels: unknown } }).lm;
+    const original = lm.selectChatModels;
+    let cancelledByHost = false;
+    lm.selectChatModels = () =>
+      Promise.resolve([
+        {
+          id: "gpt-test",
+          name: "GPT Test",
+          vendor: "copilot",
+          family: "gpt",
+          sendRequest: (
+            _messages: readonly unknown[],
+            _options: unknown,
+            token: vscode.CancellationToken
+          ) =>
+            new Promise((_resolve, reject) => {
+              // Honour the token the transport hands us, as the real API does.
+              token.onCancellationRequested(() => {
+                cancelledByHost = true;
+                reject(new Error("Canceled"));
+              });
+            }),
+        },
+      ]);
+    try {
+      const transport = createCopilotLmToolSessionTransportV1({
+        // Named explicitly: an undefined id resolves only a model called
+        // "auto", which this stub is not.
+        model: "gpt-test",
+        toolHandler: recordingHandler(() => "{}"),
+        roundTimeoutMs: 40,
+      });
+      const exit = await transport.invoke(makeRequest(), makeWriter());
+      assert.equal(exit.kind, "transportFailure");
+      assert.equal(
+        exit.kind === "transportFailure" ? exit.code : undefined,
+        "copilotRequestTimedOut",
+        "a timed-out round must not be reported as copilotRequestFailed or callerCancelled"
+      );
+      assert.match(
+        exit.kind === "transportFailure" ? (exit.detail ?? "") : "",
+        /round 1 produced no response within/,
+        "the detail must name the round and the deadline"
+      );
+      assert.ok(
+        cancelledByHost,
+        "the in-flight request must actually be cancelled, not just abandoned by a race"
+      );
+    } finally {
+      lm.selectChatModels = original;
+    }
+  });
+
   void it("fails closed with copilotNoModelsAvailable when no Copilot models exist", async () => {
     const transport = createCopilotLmToolSessionTransportV1({
       model: undefined,
