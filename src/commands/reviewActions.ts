@@ -4540,8 +4540,8 @@ export async function fastForwardReviewWithAI(
     if (siblingImplStage && siblingBlockers > 0) {
       NotificationRouter.showWarning(
         `Fast Forward Review: stopped after ${outcome.attempts} attempt(s) — two consecutive ` +
-          `${stageName} reviews found nothing left to fix (last score ${outcome.score}/10). ` +
-          `The task is NOT finished, though: the ${STAGE_DISPLAY_NAMES[siblingImplStage]} review ` +
+          `${stageName} rounds found nothing left to fix (last score ${outcome.score}/10). ` +
+          `The task is NOT finished, though: the ${STAGE_DISPLAY_NAMES[siblingImplStage]} ` +
           `still lists ${siblingBlockers} problem(s). Use Apply Review to fix those.`,
         undefined,
         undefined,
@@ -4562,7 +4562,7 @@ export async function fastForwardReviewWithAI(
     } else {
       NotificationRouter.showInformation(
         `Fast Forward Review: stopped after ${outcome.attempts} attempt(s) — two consecutive ` +
-          `${stageName} reviews reported zero task-fixable blockers (last score ${outcome.score}/10). ` +
+          `${stageName} rounds reported zero task-fixable blockers (last score ${outcome.score}/10). ` +
           `Nothing fixable remains in ${stageName} for further automated iteration.`
       );
     }

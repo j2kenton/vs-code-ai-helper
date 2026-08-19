@@ -701,18 +701,21 @@ export function decidePostReviewActionV1(input: {
     (best, entry) => (best === undefined || entry.at >= best.at ? entry : best),
     undefined
   );
-  const stageName = latest ? STAGE_DISPLAY_NAMES[latest.stage] : "implementation";
+  // STAGE_DISPLAY_NAMES already ends in "Review" for every review stage
+  // ("Low-Level Code Review"), so nothing below appends the word again — that
+  // read as "the Low-Level Code Review review found…" in a user-facing dialog.
+  const stageName = latest ? STAGE_DISPLAY_NAMES[latest.stage] : "code review";
   // No review for these stages yet — the checklist is the only signal there
   // is, and Implementation is the action that reads it.
   if (!latest) {
     return input.hasUntickedChecklistItems
       ? {
           action: "implementation",
-          reason: `No ${stageName} review has run yet; the plan checklist still has unticked items.`,
+          reason: `No ${stageName} has run yet; the plan checklist still has unticked items.`,
         }
       : {
           action: "none",
-          reason: `No ${stageName} review has run yet and the plan checklist is complete.`,
+          reason: `No ${stageName} has run yet and the plan checklist is complete.`,
         };
   }
   if (latest.taskFixableCount > 0) {
@@ -724,7 +727,7 @@ export function decidePostReviewActionV1(input: {
       // rendered into the implementation prompt" is a sentence that describes
       // the mechanism perfectly and tells nobody what to click.
       reason:
-        `The ${stageName} review found ${latest.taskFixableCount} problem(s) in the code that ` +
+        `The ${stageName} found ${latest.taskFixableCount} problem(s) in the code that ` +
         "still need fixing. Implementation works only from the plan checklist, so it cannot fix " +
         "them — Apply Review can.",
     };
@@ -733,13 +736,13 @@ export function decidePostReviewActionV1(input: {
     return {
       action: "implementation",
       reviewStage: latest.stage,
-      reason: `The newest ${stageName} review reports no task-fixable blockers; unticked checklist items remain.`,
+      reason: `The newest ${stageName} reports no task-fixable blockers; unticked checklist items remain.`,
     };
   }
   return {
     action: "none",
     reviewStage: latest.stage,
-    reason: `The newest ${stageName} review reports no task-fixable blockers and the plan checklist is complete.`,
+    reason: `The newest ${stageName} reports no task-fixable blockers and the plan checklist is complete.`,
   };
 }
 

@@ -29,7 +29,9 @@
  */
 
 import * as vscode from "vscode";
+import * as path from "path";
 import { TaskStage } from "../types/taskProgress";
+import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 
 /**
  * Set `taskFolderPath`'s stage to `reviewStage`, then invoke that stage's
@@ -47,6 +49,30 @@ export async function goToReviewAndApplyV1(input: {
       stage: input.reviewStage,
     });
   } catch {
+    return false;
+  }
+  // `setTaskStage` reports EVERY failure by notification and then returns —
+  // it does not throw (setTaskStage.ts: the cancel-running-operations failure
+  // and the transition failure both `showError`/`showWarning` then `return`).
+  // So the catch above is nearly dead code, and the only trustworthy signal
+  // that the stage moved is the persisted stage itself.
+  //
+  // This is not hypothetical. Observed 2026-08-19: a running operation would
+  // not stop, `setTaskStage` reported "Could not set stage … The running
+  // operation did not stop in time", returned normally, and this function
+  // dispatched the apply anyway — which then warned "Task is not at a
+  // Low-Level Review stage". The user saw two contradictory errors and no
+  // work, from the exact out-of-stage dispatch this function exists to
+  // prevent.
+  const verified = await readTaskProgressStrictV1(
+    vscode.Uri.file(input.taskFolderPath),
+    { expectedTaskFolder: path.basename(input.taskFolderPath) }
+  );
+  if (!verified.ok || verified.decoded.progress.currentStage !== input.reviewStage) {
+    // `setTaskStage` has already told the user why, in terms specific to the
+    // real cause; adding a second notification here would only compete with
+    // it. Returning false lets a caller that cares distinguish "did not run"
+    // from "ran".
     return false;
   }
   await vscode.commands.executeCommand(

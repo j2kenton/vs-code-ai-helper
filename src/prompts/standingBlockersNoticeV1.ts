@@ -25,8 +25,6 @@
 
 import { ReviewBlocker } from "../utils/reviewReadiness";
 
-/** Heading the notice is appended under — also the strip marker. */
-const STANDING_BLOCKERS_MARKER_V1 = "\n\n## Standing Review Blockers";
 
 /**
  * Cap on how many blockers are listed. A review that reports a very long
@@ -36,16 +34,6 @@ const STANDING_BLOCKERS_MARKER_V1 = "\n\n## Standing Review Blockers";
  * truncated list never reads as the complete picture.
  */
 export const MAX_LISTED_STANDING_BLOCKERS_V1 = 8;
-
-/**
- * Recover the base prompt this notice was appended to, mirroring
- * `stripImplementationContinuationNoticeV1`. Truncates at the LAST occurrence
- * so a base prompt that happens to quote the heading earlier is left alone.
- */
-export function stripStandingBlockersNoticeV1(prompt: string): string {
-  const markerIndex = prompt.lastIndexOf(STANDING_BLOCKERS_MARKER_V1);
-  return markerIndex === -1 ? prompt : prompt.slice(0, markerIndex);
-}
 
 /**
  * Append the standing task-fixable blockers to an Implementation prompt.
@@ -77,7 +65,7 @@ export function buildStandingBlockersNoticeV1(
       "",
       "## Standing Review Blockers",
       "",
-      `The most recent ${context.reviewStageName} review reported ` +
+      `The most recent ${context.reviewStageName} reported ` +
         `${taskFixable.length} unresolved task-fixable blocker(s) against work that is ` +
         "already built. These are defects in existing code, not unbuilt plan steps, so " +
         "several of them may have no corresponding checklist item at all.",

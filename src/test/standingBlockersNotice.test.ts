@@ -9,7 +9,6 @@ import { describe, it } from "node:test";
 import {
   buildStandingBlockersNoticeV1,
   MAX_LISTED_STANDING_BLOCKERS_V1,
-  stripStandingBlockersNoticeV1,
 } from "../prompts/standingBlockersNoticeV1";
 import { ReviewBlocker } from "../utils/reviewReadiness";
 
@@ -102,25 +101,3 @@ void describe("buildStandingBlockersNoticeV1", () => {
   });
 });
 
-void describe("stripStandingBlockersNoticeV1", () => {
-  void it("recovers the base prompt", () => {
-    const prompt = buildStandingBlockersNoticeV1(BASE, {
-      blockers: [blocker()],
-      reviewStageName: "Low-Level Implementation Review",
-    });
-    assert.strictEqual(stripStandingBlockersNoticeV1(prompt), BASE);
-  });
-
-  void it("leaves a prompt with no notice untouched", () => {
-    assert.strictEqual(stripStandingBlockersNoticeV1(BASE), BASE);
-  });
-
-  void it("strips only the last occurrence, so a quoted heading survives", () => {
-    const quoting = `${BASE}\n\n## Standing Review Blockers (quoted in the body)`;
-    const prompt = buildStandingBlockersNoticeV1(quoting, {
-      blockers: [blocker()],
-      reviewStageName: "Low-Level Implementation Review",
-    });
-    assert.strictEqual(stripStandingBlockersNoticeV1(prompt), quoting);
-  });
-});
