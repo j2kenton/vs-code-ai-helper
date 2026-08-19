@@ -32,11 +32,7 @@ import {
   MAX_TOOL_PROTOCOL_VIOLATIONS_V1,
   MAX_TOOL_ROUNDS_V1,
 } from "../types/workflowToolProtocolV1";
-import {
-  FRAME_END_V1,
-  FRAME_START_V1,
-  LEGACY_FRAME_END_V1,
-} from "../types/aiResultEnvelope";
+import { containsResultFrameV1, FRAME_START_V1 } from "../types/aiResultEnvelope";
 import { RequestLocalToolHandlerV1 } from "./requestLocalToolHandlerV1";
 import {
   VscodeLmModuleV1,
@@ -88,53 +84,6 @@ export const MAX_TOOL_SESSION_RESULT_BYTES_V1 = 8 * 1024 * 1024;
  */
 const MAX_NARRATION_NUDGES_V1 = 2;
 
-/**
- * Whether a reply carries a genuinely PARSEABLE result frame.
- *
- * Marker presence is not enough, in either direction. `includes(FRAME_START_V1)`
- * accepted narration that merely mentions the marker ("I will now emit
- * <<<ENSEMBLE_AI_RESULT_V1>>>…") — the exact narration case the nudge exists
- * to catch — and requiring both markers only widened that to prose quoting
- * both, or to a frame whose body is not valid JSON.
- *
- * So this decodes the framed body the same way the consumer will: scan from
- * the END for the last start marker (the envelope parser's own last-frame-wins
- * rule), take the text up to the terminator, and require it to be parseable
- * JSON. Anything less means the model is still talking and should be asked
- * again while a round remains.
- *
- * Structural only — this is NOT the authoritative decode. Correlation echo,
- * strict duplicate-key parsing, content-schema and byte ceilings all remain
- * `parseAiResultEnvelopeV1`'s job; a reply that passes here can still be
- * rejected there, and should be, with an accurate reason.
- */
-function carriesCompleteResultFrameV1(text: string): boolean {
-  const start = text.lastIndexOf(FRAME_START_V1);
-  if (start < 0) {
-    return false;
-  }
-  const bodyStart = start + FRAME_START_V1.length;
-  const candidates = [
-    text.indexOf(FRAME_END_V1, bodyStart),
-    text.indexOf(LEGACY_FRAME_END_V1, bodyStart),
-  ].filter((index) => index >= 0);
-  if (candidates.length === 0) {
-    return false;
-  }
-  const body = text.slice(bodyStart, Math.min(...candidates)).trim();
-  if (body.length === 0) {
-    return false;
-  }
-  try {
-    // Shape only: an object is the only thing the envelope can be. A bare
-    // string or number would parse but could never be an envelope, and
-    // accepting one would send unusable text on to be rejected downstream
-    // instead of asking the model again while it still can answer.
-    return typeof JSON.parse(body) === "object" && JSON.parse(body) !== null;
-  } catch {
-    return false;
-  }
-}
 
 /** One round's activity, reported for observability. Never affects behaviour. */
 export interface LmToolSessionRoundV1 {
@@ -339,7 +288,7 @@ export function createCopilotLmToolSessionTransportV1(
           // simply accepting the text. With no round left, accept and let the
           // envelope parser reject it with an accurate reason.
           if (
-            !carriesCompleteResultFrameV1(roundText) &&
+            !containsResultFrameV1(roundText) &&
             narrationNudges < MAX_NARRATION_NUDGES_V1 &&
             round + 1 < maxRounds
           ) {

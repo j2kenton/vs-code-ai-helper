@@ -1239,6 +1239,66 @@ function decodeEnvelopeV1(
  * kind or content processing."
  */
 /**
+ * Does this response carry a frame the parser will even attempt to decode?
+ *
+ * Exists for callers that must decide, BEFORE settling a response, whether the
+ * model produced a result frame at all — the Copilot tool session uses it to
+ * tell "still narrating" from "answered" while a round remains to ask again.
+ *
+ * Lives here, beside the parser, because the two must agree. A separate
+ * approximation in the transport disagreed in both directions (2026-08-19
+ * review): it required a terminator, so it rejected the VALID unterminated
+ * frames `parseUnterminatedFrameV1` deliberately accepts; and it searched for
+ * the terminator anywhere, so it accepted terminated JSON followed by trailing
+ * narration, which the parser rejects because the body must END with the
+ * marker. Either way the caller's decision was made on different rules than
+ * the decode that follows it.
+ *
+ * Frame-level only, by design: this answers "is there a frame here", never
+ * "is it a valid envelope". Correlation echo, strict JSON, content schema and
+ * byte ceilings all remain {@link parseAiResultEnvelopeV1}'s job, and a
+ * response accepted here can still be rejected there — which is correct, and
+ * gives the user an accurate reason instead of a nudge that hides it.
+ *
+ * Agreement with the parser is pinned by a parity test rather than by comment:
+ * for any input, this returns true exactly when the parser does NOT report
+ * `invalidFrame`.
+ */
+export function containsResultFrameV1(response: string): boolean {
+  // Same trailing-newline trim the parser applies before locating the frame.
+  let trimmed = response;
+  if (trimmed.endsWith("\r\n")) {
+    trimmed = trimmed.slice(0, -2);
+  } else if (trimmed.endsWith("\n")) {
+    trimmed = trimmed.slice(0, -1);
+  }
+
+  const frameStartIndex = trimmed.lastIndexOf(FRAME_START_V1);
+  if (frameStartIndex === -1) {
+    return false;
+  }
+  const body = trimmed.slice(frameStartIndex);
+
+  // Terminated: the body must END with a terminator, exactly as the parser
+  // requires — a terminator merely present somewhere is narration around a
+  // frame, not a frame.
+  if (body.endsWith(FRAME_END_V1) || body.endsWith(LEGACY_FRAME_END_V1)) {
+    return true;
+  }
+
+  // Unterminated: the parser accepts a complete payload whose closing marker
+  // never arrived, but only in the strict shape it defines — one line break
+  // after the start marker, then a single line, then nothing.
+  const afterStart = body.slice(FRAME_START_V1.length);
+  const eol = afterStart.startsWith("\r\n") ? "\r\n" : afterStart.startsWith("\n") ? "\n" : undefined;
+  if (eol === undefined) {
+    return false;
+  }
+  const payload = afterStart.slice(eol.length);
+  return payload.length > 0 && !payload.includes("\n") && !payload.includes("\r");
+}
+
+/**
  * Accept a frame whose payload is complete but whose `FRAME_END_V1`
  * terminator never arrived — the shape a truncated agentic response leaves
  * behind (2026-08-12 field report, item 1): the model's JSON is byte-perfect

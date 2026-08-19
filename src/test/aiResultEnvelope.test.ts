@@ -2,10 +2,68 @@ import * as assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { describe, it } from "node:test";
 import {
+  containsResultFrameV1,
+  FRAME_END_V1,
+  FRAME_START_V1,
   parseAiResultEnvelopeV1,
   setInertTrailingObserverV1,
   setLegacyFrameEndObserverV1,
 } from "../types/aiResultEnvelope";
+
+void describe("containsResultFrameV1 — parity with the parser", () => {
+  // The tool session decides whether to nudge a reply BEFORE the authoritative
+  // decode. If that precheck uses different rules than the parser, it either
+  // discards a response the parser would have accepted, or skips a nudge for
+  // one the parser will reject. Both happened (2026-08-19 review): an
+  // approximation in the transport required a terminator (rejecting the VALID
+  // unterminated frames the parser accepts) and searched for the terminator
+  // anywhere (accepting terminated JSON followed by narration, which the
+  // parser rejects).
+  //
+  // This pins the invariant directly rather than by inspection: for every
+  // input, the helper must say "frame present" exactly when the parser does
+  // NOT report `invalidFrame`.
+  const correlation: ActionCorrelationV1 = {
+    actionKey: "review.v1",
+    operationId: "a".repeat(32),
+    attemptId: "b".repeat(32),
+    taskBindingId: "c".repeat(32),
+    chatDocumentId: "d".repeat(32),
+  };
+  const envelope = JSON.stringify({
+    version: 1,
+    correlation,
+    kind: "completed",
+    content: { contentType: "chat-message.v1", schemaVersion: 1, text: "hi" },
+  });
+
+  const cases: ReadonlyArray<{ readonly name: string; readonly raw: string }> = [
+    { name: "terminated frame", raw: `${FRAME_START_V1}\n${envelope}\n${FRAME_END_V1}` },
+    { name: "terminated frame, trailing newline", raw: `${FRAME_START_V1}\n${envelope}\n${FRAME_END_V1}\n` },
+    // The parser accepts this deliberately: a truncated CLI response whose
+    // JSON is byte-perfect but whose closing marker never arrived.
+    { name: "unterminated but complete", raw: `${FRAME_START_V1}\n${envelope}` },
+    // The parser rejects this: the body must END with the terminator, so
+    // narration after it is not a frame.
+    { name: "terminated then narration", raw: `${FRAME_START_V1}\n${envelope}\n${FRAME_END_V1}\n\nNow I will explain.` },
+    { name: "narration quoting both markers", raw: `I will emit ${FRAME_START_V1} then ${FRAME_END_V1} shortly.` },
+    { name: "no markers at all", raw: "I verified both tests. Now I will write the frame." },
+    { name: "start marker only, no payload", raw: FRAME_START_V1 },
+    { name: "empty", raw: "" },
+  ];
+
+  for (const testCase of cases) {
+    void it(`agrees with the parser: ${testCase.name}`, () => {
+      const parsed = parseAiResultEnvelopeV1(testCase.raw, correlation);
+      const parserSawAFrame = !(parsed.kind === "malformed" && parsed.code === "invalidFrame");
+      assert.equal(
+        containsResultFrameV1(testCase.raw),
+        parserSawAFrame,
+        `precheck and parser disagreed on: ${testCase.name}`
+      );
+    });
+  }
+});
 import { ActionCorrelationV1 } from "../types/actionCorrelationV1";
 import { DEFAULT_TEXT_ANSWER_MAX_LENGTH_V1 } from "../types/structuredQuestionV1";
 
