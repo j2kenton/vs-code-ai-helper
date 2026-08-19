@@ -274,6 +274,18 @@ void describe("getAvailableModels", () => {
             id: "copilot-claude-opus-4.5",
             name: "claude-opus-4.5",
           } as SelectableModel as never,
+          {
+            id: "copilot-gemini-3.6-flash",
+            name: "Gemini 3.6 Flash",
+          } as SelectableModel as never,
+          {
+            id: "copilot-gemini-3.7-flash",
+            name: "Gemini 3.7 Flash",
+          } as SelectableModel as never,
+          {
+            id: "copilot-grok-4.6",
+            name: "Grok 4.6",
+          } as SelectableModel as never,
         ]);
       },
       cliCommandExists() {
@@ -485,6 +497,34 @@ void describe("getAvailableModels", () => {
         ]),
         copilotModel("copilot-claude-opus-4.6", "claude-opus-4.6"),
         copilotModel("copilot-claude-opus-4.5", "claude-opus-4.5"),
+        copilotModel("copilot-gemini-3.6-flash", "Gemini 3.6 Flash"),
+        ...copilotReasoningAndContextVariants(
+          "copilot-gemini-3.6-flash",
+          "Gemini 3.6 Flash",
+          [
+            ["low", "Low"],
+            ["medium", "Medium"],
+            ["high", "High"],
+          ],
+          true
+        ),
+        copilotModel("copilot-gemini-3.7-flash", "Gemini 3.7 Flash"),
+        ...copilotReasoningAndContextVariants(
+          "copilot-gemini-3.7-flash",
+          "Gemini 3.7 Flash",
+          [
+            ["low", "Low"],
+            ["medium", "Medium"],
+            ["high", "High"],
+          ],
+          true
+        ),
+        copilotModel("copilot-grok-4.6", "Grok 4.6"),
+        ...copilotReasoningVariants("copilot-grok-4.6", "Grok 4.6", [
+          ["low", "Low"],
+          ["medium", "Medium"],
+          ["high", "High"],
+        ]),
       ];
       assert.deepStrictEqual(
         providerModels(models, "GitHub Copilot"),
@@ -657,6 +697,21 @@ void describe("getAvailableModels", () => {
           {
             id: "antigravity-cli:default",
             name: "Antigravity (CLI default)",
+            providerLabel: "Antigravity CLI (subscription CLI)",
+          },
+          {
+            id: "antigravity-cli:Gemini 3.7 Flash (Low)",
+            name: "Gemini 3.7 Flash (Low)",
+            providerLabel: "Antigravity CLI (subscription CLI)",
+          },
+          {
+            id: "antigravity-cli:Gemini 3.7 Flash (Medium)",
+            name: "Gemini 3.7 Flash (Medium)",
+            providerLabel: "Antigravity CLI (subscription CLI)",
+          },
+          {
+            id: "antigravity-cli:Gemini 3.7 Flash (High)",
+            name: "Gemini 3.7 Flash (High)",
             providerLabel: "Antigravity CLI (subscription CLI)",
           },
           {

@@ -683,6 +683,11 @@ const COPILOT_REASONING_LEVELS = {
     { effort: "medium", label: "Medium" },
     { effort: "high", label: "High" },
   ],
+  grok: [
+    { effort: "low", label: "Low" },
+    { effort: "medium", label: "Medium" },
+    { effort: "high", label: "High" },
+  ],
   gpt53: [
     { effort: "low", label: "Low" },
     { effort: "medium", label: "Medium" },
@@ -723,8 +728,11 @@ const COPILOT_MODEL_VARIANT_RULES: Readonly<
   { slug: "claude-opus-4.7", efforts: COPILOT_REASONING_LEVELS.claude, longContext: true },
   { slug: "gemini-3.1-pro", efforts: COPILOT_REASONING_LEVELS.gemini, longContext: true },
   { slug: "gemini-3.5-flash", efforts: COPILOT_REASONING_LEVELS.gemini, longContext: true },
+  { slug: "gemini-3.6-flash", efforts: COPILOT_REASONING_LEVELS.gemini, longContext: true },
+  { slug: "gemini-3.7-flash", efforts: COPILOT_REASONING_LEVELS.gemini, longContext: true },
   { slug: "kimi-k2.7-code", efforts: [], longContext: false },
   { slug: "mai-code-1-flash", efforts: COPILOT_REASONING_LEVELS.gpt53, longContext: false },
+  { slug: "grok-4.6", efforts: COPILOT_REASONING_LEVELS.grok, longContext: false },
   { slug: "claude-opus-4.6", efforts: [], longContext: false },
   { slug: "claude-opus-4.5", efforts: [], longContext: false },
 ];
@@ -1364,7 +1372,11 @@ function createSeededOpencodeModels(): readonly DiscoveredCliModel[] {
 
 /**
  * Raw `devpass-code models --verbose` catalog snapshot (devpass-code
- * 1.17.13, captured 2026-07-30), compacted the same way as
+ * 1.17.13, captured 2026-07-30; refreshed 2026-08-19 against devpass-code
+ * 1.18.11, adding gemini-3.7-flash, grok-4-6, hy3, kimi-k3-fast,
+ * ling-3.0-flash, muse-spark-1.2, qwen3.8-max, and seed-2-1-turbo, and
+ * adding the low/medium/high variant sets the grok family gained since the
+ * first capture), compacted the same way as
  * OPENCODE_SEEDED_CATALOG_RAW above and run through the SAME
  * parseOpencodeModelsOutput parser — devpass-code is a rebrand/fork of
  * OpenCode with a byte-for-byte identical `models --verbose` shape (see
@@ -1372,7 +1384,11 @@ function createSeededOpencodeModels(): readonly DiscoveredCliModel[] {
  * `capabilities.toolcall` was true in the live capture: the full catalog
  * (204 entries) includes embedding, image-generation, transcription, and
  * reranker models with no tool-calling support at all, which this agentic
- * coding integration can never usefully drive. Regenerate by piping a
+ * coding integration can never usefully drive. Two realtime models that
+ * pass even that filter — gemini-2.5-flash-native-audio-preview-12-2025
+ * (audio in/out) and gemini-3.1-flash-live-preview (Live API session
+ * shape) — are additionally excluded: neither can be driven by this
+ * integration's headless text-in/text-out contract. Regenerate by piping a
  * fresh `devpass-code models --verbose` through the same
  * id/providerID/name/variants compaction, re-applying the toolcall filter,
  * when the catalog changes.
@@ -1432,6 +1448,8 @@ llmgateway-devpass/gemini-3.5-flash-lite
 {"id":"gemini-3.5-flash-lite","providerID":"llmgateway-devpass","name":"Gemini 3.5 Flash Lite","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
 llmgateway-devpass/gemini-3.6-flash
 {"id":"gemini-3.6-flash","providerID":"llmgateway-devpass","name":"Gemini 3.6 Flash","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/gemini-3.7-flash
+{"id":"gemini-3.7-flash","providerID":"llmgateway-devpass","name":"Gemini 3.7 Flash","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
 llmgateway-devpass/gemini-pro-latest
 {"id":"gemini-pro-latest","providerID":"llmgateway-devpass","name":"Gemini Pro Latest","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
 llmgateway-devpass/gemma-4-26b-a4b-it
@@ -1525,29 +1543,33 @@ llmgateway-devpass/gpt-realtime-2.1
 llmgateway-devpass/gpt-realtime-2.1-mini
 {"id":"gpt-realtime-2.1-mini","providerID":"llmgateway-devpass","name":"GPT Realtime 2.1 Mini","variants":{}}
 llmgateway-devpass/grok-4
-{"id":"grok-4","providerID":"llmgateway-devpass","name":"Grok 4","variants":{}}
+{"id":"grok-4","providerID":"llmgateway-devpass","name":"Grok 4","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
 llmgateway-devpass/grok-4-1-fast-non-reasoning
 {"id":"grok-4-1-fast-non-reasoning","providerID":"llmgateway-devpass","name":"Grok 4.1 Fast Non-Reasoning","variants":{}}
 llmgateway-devpass/grok-4-1-fast-reasoning
-{"id":"grok-4-1-fast-reasoning","providerID":"llmgateway-devpass","name":"Grok 4.1 Fast Reasoning","variants":{}}
+{"id":"grok-4-1-fast-reasoning","providerID":"llmgateway-devpass","name":"Grok 4.1 Fast Reasoning","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
 llmgateway-devpass/grok-4-20-beta-0309-non-reasoning
 {"id":"grok-4-20-beta-0309-non-reasoning","providerID":"llmgateway-devpass","name":"Grok 4.20 Beta Non-Reasoning (0309)","variants":{}}
 llmgateway-devpass/grok-4-20-beta-0309-reasoning
-{"id":"grok-4-20-beta-0309-reasoning","providerID":"llmgateway-devpass","name":"Grok 4.20 Beta Reasoning (0309)","variants":{}}
+{"id":"grok-4-20-beta-0309-reasoning","providerID":"llmgateway-devpass","name":"Grok 4.20 Beta Reasoning (0309)","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
 llmgateway-devpass/grok-4-20-non-reasoning
 {"id":"grok-4-20-non-reasoning","providerID":"llmgateway-devpass","name":"Grok 4.20 Non-Reasoning","variants":{}}
 llmgateway-devpass/grok-4-20-reasoning
-{"id":"grok-4-20-reasoning","providerID":"llmgateway-devpass","name":"Grok 4.20 Reasoning","variants":{}}
+{"id":"grok-4-20-reasoning","providerID":"llmgateway-devpass","name":"Grok 4.20 Reasoning","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
 llmgateway-devpass/grok-4-3
-{"id":"grok-4-3","providerID":"llmgateway-devpass","name":"Grok 4.3","variants":{}}
+{"id":"grok-4-3","providerID":"llmgateway-devpass","name":"Grok 4.3","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
 llmgateway-devpass/grok-4-5
-{"id":"grok-4-5","providerID":"llmgateway-devpass","name":"Grok 4.5","variants":{}}
+{"id":"grok-4-5","providerID":"llmgateway-devpass","name":"Grok 4.5","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/grok-4-6
+{"id":"grok-4-6","providerID":"llmgateway-devpass","name":"Grok 4.6","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
 llmgateway-devpass/grok-build-0-1
-{"id":"grok-build-0-1","providerID":"llmgateway-devpass","name":"Grok Build 0.1","variants":{}}
+{"id":"grok-build-0-1","providerID":"llmgateway-devpass","name":"Grok Build 0.1","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
 llmgateway-devpass/hermes-4-405b
 {"id":"hermes-4-405b","providerID":"llmgateway-devpass","name":"Hermes 4 405B","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
 llmgateway-devpass/hermes-4-70b
 {"id":"hermes-4-70b","providerID":"llmgateway-devpass","name":"Hermes 4 70B","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/hy3
+{"id":"hy3","providerID":"llmgateway-devpass","name":"Hy3","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
 llmgateway-devpass/kimi-k2
 {"id":"kimi-k2","providerID":"llmgateway-devpass","name":"Kimi K2","variants":{}}
 llmgateway-devpass/kimi-k2.5
@@ -1560,6 +1582,10 @@ llmgateway-devpass/kimi-k2.7-code-highspeed
 {"id":"kimi-k2.7-code-highspeed","providerID":"llmgateway-devpass","name":"Kimi K2.7 Code Highspeed","variants":{}}
 llmgateway-devpass/kimi-k3
 {"id":"kimi-k3","providerID":"llmgateway-devpass","name":"Kimi K3","variants":{}}
+llmgateway-devpass/kimi-k3-fast
+{"id":"kimi-k3-fast","providerID":"llmgateway-devpass","name":"Kimi K3 Fast","variants":{}}
+llmgateway-devpass/ling-3.0-flash
+{"id":"ling-3.0-flash","providerID":"llmgateway-devpass","name":"InclusionAI Ling 3.0 Flash","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
 llmgateway-devpass/llama-3.3-70b-instruct
 {"id":"llama-3.3-70b-instruct","providerID":"llmgateway-devpass","name":"Llama 3.3 70B Instruct","variants":{}}
 llmgateway-devpass/llama-4-maverick-17b-instruct
@@ -1588,6 +1614,8 @@ llmgateway-devpass/minimax-text-01
 {"id":"minimax-text-01","providerID":"llmgateway-devpass","name":"MiniMax Text 01","variants":{}}
 llmgateway-devpass/muse-spark-1.1
 {"id":"muse-spark-1.1","providerID":"llmgateway-devpass","name":"Muse Spark 1.1","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/muse-spark-1.2
+{"id":"muse-spark-1.2","providerID":"llmgateway-devpass","name":"Muse Spark 1.2","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
 llmgateway-devpass/nemotron-3-nano-30b
 {"id":"nemotron-3-nano-30b","providerID":"llmgateway-devpass","name":"Nemotron 3 Nano 30B","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
 llmgateway-devpass/nemotron-3-nano-omni
@@ -1650,6 +1678,8 @@ llmgateway-devpass/qwen3.7-max
 {"id":"qwen3.7-max","providerID":"llmgateway-devpass","name":"Qwen3.7 Max","variants":{}}
 llmgateway-devpass/qwen3.7-plus
 {"id":"qwen3.7-plus","providerID":"llmgateway-devpass","name":"Qwen3.7 Plus","variants":{}}
+llmgateway-devpass/qwen3.8-max
+{"id":"qwen3.8-max","providerID":"llmgateway-devpass","name":"Qwen3.8 Max","variants":{}}
 llmgateway-devpass/qwen35-397b-a17b
 {"id":"qwen35-397b-a17b","providerID":"llmgateway-devpass","name":"Qwen3.5 397B A17B","variants":{}}
 llmgateway-devpass/seed-1-6-250615
@@ -1660,6 +1690,8 @@ llmgateway-devpass/seed-1-6-flash-250715
 {"id":"seed-1-6-flash-250715","providerID":"llmgateway-devpass","name":"Seed 1.6 Flash (250715)","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
 llmgateway-devpass/seed-1-8-251228
 {"id":"seed-1-8-251228","providerID":"llmgateway-devpass","name":"Seed 1.8 (251228)","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
+llmgateway-devpass/seed-2-1-turbo
+{"id":"seed-2-1-turbo","providerID":"llmgateway-devpass","name":"Seed 2.1 Turbo","variants":{"low":{"reasoningEffort":"low"},"medium":{"reasoningEffort":"medium"},"high":{"reasoningEffort":"high"}}}
 `;
 
 function createSeededDevpassModels(): readonly DiscoveredCliModel[] {
@@ -1679,6 +1711,9 @@ const SEEDED_CLI_MODELS: Readonly<
   // slug like `gemini-3.5-flash-medium` fails with "invalid --model"). Keep
   // these in sync with `agy models`' own output — see cliModelDiscovery.ts.
   "antigravity-cli": [
+    { model: "Gemini 3.7 Flash (Low)", name: "Gemini 3.7 Flash (Low)" },
+    { model: "Gemini 3.7 Flash (Medium)", name: "Gemini 3.7 Flash (Medium)" },
+    { model: "Gemini 3.7 Flash (High)", name: "Gemini 3.7 Flash (High)" },
     { model: "Gemini 3.6 Flash (Low)", name: "Gemini 3.6 Flash (Low)" },
     { model: "Gemini 3.6 Flash (Medium)", name: "Gemini 3.6 Flash (Medium)" },
     { model: "Gemini 3.6 Flash (High)", name: "Gemini 3.6 Flash (High)" },
