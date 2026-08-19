@@ -60,6 +60,8 @@ export interface CopilotLmToolSessionOptionsV1 {
    * MAX_TOOL_ROUND_WALL_CLOCK_MS_V1.
    */
   readonly roundTimeoutMs?: number;
+  /** Model-enumeration deadline override for tests. */
+  readonly modelSelectionTimeoutMs?: number;
 }
 
 /**
@@ -83,6 +85,44 @@ export interface CopilotLmToolSessionOptionsV1 {
  * pre-request boundary marker that would.
  */
 export const MAX_TOOL_ROUND_WALL_CLOCK_MS_V1 = 6 * 60_000;
+
+/**
+ * Deadline for enumerating Copilot models — a local capability query that
+ * should answer in milliseconds. Generous only so a genuinely busy host is
+ * never cut off; anything approaching this is a hang, not slowness.
+ */
+export const MAX_MODEL_SELECTION_WALL_CLOCK_MS_V1 = 60_000;
+
+/**
+ * Await `work`, giving up after `ms`. Returns `{ ok: false }` on expiry rather
+ * than throwing, so a caller distinguishes "timed out" from "rejected" without
+ * inspecting error shapes.
+ *
+ * The abandoned promise keeps running — unavoidable for an API that takes no
+ * cancellation token. Only use this where the caller exits regardless, so
+ * nothing downstream depends on the result; where a token IS available,
+ * cancel it instead (see the per-round deadline).
+ */
+async function raceDeadlineV1<T>(
+  // `Thenable`, not `Promise`: the VS Code API returns its own thenable, which
+  // lacks `catch`/`finally`. Only `then` is used here.
+  work: Thenable<T>,
+  ms: number
+): Promise<{ readonly ok: true; readonly value: T } | { readonly ok: false }> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      Promise.resolve(work).then((value) => ({ ok: true as const, value })),
+      new Promise<{ readonly ok: false }>((resolve) => {
+        timer = setTimeout(() => resolve({ ok: false }), ms);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
+  }
+}
 
 /**
  * Cumulative cap on tool-result bytes fed back into one session.
@@ -155,6 +195,8 @@ export function createCopilotLmToolSessionTransportV1(
   const maxRounds = options.maxRounds ?? MAX_TOOL_ROUNDS_V1;
   const maxResultBytes = options.maxResultBytes ?? MAX_TOOL_SESSION_RESULT_BYTES_V1;
   const roundTimeoutMs = options.roundTimeoutMs ?? MAX_TOOL_ROUND_WALL_CLOCK_MS_V1;
+  const modelSelectionTimeoutMs =
+    options.modelSelectionTimeoutMs ?? MAX_MODEL_SELECTION_WALL_CLOCK_MS_V1;
 
   return {
     runnerId: COPILOT_LM_RUNNER_ID,
@@ -169,9 +211,33 @@ export function createCopilotLmToolSessionTransportV1(
         return { kind: "transportFailure", code: "lmToolApiUnavailable" };
       }
 
+      // Model enumeration is awaited BEFORE the round loop, so the per-round
+      // deadline below does not cover it — and it is every bit as unbounded.
+      // A hang here is indistinguishable from a hang in `sendRequest` from
+      // the outside (transaction pinned at `invocationPending`, no round, no
+      // run log, no context pack), which is exactly the state observed at
+      // 16:55 on 2026-08-19 while a per-round deadline was already shipped.
+      //
+      // Raced rather than cancelled: `selectChatModels` takes no cancellation
+      // token, so abandoning the promise is the only option available. That
+      // is acceptable here precisely because the whole transport exits — no
+      // later code depends on the abandoned promise.
       let models: vscode.LanguageModelChat[];
       try {
-        models = await vscode.lm.selectChatModels({ vendor: "copilot" });
+        const selection = await raceDeadlineV1(
+          vscode.lm.selectChatModels({ vendor: "copilot" }),
+          modelSelectionTimeoutMs
+        );
+        if (!selection.ok) {
+          return {
+            kind: "transportFailure",
+            code: "copilotModelSelectionTimedOut",
+            detail:
+              `enumerating Copilot models did not answer within ` +
+              `${Math.round(modelSelectionTimeoutMs / 1000)}s`,
+          };
+        }
+        models = selection.value;
       } catch (error) {
         // Was a bare `catch {}` — see the identical fix below for
         // `sendRequest`'s failure path and its reasoning.
@@ -249,9 +315,15 @@ export function createCopilotLmToolSessionTransportV1(
           return {
             kind: "transportFailure",
             code: "copilotRequestTimedOut",
+            // NOT "produced no response": this deadline spans the whole round
+            // — request, full stream, and tool-call handling — so it can fire
+            // mid-stream on a round that produced plenty of text and tool
+            // calls but never finished. Describing that as "no response"
+            // would be the same species of misdiagnosis this module rejects
+            // elsewhere (see the catch-ordering note below).
             detail:
-              `round ${round + 1} produced no response within ${Math.round(roundTimeoutMs / 1000)}s ` +
-              "and was abandoned",
+              `round ${round + 1} exceeded the ${Math.round(roundTimeoutMs / 1000)}s wall-clock ` +
+              "deadline and was abandoned",
           };
         };
         try {

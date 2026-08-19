@@ -301,12 +301,94 @@ void describe("languageModelToolSessionV1", () => {
       );
       assert.match(
         exit.kind === "transportFailure" ? (exit.detail ?? "") : "",
-        /round 1 produced no response within/,
+        /round 1 exceeded the \d+s wall-clock deadline/,
         "the detail must name the round and the deadline"
       );
       assert.ok(
         cancelledByHost,
         "the in-flight request must actually be cancelled, not just abandoned by a race"
+      );
+    } finally {
+      lm.selectChatModels = original;
+    }
+  });
+
+  void it("reports a timeout even when the stream ENDS on cancellation instead of throwing", async () => {
+    // Covers the re-check after the `try`. A stream that terminates quietly
+    // when its token is cancelled — rather than rejecting — falls straight
+    // through the try/catch with a truncated round and no error, so a
+    // deadline checked only inside `catch` would let it continue to the next
+    // round (or settle as a normal tool-free round) and lose the diagnosis.
+    const lm = (vscode as unknown as { lm: { selectChatModels: unknown } }).lm;
+    const original = lm.selectChatModels;
+    lm.selectChatModels = () =>
+      Promise.resolve([
+        {
+          id: "gpt-test",
+          name: "GPT Test",
+          vendor: "copilot",
+          family: "gpt",
+          sendRequest: (
+            _messages: readonly unknown[],
+            _options: unknown,
+            token: vscode.CancellationToken
+          ) =>
+            Promise.resolve({
+              // An async iterable whose first `next()` never yields and simply
+              // reports `done` once cancelled — no value, no throw. Written
+              // out rather than as a generator because the point is that it
+              // yields nothing, which `require-yield` (correctly) rejects in
+              // a generator.
+              stream: {
+                [Symbol.asyncIterator]: () => ({
+                  next: (): Promise<IteratorResult<object>> =>
+                    new Promise((resolve) => {
+                      token.onCancellationRequested(() =>
+                        resolve({ done: true, value: undefined })
+                      );
+                    }),
+                }),
+              },
+            }),
+        },
+      ]);
+    try {
+      const transport = createCopilotLmToolSessionTransportV1({
+        model: "gpt-test",
+        toolHandler: recordingHandler(() => "{}"),
+        roundTimeoutMs: 40,
+      });
+      const exit = await transport.invoke(makeRequest(), makeWriter());
+      assert.equal(
+        exit.kind === "transportFailure" ? exit.code : exit.kind,
+        "copilotRequestTimedOut",
+        "a quietly-ended stream past the deadline must still report the timeout"
+      );
+    } finally {
+      lm.selectChatModels = original;
+    }
+  });
+
+  void it("abandons model enumeration that never answers, before any round starts", async () => {
+    // The per-round deadline above does NOT cover this: `selectChatModels` is
+    // awaited before the round loop. Shipping only the round deadline left
+    // this path unbounded, and a run at 16:55 on 2026-08-19 hung there — 12
+    // minutes past a 6-minute round deadline, with no round, no run log and
+    // no context pack, on a build that already carried it.
+    const lm = (vscode as unknown as { lm: { selectChatModels: unknown } }).lm;
+    const original = lm.selectChatModels;
+    lm.selectChatModels = () => new Promise(() => undefined);
+    try {
+      const transport = createCopilotLmToolSessionTransportV1({
+        model: "gpt-test",
+        toolHandler: recordingHandler(() => "{}"),
+        modelSelectionTimeoutMs: 40,
+      });
+      const exit = await transport.invoke(makeRequest(), makeWriter());
+      assert.equal(
+        exit.kind === "transportFailure" ? exit.code : exit.kind,
+        "copilotModelSelectionTimedOut",
+        "a hang enumerating models must be reported distinctly from a selection error"
       );
     } finally {
       lm.selectChatModels = original;
