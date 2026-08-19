@@ -92,19 +92,54 @@ void describe("provider CLI contracts", () => {
       "llmgateway-devpass/deepseek-v4-pro",
     ]);
 
-    const resumedArgs = devpass.buildArgs("edit", "llmgateway-devpass/deepseek-v4-pro", {
+    // Resuming without a pinned id must FAIL rather than fall back to
+    // `--continue`: that flag is cwd-scoped, every task in a workspace shares
+    // the directory, and an edit-mode retry continuing another task's
+    // conversation would apply its edits here. The caller refuses to resume at
+    // all in that case (runImplementationWithCli), so this throw is the
+    // backstop for a caller bug.
+    assert.throws(
+      () =>
+        devpass.buildArgs("edit", "llmgateway-devpass/deepseek-v4-pro", {
+          resumePreviousConversation: true,
+        }),
+      /pinned session id/
+    );
+    assert.equal(
+      devpass.conversationResume?.requiresPinnedSession,
+      true,
+      "devpass must declare that its resume needs an exact session id"
+    );
+
+    // With one, it MUST be pinned. `--continue` is cwd-scoped and every task in
+    // a workspace shares that directory, so a concurrent task or a manual CLI
+    // run between the timed-out attempt and its retry would otherwise hand this
+    // edit-mode retry someone else's conversation — and its edits would land
+    // here.
+    const pinnedArgs = devpass.buildArgs("edit", "llmgateway-devpass/deepseek-v4-pro", {
       resumePreviousConversation: true,
+      resumeSessionId: "ses_fe7d578cfffeuHItLg03eZAUc6",
     });
-    assert.deepStrictEqual(resumedArgs, [
+    assert.deepStrictEqual(pinnedArgs, [
       "run",
       "--format",
       "json",
-      "--continue",
+      "--session",
+      "ses_fe7d578cfffeuHItLg03eZAUc6",
       "--agent",
       "build",
       "--model",
       "llmgateway-devpass/deepseek-v4-pro",
     ]);
+    assert.ok(!pinnedArgs.includes("--continue"), "a pinned session must not also pass --continue");
+
+    // A session id without a resume is not a resume: an ordinary first run
+    // must never continue anything.
+    const freshArgs = devpass.buildArgs("edit", "llmgateway-devpass/deepseek-v4-pro", {
+      resumeSessionId: "ses_should_be_ignored",
+    });
+    assert.ok(!freshArgs.includes("--session"));
+    assert.ok(!freshArgs.includes("--continue"));
 
     // A non-resumed text run must never carry --continue: text mode is the
     // read-only path and has no partial edits to preserve.

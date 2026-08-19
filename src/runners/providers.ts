@@ -99,6 +99,18 @@ export interface CliBuildArgsContext {
    */
   resumePreviousConversation?: boolean;
   /**
+   * The exact provider session to continue, when the previous attempt's event
+   * stream reported one.
+   *
+   * `resumePreviousConversation` alone means "continue the last session",
+   * which the OpenCode-shaped CLIs scope to the WORKING DIRECTORY — shared by
+   * every task in a workspace. A concurrent task (or a manual CLI run) between
+   * a timed-out attempt and its retry makes "the last session" someone else's,
+   * and an edit-mode retry would continue unrelated context and apply its
+   * edits here. When this is set the provider must pin it instead.
+   */
+  resumeSessionId?: string;
+  /**
    * This run's reply must be exactly one `<<<ENSEMBLE_AI_RESULT_V1>>>` frame
    * (the V1 text transport parses stdout with `parseAiResultEnvelopeV1`; the
    * legacy path does not). Set only by `createCliTextTransportV1`.
@@ -118,6 +130,19 @@ export interface CliBuildArgsContext {
 }
 
 export interface CliConversationResumeDefinition {
+  /**
+   * This provider's resume MUST name an exact session id; "continue the last
+   * one" is not acceptable for it.
+   *
+   * Set where the provider's own continue flag is scoped to the WORKING
+   * DIRECTORY, which every task in a workspace shares — so without a pinned id
+   * an edit retry can continue an unrelated task's conversation and apply its
+   * edits here. Providers that do not set this keep the older
+   * continue-the-last-session behaviour; that is a weaker guarantee, and the
+   * same latent ambiguity applies to them, but it is long-shipping behaviour
+   * and is not changed here.
+   */
+  readonly requiresPinnedSession?: boolean;
   /**
    * Exact, provider-owned diagnostic fragments that mean a failed process can
    * be recovered by continuing the conversation it just persisted.
@@ -1749,6 +1774,13 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     // Add one only after seeing a genuine recoverable error live.
     conversationResume: {
       errorMarkers: [],
+      // `--continue` is scoped to the WORKING DIRECTORY (verified live
+      // 2026-08-18), which every task in a workspace shares — so a resume that
+      // does not name the session can continue another task's conversation and
+      // apply its edits here. devpass reports a `sessionID` on every event of
+      // its `--format json` stream, so it can always be pinned; a run that
+      // somehow produced none is not resumed at all.
+      requiresPinnedSession: true,
       continuationPrompt:
         "Continue the same task from where the previous response stopped. Your earlier " +
         "context, including any files you already read, is still in this conversation — " +
@@ -1760,11 +1792,28 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     buildArgs(mode, model, context): string[] {
       const args = ["run", "--format", "json"];
       if (context?.resumePreviousConversation) {
-        // See conversationResume above for the live verification. Continues
-        // the last session for THIS cwd; the retry sends only
-        // continuationPrompt, so prior partial edits are preserved rather
-        // than replayed.
-        args.push("--continue");
+        // Prefer the EXACT session over "the last one in this directory".
+        // `--continue` is cwd-scoped (verified live 2026-08-18), and every
+        // task in a workspace shares that directory, so a concurrent task or a
+        // manual CLI run between the timed-out attempt and this retry would
+        // otherwise hand us someone else's conversation — and an edit-mode
+        // retry would apply its edits here. `--session <id>` removes the
+        // ambiguity; `--continue` remains only as the fallback for a run whose
+        // stream never reported an id.
+        // No `--continue` fallback. It resumes "the last session for this
+        // working directory", which every task in a workspace shares, so
+        // without a pinned id an edit-mode retry can continue an unrelated
+        // conversation and apply its edits here. The caller refuses to resume
+        // at all when it has no id (see runImplementationWithCli), so reaching
+        // this branch without one is a caller bug rather than a state to
+        // paper over.
+        if (!context.resumeSessionId) {
+          throw new Error(
+            "devpass-code resume requires a pinned session id: continuing " +
+              "'the last session' is ambiguous when several tasks share a workspace."
+          );
+        }
+        args.push("--session", context.resumeSessionId);
       }
       // Verified live against devpass-code 1.17.13 via `devpass-code agent
       // list` (re-confirmed present on 1.18.11): "plan" carries the same

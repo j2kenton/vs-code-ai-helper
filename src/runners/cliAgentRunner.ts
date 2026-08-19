@@ -339,6 +339,32 @@ export interface CliExecResult {
    * wedged process apart from a genuinely long-running one.
    */
   timeoutReason?: "wall-clock" | "inactivity";
+  /**
+   * The provider's own session identifier for THIS run, when its event stream
+   * reports one.
+   *
+   * A resume that says only "continue the last session" is ambiguous: the
+   * OpenCode-shaped CLIs scope `--continue` to the WORKING DIRECTORY, and
+   * every task in a workspace shares that directory. A second task (or the
+   * user running the CLI by hand) between the timed-out run and its retry
+   * makes "the last session" someone else's — and an edit-mode retry would
+   * then continue unrelated context and apply its edits here. Pinning the
+   * exact id removes the ambiguity entirely.
+   */
+  sessionId?: string;
+}
+
+/**
+ * First `sessionID` reported by an OpenCode-shaped `--format json` event
+ * stream (opencode-cli, devpass-cli). Every event in that stream carries it,
+ * so the first match identifies the session this run created. Deliberately a
+ * narrow literal match rather than a JSON parse: the stream is line-delimited
+ * and may be truncated by a timeout — exactly the case this matters for — so
+ * the extraction has to work on a partial buffer.
+ */
+export function extractOpencodeSessionIdV1(rawStdout: string): string | undefined {
+  const match = /"sessionID"\s*:\s*"([A-Za-z0-9_-]{1,128})"/.exec(rawStdout);
+  return match?.[1];
 }
 
 /**
@@ -2507,6 +2533,8 @@ export async function execCliAgent(options: {
   onProgress?: (message: string) => void;
   /** Continue the provider conversation persisted by the previous attempt. */
   resumePreviousConversation?: boolean;
+  /** The exact session to continue — see CliBuildArgsContext.resumeSessionId. */
+  resumeSessionId?: string;
 }): Promise<CliExecResult> {
   const {
     def,
@@ -2517,6 +2545,7 @@ export async function execCliAgent(options: {
     token,
     onProgress,
     resumePreviousConversation,
+    resumeSessionId,
   } = options;
 
   const promptTransport = def.promptTransport ?? "stdin";
@@ -2574,6 +2603,7 @@ export async function execCliAgent(options: {
   let args: string[];
   try {
     args = def.buildArgs(mode, model, {
+      ...(resumeSessionId !== undefined ? { resumeSessionId } : {}),
       cwd,
       promptFile,
       resumePreviousConversation,
@@ -2711,6 +2741,12 @@ export async function execCliAgent(options: {
     // timeoutReason marker (wall-clock vs inactivity) that recovery routing
     // and run records use to tell a wedged process apart from a genuinely
     // long-running one.
+    // Extracted lazily from whatever stdout has accumulated: on the timeout
+    // path the stream is truncated by definition, and the id appears on the
+    // very first event, so a partial buffer is enough.
+    const sessionIdOfRun = (): string | undefined =>
+      def.structuredEventStream === "opencode" ? extractOpencodeSessionIdV1(stdout) : undefined;
+
     const emitTimeout = (message: string, timeoutReason: "wall-clock" | "inactivity"): void => {
       killProcessTree(child);
       // Edit-mode timeouts are always promoted: edit mode has its OWN
@@ -2763,6 +2799,9 @@ export async function execCliAgent(options: {
         // retry-evidence input for edit-capable runs.
         editEvidence: analyzeCliEventStream(stdout),
         timeoutReason,
+        // Pin the session this run created, so a resume continues THIS
+        // conversation rather than whatever ran last in the directory.
+        ...(sessionIdOfRun() !== undefined ? { sessionId: sessionIdOfRun() } : {}),
       });
     };
 
@@ -3491,6 +3530,12 @@ export async function runImplementationWithCli(options: {
   // provider-specific conversationResume signal is different: it continues
   // the persisted conversation and intentionally preserves prior edits.
   const retryAudit: RetryAuditEntry[] = [];
+  /**
+   * The provider session this run established, remembered across attempts.
+   * An edit-mode resume is only safe when it names an exact session — see
+   * `CliBuildArgsContext.resumeSessionId`.
+   */
+  let lastKnownSessionId: string | undefined;
   const retryDelayMs = options.retryDelayMs ?? CLI_RETRY_DELAY_MS;
   let attempt = 1;
   // Part 7: when a timed-out run refuses to retry, the reason is recorded
@@ -3505,8 +3550,21 @@ export async function runImplementationWithCli(options: {
     attempt < CLI_RETRY_MAX_ATTEMPTS &&
     !token.isCancellationRequested
   ) {
+    // Fail closed: a resume without a pinned session id would continue "the
+    // last session in this directory", which is not necessarily this task's.
+    // For an EDIT run that means applying another conversation's edits here,
+    // so a timeout that produced no id is not retried at all — the audit
+    // below records exactly that, rather than the retry happening blind.
+    const resumeSessionId = result.sessionId ?? lastKnownSessionId;
+    // Only providers that DECLARE they need a pinned session are held to it.
+    // Extending the requirement to every provider would silently disable
+    // Antigravity's and Kimi's long-shipping resume, whose streams report no
+    // id for us to pin — a regression, not a fix.
+    const needsPinnedSession = def.conversationResume?.requiresPinnedSession === true;
     const resumeConversation =
-      result.resumeConversation === true && def.conversationResume !== undefined;
+      result.resumeConversation === true &&
+      def.conversationResume !== undefined &&
+      (!needsPinnedSession || resumeSessionId !== undefined);
     const decision: EditRetryDecision = resumeConversation
       ? {
           retry: true,
@@ -3516,8 +3574,12 @@ export async function runImplementationWithCli(options: {
       : {
           retry: false,
           reason:
-            `Automatic retry is disabled for ${def.label} edit runs: its CLI protocol ` +
-            "does not guarantee edit events are flushed before side effects.",
+            needsPinnedSession && resumeSessionId === undefined
+              ? `Automatic retry is disabled for this ${def.label} edit run: the timed-out ` +
+                "attempt reported no session id, and resuming without one would continue " +
+                "whichever session ran last in this working directory — possibly another task's."
+              : `Automatic retry is disabled for ${def.label} edit runs: its CLI protocol ` +
+                "does not guarantee edit events are flushed before side effects.",
         };
     retryAudit.push({
       attempt,
@@ -3546,6 +3608,10 @@ export async function runImplementationWithCli(options: {
       break;
     }
     attempt++;
+    // Carried across attempts: a later attempt that dies before its stream
+    // reports an id must not lose the one an earlier attempt established, or
+    // the resume silently degrades to "whatever ran last in this directory".
+    lastKnownSessionId = result.sessionId ?? lastKnownSessionId;
     result = await execCliAgent({
       def,
       mode: "edit",
@@ -3557,6 +3623,9 @@ export async function runImplementationWithCli(options: {
       token,
       onProgress,
       resumePreviousConversation: resumeConversation,
+      // Continue THIS run's conversation, not whatever ran last in the
+      // directory — see CliBuildArgsContext.resumeSessionId.
+      ...(lastKnownSessionId !== undefined ? { resumeSessionId: lastKnownSessionId } : {}),
     });
   }
   await persistRetryAuditLog(
