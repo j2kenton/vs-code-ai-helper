@@ -162,7 +162,10 @@ export function validatePreflightPlanAgainstLedgerV1(
     if (seenTargets.has(targetKey)) {
       return failure(
         "duplicateTarget",
-        `${where} targets ${operation.relativePath}, which an earlier operation already targets`
+        `${where} targets ${operation.relativePath}, which an earlier operation already targets. ` +
+          "Each operation carries the revision observed during planning, so the second write " +
+          "would use a revision the first one already replaced — combine them into one " +
+          "operation, or leave the rest for the next round."
       );
     }
     seenTargets.add(targetKey);
