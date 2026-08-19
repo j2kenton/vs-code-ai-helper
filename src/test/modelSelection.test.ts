@@ -7,6 +7,7 @@ import {
   findStagesSharingBlockedPrimaryV1,
   getAvailableCopilotModels,
   getAvailableModels,
+  resolveConfiguredReviewStages,
   type SelectableModel,
   describeModel,
   getModelDisplayName,
@@ -1416,6 +1417,76 @@ void describe("describeStageSubstitutesV1 (workflow 3 continuation, first item â
     });
     try {
       assert.deepEqual(describeStageSubstitutesV1("claude-cli:opus"), []);
+    } finally {
+      settings.restore();
+    }
+  });
+});
+
+void describe("resolveConfiguredReviewStages (auto-advance General Model fallback for optional review stages)", () => {
+  void it("keeps plan-low-review configured when it has no chain of its own but the General Model is configured", async () => {
+    const settings = installModelSettings({
+      desc: { primary: "copilot-gpt-5.6-sol", strategy: "alert-and-wait" },
+    });
+    try {
+      const configured = await resolveConfiguredReviewStages(vscode.Uri.file("/fake/task"));
+      assert.ok(configured.has("plan-low-review"), "plan-low-review should inherit the General Model and stay configured");
+    } finally {
+      settings.restore();
+    }
+  });
+
+  void it("keeps impl-low-review configured when it has no chain of its own but the General Model is configured", async () => {
+    const settings = installModelSettings({
+      desc: { primary: "copilot-gpt-5.6-sol", strategy: "alert-and-wait" },
+    });
+    try {
+      const configured = await resolveConfiguredReviewStages(vscode.Uri.file("/fake/task"));
+      assert.ok(configured.has("impl-low-review"), "impl-low-review should inherit the General Model and stay configured");
+    } finally {
+      settings.restore();
+    }
+  });
+
+  void it("skips plan-low-review only when neither its own chain nor the General Model is configured", async () => {
+    const settings = installModelSettings({});
+    try {
+      const configured = await resolveConfiguredReviewStages(vscode.Uri.file("/fake/task"));
+      assert.ok(!configured.has("plan-low-review"), "plan-low-review should be skipped when no model is configured anywhere");
+    } finally {
+      settings.restore();
+    }
+  });
+
+  void it("skips impl-low-review only when neither its own chain nor the General Model is configured", async () => {
+    const settings = installModelSettings({});
+    try {
+      const configured = await resolveConfiguredReviewStages(vscode.Uri.file("/fake/task"));
+      assert.ok(!configured.has("impl-low-review"), "impl-low-review should be skipped when no model is configured anywhere");
+    } finally {
+      settings.restore();
+    }
+  });
+
+  void it("keeps every other review stage configured regardless of the General Model, since they are never opted out", async () => {
+    const settings = installModelSettings({});
+    try {
+      const configured = await resolveConfiguredReviewStages(vscode.Uri.file("/fake/task"));
+      assert.ok(configured.has("plan-high-review"));
+      assert.ok(configured.has("impl-high-review"));
+      assert.ok(configured.has("publish"));
+    } finally {
+      settings.restore();
+    }
+  });
+
+  void it("prefers a stage's own configured chain over the General Model", async () => {
+    const settings = installModelSettings({
+      "plan-low-review": { primary: "kiro-cli:default", strategy: "alert-and-wait" },
+    });
+    try {
+      const configured = await resolveConfiguredReviewStages(vscode.Uri.file("/fake/task"));
+      assert.ok(configured.has("plan-low-review"));
     } finally {
       settings.restore();
     }

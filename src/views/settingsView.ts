@@ -1709,6 +1709,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             let container = document.getElementById('provider-selection');
             container.innerHTML =
               '<fieldset><legend>Provider Selection</legend>' +
+              '<p class="provider-help">Log in to the corresponding provider\\'s CLI (or, for GitHub Copilot, sign in through VS Code\\'s Accounts menu), then select it here.</p>' +
               providers.map(provider =>
                 '<div class="provider-row">' +
                 '<label><input type="checkbox" data-provider="' + escapeHtml(provider.id) + '" ' + (isProviderChecked(provider.id) ? 'checked' : '') + '> ' + escapeHtml(provider.label) + '</label>' +

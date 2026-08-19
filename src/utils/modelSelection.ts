@@ -565,13 +565,18 @@ export async function resolveFreshModelForStage(
 /**
  * "plan-low-review" and "impl-low-review" are optional deep-dive reviews:
  * unlike the other review stages, auto-advance should skip straight past
- * them when no model is configured, rather than parking the task at a
- * review stage it has no way to act on. Other review stages (high-level
- * reviews, publish) are never skipped this way.
+ * them ONLY when they have no usable model at all — neither their own
+ * chain NOR the General Model's chain. A stage with no chain of its own
+ * inherits the General Model exactly like every other configurable stage
+ * (resolveEffectiveStageChainV1's "general" fallback tier); these two
+ * stages are optional only in the sense that leaving BOTH tiers blank is
+ * the opt-out signal auto-advance relies on to skip them. Other review
+ * stages (high-level reviews, publish) are never skipped this way — they
+ * already always resolve through the General Model when left blank.
  *
  * Returns the set of review stages that auto-advance is allowed to land on
- * for this task — every review stage except an optional one with no
- * configured model — for use as `computeNextStage`'s `configuredStages`.
+ * for this task — every review stage except an optional one with no usable
+ * model anywhere — for use as `computeNextStage`'s `configuredStages`.
  */
 const OPTIONAL_REVIEW_STAGES: readonly TaskStage[] = [
   "plan-low-review",
@@ -583,12 +588,12 @@ export function resolveConfiguredReviewStages(
 ): Promise<ReadonlySet<TaskStage>> {
   const configured = new Set<TaskStage>(REVIEW_STAGES);
   for (const stage of OPTIONAL_REVIEW_STAGES) {
-    // Deliberate exception to the general-model fallback: leaving an
-    // OPTIONAL deep-dive review blank is the opt-out signal auto-advance
-    // relies on. Only the stage's OWN chain counts here — otherwise
-    // configuring a general model would make these stages impossible to
-    // skip. Required stages still fall through to the general model.
-    if (resolveEffectiveStageChainV1(stage).source !== "stage") {
+    // Skip only when NEITHER this stage's own chain NOR the General Model's
+    // chain resolves to a primary — i.e. resolveEffectiveStageChainV1's
+    // overall source is "none". A stage left blank still inherits the
+    // General Model like any other stage (source "general"); it is only
+    // skipped when there is truly no model configured anywhere for it.
+    if (resolveEffectiveStageChainV1(stage).source === "none") {
       configured.delete(stage);
     }
   }

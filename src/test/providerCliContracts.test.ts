@@ -1059,12 +1059,16 @@ void describe("provider CLI contracts", () => {
     }
   });
 
-  void it("orders Provider Selection with devpass-code first and Antigravity last", () => {
+  void it("orders Provider Selection with GitHub Copilot first, devpass-code after Kiro, and Antigravity last", () => {
     assert.strictEqual(
       PROVIDER_ACCOUNT_ENTRIES[0]?.id,
-      "devpass-cli",
-      "devpass-code leads Provider Selection"
+      "copilot",
+      "GitHub Copilot leads Provider Selection"
     );
+    const kiroIndex = PROVIDER_ACCOUNT_ENTRIES.findIndex((entry) => entry.id === "kiro-cli");
+    const devpassIndex = PROVIDER_ACCOUNT_ENTRIES.findIndex((entry) => entry.id === "devpass-cli");
+    assert.ok(kiroIndex >= 0, "expected a kiro-cli row");
+    assert.strictEqual(devpassIndex, kiroIndex + 1, "devpass-code immediately follows Kiro");
     assert.strictEqual(
       PROVIDER_ACCOUNT_ENTRIES[PROVIDER_ACCOUNT_ENTRIES.length - 1]?.id,
       "antigravity-cli",

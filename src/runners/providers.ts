@@ -1947,21 +1947,32 @@ function reorderAntigravityLast<T extends { id: string }>(entries: readonly T[])
 }
 
 /**
- * Move the "devpass-cli" entry (if present) to the front of the list,
- * preserving the relative order of everything else — devpass-code leads
- * Provider Selection. Applied after reorderAntigravityLast, so Antigravity
- * still ends up last.
+ * Move the "devpass-cli" entry (if present) to immediately after the
+ * "kiro-cli" entry, preserving the relative order of everything else.
+ * GitHub Copilot now leads Provider Selection (it is the always-available
+ * default, needing no CLI install), and devpass-code follows Kiro rather
+ * than leading — applied after reorderAntigravityLast, so Antigravity still
+ * ends up last.
  */
-function reorderDevpassFirst<T extends { id: string }>(entries: readonly T[]): T[] {
-  const index = entries.findIndex((entry) => entry.id === "devpass-cli");
-  if (index === -1) {
+function reorderDevpassAfterKiro<T extends { id: string }>(entries: readonly T[]): T[] {
+  const devpassIndex = entries.findIndex((entry) => entry.id === "devpass-cli");
+  if (devpassIndex === -1) {
     return [...entries];
   }
-  const devpass = entries[index]!;
-  return [devpass, ...entries.slice(0, index), ...entries.slice(index + 1)];
+  const devpass = entries[devpassIndex]!;
+  const withoutDevpass = [...entries.slice(0, devpassIndex), ...entries.slice(devpassIndex + 1)];
+  const kiroIndex = withoutDevpass.findIndex((entry) => entry.id === "kiro-cli");
+  if (kiroIndex === -1) {
+    return [...withoutDevpass, devpass];
+  }
+  return [
+    ...withoutDevpass.slice(0, kiroIndex + 1),
+    devpass,
+    ...withoutDevpass.slice(kiroIndex + 1),
+  ];
 }
 
-export const PROVIDER_ACCOUNT_ENTRIES: readonly ProviderAccountEntry[] = reorderDevpassFirst([
+export const PROVIDER_ACCOUNT_ENTRIES: readonly ProviderAccountEntry[] = reorderDevpassAfterKiro([
   {
     id: "copilot",
     label: "GitHub Copilot",

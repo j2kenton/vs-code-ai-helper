@@ -871,4 +871,238 @@ void describe("nextStage command → auto-review chain (command-layer end-to-end
       deactivateNotificationRouter();
     }
   });
+
+  function installModelSettingsOverride(raw: Record<string, unknown>): { restore: () => void } {
+    const ws = vscode.workspace as unknown as { _configOverrides: Map<string, unknown> };
+    const had = ws._configOverrides.has("modelSettings");
+    const previous = ws._configOverrides.get("modelSettings");
+    ws._configOverrides.set("modelSettings", raw);
+    return {
+      restore: (): void => {
+        if (had) {
+          ws._configOverrides.set("modelSettings", previous);
+        } else {
+          ws._configOverrides.delete("modelSettings");
+        }
+      },
+    };
+  }
+
+  void it("score-based auto-advance runs plan-low-review via the real resolver when only the General Model is configured", async () => {
+    // Does NOT stub resolveConfiguredReviewStages: auto-advance must inherit
+    // the General Model for a blank optional review stage and actually land on it.
+    const settings = installModelSettingsOverride({
+      desc: { primary: "copilot-gpt-5.6-sol", strategy: "alert-and-wait" },
+    });
+    const { folderPath } = makeTaskFolder(`gm-plan-low-${Math.floor(Math.random() * 1e9)}`, "plan-high-review");
+    const provider = new StatusTreeProvider();
+    initNotificationRouter(provider);
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const workspaceRoot = { uri: vscode.Uri.file(REAL_ROOT), name: "root", index: 0 } as vscode.WorkspaceFolder;
+    const dispatches: AutomationDispatch[] = [];
+    const contextPack = path.join(folderPath, "context-pack.md");
+    fs.writeFileSync(contextPack, "# Context\n", "utf8");
+
+    const patches: Patched[] = [
+      patch(settingsModule, "isAutoAdvanceEnabled", () => true),
+      patch(settingsModule, "getAutoAdvanceMode", () => "auto"),
+      patch(settingsModule, "getAutoAdvanceScoreThreshold", () => 8),
+      patch(modelSelectionModule, "resolveModelForStage", () => Promise.resolve({ source: "general", modelId: "copilot-gpt-5.6-sol" })),
+      patch(modelSelectionModule, "resolveFreshModelForStage", () => Promise.resolve({ source: "general", modelId: "copilot-gpt-5.6-sol" })),
+      stubV1RunnerSelection([markdownTransportV1("Readiness: 9/10\n\n- Ready.\n")]),
+      patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.resolve("stub prompt")),
+      patch(runLogModule, "writeRunLog", () => Promise.resolve(undefined)),
+      patch(contextPackModule, "writeContextPack", () => Promise.resolve(vscode.Uri.file(contextPack))),
+      patch(automationChainModule, "scheduleAutomationChain", (dispatch: AutomationDispatch): Promise<boolean> => {
+        dispatches.push(dispatch);
+        return Promise.resolve(true);
+      }),
+    ];
+
+    try {
+      await runReviewForFolder(
+        vscode.Uri.file(REAL_ROOT),
+        vscode.Uri.file(folderPath),
+        workspaceRoot,
+        "plan-high-review",
+        true
+      );
+
+      assert.equal((await readTaskProgress(vscode.Uri.file(folderPath)))?.currentStage, "plan-low-review");
+      assert.equal(dispatches.length, 1, "auto-advance should dispatch the inherited plan-low-review");
+      assert.equal(dispatches[0]?.command, "vs-code-ai-helper.runReviewWithAI");
+      assert.equal(dispatches[0]?.chainId, "auto-review");
+    } finally {
+      for (const p of patches.reverse()) { p.restore(); }
+      settings.restore();
+      wsStub.restore();
+      fsBridge.restore();
+      provider.dispose();
+      deactivateNotificationRouter();
+    }
+  });
+
+  void it("score-based auto-advance runs impl-low-review via the real resolver when only the General Model is configured", async () => {
+    const settings = installModelSettingsOverride({
+      desc: { primary: "copilot-gpt-5.6-sol", strategy: "alert-and-wait" },
+    });
+    const { folderPath } = makeTaskFolder(`gm-impl-low-${Math.floor(Math.random() * 1e9)}`, "impl-high-review");
+    fs.writeFileSync(path.join(folderPath, "plan-final.md"), "# Plan\n\n1. Do the thing.\n", "utf8");
+    const provider = new StatusTreeProvider();
+    initNotificationRouter(provider);
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const workspaceRoot = { uri: vscode.Uri.file(REAL_ROOT), name: "root", index: 0 } as vscode.WorkspaceFolder;
+    const dispatches: AutomationDispatch[] = [];
+    const contextPack = path.join(folderPath, "context-pack.md");
+    fs.writeFileSync(contextPack, "# Context\n", "utf8");
+
+    const patches: Patched[] = [
+      patch(settingsModule, "isAutoAdvanceEnabled", () => true),
+      patch(settingsModule, "getAutoAdvanceMode", () => "auto"),
+      patch(settingsModule, "getAutoAdvanceScoreThreshold", () => 8),
+      patch(modelSelectionModule, "resolveModelForStage", () => Promise.resolve({ source: "general", modelId: "copilot-gpt-5.6-sol" })),
+      patch(modelSelectionModule, "resolveFreshModelForStage", () => Promise.resolve({ source: "general", modelId: "copilot-gpt-5.6-sol" })),
+      stubV1RunnerSelection([markdownTransportV1("Readiness: 9/10\n\n- Ready.\n")]),
+      patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.resolve("stub prompt")),
+      patch(runLogModule, "writeRunLog", () => Promise.resolve(undefined)),
+      patch(contextPackModule, "writeContextPack", () => Promise.resolve(vscode.Uri.file(contextPack))),
+      patch(automationChainModule, "scheduleAutomationChain", (dispatch: AutomationDispatch): Promise<boolean> => {
+        dispatches.push(dispatch);
+        return Promise.resolve(true);
+      }),
+    ];
+
+    try {
+      await runReviewForFolder(
+        vscode.Uri.file(REAL_ROOT),
+        vscode.Uri.file(folderPath),
+        workspaceRoot,
+        "impl-high-review",
+        true
+      );
+
+      assert.equal((await readTaskProgress(vscode.Uri.file(folderPath)))?.currentStage, "impl-low-review");
+      assert.equal(dispatches.length, 1, "auto-advance should dispatch the inherited impl-low-review");
+      assert.equal(dispatches[0]?.command, "vs-code-ai-helper.runReviewWithAI");
+      assert.equal(dispatches[0]?.chainId, "auto-review");
+    } finally {
+      for (const p of patches.reverse()) { p.restore(); }
+      settings.restore();
+      wsStub.restore();
+      fsBridge.restore();
+      provider.dispose();
+      deactivateNotificationRouter();
+    }
+  });
+
+  void it("score-based auto-advance skips plan-low-review only when neither its own chain nor the General Model is configured", async () => {
+    // Sole remaining skip condition: blank optional review + no General Model.
+    const settings = installModelSettingsOverride({});
+    const { folderPath } = makeTaskFolder(`skip-plan-low-${Math.floor(Math.random() * 1e9)}`, "plan-high-review");
+    const provider = new StatusTreeProvider();
+    initNotificationRouter(provider);
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const workspaceRoot = { uri: vscode.Uri.file(REAL_ROOT), name: "root", index: 0 } as vscode.WorkspaceFolder;
+    const dispatches: AutomationDispatch[] = [];
+    const contextPack = path.join(folderPath, "context-pack.md");
+    fs.writeFileSync(contextPack, "# Context\n", "utf8");
+
+    const patches: Patched[] = [
+      patch(settingsModule, "isAutoAdvanceEnabled", () => true),
+      patch(settingsModule, "getAutoAdvanceMode", () => "auto"),
+      patch(settingsModule, "getAutoAdvanceScoreThreshold", () => 8),
+      patch(settingsModule, "isAutoImplementAfterReviewEnabled", () => false),
+      patch(modelSelectionModule, "resolveModelForStage", () => Promise.resolve({ source: "settings", modelId: "stub:model" })),
+      patch(modelSelectionModule, "resolveFreshModelForStage", () => Promise.resolve({ source: "settings", modelId: "stub:model" })),
+      stubV1RunnerSelection([markdownTransportV1("Readiness: 9/10\n\n- Ready.\n")]),
+      patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.resolve("stub prompt")),
+      patch(runLogModule, "writeRunLog", () => Promise.resolve(undefined)),
+      patch(contextPackModule, "writeContextPack", () => Promise.resolve(vscode.Uri.file(contextPack))),
+      patch(automationChainModule, "scheduleAutomationChain", (dispatch: AutomationDispatch): Promise<boolean> => {
+        dispatches.push(dispatch);
+        return Promise.resolve(true);
+      }),
+    ];
+
+    try {
+      await runReviewForFolder(
+        vscode.Uri.file(REAL_ROOT),
+        vscode.Uri.file(folderPath),
+        workspaceRoot,
+        "plan-high-review",
+        true
+      );
+
+      assert.equal((await readTaskProgress(vscode.Uri.file(folderPath)))?.currentStage, "impl");
+      assert.equal(
+        dispatches.some((dispatch) => dispatch.command === "vs-code-ai-helper.runReviewWithAI"),
+        false,
+        "unconfigured plan-low-review must not receive a review dispatch"
+      );
+    } finally {
+      for (const p of patches.reverse()) { p.restore(); }
+      settings.restore();
+      wsStub.restore();
+      fsBridge.restore();
+      provider.dispose();
+      deactivateNotificationRouter();
+    }
+  });
+
+  void it("score-based auto-advance skips impl-low-review only when neither its own chain nor the General Model is configured", async () => {
+    const settings = installModelSettingsOverride({});
+    const { folderPath } = makeTaskFolder(`skip-impl-low-${Math.floor(Math.random() * 1e9)}`, "impl-high-review");
+    fs.writeFileSync(path.join(folderPath, "plan-final.md"), "# Plan\n\n1. Do the thing.\n", "utf8");
+    const provider = new StatusTreeProvider();
+    initNotificationRouter(provider);
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const workspaceRoot = { uri: vscode.Uri.file(REAL_ROOT), name: "root", index: 0 } as vscode.WorkspaceFolder;
+    const dispatches: AutomationDispatch[] = [];
+    const contextPack = path.join(folderPath, "context-pack.md");
+    fs.writeFileSync(contextPack, "# Context\n", "utf8");
+
+    const patches: Patched[] = [
+      patch(settingsModule, "isAutoAdvanceEnabled", () => true),
+      patch(settingsModule, "getAutoAdvanceMode", () => "auto"),
+      patch(settingsModule, "getAutoAdvanceScoreThreshold", () => 8),
+      patch(modelSelectionModule, "resolveModelForStage", () => Promise.resolve({ source: "settings", modelId: "stub:model" })),
+      patch(modelSelectionModule, "resolveFreshModelForStage", () => Promise.resolve({ source: "settings", modelId: "stub:model" })),
+      stubV1RunnerSelection([markdownTransportV1("Readiness: 9/10\n\n- Ready.\n")]),
+      patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.resolve("stub prompt")),
+      patch(runLogModule, "writeRunLog", () => Promise.resolve(undefined)),
+      patch(contextPackModule, "writeContextPack", () => Promise.resolve(vscode.Uri.file(contextPack))),
+      patch(automationChainModule, "scheduleAutomationChain", (dispatch: AutomationDispatch): Promise<boolean> => {
+        dispatches.push(dispatch);
+        return Promise.resolve(true);
+      }),
+    ];
+
+    try {
+      await runReviewForFolder(
+        vscode.Uri.file(REAL_ROOT),
+        vscode.Uri.file(folderPath),
+        workspaceRoot,
+        "impl-high-review",
+        true
+      );
+
+      assert.equal((await readTaskProgress(vscode.Uri.file(folderPath)))?.currentStage, "publish");
+      assert.equal(
+        dispatches.some((dispatch) => dispatch.command === "vs-code-ai-helper.runReviewWithAI"),
+        false,
+        "unconfigured impl-low-review must not receive a review dispatch"
+      );
+    } finally {
+      for (const p of patches.reverse()) { p.restore(); }
+      settings.restore();
+      wsStub.restore();
+      fsBridge.restore();
+      provider.dispose();
+      deactivateNotificationRouter();
+    }
+  });
 });
