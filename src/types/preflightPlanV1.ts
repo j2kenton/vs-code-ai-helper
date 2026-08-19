@@ -218,8 +218,26 @@ export function validatePreflightPlanAgainstLedgerV1(
       }
     }
 
-    const ancestors = ancestorPathsOf(operation.relativePath);
-    if (operation.parentChain.length !== ancestors.length) {
+    // A parent chain answers ONE question: will this operation's parent
+    // directory exist when the step runs? That is only ever in doubt for a
+    // CREATE — the parent may be missing, or be created by an earlier step in
+    // this same plan (`createdByStep`), which is what makes the ordered chain
+    // meaningful there.
+    //
+    // For an operation on an EXISTING target it is pure redundancy: the target
+    // observation above already proved this exact path is a `file` (or, for
+    // deleteEmptyDirectory, a provably empty `directory`), and a file cannot
+    // exist without every one of its ancestors. Demanding the chain anyway
+    // cost a model one `ensemble_stat` per directory level per file, all of it
+    // re-sent on every later tool round — and cost a whole round outright when
+    // it miscounted the depth (2026-08-19: "parent chain has 3 link(s); 4
+    // ancestor(s) required" on a four-level path).
+    //
+    // Deliberately NOT relaxed for creates: there the chain is load-bearing.
+    const requiresParentChain =
+      operation.kind === "createFile" || operation.kind === "createDirectory";
+    const ancestors = requiresParentChain ? ancestorPathsOf(operation.relativePath) : [];
+    if (requiresParentChain && operation.parentChain.length !== ancestors.length) {
       return failure(
         "parentChainMismatch",
         `${where}'s parent chain has ${operation.parentChain.length} link(s); ${ancestors.length} ancestor(s) required`
