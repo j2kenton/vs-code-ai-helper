@@ -93,6 +93,13 @@ function purposeSectionV1(purpose: PreflightRoundPurposeV1): string[] {
       "",
       "You do not have to fix every blocker in one plan. Fixing some and leaving",
       "the rest for the next round is normal and expected. Fixing none is not.",
+      "",
+      "**Several blockers usually live in the SAME file.** You may plan only ONE",
+      "operation per file (see the rule below), and a plan with two operations on",
+      "one path is rejected in full — the whole round is lost and nothing is",
+      "applied. So when two or more blockers touch one file, either widen a single",
+      "`patchFile` so its `findText` spans them all, or fix one now and leave the",
+      "others for the next round. Do not plan them as separate operations.",
     ];
   }
   if (purpose === "lint-fixes") {

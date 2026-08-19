@@ -72,12 +72,14 @@ beforeEach(() => {
   tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "goto-review-apply-"));
   restoreFs = installFsStub();
   originalExecuteCommand = vscode.commands.executeCommand;
-  (vscode.commands as { executeCommand: unknown }).executeCommand = async (
+  (vscode.commands as { executeCommand: unknown }).executeCommand = (
     command: string,
     arg: unknown
   ): Promise<unknown> => {
     dispatched.push({ command, arg });
-    return undefined;
+    // Resolved promise rather than `async`: the stub awaits nothing, and
+    // `require-await` rejects an async function with no await expression.
+    return Promise.resolve(undefined);
   };
 });
 
