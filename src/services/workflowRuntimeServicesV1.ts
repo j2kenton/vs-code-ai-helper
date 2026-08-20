@@ -37,7 +37,7 @@ import { BoundedResultStoreV1, createBoundedResultStoreV1 } from "./boundedResul
 import { createEditPlanBrokerV1, EditPlanBrokerV1 } from "./editBrokerToolSessionHandlerV1";
 import { createWorkflowLeaseStoreV1, WorkflowLeaseStoreV1 } from "./workflowLeaseStoreV1";
 import { decodeTaskProgressTextV1 } from "./taskProgressDecoderV1";
-import { TASK_PROGRESS_FILENAME } from "../types/taskProgress";
+import { RUNS_DIRNAME, TASK_PROGRESS_FILENAME } from "../types/taskProgress";
 import { deriveTaskBindingV1 } from "../types/taskBindingV1";
 import { resolveTaskRootCandidates } from "../utils/taskRoot";
 import {
@@ -193,6 +193,30 @@ export function getWorkflowPathRegistryV1(): WorkflowPathRegistryV1 {
 /** The file store derived from the shared registry's CURRENT root list. */
 export function getWorkflowFileStoreV1(): WorkflowFileStoreV1 {
   return fileStore;
+}
+
+/**
+ * Ensure a registered task folder's `runs/` directory exists, so a store
+ * write into it can succeed. Returns false when the directory could not be
+ * created (the caller's own write will then report the concrete failure).
+ *
+ * `createFileExclusive` opens with O_EXCL and deliberately never creates
+ * missing parent directories — it reports `parentMissing` instead. Both rows
+ * that promote a provider reply into `runs/` (renameTask.v1's
+ * `rename-suggestion-*.txt` and commitPushMetadata.v1's
+ * `commit-metadata-*.json`) therefore have to create the directory
+ * themselves, and neither did. Until a task ran a plan or implementation
+ * stage — the only thing that had ever created `runs/`, as a side effect of
+ * writing its run log — Rename Task with AI failed on every attempt with
+ * `promotionFailed: ... parentMissing`, which is exactly the state a freshly
+ * created, still-default-named task is in and exactly when renaming is
+ * wanted (observed 2026-08-20).
+ *
+ * Idempotent: an already-present directory (`targetExists`) is success.
+ */
+export async function ensureTaskRunsDirectoryV1(rootId: string): Promise<boolean> {
+  const result = await fileStore.createDirectory({ rootId, relativePath: RUNS_DIRNAME });
+  return result.kind === "ok" || (result.kind === "failed" && result.code === "targetExists");
 }
 
 /**

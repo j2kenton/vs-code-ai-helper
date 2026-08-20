@@ -34,6 +34,7 @@ import { isWorkflowPrivatePathV1 } from "../services/workflowPrivacyClassifierV1
 import { isLegacyAiRouteDisabledV0 } from "../services/legacyAiActionSafetyGateV0";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
 import {
+  ensureTaskRunsDirectoryV1,
   ensureWorkflowTaskFolderRootV1,
   getVerifiedTaskBindingIdV1,
   getWorkflowFileStoreV1,
@@ -366,6 +367,13 @@ async function buildCommitMessage(
     const rootId = ensureWorkflowTaskFolderRootV1(taskFolderUri.fsPath);
     const verifiedBindingId = getVerifiedTaskBindingIdV1(rootId);
     if (!verifiedBindingId) return { kind: "message", text: fallback };
+    // commitPushMetadata.v1 promotes into runs/ through createFileExclusive,
+    // which never creates missing parents (see ensureTaskRunsDirectoryV1).
+    // A task reaching Publish has effectively always run a stage that
+    // created runs/ already, so this has never actually bitten here — but
+    // the write has no business depending on that, and the same omission
+    // did break Rename Task with AI outright.
+    if (!(await ensureTaskRunsDirectoryV1(rootId))) return { kind: "message", text: fallback };
 
     const chatIdentity = await readChatDocumentIdentityV1(taskFolderUri.fsPath, taskFolderUri.fsPath);
     const chatDocumentId = chatIdentity?.documentId ?? allocateHex128IdV1();

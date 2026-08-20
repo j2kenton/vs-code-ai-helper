@@ -142,6 +142,35 @@ function fakeChatMessageTransportFactory(
   };
 }
 
+/**
+ * A transport that fails the way a real provider call does, so the action
+ * settles non-completed and NO candidate name ever reaches validation — the
+ * shape of every rename failure that is not the model's fault.
+ */
+function transportFailureFactory(
+  _replies: string[],
+  onCreate: () => void
+): (options: { model?: string }) => {
+  runnerId: string;
+  invoke: (
+    request: unknown,
+    output: { write: (chunk: string) => boolean }
+  ) => Promise<{ kind: "transportFailure"; code: string; detail: string }>;
+} {
+  return () => {
+    onCreate();
+    return {
+      runnerId: "copilot-lm",
+      invoke: (): Promise<{ kind: "transportFailure"; code: string; detail: string }> =>
+        Promise.resolve({
+          kind: "transportFailure",
+          code: "copilotRequestFailed",
+          detail: "stub transport failure",
+        }),
+    };
+  };
+}
+
 function setUpTaskActionRuntimeForTestV1(): { tearDown: () => void } {
   resetWorkflowRuntimeServicesForTestV1();
   resetProductionTaskActionRegistryForTestV1();
@@ -165,10 +194,13 @@ function setUpTaskActionRuntimeForTestV1(): { tearDown: () => void } {
 function makeTaskFolder(name: string, taskDescription: string): string {
   const folderPath = path.join(REAL_ROOT, "plans", name);
   fs.mkdirSync(folderPath, { recursive: true });
-  // The renameTask.v1 row promotes into runs/rename-suggestion-*.txt via
-  // createFileExclusive, which — unlike a plain fs write — never creates
-  // missing parent directories, so the fixture must pre-create "runs/".
-  fs.mkdirSync(path.join(folderPath, "runs"), { recursive: true });
+  // Deliberately NO "runs/" directory: renameTask.v1 promotes into
+  // runs/rename-suggestion-*.txt via createFileExclusive, which — unlike a
+  // plain fs write — never creates missing parent directories. This fixture
+  // used to pre-create "runs/" to work around that, which hid the fact that
+  // production never created it either; every real task that had not yet run
+  // a plan or implementation stage failed to rename. Keep the fixture in the
+  // state a freshly created task is actually in.
   const progress: TaskProgress = {
     taskFolder: name,
     currentStage: "impl",
@@ -280,7 +312,17 @@ async function withRenameHarness(
     context: vscode.ExtensionContext;
     warnings: string[];
     transportCallCount: () => number;
-  }) => Promise<void>
+  }) => Promise<void>,
+  options?: {
+    /**
+     * Replace the completed-envelope transport — used by the case that
+     * drives a run which never yields a reply for validation at all.
+     */
+    readonly transportFactory?: (
+      replies: string[],
+      onCreate: () => void
+    ) => (options: { model?: string }) => unknown;
+  }
 ): Promise<void> {
   const folderPath = makeTaskFolder(`renamecmd_${Math.floor(Math.random() * 1e9)}`, taskDescription);
   const inventory = installFakeInventory(folderPath);
@@ -307,7 +349,10 @@ async function withRenameHarness(
     patch(
       copilotLmTransportModule,
       "createCopilotLmTextTransportV1",
-      fakeChatMessageTransportFactory(replies, () => { transportCalls += 1; })
+      (options?.transportFactory ?? fakeChatMessageTransportFactory)(
+        replies,
+        () => { transportCalls += 1; }
+      )
     ),
     patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.resolve("stub prompt")),
   ];
@@ -334,6 +379,36 @@ void describe("renameTaskWithAI (command-level, real coordinator + fake transpor
         const persisted = await readTaskProgress(vscode.Uri.file(folderPath));
         assert.strictEqual(persisted?.displayName, "Add background export queue for large datasets");
         assert.strictEqual(transportCallCount(), 1);
+      }
+    );
+  });
+
+  void it("renames a task that has no runs/ directory yet — the 2026-08-20 regression", async () => {
+    // Observed on a freshly created, still-default-named task: the model
+    // answered correctly on both the first attempt and the bounded
+    // re-prompt (two successful provider completions in the Copilot log),
+    // but promotion into runs/rename-suggestion-*.txt failed with
+    // parentMissing because nothing had ever created runs/ — only a plan or
+    // implementation run did, as a side effect of writing its run log. The
+    // user saw "The AI did not produce a valid task summary" and the name
+    // never changed. Renaming must not depend on a prior stage having run.
+    await withRenameHarness(
+      "Surface joke-inventory headroom in the daily digest email.",
+      ["Report joke inventory headroom in daily email"],
+      async ({ folderPath, inventory, context, transportCallCount }) => {
+        assert.ok(
+          !fs.existsSync(path.join(folderPath, "runs")),
+          "fixture precondition: the task folder must start without a runs/ directory"
+        );
+        await renameTaskWithAI(context, inventory, { canonicalId: folderPath });
+        const persisted = await readTaskProgress(vscode.Uri.file(folderPath));
+        assert.strictEqual(persisted?.displayName, "Report joke inventory headroom in daily email");
+        assert.strictEqual(transportCallCount(), 1, "must not burn the re-prompt on a storage failure");
+        const runsEntries = fs.readdirSync(path.join(folderPath, "runs"));
+        assert.ok(
+          runsEntries.some((name) => /^rename-suggestion-\d+\.txt$/.test(name)),
+          `expected a promoted rename-suggestion artifact; got: ${JSON.stringify(runsEntries)}`
+        );
       }
     );
   });
@@ -372,6 +447,32 @@ void describe("renameTaskWithAI (command-level, real coordinator + fake transpor
           `expected a "did not produce a valid task summary" warning; got: ${JSON.stringify(warnings)}`
         );
       }
+    );
+  });
+
+  void it("names the real cause instead of blaming the model when no reply ever reaches validation", async () => {
+    // The 2026-08-20 failure looked like a bad model: the warning said the
+    // AI had not produced a valid summary, while the model had in fact
+    // answered correctly and the run failed in promotion. A run that never
+    // yields a candidate name must say so, and must not send diagnosis at
+    // the model or the AI Models settings.
+    await withRenameHarness(
+      "Users need to export large datasets without freezing the UI.",
+      ["irrelevant — this transport never frames a result"],
+      async ({ folderPath, inventory, context, warnings }) => {
+        await renameTaskWithAI(context, inventory, { canonicalId: folderPath });
+        const persisted = await readTaskProgress(vscode.Uri.file(folderPath));
+        assert.strictEqual(persisted?.displayName, "original task name");
+        assert.ok(
+          !warnings.some((w) => /did not produce a valid task summary/.test(w)),
+          `must not blame the model; got: ${JSON.stringify(warnings)}`
+        );
+        assert.ok(
+          warnings.some((w) => /Rename Task with AI could not complete/.test(w)),
+          `expected a run-failure warning; got: ${JSON.stringify(warnings)}`
+        );
+      },
+      { transportFactory: transportFailureFactory }
     );
   });
 

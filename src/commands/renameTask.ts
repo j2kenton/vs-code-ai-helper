@@ -23,6 +23,7 @@ import {
   RenameTaskActionInputV1,
 } from "../actions/rows/renameTaskRowV1";
 import {
+  ensureTaskRunsDirectoryV1,
   ensureWorkflowTaskFolderRootV1,
   getVerifiedTaskBindingIdV1,
   getWorkflowFileStoreV1,
@@ -225,7 +226,14 @@ function strictnessNoteFor(reason: NameValidationFailureReason | undefined): str
 
 type AiNameRequestResult =
   | { kind: "no-model" }
-  | { kind: "failed" }
+  /**
+   * The attempt never reached name validation at all — the coordinator
+   * settled non-completed, or the suggestion artifact could not be written
+   * or read back. `detail` names the concrete cause so the user-facing
+   * warning can say what actually happened instead of blaming the model for
+   * a reply it may well have produced correctly.
+   */
+  | { kind: "failed"; detail: string }
   | { kind: "ok"; name: string };
 
 /**
@@ -256,7 +264,14 @@ async function requestAiNameV1(
     const rootId = ensureWorkflowTaskFolderRootV1(taskFolderUri.fsPath);
     const taskBindingId = getVerifiedTaskBindingIdV1(rootId);
     if (!taskBindingId) {
-      return { kind: "failed" };
+      return { kind: "failed", detail: "the task folder is not a verified task binding" };
+    }
+    // The row promotes into runs/ through createFileExclusive, which never
+    // creates missing parents — see ensureTaskRunsDirectoryV1. Do it before
+    // the provider call so a task that has never run a stage does not spend
+    // a model call on a promotion that cannot land.
+    if (!(await ensureTaskRunsDirectoryV1(rootId))) {
+      return { kind: "failed", detail: "the task's runs/ directory could not be created" };
     }
     const chatIdentity = await readChatDocumentIdentityV1(
       taskFolderUri.fsPath,
@@ -287,17 +302,30 @@ async function requestAiNameV1(
     });
 
     if (outcome.kind !== "completed") {
-      return { kind: "failed" };
+      return {
+        kind: "failed",
+        detail: `the action settled ${outcome.kind}${"code" in outcome ? ` (${outcome.code})` : ""}`,
+      };
     }
     const readResult = await getWorkflowFileStoreV1().readFileBounded(targetLocator, 16 * 1024);
     if (readResult.kind !== "ok") {
-      return { kind: "failed" };
+      return {
+        kind: "failed",
+        detail: `the suggestion artifact could not be read back (${readResult.kind}${
+          "code" in readResult ? `: ${readResult.code}` : ""
+        })`,
+      };
     }
     const name = normalizeAiNameReply(readResult.value.bytes.toString("utf8"));
-    return name.length > 0 ? { kind: "ok", name } : { kind: "failed" };
+    return name.length > 0
+      ? { kind: "ok", name }
+      : { kind: "failed", detail: "the reply was empty" };
   } catch (error) {
     console.error("renameTaskWithAI: provider/coordinator call threw", error);
-    return { kind: "failed" };
+    return {
+      kind: "failed",
+      detail: error instanceof Error ? error.message : String(error),
+    };
   }
 }
 
@@ -367,12 +395,15 @@ export async function renameTaskWithAI(
         }
 
         const rejectedReplies: string[] = [];
+        let lastFailureDetail: string | undefined;
         let validated: NameValidationResult | undefined;
         if (first.kind === "ok") {
           validated = validateAiNameReply(first.name, sourceText);
           if (!validated.ok) {
             rejectedReplies.push(first.name);
           }
+        } else {
+          lastFailureDetail = first.detail;
         }
 
         // At most one bounded re-prompt covers every failure combination
@@ -390,16 +421,30 @@ export async function renameTaskWithAI(
             if (!validated.ok) {
               rejectedReplies.push(retry.name);
             }
+          } else if (retry.kind === "failed") {
+            lastFailureDetail = retry.detail;
           }
         }
 
         if (!validated || !validated.ok) {
           console.error(
             `renameTaskWithAI: no valid 6-8 word summary produced for "${task.taskFolderPath}"`,
-            { rejectedReplies }
+            { rejectedReplies, lastFailureDetail }
           );
+          // Only blame the model when it actually replied and the reply was
+          // rejected. When no reply ever reached validation the cause is the
+          // run itself — a non-completed settlement, or a storage failure
+          // writing/reading the suggestion artifact — and saying "the AI did
+          // not produce a valid summary" sends diagnosis in the wrong
+          // direction entirely (observed 2026-08-20, where the model had
+          // answered correctly twice and promotion failed on a missing
+          // runs/ directory).
           NotificationRouter.showWarning(
-            "The AI did not produce a valid task summary, so the name was not changed. Configure a Description-stage model in AI Models, or rename manually."
+            rejectedReplies.length > 0
+              ? "The AI did not produce a valid task summary, so the name was not changed. Configure a Description-stage model in AI Models, or rename manually."
+              : `Rename Task with AI could not complete, so the name was not changed — ${
+                  lastFailureDetail ?? "the provider call failed"
+                }. Try again, or rename manually.`
           );
           return;
         }
