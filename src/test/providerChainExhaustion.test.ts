@@ -39,6 +39,8 @@ import { StatusTreeProvider } from "../views/statusView";
 import { decodeTaskProgressTextV1 } from "../services/taskProgressDecoderV1";
 import { TaskProgress } from "../types/taskProgress";
 import { ProviderChainExhaustionV1 } from "../types/taskActionOutcomeV1";
+import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
+import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
 
 const REAL_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-chain-exhaustion-"));
 
@@ -163,6 +165,25 @@ async function withHarness(run: () => Promise<void>): Promise<void> {
   }
 }
 
+function makeExtensionContext(): vscode.ExtensionContext {
+  const backing = new Map<string, unknown>();
+  const memento = {
+    keys: (): readonly string[] => [...backing.keys()],
+    get: <T>(key: string, defaultValue?: T): T | undefined =>
+      backing.has(key) ? (backing.get(key) as T) : defaultValue,
+    update: (key: string, value: unknown): Thenable<void> => {
+      if (value === undefined) { backing.delete(key); } else { backing.set(key, value); }
+      return Promise.resolve();
+    },
+  };
+  return {
+    subscriptions: [] as vscode.Disposable[],
+    extensionUri: vscode.Uri.file(REAL_ROOT),
+    workspaceState: memento,
+    globalState: memento,
+  } as unknown as vscode.ExtensionContext;
+}
+
 /** A chain exhausted because the primary candidate hit a quota block. */
 const QUOTA_EXHAUSTION: ProviderChainExhaustionV1 = {
   stage: "impl-high-review",
@@ -230,6 +251,67 @@ void describe("provider chain exhaustion (stage owner)", () => {
     const persisted = readProgress(folderPath);
     assert.equal(persisted.status, "paused");
     assert.equal(persisted.quotaParkRecord, undefined);
+  });
+
+  void it("posts a WorkflowDecisionV1 enumerating retry/adjust/stay with a 'no basis' recommendation when nothing is quota-shaped", async () => {
+    const { folderUri } = makeTaskFolder("exhausted_decision_no_quota");
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    try {
+      await withHarness(async () => {
+        await pauseTaskForExhaustedChainV1(folderUri, "impl-high-review", EXHAUSTION);
+      });
+      const store = new WorkflowDecisionStoreV1(context.workspaceState);
+      const decision = store
+        .listPending(folderUri.fsPath)
+        .find((d) => d.decisionKey === "providerChainExhausted");
+      assert.ok(decision, "a decision must be posted");
+      const optionIds = decision.options.map((o) => o.optionId);
+      assert.deepEqual(
+        optionIds.sort(),
+        ["adjustSettings", "retry", "stay"].sort(),
+        "no quotaParkRecord means no 'wait' option should be offered"
+      );
+      for (const option of decision.options) {
+        assert.ok(option.consequence.length > 0, `option "${option.optionId}" must state its consequence`);
+      }
+      assert.equal(
+        decision.recommendation.kind,
+        "none",
+        "no quota/entitlement signal means the system has no basis to recommend one option over another"
+      );
+    } finally {
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
+  void it("posts a WorkflowDecisionV1 that recommends 'wait' when the quota reset is imminent", async () => {
+    const { folderUri } = makeTaskFolder("exhausted_decision_quota_wait");
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    try {
+      await withHarness(async () => {
+        await pauseTaskForExhaustedChainV1(folderUri, "impl-high-review", QUOTA_EXHAUSTION);
+      });
+      const store = new WorkflowDecisionStoreV1(context.workspaceState);
+      const decision = store
+        .listPending(folderUri.fsPath)
+        .find((d) => d.decisionKey === "providerChainExhausted");
+      assert.ok(decision, "a decision must be posted");
+      const optionIds = decision.options.map((o) => o.optionId);
+      assert.deepEqual(
+        optionIds.sort(),
+        ["adjustSettings", "retry", "stay", "wait"].sort(),
+        "a known near-term reset must add the 'wait' option to the base three"
+      );
+      assert.equal(decision.recommendation.kind, "option");
+      if (decision.recommendation.kind === "option") {
+        assert.equal(decision.recommendation.optionId, "wait");
+        assert.ok(decision.recommendation.reasoning.length > 0);
+      }
+    } finally {
+      __extensionContextV1TestOnly.reset();
+    }
   });
 
   void it("writes an enriched run record naming the exhausted chain and per-candidate reasons", async () => {

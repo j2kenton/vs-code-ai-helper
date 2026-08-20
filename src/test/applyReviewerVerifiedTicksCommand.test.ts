@@ -28,7 +28,7 @@ import * as nodePath from "node:path";
 import { after, describe, it } from "node:test";
 import * as vscode from "vscode";
 
-import { applyReviewerVerifiedTicks } from "../commands/applyReviewerVerifiedTicks";
+import { applyReviewerVerifiedTicks, applyReviewerVerifiedTicksConfirmedV1 } from "../commands/applyReviewerVerifiedTicks";
 import { TaskInventory } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { TaskProgress } from "../types/taskProgress";
@@ -37,6 +37,9 @@ import {
   deactivateNotificationRouter,
   initNotificationRouter,
 } from "../utils/notificationRouter";
+import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
+import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
+import { WorkflowDecisionV1 } from "../types/workflowDecisionV1";
 
 const ROOT = nodeFs.mkdtempSync(
   nodePath.join(nodeOs.tmpdir(), "ensemble-apply-verified-ticks-test-")
@@ -229,33 +232,83 @@ function installRealFs(): { restore: () => void } {
   };
 }
 
+function makeExtensionContext(): vscode.ExtensionContext {
+  const backing = new Map<string, unknown>();
+  const memento = {
+    keys: (): readonly string[] => [...backing.keys()],
+    get: <T>(key: string, defaultValue?: T): T | undefined =>
+      backing.has(key) ? (backing.get(key) as T) : defaultValue,
+    update: (key: string, value: unknown): Thenable<void> => {
+      if (value === undefined) { backing.delete(key); } else { backing.set(key, value); }
+      return Promise.resolve();
+    },
+  };
+  return {
+    subscriptions: [] as vscode.Disposable[],
+    extensionUri: vscode.Uri.file(ROOT),
+    workspaceState: memento,
+    globalState: memento,
+  } as unknown as vscode.ExtensionContext;
+}
+
+/**
+ * `applyReviewerVerifiedTicks` no longer confirms via a modal — it posts a
+ * `WorkflowDecisionV1` (case 2, applyReviewerVerifiedTicks.ts's doc comment)
+ * and returns. This driver wires the process-wide extension context so the
+ * decision store persists, captures whatever decision was posted, optionally
+ * injects `interference` between posting and confirming, and when `confirm`
+ * is true resolves the "apply" option and runs
+ * `applyReviewerVerifiedTicksConfirmedV1` — exactly what choosing "Apply" in
+ * Chat With AI would dispatch.
+ */
 async function run(
   name: string,
   taskOptions: { plan?: string; review?: string; currentStage?: TaskProgress["currentStage"] },
-  windowOptions: { answer?: string; onModal?: (folder: string) => void },
+  confirmOptions: { confirm?: boolean; interference?: (folder: string) => void },
   arg?: unknown
-): Promise<{ captured: Captured[]; folder: string; refreshes: number }> {
+): Promise<{ captured: Captured[]; folder: string; refreshes: number; decision?: WorkflowDecisionV1 }> {
   const { folder, progress } = makeTask(name, taskOptions);
   const canonicalId = `canonical-${name}`;
   const { inventory, refreshCount } = makeInventory(canonicalId, folder, progress);
   const workspace = installWorkspaceFolders();
   const fs = installRealFs();
-  const win = installWindowStub({
-    answer: windowOptions.answer,
-    onModal: windowOptions.onModal ? (): void => windowOptions.onModal!(folder) : undefined,
-  });
+  const win = installWindowStub({});
+  const context = makeExtensionContext();
+  __extensionContextV1TestOnly.set(context);
   try {
     await applyReviewerVerifiedTicks(
       inventory,
       makeStore(canonicalId),
       (arg ?? { canonicalId, taskFolderPath: folder }) as never
     );
+    const store = new WorkflowDecisionStoreV1(context.workspaceState);
+    const decision = store
+      .listPending(canonicalId)
+      .find((d) => d.decisionKey === "applyReviewerVerifiedTicks");
+    if (decision) {
+      const applyOption = decision.options.find((o) => o.optionId === "apply");
+      win.captured.push({
+        method: "modal",
+        message: `${decision.whatHappened}\n${applyOption?.label ?? ""}\n${applyOption?.consequence ?? ""}`,
+      });
+    }
+    confirmOptions.interference?.(folder);
+    if (confirmOptions.confirm && decision) {
+      const resolved = await store.resolve(decision.decisionId, "apply");
+      if (resolved.kind === "resolved") {
+        await applyReviewerVerifiedTicksConfirmedV1(inventory, makeStore(canonicalId), {
+          canonicalId,
+          taskFolderPath: folder,
+        });
+      }
+    }
+    return { captured: win.captured, folder, refreshes: refreshCount(), decision };
   } finally {
     win.restore();
     fs.restore();
     workspace.restore();
+    __extensionContextV1TestOnly.reset();
   }
-  return { captured: win.captured, folder, refreshes: refreshCount() };
 }
 
 void describe("applyReviewerVerifiedTicks — happy path", () => {
@@ -263,7 +316,7 @@ void describe("applyReviewerVerifiedTicks — happy path", () => {
     const result = await run(
       "happy",
       { review: REVIEW_WITH_VERIFIED_ITEMS },
-      { answer: "Apply Ticks" }
+      { confirm: true }
     );
     const plan = readPlan(result.folder);
     assert.match(plan, /- \[x\] Split the artifacts/, "already-ticked item stays ticked");
@@ -275,7 +328,7 @@ void describe("applyReviewerVerifiedTicks — happy path", () => {
       /Applied 1 reviewer-verified tick/
     );
     const modal = result.captured.find((m) => m.method === "modal")?.message ?? "";
-    assert.match(modal, /Apply 1 reviewer-verified tick/);
+    assert.match(modal, /Apply 1 Reviewer-Verified Tick/);
     assert.match(modal, /Wire the completeness gate/);
   });
 });
@@ -285,7 +338,7 @@ void describe("applyReviewerVerifiedTicks — refusals that write nothing", () =
     const result = await run(
       "no-block",
       { review: REVIEW_WITH_NO_VERIFIED_BLOCK },
-      { answer: "Apply Ticks" }
+      { confirm: true }
     );
     assert.equal(result.captured.some((m) => m.method === "modal"), false);
     assert.match(
@@ -301,7 +354,7 @@ void describe("applyReviewerVerifiedTicks — refusals that write nothing", () =
       "- Split the artifacts",
       "<!-- verified-complete:end -->",
     ].join("\n");
-    const result = await run("already-ticked", { review }, { answer: "Apply Ticks" });
+    const result = await run("already-ticked", { review }, { confirm: true });
     assert.equal(result.captured.some((m) => m.method === "modal"), false);
     assert.match(
       result.captured.find((m) => m.method === "info")?.message ?? "",
@@ -314,7 +367,7 @@ void describe("applyReviewerVerifiedTicks — refusals that write nothing", () =
     const result = await run(
       "no-checklist",
       { review: REVIEW_WITH_VERIFIED_ITEMS, plan: PLAN_WITHOUT_CHECKLIST },
-      { answer: "Apply Ticks" }
+      { confirm: true }
     );
     assert.equal(result.captured.some((m) => m.method === "modal"), false);
     assert.match(
@@ -324,7 +377,7 @@ void describe("applyReviewerVerifiedTicks — refusals that write nothing", () =
   });
 
   void it("reports no review artifact when the task has none yet", async () => {
-    const result = await run("no-review-file", {}, { answer: "Apply Ticks" });
+    const result = await run("no-review-file", {}, { confirm: true });
     assert.equal(result.captured.some((m) => m.method === "modal"), false);
     assert.match(
       result.captured.find((m) => m.method === "info")?.message ?? "",
@@ -336,7 +389,7 @@ void describe("applyReviewerVerifiedTicks — refusals that write nothing", () =
     const result = await run(
       "not-review-stage",
       { review: REVIEW_WITH_VERIFIED_ITEMS, currentStage: "impl" },
-      { answer: "Apply Ticks" }
+      { confirm: true }
     );
     assert.equal(result.captured.some((m) => m.method === "modal"), false);
     assert.match(
@@ -354,7 +407,7 @@ void describe("applyReviewerVerifiedTicks — items that do not resolve", () => 
       "- Something the plan never actually said",
       "<!-- verified-complete:end -->",
     ].join("\n");
-    const result = await run("partial-resolve", { review }, { answer: "Apply Ticks" });
+    const result = await run("partial-resolve", { review }, { confirm: true });
     const plan = readPlan(result.folder);
     assert.match(plan, /- \[x\] Wire the completeness gate/);
     assert.match(
@@ -365,19 +418,53 @@ void describe("applyReviewerVerifiedTicks — items that do not resolve", () => 
   });
 });
 
+void describe("applyReviewerVerifiedTicks — decision lists every applicable item without truncation", () => {
+  void it("lists all 12 applicable items in the option's consequence text, with no '…and N more' truncation", async () => {
+    const items = Array.from({ length: 12 }, (_, i) => `Step ${i + 1}`);
+    const plan = [
+      "<!-- ensemble:implementation-checklist -->",
+      "",
+      ...items.map((item) => `- [ ] ${item}`),
+      "",
+    ].join("\n");
+    const review = [
+      "<!-- verified-complete:start -->",
+      ...items.map((item) => `- ${item}`),
+      "<!-- verified-complete:end -->",
+    ].join("\n");
+    const result = await run("many-items", { plan, review }, { confirm: false });
+    assert.ok(result.decision, "the apply-ticks decision should have been posted");
+    const applyOption = result.decision.options.find((o) => o.optionId === "apply");
+    assert.ok(applyOption, "the decision must offer an 'apply' option");
+    for (const item of items) {
+      assert.match(
+        applyOption.consequence,
+        new RegExp(item.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+        `"${item}" must be named in the option's consequence text`
+      );
+    }
+    assert.doesNotMatch(
+      applyOption.consequence,
+      /…and \d+ more\.?/,
+      "the full list must be shown — no truncation to a preview"
+    );
+    assert.match(applyOption.label, /Apply 12 Reviewer-Verified Ticks/);
+  });
+});
+
 void describe("applyReviewerVerifiedTicks — cancellation and races", () => {
-  void it("writes nothing when the confirmation is dismissed", async () => {
+  void it("writes nothing when the decision is left unresolved", async () => {
     const result = await run(
       "cancelled",
       { review: REVIEW_WITH_VERIFIED_ITEMS },
-      { answer: undefined }
+      { confirm: false }
     );
-    assert.equal(result.captured.some((m) => m.method === "modal"), true);
+    assert.ok(result.decision, "the apply-ticks decision should have been posted");
     assert.equal(readPlan(result.folder), CHECKLIST_PLAN);
     assert.equal(result.refreshes, 0);
   });
 
-  void it("re-derives against fresh content when the plan changes while the confirmation is open, rather than aborting", async () => {
+  void it("re-derives against fresh content when the plan changes between posting and confirming, rather than aborting", async () => {
     // Ticking is monotonic and text-matched, so recomputing against whatever
     // is on disk at write time is safe — unlike reconcilePlanChecklist's
     // latch clear, which approves a byte-exact human judgement and must
@@ -386,8 +473,8 @@ void describe("applyReviewerVerifiedTicks — cancellation and races", () => {
       "race-plan-edited",
       { review: REVIEW_WITH_VERIFIED_ITEMS },
       {
-        answer: "Apply Ticks",
-        onModal: (folder): void => {
+        confirm: true,
+        interference: (folder): void => {
           nodeFs.writeFileSync(
             nodePath.join(folder, "plan-final.md"),
             CHECKLIST_PLAN.replace("- [ ] Add the retry button", "- [x] Add the retry button"),

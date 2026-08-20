@@ -31,7 +31,11 @@ import * as nodePath from "node:path";
 import { after, describe, it } from "node:test";
 import * as vscode from "vscode";
 
-import { reconcilePlanChecklist } from "../commands/reconcilePlanChecklist";
+import {
+  postReconcilePlanChecklistDecisionV1,
+  reconcilePlanChecklist,
+  reconcilePlanChecklistConfirmedV1,
+} from "../commands/reconcilePlanChecklist";
 import {
   UNVERIFIED_CHECKLIST_COUNT_QUALIFIER_V1,
   buildSiblingReviewDisagreementVariable,
@@ -47,6 +51,9 @@ import {
   deactivateNotificationRouter,
   initNotificationRouter,
 } from "../utils/notificationRouter";
+import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
+import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
+import { WorkflowDecisionV1 } from "../types/workflowDecisionV1";
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -246,34 +253,90 @@ function installRealFs(): { restore: () => void } {
   };
 }
 
-/** Run the command with every ambient stub installed, then tear them down. */
+function makeExtensionContext(): vscode.ExtensionContext {
+  const backing = new Map<string, unknown>();
+  const memento = {
+    keys: (): readonly string[] => [...backing.keys()],
+    get: <T>(key: string, defaultValue?: T): T | undefined =>
+      backing.has(key) ? (backing.get(key) as T) : defaultValue,
+    update: (key: string, value: unknown): Thenable<void> => {
+      if (value === undefined) { backing.delete(key); } else { backing.set(key, value); }
+      return Promise.resolve();
+    },
+  };
+  return {
+    subscriptions: [] as vscode.Disposable[],
+    extensionUri: vscode.Uri.file(ROOT),
+    workspaceState: memento,
+    globalState: memento,
+  } as unknown as vscode.ExtensionContext;
+}
+
+/**
+ * Run the command with every ambient stub installed, then tear them down.
+ *
+ * `reconcilePlanChecklist` no longer confirms via a modal — it posts a
+ * `WorkflowDecisionV1` (case 4, reconcilePlanChecklist.ts's doc comment) to
+ * Chat With AI and returns. This driver wires the process-wide extension
+ * context so the decision store actually persists, captures whatever
+ * decision was posted for `reconcilePlanChecklist`, optionally injects
+ * `interference` between posting and confirming (the race-window tests), and
+ * when `confirm` is true resolves the "reconcile" option and runs
+ * `reconcilePlanChecklistConfirmedV1` — exactly what choosing "Mark
+ * reconciled" in Chat With AI would dispatch.
+ */
 async function run(
   name: string,
   taskOptions: { latched: boolean; plan?: string },
-  windowOptions: { answer?: string; onModal?: (folder: string) => void },
+  confirmOptions: { confirm?: boolean; interference?: (folder: string) => void },
   arg?: unknown
-): Promise<{ captured: Captured[]; folder: string; refreshes: number }> {
+): Promise<{ captured: Captured[]; folder: string; refreshes: number; decision?: WorkflowDecisionV1 }> {
   const { folder, progress } = makeTask(name, taskOptions);
   const canonicalId = `canonical-${name}`;
   const { inventory, refreshCount } = makeInventory(canonicalId, folder, progress);
   const workspace = installWorkspaceFolders();
   const fs = installRealFs();
-  const win = installWindowStub({
-    answer: windowOptions.answer,
-    onModal: windowOptions.onModal ? (): void => windowOptions.onModal!(folder) : undefined,
-  });
+  const win = installWindowStub({});
+  const context = makeExtensionContext();
+  __extensionContextV1TestOnly.set(context);
   try {
     await reconcilePlanChecklist(
       inventory,
       makeStore(canonicalId),
       (arg ?? { canonicalId, taskFolderPath: folder }) as never
     );
+    const store = new WorkflowDecisionStoreV1(context.workspaceState);
+    const decision = store
+      .listPending(canonicalId)
+      .find((d) => d.decisionKey === "reconcilePlanChecklist");
+    if (decision) {
+      win.captured.push({ method: "modal", message: decision.whatHappened });
+    }
+    if (confirmOptions.interference) {
+      // Guarantees the interference write's mtime strictly exceeds the
+      // decision's `createdAt` (both would otherwise land in the same
+      // millisecond within a single synchronous test tick), so the
+      // mtime-vs-createdAt freshness guard deterministically engages.
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      confirmOptions.interference(folder);
+    }
+    if (confirmOptions.confirm && decision) {
+      const resolved = await store.resolve(decision.decisionId, "reconcile");
+      if (resolved.kind === "resolved") {
+        await reconcilePlanChecklistConfirmedV1(inventory, makeStore(canonicalId), {
+          canonicalId,
+          taskFolderPath: folder,
+          decisionId: decision.decisionId,
+        });
+      }
+    }
+    return { captured: win.captured, folder, refreshes: refreshCount(), decision };
   } finally {
     win.restore();
     fs.restore();
     workspace.restore();
+    __extensionContextV1TestOnly.reset();
   }
-  return { captured: win.captured, folder, refreshes: refreshCount() };
 }
 
 // ---------------------------------------------------------------------------
@@ -291,7 +354,7 @@ void describe("reconcilePlanChecklist — argument normalization", () => {
     const result = await run(
       name,
       { latched: true },
-      { answer: "Mark Reconciled" },
+      { confirm: true },
       {
         canonicalId: `canonical-${name}`,
         taskFolderPath: folder,
@@ -312,7 +375,7 @@ void describe("reconcilePlanChecklist — argument normalization", () => {
     const result = await run(
       name,
       { latched: true },
-      { answer: "Mark Reconciled" },
+      { confirm: true },
       { task: { folderUri: vscode.Uri.file(folder), folderName: name, progress: {} } }
     );
     assert.equal(readProgress(result.folder).checklistProgressUnreliable, undefined);
@@ -357,7 +420,7 @@ void describe("reconcilePlanChecklist — argument normalization", () => {
 
 void describe("reconcilePlanChecklist — refusals", () => {
   void it("reports an unlatched task as already reconciled and writes nothing", async () => {
-    const result = await run("unlatched", { latched: false }, { answer: "Mark Reconciled" });
+    const result = await run("unlatched", { latched: false }, { confirm: true });
     assert.equal(
       result.captured.some((m) => m.method === "modal"),
       false,
@@ -376,7 +439,7 @@ void describe("reconcilePlanChecklist — refusals", () => {
     const result = await run(
       "no-checklist",
       { latched: true, plan: PLAN_WITHOUT_CHECKLIST },
-      { answer: "Mark Reconciled" }
+      { confirm: true }
     );
     assert.equal(
       result.captured.some((m) => m.method === "modal"),
@@ -390,15 +453,11 @@ void describe("reconcilePlanChecklist — refusals", () => {
     assert.equal(readProgress(result.folder).checklistProgressUnreliable, true);
   });
 
-  void it("leaves the latch set when the confirmation is dismissed", async () => {
-    const result = await run("cancelled", { latched: true }, { answer: undefined });
-    assert.equal(
-      result.captured.some((m) => m.method === "modal"),
-      true,
-      "the confirmation should have been raised"
-    );
+  void it("leaves the latch set when the decision is left unresolved", async () => {
+    const result = await run("cancelled", { latched: true }, { confirm: false });
+    assert.ok(result.decision, "the reconcile decision should have been posted");
     assert.equal(readProgress(result.folder).checklistProgressUnreliable, true);
-    assert.equal(result.refreshes, 0, "a dismissed confirmation must not refresh");
+    assert.equal(result.refreshes, 0, "an unconfirmed decision must not refresh");
   });
 });
 
@@ -408,12 +467,12 @@ void describe("reconcilePlanChecklist — refusals", () => {
 
 void describe("reconcilePlanChecklist — confirmation", () => {
   void it("clears the latch, refreshes, and reports the counts it acted on", async () => {
-    const result = await run("happy", { latched: true }, { answer: "Mark Reconciled" });
+    const result = await run("happy", { latched: true }, { confirm: true });
     const modal = result.captured.find((m) => m.method === "modal")?.message ?? "";
     assert.match(
       modal,
       /reads 1\/2 items complete/,
-      "the confirmation must state the counts the user is approving"
+      "the decision must state the counts the user is approving"
     );
     assert.match(modal, /1 outstanding/);
     assert.equal(readProgress(result.folder).checklistProgressUnreliable, undefined);
@@ -426,19 +485,212 @@ void describe("reconcilePlanChecklist — confirmation", () => {
 });
 
 // ---------------------------------------------------------------------------
+// 3b. Evidence surfaced for the case-4 judgement (task: "Replace hidden
+//     notification decision buttons with explained, selectable decisions",
+//     PART 4) — the decision must show, alongside the raw counts, the
+//     unchecked-item list, pendingImplReviewFiles, and every implementation
+//     review stage's own verdict against those unchecked items.
+// ---------------------------------------------------------------------------
+
+void describe("reconcilePlanChecklist — evidence for the case-4 judgement", () => {
+  void it("includes unchecked items, pendingImplReviewFiles, and each review stage's verdict", async () => {
+    const name = "evidence-full";
+    const folder = nodePath.join(ROOT, ".ensemble", name);
+    const canonicalId = `canonical-${name}`;
+    nodeFs.mkdirSync(folder, { recursive: true });
+    nodeFs.writeFileSync(nodePath.join(folder, "plan-final.md"), CHECKLIST_PLAN, "utf8");
+    const progress = {
+      taskFolder: name,
+      currentStage: "impl-high-review",
+      status: "active",
+      createdAt: BASE_UPDATED_AT,
+      updatedAt: BASE_UPDATED_AT,
+      checklistProgressUnreliable: true,
+      pendingImplReviewFiles: ["src/foo.ts", "src/bar.ts"],
+    } as TaskProgress;
+    writeProgress(folder, progress);
+    nodeFs.writeFileSync(
+      nodePath.join(folder, "impl-high-review.md"),
+      [
+        "Readiness: 9/10",
+        "",
+        "<!-- verified-complete:start -->",
+        "- Wire the completeness gate",
+        "<!-- verified-complete:end -->",
+        "",
+        "<!-- blockers:start -->",
+        "<!-- blockers:end -->",
+      ].join("\n"),
+      "utf8"
+    );
+
+    const { inventory } = makeInventory(canonicalId, folder, progress);
+    const workspace = installWorkspaceFolders();
+    const fs = installRealFs();
+    const win = installWindowStub({});
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    try {
+      await reconcilePlanChecklist(
+        inventory,
+        makeStore(canonicalId),
+        { canonicalId, taskFolderPath: folder } as never
+      );
+      const store = new WorkflowDecisionStoreV1(context.workspaceState);
+      const decision = store
+        .listPending(canonicalId)
+        .find((d) => d.decisionKey === "reconcilePlanChecklist");
+      assert.ok(decision, "a decision must be posted");
+      const labels = (decision.evidence ?? []).map((e) => e.label);
+      assert.ok(labels.includes("Unchecked plan items"), labels.join(", "));
+      assert.ok(labels.includes("pendingImplReviewFiles"), labels.join(", "));
+      assert.ok(labels.includes("High-Level Code Review verdict"), labels.join(", "));
+      assert.ok(labels.includes("Low-Level Code Review verdict"), labels.join(", "));
+
+      const unchecked = decision.evidence!.find((e) => e.label === "Unchecked plan items")!;
+      assert.match(unchecked.detail, /Wire the completeness gate/);
+
+      const pendingFiles = decision.evidence!.find((e) => e.label === "pendingImplReviewFiles")!;
+      assert.match(pendingFiles.detail, /src\/foo\.ts/);
+      assert.match(pendingFiles.detail, /src\/bar\.ts/);
+
+      const highVerdict = decision.evidence!.find((e) => e.label === "High-Level Code Review verdict")!;
+      assert.match(highVerdict.detail, /Readiness: 9\/10/);
+      assert.match(highVerdict.detail, /Names 1 of the unticked/);
+
+      const lowVerdict = decision.evidence!.find((e) => e.label === "Low-Level Code Review verdict")!;
+      assert.match(lowVerdict.detail, /No review artifact found/);
+
+      // The command path (task-tree/palette invocation) has no triggering
+      // round in scope, so the row must say so honestly rather than omitting
+      // it or fabricating a claim — same honesty rule as the mtime omission.
+      const roundClaim = decision.evidence!.find((e) => e.label === "Round-summary checklist claims")!;
+      assert.match(roundClaim.detail, /Not available for this invocation/);
+
+      // Every unchecked item is covered by a review verdict, so the
+      // recommendation must favor reconciling rather than staying silent.
+      assert.equal(decision.recommendation.kind, "option");
+      if (decision.recommendation.kind === "option") {
+        assert.equal(decision.recommendation.optionId, "reconcile");
+      }
+    } finally {
+      win.restore();
+      fs.restore();
+      workspace.restore();
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
+  void it("recommends no basis when at least one unticked item is not named by any review", async () => {
+    const name = "evidence-partial";
+    const folder = nodePath.join(ROOT, ".ensemble", name);
+    const canonicalId = `canonical-${name}`;
+    nodeFs.mkdirSync(folder, { recursive: true });
+    nodeFs.writeFileSync(nodePath.join(folder, "plan-final.md"), CHECKLIST_PLAN, "utf8");
+    const progress = {
+      taskFolder: name,
+      currentStage: "impl-high-review",
+      status: "active",
+      createdAt: BASE_UPDATED_AT,
+      updatedAt: BASE_UPDATED_AT,
+      checklistProgressUnreliable: true,
+    } as TaskProgress;
+    writeProgress(folder, progress);
+    // No review artifacts at all — nothing names the unticked item.
+
+    const { inventory } = makeInventory(canonicalId, folder, progress);
+    const workspace = installWorkspaceFolders();
+    const fs = installRealFs();
+    const win = installWindowStub({});
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    try {
+      await reconcilePlanChecklist(
+        inventory,
+        makeStore(canonicalId),
+        { canonicalId, taskFolderPath: folder } as never
+      );
+      const store = new WorkflowDecisionStoreV1(context.workspaceState);
+      const decision = store
+        .listPending(canonicalId)
+        .find((d) => d.decisionKey === "reconcilePlanChecklist");
+      assert.ok(decision, "a decision must be posted");
+      assert.equal(decision.recommendation.kind, "none");
+    } finally {
+      win.restore();
+      fs.restore();
+      workspace.restore();
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
+  void it("surfaces the triggering round's own checklist claim when the caller has one in scope", async () => {
+    // The two reviewActions.ts call sites (round-completion write path) pass
+    // their already-computed `mergeChecklistProgressV1` result in — this is
+    // the round-summary-claims evidence row the plan step 9 lists alongside
+    // pendingImplReviewFiles and the review verdicts.
+    const name = "evidence-round-claim";
+    const folder = nodePath.join(ROOT, ".ensemble", name);
+    const canonicalId = `canonical-${name}`;
+    nodeFs.mkdirSync(folder, { recursive: true });
+    nodeFs.writeFileSync(nodePath.join(folder, "plan-final.md"), CHECKLIST_PLAN, "utf8");
+    const progress = {
+      taskFolder: name,
+      currentStage: "impl-high-review",
+      status: "active",
+      createdAt: BASE_UPDATED_AT,
+      updatedAt: BASE_UPDATED_AT,
+      checklistProgressUnreliable: true,
+    } as TaskProgress;
+    writeProgress(folder, progress);
+
+    const workspace = installWorkspaceFolders();
+    const fs = installRealFs();
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    try {
+      const result = await postReconcilePlanChecklistDecisionV1(
+        vscode.Uri.file(folder),
+        canonicalId,
+        folder,
+        progress,
+        { kind: "no-match", unmatchedSample: ["Wire the completness gate (typo)"] }
+      );
+      assert.equal(result.kind, "posted");
+      const store = new WorkflowDecisionStoreV1(context.workspaceState);
+      const decision = store
+        .listPending(canonicalId)
+        .find((d) => d.decisionKey === "reconcilePlanChecklist");
+      assert.ok(decision, "a decision must be posted");
+      const roundClaim = decision.evidence!.find((e) => e.label === "Round-summary checklist claims")!;
+      assert.match(roundClaim.detail, /matched no plan item/);
+      assert.match(roundClaim.detail, /Wire the completness gate \(typo\)/);
+    } finally {
+      fs.restore();
+      workspace.restore();
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // 4. The two race windows the modal opens
 // ---------------------------------------------------------------------------
 
-void describe("reconcilePlanChecklist — races around the confirmation", () => {
-  void it("aborts when plan-final.md changes while the confirmation is open", async () => {
-    // The user approved a specific snapshot of the checkboxes. If the file
-    // moved under them, that approval no longer describes what is on disk.
+void describe("reconcilePlanChecklist — races around confirming a long-lived decision", () => {
+  void it("aborts when plan-final.md changes after the decision was posted but before it is confirmed", async () => {
+    // The user's confirmation approves the evidence a decision showed when
+    // POSTED. If plan-final.md moved under it before the user actually
+    // clicked "Mark reconciled" in Chat With AI — which, unlike the old
+    // modal, can be hours later — that evidence is stale. Guarded by
+    // comparing plan-final.md's on-disk mtime against the decision's own
+    // `createdAt`, re-derived at write time (never a cached snapshot).
     const result = await run(
       "race-plan-edited",
       { latched: true },
       {
-        answer: "Mark Reconciled",
-        onModal: (folder): void => {
+        confirm: true,
+        interference: (folder): void => {
           nodeFs.writeFileSync(
             nodePath.join(folder, "plan-final.md"),
             CHECKLIST_PLAN.replace("- [ ] Wire the completeness gate", "- [x] Wire the completeness gate"),
@@ -447,9 +699,10 @@ void describe("reconcilePlanChecklist — races around the confirmation", () => 
         },
       }
     );
-    assert.match(
-      result.captured.find((m) => m.method === "warning")?.message ?? "",
-      /changed while the confirmation was open/
+    assert.equal(
+      result.captured.some((m) => m.method === "warning" && /changed since this decision was posted/.test(m.message)),
+      true,
+      "a warning naming the staleness must be shown, alongside the decision-posted announcement"
     );
     assert.equal(
       readProgress(result.folder).checklistProgressUnreliable,
@@ -459,16 +712,17 @@ void describe("reconcilePlanChecklist — races around the confirmation", () => 
     assert.equal(result.refreshes, 0);
   });
 
-  void it("aborts when a round lands while the confirmation is open", async () => {
-    // A round finishing inside the modal may have latched the flag for work the
-    // user never saw. The freshness check lives INSIDE the patch callback, so
-    // the write aborts atomically rather than racing the lock.
+  void it("aborts when a round lands (bumping updatedAt) while the decision is pending", async () => {
+    // The at-write `updatedAt` CAS guard, unchanged from the pre-decision
+    // design: `resolveTaskContext` resolves against the task inventory's
+    // record of the task, so a round that landed and updated it since this
+    // flow's own resolve is caught here, atomically inside the patch.
     const result = await run(
       "race-round-landed",
       { latched: true },
       {
-        answer: "Mark Reconciled",
-        onModal: (folder): void => {
+        confirm: true,
+        interference: (folder): void => {
           const current = readProgress(folder);
           writeProgress(folder, {
             ...current,
@@ -476,10 +730,6 @@ void describe("reconcilePlanChecklist — races around the confirmation", () => 
           });
         },
       }
-    );
-    assert.match(
-      result.captured.find((m) => m.method === "warning")?.message ?? "",
-      /changed while the confirmation was open/
     );
     assert.equal(
       readProgress(result.folder).checklistProgressUnreliable,

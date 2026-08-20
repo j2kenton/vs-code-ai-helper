@@ -35,7 +35,7 @@ import { describe, it } from "node:test";
 import * as vscode from "vscode";
 
 import { runImplementationWithAI, runReviewForFolder } from "../commands/reviewActions";
-import { applyReviewerVerifiedTicks } from "../commands/applyReviewerVerifiedTicks";
+import { applyReviewerVerifiedTicks, applyReviewerVerifiedTicksConfirmedV1 } from "../commands/applyReviewerVerifiedTicks";
 import { TaskInventory } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import {
@@ -64,6 +64,8 @@ import {
   setChatInteractionTransactionStoreV1,
 } from "../services/workflowRuntimeServicesV1";
 import { createChatInteractionTransactionStoreV1 } from "../services/chatInteractionTransactionStoreV1";
+import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
+import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
 
 /* eslint-disable @typescript-eslint/no-var-requires */
 const runEditActionModule = require("../commands/runEditActionV1") as Record<string, unknown>;
@@ -494,6 +496,16 @@ interface HarnessRun {
    * (finding 3).
    */
   notifications: { message: string; actionCommand?: { command: string; title: string } }[];
+  /**
+   * Every pending `WorkflowDecisionV1` left in the store at the end of the
+   * run (task: "Replace hidden notification decision buttons with explained,
+   * selectable decisions") — the reconcile/apply-ticks/restore notifications
+   * this run's write paths used to attach a bare action button to now post a
+   * decision here instead; assertions check `decisionKey` rather than a
+   * notification's `actionCommand`. Populated by `runHarnessed` itself, so it
+   * is absent until the harness returns.
+   */
+  pendingDecisions?: readonly import("../types/workflowDecisionV1").WorkflowDecisionV1[];
 }
 
 interface HarnessOptions {
@@ -624,6 +636,14 @@ async function runHarnessed(
   ];
 
   const context = makeExtensionContext();
+  // Wires the process-wide extension-context accessor (extensionContextV1.ts)
+  // so the WorkflowDecisionV1 posting paths deep in this write path (the
+  // reconcile/apply-ticks/restore decisions) can actually construct a
+  // WorkflowDecisionStoreV1 over this run's own workspaceState, exactly as
+  // extension.ts's activate() does in production — without this, every
+  // decision-posting call site silently no-ops (no active extension
+  // context) and falls back to a bare notification with no action.
+  __extensionContextV1TestOnly.set(context);
   try {
     await runImplementationWithAI(
       vscode.Uri.file(REAL_ROOT),
@@ -637,7 +657,9 @@ async function runHarnessed(
     fsBridge.restore();
     provider.dispose();
     deactivateNotificationRouter();
+    __extensionContextV1TestOnly.reset();
   }
+  run.pendingDecisions = new WorkflowDecisionStoreV1(context.workspaceState).listPending();
   return run;
 }
 
@@ -978,11 +1000,14 @@ void describe("checklist reconciliation prompt while the latch is set", () => {
     assert.match(logs[0]!, /## Checklist reconciliation needed/);
     assert.match(logs[0]!, /Mark Plan Checklist Reconciled/);
 
+    const decision = run.pendingDecisions?.find((d) => d.decisionKey === "reconcilePlanChecklist");
+    assert.ok(decision, "a WorkflowDecisionV1 must carry the reconcile affordance");
+    assert.match(decision.whatHappened, /unreliable/);
+
     const affordance = run.notifications.find(
-      (n) => n.actionCommand?.command === "vs-code-ai-helper.reconcilePlanChecklist"
+      (n) => n.actionCommand?.command === "vs-code-ai-helper.openWorkflowDecision"
     );
-    assert.ok(affordance, "a notification must carry the reconcile affordance");
-    assert.match(affordance.message, /unverified/);
+    assert.ok(affordance, "the notification announcing it must route to Chat With AI");
   });
 
   void it("an unlatched round surfaces no reconciliation prompt", async () => {
@@ -1000,9 +1025,7 @@ void describe("checklist reconciliation prompt while the latch is set", () => {
     const logs = readRunLogs(folderPath);
     assert.doesNotMatch(logs[0]!, /## Checklist reconciliation needed/);
     assert.equal(
-      run.notifications.some(
-        (n) => n.actionCommand?.command === "vs-code-ai-helper.reconcilePlanChecklist"
-      ),
+      run.pendingDecisions?.some((d) => d.decisionKey === "reconcilePlanChecklist"),
       false
     );
   });
@@ -1125,9 +1148,7 @@ void describe("checklistProgressUnreliable latch fires on claimed-but-unmerged p
     assert.equal(persisted?.checklistProgressUnreliable, true);
 
     assert.equal(
-      run.notifications.some(
-        (n) => n.actionCommand?.command === "vs-code-ai-helper.reconcilePlanChecklist"
-      ),
+      run.pendingDecisions?.some((d) => d.decisionKey === "reconcilePlanChecklist"),
       true,
       "the reconcile affordance must surface even though no files changed"
     );
@@ -1577,11 +1598,12 @@ void describe("checklistProgressUnreliable latches on a review-confirmed sterile
       true,
       "a qualifying zero-blocker full-marks review proves the checklist counts are under-recording"
     );
-    assert.equal(
-      run.notifications.some((n) => /under-recording/.test(n.message)),
-      true,
+    const reconcileDecision = run.pendingDecisions?.find((d) => d.decisionKey === "reconcilePlanChecklist");
+    assert.ok(
+      reconcileDecision,
       "the operator must be told the counts are being stood down, not just that nothing happened"
     );
+    assert.match(reconcileDecision.whatHappened, /unreliable/);
     const logs = readRunLogs(folderPath);
     assert.ok(
       logs.some((log) => /## Checklist counts stood down \(under-recording\)/.test(log)),
@@ -2171,7 +2193,13 @@ void describe("the reviewer-verified-ticks exit reaches literal Publish with no 
     const origShowWarning = windowTarget.showWarningMessage;
     windowTarget.showWarningMessage = (): Promise<string> => Promise.resolve("Apply Ticks");
     try {
+      // applyReviewerVerifiedTicks now only POSTS the explained decision
+      // (case 2 — its own doc comment); this test is about the write
+      // mechanics that used to run behind the modal, so it drives the
+      // confirmed-execution path directly, as choosing "Apply" in Chat
+      // With AI would.
       await applyReviewerVerifiedTicks(inventory, store, { taskFolderPath: folderPath });
+      await applyReviewerVerifiedTicksConfirmedV1(inventory, store, { taskFolderPath: folderPath });
     } finally {
       windowTarget.showWarningMessage = origShowWarning;
       wsStub.restore();
@@ -2326,16 +2354,20 @@ void describe("durable recovery transition (implRecovery, end to end)", () => {
     assert.match(logs[0]!, /## Unusable summary — recovery scheduled/);
     assert.match(logs[0]!, /- src\/rejected\.ts/);
 
-    // Continuation scheduled; the warning keeps the Restore Prior Round action.
+    // Continuation scheduled; the restore option is now offered as an
+    // explained WorkflowDecisionV1 rather than a bare notification button
+    // (task: "Replace hidden notification decision buttons with explained,
+    // selectable decisions").
     assert.equal(
       run.dispatches.some((d) => d.chainId === "impl-continuation"),
       true
     );
-    const warning = run.notifications.find(
-      (n) => n.actionCommand?.command === "vs-code-ai-helper.restoreRejectedImplementationRound"
-    );
-    assert.ok(warning, "the rejected-summary warning keeps its restore action");
-    assert.match(warning.message, /continuation implementation round \(1 of 3, unconstrained\)/);
+    const decision = run.pendingDecisions?.find((d) => d.decisionKey === "restoreRejectedImplementationRound");
+    assert.ok(decision, "the rejected-summary path keeps its restore decision");
+    assert.match(decision.whatHappened, /continuation implementation round \(1 of 3, unconstrained\)/);
+    const restoreOption = decision.options.find((o) => o.optionId === "restore");
+    assert.ok(restoreOption?.destructive, "the restore option must be flagged destructive");
+    assert.match(restoreOption.consequence, /discard/i);
   });
 
   void it("cap exhaustion on the rejected-summary path escalates to human instead of looping", async () => {

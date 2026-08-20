@@ -308,6 +308,17 @@
         "category": "Ensemble"
       },
       {
+        "command": "vs-code-ai-helper.openWorkflowDecision",
+        "title": "Review Pending Decision",
+        "category": "Ensemble"
+      },
+      {
+        "command": "vs-code-ai-helper.viewPendingTaskDecision",
+        "title": "Review Pending Decision",
+        "category": "Ensemble",
+        "icon": "$(comment-unresolved)"
+      },
+      {
         "command": "vs-code-ai-helper.runPublishChecks",
         "title": "Run Publish Checks (Lint, Tests & Plan)",
         "category": "Ensemble",
@@ -792,6 +803,11 @@
           "command": "vs-code-ai-helper.deleteStageBackup",
           "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage/ && viewItem =~ /-has-backup/",
           "group": "stage@1"
+        },
+        {
+          "command": "vs-code-ai-helper.viewPendingTaskDecision",
+          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^task/ && viewItem =~ /-decisionPending/",
+          "group": "inline@1"
         },
         {
           "command": "vs-code-ai-helper.renameTask",

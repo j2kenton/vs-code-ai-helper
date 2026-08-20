@@ -71,7 +71,7 @@ import { registerConfigureStepModelsCommand } from "./commands/configureStepMode
 import { TaskTreeProvider, TASKS_VIEW_ID, TaskNode, StageNode, EmptyTasksNode } from "./views/taskTreeProvider";
 import { TaskStatusBar } from "./views/taskStatusBar";
 import { SettingsViewProvider } from "./views/settingsView";
-import { ChatViewProvider, ChatInteractionServiceResultV1 } from "./views/chatView";
+import { ChatViewProvider, ChatInteractionServiceResultV1, ChatTarget } from "./views/chatView";
 import {
   createChatInteractionTransactionStoreV1,
 } from "./services/chatInteractionTransactionStoreV1";
@@ -693,6 +693,35 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("vs-code-ai-helper.resetChatHistory", () =>
       chatViewProvider.resetHistoryForCurrentTarget()
     )
+  );
+  // The single "Review decision in Chat" action a pending WorkflowDecisionV1's
+  // announcing notification (notifyPendingWorkflowDecision) and a task-tree
+  // pending-decision affordance both route through: open Chat With AI on the
+  // decision's task/stage, where the explained choice itself renders. Never
+  // the decision surface itself — see chatView.ts's module header.
+  context.subscriptions.push(
+    vscode.commands.registerCommand("vs-code-ai-helper.openWorkflowDecision", (target: ChatTarget) =>
+      chatViewProvider.open(target)
+    )
+  );
+  // The task-tree "Review Pending Decision" affordance (taskTreeProvider.ts
+  // PART 3): VS Code invokes a view/item/context command with the TreeItem
+  // itself as its argument, not a ChatTarget, so this wrapper derives the
+  // target from the TaskNode's task and its most-recently-posted pending
+  // decision (`TaskNode.pendingDecision`) — routed to that decision's own
+  // stage, since decisions render stage-scoped in Chat With AI.
+  context.subscriptions.push(
+    vscode.commands.registerCommand("vs-code-ai-helper.viewPendingTaskDecision", (node?: TaskNode) => {
+      const decision = node?.pendingDecision;
+      if (!node || !decision) return;
+      const target: ChatTarget = {
+        canonicalId: node.task.canonicalId ?? node.task.folderUri.fsPath,
+        taskFolderPath: node.task.folderUri.fsPath,
+        stage: decision.stage,
+        taskName: node.task.progress.displayName,
+      };
+      return chatViewProvider.open(target);
+    })
   );
 
   const progressBinder = new ViewProgressBinder(taskOperations);

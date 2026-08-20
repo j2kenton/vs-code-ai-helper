@@ -28,6 +28,8 @@ import {
   StructuredAnswerV1,
   StructuredQuestionV1,
 } from "../types/structuredQuestionV1";
+import { WorkflowDecisionV1 } from "../types/workflowDecisionV1";
+import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
 
 export type { ChatMessage };
 
@@ -186,6 +188,32 @@ function isInteractionActionMessage(value: unknown): value is InteractionActionM
   );
 }
 
+/**
+ * The webview's single commit path for a `WorkflowDecisionV1` card: choosing
+ * an option and pressing Confirm posts exactly this one message (task:
+ * "Replace hidden notification decision buttons with explained, selectable
+ * decisions" — PART 2 applies the SAME single-commit-path and acknowledgement
+ * rules PART 0 established for structured questions, so the two decision
+ * surfaces do not diverge).
+ */
+interface ResolveWorkflowDecisionMessage {
+  type: "resolveWorkflowDecision";
+  decisionId: string;
+  optionId: string;
+}
+
+function isResolveWorkflowDecisionMessage(value: unknown): value is ResolveWorkflowDecisionMessage {
+  if (!value || typeof value !== "object") return false;
+  const v = value as Record<string, unknown>;
+  return (
+    v.type === "resolveWorkflowDecision" &&
+    typeof v.decisionId === "string" &&
+    v.decisionId.length > 0 &&
+    typeof v.optionId === "string" &&
+    v.optionId.length > 0
+  );
+}
+
 export interface StageChatQuestion extends ChatTarget {
   question: string;
 }
@@ -224,6 +252,33 @@ function sameIdentity(a: ChatIdentity | undefined, b: ChatIdentity | undefined):
   return a.canonicalId === b.canonicalId && a.taskFolderPath === b.taskFolderPath;
 }
 
+/**
+ * Notification demotion for a posted `WorkflowDecisionV1` (task: "Replace
+ * hidden notification decision buttons with explained, selectable
+ * decisions"). The notification only ANNOUNCES that a decision is waiting
+ * and where to find it — it carries a single "Review decision in Chat"
+ * action that opens Chat With AI on the decision's task/stage, where the
+ * full explained choice (what happened, why, options with consequences, a
+ * recommendation) renders. It is never itself the decision surface.
+ *
+ * Callers already have the `ChatTarget` in scope from computing the decision
+ * itself (the decision record only carries `taskCanonicalId`/`stage`, not
+ * `taskFolderPath` or a display name), so it is passed in rather than
+ * re-derived here.
+ */
+export function notifyPendingWorkflowDecision(decision: WorkflowDecisionV1, target: ChatTarget): void {
+  if (!getNotificationRouterStatus()) return;
+  const label = target.taskName ?? target.taskFolderPath;
+  const stageName = STAGE_DISPLAY_NAMES[target.stage];
+  NotificationRouter.showWarning(
+    `Decision needed — ${label} (${stageName}): ${decision.whatHappened}`,
+    undefined,
+    undefined,
+    undefined,
+    { command: "vs-code-ai-helper.openWorkflowDecision", title: "Review decision in Chat", args: [target] }
+  );
+}
+
 /** Memento key the last-open chat target is persisted under, so the panel
  * reopens on the same conversation instead of always resetting to the
  * Global Assistant across window reloads. */
@@ -258,8 +313,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   private readonly operationsSub: vscode.Disposable;
   /** Set only once wired from extension.ts (see ChatInteractionServicesV1's doc comment). */
   private interactionServices?: ChatInteractionServicesV1;
+  /**
+   * The reusable decision contract's store (task: "Replace hidden
+   * notification decision buttons with explained, selectable decisions").
+   * Backed by the same Memento as this provider — any other module can
+   * independently construct `new WorkflowDecisionStoreV1(context.workspaceState)`
+   * and post/resolve against the same underlying records, mirroring how
+   * `PendingOperationsStore` is re-constructed per call site rather than
+   * threaded through as a single shared instance.
+   */
+  readonly workflowDecisionStore: WorkflowDecisionStoreV1;
 
   constructor(private readonly state: vscode.Memento) {
+    this.workflowDecisionStore = new WorkflowDecisionStoreV1(state);
     // taskOperations is a module singleton that outlives this provider, so the
     // subscription must be released on dispose. Only re-render when there is a
     // target to render — operations on other tasks must not rebuild this view.
@@ -294,6 +360,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         // is exactly what left the panel stuck on "Loading chat…". Send the
         // current state now that we know someone is listening.
         void this.render();
+        return;
+      }
+      if (isResolveWorkflowDecisionMessage(message)) {
+        await this.resolveWorkflowDecision(message.decisionId, message.optionId);
         return;
       }
       if (isInteractionActionMessage(message)) {
@@ -839,6 +909,39 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     }
   }
 
+  /**
+   * The webview's single commit path for a `WorkflowDecisionV1` card:
+   * resolve the record in the store FIRST (single-flight — a second press of
+   * an already-resolved control reports `alreadySettled` instead of
+   * dispatching the option's effect twice), and only once that succeeds does
+   * the option's command run. A `doNothing` option simply resolves.
+   *
+   * `alreadySettled` is presented as an informational notice, never a
+   * warning/error — task: "an already-answered decision is not an error".
+   */
+  private async resolveWorkflowDecision(decisionId: string, optionId: string): Promise<void> {
+    const result = await this.workflowDecisionStore.resolve(decisionId, optionId);
+    if (result.kind === "missing") {
+      NotificationRouter.showWarning("This decision is no longer pending — it may have already been resolved elsewhere.");
+    } else if (result.kind === "rejected") {
+      NotificationRouter.showWarning(`Could not record your choice: ${result.reason}`);
+    } else if (result.kind === "alreadySettled") {
+      NotificationRouter.showInformation("This decision was already submitted.");
+    } else {
+      const { option } = result;
+      if (option.effect.kind === "command") {
+        try {
+          await vscode.commands.executeCommand(option.effect.command, ...(option.effect.args ?? []));
+        } catch (error) {
+          NotificationRouter.showWarning(
+            `"${option.label}" could not be completed. (${error instanceof Error ? error.message : String(error)})`
+          );
+        }
+      }
+    }
+    await this.render();
+  }
+
   private async persistAppend(identity: ChatIdentity, message: ChatMessage): Promise<void> {
     try {
       const current = await loadTranscriptWithMigration(identity.taskFolderPath, identity.canonicalId, this.state);
@@ -977,6 +1080,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       }
     }
     if (!sameIdentity(target, this.target)) return;
+    // Pending `WorkflowDecisionV1` records for this exact task/stage (the
+    // global assistant never carries decisions — they are always stage-
+    // scoped). Read fresh on every render so a decision resolved from
+    // elsewhere (or superseded by a repost) disappears without a stale
+    // control lingering in the panel.
+    const pendingDecisions: readonly WorkflowDecisionV1[] =
+      target && target.kind !== "global"
+        ? this.workflowDecisionStore.listPending(target.canonicalId).filter((d) => d.stage === target.stage)
+        : [];
     // Distinguish genuinely-running work from an operation that is merely
     // parked waiting on the user's answer (round-limit pause, a pending
     // question, etc.) — the latter must never show the busy spinner, which
@@ -992,7 +1104,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     const lastEntry = entries[entries.length - 1];
     const hasPendingQuestion = lastEntry?.role === "question" && lastEntry.pending;
     const waitingForUser =
-      interaction !== undefined || hasPendingQuestion || targetOps.some((op) => op.waitingForUser);
+      interaction !== undefined ||
+      hasPendingQuestion ||
+      pendingDecisions.length > 0 ||
+      targetOps.some((op) => op.waitingForUser);
     const busy = !waitingForUser && targetOps.some((op) => !op.waitingForUser);
     // Always show the associated task: the task name when available,
     // otherwise the folder's date/task-ID code — with no bracketed raw
@@ -1023,7 +1138,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     // present but not the currently focused element, mirroring how other
     // views badge unread/actionable counts.
     if (this.view) {
-      this.view.badge = hasPendingQuestion || interaction !== undefined
+      this.view.badge = hasPendingQuestion || interaction !== undefined || pendingDecisions.length > 0
         ? { value: 1, tooltip: "Waiting for your answer" }
         : undefined;
     }
@@ -1033,6 +1148,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       label,
       entries: displayEntries,
       interaction,
+      decisions: pendingDecisions,
       busy,
       waitingForUser,
       errorMessage,
@@ -1228,15 +1344,30 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           background-color: transparent; color: var(--vscode-foreground);
           border: var(--ensemble-border-width) solid var(--vscode-widget-border);
         }
+        #decisions { display: none; }
+        .decision-card { margin: 0 0 var(--ensemble-space-3); }
+        .decision-why { margin-bottom: var(--ensemble-space-2); }
+        .decision-evidence {
+          margin: 0 0 var(--ensemble-space-2); padding: var(--ensemble-space-2);
+          background-color: var(--vscode-editor-background);
+          border: var(--ensemble-border-width) solid var(--vscode-panel-border);
+          border-radius: var(--ensemble-radius); font-size: 0.9em;
+        }
+        .decision-evidence-title { font-weight: bold; margin-bottom: var(--ensemble-space-1); }
+        .decision-option { display: block; margin: var(--ensemble-space-2) 0; }
+        .decision-option-consequence { margin: 0 0 0 1.5em; font-size: 0.9em; color: var(--vscode-descriptionForeground); }
+        .decision-option-destructive { color: var(--vscode-inputValidation-errorForeground); font-weight: bold; }
+        .decision-recommendation { margin: var(--ensemble-space-2) 0; font-style: italic; color: var(--vscode-descriptionForeground); }
       </style>
       </head><body>
       <div id="context" role="status">Loading chat…</div><div id="messages" role="log" aria-live="polite" aria-label="Conversation"></div>
       <div id="interaction" role="form" aria-label="Question from the AI"></div>
+      <div id="decisions" role="list" aria-label="Pending workflow decisions"></div>
       <div id="empty-notice" role="status"></div>
       <div id="error" role="alert"></div>
       <div id="busy-indicator" role="status" aria-live="polite"><span id="busy-spinner" class="spinner"></span><span id="busy-text">Waiting for the AI…</span></div>
       <form id="form"><textarea id="message" rows="3" aria-label="Message the AI" placeholder="Message the AI… (Enter to send, Shift+Enter for a new line)"></textarea><button type="submit" title="Send message (Enter)">Send</button></form>
-      <script nonce="${nonce}">const v=acquireVsCodeApi(), c=document.getElementById('context'), m=document.getElementById('messages'), ic=document.getElementById('interaction'), en=document.getElementById('empty-notice'), e=document.getElementById('error'), b=document.getElementById('busy-indicator'), bs=document.getElementById('busy-spinner'), bt=document.getElementById('busy-text'), f=document.getElementById('form'), i=document.getElementById('message');
+      <script nonce="${nonce}">const v=acquireVsCodeApi(), c=document.getElementById('context'), m=document.getElementById('messages'), ic=document.getElementById('interaction'), dc=document.getElementById('decisions'), en=document.getElementById('empty-notice'), e=document.getElementById('error'), b=document.getElementById('busy-indicator'), bs=document.getElementById('busy-spinner'), bt=document.getElementById('busy-text'), f=document.getElementById('form'), i=document.getElementById('message');
       const savedState = v.getState() || {};
       const scrollPositions = savedState.scrollPositions || {};
       let currentKey;
@@ -1380,6 +1511,84 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         actions.appendChild(confirmBtn); actions.appendChild(chatBtn); actions.appendChild(cancelBtn);
         ic.appendChild(actions);
       }
+      // Renders every pending WorkflowDecisionV1 for this task/stage as an
+      // explained choice: what happened, why the user is needed, evidence
+      // (case-4 decisions), enumerated options each with its own consequence
+      // text and a destructive flag, a recommendation (or explicit "no
+      // basis"), and ONE Confirm button per card — the same single-commit-
+      // path and acknowledge-on-press rules renderInteraction above applies
+      // to structured questions, so the two decision surfaces do not diverge.
+      function renderDecisions(decisions){
+        dc.replaceChildren();
+        if(!decisions || !decisions.length){ dc.style.display='none'; return; }
+        dc.style.display='block';
+        for(const dcs of decisions){
+          const card=document.createElement('div'); card.className='decision-card';
+          const err=document.createElement('div'); err.className='interaction-error';
+          card.appendChild(err);
+          const title=document.createElement('div'); title.className='interaction-title';
+          title.textContent='Decision needed';
+          card.appendChild(title);
+          const what=document.createElement('div'); what.className='interaction-prompt';
+          what.textContent=dcs.whatHappened;
+          card.appendChild(what);
+          const why=document.createElement('div'); why.className='decision-why';
+          why.textContent=dcs.whyUserNeeded;
+          card.appendChild(why);
+          if(dcs.evidence && dcs.evidence.length){
+            const evWrap=document.createElement('div'); evWrap.className='decision-evidence';
+            const evTitle=document.createElement('div'); evTitle.className='decision-evidence-title'; evTitle.textContent='Evidence';
+            evWrap.appendChild(evTitle);
+            for(const ev of dcs.evidence){
+              const line=document.createElement('div'); line.textContent=ev.label+': '+ev.detail;
+              evWrap.appendChild(line);
+            }
+            card.appendChild(evWrap);
+          }
+          const groupName='decision-'+dcs.decisionId;
+          const radios=[];
+          for(const opt of dcs.options){
+            const optWrap=document.createElement('label'); optWrap.className='decision-option';
+            const radio=document.createElement('input'); radio.type='radio'; radio.name=groupName; radio.value=opt.optionId;
+            radios.push(radio);
+            optWrap.appendChild(radio);
+            const isRecommended=dcs.recommendation.kind==='option' && dcs.recommendation.optionId===opt.optionId;
+            const labelText=document.createElement('span');
+            labelText.textContent=' '+opt.label+(isRecommended?' (Recommended)':'');
+            if(opt.destructive){ labelText.appendChild(document.createTextNode(' ')); const warn=document.createElement('span'); warn.className='decision-option-destructive'; warn.textContent='⚠ irreversible'; labelText.appendChild(warn); }
+            optWrap.appendChild(labelText);
+            const consequence=document.createElement('div'); consequence.className='decision-option-consequence';
+            consequence.textContent=opt.consequence;
+            optWrap.appendChild(consequence);
+            card.appendChild(optWrap);
+          }
+          const rec=document.createElement('div'); rec.className='decision-recommendation';
+          if(dcs.recommendation.kind==='option'){
+            const recOpt=dcs.options.find(o=>o.optionId===dcs.recommendation.optionId);
+            rec.textContent='Recommendation: '+(recOpt?recOpt.label:dcs.recommendation.optionId)+' — '+dcs.recommendation.reasoning;
+          } else {
+            rec.textContent='No recommendation: '+dcs.recommendation.reasoning;
+          }
+          card.appendChild(rec);
+          const actions=document.createElement('div'); actions.className='interaction-actions';
+          const confirmBtn=document.createElement('button'); confirmBtn.type='button'; confirmBtn.textContent='Confirm';
+          confirmBtn.addEventListener('click',()=>{
+            const checked=radios.find(r=>r.checked);
+            if(!checked){ err.textContent='Please choose an option.'; err.style.display='block'; return; }
+            err.style.display='none';
+            // Acknowledge the press immediately and make a second one
+            // impossible — the same rule PART 0 established for structured
+            // questions, for the same reason: silence after a click is what
+            // caused a double press before.
+            confirmBtn.disabled=true; confirmBtn.textContent='Confirmed';
+            for(const r of radios){ r.disabled=true; }
+            v.postMessage({type:'resolveWorkflowDecision',decisionId:dcs.decisionId,optionId:checked.value});
+          });
+          actions.appendChild(confirmBtn);
+          card.appendChild(actions);
+          dc.appendChild(card);
+        }
+      }
       window.addEventListener('message', event=>{
         const s=event.data;if(s.type!=='state')return;
         const nextKey=targetKey(s.target);
@@ -1406,6 +1615,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           return row;
         }));
         renderInteraction(s.interaction);
+        renderDecisions(s.decisions);
         en.textContent=s.emptyNotice??'';en.style.display=s.emptyNotice?'block':'none';
         e.textContent=s.errorMessage??'';e.style.display=s.errorMessage?'block':'none';
         if(s.busy){bs.style.display='inline-block';bt.textContent='Waiting for the AI…';b.style.display='block';}

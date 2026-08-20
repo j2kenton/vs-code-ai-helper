@@ -34,6 +34,8 @@ import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupRec
 import { buildQuotaRemedyTextV1 } from "../utils/quota";
 import { getConfiguredTaskRoot, normalizePath } from "../utils/taskRoot";
 import { listUncheckedChecklistItemTextsV1 } from "../utils/implementationChecklist";
+import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
+import { WorkflowDecisionV1 } from "../types/workflowDecisionV1";
 
 /**
  * The view ID for the tasks tree view (must match package.json)
@@ -139,9 +141,24 @@ function readOutstandingChecklistItemsForTooltipV1(
 }
 
 /**
+ * Most-recent-first ordering for a task's pending `WorkflowDecisionV1`
+ * records, so the tooltip and the "Review Pending Decision" affordance both
+ * lead with whichever decision was posted last. Exported for direct unit
+ * testing.
+ */
+export function sortPendingDecisionsByRecencyV1(
+  decisions: readonly WorkflowDecisionV1[]
+): WorkflowDecisionV1[] {
+  return [...decisions].sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
+}
+
+/**
  * Build a markdown tooltip summarizing a task's full stage checklist
  */
-function buildTaskTooltip(task: IncompleteTask): vscode.MarkdownString {
+function buildTaskTooltip(
+  task: IncompleteTask,
+  pendingDecisions: readonly WorkflowDecisionV1[] = []
+): vscode.MarkdownString {
   const lines: string[] = [`**${task.folderName}**`, ""];
 
   const isPaused = task.progress.status === "paused";
@@ -177,6 +194,21 @@ function buildTaskTooltip(task: IncompleteTask): vscode.MarkdownString {
       `$(clock) **Blocked by a ${label}** on \`${park.modelId}\` as of ${new Date(park.observedAt).toLocaleString()}. ${buildQuotaRemedyTextV1(park.resetAt)}`,
       ""
     );
+  }
+  // A decision the workflow needs the user to make (task: "Replace hidden
+  // notification decision buttons with explained, selectable decisions").
+  // Persistent task-node state (plan PART 3) so an owed decision stays
+  // visible until resolved, not only reachable by hovering a transient
+  // notification. The full explained choice — what happened, why, options
+  // with consequences, a recommendation — renders in Chat With AI; this line
+  // is discoverability only, never the decision surface itself.
+  if (pendingDecisions.length > 0) {
+    for (const decision of pendingDecisions) {
+      lines.push(
+        `$(warning) **Decision waiting** (${STAGE_DISPLAY_NAMES[decision.stage]}) — ${decision.whatHappened} _Review it in Chat With AI._`,
+        ""
+      );
+    }
   }
   // The completeness gate stands down for this task (see
   // checklistProgressUnreliable). Surfaced because the alternative is degrading
@@ -251,6 +283,16 @@ function toIncompleteTask(t: TaskWithProgress): IncompleteTask {
 }
 // ... (skip down to TaskNode)
 export class TaskNode extends vscode.TreeItem {
+  /**
+   * The most-recently-posted pending `WorkflowDecisionV1` for this task, if
+   * any — set from the constructor's `pendingDecisions` argument. Read by
+   * the "Review Pending Decision" command (`vs-code-ai-helper.viewPendingTaskDecision`
+   * in extension.ts) to build the `ChatTarget` that opens Chat With AI on
+   * exactly the decision's stage, since decisions are rendered stage-scoped
+   * (`chatView.ts`'s `render()`).
+   */
+  public readonly pendingDecision?: WorkflowDecisionV1;
+
   constructor(
     public readonly task: IncompleteTask,
     expanded: boolean,
@@ -259,7 +301,16 @@ export class TaskNode extends vscode.TreeItem {
     isMetaManaged: boolean = false,
     collapseEpoch: number = 0,
     /** Plan §4.7 classification for a `creating`-status row; ignored otherwise. */
-    creationFootprint?: TaskCreationContextInput
+    creationFootprint?: TaskCreationContextInput,
+    /**
+     * This task's pending `WorkflowDecisionV1` records, if any (task:
+     * "Replace hidden notification decision buttons with explained,
+     * selectable decisions", PART 3). Surfaced in the tooltip and exposed as
+     * `pendingDecision` (most recent first) so the "Review Pending Decision"
+     * command can route to the right decision's stage without re-querying
+     * the store.
+     */
+    pendingDecisions: readonly WorkflowDecisionV1[] = []
   ) {
     // An interrupted creation (plan §4.7 recovery row) has no stages to show
     // — getStageNodes() is never called for it (see getChildren) — so it
@@ -361,8 +412,13 @@ export class TaskNode extends vscode.TreeItem {
       );
     }
 
-    this.tooltip = buildTaskTooltip(task);
-    
+    const sortedPendingDecisions = sortPendingDecisionsByRecencyV1(pendingDecisions);
+    /** The most-recently-posted pending decision, if any — used by the
+     * "Review Pending Decision" command to route to the right stage. */
+    this.pendingDecision = sortedPendingDecisions[0];
+
+    this.tooltip = buildTaskTooltip(task, sortedPendingDecisions);
+
     // Centralized context value construction via buildTaskContextValue
     this.contextValue = buildTaskContextValue({
       status: isPaused ? "paused" : (task.progress.status || "active"),
@@ -376,6 +432,7 @@ export class TaskNode extends vscode.TreeItem {
       // latched tasks only (package.json matches /-checklistUnreliable/).
       checklistProgressUnreliable: task.progress.checklistProgressUnreliable === true,
       isPinned: task.progress.pinnedAt !== undefined,
+      hasPendingDecision: sortedPendingDecisions.length > 0,
       creationFootprint
     });
   }
@@ -748,6 +805,19 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
   private readonly filterKnownStatusesKey = "ensemble.taskStatusFilterKnownStatuses";
   private selectedStatuses: Set<string>;
   private readonly operationsSub: vscode.Disposable;
+  /**
+   * Reads pending `WorkflowDecisionV1` records for the "decision waiting"
+   * tooltip line and the "Review Pending Decision" affordance (task:
+   * "Replace hidden notification decision buttons with explained,
+   * selectable decisions", PART 3). Constructed over the same `state`
+   * Memento `ChatViewProvider` uses (both receive `context.workspaceState`
+   * from extension.ts), per that class's own doc comment: any module may
+   * independently construct a store over the same Memento and observe the
+   * same records. `undefined` when no Memento was supplied (minimal test
+   * stubs), in which case no task ever shows a pending decision.
+   */
+  private readonly workflowDecisionStore?: WorkflowDecisionStoreV1;
+  private readonly workflowDecisionSub?: vscode.Disposable;
 
   constructor(
     private readonly inventory: TaskInventory,
@@ -787,10 +857,20 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
     // taskOperations is a module singleton that outlives this provider, so the
     // subscription must be released on dispose or it will fire into a dead emitter.
     this.operationsSub = taskOperations.onDidChange(() => this._onDidChangeTreeData.fire());
+
+    if (state) {
+      this.workflowDecisionStore = new WorkflowDecisionStoreV1(state);
+      // Resolving/posting a decision from Chat With AI (or anywhere else
+      // sharing this Memento) must clear or add the tree's tooltip line
+      // without waiting for an unrelated refresh (AC-06: "visible until
+      // resolved", not "visible until the next coincidental refresh").
+      this.workflowDecisionSub = this.workflowDecisionStore.onDidChange(() => this._onDidChangeTreeData.fire());
+    }
   }
 
   dispose(): void {
     this.operationsSub.dispose();
+    this.workflowDecisionSub?.dispose();
   }
 
   /**
@@ -1090,6 +1170,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
                 task.folderUri.fsPath
               )
             : undefined;
+        const pendingDecisions = this.workflowDecisionStore?.listPending(taskId) ?? [];
         return new TaskNode(
           task,
           shouldExpand(task),
@@ -1097,7 +1178,8 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
           isScheduled,
           this.isMetaManaged,
           this.collapseEpoch,
-          creationFootprint
+          creationFootprint,
+          pendingDecisions
         );
       }
     );

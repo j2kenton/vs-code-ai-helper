@@ -29,6 +29,14 @@ export interface TaskContextInput {
    */
   checklistProgressUnreliable?: boolean;
   isPinned?: boolean;
+  /**
+   * A pending `WorkflowDecisionV1` exists for this task (task: "Replace
+   * hidden notification decision buttons with explained, selectable
+   * decisions", PART 3). Carried as a context token so the task tree's
+   * "Review Pending Decision" inline affordance shows only on tasks that
+   * actually owe the user a decision.
+   */
+  hasPendingDecision?: boolean;
   /** Present only when `status === "creating"` and a classification has published. */
   creationFootprint?: TaskCreationContextInput;
 }
@@ -156,6 +164,13 @@ export function buildTaskContextValue(input: TaskContextInput): string {
   // is a prefix match and is unaffected by the added suffix.
   if (input.checklistProgressUnreliable) {
     tokens.push("checklistUnreliable");
+  }
+
+  // Pending decision: gates the "Review Pending Decision" menu entry (menus
+  // match /-decisionPending/). Kept before the trailing pinned token so
+  // /-pinned$/ clauses keep matching.
+  if (input.hasPendingDecision) {
+    tokens.push("decisionPending");
   }
 
   // Pinned marker last so menu `when` clauses can match /-pinned$/ without

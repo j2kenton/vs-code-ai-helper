@@ -77,6 +77,8 @@ import { NotificationRouter } from "../utils/notificationRouter";
 import { escalateReviewToHuman } from "../utils/reviewEscalation";
 import { scheduleAutomationChain } from "../utils/automationChain";
 import type { TaskOperationHandle } from "../utils/taskOperations";
+import { postWorkflowDecisionV1 } from "../utils/workflowDecisionDispatchV1";
+import type { ChatTarget } from "../views/chatView";
 
 /**
  * How long the transition's own lease on the pending dispatch lasts. Short by
@@ -284,8 +286,16 @@ export interface ImplementationRecoveryInputV1 {
   readonly postRunReviewStage: TaskStage;
   /** Root operation whose end gates the continuation chain dispatch. */
   readonly parentOperation?: Pick<TaskOperationHandle, "id">;
-  /** Optional action attached to the warning (e.g. Restore Prior Round). */
-  readonly notificationAction?: { command: string; title: string; args: unknown[] };
+  /**
+   * True when a `_prev` backup pair actually exists to restore from — a
+   * completed round whose own summary was rejected (`incompleteRound ===
+   * undefined` at the call site), never a detected deferred/cut-short round,
+   * which never finished long enough to leave one. When true, `finishDispatch`
+   * posts a `WorkflowDecisionV1` (case 3 — "Restore Prior Round" — module
+   * doc comment) offering to discard this round's work and restore the prior
+   * state, alongside the do-nothing/let-the-continuation-run option.
+   */
+  readonly offerRestoreOption?: boolean;
 }
 
 export interface BegunImplementationRecoveryV1 {
@@ -395,13 +405,89 @@ export async function beginImplementationRecoveryV1(
     const outcomeClause = capReached
       ? `The continuation budget (${MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1}) is exhausted, so automated recovery has stopped and the task needs a human decision.`
       : `A continuation implementation round (${continuations} of ${MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1}, ${selectedMode}) has been scheduled to complete and report the work.`;
-    NotificationRouter.showWarning(
-      `${lead}${quarantineClause}${outcomeClause}`,
-      undefined,
-      undefined,
-      undefined,
-      input.notificationAction
-    );
+    const whatHappened = `${lead}${quarantineClause}${outcomeClause}`;
+
+    // Case 3 (module doc comment) — several valid options, none automatic:
+    // restoring the `_prev` backups discards this round's completed work, and
+    // only the user can weigh that against waiting on the scheduled
+    // continuation (or, once the budget is exhausted, reviewing the round
+    // themselves). Only offered when a `_prev` pair actually exists to
+    // restore from (see `offerRestoreOption`'s doc comment).
+    if (input.offerRestoreOption === true) {
+      const filesClause =
+        quarantinedPaths.length > 0
+          ? `${quarantinedPaths.length} changed file(s)`
+          : input.filesChangedUnknown
+            ? "an unknown number of changed files"
+            : "no changed files";
+      const target: ChatTarget = {
+        canonicalId: folderUri.fsPath,
+        taskFolderPath: folderUri.fsPath,
+        stage: input.postRunReviewStage,
+        taskName: persisted?.displayName,
+      };
+      const decision = await postWorkflowDecisionV1(
+        {
+          decisionKey: "restoreRejectedImplementationRound",
+          taskCanonicalId: folderUri.fsPath,
+          stage: input.postRunReviewStage,
+          whatHappened,
+          whyUserNeeded:
+            "Restoring discards this round's completed work, and the system cannot judge whether that " +
+            "trade is better than waiting for the scheduled continuation to produce a usable report — " +
+            "only you can weigh discarding real edits against keeping an unusable one.",
+          options: [
+            {
+              optionId: "keep",
+              label: capReached ? "Leave paused for review" : "Let the continuation run",
+              consequence: capReached
+                ? "Does nothing — the task stays paused with the unreported edits preserved in " +
+                  "pendingImplReviewFiles until you review or rerun the round yourself."
+                : `Does nothing — the scheduled continuation round (${continuations} of ` +
+                  `${MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1}, ${selectedMode}) will attempt to finish and ` +
+                  "report the round's work; this round's edits are kept, quarantined, not discarded.",
+              effect: { kind: "doNothing" },
+            },
+            {
+              optionId: "restore",
+              label: "Restore Prior Round",
+              destructive: true,
+              consequence:
+                `Overwrites the current implementation summary and review with their _prev backups, ` +
+                `discarding this round's completed work (${filesClause}) and returning the task to its ` +
+                "pre-round state. This cannot be undone from within the extension.",
+              effect: {
+                kind: "command",
+                command: "vs-code-ai-helper.restoreRejectedImplementationRound",
+                args: [folderUri.fsPath, input.postRunReviewStage],
+              },
+            },
+          ],
+          recommendation: capReached
+            ? {
+                kind: "none",
+                reasoning:
+                  "Automated recovery is exhausted and nothing is running to prefer over restoring — " +
+                  "whether to discard this round's edits depends on judging them yourself.",
+              }
+            : {
+                kind: "option",
+                optionId: "keep",
+                reasoning:
+                  "A continuation round is already scheduled to produce a usable report without " +
+                  "discarding this round's work.",
+              },
+        },
+        target
+      );
+      if (!decision) {
+        // No activating extension context (e.g. a unit test) — fall back to
+        // the plain announcement so the outcome is still surfaced somewhere.
+        NotificationRouter.showWarning(whatHappened);
+      }
+    } else {
+      NotificationRouter.showWarning(whatHappened);
+    }
 
     if (capReached) {
       // The attempt CAS expects the value read from the state persisted

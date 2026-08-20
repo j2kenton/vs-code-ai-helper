@@ -82,7 +82,6 @@ import {
 import {
   ChecklistProgressV1,
   countChecklistProgressV1,
-  filterUncheckedPlanItemsV1,
   hasImplementationChecklistV1,
   IMPLEMENTATION_CHECKLIST_MARKER,
   listUncheckedChecklistItemTextsV1,
@@ -164,7 +163,11 @@ import { APPLY_REVIEW_ACTION_KEY_V1, ApplyReviewActionInputV1 } from "../actions
 import { NEXT_STAGE_ACTION_KEY_V1 } from "../actions/rows/nextStageRowV1";
 import { ProviderChainExhaustionV1, TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
 import { WorkflowUnavailableCodeV1 } from "../types/workflowAvailabilityV1";
-import { ChatInteractionRefV1, ChatInteractionResumeResultV1, ChatViewProvider } from "../views/chatView";
+import { ChatInteractionRefV1, ChatInteractionResumeResultV1, ChatTarget, ChatViewProvider } from "../views/chatView";
+import { deriveApplicableVerifiedTicksV1, postApplyReviewerVerifiedTicksDecisionV1 } from "./applyReviewerVerifiedTicks";
+import { postReconcilePlanChecklistDecisionV1 } from "./reconcilePlanChecklist";
+import { postWorkflowDecisionV1 } from "../utils/workflowDecisionDispatchV1";
+import { WorkflowDecisionOptionV1, WorkflowDecisionRecommendationV1 } from "../types/workflowDecisionV1";
 import { TaskInventory } from "../state/taskInventory";
 import {
   hasZeroTaskFixableEvidence,
@@ -176,7 +179,6 @@ import {
   parseReviewBlockersDetailed,
   parseReviewedCommitSha,
   parseReviewProgress,
-  parseReviewVerifiedCompleteV1,
   reconcileProgressWithChecklistV1,
   detectSiblingReviewDisagreement,
   REVIEWED_COMMIT_STAGES,
@@ -2168,50 +2170,53 @@ export async function writeReviewRunLogV1(
 }
 
 /**
- * After a review completes, tell the operator when it named plan items as
- * verified-complete that plan-final.md still shows unticked — the "Apply N
- * reviewer-verified ticks" one-click path (workflow 3 continuation plan,
- * Part 5). Plan review stages carry no implementation checklist at all, so
- * this is a no-op for them. Best-effort: a read failure here must never break
- * the review-completion flow it's attached to, so it only ever logs to the
- * status surface via the caller's existing error handling — there is nothing
- * destructive here to guard with a try/catch of its own beyond the reads
- * `readPlanOfRecordV1` already makes safe.
+ * After a review completes, offer the operator a decision when it named plan
+ * items as verified-complete that plan-final.md still shows unticked — the
+ * "Apply N reviewer-verified ticks" one-click path (workflow 3 continuation
+ * plan, Part 5). Plan review stages carry no implementation checklist at all,
+ * so this is a no-op for them. Best-effort: a read failure here must never
+ * break the review-completion flow it's attached to.
+ *
+ * Reuses `applyReviewerVerifiedTicks`'s own derivation
+ * (`deriveApplicableVerifiedTicksV1`) to decide SILENTLY whether there is
+ * anything to offer — posting unconditionally would show its own "nothing to
+ * apply" notice after every review, which is exactly the noise this function
+ * exists to avoid. Only when something is actually applicable does it post
+ * the `WorkflowDecisionV1` (case 2 — module header,
+ * applyReviewerVerifiedTicks.ts), via `postApplyReviewerVerifiedTicksDecisionV1`
+ * directly rather than `vscode.commands.executeCommand` — this write path has
+ * no `TaskInventory` to resolve through, and a unit-test harness stubbing
+ * only the write path would not have the command registered anyway.
  */
 async function notifyReviewerVerifiedTicksV1(
   folderUri: vscode.Uri,
-  targetStage: TaskStage,
-  reviewContent: string
+  targetStage: TaskStage
 ): Promise<void> {
   if (isPlanReviewStage(targetStage)) {
     return;
   }
-  const verified = parseReviewVerifiedCompleteV1(reviewContent);
-  if (verified.items.length === 0) {
+  const derived = await deriveApplicableVerifiedTicksV1(folderUri, targetStage);
+  if (derived.kind !== "ok") {
     return;
   }
-  const plan = await readPlanOfRecordV1(folderUri);
-  if (!plan.hasChecklist || !plan.text) {
-    return;
+  const posted = await postApplyReviewerVerifiedTicksDecisionV1(folderUri, folderUri.fsPath, folderUri.fsPath, targetStage);
+  if (posted.kind === "noContext") {
+    // Case-1 sweep (workflow decisions task, PART 4 step 12): this used to
+    // fall back to the pre-migration notification — a truncated "…and N
+    // more" preview ending in the rhetorical "Apply the reviewer's ticks?"
+    // with no button to answer it, since the decision that would have
+    // carried the action failed to post. Matches the plain informational
+    // fallback every sibling decision uses (reconcilePlanChecklist.ts,
+    // applyReviewerVerifiedTicks.ts, implementationRecoveryV1.ts,
+    // pauseTaskForExhaustedChainV1) when there is no active extension
+    // context to post a WorkflowDecisionV1 into.
+    const { reviewFilename, applicable } = derived.derivation;
+    NotificationRouter.showWarning(
+      `${reviewFilename} named ${applicable.length} plan item(s) as verified complete that are still unticked ` +
+        "in plan-final.md. Could not post the reviewer-verified-ticks decision to Chat With AI " +
+        "(no active extension context); run \"Apply Reviewer-Verified Ticks\" once the extension is active."
+    );
   }
-  const applicable = filterUncheckedPlanItemsV1(plan.text, verified.items);
-  if (applicable.length === 0) {
-    return;
-  }
-  const preview = applicable.slice(0, 5).map((t) => `- ${t}`).join("\n");
-  const more = applicable.length > 5 ? `\n…and ${applicable.length - 5} more.` : "";
-  NotificationRouter.showWarning(
-    `This review named ${applicable.length} plan item(s) as verified complete that are still unticked ` +
-      `in plan-final.md:\n${preview}${more}\n\nApply the reviewer's ticks?`,
-    undefined,
-    undefined,
-    undefined,
-    {
-      command: "vs-code-ai-helper.applyReviewerVerifiedTicks",
-      title: `Apply ${applicable.length} Reviewer-Verified Tick${applicable.length === 1 ? "" : "s"}`,
-      args: [{ taskFolderPath: folderUri.fsPath, reviewStage: targetStage }],
-    }
-  );
 }
 
 async function routeReviewOutcomeV1(
@@ -2264,7 +2269,7 @@ async function routeReviewOutcomeV1(
         const contentBytes = await vscode.workspace.fs.readFile(reviewUri);
         const content = new TextDecoder().decode(contentBytes);
         const score = parseReadiness(content).score;
-        await notifyReviewerVerifiedTicksV1(folderUri, targetStage, content);
+        await notifyReviewerVerifiedTicksV1(folderUri, targetStage);
         const autoAdvanceThreshold = getAutoAdvanceScoreThreshold();
         // A high score no longer implies the plan is finished. Before the
         // progress marker existed, the review prompts capped a mid-plan
@@ -2734,6 +2739,14 @@ async function routeReviewOutcomeV1(
  * (routeReviewOutcomeV1) and the dispatch-site pre-flight, so both produce
  * identical durable state.
  *
+ * **Classification: case 3** (module header, workflowDecisionV1.ts) —
+ * several valid options exist (retry now, adjust the provider chain, wait for
+ * a known quota/entitlement reset, or stay paused) and none is automatically
+ * correct: the recommendation below is derived from the parked
+ * `quotaParkRecord` and how far off its reset is, but the system cannot know
+ * WHY a given provider is unavailable beyond that classification, so this
+ * posts a `WorkflowDecisionV1` rather than acting unprompted.
+ *
  * @internal exported for testing
  */
 export async function pauseTaskForExhaustedChainV1(
@@ -2801,14 +2814,6 @@ export async function pauseTaskForExhaustedChainV1(
   // useful before the window actually reopens.
   const resetIsFar =
     quotaParkRecord?.resetAt !== undefined && isQuotaResetBeyondThresholdV1(quotaParkRecord.resetAt);
-  const resumeAction =
-    quotaParkRecord?.resetAt !== undefined && !resetIsFar
-      ? {
-          command: "vs-code-ai-helper.scheduleQuotaResumeV1",
-          title: "Rerun after reset",
-          args: [{ taskFolderPath: folderUri.fsPath, resetAtIso: quotaParkRecord.resetAt }],
-        }
-      : undefined;
   // Workflow 3 continuation, first item (Part 6 step 4): mirrors the same
   // stage-impact enumeration the withheld-backup cascade in runnerRegistry.ts
   // already carries — a chain exhaustion caused by a long quota/entitlement
@@ -2819,18 +2824,87 @@ export async function pauseTaskForExhaustedChainV1(
     resetIsFar && quotaParkRecord
       ? describeStageSubstitutesV1(quotaParkRecord.modelId, stage)
       : [];
-  const affectedStagesClause =
-    affectedStageDescriptions.length > 0
-      ? ` This also affects: ${affectedStageDescriptions.join("; ")}.`
-      : "";
-  NotificationRouter.showWarning(
-    `⚠️ ${reason} The task has been paused; fix provider availability or the stage's ` +
-      `model configuration, then resume.${affectedStagesClause}`,
-    undefined,
-    undefined,
-    undefined,
-    resumeAction
+
+  const options: WorkflowDecisionOptionV1[] = [
+    {
+      optionId: "retry",
+      label: "Retry now",
+      consequence:
+        "Unpauses the task. This does not automatically rerun the stage — trigger it again yourself once " +
+        "you believe the provider chain can succeed.",
+      effect: { kind: "command", command: "vs-code-ai-helper.resumeTask", args: [{ taskFolderPath: folderUri.fsPath }] },
+    },
+    {
+      optionId: "adjustSettings",
+      label: "Adjust provider settings",
+      consequence: `Opens Settings focused on ${STAGE_DISPLAY_NAMES[stage]}'s model/backup configuration so you can switch providers or models.`,
+      effect: { kind: "command", command: "vs-code-ai-helper.setStageBackupModel", args: [{ stage }] },
+    },
+    ...(quotaParkRecord?.resetAt !== undefined
+      ? [
+          {
+            optionId: "wait",
+            label: "Wait for reset",
+            consequence:
+              `Schedules an automatic rerun shortly after the ${quotaParkRecord.failureKind} resets at ` +
+              `${quotaParkRecord.resetAt}. The task stays paused until then.`,
+            effect: {
+              kind: "command" as const,
+              command: "vs-code-ai-helper.scheduleQuotaResumeV1",
+              args: [{ taskFolderPath: folderUri.fsPath, resetAtIso: quotaParkRecord.resetAt }],
+            },
+          },
+        ]
+      : []),
+    {
+      optionId: "stay",
+      label: "Leave paused",
+      consequence: "Does nothing. The task stays paused until you choose one of the other options.",
+      effect: { kind: "doNothing" },
+    },
+  ];
+
+  const recommendation: WorkflowDecisionRecommendationV1 =
+    quotaParkRecord?.resetAt !== undefined && !resetIsFar
+      ? {
+          kind: "option",
+          optionId: "wait",
+          reasoning: `The ${quotaParkRecord.failureKind} is known to reset at ${quotaParkRecord.resetAt}, so waiting is likely to succeed without changing anything.`,
+        }
+      : quotaParkRecord !== undefined
+        ? {
+            kind: "option",
+            optionId: "adjustSettings",
+            reasoning:
+              quotaParkRecord.resetAt !== undefined
+                ? `The ${quotaParkRecord.failureKind} reset is far enough off that switching providers is more likely to unblock the task than waiting.`
+                : `The ${quotaParkRecord.failureKind} block has no known reset time, so switching providers is more likely to unblock the task than waiting.`,
+          }
+        : {
+            kind: "none",
+            reasoning:
+              "The chain was exhausted for reasons other than a known quota/entitlement block, so there is no " +
+              "clear signal to prefer retrying, adjusting settings, or waiting.",
+          };
+
+  const target: ChatTarget = { canonicalId: folderUri.fsPath, taskFolderPath: folderUri.fsPath, stage };
+  const decision = await postWorkflowDecisionV1(
+    {
+      decisionKey: "providerChainExhausted",
+      taskCanonicalId: folderUri.fsPath,
+      stage,
+      whatHappened: `${reason} The task has been paused.` + (affectedStageDescriptions.length > 0 ? ` This also affects: ${affectedStageDescriptions.join("; ")}.` : ""),
+      whyUserNeeded:
+        "The system cannot fix an exhausted provider chain on its own — you may already know why it failed " +
+        "(a known outage, a misconfigured model) in a way the code cannot detect.",
+      options,
+      recommendation,
+    },
+    target
   );
+  if (!decision) {
+    NotificationRouter.showWarning(`⚠️ ${reason} The task has been paused; fix provider availability or the stage's model configuration, then resume.`);
+  }
 }
 
 export async function runReviewForFolder(
@@ -6181,15 +6255,7 @@ async function executeImplementationRun(
       filesChangedUnknown: result.filesChangedUnknown === true,
       postRunReviewStage,
       parentOperation: options.parentOperation,
-      ...(incompleteRound === undefined
-        ? {
-            notificationAction: {
-              command: "vs-code-ai-helper.restoreRejectedImplementationRound",
-              title: "Restore Prior Round",
-              args: [folderUri.fsPath, postRunReviewStage],
-            },
-          }
-        : {}),
+      ...(incompleteRound === undefined ? { offerRestoreOption: true } : {}),
     });
   }
   const quarantinedPaths = recovery?.quarantinedPaths ?? [];
@@ -6410,20 +6476,32 @@ async function executeImplementationRun(
         if (existingLog !== undefined) {
           await writeTextFile(logUri, `${existingLog}${reconcileNote}\n`, { skipBackup: true });
         }
-        NotificationRouter.showWarning(
-          "⚠️ The plan checklist still shows unfinished items, but the most recent review already scored " +
-            "this stage at full marks with zero blockers — the checklist's counts are treated as " +
-            "under-recording, not real unfinished work, and completeness is no longer gating advancement. " +
-            `Tick the missed items in plan-final.md, then mark the checklist reconciled.${outstandingList}`,
-          undefined,
-          undefined,
-          undefined,
-          {
-            command: "vs-code-ai-helper.reconcilePlanChecklist",
-            title: "Mark Reconciled",
-            args: [{ taskFolderPath: folderUri.fsPath }],
-          }
-        );
+        // Posts the same explained WorkflowDecisionV1 (case 4 —
+        // reconcilePlanChecklist.ts's doc comment) that command posts,
+        // called directly (rather than via `vscode.commands.executeCommand`)
+        // because this write path has no `TaskInventory`/`CurrentTaskStore`
+        // to resolve through and a unit-test harness stubbing only the write
+        // path would not have the command registered anyway.
+        const reconcilePosted = persistedRounds
+          ? await postReconcilePlanChecklistDecisionV1(
+              folderUri,
+              folderUri.fsPath,
+              folderUri.fsPath,
+              persistedRounds,
+              checklistMergeResult
+            )
+          : { kind: "noContext" as const };
+        if (reconcilePosted.kind !== "posted") {
+          // No activating extension context (or nothing to reconcile yet) —
+          // still tell the operator the counts are being stood down rather
+          // than surfacing nothing at all.
+          NotificationRouter.showWarning(
+            "⚠️ The plan checklist still shows unfinished items, but the most recent review already scored " +
+              "this stage at full marks with zero blockers — the checklist's counts are treated as " +
+              "under-recording, not real unfinished work, and completeness is no longer gating advancement. " +
+              `Tick the missed items in plan-final.md, then mark the checklist reconciled.${outstandingList}`
+          );
+        }
       }
       // A sterile round is only evidence that "the current state satisfies the
       // plan" when there is no standing blocker. When the newest impl review
@@ -6944,19 +7022,28 @@ async function executeImplementationRun(
           skipBackup: true,
         });
       }
-      NotificationRouter.showWarning(
-        "⚠️ The plan checklist is not a complete record for this task — its step counts are unverified " +
-          "until reconciled, and completeness is not gating advancement. Tick the missed items in " +
-          `plan-final.md, then mark the checklist reconciled.${outstandingList}`,
-        undefined,
-        undefined,
-        undefined,
-        {
-          command: "vs-code-ai-helper.reconcilePlanChecklist",
-          title: "Mark Reconciled",
-          args: [{ taskFolderPath: folderUri.fsPath }],
-        }
-      );
+      // Posts the same explained WorkflowDecisionV1 (case 4) the command
+      // posts, called directly for the same reason as the sibling call site
+      // above. `post`'s supersede-on-repost means re-posting every round the
+      // latch stays set replaces the prior pending decision rather than
+      // accumulating duplicates, matching the prior behavior of re-showing
+      // the notification every such round.
+      const reconcilePosted = persistedAfterRun
+        ? await postReconcilePlanChecklistDecisionV1(
+            folderUri,
+            folderUri.fsPath,
+            folderUri.fsPath,
+            persistedAfterRun,
+            checklistMergeResult
+          )
+        : { kind: "noContext" as const };
+      if (reconcilePosted.kind !== "posted") {
+        NotificationRouter.showWarning(
+          "⚠️ The plan checklist is not a complete record for this task — its step counts are unverified " +
+            "until reconciled, and completeness is not gating advancement. Tick the missed items in " +
+            `plan-final.md, then mark the checklist reconciled.${outstandingList}`
+        );
+      }
     }
 
     // Any existing review artifact describes the tree as it was BEFORE this

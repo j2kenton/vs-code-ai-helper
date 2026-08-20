@@ -16,6 +16,8 @@ import {
 import { parseReadiness } from "../utils/reviewReadiness";
 import { parseTaskDocument, buildTaskDocument } from "../utils/taskDescriptionDocument";
 import { shortcutHint } from "../utils/shortcutHints";
+import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
+import type { CreateWorkflowDecisionInputV1, WorkflowDecisionOptionV1 } from "../types/workflowDecisionV1";
 
 // Mock dependencies before importing the module under test
 import * as stageContextModule from "../utils/stageContext";
@@ -1279,6 +1281,183 @@ void describe("TaskTreeProvider — refresh-scoped HEAD cache", () => {
       assert.equal(readiness.staleReviewedSha, undefined);
     } finally {
       restore();
+    }
+  });
+});
+
+void describe("TaskTreeProvider — pending workflow decisions (task: hidden-button decisions)", () => {
+  /** Minimal in-memory stand-in for `vscode.Memento`, mirroring workflowDecisionStoreV1.test.ts. */
+  class FakeMemento {
+    private readonly values = new Map<string, unknown>();
+    get<T>(key: string, defaultValue: T): T {
+      return (this.values.has(key) ? this.values.get(key) : defaultValue) as T;
+    }
+    update(key: string, value: unknown): Promise<void> {
+      this.values.set(key, value);
+      return Promise.resolve();
+    }
+  }
+
+  const TASK_FS_PATH = "/workspace/tasks/decision-task";
+
+  function makeSingleTaskInventory(): import("../state/taskInventory").TaskInventory {
+    return {
+      getTasks: () => [
+        {
+          taskFolderPath: TASK_FS_PATH,
+          folderName: "decision-task",
+          progress: {
+            currentStage: "impl" as TaskStage,
+            status: "active",
+            taskFolder: "decision-task",
+            createdAt: "2026-08-19T00:00:00.000Z",
+            updatedAt: "2026-08-19T00:00:00.000Z",
+          },
+          canonicalId: TASK_FS_PATH,
+        },
+      ],
+      refresh: async (): Promise<void> => {},
+      onDidChange: (_handler: () => void): { dispose: () => void } => ({ dispose(): void {} }),
+    } as unknown as import("../state/taskInventory").TaskInventory;
+  }
+
+  /** getChildren() fires setContext via executeCommand; the stub throws on unregistered commands. */
+  async function withStubbedCommands<T>(callback: () => Promise<T>): Promise<T> {
+    const commandsStub = vscode.commands as typeof vscode.commands & {
+      _executeCommandOverride?: (id: string, ...args: unknown[]) => Promise<unknown>;
+    };
+    const previous = commandsStub._executeCommandOverride;
+    commandsStub._executeCommandOverride = (): Promise<unknown> => Promise.resolve(undefined);
+    try {
+      return await callback();
+    } finally {
+      commandsStub._executeCommandOverride = previous;
+    }
+  }
+
+  function option(overrides: Partial<WorkflowDecisionOptionV1> = {}): WorkflowDecisionOptionV1 {
+    return {
+      optionId: "restore",
+      label: "Restore Prior Round",
+      consequence: "Overwrites the current summary/review with the previous round's backup, discarding the completed round.",
+      destructive: true,
+      effect: { kind: "command", command: "vs-code-ai-helper.restoreRejectedImplementationRound" },
+      ...overrides,
+    };
+  }
+
+  let counter = 0;
+  function decisionInput(overrides: Partial<CreateWorkflowDecisionInputV1> = {}): CreateWorkflowDecisionInputV1 {
+    counter += 1;
+    return {
+      decisionId: `decision-${counter}`,
+      decisionKey: "restoreRejectedRound",
+      taskCanonicalId: TASK_FS_PATH,
+      stage: "impl",
+      whatHappened: "The scheduled round's summary was rejected.",
+      whyUserNeeded: "The system cannot tell whether to retry or restore the prior round.",
+      options: [option()],
+      recommendation: { kind: "option", optionId: "restore", reasoning: "Nothing else is scheduled." },
+      createdAt: new Date().toISOString(),
+      ...overrides,
+    };
+  }
+
+  async function firstTaskNode(provider: TaskTreeProvider): Promise<TaskNode> {
+    const roots = await withStubbedCommands(() => provider.getChildren());
+    const node = roots.find((n): n is TaskNode => n instanceof TaskNode);
+    assert.ok(node, "the single task renders a TaskNode");
+    return node;
+  }
+
+  void it("surfaces a pending decision as a persistent tooltip line, context token, and pendingDecision field", async () => {
+    const memento = new FakeMemento() as unknown as vscode.Memento;
+    const store = new WorkflowDecisionStoreV1(memento);
+    const posted = await store.post(decisionInput());
+    assert.equal(posted.ok, true);
+
+    const provider = new TaskTreeProvider(makeSingleTaskInventory(), undefined, memento);
+    try {
+      const node = await firstTaskNode(provider);
+      assert.ok(node.contextValue?.includes("decisionPending"), "contextValue carries the decisionPending token");
+      const tooltipValue = (node.tooltip as vscode.MarkdownString).value;
+      assert.ok(tooltipValue.includes("Decision waiting"), "tooltip includes the decision-waiting line");
+      assert.ok(
+        tooltipValue.includes("The scheduled round's summary was rejected."),
+        "tooltip surfaces the decision's whatHappened text"
+      );
+      assert.ok(posted.ok && node.pendingDecision?.decisionId === posted.decision.decisionId);
+    } finally {
+      provider.dispose();
+    }
+  });
+
+  void it("shows no decision state for a task with nothing pending", async () => {
+    const memento = new FakeMemento() as unknown as vscode.Memento;
+    const provider = new TaskTreeProvider(makeSingleTaskInventory(), undefined, memento);
+    try {
+      const node = await firstTaskNode(provider);
+      assert.ok(!node.contextValue?.includes("decisionPending"));
+      const tooltipValue = (node.tooltip as vscode.MarkdownString).value;
+      assert.ok(!tooltipValue.includes("Decision waiting"));
+      assert.equal(node.pendingDecision, undefined);
+    } finally {
+      provider.dispose();
+    }
+  });
+
+  void it("stays visible across repeated renders until the decision is resolved, then disappears", async () => {
+    const memento = new FakeMemento() as unknown as vscode.Memento;
+    const store = new WorkflowDecisionStoreV1(memento);
+    const posted = await store.post(decisionInput());
+    assert.equal(posted.ok, true);
+
+    const provider = new TaskTreeProvider(makeSingleTaskInventory(), undefined, memento);
+    try {
+      // Two unrelated renders in a row — the decision must not be a one-shot
+      // toast that vanishes after the first read.
+      const first = await firstTaskNode(provider);
+      assert.ok(first.contextValue?.includes("decisionPending"));
+      const second = await firstTaskNode(provider);
+      assert.ok(second.contextValue?.includes("decisionPending"));
+
+      assert.ok(posted.ok);
+      if (posted.ok) {
+        const resolved = await store.resolve(posted.decision.decisionId, "restore");
+        assert.equal(resolved.kind, "resolved");
+      }
+
+      const afterResolve = await firstTaskNode(provider);
+      assert.ok(!afterResolve.contextValue?.includes("decisionPending"), "a resolved decision no longer renders");
+      assert.equal(afterResolve.pendingDecision, undefined);
+    } finally {
+      provider.dispose();
+    }
+  });
+
+  void it("fires onDidChangeTreeData when a decision is posted or resolved on a store sharing the same Memento", async () => {
+    const memento = new FakeMemento() as unknown as vscode.Memento;
+    const store = new WorkflowDecisionStoreV1(memento);
+    const provider = new TaskTreeProvider(makeSingleTaskInventory(), undefined, memento);
+    try {
+      let fires = 0;
+      const sub = provider.onDidChangeTreeData(() => { fires += 1; });
+      try {
+        const posted = await store.post(decisionInput());
+        assert.equal(posted.ok, true);
+        assert.ok(fires > 0, "posting through an independently-constructed store over the same Memento refreshes the tree");
+
+        const firedAfterPost = fires;
+        assert.ok(posted.ok);
+        if (posted.ok) {
+          await store.resolve(posted.decision.decisionId, "restore");
+        }
+        assert.ok(fires > firedAfterPost, "resolving also refreshes the tree");
+      } finally {
+        sub.dispose();
+      }
+    } finally {
+      provider.dispose();
     }
   });
 });
