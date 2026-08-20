@@ -23,6 +23,7 @@ void describe("execCliAgent argv prompt limits", () => {
       maxArgvPromptBytes: 10,
       models: [{ model: undefined, name: "default" }],
       usesLastMessageFile: false,
+      textModeResponseContractV1: "honours",
       buildArgs(): string[] {
         return ["chat", "--no-interactive"];
       },
@@ -69,6 +70,7 @@ void describe("execCliAgent argv prompt limits", () => {
       useShell: false,
       models: [{ model: undefined, name: "default" }],
       usesLastMessageFile: false,
+      textModeResponseContractV1: "honours",
       buildArgs(_mode, _model, context): string[] {
         capturedPromptFile = context?.promptFile;
         // Node script that reads the prompt file passed as its own argv and
@@ -120,6 +122,7 @@ void describe("execCliAgent argv prompt limits", () => {
       useShell: false,
       models: [{ model: undefined, name: "default" }],
       usesLastMessageFile: false,
+      textModeResponseContractV1: "honours",
       buildArgs(_mode, _model, context): string[] {
         capturedPromptFile = context?.promptFile;
         return [`--print=${context?.promptFile ?? ""}`];
@@ -163,6 +166,7 @@ void describe("execCliAgent argv prompt limits", () => {
       useShell: false,
       models: [{ model: undefined, name: "default" }],
       usesLastMessageFile: false,
+      textModeResponseContractV1: "honours",
       conversationResume: {
         errorMarkers: ["error: timeout waiting for response"],
         continuationPrompt,
@@ -226,6 +230,7 @@ void describe("pre-dispatch prompt-size skip (2j)", () => {
       maxArgvPromptBytes: 10,
       models: [{ model: undefined, name: "default" }],
       usesLastMessageFile: false,
+      textModeResponseContractV1: "honours",
       buildArgs(): string[] {
         buildArgsCalls.count++;
         return ["chat", "--no-interactive"];

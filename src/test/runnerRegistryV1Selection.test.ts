@@ -62,7 +62,7 @@ function openSelection(options: {
   session: ProviderSelectionSessionV1;
   mode: AgentExecutionModeV1;
   modelId: string | undefined;
-  requireGuaranteedReadOnlyText?: boolean;
+  requireSummaryOnlyCapableText?: boolean;
 }): ReturnType<typeof openV1RunnerSelection> {
   return openV1RunnerSelection({
     session: options.session,
@@ -70,7 +70,7 @@ function openSelection(options: {
     modelId: options.modelId,
     stage: "impl-high-review",
     workspaceCwd: "/workspace",
-    requireGuaranteedReadOnlyText: options.requireGuaranteedReadOnlyText,
+    requireSummaryOnlyCapableText: options.requireSummaryOnlyCapableText,
   });
 }
 
@@ -335,19 +335,23 @@ void describe("openV1RunnerSelection", () => {
   });
 
   /**
-   * Review blocker, 2026-08-14: a caller whose no-edit mandate must actually
-   * be enforced (`summary-only` recovery continuations,
-   * `implContinuationTextDispatchV1.ts`) cannot let the generic ranked
-   * selection substitute a write-capable backup — cline-cli/antigravity-cli/
-   * kimi-cli's text mode auto-approves every tool, so reserving one of them
-   * in place of a read-only primary would defeat the whole guarantee the
-   * caller opted into `requireGuaranteedReadOnlyText` for.
+   * Review blocker, 2026-08-14, tightened by the workflow findings dated
+   * 2026-08-20 ("summary-only continuations are selected for claude-cli,
+   * whose text mode cannot produce the required report"): a caller whose
+   * summary-only mandate must actually be enforced (`summary-only` recovery
+   * continuations, `implContinuationTextDispatchV1.ts`) cannot let the
+   * generic ranked selection substitute EITHER a write-capable backup
+   * (cline-cli/antigravity-cli/kimi-cli's text mode auto-approves every
+   * tool) OR a read-only-but-repurposed-interactive-flow backup (claude-cli's
+   * plan mode, opencode-cli's/devpass-cli's plan agent) — reserving either in
+   * place of a summary-only-capable primary would defeat the guarantee the
+   * caller opted into `requireSummaryOnlyCapableText` for.
    */
-  void it("requireGuaranteedReadOnlyText skips a write-capable backup and reserves the next read-only candidate", () => {
+  void it("requireSummaryOnlyCapableText skips a write-capable backup and reserves the next summary-only-capable candidate", () => {
     const stub = installModelSettings({
       "impl-high-review": {
-        primary: "claude-cli:sonnet",
-        backups: ["cline-cli:pass", "codex-cli:gpt-5"],
+        primary: "codex-cli:gpt-5",
+        backups: ["cline-cli:pass", "kiro-cli:default"],
         strategy: "switch-to-backup",
       },
     });
@@ -356,14 +360,14 @@ void describe("openV1RunnerSelection", () => {
       const selection = openSelection({
         session,
         mode: "text",
-        modelId: "claude-cli:sonnet",
-        requireGuaranteedReadOnlyText: true,
+        modelId: "codex-cli:gpt-5",
+        requireSummaryOnlyCapableText: true,
       });
 
       const first = selection.reserveNext(session.allocateAttempt());
       assert.equal(first.kind, "reserved");
       if (first.kind === "reserved") {
-        assert.equal(first.reserved.handle.runnerId, "claude-cli");
+        assert.equal(first.reserved.handle.runnerId, "codex-cli");
         session.reportAttemptOutcome(
           first.reserved.handle.correlation.attemptId,
           "providerUnavailablePreInvocation"
@@ -379,18 +383,133 @@ void describe("openV1RunnerSelection", () => {
         assert.equal(second.runnerId, "cline-cli");
       }
 
-      // codex-cli IS guaranteed read-only text mode, so selection reserves it.
+      // kiro-cli IS summary-only-capable (read-only AND honours the response
+      // contract), so selection reserves it.
       const third = selection.reserveNext(session.allocateAttempt());
       assert.equal(third.kind, "reserved");
       if (third.kind === "reserved") {
-        assert.equal(third.reserved.handle.runnerId, "codex-cli");
+        assert.equal(third.reserved.handle.runnerId, "kiro-cli");
       }
     } finally {
       stub.restore();
     }
   });
 
-  void it("requireGuaranteedReadOnlyText exhausts to providerModeUnavailable when every candidate is write-capable", () => {
+  // New coverage for the 2026-08-20 workflow finding: claude-cli WITHHOLDS
+  // edits (--permission-mode plan) but is a repurposed interactive
+  // plan-approval flow whose own baked-in behavior overrode the requested
+  // report contract in production (runs 019-021). It must be flagged and
+  // rejected as a candidate the same way a write-capable provider is,
+  // never merely because it fails the older read-only-only check.
+  void it("requireSummaryOnlyCapableText rejects a flagged primary (claude-cli) as candidateUnavailable, never reserved", () => {
+    const stub = installModelSettings({
+      "impl-high-review": {
+        primary: "claude-cli:sonnet",
+        backups: ["codex-cli:gpt-5"],
+        strategy: "switch-to-backup",
+      },
+    });
+    try {
+      const session = openSession();
+      const selection = openSelection({
+        session,
+        mode: "text",
+        modelId: "claude-cli:sonnet",
+        requireSummaryOnlyCapableText: true,
+      });
+
+      const first = selection.reserveNext(session.allocateAttempt());
+      assert.equal(first.kind, "candidateUnavailable");
+      if (first.kind === "candidateUnavailable") {
+        assert.equal(first.code, "providerModeUnavailable");
+        assert.equal(first.runnerId, "claude-cli");
+      }
+
+      const second = selection.reserveNext(session.allocateAttempt());
+      assert.equal(second.kind, "reserved");
+      if (second.kind === "reserved") {
+        assert.equal(second.reserved.handle.runnerId, "codex-cli");
+      }
+    } finally {
+      stub.restore();
+    }
+  });
+
+  void it("requireSummaryOnlyCapableText skips a flagged backup (opencode-cli) after an eligible primary fails pre-invocation, then reserves a later eligible backup", () => {
+    const stub = installModelSettings({
+      "impl-high-review": {
+        primary: "codex-cli:gpt-5",
+        backups: ["opencode-cli:openai/gpt-5", "kiro-cli:default"],
+        strategy: "switch-to-backup",
+      },
+    });
+    try {
+      const session = openSession();
+      const selection = openSelection({
+        session,
+        mode: "text",
+        modelId: "codex-cli:gpt-5",
+        requireSummaryOnlyCapableText: true,
+      });
+
+      const first = selection.reserveNext(session.allocateAttempt());
+      assert.equal(first.kind, "reserved");
+      if (first.kind === "reserved") {
+        assert.equal(first.reserved.handle.runnerId, "codex-cli");
+        session.reportAttemptOutcome(
+          first.reserved.handle.correlation.attemptId,
+          "providerUnavailablePreInvocation"
+        );
+      }
+
+      const second = selection.reserveNext(session.allocateAttempt());
+      assert.equal(second.kind, "candidateUnavailable");
+      if (second.kind === "candidateUnavailable") {
+        assert.equal(second.code, "providerModeUnavailable");
+        assert.equal(second.runnerId, "opencode-cli");
+      }
+
+      const third = selection.reserveNext(session.allocateAttempt());
+      assert.equal(third.kind, "reserved");
+      if (third.kind === "reserved") {
+        assert.equal(third.reserved.handle.runnerId, "kiro-cli");
+      }
+    } finally {
+      stub.restore();
+    }
+  });
+
+  void it("requireSummaryOnlyCapableText settles noneRemaining/providerModeUnavailable when every candidate is flagged (claude-cli primary + opencode-cli backup)", () => {
+    const stub = installModelSettings({
+      "impl-high-review": {
+        primary: "claude-cli:sonnet",
+        backups: ["opencode-cli:openai/gpt-5"],
+        strategy: "switch-to-backup",
+      },
+    });
+    try {
+      const session = openSession();
+      const selection = openSelection({
+        session,
+        mode: "text",
+        modelId: "claude-cli:sonnet",
+        requireSummaryOnlyCapableText: true,
+      });
+      const result = selection.reserveNext(session.allocateAttempt());
+      assert.equal(result.kind, "noneRemaining");
+      if (result.kind === "noneRemaining") {
+        assert.equal(result.code, "providerModeUnavailable");
+        assert.deepEqual(
+          result.chainExhaustion?.candidates.map((candidate) => candidate.storedModelId),
+          ["claude-cli:sonnet", "opencode-cli:openai/gpt-5"]
+        );
+      }
+    } finally {
+      stub.restore();
+    }
+  });
+
+  void it("requireSummaryOnlyCapableText exhausts to providerModeUnavailable when every candidate is write-capable", () => {
     const stub = installModelSettings({
       "impl-high-review": {
         primary: "cline-cli:pass",
@@ -404,7 +523,7 @@ void describe("openV1RunnerSelection", () => {
         session,
         mode: "text",
         modelId: "cline-cli:pass",
-        requireGuaranteedReadOnlyText: true,
+        requireSummaryOnlyCapableText: true,
       });
       const result = selection.reserveNext(session.allocateAttempt());
       assert.equal(result.kind, "noneRemaining");
@@ -420,7 +539,7 @@ void describe("openV1RunnerSelection", () => {
     }
   });
 
-  void it("requireGuaranteedReadOnlyText leaves ordinary text-mode selection unaffected when omitted (default false)", () => {
+  void it("requireSummaryOnlyCapableText leaves ordinary text-mode selection unaffected when omitted (default false)", () => {
     // Same chain as the skip test above, but WITHOUT the flag: cline-cli must
     // reserve normally, exactly as every other text-mode caller (chat,
     // review) has always been able to use it.

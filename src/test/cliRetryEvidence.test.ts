@@ -46,6 +46,7 @@ const STRUCTURED_PROVIDER_LIKE: CliProviderDefinition = {
   signInLabel: "Sign in",
   models: [],
   usesLastMessageFile: false,
+  textModeResponseContractV1: "repurposed-interactive-flow",
   structuredEventStream: "opencode",
   buildArgs(): string[] {
     return ["run", "--format", "json"];
@@ -332,6 +333,7 @@ void describe("execCliAgent inactivity watchdog (Part 7)", () => {
     signInLabel: "Sign in",
     models: [],
     usesLastMessageFile: false,
+    textModeResponseContractV1: "repurposed-interactive-flow",
     buildArgs(): string[] {
       return ["run"];
     },

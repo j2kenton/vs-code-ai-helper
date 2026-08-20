@@ -4,18 +4,31 @@
  *
  * A `summary-only` continuation's premise is "the work exists and was
  * reviewed; only the report is missing" — so the continuation must run with
- * edit permissions actually WITHHELD, not merely instructed away. This module
- * provides both halves of that guarantee:
+ * edit permissions actually WITHHELD, AND the response must actually be the
+ * requested report, not merely instructed away/toward. This module provides
+ * both halves of that guarantee:
  *
  *  - `isSummaryOnlyDispatchAvailableV1` — the per-provider capability probe
  *    mode selection feeds on (`selectImplRecoveryModeV1`): true only when the
- *    resolved provider's text mode is enforced read-only (Copilot's broker
- *    text mode grants no edit tools at all; a CLI provider qualifies only
- *    when its vendor CLI enforces read-only text mode — Claude
- *    `--permission-mode plan`, Codex `--sandbox read-only`, etc.; Antigravity/
- *    Cline, whose text mode runs every tool auto-approved, do not). When the
- *    probe is false, selection falls back to `inspect-and-complete` per the
- *    plan's rule — never an edit run carrying only a no-edits instruction.
+ *    resolved provider's text mode satisfies BOTH properties (Copilot's
+ *    broker text mode grants no edit tools at all and has no competing
+ *    response format of its own, so it satisfies both trivially; a CLI
+ *    provider is checked via `isCliTextModeSummaryOnlyCapableV1`, which
+ *    requires the mode to be vendor-enforced read-only — Codex `--sandbox
+ *    read-only`, Kiro `--trust-tools fs_read,grep,glob` — AND to declare
+ *    `textModeResponseContractV1: "honours"` rather than
+ *    "repurposed-interactive-flow"/"unproven". Claude Code's
+ *    `--permission-mode plan` withholds edits but is a repurposed
+ *    interactive plan-approval flow whose own baked-in behavior can override
+ *    the requested report — observed live 2026-08-20 even with the
+ *    mitigation system prompt attached — so it fails the second property
+ *    despite passing the first; OpenCode's/devpass-code's `--agent plan`
+ *    shares the same shape. Antigravity/Cline, whose text mode runs every
+ *    tool auto-approved, fail the first property outright). When the probe
+ *    is false, selection falls back to `inspect-and-complete` per the plan's
+ *    rule — never an edit run carrying only a no-edits instruction, and
+ *    never a read-only run that cannot be trusted to answer in the requested
+ *    shape.
  *
  *  - `runSummaryOnlyContinuationV1` — the dispatch itself, through the
  *    coordinator's `implContinuationReport.v1` row (provider mode `text`),
@@ -42,7 +55,7 @@ import {
   ImplContinuationReportActionInputV1,
 } from "../actions/rows/implContinuationReportRowV1";
 import { ImplementationRunResult } from "../runners/copilotImplementationRunner";
-import { isCliTextModeGuaranteedReadOnlyV1 } from "../runners/cliAgentRunner";
+import { isCliTextModeSummaryOnlyCapableV1 } from "../runners/cliAgentRunner";
 import { resolveEffectiveProvider } from "../runners/runnerRegistry";
 import { resolveEffectiveStageChainV1 } from "../utils/modelSelection";
 import {
@@ -61,12 +74,14 @@ import { TaskStage } from "../types/taskProgress";
 
 /**
  * Whether a `summary-only` continuation can currently be dispatched with edit
- * permissions actually withheld. `modelId` is the model the dispatch would
- * resolve against; when omitted, the impl stage's effective primary is probed
- * (the transition-time caller, `beginImplementationRecoveryV1`, has no
- * per-task model resolution in scope). Unresolvable/unconfigured models probe
- * false — the enforceable fallback (`inspect-and-complete`) is always the
- * safe answer when the capability cannot be proven.
+ * permissions actually withheld AND the requested response contract honoured
+ * — see `isCliTextModeSummaryOnlyCapableV1` for why both are required.
+ * `modelId` is the model the dispatch would resolve against; when omitted,
+ * the impl stage's effective primary is probed (the transition-time caller,
+ * `beginImplementationRecoveryV1`, has no per-task model resolution in
+ * scope). Unresolvable/unconfigured models probe false — the enforceable
+ * fallback (`inspect-and-complete`) is always the safe answer when the
+ * capability cannot be proven.
  */
 export function isSummaryOnlyDispatchAvailableV1(modelId?: string): boolean {
   try {
@@ -77,7 +92,7 @@ export function isSummaryOnlyDispatchAvailableV1(modelId?: string): boolean {
       // tools at all, so the no-edit premise is enforced by construction.
       return true;
     }
-    return isCliTextModeGuaranteedReadOnlyV1(effective.def);
+    return isCliTextModeSummaryOnlyCapableV1(effective.def);
   } catch {
     return false;
   }
@@ -182,12 +197,14 @@ export async function runSummaryOnlyContinuationV1(
   const coordinator = createProductionTaskActionCoordinatorV1({
     workspaceCwd: options.workspaceUri.fsPath,
     resolveStagePrimaryModel: () => ({ modelId: options.modelId, stage: "impl" }),
-    // The no-edit premise this dispatch exists to enforce must hold for
-    // whichever candidate actually runs, not only the one probed at
-    // selection time (review blocker, 2026-08-14): a write-capable backup
-    // (Cline/Antigravity) must never be reserved in place of a read-only
-    // primary. See the option's own doc comment.
-    requireGuaranteedReadOnlyText: true,
+    // The no-edit-AND-honoured-response-contract premise this dispatch exists
+    // to enforce must hold for whichever candidate actually runs, not only
+    // the one probed at selection time (review blocker, 2026-08-14): a
+    // write-capable backup (Cline/Antigravity) or a repurposed-interactive-
+    // flow backup (Claude/OpenCode/devpass-code) must never be reserved in
+    // place of a summary-only-capable primary. See the option's own doc
+    // comment.
+    requireSummaryOnlyCapableText: true,
   });
   const validatedInput: ImplContinuationReportActionInputV1 = {
     prompt: options.prompt,

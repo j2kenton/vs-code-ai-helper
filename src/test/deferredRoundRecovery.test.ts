@@ -518,7 +518,14 @@ interface HarnessOptions {
   /**
    * What the patched `isSummaryOnlyDispatchAvailableV1` probe reports.
    * Defaults to false (the enforceable fallback), keeping every test
-   * deterministic against the real probe's settings-dependent answer.
+   * deterministic against the real probe's settings-dependent answer. The
+   * real probe now requires BOTH that the resolved provider's text mode
+   * withholds edits AND that it honours the requested response contract
+   * (`isCliTextModeSummaryOnlyCapableV1`, tightened 2026-08-20 — claude-cli's
+   * plan mode withholds edits but is a repurposed interactive flow that can
+   * override the requested report), but this stub stays a plain boolean:
+   * the harness only needs to control the coarse "is text dispatch usable at
+   * all" outcome, not exercise the probe's own per-provider logic.
    */
   summaryOnlyDispatchAvailable?: boolean;
 }

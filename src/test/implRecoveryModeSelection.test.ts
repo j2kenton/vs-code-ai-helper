@@ -119,10 +119,23 @@ void describe("selectImplRecoveryModeV1 (Part 2 evidence table)", () => {
 });
 
 void describe("isSummaryOnlyDispatchAvailableV1 (per-provider text-mode capability probe)", () => {
-  void it("a CLI provider whose text mode is vendor-enforced read-only can honor the no-edit premise", () => {
-    // Claude Code's text mode runs `--permission-mode plan` — no
-    // permissionWarning, so text dispatch actually withholds edits.
-    assert.equal(isSummaryOnlyDispatchAvailableV1("claude-cli:sonnet"), true);
+  void it("a CLI provider whose text mode withholds edits but repurposes an interactive planning flow cannot — the response contract is not honoured", () => {
+    // Workflow findings, 2026-08-20 ("summary-only continuations are
+    // selected for claude-cli, whose text mode cannot produce the required
+    // report"): Claude Code's `--permission-mode plan` withholds edits (no
+    // permissionWarning) but is a repurposed interactive plan-approval flow
+    // whose own baked-in behavior overrode the requested report contract in
+    // production (runs 019-021), even with the mitigation system prompt
+    // attached. `textModeResponseContractV1` is
+    // "repurposed-interactive-flow" for exactly this reason, so the probe
+    // must now report false.
+    assert.equal(isSummaryOnlyDispatchAvailableV1("claude-cli:sonnet"), false);
+  });
+
+  void it("a CLI provider whose text mode is vendor-enforced read-only AND honours the response contract can honor the no-edit premise", () => {
+    // Codex's `--sandbox read-only` is a genuine one-shot, non-interactive
+    // exec dispatch with no competing interactive-flow behavior of its own.
+    assert.equal(isSummaryOnlyDispatchAvailableV1("codex-cli:gpt-5"), true);
   });
 
   void it("providers whose text mode runs every tool auto-approved cannot — selection must fall back, never trust the prompt", () => {
@@ -131,6 +144,14 @@ void describe("isSummaryOnlyDispatchAvailableV1 (per-provider text-mode capabili
     // nothing about the tree.
     assert.equal(isSummaryOnlyDispatchAvailableV1("cline-cli:some-model"), false);
     assert.equal(isSummaryOnlyDispatchAvailableV1("antigravity-cli:some-model"), false);
+  });
+
+  void it("providers whose text mode withholds edits but routes through a repurposed 'plan' agent cannot — same failure shape as claude-cli", () => {
+    // opencode-cli's/devpass-cli's text mode routes through their `--agent
+    // plan`, an interactive planning surface, not codex's genuine one-shot
+    // read-only dispatch.
+    assert.equal(isSummaryOnlyDispatchAvailableV1("opencode-cli:openai/gpt-5"), false);
+    assert.equal(isSummaryOnlyDispatchAvailableV1("devpass-cli:llmgateway-devpass/deepseek-v4-pro"), false);
   });
 
   void it("a Copilot-resolved model can honor it — broker text mode grants no edit tools at all", () => {

@@ -1277,4 +1277,35 @@ void describe("provider CLI contracts", () => {
 
     assert.strictEqual(setting, undefined);
   });
+
+  void it("pins textModeResponseContractV1 for the load-bearing providers (workflow findings, 2026-08-20)", () => {
+    // claude-cli, opencode-cli, and devpass-cli's text modes each withhold
+    // edits via a repurposed INTERACTIVE flow (Claude Code's
+    // `--permission-mode plan`; OpenCode's/devpass-code's `--agent plan`)
+    // whose own baked-in behavior can override a requested response
+    // contract — observed live for claude-cli (runs 019-021). codex-cli's
+    // `--sandbox read-only` is a genuine one-shot dispatch with no such
+    // behavior. `isCliTextModeSummaryOnlyCapableV1` (and therefore
+    // `isSummaryOnlyDispatchAvailableV1`) depends on exactly these four
+    // values staying pinned: flip one silently and a `summary-only`
+    // continuation could again be dispatched through a provider whose text
+    // mode cannot produce the required report.
+    for (const id of ["claude-cli", "opencode-cli", "devpass-cli"] as const) {
+      const provider = getCliProvider(id);
+      assert.ok(provider, `expected ${id} provider definition`);
+      assert.strictEqual(
+        provider.textModeResponseContractV1,
+        "repurposed-interactive-flow",
+        `${id} must declare its text mode as a repurposed interactive flow`
+      );
+    }
+
+    const codex = getCliProvider("codex-cli");
+    assert.ok(codex, "expected codex-cli provider definition");
+    assert.strictEqual(
+      codex.textModeResponseContractV1,
+      "honours",
+      "codex-cli's --sandbox read-only text mode must be declared to honour the requested response contract"
+    );
+  });
 });

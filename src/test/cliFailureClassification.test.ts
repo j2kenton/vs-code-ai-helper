@@ -81,6 +81,7 @@ const OPENCODE_LIKE: CliProviderDefinition = {
   signInLabel: "Sign in",
   models: [],
   usesLastMessageFile: false,
+  textModeResponseContractV1: "repurposed-interactive-flow",
   structuredEventStream: "opencode",
   buildArgs(): string[] {
     return ["run", "--format", "json"];
@@ -106,6 +107,7 @@ const CLINE_LIKE: CliProviderDefinition = {
   signInLabel: "Sign in",
   models: [],
   usesLastMessageFile: false,
+  textModeResponseContractV1: "unproven",
   structuredEventStream: "cline",
   buildArgs(): string[] {
     return ["--json"];
@@ -130,6 +132,7 @@ const CLAUDE_STRUCTURED_LIKE: CliProviderDefinition = {
   signInLabel: "Sign in",
   models: [],
   usesLastMessageFile: false,
+  textModeResponseContractV1: "repurposed-interactive-flow",
   structuredEventStream: "claude",
   buildArgs(): string[] {
     return ["-p", "--output-format", "stream-json", "--verbose"];
@@ -147,6 +150,7 @@ const OPAQUE_TEXT_LIKE: CliProviderDefinition = {
   signInLabel: "Sign in",
   models: [],
   usesLastMessageFile: false,
+  textModeResponseContractV1: "repurposed-interactive-flow",
   buildArgs(): string[] {
     return ["-p"];
   },

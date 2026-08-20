@@ -22,7 +22,7 @@ import {
   cliCommandExists,
   cliProviderSupportsV1StdoutCapture,
   createCliTextTransportV1,
-  isCliTextModeGuaranteedReadOnlyV1,
+  isCliTextModeSummaryOnlyCapableV1,
   runImplementationWithCli,
 } from "./cliAgentRunner";
 import {
@@ -1513,23 +1513,28 @@ export function openV1RunnerSelection(options: {
   workspaceCwd: string;
   /**
    * `text` mode only: reject every candidate — primary AND every ranked
-   * backup — whose text mode is not vendor-enforced read-only (review
-   * blocker, 2026-08-14: the generic ranked selection otherwise accepts any
-   * CLI provider that can capture bounded stdout, with no regard for whether
-   * its text mode actually withholds edit tools — so a read-only primary
-   * could cascade to a write-capable backup like Cline/Antigravity under a
-   * `summary-only` recovery continuation, defeating the no-edit guarantee
-   * that dispatch mode exists to enforce). Copilot's broker text mode always
-   * satisfies this (no edit tools are ever granted); a CLI candidate must
-   * pass `isCliTextModeGuaranteedReadOnlyV1`. A rejected candidate is
-   * recorded exactly like any other unsupported one — an explicit settled
-   * attempt, never a silent skip — so when no candidate qualifies the whole
-   * selection settles `providerModeUnavailable` instead of ever reserving an
-   * edit-capable provider under a no-edit mandate.
+   * backup — whose text mode does not both (a) vendor-enforce read-only AND
+   * (b) honour the requested response contract rather than repurposing an
+   * interactive planning flow (review blocker, 2026-08-14, tightened by the
+   * workflow findings dated 2026-08-20 — "summary-only continuations are
+   * selected for claude-cli, whose text mode cannot produce the required
+   * report": the generic ranked selection otherwise accepts any CLI provider
+   * that can capture bounded stdout, with no regard for either property — so
+   * a qualifying primary could cascade to a write-capable backup like
+   * Cline/Antigravity, OR to a read-only-but-repurposed-interactive backup
+   * like Claude Code/OpenCode/devpass-code, under a `summary-only` recovery
+   * continuation, defeating the guarantee that dispatch mode exists to
+   * enforce). Copilot's broker text mode always satisfies this (no edit
+   * tools are ever granted, and it has no competing response format of its
+   * own); a CLI candidate must pass `isCliTextModeSummaryOnlyCapableV1`. A
+   * rejected candidate is recorded exactly like any other unsupported one —
+   * an explicit settled attempt, never a silent skip — so when no candidate
+   * qualifies the whole selection settles `providerModeUnavailable` instead
+   * of ever reserving an unqualified provider under a summary-only mandate.
    */
-  requireGuaranteedReadOnlyText?: boolean;
+  requireSummaryOnlyCapableText?: boolean;
 }): V1RunnerSelectionV1 {
-  const { session, mode, workspaceCwd, requireGuaranteedReadOnlyText = false } = options;
+  const { session, mode, workspaceCwd, requireSummaryOnlyCapableText = false } = options;
 
   type RankedEntryV1 =
     | { readonly supported: true; readonly candidate: V1CandidateV1 }
@@ -1599,16 +1604,17 @@ export function openV1RunnerSelection(options: {
     if (
       mode !== "text" ||
       !cliProviderSupportsV1StdoutCapture(effective.def) ||
-      (requireGuaranteedReadOnlyText && !isCliTextModeGuaranteedReadOnlyV1(effective.def))
+      (requireSummaryOnlyCapableText && !isCliTextModeSummaryOnlyCapableV1(effective.def))
     ) {
       // CLI providers are unsupported for preflight/edit (plan product
       // decisions), and a last-message-file CLI cannot satisfy AC-RUNNER-02
       // ("CLI results are captured only from bounded stdout") yet; a caller
-      // that requires a guaranteed-read-only text mode (see the option's own
+      // that requires summary-only-capable text mode (see the option's own
       // doc comment) additionally rejects a CLI whose text mode auto-approves
-      // every tool. The candidate stays in the ranked list so `reserveNext`
-      // can surface it as an explicit settled attempt instead of silently
-      // bypassing it.
+      // every tool OR merely withholds edits without honouring the requested
+      // response contract. The candidate stays in the ranked list so
+      // `reserveNext` can surface it as an explicit settled attempt instead
+      // of silently bypassing it.
       return {
         supported: false,
         storedModelId,
@@ -1772,7 +1778,7 @@ export function createV1RunnerSelectionOpener(options: {
     readonly stage: TaskStage | undefined;
   };
   /** Forwarded verbatim to every `openV1RunnerSelection` call — see its doc comment. */
-  requireGuaranteedReadOnlyText?: boolean;
+  requireSummaryOnlyCapableText?: boolean;
 }): (request: {
   readonly session: ProviderSelectionSessionV1;
   readonly mode: AgentExecutionModeV1;
@@ -1786,7 +1792,7 @@ export function createV1RunnerSelectionOpener(options: {
       modelId: resolved.modelId,
       stage: resolved.stage,
       workspaceCwd: options.workspaceCwd,
-      requireGuaranteedReadOnlyText: options.requireGuaranteedReadOnlyText,
+      requireSummaryOnlyCapableText: options.requireSummaryOnlyCapableText,
     });
   };
 }

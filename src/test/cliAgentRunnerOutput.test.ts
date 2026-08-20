@@ -695,6 +695,7 @@ void describe("CLI output normalization", () => {
       useShell: false,
       models: [{ model: undefined, name: "default" }],
       usesLastMessageFile: false,
+      textModeResponseContractV1: "honours",
       buildArgs(): string[] {
         // Exits non-zero with quota-flavored stderr, simulating Claude Code
         // reporting an exhausted session allocation.
@@ -739,6 +740,7 @@ void describe("CLI output normalization", () => {
       useShell: false,
       models: [],
       usesLastMessageFile: false,
+      textModeResponseContractV1: "repurposed-interactive-flow",
       buildArgs(): string[] {
         return [
           "-e",
@@ -802,6 +804,7 @@ void describe("post-implementation type-check (2g)", () => {
       useShell: false,
       models: [{ model: undefined, name: "default" }],
       usesLastMessageFile: false,
+      textModeResponseContractV1: "unproven",
       buildArgs(): string[] {
         return [
           "-e",
@@ -891,6 +894,7 @@ void describe("post-implementation type-check (2g)", () => {
         useShell: false,
         models: [{ model: undefined, name: "default" }],
         usesLastMessageFile: false,
+        textModeResponseContractV1: "unproven",
         buildArgs(): string[] {
           return ["-e", `process.stdout.write("no changes needed")`];
         },

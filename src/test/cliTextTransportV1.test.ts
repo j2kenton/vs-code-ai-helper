@@ -94,6 +94,8 @@ function scriptedDef(options: {
     signInLabel: "test",
     models: [],
     usesLastMessageFile: false,
+    textModeResponseContractV1:
+      options.id === "cline-cli" ? "unproven" : "repurposed-interactive-flow",
     structuredEventStream: options.structuredEventStream,
     promptTransport: "stdin",
     useShell: false,

@@ -378,6 +378,38 @@ export interface CliProviderDefinition {
    * both run under vendor-enforced permissions (the normal case).
    */
   permissionWarning?: string;
+  /**
+   * Whether this provider's text mode, once it withholds edits (see
+   * `permissionWarning` — absent means vendor-enforced read-only), ALSO
+   * honours the response format a `summary-only` recovery continuation
+   * dictates (a specific report shape, no planning ceremony). These are two
+   * independent properties: a provider can withhold edits perfectly while
+   * its read-only mode is a repurposed INTERACTIVE flow whose own baked-in
+   * behavior (plan-approval prompting, writing a scratch plan file) overrides
+   * whatever the caller asked for.
+   *
+   *  - "honours": read-only text mode is a genuine one-shot, non-interactive
+   *    dispatch with no competing behavior of its own — the response is
+   *    whatever the prompt asked for.
+   *  - "repurposed-interactive-flow": read-only text mode is an interactive
+   *    planning/review mode (Claude Code's `--permission-mode plan`,
+   *    OpenCode's/devpass-code's `--agent plan`) whose own system prompt can
+   *    override a requested report contract. Observed live 2026-08-20 (runs
+   *    019-021 on this repo's own `workflow 6` task): claude-cli's text mode
+   *    produced a plan and a `~/.claude/plans/*.md` scratch-file pointer
+   *    instead of the mandated report, despite the mitigation prompt telling
+   *    it not to — see CLAUDE_CLI_HEADLESS_PLAN_MODE_SYSTEM_PROMPT's comment.
+   *  - "unproven": no live evidence either way. Treated the same as
+   *    "repurposed-interactive-flow" by the combined capability probe
+   *    (`isCliTextModeSummaryOnlyCapableV1`) — absence of proof is not proof
+   *    of the (stronger) contract, and every provider using this value
+   *    already fails the read-only half anyway (permissionWarning is set),
+   *    so the distinction from "repurposed-interactive-flow" is audit-only.
+   *
+   * Required on every provider (no default) so a newly added provider must
+   * make this call explicitly rather than silently inheriting "honours".
+   */
+  textModeResponseContractV1: "honours" | "repurposed-interactive-flow" | "unproven";
 }
 
 /**
@@ -818,6 +850,12 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     ],
     usesLastMessageFile: false,
     structuredEventStream: "claude",
+    // See runs 019-021, 2026-08-20 (cited on the field's doc comment):
+    // `--permission-mode plan` withholds edits but repurposes Claude Code's
+    // interactive plan-approval flow, whose baked-in behavior overrode the
+    // requested `summary-only` report contract even with the mitigation
+    // system prompt attached.
+    textModeResponseContractV1: "repurposed-interactive-flow",
     buildArgs(mode, model): string[] {
       const parsedModel = parseClaudeCliModelSelection(model);
       // Edit mode keeps the original plain "text" output-format, unchanged —
@@ -880,6 +918,23 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
         // reaching for those tools and puts the full plan/review/answer
         // (including any open questions, inline) directly in the response
         // text instead.
+        //
+        // REGRESSED (or never fully solved): observed live again 2026-08-20,
+        // this repo's own `workflow 6` task, runs 019-021. A `summary-only`
+        // recovery continuation dispatched through this text mode still
+        // wrote a scratch file to `~/.claude/plans/*.md` and returned a plan
+        // — this system prompt's instructions not to were ignored outright.
+        // The SAME provider/model on the unconstrained path (no plan mode)
+        // completed the next round with a full report on the first try, so
+        // this is specifically a plan-mode/mitigation-prompt problem, not a
+        // model-capability one. This is why `textModeResponseContractV1` on
+        // this definition is "repurposed-interactive-flow" rather than
+        // "honours" despite `--permission-mode plan` genuinely withholding
+        // edits: the mitigation reduces but does not eliminate the risk, so
+        // callers needing a specific response CONTRACT (not just no edits)
+        // must not select this provider's text mode for that purpose. Worth
+        // re-verifying against the current CLI version before relying on
+        // this mitigation anywhere else.
         args.push(
           "--append-system-prompt",
           CLAUDE_CLI_HEADLESS_PLAN_MODE_SYSTEM_PROMPT
@@ -934,6 +989,10 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     // stay false; see extractCodexFinalOutput.
     usesLastMessageFile: false,
     structuredEventStream: "codex",
+    // `--sandbox read-only` is a genuine one-shot, non-interactive exec
+    // dispatch (`codex exec`) with no competing interactive-flow behavior —
+    // the response is whatever the prompt asked for.
+    textModeResponseContractV1: "honours",
     buildArgs(mode, model, context): string[] {
       const parsedModel = parseCodexModelSelection(model);
       // `--json` for the same reason kimi-cli uses `--output-format
@@ -994,6 +1053,11 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
       { model: "gemini-2.5-flash", name: "Gemini 2.5 Flash" },
     ],
     usesLastMessageFile: false,
+    // Read-only is confirmed (see below), but whether that read-only mode
+    // ALSO honours an arbitrary requested response format (rather than
+    // carrying some interactive-flow behavior of its own) has not been
+    // separately tested — no affirmative basis to claim "honours" yet.
+    textModeResponseContractV1: "unproven",
     // Text mode passes no approval flag at all — verified 2026-07-20 against
     // gemini 0.51.0 by direct testing (trusted workspace, asked to write a
     // file) that this is genuinely read-only, not merely unconfigured:
@@ -1106,6 +1170,10 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     permissionWarning:
       "Antigravity can create, change, or delete any file and run shell commands without asking, " +
       "in every stage including plan and review. Its CLI has no read-only or restricted mode.",
+    // Already ineligible for summary-only via permissionWarning above (text
+    // mode is not read-only at all); "unproven" is audit-only here, not
+    // load-bearing.
+    textModeResponseContractV1: "unproven",
     buildArgs(_mode, model, context): string[] {
       // promptTransport: "file" is a contract with the caller (see
       // CliBuildArgsContext.promptFile): cliAgentRunner always writes the
@@ -1194,6 +1262,11 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     models: [{ model: undefined, name: "Kiro (CLI default)" }],
     discoverModels: discoverKiroModels,
     usesLastMessageFile: false,
+    // `chat --no-interactive` is confirmed non-interactive in every mode
+    // (buildArgs always passes it), with `--trust-tools fs_read,grep,glob`
+    // scoping text mode rather than repurposing an interactive planning
+    // surface — the response is whatever the prompt asked for.
+    textModeResponseContractV1: "honours",
     buildArgs(mode, model): string[] {
       const args = ["chat", "--no-interactive"];
       if (mode === "edit") {
@@ -1269,6 +1342,15 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     // new choices are always a concrete model in one of the two tiers.
     models: [],
     discoverModels: discoverOpencodeModels,
+    // Text mode routes through the "plan" agent (see buildArgs's `--agent`
+    // push below), an interactive planning surface repurposed for headless
+    // read-only dispatch — its own baked-in refusal language ("read-only
+    // phase", ".opencode/plans/*.md") can survive into the response instead
+    // of the requested report shape, the same failure mode observed live for
+    // Claude Code's plan mode. See isLikelyOpencodePlanModeRefusal /
+    // OPENCODE_PLAN_MODE_REFUSAL_NOTE in chatWithStage.ts, which exists
+    // specifically to paper over this in the chat path.
+    textModeResponseContractV1: "repurposed-interactive-flow",
     // The prompt is read from stdin when `run` is given no message argv
     // (verified live: `echo "..." | opencode run --format json -m ...`
     // answers correctly) — preferred over the argv-positional form so large
@@ -1390,6 +1472,10 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     permissionWarning:
       "Cline can create, change, or delete any file and run shell commands without asking, " +
       "in every stage including plan and review. Its CLI has no read-only or restricted mode.",
+    // Already ineligible for summary-only via permissionWarning above (text
+    // mode is not read-only at all); "unproven" is audit-only here, not
+    // load-bearing.
+    textModeResponseContractV1: "unproven",
     promptTransport: "stdin",
     // Keep the provider-level fallback to the account's own default model
     // only (mirroring Claude/Codex/Gemini). The full ClinePass catalog,
@@ -1504,6 +1590,10 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     permissionWarning:
       "Kimi Code can create, change, or delete any file and run shell commands without asking, " +
       "in every stage including plan and review. Its CLI has no read-only or restricted mode.",
+    // Already ineligible for summary-only via permissionWarning above (text
+    // mode is not read-only at all); "unproven" is audit-only here, not
+    // load-bearing.
+    textModeResponseContractV1: "unproven",
     // Verified live (kimi-code 0.29.2, `kimi -p "..."` with piped stdin and
     // no `--output-format` flag): stdin content is NEVER read in prompt
     // mode — the model reported "no stdin content arrived" even with a
@@ -1735,6 +1825,13 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     // --verbose`.
     models: [],
     discoverModels: discoverDevpassModels,
+    // Same "plan" agent routing as opencode-cli (identical fork, see
+    // buildArgs's `--agent` push below and the module doc comment at the top
+    // of this definition) — a repurposed interactive planning surface, not a
+    // genuine one-shot dispatch. See opencode-cli's own
+    // textModeResponseContractV1 comment for the observed failure mode this
+    // shares.
+    textModeResponseContractV1: "repurposed-interactive-flow",
     // Verified live: `echo "..." | devpass-code run --format json -m ...`
     // answers correctly, matching OpenCode's stdin transport.
     promptTransport: "stdin",

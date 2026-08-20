@@ -396,15 +396,17 @@ export function createProductionTaskActionCoordinatorV1(options: {
   /**
    * Forwarded to `createV1RunnerSelectionOpener` — when true, `text`-mode
    * candidate selection (primary AND every ranked backup) rejects any CLI
-   * provider whose text mode is not vendor-enforced read-only, so a caller
-   * whose no-edit mandate must actually be enforced (the `summary-only`
+   * provider whose text mode is not BOTH vendor-enforced read-only AND
+   * declared to honour the requested response contract (rather than
+   * repurposing an interactive planning flow), so a caller whose
+   * summary-only mandate must actually be enforced (the `summary-only`
    * recovery continuation, `implContinuationTextDispatchV1.ts`) can never
-   * have the coordinator reserve a write-capable backup in its place. Omit
-   * (default false) for every ordinary text-mode row — chat/review/etc. never
-   * required this guarantee before and must not narrow their provider chain
-   * by it now.
+   * have the coordinator reserve a write-capable backup, or a read-only-but-
+   * plan-mode backup, in its place. Omit (default false) for every ordinary
+   * text-mode row — chat/review/etc. never required this guarantee before
+   * and must not narrow their provider chain by it now.
    */
-  readonly requireGuaranteedReadOnlyText?: boolean;
+  readonly requireSummaryOnlyCapableText?: boolean;
 }): TaskActionCoordinatorV1 {
   return withMalformedResultRetryV1(createTaskActionCoordinatorV1({
     registry: getProductionTaskActionRegistryV1(),
@@ -412,7 +414,7 @@ export function createProductionTaskActionCoordinatorV1(options: {
     openRunnerSelection: createV1RunnerSelectionOpener({
       workspaceCwd: options.workspaceCwd,
       resolveStagePrimaryModel: options.resolveStagePrimaryModel,
-      requireGuaranteedReadOnlyText: options.requireGuaranteedReadOnlyText,
+      requireSummaryOnlyCapableText: options.requireSummaryOnlyCapableText,
     }),
     // Make a passed-over model visible. Until this existed, a candidate the
     // registry refused was recorded only inside the in-memory selection

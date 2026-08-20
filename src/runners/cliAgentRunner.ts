@@ -454,6 +454,26 @@ export function isCliTextModeGuaranteedReadOnlyV1(def: CliProviderDefinition): b
 }
 
 /**
+ * Exported capability probe for `summary-only` continuation SELECTION
+ * specifically (workflow findings, 2026-08-20: "summary-only continuations
+ * are selected for claude-cli, whose text mode cannot produce the required
+ * report"). Stricter than `isCliTextModeGuaranteedReadOnlyV1` above: that
+ * probe answers only "does text mode withhold edits", which claude-cli's
+ * `--permission-mode plan` satisfies — but plan mode is a repurposed
+ * INTERACTIVE flow whose own baked-in behavior (plan-approval prompting, a
+ * `~/.claude/plans/*.md` scratch file) can override the specific report
+ * format a summary-only continuation requires, observed live even with the
+ * mitigation system prompt attached. A `summary-only` dispatch needs BOTH
+ * properties — no edits AND the requested response contract honoured — so
+ * this is the probe that selection must use, while the free-retry gate
+ * (`shouldRetryReadOnlyRun`) and any other caller that only cares about
+ * "did this run mutate the tree" keeps using the read-only-only probe above.
+ */
+export function isCliTextModeSummaryOnlyCapableV1(def: CliProviderDefinition): boolean {
+  return isTextModeGuaranteedReadOnly(def) && def.textModeResponseContractV1 === "honours";
+}
+
+/**
  * Promote a mid-stream transport drop from "generic" (terminal at both backup
  * cascade gates) to "temporarily-unavailable" (cascade-eligible) — but only
  * where doing so is actually safe. See the guards below for what "safe"
