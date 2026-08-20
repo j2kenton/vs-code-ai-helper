@@ -4,7 +4,8 @@
  * The one mutation surface V1 workflow code uses for files under registered
  * roots. Every operation is exact and nonrecursive:
  *
- *  - exclusive creation (`wx` — never clobbers);
+ *  - exclusive creation (same-directory temp file, then `link()`ed into
+ *    place — atomic, and `link` itself never clobbers an existing target);
  *  - same-directory temp-then-rename replacement guarded by an exact
  *    revision check;
  *  - bounded reads (a size ceiling checked against the open handle's stat,
@@ -353,10 +354,32 @@ class WorkflowFileStoreImplV1 implements WorkflowFileStoreV1 {
     if (unsafe) {
       return unsafe;
     }
+    // Item 10 (2026-08-17..19 workflow-defects batch): a direct `wx` write to
+    // the target path is exclusive (never clobbers an existing file) but not
+    // ATOMIC — a crash, kill, or thrown error partway through the write can
+    // leave a truncated (in the worst case 0-byte) file sitting at the final
+    // path, permanently: `verifyWrittenFile` below catches the corruption and
+    // reports it, but nothing removes the bad file, and every future attempt
+    // then fails `targetExists` against it forever. Write to a same-directory
+    // temp file (still `wx`, so a colliding temp name still fails loudly),
+    // then `link()` it into place: `link` fails with EEXIST if the target
+    // already exists — so exclusivity is preserved — and otherwise makes the
+    // complete, already-fully-written bytes visible under the final name in
+    // one filesystem operation, exactly like `replaceFileExact`'s temp+rename.
+    const tempPath = path.join(
+      path.dirname(target.fsPath),
+      `.ensemble-create-${randomBytes(8).toString("hex")}.tmp`
+    );
     try {
-      await fs.promises.writeFile(target.fsPath, bytes, { flag: "wx" });
+      await fs.promises.writeFile(tempPath, bytes, { flag: "wx" });
+      await fs.promises.link(tempPath, target.fsPath);
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
+      try {
+        await fs.promises.unlink(tempPath);
+      } catch {
+        // Temp cleanup is best-effort.
+      }
       if (code === "EEXIST") {
         return { kind: "failed", code: "targetExists" };
       }
@@ -364,6 +387,13 @@ class WorkflowFileStoreImplV1 implements WorkflowFileStoreV1 {
         return { kind: "failed", code: "parentMissing" };
       }
       return ioFailure(error);
+    }
+    try {
+      await fs.promises.unlink(tempPath);
+    } catch {
+      // The target already holds the complete bytes (link succeeded); the
+      // temp directory entry is now a harmless extra name for the same
+      // data and its removal is best-effort only.
     }
     return this.verifyWrittenFile(target.fsPath, sha256Hex(bytes), bytes.length);
   }

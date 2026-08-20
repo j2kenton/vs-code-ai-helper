@@ -51,6 +51,7 @@
  *    retryable — a pre-invocation crash never permanently consumes it.
  */
 import * as assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -90,7 +91,7 @@ import {
   V1ReserveNextResultV1,
 } from "../runners/runnerRegistry";
 import { ActionCorrelationV1, allocateHex128IdV1 } from "../types/actionCorrelationV1";
-import { AgentTransportV1 } from "../types/agentExecutionV1";
+import { AgentTransportExitV1, AgentTransportV1 } from "../types/agentExecutionV1";
 import { CompletedContentV1, MalformedAiResultV1 } from "../types/aiResultEnvelope";
 import { MIGRATED_ACTION_KEYS_V0 } from "../services/legacyAiActionSafetyGateV0";
 import { EDIT_EXECUTION_ACTION_KEY_V1 } from "../actions/rows/editExecutionRowV1";
@@ -467,6 +468,30 @@ void describe("taskActionCoordinatorV1", () => {
     assert.doesNotMatch(seen.prompt, /Workspace access/);
   });
 
+  void it("tells the model plainly when a readsWorkspaceFiles row's read session could not be attached", async () => {
+    const seen = { prompt: "" };
+    const probe = readSessionProbe();
+    const throwingToolSessions: TaskActionToolSessionsV1 = {
+      ...probe.toolSessions,
+      createWorkspaceReadSession: () => {
+        throw new Error("no open workspace folder for this task");
+      },
+    };
+    const harness = makeHarness(
+      [promptCapturingTransport(seen)],
+      { readsWorkspaceFiles: true },
+      [],
+      undefined,
+      undefined,
+      { toolSessions: throwingToolSessions, providerReadsWorkspaceNatively: false }
+    );
+    const outcome = await harness.coordinator.executeAction(baseRequest());
+    assert.equal(outcome.kind, "completed", "a failed read-session attach must still run the row, tool-less");
+    assert.doesNotMatch(seen.prompt, /## Workspace access\s*$/m, "must not claim tools it does not have");
+    assert.match(seen.prompt, /Workspace access — unavailable this attempt/);
+    assert.match(seen.prompt, /could not be attached/);
+  });
+
   void it("leaves a row that does not read workspace files unchanged", async () => {
     const seen = { prompt: "" };
     const probe = readSessionProbe();
@@ -570,6 +595,98 @@ void describe("taskActionCoordinatorV1", () => {
     );
     // The lease was released before the user answers (plan §6.1 rule 6).
     assert.equal(harness.leaseStore.heldLease(TASK_BINDING.taskBindingId), undefined);
+  });
+
+  /**
+   * Item 9 (2026-08-17..19 workflow-defects batch): the questions-admission
+   * hash used to be computed from a prompt built WITHOUT the preflight tool
+   * session's `ledger`/`rootId` in context — a preflight row's `buildPrompt`
+   * weaves the root id into the text, so the admitted `promptInputSha256`
+   * silently described bytes different from what the transport actually
+   * received. Both are now assembled from the exact same `prompt` value.
+   */
+  void it("hashes the exact prompt bytes sent, including preflight session context, for a question-capable row", async () => {
+    const seen = { prompt: "" };
+    const preflightToolSessions: TaskActionToolSessionsV1 = {
+      createPreflightSession: () => ({
+        handler: {
+          descriptors: [],
+          handleToolCall: (): Promise<string> => Promise.resolve("{}"),
+          violationCount: (): number => 0,
+        },
+        ledger: createObservationLedgerV1(),
+        rootId: "preflight-root-item9",
+      }),
+      createEditSession: () => {
+        throw new Error("not used by this test");
+      },
+      createWorkspaceReadSession: () => {
+        throw new Error("not used by this test");
+      },
+    };
+    const harness = makeHarness(
+      [
+        {
+          runnerId: "scripted-transport",
+          invoke: (request, output): Promise<{ kind: "completed" }> => {
+            seen.prompt = request.prompt;
+            output.write(
+              frame({
+                version: 1,
+                correlation: request.correlation,
+                kind: "questions",
+                questions: [
+                  { questionId: "q1", kind: "text", prompt: "Which stage?", required: true },
+                ],
+              })
+            );
+            return Promise.resolve({ kind: "completed" as const });
+          },
+        },
+      ],
+      {
+        providerMode: "preflight",
+        completedContentType: "preflight-plan.v1",
+        buildPrompt: (context) =>
+          context.preflight
+            ? `PREFLIGHT ROOT ${context.preflight.rootId}`
+            : "NO PREFLIGHT CONTEXT REACHED THIS ROW",
+      },
+      [],
+      undefined,
+      undefined,
+      { toolSessions: preflightToolSessions, providerReadsWorkspaceNatively: true }
+    );
+    const outcome = await harness.coordinator.executeAction(baseRequest());
+    assert.equal(outcome.kind, "questions");
+    if (outcome.kind !== "questions") {
+      assert.fail("expected a questions outcome");
+    }
+    // The prompt actually sent must have been built WITH the preflight
+    // session's rootId in context — proof the admission-time assembly and
+    // the invocation-time assembly are now the same code path.
+    assert.match(seen.prompt, /PREFLIGHT ROOT preflight-root-item9/);
+
+    // `promptContract` is persisted on the durable transaction record but is
+    // not part of the orchestrator's `getRecord` read model, so it is read
+    // back the same way the existing questions test above proves the file
+    // was written through: directly off disk.
+    const transactionPath = path.join(
+      orchestratorTmpRoot,
+      "workflow-runtime-v1",
+      "chat-transactions",
+      outcome.correlation.operationId,
+      "transaction-v1.json"
+    );
+    const persisted = JSON.parse(fs.readFileSync(transactionPath, "utf8")) as {
+      promptContract: { promptInputSha256: string };
+    };
+    const expectedSha256 = createHash("sha256").update(seen.prompt, "utf8").digest("hex");
+    assert.equal(
+      persisted.promptContract.promptInputSha256,
+      expectedSha256,
+      "the recorded prompt digest must describe the exact bytes the transport received"
+    );
   });
 
   void it("rejects a result echoing a foreign operation as resultCorrelationMismatch", async () => {
@@ -1369,6 +1486,121 @@ void describe("taskActionCoordinatorV1", () => {
         harness.selection.reserved,
         1,
         "only the one remaining invocation of the seeded 3-budget may be reserved"
+      );
+    });
+  });
+
+  /**
+   * Item 14: a transport-flagged network fault (dropped connection, DNS
+   * failure, TLS handshake failure, HTTP/2 protocol error) earns one
+   * immediate retry of the SAME candidate before the loop falls through to
+   * the next ranked one — falling straight to a backup would silently
+   * change which model authors the artifact for a reason that had nothing
+   * to do with the model.
+   */
+  void describe("network-fault same-candidate retry", () => {
+    /** Fails with a flagged network fault on its first call, then succeeds. */
+    function networkFaultOnceThenCompletes(): AgentTransportV1 {
+      let calls = 0;
+      return {
+        runnerId: "scripted-transport",
+        invoke: (request, output): Promise<AgentTransportExitV1> => {
+          calls++;
+          if (calls === 1) {
+            return Promise.resolve({
+              kind: "transportFailure" as const,
+              code: "copilotRequestFailed",
+              networkFault: true,
+            });
+          }
+          output.write(frame({
+            version: 1,
+            correlation: request.correlation,
+            kind: "completed",
+            content: { contentType: "markdown-artifact.v1", schemaVersion: 1, markdown: "# ok" },
+          }));
+          return Promise.resolve({ kind: "completed" as const });
+        },
+      };
+    }
+
+    function networkFaultAlways(): AgentTransportV1 {
+      return {
+        runnerId: "scripted-transport",
+        invoke: () =>
+          Promise.resolve({
+            kind: "transportFailure" as const,
+            code: "copilotRequestFailed",
+            networkFault: true,
+          }),
+      };
+    }
+
+    function malformedTransport(): AgentTransportV1 {
+      return {
+        runnerId: "scripted-transport",
+        invoke: (_request, output): Promise<{ kind: "completed" }> => {
+          output.write("<<<ENSEMBLE_AI_RESULT_V1>>>\nnot valid json\n<<<END_ENSEMBLE_AI_RESULT_V1>>>\n");
+          return Promise.resolve({ kind: "completed" as const });
+        },
+      };
+    }
+
+    void it("retries the same candidate once on a flagged network fault, without reserving a new one", async () => {
+      const harness = makeHarness([
+        networkFaultOnceThenCompletes(),
+        envelopeTransport(() => {
+          throw new Error("must not reserve a 2nd candidate — the retry must reuse the first");
+        }),
+      ]);
+      const outcome = await harness.coordinator.executeAction(baseRequest());
+      assert.equal(outcome.kind, "completed");
+      assert.equal(
+        harness.selection.reserved,
+        1,
+        "the retry re-reserves the SAME candidate directly through the session, never through the registry's ranked cursor"
+      );
+    });
+
+    void it("falls through to the next candidate once the one retry is also a network fault", async () => {
+      const harness = makeHarness([
+        networkFaultAlways(),
+        envelopeTransport((correlation) =>
+          frame({
+            version: 1,
+            correlation,
+            kind: "completed",
+            content: { contentType: "markdown-artifact.v1", schemaVersion: 1, markdown: "# ok" },
+          })
+        ),
+      ]);
+      const outcome = await harness.coordinator.executeAction(baseRequest());
+      assert.equal(outcome.kind, "completed");
+      assert.equal(
+        harness.selection.reserved,
+        2,
+        "one retry (not counted as a reservation) then one genuine fallback to the 2nd ranked candidate"
+      );
+    });
+
+    void it("does not retry once the malformed-result budget is armed and exhausted", async () => {
+      const harness = makeHarness([
+        malformedTransport(),
+        networkFaultAlways(),
+        envelopeTransport(() => {
+          throw new Error("must not reserve a 3rd candidate once the shared budget is exhausted");
+        }),
+      ]);
+      const outcome = await harness.coordinator.executeAction(baseRequest());
+      // 1 (malformed) + 1 (network-fault fallback, budget already armed at
+      // that point) = 2 total invocations; the retry that would make a 3rd
+      // must be refused by the same shared-cap check the ordinary fallback
+      // uses, leaving the malformed result as the honest diagnosis.
+      assert.equal(outcome.kind, "malformedResult");
+      assert.equal(
+        harness.selection.reserved,
+        2,
+        "the network-fault retry must not push total invocations past the shared 3-budget once armed"
       );
     });
   });

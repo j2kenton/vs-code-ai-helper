@@ -395,6 +395,31 @@ void describe("provider chain exhaustion (stage owner)", () => {
     assert.doesNotMatch(persisted.pausedReason ?? "", /No configured provider/);
   });
 
+  // Item 5 (2026-08-17..19 workflow-defects batch): a monthly/hard
+  // billing-limit block (Copilot's "monthly credit limit", a devpass
+  // premium-tier weekly ceiling) previously folded into the same generic
+  // "tried and failed" sentence as an ordinary transport/code fault, costing
+  // real spend across several rounds before the actual cause was legible.
+  // When a candidate's reason classifies as quota/entitlement, the pause
+  // reason must name that plainly instead of the generic wording.
+  void it("names the quota/credit-limit block plainly instead of the generic 'tried and failed' wording", async () => {
+    const { folderPath, folderUri } = makeTaskFolder("exhausted_pause_quota_named");
+    await withHarness(async () => {
+      await pauseTaskForExhaustedChainV1(folderUri, "impl-high-review", QUOTA_EXHAUSTION, "candidatesExhausted");
+    });
+
+    const persisted = readProgress(folderPath);
+    assert.equal(persisted.status, "paused");
+    assert.match(
+      persisted.pausedReason ?? "",
+      /blocked by a quota\/credit-limit restriction on Claude Code/
+    );
+    assert.doesNotMatch(
+      persisted.pausedReason ?? "",
+      /Every configured model for impl-high-review was tried and failed/
+    );
+  });
+
   void it("pauses with the legacy 'no provider available' wording when no code is passed (back-compat)", async () => {
     const { folderPath, folderUri } = makeTaskFolder("exhausted_pause_default");
     await withHarness(async () => {

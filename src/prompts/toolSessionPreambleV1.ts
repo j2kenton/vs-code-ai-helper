@@ -94,12 +94,12 @@ function purposeSectionV1(purpose: PreflightRoundPurposeV1): string[] {
       "You do not have to fix every blocker in one plan. Fixing some and leaving",
       "the rest for the next round is normal and expected. Fixing none is not.",
       "",
-      "**Several blockers usually live in the SAME file.** You may plan only ONE",
-      "operation per file (see the rule below), and a plan with two operations on",
-      "one path is rejected in full — the whole round is lost and nothing is",
-      "applied. So when two or more blockers touch one file, either widen a single",
-      "`patchFile` so its `findText` spans them all, or fix one now and leave the",
-      "others for the next round. Do not plan them as separate operations.",
+      "**Several blockers usually live in the SAME file.** That is fine: two or",
+      "more `patchFile` operations on one file, in one plan, are allowed and apply",
+      "in order, each verified against the file as the previous one left it. Give",
+      "each blocker its own narrow `patchFile` rather than widening a single patch",
+      "to span unrelated regions — see the rule below. (Whole-file `replaceFile`",
+      "is the exception: a path may carry only one of those.)",
     ];
   }
   if (purpose === "lint-fixes") {
@@ -192,32 +192,26 @@ export function buildPreflightToolSessionPreambleV1(
     "`deleteFile` — send an empty `parentChain: []`. The file's own observation",
     "already proves its directories exist, so nothing further is needed.",
     "",
-    "When you ARE creating something, `parentChain` lists every directory between",
-    "the root (exclusive) and the new item's immediate parent (inclusive), in",
-    "root-to-parent order — one link per path segment before the final name. Each",
-    'link is either `{"kind":"observed","observationId":"..."}` for a directory you',
-    'observed, or `{"kind":"createdByStep","stepId":"..."}` for one an earlier',
-    "operation in this same plan creates. Something created directly in the root",
-    "has an empty `parentChain`.",
+    "When you ARE creating something, an ancestor directory that ALREADY EXISTS is",
+    "resolved automatically from what you have observed this session — list nothing",
+    "for it. `parentChain` should therefore usually be empty. The ONLY thing it ever",
+    'needs is `{"kind":"createdByStep","stepId":"..."}` for an ancestor that does NOT',
+    "yet exist and that an earlier operation in this same plan creates — for example,",
+    "creating `src/generated/out.ts` right after a `createDirectory` step for",
+    "`src/generated` needs one link naming that step; `src` itself needs nothing,",
+    "existing ancestors are never listed. Do not send an `\"observed\"` link — the",
+    "host already has that information and rejects one if you do.",
     "",
-    "Count the segments rather than copying an example. Creating",
-    "`apps/server/new.ts` needs two links (`apps`, `apps/server`); creating",
-    "`apps/server/lib/competition/new.ts` needs four (`apps`, `apps/server`,",
-    "`apps/server/lib`, `apps/server/lib/competition`). A plain `ensemble_stat` on",
-    "each is enough — you do NOT need to list their contents. Use `ensemble_stat`,",
-    "not `ensemble_findFiles` or `ensemble_textSearch`: a discovery result can never",
-    "authorize anything, including a parent link.",
+    "**Two or more `patchFile` operations on the SAME file, in one plan, ARE allowed**",
+    "and apply in order — each later one is verified and written against the file as",
+    "the previous one left it. Any OTHER repeat of a path (a second `createFile`,",
+    "`replaceFile`, or a mix of kinds) is rejected before anything is applied: those",
+    "carry the file's revision as observed during planning, and the first write",
+    "changes it, so a second one would be acting on a revision that no longer exists.",
     "",
-    "**At most ONE operation per file, per plan.** Two operations on the same path",
-    "are rejected before anything is applied. This is not arbitrary: each operation",
-    "carries the file's revision as observed during planning, and the first write",
-    "changes it — so a second operation on that file would be acting on a revision",
-    "that no longer exists.",
-    "",
-    "If a file needs several separate edits, either widen ONE `patchFile` so its",
-    "`findText` spans them all (include the unchanged lines in between, verbatim, in",
-    "both `findText` and `replacementText`), or make the nearest edit now and leave",
-    "the rest for the next round. Do not split one file across two operations.",
+    "If a file needs several separate `patchFile` edits, prefer emitting them as",
+    "separate operations, each with its own narrow `findText`/`replacementText`,",
+    "rather than widening one patch to span unrelated regions.",
     "",
     "`stepId` is yours to choose and must be unique within the plan.",
     "",
@@ -238,10 +232,11 @@ export function buildPreflightToolSessionPreambleV1(
     "more than once the operation is refused, so include enough surrounding lines",
     "to make it unique rather than matching a bare fragment. Copy it verbatim from",
     "what `ensemble_readFile` returned — a paraphrase or a re-indented copy will",
-    "not match. For several separate edits to the SAME file, widen one",
-    "`patchFile` to span them or leave the rest for the next round — see the",
-    "one-operation-per-file rule above; a second operation on the same path is",
-    "rejected before anything is applied.",
+    "not match. Uniqueness is re-checked against the file as it stands when the",
+    "operation actually runs, so a later patch must be unique in the file the",
+    "EARLIER patches left behind — not merely in the file you read. For several",
+    "separate edits to the SAME file, emit several narrow `patchFile` operations",
+    "rather than widening one to span them (see the rule above).",
     "",
     "Prefer this for ANY edit to an existing file. `replaceFile` carries the whole",
     "file in `contentBase64`, so it is limited by your own output budget: a small",
@@ -306,5 +301,33 @@ export function buildWorkspaceReadSessionPreambleV1(input: { readonly rootId: st
     "what you are about to write. A reply that says you will produce the answer",
     "next is recorded AS the answer, and is then rejected for not matching the",
     "contract — losing all the work you just did.",
+  ].join("\n");
+}
+
+/**
+ * Preamble for a text-producing row that DECLARED it must reason about file
+ * content (`readsWorkspaceFiles`) but whose workspace read session could not
+ * be attached this attempt (`ensureWorkflowWorkspaceRootV1` threw — e.g. no
+ * open workspace folder for this task). The row still runs, tool-less, on
+ * the context pack alone exactly as it did before item 16 — this is a
+ * best-effort degrade, not a failure — but silently doing so overstates the
+ * review's own confidence in exactly the way item 15 describes. Naming the
+ * degradation in the prompt itself means it can end up in the artifact's own
+ * confidence assessment rather than only in a log nobody reads afterward.
+ */
+export function buildWorkspaceReadSessionDegradedPreambleV1(): string {
+  return [
+    "## Workspace access — unavailable this attempt",
+    "",
+    "This review normally has read-only tools to open workspace files directly,",
+    "but they could not be attached for this attempt (the workspace root could",
+    "not be resolved). You are working from the context pack below ONLY — no",
+    "tool calls are available.",
+    "",
+    "The pack is size-bounded and may truncate or omit files this review needs.",
+    "Do not conclude work is missing purely because the pack does not show it.",
+    "Where the pack's coverage genuinely prevents you from confirming readiness,",
+    "file a `[review-confidence] [unverifiable]` blocker naming the specific file",
+    "you could not see, rather than a completion or defect blocker.",
   ].join("\n");
 }

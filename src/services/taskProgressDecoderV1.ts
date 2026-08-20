@@ -28,6 +28,7 @@ import {
   ImplRecoveryV1,
   ImplementationTypeCheckFailure,
   LintPayload,
+  MAX_OVERRIDDEN_ESCALATIONS,
   MAX_REVIEW_BLOCKER_IDENTITIES,
   MAX_REVIEW_REJECTIONS,
   MAX_REVIEW_SCORE_HISTORY,
@@ -132,6 +133,7 @@ export const TASK_PROGRESS_PRODUCT_FIELD_NAMES_V1 = [
   "reviewScoreHistory",
   "reviewRejections",
   "escalation",
+  "overriddenEscalations",
   "implementationTypeCheckFailure",
   "checklistProgressUnreliable",
   "zeroChangeImplRounds",
@@ -768,6 +770,22 @@ function validateEscalation(
     typeof value["secondOpinionAttempted"] !== "boolean"
   ) {
     return "escalation.secondOpinionAttempted must be a boolean when present";
+  }
+  return undefined;
+}
+
+function validateOverriddenEscalations(
+  value: unknown,
+  family: TaskProgressFamilyV1
+): string | undefined {
+  if (!Array.isArray(value) || value.length > MAX_OVERRIDDEN_ESCALATIONS) {
+    return "overriddenEscalations must be a bounded array";
+  }
+  for (const entry of value as unknown[]) {
+    const error = validateEscalation(entry, family);
+    if (error !== undefined) {
+      return `overriddenEscalations entry invalid: ${error}`;
+    }
   }
   return undefined;
 }
@@ -1454,6 +1472,14 @@ export function decodeTaskProgressTextV1(
           return recovery("invalidFieldValue", error);
         }
         draft.escalation = value as TaskEscalation;
+        break;
+      }
+      case "overriddenEscalations": {
+        const error = validateOverriddenEscalations(value, family);
+        if (error !== undefined) {
+          return recovery("invalidFieldValue", error);
+        }
+        draft.overriddenEscalations = value as TaskEscalation[];
         break;
       }
       case "implementationTypeCheckFailure": {

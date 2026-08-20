@@ -8,7 +8,10 @@
 import * as assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import * as vscode from "vscode";
-import { createCopilotLmToolSessionTransportV1 } from "../services/languageModelToolSessionV1";
+import {
+  createCopilotLmToolSessionTransportV1,
+  setLmToolSessionRequestIssuedObserverV1,
+} from "../services/languageModelToolSessionV1";
 import { RequestLocalToolHandlerV1 } from "../services/requestLocalToolHandlerV1";
 import { AgentExecutionRequestV1, BoundedResultWriterV1 } from "../types/agentExecutionV1";
 import { allocateHex128IdV1 } from "../types/actionCorrelationV1";
@@ -310,6 +313,90 @@ void describe("languageModelToolSessionV1", () => {
       );
     } finally {
       lm.selectChatModels = original;
+    }
+  });
+
+  void it("fires the pre-request boundary marker before a hung sendRequest ever resolves", async () => {
+    // Workflow-6 Item 18 fix 2. Fix 1 (the round deadline, tested above)
+    // converts a hang into a reported failure but cannot say WHERE the hang
+    // was: the marker fired synchronously right after `sendRequest` is
+    // called is what proves the call actually reached `vscode.lm`, even
+    // though its Thenable never settles — distinguishing that from a hang
+    // that never got as far as calling `sendRequest` at all.
+    const lm = (vscode as unknown as { lm: { selectChatModels: unknown } }).lm;
+    const original = lm.selectChatModels;
+    lm.selectChatModels = () =>
+      Promise.resolve([
+        {
+          id: "gpt-test",
+          name: "GPT Test",
+          vendor: "copilot",
+          family: "gpt",
+          sendRequest: (
+            _messages: readonly unknown[],
+            _options: unknown,
+            token: vscode.CancellationToken
+          ) =>
+            new Promise((_resolve, reject) => {
+              // Honour the token the transport hands us, as the real API does,
+              // so the round deadline can actually abandon this await instead
+              // of hanging the suite forever.
+              token.onCancellationRequested(() => {
+                reject(new Error("Canceled"));
+              });
+            }),
+        },
+      ]);
+    const issued: Array<{ round: string }> = [];
+    setLmToolSessionRequestIssuedObserverV1((event) =>
+      issued.push({ round: `${event.round}/${event.maxRounds}` })
+    );
+    try {
+      const transport = createCopilotLmToolSessionTransportV1({
+        model: "gpt-test",
+        toolHandler: recordingHandler(() => "{}"),
+        roundTimeoutMs: 40,
+      });
+      const exit = await transport.invoke(makeRequest(), makeWriter());
+      assert.equal(
+        exit.kind === "transportFailure" ? exit.code : exit.kind,
+        "copilotRequestTimedOut"
+      );
+      assert.deepEqual(
+        issued,
+        [{ round: "1/64" }],
+        "the marker must fire exactly once, for the one round that was actually issued"
+      );
+    } finally {
+      lm.selectChatModels = original;
+      setLmToolSessionRequestIssuedObserverV1(undefined);
+    }
+  });
+
+  void it("does not fire the pre-request boundary marker when capability probing fails closed first", async () => {
+    // The marker exists to prove a round REACHED `sendRequest` — a failure
+    // that never gets that far (no tool-calling host support) must not
+    // report a request that was never issued.
+    // Mutate the RAW require("vscode") module object — the `import * as`
+    // namespace binding is not configurable (see vscodeLmCompat.test.ts and
+    // the "fails closed with lmToolApiUnavailable" test below).
+    // eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/no-var-requires
+    const target = require("vscode") as Record<string, unknown>;
+    const original = target.LanguageModelToolCallPart;
+    delete target.LanguageModelToolCallPart;
+    const issued: unknown[] = [];
+    setLmToolSessionRequestIssuedObserverV1((event) => issued.push(event));
+    try {
+      const transport = createCopilotLmToolSessionTransportV1({
+        model: "gpt-test",
+        toolHandler: recordingHandler(() => "{}"),
+      });
+      const exit = await transport.invoke(makeRequest(), makeWriter());
+      assert.deepEqual(exit, { kind: "transportFailure", code: "lmToolApiUnavailable" });
+      assert.deepEqual(issued, []);
+    } finally {
+      target.LanguageModelToolCallPart = original;
+      setLmToolSessionRequestIssuedObserverV1(undefined);
     }
   });
 

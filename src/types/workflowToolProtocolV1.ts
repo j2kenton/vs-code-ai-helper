@@ -37,6 +37,17 @@ export const MAX_DIRECTORY_ENTRIES_V1 = 2_048;
 export const MAX_FIND_RESULTS_V1 = 512;
 export const MAX_TEXT_SEARCH_RESULTS_V1 = 256;
 export const MAX_TEXT_SEARCH_QUERY_LENGTH_V1 = 512;
+/**
+ * Reassessed 2026-08-20 (item 8, 2026-08-17..19 workflow-defects batch):
+ * left at 64 rather than lowered. Most edits need a handful of rounds, but
+ * 64 is no longer the primary safety net for a wedged or runaway session —
+ * `MAX_TOOL_SESSION_RESULT_BYTES_V1` (languageModelToolSessionV1.ts) now
+ * stops a session on cumulative tool-result bytes, and item 18's per-attempt
+ * wall-clock deadline bounds a hung `invocationPending` round independently.
+ * Lowering this without evidence of a real session that legitimately needs
+ * more rounds would risk truncating a working multi-file plan for no
+ * observed benefit, so it stays at 64 pending a concrete report otherwise.
+ */
 export const MAX_TOOL_ROUNDS_V1 = 64;
 export const MAX_TOOL_PROTOCOL_VIOLATIONS_V1 = 8;
 

@@ -32,6 +32,10 @@ import {
   getProductionActionConversationOrchestratorV1,
 } from "../actions/productionTaskActionRuntimeV1";
 import { ImplementationRunResult } from "../runners/copilotImplementationRunner";
+import {
+  isSummaryOnlyDispatchAvailableV1,
+  runSealedEditContinuationReportV1,
+} from "./implContinuationTextDispatchV1";
 import { readChatDocumentIdentityV1 } from "../utils/chatHistoryStore";
 import { allocateHex128IdV1 } from "../types/actionCorrelationV1";
 import {
@@ -562,6 +566,66 @@ export interface RunSealedImplementationOptionsV1 {
   readonly onQuestions?: (outcome: TaskActionOutcomeV1 & { kind: "questions" }) => Promise<void>;
 }
 
+/**
+ * The shape of `runSealedEditContinuationReportV1`'s outcome that
+ * {@link resolveSealedEditCompletionResultV1} needs to decide with — a subset
+ * of `ImplementationRunResult`, named separately so the decision function
+ * below can be unit-tested without constructing a full result object.
+ */
+export interface SealedEditReportOutcomeV1 {
+  readonly status: "completed" | "failed" | "cancelled";
+  readonly summary?: string;
+  readonly filesChangedUnknown?: boolean;
+  readonly filesChanged: readonly string[];
+}
+
+/**
+ * Part 5 item 5's completion decision: prefer a real, model-authored report
+ * for the sealed edit's own applied change set over the runner-synthesized
+ * summary, but only when that report is trustworthy on its face — completed,
+ * non-empty, and provably free of further edits (a report that changed, or
+ * may have changed, files cannot be trusted to describe only the already-applied
+ * plan). Any other outcome (absent, failed, cancelled, empty, or edited)
+ * falls back to the synthetic summary unchanged — the sealed edit's own
+ * completion never depends on this follow-up succeeding.
+ *
+ * Exported and pure (no I/O) so this decision is directly testable; the only
+ * caller is `runSealedImplementationV1`'s "completed" case.
+ */
+export function resolveSealedEditCompletionResultV1(
+  changedPaths: readonly string[],
+  appliedReceiptCount: number,
+  runnerId: string,
+  report: SealedEditReportOutcomeV1 | undefined
+): ImplementationRunResult & { runnerId: string } {
+  if (
+    report &&
+    report.status === "completed" &&
+    report.summary !== undefined &&
+    report.summary.trim().length > 0 &&
+    report.filesChangedUnknown !== true &&
+    report.filesChanged.length === 0
+  ) {
+    return {
+      status: "completed",
+      filesChanged: [...changedPaths],
+      summary: report.summary,
+      runnerId,
+    };
+  }
+  return {
+    status: "completed",
+    filesChanged: [...changedPaths],
+    summary:
+      `Applied ${appliedReceiptCount} sealed edit step(s) with ordered receipts ` +
+      `(${changedPaths.length} file(s) changed).`,
+    // Runner-authored, not model-authored against the summary prompt —
+    // see ImplementationRunResult.summaryIsSynthetic.
+    summaryIsSynthetic: true,
+    runnerId,
+  };
+}
+
 export async function runSealedImplementationV1(
   options: RunSealedImplementationOptionsV1
 ): Promise<ImplementationRunResult & { runnerId: string }> {
@@ -647,19 +711,41 @@ export async function runSealedImplementationV1(
 
   const runnerId = "copilot-lm";
   switch (result.kind) {
-    case "completed":
+    case "completed": {
       options.onProgress("Applied sealed edit plan.");
-      return {
-        status: "completed",
-        filesChanged: [...result.changedPaths],
-        summary:
-          `Applied ${result.appliedReceiptIds.length} sealed edit step(s) with ordered receipts ` +
-          `(${result.changedPaths.length} file(s) changed).`,
-        // Runner-authored, not model-authored against the summary prompt —
-        // see ImplementationRunResult.summaryIsSynthetic.
-        summaryIsSynthetic: true,
+      const changedPaths = [...result.changedPaths];
+      // Part 5 item 5: the sealed pipeline itself only ever sees applied
+      // receipts, never run-implementation.md, so it cannot produce that
+      // prompt's checklist echo — every successful sealed round therefore
+      // used to latch `checklistProgressUnreliable` and owe a manual
+      // reconciliation. When a real (non-synthetic) report can be obtained
+      // for the applied change set, use it instead: it flows through the
+      // ordinary shape gate and checklist merge in executeImplementationRun
+      // exactly like a model-authored implementation round, so a clean report
+      // ticks real boxes and never latches the reconciliation gate. Any
+      // failure to obtain one — including a report that itself changed, or
+      // may have changed, files — falls back to the runner-authored summary
+      // unchanged; the sealed edit's own completion never depends on this.
+      const report =
+        options.taskFolderUri && isSummaryOnlyDispatchAvailableV1(options.modelId)
+          ? await runSealedEditContinuationReportV1({
+              taskFolderUri: options.taskFolderUri,
+              workspaceUri: options.workspaceUri,
+              basePrompt: options.prompt,
+              changedPaths,
+              modelId: options.modelId,
+              taskStage: options.taskStage ?? stage,
+              token: options.token,
+              onProgress: options.onProgress,
+            })
+          : undefined;
+      return resolveSealedEditCompletionResultV1(
+        changedPaths,
+        result.appliedReceiptIds.length,
         runnerId,
-      };
+        report
+      );
+    }
     case "noChanges":
       if (
         options.requireFileChange === false ||

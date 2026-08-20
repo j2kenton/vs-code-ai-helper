@@ -130,7 +130,10 @@ export async function installEditBrokerHarnessV1(): Promise<EditBrokerHarnessV1>
     complete: true,
     source: "readFile",
   });
-  const srcListing = ledger.mint({
+  // Minted purely so the ancestor "src" is host-resolvable from the ledger
+  // (item 20) — createFile/createDirectory operations below no longer carry
+  // an explicit link to it.
+  ledger.mint({
     callId: "c6",
     rootId: WORKSPACE_ROOT_ID,
     relativePath: "src",
@@ -162,7 +165,9 @@ export async function installEditBrokerHarnessV1(): Promise<EditBrokerHarnessV1>
       rootId: WORKSPACE_ROOT_ID,
       relativePath: "src/new.ts",
       targetObservationId: missingNewFile.observationId,
-      parentChain: [{ kind: "observed", observationId: srcListing.observationId }],
+      // "src" already exists and is resolved host-side from the ledger
+      // (item 20) — no parentChain entry needed.
+      parentChain: [],
       contentBase64: newBytes.toString("base64"),
       decodedByteLength: newBytes.length,
       contentSha256: sha256Hex(newBytes),
@@ -173,7 +178,7 @@ export async function installEditBrokerHarnessV1(): Promise<EditBrokerHarnessV1>
       rootId: WORKSPACE_ROOT_ID,
       relativePath: "src/generated",
       targetObservationId: missingGeneratedDir.observationId,
-      parentChain: [{ kind: "observed", observationId: srcListing.observationId }],
+      parentChain: [],
     },
     {
       stepId: "s3",
@@ -181,10 +186,9 @@ export async function installEditBrokerHarnessV1(): Promise<EditBrokerHarnessV1>
       rootId: WORKSPACE_ROOT_ID,
       relativePath: "src/generated/out.ts",
       targetObservationId: missingGeneratedFile.observationId,
-      parentChain: [
-        { kind: "observed", observationId: srcListing.observationId },
-        { kind: "createdByStep", stepId: "s2" },
-      ],
+      // "src" is host-resolved; "src/generated" does not exist yet and is
+      // created by step s2, so it needs an explicit createdByStep link.
+      parentChain: [{ kind: "createdByStep", stepId: "s2" }],
       contentBase64: generatedBytes.toString("base64"),
       decodedByteLength: generatedBytes.length,
       contentSha256: sha256Hex(generatedBytes),

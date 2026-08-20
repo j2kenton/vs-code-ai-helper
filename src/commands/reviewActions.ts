@@ -29,9 +29,10 @@ import {
   STAGE_ORDER,
   TaskStage,
 } from "../types/taskProgress";
-import { ReviewScoreHistoryEntry, TaskProgress } from "../types/taskProgress";
+import { ReviewScoreHistoryEntry, TaskEscalation, TaskProgress } from "../types/taskProgress";
 import { deriveTaskBindingV1 } from "../types/taskBindingV1";
 import {
+  appendOverriddenEscalation,
   appendReviewRejection,
   appendReviewScoreHistory,
   clearImplementationTypeCheckFailure,
@@ -177,6 +178,7 @@ import {
   parseReadiness,
   parseReviewBlockers,
   parseReviewBlockersDetailed,
+  extractBlockerNamedPathsV1,
   parseReviewedCommitSha,
   parseReviewProgress,
   reconcileProgressWithChecklistV1,
@@ -601,6 +603,85 @@ export function buildFastForwardApplyReviewOptions(
     parentOperation,
     chatViewProvider,
   };
+}
+
+/**
+ * Item 13 (2026-08-18..19 workflow-defects batch): whether Fast Forward's
+ * `isPaused` callback may un-pause the task and continue through an
+ * escalation it finds mid-run, rather than aborting.
+ *
+ * A `plateau` escalation means "iteration is not converging" by definition —
+ * the one signal where finishing the attempt budget cannot help and only
+ * spends money re-confirming a stalemate — so it is NEVER ride-through
+ * eligible, regardless of the `fastForwardSurvivesEscalation` setting. Every
+ * other kind (spec-defect, environmental, unverifiable,
+ * reviewer-disagreement) is the case the setting was written for: a single
+ * escalation mid-budget on an otherwise converging run.
+ *
+ * Pulled out as a pure predicate (rather than left inline in the closure)
+ * specifically so this decision is unit-testable without standing up the
+ * full Fast Forward provider/notification harness.
+ */
+export function shouldRideThroughEscalationV1(options: {
+  survivesEscalationSetting: boolean;
+  escalationStage: TaskStage | undefined;
+  escalationKind: EscalationKind | undefined;
+  targetStage: TaskStage;
+}): boolean {
+  return (
+    options.survivesEscalationSetting &&
+    options.escalationStage === options.targetStage &&
+    options.escalationKind !== "plateau"
+  );
+}
+
+/**
+ * Item 13 review finding (2026-08-20): `escalation` is deliberately never
+ * cleared when Fast Forward rides through it (it survives for end-of-run
+ * reporting), so a later read of `TaskProgress.escalation` inside `isPaused`
+ * can still be the SAME record this run already rode through once — e.g. the
+ * task was subsequently paused again by hand (a genuine external pause)
+ * without a fresh escalation replacing the stale one. Without this check, a
+ * later manual/external pause carrying the stale record would be mistaken
+ * for the same escalation being ridden through a second time and silently
+ * undone.
+ *
+ * Pulled out as a pure predicate (matching `shouldRideThroughEscalationV1`'s
+ * own rationale) so the race this closes is directly unit-testable without
+ * standing up the full Fast Forward provider/notification harness.
+ */
+export function isFreshEscalationForRideThroughV1(
+  escalation: TaskEscalation | undefined,
+  lastRiddenThroughEscalationAt: string | undefined
+): escalation is TaskEscalation {
+  return escalation !== undefined && escalation.at !== lastRiddenThroughEscalationAt;
+}
+
+/**
+ * Item 13 review finding (2026-08-20): the write-time CAS that un-pauses the
+ * task for a ride-through previously checked only `status === "paused"` and
+ * `escalation.stage === targetStage`. Between the read that decided to ride
+ * through and this write, a DIFFERENT escalation on the same stage — most
+ * dangerously a `plateau`, which must never ride through — could have been
+ * recorded, and the stage-only check would still approve the un-pause,
+ * overriding an escalation it never actually inspected. The CAS must
+ * re-verify the EXACT escalation (stage, kind, and its own `at`) that was
+ * just inspected, not merely that some escalation exists on the same stage.
+ *
+ * Pulled out as a pure predicate for the same testability reason as
+ * `isFreshEscalationForRideThroughV1`.
+ */
+export function escalationIdentityStillMatchesV1(
+  current: Pick<TaskProgress, "status" | "escalation">,
+  inspected: TaskEscalation,
+  targetStage: TaskStage
+): boolean {
+  return (
+    current.status === "paused" &&
+    current.escalation?.stage === targetStage &&
+    current.escalation?.kind === inspected.kind &&
+    current.escalation?.at === inspected.at
+  );
 }
 
 /**
@@ -1577,7 +1658,13 @@ async function buildVerifiedChecksVariable(
   relevantFiles: readonly string[] | undefined,
   token: vscode.CancellationToken | undefined,
   includePlanItemVerification = false,
-  targetStage?: TaskStage
+  targetStage?: TaskStage,
+  // Part 6 item 6: threaded through so buildVerifiedChecksSection can state
+  // both identities (the commit this review names vs. the working tree these
+  // checks actually ran against) instead of leaving the two unconnected.
+  // Absent at the resume-interaction call site, which has no reviewedCommitSha
+  // in scope — the disclaimer is simply omitted there, same as before.
+  reviewedCommitSha?: string
 ): Promise<{ verifiedChecks: string; planItemVerification?: string; mechanicalBlockers: ReviewBlocker[] }> {
   try {
     const result = await collectCompletionLintPreview(folderUri, relevantFiles, {
@@ -1599,7 +1686,7 @@ async function buildVerifiedChecksVariable(
       await persistPublishReviewLintPayload(folderUri, result);
     }
     return {
-      verifiedChecks: buildVerifiedChecksSection(result),
+      verifiedChecks: buildVerifiedChecksSection(result, reviewedCommitSha),
       planItemVerification: includePlanItemVerification
         ? buildPlanItemVerificationSection(result.planItems)
         : undefined,
@@ -2767,14 +2854,6 @@ export async function pauseTaskForExhaustedChainV1(
     exhaustion.candidates.length > 0
       ? exhaustion.candidates.map((candidate) => candidate.providerLabel).join(" → ")
       : "no candidates configured";
-  const reason =
-    code === "candidatesExhausted"
-      ? `Every configured model for ${stageName} was tried and failed — ` +
-        `the resolved chain was exhausted (${chain}). ` +
-        "See the run log for per-candidate reasons."
-      : `No configured provider for ${stageName} is available — ` +
-        `the resolved chain was exhausted (${chain}). ` +
-        "See the run log for per-candidate reasons.";
   // Review completion blocker: a chain exhausted because every ranked
   // candidate hit a quota or model-entitlement block previously paused the
   // task with only the human-readable `reason` text — no `quotaParkRecord`,
@@ -2783,7 +2862,14 @@ export async function pauseTaskForExhaustedChainV1(
   // in runnerRegistry.ts which already records one. Scan the ranked
   // candidates (same order they were attempted) for the first one whose
   // recorded skip/failure reason classifies as quota/entitlement, and park
-  // the same shape of record for it.
+  // the same shape of record for it. Computed BEFORE `reason` below (moved up
+  // from its former position after `reason`) so a monthly/hard billing-limit
+  // block — e.g. Copilot's "You've reached your monthly credit limit" or a
+  // devpass premium-tier weekly ceiling, both matched by classifyFailure's
+  // "credit limit"/"usage limit" markers — can be named plainly instead of
+  // folding into the same generic "tried and failed" sentence every other
+  // candidatesExhausted cause used (item 3b/companion finding, 2026-08-17/18:
+  // several rounds of real spend were spent before the cause was legible).
   const quotaCandidate = exhaustion.candidates
     .map((candidate) => ({ candidate, classified: classifyFailure({ errorMessage: candidate.reason }) }))
     .find(
@@ -2800,6 +2886,19 @@ export async function pauseTaskForExhaustedChainV1(
         observedAt: new Date().toISOString(),
       }
     : undefined;
+  const reason =
+    code === "candidatesExhausted" && quotaCandidate !== undefined
+      ? `Every configured model for ${stageName} was tried, but the chain was blocked by a ` +
+        `${quotaCandidate.classified.failureKind === "quota" ? "quota/credit-limit" : "model-entitlement"} restriction on ` +
+        `${quotaCandidate.candidate.providerLabel} — this is a provider account limit, not a transport or code ` +
+        `fault (${quotaCandidate.candidate.reason}). See the run log for the remaining per-candidate reasons.`
+      : code === "candidatesExhausted"
+        ? `Every configured model for ${stageName} was tried and failed — ` +
+          `the resolved chain was exhausted (${chain}). ` +
+          "See the run log for per-candidate reasons."
+        : `No configured provider for ${stageName} is available — ` +
+          `the resolved chain was exhausted (${chain}). ` +
+          "See the run log for per-candidate reasons.";
   await patchTaskProgressStrictV1(folderUri, (current) =>
     pauseTaskWithReason(current, reason, quotaParkRecord)
   );
@@ -3076,7 +3175,8 @@ export async function runReviewForFolder(
       undefined,
       options.operation?.token,
       targetStage === "publish",
-      targetStage
+      targetStage,
+      variables.reviewedCommitSha
     );
     variables.verifiedChecks = checks.verifiedChecks;
     if (checks.planItemVerification !== undefined) {
@@ -3099,10 +3199,19 @@ export async function runReviewForFolder(
     );
   } else {
     const taskProgress = await readTaskProgressAdvisoryV1(folderUri);
+    // Item 15 fix 4: prioritise files a standing blocker on the review being
+    // re-run actually names, so the pack's size caps (which spend budget in
+    // list order — applyContentCaps) truncate or omit them last rather than
+    // an arbitrary casualty of `implReviewFiles` ordering.
+    const priorityRelPaths =
+      previousReview !== undefined
+        ? extractBlockerNamedPathsV1(parseReviewBlockers(previousReview))
+        : undefined;
     const { contextPackUri, isFallback } = await writeImplReviewContextPack(
       folderUri,
       workspaceRoot.uri,
-      taskProgress?.implReviewFiles
+      taskProgress?.implReviewFiles,
+      priorityRelPaths
     );
     if (isFallback) {
       NotificationRouter.showWarning(
@@ -4340,6 +4449,24 @@ export async function fastForwardReviewWithAI(
   // pause, and the escalation the user still has to act on loses the very
   // stop it was raised to cause.
   let escalationRiddenThrough = false;
+  // Item 13 (2026-08-18..19 workflow-defects batch): each DISTINCT escalation
+  // this run rides through (a fresh `paused` + `escalation` pair — the SAME
+  // escalation is never re-appended, since isPaused only re-enters the
+  // ride-through branch once the task is paused again with a new one), so
+  // the end-of-run summary can name every re-fire as overridden-not-acted-on
+  // instead of the operator inferring it from raw progress transitions.
+  const riddenThroughEscalations: TaskEscalation[] = [];
+  // Review finding (2026-08-20): `escalation` is deliberately never cleared
+  // when it is ridden through (it survives for end-of-run reporting), so a
+  // later read of `fresh.escalation` inside `isPaused` can still be the SAME
+  // record this run already rode through once — e.g. the task was
+  // subsequently paused again by hand (a genuine external pause) without a
+  // fresh escalation replacing the stale one. Comparing against the last
+  // ridden-through escalation's own `at` lets that case be told apart from a
+  // real new escalation: a match means nothing new fired, so the pause must
+  // be honored as external instead of being un-paused a second time as if it
+  // were still "the same escalation being approved."
+  let lastRiddenThroughEscalationAt: string | undefined;
   const reassertDeferredEscalationPause = async (): Promise<void> => {
     if (!escalationRiddenThrough) {
       return;
@@ -4434,15 +4561,102 @@ export async function fastForwardReviewWithAI(
             if (fresh?.status !== "paused") {
               return false;
             }
-            if (!resilience.fastForwardSurvivesEscalation || fresh.escalation?.stage !== targetStage) {
+            const escalation = fresh.escalation;
+            if (
+              !isFreshEscalationForRideThroughV1(escalation, lastRiddenThroughEscalationAt) ||
+              !shouldRideThroughEscalationV1({
+                survivesEscalationSetting: resilience.fastForwardSurvivesEscalation,
+                escalationStage: escalation?.stage,
+                escalationKind: escalation?.kind,
+                targetStage,
+              })
+            ) {
               return "external";
             }
-            await patchTaskProgressStrictV1(resolved.folderUri, (current) =>
-              current.status === "paused" && current.escalation?.stage === targetStage
-                ? updateTaskStatus(current, "active")
-                : current
-            );
+            // Review finding (2026-08-20): the write-time CAS previously
+            // checked only status + stage, so a DIFFERENT escalation on the
+            // same stage — e.g. a `plateau`, which must never ride through —
+            // recorded between the read above and this write would still be
+            // un-paused. The CAS now re-verifies the exact escalation
+            // (stage, kind, AND its own `at`) that was just inspected, and
+            // durably records the override (`overriddenEscalations`) in the
+            // SAME transaction as the un-pause, so a crash between deciding
+            // and reporting can never leave the override unrecorded.
+            //
+            // Second review finding (2026-08-20): checking only
+            // `patched?.status === "active"` afterward cannot prove OUR
+            // mutation ran — the decline branch also returns a value (the
+            // unmodified `current`), and if that task's status happened to
+            // already read "active" for an unrelated reason (a manual resume
+            // racing this same check, or a stale read), the decline would be
+            // misreported as a successful ride-through. `mutationApplied` is
+            // an explicit receipt set ONLY inside the true branch, so success
+            // requires both "our branch actually ran" AND "the write landed",
+            // not an inference from the resulting status alone.
+            let mutationApplied = false;
+            const patched = await patchTaskProgressStrictV1(resolved.folderUri, (current) => {
+              if (!escalationIdentityStillMatchesV1(current, escalation, targetStage)) {
+                return current;
+              }
+              mutationApplied = true;
+              return appendOverriddenEscalation(updateTaskStatus(current, "active"), escalation);
+            });
+            // The identity CAS above can decline — a fresher/different
+            // escalation replaced the inspected one between the read and the
+            // write. Nothing was actually ridden through in that case, so
+            // the pause must still abort the run rather than be reported as
+            // overridden.
+            if (!mutationApplied || patched?.status !== "active") {
+              return "external";
+            }
             escalationRiddenThrough = true;
+            lastRiddenThroughEscalationAt = escalation.at;
+            riddenThroughEscalations.push(escalation);
+            // Item 13 fix 2: the escalation's own notification/chat question
+            // (escalateReviewToHuman, raised moments earlier from inside the
+            // review round this same attempt just ran) already told the
+            // operator "the task has been paused — resume it once you've
+            // decided how to proceed." That claim is now false the instant
+            // this un-pause lands, so a corrective, honestly-worded follow-up
+            // is posted immediately rather than leaving the stale claim as
+            // the last word until end-of-run.
+            NotificationRouter.showWarning(
+              `Fast Forward Review: a ${escalation.kind} escalation was raised on ` +
+                `${STAGE_DISPLAY_NAMES[targetStage] ?? targetStage} but is being ridden through — ` +
+                `continuing to the end of the current attempt budget (attempt ${attemptNumber} of ` +
+                `${maxAttempts}) instead of stopping now. The escalation is still recorded and will be ` +
+                "re-asserted as a pause once this run finishes."
+            );
+            // Item 13 fix 3 (review finding, 2026-08-20): the durable
+            // `overriddenEscalations` field written above had no reader —
+            // only visible by opening task-progress.json directly. A run
+            // log entry is the artifact a user actually inspects after the
+            // fact (see writeReviewRunLogV1's own "best-effort diagnostic
+            // artifact" precedent), so every override is now also recorded
+            // there, explicitly marked when it is a RE-FIRE (the same or a
+            // later escalation overridden more than once in this run) so
+            // that is visible as such rather than reading as a single
+            // occurrence finally acted on.
+            void writeRunLog(
+              resolved.folderUri,
+              "fast-forward-escalation-override",
+              targetStage,
+              `# Escalation overridden (Fast Forward ride-through)\n\n` +
+                `A ${escalation.kind} escalation on ${STAGE_DISPLAY_NAMES[targetStage] ?? targetStage} was ` +
+                "overridden — not acted on — so this Fast Forward run could continue to the end of its attempt " +
+                "budget, instead of stopping for the pause it raised.\n\n" +
+                `- Raised at: ${escalation.at}\n` +
+                `- Reason: ${escalation.reason}\n` +
+                `- Overridden during attempt ${attemptNumber} of ${maxAttempts}\n` +
+                (riddenThroughEscalations.length > 1
+                  ? `- This is override #${riddenThroughEscalations.length} for this run — a previous ` +
+                    "escalation on this stage was already overridden earlier in the same run; see the earlier " +
+                    "run log(s) and the task's durable `overriddenEscalations` record for the full sequence.\n"
+                  : "")
+            ).catch(() => {
+              // Best-effort: a run-log write failure must not abort the
+              // ride-through decision that already durably persisted above.
+            });
             return "escalation";
           },
           continueThroughEscalation: resilience.fastForwardSurvivesEscalation,
@@ -4566,11 +4780,21 @@ export async function fastForwardReviewWithAI(
     // The escalation's own notification/chat question already carried the
     // reason; this re-surfaces it at end of run so finishing the attempt
     // budget never buries a signal the user must still act on.
+    //
+    // Item 13 fix 3: name every DISTINCT escalation this run overrode rather
+    // than a single undifferentiated "an escalation fired" — a ceiling that
+    // re-fires more than once in one run (observed: churn ceiling firing at
+    // 5 rounds, then again at 6, with no prior record of the first override)
+    // must be visible as re-fired-and-overridden, not mistaken for a single
+    // occurrence that was finally acted on.
+    const overriddenList = riddenThroughEscalations
+      .map((escalation, index) => `${index + 1}. [${escalation.kind}, ${escalation.at}] ${escalation.reason}`)
+      .join("\n");
     NotificationRouter.showWarning(
-      "Fast Forward Review: automated review iteration escalated during this run (see the escalation " +
-        "notification/chat question for the reason). The run was allowed to finish its attempt budget " +
-        "instead of stopping, and the task has been returned to paused — review the escalation and " +
-        "resume the task once you've decided how to proceed."
+      `Fast Forward Review: automated review iteration escalated ${riddenThroughEscalations.length} time(s) ` +
+        "during this run and was overridden — not acted on — each time so the run could finish its attempt " +
+        "budget. The task has been returned to paused — review the escalation(s) below and resume the task " +
+        `once you've decided how to proceed.${overriddenList.length > 0 ? `\n\n${overriddenList}` : ""}`
     );
   }
   if (outcome.improved) {
@@ -6399,10 +6623,72 @@ async function executeImplementationRun(
       // "Prior rounds already changed the tree": implReviewFiles is the
       // durable record of the last implementation round's real edits.
       const priorRoundsChangedTree = (priorProgress?.implReviewFiles?.length ?? 0) > 0;
-      if (!resilience.nothingToFixRoutesToReview || !priorRoundsChangedTree) {
+      // Item 4 (2026-08-17..19 workflow-defects batch): `priorRoundsChangedTree`
+      // alone cannot tell "the model correctly found nothing left to fix" from
+      // "a provider silently produced nothing" while real plan work remains.
+      // The missing evidence is the plan checklist itself, already computed a
+      // few lines below for the under-recording latch — hoisted here so the
+      // gate can consult it too. `!checklistAdvanced` excludes a round that
+      // itself just landed real ticks (that is progress, not sterility);
+      // `!checklistClaimedButUnmerged` excludes a round whose `## Plan Item
+      // Checklist` claim failed to match — that shape already has its own
+      // dedicated, unconditional latch further below (`checklistStateUnrecorded`)
+      // which fires regardless of review status and posts a reconcile
+      // decision; refusing it here first would only replace that specific,
+      // actionable outcome with a generic "provider may be blocked" warning.
+      // `remainingChecklistProgress.remaining > 0` is the plan's own claim
+      // that work remains; `latestReviewClearsStage` is the SAME
+      // zero-blocker/at-threshold signal `checklistUnderrecordingConfirmedByReview`
+      // trusts below — deliberately reused, not reinvented, so this gate
+      // stands down on exactly the evidence that latch stands up on.
+      const remainingChecklistProgress =
+        planChecklist !== undefined ? countChecklistProgressV1(planChecklist) : undefined;
+      const latestReviewClearsStage = latestQualifyingReviewMeetsThresholdV1({
+        history: priorProgress?.reviewScoreHistory,
+        stage: priorProgress?.currentStage ?? postRunReviewStage,
+        threshold: getAutoAdvanceScoreThreshold(),
+        requireZeroBlockers: true,
+      });
+      // `!checklistClaimedButUnmerged` excludes a round whose `## Plan Item
+      // Checklist` claim failed to match from THIS gate specifically — not
+      // from refusal altogether (review finding, 2026-08-20; see below). Such
+      // a round still needs the streak/no-progress-breaker machinery in the
+      // 2b block just past this gate to run (a repeated claimed-but-unmerged
+      // round must still be able to escalate to a human eventually, exactly
+      // like any other sterile round), so it is deliberately let through
+      // HERE — `checklistClaimedButUnmergedWithoutClearingReview` below
+      // refuses it for real once that accounting has had a chance to run.
+      const uncheckedItemsWithoutClearingReview =
+        !checklistAdvanced &&
+        !checklistClaimedButUnmerged &&
+        remainingChecklistProgress !== undefined &&
+        remainingChecklistProgress.remaining > 0 &&
+        !latestReviewClearsStage;
+      // Review finding (2026-08-20): a claimed-but-unmerged round with real
+      // unticked work and no clearing review must ALSO be refused — the
+      // dedicated `checklistStateUnrecorded` latch further below records the
+      // under-recording, but only sets a flag; on its own it never stopped
+      // this round from auto-advancing into review as a false "nothing to
+      // fix" completion (exactly the shape `uncheckedItemsWithoutClearingReview`
+      // exists to catch for every OTHER round). Computed now, consulted once
+      // the streak/no-progress-breaker accounting below has run.
+      const checklistClaimedButUnmergedWithoutClearingReview =
+        checklistClaimedButUnmerged &&
+        remainingChecklistProgress !== undefined &&
+        remainingChecklistProgress.remaining > 0 &&
+        !latestReviewClearsStage;
+      if (
+        !resilience.nothingToFixRoutesToReview ||
+        !priorRoundsChangedTree ||
+        uncheckedItemsWithoutClearingReview
+      ) {
         NotificationRouter.showWarning(
-          "Implementation finished, but no workspace files changed. " +
-            "Review the implementation run log; the provider may have been blocked from writing files."
+          uncheckedItemsWithoutClearingReview
+            ? "Implementation reported nothing to fix, but the plan checklist still has " +
+                `${remainingChecklistProgress?.remaining} unticked item(s) and no review has cleared this ` +
+                "stage yet. Review the implementation run log before treating this round as complete."
+            : "Implementation finished, but no workspace files changed. " +
+                "Review the implementation run log; the provider may have been blocked from writing files."
         );
         await safeOpenTextDocument(logUri, "implementation run log");
         return false;
@@ -6437,18 +6723,11 @@ async function executeImplementationRun(
       // breaker's own qualifying check just below it: a review WITH
       // blockers still names real, unresolved work and must not stand the
       // gate down.
-      const remainingChecklistProgress =
-        planChecklist !== undefined ? countChecklistProgressV1(planChecklist) : undefined;
       const checklistUnderrecordingConfirmedByReview =
         !checklistAdvanced &&
         remainingChecklistProgress !== undefined &&
         remainingChecklistProgress.remaining > 0 &&
-        latestQualifyingReviewMeetsThresholdV1({
-          history: priorProgress?.reviewScoreHistory,
-          stage: priorProgress?.currentStage ?? postRunReviewStage,
-          threshold: getAutoAdvanceScoreThreshold(),
-          requireZeroBlockers: true,
-        });
+        latestReviewClearsStage;
       const newlyLatchingChecklistUnreliable =
         checklistUnderrecordingConfirmedByReview && !priorProgress?.checklistProgressUnreliable;
       const persistedRounds = await patchTaskProgressStrictV1(folderUri, (current) => {
@@ -6623,6 +6902,57 @@ async function executeImplementationRun(
         if (escalated) {
           return false;
         }
+      }
+      // Review finding (2026-08-20): the round-level accounting above
+      // (streak increment, latch-if-a-review-already-cleared, the
+      // no-progress-breaker's chance to escalate) has now run exactly as it
+      // would for any other sterile round. If this was a claimed-but-unmerged
+      // round with real unticked plan work and no review has cleared the
+      // stage, it must still be refused instead of falling through to
+      // auto-advance as a false "nothing to fix" completion — recording the
+      // reconciliation need now (rather than only via `checklistStateUnrecorded`
+      // further below, which would otherwise be the first and only latch, and
+      // would fire too late to stop the advance that already happened).
+      if (checklistClaimedButUnmergedWithoutClearingReview) {
+        const outstandingList = describeOutstandingChecklistItemsV1(planChecklist);
+        const latchedProgress = await patchTaskProgressStrictV1(folderUri, (current) =>
+          current.checklistProgressUnreliable
+            ? undefined
+            : { ...current, checklistProgressUnreliable: true, updatedAt: new Date().toISOString() }
+        );
+        const existingLog = await readTextIfExists(logUri);
+        if (existingLog !== undefined) {
+          const reconcileNote =
+            "\n\n## Checklist reconciliation needed\n\n" +
+            "This round reported plan-item completions that did not match any item in the plan of " +
+            "record (checklistClaimedButUnmerged), the plan checklist still has unticked items, and no " +
+            "review has cleared this stage yet — so this round was refused rather than routed onward. " +
+            "`checklistProgressUnreliable` is now set: completeness is not gating advancement until the " +
+            "checklist is reconciled. Tick the missed items in plan-final.md, then run **Ensemble: Mark " +
+            `Plan Checklist Reconciled** to confirm and restore the gate.${outstandingList}`;
+          // skipBackup: appends to the just-written log; a `_prev` sibling in
+          // runs/ would read as a second run.
+          await writeTextFile(logUri, `${existingLog}${reconcileNote}\n`, { skipBackup: true });
+        }
+        const reconcilePosted = latchedProgress
+          ? await postReconcilePlanChecklistDecisionV1(
+              folderUri,
+              folderUri.fsPath,
+              folderUri.fsPath,
+              latchedProgress,
+              checklistMergeResult
+            )
+          : { kind: "noContext" as const };
+        if (reconcilePosted.kind !== "posted") {
+          NotificationRouter.showWarning(
+            "Implementation reported nothing to fix, but its plan-item completions did not match the " +
+              "plan of record and unticked items remain with no review clearing this stage. The checklist " +
+              "is treated as under-recording — tick the missed items in plan-final.md, then mark the " +
+              `checklist reconciled.${outstandingList}`
+          );
+        }
+        await safeOpenTextDocument(logUri, "implementation run log");
+        return false;
       }
     } else if (!result.filesChangedUnknown && result.filesChanged.length > 0) {
       // A round that landed real edits breaks any zero-change streak,

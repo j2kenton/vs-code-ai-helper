@@ -5,6 +5,7 @@
  * Completed-content type: `chat-message.v1`.
  * Provider mode: `text`.
  */
+import * as path from "path";
 import {
   ProviderTaskActionRowV1,
   TaskActionExecutionContextV1,
@@ -14,8 +15,18 @@ import {
 import { maxResponseBytesCeilingForModeV1 } from "../../types/agentExecutionV1";
 import { CompletedContentV1 } from "../../types/aiResultEnvelope";
 
-import { readChatHistory, writeChatHistory } from "../../utils/chatHistoryStore";
+import { readChatHistory, writeChatHistory, describeWorkflowStoreFailureV1 } from "../../utils/chatHistoryStore";
 import { TaskStage } from "../../types/taskProgress";
+import {
+  FileUpdateEnvelope,
+  planFileUpdate,
+  splitFileUpdateEnvelopes,
+} from "../../utils/chatFileUpdateEnvelope";
+import {
+  ensureWorkflowTaskFolderRootV1,
+  getWorkflowFileStoreV1,
+} from "../../services/workflowRuntimeServicesV1";
+import { WorkflowFileLocatorV1 } from "../../services/workflowFileStoreV1";
 
 export const CHAT_SEND_ACTION_KEY_V1 = "chatSend.v1";
 
@@ -78,6 +89,47 @@ class ChatSendPromotionErrorV1 extends Error {
   }
 }
 
+/**
+ * Applies the C4 chat-edit envelope (item 21, 2026-08-17..19 workflow-defects
+ * batch): a response may propose the full replacement content of exactly one
+ * markdown file inside this task's own folder. Returns an italic outcome
+ * note to append to the displayed reply — file written, or why it was
+ * refused — or `undefined` when the response carried no envelope at all.
+ * Never throws: a write failure is a soft, chat-visible refusal, not a
+ * promotion error, since the assistant's own text answer is still valid on
+ * its own regardless of whether the file update landed.
+ */
+async function applyChatFileUpdateEnvelopesV1(
+  taskFolderPath: string,
+  updates: readonly FileUpdateEnvelope[]
+): Promise<string | undefined> {
+  const plan = planFileUpdate(taskFolderPath, updates);
+  if (plan.action === "none") return undefined;
+  if (plan.action === "reject") return plan.note;
+
+  const rootId = ensureWorkflowTaskFolderRootV1(taskFolderPath);
+  const relativePath = path.relative(taskFolderPath, plan.targetPath).split(path.sep).join("/");
+  const locator: WorkflowFileLocatorV1 = { rootId, relativePath };
+  const fileStore = getWorkflowFileStoreV1();
+  const bytes = Buffer.from(plan.content, "utf8");
+
+  const stat = await fileStore.stat(locator);
+  if (stat.kind !== "ok") {
+    return `_Could not update \`${plan.relPath}\`: ${describeWorkflowStoreFailureV1(stat)}._`;
+  }
+  if (stat.value.kind === "directory") {
+    return `_Could not update \`${plan.relPath}\`: the target is a directory, not a file._`;
+  }
+  const result =
+    stat.value.kind === "file" && stat.value.revision !== undefined
+      ? await fileStore.replaceFileExact(locator, bytes, stat.value.revision)
+      : await fileStore.createFileExclusive(locator, bytes);
+  if (result.kind !== "ok") {
+    return `_Could not update \`${plan.relPath}\`: ${describeWorkflowStoreFailureV1(result)}._`;
+  }
+  return `_Updated \`${plan.relPath}\`._`;
+}
+
 async function promoteChatSendContentV1(
   content: CompletedContentV1,
   context: TaskActionExecutionContextV1
@@ -86,12 +138,21 @@ async function promoteChatSendContentV1(
     throw new ChatSendPromotionErrorV1("chatSend.v1 received a non-chat-message completed content");
   }
   const input = context.validatedInput as ChatSendActionInputV1;
+  // The envelope must never survive into the displayed/persisted text,
+  // whether or not it is applied — strip it unconditionally before anything
+  // else touches content.text.
+  const { text: strippedText, updates } = splitFileUpdateEnvelopes(content.text);
   if (input.taskFolderPath) {
+    let finalText = strippedText;
+    const outcomeNote = await applyChatFileUpdateEnvelopesV1(input.taskFolderPath, updates);
+    if (outcomeNote) {
+      finalText = finalText.length > 0 ? `${finalText}\n\n${outcomeNote}` : outcomeNote;
+    }
     const canonicalId = input.canonicalId ?? input.taskFolderPath;
     const history = await readChatHistory(input.taskFolderPath, canonicalId);
     history.push({
       role: "assistant",
-      text: content.text,
+      text: finalText,
       stage: (context.stage as TaskStage) ?? "desc",
       at: new Date().toISOString(),
     });

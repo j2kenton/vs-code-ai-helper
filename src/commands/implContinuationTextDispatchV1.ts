@@ -281,3 +281,83 @@ export async function runSummaryOnlyContinuationV1(
     filesChangedUnknown,
   });
 }
+
+/**
+ * Prompt for the report-only follow-up this module's `runSealedEditContinuationReportV1`
+ * dispatches after a sealed edit already applied its plan (workflow-robustness
+ * Part 5 item 5). Unlike `buildImplementationContinuationPromptV1`'s
+ * `summary-only` notice — written for a PRIOR round that failed to report —
+ * this names the round that just ran and the exact files its receipts
+ * already changed, so the model reports on committed work rather than
+ * re-narrating or re-planning it.
+ */
+export function buildSealedEditReportPromptV1(
+  basePrompt: string,
+  changedPaths: readonly string[]
+): string {
+  const fileList =
+    changedPaths.length > 0 ? changedPaths.map((file) => `- ${file}`) : ["- _none recorded_"];
+  return (
+    basePrompt +
+    [
+      "",
+      "",
+      "## Continuation Notice — report for the applied sealed edit",
+      "",
+      "The edit plan for this round has ALREADY been applied via the sealed edit",
+      "pipeline — the files below are already changed on disk. This round must",
+      "NOT propose or make any further edits: it produces ONLY the report the",
+      "applied plan owes — `## Files Changed` covering exactly the files listed",
+      "below, `## Verification`, and the plan checklist echo with every box the",
+      "applied changes complete. Do not defer any part of the report to a later",
+      "turn: this round gets no follow-up turn.",
+      "",
+      "Files changed by the applied edit plan:",
+      ...fileList,
+    ].join("\n")
+  );
+}
+
+export interface SealedEditReportOptionsV1 {
+  readonly taskFolderUri: vscode.Uri;
+  readonly workspaceUri: vscode.Uri;
+  /** The original edit prompt the sealed round itself was invoked with. */
+  readonly basePrompt: string;
+  /** The receipted change set the sealed round's execution actually applied. */
+  readonly changedPaths: readonly string[];
+  readonly modelId: string | undefined;
+  readonly taskStage: TaskStage;
+  readonly token: vscode.CancellationToken;
+  readonly onProgress: (message: string) => void;
+}
+
+/**
+ * Request the missing report for a sealed edit round that already applied
+ * its plan (workflow-robustness Part 5 item 5). Dispatches through the exact
+ * same text-mode, edit-permissions-withheld mechanism `runSummaryOnlyContinuationV1`
+ * uses for a recovery continuation, so the returned `summary` is model-authored
+ * (never `summaryIsSynthetic`) and can be shape-gated and checklist-merged by
+ * `executeImplementationRun` exactly like an ordinary implementation round —
+ * the only path that can ever tick the plan's own checkboxes.
+ *
+ * Callers MUST still fall back to the sealed pipeline's own synthetic summary
+ * when this does not cleanly succeed (failed/cancelled/questions outcome, or
+ * a report that itself changed — or may have changed — files): the sealed
+ * edit's completion is not contingent on this follow-up, only its checklist
+ * bookkeeping is.
+ */
+export async function runSealedEditContinuationReportV1(
+  options: SealedEditReportOptionsV1
+): Promise<
+  ImplementationRunResult & { runnerId: string; providerLabel?: string; storedModelId?: string }
+> {
+  return runSummaryOnlyContinuationV1({
+    taskFolderUri: options.taskFolderUri,
+    workspaceUri: options.workspaceUri,
+    prompt: buildSealedEditReportPromptV1(options.basePrompt, options.changedPaths),
+    modelId: options.modelId,
+    taskStage: options.taskStage,
+    token: options.token,
+    onProgress: options.onProgress,
+  });
+}

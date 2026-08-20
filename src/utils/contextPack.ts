@@ -487,11 +487,20 @@ async function getFileContentForReview(
  *
  * In both modes the per-file and total size caps are applied and any
  * truncation, omission, or missing-on-disk condition is noted in the pack.
+ *
+ * `priorityRelPaths`, when given, moves any tracked file whose path is
+ * named there to the front of the list before the size caps are applied
+ * (stable — relative order otherwise unchanged). `applyContentCaps` spends
+ * the per-file and total-char budget in list order, so a file a standing
+ * review blocker names is the last thing truncated or omitted rather than
+ * an arbitrary casualty of `implReviewFiles` ordering (workflow-defects
+ * batch item 15 fix 4).
  */
 export async function generateImplReviewContextPack(
   taskFolderUri: vscode.Uri,
   workspaceUri: vscode.Uri,
-  implReviewFiles: string[] | undefined
+  implReviewFiles: string[] | undefined,
+  priorityRelPaths?: ReadonlySet<string>
 ): Promise<{ content: string; isFallback: boolean }> {
   const taskFileUri = vscode.Uri.joinPath(taskFolderUri, TASK_FILENAME);
   const taskContent = await readTextFileIfExists(taskFileUri);
@@ -648,6 +657,19 @@ export async function generateImplReviewContextPack(
       if (content !== undefined) {
         fileInputs.push({ relPath: mappedPath, content });
       }
+    }
+
+    // Stable partition: files a standing review blocker names move to the
+    // front so `applyContentCaps` (which spends its budget in list order)
+    // truncates or omits them last, not first.
+    if (priorityRelPaths && priorityRelPaths.size > 0) {
+      const priority: typeof fileInputs = [];
+      const rest: typeof fileInputs = [];
+      for (const entry of fileInputs) {
+        (priorityRelPaths.has(entry.relPath) ? priority : rest).push(entry);
+      }
+      fileInputs.length = 0;
+      fileInputs.push(...priority, ...rest);
     }
 
     if (rejectedPaths.length > 0) {
@@ -842,12 +864,14 @@ export async function generateImplReviewContextPack(
 export async function writeImplReviewContextPack(
   taskFolderUri: vscode.Uri,
   workspaceUri: vscode.Uri,
-  implReviewFiles: string[] | undefined
+  implReviewFiles: string[] | undefined,
+  priorityRelPaths?: ReadonlySet<string>
 ): Promise<{ contextPackUri: vscode.Uri; isFallback: boolean }> {
   const { content, isFallback } = await generateImplReviewContextPack(
     taskFolderUri,
     workspaceUri,
-    implReviewFiles
+    implReviewFiles,
+    priorityRelPaths
   );
   const contextPackUri = await writeContextPackContent(taskFolderUri, content);
   return { contextPackUri, isFallback };

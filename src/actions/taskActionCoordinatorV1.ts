@@ -171,7 +171,10 @@ import {
   AI_RESULT_CONTRACT_VERSION_V1,
   buildAiResultContractPromptV1,
 } from "../prompts/aiResultContractV1";
-import { buildWorkspaceReadSessionPreambleV1 } from "../prompts/toolSessionPreambleV1";
+import {
+  buildWorkspaceReadSessionPreambleV1,
+  buildWorkspaceReadSessionDegradedPreambleV1,
+} from "../prompts/toolSessionPreambleV1";
 import {
   ActionConversationErrorV1,
   ActionConversationOrchestratorV1,
@@ -520,6 +523,21 @@ export interface TaskActionToolSessionsV1 {
 }
 
 /**
+ * The assembled prompt (and the tool session it was built with, when the row
+ * has one) for a single provider attempt — see `assembleAttemptPromptV1`'s
+ * doc comment for why `admitAction` and `runProviderRow` share exactly one
+ * of these per question-capable operation's first attempt, rather than each
+ * building — and each paying for a fresh tool session behind — their own.
+ */
+interface AssembledAttemptPromptV1 {
+  readonly preflightSession?: TaskActionPreflightSessionV1;
+  readonly toolHandler?: RequestLocalToolHandlerV1;
+  readonly context: TaskActionExecutionContextV1;
+  readonly prompt: string;
+  readonly promptSha256: string;
+}
+
+/**
  * Opaque handle produced by `admitAction` once an action has survived every
  * check that can independently reject it WITHOUT invoking a provider
  * (eligibility, input validation, cancellation, duplicate-lease rejection,
@@ -534,10 +552,30 @@ export interface AdmittedProviderActionTicketV1 {
   readonly validatedInput: unknown;
   readonly session: ProviderSelectionSessionV1;
   readonly selection: V1RunnerSelectionV1;
+  /**
+   * Set exactly when `admitAction` performed the early questions-admission
+   * for `initialCandidate` (row.permittedResultKinds includes "questions").
+   * `runProviderRow` reuses this verbatim for that candidate's first attempt
+   * instead of reassembling — see `assembleAttemptPromptV1`.
+   */
+  readonly initialCandidateAssembledPrompt?: AssembledAttemptPromptV1;
   readonly initialCandidate?: {
     readonly attemptId: string;
     readonly reserved: {
-      readonly handle: { readonly reservationId: string; readonly correlation: ActionCorrelationV1 };
+      readonly handle: {
+        readonly reservationId: string;
+        readonly correlation: ActionCorrelationV1;
+        /**
+         * The reserved candidate's identity, always populated at runtime
+         * (the handle is always a full `ProviderReservationHandleV1`) —
+         * named here so a same-candidate retry (item 14) can re-reserve the
+         * exact runner/provider/model this attempt already tried, without
+         * the loop needing to track a second, parallel identity record.
+         */
+        readonly runnerId: string;
+        readonly providerId: string;
+        readonly modelId: string;
+      };
       readonly providerLabel: string;
       readonly storedModelId: string;
       readonly createTransport: (toolHandler?: RequestLocalToolHandlerV1) => AgentTransportV1;
@@ -1028,25 +1066,52 @@ function attemptOutcomeReasonPhraseV1(outcome: AttemptOutcomeKindV1): string {
  * registry's own reason untouched. Recorded reservations appear in the same
  * ranked order selection walked the chain, so they are consumed in order,
  * matched by stored model id.
+ *
+ * A candidate may have MORE THAN ONE recorded attempt when a same-candidate
+ * network-fault retry (item 14) ran: the retry allocates a fresh attempt
+ * against the identical runner/provider/model rather than advancing the
+ * registry's ranked cursor, so it never gets its own `exhaustion.candidates`
+ * entry. `retryAttemptIds` names exactly those attempts (the coordinator's
+ * own record of which attemptIds it allocated as a retry, never inferred
+ * from matching stored model ids — two DIFFERENT ranked candidates can
+ * legitimately share one model id, and conflating that case with a retry
+ * would misattribute a later candidate's real outcome to an earlier one).
+ * A retry attempt immediately following its original is folded into that
+ * candidate's single entry, reporting the LAST (most informative — e.g. the
+ * retry's own failure, not the original's) outcome.
  */
 function enrichChainExhaustionWithAttemptOutcomesV1(
   exhaustion: ProviderChainExhaustionV1,
-  session: ProviderSelectionSessionV1
+  session: ProviderSelectionSessionV1,
+  retryAttemptIds: ReadonlySet<string> = new Set()
 ): ProviderChainExhaustionV1 {
   const reservedAttempts = session
     .recordedAttemptOutcomes()
     .filter((attempt) => attempt.modelId !== undefined);
   let cursor = 0;
   const candidates = exhaustion.candidates.map((candidate) => {
-    const attempt = reservedAttempts[cursor];
-    if (attempt?.modelId === candidate.storedModelId) {
+    const first = reservedAttempts[cursor];
+    if (first?.modelId !== candidate.storedModelId) {
+      return candidate;
+    }
+    cursor++;
+    let lastMatch = first;
+    // Fold in any immediately-following attempts this coordinator recorded
+    // as a retry OF the one just consumed — never a heuristic model-id
+    // match, so a later distinct candidate sharing the same model id is
+    // never swallowed.
+    while (
+      cursor < reservedAttempts.length &&
+      retryAttemptIds.has(reservedAttempts[cursor]!.attemptId)
+    ) {
+      lastMatch = reservedAttempts[cursor]!;
       cursor++;
-      if (attempt.outcome !== undefined) {
-        return {
-          ...candidate,
-          reason: attemptOutcomeReasonTextV1(attempt.outcome, attempt.detail),
-        };
-      }
+    }
+    if (lastMatch.outcome !== undefined) {
+      return {
+        ...candidate,
+        reason: attemptOutcomeReasonTextV1(lastMatch.outcome, lastMatch.detail),
+      };
     }
     return candidate;
   });
@@ -1150,6 +1215,127 @@ export function createTaskActionCoordinatorV1(
     retiredAdmissionTickets.add(ticket);
   }
 
+  /**
+   * Item 9 fix (2026-08-17..19 workflow-defects batch): the ONE place a
+   * provider row's prompt — and the `promptInputSha256` that describes it —
+   * is assembled. Called both by `admitAction`'s early questions-admission
+   * (before any candidate is claimed, so the durable `invocationPending`
+   * record's digest is accurate from the start) and by `runProviderRow`'s
+   * per-attempt loop below (the actual invocation). Previously each built
+   * its own separate, narrower context — admission's omitted the tool
+   * session entirely, so a `readsWorkspaceFiles` text row's read-session
+   * preamble (added only once a session exists) was silently absent from
+   * the admitted hash while present in the bytes actually sent.
+   *
+   * For a question-capable operation's FIRST attempt, `admitAction` calls
+   * this once to admit and hands the exact result forward through
+   * `AdmittedProviderActionTicketV1.initialCandidateAssembledPrompt`;
+   * `runProviderRow` REUSES that same assembly (see the identity check
+   * around `originalInitialCandidateV1` below) rather than calling this a
+   * second time — calling it twice would create a second, discarded tool
+   * session for no reason (an observable extra `createWorkspaceReadSession`/
+   * `createPreflightSession` call, not actually free — see the regression
+   * this comment replaced). Every OTHER attempt (a fallback to a new
+   * candidate, an item-14 same-candidate retry, or the initial attempt of a
+   * row that is not question-capable, which `admitAction` never
+   * pre-assembles for) still calls this fresh, preserving the "fresh
+   * ledger every attempt" guarantee unchanged.
+   */
+  function assembleAttemptPromptV1(
+    row: ProviderTaskActionRowV1,
+    correlation: ActionCorrelationV1,
+    stage: TaskStage,
+    validatedInput: unknown,
+    answers: readonly StructuredAnswerV1[] | undefined,
+    reserved: {
+      readonly providerLabel: string;
+      readonly storedModelId: string;
+      readonly providerReadsWorkspaceNatively?: boolean;
+    }
+  ):
+    | ({ readonly ok: true } & AssembledAttemptPromptV1)
+    | { readonly ok: false; readonly code: "toolSessionsUnavailable" | "toolSessionUnavailable" } {
+    let preflightSession: TaskActionPreflightSessionV1 | undefined;
+    let toolHandler: RequestLocalToolHandlerV1 | undefined;
+    // Item 16 follow-up B (2026-08-17..19 workflow-defects batch): set only
+    // when a `readsWorkspaceFiles` row's read session was attempted and
+    // failed, so the prompt can say so instead of silently reasoning from
+    // the pack alone with an overstated confidence claim (item 15).
+    let workspaceReadSessionDegraded = false;
+    if (row.providerMode !== "text") {
+      if (!deps.toolSessions) {
+        return { ok: false, code: "toolSessionsUnavailable" };
+      }
+      try {
+        if (row.providerMode === "preflight") {
+          preflightSession = deps.toolSessions.createPreflightSession(validatedInput);
+          toolHandler = preflightSession.handler;
+        } else {
+          toolHandler = deps.toolSessions.createEditSession(validatedInput);
+        }
+      } catch {
+        return { ok: false, code: "toolSessionUnavailable" };
+      }
+    } else if (row.readsWorkspaceFiles && reserved.providerReadsWorkspaceNatively === false) {
+      // A `text` row that must reason about file content, on a provider
+      // that cannot open files. Attach the read-only tools so it can, rather
+      // than leaving it to infer from a possibly-truncated context pack.
+      //
+      // Deliberately keyed on the RESERVED candidate, not the row: the same
+      // review row runs on a CLI provider (reads the workspace natively —
+      // no tools needed, no behaviour change) and on Copilot (no file access
+      // at all without this). Conflating the two is what made review quality
+      // depend on which subscription the user happened to have.
+      //
+      // Best-effort: a workspace whose root cannot be registered still runs
+      // the review exactly as before rather than failing the round. A
+      // reviewer with a truncated pack is poor; no reviewer at all is worse.
+      try {
+        preflightSession = deps.toolSessions?.createWorkspaceReadSession();
+        toolHandler = preflightSession?.handler;
+      } catch {
+        preflightSession = undefined;
+        toolHandler = undefined;
+        workspaceReadSessionDegraded = true;
+      }
+    }
+
+    const context: TaskActionExecutionContextV1 = {
+      correlation,
+      stage,
+      validatedInput,
+      ...(answers !== undefined ? { answers } : {}),
+      ...(preflightSession !== undefined
+        ? { preflight: { ledger: preflightSession.ledger, rootId: preflightSession.rootId } }
+        : {}),
+      provider: { providerLabel: reserved.providerLabel, storedModelId: reserved.storedModelId },
+    };
+    // A row that opted into read tools AND actually got a session must be
+    // TOLD it can read — attaching tools silently leaves the model reasoning
+    // from the prompt alone, which is the failure this exists to remove.
+    // Assembled here rather than in the row so every future
+    // `readsWorkspaceFiles` row inherits it, and so it appears only when a
+    // session was really created (a CLI provider gets neither).
+    const readSessionPreamble =
+      row.providerMode === "text" && preflightSession !== undefined
+        ? buildWorkspaceReadSessionPreambleV1({ rootId: preflightSession.rootId }) + "\n\n"
+        : row.providerMode === "text" && workspaceReadSessionDegraded
+          ? buildWorkspaceReadSessionDegradedPreambleV1() + "\n\n"
+          : "";
+    const prompt =
+      readSessionPreamble +
+      row.buildPrompt(context) +
+      "\n\n" +
+      buildAiResultContractPromptV1({
+        correlation,
+        permittedResultKinds: row.permittedResultKinds,
+        completedContentType: row.completedContentType,
+        maxResponseBytes: row.maxResponseBytes,
+      });
+    const promptSha256 = createHash("sha256").update(prompt, "utf8").digest("hex");
+    return { ok: true, preflightSession, toolHandler, context, prompt, promptSha256 };
+  }
+
   async function runProviderRow(
     row: ProviderTaskActionRowV1,
     cancellationToken: vscode.CancellationToken,
@@ -1184,7 +1370,15 @@ export function createTaskActionCoordinatorV1(
      * this operation's own malformed-invocation counter so the shared
      * budget is enforced across, not just within, one operation.
      */
-    malformedInvocationsAlreadyUsedV1?: number
+    malformedInvocationsAlreadyUsedV1?: number,
+    /**
+     * Item 9 fix: `admitAction`'s own assembly for `initialCandidate`'s
+     * first attempt, when it performed the early questions-admission for
+     * it. Reused verbatim below (see `originalInitialCandidateV1`) instead
+     * of calling `assembleAttemptPromptV1` a second time for that one
+     * attempt.
+     */
+    initialCandidateAssembledPrompt?: AssembledAttemptPromptV1
   ): Promise<TaskActionOutcomeV1> {
     // No task-operation lease is held anywhere in this function except the
     // settlement phase inside `settleEnvelope` (plan §6.1 rule 6: leases are
@@ -1199,6 +1393,14 @@ export function createTaskActionCoordinatorV1(
     // their pre-existing behavior entirely.
     const isFreshInvocation = claimInvocationOnce === undefined;
     let pendingCandidate = initialCandidate;
+    // Identity anchor for the one-time reuse below: `pendingCandidate` is
+    // reassigned in-loop (consumed to `undefined` here, later reassigned to
+    // a NEW object by an item-14 same-candidate retry), so comparing the
+    // CURRENT `pendingCandidate` against this captured original — read
+    // exactly once, before the loop ever reassigns it — is what tells the
+    // first iteration apart from a later reuse of the branch that shares
+    // its code.
+    const originalInitialCandidateV1 = initialCandidate;
 
     // Malformed-result candidate advancement (2026-08-12 field report, item
     // 2): a `malformedResult` used to exhaust its two attempts
@@ -1254,15 +1456,55 @@ export function createTaskActionCoordinatorV1(
     let malformedBudgetArmedV1 =
       malformedRetryEligibleV1 && malformedInvocationsAlreadyUsedV1 !== undefined;
 
+    // Item 14 same-candidate retry: identity of the currently-reserved
+    // candidate (populated whenever a FRESH ranked reservation is taken, not
+    // when `pendingCandidate` merely re-enters the loop for a retry of the
+    // same one), and how many network-fault retries this candidate has
+    // already used. A flagged network fault (dropped connection, DNS/TLS
+    // failure) is a fault of the pipe, not evidence the candidate itself is
+    // unsuitable, so it earns one immediate retry of the SAME
+    // runner/provider/model before the loop falls through to the next ranked
+    // candidate — see the "transportFailure" case below.
+    let currentCandidateIdentityV1: { runnerId: string; providerId: string; modelId: string } | undefined =
+      initialCandidate
+        ? {
+            runnerId: initialCandidate.reserved.handle.runnerId,
+            providerId: initialCandidate.reserved.handle.providerId,
+            modelId: initialCandidate.reserved.handle.modelId,
+          }
+        : undefined;
+    let networkFaultRetriesUsedV1 = 0;
+    const MAX_NETWORK_FAULT_RETRIES_PER_CANDIDATE_V1 = 1;
+    // Attempt ids this coordinator itself allocated as a same-candidate
+    // retry — the authoritative record `enrichChainExhaustionWithAttemptOutcomesV1`
+    // needs to fold a retry into its original candidate's entry without
+    // guessing from a repeated model id (see that function's doc comment).
+    const networkFaultRetryAttemptIdsV1 = new Set<string>();
+
     for (;;) {
       let attemptId: string;
       let reserved: NonNullable<AdmittedProviderActionTicketV1["initialCandidate"]>["reserved"];
+      // True only when THIS iteration reserved a brand-new ranked candidate
+      // (the `else` branch below) rather than re-entering with a carried
+      // `pendingCandidate` (the initial Resume candidate, or an item-14
+      // same-candidate retry). Questions-admission is gated on this exactly
+      // as it always was — admission happens once per fresh candidate
+      // reservation, never on a retry of the same reservation.
+      let isFreshCandidateReservationThisIterationV1 = false;
+      // True only for the literal `initialCandidate` object handed in — never
+      // for a later item-14 retry, which reassigns `pendingCandidate` to a
+      // freshly-allocated object with the same shape but a different attempt.
+      const reuseInitialAssembledPromptV1 =
+        pendingCandidate !== undefined &&
+        pendingCandidate === originalInitialCandidateV1 &&
+        initialCandidateAssembledPrompt !== undefined;
 
       if (pendingCandidate) {
         attemptId = pendingCandidate.attemptId;
         reserved = pendingCandidate.reserved;
         pendingCandidate = undefined;
       } else {
+        isFreshCandidateReservationThisIterationV1 = true;
         attemptId = session.allocateAttempt();
 
         const next = selection.reserveNext(attemptId);
@@ -1297,7 +1539,8 @@ export function createTaskActionCoordinatorV1(
                 ? {
                     chainExhaustion: enrichChainExhaustionWithAttemptOutcomesV1(
                       next.chainExhaustion,
-                      session
+                      session,
+                      networkFaultRetryAttemptIdsV1
                     ),
                   }
                 : {}),
@@ -1315,133 +1558,74 @@ export function createTaskActionCoordinatorV1(
         }
 
         reserved = next.reserved;
-
-        const questionCapableInvocation =
-          isFreshInvocation && row.permittedResultKinds.includes("questions");
-
-        if (questionCapableInvocation) {
-          const correlation = reserved.handle.correlation;
-          const context: TaskActionExecutionContextV1 = {
-            correlation,
-            stage,
-            validatedInput,
-            ...(answers !== undefined ? { answers } : {}),
-          };
-          const prompt =
-            row.buildPrompt(context) +
-            "\n\n" +
-            buildAiResultContractPromptV1({
-              correlation,
-              permittedResultKinds: row.permittedResultKinds,
-              completedContentType: row.completedContentType,
-              maxResponseBytes: row.maxResponseBytes,
-            });
-          const promptSha256 = createHash("sha256").update(prompt, "utf8").digest("hex");
-
-          await deps.orchestrator.discardInvocation(correlation.operationId);
-          const admitted = await deps.orchestrator.admitInvocation({
-            correlation,
-            stage,
-            resumeSemantics: row.resumeSemantics,
-            validatedInput,
-            promptContract: {
-              contractId: AI_RESULT_CONTRACT_ID_V1,
-              contractVersion: AI_RESULT_CONTRACT_VERSION_V1,
-              promptInputSha256: promptSha256,
-            },
-          });
-          if (!admitted.ok) {
-            session.reportAttemptOutcome(attemptId, "providerUnavailablePreInvocation");
-            return admitted.code === "workflowStorageUnavailable"
-              ? unavailableV1("workflowStorageUnavailable")
-              : {
-                  kind: "failed",
-                  correlation,
-                  code: chatTransactionFailureCodeV1(admitted.code, admitted.reason),
-                  retryable: true,
-                };
-          }
-        }
+        // A genuinely fresh ranked candidate: reset the retry budget and
+        // record its identity for a possible same-candidate retry (item 14).
+        currentCandidateIdentityV1 = {
+          runnerId: next.reserved.handle.runnerId,
+          providerId: next.reserved.handle.providerId,
+          modelId: next.reserved.handle.modelId,
+        };
+        networkFaultRetriesUsedV1 = 0;
       }
+
       const correlation = reserved.handle.correlation;
-      const claimed = session.claim(reserved.handle.reservationId);
 
-      // Per-ATTEMPT request-local tool session for preflight/edit rows
-      // (plan §7.2): a fresh ledger/handler every attempt, so a fallback or
-      // retry can never mix observations across attempts. Text rows skip
-      // this entirely — no new code runs on the migrated text paths.
-      let preflightSession: TaskActionPreflightSessionV1 | undefined;
-      let toolHandler: RequestLocalToolHandlerV1 | undefined;
-      if (row.providerMode !== "text") {
-        if (!deps.toolSessions) {
+      // Item 9 fix (2026-08-17..19 workflow-defects batch): reuse
+      // `admitAction`'s own assembly (and the ONE tool session it created)
+      // for `initialCandidate`'s first attempt rather than paying for a
+      // second tool session that would only be thrown away — see
+      // `assembleAttemptPromptV1`'s doc comment. Every other attempt (a
+      // fallback candidate, an item-14 retry, or the first attempt of a row
+      // `admitAction` never pre-assembled for) still builds fresh here.
+      const assembled = reuseInitialAssembledPromptV1
+        ? { ok: true as const, ...initialCandidateAssembledPrompt }
+        : assembleAttemptPromptV1(row, correlation, stage, validatedInput, answers, {
+            providerLabel: reserved.providerLabel,
+            storedModelId: reserved.storedModelId,
+            providerReadsWorkspaceNatively: reserved.providerReadsWorkspaceNatively,
+          });
+      if (!assembled.ok) {
+        session.reportAttemptOutcome(attemptId, "providerUnavailablePreInvocation");
+        return { kind: "failed", correlation, code: assembled.code, retryable: false };
+      }
+      const { toolHandler, context, prompt, promptSha256 } = assembled;
+
+      // Admission only ever ran for a freshly-reserved candidate (never for
+      // the initial Resume candidate or an item-14 same-candidate retry) —
+      // `isFreshCandidateReservationThisIterationV1` reproduces that exact
+      // gating now that the assembly above runs unconditionally every
+      // iteration instead of only inside the reservation branch.
+      const questionCapableInvocation =
+        isFreshCandidateReservationThisIterationV1 &&
+        isFreshInvocation &&
+        row.permittedResultKinds.includes("questions");
+      if (questionCapableInvocation) {
+        await deps.orchestrator.discardInvocation(correlation.operationId);
+        const admitted = await deps.orchestrator.admitInvocation({
+          correlation,
+          stage,
+          resumeSemantics: row.resumeSemantics,
+          validatedInput,
+          promptContract: {
+            contractId: AI_RESULT_CONTRACT_ID_V1,
+            contractVersion: AI_RESULT_CONTRACT_VERSION_V1,
+            promptInputSha256: promptSha256,
+          },
+        });
+        if (!admitted.ok) {
           session.reportAttemptOutcome(attemptId, "providerUnavailablePreInvocation");
-          return { kind: "failed", correlation, code: "toolSessionsUnavailable", retryable: false };
-        }
-        try {
-          if (row.providerMode === "preflight") {
-            preflightSession = deps.toolSessions.createPreflightSession(validatedInput);
-            toolHandler = preflightSession.handler;
-          } else {
-            toolHandler = deps.toolSessions.createEditSession(validatedInput);
-          }
-        } catch {
-          session.reportAttemptOutcome(attemptId, "providerUnavailablePreInvocation");
-          return { kind: "failed", correlation, code: "toolSessionUnavailable", retryable: false };
-        }
-      } else if (row.readsWorkspaceFiles && reserved.providerReadsWorkspaceNatively === false) {
-        // A `text` row that must reason about file content, on a provider
-        // that cannot open files. Attach the read-only tools so it can, rather
-        // than leaving it to infer from a possibly-truncated context pack.
-        //
-        // Deliberately keyed on the RESERVED candidate, not the row: the same
-        // review row runs on a CLI provider (reads the workspace natively —
-        // no tools needed, no behaviour change) and on Copilot (no file access
-        // at all without this). Conflating the two is what made review quality
-        // depend on which subscription the user happened to have.
-        //
-        // Best-effort: a workspace whose root cannot be registered still runs
-        // the review exactly as before rather than failing the round. A
-        // reviewer with a truncated pack is poor; no reviewer at all is worse.
-        try {
-          preflightSession = deps.toolSessions?.createWorkspaceReadSession();
-          toolHandler = preflightSession?.handler;
-        } catch {
-          preflightSession = undefined;
-          toolHandler = undefined;
+          return admitted.code === "workflowStorageUnavailable"
+            ? unavailableV1("workflowStorageUnavailable")
+            : {
+                kind: "failed",
+                correlation,
+                code: chatTransactionFailureCodeV1(admitted.code, admitted.reason),
+                retryable: true,
+              };
         }
       }
 
-      const context: TaskActionExecutionContextV1 = {
-        correlation,
-        stage,
-        validatedInput,
-        ...(answers !== undefined ? { answers } : {}),
-        ...(preflightSession !== undefined
-          ? { preflight: { ledger: preflightSession.ledger, rootId: preflightSession.rootId } }
-          : {}),
-        provider: { providerLabel: reserved.providerLabel, storedModelId: reserved.storedModelId },
-      };
-      // A row that opted into read tools AND actually got a session must be
-      // TOLD it can read — attaching tools silently leaves the model reasoning
-      // from the prompt alone, which is the failure this exists to remove.
-      // Assembled here rather than in the row so every future
-      // `readsWorkspaceFiles` row inherits it, and so it appears only when a
-      // session was really created (a CLI provider gets neither).
-      const readSessionPreamble =
-        row.providerMode === "text" && preflightSession !== undefined
-          ? buildWorkspaceReadSessionPreambleV1({ rootId: preflightSession.rootId }) + "\n\n"
-          : "";
-      const prompt =
-        readSessionPreamble +
-        row.buildPrompt(context) +
-        "\n\n" +
-        buildAiResultContractPromptV1({
-          correlation,
-          permittedResultKinds: row.permittedResultKinds,
-          completedContentType: row.completedContentType,
-          maxResponseBytes: row.maxResponseBytes,
-        });
-      const promptSha256 = createHash("sha256").update(prompt, "utf8").digest("hex");
+      const claimed = session.claim(reserved.handle.reservationId);
       if (preInvocationHook) {
         await preInvocationHook();
       }
@@ -1570,6 +1754,40 @@ export function createTaskActionCoordinatorV1(
             };
           }
           session.reportAttemptOutcome(attemptId, "transportFailurePreResponse", transportEvidence);
+          // Item 14: a transport-flagged network fault (dropped connection,
+          // DNS failure, TLS handshake failure, HTTP/2 protocol error) is a
+          // property of the pipe, not the model, and is usually resolved by
+          // an immediate retry — falling straight to a backup would silently
+          // change which model authors the artifact for a reason that had
+          // nothing to do with the model. Bounded to one retry per candidate,
+          // and gated on the SAME shared invocation-cap check the ordinary
+          // fallback below is gated on, so a persistent network fault cannot
+          // quietly outspend the malformed-result budget once it is armed.
+          // The retry re-reserves the exact runner/provider/model this
+          // attempt used directly through the session (bypassing the
+          // registry's ranked cursor), so it never consumes a fallback slot.
+          if (
+            raw.networkFault === true &&
+            networkFaultRetriesUsedV1 < MAX_NETWORK_FAULT_RETRIES_PER_CANDIDATE_V1 &&
+            currentCandidateIdentityV1 !== undefined &&
+            !(malformedBudgetArmedV1 && malformedInvocationCountV1 >= MAX_MALFORMED_RESULT_INVOCATIONS_V1)
+          ) {
+            networkFaultRetriesUsedV1++;
+            const retryAttemptId = session.allocateAttempt();
+            networkFaultRetryAttemptIdsV1.add(retryAttemptId);
+            const retryHandle = session.reserve({
+              attemptId: retryAttemptId,
+              mode: row.providerMode,
+              runnerId: currentCandidateIdentityV1.runnerId,
+              providerId: currentCandidateIdentityV1.providerId,
+              modelId: currentCandidateIdentityV1.modelId,
+            });
+            pendingCandidate = {
+              attemptId: retryAttemptId,
+              reserved: { ...reserved, handle: retryHandle },
+            };
+            continue;
+          }
           // Pre-response failure is the fallback-eligible case: loop for the
           // next registry-ranked candidate with a fresh attempt and an
           // explicit next reservation — UNLESS the malformed-result budget
@@ -2166,23 +2384,50 @@ export function createTaskActionCoordinatorV1(
       break;
     }
 
+    // Item 9 fix (2026-08-17..19 workflow-defects batch): populated only when
+    // the questions-admission branch below actually assembles and admits a
+    // prompt for `initialCandidate` — carried into the returned ticket so
+    // `runProviderRow` reuses this exact assembly (and its tool session)
+    // for that candidate's first attempt instead of building — and paying
+    // for a second tool session behind — its own. See
+    // `assembleAttemptPromptV1`'s doc comment.
+    let initialCandidateAssembledPrompt: AssembledAttemptPromptV1 | undefined;
+
     if (row.permittedResultKinds.includes("questions")) {
       const correlation = initialCandidate.reserved.handle.correlation;
-      const context: TaskActionExecutionContextV1 = {
+      // Built through the same `assembleAttemptPromptV1` helper
+      // `runProviderRow` uses to invoke, so the record admitted HERE —
+      // before any candidate has actually been invoked — carries the digest
+      // of the exact bytes that will later be sent, including a
+      // `readsWorkspaceFiles` row's read-session preamble.
+      const assembled = assembleAttemptPromptV1(
+        row,
         correlation,
         stage,
-        validatedInput: validation.input,
-      };
-      const prompt =
-        row.buildPrompt(context) +
-        "\n\n" +
-        buildAiResultContractPromptV1({
-          correlation,
-          permittedResultKinds: row.permittedResultKinds,
-          completedContentType: row.completedContentType,
-          maxResponseBytes: row.maxResponseBytes,
-        });
-      const promptSha256 = createHash("sha256").update(prompt, "utf8").digest("hex");
+        validation.input,
+        undefined,
+        {
+          providerLabel: initialCandidate.reserved.providerLabel,
+          storedModelId: initialCandidate.reserved.storedModelId,
+          providerReadsWorkspaceNatively: initialCandidate.reserved.providerReadsWorkspaceNatively,
+        }
+      );
+      if (!assembled.ok) {
+        session.reportAttemptOutcome(initialCandidate.attemptId, "providerUnavailablePreInvocation");
+        progress.end();
+        return {
+          kind: "settled",
+          outcome: finalizeOutcome(
+            row,
+            request,
+            operationId,
+            { kind: "failed", correlation, code: assembled.code, retryable: false },
+            metrics
+          ),
+        };
+      }
+      const { promptSha256 } = assembled;
+      initialCandidateAssembledPrompt = assembled;
 
       await deps.orchestrator.discardInvocation(operationId);
       const admitted = await deps.orchestrator.admitInvocation({
@@ -2231,6 +2476,7 @@ export function createTaskActionCoordinatorV1(
         session,
         selection,
         initialCandidate,
+        ...(initialCandidateAssembledPrompt !== undefined ? { initialCandidateAssembledPrompt } : {}),
         acquireLeasePhase,
         progress,
         metrics,
@@ -2260,7 +2506,8 @@ export function createTaskActionCoordinatorV1(
           undefined,
           ticket.preInvocationHook,
           ticket.initialCandidate,
-          ticket.request.malformedInvocationsAlreadyUsedV1
+          ticket.request.malformedInvocationsAlreadyUsedV1,
+          ticket.initialCandidateAssembledPrompt
         );
       } catch (err) {
         console.error("continueAdmittedAction error:", err);

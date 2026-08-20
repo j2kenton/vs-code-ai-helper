@@ -74,28 +74,95 @@ function defaultDeps(): AutomationChainDeps {
 
 /**
  * Chains currently pending or running, keyed by `${taskKey}::${chainId}`,
- * each mapped to a unique token identifying the specific claim. The token
- * lets a superseded claim's own (delayed) release become a safe no-op
- * instead of deleting a different, later claim that has since taken the
- * same key — see releaseAutomationChain below.
+ * each mapped to a unique token identifying the specific claim plus that
+ * claim's expiry. The token lets a superseded claim's own (delayed) release
+ * become a safe no-op instead of deleting a different, later claim that has
+ * since taken the same key — see releaseAutomationChain below. The expiry is
+ * the fix for workflow-6 Item 1: this map is in-memory and this module's
+ * `release` closures are the only thing that ever clears an entry, so a
+ * dispatch whose owning process crashes, is cancelled, or otherwise never
+ * reaches its `release()` call (any error path around `scheduleAutomationChain`
+ * that does not go through its own release plumbing) leaves the entry behind
+ * for the life of the extension host. `isAutomationChainActive` is consulted
+ * by `scheduleTaskResume.ts`'s recovery reclaimer to decide whether a pending
+ * continuation is safe to re-dispatch — an unbounded guard therefore does not
+ * just leak a map entry, it can suppress recovery of a stranded task forever
+ * (observed 2026-08-17: a completed run's rejected continuation sat idle for
+ * ~2.5 hours because nothing ever cleared the guard). A live process renews
+ * nothing here; the expiry is a ceiling on how long any one claim may block a
+ * reclaim, not a lease that needs refreshing.
  */
-const activeChainKeys = new Map<string, symbol>();
+interface ChainGuardEntryV1 {
+  readonly token: symbol;
+  readonly expiresAt: number;
+}
+
+const activeChainKeys = new Map<string, ChainGuardEntryV1>();
+
+/**
+ * How long a claimed guard slot may block a duplicate dispatch (or a
+ * recovery reclaim) before it is treated as abandoned. Generous relative to
+ * any legitimate chain observed in this codebase: a chain deferred until a
+ * root operation ends can span a full CLI run (`cliRunTimeout` is 60
+ * minutes — see cliAgentRunner.ts) plus review/finalize overhead on top, and
+ * `scheduleTaskResume.ts`'s own `STALE_DISPATCH_GRACE_MS` uses 90 minutes as
+ * its "clearly dead" threshold for the same class of stranded state. Two
+ * hours keeps this guard clearly outside that range so it never
+ * false-positives on a slow-but-live chain, while still guaranteeing it
+ * cannot block recovery "forever" the way the unbounded version did.
+ */
+export const DEFAULT_CHAIN_GUARD_TTL_MS = 2 * 60 * 60 * 1000;
 
 function chainGuardKey(taskKey: string, chainId: string): string {
   return `${taskKey}::${chainId}`;
 }
 
-/** True when a chain with this (taskKey, chainId) is pending or running. */
+/**
+ * Drop `key`'s entry if it has expired. Called from both the read side
+ * (`isAutomationChainActive`) and the write side (`claimChainGuard`) so an
+ * expired guard is self-healing: the very next check or claim after
+ * expiry clears it, with no separate sweep needed.
+ */
+function pruneIfExpiredV1(key: string, now: number): void {
+  const entry = activeChainKeys.get(key);
+  if (entry && entry.expiresAt <= now) {
+    activeChainKeys.delete(key);
+  }
+}
+
+/**
+ * True when a chain with this (taskKey, chainId) is pending or running AND
+ * its guard has not expired. An expired guard is pruned as a side effect and
+ * reported inactive — see the module doc comment above.
+ */
 export function isAutomationChainActive(
   taskKey: string,
-  chainId: string
+  chainId: string,
+  now: number = Date.now()
 ): boolean {
-  return activeChainKeys.has(chainGuardKey(taskKey, chainId));
+  const key = chainGuardKey(taskKey, chainId);
+  pruneIfExpiredV1(key, now);
+  return activeChainKeys.has(key);
 }
 
 /** Test-only: clear guard state between unit tests. */
 export function resetAutomationChainGuards(): void {
   activeChainKeys.clear();
+}
+
+/**
+ * Test-only: install a guard entry with an explicit expiry, bypassing the
+ * normal claim path. Lets a test simulate a claim that never reached its own
+ * `release()` (a crashed/cancelled dispatch) and then assert on what happens
+ * once that entry's expiry has passed, without needing a real clock or a
+ * dispatch that actually hangs.
+ */
+export function __setAutomationChainGuardForTestV1(
+  taskKey: string,
+  chainId: string,
+  expiresAt: number
+): void {
+  activeChainKeys.set(chainGuardKey(taskKey, chainId), { token: Symbol(chainId), expiresAt });
 }
 
 /**
@@ -136,19 +203,22 @@ export function releaseAutomationChain(
  */
 function claimChainGuard(
   taskKey: string | undefined,
-  chainId: string
+  chainId: string,
+  now: number = Date.now(),
+  ttlMs: number = DEFAULT_CHAIN_GUARD_TTL_MS
 ): (() => void) | undefined {
   if (!taskKey) {
     return () => undefined; // Unscoped chains are not guarded.
   }
   const key = chainGuardKey(taskKey, chainId);
+  pruneIfExpiredV1(key, now);
   if (activeChainKeys.has(key)) {
     return undefined;
   }
   const token = Symbol(key);
-  activeChainKeys.set(key, token);
+  activeChainKeys.set(key, { token, expiresAt: now + ttlMs });
   return () => {
-    if (activeChainKeys.get(key) === token) {
+    if (activeChainKeys.get(key)?.token === token) {
       activeChainKeys.delete(key);
     }
   };

@@ -103,7 +103,8 @@ import { IncompleteTask } from "./types/incompleteTask";
 import { getModelSettings, installAutoImplementConfirmation, migrateEnabledProvidersForExistingModels, migrateSettingsNamespace, migrateSettingsScope } from "./config/settings";
 import { setExtensionContextV1 } from "./utils/extensionContextV1";
 import { setInertTrailingObserverV1 } from "./types/aiResultEnvelope";
-import { setLmToolSessionObserverV1 } from "./services/languageModelToolSessionV1";
+import { setLmToolSessionObserverV1, setLmToolSessionRequestIssuedObserverV1 } from "./services/languageModelToolSessionV1";
+import { setReadToolCallObserverV1 } from "./services/readToolSessionHandlerV1";
 
 /**
  * Run an orchestrator call that throws `ActionConversationErrorV1` on
@@ -195,6 +196,32 @@ export function activate(context: vscode.ExtensionContext): void {
         roundResultBytes: round.roundResultBytes,
         totalResultBytes: round.totalResultBytes,
       })
+    );
+  });
+
+  // Workflow-6 Item 18 fix 2: the pre-request boundary. Fix 1's per-round
+  // deadline (languageModelToolSessionV1.ts) already turns a hang into a
+  // reported failure; this line is what lets a later investigation tell
+  // "never reached the provider" (absent) from "the provider accepted the
+  // request and then never answered" (present, with no round-completion or
+  // timeout line following it) — the diagnosis fix 1 alone does not give.
+  setLmToolSessionRequestIssuedObserverV1((event) => {
+    console.info(
+      "[ensemble:toolSession] sendRequest issued",
+      JSON.stringify({ round: `${event.round}/${event.maxRounds}` })
+    );
+  });
+
+  // Item 3b-2 (2026-08-17..19 workflow-defects batch): a sanitized read-
+  // session transcript — tool name plus target path only, never content —
+  // logged live as each call happens rather than batched at session end, so
+  // a session that later hits a pre-response transport failure (a billing
+  // limit, a dropped connection) still leaves a record of what it read
+  // instead of nothing at all.
+  setReadToolCallObserverV1((event) => {
+    console.info(
+      "[ensemble:toolSession] read",
+      JSON.stringify({ tool: event.tool, relativePath: event.relativePath })
     );
   });
 

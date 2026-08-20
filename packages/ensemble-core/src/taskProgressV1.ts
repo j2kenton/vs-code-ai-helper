@@ -170,6 +170,10 @@ export interface TaskProgress {
   reviewRejections?: ReviewRejectionEntry[];
   /** Set when automated review iteration needs a human decision. */
   escalation?: TaskEscalation;
+  /** Durable record of every escalation Fast Forward rode through rather than
+   * aborting for, instead of acting on it. Append-only, capped at
+   * MAX_OVERRIDDEN_ESCALATIONS (oldest dropped). */
+  overriddenEscalations?: TaskEscalation[];
   /** Set when a post-implementation type-check failed on a round that changed files. */
   implementationTypeCheckFailure?: ImplementationTypeCheckFailure;
   /** True once a round completed work the plan checklist could not record. */
@@ -353,3 +357,7 @@ export interface TaskEscalation {
   /** True when this escalation followed a deliberate second-opinion attempt. */
   secondOpinionAttempted?: boolean;
 }
+
+/** Cap on `TaskProgress.overriddenEscalations` length (oldest entries dropped
+ * first) — same rationale and size as `MAX_REVIEW_REJECTIONS`. */
+export const MAX_OVERRIDDEN_ESCALATIONS = 50;

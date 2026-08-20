@@ -12,6 +12,7 @@
  */
 import {
   ImplementationTypeCheckFailure,
+  MAX_OVERRIDDEN_ESCALATIONS,
   MAX_REVIEW_REJECTIONS,
   MAX_REVIEW_SCORE_HISTORY,
   QuotaParkRecordV1,
@@ -501,6 +502,30 @@ export function appendReviewRejection(
   return {
     ...progress,
     reviewRejections: trimmed,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * Append one escalation Fast Forward rode through (Item 13,
+ * `TaskProgress.overriddenEscalations`) to the durable override trail. Called
+ * from inside the SAME `patchTaskProgressStrictV1` transaction that un-pauses
+ * the task for the ride-through, so a crash between the two can never leave
+ * the task active with the override unrecorded. Trims from the front once
+ * the cap is exceeded.
+ */
+export function appendOverriddenEscalation(
+  progress: TaskProgress,
+  entry: TaskEscalation
+): TaskProgress {
+  const overridden = [...(progress.overriddenEscalations ?? []), entry];
+  const trimmed =
+    overridden.length > MAX_OVERRIDDEN_ESCALATIONS
+      ? overridden.slice(overridden.length - MAX_OVERRIDDEN_ESCALATIONS)
+      : overridden;
+  return {
+    ...progress,
+    overriddenEscalations: trimmed,
     updatedAt: new Date().toISOString(),
   };
 }

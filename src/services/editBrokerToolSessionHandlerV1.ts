@@ -43,6 +43,7 @@ import {
 import {
   ObservationLedgerV1,
   ObservationRecordV1,
+  ancestorPathsOfV1,
   computePreflightPlanDigestV1,
   computePreflightPlanIdV1,
 } from "../types/preflightPlanV1";
@@ -110,6 +111,18 @@ interface ExecutionStateV1 {
   readonly receipts: MutationReceiptV1[];
   readonly receiptsByStepId: Map<string, MutationReceiptV1>;
   readonly observationsById: Map<string, ObservationRecordV1>;
+  /**
+   * Post-write revision per path, keyed the same way as the preflight
+   * validator's duplicate-target grouping. A second (or third) `patchFile`
+   * touch on one path (item 17) re-verifies and writes against the PREVIOUS
+   * touch's own receipt here, not the sealed preflight observation — which
+   * the first write has already superseded.
+   */
+  readonly revisionByPath: Map<string, string>;
+}
+
+function targetKeyOfV1(rootId: string, relativePath: string): string {
+  return rootId + String.fromCharCode(0) + relativePath;
 }
 
 export interface EditPlanBrokerDepsV1 {
@@ -217,6 +230,7 @@ export function createEditPlanBrokerV1(deps: EditPlanBrokerDepsV1): EditPlanBrok
         receipts: [],
         receiptsByStepId: new Map(),
         observationsById,
+        revisionByPath: new Map(),
       });
       executionIdByOperationId.set(input.correlation.operationId, executionId);
       return { ok: true, executionId, planId, planDigest, script };
@@ -319,29 +333,50 @@ export function createEditPlanBrokerV1(deps: EditPlanBrokerDepsV1): EditPlanBrok
           blockExecution(execution);
           return errorJson("stalePreflight", "sealed target observation is missing");
         }
+        // Item 17: a later `patchFile` touch on a path this execution has
+        // already written verifies and writes against that write's own
+        // receipt revision, not the sealed preflight observation — which
+        // the earlier write has already superseded. The sealed observation
+        // remains the precondition only for the FIRST touch of a path.
+        const targetKey = targetKeyOfV1(sealed.rootId, operation.relativePath);
+        const effectiveRevision = execution.revisionByPath.get(targetKey) ?? targetObservation.revision;
 
-        // §7.7 (4): every parent-chain link re-verified — observed ancestors
-        // must still be directories; step-created ancestors must hold receipts.
-        for (const link of operation.parentChain) {
-          if (link.kind === "createdByStep") {
+        // §7.7 (4): every ancestor re-verified at the moment of execution.
+        // `operation.parentChain` now carries only `createdByStep` links
+        // (item 20) — an ancestor that already existed at preflight is no
+        // longer named there at all, so it is re-derived from the
+        // operation's own path and live-stat-checked here instead of walked
+        // from the sealed chain.
+        if (operation.kind === "createFile" || operation.kind === "createDirectory") {
+          const stepPathByStepId = new Map(
+            sealed.operations.map((op) => [op.stepId, op.relativePath] as const)
+          );
+          const stepCreatedAncestorPaths = new Set<string>();
+          for (const link of operation.parentChain) {
+            if (link.kind !== "createdByStep") {
+              continue;
+            }
             if (!execution.receiptsByStepId.has(link.stepId)) {
               blockExecution(execution);
               return errorJson("stalePreflight", `parent step ${link.stepId} has no receipt`);
             }
-            continue;
+            const stepPath = stepPathByStepId.get(link.stepId);
+            if (stepPath) {
+              stepCreatedAncestorPaths.add(stepPath);
+            }
           }
-          const parentObservation = execution.observationsById.get(link.observationId);
-          if (!parentObservation) {
-            blockExecution(execution);
-            return errorJson("stalePreflight", "sealed parent observation is missing");
-          }
-          const parentStat = await deps.getFileStore().stat({
-            rootId: sealed.rootId,
-            relativePath: parentObservation.relativePath,
-          });
-          if (parentStat.kind !== "ok" || parentStat.value.kind !== "directory") {
-            blockExecution(execution);
-            return errorJson("stalePreflight", `ancestor ${parentObservation.relativePath} is no longer a directory`);
+          for (const ancestorPath of ancestorPathsOfV1(operation.relativePath)) {
+            if (stepCreatedAncestorPaths.has(ancestorPath)) {
+              continue; // covered by its own receipt above
+            }
+            const ancestorStat = await deps.getFileStore().stat({
+              rootId: sealed.rootId,
+              relativePath: ancestorPath,
+            });
+            if (ancestorStat.kind !== "ok" || ancestorStat.value.kind !== "directory") {
+              blockExecution(execution);
+              return errorJson("stalePreflight", `ancestor ${ancestorPath} is no longer a directory`);
+            }
           }
         }
 
@@ -376,11 +411,12 @@ export function createEditPlanBrokerV1(deps: EditPlanBrokerDepsV1): EditPlanBrok
                 revision: created.value.revision,
                 sha256: created.value.sha256,
               });
+              execution.revisionByPath.set(targetKey, created.value.revision);
             } else {
               const replaced = await deps.getFileStore().replaceFileExact(
                 targetLocator,
                 bytes,
-                targetObservation.revision
+                effectiveRevision
               );
               if (replaced.kind !== "ok") {
                 blockExecution(execution);
@@ -390,6 +426,7 @@ export function createEditPlanBrokerV1(deps: EditPlanBrokerDepsV1): EditPlanBrok
                 revision: replaced.value.revision,
                 sha256: replaced.value.sha256,
               });
+              execution.revisionByPath.set(targetKey, replaced.value.revision);
             }
             break;
           }
@@ -446,7 +483,7 @@ export function createEditPlanBrokerV1(deps: EditPlanBrokerDepsV1): EditPlanBrok
             const replacedByPatch = await deps.getFileStore().replaceFileExact(
               targetLocator,
               patched,
-              targetObservation.revision
+              effectiveRevision
             );
             if (replacedByPatch.kind !== "ok") {
               blockExecution(execution);
@@ -456,6 +493,7 @@ export function createEditPlanBrokerV1(deps: EditPlanBrokerDepsV1): EditPlanBrok
               revision: replacedByPatch.value.revision,
               sha256: replacedByPatch.value.sha256,
             });
+            execution.revisionByPath.set(targetKey, replacedByPatch.value.revision);
             break;
           }
           case "createDirectory": {
@@ -475,7 +513,7 @@ export function createEditPlanBrokerV1(deps: EditPlanBrokerDepsV1): EditPlanBrok
           case "deleteFile": {
             const deleted = await deps.getFileStore().deleteFileExact(
               targetLocator,
-              targetObservation.revision
+              effectiveRevision
             );
             if (deleted.kind !== "ok") {
               blockExecution(execution);
@@ -512,7 +550,7 @@ export function createEditPlanBrokerV1(deps: EditPlanBrokerDepsV1): EditPlanBrok
           operationDigest: computeSealedOperationDigestV1(operation),
           preconditionDigest: sha256OfCanonicalJsonV1({
             kind: targetObservation.kind,
-            revision: targetObservation.revision,
+            revision: effectiveRevision,
             targetObservationId: operation.targetObservationId,
           }),
           postconditionDigest,

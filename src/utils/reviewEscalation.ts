@@ -123,22 +123,49 @@ export async function escalateReviewToHuman(
     }
 
     const stageName = STAGE_DISPLAY_NAMES[stage];
+    // Genuinely blocking (not just "here's a question, work continues"): the
+    // task is paused above and automated review iteration will not resume on
+    // its own — error level, not warning, per the "can't proceed without
+    // user feedback" contract for hard-blocked automation.
+    //
+    // Item 13 (2026-08-18..20 workflow-defects batch): a `plateau` escalation
+    // is NEVER ridden through (shouldRideThroughEscalationV1 excludes it
+    // unconditionally — see reviewActions.ts), so for that kind the pause is
+    // certain and the unqualified claim below is accurate. Every OTHER kind
+    // CAN be ridden through by a Fast Forward run configured to continue
+    // through escalations (ensemble.resilience.fastForwardSurvivesEscalation)
+    // — this function has no visibility into whether such a run is what
+    // triggered it, so it cannot know in advance whether the pause it just
+    // wrote will still hold a moment later. Claiming an unconditional pause
+    // for those kinds was misleading: the pause could be undone within
+    // seconds by the very automation the message tells the user has stopped.
+    // Both the chat question text and blockedReason below state the real,
+    // conditional truth instead of a claim that isPaused's ride-through
+    // branch may falsify immediately.
     const question = {
       canonicalId: normalizePath(folderUri.fsPath),
       taskFolderPath: folderUri.fsPath,
       stage,
       taskName: progressHint?.displayName,
       question:
-        `Automated review iteration is stuck on ${stageName} and paused the task: ${reason}\n\n` +
-        "How would you like to proceed — keep iterating (resume the task and I'll try again), make manual changes yourself, " +
-        "or accept the current state and advance anyway?",
+        kind === "plateau"
+          ? `Automated review iteration is stuck on ${stageName} and paused the task: ${reason}\n\n` +
+            "How would you like to proceed — keep iterating (resume the task and I'll try again), make manual changes yourself, " +
+            "or accept the current state and advance anyway?"
+          : `Automated review iteration is stuck on ${stageName} and paused the task: ${reason}\n\n` +
+            "If a Fast Forward run is active with 'survive escalation' enabled, it may continue iterating to the " +
+            "end of its current attempt budget before this pause takes effect (you'll see a follow-up notification " +
+            "if so). Once the pause holds, how would you like to proceed — keep iterating (resume the task and " +
+            "I'll try again), make manual changes yourself, or accept the current state and advance anyway?",
     };
 
-    // Genuinely blocking (not just "here's a question, work continues"): the
-    // task is paused above and automated review iteration will not resume on
-    // its own — error level, not warning, per the "can't proceed without
-    // user feedback" contract for hard-blocked automation.
-    const blockedReason = `${stageName} is stuck: ${reason} The task has been paused — resume it once you've decided how to proceed.`;
+    const blockedReason =
+      kind === "plateau"
+        ? `${stageName} is stuck: ${reason} The task has been paused — resume it once you've decided how to proceed.`
+        : `${stageName} is stuck: ${reason} The task has been paused. If a Fast Forward run is active with ` +
+          "'survive escalation' enabled, it may continue iterating to the end of its current attempt budget " +
+          "before this pause takes effect (you'll see a follow-up notification if so) — otherwise, resume it " +
+          "once you've decided how to proceed.";
     if (chatTarget) {
       // "vs-code-ai-helper.postStageQuestion" (registered in chatWithStage.ts)
       // routes straight to chatViewProvider.ask(question) — this task's own

@@ -7,10 +7,12 @@
 import * as assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  DEFAULT_CHAIN_GUARD_TTL_MS,
   isAutomationChainActive,
   releaseAutomationChain,
   resetAutomationChainGuards,
   scheduleAutomationChain,
+  __setAutomationChainGuardForTestV1,
   type AutomationChainDeps,
   type AutomationChainEndSnapshot,
 } from "../utils/automationChain";
@@ -284,4 +286,55 @@ void test("a review handing off to the next review stage under the same chainId,
   // claim — but by the time everything has settled, nothing should be left
   // dangling either.
   assert.equal(isAutomationChainActive("/task-a", "auto-review"), false);
+});
+
+// --- workflow-6 Item 1: a guard whose owning process never releases it ---
+
+void test("a live (non-expired) guard is reported active and blocks a duplicate claim", async () => {
+  // Baseline for the expiry test below: a guard well inside its TTL must
+  // behave exactly as before — active, and a second dispatch dropped.
+  // `now` is anchored to the real clock (not an arbitrary small epoch) since
+  // `scheduleAutomationChain` below claims through `claimChainGuard`'s own
+  // `Date.now()` default a moment later — an arbitrary tiny "now" here would
+  // read as already-expired against the real clock and silently invalidate
+  // the test.
+  resetAutomationChainGuards();
+  const now = Date.now();
+  __setAutomationChainGuardForTestV1("/task-a", "impl-continuation", now + DEFAULT_CHAIN_GUARD_TTL_MS);
+  assert.equal(isAutomationChainActive("/task-a", "impl-continuation", now), true);
+  const chain = makeFakeChain();
+  const result = await scheduleAutomationChain(
+    { command: "x.review", taskKey: "/task-a", chainId: "impl-continuation" },
+    undefined,
+    chain.deps
+  );
+  assert.equal(result, false, "a live guard must still drop a duplicate dispatch");
+});
+
+void test("an expired guard is reported inactive and does not suppress a reclaim", () => {
+  // Workflow-6 Item 1: a Fast Forward run (or any dispatch) that ends
+  // abnormally — crash, cancel, any error path that skips its own release()
+  // — must not be able to block recovery past this guard's expiry. Mirrors
+  // the exact call scheduleTaskResume.ts's armPendingImplRecoveries makes.
+  resetAutomationChainGuards();
+  const now = Date.now();
+  __setAutomationChainGuardForTestV1("/task-a", "impl-continuation", now - 1);
+  assert.equal(
+    isAutomationChainActive("/task-a", "impl-continuation", now),
+    false,
+    "a guard past its expiry must report inactive"
+  );
+});
+
+void test("an expired guard's stale entry is pruned so a fresh chain can be claimed", async () => {
+  resetAutomationChainGuards();
+  __setAutomationChainGuardForTestV1("/task-a", "impl-continuation", Date.now() - 1);
+  const chain = makeFakeChain();
+  const result = await scheduleAutomationChain(
+    { command: "vs-code-ai-helper.runImplementationWithAI", taskKey: "/task-a", chainId: "impl-continuation" },
+    undefined,
+    chain.deps
+  );
+  assert.equal(result, true, "an expired guard must not block a fresh dispatch under the same key");
+  assert.equal(chain.executed.length, 1);
 });

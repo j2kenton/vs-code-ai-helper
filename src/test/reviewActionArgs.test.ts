@@ -30,6 +30,9 @@ import {
   peekFastForwardTargetsImplReviewFromPathV1,
   resolveBaselineReviewHistoryEntryV1,
   selectReviewPromptTemplate,
+  shouldRideThroughEscalationV1,
+  isFreshEscalationForRideThroughV1,
+  escalationIdentityStillMatchesV1,
 } from "../commands/reviewActions";
 import { fastForwardCurrentTaskReview } from "../commands/fastForwardCurrentTaskReview";
 import { TaskOperationHandle } from "../utils/taskOperations";
@@ -41,6 +44,7 @@ import {
 } from "../utils/notificationRouter";
 import type { TaskInventory } from "../state/taskInventory";
 import type { CurrentTaskStore } from "../utils/currentTaskStore";
+import type { TaskEscalation, TaskProgress } from "../types/taskProgress";
 
 /**
  * Re-implement the normalizeReviewArg contract for test verification.
@@ -375,6 +379,175 @@ void describe("fast-forward fallback contract", () => {
         chatViewProvider: undefined,
       }
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Item 13 (2026-08-18..19 workflow-defects batch): Fast Forward must never
+// ride through a `plateau` escalation — it is the anti-convergence signal by
+// definition, so finishing the attempt budget cannot help. Other escalation
+// kinds remain eligible when the setting is on, matching the case the
+// setting was written for (a single escalation mid-budget on an otherwise
+// converging run). Tested as a pure predicate rather than through the full
+// Fast Forward provider/notification harness — see shouldRideThroughEscalationV1's
+// own doc comment.
+// ---------------------------------------------------------------------------
+
+void describe("shouldRideThroughEscalationV1 (item 13)", () => {
+  void it("never rides through a plateau escalation, even with the setting on and the stage matching", () => {
+    assert.equal(
+      shouldRideThroughEscalationV1({
+        survivesEscalationSetting: true,
+        escalationStage: "impl-high-review",
+        escalationKind: "plateau",
+        targetStage: "impl-high-review",
+      }),
+      false,
+      "a plateau escalation pauses Fast Forward and the pause must hold — the un-pause path must not be taken"
+    );
+  });
+
+  void it("rides through a non-plateau escalation when the setting is on and the stage matches — the breaker ordering this preserves is pinned by resilienceDefaults.test.ts", () => {
+    for (const kind of ["spec-defect", "environmental", "unverifiable", "reviewer-disagreement"] as const) {
+      assert.equal(
+        shouldRideThroughEscalationV1({
+          survivesEscalationSetting: true,
+          escalationStage: "impl-high-review",
+          escalationKind: kind,
+          targetStage: "impl-high-review",
+        }),
+        true,
+        `kind ${kind} must remain ride-through eligible`
+      );
+    }
+  });
+
+  void it("never rides through when the setting is off, regardless of kind", () => {
+    assert.equal(
+      shouldRideThroughEscalationV1({
+        survivesEscalationSetting: false,
+        escalationStage: "impl-high-review",
+        escalationKind: "environmental",
+        targetStage: "impl-high-review",
+      }),
+      false
+    );
+  });
+
+  void it("never rides through an escalation for a DIFFERENT stage than the one Fast Forward is targeting", () => {
+    assert.equal(
+      shouldRideThroughEscalationV1({
+        survivesEscalationSetting: true,
+        escalationStage: "impl-low-review",
+        escalationKind: "environmental",
+        targetStage: "impl-high-review",
+      }),
+      false
+    );
+  });
+
+  void it("never rides through when there is no escalation on record", () => {
+    assert.equal(
+      shouldRideThroughEscalationV1({
+        survivesEscalationSetting: true,
+        escalationStage: undefined,
+        escalationKind: undefined,
+        targetStage: "impl-high-review",
+      }),
+      false
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// isFreshEscalationForRideThroughV1 / escalationIdentityStillMatchesV1
+// (item 13 review fix, 2026-08-20): the two race conditions the review found
+// in the read-then-write ride-through mutation. Pulled out as pure
+// predicates for the same reason as shouldRideThroughEscalationV1 — the full
+// Fast Forward provider/notification harness is not needed to pin the exact
+// read/CAS logic that was broken.
+// ---------------------------------------------------------------------------
+
+void describe("isFreshEscalationForRideThroughV1 (item 13 review fix)", () => {
+  const escalation: TaskEscalation = {
+    stage: "impl-high-review",
+    kind: "environmental",
+    reason: "flaky provider",
+    at: "2026-08-20T10:00:00.000Z",
+  };
+
+  void it("is fresh when no ride-through has happened yet this run (lastRiddenThroughEscalationAt is undefined)", () => {
+    assert.equal(isFreshEscalationForRideThroughV1(escalation, undefined), true);
+  });
+
+  void it("is fresh when the escalation's own `at` differs from the last one ridden through", () => {
+    assert.equal(
+      isFreshEscalationForRideThroughV1(escalation, "2026-08-20T09:00:00.000Z"),
+      true
+    );
+  });
+
+  void it("is NOT fresh when the escalation's `at` matches the last one ridden through — the exact stale-record race", () => {
+    // The scenario this closes: escalation is never cleared on ride-through,
+    // so a LATER external/manual pause that happens to land while the same
+    // stale record is still on the stage must not be mistaken for the same
+    // escalation being approved a second time.
+    assert.equal(isFreshEscalationForRideThroughV1(escalation, escalation.at), false);
+  });
+
+  void it("is NOT fresh when there is no escalation at all", () => {
+    assert.equal(isFreshEscalationForRideThroughV1(undefined, undefined), false);
+  });
+});
+
+void describe("escalationIdentityStillMatchesV1 (item 13 review fix)", () => {
+  const inspected: TaskEscalation = {
+    stage: "impl-high-review",
+    kind: "environmental",
+    reason: "flaky provider",
+    at: "2026-08-20T10:00:00.000Z",
+  };
+
+  void it("matches when status, stage, kind, and `at` are all unchanged since the read", () => {
+    const current: Pick<TaskProgress, "status" | "escalation"> = {
+      status: "paused",
+      escalation: inspected,
+    };
+    assert.equal(escalationIdentityStillMatchesV1(current, inspected, "impl-high-review"), true);
+  });
+
+  void it("does NOT match when a DIFFERENT escalation (e.g. a plateau) replaced the inspected one on the same stage between read and write — the exact race the review found", () => {
+    const current: Pick<TaskProgress, "status" | "escalation"> = {
+      status: "paused",
+      escalation: {
+        stage: "impl-high-review",
+        kind: "plateau",
+        reason: "iteration is not converging",
+        at: "2026-08-20T10:00:05.000Z",
+      },
+    };
+    assert.equal(escalationIdentityStillMatchesV1(current, inspected, "impl-high-review"), false);
+  });
+
+  void it("does NOT match when the task is no longer paused", () => {
+    const current: Pick<TaskProgress, "status" | "escalation"> = {
+      status: "active",
+      escalation: inspected,
+    };
+    assert.equal(escalationIdentityStillMatchesV1(current, inspected, "impl-high-review"), false);
+  });
+
+  void it("does NOT match when the escalation moved to a different stage", () => {
+    const current: Pick<TaskProgress, "status" | "escalation"> = {
+      status: "paused",
+      escalation: { ...inspected, stage: "impl-low-review" },
+    };
+    assert.equal(escalationIdentityStillMatchesV1(current, inspected, "impl-high-review"), false);
+  });
+
+  void it("does NOT match when there is no escalation recorded at all", () => {
+    const current: Pick<TaskProgress, "status" | "escalation"> = { status: "paused" };
+    assert.equal(escalationIdentityStillMatchesV1(current, inspected, "impl-high-review"), false);
   });
 });
 

@@ -1337,7 +1337,7 @@
     "frontend": "pnpm --filter @ensemble/mobile web",
     "stack": "npm-run-all -p backend frontend",
     "package": "pnpm run check-types && pnpm run lint && node esbuild.js --production && pnpm run verify:workflow-safety",
-    "check-types": "tsc --noEmit",
+    "check-types": "tsc --noEmit && pnpm --filter \"./packages/*\" -r run check-types",
     "lint": "eslint src",
     "lint:fix": "eslint src --fix",
     "test:unit": "node -e \"require('fs').rmSync('out/test',{recursive:true,force:true})\" && tsc --project tsconfig.test.json && node test-stubs/run-unit-tests.js",

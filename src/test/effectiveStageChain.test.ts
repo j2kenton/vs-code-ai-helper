@@ -168,7 +168,13 @@ void describe("resolveEffectiveStageChainV1 — skip filtering", () => {
     }
   });
 
-  void it("falls through to the general model when every row of the stage's chain is skipped", () => {
+  void it("reports none — not the general chain — when every row of the stage's OWN configured chain is explicitly skipped (item 11, 2026-08-18 runs 060/061)", () => {
+    // A stage with its own primary/backups explicitly disabled one by one is
+    // a deliberate "run nothing here" signal, distinct from a stage that was
+    // never configured. Falling through to the general (desc) chain here
+    // silently overrides that choice — observed reaching Copilot on an impl
+    // stage with everything disabled. Only a genuinely BLANK stage (no
+    // configured candidates at all — see the test below) may fall through.
     const stub = installConfig({
       modelSettings: {
         impl: {
@@ -178,6 +184,21 @@ void describe("resolveEffectiveStageChainV1 — skip filtering", () => {
           backupsEnabled: [false],
           strategy: "switch-to-backup",
         },
+        desc: { primary: "gemini-cli:default", strategy: "alert-and-wait" },
+      },
+    });
+    try {
+      const chain = resolveEffectiveStageChainV1("impl");
+      assert.equal(chain.source, "none");
+      assert.equal(chain.primary, undefined);
+    } finally {
+      stub.restore();
+    }
+  });
+
+  void it("still falls through to the general model for a genuinely blank stage (no configured candidates at all)", () => {
+    const stub = installConfig({
+      modelSettings: {
         desc: { primary: "gemini-cli:default", strategy: "alert-and-wait" },
       },
     });
@@ -520,6 +541,34 @@ void describe("resolveModelForStage — general fallback (intentional behavior c
         ignoreActiveFallback: true,
       });
       assert.equal(resolved.modelId, undefined);
+      assert.equal(resolved.source, "none");
+    } finally {
+      stub.restore();
+    }
+  });
+
+  void it("item 11: a fully-disabled stage reports source none instead of silently resolving through general", async () => {
+    const stub = installConfig({
+      modelSettings: {
+        impl: {
+          primary: "codex-cli:gpt-5",
+          primaryEnabled: false,
+          backups: ["a-cli:one"],
+          backupsEnabled: [false],
+          strategy: "switch-to-backup",
+        },
+        desc: { primary: "gemini-cli:default", strategy: "alert-and-wait" },
+      },
+    });
+    try {
+      const resolved = await resolveModelForStage(vscode.Uri.file(os.tmpdir()), "impl", {
+        ignoreActiveFallback: true,
+      });
+      assert.equal(
+        resolved.modelId,
+        undefined,
+        "a stage whose primary and every backup were explicitly disabled must never resolve to a substitute model"
+      );
       assert.equal(resolved.source, "none");
     } finally {
       stub.restore();

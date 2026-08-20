@@ -1346,6 +1346,12 @@ void describe("zero-change streak counts checklist progress, not just file chang
   });
 
   void it("a zero-file round whose claim never merges still extends the streak", async () => {
+    // Item 4 (Part 3) note: the new `uncheckedItemsWithoutClearingReview`
+    // gate does NOT intercept this round even without a qualifying review —
+    // an unmatched `## Plan Item Checklist` claim (`checklistClaimedButUnmerged`)
+    // is deliberately excluded from that gate, because it already has its
+    // own dedicated, unconditional latch further below. This test is
+    // unaffected by the Item 4 fix as a result.
     const { folderPath, progress } = makeTaskFolder("streak_extends_on_unmatched_claim", {
       zeroChangeImplRounds: 1,
     });
@@ -1364,6 +1370,78 @@ void describe("zero-change streak counts checklist progress, not just file chang
       persisted?.zeroChangeImplRounds,
       2,
       "a claimed-but-unmerged round is exactly as sterile as one that reported nothing"
+    );
+  });
+});
+
+/**
+ * Item 4 review finding (2026-08-20): `checklistClaimedButUnmerged` was
+ * previously exempted from the unticked-items-without-a-clearing-review
+ * gate outright — the sibling test above proves the streak still extends,
+ * but that alone left a gap: nothing stopped the round from falling through
+ * to auto-advance as a false "nothing to fix" completion, with the
+ * dedicated `checklistStateUnrecorded` latch further below only setting a
+ * flag after the fact. This proves the closed gap directly — refused, not
+ * routed onward, with the reconciliation outcome recorded — while the
+ * sibling test above continues to prove the streak/no-progress-breaker
+ * safety net for a REPEATED occurrence still runs exactly as before.
+ */
+void describe("a claimed-but-unmerged round with unticked items and no clearing review is also refused (Item 4 review fix, Part 3)", () => {
+  const UNMATCHED_CLAIM_WITH_REMAINING_WORK_SUMMARY = [
+    "<!-- ensemble:implementation-checklist -->",
+    "",
+    "- [ ] Add the resolver",
+    "- [ ] Wire the decoder",
+    "",
+    "## Files Changed",
+    "",
+    "- (none) — verification only",
+    "",
+    "## Plan Item Checklist",
+    "",
+    "- Resolver addition — done <!-- ensemble:retroactive --> — src/resolver.ts:1 already implemented",
+    "",
+    "## Verification",
+    "",
+    "- ran the unit tests",
+  ].join("\n");
+
+  void it("refuses onward routing, records the reconciliation outcome, and still extends the streak", async () => {
+    const { folderPath, progress } = makeTaskFolder("item4_claimed_unmerged_refused", {
+      zeroChangeImplRounds: 1,
+      // No reviewScoreHistory at all: nothing has ever vouched that the
+      // plan's 2 remaining items are actually done.
+    });
+    const run = await runHarnessed(folderPath, progress, {
+      status: "completed",
+      filesChanged: [],
+      filesChangedUnknown: false,
+      summary: UNMATCHED_CLAIM_WITH_REMAINING_WORK_SUMMARY,
+      runnerId: "test-cli",
+      providerLabel: "Test CLI",
+      storedModelId: "cli:test-model",
+    });
+
+    const persisted = readProgress(folderPath);
+    assert.equal(
+      persisted?.zeroChangeImplRounds,
+      2,
+      "the streak/no-progress-breaker safety net must keep running for a repeated claimed-but-unmerged round"
+    );
+    assert.equal(
+      persisted?.checklistProgressUnreliable,
+      true,
+      "the round must be recorded as under-recording, not just silently refused"
+    );
+    const logs = readRunLogs(folderPath);
+    assert.ok(
+      logs.some((log) => /## Checklist reconciliation needed/.test(log)),
+      "the run log must record why the round was refused rather than routed onward"
+    );
+    const reconcileDecision = run.pendingDecisions?.find((d) => d.decisionKey === "reconcilePlanChecklist");
+    assert.ok(
+      reconcileDecision,
+      "the operator must be told reconciliation is owed, not just that nothing happened"
     );
   });
 });
@@ -1479,6 +1557,11 @@ void describe("no-progress breaker requires a qualifying passing review (Part 3,
       // already in the tree, but no qualifying passing-review loop — exactly
       // the shape the review finding named.
     });
+    // Item 4 (Part 3) note: the new gate does not intercept this round even
+    // without a qualifying review, because UNMATCHED_CLAIM_SUMMARY's
+    // `## Plan Item Checklist` claim (`checklistClaimedButUnmerged`) is
+    // deliberately excluded from that gate — see the sibling note in "zero-
+    // change streak counts checklist progress" above.
     await runHarnessed(folderPath, progress, {
       status: "completed",
       filesChanged: [],
@@ -1504,6 +1587,8 @@ void describe("no-progress breaker requires a qualifying passing review (Part 3,
       zeroChangeImplRounds: 2,
       reviewScoreHistory: [{ ...qualifyingHistory[0]!, score: 6, blockerCount: 1, taskFixableCount: 1 }],
     });
+    // Item 4 (Part 3) note: unaffected by the new gate for the same reason as
+    // the sibling test above (`checklistClaimedButUnmerged` is excluded).
     await runHarnessed(folderPath, progress, {
       status: "completed",
       filesChanged: [],
@@ -1517,6 +1602,106 @@ void describe("no-progress breaker requires a qualifying passing review (Part 3,
     const persisted = readProgress(folderPath);
     assert.equal(persisted?.status, "active", "a below-threshold review must not qualify as a passing loop");
     assert.equal(persisted?.escalation, undefined);
+  });
+});
+
+/**
+ * Item 4 (2026-08-17..19 workflow-defects batch, Part 3): the
+ * `priorRoundsChangedTree` gate could not tell "the model correctly found
+ * nothing left to fix" from "a provider silently produced nothing" while the
+ * plan checklist still had real unticked work and no review had vouched for
+ * it — runs 016/018/047/061 all settled `Status: completed` this way with an
+ * untouched checklist. The fix adds a second, complementary refusal
+ * condition: unticked plan items AND no qualifying review clearing the
+ * stage. It must stand down on exactly the evidence
+ * `checklistUnderrecordingConfirmedByReview` (tested above) stands up on, so
+ * the two behaviors are proven back to back here.
+ */
+void describe("a zero-change round with unticked plan items is refused without a clearing review (Item 4, Part 3)", () => {
+  const NOTHING_TO_FIX_SUMMARY = [
+    "<!-- ensemble:implementation-checklist -->",
+    "",
+    "- [ ] Add the resolver",
+    "- [ ] Wire the decoder",
+    "",
+    "## Files Changed",
+    "",
+    "- (none) — nothing needed changing this round",
+    "",
+    "## Verification",
+    "",
+    "- ran the unit tests",
+  ].join("\n");
+
+  const qualifyingHistory = [
+    {
+      stage: "impl-high-review" as const,
+      score: 10,
+      attemptId: "attempt-passing",
+      at: "2026-01-02T00:00:00.000Z",
+      blockerCount: 0,
+      taskFixableCount: 0,
+    },
+  ];
+
+  void it("refuses a zero-change round when the plan has unticked items and no review has cleared the stage", async () => {
+    const { folderPath, progress } = makeTaskFolder("item4_refused_no_clearing_review", {
+      // No reviewScoreHistory at all: nothing has ever vouched that the
+      // plan's 2 remaining items (from the default PLAN_FINAL fixture) are
+      // actually done.
+    });
+    const run = await runHarnessed(folderPath, progress, {
+      status: "completed",
+      filesChanged: [],
+      filesChangedUnknown: false,
+      summary: NOTHING_TO_FIX_SUMMARY,
+      runnerId: "test-cli",
+      providerLabel: "Test CLI",
+      storedModelId: "cli:test-model",
+    });
+
+    const persisted = readProgress(folderPath);
+    assert.equal(
+      persisted?.zeroChangeImplRounds,
+      undefined,
+      "a refused round must never advance the streak — it never reached that logic"
+    );
+    assert.equal(persisted?.checklistProgressUnreliable, undefined);
+    assert.equal(
+      run.notifications.some((n) => /plan checklist still has 2 unticked item\(s\)/.test(n.message)),
+      true,
+      "the operator must be told why the round was refused, not just that files did not change"
+    );
+  });
+
+  void it("routes the same round onward when the most recent qualifying review has cleared the stage", async () => {
+    const { folderPath, progress } = makeTaskFolder("item4_routes_with_clearing_review", {
+      reviewScoreHistory: qualifyingHistory,
+    });
+    const run = await runHarnessed(folderPath, progress, {
+      status: "completed",
+      filesChanged: [],
+      filesChangedUnknown: false,
+      summary: NOTHING_TO_FIX_SUMMARY,
+      runnerId: "test-cli",
+      providerLabel: "Test CLI",
+      storedModelId: "cli:test-model",
+    });
+
+    const persisted = readProgress(folderPath);
+    assert.equal(
+      run.notifications.some((n) => /plan checklist still has/.test(n.message)),
+      false,
+      "a clearing review must stand the new gate down, not just the pre-existing latch"
+    );
+    // Standing down routes into the pre-existing under-recording latch this
+    // exact evidence already drives (checklistUnderrecordingConfirmedByReview),
+    // proving the two conditions are complementary rather than fighting.
+    assert.equal(
+      persisted?.checklistProgressUnreliable,
+      true,
+      "the round proceeded far enough to reach the under-recording latch"
+    );
   });
 });
 

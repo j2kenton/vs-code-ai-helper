@@ -1601,7 +1601,10 @@ const VERIFIED_CHECKS_PROMPT_MAX_OUTPUT_CHARS = 1500;
  * explicitly so the reviewer treats it as ground truth rather than another
  * claim to be skeptical of.
  */
-export function buildVerifiedChecksSection(result: CompletionLintResult): string {
+export function buildVerifiedChecksSection(
+  result: CompletionLintResult,
+  reviewedCommitSha?: string
+): string {
   const lines: string[] = [
     "## Verified Checks (ground truth)",
     "",
@@ -1638,6 +1641,22 @@ export function buildVerifiedChecksSection(result: CompletionLintResult): string
   lines.push(`- Last run: ${result.runAt}`);
   if (result.verifiedFolder) {
     lines.push(`- Verified against: ${result.verifiedFolder}`);
+  }
+  // Workflow-robustness Part 6 item 6: these checks ran against the
+  // filesystem (the working tree) at check time, never a checkout of the
+  // `<!-- reviewed-commit: SHA -->` marker this same prompt asks you to
+  // record — the two can disagree (a later commit, or uncommitted edits,
+  // since this run) and previously nothing said so, so a review artifact
+  // could name a passing commit while quoting a failure that was never in
+  // it (or vice versa). Recorded explicitly rather than silently mixing the
+  // two identities.
+  if (reviewedCommitSha) {
+    lines.push(
+      `- These results describe the current WORKING TREE at check time, not a git checkout of the ` +
+        `reviewed commit (${reviewedCommitSha}) recorded below — if the tree changed since that commit ` +
+        "(a later commit, or uncommitted edits), the two can disagree. Both identities are recorded so they " +
+        "can be compared rather than conflated."
+    );
   }
   if (result.missingScripts.length > 0) {
     lines.push(`- Not configured (inconclusive, not passed): ${result.missingScripts.join(", ")}`);

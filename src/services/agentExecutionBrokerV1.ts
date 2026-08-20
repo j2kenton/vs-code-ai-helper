@@ -32,6 +32,7 @@ import {
   AgentTransportExitV1,
   AgentTransportV1,
   BoundedResultWriterV1,
+  classifyNetworkFaultV1,
   maxResponseBytesCeilingForModeV1,
   RawAgentExecutionResultV1,
   SealedResultPayloadV1,
@@ -308,13 +309,20 @@ async function finishInvocation(
   try {
     exit = await transport.invoke(request, writer);
   } catch (error) {
+    // A transport that throws directly (rather than resolving a
+    // `transportFailure` exit) never gets a chance to classify its own
+    // fault — classify defensively here too, so a raw network error thrown
+    // out of `invoke` gets the same item-14 treatment as one a transport
+    // catches and reports itself.
+    const networkFault = classifyNetworkFaultV1(error);
     return {
       kind: "transportFailure",
       code:
         error instanceof Error && error.name.length > 0 && error.name !== "Error"
           ? `transportException.${error.name}`
           : "transportException",
-      responseStarted: writer.bytesWritten > 0,
+      responseStarted: networkFault ? false : writer.bytesWritten > 0,
+      ...(networkFault ? { networkFault: true } : {}),
     };
   }
 
@@ -335,11 +343,18 @@ async function finishInvocation(
       return {
         kind: "transportFailure",
         code: exit.code,
-        responseStarted: writer.bytesWritten > 0,
+        // Item 14: a transport-flagged network fault forces `responseStarted`
+        // false regardless of how many bytes the writer buffered — those
+        // bytes are a truncated fragment of a frame that will never
+        // complete, not partial model output, so they must not make this
+        // failure terminal for fallback purposes. Every other transport
+        // failure keeps the existing byte-count heuristic unchanged.
+        responseStarted: exit.networkFault === true ? false : writer.bytesWritten > 0,
         // Pass the transport's sanitized cause through verbatim. Dropping it
         // here would defeat the point of capturing it: the code alone is what
         // made `copilotRequestFailed` undiagnosable.
         ...(exit.detail !== undefined ? { detail: exit.detail } : {}),
+        ...(exit.networkFault === true ? { networkFault: true } : {}),
       };
   }
 }

@@ -16,6 +16,7 @@ import {
   AgentTransportV1,
   boundedTransportDetailV1,
   BoundedResultWriterV1,
+  classifyNetworkFaultV1,
 } from "../types/agentExecutionV1";
 import { withAttribution, writeTextFile } from "../utils/fileUtils";
 import { classifyFailure } from "../utils/quota";
@@ -85,11 +86,21 @@ export function createCopilotLmTextTransportV1(options: {
         // See the identical site in languageModelToolSessionV1.ts: this was a
         // bare `catch {}`, so whatever `sendRequest` threw was unrecoverable
         // and the run record settled at 74 bytes with nothing but a code.
-        const detail = boundedTransportDetailV1(error);
+        // `sendRequest` relays the upstream provider's own error body
+        // verbatim (observed: a Fireworks-hosted structured JSON payload, a
+        // firewall/HTTP2 message) — the default 200-char bound cut those
+        // mid-sentence, so this site gets a wider allowance.
+        const detail = boundedTransportDetailV1(error, 800);
+        // Item 14: a dropped HTTP/2 connection (net::ERR_HTTP2_PROTOCOL_ERROR,
+        // observed 2026-08-18) is a fault of the pipe, not the model — flag it
+        // so the broker treats it as fallback/retry-eligible even though
+        // `output.write` may already have captured partial fragments above.
+        const networkFault = classifyNetworkFaultV1(error);
         return {
           kind: "transportFailure",
           code: "copilotRequestFailed",
           ...(detail !== undefined ? { detail } : {}),
+          ...(networkFault ? { networkFault: true } : {}),
         };
       }
       if (request.cancellationToken.isCancellationRequested) {

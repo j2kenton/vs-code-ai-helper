@@ -238,6 +238,21 @@ void describe("buildVerifiedChecksSection", () => {
     assert.match(section, /npm run test.*exit 1 \(FAILED\)/);
   });
 
+  // Workflow-robustness Part 6 item 6: these checks run against the working
+  // tree, but the review artifact separately stamps a `reviewed-commit` SHA —
+  // the two can silently disagree unless both identities are recorded
+  // together.
+  void it("states both identities when a reviewed commit is provided", () => {
+    const section = buildVerifiedChecksSection(baseResult({ passed: true }), "abc1234");
+    assert.match(section, /WORKING TREE at check time/);
+    assert.match(section, /reviewed commit \(abc1234\)/);
+  });
+
+  void it("omits the commit disclaimer when no reviewed commit is in scope (e.g. the resume path)", () => {
+    const section = buildVerifiedChecksSection(baseResult({ passed: true }));
+    assert.doesNotMatch(section, /WORKING TREE at check time/);
+  });
+
   void it("reports missing/inconclusive scripts distinctly from failures", () => {
     const result = baseResult({ passed: false, missingScripts: ["test"] });
     const section = buildVerifiedChecksSection(result);

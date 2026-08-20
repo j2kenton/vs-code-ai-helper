@@ -81,8 +81,13 @@ export interface CopilotLmToolSessionOptionsV1 {
  * silent wait into a reported, retryable failure so an unattended Fast Forward
  * loop keeps going instead of parking for hours.
  *
- * This does NOT diagnose the underlying cause; see Item 18's fix 2 for the
- * pre-request boundary marker that would.
+ * This deadline alone does NOT diagnose the underlying cause — it only proves
+ * a round didn't finish in time, not where it got stuck. Item 18 fix 2 (the
+ * `LmToolSessionRequestIssuedV1` marker below, fired synchronously right
+ * after `sendRequest` is called) is what makes that diagnosable: its presence
+ * or absence in the log for a timed-out round tells a later investigation
+ * whether the hang was before `sendRequest` was ever reached, or after the
+ * provider had already accepted the request.
  */
 export const MAX_TOOL_ROUND_WALL_CLOCK_MS_V1 = 6 * 60_000;
 
@@ -183,6 +188,43 @@ export function setLmToolSessionObserverV1(observer: LmToolSessionObserverV1 | u
 function recordLmToolSessionRoundV1(round: LmToolSessionRoundV1): void {
   try {
     lmToolSessionObserverV1?.(round);
+  } catch {
+    // Observation is a side channel; session correctness cannot depend on it.
+  }
+}
+
+/**
+ * One round's pre-request boundary (workflow-6 Item 18, fix 2). Fired the
+ * instant `sendRequest` is called — synchronously, before its Thenable is
+ * awaited — so a later hang investigation can tell "never reached the
+ * provider" (this line is absent) from "the provider accepted the request
+ * and then never answered" (this line is present but the round's own
+ * completion/timeout line never follows). Fix 1's per-round deadline
+ * (`MAX_TOOL_ROUND_WALL_CLOCK_MS_V1` above) already converts that second
+ * case into a reported failure; this marker is what makes the two
+ * distinguishable after the fact, which fix 1 alone does not.
+ */
+export interface LmToolSessionRequestIssuedV1 {
+  /** 1-based round number. */
+  readonly round: number;
+  readonly maxRounds: number;
+}
+
+export type LmToolSessionRequestIssuedObserverV1 = (event: LmToolSessionRequestIssuedV1) => void;
+
+let lmToolSessionRequestIssuedObserverV1: LmToolSessionRequestIssuedObserverV1 | undefined;
+
+/** Wire a sink for the pre-request boundary marker. Same optional-seam pattern as the round observer above. */
+export function setLmToolSessionRequestIssuedObserverV1(
+  observer: LmToolSessionRequestIssuedObserverV1 | undefined
+): void {
+  lmToolSessionRequestIssuedObserverV1 = observer;
+}
+
+/** Report, never affect. A throwing observer must not change session behaviour. */
+function recordLmToolSessionRequestIssuedV1(event: LmToolSessionRequestIssuedV1): void {
+  try {
+    lmToolSessionRequestIssuedObserverV1?.(event);
   } catch {
     // Observation is a side channel; session correctness cannot depend on it.
   }
@@ -327,11 +369,16 @@ export function createCopilotLmToolSessionTransportV1(
           };
         };
         try {
-          const response = await resolved.model.sendRequest(
+          const sendRequestThenable = resolved.model.sendRequest(
             messages,
             requestOptions,
             roundCts.token
           );
+          // Synchronous, before the await below: proves the call actually
+          // reached `vscode.lm`'s request path for this round, independent of
+          // whether the Thenable it returned ever settles.
+          recordLmToolSessionRequestIssuedV1({ round: round + 1, maxRounds });
+          const response = await sendRequestThenable;
           for await (const { part, raw } of iterateLmResponsePartsV1(vscodeModule, response)) {
             assistantRawParts.push(raw);
             if (part.kind === "text") {
@@ -397,7 +444,11 @@ export function createCopilotLmToolSessionTransportV1(
           // `copilotRequestFailed` surfaced with nothing behind it and a
           // prompt-too-large, a quota refusal and a transient API fault were
           // indistinguishable — each needing a different remedy.
-          const detail = boundedTransportDetailV1(error);
+          // `sendRequest` relays the upstream provider's own error body
+          // verbatim (observed: a Fireworks-hosted structured JSON payload,
+          // a firewall/HTTP2 message) — the default 200-char bound cut those
+          // mid-sentence, so this site gets a wider allowance.
+          const detail = boundedTransportDetailV1(error, 800);
           return {
             kind: "transportFailure",
             code: "copilotRequestFailed",

@@ -19,7 +19,6 @@
 import { allocateHex128IdV1 } from "./actionCorrelationV1";
 import { ActionCorrelationV1 } from "./actionCorrelationV1";
 import {
-  ParentChainLinkV1,
   PreflightOperationV1,
   PreflightPlanCompletedV1,
 } from "./aiResultEnvelope";
@@ -127,8 +126,18 @@ function failure(
   return { ok: false, code, reason };
 }
 
+// A NUL byte can never appear in a rootId or a relativePath, so it is a safe
+// join separator for a composite map key. Built via fromCharCode rather than
+// an inline escape literal in source, which is fragile to round-trip through
+// text tooling.
+const TARGET_KEY_SEPARATOR_V1 = String.fromCharCode(0);
+
+function targetKeyOfV1(rootId: string, relativePath: string): string {
+  return rootId + TARGET_KEY_SEPARATOR_V1 + relativePath;
+}
+
 /** Every ancestor between the root (exclusive) and the immediate parent (inclusive), root-to-parent order. */
-function ancestorPathsOf(relativePath: string): string[] {
+export function ancestorPathsOfV1(relativePath: string): string[] {
   const segments = relativePath.split("/");
   segments.pop();
   const ancestors: string[] = [];
@@ -136,6 +145,29 @@ function ancestorPathsOf(relativePath: string): string[] {
     ancestors.push(segments.slice(0, i).join("/"));
   }
   return ancestors;
+}
+
+/**
+ * Reverse lookup: an ancestor directory that already exists is resolved
+ * HOST-SIDE from this attempt's ledger, by exact path — the model no longer
+ * hand-lists it (item 20, 2026-08-20). Only a directory this same plan is
+ * about to CREATE cannot be found here, and must instead carry an explicit
+ * `createdByStep` link.
+ */
+function findAuthorizingDirectoryObservationV1(
+  ledger: ObservationLedgerV1,
+  rootId: string,
+  relativePath: string
+): ObservationRecordV1 | undefined {
+  return ledger
+    .records()
+    .find(
+      (record) =>
+        record.rootId === rootId &&
+        record.relativePath === relativePath &&
+        record.kind === "directory" &&
+        AUTHORIZING_SOURCES_V1.has(record.source)
+    );
 }
 
 /**
@@ -151,6 +183,24 @@ export function validatePreflightPlanAgainstLedgerV1(
   const stepsById = new Map<string, PreflightOperationV1>();
   const seenTargets = new Set<string>();
 
+  // A target may be touched by more than one operation ONLY when every
+  // operation sharing it is a `patchFile` (item 17) — a chained sequence of
+  // region edits whose later touches re-verify and write against the
+  // PREVIOUS patch's own post-write revision at execution time
+  // (editBrokerToolSessionHandlerV1), not the sealed observation. Any other
+  // repeat (a second whole-file write, or a mix) stays rejected: those
+  // primitives have no revision to chain from after the first write lands.
+  const operationsByTargetKey = new Map<string, PreflightOperationV1[]>();
+  for (const eachOperation of plan.operations) {
+    const key = targetKeyOfV1(eachOperation.rootId, eachOperation.relativePath);
+    const group = operationsByTargetKey.get(key);
+    if (group) {
+      group.push(eachOperation);
+    } else {
+      operationsByTargetKey.set(key, [eachOperation]);
+    }
+  }
+
   for (const [index, operation] of plan.operations.entries()) {
     const where = `operation ${index} (${operation.stepId})`;
 
@@ -158,17 +208,23 @@ export function validatePreflightPlanAgainstLedgerV1(
       return failure("rootMismatch", `${where} names root ${JSON.stringify(operation.rootId)}`);
     }
 
-    const targetKey = `${operation.rootId}\u0000${operation.relativePath}`;
+    const targetKey = targetKeyOfV1(operation.rootId, operation.relativePath);
     if (seenTargets.has(targetKey)) {
-      return failure(
-        "duplicateTarget",
-        `${where} targets ${operation.relativePath}, which an earlier operation already targets. ` +
-          "Each operation carries the revision observed during planning, so the second write " +
-          "would use a revision the first one already replaced — combine them into one " +
-          "operation, or leave the rest for the next round."
-      );
+      const group = operationsByTargetKey.get(targetKey) ?? [];
+      const allPatch = group.every((candidate) => candidate.kind === "patchFile");
+      if (!allPatch) {
+        return failure(
+          "duplicateTarget",
+          `${where} targets ${operation.relativePath}, which an earlier operation already targets. ` +
+            "Each operation carries the revision observed during planning, so the second write " +
+            "would use a revision the first one already replaced — combine them into one " +
+            "operation, or leave the rest for the next round. (Two or more patchFile operations " +
+            "on the same file ARE allowed and chain automatically; this mix is not.)"
+        );
+      }
+    } else {
+      seenTargets.add(targetKey);
     }
-    seenTargets.add(targetKey);
 
     const target = ledger.get(operation.targetObservationId);
     if (!target) {
@@ -224,7 +280,7 @@ export function validatePreflightPlanAgainstLedgerV1(
     // A parent chain answers ONE question: will this operation's parent
     // directory exist when the step runs? That is only ever in doubt for a
     // CREATE — the parent may be missing, or be created by an earlier step in
-    // this same plan (`createdByStep`), which is what makes the ordered chain
+    // this same plan (`createdByStep`), which is what makes the chain
     // meaningful there.
     //
     // For an operation on an EXISTING target it is pure redundancy: the target
@@ -240,7 +296,7 @@ export function validatePreflightPlanAgainstLedgerV1(
     const requiresParentChain =
       operation.kind === "createFile" || operation.kind === "createDirectory";
     // Not merely "ignored": an ignored link still reaches the broker, which
-    // re-verifies EVERY link at execution time regardless of kind
+    // re-verifies EVERY ancestor at execution time regardless of kind
     // (editBrokerToolSessionHandlerV1, §7.7 (4)). A link this layer skipped
     // would therefore pass preflight, get sealed, and then block execution as
     // `stalePreflight` — a validated plan failing after the point of no
@@ -254,72 +310,43 @@ export function validatePreflightPlanAgainstLedgerV1(
           "its target observation already proves every ancestor exists"
       );
     }
-    const ancestors = requiresParentChain ? ancestorPathsOf(operation.relativePath) : [];
-    if (requiresParentChain && operation.parentChain.length !== ancestors.length) {
-      return failure(
-        "parentChainMismatch",
-        // Names the ancestors, not just the count. The host derives them from
-        // the path anyway (`ancestors`, just above), so withholding them left
-        // a human reading the run log to re-derive by hand what the validator
-        // already knew — on a failure whose entire content is "you counted
-        // wrong". Third occurrence on 2026-08-19.
-        `${where}'s parent chain has ${operation.parentChain.length} link(s); ` +
-          `${ancestors.length} ancestor(s) required` +
-          (ancestors.length > 0 ? ` (${ancestors.join(", ")})` : "")
+
+    if (requiresParentChain) {
+      const ancestors = ancestorPathsOfV1(operation.relativePath);
+
+      // Ancestors that already exist are resolved HOST-SIDE from the ledger,
+      // by exact path — the model supplies nothing for them (item 20). Only
+      // an ancestor THIS plan is about to create cannot be found this way,
+      // and needs an explicit `createdByStep` link.
+      const unresolvedAncestors = ancestors.filter(
+        (ancestorPath) => !findAuthorizingDirectoryObservationV1(ledger, operation.rootId, ancestorPath)
       );
-    }
-    for (let i = 0; i < ancestors.length; i++) {
-      const ancestorPath = ancestors[i]!;
-      const link: ParentChainLinkV1 = operation.parentChain[i]!;
-      if (link.kind === "observed") {
-        const observed = ledger.get(link.observationId);
-        if (!observed) {
-          return failure("parentChainMismatch", `${where}'s parent link ${i} references an unknown observation`);
-        }
-        // A parent link's job is to prove ONE thing: this ancestor exists and
-        // is a directory. `stat` proves exactly that, and it is already in
-        // AUTHORIZING_SOURCES_V1 — trusted to authorize a mutation on the
-        // operation's own TARGET, a far stronger claim. Requiring a COMPLETE
-        // `readDirectory` here as well was therefore inconsistent, and
-        // expensive in a way that mattered: `apps/server/lib/competition/x.ts`
-        // has four ancestors, so a plan touching six such files demanded ~24
-        // full directory listings (up to MAX_DIRECTORY_ENTRIES_V1 = 2048
-        // entries each), every one re-sent on every later tool round, to prove
-        // nothing a stat had not already proven. Copilot failed a whole round
-        // on it (2026-08-18, `parentChainMismatch` on `apps`).
-        //
-        // What is still enforced, and is the actual safety property: the
-        // observation must come from this attempt's ledger, name the EXACT
-        // ancestor path under the same root, be a directory, and come from an
-        // authorizing source — so a `findFiles`/`textSearch` discovery result
-        // still cannot stand in for a parent proof (§7.2). Completeness
-        // remains required where it carries real meaning:
-        // `deleteEmptyDirectory` above, which needs a full listing to prove
-        // emptiness.
-        if (
-          observed.rootId !== operation.rootId ||
-          observed.relativePath !== ancestorPath ||
-          observed.kind !== "directory" ||
-          !AUTHORIZING_SOURCES_V1.has(observed.source)
-        ) {
+
+      const suppliedStepPathsV1 = new Set<string>();
+      for (const link of operation.parentChain) {
+        if (link.kind !== "createdByStep") {
           return failure(
             "parentChainMismatch",
-            `${where}'s parent link ${i} must be an exact-path directory observation of ${ancestorPath} ` +
-              `(from stat or readDirectory, not a discovery result)`
+            `${where}'s parent chain may only carry createdByStep links now — an ancestor that ` +
+              "already exists is resolved automatically from the observation ledger and must not be listed"
           );
         }
-      } else {
-        // Referential integrity (earlier + createDirectory) was already
-        // enforced by the envelope decoder; the ledger layer must pin the
-        // exact TARGET of that earlier step to this ancestor.
         const earlier = stepsById.get(link.stepId);
         if (!earlier || earlier.kind !== "createDirectory") {
-          return failure("parentChainMismatch", `${where}'s parent link ${i} references a non-createDirectory step`);
+          return failure("parentChainMismatch", `${where}'s parent link references a non-createDirectory step`);
         }
-        if (earlier.rootId !== operation.rootId || earlier.relativePath !== ancestorPath) {
+        if (earlier.rootId !== operation.rootId) {
+          return failure("parentChainMismatch", `${where}'s parent link step targets a different root`);
+        }
+        suppliedStepPathsV1.add(earlier.relativePath);
+      }
+
+      for (const ancestorPath of unresolvedAncestors) {
+        if (!suppliedStepPathsV1.has(ancestorPath)) {
           return failure(
             "parentChainMismatch",
-            `${where}'s parent link ${i} step creates ${earlier.relativePath}, not the required ancestor ${ancestorPath}`
+            `${where} is missing a createdByStep link for ancestor ${ancestorPath} — it does not yet ` +
+              "exist on disk and must be created by an earlier step in this same plan"
           );
         }
       }

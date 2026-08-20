@@ -360,6 +360,60 @@ void describe("agentExecutionBrokerV1", () => {
     });
   });
 
+  /**
+   * Item 14: a transport-flagged network fault (dropped HTTP/2 connection,
+   * DNS failure, TLS handshake failure) forces `responseStarted` false even
+   * though bytes were already written — the pipe broke, not the model, so
+   * those bytes are a truncated frame fragment, not partial output. Every
+   * OTHER transport failure keeps the unchanged byte-count heuristic (see
+   * "streamReset" above, which stays `responseStarted: true`).
+   */
+  void it("treats a flagged network fault as pre-response for fallback purposes, even with partial bytes", async () => {
+    const midResponseNetworkFault = makeFixture();
+    assert.deepEqual(
+      await executeAgentRequestV1(
+        midResponseNetworkFault.request,
+        midResponseNetworkFault.claimed,
+        scriptedTransport((_req, output) => {
+          output.write("partial fragment of a frame that will never complete");
+          return {
+            kind: "transportFailure",
+            code: "copilotRequestFailed",
+            detail: "net::ERR_HTTP2_PROTOCOL_ERROR",
+            networkFault: true,
+          };
+        })
+      ),
+      {
+        kind: "transportFailure",
+        code: "copilotRequestFailed",
+        responseStarted: false,
+        detail: "net::ERR_HTTP2_PROTOCOL_ERROR",
+        networkFault: true,
+      }
+    );
+
+    // A transport that throws a raw network error (rather than resolving a
+    // `transportFailure` exit itself) gets the same treatment, classified
+    // defensively by the broker.
+    const thrownNetworkFault = makeFixture();
+    const thrownResult = await executeAgentRequestV1(thrownNetworkFault.request, thrownNetworkFault.claimed, {
+      runnerId: "scripted-transport",
+      invoke: (_req, output) => {
+        output.write("partial");
+        const err = new Error("socket hang up") as NodeJS.ErrnoException;
+        err.code = "ECONNRESET";
+        return Promise.reject(err);
+      },
+    });
+    assert.deepEqual(thrownResult, {
+      kind: "transportFailure",
+      code: "transportException",
+      responseStarted: false,
+      networkFault: true,
+    });
+  });
+
   void it("rejects invalid UTF-8 output instead of sealing it lossily", async () => {
     const { request, claimed } = makeFixture();
     const result = await executeAgentRequestV1(

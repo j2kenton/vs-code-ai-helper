@@ -23,8 +23,10 @@ import {
   computeEditRequestDigestV1,
   describeEditActionOutcomeFailureV1,
   isEditPreflightActionKeyV1,
+  resolveSealedEditCompletionResultV1,
   runImplementationOrSealedV1,
 } from "../commands/runEditActionV1";
+import { buildSealedEditReportPromptV1 } from "../commands/implContinuationTextDispatchV1";
 import { ProviderChainExhaustionV1, TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
 
 const requireModule = createRequire(__filename);
@@ -577,5 +579,90 @@ void describe("describeEditActionOutcomeFailureV1 (candidatesExhausted vs provid
     const outcome: TaskActionOutcomeV1 = { kind: "cancelled", code: "userCancelled" };
     const result = describeEditActionOutcomeFailureV1(outcome, "copilot-lm");
     assert.equal(result.status, "cancelled");
+  });
+});
+
+// Workflow-robustness Part 5 item 5: a successful sealed edit only ever
+// produces a runner-authored summary (no checklist echo), which used to
+// unconditionally latch `checklistProgressUnreliable`. resolveSealedEditCompletionResultV1
+// decides whether a follow-up text-mode report is trustworthy enough to
+// replace that synthetic summary — tested in isolation since it is pure and
+// the only call site (runSealedImplementationV1's "completed" case) requires
+// the full coordinator/broker pipeline to exercise directly.
+void describe("resolveSealedEditCompletionResultV1 — Part 5 item 5", () => {
+  const CHANGED = ["src/a.ts", "src/b.ts"];
+
+  void it("prefers a clean, edit-free real report over the synthetic summary", () => {
+    const result = resolveSealedEditCompletionResultV1(CHANGED, 3, "copilot-lm", {
+      status: "completed",
+      summary: "## Files Changed\n- src/a.ts\n\n## Verification\n- ok",
+      filesChanged: [],
+      filesChangedUnknown: false,
+    });
+    assert.equal(result.status, "completed");
+    assert.equal(result.summaryIsSynthetic, undefined);
+    assert.match(result.summary ?? "", /## Files Changed/);
+    assert.deepEqual(result.filesChanged, CHANGED);
+  });
+
+  void it("falls back to the synthetic summary when no report was attempted", () => {
+    const result = resolveSealedEditCompletionResultV1(CHANGED, 3, "copilot-lm", undefined);
+    assert.equal(result.status, "completed");
+    assert.equal(result.summaryIsSynthetic, true);
+    assert.match(result.summary ?? "", /Applied 3 sealed edit step\(s\)/);
+    assert.match(result.summary ?? "", /2 file\(s\) changed/);
+  });
+
+  void it("falls back to the synthetic summary when the report run failed", () => {
+    const result = resolveSealedEditCompletionResultV1(CHANGED, 3, "copilot-lm", {
+      status: "failed",
+      filesChanged: [],
+    });
+    assert.equal(result.summaryIsSynthetic, true);
+  });
+
+  void it("falls back when the report text is empty", () => {
+    const result = resolveSealedEditCompletionResultV1(CHANGED, 3, "copilot-lm", {
+      status: "completed",
+      summary: "   ",
+      filesChanged: [],
+      filesChangedUnknown: false,
+    });
+    assert.equal(result.summaryIsSynthetic, true);
+  });
+
+  void it("distrusts a report whose no-edit premise could not be verified (filesChangedUnknown)", () => {
+    const result = resolveSealedEditCompletionResultV1(CHANGED, 3, "copilot-lm", {
+      status: "completed",
+      summary: "## Files Changed\n- none\n\n## Verification\n- ok",
+      filesChanged: [],
+      filesChangedUnknown: true,
+    });
+    assert.equal(result.summaryIsSynthetic, true);
+  });
+
+  void it("distrusts a report that itself changed files", () => {
+    const result = resolveSealedEditCompletionResultV1(CHANGED, 3, "copilot-lm", {
+      status: "completed",
+      summary: "## Files Changed\n- src/a.ts\n\n## Verification\n- ok",
+      filesChanged: ["src/c.ts"],
+      filesChangedUnknown: false,
+    });
+    assert.equal(result.summaryIsSynthetic, true);
+  });
+});
+
+void describe("buildSealedEditReportPromptV1 — Part 5 item 5", () => {
+  void it("appends a report-only notice naming the applied change set, without inviting further edits", () => {
+    const prompt = buildSealedEditReportPromptV1("BASE PROMPT", ["src/a.ts", "src/b.ts"]);
+    assert.match(prompt, /^BASE PROMPT/);
+    assert.match(prompt, /NOT propose or make any further edits/);
+    assert.match(prompt, /- src\/a\.ts/);
+    assert.match(prompt, /- src\/b\.ts/);
+  });
+
+  void it("names an empty change set explicitly rather than leaving the list blank", () => {
+    const prompt = buildSealedEditReportPromptV1("BASE PROMPT", []);
+    assert.match(prompt, /_none recorded_/);
   });
 });

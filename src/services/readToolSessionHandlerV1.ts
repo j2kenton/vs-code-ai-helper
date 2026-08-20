@@ -67,6 +67,39 @@ export interface ReadToolSessionHandlerOptionsV1 {
   readonly ledger: ObservationLedgerV1;
 }
 
+/** One exact-path tool call's target — never content, never a search query
+ * (item 3b-2, 2026-08-17..19 workflow-defects batch). */
+export interface ReadToolCallEventV1 {
+  readonly tool: string;
+  readonly relativePath: string;
+}
+
+export type ReadToolCallObserverV1 = (event: ReadToolCallEventV1) => void;
+
+let readToolCallObserverV1: ReadToolCallObserverV1 | undefined;
+
+/**
+ * Wire a sink for the sanitized read-session transcript: tool name plus
+ * target path only, on every `ensemble_readFile`/`ensemble_stat`/
+ * `ensemble_listDirectory` call. Same optional-seam pattern as
+ * `setLmToolSessionObserverV1` (languageModelToolSessionV1.ts) — before this,
+ * a preflight session that spent real provider spend reading files and then
+ * hit a pre-response transport failure (e.g. a billing-limit exhaustion, item
+ * 3b) left no record at all of which files it had opened.
+ */
+export function setReadToolCallObserverV1(observer: ReadToolCallObserverV1 | undefined): void {
+  readToolCallObserverV1 = observer;
+}
+
+/** Report, never affect. A throwing observer must not change session behaviour. */
+function recordReadToolCallV1(event: ReadToolCallEventV1): void {
+  try {
+    readToolCallObserverV1?.(event);
+  } catch {
+    // Observation is a side channel; session correctness cannot depend on it.
+  }
+}
+
 function errorResult(
   callId: string,
   tool: string,
@@ -121,6 +154,14 @@ export function createReadToolSessionHandlerV1(
       return errorResult(callId, tool, "unknownRoot", "this session exposes a single registered root");
     }
     const relativePath = decoded.input.relativePath;
+    // Item 3b-2 (2026-08-17..19 workflow-defects batch): record which file
+    // was targeted, live, before whatever happens next in the session (a
+    // budget cutoff, a crash, a non-completing outcome further down the
+    // loop). Fired here — the moment the call is known-valid — rather than
+    // batched at session end, so a failed session still leaves a record of
+    // what it read instead of nothing at all. Tool name + path only, never
+    // content (§2.2).
+    recordReadToolCallV1({ tool, relativePath });
 
     if (tool === "ensemble_readFile") {
       const read = await view.readFileBounded(locator(relativePath), MAX_READ_FILE_BYTES_V1);

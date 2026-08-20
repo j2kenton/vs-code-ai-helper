@@ -83,11 +83,17 @@ export type RawAgentExecutionResultV1 =
        * True when any response bytes had already been captured before the
        * failure. Response-started transport failures are terminal for
        * fallback purposes (plan §3.3: "Fallback is limited to pre-response
-       * outcomes").
+       * outcomes") — EXCEPT when `networkFault` is also true (see that
+       * field): a dropped connection's bytes are a truncated fragment of a
+       * frame that will never complete, not partial model output, so this is
+       * forced `false` for a flagged network fault regardless of how many
+       * bytes the writer had already buffered (item 14).
        */
       readonly responseStarted: boolean;
       /** Sanitized cause carried through from the transport — see `AgentTransportExitV1`. */
       readonly detail?: string;
+      /** Carried through from `AgentTransportExitV1.networkFault` — see its doc comment. */
+      readonly networkFault?: boolean;
     }
   | { readonly kind: "overflow" };
 
@@ -128,6 +134,19 @@ export type AgentTransportExitV1 =
        * material — see `boundedTransportDetailV1`.
        */
       readonly detail?: string;
+      /**
+       * True when the transport has classified this failure as a
+       * transport-level network fault (a dropped HTTP/2 connection,
+       * connection reset/abort, DNS failure, TLS handshake failure) rather
+       * than the provider answering with a refusal or partial content
+       * (item 14). This is an explicit signal the transport itself declares
+       * — see `classifyNetworkFaultV1` — never inferred by the broker from
+       * how many bytes had already streamed in. A network fault's bytes are
+       * a truncated frame fragment, not partial model output: the broker
+       * treats a flagged failure as fallback-eligible (pre-response) even
+       * when bytes were already written, and discards them unsealed.
+       */
+      readonly networkFault?: boolean;
     };
 
 /**
@@ -229,6 +248,89 @@ export function boundedTransportDetailV1(error: unknown, maxChars = 200): string
     return undefined;
   }
   return flattened.length > maxChars ? `${flattened.slice(0, maxChars - 1)}…` : flattened;
+}
+
+/**
+ * Node/undici error codes that mean "the pipe broke", not "the server
+ * refused". Matched against a caught `Error`'s own `.code` property (never
+ * its message), so this is a structural check, not a text heuristic.
+ */
+const NETWORK_FAULT_ERROR_CODES_V1 = [
+  "ECONNRESET",
+  "ECONNABORTED",
+  "ECONNREFUSED",
+  "ETIMEDOUT",
+  "EPIPE",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "EPROTO",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "ENETDOWN",
+  "UND_ERR_SOCKET",
+  "UND_ERR_CONNECT_TIMEOUT",
+];
+/** Prefixes of Node's TLS/SSL error codes (e.g. `ERR_TLS_CERT_ALTNAME_INVALID`). */
+const NETWORK_FAULT_ERROR_CODE_PREFIXES_V1 = ["ERR_TLS_", "ERR_SSL_"];
+
+/**
+ * Message substrings for network-level faults reported as plain text rather
+ * than a Node error code — chiefly Chromium/Electron's `net::ERR_*` family,
+ * which is exactly what VS Code's Language Model API surfaces for a dropped
+ * or failed connection (item 14's observed
+ * `net::ERR_HTTP2_PROTOCOL_ERROR`). Deliberately narrow (see the sibling
+ * `TRANSPORT_MARKERS` in `utils/quota.ts` for the same discipline): each
+ * entry names a specific fault class, never a vague phrase like "network
+ * error" that could appear in an unrelated echoed payload.
+ */
+const NETWORK_FAULT_MESSAGE_MARKERS_V1 = [
+  "net::err_http2",
+  "net::err_connection",
+  "net::err_ssl",
+  "net::err_cert",
+  "net::err_name_not_resolved",
+  "net::err_timed_out",
+  "net::err_socket_not_connected",
+  "net::err_network_changed",
+  "net::err_tunnel_connection_failed",
+  "net::err_address_unreachable",
+  "socket hang up",
+];
+
+/**
+ * True when `error` is a transport-level network fault — a dropped HTTP/2
+ * connection, connection reset/abort, DNS failure, or TLS handshake failure
+ * — as opposed to the provider answering (even with a refusal or partial
+ * content). Item 14: this is a property of the pipe, not of the answer, so a
+ * caller uses it to decide whether captured bytes may be trusted as partial
+ * output or must be discarded as a truncated frame fragment.
+ *
+ * Deliberately narrow and structural where possible (`.code` first, then a
+ * short, specific message-marker list) — the same discipline
+ * `isTransportError`/`TRANSPORT_MARKERS` in `utils/quota.ts` documents for
+ * why a broad text heuristic is unsafe here: an opaque provider's error text
+ * can otherwise echo unrelated content.
+ */
+export function classifyNetworkFaultV1(error: unknown): boolean {
+  if (error instanceof Error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (typeof code === "string" && code.length > 0) {
+      const upper = code.toUpperCase();
+      if (
+        NETWORK_FAULT_ERROR_CODES_V1.includes(upper) ||
+        NETWORK_FAULT_ERROR_CODE_PREFIXES_V1.some((prefix) => upper.startsWith(prefix))
+      ) {
+        return true;
+      }
+    }
+  }
+  const message = (
+    error instanceof Error ? error.message : typeof error === "string" ? error : ""
+  ).toLowerCase();
+  if (message.length === 0) {
+    return false;
+  }
+  return NETWORK_FAULT_MESSAGE_MARKERS_V1.some((marker) => message.includes(marker));
 }
 
 /**

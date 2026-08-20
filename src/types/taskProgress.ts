@@ -289,6 +289,20 @@ export interface TaskProgress {
    */
   escalation?: TaskEscalation;
   /**
+   * Durable record of every escalation Fast Forward rode through rather than
+   * aborting for (`ensemble.resilience.fastForwardSurvivesEscalation`, Item
+   * 13, 2026-08-18..20 workflow-defects batch): each entry is a DISTINCT
+   * escalation (identified by its own `at`) that was overridden — not acted
+   * on — so the run could finish its attempt budget. Without this, "an
+   * escalation fired and was overridden" existed only as an in-memory array
+   * surfaced through a single end-of-run notification; a ceiling that
+   * re-fires more than once in one run, or a run whose notification the
+   * operator missed, left no durable trace that anything had been ridden
+   * through at all. Never cleared automatically — append-only, capped at
+   * MAX_OVERRIDDEN_ESCALATIONS (oldest dropped).
+   */
+  overriddenEscalations?: TaskEscalation[];
+  /**
    * Set when a post-implementation type-check (2g) fails on a round that DID
    * change files — a truncated tsc/build error left the tree non-compiling.
    * Surfaced immediately so the round is never handed to a reviewer as if it
@@ -605,6 +619,12 @@ export interface TaskEscalation {
    */
   secondOpinionAttempted?: boolean;
 }
+
+/**
+ * Cap on `TaskProgress.overriddenEscalations` length (oldest entries dropped
+ * first) — same rationale and size as `MAX_REVIEW_REJECTIONS`.
+ */
+export const MAX_OVERRIDDEN_ESCALATIONS = 50;
 
 /**
  * The filename for the task progress tracking file

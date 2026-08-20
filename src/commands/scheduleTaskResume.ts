@@ -148,6 +148,21 @@ export class TaskActionScheduler implements vscode.Disposable {
   private readonly staleRecoveryNotified = new Set<string>();
 
   /**
+   * Tasks whose reclaim this window has already reported as skipped because
+   * the chain guard (`isAutomationChainActive`) is still live — once per
+   * window per task, not once per sweep, mirroring `staleRecoveryNotified`
+   * above. Workflow-6 Item 1: before the guard carried an expiry, a skipped
+   * reclaim here was completely silent — a task could sit with an owed
+   * continuation and `status: active` for hours with no indication that
+   * anything was blocking it (observed 2026-08-17, ~2.5 hours). The guard now
+   * expires on its own (`automationChain.ts`), but a *live* guard blocking a
+   * reclaim is still worth surfacing: if it turns out to be another stranded
+   * process rather than a genuinely in-flight chain, the operator has no way
+   * to tell from silence alone.
+   */
+  private readonly chainGuardSkipNotified = new Set<string>();
+
+  /**
    * Re-arm owed recovery continuations (`implRecovery`, Part 1) that were
    * persisted but never started — the durable half of the deferred-round
    * transition. A `pending` record with no live lease (and the continuation
@@ -199,7 +214,19 @@ export class TaskActionScheduler implements vscode.Disposable {
         recovery.leaseUntil !== undefined &&
         new Date(recovery.leaseUntil).getTime() > this.clock.now();
       if (leaseLive) continue;
-      if (isAutomationChainActive(task.taskFolderPath, IMPL_CONTINUATION_CHAIN_ID_V1)) continue;
+      if (isAutomationChainActive(task.taskFolderPath, IMPL_CONTINUATION_CHAIN_ID_V1, this.clock.now())) {
+        if (!this.chainGuardSkipNotified.has(task.taskFolderPath)) {
+          this.chainGuardSkipNotified.add(task.taskFolderPath);
+          NotificationRouter.showWarning(
+            `⚠️ A pending recovery continuation for "${task.progress.displayName ?? task.progress.taskFolder}" ` +
+              "was not re-dispatched this sweep because its automation chain guard is still held. " +
+              "This is expected while that chain is genuinely in flight; if it persists, the guard " +
+              "will expire on its own and the next sweep will retry."
+          );
+        }
+        continue;
+      }
+      this.chainGuardSkipNotified.delete(task.taskFolderPath);
       const claimed = await this.store.patch(vscode.Uri.file(task.taskFolderPath), (progress) => {
         const record = progress.implRecovery;
         if (!record || record.dispatch !== "pending") return progress;

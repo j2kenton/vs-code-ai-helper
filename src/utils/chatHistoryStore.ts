@@ -422,12 +422,15 @@ function corruptLocator(taskFolderPath: string, canonicalId: string): WorkflowFi
   };
 }
 
-function describeStoreFailure(result: { readonly kind: string; readonly code?: string; readonly errno?: string }): string {
+/** @internal exported so other action rows describe a workflowFileStoreV1
+ * failure identically instead of re-deriving the same formatting. */
+export function describeWorkflowStoreFailureV1(result: { readonly kind: string; readonly code?: string; readonly errno?: string }): string {
   if (result.kind === "unavailable") {
     return `workflow root unavailable (${result.code})`;
   }
   return `${result.code ?? "unknown"}${result.errno ? ` (${result.errno})` : ""}`;
 }
+const describeStoreFailure = describeWorkflowStoreFailureV1;
 
 let diagnosticsChannel: vscode.OutputChannel | undefined;
 function getDiagnosticsChannel(): vscode.OutputChannel {

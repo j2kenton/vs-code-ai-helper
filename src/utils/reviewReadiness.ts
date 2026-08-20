@@ -323,6 +323,39 @@ export function parseReviewBlockers(content: string): ReviewBlocker[] {
 }
 
 /**
+ * File-path-shaped tokens named inside a set of blocker descriptions —
+ * e.g. `` `src/foo/bar.ts` `` or `` `apps/server/lib/split.test.ts:292` ``.
+ * Used to prioritise a review's context pack toward the files a standing
+ * blocker actually names, so they are the last thing truncated or omitted
+ * rather than an arbitrary casualty of tracked-file ordering (see item 15
+ * fix 4, resources/prompts/review-scoring-rubric.md's truncation guidance).
+ *
+ * Deliberately conservative: only matches backtick-quoted spans that look
+ * like a relative path with an extension (optionally suffixed with
+ * `:line` or `:line-line`), and strips a trailing line reference before
+ * returning — the pack's tracked-file list is keyed on bare relative
+ * paths. A description with no such span contributes nothing; this is a
+ * best-effort prioritisation hint, not a parser that must find every
+ * mention.
+ */
+const BACKTICK_PATH_RE = /`([\w./-]+\.[\w]+)(?::\d+(?:-\d+)?)?`/g;
+
+export function extractBlockerNamedPathsV1(
+  blockers: ReadonlyArray<ReviewBlocker>
+): Set<string> {
+  const paths = new Set<string>();
+  for (const blocker of blockers) {
+    for (const match of blocker.description.matchAll(BACKTICK_PATH_RE)) {
+      const path = match[1];
+      if (path) {
+        paths.add(path.replace(/\\/g, "/"));
+      }
+    }
+  }
+  return paths;
+}
+
+/**
  * Result of {@link parseReviewBlockersDetailed}: the parsed blockers plus
  * whether the machine-readable block was PRESENT at all. The distinction
  * matters because an empty array is ambiguous on its own — "the reviewer

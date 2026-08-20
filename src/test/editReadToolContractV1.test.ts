@@ -12,7 +12,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
 import { createWorkflowFileStoreV1 } from "../services/workflowFileStoreV1";
-import { createReadToolSessionHandlerV1 } from "../services/readToolSessionHandlerV1";
+import {
+  createReadToolSessionHandlerV1,
+  ReadToolCallEventV1,
+  setReadToolCallObserverV1,
+} from "../services/readToolSessionHandlerV1";
 import { createObservationLedgerV1 } from "../types/preflightPlanV1";
 import { ReadToolResultV1 } from "../types/workflowToolProtocolV1";
 import { RequestLocalToolHandlerV1 } from "../services/requestLocalToolHandlerV1";
@@ -178,6 +182,63 @@ void describe("editReadToolContractV1 — read session", () => {
         assert.equal(escape.code, "pathUnsafe");
       }
     } finally {
+      h.cleanup();
+    }
+  });
+
+  // Item 3b-2 (2026-08-17..19 workflow-defects batch): a preflight/read
+  // session must leave a sanitized transcript of which files it targeted —
+  // tool name plus path, never content — even when the session goes on to
+  // fail for an unrelated reason later. The observer fires live, at call
+  // time, specifically so a later failure cannot suppress an earlier record.
+  void it("reports tool name and target path to the read-call observer, live per call, never content", async () => {
+    const h = installHarness();
+    const events: ReadToolCallEventV1[] = [];
+    setReadToolCallObserverV1((event) => events.push(event));
+    try {
+      await h.call("ensemble_readFile", { rootId: ROOT_ID, relativePath: "src/app.ts" });
+      await h.call("ensemble_stat", { rootId: ROOT_ID, relativePath: "empty" });
+      await h.call("ensemble_readDirectory", { rootId: ROOT_ID, relativePath: "empty" });
+      assert.deepEqual(events, [
+        { tool: "ensemble_readFile", relativePath: "src/app.ts" },
+        { tool: "ensemble_stat", relativePath: "empty" },
+        { tool: "ensemble_readDirectory", relativePath: "empty" },
+      ]);
+      assert.ok(
+        events.every((event) => !("content" in event) && !("contentUtf8" in event)),
+        "the observer's event shape must never carry file content"
+      );
+    } finally {
+      setReadToolCallObserverV1(undefined);
+      h.cleanup();
+    }
+  });
+
+  void it("still reports the target path to the observer when the call itself fails (invalid root)", async () => {
+    const h = installHarness();
+    const events: ReadToolCallEventV1[] = [];
+    setReadToolCallObserverV1((event) => events.push(event));
+    try {
+      // A decode failure (missing relativePath) never reaches a known path,
+      // so nothing is reported — there is no target to record.
+      await h.call("ensemble_stat", { rootId: ROOT_ID });
+      assert.deepEqual(events, []);
+    } finally {
+      setReadToolCallObserverV1(undefined);
+      h.cleanup();
+    }
+  });
+
+  void it("a throwing observer never breaks the session (report, never affect)", async () => {
+    const h = installHarness();
+    setReadToolCallObserverV1(() => {
+      throw new Error("observer boom");
+    });
+    try {
+      const read = await h.call("ensemble_readFile", { rootId: ROOT_ID, relativePath: "src/app.ts" });
+      assert.equal(read.ok, true);
+    } finally {
+      setReadToolCallObserverV1(undefined);
       h.cleanup();
     }
   });

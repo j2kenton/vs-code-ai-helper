@@ -106,6 +106,29 @@ function skipFilteredChainOf(
 }
 
 /**
+ * Whether a stage has any configured candidate at all — a primary or backup
+ * model id present in settings, REGARDLESS of its enabled flag. Distinct from
+ * `skipFilteredChainOf(...).primary`, which is undefined both when nothing
+ * was ever configured AND when everything configured was explicitly
+ * disabled; this helper tells those two apart.
+ */
+function hasAnyConfiguredCandidate(setting: StageModelSetting | undefined): boolean {
+  if (!setting) {
+    return false;
+  }
+  if (typeof setting.primary === "string" && setting.primary.trim().length > 0) {
+    return true;
+  }
+  if (typeof setting.backup === "string" && setting.backup.trim().length > 0) {
+    return true;
+  }
+  return (
+    Array.isArray(setting.backups) &&
+    setting.backups.some((model) => typeof model === "string" && model.trim().length > 0)
+  );
+}
+
+/**
  * The single, central resolver for "which model chain does this stage
  * actually run with". Synchronous and settings-only: it reads exclusively
  * from getModelSettings() output (which already folds in the legacy
@@ -119,6 +142,15 @@ function skipFilteredChainOf(
  *     = GENERAL_MODEL_STAGE) — so a blank, cleared, or fully-skipped stage
  *     is never silently unresolvable;
  *  3. nothing configured anywhere (`source: "none"`).
+ *
+ * Item 11 (2026-08-18, runs 060/061): tier 2 must trigger only when the
+ * stage has NOTHING configured at all — not when the stage has a primary and
+ * backups that the user explicitly disabled one by one. A fully-disabled
+ * stage is a deliberate "run nothing here" signal; silently substituting the
+ * general model's chain overrides that choice and was observed reaching
+ * Copilot on a stage where every entry (impl's primary and every backup) was
+ * off. `hasAnyConfiguredCandidate` distinguishes "genuinely blank" from
+ * "configured, all disabled" so only the former falls through to general.
  *
  * Skip filtering lives ONLY here (and in the identical per-stage helper
  * above): `getBackupModels` in modelFallback.ts stays raw, and
@@ -137,7 +169,7 @@ export function resolveEffectiveStageChainV1(stage: TaskStage): EffectiveStageCh
       strategy: settings[stage]?.strategy,
     };
   }
-  if (stage !== GENERAL_MODEL_STAGE) {
+  if (stage !== GENERAL_MODEL_STAGE && !hasAnyConfiguredCandidate(settings[stage])) {
     const general = skipFilteredChainOf(settings[GENERAL_MODEL_STAGE]);
     if (general.primary) {
       return {

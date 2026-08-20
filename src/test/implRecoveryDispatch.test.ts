@@ -230,4 +230,60 @@ void describe("implRecovery dispatch sweep (restart semantics)", () => {
     await harness.armAll();
     assert.equal(harness.dispatches.length, 0);
   });
+
+  void describe("workflow-6 Item 1: the automation chain guard", () => {
+    void it("skips the reclaim while the chain guard is live, surfacing it once per window", async () => {
+      // The reclaimer at scheduleTaskResume.ts's armPendingImplRecoveries
+      // consults isAutomationChainActive before re-dispatching. A live guard
+      // must still skip the reclaim (a genuinely in-flight chain must not be
+      // double-dispatched) — but before this fix the skip was completely
+      // silent, and was the exact mechanism that let a completed run's
+      // rejected continuation sit idle for ~2.5 hours (2026-08-17).
+      const harness = makeHarness(makeProgress(pendingRecord()));
+      active = harness;
+      const originalIsActive = automationChainModule.isAutomationChainActive;
+      automationChainModule.isAutomationChainActive = (): boolean => true;
+      try {
+        await harness.armAll();
+        assert.equal(harness.dispatches.length, 0, "a live guard must still block the reclaim");
+        const skipNotices = harness.notifications.filter((message) =>
+          /automation chain guard is still held/.test(message)
+        );
+        assert.equal(skipNotices.length, 1, "the skip must be surfaced");
+
+        // A second sweep while the guard is still live must not spam a
+        // second notification — same once-per-window rule as the sibling
+        // "dispatched" surfacing test above.
+        await harness.armAll();
+        assert.equal(
+          harness.notifications.filter((message) => /automation chain guard is still held/.test(message)).length,
+          1
+        );
+      } finally {
+        automationChainModule.isAutomationChainActive = originalIsActive;
+      }
+    });
+
+    void it("re-arms once the chain guard clears (or expires) without needing a window reload", async () => {
+      const harness = makeHarness(makeProgress(pendingRecord()));
+      active = harness;
+      const originalIsActive = automationChainModule.isAutomationChainActive;
+      let guardActive = true;
+      automationChainModule.isAutomationChainActive = (): boolean => guardActive;
+      try {
+        await harness.armAll();
+        assert.equal(harness.dispatches.length, 0);
+
+        // The guard clears (released normally, or — the point of this item —
+        // expired on its own after a crash). The very next sweep must
+        // re-dispatch without any special reset step.
+        guardActive = false;
+        await harness.armAll();
+        assert.equal(harness.dispatches.length, 1);
+        assert.equal(harness.dispatches[0]?.chainId, "impl-continuation");
+      } finally {
+        automationChainModule.isAutomationChainActive = originalIsActive;
+      }
+    });
+  });
 });
