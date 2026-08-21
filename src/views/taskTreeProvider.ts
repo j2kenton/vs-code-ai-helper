@@ -512,12 +512,12 @@ export class StageNode extends vscode.TreeItem {
           // readiness icon (thumbsup/question/thumbsdown) would make completed
           // stages visually ambiguous after a refresh — the acceptance criterion
           // for reliable completed-stage ticks requires the tick to be
-          // unconditional for the "done" state.
+          // unconditional for the "done" state. No "done" description text:
+          // the tick already conveys the status (same rule as TaskNode rows).
           this.iconPath = new vscode.ThemeIcon(
             "check",
             new vscode.ThemeColor("charts.green")
           );
-          this.description = "done";
           break;
         case "current": {
           // The current-stage icon is always the plain horizontal arrow,
@@ -537,23 +537,27 @@ export class StageNode extends vscode.TreeItem {
           // bug). A missing/malformed marker renders exactly the pre-existing
           // score-only output. A review whose recorded commit is no longer
           // HEAD carries a "stale" qualifier so its score stops reading as a
-          // verdict on the current workspace.
+          // verdict on the current workspace. No "current" status word in the
+          // text — the arrow icon already says that; only information the
+          // icon cannot carry (score/steps, staleness, escalation) renders.
           const staleSuffix = readiness?.staleReviewedSha ? " · stale" : "";
           const readinessLabel = readiness
             ? (readiness.progress
                 ? `${readiness.label} · ${readiness.progress.complete} of ${readiness.progress.total} steps`
                 : readiness.label) + staleSuffix
             : undefined;
-          const base = readinessLabel ? `current · ${readinessLabel}` : "current";
-          this.description = escalated ? `${base} · escalated` : base;
+          this.description = readinessLabel
+            ? (escalated ? `${readinessLabel} · escalated` : readinessLabel)
+            : (escalated ? "escalated" : undefined);
           break;
         }
         case "outstanding":
+          // No "outstanding" description text — the hollow-circle icon
+          // already conveys the status.
           this.iconPath = new vscode.ThemeIcon(
             "circle-large-outline",
             new vscode.ThemeColor("disabledForeground")
           );
-          this.description = "outstanding";
           break;
       }
     }

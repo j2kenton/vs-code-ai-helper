@@ -359,27 +359,24 @@ void describe("StageNode — done review stage icon", () => {
     assert.strictEqual(icon.id, "arrow-right");
   });
 
-  void it('has description "done" for a done review stage with readiness', () => {
+  void it("has no status description for a done review stage — the tick icon conveys it", () => {
     const task = makeTask("impl");
     const readiness = { label: "7/10" };
     const node = new StageNode(task, "plan-low-review", "done", undefined, readiness);
 
     assert.strictEqual(
       node.description,
-      "done",
-      `Expected description "done" for done review stage, got "${node.description}"`
+      undefined,
+      `Expected no description for a done review stage, got "${node.description}"`
     );
   });
 
-  void it('has description including "current" for a current review stage with readiness', () => {
+  void it('renders the readiness label without the "current" status word for a current review stage', () => {
     const task = makeTask("plan-low-review");
     const readiness = { label: "4/10" };
     const node = new StageNode(task, "plan-low-review", "current", undefined, readiness);
 
-    assert.ok(
-      String(node.description).includes("current"),
-      `Expected description to include "current", got "${node.description}"`
-    );
+    assert.strictEqual(node.description, "4/10");
   });
 });
 
@@ -926,7 +923,7 @@ void describe("StageNode — review score and step progress", () => {
       assert.deepEqual(readiness.progress, { complete: 1, total: 5 });
 
       const node = new StageNode(makeTask("impl-high-review"), "impl-high-review", "current", reviewUri, readiness);
-      assert.strictEqual(node.description, "current · 9/10 · 1 of 5 steps");
+      assert.strictEqual(node.description, "9/10 · 1 of 5 steps");
       const tooltip = (node.tooltip as vscode.MarkdownString).value;
       assert.ok(tooltip.includes("Review score: 9/10"), "score line leads the tooltip block");
       assert.ok(tooltip.includes("\n\n---\n\n"), "a divider sits between score and progress");
@@ -944,7 +941,7 @@ void describe("StageNode — review score and step progress", () => {
       assert.equal(readiness.progress, undefined);
 
       const node = new StageNode(makeTask("impl-high-review"), "impl-high-review", "current", reviewUri, readiness);
-      assert.strictEqual(node.description, "current · 9/10");
+      assert.strictEqual(node.description, "9/10");
       const tooltip = (node.tooltip as vscode.MarkdownString).value;
       assert.ok(!tooltip.includes("steps completed"), "no progress block without a marker");
     } finally {
@@ -960,7 +957,7 @@ void describe("StageNode — review score and step progress", () => {
       assert.equal(readiness.progress, undefined, "a nonsensical marker parses to no progress");
 
       const node = new StageNode(makeTask("impl-high-review"), "impl-high-review", "current", reviewUri, readiness);
-      assert.strictEqual(node.description, "current · 9/10");
+      assert.strictEqual(node.description, "9/10");
     } finally {
       restore();
     }
@@ -987,7 +984,7 @@ void describe("StageNode — review score and step progress", () => {
       );
 
       const node = new StageNode(makeTask("impl-high-review"), "impl-high-review", "current", reviewUri, readiness);
-      assert.strictEqual(node.description, "current · 9/10 · 2 of 5 steps");
+      assert.strictEqual(node.description, "9/10 · 2 of 5 steps");
       assert.ok(!String(node.description).includes("5 of 5"));
       assert.ok((node.tooltip as vscode.MarkdownString).value.includes("2 of 5 steps completed"));
     } finally {
@@ -1012,7 +1009,7 @@ void describe("StageNode — review score and step progress", () => {
       assert.deepEqual(readiness.progress, { complete: 3, total: 5 });
 
       const node = new StageNode(makeTask("plan-high-review"), "plan-high-review", "current", planReviewUri, readiness);
-      assert.strictEqual(node.description, "current · 8/10 · 3 of 5 steps");
+      assert.strictEqual(node.description, "8/10 · 3 of 5 steps");
     } finally {
       restore();
     }
