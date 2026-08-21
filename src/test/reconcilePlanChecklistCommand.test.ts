@@ -32,6 +32,8 @@ import { after, describe, it } from "node:test";
 import * as vscode from "vscode";
 
 import {
+  applyReconciliationReviewVerifiedTicksConfirmedV1,
+  applyReconciliationReviewVerifiedTicksV1,
   postReconcilePlanChecklistDecisionV1,
   reconcilePlanChecklist,
   reconcilePlanChecklistConfirmedV1,
@@ -485,6 +487,117 @@ void describe("reconcilePlanChecklist — confirmation", () => {
 });
 
 // ---------------------------------------------------------------------------
+// 3a. applyReconciliationReviewVerifiedTicksConfirmedV1 (plan Part 4, NINTH
+//     review round): review-verified evidence a synthetic round's automatic
+//     reconciliation pass finds is a CANDIDATE, never an automatic tick.
+//     This command is the only way to promote it — presents nothing on its
+//     own (the "Apply N Reviewer-Verified Tick(s)" option in the reconcile
+//     decision is the presentation surface, covered above); this covers the
+//     command's own effect: it ticks exactly the review-verified items,
+//     never more, and never touches the checklistProgressUnreliable latch by
+//     itself.
+// ---------------------------------------------------------------------------
+
+const REVIEW_NAMING_VERIFIED_ITEM = [
+  "Readiness: 9/10",
+  "",
+  "<!-- verified-complete:start -->",
+  "- Wire the completeness gate",
+  "<!-- verified-complete:end -->",
+  "",
+].join("\n");
+
+void describe("applyReconciliationReviewVerifiedTicksV1 / applyReconciliationReviewVerifiedTicksConfirmedV1", () => {
+  void it("does nothing and reports noCandidates when no review names an unticked item verified complete", async () => {
+    const { folder } = makeTask("apply-recon-none", { latched: true });
+    const workspace = installWorkspaceFolders();
+    const fs = installRealFs();
+    try {
+      const result = await applyReconciliationReviewVerifiedTicksV1(vscode.Uri.file(folder));
+      assert.equal(result.kind, "noCandidates");
+      assert.equal(
+        nodeFs.readFileSync(nodePath.join(folder, "plan-final.md"), "utf8"),
+        CHECKLIST_PLAN,
+        "nothing is written when there is nothing to apply"
+      );
+    } finally {
+      fs.restore();
+      workspace.restore();
+    }
+  });
+
+  void it("ticks exactly the review-verified item and leaves the latch untouched — a synthetic round's candidate is not applied until this explicit selection", async () => {
+    const { folder } = makeTask("apply-recon-candidate", { latched: true });
+    nodeFs.writeFileSync(
+      nodePath.join(folder, "impl-high-review.md"),
+      REVIEW_NAMING_VERIFIED_ITEM,
+      "utf8"
+    );
+    const workspace = installWorkspaceFolders();
+    const fs = installRealFs();
+    try {
+      // Before selection: the item stays unticked (this is exactly the
+      // "candidatesFound" shape `runAutomaticChecklistReconciliationV1`
+      // reports — presented, never applied on its own).
+      const before = nodeFs.readFileSync(nodePath.join(folder, "plan-final.md"), "utf8");
+      assert.match(before, /- \[ \] Wire the completeness gate/);
+
+      const result = await applyReconciliationReviewVerifiedTicksV1(vscode.Uri.file(folder));
+      assert.deepEqual(result, { kind: "applied", count: 1 });
+
+      const after = nodeFs.readFileSync(nodePath.join(folder, "plan-final.md"), "utf8");
+      assert.match(after, /- \[x\] Wire the completeness gate/);
+
+      // Applying ticks is a separate act from attesting the checklist is a
+      // complete record — the latch stays set until an explicit "Mark
+      // reconciled" (plan Part 4: "the explicit human confirmation is
+      // deliberate and correct").
+      assert.equal(
+        readProgress(folder).checklistProgressUnreliable,
+        true,
+        "applying candidate ticks must not by itself clear checklistProgressUnreliable"
+      );
+    } finally {
+      fs.restore();
+      workspace.restore();
+    }
+  });
+
+  void it("the confirmed command wrapper applies the same tick and refreshes the inventory", async () => {
+    const name = "apply-recon-command";
+    const { folder, progress } = makeTask(name, { latched: true });
+    nodeFs.writeFileSync(
+      nodePath.join(folder, "impl-high-review.md"),
+      REVIEW_NAMING_VERIFIED_ITEM,
+      "utf8"
+    );
+    const canonicalId = `canonical-${name}`;
+    const { inventory, refreshCount } = makeInventory(canonicalId, folder, progress);
+    const workspace = installWorkspaceFolders();
+    const fs = installRealFs();
+    const win = installWindowStub({});
+    try {
+      await applyReconciliationReviewVerifiedTicksConfirmedV1(
+        inventory,
+        makeStore(canonicalId),
+        { canonicalId, taskFolderPath: folder } as never
+      );
+      const after = nodeFs.readFileSync(nodePath.join(folder, "plan-final.md"), "utf8");
+      assert.match(after, /- \[x\] Wire the completeness gate/);
+      assert.equal(refreshCount(), 1);
+      assert.match(
+        win.captured.find((m) => m.method === "info")?.message ?? "",
+        /Applied 1 reviewer-verified tick/
+      );
+    } finally {
+      win.restore();
+      fs.restore();
+      workspace.restore();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // 3b. Evidence surfaced for the case-4 judgement (task: "Replace hidden
 //     notification decision buttons with explained, selectable decisions",
 //     PART 4) — the decision must show, alongside the raw counts, the
@@ -567,11 +680,26 @@ void describe("reconcilePlanChecklist — evidence for the case-4 judgement", ()
       const roundClaim = decision.evidence!.find((e) => e.label === "Round-summary checklist claims")!;
       assert.match(roundClaim.detail, /Not available for this invocation/);
 
-      // Every unchecked item is covered by a review verdict, so the
-      // recommendation must favor reconciling rather than staying silent.
+      // Every unchecked item is named verified complete by a review, but
+      // (2026-08-21 NINTH review round) that is a CANDIDATE for explicit
+      // selection, not an automatic tick — the recommendation must favor
+      // applying those ticks (monotonic, text-matched, reuses
+      // applyReviewerVerifiedTicks's own merge primitives), not "Mark
+      // reconciled" directly, which would clear the flag while leaving the
+      // verified-complete item sitting unticked.
       assert.equal(decision.recommendation.kind, "option");
       if (decision.recommendation.kind === "option") {
-        assert.equal(decision.recommendation.optionId, "reconcile");
+        assert.equal(decision.recommendation.optionId, "applyVerifiedTicks");
+      }
+      const applyOption = decision.options.find((o) => o.optionId === "applyVerifiedTicks");
+      assert.ok(applyOption, "an Apply Reviewer-Verified Tick(s) option must be offered");
+      assert.match(applyOption.label, /Apply 1 Reviewer-Verified Tick/);
+      assert.equal(applyOption.effect.kind, "command");
+      if (applyOption.effect.kind === "command") {
+        assert.equal(
+          applyOption.effect.command,
+          "vs-code-ai-helper.applyReconciliationReviewVerifiedTicksConfirmed"
+        );
       }
     } finally {
       win.restore();

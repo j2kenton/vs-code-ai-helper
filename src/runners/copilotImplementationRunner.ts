@@ -483,6 +483,26 @@ export interface ImplementationRunResult {
    * empty filesChanged as "nothing changed".
    */
   filesChangedUnknown?: boolean;
+  /**
+   * The sealed edit pipeline's own per-step applied evidence (workflow 8,
+   * item 2 / plan Part 4) — kind + path + a text excerpt of what the step
+   * actually wrote (`contentExcerpt`, added 2026-08-21 THIRD review round —
+   * see `SealedAppliedOperationV1.contentExcerpt`'s doc comment) for each
+   * step that actually applied, distinct from the deduplicated `filesChanged`
+   * set (item 3, plan Part 5). Only the sealed two-phase pipeline
+   * (`runSealedImplementationV1`) ever sets this; a model-authored
+   * implementation round (Copilot LM tool-call loop or CLI) leaves it
+   * undefined, since it has no structured per-step receipts to report.
+   * Consumed by `runAutomaticChecklistReconciliationV1` as tier-2 evidence:
+   * an unticked plan item is surfaced as a candidate from this alone,
+   * WITHOUT a review, only when every file path it names inline was touched
+   * by an operation here AND (for any non-deletion coverage) the item's own
+   * content-check tokens are corroborated by the covering step(s)'
+   * `contentExcerpt` — a narrower, explicitly lower-confidence tier than a
+   * review's judgement, and NEVER ticked automatically (2026-08-21 EIGHTH
+   * review round) — see that function's own doc comment.
+   */
+  appliedOperations?: readonly { kind: string; path: string; contentExcerpt?: string }[];
   /** Markdown summary text returned for logs/user feedback after a completed run */
   summary?: string;
   /**

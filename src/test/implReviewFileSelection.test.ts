@@ -2,9 +2,17 @@ import * as assert from "node:assert/strict";
 import { test } from "node:test";
 import {
   applyContentCaps,
+  applyContentCapsWithPagingV1,
+  applyContentCapsWithRegionsV1,
+  buildChangedRegionsStanzaV1,
+  buildOversizedFilePagingStanzaV1,
+  extractLineRangesExcerptV1,
   IMPL_REVIEW_MAX_TOTAL_CHARS,
+  IMPL_REVIEW_TRUNCATED_FILE_MAX_CHARS,
   isMachineMaintainedArtifactPathV1,
   mapSourceToTestPath,
+  mergeAndExpandLineRangesV1,
+  parseUnifiedDiffHunkRangesV1,
 } from "../utils/implReviewFileSelection";
 import { MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1 } from "../types/chatInteractionTransactionV1";
 
@@ -252,4 +260,262 @@ void test("total embed cap stays anchored under the chat-transaction input snaps
     `IMPL_REVIEW_MAX_TOTAL_CHARS=${IMPL_REVIEW_MAX_TOTAL_CHARS} no longer fits inside the ` +
       `${MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1}-byte transaction cap with the observed fixed overhead`
   );
+});
+
+// ---------------------------------------------------------------------------
+// applyContentCapsWithPagingV1 — workflow findings round 8, item 1: replaces
+// the flat 8 KB head-sample. This legacy entry point always supplies no
+// changed-region baseline, so every over-threshold file gets a deterministic
+// paging-window stanza rather than a misleading "changed regions" label or,
+// as before this round, a raised-cap head-slice. See the
+// applyContentCapsWithRegionsV1 section below for the changed-region-excerpt
+// path exercised when a real git diff baseline IS available.
+// ---------------------------------------------------------------------------
+
+void test("small tier: a file within the truncated-file cap is inlined whole, untruncated", () => {
+  const content = "x".repeat(500);
+  const [result] = applyContentCapsWithPagingV1([{ relPath: "small.ts", content }]);
+  assert.equal(result!.content, content);
+  assert.equal(result!.truncated, false);
+  assert.equal(result!.isOversizedStanza, false);
+});
+
+void test("medium tier with no baseline: a file just over the inline-whole cap is never head-sliced — it gets a stanza", () => {
+  // Workflow findings round 8 implementation review flagged the previous
+  // behavior here (a raised-cap head-slice) as still a head-sample. With no
+  // changedRanges supplied (applyContentCapsWithPagingV1's legacy no-baseline
+  // path), even a file only modestly over the cap must get an honest stanza,
+  // never a partial slice of its real text.
+  const content = "y".repeat(IMPL_REVIEW_TRUNCATED_FILE_MAX_CHARS + 5000);
+  const [result] = applyContentCapsWithPagingV1([{ relPath: "medium.ts", content }]);
+  assert.equal(result!.isOversizedStanza, true);
+  assert.ok(result!.content, "must still get stanza content, not omission");
+  assert.ok(
+    !result!.content.includes("y".repeat(100)),
+    "must never contain a slice of the file's real text"
+  );
+  assert.equal(result!.truncated, false, "a stanza is not a 'truncated' excerpt");
+});
+
+void test("oversized tier: a file over the inline-whole cap never appears as a head-sample", () => {
+  const content = "z".repeat(IMPL_REVIEW_TRUNCATED_FILE_MAX_CHARS * 3);
+  const [result] = applyContentCapsWithPagingV1([{ relPath: "huge.ts", content }]);
+  assert.equal(result!.isOversizedStanza, true);
+  assert.ok(result!.content, "an oversized file must still get stanza content, not omission");
+  assert.ok(
+    !result!.content.includes("z".repeat(100)),
+    "the stanza must never contain a slice of the file's real text"
+  );
+  assert.ok(
+    result!.content.length < IMPL_REVIEW_TRUNCATED_FILE_MAX_CHARS,
+    "a stanza must cost far less budget than even the inline-whole cap"
+  );
+});
+
+void test("oversized tier stanza names deterministic paging windows, never 'changed regions'", () => {
+  // 4000 lines at ~10 chars each — comfortably over the oversized threshold.
+  const content = Array.from({ length: 4000 }, (_, i) => `line ${i}`).join("\n");
+  const stanza = buildOversizedFilePagingStanzaV1("big.ts", content);
+  assert.ok(stanza.includes("lines 1-400"), "must name deterministic line-range windows");
+  assert.ok(!/changed region/i.test(stanza), "must never claim these are diff-derived changed regions");
+  assert.ok(stanza.includes("big.ts"));
+  assert.ok(/\d[\d,]* bytes/.test(stanza), "must report the file's real byte size");
+});
+
+void test("oversized stanza covers every window up to the listed cap without gaps", () => {
+  const content = Array.from({ length: 2000 }, (_, i) => `line ${i}`).join("\n");
+  const stanza = buildOversizedFilePagingStanzaV1("mid.ts", content);
+  assert.ok(stanza.includes("lines 1-400"));
+  assert.ok(stanza.includes("lines 401-800"));
+  assert.ok(stanza.includes("lines 1601-2000"), "the final partial window must reach the true last line");
+});
+
+void test("aggregate size: several oversized files stay well under the total budget", () => {
+  const files = Array.from({ length: 10 }, (_, i) => ({
+    relPath: `pkg/big-${i}.ts`,
+    content: "w".repeat(IMPL_REVIEW_TRUNCATED_FILE_MAX_CHARS + 50000),
+  }));
+  const results = applyContentCapsWithPagingV1(files);
+  const totalChars = results.reduce((sum, r) => sum + (typeof r.content === "string" ? r.content.length : 0), 0);
+  assert.ok(
+    totalChars < IMPL_REVIEW_MAX_TOTAL_CHARS,
+    "ten oversized files' stanzas together must still fit comfortably under the total pack budget"
+  );
+  assert.ok(
+    results.every((r) => r.isOversizedStanza),
+    "every file here was constructed oversized and must be stanza-represented, not omitted"
+  );
+});
+
+void test("acceptance: a ~163 KB file (cliAgentRunner.ts scale) gets a bounded paging stanza covering it fully", () => {
+  // Mirrors the field capture: a real 162,855-byte file the reviewer could
+  // only see 5% of. ~4200 lines at ~39 chars/line ≈ 163 KB.
+  const lineText = "  const someIdentifier = someExpression(argumentOne, argumentTwo);";
+  const totalLines = 4200;
+  const content = Array.from({ length: totalLines }, () => lineText).join("\n");
+  assert.ok(Buffer.byteLength(content, "utf8") > 160_000, "fixture must be ~163 KB to mirror the field capture");
+
+  const [result] = applyContentCapsWithPagingV1([{ relPath: "src/runners/cliAgentRunner.ts", content }]);
+  assert.equal(result!.isOversizedStanza, true, "a 163 KB file must never be shown as a partial head-sample");
+  const stanza = result!.content as string;
+  // The last listed (or noted) window must reach the file's true final line
+  // — the reviewer's paging plan must cover the whole file, not just the
+  // first IMPL_REVIEW_MAX_PAGING_WINDOWS_LISTED windows' worth.
+  assert.ok(
+    stanza.includes(String(totalLines)) || /\+\d+ more window/.test(stanza),
+    "the stanza must either name the final window or explicitly note more windows remain"
+  );
+  assert.ok(
+    stanza.length < 2000,
+    "the stanza itself must be tiny relative to the 163 KB file it stands in for"
+  );
+});
+
+// ---------------------------------------------------------------------------
+// parseUnifiedDiffHunkRangesV1 / mergeAndExpandLineRangesV1 /
+// extractLineRangesExcerptV1 / buildChangedRegionsStanzaV1 —
+// applyContentCapsWithRegionsV1's changed-region-excerpt path (implementation
+// review blocker: the previous round unconditionally substituted the
+// no-baseline stanza instead of implementing the mandatory changed-region
+// excerpt design).
+// ---------------------------------------------------------------------------
+
+void test("parseUnifiedDiffHunkRangesV1 extracts the new-side range from each hunk header", () => {
+  const diff = [
+    "diff --git a/foo.ts b/foo.ts",
+    "index 111..222 100644",
+    "--- a/foo.ts",
+    "+++ b/foo.ts",
+    "@@ -10,0 +10,3 @@",
+    "+added line 1",
+    "+added line 2",
+    "+added line 3",
+    "@@ -50,5 +52,1 @@",
+    "-removed",
+    "+kept",
+  ].join("\n");
+  const ranges = parseUnifiedDiffHunkRangesV1(diff);
+  assert.deepEqual(ranges, [
+    { start: 10, end: 12 },
+    { start: 52, end: 52 },
+  ]);
+});
+
+void test("parseUnifiedDiffHunkRangesV1 anchors a pure-deletion hunk (count 0) to a single line", () => {
+  const diff = "@@ -20,3 +19,0 @@\n-a\n-b\n-c\n";
+  const ranges = parseUnifiedDiffHunkRangesV1(diff);
+  assert.deepEqual(ranges, [{ start: 19, end: 19 }]);
+});
+
+void test("parseUnifiedDiffHunkRangesV1 returns no ranges for diff text with no hunks", () => {
+  assert.deepEqual(parseUnifiedDiffHunkRangesV1(""), []);
+  assert.deepEqual(parseUnifiedDiffHunkRangesV1("no hunks here"), []);
+});
+
+void test("mergeAndExpandLineRangesV1 expands by context and merges touching ranges", () => {
+  const ranges = mergeAndExpandLineRangesV1(
+    [{ start: 100, end: 100 }, { start: 130, end: 132 }],
+    20,
+    1000
+  );
+  // First range expands to [80,120]; second expands to [110,152] — these
+  // overlap (110 <= 120) and must merge into one contiguous range.
+  assert.deepEqual(ranges, [{ start: 80, end: 152 }]);
+});
+
+void test("mergeAndExpandLineRangesV1 clamps expansion to the file's real line bounds", () => {
+  const ranges = mergeAndExpandLineRangesV1([{ start: 2, end: 3 }], 20, 10);
+  assert.deepEqual(ranges, [{ start: 1, end: 10 }]);
+});
+
+void test("extractLineRangesExcerptV1 pulls the real text at each range with a line-range header", () => {
+  const content = Array.from({ length: 50 }, (_, i) => `line ${i + 1}`).join("\n");
+  const { excerpt, usedRanges, truncated } = extractLineRangesExcerptV1(
+    content,
+    [{ start: 5, end: 8 }],
+    10000
+  );
+  assert.equal(truncated, false);
+  assert.deepEqual(usedRanges, [{ start: 5, end: 8 }]);
+  assert.ok(excerpt.includes("--- lines 5-8 ---"));
+  assert.ok(excerpt.includes("line 5"));
+  assert.ok(excerpt.includes("line 8"));
+  assert.ok(!excerpt.includes("line 30"), "must not include content outside the requested range");
+});
+
+void test("extractLineRangesExcerptV1 reports truncated when a region doesn't fit the budget", () => {
+  const content = "x".repeat(100);
+  const { truncated, usedRanges } = extractLineRangesExcerptV1(
+    content,
+    [{ start: 1, end: 1 }],
+    5 // smaller than even the header text
+  );
+  assert.equal(truncated, true);
+  assert.deepEqual(usedRanges, []);
+});
+
+void test("buildChangedRegionsStanzaV1 names the real changed-region ranges and says 'changed regions'", () => {
+  const content = "x".repeat(5000);
+  const stanza = buildChangedRegionsStanzaV1("src/big.ts", content, [
+    { start: 40, end: 60 },
+    { start: 900, end: 920 },
+  ]);
+  assert.ok(/changed regions?/i.test(stanza), "must claim these ARE diff-derived changed regions");
+  assert.ok(stanza.includes("lines 40-60"));
+  assert.ok(stanza.includes("lines 900-920"));
+  assert.ok(stanza.includes("src/big.ts"));
+});
+
+void test("applyContentCapsWithRegionsV1: a large file with a small changed region gets a real excerpt, not a stanza", () => {
+  const lines = Array.from({ length: 5000 }, (_, i) => `line ${i + 1} unchanged filler text here`);
+  lines[999] = "line 1000 THIS ONE CHANGED";
+  const content = lines.join("\n");
+  assert.ok(content.length > IMPL_REVIEW_TRUNCATED_FILE_MAX_CHARS, "fixture must exceed the inline-whole cap");
+
+  const [result] = applyContentCapsWithRegionsV1([
+    { relPath: "src/big.ts", content, changedRanges: [{ start: 1000, end: 1000 }] },
+  ]);
+  assert.equal(result!.contentKind, "changed-regions-excerpt");
+  assert.equal(result!.isOversizedStanza, false);
+  assert.ok(result!.content!.includes("THIS ONE CHANGED"), "the real changed line must appear in the excerpt");
+  assert.ok(
+    !result!.content!.includes("line 4999"),
+    "content far from the changed region must not be pulled in"
+  );
+});
+
+void test("applyContentCapsWithRegionsV1: changed regions that still exceed the per-file budget fall back to the ranges-bearing stanza", () => {
+  const lines = Array.from({ length: 5000 }, (_, i) => `line ${i + 1} padding text to add some length here`);
+  const content = lines.join("\n");
+  // Scattered ranges every 100 lines: with the default 20-line context on
+  // each side, each expands to a 41-line window, together covering most of
+  // the file — well past a deliberately tiny per-file budget.
+  const changedRanges = Array.from({ length: 40 }, (_, i) => ({
+    start: i * 100 + 1,
+    end: i * 100 + 1,
+  }));
+  const [result] = applyContentCapsWithRegionsV1(
+    [{ relPath: "src/huge.ts", content, changedRanges }],
+    { maxTotalChars: 4000 }
+  );
+  assert.equal(result!.contentKind, "changed-regions-stanza");
+  assert.equal(result!.isOversizedStanza, true);
+  assert.ok(/changed regions?/i.test(result!.content as string));
+});
+
+void test("applyContentCapsWithRegionsV1: a file with no changedRanges falls back to the no-baseline stanza", () => {
+  const content = "q".repeat(IMPL_REVIEW_TRUNCATED_FILE_MAX_CHARS * 2);
+  const [result] = applyContentCapsWithRegionsV1([{ relPath: "src/unbaselined.ts", content }]);
+  assert.equal(result!.contentKind, "no-baseline-stanza");
+  assert.equal(result!.isOversizedStanza, true);
+  assert.ok(!/changed regions?/i.test(result!.content as string), "must never mislabel paging windows as changed regions");
+});
+
+void test("applyContentCapsWithRegionsV1: a file at or under the inline-whole cap is always inlined whole, even with changedRanges supplied", () => {
+  const content = "small file content";
+  const [result] = applyContentCapsWithRegionsV1([
+    { relPath: "src/small.ts", content, changedRanges: [{ start: 1, end: 1 }] },
+  ]);
+  assert.equal(result!.contentKind, "whole");
+  assert.equal(result!.content, content);
 });

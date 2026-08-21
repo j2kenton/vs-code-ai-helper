@@ -26,6 +26,7 @@ import {
   StructuredQuestionV1,
   decodeStructuredQuestionsFromProviderV1,
 } from "./structuredQuestionV1";
+import type { AgentExecutionModeV1 } from "./agentExecutionV1";
 
 export interface MarkdownArtifactCompletedV1 {
   readonly contentType: "markdown-artifact.v1";
@@ -1274,6 +1275,46 @@ function decodeEnvelopeV1(
  * for any input, this returns true exactly when the parser does NOT report
  * `invalidFrame`.
  */
+export interface RoundDeliverableContractV1 {
+  /** True when the round owes free-form Markdown/chat/commit-subject text. */
+  readonly requiresTextDeliverable: boolean;
+  /** True when the round's output must decode as a framed {@link AiResultEnvelopeV1}. */
+  readonly requiresResultFrame: boolean;
+}
+
+/**
+ * What a round owes the coordinator, given the execution mode a model round
+ * actually ran under — or `undefined` for a round where no model round ran
+ * at all.
+ *
+ * `mode` is `AgentExecutionRequestV1["mode"]`, which already determines the
+ * completed-content type a row accepts (`requiredModeForContentType` in
+ * `taskActionRegistryV1.ts`: "text" for every free-text content type,
+ * "preflight" for `preflight-plan.v1`, "edit" for `edit-execution.v1`), so no
+ * separate deliverable-type parameter is needed here.
+ *
+ * `undefined` is the sealed/tool-only edit case: `runEditActionV1.ts`'s
+ * `resolveSealedEditCompletionResultV1` can synthesize its own completion
+ * summary (`summaryIsSynthetic: true`) without ever invoking a model round,
+ * so there is no text and no frame to have been omitted — a round that never
+ * ran cannot be classified as having failed to deliver.
+ */
+export function roundDeliverableContractV1(
+  mode: AgentExecutionModeV1 | undefined
+): RoundDeliverableContractV1 {
+  if (mode === undefined) {
+    return { requiresTextDeliverable: false, requiresResultFrame: false };
+  }
+  if (mode === "text") {
+    return { requiresTextDeliverable: true, requiresResultFrame: true };
+  }
+  // "preflight" (preflight-plan.v1) and "edit" (edit-execution.v1) both
+  // deliver structured JSON rather than free text, but both still arrive
+  // framed — parseAiResultEnvelopeV1 is the one decoder for every completed
+  // content type, this module's own union included.
+  return { requiresTextDeliverable: false, requiresResultFrame: true };
+}
+
 export function containsResultFrameV1(response: string): boolean {
   // Entry guards, before anything else — the parser rejects both of these as
   // `invalidFrame` regardless of what follows, so a precheck that skipped them
@@ -1352,6 +1393,55 @@ export function containsResultFrameV1(response: string): boolean {
   // called it `invalidFrame` — so the tool session skipped its nudge and
   // forwarded a response that could only fail (2026-08-19 review).
   return parseStrictJsonV1(payload).ok;
+}
+
+/**
+ * Shared "no result frame, ask once more" nudge text (item 1 fix 4,
+ * workflow findings round 8). Originally lived only in
+ * `languageModelToolSessionV1.ts`; hoisted here so a second transport can
+ * reuse the exact wording instead of drifting a paraphrase.
+ */
+export const RESULT_FRAME_NUDGE_MESSAGE_V1 =
+  "That response contained no result frame, so it cannot be accepted. " +
+  "Reply now with ONLY the complete final result frame described in the " +
+  "result contract — starting with " +
+  FRAME_START_V1 +
+  " — and nothing else. Do not restate your findings or announce what you " +
+  "are about to do; this reply is your final answer.";
+
+/**
+ * Transport-independent "should this response be nudged for a missing
+ * result frame" decision (item 1 fix 4, workflow findings round 8). Both
+ * the Copilot LM transport (which loops within one call) and a CLI
+ * transport (which can only retry by respawning the process) ask this same
+ * question before accepting a tool-free/final response as the round's
+ * answer — only the retry mechanics differ per transport, so those stay
+ * with each transport while the decision itself lives here once.
+ *
+ * `attemptsRemaining` is the caller's own budget check (the LM transport's
+ * `round + 1 < maxRounds`, a CLI transport's "have I already spawned the one
+ * retry"): nudging on the very last attempt would spend it and fall through
+ * to a round-limit failure that misreports "too many rounds" for what was
+ * actually "no result frame" — see `languageModelToolSessionV1.ts`'s
+ * identical reasoning at its call site.
+ */
+export function shouldNudgeForMissingResultFrameV1(options: {
+  readonly responseText: string;
+  readonly requiresResultFrame: boolean;
+  readonly nudgesUsed: number;
+  readonly maxNudges: number;
+  readonly attemptsRemaining: boolean;
+}): boolean {
+  if (!options.requiresResultFrame) {
+    return false;
+  }
+  if (options.nudgesUsed >= options.maxNudges) {
+    return false;
+  }
+  if (!options.attemptsRemaining) {
+    return false;
+  }
+  return !containsResultFrameV1(options.responseText);
 }
 
 /**

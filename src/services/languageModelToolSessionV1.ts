@@ -32,7 +32,11 @@ import {
   MAX_TOOL_PROTOCOL_VIOLATIONS_V1,
   MAX_TOOL_ROUNDS_V1,
 } from "../types/workflowToolProtocolV1";
-import { containsResultFrameV1, FRAME_START_V1 } from "../types/aiResultEnvelope";
+import {
+  RESULT_FRAME_NUDGE_MESSAGE_V1,
+  roundDeliverableContractV1,
+  shouldNudgeForMissingResultFrameV1,
+} from "../types/aiResultEnvelope";
 import { RequestLocalToolHandlerV1 } from "./requestLocalToolHandlerV1";
 import {
   VscodeLmModuleV1,
@@ -497,21 +501,18 @@ export function createCopilotLmToolSessionTransportV1(
           // simply accepting the text. With no round left, accept and let the
           // envelope parser reject it with an accurate reason.
           if (
-            !containsResultFrameV1(roundText) &&
-            narrationNudges < MAX_NARRATION_NUDGES_V1 &&
-            round + 1 < maxRounds
+            shouldNudgeForMissingResultFrameV1({
+              responseText: roundText,
+              requiresResultFrame: roundDeliverableContractV1(request.mode).requiresResultFrame,
+              nudgesUsed: narrationNudges,
+              maxNudges: MAX_NARRATION_NUDGES_V1,
+              attemptsRemaining: round + 1 < maxRounds,
+            })
           ) {
             narrationNudges += 1;
             messages.push(createLmAssistantMessageWithPartsV1(vscodeModule, assistantRawParts));
             messages.push(
-              vscode.LanguageModelChatMessage.User(
-                "That response contained no result frame, so it cannot be accepted. " +
-                  "Reply now with ONLY the complete final result frame described in the " +
-                  "result contract — starting with " +
-                  FRAME_START_V1 +
-                  " — and nothing else. Do not restate your findings or announce what you " +
-                  "are about to do; this reply is your final answer."
-              )
+              vscode.LanguageModelChatMessage.User(RESULT_FRAME_NUDGE_MESSAGE_V1)
             );
             continue;
           }

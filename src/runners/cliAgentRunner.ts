@@ -18,7 +18,12 @@ import {
   boundedTransportDetailV1,
   BoundedResultWriterV1,
 } from "../types/agentExecutionV1";
-import { FRAME_START_V1 } from "../types/aiResultEnvelope";
+import {
+  FRAME_START_V1,
+  RESULT_FRAME_NUDGE_MESSAGE_V1,
+  roundDeliverableContractV1,
+  shouldNudgeForMissingResultFrameV1,
+} from "../types/aiResultEnvelope";
 import { createCliStdoutResultCaptureV1 } from "../services/cliStdoutResultCaptureV1";
 import { withAttribution, writeTextFile } from "../utils/fileUtils";
 import { ImplementationRunResult } from "./copilotImplementationRunner";
@@ -1761,6 +1766,28 @@ function extractOpencodeFinalOutput(
   return cleaned;
 }
 
+/**
+ * Every structured-stream extractor's "the provider exited 0 but the stream
+ * carried zero text parts" placeholder (item 1, workflow findings round 8):
+ * a real 2026-08-20 field capture had a CLI provider's second attempt settle
+ * on exactly `KIMI_NO_TEXT_REPLY_PLACEHOLDER` as a `kind: "completed"` round
+ * — no frame, no content, and no fallback to a backup model, because the
+ * transport only looks at the process exit code, not at what (if anything)
+ * the model actually said. Checked by `createCliTextTransportV1`, which only
+ * ever runs in `"text"` mode, where `roundDeliverableContractV1` always
+ * requires both a text deliverable and a result frame — never consulted for
+ * edit-mode runs, where an empty reply is legitimately silent (a tool-only
+ * edit is judged by `filesChanged`, not by reply text; see
+ * OPENCODE_NO_TEXT_REPLY_PLACEHOLDER's own doc comment).
+ */
+const TEXT_MODE_EMPTY_REPLY_PLACEHOLDERS_V1: ReadonlySet<string> = new Set([
+  OPENCODE_NO_TEXT_REPLY_PLACEHOLDER,
+  CLINE_NO_TEXT_REPLY_PLACEHOLDER,
+  KIMI_NO_TEXT_REPLY_PLACEHOLDER,
+  CODEX_NO_TEXT_REPLY_PLACEHOLDER,
+  CLAUDE_CLI_NO_TEXT_REPLY_PLACEHOLDER,
+]);
+
 function normalizeCliOutput(
   def: CliProviderDefinition,
   stdout: string,
@@ -1863,6 +1890,29 @@ export const MAX_CLI_STRUCTURED_EVENT_STREAM_BYTES_V1 = 64 * 1024 * 1024;
  * Selection happens in `runnerRegistry.ts`; constructing this transport is
  * not an invocation.
  */
+/**
+ * One spawn-and-wait attempt's outcome, before the caller decides whether to
+ * accept it or respawn once with a nudged prompt (item 1 fix 4, workflow
+ * findings round 8). `textCompleted` carries the extracted text WITHOUT
+ * having written it to the broker's writer yet — that write is deferred to
+ * whichever attempt the caller keeps, so a frameless first attempt never
+ * reaches the writer at all.
+ *
+ * Both opaque-text and structured-event CLIs resolve to `textCompleted`
+ * (2026-08-21 review finding): an EARLIER version of this type kept opaque
+ * output streaming straight into the broker's writer as bytes arrived
+ * (`opaqueCompleted`, carrying no text), which meant the frameless-response
+ * nudge below — built for the structured path — silently never fired for an
+ * opaque provider narrating instead of answering. Buffering opaque stdout the
+ * same bounded way the structured path already does (see the `data` handler)
+ * costs nothing this transport was relying on: neither path streams progress
+ * to `onProgress` (this transport has no such signal at all — see the
+ * inactivity-watchdog comment below), so deferring the write is free.
+ */
+type CliTextAttemptResultV1 =
+  | { readonly kind: "terminal"; readonly exit: AgentTransportExitV1 }
+  | { readonly kind: "textCompleted"; readonly normalized: string };
+
 export function createCliTextTransportV1(options: {
   def: CliProviderDefinition;
   /** Provider-native (unqualified) model id; undefined runs the CLI default. */
@@ -1997,214 +2047,343 @@ export function createCliTextTransportV1(options: {
           };
         }
 
-        return new Promise<AgentTransportExitV1>((resolve) => {
-          let settled = false;
-          let cancelled = false;
-          const capture = createCliStdoutResultCaptureV1(output);
-          // Structured-event CLIs buffer raw stdout for post-exit extraction
-          // (see the function doc comment); opaque-text CLIs stream directly.
-          const structuredStream = def.structuredEventStream !== undefined;
-          const rawEventChunks: Buffer[] = [];
-          let rawEventBytes = 0;
-          // Part 7: last time ANY raw byte arrived on stdout or stderr. Keyed
-          // off raw chunk arrival rather than onProgress/capture callbacks,
-          // since structured providers buffer everything until close and
-          // never call onProgress mid-run — this transport has no other
-          // activity signal.
-          let lastActivityAt = Date.now();
+        const capture = createCliStdoutResultCaptureV1(output);
+        // Structured-event CLIs buffer raw stdout for post-exit extraction
+        // (see the function doc comment); opaque-text CLIs stream directly.
+        const structuredStream = def.structuredEventStream !== undefined;
 
-          // Same shell-quoting rule as execCliAgent: with shell:true Node
-          // joins argv with plain spaces, so multi-word values must be
-          // quoted on both platforms.
-          const spawnArgs = useShell
-            ? args.map((a) =>
-                process.platform === "win32"
-                  ? a.includes(" ")
-                    ? `"${a}"`
-                    : a
-                  : quotePosixShellArg(a)
-              )
-            : args;
-          let child: cp.ChildProcess;
-          try {
-            child = cp.spawn(resolvedCommand, spawnArgs, {
-              cwd,
-              shell: useShell,
-              windowsHide: true,
-              // buildEnv is merged OVER sanitizedCliEnv(), never the other
-              // way — a provider's own env additions (e.g. Kimi's
-              // KIMI_MODEL_THINKING_EFFORT) can only add variables, not
-              // weaken the sanitized base.
-              env: { ...sanitizedCliEnv(), ...def.buildEnv?.(model) },
-              detached: process.platform !== "win32",
-            });
-          } catch (error) {
-            cleanupPromptFile();
-            const detail = boundedTransportDetailV1(error);
-            resolve({
-              kind: "transportFailure",
-              code: "cliSpawnFailed",
-              ...(detail !== undefined ? { detail } : {}),
-            });
-            return;
-          }
+        // Same shell-quoting rule as execCliAgent: with shell:true Node
+        // joins argv with plain spaces, so multi-word values must be
+        // quoted on both platforms. Fixed across attempts — only the
+        // prompt payload (stdin bytes or promptFile content) varies.
+        const spawnArgs = useShell
+          ? args.map((a) =>
+              process.platform === "win32"
+                ? a.includes(" ")
+                  ? `"${a}"`
+                  : a
+                : quotePosixShellArg(a)
+            )
+          : args;
 
-          const finish = (exit: AgentTransportExitV1): void => {
-            if (settled) {
-              return;
-            }
-            settled = true;
-            clearTimeout(timeoutHandle);
-            if (inactivityCheckHandle) {
-              clearInterval(inactivityCheckHandle);
-            }
-            cancellationListener.dispose();
-            cleanupPromptFile();
-            resolve(exit);
-          };
+        // One spawn-and-wait attempt, parameterized on the prompt text sent
+        // over stdin (file/argv transports read their prompt from
+        // `promptFile`/`args`, rewritten by the caller between attempts).
+        // Everything the ORIGINAL single-attempt implementation did is
+        // unchanged here — the only difference is that a structured-stream
+        // success defers `capture.handleStdout` to the caller instead of
+        // writing immediately, so item 1 fix 4's nudge-and-retry (below) can
+        // still discard a frameless first attempt before anything reaches
+        // the broker's writer.
+        const runOneAttempt = (stdinPromptText: string): Promise<CliTextAttemptResultV1> =>
+          new Promise<CliTextAttemptResultV1>((resolve) => {
+            let settled = false;
+            let cancelled = false;
+            const rawEventChunks: Buffer[] = [];
+            let rawEventBytes = 0;
+            // Part 7: last time ANY raw byte arrived on stdout or stderr. Keyed
+            // off raw chunk arrival rather than onProgress/capture callbacks,
+            // since structured providers buffer everything until close and
+            // never call onProgress mid-run — this transport has no other
+            // activity signal.
+            let lastActivityAt = Date.now();
 
-          const timeoutHandle = setTimeout(() => {
-            killProcessTree(child);
-            // stderr CONTENT is deliberately never retained (§2.2 — see
-            // cliStdoutResultCaptureV1); the byte counts are the sanitized
-            // summary its own doc marks safe to log, and they answer the
-            // first question about any timeout: was the process saying
-            // anything, or silently wedged?
-            const stderr = capture.stderrSummary();
-            finish({
-              kind: "transportFailure",
-              code: "cliRunTimeout",
-              detail:
-                `no exit after ${Math.round(RUN_TIMEOUT_MS / 60_000)}m wall clock; ` +
-                `stderr ${stderr.totalByteLength} byte(s)`,
-            });
-          }, RUN_TIMEOUT_MS);
-
-          // Part 7 inactivity watchdog: mirrors execCliAgent's — kills a
-          // process producing zero bytes long before the flat wall-clock cap,
-          // with a distinct transportFailure code ("cliRunInactivityTimeout")
-          // so the caller (and the run record) can tell a wedged process
-          // apart from a genuinely long-running one. 0 disables it.
-          const inactivityLimitMinutes = getResilienceSettings().inactivityTimeoutMinutes;
-          const inactivityLimitMs = inactivityLimitMinutes * 60_000;
-          const inactivityCheckHandle =
-            inactivityLimitMinutes > 0
-              ? setInterval(() => {
-                  if (settled) {
-                    return;
-                  }
-                  if (Date.now() - lastActivityAt >= inactivityLimitMs) {
-                    killProcessTree(child);
-                    const stderr = capture.stderrSummary();
-                    finish({
-                      kind: "transportFailure",
-                      code: "cliRunInactivityTimeout",
-                      detail:
-                        `no output for ${inactivityLimitMinutes}m ` +
-                        `(ensemble.resilience.inactivityTimeoutMinutes); ` +
-                        `stderr ${stderr.totalByteLength} byte(s)`,
-                    });
-                  }
-                }, 15_000)
-              : undefined;
-
-          const cancellationListener = request.cancellationToken.onCancellationRequested(() => {
-            cancelled = true;
-            killProcessTree(child);
-            finish({ kind: "callerCancelled" });
-          });
-
-          child.on("error", (error) => {
-            // Was a bare arrow discarding the error: a spawn/runtime fault
-            // (ENOENT, EACCES, EPIPE) reached the user as a bare code with
-            // no way to tell which.
-            const detail = boundedTransportDetailV1(error);
-            finish({
-              kind: "transportFailure",
-              code: "cliSpawnFailed",
-              ...(detail !== undefined ? { detail } : {}),
-            });
-          });
-
-          child.stdout?.on("data", (chunk: Buffer) => {
-            lastActivityAt = Date.now();
-            if (!structuredStream) {
-              capture.handleStdout(chunk);
-              return;
-            }
-            if (settled) {
-              return;
-            }
-            rawEventBytes += chunk.length;
-            if (rawEventBytes > maxEventStreamBytes) {
-              // The raw event stream is unboundedly large — discard it and
-              // fail without writing anything: no bytes ever reached the
-              // result writer, so this stays a pre-response failure.
-              rawEventChunks.length = 0;
-              killProcessTree(child);
-              finish({
-                kind: "transportFailure",
-                code: "cliEventStreamTooLarge",
-                detail: `structured event stream exceeded ${maxEventStreamBytes} bytes (read ${rawEventBytes})`,
+            let child: cp.ChildProcess;
+            try {
+              child = cp.spawn(resolvedCommand, spawnArgs, {
+                cwd,
+                shell: useShell,
+                windowsHide: true,
+                // buildEnv is merged OVER sanitizedCliEnv(), never the other
+                // way — a provider's own env additions (e.g. Kimi's
+                // KIMI_MODEL_THINKING_EFFORT) can only add variables, not
+                // weaken the sanitized base.
+                env: { ...sanitizedCliEnv(), ...def.buildEnv?.(model) },
+                detached: process.platform !== "win32",
+              });
+            } catch (error) {
+              const detail = boundedTransportDetailV1(error);
+              resolve({
+                kind: "terminal",
+                exit: {
+                  kind: "transportFailure",
+                  code: "cliSpawnFailed",
+                  ...(detail !== undefined ? { detail } : {}),
+                },
               });
               return;
             }
-            rawEventChunks.push(Buffer.from(chunk));
-          });
-          child.stderr?.on("data", (chunk: Buffer) => {
-            lastActivityAt = Date.now();
-            capture.handleStderr(chunk);
-          });
 
-          child.on("close", (code) => {
-            if (cancelled) {
-              finish({ kind: "callerCancelled" });
-              return;
-            }
-            if (code === 0) {
-              if (structuredStream && !settled) {
-                // Unwrap the model's final text from the event stream with
-                // the provider's own extractor and write it as the single
-                // captured payload — a framed result the model emitted
-                // arrives at the broker as directly parseable framed bytes.
-                // requiresFramedResult: true (2026-08-07) — this reply is
-                // parsed by parseAiResultEnvelopeV1, so opencode/devpass-cli
-                // keep only the model's LAST text part instead of
-                // concatenating narration ahead of the frame; see
-                // extractOpencodeFinalOutput's own doc comment.
-                const rawStdout = Buffer.concat(rawEventChunks).toString("utf8");
-                rawEventChunks.length = 0;
-                capture.handleStdout(normalizeCliOutput(def, rawStdout, undefined, true));
+            const finishTerminal = (exit: AgentTransportExitV1): void => {
+              if (settled) {
+                return;
               }
-              finish({ kind: "completed" });
-              return;
-            }
-            // A structured-event CLI's failed run wrote nothing to the result
-            // writer (its final text only materializes on exit 0), so the
-            // broker correctly reports this as a pre-response failure.
-            rawEventChunks.length = 0;
-            // Sanitized stderr accounting only (never its text): "exited 1,
-            // stderr 0 bytes" and "exited 1, stderr 4KB" are completely
-            // different failures and were previously indistinguishable.
-            const stderr = capture.stderrSummary();
-            finish({
-              kind: "transportFailure",
-              code: `cliExit.${String(code)}`,
-              detail:
-                `${def.label} exited ${String(code)}; stderr ${stderr.totalByteLength} byte(s)` +
-                `${stderr.truncated ? " (truncated)" : ""}`,
+              settled = true;
+              clearTimeout(timeoutHandle);
+              if (inactivityCheckHandle) {
+                clearInterval(inactivityCheckHandle);
+              }
+              cancellationListener.dispose();
+              resolve({ kind: "terminal", exit });
+            };
+            const finishTextCompleted = (normalized: string): void => {
+              if (settled) {
+                return;
+              }
+              settled = true;
+              clearTimeout(timeoutHandle);
+              if (inactivityCheckHandle) {
+                clearInterval(inactivityCheckHandle);
+              }
+              cancellationListener.dispose();
+              resolve({ kind: "textCompleted", normalized });
+            };
+
+            const timeoutHandle = setTimeout(() => {
+              killProcessTree(child);
+              // stderr CONTENT is deliberately never retained (§2.2 — see
+              // cliStdoutResultCaptureV1); the byte counts are the sanitized
+              // summary its own doc marks safe to log, and they answer the
+              // first question about any timeout: was the process saying
+              // anything, or silently wedged?
+              const stderr = capture.stderrSummary();
+              finishTerminal({
+                kind: "transportFailure",
+                code: "cliRunTimeout",
+                detail:
+                  `no exit after ${Math.round(RUN_TIMEOUT_MS / 60_000)}m wall clock; ` +
+                  `stderr ${stderr.totalByteLength} byte(s)`,
+              });
+            }, RUN_TIMEOUT_MS);
+
+            // Part 7 inactivity watchdog: mirrors execCliAgent's — kills a
+            // process producing zero bytes long before the flat wall-clock cap,
+            // with a distinct transportFailure code ("cliRunInactivityTimeout")
+            // so the caller (and the run record) can tell a wedged process
+            // apart from a genuinely long-running one. 0 disables it.
+            const inactivityLimitMinutes = getResilienceSettings().inactivityTimeoutMinutes;
+            const inactivityLimitMs = inactivityLimitMinutes * 60_000;
+            const inactivityCheckHandle =
+              inactivityLimitMinutes > 0
+                ? setInterval(() => {
+                    if (settled) {
+                      return;
+                    }
+                    if (Date.now() - lastActivityAt >= inactivityLimitMs) {
+                      killProcessTree(child);
+                      const stderr = capture.stderrSummary();
+                      finishTerminal({
+                        kind: "transportFailure",
+                        code: "cliRunInactivityTimeout",
+                        detail:
+                          `no output for ${inactivityLimitMinutes}m ` +
+                          `(ensemble.resilience.inactivityTimeoutMinutes); ` +
+                          `stderr ${stderr.totalByteLength} byte(s)`,
+                      });
+                    }
+                  }, 15_000)
+                : undefined;
+
+            const cancellationListener = request.cancellationToken.onCancellationRequested(() => {
+              cancelled = true;
+              killProcessTree(child);
+              finishTerminal({ kind: "callerCancelled" });
             });
+
+            child.on("error", (error) => {
+              // Was a bare arrow discarding the error: a spawn/runtime fault
+              // (ENOENT, EACCES, EPIPE) reached the user as a bare code with
+              // no way to tell which.
+              const detail = boundedTransportDetailV1(error);
+              finishTerminal({
+                kind: "transportFailure",
+                code: "cliSpawnFailed",
+                ...(detail !== undefined ? { detail } : {}),
+              });
+            });
+
+            child.stdout?.on("data", (chunk: Buffer) => {
+              lastActivityAt = Date.now();
+              if (settled) {
+                return;
+              }
+              // Buffered for BOTH opaque-text and structured-event CLIs (see
+              // CliTextAttemptResultV1's doc comment): the raw stream is
+              // unboundedly large in either case, so it is discarded and the
+              // run fails without writing anything — no bytes ever reach the
+              // result writer, so this stays a pre-response failure.
+              rawEventBytes += chunk.length;
+              if (rawEventBytes > maxEventStreamBytes) {
+                rawEventChunks.length = 0;
+                killProcessTree(child);
+                finishTerminal({
+                  kind: "transportFailure",
+                  code: "cliEventStreamTooLarge",
+                  detail: `raw stdout stream exceeded ${maxEventStreamBytes} bytes (read ${rawEventBytes})`,
+                });
+                return;
+              }
+              rawEventChunks.push(Buffer.from(chunk));
+            });
+            child.stderr?.on("data", (chunk: Buffer) => {
+              lastActivityAt = Date.now();
+              capture.handleStderr(chunk);
+            });
+
+            child.on("close", (code) => {
+              if (cancelled) {
+                finishTerminal({ kind: "callerCancelled" });
+                return;
+              }
+              if (code === 0) {
+                if (!settled) {
+                  // Unwrap the model's final text from the buffered raw
+                  // stream with the provider's own event-stream extractor —
+                  // for a structured CLI only. An opaque-text CLI's stdout IS
+                  // the model's final answer (AC-RUNNER-02), so `normalized`
+                  // is the raw bytes UNCHANGED — passed through byte-for-byte
+                  // exactly as the pre-buffering version of this transport
+                  // did (`still streams an opaque-text CLI's stdout through
+                  // unchanged`, cliTextTransportV1.test.ts) — never
+                  // ANSI-stripped or trimmed, only buffered instead of
+                  // streamed so the nudge decision below can still discard a
+                  // frameless first attempt before anything reaches the
+                  // writer. requiresFramedResult: true (2026-08-07) — this
+                  // reply is parsed by parseAiResultEnvelopeV1, so
+                  // opencode/devpass-cli keep only the model's LAST text part
+                  // instead of concatenating narration ahead of the frame;
+                  // see extractOpencodeFinalOutput's own doc comment.
+                  const rawStdout = Buffer.concat(rawEventChunks).toString("utf8");
+                  rawEventChunks.length = 0;
+                  const normalized = structuredStream
+                    ? normalizeCliOutput(def, rawStdout, undefined, true)
+                    : rawStdout;
+                  // Item 1 (workflow findings round 8): this transport only
+                  // ever runs in "text" mode (see the mode guard above), where
+                  // roundDeliverableContractV1 always requires a text
+                  // deliverable — a process that exited 0 but wrote no text
+                  // reply (or, for a structured CLI, whose event stream
+                  // carried zero text parts) did not deliver one, and
+                  // reporting it "completed" anyway (2026-08-20 field capture:
+                  // Kimi Code CLI's second attempt settled on exactly this
+                  // placeholder) burns the round instead of engaging the
+                  // backup chain. No bytes are written to the result writer in
+                  // this branch, so the failure is correctly pre-response.
+                  //
+                  // `normalized.length === 0` is checked alongside the known
+                  // structured-extractor placeholder set, not instead of it:
+                  // every structured extractor's own "cleaned.length === 0"
+                  // branch (genuinely empty stdout — not the "saw events but
+                  // no text" case the placeholders cover) returns "" directly
+                  // rather than a placeholder, and extractOpencodeFinalOutput's
+                  // requiresFramedResult path can likewise return "" when every
+                  // text part is an explicit empty string and none carries the
+                  // frame. All of these are still "exited 0 with no text
+                  // reply" and were previously written through as zero
+                  // captured bytes under a "completed" verdict (2026-08-20
+                  // review finding).
+                  if (
+                    roundDeliverableContractV1(request.mode).requiresTextDeliverable &&
+                    (normalized.length === 0 || TEXT_MODE_EMPTY_REPLY_PLACEHOLDERS_V1.has(normalized))
+                  ) {
+                    finishTerminal({
+                      kind: "transportFailure",
+                      code: "cliEmptyTextReply",
+                      detail: `${def.label} exited 0 but wrote no reply text`,
+                    });
+                    return;
+                  }
+                  finishTextCompleted(normalized);
+                }
+                return;
+              }
+              // A CLI whose run failed wrote nothing to the result writer
+              // (its buffered raw stdout is only ever extracted/written on
+              // exit 0, for both opaque and structured CLIs — see above), so
+              // the broker correctly reports this as a pre-response failure.
+              rawEventChunks.length = 0;
+              // Sanitized stderr accounting only (never its text): "exited 1,
+              // stderr 0 bytes" and "exited 1, stderr 4KB" are completely
+              // different failures and were previously indistinguishable.
+              const stderr = capture.stderrSummary();
+              finishTerminal({
+                kind: "transportFailure",
+                code: `cliExit.${String(code)}`,
+                detail:
+                  `${def.label} exited ${String(code)}; stderr ${stderr.totalByteLength} byte(s)` +
+                  `${stderr.truncated ? " (truncated)" : ""}`,
+              });
+            });
+
+            if (promptTransport === "stdin") {
+              child.stdin?.on("error", () => {
+                // Ignore EPIPE when the process exits before consuming the
+                // prompt; the close handler reports the real failure.
+              });
+              child.stdin?.write(stdinPromptText);
+            }
+            child.stdin?.end();
           });
 
-          if (promptTransport === "stdin") {
-            child.stdin?.on("error", () => {
-              // Ignore EPIPE when the process exits before consuming the
-              // prompt; the close handler reports the real failure.
-            });
-            child.stdin?.write(request.prompt);
+        try {
+          const attempt1 = await runOneAttempt(request.prompt);
+          if (attempt1.kind === "terminal") {
+            return attempt1.exit;
           }
-          child.stdin?.end();
-        });
+          // textCompleted (opaque OR structured — see CliTextAttemptResultV1's
+          // doc comment): item 1 fix 4 (workflow findings round 8) — a
+          // completed reply that omits the required result frame is
+          // narration, not an answer (2026-08-18 jester review: "Now I'll
+          // write the re-review frame." lost the round on the LM transport
+          // this mirrors). Generalized from structured-stream-only to every
+          // CLI provider (2026-08-21 review finding): an opaque-text provider
+          // narrating instead of answering used to bypass this check
+          // entirely, because its output streamed straight to the result
+          // writer before this decision point existed. Bounded to exactly one
+          // respawn with the same nudge text `languageModelToolSessionV1.ts`
+          // uses, and only for stdin/file prompt delivery — no shipped
+          // provider uses `promptTransport: "argv"` today (`args` is built
+          // once, before either attempt, and an argv-delivered prompt cannot
+          // be swapped between attempts without rebuilding it).
+          const canRetryWithNudge = promptTransport !== "argv";
+          if (
+            canRetryWithNudge &&
+            shouldNudgeForMissingResultFrameV1({
+              responseText: attempt1.normalized,
+              requiresResultFrame: roundDeliverableContractV1(request.mode).requiresResultFrame,
+              nudgesUsed: 0,
+              maxNudges: 1,
+              attemptsRemaining: true,
+            })
+          ) {
+            const nudgedPrompt = `${request.prompt}\n\n${RESULT_FRAME_NUDGE_MESSAGE_V1}`;
+            if (promptFile) {
+              try {
+                nodeFs.writeFileSync(promptFile, nudgedPrompt, { encoding: "utf8", mode: 0o600 });
+              } catch (error) {
+                const detail = boundedTransportDetailV1(error);
+                return {
+                  kind: "transportFailure",
+                  code: "cliPromptFileWriteFailed",
+                  ...(detail !== undefined ? { detail } : {}),
+                };
+              }
+            }
+            const attempt2 = await runOneAttempt(nudgedPrompt);
+            if (attempt2.kind === "terminal") {
+              return attempt2.exit;
+            }
+            // Bounded to one retry regardless of whether attempt2 still
+            // lacks a frame — the writer forwards it either way and the
+            // envelope parser reports the accurate reason.
+            capture.handleStdout(attempt2.normalized);
+            return { kind: "completed" };
+          }
+          capture.handleStdout(attempt1.normalized);
+          return { kind: "completed" };
+        } finally {
+          cleanupPromptFile();
+        }
       })();
     },
   };

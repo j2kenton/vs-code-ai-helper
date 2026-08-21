@@ -1552,6 +1552,36 @@ void describe("checklist item identity survives escaped-quote corruption", () =>
     );
   });
 
+  // workflow 8, item 2's jester probe: the only two items (of eight) that
+  // never ticked in a real fixture were the only two containing a
+  // backslash-escaped backtick — a plan item quoting an identifier in
+  // markdown, the single most common way a backtick reaches a checklist line.
+  void it("unescapes backslash-escaped backticks", () => {
+    assert.equal(
+      normalizeChecklistItemTextV1("Rename the \\`exportedName\\` export"),
+      normalizeChecklistItemTextV1("Rename the `exportedName` export")
+    );
+  });
+
+  void it("an echo with clean backticks still ticks a plan line carrying escaped backticks", () => {
+    const plan = [
+      "<!-- ensemble:implementation-checklist -->",
+      "",
+      "- [ ] Rename the \\`exportedName\\` export",
+      "- [ ] Wire the gate",
+    ].join("\n");
+    const echo = [
+      "<!-- ensemble:implementation-checklist -->",
+      "- [x] Rename the `exportedName` export",
+    ].join("\n");
+    const merged = mergedContent(mergeChecklistProgressV1(plan, echo));
+    assert.ok(
+      merged.includes("- [x] Rename the \\`exportedName\\` export"),
+      "the plan's original (corrupted) spelling is ticked, byte-preserving except the box"
+    );
+    assert.deepEqual(countChecklistProgressV1(merged), { total: 2, checked: 1, remaining: 1, excluded: 0 });
+  });
+
   void it("an echo with clean quotes still ticks a plan line carrying escaped quotes", () => {
     const plan = [
       "<!-- ensemble:implementation-checklist -->",

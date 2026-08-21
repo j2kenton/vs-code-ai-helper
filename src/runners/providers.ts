@@ -932,9 +932,24 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
         // "honours" despite `--permission-mode plan` genuinely withholding
         // edits: the mitigation reduces but does not eliminate the risk, so
         // callers needing a specific response CONTRACT (not just no edits)
-        // must not select this provider's text mode for that purpose. Worth
-        // re-verifying against the current CLI version before relying on
-        // this mitigation anywhere else.
+        // must not select this provider's text mode for that purpose.
+        //
+        // RE-VERIFIED 2026-08-21 against claude 2.1.233 (the 08-20 failure was
+        // on an unrecorded version between 2.1.216 and this one):
+        // `node scripts/probe-plans-leak.mjs` → PASS, no scratch file written
+        // and the response carried the real answer inline. Evidence captured
+        // in `docs/verification/plans-leak-probe-2026-08.md`.
+        //
+        // That PASS does NOT close the regression above. The probe uses a
+        // synthetic one-line prompt; the 08-20 failure was a real
+        // `summary-only` continuation with a full context pack, and the
+        // leaked file is still on disk. So the behaviour is INTERMITTENT —
+        // load-dependent, not fixed — and the classification stays
+        // "repurposed-interactive-flow". A passing probe is evidence the
+        // instruction is present and effective under light load, nothing
+        // more. To exercise the failing case, run a genuine summary-only
+        // continuation through this text mode and check `~/.claude/plans`
+        // afterwards.
         args.push(
           "--append-system-prompt",
           CLAUDE_CLI_HEADLESS_PLAN_MODE_SYSTEM_PROMPT

@@ -166,7 +166,11 @@ import { ProviderChainExhaustionV1, TaskActionOutcomeV1 } from "../types/taskAct
 import { WorkflowUnavailableCodeV1 } from "../types/workflowAvailabilityV1";
 import { ChatInteractionRefV1, ChatInteractionResumeResultV1, ChatTarget, ChatViewProvider } from "../views/chatView";
 import { deriveApplicableVerifiedTicksV1, postApplyReviewerVerifiedTicksDecisionV1 } from "./applyReviewerVerifiedTicks";
-import { postReconcilePlanChecklistDecisionV1 } from "./reconcilePlanChecklist";
+import {
+  postReconcilePlanChecklistDecisionV1,
+  runAutomaticChecklistReconciliationV1,
+  AutomaticChecklistReconciliationOutcomeV1,
+} from "./reconcilePlanChecklist";
 import { postWorkflowDecisionV1 } from "../utils/workflowDecisionDispatchV1";
 import { WorkflowDecisionOptionV1, WorkflowDecisionRecommendationV1 } from "../types/workflowDecisionV1";
 import { TaskInventory } from "../state/taskInventory";
@@ -212,6 +216,10 @@ import {
 } from "../utils/publishChecksFreshness";
 import { improveReviewScore } from "../utils/reviewScoreLoop";
 import { countCommitsSinceSha, resolveHeadCommitSha } from "../utils/gitRepoInfo";
+import {
+  readTaskImplementationBaselineShaV1,
+  recordTaskImplementationBaselineShaIfAbsentV1,
+} from "../utils/taskImplementationBaselineV1";
 import {
   blockerIdentities,
   decidePostReviewActionV1,
@@ -1457,6 +1465,100 @@ export function describeOutstandingChecklistItemsV1(
       ? `\n…and ${unchecked.total - unchecked.items.length} more.`
       : "";
   return `\n${bullets}${more}`;
+}
+
+/**
+ * The exact "is a synthetic edit round exempt from `checklistProgressUnreliable`"
+ * decision (plan Part 4, acceptance criterion 5) — pulled out of the
+ * post-round `patchTaskProgressStrictV1` callback so it is directly unit
+ * testable without constructing a full round.
+ *
+ * 2026-08-21 NINTH review round (the persisting Part 4 architectural blocker,
+ * after the EIGHTH round closed it for tier 2 alone): this function used to
+ * read `runAutomaticChecklistReconciliationV1`'s outcome and exempt a
+ * synthetic round when the pass either ticked review-verified items with no
+ * unresolved overlap ("merged") or affirmatively found nothing to cover
+ * ("nothingCovered"). The review held that BOTH exemptions were the same
+ * mistake tier 2's auto-tick was: "ticking a box cannot be distinguished
+ * from ticking the LAST box, so no automatic check can tell a partial edit
+ * from a finished reconciliation" (the module doc comment on
+ * `reconcilePlanChecklist`, written for the human-facing decision) applies
+ * exactly as much to this function's own automatic exemption — an
+ * affirmative "nothing covered" is still this PASS's own conclusion, not a
+ * human's. So a synthetic round that may have changed files now ALWAYS
+ * latches, full stop; the automatic reconciliation pass no longer has any
+ * power to clear it. The pass's output still matters — it drives the round
+ * log and the evidence a human sees in the `reconcilePlanChecklist` decision
+ * (`gatherReconcileEvidenceV1`) — but it no longer factors into this
+ * function's return value at all, and the parameter is removed rather than
+ * kept-but-ignored.
+ *
+ * @internal exported for testing
+ */
+export function computeSyntheticRoundChecklistLatchV1(input: {
+  readonly planChecklistPresent: boolean;
+  readonly roundMayHaveChangedFiles: boolean;
+  readonly summaryIsSynthetic: boolean;
+  readonly summaryIssuePresent: boolean;
+  readonly checklistClaimedButUnmerged: boolean;
+}): boolean {
+  return (
+    input.planChecklistPresent &&
+    ((input.roundMayHaveChangedFiles && (input.summaryIsSynthetic || input.summaryIssuePresent)) ||
+      input.checklistClaimedButUnmerged)
+  );
+}
+
+/**
+ * Renders a round's `## Checklist merge diagnostics` run-log section (plan
+ * Part 4, item 2) — pulled out of the round-completion write path so the
+ * three merge outcomes it must visibly distinguish (no echo at all
+ * (`"no-report"`), an echo that matched no plan item text (`"no-match"`,
+ * with the unmatched sample named), and a successful merge — plus the
+ * automatic-reconciliation outcome for synthetic rounds) are directly unit
+ * testable without constructing a full round.
+ *
+ * @internal exported for testing
+ */
+export function buildChecklistMergeDiagnosticsNoteV1(input: {
+  readonly mergeKind: "no-report" | "unchanged" | "no-match" | "merged";
+  readonly unmatchedSample?: readonly string[];
+  readonly latchSet: boolean;
+  readonly automaticChecklistReconciliation?: AutomaticChecklistReconciliationOutcomeV1;
+}): string {
+  const unmatchedNote =
+    input.mergeKind === "no-match" && input.unmatchedSample && input.unmatchedSample.length > 0
+      ? ` Unmatched claim text: ${input.unmatchedSample.map((text) => `"${text}"`).join(", ")}.`
+      : "";
+  const reconciliation = input.automaticChecklistReconciliation;
+  const describePending = (items: readonly { item: string; evidence: string }[]): string =>
+    `${items.length} item(s) have applied-operation evidence pending human attestation (lexical corroboration ` +
+    `only — not ticked automatically):\n${items.map((c) => `- ${c.item}`).join("\n")}`;
+  const describeReviewVerified = (items: readonly string[]): string =>
+    `${items.length} item(s) have review-verified evidence pending explicit human selection (not ticked ` +
+    `automatically — see Ensemble: Apply Reviewer-Verified Ticks):\n${items.map((item) => `- ${item}`).join("\n")}`;
+  const autoReconcileNote =
+    reconciliation === undefined
+      ? ""
+      : reconciliation.kind === "candidatesFound"
+        ? ` Automatic checklist reconciliation: \`candidatesFound\` — ` +
+          (reconciliation.reviewVerifiedItems.length > 0
+            ? describeReviewVerified(reconciliation.reviewVerifiedItems)
+            : "no review-verified candidates.") +
+          (reconciliation.pendingOperationEvidenceItems.length > 0
+            ? `\n${describePending(reconciliation.pendingOperationEvidenceItems)}`
+            : "") +
+          (reconciliation.unresolvedOverlap.length > 0
+            ? `\nUnresolved overlap — ${reconciliation.unresolvedOverlap.length} other unticked item(s) cannot be ruled unrelated to this round's changes (referencing a file this round changed, or naming no file at all), covered by neither tier:\n${reconciliation.unresolvedOverlap.map((item) => `- ${item}`).join("\n")}`
+            : "")
+        : reconciliation.kind === "nothingCovered"
+          ? " Automatic checklist reconciliation: `nothingCovered` — no implementation review on file names any currently-unticked item as verified complete, and this round's own applied operations do not cover one either."
+          : ` Automatic checklist reconciliation: \`unavailable\` — ${reconciliation.reason}`;
+  return (
+    "\n\n## Checklist merge diagnostics\n\n" +
+    `Merge kind: \`${input.mergeKind}\`.${unmatchedNote} Latch (\`checklistProgressUnreliable\`) after this round: ` +
+    `${input.latchSet ? "set" : "not set"}.${autoReconcileNote}`
+  );
 }
 
 /**
@@ -3207,11 +3309,26 @@ export async function runReviewForFolder(
       previousReview !== undefined
         ? extractBlockerNamedPathsV1(parseReviewBlockers(previousReview))
         : undefined;
+    // Anchor changed-region excerpts to the commit the PREVIOUS round of
+    // this same review actually assessed (2i's marker), not just the latest
+    // commit touching each file — see computeChangedLineRangesForFileV1's
+    // doc comment for why that distinction matters across multi-commit tasks.
+    // A re-review anchors to the PREVIOUS round of this same review's own
+    // marker (2i). A task's first review (or a review whose previous round
+    // predates the 2i marker) has none — fall back to the commit snapshotted
+    // before this task's first implementation round ran (see
+    // taskImplementationBaselineV1.ts), so the excerpt still covers every
+    // committed round since the task began rather than just the latest
+    // commit touching each file.
+    const baselineSha =
+      (previousReview !== undefined ? parseReviewedCommitSha(previousReview) : undefined) ??
+      (await readTaskImplementationBaselineShaV1(folderUri));
     const { contextPackUri, isFallback } = await writeImplReviewContextPack(
       folderUri,
       workspaceRoot.uri,
       taskProgress?.implReviewFiles,
-      priorityRelPaths
+      priorityRelPaths,
+      baselineSha
     );
     if (isFallback) {
       NotificationRouter.showWarning(
@@ -6133,6 +6250,12 @@ async function executeImplementationRun(
 ): Promise<boolean> {
   const cwd = workspaceRoot.uri.fsPath;
 
+  // Snapshot HEAD as this task's implementation baseline, first round only
+  // (workflow findings round 8, item 1: a task's first implementation review
+  // has no `<!-- reviewed-commit -->` marker to anchor to — see
+  // taskImplementationBaselineV1.ts). Must run before any edit below.
+  await recordTaskImplementationBaselineShaIfAbsentV1(folderUri, cwd);
+
   // Pre-run safety checks for agentic file-editing runs
   if (!options.skipPreRunSafetyCheck) {
     const isGit = await isGitWorkspace(cwd);
@@ -6990,6 +7113,13 @@ async function executeImplementationRun(
     // that echo is the only thing that advances plan progress, so the merge
     // below reuses the same read the gate validated against.
     const planOfRecordUri = getCanonicalImplementationUri(folderUri);
+    // Filled in below, only for a runner-synthesized round with a plan
+    // checklist — read by the run log write to record the evidence found,
+    // and by the reconcile-decision post to surface it for explicit human
+    // selection (workflow 8, item 2 / plan Part 4). Never used to exempt the
+    // round from checklistProgressUnreliable — see
+    // `computeSyntheticRoundChecklistLatchV1`'s doc comment.
+    let automaticChecklistReconciliation: AutomaticChecklistReconciliationOutcomeV1 | undefined;
 
     // Attribution (finding 2): the git snapshot diff spans the round's
     // wall-clock window, not its authorship — edits made BY HAND in the same
@@ -7087,6 +7217,36 @@ async function executeImplementationRun(
         }
         // "unchanged" / "no-report" behave as the old undefined case did: no
         // write, no warning.
+      }
+
+      // Bounded automatic checklist reconciliation evidence-gathering
+      // (workflow 8, item 2 / plan Part 4): a runner-synthesized round has no
+      // echo to merge above — the sealed edit pipeline returns tool-call
+      // receipts, not prose — so its checklist state is otherwise ALWAYS
+      // "unrecorded" and latches checklistProgressUnreliable below, even when
+      // an implementation review already on file verified the exact plan
+      // items this round's edits complete. Gather that evidence once, from
+      // hard evidence only (never from this round's own diff or intent — see
+      // `runAutomaticChecklistReconciliationV1`'s doc comment) — but 2026-08-21
+      // NINTH review round: NEVER write it. plan-final.md is untouched here;
+      // the evidence is surfaced to the operator via
+      // `postReconcilePlanChecklistDecisionV1` below, and only an explicit
+      // selection there (`applyReconciliationReviewVerifiedTicksV1`) can turn
+      // it into a tick. Never run for a model-authored round: those either
+      // echo the checklist themselves (merged/no-match/unchanged above) or
+      // are a rejected summary, a different failure class this part does not
+      // touch.
+      if (planChecklist !== undefined && result.summaryIsSynthetic) {
+        automaticChecklistReconciliation = await runAutomaticChecklistReconciliationV1(
+          folderUri,
+          attributedFilesChanged,
+          // Only the sealed pipeline ever sets this (see
+          // ImplementationRunResult.appliedOperations's own doc comment); a
+          // model-authored round never reaches this branch at all
+          // (`result.summaryIsSynthetic` gates it), so this is never a stale
+          // carry-over from a different round's shape.
+          result.appliedOperations
+        );
       }
     } else {
       // Stamped HERE, next to the write it replaces, rather than beside the
@@ -7224,11 +7384,20 @@ async function executeImplementationRun(
       // `roundMayHaveChangedFiles` — a verification-only round that changed
       // no files is precisely the shape this was observed in (round 013,
       // task "1.9").
-      const checklistStateUnrecorded =
-        planChecklist !== undefined &&
-        ((roundMayHaveChangedFiles &&
-          (result!.summaryIsSynthetic === true || summaryIssue !== undefined)) ||
-          checklistClaimedButUnmerged);
+      // A synthetic round ALWAYS latches the "unrecorded" half (2026-08-21
+      // NINTH review round — see `computeSyntheticRoundChecklistLatchV1`'s
+      // own doc comment): the automatic reconciliation pass above gathers
+      // evidence for a human to act on, but it never exempts the round
+      // itself, regardless of what it found (plan Part 4: "never
+      // auto-exempt"). Only an explicit human attestation
+      // (`reconcilePlanChecklistConfirmedV1`) clears this latch.
+      const checklistStateUnrecorded = computeSyntheticRoundChecklistLatchV1({
+        planChecklistPresent: planChecklist !== undefined,
+        roundMayHaveChangedFiles,
+        summaryIsSynthetic: result!.summaryIsSynthetic === true,
+        summaryIssuePresent: summaryIssue !== undefined,
+        checklistClaimedButUnmerged,
+      });
       // updatedAt is bumped with the latch. patchTaskProgressStrictV1 does not
       // set it (only creation does), and the updateImplReviewFiles branch below
       // — which would have — is skipped when the change set is unknown. Without
@@ -7309,12 +7478,23 @@ async function executeImplementationRun(
     if (planChecklist !== undefined) {
       const existingLog = await readTextIfExists(logUri);
       if (existingLog !== undefined) {
-        const mergeKind = checklistMergeResult?.kind ?? "no-report";
-        const latchSet = persistedAfterRun?.checklistProgressUnreliable === true;
-        const diagnosticsNote =
-          "\n\n## Checklist merge diagnostics\n\n" +
-          `Merge kind: \`${mergeKind}\`. Latch (\`checklistProgressUnreliable\`) after this round: ` +
-          `${latchSet ? "set" : "not set"}.`;
+        const diagnosticsNote = buildChecklistMergeDiagnosticsNoteV1({
+          mergeKind: checklistMergeResult?.kind ?? "no-report",
+          // Distinguishes "no-report" (no echo at all) from "no-match" (an
+          // echo was produced but matched no plan item text) beyond the kind
+          // string alone — the sample of what did not match is what actually
+          // lets a reader tell a corrupted/reworded echo from a round that
+          // said nothing (plan Part 4, item 2).
+          unmatchedSample:
+            checklistMergeResult?.kind === "no-match" ? checklistMergeResult.unmatchedSample : undefined,
+          latchSet: persistedAfterRun?.checklistProgressUnreliable === true,
+          // The automatic reconciliation pass (only ever run for a synthetic
+          // round — see the call site) is recorded here too, marked
+          // evidence-derived, so a reader can tell "no echo, and nothing
+          // reconciled it" from "no echo, but review evidence already covered
+          // it" without re-deriving either from the round's raw files.
+          automaticChecklistReconciliation,
+        });
         // skipBackup: appends to the just-written log; a `_prev` sibling in
         // runs/ would read as a second run.
         await writeTextFile(logUri, `${existingLog}${diagnosticsNote}\n`, {
@@ -7358,13 +7538,18 @@ async function executeImplementationRun(
       // latch stays set replaces the prior pending decision rather than
       // accumulating duplicates, matching the prior behavior of re-showing
       // the notification every such round.
+      const pendingOperationEvidenceForDecision =
+        automaticChecklistReconciliation?.kind === "candidatesFound"
+          ? automaticChecklistReconciliation.pendingOperationEvidenceItems
+          : undefined;
       const reconcilePosted = persistedAfterRun
         ? await postReconcilePlanChecklistDecisionV1(
             folderUri,
             folderUri.fsPath,
             folderUri.fsPath,
             persistedAfterRun,
-            checklistMergeResult
+            checklistMergeResult,
+            pendingOperationEvidenceForDecision
           )
         : { kind: "noContext" as const };
       if (reconcilePosted.kind !== "posted") {
@@ -8686,13 +8871,26 @@ async function buildReviewResumeVariablesV1(
     setMechanicalBlockersForStage(folderUri, targetStage, checks.mechanicalBlockers);
   }
 
+  let resumeBaselineSha: string | undefined;
+  if (!isPlanReview) {
+    const targetReviewUri = artifactUri(folderUri, targetStage);
+    const previousReviewForBaseline = targetReviewUri
+      ? await readPreviousReviewForRereview(targetReviewUri)
+      : undefined;
+    resumeBaselineSha =
+      (previousReviewForBaseline !== undefined
+        ? parseReviewedCommitSha(previousReviewForBaseline)
+        : undefined) ?? (await readTaskImplementationBaselineShaV1(folderUri));
+  }
   const contextPackUri = isPlanReview
     ? await writeContextPack(folderUri, workspaceUri, false)
     : (
         await writeImplReviewContextPack(
           folderUri,
           workspaceUri,
-          (await readTaskProgressAdvisoryV1(folderUri))?.implReviewFiles
+          (await readTaskProgressAdvisoryV1(folderUri))?.implReviewFiles,
+          undefined,
+          resumeBaselineSha
         )
       ).contextPackUri;
   variables.contextPack = new TextDecoder().decode(await vscode.workspace.fs.readFile(contextPackUri));

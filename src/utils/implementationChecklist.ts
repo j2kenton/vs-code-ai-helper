@@ -179,16 +179,24 @@ function isExcludedChecklistItemText(itemText: string): boolean {
  * through a JSON-encoded field (the checklist echo travels inside the
  * `<<<ENSEMBLE_AI_RESULT_V1>>>` frame's `"markdown"` string, and the plan of
  * record was itself generated the same way): backslash-escaped quotes
- * (`\"` -> `"`), apostrophes (`\'` -> `'`) and doubled backslashes
- * (`\\` -> `\`). Shared by `normalizeChecklistItemTextV1` (for the merge key)
- * and `verifyPlanItems` (for the text it displays/hands to AI verification),
- * so a corrupted plan item is unescaped identically wherever it is read —
- * neither copy duplicates this logic.
+ * (`\"` -> `"`), apostrophes (`\'` -> `'`), backticks (`` \` `` -> `` ` ``)
+ * and doubled backslashes (`\\` -> `\`). Backtick was the one escapable
+ * character missing from this set (workflow 8, item 2's jester probe): a
+ * plan item that quotes an identifier or format string in markdown — the
+ * single most common reason a checklist line contains a backtick at all —
+ * survived a JSON round-trip as `` \` `` on the plan side while the round's
+ * own echo reproduced it clean, so the two normalized to different keys and
+ * the tick was silently dropped even though six of eight items in the same
+ * fixture ticked normally. Shared by `normalizeChecklistItemTextV1` (for the
+ * merge key) and `verifyPlanItems` (for the text it displays/hands to AI
+ * verification), so a corrupted plan item is unescaped identically wherever
+ * it is read — neither copy duplicates this logic.
  */
 export function unescapeChecklistItemTextV1(text: string): string {
   return text
     .replace(/\\"/g, "\"")
     .replace(/\\'/g, "'")
+    .replace(/\\`/g, "`")
     .replace(/\\\\/g, "\\");
 }
 

@@ -603,6 +603,11 @@ void describe("resolveSealedEditCompletionResultV1 — Part 5 item 5", () => {
     assert.equal(result.summaryIsSynthetic, undefined);
     assert.match(result.summary ?? "", /## Files Changed/);
     assert.deepEqual(result.filesChanged, CHANGED);
+    // Item 3 / plan Part 5: an accepted model-authored report must still
+    // carry the applied operation count separately from the distinct-file
+    // count — previously only the synthetic fallback did.
+    assert.match(result.summary ?? "", /Applied 3 sealed edit step\(s\)/);
+    assert.match(result.summary ?? "", /2 file\(s\) changed/);
   });
 
   void it("falls back to the synthetic summary when no report was attempted", () => {
@@ -649,6 +654,47 @@ void describe("resolveSealedEditCompletionResultV1 — Part 5 item 5", () => {
       filesChangedUnknown: false,
     });
     assert.equal(result.summaryIsSynthetic, true);
+  });
+
+  // 2026-08-21 review finding (Part 4 production-path evidence): the sealed
+  // pipeline's per-step applied-operation evidence (kind + path — see
+  // `SealedAppliedOperationV1`) must reach `ImplementationRunResult` exactly
+  // as `runTwoPhaseEditActionV1` produced it, on BOTH the synthetic-summary
+  // path and the accepted-report path — this is the same production function
+  // reviewActions.ts feeds into `runAutomaticChecklistReconciliationV1`
+  // (via `result.appliedOperations`), so a break here would silently starve
+  // that pass of evidence without any test noticing.
+  void it("carries appliedOperations through unchanged on the synthetic-summary path", () => {
+    const operations = [
+      { kind: "createFile" as const, path: "src/a.ts" },
+      { kind: "deleteFile" as const, path: "src/b.ts" },
+    ];
+    const result = resolveSealedEditCompletionResultV1(CHANGED, 2, "copilot-lm", undefined, operations);
+    assert.equal(result.summaryIsSynthetic, true);
+    assert.deepEqual(result.appliedOperations, operations);
+  });
+
+  void it("carries appliedOperations through unchanged on the accepted-report path", () => {
+    const operations = [{ kind: "patchFile" as const, path: "src/a.ts" }];
+    const result = resolveSealedEditCompletionResultV1(
+      CHANGED,
+      1,
+      "copilot-lm",
+      {
+        status: "completed",
+        summary: "## Files Changed\n- src/a.ts\n\n## Verification\n- ok",
+        filesChanged: [],
+        filesChangedUnknown: false,
+      },
+      operations
+    );
+    assert.equal(result.summaryIsSynthetic, undefined);
+    assert.deepEqual(result.appliedOperations, operations);
+  });
+
+  void it("defaults appliedOperations to an empty array when the caller omits it", () => {
+    const result = resolveSealedEditCompletionResultV1(CHANGED, 2, "copilot-lm", undefined);
+    assert.deepEqual(result.appliedOperations, []);
   });
 });
 

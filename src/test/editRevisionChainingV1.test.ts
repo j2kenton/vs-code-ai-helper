@@ -22,6 +22,7 @@ import { PreflightOperationV1, PreflightPlanCompletedV1 } from "../types/aiResul
 import { ActionCorrelationV1, allocateHex128IdV1 } from "../types/actionCorrelationV1";
 import { EditExecutionScriptV1 } from "../types/editExecutionProtocolV1";
 import { RequestLocalToolHandlerV1 } from "../services/requestLocalToolHandlerV1";
+import { buildPreflightToolSessionPreambleV1 } from "../prompts/toolSessionPreambleV1";
 
 const WORKSPACE_ROOT_ID = "workspace:revision-chaining-test";
 const PRIVATE_ROOT_ID = "private:revision-chaining-test";
@@ -257,6 +258,51 @@ void describe("editRevisionChainingV1 — item 17", () => {
       }
       assert.equal(finalRead.value.bytes.toString("utf8"), "start\nreplacement\nend\n");
       assert.equal(fixture.broker.executionOutcome(sealed.executionId)?.state, "partialEditBlocked");
+    } finally {
+      fixture.cleanup();
+    }
+  });
+});
+
+// Item 4 (workflow 8): the preamble and the validator it describes drifted
+// apart silently once — the validator was relaxed to allow a repeated
+// `patchFile` target (item 17, tested above), but two prompt references kept
+// asserting the OLD one-operation-per-file rule for a day before being
+// corrected by hand. Nothing connects the prompt text to the validator's
+// actual behavior, so this recurs whenever either changes. This test pins
+// both sides of the claim together: build the exact plan shape the preamble
+// describes (two `patchFile` operations, one path), assert the validator
+// really does accept it, and assert the preamble states that outcome — not
+// the one-operation-per-file rule this validator no longer enforces.
+void describe("toolSessionPreambleV1 vs validatePreflightPlanAgainstLedgerV1 — item 4", () => {
+  void it("the preamble's repeat-patchFile-target claim matches what the validator actually accepts", async () => {
+    const fixture = await installFixtureV1("start\nMARKER\nend\n");
+    try {
+      const plan = planOf([
+        patchOp("s1", "MARKER", "middle-one\nmiddle-two", fixture.fileObservation.observationId),
+        patchOp("s2", "middle-two", "middle-two-edited", fixture.fileObservation.observationId),
+      ]);
+      assert.deepEqual(
+        validatePreflightPlanAgainstLedgerV1(plan, fixture.ledger, WORKSPACE_ROOT_ID),
+        { ok: true },
+        "two patchFile operations on one path must validate — this is the behavior the preamble text below claims"
+      );
+
+      const preamble = buildPreflightToolSessionPreambleV1({
+        rootId: WORKSPACE_ROOT_ID,
+        rootBindingId: "cd".repeat(32),
+        requestDigest: "ab".repeat(32),
+      });
+      assert.ok(
+        preamble.includes(
+          "Two or more `patchFile` operations on the SAME file, in one plan, ARE allowed"
+        ),
+        "preamble must state that a repeat patchFile target is allowed, matching the validator above"
+      );
+      assert.ok(
+        !/only ONE operation per file/i.test(preamble) && !/one operation per file/i.test(preamble),
+        "preamble must not also claim only one operation per file is allowed — the stale claim that drifted from the validator"
+      );
     } finally {
       fixture.cleanup();
     }

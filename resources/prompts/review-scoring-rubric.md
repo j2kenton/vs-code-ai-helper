@@ -29,6 +29,8 @@ If you are running as a CLI coding agent, or your environment otherwise exposes 
 
 Read what the review genuinely needs and no more; this is not an invitation to audit the whole repository.
 
+**A file too large to open in one read is still readable — page through it.** Some files are large enough that a single read tool call cannot return the whole thing. That is normal, not a dead end: issue however many reads it takes, in sequence, to cover the region(s) you actually need. A file the pack could only excerpt may carry a note naming deterministic line-range windows (e.g. "lines 1-400, 401-800, ...") — use those as your paging plan. Stopping after one failed read and reporting the file as unreviewable, when reading it in chunks would have worked, is the same "gave up early" failure as never attempting the read at all.
+
 Because of this, **"it was not in the context pack" is not by itself grounds for a review-confidence blocker.** Reserve `[unverifiable]` for something you genuinely could not access or determine — a file you tried to read and could not, evidence that exists nowhere in the workspace, or an environment with no file-inspection capability at all. If you never attempted to read the file, you have not yet established that it is unverifiable. Saying "I cannot see these files" while sitting in the workspace that contains them stalls the task for no reason: it blocks on a gap no implementation round can close, because there is nothing there to fix.
 
 **A truncated or omitted file is missing evidence, not negative evidence.** If the pack cuts a file off before the region you need, that proves nothing about what the cutoff region contains — it is not license to conclude the described work is absent. Either read the actual file (you can, per above) and settle it, or if you truly cannot, file a `[review-confidence] [unverifiable]` blocker naming the specific file that could not be read. Never report "not implemented" purely because the pack ran out before showing you the answer.
@@ -50,6 +52,10 @@ When the implementation notes below include a plan checklist (`<!-- ensemble:imp
 ```
 
 This drives a one-click action that ticks exactly these items in plan-final.md on the strength of your verification alone — so only list an item here when you actually checked it against the tree yourself, never because it merely seems likely to be done. Omit an item you did not personally verify. Skip this block entirely when there is no checklist to check items against (e.g. a plan review), or emit it with the two markers and no entries when a checklist exists but you verified nothing beyond what is already ticked.
+
+## Automatic Reconciliation Evidence — Not Yet Ticked
+
+A synthetic (tool-only) edit round with no checklist echo may trigger a bounded automatic reconciliation pass. It never ticks a box on the strength of its own lexical corroboration alone — matching file paths, operation kinds, and keyword content is evidence, not verification, and is surfaced elsewhere (the round log, the reconciliation decision) as a candidate pending explicit human attestation. If you independently open a candidate item's referenced file(s) and confirm the described requirement is genuinely met, name it in the `## Verified Complete` block above exactly like any other item you verified — that is the only way this kind of evidence becomes a tick.
 
 ## Blocker Classification
 

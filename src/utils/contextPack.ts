@@ -3,11 +3,12 @@ import * as nodePath from "path";
 import * as nodeFs from "fs";
 import { CONTEXT_PACK_FILENAME, TASK_FILENAME } from "../types/taskProgress";
 import {
-  applyContentCaps,
-  IMPL_REVIEW_MAX_CHARS_PER_FILE,
-  IMPL_REVIEW_MAX_TOTAL_CHARS,
+  applyContentCapsWithRegionsV1,
+  IMPL_REVIEW_TRUNCATED_FILE_MAX_CHARS,
   isMachineMaintainedArtifactPathV1,
+  type LineRange,
   mapSourceToTestPath,
+  parseUnifiedDiffHunkRangesV1,
 } from "./implReviewFileSelection";
 import { sanitizeRelativePath } from "./pathSafety";
 import {
@@ -17,6 +18,7 @@ import {
   isDenylisted,
 } from "./contextEligibility";
 import { isWorkflowPrivatePathV1 } from "../services/workflowPrivacyClassifierV1";
+import { resolveGitRepo, runGitCommand } from "./gitRepoInfo";
 
 /**
  * Resolve the real, symlink-free path of the nearest existing ancestor of
@@ -460,6 +462,137 @@ async function getFileContentForReview(
 }
 
 /**
+ * Compute the 1-indexed line ranges `relPath` changed across, for use as a
+ * changed-region excerpt baseline (workflow findings round 8, item 1, fix 1).
+ *
+ * When `baselineSha` is supplied (the commit the review's own previous round
+ * recorded via its `<!-- reviewed-commit: SHA -->` marker, see
+ * `parseReviewedCommitSha` in reviewReadiness.ts), it is tried FIRST: `git
+ * diff baselineSha -- path` compares that commit directly against the
+ * current working tree, so it captures every hunk since the last time this
+ * review looked — committed across any number of rounds, and any
+ * uncommitted change on top — in one pass. This is the fix for the
+ * multi-round-commit gap the last-commit-vs-parent proxy below cannot close:
+ * that proxy only ever sees the SINGLE most recent commit that touched the
+ * file, so an earlier commit's hunk in the same file (already reviewed) or a
+ * gap (not yet reviewed) can be silently dropped or wrongly merged depending
+ * on commit order.
+ *
+ * A thrown baseline diff (invalid/rewritten SHA, e.g. after a rebase) falls
+ * through to the no-baseline heuristics below rather than propagating,
+ * since a stale baseline is still better replaced by the existing proxy than
+ * by failing the whole pack. A baseline diff that succeeds but is empty
+ * means nothing in this file changed since the last review looked — that is
+ * a real, non-empty result (no ranges), not a failure, so it is returned
+ * as-is rather than falling through to the last-commit proxy (which would
+ * otherwise wrongly resurface an already-reviewed hunk as new).
+ *
+ * With no baseline (or when it throws), tries the working tree's uncommitted
+ * diff against HEAD next. If that is empty — the file's most recent change
+ * is already committed — falls back to diffing the last commit that touched
+ * the file against its parent, as the best available proxy for "what
+ * changed" without any baseline at all (e.g. a task's first review, or a
+ * plan-stage review, neither of which has a prior `reviewed-commit` marker).
+ *
+ * Returns undefined when no git repo is found, the file has no git history
+ * (brand-new/untracked), or its only commit has no parent to diff against —
+ * callers must treat undefined as "no baseline available" and fall back to
+ * the deterministic paging-window stanza, never as "zero changes".
+ */
+async function computeChangedLineRangesForFileV1(
+  repoRoot: string,
+  relPath: string,
+  baselineSha?: string
+): Promise<LineRange[] | undefined> {
+  const gitRelPath = relPath.replace(/\\/g, "/");
+
+  if (baselineSha) {
+    try {
+      const { stdout } = await runGitCommand(repoRoot, "diff", [
+        "--unified=0",
+        "--no-color",
+        baselineSha,
+        "--",
+        gitRelPath,
+      ]);
+      return parseUnifiedDiffHunkRangesV1(stdout);
+    } catch {
+      // Baseline SHA no longer resolvable (rewritten history) — fall through
+      // to the no-baseline heuristics below.
+    }
+  }
+
+  try {
+    const { stdout } = await runGitCommand(repoRoot, "diff", [
+      "--unified=0",
+      "--no-color",
+      "HEAD",
+      "--",
+      gitRelPath,
+    ]);
+    const ranges = parseUnifiedDiffHunkRangesV1(stdout);
+    if (ranges.length > 0) {
+      return ranges;
+    }
+  } catch {
+    // Not a git repo, git unavailable, or no HEAD yet — fall through to the
+    // last-commit-vs-parent proxy below.
+  }
+
+  try {
+    const { stdout: logOut } = await runGitCommand(repoRoot, "log", [
+      "-1",
+      "--format=%H",
+      "--",
+      gitRelPath,
+    ]);
+    const lastCommit = logOut.trim();
+    if (!lastCommit) {
+      return undefined;
+    }
+    const { stdout: diffOut } = await runGitCommand(repoRoot, "diff", [
+      "--unified=0",
+      "--no-color",
+      `${lastCommit}^`,
+      lastCommit,
+      "--",
+      gitRelPath,
+    ]);
+    const ranges = parseUnifiedDiffHunkRangesV1(diffOut);
+    return ranges.length > 0 ? ranges : undefined;
+  } catch {
+    // No parent commit (file's only history is the initial commit), or git
+    // unavailable — no baseline available.
+    return undefined;
+  }
+}
+
+/**
+ * Attach git-diff-derived `changedRanges` to every file input whose content
+ * exceeds the inline-whole threshold (files at or under it are inlined whole
+ * regardless, so a diff lookup for them would be wasted work). When
+ * `repoRoot` is undefined (no git repo found for the workspace), every file
+ * is returned with `changedRanges: undefined` — `applyContentCapsWithRegionsV1`
+ * then falls back to the no-baseline paging stanza for each, unchanged from
+ * before this round's git-diff wiring.
+ */
+async function attachChangedRangesV1(
+  repoRoot: string | undefined,
+  fileInputs: ReadonlyArray<{ relPath: string; content: string | undefined }>,
+  baselineSha?: string
+): Promise<Array<{ relPath: string; content: string | undefined; changedRanges: LineRange[] | undefined }>> {
+  return Promise.all(
+    fileInputs.map(async (f) => {
+      if (!repoRoot || f.content === undefined || f.content.length <= IMPL_REVIEW_TRUNCATED_FILE_MAX_CHARS) {
+        return { ...f, changedRanges: undefined };
+      }
+      const changedRanges = await computeChangedLineRangesForFileV1(repoRoot, f.relPath, baselineSha);
+      return { ...f, changedRanges };
+    })
+  );
+}
+
+/**
  * Build the body of context-pack.md for an implementation review.
  *
  * **Tracked / no-change mode** (when `implReviewFiles` is an array, even
@@ -495,15 +628,29 @@ async function getFileContentForReview(
  * review blocker names is the last thing truncated or omitted rather than
  * an arbitrary casualty of `implReviewFiles` ordering (workflow-defects
  * batch item 15 fix 4).
+ *
+ * `baselineSha`, when given (a prior review's own `<!-- reviewed-commit -->`
+ * marker — see `parseReviewedCommitSha`), is the diff baseline every
+ * over-threshold file's changed-region excerpt is computed against, so a
+ * re-review sees everything changed since it last looked regardless of how
+ * many commits landed in between. See `computeChangedLineRangesForFileV1`'s
+ * doc comment for the no-baseline fallback used when this is omitted.
  */
 export async function generateImplReviewContextPack(
   taskFolderUri: vscode.Uri,
   workspaceUri: vscode.Uri,
   implReviewFiles: string[] | undefined,
-  priorityRelPaths?: ReadonlySet<string>
+  priorityRelPaths?: ReadonlySet<string>,
+  baselineSha?: string
 ): Promise<{ content: string; isFallback: boolean }> {
   const taskFileUri = vscode.Uri.joinPath(taskFolderUri, TASK_FILENAME);
   const taskContent = await readTextFileIfExists(taskFileUri);
+
+  // Resolved once and shared by both the tracked and fallback branches below
+  // — undefined when the workspace isn't a git repo, in which case every
+  // over-threshold file falls back to the no-baseline paging stanza exactly
+  // as before this round's git-diff wiring.
+  const repoRoot = await resolveGitRepo(workspaceUri.fsPath);
 
   const lines: string[] = [];
   lines.push("# Context Pack");
@@ -695,11 +842,8 @@ export async function generateImplReviewContextPack(
     lines.push("## Implementation Review File Contents");
     lines.push("");
 
-    const results = applyContentCaps(
-      fileInputs,
-      IMPL_REVIEW_MAX_CHARS_PER_FILE,
-      IMPL_REVIEW_MAX_TOTAL_CHARS
-    );
+    const inputsWithRanges = await attachChangedRangesV1(repoRoot, fileInputs, baselineSha);
+    const results = applyContentCapsWithRegionsV1(inputsWithRanges);
 
     const included = results.filter(
       (r): r is (typeof r) & { content: string | undefined } => r.content !== null
@@ -711,6 +855,28 @@ export async function generateImplReviewContextPack(
         lines.push(`### ${result.relPath} (missing on disk)`);
         lines.push("");
         lines.push("_File was tracked as changed but no longer exists on disk._");
+        lines.push("");
+      } else if (result.contentKind === "changed-regions-excerpt") {
+        // A real excerpt of the file's actual text at its git-diff-derived
+        // changed regions (plus surrounding context) — not the whole file,
+        // but every byte shown is real, unlike a stanza.
+        lines.push(`### ${result.relPath} (changed-region excerpt)`);
+        lines.push("");
+        lines.push("```");
+        lines.push(result.content);
+        lines.push("```");
+        lines.push("");
+      } else if (result.isOversizedStanza) {
+        // Workflow findings round 8, item 1: never a truncated code-fence
+        // masquerading as the file — this is a direction to read the real
+        // file natively, not a byte of its content.
+        const title =
+          result.contentKind === "changed-regions-stanza"
+            ? "too large to embed — read these changed regions natively"
+            : "too large to embed — read natively";
+        lines.push(`### ${result.relPath} (${title})`);
+        lines.push("");
+        lines.push(result.content);
         lines.push("");
       } else {
         const label = result.truncated ? " (truncated)" : "";
@@ -813,11 +979,8 @@ export async function generateImplReviewContextPack(
       // or generated inventory would burn embed budget on unreviewable text.
       .filter((f) => !isMachineMaintainedArtifactPathV1(f.relPath));
 
-    const results = applyContentCaps(
-      fileInputs,
-      IMPL_REVIEW_MAX_CHARS_PER_FILE,
-      IMPL_REVIEW_MAX_TOTAL_CHARS
-    );
+    const inputsWithRanges = await attachChangedRangesV1(repoRoot, fileInputs, baselineSha);
+    const results = applyContentCapsWithRegionsV1(inputsWithRanges);
 
     const included = results.filter(
       (r): r is (typeof r) & { content: string | undefined } => r.content !== null
@@ -826,13 +989,31 @@ export async function generateImplReviewContextPack(
 
     for (const result of included) {
       if (result.content !== undefined) {
-        const label = result.truncated ? " (truncated)" : "";
-        lines.push(`### ${result.relPath}${label}`);
-        lines.push("");
-        lines.push("```");
-        lines.push(result.content);
-        lines.push("```");
-        lines.push("");
+        if (result.contentKind === "changed-regions-excerpt") {
+          lines.push(`### ${result.relPath} (changed-region excerpt)`);
+          lines.push("");
+          lines.push("```");
+          lines.push(result.content);
+          lines.push("```");
+          lines.push("");
+        } else if (result.isOversizedStanza) {
+          const title =
+            result.contentKind === "changed-regions-stanza"
+              ? "too large to embed — read these changed regions natively"
+              : "too large to embed — read natively";
+          lines.push(`### ${result.relPath} (${title})`);
+          lines.push("");
+          lines.push(result.content);
+          lines.push("");
+        } else {
+          const label = result.truncated ? " (truncated)" : "";
+          lines.push(`### ${result.relPath}${label}`);
+          lines.push("");
+          lines.push("```");
+          lines.push(result.content);
+          lines.push("```");
+          lines.push("");
+        }
       }
     }
 
@@ -865,13 +1046,15 @@ export async function writeImplReviewContextPack(
   taskFolderUri: vscode.Uri,
   workspaceUri: vscode.Uri,
   implReviewFiles: string[] | undefined,
-  priorityRelPaths?: ReadonlySet<string>
+  priorityRelPaths?: ReadonlySet<string>,
+  baselineSha?: string
 ): Promise<{ contextPackUri: vscode.Uri; isFallback: boolean }> {
   const { content, isFallback } = await generateImplReviewContextPack(
     taskFolderUri,
     workspaceUri,
     implReviewFiles,
-    priorityRelPaths
+    priorityRelPaths,
+    baselineSha
   );
   const contextPackUri = await writeContextPackContent(taskFolderUri, content);
   return { contextPackUri, isFallback };

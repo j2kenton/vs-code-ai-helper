@@ -6,12 +6,125 @@ import {
   FRAME_END_V1,
   FRAME_START_V1,
   parseAiResultEnvelopeV1,
+  RESULT_FRAME_NUDGE_MESSAGE_V1,
+  roundDeliverableContractV1,
   setInertTrailingObserverV1,
   setLegacyFrameEndObserverV1,
+  shouldNudgeForMissingResultFrameV1,
 } from "../types/aiResultEnvelope";
 
 import { ActionCorrelationV1 } from "../types/actionCorrelationV1";
 import { DEFAULT_TEXT_ANSWER_MAX_LENGTH_V1 } from "../types/structuredQuestionV1";
+
+void describe("roundDeliverableContractV1", () => {
+  void it("requires both a text deliverable and a result frame for text mode", () => {
+    assert.deepEqual(roundDeliverableContractV1("text"), {
+      requiresTextDeliverable: true,
+      requiresResultFrame: true,
+    });
+  });
+
+  void it("requires a result frame but not free text for preflight mode", () => {
+    assert.deepEqual(roundDeliverableContractV1("preflight"), {
+      requiresTextDeliverable: false,
+      requiresResultFrame: true,
+    });
+  });
+
+  void it("requires a result frame but not free text for edit mode", () => {
+    assert.deepEqual(roundDeliverableContractV1("edit"), {
+      requiresTextDeliverable: false,
+      requiresResultFrame: true,
+    });
+  });
+
+  void it("requires neither for a sealed/tool-only round where no model round ran", () => {
+    // resolveSealedEditCompletionResultV1's runner-synthesized summary
+    // (summaryIsSynthetic: true) never invokes a model round at all — there
+    // is no text and no frame to have been omitted.
+    assert.deepEqual(roundDeliverableContractV1(undefined), {
+      requiresTextDeliverable: false,
+      requiresResultFrame: false,
+    });
+  });
+});
+
+void describe("shouldNudgeForMissingResultFrameV1 (item 1 fix 4, workflow findings round 8)", () => {
+  const FRAMED = `${FRAME_START_V1}\n{"kind":"completed"}\n${FRAME_END_V1}`;
+  const NARRATION = "Let me check that first.";
+
+  void it("nudges a frameless response when the frame is required and budget/attempts remain", () => {
+    assert.equal(
+      shouldNudgeForMissingResultFrameV1({
+        responseText: NARRATION,
+        requiresResultFrame: true,
+        nudgesUsed: 0,
+        maxNudges: 2,
+        attemptsRemaining: true,
+      }),
+      true
+    );
+  });
+
+  void it("never nudges a response that already carries the frame", () => {
+    assert.equal(
+      shouldNudgeForMissingResultFrameV1({
+        responseText: FRAMED,
+        requiresResultFrame: true,
+        nudgesUsed: 0,
+        maxNudges: 2,
+        attemptsRemaining: true,
+      }),
+      false
+    );
+  });
+
+  void it("never nudges when the round's deliverable contract does not require a frame", () => {
+    // The sealed/tool-only-edit case: no model round ran, so there is no
+    // text and no frame to have been omitted.
+    assert.equal(
+      shouldNudgeForMissingResultFrameV1({
+        responseText: NARRATION,
+        requiresResultFrame: false,
+        nudgesUsed: 0,
+        maxNudges: 2,
+        attemptsRemaining: true,
+      }),
+      false
+    );
+  });
+
+  void it("stops once the nudge budget is spent", () => {
+    assert.equal(
+      shouldNudgeForMissingResultFrameV1({
+        responseText: NARRATION,
+        requiresResultFrame: true,
+        nudgesUsed: 2,
+        maxNudges: 2,
+        attemptsRemaining: true,
+      }),
+      false
+    );
+  });
+
+  void it("never nudges on the last available attempt — accept and let the parser report the real reason", () => {
+    assert.equal(
+      shouldNudgeForMissingResultFrameV1({
+        responseText: NARRATION,
+        requiresResultFrame: true,
+        nudgesUsed: 0,
+        maxNudges: 2,
+        attemptsRemaining: false,
+      }),
+      false
+    );
+  });
+
+  void it("the shared nudge message names the result frame contract", () => {
+    assert.match(RESULT_FRAME_NUDGE_MESSAGE_V1, /no result frame/);
+    assert.ok(RESULT_FRAME_NUDGE_MESSAGE_V1.includes(FRAME_START_V1));
+  });
+});
 
 void describe("containsResultFrameV1 — parity with the parser", () => {
   // The tool session decides whether to nudge a reply BEFORE the authoritative

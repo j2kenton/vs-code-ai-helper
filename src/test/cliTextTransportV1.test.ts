@@ -289,6 +289,108 @@ void describe("createCliTextTransportV1 structured-event capture", () => {
     );
   });
 
+  /**
+   * Item 1 (workflow findings round 8), fix 3: a structured-stream provider
+   * that exits 0 but whose event stream carried zero text parts must not
+   * settle as `kind: "completed"` — that silently burns the round instead of
+   * engaging the backup chain (2026-08-20 field capture: Kimi Code CLI's
+   * second attempt on the same stage settled on exactly its own
+   * no-text-reply placeholder as a "completed" round).
+   */
+  void it("reports transportFailure, not completed, when a structured stream carries zero text parts", async () => {
+    const correlation = makeCorrelation();
+    const stdout = [
+      JSON.stringify({ type: "step-start", part: { type: "step-start" } }),
+      JSON.stringify({ type: "step-finish", part: { type: "step-finish", reason: "stop" } }),
+      "",
+    ].join("\n");
+
+    const def = scriptedDef({ id: "opencode-cli", structuredEventStream: "opencode", stdout });
+    const transport = createCliTextTransportV1({ def, model: undefined, cwd: process.cwd() });
+    const { writer } = collectingWriter();
+    const exit = await transport.invoke(makeRequest(correlation), writer);
+
+    assert.equal(exit.kind, "transportFailure");
+    assert.equal(exit.kind === "transportFailure" && exit.code, "cliEmptyTextReply");
+    assert.equal(
+      writer.bytesWritten,
+      0,
+      "an empty text reply must not write placeholder bytes to the result writer"
+    );
+  });
+
+  /**
+   * 2026-08-20 review follow-up: the placeholder-set check above only ever
+   * catches "saw recognizable events but none carried text" — every
+   * structured extractor's OWN "cleaned.length === 0" branch (genuinely
+   * empty stdout, not just an empty-text event) returns "" directly rather
+   * than routing through a placeholder, which the placeholder-only check
+   * let straight through to `completed` with zero captured bytes.
+   */
+  void it("reports transportFailure, not completed, when a structured-stream CLI writes zero stdout bytes", async () => {
+    const correlation = makeCorrelation();
+    const def = scriptedDef({ id: "opencode-cli", structuredEventStream: "opencode", stdout: "" });
+    const transport = createCliTextTransportV1({ def, model: undefined, cwd: process.cwd() });
+    const { writer } = collectingWriter();
+    const exit = await transport.invoke(makeRequest(correlation), writer);
+
+    assert.equal(exit.kind, "transportFailure");
+    assert.equal(exit.kind === "transportFailure" && exit.code, "cliEmptyTextReply");
+    assert.equal(
+      writer.bytesWritten,
+      0,
+      "zero stdout bytes must not settle as a completed round with nothing captured"
+    );
+  });
+
+  /**
+   * Same review follow-up: an explicit empty-string text part (the model
+   * emitted a `type: "text"` event whose `part.text` is `""`) is a real
+   * recognized event, so `sawRecognizedEvent` is true and the "no text
+   * parts at all" placeholder branch is never reached either —
+   * `extractOpencodeFinalOutput`'s `requiresFramedResult` loop falls through
+   * to returning that empty part verbatim.
+   */
+  void it("reports transportFailure, not completed, when the only text part is an explicit empty string", async () => {
+    const correlation = makeCorrelation();
+    const stdout = [
+      JSON.stringify({ type: "text", part: { type: "text", text: "" } }),
+      JSON.stringify({ type: "step-finish", part: { type: "step-finish", reason: "stop" } }),
+      "",
+    ].join("\n");
+    const def = scriptedDef({ id: "opencode-cli", structuredEventStream: "opencode", stdout });
+    const transport = createCliTextTransportV1({ def, model: undefined, cwd: process.cwd() });
+    const { writer } = collectingWriter();
+    const exit = await transport.invoke(makeRequest(correlation), writer);
+
+    assert.equal(exit.kind, "transportFailure");
+    assert.equal(exit.kind === "transportFailure" && exit.code, "cliEmptyTextReply");
+    assert.equal(
+      writer.bytesWritten,
+      0,
+      "an explicit empty text part must not write an empty payload as a completed round"
+    );
+  });
+
+  /**
+   * Same review follow-up, opaque-text path: a CLI with no
+   * `structuredEventStream` never runs through `normalizeCliOutput` or the
+   * placeholder set at all — it streams stdout straight into the writer as
+   * it arrives — so the gap there is a provider that exits 0 having written
+   * nothing whatsoever.
+   */
+  void it("reports transportFailure, not completed, when an opaque-text CLI writes zero stdout bytes", async () => {
+    const correlation = makeCorrelation();
+    const def = scriptedDef({ id: "claude-cli", stdout: "" });
+    const transport = createCliTextTransportV1({ def, model: undefined, cwd: process.cwd() });
+    const { writer } = collectingWriter();
+    const exit = await transport.invoke(makeRequest(correlation), writer);
+
+    assert.equal(exit.kind, "transportFailure");
+    assert.equal(exit.kind === "transportFailure" && exit.code, "cliEmptyTextReply");
+    assert.equal(writer.bytesWritten, 0, "an opaque-text CLI with zero stdout must not settle as completed");
+  });
+
   void it("bounds the buffered raw event stream and fails without writing on overflow", async () => {
     const correlation = makeCorrelation();
     // ~64 KiB of tool-event noise against a 1 KiB bound. Generated inside
@@ -319,6 +421,191 @@ void describe("createCliTextTransportV1 structured-event capture", () => {
       /exceeded \d+ bytes \(read \d+\)/
     );
     assert.equal(writer.bytesWritten, 0, "an overflowed event stream must never reach the writer");
+  });
+});
+
+/**
+ * Item 1 fix 4 (workflow findings round 8): a structured-stream reply that
+ * omits the required result frame is narration, not an answer — mirrors the
+ * Copilot LM transport's bounded nudge (`languageModelToolSessionV1.ts`),
+ * respawning the CLI process once with the same nudge text appended to the
+ * prompt instead of accepting the narration as the round's result.
+ */
+void describe("createCliTextTransportV1 frameless-response nudge (item 1 fix 4)", () => {
+  function counterFile(): { path: string; count: () => number } {
+    const p = nodePath.join(
+      os.tmpdir(),
+      `vs-code-ai-helper-nudge-counter-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`
+    );
+    return {
+      path: p,
+      count: (): number => (nodeFs.existsSync(p) ? nodeFs.readFileSync(p, "utf8").length : 0),
+    };
+  }
+
+  /**
+   * A stdin-fed structured-stream script that appends one byte to
+   * `counterPath` on every invocation (so the test can assert exactly how
+   * many processes were spawned) and inspects the prompt IT received: a
+   * prompt containing `nudgeMarker` gets `framedText`, any other prompt gets
+   * `narrationText`. Since each retry is a brand-new process, this is how
+   * the fixture tells "first attempt" from "the nudged retry" apart without
+   * any shared in-process state.
+   */
+  function nudgeAwareDef(options: {
+    counterPath: string;
+    nudgeMarker: string;
+    narrationText: string;
+    framedText: string;
+  }): CliProviderDefinition {
+    const script =
+      'const fs = require("node:fs");' +
+      `fs.appendFileSync(${JSON.stringify(options.counterPath)}, "x");` +
+      'const prompt = fs.readFileSync(0, "utf8");' +
+      `const nudged = prompt.includes(${JSON.stringify(options.nudgeMarker)});` +
+      `const reply = nudged ? ${JSON.stringify(options.framedText)} : ${JSON.stringify(options.narrationText)};` +
+      `process.stdout.write(JSON.stringify({ type: "text", part: { type: "text", text: reply } }) + "\\n");`;
+    return {
+      id: "opencode-cli",
+      label: "Scripted CLI",
+      command: "node",
+      installHint: "test",
+      loginHint: "test",
+      authErrorMarkers: [],
+      signInLabel: "test",
+      models: [],
+      usesLastMessageFile: false,
+      textModeResponseContractV1: "repurposed-interactive-flow",
+      structuredEventStream: "opencode",
+      promptTransport: "stdin",
+      useShell: false,
+      buildArgs(): string[] {
+        return ["-e", script];
+      },
+    };
+  }
+
+  /**
+   * Same fixture shape as `nudgeAwareDef`, but for an opaque-text CLI (no
+   * `structuredEventStream`): stdout IS the model's final answer, written
+   * directly rather than wrapped in a JSON-lines event.
+   */
+  function opaqueNudgeAwareDef(options: {
+    counterPath: string;
+    nudgeMarker: string;
+    narrationText: string;
+    framedText: string;
+  }): CliProviderDefinition {
+    const script =
+      'const fs = require("node:fs");' +
+      `fs.appendFileSync(${JSON.stringify(options.counterPath)}, "x");` +
+      'const prompt = fs.readFileSync(0, "utf8");' +
+      `const nudged = prompt.includes(${JSON.stringify(options.nudgeMarker)});` +
+      `process.stdout.write(nudged ? ${JSON.stringify(options.framedText)} : ${JSON.stringify(options.narrationText)});`;
+    return {
+      id: "claude-cli",
+      label: "Scripted CLI",
+      command: "node",
+      installHint: "test",
+      loginHint: "test",
+      authErrorMarkers: [],
+      signInLabel: "test",
+      models: [],
+      usesLastMessageFile: false,
+      textModeResponseContractV1: "repurposed-interactive-flow",
+      promptTransport: "stdin",
+      useShell: false,
+      buildArgs(): string[] {
+        return ["-e", script];
+      },
+    };
+  }
+
+  void it("respawns an opaque-text CLI exactly once and accepts the framed retry, when the first reply narrates instead of answering (2026-08-21 review finding)", async () => {
+    const correlation = makeCorrelation();
+    const frame = frameFor(correlation);
+    const { path, count } = counterFile();
+    const def = opaqueNudgeAwareDef({
+      counterPath: path,
+      nudgeMarker: "cannot be accepted",
+      narrationText: "Now I'll write the re-review frame.",
+      framedText: frame,
+    });
+    const transport = createCliTextTransportV1({ def, model: undefined, cwd: process.cwd() });
+    const { writer, text } = collectingWriter();
+    const exit = await transport.invoke(makeRequest(correlation), writer);
+
+    assert.deepEqual(exit, { kind: "completed" });
+    assert.equal(text(), frame, "the retry's framed reply must be the captured payload");
+    const parsed = parseAiResultEnvelopeV1(text(), correlation);
+    assert.equal(parsed.kind, "completed");
+    assert.equal(count(), 2, "exactly one respawn: two total process invocations");
+  });
+
+  void it("respawns exactly once and accepts the framed retry, when the first reply is narration", async () => {
+    const correlation = makeCorrelation();
+    const frame = frameFor(correlation);
+    const { path, count } = counterFile();
+    const def = nudgeAwareDef({
+      counterPath: path,
+      nudgeMarker: "cannot be accepted",
+      narrationText: "Let me think about this out loud first.",
+      framedText: frame,
+    });
+    const transport = createCliTextTransportV1({ def, model: undefined, cwd: process.cwd() });
+    const { writer, text } = collectingWriter();
+    const exit = await transport.invoke(makeRequest(correlation), writer);
+
+    assert.deepEqual(exit, { kind: "completed" });
+    assert.equal(text(), frame, "the retry's framed reply must be the captured payload");
+    const parsed = parseAiResultEnvelopeV1(text(), correlation);
+    assert.equal(parsed.kind, "completed");
+    assert.equal(count(), 2, "exactly one respawn: two total process invocations");
+  });
+
+  void it("never respawns when the first reply already carries the frame", async () => {
+    const correlation = makeCorrelation();
+    const frame = frameFor(correlation);
+    const { path, count } = counterFile();
+    // narrationText is unreachable here — the def always answers framed,
+    // proving a framed FIRST reply is accepted without ever checking for a
+    // nudge marker in the prompt.
+    const def = nudgeAwareDef({
+      counterPath: path,
+      nudgeMarker: "__never_sent__",
+      narrationText: frame,
+      framedText: frame,
+    });
+    const transport = createCliTextTransportV1({ def, model: undefined, cwd: process.cwd() });
+    const { writer, text } = collectingWriter();
+    const exit = await transport.invoke(makeRequest(correlation), writer);
+
+    assert.deepEqual(exit, { kind: "completed" });
+    assert.equal(text(), frame);
+    assert.equal(count(), 1, "a framed first reply must not trigger a retry");
+  });
+
+  void it("never nudges a tool-only edit-mode round (no result frame is ever required)", async () => {
+    const correlation = makeCorrelation();
+    const { path, count } = counterFile();
+    // Narrates forever without a frame — if the edit-mode path could nudge,
+    // this def would need two spawns; it must instead never spawn at all,
+    // since the mode guard rejects "edit" before any process starts.
+    const def = nudgeAwareDef({
+      counterPath: path,
+      nudgeMarker: "__never_sent__",
+      narrationText: "narrating, no frame",
+      framedText: "narrating, no frame",
+    });
+    const transport = createCliTextTransportV1({ def, model: undefined, cwd: process.cwd() });
+    const { writer } = collectingWriter();
+    const request = { ...makeRequest(correlation), mode: "edit" as const };
+    const exit = await transport.invoke(request, writer);
+
+    assert.equal(exit.kind, "transportFailure");
+    assert.equal(exit.kind === "transportFailure" && exit.code, "cliModeUnsupported");
+    assert.equal(writer.bytesWritten, 0);
+    assert.equal(count(), 0, "an edit-mode round must never spawn the CLI process at all");
   });
 });
 

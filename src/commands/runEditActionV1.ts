@@ -320,12 +320,48 @@ export async function checkEditActionAvailabilityV1(options: {
   };
 }
 
+/**
+ * A single applied sealed-plan step, kept distinct from `changedPaths` (which
+ * is deduplicated to a file-count-safe set — item 3, plan Part 5): reconciling
+ * a checklist against this round's own edits (workflow 8, item 2 / plan Part
+ * 4) needs to know not just WHICH files changed but WHAT HAPPENED to them —
+ * `deleteFile` and `patchFile` on the same path are very different evidence,
+ * and `changedPaths` alone cannot distinguish them.
+ */
+export interface SealedAppliedOperationV1 {
+  readonly kind: "createFile" | "replaceFile" | "patchFile" | "deleteFile";
+  readonly path: string;
+  /**
+   * A plain-text excerpt of what this step actually wrote (2026-08-21 THIRD
+   * review round — the persisting Part 4 architectural blocker: "a create,
+   * replace, or patch receipt touching the sole path named by a checklist
+   * item" was treated as proof the item's semantic requirement was met, with
+   * no examination of the resulting content — a `createFile` at the right
+   * path with unrelated or empty content still ticked an "Add X" item).
+   * Decoded from the step's own authored bytes (`contentBase64` for
+   * createFile/replaceFile, `replacementBase64` for patchFile — the exact
+   * text the step introduced, not the whole surrounding file), capped at
+   * `SEALED_OPERATION_CONTENT_EXCERPT_MAX_CHARS_V1` since only substring
+   * corroboration is ever needed. Always undefined for `deleteFile` — there
+   * is no new content to excerpt from a removal, and the reconciliation
+   * pass's kind-vs-intent guard governs that case on kind alone. Consumed
+   * ONLY by `runAutomaticChecklistReconciliationV1`'s tier-2 content-
+   * corroboration guard, never rendered to a user.
+   */
+  readonly contentExcerpt?: string;
+}
+
+/** See `SealedAppliedOperationV1.contentExcerpt`'s doc comment. */
+export const SEALED_OPERATION_CONTENT_EXCERPT_MAX_CHARS_V1 = 4000;
+
 export type TwoPhaseEditResultV1 =
   | {
       readonly kind: "completed";
       readonly appliedReceiptIds: readonly string[];
       /** Workspace-relative FILE paths the sealed plan wrote or deleted. */
       readonly changedPaths: readonly string[];
+      /** The same applied steps as `changedPaths`, kept per-operation with kind — see `SealedAppliedOperationV1`. */
+      readonly appliedOperations: readonly SealedAppliedOperationV1[];
     }
   | { readonly kind: "noChanges" }
   | { readonly kind: "questions"; readonly outcome: TaskActionOutcomeV1 }
@@ -344,6 +380,8 @@ export type TwoPhaseEditResultV1 =
       readonly appliedReceiptIds: readonly string[];
       /** File paths of the steps that verifiably applied before the block. */
       readonly changedPaths: readonly string[];
+      /** The same applied steps as `changedPaths`, kept per-operation with kind — see `SealedAppliedOperationV1`. */
+      readonly appliedOperations: readonly SealedAppliedOperationV1[];
       readonly reason: string;
     }
   | { readonly kind: "failed"; readonly outcome: TaskActionOutcomeV1 };
@@ -482,15 +520,78 @@ export async function continueSealedEditExecutionV1(
       ? operation.relativePath
       : undefined;
   };
+  // Deduplicated to a distinct set of paths, in first-occurrence order:
+  // several sealed steps (e.g. two `patchFile` operations, legal since
+  // `duplicateTarget` was relaxed — item 17) can legitimately target the
+  // same file, and a caller reading `changedPaths.length` as a file count
+  // — the zero-change gate, the "Files changed:" run-log block, any reader
+  // eyeballing it — would otherwise see one file reported as two (item 3).
+  // The step/operation count itself is reported separately by the caller
+  // (`appliedReceiptCount`), so nothing here loses how many steps ran.
   const changedPathsForApplied = (count: number): string[] => {
+    const seen = new Set<string>();
     const paths: string[] = [];
     for (let i = 0; i < count; i++) {
       const filePath = filePathOfStep(i);
-      if (filePath !== undefined) {
+      if (filePath !== undefined && !seen.has(filePath)) {
+        seen.add(filePath);
         paths.push(filePath);
       }
     }
     return paths;
+  };
+  // Decodes the actual text a step introduced — see
+  // `SealedAppliedOperationV1.contentExcerpt`'s doc comment. `contentBase64`
+  // is always present for createFile/replaceFile and `replacementBase64` is
+  // always present for patchFile once a plan has decoded successfully
+  // (`decodePreflightOperation` normalizes any plain-text form into these
+  // fields and never accepts a write/patch step without them), so this only
+  // returns undefined for a base64 payload that fails to decode as UTF-8.
+  const contentExcerptForStep = (
+    operation: { kind: string; contentBase64?: string; replacementBase64?: string }
+  ): string | undefined => {
+    const encoded =
+      operation.kind === "createFile" || operation.kind === "replaceFile"
+        ? operation.contentBase64
+        : operation.kind === "patchFile"
+          ? operation.replacementBase64
+          : undefined;
+    if (encoded === undefined) {
+      return undefined;
+    }
+    try {
+      return Buffer.from(encoded, "base64")
+        .toString("utf8")
+        .slice(0, SEALED_OPERATION_CONTENT_EXCERPT_MAX_CHARS_V1);
+    } catch {
+      return undefined;
+    }
+  };
+  // Unlike `changedPathsForApplied`, this is NOT deduplicated to a distinct
+  // path set — a checklist-reconciliation reader needs to see every applied
+  // step (e.g. a `patchFile` followed by another `patchFile` on the same
+  // path is two pieces of evidence, not one), never a file count.
+  const appliedOperationsForApplied = (count: number): SealedAppliedOperationV1[] => {
+    const operations: SealedAppliedOperationV1[] = [];
+    for (let i = 0; i < count; i++) {
+      const operation = sealed.operations[i];
+      if (!operation) {
+        continue;
+      }
+      if (
+        operation.kind === "createFile" ||
+        operation.kind === "replaceFile" ||
+        operation.kind === "patchFile" ||
+        operation.kind === "deleteFile"
+      ) {
+        operations.push({
+          kind: operation.kind,
+          path: operation.relativePath,
+          contentExcerpt: contentExcerptForStep(operation),
+        });
+      }
+    }
+    return operations;
   };
 
   const execution = broker.executionOutcome(sealed.executionId);
@@ -499,6 +600,7 @@ export async function continueSealedEditExecutionV1(
       kind: "completed",
       appliedReceiptIds: execution.appliedReceiptIds,
       changedPaths: changedPathsForApplied(sealed.operations.length),
+      appliedOperations: appliedOperationsForApplied(sealed.operations.length),
     };
   }
   // §7.7: the broker's authoritative state — not the provider's own story —
@@ -509,6 +611,7 @@ export async function continueSealedEditExecutionV1(
       kind: "partialEditBlocked",
       appliedReceiptIds,
       changedPaths: changedPathsForApplied(appliedReceiptIds.length),
+      appliedOperations: appliedOperationsForApplied(appliedReceiptIds.length),
       reason:
         "The edit session stopped after some steps were verified and applied. Applied edits remain in place; " +
         "review them and run a fresh preflight for the remainder.",
@@ -591,12 +694,20 @@ export interface SealedEditReportOutcomeV1 {
  *
  * Exported and pure (no I/O) so this decision is directly testable; the only
  * caller is `runSealedImplementationV1`'s "completed" case.
+ *
+ * `appliedOperations` (workflow 8, item 2 / plan Part 4) is carried through to
+ * `ImplementationRunResult` unchanged, regardless of which branch below fires
+ * — it is the sealed pipeline's own applied-step evidence, independent of
+ * whether a follow-up text report was obtained, and is consumed downstream
+ * only by the automatic checklist-reconciliation pass (never by this
+ * function's own report-vs-synthetic decision).
  */
 export function resolveSealedEditCompletionResultV1(
   changedPaths: readonly string[],
   appliedReceiptCount: number,
   runnerId: string,
-  report: SealedEditReportOutcomeV1 | undefined
+  report: SealedEditReportOutcomeV1 | undefined,
+  appliedOperations: readonly SealedAppliedOperationV1[] = []
 ): ImplementationRunResult & { runnerId: string } {
   if (
     report &&
@@ -609,13 +720,22 @@ export function resolveSealedEditCompletionResultV1(
     return {
       status: "completed",
       filesChanged: [...changedPaths],
-      summary: report.summary,
+      appliedOperations,
+      // The model-authored report's own prose is preserved, but the applied
+      // step count and distinct-file count (item 3 / plan Part 5) are stated
+      // separately on their own line so an accepted report guarantees the
+      // same counts a synthetic summary always has — the report's prose has
+      // no reason to know the sealed pipeline's own receipt count.
+      summary:
+        `${report.summary.trimEnd()}\n\n` +
+        `Applied ${appliedReceiptCount} sealed edit step(s) (${changedPaths.length} file(s) changed).`,
       runnerId,
     };
   }
   return {
     status: "completed",
     filesChanged: [...changedPaths],
+    appliedOperations,
     summary:
       `Applied ${appliedReceiptCount} sealed edit step(s) with ordered receipts ` +
       `(${changedPaths.length} file(s) changed).`,
@@ -743,7 +863,8 @@ export async function runSealedImplementationV1(
         changedPaths,
         result.appliedReceiptIds.length,
         runnerId,
-        report
+        report,
+        result.appliedOperations
       );
     }
     case "noChanges":

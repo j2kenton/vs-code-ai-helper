@@ -57,7 +57,7 @@ function normalizeArg(
  * as the round's "own" text (`splitSummaryAtEchoV1`) — where
  * `collectRetroactiveTickClaimsV1` reads claims from.
  */
-function buildSyntheticVerifiedCompleteSummaryV1(
+export function buildSyntheticVerifiedCompleteSummaryV1(
   items: readonly string[],
   evidence: string
 ): string {
