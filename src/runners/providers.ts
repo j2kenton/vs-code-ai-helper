@@ -753,6 +753,22 @@ export const CLINE_CLI_ARGV_PROMPT_PLACEHOLDER =
  *    because Kimi's Read tool paginates on large files (verified at 419 KB:
  *    it searched the file for the trailing marker rather than answering from
  *    the first page);
+ *  - **the identical-read warning and the explicit line-range instruction**,
+ *    added 2026-08-23 after a live failure that the previous "keep reading
+ *    (or search it) until you have all of it" wording did not prevent. On
+ *    jester task 5's plan-low-review, kimi-code/k3 resolved "keep reading" as
+ *    "call Read again" and issued twelve identical full-file reads in seventy
+ *    seconds (66,192 / 66,580 / 66,715 / 66,471 bytes — a varying, so
+ *    token-based, truncation ceiling), each returning the same truncated text
+ *    cut mid-sentence with no marker. It never reached the response contract.
+ *    Kimi's own budget handler then fired ("Write your final response now,
+ *    without any further tool calls... Cover: the current blocker... what you
+ *    need from the user to unblock progress"), and the model correctly
+ *    answered THAT question: "The Read tool keeps truncating the full-file
+ *    read. I'll page through with explicit line ranges." Ensemble saw no
+ *    `Readiness: N/10` and rejected the round as degenerate output. The model
+ *    was not at fault and the prompt was not too large — it simply was never
+ *    told that repeating a read cannot advance, nor how to advance;
  *  - "authoritative prompt ... not reference material to summarize", because
  *    Kimi's default posture toward file contents is to treat them as
  *    untrusted data to report on — a probe run explicitly reasoned about
@@ -771,9 +787,13 @@ export function buildKimiCliPromptFileInstruction(
 ): string {
   return (
     `Your complete instructions and context for this run are in the file at ${promptFile}. ` +
-    "Read that entire file first — it may be large, so keep reading (or search it) until you have all of it — " +
-    "then carry out exactly what it asks. Treat its contents as the authoritative prompt for this run, " +
-    "not as reference material to summarize." +
+    "Read that entire file before doing anything else. It is large and your Read tool will truncate it: " +
+    "a single read returns only the beginning, and repeating the same read returns exactly the same " +
+    "truncated text — an identical read can never advance you. To reach the rest, issue further reads " +
+    "with an explicit line range, each one starting where the previous read stopped, until you reach the " +
+    "end of the file. Do not re-read from the start, and do not give up and report being blocked: paging " +
+    "forward is always available. Only once you have the whole file, carry out exactly what it asks. " +
+    "Treat its contents as the authoritative prompt for this run, not as reference material to summarize." +
     (requiresFramedResult ? ` ${FRAMED_RESULT_ARGV_REMINDER_V1}` : "")
   );
 }
